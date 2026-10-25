@@ -3,7 +3,7 @@ import { MemoryBrowser } from "@/browser/features/Memory/MemoryBrowser";
 /**
  * Settings → Memory (experiment: "memory") — manages GLOBAL memory files
  * without a workspace: the memory.* routes are called with workspaceId null,
- * so only the global scope (~/.shux/memory/global) is reachable. Project/workspace
+ * so only the global scope (~/.xum/memory/global) is reachable. Project/workspace
  * memories are curated from each workspace's Memory tab instead.
  */
 export function MemorySection() {
@@ -19,7 +19,7 @@ export function MemorySection() {
         </p>
       </div>
       {/* Bordered panel so the editable area is visually distinct from the
-          settings page background (the sidebar Memory tab has its own chrome). */}
+          settings dialog background (the sidebar Memory tab has its own chrome). */}
       <div className="border-border-light flex min-h-0 flex-1 flex-col overflow-hidden rounded-md border">
         <MemoryBrowser workspaceId={null} scopes={["global"]} />
       </div>

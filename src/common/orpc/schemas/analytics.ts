@@ -162,6 +162,10 @@ export const EventRowSchema = z.object({
   output_tps: z.number().nullable(),
   response_index: z.number().nullable(),
   is_sub_agent: z.boolean().default(false),
+  // Refusal-fallback downgrade metadata, populated only on the main turn row
+  // (tool_name IS NULL) when the turn was answered by a fallback model.
+  requested_model: z.string().nullable().default(null),
+  refused_models_json: z.string().nullable().default(null),
 });
 export type EventRow = z.infer<typeof EventRowSchema>;
 
@@ -190,6 +194,8 @@ export const analytics = {
       from: z.coerce.date().nullish(),
       to: z.coerce.date().nullish(),
       timeZone: z.string().nullish(),
+      /** The zone whose calendar dates `from` and `to` bound; defaults to `timeZone`. */
+      filterTimeZone: z.string().nullish(),
     }),
     output: z.array(
       z.object({

@@ -2,7 +2,7 @@ import React from "react";
 import { ChevronRight, EyeOff } from "lucide-react";
 import { z } from "zod";
 import { cn } from "@/common/lib/utils";
-import { AgentSkillDescriptorSchema } from "@/common/orpc/schemas";
+import { AgentSkillDescriptorSchema } from "@/common/orpc/schemas/agentSkill";
 import type { AgentSkillDescriptor, AgentSkillScope } from "@/common/types/agentSkill";
 import type { AgentSkillListToolArgs } from "@/common/types/tools";
 import {
@@ -38,7 +38,7 @@ import {
  * omitted here rather than wired to data that can never arrive.
  */
 
-// Scope → label + dot/label color. Project and global reuse the Shux mode hues
+// Scope → label + dot/label color. Project and global reuse the Xum mode hues
 // (teal / indigo); built-in is neutral. Colors come from globals.css theme tokens
 // (`--color-task-mode` etc.) via utilities — never hardcoded — so they track the
 // active theme. Record keyed by scope so a new AgentSkillScope is a compile error.

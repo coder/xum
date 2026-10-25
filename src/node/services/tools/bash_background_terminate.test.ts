@@ -7,9 +7,24 @@ import type {
   BashBackgroundTerminateArgs,
   BashBackgroundTerminateResult,
 } from "@/common/types/tools";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { randomUUID } from "crypto";
+import { TestTempDir, createTestToolConfig as createBaseToolConfig } from "./testHelpers";
 import type { ToolExecutionOptions } from "ai";
 import * as fs from "fs/promises";
+
+// Unique workspace IDs per run (#7256): spawn records live in the shared
+// /tmp/mux-bashes/<workspaceId>, and the loop-test runner runs several test files at once. A fixed
+// "test-workspace" let one file's cleanup delete another file's records, as #5591 fixed for
+// backgroundProcessManager.test.ts.
+const RUN_ID = randomUUID().slice(0, 12);
+const TEST_WS = `test-workspace-${RUN_ID}`;
+const WS_A = `workspace-a-${RUN_ID}`;
+const WS_B = `workspace-b-${RUN_ID}`;
+const createTestToolConfig = (
+  tempDir: string,
+  options?: Parameters<typeof createBaseToolConfig>[1]
+): ReturnType<typeof createBaseToolConfig> =>
+  createBaseToolConfig(tempDir, { workspaceId: TEST_WS, ...options });
 
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -23,7 +38,7 @@ function createTestRuntime(): Runtime {
 }
 
 // Workspace IDs used in tests - need cleanup after each test
-const TEST_WORKSPACES = ["test-workspace", "workspace-a", "workspace-b"];
+const TEST_WORKSPACES = [TEST_WS, WS_A, WS_B];
 
 describe("bash_background_terminate tool", () => {
   afterEach(async () => {
@@ -84,7 +99,7 @@ describe("bash_background_terminate tool", () => {
     config.backgroundProcessManager = manager;
 
     // Spawn a long-running process
-    const spawnResult = await manager.spawn(runtime, "test-workspace", "sleep 10", {
+    const spawnResult = await manager.spawn(runtime, TEST_WS, "sleep 10", {
       cwd: process.cwd(),
       displayName: "test",
     });
@@ -112,7 +127,7 @@ describe("bash_background_terminate tool", () => {
     const bgProcess = await manager.getProcess(spawnResult.processId);
     expect(bgProcess?.status).not.toBe("running");
 
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
   });
 
@@ -125,7 +140,7 @@ describe("bash_background_terminate tool", () => {
     config.backgroundProcessManager = manager;
 
     // Spawn a process
-    const spawnResult = await manager.spawn(runtime, "test-workspace", "sleep 10", {
+    const spawnResult = await manager.spawn(runtime, TEST_WS, "sleep 10", {
       cwd: process.cwd(),
       displayName: "test",
     });
@@ -153,7 +168,7 @@ describe("bash_background_terminate tool", () => {
     )) as BashBackgroundTerminateResult;
     expect(result2.success).toBe(true);
 
-    await manager.cleanup("test-workspace");
+    await manager.cleanup(TEST_WS);
     tempDir[Symbol.dispose]();
   });
 
@@ -164,14 +179,14 @@ describe("bash_background_terminate tool", () => {
 
     // Config is for workspace-a
     const config = createTestToolConfig(process.cwd(), {
-      workspaceId: "workspace-a",
+      workspaceId: WS_A,
       sessionsDir: tempDir.path,
     });
     config.runtimeTempDir = tempDir.path;
     config.backgroundProcessManager = manager;
 
     // Spawn process in workspace-b
-    const spawnResult = await manager.spawn(runtime, "workspace-b", "sleep 10", {
+    const spawnResult = await manager.spawn(runtime, WS_B, "sleep 10", {
       cwd: process.cwd(),
       displayName: "test",
     });
@@ -201,7 +216,7 @@ describe("bash_background_terminate tool", () => {
     expect(proc?.status).toBe("running");
 
     // Cleanup
-    await manager.cleanup("workspace-b");
+    await manager.cleanup(WS_B);
     tempDir[Symbol.dispose]();
   });
 });

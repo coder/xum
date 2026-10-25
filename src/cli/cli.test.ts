@@ -1,5 +1,5 @@
 /**
- * E2E tests for the CLI layer (shux api commands).
+ * E2E tests for the CLI layer (xum api commands).
  *
  * These tests verify that:
  * 1. CLI commands work correctly via HTTP to a real server
@@ -19,7 +19,7 @@ import { createCli, FailedToExitError } from "trpc-cli";
 import { router } from "@/node/orpc/router";
 import { proxifyOrpc } from "./proxifyOrpc";
 import type { ORPCContext } from "@/node/orpc/context";
-import { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
 import { ServiceContainer } from "@/node/services/serviceContainer";
 import { createOrpcServer, type OrpcServer } from "@/node/orpc/server";
 
@@ -38,7 +38,7 @@ interface TestServerHandle {
 async function createTestServer(authToken?: string): Promise<TestServerHandle> {
   // Create temp dir for config
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-cli-test-"));
-  const config = new Config(tempDir);
+  const stores = createConfigStores(tempDir);
 
   // Mock BrowserWindow
   const mockWindow: BrowserWindow = {
@@ -51,7 +51,7 @@ async function createTestServer(authToken?: string): Promise<TestServerHandle> {
   } as unknown as BrowserWindow;
 
   // Initialize services
-  const services = new ServiceContainer(config);
+  const services = new ServiceContainer(stores);
   await services.initialize();
   services.windowService.setMainWindow(mockWindow);
 
@@ -71,6 +71,9 @@ async function createTestServer(authToken?: string): Promise<TestServerHandle> {
     tempDir,
     close: async () => {
       await server.close();
+      // Closing HTTP leaves service fibers and intervals alive; stop them before deleting config.
+      await services.dispose();
+      await services.shutdown();
       // Cleanup temp directory
       await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
     },
@@ -174,15 +177,54 @@ describe("CLI via HTTP", () => {
   });
 
   describe("object input schemas", () => {
+    test("perf-captures capture-now parses --duration-ms and rejects out-of-range values", async () => {
+      const captureNow = (durationMs: string) =>
+        runCli([
+          "perf-captures",
+          "capture-now",
+          "--process",
+          "backend",
+          "--duration-ms",
+          durationMs,
+        ]).then(
+          () => null,
+          (rejection: unknown) => rejection
+        );
+      // A valid integer reaches the server, which refuses it: the experiment is off in a
+      // fresh root, so CLI parsing accepted the option.
+      expect(await captureNow("2000")).toMatchObject({ code: "PRECONDITION_FAILED" });
+      for (const value of ["500", "abc"]) {
+        expect(await captureNow(value)).toMatchObject({ code: "BAD_REQUEST" });
+      }
+    });
+
+    test("workspace heartbeat set accepts a nullable integer --interval-ms (#6329)", async () => {
+      const setInterval = (intervalMs: string) =>
+        runCli([
+          "workspace",
+          "heartbeat",
+          "set",
+          "--workspace-id",
+          "nonexistent",
+          "--enabled",
+          "true",
+          "--interval-ms",
+          intervalMs,
+        ]).then(
+          (result: unknown) => ({ result }),
+          (rejection: unknown) => ({ rejection: String(rejection) })
+        );
+      // An integer passes CLI parsing and reaches the server, which reports the unknown
+      // workspace in its result.
+      expect(await setInterval("1800000")).toMatchObject({ result: { success: false } });
+      // A fraction is still not an integer.
+      const fraction = await setInterval("1800000.5");
+      expect("rejection" in fraction && fraction.rejection).toContain("expected integer or null");
+    });
+
     test("workspace get-info with workspace-id option", async () => {
       const result = await runCli(["workspace", "get-info", "--workspace-id", "nonexistent"]);
       expect(result).toBeNull(); // Non-existent workspace returns null
-    });
-
-    test("general tick with object options", async () => {
-      const result = await runCli(["general", "tick", "--count", "2", "--interval-ms", "10"]);
-      // tick returns an async generator, so result should be the generator
-      expect(result).toBeDefined();
     });
   });
 });

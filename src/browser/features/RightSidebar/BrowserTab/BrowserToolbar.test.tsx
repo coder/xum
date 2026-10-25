@@ -1,3 +1,5 @@
+import "../../../../../tests/ui/dom";
+import { APIProvider } from "@/browser/contexts/API";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
@@ -12,36 +14,33 @@ const controlMock = mock<() => Promise<BrowserControlResponse>>(() =>
   Promise.resolve({ success: true })
 );
 
-void mock.module("@/browser/contexts/API", () => ({
-  useAPI: () => ({
-    api: {
-      browser: {
-        control: controlMock,
-      },
-    },
-    status: "connected" as const,
-    error: null,
-    authenticate: () => undefined,
-    retry: () => undefined,
-  }),
-}));
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks this partial client into later-evaluated suites.
+const apiClient = createTestApiClient({
+  browser: {
+    control: controlMock,
+  },
+});
 
 import { BrowserToolbar } from "./BrowserToolbar";
+import { createTestApiClient } from "@/browser/testUtils";
 
 function renderToolbar(overrides: Partial<ComponentProps<typeof BrowserToolbar>> = {}) {
   const onSetPendingUrl = mock(() => undefined);
 
   const view = render(
-    <BrowserToolbar
-      workspaceId="workspace-1"
-      sessionName="session-a"
-      currentUrl="https://current.example.com"
-      pendingUrl={null}
-      isPageLoading={false}
-      isConnected={true}
-      onSetPendingUrl={onSetPendingUrl}
-      {...overrides}
-    />
+    <APIProvider client={apiClient}>
+      <BrowserToolbar
+        workspaceId="workspace-1"
+        sessionName="session-a"
+        currentUrl="https://current.example.com"
+        pendingUrl={null}
+        isPageLoading={false}
+        isConnected={true}
+        onSetPendingUrl={onSetPendingUrl}
+        {...overrides}
+      />
+    </APIProvider>
   );
 
   return { onSetPendingUrl, ...view };

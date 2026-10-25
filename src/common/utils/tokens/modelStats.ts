@@ -9,12 +9,13 @@ export interface ModelStats {
   max_output_tokens?: number;
   input_cost_per_token: number;
   output_cost_per_token: number;
-  input_cost_per_token_above_200k_tokens?: number;
-  output_cost_per_token_above_200k_tokens?: number;
+  input_cost_per_token_above_threshold?: number;
+  output_cost_per_token_above_threshold?: number;
   cache_creation_input_token_cost?: number;
-  cache_creation_input_token_cost_above_200k_tokens?: number;
+  cache_creation_input_token_cost_above_threshold?: number;
   cache_read_input_token_cost?: number;
-  cache_read_input_token_cost_above_200k_tokens?: number;
+  cache_read_input_token_cost_above_threshold?: number;
+  /** Prompt size above which a request bills at the `_above_threshold` rates. */
   tiered_pricing_threshold_tokens?: number;
 }
 
@@ -26,22 +27,48 @@ interface RawModelData {
   input_cost_per_image_token?: number;
   output_cost_per_image_token?: number;
   cache_read_input_image_token_cost?: number;
-  input_cost_per_token_above_200k_tokens?: number;
-  output_cost_per_token_above_200k_tokens?: number;
   cache_creation_input_token_cost?: number;
-  cache_creation_input_token_cost_above_200k_tokens?: number;
   cache_read_input_token_cost?: number;
-  cache_read_input_token_cost_above_200k_tokens?: number;
-  tiered_pricing_threshold_tokens?: number | string | null;
   [key: string]: unknown;
 }
 
-const PROVIDER_KEY_ALIASES: Record<string, string> = {
+const LONG_CONTEXT_RATE_CLASSES = [
+  "input_cost_per_token",
+  "output_cost_per_token",
+  "cache_creation_input_token_cost",
+  "cache_read_input_token_cost",
+] as const;
+export type LongContextRateClass = (typeof LONG_CONTEXT_RATE_CLASSES)[number];
+
+/**
+ * A long-context rate, which LiteLLM names after its threshold in thousands of prompt
+ * tokens (`input_cost_per_token_above_272k_tokens`). Service-tier variants such as
+ * `..._tokens_priority` do not match: serviceTierPricing derives those from Standard.
+ */
+export const LONG_CONTEXT_RATE_FIELD = new RegExp(
+  `^(${LONG_CONTEXT_RATE_CLASSES.join("|")})_above_(\\d+)k_tokens$`
+);
+
+export const PROVIDER_KEY_ALIASES: Record<string, string> = {
   // GitHub Copilot keys in models.json use underscores for LiteLLM provider names.
   "github-copilot": "github_copilot",
 };
 
-function parseNum(value: unknown): number | null {
+/**
+ * LiteLLM names for Xum providers whose built-ins are keyed under the Xum name
+ * (moonshotai/kimi-k3 in models-extra). Tried after every other key, so custom
+ * models gain LiteLLM metadata without changing what already resolves.
+ */
+export const PROVIDER_KEY_FALLBACKS: Record<string, string> = {
+  moonshotai: "moonshot",
+};
+
+/**
+ * Runtime numeric semantics for raw catalog values (accepts numeric strings
+ * with comma separators). Exported so update-models validation compares
+ * magnitudes exactly as getModelStats would parse them.
+ */
+export function parseNum(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return value;
   }
@@ -54,25 +81,27 @@ function parseNum(value: unknown): number | null {
   return null;
 }
 
-const DEFAULT_TIERED_PRICING_THRESHOLD_TOKENS = 200_000;
-
 function parseOptionalNumber(value: unknown): number | undefined {
   return parseNum(value) ?? undefined;
 }
 
-function hasTieredPricing(data: RawModelData): boolean {
-  return (
-    parseOptionalNumber(data.input_cost_per_token_above_200k_tokens) != null ||
-    parseOptionalNumber(data.output_cost_per_token_above_200k_tokens) != null ||
-    parseOptionalNumber(data.cache_creation_input_token_cost_above_200k_tokens) != null ||
-    parseOptionalNumber(data.cache_read_input_token_cost_above_200k_tokens) != null
-  );
+/** The threshold of the entry's long-context rates, in thousands of prompt tokens. */
+function findLongContextThresholdK(data: RawModelData): number | undefined {
+  let lowest: number | undefined;
+  for (const [field, value] of Object.entries(data)) {
+    const match = LONG_CONTEXT_RATE_FIELD.exec(field);
+    if (match === null || parseNum(value) === null) continue;
+    // Pricing models one long-context tier; LiteLLM gives no model more than one.
+    lowest = Math.min(lowest ?? Infinity, Number(match[2]));
+  }
+  return lowest;
 }
 
 /**
- * Validates raw model data has required fields
+ * Whether raw model metadata is usable for stats resolution. Exported so the
+ * update-models validation applies the same bar as getModelStats.
  */
-function isValidModelData(data: RawModelData): boolean {
+export function hasUsableTokenLimits(data: RawModelData): boolean {
   const maxInputTokens = parseNum(data.max_input_tokens);
   return maxInputTokens != null && maxInputTokens > 0;
 }
@@ -81,12 +110,11 @@ function isValidModelData(data: RawModelData): boolean {
  * Extracts ModelStats from validated raw data
  */
 function extractModelStats(data: RawModelData): ModelStats {
-  const tieredPricingThresholdTokens =
-    parseOptionalNumber(data.tiered_pricing_threshold_tokens) ??
-    // LiteLLM names long-context rates with `_above_200k_tokens` but does not ship a
-    // separate threshold field. Keep 200K as the compatibility default unless an override
-    // (like GPT-5.5's published 272K boundary) is provided explicitly.
-    (hasTieredPricing(data) ? DEFAULT_TIERED_PRICING_THRESHOLD_TOKENS : undefined);
+  const thresholdK = findLongContextThresholdK(data);
+  const aboveThreshold = (rateClass: LongContextRateClass) =>
+    thresholdK === undefined
+      ? undefined
+      : parseOptionalNumber(data[`${rateClass}_above_${thresholdK}k_tokens`]);
 
   return {
     max_input_tokens: parseNum(data.max_input_tokens) ?? 0,
@@ -102,27 +130,21 @@ function extractModelStats(data: RawModelData): ModelStats {
         : typeof data.output_cost_per_token === "number"
           ? data.output_cost_per_token
           : 0,
-    input_cost_per_token_above_200k_tokens: parseOptionalNumber(
-      data.input_cost_per_token_above_200k_tokens
-    ),
-    output_cost_per_token_above_200k_tokens: parseOptionalNumber(
-      data.output_cost_per_token_above_200k_tokens
-    ),
+    input_cost_per_token_above_threshold: aboveThreshold("input_cost_per_token"),
+    output_cost_per_token_above_threshold: aboveThreshold("output_cost_per_token"),
     cache_creation_input_token_cost:
       typeof data.cache_creation_input_token_cost === "number"
         ? data.cache_creation_input_token_cost
         : undefined,
-    cache_creation_input_token_cost_above_200k_tokens: parseOptionalNumber(
-      data.cache_creation_input_token_cost_above_200k_tokens
+    cache_creation_input_token_cost_above_threshold: aboveThreshold(
+      "cache_creation_input_token_cost"
     ),
     cache_read_input_token_cost:
       typeof data.cache_read_input_token_cost === "number"
         ? data.cache_read_input_token_cost
         : undefined,
-    cache_read_input_token_cost_above_200k_tokens: parseOptionalNumber(
-      data.cache_read_input_token_cost_above_200k_tokens
-    ),
-    tiered_pricing_threshold_tokens: tieredPricingThresholdTokens,
+    cache_read_input_token_cost_above_threshold: aboveThreshold("cache_read_input_token_cost"),
+    tiered_pricing_threshold_tokens: thresholdK === undefined ? undefined : thresholdK * 1000,
   };
 }
 
@@ -135,10 +157,13 @@ function stripLatestSuffix(modelName: string): string {
 }
 
 /**
- * Generates lookup keys for a model string with multiple naming patterns
- * Handles LiteLLM conventions like "ollama/model-cloud" and "provider/model"
+ * Generates lookup keys for a model string with multiple naming patterns.
+ * Handles LiteLLM conventions like "ollama/model-cloud" and "provider/model".
+ * Exported so capability resolution shares the exact same key preference:
+ * provider-scoped entries must win over bare-name entries in both lookups,
+ * otherwise a model can inherit stats and capabilities from different entries.
  */
-function generateLookupKeys(modelString: string): string[] {
+export function generateModelLookupKeys(modelString: string): string[] {
   const colonIndex = modelString.indexOf(":");
   const provider = colonIndex !== -1 ? modelString.slice(0, colonIndex) : "";
   const modelName = colonIndex !== -1 ? modelString.slice(colonIndex + 1) : modelString;
@@ -219,7 +244,47 @@ function generateLookupKeys(modelString: string): string[] {
     push(lowercaseFamilyModelName);
   }
 
+  const fallbackProvider = PROVIDER_KEY_FALLBACKS[provider];
+  if (fallbackProvider) {
+    pushProviderScoped(fallbackProvider, modelName);
+  }
+
   return keys;
+}
+
+export interface ResolvedRawModelEntry {
+  /** The models-extra/models.json key the stats actually come from. */
+  key: string;
+  data: RawModelData;
+}
+
+/**
+ * Resolves the raw override/catalog entry backing a model string, preserving
+ * getModelStats' precedence: models-extra across every lookup key first, then
+ * models.json. Exported so the Treat-as catalog can exclude ids whose stats
+ * would resolve from a different entry than the row represents.
+ */
+export function resolveRawModelEntry(modelString: string): ResolvedRawModelEntry | null {
+  const normalized = normalizeToCanonical(modelString);
+  const lookupKeys = generateModelLookupKeys(normalized);
+
+  // Check models-extra.ts first (overrides for models with incorrect upstream data)
+  for (const key of lookupKeys) {
+    const data = (modelsExtra as Record<string, RawModelData>)[key];
+    if (data && hasUsableTokenLimits(data)) {
+      return { key, data };
+    }
+  }
+
+  // Fall back to main models.json
+  for (const key of lookupKeys) {
+    const data = (modelsData as Record<string, RawModelData>)[key];
+    if (data && hasUsableTokenLimits(data)) {
+      return { key, data };
+    }
+  }
+
+  return null;
 }
 
 /**
@@ -228,26 +293,8 @@ function generateLookupKeys(modelString: string): string[] {
  * @returns ModelStats or null if model not found
  */
 export function getModelStats(modelString: string): ModelStats | null {
-  const normalized = normalizeToCanonical(modelString);
-  const lookupKeys = generateLookupKeys(normalized);
-
-  // Check models-extra.ts first (overrides for models with incorrect upstream data)
-  for (const key of lookupKeys) {
-    const data = (modelsExtra as Record<string, RawModelData>)[key];
-    if (data && isValidModelData(data)) {
-      return extractModelStats(data);
-    }
-  }
-
-  // Fall back to main models.json
-  for (const key of lookupKeys) {
-    const data = (modelsData as Record<string, RawModelData>)[key];
-    if (data && isValidModelData(data)) {
-      return extractModelStats(data);
-    }
-  }
-
-  return null;
+  const entry = resolveRawModelEntry(modelString);
+  return entry === null ? null : extractModelStats(entry.data);
 }
 
 export function getModelStatsResolved(

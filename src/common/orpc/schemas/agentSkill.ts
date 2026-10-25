@@ -15,12 +15,62 @@ export const SkillNameSchema = z
   .max(64)
   .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
 
+/**
+ * Skill lookup name: a bare skill name, or `<plugin>:<skill>` for an Agent Plugin's
+ * skill (Claude Code's plugin namespace convention). Plugin names cannot contain `:`,
+ * so it is an unambiguous separator. Lookahead-free (no `.refine`) because tool input
+ * schemas go to OpenAI strict mode; parseSkillLookupName enforces the full plugin-name
+ * grammar (`--`, `..`, Windows reserved names, 64-char cap).
+ */
+export const SkillLookupNameSchema = z
+  .string()
+  .min(1)
+  .max(129)
+  .regex(/^(?:[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?:)?[a-z0-9]+(?:-[a-z0-9]+)*$/);
+
+/**
+ * Why a metadata value cannot round-trip as JSON, or undefined when it can.
+ * - A recursive YAML alias (`a: &A { self: *A }`) parses to a cyclic object, which
+ *   `z.json()` accepts but the oRPC serializer and the consent fingerprint cannot walk.
+ *   Shared (non-recursive) aliases are fine, so this tracks the current path only.
+ * - YAML rounds numbers before Xum sees them (`9007199254740993`, `1e-400`,
+ *   `0.10000000000000001`), so the tool card and the consent fingerprint would show a
+ *   different value than the file holds. A number must be quoted, as the spec's own
+ *   example does (`version: "1.0"`). Strings, booleans and null round-trip exactly.
+ */
+function metadataValueProblem(value: unknown, ancestors = new Set<object>()): string | undefined {
+  if (typeof value === "number") {
+    return "must not contain an unquoted number (YAML rounds it; quote it as a string)";
+  }
+  if (typeof value !== "object" || value === null) return undefined;
+  if (ancestors.has(value)) return "must not contain a recursive YAML alias";
+  ancestors.add(value);
+  const children: unknown[] = Array.isArray(value) ? value : Object.values(value);
+  const problem = children.reduce<string | undefined>(
+    (found, child) => found ?? metadataValueProblem(child, ancestors),
+    undefined
+  );
+  ancestors.delete(value);
+  return problem;
+}
+
 export const AgentSkillFrontmatterSchema = z.object({
   name: SkillNameSchema,
   description: z.string().min(1).max(1024),
   license: z.string().optional(),
   compatibility: z.string().min(1).max(500).optional(),
-  metadata: z.record(z.string(), z.string()).optional(),
+  // agentskills.io says string values, but skills-ref (the spec's own validator)
+  // accepts any value. Xum only displays metadata, so a nested value must not
+  // hide the skill (warpdotdev/common-skills merge-risk uses metadata.credits).
+  // Values must stay JSON: tagged YAML (`!!set`, `!!omap`, `!!binary`) parses to
+  // Set/Map/Uint8Array, which the tool card and the consent fingerprint show as `{}`.
+  metadata: z
+    .record(z.string(), z.json())
+    .superRefine((value, ctx) => {
+      const problem = metadataValueProblem(value);
+      if (problem !== undefined) ctx.addIssue({ code: "custom", message: problem });
+    })
+    .optional(),
 
   // When false, skill is NOT listed in the tool description's skill index.
   // Unadvertised skills can still be invoked via /skill-name or agent_skill_read({ name: "skill-name" }).
@@ -50,6 +100,12 @@ export const AgentSkillFrontmatterSchema = z.object({
   // Claude-Code-style keys above).
   when_to_use: z.string().min(1).max(1024).optional(),
   "when-to-use": z.string().min(1).max(1024).optional(),
+
+  // Ecosystem-standard (Cursor / Claude Code) path scope: workspace-root-relative globs,
+  // as a comma-separated string or a list. A path-scoped skill is left out of the
+  // agent_skill_read index and surfaces only after a file tool touches a matching file.
+  // parseSkillMarkdown validates the patterns (normalizeSkillPaths).
+  paths: z.union([z.string(), z.array(z.string())]).optional(),
 });
 
 /**
@@ -109,8 +165,15 @@ export const AgentSkillDescriptorSchema = z.object({
   argumentHint: z.string().min(1).max(200).optional(),
   /** Normalized `when_to_use`/`when-to-use` frontmatter (extra model-facing index guidance). */
   whenToUse: z.string().min(1).max(1024).optional(),
+  /** Normalized `paths` frontmatter (workspace-root-relative globs; see skillPaths.ts). */
+  paths: z.array(z.string().min(1)).min(1).optional(),
   /** Agent Plugins: contributing plugin name (absent for non-plugin skills). */
   pluginName: z.string().min(1).optional(),
+  /**
+   * Raw SKILL.md `name` when it is not the skill ID (the directory name). User-facing
+   * only (slash menu, skill indicator); never model-facing.
+   */
+  displayName: z.string().min(1).max(64).optional(),
 });
 
 export const AgentSkillPackageSchema = z
@@ -136,4 +199,28 @@ export const AgentSkillIssueSchema = z.object({
   message: z.string().min(1),
   /** Optional fix suggestion. */
   hint: z.string().min(1).optional(),
+});
+
+/** A skills root that could not be read, e.g. a project root on an unreachable SSH host. */
+export const AgentSkillUnavailableSourceSchema = z.object({
+  scope: AgentSkillScopeSchema,
+  displayPath: z.string().min(1),
+  message: z.string().min(1),
+});
+
+/**
+ * A skill list is partial by design: it keeps every source that answered and
+ * names each source that did not, so one unreachable root never hides the rest.
+ */
+export const AgentSkillListResultSchema = z.object({
+  skills: z.array(AgentSkillDescriptorSchema),
+  invalidSkills: z.array(AgentSkillIssueSchema),
+  unavailableSources: z.array(AgentSkillUnavailableSourceSchema),
+  /**
+   * Plugin skills whose bare name lost to a higher-precedence skill. Each stays
+   * reachable as `<pluginName>:<name>`. Omitted when empty.
+   */
+  shadowedPluginSkills: z.array(AgentSkillDescriptorSchema).optional(),
+  /** Loaded skills with a non-fatal problem (e.g. a display name). Omitted when empty. */
+  skillWarnings: z.array(AgentSkillIssueSchema).optional(),
 });

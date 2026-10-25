@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import type { KeyboardEventHandler, ReactNode, Ref } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
@@ -20,6 +20,9 @@ interface ChatInputDecorationProps {
    * whose `onToggle` navigates elsewhere instead of expanding inline.
    */
   trailingIcon?: ReactNode;
+  /** Ref and key handler for the expanded content, for decorations with keyboard navigation. */
+  contentRef?: Ref<HTMLDivElement>;
+  onContentKeyDown?: KeyboardEventHandler<HTMLDivElement>;
 }
 
 // Keep collapsible decorations aligned with the chat input gutter so swapping
@@ -42,7 +45,7 @@ export function ChatInputDecoration(props: ChatInputDecorationProps) {
         className={cn(
           // Use a fixed collapsed row height so every decoration reads with the
           // same top/bottom breathing room regardless of icon/text mix.
-          "group flex h-6 items-center gap-2 text-xs leading-none transition-colors",
+          "group mobile-touch-row flex h-6 items-center gap-2 text-xs leading-none transition-colors",
           columnWidthClass,
           props.summaryClassName
         )}
@@ -58,7 +61,13 @@ export function ChatInputDecoration(props: ChatInputDecorationProps) {
         </div>
       </button>
       {props.expanded && props.renderExpanded && (
-        <div className={cn(columnWidthClass, props.contentClassName)}>{props.renderExpanded()}</div>
+        <div
+          ref={props.contentRef}
+          onKeyDown={props.onContentKeyDown}
+          className={cn(columnWidthClass, props.contentClassName)}
+        >
+          {props.renderExpanded()}
+        </div>
       )}
     </div>
   );

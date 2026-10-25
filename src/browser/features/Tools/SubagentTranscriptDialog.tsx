@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import type { DisplayedMessage, MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { ChatMuxMessage } from "@/common/orpc/types";
@@ -14,6 +14,7 @@ import { ErrorBox, LoadingDots } from "./Shared/ToolPrimitives";
 import { MessageRenderer } from "@/browser/features/Messages/MessageRenderer";
 import { ModelDisplay } from "@/browser/features/Messages/ModelDisplay";
 import { BashCollapsedSummaryModeProvider } from "./BashCollapsedSummaryModeContext";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { getErrorMessage } from "@/common/utils/errors";
 
 interface SubagentTranscriptDialogProps {
@@ -54,7 +55,10 @@ export const SubagentTranscriptDialog: React.FC<SubagentTranscriptDialogProps> =
           </DialogTitle>
         </DialogHeader>
 
+        {/* Keyed by the transcript, so another task starts from an empty viewer, while a new API
+            client (a reconnect) only re-runs the viewer's read and keeps the transcript shown. */}
         <SubagentTranscriptViewer
+          key={props.taskId}
           open={props.open}
           workspaceId={props.workspaceId}
           taskId={props.taskId}
@@ -70,8 +74,8 @@ const SubagentTranscriptViewer: React.FC<{
   open: boolean;
   workspaceId?: string;
   taskId: string;
-  setModel?: (model: string | undefined) => void;
-  setThinkingLevel?: (thinkingLevel: ThinkingLevel | undefined) => void;
+  setModel: (model: string | undefined) => void;
+  setThinkingLevel: (thinkingLevel: ThinkingLevel | undefined) => void;
 }> = (props) => {
   const { api } = useAPI();
 
@@ -81,9 +85,19 @@ const SubagentTranscriptViewer: React.FC<{
   const setModel = props.setModel;
   const setThinkingLevel = props.setThinkingLevel;
 
-  const [isLoading, setIsLoading] = useState(false);
+  // Loading until the first read lands: a fresh viewer (another task, or the dialog reopened)
+  // starts empty, and a new API client keeps what the viewer shows.
+  const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [messages, setMessages] = useState<MuxMessage[] | null>(null);
+  // True once a transcript is on screen: a re-read (a new API client) then keeps it shown.
+  const hasTranscriptRef = useRef(false);
+
+  // The header's model and thinking level belong to the transcript this viewer shows.
+  useEffect(() => {
+    setModel(undefined);
+    setThinkingLevel(undefined);
+  }, [setModel, setThinkingLevel]);
 
   useEffect(() => {
     // TaskToolCall renders this dialog component for each completed task even while closed.
@@ -92,16 +106,18 @@ const SubagentTranscriptViewer: React.FC<{
       return;
     }
 
-    setIsLoading(true);
     setError(null);
-    setMessages(null);
-    setModel?.(undefined);
-    setThinkingLevel?.(undefined);
 
     if (!api) {
       setIsLoading(false);
       setError("API unavailable");
       return;
+    }
+
+    // Without a transcript on screen, show the loading state (the dialog may have opened while
+    // there was no client).
+    if (!hasTranscriptRef.current) {
+      setIsLoading(true);
     }
 
     let cancelled = false;
@@ -116,11 +132,14 @@ const SubagentTranscriptViewer: React.FC<{
         if (cancelled) return;
 
         setMessages(transcript.messages);
-        setModel?.(transcript.model);
-        setThinkingLevel?.(transcript.thinkingLevel);
+        setModel(transcript.model);
+        setThinkingLevel(transcript.thinkingLevel);
         setIsLoading(false);
+        hasTranscriptRef.current = true;
       } catch (err: unknown) {
-        if (cancelled) return;
+        // A lost connection (or this effect's own cleanup) is not a transcript error: keep what
+        // is shown for the next client.
+        if (cancelled || isConnectionLostError(err)) return;
         setIsLoading(false);
         setError(getErrorMessage(err));
       }

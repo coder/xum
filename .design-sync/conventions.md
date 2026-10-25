@@ -20,7 +20,7 @@ import { ThemeProvider } from "<this design system>";
 
 Data-driven components (anything that reads workspaces, settings, providers, etc.)
 also expect Mux's context providers — `APIProvider`, `SettingsProvider`,
-`PolicyProvider`, `ProjectProvider`, `RouterProvider` (all bundle exports). Wrap
+`ProjectProvider`, `RouterProvider` (all bundle exports). Wrap
 once near the root; leaf/presentational components (banners, tool-call cards,
 badges) need only `ThemeProvider`.
 

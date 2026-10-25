@@ -1,3 +1,4 @@
+import type { StreamStopCause } from "@/common/types/streamStopCause";
 import type { ModelMessage, UIMessage } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import type { StreamErrorType } from "./errors";
@@ -7,14 +8,21 @@ import type {
   ContextBoundaryKind,
   PersistedContextBoundaryKind,
 } from "@/common/constants/contextBoundary";
-import type { GoalSyntheticMessageKind } from "@/constants/goals";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { z } from "zod";
 import type { AgentMode } from "./mode";
 import type { AgentSkillScope } from "./agentSkill";
+import type {
+  AgentMessageRelationship,
+  AgentPeerMessageMeta,
+} from "@/common/utils/agentMessageEnvelope";
 import type { ThinkingLevel } from "./thinking";
+import type { AutoModelRoutingRecord } from "./autoModelRouting";
 import { type ReviewNoteData, formatReviewForModel } from "./review";
 import { isMcpPromptCommandKey } from "@/common/utils/tools/mcpPromptCommandKey";
+import type { PlanReviewRecordKind } from "@/common/utils/planReview/planReviewRecord";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 
 export type { ModelMessage };
 
@@ -54,11 +62,12 @@ type PreservedSendOptions = Pick<
   SendMessageOptions,
   | "thinkingLevel"
   | "reasoningMode"
+  | "serviceTier"
   | "additionalSystemInstructions"
   | "providerOptions"
-  | "experiments"
   | "disableWorkspaceAgents"
-  | "allowAgentSetGoal"
+  | "toolPolicy"
+  | "strictAgentResolution"
   | "skipAiSettingsPersistence"
 >;
 
@@ -67,15 +76,32 @@ type PreservedSendOptions = Pick<
  * Use this helper to avoid duplicating the field list when building CompactionFollowUpRequest.
  */
 export function pickPreservedSendOptions(options: SendMessageOptions): PreservedSendOptions {
+  // Unset fields are OMITTED, not emitted as explicit undefined: compaction recovery spreads
+  // this pick over an already-persisted follow-up, and an undefined key would clobber the
+  // original preserved value (e.g. a restricted turn's toolPolicy) instead of leaving it.
   return {
-    thinkingLevel: options.thinkingLevel,
-    reasoningMode: options.reasoningMode,
-    additionalSystemInstructions: options.additionalSystemInstructions,
-    providerOptions: options.providerOptions,
-    experiments: options.experiments,
-    disableWorkspaceAgents: options.disableWorkspaceAgents,
-    allowAgentSetGoal: options.allowAgentSetGoal,
-    skipAiSettingsPersistence: options.skipAiSettingsPersistence,
+    ...(options.thinkingLevel !== undefined ? { thinkingLevel: options.thinkingLevel } : {}),
+    ...(options.reasoningMode !== undefined ? { reasoningMode: options.reasoningMode } : {}),
+    ...(options.serviceTier !== undefined ? { serviceTier: options.serviceTier } : {}),
+    ...(options.additionalSystemInstructions !== undefined
+      ? { additionalSystemInstructions: options.additionalSystemInstructions }
+      : {}),
+    ...(options.providerOptions !== undefined ? { providerOptions: options.providerOptions } : {}),
+    ...(options.disableWorkspaceAgents !== undefined
+      ? { disableWorkspaceAgents: options.disableWorkspaceAgents }
+      : {}),
+    // Security: a restricted turn (including a terminal-wake send restoring the caller's
+    // policy) that triggers on-send compaction must not redispatch its follow-up allow-all.
+    ...(options.toolPolicy !== undefined ? { toolPolicy: options.toolPolicy } : {}),
+    // Delegated turns with explicit agent overrides must stay loud across the
+    // compaction replay too — dropping this would let the follow-up silently
+    // fall back to exec if the agent vanished in the meantime.
+    ...(options.strictAgentResolution !== undefined
+      ? { strictAgentResolution: options.strictAgentResolution }
+      : {}),
+    ...(options.skipAiSettingsPersistence !== undefined
+      ? { skipAiSettingsPersistence: options.skipAiSettingsPersistence }
+      : {}),
   };
 }
 
@@ -85,20 +111,37 @@ export type StartupRetrySendOptions = Pick<
   | "agentId"
   | "thinkingLevel"
   | "reasoningMode"
+  | "serviceTier"
   | "toolPolicy"
   | "additionalSystemInstructions"
   | "maxOutputTokens"
   | "providerOptions"
-  | "experiments"
   | "disableWorkspaceAgents"
-  | "allowAgentSetGoal"
+  | "strictAgentResolution"
 > & {
-  /** Correlation for a delegated workspace turn that must survive restart recovery. */
-  muxMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /**
+   * Correlation metadata that must survive restart recovery: delegated
+   * workspace turns and interrupted compaction requests. A resumed compaction
+   * stream needs its original metadata so trailing synthetic rows cannot break
+   * compaction detection (resolveCompactionRequest only skips synthetic rows
+   * when the stream itself identifies as a compaction request).
+   */
+  muxMetadata?:
+    | Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>
+    | Extract<MuxMessageMetadata, { type: "compaction-request" }>;
   /** Internal-only Copilot billing override for startup auto-retry. */
   agentInitiated?: boolean;
   /** Internal goal continuation classification for startup auto-retry accounting. */
   goalKind?: GoalSyntheticMessageKind;
+  /**
+   * Goal identity matching `goalKind`. Not persisted by
+   * pickStartupRetrySendOptions (the user row's own metadata.goalId is the
+   * durable copy); startup recovery re-derives it so resumed streams keep
+   * goal-scoped compaction follow-ups (Codex P2 PRRT_kwDOPxxmWM6cIv2E).
+   */
+  goalId?: string;
+  /** Automatic sub-agent turn provenance (see TaskTurnKind); resumed turns keep it. */
+  taskTurnKind?: TaskTurnKind;
 };
 
 /**
@@ -108,7 +151,8 @@ export type StartupRetrySendOptions = Pick<
 export function pickStartupRetrySendOptions(
   options: SendMessageOptions,
   agentInitiated?: boolean,
-  goalKind?: GoalSyntheticMessageKind
+  goalKind?: GoalSyntheticMessageKind,
+  taskTurnKind?: TaskTurnKind
 ): StartupRetrySendOptions {
   const typedMuxMetadata = options.muxMetadata as MuxMessageMetadata | undefined;
   const workspaceTurnMuxMetadata =
@@ -118,16 +162,18 @@ export function pickStartupRetrySendOptions(
     agentId: options.agentId,
     thinkingLevel: options.thinkingLevel,
     reasoningMode: options.reasoningMode,
+    serviceTier: options.serviceTier,
     toolPolicy: options.toolPolicy,
     additionalSystemInstructions: options.additionalSystemInstructions,
     maxOutputTokens: options.maxOutputTokens,
     providerOptions: options.providerOptions,
-    experiments: options.experiments,
     disableWorkspaceAgents: options.disableWorkspaceAgents,
-    allowAgentSetGoal: options.allowAgentSetGoal,
+    // Keep explicit-agent turns loud across restart recovery (see pickPreservedSendOptions).
+    strictAgentResolution: options.strictAgentResolution,
     ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     ...(agentInitiated === true ? { agentInitiated: true } : {}),
     ...(goalKind != null ? { goalKind } : {}),
+    ...(taskTurnKind != null ? { taskTurnKind } : {}),
   };
 }
 
@@ -160,6 +206,18 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
   agentInitiated?: boolean;
   /** Internal goal continuation classification for synthetic follow-up accounting. */
   goalKind?: GoalSyntheticMessageKind;
+  /**
+   * Goal identity matching `goalKind`. Preserved through compaction so the
+   * re-dispatched follow-up row stays goal-scoped for chat-tail
+   * reconciliation instead of degrading to a legacy unscoped row (Codex P2
+   * PRRT_kwDOPxxmWM6cIv2E).
+   */
+  goalId?: string;
+  /**
+   * Automatic sub-agent turn provenance (see TaskTurnKind). Preserved through compaction so
+   * the re-dispatched follow-up is still classified (and set_goal-gated) as that task turn.
+   */
+  taskTurnKind?: TaskTurnKind;
   /** Internal dispatch guardrails for crash-safe follow-up recovery. */
   dispatchOptions?: CompactionFollowUpDispatchOptions;
   /**
@@ -171,6 +229,18 @@ export interface CompactionFollowUpRequest extends CompactionFollowUpInput, Pres
    * AgentSession.inheritOpenWorkspaceTurnMetadata).
    */
   workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+  /**
+   * Auto routing decision made for the diverted send. The redispatched turn
+   * persists it instead of classifying (and billing) again.
+   */
+  autoModelRouting?: AutoModelRoutingRecord;
+  /**
+   * The diverted send already ran the message.send prompt hooks: the redispatch must not run them
+   * a second time. Only Xum sets it (stripClientPluginSendHookFields drops a client's).
+   */
+  pluginSendHooksApplied?: true;
+  /** The diverted send's prompt-hook context, restored on the redispatched user row. */
+  pluginHookContext?: PluginHookContextEntry[];
 }
 
 /**
@@ -480,10 +550,51 @@ export interface TranscriptAnchor {
   partIndex: number;
 }
 
+/**
+ * A message sent from an agent-written artifact (Artifacts M5b): `window.xum.send` or a canvas
+ * button, sent by the user's click in the artifact or confirmed in the host-owned strip. Only the backend sets it (generic sends
+ * refuse it), so the "from artifact" label cannot be faked by typing the model-facing tag.
+ */
+export interface ArtifactInteractionMetadata {
+  /** Pending-record id; replay skips ids already in history. */
+  id: string;
+  /** POSIX path relative to $XUM_SCRATCH_DIR/artifacts. */
+  artifactPath: string;
+  title: string;
+  /** Artifact version the user interacted with (0 when the file had no stored version). */
+  version: number;
+  action: "send";
+  text: string;
+  /** Optional JSON payload from the artifact. */
+  data?: unknown;
+}
+
+/** Answers to a non-blocking ask_user_question, delivered as a user message. */
+export interface AskUserQuestionAnswerMetadata {
+  toolCallId: string;
+  /** Keyed by question text; an empty string means the user skipped that question. */
+  answers: Record<string, string>;
+}
+
 /** Base fields common to all metadata types */
 interface MuxMessageMetadataBase {
+  /** Correlates a rollover continuation without replacing its original attribution. */
+  rolloverId?: string;
   /** Structured review data for rich UI display (orthogonal to message type) */
   reviews?: ReviewNoteDataForDisplay[];
+  /** Set by the backend only: this user message came from an artifact (Artifacts M5b). */
+  artifactInteraction?: ArtifactInteractionMetadata;
+  /**
+   * Set by the question card: this user message delivers the answers to a non-blocking
+   * ask_user_question (answerDelivery "message"). A display hint only, like Codex dropping a
+   * pending question once its reply is in history: the card shows these answers instead of the
+   * form. Nothing gates on it, so a missing or forged value only changes which card looks open.
+   *
+   * One answered call is an object (the only shape older builds read). The dock's chained form
+   * answers several open calls in one message and sends an array, one entry per call; an older
+   * build drops the array as malformed and keeps showing those calls as open (display-only).
+   */
+  askUserQuestionAnswer?: AskUserQuestionAnswerMetadata | AskUserQuestionAnswerMetadata[];
   /** Command prefix to highlight in UI (e.g., "/compact -m sonnet" or "/react-effects") */
   commandPrefix?: string;
   /**
@@ -503,6 +614,8 @@ interface MuxMessageMetadataBase {
    */
   agentSkillRefs?: AgentSkillReference[];
   mcpPromptRefs?: MCPPromptReference[];
+  /** Internal budget control turn; retains delegation metadata without a human prompt bubble. */
+  contextBudgetContinuation?: true;
   /** Display-only insertion point within an assistant message that was streaming. */
   transcriptAnchor?: TranscriptAnchor;
 }
@@ -512,6 +625,8 @@ export interface DisplayStatus {
   emoji: string;
   message: string;
 }
+
+export type BashMonitorFailedOperation = "readOutput" | "getExitCode";
 
 /**
  * Compact per-record summary attached to bash monitor wake turns so the
@@ -524,13 +639,59 @@ export interface BashMonitorWakeDisplayRecord {
   /** Persisted wake snapshot version; paired with processId for accepted-delivery recovery. */
   wakeUpdatedAt?: string;
   kind: "match" | "monitor-lost";
+  /** Missing on legacy monitor-lost records, which represent restart losses. */
+  lostReason?: "restart" | "runtime-failure";
   displayName: string;
   filter: string;
   filterExclude: boolean;
+  /**
+   * Present when the wake reported process settlement (exit, kill, timeout). "unknown" is the
+   * backend's read-time degrade of malformed persisted metadata — still a settlement for
+   * display.
+   */
+  terminal?: { status: "exited" | "killed" | "failed" | "unknown"; exitCode?: number };
+  /**
+   * Present when the wake carries a dead earlier generation's settlement whose processId was
+   * re-armed by a new live process — still a settlement for display, never "monitor matched".
+   */
+  staleTerminal?: { status: "exited" | "killed" | "failed" | "unknown"; exitCode?: number };
 }
 
 export type MuxMessageMetadata = MuxMessageMetadataBase &
   (
+    | {
+        type: "context-window-rollover";
+        rolloverId: string;
+        reason: "on-send" | "mid-stream" | "context-exceeded";
+        /**
+         * Set when the model asked for this window with new_context. Kept out of `reason` so a
+         * downgraded release still parses the row as an ordinary rollover (not a privacy reset).
+         */
+        requestedBy?: "model";
+        previousWindowId: string;
+        flushOpportunity: boolean;
+        contextTokens: number;
+        maxTokens: number;
+      }
+    | {
+        type: "context-window-continuation";
+        rolloverId: string;
+      }
+    | {
+        type: "context-window-lead-in";
+        rolloverId: string;
+      }
+    | {
+        type: "context-budget-warning";
+        contextTokens: number;
+        maxTokens: number;
+        budgetTokens: number;
+        /** Final pre-rollover flush prompt (absent on the advance warning). */
+        final?: true;
+        /** Agent-led handoff request; old builds can still display it as a warning. */
+        handoff?: true;
+        handoffTokens?: number;
+      }
     | {
         type: "compaction-request";
         rawCommand: string; // The original /compact command as typed by user (for display)
@@ -542,11 +703,22 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
          * - auto-compaction: threshold-triggered compaction (on-send / mid-stream)
          */
         source?: "idle-compaction" | "auto-compaction";
+        /**
+         * RLM keep-recent floor (rlm-mode experiment): history rows at or after
+         * this historySequence are excluded from the summarization request and
+         * preserved verbatim (re-appended after the boundary) instead of being
+         * summarized. Stamped at request-persist time so live assembly,
+         * compaction completion, and replay all derive the same tail from
+         * durable rows. Absent when RLM is off — behavior is then unchanged.
+         */
+        keepRecentTail?: { startHistorySequence: number };
         /** Transient status to display in sidebar during this operation */
         displayStatus?: DisplayStatus;
       }
     | {
         type: "compaction-summary";
+        /** Distinguishes eager prefix compaction from the existing full compaction flow. */
+        strategy?: "continuous";
         /**
          * Follow-up content to dispatch after compaction completes.
          * Stored on the summary so it survives crashes - the user message
@@ -577,14 +749,59 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
       }
     | {
         // Synthetic wake-up appended when background bash monitors match output or
-        // are lost to a Shux restart. The full prompt stays in the message text for
+        // are lost to a Xum restart. The full prompt stays in the message text for
         // the model; this metadata lets the transcript render the compact card.
         type: "bash-monitor-wake";
         /** One entry per wake record in the prompt, in prompt order. */
         records: BashMonitorWakeDisplayRecord[];
+        /**
+         * Present when the wake reactivates an inactive sub-agent (reported or interrupted,
+         * no live continuation): the fresh parent-owned continuation the woken turn runs
+         * under. The row keeps its wake type, which the wake reconciler reads as proof of
+         * delivery, so the turn correlation rides here instead of on a separate
+         * workspace-turn-task row.
+         */
+        workspaceTurn?: WorkspaceTurnTaskCorrelation;
       }
     | {
         type: "goal-pause-boundary";
+        /**
+         * Goal this boundary pauses. Chat-tail reconciliation ignores
+         * boundaries stamped for a different goal so a stale pause finalizer
+         * racing a replacement cannot silently pause the newer goal (Codex P2
+         * PRRT_kwDOPxxmWM6cEl4F). Optional for legacy rows, which keep the
+         * old any-goal semantics.
+         */
+        goalId?: string;
+      }
+    | {
+        // Durable, provider-visible summary of an abandoned history branch
+        // (rlm-mode experiment): appended after a fork-from-message or an
+        // edit-resend truncation so the new branch retains context from the
+        // discarded tail. The labeled summary stays in the message text for
+        // the model; this marker identifies the row for UI/tests.
+        type: "branch-summary";
+      }
+    | {
+        // Durable summary of a completed /refine pass (rlm-mode experiment):
+        // lists each applied self-modification with its refinement journal id
+        // so users can audit and roll edits back (r6). The labeled summary
+        // stays in the message text; this marker identifies the row for
+        // UI/tests.
+        type: "refine-summary";
+        /**
+         * Staged-mode proposals only: sha256 over the canonical staged-edit
+         * set rendered in this row. /refine apply verifies refine-staged.json
+         * still hashes to this value, binding approval to the displayed bytes.
+         */
+        stagedSetHash?: string;
+      }
+    | {
+        // Child-controlled family-message payload (task_message_parent),
+        // stored as an ASSISTANT-role synthetic row so prompt-injected child
+        // output never gains user-priority trust; a separate fixed-content
+        // user trigger row (no child bytes) wakes the parent turn.
+        type: "family-message";
       }
     | {
         type: "heartbeat-request";
@@ -634,8 +851,117 @@ export type MuxMessageMetadata = MuxMessageMetadataBase &
         taskHandleId: string;
         ownerWorkspaceId: string;
         turnId: string;
+        /**
+         * Peer attribution for a peer-message wake trigger that must carry the delegated turn's
+         * correlation (stream-end settlement reads this variant's type). Carrying the full
+         * attribution — not just a flag — lets correlation stripping downgrade the row to plain
+         * peer metadata, so the UI keeps rendering it as a machine notification, never as a
+         * human prompt.
+         */
+        agentPeerMessageTrigger?: AgentPeerMessageMeta;
+      }
+    | {
+        // Intra-tree agent peer message (sibling/cousin or descendant→ancestor task_send_message).
+        // The <mux_agent_message> envelope stays in the message text for the model; this metadata
+        // drives the compact transcript card and queue-entry counting without re-parsing it.
+        type: "agent-peer-message";
+        /** Sender's tree target id — the reply address for task_send_message. */
+        fromWorkspaceId: string;
+        fromTitle?: string;
+        /** The sender's relationship to the recipient (mirrors the envelope enum). */
+        relationship: AgentMessageRelationship;
+        /** Trigger rows only: history ID of the payload row (see AgentPeerMessageMeta). */
+        payloadMessageId?: string;
+      }
+    | {
+        // Native plan review record (src/common/utils/planReview). The <mux_plan_review>
+        // envelope stays in the message text; this metadata mirrors the record identity so
+        // filters and the UI never re-parse it. `feedback` rows are real user messages the
+        // model receives; every other kind is hidden UI state (see isPlanReviewRecordMessage).
+        type: "plan-review";
+        kind: PlanReviewRecordKind;
+        recordId: string;
+        snapshotId?: string;
+        threadId?: string;
+        feedbackId?: string;
       }
   );
+
+/** Rollover internals do not make an otherwise empty window eligible for another reset. */
+export function isTokenBudgetInternalMessage(message: MuxMessage): boolean {
+  const type = message.metadata?.muxMetadata?.type;
+  return (
+    type === "context-window-lead-in" ||
+    type === "context-budget-warning" ||
+    (message.metadata?.synthetic === true &&
+      message.metadata.muxMetadata?.contextBudgetContinuation === true)
+  );
+}
+
+/** Token Budget warning rows are advisory notices, never a turn's trigger or request. */
+export function isContextBudgetWarningMessage(message: MuxMessage): boolean {
+  return message.metadata?.muxMetadata?.type === "context-budget-warning";
+}
+
+export function isRolloverBoundary(message: MuxMessage): boolean {
+  return (
+    message.metadata?.contextBoundaryKind === "reset" &&
+    message.metadata.muxMetadata?.type === "context-window-rollover"
+  );
+}
+
+/** Correlation identifying which delegated workspace turn a stream belongs to. */
+export interface WorkspaceTurnTaskCorrelation {
+  taskHandleId: string;
+  ownerWorkspaceId: string;
+  turnId: string;
+}
+
+/**
+ * Parse untyped muxMetadata (from persisted history or live stream info) into a
+ * workspace-turn correlation. Returns null unless the value is a well-formed
+ * "workspace-turn-task" marker, or a "bash-monitor-wake" marker carrying one (a wake
+ * that reactivated an inactive sub-agent). Callers use this to attribute a workspace's
+ * active stream to a specific delegated turn (e.g. archive interruption must not stop a
+ * user stream that replaced an ended delegated stream).
+ */
+export function parseWorkspaceTurnTaskCorrelation(
+  muxMetadata: unknown
+): WorkspaceTurnTaskCorrelation | null {
+  if (typeof muxMetadata !== "object" || muxMetadata == null || Array.isArray(muxMetadata)) {
+    return null;
+  }
+  const marker = muxMetadata as Record<string, unknown>;
+  const source =
+    marker.type === "workspace-turn-task"
+      ? marker
+      : marker.type === "bash-monitor-wake"
+        ? marker.workspaceTurn
+        : null;
+  if (typeof source !== "object" || source == null || Array.isArray(source)) {
+    return null;
+  }
+  const data = source as Record<string, unknown>;
+  const taskHandleId = typeof data.taskHandleId === "string" ? data.taskHandleId.trim() : "";
+  const ownerWorkspaceId =
+    typeof data.ownerWorkspaceId === "string" ? data.ownerWorkspaceId.trim() : "";
+  const turnId = typeof data.turnId === "string" ? data.turnId.trim() : "";
+  if (taskHandleId.length === 0 || ownerWorkspaceId.length === 0 || turnId.length === 0) {
+    return null;
+  }
+  return { taskHandleId, ownerWorkspaceId, turnId };
+}
+
+export function isSameWorkspaceTurnTaskCorrelation(
+  first: WorkspaceTurnTaskCorrelation,
+  second: WorkspaceTurnTaskCorrelation
+): boolean {
+  return (
+    first.taskHandleId === second.taskHandleId &&
+    first.ownerWorkspaceId === second.ownerWorkspaceId &&
+    first.turnId === second.turnId
+  );
+}
 
 export function getCompactionFollowUpContent(
   metadata?: MuxMessageMetadata
@@ -680,24 +1006,79 @@ export interface PersistedToolModelUsage {
 }
 
 /**
+ * PersistedToolModelUsage.toolName marker for a refused fallback attempt.
+ * Analytics keys on this exact string (events.tool_name), the sidecar flatten
+ * path uses it to relabel refusal usage as "refused_stream", and the session
+ * ledger rebuild uses it to skip zero-usage refusal markers (which exist only
+ * so analytics can count refused attempts, never as ledger entries).
+ */
+export const MODEL_FALLBACK_REFUSAL_TOOL_NAME = "model_fallback_refusal";
+
+/** True when any token counter on the usage payload is positive. */
+export function hasTokenUsage(
+  usage: LanguageModelV2Usage | undefined
+): usage is LanguageModelV2Usage {
+  return (
+    usage !== undefined &&
+    ((usage.inputTokens ?? 0) > 0 ||
+      (usage.outputTokens ?? 0) > 0 ||
+      (usage.totalTokens ?? 0) > 0 ||
+      (usage.cachedInputTokens ?? 0) > 0 ||
+      (usage.reasoningTokens ?? 0) > 0)
+  );
+}
+
+/** One plugin's message.send context for a user row (see MuxMetadata.pluginHookContext). */
+export interface PluginHookContextEntry {
+  pluginId: string;
+  text: string;
+}
+
+/**
  * Record of a model-fallback chain application. `requestedModel` is the model
  * originally asked for; `refusedModels` lists every model that refused, in
  * chain order (the requested model is always the first entry). The effective
  * (answering) model is recorded separately as the message's `model`.
  */
+/** MuxMetadata.volatileSystemTail: where a turn sent the volatile system tail, and its text. */
+export interface VolatileSystemTailRecord {
+  text: string;
+  placement: "system" | "row";
+}
+
+/** A turn's system-section records (prompt-cache mechanism 10), as its assistant row holds them. */
+export const SYSTEM_SECTION_RECORD_FIELDS = [
+  "volatileSystemTail",
+  "customInstructions",
+  "skillIndex",
+  "toolInstructions",
+] as const;
+export type SystemSectionRecords = Pick<MuxMetadata, (typeof SYSTEM_SECTION_RECORD_FIELDS)[number]>;
+
 export interface ModelFallbackRecord {
   requestedModel: string;
   refusedModels: string[];
 }
 
+export interface ContextBudgetRejectedMessage {
+  role: "user" | "assistant";
+  parts: MuxMessage["parts"];
+  metadata?: Omit<MuxMetadata, "contextBudgetRejectedMessage">;
+}
+
 // Our custom metadata type
 export interface MuxMetadata {
+  /** Stop replaced by this durably accepted row; its enclosing id/sequence identify the receipt. */
+  compactionReplacementNonce?: string;
   /** Highest persisted history sequence included in the provider request that produced this assistant. */
   requestHistorySequence?: number;
   historySequence?: number; // Assigned by backend for global message ordering (required when writing to history)
+  /** Provider step boundaries in parts, persisted so continuous compaction can keep complete steps. */
+  stepStartPartIndices?: number[];
   duration?: number;
   ttftMs?: number; // Time-to-first-token measured from stream start; omitted when unavailable
   finishReason?: string; // Provider/model finish reason for the final step (e.g. stop, length)
+  stopCause?: StreamStopCause;
   /** @deprecated Legacy base mode derived from agent definition. */
   mode?: AgentMode;
   timestamp?: number;
@@ -706,12 +1087,10 @@ export interface MuxMetadata {
   metadataModel?: string;
   /** Effective thinking/reasoning level used for this response (after model policy clamping). */
   thinkingLevel?: ThinkingLevel;
-  /** @deprecated Legacy gateway flag; prefer routeProvider for source attribution. */
-  routedThroughGateway?: boolean;
   routeProvider?: string;
   /**
-   * True when usage costs are included in a subscription (e.g., ChatGPT subscription routing).
-   * Token counts are still tracked, but the UI should display costs as $0.
+   * Legacy marker for usage that the app classified as subscription-covered.
+   * The UI preserves token counts and $0 costs for these historical records.
    */
   costsIncluded?: boolean;
   // Total usage across all steps (for cost calculation)
@@ -729,11 +1108,81 @@ export interface MuxMetadata {
    * order. Refused-attempt token usage is attributed via toolModelUsages.
    */
   modelFallback?: ModelFallbackRecord;
+  /** Present when the composer's Auto entry classified this turn's difficulty. */
+  autoModelRouting?: AutoModelRoutingRecord;
+  /**
+   * Receipt of an Anthropic thinking strip: a request of this turn sent earlier thinking
+   * without its blocks (signature repair, in-turn prefix change, or server-tool containment).
+   * Preserved thinking binds each block to its prefix, and putting removed blocks back
+   * invalidates every later block, so request building keeps the removed blocks out until the
+   * next compaction or reset boundary. Where the strip ends: anthropicThinkingReplayFromStep.
+   */
+  anthropicThinkingReplay?: "off";
+  /**
+   * Where the receipt's strip ends, so later requests keep the thinking the turn kept sending
+   * (prompt-cache prefix, mechanism 11). A number is a step of THIS row (an index into
+   * stepStartPartIndices): earlier rows and this row's earlier steps lose their Anthropic
+   * thinking, this step and later keep it. "end": this row loses all of it (#5887 server
+   * tool). Rows after this one keep theirs. Absent (older builds): every row of the segment
+   * loses it.
+   */
+  anthropicThinkingReplayFromStep?: number | "end";
+  /**
+   * The volatile system-prompt tail (MCP warning, context-window ids) this
+   * turn's request sent (prompt-cache mechanism 10). "system": at the end of the system
+   * prompt, where it stays frozen for the rest of the context segment. "row": as a
+   * mid-conversation system row right before this row, because the tail changed inside the
+   * segment. See src/node/utils/messages/volatileSystemTail.ts.
+   */
+  volatileSystemTail?: VolatileSystemTailRecord;
+  /**
+   * The `<custom-instructions>` block (AGENTS.md files, project instructions) this turn's
+   * request sent, with the same rule as volatileSystemTail: "system" freezes it in the cached
+   * system prompt for the rest of the segment, "row" sent a changed block as a system row
+   * right before this row. Without it an AGENTS.md change rewrote the whole cached history.
+   */
+  customInstructions?: VolatileSystemTailRecord;
+  /**
+   * The "Available skills" index of the agent_skill_read tool description this turn's request
+   * sent, with the same rule: "system" freezes it in the cached tool block for the segment,
+   * "row" sent a changed index as a system row right before this row.
+   */
+  skillIndex?: VolatileSystemTailRecord;
+  /**
+   * The `Tool: <name>` instructions the tool descriptions of this turn's request sent (text: the
+   * JSON map of tool to instructions, "" for none), with the same rule as skillIndex.
+   */
+  toolInstructions?: VolatileSystemTailRecord;
   // Last step's provider metadata (for context window cache display)
   contextProviderMetadata?: Record<string, unknown>;
   systemMessageTokens?: number; // Token count for system message sent with this request (calculated by AIService)
   partial?: boolean; // Whether this message was interrupted and is incomplete
+  /**
+   * partial.json only, never a chat.jsonl row: the provider finished this turn but its final
+   * history write failed, so the kept partial is a completed reply, not an interrupted one
+   * (#5322). Read it through isStreamFinalizedPartial.
+   */
+  streamFinalized?: boolean;
   synthetic?: boolean; // Whether this message was synthetically generated (e.g., [CONTINUE] sentinel)
+  /**
+   * For queue-dispatched user turns: when the user last added to the queued
+   * entry. The row `timestamp` is stamped at dispatch (after the blocking turn
+   * ends), so goal safety needs this to durably tell messages typed before a
+   * mid-turn goal existed from genuine interventions against a visible goal.
+   */
+  enqueuedAtMs?: number;
+  /**
+   * Ids of the sends this row accepted (idempotent sends): one per send, several for a queued
+   * batch. A row on disk is the only evidence that a send was accepted, so the history write
+   * path refuses to append a second row for an id listed here (see sendIds.ts).
+   */
+  sendIds?: string[];
+  /**
+   * Per send id: a digest of the submitted payload, fixed when the id was first assigned. A
+   * retry under a known id with a different digest is a conflict, not a duplicate. A joined
+   * batch row cannot recover each payload, hence one digest per id.
+   */
+  sendDigests?: Record<string, string>;
   /**
    * UI hint: show in the chat UI even when synthetic.
    *
@@ -741,6 +1190,12 @@ export interface MuxMetadata {
    * Set this flag for synthetic notices that should be visible to users.
    */
   uiVisible?: boolean;
+  /** Display-only input rejected by the token-budget gate before provider submission. */
+  contextBudgetRejected?: true;
+  /** Inert original content for transcript display only; never restore it for provider requests. */
+  contextBudgetRejectedMessage?: ContextBudgetRejectedMessage;
+  /** Accepted snapshots and assistant payloads that must travel with this turn on retry. */
+  requestPreludeMessageIds?: string[];
   /** Display-only insertion point within an assistant message that was streaming. */
   transcriptAnchor?: TranscriptAnchor;
   error?: string; // Error message if stream failed
@@ -761,6 +1216,10 @@ export interface MuxMetadata {
    * This lets downstream logic identify compaction boundaries without mutating history.
    */
   compactionBoundary?: boolean;
+  /** Exact composed publication occurrence, shared with the pending file writeId. */
+  compactionPublicationId?: string;
+  /** Captured generation of this publication; legacy rewrites must not inherit it. */
+  compactionPublicationGeneration?: string | null;
   /** Durable provider-context boundary kind. Existing compaction rows are also boundaries via compactionBoundary. */
   contextBoundaryKind?: PersistedContextBoundaryKind;
   toolPolicy?: ToolPolicy; // Tool policy active when this message was sent (user messages only)
@@ -772,12 +1231,42 @@ export interface MuxMetadata {
   muxMetadata?: MuxMessageMetadata; // Command metadata used by both frontend and backend message flows
   /** Persisted discriminator for synthetic user turns created by the active-goal loop. */
   kind?: "goal_continuation" | "goal_budget_limit";
+  /**
+   * Goal identity for `kind` rows. Chat-tail reconciliation only accepts a
+   * continuation row as "goal is active" evidence when it was dispatched for
+   * the goal being reconciled — a replaced goal's continuation must not
+   * reactivate its successor (Codex P2 PRRT_kwDOPxxmWM6cH3kV). Legacy rows
+   * without a goalId keep the old any-goal semantics.
+   */
+  goalId?: string;
+  /**
+   * Automatic sub-agent turn provenance (see TaskTurnKind), stamped by TaskService sends.
+   * Separate from `kind` because a task turn is not a goal-loop row for chat-tail
+   * reconciliation.
+   */
+  taskTurnKind?: TaskTurnKind;
+  /**
+   * Context that message.send prompt hooks (Codex UserPromptSubmit `additionalContext`) added
+   * for this user row. Request building renders it into this message's content
+   * (renderPluginHookContextForProvider), never into the system prompt, so the cached prefix
+   * stays stable and later turns keep it. Not shown in the user's bubble.
+   */
+  pluginHookContext?: PluginHookContextEntry[];
 
   /**
    * ACP-only correlation id propagated through stream events so prompt() can
    * match terminal events to the originating ACP request in shared workspaces.
    */
   acpPromptId?: string;
+
+  /**
+   * RLM keep-recent floor: marks a sanitized copy of a pre-compaction message
+   * re-appended after its compaction boundary so the model keeps the recent
+   * tail verbatim. Copies are synthetic (UI-hidden — the originals remain
+   * visible above the boundary) and carry no usage/cost metadata so session
+   * usage rebuilds never double-count them.
+   */
+  rlmPreservedTailCopy?: boolean;
 
   /**
    * @file mention snapshot token(s) this message provides content for.
@@ -835,16 +1324,23 @@ export interface MuxReasoningPart {
    */
   signature?: string;
   /**
-   * Provider options for SDK compatibility.
-   * When converting to ModelMessages via the SDK's convertToModelMessages,
-   * this is passed through so reasoning can be replayed:
+   * Persisted replay data for reasoning parts. The SDK's convertToModelMessages
+   * only reads `providerMetadata` from UI parts, so attachReasoningReplayMetadata
+   * mirrors this field there at request time so reasoning can be replayed:
    * - Anthropic: { anthropic: { signature } }
    * - OpenAI/xAI Responses (esp. store=false/ZDR): itemId + reasoningEncryptedContent
    *   so the next turn can restore encrypted reasoning without server-side storage.
+   * - Google: { google: { thoughtSignature } }
+   * - Google Vertex AI: { googleVertex: { thoughtSignature } }
    */
   providerOptions?: {
     anthropic?: {
       signature?: string;
+      /**
+       * Anthropic `redacted_thinking` data. The SDK replays the part as a
+       * redacted_thinking block when there is no signature.
+       */
+      redactedData?: string;
     };
     openai?: {
       itemId?: string;
@@ -853,6 +1349,12 @@ export interface MuxReasoningPart {
     xai?: {
       itemId?: string;
       reasoningEncryptedContent?: string | null;
+    };
+    google?: {
+      thoughtSignature?: string;
+    };
+    googleVertex?: {
+      thoughtSignature?: string;
     };
   };
 }
@@ -863,9 +1365,17 @@ export interface MuxFilePart {
   mediaType: string; // IANA media type, e.g., "image/png", "application/pdf"
   url: string; // Data URL (e.g., "data:application/pdf;base64,...") or hosted URL
   filename?: string; // Optional filename
+  /**
+   * Part-level metadata convertToModelMessages forwards as FilePart.providerOptions.
+   * Used to mark request-only synthetic tool-media parts (see
+   * SYNTHETIC_TOOL_MEDIA_PART_METADATA in toolResultAttachments.ts) so per-step
+   * transforms can evict the oldest ones under the request-wide media cap
+   * instead of treating them like immutable user uploads (r34).
+   */
+  providerMetadata?: Record<string, Record<string, unknown>>;
 }
 
-// ShuxMessage extends UIMessage with our metadata and custom parts
+// XumMessage extends UIMessage with our metadata and custom parts
 // Supports text, reasoning, file, and tool parts (including interrupted tool calls)
 export type MuxMessage = Omit<UIMessage<MuxMetadata, never, never>, "parts"> & {
   parts: Array<MuxTextPart | MuxReasoningPart | MuxFilePart | MuxToolPart>;
@@ -877,7 +1387,7 @@ export type DisplayedMessage =
   | {
       type: "user";
       id: string; // Display ID for UI/React keys
-      historyId: string; // Original ShuxMessage ID for history operations
+      historyId: string; // Original XumMessage ID for history operations
       content: string;
       /**
        * Command prefix to highlight in the UI (e.g. "/compact -m sonnet" or "/react-effects").
@@ -887,13 +1397,26 @@ export type DisplayedMessage =
       fileParts?: FilePart[]; // Optional attachments
       historySequence: number; // Global ordering across all messages
       isSynthetic?: boolean;
+      /**
+       * Presentation-only row for a first send that is not persisted yet (workspace creation).
+       * Never backed by history, so it cannot be edited, forked, or navigated to.
+       */
+      isPendingSend?: true;
       /** True only for synthetic messages intentionally rendered in the normal transcript. */
       isUiVisible?: boolean;
+      /** Durable terminal rejection: keep visible, but never retry this or an older turn. */
+      contextBudgetRejected?: true;
       timestamp?: number;
       /** True for synthetic user turns created by the active-goal continuation loop. */
       isGoalContinuation?: boolean;
       /** True for the one-shot wrap-up turn after a goal continuation exhausts its budget. */
       isBudgetLimitWrapup?: boolean;
+      /**
+       * True for an authentic plan-review feedback row. Generic editing is disabled for it: an edit
+       * resends only the envelope text, which is neutralized as an untrusted lookalike, so the
+       * threads this feedback opened would silently vanish from review state.
+       */
+      isPlanReviewFeedback?: true;
       /** True when this row is loaded above the latest Context Boundary and must not mutate active context. */
       isBeforeLatestContextBoundary?: boolean;
       /** Present when this message invoked an agent skill or MCP prompt via slash command. */
@@ -926,15 +1449,38 @@ export type DisplayedMessage =
       };
       /** Structured review data for rich UI display (from muxMetadata) */
       reviews?: ReviewNoteDataForDisplay[];
+      /** Message sent from an artifact (from muxMetadata); drives the "from artifact" pill. */
+      artifactInteraction?: ArtifactInteractionMetadata;
+      /** Answers to non-blocking ask_user_question calls, one entry per call (from muxMetadata). */
+      askUserQuestionAnswers?: AskUserQuestionAnswerMetadata[];
       /** Present when this synthetic turn is a background bash monitor wake-up. */
       bashMonitorWake?: {
         records: BashMonitorWakeDisplayRecord[];
+      };
+      /**
+       * True for the fixed user-role notification that wakes a peer-message recipient (the
+       * payload itself is a separate assistant row). Excluded from human-prompt navigation.
+       */
+      agentPeerMessageTrigger?: true;
+      /**
+       * Trigger rows that name their payload row: lets the transcript fold this notification
+       * into the payload's agent-message card once that card is actually rendered.
+       */
+      agentPeerTriggerPayload?: { payloadMessageId: string; fromWorkspaceId: string };
+      /** Synthetic flush warning; displayed as a machine row, not a human prompt. */
+      contextBudgetWarning?: {
+        contextTokens: number;
+        maxTokens: number;
+        /** Final pre-rollover flush prompt rather than the advance warning. */
+        final: boolean;
+        /** Agent-led handoff request rather than the advance warning. */
+        handoff: boolean;
       };
     }
   | {
       type: "assistant";
       id: string; // Display ID for UI/React keys
-      historyId: string; // Original ShuxMessage ID for history operations
+      historyId: string; // Original XumMessage ID for history operations
       content: string;
       historySequence: number; // Global ordering across all messages
       isStreaming: boolean;
@@ -945,10 +1491,11 @@ export type DisplayedMessage =
       /** True when this assistant row predates the latest Context Boundary. */
       isBeforeLatestContextBoundary?: boolean;
       model?: string;
-      routedThroughGateway?: boolean;
       routeProvider?: string;
       /** Present when a fallback model answered after the requested model refused. */
       modelFallback?: ModelFallbackRecord;
+      /** Present when the composer's Auto entry routed this turn by difficulty. */
+      autoModelRouting?: AutoModelRoutingRecord;
       agentId?: string; // Agent id active when this message was sent (assistant messages only)
       /** @deprecated Legacy base mode derived from agent definition. */
       mode?: AgentMode;
@@ -958,11 +1505,20 @@ export type DisplayedMessage =
       streamPresentation?: {
         source: "live" | "replay";
       };
+      /**
+       * Present when this synthetic assistant row is an intra-tree agent peer message payload
+       * (delivered as an assistant pre-turn row so peer bytes never gain user-role authority).
+       */
+      agentPeerMessage?: {
+        fromWorkspaceId: string;
+        fromTitle?: string;
+        relationship: AgentMessageRelationship;
+      };
     }
   | {
       type: "tool";
       id: string; // Display ID for UI/React keys
-      historyId: string; // Original ShuxMessage ID for history operations
+      historyId: string; // Original XumMessage ID for history operations
       toolCallId: string;
       toolName: string;
       args: unknown;
@@ -980,21 +1536,29 @@ export type DisplayedMessage =
       executionStartedAt?: number;
       /** Durable workflow run attachment recovered from partial history. */
       workflowRun?: MuxToolPart["workflowRun"];
+      /** Host-authored MCP identity frozen for this call (display only, never relabeled). */
+      mcpServer?: MuxToolPart["mcpServer"];
       // Nested tool calls for code_execution (from PTC streaming or reconstructed from result)
+      // input is optional to mirror NestedToolCallSchema: zero-arg kernel calls
+      // persist without an input key.
       nestedCalls?: Array<{
         toolCallId: string;
         toolName: string;
-        input: unknown;
+        input?: unknown;
         output?: unknown;
         state: "input-available" | "output-available" | "output-redacted";
         failed?: boolean;
         timestamp?: number;
+        /** Durable run identity for nested workflow tool calls (see NestedToolCallSchema). */
+        workflowRun?: MuxToolPart["workflowRun"];
+        /** Frozen MCP identity captured for this nested call (see NestedToolCallSchema). */
+        mcpServer?: MuxToolPart["mcpServer"];
       }>;
     }
   | {
       type: "reasoning";
       id: string; // Display ID for UI/React keys
-      historyId: string; // Original ShuxMessage ID for history operations
+      historyId: string; // Original XumMessage ID for history operations
       content: string;
       historySequence: number; // Global ordering across all messages
       isStreaming: boolean;
@@ -1015,22 +1579,25 @@ export type DisplayedMessage =
   | {
       type: "stream-error";
       id: string; // Display ID for UI/React keys
-      historyId: string; // Original ShuxMessage ID for history operations
+      historyId: string; // Original XumMessage ID for history operations
       error: string; // Error message
       errorType: StreamErrorType; // Error type/category
       historySequence: number; // Global ordering across all messages
       timestamp?: number;
       model?: string;
-      routedThroughGateway?: boolean;
       errorCount?: number; // Number of consecutive identical errors merged into this message
     }
   | {
       type: "compaction-boundary";
       id: string; // Display ID for UI/React keys
       historySequence: number; // Sequence of the compaction summary this boundary belongs to
+      timestamp?: number;
       boundaryKind?: ContextBoundaryKind;
+      /** Distinguishes automatic rollover from a manual reset without changing boundary semantics. */
+      contextWindowRollover?: true;
       position: "start" | "end";
       compactionEpoch?: number;
+      strategy?: CompactionSummaryMetadata["strategy"];
     }
   | {
       type: "history-hidden";
@@ -1046,10 +1613,11 @@ export type DisplayedMessage =
   | {
       type: "workspace-init";
       id: string; // Display ID for UI/React keys
-      historySequence: number; // Position in message stream (-1 for ephemeral, non-persisted events)
+      historySequence: number; // -1 for the creation card placed after the first displayed user turn
       status: "running" | "success" | "error";
-      hookPath: string; // Path to the init script being executed
-      lines: Array<{ line: string; isError: boolean }>; // Accumulated output lines (stderr tagged via isError)
+      hookPath: string; // Project path being initialized
+      lines: Array<{ line: string; isError: boolean; step?: boolean }>;
+      progress: { label: string; percent: number } | null;
       exitCode: number | null; // Final exit code (null while running)
       timestamp: number;
       durationMs: number | null; // Duration in milliseconds (null while running)
@@ -1058,7 +1626,7 @@ export type DisplayedMessage =
   | {
       type: "plan-display"; // Ephemeral plan display from /plan command
       id: string; // Display ID for UI/React keys
-      historyId: string; // Original ShuxMessage ID (same as id for ephemeral messages)
+      historyId: string; // Original XumMessage ID (same as id for ephemeral messages)
       content: string; // Plan markdown content
       path: string; // Path to the plan file
       historySequence: number; // Global ordering across all messages
@@ -1079,16 +1647,26 @@ export interface QueuedMessage {
   queueDispatchMode?: QueueDispatchMode;
   /** True when the queued message is a compaction request (/compact) */
   hasCompactionRequest?: boolean;
+  /** The queued message was sent from an artifact (Artifacts M5b): shown as such, not editable. */
+  artifactInteraction?: ArtifactInteractionMetadata;
+  /** Send ids of the queued sends (idempotent sends; see ChatPane's queue edit). */
+  sendIds?: string[];
 }
 
 /** Keep every snapshot kind here so history scans and edits retain it with its user message. */
 export function isSyntheticSnapshotUserMessage(message: MuxMessage): boolean {
   return (
-    message.role === "user" &&
-    message.metadata?.synthetic === true &&
-    (message.metadata.fileAtMentionSnapshot !== undefined ||
-      message.metadata.agentSkillSnapshot !== undefined ||
-      message.metadata.mcpPromptSnapshot !== undefined)
+    (message.role === "user" &&
+      message.metadata?.synthetic === true &&
+      (message.metadata.fileAtMentionSnapshot !== undefined ||
+        message.metadata.agentSkillSnapshot !== undefined ||
+        message.metadata.mcpPromptSnapshot !== undefined)) ||
+    // Plan-review record rows are hidden UI state, not human turns: rolling cut,
+    // keep-recent-tail, retry eligibility and goal reconciliation must all skip them through
+    // this one predicate instead of mistaking them for a user prompt. Edit truncation skips
+    // them too but never cuts them (see getEditTruncateTargetFromMessages): unlike request
+    // preludes they are independent durable mutations.
+    isPlanReviewRecordMessage(message)
   );
 }
 

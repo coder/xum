@@ -1,4 +1,4 @@
-import assert from "shux/common/utils/assert";
+import assert from "xum/common/utils/assert";
 
 import type { WebviewToExtensionMessage } from "./protocol";
 

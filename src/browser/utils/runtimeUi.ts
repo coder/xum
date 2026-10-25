@@ -107,7 +107,7 @@ export const RUNTIME_UI = {
   },
   worktree: {
     label: "Worktree",
-    description: "Isolated git worktree in ~/.shux/src",
+    description: "Isolated git worktree in ~/.xum/src",
     docsPath: "/runtime/worktree",
     Icon: WorktreeIcon,
     button: {
@@ -261,12 +261,14 @@ export function getDevcontainerStatusChip(
     case "running":
       return {
         label: "Devcontainer Running",
-        className: "bg-emerald-500/15 text-emerald-400",
+        // Theme success tokens: raw emerald text was below WCAG AA in the light themes (#6882).
+        className: "bg-success/10 text-success-text",
       };
     case "stopped":
       return {
         label: "Devcontainer Stopped",
-        className: "bg-muted/50 text-muted-foreground",
+        // The /50 muted tint left even foreground text at 4.17:1 in flexoki-dark (#6544).
+        className: "bg-muted/15 text-foreground",
       };
     default:
       return null;

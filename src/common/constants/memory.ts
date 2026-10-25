@@ -4,17 +4,35 @@
  * Models only ever see virtual paths under the virtual root (e.g.
  * /memories/global/preferences.md). The MemoryService maps each scope to a
  * physical root:
- * - global    -> <muxHome>/memory/global/ (host-local, permanent, shared across projects)
- * - project   -> <muxHome>/memory/project/<project dir>/ (host-local, private
- *                per-project notes; never committed, survives workspaces)
- * - workspace -> <sessionDir>/memory/ (host-local, deleted with the workspace)
+ * - global    -> <xumHome>/memory/global/ (host-local, permanent, shared across projects)
+ * - project   -> <xumHome>/memory/project/<project dir>/ (host-local, private
+ *                per-project notes; never committed to the repo, survives
+ *                workspaces; carried by the settings backup only when the
+ *                user opts into the project bundle)
+ * - workspace -> <sessionDir>/memory/ of the task-tree OWNER (host-local, deleted
+ *                with that workspace; sub-agents share their parent's store)
+ * - session   -> <sessionDir>/session-memory/ of the ACTING workspace (host-local,
+ *                deleted with that workspace; never shared with the parent or
+ *                sub-agents). Token budget keeps its rollover checkpoint here, and
+ *                agents see the scope only in token-budget mode.
  */
 
 /** Virtual root prefix all memory paths are expressed under. */
 export const MEMORY_VIRTUAL_ROOT = "/memories";
 
-export const MEMORY_SCOPES = ["global", "project", "workspace"] as const;
+export const MEMORY_SCOPES = ["global", "project", "workspace", "session"] as const;
 export type MemoryScope = (typeof MEMORY_SCOPES)[number];
+
+/** Scopes every memory caller may use; the session scope needs an explicit opt-in. */
+export const SHARED_MEMORY_SCOPES: readonly MemoryScope[] = MEMORY_SCOPES.filter(
+  (scope) => scope !== "session"
+);
+
+/** Directory of the session scope inside the acting workspace's session dir. */
+export const SESSION_MEMORY_DIR_NAME = "session-memory";
+
+/** Virtual directory of the session scope, where token-budget agents keep their checkpoint. */
+export const SESSION_MEMORY_VIRTUAL_DIR = `${MEMORY_VIRTUAL_ROOT}/session/`;
 
 export type MemoryAccessLevel = "read" | "readwrite";
 
@@ -23,7 +41,9 @@ export type MemoryAccessLevel = "read" | "readwrite";
  * - Exec-like (editing-capable): all scopes read-write.
  * - Plan-like: all scopes read-write; project memory is host-local and never
  *   mutates the checkout.
- * - Explore/read-only: all scopes read-only (view only).
+ * - Explore/read-only: all scopes read-only (view only), except session.
+ * Every agent may write its own session scope: it is a private checkpoint that no
+ * other agent reads, and read-only agents need it to survive a context rollover.
  */
 export type MemoryScopeAccess = Record<MemoryScope, MemoryAccessLevel>;
 
@@ -50,26 +70,6 @@ export const MEMORY_INDEX_DESCRIPTION_PREFIX_BYTES = 4 * 1024;
 
 /** Directory listing depth for `view` on a directory (per Anthropic memory-tool semantics). */
 export const MEMORY_VIEW_MAX_DEPTH = 2;
-
-/**
- * Hot-set budgets: user-pinned + frequently-used memory files are preloaded
- * into context (the second tier between the always-present index and
- * tool-call cold reads). The hot set is recomputed on first use of a model in
- * a session segment and at compaction boundaries so repeated turns keep
- * prompt-cache-stable bytes.
- */
-/** Maximum bytes of a single preloaded memory file (longer files are truncated). */
-export const MEMORY_HOT_SET_MAX_ITEM_BYTES = 16 * 1024;
-/** Maximum total bytes of selected hot-memory file content. */
-export const MEMORY_HOT_SET_MAX_TOTAL_BYTES = 48 * 1024;
-/** Maximum tokens consumed by the rendered <hot_memories> block. */
-export const MEMORY_HOT_SET_MAX_TOTAL_TOKENS = 12_000;
-/** Maximum number of memory files preloaded into the system prompt. */
-export const MEMORY_HOT_SET_MAX_ITEMS = 8;
-/** Maximum ranked candidates to read/tokenize while filling the hot set. */
-export const MEMORY_HOT_SET_MAX_SELECTION_ATTEMPTS = 64;
-/** Half-life of the recency decay applied to access counts when ranking auto-hot files. */
-export const MEMORY_HOT_SET_DECAY_HALF_LIFE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
  * Memory consolidation ("dream" agent, issue #3534): maximum mutating memory

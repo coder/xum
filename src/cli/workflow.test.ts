@@ -1,8 +1,11 @@
 import * as fs from "node:fs/promises";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 import * as path from "node:path";
 
 import { describe, expect, test } from "bun:test";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { nodeVersionWarning } from "./nodeVersion";
 import { parseWorkflowArgs } from "./workflow";
 
 const BUN_EXECUTABLE = process.execPath;
@@ -10,6 +13,15 @@ const WORKFLOW_ENTRY = path.join(import.meta.dir, "workflow.ts");
 // index.ts imports the generated src/version.ts; direct `bun test` runs in a fresh
 // worktree need `./scripts/generate-version.sh` first (`make test` generates it).
 const INDEX_ENTRY = path.join(import.meta.dir, "index.ts");
+
+// Exercise the shipped Node CLI: Bun's source runner can crash before workflow assertions.
+async function getCompiledCliEntry(): Promise<string> {
+  const compiledEntry = path.resolve(import.meta.dir, "../../dist/cli/index.js");
+  await fs.access(compiledEntry).catch((cause: unknown) => {
+    throw new Error("Build the CLI with make build-main before running this test", { cause });
+  });
+  return compiledEntry;
+}
 
 async function getRejectedMessage(promise: Promise<unknown>): Promise<string> {
   try {
@@ -26,7 +38,13 @@ async function trustProject(muxRoot: string, repo: string): Promise<void> {
     .quiet();
 }
 
-describe("shux workflow CLI helpers", () => {
+async function seedEvaluationDefault(muxRoot: string, model: string): Promise<void> {
+  await Bun.$`${BUN_EXECUTABLE} -e ${`import { Config } from "./src/node/config"; const c = new Config(); await c.editConfig((cfg) => ({ ...cfg, evaluationDefaults: { model: process.argv[1] } }));`} ${model}`
+    .env({ ...process.env, MUX_ROOT: muxRoot })
+    .quiet();
+}
+
+describe("xum workflow CLI helpers", () => {
   test("rejects ambiguous structured args modes", async () => {
     expect(
       await getRejectedMessage(parseWorkflowArgs({ argsJson: "{}", argsFile: "args.json" }))
@@ -52,9 +70,9 @@ describe("shux workflow CLI helpers", () => {
     });
   });
 
-  // Invoking the subcommand implies the dynamic-workflows experiment; no persisted
-  // override is needed. Routed through index.ts to cover the `wf` alias.
-  test("CLI run works without the dynamic-workflows experiment", async () => {
+  // Promoted experiment IDs stay accepted so existing automation keeps working.
+  // Routed through index.ts to cover the `wf` alias.
+  test("CLI run accepts promoted experiment IDs as no-ops", async () => {
     using tmp = new DisposableTempDir("workflow-cli-experiment");
     const repo = path.join(tmp.path, "repo");
     const muxRoot = path.join(tmp.path, "mux-root");
@@ -69,7 +87,7 @@ describe("shux workflow CLI helpers", () => {
     await trustProject(muxRoot, repo);
 
     const result =
-      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo-review.js --dir ${repo}`
+      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/echo-review.js --dir ${repo} -e dynamic-workflows -e agent-plugins -e advisor-tool`
         .env({ ...process.env, MUX_ROOT: muxRoot })
         .nothrow()
         .quiet();
@@ -78,46 +96,44 @@ describe("shux workflow CLI helpers", () => {
     expect(result.exitCode).toBe(0);
   });
 
-  // Regression: headless `shux workflow` must initialize PolicyService and thread
-  // it through the core service graph like the desktop wiring. Without it, a
-  // stored credential for a provider that MUX_POLICY_FILE / Shux Governor now
-  // denies would remain usable from workflow-owned agents. The agent task must
-  // fail closed before any provider network call (the configured API key is fake).
-  test("CLI run enforces MUX_POLICY_FILE provider denials", async () => {
-    using tmp = new DisposableTempDir("workflow-cli-policy");
+  // The CLI root owns an Effect runtime (createCoreServices). Its cleanup must
+  // close the supervised fiber scope before the session-level disposers and
+  // release the runtime after the background processes are terminated, mirroring
+  // ServiceContainer.dispose(); the debug shutdown lines pin that order.
+  test("CLI run closes the AppFiberScope first and disposes the AppRuntime last", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-runtime");
     const repo = path.join(tmp.path, "repo");
     const muxRoot = path.join(tmp.path, "mux-root");
     await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
     await fs.mkdir(muxRoot, { recursive: true });
     await fs.writeFile(
-      path.join(muxRoot, "providers.jsonc"),
-      JSON.stringify({ anthropic: { apiKey: "fake-key-policy-test" } }),
-      "utf-8"
-    );
-    const policyPath = path.join(muxRoot, "policy.json");
-    await fs.writeFile(
-      policyPath,
-      JSON.stringify({ policy_format_version: "0.1", provider_access: [{ id: "openai" }] }),
-      "utf-8"
-    );
-    await fs.writeFile(
-      path.join(repo, "workflows", "policy-denied.js"),
-      `export default async function workflow({ agent }) { return await agent("say hi", { id: "hello" }); }
+      path.join(repo, "workflows", "echo.js"),
+      `export default function workflow() { return { reportMarkdown: "ok" }; }
 `,
       "utf-8"
     );
     await trustProject(muxRoot, repo);
 
-    const result =
-      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/policy-denied.js --model anthropic:claude-opus-5 --dir ${repo}`
-        .env({ ...process.env, MUX_ROOT: muxRoot, MUX_POLICY_FILE: policyPath })
-        .nothrow()
-        .quiet();
+    const compiledEntry = await getCompiledCliEntry();
+    const result = await Bun.$`node ${compiledEntry} wf run ./workflows/echo.js --dir ${repo}`
+      .env({ ...process.env, MUX_ROOT: muxRoot, XUM_LOG_LEVEL: "debug", NO_COLOR: "1" })
+      .nothrow()
+      .quiet();
 
-    expect(result.exitCode).not.toBe(0);
-    expect(result.stdout.toString() + result.stderr.toString()).toContain(
-      "Provider anthropic is not allowed by policy"
-    );
+    const output = result.stdout.toString() + result.stderr.toString();
+    // #6735: the child once exited 133 (SIGTRAP: a V8 fatal error) in CI. On a failure, show its
+    // exit code with the stderr tail, where V8 prints the reason, so the failure explains itself.
+    const failure =
+      result.exitCode === 0
+        ? ""
+        : `exit ${result.exitCode}\n${result.stderr.toString().slice(-4000)}`;
+    expect(failure).toBe("");
+    const scopeClosedAt = output.indexOf("[shutdown] AppFiberScope closed");
+    const terminateAllAt = output.indexOf("BackgroundProcessManager.terminateAll() called");
+    const runtimeDisposedAt = output.indexOf("[shutdown] AppRuntime disposed");
+    expect(scopeClosedAt).toBeGreaterThan(output.indexOf("[startup] AppRuntime built"));
+    expect(terminateAllAt).toBeGreaterThan(scopeClosedAt);
+    expect(runtimeDisposedAt).toBeGreaterThan(terminateAllAt);
   });
 
   test("CLI run reports an actionable trust error for untrusted project workflows", async () => {
@@ -166,9 +182,204 @@ describe("shux workflow CLI helpers", () => {
 
     expect(result.exitCode).not.toBe(0);
     expect(result.stderr.toString()).toContain(
-      "shux workflow currently supports only local runtime"
+      "xum workflow currently supports only local runtime"
     );
   });
+
+  test("CLI stops the config.json watches when the workflow setup fails", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-setup-failure");
+    const repo = path.join(tmp.path, "repo");
+    const muxRoot = path.join(tmp.path, "mux-root");
+    await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
+    await fs.mkdir(muxRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(repo, "workflows", "echo.js"),
+      `export default function workflow() { return { reportMarkdown: "should not run" }; }
+`,
+      "utf-8"
+    );
+    await trustProject(muxRoot, repo);
+    // The preload fails the setup after the services subscribed to config changes, which
+    // opens the watches, and reports each stop of a watch.
+    const srcDir = path.resolve(import.meta.dir, "..");
+    const preload = path.join(tmp.path, "fail-setup.ts");
+    await fs.writeFile(
+      preload,
+      `import { AgentSession } from ${JSON.stringify(path.join(srcDir, "node/services/agentSession"))};
+import { Config } from ${JSON.stringify(path.join(srcDir, "node/config"))};
+const stop = Config.prototype.stopWatchingConfigFile;
+Config.prototype.stopWatchingConfigFile = function (this: Config) {
+  process.stderr.write("config watches stopped\\n");
+  stop.call(this);
+};
+AgentSession.prototype.ensureMetadata = () => Promise.reject(new Error("setup failed on purpose"));
+`,
+      "utf-8"
+    );
+
+    const result =
+      await Bun.$`${BUN_EXECUTABLE} --preload ${preload} ${WORKFLOW_ENTRY} run ./workflows/echo.js --dir ${repo}`
+        .env({ ...process.env, MUX_ROOT: muxRoot })
+        .nothrow()
+        .quiet();
+
+    const stderr = result.stderr.toString();
+    expect(result.exitCode).not.toBe(0);
+    expect(stderr).toContain("setup failed on purpose");
+    expect(stderr).toContain("config watches stopped");
+  });
+
+  // Each model source resolves to a distinct, key-independent failure code, so the
+  // reported code identifies which source won: nothing → no-model; an unknown
+  // provider → unsupported-provider; an explicit gateway prefix → unsupported-route.
+  test("CLI --evaluation-model sits between the per-call model and the Settings default", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-evaluation-model");
+    const repo = path.join(tmp.path, "repo");
+    const muxRoot = path.join(tmp.path, "mux-root");
+    await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
+    await fs.mkdir(muxRoot, { recursive: true });
+    await fs.writeFile(
+      path.join(repo, "workflows", "probe.js"),
+      `export default function workflow({ args, evaluate }) {
+  try {
+    evaluate("probe", {
+      id: "probe",
+      questions: { ok: { type: "boolean", instructions: "Is it ok?" } },
+      ...(args.model ? { model: args.model } : {}),
+    });
+    return { reportMarkdown: "unexpected success" };
+  } catch (error) {
+    return { reportMarkdown: error.message };
+  }
+}
+`,
+      "utf-8"
+    );
+    await trustProject(muxRoot, repo);
+    const probe = async (...extra: string[]) => {
+      const result =
+        await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/probe.js --dir ${repo} --quiet ${extra}`
+          .env({ ...process.env, MUX_ROOT: muxRoot })
+          .nothrow()
+          .quiet();
+      return { exitCode: result.exitCode, stdout: result.stdout.toString().trim() };
+    };
+
+    const unconfigured = await probe();
+    expect(unconfigured.exitCode).toBe(0);
+    expect(unconfigured.stdout).toContain("evaluation failed: invalid-input/no-model");
+
+    // The Settings default must come from the real config, not the ephemeral run copy.
+    await seedEvaluationDefault(muxRoot, "nope:settings-model");
+    expect((await probe()).stdout).toContain("evaluation failed: unsupported/unsupported-provider");
+
+    expect((await probe("--evaluation-model", "openrouter:openai/gpt-5")).stdout).toContain(
+      "evaluation failed: unsupported/unsupported-route"
+    );
+
+    expect(
+      (
+        await probe(
+          "--evaluation-model",
+          "openrouter:openai/gpt-5",
+          "--args-json",
+          '{"model":"nope:per-call"}'
+        )
+      ).stdout
+    ).toContain("evaluation failed: unsupported/unsupported-provider");
+
+    const blank =
+      await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/probe.js --dir ${repo} --evaluation-model ${" "}`
+        .env({ ...process.env, MUX_ROOT: muxRoot })
+        .nothrow()
+        .quiet();
+    expect(blank.exitCode).not.toBe(0);
+    expect(blank.stderr.toString()).toContain("Invalid --evaluation-model");
+  }, 60_000);
+
+  // The evaluation-only `typesafe` key is not a configured chat provider, yet it
+  // must reach the run's providers copy and survive chat hydration from the
+  // environment for an evaluate()-only workflow to run.
+  test("CLI runs an evaluate()-only workflow with only the TypeSafe key configured", async () => {
+    using tmp = new DisposableTempDir("workflow-cli-typesafe-only");
+    const repo = path.join(tmp.path, "repo");
+    const muxRoot = path.join(tmp.path, "mux-root");
+    await fs.mkdir(path.join(repo, "workflows"), { recursive: true });
+    await fs.mkdir(muxRoot, { recursive: true });
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const fixture = http.createServer((request, response) => {
+      const chunks: Buffer[] = [];
+      request.on("data", (chunk: Buffer) => chunks.push(chunk));
+      request.on("end", () => {
+        requests.push({
+          url: request.url ?? "",
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>,
+        });
+        response.writeHead(200, { "Content-Type": "application/json" });
+        response.end(
+          JSON.stringify({
+            answers: { ok: { type: "noul", noul: 0.9 } },
+            usage: { input_tokens: 3, output_tokens: 1 },
+          })
+        );
+      });
+    });
+    await new Promise<void>((resolve) => fixture.listen(0, "127.0.0.1", resolve));
+    try {
+      const origin = `http://127.0.0.1:${(fixture.address() as AddressInfo).port}`;
+      await fs.writeFile(
+        path.join(muxRoot, "providers.jsonc"),
+        JSON.stringify({ typesafe: { apiKey: "fixture-typesafe-key", baseUrl: `${origin}/v1` } }),
+        "utf-8"
+      );
+      await fs.writeFile(
+        path.join(repo, "workflows", "probe.js"),
+        `export default function workflow({ evaluate }) {
+  const result = evaluate("probe", {
+    id: "probe",
+    model: "typesafe:jev-latest",
+    questions: { ok: { type: "boolean", instructions: "Is it ok?" } },
+  });
+  return { reportMarkdown: "evaluated", structuredOutput: result };
+}
+`,
+        "utf-8"
+      );
+      await trustProject(muxRoot, repo);
+
+      const run =
+        await Bun.$`${BUN_EXECUTABLE} ${INDEX_ENTRY} wf run ./workflows/probe.js --dir ${repo} --json`
+          // A chat key in the environment triggers hydration of the run's providers
+          // copy, which must merge over (not replace) the TypeSafe entry.
+          .env({ ...process.env, MUX_ROOT: muxRoot, OPENAI_API_KEY: "env-chat-key" })
+          .nothrow()
+          .quiet();
+      expect(run.exitCode).toBe(0);
+      const events = run.stdout
+        .toString()
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { type: string });
+      expect(events.find((event) => event.type === "result")).toMatchObject({
+        status: "completed",
+        result: {
+          structuredOutput: {
+            answers: { ok: { type: "boolean", probability: 0.9 } },
+            model: { modelString: "typesafe:jev-latest" },
+          },
+        },
+      });
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.url).toBe("/v1/systemone");
+      expect(requests[0]?.body).toMatchObject({
+        model: "jev-latest",
+        questions: { ok: { type: "noul" } },
+      });
+    } finally {
+      fixture.closeAllConnections();
+      await new Promise<void>((resolve) => fixture.close(() => resolve()));
+    }
+  }, 60_000);
 
   test("CLI runs a trusted explicit workflow script with structured args", async () => {
     using tmp = new DisposableTempDir("workflow-cli-e2e");
@@ -199,8 +410,9 @@ describe("shux workflow CLI helpers", () => {
 
     await trustProject(muxRoot, repo);
 
+    const compiledEntry = await getCompiledCliEntry();
     const runOutput =
-      await Bun.$`${BUN_EXECUTABLE} ${WORKFLOW_ENTRY} run ./workflows/echo-review.js --dir ${repo} --args-json ${'{"base":"main"}'} --json`
+      await Bun.$`node ${compiledEntry} wf run ./workflows/echo-review.js --dir ${repo} --args-json ${'{"base":"main"}'} --json`
         .env({ ...process.env, MUX_ROOT: muxRoot })
         .text();
     const lines = runOutput.trim().split("\n");
@@ -213,15 +425,16 @@ describe("shux workflow CLI helpers", () => {
     });
 
     const quietOutput =
-      await Bun.$`${BUN_EXECUTABLE} ${WORKFLOW_ENTRY} run ./workflows/echo-review.js --dir ${repo} --args-json ${'{"input":"hello"}'} --quiet`
+      await Bun.$`node ${compiledEntry} wf run ./workflows/echo-review.js --dir ${repo} --args-json ${'{"input":"hello"}'} --quiet`
         .env({ ...process.env, MUX_ROOT: muxRoot })
         .text();
     expect(quietOutput).toBe('Echo: {"input":"hello"}\n');
 
     const stdinProc = Bun.spawn(
       [
-        BUN_EXECUTABLE,
-        WORKFLOW_ENTRY,
+        "node",
+        compiledEntry,
+        "wf",
         "run",
         "./workflows/echo-review.js",
         "--dir",
@@ -244,7 +457,13 @@ describe("shux workflow CLI helpers", () => {
       stdinProc.exited,
     ]);
     expect(stdinExitCode).toBe(0);
-    expect(stdinStderr).toBe("");
+    // The CLI warns on stderr when the host Node is a release affected by CVE-2026-111497, so the
+    // only stderr this run may print is the warning for the Node this test spawned.
+    const hostNodeVersions = JSON.parse(
+      await Bun.$`node -p ${"JSON.stringify(process.versions)"}`.text()
+    ) as Record<string, string | undefined>;
+    const hostNodeWarning = nodeVersionWarning(hostNodeVersions);
+    expect(stdinStderr).toBe(hostNodeWarning === undefined ? "" : `${hostNodeWarning}\n`);
     const stdinEvent = JSON.parse(stdinStdout.trim()) as unknown;
     expect(stdinEvent).toMatchObject({
       type: "result",
@@ -252,11 +471,10 @@ describe("shux workflow CLI helpers", () => {
       result: { reportMarkdown: 'Echo: {"fromStdin":true}' },
     });
 
-    const failedRun =
-      await Bun.$`${BUN_EXECUTABLE} ${WORKFLOW_ENTRY} run ./workflows/explode.js --dir ${repo}`
-        .env({ ...process.env, MUX_ROOT: muxRoot })
-        .nothrow()
-        .quiet();
+    const failedRun = await Bun.$`node ${compiledEntry} wf run ./workflows/explode.js --dir ${repo}`
+      .env({ ...process.env, MUX_ROOT: muxRoot })
+      .nothrow()
+      .quiet();
     expect(failedRun.exitCode).toBe(1);
   }, 30_000);
 });

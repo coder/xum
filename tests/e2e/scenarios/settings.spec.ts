@@ -12,16 +12,11 @@ test.describe("Settings", () => {
     // Open settings
     await ui.settings.open();
 
-    // The titlebar settings control now acts as the close toggle while settings are open.
-    await expect(page.getByTestId("settings-button")).toHaveAttribute(
-      "aria-label",
-      "Close settings"
-    );
-
-    // Verify sidebar sections are present
-    await expect(page.getByRole("button", { name: "General", exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Providers", exact: true })).toBeVisible();
-    await expect(page.getByRole("button", { name: "Models", exact: true })).toBeVisible();
+    // Verify section navigation is present
+    const dialog = page.getByRole("dialog", { name: "Settings" });
+    await expect(dialog.getByRole("button", { name: "General", exact: true })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Providers", exact: true })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Models", exact: true })).toBeVisible();
 
     // Verify default section is General (theme toggle visible)
     await expect(page.getByText("Theme", { exact: true })).toBeVisible();
@@ -44,13 +39,11 @@ test.describe("Settings", () => {
     await expect(page.getByText("Theme", { exact: true })).toBeVisible();
   });
 
-  test("closes settings with the titlebar toggle button", async ({ ui, page }) => {
+  test("closes settings with Escape", async ({ ui, page }) => {
     await ui.projects.openFirstWorkspace();
     await ui.settings.open();
 
-    const closeButton = page.getByTestId("settings-button");
-    await expect(closeButton).toHaveAttribute("aria-label", "Close settings");
-    await closeButton.click();
+    await page.keyboard.press("Escape");
 
     await ui.settings.expectClosed();
   });
@@ -88,7 +81,11 @@ test.describe("Settings", () => {
     await expect(
       page.getByRole("button", { name: /OpenAI/i }).filter({ has: page.getByText("OpenAI icon") })
     ).toBeVisible();
-    await expect(page.getByRole("button", { name: /Google/i })).toBeVisible();
+    // "Google" is a prefix of "Google Vertex AI", so match the name text exactly.
+    await expect(
+      page.getByRole("button").filter({ has: page.getByText("Google", { exact: true }) })
+    ).toBeVisible();
+    await expect(page.getByRole("button", { name: /Google Vertex AI/ })).toBeVisible();
     await expect(page.getByRole("button", { name: /xAI/i })).toBeVisible();
     await expect(page.getByRole("button", { name: /Ollama/i })).toBeVisible();
     await expect(page.getByRole("button", { name: /OpenRouter/i })).toBeVisible();
@@ -108,8 +105,9 @@ test.describe("Settings", () => {
       .filter({ has: page.getByPlaceholder(/model-id/i) })
       .filter({ has: page.getByRole("button", { name: /^Add$/i }) })
       .last();
-    await expect(addForm.getByRole("combobox")).toBeVisible(); // Provider dropdown
-    await expect(page.getByPlaceholder(/model-id/i)).toBeVisible();
+    // The add row has two comboboxes: the provider dropdown and the editable Model ID field.
+    await expect(addForm.getByRole("combobox", { name: "Provider" })).toBeVisible();
+    await expect(addForm.getByRole("combobox", { name: "Model ID" })).toBeVisible();
     await expect(page.getByRole("button", { name: /^Add$/i })).toBeVisible();
   });
 

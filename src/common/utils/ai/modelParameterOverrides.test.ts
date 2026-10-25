@@ -466,6 +466,27 @@ describe("resolveModelParameterOverrides", () => {
     });
   });
 
+  it("strips deprecated sampling parameters for Gemini 3.8 Flash and Gemini 4 Argon", () => {
+    const providersConfig = withGoogleModelParameters({
+      "*": {
+        max_output_tokens: 32768,
+        temperature: 0.7,
+        top_p: 0.9,
+        top_k: 40,
+      },
+    });
+
+    for (const model of ["google:gemini-3.8-flash", "google:gemini-4-argon"]) {
+      const result = resolveModelParameterOverrides(providersConfig, "google", model);
+
+      expect(result).toEqual({
+        standard: {
+          maxOutputTokens: 32768,
+        },
+      });
+    }
+  });
+
   it("strips deprecated sampling parameters for Gemini 3.5 Flash-Lite", () => {
     const providersConfig = withGoogleModelParameters({
       "gemini-3.5-flash-lite": {
@@ -497,8 +518,8 @@ describe("resolveModelParameterOverrides", () => {
     const result = resolveModelParameterOverrides(
       providersConfig,
       "google",
-      "google:gemini-3.7-flash",
-      "mux-gateway:google/gemini-3.7-flash"
+      "google:gemini-3.8-flash",
+      "openrouter:google/gemini-3.8-flash"
     );
 
     expect(result).toEqual({ standard: {} });
@@ -507,7 +528,7 @@ describe("resolveModelParameterOverrides", () => {
   it("strips sampling parameters for custom entries mapped to a sampling-rejecting model", () => {
     const providersConfig = asProvidersConfig({
       google: {
-        models: [{ id: "team-flash", mappedToModel: "google:gemini-3.7-flash" }],
+        models: [{ id: "team-flash", mappedToModel: "google:gemini-3.8-flash" }],
         modelParameters: {
           "*": {
             temperature: 0.7,
@@ -524,6 +545,33 @@ describe("resolveModelParameterOverrides", () => {
         maxOutputTokens: 4096,
       },
     });
+  });
+
+  it("strips sampling parameters for Haiku 5.5 on Bedrock but keeps them for Haiku 4.5", () => {
+    const providersConfig = asProvidersConfig({
+      bedrock: {
+        modelParameters: {
+          "*": { temperature: 0.7, top_p: 0.9, top_k: 40, max_output_tokens: 4096 },
+        },
+      },
+    });
+    for (const model of [
+      "bedrock:anthropic.claude-haiku-5-5",
+      "bedrock:us.anthropic.claude-haiku-5-5",
+      "anthropic:claude-haiku-5-5",
+    ]) {
+      expect({
+        model,
+        result: resolveModelParameterOverrides(providersConfig, "bedrock", model),
+      }).toEqual({ model, result: { standard: { maxOutputTokens: 4096 } } });
+    }
+    expect(
+      resolveModelParameterOverrides(
+        providersConfig,
+        "bedrock",
+        "bedrock:anthropic.claude-haiku-4-5"
+      )
+    ).toEqual({ standard: { temperature: 0.7, topP: 0.9, topK: 40, maxOutputTokens: 4096 } });
   });
 
   it("keeps sampling parameters for Gemini models that still support them", () => {

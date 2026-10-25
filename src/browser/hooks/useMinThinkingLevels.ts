@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback } from "react";
 import { useOptionalAPI } from "@/browser/contexts/API";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
+import { getAppConfigStore, useAppConfig } from "@/browser/stores/AppConfigStore";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 import {
   getAvailableThinkingLevels,
@@ -9,6 +10,9 @@ import {
   resolveMinimumThinkingLevel,
 } from "@/common/utils/thinking/policy";
 import type { ThinkingLevel } from "@/common/types/thinking";
+
+// Stable fallback so snapshot-less renders don't churn referential equality.
+const EMPTY_MIN_LEVELS: Record<string, ThinkingLevel> = {};
 
 export interface MinThinkingLevelsState {
   /** Per-model minimum thinking overrides, keyed by canonical model id. */
@@ -38,65 +42,11 @@ export function useMinThinkingLevels(): MinThinkingLevelsState {
   // Resolve mapped aliases (mappedToModel) to their capability model so floors
   // and ladders match the target model; degrades to null outside APIProvider.
   const { config: providersConfig } = useProvidersConfig();
-  const [minThinkingLevelByModel, setMap] = useState<Record<string, ThinkingLevel>>({});
-  // Ignore stale config fetches so backend refreshes can't overwrite newer optimistic edits.
-  const fetchVersionRef = useRef(0);
-
-  const fetchConfig = useCallback(async () => {
-    const getConfig = api?.config?.getConfig;
-    if (!getConfig) {
-      return;
-    }
-
-    const fetchVersion = ++fetchVersionRef.current;
-
-    try {
-      const config = await getConfig();
-      if (fetchVersion !== fetchVersionRef.current) {
-        return;
-      }
-      setMap(config.minThinkingLevelByModel ?? {});
-    } catch {
-      // Best-effort only.
-    }
-  }, [api]);
-
-  useEffect(() => {
-    const onConfigChanged = api?.config?.onConfigChanged;
-    if (!onConfigChanged) {
-      return;
-    }
-
-    const abortController = new AbortController();
-    const { signal } = abortController;
-    let iterator: AsyncIterator<unknown> | null = null;
-
-    void fetchConfig();
-
-    (async () => {
-      try {
-        const subscribedIterator = await onConfigChanged(undefined, { signal });
-        if (signal.aborted) {
-          void subscribedIterator.return?.();
-          return;
-        }
-        iterator = subscribedIterator;
-        for await (const _ of subscribedIterator) {
-          if (signal.aborted) {
-            break;
-          }
-          void fetchConfig();
-        }
-      } catch {
-        // Subscription cancelled via abort signal - expected on cleanup.
-      }
-    })();
-
-    return () => {
-      abortController.abort();
-      void iterator?.return?.();
-    };
-  }, [api, fetchConfig]);
+  // Shared AppConfigStore (one fetch + one onConfigChanged subscription per
+  // app session) instead of per-mount fetches — see useRouting.
+  const store = getAppConfigStore();
+  const minThinkingLevelByModel =
+    useAppConfig((config) => config.minThinkingLevelByModel) ?? EMPTY_MIN_LEVELS;
 
   // Lookups go through lookupMinThinkingLevelOverride so floors persisted by
   // older versions under the name-canonical key keep applying (see helper).
@@ -137,17 +87,16 @@ export function useMinThinkingLevels(): MinThinkingLevelsState {
         next[key] = level;
       }
 
-      fetchVersionRef.current++;
-      setMap(next);
+      store.updateOptimistically({ minThinkingLevelByModel: next });
 
       api?.config?.updateMinThinkingLevels({ minThinkingLevelByModel: next }).catch(() => {
         // If the write fails, re-fetch so the UI reverts to the backend's actual floor rather
         // than displaying an override the send path (which reads config synchronously) never
         // applied. On success, the onConfigChanged subscription already reconciles state.
-        void fetchConfig();
+        void store.refresh();
       });
     },
-    [api, fetchConfig, minThinkingLevelByModel, providersConfig]
+    [api, minThinkingLevelByModel, providersConfig, store]
   );
 
   return {

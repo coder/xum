@@ -1,0 +1,305 @@
+import cjsFs from "fs";
+import * as fs from "fs/promises";
+import * as path from "path";
+import { describe, expect, it, spyOn } from "bun:test";
+import { Config } from "@/node/config";
+import { TestTempDir } from "@/node/services/tools/testHelpers";
+import { MAX_DRAFT_JSON_BYTES } from "@/constants/drafts";
+import { draftTooLargeMessage, isDraftTooLargeError } from "@/common/utils/drafts";
+import type { DraftAttachment, DraftScope } from "@/common/orpc/schemas/drafts";
+import { DRAFT_CHANGE_EVENT, DraftService } from "./draftService";
+
+const WORKSPACE_ID = "draft-ws";
+const WORKSPACE_SCOPE: DraftScope = { kind: "workspace", workspaceId: WORKSPACE_ID };
+
+async function createHarness(tempDir: TestTempDir) {
+  const config = new Config(path.join(tempDir.path, "xum-home"));
+  const projectPath = path.join(tempDir.path, "project");
+  await fs.mkdir(projectPath, { recursive: true });
+  await config.addWorkspace(projectPath, {
+    id: WORKSPACE_ID,
+    name: "draft-branch",
+    projectPath,
+    projectName: "project",
+    runtimeConfig: { type: "local" },
+  });
+  // The on-disk location is a storage contract (upgrade/downgrade), so spell it out here.
+  const workspaceFile = path.join(config.sessionsDir, WORKSPACE_ID, "draft.json");
+  return { config, projectPath, workspaceFile };
+}
+
+const image: DraftAttachment = {
+  kind: "provider",
+  id: "img-1",
+  url: "data:image/png;base64,iVBORw0KGgo=",
+  mediaType: "image/png",
+  filename: "shot.png",
+};
+
+async function exists(filePath: string): Promise<boolean> {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+describe("DraftService", () => {
+  it("persists partial updates and deletes the file when the draft becomes empty", async () => {
+    using tempDir = new TestTempDir("drafts-roundtrip");
+    const { config, workspaceFile } = await createHarness(tempDir);
+    const service = new DraftService(config);
+
+    await service.update({ scope: WORKSPACE_SCOPE, text: "hello", attachments: [image] });
+    // Typing sends only text: the stored attachments must survive it.
+    await service.update({ scope: WORKSPACE_SCOPE, text: "hello world" });
+
+    const reloaded = await new DraftService(config).get(WORKSPACE_SCOPE);
+    expect(reloaded.text).toBe("hello world");
+    expect(reloaded.attachments).toEqual([image]);
+
+    await service.update({ scope: WORKSPACE_SCOPE, text: "", attachments: [] });
+    expect(await exists(workspaceFile)).toBe(false);
+    expect(await service.list()).toEqual([]);
+  });
+
+  it("lists metadata without payloads and drops drafts whose session dir was removed", async () => {
+    using tempDir = new TestTempDir("drafts-list");
+    const { config } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({ scope: WORKSPACE_SCOPE, text: "t", attachments: [image] });
+
+    // A fresh instance builds its index from disk.
+    const fresh = new DraftService(config);
+    const [summary] = await fresh.list();
+    expect(summary.scope).toEqual(WORKSPACE_SCOPE);
+    expect(summary.attachments.map(({ id, filename }) => ({ id, filename }))).toEqual([
+      { id: "img-1", filename: "shot.png" },
+    ]);
+    expect(JSON.stringify(summary)).not.toContain("iVBORw0KGgo");
+
+    // Workspace removal deletes the session dir without telling the service.
+    await fs.rm(path.join(config.sessionsDir, WORKSPACE_ID), { recursive: true });
+    expect(await fresh.list()).toEqual([]);
+  });
+
+  it("self-heals malformed and unparseable files but throws on other read errors", async () => {
+    using tempDir = new TestTempDir("drafts-self-heal");
+    const { config, workspaceFile } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await fs.mkdir(path.dirname(workspaceFile), { recursive: true });
+
+    await fs.writeFile(
+      workspaceFile,
+      JSON.stringify({ text: "kept", attachments: [image, { kind: "provider", id: 7 }] })
+    );
+    const sanitized = await service.get(WORKSPACE_SCOPE);
+    expect(sanitized.text).toBe("kept");
+    expect(sanitized.attachments).toEqual([image]);
+
+    await fs.writeFile(workspaceFile, "{not json");
+    expect((await service.get(WORKSPACE_SCOPE)).text).toBe("");
+
+    // EISDIR: the data may exist but cannot be read, so a write must not replace it.
+    await fs.rm(workspaceFile);
+    await fs.mkdir(workspaceFile);
+    let getError: unknown;
+    try {
+      await service.get(WORKSPACE_SCOPE);
+    } catch (error) {
+      getError = error;
+    }
+    expect(getError).toBeDefined();
+    let updateError: unknown;
+    try {
+      await service.update({ scope: WORKSPACE_SCOPE, text: "new" });
+    } catch (error) {
+      updateError = error;
+    }
+    expect(updateError).toBeDefined();
+  });
+
+  it("imports legacy drafts without clobbering and reports ownerless scopes as orphaned", async () => {
+    using tempDir = new TestTempDir("drafts-import");
+    const { config } = await createHarness(tempDir);
+    const service = new DraftService(config);
+
+    const applied = await service.importLegacy({ scope: WORKSPACE_SCOPE, text: "legacy" });
+    expect(applied.result).toBe("applied");
+    await service.update({ scope: WORKSPACE_SCOPE, text: "edited on the backend" });
+
+    // Another origin still holding its old localStorage copy must not overwrite the backend.
+    const present = await service.importLegacy({
+      scope: WORKSPACE_SCOPE,
+      text: "stale",
+      attachments: [image],
+    });
+    expect(present.result).toBe("present");
+    const stored = await service.get(WORKSPACE_SCOPE);
+    expect(stored.text).toBe("edited on the backend");
+    expect(stored.attachments).toEqual([]);
+
+    const unknown = await service.importLegacy({
+      scope: { kind: "workspace", workspaceId: "never-registered" },
+      text: "orphan",
+    });
+    expect(unknown.result).toBe("orphaned");
+    expect(await exists(path.join(config.sessionsDir, "never-registered"))).toBe(false);
+  });
+
+  it("refuses an oversized legacy import like an oversized update", async () => {
+    using tempDir = new TestTempDir("drafts-import-too-large");
+    const { config, workspaceFile } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    const text = "x".repeat(MAX_DRAFT_JSON_BYTES);
+
+    let error: unknown;
+    try {
+      await service.importLegacy({ scope: WORKSPACE_SCOPE, text });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(
+      draftTooLargeMessage(JSON.stringify({ text, attachments: [] }).length)
+    );
+    expect(await exists(workspaceFile)).toBe(false);
+  });
+
+  it("measures the size limit in UTF-8 bytes", async () => {
+    using tempDir = new TestTempDir("drafts-too-large-bytes");
+    const { config, workspaceFile } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    // Under the limit in UTF-16 code units, over it in bytes (2 bytes per "é").
+    const text = "é".repeat(Math.ceil(MAX_DRAFT_JSON_BYTES * 0.6));
+
+    let error: unknown;
+    try {
+      await service.update({ scope: WORKSPACE_SCOPE, text });
+    } catch (caught) {
+      error = caught;
+    }
+    expect(isDraftTooLargeError(error)).toBe(true);
+    expect(await exists(workspaceFile)).toBe(false);
+  });
+
+  it("a write that fails during the first scan does not hide the draft on disk", async () => {
+    using tempDir = new TestTempDir("drafts-scan-failed-write");
+    const { config, workspaceFile } = await createHarness(tempDir);
+    await new DraftService(config).update({ scope: WORKSPACE_SCOPE, text: "on disk" });
+    const service = new DraftService(config);
+
+    // The write lands while the scan runs (between its sessions-dir listing and its reads) and
+    // fails like ENOSPC: the atomic write's rename onto draft.json is refused.
+    const realReaddir = fs.readdir.bind(fs);
+    const realRename = cjsFs.rename.bind(cjsFs);
+    let failedWrite = null as Promise<unknown> | null;
+    const readdirSpy = spyOn(fs, "readdir").mockImplementation((async (
+      ...args: Parameters<typeof fs.readdir>
+    ) => {
+      const listing = await (realReaddir as (...a: typeof args) => Promise<unknown>)(...args);
+      if (failedWrite === null && args[0] === config.sessionsDir) {
+        const renameSpy = spyOn(cjsFs, "rename").mockImplementation(((
+          from: cjsFs.PathLike,
+          to: cjsFs.PathLike,
+          callback: cjsFs.NoParamCallback
+        ) => {
+          if (String(to) === workspaceFile) {
+            callback(
+              Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" })
+            );
+            return;
+          }
+          realRename(from, to, callback);
+        }) as typeof cjsFs.rename);
+        failedWrite = service
+          .update({ scope: WORKSPACE_SCOPE, text: "lost write" })
+          .catch((error: unknown) => error);
+        await failedWrite;
+        renameSpy.mockRestore();
+      }
+      return listing;
+    }) as typeof fs.readdir);
+    try {
+      const summaries = await service.list();
+      expect(await failedWrite).toBeInstanceOf(Error);
+      expect(summaries.map((summary) => summary.text)).toEqual(["on disk"]);
+    } finally {
+      readdirSpy.mockRestore();
+    }
+  });
+
+  // #6728: a write published its draft to the index (what a snapshot lists) and its change event
+  // only after the directory fsync, but get() reads the renamed file at once. A window that
+  // subscribed during that fsync showed the old draft. Now all readers switch at the rename, and
+  // the write's reply still waits for the fsync.
+  it("a snapshot during a write's directory fsync shows what get() shows", async () => {
+    using tempDir = new TestTempDir("drafts-snapshot-during-fsync");
+    const { config } = await createHarness(tempDir);
+    const service = new DraftService(config);
+    await service.update({ scope: WORKSPACE_SCOPE, text: "old" });
+    const changed: string[] = [];
+    service.on(DRAFT_CHANGE_EVENT, (event: { type: string; text?: string }) => {
+      if (event.type === "changed" && event.text !== undefined) changed.push(event.text);
+    });
+
+    // Hold every directory fsync (the one after the rename) until released.
+    let releaseFsync: () => void = () => undefined;
+    const fsyncGate = new Promise<void>((resolve) => {
+      releaseFsync = resolve;
+    });
+    const realFsync = cjsFs.fsync.bind(cjsFs);
+    const fsyncSpy = spyOn(cjsFs, "fsync").mockImplementation(((
+      fd: number,
+      callback: cjsFs.NoParamCallback
+    ) => {
+      if (!cjsFs.fstatSync(fd).isDirectory()) return realFsync(fd, callback);
+      void fsyncGate.then(() => realFsync(fd, callback));
+    }) as typeof cjsFs.fsync);
+    try {
+      let replied = false;
+      const writing = service.update({ scope: WORKSPACE_SCOPE, text: "new" }).then((reply) => {
+        replied = true;
+        return reply;
+      });
+      const deadline = Date.now() + 5_000;
+      while ((await service.get(WORKSPACE_SCOPE)).text !== "new") {
+        if (Date.now() > deadline) throw new Error("the rename never happened");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+
+      const snapshot = await service.getSnapshotEvent();
+      expect(snapshot.drafts.map((draft) => draft.text)).toEqual(["new"]);
+      expect(changed).toEqual(["new"]);
+      expect(replied).toBe(false);
+
+      releaseFsync();
+      const reply = await writing;
+      expect(reply.revision).toBe(snapshot.drafts[0].revision);
+    } finally {
+      releaseFsync();
+      fsyncSpy.mockRestore();
+    }
+  });
+
+  it("rejects scopes that would resolve outside their storage dir", async () => {
+    using tempDir = new TestTempDir("drafts-traversal");
+    const { config } = await createHarness(tempDir);
+    const service = new DraftService(config);
+
+    const escapes: DraftScope[] = [{ kind: "workspace", workspaceId: "../escape" }];
+    for (const scope of escapes) {
+      let error: unknown;
+      try {
+        await service.update({ scope, text: "x" });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toBeDefined();
+      expect((await service.importLegacy({ scope, text: "x" })).result).toBe("orphaned");
+    }
+    expect(await exists(path.join(config.rootDir, "escape"))).toBe(false);
+    expect(await exists(path.join(config.rootDir, "escape.json"))).toBe(false);
+  });
+});

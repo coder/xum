@@ -1,16 +1,16 @@
-import React, { createContext, useContext, useState, useCallback, useEffect } from "react";
+import React, { createContext, useContext, useState, useCallback, useRef } from "react";
 import {
   TutorialTooltip,
   type TutorialStep,
 } from "@/browser/components/TutorialTooltip/TutorialTooltip";
-import {
-  TUTORIAL_STATE_KEY,
-  DEFAULT_TUTORIAL_STATE,
-  type TutorialState,
-  type TutorialSequence,
-} from "@/common/constants/storage";
 import { useIsSplashScreenActive } from "@/browser/features/SplashScreens/SplashScreenProvider";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  updateUserPreferences,
+  useAppConfig,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
+
+type TutorialSequence = "creation" | "workspace" | "review";
 
 // Tutorial step definitions for each sequence
 const TUTORIAL_SEQUENCES: Record<TutorialSequence, TutorialStep[]> = {
@@ -112,27 +112,30 @@ interface TutorialProviderProps {
 }
 
 export function TutorialProvider({ children }: TutorialProviderProps) {
-  const [tutorialState, setTutorialState] = useState<TutorialState>(() =>
-    readPersistedState(TUTORIAL_STATE_KEY, DEFAULT_TUTORIAL_STATE)
-  );
+  const tutorialDisabled =
+    useUserPreferences((preferences) => preferences.ui?.tutorialState?.disabled) ?? false;
+  const completed = useUserPreferences((preferences) => preferences.ui?.tutorialState?.completed);
+  const preferencesLoaded = useAppConfig((config) => config.userPreferences !== undefined);
   const isSplashScreenActive = useIsSplashScreenActive();
   const [activeSequence, setActiveSequence] = useState<TutorialSequence | null>(null);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  // Exits hold for the session: when the save is refused or fails, the store shows no exit and
+  // the start effects would reopen the tutorial at once.
+  const sessionExitsRef = useRef(new Set<TutorialSequence>());
+  const sessionDisabledRef = useRef(false);
   const sandboxTutorialOptIn = getTutorialSandboxOptIn();
   // Keep sandbox suppression runtime-only so a default sandbox launch cannot poison
   // later opt-in runs that reuse the same browser origin or Electron userData profile.
-  const effectiveTutorialsDisabled = tutorialState.disabled || sandboxTutorialOptIn === false;
-
-  // Persist state changes
-  useEffect(() => {
-    updatePersistedState(TUTORIAL_STATE_KEY, tutorialState);
-  }, [tutorialState]);
+  const effectiveTutorialsDisabled = tutorialDisabled || sandboxTutorialOptIn === false;
+  // Another window can finish the open tutorial; its synced completion closes it here too.
+  const shownSequence =
+    activeSequence !== null && completed?.[activeSequence] !== true ? activeSequence : null;
 
   const isSequenceCompleted = useCallback(
     (sequence: TutorialSequence): boolean => {
-      return tutorialState.completed[sequence] === true;
+      return completed?.[sequence] === true;
     },
-    [tutorialState.completed]
+    [completed]
   );
 
   const isTutorialDisabled = useCallback((): boolean => {
@@ -141,54 +144,54 @@ export function TutorialProvider({ children }: TutorialProviderProps) {
 
   const startSequence = useCallback(
     (sequence: TutorialSequence) => {
-      // Don't start if disabled or already completed
-      if (effectiveTutorialsDisabled || tutorialState.completed[sequence]) {
+      // Don't start before the saved state is known, if disabled, or if already completed
+      if (
+        !preferencesLoaded ||
+        effectiveTutorialsDisabled ||
+        sessionDisabledRef.current ||
+        completed?.[sequence] ||
+        sessionExitsRef.current.has(sequence)
+      ) {
         return;
       }
       // Don't start if another sequence is active
-      if (activeSequence !== null) {
+      if (shownSequence !== null) {
         return;
       }
       setActiveSequence(sequence);
       setCurrentStepIndex(0);
     },
-    [effectiveTutorialsDisabled, tutorialState.completed, activeSequence]
+    [preferencesLoaded, effectiveTutorialsDisabled, completed, shownSequence]
   );
 
-  const handleNext = useCallback(() => {
-    if (activeSequence === null) return;
+  const completeSequence = useCallback((sequence: TutorialSequence) => {
+    sessionExitsRef.current.add(sequence);
+    updateUserPreferences({ ui: { tutorialState: { completed: { [sequence]: true } } } });
+    setActiveSequence(null);
+    setCurrentStepIndex(0);
+  }, []);
 
-    const steps = TUTORIAL_SEQUENCES[activeSequence];
+  const handleNext = useCallback(() => {
+    if (shownSequence === null) return;
+
+    const steps = TUTORIAL_SEQUENCES[shownSequence];
     if (currentStepIndex < steps.length - 1) {
       setCurrentStepIndex((prev) => prev + 1);
     } else {
-      // Complete the sequence
-      setTutorialState((prev) => ({
-        ...prev,
-        completed: { ...prev.completed, [activeSequence]: true },
-      }));
-      setActiveSequence(null);
-      setCurrentStepIndex(0);
+      completeSequence(shownSequence);
     }
-  }, [activeSequence, currentStepIndex]);
+  }, [shownSequence, completeSequence, currentStepIndex]);
 
   const handleDismiss = useCallback(() => {
-    if (activeSequence === null) return;
+    if (shownSequence === null) return;
 
     // Mark as completed when dismissed
-    setTutorialState((prev) => ({
-      ...prev,
-      completed: { ...prev.completed, [activeSequence]: true },
-    }));
-    setActiveSequence(null);
-    setCurrentStepIndex(0);
-  }, [activeSequence]);
+    completeSequence(shownSequence);
+  }, [shownSequence, completeSequence]);
 
   const handleDisableTutorial = useCallback(() => {
-    setTutorialState((prev) => ({
-      ...prev,
-      disabled: true,
-    }));
+    sessionDisabledRef.current = true;
+    updateUserPreferences({ ui: { tutorialState: { disabled: true } } });
     setActiveSequence(null);
     setCurrentStepIndex(0);
   }, []);
@@ -199,7 +202,7 @@ export function TutorialProvider({ children }: TutorialProviderProps) {
     isTutorialDisabled,
   };
 
-  const activeSteps = activeSequence ? TUTORIAL_SEQUENCES[activeSequence] : null;
+  const activeSteps = shownSequence ? TUTORIAL_SEQUENCES[shownSequence] : null;
   const currentStep = activeSteps?.[currentStepIndex];
 
   return (

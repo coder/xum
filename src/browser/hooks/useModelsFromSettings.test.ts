@@ -1,10 +1,10 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+// Bootstrap DOM before API imports can initialize Radix layout effects.
+import { installDom } from "../../../tests/ui/dom";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import * as APIModule from "@/browser/contexts/API";
-import * as PolicyContextModule from "@/browser/contexts/PolicyContext";
 import * as ProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
 import * as RoutingModule from "@/browser/hooks/useRouting";
-import { installDom } from "../../../tests/ui/dom";
 import {
   filterHiddenModels,
   getDefaultModel,
@@ -17,7 +17,7 @@ import type {
   ProviderModelEntry,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
-import { DEFAULT_MODEL_KEY, HIDDEN_MODELS_KEY } from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 
 function countOccurrences(haystack: string[], needle: string): number {
   return haystack.filter((v) => v === needle).length;
@@ -70,6 +70,7 @@ const useRoutingMock = mock(() => ({
   routePriority,
   routeOverrides,
   resolveRoute: () => ({ route: "direct", isAuto: true, displayName: "Direct" }),
+  resolveEffectiveRoute: () => "direct",
   availableRoutes: () => [],
   setRoutePreferences: () => {
     /* noop */
@@ -85,7 +86,6 @@ const useRoutingMock = mock(() => ({
 const actualProvidersConfigModule = { ...ProvidersConfigModule };
 const actualRoutingModule = { ...RoutingModule };
 const actualAPIModule = { ...APIModule };
-const actualPolicyContextModule = { ...PolicyContextModule };
 
 // Specifiers mocked by this suite, shared by install/restore so the two helpers can never
 // drift: a path that gets mocked but not restored would silently re-introduce the
@@ -93,7 +93,6 @@ const actualPolicyContextModule = { ...PolicyContextModule };
 const PROVIDERS_CONFIG_MODULE = "@/browser/hooks/useProvidersConfig";
 const ROUTING_MODULE = "@/browser/hooks/useRouting";
 const API_MODULE = "@/browser/contexts/API";
-const POLICY_CONTEXT_MODULE = "@/browser/contexts/PolicyContext";
 
 async function installUseModelsModuleMocks() {
   await mock.module(PROVIDERS_CONFIG_MODULE, () => ({
@@ -108,13 +107,6 @@ async function installUseModelsModuleMocks() {
     ...actualAPIModule,
     useAPI: () => ({ api: apiMock }),
   }));
-  await mock.module(POLICY_CONTEXT_MODULE, () => ({
-    ...actualPolicyContextModule,
-    usePolicy: () => ({
-      status: { state: "disabled" as const },
-      policy: null,
-    }),
-  }));
 }
 
 async function restoreUseModelsModuleMocks() {
@@ -123,7 +115,6 @@ async function restoreUseModelsModuleMocks() {
   await mock.module(PROVIDERS_CONFIG_MODULE, () => actualProvidersConfigModule);
   await mock.module(ROUTING_MODULE, () => actualRoutingModule);
   await mock.module(API_MODULE, () => actualAPIModule);
-  await mock.module(POLICY_CONTEXT_MODULE, () => actualPolicyContextModule);
 }
 
 let cleanupDom: (() => void) | null = null;
@@ -135,11 +126,14 @@ async function setupUseModelsHookTest() {
   routePriority = ["direct"];
   routeOverrides = {};
   apiMock = null;
+  getAppConfigStore().updateOptimistically({ defaultModel: undefined, hiddenModels: undefined });
   await installUseModelsModuleMocks();
 }
 
 async function cleanupUseModelsHookTest() {
   cleanup();
+  // The store is an app-wide singleton; a default left here changes later files' send model.
+  getAppConfigStore().updateOptimistically({ defaultModel: undefined, hiddenModels: undefined });
   await restoreUseModelsModuleMocks();
   mock.restore();
   cleanupDom?.();
@@ -171,13 +165,6 @@ describe("getSuggestedModels", () => {
         isConfigured: true,
         models: [builtInModelId],
       },
-      "mux-gateway": {
-        apiKeySet: true,
-        isEnabled: true,
-        isConfigured: true,
-        couponCodeSet: true,
-        models: ["ignored"],
-      },
     };
 
     const suggested = getSuggestedModels(config);
@@ -185,9 +172,6 @@ describe("getSuggestedModels", () => {
     // Custom models are listed first (in config order)
     expect(suggested[0]).toBe("openai:my-team-model");
     expect(suggested[1]).toBe(`${builtInProvider}:${builtInModelId}`);
-
-    // mux-gateway models should never appear as selectable entries
-    expect(suggested.some((m) => m.startsWith("mux-gateway:"))).toBe(false);
 
     // Built-ins should be present, but deduped against any custom entry
     expect(countOccurrences(suggested, builtIn)).toBe(1);
@@ -228,7 +212,7 @@ describe("useModelsFromSettings selected model preservation", () => {
 
   test("getDefaultModel preserves explicit gateway-scoped defaults", () => {
     const gatewayModel = "openrouter:openai/gpt-5";
-    globalThis.window.localStorage.setItem(DEFAULT_MODEL_KEY, JSON.stringify(gatewayModel));
+    getAppConfigStore().updateOptimistically({ defaultModel: gatewayModel });
 
     expect(getDefaultModel()).toBe(gatewayModel);
   });
@@ -246,12 +230,40 @@ describe("useModelsFromSettings selected model preservation", () => {
     });
 
     await waitFor(() => expect(result.current.defaultModel).toBe("openrouter:openai/gpt-5"));
-    expect(globalThis.window.localStorage.getItem(DEFAULT_MODEL_KEY)).toBe(
-      JSON.stringify("openrouter:openai/gpt-5")
-    );
     expect(updateModelPreferences).toHaveBeenCalledWith({
       defaultModel: "openrouter:openai/gpt-5",
     });
+  });
+
+  test("refuses a default model change visibly while disconnected", () => {
+    const alert = spyOn(window, "alert").mockImplementation(() => undefined);
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    act(() => {
+      result.current.setDefaultModel("openrouter:openai/gpt-5");
+    });
+
+    expect(getAppConfigStore().getSnapshot()?.defaultModel).toBeUndefined();
+    expect(alert).toHaveBeenCalledTimes(1);
+  });
+
+  test("a default model save cut off by a lost connection is reported as unconfirmed", async () => {
+    // Without a mounted composer the toast falls back to window.alert (fresh window per test).
+    const alerts: unknown[] = [];
+    window.alert = (message?: unknown) => alerts.push(message);
+    // oRPC settles a request on a closed socket with an AbortError.
+    const closed = new Error("WebSocket closed (code 1006)");
+    closed.name = "AbortError";
+    apiMock = { config: { updateModelPreferences: mock(() => Promise.reject(closed)) } };
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    act(() => {
+      result.current.setDefaultModel("openrouter:openai/gpt-5");
+    });
+
+    await waitFor(() =>
+      expect(alerts).toEqual(["Connection lost: settings may not have been saved"])
+    );
   });
 
   test("ensureModelInSettings skips syncing explicit gateway-scoped selections", () => {
@@ -270,7 +282,6 @@ describe("useModelsFromSettings selected model preservation", () => {
 
     act(() => {
       result.current.ensureModelInSettings("openrouter:anthropic/custom-model");
-      result.current.ensureModelInSettings("mux-gateway:anthropic/custom-model");
     });
 
     expect(setModels).not.toHaveBeenCalled();
@@ -364,7 +375,7 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
         codexOauthSet: true,
         models: [
           ...SEEDED_OPENAI_CUSTOM_MODELS,
-          { id: "team-codex", mappedToModel: KNOWN_MODELS.GPT_53_CODEX.id },
+          { id: "team-codex", mappedToModel: KNOWN_MODELS.GPT.id },
         ],
       },
     };
@@ -372,33 +383,11 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
     const { result } = renderHook(() => useModelsFromSettings());
 
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.models).not.toContain(KNOWN_MODELS.GPT_PRO.id);
-    expect(result.current.models).toContain("openai:gpt-5.2-codex");
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_53_CODEX.id);
-    expect(result.current.models).toContain("openai:gpt-5.3-codex-spark");
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_6_LUNA.id);
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_6_ASTRA.id);
+    expect(result.current.models).not.toContain("openai:gpt-5.2-codex");
     expect(result.current.models).toContain("openai:team-codex");
     expect(result.current.models).not.toContain("openai:gpt-5.2-pro");
-  });
-
-  test("api key only: hides only OAuth-required OpenAI models", () => {
-    providersConfig = {
-      openai: {
-        apiKeySet: true,
-        isEnabled: true,
-        isConfigured: true,
-        codexOauthSet: false,
-        models: SEEDED_OPENAI_CUSTOM_MODELS,
-      },
-    };
-
-    const { result } = renderHook(() => useModelsFromSettings());
-
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
-    expect(result.current.models).toContain("openai:gpt-5.2-codex");
-    expect(result.current.models).toContain("openai:gpt-5.2-pro");
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_53_CODEX.id);
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.models).not.toContain("openai:gpt-5.3-codex-spark");
   });
 
   test("api key + codex oauth: allows all OpenAI models", () => {
@@ -414,33 +403,53 @@ describe("useModelsFromSettings OpenAI Codex OAuth gating", () => {
 
     const { result } = renderHook(() => useModelsFromSettings());
 
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_6_ASTRA.id);
     expect(result.current.models).toContain("openai:gpt-5.2-codex");
     expect(result.current.models).toContain("openai:gpt-5.2-pro");
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_53_CODEX.id);
+    expect(result.current.models).toContain(KNOWN_MODELS.GPT_6_LUNA.id);
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.models).toContain("openai:gpt-5.3-codex-spark");
   });
 
-  test("neither auth mode: still hides only OAuth-required OpenAI models", () => {
+  test("codex oauth only: a gateway route bypasses the OpenAI auth gate", () => {
     providersConfig = {
       openai: {
         apiKeySet: false,
         isEnabled: true,
         isConfigured: true,
-        codexOauthSet: false,
+        codexOauthSet: true,
         models: SEEDED_OPENAI_CUSTOM_MODELS,
       },
+      openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
     };
+    routePriority = ["openrouter", "direct"];
 
     const { result } = renderHook(() => useModelsFromSettings());
 
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_PRO.id);
+    // The gateway supplies its own credentials, so API-key-only models stay visible.
     expect(result.current.models).toContain("openai:gpt-5.2-codex");
     expect(result.current.models).toContain("openai:gpt-5.2-pro");
-    expect(result.current.models).toContain(KNOWN_MODELS.GPT_53_CODEX.id);
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.models).not.toContain("openai:gpt-5.3-codex-spark");
+  });
+
+  test("codex oauth only: a per-model gateway override bypasses the gate for that model only", () => {
+    providersConfig = {
+      openai: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        codexOauthSet: true,
+        models: SEEDED_OPENAI_CUSTOM_MODELS,
+      },
+      openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
+    };
+    routePriority = ["direct", "openrouter"];
+    routeOverrides = { "openai:gpt-5.2-codex": "openrouter" };
+
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    expect(result.current.models).toContain("openai:gpt-5.2-codex");
+    // Direct-routed models keep the OAuth-only gate.
+    expect(result.current.models).not.toContain("openai:gpt-5.2-pro");
   });
 
   test("exposes OpenAI auth state flags", () => {
@@ -498,19 +507,14 @@ describe("useModelsFromSettings provider availability gating", () => {
   test("keeps routed provider models visible when a gateway route is active", () => {
     providersConfig = {
       anthropic: { apiKeySet: false, isEnabled: true, isConfigured: false },
-      "mux-gateway": {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        couponCodeSet: true,
-      },
+      openrouter: { apiKeySet: true, isEnabled: true, isConfigured: true },
     };
-    routePriority = ["mux-gateway", "direct"];
+    routePriority = ["openrouter", "direct"];
     routeOverrides = {};
 
     const { result } = renderHook(() => useModelsFromSettings());
 
-    // Routing availability is provider-level: a configured mux-gateway makes
+    // Routing availability is provider-level: a configured OpenRouter makes
     // all built-in Anthropic models visible, not just a per-model allowlist.
     expect(result.current.models).toContain(KNOWN_MODELS.OPUS.id);
     expect(result.current.models).toContain(KNOWN_MODELS.SONNET.id);
@@ -546,7 +550,7 @@ describe("useModelsFromSettings provider availability gating", () => {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: [KNOWN_MODELS.GPT_54_MINI.providerModelId],
+        models: [KNOWN_MODELS.GPT_6_LUNA.providerModelId],
       },
     };
     routePriority = ["github-copilot", "direct"];
@@ -557,6 +561,29 @@ describe("useModelsFromSettings provider availability gating", () => {
     expect(result.current.hiddenModelsForSelector).toContain(KNOWN_MODELS.GPT.id);
   });
 
+  test.each([
+    { canonicalRoutes: { google: "agents-google" }, routed: true },
+    { canonicalRoutes: undefined, routed: false },
+  ])("Coder canonicalRoutes decides Google availability: %j", (testCase) => {
+    providersConfig = {
+      coder: {
+        apiKeySet: false,
+        isEnabled: true,
+        isConfigured: true,
+        discoveredProviders: [{ name: "agents-google", type: "google" }],
+        canonicalRoutes: testCase.canonicalRoutes,
+      },
+    };
+    routePriority = ["coder", "direct"];
+
+    const { result } = renderHook(() => useModelsFromSettings());
+
+    expect(result.current.models.includes(KNOWN_MODELS.GEMINI_FLASH.id)).toBe(testCase.routed);
+    expect(result.current.hiddenModelsForSelector.includes(KNOWN_MODELS.GEMINI_FLASH.id)).toBe(
+      !testCase.routed
+    );
+  });
+
   test("keeps Copilot catalogs authoritative without surfacing selector entries", () => {
     providersConfig = {
       openai: { apiKeySet: false, isEnabled: true, isConfigured: false },
@@ -564,7 +591,7 @@ describe("useModelsFromSettings provider availability gating", () => {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: [KNOWN_MODELS.GPT_54_MINI.providerModelId],
+        models: [KNOWN_MODELS.GPT_6_LUNA.providerModelId],
       },
     };
     routePriority = ["github-copilot", "direct"];
@@ -606,7 +633,7 @@ describe("useModelsFromSettings provider availability gating", () => {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: ["claude-haiku-4.5"],
+        models: ["claude-haiku-5.5"],
       },
     };
     routePriority = ["github-copilot", "direct"];
@@ -635,25 +662,6 @@ describe("useModelsFromSettings provider availability gating", () => {
 
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
     expect(result.current.hiddenModelsForSelector).not.toContain(KNOWN_MODELS.GPT.id);
-  });
-
-  test("excludes OAuth-gated OpenAI models from hidden bucket when unconfigured", () => {
-    // OpenAI is unconfigured and neither API key nor OAuth is set.
-    providersConfig = {
-      openai: { apiKeySet: false, isEnabled: true, isConfigured: false, codexOauthSet: false },
-    };
-
-    const { result } = renderHook(() => useModelsFromSettings());
-
-    // OAuth-required models (currently Spark) should NOT appear in either list
-    // because selecting them from "Show all models…" would fail at send time.
-    expect(result.current.models).not.toContain("openai:gpt-5.3-codex-spark");
-    expect(result.current.hiddenModelsForSelector).not.toContain("openai:gpt-5.3-codex-spark");
-
-    // Non-OAuth-required OpenAI models should still be in the hidden bucket
-    // when the provider is unconfigured.
-    expect(result.current.hiddenModelsForSelector).toContain("openai:gpt-5.3-codex");
-    expect(result.current.hiddenModelsForSelector).toContain(KNOWN_MODELS.GPT.id);
   });
 
   test("shows explicit OpenRouter custom models when only the direct provider is configured", () => {
@@ -690,7 +698,7 @@ describe("useModelsFromSettings provider availability gating", () => {
     expect(result.current.hiddenModelsForSelector).not.toContain(OPENROUTER_OPENAI_CUSTOM_MODEL);
   });
 
-  test("shows explicit OpenRouter custom models when OpenRouter is unavailable but mux-gateway is configured", () => {
+  test("shows explicit OpenRouter custom models when OpenRouter is unavailable but another gateway is configured", () => {
     providersConfig = {
       openrouter: {
         apiKeySet: false,
@@ -699,9 +707,9 @@ describe("useModelsFromSettings provider availability gating", () => {
         models: ["openai/gpt-5"],
       },
       openai: { apiKeySet: true, isEnabled: true, isConfigured: true },
-      "mux-gateway": { apiKeySet: false, isEnabled: true, isConfigured: true },
+      "github-copilot": { apiKeySet: true, isEnabled: true, isConfigured: true },
     };
-    routePriority = ["openrouter", "mux-gateway", "direct"];
+    routePriority = ["openrouter", "github-copilot", "direct"];
 
     const { result } = renderHook(() => useModelsFromSettings());
 
@@ -723,10 +731,7 @@ describe("useModelsFromSettings provider availability gating", () => {
   });
 
   test("keeps persisted hiddenModels separate from provider-hidden models", () => {
-    globalThis.window.localStorage.setItem(
-      HIDDEN_MODELS_KEY,
-      JSON.stringify([KNOWN_MODELS.GPT.id])
-    );
+    getAppConfigStore().updateOptimistically({ hiddenModels: [KNOWN_MODELS.GPT.id] });
 
     providersConfig = {
       anthropic: { apiKeySet: false, isEnabled: true, isConfigured: false },
@@ -749,12 +754,12 @@ describe("useModelsFromSettings provider availability gating", () => {
 
     expect(result.current.models).toContain(KNOWN_MODELS.OPUS.id);
     expect(result.current.models).toContain(KNOWN_MODELS.GPT.id);
-    expect(result.current.hiddenModelsForSelector.length).toBe(0);
+    expect(result.current.hiddenModelsForSelector).toEqual([]);
   });
 
   test("gateway-prefixed custom model stays available via canonical route override when gateway is unavailable", () => {
     routePriority = ["direct"];
-    routeOverrides = { "openai:gpt-5": "mux-gateway" };
+    routeOverrides = { "openai:gpt-5": "github-copilot" };
 
     providersConfig = {
       openrouter: {
@@ -764,12 +769,7 @@ describe("useModelsFromSettings provider availability gating", () => {
         models: ["openai/gpt-5"],
       },
       openai: { apiKeySet: false, isEnabled: true, isConfigured: false },
-      "mux-gateway": {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: true,
-        couponCodeSet: true,
-      },
+      "github-copilot": { apiKeySet: true, isEnabled: true, isConfigured: true },
     };
 
     const { result } = renderHook(() => useModelsFromSettings());
@@ -796,6 +796,7 @@ describe("useModelsFromSettings hidden-model gateway identity", () => {
   afterEach(cleanupUseModelsHookTest);
 
   test("hiding an explicit Coder gateway model hides that entry, not the direct model", async () => {
+    apiMock = { config: { updateModelPreferences: mock(() => Promise.resolve(undefined)) } };
     // Cross-typed instance: name "openai", type "anthropic". Name-only
     // canonicalization would persist openai:claude-opus-4-1, leaving the
     // Coder entry visible and hiding the distinct direct OpenAI model.
@@ -837,5 +838,36 @@ describe("useModelsFromSettings hidden-model gateway identity", () => {
     await waitFor(() => {
       expect(result.current.models).toContain("coder:openai/claude-opus-4-1");
     });
+  });
+});
+
+describe("useModelsFromSettings hidden-model persistence", () => {
+  beforeEach(setupUseModelsHookTest);
+  afterEach(cleanupUseModelsHookTest);
+
+  test("hide and unhide persist to the backend and survive remount", async () => {
+    const luna = KNOWN_MODELS.GPT_6_LUNA.id;
+    const astra = KNOWN_MODELS.GPT_6_ASTRA.id;
+    providersConfig = { openai: { apiKeySet: true, isEnabled: true, isConfigured: true } };
+    const persist = mock(() => Promise.resolve());
+    apiMock = { config: { updateModelPreferences: persist } };
+    getAppConfigStore().updateOptimistically({
+      defaultModel: KNOWN_MODELS.GPT.id,
+      hiddenModels: [luna],
+    });
+    let hook = renderHook(() => useModelsFromSettings());
+    expect(hook.result.current.models).not.toContain(luna);
+
+    act(() => hook.result.current.hideModel(astra));
+    act(() => hook.result.current.unhideModel(luna));
+    await waitFor(() => expect(hook.result.current.models).toContain(luna));
+    expect(hook.result.current.models).not.toContain(astra);
+    expect(persist).toHaveBeenLastCalledWith({ hiddenModels: [astra] });
+
+    hook.unmount();
+    hook = renderHook(() => useModelsFromSettings());
+    expect(hook.result.current.models).toContain(luna);
+    expect(hook.result.current.models).not.toContain(astra);
+    expect(hook.result.current.defaultModel).toBe(KNOWN_MODELS.GPT.id);
   });
 });

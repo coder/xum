@@ -6,10 +6,18 @@ import * as path from "path";
 
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { buildSessionFiles } from "@/node/services/sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
 import { setTodosForSessionDir } from "@/node/services/tools/todo";
+import {
+  createMemoryHost,
+  MEMORY_USER_HOME,
+} from "@/node/services/hostFiles/memoryHostFiles.testHarness";
 
 import { MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD } from "./internalToolResultFields";
 import { getToolsForModel } from "./tools";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 type ToolExecuteFn = (args?: unknown, options?: unknown) => Promise<unknown>;
 
@@ -39,11 +47,17 @@ describe("getToolsForModel - model-only notifications", () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ws-"));
 
     try {
-      await setTodosForSessionDir("ws-1", workspaceSessionDir, [
-        { content: "Completed", status: "completed" },
-        { content: "In progress", status: "in_progress" },
-        { content: "Pending", status: "pending" },
-      ]);
+      await setTodosForSessionDir(
+        "ws-1",
+        workspaceSessionDir,
+        [
+          { content: "Completed", status: "completed" },
+          { content: "In progress", status: "in_progress" },
+          { content: "Pending", status: "pending" },
+        ],
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
       const runtime = new LocalRuntime(process.cwd());
       const initStateManager = {
@@ -83,9 +97,13 @@ describe("getToolsForModel - model-only notifications", () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ws-"));
 
     try {
-      await setTodosForSessionDir("ws-1", workspaceSessionDir, [
-        { content: "In progress", status: "in_progress" },
-      ]);
+      await setTodosForSessionDir(
+        "ws-1",
+        workspaceSessionDir,
+        [{ content: "In progress", status: "in_progress" }],
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
       const runtime = new LocalRuntime(process.cwd());
       const initStateManager = {
@@ -180,9 +198,13 @@ describe("getToolsForModel - model-only notifications", () => {
     const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ws-"));
 
     try {
-      await setTodosForSessionDir("ws-1", workspaceSessionDir, [
-        { content: "In progress", status: "in_progress" },
-      ]);
+      await setTodosForSessionDir(
+        "ws-1",
+        workspaceSessionDir,
+        [{ content: "In progress", status: "in_progress" }],
+        nodeSessionLocks,
+        nodeSessionFiles
+      );
 
       const runtime = new LocalRuntime(process.cwd());
       const initStateManager = {
@@ -221,5 +243,81 @@ describe("getToolsForModel - model-only notifications", () => {
     } finally {
       await fs.rm(workspaceSessionDir, { recursive: true, force: true });
     }
+  });
+
+  test("the reminder reads the list that todo_write left in the session's SessionFiles", async () => {
+    const workspaceSessionDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-ws-"));
+
+    try {
+      const initStateManager = {
+        waitForInit: () => Promise.resolve(),
+      } as unknown as InitStateManager;
+      const tools = await getToolsForModel(
+        "noop:model",
+        {
+          cwd: process.cwd(),
+          runtime: new LocalRuntime(process.cwd()),
+          runtimeTempDir: "/tmp",
+          workspaceId: "ws-1",
+          workspaceSessionDir,
+          sessionFiles: buildSessionFiles(SessionFilesMemory),
+        },
+        "ws-1",
+        initStateManager
+      );
+
+      await getExecute(tools.todo_write)(
+        { todos: [{ content: "In progress", status: "in_progress" }] },
+        { toolCallId: "todo-1", messages: [] }
+      );
+      const todoReadExecute = getExecute(tools.todo_read);
+      for (let i = 0; i < 4; i += 1) {
+        const result = asRecord(await todoReadExecute());
+        expect(MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD in result).toBe(false);
+      }
+
+      const fifth = asRecord(await todoReadExecute());
+      expect(String((fifth[MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD] as unknown[])[0])).toContain(
+        "- [>] In progress"
+      );
+      expect(await fs.readdir(workspaceSessionDir)).toEqual([]);
+    } finally {
+      await fs.rm(workspaceSessionDir, { recursive: true, force: true });
+    }
+  });
+
+  test("the home clutter note reads the home of the HostFiles and HostPaths it was given", async () => {
+    // The agent loop passes its host layers (phase 5): an entry that appears in the memory home
+    // gets the note, and the Node home of the test process is never read.
+    const host = createMemoryHost();
+    const initStateManager = {
+      waitForInit: () => Promise.resolve(),
+    } as unknown as InitStateManager;
+    const tools = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime: new LocalRuntime(process.cwd()),
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+        workspaceSessionDir: "/sessions/ws-1",
+        sessionFiles: buildSessionFiles(SessionFilesMemory),
+        hostFiles: host.files,
+        hostPaths: host.paths,
+        xumEnv: { XUM_RUNTIME: "local", XUM_SCRATCH_DIR: "/tmp/scratch" },
+      },
+      "ws-1",
+      initStateManager
+    );
+    const todoReadExecute = getExecute(tools.todo_read);
+    // The first call waits for the turn-start listing of the home.
+    expect(MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD in asRecord(await todoReadExecute())).toBe(false);
+
+    await host.files.promises.writeFile(path.join(MEMORY_USER_HOME, "helper.sh"), "echo hi\n");
+
+    const next = asRecord(await todoReadExecute());
+    expect(String((next[MODEL_ONLY_TOOL_NOTIFICATIONS_FIELD] as unknown[])[0])).toContain(
+      "`~/helper.sh`"
+    );
   });
 });

@@ -13,9 +13,10 @@ import type { MuxMessage, MuxTextPart } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { StreamDeltaEvent, StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
+import type { StreamErrorType } from "@/common/types/errors";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { HistoryService } from "./historyService";
-import { createErrorEvent } from "./utils/sendMessageError";
+import { createErrorEvent, type StreamErrorPayload } from "./utils/sendMessageError";
 
 // ---------------------------------------------------------------------------
 // Shared context for both simulation paths
@@ -26,7 +27,6 @@ export interface SimulationContext {
   workspaceId: string;
   assistantMessageId: string;
   canonicalModelString: string;
-  routedThroughGateway: boolean;
   routeProvider?: string;
   historySequence: number;
   systemMessageTokens: number;
@@ -45,7 +45,6 @@ function createSimulatedStreamStart(ctx: SimulationContext): StreamStartEvent {
     workspaceId: ctx.workspaceId,
     messageId: ctx.assistantMessageId,
     model: ctx.canonicalModelString,
-    routedThroughGateway: ctx.routedThroughGateway,
     ...(ctx.routeProvider != null ? { routeProvider: ctx.routeProvider } : {}),
     historySequence: ctx.historySequence,
     startTime: Date.now(),
@@ -68,7 +67,7 @@ function createSimulatedStreamStart(ctx: SimulationContext): StreamStartEvent {
 export async function simulateContextLimitError(
   ctx: SimulationContext,
   historyService: HistoryService
-): Promise<void> {
+): Promise<StreamErrorPayload & { errorType: StreamErrorType }> {
   const errorMessage =
     "Context length exceeded: the conversation is too long to send to this OpenAI model. Please shorten the history and try again.";
 
@@ -79,7 +78,6 @@ export async function simulateContextLimitError(
       historySequence: ctx.historySequence,
       timestamp: Date.now(),
       model: ctx.canonicalModelString,
-      routedThroughGateway: ctx.routedThroughGateway,
       ...(ctx.routeProvider != null ? { routeProvider: ctx.routeProvider } : {}),
       systemMessageTokens: ctx.systemMessageTokens,
       agentId: ctx.effectiveAgentId,
@@ -94,15 +92,14 @@ export async function simulateContextLimitError(
 
   await historyService.writePartial(ctx.workspaceId, errorPartialMessage);
 
+  const payload = {
+    messageId: ctx.assistantMessageId,
+    error: errorMessage,
+    errorType: "context_exceeded",
+  } as const;
   ctx.emit("stream-start", createSimulatedStreamStart(ctx));
-  ctx.emit(
-    "error",
-    createErrorEvent(ctx.workspaceId, {
-      messageId: ctx.assistantMessageId,
-      error: errorMessage,
-      errorType: "context_exceeded",
-    })
-  );
+  ctx.emit("error", createErrorEvent(ctx.workspaceId, payload));
+  return payload;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,11 +116,10 @@ export async function simulateToolPolicyNoop(
   ctx: SimulationContext,
   effectiveToolPolicy: ToolPolicy | undefined,
   historyService: HistoryService
-): Promise<void> {
+): Promise<StreamEndEvent> {
   const noopMessage = createMuxMessage(ctx.assistantMessageId, "assistant", "", {
     timestamp: Date.now(),
     model: ctx.canonicalModelString,
-    routedThroughGateway: ctx.routedThroughGateway,
     ...(ctx.routeProvider != null ? { routeProvider: ctx.routeProvider } : {}),
     systemMessageTokens: ctx.systemMessageTokens,
     agentId: ctx.effectiveAgentId,
@@ -171,7 +167,6 @@ export async function simulateToolPolicyNoop(
       agentId: ctx.effectiveAgentId,
       ...(ctx.metadataMode != null ? { mode: ctx.metadataMode } : {}),
       thinkingLevel: ctx.effectiveThinkingLevel,
-      routedThroughGateway: ctx.routedThroughGateway,
       ...(ctx.routeProvider != null ? { routeProvider: ctx.routeProvider } : {}),
       systemMessageTokens: ctx.systemMessageTokens,
     },
@@ -190,4 +185,5 @@ export async function simulateToolPolicyNoop(
 
   await historyService.deletePartial(ctx.workspaceId);
   await historyService.updateHistory(ctx.workspaceId, finalAssistantMessage);
+  return streamEndEvent;
 }

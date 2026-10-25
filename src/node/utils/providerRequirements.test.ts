@@ -6,6 +6,8 @@ import { describe, expect, it } from "bun:test";
 
 import type { ProvidersConfig } from "@/node/config";
 import {
+  buildProvidersFromEnv,
+  providerSecretEnvVarNames,
   hasAnyConfiguredProvider,
   isProviderAutoRouteEligible,
   resolveCustomProviderCredentials,
@@ -46,17 +48,17 @@ describe("isProviderAutoRouteEligible", () => {
   });
 
   it("returns false for disabled non-bedrock providers even when configured", () => {
-    expect(
-      isProviderAutoRouteEligible("mux-gateway", { couponCode: "x", enabled: false }, {})
-    ).toBe(false);
+    expect(isProviderAutoRouteEligible("openrouter", { apiKey: "x", enabled: false }, {})).toBe(
+      false
+    );
   });
 
   it("returns true for non-bedrock providers when enabled is omitted", () => {
-    expect(isProviderAutoRouteEligible("mux-gateway", { couponCode: "x" }, {})).toBe(true);
+    expect(isProviderAutoRouteEligible("openrouter", { apiKey: "x" }, {})).toBe(true);
   });
 
   it("returns true for non-bedrock providers when explicitly enabled", () => {
-    expect(isProviderAutoRouteEligible("mux-gateway", { couponCode: "x", enabled: true }, {})).toBe(
+    expect(isProviderAutoRouteEligible("openrouter", { apiKey: "x", enabled: true }, {})).toBe(
       true
     );
   });
@@ -126,6 +128,22 @@ describe("hasAnyConfiguredProvider", () => {
     expect(hasAnyConfiguredProvider(providers)).toBe(true);
   });
 
+  it("ignores the TypeSafe classifier key, which cannot serve chat models", () => {
+    const providers: ProvidersConfig = {
+      typesafe: { apiKey: "ts-classifier-key" },
+    };
+
+    expect(hasAnyConfiguredProvider(providers)).toBe(false);
+  });
+
+  it("still counts a legacy custom chat provider stored under the typesafe id", () => {
+    const providers: ProvidersConfig = {
+      typesafe: { providerType: "openai-compatible", baseUrl: "http://localhost:8000/v1" },
+    };
+
+    expect(hasAnyConfiguredProvider(providers)).toBe(true);
+  });
+
   it("returns false for disabled custom OpenAI-compatible providers", () => {
     const providers: ProvidersConfig = {
       "local-vllm": {
@@ -136,6 +154,159 @@ describe("hasAnyConfiguredProvider", () => {
     };
 
     expect(hasAnyConfiguredProvider(providers)).toBe(false);
+  });
+});
+
+describe("resolveProviderCredentials - Meta", () => {
+  it.each(["META_MODEL_API_KEY", "MODEL_API_KEY"])(
+    "resolves and bootstraps Meta via %s without borrowing OpenAI's key",
+    (key) => {
+      const env = { [key]: " meta-test-key ", OPENAI_API_KEY: "other-provider-key" };
+      expect(resolveProviderCredentials("meta", {}, env)).toMatchObject({
+        isConfigured: true,
+        apiKey: "meta-test-key",
+        apiKeySource: "env",
+      });
+      expect(buildProvidersFromEnv(env).meta).toEqual({ apiKey: "meta-test-key" });
+      expect(
+        resolveProviderCredentials("meta", {}, { OPENAI_API_KEY: "other-provider-key" })
+          .isConfigured
+      ).toBe(false);
+      expect(providerSecretEnvVarNames()).toContain(key);
+    }
+  );
+
+  it("prefers the namespaced Meta key and falls back when it is empty", () => {
+    expect(
+      resolveProviderCredentials(
+        "meta",
+        {},
+        {
+          META_MODEL_API_KEY: "namespaced-key",
+          MODEL_API_KEY: "official-key",
+        }
+      ).apiKey
+    ).toBe("namespaced-key");
+    expect(
+      resolveProviderCredentials(
+        "meta",
+        {},
+        {
+          META_MODEL_API_KEY: " ",
+          MODEL_API_KEY: "official-key",
+        }
+      ).apiKey
+    ).toBe("official-key");
+  });
+
+  it("prefers saved Meta credentials and excludes disabled Meta from auto-routing", () => {
+    const env = { META_MODEL_API_KEY: "env-key" };
+    expect(resolveProviderCredentials("meta", { apiKey: "saved-key" }, env)).toMatchObject({
+      apiKey: "saved-key",
+      apiKeySource: "config",
+    });
+    expect(isProviderAutoRouteEligible("meta", {}, env)).toBe(true);
+    expect(isProviderAutoRouteEligible("meta", { enabled: false }, env)).toBe(false);
+  });
+});
+
+describe("resolveProviderCredentials - Google Vertex AI", () => {
+  it.each([
+    {
+      name: "express mode from a saved API key, without a project",
+      config: { apiKey: "vertex-key" },
+      env: {},
+      expected: { isConfigured: true, apiKey: "vertex-key", apiKeySource: "config" },
+    },
+    {
+      name: "ADC from a saved project, location defaulting to global",
+      config: { project: "my-project" },
+      env: {},
+      expected: {
+        isConfigured: true,
+        project: "my-project",
+        location: "global",
+      },
+    },
+    {
+      name: "ADC from env project and location",
+      config: {},
+      env: { GOOGLE_VERTEX_PROJECT: "env-project", GOOGLE_VERTEX_LOCATION: "us-central1" },
+      expected: { isConfigured: true, project: "env-project", location: "us-central1" },
+    },
+    {
+      name: "express mode from the env API key",
+      config: {},
+      env: { GOOGLE_VERTEX_API_KEY: "env-vertex-key" },
+      expected: { isConfigured: true, apiKey: "env-vertex-key", apiKeySource: "env" },
+    },
+    {
+      name: "saved project and location over env values",
+      config: { project: "saved-project", location: "europe-west4" },
+      env: { GOOGLE_VERTEX_PROJECT: "env-project", GOOGLE_VERTEX_LOCATION: "us-central1" },
+      expected: { isConfigured: true, project: "saved-project", location: "europe-west4" },
+    },
+    {
+      name: "the saved key file over GOOGLE_APPLICATION_CREDENTIALS",
+      config: { project: "my-project", keyFilename: "/keys/saved-sa.json" },
+      env: { GOOGLE_APPLICATION_CREDENTIALS: "/keys/env-sa.json" },
+      expected: {
+        isConfigured: true,
+        keyFilename: "/keys/saved-sa.json",
+        keyFilenameSource: "config",
+      },
+    },
+    {
+      name: "a lowercased location, since Vertex location IDs are lowercase",
+      config: { project: "my-project", location: " US-Central1 " },
+      env: {},
+      expected: { isConfigured: true, location: "us-central1" },
+    },
+    {
+      name: "unconfigured with a blank project",
+      config: { project: "   " },
+      env: {},
+      expected: { isConfigured: false, missingRequirement: "project" },
+    },
+    {
+      name: "unconfigured without a project or API key, ignoring Gemini API keys",
+      config: { location: "us-central1" },
+      env: { GOOGLE_GENERATIVE_AI_API_KEY: "gemini-key", GOOGLE_API_KEY: "gemini-key" },
+      expected: { isConfigured: false, missingRequirement: "project" },
+    },
+  ])("$name", ({ config, env, expected }) => {
+    expect(resolveProviderCredentials("google-vertex", config, env)).toMatchObject(expected);
+  });
+
+  it("expands a home-relative service account key file for ADC", () => {
+    const result = resolveProviderCredentials(
+      "google-vertex",
+      { project: "my-project", keyFilename: "~/keys/sa.json" },
+      {}
+    );
+    expect(result.keyFilename).toBe(path.join(os.homedir(), "keys/sa.json"));
+  });
+
+  it("treats the express mode env key as a provider secret", () => {
+    expect(providerSecretEnvVarNames()).toContain("GOOGLE_VERTEX_API_KEY");
+  });
+
+  // The CLI starts only when the env bootstrap yields a configured provider.
+  it.each([
+    { name: "ADC from the env project", env: { GOOGLE_VERTEX_PROJECT: "env-project" } },
+    { name: "express mode from the env API key", env: { GOOGLE_VERTEX_API_KEY: "env-vertex-key" } },
+  ])("bootstraps $name for the CLI", ({ env }) => {
+    expect(hasAnyConfiguredProvider(buildProvidersFromEnv(env))).toBe(true);
+  });
+});
+
+describe("resolveProviderCredentials - Z.ai", () => {
+  it("resolves ZAI_API_KEY from the environment", () => {
+    const result = resolveProviderCredentials("zai", {}, { ZAI_API_KEY: "zai-test-key" });
+
+    expect(result.isConfigured).toBe(true);
+    expect(result.apiKey).toBe("zai-test-key");
+    expect(result.apiKeySource).toBe("env");
   });
 });
 

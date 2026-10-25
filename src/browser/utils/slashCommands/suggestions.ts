@@ -4,6 +4,7 @@
 
 import { matchesNameBySegmentPrefix } from "@/browser/utils/suggestionMatching";
 import { MODEL_ABBREVIATIONS } from "@/common/constants/knownModels";
+import { formatSkillMenuDescription } from "@/common/utils/agentSkills/skillLookupName";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import { getSlashCommandDefinitions } from "./parser";
 import { isSlashCommandVisible, SLASH_COMMAND_DEFINITION_MAP } from "./registry";
@@ -13,8 +14,6 @@ import type {
   SlashSuggestionContext,
   SuggestionDefinition,
 } from "./types";
-
-export type { SlashSuggestion } from "./types";
 
 const COMMAND_DEFINITIONS = getSlashCommandDefinitions();
 
@@ -71,7 +70,7 @@ function buildTopLevelSuggestions(
     .filter((skill) => !SLASH_COMMAND_DEFINITION_MAP.has(skill.name))
     .map((skill) => ({
       key: skill.name,
-      description: `${skill.description} (${formatScopeLabel(skill.scope)})`,
+      description: formatSkillMenuDescription(skill, formatScopeLabel(skill.scope)),
       argumentHint: skill.argumentHint,
     }));
 

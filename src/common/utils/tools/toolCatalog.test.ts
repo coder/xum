@@ -3,18 +3,29 @@ import type { Tool } from "ai";
 import type { ModelMessage, MuxMessage } from "@/common/types/message";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
+  applyNativeToolSearchReplay,
   buildToolCatalog,
   buildToolCatalogOverview,
+  buildToolSearchModelOutput,
+  collectDeferLoadingToolNames,
+  dedupeNativeToolReferences,
+  unprojectNativeToolReferences,
   computeActiveToolNames,
+  computeLoadedToolNames,
   extractPreActivatedToolNames,
   LEGACY_TOOL_SEARCH_TOOL_NAME,
+  NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS,
   normalizeLegacyToolSearchMessages,
   prepareToolSearch,
   rebuildToolSearchState,
+  resolveToolSearchQuery,
   searchToolCatalog,
   seedToolSearchActivationsFromMessages,
+  TOOL_SEARCH_DISCOVERY_NOTE,
+  TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS,
   TOOL_SEARCH_TOOL_NAME,
   type ToolCatalogEntry,
+  type ToolCatalogOverviewMemo,
   type ToolSearchStreamState,
 } from "@/common/utils/tools/toolCatalog";
 
@@ -50,6 +61,20 @@ function baseTools(): Record<string, Tool> {
     github_create_issue: mcpTool("Create a GitHub issue", {
       title: { description: "Issue title" },
     }),
+  };
+}
+
+/**
+ * baseTools() with deferred definitions large enough for native deferral
+ * (#5405); the padding is neutral prose so search scoring is unaffected.
+ */
+function nativeTools(): Record<string, Tool> {
+  const filler = " Lorem ipsum dolor sit amet.".repeat(
+    Math.ceil(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS / 28)
+  );
+  return {
+    ...baseTools(),
+    slack_list_channels: mcpTool(`List available Slack channels.${filler}`),
   };
 }
 
@@ -134,8 +159,8 @@ describe("catalog advertising (overview + server names)", () => {
     const overview = buildToolCatalogOverview(catalog);
     expect(overview).toBe(
       "Deferred tool catalog overview (search to activate):\n" +
-        "- github (1 tool): github_create_issue\n" +
-        "- slack (2 tools): slack_list_channels, slack_send_message\n" +
+        "- github: github_create_issue\n" +
+        "- slack: slack_list_channels, slack_send_message\n" +
         "(end of deferred tool catalog overview)"
     );
   });
@@ -148,8 +173,9 @@ describe("catalog advertising (overview + server names)", () => {
       serverName: "srv",
     }));
     const overview = buildToolCatalogOverview(catalog);
-    expect(overview).toContain("- srv (10 tools):");
-    expect(overview).toContain("(+2 more)");
+    expect(overview).toContain(
+      "- srv: srv_tool_0, srv_tool_1, srv_tool_2, srv_tool_3, srv_tool_4, srv_tool_5, srv_tool_6, srv_tool_7, and more\n"
+    );
     expect(overview).not.toContain("SECRET_DESCRIPTION");
     expect(overview).not.toContain("SECRET_PARAM");
   });
@@ -159,7 +185,7 @@ describe("catalog advertising (overview + server names)", () => {
     const overview = buildToolCatalogOverview([
       { name: "mystery_tool", description: "", paramText: "" },
     ]);
-    expect(overview).toContain("- other tools (1 tool): mystery_tool");
+    expect(overview).toContain("- other tools: mystery_tool");
   });
 
   test("prepareToolSearch advertises the overview in tool_catalog_search's description", () => {
@@ -171,8 +197,8 @@ describe("catalog advertising (overview + server names)", () => {
     expect(prep.state).toBeDefined();
     const description = prep.tools[TOOL_SEARCH_TOOL_NAME].description;
     expect(description).toContain("Search deferred tools");
-    expect(description).toContain("- slack (2 tools):");
-    expect(description).toContain("- github (1 tool): github_create_issue");
+    expect(description).toContain("- slack: slack_list_channels");
+    expect(description).toContain("- github: github_create_issue");
     // Deferred MCP tool records themselves are untouched (schemas stay deferred).
     expect(prep.tools.slack_send_message.description).toBe("Send a message to a Slack channel");
   });
@@ -442,6 +468,111 @@ describe("catalog advertising (overview + server names)", () => {
   });
 });
 
+// tool_catalog_search's description sits in Anthropic's cached tools prefix, so
+// a remote server listing one tool more or less on a refetch must not change it.
+describe("overview stability across MCP tool refetches", () => {
+  /** A remote server's catalog as one refetch returns it (sorted names keep the order obvious). */
+  function refetch(
+    namesByServer: Record<string, readonly string[]>,
+    memo?: ToolCatalogOverviewMemo
+  ) {
+    const tools: Record<string, Tool> = { tool_catalog_search: fakeTool("Search deferred tools") };
+    const servers: Record<string, string> = {};
+    for (const [server, names] of Object.entries(namesByServer)) {
+      for (const name of names) {
+        tools[name] = mcpTool(`Tool ${name}`);
+        servers[name] = server;
+      }
+    }
+    const prepared = prepareToolSearch({
+      tools,
+      mcpToolNames: Object.keys(servers),
+      mcpToolServers: servers,
+      overviewMemo: memo,
+    });
+    expect(prepared.state).toBeDefined();
+    const description = prepared.tools[TOOL_SEARCH_TOOL_NAME].description;
+    if (typeof description !== "string") throw new Error("Expected a string description");
+    return {
+      description,
+      catalog: prepared.state?.catalog ?? [],
+    };
+  }
+  const notion = (count: number) =>
+    Array.from({ length: count }, (_, i) => `notion_tool_${String(i).padStart(2, "0")}`);
+
+  test("one more tool beyond the listed names keeps the description, even without a memo", () => {
+    const before = refetch({ notion: notion(55) });
+    const after = refetch({ notion: notion(56) });
+    expect(after.description).toBe(before.description);
+  });
+
+  test("a new tool that sorts into the listed names keeps the memoized description and stays searchable", () => {
+    const memo: ToolCatalogOverviewMemo = {};
+    const before = refetch({ notion: notion(55), linear: ["linear_list_issues"] }, memo);
+    const after = refetch(
+      { notion: ["notion_aaa_check_next_steps", ...notion(55)], linear: ["linear_list_issues"] },
+      memo
+    );
+    expect(after.description).toBe(before.description);
+    expect(searchToolCatalog(after.catalog, "check next steps").map((m) => m.name)).toContain(
+      "notion_aaa_check_next_steps"
+    );
+  });
+
+  test("the memo is replaced when a listed tool disappears or the server set changes", () => {
+    const memo: ToolCatalogOverviewMemo = {};
+    const first = refetch({ notion: notion(55) }, memo);
+    // notion_tool_00 is listed: keeping the old overview would advertise a missing tool.
+    const removed = refetch({ notion: notion(55).slice(1) }, memo);
+    expect(removed.description).not.toBe(first.description);
+    expect(removed.description).not.toContain("notion_tool_00");
+    const withLinear = refetch(
+      { notion: notion(55).slice(1), linear: ["linear_list_issues"] },
+      memo
+    );
+    expect(withLinear.description).toContain("linear_list_issues");
+    const linearOnly = refetch({ linear: ["linear_list_issues"] }, memo);
+    expect(linearOnly.description).not.toContain("notion");
+  });
+
+  test("the memo is replaced when a server drops to the listed count, kept when it grows past it", () => {
+    const memo: ToolCatalogOverviewMemo = {};
+    const nine = refetch({ notion: notion(9) }, memo);
+    expect(nine.description).toContain(", and more");
+    // Only the unlisted 9th tool goes: every listed name stays, but "and more" is now false.
+    const eight = refetch({ notion: notion(8) }, memo);
+    expect(eight.description).not.toContain(", and more");
+    expect(eight.description).toContain("notion_tool_07");
+    // Growing past the listed count leaves the line incomplete, not false: it is kept.
+    expect(refetch({ notion: notion(9) }, memo).description).toBe(eight.description);
+  });
+
+  test("the memo is replaced when a listed name moves to another server", () => {
+    // Two server/tool pairs can normalize to one MCP key: once the first pair
+    // goes, the key belongs to the other server while both servers stay.
+    const memo: ToolCatalogOverviewMemo = {};
+    refetch({ alpha: ["shared_tool", "alpha_other"], beta: ["beta_other"] }, memo);
+    const moved = { alpha: ["alpha_other"], beta: ["beta_other", "shared_tool"] };
+    expect(refetch(moved, memo).description).toBe(refetch(moved).description);
+  });
+
+  test("a reused overview is still stripped, not stacked, on a rebuild", () => {
+    const memo: ToolCatalogOverviewMemo = {};
+    const first = refetch({ notion: notion(12) }, memo);
+    const rebuilt = prepareToolSearch({
+      tools: {
+        ...Object.fromEntries(notion(13).map((n) => [n, mcpTool(`Tool ${n}`)])),
+        tool_catalog_search: fakeTool(first.description),
+      },
+      mcpToolNames: notion(13),
+      mcpToolServers: Object.fromEntries(notion(13).map((n) => [n, "notion"])),
+      overviewMemo: memo,
+    });
+    expect(rebuilt.tools[TOOL_SEARCH_TOOL_NAME].description).toBe(first.description);
+  });
+});
+
 describe("prepareToolSearch (post-policy gate)", () => {
   test("happy path: tools unchanged, state seeded with empty activation set", () => {
     const tools = baseTools();
@@ -532,6 +663,98 @@ describe("prepareToolSearch (post-policy gate)", () => {
   });
 });
 
+function deferLoadingNames(tools: Record<string, Tool>): string[] {
+  return [...collectDeferLoadingToolNames(tools)];
+}
+
+describe("prepareToolSearch native mode (Anthropic prompt caching)", () => {
+  test("keeps tool_catalog_search, marks only deferred tools, never scopes activeTools", () => {
+    const tools = nativeTools();
+    const result = prepareToolSearch({ tools, mcpToolNames: MCP_NAMES, promptCacheActive: true });
+    expect(result.state!.native).toBe(true);
+    // Same keys in the same order (#5252): only the markers change.
+    expect(Object.keys(result.tools)).toEqual(Object.keys(tools));
+    expect(result.tools[TOOL_SEARCH_TOOL_NAME].description).toContain(
+      "Deferred tool catalog overview"
+    );
+    expect(result.tools.bash).toBe(tools.bash);
+    expect(deferLoadingNames(result.tools)).toEqual(MCP_NAMES);
+    expect(deferLoadingNames(tools)).toEqual([]);
+    expect(computeActiveToolNames(result.state)).toBeUndefined();
+    expect(computeLoadedToolNames(result.state)).toEqual([
+      "bash",
+      "file_read",
+      "tool_catalog_search",
+    ]);
+  });
+
+  test("the marker merges into existing providerOptions and keeps runtime hooks", () => {
+    const execute = () => "ok";
+    const toModelOutput = () => ({ type: "text" as const, value: "ok" });
+    const marker = Symbol("wrapper-marker");
+    const raw: unknown = {
+      description: "Send",
+      execute,
+      toModelOutput,
+      providerOptions: { anthropic: { eagerInputStreaming: true }, openai: { strict: true } },
+      [marker]: true,
+    };
+    const tools = { ...nativeTools(), slack_send_message: raw as Tool };
+    const marked = prepareToolSearch({ tools, mcpToolNames: MCP_NAMES, promptCacheActive: true })
+      .tools.slack_send_message as Tool & Record<symbol, unknown>;
+    expect(marked.providerOptions).toEqual({
+      anthropic: { eagerInputStreaming: true, deferLoading: true },
+      openai: { strict: true },
+    });
+    expect(marked.execute).toBe(execute);
+    expect(marked.toModelOutput).toBe(toModelOutput);
+    expect(marked[marker]).toBe(true);
+  });
+
+  // #5405: below the size threshold a search costs more than deferral saves.
+  test("advertises every tool when the deferred definitions are below the size threshold", () => {
+    const tools = baseTools();
+    const native = prepareToolSearch({ tools, mcpToolNames: MCP_NAMES, promptCacheActive: true });
+    expect(native.state).toBeUndefined();
+    expect(Object.keys(native.tools)).toEqual(
+      Object.keys(tools).filter((name) => name !== TOOL_SEARCH_TOOL_NAME)
+    );
+    expect(deferLoadingNames(native.tools)).toEqual([]);
+    // Scoped deferral (no prompt caching) is not gated.
+    const scoped = prepareToolSearch({ tools, mcpToolNames: MCP_NAMES });
+    expect(scoped.state?.native).toBe(false);
+    expect([...scoped.state!.deferredToolNames].sort()).toEqual([...MCP_NAMES].sort());
+  });
+
+  test("counts description and input schema against the size threshold", () => {
+    const schema = { type: "object", properties: { channel: { type: "string" } } };
+    const withChars = (chars: number) => ({
+      bash: fakeTool("Run a shell command"),
+      tool_catalog_search: fakeTool("Search deferred tools"),
+      slack_send_message: fakeTool("x".repeat(chars - JSON.stringify(schema).length), schema),
+    });
+    const prepare = (chars: number) =>
+      prepareToolSearch({
+        tools: withChars(chars),
+        mcpToolNames: ["slack_send_message"],
+        promptCacheActive: true,
+      });
+    expect(prepare(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS).state?.native).toBe(true);
+    expect(prepare(NATIVE_TOOL_SEARCH_MIN_DEFERRED_CHARS - 1).state).toBeUndefined();
+  });
+
+  test("PTC keeps deferral off even with prompt caching", () => {
+    const result = prepareToolSearch({
+      tools: nativeTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+      ptcEnabled: true,
+    });
+    expect(result.state).toBeUndefined();
+    expect(deferLoadingNames(result.tools)).toEqual([]);
+  });
+});
+
 describe("rebuildToolSearchState (model-fallback path)", () => {
   function activeState(): ToolSearchStreamState {
     const prepared = prepareToolSearch({ tools: baseTools(), mcpToolNames: MCP_NAMES });
@@ -561,6 +784,78 @@ describe("rebuildToolSearchState (model-fallback path)", () => {
     expect(Object.keys(result.tools)).not.toContain("tool_catalog_search");
     // Same state object deactivates: prepareStep stops returning activeTools.
     expect(computeActiveToolNames(state)).toBeUndefined();
+  });
+
+  test("switches to native mode in place when the fallback model uses Anthropic prompt caching", () => {
+    const state = activeState();
+    const result = rebuildToolSearchState(state, {
+      tools: nativeTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    expect(state.native).toBe(true);
+    expect(Object.keys(result.tools)).toEqual(Object.keys(nativeTools()));
+    expect(deferLoadingNames(result.tools)).toEqual(MCP_NAMES);
+    expect(computeActiveToolNames(state)).toBeUndefined();
+    expect(computeLoadedToolNames(state)).toEqual([
+      "bash",
+      "file_read",
+      "tool_catalog_search",
+      "slack_send_message",
+      "github_create_issue",
+    ]);
+  });
+
+  test("switches back to scoped mode and removes the markers when a native primary falls back", () => {
+    const prepared = prepareToolSearch({
+      tools: nativeTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    const state = prepared.state!;
+    // Rebuilds receive the already-marked record back (request.assemble hooks).
+    const result = rebuildToolSearchState(state, {
+      tools: prepared.tools,
+      mcpToolNames: MCP_NAMES,
+    });
+    expect(state.native).toBe(false);
+    expect(deferLoadingNames(result.tools)).toEqual([]);
+    expect(computeActiveToolNames(state)).toEqual(["bash", "file_read", "tool_catalog_search"]);
+  });
+
+  test("removes the markers when a native rebuild loses tool_catalog_search", () => {
+    const prepared = prepareToolSearch({
+      tools: nativeTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...withoutSearch } = prepared.tools;
+    const result = rebuildToolSearchState(prepared.state!, {
+      tools: withoutSearch,
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    // A deferred tool without a search tool could never be referenced.
+    expect(deferLoadingNames(result.tools)).toEqual([]);
+    expect(computeLoadedToolNames(prepared.state)).toBeUndefined();
+  });
+
+  test("deactivates and removes the markers when a native rebuild falls below the size threshold", () => {
+    const prepared = prepareToolSearch({
+      tools: nativeTools(),
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    // The rebuild receives the marked record back, minus the large tool.
+    const result = rebuildToolSearchState(prepared.state!, {
+      tools: { ...prepared.tools, slack_list_channels: baseTools().slack_list_channels },
+      mcpToolNames: MCP_NAMES,
+      promptCacheActive: true,
+    });
+    expect(Object.keys(result.tools)).not.toContain(TOOL_SEARCH_TOOL_NAME);
+    expect(deferLoadingNames(result.tools)).toEqual([]);
+    expect(prepared.state!.native).toBe(false);
+    expect(computeLoadedToolNames(prepared.state)).toBeUndefined();
   });
 
   test("deactivates in place when tool_catalog_search is gone from the fallback toolset", () => {
@@ -624,6 +919,72 @@ describe("searchToolCatalog", () => {
   });
 });
 
+describe("resolveToolSearchQuery (oversized auto-load guard)", () => {
+  const bigChars = TOOL_SEARCH_MAX_AUTOLOAD_DEFINITION_CHARS + 1;
+  const catalog: ToolCatalogEntry[] = [
+    {
+      name: "slack_send_message",
+      description: "Send a message to a channel",
+      paramText: "",
+      definitionChars: 900,
+    },
+    {
+      name: "notion_query_everything",
+      description: "Query anything, send any message",
+      paramText: "",
+      definitionChars: bigChars,
+    },
+  ];
+
+  test("a keyword search without an oversized match behaves exactly like searchToolCatalog", () => {
+    const resolved = resolveToolSearchQuery(catalog, "slack channel", 5);
+    expect(resolved.matches).toEqual(searchToolCatalog(catalog, "slack channel", 5));
+    expect(resolved.matches.map((match) => match.name)).toEqual(["slack_send_message"]);
+    expect(resolved.discovery).toBeUndefined();
+  });
+
+  test("an oversized weak match flips the result to discovery: nothing loads, all candidates listed", () => {
+    const resolved = resolveToolSearchQuery(catalog, "send message", null);
+    expect(resolved.matches).toEqual([]);
+    expect(resolved.discovery?.note).toBe(TOOL_SEARCH_DISCOVERY_NOTE);
+    // All ranked candidates, in rank order, so nothing is silently skipped.
+    expect(resolved.discovery?.candidates.map((candidate) => candidate.name)).toEqual(
+      searchToolCatalog(catalog, "send message", null).map((match) => match.name)
+    );
+    const oversized = resolved.discovery?.candidates.find(
+      (candidate) => candidate.name === "notion_query_everything"
+    );
+    expect(oversized?.oversized).toBe(true);
+    expect(oversized?.approxTokens).toBe(Math.round(bigChars / 2.7));
+    const small = resolved.discovery?.candidates.find(
+      (candidate) => candidate.name === "slack_send_message"
+    );
+    expect(small?.oversized).toBeUndefined();
+    expect(small?.approxTokens).toBe(Math.round(900 / 2.7));
+  });
+
+  test("an exact-name query loads just that tool, any size, skipping ranking and the guard", () => {
+    const resolved = resolveToolSearchQuery(catalog, "  Notion_Query_Everything  ", null);
+    expect(resolved.matches.map((match) => match.name)).toEqual(["notion_query_everything"]);
+    expect(resolved.discovery).toBeUndefined();
+    // Exact lookup skips ranking: a fuzzy search for this name would also
+    // match the oversized tool (its description shares the tokens) and flip
+    // to discovery; the exact name returns the one tool alone.
+    const small = resolveToolSearchQuery(catalog, "  Slack_Send_Message  ", null);
+    expect(small.matches.map((match) => match.name)).toEqual(["slack_send_message"]);
+    expect(small.discovery).toBeUndefined();
+  });
+
+  test("entries without a recorded definition size are never guarded", () => {
+    const legacy: ToolCatalogEntry[] = [
+      { name: "mystery_tool", description: "does mysterious things", paramText: "" },
+    ];
+    const resolved = resolveToolSearchQuery(legacy, "mysterious", null);
+    expect(resolved.matches.map((match) => match.name)).toEqual(["mystery_tool"]);
+    expect(resolved.discovery).toBeUndefined();
+  });
+});
+
 describe("extractPreActivatedToolNames", () => {
   function toolResultMessage(toolName: string, output: unknown): ModelMessage {
     const raw: unknown = {
@@ -681,7 +1042,7 @@ describe("extractPreActivatedToolNames", () => {
   });
 
   test("reads MuxMessage dynamic-tool parts (pre-conversion seeding path)", () => {
-    // aiService seeds from ShuxMessages (before Shux→Model conversion) so the
+    // aiService seeds from XumMessages (before Xum→Model conversion) so the
     // agent-transition sentinel can include pre-activated tools.
     const muxMessage = (toolName: string, state: string, output?: unknown): MuxMessage => {
       const raw: unknown = {
@@ -707,7 +1068,7 @@ describe("extractPreActivatedToolNames", () => {
 });
 
 describe("normalizeLegacyToolSearchMessages", () => {
-  test("rewrites completed Shux search history without relabeling unrelated tools", () => {
+  test("rewrites completed Xum search history without relabeling unrelated tools", () => {
     const muxResult = {
       query: "slack",
       matches: [{ name: "slack_send_message", description: "Send" }],
@@ -763,6 +1124,305 @@ describe("normalizeLegacyToolSearchMessages", () => {
   });
 });
 
+describe("native tool search model output", () => {
+  const deferred = new Set(["slack_send_message", "github_create_issue"]);
+  const result = {
+    query: "slack github",
+    matches: [
+      { name: "github_create_issue", description: "Create" },
+      { name: "no_longer_deferred", description: "Gone" },
+      { name: "github_create_issue", description: "Duplicate" },
+      { name: "slack_send_message", description: "Send" },
+    ],
+    totalDeferred: 3,
+  };
+  const reference = (toolName: string) => ({
+    type: "custom" as const,
+    providerOptions: { anthropic: { type: "tool-reference", toolName } },
+  });
+
+  test("references deferred matches only, in match order, deduplicated", () => {
+    expect(buildToolSearchModelOutput(result, deferred)).toEqual({
+      type: "content",
+      value: [reference("github_create_issue"), reference("slack_send_message")],
+    });
+  });
+
+  test("a result without referenceable matches is plain text, never an empty content list", () => {
+    const empty = { query: "none", matches: [], totalDeferred: 3 };
+    expect(buildToolSearchModelOutput(empty, deferred)).toEqual({
+      type: "text",
+      value: JSON.stringify(empty),
+    });
+    const stale = { ...result, matches: [{ name: "no_longer_deferred", description: "Gone" }] };
+    expect(buildToolSearchModelOutput(stale, deferred).type).toBe("text");
+  });
+
+  function searchResultMessage(output: unknown, toolName = TOOL_SEARCH_TOOL_NAME): ModelMessage {
+    const raw: unknown = {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId: "call-1", toolName, output }],
+    };
+    return raw as ModelMessage;
+  }
+
+  test.each([
+    ["json", { type: "json", value: result }],
+    ["text", { type: "text", value: JSON.stringify(result) }],
+    ["raw", result],
+  ])("replayed %s outputs match the live toModelOutput bytes", (_encoding, output) => {
+    const [replayed] = applyNativeToolSearchReplay([searchResultMessage(output)], deferred);
+    const live = searchResultMessage(buildToolSearchModelOutput(result, deferred));
+    expect(JSON.stringify(replayed)).toBe(JSON.stringify(live));
+  });
+
+  test("replay leaves other tools, non-search outputs, and scoped mode untouched", () => {
+    const messages = [
+      searchResultMessage({ type: "json", value: result }, "bash"),
+      searchResultMessage({ type: "json", value: { hits: [] } }),
+    ];
+    const replayed = applyNativeToolSearchReplay(messages, deferred);
+    expect(replayed[0]).toBe(messages[0]);
+    expect(replayed[1]).toBe(messages[1]);
+    const scoped = [searchResultMessage({ type: "json", value: result })];
+    expect(applyNativeToolSearchReplay(scoped, new Set())).toBe(scoped);
+  });
+});
+
+describe("dedupeNativeToolReferences", () => {
+  const reference = (toolName: string) => ({
+    type: "custom" as const,
+    providerOptions: { anthropic: { type: "tool-reference", toolName } },
+  });
+  const referencesOutput = (...names: string[]) => ({
+    type: "content" as const,
+    value: names.map(reference),
+  });
+
+  function searchResultMessage(
+    toolCallId: string,
+    output: unknown,
+    toolName = TOOL_SEARCH_TOOL_NAME
+  ): ModelMessage {
+    const raw: unknown = {
+      role: "tool",
+      content: [{ type: "tool-result", toolCallId, toolName, output }],
+    };
+    return raw as ModelMessage;
+  }
+
+  /** Expected shape of a projected result: new output plus the raw stash. */
+  function projectedSearchResult(toolCallId: string, output: unknown, raw: unknown): ModelMessage {
+    const value: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId,
+          toolName: TOOL_SEARCH_TOOL_NAME,
+          output,
+          providerOptions: { mux: { rawToolSearchOutput: JSON.stringify(raw) } },
+        },
+      ],
+    };
+    return value as ModelMessage;
+  }
+
+  test("a fully repeated search projects to a deterministic text result", () => {
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha", "beta")),
+      searchResultMessage("call-2", referencesOutput("beta", "alpha")),
+    ];
+    const deduped = dedupeNativeToolReferences(messages);
+    expect(deduped[0]).toBe(messages[0]);
+    // Structural contract, not generated copy: a text status naming both
+    // repeats, no remaining references, and the raw stash for the swap path.
+    const message = deduped[1];
+    if (message.role !== "tool") throw new Error("Expected a tool message");
+    const part = message.content[0];
+    if (part.type !== "tool-result") throw new Error("Expected a tool result");
+    const output = part.output;
+    if (output.type !== "text") throw new Error("Expected a text projection");
+    expect(output.value).toContain("beta");
+    expect(output.value).toContain("alpha");
+    expect(part.providerOptions?.mux?.rawToolSearchOutput).toBe(
+      JSON.stringify(referencesOutput("beta", "alpha"))
+    );
+    // Deterministic: a second application projects the same bytes.
+    expect(JSON.stringify(dedupeNativeToolReferences(messages))).toBe(JSON.stringify(deduped));
+  });
+
+  test("unprojectNativeToolReferences inverts a full projection byte-exactly", () => {
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha", "beta")),
+      searchResultMessage("call-2", referencesOutput("beta", "alpha")),
+      searchResultMessage("call-3", referencesOutput("beta")),
+    ];
+    const deduped = dedupeNativeToolReferences(messages);
+    expect(JSON.stringify(unprojectNativeToolReferences(deduped))).toBe(JSON.stringify(messages));
+    // Stash-free arrays keep their identity.
+    expect(unprojectNativeToolReferences(messages)).toBe(messages);
+  });
+
+  test("unprojectNativeToolReferences inverts a mixed projection byte-exactly", () => {
+    // The mixed result keeps its new reference on the wire, yet the swap path
+    // must still recover the dropped repeat from the stash.
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha")),
+      searchResultMessage("call-2", referencesOutput("alpha", "beta")),
+    ];
+    const deduped = dedupeNativeToolReferences(messages);
+    expect(JSON.stringify(unprojectNativeToolReferences(deduped))).toBe(JSON.stringify(messages));
+  });
+
+  test("each projected occurrence restores its own references, even under reused toolCallIds", () => {
+    // Restoration is a pure function of the part itself, so two results that
+    // share a reused toolCallId can never restore each other's content.
+    const first = searchResultMessage("dup", referencesOutput("alpha", "beta"));
+    const second = searchResultMessage("dup", referencesOutput("beta", "alpha"));
+    const deduped = dedupeNativeToolReferences([first, second]);
+    expect(JSON.stringify(unprojectNativeToolReferences([deduped[1]])[0])).toBe(
+      JSON.stringify(second)
+    );
+    expect(JSON.stringify(unprojectNativeToolReferences([deduped[0]])[0])).toBe(
+      JSON.stringify(first)
+    );
+  });
+
+  test("a mixed result drops repeats: text beside retained references is rejected", () => {
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha")),
+      searchResultMessage("call-2", referencesOutput("alpha", "beta")),
+    ];
+    const deduped = dedupeNativeToolReferences(messages);
+    expect(deduped[0]).toBe(messages[0]);
+    expect(JSON.stringify(deduped[1])).toBe(
+      JSON.stringify(
+        projectedSearchResult("call-2", referencesOutput("beta"), referencesOutput("alpha", "beta"))
+      )
+    );
+    // No deduped result may mix text items with tool references (Anthropic 400s).
+    for (const message of dedupeNativeToolReferences(messages)) {
+      if (message.role !== "tool") continue;
+      for (const part of message.content) {
+        if (part.type !== "tool-result" || part.output.type !== "content") continue;
+        const kinds = new Set(part.output.value.map((item) => item.type));
+        expect(kinds.has("text") && kinds.has("custom")).toBe(false);
+      }
+    }
+  });
+
+  test("dedupes across parallel searches in one step", () => {
+    // Two searches of one assistant step land as parts of a single tool message.
+    const raw: unknown = {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "call-1",
+          toolName: TOOL_SEARCH_TOOL_NAME,
+          output: referencesOutput("alpha"),
+        },
+        {
+          type: "tool-result",
+          toolCallId: "call-2",
+          toolName: TOOL_SEARCH_TOOL_NAME,
+          output: referencesOutput("alpha", "beta"),
+        },
+      ],
+    };
+    const [deduped] = dedupeNativeToolReferences([raw as ModelMessage]);
+    expect(JSON.stringify(deduped)).toContain('"toolCallId":"call-1"');
+    const parts = (deduped as { content: Array<{ output: unknown }> }).content;
+    expect(parts[0].output).toEqual(referencesOutput("alpha"));
+    expect(parts[1].output).toEqual(referencesOutput("beta"));
+  });
+
+  test("returns the same array when nothing repeats", () => {
+    const messages = [
+      searchResultMessage("call-1", referencesOutput("alpha")),
+      searchResultMessage("call-2", referencesOutput("beta")),
+      searchResultMessage("call-3", { type: "json", value: { hits: [] } }),
+    ];
+    expect(dedupeNativeToolReferences(messages)).toBe(messages);
+  });
+
+  test("appending messages never rewrites the deduped prefix", () => {
+    const prefix = [
+      searchResultMessage("call-1", referencesOutput("alpha")),
+      searchResultMessage("call-2", referencesOutput("alpha", "beta")),
+    ];
+    const dedupedPrefix = dedupeNativeToolReferences(prefix);
+    const extended = dedupeNativeToolReferences([
+      ...dedupedPrefix,
+      searchResultMessage("call-3", referencesOutput("beta", "gamma")),
+    ]);
+    expect(extended[0]).toBe(dedupedPrefix[0]);
+    expect(extended[1]).toBe(dedupedPrefix[1]);
+    expect(JSON.stringify(extended[2])).toBe(
+      JSON.stringify(
+        projectedSearchResult(
+          "call-3",
+          referencesOutput("gamma"),
+          referencesOutput("beta", "gamma")
+        )
+      )
+    );
+  });
+
+  test("a compacted prefix that dropped the first reference re-references in the later result", () => {
+    const first = searchResultMessage("call-1", referencesOutput("alpha"));
+    const later = searchResultMessage("call-2", referencesOutput("alpha"));
+    expect(JSON.stringify(dedupeNativeToolReferences([first, later])[1].content)).toContain(
+      '"type":"text"'
+    );
+    // Compaction removed the first referencing result: the later one stands.
+    expect(dedupeNativeToolReferences([later])[0]).toBe(later);
+  });
+
+  test("leaves scoped-mode outputs and other tools untouched", () => {
+    const messages = [
+      searchResultMessage("call-1", { type: "json", value: { matches: [] } }),
+      searchResultMessage("call-2", referencesOutput("alpha"), "bash"),
+      searchResultMessage("call-3", referencesOutput("alpha"), "bash"),
+    ];
+    expect(dedupeNativeToolReferences(messages)).toBe(messages);
+  });
+
+  test("replayed history dedupes to the same bytes as the live steps", () => {
+    const deferred = new Set(["alpha", "beta"]);
+    const firstResult = {
+      query: "alpha",
+      matches: [{ name: "alpha", description: "A" }],
+      totalDeferred: 2,
+    };
+    const secondResult = {
+      query: "alpha beta",
+      matches: [
+        { name: "alpha", description: "A" },
+        { name: "beta", description: "B" },
+      ],
+      totalDeferred: 2,
+    };
+    // Live: toModelOutput builds each result, the per-step transform dedupes.
+    const live = dedupeNativeToolReferences([
+      searchResultMessage("call-1", buildToolSearchModelOutput(firstResult, deferred)),
+      searchResultMessage("call-2", buildToolSearchModelOutput(secondResult, deferred)),
+    ]);
+    // Replay: persisted raw results are rewritten, then deduped the same way.
+    const replayed = dedupeNativeToolReferences(
+      applyNativeToolSearchReplay(
+        [
+          searchResultMessage("call-1", { type: "json", value: firstResult }),
+          searchResultMessage("call-2", { type: "json", value: secondResult }),
+        ],
+        deferred
+      )
+    );
+    expect(JSON.stringify(replayed)).toBe(JSON.stringify(live));
+  });
+});
+
 describe("seedToolSearchActivationsFromMessages", () => {
   test("intersects history matches with the current deferred set", () => {
     const state = prepareToolSearch({ tools: baseTools(), mcpToolNames: MCP_NAMES }).state!;
@@ -803,6 +1463,7 @@ describe("computeActiveToolNames", () => {
       deferredToolNames: new Set(),
       allToolNames: ["bash"],
       activatedToolNames: new Set(),
+      native: false,
     };
     expect(computeActiveToolNames(state)).toBeUndefined();
   });

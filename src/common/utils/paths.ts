@@ -225,3 +225,14 @@ export class PlatformPaths {
     return this.basename(projectPath) || "unknown";
   }
 }
+
+/**
+ * A display label for a path the SERVER sent: its last segment, split on "/" and "\\". The
+ * renderer cannot tell the server's platform from the client's (a browser on Linux can talk to a
+ * Windows server), so it splits on both. Display only: never use it to build a path or an id.
+ * Returns `fallback` for an empty last segment (an empty path or a trailing separator) (#6714).
+ */
+export function serverPathLabel(serverPath: string, fallback: string): string {
+  const lastSeparator = Math.max(serverPath.lastIndexOf("/"), serverPath.lastIndexOf("\\"));
+  return serverPath.slice(lastSeparator + 1) || fallback;
+}

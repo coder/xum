@@ -13,18 +13,26 @@ import { TerminalRouterProvider } from "@/browser/terminal/TerminalRouterContext
 import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/windowOpenLocalhostProxy";
 import "./styles/globals.css";
 
-function TerminalWindowContent(props: { workspaceId: string; sessionId: string }) {
+function TerminalWindowContent(props: {
+  workspaceId: string;
+  sessionId: string;
+  initialTitle?: string;
+}) {
   const { api } = useAPI();
 
   return (
     <TerminalView
       workspaceId={props.workspaceId}
       sessionId={props.sessionId}
+      initialTitle={props.initialTitle}
       visible={true}
       onExit={() => {
-        api?.terminal.closeWindow({ workspaceId: props.workspaceId }).catch((err) => {
-          console.warn("[TerminalWindow] Failed to close terminal window:", err);
-        });
+        // Only this window: sibling pop-outs of the workspace keep running (#5739).
+        api?.terminal
+          .closeWindow({ workspaceId: props.workspaceId, sessionId: props.sessionId })
+          .catch((err) => {
+            console.warn("[TerminalWindow] Failed to close terminal window:", err);
+          });
       }}
     />
   );
@@ -42,6 +50,7 @@ installWindowOpenLocalhostProxyNormalization();
 const params = new URLSearchParams(window.location.search);
 const workspaceId = params.get("workspaceId");
 const sessionId = params.get("sessionId");
+const initialTitle = params.get("title") ?? undefined;
 
 if (!workspaceId || !sessionId) {
   document.body.innerHTML = `
@@ -55,10 +64,15 @@ if (!workspaceId || !sessionId) {
   // Don't use StrictMode for terminal windows to avoid double-mounting issues
   // StrictMode intentionally double-mounts components in dev, which causes
   // race conditions with WebSocket connections and terminal lifecycle
+  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
   ReactDOM.createRoot(document.getElementById("root")!).render(
     <APIProvider>
-      <TerminalRouterProvider>
-        <TerminalWindowContent workspaceId={workspaceId} sessionId={sessionId} />
+      <TerminalRouterProvider popout>
+        <TerminalWindowContent
+          workspaceId={workspaceId}
+          sessionId={sessionId}
+          initialTitle={initialTitle}
+        />
       </TerminalRouterProvider>
     </APIProvider>
   );

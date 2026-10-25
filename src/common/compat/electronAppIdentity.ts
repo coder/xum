@@ -1,4 +1,4 @@
-import { SHUX_PRODUCT_NAME, SHUX_PRODUCT_SLUG } from "@/common/constants/product";
+import { XUM_PRODUCT_NAME, XUM_PRODUCT_SLUG } from "@/common/constants/product";
 
 export interface ElectronAppIdentity {
   /** Value for `app.setName()` / `app.getName()` (menus, about). */
@@ -17,13 +17,13 @@ export interface ElectronAppIdentity {
  *
  * Linux still needs the lowercase slug for WM_CLASS, native-Wayland app_id,
  * `.desktop` files, and icon names. macOS/Windows should keep the product
- * display name so the application menu is `Shux`, not `shux`.
+ * display name so the application menu is `Xum`, not `xum`.
  */
 export function getElectronAppIdentity(platform: NodeJS.Platform): ElectronAppIdentity {
   const isLinux = platform === "linux";
   return {
-    appName: isLinux ? SHUX_PRODUCT_SLUG : SHUX_PRODUCT_NAME,
-    userDataDirName: SHUX_PRODUCT_SLUG,
-    chromeDesktop: isLinux ? `${SHUX_PRODUCT_SLUG}.desktop` : undefined,
+    appName: isLinux ? XUM_PRODUCT_SLUG : XUM_PRODUCT_NAME,
+    userDataDirName: XUM_PRODUCT_SLUG,
+    chromeDesktop: isLinux ? `${XUM_PRODUCT_SLUG}.desktop` : undefined,
   };
 }

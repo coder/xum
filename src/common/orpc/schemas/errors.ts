@@ -18,8 +18,45 @@ export const SendMessageErrorSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("incompatible_workspace"), message: z.string() }),
   z.object({ type: z.literal("runtime_not_ready"), message: z.string() }),
   z.object({ type: z.literal("runtime_start_failed"), message: z.string() }), // Transient - retryable
-  z.object({ type: z.literal("policy_denied"), message: z.string() }),
+  /** A task checkout left unsanitized by a failed launch (#4674): permanent until removal. */
+  z.object({ type: z.literal("task_checkout_unsanitized"), message: z.string() }),
+  z.object({
+    type: z.literal("context_budget_exceeded"),
+    model: z.string(),
+    estimate: z.number().finite().nonnegative(),
+    hardCeiling: z.number().finite(),
+  }),
+  z.object({ type: z.literal("context_budget_blocked"), message: z.string() }),
+  /**
+   * An edit's history precondition no longer matched under the write lock: the rows it would
+   * have deleted changed since the client captured its evidence. Nothing was truncated.
+   */
+  z.object({ type: z.literal("history-changed") }),
+  /** A direct edit targeted authentic plan-review feedback; nothing was changed. */
+  z.object({ type: z.literal("plan_review_feedback_edit_blocked"), message: z.string() }),
+  // Session tape replay mode (XUM_REPLAY_TAPES) refuses turns and model creation; deterministic
+  z.object({ type: z.literal("session_tape_replay"), message: z.string() }),
+  /** A message.send prompt hook refused the message; nothing was saved. */
+  z.object({ type: z.literal("plugin_blocked"), plugin: z.string(), reason: z.string() }),
   z.object({ type: z.literal("unknown"), raw: z.string() }),
+]);
+
+/** Typed failures of the workspace.planReview.* endpoints (see planReviewService.ts). */
+export const PlanReviewErrorSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("plan_missing"), message: z.string() }),
+  z.object({ type: z.literal("plan_too_large"), message: z.string() }),
+  z.object({ type: z.literal("unknown_snapshot"), message: z.string() }),
+  z.object({ type: z.literal("unknown_thread"), message: z.string() }),
+  z.object({ type: z.literal("invalid_anchor"), message: z.string() }),
+  z.object({ type: z.literal("nothing_to_send"), message: z.string() }),
+  /** Fields were within limits but the serialized feedback row would exceed the history row cap. */
+  z.object({ type: z.literal("feedback_too_large"), message: z.string() }),
+  /** History read/append failed (the message is the HistoryService error string). */
+  z.object({ type: z.literal("history_failed"), message: z.string() }),
+  /** The caller's abort signal fired before the snapshot row was admitted (nothing was written). */
+  z.object({ type: z.literal("capture_aborted"), message: z.string() }),
+  /** submitFeedback validated but the underlying sendMessage refused the turn. */
+  z.object({ type: z.literal("send_failed"), error: SendMessageErrorSchema }),
 ]);
 
 /**
@@ -35,6 +72,7 @@ export const StreamErrorTypeSchema = z.enum([
   "aborted", // User aborted
   "network", // Network/fetch errors
   "context_exceeded", // Context length/token limit exceeded
+  "context_budget_blocked", // Local assembled-request preflight refused an oversized request
   "quota", // Usage quota/billing limits
   "model_not_found", // Model does not exist
   "runtime_not_ready", // Container/runtime doesn't exist or failed to start (permanent)
@@ -43,6 +81,10 @@ export const StreamErrorTypeSchema = z.enum([
   "stream_truncated", // Provider stream closed before its terminal finish event
   "max_output_tokens", // Provider truncated the response at max_tokens (finishReason: "length")
   "model_refusal", // Provider declined to answer (refusal/content-filter); retrying the same request will refuse again
+  "agent_resolution", // Strict explicit-agent contract failure (agent missing/hidden/disabled/provenance changed); deterministic, retrying reproduces it
+  "reasoning_rejected", // Provider rejected replayed reasoning (OpenAI rs_ item / encrypted_content, Anthropic thinking signature) after the in-stream repair; deterministic
+  "session_tape_replay", // Perf harness (XUM_REPLAY_TAPES) refused to replay this workspace's tape; renderer-only, no model involved
+  "plugin_blocked", // A message.send prompt hook refused the message; deterministic, never retried
   "unknown", // Catch-all
 ]);
 
@@ -55,11 +97,6 @@ export const NameGenerationErrorSchema = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("permission_denied"),
-    provider: z.string().nullish(),
-    raw: z.string().nullish(),
-  }),
-  z.object({
-    type: z.literal("policy"),
     provider: z.string().nullish(),
     raw: z.string().nullish(),
   }),

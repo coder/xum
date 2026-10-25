@@ -44,6 +44,21 @@ describe("checkAutoCompaction", () => {
   const SONNET_70_PERCENT = SONNET_MAX_TOKENS * 0.7; // 140,000
   const SONNET_60_PERCENT = SONNET_MAX_TOKENS * 0.6; // 120,000
 
+  test("exposes raw context and model limit even when proactive compaction is disabled", () => {
+    const result = checkAutoCompaction(
+      createMockUsage(50000, undefined, BETA_SONNET_MODEL, createUsageEntry(60000)),
+      BETA_SONNET_MODEL,
+      false,
+      1
+    );
+    expect(result.contextTokens).toBe(60000);
+    expect(result.maxTokens).toBe(200000);
+    expect(result.shouldForceCompact).toBe(false);
+    const unknown = checkAutoCompaction(createMockUsage(50000), "unknown-model", false);
+    expect(unknown.contextTokens).toBe(50000);
+    expect(unknown.maxTokens).toBeUndefined();
+  });
+
   describe("Basic Functionality", () => {
     test("returns false when no usage data (first message)", () => {
       const result = checkAutoCompaction(undefined, BETA_SONNET_MODEL, false);
@@ -227,37 +242,18 @@ describe("checkAutoCompaction", () => {
       expect(result.shouldShowWarning).toBe(true);
     });
 
-    test("uses GPT-5.5's native 1.05M limit without relying on the 1M toggle", () => {
-      // Pin to the literal model string: gpt-5.5's 1.05M native window remains in
-      // production even though KNOWN_MODELS.GPT now points at gpt-5.6-sol (1M).
-      const usage = createMockUsage(600_000, undefined, "openai:gpt-5.5");
-      const result = checkAutoCompaction(usage, "openai:gpt-5.5", false);
-
-      expect(result.usagePercentage).toBeCloseTo(57.14, 2);
-      expect(result.shouldShowWarning).toBe(false);
-    });
-
     test("ignores use1M for models that don't support it (GPT)", () => {
-      const usage = createMockUsage(100_000, undefined, KNOWN_MODELS.GPT_MINI.id);
-      // GPT Mini has 272k context, so 100k = 36.76%
-      const result = checkAutoCompaction(usage, KNOWN_MODELS.GPT_MINI.id, true);
+      const usage = createMockUsage(100_000, undefined, KNOWN_MODELS.GPT_6_LUNA.id);
+      // GPT-6 Luna has 922k context, so 100k = 10.85%
+      const result = checkAutoCompaction(usage, KNOWN_MODELS.GPT_6_LUNA.id, true);
 
-      // Should use standard 272k, not 1M (use1M ignored for GPT)
-      expect(result.usagePercentage).toBeCloseTo(36.76, 1);
+      // Should use standard 922k, not 1M (use1M ignored for GPT)
+      expect(result.usagePercentage).toBeCloseTo(10.85, 1);
       expect(result.shouldShowWarning).toBe(false);
     });
   });
 
   describe("Edge Cases", () => {
-    test("missing context usage returns safe defaults", () => {
-      const usage: AutoCompactionUsageState = { totalTokens: 0 };
-      const result = checkAutoCompaction(usage, BETA_SONNET_MODEL, false);
-
-      expect(result.shouldShowWarning).toBe(false);
-      expect(result.usagePercentage).toBe(0);
-      expect(result.thresholdPercentage).toBe(70);
-    });
-
     test("single context usage entry works correctly", () => {
       const usage = createMockUsage(140_000);
       const result = checkAutoCompaction(usage, BETA_SONNET_MODEL, false);

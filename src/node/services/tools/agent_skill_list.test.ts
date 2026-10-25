@@ -1,11 +1,17 @@
 import * as fs from "node:fs/promises";
-import os from "node:os";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { describe, expect, it, spyOn } from "bun:test";
 
+import {
+  createTestPluginInstallEntry,
+  reviewedComponentConsent,
+  saveApprovedCopies,
+} from "@/node/services/agentPlugins/testFixtures";
+import type { ComponentConsent } from "@/node/services/agentPlugins/componentConsent";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
-import type { MuxToolScope } from "@/common/types/toolScope";
+import type { XumToolScope } from "@/common/types/toolScope";
 import type { AgentSkillListToolResult } from "@/common/types/tools";
 import { createAgentSkillListTool } from "./agent_skill_list";
 import { MAX_FILE_SIZE } from "./fileCommon";
@@ -61,7 +67,7 @@ async function writePlugin(
   containerPath: string,
   pluginName: string,
   skills: Array<{ name: string; description: string }>
-): Promise<void> {
+): Promise<string> {
   const pluginDir = path.join(containerPath, pluginName);
   await fs.mkdir(pluginDir, { recursive: true });
   await fs.writeFile(
@@ -77,26 +83,27 @@ async function writePlugin(
       description: skill.description,
     });
   }
+  return pluginDir;
 }
 
 describe("agent_skill_list", () => {
   it("lists effective available skills across project and global scopes", async () => {
     using project = new TestTempDir("test-agent-skill-list-project");
-    using muxHome = new TestTempDir("test-agent-skill-list-mux-home");
+    using xumHome = new TestTempDir("test-agent-skill-list-mux-home");
 
-    await withMuxRoot(muxHome.path, async () => {
+    await withMuxRoot(xumHome.path, async () => {
       await writeSkill(path.join(project.path, ".mux", "skills"), "project-only", {
         description: "from project",
       });
-      await writeSkill(path.join(muxHome.path, "skills"), "global-only", {
+      await writeSkill(path.join(xumHome.path, "skills"), "global-only", {
         description: "from global",
       });
 
       const tool = createAgentSkillListTool(
         createTestToolConfig(project.path, {
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: muxHome.path,
+            xumHome: xumHome.path,
             projectRoot: project.path,
             projectStorageAuthority: "host-local",
           },
@@ -126,17 +133,17 @@ describe("agent_skill_list", () => {
   it("lists skills from all four local roots in project workspaces", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-local-roots-home");
     using project = new TestTempDir("test-agent-skill-list-local-roots-project");
-    using muxHomeDir = new TestTempDir("test-agent-skill-list-local-roots-mux-home");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-local-roots-mux-home");
 
     await withHomeDir(homeDir.path, async () => {
-      await withMuxRoot(muxHomeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
         await writeSkill(path.join(project.path, ".mux", "skills"), "project-only", {
           description: "from project mux root",
         });
         await writeSkill(path.join(project.path, ".agents", "skills"), "project-universal", {
           description: "from project universal root",
         });
-        await writeGlobalSkill(muxHomeDir.path, "global-only", {
+        await writeGlobalSkill(xumHomeDir.path, "global-only", {
           description: "from global mux root",
         });
         await writeSkill(path.join(homeDir.path, ".agents", "skills"), "global-universal", {
@@ -145,9 +152,9 @@ describe("agent_skill_list", () => {
 
         const tool = createAgentSkillListTool(
           createTestToolConfig(project.path, {
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: muxHomeDir.path,
+              xumHome: xumHomeDir.path,
               projectRoot: project.path,
               projectStorageAuthority: "host-local",
             },
@@ -187,10 +194,10 @@ describe("agent_skill_list", () => {
   it("lists skills inherited from parent directories of a subproject", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-subproject-home");
     using checkout = new TestTempDir("test-agent-skill-list-subproject-checkout");
-    using muxHomeDir = new TestTempDir("test-agent-skill-list-subproject-mux-home");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-subproject-mux-home");
 
     await withHomeDir(homeDir.path, async () => {
-      await withMuxRoot(muxHomeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
         const packagesRoot = path.join(checkout.path, "packages");
         const subprojectRoot = path.join(packagesRoot, "app");
         await fs.mkdir(subprojectRoot, { recursive: true });
@@ -206,9 +213,9 @@ describe("agent_skill_list", () => {
 
         const tool = createAgentSkillListTool(
           createTestToolConfig(subprojectRoot, {
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: muxHomeDir.path,
+              xumHome: xumHomeDir.path,
               projectRoot: subprojectRoot,
               projectStorageAuthority: "host-local",
               checkoutRoot: checkout.path,
@@ -239,10 +246,10 @@ describe("agent_skill_list", () => {
   it("hides .claude/skills roots when the claude-skills-compat experiment is off", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-claude-off-home");
     using project = new TestTempDir("test-agent-skill-list-claude-off-project");
-    using muxHomeDir = new TestTempDir("test-agent-skill-list-claude-off-mux-home");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-claude-off-mux-home");
 
     await withHomeDir(homeDir.path, async () => {
-      await withMuxRoot(muxHomeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
         await writeSkill(path.join(project.path, ".claude", "skills"), "claude-project", {
           description: "from project claude root",
         });
@@ -253,9 +260,9 @@ describe("agent_skill_list", () => {
         // Default tool config: no experiments => compat roots must stay invisible.
         const tool = createAgentSkillListTool(
           createTestToolConfig(project.path, {
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: muxHomeDir.path,
+              xumHome: xumHomeDir.path,
               projectRoot: project.path,
               projectStorageAuthority: "host-local",
             },
@@ -277,10 +284,10 @@ describe("agent_skill_list", () => {
   it("lists .claude/skills roots when the claude-skills-compat experiment is on", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-claude-on-home");
     using project = new TestTempDir("test-agent-skill-list-claude-on-project");
-    using muxHomeDir = new TestTempDir("test-agent-skill-list-claude-on-mux-home");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-claude-on-mux-home");
 
     await withHomeDir(homeDir.path, async () => {
-      await withMuxRoot(muxHomeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
         await writeSkill(path.join(project.path, ".claude", "skills"), "claude-project", {
           description: "from project claude root",
         });
@@ -290,9 +297,9 @@ describe("agent_skill_list", () => {
 
         const tool = createAgentSkillListTool({
           ...createTestToolConfig(project.path, {
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: muxHomeDir.path,
+              xumHome: xumHomeDir.path,
               projectRoot: project.path,
               projectStorageAuthority: "host-local",
             },
@@ -320,55 +327,70 @@ describe("agent_skill_list", () => {
     });
   });
 
-  it("hides Agent Plugins skills when the agent-plugins experiment is off", async () => {
-    using homeDir = new TestTempDir("test-agent-skill-list-plugins-off-home");
-    using project = new TestTempDir("test-agent-skill-list-plugins-off-project");
-    using muxHomeDir = new TestTempDir("test-agent-skill-list-plugins-off-mux-home");
+  it("lists ~/.mux/skills after ~/.agents/skills, and not again when it is the Xum home's", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-legacy-mux-home");
+    using project = new TestTempDir("test-agent-skill-list-legacy-mux-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-legacy-mux-xum-home");
 
     await withHomeDir(homeDir.path, async () => {
-      await withMuxRoot(muxHomeDir.path, async () => {
-        await writePlugin(path.join(project.path, ".mux", "plugins"), "project-plugin", [
-          { name: "plugin-project", description: "from project plugin" },
-        ]);
-        await writePlugin(path.join(muxHomeDir.path, "plugins"), "global-plugin", [
-          { name: "plugin-global", description: "from global plugin" },
-        ]);
-
-        // Default tool config: no experiments => plugin roots must stay invisible.
+      await writeSkill(path.join(homeDir.path, ".agents", "skills"), "shared", {
+        description: "from agents",
+      });
+      for (const name of ["shared", "cli-only"]) {
+        await writeSkill(path.join(homeDir.path, ".mux", "skills"), name, {
+          description: "from legacy mux",
+        });
+      }
+      // The skills CLI links a skill to its store copy elsewhere in the user home.
+      await writeSkill(path.join(homeDir.path, "store"), "linked", { description: "from store" });
+      await fs.symlink(
+        path.join(homeDir.path, "store", "linked"),
+        path.join(homeDir.path, ".mux", "skills", "linked")
+      );
+      const list = async (xumHome: string) => {
         const tool = createAgentSkillListTool(
           createTestToolConfig(project.path, {
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: muxHomeDir.path,
+              xumHome,
               projectRoot: project.path,
               projectStorageAuthority: "host-local",
             },
           })
         );
         const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+        if (!result.success) throw new Error(result.error);
+        return result.skills.map((skill) => [skill.name, skill.description]);
+      };
 
-        expect(result.success).toBe(true);
-        if (!result.success) {
-          return;
-        }
-
-        expect(result.skills.find((skill) => skill.name === "plugin-project")).toBeUndefined();
-        expect(result.skills.find((skill) => skill.name === "plugin-global")).toBeUndefined();
+      // A read-only root contained at the user home, like ~/.agents/skills.
+      expect(await list(xumHomeDir.path)).toEqual([
+        ["cli-only", "from legacy mux"],
+        ["linked", "from store"],
+        ["shared", "from agents"],
+      ]);
+      // With ~/.mux as the Xum home, it is only the Xum home's root: a link out of the Xum home
+      // stays refused instead of listing through the wider user-home containment.
+      await withMuxRoot(path.join(homeDir.path, ".mux"), async () => {
+        expect(await list(path.join(homeDir.path, ".mux"))).toEqual([
+          ["cli-only", "from legacy mux"],
+          ["shared", "from legacy mux"],
+        ]);
       });
     });
   });
 
-  it("lists Agent Plugins skills when the agent-plugins experiment is on", async () => {
+  it("lists Agent Plugins skills", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-plugins-on-home");
     using project = new TestTempDir("test-agent-skill-list-plugins-on-project");
-    using muxHomeDir = new TestTempDir("test-agent-skill-list-plugins-on-mux-home");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-plugins-on-mux-home");
 
     await withHomeDir(homeDir.path, async () => {
-      await withMuxRoot(muxHomeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
         await writePlugin(path.join(project.path, ".mux", "plugins"), "project-plugin", [
           { name: "plugin-project", description: "from project plugin" },
         ]);
-        await writePlugin(path.join(muxHomeDir.path, "plugins"), "global-plugin", [
+        await writePlugin(path.join(xumHomeDir.path, "plugins"), "global-plugin", [
           { name: "plugin-global", description: "from global plugin" },
         ]);
         // Sibling non-plugin entry (e.g. Codex marketplace metadata) must not break listing.
@@ -381,14 +403,13 @@ describe("agent_skill_list", () => {
 
         const tool = createAgentSkillListTool({
           ...createTestToolConfig(project.path, {
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: muxHomeDir.path,
+              xumHome: xumHomeDir.path,
               projectRoot: project.path,
               projectStorageAuthority: "host-local",
             },
           }),
-          experiments: { agentPlugins: true },
         });
         const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
 
@@ -411,13 +432,329 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it("lists a plugin skill in a snake_case folder under its kebab-case name", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-snake-home");
+    using project = new TestTempDir("test-agent-skill-list-snake-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-snake-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        // google/elephant-goldfish-model: skills/egm_bootstrap/SKILL.md has `name: egm-bootstrap`.
+        const pluginDir = await writePlugin(path.join(xumHomeDir.path, "plugins"), "egm", []);
+        const skillDir = path.join(pluginDir, "skills", "egm_bootstrap");
+        await fs.mkdir(skillDir, { recursive: true });
+        await fs.writeFile(
+          path.join(skillDir, "SKILL.md"),
+          "---\nname: egm-bootstrap\ndescription: Bootstrap\n---\nBody\n"
+        );
+
+        const tool = createAgentSkillListTool({
+          ...createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          }),
+        });
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(getSkill(result.skills, "egm-bootstrap").description).toBe("Bootstrap");
+      });
+    });
+  });
+
+  it("lists a plugin skills path that holds SKILL.md as one skill", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-single-home");
+    using project = new TestTempDir("test-agent-skill-list-single-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-single-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        const pluginDir = path.join(xumHomeDir.path, "plugins", "solo");
+        await fs.mkdir(pluginDir, { recursive: true });
+        await fs.writeFile(
+          path.join(pluginDir, "plugin.json"),
+          JSON.stringify({
+            $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+            name: "solo",
+            contributes: { skills: ["lone", ".", "leaky"] },
+          })
+        );
+        await writeSkill(pluginDir, "lone", { description: "single folder" });
+        // The plugin root is a skill folder too: it lists under the plugin name.
+        await writeSkill(path.dirname(pluginDir), "solo", { description: "plugin root" });
+        // A single skill folder whose SKILL.md links outside the plugin is refused.
+        await writeSkill(homeDir.path, "leaky", { description: "outside" });
+        await fs.mkdir(path.join(pluginDir, "leaky"));
+        await fs.symlink(
+          path.join(homeDir.path, "leaky", "SKILL.md"),
+          path.join(pluginDir, "leaky", "SKILL.md")
+        );
+
+        const tool = createAgentSkillListTool(
+          createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          })
+        );
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.skills.map((skill) => [skill.name, skill.description])).toEqual([
+          ["lone", "single folder"],
+          ["solo", "plugin root"],
+        ]);
+      });
+    });
+  });
+
+  it("hides a Claude command from the model and lists it only with includeUnadvertised", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-command-home");
+    using project = new TestTempDir("test-agent-skill-list-command-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-command-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        const pluginDir = path.join(xumHomeDir.path, "plugins", "kit");
+        await fs.mkdir(path.join(pluginDir, ".claude-plugin"), { recursive: true });
+        await fs.writeFile(
+          path.join(pluginDir, ".claude-plugin", "plugin.json"),
+          JSON.stringify({ name: "kit" })
+        );
+        await fs.mkdir(path.join(pluginDir, "commands"));
+        await fs.writeFile(path.join(pluginDir, "commands", "review.md"), "Review $ARGUMENTS\n");
+        await writeSkill(path.join(pluginDir, "skills"), "greet", { description: "Greets" });
+
+        const tool = createAgentSkillListTool(
+          createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          })
+        );
+        const list = async (includeUnadvertised: boolean) => {
+          const result = (await tool.execute!(
+            { includeUnadvertised },
+            mockToolCallOptions
+          )) as AgentSkillListToolResult;
+          expect(result.success).toBe(true);
+          return result.success ? result.skills.map((skill) => skill.name) : [];
+        };
+
+        expect(await list(false)).toEqual(["greet"]);
+        expect(await list(true)).toEqual(["greet", "review"]);
+      });
+    });
+  });
+
+  it("lists only imported plugin skills and refreshes additions without hiding fallback sources", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-imports-home");
+    using project = new TestTempDir("test-agent-skill-list-imports-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-imports-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        const container = path.join(xumHomeDir.path, "plugins");
+        const pluginDir = await writePlugin(container, "a-managed", [
+          { name: "selected", description: "selected plugin skill" },
+          { name: "skipped", description: "managed skill" },
+          { name: "hidden", description: "not imported" },
+        ]);
+        await writePlugin(container, "z-unmanaged", [
+          { name: "skipped", description: "fallback skill" },
+        ]);
+        const consent = await reviewedComponentConsent({ pluginDir });
+        const saveSelection = (skills: string[] | null) =>
+          fs.writeFile(
+            path.join(xumHomeDir.path, "plugins.json"),
+            JSON.stringify({
+              plugins: [
+                {
+                  ...createTestPluginInstallEntry("a-managed", undefined, consent),
+                  importedComponents: { skills, mcpServers: [] },
+                },
+              ],
+            })
+          );
+        await saveSelection(["selected"]);
+        const tool = createAgentSkillListTool({
+          ...createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          }),
+        });
+        const list = async () => {
+          const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+          if (!result.success) throw new Error(result.error);
+          return result.skills;
+        };
+        const initial = await list();
+        expect(initial.some((skill) => skill.name === "selected")).toBe(true);
+        expect(initial.some((skill) => skill.name === "hidden")).toBe(false);
+        expect(getSkill(initial, "skipped").description).toBe("fallback skill");
+
+        await saveSelection(["selected", "skipped"]);
+        expect(getSkill(await list(), "skipped").description).toBe("managed skill");
+        // Malformed selection is not a legacy import-all entry.
+        await saveSelection(null);
+        const invalid = await list();
+        expect(invalid.some((skill) => skill.name === "selected")).toBe(false);
+        expect(getSkill(invalid, "skipped").description).toBe("fallback skill");
+      });
+    });
+  });
+
+  it("lists a managed plugin skill only under the frontmatter the user reviewed (#6498)", async () => {
+    using home = new TestTempDir("test-agent-skill-list-consent");
+    await withHomeDir(home.path, async () => {
+      const container = path.join(home.path, "plugins");
+      const managedDir = await writePlugin(container, "a-managed", [
+        { name: "shared", description: "managed" },
+        { name: "solo", description: "managed only" },
+      ]);
+      await writePlugin(container, "b-unmanaged", [
+        { name: "shared", description: "fallback" },
+        { name: "free", description: "unmanaged" },
+      ]);
+      const saveConsent = (componentConsent?: ComponentConsent) =>
+        fs.writeFile(
+          path.join(home.path, "plugins.json"),
+          JSON.stringify({
+            plugins: [createTestPluginInstallEntry("a-managed", undefined, componentConsent)],
+          })
+        );
+      const tool = createAgentSkillListTool(
+        createTestToolConfig(home.path, {
+          workspaceId: GLOBAL_WORKSPACE_ID,
+          xumScope: { type: "global", xumHome: home.path },
+        })
+      );
+      const list = async () => {
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+        if (!result.success) throw new Error(result.error);
+        return Object.fromEntries(result.skills.map((skill) => [skill.name, skill.description]));
+      };
+
+      // No records (an install from before #6498), or a record for another fingerprint: not listed.
+      await saveConsent();
+      expect(await list()).toEqual({ shared: "fallback", free: "unmanaged" });
+      await saveConsent({
+        skills: { shared: "0".repeat(64), solo: "0".repeat(64) },
+        mcpServers: {},
+        workflows: {},
+        agents: {},
+        slashCommands: {},
+      });
+      expect(await list()).toEqual({ shared: "fallback", free: "unmanaged" });
+
+      const reviewed = await reviewedComponentConsent({ pluginDir: managedDir });
+      await saveConsent(reviewed);
+      expect(await list()).toEqual({ shared: "managed", solo: "managed only", free: "unmanaged" });
+      const entry = createTestPluginInstallEntry("a-managed", undefined, reviewed);
+      await saveApprovedCopies({ xumHome: home.path, pluginDir: managedDir, entry });
+
+      // A frontmatter change under the same name needs a new review: the approved version lists
+      // meanwhile, and without an approved copy the skill does not list at all.
+      await writeSkill(path.join(managedDir, "skills"), "shared", {
+        description: "run every tool",
+      });
+      expect(await list()).toEqual({ shared: "managed", solo: "managed only", free: "unmanaged" });
+      await fs.rm(path.join(home.path, "plugin-approved-copies"), { recursive: true });
+      expect(await list()).toEqual({ shared: "fallback", solo: "managed only", free: "unmanaged" });
+    });
+  });
+
+  it.each([
+    [".xum", false],
+    [".mux", false],
+    [".xum", true],
+    [".mux", true],
+  ] as const)(
+    "combined tool-list containers retain managed imports when the project overlaps %s (aliased home: %s)",
+    async (metadataDir, aliasHome) => {
+      using home = new TestTempDir("plugin-tool-list-overlap");
+      const physicalHome = path.join(home.path, metadataDir);
+      const xumHome = aliasHome ? path.join(home.path, "configured-home") : physicalHome;
+      await fs.mkdir(physicalHome, { recursive: true });
+      if (aliasHome) await fs.symlink(physicalHome, xumHome, "dir");
+      await withHomeDir(home.path, async () => {
+        await withMuxRoot(xumHome, async () => {
+          const pluginDir = await writePlugin(path.join(xumHome, "plugins"), "managed", [
+            { name: "allowed", description: "imported" },
+            { name: "blocked", description: "not imported" },
+          ]);
+          await writePlugin(path.join(home.path, ".agents", "plugins"), "project-only", [
+            { name: "unmanaged", description: "unmanaged project" },
+          ]);
+          const registryPath = path.join(xumHome, "plugins.json");
+          await fs.writeFile(
+            registryPath,
+            JSON.stringify({
+              plugins: [
+                createTestPluginInstallEntry(
+                  "managed",
+                  { skills: ["allowed"], mcpServers: [] },
+                  await reviewedComponentConsent({ pluginDir })
+                ),
+              ],
+            })
+          );
+          const tool = createAgentSkillListTool({
+            ...createTestToolConfig(home.path, {
+              xumScope: {
+                type: "project",
+                xumHome,
+                projectRoot: home.path,
+                projectStorageAuthority: "host-local",
+              },
+            }),
+          });
+          const list = async () => {
+            const result = (await tool.execute!(
+              {},
+              mockToolCallOptions
+            )) as AgentSkillListToolResult;
+            if (!result.success) throw new Error(result.error);
+            return result.skills;
+          };
+          const initial = await list();
+          expect(getSkill(initial, "allowed").scope).toBe("project");
+          expect(initial.some((skill) => skill.name === "blocked")).toBe(false);
+          expect(initial.some((skill) => skill.name === "unmanaged")).toBe(true);
+          await fs.writeFile(registryPath, "{");
+          const corrupted = await list();
+          expect(corrupted.some((skill) => ["allowed", "blocked"].includes(skill.name))).toBe(
+            false
+          );
+          expect(corrupted.some((skill) => skill.name === "unmanaged")).toBe(true);
+        });
+      });
+    }
+  );
+
   it("lists checkout-level plugin skills when the workspace executes in a subproject", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-plugins-subproject-home");
     using checkout = new TestTempDir("test-agent-skill-list-plugins-subproject-checkout");
-    using muxHomeDir = new TestTempDir("test-agent-skill-list-plugins-subproject-mux-home");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-plugins-subproject-mux-home");
 
     await withHomeDir(homeDir.path, async () => {
-      await withMuxRoot(muxHomeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
         // subProjectPath workspaces execute in a subdirectory of the checkout;
         // plugin containers live at the checkout level.
         const subprojectRoot = path.join(checkout.path, "packages", "app");
@@ -428,15 +765,14 @@ describe("agent_skill_list", () => {
 
         const tool = createAgentSkillListTool({
           ...createTestToolConfig(subprojectRoot, {
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: muxHomeDir.path,
+              xumHome: xumHomeDir.path,
               projectRoot: subprojectRoot,
               projectStorageAuthority: "host-local",
               checkoutRoot: checkout.path,
             },
           }),
-          experiments: { agentPlugins: true },
         });
         const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
 
@@ -457,10 +793,10 @@ describe("agent_skill_list", () => {
   it("lists plugin skills behind symlinks contained in the plugin root, rejects escaping ones", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-plugins-symlink-home");
     using project = new TestTempDir("test-agent-skill-list-plugins-symlink-project");
-    using muxHomeDir = new TestTempDir("test-agent-skill-list-plugins-symlink-mux-home");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-plugins-symlink-mux-home");
 
     await withHomeDir(homeDir.path, async () => {
-      await withMuxRoot(muxHomeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
         await writePlugin(path.join(project.path, ".mux", "plugins"), "sym-plugin", []);
         const pluginDir = path.join(project.path, ".mux", "plugins", "sym-plugin");
         await fs.mkdir(path.join(pluginDir, "skills"), { recursive: true });
@@ -485,14 +821,13 @@ describe("agent_skill_list", () => {
 
         const tool = createAgentSkillListTool({
           ...createTestToolConfig(project.path, {
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: muxHomeDir.path,
+              xumHome: xumHomeDir.path,
               projectRoot: project.path,
               projectStorageAuthority: "host-local",
             },
           }),
-          experiments: { agentPlugins: true },
         });
         const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
 
@@ -513,21 +848,21 @@ describe("agent_skill_list", () => {
 
   it("returns only the winning descriptor when project skills shadow global skills", async () => {
     using project = new TestTempDir("test-agent-skill-list-shadow-project");
-    using muxHome = new TestTempDir("test-agent-skill-list-shadow-home");
+    using xumHome = new TestTempDir("test-agent-skill-list-shadow-home");
 
-    await withMuxRoot(muxHome.path, async () => {
+    await withMuxRoot(xumHome.path, async () => {
       await writeSkill(path.join(project.path, ".mux", "skills"), "shared-skill", {
         description: "from project",
       });
-      await writeSkill(path.join(muxHome.path, "skills"), "shared-skill", {
+      await writeSkill(path.join(xumHome.path, "skills"), "shared-skill", {
         description: "from global",
       });
 
       const tool = createAgentSkillListTool(
         createTestToolConfig(project.path, {
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: muxHome.path,
+            xumHome: xumHome.path,
             projectRoot: project.path,
             projectStorageAuthority: "host-local",
           },
@@ -558,22 +893,22 @@ describe("agent_skill_list", () => {
 
   it("filters unadvertised skills by default across scopes", async () => {
     using project = new TestTempDir("test-agent-skill-list-hidden-project");
-    using muxHome = new TestTempDir("test-agent-skill-list-hidden-home");
+    using xumHome = new TestTempDir("test-agent-skill-list-hidden-home");
 
-    await withMuxRoot(muxHome.path, async () => {
+    await withMuxRoot(xumHome.path, async () => {
       await writeSkill(path.join(project.path, ".mux", "skills"), "visible-project");
       await writeSkill(path.join(project.path, ".agents", "skills"), "hidden-project", {
         advertise: false,
       });
-      await writeSkill(path.join(muxHome.path, "skills"), "hidden-global", {
+      await writeSkill(path.join(xumHome.path, "skills"), "hidden-global", {
         advertise: false,
       });
 
       const tool = createAgentSkillListTool(
         createTestToolConfig(project.path, {
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: muxHome.path,
+            xumHome: xumHome.path,
             projectRoot: project.path,
             projectStorageAuthority: "host-local",
           },
@@ -594,9 +929,9 @@ describe("agent_skill_list", () => {
 
   it("treats disable-model-invocation: true like advertise: false (either opt-out hides)", async () => {
     using project = new TestTempDir("test-agent-skill-list-dmi-project");
-    using muxHome = new TestTempDir("test-agent-skill-list-dmi-home");
+    using xumHome = new TestTempDir("test-agent-skill-list-dmi-home");
 
-    await withMuxRoot(muxHome.path, async () => {
+    await withMuxRoot(xumHome.path, async () => {
       await writeSkill(path.join(project.path, ".mux", "skills"), "user-only", {
         disableModelInvocation: true,
       });
@@ -611,9 +946,9 @@ describe("agent_skill_list", () => {
 
       const tool = createAgentSkillListTool(
         createTestToolConfig(project.path, {
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: muxHome.path,
+            xumHome: xumHome.path,
             projectRoot: project.path,
             projectStorageAuthority: "host-local",
           },
@@ -649,9 +984,9 @@ describe("agent_skill_list", () => {
 
   it("normalizes user-invocable, argument-hint, and when_to_use into descriptors", async () => {
     using project = new TestTempDir("test-agent-skill-list-normalized-project");
-    using muxHome = new TestTempDir("test-agent-skill-list-normalized-home");
+    using xumHome = new TestTempDir("test-agent-skill-list-normalized-home");
 
-    await withMuxRoot(muxHome.path, async () => {
+    await withMuxRoot(xumHome.path, async () => {
       await writeSkill(path.join(project.path, ".mux", "skills"), "model-only", {
         userInvocable: false,
         argumentHint: "[issue-number]",
@@ -669,9 +1004,9 @@ describe("agent_skill_list", () => {
 
       const tool = createAgentSkillListTool(
         createTestToolConfig(project.path, {
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: muxHome.path,
+            xumHome: xumHome.path,
             projectRoot: project.path,
             projectStorageAuthority: "host-local",
           },
@@ -703,12 +1038,12 @@ describe("agent_skill_list", () => {
   it("filters hidden skills from local legacy .agents/skills roots unless includeUnadvertised is true", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-local-hidden-legacy-home");
     using project = new TestTempDir("test-agent-skill-list-local-hidden-legacy-project");
-    using muxHomeDir = new TestTempDir("test-agent-skill-list-local-hidden-legacy-mux-home");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-local-hidden-legacy-mux-home");
     const hiddenProjectSkill = "hidden-project-universal";
     const hiddenGlobalSkill = "hidden-global-universal";
 
     await withHomeDir(homeDir.path, async () => {
-      await withMuxRoot(muxHomeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
         await writeSkill(path.join(project.path, ".agents", "skills"), hiddenProjectSkill, {
           advertise: false,
         });
@@ -718,9 +1053,9 @@ describe("agent_skill_list", () => {
 
         const tool = createAgentSkillListTool(
           createTestToolConfig(project.path, {
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: muxHomeDir.path,
+              xumHome: xumHomeDir.path,
               projectRoot: project.path,
               projectStorageAuthority: "host-local",
             },
@@ -766,14 +1101,14 @@ describe("agent_skill_list", () => {
 
   it("includes unadvertised winning descriptors when includeUnadvertised is true", async () => {
     using project = new TestTempDir("test-agent-skill-list-include-hidden-project");
-    using muxHome = new TestTempDir("test-agent-skill-list-include-hidden-home");
+    using xumHome = new TestTempDir("test-agent-skill-list-include-hidden-home");
 
-    await withMuxRoot(muxHome.path, async () => {
+    await withMuxRoot(xumHome.path, async () => {
       await writeSkill(path.join(project.path, ".mux", "skills"), "project-hidden", {
         description: "hidden project winner",
         advertise: false,
       });
-      await writeSkill(path.join(muxHome.path, "skills"), "global-hidden", {
+      await writeSkill(path.join(xumHome.path, "skills"), "global-hidden", {
         description: "hidden global winner",
         advertise: false,
       });
@@ -781,16 +1116,16 @@ describe("agent_skill_list", () => {
         description: "hidden project winner",
         advertise: false,
       });
-      await writeSkill(path.join(muxHome.path, "skills"), "shared-hidden", {
+      await writeSkill(path.join(xumHome.path, "skills"), "shared-hidden", {
         description: "hidden global loser",
         advertise: false,
       });
 
       const tool = createAgentSkillListTool(
         createTestToolConfig(project.path, {
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: muxHome.path,
+            xumHome: xumHome.path,
             projectRoot: project.path,
             projectStorageAuthority: "host-local",
           },
@@ -862,9 +1197,9 @@ describe("agent_skill_list", () => {
       const config = createTestToolConfig(tempDir.path, {
         workspaceId: GLOBAL_WORKSPACE_ID,
         sessionsDir: workspaceSessionDir,
-        muxScope: {
+        xumScope: {
           type: "global",
-          muxHome: tempDir.path,
+          xumHome: tempDir.path,
         },
       });
 
@@ -894,9 +1229,9 @@ describe("agent_skill_list", () => {
       await writeGlobalSkill(tempDir.path, "global-skill");
       await writeGlobalSkill(path.join(projectRoot, ".mux"), "project-skill");
 
-      const projectScope: MuxToolScope = {
+      const projectScope: XumToolScope = {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot,
         projectStorageAuthority: "host-local",
       };
@@ -904,7 +1239,7 @@ describe("agent_skill_list", () => {
       const config = createTestToolConfig(tempDir.path, {
         workspaceId: GLOBAL_WORKSPACE_ID,
         sessionsDir: workspaceSessionDir,
-        muxScope: projectScope,
+        xumScope: projectScope,
       });
 
       const tool = createAgentSkillListTool(config);
@@ -919,6 +1254,45 @@ describe("agent_skill_list", () => {
       }
     });
   });
+  // The display name is user-facing only: plugin model-visible fields are
+  // consent-fingerprinted, so this model-facing list must not carry it.
+  it("lists a display-name skill under its directory name without the display name", async () => {
+    using tempDir = new TestTempDir("test-agent-skill-list-display-name");
+    const skillDir = path.join(tempDir.path, ".agents", "skills", "poteto-mode");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: Poteto Mode\ndescription: pstack router\n---\nBody\n",
+      "utf-8"
+    );
+    const xumScope = {
+      type: "project" as const,
+      xumHome: tempDir.path,
+      projectRoot: tempDir.path,
+    };
+    // host-local reads SKILL.md itself; runtime authority goes through discovery.
+    const configs = (["host-local", "runtime"] as const).map((projectStorageAuthority) =>
+      createTestToolConfig(tempDir.path, {
+        workspaceId: "regular-workspace",
+        xumScope: { ...xumScope, projectStorageAuthority },
+      })
+    );
+
+    await withHomeDir(tempDir.path, async () => {
+      for (const config of configs) {
+        const result = (await createAgentSkillListTool(config).execute!(
+          { includeUnadvertised: true },
+          mockToolCallOptions
+        )) as AgentSkillListToolResult;
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        const skill = getSkill(result.skills, "poteto-mode");
+        expect(skill.description).toBe("pstack router");
+        expect("displayName" in skill).toBe(false);
+      }
+    });
+  });
+
   describe("split-root (project-runtime)", () => {
     it("routes through project-runtime when runtime is non-local", async () => {
       using tempDir = new TestTempDir("test-agent-skill-list-split-root-project-runtime");
@@ -931,9 +1305,9 @@ describe("agent_skill_list", () => {
       const config = createTestToolConfig(tempDir.path, {
         workspaceId: "regular-workspace",
         runtime: remoteRuntime,
-        muxScope: {
+        xumScope: {
           type: "project",
-          muxHome: tempDir.path,
+          xumHome: tempDir.path,
           projectRoot: tempDir.path,
           projectStorageAuthority: "runtime",
         },
@@ -959,7 +1333,7 @@ describe("agent_skill_list", () => {
 
     it("dedupes inherited project skills to the nearest runtime definition", async () => {
       using checkout = new TestTempDir("test-agent-skill-list-runtime-subproject-checkout");
-      using muxHome = new TestTempDir("test-agent-skill-list-runtime-subproject-mux-home");
+      using xumHome = new TestTempDir("test-agent-skill-list-runtime-subproject-mux-home");
       const packagesRoot = path.join(checkout.path, "packages");
       const subprojectRoot = path.join(packagesRoot, "app");
       const remoteCheckoutRoot = "/remote/workspace";
@@ -977,9 +1351,9 @@ describe("agent_skill_list", () => {
         ...createTestToolConfig(subprojectRoot, {
           workspaceId: "regular-workspace",
           runtime,
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: muxHome.path,
+            xumHome: xumHome.path,
             projectRoot: subprojectRoot,
             projectStorageAuthority: "runtime",
             checkoutRoot: remoteCheckoutRoot,
@@ -1007,16 +1381,16 @@ describe("agent_skill_list", () => {
 
     it("lists host-global skills in SSH project-runtime mode", async () => {
       using project = new TestTempDir("test-agent-skill-list-ssh-host-global");
-      using muxHome = new TestTempDir("test-agent-skill-list-ssh-mux-home");
+      using xumHome = new TestTempDir("test-agent-skill-list-ssh-mux-home");
 
       const remoteWorkspaceRoot = "/remote/workspace";
 
-      await withHomeDir(muxHome.path, async () => {
-        await withMuxRoot(muxHome.path, async () => {
+      await withHomeDir(xumHome.path, async () => {
+        await withMuxRoot(xumHome.path, async () => {
           await writeSkill(path.join(project.path, ".mux", "skills"), "project-remote", {
             description: "from remote workspace",
           });
-          await writeGlobalSkill(muxHome.path, "host-global", {
+          await writeGlobalSkill(xumHome.path, "host-global", {
             description: "from host mux home",
           });
 
@@ -1026,9 +1400,9 @@ describe("agent_skill_list", () => {
           const config = createTestToolConfig(project.path, {
             workspaceId: "regular-workspace",
             runtime: remoteRuntime,
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: muxHome.path,
+              xumHome: xumHome.path,
               projectRoot: project.path,
               projectStorageAuthority: "runtime",
             },
@@ -1079,16 +1453,16 @@ describe("agent_skill_list", () => {
           });
 
           const remoteRuntime = new RemotePathMappedRuntime(tempDir.path, "/var", {
-            muxHome: "/var/mux",
+            xumHome: "/var/mux",
             resolveToRemotePath: false,
           });
 
           const config = createTestToolConfig(tempDir.path, {
             workspaceId: "regular-workspace",
             runtime: remoteRuntime,
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: legacyHome.path,
+              xumHome: legacyHome.path,
               projectRoot: tempDir.path,
               projectStorageAuthority: "runtime",
             },
@@ -1138,9 +1512,9 @@ describe("agent_skill_list", () => {
 
         const config = createTestToolConfig(tempDir.path, {
           workspaceId: "regular-workspace",
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: tempDir.path,
+            xumHome: tempDir.path,
             projectRoot: tempDir.path,
             projectStorageAuthority: "runtime",
           },
@@ -1186,9 +1560,9 @@ describe("agent_skill_list", () => {
 
           const config = createTestToolConfig(projectDir.path, {
             workspaceId: "regular-workspace",
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: homeDir.path,
+              xumHome: homeDir.path,
               projectRoot: projectDir.path,
               projectStorageAuthority: "runtime",
             },
@@ -1232,9 +1606,9 @@ describe("agent_skill_list", () => {
 
           const config = createTestToolConfig(projectDir.path, {
             workspaceId: "regular-workspace",
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: homeDir.path,
+              xumHome: homeDir.path,
               projectRoot: projectDir.path,
               projectStorageAuthority: "runtime",
             },
@@ -1282,9 +1656,9 @@ describe("agent_skill_list", () => {
 
           const config = createTestToolConfig(projectDir.path, {
             workspaceId: "regular-workspace",
-            muxScope: {
+            xumScope: {
               type: "project",
-              muxHome: homeDir.path,
+              xumHome: homeDir.path,
               projectRoot: projectDir.path,
               projectStorageAuthority: "runtime",
             },
@@ -1324,14 +1698,14 @@ describe("agent_skill_list", () => {
       using escapedSkillsDir = new TestTempDir(
         "test-agent-skill-list-split-root-containment-escape"
       );
-      using muxHomeDir = new TestTempDir("test-agent-skill-list-split-root-containment-mux-home");
+      using xumHomeDir = new TestTempDir("test-agent-skill-list-split-root-containment-mux-home");
 
       const remoteWorkspaceRoot = "/remote/workspace";
       const escapedSkillName = "escaped-runtime-skill";
       const safeGlobalSkillName = "runtime-safe-global-skill";
       const previousMuxRoot = process.env.MUX_ROOT;
 
-      process.env.MUX_ROOT = muxHomeDir.path;
+      process.env.MUX_ROOT = xumHomeDir.path;
 
       try {
         await writeGlobalSkill(escapedSkillsDir.path, escapedSkillName);
@@ -1341,15 +1715,15 @@ describe("agent_skill_list", () => {
           process.platform === "win32" ? "junction" : "dir"
         );
 
-        await writeGlobalSkill(muxHomeDir.path, safeGlobalSkillName);
+        await writeGlobalSkill(xumHomeDir.path, safeGlobalSkillName);
 
         const remoteRuntime = new RemotePathMappedRuntime(tempDir.path, remoteWorkspaceRoot);
         const config = createTestToolConfig(tempDir.path, {
           workspaceId: "regular-workspace",
           runtime: remoteRuntime,
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: tempDir.path,
+            xumHome: tempDir.path,
             projectRoot: tempDir.path,
             projectStorageAuthority: "runtime",
           },
@@ -1401,9 +1775,9 @@ describe("agent_skill_list", () => {
       const config = createTestToolConfig(tempDir.path, {
         workspaceId: GLOBAL_WORKSPACE_ID,
         sessionsDir: workspaceSessionDir,
-        muxScope: {
+        xumScope: {
           type: "global",
-          muxHome: tempDir.path,
+          xumHome: tempDir.path,
         },
       });
 
@@ -1461,9 +1835,9 @@ describe("agent_skill_list", () => {
       // Also create a real global skill.
       await writeGlobalSkill(tempDir.path, "global-skill");
 
-      const projectScope: MuxToolScope = {
+      const projectScope: XumToolScope = {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot,
         projectStorageAuthority: "host-local",
       };
@@ -1471,7 +1845,7 @@ describe("agent_skill_list", () => {
       const config = createTestToolConfig(tempDir.path, {
         workspaceId: GLOBAL_WORKSPACE_ID,
         sessionsDir: workspaceSessionDir,
-        muxScope: projectScope,
+        xumScope: projectScope,
       });
 
       const tool = createAgentSkillListTool(config);
@@ -1511,9 +1885,9 @@ describe("agent_skill_list", () => {
       );
       await fs.symlink(storeSkillDir, path.join(skillsDir, "linked-skill"));
 
-      const projectScope: MuxToolScope = {
+      const projectScope: XumToolScope = {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot,
         projectStorageAuthority: "host-local",
       };
@@ -1521,7 +1895,7 @@ describe("agent_skill_list", () => {
       const config = createTestToolConfig(tempDir.path, {
         workspaceId: GLOBAL_WORKSPACE_ID,
         sessionsDir: workspaceSessionDir,
-        muxScope: projectScope,
+        xumScope: projectScope,
       });
 
       const tool = createAgentSkillListTool(config);
@@ -1566,9 +1940,9 @@ describe("agent_skill_list", () => {
       await fs.symlink(decoyFile, path.join(externalSkillDir, "SKILL.md"));
       await fs.symlink(externalSkillDir, path.join(skillsDir, "evil-skill"));
 
-      const projectScope: MuxToolScope = {
+      const projectScope: XumToolScope = {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot,
         projectStorageAuthority: "host-local",
       };
@@ -1576,7 +1950,7 @@ describe("agent_skill_list", () => {
       const config = createTestToolConfig(tempDir.path, {
         workspaceId: GLOBAL_WORKSPACE_ID,
         sessionsDir: workspaceSessionDir,
-        muxScope: projectScope,
+        xumScope: projectScope,
       });
 
       const tool = createAgentSkillListTool(config);
@@ -1621,9 +1995,9 @@ describe("agent_skill_list", () => {
       // Also create a global skill.
       await writeGlobalSkill(tempDir.path, "global-skill");
 
-      const projectScope: MuxToolScope = {
+      const projectScope: XumToolScope = {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot,
         projectStorageAuthority: "host-local",
       };
@@ -1631,7 +2005,7 @@ describe("agent_skill_list", () => {
       const config = createTestToolConfig(tempDir.path, {
         workspaceId: GLOBAL_WORKSPACE_ID,
         sessionsDir: workspaceSessionDir,
-        muxScope: projectScope,
+        xumScope: projectScope,
       });
 
       const tool = createAgentSkillListTool(config);
@@ -1665,9 +2039,9 @@ describe("agent_skill_list", () => {
       const config = createTestToolConfig(tempDir.path, {
         workspaceId: GLOBAL_WORKSPACE_ID,
         sessionsDir: workspaceSessionDir,
-        muxScope: {
+        xumScope: {
           type: "global",
-          muxHome: tempDir.path,
+          xumHome: tempDir.path,
         },
       });
 
@@ -1684,20 +2058,20 @@ describe("agent_skill_list", () => {
 
   it("continues listing global skills when project skills root is not a directory", async () => {
     using project = new TestTempDir("test-agent-skill-list-project-root-not-directory");
-    using muxHome = new TestTempDir("test-agent-skill-list-global-root-valid");
+    using xumHome = new TestTempDir("test-agent-skill-list-global-root-valid");
 
-    await withHomeDir(muxHome.path, async () => {
+    await withHomeDir(xumHome.path, async () => {
       await fs.mkdir(path.join(project.path, ".mux"), { recursive: true });
       await fs.writeFile(path.join(project.path, ".mux", "skills"), "not a directory", "utf-8");
-      await writeGlobalSkill(muxHome.path, "global-skill", {
+      await writeGlobalSkill(xumHome.path, "global-skill", {
         description: "from global",
       });
 
       const tool = createAgentSkillListTool(
         createTestToolConfig(project.path, {
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: muxHome.path,
+            xumHome: xumHome.path,
             projectRoot: project.path,
             projectStorageAuthority: "host-local",
           },
@@ -1714,18 +2088,18 @@ describe("agent_skill_list", () => {
 
   it("returns no skills when both project and global roots are not directories", async () => {
     using project = new TestTempDir("test-agent-skill-list-both-roots-not-directories-project");
-    using muxHome = new TestTempDir("test-agent-skill-list-both-roots-not-directories-home");
+    using xumHome = new TestTempDir("test-agent-skill-list-both-roots-not-directories-home");
 
-    await withHomeDir(muxHome.path, async () => {
+    await withHomeDir(xumHome.path, async () => {
       await fs.mkdir(path.join(project.path, ".mux"), { recursive: true });
       await fs.writeFile(path.join(project.path, ".mux", "skills"), "not a directory", "utf-8");
-      await fs.writeFile(path.join(muxHome.path, "skills"), "not a directory", "utf-8");
+      await fs.writeFile(path.join(xumHome.path, "skills"), "not a directory", "utf-8");
 
       const tool = createAgentSkillListTool(
         createTestToolConfig(project.path, {
-          muxScope: {
+          xumScope: {
             type: "project",
-            muxHome: muxHome.path,
+            xumHome: xumHome.path,
             projectRoot: project.path,
             projectStorageAuthority: "host-local",
           },
@@ -1767,9 +2141,9 @@ describe("agent_skill_list", () => {
       // Also create a real global skill
       await writeGlobalSkill(tempDir.path, "global-skill");
 
-      const projectScope: MuxToolScope = {
+      const projectScope: XumToolScope = {
         type: "project",
-        muxHome: tempDir.path,
+        xumHome: tempDir.path,
         projectRoot,
         projectStorageAuthority: "host-local",
       };
@@ -1777,7 +2151,7 @@ describe("agent_skill_list", () => {
       const config = createTestToolConfig(tempDir.path, {
         workspaceId: GLOBAL_WORKSPACE_ID,
         sessionsDir: workspaceSessionDir,
-        muxScope: projectScope,
+        xumScope: projectScope,
       });
 
       const tool = createAgentSkillListTool(config);

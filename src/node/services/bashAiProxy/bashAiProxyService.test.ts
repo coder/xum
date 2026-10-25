@@ -1,0 +1,961 @@
+import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
+import * as http from "node:http";
+import * as net from "node:net";
+import * as os from "node:os";
+import * as path from "node:path";
+import type { AddressInfo } from "node:net";
+
+import type { ChatUsageDisplay } from "@/common/utils/tokens/usageAggregator";
+import type { AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
+import { log } from "@/node/services/log";
+import type { ProviderConfigRaw } from "@/node/utils/providerRequirements";
+
+import { ReverseForwardRefusedError, type ReverseForward } from "@/node/runtime/transports";
+
+import { BashAiProxyService } from "./bashAiProxyService";
+import type { ForwardTarget } from "./reverseForwards";
+import { BASH_AI_PROXY_HEALTH_PATH, candidatePorts } from "./stableIdentity";
+
+interface SeenRequest {
+  method: string;
+  url: string;
+  headers: http.IncomingHttpHeaders;
+  body: string;
+}
+
+const zero = { tokens: 0 };
+const emptyDisplayUsage: ChatUsageDisplay = {
+  input: zero,
+  cached: zero,
+  cacheCreate: zero,
+  output: zero,
+  reasoning: zero,
+};
+
+interface RecordCall {
+  workspaceId: string;
+  modelString: string;
+  usage: AiSdkUsageLike;
+}
+
+const anthropicSse = [
+  `event: message_start\ndata: ${JSON.stringify({
+    type: "message_start",
+    message: { model: "claude-sonnet-5-5", usage: { input_tokens: 11, output_tokens: 1 } },
+  })}\n\n`,
+  `event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", usage: { output_tokens: 4 } })}\n\n`,
+].join("");
+
+/** A loopback stand-in for the provider: records each request and answers by path. */
+async function startUpstream() {
+  const seen: SeenRequest[] = [];
+  const server = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk: Buffer) => (body += chunk.toString()));
+    req.on("end", () => {
+      seen.push({ method: req.method ?? "", url: req.url ?? "", headers: req.headers, body });
+      if (req.url === "/v1/messages") {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(anthropicSse);
+      } else if (req.url === "/v1/chat/completions") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({ model: "gpt-6.1", usage: { prompt_tokens: 3, completion_tokens: 2 } })
+        );
+      } else if (req.url === "/v1/responses") {
+        res.writeHead(307, { location: "https://elsewhere.example/v1/responses" });
+        res.end();
+      } else {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  return { seen, server, baseUrl: `http://127.0.0.1:${port}/v1` };
+}
+
+describe("BashAiProxyService", () => {
+  let upstream: Awaited<ReturnType<typeof startUpstream>>;
+  let proxy: BashAiProxyService;
+  let enabled: boolean;
+  let rootDir: string;
+  let removed: Set<string>;
+  let sshTargets: Map<string, ForwardTarget>;
+  let configs: Record<string, ProviderConfigRaw>;
+  let recorded: RecordCall[];
+  let liveDeltas: string[];
+  let untrusted: Set<string>;
+  let rootShared: boolean;
+
+  beforeEach(async () => {
+    upstream = await startUpstream();
+    enabled = true;
+    configs = {
+      anthropic: { apiKey: "real-anthropic-key", baseUrl: upstream.baseUrl },
+      openai: {
+        apiKey: "real-openai-key",
+        baseUrl: upstream.baseUrl,
+        headers: { "x-gateway-team": "qa", Authorization: "Bearer not-this-one" },
+      },
+    };
+    recorded = [];
+    liveDeltas = [];
+    rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "bash-ai-proxy-"));
+    removed = new Set();
+    untrusted = new Set();
+    rootShared = false;
+    sshTargets = new Map();
+    proxy = makeProxy();
+  });
+
+  function makeProxy(): BashAiProxyService {
+    return new BashAiProxyService({
+      rootDir,
+      isEnabled: () => enabled,
+      workspaceExists: (workspaceId) => !removed.has(workspaceId),
+      isWorkspaceTrusted: (workspaceId) => Promise.resolve(!untrusted.has(workspaceId)),
+      isRootShared: () => Promise.resolve(rootShared),
+      // Like the app: a removed workspace has no metadata, so no runtime.
+      forwardTargetFor: (workspaceId) =>
+        Promise.resolve(removed.has(workspaceId) ? undefined : sshTargets.get(workspaceId)),
+      loadProviderConfig: (provider) => configs[provider] ?? {},
+      recordUsage: (workspaceId, modelString, usage) => {
+        recorded.push({ workspaceId, modelString, usage });
+        return Promise.resolve(
+          workspaceId === "removed-ws"
+            ? undefined
+            : { model: modelString, usage: emptyDisplayUsage }
+        );
+      },
+      onUsageRecorded: (workspaceId) => liveDeltas.push(workspaceId),
+    });
+  }
+
+  type SavedForwards = Record<string, { usedAt: number; workspaceIds: string[] }>;
+  async function readState(): Promise<{ forwards: SavedForwards }> {
+    const text = await fs.promises.readFile(path.join(rootDir, "bash-ai-proxy.json"), "utf8");
+    return JSON.parse(text) as { forwards: SavedForwards };
+  }
+
+  afterEach(async () => {
+    await proxy.stop();
+    upstream.server.close();
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  });
+
+  test("both Anthropic SDK path styles reach /v1/messages with the Xum key and record once each", async () => {
+    const env = await proxy.envFor("ws-1", "worktree", []);
+    const base = env.ANTHROPIC_BASE_URL;
+    expect(env.ANTHROPIC_API_KEY).toStartWith("xum-proxy-");
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe(env.ANTHROPIC_API_KEY);
+
+    // AI SDK style (base + /messages) and official SDK style (base + /v1/messages).
+    for (const path of ["/messages", "/v1/messages"]) {
+      const res = await fetch(`${base}${path}`, {
+        method: "POST",
+        headers: { "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
+        body: JSON.stringify({ model: "claude-sonnet-5-5", stream: true }),
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(anthropicSse);
+    }
+
+    expect(upstream.seen.map((r) => r.url)).toEqual(["/v1/messages", "/v1/messages"]);
+    for (const request of upstream.seen) {
+      expect(request.headers["x-api-key"]).toBe("real-anthropic-key");
+      expect(request.headers["anthropic-version"]).toBe("2023-06-01");
+      expect(JSON.stringify(request.headers)).not.toContain("xum-proxy-");
+    }
+    expect(recorded).toEqual([
+      {
+        workspaceId: "ws-1",
+        modelString: "anthropic:claude-sonnet-5-5",
+        usage: { inputTokens: 11, cachedInputTokens: 0, outputTokens: 4 },
+      },
+      {
+        workspaceId: "ws-1",
+        modelString: "anthropic:claude-sonnet-5-5",
+        usage: { inputTokens: 11, cachedInputTokens: 0, outputTokens: 4 },
+      },
+    ]);
+    expect(liveDeltas).toEqual(["ws-1", "ws-1"]);
+  });
+
+  test("a Bearer key works for OpenAI, and streamed chat requests ask for usage", async () => {
+    const env = await proxy.envFor("ws-2", "local", []);
+    const res = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${env.OPENAI_API_KEY}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ model: "gpt-6.1", stream: true, stream_options: { foo: 1 } }),
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    const [request] = upstream.seen;
+    expect(request.headers.authorization).toBe("Bearer real-openai-key");
+    // providers.jsonc headers go upstream, but never replace the auth header.
+    expect(request.headers["x-gateway-team"]).toBe("qa");
+    expect(JSON.parse(request.body)).toEqual({
+      model: "gpt-6.1",
+      stream: true,
+      stream_options: { foo: 1, include_usage: true },
+    });
+    expect(recorded.map((r) => r.modelString)).toEqual(["openai:gpt-6.1"]);
+  });
+
+  test("an explicit include_usage choice is kept", async () => {
+    const env = await proxy.envFor("ws-2b", "local", []);
+    const body = JSON.stringify({ stream: true, stream_options: { include_usage: false } });
+    const res = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      body,
+    });
+    await res.text();
+    expect(upstream.seen[0].body).toBe(body);
+  });
+
+  test("an origin-only OpenAI base URL gets /v1, like chat requests", async () => {
+    configs.openai = { ...configs.openai, baseUrl: upstream.baseUrl.replace(/\/v1$/, "") };
+    const env = await proxy.envFor("ws-origin", "local", []);
+    const res = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    expect(upstream.seen.map((r) => r.url)).toEqual(["/v1/chat/completions"]);
+  });
+
+  test("a base URL query stays a query, merged with the request's", async () => {
+    configs.anthropic = { ...configs.anthropic, baseUrl: `${upstream.baseUrl}?token=abc` };
+    const env = await proxy.envFor("ws-query", "local", []);
+    await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages?beta=true`, {
+      method: "POST",
+      headers: { "x-api-key": env.ANTHROPIC_API_KEY },
+      body: "{}",
+    });
+    expect(upstream.seen.map((r) => r.url)).toEqual(["/v1/messages?token=abc&beta=true"]);
+  });
+
+  test("a configured OpenAI-Project header goes upstream, a command's own does not", async () => {
+    configs.openai = { ...configs.openai, headers: { "OpenAI-Project": "proj_config" } };
+    const env = await proxy.envFor("ws-project", "local", []);
+    await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}`, "openai-project": "proj_child" },
+      body: "{}",
+    });
+    expect(upstream.seen[0].headers["openai-project"]).toBe("proj_config");
+  });
+
+  test("refusals never reach the provider", async () => {
+    const env = await proxy.envFor("ws-3", "local", []);
+    const post = (url: string, key: string) =>
+      fetch(url, { method: "POST", headers: { "x-api-key": key }, body: "{}" });
+
+    const unknownKey = await post(`${env.ANTHROPIC_BASE_URL}/v1/messages`, "xum-proxy-nope");
+    expect(unknownKey.status).toBe(401);
+    expect(((await unknownKey.json()) as { error: { message: string } }).error.message).toContain(
+      "unknown key"
+    );
+
+    const notAllowed = await post(`${env.ANTHROPIC_BASE_URL}/v1/files`, env.ANTHROPIC_API_KEY);
+    expect(notAllowed.status).toBe(404);
+
+    removed.add("ws-3");
+    const revoked = await post(`${env.ANTHROPIC_BASE_URL}/v1/messages`, env.ANTHROPIC_API_KEY);
+    expect(revoked.status).toBe(401);
+
+    expect(upstream.seen).toEqual([]);
+    expect(recorded).toEqual([]);
+  });
+
+  test("after a restart the same port and key still work", async () => {
+    const before = await proxy.envFor("ws-r", "local", []);
+    await proxy.stop();
+
+    proxy = makeProxy();
+    const after = await proxy.envFor("ws-r", "local", []);
+    expect(after.ANTHROPIC_BASE_URL).toBe(before.ANTHROPIC_BASE_URL);
+    expect(after.ANTHROPIC_API_KEY).toBe(before.ANTHROPIC_API_KEY);
+
+    // A process started before the restart uses its old env and is accepted and counted.
+    const res = await fetch(`${before.ANTHROPIC_BASE_URL}/v1/messages`, {
+      method: "POST",
+      headers: { "x-api-key": before.ANTHROPIC_API_KEY },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(recorded.map((r) => r.workspaceId)).toEqual(["ws-r"]);
+  });
+
+  test("a workspace ID with spaces still gets a key that works as a Bearer token", async () => {
+    const env = await proxy.envFor("legacy project ws", "local", []);
+    const res = await fetch(`${env.OPENAI_BASE_URL}/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      body: "{}",
+    });
+    expect(res.status).toBe(200);
+    await res.text();
+    expect(recorded.map((r) => r.workspaceId)).toEqual(["legacy project ws"]);
+  });
+
+  test("a candidate port that cannot be bound for another reason is skipped", async () => {
+    // Windows can exclude a port (EACCES); a saved port can be privileged. Neither may disable
+    // the proxy for good.
+    const blocked = candidatePorts(rootDir, 1)[0];
+    const listen = Reflect.get(http.Server.prototype, "listen") as (...a: unknown[]) => http.Server;
+    const spy = spyOn(http.Server.prototype, "listen").mockImplementation(function (
+      this: http.Server,
+      ...args: unknown[]
+    ) {
+      if (args[0] !== blocked) return listen.apply(this, args);
+      process.nextTick(() =>
+        this.emit("error", Object.assign(new Error("denied"), { code: "EACCES" }))
+      );
+      return this;
+    });
+    try {
+      const env = await proxy.envFor("ws-eacces", "local", []);
+      expect(env.ANTHROPIC_BASE_URL).toBeDefined();
+      expect(new URL(env.ANTHROPIC_BASE_URL).port).not.toBe(String(blocked));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test("a busy port moves to the next candidate, and the saved port comes back when free", async () => {
+    const first = new URL((await proxy.envFor("ws-p", "local", [])).ANTHROPIC_BASE_URL).port;
+    // A second backend on the same root (or any process on that port) takes the next candidate.
+    const second = makeProxy();
+    try {
+      const other = new URL((await second.envFor("ws-p", "local", [])).ANTHROPIC_BASE_URL).port;
+      expect(other).not.toBe(first);
+    } finally {
+      await second.stop();
+    }
+    await proxy.stop();
+    proxy = makeProxy();
+    expect(new URL((await proxy.envFor("ws-p", "local", [])).ANTHROPIC_BASE_URL).port).toBe(first);
+  });
+
+  describe("SSH workspaces", () => {
+    /**
+     * A stand-in SSH host on this machine: a "remote" port is a local TCP relay to the proxy,
+     * like `ssh -R`, and the health probe is an HTTP GET through that port, like the remote
+     * bash probe.
+     */
+    function fakeSshHost(
+      hostKey: string,
+      options: {
+        refuse?: boolean;
+        unreachable?: boolean;
+        coder?: boolean;
+        survivesClose?: boolean;
+        /** openReverseForward waits for this, like a slow SSH connect. */
+        gate?: Promise<void>;
+      } = {}
+    ) {
+      const opened: number[] = [];
+      let closes = 0;
+      const relays = new Set<net.Server>();
+      const sockets = new Set<net.Socket>();
+      const destroyAll = (relay: net.Server) => {
+        relay.close();
+        for (const socket of sockets) socket.destroy(); // close() alone waits for keep-alive
+      };
+      const target: ForwardTarget = {
+        hostKey,
+        restoreAtStartup: options.coder !== true,
+        openReverseForward: async (remotePort, localPort): Promise<ReverseForward> => {
+          opened.push(remotePort);
+          if (options.refuse) throw new ReverseForwardRefusedError("remote port forwarding failed");
+          if (options.unreachable) throw new Error("ssh: connect to host: Connection timed out");
+          await options.gate;
+          const relay = net.createServer((socket) => {
+            sockets.add(socket);
+            socket.once("close", () => sockets.delete(socket));
+            const upstreamSocket = net.connect(localPort, "127.0.0.1");
+            socket.pipe(upstreamSocket).pipe(socket);
+            socket.on("error", () => upstreamSocket.destroy());
+            upstreamSocket.on("error", () => socket.destroy());
+          });
+          await new Promise<void>((resolve, reject) => {
+            relay.once("error", reject);
+            relay.listen(remotePort, "127.0.0.1", () => resolve());
+          });
+          relays.add(relay);
+          let resolveClosed!: () => void;
+          const closed = new Promise<void>((resolve) => (resolveClosed = resolve));
+          relay.once("close", () => resolveClosed());
+          return {
+            closed,
+            close: () => {
+              closes++;
+              if (options.survivesClose) return; // like an ssh process left after a crash
+              relays.delete(relay);
+              destroyAll(relay);
+            },
+          };
+        },
+        remoteHealth: async (remotePort, nonce) => {
+          try {
+            const res = await fetch(
+              `http://127.0.0.1:${remotePort}${BASH_AI_PROXY_HEALTH_PATH}?nonce=${nonce}`
+            );
+            return await res.text();
+          } catch {
+            return undefined;
+          }
+        },
+      };
+      return {
+        target,
+        opened,
+        closes: () => closes,
+        dropAll: () => {
+          for (const relay of relays) destroyAll(relay);
+          relays.clear();
+        },
+      };
+    }
+
+    test("commands reach the proxy through the host's forwarded port and are counted", async () => {
+      const host = fakeSshHost("ssh-host-1");
+      sshTargets.set("ssh-ws", host.target);
+      const env = await proxy.envFor("ssh-ws", "ssh", []);
+      const remotePort = Number(new URL(env.ANTHROPIC_BASE_URL).port);
+      expect(host.opened).toEqual([remotePort]);
+
+      const res = await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": env.ANTHROPIC_API_KEY },
+        body: "{}",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+      expect(recorded.map((r) => r.workspaceId)).toEqual(["ssh-ws"]);
+
+      // Later turns reuse the forward; a second workspace on the host shares it.
+      sshTargets.set("ssh-ws-2", host.target);
+      const env2 = await proxy.envFor("ssh-ws-2", "ssh", []);
+      expect(env2.ANTHROPIC_BASE_URL).toBe(env.ANTHROPIC_BASE_URL);
+      expect(env2.ANTHROPIC_API_KEY).not.toBe(env.ANTHROPIC_API_KEY);
+      expect(host.opened).toHaveLength(1);
+
+      // A dropped forward is opened again on the next turn.
+      host.dropAll();
+      await Bun.sleep(10);
+      await proxy.envFor("ssh-ws", "ssh", []);
+      expect(host.opened).toHaveLength(2);
+    });
+
+    test("a host that refuses forwarding gets no vars and is not retried every turn", async () => {
+      const host = fakeSshHost("ssh-host-2", { refuse: true });
+      sshTargets.set("ssh-ws", host.target);
+      expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
+      const attempts = host.opened.length;
+      expect(attempts).toBeGreaterThan(0);
+      expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
+      expect(host.opened).toHaveLength(attempts);
+    });
+
+    test("a stranger replaying an old health answer on the port is not adopted", async () => {
+      const host = fakeSshHost("ssh-host-5");
+      sshTargets.set("ssh-ws", host.target);
+      const before = await proxy.envFor("ssh-ws", "ssh", []);
+      const remotePort = Number(new URL(before.ANTHROPIC_BASE_URL).port);
+      const nonce = "0".repeat(32);
+      const recordedAnswer = await (
+        await fetch(`http://127.0.0.1:${remotePort}${BASH_AI_PROXY_HEALTH_PATH}?nonce=${nonce}`)
+      ).text();
+      await proxy.stop(); // the forward goes away; the port is free on the "host"
+
+      // Another user binds the saved remote port and answers with the recorded token.
+      const stranger = http.createServer((_req, res) => res.end(recordedAnswer));
+      await new Promise<void>((resolve) => stranger.listen(remotePort, "127.0.0.1", resolve));
+      try {
+        proxy = makeProxy();
+        const after = await proxy.envFor("ssh-ws", "ssh", []);
+        // Not adopted: Xum opened its own forward on another candidate port.
+        expect(after.ANTHROPIC_BASE_URL).not.toBe(before.ANTHROPIC_BASE_URL);
+        expect(host.opened.length).toBeGreaterThan(1);
+      } finally {
+        stranger.close();
+      }
+    });
+
+    test("a connection failure is retried after a short wait, a refusal is not", async () => {
+      const flakyOptions = { unreachable: true };
+      const flaky = fakeSshHost("ssh-host-8", flakyOptions);
+      const refusing = fakeSshHost("ssh-host-9", { refuse: true });
+      sshTargets.set("flaky-ws", flaky.target);
+      sshTargets.set("refusing-ws", refusing.target);
+      expect(await proxy.envFor("flaky-ws", "ssh", [])).toEqual({});
+      expect(await proxy.envFor("refusing-ws", "ssh", [])).toEqual({});
+      const refusedAttempts = refusing.opened.length;
+
+      flakyOptions.unreachable = false; // the VPN is back
+      setSystemTime(new Date(Date.now() + 60_000));
+      try {
+        expect((await proxy.envFor("flaky-ws", "ssh", [])).ANTHROPIC_BASE_URL).toBeDefined();
+        expect(await proxy.envFor("refusing-ws", "ssh", [])).toEqual({});
+        expect(refusing.opened).toHaveLength(refusedAttempts);
+      } finally {
+        setSystemTime();
+      }
+    });
+
+    test("restore goes through another workspace on the host when the saved one is gone", async () => {
+      const host = fakeSshHost("ssh-host-6");
+      sshTargets.set("ws-a", host.target);
+      sshTargets.set("ws-b", host.target);
+      await proxy.envFor("ws-a", "ssh", []);
+      const fromB = await proxy.envFor("ws-b", "ssh", []); // reuses ws-a's forward
+      removed.add("ws-a");
+      await proxy.stop();
+
+      proxy = makeProxy();
+      await proxy.restore();
+      await Bun.sleep(50);
+      expect(host.opened).toHaveLength(2);
+      const res = await fetch(`${fromB.ANTHROPIC_BASE_URL}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": fromB.ANTHROPIC_API_KEY },
+        body: "{}",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+    });
+
+    test("saves for one host from turns at the same time keep every workspace", async () => {
+      const host = fakeSshHost("ssh-host-14");
+      for (const id of ["ws-a", "ws-b", "ws-c"]) sshTargets.set(id, host.target);
+      await proxy.envFor("ws-a", "ssh", []);
+      // Both turns reuse the forward and save the host at once.
+      await Promise.all([proxy.envFor("ws-b", "ssh", []), proxy.envFor("ws-c", "ssh", [])]);
+      const saved = (await readState()).forwards["ssh-host-14"];
+      expect([...saved.workspaceIds].sort()).toEqual(["ws-a", "ws-b", "ws-c"]);
+    });
+
+    test("when another backend may share the Xum home, SSH gets no forward", async () => {
+      // A forward saved while this backend was alone.
+      const host = fakeSshHost("ssh-host-15");
+      sshTargets.set("ssh-ws", host.target);
+      const before = await proxy.envFor("ssh-ws", "ssh", []);
+      await proxy.stop();
+      const savedUsedAt = (await readState()).forwards["ssh-host-15"].usedAt;
+
+      rootShared = true;
+      proxy = makeProxy();
+      await proxy.restore();
+      await Bun.sleep(50);
+      expect(host.opened).toHaveLength(1); // restore opened nothing
+      expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
+      expect(host.opened).toHaveLength(1);
+      // Local and Worktree commands are not affected.
+      const local = await proxy.envFor("local-ws", "local", []);
+      expect(local.ANTHROPIC_BASE_URL).toBeDefined();
+
+      // Traffic with the SSH workspace's key writes no forward state either.
+      setSystemTime(new Date(savedUsedAt + 2 * 60 * 60_000));
+      try {
+        const res = await fetch(`${local.ANTHROPIC_BASE_URL}/v1/messages`, {
+          method: "POST",
+          headers: { "x-api-key": before.ANTHROPIC_API_KEY },
+          body: "{}",
+        });
+        expect(res.status).toBe(200);
+        await res.text();
+        await proxy.stop();
+        expect((await readState()).forwards["ssh-host-15"].usedAt).toBe(savedUsedAt);
+      } finally {
+        setSystemTime();
+      }
+    });
+
+    test("a forward whose save failed is saved on the next turn", async () => {
+      const host = fakeSshHost("ssh-host-7");
+      sshTargets.set("ssh-ws", host.target);
+      await proxy.envFor("local-ws", "local", []); // the listener and its port are saved
+      await fs.promises.chmod(rootDir, 0o500); // the next state write fails
+      try {
+        await proxy.envFor("ssh-ws", "ssh", []);
+      } finally {
+        await fs.promises.chmod(rootDir, 0o700);
+      }
+      await proxy.envFor("ssh-ws", "ssh", []);
+      expect(Object.keys((await readState()).forwards)).toEqual(["ssh-host-7"]);
+    });
+
+    test("traffic through a forward and restoring it keep it restorable", async () => {
+      const host = fakeSshHost("ssh-host-10");
+      sshTargets.set("ssh-ws", host.target);
+      const env = await proxy.envFor("ssh-ws", "ssh", []);
+      const usedAt = async () => (await readState()).forwards["ssh-host-10"].usedAt;
+      const first = await usedAt();
+      try {
+        // A long job keeps calling without a new turn.
+        setSystemTime(new Date(first + 2 * 60 * 60_000));
+        const res = await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
+          method: "POST",
+          headers: { "x-api-key": env.ANTHROPIC_API_KEY },
+          body: "{}",
+        });
+        await res.text();
+        const afterTraffic = await usedAt();
+        expect(afterTraffic).toBeGreaterThan(first);
+
+        await proxy.stop();
+        setSystemTime(new Date(first + 4 * 60 * 60_000));
+        proxy = makeProxy();
+        await proxy.restore();
+        await Bun.sleep(50);
+        expect(await usedAt()).toBeGreaterThan(afterTraffic);
+      } finally {
+        setSystemTime();
+      }
+    });
+
+    /** A host whose forward opens only when `open()` is called. */
+    function slowSshHost(hostKey: string) {
+      let open!: () => void;
+      const gate = new Promise<void>((resolve) => (open = resolve));
+      return { ...fakeSshHost(hostKey, { gate }), open };
+    }
+
+    async function until(condition: () => boolean): Promise<void> {
+      for (let i = 0; i < 200 && !condition(); i++) await Bun.sleep(5);
+      expect(condition()).toBe(true);
+    }
+
+    test("turning the switch off during a forward setup closes the forward it returns", async () => {
+      const host = slowSshHost("ssh-host-12");
+      sshTargets.set("ssh-ws", host.target);
+      const pending = proxy.envFor("ssh-ws", "ssh", []);
+      await until(() => host.opened.length === 1);
+
+      enabled = false;
+      expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
+      host.open(); // the setup finishes after the switch went off
+      expect(await pending).toEqual({});
+      await until(() => host.closes() === 1);
+
+      // Back on: a fresh forward, not the cancelled one.
+      enabled = true;
+      expect((await proxy.envFor("ssh-ws", "ssh", [])).ANTHROPIC_BASE_URL).toBeDefined();
+      expect(host.opened).toHaveLength(2);
+    });
+
+    test("stop waits for a forward setup in flight and closes its forward", async () => {
+      const host = slowSshHost("ssh-host-13");
+      sshTargets.set("ssh-ws", host.target);
+      const pending = proxy.envFor("ssh-ws", "ssh", []);
+      await until(() => host.opened.length === 1);
+
+      setTimeout(() => host.open(), 50);
+      await proxy.stop();
+      expect(host.closes()).toBe(1); // nothing (an ssh child) outlives the service
+      expect(await pending).toEqual({});
+    });
+
+    test("a workspace that would get no variables opens no forward", async () => {
+      const host = fakeSshHost("ssh-host-11");
+      sshTargets.set("ssh-ws", host.target);
+      const saved = configs;
+      // Both providers off (an empty config would read keys from the test env).
+      configs = { anthropic: { enabled: false }, openai: { enabled: false } };
+      expect(await proxy.envFor("ssh-ws", "ssh", [])).toEqual({});
+      configs = saved;
+      // Project secrets configure both providers.
+      expect(await proxy.envFor("ssh-ws", "ssh", ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"])).toEqual(
+        {}
+      );
+      expect(host.opened).toEqual([]);
+    });
+
+    test("Docker and devcontainer workspaces get no vars", async () => {
+      expect(await proxy.envFor("docker-ws", "docker", [])).toEqual({});
+      expect(await proxy.envFor("dc-ws", "devcontainer", [])).toEqual({});
+    });
+
+    test("startup restores used SSH forwards, but never connects to Coder hosts", async () => {
+      const plain = fakeSshHost("ssh-host-3");
+      const coder = fakeSshHost("coder-host", { coder: true });
+      sshTargets.set("plain-ws", plain.target);
+      sshTargets.set("coder-ws", coder.target);
+      const before = await proxy.envFor("plain-ws", "ssh", []);
+      await proxy.envFor("coder-ws", "ssh", []);
+      await proxy.stop(); // closes both forwards, like a Xum quit
+
+      proxy = makeProxy();
+      await proxy.restore();
+      await Bun.sleep(50); // forwards restore in the background
+      expect(plain.opened).toHaveLength(2);
+      expect(coder.opened).toHaveLength(1);
+
+      // A remote process started before the restart still reaches the proxy, same URL and key.
+      const res = await fetch(`${before.ANTHROPIC_BASE_URL}/v1/messages`, {
+        method: "POST",
+        headers: { "x-api-key": before.ANTHROPIC_API_KEY },
+        body: "{}",
+      });
+      expect(res.status).toBe(200);
+      await res.text();
+    });
+
+    test("a forward that outlived a restart is adopted, not replaced", async () => {
+      const host = fakeSshHost("ssh-host-4", { survivesClose: true });
+      sshTargets.set("ssh-ws", host.target);
+      const before = await proxy.envFor("ssh-ws", "ssh", []);
+      // A crash: the ssh -R process survives, the backend does not.
+      await proxy.stop();
+
+      proxy = makeProxy();
+      const after = await proxy.envFor("ssh-ws", "ssh", []);
+      expect(after.ANTHROPIC_BASE_URL).toBe(before.ANTHROPIC_BASE_URL);
+      expect(host.opened).toHaveLength(1); // the surviving forward still reaches the new proxy
+      host.dropAll();
+    });
+  });
+
+  test("a provider redirect is refused, not followed", async () => {
+    const env = await proxy.envFor("ws-4", "local", []);
+    const res = await fetch(`${env.OPENAI_BASE_URL}/responses`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${env.OPENAI_API_KEY}` },
+      body: "{}",
+    });
+    expect(res.status).toBe(502);
+    expect(upstream.seen.map((r) => r.url)).toEqual(["/v1/responses"]);
+  });
+
+  test("no live delta when the ledger write did not happen", async () => {
+    const env = await proxy.envFor("removed-ws", "local", []);
+    const res = await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
+      method: "POST",
+      headers: { "x-api-key": env.ANTHROPIC_API_KEY },
+      body: "{}",
+    });
+    await res.text();
+    expect(recorded).toHaveLength(1);
+    expect(liveDeltas).toEqual([]);
+  });
+
+  test("turning the switch off refuses keys that commands already hold", async () => {
+    const env = await proxy.envFor("ws-off", "local", []);
+    enabled = false;
+    const res = await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
+      method: "POST",
+      headers: { "x-api-key": env.ANTHROPIC_API_KEY },
+      body: "{}",
+    });
+    expect(res.status).toBe(503);
+    expect(upstream.seen).toEqual([]);
+  });
+
+  test("revoking project trust refuses keys that commands already hold", async () => {
+    const env = await proxy.envFor("ws-trust", "local", []);
+    untrusted.add("ws-trust");
+    const res = await fetch(`${env.ANTHROPIC_BASE_URL}/v1/messages`, {
+      method: "POST",
+      headers: { "x-api-key": env.ANTHROPIC_API_KEY },
+      body: "{}",
+    });
+    expect(res.status).toBe(403);
+    expect(upstream.seen).toEqual([]);
+    expect(recorded).toEqual([]);
+  });
+
+  test("envFor gives a pair only when it is safe and useful", async () => {
+    // A project secret that names any provider var turns off that provider's whole pair.
+    const withSecret = await proxy.envFor("ws-5", "local", ["ANTHROPIC_BASE_URL"]);
+    expect(Object.keys(withSecret).sort()).toEqual(["OPENAI_API_KEY", "OPENAI_BASE_URL"]);
+    // So does an OpenAI organization or project secret: the proxy would replace the header
+    // that the SDK builds from it with the Xum account's.
+    for (const name of ["OPENAI_ORG_ID", "OPENAI_PROJECT_ID"]) {
+      expect(Object.keys(await proxy.envFor("ws-5", "local", [name])).sort()).toEqual([
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+      ]);
+    }
+
+    // Runtimes that cannot reach the backend's loopback get nothing.
+    for (const runtime of ["ssh", "docker", "devcontainer"] as const) {
+      expect(await proxy.envFor("ws-5", runtime, [])).toEqual({});
+    }
+
+    // A disabled provider has nothing to pay with.
+    configs.openai = { ...configs.openai, enabled: false };
+    expect(Object.keys(await proxy.envFor("ws-5", "local", []))).not.toContain("OPENAI_API_KEY");
+
+    // The Settings switch turns the whole feature off.
+    enabled = false;
+    expect(await proxy.envFor("ws-5", "local", [])).toEqual({});
+  });
+
+  describe("skip and mix logs", () => {
+    const HOST_NAMES = [
+      "ANTHROPIC_BASE_URL",
+      "ANTHROPIC_AUTH_TOKEN",
+      "OPENAI_BASE_URL",
+      "OPENAI_API_BASE",
+    ] as const;
+    let savedHostEnv: Partial<Record<(typeof HOST_NAMES)[number], string>>;
+    let infoSpy: ReturnType<typeof spyOn<typeof log, "info">>;
+    let warnSpy: ReturnType<typeof spyOn<typeof log, "warn">>;
+
+    beforeEach(() => {
+      // The mix check reads the real process env, like LocalBaseRuntime.exec. Start clean.
+      savedHostEnv = {};
+      for (const name of HOST_NAMES) {
+        savedHostEnv[name] = process.env[name];
+        delete process.env[name];
+      }
+      infoSpy = spyOn(log, "info");
+      warnSpy = spyOn(log, "warn");
+    });
+
+    afterEach(() => {
+      infoSpy.mockRestore();
+      warnSpy.mockRestore();
+      for (const name of HOST_NAMES) {
+        const value = savedHostEnv[name];
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    });
+
+    /** [provider, reason] of each skip logged so far. */
+    function skips(): Array<[string, string]> {
+      return infoSpy.mock.calls.flatMap(([message]) => {
+        const match = /^\[bash-ai-proxy\] skipped (\w+): (.*?);/.exec(String(message));
+        return match ? [[match[1], match[2]] as [string, string]] : [];
+      });
+    }
+
+    function mixWarnings(): string[] {
+      return warnSpy.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.startsWith("[bash] a secret sets"));
+    }
+
+    test("a skipped provider is logged once per workspace with the reason that applies", async () => {
+      configs.openai = { ...configs.openai, enabled: false };
+      for (let turn = 0; turn < 3; turn++) {
+        await proxy.envFor("ws-skip", "local", ["ANTHROPIC_AUTH_TOKEN"]);
+      }
+      expect(skips()).toEqual([
+        ["anthropic", "a secret sets ANTHROPIC_AUTH_TOKEN"],
+        ["openai", "Xum has no API key for it, or it is disabled"],
+      ]);
+      // A secret wins over a missing key: it is the first thing to fix.
+      await proxy.envFor("ws-skip-2", "local", ["OPENAI_PROJECT_ID"]);
+      expect(skips().slice(2)).toEqual([["openai", "a secret sets OPENAI_PROJECT_ID"]]);
+
+      // A new reason logs again. So does the next skip after the provider got its variables.
+      await proxy.envFor("ws-skip", "local", ["ANTHROPIC_BASE_URL"]);
+      await proxy.envFor("ws-skip", "local", []);
+      await proxy.envFor("ws-skip", "local", ["ANTHROPIC_BASE_URL"]);
+      expect(skips().slice(3)).toEqual([
+        ["anthropic", "a secret sets ANTHROPIC_BASE_URL"],
+        ["anthropic", "a secret sets ANTHROPIC_BASE_URL"],
+      ]);
+
+      // With the switch off nothing is skipped, so nothing is logged.
+      enabled = false;
+      await proxy.envFor("ws-off-skip", "local", ["ANTHROPIC_API_KEY"]);
+      expect(skips()).toHaveLength(5);
+    });
+
+    test("a runtime that cannot reach the proxy logs its reason once per provider", async () => {
+      for (let turn = 0; turn < 2; turn++) {
+        await proxy.envFor("ws-docker", "docker", []);
+        await proxy.envFor("ws-dc", "devcontainer", []);
+      }
+      // SSH while another backend may share the Xum home, for the provider that is not skipped.
+      rootShared = true;
+      await proxy.envFor("ws-ssh", "ssh", ["OPENAI_API_KEY"]);
+      expect(skips()).toEqual([
+        ["anthropic", "docker commands have no route to Xum"],
+        ["openai", "docker commands have no route to Xum"],
+        ["anthropic", "devcontainer commands have no route to Xum"],
+        ["openai", "devcontainer commands have no route to Xum"],
+        ["openai", "a secret sets OPENAI_API_KEY"],
+        [
+          "anthropic",
+          "no SSH reverse forward to this host (a shared Xum home, or the forward failed)",
+        ],
+      ]);
+    });
+
+    test("a blocked workspace logs its reason once per provider, and only with the switch on", () => {
+      for (let turn = 0; turn < 2; turn++) proxy.noteBlocked("ws-untrusted", "untrusted");
+      proxy.noteBlocked("ws-kill", "kill_switch");
+      expect(skips()).toEqual([
+        ["anthropic", "the project is not trusted"],
+        ["openai", "the project is not trusted"],
+        ["anthropic", "XUM_DISABLE_PROJECT_AUTOMATION=1 is set"],
+        ["openai", "XUM_DISABLE_PROJECT_AUTOMATION=1 is set"],
+      ]);
+      enabled = false;
+      proxy.noteBlocked("ws-untrusted-off", "untrusted");
+      expect(skips()).toHaveLength(4);
+    });
+
+    test("a secret provider key next to a host base URL or token warns once, without values", async () => {
+      // No host route vars: the secret key is the only credential, no warning.
+      await proxy.envFor("ws-mix", "local", ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+      expect(mixWarnings()).toEqual([]);
+
+      process.env.ANTHROPIC_BASE_URL = "https://gateway.example/api/v2/aibridge/anthropic";
+      process.env.ANTHROPIC_AUTH_TOKEN = "host-gateway-token";
+      process.env.OPENAI_API_BASE = "https://gateway.example/openai/v1";
+      // The switch does not matter: bash gets the mix either way.
+      enabled = false;
+      for (let turn = 0; turn < 3; turn++) {
+        await proxy.envFor("ws-mix", "worktree", ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"]);
+      }
+      expect(mixWarnings()).toHaveLength(2);
+      const [anthropic, openai] = mixWarnings();
+      expect(anthropic).toContain("ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN");
+      expect(openai).toContain("OPENAI_API_BASE");
+      expect(openai).not.toContain("OPENAI_BASE_URL");
+      for (const message of mixWarnings()) {
+        expect(message).not.toContain("gateway.example");
+        expect(message).not.toContain("host-gateway-token");
+      }
+    });
+
+    test("no mix warning when the secrets also set the host vars, set no key, or bash runs elsewhere", async () => {
+      process.env.ANTHROPIC_BASE_URL = "https://gateway.example/anthropic";
+      process.env.ANTHROPIC_AUTH_TOKEN = "host-gateway-token";
+      process.env.OPENAI_BASE_URL = "https://gateway.example/openai/v1";
+      // The secrets replace every host var that would mix.
+      await proxy.envFor("ws-a", "local", [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+      ]);
+      // A gateway token as a secret next to the host's gateway URL is a valid setup.
+      await proxy.envFor("ws-b", "local", ["ANTHROPIC_AUTH_TOKEN", "OPENAI_ORG_ID"]);
+      // An empty host value routes nothing.
+      process.env.OPENAI_BASE_URL = " ";
+      await proxy.envFor("ws-c", "local", ["OPENAI_API_KEY"]);
+      // Remote and container commands do not inherit the Xum process env.
+      for (const runtime of ["ssh", "docker", "devcontainer"] as const) {
+        await proxy.envFor(`ws-${runtime}`, runtime, ["ANTHROPIC_API_KEY"]);
+      }
+      expect(mixWarnings()).toEqual([]);
+    });
+  });
+});

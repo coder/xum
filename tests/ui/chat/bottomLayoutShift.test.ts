@@ -28,7 +28,7 @@ async function waitForBashScriptSpan(
       );
       const span = matches[matches.length - 1];
       if (!span) throw new Error(`Bash script span "${script}" not found yet`);
-      return span as HTMLSpanElement;
+      return span;
     },
     { timeout: 10_000 }
   );
@@ -36,7 +36,7 @@ async function waitForBashScriptSpan(
 
 function getMessageWindow(container: HTMLElement): HTMLDivElement {
   const element = container.querySelector('[data-testid="message-window"]');
-  if (!element || element.tagName !== "DIV") {
+  if (element?.tagName !== "DIV") {
     throw new Error("Message window not found");
   }
   return element as HTMLDivElement;
@@ -97,9 +97,7 @@ describe("Chat bottom layout stability", () => {
 
       const idleRow = await waitFor(
         () => {
-          const row = app.view.container.querySelector(
-            `[data-workspace-id="${idleWorkspaceId}"]`
-          ) as HTMLElement | null;
+          const row = app.view.container.querySelector(`[data-workspace-id="${idleWorkspaceId}"]`);
           if (!row) {
             throw new Error("Idle workspace row not rendered");
           }
@@ -118,9 +116,7 @@ describe("Chat bottom layout stability", () => {
 
       const sourceRow = await waitFor(
         () => {
-          const row = app.view.container.querySelector(
-            `[data-workspace-id="${app.workspaceId}"]`
-          ) as HTMLElement | null;
+          const row = app.view.container.querySelector(`[data-workspace-id="${app.workspaceId}"]`);
           if (!row) {
             throw new Error("Source workspace row not rendered");
           }
@@ -207,6 +203,37 @@ describe("Chat bottom layout stability", () => {
       // The bottom-lock path pins the transcript immediately via layout/resize
       // signals; there is no timer/RAF path to race a frame at the wrong scrollTop.
       expect(port.getScrollTop()).toBe(port.getMaxScrollTop());
+
+      app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
+      await app.chat.expectStreamComplete();
+    } finally {
+      await app.dispose();
+    }
+  }, 60_000);
+
+  // #6678 review: the workspace-switch effect must not run again on a same-workspace render.
+  test("a same-workspace re-render keeps the reader's scroll-up", async () => {
+    const app = await createAppHarness({ branchPrefix: "scroll-up-stream" });
+
+    try {
+      await app.chat.send("Seed transcript before testing scroll-up during a stream");
+      await app.chat.expectStreamComplete();
+      await app.chat.send("[mock:wait-start] Hold stream-start until the reader scrolls up");
+      await waitFor(
+        () =>
+          expect(workspaceStore.getWorkspaceSidebarState(app.workspaceId).isStarting).toBe(true),
+        { timeout: 10_000 }
+      );
+
+      const messageWindow = getMessageWindow(app.view.container);
+      const port = mockScrollportMetrics(messageWindow, { scrollHeight: 1800, clientHeight: 500 });
+      fireEvent.wheel(messageWindow, { deltaY: -100 });
+      port.setScrollTop(250);
+      fireEvent.scroll(messageWindow);
+      // Releasing the lock re-renders ChatPane with the same workspace: the switch-time jump to
+      // the bottom must not run again and take the position back.
+      await app.view.findByRole("button", { name: /Jump to bottom/ });
+      expect(port.getScrollTop()).toBe(250);
 
       app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
       await app.chat.expectStreamComplete();

@@ -189,8 +189,8 @@ describeIntegration("Workspace deletion integration tests", () => {
   // Reset SSH connection pool state before each test to prevent backoff from one
   // test affecting subsequent tests. This allows tests to run concurrently.
   beforeEach(() => {
-    sshConnectionPool.clearAllHealth();
-    ssh2ConnectionPool.clearAllHealth();
+    sshConnectionPool.clearAllHealthForTests();
+    ssh2ConnectionPool.clearAllHealthForTests();
   });
 
   // Test matrix: Run tests for both local and SSH runtimes
@@ -285,7 +285,7 @@ describeIntegration("Workspace deletion integration tests", () => {
 
           const sleepSeconds = 5;
           const tempGitRepo = await createTempGitRepoWithInitHook(
-            `echo HOOK_STARTED\nsleep ${sleepSeconds}\necho done > \"${markerPath}\"`
+            `echo HOOK_STARTED\nsleep ${sleepSeconds}\necho done > "${markerPath}"`
           );
 
           try {

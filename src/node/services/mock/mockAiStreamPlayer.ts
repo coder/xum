@@ -4,9 +4,16 @@ import { createMuxMessage } from "@/common/types/message";
 import type { HistoryService } from "@/node/services/historyService";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
-import type { SendMessageError } from "@/common/types/errors";
+import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
 import type { AIService } from "@/node/services/aiService";
 import { createErrorEvent } from "@/node/services/utils/sendMessageError";
+import {
+  createTurnCompletionController,
+  type ActiveStreamInfo,
+  type StopStreamOptions,
+  type TurnCompletion,
+  type TurnStreamHandle,
+} from "@/node/services/streamManager";
 import { log } from "@/node/services/log";
 import type {
   MockAssistantEvent,
@@ -14,12 +21,16 @@ import type {
   MockStreamStartEvent,
 } from "./mockAiEventTypes";
 import { MockAiRouter } from "./mockAiRouter";
+import { setTodosForSessionDir } from "@/node/services/tools/todo";
+import type { TodoItem } from "@/common/types/tools";
+import * as path from "node:path";
 import { buildMockStreamEventsFromReply } from "./mockAiStreamAdapter";
 import type {
   CompletedMessagePart,
   StreamStartEvent,
   StreamDeltaEvent,
   StreamEndEvent,
+  StreamAbortEvent,
   UsageDeltaEvent,
 } from "@/common/types/stream";
 import type { ToolCallStartEvent, ToolCallEndEvent } from "@/common/types/stream";
@@ -32,6 +43,25 @@ const MOCK_TOKENIZER_MODEL = KNOWN_MODELS.GPT.id;
 const TOKENIZE_TIMEOUT_MS = 150;
 let tokenizerFallbackLogged = false;
 let tokenizerUnavailableLogged = false;
+/**
+ * A tokenizer call that missed TOKENIZE_TIMEOUT_MS and is still running (cold tokenizer load or
+ * a busy worker). Until it settles, deltas use the approximate count at once: waiting the full
+ * timeout per delta held the event queue for 150 ms per 25 ms delta, and the throttled partial
+ * write queued behind that backlog (partial.json appeared ~1.9 s into a stream, #7065).
+ */
+let slowTokenizeInFlight: Promise<unknown> | null = null;
+
+function trackSlowTokenize(pending: Promise<unknown>): void {
+  const inFlight = pending.finally(() => {
+    if (slowTokenizeInFlight === inFlight) slowTokenizeInFlight = null;
+  });
+  slowTokenizeInFlight = inFlight;
+}
+
+async function countMockTokens(text: string, context: string): Promise<number> {
+  if (slowTokenizeInFlight !== null) return approximateTokenCount(text);
+  return tokenizeWithMockModel(text, context);
+}
 
 function approximateTokenCount(text: string): number {
   const normalizedLength = text.trim().length;
@@ -55,6 +85,7 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
   const fallbackPromise = new Promise<number>((resolve) => {
     timeoutId = setTimeout(() => {
       fallbackUsed = true;
+      trackSlowTokenize(actualPromise);
       resolve(approximateTokens);
     }, TOKENIZE_TIMEOUT_MS);
   });
@@ -110,15 +141,40 @@ async function tokenizeWithMockModel(text: string, context: string): Promise<num
 
 const MOCK_PARTIAL_WRITE_THROTTLE_MS = 100;
 
+/** The list a successful canned todo_write wrote, from its tool-start input; null for any other call. */
+function writtenTodoList(
+  parts: MuxMessage["parts"],
+  event: Extract<MockAssistantEvent, { kind: "tool-end" }>
+): TodoItem[] | null {
+  if (event.toolName !== "todo_write") return null;
+  if ((event.result as { success?: unknown } | undefined)?.success !== true) return null;
+  const part = parts.find(
+    (candidate) => candidate.type === "dynamic-tool" && candidate.toolCallId === event.toolCallId
+  );
+  const input = part?.type === "dynamic-tool" ? part.input : undefined;
+  const todos = (input as { todos?: TodoItem[] } | undefined)?.todos;
+  assert(Array.isArray(todos), "mock todo_write call needs args.todos");
+  return todos;
+}
+
 interface MockPlayerDeps {
   aiService: AIService;
   historyService: HistoryService;
+  /** Where the canned todo_write side effect writes (see applyToolSideEffects); unit tests omit it. */
+  sessionsDir?: string;
 }
 
 interface StreamStartGate {
   promise: Promise<void>;
   resolve: () => void;
 }
+
+/** Live payloads a mid-stream replay re-emits (see replayStream). */
+type ReplayableMockEvent =
+  | StreamDeltaEvent
+  | ReasoningDeltaEvent
+  | ToolCallStartEvent
+  | ToolCallEndEvent;
 
 interface ActiveStream {
   timers: Array<ReturnType<typeof setTimeout>>;
@@ -134,7 +190,26 @@ interface ActiveStream {
   partialWriteTimer: ReturnType<typeof setTimeout> | null;
   eventQueue: Array<() => Promise<void>>;
   isProcessing: boolean;
+  processing?: ReturnType<typeof Promise.withResolvers<void>>;
+  cancelPromise?: Promise<void>;
+  terminalCompletion?: TurnCompletion;
   cancelled: boolean;
+  settleCompletion: (completion: TurnCompletion) => void;
+  // Reconnect replay state (#4542). `parts` above merges deltas for partial.json and history;
+  // StreamManager instead keeps one part per delta, and reconnect cursors depend on that.
+  /** Live stream-start payload; unset until emitted, so replay never precedes the live start. */
+  streamStart?: StreamStartEvent;
+  /** Set when stream-end/stream-error handling begins (StreamManager's FINALIZING). */
+  finalizing: boolean;
+  /** Every emitted delta/tool event in emission order, re-emitted by replayStream. */
+  emittedEvents: ReplayableMockEvent[];
+  lastUsageDelta?: UsageDeltaEvent;
+  /** StreamManager-shaped parts (one per delta) and tool completions for getStreamInfo. */
+  streamInfoParts: CompletedMessagePart[];
+  toolCompletionTimestamps: Map<string, number>;
+  lastEventTimestamp: number;
+  /** Set when a tool-start holds the stream; released by the test or by cancellation. */
+  toolCallRelease?: ReturnType<typeof Promise.withResolvers<void>>;
 }
 
 export class MockAiStreamPlayer {
@@ -181,6 +256,16 @@ export class MockAiStreamPlayer {
     gate.resolve();
   }
 
+  /**
+   * Release a stream held before its tool calls (reply.holdToolCalls). Throws when the workspace
+   * has no such stream: a test that releases nothing has the wrong idea of the stream state.
+   */
+  releaseToolCalls(workspaceId: string): void {
+    const release = this.activeStreams.get(workspaceId)?.toolCallRelease;
+    if (!release) throw new Error(`No mock stream in ${workspaceId} holds its tool calls`);
+    release.resolve();
+  }
+
   private getStreamStartGate(workspaceId: string): StreamStartGate {
     const existing = this.streamStartGates.get(workspaceId);
     if (existing) {
@@ -194,6 +279,32 @@ export class MockAiStreamPlayer {
     const gate = { promise, resolve };
     this.streamStartGates.set(workspaceId, gate);
     return gate;
+  }
+
+  /**
+   * Canned tool calls never run, but a successful todo_write must leave the list in the session's
+   * files as the real tool does: AgentSession's turn-end TODO nudge reads it there
+   * (needsTodoTurnEndNudge).
+   * Runs in the call's tool-end handler, before its tool-call-end event: a stream stopped before
+   * that point writes nothing, as with a real tool. The queue awaits each handler in order, so
+   * stream-end always sees the new list.
+   */
+  private async applyTodoWriteSideEffect(
+    workspaceId: string,
+    active: ActiveStream,
+    event: Extract<MockAssistantEvent, { kind: "tool-end" }>
+  ): Promise<void> {
+    const sessionsDir = this.deps.sessionsDir;
+    if (sessionsDir === undefined) return;
+    const todos = writtenTodoList(active.parts, event);
+    if (todos === null) return;
+    await setTodosForSessionDir(
+      workspaceId,
+      path.join(sessionsDir, workspaceId),
+      todos,
+      this.deps.historyService.locks,
+      this.deps.historyService.files
+    );
   }
 
   private async waitForStreamStartGate(
@@ -229,33 +340,52 @@ export class MockAiStreamPlayer {
       }
     });
   }
-  private async stopActiveStream(workspaceId: string): Promise<void> {
+  private stopActiveStream(workspaceId: string, options?: StopStreamOptions): Promise<void> {
     const active = this.activeStreams.get(workspaceId);
-    if (!active) return;
-
-    active.cancelled = true;
-
-    // Emit stream-abort event to mirror real streaming behavior before we await disk cleanup.
-    this.deps.aiService.emit("stream-abort", {
+    if (!active) return Promise.resolve();
+    if (active.cancelPromise) return active.cancelPromise;
+    const canceled = Promise.withResolvers<void>();
+    active.cancelPromise = canceled.promise;
+    this.cancelTimers(active);
+    const abortReason = options?.abortReason ?? "system";
+    const streamAbort: StreamAbortEvent = {
       type: "stream-abort",
       workspaceId,
       messageId: active.messageId,
-      abortReason: "user",
-    });
-
-    this.cleanup(workspaceId);
-
-    // User-initiated mock interrupts should not leave behind resumable partial state.
-    const deletePartialResult = await this.deps.historyService.deletePartial(workspaceId);
-    if (!deletePartialResult.success) {
-      log.error(
-        `Failed to clear mock partial on stop for ${active.messageId}: ${deletePartialResult.error}`
-      );
-    }
+      abortReason,
+      abandonPartial: options?.abandonPartial,
+    };
+    (async () => {
+      // Join the exact running event/write before touching partial.json. A replacement
+      // joins this same cancellation, including persistence and raw delivery.
+      await active.processing?.promise;
+      if (active.terminalCompletion) return;
+      try {
+        const result = options?.abandonPartial
+          ? await this.deps.historyService.deletePartialIfMessageIdMatches(
+              workspaceId,
+              active.messageId
+            )
+          : await this.deps.historyService.commitPartial(workspaceId, active.messageId);
+        if (!result.success)
+          log.error("Failed to finalize mock partial", { workspaceId, error: result.error });
+      } catch (error) {
+        log.error("Failed to finalize mock partial", { workspaceId, error });
+      }
+      try {
+        this.deps.aiService.emit("stream-abort", streamAbort);
+      } finally {
+        if (this.activeStreams.get(workspaceId) === active) this.activeStreams.delete(workspaceId);
+        active.settleCompletion({ status: "aborted", abortReason, streamAbort });
+      }
+    })()
+      .catch((error: unknown) => log.error("Mock abort delivery failed", { error }))
+      .finally(canceled.resolve);
+    return canceled.promise;
   }
 
-  async stop(workspaceId: string): Promise<void> {
-    await this.stopActiveStream(workspaceId);
+  stop(workspaceId: string, options?: StopStreamOptions): Promise<void> {
+    return this.stopActiveStream(workspaceId, options);
   }
 
   private async deleteAssistantPlaceholder(workspaceId: string, messageId: string): Promise<void> {
@@ -281,13 +411,26 @@ export class MockAiStreamPlayer {
       muxMetadata?: MuxMessageMetadata;
       abortSignal?: AbortSignal;
     }
-  ): Promise<Result<void, SendMessageError>> {
+  ): Promise<Result<TurnStreamHandle | undefined, SendMessageError>> {
     const abortSignal = options?.abortSignal;
     if (abortSignal?.aborted) {
       return Ok(undefined);
     }
 
-    const latest = messages[messages.length - 1];
+    // A request that ends with a partial assistant continues an interrupted or errored turn:
+    // stream-error now keeps that partial, as StreamManager does (#5700). Real requests get a
+    // [CONTINUE] row at transform time (addInterruptedSentinel), which this mock never sees, so
+    // answer the user message that started the turn, as a provider would. commitPartial keeps
+    // `partial: true` on errored partials, so repeated retries leave several in a row.
+    let latestIndex = messages.length - 1;
+    while (
+      latestIndex >= 0 &&
+      messages[latestIndex].role === "assistant" &&
+      messages[latestIndex].metadata?.partial === true
+    ) {
+      latestIndex -= 1;
+    }
+    const latest = latestIndex >= 0 ? messages[latestIndex] : undefined;
     if (!latest || latest.role !== "user") {
       return Err({ type: "unknown", raw: "Mock AI expected a user message" });
     }
@@ -402,18 +545,116 @@ export class MockAiStreamPlayer {
       return Ok(undefined);
     }
 
-    this.scheduleEvents(workspaceId, events, messageId, historySequence, options?.muxMetadata);
+    const handle = this.scheduleEvents(
+      workspaceId,
+      events,
+      messageId,
+      historySequence,
+      options?.muxMetadata
+    );
 
     await streamStartPromise;
-    if (abortSignal?.aborted) {
-      return Ok(undefined);
-    }
-
-    return Ok(undefined);
+    return Ok(handle);
   }
 
-  async replayStream(_workspaceId: string): Promise<void> {
-    // No-op for mock streams; events are deterministic and do not support mid-stream replay.
+  /** Mirrors StreamManager.getStreamInfo for mock streams, which it does not track. */
+  getStreamInfo(workspaceId: string, includeFinalizing = false): ActiveStreamInfo | undefined {
+    const active = this.activeStreams.get(workspaceId);
+    if (!active || (!includeFinalizing && !this.isReplayable(active))) return undefined;
+    return {
+      messageId: active.messageId,
+      model: active.model,
+      historySequence: active.historySequence,
+      startTime: active.startTime,
+      parts: active.streamInfoParts,
+      currentStepStartIndex: 0,
+      stepStartIndices: [0],
+      initialMetadata: {},
+      toolCompletionTimestamps: active.toolCompletionTimestamps,
+      muxMetadata: active.muxMetadata,
+    };
+  }
+
+  /**
+   * Re-emit the active stream's start and its events after `afterTimestamp` (all of them when
+   * unset) with `replay: true`, like StreamManager.replayStream. Emission is synchronous: the
+   * events emitted so far are exactly what gets replayed, so no live event can be duplicated or
+   * interleaved, and AgentSession routes the replay to the reconnecting subscriber through this
+   * call's async context.
+   */
+  replayStream(workspaceId: string, opts?: { afterTimestamp?: number }): Promise<void> {
+    const active = this.activeStreams.get(workspaceId);
+    if (!active?.streamStart || !this.isReplayable(active)) return Promise.resolve();
+
+    const afterTimestamp = opts?.afterTimestamp;
+    this.deps.aiService.emit("stream-start", { ...active.streamStart, replay: true });
+    for (const event of active.emittedEvents) {
+      if (afterTimestamp != null && event.timestamp <= afterTimestamp) continue;
+      this.deps.aiService.emit(event.type, { ...event, replay: true });
+    }
+    // Like StreamManager: only full replays restore usage; incremental ones would duplicate it.
+    if (afterTimestamp == null && active.lastUsageDelta) {
+      this.deps.aiService.emit("usage-delta", { ...active.lastUsageDelta, replay: true });
+    }
+    return Promise.resolve();
+  }
+
+  private isReplayable(active: ActiveStream): boolean {
+    return active.streamStart !== undefined && !active.cancelled && !active.finalizing;
+  }
+
+  // StreamManager.nextPartTimestamp: reconnect cursors compare timestamps, so two events in the
+  // same millisecond must not share one.
+  private nextEventTimestamp(active: ActiveStream): number {
+    const now = Date.now();
+    active.lastEventTimestamp =
+      now <= active.lastEventTimestamp ? active.lastEventTimestamp + 1 : now;
+    return active.lastEventTimestamp;
+  }
+
+  private recordReplayableEvent(active: ActiveStream, event: ReplayableMockEvent): void {
+    active.emittedEvents.push(event);
+    switch (event.type) {
+      case "stream-delta":
+        active.streamInfoParts.push({
+          type: "text",
+          text: event.delta,
+          timestamp: event.timestamp,
+        });
+        break;
+      case "reasoning-delta":
+        active.streamInfoParts.push({
+          type: "reasoning",
+          text: event.delta,
+          timestamp: event.timestamp,
+        });
+        break;
+      case "tool-call-start":
+        active.streamInfoParts.push({
+          type: "dynamic-tool",
+          state: "input-available",
+          toolCallId: event.toolCallId,
+          toolName: event.toolName,
+          input: event.args,
+          timestamp: event.timestamp,
+        });
+        break;
+      case "tool-call-end": {
+        const index = active.streamInfoParts.findIndex(
+          (part) => part.type === "dynamic-tool" && part.toolCallId === event.toolCallId
+        );
+        const part = active.streamInfoParts[index];
+        if (part?.type === "dynamic-tool") {
+          active.streamInfoParts[index] = {
+            ...part,
+            state: "output-available",
+            output: event.result,
+          };
+        }
+        active.toolCompletionTimestamps.set(event.toolCallId, event.timestamp);
+        break;
+      }
+    }
   }
 
   private scheduleEvents(
@@ -422,11 +663,22 @@ export class MockAiStreamPlayer {
     messageId: string,
     historySequence: number,
     muxMetadata?: MuxMessageMetadata
-  ): void {
+  ): TurnStreamHandle {
+    let previousDelay = 0;
+    for (const event of events) {
+      // Node clamps out-of-range delays to an early timer; that would invalidate the due-prefix check.
+      assert(
+        event.delay >= previousDelay && event.delay === (event.delay | 0),
+        "Mock stream delays must be ordered non-negative signed 32-bit timer values"
+      );
+      previousDelay = event.delay;
+    }
+
     const timers: Array<ReturnType<typeof setTimeout>> = [];
     const streamStart = events.find(
       (event): event is MockStreamStartEvent => event.kind === "stream-start"
     );
+    const completionController = createTurnCompletionController();
     this.activeStreams.set(workspaceId, {
       timers,
       messageId,
@@ -442,16 +694,34 @@ export class MockAiStreamPlayer {
       eventQueue: [],
       isProcessing: false,
       cancelled: false,
+      settleCompletion: completionController.settle,
+      finalizing: false,
+      emittedEvents: [],
+      streamInfoParts: [],
+      toolCompletionTimestamps: new Map(),
+      lastEventTimestamp: 0,
+      ...(events.some((event) => event.kind === "tool-start" && event.holdUntilReleased) && {
+        toolCallRelease: Promise.withResolvers<void>(),
+      }),
     });
 
-    for (const event of events) {
+    let nextEventIndex = 0;
+    for (const [index, event] of events.entries()) {
       const timer = setTimeout(() => {
-        this.enqueueEvent(workspaceId, messageId, () =>
-          this.dispatchEvent(workspaceId, event, messageId, historySequence)
-        );
+        // Overdue timers can fire out of order under load. A later deadline makes every
+        // predecessor due too, so enqueue that prefix once rather than trust callback order.
+        while (nextEventIndex <= index) {
+          const nextEvent = events[nextEventIndex];
+          assert(nextEvent, "Scheduled mock event must exist");
+          nextEventIndex++;
+          this.enqueueEvent(workspaceId, messageId, () =>
+            this.dispatchEvent(workspaceId, nextEvent, messageId, historySequence)
+          );
+        }
       }, event.delay);
       timers.push(timer);
     }
+    return { messageId, completion: completionController.promise };
   }
 
   private enqueueEvent(workspaceId: string, messageId: string, handler: () => Promise<void>): void {
@@ -467,6 +737,8 @@ export class MockAiStreamPlayer {
     if (!active || active.isProcessing) return;
 
     active.isProcessing = true;
+    const processing = Promise.withResolvers<void>();
+    active.processing = processing;
 
     while (active.eventQueue.length > 0) {
       const handler = active.eventQueue.shift();
@@ -480,6 +752,8 @@ export class MockAiStreamPlayer {
     }
 
     active.isProcessing = false;
+    active.processing = undefined;
+    processing.resolve();
   }
 
   private appendTextPart(active: ActiveStream, text: string, timestamp: number): void {
@@ -589,9 +863,11 @@ export class MockAiStreamPlayer {
   // parts here keeps mock-mode reconnects aligned with the real stream manager.
   private async writePartialFromActiveStream(
     workspaceId: string,
-    active: ActiveStream
+    active: ActiveStream,
+    // Set only by stream-error, which keeps the partial even when nothing streamed yet.
+    streamError?: { error: string; errorType: StreamErrorType }
   ): Promise<void> {
-    if (active.parts.length === 0 || active.cancelled) {
+    if ((active.parts.length === 0 && !streamError) || active.cancelled) {
       return;
     }
 
@@ -606,6 +882,7 @@ export class MockAiStreamPlayer {
         ...(active.agentId && { agentId: active.agentId }),
         ...(active.thinkingLevel && { thinkingLevel: active.thinkingLevel }),
         ...(active.muxMetadata && { muxMetadata: active.muxMetadata }),
+        ...(streamError && { error: streamError.error, errorType: streamError.errorType }),
         partial: true,
       },
       parts: structuredClone(active.parts),
@@ -621,7 +898,7 @@ export class MockAiStreamPlayer {
     workspaceId: string,
     active: ActiveStream
   ): Promise<void> {
-    if (this.isCurrentActiveStream(workspaceId, active)) {
+    if (this.isCurrentActiveStream(workspaceId, active) || active.cancelPromise) {
       return;
     }
 
@@ -663,6 +940,31 @@ export class MockAiStreamPlayer {
     return nextParts;
   }
 
+  /** A canned tool call's completion: its side effect first, then the tool-call-end event. */
+  private async dispatchToolEnd(
+    workspaceId: string,
+    active: ActiveStream,
+    event: Extract<MockAssistantEvent, { kind: "tool-end" }>,
+    messageId: string
+  ): Promise<void> {
+    await this.applyTodoWriteSideEffect(workspaceId, active, event);
+    // A Stop during the write cancels the stream: emit no completion into the aborted turn.
+    if (active.cancelled) return;
+    const payload: ToolCallEndEvent = {
+      type: "tool-call-end",
+      workspaceId,
+      messageId,
+      toolCallId: event.toolCallId,
+      toolName: event.toolName,
+      result: event.result,
+      timestamp: this.nextEventTimestamp(active),
+    };
+    this.setToolPartOutput(active, event, payload.timestamp);
+    this.schedulePartialWrite(workspaceId, active);
+    this.deps.aiService.emit("tool-call-end", payload);
+    this.recordReplayableEvent(active, payload);
+  }
+
   private async dispatchEvent(
     workspaceId: string,
     event: MockAssistantEvent,
@@ -686,15 +988,19 @@ export class MockAiStreamPlayer {
           ...(event.mode && { mode: event.mode }),
           ...(event.agentId && { agentId: event.agentId }),
           ...(event.thinkingLevel && { thinkingLevel: event.thinkingLevel }),
+          // Same turn metadata the real StreamManager sends at start, so the renderer can
+          // classify the turn (e.g. hide a token-budget flush) before the first delta.
+          ...(active.muxMetadata && { muxMetadata: active.muxMetadata }),
         };
         active.model = event.model;
         active.startTime = payload.startTime;
+        active.streamStart = payload;
         this.deps.aiService.emit("stream-start", payload);
         break;
       }
       case "reasoning-delta": {
         // Mock streams use the same tokenization logic as real streams for consistency
-        const tokens = await tokenizeWithMockModel(event.text, "reasoning-delta text");
+        const tokens = await countMockTokens(event.text, "reasoning-delta text");
         if (active.cancelled) return;
         const payload: ReasoningDeltaEvent = {
           type: "reasoning-delta",
@@ -702,17 +1008,24 @@ export class MockAiStreamPlayer {
           messageId,
           delta: event.text,
           tokens,
-          timestamp: Date.now(),
+          timestamp: this.nextEventTimestamp(active),
         };
         this.appendReasoningPart(active, event.text, payload.timestamp);
         this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("reasoning-delta", payload);
+        this.recordReplayableEvent(active, payload);
         break;
       }
       case "tool-start": {
+        if (event.holdUntilReleased) {
+          assert(active.toolCallRelease, "a held tool-start has a release");
+          // The event queue waits here, so the stream stays open with no tool call yet.
+          await active.toolCallRelease.promise;
+          if (active.cancelled) return;
+        }
         // Mock streams use the same tokenization logic as real streams for consistency
         const inputText = JSON.stringify(event.args);
-        const tokens = await tokenizeWithMockModel(inputText, "tool-call args");
+        const tokens = await countMockTokens(inputText, "tool-call args");
         if (active.cancelled) return;
         const payload: ToolCallStartEvent = {
           type: "tool-call-start",
@@ -722,11 +1035,12 @@ export class MockAiStreamPlayer {
           toolName: event.toolName,
           args: event.args,
           tokens,
-          timestamp: Date.now(),
+          timestamp: this.nextEventTimestamp(active),
         };
         this.setToolPartInput(active, event, payload.timestamp);
         this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("tool-call-start", payload);
+        this.recordReplayableEvent(active, payload);
         break;
       }
       case "usage-delta": {
@@ -740,28 +1054,18 @@ export class MockAiStreamPlayer {
           cumulativeProviderMetadata: event.cumulativeProviderMetadata,
         };
         this.deps.aiService.emit("usage-delta", payload);
+        active.lastUsageDelta = payload;
         break;
       }
       case "tool-end": {
-        const payload: ToolCallEndEvent = {
-          type: "tool-call-end",
-          workspaceId,
-          messageId,
-          toolCallId: event.toolCallId,
-          toolName: event.toolName,
-          result: event.result,
-          timestamp: Date.now(),
-        };
-        this.setToolPartOutput(active, event, payload.timestamp);
-        this.schedulePartialWrite(workspaceId, active);
-        this.deps.aiService.emit("tool-call-end", payload);
+        await this.dispatchToolEnd(workspaceId, active, event, messageId);
         break;
       }
       case "stream-delta": {
         // Mock streams use the same tokenization logic as real streams for consistency
         let tokens: number;
         try {
-          tokens = await tokenizeWithMockModel(event.text, "stream-delta text");
+          tokens = await countMockTokens(event.text, "stream-delta text");
         } catch (error) {
           log.error("tokenize failed for stream-delta", error);
           throw error;
@@ -772,11 +1076,12 @@ export class MockAiStreamPlayer {
           messageId,
           delta: event.text,
           tokens,
-          timestamp: Date.now(),
+          timestamp: this.nextEventTimestamp(active),
         };
         this.appendTextPart(active, event.text, payload.timestamp);
         this.schedulePartialWrite(workspaceId, active);
         this.deps.aiService.emit("stream-delta", payload);
+        this.recordReplayableEvent(active, payload);
         break;
       }
       case "stream-error": {
@@ -784,30 +1089,47 @@ export class MockAiStreamPlayer {
         if (!this.isCurrentActiveStream(workspaceId, active)) {
           return;
         }
-
-        const deletePartialResult = await this.deps.historyService.deletePartial(workspaceId);
-        if (!deletePartialResult.success) {
-          log.error(`Failed to clear mock partial for ${messageId}: ${deletePartialResult.error}`);
+        active.finalizing = true;
+        // Error-path only (#5700): stream-delta and stream-end handling are unchanged.
+        if (active.partialWriteTimer) {
+          clearTimeout(active.partialWriteTimer);
+          active.partialWriteTimer = null;
         }
 
-        // Replacement streams can cancel this handler while deletePartial() is in flight.
-        // Ignore the stale error once the original active stream has been cancelled or replaced.
+        // Keep the streamed partial with its error details, as StreamManager.persistStreamError
+        // does. Deleting it left an empty assistant row after a reload, so the mock's error flow
+        // differed from a real one (#5700).
+        await this.writePartialFromActiveStream(workspaceId, active, {
+          error: payload.error,
+          errorType: payload.errorType,
+        });
+
+        // Replacement streams can cancel this handler while the write is in flight. Ignore the
+        // stale error once the original active stream has been cancelled or replaced: the stop
+        // that cancelled it joins this handler, then commits or deletes the partial by its id.
         if (!this.isCurrentActiveStream(workspaceId, active)) {
           return;
         }
 
-        this.deps.aiService.emit(
-          "error",
-          createErrorEvent(workspaceId, {
-            messageId,
-            error: payload.error,
-            errorType: payload.errorType,
-          })
-        );
-        this.cleanup(workspaceId);
+        // AgentSession schedules auto-retry from the completion's streamError, so retryAfterMs
+        // must reach it (StreamManager's buildStreamErrorPayload sets it the same way).
+        const streamError = {
+          messageId,
+          error: payload.error,
+          errorType: payload.errorType,
+          ...(payload.retryAfterMs != null ? { retryAfterMs: payload.retryAfterMs } : {}),
+        };
+        active.terminalCompletion = { status: "failed", streamError };
+        try {
+          this.deps.aiService.emit("error", createErrorEvent(workspaceId, streamError));
+        } finally {
+          this.cleanup(workspaceId);
+          active.settleCompletion(active.terminalCompletion);
+        }
         break;
       }
       case "stream-end": {
+        active.finalizing = true;
         if (active.partialWriteTimer) {
           clearTimeout(active.partialWriteTimer);
           active.partialWriteTimer = null;
@@ -867,8 +1189,13 @@ export class MockAiStreamPlayer {
 
         if (!this.isCurrentActiveStream(workspaceId, active)) return;
 
-        this.deps.aiService.emit("stream-end", payload);
-        this.cleanup(workspaceId);
+        active.terminalCompletion = { status: "completed", streamEnd: payload };
+        try {
+          this.deps.aiService.emit("stream-end", payload);
+        } finally {
+          this.cleanup(workspaceId);
+          active.settleCompletion(active.terminalCompletion);
+        }
         break;
       }
     }
@@ -878,7 +1205,14 @@ export class MockAiStreamPlayer {
     const active = this.activeStreams.get(workspaceId);
     if (!active) return;
 
+    this.cancelTimers(active);
+    if (this.activeStreams.get(workspaceId) === active) this.activeStreams.delete(workspaceId);
+  }
+
+  private cancelTimers(active: ActiveStream): void {
     active.cancelled = true;
+    // A held tool-start blocks the event queue, and stopping joins that queue.
+    active.toolCallRelease?.resolve();
 
     if (active.partialWriteTimer) {
       clearTimeout(active.partialWriteTimer);
@@ -892,8 +1226,6 @@ export class MockAiStreamPlayer {
 
     // Clear event queue to prevent any pending events from processing
     active.eventQueue = [];
-
-    this.activeStreams.delete(workspaceId);
   }
 
   private extractText(message: MuxMessage): string {

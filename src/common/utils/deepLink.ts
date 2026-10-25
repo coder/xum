@@ -1,7 +1,7 @@
-import { SUPPORTED_SHUX_PROTOCOL_SCHEMES } from "@/common/compat/legacyMux";
+import { SUPPORTED_XUM_PROTOCOL_SCHEMES } from "@/common/compat/legacyMux";
 import type { DeepLinkPayload } from "@/common/types/deepLink";
 
-const SUPPORTED_PROTOCOLS = new Set(SUPPORTED_SHUX_PROTOCOL_SCHEMES.map((scheme) => `${scheme}:`));
+const SUPPORTED_PROTOCOLS = new Set(SUPPORTED_XUM_PROTOCOL_SCHEMES.map((scheme) => `${scheme}:`));
 
 function getNonEmptySearchParam(url: URL, key: string): string | undefined {
   const value = url.searchParams.get(key);
@@ -10,10 +10,10 @@ function getNonEmptySearchParam(url: URL, key: string): string | undefined {
 }
 
 /**
- * Parse the canonical shux:// scheme or legacy mux:// alias into one typed payload.
- * Currently supported route: shux://chat/new
+ * Parse the canonical xum:// scheme or legacy mux:// alias into one typed payload.
+ * Currently supported route: xum://chat/new
  */
-export function parseShuxDeepLink(raw: string): DeepLinkPayload | null {
+export function parseXumDeepLink(raw: string): DeepLinkPayload | null {
   let url: URL;
 
   try {
@@ -54,7 +54,7 @@ export function parseShuxDeepLink(raw: string): DeepLinkPayload | null {
 export function normalizeProjectPathForComparison(projectPath: string, platform?: string): string {
   let normalized = projectPath.trim();
 
-  // Be forgiving: shux:// and legacy mux:// links may include trailing path separators.
+  // Be forgiving: xum:// and legacy mux:// links may include trailing path separators.
   normalized = normalized.replace(/[\\/]+$/, "");
 
   if (platform === "win32") {

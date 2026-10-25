@@ -1,15 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { parseShuxDeepLink, resolveProjectPathFromProjectQuery } from "./deepLink";
+import { parseXumDeepLink, resolveProjectPathFromProjectQuery } from "./deepLink";
 
-describe("parseShuxDeepLink", () => {
-  test("parses canonical shux://chat/new", () => {
-    const payload = parseShuxDeepLink(
-      "shux://chat/new/?project=shux&projectPath=%2Ftmp%2Frepo&projectId=proj_123&prompt=hello%20world"
+describe("parseXumDeepLink", () => {
+  test("parses canonical xum://chat/new", () => {
+    const payload = parseXumDeepLink(
+      "xum://chat/new/?project=xum&projectPath=%2Ftmp%2Frepo&projectId=proj_123&prompt=hello%20world"
     );
 
     expect(payload).toEqual({
       type: "new_chat",
-      project: "shux",
+      project: "xum",
       projectPath: "/tmp/repo",
       projectId: "proj_123",
       prompt: "hello world",
@@ -17,17 +17,17 @@ describe("parseShuxDeepLink", () => {
   });
 
   test("normalizes the legacy mux:// scheme to the same payload", () => {
-    expect(parseShuxDeepLink("mux://chat/new?prompt=hello")).toEqual(
-      parseShuxDeepLink("shux://chat/new?prompt=hello")
+    expect(parseXumDeepLink("mux://chat/new?prompt=hello")).toEqual(
+      parseXumDeepLink("xum://chat/new?prompt=hello")
     );
   });
 
   test("returns null for invalid scheme", () => {
-    expect(parseShuxDeepLink("http://chat/new?prompt=hi")).toBeNull();
+    expect(parseXumDeepLink("http://chat/new?prompt=hi")).toBeNull();
   });
 
   test("returns null for unknown route", () => {
-    expect(parseShuxDeepLink("shux://chat/old?prompt=hi")).toBeNull();
+    expect(parseXumDeepLink("xum://chat/old?prompt=hi")).toBeNull();
   });
 
   test("resolves deep-link project query by final path segment", () => {

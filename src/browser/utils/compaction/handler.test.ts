@@ -1,7 +1,7 @@
 import { describe, expect, test, mock } from "bun:test";
-import type { APIClient } from "@/browser/contexts/API";
 import { appendStagedAttachmentNotice } from "@/browser/features/ChatInput/stagedAttachments";
 import { cancelCompaction } from "./handler";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const STAGED_ATTACHMENT = {
   kind: "staged" as const,
@@ -18,14 +18,14 @@ describe("cancelCompaction", () => {
 
     const interruptStream = mock(() => {
       calls.push("interrupt");
-      return Promise.resolve({ success: true });
+      return Promise.resolve({ success: true as const, data: undefined });
     });
 
-    const client = {
+    const client = createTestApiClient({
       workspace: {
         interruptStream,
       },
-    } as unknown as APIClient;
+    });
 
     const aggregator = {
       getAllMessages: () => [
@@ -62,18 +62,20 @@ describe("cancelCompaction", () => {
     });
     expect(interruptStream).toHaveBeenCalledWith({
       workspaceId: "ws-1",
-      options: { abandonPartial: true },
+      options: { abandonPartial: true, disableAutoRetry: true, retireBashMonitorAttention: true },
     });
     expect(calls).toEqual(["edit", "interrupt"]);
   });
 
   test("strips generated staged notices from raw compaction commands", async () => {
-    const interruptStream = mock(() => Promise.resolve({ success: true }));
-    const client = {
+    const interruptStream = mock(() =>
+      Promise.resolve({ success: true as const, data: undefined })
+    );
+    const client = createTestApiClient({
       workspace: {
         interruptStream,
       },
-    } as unknown as APIClient;
+    });
 
     const aggregator = {
       getAllMessages: () => [
@@ -121,14 +123,14 @@ describe("cancelCompaction", () => {
 
     const interruptStream = mock(() => {
       calls.push("interrupt");
-      return Promise.resolve({ success: true });
+      return Promise.resolve({ success: true as const, data: undefined });
     });
 
-    const client = {
+    const client = createTestApiClient({
       workspace: {
         interruptStream,
       },
-    } as unknown as APIClient;
+    });
 
     const mockFilePart = {
       type: "file" as const,
@@ -181,12 +183,14 @@ describe("cancelCompaction", () => {
   });
 
   test("restores staged follow-up attachments without exposing the hidden notice", async () => {
-    const interruptStream = mock(() => Promise.resolve({ success: true }));
-    const client = {
+    const interruptStream = mock(() =>
+      Promise.resolve({ success: true as const, data: undefined })
+    );
+    const client = createTestApiClient({
       workspace: {
         interruptStream,
       },
-    } as unknown as APIClient;
+    });
 
     const aggregator = {
       getAllMessages: () => [

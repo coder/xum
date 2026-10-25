@@ -1,3 +1,5 @@
+import assert from "@/common/utils/assert";
+import { clockOf, nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { tool } from "ai";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -17,11 +19,13 @@ import {
 } from "@/common/types/workflow";
 
 import { fromBashTaskId, isWorkflowRunTaskId, toBashTaskId } from "./taskId";
+import { pageTaskReportForResult } from "@/common/utils/tools/pageToolText";
 import { formatBashOutputReport } from "./bashTaskReport";
 import {
   dedupeStrings,
   parseToolResult,
   requireTaskService,
+  requireWorkspaceTurnManager,
   requireWorkspaceId,
 } from "./toolUtils";
 import { getErrorMessage } from "@/common/utils/errors";
@@ -32,9 +36,9 @@ import {
   type WorkspaceTurnTaskStatus,
 } from "@/node/services/taskHandleStore";
 import { buildWorkflowProgressSummary, formatWorkflowProgressNote } from "./workflowProgress";
+import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import {
   ForegroundWaitBackgroundedError,
-  type AgentTaskStatus,
   type AgentTaskStatusLookup,
   type AgentTaskTimestamps,
 } from "@/node/services/taskService";
@@ -77,6 +81,7 @@ function parseTimestampMs(value: string | undefined): number | undefined {
   return Number.isFinite(ms) ? ms : undefined;
 }
 
+// Wall clock on purpose: TaskService stamps createdAt/reportedAt with Date.now() (#7282).
 function getAgentTaskElapsedMs(
   timestamps: AgentTaskTimestamps | null | undefined
 ): number | undefined {
@@ -85,7 +90,7 @@ function getAgentTaskElapsedMs(
     return undefined;
   }
 
-  const endAtMs = parseTimestampMs(timestamps?.reportedAt) ?? Date.now();
+  const endAtMs = parseTimestampMs(timestamps?.reportedAt) ?? nodeClock.nowMs();
   return Math.max(0, endAtMs - createdAtMs);
 }
 
@@ -104,18 +109,50 @@ function buildTaskAwaitSequencingError(taskId: string, suggestedTaskIds: string[
   };
 }
 
-function parseWorkflowRun(value: unknown): WorkflowRunRecord {
-  return WorkflowRunRecordSchema.parse(value);
+/**
+ * Page a completed report (sub-agent, workspace turn or workflow) to TOOL_TEXT_PAGE_MAX_CHARS.
+ * The report stays persisted, so task_await with timeout_secs 0 and offset_chars re-fetches the
+ * next page. Bash reports are not paged: their output is already capped per read, and an offset
+ * would skip output of an incremental read that no later read returns.
+ */
+function pageCompletedReport<T extends { status: string; taskId: string }>(
+  result: T,
+  offsetChars: number | null | undefined
+): T {
+  if (!isPageableReport(result)) return result;
+  const { text, ...paging } = pageTaskReportForResult(
+    result.taskId,
+    result.reportMarkdown,
+    offsetChars
+  );
+  const firstPage = (offsetChars ?? 0) === 0;
+  // A whole report read from the start keeps its result as is (including the re-fetch note).
+  if (firstPage && text === result.reportMarkdown) return result;
+  const page = { ...result, reportMarkdown: text, ...paging };
+  // structuredOutput has no size bound: only a read from offset 0 carries it, so reading a
+  // report page by page does not repeat it. Decided by the requested offset, not by the text:
+  // an empty report reads back the same empty text at any offset.
+  if (!firstPage) Reflect.deleteProperty(page, "structuredOutput");
+  return page;
 }
 
+/** A completed, non-bash result with a string report: the results report paging applies to. */
+function isPageableReport<T extends { status: string; taskId: string }>(
+  result: T
+): result is T & { reportMarkdown: string } {
+  if (result.status !== "completed" || fromBashTaskId(result.taskId) != null) return false;
+  return "reportMarkdown" in result && typeof result.reportMarkdown === "string";
+}
+
+// Wall clock on purpose: WorkflowService stamps createdAt/updatedAt with Date.now() (#7282).
 function getWorkflowRunElapsedMs(run: WorkflowRunRecord): number | undefined {
   const createdAtMs = parseTimestampMs(run.createdAt);
   if (createdAtMs == null) {
     return undefined;
   }
   const updatedAtMs = parseTimestampMs(run.updatedAt);
-  const endAtMs = isTerminalWorkflowRunStatus(run.status) ? updatedAtMs : Date.now();
-  return Math.max(0, (endAtMs ?? Date.now()) - createdAtMs);
+  const endAtMs = isTerminalWorkflowRunStatus(run.status) ? updatedAtMs : nodeClock.nowMs();
+  return Math.max(0, (endAtMs ?? nodeClock.nowMs()) - createdAtMs);
 }
 
 function getWorkflowRunReport(run: WorkflowRunRecord): {
@@ -221,16 +258,20 @@ function buildWorkflowAwaitResult(run: WorkflowRunRecord) {
   }
 }
 
-async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal): Promise<void> {
+async function waitForDelayOrAbort(
+  clock: HostClock,
+  delayMs: number,
+  signal: AbortSignal
+): Promise<void> {
   if (signal.aborted) {
     return;
   }
   await new Promise<void>((resolve) => {
-    const timer = setTimeout(resolve, delayMs);
+    const cancelTimer = clock.setTimer(resolve, delayMs);
     signal.addEventListener(
       "abort",
       () => {
-        clearTimeout(timer);
+        cancelTimer();
         resolve();
       },
       { once: true }
@@ -239,12 +280,14 @@ async function waitForDelayOrAbort(delayMs: number, signal: AbortSignal): Promis
 }
 
 export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
+  const clock = clockOf(config);
   return tool({
     description: TOOL_DEFINITIONS.task_await.description,
     inputSchema: TOOL_DEFINITIONS.task_await.schema,
     execute: async (args, { abortSignal }): Promise<unknown> => {
       const workspaceId = requireWorkspaceId(config, "task_await");
       const taskService = requireTaskService(config, "task_await");
+      const workspaceTurnManager = requireWorkspaceTurnManager(config, "task_await");
 
       const timeoutMs = coerceTimeoutMs(args.timeout_secs);
       // Preserve the documented 600s default when the model sends null
@@ -307,10 +350,10 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         return dedupeStrings(workflowRunIds);
       };
       const listInScopeWorkspaceTurnTaskIds = async (): Promise<string[]> => {
-        if (taskService.listWorkspaceTurnTasks == null) {
+        if (workspaceTurnManager.listWorkspaceTurnTasks == null) {
           return [];
         }
-        const turns = await taskService.listWorkspaceTurnTasks(workspaceId, {
+        const turns = await workspaceTurnManager.listWorkspaceTurnTasks(workspaceId, {
           statuses: ["queued", "starting", "running"],
         });
         const publicTurnIds: string[] = [];
@@ -402,7 +445,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         if (run == null) {
           return null;
         }
-        return parseWorkflowRun(run);
+        return WorkflowRunRecordSchema.parse(run);
       };
 
       const markWorkflowTerminalAttentionConsumed = async (
@@ -411,10 +454,12 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         if (!isTerminalWorkflowRunStatus(run.status)) {
           return;
         }
-        await taskService.markWorkflowRunTerminalAttentionConsumed?.({
+        await taskService.markWorkflowRunTerminalAttentionSettled?.({
           ownerWorkspaceId: workspaceId,
           status: run.status,
           runId: run.id,
+          runUpdatedAt: run.updatedAt,
+          settledAs: "delivered",
         });
       };
 
@@ -428,17 +473,18 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
           return buildWorkflowAwaitResult(run);
         }
 
-        const deadline = Date.now() + (timeoutMs ?? DEFAULT_TASK_AWAIT_TIMEOUT_MS);
+        const deadline = clock.nowMs() + (timeoutMs ?? DEFAULT_TASK_AWAIT_TIMEOUT_MS);
         while (!isTerminalWorkflowRunStatus(run.status)) {
           if (abortSignal?.aborted) {
             return { status: "error" as const, taskId: runId, error: "Interrupted" };
           }
-          if (taskSignal.aborted || Date.now() >= deadline) {
+          if (taskSignal.aborted || clock.nowMs() >= deadline) {
             return buildWorkflowAwaitResult(run);
           }
 
-          const remainingMs = Math.max(1, deadline - Date.now());
+          const remainingMs = Math.max(1, deadline - clock.nowMs());
           await waitForDelayOrAbort(
+            clock,
             Math.min(WORKFLOW_AWAIT_POLL_INTERVAL_MS, remainingMs),
             taskSignal
           );
@@ -503,7 +549,8 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             timeoutSecsForBash,
             taskSignal,
             workspaceId,
-            "task_await"
+            "task_await",
+            config.hasQueuedMessages
           );
 
           if (!outputResult.success) {
@@ -552,9 +599,13 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
               : null;
           const workspaceTurnOwnerId = resolvedExecution?.ownerWorkspaceId ?? workspaceId;
           const getWorkspaceTurnSnapshotForAwait = () =>
-            taskService.getWorkspaceTurnSnapshot(workspaceTurnOwnerId, workspaceTurnTaskId, {
-              consumingWorkspaceId: workspaceId,
-            });
+            workspaceTurnManager.getWorkspaceTurnSnapshot(
+              workspaceTurnOwnerId,
+              workspaceTurnTaskId,
+              {
+                consumingWorkspaceId: workspaceId,
+              }
+            );
           const snapshot =
             resolvedExecution?.record ??
             (resolveAgentExecution == null || !isAgentContinuation
@@ -578,7 +629,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             status: WorkspaceTurnTaskStatus;
             updatedAt: string;
           }): Promise<void> => {
-            await taskService.markWorkspaceTurnTerminalAttentionConsumed?.({
+            await workspaceTurnManager.markWorkspaceTurnTerminalAttentionConsumed?.({
               ownerWorkspaceId: workspaceTurnOwnerId,
               consumingWorkspaceId: workspaceId,
               handleId: workspaceTurnTaskId,
@@ -640,7 +691,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
             };
           }
           try {
-            const report = await taskService.waitForWorkspaceTurn(workspaceTurnTaskId, {
+            const report = await workspaceTurnManager.waitForWorkspaceTurn(workspaceTurnTaskId, {
               timeoutMs: timeoutMs ?? DEFAULT_TASK_AWAIT_TIMEOUT_MS,
               abortSignal: taskSignal,
               requestingWorkspaceId: workspaceId,
@@ -925,6 +976,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
         // bash getProcess/getOutput reads) run outside its internal try/catch and could reject.
         // Convert any stray rejection into an `error` result so the task still counts as settled —
         // otherwise the gate below could never reach `wantCount` or "all settled" and would stall.
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         const promise = awaitOne(taskId, taskControllers.get(taskId)!.signal).catch(
           (error: unknown): Awaited<ReturnType<typeof awaitOne>> => ({
             status: "error",
@@ -977,7 +1029,11 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // those to land so every awaited task has a result before assembling the ordered array.
       await Promise.all(taskPromises);
 
-      const results = uniqueTaskIds.map((taskId) => resultsByTaskId.get(taskId)!);
+      const results = uniqueTaskIds.map((taskId) => {
+        const result = resultsByTaskId.get(taskId);
+        assert(result != null, "every awaited task has a result once all promises settled");
+        return pageCompletedReport(result, args.offset_chars);
+      });
 
       return parseToolResult(TaskAwaitToolResultSchema, { results }, "task_await");
     },

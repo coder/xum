@@ -7,6 +7,10 @@ import { WorkspaceModeAISync } from "@/browser/components/WorkspaceModeAISync/Wo
 import { AgentProvider } from "@/browser/contexts/AgentContext";
 import { BackgroundBashProvider } from "@/browser/contexts/BackgroundBashContext";
 import { WorkspaceShell } from "../WorkspaceShell/WorkspaceShell";
+import { ToolCardsPreloader } from "@/browser/features/Tools/Shared/ToolCardsLoad";
+
+// For MemoryFileEditor's lazy preview: keeps the Markdown stack in this page's chunk (see there).
+export { MarkdownFilePreview } from "@/browser/features/Messages/MarkdownFilePreview";
 
 interface AIViewProps {
   workspaceId: string;
@@ -15,7 +19,6 @@ interface AIViewProps {
   workspaceName: string;
   namedWorkspacePath: string; // User-friendly path for display and terminal
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   runtimeConfig?: RuntimeConfig;
   className?: string;
   /** If set, workspace is incompatible (from newer mux version) and this error should be displayed */
@@ -26,7 +29,7 @@ interface AIViewProps {
 
 /**
  * Incompatible workspace error display.
- * Shown when a workspace was created with a newer version of shux.
+ * Shown when a workspace was created with a newer version of xum.
  */
 const IncompatibleWorkspaceView: React.FC<{ message: string; className?: string }> = ({
   message,
@@ -42,7 +45,7 @@ const IncompatibleWorkspaceView: React.FC<{ message: string; className?: string 
       </h2>
       <p className="mb-4 text-[var(--color-text-secondary)]">{message}</p>
       <p className="text-sm text-[var(--color-text-tertiary)]">
-        You can delete this workspace and create a new one, or upgrade shux to use it.
+        You can delete this workspace and create a new one, or upgrade xum to use it.
       </p>
     </div>
   </div>
@@ -60,6 +63,7 @@ export const AIView: React.FC<AIViewProps> = (props) => {
   return (
     <AgentProvider workspaceId={props.workspaceId} projectPath={props.projectPath}>
       <WorkspaceModeAISync workspaceId={props.workspaceId} />
+      <ToolCardsPreloader />
       <ThinkingProvider workspaceId={props.workspaceId}>
         <BackgroundBashProvider workspaceId={props.workspaceId}>
           <WorkspaceShell {...props} />

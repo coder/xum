@@ -3,11 +3,12 @@
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 CANONICAL_TARBALL="${CANONICAL_TARBALL:-}"
 MUX_COMPAT_DIR="${MUX_COMPAT_DIR:-packages/mux-compat}"
 
 if [[ -z "$CANONICAL_TARBALL" ]] || [[ ! -f "$CANONICAL_TARBALL" ]]; then
-  echo "CANONICAL_TARBALL must point to the packed @coder/shux tarball" >&2
+  echo "CANONICAL_TARBALL must point to the packed @coder/xum tarball" >&2
   exit 1
 fi
 
@@ -24,7 +25,7 @@ node - "$TEMP_MUX_DIR/package.json" "$CANONICAL_TARBALL" <<'NODE'
 const fs = require("node:fs");
 const [packageJsonPath, canonicalTarball] = process.argv.slice(2);
 const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, "utf8"));
-packageJson.dependencies["@coder/shux"] = `file:${canonicalTarball}`;
+packageJson.dependencies["@coder/xum"] = `file:${canonicalTarball}`;
 fs.writeFileSync(packageJsonPath, `${JSON.stringify(packageJson, null, 2)}\n`);
 NODE
 
@@ -40,10 +41,12 @@ process.stdin.on("end", () => {
 ')
 MUX_TARBALL="$TEMP_MUX_DIR/$MUX_TARBALL"
 
+# Install mux the way npm installs it from the registry, with @coder/xum's npm-shrinkwrap.json
+# (smoke-test.sh explains why `npm install <tarball>` cannot).
 INSTALL_DIR="$TEST_DIR/install"
 mkdir -p "$INSTALL_DIR"
-printf '{"name":"mux-compat-smoke","private":true}\n' >"$INSTALL_DIR/package.json"
-(cd "$INSTALL_DIR" && npm install --ignore-scripts --no-audit --no-fund "$MUX_TARBALL")
+bun "$SCRIPT_DIR/generate-npm-shrinkwrap.ts" --tarball-install "$INSTALL_DIR" "$CANONICAL_TARBALL" "$MUX_TARBALL"
+(cd "$INSTALL_DIR" && "$SCRIPT_DIR/retry.sh" 3 30 npm ci --ignore-scripts --no-audit --no-fund)
 
 if [[ ! -x "$INSTALL_DIR/node_modules/.bin/mux" ]]; then
   echo "mux forwarding binary was not installed" >&2

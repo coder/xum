@@ -11,7 +11,7 @@ export const Streaming = () => (
     <div className="bg-background p-6">
       <div className="w-full max-w-3xl rounded-md border border-[var(--color-border-medium)] bg-[var(--color-card)] p-4">
         <StreamingBarrierView
-          statusText="claude-opus-4 streaming..."
+          statusText="claude-opus-4 streaming"
           cancelText="hit Esc to cancel"
           cancelShortcutText="Esc"
           onCancel={noop}

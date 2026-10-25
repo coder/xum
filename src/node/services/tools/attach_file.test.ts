@@ -493,3 +493,28 @@ describe("attach_file tool", () => {
     });
   });
 });
+
+describe("attach_file in the artifacts folder", () => {
+  // Only the artifact tool makes versions: attaching an artifact shows it, nothing more.
+  it("stores no artifact version and names no artifact in ui_only", async () => {
+    using dir = new TestTempDir("attach-file-artifact");
+    const file = path.join(dir.path, "scratch/artifacts/report.md");
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, "# Report");
+    const config = {
+      ...createTestToolConfig(dir.path, { sessionsDir: path.join(dir.path, "session") }),
+      xumEnv: { XUM_SCRATCH_DIR: path.join(dir.path, "scratch"), XUM_RUNTIME: "worktree" },
+      experiments: { artifacts: true },
+    };
+    const result = expectSuccessfulAttachFileResult(
+      (await createAttachFileTool(config).execute!(
+        { path: file },
+        mockToolCallOptions
+      )) as AttachFileToolResult
+    );
+    expect(result.ui_only).toBeUndefined();
+    expect(await fs.readdir(path.join(dir.path, "session")).catch(() => [])).not.toContain(
+      "artifact-versions"
+    );
+  });
+});

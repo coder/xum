@@ -4,8 +4,12 @@ import {
   ProviderConfigInfoSchema,
   ProvidersConfigMapSchema,
   config,
+  agentPlugins,
+  mcp,
   workspace,
 } from "./api";
+import { OnChatEventSchema } from "./stream";
+import { MCP_ICON_LIMITS } from "../../constants/mcpIcon";
 import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from "../types";
 
 /**
@@ -84,20 +88,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
     expect(parsed.aws).toEqual(full.aws);
   });
 
-  it("preserves all ProviderConfigInfo fields (with couponCodeSet)", () => {
-    const full: ProviderConfigInfo = {
-      apiKeySet: true,
-      isEnabled: true,
-      isConfigured: true,
-      couponCodeSet: true,
-    };
-
-    const parsed = ProviderConfigInfoSchema.parse(full);
-
-    expect(parsed).toEqual(full);
-    expect(parsed.couponCodeSet).toBe(true);
-  });
-
   it("preserves all ProviderConfigInfo fields (full object with all optional fields)", () => {
     // This is the most comprehensive test - includes ALL possible fields
     const full: ProviderConfigInfo = {
@@ -126,7 +116,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
         accessKeyIdSet: true,
         secretAccessKeySet: true,
       },
-      couponCodeSet: true,
     };
 
     const parsed = ProviderConfigInfoSchema.parse(full);
@@ -153,7 +142,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
     expect(parsed.codexOauthSet).toBe(full.codexOauthSet);
     expect(parsed.codexOauthDefaultAuth).toBe(full.codexOauthDefaultAuth);
     expect(parsed.aws).toEqual(full.aws);
-    expect(parsed.couponCodeSet).toBe(full.couponCodeSet);
   });
 
   it("preserves ProvidersConfigMap with multiple providers", () => {
@@ -185,13 +173,6 @@ describe("ProviderConfigInfoSchema conformance", () => {
           accessKeyIdSet: true,
           secretAccessKeySet: true,
         },
-      },
-      "mux-gateway": {
-        apiKeySet: false,
-        isEnabled: true,
-        isConfigured: false,
-        couponCodeSet: true,
-        models: ["anthropic/claude-sonnet-4-5"],
       },
     };
 
@@ -288,5 +269,70 @@ describe("config.saveConfig schema", () => {
     });
 
     expect(result.success).toBe(true);
+  });
+});
+
+describe("mcp.icons schema", () => {
+  it("accepts a bounded list of well-formed refs and rejects oversized or malformed input", () => {
+    const ref = (n: number) => n.toString(16).padStart(32, "0");
+    const refs = (count: number) => Array.from({ length: count }, (_, i) => ref(i));
+    expect(mcp.icons.input.safeParse({ iconRefs: [] }).success).toBe(true);
+    expect(
+      mcp.icons.input.safeParse({ iconRefs: refs(MCP_ICON_LIMITS.registryMaxEntries) }).success
+    ).toBe(true);
+    expect(
+      mcp.icons.input.safeParse({ iconRefs: refs(MCP_ICON_LIMITS.registryMaxEntries + 1) }).success
+    ).toBe(false);
+    expect(mcp.icons.input.safeParse({ iconRefs: ["not-a-ref"] }).success).toBe(false);
+    // Output carries one answer per requested ref; unknown refs are null.
+    expect(
+      mcp.icons.output.safeParse({
+        [ref(1)]:
+          "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aFOcAAAAASUVORK5CYII=",
+        [ref(2)]: null,
+      }).success
+    ).toBe(true);
+    expect(mcp.icons.output.safeParse({ [ref(1)]: "https://example.com/icon.png" }).success).toBe(
+      false
+    );
+  });
+});
+
+describe("agentPlugins.setComponents schema", () => {
+  it("requires a baseline and distinguishes legacy absence from an explicit empty selection", () => {
+    const request = {
+      name: "plugin",
+      expectedLockedSha: "sha",
+      expectedContentHash: "receipt",
+      importedComponents: { skills: [], mcpServers: [] },
+    };
+    expect(agentPlugins.setComponents.input.safeParse(request).success).toBe(false);
+    for (const expectedImportedComponents of [null, { skills: [], mcpServers: [] }]) {
+      expect(
+        agentPlugins.setComponents.input.parse({ ...request, expectedImportedComponents })
+          .expectedImportedComponents
+      ).toEqual(expectedImportedComponents);
+    }
+  });
+});
+
+// #5102: only onChat sends `message-batch`, so only its event schema admits one.
+describe("message-batch is onChat-only", () => {
+  const row = {
+    type: "message",
+    id: "m1",
+    role: "user",
+    parts: [],
+    metadata: { historySequence: 1 },
+  };
+  const batch = { type: "message-batch", messages: [row] };
+
+  it("the onChat event schema admits a batch", () => {
+    expect(OnChatEventSchema.safeParse(batch).success).toBe(true);
+  });
+
+  it("getFullReplay's output admits the row but refuses the batch", () => {
+    expect(workspace.getFullReplay.output.safeParse([row]).success).toBe(true);
+    expect(workspace.getFullReplay.output.safeParse([batch]).success).toBe(false);
   });
 });

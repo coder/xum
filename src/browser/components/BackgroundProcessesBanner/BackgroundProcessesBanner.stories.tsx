@@ -1,5 +1,6 @@
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import type { AppStory } from "@/browser/stories/meta.js";
-import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
+import { appMeta, AppWithMocks, PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createTerminalTool } from "@/browser/stories/mocks/tools";
@@ -89,5 +90,208 @@ export const BackgroundProcesses: AppStory = {
           "Shows the background processes banner when there are running background bash processes. Click the banner to expand and see process details or terminate them.",
       },
     },
+  },
+};
+
+/**
+ * A one-shot watcher matched its monitor filter and exited, but the synthetic wake turn
+ * has not been delivered yet. The banner must keep the process visible with a pending
+ * indicator instead of vanishing (which previously looked like a lost wake).
+ */
+export const MonitorWakePendingAfterExit: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          // Own workspace: see OutputDialogHeading.
+          workspaceId: "ws-monitor-wake-pending",
+          messages: [
+            createUserMessage("msg-1", "Watch the PR checks and wake me when they finish", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+            createAssistantMessage(
+              "msg-2",
+              "I've started a background watcher that prints WAKE: when the checks finish.",
+              {
+                historySequence: 2,
+                timestamp: STABLE_TIMESTAMP - 50000,
+                toolCalls: [
+                  createTerminalTool("call-1", "./watch_pr_checks.sh", "Watching PR checks..."),
+                ],
+              }
+            ),
+          ],
+          backgroundProcesses: [
+            {
+              id: "bash_watcher",
+              pid: 22345,
+              script: "./watch_pr_checks.sh",
+              displayName: "PR Checks Watcher",
+              startTime: Date.now() - 90000,
+              monitor: {
+                filter: "WAKE:",
+                filter_exclude: false,
+                cooldown_ms: 1000,
+                totalMatches: 1,
+                droppedLines: 0,
+                lastLines: ["WAKE: all checks green"],
+                stopped: true,
+                pendingWakeKind: "match",
+              },
+              status: "exited",
+              exitCode: 0,
+            },
+          ],
+        })
+      }
+    />
+  ),
+  // The waking indicator sits on its own non-truncating line specifically so narrow
+  // rows cannot ellipsize it away; snapshot the phone width (alongside desktop) so the
+  // guarded condition is actually exercised.
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { viewports: ["phone", "desktop"] },
+    },
+    docs: {
+      description: {
+        story:
+          "A one-shot watcher matched and exited while its monitor wake is still pending delivery. The banner stays visible with a 'waking agent' indicator, no live duration, and no terminate button.",
+      },
+    },
+  },
+};
+
+export const MonitorLostWakePendingAfterRestart: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          // Own workspace: see OutputDialogHeading.
+          workspaceId: "ws-monitor-lost-wake",
+          messages: [
+            createUserMessage("msg-1", "Watch the PR checks and wake me when they finish", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+          ],
+          backgroundProcesses: [
+            // Synthesized from a durable pending monitor-lost wake after restart: no live
+            // process (pid 0), so no pid line, no output action, and "monitor lost" wording
+            // instead of claiming a match.
+            {
+              id: "bash_watcher",
+              pid: 0,
+              script: "./watch_pr_checks.sh",
+              displayName: "PR Checks Watcher",
+              synthesized: true,
+              startTime: Date.now() - 90000,
+              monitor: {
+                filter: "WAKE:",
+                filter_exclude: false,
+                cooldown_ms: 0,
+                totalMatches: 0,
+                droppedLines: 0,
+                lastLines: [],
+                stopped: true,
+                pendingWakeKind: "monitor-lost",
+              },
+              status: "exited",
+            },
+          ],
+        })
+      }
+    />
+  ),
+  // Same phone-width coverage as MonitorWakePendingAfterExit: the lost-monitor label
+  // must stay visible on narrow rows too.
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    pixel: {
+      matrix: { viewports: ["phone", "desktop"] },
+    },
+    docs: {
+      description: {
+        story:
+          "An app restart terminated an armed watcher; its durable monitor-lost wake is still pending delivery. The synthesized row shows 'monitor lost' wording with no pid, duration, output, or terminate affordances.",
+      },
+    },
+  },
+};
+
+const NAMED_PROCESS = "Background calls, one every 5 s";
+
+/**
+ * The output dialog of a process whose ID equals its display name (the usual case: the backend
+ * uses the bash call's display_name as the ID). The heading shows the name once (#5771).
+ */
+export const OutputDialogHeading: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupSimpleChatStory({
+          // Its own workspace. The test runner renders this file's stories one after another in
+          // one page, and the app keeps the state of a workspace it already loaded. With the
+          // shared default "ws-chat", this story showed the first story's transcript and no banner.
+          workspaceId: "ws-output-dialog-heading",
+          messages: [
+            createUserMessage("msg-1", "Poll the API in the background", {
+              historySequence: 1,
+              timestamp: STABLE_TIMESTAMP - 60000,
+            }),
+          ],
+          backgroundProcesses: [
+            {
+              id: NAMED_PROCESS,
+              pid: 32345,
+              script: "while true; do curl -sS localhost:8080/health; sleep 5; done",
+              displayName: NAMED_PROCESS,
+              startTime: Date.now() - 30000,
+              status: "running",
+            },
+            {
+              // A duplicate name gets a suffixed ID; the dialog still shows that ID.
+              id: `${NAMED_PROCESS} (2)`,
+              pid: 32346,
+              script: "sleep 600",
+              displayName: NAMED_PROCESS,
+              startTime: Date.now() - 20000,
+              status: "running",
+            },
+          ],
+        })
+      }
+    />
+  ),
+  // No Pixel capture: the snapshot budget (scripts/check-storybook-snapshot-budget.mjs) is full.
+  // The play asserts the heading text instead.
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await userEvent.click(await canvas.findByText(/background bashes/));
+    const body = within(canvasElement.ownerDocument.body);
+
+    const viewButtons = await canvas.findAllByRole("button", { name: "View output" });
+    await userEvent.click(viewButtons[0]);
+    const dialog = await body.findByRole("dialog");
+    await waitFor(() => {
+      const heading = within(dialog).getByRole("heading");
+      void expect(heading.textContent).toBe(NAMED_PROCESS);
+    });
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => expect(body.queryByRole("dialog")).toBeNull());
+
+    await userEvent.click(viewButtons[1]);
+    const second = await body.findByRole("dialog");
+    await waitFor(() => {
+      const heading = within(second).getByRole("heading");
+      void expect(heading.textContent).toBe(`${NAMED_PROCESS}${NAMED_PROCESS} (2)`);
+    });
   },
 };

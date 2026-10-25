@@ -8,7 +8,7 @@
 
 import {
   getLocalProductHomeTildeSuffix,
-  resolveShuxEnvironmentValue,
+  resolveXumEnvironmentValue,
 } from "@/common/compat/legacyMux";
 import { platform, env } from "node:process";
 
@@ -208,16 +208,16 @@ export class PlatformPaths {
       return filePath;
     }
 
-    // Isolated environments can place all state under SHUX_ROOT. Legacy MUX_ROOT and
+    // Isolated environments can place all state under XUM_ROOT. Legacy MUX_ROOT and
     // ~/.mux / ~/.cmux paths resolve through the same boundary so older configs remain portable.
-    const shuxRoot = resolveShuxEnvironmentValue("ROOT", env);
-    if (shuxRoot) {
+    const xumRoot = resolveXumEnvironmentValue("ROOT", env);
+    if (xumRoot) {
       const productHomeSuffix = getLocalProductHomeTildeSuffix(filePath);
       if (productHomeSuffix !== undefined) {
-        const normalizedShuxRoot = shuxRoot.replace(/[\\/]+$/g, "");
+        const normalizedXumRoot = xumRoot.replace(/[\\/]+$/g, "");
         const sep = getSeparator();
         const normalizedRest = productHomeSuffix.replace(/[\\/]+/g, sep);
-        return normalizedShuxRoot + (normalizedRest ? sep + normalizedRest : "");
+        return normalizedXumRoot + (normalizedRest ? sep + normalizedRest : "");
       }
     }
 

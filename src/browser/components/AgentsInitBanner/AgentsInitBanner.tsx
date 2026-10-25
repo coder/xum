@@ -3,6 +3,8 @@ import { Bot, X } from "lucide-react";
 interface AgentsInitBannerProps {
   onRunInit: () => void | Promise<void>;
   onDismiss: () => void;
+  /** #6038: off while the creation composer cannot send, so a click never goes unsent. */
+  runDisabled?: boolean;
 }
 
 /**
@@ -23,7 +25,7 @@ export function AgentsInitBanner(props: AgentsInitBannerProps) {
         <span className="text-muted-foreground text-xs">
           Add or improve an{" "}
           <code className="bg-bg-dark-hover rounded px-1 font-mono">AGENTS.md</code>
-          so Shux learns your repo’s commands, conventions, and constraints.
+          so Xum learns your repo’s commands, conventions, and constraints.
         </span>
       </div>
 
@@ -31,7 +33,8 @@ export function AgentsInitBanner(props: AgentsInitBannerProps) {
         <button
           type="button"
           onClick={() => void props.onRunInit()}
-          className="bg-accent hover:bg-accent/80 text-accent-foreground inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors"
+          disabled={props.runDisabled}
+          className="bg-accent hover:bg-accent-button-hover text-accent-foreground inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50"
           data-testid="agents-init-run"
         >
           Run /init

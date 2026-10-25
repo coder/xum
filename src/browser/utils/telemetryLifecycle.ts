@@ -1,0 +1,50 @@
+/**
+ * Telemetry lifecycle tracking
+ *
+ * Handles app startup events
+ */
+
+import { readPersistedRawString, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { trackEvent } from "@/common/telemetry/client";
+import { FIRST_LAUNCH_KEY } from "@/common/constants/storage";
+
+/**
+ * Check if this is the first app launch
+ * Uses localStorage to persist flag across sessions
+ */
+function checkFirstLaunch(): boolean {
+  if (readPersistedRawString(FIRST_LAUNCH_KEY)) {
+    return false;
+  }
+
+  // First launch - set the flag. JSON true serializes to "true", the raw value older builds wrote.
+  updatePersistedState(FIRST_LAUNCH_KEY, true);
+  return true;
+}
+
+/**
+ * Check if vim mode is enabled
+ */
+function checkVimModeEnabled(): boolean {
+  return getUserPreferences().appearance?.vimEnabled === true;
+}
+
+/**
+ * Track app startup
+ * Should be called once, after the app config store's first snapshot
+ */
+export function trackAppStarted(): void {
+  const isFirstLaunch = checkFirstLaunch();
+  const vimModeEnabled = checkVimModeEnabled();
+
+  console.debug("[Telemetry] trackAppStarted", { isFirstLaunch, vimModeEnabled });
+
+  trackEvent({
+    event: "app_started",
+    properties: {
+      isFirstLaunch,
+      vimModeEnabled,
+    },
+  });
+}

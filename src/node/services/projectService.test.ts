@@ -1,15 +1,26 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
-import * as fs from "fs/promises";
 import * as path from "path";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import * as fs from "fs/promises";
+import cjsFs from "fs";
 import * as os from "os";
 import { execSync } from "child_process";
 import { createHash } from "crypto";
 import { Config } from "@/node/config";
 import { Ok } from "@/common/types/result";
+import { ORPCError } from "@orpc/server";
 import type { SshPromptRequest } from "@/common/orpc/schemas/ssh";
 import { SshPromptService } from "@/node/services/sshPromptService";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { CreationDraftService } from "./creationDraftService";
 import { ProjectService, type CloneEvent } from "./projectService";
+import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
+import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { getRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/remoteProjectPlugins";
+import {
+  projectRegistrationLockFilePath,
+  withProjectRegistrationLock,
+} from "@/node/config/projectRegistrationLock";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 
 async function createLocalGitRepository(rootDir: string, repoName: string): Promise<string> {
   const repoPath = path.join(rootDir, repoName);
@@ -136,6 +147,16 @@ async function collectCloneEvents(
   return { events, clonedUrls };
 }
 
+/**
+ * Simulated concurrent registration for create()'s in-transform duplicate re-check. Real
+ * writers are serialized with create() by the registration lock (Config.editConfig takes
+ * it for any project-set change), so the interleaving these tests exercise is reproduced by
+ * marking the edit as a same-window writer; the re-check stays as defense in depth.
+ */
+const REGISTER_CONCURRENTLY = {
+  withinRegistrationLock: { assertStillOwned: () => Promise.resolve() },
+} as const;
+
 describe("ProjectService", () => {
   let tempDir: string;
   let config: Config;
@@ -152,6 +173,391 @@ describe("ProjectService", () => {
   });
 
   describe("create", () => {
+    // #5917: a root project would make file completions, git status and review scans walk the
+    // whole disk.
+    it("refuses to register the filesystem root", async () => {
+      expect(await service.create("/")).toEqual({
+        success: false,
+        error: "A project cannot be the filesystem root",
+      });
+      expect(config.loadConfigOrDefault().projects.size).toBe(0);
+    });
+
+    // Windows needs extra privileges for symlinks.
+    it.skipIf(process.platform === "win32")(
+      "refuses a symlink that resolves to the filesystem root",
+      async () => {
+        const link = path.join(tempDir, "root-link");
+        await fs.symlink("/", link);
+        expect(await service.create(link)).toEqual({
+          success: false,
+          error: "A project cannot be the filesystem root",
+        });
+        expect(config.loadConfigOrDefault().projects.size).toBe(0);
+      }
+    );
+
+    it("creates and registers a git project at a new path", async () => {
+      const projectPath = path.join(tempDir, "new-git-project");
+
+      const result = await service.create(projectPath, { initGit: true });
+
+      expect(result.success).toBe(true);
+      if (!result.success) throw new Error("Expected success");
+      expect(result.data.normalizedPath).toBe(projectPath);
+      expect((await fs.stat(path.join(projectPath, ".git"))).isDirectory()).toBe(true);
+      expect(
+        execSync("git branch --show-current", { cwd: projectPath, encoding: "utf-8" }).trim()
+      ).toBe("main");
+      expect(
+        execSync("git rev-list --count HEAD", { cwd: projectPath, encoding: "utf-8" }).trim()
+      ).toBe("1");
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(true);
+    });
+
+    it("initializes and registers an existing empty directory", async () => {
+      const projectPath = path.join(tempDir, "empty-git-project");
+      await fs.mkdir(projectPath);
+
+      const result = await service.create(projectPath, { initGit: true });
+
+      expect(result.success).toBe(true);
+      expect((await fs.stat(path.join(projectPath, ".git"))).isDirectory()).toBe(true);
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(true);
+    });
+
+    it("rejects an existing non-empty directory without modifying it", async () => {
+      const projectPath = path.join(tempDir, "non-empty-project");
+      const existingFile = path.join(projectPath, "README.md");
+      await fs.mkdir(projectPath);
+      await fs.writeFile(existingFile, "existing content", "utf-8");
+
+      const result = await service.create(projectPath, { initGit: true });
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("already exists and is not empty");
+      expect(await fs.readFile(existingFile, "utf-8")).toBe("existing content");
+      expect(fs.stat(path.join(projectPath, ".git"))).rejects.toThrow();
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
+    });
+
+    it("rejects invalid paths without registering a project", async () => {
+      const filePath = path.join(tempDir, "not-a-directory");
+      await fs.writeFile(filePath, "content", "utf-8");
+
+      const fileResult = await service.create(filePath, { initGit: true });
+      const emptyResult = await service.create("", { initGit: true });
+
+      expect(fileResult.success).toBe(false);
+      expect(emptyResult.success).toBe(false);
+      expect(await fs.readFile(filePath, "utf-8")).toBe("content");
+      expect(config.loadConfigOrDefault().projects.size).toBe(0);
+    });
+
+    it("rejects initGit inside a registered project tree", async () => {
+      const parentPath = await createLocalGitRepository(tempDir, "parent-repo");
+      const parentResult = await service.create(parentPath);
+      expect(parentResult.success).toBe(true);
+
+      const nestedPath = path.join(parentPath, "nested-new-repo");
+      const snapshot = config.loadConfigOrDefault();
+      const projects = snapshot.projects;
+      const result = await service.create(nestedPath, { initGit: true });
+      expect(config.loadConfigOrDefault()).toBe(snapshot);
+      expect(snapshot.projects).toBe(projects);
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain(
+        "Cannot create a new git repository inside an existing project"
+      );
+      // The rejected nested directory must not linger inside the parent checkout.
+      expect(fs.stat(nestedPath)).rejects.toThrow();
+      expect(config.loadConfigOrDefault().projects.has(nestedPath)).toBe(false);
+    });
+
+    it("rejects initGit reached through a symlink into a registered project tree", async () => {
+      if (process.platform === "win32") return;
+
+      // Canonicalize the temp root (macOS /var is itself a symlink) so the registered
+      // parent path matches what realpath resolves the alias to.
+      const realTempDir = await fs.realpath(tempDir);
+      const parentPath = await createLocalGitRepository(realTempDir, "symlink-parent-repo");
+      const parentResult = await service.create(parentPath);
+      expect(parentResult.success).toBe(true);
+
+      const aliasPath = path.join(realTempDir, "parent-alias");
+      await fs.symlink(parentPath, aliasPath);
+      const nestedAliasPath = path.join(aliasPath, "nested-new-repo");
+
+      const result = await service.create(nestedAliasPath, { initGit: true });
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain(
+        "Cannot create a new git repository inside an existing project"
+      );
+      expect(fs.stat(path.join(parentPath, "nested-new-repo"))).rejects.toThrow();
+      expect(config.loadConfigOrDefault().projects.has(nestedAliasPath)).toBe(false);
+    });
+
+    it("rejects initGit when the canonical parent registers concurrently via symlink", async () => {
+      if (process.platform === "win32") return;
+
+      const realTempDir = await fs.realpath(tempDir);
+      const parentPath = await createLocalGitRepository(realTempDir, "late-parent-repo");
+      const aliasPath = path.join(realTempDir, "late-parent-alias");
+      await fs.symlink(parentPath, aliasPath);
+      const nestedAliasPath = path.join(aliasPath, "nested-late-repo");
+
+      // Deterministic interleaving: queue the parent registration so create()'s
+      // snapshot read misses it while its transform sees it. The lexical fresh-parent
+      // check cannot catch this (the alias is not lexically beneath the real path);
+      // only the canonical re-check in the transform can reject it.
+      const registerParent = config.editConfig((cfg) => {
+        cfg.projects.set(parentPath, { workspaces: [] });
+        return cfg;
+      }, REGISTER_CONCURRENTLY);
+      const result = await service.create(nestedAliasPath, { initGit: true });
+      await registerParent;
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("changed concurrently");
+      // The nested repository must not survive inside the registered checkout.
+      expect(fs.stat(path.join(parentPath, "nested-late-repo"))).rejects.toThrow();
+      expect(config.loadConfigOrDefault().projects.has(nestedAliasPath)).toBe(false);
+    });
+
+    it("fails initGit create without leaving .git when config persistence fails", async () => {
+      const projectPath = path.join(tempDir, "persist-fail-project");
+      const nonPersistingConfig = new Config(tempDir);
+      // Run the transform (so create() reaches its success path) but drop the save,
+      // modeling a write that did not land.
+      nonPersistingConfig.editConfig = (transform) => {
+        transform(nonPersistingConfig.loadConfigOrDefault());
+        return Promise.resolve();
+      };
+      const nonPersistingService = new ProjectService(nonPersistingConfig);
+
+      const result = await nonPersistingService.create(projectPath, { initGit: true });
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("save project configuration");
+      // Roll back the created directory so a retry is not blocked by leftover .git.
+      expect(fs.stat(projectPath)).rejects.toThrow();
+    });
+
+    it("rolls back a partial .git when git init itself fails", async () => {
+      if (process.platform === "win32") return;
+
+      const projectPath = path.join(tempDir, "partial-init-project");
+      await fs.mkdir(projectPath);
+      // Model a broken init template: init creates a partial .git, then fails.
+      const fakeGit = await installFakeGit(
+        tempDir,
+        "create-partial-init-failure",
+        `#!/bin/sh
+prev=""
+for arg in "$@"; do
+  if [ "$arg" = "init" ]; then
+    mkdir -p "$prev/.git"
+    printf 'init failed' >&2
+    exit 1
+  fi
+  prev="$arg"
+done
+exit 1
+`
+      );
+
+      const result = await withEnv(fakeGit.env, () =>
+        service.create(projectPath, { initGit: true })
+      );
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("init failed");
+      expect((await fs.stat(projectPath)).isDirectory()).toBe(true);
+      expect(fs.stat(path.join(projectPath, ".git"))).rejects.toThrow();
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
+    });
+
+    it("removes only .git when a plain create wins the same pre-existing directory", async () => {
+      const projectPath = path.join(tempDir, "plain-vs-initgit");
+      await fs.mkdir(projectPath);
+
+      // Deterministic interleaving: queue the plain registration so the initGit
+      // create's snapshot misses it (git init runs) while its transform hits the
+      // duplicate re-check; the loser must strip its .git from the winner's project.
+      const registerPlain = config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { workspaces: [] });
+        return cfg;
+      }, REGISTER_CONCURRENTLY);
+      const result = await service.create(projectPath, { initGit: true });
+      await registerPlain;
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("already exists");
+      expect((await fs.stat(projectPath)).isDirectory()).toBe(true);
+      expect(fs.stat(path.join(projectPath, ".git"))).rejects.toThrow();
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(true);
+    });
+
+    it("initializes the new project even when GIT_DIR/GIT_WORK_TREE point elsewhere", async () => {
+      const externalRepoPath = await createLocalGitRepository(tempDir, "external-selected-repo");
+      const externalCommitsBefore = execSync("git rev-list --count HEAD", {
+        cwd: externalRepoPath,
+        encoding: "utf-8",
+      }).trim();
+      const projectPath = path.join(tempDir, "env-selected-project");
+
+      const result = await withEnv(
+        { GIT_DIR: path.join(externalRepoPath, ".git"), GIT_WORK_TREE: externalRepoPath },
+        () => service.create(projectPath, { initGit: true })
+      );
+
+      expect(result.success).toBe(true);
+      // The new project owns its own repository; the externally selected one is untouched.
+      expect((await fs.stat(path.join(projectPath, ".git"))).isDirectory()).toBe(true);
+      expect(
+        execSync("git rev-list --count HEAD", { cwd: externalRepoPath, encoding: "utf-8" }).trim()
+      ).toBe(externalCommitsBefore);
+    });
+
+    it("serializes concurrent gitInit calls for the same directory", async () => {
+      const projectPath = path.join(tempDir, "concurrent-gitinit");
+      await fs.mkdir(projectPath);
+
+      const [first, second] = await Promise.all([
+        service.gitInit(projectPath),
+        service.gitInit(projectPath),
+      ]);
+
+      const outcomes = [first, second];
+      expect(outcomes.filter((r) => r.success)).toHaveLength(1);
+      const loser = outcomes.find((r) => !r.success);
+      expect(loser && !loser.success ? loser.error : "").toContain("already initializing");
+      // The winner's repository survives with exactly its initial commit.
+      expect(
+        execSync("git rev-list --count HEAD", { cwd: projectPath, encoding: "utf-8" }).trim()
+      ).toBe("1");
+    });
+
+    it("removes only .git when a descendant wins registration during an initGit create", async () => {
+      const parentPath = path.join(tempDir, "late-descendant-parent");
+      const descendantPath = path.join(parentPath, "child-project");
+
+      // Deterministic interleaving: queue the descendant registration so create()'s
+      // snapshot misses it (git init runs) while its transform sees it and records
+      // hierarchy-changed-descendant, which must strip our .git but keep the tree.
+      const registerDescendant = config.editConfig((cfg) => {
+        cfg.projects.set(descendantPath, { workspaces: [] });
+        return cfg;
+      }, REGISTER_CONCURRENTLY);
+      const result = await service.create(parentPath, { initGit: true });
+      await registerDescendant;
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("changed concurrently");
+      // The winner's tree survives, but our unregistered outer repository must not.
+      expect((await fs.stat(parentPath)).isDirectory()).toBe(true);
+      expect(fs.stat(path.join(parentPath, ".git"))).rejects.toThrow();
+      expect(config.loadConfigOrDefault().projects.has(parentPath)).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(descendantPath)).toBe(true);
+    });
+
+    it("serializes concurrent initGit creates of the same pre-existing empty directory", async () => {
+      const projectPath = path.join(tempDir, "shared-empty-project");
+      await fs.mkdir(projectPath);
+
+      const [first, second] = await Promise.all([
+        service.create(projectPath, { initGit: true }),
+        service.create(projectPath, { initGit: true }),
+      ]);
+
+      const outcomes = [first, second];
+      expect(outcomes.filter((r) => r.success)).toHaveLength(1);
+      // The loser must never touch the winner's git state: the repository stays
+      // intact with its initial commit and stays registered.
+      expect(
+        execSync("git rev-list --count HEAD", { cwd: projectPath, encoding: "utf-8" }).trim()
+      ).toBe("1");
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(true);
+    });
+
+    it("rolls back git init in a pre-existing directory when the initial commit fails", async () => {
+      if (process.platform === "win32") return;
+
+      const projectPath = path.join(tempDir, "existing-empty-project");
+      await fs.mkdir(projectPath);
+      // Real `git init` so the .git rollback has something to remove; the shim fails
+      // only the commit step to model hook/signing failures after a successful init.
+      const realGit = execSync("command -v git", { encoding: "utf-8" }).trim();
+      const fakeGit = await installFakeGit(
+        tempDir,
+        "create-commit-failure",
+        `#!/bin/sh
+for arg in "$@"; do
+  if [ "$arg" = "commit" ]; then
+    printf 'commit failed' >&2
+    exit 1
+  fi
+done
+exec ${realGit} "$@"
+`
+      );
+
+      const result = await withEnv(fakeGit.env, () =>
+        service.create(projectPath, { initGit: true })
+      );
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("commit failed");
+      // The user's directory survives, but the partial .git must be rolled back so a
+      // retry is not rejected as non-empty.
+      expect((await fs.stat(projectPath)).isDirectory()).toBe(true);
+      expect(fs.stat(path.join(projectPath, ".git"))).rejects.toThrow();
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
+
+      const retry = await service.create(projectPath, { initGit: true });
+      expect(retry.success).toBe(true);
+    });
+
+    it("removes a newly created directory when git initialization fails", async () => {
+      if (process.platform === "win32") return;
+
+      const projectPath = path.join(tempDir, "failed-git-project");
+      const fakeGit = await installFakeGit(
+        tempDir,
+        "create-init-failure",
+        "#!/bin/sh\nprintf 'git failed' >&2\nexit 1\n"
+      );
+
+      const result = await withEnv(fakeGit.env, () =>
+        service.create(projectPath, { initGit: true })
+      );
+
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("git failed");
+      expect(fs.stat(projectPath)).rejects.toThrow();
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
+    });
+
+    it("concurrent initGit creates of the same new path leave one intact repository", async () => {
+      const projectPath = path.join(tempDir, "concurrent-git-project");
+
+      const [first, second] = await Promise.all([
+        service.create(projectPath, { initGit: true }),
+        service.create(projectPath, { initGit: true }),
+      ]);
+
+      const outcomes = [first, second];
+      expect(outcomes.filter((r) => r.success)).toHaveLength(1);
+      // The loser must never run git operations in the winner's directory, so the
+      // winner's repository stays intact and registered.
+      expect(
+        execSync("git rev-list --count HEAD", { cwd: projectPath, encoding: "utf-8" }).trim()
+      ).toBe("1");
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(true);
+    });
+
     // Regression (PR #3694 Codex P1): two concurrent create() calls for the same
     // not-yet-existing path both compute createdDirectory === true before either
     // registration is serialized. The loser hits the duplicate re-check inside the
@@ -200,7 +606,7 @@ describe("ProjectService", () => {
       const registerPkg = config.editConfig((cfg) => {
         cfg.projects.set(pkgPath, { workspaces: [], parentProjectPath: repoPath });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const api = await service.create(apiPath);
       await registerPkg;
 
@@ -232,7 +638,7 @@ describe("ProjectService", () => {
       const registerRepo = config.editConfig((cfg) => {
         cfg.projects.set(repoPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(pkgPath);
       await registerRepo;
 
@@ -257,7 +663,7 @@ describe("ProjectService", () => {
       const registerDescendant = config.editConfig((cfg) => {
         cfg.projects.set(descendantPath, { workspaces: [] });
         return cfg;
-      });
+      }, REGISTER_CONCURRENTLY);
       const result = await service.create(parentPath);
       await registerDescendant;
 
@@ -759,6 +1165,33 @@ exit 1
         const err = error as NodeJS.ErrnoException;
         expect(err.code).toBe("ENOENT");
       }
+    });
+
+    it("yields error and rolls back when the config write rejects", async () => {
+      const sourceRepoPath = await createLocalGitRepository(tempDir, "source-repo-write-reject");
+      const cloneParentDir = path.join(tempDir, "write-reject-clones");
+      const rejectingConfig = new Config(tempDir);
+      rejectingConfig.editConfig = () => Promise.reject(new Error("EACCES: permission denied"));
+      const rejectingService = new ProjectService(rejectingConfig);
+
+      const events: CloneEvent[] = [];
+      for await (const event of rejectingService.cloneWithProgress({
+        repoUrl: sourceRepoPath,
+        cloneParentDir,
+      })) {
+        events.push(event);
+      }
+
+      const terminalEvent = events[events.length - 1];
+      expect(terminalEvent?.type).toBe("error");
+      if (terminalEvent?.type !== "error") throw new Error("Expected error event");
+      expect(terminalEvent.error).toContain("EACCES");
+      // A rejected registration must not orphan the clone at the user's chosen path (#4444).
+      const expectedProjectPath = path.resolve(cloneParentDir, "source-repo-write-reject");
+      const stat = await fs
+        .stat(expectedProjectPath)
+        .catch((error: NodeJS.ErrnoException) => error);
+      expect(stat).toMatchObject({ code: "ENOENT" });
     });
 
     it("cleans up partial clone and yields cancellation event when aborted", async () => {
@@ -1822,6 +2255,27 @@ exit 1
     }
   });
 
+  describe("beginShutdown", () => {
+    it("refuses new project mutations once teardown starts", async () => {
+      const projectPath = path.join(tempDir, "late-project");
+      await fs.mkdir(projectPath);
+      service.beginShutdown();
+
+      const outcomes = await Promise.allSettled([
+        service.create(projectPath),
+        service.gitInit(projectPath),
+        service.remove(projectPath),
+        service.cloneWithProgress({ repoUrl: "https://example.invalid/repo.git" }).next(),
+      ]);
+      expect(
+        outcomes.map((outcome) =>
+          outcome.status === "rejected" ? String(outcome.reason) : "fulfilled"
+        )
+      ).toEqual(Array<string>(4).fill("Error: Server is shutting down"));
+      expect(service.getMutationCount()).toBe(0);
+    });
+  });
+
   describe("gitInit", () => {
     it("initializes git repo in non-git directory with initial commit", async () => {
       const testDir = path.join(tempDir, "new-project");
@@ -1840,6 +2294,26 @@ exit 1
       const branchResult = await service.listBranches(testDir);
       expect(branchResult.branches).toContain("main");
       expect(branchResult.recommendedTrunk).toBe("main");
+    });
+
+    // A failed create removes the directory right after the initial commit. A detached
+    // `git maintenance run --auto` from that commit was still using the repository then, and
+    // Bun's recursive fs.rm can stop early without an error when an entry it listed is
+    // removed meanwhile, so the "fails initGit create without leaving .git" test saw the
+    // directory survive about 1 run in 40 with git 2.55.
+    it("starts no background git maintenance that outlives the initial commit", async () => {
+      const testDir = path.join(tempDir, "no-maintenance");
+      await fs.mkdir(testDir);
+      const tracePath = path.join(tempDir, "git-trace2.json");
+
+      const result = await withEnv({ GIT_TRACE2_EVENT: tracePath }, () => service.gitInit(testDir));
+
+      expect(result.success).toBe(true);
+      // The commit writes the child_start event for a maintenance child before it exits, so
+      // the child shows up here even if it detached and has not run yet.
+      const trace = await fs.readFile(tracePath, "utf-8");
+      expect(trace).toContain('"hierarchy":"commit"');
+      expect(trace).not.toContain('"maintenance"');
     });
 
     it("succeeds for unborn git repo (git init but no commits)", async () => {
@@ -1906,7 +2380,239 @@ exit 1
     });
   });
 
+  describe("project settings mutations", () => {
+    it("setTrust never creates a project at the filesystem root, but updates an existing one", async () => {
+      let refusal: unknown;
+      try {
+        await service.setTrust("/", true);
+      } catch (error) {
+        refusal = error;
+      }
+      expect(refusal).toBeInstanceOf(Error);
+      expect((refusal as Error).message).toBe("A project cannot be the filesystem root");
+      expect(config.loadConfigOrDefault().projects.size).toBe(0);
+
+      // An older config can already hold the root project (#5917): its trust still changes.
+      await config.editConfig((current) => {
+        current.projects.set("/", { workspaces: [] });
+        return current;
+      });
+      await service.setTrust("/", true);
+      expect(new Config(tempDir).loadConfigOrDefault().projects.get("/")?.trusted).toBe(true);
+    });
+
+    it("propagates parent trust to MCP state", async () => {
+      const parentPath = path.join(tempDir, "project");
+      const childPath = path.join(parentPath, "packages", "api");
+      await config.editConfig((current) => {
+        current.projects.set(parentPath, { workspaces: [] });
+        current.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
+        return current;
+      });
+      const updates: Array<Array<{ projectPath: string; trusted: boolean }>> = [];
+      service.setMcpServerManager({
+        applyProjectTrust: (value) => updates.push(value),
+        forgetProjectTrust: () => undefined,
+      });
+
+      await service.setTrust(`${parentPath}/`, true);
+
+      expect(config.loadConfigOrDefault().projects.get(parentPath)?.trusted).toBe(true);
+      expect(updates).toEqual([
+        [
+          { projectPath: parentPath, trusted: true },
+          { projectPath: childPath, trusted: true },
+        ],
+      ]);
+    });
+
+    it("setTrust drops remote plugin snapshots even when the MCP update throws (#6426)", async () => {
+      // A remote host whose listing runs in a local shell; each exec is one cold read.
+      let execs = 0;
+      class CountingRuntime extends ShellRemoteRuntime {
+        override getAgentHostKey(): string {
+          return "trust-test";
+        }
+        override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+          execs++;
+          return super.exec(command, options);
+        }
+      }
+      const runtime = new CountingRuntime(tempDir);
+      const containers = [path.join(tempDir, ".xum", "plugins")];
+      await getRemoteProjectPluginSnapshot(runtime, tempDir, containers);
+      service.setMcpServerManager({
+        applyProjectTrust: () => {
+          throw new Error("MCP update failed");
+        },
+        forgetProjectTrust: () => undefined,
+      });
+      // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
+      await expect(service.setTrust(path.join(tempDir, "project"), true)).rejects.toThrow(
+        "MCP update failed"
+      );
+      await getRemoteProjectPluginSnapshot(runtime, tempDir, containers);
+      expect(execs).toBe(2);
+    });
+
+    it("setIcon stores an icon name and null clears it", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+
+      await service.setIcon(projectPath, "rocket");
+      expect(new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.icon).toBe(
+        "rocket"
+      );
+
+      await service.setIcon(projectPath, null);
+      const [listed] = service.list().filter(([listedPath]) => listedPath === projectPath);
+      expect(listed?.[1]).not.toHaveProperty("icon");
+      expect(
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)
+      ).not.toHaveProperty("icon");
+    });
+
+    it("validates, writes, and clears code workspace sync paths", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+
+      let invalid: unknown;
+      try {
+        await service.setCodeWorkspaceSyncPath(projectPath, "notes.txt");
+      } catch (error) {
+        invalid = error;
+      }
+      expect(invalid).toBeInstanceOf(ORPCError);
+      expect((invalid as Error).message).toContain(".code-workspace");
+
+      await service.setCodeWorkspaceSyncPath(projectPath, "  proj.code-workspace  ");
+      const workspaceFile = path.join(projectPath, "proj.code-workspace");
+      expect(config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath).toBe(
+        "proj.code-workspace"
+      );
+      expect(JSON.parse(await fs.readFile(workspaceFile, "utf-8"))).toEqual({
+        folders: [{ path: projectPath }],
+      });
+
+      await service.setCodeWorkspaceSyncPath(projectPath, null);
+      expect(
+        config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
+      ).toBeUndefined();
+      expect((await fs.stat(workspaceFile)).isFile()).toBe(true);
+    });
+
+    it("rolls back code workspace paths when explicit sync fails", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      await fs.writeFile(path.join(projectPath, "broken.code-workspace"), "{ not valid jsonc");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+
+      let thrown: unknown;
+      try {
+        await service.setCodeWorkspaceSyncPath(projectPath, "broken.code-workspace");
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(ORPCError);
+      expect((thrown as Error).message).toContain("not valid JSONC");
+      expect(
+        config.loadConfigOrDefault().projects.get(projectPath)?.codeWorkspaceSyncPath
+      ).toBeUndefined();
+    });
+
+    it("keeps the sync error when the rollback write also fails (#4748)", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await fs.mkdir(projectPath, { recursive: true });
+      await fs.writeFile(path.join(projectPath, "broken.code-workspace"), "{ not valid jsonc");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [] });
+        return current;
+      });
+      const realEdit = config.editConfig.bind(config);
+      spyOn(config, "editConfig")
+        .mockImplementationOnce(realEdit)
+        .mockImplementationOnce(() => Promise.reject(new Error("rollback write failed")));
+
+      const thrown = await service
+        .setCodeWorkspaceSyncPath(projectPath, "broken.code-workspace")
+        .catch((error: unknown) => error);
+
+      // The user needs the reason the sync failed, not the secondary rollback failure.
+      expect(thrown).toBeInstanceOf(ORPCError);
+      expect((thrown as Error).message).toContain("not valid JSONC");
+    });
+  });
+
   describe("assignWorkspaceToSubProject", () => {
+    it("syncs both code workspace files after reassignment", async () => {
+      const parentPath = path.join(tempDir, "project");
+      const subProjectA = path.join(parentPath, "packages", "a");
+      const subProjectB = path.join(parentPath, "packages", "b");
+      const worktreePath = path.join(config.srcDir, "project", "feat-1");
+      await Promise.all([
+        fs.mkdir(subProjectA, { recursive: true }),
+        fs.mkdir(subProjectB, { recursive: true }),
+        fs.mkdir(worktreePath, { recursive: true }),
+      ]);
+      await config.editConfig((current) => {
+        current.projects.set(parentPath, {
+          workspaces: [
+            {
+              path: worktreePath,
+              id: "aaaaaaaaaa",
+              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+              subProjectPath: subProjectA,
+            },
+          ],
+        });
+        current.projects.set(subProjectA, {
+          workspaces: [],
+          parentProjectPath: parentPath,
+          codeWorkspaceSyncPath: "a.code-workspace",
+        });
+        current.projects.set(subProjectB, {
+          workspaces: [],
+          parentProjectPath: parentPath,
+          codeWorkspaceSyncPath: "b.code-workspace",
+        });
+        return current;
+      });
+      const fileA = path.join(subProjectA, "a.code-workspace");
+      const fileB = path.join(subProjectB, "b.code-workspace");
+      await fs.writeFile(fileA, JSON.stringify({ folders: [{ path: worktreePath }] }));
+      let refreshed = "";
+      service.setWorkspaceMetadataRefresher({
+        refreshAndEmitMetadata: (workspaceId) => {
+          refreshed = workspaceId;
+          return Promise.resolve();
+        },
+      });
+
+      const result = await service.assignWorkspaceToSubProjectAndSync(
+        parentPath,
+        "aaaaaaaaaa",
+        subProjectB
+      );
+
+      const foldersOf = async (file: string) =>
+        (JSON.parse(await fs.readFile(file, "utf-8")) as { folders: Array<{ path: string }> })
+          .folders;
+      expect(result.success).toBe(true);
+      expect(refreshed).toBe("aaaaaaaaaa");
+      expect((await foldersOf(fileA)).map((folder) => folder.path)).not.toContain(worktreePath);
+      expect((await foldersOf(fileB)).map((folder) => folder.path)).toContain(worktreePath);
+    });
+
     it("accepts either parent or sub-project path as the owner selector", async () => {
       const parentPath = "/fake/project";
       const subProjectPath = "/fake/project/packages/api";
@@ -2007,18 +2713,286 @@ exit 1
     });
   });
 
+  describe("list", () => {
+    it("excludes archived workspaces while preserving live ones", async () => {
+      const projectPath = "/fake/project";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          { id: "live-1", path: "/fake/project/ws-live" },
+          { id: "archived-1", path: "/fake/project/ws-archived", archivedAt: ARCHIVED_AT },
+          {
+            id: "unarchived-1",
+            path: "/fake/project/ws-unarchived",
+            archivedAt: ARCHIVED_AT,
+            unarchivedAt: "2026-01-02T00:00:00.000Z",
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const listed = service.list();
+
+      const project = listed.find(([listedPath]) => listedPath === projectPath)?.[1];
+      expect(project).toBeDefined();
+      expect(project?.workspaces.map((workspace) => workspace.id)).toEqual([
+        "live-1",
+        "unarchived-1",
+      ]);
+    });
+
+    it("keeps live multi-project workspaces in their bucket", async () => {
+      const projectPath = "/fake/project";
+      const otherProjectPath = "/fake/other";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          {
+            id: "multi-live",
+            path: "/fake/project/ws-multi",
+            projects: [
+              { projectPath, projectName: "project" },
+              { projectPath: otherProjectPath, projectName: "other" },
+            ],
+          },
+          {
+            id: "multi-archived",
+            path: "/fake/project/ws-multi-archived",
+            archivedAt: ARCHIVED_AT,
+            projects: [
+              { projectPath, projectName: "project" },
+              { projectPath: otherProjectPath, projectName: "other" },
+            ],
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const listed = service.list();
+
+      const project = listed.find(([listedPath]) => listedPath === projectPath)?.[1];
+      expect(project?.workspaces.map((workspace) => workspace.id)).toEqual(["multi-live"]);
+      expect(project?.workspaces[0]?.projects?.map((ref) => ref.projectPath)).toEqual([
+        projectPath,
+        otherProjectPath,
+      ]);
+    });
+
+    it("does not modify archived entries in persisted config", async () => {
+      const projectPath = "/fake/project";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          { id: "live-1", path: "/fake/project/ws-live" },
+          { id: "archived-1", path: "/fake/project/ws-archived", archivedAt: ARCHIVED_AT },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      service.list();
+
+      // The projection must not leak into the in-memory or persisted config:
+      // archived entries stay on disk for older builds (downgrade safety).
+      const after = config.loadConfigOrDefault();
+      expect(after.projects.get(projectPath)?.workspaces.map((workspace) => workspace.id)).toEqual([
+        "live-1",
+        "archived-1",
+      ]);
+    });
+  });
+
+  describe("getRemovalBlockers", () => {
+    it("counts own-bucket and cross-project blockers without mutating config", async () => {
+      const projectPath = "/fake/project";
+      const otherPath = "/fake/other";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [
+          // Missing checkout directory on purpose: unlike remove(), the
+          // preflight must not prune stale entries (or delete the project).
+          { id: "stale-live", path: path.join(tempDir, "missing-checkout") },
+          { id: "own-archived", path: path.join(tempDir, "archived"), archivedAt: ARCHIVED_AT },
+        ],
+      });
+      cfg.projects.set(otherPath, {
+        workspaces: [
+          {
+            id: "cross-ref",
+            path: path.join(tempDir, "cross"),
+            projects: [
+              { projectPath: otherPath, projectName: "other" },
+              { projectPath, projectName: "project" },
+            ],
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const counts = service.getRemovalBlockers(projectPath);
+
+      expect(counts).toEqual({ activeCount: 2, archivedCount: 1 });
+      const after = config.loadConfigOrDefault();
+      expect(after.projects.get(projectPath)?.workspaces.map((ws) => ws.id)).toEqual([
+        "stale-live",
+        "own-archived",
+      ]);
+    });
+
+    it("returns zero counts for unknown projects", () => {
+      expect(service.getRemovalBlockers("/no/such/project")).toEqual({
+        activeCount: 0,
+        archivedCount: 0,
+      });
+    });
+  });
+
+  // #5926: stored keys that normalize to the same path ("/fake/merged" and "/fake/merged/") load
+  // as one project. Trust and remove must act on that one project and leave no alias behind.
+  describe("aliased project keys", () => {
+    async function writeAliasedProject(): Promise<void> {
+      const rows = ["ws-a", "ws-b"].map((id) => ({ id, name: id, path: path.join(tempDir, id) }));
+      for (const row of rows) await fs.mkdir(row.path, { recursive: true });
+      await fs.writeFile(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/fake/merged/", { workspaces: [rows[0]] }],
+            ["/fake/merged", { workspaces: [rows[1]] }],
+          ],
+        })
+      );
+    }
+
+    async function storedProjectKeys(): Promise<string[]> {
+      const saved = JSON.parse(await fs.readFile(path.join(tempDir, "config.json"), "utf-8")) as {
+        projects: Array<[string, unknown]>;
+      };
+      return saved.projects.map(([key]) => key);
+    }
+
+    it("keeps a trust change on a merged project through a reload", async () => {
+      await writeAliasedProject();
+
+      await service.setTrust("/fake/merged/", true);
+
+      expect(await storedProjectKeys()).toEqual(["/fake/merged"]);
+      const reloaded = new Config(tempDir).loadConfigOrDefault().projects.get("/fake/merged");
+      expect(reloaded?.trusted).toBe(true);
+      expect(reloaded?.workspaces.map((workspace) => workspace.id)).toEqual(["ws-a", "ws-b"]);
+    });
+
+    it("removes a merged project with no alias left behind", async () => {
+      await writeAliasedProject();
+      service.setWorkspaceService({
+        remove: async (workspaceId) => {
+          await config.removeWorkspace(workspaceId);
+          return Ok(undefined);
+        },
+      });
+
+      const result = await service.remove("/fake/merged/", true);
+
+      expect(result.success).toBe(true);
+      expect(await storedProjectKeys()).toEqual([]);
+      expect([...new Config(tempDir).loadConfigOrDefault().projects.keys()]).toEqual([]);
+    });
+  });
+
   describe("remove", () => {
-    it("removes project with no workspaces", async () => {
+    it("force removal fails fast on cross-project references without deleting owned workspaces", async () => {
+      const projectPath = "/fake/project";
+      const otherPath = "/fake/other";
+      const ownWorkspaceDir = path.join(tempDir, "owned-workspace");
+      await fs.mkdir(ownWorkspaceDir, { recursive: true });
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, {
+        workspaces: [{ id: "owned-1", path: ownWorkspaceDir }],
+      });
+      cfg.projects.set(otherPath, {
+        workspaces: [
+          {
+            id: "cross-ref",
+            path: path.join(tempDir, "cross"),
+            projects: [
+              { projectPath: otherPath, projectName: "other" },
+              { projectPath, projectName: "project" },
+            ],
+          },
+        ],
+      });
+      await config.editConfig(() => cfg);
+
+      const removedWorkspaceIds: string[] = [];
+      service.setWorkspaceService({
+        remove: async (workspaceId) => {
+          removedWorkspaceIds.push(workspaceId);
+          await config.removeWorkspace(workspaceId);
+          return Ok(undefined);
+        },
+      });
+
+      const result = await service.remove(projectPath, true);
+
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected failure");
+      expect(result.error).toEqual({
+        type: "workspace_blockers",
+        activeCount: 2,
+        archivedCount: 0,
+      });
+      // The cascade must not have started: a partial deletion would destroy
+      // owned workspaces and still leave the project registered.
+      expect(removedWorkspaceIds).toEqual([]);
+      const after = config.loadConfigOrDefault();
+      expect(after.projects.get(projectPath)?.workspaces.map((ws) => ws.id)).toEqual(["owned-1"]);
+    });
+
+    it("removes project with no workspaces and deletes its creation drafts", async () => {
       const projectPath = "/fake/project";
       const cfg = config.loadConfigOrDefault();
       cfg.projects.set(projectPath, { workspaces: [] });
       await config.editConfig(() => cfg);
+      const draftService = new CreationDraftService(config);
+      service.setDraftCleaner(draftService);
+      const scope = { kind: "creation" as const, draftId: "draft-1" };
+      await draftService.update({ scope, projectPath, text: "unsent" });
 
       const result = await service.remove(projectPath);
 
       expect(result.success).toBe(true);
+      // The removing renderer clears the localStorage keys of these drafts.
+      expect(result.success && result.data.removedCreationDrafts).toEqual([
+        { projectPath, draftId: "draft-1" },
+      ]);
       const after = config.loadConfigOrDefault();
       expect(after.projects.has(projectPath)).toBe(false);
+      // Removal cleans the draft files server-side, whichever client (if any) removed it.
+      expect(await fs.readdir(path.join(config.rootDir, "creation-drafts"))).toEqual([]);
+      expect((await draftService.list()).drafts).toEqual([]);
+    });
+
+    it.each([
+      ["the sub-project", "/fake/parent/packages/child"],
+      ["its parent", "/fake/parent"],
+    ])("deletes a sub-project's creation drafts when removing %s", async (_name, removedPath) => {
+      const parentPath = "/fake/parent";
+      const childPath = "/fake/parent/packages/child";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(parentPath, { workspaces: [] });
+      cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
+      await config.editConfig(() => cfg);
+      const draftService = new CreationDraftService(config);
+      service.setDraftCleaner(draftService);
+      const scope = { kind: "creation" as const, draftId: "draft-1" };
+      await draftService.update({ scope, projectPath: childPath, text: "unsent" });
+
+      const result = await service.remove(removedPath);
+
+      expect(result.success && result.data.removedCreationDrafts).toEqual([
+        { projectPath: childPath, draftId: "draft-1" },
+      ]);
+      expect(await fs.readdir(path.join(config.rootDir, "creation-drafts"))).toEqual([]);
+      expect((await draftService.list()).drafts).toEqual([]);
     });
 
     it("returns project_not_found for unknown project", async () => {
@@ -2029,21 +3003,425 @@ exit 1
       expect(result.error.type).toBe("project_not_found");
     });
 
-    it("reports cascade-removed sub-project paths so callers can drop per-path state", async () => {
-      // Retained MCP trust is keyed by path; omitting a cascaded child here
-      // would let a re-registered path inherit the removed project's grant.
+    it("waits for a settings-backup restore holding the registration lock", async () => {
+      const projectPath = "/fake/project";
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(projectPath, { workspaces: [] });
+      await config.editConfig(() => cfg);
+
+      // A restore writing this project's matched memory holds the lock; the removal must
+      // land after it, never between its registration read and its memory write.
+      const held = Promise.withResolvers<void>();
+      const lockAcquired = Promise.withResolvers<void>();
+      const holding = withProjectRegistrationLock(tempDir, async () => {
+        lockAcquired.resolve();
+        await held.promise;
+      });
+      await lockAcquired.promise;
+
+      let removed = false;
+      const removing = service.remove(projectPath).then((result) => {
+        removed = true;
+        return result;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(removed).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(true);
+
+      held.resolve();
+      await holding;
+      expect((await removing).success).toBe(true);
+      expect(config.loadConfigOrDefault().projects.has(projectPath)).toBe(false);
+    });
+
+    it("lets a backup import register and write inside one registration window", async () => {
+      const existing = "/fake/existing";
+      const target = path.join(tempDir, "imported");
+      await fs.mkdir(target);
+      const cfg = config.loadConfigOrDefault();
+      cfg.projects.set(existing, { workspaces: [] });
+      await config.editConfig(() => cfg);
+
+      const inside = Promise.withResolvers<void>();
+      const proceed = Promise.withResolvers<void>();
+      let removed = false;
+      const window = service.withRegistrationLock(async ({ create }) => {
+        // create() registers within the window rather than deadlocking on its own lock.
+        const created = await create(target);
+        expect(created.success).toBe(true);
+        inside.resolve();
+        await proceed.promise;
+        // A removal requested meanwhile has not landed: the registry is stable until the
+        // window closes, so an import writing memory here cannot lose its project.
+        expect(removed).toBe(false);
+        expect(config.loadConfigOrDefault().projects.has(existing)).toBe(true);
+      });
+      await inside.promise;
+      const removing = service.remove(existing).then((result) => {
+        removed = true;
+        return result;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      proceed.resolve();
+      await window;
+
+      expect((await removing).success).toBe(true);
+      expect(config.loadConfigOrDefault().projects.has(existing)).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
+    });
+
+    it("gates every registration path through Config, not just create and remove", async () => {
+      // setTrust registers a missing entry as a side effect — one of several writers that
+      // add a project key without going through create(). Config.editConfig serializes it
+      // with the restore window all the same — as it does every edit, since each one saves
+      // the whole config.
+      const unregistered = "/fake/trusted-later";
+      const held = Promise.withResolvers<void>();
+      const lockAcquired = Promise.withResolvers<void>();
+      const holding = withProjectRegistrationLock(tempDir, async () => {
+        lockAcquired.resolve();
+        await held.promise;
+      });
+      await lockAcquired.promise;
+
+      let trusted = false;
+      const trusting = service.setTrust(unregistered, true).then(() => {
+        trusted = true;
+      });
+      let valueSaved = false;
+      const valueEdit = config
+        .editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }))
+        .then(() => {
+          valueSaved = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(trusted).toBe(false);
+      expect(valueSaved).toBe(false);
+      expect(config.loadConfigOrDefault().projects.has(unregistered)).toBe(false);
+
+      held.resolve();
+      await holding;
+      await Promise.all([trusting, valueEdit]);
+      expect(config.loadConfigOrDefault().projects.get(unregistered)?.trusted).toBe(true);
+      expect(config.loadConfigOrDefault().llmDebugLogs).toBe(true);
+    });
+
+    it("waits for another process's registration hold and re-reads config under it", async () => {
+      // The cross-process leg, as `mux trust` or a restore in another process would hold it.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      let transformRuns = 0;
+      let registered = false;
+      const registering = config
+        .editConfig((cfg) => {
+          transformRuns += 1;
+          cfg.projects.set("/fake/from-this-process", { workspaces: [] });
+          return cfg;
+        })
+        .then(() => {
+          registered = true;
+        });
+      // A window in this process waits too.
+      let windowRan = false;
+      const window = withProjectRegistrationLock(tempDir, () => {
+        windowRan = true;
+        return Promise.resolve();
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(registered).toBe(false);
+      expect(windowRan).toBe(false);
+
+      // The other process registers a project while ours waits: our transform must run on
+      // those bytes — once, under the lock — or a pre-wait snapshot would clobber that
+      // registration.
+      const otherConfig = new Config(tempDir);
+      await otherConfig.editConfig(
+        (cfg) => {
+          cfg.projects.set("/fake/from-other-process", { workspaces: [] });
+          return cfg;
+        },
+        { withinRegistrationLock: otherProcess }
+      );
+      await otherProcess[Symbol.asyncDispose]();
+      await registering;
+      await window;
+
+      expect(transformRuns).toBe(1);
+      const projects = config.loadConfigOrDefault().projects;
+      expect(projects.has("/fake/from-this-process")).toBe(true);
+      expect(projects.has("/fake/from-other-process")).toBe(true);
+    });
+
+    it("validates a new project without holding the registration lock", async () => {
+      const target = path.join(tempDir, "validated-unlocked");
+      await fs.mkdir(target);
+      // Another process holds the lock throughout the validation. Every config save waits
+      // for that lock, so a create that took it around its stats, realpath, and git probes
+      // would hold up unrelated saves for as long as a slow filesystem keeps it busy.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      // The path resolution is the last filesystem probe of the validation; the registering
+      // write is the first thing the lock covers.
+      const realpath = spyOn(fs, "realpath");
+      const editConfig = spyOn(config, "editConfig");
+      const creating = service.create(target);
+      const deadline = Date.now() + 2_000;
+      while (realpath.mock.calls.length === 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      // Validated while the lock is still held elsewhere, but not yet registering.
+      expect(realpath).toHaveBeenCalledWith(target);
+      expect(editConfig).not.toHaveBeenCalled();
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
+
+      await otherProcess[Symbol.asyncDispose]();
+      expect((await creating).success).toBe(true);
+      expect(editConfig).toHaveBeenCalledTimes(1);
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
+      realpath.mockRestore();
+    });
+
+    it("does not git-initialize a directory an import registers while it waits for the lock", async () => {
+      const target = path.join(tempDir, "imported-empty");
+      await fs.mkdir(target);
+      const initializeGit = spyOn(
+        service as unknown as { initializeGitRepository: () => unknown },
+        "initializeGitRepository"
+      );
+      // A restore window registers the same empty directory as an import target while an
+      // initGit create of it waits for the lock. The create must fail as a duplicate without
+      // having run `git init` there: initializing and rolling back inside a directory that
+      // is the import's by then would touch the imported project's checkout.
+      const windowOpen = Promise.withResolvers<void>();
+      const proceed = Promise.withResolvers<void>();
+      const window = service.withRegistrationLock(async ({ create }) => {
+        windowOpen.resolve();
+        await proceed.promise;
+        expect((await create(target)).success).toBe(true);
+      });
+      await windowOpen.promise;
+      const creating = service.create(target, { initGit: true });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      proceed.resolve();
+      await window;
+
+      const result = await creating;
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toBe("Project already exists");
+      expect(initializeGit).not.toHaveBeenCalled();
+      expect(await fs.lstat(path.join(target, ".git")).catch(() => null)).toBeNull();
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(true);
+    });
+
+    it("rolls back git init when the registering write finds the hold reclaimed", async () => {
+      const target = path.join(tempDir, "reclaimed-init");
+      await fs.mkdir(target);
+      const result = await service.withRegistrationLock(async ({ create }) => {
+        // Displaced while git init runs, by a holder whose pid is dead: the registering
+        // write's ownership check refuses, and the rollback's own hold can reclaim the lock.
+        await fs.writeFile(projectRegistrationLockFilePath(tempDir), "9999999:reclaimed", "utf-8");
+        return create(target, { initGit: true });
+      });
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("no longer owned");
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
+      // Left behind, the .git would fail every retry on the non-empty-directory check.
+      expect(await fs.lstat(path.join(target, ".git")).catch(() => null)).toBeNull();
+      expect((await service.create(target, { initGit: true })).success).toBe(true);
+    });
+
+    it("keeps a directory registered under another spelling while its hold was reclaimed", async () => {
+      const target = path.join(tempDir, "reclaimed-target");
+      const alias = path.join(tempDir, "reclaimed-alias");
+      await fs.symlink(target, alias, "dir");
+      const result = await service.withRegistrationLock(async ({ create }) => {
+        await fs.writeFile(projectRegistrationLockFilePath(tempDir), "9999999:reclaimed", "utf-8");
+        // The process that reclaimed the lock registered the same directory through a
+        // symlink: neither spelling create() knows is a registry key.
+        await new Config(tempDir).editConfig((cfg) => {
+          cfg.projects.set(alias, { workspaces: [] });
+          return cfg;
+        }, REGISTER_CONCURRENTLY);
+        return create(target, { initGit: true });
+      });
+      expect(result.success).toBe(false);
+      expect(!result.success && result.error).toContain("no longer owned");
+      // The directory this request created is the winner's checkout now and stays; only the
+      // .git the request initialized into it goes.
+      expect((await fs.stat(target)).isDirectory()).toBe(true);
+      expect(await fs.lstat(path.join(target, ".git")).catch(() => null)).toBeNull();
+      expect(config.loadConfigOrDefault().projects.has(alias)).toBe(true);
+    });
+
+    it("refuses to register once another process has displaced the registration lock", async () => {
+      const target = path.join(tempDir, "displaced");
+      await fs.mkdir(target);
+      // A holder frozen past the lease is judged stale and displaced; when it resumes, its
+      // registration must not commit as if it still held the lock.
+      const result = await service.withRegistrationLock(async ({ create }) => {
+        await fs.writeFile(projectRegistrationLockFilePath(tempDir), "another holder", "utf-8");
+        return create(target);
+      });
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected failure");
+      expect(result.error).toContain("no longer owned");
+      expect(config.loadConfigOrDefault().projects.has(target)).toBe(false);
+    });
+
+    it("covers an edit that leaves the project set alone against another process's write", async () => {
+      // Every edit persists the whole config from the bytes it read, so a registration made
+      // by another process between this edit's read and its write would be dropped unless
+      // the edit, too, runs under the cross-process lock.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      let saved = false;
+      const saving = config
+        .editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }))
+        .then(() => {
+          saved = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(saved).toBe(false);
+
+      const otherConfig = new Config(tempDir);
+      await otherConfig.editConfig(
+        (cfg) => {
+          cfg.projects.set("/fake/registered-meanwhile", { workspaces: [] });
+          return cfg;
+        },
+        { withinRegistrationLock: otherProcess }
+      );
+      await otherProcess[Symbol.asyncDispose]();
+      await saving;
+
+      const after = config.loadConfigOrDefault();
+      expect(after.llmDebugLogs).toBe(true);
+      expect(after.projects.has("/fake/registered-meanwhile")).toBe(true);
+    });
+
+    it("does not let a value-only edit slip past a foreign hold while another edit waits for it", async () => {
+      // A registration edit waiting for another process's hold must not make a concurrent
+      // value-only edit believe this process holds the lock: both have to wait, or the
+      // value-only edit's whole-config save drops what the other process registers.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      let registered = false;
+      const registering = config
+        .editConfig((cfg) => {
+          cfg.projects.set("/fake/waiting-registration", { workspaces: [] });
+          return cfg;
+        })
+        .then(() => {
+          registered = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(registered).toBe(false);
+      let valueSaved = false;
+      const valueEdit = config
+        .editConfig((cfg) => ({ ...cfg, llmDebugLogs: true }))
+        .then(() => {
+          valueSaved = true;
+        });
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(valueSaved).toBe(false);
+
+      const otherConfig = new Config(tempDir);
+      await otherConfig.editConfig(
+        (cfg) => {
+          cfg.projects.set("/fake/from-other-process", { workspaces: [] });
+          return cfg;
+        },
+        { withinRegistrationLock: otherProcess }
+      );
+      await otherProcess[Symbol.asyncDispose]();
+      await Promise.all([registering, valueEdit]);
+
+      const after = config.loadConfigOrDefault();
+      expect(after.llmDebugLogs).toBe(true);
+      expect(after.projects.has("/fake/waiting-registration")).toBe(true);
+      expect(after.projects.has("/fake/from-other-process")).toBe(true);
+    });
+
+    it("returns an Err when the registration lock cannot be taken", async () => {
+      const target = path.join(tempDir, "locked-out");
+      await fs.mkdir(target);
+      // The lock directory is a file, so the cross-process leg cannot be created.
+      await fs.mkdir(path.dirname(projectRegistrationLockFilePath(tempDir)), { recursive: true });
+      await fs.rm(path.dirname(projectRegistrationLockFilePath(tempDir)), { recursive: true });
+      await fs.writeFile(path.dirname(projectRegistrationLockFilePath(tempDir)), "file", "utf-8");
+
+      const result = await service.create(target);
+      expect(result.success).toBe(false);
+      if (result.success) throw new Error("Expected failure");
+      expect(result.error).toContain("Failed to create project");
+    });
+
+    // #4746: secrets are irreversible, so they may only be deleted after the config
+    // write that forgets the project lands. A failed write must leave both intact.
+    for (const kind of ["sub-project", "project"] as const) {
+      it(`keeps ${kind} secrets when the removal's config write fails`, async () => {
+        const parentPath = "/fake/parent";
+        const childPath = "/fake/parent/packages/api";
+        const targetPath = kind === "sub-project" ? childPath : parentPath;
+        const cfg = config.loadConfigOrDefault();
+        cfg.projects.set(parentPath, { workspaces: [] });
+        cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
+        await config.editConfig(() => cfg);
+        const secret = { key: "TOKEN", value: "kept" };
+        expect((await service.updateSecrets(targetPath, [secret])).success).toBe(true);
+
+        const realRename = cjsFs.rename.bind(cjsFs);
+        const renameSpy = spyOn(cjsFs, "rename").mockImplementation(((
+          from: cjsFs.PathLike,
+          to: cjsFs.PathLike,
+          callback: cjsFs.NoParamCallback
+        ) => {
+          if (path.basename(String(to)) === "config.json") {
+            callback(Object.assign(new Error("EROFS: read-only file system"), { code: "EROFS" }));
+            return;
+          }
+          realRename(from, to, callback);
+        }) as typeof cjsFs.rename);
+        let result: Awaited<ReturnType<ProjectService["remove"]>>;
+        try {
+          result = await service.remove(targetPath);
+        } finally {
+          renameSpy.mockRestore();
+        }
+
+        expect(result.success).toBe(false);
+        expect(config.loadConfigOrDefault().projects.has(targetPath)).toBe(true);
+        expect(service.getSecrets(targetPath)).toEqual([secret]);
+      });
+    }
+
+    it("forgets retained trust for cascade-removed sub-projects", async () => {
       const parentPath = "/fake/parent";
       const childPath = "/fake/parent/packages/api";
+      const forgottenPaths: string[] = [];
+      service.setMcpServerManager({
+        applyProjectTrust: () => undefined,
+        forgetProjectTrust: (projectPath) => forgottenPaths.push(projectPath),
+      });
       const cfg = config.loadConfigOrDefault();
       cfg.projects.set(parentPath, { workspaces: [] });
       cfg.projects.set(childPath, { workspaces: [], parentProjectPath: parentPath });
       await config.editConfig(() => cfg);
 
-      const result = await service.remove(parentPath);
-
-      expect(result.success).toBe(true);
-      if (!result.success) throw new Error("Expected success");
-      expect(result.data.removedProjectPaths.sort()).toEqual([parentPath, childPath]);
+      expect((await service.remove(parentPath)).success).toBe(true);
+      expect(forgottenPaths.sort()).toEqual([parentPath, childPath]);
       const after = config.loadConfigOrDefault();
       expect(after.projects.has(parentPath)).toBe(false);
       expect(after.projects.has(childPath)).toBe(false);
@@ -2178,7 +3556,10 @@ exit 1
       await config.editConfig(() => cfg);
 
       const legacyWorkspaceId = config.generateLegacyId(projectPath, archivedWorkspaceDir);
-      const metadataPath = path.join(config.getSessionDir(legacyWorkspaceId), "metadata.json");
+      const metadataPath = path.join(
+        path.join(config.sessionsDir, legacyWorkspaceId),
+        "metadata.json"
+      );
       await fs.mkdir(path.dirname(metadataPath), { recursive: true });
       await fs.writeFile(
         metadataPath,

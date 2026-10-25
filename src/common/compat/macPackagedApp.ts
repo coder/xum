@@ -8,8 +8,8 @@
  * and `electronMac.createMacApp` renames Electron.app to `${productFilename}.app`.
  *
  * Do not infer the bundle name from `productName` casing. Default macOS
- * volumes fold case, so `stat("shux.app")` can succeed even when `readdir`
- * stored `Shux.app`.
+ * volumes fold case, so `stat("xum.app")` can succeed even when `readdir`
+ * stored `Xum.app`.
  */
 export function resolveMacPackagedAppNames(build: {
   productName?: string;

@@ -1,12 +1,51 @@
 import { tool } from "ai";
 
+import type { AgentSkillDescriptor, InvocableSkill } from "@/common/types/agentSkill";
 import type { AgentSkillReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
-import { SkillNameSchema } from "@/common/orpc/schemas";
+import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
+import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import { getErrorMessage } from "@/common/utils/errors";
-import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
+import type { Runtime } from "@/node/runtime/Runtime";
+import {
+  readAgentSkill,
+  type ResolvedAgentSkill,
+} from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  resolveSkillDirectory,
+  substituteSkillDirectoryPlaceholders,
+} from "@/node/services/agentSkills/skillDirectory";
+import {
+  pluginSiblingNoteFor,
+  prependPluginSiblingNote,
+} from "@/node/services/agentSkills/pluginSiblingNote";
+
+/** Single-line skill description for the index, cut with an ellipsis past the cap. */
+export function formatSkillIndexDescription(description: string): string {
+  const singleLine = description.replace(/\s+/g, " ").trim();
+  if (singleLine.length <= AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS) {
+    return singleLine;
+  }
+  let end = AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS - 1;
+  // A lone high surrogate would make providers reject every request carrying this tool block.
+  const last = singleLine.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${singleLine.slice(0, end).trimEnd()}…`;
+}
+
+/**
+ * Whether a skill belongs in the static index. Unadvertised skills (advertise: false or
+ * disable-model-invocation: true, normalized into descriptor.advertise) stay out and can
+ * still be invoked via /skill-name or agent_skill_read. Path-scoped skills (`paths`
+ * frontmatter) stay out too: like Cursor and Claude Code, they surface only once a file
+ * tool touches a matching file (pathSkillActivation.ts), and stay readable by name.
+ */
+function isIndexedSkill(skill: AgentSkillDescriptor): boolean {
+  return skill.advertise !== false && skill.paths === undefined;
+}
 
 /**
  * Build dynamic agent_skill_read tool description with available skills.
@@ -14,14 +53,27 @@ import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillSto
  * so the model sees them adjacent to the tool call schema.
  */
 function buildSkillReadDescription(config: ToolConfiguration): string {
-  const baseDescription = TOOL_DEFINITIONS.agent_skill_read.description;
-  // Filter out unadvertised skills (advertise: false or disable-model-invocation: true,
-  // normalized into descriptor.advertise) from the tool description.
-  // Unadvertised skills can still be invoked via /skill-name or agent_skill_read.
-  const skills = (config.availableSkills ?? []).filter((s) => s.advertise !== false);
+  const { prefix, block } = skillIndexSectionFor(config.availableSkills);
+  return prefix + block;
+}
+
+/**
+ * The agent_skill_read description split at its "Available skills" part (block, "" without
+ * skills). The request assembler keeps that block frozen inside a context segment
+ * (planSkillIndex), so a skill added mid-session does not rewrite the cached tool block.
+ */
+export function skillIndexSectionFor(availableSkills: readonly InvocableSkill[] | undefined) {
+  return {
+    prefix: TOOL_DEFINITIONS.agent_skill_read.description,
+    block: buildSkillIndexSection(availableSkills),
+  };
+}
+
+function buildSkillIndexSection(availableSkills: readonly InvocableSkill[] | undefined) {
+  const skills = (availableSkills ?? []).filter(isIndexedSkill);
 
   if (skills.length === 0) {
-    return baseDescription;
+    return "";
   }
 
   const MAX_SKILLS = 50;
@@ -29,7 +81,7 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
   const omitted = skills.length - shown.length;
 
   const skillLines = shown.map((skill) => {
-    const line = `- ${skill.name}: ${skill.description} (scope: ${skill.scope})`;
+    const line = `- ${skill.name}: ${formatSkillIndexDescription(skill.description)} (scope: ${skill.scope})`;
     // whenToUse (when_to_use/when-to-use frontmatter) is extra model-facing guidance;
     // keep it on the same index line to stay token-lean.
     return skill.whenToUse == null ? line : `${line} When to use: ${skill.whenToUse}`;
@@ -38,9 +90,36 @@ function buildSkillReadDescription(config: ToolConfiguration): string {
     skillLines.push(`(+${omitted} more not shown)`);
   }
 
-  const usageHint = `\nTo read referenced files inside a skill directory:\n- agent_skill_read_file({ name: "<skill-name>", filePath: "references/whatever.txt" })`;
+  return `\n\nAvailable skills:\n${skillLines.join("\n")}`;
+}
 
-  return `${baseDescription}\n\nAvailable skills:\n${skillLines.join("\n")}${usageHint}`;
+/**
+ * Skills that ship scripts locate themselves through skillDir (or the
+ * ${CLAUDE_SKILL_DIR} placeholder) instead of a hard-coded install path.
+ */
+function buildSkillReadSuccess(
+  resolved: ResolvedAgentSkill,
+  workspaceRuntime: Runtime,
+  availableSkills: readonly InvocableSkill[] | undefined
+): AgentSkillReadToolResult {
+  const dir = resolveSkillDirectory(resolved, workspaceRuntime);
+  const location = dir.available
+    ? { skillDir: dir.skillDir, ...(dir.pluginRoot != null ? { pluginRoot: dir.pluginRoot } : {}) }
+    : { skillDirUnavailable: dir.reason };
+  // A plugin skill's bare references to its siblings must reach the plugin's
+  // own skills, not higher-precedence skills with the same name.
+  const siblingNote = pluginSiblingNoteFor(resolved, availableSkills);
+  return {
+    success: true,
+    skill: {
+      ...resolved.package,
+      body: prependPluginSiblingNote(
+        substituteSkillDirectoryPlaceholders(resolved.package.body, dir),
+        siblingNote
+      ),
+    },
+    ...location,
+  };
 }
 
 /**
@@ -61,41 +140,34 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
       }
 
       // Defensive: validate again even though inputSchema should guarantee shape.
-      const parsedName = SkillNameSchema.safeParse(name);
-      if (!parsedName.success) {
+      // The schema regex cannot express the full plugin-name grammar.
+      if (parseSkillLookupName(name) == null) {
         return {
           success: false,
-          error: parsedName.error.message,
+          error: `Invalid skill name: ${name}`,
         };
       }
 
       try {
         // claude-skills-compat experiment: allow reading skills discovered from .claude roots.
         const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
-        // agent-plugins experiment: allow reading skills discovered from Agent Plugins.
-        const includeAgentPlugins = config.experiments?.agentPlugins === true;
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
+          runtimeFactory: toolRuntimeFactory(config),
           workspacePath,
-          muxScope: config.muxScope ?? null,
+          xumScope: config.xumScope ?? null,
           includeClaudeSkills,
-          includeAgentPlugins,
         });
-        const resolved = await readAgentSkill(
-          skillCtx.runtime,
-          skillCtx.workspacePath,
-          parsedName.data,
-          {
-            roots: skillCtx.roots,
-            containment: skillCtx.containment,
-            includeClaudeSkills,
-            includeAgentPlugins,
-          }
-        );
-        return {
-          success: true,
-          skill: resolved.package,
-        };
+        const resolved = await readAgentSkill(skillCtx.runtime, skillCtx.workspacePath, name, {
+          roots: skillCtx.roots,
+          containment: skillCtx.containment,
+          runtimeFactory: toolRuntimeFactory(config),
+          includeClaudeSkills,
+        });
+        // Judged against config.runtime: that is where the model's bash runs.
+        // availableSkills is this turn's invocable list from the same skill
+        // storage context, so the sibling note costs no extra discovery.
+        return buildSkillReadSuccess(resolved, config.runtime, config.availableSkills);
       } catch (error) {
         return {
           success: false,

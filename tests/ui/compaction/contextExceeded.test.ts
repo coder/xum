@@ -17,7 +17,6 @@ import {
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
 import { cleanupView, setupWorkspaceView } from "../helpers";
-import type { APIClient } from "@/browser/contexts/API";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { setupProviders } from "../../ipc/setup";
 
@@ -36,8 +35,7 @@ describeIntegration("Context exceeded compaction suggestion (UI)", () => {
     await withSharedWorkspace("openai", async ({ env, workspaceId, metadata }) => {
       const cleanupDom = installDom();
 
-      const apiClient = env.orpc as unknown as APIClient;
-      const view = renderApp({ apiClient, metadata });
+      const view = renderApp({ apiClient: env.orpc, metadata });
 
       try {
         await setupWorkspaceView(view, metadata, workspaceId);
@@ -45,7 +43,7 @@ describeIntegration("Context exceeded compaction suggestion (UI)", () => {
         // Ensure the workspace view (and chat subscription) is live before sending.
         await waitFor(
           () => {
-            const el = view.container.querySelector('textarea[aria-label="Message Claude"]');
+            const el = view.container.querySelector('textarea[aria-label="Message"]');
             if (!el) throw new Error("Chat textarea not found");
           },
           { timeout: 10_000 }
@@ -92,8 +90,7 @@ describeIntegration("Context exceeded compaction suggestion (UI)", () => {
 
       const expectedCompactionCommand = `/compact -m ${KNOWN_MODELS.HAIKU.id}`;
 
-      const apiClient = env.orpc as unknown as APIClient;
-      const view = renderApp({ apiClient, metadata });
+      const view = renderApp({ apiClient: env.orpc, metadata });
 
       try {
         await setupWorkspaceView(view, metadata, workspaceId);
@@ -101,7 +98,7 @@ describeIntegration("Context exceeded compaction suggestion (UI)", () => {
         // Ensure the workspace view (and chat subscription) is live before sending.
         await waitFor(
           () => {
-            const el = view.container.querySelector('textarea[aria-label="Message Claude"]');
+            const el = view.container.querySelector('textarea[aria-label="Message"]');
             if (!el) throw new Error("Chat textarea not found");
           },
           { timeout: 10_000 }

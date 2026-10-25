@@ -20,7 +20,7 @@ export function isWindowsUnusableSegment(segment: string): boolean {
 /**
  * The managed subdirectory scopes every write and every `git clean`, so it must be a
  * real subdirectory. `.`, `..`, absolute paths, and backslashes would let a backup
- * reach outside the directory Shux is allowed to own.
+ * reach outside the directory Xum is allowed to own.
  */
 export function isValidBackupPath(value: string): boolean {
   const segments = value.split("/").filter((segment) => segment !== "");
@@ -49,7 +49,7 @@ const INVALID_GIT_REF_CHARACTERS: ReadonlySet<string> = new Set([
   "\\",
 ]);
 
-/** Shux prefixes branch names with `refs/heads/`, so callers must provide an unqualified name. */
+/** Xum prefixes branch names with `refs/heads/`, so callers must provide an unqualified name. */
 export function isValidBackupBranch(value: string): boolean {
   if (
     value === "" ||
@@ -198,11 +198,147 @@ export function hasUrlCredentials(repoUrl: string): boolean {
   }
 }
 
+/** Bounds project-bundle manifest parsing work, mirroring the MCP redaction caps. */
+export const MAX_BACKUP_PROJECT_ENTRIES = 256;
+
+/**
+ * A recorded project remote is display-only data on restore, but it still travels through a
+ * repository other people may read, and a crafted bundle could try to smuggle an executable
+ * remote (`ext::`), a local path, or an embedded credential back into the UI. Only plain
+ * `http(s)`, `ssh`, and scp-like `user@host:path` shapes survive; anything else is dropped
+ * rather than rejected, because a remote is a hint and never worth failing an export or a
+ * restore over.
+ */
+export function sanitizeBackupGitRemote(rawUrl: string): string | undefined {
+  const url = rawUrl.trim();
+  if (url === "" || url.length > 2048) return undefined;
+  // Control characters and whitespace have no place in a remote URL and are how command
+  // injection into a later shell paste would start.
+  // eslint-disable-next-line no-control-regex
+  if (/[\s\u0000-\u001f\u007f]/.test(url)) return undefined;
+  // Percent-escapes would let a credential pattern hide from the publish-time secret scan
+  // (which sees the manifest text, not its decoded form); real remotes do not need them.
+  if (/%[0-9A-Fa-f]{2}/.test(url)) return undefined;
+  if (hasUrlCredentials(url)) return undefined;
+  if (/^(?:https?|ssh):\/\/[^/]+/i.test(url)) return url;
+  // scp-like `user@host:path`. A scheme prefix was handled above, and a single-letter
+  // prefix would be a Windows drive path rather than a host.
+  if (/^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^/][^\s]*$/.test(url) && !url.includes("::")) return url;
+  return undefined;
+}
+
+/**
+ * One project entry in the opt-in project bundle. `path` is the absolute path on the
+ * machine that exported the backup — an import hint only, never a write target on this
+ * one. `memoryDir` records the actual memory directory name of the source install;
+ * restore destinations are always recomputed locally from the target path.
+ */
+// Per-field caps because the manifest is repository-controlled: without them a crafted,
+// otherwise valid manifest could put megabytes into one name or path and push that through
+// hashing, IPC, and renderer text nodes. The bounds are generous for real values — paths
+// beat every platform default and the remote cap matches sanitizeBackupGitRemote's.
+/**
+ * Cap on a recorded project path. Also the cap on an import's target path: the local
+ * recovery copy a later matched restore writes records the local project path in this same
+ * schema, so a target this build could not record would fail every later restore of it.
+ */
+export const MAX_BACKUP_PROJECT_PATH_CHARS = 1024;
+
+export const BackupProjectBundleEntrySchema = z.object({
+  path: z.string().min(1).max(MAX_BACKUP_PROJECT_PATH_CHARS),
+  name: z.string().min(1).max(256),
+  gitRemote: z.string().max(2048).optional(),
+  memoryDir: z.string().min(1),
+});
+
+export const BackupProjectBundleManifestSchema = z.object({
+  schemaVersion: z.literal(1),
+  projects: z.array(BackupProjectBundleEntrySchema).max(MAX_BACKUP_PROJECT_ENTRIES),
+  files: z.array(
+    z.object({
+      // Capped like the entry fields: an unbounded path would reach lstat (whose error
+      // message echoes it) and the renderer before any shape validation ran.
+      path: z.string().min(1).max(1024),
+      sha256: z.string().regex(/^[0-9a-f]{64}$/),
+    })
+  ),
+});
+
+export type BackupProjectBundleEntry = z.infer<typeof BackupProjectBundleEntrySchema>;
+export type BackupProjectBundleManifest = z.infer<typeof BackupProjectBundleManifestSchema>;
+
+/**
+ * What a backup carries, and what a restore writes; one selection governs both directions.
+ * Every flag is optional in config so an older config.json still loads; `resolveBackupContents`
+ * applies the defaults. Categories the user does not select are simply absent from the
+ * export and never written by a restore, which is how credential-bearing MCP fields (header
+ * values, stdio commands) stay out of a repository other people may read.
+ */
+const BackupContentFlagsSchema = z.object({
+  /** `AGENTS.md` */
+  includeInstructions: z.boolean().optional(),
+  /** `agents/*.md` */
+  includeAgents: z.boolean().optional(),
+  /** `skills/` */
+  includeSkills: z.boolean().optional(),
+  /** `memory/global/` */
+  includeGlobalMemory: z.boolean().optional(),
+  /** `mcp.jsonc`, limited to the fields Xum reads. */
+  includeMcp: z.boolean().optional(),
+  /** HTTP header values inside `mcp.jsonc`; excluded ones stay local. */
+  includeMcpHeaders: z.boolean().optional(),
+  /** stdio commands inside `mcp.jsonc`; excluded ones stay local. */
+  includeMcpCommands: z.boolean().optional(),
+  /** The portable subset of user preferences. */
+  includePreferences: z.boolean().optional(),
+  /**
+   * The project list and per-project memories as a `project-bundle/` sidecar, and restores
+   * of project content. Off by default, unlike the rest: project memories are private working
+   * notes and the project list reveals local paths.
+   */
+  includeProjects: z.boolean().optional(),
+  /**
+   * The global artifact shelf (`artifacts/global/`) in its own sidecar. Off by default:
+   * artifacts are agent output, not settings. Project shelves travel only with includeProjects.
+   */
+  includeGlobalArtifacts: z.boolean().optional(),
+});
+
+export type BackupContentFlag = keyof z.infer<typeof BackupContentFlagsSchema>;
+export type BackupContents = Record<BackupContentFlag, boolean>;
+
+export const BACKUP_CONTENT_DEFAULTS: BackupContents = {
+  includeInstructions: true,
+  includeAgents: true,
+  includeSkills: true,
+  includeGlobalMemory: true,
+  includeMcp: true,
+  includeMcpHeaders: true,
+  includeMcpCommands: true,
+  includePreferences: true,
+  includeProjects: false,
+  includeGlobalArtifacts: false,
+};
+
+export const BACKUP_CONTENT_FLAGS: readonly BackupContentFlag[] =
+  BackupContentFlagsSchema.keyof().options;
+
+export function resolveBackupContents(
+  flags: Partial<Record<BackupContentFlag, boolean | undefined>>
+): BackupContents {
+  const resolved = { ...BACKUP_CONTENT_DEFAULTS };
+  for (const flag of BACKUP_CONTENT_FLAGS) {
+    const value = flags[flag];
+    if (typeof value === "boolean") resolved[flag] = value;
+  }
+  return resolved;
+}
+
 /**
  * The persisted schema extends the IPC input schema so config.json cannot hold a value
  * the `getSettings` response rejects, leaving the Backup screen unable to load saved settings.
  */
-export const SettingsBackupInputSchema = z.object({
+export const SettingsBackupInputSchema = BackupContentFlagsSchema.extend({
   repoUrl: z
     .string()
     .trim()

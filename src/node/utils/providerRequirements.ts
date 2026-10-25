@@ -11,15 +11,20 @@ import { readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import {
+  GOOGLE_VERTEX_DEFAULT_LOCATION,
+  PROVIDER_DEFINITIONS,
+  type ProviderName,
+} from "@/common/constants/providers";
+import { TYPESAFE_API_KEY_ENV_VARS, TYPESAFE_PROVIDER_KEY } from "@/constants/autoModelRouting";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import type {
   BaseProviderConfig,
   BedrockProviderConfig,
   CoderProviderConfig,
-  MuxGatewayProviderConfig,
+  GoogleVertexProviderConfig,
   OpenAIProviderConfig,
 } from "@/common/config/schemas/providersConfig";
 import type { ProviderConfig, ProvidersConfig } from "@/node/config";
@@ -40,6 +45,9 @@ export const PROVIDER_ENV_VARS: Partial<
       baseUrl?: string[];
       organization?: string[];
       region?: string[];
+      project?: string[];
+      location?: string[];
+      keyFilename?: string[];
     }
   >
 > = {
@@ -63,17 +71,30 @@ export const PROVIDER_ENV_VARS: Partial<
   openrouter: {
     apiKey: ["OPENROUTER_API_KEY"],
   },
+  meta: {
+    // Prefer the namespaced key when both are set, but accept Meta's quickstart variable.
+    apiKey: ["META_MODEL_API_KEY", "MODEL_API_KEY"],
+  },
   deepseek: {
     apiKey: ["DEEPSEEK_API_KEY"],
   },
   moonshotai: {
     apiKey: ["MOONSHOT_API_KEY"],
   },
+  zai: {
+    apiKey: ["ZAI_API_KEY"],
+  },
   "github-copilot": {
     apiKey: ["GITHUB_COPILOT_TOKEN"],
   },
   bedrock: {
     region: ["AWS_REGION", "AWS_DEFAULT_REGION"],
+  },
+  "google-vertex": {
+    apiKey: ["GOOGLE_VERTEX_API_KEY"],
+    project: ["GOOGLE_VERTEX_PROJECT"],
+    location: ["GOOGLE_VERTEX_LOCATION"],
+    keyFilename: ["GOOGLE_APPLICATION_CREDENTIALS"],
   },
 };
 
@@ -94,6 +115,32 @@ export const BEDROCK_AUTH_ENV_VARS = {
   profile: "AWS_PROFILE",
 } as const;
 
+/**
+ * Secret-bearing provider env var names (API keys / auth tokens plus AWS
+ * credential material). Consumed by repo-automation-off git executions
+ * (gitNoHooksEnv) to blank provider secrets so repo-controlled processes
+ * cannot exfiltrate them. Excludes non-secret vars (base URLs, org IDs,
+ * regions), which unrelated tooling legitimately reads.
+ */
+export function providerSecretEnvVarNames(): string[] {
+  const names = new Set<string>();
+  for (const mapping of Object.values(PROVIDER_ENV_VARS)) {
+    // A key file path is not a secret itself, but it leads straight to one.
+    for (const key of [...(mapping.apiKey ?? []), ...(mapping.keyFilename ?? [])]) {
+      names.add(key);
+    }
+  }
+  names.add(AZURE_OPENAI_ENV_VARS.apiKey);
+  names.add(BEDROCK_AUTH_ENV_VARS.accessKeyId);
+  names.add(BEDROCK_AUTH_ENV_VARS.secretAccessKey);
+  names.add(BEDROCK_AUTH_ENV_VARS.bearerToken);
+  // The TypeSafe evaluation key is not a chat provider, but it is a bearer credential all the same.
+  for (const key of TYPESAFE_API_KEY_ENV_VARS) {
+    names.add(key);
+  }
+  return [...names];
+}
+
 /** Resolve first non-empty env var from a list of candidates */
 function resolveEnv(
   keys: string[] | undefined,
@@ -110,6 +157,15 @@ function hasNonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.trim().length > 0;
 }
 
+/** A saved config string wins over its env vars (the user's explicit choice). */
+function resolveConfigOrEnv(
+  configValue: unknown,
+  envKeys: string[] | undefined,
+  env: Record<string, string | undefined>
+): string | undefined {
+  return hasNonEmptyString(configValue) ? configValue.trim() : resolveEnv(envKeys, env);
+}
+
 function hasCredentialPair(accessKeyId: unknown, secretAccessKey: unknown): boolean {
   return hasNonEmptyString(accessKeyId) && hasNonEmptyString(secretAccessKey);
 }
@@ -123,9 +179,9 @@ type ProviderSpecificCredentialFields = Partial<
     BedrockProviderConfig,
     "region" | "profile" | "bearerToken" | "accessKeyId" | "secretAccessKey"
   > &
-    Pick<MuxGatewayProviderConfig, "couponCode" | "voucher"> &
     Pick<OpenAIProviderConfig, "organization"> &
-    Pick<CoderProviderConfig, "deploymentUrl"> & {
+    Pick<CoderProviderConfig, "deploymentUrl"> &
+    Pick<GoogleVertexProviderConfig, "project" | "location" | "keyFilename"> & {
       // Wider than the schema type: callers pass raw (unvalidated) config.
       coderOauth?: unknown;
     }
@@ -144,12 +200,15 @@ export type ProviderConfigRaw = Omit<ProviderConfig, "enabled" | "models"> & {
 export interface ResolvedCredentials {
   isConfigured: boolean;
   /** What's missing, if not configured (for error messages) */
-  missingRequirement?: "api_key" | "region" | "coupon_code" | "coder_login";
+  missingRequirement?: "api_key" | "region" | "coder_login" | "project";
 
   // Resolved credential values - aiService uses these directly
   apiKey?: string; // anthropic, openai, etc.
   region?: string; // bedrock
-  couponCode?: string; // mux-gateway
+  project?: string; // google-vertex (ADC mode)
+  location?: string; // google-vertex
+  keyFilename?: string; // google-vertex ADC key file (config path home-expanded, else env), ADC mode only
+  keyFilenameSource?: "config" | "env";
   deploymentUrl?: string; // coder
   baseUrl?: string; // runtime value from config or env when API-key auth is active
   baseUrlResolved?: string; // display-only metadata, including when API key auth is missing
@@ -204,6 +263,13 @@ type ApiKeyFileResolution =
   | { kind: "resolved"; apiKey: string }
   | { kind: "error"; error: ProviderRequirementError };
 
+/**
+ * Size cap for credential files read from disk (API key files, Vertex service
+ * account keys). Real ones are a few KB; a larger file is a wrong path, and
+ * reading it whole could exhaust the heap.
+ */
+export const MAX_CREDENTIAL_FILE_BYTES = 64 * 1024;
+
 function expandHomePath(filePath: string): string {
   return filePath.startsWith("~") ? path.join(os.homedir(), filePath.slice(1)) : filePath;
 }
@@ -220,6 +286,15 @@ function resolveBaseUrl(
 
   const envBaseUrl = resolveEnv(PROVIDER_ENV_VARS[provider]?.baseUrl, env);
   return envBaseUrl ? { baseUrlResolved: envBaseUrl, baseUrlSource: "env" } : {};
+}
+
+/** Once a provider is configured, its resolved base URL becomes the runtime one. */
+function withActiveBaseUrl(
+  baseUrlInfo: Pick<ResolvedCredentials, "baseUrlResolved" | "baseUrlSource">
+): Pick<ResolvedCredentials, "baseUrl" | "baseUrlResolved" | "baseUrlSource"> {
+  return baseUrlInfo.baseUrlResolved
+    ? { ...baseUrlInfo, baseUrl: baseUrlInfo.baseUrlResolved }
+    : baseUrlInfo;
 }
 
 /**
@@ -241,7 +316,7 @@ function resolveApiKeyFileDetailed(filePath: unknown): ApiKeyFileResolution {
         error: { code: "api_key_file_unreadable", path: filePath, reason: "not_file" },
       };
     }
-    if (stat.size > 65536) {
+    if (stat.size > MAX_CREDENTIAL_FILE_BYTES) {
       return {
         kind: "error",
         error: { code: "api_key_file_unreadable", path: filePath, reason: "too_large" },
@@ -280,7 +355,7 @@ export function isLegacyOpApiKey(value: unknown): value is string {
   return typeof value === "string" && value.startsWith("op://");
 }
 
-function resolveApiKeyCandidate(
+export function resolveApiKeyCandidate(
   config: { apiKey?: unknown; apiKeyFile?: unknown },
   options: {
     envApiKeys?: string[];
@@ -340,12 +415,8 @@ export function resolveProviderCredentials(
       : { isConfigured: false, missingRequirement: "region" };
   }
 
-  // Shux Gateway: coupon code required (no env var support)
-  if (provider === "mux-gateway") {
-    const couponCode = config.couponCode ?? config.voucher;
-    return couponCode
-      ? { isConfigured: true, couponCode }
-      : { isConfigured: false, missingRequirement: "coupon_code" };
+  if (provider === "google-vertex") {
+    return resolveGoogleVertexCredentials(config, env);
   }
 
   // Coder: deployment URL + OAuth tokens from "Login with Coder" required
@@ -391,19 +462,107 @@ export function resolveProviderCredentials(
   const organization = configOrganization ?? resolveEnv(envMapping?.organization, env);
 
   if (apiKeyResult.kind === "resolved") {
-    const configuredBaseUrlInfo = baseUrlInfo.baseUrlResolved
-      ? { ...baseUrlInfo, baseUrl: baseUrlInfo.baseUrlResolved }
-      : baseUrlInfo;
     return {
       isConfigured: true,
       apiKey: apiKeyResult.apiKey,
       organization,
       apiKeySource: apiKeyResult.source,
-      ...configuredBaseUrlInfo,
+      ...withActiveBaseUrl(baseUrlInfo),
     };
   }
 
   return { isConfigured: false, missingRequirement: "api_key", ...baseUrlInfo };
+}
+
+/**
+ * Google Vertex AI: an API key selects express mode (project/location unused);
+ * otherwise Google Application Default Credentials authenticate and the SDK
+ * requires a project. Values are resolved here (config, then env) and passed
+ * explicitly so the SDK's own env reads cannot silently switch auth modes.
+ */
+function resolveGoogleVertexCredentials(
+  config: ProviderConfigRaw,
+  env: Record<string, string | undefined>
+): ResolvedCredentials {
+  const envMapping = PROVIDER_ENV_VARS["google-vertex"];
+  const apiKeyResult = resolveApiKeyCandidate(
+    { apiKey: config.apiKey, apiKeyFile: config.apiKeyFile },
+    { envApiKeys: envMapping?.apiKey, env, fileErrors: "ignore" }
+  );
+  const project = resolveConfigOrEnv(config.project, envMapping?.project, env);
+  // Vertex location IDs are lowercase ("us-central1"); "US" would build a
+  // nonexistent "US-aiplatform" host.
+  const location = (
+    resolveConfigOrEnv(config.location, envMapping?.location, env) ?? GOOGLE_VERTEX_DEFAULT_LOCATION
+  ).toLowerCase();
+  const baseUrlInfo = resolveBaseUrl("google-vertex", config, env);
+
+  if (apiKeyResult.kind === "resolved") {
+    return {
+      isConfigured: true,
+      apiKey: apiKeyResult.apiKey,
+      apiKeySource: apiKeyResult.source,
+      project,
+      location,
+      ...withActiveBaseUrl(baseUrlInfo),
+    };
+  }
+  if (!project) {
+    return { isConfigured: false, missingRequirement: "project", ...baseUrlInfo };
+  }
+  // The env key file is resolved too, so the factory can check it before the
+  // first request, as it checks the configured one.
+  const envKeyFilename = resolveEnv(envMapping?.keyFilename, env);
+  return {
+    isConfigured: true,
+    project,
+    location,
+    ...(hasNonEmptyString(config.keyFilename)
+      ? { keyFilename: expandHomePath(config.keyFilename.trim()), keyFilenameSource: "config" }
+      : envKeyFilename != null && { keyFilename: envKeyFilename, keyFilenameSource: "env" }),
+    ...withActiveBaseUrl(baseUrlInfo),
+  };
+}
+
+/** Vertex settings from env vars only, so Settings can show env-sourced values. */
+export function resolveGoogleVertexEnvSettings(env: Record<string, string | undefined>): {
+  project?: string;
+  location?: string;
+  keyFilename?: string;
+} {
+  const envMapping = PROVIDER_ENV_VARS["google-vertex"];
+  return {
+    project: resolveEnv(envMapping?.project, env),
+    location: resolveEnv(envMapping?.location, env),
+    keyFilename: resolveEnv(envMapping?.keyFilename, env),
+  };
+}
+
+/**
+ * Credentials for the evaluation-only TypeSafe key (`TYPESAFE_PROVIDER_KEY`),
+ * which is not a ProviderName and so has no PROVIDER_ENV_VARS entry: config
+ * apiKey → apiKeyFile → TYPESAFE_API_KEY_ENV_VARS, plus the configured base
+ * URL (no env base URL exists for it). Shared by both evaluation-model
+ * factories (auto model routing and workflow `evaluate()`).
+ */
+export function resolveTypeSafeCredentials(
+  config: ProviderConfigRaw,
+  env: Record<string, string | undefined> = process.env
+): ResolvedCredentials {
+  const apiKeyResult = resolveApiKeyCandidate(
+    { apiKey: config.apiKey, apiKeyFile: config.apiKeyFile },
+    { envApiKeys: [...TYPESAFE_API_KEY_ENV_VARS], env, fileErrors: "ignore" }
+  );
+  const baseUrl = resolveConfigBaseUrl(config);
+  if (apiKeyResult.kind === "resolved") {
+    return {
+      isConfigured: true,
+      apiKey: apiKeyResult.apiKey,
+      apiKeySource: apiKeyResult.source,
+      ...(baseUrl ? { baseUrl } : {}),
+    };
+  }
+  return { isConfigured: false, missingRequirement: "api_key", ...(baseUrl ? { baseUrl } : {}) };
 }
 
 function customCredentialSourceFromApiKeySource(
@@ -542,6 +701,10 @@ export function buildProvidersFromEnv(
       if (creds.baseUrl) entry.baseUrl = creds.baseUrl;
       if (creds.organization) entry.organization = creds.organization;
       providers[provider] = entry;
+    } else if (creds.isConfigured && creds.project) {
+      // Vertex AI with Application Default Credentials has no API key; the
+      // project selects it, and the location keeps resolving from env.
+      providers[provider] = { project: creds.project };
     }
   }
 
@@ -592,9 +755,15 @@ export function hasAnyConfiguredProvider(providers: ProvidersConfig | null | und
       return true;
     }
 
+    // The TypeSafe evaluation key cannot serve a chat model (a legacy custom provider
+    // under the same id still counts).
+    if (providerKey === TYPESAFE_PROVIDER_KEY && !isCustomProviderConfig(rawConfig)) {
+      continue;
+    }
+
     if (!(providerKey in PROVIDER_DEFINITIONS)) {
       if (
-        isCustomOpenAICompatibleProviderConfig(rawConfig) &&
+        isCustomProviderConfig(rawConfig) &&
         !isProviderDisabledInConfig(rawConfig) &&
         resolveConfigBaseUrl(rawConfig) !== undefined
       ) {

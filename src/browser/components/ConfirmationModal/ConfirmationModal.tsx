@@ -18,6 +18,8 @@ interface ConfirmationModalProps {
   isOpen: boolean;
   title: string;
   description?: string;
+  /** Items listed under the description, e.g. the files a removal would delete. */
+  details?: { label: string; items: string[] };
   /** Warning message shown in red warning box */
   warning?: string;
   confirmLabel?: string;
@@ -85,6 +87,19 @@ export const ConfirmationModal: React.FC<ConfirmationModalProps> = (props) => {
           <DialogTitle>{props.title}</DialogTitle>
           {props.description && <DialogDescription>{props.description}</DialogDescription>}
         </DialogHeader>
+
+        {props.details && props.details.items.length > 0 && (
+          <section aria-label={props.details.label} className="min-w-0 space-y-2 text-sm">
+            <p>{props.details.label}:</p>
+            <ul className="text-muted max-h-48 space-y-1 overflow-y-auto font-mono text-xs">
+              {props.details.items.map((item) => (
+                <li key={item} className="break-all">
+                  {item}
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
 
         {props.warning && (
           <WarningBox>

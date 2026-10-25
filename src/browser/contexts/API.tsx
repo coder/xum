@@ -1,3 +1,5 @@
+import { SERVER_VERSION_CHECK_TIMEOUT_MS } from "@/constants/serverUpdate";
+import { VERSION } from "@/version";
 import {
   createContext,
   useContext,
@@ -7,6 +9,7 @@ import {
   useRef,
   useMemo,
 } from "react";
+import type { ClientContext } from "@orpc/client";
 import { createClient } from "@/common/orpc/client";
 import { RPCLink as WebSocketLink } from "@orpc/client/websocket";
 import { RPCLink as MessagePortLink } from "@orpc/client/message-port";
@@ -17,6 +20,8 @@ import {
 } from "@/browser/components/AuthTokenModal/AuthTokenModal";
 import { getBrowserBackendBaseUrl } from "@/browser/utils/backendBaseUrl";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { ConnectionLink } from "@/browser/contexts/connectionLink";
 
 type APIClient = ReturnType<typeof createClient>;
 
@@ -26,10 +31,13 @@ export type { APIClient };
 export type APIState =
   | { status: "connecting"; api: null; error: null }
   | { status: "connected"; api: APIClient; error: null }
-  | { status: "degraded"; api: APIClient; error: null } // Connected but pings failing
-  | { status: "reconnecting"; api: null; error: null; attempt: number }
+  | { status: "degraded"; api: APIClient; error: null } // Connected but the backend answers slowly
+  // While reconnecting, and in an error after a lost session, `api` can be the last client: the
+  // App stays mounted, and panes keep what they show. Calls on it then fail fast with
+  // ConnectionLostError (connectionLink.ts). Code that must know "offline" uses useLiveAPI().
+  | { status: "reconnecting"; api: APIClient | null; error: null; attempt: number }
   | { status: "auth_required"; api: null; error: string | null }
-  | { status: "error"; api: null; error: string };
+  | { status: "error"; api: APIClient | null; error: string };
 
 interface APIStateMethods {
   authenticate: (token: string) => void;
@@ -39,14 +47,23 @@ interface APIStateMethods {
 // Union distributes over intersection, preserving discriminated union behavior
 export type UseAPIResult = APIState & APIStateMethods;
 
-// Internal state for the provider (includes cleanup)
+// Internal state for the provider (includes cleanup).
+// `client` goes through the provider's ConnectionLink, so it keeps working after a reconnect.
+// `probe` talks to this socket only: liveness pings must measure their own connection.
+interface LiveConnection {
+  client: APIClient;
+  probe: APIClient;
+  cleanup: () => void;
+}
 type ConnectionState =
   | { status: "connecting" }
-  | { status: "connected"; client: APIClient; cleanup: () => void }
-  | { status: "degraded"; client: APIClient; cleanup: () => void } // Pings failing
-  | { status: "reconnecting"; attempt: number }
+  | ({ status: "connected" } & LiveConnection)
+  | ({ status: "degraded" } & LiveConnection) // Backend slow
+  // `client` is the last connected client (null before the first connect): the App stays
+  // mounted and panes keep what they show. Its calls fail fast with ConnectionLostError.
+  | { status: "reconnecting"; attempt: number; client: APIClient | null }
   | { status: "auth_required"; error?: string }
-  | { status: "error"; error: string };
+  | { status: "error"; error: string; client: APIClient | null };
 
 // Reconnection constants
 const MAX_RECONNECT_ATTEMPTS = 10;
@@ -58,11 +75,23 @@ const MAX_DELAY_MS = 10000;
 // infer whether auth is required, but the probe must never block reconnect progress.
 const AUTH_PROBE_TIMEOUT_MS = 2000;
 
-// Liveness check constants
-const LIVENESS_INTERVAL_MS = 5000; // Check every 5 seconds
-const LIVENESS_TIMEOUT_MS = 3000; // Ping must respond within 3 seconds
-const CONSECUTIVE_FAILURES_FOR_DEGRADED = 2; // Mark degraded after N failures
-const CONSECUTIVE_FAILURES_FOR_RECONNECT = 3; // Force reconnect after N failures (WS may be half-open)
+// Liveness check constants. The probe measures backend round-trip time: a connection whose
+// transport is alive but whose server answers slowly must still surface as degraded.
+const LIVENESS_INTERVAL_MS = 5000;
+// A probe whose RTT (or pending age at tick time) exceeds this is one "slow" observation.
+const SLOW_RESPONSE_MS = 2000;
+// A single slow ping is transient; require consecutive slow observations before degrading.
+const SLOW_OBSERVATIONS_FOR_DEGRADED = 2;
+// Browser WebSocket only: force reconnect when a probe has been outstanding this long AND no
+// inbound frame of any kind arrived meanwhile (the socket may be half-open).
+const SILENCE_FOR_RECONNECT_MS = 15000;
+// Abandon an outstanding probe older than this so a single lost ping cannot pin the
+// indicator on "degraded" after the backend recovers.
+const MAX_PROBE_AGE_MS = 30000;
+// Browser WebSocket only: a probe that is rejected outright (not slow) means the server is
+// answering but refusing us, e.g. an expired session. Reconnect after this many in a row so
+// the handshake's auth-check can surface auth_required instead of pinning "degraded".
+const REJECTED_PROBES_FOR_RECONNECT = 3;
 
 // Exported so hooks that need to tolerate being mounted outside an
 // APIProvider (e.g., `useGoalDefaults`, `useGoalBoard`) can read the
@@ -71,12 +100,18 @@ const CONSECUTIVE_FAILURES_FOR_RECONNECT = 3; // Force reconnect after N failure
 // API access is required, not optional.
 export const APIContext = createContext<UseAPIResult | null>(null);
 
+// The live latency figure changes on every liveness tick while degraded. It lives in its own
+// context so those ticks re-render only the indicator, not every useAPI() consumer.
+const ConnectionLatencyContext = createContext<number | null>(null);
+
 interface APIProviderProps {
   children: React.ReactNode;
   /** Optional pre-created client. If provided, skips internal connection setup. */
   client?: APIClient;
   /** WebSocket factory for testing. Defaults to native WebSocket constructor. */
   createWebSocket?: (url: string) => WebSocket;
+  /** The VS Code webview connects AppConfigStore itself, only while its host has a server. */
+  skipAppConfigStore?: boolean;
 }
 
 const noopConnectionControl = (_token?: string) => undefined;
@@ -92,75 +127,30 @@ function closeWebSocketSafely(ws: WebSocket) {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function tryParseJSONFramePayload(data: unknown): Record<string, unknown> | null {
-  if (typeof data !== "string" && !(data instanceof ArrayBuffer) && !ArrayBuffer.isView(data)) {
-    return null;
-  }
-
-  const rawPayload =
-    typeof data === "string"
-      ? data
-      : new TextDecoder().decode(
-          data instanceof ArrayBuffer
-            ? new Uint8Array(data)
-            : new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
-        );
-
-  try {
-    const parsed: unknown = JSON.parse(rawPayload);
-    return isRecord(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function isLikelyOrpcPongResponseFrame(data: unknown): boolean {
-  const payload = tryParseJSONFramePayload(data);
-  if (!payload) {
-    return false;
-  }
-
-  // Defensive guard: ORPC frames should always carry a numeric request id.
-  if (typeof payload.i !== "number") {
-    return false;
-  }
-
-  // Event iterator and abort frames are never ping responses.
-  if (payload.t === 3 || payload.t === 4) {
-    return false;
-  }
-
-  if (!isRecord(payload.p)) {
-    return false;
-  }
-
-  // ORPC encodes normal response bodies at payload.p.b.
-  return payload.p.b === "pong";
-}
-
-function createElectronClient(): { client: APIClient; cleanup: () => void } {
+function createElectronClient(link: ConnectionLink): LiveConnection {
   const { port1: clientPort, port2: serverPort } = new MessageChannel();
   window.postMessage("start-orpc-client", "*", [serverPort]);
 
-  const link = new MessagePortLink({ port: clientPort });
+  const inner = new MessagePortLink({ port: clientPort });
   clientPort.start();
+  const generation = link.attach(inner);
 
   return {
     client: createClient(link),
-    cleanup: () => clientPort.close(),
+    probe: createClient(inner),
+    cleanup: () => {
+      link.detach(generation);
+      clientPort.close();
+    },
   };
 }
 
-function createBrowserClient(
+function createBrowserSocket(
   authToken: string | null,
   createWebSocket: (url: string) => WebSocket
 ): {
-  client: APIClient;
-  cleanup: () => void;
+  inner: WebSocketLink<ClientContext>;
+  probe: APIClient;
   ws: WebSocket;
 } {
   const apiBaseUrl = getBrowserBackendBaseUrl();
@@ -172,13 +162,69 @@ function createBrowserClient(
   }
 
   const ws = createWebSocket(wsUrl.toString());
-  const link = new WebSocketLink({ websocket: ws });
+  // oRPC >=1.14 replaced the `websocket` option with a `connect` factory.
+  const inner = new WebSocketLink<ClientContext>({ connect: () => ws });
 
-  return {
-    client: createClient(link),
-    cleanup: () => closeWebSocketSafely(ws),
-    ws,
-  };
+  return { inner, probe: createClient(inner), ws };
+}
+
+async function reloadIfServerBuildChanged(
+  backendBaseUrl: string,
+  isCurrentConnection: () => boolean
+): Promise<void> {
+  try {
+    const response = await fetch(`${backendBaseUrl}/version`, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(SERVER_VERSION_CHECK_TIMEOUT_MS),
+    });
+    const version: unknown = response.ok ? await response.json() : null;
+    if (
+      isCurrentConnection() &&
+      version &&
+      typeof version === "object" &&
+      "git_commit" in version &&
+      typeof version.git_commit === "string" &&
+      version.git_commit.length > 0 &&
+      (version.git_commit !== VERSION.git_commit ||
+        ("git_describe" in version && version.git_describe !== VERSION.git_describe))
+    ) {
+      window.location.reload();
+    }
+  } catch {
+    // Version discovery must not disturb an already reconnected client.
+  }
+}
+
+// Connected here rather than in AppLoader so terminal and desktop popouts get the config store too.
+function useAppConfigStoreClient(api: APIClient | null, skip = false) {
+  useEffect(() => {
+    if (skip) return;
+    const store = getAppConfigStore();
+    store.setClient(api);
+    return () => store.setClient(null);
+  }, [api, skip]);
+}
+
+// Convert internal state to the discriminated union API
+function toAPIState(state: ConnectionState): APIState {
+  switch (state.status) {
+    case "connecting":
+      return { status: "connecting", api: null, error: null };
+    case "connected":
+    case "degraded":
+      return { status: state.status, api: state.client, error: null };
+    case "reconnecting":
+      return { status: "reconnecting", api: state.client, error: null, attempt: state.attempt };
+    case "auth_required":
+      return { status: "auth_required", api: null, error: state.error ?? null };
+    case "error":
+      return { status: "error", api: state.client, error: state.error };
+  }
+}
+
+// The cache cleanup never rejects today (#6848); log rather than drop a future failure.
+function logServiceWorkerCacheCleanupFailure(error: unknown): void {
+  console.warn("[APIProvider] Service worker cache cleanup failed:", error);
 }
 
 function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
@@ -187,7 +233,9 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     const urlParams = new URLSearchParams(window.location.search);
     const urlToken = urlParams.get("token")?.trim();
     if (urlToken) {
-      setStoredAuthToken(urlToken);
+      // Render cannot await. Safe: only the legacy mux-v2 cache can hold session data, and the
+      // v3 worker's activate deletes it even if this cleanup is cut short (#6848).
+      setStoredAuthToken(urlToken).catch(logServiceWorkerCacheCleanupFailure);
       // Strip token from URL so it doesn't leak into bookmarks, browser
       // history, PWA launch URLs, or Referer headers.
       const cleanUrl = new URL(window.location.href);
@@ -199,15 +247,24 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     return getStoredAuthToken();
   });
 
+  // One link for the provider's lifetime: every client made from it (old ones too) reaches the
+  // current socket, and while offline their calls fail fast instead of hanging.
+  const [link] = useState(() => new ConnectionLink());
+  // The last connected client, kept while reconnecting and in a later error (see APIState).
+  const lastClientRef = useRef<APIClient | null>(null);
   const cleanupRef = useRef<(() => void) | null>(null);
   const hasConnectedRef = useRef(false);
   const reconnectAttemptRef = useRef(0);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const scheduleReconnectRef = useRef<(() => void) | null>(null);
-  const consecutivePingFailuresRef = useRef(0);
+  const consecutiveSlowProbesRef = useRef(0);
+  const consecutiveRejectedProbesRef = useRef(0);
+  const [latencyMs, setLatencyMs] = useState<number | null>(null);
   const connectionIdRef = useRef(0);
   const forceReconnectInProgressRef = useRef(false);
-  const livenessPingsInFlightCountRef = useRef(0);
+  // Probe ages, RTT, and silence use performance.now(): it is monotonic, whereas a wall-clock
+  // correction could make a stalled probe look young or a slow probe look fast.
+  const outstandingProbeRef = useRef<{ sentAt: number; connectionId: number } | null>(null);
   const lastInboundBrowserFrameAtRef = useRef(0);
 
   // When we decide the user needs to provide a token, stop the reconnect loop.
@@ -223,13 +280,29 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     [props.createWebSocket]
   );
 
+  // The session is gone: the next connect needs a token, and the App (with the last client)
+  // unmounts behind the token prompt.
+  const enterAuthRequired = useCallback((error: string | undefined) => {
+    authRequiredRef.current = true;
+    // Safe unawaited: this only shows the token prompt, which caches nothing and navigates
+    // nowhere until the user submits, and the modal awaits its own cleanup then (#6848).
+    clearStoredAuthToken().catch(logServiceWorkerCacheCleanupFailure);
+    hasConnectedRef.current = false;
+    lastClientRef.current = null;
+    setState({ status: "auth_required", error });
+  }, []);
+
   const connect = useCallback(
     (token: string | null) => {
       const connectionId = ++connectionIdRef.current;
-      // Reset per-connection inbound traffic tracking so stale timestamps from a prior
-      // socket cannot suppress liveness pings on the next connection.
-      lastInboundBrowserFrameAtRef.current = 0;
-      livenessPingsInFlightCountRef.current = 0;
+      // Reset per-connection liveness bookkeeping so a prior socket's frames or probes
+      // cannot influence the next connection. Silence is measured from the connect time until
+      // the first frame arrives.
+      lastInboundBrowserFrameAtRef.current = performance.now();
+      outstandingProbeRef.current = null;
+      consecutiveSlowProbesRef.current = 0;
+      consecutiveRejectedProbesRef.current = 0;
+      setLatencyMs(null);
 
       authRequiredRef.current = false;
 
@@ -244,35 +317,42 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
 
       // Skip Electron detection if custom WebSocket factory provided (for testing)
       if (!props.createWebSocket && window.api) {
-        const { client, cleanup } = createElectronClient();
-        window.__ORPC_CLIENT__ = client;
-        cleanupRef.current = cleanup;
-        setState({ status: "connected", client, cleanup });
+        const connection = createElectronClient(link);
+        window.__ORPC_CLIENT__ = connection.client;
+        lastClientRef.current = connection.client;
+        cleanupRef.current = connection.cleanup;
+        setState({ status: "connected", ...connection });
         return;
       }
 
-      setState({ status: "connecting" });
-      const { client, cleanup, ws } = createBrowserClient(token, wsFactory);
-      ws.addEventListener("message", (event) => {
-        // User rationale: during large catch-up streams, ORPC ping responses can be delayed
-        // behind data frames. Treat inbound non-probe traffic as proof of liveness to avoid
-        // unnecessary reconnect loops for healthy-but-busy connections.
+      // Once a session has been connected, any new attempt is a reconnect from the user's
+      // perspective: keep the "Reconnecting to server" banner up through the handshake instead
+      // of dropping to "connecting", which renders nothing and is meant for the initial load.
+      setState(
+        hasConnectedRef.current
+          ? {
+              status: "reconnecting",
+              attempt: Math.max(1, reconnectAttemptRef.current),
+              client: lastClientRef.current,
+            }
+          : { status: "connecting" }
+      );
+      const { inner, probe, ws } = createBrowserSocket(token, wsFactory);
+      // Set once the auth check passes and the socket joins the link.
+      let detachFromLink: () => void = () => undefined;
+      // Detaching first rejects this socket's calls and streams at once, before any state change.
+      const cleanup = () => {
+        detachFromLink();
+        closeWebSocketSafely(ws);
+      };
+      ws.addEventListener("message", () => {
+        // Inbound frames prove the transport is alive, not that the backend is responsive:
+        // they only suppress the total-silence reconnect and never skip or satisfy a probe.
         if (connectionId !== connectionIdRef.current) {
           return;
         }
 
-        // Keep counting stream frames while liveness probes are in flight; otherwise a slow
-        // probe could incorrectly hide active traffic and trigger false reconnects.
-        //
-        // Only ignore frames that look like ORPC "pong" responses from those probes.
-        const isLikelyProbeReply =
-          livenessPingsInFlightCountRef.current > 0 && isLikelyOrpcPongResponseFrame(event.data);
-
-        if (isLikelyProbeReply) {
-          return;
-        }
-
-        lastInboundBrowserFrameAtRef.current = Date.now();
+        lastInboundBrowserFrameAtRef.current = performance.now();
       });
 
       ws.addEventListener("open", () => {
@@ -282,7 +362,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
           return;
         }
 
-        client.general
+        probe.general
           .ping("auth-check")
           .then(() => {
             // Ignore stale connections (e.g., auth-check returned after a new connect()).
@@ -291,14 +371,31 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
               return;
             }
 
+            const reconnected = hasConnectedRef.current;
             authRequiredRef.current = false;
             hasConnectedRef.current = true;
             reconnectAttemptRef.current = 0;
-            consecutivePingFailuresRef.current = 0;
+            consecutiveSlowProbesRef.current = 0;
             forceReconnectInProgressRef.current = false;
+            const generation = link.attach(inner);
+            detachFromLink = () => link.detach(generation);
+            // A new object per connect: effects with the client in their deps run again.
+            const client = createClient(link);
             window.__ORPC_CLIENT__ = client;
+            lastClientRef.current = client;
             cleanupRef.current = cleanup;
-            setState({ status: "connected", client, cleanup });
+            setState({ status: "connected", client, probe, cleanup });
+            // A reconnected socket may belong to a newer server than this loaded bundle. The probe
+            // runs after the client is published so a slow /version never delays reconnection, and
+            // only a bundle served by that server can be refreshed by reloading, so split-origin
+            // setups (VITE_BACKEND_URL, extension webviews) skip it.
+            const backendBaseUrl = getBrowserBackendBaseUrl();
+            if (reconnected && new URL(backendBaseUrl).origin === window.location.origin) {
+              void reloadIfServerBuildChanged(
+                backendBaseUrl,
+                () => connectionId === connectionIdRef.current
+              );
+            }
           })
           .catch((err: unknown) => {
             if (connectionId !== connectionIdRef.current) {
@@ -316,16 +413,13 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
               errMsgLower.includes("authentication");
 
             if (isAuthError) {
-              authRequiredRef.current = true;
-              clearStoredAuthToken();
-              hasConnectedRef.current = false; // Reset - need fresh auth
-              setState({ status: "auth_required", error: token ? "Invalid token" : undefined });
+              enterAuthRequired(token ? "Invalid token" : undefined);
               cleanup();
               return;
             }
 
             cleanup();
-            setState({ status: "error", error: errMsg });
+            setState({ status: "error", error: errMsg, client: lastClientRef.current });
           });
       });
 
@@ -351,10 +445,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
         // overwrite the modal with a reconnect attempt.
         // Auth-specific close codes
         if (event.code === 1008 || event.code === 4401) {
-          authRequiredRef.current = true;
-          clearStoredAuthToken();
-          hasConnectedRef.current = false; // Reset - need fresh auth
-          setState({ status: "auth_required", error: "Authentication required" });
+          enterAuthRequired("Authentication required");
           return;
         }
 
@@ -415,10 +506,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
               }
 
               if (result === "requires_auth") {
-                authRequiredRef.current = true;
-                clearStoredAuthToken();
-                hasConnectedRef.current = false; // Reset - need fresh auth
-                setState({ status: "auth_required", error: "Authentication required" });
+                enterAuthRequired("Authentication required");
                 return;
               }
 
@@ -450,7 +538,7 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
         scheduleReconnectRef.current?.();
       });
     },
-    [props.createWebSocket, wsFactory]
+    [props.createWebSocket, wsFactory, link, enterAuthRequired]
   );
 
   // Schedule reconnection with exponential backoff
@@ -463,14 +551,14 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     if (attempt >= MAX_RECONNECT_ATTEMPTS) {
       const error = hasConnectedRef.current
         ? "Connection lost. Please refresh the page."
-        : "Failed to connect to the Shux backend after multiple attempts.";
-      setState({ status: "error", error });
+        : "Failed to connect to the Xum backend after multiple attempts.";
+      setState({ status: "error", error, client: lastClientRef.current });
       return;
     }
 
     const delay = Math.min(BASE_DELAY_MS * Math.pow(2, attempt), MAX_DELAY_MS);
     reconnectAttemptRef.current = attempt + 1;
-    setState({ status: "reconnecting", attempt: attempt + 1 });
+    setState({ status: "reconnecting", attempt: attempt + 1, client: lastClientRef.current });
 
     reconnectTimeoutRef.current = setTimeout(() => {
       connect(authToken);
@@ -491,136 +579,142 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Liveness check: periodic ping to detect degraded connections.
-  // Only runs for managed browser WebSocket connections.
+  // Liveness check: probe the backend's round-trip time to detect a slow server, for both
+  // browser WebSocket and Electron MessagePort clients. Keyed on the live client identity
+  // rather than the whole state object: degraded <-> connected transitions keep the same
+  // client, so per-tick latency updates must not restart the interval or the outstanding probe.
+  const isLive = state.status === "connected" || state.status === "degraded";
+  const liveClient = isLive ? state.client : null;
+  const liveProbe = isLive ? state.probe : null;
+  const liveCleanup = isLive ? state.cleanup : null;
   useEffect(() => {
-    // Only check liveness for connected/degraded browser connections.
-    if (state.status !== "connected" && state.status !== "degraded") return;
-    // Skip for Electron (MessagePort) clients.
-    if (!props.createWebSocket && window.api) return;
-
-    const client = state.client;
-    const cleanup = state.cleanup;
+    if (!liveClient || !liveProbe || !liveCleanup) return;
+    const client = liveClient;
+    const probeClient = liveProbe;
+    const cleanup = liveCleanup;
+    // Electron has no socket to reconnect and no inbound-frame signal, so it only gets
+    // RTT-based degraded detection.
+    const isBrowserWebSocket = Boolean(props.createWebSocket) || !window.api;
     let effectDisposed = false;
 
-    const markConnectionHealthy = () => {
-      if (effectDisposed) {
-        return;
-      }
+    const forceReconnect = (reason: string) => {
+      if (!isBrowserWebSocket || forceReconnectInProgressRef.current) return false;
+      forceReconnectInProgressRef.current = true;
+      console.warn(`[APIProvider] ${reason}; reconnecting...`);
+      cleanup();
+      if (!effectDisposed) connect(authToken);
+      return true;
+    };
 
-      consecutivePingFailuresRef.current = 0;
+    const recordSlowObservation = (observedLatencyMs: number) => {
+      consecutiveSlowProbesRef.current += 1;
+      if (consecutiveSlowProbesRef.current < SLOW_OBSERVATIONS_FOR_DEGRADED) return;
+      setLatencyMs(observedLatencyMs);
+      // Returning prev while already degraded keeps the API context value stable, so only the
+      // latency context consumers re-render on later ticks.
+      setState((prev) =>
+        prev.status === "connected" && prev.client === client
+          ? { status: "degraded", client, probe: probeClient, cleanup }
+          : prev
+      );
+    };
+
+    const recordFastObservation = () => {
+      consecutiveSlowProbesRef.current = 0;
       forceReconnectInProgressRef.current = false;
-      if (state.status === "degraded") {
-        setState({ status: "connected", client, cleanup });
-      }
+      setLatencyMs(null);
+      setState((prev) =>
+        prev.status === "degraded" && prev.client === client
+          ? { status: "connected", client, probe: probeClient, cleanup }
+          : prev
+      );
     };
 
-    const checkLiveness = async () => {
-      if (effectDisposed) {
-        return;
-      }
+    const sendProbe = () => {
+      const probe = { sentAt: performance.now(), connectionId: connectionIdRef.current };
+      outstandingProbeRef.current = probe;
 
-      const timeSinceLastInboundFrameMs = Date.now() - lastInboundBrowserFrameAtRef.current;
-      const hasRecentInboundTraffic =
-        lastInboundBrowserFrameAtRef.current > 0 &&
-        timeSinceLastInboundFrameMs >= 0 &&
-        timeSinceLastInboundFrameMs <= LIVENESS_TIMEOUT_MS;
-
-      if (hasRecentInboundTraffic) {
-        // User rationale: if we're still receiving stream frames, the connection is alive
-        // even when application-level ping responses are delayed behind backlog.
-        markConnectionHealthy();
-        return;
-      }
-
-      try {
-        // Race ping against timeout
-        const livenessPingConnectionId = connectionIdRef.current;
-        const pingPromise = client.general.ping("liveness");
-        livenessPingsInFlightCountRef.current += 1;
-        const finalizeLivenessProbe = () => {
-          // Ignore stale probes from an older socket after reconnect.
-          if (livenessPingConnectionId !== connectionIdRef.current) {
+      const settle = (resolved: boolean) => {
+        // Ignore settlements from a superseded socket, a disposed effect, or an abandoned probe.
+        if (
+          effectDisposed ||
+          probe.connectionId !== connectionIdRef.current ||
+          outstandingProbeRef.current !== probe
+        ) {
+          return;
+        }
+        outstandingProbeRef.current = null;
+        const rtt = performance.now() - probe.sentAt;
+        if (resolved) {
+          consecutiveRejectedProbesRef.current = 0;
+          if (rtt <= SLOW_RESPONSE_MS) {
+            recordFastObservation();
             return;
           }
-
-          // Multiple probes can overlap when a ping exceeds LIVENESS_INTERVAL_MS.
-          // Track count instead of boolean so one delayed probe cannot clear
-          // in-flight state for a newer still-pending probe.
-          livenessPingsInFlightCountRef.current = Math.max(
-            0,
-            livenessPingsInFlightCountRef.current - 1
-          );
-        };
-
-        // Handle both resolve/reject explicitly to avoid an unhandled rejection chain.
-        void pingPromise.then(finalizeLivenessProbe, finalizeLivenessProbe);
-
-        let timeoutId: ReturnType<typeof setTimeout> | undefined;
-        try {
-          const timeoutPromise = new Promise<never>((_, reject) => {
-            timeoutId = setTimeout(() => reject(new Error("Ping timeout")), LIVENESS_TIMEOUT_MS);
-          });
-
-          await Promise.race([pingPromise, timeoutPromise]);
-        } finally {
-          if (timeoutId) {
-            clearTimeout(timeoutId);
-          }
-        }
-
-        if (effectDisposed) {
+          recordSlowObservation(rtt);
           return;
         }
-
-        // Ping succeeded - reset failure count and restore connected state if degraded
-        markConnectionHealthy();
-      } catch {
-        if (effectDisposed) {
-          return;
+        // A rejection is a prompt answer, not slowness: it never feeds the latency indicator.
+        consecutiveRejectedProbesRef.current += 1;
+        if (consecutiveRejectedProbesRef.current >= REJECTED_PROBES_FOR_RECONNECT) {
+          forceReconnect(`Liveness probe rejected ${consecutiveRejectedProbesRef.current} times`);
         }
+      };
 
-        // Ping failed
-        consecutivePingFailuresRef.current++;
-
-        if (
-          consecutivePingFailuresRef.current >= CONSECUTIVE_FAILURES_FOR_RECONNECT &&
-          !forceReconnectInProgressRef.current
-        ) {
-          forceReconnectInProgressRef.current = true;
-          console.warn(
-            `[APIProvider] Liveness ping failed ${consecutivePingFailuresRef.current} times; reconnecting...`
-          );
-          cleanup();
-          if (effectDisposed) {
-            return;
-          }
-          connect(authToken);
-          return;
-        }
-
-        if (
-          consecutivePingFailuresRef.current >= CONSECUTIVE_FAILURES_FOR_DEGRADED &&
-          state.status === "connected"
-        ) {
-          setState({ status: "degraded", client, cleanup });
-        }
-      }
+      probeClient.general.ping("liveness").then(
+        () => settle(true),
+        () => settle(false)
+      );
     };
 
-    const intervalId = setInterval(() => {
-      void checkLiveness();
-    }, LIVENESS_INTERVAL_MS);
+    const tick = () => {
+      if (effectDisposed) return;
+      const now = performance.now();
+      const outstanding = outstandingProbeRef.current;
+
+      if (outstanding) {
+        const pendingMs = now - outstanding.sentAt;
+        // Silence is checked before the probe is aged out: a throttled or suspended tab can
+        // fire its next tick past MAX_PROBE_AGE_MS, and a half-open socket must reconnect on
+        // that tick rather than merely re-probe.
+        const silentMs = now - lastInboundBrowserFrameAtRef.current;
+        if (
+          pendingMs >= SILENCE_FOR_RECONNECT_MS &&
+          silentMs >= SILENCE_FOR_RECONNECT_MS &&
+          forceReconnect(`Liveness probe outstanding for ${pendingMs}ms with no inbound traffic`)
+        ) {
+          return;
+        }
+        if (pendingMs <= MAX_PROBE_AGE_MS) {
+          // At most one probe in flight; a pending probe past the slow threshold is itself a
+          // slow observation, with the pending age as the live latency figure.
+          if (pendingMs > SLOW_RESPONSE_MS) {
+            recordSlowObservation(pendingMs);
+          }
+          return;
+        }
+        // Presume the probe lost; its eventual settlement is ignored via the identity check.
+        outstandingProbeRef.current = null;
+      }
+
+      sendProbe();
+    };
+
+    tick();
+    const intervalId = setInterval(tick, LIVENESS_INTERVAL_MS);
     return () => {
       effectDisposed = true;
       clearInterval(intervalId);
+      outstandingProbeRef.current = null;
     };
-  }, [state, props.createWebSocket, connect, authToken]);
+  }, [liveClient, liveProbe, liveCleanup, props.createWebSocket, connect, authToken]);
 
   const authenticate = useCallback(
     (token: string) => {
       authProbeAttemptedRef.current = false;
-      setStoredAuthToken(token);
+      // Safe unawaited: every caller is the token modal's onSubmit, which already awaited
+      // setStoredAuthToken(token), so the token is unchanged here and nothing is cleared (#6848).
+      setStoredAuthToken(token).catch(logServiceWorkerCacheCleanupFailure);
       setAuthToken(token);
       connect(token);
     },
@@ -632,35 +726,30 @@ function ManagedAPIProvider(props: Omit<APIProviderProps, "client">) {
     connect(authToken);
   }, [connect, authToken]);
 
-  // Convert internal state to the discriminated union API
-  const value = useMemo((): UseAPIResult => {
-    const base = { authenticate, retry };
-    switch (state.status) {
-      case "connecting":
-        return { status: "connecting", api: null, error: null, ...base };
-      case "connected":
-        return { status: "connected", api: state.client, error: null, ...base };
-      case "degraded":
-        return { status: "degraded", api: state.client, error: null, ...base };
-      case "reconnecting":
-        return { status: "reconnecting", api: null, error: null, attempt: state.attempt, ...base };
-      case "auth_required":
-        return { status: "auth_required", api: null, error: state.error ?? null, ...base };
-      case "error":
-        return { status: "error", api: null, error: state.error, ...base };
-    }
-  }, [state, authenticate, retry]);
+  const value = useMemo(
+    (): UseAPIResult => ({ ...toAPIState(state), authenticate, retry }),
+    [state, authenticate, retry]
+  );
+  // The store must see "offline" to resubscribe after the reconnect.
+  useAppConfigStoreClient(liveClientOf(value));
 
   // Always render children - consumers handle their own loading/error states
-  return <APIContext.Provider value={value}>{props.children}</APIContext.Provider>;
+  return (
+    <APIContext.Provider value={value}>
+      <ConnectionLatencyContext.Provider value={latencyMs}>
+        {props.children}
+      </ConnectionLatencyContext.Provider>
+    </APIContext.Provider>
+  );
 }
 
 function InjectedClientAPIProvider(
-  props: Pick<APIProviderProps, "children"> & { client: APIClient }
+  props: Pick<APIProviderProps, "children" | "skipAppConfigStore"> & { client: APIClient }
 ) {
   // User rationale: injected clients are already fully constructed, so wrapping them in the
   // browser liveness/reconnect state machine risks leaking async state updates into tests.
   window.__ORPC_CLIENT__ = props.client;
+  useAppConfigStoreClient(props.client, props.skipAppConfigStore);
 
   return (
     <APIContext.Provider
@@ -680,7 +769,12 @@ function InjectedClientAPIProvider(
 export const APIProvider = (props: APIProviderProps) => {
   if (props.client) {
     return (
-      <InjectedClientAPIProvider client={props.client}>{props.children}</InjectedClientAPIProvider>
+      <InjectedClientAPIProvider
+        client={props.client}
+        skipAppConfigStore={props.skipAppConfigStore}
+      >
+        {props.children}
+      </InjectedClientAPIProvider>
     );
   }
 
@@ -699,9 +793,28 @@ export const useAPI = (): UseAPIResult => {
   return context;
 };
 
+/** The client while the connection is live (connected or degraded), else null. */
+export function liveClientOf(state: APIState): APIClient | null {
+  return state.status === "connected" || state.status === "degraded" ? state.api : null;
+}
+
+/**
+ * The API client only while the connection is live; null while offline.
+ *
+ * `useAPI().api` can stay set while Xum reconnects, so the UI keeps what it shows. Code that must
+ * see "offline" uses this instead: the stores (they resubscribe when it comes back), deferred
+ * writes that must wait for a live server, and handlers that report "API not connected".
+ */
+export function useLiveAPI(): APIClient | null {
+  return liveClientOf(useAPI());
+}
+
 /**
  * Like {@link useAPI} but returns null instead of throwing when there is no APIProvider.
  * Use this in best-effort hooks that may render outside an APIProvider (e.g. isolated
  * test harnesses) and should degrade gracefully rather than crash.
  */
 export const useOptionalAPI = (): UseAPIResult | null => useContext(APIContext);
+
+/** Last measured backend round-trip time while the connection is degraded, else null. */
+export const useConnectionLatencyMs = (): number | null => useContext(ConnectionLatencyContext);

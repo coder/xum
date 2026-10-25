@@ -1,15 +1,24 @@
-import { describe, expect, mock, test } from "bun:test";
+import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "fs/promises";
+import * as http from "http";
+import * as net from "net";
 import * as os from "os";
 import * as path from "path";
+import * as zlib from "zlib";
 import { WebSocket, WebSocketServer } from "ws";
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
 import type { RouterClient } from "@orpc/server";
-import { createOrpcServer, DESKTOP_WS_PATH } from "./server";
+import { createOrpcServer, DESKTOP_WS_PATH, ORPC_WS_PATH } from "./server";
+import {
+  FIRST_RUN_EARLY_SCRIPT,
+  FIRST_RUN_MODULES_ID,
+  FIRST_RUN_TEMPLATE_ID,
+  FIRST_RUN_VIEW_HTML,
+} from "./firstRunView";
+import { log } from "@/node/services/log";
 import type { ORPCContext } from "./context";
 import type { AppRouter } from "./router";
-import { Config } from "@/node/config";
 
 function getErrorCode(error: unknown): string | null {
   if (typeof error !== "object" || error === null) {
@@ -54,6 +63,11 @@ async function waitForWebSocketOpen(ws: WebSocket): Promise<void> {
 }
 
 async function waitForWebSocketRejection(ws: WebSocket): Promise<void> {
+  // Since Bun 1.3.10 the `ws` client shim's once() installs two native forwarders, so a
+  // rejected handshake fires 'error' twice (and terminate() before 'close' re-emits it).
+  // The listeners below detach once settled, so keep one for the socket's lifetime;
+  // otherwise the extra 'error' is thrown as unhandled.
+  ws.on("error", () => undefined);
   return new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
       cleanup();
@@ -104,7 +118,8 @@ function createHttpClient(
   headers?: Record<string, string>
 ): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
     headers,
   });
 
@@ -296,6 +311,568 @@ async function expectWebSocketOriginCase(input: {
   );
 }
 
+interface RawResponse {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: string;
+}
+
+// node:http instead of fetch: fetch decodes Content-Encoding transparently, which would hide
+// which file (identity, .br or .gz) the server actually sent.
+function rawRequest(
+  baseUrl: string,
+  urlPath: string,
+  options: { method?: string; headers?: Record<string, string>; body?: Buffer } = {}
+): Promise<RawResponse> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      new URL(urlPath, baseUrl),
+      { method: options.method ?? "GET", headers: options.headers },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk: Buffer) => chunks.push(chunk));
+        res.on("end", () =>
+          resolve({
+            status: res.statusCode ?? 0,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString("utf-8"),
+          })
+        );
+        res.on("error", reject);
+      }
+    );
+    req.on("error", reject);
+    req.end(options.body);
+  });
+}
+
+interface RawBuffer {
+  status: number;
+  headers: http.IncomingHttpHeaders;
+  body: Buffer;
+}
+
+// As rawRequest, but keeps the body as bytes so a compressed response can be decoded.
+function rawRequestBuffer(
+  baseUrl: string,
+  urlPath: string,
+  options: { headers?: Record<string, string> } = {}
+): Promise<RawBuffer> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(new URL(urlPath, baseUrl), { headers: options.headers }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (chunk: Buffer) => chunks.push(chunk));
+      res.on("end", () =>
+        resolve({ status: res.statusCode ?? 0, headers: res.headers, body: Buffer.concat(chunks) })
+      );
+      res.on("error", reject);
+    });
+    req.on("error", reject);
+    req.end();
+  });
+}
+
+function varyIncludesAcceptEncoding(headers: http.IncomingHttpHeaders): boolean {
+  const vary = headers.vary;
+  return (
+    vary
+      ?.split(",")
+      .map((value) => value.trim().toLowerCase())
+      .includes("accept-encoding") ?? false
+  );
+}
+
+describe("createOrpcServer compressed request bodies", () => {
+  // CVE-2026-111497: body-parser runs before auth and would inflate a br body with Node's
+  // Brotli decoder, so the server must refuse every compressed body without decoding it.
+  async function postWait(
+    contentType: string,
+    body: Buffer,
+    contentEncoding?: string
+  ): Promise<{ status: number; flowIds: string[] }> {
+    const flowIds: string[] = [];
+    const context: Partial<ORPCContext> = {
+      serverAuthService: {
+        waitForGithubDeviceFlow: (flowId: string) => {
+          flowIds.push(flowId);
+          return Promise.resolve({ success: false, error: "stub" });
+        },
+        cancelGithubDeviceFlow: () => undefined,
+      } as unknown as ORPCContext["serverAuthService"],
+    };
+    // The server requires a token and the request sends none: the 415 must come from body-parser,
+    // which an unauthenticated client reaches.
+    const server = await createOrpcServer({
+      host: "127.0.0.1",
+      port: 0,
+      authToken: "test-token",
+      context: context as ORPCContext,
+    });
+    try {
+      const headers: Record<string, string> = { "Content-Type": contentType };
+      if (contentEncoding !== undefined) headers["Content-Encoding"] = contentEncoding;
+      const res = await rawRequest(server.baseUrl, "/auth/server-login/github/wait", {
+        method: "POST",
+        headers,
+        body,
+      });
+      return { status: res.status, flowIds };
+    } finally {
+      await server.close();
+    }
+  }
+
+  const json = Buffer.from(JSON.stringify({ flowId: "flow-1" }));
+  const form = Buffer.from("flowId=flow-1");
+
+  test.each([
+    ["br JSON", "application/json", zlib.brotliCompressSync(json), "br"],
+    ["br form", "application/x-www-form-urlencoded", zlib.brotliCompressSync(form), "br"],
+    ["gzip JSON", "application/json", zlib.gzipSync(json), "gzip"],
+  ] as const)(
+    "refuses a %s body with 415 before auth and before the route",
+    async (_name, contentType, body, encoding) => {
+      const result = await postWait(contentType, body, encoding);
+      expect(result.status).toBe(415);
+      expect(result.flowIds).toEqual([]);
+    }
+  );
+
+  test.each([
+    ["JSON", "application/json", json],
+    ["form", "application/x-www-form-urlencoded", form],
+  ] as const)("still parses an uncompressed %s body", async (_name, contentType, body) => {
+    const result = await postWait(contentType, body);
+    expect(result.status).not.toBe(415);
+    expect(result.flowIds).toEqual(["flow-1"]);
+  });
+});
+
+describe("createOrpcServer hashed static asset compression", () => {
+  const HASHED_JS = "main-AbCd1234.js";
+  const IDENTITY_BODY = "console.log('identity body');";
+  // Distinct bytes and lengths per file so each assertion proves which file the server sent.
+  const BROTLI_BODY = "fake brotli payload";
+  const GZIP_BODY = "fake gzip payload, longer";
+  const IMMUTABLE_CACHE_CONTROL = "public, max-age=31536000, immutable";
+  const staticFiles = {
+    [HASHED_JS]: IDENTITY_BODY,
+    [`${HASHED_JS}.br`]: BROTLI_BODY,
+    [`${HASHED_JS}.gz`]: GZIP_BODY,
+    "plain-ZyXw9876.js": "console.log('no precompressed siblings');",
+    "manifest.json": '{"name":"xum"}',
+    "manifest.json.br": "unhashed brotli must never be sent",
+    "terminal.html": "<!doctype html><title>terminal</title>",
+  };
+
+  test("negotiates the precompressed file by Accept-Encoding and caches it as immutable", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      const identity = await rawRequest(server.baseUrl, `/${HASHED_JS}`);
+      expect(identity.headers["content-type"]).toContain("javascript");
+
+      const cases: Array<{
+        urlPath: string;
+        acceptEncoding: string | undefined;
+        encoding: string | undefined;
+        body: string;
+      }> = [
+        // Browsers list gzip before br; brotli must still win.
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "gzip, deflate, br, zstd",
+          encoding: "br",
+          body: BROTLI_BODY,
+        },
+        { urlPath: `/${HASHED_JS}?v=1`, acceptEncoding: "br", encoding: "br", body: BROTLI_BODY },
+        { urlPath: `/${HASHED_JS}`, acceptEncoding: "gzip", encoding: "gzip", body: GZIP_BODY },
+        // A higher client q-value beats the server's brotli preference.
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "gzip;q=1, br;q=0.1",
+          encoding: "gzip",
+          body: GZIP_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "identity;q=1, br;q=0.5",
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: undefined,
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "identity",
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        {
+          urlPath: `/${HASHED_JS}`,
+          acceptEncoding: "br;q=0, gzip;q=0",
+          encoding: undefined,
+          body: IDENTITY_BODY,
+        },
+        // No .br/.gz on disk: fall back to the identity file, not an error or the SPA HTML.
+        {
+          urlPath: "/plain-ZyXw9876.js",
+          acceptEncoding: "br, gzip",
+          encoding: undefined,
+          body: staticFiles["plain-ZyXw9876.js"],
+        },
+      ];
+
+      for (const testCase of cases) {
+        const label = `${testCase.urlPath} with Accept-Encoding ${testCase.acceptEncoding ?? "(none)"}`;
+        const res = await rawRequest(server.baseUrl, testCase.urlPath, {
+          headers: testCase.acceptEncoding ? { "Accept-Encoding": testCase.acceptEncoding } : {},
+        });
+        expect(res.status, label).toBe(200);
+        expect(res.headers["content-encoding"], label).toBe(testCase.encoding);
+        expect(res.body, label).toBe(testCase.body);
+        expect(res.headers["content-type"], label).toBe(identity.headers["content-type"]);
+        expect(varyIncludesAcceptEncoding(res.headers), label).toBe(true);
+        expect(res.headers["cache-control"], label).toBe(IMMUTABLE_CACHE_CONTROL);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("keeps existing headers for unhashed files", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      const cases = [
+        {
+          urlPath: "/manifest.json",
+          cacheControl: "public, max-age=0",
+          body: staticFiles["manifest.json"],
+        },
+        {
+          urlPath: "/terminal.html",
+          cacheControl: "public, max-age=0",
+          body: staticFiles["terminal.html"],
+        },
+      ];
+
+      for (const testCase of cases) {
+        const res = await rawRequest(server.baseUrl, testCase.urlPath, {
+          headers: { "Accept-Encoding": "br, gzip" },
+        });
+        expect(res.status, testCase.urlPath).toBe(200);
+        expect(res.body, testCase.urlPath).toContain(testCase.body);
+        expect(res.headers["content-encoding"], testCase.urlPath).toBeUndefined();
+        expect(res.headers["cache-control"], testCase.urlPath).toBe(testCase.cacheControl);
+        expect(varyIncludesAcceptEncoding(res.headers), testCase.urlPath).toBe(false);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("answers HEAD on an encoded hashed asset with the GET headers and no body", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      const headers = { "Accept-Encoding": "br" };
+      const get = await rawRequest(server.baseUrl, `/${HASHED_JS}`, { headers });
+      const head = await rawRequest(server.baseUrl, `/${HASHED_JS}`, { method: "HEAD", headers });
+      expect(head.status).toBe(200);
+      expect(head.body).toBe("");
+      expect(head.headers["content-encoding"]).toBe("br");
+      expect(head.headers["content-length"]).toBe(String(BROTLI_BODY.length));
+      for (const name of ["content-type", "content-length", "cache-control", "vary", "etag"]) {
+        expect(head.headers[name], name).toBe(get.headers[name]);
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("ignores Range on encoded hashed assets but honors it on identity responses", async () => {
+    const { server, close } = await createStaticTestServer({ files: staticFiles });
+
+    try {
+      // A byte range of the brotli stream is not a range of the identity resource: send it whole.
+      const encoded = await rawRequest(server.baseUrl, `/${HASHED_JS}`, {
+        headers: { "Accept-Encoding": "br", Range: "bytes=0-3" },
+      });
+      expect(encoded.status).toBe(200);
+      expect(encoded.body).toBe(BROTLI_BODY);
+      expect(encoded.headers["content-range"]).toBeUndefined();
+      expect(encoded.headers["accept-ranges"]).toBeUndefined();
+
+      const identity = await rawRequest(server.baseUrl, `/${HASHED_JS}`, {
+        headers: { Range: "bytes=0-3" },
+      });
+      expect(identity.status).toBe(206);
+      expect(identity.headers["content-range"]).toBe(`bytes 0-3/${IDENTITY_BODY.length}`);
+      expect(identity.body).toBe(IDENTITY_BODY.slice(0, 4));
+    } finally {
+      await close();
+    }
+  });
+});
+
+// T3 Option C step 1: the SPA page is compressed per response (its HTML is rewritten per request) and
+// preloads the fonts its first view paints with, named by the built CSS. dist/index.html is untouched:
+// Electron loads it from file://.
+describe("createOrpcServer SPA fallback compression and font preloads", () => {
+  const css =
+    '@font-face{font-family:Geist;src:url(./Geist-Variable-C_ya05Eu.woff2)format("woff2")}' +
+    '@font-face{font-family:Nerd Font Symbols;src:url(./nerd-font-symbols-CoUzE12l.woff2)format("woff2")}' +
+    '@font-face{font-family:Geist Mono;src:url(./GeistMono-Variable-BJ0bRpLQ.woff2)format("woff2")}';
+  const indexHtml =
+    '<!doctype html><html><head><title>mux</title><link rel="stylesheet" crossorigin href="./API-CCITiHZd.css"></head><body><div>ok</div></body></html>';
+  const files = { "index.html": indexHtml, "API-CCITiHZd.css": css };
+
+  function decode(res: RawBuffer): string {
+    const encoding = res.headers["content-encoding"];
+    if (encoding === "br") return zlib.brotliDecompressSync(res.body).toString("utf-8");
+    if (encoding === "gzip") return zlib.gunzipSync(res.body).toString("utf-8");
+    expect(encoding).toBeUndefined();
+    return res.body.toString("utf-8");
+  }
+
+  test("negotiates br, gzip and identity with Vary, and keeps no-store", async () => {
+    const { server, close } = await createStaticTestServer({ files });
+    try {
+      const cases: Array<[string | undefined, string | undefined]> = [
+        ["br", "br"],
+        ["gzip", "gzip"],
+        [undefined, undefined],
+        ["identity", undefined],
+        // A browser lists gzip first: on equal q-values the server prefers brotli.
+        ["gzip, deflate, br, zstd", "br"],
+        ["br;q=0.5, gzip", "gzip"],
+      ];
+      for (const [acceptEncoding, expected] of cases) {
+        for (const urlPath of ["/", "/workspace/a1b2c3d4e5"]) {
+          const res = await rawRequestBuffer(server.baseUrl, urlPath, {
+            headers: acceptEncoding === undefined ? {} : { "Accept-Encoding": acceptEncoding },
+          });
+          const label = `${urlPath} ${acceptEncoding ?? "(none)"}`;
+          expect(res.status, label).toBe(200);
+          expect(res.headers["content-encoding"], label).toBe(expected);
+          expect(varyIncludesAcceptEncoding(res.headers), label).toBe(true);
+          expect(res.headers["cache-control"], label).toBe("no-store");
+          expect(decode(res), label).toContain("<title>mux</title>");
+        }
+      }
+    } finally {
+      await close();
+    }
+  });
+
+  test("preloads only Geist in the response, on every route, never in dist/index.html", async () => {
+    const { server, tempDir, close } = await createStaticTestServer({ files });
+    try {
+      const preload = (file: string) =>
+        `<link rel="preload" as="font" type="font/woff2" crossorigin href="./${file}" />`;
+      const root = decode(await rawRequestBuffer(server.baseUrl, "/"));
+      const workspace = decode(await rawRequestBuffer(server.baseUrl, "/workspace/a1b2c3d4e5"));
+      for (const html of [root, workspace]) {
+        expect(html).toContain(preload("Geist-Variable-C_ya05Eu.woff2"));
+        expect(html.match(/rel="preload" as="font"/g)).toHaveLength(1);
+        // Not even on /workspace, where code shows: on a throttled phone the Geist Mono preload
+        // competed with the app JS and made the page's content 0.28 s later (page-timing, #6216).
+        expect(html).not.toContain("GeistMono-Variable");
+        // Not a first-view font, though it is a woff2 in the same CSS.
+        expect(html).not.toContain("nerd-font-symbols");
+        // After the injected <base>, so the relative font URLs resolve under a proxy base path.
+        expect(html.indexOf("<base ")).toBeLessThan(html.indexOf('rel="preload"'));
+      }
+      expect(await fs.readFile(path.join(tempDir, "index.html"), "utf-8")).toBe(indexHtml);
+    } finally {
+      await close();
+    }
+  });
+});
+
+// T3 C step 2 (plan section 5.6, PR 4b): only "/" gets the static first-run view and loads the app
+// JS after it paints. Catches the view on another route, a module tag left in <head>, a module
+// list after the early script (a paint-cache visit loads at once and needs it), an early script
+// after the stylesheet (it would wait for the CSS), a view on a page with no module script, and
+// a write to dist/index.html.
+describe("createOrpcServer static first-run view on /", () => {
+  const MODULES =
+    '<script type="module" crossorigin src="./main-AAAAAAAA.js"></script>\n    <link rel="modulepreload" crossorigin href="./API-BBBBBBBB.js">\n';
+  const indexHtml = `<!doctype html><html><head><title>mux</title>\n    ${MODULES}    <link rel="stylesheet" crossorigin href="./API-CCITiHZd.css"></head><body><div id="root"></div></body></html>`;
+  const decode = (res: RawBuffer) => {
+    const encoding = res.headers["content-encoding"];
+    if (encoding === "br") return zlib.brotliDecompressSync(res.body).toString("utf-8");
+    if (encoding === "gzip") return zlib.gunzipSync(res.body).toString("utf-8");
+    return res.body.toString("utf-8");
+  };
+  const at = (html: string, needle: string) => {
+    expect(countOccurrences(html, needle), needle).toBe(1);
+    return html.indexOf(needle);
+  };
+
+  test("serves / with the view's template, the module list and the early script, in order", async () => {
+    const { server, tempDir, close } = await createStaticTestServer({
+      files: { "index.html": indexHtml },
+    });
+    try {
+      for (const [urlPath, encoding] of [
+        ["/", "br"],
+        ["/", "gzip"],
+        ["/?token=t", "identity"],
+      ]) {
+        const res = await rawRequestBuffer(server.baseUrl, urlPath, {
+          headers: { "Accept-Encoding": encoding },
+        });
+        expect(res.headers["content-encoding"], urlPath).toBe(
+          encoding === "identity" ? undefined : encoding
+        );
+        const html = decode(res);
+        expect(html).not.toContain('<script type="module"');
+        expect(html).not.toContain('<link rel="modulepreload"');
+        const list = `<script type="application/json" id="${FIRST_RUN_MODULES_ID}">`;
+        const listJson = html.slice(
+          at(html, list) + list.length,
+          html.indexOf("</script>", at(html, list))
+        );
+        expect(JSON.parse(listJson)).toEqual({
+          script: "./main-AAAAAAAA.js",
+          preload: ["./API-BBBBBBBB.js"],
+        });
+        const order = [
+          at(html, "<base "),
+          at(html, list),
+          at(html, `<script>${FIRST_RUN_EARLY_SCRIPT}</script>`),
+          at(html, 'rel="stylesheet"'),
+          at(html, '<div id="root"></div>'),
+          at(html, `<template id="${FIRST_RUN_TEMPLATE_ID}">${FIRST_RUN_VIEW_HTML}</template>`),
+          at(html, "</body>"),
+        ];
+        expect(order, urlPath).toEqual([...order].sort((a, b) => a - b));
+      }
+      expect(await fs.readFile(path.join(tempDir, "index.html"), "utf-8")).toBe(indexHtml);
+    } finally {
+      await close();
+    }
+  });
+
+  test("leaves every other route, and a / without one module script, as before", async () => {
+    const noModules = indexHtml.replace(MODULES, "");
+    for (const [page, urlPaths] of [
+      [indexHtml, ["/workspace/a1b2c3d4e5", "/project?path=%2Ftmp%2Fp", "/index.html"]],
+      [noModules, ["/"]],
+    ] as const) {
+      const { server, close } = await createStaticTestServer({ files: { "index.html": page } });
+      try {
+        for (const urlPath of urlPaths) {
+          const html = decode(await rawRequestBuffer(server.baseUrl, urlPath));
+          // Without the base, redirect and proxy-template injections the page is dist's, byte for byte.
+          const stripped = html
+            .replace(/\n {4}<script>\(\(\)=>\{const pathname=[^\n]*<\/script>/, "")
+            .replace(/\n {4}<script>window\.__MUX_PROXY_URI_TEMPLATE__ = [^<]*<\/script>/, "")
+            .replace(/\n {4}<base href="[^"]*" \/>/, "");
+          expect(stripped, urlPath).toBe(page);
+        }
+      } finally {
+        await close();
+      }
+    }
+  });
+});
+
+// #5945: crawlers and agents probe /robots.txt, /llms.txt and /.well-known/*. Answering them with
+// the SPA page (status 200, text/html) makes Lighthouse report invalid files instead of absent ones.
+describe("createOrpcServer SPA fallback for file and well-known paths", () => {
+  const SPA_TITLE = "<title>mux</title>";
+
+  test("answers missing file paths and /.well-known/ with 404 instead of the SPA page", async () => {
+    const { server, close } = await createStaticTestServer();
+
+    try {
+      const urlPaths = [
+        // No robots.txt on purpose: a 4xx makes Lighthouse skip its robots audit, while
+        // `Disallow: /` failed is-crawlable and dropped SEO from 91 to 63.
+        "/robots.txt",
+        `${APP_PROXY_BASE_PATH}/robots.txt`,
+        "/llms.txt",
+        "/.well-known/ai-catalog.json",
+        "/.well-known/security",
+        "/.well-known",
+        "/.env",
+        "/.git/config",
+        "/assets/.env",
+        // Express keeps percent escapes in req.path; serve-static decodes them before its lookup.
+        "/%2Eenv",
+        "/%2ewell-known/ai-catalog.json",
+        "/missing%2Ejs",
+        "/assets/x.js",
+        "/other/missing.js",
+        "/workspace/abc/missing.js",
+        "/favicon.png?v=1",
+        `${APP_PROXY_BASE_PATH}/llms.txt`,
+      ];
+      for (const urlPath of urlPaths) {
+        const res = await rawRequest(server.baseUrl, urlPath);
+        expect(res.status, urlPath).toBe(404);
+        expect(res.body, urlPath).not.toContain(SPA_TITLE);
+        expect(res.headers["cache-control"], urlPath).not.toBe("no-store");
+      }
+
+      // Hashed-looking but absent (#5953): no immutable cache or encoding headers either.
+      const missingHashed = await rawRequest(server.baseUrl, "/missing-AbCd1234.js", {
+        headers: { "Accept-Encoding": "br, gzip" },
+      });
+      expect(missingHashed.status).toBe(404);
+      expect(missingHashed.body).not.toContain(SPA_TITLE);
+      expect(missingHashed.headers["content-encoding"]).toBeUndefined();
+      expect(missingHashed.headers["cache-control"]).toBeUndefined();
+      expect(varyIncludesAcceptEncoding(missingHashed.headers)).toBe(false);
+    } finally {
+      await close();
+    }
+  });
+
+  test("keeps serving the no-store SPA page for client routes and API files", async () => {
+    const { server, close } = await createStaticTestServer();
+
+    try {
+      const spaPaths = [
+        "/",
+        "/index.html",
+        "/workspace/abc",
+        // Legacy workspace IDs are `${project}-${branch}` and can contain dots.
+        "/workspace/next.js-main",
+        "/workspace/proj-release-1.2",
+        "/workspace/proj-fix.js",
+        "/workspace/next%2Ejs-main",
+        // A malformed escape must not throw; the path has no dot, so it stays a client route.
+        "/settings%E0",
+        "/settings",
+        "/settings/providers",
+        "/project?path=%2Fhome%2Fdev%2Frepo.git",
+        `${APP_PROXY_BASE_PATH}/workspace/abc`,
+      ];
+      for (const urlPath of spaPaths) {
+        const res = await rawRequest(server.baseUrl, urlPath);
+        expect(res.status, urlPath).toBe(200);
+        expect(res.body, urlPath).toContain(SPA_TITLE);
+        expect(res.headers["cache-control"], urlPath).toBe("no-store");
+      }
+
+      // API paths that end in a file extension stay with their own handlers.
+      const spec = await rawRequest(server.baseUrl, "/api/spec.json");
+      expect(spec.status).toBe(200);
+      expect(spec.headers["content-type"]).toContain("application/json");
+    } finally {
+      await close();
+    }
+  });
+});
+
 describe("createOrpcServer", () => {
   test("serveStatic fallback does not swallow /api routes", async () => {
     // Minimal context stub - router won't be exercised by this test.
@@ -343,10 +920,17 @@ describe("createOrpcServer", () => {
       expect(countOccurrences(rootHtml, '<base href="./" />')).toBe(1);
       expectSlashlessRootRedirectBeforeBase(rootHtml, "./");
 
-      const doubleSlashRes = await fetch(`${server.baseUrl}//attacker.example`);
-      expect(doubleSlashRes.status).toBe(200);
-      const doubleSlashHtml = await doubleSlashRes.text();
-      expect(doubleSlashHtml).not.toContain("location.replace(location.origin+pathname");
+      // A dotted host looks like a file name and gets a 404 (#5945). The dotless host keeps the
+      // redirect guard covered on an SPA response.
+      for (const [urlPath, status] of [
+        ["//attacker.example", 404],
+        ["//attacker", 200],
+      ] as const) {
+        const doubleSlashRes = await fetch(`${server.baseUrl}${urlPath}`);
+        expect(doubleSlashRes.status, urlPath).toBe(status);
+        const doubleSlashHtml = await doubleSlashRes.text();
+        expect(doubleSlashHtml, urlPath).not.toContain("location.replace(location.origin+pathname");
+      }
 
       const deepRouteRes = await fetch(`${server.baseUrl}/some/spa/route`);
       expect(deepRouteRes.status).toBe(200);
@@ -529,15 +1113,18 @@ describe("createOrpcServer", () => {
   });
 
   test("includes app-proxy base paths in OAuth redirect and callback return URLs", async () => {
-    let muxGatewayRedirectUri = "";
+    const redirectUris: string[] = [];
     const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
+      coderOauthService: {
         startServerFlow: (input: { redirectUri: string }) => {
-          muxGatewayRedirectUri = input.redirectUri;
-          return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway" };
+          redirectUris.push(input.redirectUri);
+          return Promise.resolve({
+            success: true,
+            data: { flowId: "flow", authorizeUrl: "https://coder.test/authorize" },
+          });
         },
-        handleServerCallbackAndExchange: () => Promise.resolve({ success: true, data: undefined }),
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+        handleServerCallback: () => Promise.resolve({ success: true, data: undefined }),
+      } as unknown as ORPCContext["coderOauthService"],
     };
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
 
@@ -549,19 +1136,20 @@ describe("createOrpcServer", () => {
         authToken: "test-token",
       });
 
-      const startResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/start`, {
-        headers: {
-          Authorization: "Bearer test-token",
-          "X-Forwarded-Prefix": APP_PROXY_BASE_PATH,
-        },
-      });
-      expect(startResponse.status).toBe(200);
-      expect(muxGatewayRedirectUri).toBe(
-        `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/mux-gateway/callback`
+      const startResponse = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`,
+        {
+          headers: {
+            Authorization: "Bearer test-token",
+            "X-Forwarded-Prefix": APP_PROXY_BASE_PATH,
+          },
+        }
       );
+      expect(startResponse.status).toBe(200);
+      expect(redirectUris).toEqual([`${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback`]);
 
       const callbackResponse = await fetch(
-        `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/mux-gateway/callback?state=test&code=test`
+        `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback?state=test&code=test`
       );
       expect(callbackResponse.status).toBe(200);
       const callbackHtml = await callbackResponse.text();
@@ -778,25 +1366,17 @@ describe("createOrpcServer", () => {
   });
 
   test("uses HTTPS redirect URIs for OAuth start routes when allowHttpOrigin is enabled", async () => {
-    let muxGatewayRedirectUri = "";
-    let muxGovernorRedirectUri = "";
-
+    const redirectUris: string[] = [];
     const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
+      coderOauthService: {
         startServerFlow: (input: { redirectUri: string }) => {
-          muxGatewayRedirectUri = input.redirectUri;
-          return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway" };
-        },
-      } as unknown as ORPCContext["muxGatewayOauthService"],
-      muxGovernorOauthService: {
-        startServerFlow: (input: { governorOrigin: string; redirectUri: string }) => {
-          muxGovernorRedirectUri = input.redirectUri;
-          return {
+          redirectUris.push(input.redirectUri);
+          return Promise.resolve({
             success: true,
-            data: { authorizeUrl: "https://governor.example.com/auth", state: "state-governor" },
-          };
+            data: { flowId: "flow", authorizeUrl: "https://coder.test/authorize" },
+          });
         },
-      } as unknown as ORPCContext["muxGovernorOauthService"],
+      } as unknown as ORPCContext["coderOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -817,40 +1397,30 @@ describe("createOrpcServer", () => {
         "X-Forwarded-Proto": "http",
       };
 
-      const muxGatewayResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/start`, {
-        headers: sharedHeaders,
-      });
-      expect(muxGatewayResponse.status).toBe(200);
+      const response = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`,
+        { headers: sharedHeaders }
+      );
+      expect(response.status).toBe(200);
 
-      const muxGovernorResponse = await fetch(
-        `${server.baseUrl}/auth/mux-governor/start?governorUrl=${encodeURIComponent("https://governor.example.com")}`,
-        {
-          headers: sharedHeaders,
-        }
-      );
-      expect(muxGovernorResponse.status).toBe(200);
-
-      expect(muxGatewayRedirectUri).toBe(
-        "https://mux-public.example.com/auth/mux-gateway/callback"
-      );
-      expect(muxGovernorRedirectUri).toBe(
-        "https://mux-public.example.com/auth/mux-governor/callback"
-      );
+      expect(redirectUris).toEqual(["https://mux-public.example.com/auth/coder/callback"]);
     } finally {
       await server?.close();
     }
   });
 
   test("uses HTTP redirect URIs for OAuth start routes when client-facing proto is HTTP", async () => {
-    let muxGatewayRedirectUri = "";
-
+    const redirectUris: string[] = [];
     const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
+      coderOauthService: {
         startServerFlow: (input: { redirectUri: string }) => {
-          muxGatewayRedirectUri = input.redirectUri;
-          return { authorizeUrl: "https://gateway.example.com/auth", state: "state-gateway-http" };
+          redirectUris.push(input.redirectUri);
+          return Promise.resolve({
+            success: true,
+            data: { flowId: "flow", authorizeUrl: "https://coder.test/authorize" },
+          });
         },
-      } as unknown as ORPCContext["muxGatewayOauthService"],
+      } as unknown as ORPCContext["coderOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -863,16 +1433,19 @@ describe("createOrpcServer", () => {
         authToken: "test-token",
       });
 
-      const response = await fetch(`${server.baseUrl}/auth/mux-gateway/start`, {
-        headers: {
-          Authorization: "Bearer test-token",
-          Origin: server.baseUrl,
-          "X-Forwarded-Proto": "http,https",
-        },
-      });
+      const response = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`,
+        {
+          headers: {
+            Authorization: "Bearer test-token",
+            Origin: server.baseUrl,
+            "X-Forwarded-Proto": "http,https",
+          },
+        }
+      );
 
       expect(response.status).toBe(200);
-      expect(muxGatewayRedirectUri).toBe(`${server.baseUrl}/auth/mux-gateway/callback`);
+      expect(redirectUris).toEqual([`${server.baseUrl}/auth/coder/callback`]);
     } finally {
       await server?.close();
     }
@@ -1115,9 +1688,9 @@ describe("createOrpcServer", () => {
 
   test("OAuth callback routes accept POST redirects (query + form_post)", async () => {
     const stubContext: Partial<ORPCContext> = {
-      muxGovernorOauthService: {
-        handleServerCallbackAndExchange: () => Promise.resolve({ success: true, data: undefined }),
-      } as unknown as ORPCContext["muxGovernorOauthService"],
+      coderOauthService: {
+        handleServerCallback: () => Promise.resolve({ success: true, data: undefined }),
+      } as unknown as ORPCContext["coderOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1131,22 +1704,70 @@ describe("createOrpcServer", () => {
 
       // Some OAuth providers issue 307/308 redirects which preserve POST.
       const queryRes = await fetch(
-        `${server.baseUrl}/auth/mux-governor/callback?state=test-state&code=test-code`,
+        `${server.baseUrl}/auth/coder/callback?state=test-state&code=test-code`,
         { method: "POST" }
       );
       expect(queryRes.status).toBe(200);
       const queryText = await queryRes.text();
-      expect(queryText).toContain("Enrollment complete");
+      expect(queryText).toContain("Login complete");
 
       // response_mode=form_post delivers params in the request body.
-      const formRes = await fetch(`${server.baseUrl}/auth/mux-governor/callback`, {
+      const formRes = await fetch(`${server.baseUrl}/auth/coder/callback`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: "state=test-state&code=test-code",
       });
       expect(formRes.status).toBe(200);
       const formText = await formRes.text();
-      expect(formText).toContain("Enrollment complete");
+      expect(formText).toContain("Login complete");
+    } finally {
+      await server?.close();
+    }
+  });
+
+  test("MCP OAuth callback forwards the RFC 9207 iss parameter (query + form_post)", async () => {
+    // The MCP SDK rejects the code exchange for issuers that advertise RFC 9207
+    // unless the route passes `iss` through (Linear login regression).
+    const callbackInputs: unknown[] = [];
+    const stubContext: Partial<ORPCContext> = {
+      mcpOauthService: {
+        handleServerCallbackAndExchange: (input: unknown) => {
+          callbackInputs.push(input);
+          return Promise.resolve({ success: true, data: undefined });
+        },
+      } as unknown as ORPCContext["mcpOauthService"],
+    };
+
+    let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
+
+    try {
+      server = await createOrpcServer({
+        host: "127.0.0.1",
+        port: 0,
+        context: stubContext as ORPCContext,
+      });
+
+      const issuer = "https://mcp.linear.app";
+      const queryRes = await fetch(
+        `${server.baseUrl}/auth/mcp-oauth/callback?state=query-state&code=query-code&iss=${encodeURIComponent(issuer)}`
+      );
+      expect(queryRes.status).toBe(200);
+
+      const formRes = await fetch(`${server.baseUrl}/auth/mcp-oauth/callback`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          state: "form-state",
+          code: "form-code",
+          iss: issuer,
+        }).toString(),
+      });
+      expect(formRes.status).toBe(200);
+
+      expect(callbackInputs).toEqual([
+        expect.objectContaining({ state: "query-state", code: "query-code", iss: issuer }),
+        expect.objectContaining({ state: "form-state", code: "form-code", iss: issuer }),
+      ]);
     } finally {
       await server?.close();
     }
@@ -1155,15 +1776,12 @@ describe("createOrpcServer", () => {
   test("allows cross-origin POST requests on OAuth callback routes", async () => {
     const handleSuccessfulCallback = () => Promise.resolve({ success: true, data: undefined });
     const stubContext: Partial<ORPCContext> = {
-      muxGatewayOauthService: {
-        handleServerCallbackAndExchange: handleSuccessfulCallback,
-      } as unknown as ORPCContext["muxGatewayOauthService"],
-      muxGovernorOauthService: {
-        handleServerCallbackAndExchange: handleSuccessfulCallback,
-      } as unknown as ORPCContext["muxGovernorOauthService"],
       mcpOauthService: {
         handleServerCallbackAndExchange: handleSuccessfulCallback,
       } as unknown as ORPCContext["mcpOauthService"],
+      coderOauthService: {
+        handleServerCallback: handleSuccessfulCallback,
+      } as unknown as ORPCContext["coderOauthService"],
     };
 
     let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
@@ -1180,21 +1798,13 @@ describe("createOrpcServer", () => {
         "Content-Type": "application/x-www-form-urlencoded",
       };
 
-      const muxGatewayResponse = await fetch(`${server.baseUrl}/auth/mux-gateway/callback`, {
+      const coderOauthResponse = await fetch(`${server.baseUrl}/auth/coder/callback`, {
         method: "POST",
         headers: callbackHeaders,
         body: "state=test-state&code=test-code",
       });
-      expect(muxGatewayResponse.status).toBe(200);
-      expect(muxGatewayResponse.headers.get("access-control-allow-origin")).toBeNull();
-
-      const muxGovernorResponse = await fetch(`${server.baseUrl}/auth/mux-governor/callback`, {
-        method: "POST",
-        headers: callbackHeaders,
-        body: "state=test-state&code=test-code",
-      });
-      expect(muxGovernorResponse.status).toBe(200);
-      expect(muxGovernorResponse.headers.get("access-control-allow-origin")).toBeNull();
+      expect(coderOauthResponse.status).toBe(200);
+      expect(coderOauthResponse.headers.get("access-control-allow-origin")).toBeNull();
 
       const mcpOauthResponse = await fetch(`${server.baseUrl}/auth/mcp-oauth/callback`, {
         method: "POST",
@@ -1205,6 +1815,204 @@ describe("createOrpcServer", () => {
       expect(mcpOauthResponse.headers.get("access-control-allow-origin")).toBeNull();
     } finally {
       await server?.close();
+    }
+  });
+
+  test("Coder OAuth start route builds a server-hosted redirect URI and the callback renders the flow outcome", async () => {
+    const startCalls: Array<{ deploymentUrl: string; flowId?: string; redirectUri: string }> = [];
+    const callbackCalls: Array<{
+      state: string | null;
+      code: string | null;
+      error: string | null;
+    }> = [];
+    const stubContext: Partial<ORPCContext> = {
+      coderOauthService: {
+        startServerFlow: (input: {
+          deploymentUrl: string;
+          flowId?: string;
+          redirectUri: string;
+        }) => {
+          startCalls.push(input);
+          return Promise.resolve({
+            success: true,
+            data: {
+              flowId: input.flowId ?? "generated",
+              authorizeUrl: "https://coder.test/authorize",
+            },
+          });
+        },
+        handleServerCallback: (input: {
+          state: string | null;
+          code: string | null;
+          error: string | null;
+        }) => {
+          callbackCalls.push(input);
+          return Promise.resolve(
+            input.state === "known-state"
+              ? { success: true, data: undefined }
+              : { success: false, error: "Unknown or expired OAuth state" }
+          );
+        },
+      } as unknown as ORPCContext["coderOauthService"],
+    };
+    let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
+
+    try {
+      server = await createOrpcServer({
+        host: "127.0.0.1",
+        port: 0,
+        context: stubContext as ORPCContext,
+        authToken: "test-token",
+      });
+
+      // Start requires auth: the route mints a registration on the deployment.
+      const unauthenticated = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test`
+      );
+      expect(unauthenticated.status).toBe(401);
+      expect(startCalls).toHaveLength(0);
+
+      const missingDeployment = await fetch(`${server.baseUrl}/auth/coder/start`, {
+        headers: { Authorization: "Bearer test-token" },
+      });
+      expect(missingDeployment.status).toBe(400);
+
+      // The redirect URI is derived from the request (incl. app-proxy prefix),
+      // never taken from the client.
+      const startResponse = await fetch(
+        `${server.baseUrl}/auth/coder/start?deploymentUrl=https://coder.test&flowId=flow-0123456789abcdef`,
+        {
+          headers: {
+            Authorization: "Bearer test-token",
+            "X-Forwarded-Prefix": APP_PROXY_BASE_PATH,
+          },
+        }
+      );
+      expect(startResponse.status).toBe(200);
+      expect(await startResponse.json()).toEqual({
+        flowId: "flow-0123456789abcdef",
+        authorizeUrl: "https://coder.test/authorize",
+      });
+      expect(startCalls).toEqual([
+        {
+          deploymentUrl: "https://coder.test",
+          flowId: "flow-0123456789abcdef",
+          redirectUri: `${server.baseUrl}${APP_PROXY_BASE_PATH}/auth/coder/callback`,
+        },
+      ]);
+
+      // Callback: unauthenticated navigation; outcome decides the page.
+      const okResponse = await fetch(
+        `${server.baseUrl}/auth/coder/callback?state=known-state&code=test-code`
+      );
+      expect(okResponse.status).toBe(200);
+      const okHtml = await okResponse.text();
+      expect(okHtml).toContain("Login complete");
+      expect(okHtml).toContain('"type":"coder-oauth"');
+
+      const failedResponse = await fetch(
+        `${server.baseUrl}/auth/coder/callback?state=stale-state&code=test-code`
+      );
+      expect(failedResponse.status).toBe(400);
+      expect(await failedResponse.text()).toContain("Unknown or expired OAuth state");
+      expect(callbackCalls.map((c) => c.state)).toEqual(["known-state", "stale-state"]);
+    } finally {
+      await server?.close();
+    }
+  });
+
+  test("localhost binds both loopback families on one port", async () => {
+    // Regression: binding "localhost" used to take only the first resolved family,
+    // leaving the other loopback address free for another dev server on the same port.
+    // Mixed case also exercises hostname normalization.
+    const stubContext: Partial<ORPCContext> = {};
+    const server = await createOrpcServer({
+      host: "LocalHost",
+      port: 0,
+      context: stubContext as ORPCContext,
+      authToken: "test-token",
+    });
+
+    try {
+      expect(server.baseUrl).toBe(`http://LocalHost:${server.port}`);
+      const v4 = await fetch(`http://127.0.0.1:${server.port}/version`);
+      expect(v4.status).toBe(200);
+
+      let v6: Response;
+      try {
+        v6 = await fetch(`http://[::1]:${server.port}/version`);
+      } catch {
+        // Some CI environments do not have IPv6 loopback; the server falls back to IPv4 only.
+        return;
+      }
+      expect(v6.status).toBe(200);
+
+      // WebSocket upgrades arriving on ::1 must reach the shared upgrade handler.
+      const ws = new WebSocket(`ws://[::1]:${server.port}${ORPC_WS_PATH}?token=test-token`);
+      try {
+        await waitForWebSocketOpen(ws);
+      } finally {
+        ws.terminate();
+      }
+    } finally {
+      await server.close();
+    }
+
+    // close() must release both listeners.
+    const reuse = net.createServer();
+    await new Promise<void>((resolve, reject) => {
+      reuse.once("error", reject);
+      reuse.listen(server.port, "127.0.0.1", () => resolve());
+    });
+    await new Promise<void>((resolve) => reuse.close(() => resolve()));
+  });
+
+  test("localhost fails with EADDRINUSE when another process holds the IPv6 loopback port", async () => {
+    const squatter = net.createServer();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        squatter.once("error", reject);
+        squatter.listen(0, "::1", () => resolve());
+      });
+    } catch (error) {
+      const code = getErrorCode(error);
+      if (code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL") {
+        return;
+      }
+      throw error;
+    }
+
+    const address = squatter.address();
+    if (!address || typeof address === "string") {
+      throw new Error("expected TCP address");
+    }
+    const port = address.port;
+
+    try {
+      const stubContext: Partial<ORPCContext> = {};
+      let caught: unknown = null;
+      try {
+        const server = await createOrpcServer({
+          host: "localhost",
+          port,
+          context: stubContext as ORPCContext,
+          authToken: "test-token",
+        });
+        await server.close();
+      } catch (error) {
+        caught = error;
+      }
+      expect(getErrorCode(caught)).toBe("EADDRINUSE");
+
+      // The IPv4 listener bound before the failure must be released.
+      const reuse = net.createServer();
+      await new Promise<void>((resolve, reject) => {
+        reuse.once("error", reject);
+        reuse.listen(port, "127.0.0.1", () => resolve());
+      });
+      await new Promise<void>((resolve) => reuse.close(() => resolve()));
+    } finally {
+      await new Promise<void>((resolve) => squatter.close(() => resolve()));
     }
   });
 
@@ -1523,6 +2331,35 @@ describe("createOrpcServer", () => {
     });
   }
 
+  test("does not log the auth token of a blocked cross-origin WebSocket upgrade", async () => {
+    // Browser clients authenticate the oRPC WebSocket with `?token=` (#4853).
+    const secret = "SECRET-auth-token-4853";
+    const warnSpy = spyOn(log, "warn");
+
+    try {
+      await withTestOrpcServer(async (server) => {
+        const ws = new WebSocket(`${server.wsUrl}?token=${secret}`, {
+          headers: { origin: "https://evil.example.com" },
+        });
+
+        try {
+          await waitForWebSocketRejection(ws);
+        } finally {
+          ws.terminate();
+        }
+      });
+
+      const blockedCalls = warnSpy.mock.calls.filter(
+        ([message]) => message === "Blocked cross-origin WebSocket upgrade request"
+      );
+      expect(blockedCalls).toHaveLength(1);
+      expect(blockedCalls[0]?.[1]).toMatchObject({ path: ORPC_WS_PATH });
+      expect(JSON.stringify(warnSpy.mock.calls)).not.toContain(secret);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   test("returns restrictive CORS preflight headers for same-origin requests", async () => {
     const stubContext: Partial<ORPCContext> = {};
 
@@ -1556,81 +2393,6 @@ describe("createOrpcServer", () => {
     } finally {
       await server?.close();
     }
-  });
-
-  test("passes project trust through to global MCP tests when projectPath is provided", async () => {
-    async function runCase(trusted: boolean): Promise<void> {
-      const muxRoot = await fs.mkdtemp(
-        path.join(os.tmpdir(), `mux-orpc-mcp-test-${trusted ? "trusted" : "untrusted"}-`)
-      );
-      const projectPath = path.join(muxRoot, "project");
-      await fs.mkdir(projectPath, { recursive: true });
-
-      const config = new Config(muxRoot);
-      await config.editConfig((cfg) => {
-        cfg.projects.set(projectPath, { trusted, workspaces: [] });
-        return cfg;
-      });
-
-      const listServerCalls: Array<{ projectPath?: string; trusted?: boolean }> = [];
-      const testCalls: Array<{ projectPath: string; trusted?: boolean; name?: string }> = [];
-      const stubContext: Partial<ORPCContext> = {
-        config,
-        mcpConfigService: {
-          listServers: (listedProjectPath?: string, listedTrusted?: boolean) => {
-            listServerCalls.push({ projectPath: listedProjectPath, trusted: listedTrusted });
-            return Promise.resolve({
-              "repo-local": { transport: "stdio", command: "echo repo-local" },
-            });
-          },
-        } as unknown as ORPCContext["mcpConfigService"],
-        mcpServerManager: {
-          test: (options: { projectPath: string; trusted?: boolean; name?: string }) => {
-            testCalls.push(options);
-            return Promise.resolve({ success: true, tools: ["repo_tool"] });
-          },
-        } as unknown as ORPCContext["mcpServerManager"],
-        policyService: {
-          isEnforced: () => false,
-        } as unknown as ORPCContext["policyService"],
-        telemetryService: {
-          capture: () => undefined,
-        } as unknown as ORPCContext["telemetryService"],
-      };
-
-      let server: Awaited<ReturnType<typeof createOrpcServer>> | null = null;
-
-      try {
-        server = await createOrpcServer({
-          host: "127.0.0.1",
-          port: 0,
-          context: stubContext as ORPCContext,
-        });
-
-        const client = createHttpClient(server.baseUrl);
-        const result = await Promise.resolve(
-          client.mcp.test({
-            projectPath,
-            name: "repo-local",
-          })
-        );
-
-        expect(result).toEqual({ success: true, tools: ["repo_tool"] });
-        expect(listServerCalls).toHaveLength(1);
-        expect(listServerCalls[0]?.projectPath).toBe(projectPath);
-        expect(listServerCalls[0]?.trusted).toBe(trusted);
-        expect(testCalls).toHaveLength(1);
-        expect(testCalls[0]?.projectPath).toBe(projectPath);
-        expect(testCalls[0]?.trusted).toBe(trusted);
-        expect(testCalls[0]?.name).toBe("repo-local");
-      } finally {
-        await server?.close();
-        await fs.rm(muxRoot, { recursive: true, force: true });
-      }
-    }
-
-    await runCase(false);
-    await runCase(true);
   });
 
   test("general.restartApp delegates to the window service restart hook", async () => {
@@ -1713,6 +2475,39 @@ describe("createOrpcServer", () => {
       expect(response.status).toBe(403);
     } finally {
       await server?.close();
+    }
+  });
+});
+
+// PR5b-2: a phone's workspace page carries the static view's script and no request or workspace
+// data: the service worker caches every GET, also for other routes and windows.
+describe("the static workspace view on a phone's workspace page", () => {
+  const PHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Mobile/15E148 Safari/604.1";
+  const DESKTOP = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/140.0 Safari/537.36";
+  const indexHtml =
+    '<!doctype html><html><head><title>x</title><meta name="viewport" content="width=device-width"><script type="module" src="./main-A.js"></script></head><body><div id="root"></div></body></html>';
+
+  test("only a phone gets the script, the same for every workspace, with the same headers", async () => {
+    const { server, close } = await createStaticTestServer({ files: { "index.html": indexHtml } });
+    try {
+      const read = async (route: string, userAgent: string) => {
+        const res = await fetch(`${server.baseUrl}${route}`, {
+          headers: { "Accept-Encoding": "identity", "User-Agent": userAgent },
+        });
+        const skip = new Set(["date", "content-length", "etag"]); // etag: a body hash
+        const headers = Object.fromEntries([...res.headers].filter(([name]) => !skip.has(name)));
+        return { headers, body: await res.text() };
+      };
+      const phone = await read("/workspace/a1b2c3d4e5", PHONE);
+      const desktop = await read("/workspace/a1b2c3d4e5", DESKTOP);
+      expect(phone.body).toContain("buildWorkspaceView");
+      expect(desktop.body).toContain('<script type="module" src="./main-A.js">');
+      expect(desktop.body).not.toContain("buildWorkspaceView");
+      expect(phone.headers).toEqual(desktop.headers);
+      expect((await read("/workspace/other-ws", PHONE)).body).toBe(phone.body);
+      expect(phone.body).not.toContain("a1b2c3d4e5");
+    } finally {
+      await close();
     }
   });
 });

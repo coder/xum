@@ -1,16 +1,16 @@
 import {
-  assignShuxEnvironmentValue,
-  resolveShuxEnvironmentValue,
-  type ShuxEnvironment,
-} from "../../src/common/compat/shuxEnv";
+  assignXumEnvironmentValue,
+  resolveXumEnvironmentValue,
+  type XumEnvironment,
+} from "../../src/common/compat/xumEnv";
 
-export function getShuxE2EEnv(
+export function getXumE2EEnv(
   suffix: string,
-  env: ShuxEnvironment = process.env
+  env: XumEnvironment = process.env
 ): string | undefined {
-  return resolveShuxEnvironmentValue(suffix, env);
+  return resolveXumEnvironmentValue(suffix, env);
 }
 
-export function setShuxE2EEnv(env: ShuxEnvironment, suffix: string, value: string): void {
-  assignShuxEnvironmentValue(env, suffix, value);
+export function setXumE2EEnv(env: XumEnvironment, suffix: string, value: string): void {
+  assignXumEnvironmentValue(env, suffix, value);
 }

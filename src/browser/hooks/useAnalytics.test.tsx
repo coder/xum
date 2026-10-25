@@ -1,97 +1,28 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
-import { access, copyFile, readFile, rm, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { GlobalWindow } from "happy-dom";
 import { RPCLink as HTTPRPCLink } from "@orpc/client/fetch";
 import { createORPCClient } from "@orpc/client";
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
-import type { OrpcServer } from "@/node/orpc/server";
+// eslint-disable-next-line local/no-cross-boundary-imports -- test-only server fixture, never bundled into the renderer
+import { createOrpcServer, type OrpcServer } from "@/node/orpc/server";
 import type { ORPCContext } from "@/node/orpc/context";
-import type * as APIModule from "@/browser/contexts/API";
-import type { APIClient } from "@/browser/contexts/API";
-import { requireTestModule } from "@/browser/testUtils";
+import { APIProvider } from "@/browser/contexts/API";
 import type { SavedQuery } from "@/common/types/savedQueries";
-import type * as OrpcServerModule from "@/node/orpc/server";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
-import type * as UseAnalyticsModule from "./useAnalytics";
-
-let APIProvider!: typeof APIModule.APIProvider;
-let useAnalyticsProviderCacheHitRatio!: typeof UseAnalyticsModule.useAnalyticsProviderCacheHitRatio;
-let useAnalyticsRawQuery!: typeof UseAnalyticsModule.useAnalyticsRawQuery;
-let useAnalyticsSpendByModel!: typeof UseAnalyticsModule.useAnalyticsSpendByModel;
-let useAnalyticsSpendOverTime!: typeof UseAnalyticsModule.useAnalyticsSpendOverTime;
-let useAnalyticsSummary!: typeof UseAnalyticsModule.useAnalyticsSummary;
-let useSavedQueries!: typeof UseAnalyticsModule.useSavedQueries;
-let isolatedModulePaths: string[] = [];
-
-const hooksDir = dirname(fileURLToPath(import.meta.url));
-const contextsDir = join(hooksDir, "../contexts");
-
-async function importIsolatedAnalyticsModules() {
-  const suffix = randomUUID();
-  const isolatedApiPath = join(contextsDir, `API.real.${suffix}.tsx`);
-  const isolatedHookPath = join(hooksDir, `useAnalytics.real.${suffix}.ts`);
-
-  await copyFile(join(contextsDir, "API.tsx"), isolatedApiPath);
-
-  const hookSource = await readFile(join(hooksDir, "useAnalytics.ts"), "utf8");
-  const isolatedHookSource = hookSource.replaceAll(
-    'from "@/browser/contexts/API";',
-    `from "../contexts/API.real.${suffix}.tsx";`
-  );
-
-  if (isolatedHookSource === hookSource) {
-    throw new Error("Failed to rewrite useAnalytics API imports for the isolated test copy");
-  }
-
-  await writeFile(isolatedHookPath, isolatedHookSource);
-
-  ({ APIProvider } = requireTestModule<{ APIProvider: typeof APIModule.APIProvider }>(
-    isolatedApiPath
-  ));
-  ({
-    useAnalyticsProviderCacheHitRatio,
-    useAnalyticsRawQuery,
-    useAnalyticsSpendByModel,
-    useAnalyticsSpendOverTime,
-    useAnalyticsSummary,
-    useSavedQueries,
-  } = requireTestModule<{
-    useAnalyticsProviderCacheHitRatio: typeof UseAnalyticsModule.useAnalyticsProviderCacheHitRatio;
-    useAnalyticsRawQuery: typeof UseAnalyticsModule.useAnalyticsRawQuery;
-    useAnalyticsSpendByModel: typeof UseAnalyticsModule.useAnalyticsSpendByModel;
-    useAnalyticsSpendOverTime: typeof UseAnalyticsModule.useAnalyticsSpendOverTime;
-    useAnalyticsSummary: typeof UseAnalyticsModule.useAnalyticsSummary;
-    useSavedQueries: typeof UseAnalyticsModule.useSavedQueries;
-  }>(isolatedHookPath));
-
-  return [isolatedApiPath, isolatedHookPath];
-}
-
-const builtInSkillContentPath = join(
-  hooksDir,
-  "../../node/services/agentSkills/builtInSkillContent.generated.ts"
-);
-let createdBuiltInSkillContentStub = false;
-
-async function ensureBuiltInSkillContentStub() {
-  try {
-    await access(builtInSkillContentPath);
-    createdBuiltInSkillContentStub = false;
-  } catch {
-    // Local test workspaces may omit the generated built-in skill bundle. Provide a
-    // minimal stub here so the analytics oRPC server can boot without widening scope.
-    await writeFile(builtInSkillContentPath, "export const BUILTIN_SKILL_FILES = {};\n");
-    createdBuiltInSkillContentStub = true;
-  }
-}
+import {
+  useAnalyticsProviderCacheHitRatio,
+  useAnalyticsRawQuery,
+  useAnalyticsSpendByModel,
+  useAnalyticsSpendOverTime,
+  useAnalyticsSummary,
+  useSavedQueries,
+  type Summary,
+} from "./useAnalytics";
 
 const ANALYTICS_UNAVAILABLE_MESSAGE = "Analytics backend is not available in this build.";
-type Summary = UseAnalyticsModule.Summary;
 
 const summaryFixture: Summary = {
   totalSpendUsd: 42.25,
@@ -141,18 +72,6 @@ interface AnalyticsServiceCalls {
 let currentApiClient: RouterClient<AppRouter> | null = null;
 let analyticsServiceCalls: AnalyticsServiceCalls | null = null;
 
-function importCreateOrpcServer(): typeof OrpcServerModule.createOrpcServer {
-  void mock.module("@/version", () => ({
-    VERSION: "test-version",
-  }));
-
-  const { createOrpcServer } = requireTestModule<{
-    createOrpcServer: typeof OrpcServerModule.createOrpcServer;
-  }>("@/node/orpc/server");
-  mock.restore();
-  return createOrpcServer;
-}
-
 function renderAnalyticsHook<TResult>(callback: () => TResult) {
   const apiClient = currentApiClient;
   if (!apiClient) {
@@ -161,14 +80,15 @@ function renderAnalyticsHook<TResult>(callback: () => TResult) {
 
   return renderHook(callback, {
     wrapper: (props: { children: React.ReactNode }) => (
-      <APIProvider client={apiClient as unknown as APIClient}>{props.children}</APIProvider>
+      <APIProvider client={apiClient}>{props.children}</APIProvider>
     ),
   });
 }
 
 function createHttpClient(baseUrl: string): RouterClient<AppRouter> {
   const link = new HTTPRPCLink({
-    url: `${baseUrl}/orpc`,
+    origin: baseUrl,
+    url: "/orpc",
   });
 
   // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- typed test helper
@@ -245,8 +165,12 @@ function createAnalyticsServiceStub(summary: Summary): {
   return {
     calls,
     service: {
-      getSummary: (projectPath, from, to) => {
-        calls.summary.push({ projectPath, from, to });
+      getSummary: (input) => {
+        calls.summary.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve(summary);
       },
       getSpendOverTime: (input) => {
@@ -260,14 +184,22 @@ function createAnalyticsServiceStub(summary: Summary): {
         return Promise.resolve([]);
       },
       getSpendByProject: () => Promise.resolve([]),
-      getSpendByModel: (projectPath, from, to) => {
-        calls.spendByModel.push({ projectPath, from, to });
+      getSpendByModel: (input) => {
+        calls.spendByModel.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve([]);
       },
       getTimingDistribution: () => Promise.resolve({ p50: 0, p90: 0, p99: 0, histogram: [] }),
       getAgentCostBreakdown: () => Promise.resolve([]),
-      getCacheHitRatioByProvider: (projectPath, from, to) => {
-        calls.cacheHitRatioByProvider.push({ projectPath, from, to });
+      getCacheHitRatioByProvider: (input) => {
+        calls.cacheHitRatioByProvider.push({
+          projectPath: input.projectPath ?? null,
+          from: input.from,
+          to: input.to,
+        });
         return Promise.resolve([]);
       },
       rebuildAll: () => Promise.resolve({ success: true, workspacesIngested: 0 }),
@@ -289,9 +221,8 @@ describe("useAnalytics hooks", () => {
   let server: OrpcServer | null = null;
 
   beforeEach(async () => {
-    isolatedModulePaths = await importIsolatedAnalyticsModules();
+    saveDomGlobals();
     mock.restore();
-    await ensureBuiltInSkillContentStub();
 
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
@@ -302,8 +233,6 @@ describe("useAnalytics hooks", () => {
     const context: Partial<ORPCContext> = {
       analyticsService: analyticsStub.service as unknown as ORPCContext["analyticsService"],
     };
-
-    const createOrpcServer = importCreateOrpcServer();
 
     server = await createOrpcServer({
       host: "127.0.0.1",
@@ -322,18 +251,7 @@ describe("useAnalytics hooks", () => {
     analyticsServiceCalls = null;
     await server?.close();
     server = null;
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-
-    for (const modulePath of isolatedModulePaths) {
-      await rm(modulePath, { force: true });
-    }
-    isolatedModulePaths = [];
-
-    if (createdBuiltInSkillContentStub) {
-      await rm(builtInSkillContentPath, { force: true });
-      createdBuiltInSkillContentStub = false;
-    }
+    restoreDomGlobals();
   });
 
   test("loads summary from a real ORPC client without backend-unavailable false negatives", async () => {
@@ -530,8 +448,6 @@ describe("useAnalytics hooks", () => {
       analyticsService: analyticsStub.service as unknown as ORPCContext["analyticsService"],
     };
 
-    const createOrpcServer = importCreateOrpcServer();
-
     server = await createOrpcServer({
       host: "127.0.0.1",
       port: 0,
@@ -576,8 +492,6 @@ describe("useAnalytics hooks", () => {
     const context: Partial<ORPCContext> = {
       analyticsService: analyticsStub.service as unknown as ORPCContext["analyticsService"],
     };
-
-    const createOrpcServer = importCreateOrpcServer();
 
     server = await createOrpcServer({
       host: "127.0.0.1",
@@ -625,8 +539,6 @@ describe("useAnalytics hooks", () => {
       analyticsService: analyticsStub.service as unknown as ORPCContext["analyticsService"],
     };
 
-    const createOrpcServer = importCreateOrpcServer();
-
     server = await createOrpcServer({
       host: "127.0.0.1",
       port: 0,
@@ -643,7 +555,11 @@ describe("useAnalytics hooks", () => {
 
     await waitFor(() => expect(result.current.loading).toBe(false));
 
-    expect(result.current.error).toBe("Internal server error");
+    // The behavioral contract is "generic error, no infrastructure detail leak".
+    // Match case-insensitively: oRPC changed its default INTERNAL_SERVER_ERROR
+    // message casing in 1.14 ("Internal server error" -> "Internal Server Error").
+    expect(result.current.error ?? "").toMatch(/^internal server error$/i);
+    expect(result.current.error).not.toContain("Analytics worker");
     expect(result.current.data).toBeNull();
   });
 });

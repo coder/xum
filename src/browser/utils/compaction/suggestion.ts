@@ -4,14 +4,13 @@
  * Used by RetryBarrier to offer "Compact & retry" when we hit context limits.
  */
 
-import { isModelAllowedByPolicy } from "@/browser/utils/policyUi";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { isModelAvailable } from "@/common/routing";
-import type { EffectivePolicy, ProvidersConfigMap } from "@/common/orpc/types";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 import {
-  isGatewayModelAccessibleFromAuthoritativeCatalog,
+  createGatewayRouting,
   isProviderModelAccessibleFromAuthoritativeCatalog,
 } from "@/common/utils/providers/gatewayModelCatalog";
 import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/modelStats";
@@ -37,19 +36,6 @@ function buildIsConfigured(
   return (provider: string) =>
     providersConfig?.[provider]?.isConfigured === true &&
     providersConfig?.[provider]?.isEnabled !== false;
-}
-
-function buildIsGatewayModelAccessible(
-  providersConfig: ProvidersConfigMap | null
-): (gateway: string, modelId: string) => boolean {
-  return (gateway: string, modelId: string) =>
-    isGatewayModelAccessibleFromAuthoritativeCatalog(
-      gateway,
-      modelId,
-      providersConfig?.[gateway]?.models,
-      providersConfig?.[gateway]?.discoveredModels,
-      providersConfig?.[gateway]?.removedModels
-    );
 }
 
 function buildIsAuthoritativeProviderModelAccessible(
@@ -86,7 +72,6 @@ export interface CompactionRouteOptions {
 
 export interface CompactionAvailabilityOptions extends CompactionRouteOptions {
   providersConfig: ProvidersConfigMap | null;
-  policy?: EffectivePolicy | null;
 }
 
 export function getExplicitCompactionSuggestion(
@@ -99,14 +84,14 @@ export function getExplicitCompactionSuggestion(
     return null;
   }
 
-  // Raw-first: keep coder:<instance>/<model> identities intact so catalog,
-  // routing, and policy checks validate the Coder gateway entry itself. A
+  // Raw-first: keep coder:<instance>/<model> identities intact so catalog
+  // and routing checks validate the Coder gateway entry itself. A
   // cross-typed instance ({name:"openai", type:"anthropic"}) canonicalizes by
   // NAME to the direct provider, so canonical-first checks would reject an
   // available Coder compaction model (or validate an unrelated direct one).
   const normalized = modelId.startsWith("coder:") ? modelId : normalizeToCanonical(modelId);
   const isConfigured = buildIsConfigured(options.providersConfig);
-  const isGatewayModelAccessible = buildIsGatewayModelAccessible(options.providersConfig);
+  const gatewayRouting = createGatewayRouting(options.providersConfig);
   const isAuthoritativeProviderModelAccessible = buildIsAuthoritativeProviderModelAccessible(
     options.providersConfig
   );
@@ -120,18 +105,14 @@ export function getExplicitCompactionSuggestion(
       options.routePriority,
       options.routeOverrides,
       isConfigured,
-      isGatewayModelAccessible
+      gatewayRouting.isGatewayModelAccessible,
+      gatewayRouting.resolveGatewayModelId
     )
   ) {
     return null;
   }
 
   const colonIndex = normalized.indexOf(":");
-
-  // Validate against policy if provided
-  if (!isModelAllowedByPolicy(options.policy ?? null, normalized)) {
-    return null;
-  }
 
   // Metadata-aware stats: coder identities resolve through the instance type
   // (and mappedToModel overrides) to their upstream catalog entry.
@@ -170,7 +151,7 @@ export function getHigherContextCompactionSuggestion(
 
   let best: CompactionSuggestion | null = null;
   const isConfigured = buildIsConfigured(options.providersConfig);
-  const isGatewayModelAccessible = buildIsGatewayModelAccessible(options.providersConfig);
+  const gatewayRouting = createGatewayRouting(options.providersConfig);
 
   for (const known of Object.values(KNOWN_MODELS)) {
     if (
@@ -179,14 +160,10 @@ export function getHigherContextCompactionSuggestion(
         options.routePriority,
         options.routeOverrides,
         isConfigured,
-        isGatewayModelAccessible
+        gatewayRouting.isGatewayModelAccessible,
+        gatewayRouting.resolveGatewayModelId
       )
     ) {
-      continue;
-    }
-
-    // Skip models blocked by policy
-    if (!isModelAllowedByPolicy(options.policy ?? null, known.id)) {
       continue;
     }
 

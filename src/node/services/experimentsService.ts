@@ -1,14 +1,17 @@
+import { acquireProcessFileLock, type ProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import assert from "@/common/utils/assert";
 import {
+  EXPERIMENT_IDS,
+  EXPERIMENTS_WRITE_TIMEOUT_MS,
   EXPERIMENTS,
   isExperimentSupportedOnPlatform,
   type ExperimentId,
 } from "@/common/constants/experiments";
-import { getShuxHome } from "@/common/constants/paths";
+import { getXumHome } from "@/common/constants/paths";
 import type { TelemetryService } from "@/node/services/telemetryService";
 
 import * as fs from "fs/promises";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import * as path from "path";
 
 interface ExperimentsFile {
@@ -22,7 +25,7 @@ interface ExperimentsFile {
   overrides?: Record<string, boolean>;
 }
 
-const OVERRIDES_FILE_NAME = "feature_flags.json";
+export const EXPERIMENT_OVERRIDES_FILE_NAME = "feature_flags.json";
 const OVERRIDES_FILE_VERSION = 1;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -46,16 +49,43 @@ async function readOverridesFile(filePath: string): Promise<Map<ExperimentId, bo
     }
 
     for (const [key, value] of Object.entries(persisted)) {
-      if (!(key in EXPERIMENTS) || typeof value !== "boolean") {
-        continue;
+      if (typeof value === "boolean" && key in EXPERIMENTS) {
+        overrides.set(key as ExperimentId, value);
       }
-
-      overrides.set(key as ExperimentId, value);
     }
   } catch {
     // Ignore missing/corrupt overrides
   }
+  applyMcpAppsUpgradeDefault(overrides);
   return overrides;
+}
+
+/**
+ * #6760 upgrade default: before MCP Apps had their own experiment, the Artifacts experiment
+ * gated them. A file without an mcp-apps entry predates the split, so MCP Apps stay on for users
+ * who had Artifacts on and use MCP Apps today. freezeMcpAppsUpgradeDefault persists the entry
+ * before Artifacts changes, so from then on the two experiments are independent.
+ */
+function applyMcpAppsUpgradeDefault(overrides: Map<ExperimentId, boolean>): void {
+  if (!overrides.has(EXPERIMENT_IDS.MCP_APPS) && overrides.get(EXPERIMENT_IDS.ARTIFACTS) === true) {
+    overrides.set(EXPERIMENT_IDS.MCP_APPS, true);
+  }
+}
+
+/**
+ * After a write to Artifacts or MCP Apps, store an MCP Apps entry, so the upgrade default never
+ * applies again: turning Artifacts on must not turn MCP Apps on, turning it off must not turn
+ * them off, and clearing the MCP Apps override must stay "off" after a restart. The read already
+ * derived "on" where it applies, so a missing entry here means "off".
+ */
+function freezeMcpAppsUpgradeDefault(
+  overrides: Map<ExperimentId, boolean>,
+  changed: ExperimentId
+): void {
+  const relevant = changed === EXPERIMENT_IDS.ARTIFACTS || changed === EXPERIMENT_IDS.MCP_APPS;
+  if (relevant && !overrides.has(EXPERIMENT_IDS.MCP_APPS)) {
+    overrides.set(EXPERIMENT_IDS.MCP_APPS, false);
+  }
 }
 
 /**
@@ -65,7 +95,7 @@ async function readOverridesFile(filePath: string): Promise<Map<ExperimentId, bo
  */
 export async function readPersistedExperimentEnabled(
   experimentId: ExperimentId,
-  options?: { muxHome?: string; platform?: NodeJS.Platform }
+  options?: { xumHome?: string; platform?: NodeJS.Platform }
 ): Promise<boolean> {
   assert(experimentId in EXPERIMENTS, `Unknown experimentId: ${experimentId}`);
 
@@ -73,8 +103,8 @@ export async function readPersistedExperimentEnabled(
     return false;
   }
 
-  const muxHome = options?.muxHome ?? getShuxHome();
-  const overrides = await readOverridesFile(path.join(muxHome, OVERRIDES_FILE_NAME));
+  const xumHome = options?.xumHome ?? getXumHome();
+  const overrides = await readOverridesFile(path.join(xumHome, EXPERIMENT_OVERRIDES_FILE_NAME));
   return overrides.get(experimentId) === true;
 }
 
@@ -87,22 +117,24 @@ export async function readPersistedExperimentEnabled(
  */
 export class ExperimentsService {
   private readonly telemetryService: TelemetryService;
-  private readonly muxHome: string;
+  private readonly xumHome: string;
   private readonly overridesFilePath: string;
   private readonly platform: NodeJS.Platform;
 
-  private readonly overrides = new Map<ExperimentId, boolean>();
+  private overrides = new Map<ExperimentId, boolean>();
 
   private initialized = false;
+  private initialization: Promise<void> | undefined;
+  private readonly changeListeners = new Set<() => void>();
 
   constructor(options: {
     telemetryService: TelemetryService;
-    muxHome?: string;
+    xumHome?: string;
     platform?: NodeJS.Platform;
   }) {
     this.telemetryService = options.telemetryService;
-    this.muxHome = options.muxHome ?? getShuxHome();
-    this.overridesFilePath = path.join(this.muxHome, OVERRIDES_FILE_NAME);
+    this.xumHome = options.xumHome ?? getXumHome();
+    this.overridesFilePath = path.join(this.xumHome, EXPERIMENT_OVERRIDES_FILE_NAME);
     this.platform = options.platform ?? process.platform;
   }
 
@@ -110,43 +142,23 @@ export class ExperimentsService {
     return isExperimentSupportedOnPlatform(experimentId, this.platform);
   }
 
-  async initialize(): Promise<void> {
-    if (this.initialized) {
-      return;
-    }
+  initialize(): Promise<void> {
+    return (this.initialization ??= this.initializeOnce());
+  }
 
-    await this.loadOverridesFromDisk();
+  private async initializeOnce(): Promise<void> {
+    try {
+      // Adopt under the lock so a sibling's newer write cannot land between read and adopt.
+      await this.withOverridesLock(() => this.loadOverridesFromDisk());
+    } catch {
+      // Startup is best effort; explicit mutations below must report failed persistence.
+    }
     this.initialized = true;
-
-    for (const [experimentId, enabled] of this.overrides) {
-      this.telemetryService.setFeatureFlagVariant(
-        experimentId,
-        this.isExperimentSupported(experimentId) ? enabled : null
-      );
-    }
   }
 
   /**
-   * Overrides persisted for this machine. Renderers read these so a client whose
-   * origin-scoped localStorage is empty still shows the state its backend gates use.
-   */
-  async getOverrides(): Promise<Partial<Record<ExperimentId, boolean>>> {
-    await this.ensureInitialized();
-
-    const result: Partial<Record<ExperimentId, boolean>> = {};
-    for (const [experimentId, enabled] of this.overrides) {
-      if (this.isExperimentSupported(experimentId)) {
-        result[experimentId] = enabled;
-      }
-    }
-
-    return result;
-  }
-
-  /**
-   * Update a single override. Writes are per-experiment so a client cannot clear
-   * overrides it never knew about: localStorage is origin-scoped, and a second
-   * renderer starting empty must not wipe state persisted for this machine.
+   * Update a single override. Writes are per-experiment and merge into current
+   * disk state, so a writer never clears overrides it did not change.
    */
   async setOverride(
     experimentId: ExperimentId,
@@ -155,15 +167,42 @@ export class ExperimentsService {
     await this.ensureInitialized();
     assert(experimentId in EXPERIMENTS, `Unknown experimentId: ${experimentId}`);
 
-    if (!this.isExperimentSupported(experimentId) || enabled == null) {
-      this.overrides.delete(experimentId);
-      this.telemetryService.setFeatureFlagVariant(experimentId, null);
-    } else {
-      this.overrides.set(experimentId, enabled);
-      this.telemetryService.setFeatureFlagVariant(experimentId, enabled);
-    }
+    await this.withOverridesLock(async (lease) => {
+      // Merge the individual mutation into current disk state. A stale sibling
+      // changing an unrelated flag must never restore withdrawn Design consent.
+      const next = await readOverridesFile(this.overridesFilePath);
+      const value = this.isExperimentSupported(experimentId) ? enabled : null;
+      if (value == null) next.delete(experimentId);
+      else next.set(experimentId, value);
+      freezeMcpAppsUpgradeDefault(next, experimentId);
+      await lease.assertStillOwned();
+      await this.writeOverridesToDisk(next);
+      // A successful acknowledgement means the change survives a restart.
+      this.adoptOverrides(next);
+    });
+    this.notifyChange();
+  }
 
-    await this.writeOverridesToDisk();
+  onChange(listener: () => void): () => void {
+    this.changeListeners.add(listener);
+    return () => {
+      this.changeListeners.delete(listener);
+    };
+  }
+
+  private notifyChange(): void {
+    for (const listener of this.changeListeners) listener();
+  }
+
+  private async withOverridesLock<T>(
+    operation: (lease: ProcessFileLock) => Promise<T>
+  ): Promise<T> {
+    await using lease = await acquireProcessFileLock({
+      lockPath: `${this.overridesFilePath}.lock`,
+      timeoutMs: EXPERIMENTS_WRITE_TIMEOUT_MS,
+      label: "experiment overrides",
+    });
+    return await operation(lease);
   }
 
   /**
@@ -182,6 +221,24 @@ export class ExperimentsService {
     return this.overrides.get(experimentId) === true;
   }
 
+  /**
+   * Re-reads disk first so this backend adopts writes a sibling backend made to the
+   * shared file. A busy lock keeps the last adopted state.
+   */
+  async getEnabledStates(): Promise<Partial<Record<ExperimentId, boolean>>> {
+    await this.ensureInitialized();
+    try {
+      await this.withOverridesLock(() => this.loadOverridesFromDisk());
+    } catch {
+      // The next read retries.
+    }
+    const states: Partial<Record<ExperimentId, boolean>> = {};
+    for (const experimentId of Object.values(EXPERIMENT_IDS)) {
+      states[experimentId] = this.isExperimentEnabled(experimentId);
+    }
+    return states;
+  }
+
   private async ensureInitialized(): Promise<void> {
     if (this.initialized) {
       return;
@@ -192,28 +249,34 @@ export class ExperimentsService {
   }
 
   private async loadOverridesFromDisk(): Promise<void> {
-    for (const [experimentId, enabled] of await readOverridesFile(this.overridesFilePath)) {
-      this.overrides.set(experimentId, enabled);
-    }
+    // Other clients refetch only on a change signal. Without one they keep showing the old
+    // value while turns already use the adopted one.
+    if (this.adoptOverrides(await readOverridesFile(this.overridesFilePath))) this.notifyChange();
   }
 
-  private async writeOverridesToDisk(): Promise<void> {
-    try {
-      const overrides: NonNullable<ExperimentsFile["overrides"]> = {};
-      for (const [experimentId, enabled] of this.overrides) {
-        overrides[experimentId] = enabled;
+  /** Returns whether an experiment's effective value changed. */
+  private adoptOverrides(next: Map<ExperimentId, boolean>): boolean {
+    let changed = false;
+    // Disk reconciliation also changes telemetry, including removed overrides.
+    for (const id of new Set([...this.overrides.keys(), ...next.keys()])) {
+      if (this.overrides.get(id) !== next.get(id)) {
+        const supported = this.isExperimentSupported(id);
+        this.telemetryService.setFeatureFlagVariant(id, supported ? (next.get(id) ?? null) : null);
+        changed ||= supported && (this.overrides.get(id) === true) !== (next.get(id) === true);
       }
-
-      const payload: ExperimentsFile = {
-        version: OVERRIDES_FILE_VERSION,
-        experiments: {},
-        overrides,
-      };
-
-      await fs.mkdir(this.muxHome, { recursive: true });
-      await writeFileAtomic(this.overridesFilePath, JSON.stringify(payload, null, 2), "utf-8");
-    } catch {
-      // Ignore persistence failures
     }
+    this.overrides = next;
+    return changed;
+  }
+
+  private async writeOverridesToDisk(state: Map<ExperimentId, boolean>): Promise<void> {
+    const payload: ExperimentsFile = {
+      version: OVERRIDES_FILE_VERSION,
+      experiments: {},
+      overrides: Object.fromEntries(state),
+    };
+
+    await fs.mkdir(this.xumHome, { recursive: true });
+    await writeFileAtomic(this.overridesFilePath, JSON.stringify(payload, null, 2), "utf-8");
   }
 }

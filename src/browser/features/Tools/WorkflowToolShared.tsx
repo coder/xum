@@ -3,7 +3,7 @@ import React from "react";
 import { cn } from "@/common/lib/utils";
 import type { WorkflowScriptDescriptor } from "@/common/types/workflow";
 import { DetailSection } from "./Shared/ToolPrimitives";
-import { HighlightedCode, JsonHighlight } from "./Shared/HighlightedCode";
+import { JsonHighlight } from "./Shared/HighlightedCode";
 
 export const WORKFLOW_ACTION_BUTTON_CLASS =
   "text-muted hover:text-foreground border-border rounded border px-2 py-1 disabled:opacity-50 disabled:hover:text-muted";
@@ -24,7 +24,7 @@ export function WorkflowBadge(props: {
     <span
       className={cn(
         "border-border bg-background/40 rounded border px-1.5 py-0.5 text-[10px] font-medium whitespace-nowrap",
-        props.tone === "success" && "border-success/30 text-success",
+        props.tone === "success" && "border-success/30 text-success-text",
         props.tone === "warning" && "border-warning/30 text-warning",
         // Blocked workflows/actions need to stand apart from yellow external-action warnings.
         props.tone === "danger" && "border-danger/40 bg-danger-overlay text-danger",
@@ -71,27 +71,6 @@ export function WorkflowJsonBlock(props: {
     >
       <JsonHighlight value={props.value} />
     </div>
-  );
-}
-
-export function WorkflowSourceBlock(props: {
-  source: string;
-  title?: string;
-  className?: string;
-  maxHeightClassName?: string;
-}) {
-  const source = props.source.trimEnd();
-  return (
-    <WorkflowSection title={props.title ?? "Source"} className={props.className}>
-      <div
-        className={cn(
-          "border-border bg-code-bg overflow-auto rounded border p-2",
-          props.maxHeightClassName ?? "max-h-[420px]"
-        )}
-      >
-        <HighlightedCode language="javascript" code={source} showLineNumbers />
-      </div>
-    </WorkflowSection>
   );
 }
 

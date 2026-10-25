@@ -34,16 +34,6 @@ export function formatNameGenerationError(error: NameGenerationError): Formatted
         };
       }
 
-      // Shux Gateway uses OAuth coupon codes, not API keys.
-      if (error.authKind === "api_key_missing" && error.provider === "mux-gateway") {
-        return {
-          title: "Shux Gateway not connected",
-          message: "Connect your Shux Gateway account to enable workspace naming.",
-          hint: "Open Settings → Providers and connect Shux Gateway.",
-          docsPath: "/getting-started/mux-gateway",
-        };
-      }
-
       // api_key_missing and invalid_credentials share the same remediation path.
       return {
         title: "API key error",
@@ -64,17 +54,6 @@ export function formatNameGenerationError(error: NameGenerationError): Formatted
           ? `Permission denied by ${provider}.`
           : "The API key does not have permission for this operation.",
         hint: "Ensure your API key is valid.",
-        docsPath: "/config/providers",
-      };
-    }
-    case "policy": {
-      const provider = error.provider ? getProviderDisplayName(error.provider) : null;
-      return {
-        title: "Blocked by policy",
-        message: provider
-          ? `An organization policy prevents using ${provider} for workspace naming.`
-          : "An organization policy prevents this model from being used.",
-        hint: "Contact your administrator or select a different provider in Settings.",
         docsPath: "/config/providers",
       };
     }

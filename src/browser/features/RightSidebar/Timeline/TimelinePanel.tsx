@@ -7,6 +7,7 @@ import {
   useOptionalWorkspaceContext,
 } from "@/browser/contexts/WorkspaceContext";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { getTimelineFilterKey } from "@/common/constants/storage";
 import {
   pinTimelineRevealTarget,
   useWorkspaceStoreRaw,
@@ -39,6 +40,7 @@ import {
   getTimelineEventKind,
   getAgentEventIcon,
   getAgentEventTint,
+  getPromptCacheBreakView,
   getTimelineEventTitle,
   getTimelinePresentation,
   isMachineryKind,
@@ -396,6 +398,31 @@ function TimelineRuleRow(props: {
   );
 }
 
+/** One label/value row of a cache break; a row without a value is not shown. */
+function PromptCacheBreakRow(props: { label: string; value: string | undefined }) {
+  if (props.value == null) return null;
+  return (
+    <>
+      <span>{props.label}</span>
+      <span className="text-content-secondary min-w-0 break-words">{props.value}</span>
+    </>
+  );
+}
+
+function PromptCacheBreakDetails(props: { event: TimelineEvent }) {
+  const view = getPromptCacheBreakView(props.event);
+  if (view == null) return null;
+  return (
+    <span className="text-muted counter-nums mt-1 grid min-w-0 grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-0.5 text-[11px]">
+      {/* Wrap instead of truncating: the tool name and size at the end are what a reader needs. */}
+      <span className="col-span-2 min-w-0 break-words">{view.position}</span>
+      <PromptCacheBreakRow label="Before" value={view.before} />
+      <PromptCacheBreakRow label="After" value={view.after} />
+      <PromptCacheBreakRow label="Changed" value={view.changedOptions} />
+    </span>
+  );
+}
+
 function TimelineEventRow(props: {
   event: TimelineEvent;
   selected: boolean;
@@ -412,7 +439,6 @@ function TimelineEventRow(props: {
     presentation.icon;
   const failed = props.event.status === "failed";
   const interrupted = props.event.status === "interrupted";
-
   return (
     <button
       type="button"
@@ -461,6 +487,7 @@ function TimelineEventRow(props: {
             ) : null}
           </span>
         ) : null}
+        <PromptCacheBreakDetails event={props.event} />
       </span>
       <time
         dateTime={new Date(props.event.ts).toISOString()}
@@ -557,9 +584,9 @@ function TimelinePreviewCard(props: {
   const workspaceContext = useOptionalWorkspaceContext();
   const workspaceStore = props.workspaceStore;
   const [previewState, setPreviewState] = useState<PreviewState>({ status: "loading" });
-  const [revealState, setRevealState] = useState<"idle" | "revealing" | "not-found" | "error">(
-    "idle"
-  );
+  const [revealState, setRevealState] = useState<
+    "idle" | "revealing" | "not-found" | "not-loaded" | "error"
+  >("idle");
 
   const revealOperationRef = useRef(0);
   const revealButtonRef = useRef<HTMLButtonElement>(null);
@@ -663,6 +690,14 @@ function TimelinePreviewCard(props: {
       ) {
         return;
       }
+      // Duplicate panels can be mounted at once: narrow viewports CSS-hide the right
+      // sidebar without unmounting its Timeline tab while the mobile dialog mounts a
+      // second panel. Only the visible panel may act on this window-level shortcut:
+      // offsetParent is null inside display:none subtrees, and content outside an open
+      // modal dialog (or an inert-hidden sidebar) is marked aria-hidden/inert.
+      if (button.offsetParent === null || button.closest("[inert], [aria-hidden='true']") != null) {
+        return;
+      }
       event.preventDefault();
       button.click();
     };
@@ -746,9 +781,13 @@ function TimelinePreviewCard(props: {
               </button>
             ) : null}
           </div>
-          {revealState === "not-found" ? (
-            <div data-testid="timeline-reveal-not-found" className="text-muted text-[10px]">
+          {revealState === "not-loaded" ? (
+            <div data-testid="timeline-reveal-not-loaded" className="text-muted text-[10px]">
               Too far back; showing preview only
+            </div>
+          ) : revealState === "not-found" ? (
+            <div data-testid="timeline-reveal-not-found" className="text-muted text-[10px]">
+              Not in the transcript; showing preview only
             </div>
           ) : revealState === "error" ? (
             <div className="text-muted text-[10px]">Reveal unavailable</div>
@@ -767,9 +806,11 @@ interface TimelinePanelViewProps extends TimelinePanelProps {
 export function TimelinePanelView(props: TimelinePanelViewProps) {
   const timeline = props.timeline;
   const workspaceStore = props.workspaceStore;
+  // listener keeps every mount of this panel in sync: they share this persisted filter.
   const [storedFilter, setStoredFilter] = usePersistedState<string>(
-    `timeline-filter:${props.workspaceId}`,
-    "all"
+    getTimelineFilterKey(props.workspaceId),
+    "all",
+    { listener: true }
   );
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [expandedRuns, setExpandedRuns] = useState<Record<string, boolean>>({});
@@ -797,7 +838,7 @@ export function TimelinePanelView(props: TimelinePanelViewProps) {
       }}
     >
       <div className="border-border shrink-0 border-b px-3 py-2.5">
-        <div className="scrollbar-none flex min-w-0 gap-1.5 overflow-x-auto">
+        <div className="scrollbar-none scroll-fade-x flex min-w-0 gap-1.5 overflow-x-auto">
           {FILTERS.map((item) => (
             <button
               key={item.value}

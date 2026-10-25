@@ -8,17 +8,48 @@ import {
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
 import {
+  BackupProjectBundleManifestSchema,
   CREDENTIAL_URL_PARAMETER_NAMES,
+  MAX_BACKUP_PROJECT_ENTRIES,
   decodeDelimitersOnce,
   hasCredentialUrlParameters,
   isWindowsUnusableSegment,
+  sanitizeBackupGitRemote,
+  type BackupContentFlag,
+  type BackupContents,
+  type BackupProjectBundleEntry,
+  type BackupProjectBundleManifest,
 } from "@/common/config/schemas/settingsBackup";
+import { acquireGlobalMcpConfigLock } from "@/node/services/mcpConfigService";
+import { projectPathHashSuffix } from "@/node/services/memoryService";
+import { MEMORY_MAX_FILE_BYTES, MEMORY_MAX_FILES_PER_SCOPE } from "@/common/constants/memory";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isErrnoWithCode } from "@/node/utils/fs";
-import type { BackupCommandApproval } from "@/common/orpc/schemas/backup";
+import type { BackupCommandApproval, BackupProjectImport } from "@/common/orpc/schemas/backup";
 
 export const BACKUP_SCHEMA_VERSION = 1;
-const BACKUP_MANIFEST_FILE = "manifest.json";
+/**
+ * Written only when the backup carries a literal MCP header value. Builds before this one
+ * restore a header as the same-named local value or nothing, so they would drop every header
+ * the user chose to carry while reporting a complete restore; a schema version they do not
+ * know makes them refuse the backup instead. Backups without literal headers keep version 1
+ * so a downgraded build can still restore them.
+ */
+export const BACKUP_SCHEMA_VERSION_LITERAL_HEADERS = 2;
+type BackupSchemaVersion =
+  | typeof BACKUP_SCHEMA_VERSION
+  | typeof BACKUP_SCHEMA_VERSION_LITERAL_HEADERS;
+export const BACKUP_MANIFEST_FILE = "manifest.json";
+/**
+ * The opt-in project bundle lives beside the core payload, never inside its manifest: an
+ * old build's `parseManifest` hard-fails on unknown paths, so listing bundle files there
+ * would brick preview and restore on downgrade, while a sidecar directory is silently
+ * ignored by the manifest-driven reader.
+ */
+export const PROJECT_BUNDLE_DIR = "project-bundle";
+/** Opt-in artifact shelf sidecar (Artifacts M5c), beside the project bundle for the same reason. */
+export const ARTIFACT_SHELF_BACKUP_DIR = "artifact-shelf";
+const PROJECT_MEMORY_PATH_PREFIX = "memory/project/";
 /**
  * A payload is read wholly into memory on both sides, and the repository side is written by
  * whoever can push to the branch, so an oversized entry would crash the main process during
@@ -92,7 +123,7 @@ export interface BackupManifestFile {
 export type BackupRedactionPath = jsonc.JSONPath;
 
 export interface BackupManifest {
-  schemaVersion: typeof BACKUP_SCHEMA_VERSION;
+  schemaVersion: BackupSchemaVersion;
   exportedAt: string;
   muxVersion: string;
   sourceLabel: string;
@@ -108,6 +139,7 @@ export interface BackupPayload {
 
 export interface CreateBackupPayloadOptions {
   muxRoot: string;
+  contents: BackupContents;
   preferences?: UserPreferences;
   muxVersion: string;
   sourceLabel: string;
@@ -123,6 +155,7 @@ export interface CreateBackupPayloadOptions {
 
 export interface RestoreBackupPayloadOptions {
   muxRoot: string;
+  contents: BackupContents;
   payload: BackupPayload;
   approvedCommandTokens?: readonly string[];
 }
@@ -140,6 +173,22 @@ export class BackupCommandApprovalRequiredError extends Error {
   /** The paths the UI lists, matching how `SECRET_DETECTED` reports blocked files. */
   get files(): string[] {
     return this.approvals.map((approval) => `${approval.path}: ${approval.command}`);
+  }
+}
+
+/**
+ * Mirrors BackupCommandApprovalRequiredError for project imports: thrown when a restore
+ * names an import token the currently checked-out payload does not produce, carrying the
+ * fresh candidate list so the UI can re-present it without another preview.
+ */
+export class BackupProjectImportApprovalRequiredError extends Error {
+  readonly code = "PROJECT_IMPORT_APPROVAL_REQUIRED";
+
+  constructor(readonly projectImports: readonly BackupProjectImport[]) {
+    super(
+      "The approved project imports no longer match the backup. Review and approve the current list before restoring."
+    );
+    this.name = "BackupProjectImportApprovalRequiredError";
   }
 }
 
@@ -169,12 +218,24 @@ function isOwnerOnlyPayloadPath(relativePath: string): boolean {
   return relativePath === "mcp.jsonc";
 }
 
+/** The content flag that selects a core payload path, or undefined when the path is not allowlisted. */
+function payloadPathContentFlag(relativePath: string): BackupContentFlag | undefined {
+  if (relativePath === "AGENTS.md") return "includeInstructions";
+  if (relativePath === "mcp.jsonc") return "includeMcp";
+  if (relativePath === "preferences.json") return "includePreferences";
+  if (/^agents\/[^/]+\.md$/.test(relativePath)) return "includeAgents";
+  if (/^skills\/.+/.test(relativePath)) return "includeSkills";
+  if (/^memory\/global\/.+/.test(relativePath)) return "includeGlobalMemory";
+  return undefined;
+}
+
 function isAllowedPayloadPath(relativePath: string): boolean {
-  if (relativePath === "AGENTS.md" || relativePath === "mcp.jsonc") return true;
-  if (relativePath === "preferences.json") return true;
-  if (/^agents\/[^/]+\.md$/.test(relativePath)) return true;
-  if (/^skills\/.+/.test(relativePath)) return true;
-  return /^memory\/global\/.+/.test(relativePath);
+  return payloadPathContentFlag(relativePath) !== undefined;
+}
+
+function isSelectedPayloadPath(relativePath: string, contents: BackupContents): boolean {
+  const flag = payloadPathContentFlag(relativePath);
+  return flag !== undefined && contents[flag];
 }
 
 function backupPathSegments(relativePath: string): string[] {
@@ -188,17 +249,16 @@ function backupPathSegments(relativePath: string): string[] {
 }
 
 /**
- * Local safety snapshots use `portable: false` so cross-platform filename checks cannot block
- * a restore while protecting a file valid on the current filesystem. Containment and allowlist
- * checks still apply.
+ * The shape rules every payload path shares, independent of which allowlist it must also
+ * satisfy: the core payload and the project bundle validate different path sets but reject
+ * the same traversal, hidden-name, forbidden-basename, and portability hazards.
  */
-function assertAllowedPayloadPath(
+export function hasDisallowedPathShape(
   relativePath: string,
-  options: { portable: boolean } = { portable: true }
-): void {
+  options: { portable: boolean }
+): boolean {
   const segments = backupPathSegments(relativePath);
-  if (
-    !isAllowedPayloadPath(relativePath) ||
+  return (
     path.isAbsolute(relativePath) ||
     // Payload paths are always posix. A backslash is an ordinary filename character
     // here but a separator on Windows, so `skills/..\..\evil` would escape the
@@ -207,12 +267,25 @@ function assertAllowedPayloadPath(
     (options.portable && relativePath.includes("\\")) ||
     segments.some(
       (segment) =>
+        segment === "" ||
         segment === ".." ||
         isHiddenName(segment) ||
         (options.portable && isWindowsUnusableSegment(segment))
     ) ||
     isForbiddenBasename(path.posix.basename(relativePath))
-  ) {
+  );
+}
+
+/**
+ * Local safety snapshots use `portable: false` so cross-platform filename checks cannot block
+ * a restore while protecting a file valid on the current filesystem. Containment and allowlist
+ * checks still apply.
+ */
+function assertAllowedPayloadPath(
+  relativePath: string,
+  options: { portable: boolean } = { portable: true }
+): void {
+  if (!isAllowedPayloadPath(relativePath) || hasDisallowedPathShape(relativePath, options)) {
     throw new Error(`Backup contains disallowed path '${relativePath}'`);
   }
 }
@@ -222,6 +295,20 @@ async function lstatOrNull(target: string) {
     return await fs.lstat(target);
   } catch {
     return null;
+  }
+}
+
+/**
+ * `null` only when the path does not exist. Any other failure (`EACCES` on an unreadable
+ * parent, `EIO`) propagates: a preflight that read it as "missing" would accept a write the
+ * filesystem is about to refuse, after the point where refusing changes nothing.
+ */
+async function lstatIfExists(target: string): Promise<Stats | null> {
+  try {
+    return await fs.lstat(target);
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) return null;
+    throw error;
   }
 }
 
@@ -431,7 +518,7 @@ async function assertOpenedFileContained(
 /**
  * Resolved once where an operation begins, so every open and check below it uses that result.
  * The root being a symlink is then neither refused nor traversed again: a user is free to keep
- * `~/.shux` on another volume, and swapping that link partway through cannot move an operation
+ * `~/.xum` on another volume, and swapping that link partway through cannot move an operation
  * already under way onto a different tree. Only the components below the root are held to the
  * no-symlink rule.
  */
@@ -694,17 +781,36 @@ async function isRegularFile(filePath: string): Promise<boolean> {
   return (await lstatOrNull(filePath))?.isFile() === true;
 }
 
-export async function collectAllowlistedFiles(muxRoot: string): Promise<BackupFile[]> {
-  const root = await resolveRoot(muxRoot);
+/**
+ * One collection pass with its own byte budget, hard-link tracker, and path-complexity
+ * tracker. The core payload and the project bundle collect through separate instances so a
+ * large bundle can never starve the core payload's budget, and vice versa.
+ */
+function createBackupFileCollector(root: BackupRoot) {
   const files: BackupFile[] = [];
   const budget = createByteBudget();
   const links = createHardLinkTracker();
-
   const pathComplexity = createBackupPathComplexityTracker();
 
+  /**
+   * `maxFileBytes` and `maxFiles` skip what the caller would drop anyway, before the file
+   * count or byte budget is charged and before any read, so a directory with oversized or
+   * surplus files can never block a collection that means to leave them out.
+   */
   async function collectDirectory(
     relativeRoot: string,
-    filter: (relativePath: string, entry: Dirent) => boolean
+    filter: (relativePath: string, entry: Dirent) => boolean,
+    collectOptions: { maxFileBytes?: number; maxFiles?: number } = {}
+  ): Promise<void> {
+    const progress = { collected: 0 };
+    await walkDirectory(relativeRoot, filter, collectOptions, progress);
+  }
+
+  async function walkDirectory(
+    relativeRoot: string,
+    filter: (relativePath: string, entry: Dirent) => boolean,
+    collectOptions: { maxFileBytes?: number; maxFiles?: number },
+    progress: { collected: number }
   ): Promise<void> {
     const absoluteRoot = path.join(root.path, ...relativeRoot.split("/"));
     // A symlinked collection root would let readdir walk outside MUX_ROOT, and restore
@@ -726,31 +832,62 @@ export async function collectAllowlistedFiles(muxRoot: string): Promise<BackupFi
       const relativePath = toPosixPath(relativeRoot, entry.name);
       if (!filter(relativePath, entry)) continue;
       if (entry.isDirectory()) {
-        await collectDirectory(relativePath, filter);
+        await walkDirectory(relativePath, filter, collectOptions, progress);
       } else if (entry.isFile() && !isForbiddenBasename(entry.name)) {
+        if (
+          collectOptions.maxFiles !== undefined &&
+          progress.collected >= collectOptions.maxFiles
+        ) {
+          continue;
+        }
+        if (collectOptions.maxFileBytes !== undefined) {
+          const stat = await lstatOrNull(path.join(root.path, ...relativePath.split("/")));
+          if (stat !== null && stat.size > collectOptions.maxFileBytes) continue;
+        }
         assertBackupFileCount(files.length + 1);
         pathComplexity.recordFile(relativePath);
         files.push(await readBackupFile(root, relativePath, budget, links));
+        progress.collected += 1;
       }
     }
   }
 
-  for (const relativePath of ["AGENTS.md", "mcp.jsonc"]) {
-    if (await isRegularFile(path.join(root.path, relativePath))) {
+  async function collectNamedFile(relativePath: string): Promise<void> {
+    if (await isRegularFile(path.join(root.path, ...relativePath.split("/")))) {
       assertBackupFileCount(files.length + 1);
       pathComplexity.recordFile(relativePath);
       files.push(await readBackupFile(root, relativePath, budget, links));
     }
   }
 
-  await collectDirectory(
-    "agents",
-    (relativePath, entry) => entry.isDirectory() || /^agents\/[^/]+\.md$/.test(relativePath)
-  );
-  await collectDirectory("skills", () => true);
-  await collectDirectory("memory/global", () => true);
-  links.assertContained();
-  return files.sort((a, b) => a.path.localeCompare(b.path));
+  return {
+    files,
+    collectDirectory,
+    collectNamedFile,
+    assertHardLinksContained: () => links.assertContained(),
+  };
+}
+
+/** The local files in the selected categories, for export and for the restore's local view. */
+export async function collectAllowlistedFiles(
+  muxRoot: string,
+  contents: BackupContents
+): Promise<BackupFile[]> {
+  const root = await resolveRoot(muxRoot);
+  const collector = createBackupFileCollector(root);
+
+  if (contents.includeInstructions) await collector.collectNamedFile("AGENTS.md");
+  if (contents.includeMcp) await collector.collectNamedFile("mcp.jsonc");
+  if (contents.includeAgents) {
+    await collector.collectDirectory(
+      "agents",
+      (relativePath, entry) => entry.isDirectory() || /^agents\/[^/]+\.md$/.test(relativePath)
+    );
+  }
+  if (contents.includeSkills) await collector.collectDirectory("skills", () => true);
+  if (contents.includeGlobalMemory) await collector.collectDirectory("memory/global", () => true);
+  collector.assertHardLinksContained();
+  return collector.files.sort((a, b) => a.path.localeCompare(b.path));
 }
 
 function copyJson<T>(value: T): T {
@@ -777,15 +914,31 @@ const BACKED_UP_APPEARANCE_FIELDS = [
   "transcriptDensity",
   "bashCollapsedSummaryMode",
   "terminalFontConfig",
+  "terminalBadgeConfig",
   "vimEnabled",
+  "powerModeEnabled",
+  "gitStatusIndicatorMode",
 ] as const satisfies ReadonlyArray<keyof Appearance>;
 
-function projectAppearance(value: Appearance | undefined): Appearance | undefined {
+type Review = NonNullable<UserPreferences["review"]>;
+
+// `defaultBaseByProject` is keyed by local project paths, so it stays out of a backup.
+const BACKED_UP_REVIEW_FIELDS = [
+  "includeUncommitted",
+  "sortOrder",
+  "fileTreeViewMode",
+  "showRead",
+] as const satisfies ReadonlyArray<keyof Review>;
+
+function projectFields<T extends object>(
+  value: T | undefined,
+  fields: ReadonlyArray<keyof T>
+): Partial<T> | undefined {
   if (!value) return undefined;
-  const projected: Appearance = {};
-  for (const field of BACKED_UP_APPEARANCE_FIELDS) {
+  const projected: Partial<T> = {};
+  for (const field of fields) {
     if (value[field] !== undefined) {
-      Object.assign(projected, { [field]: copyJson(value[field]) });
+      projected[field] = copyJson(value[field]);
     }
   }
   return Object.keys(projected).length > 0 ? projected : undefined;
@@ -818,7 +971,7 @@ export function projectBackupPreferences(value: unknown): UserPreferences {
   const parsed = UserPreferencesSchema.parse(value ?? {});
   const projected: UserPreferences = {};
 
-  const appearance = projectAppearance(parsed.appearance);
+  const appearance = projectFields(parsed.appearance, BACKED_UP_APPEARANCE_FIELDS);
   if (appearance !== undefined) projected.appearance = appearance;
   if (parsed.navigation?.launchBehavior !== undefined) {
     projected.navigation = { launchBehavior: parsed.navigation.launchBehavior };
@@ -835,8 +988,13 @@ export function projectBackupPreferences(value: unknown): UserPreferences {
     }
     if (Object.keys(ai).length > 0) projected.ai = ai;
   }
-  if (parsed.review?.includeUncommitted !== undefined) {
-    projected.review = { includeUncommitted: parsed.review.includeUncommitted };
+  const review = projectFields(parsed.review, BACKED_UP_REVIEW_FIELDS);
+  if (review !== undefined) projected.review = review;
+  if (parsed.ui !== undefined) {
+    // The artifact CDN choice is a security setting: a repository that could turn it back on
+    // would reopen the CDN request channel to hostile artifacts.
+    const { artifactsAllowCdnScripts, ...ui } = parsed.ui;
+    if (Object.keys(ui).length > 0) projected.ui = copyJson(ui);
   }
 
   return projected;
@@ -872,11 +1030,12 @@ export function mergeBackupPreferences(
       : {}),
     ...(projected.ai ? { ai: mergeAiPreferences(current?.ai, projected.ai) } : {}),
     ...(projected.review ? { review: { ...current?.review, ...projected.review } } : {}),
+    ...(projected.ui ? { ui: { ...current?.ui, ...projected.ui } } : {}),
   });
 }
 
 /**
- * `MCPHeaderValue` is `string | { secret }` (src/common/types/mcp.ts), so Shux sends a plain
+ * `MCPHeaderValue` is `string | { secret }` (src/common/types/mcp.ts), so Xum sends a plain
  * string verbatim and never interpolates it: only the reference form is portable. Exactly one
  * key, because a sibling property inside the reference would be published verbatim and is a
  * place to hide a credential that `resolveHeaders` would never read.
@@ -1048,12 +1207,11 @@ function isUnsupportedServerMap(value: unknown): boolean {
 }
 
 /**
- * Fields Shux itself reads (`McpConfigService.normalizeEntry`), with the type it reads them as.
+ * Fields Xum itself reads (`McpConfigService.normalizeEntry`), with the type it reads them as.
  * Anything else in the document, at any depth, is replaced with the marker: `normalizeEntry`
- * ignores an unrecognised field such as `env` or `args`, so nobody here can say whether its
- * value is a credential, and `{ "API_KEY": "hunter2" }` is not something a scanner can catch.
- * Restore puts the local value back at that exact path, so a field only Shux ignores is not
- * lost from a machine that already has it.
+ * ignores an unrecognised field such as `env` or `args`, so backing it up would publish a
+ * value nothing here uses. Restore puts the local value back at that exact path, so a field
+ * only Xum ignores is not lost from a machine that already has it.
  */
 const PORTABLE_SERVER_FIELDS: Record<string, (value: unknown) => boolean> = {
   command: (value) => typeof value === "string",
@@ -1063,6 +1221,49 @@ const PORTABLE_SERVER_FIELDS: Record<string, (value: unknown) => boolean> = {
   disabled: (value) => typeof value === "boolean",
   toolAllowlist: (value) => Array.isArray(value) && value.every((tool) => typeof tool === "string"),
 };
+
+/** The header shapes `normalizeEntry` reads: a literal value or a project-secret reference. */
+function isReadableHeaderValue(value: unknown): boolean {
+  return typeof value === "string" || isPortableReference(value);
+}
+
+/**
+ * The credential-bearing MCP fields the user can leave out of a backup. An excluded value is
+ * replaced with the marker rather than deleted, so a restore knows to keep the local value.
+ */
+export interface McpProjectionOptions {
+  includeHeaders: boolean;
+  includeCommands: boolean;
+  /**
+   * Restore side only: a deselected field the backup entry does not carry still gets a marker,
+   * so the local value survives the restore instead of vanishing with the entry. An export
+   * leaves the field absent, since the source machine had nothing there to keep. The publish
+   * caps on marker counts do not apply here: the file already passed them on read, the
+   * markers added are bounded by its server count, and the projection never leaves this
+   * machine, so a large but valid backup must not become unrestorable by deselecting a
+   * category.
+   */
+  markAbsent?: boolean;
+}
+
+export function mcpProjectionOptions(contents: BackupContents): McpProjectionOptions {
+  return {
+    includeHeaders: contents.includeMcpHeaders,
+    includeCommands: contents.includeMcpCommands,
+  };
+}
+
+/** Refused rather than redacted: restore rejects this shape on every machine, including the one that wrote it. */
+function assertExportableMcpServers(content: Buffer): void {
+  const { parsed } = parseJsoncObjectWithTree(content.toString("utf-8"), "mcp.jsonc");
+  if (isUnsupportedServerMap(readOwn(parsed, "servers"))) {
+    throw new BackupInvalidPayloadError(
+      new Error(
+        "Cannot back up: mcp.jsonc lists servers as something other than an object. Fix the local file, then back up again."
+      )
+    );
+  }
+}
 
 /**
  * A jsonc edit keeps every comment, and a comment is prose the projection cannot inspect, so a
@@ -1097,7 +1298,10 @@ function valueHasRedactionAtPath(
   return typeof value === "string" && containsRedaction(value);
 }
 
-function redactMcpConfig(content: Buffer): {
+function redactMcpConfig(
+  content: Buffer,
+  options: McpProjectionOptions
+): {
   content: Buffer;
   redactionPaths: BackupRedactionPath[];
 } {
@@ -1116,7 +1320,7 @@ function redactMcpConfig(content: Buffer): {
     const retainedRedactionPaths = redactionPaths.filter((jsonPath) =>
       valueHasRedactionAtPath(projected.parsed, jsonPath)
     );
-    assertBackupMcpRedactions(retainedRedactionPaths);
+    if (!options.markAbsent) assertBackupMcpRedactions(retainedRedactionPaths);
     return {
       content: projected.content,
       redactionPaths: retainedRedactionPaths,
@@ -1130,24 +1334,16 @@ function redactMcpConfig(content: Buffer): {
     if (key !== "servers") redact([key]);
   }
 
-  const servers = readOwn(root, "servers");
-  // Refused rather than redacted: restore rejects this shape on every machine, including the
-  // one that wrote it, so redacting here would report a successful push for a backup that can
-  // never be restored.
-  if (isUnsupportedServerMap(servers)) {
-    throw new BackupInvalidPayloadError(
-      new Error(
-        "Cannot back up: mcp.jsonc lists servers as something other than an object. Fix the local file, then back up again."
-      )
-    );
-  }
-  const serverRecord = readRecord(servers);
+  const serverRecord = readRecord(readOwn(root, "servers"));
   if (!serverRecord) return finish();
 
   for (const serverName of objectKeyNames(tree, ["servers"])) {
     const rawServer = readOwn(serverRecord, serverName);
     // A bare string entry is the stdio command itself (`McpConfigService.normalizeEntry`).
-    if (typeof rawServer === "string") continue;
+    if (typeof rawServer === "string") {
+      if (!options.includeCommands) redact(["servers", serverName]);
+      continue;
+    }
     const server = readRecord(rawServer);
     if (!server) {
       redact(["servers", serverName]);
@@ -1163,25 +1359,38 @@ function redactMcpConfig(content: Buffer): {
       if (isPortableField) {
         // Read as the wrong type, `normalizeEntry` ignores it, which makes it another place
         // to hide a value nobody reads.
-        if (!isPortableField(value)) redact(fieldPath);
+        if (!isPortableField(value) || (field === "command" && !options.includeCommands)) {
+          redact(fieldPath);
+        }
         continue;
       }
       if (field === "headers") {
         const headers = readRecord(value);
-        if (!headers) {
+        // One marker for the whole object when headers are left out, so a restore puts the
+        // local headers back as a unit instead of only the names this backup happened to list.
+        if (!headers || !options.includeHeaders) {
           redact(fieldPath);
           continue;
         }
         for (const headerName of objectKeyNames(tree, fieldPath)) {
-          if (!isPortableReference(readOwn(headers, headerName))) {
+          if (!isReadableHeaderValue(readOwn(headers, headerName))) {
             redact([...fieldPath, headerName]);
           }
         }
         continue;
       }
-      // Shux ignores every other field, so its value may carry credentials under a shape this
-      // projection cannot classify. Restore uses only the local value at that exact path.
+      // Xum ignores every other field, so backing it up would only publish a value nothing
+      // reads. Restore uses the local value at that exact path.
       redact(fieldPath);
+    }
+    if (options.markAbsent) {
+      const fields = objectKeyNames(tree, ["servers", serverName]);
+      if (!options.includeHeaders && !fields.includes("headers")) {
+        redact(["servers", serverName, "headers"]);
+      }
+      if (!options.includeCommands && !fields.includes("command")) {
+        redact(["servers", serverName, "command"]);
+      }
     }
   }
   return finish();
@@ -1303,7 +1512,13 @@ function urlHasCredentialComponents(rawUrl: string): boolean {
   );
 }
 
-function mcpConfigRequiresPublishApproval(content: string): boolean {
+/**
+ * The MCP values that commonly hold credentials and are published verbatim when selected: a
+ * stdio command (tokens in arguments or an env prefix), a URL with credential components, or a
+ * literal header value. A category the export left out holds only markers, so it is not
+ * reviewed; a `{secret: NAME}` reference names a secret without carrying it.
+ */
+function mcpConfigRequiresPublishApproval(content: string, options: McpProjectionOptions): boolean {
   const errors: jsonc.ParseError[] = [];
   const parsed = readRecord(jsonc.parse(content, errors));
   if (errors.length > 0 || !parsed) return false;
@@ -1313,32 +1528,85 @@ function mcpConfigRequiresPublishApproval(content: string): boolean {
     const serverRecord = readRecord(server);
     const command =
       typeof server === "string" ? server : serverRecord && readOwn(serverRecord, "command");
-    if (typeof command === "string" && command.trim() !== "") return true;
+    if (options.includeCommands && typeof command === "string" && command.trim() !== "") {
+      return true;
+    }
     if (!serverRecord) continue;
     const url = readOwn(serverRecord, "url");
     if (typeof url === "string" && urlHasCredentialComponents(url)) return true;
+    const headers = readRecord(readOwn(serverRecord, "headers"));
+    if (
+      options.includeHeaders &&
+      headers &&
+      Object.values(headers).some((value) => typeof value === "string")
+    ) {
+      return true;
+    }
   }
   return false;
 }
 
+/** A header value carried verbatim: neither a `{secret: NAME}` reference nor a marker. */
+function mcpConfigCarriesLiteralHeaders(content: string): boolean {
+  const errors: jsonc.ParseError[] = [];
+  const parsed = readRecord(jsonc.parse(content, errors));
+  if (errors.length > 0 || !parsed) return false;
+  const servers = readRecord(readOwn(parsed, "servers"));
+  if (!servers) return false;
+  return Object.values(servers).some((server) => {
+    const serverRecord = readRecord(server);
+    const headers = serverRecord && readRecord(readOwn(serverRecord, "headers"));
+    return (
+      headers !== undefined &&
+      Object.values(headers).some(
+        (value) => typeof value === "string" && value !== REDACTED_BACKUP_VALUE
+      )
+    );
+  });
+}
+
 function isRecursivelyCollected(filePath: string): boolean {
-  return filePath.startsWith("skills/") || filePath.startsWith("memory/global/");
+  return (
+    filePath.startsWith("skills/") ||
+    filePath.startsWith("memory/global/") ||
+    // Project-bundle memory files are scanned alongside the core payload with their
+    // bundle-relative paths, and are swept up recursively the same way global memory is.
+    filePath.startsWith(PROJECT_MEMORY_PATH_PREFIX) ||
+    // Shelf artifacts are agent output (HTML, JSON, images...): anything but Markdown or text
+    // waits for review like other recursively collected files.
+    filePath.startsWith(`${ARTIFACT_SHELF_BACKUP_DIR}/`)
+  );
+}
+
+/** Shelf entry metadata Xum writes itself; its content is still scanned for secrets. */
+function isShelfEntryMeta(filePath: string): boolean {
+  return (
+    filePath.startsWith(`${ARTIFACT_SHELF_BACKUP_DIR}/`) &&
+    (path.posix.basename(filePath) === "meta.json" ||
+      filePath === `${ARTIFACT_SHELF_BACKUP_DIR}/${BACKUP_MANIFEST_FILE}`)
+  );
 }
 
 /**
  * Files a push must not publish until the user approves this exact payload. Not all of them
  * hold a secret: the structural cases are suspicion rather than detection.
  */
-export function scanBackupFilesForSecrets(files: readonly BackupFile[]): string[] {
+export function scanBackupFilesForSecrets(
+  files: readonly BackupFile[],
+  contents: BackupContents
+): string[] {
+  const mcpOptions = mcpProjectionOptions(contents);
   return files
     .filter((file) => {
       const content = file.content.toString("utf-8");
       if (SECRET_PATTERNS.some((pattern) => pattern.test(content))) return true;
-      if (file.path === "mcp.jsonc" && mcpConfigRequiresPublishApproval(content)) return true;
+      if (file.path === "mcp.jsonc" && mcpConfigRequiresPublishApproval(content, mcpOptions)) {
+        return true;
+      }
       // Every collected file, not just the recursive ones: `agents/` is collected by name and
       // its `.md` filter would otherwise auto-publish `agents/api-key.md`.
       if (hasCredentialPathHint(file.path)) return true;
-      if (!isRecursivelyCollected(file.path)) return false;
+      if (!isRecursivelyCollected(file.path) || isShelfEntryMeta(file.path)) return false;
       return !AUTO_PUBLISHED_RECURSIVE_FILE.test(file.path);
     })
     .map((file) => file.path)
@@ -1367,18 +1635,22 @@ export function backupSecretApprovalDigest(
 export async function createBackupPayload(
   options: CreateBackupPayloadOptions
 ): Promise<BackupPayload> {
-  const files = await collectAllowlistedFiles(options.muxRoot);
+  const files = await collectAllowlistedFiles(options.muxRoot, options.contents);
   const mcpRedactionPaths: BackupRedactionPath[] = [];
   const mcpFile = files.find((file) => file.path === "mcp.jsonc");
   if (mcpFile && options.keepLocalSecrets !== true) {
-    const redacted = redactMcpConfig(mcpFile.content);
+    // Redacting this shape would report a successful push for a backup no machine can restore.
+    assertExportableMcpServers(mcpFile.content);
+    const redacted = redactMcpConfig(mcpFile.content, mcpProjectionOptions(options.contents));
     mcpFile.content = redacted.content;
     mcpRedactionPaths.push(...redacted.redactionPaths);
   }
-  files.push({
-    path: "preferences.json",
-    content: serializeBackupPreferences(options.preferences),
-  });
+  if (options.contents.includePreferences) {
+    files.push({
+      path: "preferences.json",
+      content: serializeBackupPreferences(options.preferences),
+    });
+  }
   // Count and complexity only: this payload may be a local snapshot, whose names keep
   // current-filesystem forms that portable validation would refuse. Collection already
   // validated each name under local rules; publication re-checks with portable rules.
@@ -1387,7 +1659,7 @@ export async function createBackupPayload(
   files.sort((a, b) => a.path.localeCompare(b.path));
 
   if (options.reportSecrets !== true) {
-    const secretFiles = scanBackupFilesForSecrets(files);
+    const secretFiles = scanBackupFilesForSecrets(files, options.contents);
     if (secretFiles.length > 0) {
       throw new Error(`Backup contains possible secrets in: ${secretFiles.join(", ")}`);
     }
@@ -1395,7 +1667,10 @@ export async function createBackupPayload(
 
   return {
     manifest: {
-      schemaVersion: BACKUP_SCHEMA_VERSION,
+      schemaVersion:
+        mcpFile && mcpConfigCarriesLiteralHeaders(mcpFile.content.toString("utf-8"))
+          ? BACKUP_SCHEMA_VERSION_LITERAL_HEADERS
+          : BACKUP_SCHEMA_VERSION,
       exportedAt: options.exportedAt ?? new Date().toISOString(),
       muxVersion: normalizeMuxVersion(options.muxVersion),
       sourceLabel: options.sourceLabel,
@@ -1566,7 +1841,19 @@ function assertBackupMcpRedactions(
   }
 }
 
-function parseManifest(raw: string, portable: boolean): BackupManifest {
+/**
+ * With `contents`, entries for unselected categories and, when MCP is left out, the
+ * `mcpRedactions` list are dropped before they are counted or validated: they describe
+ * files this selection never opens, so neither their shape nor their number can be allowed
+ * to fail a restore of everything else. The selection filters entries, not the document: the
+ * manifest is parsed and checked for duplicate keys whole first, because the filter classifies
+ * an entry by its `path` key and a duplicate key lets the tree and `JSON.parse` disagree about
+ * that value, so a crafted entry could look unselected to one and selected to the other. The
+ * repository tree is likewise validated whole before checkout (gitRepo.ts): unselected content
+ * is still checked out, only not restored. Entries whose category cannot be told (no string
+ * path) are still validated.
+ */
+function parseManifest(raw: string, portable: boolean, contents?: BackupContents): BackupManifest {
   const tree = jsonc.parseTree(raw);
   if (!tree) throw new Error("Invalid backup manifest");
   assertNoDuplicateKeys(tree, "backup manifest");
@@ -1574,19 +1861,29 @@ function parseManifest(raw: string, portable: boolean): BackupManifest {
   if (!isPlainObject(value)) throw new Error("Invalid backup manifest");
   const manifest: Partial<BackupManifest> = value;
   if (
-    manifest.schemaVersion !== BACKUP_SCHEMA_VERSION ||
+    (manifest.schemaVersion !== BACKUP_SCHEMA_VERSION &&
+      manifest.schemaVersion !== BACKUP_SCHEMA_VERSION_LITERAL_HEADERS) ||
     typeof manifest.exportedAt !== "string" ||
     typeof manifest.muxVersion !== "string" ||
     typeof manifest.sourceLabel !== "string"
   ) {
     throw new Error("Invalid backup manifest");
   }
+  if (contents && !contents.includeMcp) delete manifest.mcpRedactions;
   const mcpRedactions: unknown = manifest.mcpRedactions;
   if (mcpRedactions !== undefined) {
     if (!Array.isArray(mcpRedactions)) throw new Error("Invalid backup manifest");
     assertBackupMcpRedactions(mcpRedactions);
   }
   if (!Array.isArray(manifest.files)) throw new Error("Invalid backup manifest");
+  if (contents) {
+    manifest.files = manifest.files.filter(
+      (file: unknown) =>
+        !isPlainObject(file) ||
+        typeof file.path !== "string" ||
+        isSelectedPayloadPath(file.path, contents)
+    );
+  }
   assertBackupFileCount(manifest.files.length);
   if (mcpRedactions !== undefined) {
     const paths = new Set<string>();
@@ -1612,6 +1909,20 @@ function parseManifest(raw: string, portable: boolean): BackupManifest {
     { portable }
   );
   return manifest as BackupManifest;
+}
+
+/**
+ * True when the bytes parse as a portable backup manifest. Managed-path selection probes
+ * with this rather than mere existence: `manifest.json` is a generic filename, so an
+ * unrelated or corrupt file under one spelling must not beat a valid backup under another.
+ */
+export function isParseableBackupManifest(raw: string): boolean {
+  try {
+    parseManifest(raw, true);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function backupPayloadExists(sourceDir: string): Promise<boolean> {
@@ -1640,13 +1951,21 @@ function isFilesystemError(error: unknown): boolean {
  * `portable: false` for a local safety snapshot, matching the `writeBackupPayload` call that
  * produced it: those keep names only this filesystem has to accept, so the cross-platform
  * rules a repository payload needs would reject the copy a recovery reads.
+ *
+ * With `contents`, only the selected categories are read and the result is already projected
+ * through `selectBackupContents`. A restore leaves the rest alone, so a malformed or missing
+ * file there must not block the categories the user did select.
  */
 export async function readBackupPayload(
   sourceDir: string,
-  options: { portable?: boolean } = {}
+  options: { portable?: boolean; contents?: BackupContents } = {}
 ): Promise<BackupPayload> {
   try {
-    return await readBackupPayloadUnchecked(sourceDir, options.portable !== false);
+    return await readBackupPayloadUnchecked(
+      sourceDir,
+      options.portable !== false,
+      options.contents
+    );
   } catch (error) {
     if (isFilesystemError(error)) throw error;
     throw new BackupInvalidPayloadError(error);
@@ -1680,7 +1999,8 @@ async function readManifestEntry(
 
 async function readBackupPayloadUnchecked(
   sourceDir: string,
-  portable: boolean
+  portable: boolean,
+  contents?: BackupContents
 ): Promise<BackupPayload> {
   const budget = createByteBudget();
   const root = await resolveRoot(sourceDir);
@@ -1690,7 +2010,7 @@ async function readBackupPayloadUnchecked(
   const manifestRaw = await readCheckedFile(root, BACKUP_MANIFEST_FILE, (size) => {
     budget(BACKUP_MANIFEST_FILE, size);
   });
-  const manifest = parseManifest(manifestRaw.content.toString("utf-8"), portable);
+  const manifest = parseManifest(manifestRaw.content.toString("utf-8"), portable, contents);
   const files: BackupFile[] = [];
   const seen = new Set<string>();
   for (const manifestFile of manifest.files) {
@@ -1717,20 +2037,73 @@ async function readBackupPayloadUnchecked(
   const parsedMcp = mcpFile
     ? parseJsoncObjectWithTree(mcpFile.content.toString("utf-8"), "backup mcp.jsonc")
     : undefined;
-  if (manifest.mcpRedactions !== undefined) {
+  const mcpRedactions = manifest.mcpRedactions;
+  let payload: BackupPayload;
+  if (mcpRedactions !== undefined) {
     if (!parsedMcp) throw new Error("Backup manifest lists MCP redactions without mcp.jsonc");
-    validateMcpRedactionPaths(parsedMcp.tree, manifest.mcpRedactions);
-    return {
+    validateMcpRedactionPaths(parsedMcp.tree, mcpRedactions);
+    payload = { manifest, files, redactions: mcpRedactions.map(redactionPathLabel) };
+  } else {
+    payload = {
       manifest,
       files,
-      redactions: manifest.mcpRedactions.map(redactionPathLabel),
+      redactions: parsedMcp ? findMcpRedactionPaths(parsedMcp.tree).map(redactionPathLabel) : [],
     };
   }
-  return {
-    manifest,
-    files,
-    redactions: parsedMcp ? findMcpRedactionPaths(parsedMcp.tree).map(redactionPathLabel) : [],
+  return contents ? selectBackupContents(payload, contents) : payload;
+}
+
+/**
+ * The part of a checked-out backup the current selection restores. Files outside the selected
+ * categories are left alone on this machine, and when MCP is selected without its headers or
+ * commands, the backup's `mcp.jsonc` gets the markers an export with this selection would
+ * carry, so the restore keeps this machine's values for them. Preview, approvals, and the
+ * restore all read the selected payload, so none of them can promise a different result.
+ */
+export function selectBackupContents(
+  payload: BackupPayload,
+  contents: BackupContents
+): BackupPayload {
+  const files = payload.files.filter((file) => isSelectedPayloadPath(file.path, contents));
+  const manifest: BackupManifest = {
+    ...payload.manifest,
+    files: payload.manifest.files.filter((file) => isSelectedPayloadPath(file.path, contents)),
   };
+  let redactions = payload.redactions;
+  if (!contents.includeMcp) {
+    // The list describes a file this selection leaves alone.
+    delete manifest.mcpRedactions;
+    redactions = [];
+  }
+  const mcpFile = files.find((file) => file.path === "mcp.jsonc");
+  const projection = { ...mcpProjectionOptions(contents), markAbsent: true };
+  if (mcpFile && !(projection.includeHeaders && projection.includeCommands)) {
+    // A manifest without the list is read by marker text; listing the markers it already has
+    // keeps that reading once this pass adds paths of its own and the file is read by path.
+    const listed =
+      manifest.mcpRedactions ??
+      findMcpRedactionPaths(
+        parseJsoncObjectWithTree(mcpFile.content.toString("utf-8"), "backup mcp.jsonc").tree
+      );
+    const redacted = redactMcpConfig(mcpFile.content, projection);
+    files[files.indexOf(mcpFile)] = { ...mcpFile, content: redacted.content };
+    // A listed path under a value this pass replaced whole (a backup written when header
+    // values were redacted one by one, restored with headers deselected) no longer names a
+    // marker, and the restore rejects paths it cannot find.
+    const projected = parseJsoncObjectWithTree(
+      redacted.content.toString("utf-8"),
+      "backup mcp.jsonc"
+    ).parsed;
+    const merged = new Map<string, BackupRedactionPath>();
+    for (const jsonPath of [...listed, ...redacted.redactionPaths]) {
+      if (valueHasRedactionAtPath(projected, jsonPath)) {
+        merged.set(redactionPathKey(jsonPath), jsonPath);
+      }
+    }
+    manifest.mcpRedactions = [...merged.values()];
+    redactions = manifest.mcpRedactions.map(redactionPathLabel);
+  }
+  return { manifest, files, redactions };
 }
 
 function containsRedaction(value: string): boolean {
@@ -2005,6 +2378,11 @@ async function restoreMcpFile(
       localServerMerge.objectTrailingText
     );
   }
+  // Plugin enablement is local consent, not backup content. Even rehydrating
+  // local keys could resurrect consent revoked by a concurrent uninstall.
+  restoredText = applyJsoncEdits(restoredText, [
+    { path: ["enabledPluginServers"], value: undefined },
+  ]);
   parseJsoncObjectWithTree(restoredText, "restored mcp.jsonc");
   return Buffer.from(restoredText, "utf-8");
 }
@@ -2183,21 +2561,21 @@ function resolveRestoredCommands(
 }
 
 /**
- * A restored header value is only ever the local value at that exact path, or nothing.
+ * A literal header value the backup carries is restored as written: the user chose to back
+ * headers up, and anyone who can edit the repository could already read the value, so sending
+ * it to a url they chose exposes nothing new.
  *
- * `MCPServerManager.resolveHeaders` resolves both a literal header and a `{secret: NAME}`
- * reference against local data, then sends the result to whatever `url` the entry carries.
- * Deciding per value shape which ones are safe to carry over from a backup does not work:
- * a marker, a marker standing in for the whole `headers` object, a bare reference in a
- * marker-free file, and a reference the backup adds next to a url it chose are all the same
- * defect. So nothing the backup writes under `headers` survives unless the local file
- * already holds it at the same path, which makes the shape irrelevant.
+ * Everything else under `headers` resolves to the local value at that exact path, or nothing.
+ * `MCPServerManager.resolveHeaders` resolves a `{secret: NAME}` reference against local
+ * secrets, then sends the result to whatever `url` the entry carries, so a reference the
+ * backup adds next to a url it chose would exfiltrate a secret the repository never held. A
+ * marker stands for a value the backup left out. Neither survives unless the local file already
+ * holds that header, and only when the restored entry still points at the endpoint the local
+ * config sends it to; otherwise the header is dropped, leaving an entry that cannot
+ * authenticate rather than one that authenticates somewhere the user never approved.
  *
- * A local value is only put back when the restored entry still points at the endpoint the
- * local config already sends that header to. Otherwise the header is dropped, leaving an
- * entry that cannot authenticate rather than one that authenticates somewhere the user never
- * approved. Only header names the backup itself lists are considered, so a restore never
- * introduces a local header the backup did not have.
+ * A marker standing for the whole `headers` object (an export that left headers out) puts the
+ * entire local object back under the same endpoint rule.
  *
  * Returns the paths handled here so the generic redaction walk leaves them alone.
  */
@@ -2226,30 +2604,47 @@ function resolveRestoredHeaders(
     // by a path this function did not decide on.
     handled.add(headersPath.join("\u0000"));
 
-    const headers = readRecord(rawHeaders);
     const endpointMatches =
       restoredServerUrl(entry, localServer, name, redactedPaths) === readUrl(localServer);
-    if (!headers || !endpointMatches) {
+    const localHeaders = endpointMatches ? readRecord(localServer?.headers) : undefined;
+    if (
+      typeof rawHeaders === "string" &&
+      isRedactedBackupValue(rawHeaders, headersPath, redactedPaths)
+    ) {
+      edits.push({ path: headersPath, value: localHeaders });
+      continue;
+    }
+    const headers = readRecord(rawHeaders);
+    if (!headers) {
       edits.push({ path: headersPath, value: undefined });
       continue;
     }
 
-    const localHeaders = readRecord(localServer?.headers) ?? {};
     // Names come from the document, not the parsed object, because `jsonc.parse` drops a
     // `__proto__` key while the text keeps it. Enumerating the parse result would leave that
     // header, and its marker, untouched in the restored file.
-    const names = objectKeyNames(backupTree, ["servers", name, "headers"]);
+    const names = objectKeyNames(backupTree, headersPath);
     const restored: Record<string, unknown> = {};
     for (const headerName of names) {
-      if (!Object.hasOwn(localHeaders, headerName)) continue;
-      restored[headerName] = localHeaders[headerName];
+      const value = readOwn(headers, headerName);
+      if (
+        typeof value === "string" &&
+        !isRedactedBackupValue(value, [...headersPath, headerName], redactedPaths)
+      ) {
+        restored[headerName] = value;
+      } else if (localHeaders && Object.hasOwn(localHeaders, headerName)) {
+        restored[headerName] = localHeaders[headerName];
+      }
     }
 
     if (names.length !== Object.keys(restored).length) {
       // Something has to go: a header with no local counterpart, a duplicate key, or a name
       // the parser hides. Replacing the whole value is the only edit that reliably removes
       // it, since `jsonc.modify` cannot address a key it cannot see.
-      edits.push({ path: headersPath, value: restored });
+      edits.push({
+        path: headersPath,
+        value: Object.keys(restored).length > 0 ? restored : undefined,
+      });
       continue;
     }
     for (const [headerName, value] of Object.entries(restored)) {
@@ -2466,13 +2861,20 @@ export async function restoreBackupPayload(
   options: RestoreBackupPayloadOptions
 ): Promise<RestoreBackupPayloadResult> {
   const localPaths = new Set(
-    (await collectAllowlistedFiles(options.muxRoot)).map((file) => file.path)
+    (await collectAllowlistedFiles(options.muxRoot, options.contents)).map((file) => file.path)
   );
   const restoredPaths = new Set(
     options.payload.files
       .filter((file) => file.path !== "preferences.json")
       .map((file) => file.path)
   );
+  // Restore revokes local plugin consent. Serialize its local reads, approval
+  // check and writes with admission and ordinary MCP mutations, not just the
+  // final write: a pre-lock plan could overwrite a newer local configuration.
+  // Keep the existing whole-payload preflight before any settings are changed.
+  await using _mcpLock = restoredPaths.has("mcp.jsonc")
+    ? { [Symbol.asyncDispose]: await acquireGlobalMcpConfigLock(options.muxRoot) }
+    : undefined;
   // Recomputed here rather than trusted from the preview, so an approval cannot authorize
   // a command the repository changed between the preview and this restore.
   assertBackupCommandsApproved(
@@ -2495,4 +2897,973 @@ export async function restoreBackupPayload(
   }
 
   return { backupPreferences: plan.backupPreferences, localOnlyFiles: localOnly };
+}
+
+// ---------------------------------------------------------------------------
+// Project bundle: the opt-in `project-bundle/` sidecar carrying the project
+// list and per-project memories. Kept out of the core manifest for downgrade
+// safety (see PROJECT_BUNDLE_DIR); every function here validates with its own
+// bundle-scoped allowlist and byte budget so a bundle can neither smuggle a
+// path past the core allowlist nor starve a core-only read.
+// ---------------------------------------------------------------------------
+
+export interface BackupProjectBundle {
+  manifest: BackupProjectBundleManifest;
+  files: BackupFile[];
+}
+
+/** Bundle files live only under `memory/project/<dir>/...`, so at least four segments. */
+function assertAllowedBundleFilePath(
+  relativePath: string,
+  options: { portable: boolean } = { portable: true }
+): void {
+  const segments = relativePath.split("/");
+  // The memory directory segment is derived from the project's basename, which may itself
+  // start with a dot (`~/.dotfiles` → `.dotfiles-<hash>`), so the hidden-name rule does not
+  // apply to it; it is held to its own charset and hash rules by assertValidBundleEntryDir
+  // and must equal a listed entry's directory exactly. `.`/`..` still fail the shape check.
+  const memoryDir = segments[2] ?? "";
+  const shapeChecked = [
+    ...segments.slice(0, 2),
+    /^\.{1,2}$/.test(memoryDir) ? memoryDir : memoryDir.replace(/^\./, "_"),
+    ...segments.slice(3),
+  ].join("/");
+  if (
+    !relativePath.startsWith(PROJECT_MEMORY_PATH_PREFIX) ||
+    segments.length < 4 ||
+    hasDisallowedPathShape(shapeChecked, options)
+  ) {
+    throw new Error(`Backup project bundle contains disallowed path '${relativePath}'`);
+  }
+}
+
+/**
+ * A recorded memory directory name is repository-controlled, so it is held to the safe
+ * charset `projectMemoryDirName` emits and its hash suffix must match the entry's own
+ * project path. Deliberately NOT full `projectMemoryDirName(entry.path)` equality: the
+ * sanitized basename half is derived from the source machine's path syntax, so a Windows
+ * export legitimately disagrees with a POSIX recomputation, while the pure string hash is
+ * host-independent. Restore destinations are always recomputed locally either way.
+ */
+function assertValidBundleEntryDir(entry: BackupProjectBundleEntry): void {
+  const { memoryDir } = entry;
+  // A leading dot is legitimate here (a `.dotfiles` project); `.` and `..` cannot pass the
+  // hash-suffix rule below.
+  if (
+    !/^[A-Za-z0-9._-]{1,64}$/.test(memoryDir) ||
+    isForbiddenBasename(memoryDir) ||
+    isWindowsUnusableSegment(memoryDir) ||
+    !memoryDir.endsWith(`-${projectPathHashSuffix(entry.path)}`) ||
+    !/[0-9a-f]{12}$/.test(memoryDir)
+  ) {
+    throw new Error(
+      `Backup project bundle entry '${entry.path}' has an invalid memory directory name`
+    );
+  }
+}
+
+/** The memory directory segment of a bundle file path, exactly as spelled. */
+function bundleFileDirSegment(relativePath: string): string {
+  return relativePath.split("/")[2] ?? "";
+}
+
+export function bundleEntryFiles(
+  files: readonly BackupFile[],
+  entry: BackupProjectBundleEntry
+): BackupFile[] {
+  // Exact spelling, not the collision-folded key: a matched restore writes these paths
+  // verbatim, so a case- or normalization-variant directory would land files where the
+  // project's memory store never reads them. Reading rejects such files outright.
+  const prefix = `${PROJECT_MEMORY_PATH_PREFIX}${entry.memoryDir}/`;
+  return files.filter((file) => file.path.startsWith(prefix));
+}
+
+/**
+ * Collects the memory directories of the given project entries from the local Xum root.
+ * Per entry rather than a blind `memory/project` sweep, so orphaned directories of deleted
+ * projects stay local. Entries must already carry their locally computed memory dir names.
+ */
+export async function collectProjectBundle(
+  muxRoot: string,
+  entries: readonly BackupProjectBundleEntry[],
+  options: { portableMemoryOnly?: boolean } = {}
+): Promise<BackupProjectBundle> {
+  if (entries.length > MAX_BACKUP_PROJECT_ENTRIES) {
+    throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
+  }
+  const seenPaths = new Set<string>();
+  const seenDirs = new Set<string>();
+  for (const entry of entries) {
+    // Local entries come from projectMemoryDirName, so these are impossible-condition
+    // checks on the export side; the same validation guards the read side for real.
+    assertValidBundleEntryDir(entry);
+    if (seenPaths.has(entry.path)) {
+      throw new Error(`Backup project bundle lists '${entry.path}' twice`);
+    }
+    seenPaths.add(entry.path);
+    const dirKey = collisionKey(entry.memoryDir);
+    if (seenDirs.has(dirKey)) {
+      throw new Error(`Backup project bundle reuses memory directory '${entry.memoryDir}'`);
+    }
+    seenDirs.add(dirKey);
+  }
+
+  const root = await resolveRoot(muxRoot);
+  const collector = createBackupFileCollector(root);
+  const sorted = [...entries].sort((a, b) => a.path.localeCompare(b.path));
+  for (const entry of sorted) {
+    await collector.collectDirectory(
+      `${PROJECT_MEMORY_PATH_PREFIX}${entry.memoryDir}`,
+      () => true,
+      // Exports skip what the memory subsystem itself could not have produced or cannot
+      // read — files past its size limit and files beyond its per-scope count: bundling
+      // them would produce a backup this build's own restore rejects. Snapshots keep
+      // full fidelity so an overwritten oversized local file stays recoverable.
+      options.portableMemoryOnly === true
+        ? { maxFileBytes: MEMORY_MAX_FILE_BYTES, maxFiles: MEMORY_MAX_FILES_PER_SCOPE }
+        : {}
+    );
+  }
+  collector.assertHardLinksContained();
+  // The executable bit is dropped on purpose: memory files are notes, and the bundle
+  // manifest does not record modes, so restores always land them non-executable.
+  const files = collector.files
+    .map((file) => ({ path: file.path, content: file.content }))
+    .sort((a, b) => a.path.localeCompare(b.path));
+  return {
+    manifest: {
+      schemaVersion: 1,
+      projects: sorted.map((entry) => ({
+        path: entry.path,
+        name: entry.name,
+        ...(entry.gitRemote !== undefined ? { gitRemote: entry.gitRemote } : {}),
+        memoryDir: entry.memoryDir,
+      })),
+      files: files.map((file) => ({ path: file.path, sha256: sha256(file.content) })),
+    },
+    files,
+  };
+}
+
+/**
+ * Writes the bundle into its sidecar directory. No manifest-reuse dance like the core
+ * writer needs: the bundle manifest has no volatile metadata, and its arrays are sorted,
+ * so identical content serializes to identical bytes and never forces a no-op commit.
+ */
+export async function writeProjectBundle(
+  destinationDir: string,
+  bundle: BackupProjectBundle,
+  options: { portable?: boolean; ownerOnly?: boolean } = {}
+): Promise<void> {
+  const portable = options.portable !== false;
+  const ownerOnly = options.ownerOnly === true;
+  // The same schema the reader enforces, so an entry this install generated but no build
+  // can read back (a registered path past the manifest's cap) fails the export here, not
+  // the next restore.
+  const manifestCheck = BackupProjectBundleManifestSchema.safeParse(bundle.manifest);
+  if (!manifestCheck.success) {
+    throw new Error(
+      `Cannot back up the project list: ${manifestCheck.error.issues
+        .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+        .join("; ")}`
+    );
+  }
+  assertBackupFileCount(bundle.files.length);
+  assertBackupPathComplexity(bundle.files.map((file) => file.path));
+  for (const file of bundle.files) assertAllowedBundleFilePath(file.path, { portable });
+  for (const file of bundle.manifest.files) assertAllowedBundleFilePath(file.path, { portable });
+  const claimed = new Set<string>();
+  for (const file of bundle.files) {
+    const claim = portable ? collisionKey(file.path) : file.path;
+    if (claimed.has(claim)) throw new Error(`Duplicate backup path '${file.path}'`);
+    claimed.add(claim);
+  }
+  const manifestJson = serializeProjectBundleManifest(bundle.manifest).toString("utf-8");
+  // Bound what is published so a bundle that writes is never one every later read rejects.
+  const budget = createByteBudget();
+  budget(BACKUP_MANIFEST_FILE, Buffer.byteLength(manifestJson, "utf-8"));
+  for (const file of bundle.files) budget(file.path, file.content.length);
+
+  await fs.rm(destinationDir, { recursive: true, force: true });
+  await fs.mkdir(destinationDir, { recursive: true, ...(ownerOnly ? { mode: 0o700 } : {}) });
+  const root = await resolveRoot(destinationDir);
+  for (const file of bundle.files) {
+    await resolveContainedPath(root.path, file.path);
+    await writeCheckedFile(root, file.path, file.content, false, { ownerOnly });
+  }
+  await writeCheckedFile(root, BACKUP_MANIFEST_FILE, Buffer.from(manifestJson, "utf-8"), false, {
+    ownerOnly,
+  });
+}
+
+/** The bytes `writeProjectBundle` publishes for the manifest; exported so the secret scan sees them too. */
+export function serializeProjectBundleManifest(manifest: BackupProjectBundleManifest): Buffer {
+  return Buffer.from(`${JSON.stringify(manifest, null, 2)}\n`, "utf-8");
+}
+
+/** Where the bundle manifest lands relative to the managed path. */
+export const PROJECT_BUNDLE_MANIFEST_PATH = `${PROJECT_BUNDLE_DIR}/${BACKUP_MANIFEST_FILE}`;
+
+/**
+ * The checkout side bounds the whole managed tree — core payload, bundle, both manifests —
+ * with one file-count, byte, and path-complexity limit set, while export budgets the two
+ * halves independently. An export both halves accept individually can still exceed the
+ * combined limits, so it is measured here exactly as the next checkout will measure it.
+ */
+export async function assertManagedTreeWithinLimits(destinationDir: string): Promise<void> {
+  const entries = await fs.readdir(destinationDir, { withFileTypes: true, recursive: true });
+  const files = entries.filter((entry) => entry.isFile());
+  assertBackupFileCount(files.length);
+  const relativePaths = files.map((entry) =>
+    path.relative(destinationDir, path.join(entry.parentPath, entry.name)).split(path.sep).join("/")
+  );
+  assertBackupPathComplexity(relativePaths);
+  const budget = createByteBudget();
+  for (const [index, entry] of files.entries()) {
+    const stat = await fs.lstat(path.join(entry.parentPath, entry.name));
+    budget(relativePaths[index] ?? entry.name, stat.size);
+  }
+}
+
+/**
+ * Existence is checked without parsing, so a malformed sidecar can be reported as present
+ * while `includeProjects` is off without ever blocking a core-only restore on its contents.
+ * "Present" is anything at the sidecar path: a symlink or a stray file there is a bundle
+ * the full read refuses, and the toggle-off report should say so rather than "none".
+ */
+export async function projectBundleExists(sourceDir: string): Promise<boolean> {
+  // lstat, never stat: on hosts where git materializes symlinks, a crafted sidecar pointing
+  // at a UNC path would otherwise be followed here — reached even with project backup off —
+  // and Windows would start SMB authentication.
+  return (await lstatIfExists(path.join(sourceDir, PROJECT_BUNDLE_DIR))) !== null;
+}
+
+function parseProjectBundleManifest(raw: string): BackupProjectBundleManifest {
+  const tree = jsonc.parseTree(raw);
+  if (!tree) throw new Error("Invalid backup project bundle manifest");
+  assertNoDuplicateKeys(tree, "backup project bundle manifest");
+  const value: unknown = JSON.parse(raw);
+  // Array lengths are bounded before the per-entry schema runs, as the core manifest parser
+  // does: a manifest-sized array of tiny valid entries would otherwise be fully validated
+  // and copied before the file-count check ever ran.
+  if (!isPlainObject(value) || !Array.isArray(value.files) || !Array.isArray(value.projects)) {
+    throw new Error("Invalid backup project bundle manifest");
+  }
+  assertBackupFileCount(value.files.length);
+  if (value.projects.length > MAX_BACKUP_PROJECT_ENTRIES) {
+    throw new Error(`Backup has more than ${MAX_BACKUP_PROJECT_ENTRIES} projects`);
+  }
+  const parsed = BackupProjectBundleManifestSchema.safeParse(value);
+  if (!parsed.success) throw new Error("Invalid backup project bundle manifest");
+  return {
+    ...parsed.data,
+    // Remotes are display-only hints; a shape the sanitizer refuses is dropped rather
+    // than failing the whole bundle, and the import token binds the normalized entry.
+    projects: parsed.data.projects.map((entry) => {
+      const gitRemote =
+        entry.gitRemote === undefined ? undefined : sanitizeBackupGitRemote(entry.gitRemote);
+      return {
+        path: entry.path,
+        name: entry.name,
+        ...(gitRemote !== undefined ? { gitRemote } : {}),
+        memoryDir: entry.memoryDir,
+      };
+    }),
+  };
+}
+
+/**
+ * Reads and fully validates the sidecar, or returns null when the backup carries none.
+ * Callers gate this on `includeProjects`: with the toggle off the sidecar is never parsed,
+ * so a malformed bundle cannot block a core-only restore.
+ *
+ * "None" means nothing at the sidecar path. Anything else there — a symlink, a file, a
+ * directory without its manifest — is a bundle the read below refuses: reading it as absent
+ * would apply the core restore while silently omitting every backed-up project.
+ */
+export async function readProjectBundle(
+  sourceDir: string,
+  options: { portable?: boolean } = {}
+): Promise<BackupProjectBundle | null> {
+  if (!(await projectBundleExists(sourceDir))) return null;
+  try {
+    return await readProjectBundleUnchecked(sourceDir, options.portable !== false);
+  } catch (error) {
+    if (isFilesystemError(error)) throw error;
+    throw new BackupInvalidPayloadError(error);
+  }
+}
+
+async function readProjectBundleUnchecked(
+  sourceDir: string,
+  portable: boolean
+): Promise<BackupProjectBundle> {
+  // Contained resolution first: a symlinked `project-bundle` in a crafted repository must
+  // be refused before resolveRoot would canonicalize straight through it.
+  const bundleDir = await resolveContainedPath(sourceDir, PROJECT_BUNDLE_DIR);
+  const budget = createByteBudget();
+  const root = await resolveRoot(bundleDir);
+  await resolveContainedPath(root.path, BACKUP_MANIFEST_FILE);
+  // Explicit, so a sidecar directory without its manifest is an invalid bundle rather than
+  // an ENOENT surfacing as an I/O failure.
+  if ((await lstatIfExists(path.join(root.path, BACKUP_MANIFEST_FILE)))?.isFile() !== true) {
+    throw new Error("Backup project bundle has no manifest");
+  }
+  const manifestRaw = await readCheckedFile(root, BACKUP_MANIFEST_FILE, (size) => {
+    budget(BACKUP_MANIFEST_FILE, size);
+  });
+  const manifest = parseProjectBundleManifest(manifestRaw.content.toString("utf-8"));
+
+  const entryDirKeys = new Set<string>();
+  const entryDirs = new Set<string>();
+  const entryPaths = new Set<string>();
+  for (const entry of manifest.projects) {
+    assertValidBundleEntryDir(entry);
+    if (entryPaths.has(entry.path)) {
+      throw new Error(`Backup project bundle lists '${entry.path}' twice`);
+    }
+    entryPaths.add(entry.path);
+    const dirKey = collisionKey(entry.memoryDir);
+    if (entryDirKeys.has(dirKey)) {
+      throw new Error(`Backup project bundle reuses memory directory '${entry.memoryDir}'`);
+    }
+    entryDirKeys.add(dirKey);
+    entryDirs.add(entry.memoryDir);
+  }
+
+  assertBackupFileCount(manifest.files.length);
+  assertBackupPathComplexity(manifest.files.map((file) => file.path));
+  const files: BackupFile[] = [];
+  const seen = new Set<string>();
+  for (const manifestFile of manifest.files) {
+    assertAllowedBundleFilePath(manifestFile.path, { portable });
+    // Exact directory spelling: `bundleEntryFiles` associates by exact prefix, so a
+    // case- or normalization-variant of a listed directory would otherwise be a file no
+    // entry owns — accepted, never restored, and invisible to the import token.
+    if (!entryDirs.has(bundleFileDirSegment(manifestFile.path))) {
+      throw new Error(
+        `Backup project bundle file '${manifestFile.path}' does not belong to a listed project`
+      );
+    }
+    const key = portable ? collisionKey(manifestFile.path) : manifestFile.path;
+    if (seen.has(key)) throw new Error(`Duplicate backup path '${manifestFile.path}'`);
+    seen.add(key);
+    const content = await readManifestEntry(root, manifestFile.path, budget);
+    if (sha256(content) !== manifestFile.sha256) {
+      throw new Error(`Backup checksum mismatch for '${manifestFile.path}'`);
+    }
+    files.push({ path: manifestFile.path, content });
+  }
+  return { manifest, files };
+}
+
+/**
+ * Binds an import approval to the exact entry and content it was shown for. JSON with a
+ * fixed key order, so no delimiter ambiguity; any change to the entry's metadata or to one
+ * of its memory files between preview and restore produces a different token and forces
+ * re-approval.
+ */
+export function projectImportToken(
+  entry: BackupProjectBundleEntry,
+  files: readonly BackupFile[]
+): string {
+  const contentHashes = bundleEntryFiles(files, entry)
+    .map((file) => [file.path, sha256(file.content)] as const)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return sha256(
+    Buffer.from(
+      JSON.stringify([
+        1,
+        {
+          path: entry.path,
+          name: entry.name,
+          gitRemote: entry.gitRemote ?? null,
+          memoryDir: entry.memoryDir,
+        },
+        contentHashes,
+      ]),
+      "utf-8"
+    )
+  );
+}
+
+/**
+ * A bundle entry the restore writes without approval, and the local project it writes to.
+ * `projectPath`/`localMemoryDir` equal the entry's own path/dir for a project registered at
+ * its recorded path, and the import target's for a project brought in by an earlier import.
+ */
+export interface MatchedProjectEntry {
+  entry: BackupProjectBundleEntry;
+  files: BackupFile[];
+  projectPath: string;
+  localMemoryDir: string;
+}
+
+export interface ProjectBundleRestorePlan {
+  /** Entries with a local project identity: restored verbatim into that project's memory. */
+  matched: MatchedProjectEntry[];
+  /** Everything else: never written without an explicit per-entry import approval. */
+  imports: Array<{ entry: BackupProjectBundleEntry; files: BackupFile[]; token: string }>;
+}
+
+/** The local project an earlier import created for a recorded source path. */
+export interface ProjectMemoryOrigin {
+  projectPath: string;
+  memoryDir: string;
+}
+
+/**
+ * Partitions bundle entries against the projects registered on this machine. The caller
+ * supplies `registeredDirByPath` as project path → locally computed memory dir name, so a
+ * match asserts both "registered at exactly this path" and "the recorded dir name is the
+ * one this host computes" — a foreign-OS source path with a correct hash suffix falls
+ * through to an import candidate rather than being rejected or silently written.
+ * `origins` (recorded source path → local project) lets a project imported under another
+ * path keep receiving updates on later restores; without it every restore after an import
+ * would re-offer the project as an add-only candidate that can never update a file.
+ */
+export function planProjectBundleRestore(
+  bundle: BackupProjectBundle,
+  registeredDirByPath: ReadonlyMap<string, string>,
+  origins: ReadonlyMap<string, ProjectMemoryOrigin> = new Map()
+): ProjectBundleRestorePlan {
+  const plan: ProjectBundleRestorePlan = { matched: [], imports: [] };
+  // One local project receives at most one entry: a project recorded directly at a path
+  // that an earlier import also targets would otherwise merge two entries' notes into one
+  // memory scope. The exact-path match wins; the colliding entry is re-offered as an import.
+  const claimed = new Set<string>();
+  const localIdentity = (entry: BackupProjectBundleEntry): ProjectMemoryOrigin | null => {
+    if (registeredDirByPath.get(entry.path) === entry.memoryDir) {
+      return { projectPath: entry.path, memoryDir: entry.memoryDir };
+    }
+    const origin = origins.get(entry.path);
+    // The origin's project must still be registered with the dir name this host computes;
+    // a stale marker under an unregistered or renamed directory falls back to an import.
+    return origin !== undefined && registeredDirByPath.get(origin.projectPath) === origin.memoryDir
+      ? origin
+      : null;
+  };
+  const entries = bundle.manifest.projects.map((entry) => ({ entry, local: localIdentity(entry) }));
+  for (const { entry, local } of entries) {
+    if (local !== null && local.projectPath === entry.path) claimed.add(local.projectPath);
+  }
+  for (const { entry, local } of entries) {
+    const files = bundleEntryFiles(bundle.files, entry);
+    const viaOrigin = local !== null && local.projectPath !== entry.path;
+    if (local !== null && (!viaOrigin || !claimed.has(local.projectPath))) {
+      claimed.add(local.projectPath);
+      plan.matched.push({
+        entry,
+        files,
+        projectPath: local.projectPath,
+        localMemoryDir: local.memoryDir,
+      });
+      continue;
+    }
+    plan.imports.push({ entry, files, token: projectImportToken(entry, bundle.files) });
+  }
+  return plan;
+}
+
+/** A matched entry's files addressed to the local project's memory directory. */
+export function matchedProjectWrites(
+  match: MatchedProjectEntry
+): Array<{ path: string; content: Buffer }> {
+  return match.files.map((file) => ({
+    path: rekeyProjectMemoryPath(file.path, match.localMemoryDir),
+    content: file.content,
+  }));
+}
+
+/**
+ * Markers recording which local project an imported source lives in, as a pair of records
+ * that must agree: one keyed by the recorded source path (hashed) and one keyed by the local
+ * memory directory (hashed), each naming the other. A source has one record and a project has
+ * one record, so importing a source elsewhere or importing another source into the same
+ * project each replace exactly one record and thereby invalidate the association it
+ * superseded — the newest explicit association is the only one both sides confirm — and a
+ * restore locates a source's association in two reads, never by scanning the directory.
+ * Kept in `memory/.backup-origins/` — beside, not inside, the project scopes — so no memory
+ * path a user or agent can address through MemoryService collides with it, and the core
+ * allowlist (which collects only `memory/global`) never exports it. Needs no config schema.
+ */
+const PROJECT_MEMORY_ORIGINS_DIR = "memory/.backup-origins";
+/**
+ * Bound on a marker's bytes, aligned with what the writer can produce: a schema-capped
+ * 1024-character source path fully `\uXXXX`-escaped (6144 bytes), a 64-character memory
+ * directory name, and the JSON framing.
+ */
+const MAX_PROJECT_MEMORY_ORIGIN_BYTES = 8192;
+
+function projectMemoryOriginPath(sourcePath: string): string {
+  return `${PROJECT_MEMORY_ORIGINS_DIR}/${sha256(Buffer.from(sourcePath, "utf-8")).slice(0, 32)}.json`;
+}
+
+function projectMemoryOriginTargetPath(localMemoryDir: string): string {
+  return `${PROJECT_MEMORY_ORIGINS_DIR}/target-${sha256(Buffer.from(localMemoryDir, "utf-8")).slice(0, 32)}.json`;
+}
+
+export async function writeProjectMemoryOrigin(
+  muxRoot: string,
+  localMemoryDir: string,
+  sourcePath: string
+): Promise<void> {
+  const root = await resolveRoot(muxRoot);
+  const content = Buffer.from(
+    `${JSON.stringify({ sourcePath, memoryDir: localMemoryDir })}\n`,
+    "utf-8"
+  );
+  // The reader's cap, checked before writing: an import must not report success with a
+  // marker no later restore will read.
+  if (content.length > MAX_PROJECT_MEMORY_ORIGIN_BYTES) {
+    throw new Error("Cannot record the imported project's origin: the marker is too large");
+  }
+  // Two files cannot change atomically, so the order decides what a crash between the two
+  // writes leaves behind. The project's record goes first and the source's record is the
+  // commit point: until it is replaced, the source's previous association (if any) still has
+  // both of its halves untouched and stays confirmed, and the project's new record names a
+  // source that does not point back — a claim nothing confirms, exactly like a project whose
+  // source was imported elsewhere. The other order would void the previous association
+  // first, and no crash-recovery rule on the source's record can tell an incomplete write
+  // from a completed association that another import into the same project superseded.
+  // The project's record was the half the import's memory write had already committed to.
+  //
+  // What such a crash does cost is the project's own previous association, if it had one:
+  // its record now names the new source, so its previous source is re-offered as an import
+  // on the next restore, its files intact in the project (an add-only re-import restores the
+  // association). That is deliberate. Recording the previous source for recovery would need
+  // a reader to tell "the new pair never committed" from "it committed and the source later
+  // moved on", and the two files cannot say which — a crash after the commit but before any
+  // cleanup of that recovery state looks identical — so the recovered association could be
+  // one a completed import had superseded, and a matched restore would then overwrite the
+  // project's memory without approval. The records fail toward an explicit re-import, never
+  // toward a match nobody approved.
+  const targetRecord = projectMemoryOriginTargetPath(localMemoryDir);
+  const previousTarget = await readProjectMemoryOriginRecordBytes(root, targetRecord);
+  await writeProjectMemoryOriginRecord(root, targetRecord, content);
+  try {
+    await writeProjectMemoryOriginRecord(root, projectMemoryOriginPath(sourcePath), content);
+  } catch (error) {
+    // Put the project's record back so a failed import does not void the association the
+    // project had before it. Best effort under the same I/O conditions that failed the write;
+    // if it fails too, the reader confirms neither half rather than a wrong one.
+    if (previousTarget === "absent") {
+      await fs.rm(absolutePathOf(root.path, targetRecord), { force: true }).catch(() => undefined);
+    } else if (previousTarget !== "unreadable") {
+      await writeProjectMemoryOriginRecord(root, targetRecord, previousTarget).catch(
+        () => undefined
+      );
+    }
+    throw error;
+  }
+}
+
+/**
+ * A record's current bytes for putting it back, `"absent"` when there is none, and
+ * `"unreadable"` when it exists but cannot be read — in which case nothing can be restored,
+ * and the caller leaves the new record in place for the reader to refuse.
+ */
+async function readProjectMemoryOriginRecordBytes(
+  root: BackupRoot,
+  relativePath: string
+): Promise<Buffer | "absent" | "unreadable"> {
+  if ((await lstatIfExists(absolutePathOf(root.path, relativePath))) === null) return "absent";
+  try {
+    return (
+      await readCheckedFile(root, relativePath, (size) => {
+        if (size > MAX_PROJECT_MEMORY_ORIGIN_BYTES) throw new Error("origin marker too large");
+      })
+    ).content;
+  } catch {
+    return "unreadable";
+  }
+}
+
+async function writeProjectMemoryOriginRecord(
+  root: BackupRoot,
+  relativePath: string,
+  content: Buffer
+): Promise<void> {
+  const staging = `${relativePath}.tmp`;
+  // Contained and then written through the checked writer, like every other file a restore
+  // lands: `.backup-origins` or the marker itself left behind as a symlink (a copied or
+  // corrupted Xum home) would otherwise be followed, and an approved import would replace a
+  // file outside the memory tree with backup-controlled JSON.
+  await resolveContainedPath(root.path, relativePath);
+  await resolveContainedPath(root.path, staging);
+  // Staged beside the record and renamed over it, so a record is replaced only by a complete
+  // replacement: a write that fails midway (disk full) leaves the old record as it was.
+  try {
+    await writeCheckedFile(root, staging, content, false);
+    await fs.rename(absolutePathOf(root.path, staging), absolutePathOf(root.path, relativePath));
+  } catch (error) {
+    await fs.rm(absolutePathOf(root.path, staging), { force: true }).catch(() => undefined);
+    throw error;
+  }
+}
+
+interface ProjectMemoryOriginRecord {
+  sourcePath: string;
+  memoryDir: string;
+}
+
+function parseProjectMemoryOriginRecord(content: Buffer): ProjectMemoryOriginRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content.toString("utf-8"));
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(parsed)) return null;
+  const { sourcePath, memoryDir } = parsed;
+  if (
+    typeof sourcePath !== "string" ||
+    sourcePath === "" ||
+    typeof memoryDir !== "string" ||
+    memoryDir === ""
+  ) {
+    return null;
+  }
+  return { sourcePath, memoryDir };
+}
+
+/** A record's fields, or null for a missing, unreadable, refused, or malformed one. */
+async function readProjectMemoryOriginRecord(
+  root: BackupRoot,
+  relativePath: string
+): Promise<ProjectMemoryOriginRecord | null> {
+  try {
+    // The checked reader refuses a symlinked directory or record the same way the writer
+    // does, so a planted link cannot re-point a project at another source.
+    const { content } = await readCheckedFile(root, relativePath, (size) => {
+      if (size > MAX_PROJECT_MEMORY_ORIGIN_BYTES) throw new Error("origin marker too large");
+    });
+    return parseProjectMemoryOriginRecord(content);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Recorded source path → local project, for the given sources (a bundle's entries) whose
+ * association a currently registered project confirms from its side. Bounded by the sources
+ * asked about, never by how many records have accumulated.
+ */
+export async function readProjectMemoryOrigins(
+  muxRoot: string,
+  registeredDirByPath: ReadonlyMap<string, string>,
+  sourcePaths: Iterable<string>
+): Promise<Map<string, ProjectMemoryOrigin>> {
+  const root = await resolveRoot(muxRoot);
+  // Memory dir → registered project. Two registered projects computing one dir name is all
+  // but impossible (the name carries a hash of the path); should it happen, the dir names
+  // neither, since the record could not say which project it meant.
+  const projectByDir = new Map<string, string | null>();
+  for (const [projectPath, memoryDir] of registeredDirByPath) {
+    projectByDir.set(memoryDir, projectByDir.has(memoryDir) ? null : projectPath);
+  }
+  const origins = new Map<string, ProjectMemoryOrigin>();
+  for (const sourcePath of new Set(sourcePaths)) {
+    const claim = await readProjectMemoryOriginRecord(root, projectMemoryOriginPath(sourcePath));
+    // Each file is named by a hash of one field; the recorded fields have to agree with the
+    // name and with each other, or the record is not this association's (a hand-placed or
+    // corrupted file, or a superseded half).
+    if (claim?.sourcePath !== sourcePath) continue;
+    // The project's own record must name this source back: a project imported into again
+    // from another source names that source now, and the older claim on it is void even
+    // though the older source's record still exists. There is no fallback from an
+    // unconfirmed claim to an earlier association: the writer's order (see
+    // writeProjectMemoryOrigin) keeps an earlier association's own two halves intact until
+    // the new pair is complete, so it is found here directly or not at all.
+    const target = await readProjectMemoryOriginRecord(
+      root,
+      projectMemoryOriginTargetPath(claim.memoryDir)
+    );
+    if (target?.sourcePath !== sourcePath || target.memoryDir !== claim.memoryDir) continue;
+    const projectPath = projectByDir.get(claim.memoryDir);
+    if (projectPath == null) continue;
+    origins.set(sourcePath, { projectPath, memoryDir: claim.memoryDir });
+  }
+  return origins;
+}
+
+/** `memory/project/<recorded>/rest` re-keyed to the locally computed target directory. */
+export function rekeyProjectMemoryPath(bundlePath: string, targetDirName: string): string {
+  const segments = bundlePath.split("/");
+  return [segments[0], segments[1], targetDirName, ...segments.slice(3)].join("/");
+}
+
+/**
+ * Carries the files a failed project-memory write had already created: the writes are
+ * sequential without rollback, so the caller's failure report must include the partial
+ * progress as the user's cleanup list instead of claiming nothing was written.
+ */
+export class ProjectMemoryWriteError extends Error {
+  readonly written: string[];
+  readonly skipped: string[];
+
+  constructor(
+    message: string,
+    progress: { written: string[]; skipped: string[] },
+    options?: { cause?: unknown }
+  ) {
+    super(message, options);
+    this.name = "ProjectMemoryWriteError";
+    this.written = progress.written;
+    this.skipped = progress.skipped;
+  }
+}
+
+/**
+ * A matched-memory restore that failed after some entries were written. The service's
+ * change notification runs on the success path, so the failure must carry the projects
+ * whose memory already changed or an open memory browser keeps showing stale contents.
+ */
+export class ProjectMemoryRestoreError extends Error {
+  readonly restoredProjectMemory: Array<{ projectPath: string; files: string[] }>;
+
+  constructor(
+    message: string,
+    restoredProjectMemory: Array<{ projectPath: string; files: string[] }>,
+    options?: { cause?: unknown }
+  ) {
+    super(message, options);
+    this.name = "ProjectMemoryRestoreError";
+    this.restoredProjectMemory = restoredProjectMemory;
+  }
+}
+
+/**
+ * Regular files under a directory as MemoryService counts them for its per-scope cap:
+ * dot-prefixed entries (and anything beneath one) are invisible to the memory store, so
+ * counting them here would refuse a note the store itself would still create. The walk
+ * stops as soon as the count exceeds `limit`, so an externally bloated scope cannot make the
+ * preflight materialize its whole tree just to learn it is over the limit.
+ */
+async function countFilesUnder(dirAbs: string, limit: number): Promise<number> {
+  let count = 0;
+  const pending = [dirAbs];
+  while (pending.length > 0) {
+    const dir = pending.pop();
+    if (dir === undefined) break;
+    // A missing scope directory counts as empty rather than failing the restore. Nothing
+    // else does: a directory that exists but cannot be read (permissions changed) would
+    // otherwise pass the preflight and fail the write after the core settings changed.
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch((error: unknown) => {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) return [];
+      throw error;
+    });
+    for (const entry of entries) {
+      if (isHiddenName(entry.name)) continue;
+      // Dirent reports a symlink as neither file nor directory, so links are not followed.
+      if (entry.isDirectory()) {
+        pending.push(path.join(dir, entry.name));
+      } else if (entry.isFile()) {
+        count += 1;
+        if (count > limit) return count;
+      }
+    }
+  }
+  return count;
+}
+
+/**
+ * Writes project memory files into the local Xum root. `addOnly: true` is the import mode:
+ * an identical existing file is fine, a differing one is skipped and reported as a conflict
+ * rather than overwritten unpreviewed. `addOnly: false` is the matched-restore mode, where
+ * overwriting is exactly what the previewed plan promised. Identical files are never
+ * rewritten in either mode, so `written` doubles as the changed-files report.
+ *
+ * Callers own the memory mutation lock: this function must run inside
+ * `withTargetMutationLock` on the memory root so backup never becomes an uncoordinated
+ * memory writer, and the conflict checks here are the required re-check under that lock.
+ */
+export async function writeProjectMemoryFiles(
+  muxRoot: string,
+  writes: ReadonlyArray<{ path: string; content: Buffer }>,
+  options: { addOnly: boolean }
+): Promise<{ written: string[]; skipped: string[] }> {
+  const root = await resolveRoot(muxRoot);
+  // Re-run under the lock even when the caller already ran it as a preflight: the
+  // destinations may have changed since, and these checks are what make the write safe.
+  const planned = await planProjectMemoryWrites(root, writes, options);
+  const written: string[] = [];
+  const skipped: string[] = [];
+  try {
+    for (const write of planned) {
+      if (write.action === "identical") continue;
+      if (write.action === "conflict") {
+        skipped.push(write.path);
+        continue;
+      }
+      // Recorded before the mutating call: a write that fails midway (ENOSPC after the
+      // destination was created or truncated) must still appear in the cleanup list.
+      written.push(write.path);
+      await writeCheckedFile(root, write.path, write.content, false);
+    }
+  } catch (error) {
+    // Sequential writes without rollback: report what already landed, including the
+    // attempted file, so the caller's failure result can double as the cleanup list.
+    throw new ProjectMemoryWriteError(
+      error instanceof Error ? error.message : String(error),
+      { written, skipped },
+      { cause: error }
+    );
+  }
+  return { written, skipped };
+}
+
+/**
+ * Everything about a set of project-memory writes that can be refused without touching the
+ * disk: path shape, the memory subsystem's per-file size and per-scope count limits,
+ * destinations that are not plain files, and destinations the write could not open.
+ * Exposed so the restore preflight can refuse a bundle that would fail here before the
+ * core restore has overwritten anything. `addOnly` must match the write it stands in for:
+ * it decides which existing destinations are skipped and therefore need no permission.
+ */
+export async function assertProjectMemoryWritesAllowed(
+  muxRoot: string,
+  writes: ReadonlyArray<{ path: string; content: Buffer }>,
+  options: { addOnly: boolean }
+): Promise<void> {
+  await planProjectMemoryWrites(await resolveRoot(muxRoot), writes, options);
+}
+
+interface PlannedProjectMemoryWrite {
+  path: string;
+  content: Buffer;
+  /**
+   * `write`: lands (new file, or an existing one this mode overwrites). `identical`: the
+   * destination already holds these bytes. `conflict`: differs and add-only mode skips it.
+   */
+  action: "write" | "identical" | "conflict";
+  isNew: boolean;
+}
+
+async function planProjectMemoryWrites(
+  root: BackupRoot,
+  writes: ReadonlyArray<{ path: string; content: Buffer }>,
+  options: { addOnly: boolean }
+): Promise<PlannedProjectMemoryWrite[]> {
+  // Charged so a marker-thin bundle cannot expand past the same bound reads enforce.
+  const budget = createByteBudget();
+  // Everything refusable is refused before the first write, so a rejected bundle
+  // changes nothing on disk.
+  const planned: PlannedProjectMemoryWrite[] = [];
+  for (const write of writes) {
+    assertAllowedBundleFilePath(write.path);
+    // The memory subsystem's own read limit: a restored file larger than this would be
+    // persisted but permanently unreadable through memory commands, so it is refused
+    // here rather than written as unusable state.
+    if (write.content.length > MEMORY_MAX_FILE_BYTES) {
+      throw new Error(
+        `Cannot restore '${write.path}': larger than the ${MEMORY_MAX_FILE_BYTES}-byte memory file limit`
+      );
+    }
+    budget(write.path, write.content.length);
+    const destination = await resolveContainedPath(root.path, write.path);
+    const existing = await lstatIfExists(destination);
+    if (existing !== null && !existing.isFile()) {
+      throw new Error(`Cannot restore '${write.path}': a non-file already exists there`);
+    }
+    let action: PlannedProjectMemoryWrite["action"] = "write";
+    if (existing !== null) {
+      // Sizes first, from the lstat: an existing file of a different size can never be
+      // identical, so it is never read — an externally bloated destination would otherwise
+      // be buffered whole just to detect a conflict. Equal sizes are bounded by the incoming
+      // file's own memory limit. Decided here, once, so the writability probe below covers
+      // exactly the destinations the write will open.
+      if (
+        existing.size === write.content.length &&
+        (await readCheckedFile(root, write.path, () => undefined)).content.equals(write.content)
+      ) {
+        action = "identical";
+      } else if (options.addOnly) {
+        action = "conflict";
+      }
+    }
+    // The same probe as the core restore's planner: a read-only destination or an
+    // unwritable parent fails `writeCheckedFile` with the core settings already changed,
+    // so the permission the write will need is checked while nothing has changed yet.
+    if (action === "write")
+      await assertRestoreDestinationWritable(destination, existing, write.path);
+    planned.push({ path: write.path, content: write.content, action, isNew: existing === null });
+  }
+  // Per-scope file-count cap, mirrored from MemoryService. Only growth past the limit is
+  // refused: a store that already exceeds it (hand-placed files) can still be restored
+  // in place as long as this restore does not add to the overflow.
+  const addsByDir = new Map<string, number>();
+  for (const write of planned) {
+    if (!write.isNew) continue;
+    const scopeDir = write.path.split("/").slice(0, 3).join("/");
+    addsByDir.set(scopeDir, (addsByDir.get(scopeDir) ?? 0) + 1);
+  }
+  for (const [scopeDir, adds] of addsByDir) {
+    const existingCount = await countFilesUnder(
+      path.join(root.path, scopeDir),
+      MEMORY_MAX_FILES_PER_SCOPE
+    );
+    if (existingCount + adds > MEMORY_MAX_FILES_PER_SCOPE && adds > 0) {
+      throw new Error(
+        `Cannot restore '${scopeDir}': it would exceed the ${MEMORY_MAX_FILES_PER_SCOPE}-file memory limit`
+      );
+    }
+  }
+  return planned;
+}
+
+/**
+ * A recovery copy of exactly the local files a matched restore may overwrite: the current
+ * contents at the incoming bundle paths, and nothing else in the project's memory
+ * directory. Collecting whole directories would let an unrelated local-only note — say,
+ * one past the backup size budget — fail a restore that never touches it.
+ */
+export async function collectOverwritableProjectMemory(
+  muxRoot: string,
+  matched: readonly MatchedProjectEntry[]
+): Promise<BackupProjectBundle> {
+  const root = await resolveRoot(muxRoot);
+  const budget = createByteBudget();
+  const files: BackupFile[] = [];
+  for (const match of matched) {
+    for (const write of matchedProjectWrites(match)) {
+      assertAllowedBundleFilePath(write.path);
+      const destination = await resolveContainedPath(root.path, write.path);
+      if ((await lstatOrNull(destination))?.isFile() !== true) continue;
+      const current = await readCheckedFile(root, write.path, (size) => {
+        budget(write.path, size);
+      });
+      files.push({ path: write.path, content: current.content });
+    }
+  }
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  // Entries describe the LOCAL projects the copy came from, so the recovery copy's manifest
+  // is consistent with its own file paths even for import-matched entries.
+  const entries = [...matched].sort((a, b) => a.projectPath.localeCompare(b.projectPath));
+  const manifest: BackupProjectBundleManifest = {
+    schemaVersion: 1,
+    projects: entries.map((match) => ({
+      path: match.projectPath,
+      name: match.entry.name,
+      ...(match.entry.gitRemote !== undefined ? { gitRemote: match.entry.gitRemote } : {}),
+      memoryDir: match.localMemoryDir,
+    })),
+    files: files.map((file) => ({ path: file.path, sha256: sha256(file.content) })),
+  };
+  // The writer charges the manifest against the same budget, so a preflight that skipped
+  // it could pass a recovery copy the write would then refuse.
+  budget(BACKUP_MANIFEST_FILE, serializeProjectBundleManifest(manifest).length);
+  // And validates it against the same schema: a local project path or name the manifest
+  // cannot record would otherwise refuse the restore only at the recovery write, after the
+  // core snapshot. Imports cap their targets to keep this from arising; this is the check
+  // that makes the preflight, not the write, the place it surfaces if it ever does.
+  const manifestCheck = BackupProjectBundleManifestSchema.safeParse(manifest);
+  if (!manifestCheck.success) {
+    throw new Error(
+      `Cannot snapshot project memory: ${manifestCheck.error.issues
+        .map((issue) => `${issue.path.join(".")}: ${issue.message}`)
+        .join("; ")}`
+    );
+  }
+  return { manifest, files };
 }

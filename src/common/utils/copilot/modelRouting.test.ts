@@ -1,30 +1,10 @@
 import { describe, expect, it } from "bun:test";
 import {
-  COPILOT_MODEL_PREFIXES,
   isCopilotModelAccessible,
-  isCopilotRoutableModel,
   normalizeCopilotModelId,
   selectCopilotApiMode,
   toCopilotModelId,
 } from "./modelRouting";
-
-describe("COPILOT_MODEL_PREFIXES", () => {
-  it("exports the shared Copilot model family filters", () => {
-    expect(COPILOT_MODEL_PREFIXES).toEqual(["gpt-5", "claude-", "gemini-3", "grok-code"]);
-  });
-});
-
-describe("isCopilotRoutableModel", () => {
-  it("keeps non-Codex models routable through Copilot", () => {
-    expect(isCopilotRoutableModel("gpt-5.5")).toBe(true);
-    expect(isCopilotRoutableModel("claude-opus-4-6")).toBe(true);
-  });
-
-  it("keeps Codex-family models routable through Copilot", () => {
-    expect(isCopilotRoutableModel("gpt-5.3-codex")).toBe(true);
-    expect(isCopilotRoutableModel("gpt-5.1-codex-mini")).toBe(true);
-  });
-});
 
 describe("selectCopilotApiMode", () => {
   it("routes catalog-declared Responses-only models by exact id", () => {

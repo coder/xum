@@ -1,11 +1,12 @@
 export const LEFT_SIDEBAR_DEFAULT_WIDTH_PX = 288;
-export const LEFT_SIDEBAR_MIN_WIDTH_PX = 200;
+export const LEFT_SIDEBAR_MIN_WIDTH_PX = 232;
 export const LEFT_SIDEBAR_MAX_WIDTH_PX = 600;
-export const LEFT_SIDEBAR_COLLAPSED_WIDTH_PX = 20;
+export const LEFT_SIDEBAR_COLLAPSED_WIDTH_PX = 0;
 
-// When the left sidebar is collapsed, WorkspaceMenuBar still needs extra room for the
-// floating reopen affordance so the header content doesn't sit underneath it.
-export const WORKSPACE_MENU_BAR_LEFT_SIDEBAR_COLLAPSED_PADDING_PX = 60;
+// New chats should show the collapsed overview instead of opening Review (or another tool).
+// Share the fallback so the lazy frame, header controls, and saved layouts agree on first paint.
+export const RIGHT_SIDEBAR_DEFAULT_COLLAPSED = true;
+
 export const CREATION_COLUMN_MAX_WIDTH_CLASS = "max-w-[67rem]";
 
 // The composer dock cancels the transcript scrollport's padding to paint full-bleed, so surfaces
@@ -15,6 +16,10 @@ export const CHAT_DOCK_GUTTER_CLASS = "px-[15px]";
 // Minimum height globals.css gives touch targets on coarse-pointer viewports. Shared so tests can
 // reproduce that environment, which Storybook and Pixel cannot: neither emulates `pointer: coarse`.
 export const MOBILE_TOUCH_TARGET_PX = 44;
+// Touch target above the phone breakpoint (tablets), where globals.css sets no touch floor: the
+// WCAG 2.2 target-size minimum. The right sidebar tab strip's `[@media(pointer:coarse)]:min-h-6`
+// and `min-w-6` classes repeat this literal (Tailwind scans source text).
+export const TABLET_TOUCH_TARGET_PX = 24;
 
 // Width at or below which the app switches to its narrow layout (overlaying sidebar, PR badge in the
 // workspace header instead of the footer info bar). Tailwind arbitrary variants cannot read a TS

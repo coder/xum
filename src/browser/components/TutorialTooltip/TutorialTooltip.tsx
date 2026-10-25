@@ -1,6 +1,15 @@
-import React, { useState, useRef, useLayoutEffect } from "react";
+import React, { useState, useRef, useLayoutEffect, useEffect, useId } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/common/lib/utils";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+
+// The bubble's secondary texts (step counter, body, Skip, opt-out). Plain text-muted on the modal
+// background is below WCAG AA in dark (3.78) and flexoki-light (4.47); 30% of the text color
+// clears it in all four themes (#6010). A class, not an inline style, so hover:text-foreground
+// still wins on the buttons.
+const TUTORIAL_MUTED_TEXT =
+  "text-[color:color-mix(in_srgb,var(--color-muted),var(--color-text)_30%)]";
 
 export interface TutorialStep {
   target: string; // data-tutorial attribute value
@@ -25,6 +34,60 @@ interface TooltipPosition {
   actualPosition: "top" | "bottom" | "left" | "right";
 }
 
+/**
+ * Whether something is drawn over the bubble: the full-screen Artifacts and App View panels
+ * (z-1500, above the tutorial) are not modal, so they do not trap focus. A hit test needs no list
+ * of such layers. An unknown result (no layout, or the center off screen) counts as uncovered.
+ */
+function isBubbleCovered(bubble: HTMLElement): boolean {
+  const rect = bubble.getBoundingClientRect();
+  const hit = document.elementFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2);
+  return hit != null && !bubble.contains(hit);
+}
+
+/**
+ * Moves focus into the bubble once it is on screen (a hidden element cannot take focus), so
+ * Escape, Skip and Next work from the keyboard (#5701). Later steps keep focus on the control that
+ * advanced them. When the bubble closes and leaves focus on the body, focus goes back to where it
+ * was. An open modal dialog traps focus, so the bubble cannot take it from one.
+ *
+ * It leaves focus alone in a text field, where the user may be typing (keys such as Escape would
+ * otherwise skip a tutorial they never chose to act on), and under a layer that covers the bubble,
+ * where Escape would skip a tutorial the user cannot see (#7114). The bubble stays clickable.
+ */
+function useBubbleFocus(
+  tooltipRef: React.RefObject<HTMLDivElement | null>,
+  isPositioned: boolean
+): void {
+  useEffect(() => {
+    const bubble = tooltipRef.current;
+    if (!isPositioned || !bubble) return;
+    const previous = document.activeElement;
+    if (!isEditableElement(previous) && !isBubbleCovered(bubble)) bubble.focus();
+    // Registered even when the bubble left focus alone: a click on Skip or Next still moves focus
+    // into the bubble, and it must go back to the composer when the bubble closes.
+    return () => {
+      const active = document.activeElement;
+      const focusLost = active === document.body || bubble.contains(active);
+      if (focusLost && previous instanceof HTMLElement && previous.isConnected) previous.focus();
+    };
+  }, [tooltipRef, isPositioned]);
+}
+
+/**
+ * Escape on the bubble counts as Skip. Only keys sent to the bubble reach this handler, so an open
+ * popover, menu, dialog or editor keeps its own Escape: #5670 took every Escape with a window
+ * listener.
+ */
+function dismissOnEscape(e: React.KeyboardEvent, onDismiss: () => void): void {
+  // A layer that already handled this Escape marks it with preventDefault.
+  if (!matchesKeybind(e, KEYBINDS.CANCEL) || e.defaultPrevented) return;
+  e.preventDefault();
+  // The window's stream-interrupt listener must not also act on this Escape.
+  stopKeyboardPropagation(e);
+  onDismiss();
+}
+
 export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
   step,
   currentStep,
@@ -34,8 +97,9 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
   onDisableTutorial,
 }) => {
   const tooltipRef = useRef<HTMLDivElement>(null);
+  const titleId = useId();
   const [position, setPosition] = useState<TooltipPosition | null>(null);
-  const [showDisableOption, setShowDisableOption] = useState(false);
+  const isPositioned = position !== null;
 
   useLayoutEffect(() => {
     const targetEl = document.querySelector(`[data-tutorial="${step.target}"]`);
@@ -45,6 +109,7 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
 
     const calculatePosition = () => {
       const target = targetEl.getBoundingClientRect();
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const tooltip = tooltipRef.current!.getBoundingClientRect();
       const viewportWidth = window.innerWidth;
       const viewportHeight = window.innerHeight;
@@ -145,27 +210,33 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
     };
   }, [step.target]);
 
+  useBubbleFocus(tooltipRef, isPositioned);
+
   const isLastStep = currentStep === totalSteps;
 
-  const handleDismissClick = () => {
-    if (showDisableOption) {
-      onDismiss();
-    } else {
-      setShowDisableOption(true);
-    }
-  };
-
+  // Stacking (#5701): the highlight (.tutorial-highlight, 1497), this backdrop (1498) and the
+  // bubble (1499) sit just under the shared Dialog layer (1500). Every layer the user opens on
+  // purpose (dialogs such as Settings, popovers, selects, the command palette) draws over the
+  // tutorial and keeps its keys, and everything the tutorial covered before stays covered.
   return createPortal(
     <>
       {/* Backdrop - subtle overlay */}
       <div
-        className="fixed inset-0 z-[9998] bg-black/20"
+        // Dim painted on a pseudo-element so iOS/iPadOS 26 WebKit's status-bar edge
+        // sampler ignores this fixed overlay (same pattern as Dialog/LeftSidebar).
+        className="fixed inset-0 z-[1498] before:absolute before:inset-0 before:bg-black/20"
         data-testid="tutorial-backdrop"
         onClick={onDismiss}
       />
       {/* Tooltip */}
+      {/* A group, not a dialog: role="dialog" would count as an open dialog portal in shared
+          key and focus checks (isEventFromDialogPortal, the Backup section's topmost dialog). */}
       <div
         ref={tooltipRef}
+        role="group"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        onKeyDown={(e) => dismissOnEscape(e, onDismiss)}
         style={{
           position: "fixed",
           top: position?.top ?? -9999,
@@ -173,7 +244,7 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
           visibility: position ? "visible" : "hidden",
         }}
         className={cn(
-          "z-[9999] w-72 rounded-lg border-2 border-accent bg-modal-bg p-4 shadow-lg",
+          "z-[1499] w-72 rounded-lg border-2 border-accent bg-modal-bg p-4 shadow-lg outline-none",
           "text-foreground"
         )}
       >
@@ -182,37 +253,41 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
 
         {/* Header */}
         <div className="mb-2 flex items-start justify-between">
-          <h3 className="text-sm font-semibold">{step.title}</h3>
-          <span className="text-muted text-xs">
+          <h3 id={titleId} className="text-sm font-semibold">
+            {step.title}
+          </h3>
+          <span className={cn(TUTORIAL_MUTED_TEXT, "text-xs")}>
             {currentStep}/{totalSteps}
           </span>
         </div>
 
         {/* Content */}
-        <p className="text-muted mb-4 text-xs leading-relaxed">{step.content}</p>
+        <p className={cn(TUTORIAL_MUTED_TEXT, "mb-4 text-xs leading-relaxed")}>{step.content}</p>
 
         {/* Actions */}
         <div className="flex items-center justify-between">
-          <div>
-            {showDisableOption ? (
-              <button
-                onClick={onDisableTutorial}
-                className="text-muted hover:text-foreground text-[10px] underline transition-colors"
-              >
-                Don&apos;t show tutorials again
-              </button>
-            ) : (
-              <button
-                onClick={handleDismissClick}
-                className="text-muted hover:text-foreground text-xs transition-colors"
-              >
-                Skip
-              </button>
-            )}
+          {/* Skip ends this tutorial only. The opt-out is its own control so a second tap on
+              Skip can never turn off every tutorial. */}
+          <div className="flex items-center gap-3">
+            <button
+              onClick={onDismiss}
+              className={cn(TUTORIAL_MUTED_TEXT, "hover:text-foreground text-xs transition-colors")}
+            >
+              Skip
+            </button>
+            <button
+              onClick={onDisableTutorial}
+              className={cn(
+                TUTORIAL_MUTED_TEXT,
+                "hover:text-foreground text-[10px] underline transition-colors"
+              )}
+            >
+              Don&apos;t show tutorials again
+            </button>
           </div>
           <button
             onClick={isLastStep ? onDismiss : onNext}
-            className="bg-accent rounded px-3 py-1.5 text-xs font-medium text-white transition-colors hover:opacity-90"
+            className="bg-accent text-accent-foreground hover:bg-accent-button-hover rounded px-3 py-1.5 text-xs font-medium transition-colors"
           >
             {isLastStep ? "Done" : "Next"}
           </button>

@@ -1,13 +1,13 @@
 ---
 title: Install
-description: Download and install Shux for macOS, Linux, and Windows
+description: Download and install Xum for macOS, Linux, and Windows
 ---
 
 ## Downloads
 
 ### Release Builds
 
-<Card title="Download Shux" icon="download" href="https://github.com/coder/mux/releases">
+<Card title="Download Xum" icon="download" href="https://github.com/coder/mux/releases">
   Download pre-built binaries from the releases page.
 </Card>
 
@@ -40,7 +40,7 @@ To download:
    - Intel Mac: `macos-dmg-x64`
    - Apple Silicon: `macos-dmg-arm64`
 2. Open the DMG file
-3. Drag Shux to Applications folder
+3. Drag Xum to Applications folder
 4. Open the app normally
 
 The app is code-signed and notarized by Apple, so it will open without security warnings.
@@ -48,8 +48,8 @@ The app is code-signed and notarized by Apple, so it will open without security 
 #### Linux
 
 1. Download the AppImage file
-2. Make it executable: `chmod +x shux-*.AppImage`
-3. Run it: `./shux-*.AppImage`
+2. Make it executable: `chmod +x xum-*.AppImage`
+3. Run it: `./xum-*.AppImage`
 
 #### Windows
 
@@ -58,12 +58,12 @@ _(alpha)_
 Prerequisites:
 
 - Install **Git for Windows** (includes Git Bash). **WSL is not supported.**
-- Restart Shux after installing Git for Windows.
+- Restart Xum after installing Git for Windows.
 
-1. Download the installer exe from [releases](https://github.com/coder/mux/releases) (e.g., `shux-x.x.x-x64.exe`)
+1. Download the installer exe from [releases](https://github.com/coder/mux/releases) (e.g., `xum-x.x.x-x64-win.exe`)
 2. Run the installer
 3. Follow the installation prompts
-4. Launch Shux from the Start menu or desktop shortcut
+4. Launch Xum from the Start menu or desktop shortcut
 
 <Warning>
   Windows support is currently in alpha. Please [report any
@@ -78,28 +78,60 @@ Prerequisites:
 </Warning>
 
 1. After installing, open Terminal
-2. Run: `xattr -cr /Applications/shux.app`
-3. Run: `codesign --force --deep --sign - /Applications/shux.app`
+2. Run: `xattr -cr /Applications/xum.app`
+3. Run: `codesign --force --deep --sign - /Applications/xum.app`
 4. Now you can open the app normally
+
+## Nix and NixOS
+
+The repository is a Nix flake. To try Xum without installing it:
+
+```bash
+nix run github:coder/mux
+```
+
+The flake builds on Linux and on Apple silicon Macs. It does not build on Intel Macs, because current nixpkgs has dropped them. On an Intel Mac, use the [macOS download](#macos) instead.
+
+To install it, add the flake as an input of your own flake:
+
+```nix
+inputs.xum = {
+  url = "github:coder/mux";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+Then add the overlay and the package to a NixOS module (this example passes `inputs` through `specialArgs`):
+
+```nix
+nixpkgs.overlays = [ inputs.xum.overlays.default ];
+environment.systemPackages = [ pkgs.xum ];
+```
+
+The overlay builds Xum with your nixpkgs, so Electron uses the same glibc as your graphics drivers. It needs a nixpkgs that has `electron_44`, such as `nixos-unstable`. With the overlay, `inputs.nixpkgs.follows` only keeps a second copy of nixpkgs out of your `flake.lock`. On an older nixpkgs, remove `inputs.nixpkgs.follows` and use `inputs.xum.packages.${pkgs.stdenv.hostPlatform.system}.default` instead.
+
+If the window stays on the loading screen, start Xum with `xum --disable-gpu`.
 
 ## CLI via npm
 
-The Shux CLI can also be run directly via `npx` without installing the desktop app:
+The Xum CLI can also be run directly via `npx` without installing the desktop app:
 
 ```bash
 # Run agent tasks
-npx @coder/shux run "Fix the failing tests"
+npx @coder/xum run "Fix the failing tests"
 
 # Start the server for remote/mobile access
-npx @coder/shux server --port 3000
+npx @coder/xum server --port 3000
 ```
 
 Or install globally:
 
 ```bash
-npm install -g @coder/shux
+npm install -g @coder/xum
 ```
 
-The legacy `mux` package and command forward to the matching Shux release during the transition. See [Mux compatibility](/reference/mux-compatibility) for storage, environment-variable, and downgrade details.
+The CLI and `xum server` need Node 22.23.4 or a later 22.x, 24.22.1 or a later 24.x, or 26.12.1 or newer. Older releases are affected by CVE-2026-111497, which lets crafted Brotli data run code. On an older or affected Node, the CLI prints a warning at startup.
+
+The legacy `mux` package and command forward to the matching Xum release during the transition. See [Mux compatibility](/reference/mux-compatibility) for storage, environment-variable, and downgrade details.
 
 This is ideal for CI/CD pipelines and scripted automation. See the [CLI documentation](/reference/cli) for all available commands and options.

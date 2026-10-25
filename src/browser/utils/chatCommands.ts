@@ -6,14 +6,17 @@
  * to ensure consistent behavior and avoid duplication.
  */
 
+import { isGoalLifecycleActive } from "@/common/types/goal";
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
 import type {
   FilePart,
+  HistoryEditPrecondition,
   ProviderModelEntry,
   ProvidersConfigMap,
   SendMessageOptions,
 } from "@/common/orpc/types";
+import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import {
   type MuxMessageMetadata,
   type CompactionRequestData,
@@ -32,9 +35,8 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { RUNTIME_MODE, parseRuntimeModeAndHost } from "@/common/types/runtime";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { isExperimentEnabled } from "@/browser/hooks/useExperiments";
+import { getDraftStore } from "@/browser/stores/DraftStore";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import {
   formatCompactionCommandLine,
@@ -50,8 +52,9 @@ import {
   UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
 } from "@/common/utils/goals/budgetPricing";
 import { getContextResetSuccessMessage } from "@/browser/utils/contextResetFeedback";
-import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
 import {
+  SIDE_CHAT_DISALLOWED_COMMAND_KEYS,
+  SIDE_CHAT_DISALLOWED_COMMAND_TYPES,
   WORKSPACE_ONLY_COMMAND_KEYS,
   WORKSPACE_ONLY_COMMAND_TYPES,
   type WorkspaceOnlyCommandType,
@@ -63,10 +66,17 @@ import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/a
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import type { ChatAttachment } from "../features/ChatInput/ChatAttachments";
 import { dispatchWorkspaceSwitch } from "./workspaceEvents";
-import { getRuntimeKey, copyWorkspaceStorage } from "@/common/constants/storage";
+import { copyWorkspaceStorage } from "@/browser/utils/workspaceStorage";
+import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  getWorkspaceAgentId,
+  snapshotPendingAiSelection,
+} from "@/browser/utils/aiSelectionIntent";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
-import { isCustomOpenAICompatibleProviderConfig } from "@/common/utils/providers/customProviders";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
 import { isValidProvider } from "@/common/constants/providers";
 import { openInEditor } from "@/browser/utils/openInEditor";
 import {
@@ -84,13 +94,38 @@ import {
   createInvalidCompactModelToast,
 } from "@/browser/features/ChatInput/ChatInputToasts";
 import { trackCommandUsed } from "@/common/telemetry";
-import { addEphemeralMessage } from "@/browser/stores/WorkspaceStore";
-import { setGoalWithConflictRetry } from "@/browser/utils/goals/setGoalWithConflictRetry";
+import {
+  addEphemeralMessage,
+  getDisplayedRefineProposalHash,
+} from "@/browser/stores/WorkspaceStore";
+import { setGoalForIntendedGoal } from "@/browser/utils/goals/setGoalForIntendedGoal";
 import { loadGoalDefaults, resolveGoalSetIntent } from "@/browser/utils/goals/resolveGoalSetIntent";
 import {
   WORKFLOW_RESULT_METADATA_TYPE,
   buildWorkflowResultContextMessage,
 } from "@/common/utils/workflowRunMessages";
+import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import { getModelIdLengthError } from "@/browser/utils/boundedPersistedValue";
+import {
+  EDIT_NOT_HELD_MESSAGE,
+  TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+} from "@/constants/transcriptBarrier";
+
+import { getProjectScopeId, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
+import { DEFAULT_ROUTE_PRIORITY, resolveRoute } from "@/common/routing";
+import { createGatewayRouting } from "@/common/utils/providers/gatewayModelCatalog";
+import {
+  getFastModeProvider,
+  resolveChatServiceTier,
+  setWorkspaceServiceTier,
+  toggleServiceTier,
+  ultrafastModeAvailable,
+} from "@/browser/utils/fastModeServiceTier";
+
+// Non-OpenAI speed preferences remain global: serialize slash toggles while config loads.
+let speedModeToggleInFlight = false;
 
 const BUILT_IN_MODEL_SET = new Set<string>(Object.values(KNOWN_MODELS).map((model) => model.id));
 
@@ -117,6 +152,13 @@ export interface ForkResult {
  */
 export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const { client } = options;
+  const copyPendingAiSelectionTo = snapshotPendingAiSelection(options.sourceWorkspaceId);
+  // The backend copies the source's draft file into the fork: save the latest (debounced) edit
+  // first. A failed save does not block the fork, which then copies the last saved draft; the
+  // source keeps the change and retries it.
+  await getDraftStore()
+    .flush({ kind: "workspace", workspaceId: options.sourceWorkspaceId })
+    .catch((error: unknown) => console.warn("Failed to save the draft before forking:", error));
   const result = await client.workspace.fork({
     sourceWorkspaceId: options.sourceWorkspaceId,
     newName: options.newName,
@@ -128,8 +170,8 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
     return { success: false, error: result.error ?? "Failed to fork workspace" };
   }
 
-  // Copy UI state to the new workspace
   copyWorkspaceStorage(options.sourceWorkspaceId, result.metadata.id);
+  copyPendingAiSelectionTo(result.metadata.id);
 
   // Get workspace info for switching
   const workspaceInfo = await client.workspace.getInfo({ workspaceId: result.metadata.id });
@@ -148,12 +190,19 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   const startMessage = options.startMessage;
   const sendMessageOptions = options.sendMessageOptions;
   if (startMessage && sendMessageOptions) {
+    const forkId = result.metadata.id;
+    const agentId = sendMessageOptions.agentId;
     requestAnimationFrame(() => {
+      // Like a composer send, the start message saves the copied picks it carries, so they end.
+      const aiSelection = getAiSelectionIntentForSendOptions(forkId, agentId, sendMessageOptions);
       client.workspace
         .sendMessage({
-          workspaceId: result.metadata.id,
+          workspaceId: forkId,
           message: startMessage,
           options: sendMessageOptions,
+        })
+        .then((sent) => {
+          if (sent.success) consumeAiSelectionIntent(forkId, agentId, aiSelection);
         })
         .catch(() => {
           // Best-effort: the user can send the message manually if this fails.
@@ -164,41 +213,88 @@ export async function forkWorkspace(options: ForkOptions): Promise<ForkResult> {
   return { success: true, workspaceInfo };
 }
 
-export interface SlashCommandContext extends Omit<CommandHandlerContext, "workspaceId" | "api"> {
+export type CommandInputDisposition = "consume" | "restore" | "restore-if-empty";
+
+export type CommandAction =
+  | { type: "clear-input" }
+  | { type: "reset-input-height" }
+  | { type: "show-toast"; toast: Toast }
+  | { type: "set-preferred-model"; model: string }
+  | { type: "toggle-vim" }
+  | { type: "set-sending"; sending: boolean }
+  | { type: "clear-attachments" }
+  | { type: "detach-reviews" }
+  | { type: "check-reviews"; reviewIds: string[] }
+  | { type: "message-sent"; dispatchMode: QueueDispatchMode }
+  | { type: "cancel-edit" }
+  /**
+   * The backend refused an editing command with `history-changed`: the composer stays in edit
+   * mode and starts the same transcript refresh a refused edit send does.
+   */
+  | { type: "edit-history-changed"; editMessageId: string; precondition: HistoryEditPrecondition };
+
+export type CommandResult =
+  | { kind: "phase"; actions: CommandAction[]; continue: () => Promise<CommandResult> }
+  | {
+      kind: "complete";
+      actions: CommandAction[];
+      inputDisposition: CommandInputDisposition;
+      /** Detached work whose settle actions are applied independently of the command chain. */
+      backgroundTask?: () => Promise<CommandAction[]>;
+    };
+
+export interface SlashCommandEnv {
   api: RouterClient<AppRouter> | null;
+  /** Composer's AI scope, which may be the owning project rather than a sub-project path. */
+  aiScopeId?: string;
   workspaceId?: string;
   variant: "workspace" | "creation";
   projectPath?: string | null;
-  openSettings?: (section?: string) => void;
-
   /** Original slash command text as typed, for durable command display. */
   rawInput?: string;
-
-  /** Current dynamic-workflows experiment assignment for executable workflow commands. */
-  dynamicWorkflowsEnabled?: boolean;
-
-  // Global Actions
-  setPreferredModel: (model: string) => void;
-  setVimEnabled: (cb: (prev: boolean) => boolean) => void;
-
-  // Workspace Actions
-  onResetContext?: () => Promise<"reset" | "noop">;
-  onTruncateHistory?: (percentage?: number) => Promise<void>;
-  resetInputHeight: () => void;
-  /** Read the latest composer text so async command failures don't overwrite newer drafts. */
-  getInput?: () => string;
-  /** Token identifying the command invocation that launched async follow-up work. */
-  asyncCommandToken?: number;
-  /** Return false when an async command completion belongs to a stale workspace/input. */
-  isAsyncCommandCurrent?: (token: number, workspaceId: string) => boolean;
-  /** Callback to trigger message-sent side effects (auto-scroll, auto-background) */
-  onMessageSent?: (dispatchMode: QueueDispatchMode) => void;
-  /** Callback to detach review context from the composer without marking it checked */
-  onDetachAllReviews?: () => void;
-  /** Callback to mark review IDs as checked after successful send */
-  onCheckReviews?: (reviewIds: string[]) => void;
-  /** Review IDs that are attached (for marking as checked on success) */
+  currentModel?: string | null;
+  sendMessageOptions: SendMessageOptions;
+  attachments?: ChatAttachment[];
+  fileParts?: FilePart[];
+  reviews?: ReviewNoteData[];
+  editMessageId?: string;
+  /** Edit fence captured when editing began; required by the RPC alongside editMessageId. */
+  historyEditPrecondition?: HistoryEditPrecondition;
   attachedReviewIds?: string[];
+  resetContext?: () => Promise<"reset" | "noop">;
+  truncateHistory?: (percentage?: number) => Promise<void>;
+  isCurrent?: () => boolean;
+  /** The composer belongs to an ephemeral /side chat (see handleSideCommand). */
+  isSideChat?: boolean;
+}
+
+interface WorkspaceCommandEnv extends SlashCommandEnv {
+  api: RouterClient<AppRouter>;
+  workspaceId: string;
+}
+
+function complete(
+  inputDisposition: CommandInputDisposition,
+  actions: CommandAction[] = [],
+  backgroundTask?: () => Promise<CommandAction[]>
+): CommandResult {
+  return {
+    kind: "complete",
+    actions,
+    inputDisposition,
+    ...(backgroundTask ? { backgroundTask } : {}),
+  };
+}
+
+function phase(
+  actions: CommandAction[],
+  continuation: () => Promise<CommandResult>
+): CommandResult {
+  return { kind: "phase", actions, continue: continuation };
+}
+
+function showToast(toast: Toast): CommandAction {
+  return { type: "show-toast", toast };
 }
 
 export const WORKFLOW_FREEFORM_ARGS_ERROR_MESSAGE =
@@ -288,447 +384,12 @@ function isWorkspaceOnlyParsedCommand(
   return WORKSPACE_ONLY_COMMAND_TYPES.has(parsed.type);
 }
 
-/**
- * Process any slash command
- * Returns true if the command was handled (even if it failed)
- * Returns false if it's not a command (should be sent as message) - though parsed usually implies it is a command
- */
+/** Dispatch a parsed slash command into caller-applied result phases. */
 export async function processSlashCommand(
   parsed: ParsedCommand,
-  context: SlashCommandContext
-): Promise<CommandHandlerResult> {
-  if (!parsed) return { clearInput: false, toastShown: false };
-  const { api: client, setInput, setToast, variant, setVimEnabled, setPreferredModel } = context;
-
-  const requireClient = (): RouterClient<AppRouter> | null => {
-    if (client) return client;
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      message: "Not connected to server",
-    });
-    return null;
-  };
-
-  // 1. Global Commands
-  if (parsed.type === "model-set") {
-    const modelString = parsed.modelString;
-
-    const activeClient = client;
-    const normalized = normalizeModelInput(modelString);
-
-    if (!normalized.model) {
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: `Invalid model format: expected "provider:model"`,
-      });
-      return { clearInput: false, toastShown: true };
-    }
-
-    const selectedModel = normalized.model;
-    const separatorIndex = selectedModel.indexOf(":");
-    const provider = selectedModel.slice(0, separatorIndex);
-    const modelId = selectedModel.slice(separatorIndex + 1);
-    const canonicalModel = normalizeToCanonical(selectedModel);
-    const explicitGateway = getExplicitGatewayPrefix(selectedModel);
-
-    try {
-      let providersConfig: ProvidersConfigMap | null = null;
-      let providersConfigLoadFailed = false;
-      if (activeClient) {
-        try {
-          providersConfig = await activeClient.providers.getConfig();
-        } catch (error) {
-          providersConfigLoadFailed = true;
-          console.error("Failed to load provider settings:", error);
-        }
-      }
-
-      const providerConfig = providersConfig?.[provider];
-      if (!isValidProvider(provider) && !isCustomOpenAICompatibleProviderConfig(providerConfig)) {
-        setToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: providersConfigLoadFailed
-            ? `Could not verify provider "${provider}": backend unreachable. Please retry.`
-            : `Unknown provider "${provider}"`,
-        });
-        return { clearInput: false, toastShown: true };
-      }
-
-      if (
-        !modelHasPricingData(selectedModel, providersConfig ?? null) &&
-        (await hasBudgetedResumableGoalForWorkspaceModelSwitch(context))
-      ) {
-        showUnpricedModelGoalToast(setToast, "target");
-        return { clearInput: false, toastShown: true };
-      }
-
-      // Align with settings behavior: only persist non-built-in direct-provider models.
-      if (
-        activeClient &&
-        providersConfig &&
-        !BUILT_IN_MODEL_SET.has(canonicalModel) &&
-        !explicitGateway
-      ) {
-        try {
-          const existingModels: ProviderModelEntry[] = providerConfig?.models ?? [];
-          if (!existingModels.some((entry) => getProviderModelEntryId(entry) === modelId)) {
-            // Add model via the same API as settings
-            await activeClient.providers.setModels({
-              provider,
-              models: [...existingModels, modelId],
-            });
-          }
-        } catch (error) {
-          console.error("Failed to sync model settings:", error);
-        }
-      }
-
-      setInput("");
-      setPreferredModel(selectedModel);
-      trackCommandUsed("model");
-      setToast({
-        id: Date.now().toString(),
-        type: "success",
-        message: `Model changed to ${selectedModel}`,
-      });
-      return { clearInput: true, toastShown: true };
-    } catch (error) {
-      console.error("Failed to update model:", error);
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: error instanceof Error ? error.message : "Failed to update model",
-      });
-      return { clearInput: false, toastShown: true };
-    }
-  }
-
-  // model-oneshot ("/<model-alias> ...") is handled directly in ChatInput.
-  // This keeps the command parsing centralized, but routes actual sending through the
-  // normal message-send flow (so side effects like review completion and last-read
-  // tracking can't drift).
-
-  if (parsed.type === "model-oneshot") {
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      message: "Model one-shot is handled in the chat input.",
-    });
-    return { clearInput: false, toastShown: true };
-  }
-
-  if (parsed.type === "workflow-run") {
-    const workflowsEnabled =
-      context.dynamicWorkflowsEnabled ??
-      isExperimentEnabled(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS) === true;
-    if (!workflowsEnabled) {
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: "Dynamic workflows are disabled",
-      });
-      return { clearInput: false, toastShown: true };
-    }
-
-    const activeClient = requireClient();
-    if (!activeClient) {
-      return { clearInput: false, toastShown: true };
-    }
-    if (!context.workspaceId) {
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: "No workspace selected",
-      });
-      return { clearInput: false, toastShown: true };
-    }
-
-    let args: unknown;
-    try {
-      args = parseWorkflowSlashArgs(parsed.argsText);
-    } catch (error) {
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: error instanceof Error ? error.message : "Invalid workflow arguments",
-      });
-      return { clearInput: false, toastShown: true };
-    }
-
-    const workspaceId = context.workspaceId;
-    const scriptPath = parsed.scriptPath;
-    const rawInput = context.rawInput?.trim();
-    const rawCommand = rawInput && rawInput.length > 0 ? rawInput : `/${scriptPath}`;
-    const commandPrefix = rawCommand.split(/\s+/u)[0] ?? `/${scriptPath}`;
-    const isCurrent =
-      context.asyncCommandToken != null && context.isAsyncCommandCurrent != null
-        ? () => context.isAsyncCommandCurrent?.(context.asyncCommandToken!, workspaceId) !== false
-        : undefined;
-
-    setInput("");
-    let sendingStateActive = false;
-    const setWorkflowSendingState = (active: boolean) => {
-      if (sendingStateActive === active) {
-        return;
-      }
-      sendingStateActive = active;
-      context.setSendingState(active);
-    };
-
-    setWorkflowSendingState(true);
-    try {
-      const result = await activeClient.workflows.start({
-        workspaceId,
-        scriptPath,
-        runInBackground: true,
-        args,
-        continuationOptions: context.sendMessageOptions,
-        rawCommand,
-      });
-      // The workflow is durable and backgrounded; do not pin the composer while polling for
-      // completion, otherwise the user cannot supersede a long-running slash workflow.
-      setWorkflowSendingState(false);
-      if (result.invocationMessagePersisted === true) {
-        trackCommandUsed("workflow");
-        setToast({
-          id: Date.now().toString(),
-          type: "success",
-          message: `Workflow ${scriptPath} started`,
-        });
-        return { clearInput: true, toastShown: true };
-      }
-      const run = await waitForWorkflowTerminalRun({
-        client: activeClient,
-        workspaceId,
-        runId: result.runId,
-        initialStatus: result.status,
-        isCurrent,
-      });
-      const terminalStatus = run?.status ?? result.status;
-      if (terminalStatus === "interrupted") {
-        trackCommandUsed("workflow");
-        setToast({
-          id: Date.now().toString(),
-          type: "success",
-          message: `Workflow ${scriptPath} interrupted`,
-        });
-        return { clearInput: true, toastShown: true };
-      }
-      const workflowResultMessage = buildWorkflowResultContextMessage({
-        rawCommand,
-        name: scriptPath,
-        runId: result.runId,
-        status: terminalStatus,
-        result: result.result,
-        run,
-      });
-      // Keep workflow outputs model-visible but UI-hidden: rawCommand drives transcript display,
-      // while the XML block below gives the main agent the completed workflow result.
-      setWorkflowSendingState(true);
-      const sendResult = await activeClient.workspace.sendMessage({
-        workspaceId,
-        message: workflowResultMessage,
-        options: {
-          ...context.sendMessageOptions,
-          muxMetadata: {
-            type: WORKFLOW_RESULT_METADATA_TYPE,
-            rawCommand,
-            commandPrefix,
-            runId: result.runId,
-            requestedModel: context.sendMessageOptions.model,
-          },
-        },
-      });
-      if (!sendResult.success) {
-        throw new Error("Failed to send workflow result to the agent");
-      }
-      context.onMessageSent?.(context.sendMessageOptions.queueDispatchMode ?? "tool-end");
-      trackCommandUsed("workflow");
-      setToast({
-        id: Date.now().toString(),
-        type: "success",
-        message: `Workflow ${scriptPath} ${terminalStatus}`,
-      });
-      return { clearInput: true, toastShown: true };
-    } catch (error) {
-      if (error instanceof Error && error.message === WORKFLOW_COMMAND_SUPERSEDED_MESSAGE) {
-        return { clearInput: true, toastShown: false };
-      }
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: error instanceof Error ? error.message : "Failed to run workflow",
-      });
-      const currentInput = context.getInput?.();
-      const shouldRestoreCommand = currentInput === undefined || currentInput.trim().length === 0;
-      return { clearInput: !shouldRestoreCommand, toastShown: true };
-    } finally {
-      setWorkflowSendingState(false);
-    }
-  }
-
-  if (parsed.type === "debug-llm-request") {
-    setInput("");
-    window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.OPEN_DEBUG_LLM_REQUEST));
-    return { clearInput: true, toastShown: false };
-  }
-
-  if (parsed.type === "idle-compaction") {
-    const activeClient = requireClient();
-    if (!activeClient) {
-      return { clearInput: false, toastShown: true };
-    }
-
-    if (!context.projectPath) {
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: "No project selected",
-      });
-      return { clearInput: false, toastShown: true };
-    }
-
-    setInput("");
-
-    try {
-      const result = await activeClient.projects.idleCompaction.set({
-        projectPath: context.projectPath,
-        hours: parsed.hours,
-      });
-
-      if (!result.success) {
-        setToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: result.error ?? "Failed to update setting",
-        });
-        return { clearInput: false, toastShown: true };
-      }
-
-      setToast({
-        id: Date.now().toString(),
-        type: "success",
-        message: parsed.hours
-          ? `Idle compaction set to ${parsed.hours} hours`
-          : "Idle compaction disabled",
-      });
-      return { clearInput: true, toastShown: true };
-    } catch (error) {
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: error instanceof Error ? error.message : "Failed to update setting",
-      });
-      return { clearInput: false, toastShown: true };
-    }
-  }
-
-  if (parsed.type === "heartbeat-set") {
-    const activeClient = requireClient();
-    if (!activeClient) {
-      return { clearInput: false, toastShown: true };
-    }
-
-    // Manual /heartbeat invocations stay gated until the experiment is explicitly enabled.
-    // Guard the experiment check so non-browser test environments treat it as disabled safely.
-    let heartbeatExperimentEnabled: boolean | undefined;
-    try {
-      heartbeatExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
-    } catch {
-      heartbeatExperimentEnabled = false;
-    }
-    if (!heartbeatExperimentEnabled) {
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message:
-          "Heartbeat configuration requires the Workspace Heartbeats experiment to be enabled",
-      });
-      return { clearInput: false, toastShown: true };
-    }
-
-    if (!context.workspaceId) {
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: "No workspace selected",
-      });
-      return { clearInput: false, toastShown: true };
-    }
-
-    setInput("");
-
-    try {
-      // Best-effort read: malformed persisted heartbeat settings should not block a command that
-      // can repair them by writing a fresh interval or disabling the feature.
-      let currentHeartbeatSettings: Awaited<
-        ReturnType<typeof activeClient.workspace.heartbeat.get>
-      > | null = null;
-      try {
-        currentHeartbeatSettings = await activeClient.workspace.heartbeat.get({
-          workspaceId: context.workspaceId,
-        });
-      } catch {
-        currentHeartbeatSettings = null;
-      }
-
-      // Preserve the stored cadence when toggling heartbeats off so re-enabling restores it,
-      // and keep any saved custom heartbeat message when commands only change cadence.
-      const intervalMs =
-        parsed.minutes === null
-          ? (currentHeartbeatSettings?.intervalMs ?? HEARTBEAT_DEFAULT_INTERVAL_MS)
-          : parsed.minutes * 60 * 1000;
-      const result = await activeClient.workspace.heartbeat.set({
-        workspaceId: context.workspaceId,
-        enabled: parsed.minutes !== null,
-        intervalMs,
-        // Omit message when the best-effort read failed; WorkspaceService preserves the
-        // persisted custom message when this field is absent.
-        ...(currentHeartbeatSettings?.message != null
-          ? { message: currentHeartbeatSettings.message }
-          : {}),
-      });
-
-      if (!result.success) {
-        setToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: result.error ?? "Failed to update setting",
-        });
-        return { clearInput: false, toastShown: true };
-      }
-
-      setToast({
-        id: Date.now().toString(),
-        type: "success",
-        message:
-          parsed.minutes === null
-            ? "Heartbeat disabled"
-            : `Heartbeat set to every ${parsed.minutes} minutes`,
-      });
-      return { clearInput: true, toastShown: true };
-    } catch (error) {
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: error instanceof Error ? error.message : "Failed to update setting",
-      });
-      return { clearInput: false, toastShown: true };
-    }
-  }
-
-  if (parsed.type === "vim-toggle") {
-    setInput("");
-    setVimEnabled((prev) => !prev);
-    trackCommandUsed("vim");
-    return { clearInput: true, toastShown: false };
-  }
-
-  // 2. Workspace Commands
-  // Use command keys for help/invalid variants so creation mode doesn't surface workspace-only help text.
+  env: SlashCommandEnv
+): Promise<CommandResult> {
+  if (!parsed) return complete("restore");
   const workspaceOnlyKey = (() => {
     switch (parsed.type) {
       case "command-missing-args":
@@ -740,119 +401,632 @@ export async function processSlashCommand(
         return null;
     }
   })();
-
   const isWorkspaceCommandType = isWorkspaceOnlyParsedCommand(parsed);
   const isWorkspaceOnlyCommand =
     isWorkspaceCommandType ||
     (workspaceOnlyKey ? WORKSPACE_ONLY_COMMAND_KEYS.has(workspaceOnlyKey) : false);
+  // Side chats cannot own workspace/project operations. Gate them before any handler,
+  // including the early workflow, idle and heartbeat branches, so no backend mutation starts.
+  if (
+    env.isSideChat === true &&
+    (SIDE_CHAT_DISALLOWED_COMMAND_TYPES.has(parsed.type) ||
+      (workspaceOnlyKey != null && SIDE_CHAT_DISALLOWED_COMMAND_KEYS.has(workspaceOnlyKey)))
+  ) {
+    return complete("restore", [
+      showToast({
+        id: Date.now().toString(),
+        type: "error",
+        message: "Command not available in side chats. Press Esc to return to the main chat.",
+      }),
+    ]);
+  }
 
-  if (isWorkspaceOnlyCommand && variant !== "workspace") {
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      message: "Command not available during workspace creation",
+  const client = env.api;
+  const notConnected = () =>
+    complete("restore", [
+      showToast({ id: Date.now().toString(), type: "error", message: "Not connected to server" }),
+    ]);
+
+  if (parsed.type === "model-set") {
+    const normalized = normalizeModelInput(parsed.modelString);
+    if (!normalized.model) {
+      return complete("restore", [
+        showToast({
+          id: Date.now().toString(),
+          type: "error",
+          message: 'Invalid model format: expected "provider:model"',
+        }),
+      ]);
+    }
+    const selectedModel = normalized.model;
+    const separatorIndex = selectedModel.indexOf(":");
+    const provider = selectedModel.slice(0, separatorIndex);
+    const modelId = selectedModel.slice(separatorIndex + 1);
+    const lengthError = getModelIdLengthError(provider, modelId);
+    if (lengthError) {
+      return complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", message: lengthError }),
+      ]);
+    }
+    const canonicalModel = normalizeToCanonical(selectedModel);
+    const explicitGateway = getExplicitGatewayPrefix(selectedModel);
+    try {
+      let providersConfig: ProvidersConfigMap | null = null;
+      let providersConfigLoadFailed = false;
+      if (client) {
+        try {
+          providersConfig = await client.providers.getConfig();
+        } catch (error) {
+          providersConfigLoadFailed = true;
+          console.error("Failed to load provider settings:", error);
+        }
+      }
+      const providerConfig = providersConfig?.[provider];
+      if (!isValidProvider(provider) && !isCustomProviderConfig(providerConfig)) {
+        return complete("restore", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: providersConfigLoadFailed
+              ? 'Could not verify provider "' + provider + '": backend unreachable. Please retry.'
+              : 'Unknown provider "' + provider + '"',
+          }),
+        ]);
+      }
+      if (
+        !modelHasPricingData(selectedModel, providersConfig ?? null) &&
+        (await hasBudgetedResumableGoalForWorkspaceModelSwitch(env))
+      ) {
+        return complete("restore", [showToast(createUnpricedModelGoalToast("target"))]);
+      }
+      if (
+        client &&
+        providersConfig &&
+        !BUILT_IN_MODEL_SET.has(canonicalModel) &&
+        !explicitGateway
+      ) {
+        try {
+          const existingModels: ProviderModelEntry[] = providerConfig?.models ?? [];
+          if (!existingModels.some((entry) => getProviderModelEntryId(entry) === modelId)) {
+            await client.providers.setModels({ provider, models: [...existingModels, modelId] });
+          }
+        } catch (error) {
+          console.error("Failed to sync model settings:", error);
+        }
+      }
+      trackCommandUsed("model");
+      return complete("consume", [
+        { type: "clear-input" },
+        { type: "set-preferred-model", model: selectedModel },
+        showToast({
+          id: Date.now().toString(),
+          type: "success",
+          message: "Model changed to " + selectedModel,
+        }),
+      ]);
+    } catch (error) {
+      console.error("Failed to update model:", error);
+      return complete("restore", [
+        showToast({
+          id: Date.now().toString(),
+          type: "error",
+          message: error instanceof Error ? error.message : "Failed to update model",
+        }),
+      ]);
+    }
+  }
+
+  if (parsed.type === "model-oneshot") {
+    return complete("restore", [
+      showToast({
+        id: Date.now().toString(),
+        type: "error",
+        message: "Model one-shot is handled in the chat input.",
+      }),
+    ]);
+  }
+
+  if (parsed.type === "workflow-run") {
+    if (!client) return notConnected();
+    if (!env.workspaceId) {
+      return complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", message: "No workspace selected" }),
+      ]);
+    }
+    let args: unknown;
+    try {
+      args = parseWorkflowSlashArgs(parsed.argsText);
+    } catch (error) {
+      return complete("restore", [
+        showToast({
+          id: Date.now().toString(),
+          type: "error",
+          message: error instanceof Error ? error.message : "Invalid workflow arguments",
+        }),
+      ]);
+    }
+    const workspaceId = env.workspaceId;
+    const scriptPath = parsed.scriptPath;
+    const rawInput = env.rawInput?.trim();
+    const rawCommand = rawInput && rawInput.length > 0 ? rawInput : "/" + scriptPath;
+    const commandPrefix = rawCommand.split(/\s+/u)[0] ?? "/" + scriptPath;
+    let sendingStateActive = false;
+    const setWorkflowSending = (sending: boolean): CommandAction[] => {
+      if (sendingStateActive === sending) return [];
+      sendingStateActive = sending;
+      return [{ type: "set-sending", sending }];
+    };
+    return phase([{ type: "clear-input" }, ...setWorkflowSending(true)], async () => {
+      try {
+        const result = await client.workflows.start({
+          workspaceId,
+          scriptPath,
+          runInBackground: true,
+          args,
+          continuationOptions: env.sendMessageOptions,
+          rawCommand,
+        });
+        const stoppedActions = setWorkflowSending(false);
+        if (result.invocationMessagePersisted === true) {
+          trackCommandUsed("workflow");
+          return complete("consume", [
+            ...stoppedActions,
+            showToast({
+              id: Date.now().toString(),
+              type: "success",
+              message: "Workflow " + scriptPath + " started",
+            }),
+          ]);
+        }
+        return phase(stoppedActions, async () => {
+          try {
+            const run = await waitForWorkflowTerminalRun({
+              client,
+              workspaceId,
+              runId: result.runId,
+              initialStatus: result.status,
+              isCurrent: env.isCurrent,
+            });
+            const terminalStatus = run?.status ?? result.status;
+            if (terminalStatus === "interrupted") {
+              trackCommandUsed("workflow");
+              return complete("consume", [
+                showToast({
+                  id: Date.now().toString(),
+                  type: "success",
+                  message: "Workflow " + scriptPath + " interrupted",
+                }),
+              ]);
+            }
+            const workflowResultMessage = buildWorkflowResultContextMessage({
+              rawCommand,
+              name: scriptPath,
+              runId: result.runId,
+              status: terminalStatus,
+              result: result.result,
+              run,
+            });
+            return phase(setWorkflowSending(true), async () => {
+              try {
+                const sendResult = await client.workspace.sendMessage({
+                  workspaceId,
+                  message: workflowResultMessage,
+                  options: {
+                    ...env.sendMessageOptions,
+                    muxMetadata: {
+                      type: WORKFLOW_RESULT_METADATA_TYPE,
+                      rawCommand,
+                      commandPrefix,
+                      runId: result.runId,
+                      requestedModel: env.sendMessageOptions.model,
+                    },
+                  },
+                });
+                if (!sendResult.success) {
+                  throw new Error("Failed to send workflow result to the agent");
+                }
+                trackCommandUsed("workflow");
+                return complete("consume", [
+                  ...setWorkflowSending(false),
+                  {
+                    type: "message-sent",
+                    dispatchMode: env.sendMessageOptions.queueDispatchMode ?? "tool-end",
+                  },
+                  showToast({
+                    id: Date.now().toString(),
+                    type: "success",
+                    message: "Workflow " + scriptPath + " " + terminalStatus,
+                  }),
+                ]);
+              } catch (error) {
+                return complete("restore-if-empty", [
+                  ...setWorkflowSending(false),
+                  showToast({
+                    id: Date.now().toString(),
+                    type: "error",
+                    message: error instanceof Error ? error.message : "Failed to run workflow",
+                  }),
+                ]);
+              }
+            });
+          } catch (error) {
+            if (error instanceof Error && error.message === WORKFLOW_COMMAND_SUPERSEDED_MESSAGE) {
+              return complete("consume");
+            }
+            return complete("restore-if-empty", [
+              showToast({
+                id: Date.now().toString(),
+                type: "error",
+                message: error instanceof Error ? error.message : "Failed to run workflow",
+              }),
+            ]);
+          }
+        });
+      } catch (error) {
+        return complete("restore-if-empty", [
+          ...setWorkflowSending(false),
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: error instanceof Error ? error.message : "Failed to run workflow",
+          }),
+        ]);
+      }
     });
-    return { clearInput: false, toastShown: true };
+  }
+
+  if (parsed.type === "debug-llm-request") {
+    window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.OPEN_DEBUG_LLM_REQUEST));
+    return complete("consume", [{ type: "clear-input" }]);
+  }
+
+  if (parsed.type === "idle-compaction") {
+    if (!client) return notConnected();
+    if (!env.projectPath) {
+      return complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", message: "No project selected" }),
+      ]);
+    }
+    const projectPath = env.projectPath;
+    return phase([{ type: "clear-input" }], async () => {
+      try {
+        const result = await client.projects.idleCompaction.set({
+          projectPath,
+          hours: parsed.hours,
+        });
+        if (!result.success) {
+          return complete("restore", [
+            showToast({
+              id: Date.now().toString(),
+              type: "error",
+              message: result.error ?? "Failed to update setting",
+            }),
+          ]);
+        }
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "success",
+            message: parsed.hours
+              ? "Idle compaction set to " + parsed.hours + " hours"
+              : "Idle compaction disabled",
+          }),
+        ]);
+      } catch (error) {
+        return complete("restore", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: error instanceof Error ? error.message : "Failed to update setting",
+          }),
+        ]);
+      }
+    });
+  }
+
+  if (parsed.type === "heartbeat-set") {
+    if (!client) return notConnected();
+    if (!env.workspaceId) {
+      return complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", message: "No workspace selected" }),
+      ]);
+    }
+    const workspaceId = env.workspaceId;
+    return phase([{ type: "clear-input" }], async () => {
+      try {
+        let currentHeartbeatSettings: Awaited<
+          ReturnType<typeof client.workspace.heartbeat.get>
+        > | null = null;
+        try {
+          currentHeartbeatSettings = await client.workspace.heartbeat.get({ workspaceId });
+        } catch {
+          currentHeartbeatSettings = null;
+        }
+        const result = await client.workspace.heartbeat.set({
+          workspaceId,
+          enabled: parsed.minutes !== null,
+          // Turning heartbeats off keeps the saved interval. Omitting it also keeps a workspace
+          // that follows the global default on the default (#5692).
+          ...(parsed.minutes !== null ? { intervalMs: parsed.minutes * 60 * 1000 } : {}),
+          ...(currentHeartbeatSettings?.message != null
+            ? { message: currentHeartbeatSettings.message }
+            : {}),
+        });
+        if (!result.success) {
+          return complete("restore", [
+            showToast({
+              id: Date.now().toString(),
+              type: "error",
+              message: result.error ?? "Failed to update setting",
+            }),
+          ]);
+        }
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "success",
+            message:
+              parsed.minutes === null
+                ? "Heartbeat disabled"
+                : "Heartbeat set to every " + parsed.minutes + " minutes",
+          }),
+        ]);
+      } catch (error) {
+        return complete("restore", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: error instanceof Error ? error.message : "Failed to update setting",
+          }),
+        ]);
+      }
+    });
+  }
+
+  if (parsed.type === "speed-mode-toggle") {
+    if (!client) return notConnected();
+    if (speedModeToggleInFlight) return complete("restore");
+    const scopeId =
+      env.aiScopeId ??
+      (env.variant === "workspace"
+        ? env.workspaceId
+        : env.projectPath
+          ? getProjectScopeId(env.projectPath)
+          : GLOBAL_SCOPE_ID);
+    const selectedAgent = scopeId ? getWorkspaceAgentId(scopeId) : undefined;
+    const selectedModel = scopeId ? getWorkspaceAiSelection(scopeId).model : undefined;
+    trackCommandUsed(parsed.mode);
+    return phase([{ type: "clear-input" }], async () => {
+      if (speedModeToggleInFlight) return complete("restore-if-empty");
+      speedModeToggleInFlight = true;
+      const store = getProvidersConfigStore();
+      const label = parsed.mode === "fast" ? "Fast" : "Ultrafast";
+      try {
+        // Use the selected model, including creation composers, and preserve the
+        // same route/model restrictions as the speed selector.
+        const model = env.sendMessageOptions.model;
+        const providersConfig = await client.providers.getConfig();
+        const routeConfig = getAppConfigStore().getSnapshot() ?? (await client.config.getConfig());
+        const { isGatewayModelAccessible, resolveGatewayModelId } =
+          createGatewayRouting(providersConfig);
+        const route = resolveRoute(
+          normalizeToCanonical(model),
+          routeConfig.routePriority ?? DEFAULT_ROUTE_PRIORITY,
+          routeConfig.routeOverrides ?? {},
+          (provider) =>
+            providersConfig[provider]?.isConfigured === true &&
+            providersConfig[provider]?.isEnabled !== false,
+          isGatewayModelAccessible,
+          resolveGatewayModelId
+        );
+        const availability = {
+          providersConfig,
+          resolvedRouteProvider:
+            route.routeProvider === route.origin ? "direct" : route.routeProvider,
+        };
+        const provider = getFastModeProvider(model, availability);
+        if (
+          provider == null ||
+          (parsed.mode === "ultrafast" && !ultrafastModeAvailable(model, availability))
+        ) {
+          throw new Error(
+            `${label} mode is not available for ${model} on its current provider route and wire format.`
+          );
+        }
+        const targetTier = parsed.mode === "fast" ? "priority" : "ultrafast";
+        if (!scopeId) throw new Error("Workspace ID required");
+        // Async capability loading must not apply an old command to a newly selected agent.
+        if (
+          (env.variant === "workspace" && env.isCurrent?.() === false) ||
+          getWorkspaceAgentId(scopeId) !== selectedAgent ||
+          getWorkspaceAiSelection(scopeId).model !== selectedModel
+        ) {
+          return complete("restore-if-empty");
+        }
+        // Speed belongs to the chat for every provider, like its reasoning level: share the
+        // picker/shortcut's pending choice and next-step nudge, not a provider-wide write.
+        // Read after awaits so an intervening pick is respected.
+        const currentTier = resolveChatServiceTier(
+          provider,
+          getWorkspaceAiSelection(scopeId).serviceTier,
+          providersConfig
+        );
+        const tier = toggleServiceTier(currentTier, targetTier);
+        setWorkspaceServiceTier(client, scopeId, tier);
+        const enabled = tier === targetTier;
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "success",
+            message: `${label} mode ${enabled ? "enabled" : "disabled"}`,
+          }),
+        ]);
+      } catch (error) {
+        await store.refresh();
+        return complete("restore-if-empty", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: error instanceof Error ? error.message : `Failed to toggle ${label} mode`,
+          }),
+        ]);
+      } finally {
+        speedModeToggleInFlight = false;
+      }
+    });
+  }
+
+  if (parsed.type === "vim-toggle") {
+    trackCommandUsed("vim");
+    return complete("consume", [{ type: "clear-input" }, { type: "toggle-vim" }]);
+  }
+
+  if (isWorkspaceOnlyCommand && env.variant !== "workspace") {
+    return complete("restore", [
+      showToast({
+        id: Date.now().toString(),
+        type: "error",
+        message: "Command not available during workspace creation",
+      }),
+    ]);
   }
 
   if (isWorkspaceCommandType) {
-    // Dispatch workspace commands
     switch (parsed.type) {
       case "clear":
-        return handleClearCommand(parsed, context);
+        return handleClearCommand(parsed, env);
       case "compact":
-        // handleCompactCommand expects workspaceId in context
-        if (!context.workspaceId) throw new Error("Workspace ID required");
-        if (!requireClient()) {
-          return { clearInput: false, toastShown: true };
-        }
-        return handleCompactCommand(parsed, {
-          ...context,
-          api: client,
-          workspaceId: context.workspaceId,
-        } as CommandHandlerContext);
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        return handleCompactCommand(parsed, { ...env, api: client, workspaceId: env.workspaceId });
       case "dream": {
-        if (!context.workspaceId) throw new Error("Workspace ID required");
-        const dreamClient = requireClient();
-        if (!dreamClient) {
-          return { clearInput: false, toastShown: true };
-        }
-        // Fire-and-forget by design (PRD #3534): the dream run is background
-        // housekeeping; results surface in the Memory tab, not the chat. The
-        // only toast is the settle toast — an optimistic "started" success
-        // toast would flash green-then-red whenever the backend rejects
-        // immediately (experiment off, debounced, run already in flight).
-        const dreamWorkspaceId = context.workspaceId;
-        void dreamClient.memory
-          .consolidate({ workspaceId: dreamWorkspaceId })
-          .then((result) => {
-            // "Changes" counts applied ops only; the journal also records
-            // rejected/failed commands, which are not changes.
-            const applied = result.success ? result.data.ops.filter((op) => op.applied).length : 0;
-            context.setToast(
-              result.success
-                ? {
-                    id: Date.now().toString(),
-                    type: "success",
-                    message:
-                      applied === 0
-                        ? "Memory consolidation: no changes needed"
-                        : `Memory consolidated: ${applied} change(s)`,
-                  }
-                : {
-                    id: Date.now().toString(),
-                    type: "error",
-                    message: `Memory consolidation failed: ${result.error}`,
-                  }
-            );
-          })
-          .catch((error: unknown) => {
-            context.setToast({
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        const workspaceId = env.workspaceId;
+        return complete("consume", [{ type: "clear-input" }], async () => {
+          try {
+            const result = await client.memory.consolidate({ workspaceId });
+            const applied = result.success
+              ? result.data.ops.filter((operation) => operation.applied).length
+              : 0;
+            return [
+              showToast(
+                result.success
+                  ? {
+                      id: Date.now().toString(),
+                      type: "success",
+                      message:
+                        applied === 0
+                          ? "Memory consolidation: no changes needed"
+                          : "Memory consolidated: " + applied + " change(s)",
+                    }
+                  : {
+                      id: Date.now().toString(),
+                      type: "error",
+                      message: "Memory consolidation failed: " + result.error,
+                    }
+              ),
+            ];
+          } catch (error) {
+            return [
+              showToast({
+                id: Date.now().toString(),
+                type: "error",
+                message: "Memory consolidation failed: " + String(error),
+              }),
+            ];
+          }
+        });
+      }
+      case "refine": {
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        const workspaceId = env.workspaceId;
+        const apply = parsed.apply === true;
+        const displayedProposalHash = apply ? getDisplayedRefineProposalHash(workspaceId) : null;
+        if (apply && displayedProposalHash === null) {
+          return complete("consume", [
+            { type: "clear-input" },
+            showToast({
               id: Date.now().toString(),
               type: "error",
-              message: `Memory consolidation failed: ${String(error)}`,
-            });
-          });
-        return { clearInput: true, toastShown: true };
+              message:
+                "Refine failed: no staged /refine proposal is visible in this chat; run /refine first",
+            }),
+          ]);
+        }
+        return complete("consume", [{ type: "clear-input" }], async () => {
+          try {
+            const result =
+              apply && displayedProposalHash !== null
+                ? await client.refinements.apply({
+                    workspaceId,
+                    approvedProposalHash: displayedProposalHash,
+                  })
+                : await client.refinements.run({ workspaceId });
+            const appliedCount = result.success
+              ? result.data.applied.length + (result.data.untrackedApplied ?? 0)
+              : 0;
+            const failedCount = result.success ? (result.data.failed?.length ?? 0) : 0;
+            const allFailed =
+              result.success && apply && !result.data.noOp && appliedCount === 0 && failedCount > 0;
+            return [
+              showToast(
+                result.success
+                  ? {
+                      id: Date.now().toString(),
+                      type: allFailed ? "error" : "success",
+                      message: result.data.noOp
+                        ? apply
+                          ? "Refine: nothing was applied"
+                          : "Refine: nothing worth distilling"
+                        : apply
+                          ? "Refine: " +
+                            appliedCount +
+                            " edit(s) applied" +
+                            (failedCount > 0 ? ", " + failedCount + " failed" : "") +
+                            " (see chat summary)"
+                          : "Refine: " +
+                            (result.data.staged?.length ?? 0) +
+                            " edit(s) staged — approve with /refine apply",
+                    }
+                  : {
+                      id: Date.now().toString(),
+                      type: "error",
+                      message: "Refine failed: " + result.error,
+                    }
+              ),
+            ];
+          } catch (error) {
+            return [
+              showToast({
+                id: Date.now().toString(),
+                type: "error",
+                message: "Refine failed: " + String(error),
+              }),
+            ];
+          }
+        });
       }
       case "fork":
-        if (!requireClient()) {
-          return { clearInput: false, toastShown: true };
-        }
-        return handleForkCommand(parsed, {
-          ...context,
-          api: client,
-        });
+        if (!client) return notConnected();
+        return handleForkCommand(parsed, { ...env, api: client });
+      case "side":
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        return handleSideCommand({ ...env, api: client, workspaceId: env.workspaceId });
       case "new":
-        if (!context.workspaceId) throw new Error("Workspace ID required");
-        if (!requireClient()) {
-          return { clearInput: false, toastShown: true };
-        }
-        return handleNewCommand(parsed, {
-          ...context,
-          api: client,
-          workspaceId: context.workspaceId,
-        } as CommandHandlerContext);
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        return handleNewCommand(parsed, { ...env, api: client, workspaceId: env.workspaceId });
       case "plan-show":
-        if (!context.workspaceId) throw new Error("Workspace ID required");
-        if (!requireClient()) {
-          return { clearInput: false, toastShown: true };
-        }
-        return handlePlanShowCommand({
-          ...context,
-          api: client,
-          workspaceId: context.workspaceId,
-        } as CommandHandlerContext);
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        return handlePlanShowCommand({ ...env, api: client, workspaceId: env.workspaceId });
       case "plan-open":
-        if (!context.workspaceId) throw new Error("Workspace ID required");
-        if (!requireClient()) {
-          return { clearInput: false, toastShown: true };
-        }
-        return handlePlanOpenCommand({
-          ...context,
-          api: client,
-          workspaceId: context.workspaceId,
-        } as CommandHandlerContext);
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        return handlePlanOpenCommand({ ...env, api: client, workspaceId: env.workspaceId });
       case "goal-show":
       case "goal-set":
       case "goal-budget":
@@ -860,30 +1034,15 @@ export async function processSlashCommand(
       case "goal-resume":
       case "goal-complete":
       case "goal-clear":
-        if (!context.workspaceId) throw new Error("Workspace ID required");
-        if (!requireClient()) {
-          return { clearInput: false, toastShown: true };
-        }
-        return handleGoalCommand(parsed, {
-          ...context,
-          api: client,
-          workspaceId: context.workspaceId,
-        } as CommandHandlerContext);
-      // No default: parsed is narrowed to workspace-only commands (minus
-      // workflow-run/heartbeat-set, which returned above), so adding a type
-      // to WORKSPACE_ONLY_COMMAND_TYPE_LIST without a case fails the
-      // switch-exhaustiveness lint here.
+        if (!env.workspaceId) throw new Error("Workspace ID required");
+        if (!client) return notConnected();
+        return handleGoalCommand(parsed, { ...env, api: client, workspaceId: env.workspaceId });
     }
   }
 
-  // 3. Fallback / Help / Unknown
   const commandToast = createCommandToast(parsed);
-  if (commandToast) {
-    setToast(commandToast);
-    return { clearInput: false, toastShown: true };
-  }
-
-  return { clearInput: false, toastShown: false };
+  if (commandToast) return complete("restore", [showToast(commandToast)]);
+  return complete("restore");
 }
 
 // ============================================================================
@@ -907,36 +1066,23 @@ type GoalSetCommandResult =
   | { success: true; goal: GoalRecordV1 }
   | { success: false; error: GoalSetError };
 
-async function setGoalWithSingleConflictRetry(
-  context: CommandHandlerContext,
+async function setGoalForCommand(
+  env: WorkspaceCommandEnv,
   intent: GoalSetCommandIntent
 ): Promise<GoalSetCommandResult> {
-  // Shared retry helper centralized in `@/browser/utils/goals/` to avoid the
-  // three-way drift Coder-agents-review P3 DEREM-25 flagged. Adapts the raw
-  // API result to the typed `GoalSetCommandResult` this caller exposes.
-  const result = await setGoalWithConflictRetry(context.api, context.workspaceId, intent);
-  if (result.success) {
-    return { success: true, goal: result.data };
-  }
+  const result = await setGoalForIntendedGoal(env.api, env.workspaceId, intent);
+  if (result.success) return { success: true, goal: result.data };
   return { success: false, error: result.error };
 }
 
-async function getGoalDefaults(context: CommandHandlerContext): Promise<GoalDefaults> {
-  // Centralized in `@/browser/utils/goals/` so the slash command path and
-  // the command palette path read defaults the same way (Coder-agents-
-  // review P3 DEREM-27). Pass the workspaceId so the helper layers any
-  // per-workspace override on top of the global default — workspace rules
-  // win for `/goal` invocations inside that workspace.
-  return loadGoalDefaults(context.api, context.workspaceId);
+async function getGoalDefaults(env: WorkspaceCommandEnv): Promise<GoalDefaults> {
+  return loadGoalDefaults(env.api, env.workspaceId);
 }
 
 function resolveSlashGoalSetIntent(
   parsed: Extract<ParsedCommand, { type: "goal-set" }>,
   defaults: GoalDefaults
 ): GoalSetCommandIntent {
-  // The slash command's parser leaves `budgetCents`/`turnCap` undefined
-  // when omitted (rather than `null`), so we forward as-is to the shared
-  // resolver which treats `undefined` as "apply default".
   return resolveGoalSetIntent(
     {
       objective: parsed.objective,
@@ -948,42 +1094,36 @@ function resolveSlashGoalSetIntent(
 }
 
 async function hasBudgetedResumableGoalForWorkspaceModelSwitch(
-  context: SlashCommandContext
+  env: SlashCommandEnv
 ): Promise<boolean> {
-  if (context.variant !== "workspace" || !context.api || !context.workspaceId) {
-    return false;
-  }
-
+  if (env.variant !== "workspace" || !env.api || !env.workspaceId) return false;
   try {
-    const result = await context.api.workspace.getGoal({ workspaceId: context.workspaceId });
+    const result = await env.api.workspace.getGoal({ workspaceId: env.workspaceId });
     return hasBudgetedResumableGoal(result.goal);
   } catch {
     return false;
   }
 }
 
-async function currentModelHasPricingData(context: CommandHandlerContext): Promise<boolean> {
+async function currentModelHasPricingData(env: WorkspaceCommandEnv): Promise<boolean> {
   let providersConfig: unknown = null;
   try {
-    providersConfig = await context.api.providers.getConfig();
+    providersConfig = await env.api.providers.getConfig();
   } catch {
     providersConfig = null;
   }
-  return modelHasPricingData(context.sendMessageOptions.model, providersConfig);
+  return modelHasPricingData(env.sendMessageOptions.model, providersConfig);
 }
 
-function showUnpricedModelGoalToast(
-  setToast: (toast: Toast) => void,
-  modelPosition: "current" | "target" = "current"
-): void {
-  setToast({
+function createUnpricedModelGoalToast(modelPosition: "current" | "target" = "current"): Toast {
+  return {
     id: Date.now().toString(),
     type: "error",
     message:
       modelPosition === "current"
         ? UNPRICED_CURRENT_MODEL_GOAL_MESSAGE
         : UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
-  });
+  };
 }
 
 function getGoalSetErrorMessage(error: GoalSetError): string {
@@ -993,15 +1133,15 @@ function getGoalSetErrorMessage(error: GoalSetError): string {
   return error.message;
 }
 
-function showGoalSetErrorToast(setToast: (toast: Toast) => void, error: GoalSetError): void {
-  setToast({
+function createGoalSetErrorToast(error: GoalSetError): Toast {
+  return {
     id: Date.now().toString(),
     type: "error",
     message: getGoalSetErrorMessage(error),
-  });
+  };
 }
 
-async function handleGoalCommand(
+function handleGoalCommand(
   parsed: Extract<
     ParsedCommand,
     {
@@ -1015,277 +1155,332 @@ async function handleGoalCommand(
         | "goal-clear";
     }
   >,
-  context: CommandHandlerContext
-): Promise<CommandHandlerResult> {
-  const { api, workspaceId, setInput, setToast } = context;
-
-  setInput("");
-
-  try {
-    if (parsed.type === "goal-show") {
-      const result = await api.workspace.getGoal({ workspaceId });
-      if (result.goal) {
-        window.dispatchEvent?.(createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId }));
-        return { clearInput: true, toastShown: false };
+  env: WorkspaceCommandEnv
+): CommandResult {
+  return phase([{ type: "clear-input" }], async () => {
+    try {
+      if (parsed.type === "goal-show") {
+        const result = await env.api.workspace.getGoal({ workspaceId: env.workspaceId });
+        if (result.goal) {
+          window.dispatchEvent?.(
+            createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId: env.workspaceId })
+          );
+          return complete("consume");
+        }
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "success",
+            message: "No goal is set. Use /goal <objective> to create one.",
+          }),
+        ]);
       }
 
-      setToast({
-        id: Date.now().toString(),
-        type: "success",
-        message: "No goal is set. Use /goal <objective> to create one.",
-      });
-      return { clearInput: true, toastShown: true };
-    }
-
-    if (parsed.type === "goal-pause") {
-      const result = await setGoalWithSingleConflictRetry(context, { status: "paused" });
-      if (!result.success) {
-        showGoalSetErrorToast(setToast, result.error);
-        return { clearInput: false, toastShown: true };
-      }
-      setToast({ id: Date.now().toString(), type: "success", message: "Goal paused" });
-      trackCommandUsed("goal");
-      return { clearInput: true, toastShown: true };
-    }
-
-    if (parsed.type === "goal-resume") {
-      const currentGoal = await api.workspace.getGoal({ workspaceId });
-      if (
-        hasBudgetedResumableGoal(currentGoal.goal) &&
-        !(await currentModelHasPricingData(context))
-      ) {
-        showUnpricedModelGoalToast(setToast);
-        return { clearInput: false, toastShown: true };
+      if (parsed.type === "goal-pause") {
+        // Same rule as the Goal tab and the palette: only a running goal pauses. The backend also
+        // lets the user move a completed goal to paused (a revive), which /goal pause must not do
+        // (bug bash: it reopened a completed goal and reported "Goal paused").
+        const currentGoal = await env.api.workspace.getGoal({ workspaceId: env.workspaceId });
+        if (currentGoal.goal?.status !== "active") {
+          return complete("restore", [
+            showToast({
+              id: Date.now().toString(),
+              type: "error",
+              message: "No running goal to pause.",
+            }),
+          ]);
+        }
+        const result = await setGoalForCommand(env, { status: "paused" });
+        if (!result.success) {
+          return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
+        }
+        trackCommandUsed("goal");
+        return complete("consume", [
+          showToast({ id: Date.now().toString(), type: "success", message: "Goal paused" }),
+        ]);
       }
 
-      const result = await setGoalWithSingleConflictRetry(context, { status: "active" });
-      if (!result.success) {
-        showGoalSetErrorToast(setToast, result.error);
-        return { clearInput: false, toastShown: true };
+      if (parsed.type === "goal-resume") {
+        const currentGoal = await env.api.workspace.getGoal({ workspaceId: env.workspaceId });
+        if (
+          hasBudgetedResumableGoal(currentGoal.goal) &&
+          !(await currentModelHasPricingData(env))
+        ) {
+          return complete("restore", [showToast(createUnpricedModelGoalToast())]);
+        }
+        const result = await setGoalForCommand(env, { status: "active" });
+        if (!result.success) {
+          return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
+        }
+        trackCommandUsed("goal");
+        return complete("consume", [
+          showToast({ id: Date.now().toString(), type: "success", message: "Goal resumed" }),
+        ]);
       }
-      setToast({ id: Date.now().toString(), type: "success", message: "Goal resumed" });
-      trackCommandUsed("goal");
-      return { clearInput: true, toastShown: true };
-    }
 
-    if (parsed.type === "goal-complete") {
-      if (!parsed.summary) {
+      if (parsed.type === "goal-complete") {
+        if (!parsed.summary) {
+          // The summary form lives in the Goal tab and only shows for a goal that can complete:
+          // without one, opening the tab would do nothing visible (bug bash).
+          const currentGoal = await env.api.workspace.getGoal({ workspaceId: env.workspaceId });
+          if (currentGoal.goal == null || !isGoalLifecycleActive(currentGoal.goal.status)) {
+            return complete("restore", [
+              showToast({
+                id: Date.now().toString(),
+                type: "error",
+                message: "No goal to complete.",
+              }),
+            ]);
+          }
+          window.dispatchEvent?.(
+            createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, {
+              workspaceId: env.workspaceId,
+              openCompleteInput: true,
+            })
+          );
+          return complete("consume");
+        }
+        const result = await setGoalForCommand(env, {
+          status: "complete",
+          completionSummary: parsed.summary,
+        });
+        if (!result.success) {
+          return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
+        }
         window.dispatchEvent?.(
-          createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, {
-            workspaceId,
-            openCompleteInput: true,
+          createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId: env.workspaceId })
+        );
+        trackCommandUsed("goal");
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "success",
+            message: "Goal marked complete",
+          }),
+        ]);
+      }
+
+      if (parsed.type === "goal-clear") {
+        const result = await env.api.workspace.clearGoal({ workspaceId: env.workspaceId });
+        trackCommandUsed("goal");
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "success",
+            message: result.cleared ? "Goal cleared" : "No goal was set",
+          }),
+        ]);
+      }
+
+      if (parsed.type === "goal-budget") {
+        if (hasGoalBudgetLimit(parsed.budgetCents) && !(await currentModelHasPricingData(env))) {
+          return complete("restore", [showToast(createUnpricedModelGoalToast())]);
+        }
+        const result = await setGoalForCommand(env, {
+          budgetCents: parsed.budgetCents,
+        });
+        if (!result.success) {
+          return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
+        }
+        window.dispatchEvent?.(
+          createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId: env.workspaceId })
+        );
+        trackCommandUsed("goal");
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "success",
+            message: "Goal budget updated",
+          }),
+        ]);
+      }
+
+      const goalDefaults = await getGoalDefaults(env);
+      const goalSetIntent = resolveSlashGoalSetIntent(parsed, goalDefaults);
+      if (
+        hasGoalBudgetLimit(goalSetIntent.budgetCents) &&
+        !(await currentModelHasPricingData(env))
+      ) {
+        return complete("restore", [showToast(createUnpricedModelGoalToast())]);
+      }
+      const result = await setGoalForCommand(env, goalSetIntent);
+      if (!result.success) {
+        return complete("restore", [showToast(createGoalSetErrorToast(result.error))]);
+      }
+      window.dispatchEvent?.(
+        createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId: env.workspaceId })
+      );
+      trackCommandUsed("goal");
+      return complete("consume");
+    } catch (error) {
+      return complete("restore", [
+        showToast({
+          id: Date.now().toString(),
+          type: "error",
+          message: error instanceof Error ? error.message : "Goal command failed",
+        }),
+      ]);
+    }
+  });
+}
+
+function handleClearCommand(
+  parsed: Extract<ParsedCommand, { type: "clear" }>,
+  env: SlashCommandEnv
+): CommandResult {
+  if (parsed.mode === "soft") {
+    if (!env.resetContext) return complete("consume");
+    return phase([], async () => {
+      try {
+        const result = await env.resetContext?.();
+        const actions: CommandAction[] = [{ type: "clear-input" }, { type: "reset-input-height" }];
+        if (result === "reset") {
+          actions.push({ type: "clear-attachments" }, { type: "detach-reviews" });
+        }
+        trackCommandUsed("clear:soft");
+        actions.push(
+          showToast({
+            id: Date.now().toString(),
+            type: "success",
+            message: getContextResetSuccessMessage(result ?? "noop"),
           })
         );
-        return { clearInput: true, toastShown: false };
+        return complete("consume", actions);
+      } catch (error) {
+        const normalized = error instanceof Error ? error : new Error("Failed to reset context");
+        console.error("Failed to reset context:", normalized);
+        return complete("restore", [
+          showToast({ id: Date.now().toString(), type: "error", message: normalized.message }),
+        ]);
       }
-
-      const result = await setGoalWithSingleConflictRetry(context, {
-        status: "complete",
-        completionSummary: parsed.summary,
-      });
-      if (!result.success) {
-        showGoalSetErrorToast(setToast, result.error);
-        return { clearInput: false, toastShown: true };
-      }
-      setToast({ id: Date.now().toString(), type: "success", message: "Goal marked complete" });
-      window.dispatchEvent?.(createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId }));
-      trackCommandUsed("goal");
-      return { clearInput: true, toastShown: true };
-    }
-
-    if (parsed.type === "goal-clear") {
-      const result = await api.workspace.clearGoal({ workspaceId });
-      setToast({
-        id: Date.now().toString(),
-        type: "success",
-        message: result.cleared ? "Goal cleared" : "No goal was set",
-      });
-      trackCommandUsed("goal");
-      return { clearInput: true, toastShown: true };
-    }
-
-    if (parsed.type === "goal-budget") {
-      if (hasGoalBudgetLimit(parsed.budgetCents) && !(await currentModelHasPricingData(context))) {
-        showUnpricedModelGoalToast(setToast);
-        return { clearInput: false, toastShown: true };
-      }
-
-      const result = await setGoalWithSingleConflictRetry(context, {
-        budgetCents: parsed.budgetCents,
-      });
-      if (!result.success) {
-        showGoalSetErrorToast(setToast, result.error);
-        return { clearInput: false, toastShown: true };
-      }
-      setToast({ id: Date.now().toString(), type: "success", message: "Goal budget updated" });
-      window.dispatchEvent?.(createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId }));
-      trackCommandUsed("goal");
-      return { clearInput: true, toastShown: true };
-    }
-
-    const goalDefaults = await getGoalDefaults(context);
-    const goalSetIntent = resolveSlashGoalSetIntent(parsed, goalDefaults);
-    if (
-      hasGoalBudgetLimit(goalSetIntent.budgetCents) &&
-      !(await currentModelHasPricingData(context))
-    ) {
-      showUnpricedModelGoalToast(setToast);
-      return { clearInput: false, toastShown: true };
-    }
-
-    const result = await setGoalWithSingleConflictRetry(context, goalSetIntent);
-    if (!result.success) {
-      showGoalSetErrorToast(setToast, result.error);
-      return { clearInput: false, toastShown: true };
-    }
-    window.dispatchEvent?.(createCustomEvent(CUSTOM_EVENTS.OPEN_GOAL_TAB, { workspaceId }));
-    trackCommandUsed("goal");
-    return { clearInput: true, toastShown: false };
-  } catch (error) {
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      message: error instanceof Error ? error.message : "Goal command failed",
     });
-    return { clearInput: false, toastShown: true };
   }
-}
 
-async function handleClearCommand(
-  parsed: Extract<ParsedCommand, { type: "clear" }>,
-  context: SlashCommandContext
-): Promise<CommandHandlerResult> {
-  const {
-    setInput,
-    setAttachments,
-    onDetachAllReviews,
-    onResetContext,
-    onTruncateHistory,
-    resetInputHeight,
-    setToast,
-  } = context;
-
-  if (parsed.mode === "soft") {
-    if (!onResetContext) return { clearInput: true, toastShown: false };
-
+  const initialActions: CommandAction[] = [{ type: "clear-input" }, { type: "reset-input-height" }];
+  if (!env.truncateHistory) {
+    return phase(initialActions, () => Promise.resolve(complete("consume")));
+  }
+  return phase(initialActions, async () => {
     try {
-      const result = await onResetContext();
-      setInput("");
-      resetInputHeight();
-      if (result === "reset") {
-        setAttachments([]);
-        onDetachAllReviews?.();
-      }
-      trackCommandUsed("clear:soft");
-      setToast({
-        id: Date.now().toString(),
-        type: "success",
-        message: getContextResetSuccessMessage(result),
-      });
-      return { clearInput: true, toastShown: true };
+      await env.truncateHistory?.(1.0);
+      trackCommandUsed("clear:hard");
+      return complete("consume", [
+        { type: "clear-attachments" },
+        { type: "detach-reviews" },
+        showToast({
+          id: Date.now().toString(),
+          type: "success",
+          message: "Chat history cleared",
+        }),
+      ]);
     } catch (error) {
-      const normalized = error instanceof Error ? error : new Error("Failed to reset context");
-      console.error("Failed to reset context:", normalized);
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: normalized.message,
-      });
-      return { clearInput: false, toastShown: true };
+      const normalized = error instanceof Error ? error : new Error("Failed to clear history");
+      console.error("Failed to clear history:", normalized);
+      return complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", message: normalized.message }),
+      ]);
     }
-  }
-
-  setInput("");
-  resetInputHeight();
-
-  if (!onTruncateHistory) return { clearInput: true, toastShown: false };
-
-  try {
-    await onTruncateHistory(1.0);
-    setAttachments([]);
-    onDetachAllReviews?.();
-    trackCommandUsed("clear:hard");
-    setToast({
-      id: Date.now().toString(),
-      type: "success",
-      message: "Chat history cleared",
-    });
-    return { clearInput: true, toastShown: true };
-  } catch (error) {
-    const normalized = error instanceof Error ? error : new Error("Failed to clear history");
-    console.error("Failed to clear history:", normalized);
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      message: normalized.message,
-    });
-    return { clearInput: false, toastShown: true };
-  }
+  });
 }
 
-async function handleForkCommand(
+/**
+ * /side (Codex's side conversation): open an ephemeral fork of this chat. It opens as a tab in
+ * this workspace's right sidebar so both chats stay visible (closing the tab discards it). Where
+ * the sidebar is hidden (narrow viewports) it takes over the chat view instead, like Codex, and
+ * leaving it discards it (useDiscardSideChatOnLeave).
+ */
+export async function openSideChat(options: {
+  api: RouterClient<AppRouter>;
+  workspaceId: string;
+  /** Replace this launcher's New tab; slash commands simply add a tab. */
+  tabsetId?: string;
+}): Promise<void> {
+  const result = await options.api.workspace.createSideChat({
+    parentWorkspaceId: options.workspaceId,
+  });
+  if (!result.success) throw new Error(result.error);
+  // Both entry points inherit the same settings without submitting or modifying the main draft.
+  copyWorkspaceStorage(options.workspaceId, result.metadata.id);
+  const openTab = new CustomEvent(CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB, {
+    detail: {
+      workspaceId: options.workspaceId,
+      sideChatWorkspaceId: result.metadata.id,
+      tabsetId: options.tabsetId,
+    },
+    cancelable: true,
+  });
+  // A hidden sidebar leaves this unclaimed, so narrow layouts still open the full-screen chat.
+  if (window.dispatchEvent(openTab)) dispatchWorkspaceSwitch(result.metadata);
+}
+
+function handleSideCommand(env: WorkspaceCommandEnv): CommandResult {
+  return phase([{ type: "clear-input" }, { type: "set-sending", sending: true }], async () => {
+    const failed = (message: string) =>
+      complete("restore", [
+        showToast({ id: Date.now().toString(), type: "error", title: "Side Chat Failed", message }),
+        { type: "set-sending", sending: false },
+      ]);
+    try {
+      await openSideChat({ api: env.api, workspaceId: env.workspaceId });
+      trackCommandUsed("side");
+      return complete("consume", [{ type: "set-sending", sending: false }]);
+    } catch (error) {
+      return failed(error instanceof Error ? error.message : "Failed to start side chat");
+    }
+  });
+}
+
+function handleForkCommand(
   parsed: Extract<ParsedCommand, { type: "fork" }>,
-  context: SlashCommandContext
-): Promise<CommandHandlerResult> {
-  const {
-    api: client,
-    workspaceId,
-    sendMessageOptions,
-    setInput,
-    setSendingState,
-    setToast,
-  } = context;
-
-  setInput(""); // Clear input immediately
-  setSendingState(true);
-
-  try {
-    // Note: workspaceId is required for fork, but SlashCommandContext allows undefined workspaceId.
-    // If we are here, variant === "workspace", so workspaceId should be defined.
-    if (!workspaceId) throw new Error("Workspace ID required for fork");
-
-    if (!client) throw new Error("Client required for fork");
-    const forkResult = await forkWorkspace({
-      client,
-      sourceWorkspaceId: workspaceId,
-      startMessage: parsed.startMessage,
-      sendMessageOptions,
-    });
-
-    if (!forkResult.success) {
-      const errorMsg = forkResult.error ?? "Failed to fork workspace";
-      console.error("Failed to fork workspace:", errorMsg);
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        title: "Fork Failed",
-        message: errorMsg,
+  env: SlashCommandEnv & { api: RouterClient<AppRouter> }
+): CommandResult {
+  return phase([{ type: "clear-input" }, { type: "set-sending", sending: true }], async () => {
+    try {
+      if (!env.workspaceId) throw new Error("Workspace ID required for fork");
+      const result = await forkWorkspace({
+        client: env.api,
+        sourceWorkspaceId: env.workspaceId,
+        startMessage: parsed.startMessage,
+        sendMessageOptions: env.sendMessageOptions,
       });
-      return { clearInput: false, toastShown: true };
-    } else {
+      if (!result.success) {
+        const message = result.error ?? "Failed to fork workspace";
+        console.error("Failed to fork workspace:", message);
+        return complete("restore", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            title: "Fork Failed",
+            message,
+          }),
+          { type: "set-sending", sending: false },
+        ]);
+      }
       trackCommandUsed("fork");
       const displayName =
-        forkResult.workspaceInfo?.title ?? forkResult.workspaceInfo?.name ?? "new workspace";
-      setToast({
-        id: Date.now().toString(),
-        type: "success",
-        message: `Forked to workspace "${displayName}"`,
-      });
-      return { clearInput: true, toastShown: true };
+        result.workspaceInfo?.title ?? result.workspaceInfo?.name ?? "new workspace";
+      return complete("consume", [
+        showToast({
+          id: Date.now().toString(),
+          type: "success",
+          message: 'Forked to workspace "' + displayName + '"',
+        }),
+        { type: "set-sending", sending: false },
+      ]);
+    } catch (error) {
+      const normalized = error instanceof Error ? error : new Error("Failed to fork workspace");
+      console.error("Fork error:", normalized);
+      return complete("restore", [
+        showToast({
+          id: Date.now().toString(),
+          type: "error",
+          title: "Fork Failed",
+          message: normalized.message,
+        }),
+        { type: "set-sending", sending: false },
+      ]);
     }
-  } catch (error) {
-    const normalized = error instanceof Error ? error : new Error("Failed to fork workspace");
-    console.error("Fork error:", normalized);
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      title: "Fork Failed",
-      message: normalized.message,
-    });
-    return { clearInput: false, toastShown: true };
-  } finally {
-    setSendingState(false);
-  }
+  });
 }
 
 /**
@@ -1337,7 +1532,7 @@ export function parseRuntimeString(runtime: string | undefined): RuntimeConfig |
         type: RUNTIME_MODE.SSH,
         host: parsed.host,
         // Stable SSH remote layout is still ~/mux (same as buildRuntimeConfig /
-        // CLI parseRuntimeConfig). Local Shux home and SSH product-home compat
+        // CLI parseRuntimeConfig). Local Xum home and SSH product-home compat
         // live elsewhere; this default is a persisted remote path contract.
         srcBaseDir: "~/mux",
       };
@@ -1367,7 +1562,7 @@ export interface CreateWorkspaceOptions {
   projectPath: string;
   /**
    * Workspace branch name. When omitted, the backend auto-generates one
-   * (e.g., "workspace-1", "workspace-2") so /new can mirror /fork's
+   * (e.g., "calm-otters-sing") so /new can mirror /fork's
    * seamless creation flow.
    */
   workspaceName?: string;
@@ -1406,18 +1601,18 @@ export async function createNewWorkspace(
     effectiveTrunk = recommendedTrunk ?? "main";
   }
 
-  // Use saved default runtime preference if not explicitly provided
-  let effectiveRuntime = options.runtime;
-  if (effectiveRuntime === undefined) {
-    const runtimeKey = getRuntimeKey(options.projectPath);
-    const savedRuntime = localStorage.getItem(runtimeKey);
-    if (savedRuntime) {
-      effectiveRuntime = savedRuntime;
-    }
+  // /new cannot ask for the host, image or config path the other runtimes need, so only a
+  // configured local default applies; anything else gets the backend's worktree default.
+  let runtime = options.runtime;
+  if (runtime === undefined) {
+    // A project default replaces the global one, as in the creation UI.
+    const projects = new Map(await options.client.projects.list());
+    const defaultRuntime =
+      projects.get(options.projectPath)?.defaultRuntime ??
+      getAppConfigStore().getSnapshot()?.defaultRuntime;
+    if (defaultRuntime === RUNTIME_MODE.LOCAL) runtime = defaultRuntime;
   }
-
-  // Parse runtime config if provided.
-  const runtimeConfig = parseRuntimeString(effectiveRuntime);
+  const runtimeConfig = parseRuntimeString(runtime);
 
   const result = await options.client.workspace.create({
     projectPath: options.projectPath,
@@ -1482,6 +1677,8 @@ export interface CompactionOptions {
   model?: string;
   sendMessageOptions: SendMessageOptions;
   editMessageId?: string;
+  /** Edit fence for an editing compaction (see SendMessageOptions.historyEditPrecondition). */
+  historyEditPrecondition?: HistoryEditPrecondition;
   /** Source of compaction request (e.g., "idle-compaction" for auto-triggered) */
   source?: "idle-compaction";
 }
@@ -1489,6 +1686,12 @@ export interface CompactionOptions {
 export interface CompactionResult {
   success: boolean;
   error?: string;
+  /**
+   * The backend refused an editing compaction with `history-changed`: the fenced range changed
+   * since the caller captured its evidence. Callers that own an edit session (the composer)
+   * start a transcript refresh; others just report the failure.
+   */
+  historyChanged?: true;
 }
 
 /**
@@ -1557,7 +1760,6 @@ export function prepareCompactionMessage(options: CompactionOptions): {
     followUpContent: fc,
   };
 
-  // Apply compaction overrides
   const sendOptions = applyCompactionOverrides(options.sendMessageOptions, compactData);
 
   const metadata: MuxMessageMetadata = {
@@ -1582,6 +1784,18 @@ export function prepareCompactionMessage(options: CompactionOptions): {
 export async function executeCompaction(
   options: CompactionOptions & { api: RouterClient<AppRouter> }
 ): Promise<CompactionResult> {
+  // An editing compaction truncates history after the edited row, so its meaning depends on
+  // the transcript the user is looking at. Append-only compaction (auto/idle/model switch)
+  // never rewrites visible rows and stays available while a transcript is still hydrating.
+  if (options.editMessageId && !isTranscriptMutationAllowed(options.workspaceId)) {
+    return { success: false, error: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE };
+  }
+  // Every UI edit is fenced; a caller that could not capture evidence (the edited row is not
+  // held) is refused here with a readable reason instead of by the RPC schema.
+  if (options.editMessageId && !options.historyEditPrecondition) {
+    return { success: false, error: EDIT_NOT_HELD_MESSAGE };
+  }
+
   const { messageText, metadata, sendOptions } = prepareCompactionMessage(options);
 
   const result = await options.api.workspace.sendMessage({
@@ -1591,318 +1805,269 @@ export async function executeCompaction(
       ...sendOptions,
       muxMetadata: metadata,
       editMessageId: options.editMessageId,
+      historyEditPrecondition: options.historyEditPrecondition,
     },
   });
 
   if (!result.success) {
-    // Convert SendMessageError to string for error display
+    // Convert SendMessageError to string for error display. Typed errors get their user-facing
+    // text so a `history-changed` refusal reads as guidance rather than an error code; the
+    // refusal itself is kept as a flag so an edit session can start its recovery.
+    const typedError =
+      result.error && typeof result.error === "object" && "type" in result.error
+        ? result.error
+        : undefined;
     const errorString = result.error
       ? typeof result.error === "string"
         ? result.error
-        : "type" in result.error
-          ? result.error.type
+        : typedError
+          ? formatSendMessageError(typedError).message
           : "Failed to compact"
       : undefined;
-    return { success: false, error: errorString };
+    return {
+      success: false,
+      error: errorString,
+      ...(typedError?.type === "history-changed" ? { historyChanged: true as const } : {}),
+    };
   }
 
   return { success: true };
 }
 
-// ============================================================================
-// Command Handler Types
-// ============================================================================
-
-export interface CommandHandlerContext {
-  api: RouterClient<AppRouter>;
-  workspaceId: string;
-  currentModel?: string | null;
-  sendMessageOptions: SendMessageOptions;
-  attachments?: ChatAttachment[];
-  fileParts?: FilePart[];
-  /** Reviews attached to the message (from code review panel) */
-  reviews?: ReviewNoteData[];
-  editMessageId?: string;
-  setInput: (value: string) => void;
-  setAttachments: (attachments: ChatAttachment[]) => void;
-  /** Increment/decrement the sending counter. Pass true to increment, false to decrement. */
-  setSendingState: (increment: boolean) => void;
-  setToast: (toast: Toast) => void;
-  onCancelEdit?: () => void;
-}
-
-export interface CommandHandlerResult {
-  /** Whether the input should be cleared */
-  clearInput: boolean;
-  /** Whether to show a toast (already set via context.setToast) */
-  toastShown: boolean;
-}
-
-/**
- * Handle /new command execution.
- *
- * Mirrors /fork's seamless flow: no modal, no required workspace name. The
- * backend auto-generates a branch name, and when a start message is supplied
- * we ask it to fill in the workspace title from that message via
- * `pendingAutoTitle`.
- */
-export async function handleNewCommand(
+/** Handle /new command execution. */
+function handleNewCommand(
   parsed: Extract<ParsedCommand, { type: "new" }>,
-  context: CommandHandlerContext
-): Promise<CommandHandlerResult> {
-  const {
-    api: client,
-    workspaceId,
-    sendMessageOptions,
-    setInput,
-    setSendingState,
-    setToast,
-  } = context;
-
-  setInput(""); // Clear input immediately, like /fork.
-  setSendingState(true);
-
-  try {
-    // Get workspace info to extract projectPath. /new is a workspace-only
-    // command, so the parent workspace's project becomes the new workspace's
-    // project.
-    const workspaceInfo = await client.workspace.getInfo({ workspaceId });
-    if (!workspaceInfo) {
-      throw new Error("Failed to get workspace info");
-    }
-
-    // Treat blank/whitespace-only payloads the same as no message — pendingAutoTitle
-    // only makes sense when there is real content for the LLM to title from.
-    const trimmedStartMessage = parsed.startMessage?.trim() ?? "";
-    const startMessage = trimmedStartMessage.length > 0 ? trimmedStartMessage : undefined;
-
-    const createResult = await createNewWorkspace({
-      client,
-      projectPath: workspaceInfo.projectPath,
-      // workspaceName intentionally omitted — backend auto-generates (like /fork).
-      startMessage,
-      sendMessageOptions,
-      // Match /fork: only flag pendingAutoTitle when there is a message to
-      // generate the title from.
-      pendingAutoTitle: Boolean(startMessage),
-    });
-
-    if (!createResult.success) {
-      const errorMsg = createResult.error ?? "Failed to create workspace";
-      console.error("Failed to create workspace:", errorMsg);
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        title: "Create Failed",
-        message: errorMsg,
+  env: WorkspaceCommandEnv
+): CommandResult {
+  return phase([{ type: "clear-input" }, { type: "set-sending", sending: true }], async () => {
+    try {
+      const workspaceInfo = await env.api.workspace.getInfo({ workspaceId: env.workspaceId });
+      if (!workspaceInfo) throw new Error("Failed to get workspace info");
+      const trimmedStartMessage = parsed.startMessage?.trim() ?? "";
+      const startMessage = trimmedStartMessage.length > 0 ? trimmedStartMessage : undefined;
+      const result = await createNewWorkspace({
+        client: env.api,
+        projectPath: workspaceInfo.projectPath,
+        startMessage,
+        sendMessageOptions: env.sendMessageOptions,
+        pendingAutoTitle: Boolean(startMessage),
       });
-      return { clearInput: false, toastShown: true };
+      if (!result.success) {
+        const message = result.error ?? "Failed to create workspace";
+        console.error("Failed to create workspace:", message);
+        return complete("restore", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            title: "Create Failed",
+            message,
+          }),
+          { type: "set-sending", sending: false },
+        ]);
+      }
+      trackCommandUsed("new");
+      const displayName =
+        result.workspaceInfo?.title ?? result.workspaceInfo?.name ?? "new workspace";
+      return complete("consume", [
+        showToast({
+          id: Date.now().toString(),
+          type: "success",
+          message: 'Created workspace "' + displayName + '"',
+        }),
+        { type: "set-sending", sending: false },
+      ]);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to create workspace";
+      console.error("Create error:", error);
+      return complete("restore", [
+        showToast({
+          id: Date.now().toString(),
+          type: "error",
+          title: "Create Failed",
+          message,
+        }),
+        { type: "set-sending", sending: false },
+      ]);
     }
-
-    trackCommandUsed("new");
-    const displayName =
-      createResult.workspaceInfo?.title ?? createResult.workspaceInfo?.name ?? "new workspace";
-    setToast({
-      id: Date.now().toString(),
-      type: "success",
-      message: `Created workspace "${displayName}"`,
-    });
-    return { clearInput: true, toastShown: true };
-  } catch (error) {
-    const errorMsg = error instanceof Error ? error.message : "Failed to create workspace";
-    console.error("Create error:", error);
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      title: "Create Failed",
-      message: errorMsg,
-    });
-    return { clearInput: false, toastShown: true };
-  } finally {
-    setSendingState(false);
-  }
+  });
 }
 
-/**
- * Handle /compact command execution
- */
-export async function handleCompactCommand(
+/** Handle /compact command execution. */
+function handleCompactCommand(
   parsed: Extract<ParsedCommand, { type: "compact" }>,
-  context: CommandHandlerContext
-): Promise<CommandHandlerResult> {
-  const {
-    api,
-    workspaceId,
-    sendMessageOptions,
-    editMessageId,
-    setInput,
-    setAttachments,
-    setSendingState,
-    setToast,
-    onCancelEdit,
-  } = context;
-
-  // normalizeModelInput handles null/empty — returns { model: null } for empty input
+  env: WorkspaceCommandEnv
+): CommandResult {
   const normalizedModel = normalizeModelInput(parsed.model);
-
-  // Validate model format early - fail fast before sending to backend
   if (parsed.model && !normalizedModel.model) {
-    setToast(createInvalidCompactModelToast(parsed.model));
-    return { clearInput: false, toastShown: true };
+    return complete("restore", [showToast(createInvalidCompactModelToast(parsed.model))]);
   }
 
-  setInput("");
-  setAttachments([]);
-  setSendingState(true);
-
-  try {
-    // Build followUpContent directly from parsed command + context.
-    const stagedAttachments = context.attachments ? getStagedAttachments(context.attachments) : [];
-    const hasContent =
-      parsed.continueMessage ??
-      context.fileParts?.length ??
-      context.reviews?.length ??
-      stagedAttachments.length;
-    const followUpContent: CompactionFollowUpInput | undefined = hasContent
-      ? {
-          text: appendStagedAttachmentNotice(parsed.continueMessage ?? "", stagedAttachments),
-          fileParts: context.fileParts,
-          reviews: context.reviews,
-        }
-      : undefined;
-
-    const resolvedModel = normalizedModel.model ?? undefined;
-
-    const result = await executeCompaction({
-      api,
-      workspaceId,
-      maxOutputTokens: parsed.maxOutputTokens,
-      followUpContent,
-      model: resolvedModel,
-      sendMessageOptions,
-      editMessageId,
-    });
-
-    if (!result.success) {
-      console.error("Failed to initiate compaction:", result.error);
-      const errorMsg = result.error ?? "Failed to start compaction";
-      setToast({
-        id: Date.now().toString(),
-        type: "error",
-        message: errorMsg,
+  // Attachments are cleared only once compaction has started (like `/clear`): every failure
+  // path below restores the text with `"restore"`, and a refused edit (`history-changed`) must
+  // hand the whole draft back for review, files included.
+  return phase([{ type: "clear-input" }, { type: "set-sending", sending: true }], async () => {
+    try {
+      const stagedAttachments = env.attachments ? getStagedAttachments(env.attachments) : [];
+      const hasContent =
+        parsed.continueMessage ??
+        env.fileParts?.length ??
+        env.reviews?.length ??
+        stagedAttachments.length;
+      const followUpContent: CompactionFollowUpInput | undefined = hasContent
+        ? {
+            text: appendStagedAttachmentNotice(parsed.continueMessage ?? "", stagedAttachments),
+            fileParts: env.fileParts,
+            reviews: env.reviews,
+          }
+        : undefined;
+      const result = await executeCompaction({
+        api: env.api,
+        workspaceId: env.workspaceId,
+        maxOutputTokens: parsed.maxOutputTokens,
+        followUpContent,
+        model: normalizedModel.model ?? undefined,
+        sendMessageOptions: env.sendMessageOptions,
+        editMessageId: env.editMessageId,
+        historyEditPrecondition: env.historyEditPrecondition,
       });
-      return { clearInput: false, toastShown: true };
+      if (!result.success) {
+        console.error("Failed to initiate compaction:", result.error);
+        return complete("restore", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: result.error ?? "Failed to start compaction",
+          }),
+          { type: "set-sending", sending: false },
+          // An editing /compact refused with `history-changed` recovers exactly like a refused
+          // edit send: stay in edit mode and refresh the transcript for an explicit re-send.
+          ...(result.historyChanged && env.editMessageId && env.historyEditPrecondition
+            ? ([
+                {
+                  type: "edit-history-changed",
+                  editMessageId: env.editMessageId,
+                  precondition: env.historyEditPrecondition,
+                },
+              ] satisfies CommandAction[])
+            : []),
+        ]);
+      }
+      trackCommandUsed("compact");
+      return complete("consume", [
+        { type: "clear-attachments" },
+        showToast({
+          id: Date.now().toString(),
+          type: "success",
+          message: parsed.continueMessage
+            ? "Compaction started. Will continue automatically after completion."
+            : "Compaction started. AI will summarize the conversation.",
+        }),
+        ...(env.editMessageId ? ([{ type: "cancel-edit" }] satisfies CommandAction[]) : []),
+        { type: "set-sending", sending: false },
+        { type: "check-reviews", reviewIds: env.attachedReviewIds ?? [] },
+        {
+          type: "message-sent",
+          dispatchMode: env.sendMessageOptions.queueDispatchMode ?? "tool-end",
+        },
+      ]);
+    } catch (error) {
+      console.error("Compaction error:", error);
+      return complete("restore", [
+        showToast({
+          id: Date.now().toString(),
+          type: "error",
+          message: error instanceof Error ? error.message : "Failed to start compaction",
+        }),
+        { type: "set-sending", sending: false },
+      ]);
     }
-
-    trackCommandUsed("compact");
-    setToast({
-      id: Date.now().toString(),
-      type: "success",
-      message: parsed.continueMessage
-        ? "Compaction started. Will continue automatically after completion."
-        : "Compaction started. AI will summarize the conversation.",
-    });
-
-    // Clear editing state on success
-    if (editMessageId && onCancelEdit) {
-      onCancelEdit();
-    }
-
-    return { clearInput: true, toastShown: true };
-  } catch (error) {
-    console.error("Compaction error:", error);
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      message: error instanceof Error ? error.message : "Failed to start compaction",
-    });
-    return { clearInput: false, toastShown: true };
-  } finally {
-    setSendingState(false);
-  }
+  });
 }
 
-// ============================================================================
-// Plan Command Handlers
-// ============================================================================
-
-export async function handlePlanShowCommand(
-  context: CommandHandlerContext
-): Promise<CommandHandlerResult> {
-  const { api, workspaceId, setInput, setToast } = context;
-
-  setInput("");
-
-  const result = await api.workspace.getPlanContent({ workspaceId });
-  if (!result.success) {
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      message: "No plan found for this workspace",
-    });
-    return { clearInput: true, toastShown: true };
-  }
-
-  // Keep the ephemeral preview a singleton so repeated /plan show calls replace it instead of
-  // accumulating permanent-looking cards at the transcript bottom.
-  const planMessage = {
-    id: "plan-display-preview",
-    role: "assistant" as const,
-    parts: [{ type: "text" as const, text: result.data.content }],
-    metadata: {
-      historySequence: Number.MAX_SAFE_INTEGER, // Appear at end of chat
-      muxMetadata: { type: "plan-display" as const, path: result.data.path },
-    },
-  };
-  addEphemeralMessage(workspaceId, planMessage);
-
-  trackCommandUsed("plan");
-  return { clearInput: true, toastShown: false };
+function handlePlanShowCommand(env: WorkspaceCommandEnv): CommandResult {
+  return phase([{ type: "clear-input" }], async () => {
+    try {
+      const result = await env.api.workspace.getPlanContent({ workspaceId: env.workspaceId });
+      if (!result.success) {
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: "No plan found for this workspace",
+          }),
+        ]);
+      }
+      addEphemeralMessage(env.workspaceId, {
+        id: "plan-display-preview",
+        role: "assistant" as const,
+        parts: [{ type: "text" as const, text: result.data.content }],
+        metadata: {
+          historySequence: Number.MAX_SAFE_INTEGER,
+          muxMetadata: { type: "plan-display" as const, path: result.data.path },
+        },
+      });
+      trackCommandUsed("plan");
+      return complete("consume");
+    } catch (error) {
+      return complete("restore", [
+        showToast({
+          id: Date.now().toString(),
+          type: "error",
+          message: error instanceof Error ? error.message : "Failed to show plan",
+        }),
+      ]);
+    }
+  });
 }
 
-export async function handlePlanOpenCommand(
-  context: CommandHandlerContext
-): Promise<CommandHandlerResult> {
-  const { api, workspaceId, setInput, setToast } = context;
-
-  setInput("");
-
-  // First get the plan path
-  const planResult = await api.workspace.getPlanContent({ workspaceId });
-  if (!planResult.success) {
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      message: "No plan found for this workspace",
-    });
-    return { clearInput: true, toastShown: true };
-  }
-
-  const workspaceInfo = await api.workspace.getInfo({ workspaceId });
-  const openResult = await openInEditor({
-    api,
-    workspaceId,
-    targetPath: planResult.data.path,
-    runtimeConfig: workspaceInfo?.runtimeConfig,
-    isFile: true,
+function handlePlanOpenCommand(env: WorkspaceCommandEnv): CommandResult {
+  return phase([{ type: "clear-input" }], async () => {
+    try {
+      const planResult = await env.api.workspace.getPlanContent({ workspaceId: env.workspaceId });
+      if (!planResult.success) {
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: "No plan found for this workspace",
+          }),
+        ]);
+      }
+      const workspaceInfo = await env.api.workspace.getInfo({ workspaceId: env.workspaceId });
+      const openResult = await openInEditor({
+        api: env.api,
+        workspaceId: env.workspaceId,
+        targetPath: planResult.data.path,
+        runtimeConfig: workspaceInfo?.runtimeConfig,
+        isFile: true,
+      });
+      if (!openResult.success) {
+        return complete("consume", [
+          showToast({
+            id: Date.now().toString(),
+            type: "error",
+            message: openResult.error ?? "Failed to open editor",
+          }),
+        ]);
+      }
+      trackCommandUsed("plan");
+      return complete("consume", [
+        showToast({
+          id: Date.now().toString(),
+          type: "success",
+          message: "Opened plan in editor",
+        }),
+      ]);
+    } catch (error) {
+      return complete("restore", [
+        showToast({
+          id: Date.now().toString(),
+          type: "error",
+          message: error instanceof Error ? error.message : "Failed to open plan",
+        }),
+      ]);
+    }
   });
-
-  if (!openResult.success) {
-    setToast({
-      id: Date.now().toString(),
-      type: "error",
-      message: openResult.error ?? "Failed to open editor",
-    });
-    return { clearInput: true, toastShown: true };
-  }
-
-  trackCommandUsed("plan");
-  setToast({
-    id: Date.now().toString(),
-    type: "success",
-    message: "Opened plan in editor",
-  });
-  return { clearInput: true, toastShown: true };
 }
 
 // ============================================================================

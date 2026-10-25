@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Smoke test for the canonical @coder/shux npm package and legacy mux binary alias.
+# Smoke test for the canonical @coder/xum npm package and legacy mux binary alias.
 # Tests that the package can be installed and the server starts correctly.
 
 set -euo pipefail
@@ -43,11 +43,6 @@ cleanup() {
     rm -rf "$TEST_DIR"
   fi
 
-  # Remove repack directory (created when SKIP_SHRINKWRAP=1)
-  if [[ -n "${REPACK_DIR:-}" ]] && [[ -d "$REPACK_DIR" ]]; then
-    rm -rf "$REPACK_DIR"
-  fi
-
   if [[ $exit_code -eq 0 ]]; then
     log_info "✅ Smoke test completed successfully"
   else
@@ -66,7 +61,7 @@ SERVER_HOST="${SERVER_HOST:-localhost}"
 STARTUP_TIMEOUT="${STARTUP_TIMEOUT:-30}"
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-10}"
 AUTH_TOKEN="smoke-test-token-$(date +%s)"
-# When set to "1", strip npm-shrinkwrap.json from the package before installing.
+# When set to "1", install without npm-shrinkwrap.json, resolving every dependency afresh.
 # This simulates package managers like `bun x` that ignore shrinkwrap, catching
 # dependency resolution issues that the lockfile would otherwise mask.
 SKIP_SHRINKWRAP="${SKIP_SHRINKWRAP:-0}"
@@ -94,58 +89,59 @@ log_info "Created test directory: $TEST_DIR"
 
 cd "$TEST_DIR"
 
-# Initialize a minimal package.json to avoid npm warnings
-cat >package.json <<EOF
-{
-  "name": "shux-smoke-test",
-  "version": "1.0.0",
-  "private": true
-}
-EOF
-
-# Optionally strip shrinkwrap to simulate `bun x` / lockfile-free resolution.
-# When a user runs `bun x @coder/shux@latest`, bun ignores npm-shrinkwrap.json and resolves
-# dependencies from scratch. This can resolve to different (potentially broken) versions
-# than what the shrinkwrap locks to. Testing without shrinkwrap catches these mismatches.
-if [[ "$SKIP_SHRINKWRAP" == "1" ]]; then
-  log_warning "SKIP_SHRINKWRAP=1: stripping npm-shrinkwrap.json from package (simulating bun x)"
-  REPACK_DIR=$(mktemp -d)
-  tar -xzf "$PACKAGE_TARBALL" -C "$REPACK_DIR"
-  if [[ -f "$REPACK_DIR/package/npm-shrinkwrap.json" ]]; then
-    rm "$REPACK_DIR/package/npm-shrinkwrap.json"
-    log_info "Removed npm-shrinkwrap.json from package"
-  else
-    log_warning "No npm-shrinkwrap.json found in package (nothing to strip)"
-  fi
-  STRIPPED_TARBALL="$REPACK_DIR/shux-no-shrinkwrap.tgz"
-  tar -czf "$STRIPPED_TARBALL" -C "$REPACK_DIR" package
-  PACKAGE_TARBALL="$STRIPPED_TARBALL"
-  log_info "Repacked tarball without shrinkwrap: $PACKAGE_TARBALL"
-fi
-
-# Publish waves (e.g. AWS SDK) can transiently request sibling versions not yet visible on the registry.
+# npm ignores the shrinkwrap of a tarball file, so `npm install <tarball>` would resolve every
+# dependency afresh. By default, install the way npm installs the published package from the
+# registry: exactly its npm-shrinkwrap.json, nested under node_modules/@coder/xum. `npm ci` fails
+# if the shrinkwrap leaves anything to resolve.
 log_info "Installing package..."
-if ! "$SCRIPT_DIR/retry.sh" 5 60 npm install --no-save "$PACKAGE_TARBALL"; then
-  log_error "Failed to install package"
-  exit 1
+if [[ "$SKIP_SHRINKWRAP" == "1" ]]; then
+  log_warning "SKIP_SHRINKWRAP=1: resolving dependencies without npm-shrinkwrap.json (simulating bun x)"
+  echo '{"name":"xum-smoke-test","version":"1.0.0","private":true}' >package.json
+  # Publish waves (e.g. AWS SDK) can transiently request sibling versions not yet visible on the registry.
+  if ! "$SCRIPT_DIR/retry.sh" 5 60 npm install --no-save "$PACKAGE_TARBALL"; then
+    log_error "Failed to install package"
+    exit 1
+  fi
+else
+  bun "$SCRIPT_DIR/generate-npm-shrinkwrap.ts" --tarball-install "$TEST_DIR" "$PACKAGE_TARBALL"
+  if ! "$SCRIPT_DIR/retry.sh" 3 30 npm ci --no-audit --no-fund; then
+    log_error "Failed to install package from its npm-shrinkwrap.json"
+    exit 1
+  fi
 fi
 
 log_info "✅ Package installed successfully"
 
+# Bun-managed servers stage updates by installing the downloaded tarball with this command
+# (installCommand in src/node/services/serverUpdate/staging.ts), and bun honors manifest fields npm
+# ignores. bun also ignores npm-shrinkwrap.json, so the no-shrinkwrap pass would only repeat this.
+if [[ "$SKIP_SHRINKWRAP" != "1" ]]; then
+  log_info "Installing package with bun like the server updater..."
+  BUN_INSTALL_DIR="$TEST_DIR/bun-install"
+  mkdir "$BUN_INSTALL_DIR"
+  echo '{"private":true}' >"$BUN_INSTALL_DIR/package.json"
+  if ! (cd "$BUN_INSTALL_DIR" && "$SCRIPT_DIR/retry.sh" 5 60 bun add --ignore-scripts --save-text-lockfile \
+    "$PACKAGE_TARBALL" --registry "${npm_config_registry:-https://registry.npmjs.org}"); then
+    log_error "bun failed to install the package the way the server updater does"
+    exit 1
+  fi
+  log_info "✅ Package installed with bun"
+fi
+
 # Verify both the canonical binary and downgrade-compatible alias are available.
-for binary in shux mux; do
+for binary in xum mux; do
   if [[ ! -f "node_modules/.bin/$binary" ]]; then
     log_error "$binary binary not found in node_modules/.bin/"
     exit 1
   fi
 done
 
-log_info "✅ shux and mux binaries found"
+log_info "✅ xum and mux binaries found"
 
 # Test the canonical command and the legacy alias against the same ESM bundle.
-log_info "Testing shux api subcommand and mux compatibility alias..."
-if ! node_modules/.bin/shux api --help >/dev/null 2>&1; then
-  log_error "shux api --help failed - ESM bundle (api.mjs) may be missing from package"
+log_info "Testing xum api subcommand and mux compatibility alias..."
+if ! node_modules/.bin/xum api --help >/dev/null 2>&1; then
+  log_error "xum api --help failed - ESM bundle (api.mjs) may be missing from package"
   exit 1
 fi
 if ! node_modules/.bin/mux --help >/dev/null 2>&1; then
@@ -156,8 +152,8 @@ fi
 log_info "✅ canonical and legacy CLI entry points work"
 
 # Start the server in background
-log_info "Starting shux server on $SERVER_HOST:$SERVER_PORT..."
-node_modules/.bin/shux server --host "$SERVER_HOST" --port "$SERVER_PORT" --auth-token "$AUTH_TOKEN" >server.log 2>&1 &
+log_info "Starting xum server on $SERVER_HOST:$SERVER_PORT..."
+node_modules/.bin/xum server --host "$SERVER_HOST" --port "$SERVER_PORT" --auth-token "$AUTH_TOKEN" >server.log 2>&1 &
 SERVER_PID=$!
 
 log_info "Server started with PID: $SERVER_PID"
@@ -233,22 +229,24 @@ touch "$PROJECT_DIR/README.md"
 git -C "$PROJECT_DIR" add .
 git -C "$PROJECT_DIR" commit -m "Initial commit" >/dev/null 2>&1
 
-# Run oRPC tests via Node.js using the installed shux package's dependencies.
-# The shux package includes @orpc/client which we can use.
-node -e "
+# Run oRPC tests via Node.js using the installed xum package's dependencies, resolved from the
+# package's folder because npm nests them there. The xum package includes @orpc/client.
+(cd node_modules/@coder/xum && node -e "
 const { RPCLink } = require('@orpc/client/fetch');
 const { createORPCClient } = require('@orpc/client');
 const WebSocket = require('ws');
 
-const ORPC_URL = 'http://${SERVER_HOST}:${SERVER_PORT}/orpc';
+const ORPC_ORIGIN = 'http://${SERVER_HOST}:${SERVER_PORT}';
 const WS_URL = 'ws://${SERVER_HOST}:${SERVER_PORT}/orpc/ws';
 const PROJECT_DIR = '$PROJECT_DIR';
 
 async function runTests() {
   // Test 1: HTTP oRPC client - create project
   console.log('Testing oRPC project creation via HTTP...');
+  // oRPC >=1.14 splits the request URL into origin + path-only url.
   const httpLink = new RPCLink({
-    url: ORPC_URL,
+    origin: ORPC_ORIGIN,
+    url: '/orpc',
     headers: { 'Authorization': 'Bearer ${AUTH_TOKEN}' }
   });
   const client = createORPCClient(httpLink);
@@ -304,7 +302,7 @@ runTests().catch(err => {
   console.error('oRPC test failed:', err.message);
   process.exit(1);
 });
-" 2>&1
+") 2>&1
 
 ORPC_EXIT_CODE=$?
 if [[ $ORPC_EXIT_CODE -ne 0 ]]; then

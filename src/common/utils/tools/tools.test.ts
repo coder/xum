@@ -1,15 +1,25 @@
 /* eslint-disable @typescript-eslint/require-await */
+import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
+import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import { describe, expect, mock, test } from "bun:test";
+import { asSchema, generateText, type Tool } from "ai";
+import { createGoogleGenerativeAI } from "@ai-sdk/google";
+import { createVertex } from "@ai-sdk/google-vertex";
 import { z } from "zod";
+import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
 
 import { Ok } from "@/common/types/result";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { createTestComputerUseService } from "@/node/services/computerUse/computerUseTestFixtures";
 import {
   getForcedXaiSearchToolNames,
   getToolsForModel,
   supportsAnthropicNativeWebFetch,
+  supportsAnthropicToolSearch,
   type ToolConfiguration,
   type WorkspaceHeartbeatToolService,
 } from "./tools";
@@ -72,6 +82,11 @@ describe("supportsAnthropicNativeWebFetch", () => {
     ["claude-fable-5", true],
     ["claude-mythos-5", true],
     // Two-segment IDs at/after the 4.6 cutoff.
+    ["claude-fable-5-1", true],
+    ["claude-mythos-5-1", true],
+    ["claude-opus-5-5", true],
+    ["claude-sonnet-5-5", true],
+    ["claude-haiku-5-5", true],
     ["claude-sonnet-4-6", true],
     ["claude-opus-4-6", true],
     ["claude-opus-4-8", true],
@@ -91,7 +106,55 @@ describe("supportsAnthropicNativeWebFetch", () => {
   });
 });
 
+describe("supportsAnthropicToolSearch", () => {
+  test.each([
+    ["claude-haiku-4-5-20251001", true],
+    ["claude-sonnet-4-5", true],
+    ["claude-opus-4-5-20251101", true],
+    ["claude-opus-5-5", true],
+    ["claude-fable-5", true],
+    ["claude-opus-4-1", false],
+    ["claude-sonnet-4-20250514", false],
+    ["claude-3-7-sonnet-20250219", false],
+  ] as const)("%s -> %s", (modelId, expected) => {
+    expect(supportsAnthropicToolSearch(modelId)).toBe(expected);
+  });
+});
+
 describe("getToolsForModel", () => {
+  // A shared advisor cannot be the right stronger model for both Haiku and Astra chats;
+  // configuring that relationship adds too much UX burden. Legacy state must not revive it.
+  test("ignores a legacy advisor runtime instead of registering a callable tool", async () => {
+    const createModel = mock(() => Promise.reject(new Error("retired tool must not run")));
+    // Callers from an older session may still supply extra runtime fields. They must not
+    // resurrect the removed tool, while ordinary tools remain available.
+    const legacyRuntime = {
+      advisorRuntime: {
+        advisorModelString: "openai:gpt-5.2",
+        maxUsesPerTurn: 3,
+        getTranscriptSnapshot: () => [],
+        takeToolCallSnapshot: () => undefined,
+        createModel,
+        abortSignal: new AbortController().signal,
+      },
+    };
+    const tools = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime: new LocalRuntime(process.cwd()),
+        runtimeTempDir: "/tmp",
+        ...legacyRuntime,
+      },
+      "ws-1",
+      createInitStateManager()
+    );
+
+    expect(tools.advisor).toBeUndefined();
+    expect(tools.bash.execute).toBeFunction();
+    expect(createModel).not.toHaveBeenCalled();
+  });
+
   test("only includes agent_report when enableAgentReport=true", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
@@ -123,7 +186,43 @@ describe("getToolsForModel", () => {
     expect(toolsWithReport.agent_report).toBeDefined();
   });
 
-  test("includes heartbeat only when the heartbeat service and experiment are configured", async () => {
+  test("only includes family messaging tools when enableFamilyMessaging=true", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const initStateManager = createInitStateManager();
+
+    // A plain sub-agent session (agent_report on, no RLM spawn stamp) must not see
+    // the family messaging tools.
+    const toolsWithout = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        enableAgentReport: true,
+      },
+      "ws-1",
+      initStateManager
+    );
+    expect(toolsWithout.task_message_parent).toBeUndefined();
+    expect(toolsWithout.task_message_sibling).toBeUndefined();
+
+    const toolsWith = await getToolsForModel(
+      "noop:model",
+      {
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        enableAgentReport: true,
+        enableFamilyMessaging: true,
+      },
+      "ws-1",
+      initStateManager
+    );
+    expect(toolsWith.task_message_parent).toBeDefined();
+    expect(toolsWith.task_message_sibling).toBeDefined();
+  });
+
+  test("includes heartbeat only for top-level workspaces with a heartbeat service", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
 
@@ -134,7 +233,6 @@ describe("getToolsForModel", () => {
         runtime,
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
-        experiments: { workspaceHeartbeats: true },
       },
       "ws-1",
       initStateManager
@@ -150,20 +248,6 @@ describe("getToolsForModel", () => {
       ),
       unsetHeartbeatSettings: mock(() => Promise.resolve(Ok(undefined))),
     };
-    const toolsWithExperimentDisabled = await getToolsForModel(
-      "noop:model",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-        workspaceHeartbeatService: heartbeatService,
-      },
-      "ws-1",
-      initStateManager
-    );
-    expect(toolsWithExperimentDisabled.heartbeat).toBeUndefined();
-
     const toolsWithHeartbeat = await getToolsForModel(
       "noop:model",
       {
@@ -171,7 +255,6 @@ describe("getToolsForModel", () => {
         runtime,
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
-        experiments: { workspaceHeartbeats: true },
         workspaceHeartbeatService: heartbeatService,
       },
       "ws-1",
@@ -185,7 +268,6 @@ describe("getToolsForModel", () => {
         runtimeTempDir: "/tmp",
         workspaceId: "child-ws",
         enableAgentReport: true,
-        experiments: { workspaceHeartbeats: true },
         workspaceHeartbeatService: heartbeatService,
       },
       "child-ws",
@@ -195,44 +277,103 @@ describe("getToolsForModel", () => {
     expect(toolsWithHeartbeat.heartbeat).toBeDefined();
   });
 
-  test("only includes set_goal when goal service and setGoal gate are enabled", async () => {
+  // #5247: goal tool registration and definitions must not depend on per-turn
+  // state, or the provider prompt cache misses. Handlers gate at execution time.
+  test("registers identical goal tools whenever a goal service exists", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
     // Registration-only test; goal tools capture the service but never execute it here.
     // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
     const goalService = {} as never;
+    const goalToolContexts: GoalToolContext[] = [
+      { parentWorkspaceId: null, agentId: "exec" },
+      { parentWorkspaceId: "parent", agentId: "exec" },
+      { parentWorkspaceId: null, agentId: "explore" },
+      { parentWorkspaceId: null, agentId: "exec", goalTurnKind: GOAL_CONTINUATION_KIND },
+    ];
 
-    const disabled = await getToolsForModel(
+    const serialized: string[] = [];
+    for (const goalToolContext of goalToolContexts) {
+      const tools = await getToolsForModel(
+        "noop:model",
+        {
+          cwd: process.cwd(),
+          runtime,
+          runtimeTempDir: "/tmp",
+          workspaceId: "ws-1",
+          goalService,
+          goalToolContext,
+        },
+        "ws-1",
+        initStateManager
+      );
+      serialized.push(
+        JSON.stringify(
+          (["set_goal", "get_goal", "complete_goal"] as const).map((name) => ({
+            name,
+            description: tools[name]?.description,
+            inputSchema: tools[name] ? asSchema(tools[name].inputSchema).jsonSchema : null,
+          }))
+        )
+      );
+    }
+    expect(serialized[0]).not.toContain('"inputSchema":null');
+    expect(new Set(serialized).size).toBe(1);
+
+    const withoutGoalService = await getToolsForModel(
       "noop:model",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-        goalService,
-        enableGoalTools: { setGoal: false, getGoal: true, completeGoal: true },
-      },
+      { cwd: process.cwd(), runtime, runtimeTempDir: "/tmp", workspaceId: "ws-1" },
       "ws-1",
       initStateManager
     );
-    expect(disabled.set_goal).toBeUndefined();
-    expect(disabled.get_goal).toBeDefined();
-    expect(disabled.complete_goal).toBeDefined();
+    expect(withoutGoalService.set_goal).toBeUndefined();
+    expect(withoutGoalService.get_goal).toBeUndefined();
+    expect(withoutGoalService.complete_goal).toBeUndefined();
+  });
 
-    const enabled = await getToolsForModel(
-      "noop:model",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-        goalService,
-        enableGoalTools: { setGoal: true, getGoal: true, completeGoal: true },
-      },
-      "ws-1",
-      initStateManager
-    );
-    expect(enabled.set_goal).toBeDefined();
+  test("registers an identical new_context whether or not rollover is available", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const initStateManager = createInitStateManager();
+    const build = (config: Partial<ToolConfiguration>) =>
+      getToolsForModel(
+        "noop:model",
+        {
+          cwd: process.cwd(),
+          runtime,
+          runtimeTempDir: "/tmp",
+          workspaceId: "ws-1",
+          // session_history ships with new_context; it only needs the service handle here.
+          // eslint-disable-next-line @typescript-eslint/consistent-type-assertions
+          historyService: {} as never,
+          experiments: { tokenBudget: true },
+          ...config,
+        },
+        "ws-1",
+        initStateManager
+      );
+    // Auto-compaction at 100% disables rollover. That is a settings edit during the
+    // workspace's life, so it must not change the tool block (prompt cache, #5249).
+    const serialized: string[] = [];
+    for (const contextBudgetRolloverAvailable of [true, false, undefined]) {
+      const tools = await build({ contextBudgetRolloverAvailable });
+      expect(tools.new_context).toBeDefined();
+      serialized.push(
+        JSON.stringify(
+          Object.entries(tools).map(([name, tool]) => ({
+            name,
+            description: tool.description,
+            inputSchema: asSchema(tool.inputSchema).jsonSchema,
+          }))
+        )
+      );
+    }
+    expect(new Set(serialized).size).toBe(1);
+
+    // Experiment combinations that replace rollover still withhold the tool.
+    const continuous = await build({
+      experiments: { tokenBudget: true, continuousCompaction: true },
+    });
+    expect(continuous.new_context).toBeUndefined();
   });
 
   test("withholds review_pane_* tools from sub-agents (enableAgentReport=true)", async () => {
@@ -270,41 +411,50 @@ describe("getToolsForModel", () => {
     expect(subAgentTools.review_pane_get).toBeUndefined();
   });
 
-  test("only includes workflow tools when dynamic workflows service and experiment are enabled", async () => {
+  test("withholds repository tools from scratch chats", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const build = (scratchWorkspace: boolean) =>
+      getToolsForModel(
+        "noop:model",
+        { cwd: process.cwd(), runtime, runtimeTempDir: "/tmp", scratchWorkspace },
+        "ws-1",
+        createInitStateManager()
+      );
+    const repositoryTools = ["review_pane_update", "review_pane_get", "task_apply_git_patch"];
+
+    const project = Object.keys(await build(false));
+    const scratch = Object.keys(await build(true));
+
+    expect(repositoryTools.filter((name) => !project.includes(name))).toEqual([]);
+    expect(scratch.filter((name) => repositoryTools.includes(name))).toEqual([]);
+    expect(scratch).toContain("task");
+  });
+
+  test("only includes workflow tools when the workflow service is available", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
 
-    const withoutExperiment = await getToolsForModel(
+    const withoutService = await getToolsForModel(
       "noop:model",
       {
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
-        workflowService: {
-          startWorkflow: mock(async () => ({
-            runId: "wfr_1",
-            status: "completed" as const,
-            result: null,
-          })),
-        },
       },
       "ws-1",
       initStateManager
     );
-    expect(withoutExperiment.workflow_list).toBeUndefined();
-    expect(withoutExperiment.workflow_read).toBeUndefined();
-    expect(withoutExperiment.workflow_run).toBeUndefined();
-    expect(withoutExperiment.workflow_resume).toBeUndefined();
+    expect(withoutService.workflow_run).toBeUndefined();
+    expect(withoutService.workflow_resume).toBeUndefined();
 
-    const withExperiment = await getToolsForModel(
+    const withService = await getToolsForModel(
       "noop:model",
       {
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
-        experiments: { dynamicWorkflows: true },
         workflowService: {
           startWorkflow: mock(async () => ({
             runId: "wfr_1",
@@ -316,10 +466,10 @@ describe("getToolsForModel", () => {
       "ws-1",
       initStateManager
     );
-    expect(withExperiment.workflow_list).toBeUndefined();
-    expect(withExperiment.workflow_read).toBeUndefined();
-    expect(withExperiment.workflow_run).toBeDefined();
-    expect(withExperiment.workflow_resume).toBeDefined();
+    expect(withService.workflow_list).toBeUndefined();
+    expect(withService.workflow_read).toBeUndefined();
+    expect(withService.workflow_run).toBeDefined();
+    expect(withService.workflow_resume).toBeDefined();
   });
 
   test("includes desktop tools when workspace capability is available", async () => {
@@ -391,65 +541,115 @@ describe("getToolsForModel", () => {
     expect(Object.keys(tools).filter((toolName) => toolName.startsWith("desktop_"))).toEqual([]);
   });
 
-  test("adds native Google Search and URL Context only for Gemini 3 models", async () => {
+  test("includes the computer tool only for the owner, bound to its own stream's grant", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
+    const { service: computerUseService } = createTestComputerUseService();
+    await computerUseService.setEnabled("a", true);
 
-    const gemini25Tools = await getToolsForModel(
-      "google:gemini-2.5-pro",
+    const toolsFor = (workspaceId: string) =>
+      getToolsForModel(
+        "noop:model",
+        {
+          cwd: process.cwd(),
+          runtime,
+          runtimeTempDir: "/tmp",
+          workspaceId,
+          computerUseService,
+        },
+        workspaceId,
+        initStateManager
+      );
+
+    // Each call is its own model response, so the one-action-per-response guard stays out of the way.
+    const run = (tool: Tool, action: string) =>
+      tool.execute!(
+        { action },
+        { toolCallId: "call", messages: [], context: undefined }
+      ) as Promise<{
+        error?: string;
+      }>;
+    const streamTool = (await toolsFor("a")).computer;
+    expect(streamTool).toBeDefined();
+    expect((await toolsFor("b")).computer).toBeUndefined();
+
+    // The next stream's model never saw this stream's screenshot.
+    await run(streamTool, "screenshot");
+    const nextStreamTool = (await toolsFor("a")).computer;
+    expect((await run(nextStreamTool, "cursor_position")).error).toMatch(/Take a screenshot first/);
+    expect((await run(streamTool, "cursor_position")).error).toBeUndefined();
+
+    // A stream keeps the grant it started with, so turning computer use back on does not revive it.
+    await computerUseService.setEnabled("a", false);
+    await computerUseService.setEnabled("a", true);
+    expect((await run(streamTool, "screenshot")).error).toMatch(/turned off by the user/);
+  });
+
+  // Gemini's built-in googleSearch tool (which needs includeServerSideToolInvocations) broke
+  // its implicit caching, so Gemini requests carry function tools only.
+  test.each([
+    { provider: "google", modelId: "gemini-4-argon" },
+    { provider: "google", modelId: "gemini-3.8-flash" },
+    { provider: "google-vertex", modelId: "gemini-4-argon" },
+    { provider: "google-vertex", modelId: "gemini-3.8-flash" },
+  ])("sends $provider:$modelId only function tools", async ({ provider, modelId }) => {
+    const tools = await getToolsForModel(
+      `${provider}:${modelId}`,
       {
         cwd: process.cwd(),
-        runtime,
+        runtime: new LocalRuntime(process.cwd()),
         runtimeTempDir: "/tmp",
         workspaceId: "ws-1",
       },
       "ws-1",
-      initStateManager
-    );
-    expect(gemini25Tools.google_search).toBeUndefined();
-    expect(gemini25Tools.url_context).toBeUndefined();
-
-    const gemini4Tools = await getToolsForModel(
-      "google:gemini-4-pro",
+      createInitStateManager(),
+      undefined,
       {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
+        github_list_issues: {
+          description: "List issues",
+          inputSchema: z.object({}),
+          execute: mock(() => Promise.resolve({})),
+        },
+      }
     );
-    expect(gemini4Tools.google_search).toBeUndefined();
-    expect(gemini4Tools.url_context).toBeUndefined();
+    const providerTools = Object.entries(tools).filter(([, tool]) => tool.type === "provider");
+    expect(providerTools.map(([name]) => name)).toEqual([]);
 
-    const gemini35Tools = await getToolsForModel(
-      "google:gemini-3.5-flash",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
-    );
-    const namespacedGemini35Tools = await getToolsForModel(
-      "google:models/gemini-3.5-flash",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-        workspaceId: "ws-1",
-      },
-      "ws-1",
-      initStateManager
-    );
-    expect(namespacedGemini35Tools.google_search).toBeDefined();
-    expect(namespacedGemini35Tools.url_context).toBeDefined();
+    interface GeminiRequestBody {
+      tools?: Array<{ functionDeclarations?: Array<{ name: string }> }>;
+      toolConfig?: { includeServerSideToolInvocations?: boolean };
+    }
+    let body: GeminiRequestBody = {};
+    const fakeFetchImpl = (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (typeof init?.body !== "string") {
+        throw new Error("Expected a JSON string request body");
+      }
+      body = JSON.parse(init.body) as GeminiRequestBody;
+      const reply = {
+        candidates: [{ content: { role: "model", parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+      };
+      return Promise.resolve(Response.json(reply));
+    };
+    // Keep Bun's fetch extensions (preconnect) that `typeof fetch` expects.
+    const fakeFetch = Object.assign(fakeFetchImpl, fetch) as typeof fetch;
+    const model =
+      provider === "google"
+        ? createGoogleGenerativeAI({ apiKey: "test-key", fetch: fakeFetch })(modelId)
+        : createVertex({ apiKey: "test-key", fetch: fakeFetch })(modelId);
 
-    expect(gemini35Tools.google_search).toBeDefined();
-    expect(gemini35Tools.url_context).toBeDefined();
+    await generateText({ model, prompt: "hello", tools, maxRetries: 0 });
+
+    const sentTools = body.tools ?? [];
+    expect(sentTools.flatMap((entry) => Object.keys(entry))).toEqual(["functionDeclarations"]);
+    expect(body.toolConfig?.includeServerSideToolInvocations).toBeUndefined();
+    // Every tool Xum built reaches Gemini as a function, MCP tools and the client web_fetch included.
+    const declaredNames = sentTools
+      .flatMap((entry) => entry.functionDeclarations ?? [])
+      .map((declaration) => declaration.name);
+    expect(declaredNames.sort()).toEqual(Object.keys(tools).sort());
+    for (const name of ["bash", "file_read", "web_fetch", "github_list_issues"]) {
+      expect(declaredNames).toContain(name);
+    }
   });
 
   test("adds xAI native web and X search tools for Grok 4.5", async () => {
@@ -773,5 +973,119 @@ describe("getToolsForModel", () => {
     );
 
     expect(tools.web_fetch).toBeDefined();
+  });
+
+  // #5840: provider-native fetch runs on the provider, past tool hooks. Where hooks can run
+  // (trusted projects), fetch must go through the hook-wrapped client web_fetch.
+  describe("tool hooks gate web fetch", () => {
+    const BLOCKED_URL = "http://127.0.0.1:9/";
+    interface FetchResult {
+      success?: boolean;
+      error?: string;
+    }
+
+    async function withProject(run: (dir: string) => Promise<void>) {
+      const dir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-tools-hook-"));
+      try {
+        await fs.mkdir(path.join(dir, ".xum"), { recursive: true });
+        await run(dir);
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    }
+
+    async function writePreHook(dir: string, script: string) {
+      const hookPath = path.join(dir, ".xum", "tool_pre");
+      await fs.writeFile(hookPath, `#!/bin/bash\n${script}\n`);
+      await fs.chmod(hookPath, 0o755);
+    }
+
+    const toolsFor = (model: string, dir: string, trusted: boolean) =>
+      getToolsForModel(
+        model,
+        {
+          cwd: dir,
+          runtime: new LocalRuntime(dir),
+          runtimeTempDir: dir,
+          workspaceId: "ws-1",
+          trusted,
+        },
+        "ws-1",
+        createInitStateManager()
+      );
+
+    async function fetchWith(tool: Tool | undefined): Promise<FetchResult> {
+      if (tool?.execute == null) throw new Error("Expected the client web_fetch tool");
+      return (await tool.execute(
+        { url: BLOCKED_URL },
+        { toolCallId: "call-1", messages: [], context: undefined }
+      )) as FetchResult;
+    }
+
+    test("a blocking tool_pre hook denies Claude 4.6+ and Gemini fetches", async () => {
+      await withProject(async (dir) => {
+        await writePreHook(dir, 'echo "egress blocked" >&2\nexit 1');
+        for (const model of [
+          "anthropic:claude-sonnet-5-5",
+          "anthropic:claude-haiku-5-5",
+          "google:gemini-4-argon",
+        ]) {
+          const result = await fetchWith((await toolsFor(model, dir, true)).web_fetch);
+          expect({ model, error: result.error }).toEqual({ model, error: "egress blocked" });
+        }
+      });
+    });
+
+    test("an allowing tool_pre hook lets the fetch run", async () => {
+      await withProject(async (dir) => {
+        await writePreHook(dir, "exit 0");
+        const tools = await toolsFor("anthropic:claude-sonnet-5-5", dir, true);
+        // The client tool itself ran: it refuses loopback targets after the hook allowed it.
+        expect((await fetchWith(tools.web_fetch)).error).toContain("Blocked URL");
+      });
+    });
+
+    test("a hook added between two invocations gates the second", async () => {
+      await withProject(async (dir) => {
+        const tools = await toolsFor("anthropic:claude-sonnet-5-5", dir, true);
+        expect((await fetchWith(tools.web_fetch)).error).toContain("Blocked URL");
+        await writePreHook(dir, 'echo "egress blocked" >&2\nexit 1');
+        expect((await fetchWith(tools.web_fetch)).error).toBe("egress blocked");
+      });
+    });
+
+    test("a route that cannot run native fetch gets the client web_fetch (#2922)", async () => {
+      await withProject(async (dir) => {
+        const tools = await getToolsForModel(
+          "anthropic:claude-opus-4-6",
+          {
+            cwd: dir,
+            runtime: new LocalRuntime(dir),
+            runtimeTempDir: dir,
+            workspaceId: "ws-1",
+            trusted: false,
+            anthropicNativeWebFetchEnabled: false,
+          },
+          "ws-1",
+          createInitStateManager()
+        );
+        // Xum's own fetch tool runs locally; native web search stays (proxies accept it).
+        expect((await fetchWith(tools.web_fetch)).error).toContain("Blocked URL");
+        expect(tools.web_search).toMatchObject({ type: "provider" });
+      });
+    });
+
+    test("untrusted projects keep the provider-native fetch tools", async () => {
+      await withProject(async (dir) => {
+        // Hooks never run in untrusted projects, so a hook file changes nothing.
+        await writePreHook(dir, 'echo "egress blocked" >&2\nexit 1');
+        for (const model of ["anthropic:claude-sonnet-5-5", "anthropic:claude-haiku-5-5"]) {
+          expect((await toolsFor(model, dir, false)).web_fetch).toMatchObject({
+            type: "provider",
+            id: "anthropic.web_fetch_20250910",
+          });
+        }
+      });
+    });
   });
 });

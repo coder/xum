@@ -9,10 +9,12 @@ import {
   getWorkspacePathHintForProject,
   getWorkspaceProjectRepos,
 } from "@/node/services/workspaceProjectRepos";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 describe("getWorkspaceProjectRepos", () => {
   it("treats an empty project list as a single-project fallback", () => {
     const repos = getWorkspaceProjectRepos({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: "workspace-1",
       workspaceName: "main",
       workspacePath: "/tmp/workspaces/main",
@@ -34,6 +36,7 @@ describe("getWorkspaceProjectRepos", () => {
 
   it("sanitizes storage keys derived from malformed project names", () => {
     const repos = getWorkspaceProjectRepos({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: "workspace-1",
       workspaceName: "main",
       workspacePath: "/tmp/workspaces/main",
@@ -59,6 +62,7 @@ describe("getWorkspaceProjectRepos", () => {
       workspaceName
     );
     const repos = getWorkspaceProjectRepos({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: "workspace-1",
       workspaceName,
       workspacePath,
@@ -84,6 +88,7 @@ describe("getWorkspaceProjectRepos", () => {
     const primaryProjectPath = "/tmp/projects/main";
     const secondaryProjectPath = "/tmp/projects/other";
     const repos = getWorkspaceProjectRepos({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: "workspace-1",
       workspaceName,
       workspacePath: "/tmp/legacy/main",
@@ -167,6 +172,7 @@ describe("getWorkspaceProjectRepos", () => {
 
   it("disambiguates storage keys when sanitized project names collide", () => {
     const repos = getWorkspaceProjectRepos({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: "workspace-1",
       workspaceName: "main",
       workspacePath: "/tmp/workspaces/main",

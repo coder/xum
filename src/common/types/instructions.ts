@@ -4,7 +4,7 @@
  *
  * These types are inferred from the Zod schemas in
  * `@/common/orpc/schemas/instructions` so the IPC payload and the internal
- * data structure used by `buildSystemMessage` cannot drift — adding a field
+ * data structure used by `buildSystemMessageFromSources` cannot drift — adding a field
  * to the schema flows through every consumer (prompt builder, IPC handler,
  * right-sidebar Instructions tab) at compile time.
  */
@@ -12,7 +12,6 @@
 import type { z } from "zod";
 import { INSTRUCTION_SCOPE } from "@/common/orpc/schemas/instructions";
 import type {
-  AdditionalSystemContextSchema,
   InstructionFileSchema,
   InstructionScopeSchema,
   InstructionSetSchema,
@@ -21,8 +20,6 @@ import type {
 } from "@/common/orpc/schemas/instructions";
 
 export { INSTRUCTION_SCOPE };
-
-export type AdditionalSystemContext = z.infer<typeof AdditionalSystemContextSchema>;
 export type InstructionScope = z.infer<typeof InstructionScopeSchema>;
 export type InstructionFile = z.infer<typeof InstructionFileSchema>;
 export type InstructionSet = z.infer<typeof InstructionSetSchema>;
@@ -36,7 +33,7 @@ export type WorkspaceInstructions = z.infer<typeof WorkspaceInstructionsSchema>;
  */
 export function flattenInstructionFiles(sources: InstructionSources): InstructionFile[] {
   const out: InstructionFile[] = [];
-  if (sources.global) out.push(...sources.global.files);
+  for (const set of sources.global) out.push(...set.files);
   for (const set of sources.context) out.push(...set.files);
   return out;
 }
@@ -44,10 +41,10 @@ export function flattenInstructionFiles(sources: InstructionSources): Instructio
 /**
  * Collect every instruction file's content from a sequence of instruction
  * sets, in prompt order. Used for scoped `Tool:` extraction, which is honored
- * in shared and Shux-dedicated files alike.
+ * in shared and Xum-dedicated files alike.
  *
  * Returned per-file (not concatenated) for the same reason as
- * `collectShuxOnlyInstructionContents`: a scoped section at the end of one file
+ * `collectXumOnlyInstructionContents`: a scoped section at the end of one file
  * must not swallow the next file's unscoped content.
  */
 export function collectInstructionContents(sets: ReadonlyArray<InstructionSet | null>): string[] {
@@ -58,10 +55,10 @@ export function collectInstructionContents(sets: ReadonlyArray<InstructionSet | 
 }
 
 /**
- * Collect the contents of Shux-dedicated (`muxOnly`) files from a sequence of
+ * Collect the contents of Xum-dedicated (`xumOnly`) files from a sequence of
  * instruction sets, in prompt order. These are the source texts for scoped
  * `Model:`/`Mode:` directives — shared AGENTS.md content is deliberately
- * excluded so those directives never activate from files that non-Shux agents
+ * excluded so those directives never activate from files that non-Xum agents
  * also read.
  *
  * Returned per-file (not concatenated) so a scoped section at the end of one
@@ -74,7 +71,7 @@ export function collectMuxOnlyInstructionContents(
 ): string[] {
   return sets
     .flatMap((set) => set?.files ?? [])
-    .filter((file) => file.muxOnly)
+    .filter((file) => file.xumOnly)
     .map((file) => file.content)
     .filter((content) => content.length > 0);
 }

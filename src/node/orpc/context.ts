@@ -1,11 +1,19 @@
 import type { IJSRuntimeFactory } from "@/node/services/ptc/runtime";
+import type { RowTreeClient } from "@/node/orpc/staticWorkspaceView/rowTreeClient";
 import type { IncomingHttpHeaders } from "http";
-import type { Config } from "@/node/config";
+import type {
+  Config,
+  FileLeaseManager,
+  ProvidersConfigStore,
+  SecretsStore,
+  WorkspaceSessionLocator,
+} from "@/node/config";
 import type { AIService } from "@/node/services/aiService";
+import type { HistoryService } from "@/node/services/historyService";
+import type { InitStateManager } from "@/node/services/initStateManager";
+import type { StreamManager } from "@/node/services/streamManager";
 import type { ProjectService } from "@/node/services/projectService";
 import type { WorkspaceService } from "@/node/services/workspaceService";
-import type { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
-import type { MuxGovernorOauthService } from "@/node/services/muxGovernorOauthService";
 import type { CodexOauthService } from "@/node/services/codexOauthService";
 import type { CoderOauthService } from "@/node/services/coderOauthService";
 import type { CopilotOauthService } from "@/node/services/copilotOauthService";
@@ -22,15 +30,23 @@ import type { VoiceService } from "@/node/services/voiceService";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import type { McpOauthService } from "@/node/services/mcpOauthService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
+import type { FlightRecorder } from "@/node/services/perf/flightRecorder";
+import type { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
+import type { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
+import type { PerfReportService } from "@/node/services/perf/perfReportService";
+import type { SessionTapeFolderService } from "@/node/services/sessionTapes/sessionTapeFolderService";
 import type { MemoryService } from "@/node/services/memoryService";
 import type { MemoryConsolidationService } from "@/node/services/memoryConsolidationService";
 import type { MemoryMetaService } from "@/node/services/memoryMeta";
+import type { RefineService } from "@/node/services/refinement/refineService";
 import type { WorkspaceMcpOverridesService } from "@/node/services/workspaceMcpOverridesService";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
+import type { AgentPluginInstallService } from "@/node/services/agentPlugins/installService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
+import type { EvaluationService } from "@/node/services/evaluation/evaluationService";
 import type { InstructionsService } from "@/node/services/instructionsService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { TaskService } from "@/node/services/taskService";
@@ -40,24 +56,40 @@ import type { BrowserBridgeTokenManager } from "@/node/services/browser/BrowserB
 import type { BrowserControlService } from "@/node/services/browser/BrowserControlService";
 import type { BrowserSessionStateHub } from "@/node/services/browser/BrowserSessionStateHub";
 import type { DevToolsService } from "@/node/services/devToolsService";
-import type { PolicyService } from "@/node/services/policyService";
+import type { ReviewStateService } from "@/node/services/reviewStateService";
+import type { DraftService } from "@/node/services/draftService";
 import type { CoderService } from "@/node/services/coderService";
 import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
 import type { AnalyticsService } from "@/node/services/analytics/analyticsService";
 import type { DesktopBridgeServer } from "@/node/services/desktop/DesktopBridgeServer";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { DesktopTokenManager } from "@/node/services/desktop/DesktopTokenManager";
+import type { WithEffectContext } from "@orpc/experimental-effect";
+import type { OrpcEffectServices } from "@/node/orpc/effectContext";
 
-export interface ORPCContext {
+/**
+ * `WithEffectContext` adds the `"effect/context"` key carrying the Effect
+ * services available to Effect-native handlers (the app runtime's built
+ * service context, `ServiceContainer.runtime.context`).
+ */
+export interface ORPCContext extends WithEffectContext<OrpcEffectServices> {
+  /** Only `xum server` sets it: the static workspace view's row trees (workspace.history.tail). */
+  rowTreeClient?: RowTreeClient;
   config: Config;
+  sessionLocator: WorkspaceSessionLocator;
+  providersConfigStore: ProvidersConfigStore;
+  secretsStore: SecretsStore;
+  fileLeaseManager: FileLeaseManager;
   aiService: AIService;
+  historyService: HistoryService;
+  streamManager: StreamManager;
+  initStateManager: InitStateManager;
   projectService: ProjectService;
   workspaceService: WorkspaceService;
   taskService: TaskService;
   providerService: ProviderService;
-  muxGatewayOauthService: MuxGatewayOauthService;
-  muxGovernorOauthService: MuxGovernorOauthService;
   codexOauthService: CodexOauthService;
   coderOauthService: CoderOauthService;
   copilotOauthService: CopilotOauthService;
@@ -74,28 +106,38 @@ export interface ORPCContext {
   mcpOauthService: McpOauthService;
   workspaceMcpOverridesService: WorkspaceMcpOverridesService;
   mcpServerManager: MCPServerManager;
+  agentPluginInstallService: AgentPluginInstallService;
   sessionTimingService: SessionTimingService;
   timelineService: TimelineService;
   telemetryService: TelemetryService;
   experimentsService: ExperimentsService;
+  perfFlightRecorder: FlightRecorder;
+  perfCaptures: PerfCaptureService;
+  agentResourceLimits: AgentResourceLimitsService;
+  perfReports: PerfReportService;
+  sessionTapes: SessionTapeFolderService;
   memoryService: MemoryService;
   memoryMetaService: MemoryMetaService;
   memoryConsolidationService: MemoryConsolidationService;
+  refineService: RefineService;
   sessionUsageService: SessionUsageService;
+  evaluationService: EvaluationService;
   instructionsService: InstructionsService;
   workspaceGoalService: WorkspaceGoalService;
   devToolsService: DevToolsService;
+  reviewStateService: ReviewStateService;
+  draftService: DraftService;
   browserSessionDiscoveryService: AgentBrowserSessionDiscoveryService;
   browserBridgeTokenManager: BrowserBridgeTokenManager;
   browserBridgeServer: BrowserBridgeServer;
   browserControlService: BrowserControlService;
   browserSessionStateHub: BrowserSessionStateHub;
-  policyService: PolicyService;
   coderService: CoderService;
   serverAuthService: ServerAuthService;
   sshPromptService: SshPromptService;
   analyticsService: AnalyticsService;
   desktopSessionManager: DesktopSessionManager;
+  computerUseService: ComputerUseService;
   desktopTokenManager: DesktopTokenManager;
   desktopBridgeServer: DesktopBridgeServer;
   workflowRuntimeFactory: IJSRuntimeFactory;

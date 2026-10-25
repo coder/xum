@@ -6,7 +6,7 @@ import { formatWithOptions } from "node:util";
 import { Command } from "commander";
 import { isolateStdoutForAcp, runAcpAdapter } from "../node/acp/adapter";
 import { connectToServer } from "../node/acp/serverConnection";
-import { resolveShuxEnvironmentValue } from "@/common/compat/legacyMux";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { getParseOptions } from "./argv";
 
 const program = new Command();
@@ -104,9 +104,9 @@ async function installAcpLogFileRedirect(logFilePath: string): Promise<() => Pro
 let cleanupAcpLogRedirect: (() => Promise<void>) | undefined;
 
 program
-  .name("shux acp")
+  .name("xum acp")
   .description("ACP (Agent-Client Protocol) stdio interface for editor integration")
-  .option("--server-url <url>", "URL of a running shux server")
+  .option("--server-url <url>", "URL of a running xum server")
   .option("--auth-token <token>", "Auth token for server connection")
   .option("--log-file <path>", "Write ACP logs to a file instead of stderr")
   .action(async (options: Record<string, unknown>) => {
@@ -122,10 +122,10 @@ program
       cleanupAcpLogRedirect = await installAcpLogFileRedirect(logFile);
     }
 
-    console.error("[acp] Connecting to shux server…");
+    console.error("[acp] Connecting to xum server…");
     const connection = await connectToServer({
-      serverUrl: serverUrl ?? resolveShuxEnvironmentValue("SERVER_URL", process.env),
-      authToken: authToken ?? resolveShuxEnvironmentValue("SERVER_AUTH_TOKEN", process.env),
+      serverUrl: serverUrl ?? resolveXumEnvironmentValue("SERVER_URL", process.env),
+      authToken: authToken ?? resolveXumEnvironmentValue("SERVER_AUTH_TOKEN", process.env),
     });
     console.error("[acp] Connected to server at", connection.baseUrl);
 

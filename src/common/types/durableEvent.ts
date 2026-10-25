@@ -60,6 +60,12 @@ export const TurnEnvelopeDataSchema = z.object({
   wireProviderName: z.string().optional(),
   /** Per-send Anthropic cache TTL override ("5m" | "1h"); absent = default. */
   anthropicCacheTtl: z.string().optional(),
+  /**
+   * JS string length of the system prompt's volatile tail (MCP warning, hot
+   * memories, context-window ids), sent as a separate uncached system block
+   * after the cached stable block (#5251). Absent = one block.
+   */
+  systemPromptVolatileSuffixLength: z.number().int().positive().optional(),
   /** Plan content injected on a plan→exec handoff (blob-stored, model-visible). */
   planTransitionContentHash: BlobRefSchema.optional(),
   /** Plan file path referenced by the plan→exec handoff injection. */
@@ -73,6 +79,14 @@ export const TurnEnvelopeDataSchema = z.object({
    * recover this message from chat.jsonl alone.
    */
   partialContinuationHash: BlobRefSchema.optional(),
+  /**
+   * JSON-serialized MuxMessage: the request-only user-role MCP Apps model
+   * context message (ui/update-model-context) inserted before the newest user
+   * row, which the provider transform merges into it (blob-stored). It is
+   * built at request time from the MCP Apps store and
+   * never reaches chat.jsonl, so replay cannot recover it from history.
+   */
+  mcpAppModelContextHash: BlobRefSchema.optional(),
 });
 
 /**
@@ -87,6 +101,14 @@ export const RefinementDataSchema = z.object({
   evidence: JsonValueSchema.optional(),
   /** Envelope `id` of the entry this one rolls back. */
   rollbackOf: z.string().optional(),
+  /** Expected post-action file hashes (RefinementPostStateSchema in refinement.ts). */
+  postState: JsonValueSchema.optional(),
+  /**
+   * "remote" when the mutation ran through a non-local runtime (SSH/Docker):
+   * its inverse paths are runtime-namespace and must not be applied to the
+   * host filesystem. Absent (older rows / local runtimes) = host-local.
+   */
+  runtime: z.string().optional(),
 });
 
 /**
@@ -122,6 +144,16 @@ export const SandboxVarsSnapshotDataSchema = z.object({
   scopeKey: z.string(),
   blobHash: BlobRefSchema,
   size: z.number().int().nonnegative(),
+  /**
+   * Marks a context-reset tombstone (r52): an empty snapshot superseding all
+   * prior ones. The count of reset-marked rows per scope is its "reset
+   * generation" — persistent mounts capture it at creation and re-verify it
+   * before every lease and persist, so a mount still alive in ANOTHER
+   * backend (XUM_ALLOW_MULTIPLE_INSTANCES=1) cannot expose or re-persist
+   * vars the user discarded. Absent on ordinary snapshots and on pre-r52
+   * rows (both count as generation contributions of zero).
+   */
+  reset: z.boolean().optional(),
 });
 
 /** Envelope shared by all durable agent events (one JSONL row each). */
@@ -149,7 +181,6 @@ export const DurableEventSchema = z.discriminatedUnion("kind", [
 ]);
 
 export type DurableEvent = z.infer<typeof DurableEventSchema>;
-export type DurableEventKind = DurableEvent["kind"];
 
 /** Omit that distributes over union members, preserving the discriminant pairing. */
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;

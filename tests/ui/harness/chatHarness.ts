@@ -1,14 +1,27 @@
 import { act, fireEvent, waitFor } from "@testing-library/react";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getInputKey } from "@/common/constants/storage";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { getDraftStore, type DraftStoreScope } from "@/browser/stores/DraftStore";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
 export class ChatHarness {
   constructor(
     private readonly container: HTMLElement,
-    private readonly workspaceId: string
+    private readonly workspaceId: string,
+    /** The composer's draft scope; a creation composer passes its creation draft id. */
+    private readonly draftScope: DraftStoreScope | { kind: "creation"; draftId: string } = {
+      kind: "workspace",
+      workspaceId,
+    }
   ) {}
+
+  private setDraftText(text: string): void {
+    if (this.draftScope.kind === "creation") {
+      getCreationDraftStore().update(this.draftScope.draftId, { text });
+    } else {
+      getDraftStore().setText(this.draftScope, text);
+    }
+  }
 
   private async getActiveTextarea(): Promise<HTMLTextAreaElement> {
     return waitFor(
@@ -16,8 +29,8 @@ export class ChatHarness {
         // There can be multiple ChatInput instances mounted (e.g., ProjectPage + Workspace view).
         // Use the last textarea in DOM order to target the active view.
         const textareas = Array.from(
-          this.container.querySelectorAll('textarea[aria-label="Message Claude"]')
-        ) as HTMLTextAreaElement[];
+          this.container.querySelectorAll<HTMLTextAreaElement>('textarea[aria-label="Message"]')
+        );
 
         if (textareas.length === 0) {
           throw new Error("Chat textarea not found");
@@ -40,10 +53,10 @@ export class ChatHarness {
     textarea.focus();
 
     // happy-dom + React can be flaky for synthetic textarea input events.
-    // Since ChatInput uses usePersistedState, updating the persisted key is both deterministic
+    // ChatInput renders the draft store, so writing the draft there is both deterministic
     // and exercises the real UI state path.
     act(() => {
-      updatePersistedState(getInputKey(this.workspaceId), text);
+      this.setDraftText(text);
     });
 
     await waitFor(
@@ -62,9 +75,9 @@ export class ChatHarness {
 
     const sendButton = await waitFor(
       () => {
-        const el = chatInputSection.querySelector(
+        const el = chatInputSection.querySelector<HTMLButtonElement>(
           'button[aria-label="Send message"]'
-        ) as HTMLButtonElement | null;
+        );
         if (!el) {
           throw new Error("Send button not found");
         }
@@ -79,10 +92,18 @@ export class ChatHarness {
     fireEvent.click(sendButton);
   }
 
-  async expectTranscriptContains(
-    needle: string | RegExp,
-    timeoutMs: number = 30_000
-  ): Promise<void> {
+  async startHeldToolTurn(label: string): Promise<void> {
+    // Foreground Bash belongs to a live turn; an idle send bypasses queued input.
+    await this.send(`[mock:tool:parallel-step] ${label}`);
+    await waitFor(
+      () => {
+        expect(workspaceStore.getWorkspaceSidebarState(this.workspaceId).canInterrupt).toBe(true);
+      },
+      { timeout: 30_000 }
+    );
+  }
+
+  async expectTranscriptContains(needle: string | RegExp, timeoutMs = 30_000): Promise<void> {
     await waitFor(
       () => {
         const text = this.container.textContent ?? "";
@@ -102,7 +123,7 @@ export class ChatHarness {
    * phase (canInterrupt) before resolving — ensuring all lifecycle callbacks
    * (recency update, onResponseComplete) have completed.
    */
-  async expectStreamComplete(timeoutMs: number = 30_000): Promise<void> {
+  async expectStreamComplete(timeoutMs = 30_000): Promise<void> {
     await waitFor(
       () => {
         const state = workspaceStore.getWorkspaceSidebarState(this.workspaceId);
@@ -124,7 +145,7 @@ export class ChatHarness {
     );
   }
 
-  async expectTranscriptNotContains(needle: string, timeoutMs: number = 30_000): Promise<void> {
+  async expectTranscriptNotContains(needle: string, timeoutMs = 30_000): Promise<void> {
     await waitFor(
       () => {
         const text = this.container.textContent ?? "";
@@ -143,7 +164,7 @@ export class ChatHarness {
     textarea.focus();
 
     act(() => {
-      updatePersistedState(getInputKey(this.workspaceId), text);
+      this.setDraftText(text);
     });
 
     await waitFor(
@@ -167,7 +188,7 @@ export class ChatHarness {
   /**
    * Assert the chat input contains the expected text.
    */
-  async expectInputValue(expected: string, timeoutMs: number = 5_000): Promise<void> {
+  async expectInputValue(expected: string, timeoutMs = 5_000): Promise<void> {
     await waitFor(
       async () => {
         const value = await this.getInputValue();

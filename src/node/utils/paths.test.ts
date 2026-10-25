@@ -111,61 +111,59 @@ describe("PlatformPaths", () => {
       const testPath = path.join("/", "home", "user", "project");
       expect(PlatformPaths.expandHome(testPath)).toBe(testPath);
     });
-    test("expands canonical and legacy home paths to SHUX_ROOT", () => {
-      const originalShuxRoot = process.env.SHUX_ROOT;
+    test("expands canonical and legacy home paths to XUM_ROOT", () => {
+      const originalXumRoot = process.env.XUM_ROOT;
       const originalMuxRoot = process.env.MUX_ROOT;
-      const testShuxRoot = path.join(os.tmpdir(), "shux-root-test");
-      process.env.SHUX_ROOT = testShuxRoot;
+      const testXumRoot = path.join(os.tmpdir(), "xum-root-test");
+      process.env.XUM_ROOT = testXumRoot;
       delete process.env.MUX_ROOT;
 
       try {
         const sep = path.sep;
-        for (const directory of [".shux", ".mux", ".cmux"]) {
-          const shuxPath = `~${sep}${directory}${sep}src${sep}project`;
-          expect(PlatformPaths.expandHome(shuxPath)).toBe(
-            path.join(testShuxRoot, "src", "project")
-          );
-          expect(PlatformPaths.expandHome(`~${sep}${directory}`)).toBe(testShuxRoot);
+        for (const directory of [".xum", ".mux", ".cmux"]) {
+          const xumPath = `~${sep}${directory}${sep}src${sep}project`;
+          expect(PlatformPaths.expandHome(xumPath)).toBe(path.join(testXumRoot, "src", "project"));
+          expect(PlatformPaths.expandHome(`~${sep}${directory}`)).toBe(testXumRoot);
         }
 
         // Other ~ paths should still resolve to the actual OS home directory.
         const home = os.homedir();
-        const homePath = `~${sep}projects${sep}shux`;
-        expect(PlatformPaths.expandHome(homePath)).toBe(path.join(home, "projects", "shux"));
+        const homePath = `~${sep}projects${sep}xum`;
+        expect(PlatformPaths.expandHome(homePath)).toBe(path.join(home, "projects", "xum"));
       } finally {
-        if (originalShuxRoot === undefined) delete process.env.SHUX_ROOT;
-        else process.env.SHUX_ROOT = originalShuxRoot;
+        if (originalXumRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = originalXumRoot;
         if (originalMuxRoot === undefined) delete process.env.MUX_ROOT;
         else process.env.MUX_ROOT = originalMuxRoot;
       }
     });
 
-    test("accepts MUX_ROOT when SHUX_ROOT is not set", () => {
-      const originalShuxRoot = process.env.SHUX_ROOT;
+    test("accepts MUX_ROOT when XUM_ROOT is not set", () => {
+      const originalXumRoot = process.env.XUM_ROOT;
       const originalMuxRoot = process.env.MUX_ROOT;
       const testLegacyRoot = path.join(os.tmpdir(), "mux-root-test");
-      delete process.env.SHUX_ROOT;
+      delete process.env.XUM_ROOT;
       process.env.MUX_ROOT = testLegacyRoot;
 
       try {
-        expect(PlatformPaths.expandHome("~/.shux/src/project")).toBe(
+        expect(PlatformPaths.expandHome("~/.xum/src/project")).toBe(
           path.join(testLegacyRoot, "src", "project")
         );
         expect(PlatformPaths.expandHome("~/.cmux/src/project")).toBe(
           path.join(testLegacyRoot, "src", "project")
         );
       } finally {
-        if (originalShuxRoot === undefined) delete process.env.SHUX_ROOT;
-        else process.env.SHUX_ROOT = originalShuxRoot;
+        if (originalXumRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = originalXumRoot;
         if (originalMuxRoot === undefined) delete process.env.MUX_ROOT;
         else process.env.MUX_ROOT = originalMuxRoot;
       }
     });
 
     test("leaves product-home tilde paths on OS home when no explicit root is set", () => {
-      const originalShuxRoot = process.env.SHUX_ROOT;
+      const originalXumRoot = process.env.XUM_ROOT;
       const originalMuxRoot = process.env.MUX_ROOT;
-      delete process.env.SHUX_ROOT;
+      delete process.env.XUM_ROOT;
       delete process.env.MUX_ROOT;
 
       try {
@@ -173,8 +171,8 @@ describe("PlatformPaths", () => {
           path.join(os.homedir(), ".cmux", "src", "project")
         );
       } finally {
-        if (originalShuxRoot === undefined) delete process.env.SHUX_ROOT;
-        else process.env.SHUX_ROOT = originalShuxRoot;
+        if (originalXumRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = originalXumRoot;
         if (originalMuxRoot === undefined) delete process.env.MUX_ROOT;
         else process.env.MUX_ROOT = originalMuxRoot;
       }
@@ -272,13 +270,6 @@ describe("toPosixPath", () => {
         const result = toPosixPath("C:\\Users\\test");
         expect(result).toMatch(/^\/c\/Users\/test$/i);
       }
-    });
-
-    test("falls back to original path if cygpath unavailable", () => {
-      // If cygpath is not available (edge case), the function catches
-      // the error and returns the original path unchanged
-      // This prevents crashes if Git Bash is misconfigured
-      expect(true).toBe(true); // Cannot easily test without mocking execSync
     });
   });
 });

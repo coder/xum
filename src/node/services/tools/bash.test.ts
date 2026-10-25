@@ -1,21 +1,29 @@
-import { describe, it, expect } from "bun:test";
+import { afterEach, beforeEach, describe, it, expect, spyOn } from "bun:test";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import { buildBashToolDescription, createBashTool } from "./bash";
 import type { BashOutputEvent } from "@/common/types/stream";
 import type { ProjectRef } from "@/common/types/workspace";
 import type { BashToolArgs, BashToolResult } from "@/common/types/tools";
 import { BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
+import { EXIT_CODE_ABORTED } from "@/common/constants/exitCodes";
+import { shellQuote } from "@/common/utils/shell";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import * as path from "path";
 import * as fs from "fs";
-import { TestTempDir, createTestToolConfig, getTestDeps, mockToolCallOptions } from "./testHelpers";
-import type { createRuntime as CreateRuntimeFn } from "@/node/runtime/runtimeFactory";
+import { execFileSync } from "child_process";
+import { randomUUID } from "crypto";
+import {
+  TestTempDir,
+  createTestToolConfig as createBaseToolConfig,
+  getTestDeps,
+  mockToolCallOptions,
+} from "./testHelpers";
 
-/* eslint-disable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
-const {
-  createRuntime,
-}: { createRuntime: typeof CreateRuntimeFn } = require("@/node/runtime/runtimeFactory?real=1");
-/* eslint-enable @typescript-eslint/no-require-imports, @typescript-eslint/no-unsafe-assignment */
+// A static import, not a require("...?real=1") copy: Bun's LCOV keeps only the last-loaded copy of
+// a file, so a copy would replace runtimeFactory.test.ts's coverage of runtimeFactory.ts.
+import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { sshConnectionPool } from "@/node/runtime/sshConnectionPool";
 
 // Type guard to narrow foreground success result (has note, no backgroundProcessId)
@@ -25,11 +33,43 @@ function isForegroundSuccess(
   return result.success && !("backgroundProcessId" in result);
 }
 
-import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import {
+  BackgroundProcessManager,
+  SPAWN_NAME_LOCK_FILENAME,
+} from "@/node/services/backgroundProcessManager";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+
+// Unique workspace IDs per run (#7256): spawn records live in the shared
+// /tmp/mux-bashes/<workspaceId>, and the loop-test runner runs several test files at once. A fixed
+// "test-workspace" let one file's cleanup delete another file's records, as #5591 fixed for
+// backgroundProcessManager.test.ts.
+const RUN_ID = randomUUID().slice(0, 12);
+const TEST_WS = `test-workspace-${RUN_ID}`;
+const createTestToolConfig = (
+  tempDir: string,
+  options?: Parameters<typeof createBaseToolConfig>[1]
+): ReturnType<typeof createBaseToolConfig> =>
+  createBaseToolConfig(tempDir, { workspaceId: TEST_WS, ...options });
 
 // Helper to create bash tool with test configuration
 // Returns both tool and disposable temp directory
 // Use with: using testEnv = createTestBashTool();
+function createExecStream(stdout: string, exitCode = 0): ExecStream {
+  const encoder = new TextEncoder();
+  return {
+    stdout: new ReadableStream({
+      start(controller) {
+        if (stdout.length > 0) controller.enqueue(encoder.encode(stdout));
+        controller.close();
+      },
+    }),
+    stderr: new ReadableStream({ start: (controller) => controller.close() }),
+    stdin: new WritableStream(),
+    exitCode: Promise.resolve(exitCode),
+    duration: Promise.resolve(0),
+  };
+}
+
 function createTestBashTool() {
   const tempDir = new TestTempDir("test-bash");
   const config = createTestToolConfig(process.cwd());
@@ -71,14 +111,6 @@ describe("buildBashToolDescription", () => {
     expect(description).toContain("  - frontend/ → /workspace/root/frontend");
     expect(description).toContain("  - backend/ → /workspace/root/backend");
     expect(description).toContain("independent git repo");
-  });
-
-  it("includes project paths for multi-project workspaces", () => {
-    const description = buildBashToolDescription(cwd, multiProjectRefs);
-
-    for (const projectRef of multiProjectRefs) {
-      expect(description).toContain(projectRef.projectPath);
-    }
   });
 });
 
@@ -185,7 +217,7 @@ describe("bash tool", () => {
     expect(result.success).toBe(true);
     if (isForegroundSuccess(result)) {
       expect(result.output).toBe("hello\nworld");
-      expect(result.note).toContain("DO NOT use `cat`");
+      expect(result.note).toContain("Use the `file_read` tool to read files instead of `cat`");
       expect(result.note).toContain("file_read");
     }
   });
@@ -348,7 +380,7 @@ describe("bash tool", () => {
     expect(result.success).toBe(true);
     if (isForegroundSuccess(result)) {
       expect(result.output).toBe("");
-      expect(result.note).toContain("DO NOT use `cat`");
+      expect(result.note).toContain("Use the `file_read` tool to read files instead of `cat`");
       expect(result.note).toContain("[OUTPUT OVERFLOW");
 
       const match = /saved to (\/.*?\.txt)/.exec(result.note ?? "");
@@ -503,6 +535,134 @@ describe("bash tool", () => {
     expect(bashFiles.length).toBe(0);
 
     tempDir[Symbol.dispose]();
+  });
+
+  // #6732: the truncate policy keeps 1 MB and then stops a command that is still writing. Closing
+  // its output alone did not stop it reliably: here it ignores the broken pipe, sleeps and fails
+  // with its own status, which the old code then reported. The stop makes the result ours.
+  it(
+    "should stop a command that is still writing once truncation keeps 1 MB",
+    async () => {
+      using tempDir = new TestTempDir("test-bash-truncate-stop");
+      const config = createTestToolConfig(process.cwd());
+      config.runtimeTempDir = tempDir.path;
+      config.overflow_policy = "truncate";
+      const tool = createBashTool(config);
+
+      const args: BashToolArgs = {
+        script:
+          "trap '' PIPE; perl -e '$| = 1; for (1..1300) { print \"A\" x 900 . \"\\n\" }' 2>/dev/null; sleep 5; exit 42",
+        timeout_secs: 30,
+        run_in_background: false,
+        display_name: "test",
+      };
+
+      const result = (await tool.execute!(args, mockToolCallOptions)) as BashToolResult;
+
+      expect(result).toMatchObject({ success: true, exitCode: 0 });
+      if (result.success && "truncated" in result) {
+        expect(result.truncated?.reason).toContain("exceed");
+      }
+      expect(result.output?.length).toBeGreaterThan(1000000);
+      // Stopped at the cut, not after its 5 s sleep.
+      expect(result.wall_duration_ms).toBeLessThan(4000);
+    },
+    { timeout: 20_000 }
+  );
+
+  // #6873: after the truncate policy stops a command, a stream read or the exit status can fail
+  // because of that stop: RemoteRuntime rejects its exit status when the child errors after our
+  // kill (an SSH2 channel that closes without an exit status), and a stream can error instead of
+  // ending. That failure says nothing about the command, so the result stays the truncated
+  // success instead of "Failed to execute command".
+  it.each([
+    ["a stream read rejects", "stream"],
+    ["the exit status rejects", "exit"],
+  ] as const)(
+    "keeps the truncated success when %s after the stop at the file limit",
+    async (_name, failure) => {
+      const encoder = new TextEncoder();
+      using tempDir = new TestTempDir("test-bash-truncate-stop-failure");
+      // A real runtime for the tool's own file checks; only the command's streams are scripted.
+      class StoppedCommandRuntime extends LocalRuntime {
+        override exec(_command: string, options: ExecOptions): Promise<ExecStream> {
+          const signal = options.abortSignal;
+          const failAfterStop = new Error("SSH2 channel failed after the stop");
+          return Promise.resolve({
+            stdout: new ReadableStream<Uint8Array>({
+              start(controller) {
+                // 1.17 MB: over the 1 MB file limit, and the command keeps running.
+                for (let i = 0; i < 1300; i++)
+                  controller.enqueue(encoder.encode(`${"A".repeat(900)}\n`));
+              },
+            }),
+            // Still open when the stop comes; errors on it in the "stream" case.
+            stderr: new ReadableStream<Uint8Array>({
+              start(controller) {
+                signal?.addEventListener("abort", () => {
+                  if (failure === "stream") controller.error(failAfterStop);
+                  else controller.close();
+                });
+              },
+            }),
+            stdin: new WritableStream(),
+            exitCode: new Promise<number>((resolve, reject) => {
+              signal?.addEventListener("abort", () => {
+                if (failure === "exit") reject(failAfterStop);
+                else resolve(EXIT_CODE_ABORTED);
+              });
+            }),
+            duration: Promise.resolve(0),
+          });
+        }
+      }
+      // An empty, trusted directory: no git discovery or hook runs before the command.
+      const config = createTestToolConfig(tempDir.path);
+      config.runtime = new StoppedCommandRuntime(tempDir.path);
+      config.trusted = true;
+      config.overflow_policy = "truncate";
+      const tool = createBashTool(config);
+
+      const result = (await tool.execute!(
+        { script: "flood", timeout_secs: 30, run_in_background: false, display_name: "test" },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(result).toMatchObject({ success: true, exitCode: 0 });
+      if (result.success && "truncated" in result) {
+        expect(result.truncated?.reason).toContain("exceed");
+      }
+      expect(result.output?.length).toBeGreaterThan(1000000);
+    }
+  );
+
+  // #6873: SSH and Docker share RemoteRuntime.exec, which stops a command with SIGTERM to its
+  // client and reports EXIT_CODE_ABORTED. The truncate policy's stop must give the same result
+  // there as on a local runtime: the kept output, as a success.
+  it("stops a command at the file limit through RemoteRuntime.exec", async () => {
+    using tempDir = new TestTempDir("test-bash-truncate-stop-remote");
+    const config = createTestToolConfig(tempDir.path);
+    config.runtime = new ShellRemoteRuntime(tempDir.path);
+    config.trusted = true;
+    config.overflow_policy = "truncate";
+    const tool = createBashTool(config);
+
+    const result = (await tool.execute!(
+      {
+        script:
+          "trap '' PIPE; perl -e '$| = 1; for (1..1300) { print \"A\" x 900 . \"\\n\" }' 2>/dev/null; exit 42",
+        timeout_secs: 30,
+        run_in_background: false,
+        display_name: "test",
+      },
+      mockToolCallOptions
+    )) as BashToolResult;
+
+    expect(result).toMatchObject({ success: true, exitCode: 0 });
+    if (result.success && "truncated" in result) {
+      expect(result.truncated?.reason).toContain("exceed");
+    }
+    expect(result.output?.length).toBeGreaterThan(1000000);
   });
 
   it("should reject single overlong line before storing it (IPC mode)", async () => {
@@ -1611,12 +1771,282 @@ describe("zombie process cleanup", () => {
   });
 });
 
-describe("shuxEnv environment variables", () => {
-  it("should inject MUX_ environment variables when shuxEnv is provided", async () => {
+describe("remote bash git hardening", () => {
+  it("discovers remote drivers and keeps provider secrets blanked", async () => {
+    const calls: Array<{ command: string; options: ExecOptions }> = [];
+    const runtime = {
+      exec(command: string, options: ExecOptions): Promise<ExecStream> {
+        calls.push({ command, options });
+        if (command.includes("xum-git-discovery 1")) {
+          if (options.cwd === "/remote/workspace/project-a") {
+            return Promise.resolve(createExecStream("xum-git-discovery 1\n\0drivers 1\n"));
+          }
+          return Promise.resolve(
+            createExecStream(
+              "xum-git-discovery 1\n" +
+                "filter.evil.smudge\ncat\0filter.evil.required\ntrue\0alias.evil\n!steal\0" +
+                "\0drivers 0\n"
+            )
+          );
+        }
+        return Promise.resolve(createExecStream("done\n"));
+      },
+    } as unknown as Runtime;
+    const config = createTestToolConfig("/remote/workspace");
+    config.runtime = runtime;
+    config.trusted = false;
+    config.projects = [
+      { projectName: "project-a", projectPath: "/remote/project-a" },
+      { projectName: "project-b", projectPath: "/remote/project-b" },
+    ];
+    config.secrets = { ANTHROPIC_API_KEY: "secret" };
+    const tool = createBashTool(config);
+
+    const result = (await tool.execute!(
+      {
+        script: "git checkout -- data.txt",
+        timeout_secs: 5,
+        run_in_background: false,
+        display_name: "test",
+      },
+      mockToolCallOptions
+    )) as BashToolResult;
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(3);
+    expect(calls[0]?.options.cwd).toBe("/remote/workspace/project-a");
+    expect(calls[0]?.options.env?.GIT_CONFIG_KEY_0).toBe("core.hooksPath");
+    expect(calls[1]?.options.cwd).toBe("/remote/workspace/project-b");
+    expect(calls[2]?.options.env?.ANTHROPIC_API_KEY).toBe("");
+    expect(Object.values(calls[2]?.options.env ?? {})).toContain("filter.evil.smudge");
+    expect(Object.values(calls[2]?.options.env ?? {})).toContain("alias.evil");
+  });
+
+  it("fails closed when remote driver discovery fails", async () => {
+    let callCount = 0;
+    const runtime = {
+      exec(): Promise<ExecStream> {
+        callCount += 1;
+        // project-a discovery succeeds; project-b discovery exits 2.
+        return Promise.resolve(
+          callCount === 1
+            ? createExecStream("xum-git-discovery 1\n\0drivers 1\n")
+            : createExecStream("", 2)
+        );
+      },
+    } as unknown as Runtime;
+    const config = createTestToolConfig("/remote/workspace");
+    config.runtime = runtime;
+    config.trusted = false;
+    config.projects = [
+      { projectName: "project-a", projectPath: "/remote/project-a" },
+      { projectName: "project-b", projectPath: "/remote/project-b" },
+    ];
+    const tool = createBashTool(config);
+
+    let rejection: unknown;
+    try {
+      await tool.execute!(
+        {
+          script: "echo should-not-run",
+          timeout_secs: 5,
+          run_in_background: false,
+          display_name: "test",
+        },
+        mockToolCallOptions
+      );
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toContain("Failed to inspect repository");
+    expect(callCount).toBe(2);
+  });
+
+  it("blanks run-session roots inherited by local Bash", async () => {
+    const previousXumRoot = process.env.XUM_RUN_SESSION_ROOT;
+    const previousMuxRoot = process.env.MUX_RUN_SESSION_ROOT;
+    process.env.XUM_RUN_SESSION_ROOT = "/tmp/xum-session";
+    process.env.MUX_RUN_SESSION_ROOT = "/tmp/mux-session";
+
+    try {
+      const config = createTestToolConfig(process.cwd());
+      config.trusted = false;
+      const tool = createBashTool(config);
+      const result = (await tool.execute!(
+        {
+          script: 'printf "%s|%s" "$XUM_RUN_SESSION_ROOT" "$MUX_RUN_SESSION_ROOT"',
+          timeout_secs: 5,
+          run_in_background: false,
+          display_name: "test",
+        },
+        mockToolCallOptions
+      )) as BashToolResult;
+
+      expect(result.success).toBe(true);
+      if (result.success) expect(result.output).toBe("|");
+    } finally {
+      if (previousXumRoot == null) delete process.env.XUM_RUN_SESSION_ROOT;
+      else process.env.XUM_RUN_SESSION_ROOT = previousXumRoot;
+      if (previousMuxRoot == null) delete process.env.MUX_RUN_SESSION_ROOT;
+      else process.env.MUX_RUN_SESSION_ROOT = previousMuxRoot;
+    }
+  });
+});
+
+describe("untrusted bash repo discovery paths", () => {
+  // The host's global git config can define filters (git-lfs); isolate so results depend only
+  // on the repos built here.
+  const previousGitEnv: Record<string, string | undefined> = {};
+  let root: TestTempDir;
+
+  beforeEach(() => {
+    root = new TestTempDir("test-bash-repo-paths");
+    for (const key of ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"]) {
+      previousGitEnv[key] = process.env[key];
+    }
+    const globalConfig = path.join(root.path, "gitconfig-global");
+    fs.writeFileSync(globalConfig, "");
+    process.env.GIT_CONFIG_GLOBAL = globalConfig;
+    process.env.GIT_CONFIG_NOSYSTEM = "1";
+  });
+
+  afterEach(() => {
+    for (const [key, value] of Object.entries(previousGitEnv)) {
+      if (value == null) delete process.env[key];
+      else process.env[key] = value;
+    }
+    root[Symbol.dispose]();
+  });
+
+  const PLANTED_SMUDGE = "echo planted-smudge";
+
+  function createRepo(name: string, options: { plantedFilter: boolean }): string {
+    const repo = path.join(root.path, name);
+    fs.mkdirSync(repo);
+    execFileSync("git", ["init", "-q"], { cwd: repo });
+    if (options.plantedFilter) {
+      execFileSync("git", ["config", "filter.probe.smudge", PLANTED_SMUDGE], { cwd: repo });
+      fs.writeFileSync(path.join(repo, ".gitattributes"), "* filter=probe\n");
+      execFileSync("git", ["add", ".gitattributes"], { cwd: repo });
+    }
+    return repo;
+  }
+
+  function createUntrustedLocalTool(cwd: string, projects: ProjectRef[]) {
+    const config = createTestToolConfig(cwd, { runtime: new LocalRuntime(cwd) });
+    const runtimeTempDir = path.join(root.path, "runtime-tmp");
+    fs.mkdirSync(runtimeTempDir, { recursive: true });
+    config.runtimeTempDir = runtimeTempDir;
+    config.trusted = false;
+    config.projects = projects;
+    return createBashTool(config);
+  }
+
+  // Same layout as the multi-project container: one symlink per project; only b plants a filter.
+  function createMultiProjectTool() {
+    const repoA = createRepo("repo-a", { plantedFilter: false });
+    const repoB = createRepo("repo-b", { plantedFilter: true });
+    const container = path.join(root.path, "_workspaces", "ws");
+    fs.mkdirSync(container, { recursive: true });
+    fs.symlinkSync(repoA, path.join(container, "a"));
+    fs.symlinkSync(repoB, path.join(container, "b"));
+    const tool = createUntrustedLocalTool(container, [
+      { projectName: "a", projectPath: "/projects/a" },
+      { projectName: "b", projectPath: "/projects/b" },
+    ]);
+    return { tool, repoB };
+  }
+
+  async function runScript(
+    tool: ReturnType<typeof createBashTool>,
+    script: string
+  ): Promise<BashToolResult> {
+    return (await tool.execute!(
+      { script, timeout_secs: 10, run_in_background: false, display_name: "test" },
+      mockToolCallOptions
+    )) as BashToolResult;
+  }
+
+  it("untrusted single-project local workspace applies the repo's driver config", async () => {
+    const repo = createRepo("checkout", { plantedFilter: true });
+    // Production passes getProjects(metadata), which has one entry whose projectName differs
+    // from the checkout directory name.
+    const tool = createUntrustedLocalTool(repo, [
+      { projectName: "proj", projectPath: "/some/proj" },
+    ]);
+
+    const result = await runScript(tool, 'git config --get filter.probe.smudge; echo "rc=$?"');
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.output).not.toContain("planted-smudge");
+      expect(result.output.trim()).toBe("rc=0");
+    }
+  });
+
+  it("untrusted single-project remote workspace inspects the workspace directory", async () => {
+    const calls: Array<{ command: string; options: ExecOptions }> = [];
+    const runtime = {
+      exec(command: string, options: ExecOptions): Promise<ExecStream> {
+        calls.push({ command, options });
+        return Promise.resolve(
+          command.includes("xum-git-discovery 1")
+            ? createExecStream("xum-git-discovery 1\n\0drivers 1\n")
+            : createExecStream("done\n")
+        );
+      },
+    } as unknown as Runtime;
+    const config = createTestToolConfig("/remote/workspace");
+    config.runtime = runtime;
+    config.trusted = false;
+    config.projects = [{ projectName: "proj", projectPath: "/remote/proj" }];
+    const tool = createBashTool(config);
+
+    const result = await runScript(tool, "echo hello");
+
+    expect(result.success).toBe(true);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.command).toContain("xum-git-discovery 1");
+    expect(calls[0]?.options.cwd).toBe("/remote/workspace");
+  });
+
+  it("untrusted multi-project local workspace inspects each project checkout", async () => {
+    const { tool } = createMultiProjectTool();
+
+    const result = await runScript(tool, 'git -C b config --get filter.probe.smudge; echo "rc=$?"');
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.output).not.toContain("planted-smudge");
+      expect(result.output.trim()).toBe("rc=0");
+    }
+  });
+
+  it("untrusted local workspace fails when a project directory is missing", async () => {
+    const { tool, repoB } = createMultiProjectTool();
+    fs.rmSync(repoB, { recursive: true, force: true });
+    const marker = path.join(root.path, "command-ran");
+
+    let rejection: unknown;
+    try {
+      await runScript(tool, `touch ${JSON.stringify(marker)}`);
+    } catch (error) {
+      rejection = error;
+    }
+
+    expect(rejection).toBeInstanceOf(Error);
+    expect((rejection as Error).message).toBe("Failed to inspect repository automation drivers");
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+});
+
+describe("xumEnv environment variables", () => {
+  it("should inject MUX_ environment variables when xumEnv is provided", async () => {
     using tempDir = new TestTempDir("test-mux-env");
     const config = createTestToolConfig(process.cwd());
     config.runtimeTempDir = tempDir.path;
-    config.shuxEnv = {
+    config.xumEnv = {
       MUX_PROJECT_PATH: "/test/project/path",
       MUX_RUNTIME: "worktree",
       MUX_WORKSPACE_NAME: "feature-branch",
@@ -1640,11 +2070,11 @@ describe("shuxEnv environment variables", () => {
     }
   });
 
-  it("should allow secrets to override shuxEnv", async () => {
+  it("should allow secrets to override xumEnv", async () => {
     using tempDir = new TestTempDir("test-mux-env-override");
     const config = createTestToolConfig(process.cwd());
     config.runtimeTempDir = tempDir.path;
-    config.shuxEnv = {
+    config.xumEnv = {
       MUX_PROJECT_PATH: "/mux/path",
       CUSTOM_VAR: "from-mux",
     };
@@ -1664,9 +2094,9 @@ describe("shuxEnv environment variables", () => {
 
     expect(result.success).toBe(true);
     if (result.success) {
-      // MUX_PROJECT_PATH from shuxEnv should be present
+      // MUX_PROJECT_PATH from xumEnv should be present
       expect(result.output).toContain("MUX:/mux/path");
-      // Secrets should override shuxEnv when there's a conflict
+      // Secrets should override xumEnv when there's a conflict
       expect(result.output).toContain("CUSTOM:from-secrets");
     }
   });
@@ -1883,11 +2313,39 @@ describe("bash tool - background execution", () => {
     }
   });
 
+  // B2: an archive or removal stops the stream before it stops the workspace's background
+  // processes; a tool call of that stream must not start a new one afterwards.
+  it("does not start a background process once the tool call was aborted", async () => {
+    const tempDir = new TestTempDir("test-bash-bg-aborted");
+    const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+    const workspaceId = path.basename(tempDir.path);
+    const config = createTestToolConfig(tempDir.path, { workspaceId });
+    config.backgroundProcessManager = manager;
+    // Trusted: untrusted repos run an abortable git-automation probe that would fail first.
+    config.trusted = true;
+    const spawn = spyOn(manager, "spawn");
+    const abortController = new AbortController();
+    abortController.abort();
+
+    const result = (await createBashTool(config).execute!(
+      { script: "sleep 30", timeout_secs: 60, run_in_background: true, display_name: "late" },
+      { ...mockToolCallOptions, abortSignal: abortController.signal }
+    )) as BashToolResult;
+
+    expect(result).toMatchObject({ success: false, error: "Command execution was aborted" });
+    expect(spawn).not.toHaveBeenCalled();
+    expect(await manager.list(workspaceId)).toEqual([]);
+    tempDir[Symbol.dispose]();
+  });
+
   it("should accept timeout with background mode for auto-termination", async () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 
     const tempDir = new TestTempDir("test-bash-bg");
-    const config = createTestToolConfig(tempDir.path);
+    // Unique workspace: host-local records under /tmp/mux-bashes outlive the test, and an
+    // existing record directory is never reused, so a fixed workspace would get "name (2)".
+    const workspaceId = path.basename(tempDir.path);
+    const config = createTestToolConfig(tempDir.path, { workspaceId });
     config.backgroundProcessManager = manager;
 
     const tool = createBashTool(config);
@@ -1907,6 +2365,7 @@ describe("bash tool - background execution", () => {
     }
 
     await manager.terminateAll();
+    fs.rmSync(`/tmp/mux-bashes/${workspaceId}`, { recursive: true, force: true });
     tempDir[Symbol.dispose]();
   });
 
@@ -1914,7 +2373,9 @@ describe("bash tool - background execution", () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 
     const tempDir = new TestTempDir("test-bash-bg");
-    const config = createTestToolConfig(tempDir.path);
+    // Unique workspace for the exact-name assertion (see the timeout test above).
+    const workspaceId = path.basename(tempDir.path);
+    const config = createTestToolConfig(tempDir.path, { workspaceId });
     config.backgroundProcessManager = manager;
 
     const tool = createBashTool(config);
@@ -1937,7 +2398,590 @@ describe("bash tool - background execution", () => {
       throw new Error("Expected background process ID in result");
     }
 
+    await manager.terminateAll();
+    fs.rmSync(`/tmp/mux-bashes/${workspaceId}`, { recursive: true, force: true });
     tempDir[Symbol.dispose]();
+  });
+
+  describe("live queued-message backgrounding", () => {
+    it.each([
+      { phase: "running", emitEvents: true, backgrounds: true },
+      { phase: "running", emitEvents: false, backgrounds: true },
+      { phase: "preparation", emitEvents: true, backgrounds: true },
+      { phase: "registration", emitEvents: true, backgrounds: true },
+      { phase: "never", emitEvents: true, backgrounds: false },
+      { phase: "withdrawn", emitEvents: true, backgrounds: false },
+    ] as const)(
+      "$phase (chat events: $emitEvents)",
+      async ({ phase, emitEvents, backgrounds }) => {
+        using tempDir = new TestTempDir("test-bash-live-queue");
+        const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+        const config = createTestToolConfig(tempDir.path);
+        config.backgroundProcessManager = manager;
+        if (emitEvents) config.emitChatEvent = () => undefined;
+
+        const processReady = Promise.withResolvers<void>();
+        const sampledWhileReady = Promise.withResolvers<void>();
+        let runtimeReady = false;
+        let queued = phase === "preparation" || phase === "withdrawn";
+        const dispatchModes: Array<"tool-end" | "turn-end" | undefined> = [];
+        config.hasQueuedMessages = (dispatchMode?: "tool-end" | "turn-end") => {
+          dispatchModes.push(dispatchMode);
+          if (runtimeReady) sampledWhileReady.resolve();
+          return queued;
+        };
+
+        // Publish/withdraw the live decision before registration is ready, without notifying
+        // the manager. A withdrawn preparation-time decision must not become a pending flag.
+        const register = manager.registerForegroundProcess.bind(manager);
+        const registrationSpy = spyOn(manager, "registerForegroundProcess").mockImplementation(
+          (...args) => {
+            if (phase === "registration") queued = true;
+            if (phase === "withdrawn") queued = false;
+            return register(...args);
+          }
+        );
+
+        // Keep the actual runtime/manager: wait for the process to install its completion
+        // watcher before returning its real ExecStream. No sleeps or exit-grace coordination.
+        const exec = config.runtime.exec.bind(config.runtime);
+        const execSpy = spyOn(config.runtime, "exec").mockImplementation(
+          async (script, options) => {
+            const stream = await exec(script, options);
+            const reader = stream.stdout.getReader();
+            try {
+              if ((await reader.read()).done) throw new Error("Process exited before readiness");
+            } finally {
+              reader.releaseLock();
+            }
+            runtimeReady = true;
+            processReady.resolve();
+            return stream;
+          }
+        );
+
+        const completionFile = path.join(tempDir.path, "complete");
+        const scriptFile = path.join(tempDir.path, "gated.cjs");
+        fs.writeFileSync(completionFile, "");
+        fs.writeFileSync(
+          scriptFile,
+          `const fs = require("node:fs");
+const completionFile = ${JSON.stringify(completionFile)};
+const watcher = fs.watch(completionFile, () => {
+  if (fs.readFileSync(completionFile, "utf8") !== "complete") return;
+  watcher.close();
+  console.log("done");
+  process.exitCode = 3;
+});
+console.log("ready");
+`
+        );
+        const abortController = new AbortController();
+        let settled = false;
+        const resultPromise = (
+          createBashTool(config).execute!(
+            {
+              script: `${shellQuote(process.execPath)} ${shellQuote(scriptFile)}`,
+              timeout_secs: 10,
+              run_in_background: false,
+              display_name: "live-queue",
+            },
+            {
+              ...mockToolCallOptions,
+              abortSignal: AbortSignal.any([abortController.signal, AbortSignal.timeout(5000)]),
+            }
+          ) as Promise<BashToolResult>
+        ).then((result) => {
+          settled = true;
+          return result;
+        });
+        const waitForSignal = (signal: Promise<void>) =>
+          Promise.race([signal.then(() => true), resultPromise.then(() => false)]);
+
+        try {
+          expect(await waitForSignal(processReady.promise)).toBe(true);
+          // Already-true decisions can background immediately on registration; the other
+          // cases must observe the live interval while the actual process is still running.
+          if (phase === "running" || !backgrounds) {
+            expect(await waitForSignal(sampledWhileReady.promise)).toBe(true);
+          }
+
+          if (phase === "running") {
+            expect(settled).toBe(false);
+            // A live decision can change without any new enqueue event (e.g. compaction ends).
+            queued = true;
+          }
+
+          if (backgrounds) {
+            const result = await resultPromise;
+            expect(result.success).toBe(true);
+            if (!(result.success && "backgroundProcessId" in result)) {
+              throw new Error("Expected the running Bash process to background");
+            }
+            const running = await manager.list(config.workspaceId);
+            expect(running).toHaveLength(1);
+            expect(running[0]).toMatchObject({ id: result.backgroundProcessId, status: "running" });
+            expect(manager.getForegroundToolCallIds(config.workspaceId!)).toEqual([]);
+          } else {
+            // A false/withdrawn live decision must leave Bash waiting on the actual process.
+            expect(settled).toBe(false);
+            expect(manager.getForegroundToolCallIds(config.workspaceId!)).toEqual([
+              mockToolCallOptions.toolCallId,
+            ]);
+            expect(await manager.list(config.workspaceId)).toEqual([]);
+            fs.writeFileSync(completionFile, "complete");
+            const result = await resultPromise;
+            // A nonzero process exit stays a foreground failure, not a successful background task.
+            expect(result).toMatchObject({ success: false, exitCode: 3, output: "done" });
+            expect(manager.getForegroundToolCallIds(config.workspaceId!)).toEqual([]);
+          }
+          expect(dispatchModes.length).toBeGreaterThan(0);
+          expect(dispatchModes.every((mode) => mode === "tool-end")).toBe(true);
+        } finally {
+          abortController.abort();
+          await resultPromise.catch(() => undefined);
+          await manager.cleanup(config.workspaceId!);
+          execSpy.mockRestore();
+          registrationSpy.mockRestore();
+        }
+      },
+      15000
+    );
+  });
+
+  it("terminates the process and fails when foreground-to-background migration fails", async () => {
+    const tempDir = new TestTempDir("test-bash-migrate-fail");
+    // Point the manager's output root at a regular FILE so migrateToBackground's mkdir
+    // fails deterministically (stand-in for ENOSPC/EACCES-style failures).
+    const blockedRoot = path.join(tempDir.path, "bg-root-blocked");
+    fs.writeFileSync(blockedRoot, "not a directory");
+    const manager = new BackgroundProcessManager(blockedRoot);
+
+    const config = createTestToolConfig(process.cwd());
+    config.runtimeTempDir = tempDir.path;
+    config.backgroundProcessManager = manager;
+
+    const tool = createBashTool(config);
+    const pidFile = path.join(tempDir.path, "migrate-fail.pid");
+    const resultPromise = tool.execute!(
+      {
+        script: `echo $$ > "${pidFile}"; sleep 30`,
+        timeout_secs: 60,
+        run_in_background: false,
+        display_name: "migrate-fail",
+      },
+      mockToolCallOptions
+    ) as Promise<BashToolResult>;
+
+    // Wait for the script to be running before clicking "send to background".
+    const startDeadline = Date.now() + 5000;
+    while (!fs.existsSync(pidFile) && Date.now() < startDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(fs.existsSync(pidFile)).toBe(true);
+
+    const sendResult = manager.sendToBackground(mockToolCallOptions.toolCallId);
+    expect(sendResult.success).toBe(true);
+
+    // An untracked live process would be invisible to archive gates and crash-orphan scans,
+    // so a failed migration must terminate the process and report failure instead of
+    // claiming the process will continue running.
+    const result = await resultPromise;
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("terminated because it could not be tracked");
+    }
+
+    // The failure is returned only once the terminated command exited (#4805): until then a
+    // removal's cleanup() waits on the pending migration.
+    const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+    expect(pid).toBeGreaterThan(1);
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    if (alive) process.kill(pid, "SIGKILL");
+    expect(alive).toBe(false);
+
+    tempDir[Symbol.dispose]();
+  }, 15000);
+
+  // #4760: workspace removal calls cleanup() before deleting the checkout. For a foreground
+  // command sent to the background, that must kill the process, not just stop tracking it.
+  it("cleanup kills a process that was sent to the background", async () => {
+    const tempDir = new TestTempDir("test-bash-migrate-cleanup");
+    const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+    const config = createTestToolConfig(process.cwd());
+    config.runtimeTempDir = tempDir.path;
+    config.backgroundProcessManager = manager;
+
+    const tool = createBashTool(config);
+    const pidFile = path.join(tempDir.path, "migrate-cleanup.pid");
+    const resultPromise = tool.execute!(
+      {
+        script: `echo $$ > "${pidFile}"; sleep 30`,
+        timeout_secs: 60,
+        run_in_background: false,
+        display_name: "migrate-cleanup",
+      },
+      mockToolCallOptions
+    ) as Promise<BashToolResult>;
+
+    const startDeadline = Date.now() + 5000;
+    while (!fs.existsSync(pidFile) && Date.now() < startDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(fs.existsSync(pidFile)).toBe(true);
+    expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+    const result = await resultPromise;
+    expect(result.success).toBe(true);
+
+    const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+    expect(pid).toBeGreaterThan(1);
+    await manager.cleanup(config.workspaceId!);
+
+    // cleanup() joins the exit, so the process is gone as soon as it returns.
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    if (alive) process.kill(pid, "SIGKILL");
+    expect(alive).toBe(false);
+
+    tempDir[Symbol.dispose]();
+  }, 15000);
+
+  // #4805: while migrateToBackground sets up its files, the command has left foreground
+  // tracking but is not in the manager's processes yet. A removal's cleanup() landing then
+  // must still kill it instead of letting it register and keep running in a deleted checkout.
+  it("cleanup during a foreground command's migration kills it", async () => {
+    const tempDir = new TestTempDir("test-bash-migrate-cleanup-window");
+    const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+    const config = createTestToolConfig(process.cwd());
+    config.runtimeTempDir = tempDir.path;
+    config.backgroundProcessManager = manager;
+    // bash.ts reads the output dir as the migrateToBackground argument, inside the window.
+    const bgOutputDir = manager.getBgOutputDir();
+    let cleanupInWindow: Promise<void> | undefined;
+    spyOn(manager, "getBgOutputDir").mockImplementation(() => {
+      cleanupInWindow ??= manager.cleanup(config.workspaceId!);
+      return bgOutputDir;
+    });
+
+    const tool = createBashTool(config);
+    const pidFile = path.join(tempDir.path, "migrate-window.pid");
+    const resultPromise = tool.execute!(
+      {
+        script: `echo $$ > "${pidFile}"; sleep 30`,
+        timeout_secs: 60,
+        run_in_background: false,
+        display_name: "migrate-window",
+      },
+      mockToolCallOptions
+    ) as Promise<BashToolResult>;
+
+    const startDeadline = Date.now() + 5000;
+    while (!fs.existsSync(pidFile) && Date.now() < startDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(fs.existsSync(pidFile)).toBe(true);
+    expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+    await resultPromise;
+    expect(cleanupInWindow).toBeDefined();
+    await cleanupInWindow;
+
+    const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+    expect(pid).toBeGreaterThan(1);
+    let alive = true;
+    try {
+      process.kill(pid, 0);
+    } catch {
+      alive = false;
+    }
+    if (alive) process.kill(pid, "SIGKILL");
+    expect(alive).toBe(false);
+
+    tempDir[Symbol.dispose]();
+  }, 15000);
+
+  // #4967: cleanup() waited only for migrations that had begun when it started, and a command
+  // began its migration only after the awaited name claim and exit grace. A command still in
+  // those when cleanup looked then registered afterwards and kept running.
+  describe.skipIf(process.platform === "win32")("cleanup vs. a command being backgrounded", () => {
+    function isAlive(pid: number): boolean {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    /** Starts a foreground command; resolves once it runs, with its pid (reported via a FIFO). */
+    async function startCommand(tempDir: TestTempDir, manager: BackgroundProcessManager) {
+      const config = createTestToolConfig(process.cwd());
+      config.runtimeTempDir = tempDir.path;
+      config.backgroundProcessManager = manager;
+      const pidFifo = path.join(tempDir.path, "pid.fifo");
+      execFileSync("mkfifo", [pidFifo]);
+      const result = createBashTool(config).execute!(
+        {
+          script: `echo $$ > "${pidFifo}"; sleep 30`,
+          timeout_secs: 60,
+          run_in_background: false,
+          display_name: "migrate-seal",
+        },
+        mockToolCallOptions
+      ) as Promise<BashToolResult>;
+      const pid = Number.parseInt((await fs.promises.readFile(pidFifo, "utf8")).trim(), 10);
+      expect(pid).toBeGreaterThan(1);
+      return { workspaceId: config.workspaceId!, result, pid };
+    }
+
+    it("joins a command still claiming its record name, then stops it", async () => {
+      const tempDir = new TestTempDir("test-bash-migrate-cleanup-join");
+      const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+      // Parks the command once it has claimed its record name, before it migrates.
+      const claimed = Promise.withResolvers<void>();
+      const resumeCommand = Promise.withResolvers<void>();
+      const claim = manager.claimMigrationProcessId.bind(manager);
+      spyOn(manager, "claimMigrationProcessId").mockImplementation(async (...args) => {
+        const result = await claim(...args);
+        claimed.resolve();
+        await resumeCommand.promise;
+        return result;
+      });
+      let pid = 0;
+      try {
+        const command = await startCommand(tempDir, manager);
+        pid = command.pid;
+        expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+        await claimed.promise;
+
+        let cleanupDone = false;
+        const cleanup = manager.cleanup(command.workspaceId).then(() => (cleanupDone = true));
+        // Once pending I/O callbacks run, the old cleanup (no other process to stop) had returned.
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(cleanupDone).toBe(false);
+
+        resumeCommand.resolve();
+        await command.result;
+        await cleanup;
+        expect(await manager.list(command.workspaceId)).toEqual([]);
+        expect(isAlive(pid)).toBe(false);
+      } finally {
+        resumeCommand.resolve();
+        await manager.cleanup(TEST_WS);
+        if (pid > 1 && isAlive(pid)) process.kill(pid, "SIGKILL");
+        tempDir[Symbol.dispose]();
+      }
+    }, 15000);
+
+    it("terminates a command sent to the background while cleanup runs", async () => {
+      const tempDir = new TestTempDir("test-bash-migrate-cleanup-seal");
+      const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+      const finishTerminate = Promise.withResolvers<void>();
+      let otherClaim: AsyncDisposable | undefined;
+      let pid = 0;
+      try {
+        const command = await startCommand(tempDir, manager);
+        pid = command.pid;
+        // Keeps cleanup() running after its snapshot: stopping this process waits on a gate.
+        const busy = await manager.spawn(
+          new LocalRuntime(tempDir.path),
+          command.workspaceId,
+          "sleep 30",
+          { cwd: tempDir.path, displayName: "busy" }
+        );
+        expect(busy.success).toBe(true);
+        const terminating = Promise.withResolvers<void>();
+        const terminate = manager.terminate.bind(manager);
+        spyOn(manager, "terminate").mockImplementation(async (...args) => {
+          terminating.resolve();
+          await finishTerminate.promise;
+          return terminate(...args);
+        });
+
+        // Another migration holds the record-name lock: a refused command must not wait for it
+        // (up to its 30 s timeout) while cleanup waits for the command.
+        const held = await manager.claimMigrationProcessId(command.workspaceId, "other");
+        if (!held.success) throw new Error(held.error);
+        otherClaim = held;
+
+        const cleanup = manager.cleanup(command.workspaceId);
+        await terminating.promise; // cleanup has taken its snapshot and is still running
+        expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+        const result = await command.result;
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error).toContain("terminated because it could not be tracked");
+        }
+        finishTerminate.resolve();
+        await cleanup;
+        expect(await manager.list(command.workspaceId)).toEqual([]);
+        expect(isAlive(pid)).toBe(false);
+      } finally {
+        finishTerminate.resolve();
+        await otherClaim?.[Symbol.asyncDispose]();
+        await manager.cleanup(TEST_WS);
+        if (pid > 1 && isAlive(pid)) process.kill(pid, "SIGKILL");
+        tempDir[Symbol.dispose]();
+      }
+    }, 15000);
+  });
+
+  // #4878: two backends (desktop + `xum server` on one XUM_ROOT) have separate managers but
+  // share the migrated-record root, so migration names must be claimed across processes.
+  describe("foreground-to-background migration across backends", () => {
+    async function waitForFile(filePath: string): Promise<void> {
+      const deadline = Date.now() + 5000;
+      while (!fs.existsSync(filePath) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(fs.existsSync(filePath)).toBe(true);
+    }
+
+    function startForeground(
+      manager: BackgroundProcessManager,
+      tempDir: TestTempDir,
+      script: string,
+      displayName: string
+    ): Promise<BashToolResult> {
+      const config = createTestToolConfig(process.cwd());
+      config.runtimeTempDir = tempDir.path;
+      config.backgroundProcessManager = manager;
+      return createBashTool(config).execute!(
+        { script, timeout_secs: 60, run_in_background: false, display_name: displayName },
+        mockToolCallOptions
+      ) as Promise<BashToolResult>;
+    }
+
+    async function migratedOutputDir(
+      manager: BackgroundProcessManager,
+      result: BashToolResult
+    ): Promise<string> {
+      expect(result.success).toBe(true);
+      const processId = "backgroundProcessId" in result ? result.backgroundProcessId : undefined;
+      expect(processId).toBeDefined();
+      const proc = (await manager.list(TEST_WS)).find((p) => p.id === processId);
+      expect(proc).toBeDefined();
+      return proc!.outputDir;
+    }
+
+    it("gives same-name migrations from two backends distinct record directories", async () => {
+      const tempDir = new TestTempDir("test-bash-migrate-two-backends");
+      const bgRoot = path.join(tempDir.path, "bg-root");
+      const managers = [new BackgroundProcessManager(bgRoot), new BackgroundProcessManager(bgRoot)];
+      try {
+        const results = managers.map((manager, i) =>
+          startForeground(
+            manager,
+            tempDir,
+            `touch "${path.join(tempDir.path, `started-${i}`)}"; sleep 30`,
+            "dev"
+          )
+        );
+        await Promise.all(
+          managers.map((_, i) => waitForFile(path.join(tempDir.path, `started-${i}`)))
+        );
+        for (const manager of managers) {
+          expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+        }
+        const settled = await Promise.all(results);
+        const dirs = await Promise.all(managers.map((m, i) => migratedOutputDir(m, settled[i])));
+        expect(dirs[0]).not.toBe(dirs[1]);
+      } finally {
+        await Promise.all(managers.map((m) => m.cleanup(TEST_WS)));
+        tempDir[Symbol.dispose]();
+      }
+    }, 20000);
+
+    it("reports a command that exits while the name lock is contended as completed", async () => {
+      const tempDir = new TestTempDir("test-bash-migrate-exit-during-claim");
+      const bgRoot = path.join(tempDir.path, "bg-root");
+      const manager = new BackgroundProcessManager(bgRoot);
+      const started = path.join(tempDir.path, "started");
+      const go = path.join(tempDir.path, "go");
+      const pidFile = path.join(tempDir.path, "pid");
+      try {
+        const resultPromise = startForeground(
+          manager,
+          tempDir,
+          `echo $$ > "${pidFile}"; touch "${started}"; while [ ! -f "${go}" ]; do sleep 0.05; done; echo done; exit 3`,
+          "exits-during-claim"
+        );
+        await waitForFile(started);
+        // Another backend holds the spawn-name lock while this one sends its command to the
+        // background; the command exits before the lock frees up.
+        const otherBackendLock = await acquireProcessFileLock({
+          lockPath: path.join(bgRoot, TEST_WS, SPAWN_NAME_LOCK_FILENAME),
+          timeoutMs: 5000,
+          label: "test: other backend's spawn lock",
+        });
+        try {
+          expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          fs.writeFileSync(go, "");
+          const pid = Number.parseInt(fs.readFileSync(pidFile, "utf8").trim(), 10);
+          const deadline = Date.now() + 5000;
+          for (;;) {
+            try {
+              process.kill(pid, 0);
+            } catch {
+              break;
+            }
+            expect(Date.now()).toBeLessThan(deadline);
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
+        } finally {
+          await otherBackendLock[Symbol.asyncDispose]();
+        }
+
+        // The command finished before it could be migrated, so the real exit is reported.
+        const result = await resultPromise;
+        expect("backgroundProcessId" in result).toBe(false);
+        expect(result.exitCode).toBe(3);
+        expect(await manager.list(TEST_WS)).toEqual([]);
+      } finally {
+        await manager.cleanup(TEST_WS);
+        tempDir[Symbol.dispose]();
+      }
+    }, 20000);
+
+    it("does not inherit a previous session's exit marker", async () => {
+      const tempDir = new TestTempDir("test-bash-migrate-stale-marker");
+      const bgRoot = path.join(tempDir.path, "bg-root");
+      const staleDir = path.join(bgRoot, TEST_WS, "stale-job");
+      fs.mkdirSync(staleDir, { recursive: true });
+      fs.writeFileSync(path.join(staleDir, "exit_code"), "0");
+      fs.writeFileSync(
+        path.join(staleDir, "meta.json"),
+        JSON.stringify({ id: "stale-job", pid: 0, script: "old", startTime: 1, status: "exited" })
+      );
+      const manager = new BackgroundProcessManager(bgRoot);
+      const started = path.join(tempDir.path, "started");
+      try {
+        const resultPromise = startForeground(
+          manager,
+          tempDir,
+          `touch "${started}"; sleep 30`,
+          "stale-job"
+        );
+        await waitForFile(started);
+        expect(manager.sendToBackground(mockToolCallOptions.toolCallId).success).toBe(true);
+        const outputDir = await migratedOutputDir(manager, await resultPromise);
+        // A stale marker would make the live migrated command read as exited to the other
+        // backend's name probe and to crash-orphan archive gating.
+        expect(fs.existsSync(path.join(outputDir, "exit_code"))).toBe(false);
+      } finally {
+        await manager.cleanup(TEST_WS);
+        tempDir[Symbol.dispose]();
+      }
+    }, 20000);
   });
 
   it("should arm monitor for background mode and echo monitor config", async () => {
@@ -2033,13 +3077,13 @@ describe("bash tool - background execution", () => {
     tempDir[Symbol.dispose]();
   });
 
-  it("should inject shuxEnv environment variables in background mode", async () => {
+  it("should inject xumEnv environment variables in background mode", async () => {
     const manager = new BackgroundProcessManager("/tmp/mux-test-bg");
 
     const tempDir = new TestTempDir("test-bash-bg-mux-env");
     const config = createTestToolConfig(tempDir.path);
     config.backgroundProcessManager = manager;
-    config.shuxEnv = {
+    config.xumEnv = {
       MUX_MODEL_STRING: "openai:gpt-5.2",
       MUX_THINKING_LEVEL: "medium",
     };
@@ -2074,4 +3118,37 @@ describe("bash tool - background execution", () => {
     await manager.terminateAll();
     tempDir[Symbol.dispose]();
   });
+
+  // `exec` replaces the shell that runs the script. The exit code must still be recorded, or the
+  // process reads "running" until its lifetime timeout kills it.
+  it.skipIf(process.platform === "win32")(
+    "settles a background script that ends with exec",
+    async () => {
+      const tempDir = new TestTempDir("test-bash-bg-exec");
+      const manager = new BackgroundProcessManager(path.join(tempDir.path, "bg-root"));
+      try {
+        const config = createTestToolConfig(tempDir.path);
+        config.backgroundProcessManager = manager;
+        const result = (await createBashTool(config).execute!(
+          {
+            script: "exec sleep 1",
+            timeout_secs: 30,
+            run_in_background: true,
+            display_name: "exec-sleep",
+          },
+          mockToolCallOptions
+        )) as BashToolResult;
+        if (!(result.success && "backgroundProcessId" in result)) {
+          throw new Error("Expected background process ID in result");
+        }
+
+        const output = await manager.getOutput(result.backgroundProcessId, undefined, undefined, 5);
+        expect(output).toMatchObject({ success: true, status: "exited", exitCode: 0 });
+      } finally {
+        await manager.terminateAll();
+        tempDir[Symbol.dispose]();
+      }
+    },
+    15000
+  );
 });

@@ -5,26 +5,45 @@
  * Each workspace can have multiple terminal windows open simultaneously.
  */
 
-import { app, BrowserWindow, shell } from "electron";
+import { app, BrowserWindow, shell, type BrowserWindowConstructorOptions } from "electron";
 import * as path from "path";
-import { resolveShuxEnvironmentValue } from "@/common/compat/legacyMux";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { normalizeAndValidateExternalUrl } from "@/desktop/utils/normalizeAndValidateExternalUrl";
+import { refuseSessionTapeReplayExternalOpen } from "@/desktop/sessionTapeReplayEgress";
+import { TERMINAL_DEV_SERVER_ORIGIN } from "@/desktop/terminalDevServerOrigin";
 import { log } from "@/node/services/log";
 import type { Config } from "@/node/config";
+import { TerminalWindowRegistry } from "./terminalWindowRegistry";
 
-// SHUX_PROXY_URI explicitly overrides VSCODE_PROXY_URI for localhost external-link rewrites.
-const shuxProxyUri = resolveShuxEnvironmentValue("PROXY_URI", process.env)?.trim();
+// XUM_PROXY_URI explicitly overrides VSCODE_PROXY_URI for localhost external-link rewrites.
+const xumProxyUri = resolveXumEnvironmentValue("PROXY_URI", process.env)?.trim();
 const localhostProxyTemplate =
   // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- empty/whitespace-only env vars should be treated as unset
-  shuxProxyUri || process.env.VSCODE_PROXY_URI?.trim() || undefined;
+  xumProxyUri || process.env.VSCODE_PROXY_URI?.trim() || undefined;
 
 export class TerminalWindowManager {
-  private windows = new Map<string, Set<BrowserWindow>>(); // workspaceId -> Set of windows
+  private readonly windows = new TerminalWindowRegistry<BrowserWindow>();
   private windowCount = 0; // Counter for unique window IDs
   private readonly config: Config;
+  private onSessionWindowClosed: ((sessionId: string, closedBy: "user" | "app") => void) | null =
+    null;
+  /** Windows closed by closeTerminalWindow rather than by the user. */
+  private readonly appClosedWindows = new WeakSet<BrowserWindow>();
 
-  constructor(config: Config) {
+  constructor(
+    config: Config,
+    private readonly createWindow: (options: BrowserWindowConstructorOptions) => BrowserWindow = (
+      options
+    ) => new BrowserWindow(options)
+  ) {
     this.config = config;
+  }
+
+  /** Called with the session ID when a pop-out window that showed a session has closed. */
+  setSessionWindowClosedHandler(
+    handler: (sessionId: string, closedBy: "user" | "app") => void
+  ): void {
+    this.onSessionWindowClosed = handler;
   }
 
   /**
@@ -32,7 +51,11 @@ export class TerminalWindowManager {
    * Multiple windows can be open for the same workspace
    * @param sessionId Optional session ID to reattach to (for pop-out handoff from embedded terminal)
    */
-  async openTerminalWindow(workspaceId: string, sessionId?: string): Promise<void> {
+  async openTerminalWindow(
+    workspaceId: string,
+    sessionId?: string,
+    initialTitle?: string
+  ): Promise<void> {
     this.windowCount++;
     const windowId = this.windowCount;
 
@@ -48,7 +71,7 @@ export class TerminalWindowManager {
       title = `Terminal ${windowId} — ${workspaceId}`;
     }
 
-    const terminalWindow = new BrowserWindow({
+    const terminalWindow = this.createWindow({
       width: 1000,
       height: 600,
       title,
@@ -64,6 +87,7 @@ export class TerminalWindowManager {
     });
 
     const openExternalUrl = (url: string): void => {
+      if (refuseSessionTapeReplayExternalOpen(url)) return;
       const externalUrl = normalizeAndValidateExternalUrl({
         url,
         localhostProxyTemplate,
@@ -90,26 +114,29 @@ export class TerminalWindowManager {
     });
 
     // Track the window
-    if (!this.windows.has(workspaceId)) {
-      this.windows.set(workspaceId, new Set());
-    }
-    this.windows.get(workspaceId)!.add(terminalWindow);
+    this.windows.add(workspaceId, terminalWindow, sessionId);
 
     // Clean up when window is closed
     terminalWindow.on("closed", () => {
-      const windowSet = this.windows.get(workspaceId);
-      if (windowSet) {
-        windowSet.delete(terminalWindow);
-        if (windowSet.size === 0) {
-          this.windows.delete(workspaceId);
+      this.windows.remove(workspaceId, terminalWindow);
+      log.info(`Terminal window ${windowId} closed for workspace: ${workspaceId}`);
+      // 'closed' fires only when the window really goes away: its reload and a renderer crash
+      // keep the window, so the session survives those.
+      if (sessionId) {
+        try {
+          this.onSessionWindowClosed?.(
+            sessionId,
+            this.appClosedWindows.has(terminalWindow) ? "app" : "user"
+          );
+        } catch (err) {
+          log.error(`Failed to end terminal session ${sessionId} after its window closed:`, err);
         }
       }
-      log.info(`Terminal window ${windowId} closed for workspace: ${workspaceId}`);
     });
 
     // Load the terminal page
-    // Match main window logic: use dev server unless packaged or SHUX_E2E_LOAD_DIST=1
-    const forceDistLoad = resolveShuxEnvironmentValue("E2E_LOAD_DIST", process.env) === "1";
+    // Match main window logic: use dev server unless packaged or XUM_E2E_LOAD_DIST=1
+    const forceDistLoad = resolveXumEnvironmentValue("E2E_LOAD_DIST", process.env) === "1";
     const useDevServer = !app.isPackaged && !forceDistLoad;
 
     // Build query params including optional sessionId for session handoff
@@ -117,11 +144,16 @@ export class TerminalWindowManager {
     if (sessionId) {
       queryParams.sessionId = sessionId;
     }
+    if (initialTitle) {
+      queryParams.title = initialTitle;
+    }
 
     if (useDevServer) {
       // Development mode - load from Vite dev server
       const params = new URLSearchParams(queryParams);
-      await terminalWindow.loadURL(`http://localhost:5173/terminal.html?${params.toString()}`);
+      await terminalWindow.loadURL(
+        `${TERMINAL_DEV_SERVER_ORIGIN}/terminal.html?${params.toString()}`
+      );
       terminalWindow.webContents.openDevTools();
     } else {
       // Production mode (or E2E dist mode) - load from built files
@@ -134,47 +166,15 @@ export class TerminalWindowManager {
   }
 
   /**
-   * Close all terminal windows for a workspace
+   * Close a workspace's terminal windows: only the one showing `sessionId` when given (its shell
+   * exited), otherwise all of them.
    */
-  closeTerminalWindow(workspaceId: string): void {
-    const windowSet = this.windows.get(workspaceId);
-    if (windowSet) {
-      for (const window of windowSet) {
-        if (!window.isDestroyed()) {
-          window.close();
-        }
+  closeTerminalWindow(workspaceId: string, sessionId?: string): void {
+    for (const window of this.windows.select(workspaceId, sessionId)) {
+      if (!window.isDestroyed()) {
+        this.appClosedWindows.add(window);
+        window.close();
       }
-      this.windows.delete(workspaceId);
     }
-  }
-
-  /**
-   * Close all terminal windows for all workspaces
-   */
-  closeAll(): void {
-    for (const [workspaceId, windowSet] of this.windows.entries()) {
-      for (const window of windowSet) {
-        if (!window.isDestroyed()) {
-          window.close();
-        }
-      }
-      this.windows.delete(workspaceId);
-    }
-  }
-
-  /**
-   * Get all windows for a workspace
-   */
-  getWindows(workspaceId: string): BrowserWindow[] {
-    const windowSet = this.windows.get(workspaceId);
-    if (!windowSet) return [];
-    return Array.from(windowSet).filter((w) => !w.isDestroyed());
-  }
-
-  /**
-   * Get count of open terminal windows for a workspace
-   */
-  getWindowCount(workspaceId: string): number {
-    return this.getWindows(workspaceId).length;
   }
 }

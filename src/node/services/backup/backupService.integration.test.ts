@@ -1,13 +1,17 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as jsonc from "jsonc-parser";
 import { Config } from "@/node/config";
+import * as disposableExec from "@/node/utils/disposableExec";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
 import { createBackupGitRepo, createBackupPayloadStore } from "./adapters";
 import { backupCachePath } from "./gitRepo";
 import { BackupService } from "./backupService";
 import { REDACTED_BACKUP_VALUE } from "./payload";
+import { ProjectService } from "@/node/services/projectService";
+import { projectMemoryDirName } from "@/node/services/memoryService";
 import { runGit, writeFixtureFile } from "./testHelpers";
 
 const SECRET_FILES = [
@@ -59,13 +63,44 @@ describe("BackupService against a real repository", () => {
       .sort();
   }
 
+  // #4417: a first push once stalled past the 5 s test timeout, and the IO_ERROR it returned
+  // after teardown could not say which git child it was waiting on. Report every spawn still
+  // running at teardown, and any that took over a second, so a recurrence names the command.
+  const runningSpawns = new Map<number, { command: string; startedAt: number }>();
+  let spawnCount = 0;
+  let execSpy: { mockRestore: () => void } | undefined;
+
+  beforeEach(() => {
+    const realExecFileAsync = disposableExec.execFileAsync;
+    execSpy = spyOn(disposableExec, "execFileAsync").mockImplementation((file, args, options) => {
+      const id = spawnCount++;
+      const startedAt = Date.now();
+      const command = [file, ...args].join(" ");
+      runningSpawns.set(id, { command, startedAt });
+      const spawned = realExecFileAsync(file, args, options);
+      const settled = () => {
+        const elapsedMs = Date.now() - startedAt;
+        if (elapsedMs > 1_000) {
+          console.warn(`[#4417] slow spawn (${elapsedMs} ms): ${command}`);
+        }
+        runningSpawns.delete(id);
+      };
+      // Observes the caller's promise; the caller still receives and handles the original.
+      void spawned.result.then(settled, settled);
+      return spawned;
+    });
+  });
+
   beforeEach(async () => {
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-backup-e2e-"));
     muxRoot = path.join(tempDir, "mux-root");
     originPath = path.join(tempDir, "origin.git");
     await fs.mkdir(muxRoot, { recursive: true });
     await runGit(["init", "--bare", "--initial-branch=main", originPath]);
-    settings = { repoUrl: originPath, branch: "main", path: "mux" };
+    // Header values stay local: a repository other people may read is the usual reason to
+    // back up at all, and it lets the fixture below carry a literal token without every push
+    // stopping for approval.
+    settings = { repoUrl: originPath, branch: "main", path: "mux", includeMcpHeaders: false };
     config = new Config(muxRoot);
     service = createService();
 
@@ -97,6 +132,12 @@ describe("BackupService against a real repository", () => {
   });
 
   afterEach(async () => {
+    const now = Date.now();
+    for (const { command, startedAt } of runningSpawns.values()) {
+      console.warn(`[#4417] still running at teardown (${now - startedAt} ms): ${command}`);
+    }
+    runningSpawns.clear();
+    execSpy?.mockRestore();
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
@@ -125,18 +166,59 @@ describe("BackupService against a real repository", () => {
     }
   });
 
-  it("keeps MCP URLs while redacting a literal header value", async () => {
+  it("keeps MCP URLs while leaving header values out of the backup", async () => {
     const pushed = await pushOrThrow();
-    expect(pushed.data.redactions.length).toBeGreaterThan(0);
+    expect(pushed.data.redactions).toEqual([
+      "servers.literal.headers",
+      "servers.referenced.headers",
+    ]);
 
     const clone = await cloneOrigin("verify");
     const mcp = await fs.readFile(path.join(clone, "mux/mcp.jsonc"), "utf-8");
     expect(mcp).not.toContain("Bearer abc123");
+    expect(mcp).not.toContain("MCP_TOKEN");
     expect(mcp).toContain(REDACTED_BACKUP_VALUE);
     expect(mcp).toContain('"url": "https://example.com/mcp"');
-    expect(mcp).toContain('"secret": "MCP_TOKEN"');
     // A comment is prose no projection can inspect, so it is not published at all.
     expect(mcp).not.toContain("comment-secret-abc123");
+  });
+
+  it("publishes header values once selected and approved, and restores them elsewhere", async () => {
+    const withHeaders = { ...settings, includeMcpHeaders: true };
+    const blocked = await service.push(withHeaders);
+    expect(blocked.success).toBe(false);
+    if (blocked.success) throw new Error("Expected the literal header to need approval");
+    expect(blocked.error.code).toBe("SECRET_DETECTED");
+    expect(blocked.error.files).toEqual(["mcp.jsonc"]);
+
+    const pushed = await service.push(withHeaders, {
+      approvedSecretDigest: blocked.error.secretApproval ?? undefined,
+    });
+    expect(pushed.success).toBe(true);
+    if (!pushed.success) throw new Error(pushed.error.message);
+    expect(pushed.data.redactions).toEqual([]);
+    const clone = await cloneOrigin("verify");
+    const mcp = await fs.readFile(path.join(clone, "mux/mcp.jsonc"), "utf-8");
+    expect(mcp).toContain("Bearer abc123");
+    expect(mcp).toContain('"secret": "MCP_TOKEN"');
+
+    // A fresh install gets the literal value; the reference names a secret it does not hold.
+    const freshRoot = path.join(tempDir, "fresh-root");
+    await fs.mkdir(freshRoot, { recursive: true });
+    const freshConfig = new Config(freshRoot);
+    const freshService = new BackupService(freshConfig, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(freshRoot, "backup-cache") }),
+      payload: createBackupPayloadStore({ config: freshConfig }),
+    });
+    const restored = await freshService.restore(withHeaders);
+    expect(restored.success).toBe(true);
+    const restoredMcp = jsonc.parse(
+      await fs.readFile(path.join(freshRoot, "mcp.jsonc"), "utf-8")
+    ) as {
+      servers: Record<string, { headers?: unknown }>;
+    };
+    expect(restoredMcp.servers.literal.headers).toEqual({ Authorization: "Bearer abc123" });
+    expect(restoredMcp.servers.referenced.headers).toBeUndefined();
   });
 
   it("does not create a second commit when nothing changed", async () => {
@@ -341,6 +423,32 @@ describe("BackupService against a real repository", () => {
     expect(service.getSettings()?.lastRestoredCommit).toBe(pushed.data.commit);
   });
 
+  it("restores and re-pushes a pre-rename mux/ backup through xum/ settings", async () => {
+    // The backup was pushed while the default managed path was still `mux/`.
+    const pushed = await pushOrThrow();
+
+    // A post-rename client points the default `xum/` path at the same repository.
+    await writeFixtureFile(muxRoot, "AGENTS.md", "locally diverged\n");
+    settings = { ...settings, path: "xum/" };
+    const restored = await service.restore(settings);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.commit).toBe(pushed.data.commit);
+    expect(await fs.readFile(path.join(muxRoot, "AGENTS.md"), "utf-8")).toBe(
+      "global instructions\n"
+    );
+
+    // Pushing through the renamed settings updates mux/ in place instead of forking xum/.
+    await writeFixtureFile(muxRoot, "AGENTS.md", "updated after rename\n");
+    await pushOrThrow();
+    const clone = await cloneOrigin("after-rename");
+    const files = await listFiles(clone);
+    expect(files).toContain("mux/AGENTS.md");
+    expect(files.some((file) => file.startsWith("xum/"))).toBe(false);
+    expect(await fs.readFile(path.join(clone, "mux/AGENTS.md"), "utf-8")).toBe(
+      "updated after rename\n"
+    );
+  });
+
   it("reports an empty repository as reachable and bootstraps its first commit", async () => {
     const validated = await service.validate(settings);
     if (!validated.success) throw new Error(validated.error.message);
@@ -401,5 +509,61 @@ describe("BackupService against a real repository", () => {
     const missing = { ...settings, repoUrl: path.join(tempDir, "does-not-exist.git") };
     const validated = await service.validate(missing);
     expect(validated.success).toBe(false);
+  });
+
+  it("round-trips the project bundle and reimports a project at a different path", async () => {
+    // Source machine: one registered project with memory.
+    const projectPath = path.join(tempDir, "projects", "rocket");
+    await fs.mkdir(projectPath, { recursive: true });
+    const projectService = new ProjectService(config);
+    const created = await projectService.create(projectPath);
+    if (!created.success) throw new Error(created.error);
+    const sourceDir = projectMemoryDirName(created.data.normalizedPath);
+    await writeFixtureFile(muxRoot, `memory/project/${sourceDir}/notes.md`, "rocket memory\n");
+
+    const withProjects = { ...settings, includeProjects: true };
+    const pushed = await service.push(withProjects);
+    expect(pushed.success).toBe(true);
+
+    const clone = await cloneOrigin("bundle-verify");
+    const files = await listFiles(clone);
+    expect(files).toContain("mux/project-bundle/manifest.json");
+    expect(files).toContain(`mux/project-bundle/memory/project/${sourceDir}/notes.md`);
+    // The core manifest stays bundle-free so an old build's reader ignores the sidecar.
+    const coreManifest = await fs.readFile(path.join(clone, "mux", "manifest.json"), "utf-8");
+    expect(coreManifest).not.toContain("project-bundle");
+
+    // Target machine: a fresh Xum root restoring from the same repository.
+    const otherRoot = path.join(tempDir, "other-root");
+    await fs.mkdir(otherRoot, { recursive: true });
+    const otherConfig = new Config(otherRoot);
+    const otherService = new BackupService(otherConfig, {
+      gitRepo: createBackupGitRepo({ cacheRoot: path.join(otherRoot, "backup-cache") }),
+      payload: createBackupPayloadStore({ config: otherConfig }),
+    });
+    otherService.setProjectService(new ProjectService(otherConfig));
+
+    const preview = await otherService.preview(withProjects);
+    expect(preview.success).toBe(true);
+    if (!preview.success) throw new Error(preview.error.message);
+    expect(preview.data.projectImports).toHaveLength(1);
+    const candidate = preview.data.projectImports[0];
+    expect(candidate.sourcePath).toBe(created.data.normalizedPath);
+
+    const movedPath = path.join(tempDir, "projects", "rocket-moved");
+    await fs.mkdir(movedPath, { recursive: true });
+    const restored = await otherService.restore(withProjects, {
+      projectImports: [{ token: candidate.token, targetPath: movedPath }],
+    });
+    expect(restored.success).toBe(true);
+    if (!restored.success) throw new Error(restored.error.message);
+    expect(restored.data.projectImportResults[0]?.status).toBe("imported");
+
+    const rekeyedDir = projectMemoryDirName(path.resolve(movedPath));
+    expect(rekeyedDir).not.toBe(sourceDir);
+    expect(
+      await fs.readFile(path.join(otherRoot, "memory", "project", rekeyedDir, "notes.md"), "utf-8")
+    ).toBe("rocket memory\n");
+    expect(otherConfig.loadConfigOrDefault().projects.has(path.resolve(movedPath))).toBe(true);
   });
 });

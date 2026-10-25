@@ -1,8 +1,14 @@
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { StreamingContext } from "./StreamingContext";
 import { Mermaid, sanitizeMermaidSvg } from "./Mermaid";
+import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
+import MarkdownIt from "markdown-it";
+import { MarkdownRenderer } from "./MarkdownRenderer";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import * as RealMermaidModule from "mermaid";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 const DEFAULT_SVG =
   '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"><rect width="10" height="10" /></svg>';
@@ -11,6 +17,8 @@ const mermaidInitialize = mock(() => undefined);
 const mermaidParse = mock((_chart: string) => Promise.resolve());
 const mermaidRender = mock((_id: string, _chart: string) => Promise.resolve({ svg: DEFAULT_SVG }));
 
+// Restore the real mermaid module after this suite so the renderer stub cannot leak into later files.
+restoreModulesAfterSuite([["mermaid", { ...RealMermaidModule }]]);
 void mock.module("mermaid", () => ({
   default: {
     initialize: mermaidInitialize,
@@ -31,16 +39,19 @@ describe("Mermaid layout stability", () => {
   let originalWindow: typeof globalThis.window;
   let originalDocument: typeof globalThis.document;
   let originalDOMParser: typeof globalThis.DOMParser;
+  let originalHTMLElement: typeof globalThis.HTMLElement;
 
   beforeEach(() => {
     originalWindow = globalThis.window;
     originalDocument = globalThis.document;
     originalDOMParser = globalThis.DOMParser;
+    originalHTMLElement = globalThis.HTMLElement;
 
     const domWindow = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.window = domWindow;
     globalThis.document = domWindow.document;
     globalThis.DOMParser = domWindow.DOMParser;
+    globalThis.HTMLElement = domWindow.HTMLElement;
 
     mermaidParse.mockImplementation(() => Promise.resolve());
     mermaidRender.mockImplementation(() => Promise.resolve({ svg: DEFAULT_SVG }));
@@ -51,8 +62,167 @@ describe("Mermaid layout stability", () => {
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
     globalThis.DOMParser = originalDOMParser;
+    globalThis.HTMLElement = originalHTMLElement;
     mermaidParse.mockClear();
     mermaidRender.mockClear();
+  });
+
+  // React.lazy caches the resolved module for the whole process, so this must stay the first
+  // markdown mermaid render: later renders mount Mermaid synchronously (e.g. under `--rerun-each`).
+  test("markdown shows the pending diagram frame until the Mermaid chunk loads", async () => {
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <MarkdownRenderer content={"```mermaid\ngraph TD\nA-->B\n```"} />
+      </ThemeProvider>
+    );
+
+    // The chunk has not loaded yet: no zoom controls, but the same box Mermaid reserves.
+    const pending = view.container.querySelector<HTMLElement>(".mermaid-container");
+    expect(view.queryAllByRole("button")).toHaveLength(0);
+    expect(pending?.style.minHeight).toBe("300px");
+    expect(pending?.textContent).toBe("Rendering diagram...");
+    const pendingFrameStyle = pending?.parentElement?.style.cssText;
+
+    expect(await view.findByRole("button", { name: "⤢" })).toBeTruthy();
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg")).not.toBeNull()
+    );
+    // Same outer frame before and after the chunk loads, so nothing shifts.
+    const loaded = view.container.querySelector<HTMLElement>(".mermaid-container");
+    expect(loaded?.parentElement?.style.cssText).toBe(pendingFrameStyle);
+    expect(loaded?.style.minHeight).toBe("300px");
+  });
+
+  test("copies a selected textless diagram and excludes diagram controls", async () => {
+    const chart = "graph TD\nA-->B";
+    const view = render(
+      <div data-transcript-message>
+        <div data-transcript-quote-root>
+          <p>Before</p>
+          <Mermaid chart={chart} />
+          <p>After</p>
+        </div>
+      </div>
+    );
+    await waitFor(() =>
+      expect(view.container.querySelector(".mermaid-container svg")).not.toBeNull()
+    );
+    const diagram = view.container.querySelector(".mermaid-container")!;
+    const range = document.createRange();
+    range.selectNodeContents(diagram);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    expect(selection.toString()).toBe("");
+    const options = {
+      transcriptRoot: view.container,
+      selection,
+      target: diagram.querySelector("rect"),
+    };
+    const copied = getTranscriptContextMenuMarkdown(options)!;
+    const parsed = document.createElement("div");
+    parsed.innerHTML = new MarkdownIt().render(copied.text);
+    expect(parsed.querySelector("code.language-mermaid")?.textContent?.trim()).toBe(chart);
+    expect(copied.html).not.toContain("svg");
+    expect(
+      getTranscriptContextMenuMarkdown({
+        ...options,
+        target: view.container.querySelector("button"),
+      })
+    ).toBeNull();
+
+    const first = view.container.querySelector("p")!;
+    range.setStart(first.firstChild!, 0);
+    range.setEndBefore(diagram.parentElement!);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    expect(getTranscriptContextMenuMarkdown({ ...options, target: first })?.text).toBe("Before");
+
+    range.setEndAfter(diagram.parentElement!);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const mixed = getTranscriptContextMenuMarkdown({ ...options, target: first })!;
+    parsed.innerHTML = new MarkdownIt().render(mixed.text);
+    expect(parsed.querySelector("p")?.textContent).toBe("Before");
+    expect(parsed.querySelector("code.language-mermaid")?.textContent?.trim()).toBe(chart);
+    expect(parsed.textContent).not.toContain("After");
+  });
+
+  test("copies the displayed chart during pending and invalid streaming updates", async () => {
+    const first = "graph TD\nA-->B";
+    const next = "graph TD\nB-->C";
+    const renderContent = (chart: string) => (
+      <ThemeProvider forcedTheme="dark">
+        <StreamingContext.Provider value={{ isStreaming: true }}>
+          <div data-transcript-message>
+            <div data-transcript-quote-root>
+              <MarkdownRenderer content={"```mermaid\n" + chart + "\n```"} />
+            </div>
+          </div>
+        </StreamingContext.Provider>
+      </ThemeProvider>
+    );
+    const view = render(renderContent(first));
+    const copySource = () => {
+      const diagram = view.container.querySelector(".mermaid-container")!;
+      const range = document.createRange();
+      range.selectNodeContents(diagram);
+      const selection = window.getSelection()!;
+      selection.removeAllRanges();
+      selection.addRange(range);
+      const copied = getTranscriptContextMenuMarkdown({
+        transcriptRoot: view.container,
+        selection,
+        target: diagram,
+      })!;
+      const parsed = document.createElement("div");
+      parsed.innerHTML = new MarkdownIt().render(copied.text);
+      return parsed.querySelector("code.language-mermaid")?.textContent?.trim();
+    };
+    await waitFor(() => expect(view.container.querySelector("svg")).not.toBeNull());
+    expect(copySource()).toBe(first);
+    const pending = Promise.withResolvers<void>();
+    mermaidParse.mockImplementation(() => pending.promise);
+    view.rerender(renderContent(next));
+    expect(copySource()).toBe(first);
+    await waitFor(() => expect(mermaidParse).toHaveBeenCalledWith(next + "\n"));
+    expect(copySource()).toBe(first);
+    await act(async () => {
+      pending.reject(new Error("Incomplete diagram"));
+      await pending.promise.catch(() => undefined);
+    });
+    expect(copySource()).toBe(first);
+
+    mermaidParse.mockImplementation(() => Promise.resolve());
+    const third = "graph TD\nC-->D";
+    view.rerender(renderContent(third));
+    await waitFor(() => expect(copySource()).toBe(third));
+    const pasted = render(renderContent(copySource()!));
+    await waitFor(() =>
+      expect(pasted.container.querySelector(".mermaid-container svg")).not.toBeNull()
+    );
+  });
+
+  test("guest Escape cannot close an expanded host diagram", async () => {
+    const view = renderMermaid();
+    fireEvent.click(await view.findByRole("button", { name: "⤢" }));
+    const close = await view.findByRole("button", { name: "Close" });
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-desktop-viewport", "");
+    const canvas = document.createElement("canvas");
+    viewport.appendChild(canvas);
+    view.container.appendChild(viewport);
+    const event = new window.KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    });
+    fireEvent(canvas, event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(view.getByRole("button", { name: "Close" })).toBe(close);
+
+    fireEvent.keyDown(close, { key: "Escape" });
+    expect(view.queryByRole("button", { name: "Close" })).toBeNull();
   });
 
   test("reserves diagram height while a streaming diagram is still rendering", () => {

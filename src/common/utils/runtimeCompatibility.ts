@@ -5,7 +5,7 @@
  * with runtime implementations (LocalRuntime, SSHRuntime, etc.).
  */
 
-import { RuntimeModeSchema } from "@/common/orpc/schemas";
+import { RuntimeModeSchema } from "@/common/orpc/schemas/runtime";
 import type { RuntimeConfig } from "@/common/types/runtime";
 
 /**

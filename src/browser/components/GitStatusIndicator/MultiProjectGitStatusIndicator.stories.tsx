@@ -1,8 +1,9 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { userEvent, waitFor, within } from "@storybook/test";
+import { expect, userEvent, waitFor, within } from "storybook/test";
 import { useEffect, useMemo } from "react";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { clearGitStatus, useGitStatusStoreRaw } from "@/browser/stores/GitStatusStore";
 import type { ProjectGitStatusResult as ApiProjectGitStatusResult } from "@/common/orpc/schemas/api";
@@ -247,5 +248,9 @@ export const DialogOpen: Story = {
     await dialogScope.findByText("Project");
     await dialogScope.findByText("docs");
     await dialogScope.findByText("1 dirty");
+
+    // The green "+N" addition counts were 2.08:1 or lower in the light themes (#6885).
+    const additions = dialogScope.getAllByText(/^\+[1-9]\d*$/);
+    await expect(textsBelowAaInThemes(() => additions).join("\n")).toBe("");
   },
 };

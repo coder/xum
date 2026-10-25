@@ -1,5 +1,5 @@
 import { isPixel } from "@coder/pixel-storybook/storyapi";
-import { waitFor, within } from "@storybook/test";
+import { waitFor, within } from "storybook/test";
 
 import type { AppStory } from "@/browser/stories/meta.js";
 import { appMeta, AppWithMocks } from "@/browser/stories/meta.js";
@@ -99,10 +99,9 @@ export const ProposePlanInPlanMode: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        window.localStorage.setItem("agentId:ws-plan-mode", JSON.stringify("plan"));
-
         return setupSimpleChatStory({
           workspaceId: "ws-plan-mode",
+          agentId: "plan",
           messages: [
             createUserMessage("msg-1", "Help me refactor the authentication module", {
               historySequence: 1,
@@ -192,7 +191,7 @@ export const ProposePlanMobile: AppStory = {
  * Wide-viewport story that exercises the sticky plan TOC.
  *
  * The TOC lives in an absolutely-positioned `<aside>` outside the centered
- * `max-w-4xl` transcript column, and is gated by a container query on the
+ * `max-w-chat` transcript column, and is gated by a container query on the
  * transcript scrollport. At desktop (1280px) viewport the gate stays closed;
  * the `wide` viewport (1600px) gives the scrollport enough room to reveal
  * the TOC alongside the plan.
@@ -282,9 +281,8 @@ Blue/green cutover with automatic rollback on auth-error spikes.
 
     const canvas = within(canvasElement);
     const toc = await canvas.findByTestId("plan-toc-nav");
-    // Explicit timeout: preview.tsx's configure({ asyncUtilTimeout }) targets the
-    // storybook/test module, not this @storybook/test import, so waitFor would
-    // otherwise give up after 1s while the container query settles on loaded CI runners.
+    // Explicit timeout, above preview.tsx's 5 s default: the container query can settle late on
+    // loaded CI runners.
     await waitFor(
       () => {
         // Fail if the pinned viewport no longer reveals the full sticky ToC.

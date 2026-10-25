@@ -1,15 +1,21 @@
 import "../../../../tests/ui/dom";
 
 import React, { type ComponentProps, type PropsWithChildren } from "react";
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import * as ReactDndModule from "react-dnd";
 import * as ReactDndHtml5BackendModule from "react-dnd-html5-backend";
-import * as ReactColorfulModule from "react-colorful";
+import * as LazyHexColorPickerModule from "@/browser/components/LazyHexColorPicker/LazyHexColorPicker";
 import { installDom } from "../../../../tests/ui/dom";
-import { EXPANDED_PROJECTS_KEY, SIDEBAR_HIDE_SUBAGENTS_KEY } from "@/common/constants/storage";
-import { getDraftScopeId, getInputKey } from "@/common/constants/storage";
-import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_SIDEBAR_SECTION_ID } from "@/common/constants/scratch";
+import { EXPANDED_PROJECTS_KEY } from "@/common/constants/storage";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
+import {
+  SCRATCH_PROJECT_CONFIG_KEY,
+  SCRATCH_PROJECT_NAME,
+  SCRATCH_SIDEBAR_SECTION_ID,
+} from "@/common/constants/scratch";
 import { MULTI_PROJECT_SIDEBAR_SECTION_ID } from "@/common/constants/multiProject";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import type {
@@ -31,7 +37,6 @@ import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as PopoverErrorHookModule from "@/browser/hooks/usePopoverError";
 import * as TooltipModule from "../Tooltip/Tooltip";
-import * as SidebarCollapseButtonModule from "../SidebarCollapseButton/SidebarCollapseButton";
 import * as ConfirmationModalModule from "../ConfirmationModal/ConfirmationModal";
 import * as ProjectDeleteConfirmationModalModule from "../ProjectDeleteConfirmationModal/ProjectDeleteConfirmationModal";
 import * as PopoverErrorModule from "../PopoverError/PopoverError";
@@ -40,7 +45,11 @@ import * as WorkspaceSectionDropZoneModule from "../WorkspaceSectionDropZone/Wor
 import * as WorkspaceDragLayerModule from "../WorkspaceDragLayer/WorkspaceDragLayer";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import type ProjectSidebarComponent from "./ProjectSidebar";
+import type * as AgentListItemModuleExports from "@/browser/components/AgentListItem/AgentListItem";
 import type * as WorkspaceStatusIndicatorModuleExports from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
+import * as RealPositionedMenuModule from "@/browser/components/PositionedMenu/PositionedMenu";
+import * as RealContextMenuPositionModule from "@/browser/hooks/useContextMenuPosition";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 const agentItemTestId = (workspaceId: string) => `agent-item-${workspaceId}`;
 const toggleButtonLabel = (workspaceId: string) => `toggle-completed-${workspaceId}`;
@@ -53,22 +62,54 @@ const ProviderIconSvgStub = (props: React.SVGProps<SVGSVGElement>) => (
   <svg data-testid="provider-icon-mock" {...props} />
 );
 
-function installProviderIconSvgMocks() {
-  const providerIconSvgPaths = [
-    "@/browser/assets/icons/anthropic.svg?react",
-    "@/browser/assets/icons/openai.svg?react",
-    "@/browser/assets/icons/google.svg?react",
-    "@/browser/assets/icons/xai.svg?react",
-    "@/browser/assets/icons/openrouter.svg?react",
-    "@/browser/assets/icons/ollama.svg?react",
-    "@/browser/assets/icons/deepseek.svg?react",
-    "@/browser/assets/icons/moonshotai.svg?react",
-    "@/browser/assets/icons/aws.svg?react",
-    "@/browser/assets/icons/github.svg?react",
-    "@/browser/assets/icons/coder.svg?react",
-  ] as const;
+const PROVIDER_ICON_SVG_PATHS = [
+  "@/browser/assets/icons/anthropic.svg?react",
+  "@/browser/assets/icons/openai.svg?react",
+  "@/browser/assets/icons/google.svg?react",
+  "@/browser/assets/icons/xai.svg?react",
+  "@/browser/assets/icons/openrouter.svg?react",
+  "@/browser/assets/icons/ollama.svg?react",
+  "@/browser/assets/icons/deepseek.svg?react",
+  "@/browser/assets/icons/moonshotai.svg?react",
+  "@/browser/assets/icons/zai.svg?react",
+  "@/browser/assets/icons/aws.svg?react",
+  "@/browser/assets/icons/github.svg?react",
+  "@/browser/assets/icons/coder.svg?react",
+] as const;
 
-  for (const svgPath of providerIconSvgPaths) {
+// installProjectSidebarTestDoubles() registers module mocks from setup hooks, and `mock.restore()`
+// in cleanup does not undo mock.module, so restore the real modules once the suite ends; they
+// otherwise leak into every later test file in the bun process (#4639).
+restoreModulesAfterSuite([
+  ["@/browser/hooks/useContextMenuPosition", { ...RealContextMenuPositionModule }],
+  ["@/browser/components/PositionedMenu/PositionedMenu", { ...RealPositionedMenuModule }],
+]);
+// AgentListItem and the SVGs (logos, provider icons) are restored lazily instead: loading them
+// (or AgentListItem's SVG icons) while this file's module graph is being evaluated makes bun's
+// warm transpiler cache parse the SVG assets as JSX ("Legacy HTML comments not implemented").
+// The query-suffixed AgentListItem is the same real instance the real-row tests render. Without
+// svgr, bun test's real `?react` SVG module is the file loader's `{ default: <asset path> }`.
+function realAgentListItemModule(): typeof AgentListItemModuleExports {
+  /* eslint-disable @typescript-eslint/no-require-imports */
+  return require("../AgentListItem/AgentListItem?project-sidebar-real-row=1") as typeof AgentListItemModuleExports;
+  /* eslint-enable @typescript-eslint/no-require-imports */
+}
+afterAll(() => {
+  for (const svgPath of [
+    "@/browser/assets/logos/xum-logo-dark.svg?react",
+    "@/browser/assets/logos/xum-logo-light.svg?react",
+    ...PROVIDER_ICON_SVG_PATHS,
+  ]) {
+    void mock.module(svgPath, () => ({
+      default: Bun.resolveSync(svgPath.replace(/\?react$/, ""), import.meta.dir),
+    }));
+  }
+  const realAgentListItem = { ...realAgentListItemModule() };
+  void mock.module("@/browser/components/AgentListItem/AgentListItem", () => realAgentListItem);
+});
+
+function installProviderIconSvgMocks() {
+  for (const svgPath of PROVIDER_ICON_SVG_PATHS) {
     void mock.module(svgPath, () => ({
       __esModule: true,
       default: ProviderIconSvgStub,
@@ -123,6 +164,9 @@ interface MockAgentListItemProps {
   };
   depth?: number;
   rowRenderMeta?: AgentRowRenderMeta;
+  projectBadgeName?: string;
+  projectBadgeColor?: string;
+  projectBadgeIcon?: string;
   delegatedActivity?: { activeCount: number; queuedCount: number };
   hiddenSubAgentsSummary?: WorkspaceSubAgentsSummary;
   getWorkflowRunName?: (runId: string) => string | undefined;
@@ -130,25 +174,18 @@ interface MockAgentListItemProps {
   completedChildrenExpanded?: boolean;
   onToggleCompletedChildren?: (workspaceId: string) => void;
   onArchiveWorkspace?: (workspaceId: string, button: HTMLElement) => Promise<void>;
+  onCancelCreation?: (workspaceId: string) => Promise<void>;
 }
 
-type HexColorPickerProps = ComponentProps<typeof ReactColorfulModule.HexColorPicker>;
+type HexColorPickerProps = ComponentProps<typeof LazyHexColorPickerModule.LazyHexColorPicker>;
 
 let renderRealAgentListItems = false;
 let latestArchiveWorkspaceHandler:
   | ((workspaceId: string, button: HTMLElement) => Promise<void>)
   | null = null;
+let latestCancelCreationHandler: ((workspaceId: string) => Promise<void>) | null = null;
 
 let ProjectSidebar!: typeof ProjectSidebarComponent;
-let latestArchiveConfirmationModalProps: {
-  isOpen: boolean;
-  title: string;
-  description?: string;
-  warning?: string;
-  confirmLabel?: string;
-  onConfirm: () => void | Promise<void>;
-  onCancel: () => void;
-} | null = null;
 let preflightArchiveWorkspaceMock = mock(
   (_workspaceId: string): Promise<ArchivePreflightActionResult> => resolveArchivePreflight()
 );
@@ -165,6 +202,7 @@ let archivePopoverShowErrorMock = mock(
 );
 
 let interruptibleWorkspaceIds = new Set<string>();
+let monitoredWorkspaceIds = new Set<string>();
 let workspaceStoreSubscriptions = new Map<string, () => void>();
 let activeWorkflowRunIdsByWorkspaceId = new Map<string, string[]>();
 
@@ -177,13 +215,19 @@ function setupProjectSidebarDom(projectPath = "/projects/demo-project") {
     userProjects: new Map([[projectPath, { workspaces: [] }]]),
   });
   interruptibleWorkspaceIds = new Set();
+  monitoredWorkspaceIds = new Set();
   workspaceStoreSubscriptions = new Map();
   activeWorkflowRunIdsByWorkspaceId = new Map();
   installProjectSidebarTestDoubles();
 }
 
+function setSidebarPreferences(ui: NonNullable<UserPreferences["ui"]>) {
+  getAppConfigStore().updateOptimistically({ userPreferences: { ui } });
+}
+
 function cleanupProjectSidebarDom() {
   cleanup();
+  getAppConfigStore().updateOptimistically({ userPreferences: undefined });
   cleanupDom?.();
   cleanupDom = null;
   mock.restore();
@@ -209,15 +253,13 @@ function renderProjectSidebarForWorkspace(
   );
 }
 
-function useArchiveActions(
-  actions: Pick<
-    ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>,
-    "preflightArchiveWorkspace" | "archiveWorkspace"
-  >
+function mockWorkspaceActions(
+  actions: Partial<ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>>
 ) {
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
       ({
+        archivingWorkspaceIds: new Set<string>(),
         selectedWorkspace: null,
         setSelectedWorkspace: () => undefined,
         removeWorkspace: () => Promise.resolve({ success: true }),
@@ -249,6 +291,7 @@ function createProjectContextValue(
     refreshProjects: () => Promise.resolve(),
     addProject: () => undefined,
     removeProject: () => Promise.resolve({ success: true }),
+    getRemovalBlockers: () => Promise.resolve({ activeCount: 0, archivedCount: 0 }),
     isProjectCreateModalOpen: false,
     openProjectCreateModal: () => undefined,
     closeProjectCreateModal: () => undefined,
@@ -268,7 +311,9 @@ function createProjectContextValue(
     updateSecrets: () => Promise.resolve(),
     updateDisplayName: () => resolveVoidResult(),
     updateColor: () => resolveVoidResult(),
+    updateIcon: () => resolveVoidResult(),
     updateCustomInstructions: () => resolveVoidResult(),
+    updateCodeWorkspaceSyncPath: () => resolveVoidResult(),
     assignWorkspaceToSubProject: () => resolveVoidResult(),
     hasAnyProject: false,
     resolveNewChatProjectPath: () => null,
@@ -294,21 +339,25 @@ function installProjectSidebarTestDoubles() {
   );
   confirmDialogMock = mock(() => Promise.resolve(true));
   latestArchiveWorkspaceHandler = null;
-  latestArchiveConfirmationModalProps = null;
-  void mock.module("@/browser/assets/logos/shux-logo-dark.svg?react", () => ({
+  latestCancelCreationHandler = null;
+  void mock.module("@/browser/assets/logos/xum-logo-dark.svg?react", () => ({
     __esModule: true,
-    default: () => <svg data-testid="shux-logo-dark" />,
+    default: () => <svg data-testid="xum-logo-dark" />,
   }));
-  void mock.module("@/browser/assets/logos/shux-logo-light.svg?react", () => ({
+  void mock.module("@/browser/assets/logos/xum-logo-light.svg?react", () => ({
     __esModule: true,
-    default: () => <svg data-testid="shux-logo-light" />,
+    default: () => <svg data-testid="xum-logo-light" />,
   }));
-  void mock.module("../AgentListItem/AgentListItem", () => ({
+  void mock.module("@/browser/components/AgentListItem/AgentListItem", () => ({
     AgentListItem: (props: MockAgentListItemProps) => {
       if (props.draft) {
         return (
-          <div data-testid={`draft-item-${props.draft.draftId}`}>
+          <div
+            data-testid={`draft-item-${props.draft.draftId}`}
+            data-project-badge-icon={props.projectBadgeIcon}
+          >
             {props.draft.title ?? "Draft"}
+            {props.projectBadgeName != null && <span>{props.projectBadgeName}</span>}
           </div>
         );
       }
@@ -319,13 +368,8 @@ function installProjectSidebarTestDoubles() {
       const metadata = props.metadata;
 
       if (renderRealAgentListItems) {
-        /* eslint-disable @typescript-eslint/no-require-imports */
-        const ActualAgentListItem = (
-          require("../AgentListItem/AgentListItem?project-sidebar-real-row=1") as {
-            AgentListItem: React.ComponentType<Record<string, unknown>>;
-          }
-        ).AgentListItem;
-        /* eslint-enable @typescript-eslint/no-require-imports */
+        const ActualAgentListItem = realAgentListItemModule()
+          .AgentListItem as unknown as React.ComponentType<Record<string, unknown>>;
         return <ActualAgentListItem {...(props as unknown as Record<string, unknown>)} />;
       }
 
@@ -336,6 +380,7 @@ function installProjectSidebarTestDoubles() {
       const displayTitle = metadata.title ?? metadata.name;
 
       latestArchiveWorkspaceHandler = props.onArchiveWorkspace ?? null;
+      latestCancelCreationHandler = props.onCancelCreation ?? null;
 
       return (
         <div
@@ -346,6 +391,8 @@ function installProjectSidebarTestDoubles() {
           data-shared-below={String(props.rowRenderMeta?.sharedTrunkActiveBelowRow ?? false)}
           data-row-kind={props.rowRenderMeta?.rowKind ?? "unknown"}
           data-connector-layout={props.subAgentConnectorLayout ?? "default"}
+          data-project-badge-color={props.projectBadgeColor}
+          data-project-badge-icon={props.projectBadgeIcon}
           data-completed-expanded={String(props.completedChildrenExpanded ?? false)}
           data-delegated-active={String(props.delegatedActivity?.activeCount ?? 0)}
           data-delegated-queued={String(props.delegatedActivity?.queuedCount ?? 0)}
@@ -367,6 +414,7 @@ function installProjectSidebarTestDoubles() {
           )}
         >
           <span>{displayTitle}</span>
+          {props.projectBadgeName != null ? <span>{props.projectBadgeName}</span> : null}
           {hasCompletedChildren && props.onToggleCompletedChildren ? (
             <button
               type="button"
@@ -466,7 +514,11 @@ function installProjectSidebarTestDoubles() {
     currentOffset: null,
   })) as unknown as typeof ReactDndModule.useDragLayer);
   spyOn(ReactDndHtml5BackendModule, "getEmptyImage").mockImplementation(() => new Image());
-  spyOn(ReactColorfulModule, "HexColorPicker").mockImplementation(((props: HexColorPickerProps) => (
+  // Mock the lazy wrapper, not react-colorful: React.lazy keeps the first export it resolves for
+  // the whole process, so a per-test spy on react-colorful only reaches the first test (#6982).
+  spyOn(LazyHexColorPickerModule, "LazyHexColorPicker").mockImplementation(((
+    props: HexColorPickerProps
+  ) => (
     <button
       type="button"
       data-testid="hex-color-picker"
@@ -476,7 +528,7 @@ function installProjectSidebarTestDoubles() {
     >
       mock color picker
     </button>
-  )) as typeof ReactColorfulModule.HexColorPicker);
+  )) as typeof LazyHexColorPickerModule.LazyHexColorPicker);
 
   spyOn(DesktopTitlebarModule, "isDesktopMode").mockImplementation(() => false);
   spyOn(ThemeContextModule, "useTheme").mockImplementation(() => ({
@@ -505,6 +557,9 @@ function installProjectSidebarTestDoubles() {
     navigateFromSettings: () => undefined,
     navigateToAnalytics: () => undefined,
     navigateFromAnalytics: () => undefined,
+    navigateBack: () => undefined,
+    navigateForward: () => undefined,
+    usesBrowserHistory: false,
     currentWorkspaceId: null,
     currentSettingsSection: null,
     currentProjectId: null,
@@ -534,6 +589,7 @@ function installProjectSidebarTestDoubles() {
   spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
     () =>
       ({
+        archivingWorkspaceIds: new Set<string>(),
         selectedWorkspace: null,
         setSelectedWorkspace: () => undefined,
         preflightArchiveWorkspace: preflightArchiveWorkspaceMock,
@@ -580,6 +636,7 @@ function installProjectSidebarTestDoubles() {
         getWorkspaceMetadata: () => undefined,
         getWorkspaceSidebarState: (workspaceId: string) => ({
           canInterrupt: interruptibleWorkspaceIds.has(workspaceId),
+          activeBashMonitorCount: monitoredWorkspaceIds.has(workspaceId) ? 1 : 0,
           isStarting: false,
           awaitingUserQuestion: false,
           lastAbortReason: null,
@@ -607,9 +664,6 @@ function installProjectSidebarTestDoubles() {
   spyOn(TooltipModule, "TooltipContent").mockImplementation(
     (() => null) as unknown as typeof TooltipModule.TooltipContent
   );
-  spyOn(SidebarCollapseButtonModule, "SidebarCollapseButton").mockImplementation((() => (
-    <button type="button">toggle sidebar</button>
-  )) as unknown as typeof SidebarCollapseButtonModule.SidebarCollapseButton);
   spyOn(ConfirmationModalModule, "ConfirmationModal").mockImplementation(((props: {
     isOpen: boolean;
     title: string;
@@ -619,7 +673,6 @@ function installProjectSidebarTestDoubles() {
     onConfirm: () => void | Promise<void>;
     onCancel: () => void;
   }) => {
-    latestArchiveConfirmationModalProps = props;
     return props.isOpen ? (
       <div data-testid="archive-confirmation-modal">
         <div>{props.title}</div>
@@ -638,11 +691,15 @@ function installProjectSidebarTestDoubles() {
     ((props: {
       isOpen: boolean;
       projectName: string;
+      activeCount: number;
+      archivedCount: number;
       onConfirm: () => void;
       onCancel: () => void;
     }) =>
       props.isOpen ? (
-        <div data-testid="project-delete-confirmation-modal">{props.projectName}</div>
+        <div data-testid="project-delete-confirmation-modal">
+          {`${props.projectName}:${props.activeCount}:${props.archivedCount}`}
+        </div>
       ) : null) as unknown as typeof ProjectDeleteConfirmationModalModule.ProjectDeleteConfirmationModal
   );
   installProviderIconSvgMocks();
@@ -665,7 +722,7 @@ function installProjectSidebarTestDoubles() {
   spyOn(WorkspaceDragLayerModule, "WorkspaceDragLayer").mockImplementation(
     (() => null) as unknown as typeof WorkspaceDragLayerModule.WorkspaceDragLayer
   );
-  void mock.module("../PositionedMenu/PositionedMenu", () => ({
+  void mock.module("@/browser/components/PositionedMenu/PositionedMenu", () => ({
     PositionedMenu: (props: { open: boolean; children: React.ReactNode }) =>
       props.open ? <div data-testid="project-actions-menu">{props.children}</div> : null,
     PositionedMenuItem: (props: {
@@ -762,6 +819,68 @@ describe("ProjectSidebar scratch chats", () => {
     expect(view.getByText("Explore an idea")).toBeTruthy();
   });
 
+  test("renders a global pinned-first list with project badges and restores folders when disabled", async () => {
+    const alpha = {
+      ...createWorkspace("alpha", { title: "Alpha chat" }),
+      projects: undefined,
+      projectPath: "/projects/alpha",
+      projectName: "alpha",
+      pinnedAt: "2026-01-02T00:00:00.000Z",
+    };
+    const beta = {
+      ...createWorkspace("beta", { title: "Beta chat" }),
+      projects: undefined,
+      projectPath: "/projects/beta",
+      projectName: "beta",
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/alpha", { displayName: "Alpha Project", color: "Blue", workspaces: [] }],
+        ["/projects/beta", { displayName: "Beta Project", color: "Green", workspaces: [] }],
+      ]),
+    });
+    setSidebarPreferences({ sidebarFlatMode: true });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([
+            ["/projects/alpha", [alpha]],
+            ["/projects/beta", [beta]],
+          ])
+        }
+        workspaceRecency={{ alpha: 1, beta: 2 }}
+      />
+    );
+
+    expect(view.queryByLabelText("Expand project alpha")).toBeNull();
+    // Badge names are asserted inside their rows: the project management
+    // headers below the flat list repeat the display names.
+    expect(
+      within(view.getByTestId(agentItemTestId("alpha"))).getByText("Alpha Project")
+    ).toBeTruthy();
+    expect(
+      within(view.getByTestId(agentItemTestId("beta"))).getByText("Beta Project")
+    ).toBeTruthy();
+    const workspaceRows = Array.from(
+      view.container.querySelectorAll('[data-testid^="agent-item-"]')
+    );
+    expect(workspaceRows.map((row) => row.getAttribute("data-testid"))).toEqual([
+      agentItemTestId("beta"),
+      agentItemTestId("alpha"),
+    ]);
+
+    act(() => {
+      setSidebarPreferences({ sidebarFlatMode: false });
+    });
+    await waitFor(() => {
+      expect(view.getByLabelText("Expand project alpha")).toBeTruthy();
+      expect(view.getByLabelText("Expand project beta")).toBeTruthy();
+    });
+  });
   test("Ctrl+N from a selected scratch chat opens a scratch draft, not a workdir project draft", () => {
     // Scratch rows are bucketed under the scratch config key while the
     // selection's projectPath is the app-managed workdir, so the keybind
@@ -781,6 +900,7 @@ describe("ProjectSidebar scratch chats", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: {
             workspaceId: workspace.id,
             projectPath: scratchPath,
@@ -833,6 +953,991 @@ describe("ProjectSidebar scratch chats", () => {
   });
 });
 
+describe("ProjectSidebar title keys", () => {
+  // setupProjectSidebarDom loads ProjectSidebar behind the shared test doubles.
+  beforeEach(() => setupProjectSidebarDom());
+
+  afterEach(cleanupProjectSidebarDom);
+
+  // The collapsed sidebar renders no rows, but Shift+F2 needs none (#6328).
+  test("Shift+F2 generates the selected workspace's title with the sidebar collapsed", async () => {
+    const workspace = createWorkspace("title-target");
+    mockWorkspaceActions({
+      selectedWorkspace: {
+        workspaceId: workspace.id,
+        projectPath: workspace.projectPath,
+        projectName: workspace.projectName,
+        namedWorkspacePath: workspace.namedWorkspacePath,
+      },
+    });
+    const regenerateTitle = mock((_input: { workspaceId: string }) =>
+      Promise.resolve({ success: true as const, data: { title: "Generated" } })
+    );
+    const api = { workspace: { regenerateTitle } } as unknown as NonNullable<
+      ReturnType<typeof APIModule.useAPI>["api"]
+    >;
+    spyOn(APIModule, "useAPI").mockImplementation(() => ({
+      api,
+      status: "connected",
+      error: null,
+      authenticate: () => undefined,
+      retry: () => undefined,
+    }));
+
+    render(
+      <ProjectSidebar
+        collapsed={true}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([[workspace.projectPath, [workspace]]])}
+        workspaceRecency={{ [workspace.id]: Date.now() }}
+      />
+    );
+    fireEvent.keyDown(window, { key: "F2", shiftKey: true });
+
+    await waitFor(() =>
+      expect(regenerateTitle).toHaveBeenCalledWith({ workspaceId: workspace.id })
+    );
+  });
+});
+
+describe("ProjectSidebar flat chat list", () => {
+  beforeEach(() => {
+    setupProjectSidebarDom();
+    /* eslint-disable @typescript-eslint/no-require-imports */
+    ({ default: ProjectSidebar } = require("./ProjectSidebar?project-sidebar-flat-test=1") as {
+      default: typeof ProjectSidebarComponent;
+    });
+    /* eslint-enable @typescript-eslint/no-require-imports */
+    setSidebarPreferences({ sidebarFlatMode: true });
+  });
+
+  afterEach(cleanupProjectSidebarDom);
+
+  const singleProjectRefs = [
+    { projectPath: "/projects/demo-project", projectName: "demo-project" },
+  ];
+
+  describe("New chat button", () => {
+    const olderDemo = {
+      ...createWorkspace("older-demo", { title: "Older demo chat" }),
+      projects: singleProjectRefs,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+    const newerOther = {
+      ...createWorkspace("newer-other", { title: "Newer other chat" }),
+      projects: undefined,
+      projectPath: "/projects/other",
+      projectName: "other",
+      createdAt: "2026-01-02T00:00:00.000Z",
+    };
+
+    function renderFlatSidebar(
+      sortedWorkspacesByProject: Map<string, FrontendWorkspaceMetadata[]>
+    ) {
+      const createWorkspaceDraft = mock(() => undefined);
+      mockWorkspaceActions({ createWorkspaceDraft });
+      const view = render(
+        <ProjectSidebar
+          collapsed={false}
+          onToggleCollapsed={() => undefined}
+          sortedWorkspacesByProject={sortedWorkspacesByProject}
+          workspaceRecency={{}}
+        />
+      );
+      fireEvent.click(view.getByRole("button", { name: "New chat" }));
+      return createWorkspaceDraft;
+    }
+
+    test("targets the project of the most recently created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          ["/projects/other", { workspaces: [] }],
+        ]),
+      });
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo]],
+          ["/projects/other", [newerOther]],
+        ])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/other", undefined);
+    });
+
+    test("ignores a newer sub-agent because it is not a user-created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          ["/projects/other", { workspaces: [] }],
+        ]),
+      });
+      const newestChild = {
+        ...createWorkspace("newest-child", {
+          title: "Newest sub-agent",
+          parentWorkspaceId: olderDemo.id,
+        }),
+        projects: singleProjectRefs,
+        createdAt: "2026-01-03T00:00:00.000Z",
+      };
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo, newestChild]],
+          ["/projects/other", [newerOther]],
+        ])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith("/projects/other", undefined);
+    });
+
+    test("targets scratch when the most recently created chat is a scratch chat", () => {
+      const scratchPath = "/home/user/.xum/scratch/scratch-newest";
+      const scratch: FrontendWorkspaceMetadata = {
+        kind: "scratch",
+        id: "scratch-newest",
+        name: "scratch-scratch-newest",
+        projectName: "Scratch",
+        projectPath: scratchPath,
+        namedWorkspacePath: scratchPath,
+        createdAt: "2026-01-03T00:00:00.000Z",
+        runtimeConfig: { type: "local" },
+      };
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([
+          ["/projects/demo-project", [olderDemo]],
+          [SCRATCH_PROJECT_CONFIG_KEY, [scratch]],
+        ])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(SCRATCH_PROJECT_CONFIG_KEY, undefined);
+    });
+
+    test("targets the sub-project of the most recently created chat", () => {
+      projectContextValue = createProjectContextValue({
+        userProjects: new Map([
+          ["/projects/demo-project", { workspaces: [] }],
+          [
+            "/projects/demo-project/features",
+            { parentProjectPath: "/projects/demo-project", workspaces: [] },
+          ],
+        ]),
+      });
+      const newerInSection = {
+        ...createWorkspace("newer-section", {
+          title: "Newer section chat",
+          subProjectPath: "/projects/demo-project/features",
+        }),
+        projects: singleProjectRefs,
+        createdAt: "2026-01-02T00:00:00.000Z",
+      };
+
+      const createWorkspaceDraft = renderFlatSidebar(
+        new Map([["/projects/demo-project", [olderDemo, newerInSection]]])
+      );
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(
+        "/projects/demo-project",
+        "/projects/demo-project/features"
+      );
+    });
+
+    test("falls back to scratch when there are no chats", () => {
+      const createWorkspaceDraft = renderFlatSidebar(new Map());
+
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(SCRATCH_PROJECT_CONFIG_KEY, undefined);
+    });
+  });
+
+  // The collapsed sidebar's toggle bar New chat and Ctrl+N share one path; on a draft page nothing is
+  // selected, so both open another draft in the page's project.
+  describe("New chat without a selected chat", () => {
+    function renderOnDraftPage() {
+      const createWorkspaceDraft = mock(() => undefined);
+      mockWorkspaceActions({
+        createWorkspaceDraft,
+        pendingNewWorkspaceProject: "/projects/demo-project",
+        pendingNewWorkspaceSubProjectPath: "/projects/demo-project/features",
+        pendingNewWorkspaceDraftId: "draft-1",
+      });
+      render(
+        <ProjectSidebar
+          collapsed
+          onToggleCollapsed={() => undefined}
+          sortedWorkspacesByProject={new Map()}
+          workspaceRecency={{}}
+        />
+      );
+      return createWorkspaceDraft;
+    }
+
+    test("Ctrl+N opens a draft in the draft page's project", () => {
+      const createWorkspaceDraft = renderOnDraftPage();
+      fireEvent.keyDown(window, { key: "n", ctrlKey: true });
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(
+        "/projects/demo-project",
+        "/projects/demo-project/features"
+      );
+    });
+
+    test("the toggle bar's New chat request opens a draft in the draft page's project", () => {
+      const createWorkspaceDraft = renderOnDraftPage();
+      act(() => {
+        window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.NEW_CHAT_REQUESTED));
+      });
+      expect(createWorkspaceDraft).toHaveBeenCalledWith(
+        "/projects/demo-project",
+        "/projects/demo-project/features"
+      );
+    });
+  });
+
+  test("filters multi-project rows out of the flat list while the experiment is disabled", () => {
+    spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
+    const single = {
+      ...createWorkspace("single", { title: "Single chat" }),
+      projects: singleProjectRefs,
+    };
+    const multi = createWorkspace("multi", { title: "Multi chat" });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [single, multi]]])}
+        workspaceRecency={{ single: Date.now(), multi: Date.now() }}
+      />
+    );
+
+    expect(view.getByTestId(agentItemTestId("single"))).toBeTruthy();
+    expect(view.queryByTestId(agentItemTestId("multi"))).toBeNull();
+  });
+
+  test("filters _multi drafts out of the flat list while the experiment is disabled", () => {
+    spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
+    const workspace = {
+      ...createWorkspace("solo-draft-gate", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            _multi: [{ draftId: "draft-multi", createdAt: Date.now(), manualName: "" }],
+            "/projects/demo-project": [
+              { draftId: "draft-single", createdAt: Date.now(), manualName: "" },
+            ],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    setSidebarPreferences({ sidebarFlatMode: true });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ "solo-draft-gate": Date.now() }}
+      />
+    );
+
+    // The _multi draft follows the metadata gate: hidden while the experiment
+    // is off, while ordinary project drafts still render.
+    expect(view.getByTestId("draft-item-draft-single")).toBeTruthy();
+    expect(view.queryByTestId("draft-item-draft-multi")).toBeNull();
+  });
+
+  test("labels _multi drafts with the multi-project badge instead of the internal key", () => {
+    const workspace = {
+      ...createWorkspace("solo-multi-badge", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            _multi: [{ draftId: "draft-multi-badge", createdAt: Date.now(), manualName: "" }],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    setSidebarPreferences({ sidebarFlatMode: true });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ "solo-multi-badge": Date.now() }}
+      />
+    );
+
+    // The _multi bucket is a system key excluded from userProjects; the badge
+    // must show the explicit multi-project label, never the raw key.
+    const row = view.getByTestId("draft-item-draft-multi-badge");
+    expect(within(row).getByText("Multi-project")).toBeTruthy();
+    expect(within(row).queryByText(/_multi/)).toBeNull();
+  });
+
+  test("keeps project management headers reachable in flat mode without nesting chats", () => {
+    const workspace = {
+      ...createWorkspace("solo", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    setSidebarPreferences({ sidebarFlatMode: true });
+    // Grouped-mode expansion state must not nest chats under flat headers.
+    updatePersistedState(EXPANDED_PROJECTS_KEY, ["/projects/demo-project"]);
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ solo: Date.now() }}
+      />
+    );
+
+    // Per-project creation and the options menu stay reachable via the
+    // compact header row; the expansion chevron is grouped-mode only.
+    expect(view.getByLabelText("Create workspace in demo-project")).toBeTruthy();
+    expect(view.getByLabelText("Project options for demo-project")).toBeTruthy();
+    expect(view.queryByLabelText("Expand project demo-project")).toBeNull();
+    expect(view.queryByLabelText("Collapse project demo-project")).toBeNull();
+    // The chat renders once in the flat list, never nested under the header.
+    expect(view.getAllByTestId(agentItemTestId("solo"))).toHaveLength(1);
+  });
+
+  test("keeps sub-project management reachable in flat mode", () => {
+    const workspace = {
+      ...createWorkspace("solo-sub", { title: "Solo chat" }),
+      projects: singleProjectRefs,
+    };
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+      ]),
+    });
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            "/projects/demo-project": [
+              {
+                draftId: "draft-in-section",
+                createdAt: Date.now(),
+                manualName: "",
+                subProjectPath: "/projects/demo-project/features",
+              },
+            ],
+          },
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+    setSidebarPreferences({ sidebarFlatMode: true });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [workspace]]])}
+        workspaceRecency={{ "solo-sub": Date.now() }}
+      />
+    );
+
+    // SectionHeader is stubbed in this suite, so assert the management row's
+    // contract via its props: the flat row keeps the scoped controls but has
+    // no expansion toggle (nothing nests under it in flat mode), and its count
+    // includes section drafts like the grouped header.
+    expect(view.getByLabelText("Create workspace in demo-project")).toBeTruthy();
+    const sectionHeaderCalls = (
+      SectionHeaderModule.SectionHeader as unknown as {
+        mock: {
+          calls: Array<[Parameters<typeof SectionHeaderModule.SectionHeader>[0]]>;
+        };
+      }
+    ).mock.calls;
+    const sectionProps = sectionHeaderCalls
+      .map(([props]) => props)
+      .find((props) => props.section.id === "/projects/demo-project/features");
+    expect(sectionProps?.section.name).toBe("Features");
+    expect(sectionProps?.onToggleExpand).toBeUndefined();
+    expect(sectionProps?.workspaceCount).toBe(1);
+
+    // The management rows stay drop targets: the sub-project row assigns a
+    // dragged chat to the section, the project header clears the assignment.
+    const dropZoneCalls = (
+      WorkspaceSectionDropZoneModule.WorkspaceSectionDropZone as unknown as {
+        mock: {
+          calls: Array<
+            [Parameters<typeof WorkspaceSectionDropZoneModule.WorkspaceSectionDropZone>[0]]
+          >;
+        };
+      }
+    ).mock.calls.map(([props]) => props);
+    const sectionZone = dropZoneCalls.find(
+      (props) => props.sectionId === "/projects/demo-project/features"
+    );
+    expect(typeof sectionZone?.onDrop).toBe("function");
+    const clearZone = dropZoneCalls.find(
+      (props) => props.sectionId === null && props.projectPath === "/projects/demo-project"
+    );
+    expect(typeof clearZone?.onDrop).toBe("function");
+  });
+
+  test("badges flat rows with their sub-project identity, falling back when stale", () => {
+    const sectionScoped = {
+      ...createWorkspace("in-section", { title: "Scoped chat" }),
+      projects: singleProjectRefs,
+      subProjectPath: "/projects/demo-project/features",
+    };
+    const staleScoped = {
+      ...createWorkspace("stale-section", { title: "Stale chat" }),
+      projects: singleProjectRefs,
+      subProjectPath: "/projects/demo-project/deleted",
+    };
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { displayName: "Demo", workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+      ]),
+    });
+    setSidebarPreferences({ sidebarFlatMode: true });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([["/projects/demo-project", [sectionScoped, staleScoped]]])
+        }
+        workspaceRecency={{ "in-section": Date.now(), "stale-section": Date.now() }}
+      />
+    );
+
+    // A valid sub-project reference badges hierarchically (sub names are only
+    // unique within a parent); a stale (deleted) reference falls back to the
+    // parent project badge.
+    expect(
+      within(view.getByTestId(agentItemTestId("in-section"))).getByText("Demo / Features")
+    ).toBeTruthy();
+    expect(
+      within(view.getByTestId(agentItemTestId("stale-section"))).getByText("Demo")
+    ).toBeTruthy();
+  });
+
+  test("tells uncolored projects apart by avatar color, and gives scratch chats an avatar identity", () => {
+    const parentChat = { ...createWorkspace("parent-chat"), projects: singleProjectRefs };
+    const subChat = {
+      ...createWorkspace("sub-chat", { subProjectPath: "/projects/demo-project/features" }),
+      projects: singleProjectRefs,
+    };
+    const otherChat = {
+      ...createWorkspace("other-chat"),
+      projects: undefined,
+      projectPath: "/projects/other",
+      projectName: "other",
+    };
+    const scratchPath = "/home/user/.xum/scratch/scratch-chat";
+    const scratchChat: FrontendWorkspaceMetadata = {
+      kind: "scratch",
+      id: "scratch-chat",
+      name: "scratch-scratch-chat",
+      title: "Explore an idea",
+      projectName: "Scratch",
+      projectPath: scratchPath,
+      namedWorkspacePath: scratchPath,
+      runtimeConfig: { type: "local" },
+    };
+    // No project has a configured color.
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { displayName: "Demo", workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+        ["/projects/other", { displayName: "Other", workspaces: [] }],
+      ]),
+    });
+
+    const now = Date.now();
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([
+            ["/projects/demo-project", [parentChat, subChat]],
+            ["/projects/other", [otherChat]],
+            [SCRATCH_PROJECT_CONFIG_KEY, [scratchChat]],
+          ])
+        }
+        workspaceRecency={{
+          "parent-chat": now,
+          "sub-chat": now,
+          "other-chat": now,
+          "scratch-chat": now,
+        }}
+      />
+    );
+
+    const avatarColor = (workspaceId: string) =>
+      view.getByTestId(agentItemTestId(workspaceId)).dataset.projectBadgeColor;
+    // Different projects get different colors without the user picking any.
+    expect(avatarColor("other-chat")).not.toBe(avatarColor("parent-chat"));
+    // The sub-project avatar shows the parent's letter, so it keeps the parent's color too.
+    expect(avatarColor("sub-chat")).toBe(avatarColor("parent-chat"));
+    // Scratch chats have no project but still get an avatar identity.
+    expect(
+      within(view.getByTestId(agentItemTestId("scratch-chat"))).getByText(SCRATCH_PROJECT_NAME)
+    ).toBeTruthy();
+  });
+
+  test("flat rows and drafts carry their project's icon, and sub-project rows inherit the parent's", () => {
+    const parentChat = { ...createWorkspace("parent-chat"), projects: singleProjectRefs };
+    const subChat = {
+      ...createWorkspace("sub-chat", { subProjectPath: "/projects/demo-project/features" }),
+      projects: singleProjectRefs,
+    };
+    const otherChat = {
+      ...createWorkspace("other-chat"),
+      projects: undefined,
+      projectPath: "/projects/other",
+      projectName: "other",
+    };
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "icon-draft", createdAt: Date.now(), manualName: "" }],
+    });
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { displayName: "Demo", icon: "rocket", workspaces: [] }],
+        [
+          "/projects/demo-project/features",
+          {
+            displayName: "Features",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+        ["/projects/other", { displayName: "Other", workspaces: [] }],
+      ]),
+    });
+
+    const now = Date.now();
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([
+            ["/projects/demo-project", [parentChat, subChat]],
+            ["/projects/other", [otherChat]],
+          ])
+        }
+        workspaceRecency={{ "parent-chat": now, "sub-chat": now, "other-chat": now }}
+      />
+    );
+
+    const avatarIcon = (workspaceId: string) =>
+      view.getByTestId(agentItemTestId(workspaceId)).dataset.projectBadgeIcon;
+    expect(avatarIcon("parent-chat")).toBe("rocket");
+    expect(avatarIcon("sub-chat")).toBe("rocket");
+    expect(avatarIcon("other-chat")).toBeUndefined();
+    expect(view.getByTestId("draft-item-icon-draft").dataset.projectBadgeIcon).toBe("rocket");
+  });
+
+  test("coalesces best-of children into a task group in the flat list", () => {
+    const parentWorkspace = {
+      ...createWorkspace("parent", { title: "Parent workspace" }),
+      projects: singleProjectRefs,
+    };
+    const bestOfGroup = { groupId: "best-of-flat", index: 0, total: 2 } as const;
+    const childOne = {
+      ...createWorkspace("child-1", {
+        parentWorkspaceId: "parent",
+        taskStatus: "running",
+        title: "Candidate",
+        bestOf: bestOfGroup,
+      }),
+      projects: singleProjectRefs,
+    };
+    const childTwo = {
+      ...createWorkspace("child-2", {
+        parentWorkspaceId: "parent",
+        taskStatus: "queued",
+        title: "Candidate",
+        bestOf: { ...bestOfGroup, index: 1 },
+      }),
+      projects: singleProjectRefs,
+    };
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([["/projects/demo-project", [parentWorkspace, childOne, childTwo]]])
+        }
+        workspaceRecency={{ parent: Date.now(), "child-1": Date.now(), "child-2": Date.now() }}
+      />
+    );
+
+    // Best-of workers render behind one collapsed group header, not as bare rows.
+    expect(view.getByTestId("task-group-best-of-flat")).toBeTruthy();
+    expect(view.queryByTestId(agentItemTestId("child-1"))).toBeNull();
+    expect(view.queryByTestId(agentItemTestId("child-2"))).toBeNull();
+    expect(view.getByTestId(agentItemTestId("parent"))).toBeTruthy();
+  });
+
+  const mockDraftActions = (
+    workspaceDraftsByProject: Record<string, Array<Record<string, unknown>>>
+  ) =>
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject,
+          workspaceDraftPromotionsByProject: {},
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+  const renderedRowIds = (container: HTMLElement) =>
+    Array.from(
+      container.querySelectorAll('[data-testid^="agent-item-"], [data-testid^="draft-item-"]')
+    ).map((row) => row.getAttribute("data-testid"));
+
+  // Drafts lead the list in both sidebar modes, above pinned chats.
+  test.each([
+    { mode: "flat list", sidebarFlatMode: true },
+    { mode: "project view", sidebarFlatMode: false },
+  ])("renders drafts above the pinned block in the $mode", ({ sidebarFlatMode }) => {
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const regular = {
+      ...createWorkspace("regular-chat", { title: "Regular chat" }),
+      projects: singleProjectRefs,
+    };
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "draft-order", createdAt: Date.now(), manualName: "" }],
+    });
+    setSidebarPreferences({ sidebarFlatMode });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [pinned, regular]]])}
+        workspaceRecency={{ "pinned-chat": Date.now(), "regular-chat": Date.now() }}
+      />
+    );
+
+    expect(renderedRowIds(view.container)).toEqual([
+      "draft-item-draft-order",
+      agentItemTestId("pinned-chat"),
+      agentItemTestId("regular-chat"),
+    ]);
+  });
+
+  test("labels the Pinned and Recent sections below the drafts and moves a chat between them on pin", () => {
+    const newer = {
+      ...createWorkspace("newer-chat", { title: "Newer chat" }),
+      projects: singleProjectRefs,
+    };
+    const older = {
+      ...createWorkspace("older-chat", { title: "Older chat" }),
+      projects: singleProjectRefs,
+    };
+    const now = Date.now();
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "draft-labels", createdAt: now, manualName: "" }],
+    });
+    const renderFlatList = (workspaces: FrontendWorkspaceMetadata[]) => (
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", workspaces]])}
+        workspaceRecency={{ "newer-chat": now, "older-chat": now - 60_000 }}
+      />
+    );
+    // Section labels and rows in document order.
+    const listOrder = () => {
+      const nodes = [
+        ...view.container.querySelectorAll<HTMLElement>(
+          '[data-testid^="agent-item-"], [data-testid^="draft-item-"]'
+        ),
+        ...view.queryAllByText(/^(Pinned|Recent)$/),
+      ];
+      nodes.sort((a, b) =>
+        a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+      );
+      return nodes.map((node) => node.getAttribute("data-testid") ?? node.textContent);
+    };
+
+    const view = render(renderFlatList([newer, older]));
+    // No pinned chat, no Pinned section. Drafts lead without a label.
+    const unpinnedOrder = [
+      "draft-item-draft-labels",
+      "Recent",
+      agentItemTestId("newer-chat"),
+      agentItemTestId("older-chat"),
+    ];
+    expect(listOrder()).toEqual(unpinnedOrder);
+
+    // Pinning (the optimistic pinnedAt) moves the chat into Pinned at once.
+    view.rerender(renderFlatList([newer, { ...older, pinnedAt: "2026-01-01T00:00:00.000Z" }]));
+    expect(listOrder()).toEqual([
+      "draft-item-draft-labels",
+      "Pinned",
+      agentItemTestId("older-chat"),
+      "Recent",
+      agentItemTestId("newer-chat"),
+    ]);
+
+    // Unpinning returns it to its recency position in Recent.
+    view.rerender(renderFlatList([newer, older]));
+    expect(listOrder()).toEqual(unpinnedOrder);
+  });
+
+  test("collapses each section from its heading and keeps it collapsed after a remount", () => {
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const regular = {
+      ...createWorkspace("regular-chat", { title: "Regular chat" }),
+      projects: singleProjectRefs,
+    };
+    mockDraftActions({
+      "/projects/demo-project": [{ draftId: "draft-kept", createdAt: Date.now(), manualName: "" }],
+    });
+    const renderFlatList = () =>
+      render(
+        <ProjectSidebar
+          collapsed={false}
+          onToggleCollapsed={() => undefined}
+          sortedWorkspacesByProject={new Map([["/projects/demo-project", [pinned, regular]]])}
+          workspaceRecency={{ "pinned-chat": Date.now(), "regular-chat": Date.now() }}
+        />
+      );
+    let view = renderFlatList();
+    // The project management row stands for the Projects section's rows.
+    const visibleRows = () => [
+      ...renderedRowIds(view.container),
+      ...(view.queryByRole("button", { name: "Create workspace in demo-project" })
+        ? ["project-row"]
+        : []),
+    ];
+    const toggleSection = (name: string) => fireEvent.click(view.getByRole("button", { name }));
+
+    toggleSection("Pinned");
+    expect(view.getByRole("button", { name: "Pinned" }).getAttribute("aria-expanded")).toBe(
+      "false"
+    );
+    expect(visibleRows()).toEqual([
+      "draft-item-draft-kept",
+      agentItemTestId("regular-chat"),
+      "project-row",
+    ]);
+    toggleSection("Recent");
+    toggleSection("Projects");
+    // Drafts belong to no section.
+    expect(visibleRows()).toEqual(["draft-item-draft-kept"]);
+
+    view.unmount();
+    view = renderFlatList();
+    expect(visibleRows()).toEqual(["draft-item-draft-kept"]);
+
+    toggleSection("Pinned");
+    toggleSection("Recent");
+    toggleSection("Projects");
+    expect(visibleRows()).toEqual([
+      "draft-item-draft-kept",
+      agentItemTestId("pinned-chat"),
+      agentItemTestId("regular-chat"),
+      "project-row",
+    ]);
+  });
+
+  test("renders drafts first in the unsectioned zone and in their sub-project in the project view", () => {
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        ["/projects/demo-project", { workspaces: [] }],
+        [
+          "section-1",
+          {
+            displayName: "Section 1",
+            parentProjectPath: "/projects/demo-project",
+            workspaces: [],
+          },
+        ],
+      ]),
+    });
+    const pinned = {
+      ...createWorkspace("pinned-chat", { title: "Pinned chat" }),
+      projects: singleProjectRefs,
+      pinnedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const sectionChat = {
+      ...createWorkspace("section-chat", { title: "Section chat", subProjectPath: "section-1" }),
+      projects: singleProjectRefs,
+    };
+    mockDraftActions({
+      "/projects/demo-project": [
+        { draftId: "draft-unsectioned", createdAt: Date.now(), manualName: "" },
+        {
+          draftId: "draft-in-section",
+          createdAt: Date.now(),
+          manualName: "",
+          subProjectPath: "section-1",
+        },
+      ],
+    });
+    setSidebarPreferences({ sidebarFlatMode: false });
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [pinned, sectionChat]]])}
+        workspaceRecency={{ "pinned-chat": Date.now(), "section-chat": Date.now() }}
+      />
+    );
+
+    expect(renderedRowIds(view.container)).toEqual([
+      "draft-item-draft-unsectioned",
+      agentItemTestId("pinned-chat"),
+      "draft-item-draft-in-section",
+      agentItemTestId("section-chat"),
+    ]);
+  });
+
+  test("renders a promoted flat draft once as the live workspace row", () => {
+    const promotedWorkspace = {
+      ...createWorkspace("promoted", { title: "Promoted chat" }),
+      projects: singleProjectRefs,
+    };
+    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
+      () =>
+        ({
+          selectedWorkspace: null,
+          setSelectedWorkspace: () => undefined,
+          archivingWorkspaceIds: new Set<string>(),
+          preflightArchiveWorkspace: () =>
+            Promise.resolve({ success: true, data: { kind: "ready" } }),
+          archiveWorkspace: () => Promise.resolve({ success: true, data: { kind: "archived" } }),
+          removeWorkspace: () => Promise.resolve({ success: true }),
+          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
+          refreshWorkspaceMetadata: () => Promise.resolve(),
+          pendingNewWorkspaceProject: null,
+          pendingNewWorkspaceDraftId: null,
+          workspaceDraftsByProject: {
+            "/projects/demo-project": [{ draftId: "draft-promoted", createdAt: Date.now() }],
+          },
+          workspaceDraftPromotionsByProject: {
+            "/projects/demo-project": { "draft-promoted": promotedWorkspace },
+          },
+          createWorkspaceDraft: () => undefined,
+          openWorkspaceDraft: () => undefined,
+          deleteWorkspaceDraft: () => undefined,
+        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
+    );
+
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map([["/projects/demo-project", [promotedWorkspace]]])}
+        workspaceRecency={{}}
+      />
+    );
+
+    expect(
+      view.container.querySelectorAll(`[data-testid="${agentItemTestId("promoted")}"]`)
+    ).toHaveLength(1);
+    expect(view.queryByTestId("draft-item-draft-promoted")).toBeNull();
+  });
+});
+
 describe("ProjectSidebar multi-project completed-subagent toggles", () => {
   beforeEach(() => {
     cleanupDom = installDom();
@@ -846,12 +1951,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     installProjectSidebarTestDoubles();
   });
 
-  afterEach(() => {
-    cleanup();
-    cleanupDom?.();
-    cleanupDom = null;
-    mock.restore();
-  });
+  afterEach(cleanupProjectSidebarDom);
 
   test("filters multi-project rows out entirely when the experiment is disabled", () => {
     spyOn(ExperimentsModule, "useExperimentValue").mockImplementation(() => false);
@@ -879,6 +1979,40 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     expect(view.queryByText("Multi-Project")).toBeNull();
     expect(view.queryByTestId(agentItemTestId("parent"))).toBeNull();
     expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+  });
+
+  test("shows a reported child only while its background Bash monitor is armed", () => {
+    const parentWorkspace = createWorkspace("parent");
+    const childWorkspace = {
+      ...createWorkspace("child", { parentWorkspaceId: "parent", taskStatus: "reported" }),
+      taskExecutionStatus: "completed" as const,
+    };
+    // The stream hint stays true throughout, as it can during final-turn teardown.
+    // Arming/retiring a monitor must still trigger a render when isWorking is unchanged.
+    interruptibleWorkspaceIds.add("child");
+    const view = render(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={
+          new Map([["/projects/demo-project", [parentWorkspace, childWorkspace]]])
+        }
+        workspaceRecency={{}}
+      />
+    );
+    expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+    act(() => {
+      monitoredWorkspaceIds.add("child");
+      workspaceStoreSubscriptions.get("child")?.();
+    });
+    expect(view.getByTestId(agentItemTestId("child"))).toBeTruthy();
+    expect(view.getByTestId(agentItemTestId("parent")).dataset.delegatedActive).toBe("1");
+    act(() => {
+      monitoredWorkspaceIds.delete("child");
+      workspaceStoreSubscriptions.get("child")?.();
+    });
+    expect(view.queryByTestId(agentItemTestId("child"))).toBeNull();
+    expect(view.getByTestId(agentItemTestId("parent")).dataset.delegatedActive).toBe("0");
   });
 
   test("keeps inactive persistent children out of the left sidebar", () => {
@@ -928,7 +2062,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
   });
 
   test("hides sub-agent rows behind a parent summary when the setting is on", () => {
-    window.localStorage.setItem(SIDEBAR_HIDE_SUBAGENTS_KEY, JSON.stringify(true));
+    setSidebarPreferences({ sidebarHideSubAgents: true });
     const parentWorkspace = createWorkspace("parent", { title: "Parent workspace" });
     const runningChild = createWorkspace("running-child", {
       parentWorkspaceId: "parent",
@@ -970,7 +2104,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
   });
 
   test("summarizes a hidden workflow run on the parent row instead of a group header", () => {
-    window.localStorage.setItem(SIDEBAR_HIDE_SUBAGENTS_KEY, JSON.stringify(true));
+    setSidebarPreferences({ sidebarHideSubAgents: true });
     window.localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(["/projects/demo-project"]));
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
@@ -1039,7 +2173,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
   });
 
   test("retains a hidden run's workflow name across workerless step gaps", () => {
-    window.localStorage.setItem(SIDEBAR_HIDE_SUBAGENTS_KEY, JSON.stringify(true));
+    setSidebarPreferences({ sidebarHideSubAgents: true });
     window.localStorage.setItem(EXPANDED_PROJECTS_KEY, JSON.stringify(["/projects/demo-project"]));
     projectContextValue = createProjectContextValue({
       userProjects: new Map([["/projects/demo-project", { workspaces: [] }]]),
@@ -1314,6 +2448,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       refreshProjects: () => Promise.resolve(),
       addProject: () => undefined,
       removeProject: () => Promise.resolve({ success: true }),
+      getRemovalBlockers: () => Promise.resolve({ activeCount: 0, archivedCount: 0 }),
       isProjectCreateModalOpen: false,
       openProjectCreateModal: () => undefined,
       closeProjectCreateModal: () => undefined,
@@ -1333,7 +2468,9 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       updateSecrets: () => Promise.resolve(),
       updateDisplayName: () => resolveVoidResult(),
       updateColor: () => resolveVoidResult(),
+      updateIcon: () => resolveVoidResult(),
       updateCustomInstructions: () => resolveVoidResult(),
+      updateCodeWorkspaceSyncPath: () => resolveVoidResult(),
       assignWorkspaceToSubProject: () => resolveVoidResult(),
       hasAnyProject: true,
       resolveNewChatProjectPath: () => "/projects/demo-project",
@@ -1785,6 +2922,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: {
             workspaceId: "done-1",
             projectPath: "/projects/demo-project",
@@ -1905,6 +3043,7 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       refreshProjects: () => Promise.resolve(),
       addProject: () => undefined,
       removeProject: () => Promise.resolve({ success: true }),
+      getRemovalBlockers: () => Promise.resolve({ activeCount: 0, archivedCount: 0 }),
       isProjectCreateModalOpen: false,
       openProjectCreateModal: () => undefined,
       closeProjectCreateModal: () => undefined,
@@ -1924,7 +3063,9 @@ describe("ProjectSidebar multi-project completed-subagent toggles", () => {
       updateSecrets: () => Promise.resolve(),
       updateDisplayName: () => resolveVoidResult(),
       updateColor: () => resolveVoidResult(),
+      updateIcon: () => resolveVoidResult(),
       updateCustomInstructions: () => resolveVoidResult(),
+      updateCodeWorkspaceSyncPath: () => resolveVoidResult(),
       assignWorkspaceToSubProject: () => resolveVoidResult(),
       hasAnyProject: true,
       resolveNewChatProjectPath: () => "/projects/demo-project",
@@ -2030,119 +3171,6 @@ describe("ProjectSidebar archive confirmations", () => {
     expect(view.getByText("Archive workspace with untracked files?")).toBeTruthy();
     expect(view.getByRole("button", { name: "Archive and delete files" })).toBeTruthy();
   });
-
-  test("reopens the archive confirmation modal when archive finds new untracked files", async () => {
-    let archiveAttempt = 0;
-    archiveWorkspaceActionMock = mock(
-      (
-        workspaceId: string,
-        options?: { acknowledgedUntrackedPaths?: string[] }
-      ): Promise<ArchiveWorkspaceActionResult> => {
-        archiveAttempt += 1;
-        if (archiveAttempt === 1) {
-          return resolveArchiveResult({
-            kind: "confirm-lossy-untracked-files",
-            paths: ["late-file.txt"],
-          });
-        }
-
-        expect(workspaceId).toBe("archive-late-confirm");
-        expect(options).toEqual({ acknowledgedUntrackedPaths: ["late-file.txt"] });
-        return resolveArchiveResult({ kind: "archived" });
-      }
-    );
-
-    const workspace = {
-      ...createWorkspace("archive-late-confirm"),
-      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
-    };
-    const view = renderProjectSidebarForWorkspace(workspace);
-
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
-    await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
-    });
-
-    await waitFor(() => {
-      expect(view.getByTestId("archive-confirmation-modal")).toBeTruthy();
-    });
-    expect(archivePopoverShowErrorMock).not.toHaveBeenCalled();
-    expect(archiveWorkspaceActionMock).toHaveBeenCalledTimes(1);
-    expect(archiveWorkspaceActionMock).toHaveBeenNthCalledWith(1, workspace.id, undefined);
-
-    act(() => {
-      fireEvent.click(view.getByRole("button", { name: "Archive and delete files" }));
-    });
-
-    await waitFor(() => {
-      expect(archiveWorkspaceActionMock).toHaveBeenCalledTimes(2);
-    });
-    expect(archiveWorkspaceActionMock).toHaveBeenNthCalledWith(2, workspace.id, {
-      acknowledgedUntrackedPaths: ["late-file.txt"],
-    });
-    expect(archivePopoverShowErrorMock).not.toHaveBeenCalled();
-  });
-
-  test("surfaces archive errors after confirmation when untracked paths are unchanged", async () => {
-    let preflightCallCount = 0;
-    preflightArchiveWorkspaceMock = mock(
-      (_workspaceId: string): Promise<ArchivePreflightActionResult> => {
-        preflightCallCount += 1;
-        return resolveArchivePreflight({
-          kind: "confirm-lossy-untracked-files",
-          paths: ["late-file.txt"],
-        });
-      }
-    );
-    archiveWorkspaceActionMock = mock(
-      (
-        workspaceId: string,
-        options?: { acknowledgedUntrackedPaths?: string[] }
-      ): Promise<ArchiveWorkspaceActionResult> => {
-        expect(workspaceId).toBe("archive-stable-untracked");
-        expect(options).toEqual({ acknowledgedUntrackedPaths: ["late-file.txt"] });
-        return Promise.resolve({ success: false as const, error: "snapshot failed" });
-      }
-    );
-
-    spyOn(PopoverErrorHookModule, "usePopoverError").mockImplementation(
-      () =>
-        ({
-          error: null,
-          showError: archivePopoverShowErrorMock,
-          clearError: mock(() => undefined),
-        }) as unknown as ReturnType<typeof PopoverErrorHookModule.usePopoverError>
-    );
-
-    const workspace = {
-      ...createWorkspace("archive-stable-untracked"),
-      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
-    };
-    const view = renderProjectSidebarForWorkspace(workspace);
-
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
-    await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
-    });
-
-    await waitFor(() => {
-      expect(view.getByTestId("archive-confirmation-modal")).toBeTruthy();
-    });
-
-    await act(async () => {
-      await latestArchiveConfirmationModalProps?.onConfirm();
-    });
-
-    await waitFor(() => {
-      expect(archiveWorkspaceActionMock).toHaveBeenCalledTimes(1);
-      expect(archivePopoverShowErrorMock).toHaveBeenCalledTimes(1);
-    });
-    expect(preflightCallCount).toBe(2);
-    expect(archivePopoverShowErrorMock).toHaveBeenCalledWith(workspace.id, "snapshot failed");
-    expect(view.queryByTestId("archive-confirmation-modal")).toBeNull();
-  });
 });
 
 describe("ProjectSidebar archive errors", () => {
@@ -2221,99 +3249,51 @@ describe("ProjectSidebar archive errors", () => {
   });
 });
 
-describe("ProjectSidebar archive confirmations", () => {
-  beforeEach(() => setupProjectSidebarDom());
+// #5143: cancel-creation forces the removal without the Force Delete dialog, so what the removal
+// left behind (a devcontainer that may still hold the plan) must reach the user another way.
+describe("ProjectSidebar cancel-creation warnings", () => {
+  const showPopoverMock = mock(
+    (_workspaceId: string, _message: string, _anchor?: { top: number; left: number }) => undefined
+  );
+
+  beforeEach(() => {
+    setupProjectSidebarDom();
+    showPopoverMock.mockClear();
+    spyOn(PopoverErrorHookModule, "usePopoverError").mockImplementation(
+      () =>
+        ({
+          error: null,
+          showError: showPopoverMock,
+          clearError: mock(() => undefined),
+        }) as unknown as ReturnType<typeof PopoverErrorHookModule.usePopoverError>
+    );
+  });
   afterEach(cleanupProjectSidebarDom);
 
-  test("opens the archive confirmation modal when preflight finds untracked files", async () => {
-    const workspace = {
-      ...createWorkspace("archive-untracked"),
-      projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
-    };
-    const preflightArchiveWorkspace = mock(() =>
+  test("shows what a cancelled creation's forced removal left behind", async () => {
+    const description = "The devcontainer container labeled x was left behind";
+    const removeWorkspaceMock = mock((_workspaceId: string, _options?: { force?: boolean }) =>
       Promise.resolve({
-        success: true as const,
-        data: { kind: "confirm-lossy-untracked-files" as const, paths: ["scratch.txt"] },
+        success: true,
+        warnings: [{ kind: "leftover" as const, description }],
       })
     );
-    const archiveWorkspace = mock(() => Promise.resolve({ success: true as const }));
-
-    useArchiveActions({ preflightArchiveWorkspace, archiveWorkspace });
-
-    renderProjectSidebarForWorkspace(workspace);
-
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
-    await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
-    });
-
-    await waitFor(() => {
-      expect(latestArchiveConfirmationModalProps?.isOpen).toBe(true);
-    });
-    expect(latestArchiveConfirmationModalProps?.title).toBe(
-      "Archive workspace with untracked files?"
-    );
-    expect(archiveWorkspace).not.toHaveBeenCalled();
-  });
-
-  test("reopens the archive confirmation modal when archive finds new untracked files", async () => {
+    mockWorkspaceActions({ removeWorkspace: removeWorkspaceMock });
     const workspace = {
-      ...createWorkspace("archive-race-window"),
+      ...createWorkspace("cancel-target"),
       projects: [{ projectPath: "/projects/demo-project", projectName: "demo-project" }],
     };
-    let preflightCallCount = 0;
-    const preflightArchiveWorkspace = mock(
-      (workspaceId: string): Promise<ArchivePreflightActionResult> => {
-        if (workspaceId !== workspace.id) {
-          return Promise.resolve({ success: true, data: { kind: "ready" } });
-        }
-        preflightCallCount += 1;
-        if (preflightCallCount === 1) {
-          return Promise.resolve({
-            success: true,
-            data: { kind: "confirm-lossy-untracked-files", paths: ["a.txt"] },
-          });
-        }
-        return Promise.resolve({
-          success: true,
-          data: { kind: "confirm-lossy-untracked-files", paths: ["a.txt", "b.txt"] },
-        });
-      }
-    );
-    const archiveWorkspace = mock(() =>
-      Promise.resolve({
-        success: false as const,
-        error:
-          "Untracked files changed since you reviewed them. New files: b.txt. Please try again.",
-      })
-    );
-
-    useArchiveActions({ preflightArchiveWorkspace, archiveWorkspace });
-
     renderProjectSidebarForWorkspace(workspace);
 
-    const archiveButton = document.createElement("button");
-    expect(latestArchiveWorkspaceHandler).toBeTruthy();
+    expect(latestCancelCreationHandler).toBeTruthy();
     await act(async () => {
-      await latestArchiveWorkspaceHandler?.(workspace.id, archiveButton);
+      await latestCancelCreationHandler?.(workspace.id);
     });
 
-    await waitFor(() => {
-      expect(latestArchiveConfirmationModalProps?.isOpen).toBe(true);
-      expect(latestArchiveConfirmationModalProps?.warning?.includes("a.txt")).toBe(true);
-    });
-
-    await act(async () => {
-      await latestArchiveConfirmationModalProps?.onConfirm();
-    });
-
-    await waitFor(() => {
-      expect(preflightArchiveWorkspace.mock.calls.length).toBe(2);
-      expect(latestArchiveConfirmationModalProps?.isOpen).toBe(true);
-      expect(latestArchiveConfirmationModalProps?.warning?.includes("b.txt")).toBe(true);
-    });
-    expect(archivePopoverShowErrorMock).not.toHaveBeenCalled();
+    expect(removeWorkspaceMock).toHaveBeenCalledWith(workspace.id, { force: true });
+    expect(showPopoverMock).toHaveBeenCalledTimes(1);
+    expect(showPopoverMock.mock.calls[0]?.[0]).toBe(workspace.id);
+    expect(showPopoverMock.mock.calls[0]?.[1]).toContain(description);
   });
 });
 
@@ -2352,6 +3332,7 @@ describe("ProjectSidebar project actions menu", () => {
       "Manage secrets",
       "Instructions",
       "Change color",
+      "Change icon",
       "Delete...",
     ]);
   });
@@ -2365,11 +3346,19 @@ describe("ProjectSidebar project actions menu", () => {
     expect(view.getByRole("button", { name: "Edit name" })).toBeTruthy();
   });
 
-  test("menu actions route to settings and delete confirmation", () => {
+  test("menu actions route to settings and delete confirmation", async () => {
+    const removeProjectCalls: Array<{ path: string; options?: { force?: boolean } }> = [];
     projectContextValue = createProjectContextValue({
       userProjects: new Map([
         [demoProjectPath, { workspaces: [{ path: `${demoProjectPath}/ws-1` }] }],
       ]),
+      removeProject: (path, options) => {
+        removeProjectCalls.push({ path, options });
+        return Promise.resolve({ success: true });
+      },
+      // projects.list excludes archived workspaces, so the delete flow gets
+      // blocker counts from the read-only backend preflight.
+      getRemovalBlockers: () => Promise.resolve({ activeCount: 2, archivedCount: 3 }),
     });
 
     const view = renderSidebar();
@@ -2391,7 +3380,145 @@ describe("ProjectSidebar project actions menu", () => {
     fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
     fireEvent.click(view.getByRole("button", { name: "Delete..." }));
 
-    expect(view.getByTestId("project-delete-confirmation-modal").textContent).toBe("demo-project");
+    // The confirmation dialog shows the backend-reported counts, and nothing
+    // is removed before the user confirms.
+    await waitFor(() => {
+      expect(view.getByTestId("project-delete-confirmation-modal").textContent).toBe(
+        "demo-project:2:3"
+      );
+    });
+    expect(removeProjectCalls).toEqual([]);
+  });
+
+  test("a stale removal preflight cannot overwrite the newer confirmation dialog", async () => {
+    const zetaProjectPath = "/projects/zeta-project";
+    const resolvers = new Map<
+      string,
+      (counts: { activeCount: number; archivedCount: number }) => void
+    >();
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        [demoProjectPath, { workspaces: [{ path: `${demoProjectPath}/ws-1` }] }],
+        [zetaProjectPath, { workspaces: [{ path: `${zetaProjectPath}/ws-1` }] }],
+      ]),
+      getRemovalBlockers: (path) =>
+        new Promise((resolve) => {
+          resolvers.set(path, resolve);
+        }),
+    });
+
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Delete..." }));
+    fireEvent.click(view.getByRole("button", { name: "Project options for zeta-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Delete..." }));
+
+    await waitFor(() => {
+      expect(resolvers.size).toBe(2);
+    });
+
+    // The newer preflight resolves first and opens its dialog.
+    resolvers.get(zetaProjectPath)!({ activeCount: 1, archivedCount: 0 });
+    await waitFor(() => {
+      expect(view.getByTestId("project-delete-confirmation-modal").textContent).toBe(
+        "zeta-project:1:0"
+      );
+    });
+
+    // The slower, earlier preflight must be discarded, not overwrite the dialog.
+    resolvers.get(demoProjectPath)!({ activeCount: 2, archivedCount: 3 });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(view.getByTestId("project-delete-confirmation-modal").textContent).toBe(
+      "zeta-project:1:0"
+    );
+  });
+
+  test("delete removes an empty project immediately without a confirmation dialog", async () => {
+    const removeProjectCalls: Array<{ path: string; options?: { force?: boolean } }> = [];
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([[demoProjectPath, { workspaces: [] }]]),
+      removeProject: (path, options) => {
+        removeProjectCalls.push({ path, options });
+        return Promise.resolve({ success: true });
+      },
+    });
+
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Delete..." }));
+
+    await waitFor(() => {
+      expect(removeProjectCalls).toEqual([{ path: demoProjectPath, options: undefined }]);
+    });
+    expect(view.queryByTestId("project-delete-confirmation-modal")).toBeNull();
+  });
+
+  test("the icon panel sets a project icon and clears it back to the initial", async () => {
+    const updateIcon = mock((_projectPath: string, _icon: string | null) => resolveVoidResult());
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([[demoProjectPath, { workspaces: [] }]]),
+      updateIcon,
+    });
+
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Change icon" }));
+    // Without a stored icon the initial is the current choice.
+    expect(
+      view.getByRole("button", { name: "Use project initial" }).getAttribute("aria-pressed")
+    ).toBe("true");
+    fireEvent.click(view.getByRole("button", { name: "Set project icon to Rocket" }));
+
+    await waitFor(() => {
+      expect(updateIcon.mock.calls).toEqual([[demoProjectPath, "rocket"]]);
+    });
+    // Like a color swatch, a pick closes the panel but keeps the menu open.
+    expect(view.queryByRole("group", { name: "Project icon" })).toBeNull();
+    expect(view.getByTestId("project-actions-menu")).toBeTruthy();
+
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([[demoProjectPath, { workspaces: [], icon: "rocket" }]]),
+      updateIcon,
+    });
+    view.rerender(
+      <ProjectSidebar
+        collapsed={false}
+        onToggleCollapsed={() => undefined}
+        sortedWorkspacesByProject={new Map()}
+        workspaceRecency={{}}
+      />
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Change icon" }));
+    expect(
+      view.getByRole("button", { name: "Set project icon to Rocket" }).getAttribute("aria-pressed")
+    ).toBe("true");
+    fireEvent.click(view.getByRole("button", { name: "Use project initial" }));
+
+    await waitFor(() => {
+      expect(updateIcon.mock.calls).toEqual([
+        [demoProjectPath, "rocket"],
+        [demoProjectPath, null],
+      ]);
+    });
+  });
+
+  test("the icon and color panels replace each other", () => {
+    const view = renderSidebar();
+
+    fireEvent.click(view.getByRole("button", { name: "Project options for demo-project" }));
+    fireEvent.click(view.getByRole("button", { name: "Change color" }));
+    expect(view.getByRole("button", { name: "Set project color to Blue" })).toBeTruthy();
+
+    fireEvent.click(view.getByRole("button", { name: "Change icon" }));
+    expect(view.getByRole("group", { name: "Project icon" })).toBeTruthy();
+    expect(view.queryByRole("button", { name: "Set project color to Blue" })).toBeNull();
+
+    fireEvent.click(view.getByRole("button", { name: "Change color" }));
+    expect(view.queryByRole("group", { name: "Project icon" })).toBeNull();
   });
 
   test("reopening the color picker does not apply stale pending color", async () => {
@@ -2463,7 +3590,8 @@ describe("ProjectSidebar project actions menu", () => {
     const initialInput = view.container.querySelector<HTMLInputElement>('input[type="text"]');
     expect(initialInput?.value).toBe("#6b7280");
 
-    fireEvent.click(view.getByTestId("hex-color-picker"));
+    // The picker may load after the popover opens (#6982), so wait for it.
+    fireEvent.click(await view.findByTestId("hex-color-picker"));
 
     await waitFor(() => {
       const input = view.container.querySelector<HTMLInputElement>('input[type="text"]');
@@ -2533,6 +3661,7 @@ describe("ProjectSidebar project actions menu", () => {
     spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
       () =>
         ({
+          archivingWorkspaceIds: new Set<string>(),
           selectedWorkspace: null,
           setSelectedWorkspace: () => undefined,
           preflightArchiveWorkspace: preflightArchiveWorkspaceMock,
@@ -2583,6 +3712,31 @@ describe("ProjectSidebar project actions menu", () => {
       .find((props) => props.section.id === "section-1");
 
     expect(sectionProps?.hasAttention).toBe(true);
+  });
+
+  test("collapses a sub-project on its first toggle", () => {
+    projectContextValue = createProjectContextValue({
+      userProjects: new Map([
+        [demoProjectPath, { workspaces: [] }],
+        [
+          "section-1",
+          { displayName: "Section 1", parentProjectPath: demoProjectPath, workspaces: [] },
+        ],
+      ]),
+    });
+    renderSidebar();
+    const latestSectionProps = () =>
+      (
+        SectionHeaderModule.SectionHeader as unknown as {
+          mock: { calls: Array<[Parameters<typeof SectionHeaderModule.SectionHeader>[0]]> };
+        }
+      ).mock.calls
+        .map(([props]) => props)
+        .findLast((props) => props.section.id === "section-1");
+
+    expect(latestSectionProps()?.isExpanded).toBe(true);
+    act(() => latestSectionProps()?.onToggleExpand?.());
+    expect(latestSectionProps()?.isExpanded).toBe(false);
   });
 
   test("supports inline project name editing with Enter, Escape, and empty-to-null commit", async () => {
@@ -2640,86 +3794,5 @@ describe("ProjectSidebar project actions menu", () => {
 
     expect(view.getByText("Custom Label")).toBeTruthy();
     expect(view.getByText("fallback-project")).toBeTruthy();
-  });
-
-  test("keeps empty placeholder visible when only hidden empty drafts exist", () => {
-    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
-      () =>
-        ({
-          selectedWorkspace: null,
-          setSelectedWorkspace: () => undefined,
-          preflightArchiveWorkspace: () =>
-            Promise.resolve({ success: true, data: { kind: "ready" as const } }),
-          archiveWorkspace: archiveWorkspaceActionMock,
-          removeWorkspace: () => Promise.resolve({ success: true }),
-          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
-          refreshWorkspaceMetadata: () => Promise.resolve(),
-          pendingNewWorkspaceProject: null,
-          pendingNewWorkspaceDraftId: null,
-          workspaceDraftsByProject: {
-            [demoProjectPath]: [
-              {
-                draftId: "draft-hidden-empty",
-                subProjectPath: null,
-                createdAt: Date.now(),
-              },
-            ],
-          },
-          workspaceDraftPromotionsByProject: {},
-          createWorkspaceDraft: () => undefined,
-          openWorkspaceDraft: () => undefined,
-          deleteWorkspaceDraft: () => undefined,
-        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-
-    const view = renderSidebar();
-
-    expect(view.getByText("Empty")).toBeTruthy();
-  });
-
-  test("hides empty placeholder immediately when a hidden draft becomes visible", async () => {
-    const draftId = "draft-hidden-empty";
-    spyOn(WorkspaceContextModule, "useWorkspaceActions").mockImplementation(
-      () =>
-        ({
-          selectedWorkspace: null,
-          setSelectedWorkspace: () => undefined,
-          preflightArchiveWorkspace: () =>
-            Promise.resolve({ success: true, data: { kind: "ready" as const } }),
-          archiveWorkspace: archiveWorkspaceActionMock,
-          removeWorkspace: () => Promise.resolve({ success: true }),
-          updateWorkspaceTitle: () => Promise.resolve({ success: true }),
-          refreshWorkspaceMetadata: () => Promise.resolve(),
-          pendingNewWorkspaceProject: null,
-          pendingNewWorkspaceDraftId: null,
-          workspaceDraftsByProject: {
-            [demoProjectPath]: [
-              {
-                draftId,
-                subProjectPath: null,
-                createdAt: Date.now(),
-              },
-            ],
-          },
-          workspaceDraftPromotionsByProject: {},
-          createWorkspaceDraft: () => undefined,
-          openWorkspaceDraft: () => undefined,
-          deleteWorkspaceDraft: () => undefined,
-        }) as unknown as ReturnType<typeof WorkspaceContextModule.useWorkspaceActions>
-    );
-
-    const view = renderSidebar();
-    expect(view.getByText("Empty")).toBeTruthy();
-
-    const draftScopeId = getDraftScopeId(demoProjectPath, draftId);
-    const draftInputKey = getInputKey(draftScopeId);
-
-    act(() => {
-      updatePersistedState<string>(draftInputKey, "Visible draft prompt", "");
-    });
-
-    await waitFor(() => {
-      expect(view.queryByText("Empty")).toBeNull();
-    });
   });
 });

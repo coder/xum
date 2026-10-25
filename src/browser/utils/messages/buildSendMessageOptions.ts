@@ -1,25 +1,20 @@
+import type { ServiceTier } from "@/common/config/schemas/providersConfig";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { OpenAIReasoningMode, ThinkingLevel } from "@/common/types/thinking";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
 
-export interface ExperimentValues {
-  programmaticToolCalling: boolean | undefined;
-  programmaticToolCallingExclusive: boolean | undefined;
-  advisorTool: boolean | undefined;
-  dynamicWorkflows: boolean | undefined;
-  memory: boolean | undefined;
-  toolSearch: boolean | undefined;
-}
-
 export interface SendMessageOptionsInput {
   model: string;
   thinkingLevel: ThinkingLevel;
   reasoningMode: OpenAIReasoningMode;
+  serviceTier?: ServiceTier;
   agentId: string;
   providerOptions: MuxProviderOptions;
-  experiments: ExperimentValues;
-  disableWorkspaceAgents?: boolean;
+  /** Composer Auto selection; only real user sends set it (compaction/resume paths leave it unset). */
+  autoModelRouting?: boolean;
+  /** Composer thinking level set to Auto; independent of autoModelRouting. */
+  autoThinkingLevel?: boolean;
 }
 
 /** Normalize a preferred model string for routing while preserving explicit gateway choices. */
@@ -37,11 +32,11 @@ export function buildSendMessageOptions(input: SendMessageOptionsInput): SendMes
   return {
     thinkingLevel: input.thinkingLevel,
     reasoningMode: input.reasoningMode,
+    ...(input.serviceTier != null ? { serviceTier: input.serviceTier } : {}),
     model: input.model,
     agentId: input.agentId,
     providerOptions: input.providerOptions,
-    experiments: { ...input.experiments },
-    allowAgentSetGoal: true,
-    disableWorkspaceAgents: input.disableWorkspaceAgents ? true : undefined,
+    autoModelRouting: input.autoModelRouting ? true : undefined,
+    autoThinkingLevel: input.autoThinkingLevel ? true : undefined,
   };
 }

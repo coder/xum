@@ -38,9 +38,140 @@ describe("ExperimentsService", () => {
     return JSON.parse(raw) as { experiments?: unknown; overrides?: Record<string, unknown> };
   }
 
+  test("failed Design persistence rejects the toggle without publishing it", async () => {
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, true);
+    const file = path.join(tempDir, OVERRIDES_FILE);
+    const backup = `${file}.backup`;
+    await fs.rename(file, backup);
+    await fs.mkdir(file);
+    try {
+      const error: unknown = await service
+        .setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, false)
+        .then(
+          () => undefined,
+          (failure: unknown) => failure
+        );
+      expect(error).toBeInstanceOf(Error);
+      expect(service.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP)).toBe(true);
+    } finally {
+      await fs.rmdir(file);
+      await fs.rename(backup, file);
+    }
+    expect((await readOverridesFile()).overrides?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]).toBe(true);
+  });
+
+  test("stale sibling flag mutations preserve a durable Design disable", async () => {
+    const { telemetryService } = createTelemetryService();
+    const first = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await first.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, true);
+    const sibling = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await sibling.initialize();
+    await first.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, false);
+    await sibling.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, true);
+    expect((await readOverridesFile()).overrides?.[EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]).toBe(false);
+    expect((await readOverridesFile()).overrides?.[EXPERIMENT_IDS.AGENT_BROWSER]).toBe(true);
+  });
+
+  test("disk reconciliation updates and clears sibling telemetry variants", async () => {
+    const first = createTelemetryService();
+    const service = new ExperimentsService({
+      telemetryService: first.telemetryService,
+      xumHome: tempDir,
+    });
+    const sibling = new ExperimentsService({
+      telemetryService: createTelemetryService().telemetryService,
+      xumHome: tempDir,
+    });
+    await service.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, true);
+    await sibling.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, false);
+    await service.setOverride(EXPERIMENT_IDS.MEMORY, true);
+    expect(first.setFeatureFlagVariant).toHaveBeenCalledWith(
+      EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
+      false
+    );
+    await sibling.setOverride(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP, null);
+    await service.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, true);
+    expect(first.setFeatureFlagVariant).toHaveBeenCalledWith(
+      EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
+      null
+    );
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.CLAUDE_DESIGN_MCP)).toBe(false);
+  });
+
+  test("a read that adopts another backend's write notifies change listeners once", async () => {
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    const sibling = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    const ptc = EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING;
+    await service.getEnabledStates();
+    const listener = mock(() => undefined);
+    service.onChange(listener);
+
+    await sibling.setOverride(ptc, true);
+    // Concurrent reads adopt the write once, and a read that adopts nothing new stays quiet.
+    const reads = await Promise.all([service.getEnabledStates(), service.getEnabledStates()]);
+    expect(reads.map((states) => states[ptc])).toEqual([true, true]);
+    expect((await service.getEnabledStates())[ptc]).toBe(true);
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  describe("MCP Apps upgrade default (#6760)", () => {
+    const service = () =>
+      new ExperimentsService({
+        telemetryService: createTelemetryService().telemetryService,
+        xumHome: tempDir,
+      });
+    const writeFile = (overrides: Record<string, boolean>) =>
+      fs.writeFile(path.join(tempDir, OVERRIDES_FILE), JSON.stringify({ version: 1, overrides }));
+
+    test("a file from before the split keeps MCP Apps on for Artifacts users", async () => {
+      await writeFile({ [EXPERIMENT_IDS.ARTIFACTS]: true });
+      const s = service();
+      await s.initialize();
+      expect(s.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(true);
+      // Turning Artifacts off afterwards leaves MCP Apps on, also after a restart.
+      await s.setOverride(EXPERIMENT_IDS.ARTIFACTS, false);
+      const restarted = service();
+      await restarted.initialize();
+      expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)).toBe(false);
+      expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(true);
+    });
+
+    test("turning Artifacts on later leaves MCP Apps off, also after a restart", async () => {
+      const s = service();
+      await s.initialize();
+      await s.setOverride(EXPERIMENT_IDS.ARTIFACTS, true);
+      expect(s.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
+      const restarted = service();
+      await restarted.initialize();
+      expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS)).toBe(true);
+      expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
+    });
+
+    test("clearing the MCP Apps override keeps them off after a restart", async () => {
+      await writeFile({ [EXPERIMENT_IDS.ARTIFACTS]: true });
+      const s = service();
+      await s.initialize();
+      await s.setOverride(EXPERIMENT_IDS.MCP_APPS, null);
+      expect(s.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
+      const restarted = service();
+      await restarted.initialize();
+      expect(restarted.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
+    });
+
+    test("an explicit MCP Apps choice wins over the derived default", async () => {
+      await writeFile({ [EXPERIMENT_IDS.ARTIFACTS]: true, [EXPERIMENT_IDS.MCP_APPS]: false });
+      const s = service();
+      await s.initialize();
+      expect(s.isExperimentEnabled(EXPERIMENT_IDS.MCP_APPS)).toBe(false);
+    });
+  });
+
   test("experiments are disabled until the user sets an override", async () => {
     const { telemetryService } = createTelemetryService();
-    const service = new ExperimentsService({ telemetryService, muxHome: tempDir });
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
     await service.initialize();
 
     expect(service.isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING)).toBe(false);
@@ -54,7 +185,7 @@ describe("ExperimentsService", () => {
     const first = createTelemetryService();
     const service = new ExperimentsService({
       telemetryService: first.telemetryService,
-      muxHome: tempDir,
+      xumHome: tempDir,
     });
     await service.setOverride(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES, true);
 
@@ -65,7 +196,7 @@ describe("ExperimentsService", () => {
     const second = createTelemetryService();
     const reloaded = new ExperimentsService({
       telemetryService: second.telemetryService,
-      muxHome: tempDir,
+      xumHome: tempDir,
     });
     await reloaded.initialize();
 
@@ -78,7 +209,7 @@ describe("ExperimentsService", () => {
 
   test("clearing an override disables the experiment and drops its telemetry variant", async () => {
     const { telemetryService, setFeatureFlagVariant } = createTelemetryService();
-    const service = new ExperimentsService({ telemetryService, muxHome: tempDir });
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
     await service.setOverride(EXPERIMENT_IDS.MEMORY, true);
 
     await service.setOverride(EXPERIMENT_IDS.MEMORY, null);
@@ -90,7 +221,7 @@ describe("ExperimentsService", () => {
 
   test("an explicit false override keeps the experiment disabled", async () => {
     const { telemetryService } = createTelemetryService();
-    const service = new ExperimentsService({ telemetryService, muxHome: tempDir });
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
     await service.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, false);
 
     expect(service.isExperimentEnabled(EXPERIMENT_IDS.AGENT_BROWSER)).toBe(false);
@@ -113,7 +244,7 @@ describe("ExperimentsService", () => {
     const { telemetryService, setFeatureFlagVariant } = createTelemetryService();
     const service = new ExperimentsService({
       telemetryService,
-      muxHome: tempDir,
+      xumHome: tempDir,
       platform: "darwin",
     });
     await service.initialize();
@@ -132,7 +263,7 @@ describe("ExperimentsService", () => {
       JSON.stringify({
         version: 1,
         experiments: {
-          [EXPERIMENT_IDS.TOOL_SEARCH]: { value: "test", fetchedAtMs: Date.now() },
+          [EXPERIMENT_IDS.MEMORY]: { value: "test", fetchedAtMs: Date.now() },
         },
         overrides: { [EXPERIMENT_IDS.AGENT_BROWSER]: true },
       }),
@@ -140,12 +271,34 @@ describe("ExperimentsService", () => {
     );
 
     const { telemetryService } = createTelemetryService();
-    const service = new ExperimentsService({ telemetryService, muxHome: tempDir });
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
     await service.initialize();
 
     expect(service.isExperimentEnabled(EXPERIMENT_IDS.AGENT_BROWSER)).toBe(true);
     // A cached remote assignment must not survive as an implicit opt-in.
-    expect(service.isExperimentEnabled(EXPERIMENT_IDS.TOOL_SEARCH)).toBe(false);
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.MEMORY)).toBe(false);
+  });
+
+  test("unknown ids, including the legacy exclusive key, are ignored and dropped on write", async () => {
+    await fs.writeFile(
+      path.join(tempDir, OVERRIDES_FILE),
+      JSON.stringify({
+        version: 1,
+        experiments: {},
+        overrides: { "programmatic-tool-calling-exclusive": true, "advisor-tool": true },
+      }),
+      "utf-8"
+    );
+
+    const { telemetryService } = createTelemetryService();
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.initialize();
+    expect(service.isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING)).toBe(false);
+
+    await service.setOverride(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING, true);
+    expect((await readOverridesFile()).overrides).toEqual({
+      [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: true,
+    });
   });
 
   test("a client with empty local state does not clear overrides it never knew about", async () => {
@@ -160,45 +313,23 @@ describe("ExperimentsService", () => {
     );
 
     const { telemetryService } = createTelemetryService();
-    const service = new ExperimentsService({ telemetryService, muxHome: tempDir });
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
     await service.initialize();
 
     // A second renderer (different origin, so empty localStorage) uploads nothing and
     // reads state back. It must not disable what another client persisted.
     await service.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, true);
 
-    expect(await service.getOverrides()).toEqual({
+    expect((await readOverridesFile()).overrides).toEqual({
       [EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT]: true,
       [EXPERIMENT_IDS.AGENT_BROWSER]: true,
     });
-    expect(service.isExperimentEnabled(EXPERIMENT_IDS.SKILL_DYNAMIC_CONTEXT)).toBe(true);
-  });
-
-  test("getOverrides hides overrides for platform-unsupported experiments", async () => {
-    await fs.writeFile(
-      path.join(tempDir, OVERRIDES_FILE),
-      JSON.stringify({
-        version: 1,
-        experiments: {},
-        overrides: { [EXPERIMENT_IDS.PORTABLE_DESKTOP]: true },
-      }),
-      "utf-8"
-    );
-
-    const { telemetryService } = createTelemetryService();
-    const service = new ExperimentsService({
-      telemetryService,
-      muxHome: tempDir,
-      platform: "darwin",
-    });
-
-    expect(await service.getOverrides()).toEqual({});
   });
 
   test("writes an empty experiments map so older builds still read overrides", async () => {
     const { telemetryService } = createTelemetryService();
-    const service = new ExperimentsService({ telemetryService, muxHome: tempDir });
-    await service.setOverride(EXPERIMENT_IDS.TIMELINE, true);
+    const service = new ExperimentsService({ telemetryService, xumHome: tempDir });
+    await service.setOverride(EXPERIMENT_IDS.AGENT_BROWSER, true);
 
     expect((await readOverridesFile()).experiments).toEqual({});
   });

@@ -27,6 +27,10 @@ export interface WorkspaceFixture {
   title?: string;
   transcriptOnly?: boolean;
   pinnedAt?: string;
+  /** Recipient consent generation; present means cross-tree discovery/messaging is on. */
+  unrelatedWorkspaceConsent?: string;
+  aiSettings?: FrontendWorkspaceMetadata["aiSettings"];
+  agentId?: string;
 }
 
 /** Create a workspace with sensible defaults */
@@ -51,6 +55,9 @@ export function createWorkspace(
     workflowTask: opts.workflowTask,
     transcriptOnly: opts.transcriptOnly,
     pinnedAt: opts.pinnedAt,
+    unrelatedWorkspaceConsent: opts.unrelatedWorkspaceConsent,
+    aiSettings: opts.aiSettings,
+    agentId: opts.agentId,
   };
 }
 
@@ -91,7 +98,7 @@ export function createIncompatibleWorkspace(
     ...createWorkspace(opts),
     incompatibleRuntime:
       opts.incompatibleReason ??
-      "This workspace was created with a newer version of shux.\nPlease upgrade shux to use this workspace.",
+      "This workspace was created with a newer version of xum.\nPlease upgrade xum to use this workspace.",
   };
 }
 
@@ -109,15 +116,6 @@ export function createArchivedWorkspace(
     archivedAt: opts.archivedAt ?? new Date(NOW - 86400000).toISOString(), // 1 day ago
     // No unarchivedAt means it's archived (archivedAt > unarchivedAt where unarchivedAt is undefined)
   };
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-// PROJECT FACTORY
-// ═══════════════════════════════════════════════════════════════════════════════
-
-export interface ProjectFixture {
-  path: string;
-  workspaces: FrontendWorkspaceMetadata[];
 }
 
 /** Create project config from workspaces */

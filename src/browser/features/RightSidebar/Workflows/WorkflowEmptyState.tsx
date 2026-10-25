@@ -4,6 +4,8 @@ import { BookOpen, Play, Workflow } from "lucide-react";
 import { SLASH_COMMAND_HINTS } from "@/common/constants/slashCommandHints";
 import type { AvailableWorkflow, WorkflowArgSummary } from "@/common/types/workflow";
 
+import { WorkflowPhaseFlow, phaseFlowNodesFromManifest } from "./WorkflowPhaseFlow";
+
 import { WorkflowScopeBadge } from "./WorkflowBadges";
 import { stringifyWorkflowArgValue } from "./projectWorkflowRun";
 
@@ -124,7 +126,7 @@ const WorkflowRunForm: React.FC<{
         type="button"
         disabled={props.busy || missingRequired}
         onClick={submit}
-        className="border-accent bg-accent inline-flex items-center gap-1 self-start rounded-md border px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:opacity-90 disabled:cursor-default disabled:opacity-50"
+        className="border-accent bg-accent text-accent-foreground hover:bg-accent-button-hover inline-flex items-center gap-1 self-start rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:cursor-default disabled:opacity-50"
       >
         <Play className="h-3 w-3" /> Start
       </button>
@@ -138,6 +140,20 @@ interface WorkflowEmptyStateProps {
   // Keyed by scriptPath (unique) rather than descriptor.name, which can collide across skill
   // workflows that omit meta.name (both normalize to "workflow").
   busyScriptPath: string | null;
+  /** No live connection: nothing can start, so Run and Start are disabled. */
+  offline?: boolean;
+}
+
+/** Run is disabled for a blocked script, while another script starts, and while offline. */
+function isRunDisabled(
+  script: AvailableWorkflow,
+  busyScriptPath: string | null,
+  offline: boolean
+): boolean {
+  if (offline || !script.descriptor.executable) {
+    return true;
+  }
+  return busyScriptPath != null && busyScriptPath !== script.scriptPath;
 }
 
 /**
@@ -147,12 +163,13 @@ interface WorkflowEmptyStateProps {
  */
 export const WorkflowEmptyState: React.FC<WorkflowEmptyStateProps> = (props) => {
   const [configuring, setConfiguring] = React.useState<string | null>(null);
+  const offline = props.offline === true;
 
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-col items-center gap-2 px-4 pt-5 pb-2 text-center">
         <span
-          className="text-accent grid h-12 w-12 place-items-center rounded-xl border"
+          className="text-accent-text grid h-12 w-12 place-items-center rounded-xl border"
           style={{
             background: "color-mix(in srgb, var(--color-accent) 12%, transparent)",
             borderColor: "color-mix(in srgb, var(--color-accent) 30%, transparent)",
@@ -205,14 +222,27 @@ export const WorkflowEmptyState: React.FC<WorkflowEmptyStateProps> = (props) => 
                           {script.descriptor.blockedReason}
                         </div>
                       )}
+                      {/* Pre-run phase preview: the declared/inferred rail with all
+                          phases pending, so the flow is visible before any run exists. */}
+                      {script.descriptor.phaseManifest != null && (
+                        <WorkflowPhaseFlow
+                          className="mt-1.5"
+                          nodes={phaseFlowNodesFromManifest(script.descriptor.phaseManifest)}
+                          provenance={script.descriptor.phaseManifest.provenance}
+                        />
+                      )}
+                      {script.phaseManifestWarning != null && (
+                        <div className="text-warning mt-0.5 min-w-0 text-[11px] break-words">
+                          Invalid meta.phases declaration — runs will be rejected:{" "}
+                          {script.phaseManifestWarning}
+                        </div>
+                      )}
                     </div>
                     <button
                       type="button"
-                      disabled={
-                        !script.descriptor.executable || (props.busyScriptPath != null && !isBusy)
-                      }
+                      disabled={isRunDisabled(script, props.busyScriptPath, offline)}
                       onClick={onRunClick}
-                      className="border-accent bg-accent inline-flex shrink-0 items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:opacity-90 disabled:cursor-default disabled:opacity-50"
+                      className="border-accent bg-accent text-accent-foreground hover:bg-accent-button-hover inline-flex shrink-0 items-center gap-1 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:cursor-default disabled:opacity-50"
                     >
                       <Play className="h-3 w-3" /> Run
                     </button>
@@ -220,7 +250,7 @@ export const WorkflowEmptyState: React.FC<WorkflowEmptyStateProps> = (props) => 
                   {isConfiguring && (
                     <WorkflowRunForm
                       script={script}
-                      busy={isBusy}
+                      busy={isBusy || offline}
                       onSubmit={(args) => props.onRun(script, args)}
                     />
                   )}

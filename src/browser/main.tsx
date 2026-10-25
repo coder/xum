@@ -1,12 +1,25 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import assert from "@/common/utils/assert";
 import { installBrowserLogCapture } from "@/browser/utils/browserLog";
 import { installWindowOpenLocalhostProxyNormalization } from "@/browser/utils/windowOpenLocalhostProxy";
 import { installInactiveAnimationPause } from "@/browser/utils/inactiveAnimations";
+import {
+  installIosFocusZoomGuard,
+  installViewportHeightSync,
+} from "@/browser/utils/viewportHeight";
+import { removeDroppedCacheKeys } from "@/browser/utils/legacyLocalStorageCleanup";
 import { AppLoader } from "@/browser/components/AppLoader/AppLoader";
-import { initTelemetry, trackAppStarted } from "@/common/telemetry";
+import { initTelemetry } from "@/common/telemetry";
+import { trackAppStarted } from "@/browser/utils/telemetryLifecycle";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { initTitlebarInsets } from "@/browser/hooks/useDesktopTitlebar";
 import { resolveBrowserAssetUrl } from "@/browser/utils/frontendBasePath";
+import { removeFirstRunView } from "@/browser/features/SplashScreens/SplashScreenProvider";
+import {
+  markAppStarted,
+  removeWorkspaceView,
+} from "@/browser/features/StaticWorkspaceView/removeWorkspaceView";
 
 // Initialize telemetry on app startup
 try {
@@ -21,10 +34,27 @@ try {
   // Animation throttling is an optimization and must never block renderer startup.
 }
 
+try {
+  removeDroppedCacheKeys();
+} catch {
+  // Reclaiming localStorage quota is best-effort and must never block renderer startup.
+}
+
 installWindowOpenLocalhostProxyNormalization();
+installViewportHeightSync();
+
+try {
+  installIosFocusZoomGuard();
+} catch {
+  // Stopping iOS focus zoom is cosmetic and must never block renderer startup.
+}
 
 initTelemetry();
-trackAppStarted();
+// vimEnabled lives in config.json, so the startup event waits for the first config snapshot.
+const stopWaitingForAppConfig = getAppConfigStore().subscribe(() => {
+  stopWaitingForAppConfig();
+  trackAppStarted();
+});
 
 // Initialize titlebar CSS custom properties (platform-specific insets)
 initTitlebarInsets();
@@ -32,14 +62,16 @@ initTitlebarInsets();
 // Global error handlers for renderer process
 // These catch errors that escape the ErrorBoundary
 window.addEventListener("error", (event) => {
-  console.error("Uncaught error in renderer:", event.error);
+  // ErrorEvent.error is typed `any`: anything can be thrown.
+  const error: unknown = event.error;
+  console.error("Uncaught error in renderer:", error);
   console.error("Error details:", {
     message: event.message,
     filename: event.filename,
     lineno: event.lineno,
     colno: event.colno,
-    error: event.error,
-    stack: event.error?.stack,
+    error,
+    stack: error instanceof Error ? error.stack : undefined,
   });
 });
 
@@ -51,9 +83,40 @@ window.addEventListener("unhandledrejection", (event) => {
   }
 });
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
+/**
+ * T3 #5971, C step 2: an uncaught render error unmounts the whole root, and the static first-run
+ * view (outside #root) would stay on screen. This boundary removes it, then renders what such an
+ * error leaves today (an empty root) and reports the error as an uncaught one.
+ */
+export class FirstRunViewErrorBoundary extends React.Component<
+  { children: React.ReactNode },
+  { failed: boolean }
+> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  componentDidCatch(error: Error) {
+    removeFirstRunView();
+    removeWorkspaceView();
+    window.reportError(error);
+  }
+
+  render() {
+    return this.state.failed ? null : this.props.children;
+  }
+}
+
+markAppStarted();
+const rootElement = document.getElementById("root");
+assert(rootElement, "index.html must contain the #root element");
+ReactDOM.createRoot(rootElement).render(
   <React.StrictMode>
-    <AppLoader />
+    <FirstRunViewErrorBoundary>
+      <AppLoader />
+    </FirstRunViewErrorBoundary>
   </React.StrictMode>
 );
 
@@ -62,7 +125,7 @@ if ("serviceWorker" in navigator) {
   const isHttpProtocol =
     window.location.protocol === "http:" || window.location.protocol === "https:";
   if (isHttpProtocol) {
-    window.addEventListener("load", () => {
+    const registerServiceWorker = () => {
       navigator.serviceWorker
         .register(resolveBrowserAssetUrl("service-worker.js"))
         .then((registration) => {
@@ -71,6 +134,10 @@ if ("serviceWorker" in navigator) {
         .catch((error) => {
           console.log("Service Worker registration failed:", error);
         });
-    });
+    };
+    // C step 2 loads this module after the static first-run view paints, which can be after
+    // `load`: then the event never fires again.
+    if (document.readyState === "complete") registerServiceWorker();
+    else window.addEventListener("load", registerServiceWorker);
   }
 }

@@ -1,0 +1,138 @@
+import { describe, expect, test } from "bun:test";
+import { createTestApiClient } from "@/browser/testUtils";
+import type { McpAppView } from "@/common/orpc/schemas/mcpApps";
+import {
+  flushOfflineMcpAppWidgetStates,
+  mcpAppWidgetStateSeed,
+  mcpAppWidgetStateTarget,
+  saveMcpAppWidgetState,
+} from "./mcpAppWidgetState";
+
+/** A getView result of a view whose result record has `binding`. */
+function loadedView(binding: string | null, widgetState: unknown = null): McpAppView {
+  return {
+    html: "<p/>",
+    csp: {},
+    prefersBorder: null,
+    resultAvailable: true,
+    result: null,
+    widgetState,
+    widgetStateBinding: binding,
+    invocation: binding === null ? null : { serverName: "srv", toolName: "show", arguments: {} },
+  };
+}
+
+/** An API whose setWidgetState calls wait until the test settles them. */
+function deferredApi() {
+  const writes: Array<{ state: unknown; binding: string; settle: (ok: boolean) => void }> = [];
+  const api = createTestApiClient({
+    mcpApps: {
+      setWidgetState: (input: { state: unknown; binding: string }) =>
+        new Promise<
+          { success: true; data: Record<string, never> } | { success: false; error: string }
+        >((resolve) =>
+          writes.push({
+            state: input.state,
+            binding: input.binding,
+            settle: (ok) =>
+              resolve(ok ? { success: true, data: {} } : { success: false, error: "refused" }),
+          })
+        ),
+    },
+  });
+  return { api, writes };
+}
+
+const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe("MCP App widget state", () => {
+  test("writes reach the backend in order, and a newer pending write replaces an older one", async () => {
+    const { api, writes } = deferredApi();
+    const target = mcpAppWidgetStateTarget("ws-order", "c1", loadedView("r10"));
+    saveMcpAppWidgetState(api, target, { n: 1 });
+    saveMcpAppWidgetState(api, target, { n: 2 });
+    saveMcpAppWidgetState(api, target, { n: 3 });
+    await flush();
+    // One write at a time: the first is in flight, the newest waits, { n: 2 } is never sent.
+    expect(writes.map((w) => w.state)).toEqual([{ n: 1 }]);
+    writes[0].settle(true);
+    await flush();
+    expect(writes.map((w) => w.state)).toEqual([{ n: 1 }, { n: 3 }]);
+    expect(writes.every((w) => w.binding === "r10")).toBe(true);
+  });
+
+  test("a new document starts with the latest state, even while its write is in flight", async () => {
+    const { api, writes } = deferredApi();
+    const target = mcpAppWidgetStateTarget("ws-remount", "c1", loadedView("r10", { n: 0 }));
+    saveMcpAppWidgetState(api, target, { n: 5 });
+    await flush();
+    // The frame unmounted and mounted again before the write landed: getView still has n: 0.
+    const remounted = mcpAppWidgetStateTarget("ws-remount", "c1", loadedView("r10", { n: 0 }));
+    expect(mcpAppWidgetStateSeed(remounted)).toEqual({ n: 5 });
+    writes[0].settle(true);
+  });
+
+  test("a new record under a reused tool call ID gets only its own stored state", () => {
+    const { api } = deferredApi();
+    saveMcpAppWidgetState(api, mcpAppWidgetStateTarget("ws-reuse", "c1", loadedView("r10")), {
+      secret: true,
+    });
+    const reused = mcpAppWidgetStateTarget("ws-reuse", "c1", loadedView("r20"));
+    expect(mcpAppWidgetStateSeed(reused)).toBeNull();
+  });
+
+  test("a write made while Xum reconnects is sent once a client is back", async () => {
+    const target = mcpAppWidgetStateTarget("ws-offline", "c1", loadedView("r10"));
+    saveMcpAppWidgetState(null, target, { n: 1 });
+    saveMcpAppWidgetState(null, target, { n: 2 });
+    const { api, writes } = deferredApi();
+    flushOfflineMcpAppWidgetStates(api);
+    await flush();
+    // Only the newest offline state is sent.
+    expect(writes.map((w) => w.state)).toEqual([{ n: 2 }]);
+    writes[0].settle(true);
+    // Sent once: a later flush has nothing left.
+    flushOfflineMcpAppWidgetStates(api);
+    await flush();
+    expect(writes).toHaveLength(1);
+  });
+
+  // #6181: the offline map keeps one state per view instance; like the other maps it is bounded.
+  test("offline states are bounded: the oldest views' states go first", async () => {
+    const count = 70;
+    for (let i = 0; i < count; i++) {
+      const target = mcpAppWidgetStateTarget("ws-many-offline", `c${i}`, loadedView(`r${i}`));
+      saveMcpAppWidgetState(null, target, { i });
+    }
+    const { api, writes } = deferredApi();
+    flushOfflineMcpAppWidgetStates(api);
+    await flush();
+    const sent = writes.map((w) => (w.state as { i: number }).i);
+    expect(sent).toHaveLength(64);
+    expect(sent[0]).toBe(count - 64);
+    for (const write of writes) write.settle(true);
+  });
+
+  test("a write lost to a dropped connection is sent again with the next client", async () => {
+    const target = mcpAppWidgetStateTarget("ws-dropped", "c1", loadedView("r10"));
+    const dropped = createTestApiClient({
+      mcpApps: { setWidgetState: () => Promise.reject(new Error("connection lost")) },
+    });
+    saveMcpAppWidgetState(dropped, target, { n: 7 });
+    await flush();
+    const { api, writes } = deferredApi();
+    flushOfflineMcpAppWidgetStates(api);
+    await flush();
+    expect(writes.map((w) => w.state)).toEqual([{ n: 7 }]);
+    writes[0].settle(true);
+  });
+
+  test("a view without a result record has no state to keep", () => {
+    const { api, writes } = deferredApi();
+    const target = mcpAppWidgetStateTarget("ws-none", "c1", loadedView(null));
+    expect(target).toBeNull();
+    saveMcpAppWidgetState(api, target, { n: 1 });
+    expect(writes).toEqual([]);
+    expect(mcpAppWidgetStateSeed(target)).toBeNull();
+  });
+});

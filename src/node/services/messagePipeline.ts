@@ -1,5 +1,5 @@
 /**
- * Message pipeline: transforms ShuxMessages into provider-ready ModelMessages.
+ * Message pipeline: transforms XumMessages into provider-ready ModelMessages.
  *
  * This module extracts the message preparation pipeline from `streamMessage()`,
  * making the sequential transform steps explicit and testable.
@@ -12,20 +12,31 @@ import { convertToModelMessages, type AssistantModelMessage, type ModelMessage }
 import { applyToolOutputRedaction } from "@/browser/utils/messages/applyToolOutputRedaction";
 import { sanitizeToolInputs } from "@/browser/utils/messages/sanitizeToolInput";
 import { inlineSvgAsTextForProvider } from "@/node/utils/messages/inlineSvgAsTextForProvider";
-import { extractToolMediaAsUserMessages } from "@/node/utils/messages/extractToolMediaAsUserMessages";
+import { renderPluginHookContextForProvider } from "@/node/utils/messages/renderPluginHookContextForProvider";
+import { neutralizeAgentEnvelopeLookalikesForProvider } from "@/node/utils/messages/neutralizeAgentEnvelopeLookalikesForProvider";
+import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { sanitizeAnthropicPdfFilenames } from "@/node/utils/messages/sanitizeAnthropicDocumentFilename";
 import { convertDataUriFilePartsForSdk } from "@/node/utils/messages/convertDataUriFilePartsForSdk";
+import { insertStepStartPartsForSdk } from "@/node/utils/messages/insertStepStartPartsForSdk";
+import { prepareMcpReplay } from "@/node/services/mcpModelOutput";
+import { planAnthropicThinkingStrip } from "@/node/utils/messages/anthropicThinkingReplay";
+import { attachReasoningReplayMetadata } from "@/node/utils/messages/reasoningProviderOptions";
 import type { MuxMessage } from "@/common/types/message";
 import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import type { ThinkingLevel } from "@/common/types/thinking";
+import { anthropicBindsThinkingToPrefix, type ThinkingLevel } from "@/common/types/thinking";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import {
   transformModelMessages,
   validateAnthropicCompliance,
   injectAgentTransition,
   injectPostCompactionAttachments,
 } from "@/browser/utils/messages/modelMessageTransform";
-import { normalizeLegacyToolSearchMessages } from "@/common/utils/tools/toolCatalog";
+import {
+  applyNativeToolSearchReplay,
+  dedupeNativeToolReferences,
+  normalizeLegacyToolSearchMessages,
+} from "@/common/utils/tools/toolCatalog";
 import { applyCacheControl, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
 import { log } from "./log";
 
@@ -60,25 +71,38 @@ export interface PrepareMessagesOptions {
   anthropicCacheTtl?: AnthropicCacheTtl | null;
   /** Workspace ID (used only for debug logging). */
   workspaceId: string;
+  /**
+   * Tools the request marks for native Anthropic deferred loading. Non-empty
+   * only in native tool-search mode, where replayed tool_catalog_search results
+   * become the same tool_reference output the live turn sent.
+   */
+  deferLoadingToolNames?: ReadonlySet<string>;
+  /**
+   * Rows searched for the Anthropic thinking-repair receipt; defaults to messagesWithSentinel.
+   * The empty-row filter drops a repaired turn that produced no output, so callers that
+   * filter pass the rows from before it (#5886).
+   */
+  replayReceiptMessages?: MuxMessage[];
 }
 
 /**
  * Run the full message preparation pipeline.
  *
- * Transforms pre-filtered `ShuxMessage[]` into provider-ready `ModelMessage[]` by:
+ * Transforms pre-filtered `XumMessage[]` into provider-ready `ModelMessage[]` by:
  * 1. Injecting agent-transition context (plan→exec handoff)
  * 2. Injecting post-compaction attachments
  * 3. Redacting heavy tool outputs
  * 4. Sanitizing tool inputs
  * 5. Inlining SVG attachments as text
- * 6. Sanitizing PDF filenames for Anthropic
- * 7. Extracting tool-result media as user message attachments
- * 8. Rewriting data-URI file parts to SDK-safe inline base64
- * 9. Converting to Vercel AI SDK ModelMessage format
- * 10. Self-healing: filtering empty/whitespace assistant messages
- * 11. Applying provider-specific message transforms
- * 12. Applying cache control headers
- * 13. Validating Anthropic compliance (logs warnings only)
+ * 6. Neutralizing user-typed <mux_agent_message> lookalikes (peer-envelope provenance)
+ * 7. Sanitizing PDF filenames for Anthropic
+ * 8. Extracting tool-result media as user message attachments
+ * 9. Rewriting data-URI file parts to SDK-safe inline base64
+ * 10. Converting to Vercel AI SDK ModelMessage format, split at persisted step boundaries
+ * 11. Self-healing: filtering empty/whitespace assistant messages
+ * 12. Applying provider-specific message transforms
+ * 13. Applying cache control headers
+ * 14. Validating Anthropic compliance (logs warnings only)
  *
  * Log purity: this pipeline never reads live workspace state (disk, file
  * trackers). File-change notifications and @file mention snapshots are
@@ -103,9 +127,11 @@ export async function prepareMessagesForProvider(
     providersConfig,
     anthropicCacheTtl,
     workspaceId,
+    deferLoadingToolNames,
+    replayReceiptMessages,
   } = opts;
 
-  // --- ShuxMessage-level transforms ---
+  // --- XumMessage-level transforms ---
 
   // Inject agent transition context with plan content (for plan→exec handoff)
   const messagesWithAgentContext = injectAgentTransition(
@@ -137,39 +163,80 @@ export async function prepareMessagesForProvider(
   // Request-only — does not mutate persisted history.
   const messagesWithInlinedSvg = inlineSvgAsTextForProvider(sanitizedMessages);
 
+  // Rewrite user-typed <mux_agent_message> lookalikes so only server-authored peer envelopes
+  // reach the provider with the exact wrapper (pasted envelopes keep user authority).
+  const messagesWithNeutralizedEnvelopes =
+    neutralizeAgentEnvelopeLookalikesForProvider(messagesWithInlinedSvg);
+
+  // Render prompt-hook context into its user message (never the system prompt).
+  const messagesWithHookContext = renderPluginHookContextForProvider(
+    messagesWithNeutralizedEnvelopes
+  );
+
   // Sanitize PDF filenames for Anthropic (request-only, preserves original in UI/history).
   // Anthropic rejects document names containing periods, underscores, etc.
   const messagesWithSanitizedPdf =
     providerForMessages === "anthropic"
-      ? sanitizeAnthropicPdfFilenames(messagesWithInlinedSvg)
-      : messagesWithInlinedSvg;
-
-  // Rewrite supported tool-result attachments to small text placeholders + file parts.
-  // Prevents providers from treating large base64 payloads as text/JSON context.
-  const messagesWithToolMediaExtracted =
-    await extractToolMediaAsUserMessages(messagesWithSanitizedPdf);
+      ? sanitizeAnthropicPdfFilenames(messagesWithHookContext)
+      : messagesWithHookContext;
 
   // Rewrite user file-part data URIs to raw base64 payloads before SDK conversion.
   // convertToModelMessages maps FileUIPart.url -> FilePart.data; keeping data: URLs here
   // can trigger URL-download validation in downstream provider utilities.
-  const messagesWithSdkSafeFileParts = convertDataUriFilePartsForSdk(
-    messagesWithToolMediaExtracted
+  const messagesWithSdkSafeFileParts = convertDataUriFilePartsForSdk(messagesWithSanitizedPdf);
+
+  // Mirror persisted reasoning replay data (signatures, encrypted reasoning) into
+  // providerMetadata, the only field convertToModelMessages forwards to the request.
+  const messagesWithReasoningReplay = attachReasoningReplayMetadata(messagesWithSdkSafeFileParts);
+
+  // Preserved thinking: a thinking-replay receipt (MuxMetadata.anthropicThinkingReplay) says a
+  // request of that turn sent earlier Anthropic thinking without its blocks. Removed blocks
+  // must never come back: putting them back invalidates every block produced while they were
+  // gone, so the next turn would 400 and pay the repair again. Blocks the turn kept sending
+  // after the strip stay (anthropicThinkingReplayFromStep), or every later turn would rewrite
+  // the previous turn's tail (prompt-cache prefix). Mark here, while part indices still match
+  // the persisted step boundaries; the strip runs after conversion and the provider transforms.
+  const thinkingStrip = planAnthropicThinkingStrip(
+    providerForMessages,
+    messagesWithReasoningReplay,
+    replayReceiptMessages ?? messagesWithSentinel
   );
+
+  // Restore each assistant row's step boundaries, so the rebuild splits messages where the
+  // in-turn steps did (prompt-cache prefix). Last: every transform above keeps assistant parts
+  // 1:1, so the persisted stepStartPartIndices still point at the right parts.
+  // MCP results replay through the toModelOutput their in-turn step used (parts stay 1:1).
+  const mcpReplay = prepareMcpReplay(thinkingStrip.messages);
+  const messagesWithStepStarts = insertStepStartPartsForSdk(mcpReplay.messages);
 
   // --- Convert to ModelMessage format ---
 
-  // Type assertion needed because ShuxMessage has custom tool parts for interrupted tools
+  // Type assertion needed because XumMessage has custom tool parts for interrupted tools
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
-  const rawModelMessages = await convertToModelMessages(messagesWithSdkSafeFileParts as any, {
+  const rawModelMessages = await convertToModelMessages(messagesWithStepStarts as any, {
     // Drop unfinished tool calls (input-streaming/input-available) so downstream
     // transforms only see tool calls that actually produced outputs.
     ignoreIncompleteToolCalls: true,
+    tools: mcpReplay.tools,
   });
 
   // --- ModelMessage-level transforms ---
 
-  const modelMessages = normalizeLegacyToolSearchMessages(
-    sanitizeAssistantModelMessages(rawModelMessages, workspaceId)
+  // Rewrite supported tool-result attachments to small text placeholders + file parts, so
+  // providers do not read large base64 payloads as text. Runs on ModelMessages, the same
+  // transform StreamManager applies to every in-turn step (transformStepMessages): each image
+  // lands right after its own step's tool result. The MuxMessage-level extraction this
+  // replaces appended it after the whole assistant row instead. Every later thinking block of
+  // that turn then lost part of its prefix, and Anthropic rejected it ("Content that preceded
+  // this block when it was created is missing").
+  const messagesWithToolMediaExtracted =
+    await extractToolMediaAsUserMessagesFromModelMessages(rawModelMessages);
+
+  const modelMessages = applyNativeToolSearchReplay(
+    normalizeLegacyToolSearchMessages(
+      sanitizeAssistantModelMessages(messagesWithToolMediaExtracted, workspaceId)
+    ),
+    deferLoadingToolNames ?? new Set()
   );
 
   log.debug_obj(`${workspaceId}/2_model_messages.json`, modelMessages);
@@ -178,11 +245,30 @@ export async function prepareMessagesForProvider(
   const transformedMessages = transformModelMessages(modelMessages, providerForMessages, {
     anthropicThinkingEnabled:
       providerForMessages === "anthropic" && effectiveThinkingLevel !== "off",
+    // At "off", neither `between_tools` (Sonnet 5.5) nor `disabled` (Haiku 5.5) carries
+    // blockBinding, and this replay is not append-only (see buildProviderOptions), so a
+    // history block with a changed prefix would 400 on enforced accounts. Strip
+    // history-side blocks: #5086's "strip from the edited turn onward", applied to every
+    // turn, since a system prompt or tools change edits every block's prefix. Blocks the
+    // current turn produces between steps still replay.
+    anthropicStripReasoning:
+      providerForMessages === "anthropic" &&
+      effectiveThinkingLevel === "off" &&
+      anthropicBindsThinkingToPrefix(resolveModelForMetadata(modelString, providersConfig ?? null)),
   });
+
+  // The receipt's strip, planned above (an old receipt strips the whole segment).
+  const segmentMessages = thinkingStrip.strip(transformedMessages);
+
+  // Dedupe after transformModelMessages: its orphan strip (self-healing for
+  // interrupted/corrupted history) can remove a result whose reference would
+  // otherwise consume a tool's single dedupe slot, unloading the tool from the
+  // final request. Decide against the transcript the provider actually sees.
+  const dedupedMessages = dedupeNativeToolReferences(segmentMessages);
 
   // Apply cache control for Anthropic models AFTER transformation
   const finalMessages = applyCacheControl(
-    transformedMessages,
+    dedupedMessages,
     modelString,
     anthropicCacheTtl,
     providersConfig

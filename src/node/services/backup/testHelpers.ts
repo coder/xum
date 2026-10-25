@@ -36,7 +36,7 @@ export async function commitAll(repoDir: string, message: string): Promise<void>
     "-c",
     "user.email=mux@example.com",
     "-c",
-    "user.name=Shux",
+    "user.name=Xum",
     "commit",
     "-m",
     message,

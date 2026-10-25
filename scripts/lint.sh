@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# Usage: scripts/lint.sh [--eslint | --full] [--fix]
+#
+# Default: oxlint on every file with .oxlintrc.json, which mirrors the eslint.config.mjs rules
+# oxlint can run (make check-oxlint-config verifies it). It takes seconds and well under 1 GiB.
+# --eslint: also type-aware ESLint on the files changed since the merge base with origin/main (see
+# scripts/lib/lint_targets.js for why and when it falls back to all files).
+# --full: oxlint, then ESLint on every file, as CI does.
 
 set -e
 
@@ -6,6 +13,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 cd "$PROJECT_ROOT"
+
+MODE=oxlint
+FIX_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --eslint) [ "$MODE" = full ] || MODE=eslint ;;
+    --full) MODE=full ;;
+    --fix) FIX_ARGS=(--fix) ;;
+    *)
+      echo "Unknown argument: $arg (expected --eslint or --full, and/or --fix)" >&2
+      exit 2
+      ;;
+  esac
+done
 
 # Check for PNG files in docs - suggest WebP instead
 echo "Checking for PNG files in docs..."
@@ -22,19 +43,33 @@ if [ -n "$PNG_FILES" ]; then
   exit 1
 fi
 
+run_oxlint() {
+  # A separate assignment so set -e stops on a listing error.
+  local listing
+  listing="$(node "$SCRIPT_DIR/lib/lint_targets.js" --oxlint-args)"
+  local oxlint_args=()
+  while IFS= read -r arg; do
+    [ -n "$arg" ] && oxlint_args+=("$arg")
+  done <<<"$listing"
+  echo "Running oxlint (type-aware rules: make lint-eslint, or CI)..."
+  # More threads barely help: the JS plugins (Tailwind, the local rules) dominate the run time.
+  bun x oxlint -c .oxlintrc.json --threads 4 --deny-warnings "${oxlint_args[@]}" "${FIX_ARGS[@]}"
+}
+
 # Workflow runtime and packaged skill workflow sources are executable JS embedded
 # into the app; lint them alongside the TS sources (they get dedicated
 # non-type-aware config blocks).
 ESLINT_PATTERNS=(
   'src/**/*.{ts,tsx}'
+  'tests/**/*.{ts,tsx}'
   'src/node/builtinSkills/**/*.js'
   'src/node/workflowRuntime/*.js'
   'scripts/lib/*.js'
 )
 
 get_default_eslint_concurrency() {
-  # Most local `make static-check` runs are warm-cache validation after a small
-  # edit. ESLint's worker startup/merge overhead dominates that path, so keep it
+  # Most local runs are warm-cache validation after a small edit. ESLint's
+  # worker startup/merge overhead dominates that path, so keep it
   # single-process once the cache exists; cold caches still scale up for CI-like
   # first runs.
   if [ -f .eslintcache ]; then
@@ -53,19 +88,60 @@ get_default_eslint_concurrency() {
   fi
 }
 
-ESLINT_CONCURRENCY="${MUX_ESLINT_CONCURRENCY:-$(get_default_eslint_concurrency)}"
 ESLINT_ARGS=(
-  --concurrency "$ESLINT_CONCURRENCY"
   --cache
   --cache-strategy content
   --max-warnings 0
 )
 
-if [ "${1:-}" = "--fix" ]; then
-  echo "Running bun x eslint with --fix (concurrency=$ESLINT_CONCURRENCY)..."
-  bun x eslint "${ESLINT_ARGS[@]}" "${ESLINT_PATTERNS[@]}" --fix
-else
-  echo "Running eslint (concurrency=$ESLINT_CONCURRENCY)..."
-  bun x eslint "${ESLINT_ARGS[@]}" "${ESLINT_PATTERNS[@]}"
-  echo "ESLint checks passed!"
+run_full_eslint() {
+  local concurrency="${MUX_ESLINT_CONCURRENCY:-$(get_default_eslint_concurrency)}"
+  echo "Running eslint on all files ($1, concurrency=$concurrency)..."
+  local eslint=(bun x eslint --concurrency "$concurrency" "${ESLINT_ARGS[@]}" "${ESLINT_PATTERNS[@]}" "${FIX_ARGS[@]}")
+  # One full run at a time per machine: each peaks at ~7.6 GiB, and parallel agents running
+  # several at once OOM-killed shared workspaces. XUM_LINT_LOCK=0 skips the wait.
+  if [ "${XUM_LINT_LOCK:-1}" = 0 ]; then
+    "${eslint[@]}"
+  else
+    node "$SCRIPT_DIR/lib/run_exclusive.js" full-lint -- "${eslint[@]}"
+  fi
+}
+
+run_changed_eslint() {
+  # A separate assignment so set -e stops on a selection error (e.g. a bad XUM_LINT_BASE).
+  local selection
+  selection="$(node "$SCRIPT_DIR/lib/lint_targets.js")"
+  local header="${selection%%$'\n'*}"
+  local kind="${header%% *}"
+  local detail="${header#* }"
+  if [ "$kind" = full ]; then
+    run_full_eslint "$detail"
+    return
+  fi
+  local changed_files=()
+  if [[ "$selection" == *$'\n'* ]]; then
+    while IFS= read -r file; do
+      [ -n "$file" ] && changed_files+=("$file")
+    done <<<"${selection#*$'\n'}"
+  fi
+  if [ "${#changed_files[@]}" -eq 0 ]; then
+    echo "No lintable files changed since ${detail:0:12}; skipping eslint (make lint-full lints all files)."
+    return
+  fi
+  echo "Running eslint on ${#changed_files[@]} file(s) changed since ${detail:0:12} (make lint-full lints all files)..."
+  # One worker: worker start-up costs more than it saves on a small file set, and each worker
+  # loads its own copy of the TypeScript program. --no-warn-ignored: a changed file that the
+  # config ignores (e.g. src/browser/main.tsx) must not fail --max-warnings 0.
+  bun x eslint --concurrency "${MUX_ESLINT_CONCURRENCY:-1}" "${ESLINT_ARGS[@]}" --no-warn-ignored \
+    "${changed_files[@]}" "${FIX_ARGS[@]}"
+}
+
+run_oxlint
+case "$MODE" in
+  eslint) run_changed_eslint ;;
+  full) run_full_eslint "--full" ;;
+esac
+
+if [ "${#FIX_ARGS[@]}" -eq 0 ]; then
+  echo "Lint checks passed!"
 fi

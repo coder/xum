@@ -61,18 +61,16 @@ describeIntegration("LeftSidebar (UI)", () => {
           { timeout: 10_000 }
         );
 
-        const handle = sidebar.querySelector(
-          '[data-testid="left-sidebar-resize-handle"]'
-        ) as HTMLElement | null;
+        const handle = sidebar.querySelector('[data-testid="left-sidebar-resize-handle"]');
         if (!handle) {
           throw new Error("LeftSidebar resize handle not found");
         }
 
         expect(sidebar.style.width).toBe("288px");
 
-        fireEvent.mouseDown(handle, { clientX: 200 });
-        fireEvent.mouseMove(document, { clientX: 300 });
-        fireEvent.mouseUp(document);
+        fireEvent.pointerDown(handle, { clientX: 200 });
+        fireEvent.pointerMove(document, { clientX: 300 });
+        fireEvent.pointerUp(document);
 
         // +100px wider from default.
         await waitFor(() => expect(sidebar.style.width).toBe("388px"));

@@ -1,10 +1,11 @@
+import * as path from "path";
 import assert from "@/common/utils/assert";
 import * as fs from "fs/promises";
-import * as path from "path";
 import { EventEmitter } from "events";
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import type { Config } from "@/node/config";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import type { AgentMode } from "@/common/types/mode";
 import {
@@ -33,6 +34,7 @@ import { createDeltaStorage, type DeltaRecordStorage } from "@/common/utils/toke
 import { log } from "./log";
 import type { TelemetryService } from "./telemetryService";
 import { roundToBase2 } from "@/common/telemetry/utils";
+import { getErrorMessage } from "@/common/utils/errors";
 
 const SESSION_TIMING_FILE = "session-timing.json";
 const SESSION_TIMING_VERSION = 2 as const;
@@ -156,13 +158,14 @@ function validateTiming(params: {
  *
  * Backend source-of-truth for timing stats.
  * - Keeps active stream timing in memory
- * - Persists cumulative session timing to ~/.shux/sessions/{workspaceId}/session-timing.json
+ * - Persists cumulative session timing to ~/.xum/sessions/{workspaceId}/session-timing.json
  * - Emits snapshots to oRPC subscribers
  */
 export class SessionTimingService {
   private readonly config: Config;
   private readonly telemetryService: TelemetryService;
-  private readonly fileLocks = workspaceFileLocks;
+  /** The one workspace FIFO (phase 4: from SessionLocks; desktop.ts keeps the Node default). */
+  private readonly fileLocks: SessionLocks["workspaceFiles"];
 
   private readonly activeStreams = new Map<string, ActiveStreamState>();
   private readonly timingFileCache = new Map<string, SessionTimingFile>();
@@ -180,9 +183,14 @@ export class SessionTimingService {
     { lastEmitTimeMs: number; timer?: ReturnType<typeof setTimeout> }
   >();
 
-  constructor(config: Config, telemetryService: TelemetryService) {
+  constructor(
+    config: Config,
+    telemetryService: TelemetryService,
+    locks: SessionLocks = nodeSessionLocks
+  ) {
     this.config = config;
     this.telemetryService = telemetryService;
+    this.fileLocks = locks.workspaceFiles;
   }
 
   addSubscriber(workspaceId: string): void {
@@ -330,7 +338,7 @@ export class SessionTimingService {
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), SESSION_TIMING_FILE);
+    return path.join(this.config.sessionsDir, workspaceId, SESSION_TIMING_FILE);
   }
 
   private async readTimingFile(workspaceId: string): Promise<SessionTimingFile> {
@@ -496,6 +504,15 @@ export class SessionTimingService {
     });
     this.timingFileCache.set(workspaceId, loaded);
     return loaded;
+  }
+
+  async clearTimingFileForApi(workspaceId: string) {
+    try {
+      await this.clearTimingFile(workspaceId);
+      return { success: true as const, data: undefined };
+    } catch (error) {
+      return { success: false as const, error: getErrorMessage(error) };
+    }
   }
 
   async clearTimingFile(workspaceId: string): Promise<void> {

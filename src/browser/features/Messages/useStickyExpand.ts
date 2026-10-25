@@ -1,6 +1,7 @@
 import { useCallback, useRef, useState } from "react";
 
-import { getAutoExpandPrefsKey } from "@/common/constants/storage";
+import { AUTO_EXPAND_PREFS_MAX_CHARS, getAutoExpandPrefsKey } from "@/common/constants/storage";
+import { withRecordEntry } from "@/browser/utils/boundedPersistedValue";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 
 import { useOptionalMessageListContext } from "./MessageListContext";
@@ -45,7 +46,11 @@ function applyStoredPref(
   next: boolean
 ): AutoExpandPrefs {
   if (kind === "thinking") return { ...prev, thinking: next };
-  return toolName == null ? prev : { ...prev, tools: { ...prev.tools, [toolName]: next } };
+  if (toolName == null) return prev;
+  // One entry per tool ever toggled (MCP tool names are long): keep the newest ones inside the
+  // key budget, leaving room for the thinking flag and the object wrapper.
+  const toolsMaxChars = AUTO_EXPAND_PREFS_MAX_CHARS - '{"thinking":false,"tools":}'.length;
+  return { ...prev, tools: withRecordEntry(prev.tools ?? {}, toolName, next, toolsMaxChars) };
 }
 
 export interface UseStickyExpandOptions {

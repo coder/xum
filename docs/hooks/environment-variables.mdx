@@ -7,33 +7,34 @@ The following environment variables are available in all agent bash tool executi
 
 ## Available Variables
 
-| Variable              | Description                                                                                                                   |
-| --------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `SHUX_PROJECT_PATH`   | Absolute path to the project root on the **local machine**. Always refers to your local project path, even on SSH workspaces. |
-| `SHUX_RUNTIME`        | Runtime type: `"local"`, `"worktree"`, `"ssh"`, or `"docker"`                                                                 |
-| `SHUX_WORKSPACE_NAME` | Name of the workspace (typically the branch name)                                                                             |
-| `SHUX_MODEL_STRING`   | Model identifier (e.g., `"anthropic:claude-sonnet-4-20250514"`)                                                               |
-| `SHUX_THINKING_LEVEL` | Reasoning level: `"off"`, `"low"`, `"medium"`, `"high"`, or `"xhigh"`                                                         |
-| `SHUX_COSTS_USD`      | Cumulative session costs in USD, formatted to 2 decimal places (e.g., `"1.23"`)                                               |
+| Variable             | Description                                                                                                                                                                                                                                                                                                                                                    |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `XUM_PROJECT_PATH`   | Absolute path to the project root on the **local machine**. Always refers to your local project path, even on SSH workspaces.                                                                                                                                                                                                                                  |
+| `XUM_RUNTIME`        | Runtime type: `"local"`, `"worktree"`, `"ssh"`, or `"docker"`                                                                                                                                                                                                                                                                                                  |
+| `XUM_WORKSPACE_NAME` | Name of the workspace, usually also its branch name. A worktree workspace named after its first message keeps its random provisional name (such as `calm-otters-sing`) while its branch gets the generated name; read the branch with `git branch --show-current`.                                                                                             |
+| `XUM_MODEL_STRING`   | Model identifier (e.g., `"anthropic:claude-sonnet-4-20250514"`)                                                                                                                                                                                                                                                                                                |
+| `XUM_THINKING_LEVEL` | Reasoning level: `"off"`, `"low"`, `"medium"`, `"high"`, or `"xhigh"`                                                                                                                                                                                                                                                                                          |
+| `XUM_COSTS_USD`      | Cumulative session costs in USD, formatted to 2 decimal places (e.g., `"1.23"`)                                                                                                                                                                                                                                                                                |
+| `XUM_SCRATCH_DIR`    | A scratch folder for files that do not belong in the repo. Local and worktree workspaces always use a host folder. SSH, Docker and devcontainer workspaces get one only when the Artifacts experiment is on: SSH and Docker use a folder on the runtime, and devcontainers also need a local Docker daemon. Deleted with the workspace. Not set in init hooks. |
 
-Matching `MUX_*` names remain accepted aliases. When both are set, the `SHUX_*` value wins. See [Mux compatibility](/reference/mux-compatibility).
+Matching `MUX_*` names remain accepted aliases. When both are set, the `XUM_*` value wins. See [Mux compatibility](/reference/mux-compatibility).
 
 ## Usage Example
 
 ```bash
 #!/usr/bin/env bash
 
-echo "Project: $SHUX_PROJECT_PATH"
-echo "Runtime: $SHUX_RUNTIME"
-echo "Workspace: $SHUX_WORKSPACE_NAME"
-echo "Model: $SHUX_MODEL_STRING"
-echo "Thinking: $SHUX_THINKING_LEVEL"
-echo "Costs: \$${SHUX_COSTS_USD:-0.00}"
+echo "Project: $XUM_PROJECT_PATH"
+echo "Runtime: $XUM_RUNTIME"
+echo "Workspace: $XUM_WORKSPACE_NAME"
+echo "Model: $XUM_MODEL_STRING"
+echo "Thinking: $XUM_THINKING_LEVEL"
+echo "Costs: \$${XUM_COSTS_USD:-0.00}"
 
 # Runtime-specific behavior
-if [ "$SHUX_RUNTIME" = "ssh" ]; then
+if [ "$XUM_RUNTIME" = "ssh" ]; then
   echo "Running on SSH remote"
-elif [ "$SHUX_RUNTIME" = "docker" ]; then
+elif [ "$XUM_RUNTIME" = "docker" ]; then
   echo "Running in Docker container"
 else
   echo "Running locally"

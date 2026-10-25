@@ -1,7 +1,7 @@
 {
   "name": "mux",
-  "version": "0.28.2",
-  "description": "Compatibility package forwarding the legacy mux command to @coder/shux",
+  "version": "0.32.0",
+  "description": "Compatibility package forwarding the legacy mux command to @coder/xum",
   "bin": {
     "mux": "bin/mux.js"
   },
@@ -10,11 +10,11 @@
     "README.md"
   ],
   "dependencies": {
-    "@coder/shux": "0.28.2"
+    "@coder/xum": "0.32.0"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/coder/shux.git",
+    "url": "git+https://github.com/coder/xum.git",
     "directory": "packages/mux-compat"
   },
   "license": "AGPL-3.0-only"

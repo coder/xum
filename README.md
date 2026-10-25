@@ -1,12 +1,12 @@
 <div align="center">
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/img/white-shux.svg" />
-  <source media="(prefers-color-scheme: light)" srcset="docs/img/black-shux.svg" />
-  <img src="docs/img/black-shux.svg" alt="Shux logo" width="18%" />
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/white-xum.svg" />
+  <source media="(prefers-color-scheme: light)" srcset="docs/img/black-xum.svg" />
+  <img src="docs/img/black-xum.svg" alt="Xum logo" width="18%" />
 </picture>
 
-# Shux - Coding Agent Multiplexer
+# Xum - Coding Agent Multiplexer
 
 [![Download](https://img.shields.io/badge/Download-Releases-purple)](https://github.com/coder/mux/releases)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%203.0-blue.svg)](LICENSE)
@@ -16,11 +16,9 @@
 </div>
 
 > [!IMPORTANT]
-> This project was renamed from Mux to Shux after Mux.com raised a trademark concern. “Mux” is a common technical abbreviation of “multiplexer” and we do not expect confusion between the projects, but chose to rename ours rather than spend more time on the dispute. “Shux” captures our reaction to the process and bears no other significance.
->
-> Shux is a desktop & browser application for parallel agentic development. It enables developers to plan and execute tasks with multiple AI agents on local or remote compute.
+> This project was renamed from Mux to Xum after Mux.com raised a trademark concern. “Mux” is a common technical abbreviation of “multiplexer” and we do not expect confusion between the projects, but chose to rename ours rather than spend more time on the dispute.
 
-<p><img src="./docs/img/mux-demo.gif" alt="Shux product demo" width="100%" /></p>
+<p><img src="./docs/img/xum-demo.gif" alt="Xum product demo" width="100%" /></p>
 
 ## Features
 
@@ -31,11 +29,11 @@
 - **Multi-model** (`sonnet-4-*`, `grok-*`, `gpt-5-*`, `opus-4-*`)
   - Ollama supported for local LLMs ([docs](https://mux.coder.com/config/models#ollama-local))
   - OpenRouter supported for long-tail of LLMs ([docs](https://mux.coder.com/config/models#openrouter-cloud))
-- **VS Code Extension**: Jump into Shux workspaces directly from VS Code ([docs](https://mux.coder.com/integrations/vscode-extension))
+- **VS Code Extension**: Jump into Xum workspaces directly from VS Code ([docs](https://mux.coder.com/integrations/vscode-extension))
 - Supporting UI and keybinds for efficiently managing a suite of agents
 - Rich markdown outputs (mermaid diagrams, LaTeX, etc.)
 
-Shux has a custom agent loop but much of the core UX is inspired by Claude Code. You'll find familiar features like Plan/Exec mode, vim inputs, `/compact` and new ones
+Xum has a custom agent loop but much of the core UX is inspired by Claude Code. You'll find familiar features like Plan/Exec mode, vim inputs, `/compact` and new ones
 like [opportunistic compaction](https://mux.coder.com/workspaces/compaction) and [mode prompts](https://mux.coder.com/agents/instruction-files#mode-prompts).
 
 **[Read the full documentation →](https://mux.coder.com)**
@@ -85,8 +83,8 @@ macOS and Linux.
 </tr>
 <tr>
 <td align="center" colspan="2">
-<img src="./docs/img/mobile-server-mode.webp" alt="Screenshot of Shux mobile UI" width="40%" /><br>
-<sub>Shux server mode has a responsive UI for mobile users</sub>
+<img src="./docs/img/mobile-server-mode.webp" alt="Screenshot of Xum mobile UI" width="40%" /><br>
+<sub>Xum server mode has a responsive UI for mobile users</sub>
 </td>
 </tr>
 </table>

@@ -1,10 +1,10 @@
-import { SUPPORTED_SHUX_PROTOCOL_SCHEMES } from "@/common/compat/legacyMux";
+import { SUPPORTED_XUM_PROTOCOL_SCHEMES } from "@/common/compat/legacyMux";
 
 /**
  * CLI environment detection for correct argv parsing across:
  * - bun/node direct invocation
  * - Electron dev mode (electron .)
- * - Packaged Electron app (./shux.AppImage)
+ * - Packaged Electron app (./xum.AppImage)
  */
 
 export interface CliEnvironment {
@@ -94,10 +94,10 @@ export function isElectronLaunchArg(
   if (!env.isElectron) return false;
 
   // In packaged Electron, Windows/Linux deep links are passed in argv.
-  // Treat canonical shux:// and legacy mux:// as desktop launch args.
+  // Treat canonical xum:// and legacy mux:// as desktop launch args.
   if (
     subcommand != null &&
-    SUPPORTED_SHUX_PROTOCOL_SCHEMES.some((scheme) => subcommand.startsWith(`${scheme}://`))
+    SUPPORTED_XUM_PROTOCOL_SCHEMES.some((scheme) => subcommand.startsWith(`${scheme}://`))
   ) {
     return true;
   }

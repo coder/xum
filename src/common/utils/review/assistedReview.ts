@@ -278,18 +278,14 @@ function hunkMatchesPathAndRange(
 }
 
 /**
- * Test whether a {@link DiffHunk} satisfies an {@link AssistedReviewHunk} filter.
+ * Test whether a {@link DiffHunk} satisfies an assisted path candidate.
  *
  * Path match is exact (project-relative). When the filter has no range, any
  * hunk in the file matches. Otherwise we check overlap against the hunk's
  * new-file span; for purely deleted regions (newLines=0) we fall back to the
  * old-file span so deletions can still be flagged.
  */
-export function hunkMatchesAssisted(hunk: DiffHunk, filter: AssistedReviewHunk): boolean {
-  return hunkMatchesPathAndRange(hunk, filter.path, filter.range);
-}
-
-export function hunkMatchesAssistedCandidate(
+function hunkMatchesAssistedCandidate(
   hunk: DiffHunk,
   candidate: AssistedReviewPathCandidate
 ): boolean {
@@ -301,18 +297,6 @@ export function hunkMatchesAssistedCandidate(
  * or null. The index lets the UI preserve the agent-declared ordering when
  * pinning matches to the top of the list.
  */
-export function findAssistedMatch(
-  hunk: DiffHunk,
-  assisted: readonly AssistedReviewHunk[]
-): { entry: AssistedReviewHunk; index: number } | null {
-  for (let i = 0; i < assisted.length; i++) {
-    if (hunkMatchesAssisted(hunk, assisted[i])) {
-      return { entry: assisted[i], index: i };
-    }
-  }
-  return null;
-}
-
 export function findAssistedCandidateMatch(
   hunk: DiffHunk,
   candidates: readonly AssistedReviewPathCandidate[]

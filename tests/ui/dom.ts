@@ -1,24 +1,34 @@
 import { GlobalWindow } from "happy-dom";
+import * as React from "react";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
+import { captureDomGlobals } from "./domGlobals";
 
-interface DomGlobalsSnapshot {
-  window: typeof globalThis.window;
-  document: typeof globalThis.document;
-  navigator: typeof globalThis.navigator;
-  localStorage: typeof globalThis.localStorage;
-  CustomEvent: typeof globalThis.CustomEvent;
-  DocumentFragment: unknown;
-  Element: unknown;
-  HTMLInputElement: unknown;
-  HTMLElement: unknown;
-  NodeFilter: unknown;
-  Node: unknown;
-  Image: unknown;
-  requestAnimationFrame: typeof globalThis.requestAnimationFrame;
-  cancelAnimationFrame: typeof globalThis.cancelAnimationFrame;
-  getComputedStyle: typeof globalThis.getComputedStyle;
-  ResizeObserver: unknown;
-  IntersectionObserver: unknown;
-  MutationObserver: unknown;
+/**
+ * Rebind Radix's layout-effect hook to the genuine React hook once a document exists.
+ *
+ * `@radix-ui/react-use-layout-effect` decides at module evaluation time whether to export
+ * `React.useLayoutEffect` or a noop, based on `globalThis.document`. In the shared Bun test
+ * process a document-less suite (hooks/contexts tests importing API → AuthTokenModal → Radix)
+ * can evaluate that module first and pin the noop for every later UI suite, so Popover and
+ * Tooltip content never mounts. `mock.module` updates the live binding seen by consumers that
+ * already imported the noop and pre-registers the export when Radix has not loaded yet, so
+ * this is order-independent. Scoped to that single module; only DOM-installing suites reach
+ * here, and no test renders through react-dom/server, so the noop is never the correct value.
+ *
+ * This harness is shared with the Jest integration suites (tests/ui/**), where `bun:test` does
+ * not exist. Jest gives each test file its own module registry, so an earlier file cannot pin
+ * the noop there; load `bun:test` only under Bun instead of importing it statically.
+ */
+let radixLayoutEffectRebound = false;
+function rebindRadixLayoutEffect(): void {
+  if (radixLayoutEffectRebound || process.versions.bun == null) return;
+  radixLayoutEffectRebound = true;
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { mock } = require("bun:test") as typeof import("bun:test");
+  // Not awaited, as before: the factory is synchronous.
+  void mock.module("@radix-ui/react-use-layout-effect", () => ({
+    useLayoutEffect: React.useLayoutEffect,
+  }));
 }
 
 // NOTE: installDom intentionally mutates globalThis.* (window/document/etc) to give UI
@@ -28,37 +38,22 @@ interface DomGlobalsSnapshot {
 // on `globalThis.document`. See the bootstrap at the bottom of this module.
 
 export function installDom(): () => void {
-  const previous: DomGlobalsSnapshot = {
-    window: globalThis.window,
-    document: globalThis.document,
-    Element: (globalThis as unknown as { Element?: unknown }).Element,
-    DocumentFragment: (globalThis as unknown as { DocumentFragment?: unknown }).DocumentFragment,
-    navigator: globalThis.navigator,
-    HTMLInputElement: (globalThis as unknown as { HTMLInputElement?: unknown }).HTMLInputElement,
-    localStorage: globalThis.localStorage,
-    CustomEvent: globalThis.CustomEvent,
-    NodeFilter: (globalThis as unknown as { NodeFilter?: unknown }).NodeFilter,
-    HTMLElement: (globalThis as unknown as { HTMLElement?: unknown }).HTMLElement,
-    Node: (globalThis as unknown as { Node?: unknown }).Node,
-    Image: (globalThis as unknown as { Image?: unknown }).Image,
-    requestAnimationFrame: globalThis.requestAnimationFrame,
-    getComputedStyle: globalThis.getComputedStyle,
-    cancelAnimationFrame: globalThis.cancelAnimationFrame,
-    ResizeObserver: (globalThis as unknown as { ResizeObserver?: unknown }).ResizeObserver,
-    MutationObserver: (globalThis as unknown as { MutationObserver?: unknown }).MutationObserver,
-    IntersectionObserver: (globalThis as unknown as { IntersectionObserver?: unknown })
-      .IntersectionObserver,
-  };
+  const restorePrevious = captureDomGlobals();
 
   const domWindow = new GlobalWindow({ url: "http://localhost" }) as unknown as Window &
     typeof globalThis;
 
   globalThis.window = domWindow;
   globalThis.document = domWindow.document;
+  // The document now exists: repair any Radix noop binding pinned by an earlier suite.
+  rebindRadixLayoutEffect();
   globalThis.navigator = domWindow.navigator;
   globalThis.getComputedStyle = domWindow.getComputedStyle.bind(domWindow);
   globalThis.localStorage = domWindow.localStorage;
-  globalThis.CustomEvent = domWindow.CustomEvent as typeof globalThis.CustomEvent;
+  globalThis.CustomEvent = domWindow.CustomEvent;
+  // Not `Event`: Node code under test dispatches on native EventTargets (wsFlowControl), which
+  // reject happy-dom events. happy-dom 21 dispatches only its own events, so DOM tests build
+  // them with `new window.Event(...)`.
   (globalThis as unknown as { Element: unknown }).Element = domWindow.Element;
   (globalThis as unknown as { DocumentFragment: unknown }).DocumentFragment =
     domWindow.DocumentFragment;
@@ -202,29 +197,7 @@ export function installDom(): () => void {
   return () => {
     domWindow.close();
 
-    (globalThis as unknown as { Element?: unknown }).Element = previous.Element;
-    globalThis.window = previous.window;
-    (globalThis as unknown as { DocumentFragment?: unknown }).DocumentFragment =
-      previous.DocumentFragment;
-    globalThis.document = previous.document;
-    globalThis.navigator = previous.navigator;
-    (globalThis as unknown as { HTMLInputElement?: unknown }).HTMLInputElement =
-      previous.HTMLInputElement;
-    globalThis.localStorage = previous.localStorage;
-    globalThis.CustomEvent = previous.CustomEvent;
-    (globalThis as unknown as { HTMLElement?: unknown }).HTMLElement = previous.HTMLElement;
-    (globalThis as unknown as { NodeFilter?: unknown }).NodeFilter = previous.NodeFilter;
-    (globalThis as unknown as { MutationObserver?: unknown }).MutationObserver =
-      previous.MutationObserver;
-    (globalThis as unknown as { Node?: unknown }).Node = previous.Node;
-    (globalThis as unknown as { Image?: unknown }).Image = previous.Image;
-    globalThis.requestAnimationFrame = previous.requestAnimationFrame;
-    globalThis.getComputedStyle = previous.getComputedStyle;
-    globalThis.cancelAnimationFrame = previous.cancelAnimationFrame;
-    (globalThis as unknown as { IntersectionObserver?: unknown }).IntersectionObserver =
-      previous.IntersectionObserver;
-    (globalThis as unknown as { ResizeObserver?: unknown }).ResizeObserver =
-      previous.ResizeObserver;
+    restorePrevious();
 
     // Self-heal: snapshots taken after a `document = undefined` teardown would
     // restore that poisoned state here, breaking modules that detect DOM
@@ -249,6 +222,10 @@ export function installDom(): () => void {
  */
 if (typeof globalThis.document === "undefined") {
   installDom();
+} else {
+  // A document from an earlier suite does not prove Radix bound the real hook: a
+  // document-less suite may have evaluated Radix before that DOM was installed.
+  rebindRadixLayoutEffect();
 }
 
 // Require (not statically import) react-dnd after the DOM bootstrap because
@@ -256,3 +233,31 @@ if (typeof globalThis.document === "undefined") {
 // module evaluation.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 require("react-dnd");
+
+// The app loads the tool cards lazily (toolCardsStore). Load them up front, after the DOM
+// bootstrap like react-dnd, so a UI suite renders a tool row's real card in its first commit.
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+require("@/browser/features/Tools/Shared/toolCardsLoader");
+
+/**
+ * Makes useNarrowViewport() read `narrow` in the DOM installDom() made: only the narrow-viewport
+ * query changes its answer, so other media queries (the color scheme) keep theirs. The next
+ * installDom() starts wide again.
+ */
+export function stubNarrowViewport(narrow: boolean): void {
+  const original = window.matchMedia.bind(window);
+  window.matchMedia = ((query: string) => {
+    if (query !== `(max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px)`) return original(query);
+    // A plain list: the viewport never changes during the test.
+    return {
+      matches: narrow,
+      media: query,
+      onchange: null,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      dispatchEvent: () => false,
+    } as unknown as MediaQueryList;
+  }) as typeof window.matchMedia;
+}

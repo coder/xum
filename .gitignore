@@ -101,6 +101,12 @@ CODE_CHANGES.md
 README_COMPACT_HERE.md
 artifacts/
 tests/e2e/tmp/
+# e2e bug-bash output (reports, videos, unredacted app logs)
+tests/bugbash/.e2e/
+tests/stories/.e2e/
+# The story replay-cache seed (tests/bugbash/sandbox/cacheSeed.ts): ignored, so no `git add -A`
+# commits recorded cache entries.
+tests/stories/.e2e-cache-seed/
 
 # Test temporary directories
 src/test-temp-*/
@@ -112,10 +118,13 @@ runs/
 __pycache__
 # ruff format (fmt.mk) drops its cache at the repo root
 .ruff_cache/
+# uv run installs pyproject.toml's dependency groups here
+/.venv/
 
 tmpfork
 .mux-agent-cli
 storybook-static/
+storybook-flakes/
 *.tgz
 src/test-workspaces/
 terminal-bench-results/
@@ -132,7 +141,9 @@ docs/theme/pagetoc.css
 *.generated.ts
 !src/node/services/workflows/builtInWorkflowActionContent.generated.ts
 !src/node/services/workflows/workflowRuntimeSources.generated.ts
+!src/common/staticWorkspaceView/phoneChrome.generated.ts
 docs/theme/pagetoc.js
+.xum/mcp.jsonc
 .mux/mcp.jsonc
 # Removed mobile/ Expo prototype: upgraded checkouts keep untracked leftovers
 # (node_modules, .expo, ios, android) that its deleted nested .gitignore used
@@ -150,3 +161,9 @@ dogfood-output/
 .design-sync/node_modules
 .ds-sync/
 ds-bundle/
+
+# CRAP score snapshots (make crap)
+.metrics/
+
+# Written from bun.lock at pack time (scripts/generate-npm-shrinkwrap.ts)
+/npm-shrinkwrap.json

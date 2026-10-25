@@ -6,32 +6,71 @@
  * The CLI entry point (server.ts) uses this to start the server.
  */
 import express, { type Express } from "express";
+import Negotiator from "negotiator";
 import * as fs from "fs/promises";
 import * as http from "http";
+import type * as net from "net";
 import * as path from "path";
+import * as zlib from "zlib";
 import { WebSocketServer, type WebSocket } from "ws";
 import { RPCHandler } from "@orpc/server/node";
-import { RPCHandler as ORPCWebSocketServerHandler } from "@orpc/server/ws";
+import { RPCHandler as ORPCWebSocketServerHandler } from "@orpc/server/websocket";
 import { ORPCError, onError } from "@orpc/server";
 import { OpenAPIGenerator } from "@orpc/openapi";
 import { OpenAPIHandler } from "@orpc/openapi/node";
-import { ZodToJsonSchemaConverter } from "@orpc/zod/zod4";
+import { ZodToJsonSchemaConverter } from "@orpc/zod";
+import { EffectSchemaToJsonSchemaConverter } from "@orpc/experimental-effect";
+
+/**
+ * Effect Schema inputs need their own JSON-schema converter alongside Zod's;
+ * without it the generator silently emits operations with no
+ * requestBody, producing a lossy /api/spec.json. Exported so tests can verify
+ * the production converter set against Effect Schema procedures.
+ */
+export function createOpenAPIGenerator(): OpenAPIGenerator {
+  return new OpenAPIGenerator({
+    converters: [new ZodToJsonSchemaConverter(), new EffectSchemaToJsonSchemaConverter()],
+  });
+}
 import { router, type AppRouter } from "@/node/orpc/router";
 import type { ORPCContext } from "@/node/orpc/context";
 import { extractCookieValues, extractWsHeaders, safeEq } from "@/node/orpc/authMiddleware";
 import { VERSION } from "@/version";
 import { formatOrpcError } from "@/node/orpc/formatOrpcError";
 import { BROWSER_BRIDGE_WS_PATH, DESKTOP_WS_PATH, ORPC_WS_PATH } from "@/node/orpc/wsPaths";
-import { resolveShuxEnvironmentValue } from "@/common/compat/legacyMux";
+import { createFlowControlledWebSocket, type FlowControlObserver } from "@/node/orpc/wsFlowControl";
+import { perfEpochNowMs } from "@/common/utils/perf/clock";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { log } from "@/node/services/log";
+import { injectWorkspaceView } from "@/node/orpc/staticWorkspaceView/workspaceViewPage";
 import {
   SERVER_AUTH_SESSION_COOKIE_NAME,
   SERVER_AUTH_SESSION_MAX_AGE_SECONDS,
 } from "@/node/services/serverAuthService";
 import { attachStreamErrorHandler, isIgnorableStreamError } from "@/node/utils/streamErrors";
 import { getErrorMessage } from "@/common/utils/errors";
+import { createHealthProbe } from "@/node/orpc/healthProbe";
+import { HEALTH_FS_PROBE_TIMEOUT_MS } from "@/constants/startup";
 import { escapeHtml } from "@/node/utils/oauthUtils";
+import type { Result } from "@/common/types/result";
+import {
+  CODER_OAUTH_SERVER_CALLBACK_PATH,
+  CODER_OAUTH_SERVER_START_PATH,
+} from "@/common/constants/coderOAuth";
 import { assert } from "@/common/utils/assert";
+import {
+  FIRST_RUN_EARLY_SCRIPT,
+  FIRST_RUN_MODULES_ID,
+  FIRST_RUN_TEMPLATE_ID,
+  FIRST_RUN_VIEW_HTML,
+} from "@/node/orpc/firstRunView";
+import {
+  deferAppModules,
+  findFirstViewFont,
+  firstViewFontPreload,
+  isHashedStaticAssetName,
+  PRECOMPRESSED_ENCODINGS,
+} from "@/node/orpc/staticAssets";
 import { getAppProxyBasePathFromPathname, stripAppProxyBasePath } from "@/common/appProxyBasePath";
 
 type AliveWebSocket = WebSocket & { isAlive?: boolean };
@@ -127,6 +166,20 @@ function escapeHtmlAttribute(value: string): string {
 const SLASHLESS_ROOT_REDIRECT_SCRIPT =
   '<script>(()=>{const pathname=location.pathname;if(pathname.startsWith("//")||pathname.endsWith("/"))return;location.replace(location.origin+pathname+"/"+location.search+location.hash);})();</script>';
 
+const NEGOTIATED_ENCODINGS = [...PRECOMPRESSED_ENCODINGS.map((e) => e.encoding), "identity"];
+
+/**
+ * The encoding to send, or undefined for identity. Client q-values decide first. On ties the server
+ * order wins (brotli, then gzip): req.acceptsEncodings breaks ties by header order and would pick
+ * gzip for every browser ("gzip, deflate, br, zstd").
+ */
+function negotiateEncoding(req: express.Request) {
+  const [encoding] = new Negotiator(req).encodings(NEGOTIATED_ENCODINGS, {
+    preferred: NEGOTIATED_ENCODINGS,
+  });
+  return PRECOMPRESSED_ENCODINGS.find((e) => e.encoding === encoding);
+}
+
 function injectBaseHref(
   indexHtml: string,
   baseHref: string,
@@ -156,8 +209,34 @@ function escapeJsonForHtmlScript(value: unknown): string {
   return JSON.stringify(value).replaceAll("<", "\\u003c");
 }
 
+/**
+ * T3 C step 2 (plan section 5.6, PR 4b), for "/" only (`isAppRoot`): the static first-run view in a <template>
+ * before </body>, and JS-after-paint. Vite's module tags move into a JSON list after the <base>,
+ * then the early script, which shows the view and loads the app from that list once the view has
+ * painted, or at once (fact list: paint-cache key, hidden tab, a failed or slow POST, rule says no).
+ * The list must precede the early script, which can load the app before the parser goes on, and
+ * both precede the stylesheet, so the script does not wait for the CSS. A page without exactly one
+ * module script, a <base> and a </body> is served as is.
+ * Split origin (VITE_BACKEND_URL, a renderer served apart from its backend): the early script posts
+ * to this page's own `api/`. There those POSTs fail, and the script loads the app with no view, as
+ * today (PR 4a's failed-POST tests). Known limit: no static view on a split origin.
+ */
+function injectFirstRunView(html: string, isAppRoot: boolean): string {
+  const deferred = isAppRoot ? deferAppModules(html) : null;
+  if (!deferred || !/<base\b[^>]*>/i.test(deferred.html) || !/<\/body>/i.test(deferred.html)) {
+    return html;
+  }
+  const list = escapeJsonForHtmlScript(deferred.modules);
+  const head = `\n    <script type="application/json" id="${FIRST_RUN_MODULES_ID}">${list}</script>\n    <script>${FIRST_RUN_EARLY_SCRIPT}</script>`;
+  const template = `<template id="${FIRST_RUN_TEMPLATE_ID}">${FIRST_RUN_VIEW_HTML}</template>\n  `;
+  // Function replacers: the inserted text holds `$` signs, which string replacements would expand.
+  return deferred.html
+    .replace(/<base\b[^>]*>/i, (base) => base + head)
+    .replace(/<\/body>/i, (end) => template + end);
+}
+
 function getBrowserProxyUriTemplate(): string | null {
-  const muxProxyUri = resolveShuxEnvironmentValue("PROXY_URI", process.env)?.trim();
+  const muxProxyUri = resolveXumEnvironmentValue("PROXY_URI", process.env)?.trim();
   if (muxProxyUri) {
     return muxProxyUri;
   }
@@ -708,9 +787,8 @@ function buildPublicAbsoluteUrl(
 }
 
 const OAUTH_CALLBACK_ORIGIN_BYPASS_PATHS = new Set<string>([
-  "/auth/mux-gateway/callback",
-  "/auth/mux-governor/callback",
   "/auth/mcp-oauth/callback",
+  CODER_OAUTH_SERVER_CALLBACK_PATH,
 ]);
 
 function isOAuthCallbackNavigationRequest(req: Pick<express.Request, "method" | "path">): boolean {
@@ -726,6 +804,118 @@ function shouldEnforceOriginValidation(req: Pick<express.Request, "path">): bool
   return (
     req.path.startsWith("/orpc") || req.path.startsWith("/api") || req.path.startsWith("/auth/")
   );
+}
+
+function listenOnce(server: net.Server, port: number, host: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onListenError = (error: Error) => {
+      server.removeListener("error", onListenError);
+      reject(error);
+    };
+
+    server.once("error", onListenError);
+    server.listen(port, host, () => {
+      server.removeListener("error", onListenError);
+      resolve();
+    });
+  });
+}
+
+function closeListener(server: net.Server): Promise<void> {
+  return new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+function getListenErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) {
+    return undefined;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
+}
+
+/** The address family is disabled or has no loopback address on this host. */
+function isLoopbackFamilyUnavailable(error: unknown): boolean {
+  const code = getListenErrorCode(error);
+  return code === "EAFNOSUPPORT" || code === "EADDRNOTAVAIL";
+}
+
+/** Random-port attempts before giving up when ::1 is taken on the port chosen for 127.0.0.1. */
+const LOOPBACK_PAIR_RANDOM_PORT_ATTEMPTS = 5;
+
+/**
+ * Bind "localhost" as both 127.0.0.1 and ::1 on the same port.
+ *
+ * Node resolves "localhost" to a single address and binds only that family, which left the
+ * other loopback address free: a dev server started later could bind the same port there
+ * without EADDRINUSE, and clients (browsers, Coder port forwarding) then reached whichever
+ * server matched the family they picked. Holding both addresses makes the port exclusive,
+ * so a later bind fails instead of silently splitting traffic.
+ *
+ * The ::1 listener is a second HTTP server that re-emits its request, upgrade, and
+ * clientError events on the primary server, so both families share one set of handlers.
+ * (Handing raw sockets over with emit("connection") works in Node but not in Bun.)
+ * When one family has no loopback (IPv4-only containers, IPv6-only hosts), binds the other
+ * one alone, as the previous single-family bind did. Returns the IPv6 server, or null when
+ * the primary server is the only listener.
+ */
+async function listenOnBothLoopbacks(
+  httpServer: http.Server,
+  port: number
+): Promise<http.Server | null> {
+  const attempts = port === 0 ? LOOPBACK_PAIR_RANDOM_PORT_ATTEMPTS : 1;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await listenOnce(httpServer, port, "127.0.0.1");
+    } catch (error) {
+      if (!isLoopbackFamilyUnavailable(error)) {
+        throw error;
+      }
+      log.debug("IPv4 loopback unavailable; listening on ::1 only");
+      await listenOnce(httpServer, port, "::1");
+      return null;
+    }
+    const address = httpServer.address();
+    assert(address !== null && typeof address !== "string", "expected a TCP listen address");
+
+    // Clients can connect to 127.0.0.1 before the ::1 bind settles. If that bind fails,
+    // close() would wait on them (upgraded WebSockets are never closed by the HTTP server),
+    // so track them and destroy them on failure.
+    const bindWindowSockets = new Set<net.Socket>();
+    const trackSocket = (socket: net.Socket) => {
+      bindWindowSockets.add(socket);
+      socket.once("close", () => bindWindowSockets.delete(socket));
+    };
+    httpServer.on("connection", trackSocket);
+
+    const ipv6Server = http.createServer();
+    attachStreamErrorHandler(ipv6Server, "orpc-http-server-ipv6", { logger: log });
+    for (const event of ["request", "upgrade", "clientError"] as const) {
+      ipv6Server.on(event, (...args: unknown[]) => httpServer.emit(event, ...args));
+    }
+    try {
+      await listenOnce(ipv6Server, address.port, "::1");
+      return ipv6Server;
+    } catch (error) {
+      if (isLoopbackFamilyUnavailable(error)) {
+        log.debug("IPv6 loopback unavailable; listening on 127.0.0.1 only");
+        return null;
+      }
+
+      const closed = closeListener(httpServer);
+      for (const socket of bindWindowSockets) {
+        socket.destroy();
+      }
+      await closed;
+      // A random IPv4 port can already be in use on ::1; pick another one. An explicit
+      // port stays an error: someone else owns it on ::1, which is the clash we prevent.
+      if (getListenErrorCode(error) === "EADDRINUSE" && attempt < attempts) {
+        continue;
+      }
+      throw error;
+    } finally {
+      httpServer.removeListener("connection", trackSocket);
+    }
+  }
 }
 
 /**
@@ -857,16 +1047,45 @@ export async function createOrpcServer({
 
   // OAuth providers may use POST redirects (307/308) or response_mode=form_post.
   // Support both JSON API requests and form-encoded callback payloads.
-  app.use(express.json({ limit: "50mb" }));
-  app.use(express.urlencoded({ extended: false }));
+  // inflate: false answers 415 for any Content-Encoding but identity before body-parser creates a
+  // decompression stream. These parsers run before auth, so otherwise any client that reaches the
+  // port could feed bytes to Node's Brotli decoder (CVE-2026-111497, which runs code on affected
+  // Node releases, including the desktop app's Electron). No xum client compresses request bodies.
+  app.use(express.json({ limit: "50mb", inflate: false }));
+  app.use(express.urlencoded({ extended: false, inflate: false }));
+
+  // Health check. Must be registered ahead of express.static: serve-static stats
+  // "<staticDir>/health" on every request before falling through, so a wedged libuv threadpool
+  // used to hang this route before it could answer. Probe the fs on purpose instead, bounded,
+  // against the root the server actually depends on, and report a stalled pool as 503. Only the
+  // async stat may touch the filesystem here: resolving the root per request (getXumHome) runs
+  // synchronous stats on the main thread, which would block the event loop on the very stall
+  // this probe exists to report.
+  const probeHealth = createHealthProbe(
+    () => fs.stat(context.config.rootDir),
+    HEALTH_FS_PROBE_TIMEOUT_MS
+  );
+  app.get("/health", async (_req, res) => {
+    const health = await probeHealth();
+    res.status(health.statusCode).json(health.body);
+  });
 
   let rawSpaIndexHtml: string | null = null;
+  let firstViewFont: string | undefined;
 
   // Static file serving (optional)
   if (serveStatic) {
     try {
       const indexHtmlPath = path.join(staticDir, "index.html");
       rawSpaIndexHtml = await fs.readFile(indexHtmlPath, "utf8");
+      // The font file comes from the stylesheets index.html links, so a rebuild with new hashes needs
+      // no code change. A stylesheet that cannot be read only costs the preload.
+      for (const [, href] of rawSpaIndexHtml.matchAll(
+        /<link[^>]*rel="stylesheet"[^>]*href="\.?\/?([^"]+\.css)"/g
+      )) {
+        const css = await fs.readFile(path.join(staticDir, href), "utf8").catch(() => "");
+        firstViewFont ??= findFirstViewFont(css);
+      }
     } catch (error) {
       log.error("Failed to read index.html for SPA fallback:", error);
     }
@@ -874,16 +1093,48 @@ export async function createOrpcServer({
     // Serve JS/CSS/assets from disk, but never serve index.html — the SPA fallback
     // (below all API routes) serves the injected version with base href + proxy template.
     const serveStaticAssets = express.static(staticDir, { index: false });
+    // Content-hashed files (#5943) are cached for a year and sent as the build-time .br/.gz
+    // sibling when the client accepts it. These headers are set only when a file is actually
+    // sent, so a missing hashed-looking path still reaches the SPA fallback untouched.
+    const hashedOptions = { index: false, maxAge: "1y", immutable: true } as const;
+    const serveHashedIdentity = express.static(staticDir, {
+      ...hashedOptions,
+      setHeaders: (res) => res.vary("Accept-Encoding"),
+    });
+    const serveHashedEncoded = express.static(staticDir, {
+      ...hashedOptions,
+      // A byte range of the compressed stream is not a range of the resource: send it whole.
+      acceptRanges: false,
+      setHeaders: (res, filePath) => {
+        const precompressed = PRECOMPRESSED_ENCODINGS.find((e) => filePath.endsWith(e.extension));
+        assert(precompressed, `unexpected precompressed asset path: ${filePath}`);
+        res.vary("Accept-Encoding");
+        res.setHeader("Content-Encoding", precompressed.encoding);
+        res.type(path.extname(filePath.slice(0, -precompressed.extension.length)));
+      },
+    });
     app.use((req, res, next) => {
       if (req.path === "/index.html") return next();
-      serveStaticAssets(req, res, next);
+      if (!isHashedStaticAssetName(req.path.slice(1))) {
+        serveStaticAssets(req, res, next);
+        return;
+      }
+      const precompressed = negotiateEncoding(req);
+      const requestPath = splitRequestUrlPathAndQuery(req.url);
+      if (!precompressed || !requestPath) {
+        serveHashedIdentity(req, res, next);
+        return;
+      }
+      const originalUrl = req.url;
+      req.url = `${requestPath.pathname}${precompressed.extension}${requestPath.querySuffix}`;
+      serveHashedEncoded(req, res, (error?: unknown) => {
+        req.url = originalUrl;
+        if (error) return next(error);
+        // No precompressed sibling on disk: serve the identity file.
+        serveHashedIdentity(req, res, next);
+      });
     });
   }
-
-  // Health check endpoint
-  app.get("/health", (_req, res) => {
-    res.json({ status: "ok" });
-  });
 
   // Version endpoint
   app.get("/version", (_req, res) => {
@@ -1043,218 +1294,29 @@ export async function createOrpcServer({
     }
   });
 
-  // --- Shux Gateway OAuth (unauthenticated bootstrap routes) ---
-  // These are raw Express routes (not oRPC) because the OAuth provider cannot
-  // send a mux Bearer token during the redirect callback.
-  app.get("/auth/mux-gateway/start", async (req, res) => {
-    if (!(await isHttpRequestAuthenticated(req))) {
-      res.status(401).json({ error: "Invalid or missing auth token/session" });
-      return;
-    }
-
-    const redirectUri = buildPublicAbsoluteUrl(req, "/auth/mux-gateway/callback", allowHttpOrigin);
-    if (!redirectUri) {
-      res.status(400).json({ error: "Missing or invalid Host header" });
-      return;
-    }
-    const { authorizeUrl, state } = context.muxGatewayOauthService.startServerFlow({ redirectUri });
-    res.json({ authorizeUrl, state });
-  });
-
-  app.all("/auth/mux-gateway/callback", async (req, res) => {
-    // Some providers use 307/308 redirects that preserve POST, or response_mode=form_post.
-    if (req.method !== "GET" && req.method !== "POST") {
-      res.sendStatus(405);
-      return;
-    }
-
-    const state = getStringParamFromQueryOrBody(req, "state");
-    const code = getStringParamFromQueryOrBody(req, "code");
-    const error = getStringParamFromQueryOrBody(req, "error");
-    const errorDescription = getStringParamFromQueryOrBody(req, "error_description") ?? undefined;
-
-    const result = await context.muxGatewayOauthService.handleServerCallbackAndExchange({
-      state,
-      code,
-      error,
-      errorDescription,
-    });
-
+  /**
+   * Browser-facing page for a server-hosted OAuth callback: reports the
+   * outcome, posts it to the opener (the Settings tab), and closes itself on
+   * success. Shared by every provider whose authorization redirect lands on
+   * this server rather than on a desktop loopback listener.
+   */
+  function sendOAuthCallbackPage(
+    req: express.Request,
+    res: express.Response,
+    input: { type: string; state: string | null; result: Result<void, string> }
+  ): void {
     const payload = {
-      type: "mux-gateway-oauth",
-      state,
-      ok: result.success,
-      error: result.success ? null : result.error,
+      type: input.type,
+      state: input.state,
+      ok: input.result.success,
+      error: input.result.success ? null : input.result.error,
     };
 
     const payloadJson = escapeJsonForHtmlScript(payload);
 
-    const title = result.success ? "Login complete" : "Login failed";
-    const description = result.success
-      ? "You can return to Shux. You may now close this tab."
-      : payload.error
-        ? escapeHtml(payload.error)
-        : "An unknown error occurred.";
-    const returnPath = getPublicAppRootPath(req, res);
-    const returnPathJson = escapeJsonForHtmlScript(returnPath);
-    const returnPathHref = escapeHtmlAttribute(returnPath);
-
-    const html = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#0e0e0e" />
-    <title>${title}</title>
-    <link rel="stylesheet" href="https://gateway.mux.coder.com/static/css/site.css" />
-  </head>
-  <body>
-    <div class="page">
-      <header class="site-header">
-        <div class="container">
-          <div class="header-title">shux</div>
-        </div>
-      </header>
-
-      <main class="site-main">
-        <div class="container">
-          <div class="content-surface">
-            <h1>${title}</h1>
-            <p>${description}</p>
-            ${result.success ? '<p class="muted">This tab should close automatically.</p>' : ""}
-            <p><a class="btn primary" href="${returnPathHref}">Return to Shux</a></p>
-          </div>
-        </div>
-      </main>
-    </div>
-
-    <script>
-      (() => {
-        const payload = ${payloadJson};
-        const ok = payload.ok === true;
-
-        try {
-          if (window.opener && typeof window.opener.postMessage === "function") {
-            window.opener.postMessage(payload, "*");
-          }
-        } catch {
-          // Ignore postMessage failures.
-        }
-
-        if (!ok) {
-          return;
-        }
-
-        try {
-          if (window.opener && typeof window.opener.focus === "function") {
-            window.opener.focus();
-          }
-        } catch {
-          // Ignore focus failures.
-        }
-
-        try {
-          window.close();
-        } catch {
-          // Ignore close failures.
-        }
-
-        setTimeout(() => {
-          try {
-            window.close();
-          } catch {
-            // Ignore close failures.
-          }
-        }, 50);
-
-        setTimeout(() => {
-          try {
-            window.location.replace(${returnPathJson});
-          } catch {
-            // Ignore navigation failures.
-          }
-        }, 150);
-      })();
-    </script>
-  </body>
-</html>`;
-
-    res.status(result.success ? 200 : 400);
-    res.setHeader("Content-Type", "text/html");
-    res.send(html);
-  });
-
-  // --- Shux Governor OAuth (unauthenticated bootstrap routes) ---
-  // Similar to Shux Gateway OAuth but accepts user-provided governorUrl.
-  app.get("/auth/mux-governor/start", async (req, res) => {
-    if (!(await isHttpRequestAuthenticated(req))) {
-      res.status(401).json({ error: "Invalid or missing auth token/session" });
-      return;
-    }
-
-    const governorUrl = typeof req.query.governorUrl === "string" ? req.query.governorUrl : null;
-    if (!governorUrl) {
-      res.status(400).json({ error: "Missing governorUrl query parameter" });
-      return;
-    }
-
-    const redirectUri = buildPublicAbsoluteUrl(req, "/auth/mux-governor/callback", allowHttpOrigin);
-    if (!redirectUri) {
-      res.status(400).json({ error: "Missing or invalid Host header" });
-      return;
-    }
-    const result = context.muxGovernorOauthService.startServerFlow({
-      governorOrigin: governorUrl,
-      redirectUri,
-    });
-
-    if (!result.success) {
-      res.status(400).json({ error: result.error });
-      return;
-    }
-
-    res.json({ authorizeUrl: result.data.authorizeUrl, state: result.data.state });
-  });
-
-  app.all("/auth/mux-governor/callback", async (req, res) => {
-    // Some providers use 307/308 redirects that preserve POST, or response_mode=form_post.
-    if (req.method !== "GET" && req.method !== "POST") {
-      res.sendStatus(405);
-      return;
-    }
-
-    const state = getStringParamFromQueryOrBody(req, "state");
-    const code = getStringParamFromQueryOrBody(req, "code");
-    const error = getStringParamFromQueryOrBody(req, "error");
-    const errorDescription = getStringParamFromQueryOrBody(req, "error_description") ?? undefined;
-
-    log.debug("Governor OAuth callback received", {
-      method: req.method,
-      state,
-      hasCode: typeof code === "string" && code.length > 0,
-      hasError: typeof error === "string" && error.length > 0,
-    });
-
-    const result = await context.muxGovernorOauthService.handleServerCallbackAndExchange({
-      state,
-      code,
-      error,
-      errorDescription,
-    });
-
-    const payload = {
-      type: "mux-governor-oauth",
-      state,
-      ok: result.success,
-      error: result.success ? null : result.error,
-    };
-
-    const payloadJson = escapeJsonForHtmlScript(payload);
-
-    const title = result.success ? "Enrollment complete" : "Enrollment failed";
-    const description = result.success
-      ? "You can return to Shux. You may now close this tab."
+    const title = input.result.success ? "Login complete" : "Login failed";
+    const description = input.result.success
+      ? "You can return to Xum. You may now close this tab."
       : payload.error
         ? escapeHtml(payload.error)
         : "An unknown error occurred.";
@@ -1272,15 +1334,14 @@ export async function createOrpcServer({
     <style>
       body { font-family: system-ui, sans-serif; max-width: 600px; margin: 4rem auto; padding: 1rem; }
       h1 { margin-bottom: 1rem; }
-      .muted { color: #666; }
-      .btn { display: inline-block; padding: 0.5rem 1rem; background: #333; color: #fff; text-decoration: none; border-radius: 4px; }
+      .muted { opacity: 0.7; }
     </style>
   </head>
   <body>
     <h1>${title}</h1>
     <p>${description}</p>
-    ${result.success ? '<p class="muted">This tab should close automatically.</p>' : ""}
-    <p><a class="btn" href="${returnPathHref}">Return to Shux</a></p>
+    ${input.result.success ? '<p class="muted">This tab should close automatically.</p>' : ""}
+    <p><a href="${returnPathHref}">Return to Xum</a></p>
 
     <script>
       (() => {
@@ -1333,10 +1394,10 @@ export async function createOrpcServer({
   </body>
 </html>`;
 
-    res.status(result.success ? 200 : 400);
+    res.status(input.result.success ? 200 : 400);
     res.setHeader("Content-Type", "text/html");
     res.send(html);
-  });
+  }
 
   // --- MCP OAuth (unauthenticated redirect callback) ---
   // The OAuth provider cannot attach a mux Bearer token during redirects.
@@ -1349,127 +1410,91 @@ export async function createOrpcServer({
 
     const state = getStringParamFromQueryOrBody(req, "state");
     const code = getStringParamFromQueryOrBody(req, "code");
+    // RFC 9207 issuer; the MCP SDK validates it during the code exchange.
+    const iss = getStringParamFromQueryOrBody(req, "iss");
     const error = getStringParamFromQueryOrBody(req, "error");
     const errorDescription = getStringParamFromQueryOrBody(req, "error_description") ?? undefined;
 
     const result = await context.mcpOauthService.handleServerCallbackAndExchange({
       state,
       code,
+      iss,
       error,
       errorDescription,
     });
 
-    const payload = {
-      type: "mcp-oauth",
+    sendOAuthCallbackPage(req, res, { type: "mcp-oauth", state, result });
+  });
+
+  // --- Coder OAuth ("Login with Coder", browser/server mode) ---
+  // Desktop clients use the oRPC startDesktopFlow with a loopback listener; a
+  // browser talking to a (possibly remote) Xum server cannot reach that
+  // listener, so the redirect targets this server instead. Raw Express routes:
+  // the start route needs the request's validated public host to build the
+  // redirect URI (never accepted from the client), and the callback arrives
+  // without a Bearer token. The flow itself is the shared one, so the client
+  // keeps waiting/cancelling through oRPC.
+  app.get(CODER_OAUTH_SERVER_START_PATH, async (req, res) => {
+    if (!(await isHttpRequestAuthenticated(req))) {
+      res.status(401).json({ error: "Invalid or missing auth token/session" });
+      return;
+    }
+
+    const deploymentUrl =
+      typeof req.query.deploymentUrl === "string" ? req.query.deploymentUrl : null;
+    if (!deploymentUrl) {
+      res.status(400).json({ error: "Missing deploymentUrl query parameter" });
+      return;
+    }
+    const flowId = typeof req.query.flowId === "string" ? req.query.flowId : undefined;
+
+    const redirectUri = buildPublicAbsoluteUrl(
+      req,
+      CODER_OAUTH_SERVER_CALLBACK_PATH,
+      allowHttpOrigin
+    );
+    if (!redirectUri) {
+      res.status(400).json({ error: "Missing or invalid Host header" });
+      return;
+    }
+    const result = await context.coderOauthService.startServerFlow({
+      deploymentUrl,
+      flowId,
+      redirectUri,
+    });
+    if (!result.success) {
+      res.status(400).json({ error: result.error });
+      return;
+    }
+    res.json(result.data);
+  });
+
+  app.all(CODER_OAUTH_SERVER_CALLBACK_PATH, async (req, res) => {
+    // Some providers use 307/308 redirects that preserve POST, or response_mode=form_post.
+    if (req.method !== "GET" && req.method !== "POST") {
+      res.sendStatus(405);
+      return;
+    }
+
+    const state = getStringParamFromQueryOrBody(req, "state");
+    const code = getStringParamFromQueryOrBody(req, "code");
+    const error = getStringParamFromQueryOrBody(req, "error");
+    const errorDescription = getStringParamFromQueryOrBody(req, "error_description") ?? undefined;
+
+    const result = await context.coderOauthService.handleServerCallback({
       state,
-      ok: result.success,
-      error: result.success ? null : result.error,
-    };
+      code,
+      error,
+      errorDescription,
+    });
 
-    const payloadJson = escapeJsonForHtmlScript(payload);
-
-    const title = result.success ? "Login complete" : "Login failed";
-    const description = result.success
-      ? "You can return to Shux. You may now close this tab."
-      : payload.error
-        ? escapeHtml(payload.error)
-        : "An unknown error occurred.";
-    const returnPath = getPublicAppRootPath(req, res);
-    const returnPathJson = escapeJsonForHtmlScript(returnPath);
-    const returnPathHref = escapeHtmlAttribute(returnPath);
-
-    const html = `<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#0e0e0e" />
-    <title>${title}</title>
-    <link rel="stylesheet" href="https://gateway.mux.coder.com/static/css/site.css" />
-  </head>
-  <body>
-    <div class="page">
-      <header class="site-header">
-        <div class="container">
-          <div class="header-title">shux</div>
-        </div>
-      </header>
-
-      <main class="site-main">
-        <div class="container">
-          <div class="content-surface">
-            <h1>${title}</h1>
-            <p>${description}</p>
-            ${result.success ? '<p class="muted">This tab should close automatically.</p>' : ""}
-            <p><a class="btn primary" href="${returnPathHref}">Return to Shux</a></p>
-          </div>
-        </div>
-      </main>
-    </div>
-
-    <script>
-      (() => {
-        const payload = ${payloadJson};
-        const ok = payload.ok === true;
-
-        try {
-          if (window.opener && typeof window.opener.postMessage === "function") {
-            window.opener.postMessage(payload, "*");
-          }
-        } catch {
-          // Ignore postMessage failures.
-        }
-
-        if (!ok) {
-          return;
-        }
-
-        try {
-          if (window.opener && typeof window.opener.focus === "function") {
-            window.opener.focus();
-          }
-        } catch {
-          // Ignore focus failures.
-        }
-
-        try {
-          window.close();
-        } catch {
-          // Ignore close failures.
-        }
-
-        setTimeout(() => {
-          try {
-            window.close();
-          } catch {
-            // Ignore close failures.
-          }
-        }, 50);
-
-        setTimeout(() => {
-          try {
-            window.location.replace(${returnPathJson});
-          } catch {
-            // Ignore navigation failures.
-          }
-        }, 150);
-      })();
-    </script>
-  </body>
-</html>`;
-
-    res.status(result.success ? 200 : 400);
-    res.setHeader("Content-Type", "text/html");
-    res.send(html);
+    sendOAuthCallbackPage(req, res, { type: "coder-oauth", state, result });
   });
 
   const orpcRouter = existingRouter ?? router(authToken);
 
   // OpenAPI generator for spec endpoint
-  const openAPIGenerator = new OpenAPIGenerator({
-    schemaConverters: [new ZodToJsonSchemaConverter()],
-  });
+  const openAPIGenerator = createOpenAPIGenerator();
 
   // OpenAPI spec endpoint
   app.get("/api/spec.json", async (req, res) => {
@@ -1481,24 +1506,27 @@ export async function createOrpcServer({
       "/api"
     );
 
+    // oRPC >=1.14 nests document fields under `base` instead of top-level options.
     const spec = await openAPIGenerator.generate(orpcRouter, {
-      info: {
-        title: "Shux API",
-        version: gitDescribe,
-        description: "API for Shux",
-      },
-      servers: [{ url: publicApiPath }],
-      security: authToken ? [{ bearerAuth: [] }] : undefined,
-      components: authToken
-        ? {
-            securitySchemes: {
-              bearerAuth: {
-                type: "http",
-                scheme: "bearer",
+      base: {
+        info: {
+          title: "Xum API",
+          version: gitDescribe,
+          description: "API for Xum",
+        },
+        servers: [{ url: publicApiPath }],
+        security: authToken ? [{ bearerAuth: [] }] : undefined,
+        components: authToken
+          ? {
+              securitySchemes: {
+                bearerAuth: {
+                  type: "http",
+                  scheme: "bearer",
+                },
               },
-            },
-          }
-        : undefined,
+            }
+          : undefined,
+      },
     });
     varyPublicBasePathHeaders(res);
     res.json(spec);
@@ -1514,7 +1542,7 @@ export async function createOrpcServer({
     const html = `<!doctype html>
 <html>
   <head>
-    <title>shux API Reference</title>
+    <title>xum API Reference</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
   </head>
@@ -1576,17 +1604,67 @@ export async function createOrpcServer({
         return next();
       }
 
+      // #5945: a missing file (/llms.txt, /assets/x.js) or a dot segment probe (/.well-known/*,
+      // /.env, /.git/config) gets a 404 instead of the SPA page. The check reads only the pathname
+      // string (a fixed number of prefix and extension checks, no filesystem call).
+      // `/workspace/<id>` is a client route whatever its ID: legacy IDs are `${project}-${branch}`
+      // and can contain dots (next.js-main).
+      const isWorkspaceRoute =
+        req.path.startsWith("/workspace/") && !req.path.includes("/", "/workspace/".length);
+      // Express keeps percent escapes in req.path (/%2Eenv), but serve-static decodes them before
+      // its lookup, so classify the decoded path. A malformed escape keeps the raw path.
+      let filePath = req.path;
+      if (filePath.includes("%")) {
+        try {
+          filePath = decodeURIComponent(filePath);
+        } catch {
+          // Not decodable: classify the raw path.
+        }
+      }
+      if (
+        req.path !== "/index.html" &&
+        !isWorkspaceRoute &&
+        (filePath.includes("/.") || path.posix.extname(filePath) !== "")
+      ) {
+        return next();
+      }
+
       if (rawSpaIndexHtml !== null) {
+        const isAppRoot = shouldInjectSlashlessRootRedirect(req);
         const spaIndexHtml = injectProxyUriTemplate(
-          injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
-            includeSlashlessRootRedirect: shouldInjectSlashlessRootRedirect(req),
-          }),
+          injectWorkspaceView(
+            injectFirstRunView(
+              injectBaseHref(rawSpaIndexHtml, getPublicBaseHref(req, res), {
+                includeSlashlessRootRedirect: isAppRoot,
+              }),
+              isAppRoot
+            ),
+            { path: req.path, headers: req.headers }
+          ),
           getBrowserProxyUriTemplate()
         );
         varyPublicBasePathHeaders(res);
-        res.setHeader("Content-Type", "text/html");
+        res.setHeader("Content-Type", "text/html; charset=utf-8");
         res.setHeader("Cache-Control", "no-store");
-        res.send(spaIndexHtml);
+        // After the injected <base>, so the relative font URLs resolve under a proxy base path.
+        const html = spaIndexHtml.replace(
+          /<\/head>/i,
+          `${firstViewFontPreload(firstViewFont)}</head>`
+        );
+        // Compressed per response, because the HTML is rewritten per request (base href, redirect).
+        // br quality 5 takes about 0.15 ms for this page. Quality 11 blocks for about 10 ms.
+        res.vary("Accept-Encoding");
+        const encoding = negotiateEncoding(req)?.encoding;
+        if (encoding) res.setHeader("Content-Encoding", encoding);
+        res.send(
+          encoding === "br"
+            ? zlib.brotliCompressSync(html, {
+                params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 5 },
+              })
+            : encoding === "gzip"
+              ? zlib.gzipSync(html)
+              : html
+        );
         return;
       }
 
@@ -1597,7 +1675,6 @@ export async function createOrpcServer({
     });
   }
 
-  // Create HTTP server
   const httpServer = http.createServer(app);
 
   // Avoid process crashes from unhandled socket/server errors.
@@ -1642,7 +1719,8 @@ export async function createOrpcServer({
         log.warn("Blocked cross-origin WebSocket upgrade request", {
           origin: getFirstHeaderValue(req, "origin"),
           expectedOrigins,
-          url: req.url,
+          // Never log req.url: browser clients send the auth token as `?token=` (#4853).
+          path: routePathname,
         });
 
         try {
@@ -1712,6 +1790,18 @@ export async function createOrpcServer({
   const orpcWsHandler = new ORPCWebSocketServerHandler(orpcRouter, {
     interceptors: [onError(onOrpcError)],
   });
+  // Flow-control waits go to the perf flight recorder (a no-op unless it is collecting). The
+  // Electron MessagePort transport has no send buffer or flow control, so it records none.
+  // Partial test contexts can lack the recorder, hence the widened type.
+  const perfRecorder: ORPCContext["perfFlightRecorder"] | undefined = context.perfFlightRecorder;
+  const wsFlowControlObserver: FlowControlObserver | undefined =
+    perfRecorder === undefined
+      ? undefined
+      : {
+          waitStarted: () => perfRecorder.beginRpcCall(),
+          waitEnded: (wait) =>
+            perfRecorder.recordWsFlowControlWait({ ...wait, endMs: perfEpochNowMs() }),
+        };
 
   wsServer.on("connection", (ws, req) => {
     const terminate = () => {
@@ -1746,22 +1836,33 @@ export async function createOrpcServer({
         writable: true,
       },
     });
-    void orpcWsHandler.upgrade(ws, { context: wsContext });
+    // Flow control bounds the socket's send backlog so a large replay cannot
+    // starve heartbeats or the keepalive pong (#4655). The keepalive above
+    // keeps using the raw ws; oRPC keys peers by this one wrapper instance.
+    void orpcWsHandler.upgrade(createFlowControlledWebSocket(ws, wsFlowControlObserver), {
+      context: wsContext,
+    });
   });
 
   // Start listening
-  await new Promise<void>((resolve, reject) => {
-    const onListenError = (error: Error) => {
-      httpServer.removeListener("error", onListenError);
-      reject(error);
-    };
-
-    httpServer.once("error", onListenError);
-    httpServer.listen(port, host, () => {
-      httpServer.removeListener("error", onListenError);
-      resolve();
-    });
-  });
+  let ipv6LoopbackServer: http.Server | null = null;
+  try {
+    // Hostnames are case-insensitive; normalize like ServerService.isLoopbackHost.
+    if (host.trim().toLowerCase() === "localhost") {
+      ipv6LoopbackServer = await listenOnBothLoopbacks(httpServer, port);
+    } else {
+      await listenOnce(httpServer, port, host);
+    }
+  } catch (error) {
+    // The caller gets no OrpcServer to close, and desktop startup keeps running after a
+    // failed bind, so release what was created above instead of leaking it per attempt.
+    clearInterval(heartbeatInterval);
+    for (const ws of wsServer.clients) {
+      ws.terminate();
+    }
+    wsServer.close();
+    throw error;
+  }
 
   // Get actual port (useful when port=0)
   const address = httpServer.address();
@@ -1803,7 +1904,14 @@ export async function createOrpcServer({
         await browserBridgeServer.stop();
       }
 
-      // Then close HTTP server.
+      // Then close HTTP server (and the IPv6 loopback listener feeding it).
+      if (ipv6LoopbackServer) {
+        ipv6LoopbackServer.closeIdleConnections?.();
+        ipv6LoopbackServer.closeAllConnections?.();
+        if (ipv6LoopbackServer.listening) {
+          await closeListener(ipv6LoopbackServer);
+        }
+      }
       httpServer.closeIdleConnections?.();
       httpServer.closeAllConnections?.();
       if (httpServer.listening) {

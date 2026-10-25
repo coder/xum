@@ -13,6 +13,10 @@
  *   await fs.writeFile("file.txt", data);
  * });
  * ```
+ *
+ * Not reentrant: a `withLock` nested inside another `withLock` on the same key
+ * queues behind the outer call, so awaiting it from the outer operation
+ * deadlocks both. Restructure so the inner work runs without re-locking.
  */
 export class MutexMap<K> {
   private locks = new Map<K, Promise<void>>();
@@ -40,6 +44,7 @@ export class MutexMap<K> {
       await previousLock; // Wait for previous operation
       return await operation();
     } finally {
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       releaseLock!();
       if (this.locks.get(key) === lockPromise) {
         this.locks.delete(key);

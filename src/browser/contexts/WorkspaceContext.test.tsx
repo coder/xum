@@ -1,7 +1,11 @@
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { beforeEach, afterEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 import { GlobalWindow } from "happy-dom";
+import { QuotaLimitedStorage, restartLocalStorage } from "../../../tests/ui/quotaLimitedStorage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import type { WorkspaceContext } from "./WorkspaceContext";
 import { WorkspaceProvider, useWorkspaceContext } from "./WorkspaceContext";
 import { ProjectProvider, useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -9,24 +13,29 @@ import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { useWorkspaceStoreRaw as getWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import {
   LAST_VISITED_ROUTE_KEY,
-  LAUNCH_BEHAVIOR_KEY,
   SELECTED_WORKSPACE_KEY,
-  getAgentIdKey,
-  getModelKey,
+  getAutoExpandPrefsKey,
   getRightSidebarLayoutKey,
   getTerminalTitlesKey,
-  getThinkingLevelKey,
+  type LaunchBehavior,
 } from "@/common/constants/storage";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
-import type { RecursivePartial } from "@/browser/testUtils";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { readPersistedState } from "@/browser/hooks/usePersistedState";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
+import {
+  getWorkspaceAgentId,
+  getWorkspaceAiMetadata,
+  setWorkspaceAgentPick,
+} from "@/browser/utils/aiSelectionIntent";
 import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
+import { resetWorkspaceStorageGcForTests } from "@/browser/utils/workspaceStorageGc";
 
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createConnectionHarness, GAP_MODES, type GapMode } from "./connection.testHarness";
 
-let currentClientMock: RecursivePartial<APIClient> = {};
+let currentClientMock: TestApiOverrides<APIClient> = {};
 
 // Helper to create test workspace metadata with default runtime config
 const createWorkspaceMetadata = (
@@ -58,6 +67,7 @@ const createProjectWorkspaceMetadata = (
 type NavigationType = "navigate" | "reload" | "back_forward" | "prerender";
 
 describe("WorkspaceContext", () => {
+  beforeEach(saveDomGlobals);
   afterEach(() => {
     cleanup();
     mock.restore();
@@ -65,11 +75,10 @@ describe("WorkspaceContext", () => {
     // Reset global workspace store to avoid cross-test leakage
     getWorkspaceStoreRaw().dispose();
 
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
-    globalThis.localStorage = undefined as unknown as Storage;
+    restoreDomGlobals();
 
     currentClientMock = {};
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
   });
 
   test("syncs workspace store subscriptions when metadata loads", async () => {
@@ -95,10 +104,7 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() =>
       expect(
-        workspaceApi.onChat.mock.calls.some(
-          ([{ workspaceId }]: [{ workspaceId: string }, ...unknown[]]) =>
-            workspaceId === "ws-sync-load"
-        )
+        workspaceApi.onChat.mock.calls.some(([input]) => input?.workspaceId === "ws-sync-load")
       ).toBe(true)
     );
   });
@@ -118,6 +124,24 @@ describe("WorkspaceContext", () => {
     expect(ctx().workspaceMetadata.size).toBe(0);
   });
 
+  test("a metadata stream that ends before its snapshot still ends startup loading", async () => {
+    const { workspace: workspaceApi } = createMockAPI();
+    workspaceApi.onMetadata.mockImplementation(() =>
+      Promise.resolve(
+        // eslint-disable-next-line require-yield
+        (async function* () {
+          await Promise.resolve();
+        })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+      )
+    );
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().loading).toBe(false));
+    expect(ctx().loaded).toBe(false);
+    expect(ctx().loadError).toBeTruthy();
+  });
+
   test("subscribes to new workspace immediately when metadata event fires", async () => {
     const { workspace: workspaceApi } = createMockAPI({
       workspace: {
@@ -129,6 +153,58 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(workspaceApi.onMetadata.mock.calls.length).toBeGreaterThan(0));
     expect(workspaceApi.onMetadata).toHaveBeenCalled();
+  });
+
+  test("deletion metadata waits for one config notification to refresh projects", async () => {
+    const workspaces = Array.from({ length: 5 }, (_, index) =>
+      createProjectWorkspaceMetadata("child-" + index, "/alpha")
+    );
+    const deletions = workspaces.map(() => Promise.withResolvers<void>());
+    const configChanged = Promise.withResolvers<void>();
+    const { projects } = createMockAPI({
+      workspace: {
+        list: () => Promise.resolve(workspaces),
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              for (const [index, workspace] of workspaces.entries()) {
+                await deletions[index].promise;
+                yield { workspaceId: workspace.id, metadata: null };
+              }
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+    });
+    currentClientMock = {
+      ...currentClientMock,
+      config: {
+        onConfigChanged: () =>
+          Promise.resolve(
+            (async function* () {
+              await configChanged.promise;
+              yield undefined;
+            })() as unknown as Awaited<ReturnType<APIClient["config"]["onConfigChanged"]>>
+          ),
+      },
+    };
+    const contexts = await setupWithProjectContext();
+    await waitFor(() => expect(contexts.workspace().workspaceMetadata.size).toBe(5));
+    await waitFor(() => expect(contexts.project().loading).toBe(false));
+    await act(async () => {
+      await contexts.project().refreshProjects();
+    });
+    const initialRequests = projects.list.mock.calls.length;
+    for (const [index, deletion] of deletions.entries()) {
+      act(() => {
+        deletion.resolve();
+      });
+      await waitFor(() => expect(contexts.workspace().workspaceMetadata.size).toBe(4 - index));
+      expect(projects.list).toHaveBeenCalledTimes(initialRequests);
+    }
+    act(() => {
+      configChanged.resolve();
+    });
+    await waitFor(() => expect(projects.list).toHaveBeenCalledTimes(initialRequests + 1));
   });
 
   test("switches selection to parent when selected child workspace is deleted", async () => {
@@ -167,9 +243,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${childId}`,
     });
 
@@ -218,9 +292,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${workspaceId}`,
     });
 
@@ -276,9 +348,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${workspaceId}`,
     });
 
@@ -333,9 +403,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${archivedId}`,
     });
 
@@ -412,9 +480,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       // Parent is selected, not the child
       locationPath: `/workspace/${parentId}`,
     });
@@ -437,98 +503,53 @@ describe("WorkspaceContext", () => {
     expect(ctx().selectedWorkspace?.workspaceId).toBe(parentId);
   });
 
-  test("refreshes projects when metadata delete event is received", async () => {
-    const workspaceId = "ws-delete-refresh";
-
-    const workspaces: FrontendWorkspaceMetadata[] = [
-      createWorkspaceMetadata({
+  test.each([true, false])(
+    "seeds settings only for non-archived metadata events (archived=%s)",
+    async (archived) => {
+      const workspaceId = "metadata-settings";
+      const metadata = createWorkspaceMetadata({
         id: workspaceId,
-        projectPath: "/alpha",
-        projectName: "alpha",
-        name: "main",
-        namedWorkspacePath: "/alpha-main",
-      }),
-    ];
-
-    let emitDelete:
-      | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
-      | null = null;
-
-    const { projects: projectsApi } = createMockAPI({
-      workspace: {
-        list: () => Promise.resolve(workspaces),
-        onMetadata: () =>
-          Promise.resolve(
-            (async function* () {
-              const event = await new Promise<{
-                workspaceId: string;
-                metadata: FrontendWorkspaceMetadata | null;
-              }>((resolve) => {
-                emitDelete = resolve;
-              });
-              yield event;
-            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
-          ),
-      },
-      projects: {
-        list: () => Promise.resolve([]),
-      },
-    });
-
-    await setup();
-
-    await waitFor(() => expect(emitDelete).toBeTruthy());
-    await waitFor(() => expect(projectsApi.list).toHaveBeenCalled());
-    const callsBeforeDelete = projectsApi.list.mock.calls.length;
-
-    act(() => {
-      emitDelete?.({ workspaceId, metadata: null });
-    });
-
-    await waitFor(() => {
-      expect(projectsApi.list.mock.calls.length).toBeGreaterThan(callsBeforeDelete);
-    });
-  });
-
-  test("seeds model + thinking localStorage from backend metadata", async () => {
-    const initialWorkspaces: FrontendWorkspaceMetadata[] = [
-      createWorkspaceMetadata({
-        id: "ws-ai",
+        archivedAt: "2025-02-01T00:00:00.000Z",
+        ...(archived ? {} : { unarchivedAt: "2025-03-01T00:00:00.000Z" }),
         aiSettings: { model: "openai:gpt-5.2", thinkingLevel: "xhigh" },
-      }),
-    ];
+      });
+      let processed = false;
+      createMockAPI({
+        workspace: {
+          list: () => Promise.resolve([]),
+          onMetadata: () =>
+            Promise.resolve(
+              (async function* () {
+                yield await Promise.resolve({ workspaceId, metadata });
+                processed = true;
+              })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+            ),
+        },
+      });
+      await setup();
+      await waitFor(() => expect(processed).toBe(true));
+      expect(getWorkspaceAiMetadata(workspaceId)?.aiSettings?.model).toBe(
+        archived ? undefined : "openai:gpt-5.2"
+      );
+    }
+  );
 
-    createMockAPI({
-      workspace: {
-        list: () => Promise.resolve(initialWorkspaces),
-      },
-      localStorage: {
-        // Seed with different values; backend should win.
-        [getModelKey("ws-ai")]: JSON.stringify("anthropic:claude-3.5"),
-        [getThinkingLevelKey("ws-ai")]: JSON.stringify("low"),
-      },
+  test.each(["unchanged", "mode", "model"])("keeps an unsent agent pick: %s", async (change) => {
+    const changed = change !== "unchanged";
+    const nextAgentId = change === "mode" ? "auto" : "plan";
+    const workspaceId = `ws-agent-main-${change}`;
+    const saved = createWorkspaceMetadata({
+      id: workspaceId,
+      agentId: "plan",
+      aiSettingsByAgent: { plan: { model: "openai:gpt-5.2", thinkingLevel: "high" } },
     });
-
-    const ctx = await setup();
-
-    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
-
-    expect(JSON.parse(globalThis.localStorage.getItem(getModelKey("ws-ai"))!)).toBe(
-      "openai:gpt-5.2"
-    );
-    expect(JSON.parse(globalThis.localStorage.getItem(getThinkingLevelKey("ws-ai"))!)).toBe(
-      "xhigh"
-    );
-  });
-  test("stale metadata does not override a main workspace agent selection", async () => {
-    const workspaceId = "ws-agent-main";
     let emitMetadata:
       | ((event: { workspaceId: string; metadata: FrontendWorkspaceMetadata | null }) => void)
       | null = null;
 
     createMockAPI({
       workspace: {
-        list: () => Promise.resolve([createWorkspaceMetadata({ id: workspaceId })]),
+        list: () => Promise.resolve([saved]),
         onMetadata: () =>
           Promise.resolve(
             (async function* () {
@@ -542,31 +563,40 @@ describe("WorkspaceContext", () => {
             })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
           ),
       },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify("exec"),
-      },
     });
 
     const ctx = await setup();
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
     await waitFor(() => expect(emitMetadata).toBeTruthy());
-    expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBeUndefined();
+    expect(getWorkspaceAgentId(workspaceId)).toBe("plan");
 
     act(() => {
+      setWorkspaceAgentPick(workspaceId, "exec");
       emitMetadata?.({
         workspaceId,
-        metadata: createWorkspaceMetadata({ id: workspaceId, agentId: "plan" }),
+        metadata: {
+          ...saved,
+          title: "Updated title",
+          ...(changed
+            ? {
+                agentId: nextAgentId,
+                aiSettingsByAgent: {
+                  [nextAgentId]: { model: "openai:gpt-5.3-codex", thinkingLevel: "medium" },
+                },
+              }
+            : {}),
+        },
       });
     });
 
-    await waitFor(() => expect(ctx().workspaceMetadata.get(workspaceId)?.agentId).toBe("plan"));
-    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
-      "exec"
+    await waitFor(() =>
+      expect(ctx().workspaceMetadata.get(workspaceId)?.title).toBe("Updated title")
     );
+    expect(getWorkspaceAgentId(workspaceId)).toBe("exec");
   });
 
-  test("child workspace metadata still seeds the locked backend agent", async () => {
+  test("child workspace metadata resolves the locked backend agent", async () => {
     const workspaceId = "ws-agent-child";
 
     createMockAPI({
@@ -576,12 +606,10 @@ describe("WorkspaceContext", () => {
             createWorkspaceMetadata({
               id: workspaceId,
               parentWorkspaceId: "ws-parent",
+              agentId: "exec",
               agentType: "plan",
             }),
           ]),
-      },
-      localStorage: {
-        [getAgentIdKey(workspaceId)]: JSON.stringify("exec"),
       },
     });
 
@@ -589,9 +617,7 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(1));
 
-    expect(readPersistedState<string | undefined>(getAgentIdKey(workspaceId), undefined)).toBe(
-      "plan"
-    );
+    expect(getWorkspaceAgentId(workspaceId)).toBe("plan");
   });
 
   test("loads workspace metadata on mount", async () => {
@@ -624,6 +650,135 @@ describe("WorkspaceContext", () => {
 
     await waitFor(() => expect(ctx().loading).toBe(false));
     expect(ctx().workspaceMetadata.size).toBe(0);
+  });
+
+  test("startup state comes from the metadata stream, not a separate stale list", async () => {
+    const staleList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    createMockAPI({
+      // A list() requested before a change answers without it, even if it resolves late.
+      metadataSnapshot: () =>
+        Promise.resolve([createWorkspaceMetadata({ id: "ws-1", title: "renamed" })]),
+      workspace: {
+        list: () => staleList.promise,
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              await Promise.resolve();
+              yield {
+                workspaceId: "ws-1",
+                metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed again" }),
+              };
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+    });
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed again"));
+    await act(async () => {
+      staleList.resolve([createWorkspaceMetadata({ id: "ws-1", title: "original" })]);
+      await staleList.promise;
+    });
+    expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed again");
+  });
+
+  test("metadata updates keep applying while the post-snapshot projects refresh is pending", async () => {
+    const projectsList =
+      Promise.withResolvers<Awaited<ReturnType<APIClient["projects"]["list"]>>>();
+    createMockAPI({
+      metadataSnapshot: () =>
+        Promise.resolve([createWorkspaceMetadata({ id: "ws-1", title: "original" })]),
+      workspace: {
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              await Promise.resolve();
+              yield {
+                workspaceId: "ws-1",
+                metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed" }),
+              };
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+      projects: { list: () => projectsList.promise },
+    });
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed"));
+    expect(ctx().loading).toBe(true);
+    await act(async () => {
+      projectsList.resolve([]);
+      await projectsList.promise;
+    });
+    await waitFor(() => expect(ctx().loading).toBe(false));
+  });
+
+  test("refreshWorkspaceMetadata keeps rows a later update changed or deleted", async () => {
+    const releaseUpdates = Promise.withResolvers<void>();
+    const refreshList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    createMockAPI({
+      metadataSnapshot: () =>
+        Promise.resolve([
+          createWorkspaceMetadata({ id: "ws-1", title: "original" }),
+          createWorkspaceMetadata({ id: "ws-2" }),
+        ]),
+      workspace: {
+        list: () => refreshList.promise,
+        onMetadata: () =>
+          Promise.resolve(
+            (async function* () {
+              await releaseUpdates.promise;
+              yield {
+                workspaceId: "ws-1",
+                metadata: createWorkspaceMetadata({ id: "ws-1", title: "renamed" }),
+              };
+              yield { workspaceId: "ws-2", metadata: null };
+            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+          ),
+      },
+    });
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().workspaceMetadata.size).toBe(2));
+    let refresh: Promise<void> | undefined;
+    act(() => {
+      refresh = ctx().refreshWorkspaceMetadata();
+    });
+    releaseUpdates.resolve();
+    await waitFor(() => expect(ctx().workspaceMetadata.has("ws-2")).toBe(false));
+    await act(async () => {
+      refreshList.resolve([
+        createWorkspaceMetadata({ id: "ws-1", title: "original" }),
+        createWorkspaceMetadata({ id: "ws-2" }),
+        createWorkspaceMetadata({ id: "ws-3" }),
+      ]);
+      await refresh;
+    });
+    expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("renamed");
+    expect(ctx().workspaceMetadata.has("ws-2")).toBe(false);
+    expect(ctx().workspaceMetadata.has("ws-3")).toBe(true);
+  });
+
+  test("refreshWorkspaceMetadata drops a list that a later snapshot superseded", async () => {
+    const snapshot = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    const refreshList = Promise.withResolvers<FrontendWorkspaceMetadata[]>();
+    createMockAPI({
+      metadataSnapshot: () => snapshot.promise,
+      workspace: { list: () => refreshList.promise },
+    });
+
+    const ctx = await setup();
+    let refresh: Promise<void> | undefined;
+    act(() => {
+      refresh = ctx().refreshWorkspaceMetadata();
+    });
+    snapshot.resolve([createWorkspaceMetadata({ id: "ws-1", title: "current" })]);
+    await waitFor(() => expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("current"));
+    await act(async () => {
+      refreshList.resolve([createWorkspaceMetadata({ id: "ws-1", title: "stale" })]);
+      await refresh;
+    });
+    expect(ctx().workspaceMetadata.get("ws-1")?.title).toBe("current");
   });
 
   test("refreshWorkspaceMetadata reloads workspace data", async () => {
@@ -686,9 +841,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve(initialWorkspaces),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-remove",
     });
 
@@ -700,6 +853,45 @@ describe("WorkspaceContext", () => {
     await ctx().removeWorkspace("ws-remove");
 
     await waitFor(() => expect(ctx().selectedWorkspace).toBeNull());
+    expect(ctx().pendingNewWorkspaceProject).toBe("/remove");
+  });
+
+  // #5190: removing the selected sub-agent returns to its parent, not the project page.
+  test.each([
+    { name: "returns to the parent when the removed sub-agent was selected", selected: "ws-child" },
+    { name: "keeps the selection when another workspace is selected", selected: "ws-other" },
+  ])("removeSubagent $name", async ({ selected }) => {
+    createMockAPI({
+      workspace: {
+        list: () =>
+          Promise.resolve([
+            createProjectWorkspaceMetadata("ws-parent", "/alpha"),
+            createProjectWorkspaceMetadata("ws-child", "/alpha", {
+              namedWorkspacePath: "/alpha-agent",
+              parentWorkspaceId: "ws-parent",
+            }),
+            createProjectWorkspaceMetadata("ws-other", "/alpha", {
+              namedWorkspacePath: "/alpha-other",
+            }),
+          ]),
+      },
+      launchBehavior: "last-workspace",
+      locationPath: `/workspace/${selected}`,
+    });
+    currentClientMock.tasks = {
+      remove: () => Promise.resolve({ success: true as const, data: {} }),
+    };
+
+    const ctx = await setup();
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(selected));
+
+    const result = await ctx().removeSubagent("ws-child", { summary: null, paths: [] });
+
+    expect(result.success).toBe(true);
+    await waitFor(() => expect(ctx().workspaceMetadata.has("ws-child")).toBe(false));
+    const expected = selected === "ws-child" ? "ws-parent" : selected;
+    await waitFor(() => expect(ctx().selectedWorkspace?.workspaceId).toBe(expected));
+    expect(ctx().pendingNewWorkspaceProject).toBeNull();
   });
 
   test("removeWorkspace returns selected scratch workspace to scratch creation", async () => {
@@ -717,9 +909,7 @@ describe("WorkspaceContext", () => {
             }),
           ]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: `/workspace/${workspaceId}`,
     });
 
@@ -745,6 +935,189 @@ describe("WorkspaceContext", () => {
     const result = await ctx().removeWorkspace("ws-1");
     expect(result.success).toBe(false);
     expect(result.error).toBe("Failed");
+  });
+
+  test("removeWorkspace forwards descendant consent and preserves blockers", async () => {
+    const { workspace: workspaceApi } = createMockAPI();
+    const ctx = await setup();
+    const failure = {
+      success: false,
+      error: "A descendant is active",
+      descendants: [{ workspaceId: "child", title: "Reviewer", active: true }],
+    };
+    workspaceApi.remove.mockResolvedValue(failure);
+    const options = { force: true, acknowledgedDescendantIds: ["child"] };
+
+    const result = await ctx().removeWorkspace("parent", options);
+
+    expect(workspaceApi.remove).toHaveBeenCalledWith({ workspaceId: "parent", options });
+    expect(result).toEqual(failure);
+  });
+
+  // useAPI() keeps the last client while reconnecting (kept-gap). The handlers must still see
+  // "offline": they return their result and do not call the lost connection.
+  describe.each([...GAP_MODES])("handlers while the connection is down (%s)", (mode) => {
+    test("return their offline result without calling the server", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      const contexts = await setupWithConnection(mode);
+      await contexts.harness.drop();
+
+      const notConnected = { success: false as const, error: "API not connected" };
+      await act(async () => {
+        expect(await contexts.workspace().archiveWorkspace("ws-1")).toEqual(notConnected);
+        expect(await contexts.workspace().unarchiveWorkspace("ws-1")).toEqual(notConnected);
+        expect(await contexts.workspace().updateWorkspaceTitle("ws-1", "next")).toEqual(
+          notConnected
+        );
+        expect(await contexts.workspace().setWorkspacePinned("ws-1", true)).toEqual(notConnected);
+        expect(await contexts.workspace().removeWorkspace("ws-1")).toEqual(notConnected);
+        expect(await contexts.workspace().getWorkspaceInfo("ws-1")).toBeNull();
+        expect(
+          await contexts.project().assignWorkspaceToSubProject("/alpha", "ws-1", null)
+        ).toEqual(notConnected);
+        expect(await contexts.project().updateDisplayName("/alpha", "A")).toEqual(notConnected);
+        expect(await contexts.project().getSecrets("/alpha")).toEqual([]);
+        const created: unknown = await contexts
+          .workspace()
+          .createWorkspace("/alpha", "branch", "main")
+          .catch((error: unknown) => error);
+        expect(created).toEqual(new Error("API not connected"));
+      });
+      expect(workspaceApi.archive).not.toHaveBeenCalled();
+      expect(workspaceApi.unarchive).not.toHaveBeenCalled();
+      expect(workspaceApi.updateTitle).not.toHaveBeenCalled();
+      expect(workspaceApi.setPinned).not.toHaveBeenCalled();
+      expect(workspaceApi.remove).not.toHaveBeenCalled();
+      expect(workspaceApi.getInfo).not.toHaveBeenCalled();
+      expect(workspaceApi.create).not.toHaveBeenCalled();
+    });
+  });
+
+  // A reconnect reloads projects and metadata through the new client. Until the reload answers,
+  // both contexts keep what they show and do not report "loading" again (stale-while-revalidate).
+  describe.each([...GAP_MODES])("reload after a reconnect (%s)", (mode) => {
+    test("keeps the loaded projects and metadata until the reload answers", async () => {
+      createMockAPI({
+        workspace: { list: () => Promise.resolve([createWorkspaceMetadata({ id: "ws-old" })]) },
+        projects: { list: () => Promise.resolve([["/old", { workspaces: [] }]]) },
+      });
+      const contexts = await setupWithConnection(mode);
+      await waitFor(() => expect(contexts.project().userProjects.has("/old")).toBe(true));
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(true);
+
+      // The next server answers only when the test lets it.
+      let answerProjects: (() => void) | null = null;
+      let answerSnapshot: (() => void) | null = null;
+      const projectsAnswered = new Promise<void>((resolve) => (answerProjects = resolve));
+      const snapshotAnswered = new Promise<void>((resolve) => (answerSnapshot = resolve));
+      currentClientMock = {
+        ...currentClientMock,
+        projects: {
+          ...currentClientMock.projects,
+          list: () => projectsAnswered.then(() => [["/new", { workspaces: [] }]]),
+        },
+        workspace: {
+          ...currentClientMock.workspace,
+          onMetadata: () =>
+            Promise.resolve(
+              (async function* () {
+                await snapshotAnswered;
+                yield {
+                  type: "snapshot" as const,
+                  workspaces: [createWorkspaceMetadata({ id: "ws-new" })],
+                };
+                await new Promise(() => undefined);
+              })()
+            ),
+        },
+      };
+
+      await contexts.harness.drop();
+      contexts.harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      expect(contexts.project().loading).toBe(false);
+      expect(contexts.project().loaded).toBe(true);
+      expect(contexts.project().userProjects.has("/old")).toBe(true);
+      expect(contexts.workspace().loading).toBe(false);
+      expect(contexts.workspace().loaded).toBe(true);
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(true);
+
+      act(() => {
+        answerSnapshot?.();
+        answerProjects?.();
+      });
+      await waitFor(() => expect(contexts.workspace().workspaceMetadata.has("ws-new")).toBe(true));
+      await waitFor(() => expect(contexts.project().userProjects.has("/new")).toBe(true));
+      expect(contexts.workspace().workspaceMetadata.has("ws-old")).toBe(false);
+      expect(contexts.project().userProjects.has("/old")).toBe(false);
+    });
+  });
+
+  // Only a loaded snapshot makes later reloads non-blocking. Without one the app must keep its
+  // loader for the new client, not leave it with an empty metadata map.
+  describe.each([...GAP_MODES])("reconnect before a first snapshot (%s)", (mode) => {
+    test("shows loading again for the new client", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      workspaceApi.onMetadata.mockImplementation(() =>
+        Promise.resolve(
+          // eslint-disable-next-line require-yield
+          (async function* () {
+            await Promise.resolve();
+          })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+        )
+      );
+      const contexts = await setupWithConnection(mode);
+      await waitFor(() => expect(contexts.workspace().loading).toBe(false));
+      expect(contexts.workspace().loaded).toBe(false);
+
+      // The next server never sends its snapshot.
+      currentClientMock = {
+        ...currentClientMock,
+        workspace: {
+          ...currentClientMock.workspace,
+          onMetadata: () =>
+            Promise.resolve(
+              // eslint-disable-next-line require-yield
+              (async function* () {
+                await new Promise(() => undefined);
+              })()
+            ),
+        },
+      };
+      await contexts.harness.drop();
+      contexts.harness.reconnect();
+      await waitFor(() => expect(contexts.workspace().loading).toBe(true));
+      expect(contexts.workspace().loaded).toBe(false);
+    });
+
+    // A stream lost with the connection rejects with ConnectionLostError: no load failure, so
+    // the startup loader stays for the whole outage, not only once the new client arrives.
+    test("a drop before the first snapshot keeps loading during the outage", async () => {
+      const { workspace: workspaceApi } = createMockAPI();
+      workspaceApi.onMetadata.mockImplementation(() =>
+        Promise.resolve(
+          // eslint-disable-next-line require-yield
+          (async function* () {
+            await new Promise(() => undefined);
+          })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
+        )
+      );
+      const contexts = await setupWithConnection(mode, { awaitLoad: false });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+      expect(contexts.workspace().loading).toBe(true);
+
+      await contexts.harness.drop();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      });
+      expect(contexts.workspace().loading).toBe(true);
+      expect(contexts.workspace().loaded).toBe(false);
+    });
   });
 
   describe("archiveWorkspace", () => {
@@ -775,6 +1148,7 @@ describe("WorkspaceContext", () => {
       const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
       const persistedLayout: RightSidebarLayoutState = {
         version: 1,
+        openTabsOnly: true,
         nextId: 2,
         focusedTabsetId: "tabset-1",
         root: {
@@ -806,10 +1180,8 @@ describe("WorkspaceContext", () => {
         throw new Error("Expected cleaned right sidebar layout to be a tabset");
       }
 
-      // Default-layout tabs such as Instructions are restored by the
-      // right-sidebar layout migration, but the archived terminal tab and title
-      // must be stripped.
-      expect(cleanedLayout.root.tabs).toEqual(["costs", "review", "instructions"]);
+      // The archived terminal tab and title are stripped; the other open tabs stay.
+      expect(cleanedLayout.root.tabs).toEqual(["costs", "review"]);
       expect(cleanedLayout.root.activeTab).not.toBe("terminal:t1");
       expect(cleanedLayout.root.tabs).toContain(cleanedLayout.root.activeTab);
       expect(
@@ -823,6 +1195,7 @@ describe("WorkspaceContext", () => {
       const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
       const persistedLayout: RightSidebarLayoutState = {
         version: 1,
+        openTabsOnly: true,
         nextId: 2,
         focusedTabsetId: "tabset-1",
         root: {
@@ -869,6 +1242,101 @@ describe("WorkspaceContext", () => {
         t1: "still-open",
       });
     });
+
+    test("marks the workspace as archiving only while preflight or archive is in flight", async () => {
+      const workspaceId = "ws-archive-pending";
+      let settleArchive: (() => void) | undefined;
+      let failPreflight: ((error: Error) => void) | undefined;
+      createMockAPI({
+        workspace: {
+          archive: () =>
+            new Promise((resolve) => {
+              settleArchive = () =>
+                resolve({ success: true as const, data: { kind: "archived" as const } });
+            }),
+          preflightArchive: () =>
+            new Promise((_resolve, reject) => {
+              failPreflight = reject;
+            }),
+        },
+      });
+
+      const ctx = await setup();
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+
+      let archivePromise: Promise<unknown> | undefined;
+      await act(async () => {
+        archivePromise = ctx().archiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        settleArchive?.();
+        await archivePromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+
+      // A failed request must clear the indicator too, or the row would read "Archiving..."
+      // forever after a dropped connection.
+      let preflightPromise: Promise<unknown> | undefined;
+      await act(async () => {
+        preflightPromise = ctx().preflightArchiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        failPreflight?.(new Error("WebSocket closed"));
+        await preflightPromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+    });
+
+    test("keeps the workspace marked until the last overlapping request settles", async () => {
+      const workspaceId = "ws-archive-overlap";
+      let settleArchive: (() => void) | undefined;
+      let settlePreflight: (() => void) | undefined;
+      createMockAPI({
+        workspace: {
+          archive: () =>
+            new Promise((resolve) => {
+              settleArchive = () =>
+                resolve({ success: true as const, data: { kind: "archived" as const } });
+            }),
+          preflightArchive: () =>
+            new Promise((resolve) => {
+              settlePreflight = () =>
+                resolve({ success: true as const, data: { kind: "ready" as const } });
+            }),
+        },
+      });
+
+      const ctx = await setup();
+
+      // Header-started archive in flight, then the sidebar shortcut fires a preflight.
+      let archivePromise: Promise<unknown> | undefined;
+      let preflightPromise: Promise<unknown> | undefined;
+      await act(async () => {
+        archivePromise = ctx().archiveWorkspace(workspaceId);
+        preflightPromise = ctx().preflightArchiveWorkspace(workspaceId);
+        await Promise.resolve();
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      // The first request to finish must not clear the indicator while the other is running.
+      await act(async () => {
+        settlePreflight?.();
+        await preflightPromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(true);
+
+      await act(async () => {
+        settleArchive?.();
+        await archivePromise;
+      });
+      expect(ctx().archivingWorkspaceIds.has(workspaceId)).toBe(false);
+    });
   });
 
   test("treats legacy archive success without data as archived", async () => {
@@ -877,6 +1345,7 @@ describe("WorkspaceContext", () => {
     const terminalTitlesKey = getTerminalTitlesKey(workspaceId);
     const persistedLayout: RightSidebarLayoutState = {
       version: 1,
+      openTabsOnly: true,
       nextId: 2,
       focusedTabsetId: "tabset-1",
       root: {
@@ -998,9 +1467,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-existing",
     });
 
@@ -1014,6 +1481,29 @@ describe("WorkspaceContext", () => {
 
     expect(ctx().selectedWorkspace).toBeNull();
     expect(ctx().pendingNewWorkspaceProject).toBe("/new/project");
+  });
+
+  // The project creation header lists Scratch as a switch target and routes
+  // it through the same call as a real project path.
+  test("beginWorkspaceCreation routes the scratch key to the scratch creation page", async () => {
+    createMockAPI({
+      workspace: {
+        list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-existing", "/existing")]),
+      },
+      launchBehavior: "last-workspace",
+      locationPath: "/workspace/ws-existing",
+    });
+
+    const ctx = await setup();
+
+    await waitFor(() => expect(ctx().selectedWorkspace).toBeTruthy());
+
+    act(() => {
+      ctx().beginWorkspaceCreation(SCRATCH_PROJECT_CONFIG_KEY);
+    });
+
+    expect(ctx().selectedWorkspace).toBeNull();
+    await waitFor(() => expect(ctx().pendingNewWorkspaceProject).toBe(SCRATCH_PROJECT_CONFIG_KEY));
   });
 
   test("reacts to metadata update events (new workspace)", async () => {
@@ -1043,8 +1533,39 @@ describe("WorkspaceContext", () => {
     });
 
     await waitFor(() =>
-      expect(localStorage.getItem(SELECTED_WORKSPACE_KEY)).toContain("ws-persist")
+      expect(localStorage.getItem(SELECTED_WORKSPACE_KEY)).toBe(
+        JSON.stringify({ workspaceId: "ws-persist" })
+      )
     );
+  });
+
+  // A selection that embedded long paths was over budget and lived only in memory.
+  test("restores a last workspace with very long paths after a restart", async () => {
+    const projectPath = `/${"p".repeat(1100)}`;
+    const workspace = createProjectWorkspaceMetadata("ws-long", projectPath, {
+      namedWorkspacePath: `/${"w".repeat(1100)}`,
+    });
+    createMockAPI({
+      workspace: { list: () => Promise.resolve([workspace]) },
+      projects: { list: () => Promise.resolve([[projectPath, { workspaces: [] }]]) },
+      launchBehavior: "last-workspace",
+    });
+    const first = await setup();
+    await waitFor(() => expect(first().loading).toBe(false));
+    act(() => {
+      first().setSelectedWorkspace({
+        workspaceId: workspace.id,
+        projectPath,
+        projectName: workspace.projectName,
+        namedWorkspacePath: workspace.namedWorkspacePath,
+      });
+    });
+    cleanup();
+
+    window.location.href = "http://localhost/";
+    restartLocalStorage();
+    const restarted = await setup();
+    await waitFor(() => expect(restarted().selectedWorkspace?.workspaceId).toBe("ws-long"));
   });
 
   test("root startup opens the recent project page instead of restoring selectedWorkspace localStorage", async () => {
@@ -1081,9 +1602,7 @@ describe("WorkspaceContext", () => {
       workspace: {
         list: () => Promise.resolve([createProjectWorkspaceMetadata("ws-open-chat", "/existing")]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       locationPath: "/workspace/ws-open-chat",
       navigationType: "reload",
     });
@@ -1112,9 +1631,7 @@ describe("WorkspaceContext", () => {
             }),
           ]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       locationPath: `/workspace/${workspaceId}`,
       navigationType: "navigate",
     });
@@ -1134,9 +1651,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       locationPath: "/workspace/ws-missing",
       navigationType: "navigate",
     });
@@ -1166,8 +1681,8 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([["/existing", { workspaces: [] }]]),
       },
+      launchBehavior: "dashboard",
       localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
         [SELECTED_WORKSPACE_KEY]: JSON.stringify(persistedSelection),
       },
       locationPath: "/workspace/ws-maybe-alive",
@@ -1228,9 +1743,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
     });
 
     const ctx = await setup();
@@ -1253,9 +1766,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
       desktopMode: true,
     });
 
@@ -1312,9 +1823,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("dashboard"),
-      },
+      launchBehavior: "dashboard",
     });
 
     const ctx = await setup();
@@ -1338,9 +1847,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
     });
 
     const ctx = await setup();
@@ -1364,9 +1871,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -1391,9 +1896,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -1418,9 +1921,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -1461,9 +1962,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -1497,9 +1996,7 @@ describe("WorkspaceContext", () => {
       server: {
         getLaunchProject: () => Promise.resolve(null),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("new-chat"),
-      },
+      launchBehavior: "new-chat",
       desktopMode: true,
     });
 
@@ -1524,9 +2021,7 @@ describe("WorkspaceContext", () => {
       projects: {
         list: () => Promise.resolve([]),
       },
-      localStorage: {
-        [LAUNCH_BEHAVIOR_KEY]: JSON.stringify("last-workspace"),
-      },
+      launchBehavior: "last-workspace",
       locationPath: "/workspace/ws-existing",
       server: {
         getLaunchProject: () => Promise.resolve("/launch-project"),
@@ -1654,6 +2149,44 @@ describe("WorkspaceContext", () => {
     });
   });
 
+  test.each([
+    { name: "project", linkedPath: "/alpha", subProjectPath: null },
+    { name: "sub-project", linkedPath: "/alpha/sub", subProjectPath: "/alpha/sub" },
+  ])(
+    "a new_chat deep link lists its draft even when localStorage is full ($name)",
+    async ({ linkedPath, subProjectPath }) => {
+      const projectPath = "/alpha";
+      createMockAPI({
+        projects: {
+          list: () =>
+            Promise.resolve([
+              [projectPath, { workspaces: [] }],
+              ["/alpha/sub", { workspaces: [], parentProjectPath: projectPath }],
+            ]),
+        },
+        pendingDeepLinks: [{ type: "new_chat", projectPath: linkedPath, prompt: "from the link" }],
+        // An explicit route, so only the deep link navigates.
+        locationPath: "/settings",
+      });
+      // A full origin: the draft list no longer depends on localStorage (#5225).
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        value: new QuotaLimitedStorage(0),
+      });
+      try {
+        const ctx = await setup();
+
+        await waitFor(() => expect(ctx().workspaceDraftsByProject[projectPath]).toHaveLength(1));
+        const [draft] = ctx().workspaceDraftsByProject[projectPath];
+        expect(draft.subProjectPath).toBe(subProjectPath);
+        expect(ctx().pendingNewWorkspaceDraftId).toBe(draft.draftId);
+        expect(getCreationDraftStore().getView(draft.draftId).draft?.text).toBe("from the link");
+      } finally {
+        getCreationDraftStore().forgetProject(projectPath);
+      }
+    }
+  );
+
   describe("reorderPinnedWorkspaces", () => {
     // Three pinned chats in one project; pinnedAt ascending = a, b, c.
     const T1 = "2026-01-01T00:00:00.000Z";
@@ -1745,7 +2278,86 @@ describe("WorkspaceContext", () => {
       expect(pinnedAtById(ctx)).toEqual(afterSecond);
     });
   });
+
+  describe("startup orphaned storage GC", () => {
+    const ACTIVE_ID = "a0a0a0a0a0";
+    const ORPHAN_ID = "deadbeef00";
+
+    test("removes keys of workspaces the backend does not know after a successful load", async () => {
+      resetWorkspaceStorageGcForTests();
+      createMockAPI({
+        workspace: {
+          list: () => Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
+          listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
+        },
+        // Drafts live on the backend now; any registered workspace-scoped key shows the GC.
+        localStorage: {
+          [getAutoExpandPrefsKey(ACTIVE_ID)]: JSON.stringify("live model"),
+          [getAutoExpandPrefsKey(ORPHAN_ID)]: JSON.stringify("orphan model"),
+        },
+      });
+
+      await setup();
+
+      await waitFor(() =>
+        expect(localStorage.getItem(getAutoExpandPrefsKey(ORPHAN_ID))).toBeNull()
+      );
+      expect(localStorage.getItem(getAutoExpandPrefsKey(ACTIVE_ID))).not.toBeNull();
+    });
+
+    test("never runs after a failed startup load, even when a later refresh succeeds", async () => {
+      resetWorkspaceStorageGcForTests();
+      let failLoad = true;
+      const { workspace: workspaceApi } = createMockAPI({
+        workspace: {
+          list: () =>
+            failLoad
+              ? Promise.reject(new Error("metadata unavailable"))
+              : Promise.resolve([createProjectWorkspaceMetadata(ACTIVE_ID, "/alpha")]),
+          listKnownIdsForStorageGc: () => Promise.resolve({ workspaceIds: [ACTIVE_ID] }),
+        },
+        localStorage: { [getAutoExpandPrefsKey(ORPHAN_ID)]: JSON.stringify("draft") },
+      });
+
+      const ctx = await setup();
+      await waitFor(() => expect(ctx().loading).toBe(false));
+      failLoad = false;
+      await act(() => ctx().refreshWorkspaceMetadata());
+      await waitFor(() => expect(ctx().workspaceMetadata.has(ACTIVE_ID)).toBe(true));
+
+      expect(workspaceApi.listKnownIdsForStorageGc).not.toHaveBeenCalled();
+      expect(localStorage.getItem(getAutoExpandPrefsKey(ORPHAN_ID))).not.toBeNull();
+    });
+  });
 });
+
+/** Like setupWithProjectContext(), over a connection the test drops (connection.testHarness). */
+async function setupWithConnection(mode: GapMode, options?: { awaitLoad?: boolean }) {
+  const harness = createConnectionHarness(mode, () => currentClientMock);
+  const workspaceRef = { current: null as WorkspaceContext | null };
+  const projectRef = { current: null as ReturnType<typeof useProjectContext> | null };
+  function ContextCapture() {
+    workspaceRef.current = useWorkspaceContext();
+    projectRef.current = useProjectContext();
+    return null;
+  }
+  render(
+    <harness.Wrapper>
+      <RouterProvider>
+        <ProjectProvider>
+          <WorkspaceProvider>
+            <ContextCapture />
+          </WorkspaceProvider>
+        </ProjectProvider>
+      </RouterProvider>
+    </harness.Wrapper>
+  );
+  getWorkspaceStoreRaw().setClient(harness.client);
+  if (options?.awaitLoad !== false) {
+    await waitFor(() => expect(workspaceRef.current?.loading).toBe(false));
+  }
+  return { harness, workspace: () => workspaceRef.current!, project: () => projectRef.current! };
+}
 
 async function setup() {
   const contexts = await setupWithProjectContext();
@@ -1763,7 +2375,7 @@ async function setupWithProjectContext() {
   }
 
   render(
-    <APIProvider client={currentClientMock as APIClient}>
+    <APIProvider client={createTestApiClient(currentClientMock)}>
       <RouterProvider>
         <ProjectProvider>
           <WorkspaceProvider>
@@ -1775,7 +2387,7 @@ async function setupWithProjectContext() {
   );
 
   // Inject client immediately to handle race conditions where effects run before store update.
-  getWorkspaceStoreRaw().setClient(currentClientMock as APIClient);
+  getWorkspaceStoreRaw().setClient(createTestApiClient(currentClientMock));
   await waitFor(() => expect(workspaceRef.current).toBeTruthy());
   await waitFor(() => expect(projectRef.current).toBeTruthy());
 
@@ -1783,10 +2395,13 @@ async function setupWithProjectContext() {
 }
 
 interface MockAPIOptions {
-  workspace?: RecursivePartial<APIClient["workspace"]>;
-  projects?: RecursivePartial<APIClient["projects"]>;
-  server?: RecursivePartial<APIClient["server"]>;
+  workspace?: TestApiOverrides<APIClient["workspace"]>;
+  /** The metadata stream's opening snapshot; defaults to workspace.list(input). */
+  metadataSnapshot?: () => Promise<FrontendWorkspaceMetadata[]>;
+  projects?: TestApiOverrides<APIClient["projects"]>;
+  server?: TestApiOverrides<APIClient["server"]>;
   localStorage?: Record<string, string>;
+  launchBehavior?: LaunchBehavior;
   locationHash?: string;
   locationPath?: string;
   desktopMode?: boolean;
@@ -1805,6 +2420,12 @@ function createMockAPI(options: MockAPIOptions = {}) {
     for (const [key, value] of Object.entries(options.localStorage)) {
       globalThis.localStorage.setItem(key, value);
     }
+  }
+
+  if (options.launchBehavior) {
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { navigation: { launchBehavior: options.launchBehavior } },
+    });
   }
 
   if (options.desktopMode) {
@@ -1854,6 +2475,10 @@ function createMockAPI(options: MockAPIOptions = {}) {
       options.workspace?.archive ??
         (() => Promise.resolve({ success: true as const, data: { kind: "archived" as const } }))
     ),
+    preflightArchive: mock(
+      options.workspace?.preflightArchive ??
+        (() => Promise.resolve({ success: true as const, data: { kind: "ready" as const } }))
+    ),
     unarchive: mock(
       options.workspace?.unarchive ??
         (() => Promise.resolve({ success: true as const, data: undefined }))
@@ -1875,18 +2500,32 @@ function createMockAPI(options: MockAPIOptions = {}) {
         (() => Promise.resolve({ success: true as const, data: undefined }))
     ),
     getInfo: mock(options.workspace?.getInfo ?? (() => Promise.resolve(null))),
-    // Async generators for subscriptions
+    // Never settles by default, so startup storage GC removes nothing unless a test opts in.
+    listKnownIdsForStorageGc: mock(
+      options.workspace?.listKnownIdsForStorageGc ??
+        (() => new Promise<{ workspaceIds: string[] }>(() => undefined))
+    ),
+    // Async generators for subscriptions. Like the server, the metadata stream opens with a
+    // snapshot equal to workspace.list(input); overrides supply only the updates after it.
     onMetadata: mock(
-      options.workspace?.onMetadata ??
-        (async () => {
-          await Promise.resolve();
-          return (
-            // eslint-disable-next-line require-yield
+      async (
+        input?: Parameters<APIClient["workspace"]["onMetadata"]>[0],
+        clientOptions?: Parameters<APIClient["workspace"]["onMetadata"]>[1]
+      ) => {
+        const updates = options.workspace?.onMetadata
+          ? await options.workspace.onMetadata(input, clientOptions)
+          : // eslint-disable-next-line require-yield
             (async function* () {
               await Promise.resolve();
-            })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>
-          );
-        })
+            })();
+        return (async function* () {
+          yield {
+            type: "snapshot" as const,
+            workspaces: await (options.metadataSnapshot?.() ?? workspace.list(input)),
+          };
+          yield* updates;
+        })() as unknown as Awaited<ReturnType<APIClient["workspace"]["onMetadata"]>>;
+      }
     ),
     getSessionUsage: mock(options.workspace?.getSessionUsage ?? (() => Promise.resolve(undefined))),
     onChat: mock(

@@ -1,7 +1,9 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
+import { createElement, type ComponentProps, type ReactNode } from "react";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
-import * as APIModule from "@/browser/contexts/API";
+import { APIProvider } from "@/browser/contexts/API";
 import {
   buildAutoSelectedTemplateConfig,
   useCoderWorkspace,
@@ -9,8 +11,8 @@ import {
 } from "./useCoderWorkspace";
 import type { CoderInfo, CoderTemplate } from "@/common/orpc/schemas/coder";
 import type { CoderWorkspaceConfig } from "@/common/types/runtime";
-
-const actualAPIModule = { ...APIModule };
+import type { APIClient } from "@/browser/contexts/API";
+import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 
 const makeTemplate = (name: string, org = "default-org"): CoderTemplate => ({
   name,
@@ -25,29 +27,26 @@ const listTemplatesMock = mock(() => Promise.resolve({ ok: true as const, templa
 const listPresetsMock = mock(() => Promise.resolve({ ok: true as const, presets: [] }));
 const listWorkspacesMock = mock(() => Promise.resolve({ ok: true as const, workspaces: [] }));
 
-const coderApiMock = {
+const coderApiMock: TestApiOverrides<APIClient["coder"]> = {
   getInfo: getInfoMock,
   listTemplates: listTemplatesMock,
   listPresets: listPresetsMock,
   listWorkspaces: listWorkspacesMock,
 };
 
-const apiMock = {
+const apiMock = createTestApiClient({
   coder: coderApiMock,
-};
-
-void mock.module("@/browser/contexts/API", () => ({
-  ...actualAPIModule,
-  useAPI: () => ({
-    api: apiMock,
-    status: "connected" as const,
-    error: null,
-  }),
-}));
-
-afterAll(async () => {
-  await mock.module("@/browser/contexts/API", () => actualAPIModule);
 });
+
+// Inject the client through the real provider; mocking the API module leaks process-wide
+// into later suites. (This file is .ts, so build the wrapper without JSX.)
+function APIWrapper(props: { children: ReactNode }) {
+  return createElement(
+    APIProvider,
+    { client: apiMock } as ComponentProps<typeof APIProvider>,
+    props.children
+  );
+}
 
 function deferred<T>() {
   let resolve!: (v: T) => void;
@@ -73,12 +72,14 @@ function renderUseCoderWorkspace(options: {
   coderConfig?: CoderWorkspaceConfig | null;
   onCoderConfigChange?: (config: CoderWorkspaceConfig | null) => void;
 }) {
-  return renderHook(() =>
-    useCoderWorkspace({
-      coderConfig: options.coderConfig ?? null,
-      onCoderConfigChange: options.onCoderConfigChange ?? noopCoderConfigChange,
-      coderInfoRefreshPolicy: options.coderInfoRefreshPolicy,
-    })
+  return renderHook(
+    () =>
+      useCoderWorkspace({
+        coderConfig: options.coderConfig ?? null,
+        onCoderConfigChange: options.onCoderConfigChange ?? noopCoderConfigChange,
+        coderInfoRefreshPolicy: options.coderInfoRefreshPolicy,
+      }),
+    { wrapper: APIWrapper }
   );
 }
 
@@ -130,6 +131,7 @@ describe("buildAutoSelectedTemplateConfig", () => {
 
 describe("useCoderWorkspace coder auth refresh", () => {
   beforeEach(() => {
+    saveDomGlobals();
     globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
     globalThis.document = globalThis.window.document;
 
@@ -150,8 +152,7 @@ describe("useCoderWorkspace coder auth refresh", () => {
   afterEach(() => {
     cleanup();
     mock.restore();
-    globalThis.window = undefined as unknown as Window & typeof globalThis;
-    globalThis.document = undefined as unknown as Document;
+    restoreDomGlobals();
   });
 
   test("mount-only policy does not refetch on focus", async () => {

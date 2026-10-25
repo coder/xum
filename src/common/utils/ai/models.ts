@@ -81,8 +81,30 @@ export function getExplicitGatewayPrefix(modelString: string): ProviderName | un
 }
 
 /**
+ * Providers served by @ai-sdk/google's Gemini language model: the Gemini API,
+ * and Vertex AI through @ai-sdk/google-vertex. Both take the same Gemini payload.
+ */
+export function isGoogleFamilyProvider(provider: string): provider is "google" | "google-vertex" {
+  return provider === "google" || provider === "google-vertex";
+}
+
+// Providers whose SDK reads providerOptions from a namespace other than the
+// provider name. Saved provider extras must reach that namespace too, not just
+// the built-in reasoning options.
+const SDK_PROVIDER_OPTIONS_NAMESPACES: ReadonlyMap<string, string> = new Map([
+  // Meta reuses the OpenAI Responses adapter.
+  ["meta", "openai"],
+  // Vertex Gemini models read `googleVertex` first, then `vertex`, then `google`.
+  ["google-vertex", "googleVertex"],
+]);
+
+function sdkProviderOptionsNamespace(provider: string): string {
+  return SDK_PROVIDER_OPTIONS_NAMESPACES.get(provider) ?? provider;
+}
+
+/**
  * Resolve which providerOptions namespace a request will use for a given
- * canonical origin and route provider. Passthrough gateways (mux-gateway)
+ * canonical origin and route provider. Passthrough gateways (coder)
  * keep the origin namespace; transforming gateways (openrouter,
  * github-copilot, bedrock) use their own.
  */
@@ -98,22 +120,21 @@ export function resolveProviderOptionsNamespaceKey(
       "passthrough" in routeDefinition &&
       routeDefinition.passthrough === true)
   ) {
-    return canonicalProviderName;
+    return sdkProviderOptionsNamespace(canonicalProviderName);
   }
 
-  return routeProvider;
+  return sdkProviderOptionsNamespace(routeProvider);
 }
 
 /**
  * Equality key for UI selection tracking (explicit-change origin recording,
  * same-model warning suppression).
  *
- * Collapses passthrough gateway aliases to canonical identity — a persisted
- * rewrite like mux-gateway:openai/x must still match an explicit openai:x
- * switch — but keeps raw coder:<instance>/<model> identities distinct: the
- * instance's TYPE (not its name) decides the upstream, so name-only
- * canonicalization would equate a cross-typed gateway selection with an
- * unrelated direct model and drop the switch/warning.
+ * Collapses passthrough gateway aliases to canonical identity, but keeps raw
+ * coder:<instance>/<model> identities distinct: the instance's TYPE (not its
+ * name) decides the upstream, so name-only canonicalization would equate a
+ * cross-typed gateway selection with an unrelated direct model and drop the
+ * switch/warning.
  */
 export function modelSelectionEqualityKey(modelString: string): string {
   const trimmed = modelString.trim();
@@ -179,13 +200,18 @@ const OPTIONAL_VERSION_SUFFIX = String.raw`(?:-(?:\d{8}|\d{4}-\d{2}-\d{2}))?`;
 const ANTHROPIC_NATIVE_1M_PATTERNS = [
   // Mythos-class models (Fable 5 / Mythos 5) ship 1M context as standard metadata.
   new RegExp(`^claude-fable-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-fable-5-1${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-mythos-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-mythos-5-1${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-opus-5-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-4-8${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-4-7${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-opus-4-6${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-sonnet-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-sonnet-5-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
   new RegExp(`^claude-sonnet-4-6${OPTIONAL_VERSION_SUFFIX}$`, "i"),
+  new RegExp(`^claude-haiku-5-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
 ];
 const ANTHROPIC_BETA_1M_PATTERNS = [
   new RegExp(`^claude-sonnet-4-5${OPTIONAL_VERSION_SUFFIX}$`, "i"),
@@ -260,7 +286,7 @@ export function getAnthropic1MContextMode(
 }
 
 /**
- * Check if a model supports Anthropic's optional 1M beta mode used by Shux's context toggle.
+ * Check if a model supports Anthropic's optional 1M beta mode used by Xum's context toggle.
  *
  * Native long-context models like Claude Opus 4.6, Claude Sonnet 4.6, and GPT-5.5 expose
  * their larger window directly through model metadata and should not appear behind this toggle.
@@ -270,11 +296,4 @@ export function supports1MContext(
   providersConfig?: Record<string, unknown> | null
 ): boolean {
   return getAnthropic1MContextMode(modelString, providersConfig) === "beta";
-}
-
-export function hasNative1MContext(
-  modelString: string,
-  providersConfig?: Record<string, unknown> | null
-): boolean {
-  return getAnthropic1MContextMode(modelString, providersConfig) === "native";
 }

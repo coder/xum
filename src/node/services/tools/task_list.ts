@@ -14,7 +14,8 @@ import { TaskListToolResultSchema, TOOL_DEFINITIONS } from "@/common/utils/tools
 import { isWorkspaceArchived } from "@/common/utils/archive";
 
 import { isNestedWorkflowRun } from "@/common/types/workflow";
-import type { AgentTaskStatus } from "@/node/services/taskService";
+import type { TaskService, TaskTreeAgentsResult } from "@/node/services/taskService";
+import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
 import { Config } from "@/node/config";
 import { log } from "@/node/services/log";
@@ -25,7 +26,12 @@ import {
 
 import { buildWorkflowProgressSummary } from "./workflowProgress";
 import { toBashTaskId } from "./taskId";
-import { parseToolResult, requireTaskService, requireWorkspaceId } from "./toolUtils";
+import {
+  parseToolResult,
+  requireTaskService,
+  requireWorkspaceId,
+  requireWorkspaceTurnManager,
+} from "./toolUtils";
 
 // "pending" and "backgrounded" are workflow-run statuses; agent/bash tasks never carry them.
 const DEFAULT_STATUSES = [
@@ -72,6 +78,25 @@ function taskListStatusFromExecution(status: WorkspaceTurnTaskStatus): TaskListS
 // indefinitely or turning every task boundary into a blanket cleanup.
 const INACTIVE_CHILD_RETENTION_NOTE = `Inactive persistent children remain available under stable task IDs. Rows with bestOf metadata are temporary grouped candidates rather than standalone bench members; after their results and artifacts are consumed and no same-candidate follow-up is expected, remove them with task_remove. Keep each parent's direct standalone bench role-based: aim for at most ${SUBAGENT_REUSABLE_BENCH_TARGET} and keep it below ${SUBAGENT_REUSABLE_BENCH_EXCLUSIVE_LIMIT}. Prefer reawakening relevant context and use task_retitle when responsibility changes; prune substantially overlapping, obsolete, or least-useful inactive roles with task_remove when the bench exceeds those bounds. Do not sweep a small bench merely because a turn, task, or PR ended. A reawakened child keeps its checkout, so for repository-dependent work verify the retained snapshot or tell it to synchronize. Interrupted children were stopped before a terminal report; reawaken and ask them to finalize if their work should count as completed.`;
 
+const TREE_SCOPE_NOTE =
+  'Rows (including the root "workspace" row) are addressable via task_send_message, except your own "self" row, best-of candidate rows (`bestOf` metadata, refused to preserve candidate independence), and non-descendant rows in terminal states like reported/interrupted (peers cannot reactivate a task — only its parent can); ' +
+  "the relationship field is computed relative to this workspace. main_chat/side_chat rows are direct side-chat ↔ own-main links, and tagged rows are root chats sharing your user-set messaging @tag; all are explicit-messaging addresses only, not task ancestry or lifecycle control.";
+
+const TREE_SCOPE_RESTRICTED_NOTE =
+  "This workspace cannot send or receive peer messages (best-of candidates stay independent; workflow-owned tasks communicate through the workflow journal), so only self/descendant rows are listed; descendants remain addressable via task_send_message guidance.";
+
+const INSTANCE_SCOPE_NOTE =
+  'Rows are local/worktree root workspaces in this Xum instance and an availability snapshot. Unrelated roots must have consented (newly created roots are opted in by default, task(kind:"workspace") targets once their first turn ends; others enable it in their workspace settings); absent or revoked consent hides them, including from searches and counts. Non-local or unresolved runtimes, archived, user-stopped, stopping, and delegated-turn roots are omitted, and a listed target can still refuse if its state changes (including consent, runtime, or a delegated turn starting on it). ' +
+  'Message them with task_send_message — "unrelated" rows receive your text as an untrusted agent message, delivered at their next tool boundary while they are busy (or after the turn, if they chose that), under their own agent/model settings; discovery grants no additional control. Your own "self" row is not addressable.';
+
+// The tree note promises self/descendant rows, which would be false here: a restricted caller
+// gets no instance rows at all.
+const INSTANCE_SCOPE_RESTRICTED_NOTE =
+  "Instance discovery is unavailable from this workspace. Unrelated discovery and messaging require local/worktree runtimes and exclude side chats, best-of candidates and workflow-owned tasks. A side chat can discover its own main chat with scope tree for explicit messaging only. Existing same-tree messaging rules are unchanged; no instance rows are listed.";
+
+const INSTANCE_SCOPE_TRUNCATED_NOTE =
+  " More rows match; pass `nextOffset` as `offset` to continue. Paging is best-effort while workspaces are created, removed, or archived, so restart from offset 0 or deduplicate by ID when completeness matters.";
+
 const MAX_ARCHIVE_ANCESTOR_DEPTH = 32;
 
 interface WorkspaceArchiveLookup {
@@ -93,7 +118,7 @@ function inferMuxRootFromWorkspaceSessionDir(workspaceSessionDir: string): strin
 }
 
 function resolveMuxRootDir(config: ToolConfiguration): string | undefined {
-  const scopedMuxHome = config.muxScope?.muxHome;
+  const scopedMuxHome = config.xumScope?.xumHome;
   if (scopedMuxHome && scopedMuxHome.length > 0) {
     return scopedMuxHome;
   }
@@ -206,6 +231,195 @@ function shouldHideArchivedWorkspaceTurn(
   );
 }
 
+/** Direct links are plain messaging addresses, not owned tasks or execution handles. */
+function relatedChatRows(
+  tree: TaskTreeAgentsResult,
+  includeWorkspaces: boolean
+): TaskListToolSuccessResult["tasks"] {
+  if (!includeWorkspaces || tree.callerPeerMessagingRestricted === true) return [];
+  return (tree.relatedChats ?? []).map((chat) => ({
+    taskId: chat.workspaceId,
+    status: "workspace" as const,
+    ...(chat.title != null ? { title: chat.title } : {}),
+    relationship: chat.relationship,
+    // Depth 0 is the plain workspace-row convention, not task ancestry.
+    depth: 0,
+  }));
+}
+
+/**
+ * scope:"tree" — peer-discovery view: every agent workspace in the caller's task tree plus the
+ * root workspace row and direct main/side-chat messaging links. Workflow runs, workspace turns,
+ * and bash processes stay descendants-only.
+ */
+async function executeTreeScope(
+  taskService: TaskService,
+  workspaceId: string,
+  requestedStatuses: readonly TaskListStatus[] | null
+): Promise<unknown> {
+  const tree = taskService.listTaskTreeAgents(workspaceId);
+  const explicit = requestedStatuses != null && requestedStatuses.length > 0;
+  const statusFilter = new Set<TaskListStatus>(
+    explicit ? requestedStatuses : [...DEFAULT_STATUSES, "workspace"]
+  );
+
+  const tasks: TaskListToolSuccessResult["tasks"] = [];
+  // The root is a plain workspace with no task lifecycle: included by default, filtered like any
+  // other row (status "workspace") when explicit statuses were passed. An ARCHIVED root is
+  // omitted entirely — sendAgentPeerMessage refuses archived targets, so advertising the row
+  // would break the note's addressability claim. A MISSING root (parent chain ending at a
+  // removed/corrupted workspace) is omitted for the same reason: sends to it return not_found.
+  // A RESTRICTED caller (best-of candidate / workflow-owned) cannot message the root at all.
+  if (
+    statusFilter.has("workspace") &&
+    tree.rootArchived !== true &&
+    tree.rootMissing !== true &&
+    tree.callerPeerMessagingRestricted !== true
+  ) {
+    tasks.push({
+      taskId: tree.rootWorkspaceId,
+      status: "workspace",
+      ...(tree.rootTitle != null ? { title: tree.rootTitle } : {}),
+      relationship: tree.rootRelationship,
+      depth: 0,
+    });
+  }
+
+  tasks.push(...relatedChatRows(tree, statusFilter.has("workspace")));
+
+  const resolveAgentExecution =
+    taskService.getDescendantAgentTaskExecutionSnapshot?.bind(taskService);
+  for (const task of tree.tasks) {
+    let status: TaskListStatus = task.status;
+    let executionStatus = task.executionStatus;
+    // The live execution overlay is ancestor-scoped; non-descendant rows fall back to the
+    // persisted execution status, which is close enough for peer discovery.
+    if (
+      task.executionTaskId != null &&
+      task.relationship === "descendant" &&
+      resolveAgentExecution != null
+    ) {
+      const resolvedExecution = await resolveAgentExecution(workspaceId, task.taskId);
+      executionStatus = resolvedExecution?.record?.status ?? executionStatus;
+    }
+    // Peer admission accepts only a RUNNING execution mirror: overlaying a queued/starting
+    // reawakening onto a sibling/ancestor row would advertise a target task_send_message always
+    // refuses. Those rows keep their stable terminal status, which the note already marks
+    // unaddressable. Descendant/self rows keep the full overlay (guidance may target any state).
+    const hideUnadmittedReawakening =
+      (task.relationship === "sibling" || task.relationship === "ancestor") &&
+      (executionStatus === "queued" || executionStatus === "starting");
+    if (executionStatus != null && !hideUnadmittedReawakening) {
+      status = taskListStatusFromExecution(executionStatus);
+    }
+    // Initially queued/starting peers (waiting for launch capacity — no execution overlay, the
+    // STABLE status is nonterminal) are also unaddressable: sendAgentPeerMessage refuses those
+    // statuses outright because only the parent may edit a queued launch prompt. Hide the row
+    // so the note's "nonterminal ⇒ addressable" claim stays true; descendant/self rows keep
+    // every state (guidance may target them).
+    if (
+      (task.relationship === "sibling" || task.relationship === "ancestor") &&
+      (status === "queued" || status === "starting")
+    ) {
+      continue;
+    }
+    if (!statusFilter.has(status)) {
+      continue;
+    }
+    const {
+      executionTaskId: _executionTaskId,
+      executionStatus: _executionStatus,
+      ...publicTask
+    } = task;
+    tasks.push({ ...publicTask, status });
+  }
+
+  return parseToolResult(
+    TaskListToolResultSchema,
+    {
+      tasks,
+      note:
+        tree.callerPeerMessagingRestricted === true ? TREE_SCOPE_RESTRICTED_NOTE : TREE_SCOPE_NOTE,
+    },
+    "task_list"
+  );
+}
+
+/**
+ * scope:"instance" — the on-demand address book: root workspaces across every project in this
+ * instance, paged. Eligibility, query filtering, ordering, and paging live in the service; the
+ * tool only applies the status filter (before paging, so an excluded "workspace" status cannot
+ * advertise a cursor for rows that will never be shown) and maps rows onto the tool schema.
+ */
+function executeInstanceScope(
+  taskService: TaskService,
+  workspaceId: string,
+  args: {
+    statuses?: readonly TaskListStatus[] | null;
+    query?: string | null;
+    limit?: number | null;
+    offset?: number | null;
+  }
+): unknown {
+  // Instance rows are plain workspaces (status "workspace", same rule as the tree root row).
+  const explicitStatuses = args.statuses ?? [];
+  if (explicitStatuses.length > 0 && !explicitStatuses.includes("workspace")) {
+    return parseToolResult(
+      TaskListToolResultSchema,
+      { tasks: [], note: INSTANCE_SCOPE_NOTE },
+      "task_list"
+    );
+  }
+
+  const options = {
+    query: args.query ?? undefined,
+    limit: args.limit ?? undefined,
+    offset: args.offset ?? undefined,
+  };
+  const page = taskService.listInstanceWorkspaces(workspaceId, options);
+  if (page.callerPeerMessagingRestricted === true) {
+    assert(
+      page.rows.length === 0 && page.nextOffset == null,
+      "task_list: a restricted caller must receive no instance rows"
+    );
+  }
+  if (options.limit != null) {
+    assert(page.rows.length <= options.limit, "task_list: instance page exceeds the limit");
+  }
+  const nextOffset = page.nextOffset;
+  if (nextOffset != null) {
+    assert(
+      nextOffset > (options.offset ?? 0),
+      "task_list: instance nextOffset must advance past the requested offset"
+    );
+  }
+
+  const tasks: TaskListToolSuccessResult["tasks"] = page.rows.map((row) => ({
+    taskId: row.workspaceId,
+    status: "workspace" as const,
+    ...(row.name != null ? { workspaceName: row.name } : {}),
+    ...(row.title != null ? { title: row.title } : {}),
+    ...(row.createdAt != null ? { createdAt: row.createdAt } : {}),
+    projectPath: row.projectPath,
+    activity: row.busy ? ("busy" as const) : ("idle" as const),
+    relationship: row.relationship,
+    depth: 0,
+  }));
+
+  const note =
+    page.callerPeerMessagingRestricted === true
+      ? INSTANCE_SCOPE_RESTRICTED_NOTE
+      : nextOffset != null
+        ? `${INSTANCE_SCOPE_NOTE}${INSTANCE_SCOPE_TRUNCATED_NOTE}`
+        : INSTANCE_SCOPE_NOTE;
+
+  return parseToolResult(
+    TaskListToolResultSchema,
+    { tasks, note, ...(nextOffset != null ? { nextOffset } : {}) },
+    "task_list"
+  );
+}
+
 export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
   return tool({
     description: TOOL_DEFINITIONS.task_list.description,
@@ -213,6 +427,28 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
     execute: async (args): Promise<unknown> => {
       const workspaceId = requireWorkspaceId(config, "task_list");
       const taskService = requireTaskService(config, "task_list");
+      const workspaceTurnManager = requireWorkspaceTurnManager(config, "task_list");
+
+      const scope = args.scope ?? "descendants";
+      if (scope !== "instance") {
+        // Paging inputs are instance-only. Silently ignoring them would let a model believe a
+        // tree/descendants listing was filtered or paged when it was not; null counts as absent
+        // (strict-mode providers send null for omitted optional fields).
+        for (const field of ["query", "limit", "offset"] as const) {
+          if (args[field] != null) {
+            throw new Error(
+              `task_list: \`${field}\` is only valid with scope:"instance" (got scope:"${scope}")`
+            );
+          }
+        }
+      }
+
+      if (scope === "instance") {
+        return executeInstanceScope(taskService, workspaceId, args);
+      }
+      if (scope === "tree") {
+        return executeTreeScope(taskService, workspaceId, args.statuses ?? null);
+      }
 
       const statuses =
         args.statuses && args.statuses.length > 0 ? args.statuses : [...DEFAULT_STATUSES];
@@ -264,7 +500,10 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
           const execution =
             resolvedExecution?.record ??
             (resolveAgentExecution == null
-              ? await taskService.getWorkspaceTurnSnapshot(workspaceId, task.executionTaskId)
+              ? await workspaceTurnManager.getWorkspaceTurnSnapshot(
+                  workspaceId,
+                  task.executionTaskId
+                )
               : null);
           executionStatus = execution?.status ?? executionStatus;
         }
@@ -312,11 +551,11 @@ export const createTaskListTool: ToolFactory = (config: ToolConfiguration) => {
         }
       }
 
-      if (workspaceTurnStatuses.length > 0 && taskService.listWorkspaceTurnTasks != null) {
+      if (workspaceTurnStatuses.length > 0 && workspaceTurnManager.listWorkspaceTurnTasks != null) {
         const storeStatuses = workspaceTurnStatuses.map((status) =>
           status === "failed" ? "error" : status
         );
-        const workspaceTurns = await taskService.listWorkspaceTurnTasks(workspaceId, {
+        const workspaceTurns = await workspaceTurnManager.listWorkspaceTurnTasks(workspaceId, {
           statuses: storeStatuses,
         });
         for (const turn of workspaceTurns) {

@@ -10,7 +10,7 @@
 
 import path from "path";
 import { getLocalProductHomeTildeSuffix } from "@/common/compat/legacyMux";
-import { getShuxHome } from "@/common/constants/paths";
+import { getXumHome } from "@/common/constants/paths";
 import { PlatformPaths } from "@/node/utils/paths.main";
 
 /**
@@ -30,13 +30,13 @@ import { PlatformPaths } from "@/node/utils/paths.main";
  * expandTilde("/abs/path")   // => "/abs/path"
  */
 export function expandTilde(filePath: string): string {
-  // Canonical and legacy local homes expand through getShuxHome so SHUX_ROOT/MUX_ROOT
+  // Canonical and legacy local homes expand through getXumHome so XUM_ROOT/MUX_ROOT
   // and development suffixes preserve test/sandbox isolation.
   const productHomeSuffix = getLocalProductHomeTildeSuffix(filePath);
   if (productHomeSuffix !== undefined) {
-    const shuxHome = getShuxHome();
+    const xumHome = getXumHome();
     const normalizedSuffix = productHomeSuffix.replace(/[/\\]+/g, path.sep);
-    return normalizedSuffix ? path.join(shuxHome, normalizedSuffix) : shuxHome;
+    return normalizedSuffix ? path.join(xumHome, normalizedSuffix) : xumHome;
   }
 
   return PlatformPaths.expandHome(filePath);

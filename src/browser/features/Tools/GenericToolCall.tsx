@@ -17,21 +17,167 @@ import { useToolExpansion, getStatusDisplay, type ToolStatus } from "./Shared/to
 import { JsonHighlight } from "./Shared/HighlightedCode";
 import { redactToolResultAttachmentsForDisplay } from "./Shared/toolResultDisplay";
 import { ToolResultImages, extractImagesFromToolResult } from "./Shared/ToolResultImages";
+import { MCPServerIdentityBadge } from "@/browser/components/MCPServerIdentity/MCPServerIdentityBadge";
+import { useMcpIcon } from "@/browser/hooks/useMcpIcon";
+import type { MCPToolCallDisplay } from "@/common/types/mcp";
+import { mcpToolDisplayName } from "@/common/utils/mcp/mcpToolDisplayName";
+import { AppWindow, Braces } from "lucide-react";
+import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import {
+  markMcpAppViewHosted,
+  mcpAppViewRefFor,
+  openMcpAppViewTab,
+  useMcpAppViewFullscreenOnly,
+  type McpAppViewRef,
+} from "@/browser/features/RightSidebar/ArtifactsTab/mcpAppViewsStore";
+import { McpAppFrame } from "@/browser/features/RightSidebar/ArtifactsTab/McpAppFrame";
+import { useMcpAppViewInTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
+import { AppViewInTabNotice } from "@/browser/features/RightSidebar/AppViewTab/AppViewTab";
 
 interface GenericToolCallProps {
   toolName: string;
   args?: unknown;
   result?: unknown;
   status?: ToolStatus;
+  /**
+   * Host-authored MCP identity frozen on the tool part for this call. Rows
+   * without a snapshot (non-MCP tools, older history) render exactly as before.
+   */
+  mcpServer?: MCPToolCallDisplay;
+  workspaceId?: string;
+  toolCallId?: string;
 }
+
+/**
+ * MCP Apps (mcp-apps experiment): whether this host can show the view of a call. Hosts
+ * without an Artifacts surface (VS Code) cannot.
+ */
+function useMcpAppViewsSupported(): boolean {
+  const enabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
+  const canOpen = useChatHostContext().uiSupport.artifactsPanel === "supported";
+  return enabled && canOpen;
+}
+
+/**
+ * Tools that declare a ui:// view get an action that opens it in its own right-sidebar tab (or
+ * focuses that tab). Own component so plain rows keep their exact previous render tree.
+ */
+const OpenMcpAppViewButton: React.FC<{ workspaceId: string; view: McpAppViewRef }> = (props) => {
+  if (!useMcpAppViewsSupported()) return null;
+  // Narrow cards (phones, a narrow chat) show the icon only, so the action never pushes the
+  // header past the card's right edge.
+  return (
+    <TooltipIfPresent tooltip="Open in tab">
+      <button
+        type="button"
+        aria-label="Open in tab"
+        onClick={(e) => {
+          // The header toggles expansion; this action must not.
+          e.stopPropagation();
+          openMcpAppViewTab(props.workspaceId, props.view);
+        }}
+        className="text-muted hover:text-foreground focus-visible:ring-accent ml-auto inline-flex shrink-0 items-center gap-1 rounded text-[11px] focus-visible:ring-1"
+      >
+        <AppWindow className="h-3 w-3" />
+        <span className="hidden @[32rem]:inline">Open in tab</span>
+      </button>
+    </TooltipIfPresent>
+  );
+};
+
+/**
+ * Whether the card shows the "Open in tab" placeholder instead of a frame: while the view's tab
+ * has it, or always once the view turned out to be fullscreen only.
+ */
+function useMcpAppViewHostedElsewhere(workspaceId: string, toolCallId: string): boolean {
+  const inTab = useMcpAppViewInTab(workspaceId, toolCallId, ["tab"]);
+  const fullscreenOnly = useMcpAppViewFullscreenOnly(workspaceId, toolCallId);
+  return inTab || fullscreenOnly;
+}
+
+/**
+ * Expanded body of a call with an app view: the view itself (the spec's inline display mode),
+ * with the raw input/output behind a toggle. The raw JSON renders below the view instead of
+ * replacing it, so toggling never reloads the view or loses its state. Falls back to the raw
+ * JSON where views are not supported.
+ */
+const McpAppToolDetails: React.FC<{
+  workspaceId: string;
+  view: McpAppViewRef;
+  raw: React.ReactNode;
+}> = (props) => {
+  // A failed call's error is in the raw output: show it without a click.
+  const [showRaw, setShowRaw] = React.useState(props.view.failed);
+  const elsewhere = useMcpAppViewHostedElsewhere(props.workspaceId, props.view.toolCallId);
+  const supported = useMcpAppViewsSupported();
+  const { workspaceId, view } = props;
+  // An expanded card is where the view goes back to on inline (ui/request-display-mode).
+  React.useEffect(() => {
+    if (!supported) return;
+    return markMcpAppViewHosted(workspaceId, view.toolCallId, "card");
+  }, [supported, workspaceId, view.toolCallId]);
+  if (!supported) return <ToolDetails>{props.raw}</ToolDetails>;
+  return (
+    <ToolDetails>
+      {elsewhere ? (
+        // One live instance per view: while its tab has it, the card shows this
+        // instead of a second frame. Closing the tab brings the view back here, unless the
+        // view declared fullscreen only: it is never hosted inline, so the card keeps this.
+        <AppViewInTabNotice workspaceId={props.workspaceId} view={props.view} />
+      ) : (
+        <McpAppFrame workspaceId={props.workspaceId} view={props.view} variant="inline" />
+      )}
+      <button
+        type="button"
+        aria-expanded={showRaw}
+        onClick={() => setShowRaw(!showRaw)}
+        className="text-muted hover:text-foreground focus-visible:ring-accent mt-1.5 inline-flex items-center gap-1 rounded text-[11px] focus-visible:ring-1"
+      >
+        <Braces className="h-3 w-3" />
+        {showRaw ? "Hide input/output" : "Show input/output"}
+      </button>
+      {showRaw && props.raw}
+    </ToolDetails>
+  );
+};
+
+/**
+ * Own component so only branded rows subscribe to the API context and the
+ * icon lookup; plain rows keep their exact previous render tree.
+ */
+const McpServerBadge: React.FC<{ mcpServer: MCPToolCallDisplay }> = (props) => (
+  <MCPServerIdentityBadge
+    compact
+    connection={props.mcpServer.connection}
+    identity={props.mcpServer.identity}
+    icon={useMcpIcon(props.mcpServer.iconRef)}
+  />
+);
 
 export const GenericToolCall: React.FC<GenericToolCallProps> = ({
   toolName,
   args,
   result,
   status = "pending",
+  mcpServer,
+  workspaceId,
+  toolCallId,
 }) => {
-  const { expanded, toggleExpanded } = useToolExpansion();
+  const sticky = useToolExpansion();
+  // This card's own toggle. A call with an app view expands only on it: the sticky per-tool
+  // preference would otherwise open every earlier call of the tool after a reload, and each
+  // expanded card mounts its view (an iframe plus a resource read). A toggle made before the
+  // call settled (the view arrives with the result) carries over.
+  const [localExpanded, setLocalExpanded] = React.useState<boolean | null>(null);
+  const isAppCall = mcpServer?.app != null && workspaceId != null && toolCallId != null;
+  const expanded = isAppCall ? (localExpanded ?? false) : sticky.expanded;
+  const toggleExpanded = () => {
+    setLocalExpanded(!expanded);
+    if (!isAppCall) sticky.toggleExpanded();
+  };
 
   const hasDetails = args !== undefined || result !== undefined;
   const images = extractImagesFromToolResult(result);
@@ -40,55 +186,75 @@ export const GenericToolCall: React.FC<GenericToolCallProps> = ({
   // Auto-expand if there are images to show
   const shouldShowDetails = expanded || hasImages;
 
+  // MCP Apps: the call's view, once it settled (null for plain rows).
+  const appView =
+    toolCallId != null ? mcpAppViewRefFor({ toolCallId, toolName, args, status, mcpServer }) : null;
+
+  const rawDetails = (
+    <>
+      {args !== undefined && (
+        <DetailSection>
+          <DetailLabel>Arguments</DetailLabel>
+          <DetailContent>
+            <JsonHighlight value={args} />
+          </DetailContent>
+        </DetailSection>
+      )}
+
+      {result !== undefined && (
+        <DetailSection>
+          <DetailLabel>Result</DetailLabel>
+          <DetailContent>
+            <JsonHighlight value={redactToolResultAttachmentsForDisplay(result)} />
+          </DetailContent>
+        </DetailSection>
+      )}
+
+      {status === "executing" && result === undefined && (
+        <DetailSection>
+          <DetailContent>
+            Waiting for result
+            <LoadingDots />
+          </DetailContent>
+        </DetailSection>
+      )}
+      {status === "redacted" && (
+        <DetailSection>
+          <DetailContent className="text-muted italic">
+            Output excluded from shared transcript
+          </DetailContent>
+        </DetailSection>
+      )}
+    </>
+  );
+
   return (
     <ToolContainer expanded={shouldShowDetails}>
       <ToolHeader onClick={() => hasDetails && toggleExpanded()}>
         {hasDetails && <ExpandIcon expanded={shouldShowDetails}>▶</ExpandIcon>}
+        {mcpServer && <McpServerBadge mcpServer={mcpServer} />}
         {TOOL_NAME_TO_ICON[toolName] && <ToolIcon toolName={toolName} />}
-        <ToolName>{toolName}</ToolName>
+        {/* Display only: a plugin's stable installation ID stays in the model-facing
+            name (dispatch, history, sticky expansion) but not in the readable label. */}
+        <ToolName className={appView ? "min-w-0 truncate" : undefined}>
+          {mcpServer ? mcpToolDisplayName(toolName, mcpServer.connection) : toolName}
+        </ToolName>
         <StatusIndicator status={status}>{getStatusDisplay(status)}</StatusIndicator>
+        {appView && workspaceId && (
+          <OpenMcpAppViewButton workspaceId={workspaceId} view={appView} />
+        )}
       </ToolHeader>
 
       {/* Always show images if present */}
       {hasImages && <ToolResultImages result={result} />}
 
-      {expanded && hasDetails && (
-        <ToolDetails>
-          {args !== undefined && (
-            <DetailSection>
-              <DetailLabel>Arguments</DetailLabel>
-              <DetailContent>
-                <JsonHighlight value={args} />
-              </DetailContent>
-            </DetailSection>
-          )}
-
-          {result !== undefined && (
-            <DetailSection>
-              <DetailLabel>Result</DetailLabel>
-              <DetailContent>
-                <JsonHighlight value={redactToolResultAttachmentsForDisplay(result)} />
-              </DetailContent>
-            </DetailSection>
-          )}
-
-          {status === "executing" && result === undefined && (
-            <DetailSection>
-              <DetailContent>
-                Waiting for result
-                <LoadingDots />
-              </DetailContent>
-            </DetailSection>
-          )}
-          {status === "redacted" && (
-            <DetailSection>
-              <DetailContent className="text-muted italic">
-                Output excluded from shared transcript
-              </DetailContent>
-            </DetailSection>
-          )}
-        </ToolDetails>
-      )}
+      {expanded &&
+        hasDetails &&
+        (appView && workspaceId ? (
+          <McpAppToolDetails workspaceId={workspaceId} view={appView} raw={rawDetails} />
+        ) : (
+          <ToolDetails>{rawDetails}</ToolDetails>
+        ))}
     </ToolContainer>
   );
 };

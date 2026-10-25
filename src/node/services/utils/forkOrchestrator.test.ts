@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn, vi } from "bun:test";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import type { Config } from "@/node/config";
 import * as gitModule from "@/node/git";
@@ -25,6 +25,7 @@ let listLocalBranchesMock!: ReturnType<typeof spyOn<typeof gitModule, "listLocal
 const PROJECT_PATH = "/projects/demo";
 const SOURCE_WORKSPACE_NAME = "feature/source";
 const NEW_WORKSPACE_NAME = "feature/new";
+const NEW_WORKSPACE_ID = "ws-new";
 const SOURCE_WORKSPACE_ID = "workspace-source";
 const SOURCE_RUNTIME_CONFIG: RuntimeConfig = { type: "local" };
 const DEFAULT_FORKED_RUNTIME_CONFIG: RuntimeConfig = {
@@ -79,6 +80,7 @@ async function runOrchestrateFork(options: RunOrchestrateForkOptions) {
     projectPath: PROJECT_PATH,
     sourceWorkspaceName: SOURCE_WORKSPACE_NAME,
     newWorkspaceName: NEW_WORKSPACE_NAME,
+    newWorkspaceId: NEW_WORKSPACE_ID,
     initLogger: createInitLogger(),
     config,
     sourceWorkspaceId: SOURCE_WORKSPACE_ID,
@@ -107,6 +109,11 @@ describe("orchestrateFork", () => {
     detectDefaultTrunkBranchMock = spyOn(gitModule, "detectDefaultTrunkBranch").mockResolvedValue(
       "main"
     );
+  });
+
+  afterEach(() => {
+    // Later suites must receive real runtimes, not this suite's factory stub.
+    vi.restoreAllMocks();
   });
 
   it("returns Ok with fork metadata when forkWorkspace succeeds", async () => {
@@ -153,6 +160,7 @@ describe("orchestrateFork", () => {
     expect(createRuntimeMock).toHaveBeenCalledWith(DEFAULT_FORKED_RUNTIME_CONFIG, {
       projectPath: PROJECT_PATH,
       workspaceName: NEW_WORKSPACE_NAME,
+      workspaceId: NEW_WORKSPACE_ID,
       workspacePath: "/workspaces/forked",
     });
   });
@@ -202,6 +210,7 @@ describe("orchestrateFork", () => {
     expect(createRuntimeMock).toHaveBeenCalledWith(DEFAULT_FORKED_RUNTIME_CONFIG, {
       projectPath: PROJECT_PATH,
       workspaceName: NEW_WORKSPACE_NAME,
+      workspaceId: NEW_WORKSPACE_ID,
       workspacePath: "/workspaces/created",
     });
   });
@@ -411,6 +420,7 @@ describe("orchestrateFork", () => {
     expect(createRuntimeMock).toHaveBeenCalledWith(customForkedRuntimeConfig, {
       projectPath: PROJECT_PATH,
       workspaceName: NEW_WORKSPACE_NAME,
+      workspaceId: NEW_WORKSPACE_ID,
       workspacePath: "/workspaces/created-with-custom-runtime",
     });
   });
@@ -461,6 +471,7 @@ describe("orchestrateFork", () => {
         projectPath: PROJECT_PATH,
         workspaceName: NEW_WORKSPACE_NAME,
         workspacePath: "/workspaces/new",
+        workspaceId: NEW_WORKSPACE_ID,
       }
     );
   });

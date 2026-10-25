@@ -1,6 +1,7 @@
 import type { RouterClient } from "@orpc/server";
 import type { AppRouter } from "@/node/orpc/router";
 import type { DeepLinkPayload } from "@/common/types/deepLink";
+import type { RemoteConnectionApi } from "@/common/types/remoteConnection";
 
 declare global {
   interface WindowApi {
@@ -16,6 +17,9 @@ declare global {
     enableTelemetryInDev?: boolean;
     // E2E test mode flag - used to adjust UI behavior (e.g., longer toast durations)
     isE2E?: boolean;
+    // Session tape replay mode (XUM_REPLAY_TAPES, perf harness): chat events are recorded, so
+    // the renderer suppresses their side effects.
+    isSessionTapeReplay?: boolean;
     // Enables in-app React render capture for dev profiling and automated perf tests.
     enableReactPerfProfile?: boolean;
     // Sandbox launchers default tutorials off unless explicitly re-enabled by env.
@@ -28,6 +32,8 @@ declare global {
     isWindowsWslShell?: boolean;
     // Async getter (Electron) for Windows environments where WSL may win PATH.
     getIsWindowsWslShell?: () => Promise<boolean>;
+    // Electron only: maps this page's perf flight recorder rendererId to its webContents.
+    announcePerfRendererId?: (rendererId: string) => void;
     // Register a callback for notification clicks (navigates to workspace)
     // Returns an unsubscribe function.
     onNotificationClicked?: (callback: (data: { workspaceId: string }) => void) => () => void;
@@ -35,6 +41,8 @@ declare global {
     consumePendingDeepLinks?: () => DeepLinkPayload[];
     // Subscribe to mux:// deep links as they arrive. Returns an unsubscribe function.
     onDeepLink?: (callback: (payload: DeepLinkPayload) => void) => () => void;
+    // Only the local desktop renderer can control remote windows.
+    remoteConnection?: RemoteConnectionApi;
     // Optional ORPC-backed API surfaces populated in tests/storybook mocks
     tokenizer?: unknown;
     providers?: unknown;

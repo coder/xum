@@ -80,7 +80,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - uses: ./.github/actions/build-vscode-extension
 
@@ -119,7 +119,9 @@ jobs:
             exit 0
           fi
 
-          bunx vsce publish -p "$VSCE_PAT"
+          # The vsce that bun.lock pins (make vscode-ext installed it); bunx would download one
+          # when it is missing.
+          ./node_modules/.bin/vsce publish -p "$VSCE_PAT"
 
   notify-slack-failure:
     name: Notify Slack on Failure

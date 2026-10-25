@@ -1,13 +1,22 @@
 /* eslint-disable @typescript-eslint/await-thenable, @typescript-eslint/require-await */
-import * as fs from "node:fs/promises";
-import * as path from "node:path";
 import assert from "node:assert/strict";
 import { describe, expect, mock, test } from "bun:test";
 import { Ok } from "@/common/types/result";
-import type { TaskApplyGitPatchConfiguration } from "@/node/services/tools/task_apply_git_patch";
-import { DisposableTempDir } from "@/node/services/tempDir";
+import type {
+  TaskApplyGitPatchArgs,
+  TaskGitPatchApplyConfig,
+  TaskGitPatchApplyOptions,
+} from "@/node/services/taskGitPatchEngine";
 import type { TaskCreateResult } from "@/node/services/taskService";
+import { createRuntime } from "@/node/runtime/runtimeFactory";
+
+const patchToolConfig: TaskGitPatchApplyConfig = {
+  cwd: "/repo",
+  runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
+  runtimeTempDir: "/tmp",
+};
 import {
+  createProductionWorkflowTaskAdapter,
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
 } from "./WorkflowTaskServiceAdapter";
@@ -83,35 +92,6 @@ describe("WorkflowTaskServiceAdapter", () => {
     await expect(adapter.runAgent({ id: "verify", prompt: "Verify claims" })).rejects.toThrow(
       refusalMessage
     );
-  });
-
-  test("inherits experiments for task creation", async () => {
-    let createArgs: unknown;
-    const create = mock(async (args: unknown) => {
-      createArgs = args;
-      return Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const });
-    });
-    const waitForAgentReport = mock(async () => ({ reportMarkdown: "child report" }));
-    const adapter = new WorkflowTaskServiceAdapter({
-      taskService: { create, waitForAgentReport },
-      parentWorkspaceId: "parent_1",
-      workflowRunId: "wfr_123",
-      defaultAgentId: "explore",
-      experiments: { dynamicWorkflows: true },
-    });
-
-    await adapter.runAgent({
-      id: "claims",
-      agentId: "exec",
-      prompt: "Extract claims",
-      outputSchema: { type: "object" },
-    });
-
-    expect(createArgs).toMatchObject({
-      agentId: "exec",
-      prompt: "Extract claims",
-      experiments: { dynamicWorkflows: true },
-    });
   });
 
   test("passes onRefusal and isolation through to task creation", async () => {
@@ -211,29 +191,6 @@ describe("WorkflowTaskServiceAdapter", () => {
     });
   });
 
-  test("passes workflow experiments to Explore workflow task creation", async () => {
-    let createArgs: unknown;
-    const create = mock(async (args: unknown) => {
-      createArgs = args;
-      return Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const });
-    });
-    const waitForAgentReport = mock(async () => ({ reportMarkdown: "child report" }));
-    const adapter = new WorkflowTaskServiceAdapter({
-      taskService: { create, waitForAgentReport },
-      parentWorkspaceId: "parent_1",
-      workflowRunId: "wfr_123",
-      defaultAgentId: "explore",
-      experiments: { dynamicWorkflows: true },
-    });
-
-    await adapter.runAgent({ id: "source", prompt: "Read source" });
-
-    expect(createArgs).toMatchObject({
-      agentId: "explore",
-      experiments: { dynamicWorkflows: true },
-    });
-  });
-
   test("bulk creates workflow child tasks with workflow metadata", async () => {
     const createMany = mock(
       async (
@@ -261,7 +218,6 @@ describe("WorkflowTaskServiceAdapter", () => {
       parentWorkspaceId: "parent_1",
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
-      experiments: { dynamicWorkflows: true },
     });
 
     const created: Array<[number, string]> = [];
@@ -293,7 +249,6 @@ describe("WorkflowTaskServiceAdapter", () => {
         prompt: "Do first",
         title: "First",
         workflowTask: { runId: "wfr_123", stepId: "first" },
-        experiments: { dynamicWorkflows: true },
       },
       {
         parentWorkspaceId: "parent_1",
@@ -302,7 +257,6 @@ describe("WorkflowTaskServiceAdapter", () => {
         prompt: "Do second",
         title: "second",
         workflowTask: { runId: "wfr_123", stepId: "second", outputSchema: { type: "object" } },
-        experiments: { dynamicWorkflows: true },
       },
     ]);
     const createManyOptions: unknown = createMany.mock.calls[0]?.[1];
@@ -343,6 +297,82 @@ describe("WorkflowTaskServiceAdapter", () => {
     expect(createMany.mock.calls[0]?.[0]).toMatchObject([
       { workflowTask: { runId: "wfr_123", stepId: "first", workflowName: "sidebar-demo" } },
     ]);
+  });
+
+  test("publishes a replacement only through createMany's retires claim, never create()", async () => {
+    const claim = { taskId: "retired_1", attemptId: "att_00000000000000c1", nonce: "n1" };
+    const create = mock(async (_args: unknown) =>
+      Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
+    );
+    const createMany = mock(async (args: unknown[], _options?: unknown) =>
+      Ok(args.map(() => ({ taskId: "task_r", kind: "agent" as const, status: "queued" as const })))
+    );
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "child report" }));
+    const adapterFor = (
+      taskService: ConstructorParameters<typeof WorkflowTaskServiceAdapter>[0]["taskService"]
+    ) =>
+      new WorkflowTaskServiceAdapter({
+        taskService,
+        parentWorkspaceId: "parent_1",
+        workflowRunId: "wfr_123",
+        defaultAgentId: "explore",
+      });
+
+    await adapterFor({ create, createMany, waitForAgentReport }).createAgentTasks(
+      [{ id: "step", prompt: "Redo" }],
+      { retires: [claim] }
+    );
+    expect(createMany.mock.calls[0]?.[1]).toMatchObject({ retires: [claim] });
+
+    // Without createMany there is no single-use commit: the fallback refuses before creating.
+    const fallback = adapterFor({ create, waitForAgentReport });
+    let caught: unknown;
+    try {
+      await fallback.createAgentTasks([{ id: "step", prompt: "Redo" }], { retires: [claim] });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  test("the production adapter refuses a task service that cannot retire attempts", () => {
+    const base = {
+      create: mock(async (_args: unknown) =>
+        Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
+      ),
+      createMany: mock(async (_args: unknown[]) => Ok([])),
+      waitForAgentReport: mock(async () => ({ reportMarkdown: "child report" })),
+    };
+    const options = {
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+    };
+    const claimRetiredAttempt = mock(async () => Ok({ nonce: "n1" }));
+    expect(() => createProductionWorkflowTaskAdapter({ ...options, taskService: base })).toThrow(
+      /claimRetiredAttempt/
+    );
+    const { createMany: _createMany, ...withoutCreateMany } = base;
+    expect(() =>
+      createProductionWorkflowTaskAdapter({
+        ...options,
+        taskService: { ...withoutCreateMany, claimRetiredAttempt },
+      })
+    ).toThrow(/createMany/);
+    expect(() =>
+      createProductionWorkflowTaskAdapter({
+        ...options,
+        taskService: { ...base, claimRetiredAttempt },
+      })
+    ).toThrow(/tombstoneUnpublishedReservation/);
+    const tombstoneUnpublishedReservation = mock(async () => Ok(undefined));
+    const adapter = createProductionWorkflowTaskAdapter({
+      ...options,
+      taskService: { ...base, claimRetiredAttempt, tombstoneUnpublishedReservation },
+    });
+    expect(adapter.claimRetiredAttempt).toBeDefined();
+    expect(adapter.tombstoneUnpublishedTask).toBeDefined();
   });
 
   test("forwards run-end lifecycle hooks to the task service", async () => {
@@ -404,14 +434,17 @@ describe("WorkflowTaskServiceAdapter", () => {
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
       getProjectTrusted: () => true,
-      applyPatchArtifact: async (args) => {
-        calls.push(args);
-        return {
-          success: true,
-          taskId: args.task_id,
-          dryRun: args.dry_run === true,
-          projectResults: [{ projectPath: "/repo", projectName: "repo", status: "applied" }],
-        };
+      patchToolConfig,
+      patchEngine: {
+        applyPatch: async (_config, args) => {
+          calls.push(args);
+          return {
+            success: true,
+            taskId: args.task_id,
+            dryRun: args.dry_run === true,
+            projectResults: [{ projectPath: "/repo", projectName: "repo", status: "applied" }],
+          };
+        },
       },
     });
 
@@ -443,80 +476,15 @@ describe("WorkflowTaskServiceAdapter", () => {
     expect(result).toMatchObject({ success: true, dryRun: false });
   });
 
-  test("rejects workflow patch artifacts outside allowed path prefixes", async () => {
-    using tmp = new DisposableTempDir("workflow-adapter-patch-paths");
-    const mboxPath = path.join(tmp.path, "subagent-patches", "task_impl", "repo", "series.mbox");
-    await fs.mkdir(path.dirname(mboxPath), { recursive: true });
-    await fs.writeFile(
-      mboxPath,
-      [
-        "diff --git a/.mux/security/runs/latest b/.mux/security/runs/latest",
-        "--- a/.mux/security/runs/latest",
-        "+++ b/.mux/security/runs/latest",
-        "@@ -1 +1 @@",
-        "-old",
-        "+new",
-        "diff --git a/src/app.ts b/src/app.ts",
-        "--- a/src/app.ts",
-        "+++ b/src/app.ts",
-        "@@ -1 +1 @@",
-        "-old",
-        "+new",
-      ].join("\n")
-    );
-    await fs.writeFile(
-      path.join(tmp.path, "subagent-patches.json"),
-      JSON.stringify({
-        version: 2,
-        artifactsByChildTaskId: {
-          task_impl: {
-            childTaskId: "task_impl",
-            parentWorkspaceId: "parent_1",
-            createdAtMs: 1,
-            status: "ready",
-            projectArtifacts: [
-              {
-                projectPath: "/other-repo",
-                projectName: "other-repo",
-                storageKey: "other-repo",
-                status: "skipped",
-              },
-              {
-                projectPath: "/repo",
-                projectName: "repo",
-                storageKey: "repo",
-                status: "ready",
-                mboxPath,
-                commitCount: 1,
-              },
-            ],
-            readyProjectCount: 1,
-            failedProjectCount: 0,
-            skippedProjectCount: 0,
-            totalCommitCount: 1,
-          },
-        },
-      })
-    );
+  test("passes allowed path prefixes after a successful dry-run", async () => {
     const create = mock(async () =>
       Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
     );
     const waitForAgentReport = mock(async () => ({ reportMarkdown: "unused" }));
-    const applyPatchCalls: unknown[] = [];
-    const applyPatchArtifact = mock(async (args: unknown) => {
-      applyPatchCalls.push(args);
-      return {
-        success: true as const,
-        taskId: "task_impl",
-        projectResults: [],
-      };
-    });
-    const patchToolConfig: TaskApplyGitPatchConfiguration = {
-      cwd: "/repo",
-      runtime: undefined as unknown as TaskApplyGitPatchConfiguration["runtime"],
-      runtimeTempDir: "/tmp",
-      workspaceSessionDir: tmp.path,
-    };
+    const calls: Array<{
+      args: TaskApplyGitPatchArgs;
+      options: TaskGitPatchApplyOptions | undefined;
+    }> = [];
     const adapter = new WorkflowTaskServiceAdapter({
       taskService: { create, waitForAgentReport },
       parentWorkspaceId: "parent_1",
@@ -524,7 +492,14 @@ describe("WorkflowTaskServiceAdapter", () => {
       defaultAgentId: "explore",
       getProjectTrusted: () => true,
       patchToolConfig,
-      applyPatchArtifact,
+      patchEngine: {
+        applyPatch: async (_config, args, options) => {
+          calls.push({ args, options });
+          return options?.allowedPathPrefixes == null
+            ? { success: true, taskId: args.task_id, dryRun: true, projectResults: [] }
+            : { success: false, taskId: args.task_id, error: "outside allowed prefixes" };
+        },
+      },
     });
 
     const result = await adapter.applyPatch({
@@ -536,12 +511,15 @@ describe("WorkflowTaskServiceAdapter", () => {
       allowedPathPrefixes: [".mux/security"],
     });
 
-    expect(result).toMatchObject({ success: false, taskId: "task_impl" });
-    expect(result.success ? "" : result.error).toContain("src/app.ts");
-    expect(applyPatchArtifact).toHaveBeenCalledTimes(1);
-    expect(applyPatchCalls).toEqual([
-      expect.objectContaining({ task_id: "task_impl", dry_run: true }),
-    ]);
+    expect(result).toEqual({
+      success: false,
+      taskId: "task_impl",
+      error: "outside allowed prefixes",
+    });
+    // Prefix policy rides the dry-run precheck, so a violation fails before the real apply.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.args.dry_run).toBe(true);
+    expect(calls[0]?.options?.allowedPathPrefixes).toEqual([".mux/security"]);
   });
 
   test("holds the stable child patch lock across workflow dry-run and real apply", async () => {
@@ -569,13 +547,16 @@ describe("WorkflowTaskServiceAdapter", () => {
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
       getProjectTrusted: () => true,
-      applyPatchArtifact: async (args) => {
-        events.push(args.dry_run === true ? "apply:dry-run" : "apply:real");
-        return {
-          success: true,
-          taskId: args.task_id,
-          projectResults: [],
-        };
+      patchToolConfig,
+      patchEngine: {
+        applyPatch: async (_config, args) => {
+          events.push(args.dry_run === true ? "apply:dry-run" : "apply:real");
+          return {
+            success: true,
+            taskId: args.task_id,
+            projectResults: [],
+          };
+        },
       },
     });
 
@@ -607,15 +588,18 @@ describe("WorkflowTaskServiceAdapter", () => {
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
       getProjectTrusted: () => true,
-      applyPatchArtifact: async (args) => {
-        calls.push(args);
-        return {
-          success: false,
-          taskId: args.task_id,
-          dryRun: true,
-          error: "Patch failed",
-          conflictPaths: ["src/auth.ts"],
-        };
+      patchToolConfig,
+      patchEngine: {
+        applyPatch: async (_config, args) => {
+          calls.push(args);
+          return {
+            success: false,
+            taskId: args.task_id,
+            dryRun: true,
+            error: "Patch failed",
+            conflictPaths: ["src/auth.ts"],
+          };
+        },
       },
     });
 
@@ -636,7 +620,7 @@ describe("WorkflowTaskServiceAdapter", () => {
       Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
     );
     const waitForAgentReport = mock(async () => ({ reportMarkdown: "unused" }));
-    const applyPatchArtifact = mock(async () => ({
+    const applyPatch = mock(async () => ({
       success: true as const,
       taskId: "task_impl",
       projectResults: [],
@@ -647,7 +631,8 @@ describe("WorkflowTaskServiceAdapter", () => {
       workflowRunId: "wfr_123",
       defaultAgentId: "explore",
       getProjectTrusted: () => false,
-      applyPatchArtifact,
+      patchToolConfig,
+      patchEngine: { applyPatch },
     });
 
     await expect(
@@ -659,7 +644,7 @@ describe("WorkflowTaskServiceAdapter", () => {
         force: false,
       })
     ).rejects.toThrow(/Project Trust/);
-    expect(applyPatchArtifact).not.toHaveBeenCalled();
+    expect(applyPatch).not.toHaveBeenCalled();
   });
 
   test("interrupts preserved descendant task workspaces for the parent workspace", async () => {
@@ -696,5 +681,155 @@ describe("WorkflowTaskServiceAdapter", () => {
       /no runnable agent/
     );
     expect(waitForAgentReport).not.toHaveBeenCalled();
+  });
+
+  test("forwards the reservation abort signal and maps cancellation to a non-restart error", async () => {
+    const create = mock(async () => ({ success: false as const, error: "unexpected create" }));
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "should not wait" }));
+    const abortController = new AbortController();
+    const createMany = mock(
+      async (
+        _args: unknown[],
+        options?: {
+          onTaskReserved?: (index: number, result: TaskCreateResult) => Promise<void> | void;
+          abortSignal?: AbortSignal;
+        }
+      ) => {
+        assert(options?.abortSignal != null, "createMany must receive the abort signal");
+        expect(options.abortSignal.aborted).toBe(false);
+        abortController.abort();
+        expect(options.abortSignal.aborted).toBe(true);
+        return { success: false as const, error: "Interrupted (stage: mutex)" };
+      }
+    );
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: { create, createMany, waitForAgentReport },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+    });
+
+    let caught: unknown;
+    try {
+      await adapter.createAgentTasks([{ id: "claims", prompt: "Extract claims" }], {
+        abortSignal: abortController.signal,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    assert(caught instanceof Error, "createAgentTasks must reject when creation is canceled");
+    expect(caught.message).toContain("Interrupted (stage: mutex)");
+    // The runner restarts started attempts on these exact sentinels; a canceled reservation
+    // must never be mistaken for one.
+    expect(caught.message).not.toBe("Task interrupted");
+    expect(caught.message).not.toBe("Task not found");
+    expect(create).not.toHaveBeenCalled();
+    expect(waitForAgentReport).not.toHaveBeenCalled();
+  });
+
+  test("refuses to create a legacy runAgent child once the wait signal is aborted", async () => {
+    const create = mock(async () =>
+      Ok({ taskId: "task_1", kind: "agent" as const, status: "running" as const })
+    );
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "should not wait" }));
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: { create, waitForAgentReport },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+    });
+    const abortController = new AbortController();
+    abortController.abort();
+
+    await expect(
+      adapter.runAgent({ id: "claims", prompt: "Extract claims" }, undefined, {
+        abortSignal: abortController.signal,
+      })
+    ).rejects.toThrow(/canceled/);
+    expect(create).not.toHaveBeenCalled();
+    expect(waitForAgentReport).not.toHaveBeenCalled();
+  });
+
+  test("exposes attempt outcome reads only when the task service can answer them", async () => {
+    const create = mock(async () => ({ success: false as const, error: "unused" }));
+    const waitForAgentReport = mock(async () => ({ reportMarkdown: "unused" }));
+    const legacyAdapter = new WorkflowTaskServiceAdapter({
+      taskService: { create, waitForAgentReport },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+    });
+    // Missing capability is unavailable authority, not a fabricated outcome.
+    expect(legacyAdapter.readSettledAgentResult).toBeUndefined();
+    expect(legacyAdapter.waitForAttemptSettlement).toBeUndefined();
+
+    const readAttemptOutcome = mock(
+      async (taskId: string, _options?: { requestingWorkspaceId?: string }) =>
+        taskId === "task_reported"
+          ? {
+              kind: "reported" as const,
+              report: {
+                reportMarkdown: "persisted report",
+                title: "Claims",
+                structuredOutput: { claims: ["durable"] },
+              },
+            }
+          : { kind: "indeterminate" as const, reason: "no settlement record" }
+    );
+    const waitForAttemptSettlement = mock(
+      async (
+        taskId: string,
+        _options: { abortSignal?: AbortSignal; timeoutMs: number; requestingWorkspaceId?: string }
+      ) =>
+        taskId === "task_reported"
+          ? { kind: "reported" as const, report: { reportMarkdown: "settled report" } }
+          : { kind: "timeout" as const }
+    );
+    const adapter = new WorkflowTaskServiceAdapter({
+      taskService: { create, waitForAgentReport, readAttemptOutcome, waitForAttemptSettlement },
+      parentWorkspaceId: "parent_1",
+      workflowRunId: "wfr_123",
+      defaultAgentId: "explore",
+    });
+    assert(adapter.readSettledAgentResult != null && adapter.waitForAttemptSettlement != null);
+
+    await expect(adapter.readSettledAgentResult("task_reported")).resolves.toEqual({
+      kind: "reported",
+      report: {
+        taskId: "task_reported",
+        reportMarkdown: "persisted report",
+        title: "Claims",
+        structuredOutput: { claims: ["durable"] },
+      },
+    });
+    await expect(adapter.readSettledAgentResult("task_unknown")).resolves.toEqual({
+      kind: "indeterminate",
+      reason: "no settlement record",
+    });
+    // Reports are looked up on behalf of the workflow parent so they stay readable after the
+    // child's config entry is cleaned up.
+    expect(readAttemptOutcome).toHaveBeenCalledWith("task_reported", {
+      requestingWorkspaceId: "parent_1",
+    });
+
+    const abortSignal = new AbortController().signal;
+    await expect(
+      adapter.waitForAttemptSettlement("task_reported", { abortSignal, timeoutMs: 1234 })
+    ).resolves.toEqual({
+      kind: "reported",
+      report: { taskId: "task_reported", reportMarkdown: "settled report" },
+    });
+    await expect(
+      adapter.waitForAttemptSettlement("task_pending", { timeoutMs: 1234 })
+    ).resolves.toEqual({ kind: "timeout" });
+    expect(waitForAttemptSettlement).toHaveBeenCalledWith("task_reported", {
+      abortSignal,
+      timeoutMs: 1234,
+      requestingWorkspaceId: "parent_1",
+    });
+    expect(waitForAttemptSettlement).toHaveBeenCalledWith("task_pending", {
+      timeoutMs: 1234,
+      requestingWorkspaceId: "parent_1",
+    });
   });
 });

@@ -1,9 +1,9 @@
 import * as vscode from "vscode";
 import assert from "node:assert";
 
-import { resolveShuxEnvironmentValue } from "shux/common/compat/legacyMux";
-import { getShuxHome } from "shux/common/constants/paths";
-import { ServerLockfile } from "shux/node/services/serverLockfile";
+import { resolveXumEnvironmentValue } from "xum/common/compat/legacyMux";
+import { getXumHome } from "xum/common/constants/paths";
+import { ServerLockfile } from "xum/node/services/serverLockfile";
 
 export type ConnectionMode = "auto" | "server-only" | "file-only";
 
@@ -50,7 +50,7 @@ export async function discoverServerConfig(
 
   let lockfileData: { baseUrl: string; token: string } | null = null;
   try {
-    const lockfile = new ServerLockfile(getShuxHome());
+    const lockfile = new ServerLockfile(getXumHome());
     const data = await lockfile.read();
     if (data) {
       lockfileData = { baseUrl: data.baseUrl, token: data.token };
@@ -60,7 +60,7 @@ export async function discoverServerConfig(
   }
 
   // Base URL precedence: settings -> env -> lockfile -> default.
-  const envBaseUrl = resolveShuxEnvironmentValue("SERVER_URL", process.env)?.trim();
+  const envBaseUrl = resolveXumEnvironmentValue("SERVER_URL", process.env)?.trim();
 
   let baseUrlSource: DiscoveredServerConfig["baseUrlSource"] = "default";
   let baseUrlRaw = "http://localhost:3000";
@@ -80,7 +80,7 @@ export async function discoverServerConfig(
 
   // Auth token precedence: secret storage -> env -> lockfile (only if same baseUrl).
   const secretToken = (await context.secrets.get(SERVER_AUTH_TOKEN_SECRET_KEY))?.trim();
-  const envToken = resolveShuxEnvironmentValue("SERVER_AUTH_TOKEN", process.env)?.trim();
+  const envToken = resolveXumEnvironmentValue("SERVER_AUTH_TOKEN", process.env)?.trim();
 
   let authTokenSource: DiscoveredServerConfig["authTokenSource"] = "none";
   let authToken: string | undefined;

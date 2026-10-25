@@ -4,6 +4,8 @@ import {
   formatDaysThreshold,
   AGE_THRESHOLDS_DAYS,
   buildSortedWorkspacesByProject,
+  buildSortedWorkspacesFlat,
+  findMostRecentlyCreatedWorkspace,
   orderMultiProjectSectionRows,
   computeWorkspaceDepthMap,
   computeAgentRowRenderMeta,
@@ -301,6 +303,33 @@ describe("buildSortedWorkspacesByProject", () => {
 
     expect(result.get("/project/a")).toHaveLength(1);
     expect(result.get("/project/a")?.[0].id).toBe("ws1");
+  });
+
+  it("never lists /side chats, whether or not config has their row yet", () => {
+    const sideChat = (id: string): FrontendWorkspaceMetadata => ({
+      ...createWorkspace(id, "/project/a"),
+      sideChatParentWorkspaceId: "ws1",
+    });
+    const projects = new Map<string, ProjectConfig>([
+      [
+        "/project/a",
+        {
+          workspaces: [
+            { path: "/a/ws1", id: "ws1" },
+            { path: "/a/ws1", id: "side-registered" },
+          ],
+        },
+      ],
+    ]);
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      ["ws1", createWorkspace("ws1", "/project/a")],
+      ["side-registered", sideChat("side-registered")],
+      ["side-pending", sideChat("side-pending")],
+    ]);
+
+    const result = buildSortedWorkspacesByProject(projects, metadata, {});
+
+    expect(result.get("/project/a")?.map((w) => w.id)).toEqual(["ws1"]);
   });
 
   it("should include pending workspaces not yet in config", () => {
@@ -628,6 +657,79 @@ describe("buildSortedWorkspacesByProject", () => {
   });
 });
 
+describe("buildSortedWorkspacesFlat", () => {
+  it("sorts all workspace kinds globally and keeps children under their parent", () => {
+    const parent = {
+      ...createWorkspace("parent", "/project/a"),
+      projects: [
+        { projectPath: "/project/a", projectName: "a" },
+        { projectPath: "/project/b", projectName: "b" },
+      ],
+    };
+    const metadata = new Map<string, FrontendWorkspaceMetadata>([
+      [
+        "pinned-late",
+        {
+          ...createWorkspace("pinned-late", "/project/a"),
+          pinnedAt: "2026-01-02T00:00:00.000Z",
+        },
+      ],
+      [
+        "pinned-early",
+        {
+          ...createWorkspace("pinned-early", "/project/b"),
+          pinnedAt: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+      ["parent", parent],
+      [
+        "child",
+        createWorkspace("child", { projectPath: "/project/a", parentWorkspaceId: "parent" }),
+      ],
+      ["scratch", { ...createWorkspace("scratch", "/scratch/path"), kind: "scratch" }],
+      ["recent", createWorkspace("recent", "/project/b")],
+    ]);
+
+    const result = buildSortedWorkspacesFlat([...metadata.values()], {
+      parent: 300,
+      child: 1,
+      scratch: 200,
+      recent: 100,
+    });
+
+    expect(result.map((workspace) => workspace.id)).toEqual([
+      "pinned-early",
+      "pinned-late",
+      "parent",
+      "child",
+      "scratch",
+      "recent",
+    ]);
+  });
+});
+
+describe("findMostRecentlyCreatedWorkspace", () => {
+  it("prefers the newest createdAt over higher recency", () => {
+    const active = { ...createWorkspace("active"), createdAt: "2026-01-01T00:00:00.000Z" };
+    const newest = { ...createWorkspace("newest"), createdAt: "2026-01-02T00:00:00.000Z" };
+
+    expect(findMostRecentlyCreatedWorkspace([newest, active], { active: 500, newest: 1 })?.id).toBe(
+      "newest"
+    );
+  });
+
+  it("breaks createdAt ties by recency", () => {
+    // Legacy rows share one default createdAt, so the tiebreak decides.
+    const createdAt = "2025-01-01T00:00:00.000Z";
+    const quiet = { ...createWorkspace("quiet"), createdAt };
+    const active = { ...createWorkspace("active"), createdAt };
+
+    expect(findMostRecentlyCreatedWorkspace([quiet, active], { quiet: 1, active: 2 })?.id).toBe(
+      "active"
+    );
+    expect(findMostRecentlyCreatedWorkspace([], {})).toBeUndefined();
+  });
+});
 describe("buildSortedWorkspacesByProject pinning", () => {
   const now = Date.now();
   const projectsWithIds = (ids: string[]): Map<string, ProjectConfig> =>
@@ -1311,6 +1413,49 @@ describe("sub-agent row render metadata", () => {
     expect(
       computeAgentRowRenderMeta(flattened, depthByWorkspaceId).has("unfinished-interrupted-child")
     ).toBe(false);
+  });
+
+  it("keeps reported children visible while a background Bash monitor is active", () => {
+    const flattened = [
+      createWorkspace("parent"),
+      createWorkspace("reported-child", {
+        parentWorkspaceId: "parent",
+        taskStatus: "reported",
+        taskExecutionStatus: "completed",
+      }),
+    ];
+    let monitorActive = true;
+    const options = {
+      isWorkspaceLiveActive: () => false,
+      hasActiveBashMonitor: (workspaceId: string) =>
+        workspaceId === "reported-child" && monitorActive,
+    };
+
+    expect(filterVisibleAgentRows(flattened, new Set(), options).map((row) => row.id)).toEqual([
+      "parent",
+      "reported-child",
+    ]);
+    expect(
+      computeDelegatedActivityByWorkspaceId(flattened, options).get("parent")?.activeCount
+    ).toBe(1);
+    expect(
+      computeSubAgentsSummaryByWorkspaceId(flattened, options).get("parent")?.runningSubAgentCount
+    ).toBe(1);
+    const metadata = computeAgentRowRenderMeta(
+      flattened,
+      computeWorkspaceDepthMap(flattened),
+      new Set(),
+      options
+    );
+    expect(metadata.get("reported-child")?.sharedTrunkActiveThroughRow).toBe(true);
+
+    monitorActive = false;
+    expect(filterVisibleAgentRows(flattened, new Set(), options).map((row) => row.id)).toEqual([
+      "parent",
+    ]);
+    expect(
+      computeDelegatedActivityByWorkspaceId(flattened, options).get("parent")?.activeCount ?? 0
+    ).toBe(0);
   });
 
   it("does not resurrect reported children from stale live workspace state", () => {

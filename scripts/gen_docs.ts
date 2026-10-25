@@ -367,9 +367,11 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   anthropic: "Anthropic",
   openai: "OpenAI",
   google: "Google",
+  "google-vertex": "Google Vertex AI",
   xai: "xAI",
   deepseek: "DeepSeek",
   moonshotai: "Moonshot AI",
+  zai: "Z.ai",
   openrouter: "OpenRouter",
   bedrock: "Bedrock",
 };
@@ -385,7 +387,9 @@ function generateProviderEnvVarsBlock(): string {
     const displayName = PROVIDER_DISPLAY_NAMES[provider] ?? provider;
     let envVars: string;
 
-    if (vars.apiKey?.length) {
+    if (vars.project?.length && vars.apiKey?.length) {
+      envVars = `\`${vars.project[0]}\` (ADC) or \`${vars.apiKey[0]}\` (express mode)`;
+    } else if (vars.apiKey?.length) {
       envVars = vars.apiKey.map((v) => `\`${v}\``).join(" or ");
     } else if (vars.region?.length) {
       envVars = `\`${vars.region[0]}\` (credentials via AWS SDK chain)`;
@@ -418,6 +422,12 @@ function generateProviderEnvVarsBlock(): string {
       lines.push(
         `| ${displayName.padEnd(12)} | \`${vars.organization[0]}\``.padEnd(42) +
           " | Organization ID     |"
+      );
+    }
+    if (vars.location?.length) {
+      lines.push(
+        `| ${displayName.padEnd(12)} | \`${vars.location[0]}\``.padEnd(42) +
+          " | GCP location        |"
       );
     }
   }
@@ -593,7 +603,7 @@ function collectToolHookEnvVarsFromZodSchema(schema: unknown): ToolHookEnvVarDoc
     if (type === "array" || type === "tuple") {
       // Arrays also get a _COUNT env var.
       add({
-        envVar: toolHookEnvVarName("SHUX_TOOL_INPUT", [...options.keyPath, "COUNT"], {
+        envVar: toolHookEnvVarName("XUM_TOOL_INPUT", [...options.keyPath, "COUNT"], {
           allowPlaceholders: true,
         }),
         jsonPath: options.jsonPath ? `${options.jsonPath}.length` : "length",
@@ -664,7 +674,7 @@ function collectToolHookEnvVarsFromZodSchema(schema: unknown): ToolHookEnvVarDoc
     if (options.keyPath.length === 0) return;
 
     add({
-      envVar: toolHookEnvVarName("SHUX_TOOL_INPUT", options.keyPath, { allowPlaceholders: true }),
+      envVar: toolHookEnvVarName("XUM_TOOL_INPUT", options.keyPath, { allowPlaceholders: true }),
       jsonPath: options.jsonPath || "(root)",
       type,
       description: description ?? "",
@@ -743,7 +753,7 @@ async function syncAutoCleanupWorkflow(): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 function generateDeepReviewSkillBlock(): string {
-  const skillPath = path.join(import.meta.dir, "..", ".mux", "skills", "deep-review", "SKILL.md");
+  const skillPath = path.join(import.meta.dir, "..", ".xum", "skills", "deep-review", "SKILL.md");
   const content = fs.readFileSync(skillPath, "utf-8");
   // Use 5 backticks to wrap the skill content since it may contain nested code blocks with 3 backticks.
   return "`````md\n" + content.trim() + "\n`````";
@@ -752,7 +762,7 @@ function generateDeepReviewSkillBlock(): string {
 async function syncDeepReviewSkill(): Promise<boolean> {
   return syncDoc({
     docsFile: "agents/agent-skills.mdx",
-    sourceLabel: ".mux/skills/deep-review/SKILL.md",
+    sourceLabel: ".xum/skills/deep-review/SKILL.md",
     markerName: "DEEP_REVIEW_SKILL",
     generateBlock: generateDeepReviewSkillBlock,
   });

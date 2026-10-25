@@ -1,21 +1,53 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 
+import { Config } from "@/node/config";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import { applyToolPolicyToNames } from "@/common/utils/tools/toolPolicy";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { RemoteRuntime, type SpawnResult } from "@/node/runtime/RemoteRuntime";
+import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
+import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
+import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import { log } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
+  AgentDefinitionRequestCache,
   discoverAgentDefinitions,
+  listAgentDefinitions,
+  type AgentDefinitionsContext,
   getSkipScopesAboveForKnownScope,
   readAgentDefinition,
   resolveAgentBody,
+  resolveAgentDefinition,
   resolveAgentFrontmatter,
 } from "./agentDefinitionsService";
 import { resolveToolPolicyForAgent } from "./resolveToolPolicy";
+import { resolveAgentInheritanceChain } from "./resolveAgentInheritanceChain";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
+import { fakeRuntimeFactory } from "@/node/services/runtimeFactory/fakeRuntimeFactory.testHarness";
+import {
+  createMemoryHost,
+  MEMORY_USER_HOME,
+} from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+
+/** The Node layer, except that its host-local runtimes read `~/` as `home`: shows which runtime a scan used. */
+function runtimeFactoryWithHome(home: string): RuntimeFactory {
+  return {
+    ...runtimeFactory,
+    createLocalRuntime: (workspacePath) => {
+      const local = runtimeFactory.createLocalRuntime(workspacePath);
+      return Object.assign(Object.create(local) as Runtime, {
+        resolvePath: (target: string) =>
+          local.resolvePath(target.startsWith("~/") ? path.join(home, target.slice(2)) : target),
+      });
+    },
+  };
+}
 
 async function writeAgent(root: string, id: string, name: string): Promise<void> {
   await fs.mkdir(root, { recursive: true });
@@ -33,14 +65,14 @@ class RemotePathMappedRuntime extends RemoteRuntime {
   private readonly localRuntime: LocalRuntime;
   private readonly localBase: string;
   private readonly remoteBase: string;
-  private readonly muxHomeOverride: string | null;
+  private readonly xumHomeOverride: string | null;
 
-  constructor(localBase: string, remoteBase: string, options?: { muxHome?: string }) {
+  constructor(localBase: string, remoteBase: string, options?: { xumHome?: string }) {
     super();
     this.localRuntime = new LocalRuntime(localBase);
     this.localBase = path.resolve(localBase);
     this.remoteBase = remoteBase === "/" ? remoteBase : remoteBase.replace(/\/+$/u, "");
-    this.muxHomeOverride = options?.muxHome ?? null;
+    this.xumHomeOverride = options?.xumHome ?? null;
   }
 
   protected readonly commandPrefix = "TestRemoteRuntime";
@@ -95,8 +127,8 @@ class RemotePathMappedRuntime extends RemoteRuntime {
     });
   }
 
-  override getShuxHome(): string {
-    return this.muxHomeOverride ?? super.getShuxHome();
+  override getXumHome(): string {
+    return this.xumHomeOverride ?? super.getXumHome();
   }
 
   override normalizePath(targetPath: string, basePath: string): string {
@@ -185,6 +217,60 @@ class TrackingRemotePathMappedRuntime extends RemotePathMappedRuntime {
 }
 
 describe("agentDefinitionsService", () => {
+  test.each([true, false])(
+    "Settings lists project overrides and filters disabled agents (disabled=%s)",
+    async (disabled) => {
+      using project = new DisposableTempDir("agent-list-project");
+      using home = new DisposableTempDir("agent-list-home");
+      const projectRoot = path.join(project.path, ".xum", "agents");
+      await fs.mkdir(projectRoot, { recursive: true });
+      await fs.writeFile(
+        path.join(projectRoot, "reviewer.md"),
+        `---\nname: Reviewer\ndisabled: ${disabled}\n---\nReview changes.`
+      );
+      await fs.writeFile(
+        path.join(projectRoot, "exec.md"),
+        "---\nname: Project Exec\nai:\n  model: private:project-exec\n---\nProject execution."
+      );
+      const config = new Config(home.path);
+      // Project-only listing does not use workspace initialization or AI services.
+      const context: AgentDefinitionsContext = {
+        config,
+        aiService: {
+          getWorkspaceMetadata: () => {
+            throw new Error("Unexpected workspace lookup");
+          },
+          runtimeFactory,
+        },
+        initStateManager: {
+          waitForInit: () => {
+            throw new Error("Unexpected workspace initialization");
+          },
+        },
+      };
+      const list = (includeDisabled = false) =>
+        listAgentDefinitions(context, { projectPath: project.path, includeDisabled });
+      const all = await list(true);
+      expect(all.find((agent) => agent.id === "reviewer")).toMatchObject({
+        name: "Reviewer",
+        scope: "project",
+      });
+      expect(all.find((agent) => agent.id === "exec")).toMatchObject({
+        name: "Project Exec",
+        scope: "project",
+        aiDefaults: { model: "private:project-exec" },
+      });
+      expect((await list()).some((agent) => agent.id === "reviewer")).toBe(!disabled);
+      for (const enabled of [true, false]) {
+        await config.editConfig((cfg) => {
+          cfg.agentAiDefaults = { reviewer: { enabled } };
+          return cfg;
+        });
+        expect((await list()).some((agent) => agent.id === "reviewer")).toBe(enabled);
+      }
+    }
+  );
+
   test("project agents override global agents", async () => {
     using project = new DisposableTempDir("agent-defs-project");
     using global = new DisposableTempDir("agent-defs-global");
@@ -196,10 +282,10 @@ describe("agentDefinitionsService", () => {
     await writeAgent(projectAgentsRoot, "foo", "Foo (project)");
     await writeAgent(globalAgentsRoot, "bar", "Bar (global)");
 
-    const roots = { projectRoot: projectAgentsRoot, globalRoot: globalAgentsRoot };
+    const roots = { projectRoots: [projectAgentsRoot], globalRoot: globalAgentsRoot };
     const runtime = new LocalRuntime(project.path);
 
-    const agents = await discoverAgentDefinitions(runtime, project.path, { roots });
+    const agents = await discoverAgentDefinitions(runtime, project.path, { roots, runtimeFactory });
 
     const foo = agents.find((a) => a.id === "foo");
     expect(foo).toBeDefined();
@@ -222,11 +308,12 @@ describe("agentDefinitionsService", () => {
     await writeAgent(projectAgentsRoot, "dup", "Zulu (project)");
     await writeAgent(globalAgentsRoot, "dup", "Alpha (global)");
 
-    const roots = { projectRoot: projectAgentsRoot, globalRoot: globalAgentsRoot };
+    const roots = { projectRoots: [projectAgentsRoot], globalRoot: globalAgentsRoot };
     const runtime = new LocalRuntime(project.path);
     const agents = await discoverAgentDefinitions(runtime, project.path, {
       roots,
       dedupeById: false,
+      runtimeFactory,
     });
 
     const dupRows = agents.filter((agent) => agent.id === "dup");
@@ -246,11 +333,14 @@ describe("agentDefinitionsService", () => {
     await writeAgent(globalAgentsRoot, "foo", "Foo (global)");
     await writeAgent(projectAgentsRoot, "foo", "Foo (project)");
 
-    const roots = { projectRoot: projectAgentsRoot, globalRoot: globalAgentsRoot };
+    const roots = { projectRoots: [projectAgentsRoot], globalRoot: globalAgentsRoot };
     const runtime = new LocalRuntime(project.path);
 
     const agentId = AgentIdSchema.parse("foo");
-    const pkg = await readAgentDefinition(runtime, project.path, agentId, { roots });
+    const pkg = await readAgentDefinition(runtime, project.path, agentId, {
+      roots,
+      runtimeFactory,
+    });
 
     expect(pkg.scope).toBe("project");
     expect(pkg.frontmatter.name).toBe("Foo (project)");
@@ -269,12 +359,15 @@ describe("agentDefinitionsService", () => {
     await writeAgent(projectAgentsRoot, "shared", "Shared (project)");
 
     const roots = {
-      projectRoot: path.posix.join(remoteWorkspacePath, ".mux", "agents"),
+      projectRoots: [path.posix.join(remoteWorkspacePath, ".mux", "agents")],
       globalRoot: globalAgentsRoot,
     };
     const runtime = new RemotePathMappedRuntime(project.path, remoteWorkspacePath);
 
-    const agents = await discoverAgentDefinitions(runtime, remoteWorkspacePath, { roots });
+    const agents = await discoverAgentDefinitions(runtime, remoteWorkspacePath, {
+      roots,
+      runtimeFactory,
+    });
 
     const hostOnly = agents.find((agent) => agent.id === "host-only");
     expect(hostOnly).toBeDefined();
@@ -288,6 +381,7 @@ describe("agentDefinitionsService", () => {
 
     const hostOnlyPkg = await readAgentDefinition(runtime, remoteWorkspacePath, "host-only", {
       roots,
+      runtimeFactory,
     });
     expect(hostOnlyPkg.scope).toBe("global");
     expect(hostOnlyPkg.frontmatter.name).toBe("Host Only");
@@ -315,12 +409,15 @@ describe("agentDefinitionsService", () => {
     );
 
     const roots = {
-      projectRoot: path.posix.join(remoteWorkspacePath, ".mux", "agents"),
+      projectRoots: [path.posix.join(remoteWorkspacePath, ".mux", "agents")],
       globalRoot: globalAgentsRoot,
     };
     const runtime = new RemotePathMappedRuntime(project.path, remoteWorkspacePath);
 
-    const body = await resolveAgentBody(runtime, remoteWorkspacePath, "child", { roots });
+    const body = await resolveAgentBody(runtime, remoteWorkspacePath, "child", {
+      roots,
+      runtimeFactory,
+    });
     expect(body).toContain("Global instructions.");
     expect(body).toContain("Project instructions.");
   });
@@ -336,14 +433,17 @@ describe("agentDefinitionsService", () => {
     await writeAgent(runtimeGlobalAgentsRoot, "docker-global", "Docker Global");
 
     const roots = {
-      projectRoot: path.posix.join(remoteWorkspacePath, ".mux", "agents"),
+      projectRoots: [path.posix.join(remoteWorkspacePath, ".mux", "agents")],
       globalRoot: path.posix.join(remoteRuntimeRoot, "global-agents"),
     };
     const runtime = new RemotePathMappedRuntime(runtimeBase.path, remoteRuntimeRoot, {
-      muxHome: "/var/mux",
+      xumHome: "/var/mux",
     });
 
-    const agents = await discoverAgentDefinitions(runtime, remoteWorkspacePath, { roots });
+    const agents = await discoverAgentDefinitions(runtime, remoteWorkspacePath, {
+      roots,
+      runtimeFactory,
+    });
 
     expect(agents.find((agent) => agent.id === "docker-global")).toMatchObject({
       id: "docker-global",
@@ -353,6 +453,7 @@ describe("agentDefinitionsService", () => {
 
     const pkg = await readAgentDefinition(runtime, remoteWorkspacePath, "docker-global", {
       roots,
+      runtimeFactory,
     });
     expect(pkg.scope).toBe("global");
     expect(pkg.frontmatter.name).toBe("Docker Global");
@@ -375,12 +476,15 @@ describe("agentDefinitionsService", () => {
     );
 
     const roots = {
-      projectRoot: path.posix.join(remoteWorkspacePath, ".mux", "agents"),
+      projectRoots: [path.posix.join(remoteWorkspacePath, ".mux", "agents")],
       globalRoot: globalAgentsRoot,
     };
     const runtime = new TrackingRemotePathMappedRuntime(project.path, remoteWorkspacePath);
 
-    const descriptors = await discoverAgentDefinitions(runtime, remoteWorkspacePath, { roots });
+    const descriptors = await discoverAgentDefinitions(runtime, remoteWorkspacePath, {
+      roots,
+      runtimeFactory,
+    });
     const askLike = descriptors.find((descriptor) => descriptor.id === "asklike");
     expect(askLike).toBeDefined();
     expect(askLike?.scope).toBe("global");
@@ -388,6 +492,7 @@ describe("agentDefinitionsService", () => {
     const frontmatter = await resolveAgentFrontmatter(runtime, remoteWorkspacePath, "asklike", {
       roots,
       skipScopesAbove: getSkipScopesAboveForKnownScope(askLike!.scope),
+      runtimeFactory,
     });
 
     expect(frontmatter.name).toBe("Ask Like");
@@ -441,16 +546,22 @@ Replaced body.
       "utf-8"
     );
 
-    const roots = { projectRoot: agentsRoot, globalRoot: agentsRoot };
+    const roots = { projectRoots: [agentsRoot], globalRoot: agentsRoot };
     const runtime = new LocalRuntime(tempDir.path);
 
     // Child without explicit prompt settings should append (new default)
-    const childBody = await resolveAgentBody(runtime, tempDir.path, "child", { roots });
+    const childBody = await resolveAgentBody(runtime, tempDir.path, "child", {
+      roots,
+      runtimeFactory,
+    });
     expect(childBody).toContain("Base instructions.");
     expect(childBody).toContain("Child additions.");
 
     // Child with prompt.append: false should replace (explicit opt-out)
-    const replacerBody = await resolveAgentBody(runtime, tempDir.path, "replacer", { roots });
+    const replacerBody = await resolveAgentBody(runtime, tempDir.path, "replacer", {
+      roots,
+      runtimeFactory,
+    });
     expect(replacerBody).toBe("Replaced body.\n");
     expect(replacerBody).not.toContain("Base instructions");
   });
@@ -475,13 +586,16 @@ Custom planning instructions.
 
     const runtime = new LocalRuntime(tempDir.path);
 
-    const customPlanBody = await resolveAgentBody(runtime, tempDir.path, "custom-plan");
+    const customPlanBody = await resolveAgentBody(runtime, tempDir.path, "custom-plan", {
+      runtimeFactory,
+    });
     expect(customPlanBody).toBe("Custom planning instructions.\n");
 
     const customPlanFrontmatter = await resolveAgentFrontmatter(
       runtime,
       tempDir.path,
-      "custom-plan"
+      "custom-plan",
+      { runtimeFactory }
     );
     expect(customPlanFrontmatter.subagent?.runnable).toBe(false);
     expect(customPlanFrontmatter.subagent?.workflow_runnable).toBe(true);
@@ -493,14 +607,16 @@ Custom planning instructions.
     const runtime = new LocalRuntime(tempDir.path);
 
     const [exploreBody, execBody] = await Promise.all([
-      resolveAgentBody(runtime, tempDir.path, "explore"),
-      resolveAgentBody(runtime, tempDir.path, "exec"),
+      resolveAgentBody(runtime, tempDir.path, "explore", { runtimeFactory }),
+      resolveAgentBody(runtime, tempDir.path, "exec", { runtimeFactory }),
     ]);
     expect(exploreBody.trim().length).toBeGreaterThan(0);
     expect(execBody.trim().length).toBeGreaterThan(0);
     expect(exploreBody).not.toContain(execBody.trim());
 
-    const exploreFrontmatter = await resolveAgentFrontmatter(runtime, tempDir.path, "explore");
+    const exploreFrontmatter = await resolveAgentFrontmatter(runtime, tempDir.path, "explore", {
+      runtimeFactory,
+    });
     expect(exploreFrontmatter.tools?.add).toContain(".*");
     expect(exploreFrontmatter.tools?.remove).toContain("file_edit_.*");
     expect(exploreFrontmatter.subagent?.runnable).toBe(true);
@@ -562,18 +678,18 @@ Project-specific additions.
       "utf-8"
     );
 
-    const roots = { projectRoot: projectAgentsRoot, globalRoot: globalAgentsRoot };
+    const roots = { projectRoots: [projectAgentsRoot], globalRoot: globalAgentsRoot };
     const runtime = new LocalRuntime(project.path);
 
     // Verify project agent is discovered
-    const agents = await discoverAgentDefinitions(runtime, project.path, { roots });
+    const agents = await discoverAgentDefinitions(runtime, project.path, { roots, runtimeFactory });
     const foo = agents.find((a) => a.id === "foo");
     expect(foo).toBeDefined();
     expect(foo!.scope).toBe("project");
     expect(foo!.base).toBe("foo"); // Points to itself by name
 
     // Verify body resolution correctly inherits from global (not self)
-    const body = await resolveAgentBody(runtime, project.path, "foo", { roots });
+    const body = await resolveAgentBody(runtime, project.path, "foo", { roots, runtimeFactory });
     expect(body).toContain("Global foo instructions.");
     expect(body).toContain("Project-specific additions.");
   });
@@ -608,11 +724,14 @@ Project body.
       "utf-8"
     );
 
-    const roots = { projectRoot: projectAgentsRoot, globalRoot: globalAgentsRoot };
+    const roots = { projectRoots: [projectAgentsRoot], globalRoot: globalAgentsRoot };
     const runtime = new LocalRuntime(project.path);
 
     // Without skip: project takes precedence
-    const normalPkg = await readAgentDefinition(runtime, project.path, "test", { roots });
+    const normalPkg = await readAgentDefinition(runtime, project.path, "test", {
+      roots,
+      runtimeFactory,
+    });
     expect(normalPkg.scope).toBe("project");
     expect(normalPkg.frontmatter.name).toBe("Test Project");
 
@@ -620,6 +739,7 @@ Project body.
     const skippedPkg = await readAgentDefinition(runtime, project.path, "test", {
       roots,
       skipScopesAbove: "project",
+      runtimeFactory,
     });
     expect(skippedPkg.scope).toBe("global");
     expect(skippedPkg.frontmatter.name).toBe("Test Global");
@@ -675,10 +795,13 @@ Project body.
       "utf-8"
     );
 
-    const roots = { projectRoot: projectAgentsRoot, globalRoot: globalAgentsRoot };
+    const roots = { projectRoots: [projectAgentsRoot], globalRoot: globalAgentsRoot };
     const runtime = new LocalRuntime(project.path);
 
-    const frontmatter = await resolveAgentFrontmatter(runtime, project.path, "foo", { roots });
+    const frontmatter = await resolveAgentFrontmatter(runtime, project.path, "foo", {
+      roots,
+      runtimeFactory,
+    });
 
     expect(frontmatter.description).toBe("Base description");
     expect(frontmatter.ui?.hidden).toBe(true);
@@ -692,6 +815,45 @@ Project body.
     expect(frontmatter.tools?.add).toEqual(["baseAdd"]);
     expect(frontmatter.tools?.remove).toEqual(["baseRemove"]);
   });
+
+  test.each([true, false])(
+    "resolves body and inherited metadata in one read per layer (append=%s)",
+    async (append) => {
+      using tempDir = new DisposableTempDir("agent-definition-snapshot");
+      const root = path.join(tempDir.path, "agents");
+      await fs.mkdir(root);
+      await fs.writeFile(
+        path.join(root, "base.md"),
+        "---\nname: Base\ndisabled: true\nai:\n  model: private:base\n---\nBase protocol."
+      );
+      await fs.writeFile(
+        path.join(root, "child.md"),
+        `---\nname: Child\nbase: base\nprompt:\n  append: ${append}\n---\nChild instructions.`
+      );
+      const runtime = new LocalRuntime(tempDir.path);
+      const read = spyOn(runtime, "readFile");
+      try {
+        const resolved = await resolveAgentDefinition(runtime, tempDir.path, "child", {
+          roots: { projectRoots: [], globalRoot: root },
+          runtimeFactory,
+        });
+        expect(resolved).toMatchObject({
+          id: "child",
+          scope: "global",
+          frontmatter: { disabled: true, ai: { model: "private:base" } },
+        });
+        expect(resolved.body).toBe(
+          append ? "Base protocol.\n\nChild instructions." : "Child instructions."
+        );
+        expect(read.mock.calls.map(([file]) => file)).toEqual([
+          path.join(root, "child.md"),
+          path.join(root, "base.md"),
+        ]);
+      } finally {
+        read.mockRestore();
+      }
+    }
+  );
 
   test("resolveAgentFrontmatter preserves explicit falsy overrides", async () => {
     using tempDir = new DisposableTempDir("agent-frontmatter-falsy");
@@ -729,10 +891,13 @@ subagent:
       "utf-8"
     );
 
-    const roots = { projectRoot: agentsRoot, globalRoot: agentsRoot };
+    const roots = { projectRoots: [agentsRoot], globalRoot: agentsRoot };
     const runtime = new LocalRuntime(tempDir.path);
 
-    const frontmatter = await resolveAgentFrontmatter(runtime, tempDir.path, "child", { roots });
+    const frontmatter = await resolveAgentFrontmatter(runtime, tempDir.path, "child", {
+      roots,
+      runtimeFactory,
+    });
 
     expect(frontmatter.ui?.hidden).toBe(false);
     expect(frontmatter.subagent?.runnable).toBe(false);
@@ -778,10 +943,13 @@ tools:
       "utf-8"
     );
 
-    const roots = { projectRoot: agentsRoot, globalRoot: agentsRoot };
+    const roots = { projectRoots: [agentsRoot], globalRoot: agentsRoot };
     const runtime = new LocalRuntime(tempDir.path);
 
-    const frontmatter = await resolveAgentFrontmatter(runtime, tempDir.path, "child", { roots });
+    const frontmatter = await resolveAgentFrontmatter(runtime, tempDir.path, "child", {
+      roots,
+      runtimeFactory,
+    });
 
     expect(frontmatter.tools?.add).toEqual(["a", "c"]);
     expect(frontmatter.tools?.remove).toEqual(["b", "d"]);
@@ -813,12 +981,12 @@ base: a
       "utf-8"
     );
 
-    const roots = { projectRoot: agentsRoot, globalRoot: agentsRoot };
+    const roots = { projectRoots: [agentsRoot], globalRoot: agentsRoot };
     const runtime = new LocalRuntime(tempDir.path);
 
-    expect(resolveAgentFrontmatter(runtime, tempDir.path, "a", { roots })).rejects.toThrow(
-      "Circular agent inheritance detected"
-    );
+    expect(
+      resolveAgentFrontmatter(runtime, tempDir.path, "a", { roots, runtimeFactory })
+    ).rejects.toThrow("Circular agent inheritance detected");
   });
 
   describe("agent plugin contributions", () => {
@@ -853,13 +1021,16 @@ base: a
       await writeAgent(projectAgentsRoot, "shared", "Shared (project)");
 
       const roots = {
-        projectRoot: projectAgentsRoot,
+        projectRoots: [projectAgentsRoot],
         globalRoot: global.path,
         projectPluginRoots: [pluginContainer],
       };
       const runtime = new LocalRuntime(project.path);
 
-      const agents = await discoverAgentDefinitions(runtime, project.path, { roots });
+      const agents = await discoverAgentDefinitions(runtime, project.path, {
+        roots,
+        runtimeFactory,
+      });
 
       const helper = agents.find((a) => a.id === "helper");
       expect(helper).toBeDefined();
@@ -873,6 +1044,70 @@ base: a
       expect(shared[0]?.pluginName).toBeUndefined();
     });
 
+    test("resolves plugin containers through the host-local runtime of the RuntimeFactory it was given", async () => {
+      using home = new DisposableTempDir("agent-defs-plugin-factory");
+      await writePluginWithAgent(
+        path.join(home.path, "plugins"),
+        "probe",
+        "factory-probe",
+        "Probe"
+      );
+      const roots = {
+        projectRoots: [],
+        globalRoot: path.join(home.path, "agents"),
+        // Tilde form: only the factory's host-local runtime maps it into the temp home.
+        globalPluginRoots: ["~/plugins"],
+      };
+
+      const agents = await discoverAgentDefinitions(new LocalRuntime(home.path), home.path, {
+        roots,
+        runtimeFactory: runtimeFactoryWithHome(home.path),
+      });
+
+      expect(agents.find((a) => a.id === "factory-probe")?.pluginName).toBe("probe");
+    });
+
+    // #6426: project plugin agents load only in a trusted project, in the listing and in a
+    // read by id (an agentId, a base). Plain project agents do not change.
+    test.each([false, true])(
+      "project plugin agents are listed and read only in a trusted project (trusted: %s)",
+      async (projectPluginsTrusted) => {
+        using project = new DisposableTempDir("agent-defs-plugin-trust");
+        await writeAgent(path.join(project.path, ".xum", "agents"), "plain-project", "Plain");
+        await writePluginWithAgent(
+          path.join(project.path, ".xum", "plugins"),
+          "repo-plugin",
+          "repo-agent",
+          "Repo (plugin)"
+        );
+        const runtime = new LocalRuntime(project.path);
+
+        const ids = (
+          await discoverAgentDefinitions(runtime, project.path, {
+            projectPluginsTrusted,
+            runtimeFactory,
+          })
+        ).map((agent) => agent.id);
+        expect(ids).toContain("plain-project");
+        expect(ids.includes("repo-agent")).toBe(projectPluginsTrusted);
+
+        // One request cache serves both trust values without mixing them.
+        const cache = new AgentDefinitionRequestCache();
+        const read = (trusted: boolean) =>
+          readAgentDefinition(runtime, project.path, AgentIdSchema.parse("repo-agent"), {
+            cache,
+            projectPluginsTrusted: trusted,
+            runtimeFactory,
+          }).then((pkg) => pkg.frontmatter.name);
+        if (projectPluginsTrusted) expect(await read(true)).toBe("Repo (plugin)");
+        else {
+          // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
+          await expect(read(false)).rejects.toThrow("Agent definition not found");
+          expect(await read(true)).toBe("Repo (plugin)");
+        }
+      }
+    );
+
     test("dedupeById: false returns shadowed plugin agents in precedence order", async () => {
       using project = new DisposableTempDir("agent-defs-plugin-project");
       using global = new DisposableTempDir("agent-defs-plugin-global");
@@ -884,7 +1119,7 @@ base: a
       await writeAgent(projectAgentsRoot, "shared", "Shared");
 
       const roots = {
-        projectRoot: projectAgentsRoot,
+        projectRoots: [projectAgentsRoot],
         globalRoot: global.path,
         projectPluginRoots: [pluginContainer],
       };
@@ -893,6 +1128,7 @@ base: a
       const agents = await discoverAgentDefinitions(runtime, project.path, {
         roots,
         dedupeById: false,
+        runtimeFactory,
       });
 
       const shared = agents.filter((a) => a.id === "shared");
@@ -900,6 +1136,275 @@ base: a
       // Precedence order within the same name: project first, plugin second.
       expect(shared[0]?.pluginName).toBeUndefined();
       expect(shared[1]?.pluginName).toBe("my-plugin");
+    });
+
+    test("a Claude Code / Cursor format plugin agent spawns with Exec's tools; project agents keep Xum defaults", async () => {
+      using project = new DisposableTempDir("agent-defs-foreign-plugin-project");
+      using global = new DisposableTempDir("agent-defs-foreign-plugin-global");
+
+      const projectAgentsRoot = path.join(project.path, ".mux", "agents");
+      const pluginContainer = path.join(project.path, ".mux", "plugins");
+      // Upstream pstack's agents/poteto-agent.md frontmatter, verbatim keys.
+      const foreign = `---\nname: poteto-agent\ndescription: Delegate subagent\nis_background: true\n---\nYou are a delegate.\n`;
+      await writePluginWithAgent(pluginContainer, "pstack", "placeholder", "Placeholder");
+      await fs.writeFile(
+        path.join(pluginContainer, "pstack", "agents", "poteto-agent.md"),
+        foreign,
+        "utf-8"
+      );
+      await fs.mkdir(projectAgentsRoot, { recursive: true });
+      await fs.writeFile(path.join(projectAgentsRoot, "local-foreign.md"), foreign, "utf-8");
+
+      const roots = {
+        projectRoots: [projectAgentsRoot],
+        globalRoot: global.path,
+        projectPluginRoots: [pluginContainer],
+      };
+      const runtime = new LocalRuntime(project.path);
+
+      const agents = await discoverAgentDefinitions(runtime, project.path, {
+        roots,
+        runtimeFactory,
+      });
+      const plugin = agents.find((a) => a.id === "poteto-agent");
+      expect(plugin).toMatchObject({ subagentRunnable: true, uiSelectable: false, base: "exec" });
+      const local = agents.find((a) => a.id === "local-foreign");
+      expect(local).toMatchObject({ subagentRunnable: false, uiSelectable: true });
+      expect(local?.base).toBeUndefined();
+
+      const resolvePolicy = async (agentId: string) => {
+        const agentDefinition = await readAgentDefinition(
+          runtime,
+          project.path,
+          AgentIdSchema.parse(agentId),
+          { roots, runtimeFactory }
+        );
+        const chain = await resolveAgentInheritanceChain({
+          runtime,
+          workspacePath: project.path,
+          agentId: AgentIdSchema.parse(agentId),
+          agentDefinition,
+          workspaceId: "ws",
+          runtimeFactory,
+        });
+        return {
+          body: await resolveAgentBody(runtime, project.path, AgentIdSchema.parse(agentId), {
+            roots,
+            runtimeFactory,
+          }),
+          policy: resolveToolPolicyForAgent({
+            agents: chain,
+            isSubagent: true,
+            disableTaskToolsForDepth: false,
+          }),
+        };
+      };
+      const sampleTools = ["bash", "file_read", "file_edit_insert", "task", "web_fetch"];
+      const pluginAgent = await resolvePolicy("poteto-agent");
+      const exec = await resolvePolicy("exec");
+      expect(applyToolPolicyToNames(sampleTools, pluginAgent.policy)).toEqual(sampleTools);
+      expect(applyToolPolicyToNames(sampleTools, pluginAgent.policy)).toEqual(
+        applyToolPolicyToNames(sampleTools, exec.policy)
+      );
+      // The plugin body is the whole system prompt, as in Claude Code and Cursor:
+      // it replaces Exec's body instead of appending to it.
+      expect(pluginAgent.body.trim()).toBe("You are a delegate.");
+      // The project copy of the same file stays toolless.
+      expect(
+        applyToolPolicyToNames(sampleTools, (await resolvePolicy("local-foreign")).policy)
+      ).toEqual([]);
+    });
+
+    test("Claude Code tools/disallowedTools lists narrow plugin agents; unresolvable or mixed lists skip the agent", async () => {
+      using project = new DisposableTempDir("agent-defs-claude-tools-project");
+      using global = new DisposableTempDir("agent-defs-claude-tools-global");
+
+      const pluginContainer = path.join(project.path, ".mux", "plugins");
+      await writePluginWithAgent(pluginContainer, "pstack", "placeholder", "Placeholder");
+      const agentFiles: Record<string, string> = {
+        // Claude Code allowlist: only the named tools.
+        reviewer: "name: reviewer\ndescription: d\ntools: Read, Grep, Bash",
+        // Claude Code denylist: every inherited tool except file writes and spawning.
+        "no-writes": "name: no-writes\ndescription: d\ndisallowedTools: [Write, Edit, Agent]",
+        // Nothing resolves: Claude Code refuses to launch it, so Xum skips it.
+        unresolved: "name: unresolved\ndescription: d\ntools: Grep, Glob",
+        // A Xum-format file with a Claude denylist: Xum cannot honor both, so it skips it.
+        mixed: "name: mixed\nbase: exec\nsubagent:\n  runnable: true\ndisallowedTools: [Bash]",
+      };
+      for (const [id, frontmatter] of Object.entries(agentFiles)) {
+        await fs.writeFile(
+          path.join(pluginContainer, "pstack", "agents", `${id}.md`),
+          `---\n${frontmatter}\n---\nBody\n`,
+          "utf-8"
+        );
+      }
+
+      const roots = {
+        projectRoots: [],
+        globalRoot: global.path,
+        projectPluginRoots: [pluginContainer],
+      };
+      const runtime = new LocalRuntime(project.path);
+      const warn = spyOn(log, "warn");
+      let ids: string[];
+      try {
+        ids = (
+          await discoverAgentDefinitions(runtime, project.path, { roots, runtimeFactory })
+        ).map((a) => a.id);
+        for (const skipped of ["unresolved", "mixed"]) {
+          expect(
+            warn.mock.calls.some(([message]) => String(message).includes(`'${skipped}'`))
+          ).toBe(true);
+        }
+      } finally {
+        warn.mockRestore();
+      }
+      expect(ids).toContain("reviewer");
+      expect(ids).toContain("no-writes");
+      expect(ids).not.toContain("unresolved");
+      expect(ids).not.toContain("mixed");
+
+      const toolsOf = async (agentId: string) => {
+        const id = AgentIdSchema.parse(agentId);
+        const agentDefinition = await readAgentDefinition(runtime, project.path, id, {
+          roots,
+          runtimeFactory,
+        });
+        const chain = await resolveAgentInheritanceChain({
+          runtime,
+          workspacePath: project.path,
+          agentId: id,
+          agentDefinition,
+          workspaceId: "ws",
+          runtimeFactory,
+        });
+        const policy = resolveToolPolicyForAgent({
+          agents: chain,
+          isSubagent: true,
+          disableTaskToolsForDepth: false,
+        });
+        return applyToolPolicyToNames(sampleTools, policy);
+      };
+      const sampleTools = [
+        "agent_report",
+        "bash",
+        "bash_output",
+        "file_read",
+        "file_edit_insert",
+        "file_edit_replace_string",
+        "task",
+        "task_await",
+        "task_apply_git_patch",
+        "workflow_run",
+        "web_fetch",
+        "todo_write",
+        "memory",
+        "github_create_issue",
+      ];
+      // agent_report stays: every non-plan sub-agent reports through it.
+      expect(await toolsOf("reviewer")).toEqual([
+        "agent_report",
+        "bash",
+        "bash_output",
+        "file_read",
+      ]);
+      const exec = await toolsOf("exec");
+      expect(await toolsOf("no-writes")).toEqual(
+        // Workflows spawn sub-agents too, so denying Agent removes them.
+        exec.filter((tool) => !/^(file_edit_|task|workflow_)/.test(tool))
+      );
+    });
+
+    test("remote runtimes list global host plugin agents but not project plugin agents", async () => {
+      using hostHome = new DisposableTempDir("agent-defs-remote-plugin-host-home");
+      using checkout = new DisposableTempDir("agent-defs-remote-plugin-checkout");
+      await writePluginWithAgent(
+        path.join(hostHome.path, "plugins"),
+        "host-plugin",
+        "host-helper",
+        "Host Helper"
+      );
+      await writePluginWithAgent(
+        path.join(checkout.path, ".xum", "plugins"),
+        "checkout-plugin",
+        "checkout-helper",
+        "Checkout Helper"
+      );
+      // Identity mapping: the checkout path also exists on the host, so a regression
+      // that scans project plugin containers with the host runtime would find it.
+      const runtime = new RemotePathMappedRuntime(checkout.path, checkout.path);
+
+      const previousRoot = process.env.XUM_ROOT;
+      process.env.XUM_ROOT = hostHome.path;
+      try {
+        const agents = await discoverAgentDefinitions(runtime, checkout.path, { runtimeFactory });
+        expect(agents.find((agent) => agent.id === "host-helper")).toMatchObject({
+          scope: "global",
+          pluginName: "host-plugin",
+        });
+        expect(agents.some((agent) => agent.id === "checkout-helper")).toBe(false);
+
+        const pkg = await readAgentDefinition(runtime, checkout.path, "host-helper", {
+          runtimeFactory,
+        });
+        expect(pkg.scope).toBe("global");
+        expect(pkg.frontmatter.name).toBe("Host Helper");
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
+        await expect(
+          readAgentDefinition(runtime, checkout.path, "checkout-helper", { runtimeFactory })
+        ).rejects.toThrow("Agent definition not found");
+      } finally {
+        if (previousRoot === undefined) delete process.env.XUM_ROOT;
+        else process.env.XUM_ROOT = previousRoot;
+      }
+    });
+
+    test("a trusted remote checkout's plugin agents load from one cached listing (#6426)", async () => {
+      using checkoutDir = new DisposableTempDir("agent-defs-remote-checkout-plugins");
+      const checkout = await fs.realpath(checkoutDir.path);
+      const container = path.join(checkout, ".xum", "plugins");
+      await writePluginWithAgent(container, "kit", "remote-helper", "Remote Helper");
+      // An agent file that is a link (here to a file outside its plugin) is not listed.
+      await writeAgent(path.join(checkout, "outside"), "escaped", "Escaped");
+      await fs.symlink(
+        path.join(checkout, "outside", "escaped.md"),
+        path.join(container, "kit", "agents", "escaped.md")
+      );
+      const runtime = new HostKeyShellRemoteRuntime(checkout, "agents-remote-plugins");
+
+      const agents = await discoverAgentDefinitions(runtime, checkout, {
+        projectPluginsTrusted: true,
+        runtimeFactory,
+      });
+      expect(agents.find((agent) => agent.id === "remote-helper")).toMatchObject({
+        scope: "project",
+        pluginName: "kit",
+      });
+      expect(agents.some((agent) => agent.id === "escaped")).toBe(false);
+      const pkg = await readAgentDefinition(runtime, checkout, "remote-helper", {
+        projectPluginsTrusted: true,
+        runtimeFactory,
+      });
+      expect(pkg.frontmatter.name).toBe("Remote Helper");
+      // The listing and the read by id share one remote listing.
+      expect(runtime.pluginListings).toBe(1);
+      // A warm turn lists skills and agents from the same snapshot: no remote command touches the
+      // plugin folders (plain .xum/skills and .xum/agents roots keep their own reads).
+      const before = runtime.commands.length;
+      await discoverAgentSkills(runtime, checkout, { projectPluginsTrusted: true, runtimeFactory });
+      await discoverAgentDefinitions(runtime, checkout, {
+        projectPluginsTrusted: true,
+        runtimeFactory,
+      });
+      const warm = runtime.commands.slice(before);
+      expect(warm.some((command) => command.includes(container))).toBe(false);
+      expect(runtime.pluginListings).toBe(1);
+
+      // Untrusted: no remote plugin agents and no listing.
+      const untrusted = new HostKeyShellRemoteRuntime(checkout, "agents-remote-untrusted");
+      const plain = await discoverAgentDefinitions(untrusted, checkout, { runtimeFactory });
+      expect(plain.some((agent) => agent.id === "remote-helper")).toBe(false);
+      expect(untrusted.pluginListings).toBe(0);
     });
 
     test("readAgentDefinition falls back to a plugin agent when no project/global agent exists", async () => {
@@ -910,15 +1415,163 @@ base: a
       await writePluginWithAgent(pluginContainer, "my-plugin", "helper", "Helper (plugin)");
 
       const roots = {
-        projectRoot: path.join(project.path, ".mux", "agents"),
+        projectRoots: [path.join(project.path, ".mux", "agents")],
         globalRoot: global.path,
         projectPluginRoots: [pluginContainer],
       };
       const runtime = new LocalRuntime(project.path);
 
-      const pkg = await readAgentDefinition(runtime, project.path, "helper", { roots });
+      const pkg = await readAgentDefinition(runtime, project.path, "helper", {
+        roots,
+        runtimeFactory,
+      });
       expect(pkg.scope).toBe("project");
       expect(pkg.frontmatter.name).toBe("Helper (plugin)");
     });
+  });
+});
+
+// #4438: on SSH runtimes a transport failure says nothing about an agent file.
+// It must never let a lower scope, a truncated base chain or a skipped root win.
+describe("transport failures", () => {
+  const networkError = () => new RuntimeError("ssh: Connection refused", "network");
+  const agent = (body: string, base?: string) =>
+    `---\nname: ${body}\n${base ? `base: ${base}\n` : ""}---\n${body}`;
+
+  async function scopedAgents(tempDir: string) {
+    const projectRoot = path.join(tempDir, "project-agents");
+    const globalRoot = path.join(tempDir, "global-agents");
+    await fs.mkdir(projectRoot);
+    await fs.mkdir(globalRoot);
+    await fs.writeFile(path.join(globalRoot, "reviewer.md"), agent("Global"));
+    return { projectRoot, globalRoot, roots: { projectRoots: [projectRoot], globalRoot } };
+  }
+
+  test("a project agent that fails in transport does not fall back to global", async () => {
+    using tempDir = new DisposableTempDir("agent-transport-scope");
+    const { projectRoot, roots } = await scopedAgents(tempDir.path);
+    await fs.writeFile(path.join(projectRoot, "reviewer.md"), agent("Project"));
+    const runtime = new LocalRuntime(tempDir.path);
+    const stat = runtime.stat.bind(runtime);
+    spyOn(runtime, "stat").mockImplementation((filePath, signal) =>
+      filePath.startsWith(projectRoot) ? Promise.reject(networkError()) : stat(filePath, signal)
+    );
+
+    const read = readAgentDefinition(runtime, tempDir.path, "reviewer", { roots, runtimeFactory });
+    expect(await read.catch((error: unknown) => error)).toMatchObject({ type: "network" });
+    // A skipped root in discovery is the same fallback.
+    spyOn(runtime, "resolvePath").mockRejectedValue(networkError());
+    const discovered = discoverAgentDefinitions(runtime, tempDir.path, { roots, runtimeFactory });
+    expect(await discovered.catch((error: unknown) => error)).toMatchObject({ type: "network" });
+  });
+
+  test("a missing project agent still falls back to global", async () => {
+    using tempDir = new DisposableTempDir("agent-transport-control");
+    const { roots } = await scopedAgents(tempDir.path);
+    const runtime = new LocalRuntime(tempDir.path);
+
+    const resolved = await readAgentDefinition(runtime, tempDir.path, "reviewer", {
+      roots,
+      runtimeFactory,
+    });
+    expect(resolved.scope).toBe("global");
+  });
+
+  test("a base agent that fails in transport does not truncate the chain", async () => {
+    using tempDir = new DisposableTempDir("agent-transport-base");
+    const agentsDir = path.join(tempDir.path, ".xum", "agents");
+    await fs.mkdir(agentsDir, { recursive: true });
+    await fs.writeFile(path.join(agentsDir, "child.md"), agent("Child", "parent"));
+    await fs.writeFile(path.join(agentsDir, "parent.md"), agent("Parent"));
+    const runtime = new LocalRuntime(tempDir.path);
+    const child = await readAgentDefinition(runtime, tempDir.path, "child", { runtimeFactory });
+    const stat = runtime.stat.bind(runtime);
+    spyOn(runtime, "stat").mockImplementation((filePath, signal) =>
+      filePath.endsWith("parent.md") ? Promise.reject(networkError()) : stat(filePath, signal)
+    );
+
+    const chain = resolveAgentInheritanceChain({
+      runtime,
+      workspacePath: tempDir.path,
+      agentId: "child",
+      agentDefinition: child,
+      workspaceId: "ws",
+      runtimeFactory,
+    });
+    expect(await chain.catch((error: unknown) => error)).toMatchObject({ type: "network" });
+  });
+});
+
+// #4827: a permission error is not a missing agent file either.
+test("an unreadable project agent or base neither falls back nor truncates the chain", async () => {
+  using tempDir = new DisposableTempDir("agent-unreadable");
+  const agentsDir = path.join(tempDir.path, ".xum", "agents");
+  await fs.mkdir(agentsDir, { recursive: true });
+  const agent = (name: string, base?: string) =>
+    `---\nname: ${name}\n${base ? `base: ${base}\n` : ""}---\n${name}`;
+  await fs.writeFile(path.join(agentsDir, "child.md"), agent("Child", "exec"));
+  await fs.writeFile(path.join(agentsDir, "exec.md"), agent("Project exec"));
+  const runtime = new LocalRuntime(tempDir.path);
+  const child = await readAgentDefinition(runtime, tempDir.path, "child", { runtimeFactory });
+  const stat = runtime.stat.bind(runtime);
+  spyOn(runtime, "stat").mockImplementation((filePath, signal) =>
+    filePath.endsWith("exec.md")
+      ? Promise.reject(
+          new RuntimeError(
+            `Failed to stat ${filePath}: stat: ${filePath}: Permission denied`,
+            "file_io"
+          )
+        )
+      : stat(filePath, signal)
+  );
+
+  // Before #4827 this silently resolved the built-in exec.
+  const read = readAgentDefinition(runtime, tempDir.path, "exec", { runtimeFactory });
+  expect(await read.catch((error: unknown) => error)).toMatchObject({ type: "file_io" });
+  const chain = resolveAgentInheritanceChain({
+    runtime,
+    workspacePath: tempDir.path,
+    agentId: "child",
+    agentDefinition: child,
+    workspaceId: "ws",
+    runtimeFactory,
+  });
+  expect(await chain.catch((error: unknown) => error)).toMatchObject({ type: "file_io" });
+});
+
+describe("agentDefinitionsService host filesystem", () => {
+  test("lists, contains and reads agents on the host filesystem of its RuntimeFactory", async () => {
+    // Phase 5: the reads beside the runtime (listing, plugin discovery, containment and the
+    // plugin agent read) go through the factory's HostFiles. These agents exist only on the
+    // memory host, so the Node filesystem finds neither.
+    const host = createMemoryHost();
+    const write = async (filePath: string, text: string): Promise<void> => {
+      await host.files.promises.mkdir(path.dirname(filePath), { recursive: true });
+      await host.files.promises.writeFile(filePath, text);
+    };
+    await write("/ws/.xum/agents/helper.md", "---\nname: Helper\n---\nHelp.\n");
+    const plugin = path.join(MEMORY_USER_HOME, ".agents", "plugins", "kit");
+    await write(
+      path.join(plugin, "plugin.json"),
+      JSON.stringify({
+        $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+        name: "kit",
+      })
+    );
+    await write(path.join(plugin, "agents", "reviewer.md"), "---\nname: Reviewer\n---\nReview.\n");
+    const options = { runtimeFactory: fakeRuntimeFactory(host) };
+
+    const agents = await discoverAgentDefinitions(host.runtime, "/ws", options);
+    const reviewer = await readAgentDefinition(
+      host.runtime,
+      "/ws",
+      AgentIdSchema.parse("reviewer"),
+      options
+    );
+
+    const found = agents.map((agent) => `${agent.id}:${agent.scope}`);
+    expect(found).toContain("helper:project");
+    expect(found).toContain("reviewer:global");
+    expect(reviewer.body).toContain("Review.");
   });
 });

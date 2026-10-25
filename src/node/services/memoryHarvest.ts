@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { MuxMessage } from "@/common/types/message";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import { accumulateStepsProviderMetadata } from "@/common/utils/tokens/usageHelpers";
 import assert from "@/common/utils/assert";
 import type { MemoryScopeContext, MemoryService } from "@/node/services/memoryService";
@@ -93,6 +94,10 @@ function buildHarvestChunks(messages: MuxMessage[]): HarvestChunk[] {
   }
 
   for (const message of messages) {
+    // Model-hidden rows (plan-review snapshot/resolve/reopen records) never reach provider
+    // requests; this direct streamText path must not forward their repository/model-influenced
+    // content to the Dream model and into persistent memory either.
+    if (isModelHiddenMessage(message)) continue;
     const formatted = formatMessageForHarvest(message);
     const nextMessages = [...currentMessages, formatted];
     const nextTranscript = JSON.stringify(nextMessages, null, 2);
@@ -161,6 +166,10 @@ async function writeInbox(args: {
   ctx: MemoryScopeContext;
   inboxPath: string;
   content: string;
+  /** r60: the inbox is WORKSPACE-scope — a write detached past the removal
+   * drain would recreate the deleted session directory. MemoryService
+   * re-checks this signal pre-commit inside its target mutation lock. */
+  abortSignal?: AbortSignal;
 }): Promise<void> {
   const existing = await args.memoryService.readFileWithSha(args.ctx, args.inboxPath);
   const expectedSha = existing.success ? existing.data.sha256 : null;
@@ -169,7 +178,8 @@ async function writeInbox(args: {
     args.inboxPath,
     args.content,
     expectedSha,
-    "agent"
+    "agent",
+    args.abortSignal
   );
   if (!result.success) {
     throw new Error(result.error.message);
@@ -180,10 +190,18 @@ async function deleteInboxIfPresent(args: {
   memoryService: MemoryService;
   ctx: MemoryScopeContext;
   inboxPath: string;
+  abortSignal?: AbortSignal;
 }): Promise<void> {
   const existing = await args.memoryService.readFileWithSha(args.ctx, args.inboxPath);
   if (!existing.success) return;
-  const result = await args.memoryService.deletePath(args.ctx, args.inboxPath, "agent");
+  const result = await args.memoryService.deletePath(
+    args.ctx,
+    args.inboxPath,
+    "agent",
+    undefined,
+    undefined,
+    args.abortSignal
+  );
   if (!result.success) {
     throw new Error(result.error);
   }
@@ -209,6 +227,8 @@ export async function runMemoryHarvest(args: {
     usage: LanguageModelV2Usage,
     providerMetadata?: Record<string, unknown>
   ) => Promise<void>;
+  /** Pricing identity of `model`; its long-context threshold sets each step's tier. */
+  pricingModel?: string;
 }): Promise<MemoryHarvestResult> {
   assert(args.agentBody.trim().length > 0, "harvest agent body must not be empty");
   assert(
@@ -278,7 +298,10 @@ export async function runMemoryHarvest(args: {
         inputTokens: (usage?.inputTokens ?? 0) + (totalUsage.inputTokens ?? 0),
         outputTokens: (usage?.outputTokens ?? 0) + (totalUsage.outputTokens ?? 0),
       };
-      await args.recordUsage?.(totalUsage, accumulateStepsProviderMetadata(await stream.steps));
+      await args.recordUsage?.(
+        totalUsage,
+        accumulateStepsProviderMetadata(await stream.steps, args.pricingModel)
+      );
     } catch {
       usage = undefined;
     }
@@ -290,6 +313,7 @@ export async function runMemoryHarvest(args: {
       memoryService: args.memoryService,
       ctx: args.ctx,
       inboxPath,
+      abortSignal: args.abortSignal,
     });
   }
   if (streamErrors.length === 0 && accepted.length > 0) {
@@ -302,6 +326,7 @@ export async function runMemoryHarvest(args: {
         summary: args.summary,
         candidates: accepted,
       }),
+      abortSignal: args.abortSignal,
     });
   }
 

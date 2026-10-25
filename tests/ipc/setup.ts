@@ -1,8 +1,9 @@
+import { createConfigStores } from "@/node/config";
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs/promises";
 import type { BrowserWindow, WebContents } from "electron";
-import { Config } from "../../src/node/config";
+import type { Config } from "../../src/node/config";
 import { ServiceContainer } from "../../src/node/services/serviceContainer";
 import { setOpenSSHHostKeyPolicyMode } from "../../src/node/runtime/sshConnectionPool";
 import {
@@ -58,7 +59,8 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-test-"));
 
   // Create config with temporary directory
-  const config = new Config(tempDir);
+  const stores = createConfigStores(tempDir);
+  const config = stores.config;
 
   // Some UI tests render ProjectPage, which now hard-blocks workspace creation when no providers
   // are configured. For non-integration tests, seed a dummy provider so the UI can render.
@@ -66,7 +68,7 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   // For integration tests (TEST_INTEGRATION=1), do NOT write dummy keys here (they would override
   // real env-backed credentials used by tests like name generation).
   if (!shouldRunIntegrationTests()) {
-    config.saveProvidersConfig({
+    stores.providersConfigStore.saveProvidersConfig({
       anthropic: { apiKey: "test-key-for-ui-tests" },
     });
   }
@@ -75,7 +77,7 @@ export async function createTestEnvironment(): Promise<TestEnvironment> {
   const mockWindow = createMockBrowserWindow();
 
   // Create ServiceContainer instance
-  const services = new ServiceContainer(config);
+  const services = new ServiceContainer(stores);
   // IPC tests run SSH against Docker containers with ephemeral host keys and no
   // interactive UI for host-key approval. Reset to headless-fallback so the
   // ServiceContainer's "strict" mode doesn't block Docker SSH connections.
@@ -161,11 +163,16 @@ export { shouldRunIntegrationTests, validateApiKeys, getApiKey };
  * Call this in beforeAll hooks to prevent Jest sandbox race conditions.
  */
 export async function preloadTestModules(): Promise<void> {
-  const [{ loadTokenizerModules }, { preloadAISDKProviders }] = await Promise.all([
+  const [{ loadTokenizerModules }, { PROVIDER_REGISTRY }] = await Promise.all([
     import("../../src/node/utils/main/tokenizer"),
-    import("../../src/node/services/providerModelFactory"),
+    import("../../src/common/constants/providers"),
   ]);
-  await Promise.all([loadTokenizerModules(), preloadAISDKProviders()]);
+  // Production lazy-loads AI SDK providers on first use; load them all up front so
+  // concurrent createModel() calls hit the module cache instead of racing.
+  await Promise.all([
+    loadTokenizerModules(),
+    ...Object.values(PROVIDER_REGISTRY).map((importProvider) => importProvider()),
+  ]);
 }
 
 /**
@@ -197,6 +204,7 @@ export async function setupWorkspace(
   if (provider === "ollama") {
     await setupProviders(env, {
       [provider]: {
+        // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty env var means unset
         baseUrl: process.env.OLLAMA_BASE_URL || "http://localhost:11434/api",
       },
     });
@@ -208,6 +216,7 @@ export async function setupWorkspace(
     });
   }
 
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty prefix falls back to the provider name
   const branchName = generateBranchName(branchPrefix || provider);
   const runtimeConfig = options?.runtimeConfig;
   const waitForInit = options?.waitForInit ?? false;
@@ -314,6 +323,7 @@ export async function setupWorkspaceWithoutProvider(branchPrefix?: string): Prom
 
   const env = await createTestEnvironment();
 
+  // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- an empty prefix falls back to the default
   const branchName = generateBranchName(branchPrefix || "noapi");
   const createResult = await createWorkspace(env, tempGitRepo, branchName);
 

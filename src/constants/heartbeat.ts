@@ -57,7 +57,7 @@ export interface HeartbeatSchedulePolicy {
  * `.default()` does not rewrite), and the `whenBusy` default is conditional on the resolved
  * trigger — an idle-triggered heartbeat skips busy slots (today's behavior), while a
  * fixed-interval heartbeat defaults to delivery after the current turn. Keeping unset values
- * unset in `~/.shux/config.json` also preserves the distinction between "user chose skip" and
+ * unset in `~/.xum/config.json` also preserves the distinction between "user chose skip" and
  * "user never touched it".
  *
  * Invalid/null/undefined values fall back to the defaults (self-healing for hand-edited or
@@ -118,7 +118,7 @@ export const HEARTBEAT_REMOVED_SUMMARY = "Heartbeat settings removed for this wo
 
 /** Human-readable heartbeat state, shared by the heartbeat tool result and the timeline row. */
 export function summarizeHeartbeatSettings(
-  settings: { enabled: boolean; intervalMs: number; trigger?: unknown; whenBusy?: unknown } | null
+  settings: { enabled: boolean; intervalMs?: number; trigger?: unknown; whenBusy?: unknown } | null
 ): string {
   if (!settings) {
     return "No heartbeat settings are configured for this workspace.";
@@ -128,5 +128,9 @@ export function summarizeHeartbeatSettings(
   // Mention the schedule shape only when it deviates from the default idle trigger.
   const scheduleSuffix =
     resolveHeartbeatSchedulePolicy(settings).trigger === "interval" ? " (fixed schedule)" : "";
-  return `Heartbeat is ${status} for this workspace at ${formatHeartbeatInterval(settings.intervalMs)}${scheduleSuffix}.`;
+  const interval =
+    settings.intervalMs != null
+      ? formatHeartbeatInterval(settings.intervalMs)
+      : "the global default interval";
+  return `Heartbeat is ${status} for this workspace at ${interval}${scheduleSuffix}.`;
 }

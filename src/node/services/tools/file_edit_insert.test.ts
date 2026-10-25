@@ -114,6 +114,22 @@ describe("file_edit_insert tool", () => {
     expect(await fs.readFile(testFilePath, "utf-8")).toBe(original);
   });
 
+  // #2732: a guard missing only because of whitespace names the line of the near match.
+  it("names the line of a guard that differs only in whitespace", async () => {
+    const tool = createTestTool(testDir);
+    const args: FileEditInsertToolArgs = {
+      path: path.relative(testDir, testFilePath),
+      content: "Line 4\n",
+      insert_after: "Line  3",
+    };
+
+    const result = (await tool.execute!(args, mockToolCallOptions)) as FileEditInsertToolResult;
+
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.note).toMatch(/line 2\b/u);
+    expect(await fs.readFile(testFilePath, "utf-8")).toBe("Line 1\nLine 3");
+  });
+
   it("fails when both insert_before and insert_after are provided", async () => {
     const tool = createTestTool(testDir);
     const args: FileEditInsertToolArgs = {

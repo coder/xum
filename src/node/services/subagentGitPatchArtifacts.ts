@@ -1,14 +1,15 @@
 import * as fsPromises from "fs/promises";
 import * as path from "node:path";
 
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 import type {
   SubagentGitPatchArtifact,
   SubagentGitProjectPatchArtifact,
 } from "@/common/utils/tools/toolDefinitions";
 import { log } from "@/node/services/log";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 export interface SubagentGitPatchArtifactsFile {
   version: 2;
@@ -239,6 +240,11 @@ function normalizeArtifactsByChildTaskId(
         throw new Error(`Invalid subagent git patch artifact for task ${childTaskId}`);
       }
 
+      // The map key, not the entry's own childTaskId, names the patch folder
+      // (getSubagentGitPatchMboxPath), so it needs the same path check. A bad
+      // key skips only its own entry instead of failing every later write.
+      assertSafeSubagentGitPatchPathComponent(childTaskId, "childTaskId key");
+
       const normalizedArtifact =
         version === 1
           ? normalizeLegacyArtifact(artifact as LegacySubagentGitPatchArtifactV1)
@@ -343,8 +349,12 @@ export async function updateSubagentGitPatchArtifactsFile(params: {
   workspaceId: string;
   workspaceSessionDir: string;
   update: (file: SubagentGitPatchArtifactsFile) => void;
+  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<SubagentGitPatchArtifactsFile> {
-  return workspaceFileLocks.withLock(params.workspaceId, async () => {
+  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
+  const fileLocks = (params.locks ?? nodeSessionLocks).workspaceFiles;
+  return fileLocks.withLock(params.workspaceId, async () => {
     const file = await readSubagentGitPatchArtifactsFile(params.workspaceSessionDir);
     params.update(file);
     file.version = SUBAGENT_GIT_PATCH_ARTIFACTS_FILE_VERSION;
@@ -370,12 +380,15 @@ export async function upsertSubagentGitPatchArtifact(params: {
   workspaceSessionDir: string;
   childTaskId: string;
   updater: (existing: SubagentGitPatchArtifact | null) => SubagentGitPatchArtifact;
+  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<SubagentGitPatchArtifact> {
   let updated: SubagentGitPatchArtifact | null = null;
 
   await updateSubagentGitPatchArtifactsFile({
     workspaceId: params.workspaceId,
     workspaceSessionDir: params.workspaceSessionDir,
+    locks: params.locks,
     update: (file) => {
       const existing = file.artifactsByChildTaskId[params.childTaskId] ?? null;
       updated = normalizeSubagentGitPatchArtifact(params.updater(existing));
@@ -396,12 +409,15 @@ export async function markSubagentGitPatchArtifactApplied(params: {
   childTaskId: string;
   projectPath: string;
   appliedAtMs: number;
+  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<SubagentGitPatchArtifact | null> {
   let updated: SubagentGitPatchArtifact | null = null;
 
   await updateSubagentGitPatchArtifactsFile({
     workspaceId: params.workspaceId,
     workspaceSessionDir: params.workspaceSessionDir,
+    locks: params.locks,
     update: (file) => {
       const existing = file.artifactsByChildTaskId[params.childTaskId] ?? null;
       if (!existing) {

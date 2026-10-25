@@ -1,4 +1,10 @@
-import React, { createContext, useCallback, useContext, useMemo, useState } from "react";
+import React, { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  COMMAND_PALETTE_RECENT_KEY,
+  COMMAND_PALETTE_RECENT_MAX_ENTRIES,
+} from "@/common/constants/storage";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
 
 export interface CommandAction {
   id: string;
@@ -72,35 +78,32 @@ export function useCommandRegistry(): CommandRegistryContextValue {
   return ctx;
 }
 
-const RECENT_STORAGE_KEY = "commandPalette:recent";
-
 export const CommandRegistryProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [initialQuery, setInitialQuery] = useState("");
   const [sources, setSources] = useState<Set<CommandSource>>(new Set());
   const [recent, setRecent] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem(RECENT_STORAGE_KEY);
-      const parsed = raw ? (JSON.parse(raw) as string[]) : [];
-      return Array.isArray(parsed) ? parsed.slice(0, 20) : [];
-    } catch {
-      return [];
-    }
+    const parsed = readPersistedState<unknown>(COMMAND_PALETTE_RECENT_KEY, []);
+    return Array.isArray(parsed)
+      ? (parsed as string[]).slice(0, COMMAND_PALETTE_RECENT_MAX_ENTRIES)
+      : [];
   });
 
   const persistRecent = useCallback((next: string[]) => {
     setRecent(next);
-    try {
-      localStorage.setItem(RECENT_STORAGE_KEY, JSON.stringify(next.slice(0, 20)));
-    } catch {
-      /* ignore persistence errors */
-    }
+    updatePersistedState(
+      COMMAND_PALETTE_RECENT_KEY,
+      next.slice(0, COMMAND_PALETTE_RECENT_MAX_ENTRIES)
+    );
   }, []);
 
   const addRecent = useCallback(
     (actionId: string) => {
       // Move to front, dedupe
-      const next = [actionId, ...recent.filter((id) => id !== actionId)].slice(0, 20);
+      const next = [actionId, ...recent.filter((id) => id !== actionId)].slice(
+        0,
+        COMMAND_PALETTE_RECENT_MAX_ENTRIES
+      );
       persistRecent(next);
     },
     [recent, persistRecent]
@@ -137,6 +140,23 @@ export const CommandRegistryProvider: React.FC<{ children: React.ReactNode }> = 
     }
     return all;
   }, [sources]);
+
+  // EXECUTE_COMMAND runs a command by ID with the palette closed. It lives here, not in the
+  // palette, because the palette module loads only on its first open (#6997).
+  useEffect(() => {
+    const handleExecuteCommand = (e: Event) => {
+      const { commandId } = (e as CustomEvent<{ commandId: string }>).detail;
+      const action = getActions().find((a) => a.id === commandId);
+      if (!action) {
+        console.warn(`Command not found: ${commandId}`);
+        return;
+      }
+      void action.run();
+      addRecent(action.id);
+    };
+    window.addEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
+    return () => window.removeEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
+  }, [getActions, addRecent]);
 
   const value = useMemo(
     () => ({

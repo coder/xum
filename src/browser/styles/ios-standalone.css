@@ -1,0 +1,7 @@
+@custom-variant ios-standalone {
+  @media (display-mode: standalone) {
+    @supports (-webkit-touch-callout: none) {
+      @slot;
+    }
+  }
+}

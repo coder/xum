@@ -1,9 +1,10 @@
-import * as fs from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 
 import * as jsonc from "jsonc-parser";
 import type { z } from "zod";
-import writeFileAtomic from "write-file-atomic";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 import {
   CONFIG_FILE_REGISTRY,
@@ -36,22 +37,23 @@ interface JsonParseErrorLike {
   message?: unknown;
 }
 
-function getConfigDocumentPath(muxHomeDir: string, fileKey: ConfigFileKey): string {
+function getConfigDocumentPath(xumHomeDir: string, fileKey: ConfigFileKey): string {
   const entry = CONFIG_FILE_REGISTRY[fileKey];
-  return path.join(muxHomeDir, entry.fileName);
+  return path.join(xumHomeDir, entry.fileName);
 }
 
 // Shared parse-only logic: reads file from disk, returns raw parsed object (no schema validation).
 async function readParsedConfigDocument(
-  muxHomeDir: string,
-  fileKey: ConfigFileKey
+  xumHomeDir: string,
+  fileKey: ConfigFileKey,
+  files: HostFiles
 ): Promise<unknown> {
   const entry = CONFIG_FILE_REGISTRY[fileKey];
-  const filePath = getConfigDocumentPath(muxHomeDir, fileKey);
+  const filePath = getConfigDocumentPath(xumHomeDir, fileKey);
 
   let raw: string;
   try {
-    raw = await fs.readFile(filePath, "utf-8");
+    raw = await files.promises.readFile(filePath, "utf-8");
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
       return {};
@@ -67,17 +69,23 @@ async function readParsedConfigDocument(
 
 // Parse-only read for mutation workflows: schema validation is deferred
 // until after mutations are applied, allowing writes to repair invalid configs.
+// `files` defaults to the host. Tests pass the memory layer (configReadWrite.test.ts).
 export async function readConfigDocumentUnvalidated(
-  muxHomeDir: string,
-  fileKey: ConfigFileKey
+  xumHomeDir: string,
+  fileKey: ConfigFileKey,
+  files: HostFiles = nodeHostFiles
 ): Promise<unknown> {
-  return readParsedConfigDocument(muxHomeDir, fileKey);
+  return readParsedConfigDocument(xumHomeDir, fileKey, files);
 }
 
 // Prevent writes from escaping the mux config boundary via symlinked targets.
-async function assertWritableConfigTarget(filePath: string, fileKey: ConfigFileKey): Promise<void> {
+async function assertWritableConfigTarget(
+  filePath: string,
+  fileKey: ConfigFileKey,
+  files: HostFiles
+): Promise<void> {
   try {
-    const stat = await fs.lstat(filePath);
+    const stat = await files.promises.lstat(filePath);
     if (stat.isSymbolicLink()) {
       throw new Error(`Refusing to write symlinked mux config target for "${fileKey}"`);
     }
@@ -91,20 +99,31 @@ async function assertWritableConfigTarget(filePath: string, fileKey: ConfigFileK
 }
 
 export async function writeConfigDocument<TKey extends ConfigFileKey>(
-  muxHomeDir: string,
+  xumHomeDir: string,
   fileKey: TKey,
-  document: unknown
+  document: unknown,
+  files: HostFiles = nodeHostFiles
 ): Promise<ConfigDocumentFor<TKey>> {
   const entry = CONFIG_FILE_REGISTRY[fileKey];
-  const filePath = getConfigDocumentPath(muxHomeDir, fileKey);
-  const validatedDocument = parseAndValidateDocument(fileKey, entry.schema, document, filePath);
+  const filePath = getConfigDocumentPath(xumHomeDir, fileKey);
+  // config.json carries a per-save write stamp (see Config.configFileWriteGeneration). A raw
+  // rewrite refreshes it like a Config save does — the document read from disk carries the
+  // previous one — or a reader comparing generations around this write would not see it.
+  const stamped =
+    fileKey === "config" &&
+    typeof document === "object" &&
+    document !== null &&
+    !Array.isArray(document)
+      ? { ...document, writeId: randomUUID() }
+      : document;
+  const validatedDocument = parseAndValidateDocument(fileKey, entry.schema, stamped, filePath);
   const serialized = JSON.stringify(validatedDocument, null, 2);
 
-  await fs.mkdir(muxHomeDir, { recursive: true });
-  await assertWritableConfigTarget(filePath, fileKey);
+  await files.promises.mkdir(xumHomeDir, { recursive: true });
+  await assertWritableConfigTarget(filePath, fileKey, files);
 
   if (entry.fileKind === "jsonc") {
-    writeFileAtomic.sync(filePath, `${PROVIDERS_JSONC_COMMENT_HEADER}${serialized}`, {
+    files.writeFileAtomicSync(filePath, `${PROVIDERS_JSONC_COMMENT_HEADER}${serialized}`, {
       encoding: "utf-8",
       mode: 0o600,
     });
@@ -112,7 +131,7 @@ export async function writeConfigDocument<TKey extends ConfigFileKey>(
     return validatedDocument;
   }
 
-  await writeFileAtomic(filePath, serialized, "utf-8");
+  await files.writeFileAtomic(filePath, serialized, { encoding: "utf-8" });
   return validatedDocument;
 }
 

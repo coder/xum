@@ -28,7 +28,6 @@ interface RefreshButtonProps {
 const TRIGGER_LABELS: Record<RefreshTrigger, string> = {
   manual: "manual click",
   scheduled: "tool completion",
-  priority: "tool completion (priority)",
   focus: "window focus",
   visibility: "tab visible",
   unpaused: "interaction ended",
@@ -120,7 +119,7 @@ export const RefreshButton: React.FC<RefreshButtonProps> = (props) => {
             disabled
               ? "text-muted/40 cursor-not-allowed"
               : animationState === "spinning"
-                ? "text-accent cursor-default hover:text-accent"
+                ? "text-accent-text cursor-default hover:text-accent-text"
                 : refreshStatus === "error"
                   ? "text-danger-soft cursor-pointer hover:text-foreground"
                   : "text-muted cursor-pointer hover:text-foreground",

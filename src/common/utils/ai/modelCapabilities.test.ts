@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { getModelCapabilities, getSupportedInputMediaTypes } from "./modelCapabilities";
+import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { extractModelCapabilities, getModelCapabilities } from "./modelCapabilities";
 
 describe("getModelCapabilities", () => {
   it("returns capabilities for known models", () => {
@@ -23,6 +24,15 @@ describe("getModelCapabilities", () => {
     expect(caps?.supportsPdfInput).toBe(true);
   });
 
+  it("keeps PDF and image input for the haiku alias after it moved off a models.json entry", () => {
+    // Haiku 4.5 got supports_pdf_input from models.json; Haiku 5.5 exists only in
+    // models-extra, so a missing flag there rejects PDF attachments on the alias.
+    const caps = getModelCapabilities(KNOWN_MODELS.HAIKU.id);
+    expect(caps).not.toBeNull();
+    expect(caps?.supportsPdfInput).toBe(true);
+    expect(caps?.supportsVision).toBe(true);
+  });
+
   it("resolves provider key aliases (github-copilot -> github_copilot)", () => {
     const caps = getModelCapabilities("github-copilot:gpt-41-copilot");
     expect(caps).not.toBeNull();
@@ -42,6 +52,15 @@ describe("getModelCapabilities", () => {
     }
   });
 
+  it("reports image-only multimodal input for GLM 5.3 Flash", () => {
+    const caps = getModelCapabilities("zai:glm-5.3-flash");
+
+    expect(caps).not.toBeNull();
+    expect(caps?.supportsVision).toBe(true);
+    expect(caps?.supportsPdfInput).toBe(false);
+    expect(caps?.supportsVideoInput).toBe(false);
+  });
+
   it("infers PDF support for OpenAI vision models when models-extra omits the flag", () => {
     const caps = getModelCapabilities("openai:gpt-5.5");
     expect(caps).not.toBeNull();
@@ -49,11 +68,12 @@ describe("getModelCapabilities", () => {
     expect(caps?.supportsVision).toBe(true);
   });
 
-  it("returns maxPdfSizeMb when present in model metadata", () => {
-    const caps = getModelCapabilities("google:gemini-1.5-flash");
-    expect(caps).not.toBeNull();
-    expect(caps?.supportsPdfInput).toBe(true);
-    expect(caps?.maxPdfSizeMb).toBeGreaterThan(0);
+  it("returns maxPdfSizeMb and infers PDF support when metadata carries the field", () => {
+    // Injected metadata: upstream LiteLLM dropped max_pdf_size_mb, but
+    // models-extra overrides can still supply it.
+    const caps = extractModelCapabilities({ max_pdf_size_mb: 30 });
+    expect(caps.supportsPdfInput).toBe(true);
+    expect(caps.maxPdfSizeMb).toBe(30);
   });
 
   it("returns multimodal capabilities for Gemini 3.5 Flash", () => {
@@ -67,19 +87,5 @@ describe("getModelCapabilities", () => {
 
   it("returns null for unknown models", () => {
     expect(getModelCapabilities("anthropic:this-model-does-not-exist")).toBeNull();
-  });
-});
-
-describe("getSupportedInputMediaTypes", () => {
-  it("includes pdf when model supports_pdf_input is true", () => {
-    const supported = getSupportedInputMediaTypes("anthropic:claude-sonnet-4-5");
-    expect(supported).not.toBeNull();
-    expect(supported?.has("pdf")).toBe(true);
-  });
-
-  it("includes pdf for OpenAI vision models that rely on the fallback", () => {
-    const supported = getSupportedInputMediaTypes("openai:gpt-5.5");
-    expect(supported).not.toBeNull();
-    expect(supported?.has("pdf")).toBe(true);
   });
 });

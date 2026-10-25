@@ -51,7 +51,7 @@ Re-read actual state immediately before every create/update operation. If the st
 Before dispatching a task or workflow, decide whether the loop's next decision depends on its result:
 
 - **Depends on the result:** use foreground/default mode (`run_in_background` omitted or `false`), or explicitly `task_await` the returned ID before continuing.
-- **Does not depend on the result:** use `run_in_background: true`. Shux treats background work as non-blocking (internal `notify_on_terminal` policy) and wakes the workspace later with the result; you do not need to force-await it just to end the turn.
+- **Does not depend on the result:** use `run_in_background: true`. Xum treats background work as non-blocking (internal `notify_on_terminal` policy) and wakes the workspace later with the result; you do not need to force-await it just to end the turn.
 
 After background dispatch, record the spawned task/workflow IDs and any convergence condition in your response or ledger. If no useful parent-side work remains, stop instead of polling; treat the terminal wake-up as the next reconciliation event.
 
@@ -61,7 +61,7 @@ Do not use background dispatch to hide an unbounded polling loop — record the 
 
 When the loop's purpose is to wake only when a condition changes, read `background-monitors` and choose based on the signal source:
 
-- If the condition is a complete line from one long-running shell command (dev server ready, watch-test failure, log panic), use `bash({ run_in_background: true, monitor: ... })`.
+- If the condition is a complete line from one long-running shell command (dev server ready, watch-test failure, log panic), use `bash({ run_in_background: true, monitor: ... })`. A monitored process also wakes the owner when it settles (exit, kill, timeout) — unless `wake_on_exit: false`, the monitor was retired by `max_events`, or the task was explicitly cancelled via `task_stop` — so a watcher that dies without matching cannot strand the loop.
 - If the condition requires polling external state with repeated commands/API calls (CI finished, mergeability changed, review arrived, deployment became healthy), use a bounded background task or workflow that performs the polling internally and completes with a report.
 
 Use raw `bash(run_in_background=true)` without `monitor` only when you plan to explicitly retrieve output with `task_await`; it will not wake the parent just because it prints output or exits.

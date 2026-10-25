@@ -39,7 +39,10 @@ class TestBridge implements VscodeBridge {
   }
 }
 
-function getLastSent(bridge: TestBridge, type: WebviewToExtensionMessage["type"]): WebviewToExtensionMessage {
+function getLastSent(
+  bridge: TestBridge,
+  type: WebviewToExtensionMessage["type"]
+): WebviewToExtensionMessage {
   const msg = [...bridge.sent].reverse().find((m) => m.type === type);
   if (!msg) {
     throw new Error(`Expected a message of type ${type}`);
@@ -52,7 +55,11 @@ describe("createVscodeOrpcLink", () => {
     const bridge = new TestBridge();
     const link = createVscodeOrpcLink(bridge, { callTimeoutMs: 1_000 });
 
-    const promise = link.call(["workspace", "sendMessage"], { workspaceId: "w", message: "hi" }, {} as any);
+    const promise = link.call(
+      ["workspace", "sendMessage"],
+      { workspaceId: "w", message: "hi" },
+      {} as any
+    );
 
     const callMsg = getLastSent(bridge, "orpcCall") as any;
     bridge.emit({
@@ -100,7 +107,7 @@ describe("createVscodeOrpcLink", () => {
     const bridge = new TestBridge();
     const link = createVscodeOrpcLink(bridge, { callTimeoutMs: 1_000 });
 
-    const promise = link.call(["general", "tick"], { count: 2, intervalMs: 1 }, {} as any);
+    const promise = link.call(["providers", "onConfigChanged"], undefined, {} as any);
 
     const callMsg = getLastSent(bridge, "orpcCall") as any;
     bridge.emit({
@@ -129,7 +136,7 @@ describe("createVscodeOrpcLink", () => {
     const bridge = new TestBridge();
     const link = createVscodeOrpcLink(bridge, { callTimeoutMs: 1_000, maxBufferedStreamEvents: 1 });
 
-    const promise = link.call(["general", "tick"], { count: 2, intervalMs: 1 }, {} as any);
+    const promise = link.call(["providers", "onConfigChanged"], undefined, {} as any);
 
     const callMsg = getLastSent(bridge, "orpcCall") as any;
     bridge.emit({

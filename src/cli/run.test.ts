@@ -1,5 +1,5 @@
 /**
- * Integration tests for `shux run` CLI command.
+ * Integration tests for `xum run` CLI command.
  *
  * These tests verify the CLI interface without actually running agent sessions.
  * They test argument parsing, help output, and error handling.
@@ -83,15 +83,11 @@ async function runCliWithClosedStdin(args: string[], timeoutMs = 5000): Promise<
  * Run run.ts directly with stdin closed to avoid hanging.
  * Passes empty stdin to simulate non-TTY invocation without input.
  */
-async function runRunDirect(
-  args: string[],
-  timeoutMs = 5000,
-  env: Record<string, string> = {}
-): Promise<ExecResult> {
+async function runRunDirect(args: string[], timeoutMs = 5000): Promise<ExecResult> {
   return new Promise((resolve) => {
     const proc = spawn("bun", [RUN_PATH, ...args], {
       timeout: timeoutMs,
-      env: { ...process.env, NO_COLOR: "1", ...env },
+      env: { ...process.env, NO_COLOR: "1" },
       stdio: ["pipe", "pipe", "pipe"], // stdin, stdout, stderr
     });
 
@@ -119,7 +115,7 @@ async function runRunDirect(
   });
 }
 
-describe("shux CLI", () => {
+describe("xum CLI", () => {
   beforeAll(() => {
     // Verify CLI files exist
     expect(Bun.file(CLI_PATH).size).toBeGreaterThan(0);
@@ -130,8 +126,8 @@ describe("shux CLI", () => {
     test("--help shows usage", async () => {
       const result = await runCli(["--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Usage: shux");
-      expect(result.stdout).toContain("Shux - AI agent orchestration");
+      expect(result.stdout).toContain("Usage: xum");
+      expect(result.stdout).toContain("Xum - AI agent orchestration");
       expect(result.stdout).toContain("run");
       expect(result.stdout).toContain("server");
     });
@@ -150,11 +146,11 @@ describe("shux CLI", () => {
     });
   });
 
-  describe("shux run", () => {
+  describe("xum run", () => {
     test("--help shows all options", async () => {
       const result = await runCli(["run", "--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Usage: shux run");
+      expect(result.stdout).toContain("Usage: xum run");
       expect(result.stdout).toContain("--dir");
       expect(result.stdout).toContain("--model");
       expect(result.stdout).toContain("--runtime");
@@ -171,7 +167,7 @@ describe("shux CLI", () => {
     test("shows default model as opus", async () => {
       const result = await runCli(["run", "--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("anthropic:claude-opus-5");
+      expect(result.stdout).toContain("anthropic:claude-opus-5-5");
     });
 
     test("--service-tier has no default auto", async () => {
@@ -248,6 +244,53 @@ describe("shux CLI", () => {
       expect(result.output).toContain("Invalid mode");
     });
 
+    test("experiment unsupported in headless runs shows error", async () => {
+      // agent-browser is a real experiment ID that a headless run does not
+      // support, so the CLI must reject it loudly instead of ignoring it.
+      const result = await runRunDirect(["-e", "agent-browser", "test message"]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain('Unknown or unsupported experiment "agent-browser"');
+    });
+
+    test("Object.prototype property names are rejected as experiments", async () => {
+      // Object.prototype names must not pass the supported-ID check.
+      const result = await runRunDirect(["-e", "constructor", "test message"]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).toContain('Unknown or unsupported experiment "constructor"');
+    });
+
+    test("rlm-mode experiment is accepted", async () => {
+      // Use a nonexistent dir so the run fails AFTER experiment parsing
+      // without starting a session.
+      const result = await runRunDirect([
+        "-e",
+        "rlm-mode",
+        "-e",
+        "programmatic-tool-calling",
+        "--dir",
+        "/nonexistent/path/that/does/not/exist",
+        "test message",
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).not.toContain("Unknown or unsupported experiment");
+    });
+
+    test("promoted and retired experiment IDs are accepted as no-ops", async () => {
+      const result = await runRunDirect([
+        "-e",
+        "advisor-tool",
+        "-e",
+        "tool-search",
+        "-e",
+        "workspace-heartbeats",
+        "--dir",
+        "/nonexistent/path/that/does/not/exist",
+        "test message",
+      ]);
+      expect(result.exitCode).toBe(1);
+      expect(result.output).not.toContain("Unknown or unsupported experiment");
+    });
+
     test("nonexistent directory shows error", async () => {
       const result = await runRunDirect([
         "--dir",
@@ -316,48 +359,13 @@ describe("shux CLI", () => {
       // Verify it got past argument parsing to directory validation
       expect(result.exitCode).toBe(1);
     });
-
-    // Regression: headless `shux run` must initialize PolicyService and thread it
-    // through the core service graph like the desktop wiring. Without it, a
-    // stored credential for a provider that MUX_POLICY_FILE / Shux Governor now
-    // denies would remain usable from the CLI. The request must fail closed
-    // before any provider network call (the configured API key is fake).
-    test("enforces MUX_POLICY_FILE provider denials", async () => {
-      const tmpBase = await fs.mkdtemp(path.join(os.tmpdir(), "mux-run-policy-"));
-      try {
-        const muxRoot = path.join(tmpBase, "mux-root");
-        const projectDir = path.join(tmpBase, "project");
-        await fs.mkdir(muxRoot, { recursive: true });
-        await fs.mkdir(projectDir, { recursive: true });
-        await fs.writeFile(
-          path.join(muxRoot, "providers.jsonc"),
-          JSON.stringify({ anthropic: { apiKey: "fake-key-policy-test" } })
-        );
-        const policyPath = path.join(muxRoot, "policy.json");
-        await fs.writeFile(
-          policyPath,
-          JSON.stringify({ policy_format_version: "0.1", provider_access: [{ id: "openai" }] })
-        );
-
-        const result = await runRunDirect(
-          ["say hi", "--model", "anthropic:claude-opus-5", "--dir", projectDir],
-          30000,
-          { MUX_ROOT: muxRoot, MUX_POLICY_FILE: policyPath }
-        );
-
-        expect(result.output).toContain("Provider anthropic is not allowed by policy");
-        expect(result.exitCode).toBe(1);
-      } finally {
-        await fs.rm(tmpBase, { recursive: true, force: true });
-      }
-    });
   });
 
-  describe("shux server", () => {
+  describe("xum server", () => {
     test("--help shows all options", async () => {
       const result = await runCli(["server", "--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Usage: shux server");
+      expect(result.stdout).toContain("Usage: xum server");
       expect(result.stdout).toContain("--host");
       expect(result.stdout).toContain("--port");
       expect(result.stdout).toContain("--auth-token");
@@ -368,11 +376,11 @@ describe("shux CLI", () => {
     });
   });
 
-  describe("shux acp", () => {
+  describe("xum acp", () => {
     test("--help shows ACP options", async () => {
       const result = await runCli(["acp", "--help"]);
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain("Usage: shux acp");
+      expect(result.stdout).toContain("Usage: xum acp");
       expect(result.stdout).toContain("--server-url");
       expect(result.stdout).toContain("--auth-token");
       expect(result.stdout).toContain("--log-file");

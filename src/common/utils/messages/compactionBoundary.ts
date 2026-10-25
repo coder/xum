@@ -5,10 +5,11 @@ import {
 } from "@/common/constants/contextBoundary";
 import { isPositiveInteger } from "@/common/utils/numbers";
 import { hasProviderReplayableContent } from "@/common/utils/messages/providerEligibility";
+import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 
 import type { MuxMessage } from "@/common/types/message";
 
-export { CONTEXT_BOUNDARY_KINDS, type ContextBoundaryKind };
+export { CONTEXT_BOUNDARY_KINDS };
 
 export function isDurableCompactedMarker(
   value: unknown
@@ -72,6 +73,15 @@ export function isDurableContextBoundaryMarker(message: MuxMessage | undefined):
 }
 
 /**
+ * Rows that may follow a compaction summary while its pendingFollowUp is still dispatchable:
+ * keep-recent tail copies and model-hidden records. Any other row after the summary proves the
+ * follow-up was consumed (its dispatched user row) or dropped as stale.
+ */
+export function leavesCompactionFollowUpPending(message: MuxMessage): boolean {
+  return message.metadata?.rlmPreservedTailCopy === true || isModelHiddenMessage(message);
+}
+
+/**
  * Locate the latest durable context boundary in reverse chronological order.
  *
  * Returns the index of the newest message tagged with valid boundary metadata,
@@ -128,17 +138,23 @@ export function sliceMessagesFromLatestCompactionBoundary(messages: MuxMessage[]
   return sliced;
 }
 
-export function isProviderEligibleMessage(message: MuxMessage): boolean {
+export function isProviderEligibleMessage(
+  message: MuxMessage,
+  options?: Parameters<typeof hasProviderReplayableContent>[1]
+): boolean {
   if (isDurableContextResetBoundaryMarker(message)) {
     return false;
   }
 
-  return hasProviderReplayableContent(message);
+  return hasProviderReplayableContent(message, options);
 }
 
-export function hasProviderEligibleMessages(messages: MuxMessage[]): boolean {
+export function hasProviderEligibleMessages(
+  messages: MuxMessage[],
+  options?: Parameters<typeof hasProviderReplayableContent>[1]
+): boolean {
   assert(Array.isArray(messages), "hasProviderEligibleMessages requires a message array");
-  return messages.some(isProviderEligibleMessage);
+  return messages.some((message) => isProviderEligibleMessage(message, options));
 }
 
 /**

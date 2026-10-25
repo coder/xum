@@ -1,6 +1,12 @@
 import { z } from "zod";
 
 import { BackgroundWorkAttentionPolicySchema } from "@/common/types/backgroundWorkAttention";
+import {
+  EvaluationAdmissionSchema,
+  EvaluationStepFailureCodeSchema,
+  EvaluationStepFailureReasonSchema,
+  EvaluationStepResultSchema,
+} from "@/common/types/evaluation";
 
 export const WorkflowNameSchema = z
   .string()
@@ -31,7 +37,15 @@ export const WorkflowRunStatusSchema = z.enum([
   "failed",
 ]);
 
-const IsoDateTimeSchema = z.string().datetime({ offset: true });
+// zod >= 4.5 rejects minute-precision datetimes with a zone ("2026-05-29T00:01Z"), which zod
+// 4.4 accepted. Writers use toISOString (always with seconds), but persisted run.json and
+// journal records from before or from other writers must stay readable: an unreadable run.json
+// makes createRunIfAbsent treat the run as half-created and delete it. This is zod's
+// documented union for accepting both precisions.
+const IsoDateTimeSchema = z.union([
+  z.iso.datetime({ offset: true }),
+  z.iso.datetime({ offset: true, precision: -1 }),
+]);
 export const JsonValueSchema: z.ZodType<unknown> = z.lazy(() =>
   z.union([
     z.string(),
@@ -60,6 +74,38 @@ export const WorkflowArgSummarySchema = z
   })
   .strict();
 
+// Limits for statically-declared workflow phases (meta.phases). Enforced both by
+// parseDeclaredPhases (run-start validation) and by this wire schema so the two
+// validators cannot drift.
+export const WORKFLOW_DECLARED_PHASES_MAX = 64;
+export const WORKFLOW_PHASE_NAME_MAX_LENGTH = 120;
+export const WORKFLOW_PHASE_DESCRIPTION_MAX_LENGTH = 500;
+
+export const WorkflowDeclaredPhaseSchema = z
+  .object({
+    /** Must match the string passed to phase(name) at runtime. */
+    name: z.string().min(1).max(WORKFLOW_PHASE_NAME_MAX_LENGTH),
+    label: z.string().min(1).max(WORKFLOW_PHASE_NAME_MAX_LENGTH).optional(),
+    description: z.string().min(1).max(WORKFLOW_PHASE_DESCRIPTION_MAX_LENGTH).optional(),
+    /** Renders a fan-out badge; purely presentational in v1. */
+    parallel: z.boolean().optional(),
+  })
+  // Unknown keys are errors to keep the namespace free for future flow metadata.
+  .strict();
+
+/**
+ * Derived phase manifest hydrated onto outbound workflow payloads at the API
+ * boundary (never persisted to run.json — see WorkflowRunStore.writeRunFile).
+ * "declared" comes from meta.phases; "inferred" from best-effort static analysis
+ * of phase() callsites in legacy scripts without a declaration.
+ */
+export const WorkflowPhaseManifestSchema = z
+  .object({
+    provenance: z.enum(["declared", "inferred"]),
+    phases: z.array(WorkflowDeclaredPhaseSchema).min(1).max(WORKFLOW_DECLARED_PHASES_MAX),
+  })
+  .strict();
+
 export const WorkflowScriptDescriptorSchema = z
   .object({
     name: WorkflowNameSchema,
@@ -70,8 +116,21 @@ export const WorkflowScriptDescriptorSchema = z
     canonicalScriptPath: z.string().min(1).optional(),
     sourceKind: z.enum(["skill", "workspace-file", "inline", "plugin"]).optional(),
     sourceHash: z.string().min(1).optional(),
+    /**
+     * Where a non-built-in `skill://` script came from (#6826): the plugin's name, or `null` for a
+     * skill outside any plugin. A stored run resumes only while the skill of that name still comes
+     * from there. Absent on legacy records and on other sources: those keep the name + scope check.
+     * An older Xum strips it (non-strict object), so its rewrite turns the record legacy.
+     */
+    skillPluginName: z.string().min(1).nullable().optional(),
     executable: z.boolean(),
     blockedReason: z.string().min(1).optional(),
+    /**
+     * Hydrated on read; never written to disk. `null` means "hydrated, none
+     * derivable"; absent means the snapshot predates hydration (pre-upgrade
+     * tool output) and a client may fetch the hydrated record once.
+     */
+    phaseManifest: WorkflowPhaseManifestSchema.nullish(),
   })
   .refine((value) => value.executable || value.blockedReason != null, {
     message: "Non-executable workflow scripts must include a blocked reason",
@@ -181,6 +240,30 @@ export const WorkflowRunEventSchema = z.discriminatedUnion("type", [
     success: z.boolean(),
     message: z.string().min(1).optional(),
   }),
+  // Progress of a workflow `evaluate()` step. Display data only: the admission
+  // on the step record is the source of truth for resume/replay. `title`,
+  // `modelString` and `responseModelId` are untrusted display metadata (author
+  // or provider text) and must only ever be rendered through React escaping,
+  // never interpolated into anything a model reads automatically.
+  z.object({
+    sequence: z.number().int().positive(),
+    type: z.literal("evaluation"),
+    at: IsoDateTimeSchema,
+    stepId: z.string().min(1),
+    inputHash: z.string().min(1),
+    attempt: z.number().int().positive(),
+    status: z.enum(["started", "completed", "failed", "cached"]),
+    title: z.string().min(1).optional(),
+    modelString: z.string().min(1).optional(),
+    responseModelId: z.string().min(1).optional(),
+    usage: EvaluationStepResultSchema.shape.usage.optional(),
+    stateBytes: z.number().int().nonnegative().optional(),
+    questionCount: z.number().int().positive().optional(),
+    reason: EvaluationStepFailureReasonSchema.optional(),
+    code: EvaluationStepFailureCodeSchema.optional(),
+    statusCode: z.number().int().optional(),
+    defect: z.boolean().optional(),
+  }),
   z.object({
     sequence: z.number().int().positive(),
     type: z.literal("result"),
@@ -235,29 +318,13 @@ export const WorkflowStepRecordSchema = z.object({
   result: StructuredTaskOutputSchema.optional(),
   timeout: WorkflowStepTimeoutMetadataSchema.optional(),
   error: z.string().min(1).optional(),
+  // Present on every record of an `evaluate()` step (absent on agent/patch
+  // records). Written atomically with the `started` record and carried on the
+  // later `completed`/`failed` record so the latest-wins merge always retains
+  // the admitted selection; resume re-validates against it instead of the
+  // current Settings default.
+  evaluation: EvaluationAdmissionSchema.optional(),
 });
-
-const WorkflowRunStatusTransitions: Record<
-  z.infer<typeof WorkflowRunStatusSchema>,
-  ReadonlyArray<z.infer<typeof WorkflowRunStatusSchema>>
-> = {
-  pending: ["running", "backgrounded", "interrupted", "failed"],
-  running: ["backgrounded", "interrupted", "completed", "failed"],
-  backgrounded: ["running", "interrupted", "completed", "failed"],
-  interrupted: ["running", "failed"],
-  completed: [],
-  failed: [],
-};
-
-export const WorkflowRunStatusTransitionSchema = z
-  .object({
-    from: WorkflowRunStatusSchema,
-    to: WorkflowRunStatusSchema,
-  })
-  .refine((transition) => WorkflowRunStatusTransitions[transition.from].includes(transition.to), {
-    message: "Invalid workflow run status transition",
-    path: ["to"],
-  });
 
 export const WorkflowRunParentSchema = z
   .object({
@@ -309,4 +376,10 @@ export const AvailableWorkflowSchema = z.object({
   descriptor: WorkflowScriptDescriptorSchema,
   scriptPath: z.string().min(1),
   args: z.array(WorkflowArgSummarySchema),
+  /**
+   * Present when the script declares meta.phases but the declaration is invalid.
+   * Discovery never fails for this; the launcher shows the warning and no phase
+   * preview (run creation will reject with the same issues).
+   */
+  phaseManifestWarning: z.string().min(1).optional(),
 });

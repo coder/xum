@@ -36,6 +36,12 @@ export const WORKFLOW_TONE_VAR: Record<WorkflowTone, string> = {
   destructive: "var(--color-danger)",
 };
 
+/** Tone → CSS color for text. Light-theme success green is below WCAG AA as text (#6882). */
+export const WORKFLOW_TONE_TEXT_VAR: Record<WorkflowTone, string> = {
+  ...WORKFLOW_TONE_VAR,
+  success: "var(--color-success-text)",
+};
+
 export function getWorkflowStepTone(status: WorkflowStepDisplayStatus): WorkflowTone {
   switch (status) {
     case "running":
@@ -62,15 +68,81 @@ export function formatWorkflowDuration(ms: number | null | undefined): string {
   return `${minutes}m ${totalSeconds % 60}s`;
 }
 
-/** Compact token count: 9.2k / 41k. */
+/** Compact count: 9.2k / 41k (tokens, characters, …). */
+export function formatCompactCount(count: number): string {
+  if (count >= 1000) {
+    return `${(count / 1000).toFixed(count >= 10_000 ? 0 : 1)}k`;
+  }
+  return String(count);
+}
+
+/** Compact token count: 9.2k / 41k; em dash when unknown. */
 export function formatWorkflowTokens(tokens: number | null | undefined): string {
   if (tokens == null) {
     return "—";
   }
-  if (tokens >= 1000) {
-    return `${(tokens / 1000).toFixed(tokens >= 10_000 ? 0 : 1)}k`;
+  return formatCompactCount(tokens);
+}
+
+/**
+ * Preview budget for long freeform workflow text (arg values / prompts, agent
+ * reports, error messages) rendered in the sidebar. Values within the tolerance
+ * render in full: a "Show more" that reveals only a few extra words is worse
+ * than just showing them.
+ */
+export const WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT = 280;
+export const WORKFLOW_TEXT_PREVIEW_TOLERANCE_CHARS = 120;
+
+export interface WorkflowTextPreview {
+  truncated: boolean;
+  /** First chars of the text when truncated, otherwise the full text. */
+  preview: string;
+  /** Total character (code point) count, for the "Show more (N chars)" affordance. */
+  totalChars: number;
+}
+
+/** Unicode code-point count ("😀".length is 2 UTF-16 units but 1 character). */
+export function countCodePoints(text: string): number {
+  let count = 0;
+  for (let i = 0; i < text.length; count += 1) {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+    const code = text.codePointAt(i)!;
+    i += code > 0xffff ? 2 : 1;
   }
-  return String(tokens);
+  return count;
+}
+
+export function getWorkflowTextPreview(
+  text: string,
+  charLimit: number = WORKFLOW_TEXT_PREVIEW_CHAR_LIMIT
+): WorkflowTextPreview {
+  // Measure and cut in Unicode code points, not UTF-16 units: a limit landing inside
+  // a surrogate pair would render a malformed replacement glyph, and emoji-heavy text
+  // would be counted (and truncated) at roughly twice its visible length.
+  const maxUntruncated = charLimit + WORKFLOW_TEXT_PREVIEW_TOLERANCE_CHARS;
+  let count = 0;
+  let cutUtf16 = 0;
+  let truncated = false;
+  for (let i = 0; i < text.length; count += 1) {
+    if (count === charLimit) {
+      cutUtf16 = i;
+    }
+    if (count === maxUntruncated) {
+      truncated = true;
+      break;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+    const code = text.codePointAt(i)!;
+    i += code > 0xffff ? 2 : 1;
+  }
+  if (!truncated) {
+    return { truncated: false, preview: text, totalChars: count };
+  }
+  return {
+    truncated: true,
+    preview: text.slice(0, cutUtf16).trimEnd(),
+    totalChars: countCodePoints(text),
+  };
 }
 
 export function formatWorkflowCost(costUsd: number | null | undefined): string {
@@ -81,6 +153,20 @@ export function formatWorkflowCost(costUsd: number | null | undefined): string {
     return "$<0.01";
   }
   return `$${costUsd.toFixed(2)}`;
+}
+
+/**
+ * Auto-surface gate for the Workflows tab: activate only when a mounted
+ * workspace transitions from zero to some active runs. A `null` previous count
+ * means "first observation" (workspace open / remount) — activating there
+ * would steal the user's persisted tab choice every time they visit a
+ * workspace with a run already in flight.
+ */
+export function shouldAutoActivateWorkflowsTab(
+  previousActiveRunCount: number | null,
+  activeRunCount: number
+): boolean {
+  return previousActiveRunCount === 0 && activeRunCount > 0;
 }
 
 /** Coarse relative time for run-history rows ("just now" / "5m ago" / "3h ago" / "2d ago"). */

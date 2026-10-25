@@ -6,8 +6,8 @@ import * as path from "path";
 
 import * as jsonc from "jsonc-parser";
 
-import { type ShuxEnvironment } from "../src/common/compat/shuxEnv";
-import { SHUX_HOME_DIR_NAME } from "../src/common/constants/product";
+import { type XumEnvironment } from "../src/common/compat/xumEnv";
+import { XUM_HOME_DIR_NAME } from "../src/common/constants/product";
 import {
   AZURE_OPENAI_ENV_VARS,
   BEDROCK_AUTH_ENV_VARS,
@@ -43,7 +43,7 @@ export type SeedSources = {
 };
 
 export type ChooseSeedSourcesOptions = {
-  env?: ShuxEnvironment;
+  env?: XumEnvironment;
   homeDir?: string;
 };
 
@@ -61,18 +61,18 @@ function uniqueExpandedPaths(values: Array<string | null | undefined>): string[]
 }
 
 /**
- * Seed-root order when no explicit SEED_SHUX_ROOT / SEED_MUX_ROOT is set:
- * SHUX_ROOT, MUX_ROOT, ~/.shux[-dev], then legacy ~/.mux[-dev] / ~/.cmux.
+ * Seed-root order when no explicit SEED_XUM_ROOT / SEED_MUX_ROOT is set:
+ * XUM_ROOT, MUX_ROOT, ~/.xum[-dev], then legacy ~/.mux[-dev] / ~/.cmux.
  */
 export function listSandboxSeedCandidateRoots(options: ChooseSeedSourcesOptions = {}): string[] {
   const env = options.env ?? process.env;
   const homeDir = options.homeDir ?? os.homedir();
 
   return uniqueExpandedPaths([
-    env.SHUX_ROOT,
+    env.XUM_ROOT,
     env.MUX_ROOT,
-    path.join(homeDir, `${SHUX_HOME_DIR_NAME}-dev`),
-    path.join(homeDir, SHUX_HOME_DIR_NAME),
+    path.join(homeDir, `${XUM_HOME_DIR_NAME}-dev`),
+    path.join(homeDir, XUM_HOME_DIR_NAME),
     // Leftover local homes remain accepted; remote ~/.mux and Docker /var/mux are separate contracts.
     path.join(homeDir, ".mux-dev"),
     path.join(homeDir, ".mux"),
@@ -81,11 +81,11 @@ export function listSandboxSeedCandidateRoots(options: ChooseSeedSourcesOptions 
 }
 
 /**
- * Pick seed files for a sandbox SHUX_ROOT.
+ * Pick seed files for a sandbox XUM_ROOT.
  *
  * providers.jsonc and config.json are chosen *independently* from the first
- * candidate root that has each file. A root like ~/.shux-dev often has only
- * config.json while provider credentials live in ~/.shux/providers.jsonc;
+ * candidate root that has each file. A root like ~/.xum-dev often has only
+ * config.json while provider credentials live in ~/.xum/providers.jsonc;
  * picking a single root would silently drop provider config and push the
  * sandboxed server onto env-var credential fallback, which can pair a real
  * API key with an unrelated *_BASE_URL proxy (e.g. Coder AI bridge) and fail
@@ -101,12 +101,12 @@ export function chooseSeedSources(options: ChooseSeedSourcesOptions = {}): SeedS
     return null;
   };
 
-  const explicitSeed = env.SEED_SHUX_ROOT ?? env.SEED_MUX_ROOT;
+  const explicitSeed = env.SEED_XUM_ROOT ?? env.SEED_MUX_ROOT;
   if (explicitSeed) {
     const explicit = expandTilde(explicitSeed);
     if (!dirExists(explicit)) {
       throw new Error(
-        `SEED_SHUX_ROOT/SEED_MUX_ROOT does not exist or is not a directory: ${explicit}`
+        `SEED_XUM_ROOT/SEED_MUX_ROOT does not exist or is not a directory: ${explicit}`
       );
     }
     // Explicit seed root: only look there.
@@ -160,6 +160,10 @@ function providerCredentialEnvVarNames(): string[] {
 const BEDROCK_CLEAN_ENV_VARS: string[] = [
   ...(PROVIDER_ENV_VARS.bedrock?.region ?? []),
   BEDROCK_AUTH_ENV_VARS.bearerToken,
+  // Google Vertex AI is likewise "configured" from a project env var alone
+  // (credentials flow via Google ADC), so a clean sandbox drops project/location.
+  ...(PROVIDER_ENV_VARS["google-vertex"]?.project ?? []),
+  ...(PROVIDER_ENV_VARS["google-vertex"]?.location ?? []),
 ];
 
 /**
@@ -261,7 +265,7 @@ export function sanitizeSandboxProviderEnv(options: {
   if (present.length > 0) {
     console.warn(
       `\nWARNING: no providers.jsonc was seeded into the sandbox; the server will fall back to provider env vars: ${present.join(", ")}.\n` +
-        "If a *_BASE_URL env var points at a proxy (e.g. Coder AI bridge), the env API key may not match it and provider auth will fail.\n"
+        "If a *_BASE_URL env var points at a proxy (e.g. Coder AI Gateway), the env API key may not match it and provider auth will fail.\n"
     );
   }
 

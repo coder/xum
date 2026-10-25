@@ -26,7 +26,6 @@ import { createStreamCollector } from "../streamCollector";
 import { isInitOutput, isMuxMessage } from "@/common/orpc/types";
 import * as path from "path";
 import * as fs from "fs/promises";
-// eslint-disable-next-line local/no-unsafe-child-process
 import { exec } from "child_process";
 import { promisify } from "util";
 
@@ -46,9 +45,7 @@ async function addInitHook(repoPath: string, scriptBody: string): Promise<void> 
   const hookPath = path.join(muxDir, "init");
   await fs.writeFile(hookPath, `#!/bin/bash\n${scriptBody}\n`, { mode: 0o755 });
 
-  // eslint-disable-next-line local/no-unsafe-child-process
   await execAsync(`git add -A`, { cwd: repoPath });
-  // eslint-disable-next-line local/no-unsafe-child-process
   await execAsync(`git -c commit.gpgsign=false commit -m "Add init hook"`, { cwd: repoPath });
 }
 

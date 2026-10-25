@@ -1,16 +1,23 @@
-import { useEffect, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
 
+import { cn } from "@/common/lib/utils";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { WINDOWS_TOOLCHAIN_BANNER_DISMISSED_KEY } from "@/common/constants/storage";
 
-const WINDOWS_TOOLCHAIN_BANNER_DISMISSED_KEY = "windowsToolchainBannerDismissedAt";
 const DISMISS_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
 /**
  * Banner shown on Windows when the default shell appears to be WSL.
  * Users can dismiss it, but it will re-appear after 30 days.
  */
-export function WindowsToolchainBanner() {
+export function WindowsToolchainBanner(props: {
+  /**
+   * The app shell's sidebar toggle bar spacer, while the fixed bar sits over this banner (left
+   * sidebar collapsed), so the warning starts after the bar instead of under it.
+   */
+  toggleBarSpacer?: React.ReactNode;
+}) {
   const [dismissedAt, setDismissedAt] = usePersistedState<number | null>(
     WINDOWS_TOOLCHAIN_BANNER_DISMISSED_KEY,
     null
@@ -53,11 +60,17 @@ export function WindowsToolchainBanner() {
   if (isWslShell !== true || isDismissed) return null;
 
   return (
-    <div className="bg-warning/10 border-warning/30 text-warning flex items-center justify-between gap-3 border-b px-4 py-2 text-sm">
+    <div
+      className={cn(
+        "bg-warning/10 border-warning/30 text-warning flex items-center justify-between gap-3 border-b px-4 py-2 text-sm",
+        props.toggleBarSpacer != null && "pl-0"
+      )}
+    >
       <div className="flex items-center gap-2">
+        {props.toggleBarSpacer}
         <AlertTriangle className="text-warning size-4 shrink-0" />
         <span>
-          Your default shell appears to be WSL. Shux requires Git for Windows (Git Bash) on Windows
+          Your default shell appears to be WSL. Xum requires Git for Windows (Git Bash) on Windows
           for reliable git + path handling.
           <a
             href="https://mux.coder.com/install#windows"
@@ -67,7 +80,7 @@ export function WindowsToolchainBanner() {
           >
             Install Git for Windows
           </a>{" "}
-          and restart Shux.
+          and restart Xum.
         </span>
       </div>
       <button

@@ -1,4 +1,6 @@
+import { restoreContextBudgetRejectedMessageForDisplay } from "@/common/utils/messages/contextBudgetRejection";
 import type {
+  ArtifactInteractionMetadata,
   BashMonitorWakeDisplayRecord,
   CompactionRequestData,
   DisplayedMessage,
@@ -9,10 +11,17 @@ import type {
 } from "@/common/types/message";
 import {
   getCompactionFollowUpContent,
+  isRolloverBoundary,
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
 import type { StreamErrorType } from "@/common/types/errors";
+import {
+  getValidAgentPeerMessageMeta,
+  getValidAgentPeerTriggerMeta,
+  parseAgentMessageEnvelope,
+  type AgentPeerMessageMeta,
+} from "@/common/utils/agentMessageEnvelope";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { getFollowUpContentText } from "@/browser/utils/compaction/format";
 import { getGoalClearedSummaryDisplayText } from "@/common/utils/goalClearedSummaryDisplay";
@@ -23,7 +32,9 @@ import {
 } from "@/common/utils/messages/compactionBoundary";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
+import { getAuthenticPlanReviewRecord } from "@/common/utils/planReview/planReviewEnvelope";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
+import { parseAskUserQuestionAnswerMetadata } from "@/common/utils/tools/askUserQuestionSummary";
 
 /**
  * Check if a tool result indicates success (for tools that return { success: boolean })
@@ -45,32 +56,6 @@ export function hasFailureResult(result: unknown): boolean {
   // Implicit failure - error field present
   if ("error" in result && result.error) return true;
   return false;
-}
-
-export function resolveRouteProvider(
-  routeProvider: string | undefined,
-  routedThroughGateway: boolean | undefined
-): string | undefined {
-  return routeProvider ?? (routedThroughGateway === true ? "mux-gateway" : undefined);
-}
-
-export function normalizeMessageRouteProvider(message: MuxMessage): MuxMessage {
-  const routeProvider = resolveRouteProvider(
-    message.metadata?.routeProvider,
-    message.metadata?.routedThroughGateway
-  );
-
-  if (!message.metadata || routeProvider === message.metadata.routeProvider) {
-    return message;
-  }
-
-  return {
-    ...message,
-    metadata: {
-      ...message.metadata,
-      routeProvider,
-    },
-  };
 }
 
 /**
@@ -162,9 +147,15 @@ function createCompactionBoundaryRow(
     type: "compaction-boundary",
     id: `${message.id}-compaction-boundary`,
     historySequence,
+    timestamp: message.metadata?.timestamp,
     boundaryKind: getContextBoundaryKind(message) ?? CONTEXT_BOUNDARY_KINDS.COMPACTION,
     position: "start",
+    contextWindowRollover: isRolloverBoundary(message) ? true : undefined,
     compactionEpoch,
+    ...(message.metadata?.muxMetadata?.type === "compaction-summary" &&
+    message.metadata.muxMetadata.strategy === "continuous"
+      ? { strategy: "continuous" }
+      : {}),
   };
 }
 
@@ -220,7 +211,77 @@ function getValidBashMonitorWakeRecords(
     typeof record.displayName === "string" &&
     typeof record.filter === "string" &&
     typeof record.filterExclude === "boolean";
-  return records.every(isValidRecord) ? records : undefined;
+  if (!records.every(isValidRecord)) return undefined;
+  // Self-healing for the optional settlement fields: an invalid terminal or staleTerminal shape
+  // drops that field, not the record, so the wake still renders with its base summary.
+  const isValidTerminal = (
+    terminal: unknown
+  ): terminal is NonNullable<BashMonitorWakeDisplayRecord["terminal"]> =>
+    isPlainObject(terminal) &&
+    (terminal.status === "exited" ||
+      terminal.status === "killed" ||
+      terminal.status === "failed" ||
+      terminal.status === "unknown") &&
+    (terminal.exitCode === undefined || typeof terminal.exitCode === "number");
+  return records.map((record) => {
+    const terminalValid = record.terminal === undefined || isValidTerminal(record.terminal);
+    const staleValid = record.staleTerminal === undefined || isValidTerminal(record.staleTerminal);
+    if (terminalValid && staleValid) return record;
+    const { terminal, staleTerminal, ...rest } = record;
+    return {
+      ...rest,
+      ...(terminalValid && terminal !== undefined ? { terminal } : {}),
+      ...(staleValid && staleTerminal !== undefined ? { staleTerminal } : {}),
+    };
+  });
+}
+
+/**
+ * Same self-healing contract as getValidBashMonitorWakeRecords: peer metadata is persisted
+ * black-box data, so a corrupted row (e.g. object-valued fromTitle rendered as a React child)
+ * must fall back to normal user-message rendering instead of bricking the transcript.
+ *
+ * Authenticity mirrors the provider sanitizer: the row must carry synthetic provenance and its
+ * text must be a well-formed envelope whose sender fields MATCH the metadata. A partially
+ * corrupted row (valid-looking metadata on ordinary model output, or a metadata/envelope sender
+ * mismatch) renders as an ordinary assistant message instead of collapsing under another
+ * sender's attribution.
+ */
+function getValidAgentPeerMessage(
+  message: { metadata?: { muxMetadata?: MuxMessageMetadata; synthetic?: boolean } },
+  partText: string
+): NonNullable<Extract<DisplayedMessage, { type: "assistant" }>["agentPeerMessage"]> | undefined {
+  const meta = getValidAgentPeerMessageMeta(message.metadata?.muxMetadata);
+  if (meta == null || message.metadata?.synthetic !== true) {
+    return undefined;
+  }
+  const parsed = parseAgentMessageEnvelope(partText);
+  if (
+    parsed == null ||
+    parsed.from !== meta.fromWorkspaceId ||
+    parsed.relationship !== meta.relationship ||
+    parsed.fromTitle !== meta.fromTitle
+  ) {
+    return undefined;
+  }
+  return meta;
+}
+
+/**
+ * Validated attribution of a peer-message wake trigger row, or null. SECURITY/self-healing:
+ * requires synthetic provenance AND validated attribution — a corrupted human user row wearing
+ * peer metadata must keep ordinary rendering, not be disguised as (or folded into) a machine
+ * notification. When the recipient is executing a delegated workspace turn, the trigger carries
+ * that turn's correlation metadata with the attribution nested on it.
+ */
+function getAgentPeerTriggerRowMeta(message: MuxMessage): AgentPeerMessageMeta | null {
+  if (message.role !== "user" || message.metadata?.synthetic !== true) return null;
+  const muxMeta = message.metadata.muxMetadata;
+  if (muxMeta?.type === "agent-peer-message") return getValidAgentPeerMessageMeta(muxMeta);
+  if (muxMeta?.type === "workspace-turn-task") {
+    return getValidAgentPeerTriggerMeta(muxMeta.agentPeerMessageTrigger);
+  }
+  return null;
 }
 
 function getRawCommand(muxMetadata: unknown): string | undefined {
@@ -242,6 +303,37 @@ function getRawCommand(muxMetadata: unknown): string | undefined {
   }
 }
 
+/**
+ * The "from artifact" pill and its rendering come only from this metadata, which the backend alone
+ * can write (generic sends refuse it), never from the model-facing tag text. Malformed metadata is
+ * dropped so the row renders as an ordinary message.
+ */
+function toArtifactInteractionDisplay(value: unknown): ArtifactInteractionMetadata | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const meta = value as Partial<Record<keyof ArtifactInteractionMetadata, unknown>>;
+  if (
+    typeof meta.id !== "string" ||
+    typeof meta.artifactPath !== "string" ||
+    typeof meta.title !== "string" ||
+    typeof meta.text !== "string" ||
+    meta.action !== "send" ||
+    typeof meta.version !== "number" ||
+    !Number.isInteger(meta.version) ||
+    meta.version < 0
+  ) {
+    return undefined;
+  }
+  return {
+    id: meta.id,
+    artifactPath: meta.artifactPath,
+    title: meta.title,
+    version: meta.version,
+    action: "send",
+    text: meta.text,
+    ...(meta.data !== undefined ? { data: meta.data } : {}),
+  };
+}
+
 function buildUserDisplayedMessages(options: {
   message: MuxMessage;
   agentSkillSnapshot?: { frontmatterYaml?: string; body?: string };
@@ -253,6 +345,7 @@ function buildUserDisplayedMessages(options: {
     options;
   const muxMeta = message.metadata?.muxMetadata;
   const partsContent = getTextPartContent(message.parts);
+  const peerTriggerMeta = getAgentPeerTriggerRowMeta(message);
 
   const fileParts = message.parts
     .filter((p): p is MuxFilePart => p.type === "file")
@@ -317,8 +410,11 @@ function buildUserDisplayedMessages(options: {
       historySequence,
       isSynthetic: message.metadata?.synthetic === true ? true : undefined,
       isUiVisible: message.metadata?.uiVisible === true ? true : undefined,
+      contextBudgetRejected: message.metadata?.contextBudgetRejected === true ? true : undefined,
       isGoalContinuation: message.metadata?.kind === GOAL_CONTINUATION_KIND ? true : undefined,
       isBudgetLimitWrapup: message.metadata?.kind === GOAL_BUDGET_LIMIT_KIND ? true : undefined,
+      isPlanReviewFeedback:
+        getAuthenticPlanReviewRecord(message)?.kind === "feedback" ? true : undefined,
       timestamp: baseTimestamp,
       agentSkill,
       mcpPromptRefs,
@@ -326,7 +422,34 @@ function buildUserDisplayedMessages(options: {
       inlineSkillSnapshots,
       compactionRequest,
       reviews: muxMeta?.reviews,
+      artifactInteraction: toArtifactInteractionDisplay(muxMeta?.artifactInteraction),
+      askUserQuestionAnswers: parseAskUserQuestionAnswerMetadata(muxMeta),
       bashMonitorWake: bashMonitorWakeRecords ? { records: bashMonitorWakeRecords } : undefined,
+      // Only genuine machine rows get collapsed; corrupted metadata must not hide human input.
+      contextBudgetWarning:
+        message.metadata?.synthetic === true &&
+        muxMeta?.type === "context-budget-warning" &&
+        Number.isFinite(muxMeta.contextTokens) &&
+        muxMeta.contextTokens >= 0 &&
+        Number.isFinite(muxMeta.maxTokens) &&
+        muxMeta.maxTokens > 0
+          ? {
+              contextTokens: muxMeta.contextTokens,
+              maxTokens: muxMeta.maxTokens,
+              final: muxMeta.final === true,
+              handoff: muxMeta.handoff === true,
+            }
+          : undefined,
+      // The peer-message wake trigger is a synthetic machine row: mark it so prompt
+      // navigation skips it (the envelope payload itself is a separate assistant row).
+      agentPeerMessageTrigger: peerTriggerMeta != null ? true : undefined,
+      agentPeerTriggerPayload:
+        peerTriggerMeta?.payloadMessageId != null
+          ? {
+              payloadMessageId: peerTriggerMeta.payloadMessageId,
+              fromWorkspaceId: peerTriggerMeta.fromWorkspaceId,
+            }
+          : undefined,
     },
   ];
 }
@@ -421,18 +544,18 @@ function appendAssistantTextRow(
     isCompacted: !!message.metadata?.compacted,
     isIdleCompacted: message.metadata?.compacted === "idle",
     model: message.metadata?.model,
-    routedThroughGateway: message.metadata?.routedThroughGateway,
-    routeProvider: resolveRouteProvider(
-      message.metadata?.routeProvider,
-      message.metadata?.routedThroughGateway
-    ),
+    routeProvider: message.metadata?.routeProvider,
     modelFallback: message.metadata?.modelFallback,
+    autoModelRouting: message.metadata?.autoModelRouting,
     mode: message.metadata?.mode,
     agentId: message.metadata?.agentId ?? message.metadata?.mode,
     timestamp: part.timestamp ?? options.baseTimestamp,
     streamPresentation: options.isStreaming
       ? { source: options.streamIsReplay ? "replay" : "live" }
       : undefined,
+    // Backend-attached metadata (never model-authored text) gates the peer-message card, so a
+    // model-emitted lookalike envelope still renders as an ordinary assistant message.
+    agentPeerMessage: getValidAgentPeerMessage(message, part.text),
   });
 }
 
@@ -479,13 +602,37 @@ function reconstructCodeExecutionNestedCalls(part: DynamicToolPart): NestedToolC
       continue;
     }
 
+    const output =
+      record.result ??
+      (typeof record.error === "string"
+        ? // success:false matches the failure shape tool cards and
+          // isFailedToolOutput already understand, so the error stays
+          // visible (e.g. bash's ErrorBox) after reload.
+          { success: false, error: record.error }
+        : undefined);
+    // RLM kernel-mode compact record (r12): the full nested result never
+    // persists in the tool output, so degraded detail after reload is expected
+    // (live streaming keeps full detail via part.nestedCalls, which takes
+    // precedence). Failure travels out-of-band via `failed` instead of a
+    // synthetic output shape, so a real tool result can never be mistaken
+    // for a reconstruction stand-in.
+    const kernelFailure = output === undefined && record.ok === false;
+
     nestedCalls.push({
       toolCallId: `${part.toolCallId}-nested-${idx}`,
       toolName: record.toolName,
       input: record.args,
-      output:
-        record.result ?? (typeof record.error === "string" ? { error: record.error } : undefined),
-      state: "output-available",
+      output,
+      ...(kernelFailure ? { failed: true } : {}),
+      // Compaction deliberately omits results. Reuse the neutral redacted state
+      // instead of making communication cards report a missing-result failure.
+      // ok:true only means the tool ran, not that a message was delivered.
+      state:
+        output === undefined &&
+        typeof record.ok === "boolean" &&
+        (record.toolName === "task_send_message" || record.toolName === "agent_report")
+          ? "output-redacted"
+          : "output-available",
       timestamp: part.timestamp,
     });
   }
@@ -525,6 +672,7 @@ function appendToolRows(
     historySequence: options.historySequence,
     isLastPartOfMessage: options.isLastPartOfMessage,
     ...(part.workflowRun != null ? { workflowRun: part.workflowRun } : {}),
+    ...(part.mcpServer != null ? { mcpServer: part.mcpServer } : {}),
     timestamp: part.timestamp ?? options.baseTimestamp,
     ...(part.executionStartedAt != null ? { executionStartedAt: part.executionStartedAt } : {}),
     nestedCalls,
@@ -584,7 +732,6 @@ function appendStreamErrorRows(
       errorType,
       historySequence: options.historySequence,
       model: options.message.metadata?.model,
-      routedThroughGateway: options.message.metadata?.routedThroughGateway,
       timestamp: options.baseTimestamp,
     });
   };
@@ -704,7 +851,8 @@ function buildAssistantDisplayedMessages(options: {
 export function buildDisplayedMessagesForMessage(
   options: BuildDisplayedMessagesForMessageOptions
 ): DisplayedMessage[] {
-  const { message, agentSkillSnapshot, inlineSkillSnapshots, hasActiveStream } = options;
+  const { agentSkillSnapshot, inlineSkillSnapshots, hasActiveStream } = options;
+  const message = restoreContextBudgetRejectedMessageForDisplay(options.message);
   const baseTimestamp = message.metadata?.timestamp;
   const historySequence = message.metadata?.historySequence ?? 0;
   const planRows = buildPlanDisplayMessages(message, historySequence);

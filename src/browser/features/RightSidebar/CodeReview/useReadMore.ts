@@ -5,8 +5,7 @@
 
 import { useState, useMemo, useEffect, useCallback } from "react";
 import type { DiffHunk } from "@/common/types/review";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getReviewReadMoreKey } from "@/common/constants/storage";
+import { getReviewStateStore, useReviewStateSelector } from "@/browser/stores/ReviewStateStore";
 import { useAPI } from "@/browser/contexts/API";
 import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import {
@@ -22,6 +21,8 @@ interface ReadMoreState {
   up: number; // Lines expanded upward (cumulative)
   down: number; // Lines expanded downward (cumulative)
 }
+
+const NO_EXPANSION: ReadMoreState = { up: 0, down: 0 };
 
 interface UseReadMoreOptions {
   hunk: DiffHunk;
@@ -59,13 +60,17 @@ export function useReadMore(options: UseReadMoreOptions): UseReadMoreResult {
     hunk.filePath
   );
 
-  // Persisted state: how many lines expanded up/down per hunk
-  const [readMoreMap, setReadMoreMap] = usePersistedState<Record<string, ReadMoreState>>(
-    getReviewReadMoreKey(workspaceId),
-    {},
-    { listener: true }
+  // Persisted state (backend review-state store): how many lines expanded up/down per hunk.
+  // Selected as primitives so other hunks' changes do not re-render this one.
+  const up = useReviewStateSelector(
+    workspaceId,
+    (view) => view.sections.readMore?.[hunkId]?.up ?? NO_EXPANSION.up
   );
-  const readMore = useMemo(() => readMoreMap[hunkId] ?? { up: 0, down: 0 }, [readMoreMap, hunkId]);
+  const down = useReviewStateSelector(
+    workspaceId,
+    (view) => view.sections.readMore?.[hunkId]?.down ?? NO_EXPANSION.down
+  );
+  const readMore = useMemo(() => ({ up, down }), [up, down]);
 
   // Loading and content state (not persisted - reloads on mount)
   const [upContent, setUpContent] = useState<string>("");
@@ -178,49 +183,47 @@ export function useReadMore(options: UseReadMoreOptions): UseReadMoreResult {
     repoRootProjectPath,
   ]);
 
-  // Expand/collapse handlers
+  // Expand/collapse handlers: pure updaters over the latest stored value (not the
+  // render-time `readMore`), so rapid clicks and pre-hydration clicks compose correctly.
+  const updateReadMore = useCallback(
+    (update: (current: ReadMoreState) => ReadMoreState) => {
+      getReviewStateStore().mutate(workspaceId, "readMore", (prev) => ({
+        set: { [hunkId]: update(prev[hunkId] ?? NO_EXPANSION) },
+      }));
+    },
+    [workspaceId, hunkId]
+  );
+
   const handleExpandUp = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
-      setReadMoreMap((prev) => ({
-        ...prev,
-        [hunkId]: { ...readMore, up: readMore.up + LINES_PER_EXPANSION },
-      }));
+      updateReadMore((current) => ({ ...current, up: current.up + LINES_PER_EXPANSION }));
     },
-    [hunkId, readMore, setReadMoreMap]
+    [updateReadMore]
   );
 
   const handleExpandDown = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
-      setReadMoreMap((prev) => ({
-        ...prev,
-        [hunkId]: { ...readMore, down: readMore.down + LINES_PER_EXPANSION },
-      }));
+      updateReadMore((current) => ({ ...current, down: current.down + LINES_PER_EXPANSION }));
     },
-    [hunkId, readMore, setReadMoreMap]
+    [updateReadMore]
   );
 
   const handleCollapseUp = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
-      setReadMoreMap((prev) => ({
-        ...prev,
-        [hunkId]: { ...readMore, up: 0 },
-      }));
+      updateReadMore((current) => ({ ...current, up: 0 }));
     },
-    [hunkId, readMore, setReadMoreMap]
+    [updateReadMore]
   );
 
   const handleCollapseDown = useCallback(
     (e: React.MouseEvent) => {
       e.stopPropagation();
-      setReadMoreMap((prev) => ({
-        ...prev,
-        [hunkId]: { ...readMore, down: 0 },
-      }));
+      updateReadMore((current) => ({ ...current, down: 0 }));
     },
-    [hunkId, readMore, setReadMoreMap]
+    [updateReadMore]
   );
 
   return {

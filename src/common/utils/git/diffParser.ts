@@ -69,7 +69,9 @@ export function parseDiff(diffOutput: string): FileDiff[] {
       const content = hunkLines.join("\n");
       const hunkId = generateHunkId(
         currentFile.filePath,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         currentHunk.oldStart!,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         currentHunk.newStart!,
         content
       );
@@ -123,13 +125,11 @@ export function parseDiff(diffOutput: string): FileDiff[] {
       continue;
     }
 
-    // New file mode
     if (line.startsWith("new file mode ")) {
       currentFile.changeType = "added";
       continue;
     }
 
-    // Deleted file mode
     if (line.startsWith("deleted file mode ")) {
       currentFile.changeType = "deleted";
       continue;
@@ -167,7 +167,6 @@ export function parseDiff(diffOutput: string): FileDiff[] {
     }
   }
 
-  // Finish last file
   finishFile();
 
   return files;

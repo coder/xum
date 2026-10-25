@@ -3,7 +3,6 @@ import type { ModelMessage, AssistantModelMessage, ToolModelMessage } from "ai";
 import {
   transformModelMessages,
   validateAnthropicCompliance,
-  getAnthropicThinkingDisableReason,
   addInterruptedSentinel,
   injectAgentTransition,
   filterEmptyAssistantMessages,
@@ -153,8 +152,10 @@ describe("modelMessageTransform", () => {
       });
 
       expect(result).toHaveLength(2);
-      expect((result[0] as AssistantModelMessage).content[0]).toMatchObject({ type: "reasoning" });
-      expect(getAnthropicThinkingDisableReason(result)).toBeUndefined();
+      expect((result[0] as AssistantModelMessage).content[0]).toMatchObject({
+        type: "reasoning",
+        providerOptions: { anthropic: { signature: "sig" } },
+      });
     });
 
     it("should insert empty reasoning for final assistant message when Anthropic thinking is enabled", () => {
@@ -178,7 +179,10 @@ describe("modelMessageTransform", () => {
         expect(lastAssistant.content[0]).toEqual({ type: "reasoning", text: "..." });
       }
     });
-    it("should keep text-only messages unchanged", () => {
+    it("merges consecutive text-only assistant messages (Anthropic alternation)", () => {
+      // Previously passed through unchanged; since synthetic assistant rows
+      // (branch summaries) can follow a streamed assistant turn, consecutive
+      // text-only assistant messages now merge like consecutive user messages.
       const assistantMsg1: AssistantModelMessage = {
         role: "assistant",
         content: [{ type: "text", text: "Let me help you with that." }],
@@ -190,7 +194,17 @@ describe("modelMessageTransform", () => {
       const messages: ModelMessage[] = [assistantMsg1, assistantMsg2];
 
       const result = transformModelMessages(messages, "anthropic");
-      expect(result).toEqual(messages);
+      // Original text parts are preserved as separate blocks so part-level
+      // providerOptions survive the merge.
+      expect(result).toEqual([
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Let me help you with that." },
+            { type: "text", text: "Here's the result." },
+          ],
+        },
+      ]);
     });
 
     it("coalesces 3 consecutive identical no-progress task_await pairs into 1 (keep last pair)", () => {
@@ -378,81 +392,6 @@ describe("modelMessageTransform", () => {
     });
   });
 
-  describe("getAnthropicThinkingDisableReason", () => {
-    it("returns a reason when tool-call message lacks signed reasoning", () => {
-      const assistantMsg: AssistantModelMessage = {
-        role: "assistant",
-        content: [{ type: "tool-call", toolCallId: "call1", toolName: "bash", input: {} }],
-      };
-      const toolMsg: ToolModelMessage = {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "call1",
-            toolName: "bash",
-            output: { type: "json", value: {} },
-          },
-        ],
-      };
-
-      const reason = getAnthropicThinkingDisableReason([assistantMsg, toolMsg]);
-      expect(reason).toContain("Message 0");
-    });
-
-    it("returns undefined when tool-call message starts with signed reasoning", () => {
-      const assistantMsg: AssistantModelMessage = {
-        role: "assistant",
-        content: [
-          {
-            type: "reasoning",
-            text: "...",
-            providerOptions: { anthropic: { signature: "sig" } },
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          } as any,
-          { type: "tool-call", toolCallId: "call1", toolName: "bash", input: {} },
-        ],
-      };
-      const toolMsg: ToolModelMessage = {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "call1",
-            toolName: "bash",
-            output: { type: "json", value: {} },
-          },
-        ],
-      };
-
-      expect(getAnthropicThinkingDisableReason([assistantMsg, toolMsg])).toBeUndefined();
-    });
-
-    it("treats unsigned reasoning as absent", () => {
-      const assistantMsg: AssistantModelMessage = {
-        role: "assistant",
-        content: [
-          { type: "reasoning", text: "..." },
-          { type: "tool-call", toolCallId: "call1", toolName: "bash", input: {} },
-        ],
-      };
-      const toolMsg: ToolModelMessage = {
-        role: "tool",
-        content: [
-          {
-            type: "tool-result",
-            toolCallId: "call1",
-            toolName: "bash",
-            output: { type: "json", value: {} },
-          },
-        ],
-      };
-
-      const reason = getAnthropicThinkingDisableReason([assistantMsg, toolMsg]);
-      expect(reason).toContain("Message 0");
-    });
-  });
-
   describe("validateAnthropicCompliance", () => {
     it("should validate correct message sequences", () => {
       const assistantMsg1: AssistantModelMessage = {
@@ -604,6 +543,35 @@ describe("modelMessageTransform", () => {
       );
     });
 
+    // Text, a PNG, then an SVG inlined as text (inlineSvgAsTextForProvider): the model must see
+    // the parts in the order the user attached them.
+    it("keeps each merged message's parts in order, joining text only across the boundary", () => {
+      const png = { type: "file" as const, mediaType: "image/png", data: "AAAA" };
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "Context" }] },
+        {
+          role: "user",
+          content: [{ type: "text", text: "Request" }, png, { type: "text", text: "<svg/>" }],
+        },
+        { role: "user", content: [png] },
+        { role: "user", content: "Last" },
+      ];
+
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result).toEqual([
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Context\nRequest" },
+            png,
+            { type: "text", text: "<svg/>" },
+            png,
+            { type: "text", text: "Last" },
+          ],
+        },
+      ]);
+    });
+
     it("should not merge user messages separated by assistant message", () => {
       const messages: ModelMessage[] = [
         {
@@ -629,6 +597,175 @@ describe("modelMessageTransform", () => {
       expect((result[2].content as Array<{ type: string; text: string }>)[0].text).toBe(
         "How are you?"
       );
+    });
+  });
+
+  describe("consecutive assistant messages", () => {
+    it("merges a text-only synthetic assistant row into the preceding assistant turn", () => {
+      // Branch summaries are assistant-role synthetic rows that can land
+      // directly after a streamed assistant turn; Anthropic rejects
+      // consecutive assistant messages just like consecutive user messages.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        { role: "assistant", content: [{ type: "text", text: "branch point answer" }] },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Summary of the abandoned branch: explored a race." }],
+        },
+        { role: "user", content: [{ type: "text", text: "first send on the fork" }] },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result).toHaveLength(3);
+      expect(result[1].role).toBe("assistant");
+      // Original text parts preserved verbatim as separate blocks (never
+      // re-joined into one string, which would drop part providerOptions).
+      expect(result[1].content).toEqual([
+        { type: "text", text: "branch point answer" },
+        { type: "text", text: "Summary of the abandoned branch: explored a race." },
+      ]);
+      // Alternation restored for Anthropic.
+      expect(result.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    });
+
+    it("preserves part providerOptions and only merges for Anthropic", () => {
+      // The folded row's text parts keep their providerOptions (e.g.
+      // cacheControl); other providers accept consecutive assistant rows, so
+      // the merge must not change their request bytes.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        { role: "assistant", content: [{ type: "text", text: "answer" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: "Summary.",
+              providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+            },
+          ],
+        },
+      ];
+      const anthropic = transformModelMessages(messages, "anthropic");
+      expect(anthropic).toHaveLength(2);
+      expect(anthropic[1].content).toEqual([
+        { type: "text", text: "answer" },
+        {
+          type: "text",
+          text: "Summary.",
+          providerOptions: { anthropic: { cacheControl: { type: "ephemeral" } } },
+        },
+      ]);
+      // Non-Anthropic providers: consecutive assistant rows pass through.
+      expect(transformModelMessages(messages, "openai")).toEqual(messages);
+      expect(transformModelMessages(messages, "google")).toEqual(messages);
+    });
+
+    it("filters empty text parts from both sides of the merge", () => {
+      // History recorded with extended thinking can carry a signed-reasoning
+      // assistant row whose trailing text part is empty; when a synthetic
+      // summary merges into it (replayed with thinking off — reasoning parts
+      // inside mixed rows are preserved), the previous row's empty block must
+      // be dropped too, not just the incoming row's — Anthropic rejects empty
+      // text blocks. The signed reasoning part itself is preserved verbatim.
+      // (With thinking ON the summary row gains a placeholder reasoning part
+      // and is no longer text-only, so this merge does not fire there.)
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "thinking...",
+              providerOptions: { anthropic: { signature: "sig" } },
+            },
+            { type: "text", text: "" },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Summary of the abandoned branch: explored a race." }],
+        },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result).toHaveLength(2);
+      expect(result[1].content).toEqual([
+        {
+          type: "reasoning",
+          text: "thinking...",
+          providerOptions: { anthropic: { signature: "sig" } },
+        },
+        { type: "text", text: "Summary of the abandoned branch: explored a race." },
+      ]);
+    });
+
+    it("filters whitespace-only text from both sides of the merge (r46)", () => {
+      // An interrupted stream can persist a whitespace-only text delta on the
+      // signed-reasoning row; Anthropic rejects text blocks without
+      // non-whitespace content, so a nonzero-length whitespace part must be
+      // dropped like an empty one — from the previous row's parts and from
+      // incoming string content alike.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "thinking...",
+              providerOptions: { anthropic: { signature: "sig" } },
+            },
+            { type: "text", text: "  \n" },
+          ],
+        },
+        { role: "assistant", content: "Summary of the abandoned branch: explored a race." },
+        { role: "assistant", content: " \t" },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result).toHaveLength(2);
+      expect(result[1].content).toEqual([
+        {
+          type: "reasoning",
+          text: "thinking...",
+          providerOptions: { anthropic: { signature: "sig" } },
+        },
+        { type: "text", text: "Summary of the abandoned branch: explored a race." },
+      ]);
+    });
+
+    it("keeps a summary row standalone after a tool-call/tool-result pair", () => {
+      // Tool-call/tool-result adjacency must stay intact: when the branch
+      // point turn ended in tool calls, the summary follows the TOOL message
+      // and must not be folded backwards across it.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "question" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "calling" },
+            { type: "tool-call", toolCallId: "t1", toolName: "bash", input: {} },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "t1",
+              toolName: "bash",
+              output: { type: "text", value: "ok" },
+            },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "Summary of the abandoned branch: stalled." }],
+        },
+      ];
+      const result = transformModelMessages(messages, "anthropic");
+      expect(result.map((m) => m.role)).toEqual(["user", "assistant", "tool", "assistant"]);
+      const validation = validateAnthropicCompliance(result);
+      expect(validation.valid).toBe(true);
     });
   });
 
@@ -781,6 +918,172 @@ describe("modelMessageTransform", () => {
       expect(result[2].id).toBe("user-2");
       // No synthetic sentinel should exist
       expect(result.every((msg) => !msg.metadata?.synthetic)).toBe(true);
+    });
+  });
+
+  describe("Anthropic preserved thinking blocks", () => {
+    // Newer Claude models bind every replayed thinking block to its prefix, so
+    // each block must go back as returned: own signature, own position.
+    const thinkingOn = { anthropicThinkingEnabled: true };
+    const sig = (signature: string) => ({ anthropic: { signature } });
+
+    function assistantContent(messages: ModelMessage[]) {
+      const assistant = messages.find(
+        (msg): msg is AssistantModelMessage => msg.role === "assistant"
+      );
+      expect(assistant).toBeDefined();
+      return assistant?.content;
+    }
+
+    it("joins the streamed deltas of one block but keeps adjacent signed blocks apart", () => {
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            // Block 1 streamed as two deltas; Anthropic signs the last one.
+            { type: "reasoning", text: "pl" },
+            { type: "reasoning", text: "an", providerOptions: sig("sig-1") },
+            // Block 2 directly follows block 1.
+            { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+            // Block 3: empty thinking with only a signature.
+            { type: "reasoning", text: "", providerOptions: sig("sig-3") },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual([
+        { type: "reasoning", text: "plan", providerOptions: sig("sig-1") },
+        { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+        { type: "reasoning", text: "", providerOptions: sig("sig-3") },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    it("keeps redacted_thinking blocks in place and never merges them with neighbors", () => {
+      const redacted = { anthropic: { redactedData: "opaque" } };
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "reasoning", text: "", providerOptions: redacted },
+            { type: "reasoning", text: "", providerOptions: redacted },
+            // An unsigned delta after a redacted block starts a new block.
+            { type: "reasoning", text: "next", providerOptions: sig("sig-1") },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual([
+        { type: "reasoning", text: "", providerOptions: redacted },
+        { type: "reasoning", text: "", providerOptions: redacted },
+        { type: "reasoning", text: "next", providerOptions: sig("sig-1") },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    it("still merges OpenAI reasoning deltas that carry the itemId on the first part", () => {
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "reasoning",
+              text: "a",
+              providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+            },
+            { type: "reasoning", text: "b" },
+            { type: "text", text: "done" },
+          ],
+        },
+      ];
+
+      expect(assistantContent(transformModelMessages(messages, "openai"))).toEqual([
+        {
+          type: "reasoning",
+          text: "ab",
+          providerOptions: { openai: { itemId: "rs_1", reasoningEncryptedContent: "enc" } },
+        },
+        { type: "text", text: "done" },
+      ]);
+    });
+
+    // #5887: interleaved thinking can put text between two thinking blocks before a tool
+    // call. Moving the second block forward edits the prefix every later block is bound to.
+    it("replays a tool-call message that starts with thinking in its original block order", () => {
+      const redacted = { anthropic: { redactedData: "opaque" } };
+      const toolCall = {
+        type: "tool-call",
+        toolCallId: "c1",
+        toolName: "bash",
+        input: {},
+      } as const;
+      const toolResult: ToolModelMessage = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "c1",
+            toolName: "bash",
+            output: { type: "text", value: "ok" },
+          },
+        ],
+      };
+      const openers = [
+        { type: "reasoning", text: "plan", providerOptions: sig("sig-1") },
+        { type: "reasoning", text: "", providerOptions: redacted },
+      ] as const;
+      for (const opener of openers) {
+        const content: AssistantModelMessage["content"] = [
+          opener,
+          { type: "text", text: "Let me check." },
+          { type: "reasoning", text: "check", providerOptions: sig("sig-2") },
+          toolCall,
+        ];
+        const messages: ModelMessage[] = [
+          { role: "user", content: [{ type: "text", text: "go" }] },
+          { role: "assistant", content },
+          toolResult,
+        ];
+
+        expect(assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))).toEqual(
+          content
+        );
+      }
+    });
+
+    it("still moves thinking first when a tool-call message starts with text", () => {
+      // Manual extended thinking requires the final assistant turn to start with thinking.
+      const messages: ModelMessage[] = [
+        { role: "user", content: [{ type: "text", text: "go" }] },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Let me check." },
+            { type: "reasoning", text: "check", providerOptions: sig("sig-1") },
+            { type: "tool-call", toolCallId: "c1", toolName: "bash", input: {} },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "c1",
+              toolName: "bash",
+              output: { type: "text", value: "ok" },
+            },
+          ],
+        },
+      ];
+
+      expect(
+        assistantContent(transformModelMessages(messages, "anthropic", thinkingOn))?.[0]
+      ).toEqual({ type: "reasoning", text: "check", providerOptions: sig("sig-1") });
     });
   });
 
@@ -1083,6 +1386,49 @@ describe("injectAgentTransition", () => {
     expect(result[0]).toEqual(messages[0]);
     expect(result[1]).toEqual(messages[1]);
     expect(result[3]).toEqual(messages[2]); // Last user message shifted
+  });
+
+  it("injects the transition before the user prompt, not before a trailing Token Budget warning", () => {
+    const messages: MuxMessage[] = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [{ type: "text", text: "Here's the plan..." }],
+        metadata: { timestamp: 1000, agentId: "plan" },
+      },
+      {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Now execute it" }],
+        metadata: { timestamp: 2000 },
+      },
+      {
+        id: "warning-1",
+        role: "user",
+        parts: [{ type: "text", text: "Token budget warning" }],
+        metadata: {
+          timestamp: 3000,
+          synthetic: true,
+          uiVisible: true,
+          muxMetadata: {
+            type: "context-budget-warning",
+            contextTokens: 80,
+            maxTokens: 100,
+            budgetTokens: 90,
+          },
+        },
+      },
+    ];
+
+    const result = injectAgentTransition(messages, "exec");
+
+    expect(result.map((message) => message.id)).toEqual([
+      "assistant-1",
+      result[1].id,
+      "user-1",
+      "warning-1",
+    ]);
+    expect(result[1].metadata?.synthetic).toBe(true);
   });
 
   it("should not inject transition when agent is the same", () => {

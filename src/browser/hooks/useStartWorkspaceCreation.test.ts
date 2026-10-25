@@ -1,76 +1,57 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   persistWorkspaceCreationPrefill,
   type StartWorkspaceCreationDetail,
 } from "./useStartWorkspaceCreation";
-import {
-  getInputKey,
-  getModelKey,
-  getPendingScopeId,
-  getProjectScopeId,
-  getTrunkBranchKey,
-} from "@/common/constants/storage";
-import type { updatePersistedState } from "@/browser/hooks/usePersistedState";
-
-type PersistFn = typeof updatePersistedState;
-type PersistCall = [string, unknown, unknown?];
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { createTestApiClient, createTestPreferencesConfig } from "@/browser/testUtils";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { resetAiSelectionIntentForTests } from "@/browser/utils/aiSelectionIntent";
 
 describe("persistWorkspaceCreationPrefill", () => {
   const projectPath = "/tmp/project";
 
-  function createPersistSpy() {
-    const calls: PersistCall[] = [];
-    const persist: PersistFn = ((...args: PersistCall) => {
-      calls.push(args);
-    }) as PersistFn;
+  beforeEach(() => {
+    const store = getAppConfigStore();
+    store.setClient(createTestApiClient({ config: createTestPreferencesConfig() }));
+    store.updateOptimistically({ userPreferences: {} });
+  });
 
-    return { persist, calls };
+  afterEach(() => {
+    getCreationDraftStore().forgetProject(projectPath);
+    resetAiSelectionIntentForTests();
+    getAppConfigStore().setClient(null);
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
+  });
+
+  function prefilledDraft(detail: StartWorkspaceCreationDetail) {
+    const draftId = persistWorkspaceCreationPrefill(projectPath, null, detail);
+    expect(draftId).toBeDefined();
+    return getCreationDraftStore().getView(draftId!).draft;
   }
 
   test("writes provided values and normalizes whitespace", () => {
-    const detail: StartWorkspaceCreationDetail = {
+    const draft = prefilledDraft({
       projectPath,
       startMessage: "Ship it",
-      model: "provider/model",
+      model: "provider:model",
       trunkBranch: " main ",
       runtime: " ssh dev ", // runtime is NOT persisted - it's a one-time override
-    };
-    const { persist, calls } = createPersistSpy();
+    });
 
-    persistWorkspaceCreationPrefill(projectPath, detail, persist);
-
-    const callMap = new Map<string, unknown>();
-    for (const [key, value] of calls) {
-      callMap.set(key, value);
-    }
-
-    expect(callMap.get(getInputKey(getPendingScopeId(projectPath)))).toBe("Ship it");
-    expect(callMap.get(getModelKey(getProjectScopeId(projectPath)))).toBe("provider/model");
-    expect(callMap.get(getTrunkBranchKey(projectPath))).toBe("main");
-    // runtime is intentionally not persisted - default can only be changed via icon selector
-    expect(calls.length).toBe(3);
+    expect(draft?.text).toBe("Ship it");
+    expect(draft?.ai.model).toBe("provider:model");
+    expect(draft?.execution).toEqual({
+      agent: null,
+      runtime: null,
+      trunkBranch: "main",
+    });
   });
 
-  test("clears persisted values when empty strings are provided", () => {
-    const detail: StartWorkspaceCreationDetail = {
-      projectPath,
-      trunkBranch: "   ",
-    };
-    const { persist, calls } = createPersistSpy();
+  test("a prefilled model is an explicit pick and leaves Auto routing", () => {
+    const draft = prefilledDraft({ projectPath, model: "provider:model" });
 
-    persistWorkspaceCreationPrefill(projectPath, detail, persist);
-
-    const callMap = new Map<string, unknown>();
-    for (const [key, value] of calls) {
-      callMap.set(key, value);
-    }
-
-    expect(callMap.get(getTrunkBranchKey(projectPath))).toBeUndefined();
-  });
-
-  test("no-op when detail is undefined", () => {
-    const { persist, calls } = createPersistSpy();
-    persistWorkspaceCreationPrefill(projectPath, undefined, persist);
-    expect(calls).toHaveLength(0);
+    expect(draft?.ai.model).toBe("provider:model");
+    expect(draft?.auto.model).toBe(false);
   });
 });

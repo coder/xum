@@ -1,35 +1,38 @@
 import { describe, expect, test } from "bun:test";
-import { SHUX_HOME_DIR_NAME } from "@/common/constants/product";
+import { XUM_HOME_DIR_NAME } from "@/common/constants/product";
 import {
+  getCanonicalProjectMetadataRelativePath,
   getLocalProductHomeTildeSuffix,
-  getShuxHomeLegacyFallbackMarkerPath,
+  getXumHomeLegacyFallbackMarkerPath,
   installLegacyMuxEnvironmentAliases,
   LEGACY_CMUX_HOME_DIR_NAME,
   LEGACY_MUX_HOME_DIR_NAME,
-  parseShuxHomeLegacyFallbackDirName,
+  listBackupManagedPathSpellings,
+  listProjectMetadataRelativePaths,
+  normalizeProjectMetadataIdentityPath,
+  parseXumHomeLegacyFallbackDirName,
   resolveLegacyMuxBuiltInSkillName,
-  resolveShuxEnvironmentValue,
-  SUPPORTED_SHUX_PROTOCOL_SCHEMES,
+  resolveXumEnvironmentValue,
   withLegacyMuxEnvironmentAliases,
 } from "./legacyMux";
 
 describe("legacy mux environment compatibility", () => {
-  test("promotes legacy values to canonical SHUX names", () => {
+  test("promotes legacy values to canonical XUM names", () => {
     const env = withLegacyMuxEnvironmentAliases({ MUX_SERVER_URL: "http://legacy" });
 
-    expect(env.SHUX_SERVER_URL).toBe("http://legacy");
+    expect(env.XUM_SERVER_URL).toBe("http://legacy");
     expect(env.MUX_SERVER_URL).toBe("http://legacy");
   });
 
   test("canonical values win when both names are provided", () => {
     const env = withLegacyMuxEnvironmentAliases({
-      SHUX_ROOT: "/canonical",
+      XUM_ROOT: "/canonical",
       MUX_ROOT: "/legacy",
     });
 
-    expect(env.SHUX_ROOT).toBe("/canonical");
+    expect(env.XUM_ROOT).toBe("/canonical");
     expect(env.MUX_ROOT).toBe("/canonical");
-    expect(resolveShuxEnvironmentValue("ROOT", env)).toBe("/canonical");
+    expect(resolveXumEnvironmentValue("ROOT", env)).toBe("/canonical");
   });
 
   test("keeps the pre-mux multiple-instance spelling synchronized", () => {
@@ -37,30 +40,59 @@ describe("legacy mux environment compatibility", () => {
 
     installLegacyMuxEnvironmentAliases(env);
 
-    expect(env.SHUX_ALLOW_MULTIPLE_INSTANCES).toBe("1");
+    expect(env.XUM_ALLOW_MULTIPLE_INSTANCES).toBe("1");
     expect(env.MUX_ALLOW_MULTIPLE_INSTANCES).toBe("1");
   });
 });
 
+describe("project metadata compatibility", () => {
+  test("keeps one canonical path ahead of the legacy read fallback", () => {
+    expect(listProjectMetadataRelativePaths("skills/demo")).toEqual([
+      ".xum/skills/demo",
+      ".mux/skills/demo",
+    ]);
+    expect(normalizeProjectMetadataIdentityPath(".xum/plugins/demo")).toBe(".mux/plugins/demo");
+    expect(normalizeProjectMetadataIdentityPath(".xum\\plugins\\demo")).toBe(".mux\\plugins\\demo");
+    expect(getCanonicalProjectMetadataRelativePath("skills/demo")).toBe(".xum/skills/demo");
+  });
+});
+
+describe("backup managed path compatibility", () => {
+  test("falls back from xum segments to the legacy mux spelling", () => {
+    expect(listBackupManagedPathSpellings("xum/")).toEqual(["xum/", "mux/"]);
+    expect(listBackupManagedPathSpellings("dotfiles/xum")).toEqual([
+      "dotfiles/xum",
+      "dotfiles/mux",
+    ]);
+  });
+
+  test("keeps paths without a xum segment as the only spelling", () => {
+    expect(listBackupManagedPathSpellings("mux/")).toEqual(["mux/"]);
+    expect(listBackupManagedPathSpellings("backups")).toEqual(["backups"]);
+    // Only whole segments alias; substrings must not be rewritten.
+    expect(listBackupManagedPathSpellings("xum-settings")).toEqual(["xum-settings"]);
+  });
+});
+
 describe("built-in skill compatibility", () => {
-  test("maps old mux skill names to their canonical shux definitions", () => {
-    expect(resolveLegacyMuxBuiltInSkillName("mux-docs")).toBe("shux-docs");
-    expect(resolveLegacyMuxBuiltInSkillName("mux-diagram")).toBe("shux-diagram");
+  test("maps old mux skill names to their canonical xum definitions", () => {
+    expect(resolveLegacyMuxBuiltInSkillName("mux-docs")).toBe("xum-docs");
+    expect(resolveLegacyMuxBuiltInSkillName("mux-diagram")).toBe("xum-diagram");
     expect(resolveLegacyMuxBuiltInSkillName("loop")).toBe("loop");
   });
 });
 
 describe("default-home leftover fallback markers", () => {
   test("accepts only leftover names for the same production or dev suffix", () => {
-    expect(parseShuxHomeLegacyFallbackDirName(".mux\n")).toBe(".mux");
-    expect(parseShuxHomeLegacyFallbackDirName(" .cmux ")).toBe(".cmux");
-    expect(parseShuxHomeLegacyFallbackDirName(".mux-dev", "-dev")).toBe(".mux-dev");
-    expect(parseShuxHomeLegacyFallbackDirName(".mux", "-dev")).toBeUndefined();
-    expect(parseShuxHomeLegacyFallbackDirName(".cmux", "-dev")).toBeUndefined();
-    expect(parseShuxHomeLegacyFallbackDirName("../.mux")).toBeUndefined();
-    expect(parseShuxHomeLegacyFallbackDirName("/tmp/evil")).toBeUndefined();
-    expect(getShuxHomeLegacyFallbackMarkerPath("/home/user", "-dev")).toBe(
-      "/home/user/.shux-dev.legacy-fallback"
+    expect(parseXumHomeLegacyFallbackDirName(".mux\n")).toBe(".mux");
+    expect(parseXumHomeLegacyFallbackDirName(" .cmux ")).toBe(".cmux");
+    expect(parseXumHomeLegacyFallbackDirName(".mux-dev", "-dev")).toBe(".mux-dev");
+    expect(parseXumHomeLegacyFallbackDirName(".mux", "-dev")).toBeUndefined();
+    expect(parseXumHomeLegacyFallbackDirName(".cmux", "-dev")).toBeUndefined();
+    expect(parseXumHomeLegacyFallbackDirName("../.mux")).toBeUndefined();
+    expect(parseXumHomeLegacyFallbackDirName("/tmp/evil")).toBeUndefined();
+    expect(getXumHomeLegacyFallbackMarkerPath("/home/user", "-dev")).toBe(
+      "/home/user/.xum-dev.legacy-fallback"
     );
   });
 
@@ -73,7 +105,7 @@ describe("default-home leftover fallback markers", () => {
 describe("local product-home tilde prefixes", () => {
   test("treats canonical and legacy local homes as the same prefix family", () => {
     for (const dirName of [
-      SHUX_HOME_DIR_NAME,
+      XUM_HOME_DIR_NAME,
       LEGACY_MUX_HOME_DIR_NAME,
       LEGACY_CMUX_HOME_DIR_NAME,
     ]) {
@@ -84,14 +116,8 @@ describe("local product-home tilde prefixes", () => {
   });
 
   test("does not treat lookalike or unrelated tilde paths as the product home", () => {
-    expect(getLocalProductHomeTildeSuffix(`~/${SHUX_HOME_DIR_NAME}-dev`)).toBeUndefined();
+    expect(getLocalProductHomeTildeSuffix(`~/${XUM_HOME_DIR_NAME}-dev`)).toBeUndefined();
     expect(getLocalProductHomeTildeSuffix(`~/${LEGACY_MUX_HOME_DIR_NAME}rc`)).toBeUndefined();
     expect(getLocalProductHomeTildeSuffix("~/projects")).toBeUndefined();
-  });
-});
-
-describe("deep-link protocol compatibility", () => {
-  test("prefers shux while retaining mux as an accepted alias", () => {
-    expect(SUPPORTED_SHUX_PROTOCOL_SCHEMES).toEqual(["shux", "mux"]);
   });
 });

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 # Keep release filenames downgrade-friendly without making mux a second build.
-# Canonical artifacts are lowercase shux-*; leftover capitalized Shux-* names are
+# Canonical artifacts are lowercase xum-*; leftover capitalized Xum-* names are
 # accepted defensively so case-insensitive volumes still emit mux-*, never
-# mux-Shux-*. ${name#shux-} is case-sensitive and would keep the productName
+# mux-Xum-*. ${name#xum-} is case-sensitive and would keep the productName
 # prefix on those leftovers.
 # Symlinks are preferred; filesystems that disallow them (notably default Windows
 # runners) get byte-identical copies as a deterministic fallback.
@@ -12,7 +12,7 @@ set -euo pipefail
 release_dir="${1:-release}"
 shopt -s nullglob
 # Both spellings so a case-sensitive tree still aliases leaked productName files.
-canonical_artifacts=("$release_dir"/shux-* "$release_dir"/Shux-*)
+canonical_artifacts=("$release_dir"/xum-* "$release_dir"/Xum-*)
 shopt -u nullglob
 
 if ((${#canonical_artifacts[@]} == 0)); then
@@ -21,13 +21,13 @@ fi
 
 for canonical_path in "${canonical_artifacts[@]}"; do
   canonical_name="$(basename "$canonical_path")"
-  if [[ ! "$canonical_name" =~ ^[Ss][Hh][Uu][Xx]-(.+)$ ]]; then
+  if [[ ! "$canonical_name" =~ ^[Xx][Uu][Mm]-(.+)$ ]]; then
     continue
   fi
 
   remainder="${BASH_REMATCH[1]}"
-  # Collapse any leftover shux-/Shux- prefix so aliases stay mux-<rest>.
-  while [[ "$remainder" =~ ^[Ss][Hh][Uu][Xx]-(.+)$ ]]; do
+  # Collapse any leftover xum-/Xum- prefix so aliases stay mux-<rest>.
+  while [[ "$remainder" =~ ^[Xx][Uu][Mm]-(.+)$ ]]; do
     remainder="${BASH_REMATCH[1]}"
   done
   if [[ -z "$remainder" ]]; then

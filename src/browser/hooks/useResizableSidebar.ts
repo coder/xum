@@ -2,8 +2,9 @@
  * useResizableSidebar - Custom hook for drag-based sidebar resizing
  *
  * Provides encapsulated resize logic without wrapping DOM elements, preserving
- * existing scroll container hierarchy. Uses global mouse listeners during drag
- * to track cursor position regardless of where the mouse moves.
+ * existing scroll container hierarchy. Uses global pointer listeners during drag
+ * to track the pointer regardless of where it moves. Pointer events (not mouse events) so a
+ * finger or pen can drag the handle too: touch drags never fire mousemove.
  *
  * Design principles:
  * - No interference with scroll containers or flex layout
@@ -24,7 +25,11 @@
 
 import { useState, useEffect, useLayoutEffect, useCallback, useRef } from "react";
 import { getStorageChangeEvent } from "@/common/constants/events";
-import { readPersistedString, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import {
+  readPersistedRawString,
+  readPersistedString,
+  updatePersistedState,
+} from "@/browser/hooks/usePersistedState";
 
 export type ResizableSidebarSide = "left" | "right";
 
@@ -43,6 +48,12 @@ interface UseResizableSidebarOptions {
   storageKey: string;
   /** Which side of the viewport the sidebar is on. Impacts drag direction. */
   side?: ResizableSidebarSide;
+  /**
+   * Opt in to drag-to-collapse. Dragging the handle far past the minimum width snaps the
+   * sidebar closed, and dragging back out within the same gesture reopens it. Called only when
+   * the snapped state flips during a drag, so callers can persist it directly.
+   */
+  onDragCollapseChange?: (collapsed: boolean) => void;
 }
 
 interface UseResizableSidebarResult {
@@ -50,8 +61,8 @@ interface UseResizableSidebarResult {
   width: number;
   /** Whether user is actively dragging the resize handle */
   isResizing: boolean;
-  /** Function to call on handle mouseDown to initiate resize */
-  startResize: (e: React.MouseEvent) => void;
+  /** Function to call on handle pointerDown to initiate resize */
+  startResize: (e: React.PointerEvent) => void;
   /** Placeholder for type compatibility (not used in render) */
   ResizeHandle: React.FC;
 }
@@ -77,6 +88,71 @@ export function resolveInitialResizableSidebarWidth(args: {
   return Math.max(args.minWidth, Math.min(effectiveMaxWidth, parsedWidth));
 }
 
+/**
+ * A drag snaps the sidebar closed once the pointer would make it narrower than this fraction of
+ * `minWidth` (VS Code's sash snap rule). Between this point and `minWidth` the sidebar holds at
+ * its minimum, which gives the drag a short "detent" before it collapses.
+ */
+const DRAG_COLLAPSE_SNAP_RATIO = 0.5;
+
+type ResizeDragResult = { collapsed: true } | { collapsed: false; width: number };
+
+/** Maps the unclamped width a drag asks for to a clamped width or a snapped-closed sidebar. */
+function resolveResizeDrag(args: {
+  rawWidth: number;
+  minWidth: number;
+  maxWidth: number;
+  collapsible: boolean;
+}): ResizeDragResult {
+  if (args.collapsible && args.rawWidth < args.minWidth * DRAG_COLLAPSE_SNAP_RATIO) {
+    return { collapsed: true };
+  }
+  return {
+    collapsed: false,
+    width: Math.max(args.minWidth, Math.min(args.maxWidth, args.rawWidth)),
+  };
+}
+
+/**
+ * While `active`, follows the pointer that started the drag anywhere on the page (document
+ * listeners), so the drag continues after the pointer leaves the handle. Other fingers on a touch
+ * screen neither move nor end the drag. The browser cancels a touch it takes over (e.g. a system
+ * gesture) and sends no pointerup, so pointercancel ends the drag too.
+ */
+function useResizeDragListeners(args: {
+  active: boolean;
+  pointerIdRef: React.RefObject<number | null>;
+  onMove: (event: PointerEvent) => void;
+  onEnd: () => void;
+}): void {
+  const { active, pointerIdRef, onMove, onEnd } = args;
+  useEffect(() => {
+    if (!active) return;
+
+    const handleMove = (event: PointerEvent) => {
+      if (event.pointerId === pointerIdRef.current) onMove(event);
+    };
+    const handleEnd = (event: PointerEvent) => {
+      if (event.pointerId === pointerIdRef.current) onEnd();
+    };
+    document.addEventListener("pointermove", handleMove);
+    document.addEventListener("pointerup", handleEnd);
+    document.addEventListener("pointercancel", handleEnd);
+
+    // Prevent text selection and show resize cursor globally during drag
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+
+    return () => {
+      document.removeEventListener("pointermove", handleMove);
+      document.removeEventListener("pointerup", handleEnd);
+      document.removeEventListener("pointercancel", handleEnd);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+  }, [active, pointerIdRef, onMove, onEnd]);
+}
+
 export function useResizableSidebar({
   enabled,
   defaultWidth,
@@ -85,6 +161,7 @@ export function useResizableSidebar({
   getMaxWidthPx,
   storageKey,
   side = "right",
+  onDragCollapseChange,
 }: UseResizableSidebarOptions): UseResizableSidebarResult {
   // Load persisted width from localStorage on mount
   // Always load persisted value regardless of enabled flag to maintain size across workspace switches
@@ -101,7 +178,7 @@ export function useResizableSidebar({
 
     try {
       return resolveInitialResizableSidebarWidth({
-        storedValue: localStorage.getItem(storageKey),
+        storedValue: readPersistedRawString(storageKey),
         defaultWidth,
         minWidth,
         maxWidth: resolvedMaxWidth,
@@ -120,13 +197,21 @@ export function useResizableSidebar({
   const [isResizing, setIsResizing] = useState(false);
 
   // Refs to track drag state without causing re-renders
-  const startXRef = useRef<number>(0); // Mouse X position when drag started
+  const pointerIdRef = useRef<number | null>(null); // Pointer that started the drag
+  const startXRef = useRef<number>(0); // Pointer X position when drag started
   const startWidthRef = useRef<number>(0); // Sidebar width when drag started
+  // Whether the current drag has snapped the sidebar closed; reset on every drag start.
+  const dragCollapsedRef = useRef(false);
 
   const getMaxWidthPxRef = useRef(getMaxWidthPx);
   useEffect(() => {
     getMaxWidthPxRef.current = getMaxWidthPx;
   }, [getMaxWidthPx]);
+
+  const onDragCollapseChangeRef = useRef(onDragCollapseChange);
+  useEffect(() => {
+    onDragCollapseChangeRef.current = onDragCollapseChange;
+  }, [onDragCollapseChange]);
 
   const resolveMaxWidthPx = useCallback(() => {
     const candidate = getMaxWidthPxRef.current?.();
@@ -205,70 +290,65 @@ export function useResizableSidebar({
   }, [isResizing, minWidth, resolveMaxWidthPx]);
 
   /**
-   * Handle mouse movement during drag.
-   * Calculates new width based on horizontal mouse delta from start position.
+   * Handle pointer movement during drag.
+   * Calculates new width based on horizontal pointer delta from start position.
    *
-   * Width grows as mouse moves:
+   * Width grows as the pointer moves:
    * - left for right-side sidebars
    * - right for left-side sidebars
    */
-  const handleMouseMove = useCallback(
-    (e: MouseEvent) => {
-      if (!isResizing) return;
-
+  const handlePointerMove = useCallback(
+    (e: PointerEvent) => {
       const deltaX =
         side === "right" ? startXRef.current - e.clientX : e.clientX - startXRef.current;
 
-      const maxWidthPx = resolveMaxWidthPx();
-      const newWidth = Math.max(minWidth, Math.min(maxWidthPx, startWidthRef.current + deltaX));
+      const result = resolveResizeDrag({
+        rawWidth: startWidthRef.current + deltaX,
+        minWidth,
+        maxWidth: resolveMaxWidthPx(),
+        collapsible: onDragCollapseChangeRef.current != null,
+      });
 
-      setWidth(newWidth);
+      if (result.collapsed !== dragCollapsedRef.current) {
+        dragCollapsedRef.current = result.collapsed;
+        onDragCollapseChangeRef.current?.(result.collapsed);
+      }
+
+      // While snapped closed, keep the pre-drag width so reopening the sidebar later restores
+      // the size the user had, not the clamped minimum the drag passed through.
+      setWidth(result.collapsed ? startWidthRef.current : result.width);
     },
-    [isResizing, minWidth, side, resolveMaxWidthPx]
+    [minWidth, side, resolveMaxWidthPx]
   );
 
   /**
-   * Handle mouse up to end drag session
+   * Handle pointer up (or a cancelled touch) to end drag session
    * Width is already persisted via useEffect, just need to clear drag state
    */
-  const handleMouseUp = useCallback(() => {
+  const handlePointerEnd = useCallback(() => {
     setIsResizing(false);
   }, []);
 
-  /**
-   * Attach/detach global mouse listeners during drag
-   * Using document-level listeners ensures we track mouse even if it leaves
-   * the resize handle area during drag (critical for smooth UX)
-   */
-  useEffect(() => {
-    if (!isResizing) return;
-
-    document.addEventListener("mousemove", handleMouseMove);
-    document.addEventListener("mouseup", handleMouseUp);
-
-    // Prevent text selection and show resize cursor globally during drag
-    document.body.style.userSelect = "none";
-    document.body.style.cursor = "col-resize";
-
-    return () => {
-      document.removeEventListener("mousemove", handleMouseMove);
-      document.removeEventListener("mouseup", handleMouseUp);
-      document.body.style.userSelect = "";
-      document.body.style.cursor = "";
-    };
-  }, [isResizing, handleMouseMove, handleMouseUp]);
+  useResizeDragListeners({
+    active: isResizing,
+    pointerIdRef,
+    onMove: handlePointerMove,
+    onEnd: handlePointerEnd,
+  });
 
   /**
    * Initiate drag session
-   * Called by resize handle's onMouseDown event
+   * Called by resize handle's onPointerDown event
    * Records starting position and width for delta calculations
    */
   const startResize = useCallback(
-    (e: React.MouseEvent) => {
+    (e: React.PointerEvent) => {
       if (!enabled) return;
       setIsResizing(true);
+      pointerIdRef.current = e.pointerId;
       startXRef.current = e.clientX;
       startWidthRef.current = width;
+      dragCollapsedRef.current = false;
     },
     [enabled, width]
   );

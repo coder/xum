@@ -1,9 +1,14 @@
 import { z } from "zod";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
+import type { PersistedToolModelUsage } from "@/common/types/message";
+import { MCPToolCallDisplaySchema } from "./mcp";
+import { StreamStopCauseSchema } from "@/common/types/streamStopCause";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { ThinkingLevelSchema } from "../../types/thinking";
+import { isValidModelFormat } from "@/common/utils/ai/models";
 import { AgentIdSchema } from "./agentDefinition";
 import { StreamErrorTypeSchema } from "./errors";
-import { AgentSkillScopeSchema, SkillNameSchema } from "./agentSkill";
+import { AgentSkillScopeSchema, SkillLookupNameSchema } from "./agentSkill";
 import { WorkflowRunIdSchema, WorkflowRunRecordSchema } from "./workflow";
 
 export const FilePartSchema = z.object({
@@ -45,6 +50,8 @@ const MuxToolPartBase = z.object({
   // this so queued-but-not-yet-executing tools don't appear to run.
   executionStartedAt: z.number().optional(),
   workflowRun: WorkflowRunToolAttachmentSchema.optional(),
+  // Host-authored display data must not enter the model-visible output.
+  mcpServer: MCPToolCallDisplaySchema.optional().catch(undefined),
 });
 
 /**
@@ -60,11 +67,23 @@ const MuxToolPartBase = z.object({
 export const NestedToolCallSchema = z.object({
   toolCallId: z.string(),
   toolName: z.string(),
-  input: z.unknown(),
+  // Optional: kernel guests can invoke a capability with zero arguments
+  // (mux.tool()), and JSON.stringify drops the resulting `input: undefined`
+  // key on persist. Requiring the key here made onChat replay of such
+  // persisted rows fail oRPC output validation and permanently brick
+  // workspace fetch (one corrupt row killed the whole subscription).
+  input: z.unknown().optional(),
   output: z.unknown().optional(),
   state: z.enum(["input-available", "output-available", "output-redacted"]),
   failed: z.boolean().optional(),
   timestamp: z.number().optional(),
+  // Durable run identity for nested workflow_run/workflow_resume calls, set
+  // by streamManager when the workflow-run-attached event targets a nested
+  // call. Kernel bounding can replace the nested args/result with a marker,
+  // so without this the transcript card loses the run after reload.
+  workflowRun: WorkflowRunToolAttachmentSchema.optional(),
+  // Host-authored display data must not enter the model-visible output.
+  mcpServer: MCPToolCallDisplaySchema.optional().catch(undefined),
 });
 
 export type NestedToolCall = z.infer<typeof NestedToolCallSchema>;
@@ -75,12 +94,16 @@ export const DynamicToolPartPendingSchema = MuxToolPartBase.extend({
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
 
-export const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
+const DynamicToolPartAvailableSchema = MuxToolPartBase.extend({
   state: z.literal("output-available"),
   output: z.unknown(),
+  // Model-only notes the in-turn result carried (`__mux_notifications`), kept out of `output`
+  // so the transcript never shows them. The request build attaches them again: see
+  // readModelOnlyToolNotifications.
+  modelOnlyNotifications: z.array(z.string()).optional().catch(undefined),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
 });
-export const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
+const DynamicToolPartRedactedSchema = MuxToolPartBase.extend({
   state: z.literal("output-redacted"),
   failed: z.boolean().optional(),
   nestedCalls: z.array(NestedToolCallSchema).optional(),
@@ -101,7 +124,6 @@ export const MuxFilePartSchema = FilePartSchema.extend({
 
 // Export types inferred from schemas for reuse across app/test code.
 export type FilePart = z.infer<typeof FilePartSchema>;
-export type MuxFilePart = z.infer<typeof MuxFilePartSchema>;
 
 const CompactionEpochSchema = z.optional(
   z.preprocess(
@@ -119,6 +141,32 @@ export const ModelFallbackRecordSchema = z.object({
   refusedModels: z.array(z.string()),
 });
 
+// One mid-turn thinking raise applied because the turn looked stuck (auto-model-routing).
+export const AutoModelRoutingEscalationSchema = z.object({
+  // 1-based index of the first step that ran at the raised level.
+  step: z.number().int().positive(),
+  from: ThinkingLevelSchema,
+  to: ThinkingLevelSchema,
+  reason: z.string(),
+});
+
+// Auto-model-routing provenance (which tier the evaluator chose, which model and thinking level ran).
+// Both models are re-read from history to build requests (a resume continues on the routed
+// model, request preparation reverts to the fallback), so a damaged value must fail parsing
+// and drop the record rather than reach pricing or the provider.
+export const AutoModelRoutingRecordSchema = z.object({
+  requestedFallbackModel: z.string().refine(isValidModelFormat),
+  tierId: z.string().optional(),
+  tierLabel: z.string().optional(),
+  confidence: z.number().optional(),
+  probabilities: z.record(z.string(), z.number()).optional(),
+  model: z.string().refine(isValidModelFormat),
+  thinkingLevel: ThinkingLevelSchema.optional(),
+  escalations: z.array(AutoModelRoutingEscalationSchema).optional(),
+  status: z.enum(["routed", "unmapped-tier", "fallback"]),
+  reason: z.string().optional(),
+});
+
 const TranscriptAnchorSchema = z.object({
   messageId: z.string(),
   historySequence: z.number(),
@@ -127,36 +175,110 @@ const TranscriptAnchorSchema = z.object({
   partIndex: z.number().int().nonnegative(),
 });
 
-// ShuxMessage (simplified)
+const MuxMessagePartsSchema = z.array(
+  z.discriminatedUnion("type", [
+    MuxTextPartSchema,
+    MuxReasoningPartSchema,
+    MuxToolPartSchema,
+    MuxFilePartSchema,
+  ])
+);
+
+export const ContextBudgetRejectedMessageSchema = z.object({
+  role: z.enum(["user", "assistant"]),
+  parts: MuxMessagePartsSchema,
+  // Original metadata stays inert until explicitly validated for display.
+  metadata: z.any().optional(),
+});
+
+/**
+ * One model-backed tool call or refused fallback attempt billed during a turn
+ * (`PersistedToolModelUsage`). Without it on the wire, onChat output validation strips
+ * `metadata.toolModelUsages`, and the renderer's per-turn cost views miss that spend.
+ */
+export const PersistedToolModelUsageSchema = z.object({
+  toolName: z.string(),
+  toolCallId: z.string().optional(),
+  timestamp: z.number().optional(),
+  model: z.string(),
+  metadataModel: z.string().optional(),
+  // Loose like `metadata.usage`: persisted usage predates the strict wire usage schema.
+  usage: z.custom<LanguageModelV2Usage>(
+    (value) => typeof value === "object" && value !== null && !Array.isArray(value)
+  ),
+  providerMetadata: z.record(z.string(), z.unknown()).optional(),
+}) satisfies z.ZodType<PersistedToolModelUsage>;
+
+/**
+ * `toolModelUsages` list, parsed entry by entry: a malformed or legacy entry is dropped
+ * alone and its valid siblings survive (a whole-array parse would discard all of them).
+ */
+export const PersistedToolModelUsagesSchema = z.array(z.unknown()).transform((entries) =>
+  entries.flatMap((entry) => {
+    const parsed = PersistedToolModelUsageSchema.safeParse(entry);
+    return parsed.success ? [parsed.data] : [];
+  })
+);
+
+// XumMessage (simplified)
 export const MuxMessageSchema = z.object({
   id: z.string(),
   role: z.enum(["system", "user", "assistant"]),
-  parts: z.array(
-    z.discriminatedUnion("type", [
-      MuxTextPartSchema,
-      MuxReasoningPartSchema,
-      MuxToolPartSchema,
-      MuxFilePartSchema,
-    ])
-  ),
+  parts: MuxMessagePartsSchema,
   createdAt: z.date().optional(),
   metadata: z
     .object({
       historySequence: z.number().optional(),
+      compactionReplacementNonce: z.string().min(1).optional().catch(undefined),
+      // Step cuts are an optimization; malformed legacy metadata must not block chat replay.
+      stepStartPartIndices: z.array(z.number()).optional().catch(undefined),
       timestamp: z.number().optional(),
       model: z.string().optional(),
       metadataModel: z.string().optional(),
       thinkingLevel: ThinkingLevelSchema.optional(),
-      routedThroughGateway: z.boolean().optional(),
       routeProvider: z.string().optional(), // Preserve replayed/non-stream route attribution.
       // Self-healing read path (like agentId/compactionEpoch): the badge is purely
       // decorative, so a shape-corrupt persisted record must degrade to "no badge"
       // instead of failing whole-chat loading at the oRPC output boundary.
       modelFallback: ModelFallbackRecordSchema.optional().catch(undefined),
+      autoModelRouting: AutoModelRoutingRecordSchema.optional().catch(undefined),
+      // Prompt-hook context (MuxMetadata.pluginHookContext); a malformed record degrades to none.
+      pluginHookContext: z
+        .array(z.object({ pluginId: z.string(), text: z.string() }))
+        .optional()
+        .catch(undefined),
+      // Anthropic thinking-signature repair receipt (see MuxMetadata.anthropicThinkingReplay).
+      anthropicThinkingReplay: z.literal("off").optional().catch(undefined),
+      // A corrupt point degrades to the strip-all receipt, which is always valid.
+      anthropicThinkingReplayFromStep: z
+        .union([z.number().int().nonnegative(), z.literal("end")])
+        .optional()
+        .catch(undefined),
+      // Volatile system-tail record (MuxMetadata.volatileSystemTail); corrupt degrades to none.
+      volatileSystemTail: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
+      // Same shape for the custom-instructions block, the skill index and the tool instructions.
+      customInstructions: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
+      skillIndex: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
+      toolInstructions: z
+        .object({ text: z.string(), placement: z.enum(["system", "row"]) })
+        .optional()
+        .catch(undefined),
       usage: z.any().optional(),
       contextUsage: z.any().optional(),
       providerMetadata: z.record(z.string(), z.unknown()).optional(),
       contextProviderMetadata: z.record(z.string(), z.unknown()).optional(),
+      // Self-healing read path: a malformed persisted list must not fail the whole history parse.
+      toolModelUsages: PersistedToolModelUsagesSchema.optional().catch(undefined),
+      stopCause: StreamStopCauseSchema.optional().catch(undefined),
       duration: z.number().optional(),
       ttftMs: z.number().optional(),
       systemMessageTokens: z.number().optional(),
@@ -174,6 +296,8 @@ export const MuxMessageSchema = z.object({
       compactionEpoch: CompactionEpochSchema,
       // Durable boundary marker for compaction summaries.
       compactionBoundary: z.boolean().optional(),
+      compactionPublicationId: z.string().min(1).optional().catch(undefined),
+      compactionPublicationGeneration: z.string().min(1).nullable().optional().catch(undefined),
       contextBoundaryKind: z.literal(CONTEXT_BOUNDARY_KINDS.RESET).optional(),
       toolPolicy: z.any().optional(),
       disableWorkspaceAgents: z.boolean().optional(),
@@ -182,12 +306,19 @@ export const MuxMessageSchema = z.object({
       partial: z.boolean().optional(),
       synthetic: z.boolean().optional(),
       uiVisible: z.boolean().optional(),
+      contextBudgetRejected: z.literal(true).optional(),
+      contextBudgetRejectedMessage: ContextBudgetRejectedMessageSchema.optional().catch(undefined),
+      requestPreludeMessageIds: z.array(z.string()).optional(),
+      // RLM keep-recent floor: sanitized post-boundary copy of a pre-compaction row.
+      rlmPreservedTailCopy: z.boolean().optional(),
       transcriptAnchor: TranscriptAnchorSchema.optional().catch(undefined),
 
       // Ignore malformed snapshot metadata so one row cannot fail the whole history parse.
       agentSkillSnapshot: z
         .object({
-          skillName: SkillNameSchema,
+          // A lookup name: `<plugin>:<skill>` for a qualified invocation. Older
+          // builds drop only this metadata (.catch below), not the row.
+          skillName: SkillLookupNameSchema,
           scope: AgentSkillScopeSchema,
           sha256: z.string(),
           frontmatterYaml: z.string().optional(),
@@ -206,6 +337,9 @@ export const MuxMessageSchema = z.object({
         .catch(undefined),
       // Marks the hidden @file snapshot turn, which the timeline skips as context plumbing.
       fileAtMentionSnapshot: z.array(z.string()).optional(),
+      // The send ids this user row accepted (idempotent sends): the composer resolves the
+      // draft entries that retain them when the row arrives.
+      sendIds: z.array(z.string()).optional().catch(undefined),
       error: z.string().optional(),
       errorType: StreamErrorTypeSchema.optional(),
     })

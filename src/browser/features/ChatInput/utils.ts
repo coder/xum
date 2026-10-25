@@ -7,7 +7,11 @@ import {
   type InlineSkillCandidate,
 } from "@/browser/utils/agentSkills/inlineSkillReferences";
 import { resolveSkillUserInvocable } from "@/common/orpc/schemas/agentSkill";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
+import {
+  findInvocableSkill,
+  resolveSkillReadIdentity,
+} from "@/common/utils/agentSkills/skillLookupName";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 import {
   buildMcpPromptBaseKey,
@@ -34,7 +38,7 @@ export type CreationRuntimeValidationError =
   | { mode: "ssh"; kind: "missingCoderPreset" };
 
 export interface SkillInvocation {
-  descriptor: AgentSkillDescriptor;
+  descriptor: InvocableSkill;
   userText: string;
   /** Trimmed text after the slash command (e.g. "123 high" for "/fix-issue 123 high"). */
   argumentText: string;
@@ -88,7 +92,7 @@ function isUnknownSlashCommand(value: ParsedCommand): value is UnknownSlashComma
 
 export function buildSkillInvocationMetadata(
   rawCommand: string,
-  descriptor: AgentSkillDescriptor,
+  descriptor: InvocableSkill,
   argumentText: string
 ): MuxMessageMetadata {
   return buildAgentSkillMetadata({
@@ -221,7 +225,7 @@ async function resolveMcpPromptInvocation(options: {
 async function resolveSkillInvocation(options: {
   messageText: string;
   parsed: ParsedCommand;
-  agentSkillDescriptors: AgentSkillDescriptor[];
+  agentSkillDescriptors: InvocableSkill[];
   api: APIClient | null;
   discovery: SkillResolutionTarget | null;
 }): Promise<SkillInvocation | null> {
@@ -239,8 +243,9 @@ async function resolveSkillInvocation(options: {
 
   // user-invocable: false skills must be treated as nonexistent for typed /skill-name
   // invocation (they remain model-invocable via agent_skill_read).
-  let skill: AgentSkillDescriptor | undefined = options.agentSkillDescriptors.find(
-    (candidate) => candidate.name === command && candidate.userInvocable !== false
+  let skill: InvocableSkill | undefined = findInvocableSkill(
+    options.agentSkillDescriptors.filter((candidate) => candidate.userInvocable !== false),
+    command
   );
 
   if (!skill && options.api && options.discovery) {
@@ -260,7 +265,8 @@ async function resolveSkillInvocation(options: {
       // gate the local descriptor list already carries in normalized form.
       if (resolveSkillUserInvocable(pkg.frontmatter) !== false) {
         skill = {
-          name: pkg.frontmatter.name,
+          // A typed `pstack:tdd` must keep naming the plugin's skill.
+          name: resolveSkillReadIdentity({ name: command }, pkg.frontmatter.name),
           description: pkg.frontmatter.description,
           scope: pkg.scope,
         };
@@ -283,7 +289,7 @@ async function resolveSkillInvocation(options: {
 
 export async function parseCommandWithSkillInvocation(options: {
   messageText: string;
-  agentSkillDescriptors: AgentSkillDescriptor[];
+  agentSkillDescriptors: InvocableSkill[];
   mcpPromptDescriptors?: MCPPromptDescriptor[];
   api: APIClient | null;
   discovery: SkillResolutionTarget | null;
@@ -340,7 +346,7 @@ export async function parseCommandWithSkillInvocation(options: {
 export async function resolveInlineSkillRefsForSend(options: {
   messageText: string;
   slashInvocation: SkillInvocation | null;
-  agentSkillDescriptors: AgentSkillDescriptor[];
+  agentSkillDescriptors: InvocableSkill[];
   api: APIClient | null;
   discovery: SkillResolutionTarget | null;
   candidates?: InlineSkillCandidate[];

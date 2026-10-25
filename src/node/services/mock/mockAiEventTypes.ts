@@ -47,6 +47,7 @@ export interface MockStreamErrorEvent extends MockAssistantEventBase {
   kind: "stream-error";
   error: string;
   errorType: StreamErrorType;
+  retryAfterMs?: number;
 }
 
 export interface MockReasoningEvent extends MockAssistantEventBase {
@@ -59,6 +60,8 @@ export interface MockToolStartEvent extends MockAssistantEventBase {
   toolCallId: string;
   toolName: string;
   args: unknown;
+  /** Hold the stream before this tool call until the test releases it (see holdToolCalls). */
+  holdUntilReleased?: boolean;
 }
 
 export interface MockUsageDeltaEvent extends MockAssistantEventBase {

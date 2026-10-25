@@ -1,3 +1,14 @@
+import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
+import type { LanguageModelV3CallOptions } from "@ai-sdk/provider";
+import { summarizeContinuousCompaction } from "../continuousCompactionSummary";
+import { createAgentSessionHarness, createStartedTurnHandle } from "../agentSession.testHarness";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { prepareWorkspaceRequestHooks } from "./requestHooks";
+import { attachLanguageModelCleanup } from "../languageModelCleanup";
+import { createMuxMessage } from "@/common/types/message";
+import { Ok } from "@/common/types/result";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 /**
  * QuickJS-heavy integration tests for Tier-1 sandboxed plugin hooks: real
  * hooks.js files, real sandbox mounts, real spine middleware. Runs in an
@@ -7,12 +18,13 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { tool, type Tool } from "ai";
 import { z } from "zod";
 import type { Runtime } from "@/node/runtime/Runtime";
 import {
   EventSpine,
+  eventSpine,
   type RequestAssembleContext,
   type ToolExecuteContext,
 } from "@/node/services/events/eventSpine";
@@ -28,8 +40,18 @@ import {
 } from "@/node/services/replay/replayFixture";
 import { collectFullHistory, replayVerifySession } from "@/node/services/replay/replayVerify";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
-import { AgentPluginHookService } from "./hookService";
+import {
+  AgentPluginHookService,
+  agentPluginHookService,
+  readHookSourceCapped,
+} from "./hookService";
+import { bumpContainerMutationEpoch, STAGING_DIR_NAME } from "./journals";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
+import {
+  createMemoryHost,
+  MEMORY_USER_HOME,
+} from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+import { buildPluginServerKey, resolvePluginInstanceId } from "./mcpConfig";
 
 const WORKSPACE_ID = "plugin-hooks-test";
 
@@ -45,18 +67,21 @@ interface Harness {
   sandboxHost: SandboxHostService;
   journal: DurableEventJournal;
   service: AgentPluginHookService;
-  ensure(overrides?: { enabled?: boolean; journal?: DurableEventJournal }): Promise<void>;
+  ensure(overrides?: { journal?: DurableEventJournal }): Promise<void>;
 }
 
 const harnesses: Harness[] = [];
 
-async function createHarness(opts?: { hookTimeoutMs?: number }): Promise<Harness> {
+async function createHarness(opts?: {
+  hookTimeoutMs?: number;
+  spine?: EventSpine;
+}): Promise<Harness> {
   const tmp = new DisposableTempDir("plugin-hooks");
   const container = path.join(tmp.path, "plugins");
   const sessionDir = path.join(tmp.path, "session");
   await fs.mkdir(container, { recursive: true });
   await fs.mkdir(sessionDir, { recursive: true });
-  const spine = new EventSpine();
+  const spine = opts?.spine ?? new EventSpine();
   const sandboxHost = new SandboxHostService();
   const journal = new DurableEventJournal(sessionDir);
   const service = new AgentPluginHookService({
@@ -80,8 +105,7 @@ async function createHarness(opts?: { hookTimeoutMs?: number }): Promise<Harness
         workspaceId: WORKSPACE_ID,
         sessionDir,
         journal: overrides?.journal ?? journal,
-        enabled: overrides?.enabled ?? true,
-        muxHome: tmp.path,
+        xumHome: tmp.path,
         projectTrusted: false,
       }),
   };
@@ -147,6 +171,83 @@ function blockedError(ctx: ToolExecuteContext): string {
   return result.error as string;
 }
 
+describe("readHookSourceCapped", () => {
+  test("enforces the hook size ceiling at the read itself", async () => {
+    // Discovery's stat-based cap and the consuming read are separated by an
+    // update-sized TOCTOU window (a managed update can promote a replacement
+    // hooks.js between them), so the ceiling must hold at read time: an
+    // oversized source is refused, a normal one round-trips byte-exact.
+    using tmp = new DisposableTempDir("hook-source-cap");
+    const smallPath = path.join(tmp.path, "hooks.js");
+    await fs.writeFile(smallPath, "({ 'tool.execute.before': () => undefined })", "utf8");
+    expect(await readHookSourceCapped(smallPath, tmp.path)).toBe(
+      "({ 'tool.execute.before': () => undefined })"
+    );
+
+    const bigPath = path.join(tmp.path, "big-hooks.js");
+    await fs.writeFile(bigPath, `// ${"x".repeat(2 * 1024 * 1024)}\n({})`, "utf8");
+    // try/catch instead of .rejects: bun:test types trip await-thenable.
+    try {
+      await readHookSourceCapped(bigPath, tmp.path);
+      expect.unreachable("an oversized hooks.js must be refused at read time");
+    } catch (error) {
+      expect((error as Error).message).toContain("too large");
+    }
+  });
+
+  test("follows a CONTAINED hooks.js symlink but refuses one escaping the plugin root", async () => {
+    // Consent-time validation (staging + discovery) accepts relative symlinks
+    // that stay inside the plugin, so the consuming read must too — but a
+    // replacement link whose target resolves OUTSIDE the plugin root (staged
+    // validation reads that as a capability removal) must be refused instead
+    // of evaluating the outside file as hook code.
+    using tmp = new DisposableTempDir("hook-source-symlink");
+    const root = path.join(tmp.path, "plugin-root");
+    await fs.mkdir(root);
+    const inside = path.join(root, "impl.js");
+    await fs.writeFile(inside, "({ 'tool.execute.before': () => undefined })", "utf8");
+    const containedLink = path.join(root, "hooks.js");
+    await fs.symlink(inside, containedLink);
+    expect(await readHookSourceCapped(containedLink, root)).toContain("tool.execute.before");
+
+    const outside = path.join(tmp.path, "outside.js");
+    await fs.writeFile(outside, "({ 'tool.execute.before': () => undefined })", "utf8");
+    const escapingLink = path.join(root, "escaping-hooks.js");
+    await fs.symlink(outside, escapingLink);
+    try {
+      await readHookSourceCapped(escapingLink, root);
+      expect.unreachable("a hooks.js symlink escaping the plugin root must be refused");
+    } catch (error) {
+      expect((error as Error).message).toContain("outside containment root");
+    }
+  });
+
+  test("refuses a hooks.js reached through a symlinked ancestor directory", async () => {
+    // The leaf lstat check cannot catch a replacement symlink at an ANCESTOR
+    // component (lib/hooks.js where `lib` becomes a link to an outside dir):
+    // lstat follows ancestor links and reports the outside file as regular
+    // with matching dev/ino. The post-open containment recheck must reject
+    // the resolved path escaping the plugin root.
+    using tmp = new DisposableTempDir("hook-source-ancestor-symlink");
+    const outsideDir = path.join(tmp.path, "outside");
+    await fs.mkdir(outsideDir);
+    await fs.writeFile(
+      path.join(outsideDir, "hooks.js"),
+      "({ 'tool.execute.before': () => undefined })",
+      "utf8"
+    );
+    const root = path.join(tmp.path, "plugin-root");
+    await fs.mkdir(root);
+    await fs.symlink(outsideDir, path.join(root, "lib"));
+    try {
+      await readHookSourceCapped(path.join(root, "lib", "hooks.js"), root);
+      expect.unreachable("an ancestor-symlinked hooks.js must be refused at read time");
+    } catch (error) {
+      expect((error as Error).message).toContain("outside containment root");
+    }
+  });
+});
+
 describe("AgentPluginHookService", () => {
   test("tool.execute.before blocks .env reads with a clear model-visible error", async () => {
     const harness = await createHarness();
@@ -181,6 +282,46 @@ describe("AgentPluginHookService", () => {
     const otherWorkspace = makeToolCtx("file_read", { path: "/repo/.env" }, "other-workspace");
     await runTool(harness.spine, otherWorkspace);
     expect(otherWorkspace.executed).toBe(true);
+  });
+
+  test("hooks retain a valid global view after rejecting an outward project alias", async () => {
+    const harness = await createHarness();
+    const project = path.join(harness.tmp.path, "checkout");
+    const alias = path.join(project, ".xum", "plugins");
+    await writeHookPlugin(
+      harness.container,
+      "fallback-guard",
+      `({
+      "tool.execute.before": () => ({ deny: "Global fallback is active" }),
+    })`,
+      { tools: ["file_read"] }
+    );
+    await fs.mkdir(path.dirname(alias), { recursive: true });
+    await fs.symlink(harness.container, alias, "dir");
+    const service = new AgentPluginHookService({
+      spine: harness.spine,
+      sandboxHost: harness.sandboxHost,
+      computeContainers: () => [
+        { path: alias, scope: "project" },
+        { path: harness.container, scope: "global" },
+      ],
+    });
+    try {
+      await service.ensureWorkspaceHooks({
+        workspaceId: WORKSPACE_ID,
+        sessionDir: harness.sessionDir,
+        journal: harness.journal,
+        xumHome: harness.tmp.path,
+        projectRoot: project,
+        projectTrusted: true,
+      });
+      const ctx = makeToolCtx("file_read", { path: "/repo/secret.txt" });
+      await runTool(harness.spine, ctx);
+      expect(ctx.executed).toBe(false);
+      expect(blockedError(ctx)).toContain("Global fallback is active");
+    } finally {
+      await service.disposeWorkspace(WORKSPACE_ID);
+    }
   });
 
   test("before-hook visibility and mutation are bounded to granted tools", async () => {
@@ -247,6 +388,470 @@ describe("AgentPluginHookService", () => {
     const result = ctx.result as { ok: boolean; hook_output?: string };
     expect(result.ok).toBe(true);
     expect(result.hook_output).toBe("[plugin:auditor] observed ok=true");
+  });
+
+  test.each(["enabled", "abort-after-load", "abort-after-assembly", "assembly-error"] as const)(
+    "headless compaction shares the plugin policy lifecycle: %s",
+    async (mode) => {
+      const controller = new AbortController();
+      const harness = await createHarness({ spine: eventSpine });
+      const h = await createAgentSessionHarness({ workspaceId: WORKSPACE_ID });
+      const policy = "Do not disclose repository secrets in summaries.";
+      await writeHookPlugin(
+        harness.container,
+        "summary-policy",
+        `({ "request.assemble": () => ({ context: ${JSON.stringify(policy)} }) })`
+      );
+      const ensure = spyOn(agentPluginHookService, "ensureWorkspaceHooks").mockImplementation(
+        async (args) => {
+          await harness.service.ensureWorkspaceHooks(args);
+          if (mode === "abort-after-load") controller.abort();
+        }
+      );
+      const removeMiddleware = eventSpine.useAfter("request.assemble", (ctx) => {
+        if (ctx.workspaceId !== WORKSPACE_ID) return;
+        if (mode === "abort-after-assembly" || mode === "assembly-error") {
+          expect(ctx.systemMessage).toContain(policy);
+          if (mode === "assembly-error") throw new Error("Assembly policy rejected request");
+          controller.abort();
+        }
+      });
+      const subProjectPath = path.join(h.config.rootDir, "subproject");
+      await fs.mkdir(subProjectPath, { recursive: true });
+      const metadata = spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(
+        Ok({
+          id: WORKSPACE_ID,
+          name: h.config.rootDir,
+          projectName: "test",
+          projectPath: h.config.rootDir,
+          subProjectPath,
+          runtimeConfig: { type: "local" },
+        })
+      );
+      const requests: LanguageModelV3CallOptions[] = [];
+      const cleanup = mock(() => undefined);
+      const sdkModel = new MockLanguageModelV3({
+        doStream: (request) => {
+          requests.push(request);
+          return Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "text-start", id: "summary" },
+                {
+                  type: "text-delta",
+                  id: "summary",
+                  delta: "Sanitized summary of the investigation.",
+                },
+                { type: "text-end", id: "summary" },
+                {
+                  type: "finish",
+                  finishReason: { unified: "stop", raw: "stop" },
+                  usage: {
+                    inputTokens: { total: 20, noCache: 20, cacheRead: 0, cacheWrite: 0 },
+                    outputTokens: { total: 5, text: 5, reasoning: 0 },
+                  },
+                },
+              ],
+            }),
+          });
+        },
+      });
+      attachLanguageModelCleanup(sdkModel, cleanup);
+      const create = spyOn(h.aiService, "createModelWithPinnedOptions").mockResolvedValue(
+        Ok({
+          model: sdkModel,
+          metadataModel: "openai:gpt-4o",
+          effectiveModelString: "openai:gpt-4o",
+          wireProviderName: "openai",
+          optionsModelString: "openai:gpt-4o",
+          optionsProvidersConfig: {},
+          optionsMuxProviderOptions: {},
+          optionsRouteProvider: "openai",
+        })
+      );
+      const record = mock(() => Promise.resolve(undefined));
+      try {
+        expect(ensure).not.toHaveBeenCalled();
+        const result = await summarizeContinuousCompaction({
+          workspaceId: WORKSPACE_ID,
+          config: h.config,
+          aiService: h.aiService,
+          sessionUsageService: { recordHeadlessUsage: record },
+          head: [createMuxMessage("head", "user", "Summarize the investigation")],
+          receiptRows: [],
+          signal: controller.signal,
+          context: {
+            enabled: true,
+            model: "openai:gpt-4o",
+            contextWindowTokens: 128_000,
+            thresholdPercent: 70,
+          },
+          baseOptions: { model: "openai:gpt-4o", agentId: "exec" },
+          compactOptions: { model: "openai:gpt-4o", agentId: "compact" },
+        }).then(
+          (data) => ({ success: true as const, data }),
+          (error: unknown) => ({ success: false as const, error })
+        );
+        expect(ensure).toHaveBeenCalledTimes(1);
+        expect(ensure.mock.calls[0][0]).toMatchObject({
+          projectRoot: h.config.rootDir,
+          // Project plugin instance IDs hash the project key, not the checkout.
+          projectKey: h.config.rootDir,
+          projectTrusted: false,
+        });
+        if (mode !== "enabled") {
+          expect(result.success).toBe(false);
+          if (result.success) throw new Error("Canceled or failed assembly published a summary");
+          expect(result.error).toBeInstanceOf(Error);
+          expect(requests).toHaveLength(0);
+          expect(record).not.toHaveBeenCalled();
+          expect(cleanup).toHaveBeenCalledTimes(mode === "abort-after-load" ? 0 : 1);
+          expect(create).toHaveBeenCalledTimes(mode === "abort-after-load" ? 0 : 1);
+          return;
+        }
+        if (!result.success) throw result.error;
+        expect(result.data?.text).toContain("Sanitized summary");
+        expect(requests).toHaveLength(1);
+        expect(
+          requests[0].prompt.some(
+            (message) => message.role === "system" && message.content.includes(policy)
+          )
+        ).toBe(true);
+        const journal = sharedDurableEventJournal(path.join(h.config.sessionsDir, WORKSPACE_ID));
+        const rows = await journal.read();
+        expect(rows.filter((row) => row.kind === "hook-context")).toHaveLength(1);
+        expect(record).toHaveBeenCalledTimes(1);
+        expect(cleanup).toHaveBeenCalledTimes(1);
+      } finally {
+        removeMiddleware();
+        ensure.mockRestore();
+        metadata.mockRestore();
+        create.mockRestore();
+        await harness.service.disposeWorkspace(WORKSPACE_ID);
+        await h.session.dispose();
+        await h.cleanup();
+      }
+    }
+  );
+
+  test("lazy context-only hooks participate in the first rollover without prebuilding tools", async () => {
+    const harness = await createHarness({ spine: eventSpine });
+    await writeHookPlugin(
+      harness.container,
+      "first-rollover",
+      `({ "request.assemble": input => ({ context: Object.keys(input).sort().join(",") }) })`
+    );
+    const injected: string[] = [];
+    const h = await createAgentSessionHarness({
+      workspaceId: WORKSPACE_ID,
+      aiServiceOverrides: {
+        captureRequestAssemblySnapshot: async (workspaceId) => {
+          await prepareWorkspaceRequestHooks({
+            config: h.config,
+            metadata,
+            hostCheckoutRoot: h.config.rootDir,
+            journal: sharedDurableEventJournal(path.join(h.config.sessionsDir, workspaceId)),
+          });
+          return Ok(eventSpine.captureRequestAssembly(workspaceId));
+        },
+        streamMessage: async (request) => {
+          expect(request.requestAssemblySnapshot?.preservesToolset).toBe(true);
+          const ctx: RequestAssembleContext = {
+            workspaceId: WORKSPACE_ID,
+            modelString: request.modelString,
+            systemMessage: "base",
+            tools: {},
+          };
+          await request.requestAssemblySnapshot!.run(ctx);
+          injected.push(ctx.systemMessage);
+          return Ok(createStartedTurnHandle(h.session.closingSignal, "assistant"));
+        },
+      },
+    });
+    const metadata: FrontendWorkspaceMetadata = {
+      id: WORKSPACE_ID,
+      name: "rollover",
+      projectName: "project",
+      projectPath: h.config.rootDir,
+      namedWorkspacePath: h.config.rootDir,
+      runtimeConfig: { type: "local" },
+    };
+    const ensure = spyOn(agentPluginHookService, "ensureWorkspaceHooks").mockImplementation(
+      (args) => harness.service.ensureWorkspaceHooks(args)
+    );
+    spyOn(h.aiService, "getWorkspaceMetadata").mockResolvedValue(Ok(metadata));
+    spyOn(h.aiService, "isExperimentEnabled").mockImplementation(
+      (id) => id === EXPERIMENT_IDS.TOKEN_BUDGET || id === EXPERIMENT_IDS.MEMORY
+    );
+    try {
+      await h.historyService.appendManyToHistory(WORKSPACE_ID, [
+        createMuxMessage("old-user", "user", "old request"),
+        createMuxMessage("old-answer", "assistant", "old answer", {
+          model: "openai:gpt-4o",
+          // Cross the usable ceiling: the handoff target no longer forces a rollover.
+          contextUsage: { inputTokens: 120000, outputTokens: 10, totalTokens: 120010 },
+        }),
+      ]);
+      expect(eventSpine.hasMiddleware("request.assemble")).toBe(false);
+      expect(
+        (
+          await h.session.sendMessage("New request", {
+            model: "openai:gpt-4o",
+            agentId: "exec",
+          })
+        ).success
+      ).toBe(true);
+      expect(ensure).toHaveBeenCalledTimes(1);
+      expect(injected).toEqual(["base\n\nmodelString,settings,workspaceId"]);
+    } finally {
+      ensure.mockRestore();
+      await h.session.dispose();
+      await h.cleanup();
+    }
+  });
+
+  test.each(["dispose", "epoch"] as const)(
+    "an admitted context snapshot cannot revive a plugin revoked by %s",
+    async (mode) => {
+      const harness = await createHarness();
+      await writeHookPlugin(
+        harness.container,
+        "revoked-context",
+        `({ "request.assemble": () => ({ context: "must not return" }) })`
+      );
+      await harness.ensure();
+      const snapshot = harness.spine.captureRequestAssembly(WORKSPACE_ID);
+      expect(snapshot.preservesToolset).toBe(true);
+      if (mode === "dispose") await harness.service.disposeWorkspace(WORKSPACE_ID);
+      else {
+        const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+        await fs.mkdir(stagingRoot, { recursive: true });
+        await bumpContainerMutationEpoch(stagingRoot);
+      }
+      const ctx: RequestAssembleContext = {
+        workspaceId: WORKSPACE_ID,
+        modelString: "model",
+        systemMessage: "base",
+        tools: {},
+      };
+      await snapshot.run(ctx);
+      expect(ctx.systemMessage).toBe("base");
+    }
+  );
+
+  test("hooks get their own plugin's MCP server settings", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "cad-hooks",
+      `({ "request.assemble": (input) => ({ context: "Units: " + input.settings.cad.units }) })`
+    );
+    const prefixes: string[] = [];
+    harness.service.setSettingsProvider((workspaceId, prefix) => {
+      expect(workspaceId).toBe(WORKSPACE_ID);
+      prefixes.push(prefix);
+      return Promise.resolve({ cad: { units: "mm" } });
+    });
+    await harness.ensure();
+    const ctx: RequestAssembleContext = {
+      workspaceId: WORKSPACE_ID,
+      modelString: "model",
+      systemMessage: "base",
+      tools: {},
+    };
+    await harness.spine.run("request.assemble", ctx);
+    expect(ctx.systemMessage).toBe("base\n\nUnits: mm");
+    // The same instance ID as the plugin's MCP server keys.
+    const instanceId = resolvePluginInstanceId(
+      { scope: "global", containerPath: harness.container, dirName: "cad-hooks" },
+      {}
+    );
+    expect(prefixes).toEqual([buildPluginServerKey(instanceId, "")]);
+  });
+
+  test("one dispatch starts every plugin's settings read before it waits on the first", async () => {
+    // #6186: the spine runs plugin middleware serially, so serial reads add one timeout each.
+    const harness = await createHarness();
+    for (const name of ["first-plugin", "second-plugin"]) {
+      await writeHookPlugin(
+        harness.container,
+        name,
+        `({ "request.assemble": (input) => ({ context: input.settings.s.v }) })`
+      );
+    }
+    const prefixes: string[] = [];
+    const firstReached = Promise.withResolvers<void>();
+    const gate = Promise.withResolvers<void>();
+    harness.service.setSettingsProvider(async (_workspaceId, prefix) => {
+      prefixes.push(prefix);
+      firstReached.resolve();
+      await gate.promise;
+      return { s: { v: prefix } };
+    });
+    await harness.ensure();
+    const ctx: RequestAssembleContext = {
+      workspaceId: WORKSPACE_ID,
+      modelString: "model",
+      systemMessage: "base",
+      tools: {},
+    };
+    const running = harness.spine.run("request.assemble", ctx);
+    await firstReached.promise;
+    const startedBeforeFirstSettled = new Set(prefixes).size;
+    gate.resolve();
+    await running;
+    expect(startedBeforeFirstSettled).toBe(2);
+    // Each hook still gets only its own plugin's settings.
+    const contributed = ctx.systemMessage.split("\n\n").slice(1);
+    expect(new Set(contributed)).toEqual(new Set(prefixes));
+    expect(contributed).toHaveLength(2);
+  });
+
+  test("a tool call prefetches settings only for sibling plugins that grant the tool", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "reads-files",
+      `({ "tool.execute.before": () => ({}) })`,
+      { tools: ["file_read"] }
+    );
+    await writeHookPlugin(
+      harness.container,
+      "runs-bash",
+      `({ "tool.execute.before": () => ({}) })`,
+      { tools: ["bash"] }
+    );
+    const prefixes: string[] = [];
+    harness.service.setSettingsProvider((_workspaceId, prefix) => {
+      prefixes.push(prefix);
+      return Promise.resolve({});
+    });
+    await harness.ensure();
+    await runTool(harness.spine, makeToolCtx("file_read", { path: "/repo/a.txt" }));
+    // Only the plugin that can run on file_read has its settings read.
+    expect(new Set(prefixes).size).toBe(1);
+  });
+
+  test("hook settings above the size cap are omitted with a flag", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "big-settings",
+      `({ "request.assemble": (input) => ({ context: Object.keys(input.settings).length + ":" + input.settingsOmitted }) })`
+    );
+    let value = "x";
+    harness.service.setSettingsProvider(() => Promise.resolve({ cad: { notes: value } }));
+    await harness.ensure();
+    const assemble = async () => {
+      const ctx: RequestAssembleContext = {
+        workspaceId: WORKSPACE_ID,
+        modelString: "model",
+        systemMessage: "base",
+        tools: {},
+      };
+      await harness.spine.run("request.assemble", ctx);
+      return ctx.systemMessage;
+    };
+    expect(await assemble()).toBe("base\n\n1:undefined");
+    // About what four servers at the per-server limits can send.
+    value = "x".repeat(400 * 1024);
+    expect(await assemble()).toBe("base\n\n0:true");
+    // The cap counts UTF-8 bytes of the settings JSON, `{"cad":{"notes":"…"}}` (20 bytes around
+    // the value): exactly at the cap passes, one byte over is omitted.
+    const cap = 64 * 1024;
+    value = "x".repeat(cap - 20);
+    expect(await assemble()).toBe("base\n\n1:undefined");
+    value = "x".repeat(cap - 19);
+    expect(await assemble()).toBe("base\n\n0:true");
+    // Non-ASCII text: fewer UTF-16 units than the cap, but more bytes.
+    value = "é".repeat((cap - 20) / 2 + 1);
+    expect(await assemble()).toBe("base\n\n0:true");
+  });
+
+  test.each(["dispose", "epoch"] as const)(
+    "a %s that lands while a hook reads its settings stops the call",
+    async (mode) => {
+      // Salvaged from #6040: the settings read must come before the revocation checks.
+      const harness = await createHarness();
+      await writeHookPlugin(
+        harness.container,
+        "revoked-mid-read",
+        `({ "tool.execute.before": () => ({ deny: "removed hook ran" }) })`,
+        { tools: ["file_read"] }
+      );
+      const gate = Promise.withResolvers<void>();
+      const reached = Promise.withResolvers<void>();
+      harness.service.setSettingsProvider(async () => {
+        reached.resolve();
+        await gate.promise;
+        return {};
+      });
+      await harness.ensure();
+      const mountSpy = spyOn(harness.sandboxHost, "withPersistentMount");
+      try {
+        const ctx = makeToolCtx("file_read", { path: "/repo/a.txt" });
+        const running = runTool(harness.spine, ctx);
+        await reached.promise;
+        if (mode === "dispose") await harness.service.disposeWorkspace(WORKSPACE_ID);
+        else {
+          const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+          await fs.mkdir(stagingRoot, { recursive: true });
+          await bumpContainerMutationEpoch(stagingRoot);
+        }
+        gate.resolve();
+        await running;
+        expect(ctx.executed).toBe(true);
+        expect(ctx.blocked).toBeUndefined();
+        expect(mountSpy).not.toHaveBeenCalled();
+      } finally {
+        gate.resolve();
+        mountSpy.mockRestore();
+      }
+    }
+  );
+
+  test("a plugin revoked (epoch bump, e.g. another backend's update) before the hook call never has its settings server contacted", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "revoked-before-read",
+      `({ "tool.execute.before": () => ({ deny: "removed hook ran" }) })`,
+      { tools: ["file_read"] }
+    );
+    let settingsReads = 0;
+    harness.service.setSettingsProvider(() => {
+      settingsReads++;
+      return Promise.resolve({});
+    });
+    await harness.ensure();
+    // The middleware stays registered (no local teardown yet); only the epoch moved.
+    const ctx = makeToolCtx("file_read", { path: "/repo/a.txt" });
+    const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+    await fs.mkdir(stagingRoot, { recursive: true });
+    await bumpContainerMutationEpoch(stagingRoot);
+    await runTool(harness.spine, ctx);
+    expect(ctx.blocked).toBeUndefined();
+    expect(settingsReads).toBe(0);
+  });
+
+  test("an admitted context snapshot reacquires a dropped sandbox instead of retaining its runtime", async () => {
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "reload-context",
+      `({ "request.assemble": (input) => ({ context: input.workspaceId }) })`
+    );
+    await harness.ensure();
+    const snapshot = harness.spine.captureRequestAssembly(WORKSPACE_ID);
+    harness.sandboxHost.disposeAll();
+    const ctx: RequestAssembleContext = {
+      workspaceId: WORKSPACE_ID,
+      modelString: "model",
+      systemMessage: "base",
+      tools: {},
+    };
+    await snapshot.run(ctx);
+    expect(ctx.systemMessage).toBe(`base\n\n${WORKSPACE_ID}`);
   });
 
   test("request.assemble context is journaled as a hook-context row, then applied", async () => {
@@ -477,14 +1082,6 @@ describe("AgentPluginHookService", () => {
     const second = makeToolCtx("file_read", { path: "/repo/a.txt" });
     await runTool(harness.spine, second);
     expect(blockedError(second)).toContain("second version");
-
-    // Disable (experiment off) → middleware unregistered, tool runs untouched.
-    await harness.ensure({ enabled: false });
-    expect(harness.spine.hasMiddleware("tool.execute")).toBe(false);
-    const third = makeToolCtx("file_read", { path: "/repo/a.txt" });
-    await runTool(harness.spine, third);
-    expect(third.executed).toBe(true);
-    expect(third.blocked).toBeUndefined();
   });
 });
 
@@ -518,8 +1115,7 @@ describe("replay determinism with hooks active", () => {
       workspaceId: REPLAY_FIXTURE_WORKSPACE_ID,
       sessionDir: harness.sessionDir,
       journal: fixtureCtx.journal,
-      enabled: true,
-      muxHome: harness.tmp.path,
+      xumHome: harness.tmp.path,
       projectTrusted: false,
     });
 
@@ -554,7 +1150,10 @@ describe("replay determinism with hooks active", () => {
     expect(hookRows[0].data.text).toBe("House rule: never commit secrets.");
 
     // ...and byte-level replay verification passes with the hook active.
-    const historyService = new HistoryService({ getSessionDir: () => harness.sessionDir });
+    const historyService = new HistoryService({
+      getSessionDir: () => harness.sessionDir,
+      rootDir: path.dirname(harness.sessionDir),
+    });
     const history = await collectFullHistory(historyService, REPLAY_FIXTURE_WORKSPACE_ID);
     expect(history.success).toBe(true);
     if (!history.success) throw new Error("history read failed");
@@ -568,5 +1167,89 @@ describe("replay determinism with hooks active", () => {
     expect(result.turns[0].status).toBe("PASS");
 
     await harness.service.disposeWorkspace(REPLAY_FIXTURE_WORKSPACE_ID);
+  });
+});
+
+describe("epoch-based hook retirement", () => {
+  test("a managed plugin mutation (epoch bump) retires live hooks before the next invocation", async () => {
+    // An uninstall/update/install committed in ANY process bumps the managed
+    // container's mutation epoch. Already-registered hooks must stop seeing
+    // tool traffic at the next invocation — not survive until the workspace's
+    // next send calls ensureWorkspaceHooks — or a mid-stream uninstall would
+    // keep exposing tool args/results to (and accepting denials/rewrites
+    // from) the removed plugin.
+    const harness = await createHarness();
+    await writeHookPlugin(
+      harness.container,
+      "epoch-demo",
+      "({ 'tool.execute.before': () => ({ deny: 'blocked by hook' }) })",
+      { tools: ["dangerous_tool"] }
+    );
+    await harness.ensure();
+
+    // Live: the hook denies the granted tool.
+    const before = makeToolCtx("dangerous_tool", { a: 1 });
+    await runTool(harness.spine, before);
+    expect(blockedError(before)).toContain("blocked by hook");
+
+    const stagingRoot = path.join(harness.tmp.path, STAGING_DIR_NAME);
+    await fs.mkdir(stagingRoot, { recursive: true });
+    await bumpContainerMutationEpoch(stagingRoot);
+
+    // Stale epoch: the registration is torn down before the hook sees input.
+    const after = makeToolCtx("dangerous_tool", { a: 2 });
+    await runTool(harness.spine, after);
+    expect(after.blocked).toBeUndefined();
+    expect(after.executed).toBe(true);
+
+    // The next ensure re-registers from disk with the fresh epoch.
+    await harness.ensure();
+    const reensured = makeToolCtx("dangerous_tool", { a: 3 });
+    await runTool(harness.spine, reensured);
+    expect(blockedError(reensured)).toContain("blocked by hook");
+  });
+});
+
+describe("AgentPluginHookService host layers", () => {
+  test("discovers and reads hooks.js on the host files and paths it is given", async () => {
+    // Phase 5: the turn passes the loop's HostFiles and HostPaths. This plugin exists only in the
+    // memory home's ~/.agents/plugins, so the Node home and filesystem find no hook.
+    const harness = await createHarness();
+    const host = createMemoryHost();
+    const plugin = path.join(MEMORY_USER_HOME, ".agents", "plugins", "memory-denier");
+    await host.files.promises.mkdir(plugin, { recursive: true });
+    await host.files.promises.writeFile(
+      path.join(plugin, "plugin.json"),
+      JSON.stringify({
+        $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0,
+        name: "memory-denier",
+        extensions: { mux: { hooks: { tools: ["file_read"] } } },
+      })
+    );
+    await host.files.promises.writeFile(
+      path.join(plugin, "hooks.js"),
+      `({ "tool.execute.before": () => ({ deny: "Denied from the memory home" }) })`
+    );
+    const service = new AgentPluginHookService({
+      spine: harness.spine,
+      sandboxHost: harness.sandboxHost,
+    });
+    try {
+      await service.ensureWorkspaceHooks({
+        workspaceId: WORKSPACE_ID,
+        sessionDir: harness.sessionDir,
+        journal: harness.journal,
+        xumHome: harness.tmp.path,
+        projectTrusted: false,
+        hostFiles: host.files,
+        hostPaths: host.paths,
+      });
+      const ctx = makeToolCtx("file_read", { path: "/repo/secret.txt" });
+      await runTool(harness.spine, ctx);
+      expect(ctx.executed).toBe(false);
+      expect(blockedError(ctx)).toContain("Denied from the memory home");
+    } finally {
+      await service.disposeWorkspace(WORKSPACE_ID);
+    }
   });
 });

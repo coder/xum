@@ -12,22 +12,24 @@ import {
   BookOpen,
   Brain,
   CircleCheck,
+  Cpu,
   Database,
   FileText,
   GitCommit,
   Globe,
   GraduationCap,
   Hand,
+  History,
   Keyboard,
   Layers,
   LayoutGrid,
-  Lightbulb,
   MessageCircleQuestion,
   Monitor,
   Move,
   MousePointerClick,
   MessageSquareMore,
   Paperclip,
+  PanelRight,
   Info,
   List,
   Pencil,
@@ -112,7 +114,7 @@ const getStatusColor = (status: string) => {
     case "executing":
       return "text-pending";
     case "completed":
-      return "text-success";
+      return "text-success-text";
     case "failed":
       return "text-danger";
     case "interrupted":
@@ -252,11 +254,18 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   // LayoutGrid (a 2×2 catalog of tiles) reads as "the index of skills you can pick
   // from" — distinct from the GraduationCap used when reading a single skill.
   agent_skill_list: LayoutGrid,
-  advisor: Lightbulb,
+  // Cpu reads as "the models (compute) you can pick from"; distinct from the
+  // Brain glyph used for the memory tool.
+  models_list: Cpu,
   ask_user_question: MessageCircleQuestion,
   file_read: BookOpen,
+  session_history: History,
+  // A model-requested fresh window: the same "start over" affordance as workflow_resume.
+  new_context: RotateCcw,
   memory: Brain,
   attach_file: Paperclip,
+  // Publishing shows the file in the Artifacts tab of the right sidebar.
+  artifact: PanelRight,
   desktop_screenshot: Monitor,
   desktop_move_mouse: Move,
   desktop_click: MousePointerClick,
@@ -265,6 +274,7 @@ export const TOOL_NAME_TO_ICON: Partial<Record<string, LucideIcon>> = {
   desktop_scroll: ArrowDownUp,
   desktop_type: Keyboard,
   desktop_key_press: Keyboard,
+  computer: Monitor,
   file_edit_insert: Pencil,
   file_edit_replace_string: Pencil,
   file_edit_replace_lines: Pencil,

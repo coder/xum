@@ -1,7 +1,7 @@
 /**
  * Pre-resolved scope for mux-managed resource tools (skills, AGENTS.md, config).
  *
- * Global: tools operate under ~/.shux/.
+ * Global: tools operate under ~/.xum/.
  * Project: tools operate under the project root (any project workspace).
  *
  * `projectRoot` is a **host-local** filesystem root used by mux tools that call
@@ -10,11 +10,11 @@
  */
 export type ProjectStorageAuthority = "host-local" | "runtime";
 
-export type MuxToolScope =
-  | { readonly type: "global"; readonly muxHome: string }
+export type XumToolScope =
+  | { readonly type: "global"; readonly xumHome: string }
   | {
       readonly type: "project";
-      readonly muxHome: string;
+      readonly xumHome: string;
       readonly projectRoot: string;
       readonly projectStorageAuthority: ProjectStorageAuthority;
       /**
@@ -23,4 +23,10 @@ export type MuxToolScope =
        * ancestor through it. Host-local Agent Plugins also anchor here.
        */
       readonly checkoutRoot?: string;
+      /**
+       * #6426: whether the project's own Agent Plugins (.xum/plugins, .agents/plugins) may
+       * contribute skills. Only `true` loads them; absent means untrusted (fail closed), the
+       * same rule their MCP servers, hooks and slash commands follow.
+       */
+      readonly projectPluginsTrusted?: boolean;
     };

@@ -1,15 +1,16 @@
 import type {
   EnsureReadyOptions,
   EnsureReadyResult,
+  PendingMaterialization,
   WorkspaceCreationParams,
   WorkspaceCreationResult,
   WorkspaceInitParams,
   WorkspaceInitResult,
   WorkspaceForkParams,
   WorkspaceForkResult,
+  WorkspaceMaterializeParams,
 } from "./Runtime";
 import { WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
-import { runWorkspaceInitHook } from "./initHook";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
 import { isGitRepository } from "@/node/utils/pathUtils";
 import { WorktreeManager } from "@/node/worktree/WorktreeManager";
@@ -44,6 +45,10 @@ export class WorktreeRuntime extends LocalBaseRuntime {
     this.currentProjectPath = options?.projectPath;
     this.currentWorkspaceName = options?.workspaceName;
     this.currentWorkspacePath = options?.workspacePath;
+  }
+
+  protected override agentCgroupProjectPath(): string | undefined {
+    return this.currentProjectPath;
   }
 
   getWorkspacePath(projectPath: string, workspaceName: string): string {
@@ -104,18 +109,32 @@ export class WorktreeRuntime extends LocalBaseRuntime {
       abortSignal: params.abortSignal,
       env: params.env,
       trusted: params.trusted,
+      deferMaterialization: params.deferMaterialization,
     });
   }
 
-  async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
-    return runWorkspaceInitHook({
-      params,
-      runtimeType: "worktree",
-      hookCheckPath: params.projectPath,
-      runHook: async ({ shuxEnv, initLogger, abortSignal }) => {
-        await this.runInitHook(params.workspacePath, shuxEnv, initLogger, abortSignal);
+  async materializeWorkspace(
+    params: WorkspaceMaterializeParams,
+    pending: PendingMaterialization
+  ): Promise<void> {
+    return this.worktreeManager.materializeWorkspace(
+      {
+        projectPath: params.projectPath,
+        workspacePath: params.workspacePath,
+        branchName: params.branchName,
+        trunkBranch: params.trunkBranch,
+        initLogger: params.initLogger,
+        abortSignal: params.abortSignal,
+        checkoutAbortSignal: params.checkoutAbortSignal,
+        env: params.env,
+        trusted: params.trusted,
       },
-    });
+      pending
+    );
+  }
+
+  async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
+    return this.initLocalWorkspace(params, "worktree");
   }
 
   async renameWorkspace(
@@ -123,12 +142,30 @@ export class WorktreeRuntime extends LocalBaseRuntime {
     oldName: string,
     newName: string,
     _abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
+    | { success: false; error: string }
   > {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    return this.worktreeManager.renameWorkspace(projectPath, oldName, newName, trusted);
+    return this.worktreeManager.renameWorkspace(projectPath, oldName, newName, trusted, options);
+  }
+
+  async renameWorkspaceBranch(
+    projectPath: string,
+    workspaceName: string,
+    oldBranchName: string,
+    newBranchName: string,
+    trusted?: boolean
+  ): Promise<{ success: true } | { success: false; error: string }> {
+    return this.worktreeManager.renameWorkspaceBranch(
+      projectPath,
+      workspaceName,
+      oldBranchName,
+      newBranchName,
+      trusted
+    );
   }
 
   async canDeleteWorkspaceWithoutForce(
@@ -144,10 +181,17 @@ export class WorktreeRuntime extends LocalBaseRuntime {
     workspaceName: string,
     force: boolean,
     _abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Note: _abortSignal ignored for local operations (fast, no need for cancellation)
-    return this.worktreeManager.deleteWorkspace(projectPath, workspaceName, force, trusted);
+    return this.worktreeManager.deleteWorkspace(
+      projectPath,
+      workspaceName,
+      force,
+      trusted,
+      options
+    );
   }
 
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {

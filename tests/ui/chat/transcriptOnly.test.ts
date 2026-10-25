@@ -36,7 +36,9 @@ describe("Transcript-only workspace UI", () => {
       workspaces: [metadata],
       onChat: (workspaceId, emit) => {
         if (workspaceId !== metadata.id) {
-          queueMicrotask(() => emit({ type: "caught-up", hasOlderHistory: false }));
+          queueMicrotask(() =>
+            emit({ type: "caught-up", historyReplayStatus: "complete", hasOlderHistory: false })
+          );
           return undefined;
         }
         return staticChatHandler(emit);
@@ -60,7 +62,7 @@ describe("Transcript-only workspace UI", () => {
       expect(notices[0].className).toContain("text-muted");
       expect(notices[0].getAttribute("role")).toBe("note");
 
-      expect(view.container.querySelector('textarea[aria-label="Message Claude"]')).toBeNull();
+      expect(view.container.querySelector('textarea[aria-label="Message"]')).toBeNull();
       expect(view.container.querySelector('[data-component="ChatInputControls"]')).toBeNull();
       expect(view.container.querySelector('[data-component="ChatModeToggles"]')).toBeNull();
       expect(view.container.querySelector('[data-component="ModelSelectorGroup"]')).toBeNull();

@@ -18,17 +18,17 @@ import * as nodeFs from "node:fs";
 import * as os from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
-import { getShuxHomeLegacyFallbackMarkerPath } from "@/common/compat/legacyMux";
-import { initializeShuxHomeTransition } from "@/node/compat/shuxTransition";
-import { sanitizeShuxChildEnv } from "@/node/runtime/childProcessEnv";
-import { cleanupObsoleteShuxBinArtifacts, getShuxHome } from "./paths";
+import { getXumHomeLegacyFallbackMarkerPath } from "@/common/compat/legacyMux";
+import { initializeXumHomeTransition } from "@/node/compat/xumTransition";
+import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
+import { cleanupObsoleteXumBinArtifacts, getXumHome } from "./paths";
 
 const tempDirs: string[] = [];
 const envKeysToRestore = [
   "HOME",
   "USERPROFILE",
-  "SHUX_ROOT",
-  "SHUX_HOME",
+  "XUM_ROOT",
+  "XUM_HOME",
   "MUX_ROOT",
   "NODE_ENV",
 ] as const;
@@ -71,8 +71,8 @@ function withHomeDir(homeDir: string, run: () => void): void {
   homedirSpy.mockReturnValue(homeDir);
   process.env.HOME = homeDir;
   process.env.USERPROFILE = homeDir;
-  delete process.env.SHUX_ROOT;
-  delete process.env.SHUX_HOME;
+  delete process.env.XUM_ROOT;
+  delete process.env.XUM_HOME;
   delete process.env.MUX_ROOT;
   delete process.env.NODE_ENV;
 
@@ -90,7 +90,7 @@ afterEach(() => {
   }
 });
 
-describe("cleanupObsoleteShuxBinArtifacts", () => {
+describe("cleanupObsoleteXumBinArtifacts", () => {
   test("removes obsolete agent-browser wrapper files from mux bin", () => {
     const muxRoot = createTempMuxRoot();
     const binDir = join(muxRoot, "bin");
@@ -99,7 +99,7 @@ describe("cleanupObsoleteShuxBinArtifacts", () => {
     writeFileSync(join(binDir, "agent-browser.cmd"), "@echo off\n", "utf8");
     writeFileSync(join(binDir, "mux-askpass"), "#!/bin/sh\necho keep\n", "utf8");
 
-    cleanupObsoleteShuxBinArtifacts(muxRoot);
+    cleanupObsoleteXumBinArtifacts(muxRoot);
 
     expect(existsSync(join(binDir, "agent-browser"))).toBe(false);
     expect(existsSync(join(binDir, "agent-browser.cmd"))).toBe(false);
@@ -113,7 +113,7 @@ describe("cleanupObsoleteShuxBinArtifacts", () => {
     const wrapperDir = join(binDir, "agent-browser");
     mkdirSync(wrapperDir, { recursive: true });
 
-    cleanupObsoleteShuxBinArtifacts(muxRoot);
+    cleanupObsoleteXumBinArtifacts(muxRoot);
 
     expect(existsSync(wrapperDir)).toBe(true);
     expect(lstatSync(wrapperDir).isDirectory()).toBe(true);
@@ -121,42 +121,42 @@ describe("cleanupObsoleteShuxBinArtifacts", () => {
 
   test("is a no-op when mux bin does not exist", () => {
     const muxRoot = createTempMuxRoot();
-    expect(() => cleanupObsoleteShuxBinArtifacts(muxRoot)).not.toThrow();
+    expect(() => cleanupObsoleteXumBinArtifacts(muxRoot)).not.toThrow();
   });
 });
 
-describe("getShuxHome", () => {
-  test("uses SHUX_ROOT exactly when set", () => {
+describe("getXumHome", () => {
+  test("uses XUM_ROOT exactly when set", () => {
     const homeDir = createTempMuxRoot();
 
     withHomeDir(homeDir, () => {
-      process.env.SHUX_ROOT = "/custom/shux-root";
-      process.env.SHUX_HOME = "/ignored/shux-home";
+      process.env.XUM_ROOT = "/custom/xum-root";
+      process.env.XUM_HOME = "/ignored/xum-home";
       process.env.NODE_ENV = "production";
 
-      expect(getShuxHome()).toBe("/custom/shux-root");
+      expect(getXumHome()).toBe("/custom/xum-root");
     });
   });
 
-  test("ignores SHUX_HOME and uses the homedir default", () => {
+  test("ignores XUM_HOME and uses the homedir default", () => {
     const homeDir = createTempMuxRoot();
 
     withHomeDir(homeDir, () => {
-      process.env.SHUX_HOME = "/ignored/shux-home";
+      process.env.XUM_HOME = "/ignored/xum-home";
       process.env.NODE_ENV = "production";
 
-      expect(getShuxHome()).toBe(join(homeDir, ".shux"));
+      expect(getXumHome()).toBe(join(homeDir, ".xum"));
     });
   });
 
-  test("uses the development suffix without SHUX_ROOT", () => {
+  test("uses the development suffix without XUM_ROOT", () => {
     const homeDir = createTempMuxRoot();
 
     withHomeDir(homeDir, () => {
-      process.env.SHUX_HOME = "/ignored/shux-home";
+      process.env.XUM_HOME = "/ignored/xum-home";
       process.env.NODE_ENV = "development";
 
-      expect(getShuxHome()).toBe(join(homeDir, ".shux-dev"));
+      expect(getXumHome()).toBe(join(homeDir, ".xum-dev"));
     });
   });
 
@@ -164,57 +164,57 @@ describe("getShuxHome", () => {
     const homeDir = createTempMuxRoot();
 
     withHomeDir(homeDir, () => {
-      expect(getShuxHome()).toBe(join(homeDir, ".shux"));
+      expect(getXumHome()).toBe(join(homeDir, ".xum"));
     });
   });
 
   test("prefers a usable canonical directory over leftover trees", () => {
     const homeDir = createTempMuxRoot();
-    mkdirSync(join(homeDir, ".shux"));
+    mkdirSync(join(homeDir, ".xum"));
     mkdirSync(join(homeDir, ".mux"));
 
     withHomeDir(homeDir, () => {
-      expect(getShuxHome()).toBe(join(homeDir, ".shux"));
+      expect(getXumHome()).toBe(join(homeDir, ".xum"));
     });
   });
 
   test("prefers a healthy leftover tree when canonical storage is a regular file", () => {
     const homeDir = createTempMuxRoot();
-    writeFileSync(join(homeDir, ".shux"), "not-a-directory", "utf8");
+    writeFileSync(join(homeDir, ".xum"), "not-a-directory", "utf8");
     mkdirSync(join(homeDir, ".mux"));
 
     withHomeDir(homeDir, () => {
-      expect(getShuxHome()).toBe(join(homeDir, ".mux"));
+      expect(getXumHome()).toBe(join(homeDir, ".mux"));
     });
   });
 
   test("prefers a healthy leftover tree when canonical storage is a broken symlink", () => {
     const homeDir = createTempMuxRoot();
-    symlinkSync(join(homeDir, "missing-target"), join(homeDir, ".shux"));
+    symlinkSync(join(homeDir, "missing-target"), join(homeDir, ".xum"));
     mkdirSync(join(homeDir, ".mux"));
 
     withHomeDir(homeDir, () => {
-      expect(getShuxHome()).toBe(join(homeDir, ".mux"));
+      expect(getXumHome()).toBe(join(homeDir, ".mux"));
     });
   });
 
   test("follows a transition fallback when canonical is unusable and leftover is new", async () => {
     const homeDir = createTempMuxRoot();
-    writeFileSync(join(homeDir, ".shux"), "not-a-directory", "utf8");
+    writeFileSync(join(homeDir, ".xum"), "not-a-directory", "utf8");
 
-    const result = await initializeShuxHomeTransition({ homeDir, env: {}, platform: "linux" });
+    const result = await initializeXumHomeTransition({ homeDir, env: {}, platform: "linux" });
 
     withHomeDir(homeDir, () => {
       expect(result.status).toBe("legacy-fallback");
-      expect(getShuxHome()).toBe(result.activePath);
-      expect(getShuxHome()).toBe(join(homeDir, ".mux"));
-      expect(lstatSync(join(homeDir, ".shux")).isFile()).toBe(true);
+      expect(getXumHome()).toBe(result.activePath);
+      expect(getXumHome()).toBe(join(homeDir, ".mux"));
+      expect(lstatSync(join(homeDir, ".xum")).isFile()).toBe(true);
     });
   });
 
   test("follows session ROOT aliases after failed empty-canonical adoption", async () => {
     const homeDir = createTempMuxRoot();
-    mkdirSync(join(homeDir, ".shux"));
+    mkdirSync(join(homeDir, ".xum"));
     mkdirSync(join(homeDir, ".mux"));
     writeFileSync(join(homeDir, ".mux", "config.json"), "legacy", "utf8");
     const env: Record<string, string | undefined> = {};
@@ -223,18 +223,18 @@ describe("getShuxHome", () => {
     });
 
     try {
-      const result = await initializeShuxHomeTransition({ homeDir, env, platform: "linux" });
+      const result = await initializeXumHomeTransition({ homeDir, env, platform: "linux" });
 
       expect(result.status).toBe("legacy-fallback");
-      expect(env.SHUX_ROOT).toBe(result.activePath);
+      expect(env.XUM_ROOT).toBe(result.activePath);
       expect(env.MUX_ROOT).toBe(result.activePath);
-      expect(sanitizeShuxChildEnv(env).SHUX_ROOT).toBe(result.activePath);
-      expect(sanitizeShuxChildEnv(env).MUX_ROOT).toBe(result.activePath);
-      expect(readFileSync(getShuxHomeLegacyFallbackMarkerPath(homeDir), "utf8")).toBe(".mux\n");
+      expect(sanitizeXumChildEnv(env).XUM_ROOT).toBe(result.activePath);
+      expect(sanitizeXumChildEnv(env).MUX_ROOT).toBe(result.activePath);
+      expect(readFileSync(getXumHomeLegacyFallbackMarkerPath(homeDir), "utf8")).toBe(".mux\n");
 
       withHomeDir(homeDir, () => {
-        expect(getShuxHome()).toBe(result.activePath);
-        expect(getShuxHome()).toBe(join(homeDir, ".mux"));
+        expect(getXumHome()).toBe(result.activePath);
+        expect(getXumHome()).toBe(join(homeDir, ".mux"));
       });
     } finally {
       rmdir.mockRestore();
@@ -243,42 +243,42 @@ describe("getShuxHome", () => {
 
   test("follows a leftover marker in a clean env without running the transition", () => {
     const homeDir = createTempMuxRoot();
-    const canonicalPath = join(homeDir, ".shux");
+    const canonicalPath = join(homeDir, ".xum");
     const legacyPath = join(homeDir, ".mux");
     mkdirSync(canonicalPath);
     mkdirSync(legacyPath);
     writeFileSync(join(legacyPath, "server.lock"), "legacy-lock", "utf8");
-    writeFileSync(getShuxHomeLegacyFallbackMarkerPath(homeDir), ".mux\n", "utf8");
+    writeFileSync(getXumHomeLegacyFallbackMarkerPath(homeDir), ".mux\n", "utf8");
 
     withHomeDir(homeDir, () => {
-      // VS Code discovery/config only call getShuxHome(); they do not run the transition.
-      expect(getShuxHome()).toBe(legacyPath);
-      expect(readFileSync(join(getShuxHome(), "server.lock"), "utf8")).toBe("legacy-lock");
+      // VS Code discovery/config only call getXumHome(); they do not run the transition.
+      expect(getXumHome()).toBe(legacyPath);
+      expect(readFileSync(join(getXumHome(), "server.lock"), "utf8")).toBe("legacy-lock");
     });
   });
 
   test("ignores a malformed leftover marker and keeps an empty canonical home", () => {
     const homeDir = createTempMuxRoot();
-    mkdirSync(join(homeDir, ".shux"));
+    mkdirSync(join(homeDir, ".xum"));
     mkdirSync(join(homeDir, ".mux"));
     writeFileSync(join(homeDir, ".mux", "config.json"), "legacy", "utf8");
-    writeFileSync(getShuxHomeLegacyFallbackMarkerPath(homeDir), "../.mux\n", "utf8");
+    writeFileSync(getXumHomeLegacyFallbackMarkerPath(homeDir), "../.mux\n", "utf8");
 
     withHomeDir(homeDir, () => {
-      expect(getShuxHome()).toBe(join(homeDir, ".shux"));
+      expect(getXumHome()).toBe(join(homeDir, ".xum"));
     });
   });
 
   test("ignores an oversized regular leftover marker without loading it as a leftover name", () => {
     const homeDir = createTempMuxRoot();
-    const canonicalPath = join(homeDir, ".shux");
+    const canonicalPath = join(homeDir, ".xum");
     mkdirSync(canonicalPath);
     mkdirSync(join(homeDir, ".mux"));
     writeFileSync(join(homeDir, ".mux", "config.json"), "legacy", "utf8");
-    writeFileSync(getShuxHomeLegacyFallbackMarkerPath(homeDir), `.mux\n${"x".repeat(80)}`, "utf8");
+    writeFileSync(getXumHomeLegacyFallbackMarkerPath(homeDir), `.mux\n${"x".repeat(80)}`, "utf8");
 
     withHomeDir(homeDir, () => {
-      expect(getShuxHome()).toBe(canonicalPath);
+      expect(getXumHome()).toBe(canonicalPath);
     });
   });
 
@@ -286,8 +286,8 @@ describe("getShuxHome", () => {
     "ignores a FIFO leftover marker without blocking startup",
     () => {
       const homeDir = createTempMuxRoot();
-      const canonicalPath = join(homeDir, ".shux");
-      const markerPath = getShuxHomeLegacyFallbackMarkerPath(homeDir);
+      const canonicalPath = join(homeDir, ".xum");
+      const markerPath = getXumHomeLegacyFallbackMarkerPath(homeDir);
       mkdirSync(canonicalPath);
       mkdirSync(join(homeDir, ".mux"));
       writeFileSync(join(homeDir, ".mux", "config.json"), "legacy", "utf8");
@@ -296,43 +296,43 @@ describe("getShuxHome", () => {
       expect(lstatSync(markerPath).isFIFO()).toBe(true);
 
       withHomeDir(homeDir, () => {
-        expect(getShuxHome()).toBe(canonicalPath);
+        expect(getXumHome()).toBe(canonicalPath);
       });
     }
   );
 
   test("ignores a leftover marker that is a directory", () => {
     const homeDir = createTempMuxRoot();
-    const canonicalPath = join(homeDir, ".shux");
+    const canonicalPath = join(homeDir, ".xum");
     mkdirSync(canonicalPath);
     mkdirSync(join(homeDir, ".mux"));
     writeFileSync(join(homeDir, ".mux", "config.json"), "legacy", "utf8");
-    mkdirSync(getShuxHomeLegacyFallbackMarkerPath(homeDir));
+    mkdirSync(getXumHomeLegacyFallbackMarkerPath(homeDir));
 
     withHomeDir(homeDir, () => {
-      expect(getShuxHome()).toBe(canonicalPath);
+      expect(getXumHome()).toBe(canonicalPath);
     });
   });
 
   test("ignores a leftover marker symlink even when the target names a leftover home", () => {
     const homeDir = createTempMuxRoot();
-    const canonicalPath = join(homeDir, ".shux");
+    const canonicalPath = join(homeDir, ".xum");
     const markerTarget = join(homeDir, "marker-target");
     mkdirSync(canonicalPath);
     mkdirSync(join(homeDir, ".mux"));
     writeFileSync(join(homeDir, ".mux", "config.json"), "legacy", "utf8");
     writeFileSync(markerTarget, ".mux\n", "utf8");
-    symlinkSync(markerTarget, getShuxHomeLegacyFallbackMarkerPath(homeDir));
+    symlinkSync(markerTarget, getXumHomeLegacyFallbackMarkerPath(homeDir));
 
     withHomeDir(homeDir, () => {
-      expect(getShuxHome()).toBe(canonicalPath);
+      expect(getXumHome()).toBe(canonicalPath);
     });
   });
 
   test("rejects a leftover marker that grows after the size check", () => {
     const homeDir = createTempMuxRoot();
-    const canonicalPath = join(homeDir, ".shux");
-    const markerPath = getShuxHomeLegacyFallbackMarkerPath(homeDir);
+    const canonicalPath = join(homeDir, ".xum");
+    const markerPath = getXumHomeLegacyFallbackMarkerPath(homeDir);
     mkdirSync(canonicalPath);
     mkdirSync(join(homeDir, ".mux"));
     writeFileSync(join(homeDir, ".mux", "config.json"), "legacy", "utf8");
@@ -350,7 +350,7 @@ describe("getShuxHome", () => {
 
     try {
       withHomeDir(homeDir, () => {
-        expect(getShuxHome()).toBe(canonicalPath);
+        expect(getXumHome()).toBe(canonicalPath);
       });
       expect(lstatSpy).toHaveBeenCalled();
       expect(fstatSpy).toHaveBeenCalled();
@@ -360,15 +360,15 @@ describe("getShuxHome", () => {
     }
   });
 
-  test("keeps explicit SHUX_ROOT even when leftover homes exist", () => {
+  test("keeps explicit XUM_ROOT even when leftover homes exist", () => {
     const homeDir = createTempMuxRoot();
     const explicitRoot = join(homeDir, "custom");
-    writeFileSync(join(homeDir, ".shux"), "not-a-directory", "utf8");
+    writeFileSync(join(homeDir, ".xum"), "not-a-directory", "utf8");
     mkdirSync(join(homeDir, ".mux"));
 
     withHomeDir(homeDir, () => {
-      process.env.SHUX_ROOT = explicitRoot;
-      expect(getShuxHome()).toBe(explicitRoot);
+      process.env.XUM_ROOT = explicitRoot;
+      expect(getXumHome()).toBe(explicitRoot);
     });
   });
 });

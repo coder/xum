@@ -19,13 +19,21 @@ export const CODER_OAUTH_DISCOVERY_PATH = "/.well-known/oauth-authorization-serv
 /** Loopback callback path for the desktop authorization-code flow. */
 export const CODER_OAUTH_CALLBACK_PATH = "/callback";
 
+/**
+ * Xum server routes for the browser/server-mode flow: the browser cannot reach
+ * a loopback listener on a remote Xum server, so the authorization redirect
+ * lands on the server itself (shared between the HTTP layer and the UI).
+ */
+export const CODER_OAUTH_SERVER_START_PATH = "/auth/coder/start";
+export const CODER_OAUTH_SERVER_CALLBACK_PATH = "/auth/coder/callback";
+
 /** Client name registered via RFC 7591 dynamic client registration. */
-export const CODER_OAUTH_CLIENT_NAME = "Shux";
+export const CODER_OAUTH_CLIENT_NAME = "Xum";
 
 /**
  * AI Gateway data-plane mount point on the deployment. Newer coderd also
  * serves the canonical alias /api/v2/ai-gateway, but the legacy prefix is
- * kept for backward compatibility and works on every deployment Shux
+ * kept for backward compatibility and works on every deployment Xum
  * supports, so it stays the single prefix used here.
  */
 export const CODER_AIBRIDGE_PATH = "/api/v2/aibridge";
@@ -56,7 +64,6 @@ export const CODER_GATEWAY_PROVIDER_TYPES = [
   "bedrock",
   "copilot",
 ] as const;
-export type CoderGatewayProviderType = (typeof CODER_GATEWAY_PROVIDER_TYPES)[number];
 
 /** A configured AI Gateway provider instance discovered from the deployment. */
 export interface CoderGatewayProvider {
@@ -70,13 +77,25 @@ export interface CoderGatewayProvider {
  * Default probe set when the providers listing is unavailable: every
  * non-Copilot type under its default (name === type) instance name. Copilot
  * is excluded because its gateway routes require request-time tokens only an
- * official Copilot client can mint — Shux's Coder OAuth token is not enough.
+ * official Copilot client can mint — Xum's Coder OAuth token is not enough.
  */
 export const CODER_GATEWAY_DEFAULT_PROVIDER_NAMES: readonly string[] =
   CODER_GATEWAY_PROVIDER_TYPES.filter((type) => type !== "copilot");
 
 /**
- * Wire protocol Shux must speak to a gateway provider, derived from its type.
+ * Bedrock model IDs in the OpenAI namespace: openai.<model>, optionally behind
+ * an inference-profile region prefix (global.openai.<model>, us.openai.<model>).
+ * Bedrock Mantle serves these over /v1/responses and rejects Anthropic-format
+ * requests for them, while its anthropic.<model> IDs stay on /v1/messages.
+ * Returns the namespace-stripped model ID, or null for every other ID.
+ */
+export function bedrockOpenAIModelId(modelId: string): string | null {
+  const match = /^(?:[a-z]+(?:-[a-z]+)*\.)?openai\.(.+)$/.exec(modelId);
+  return match?.[1] ?? null;
+}
+
+/**
+ * Wire protocol Xum must speak to a gateway provider, derived from its type.
  * Mirrors the gateway's own client mapping: anthropic/bedrock are served by
  * its Anthropic client (/v1/messages), everything else by its OpenAI client.
  * Only the real OpenAI upstream reliably supports the Responses API; the
@@ -84,14 +103,21 @@ export const CODER_GATEWAY_DEFAULT_PROVIDER_NAMES: readonly string[] =
  * /chat/completions can be assumed. Unknown (future) types default to
  * openai-chat to match the gateway's own default. Returns null for
  * unsupported types (copilot, see above).
+ *
+ * Bedrock is the one type whose wire depends on the MODEL: its OpenAI-namespaced
+ * IDs (see bedrockOpenAIModelId) speak OpenAI Responses. Callers without a
+ * model (the catalog probe) get the type's Anthropic default.
  */
 export type CoderGatewayWire = "anthropic" | "openai-responses" | "openai-chat";
 
-export function coderGatewayWireProtocol(type: string): CoderGatewayWire | null {
+export function coderGatewayWireProtocol(type: string, modelId?: string): CoderGatewayWire | null {
   switch (type) {
     case "anthropic":
-    case "bedrock":
       return "anthropic";
+    case "bedrock":
+      return modelId != null && bedrockOpenAIModelId(modelId) != null
+        ? "openai-responses"
+        : "anthropic";
     case "openai":
       return "openai-responses";
     case "copilot":
@@ -150,13 +176,14 @@ export function resolveCoderWireCanonicalModel(
   if (!provider) {
     return null;
   }
-  const wire = coderGatewayWireProtocol(provider.type);
+  const modelId = gatewayModelId.slice(separatorIndex + 1);
+  const wire = coderGatewayWireProtocol(provider.type, modelId);
   if (!wire) {
     return null;
   }
   return {
     origin: wire === "anthropic" ? "anthropic" : "openai",
-    modelId: gatewayModelId.slice(separatorIndex + 1),
+    modelId,
     // The instance's exact type: origin collapses every OpenAI-shaped wire
     // to "openai", but some config is upstream-specific (e.g. the OpenAI ZDR
     // store flag applies to the real OpenAI Responses upstream only).
@@ -192,6 +219,14 @@ export function resolveCoderMetadataCanonicalModel(
     return null;
   }
   const modelId = gatewayModelId.slice(separatorIndex + 1);
+  // Bedrock's openai.<model> IDs are the OpenAI models themselves. The
+  // bedrock gateway rules below would only canonicalize the unprefixed form
+  // (bedrock:openai.<model>), and capability gates that strip just the
+  // provider prefix would see "openai.gpt-..." and miss the model family.
+  const bedrockOpenAIModel = provider.type === "bedrock" ? bedrockOpenAIModelId(modelId) : null;
+  if (bedrockOpenAIModel != null) {
+    return `openai:${bedrockOpenAIModel}`;
+  }
   switch (provider.type) {
     case "anthropic":
     case "openai":
@@ -238,6 +273,64 @@ export function resolveCoderGatewayProvider(
     return { name, type: name };
   }
   return null;
+}
+
+/**
+ * Canonical providers whose native models (anthropic:<model>, ...) the user
+ * can map to a same-type AI Gateway instance via `coder.canonicalRoutes`.
+ */
+export const CODER_CANONICAL_ROUTE_ORIGINS = ["anthropic", "openai", "google"] as const;
+export type CoderCanonicalRouteOrigin = (typeof CODER_CANONICAL_ROUTE_ORIGINS)[number];
+export type CoderCanonicalRoutes = Partial<Record<CoderCanonicalRouteOrigin, string>>;
+
+function isCoderCanonicalRouteOrigin(value: string): value is CoderCanonicalRouteOrigin {
+  return (CODER_CANONICAL_ROUTE_ORIGINS as readonly string[]).includes(value);
+}
+
+/** Parse persisted (hand-editable) `canonicalRoutes`: known origins with non-empty names only. */
+export function parseCoderCanonicalRoutes(value: unknown): CoderCanonicalRoutes {
+  const routes: CoderCanonicalRoutes = {};
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return routes;
+  }
+  for (const [origin, instance] of Object.entries(value as Record<string, unknown>)) {
+    if (isCoderCanonicalRouteOrigin(origin) && typeof instance === "string" && instance) {
+      routes[origin] = instance;
+    }
+  }
+  return routes;
+}
+
+/**
+ * The AI Gateway instance serving a canonical origin when routing picks
+ * Coder, or null when the origin is not routable through Coder.
+ * A mapping is honored only for a KNOWN instance whose type equals the origin:
+ * falling back to the default-named instance would silently send traffic to
+ * an upstream the user moved away from, and a guessed type would speak the
+ * wrong wire. Without a mapping, anthropic/openai keep the default-named
+ * instance; google has no default because its instances are custom-named.
+ */
+export function resolveCoderCanonicalRouteInstance(
+  origin: string,
+  coderConfig:
+    | { canonicalRoutes?: unknown; discoveredProviders?: unknown; additionalProviders?: unknown }
+    | undefined
+): string | null {
+  if (!isCoderCanonicalRouteOrigin(origin)) {
+    return null;
+  }
+  const mapped = parseCoderCanonicalRoutes(coderConfig?.canonicalRoutes)[origin];
+  if (mapped == null) {
+    return origin === "google" ? null : origin;
+  }
+  const provider =
+    parseCoderGatewayProviders(coderConfig?.additionalProviders).find(
+      (entry) => entry.name === mapped
+    ) ??
+    parseCoderGatewayProviders(coderConfig?.discoveredProviders).find(
+      (entry) => entry.name === mapped
+    );
+  return provider?.type === origin ? provider.name : null;
 }
 
 /**

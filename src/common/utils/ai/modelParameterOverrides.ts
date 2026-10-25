@@ -16,18 +16,36 @@ export interface ResolvedModelParameterOverrides {
 
 const SAMPLING_CALL_SETTINGS = ["temperature", "topP", "topK"] as const;
 
+const SAMPLING_REJECTING_GEMINI_PREFIXES = [
+  "gemini-4-argon",
+  "gemini-3.8-flash",
+  "gemini-3.7-flash",
+  "gemini-3.6-flash",
+  "gemini-3.5-flash-lite",
+] as const;
+
 /**
- * Gemini 3.7/3.6 Flash and Gemini 3.5 Flash-Lite deprecate the sampling parameters
- * temperature/top_p/top_k; Google's migration guides require stripping them from
+ * Gemini 4 Argon, Gemini 3.8/3.7/3.6 Flash and Gemini 3.5 Flash-Lite deprecate the sampling
+ * parameters temperature/top_p/top_k; Google's migration guides require stripping them from
  * generation configs, so forwarding user overrides would break existing setups
  * (e.g. a wildcard temperature) when the gemini-flash alias repoints.
+ *
+ * OpenAI reasoning models are deliberately absent even though GPT-6 Astra also
+ * rejects temperature/top_p/logprobs: @ai-sdk/openai already drops those from
+ * both wire formats for any GPT-5+ id unless the effort is "none", and Astra
+ * never receives "none" (see openaiRejectsDisabledReasoning).
+ *
+ * Claude Haiku 5+ rejects every non-default temperature/top_p/top_k. @ai-sdk/anthropic
+ * already drops them, but @ai-sdk/amazon-bedrock only does while thinking is enabled, so
+ * a sampling override on Bedrock with thinking off would 400 after the `haiku` alias moved
+ * off Haiku 4.5 (which accepted them). Other sampling-rejecting Claude tiers: #5838.
  */
 export function modelRejectsSamplingParameters(modelString: string): boolean {
   const bareModelId = stripModelProviderPrefixes(modelString);
   return (
-    bareModelId.startsWith("gemini-3.7-flash") ||
-    bareModelId.startsWith("gemini-3.6-flash") ||
-    bareModelId.startsWith("gemini-3.5-flash-lite")
+    // Bedrock ids keep an `anthropic.` (and optional region) prefix after stripping.
+    /(?:^|\.)claude-haiku-(?:[5-9]|\d{2,})/.test(bareModelId) ||
+    SAMPLING_REJECTING_GEMINI_PREFIXES.some((prefix) => bareModelId.startsWith(prefix))
   );
 }
 
@@ -101,7 +119,7 @@ export function resolveModelParameterOverrides(
   }
 
   // Resolve mappedToModel aliases so custom entries pointing at a
-  // sampling-rejecting model (e.g. team-flash -> gemini-3.7-flash) are stripped too.
+  // sampling-rejecting model (e.g. team-flash -> gemini-3.8-flash) are stripped too.
   const capabilityModelString = resolveModelForMetadata(
     effectiveModelString ?? canonicalModelString,
     providersConfig

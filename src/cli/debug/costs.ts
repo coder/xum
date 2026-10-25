@@ -1,10 +1,23 @@
-import * as fs from "fs";
 import * as path from "path";
+import * as fs from "fs";
 import { defaultConfig } from "@/node/config";
 import type { MuxMessage } from "@/common/types/message";
 import { calculateTokenStats } from "@/common/utils/tokens/tokenStatsCalculator";
 import { defaultModel } from "@/common/utils/ai/models";
 import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailability";
+
+/**
+ * The tools the workspace's config row gets, so tool-definition accounting matches the
+ * request: agent_report for a child, no review-pane or git-patch tools in a scratch chat.
+ */
+function toolAvailabilityFor(workspaceId: string) {
+  const workspace = defaultConfig.findWorkspace(workspaceId);
+  return getToolAvailabilityOptions({
+    workspaceId,
+    parentWorkspaceId: workspace?.parentWorkspaceId,
+    scratchWorkspace: workspace?.kind === "scratch",
+  });
+}
 
 /**
  * Debug command to display cost/token statistics for a workspace
@@ -14,7 +27,7 @@ export async function costsCommand(workspaceId: string) {
   console.log(`\n=== Cost Statistics for workspace: ${workspaceId} ===\n`);
 
   // Load chat history
-  const sessionDir = defaultConfig.getSessionDir(workspaceId);
+  const sessionDir = path.join(defaultConfig.sessionsDir, workspaceId);
   const chatHistoryPath = path.join(sessionDir, "chat.jsonl");
 
   if (!fs.existsSync(chatHistoryPath)) {
@@ -38,18 +51,8 @@ export async function costsCommand(workspaceId: string) {
   const firstAssistantMessage = messages.find((msg) => msg.role === "assistant");
   const model = firstAssistantMessage?.metadata?.model ?? defaultModel;
 
-  // Resolve parent workspace context so child workspaces correctly include
-  // agent_report tool-definition tokens in accounting.
-  const workspaceInfo = defaultConfig.findWorkspace(workspaceId);
-  const parentWorkspaceId = workspaceInfo?.parentWorkspaceId ?? null;
-
   // Calculate stats using shared logic (now synchronous)
-  const stats = await calculateTokenStats(
-    messages,
-    model,
-    null,
-    getToolAvailabilityOptions({ workspaceId, parentWorkspaceId })
-  );
+  const stats = await calculateTokenStats(messages, model, null, toolAvailabilityFor(workspaceId));
 
   // Display results
   console.log(`Model: ${stats.model}`);

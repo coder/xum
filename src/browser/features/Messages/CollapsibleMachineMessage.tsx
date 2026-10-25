@@ -7,17 +7,19 @@ interface CollapsibleMachineMessageProps {
   content: string;
   summary: string;
   icon: ReactNode;
-  marker: "background-work-wake" | "bash-monitor-wake";
+  marker:
+    | "background-work-wake"
+    | "bash-monitor-wake"
+    | "agent-peer-message-trigger"
+    | "context-budget-warning"
+    | "todo-turn-end-nudge";
   className?: string;
 }
 
 /** Compact transcript treatment for machine-authored prompts whose raw control text is secondary. */
 export function CollapsibleMachineMessage(props: CollapsibleMachineMessageProps): ReactElement {
   const [expanded, setExpanded] = useState(false);
-  const markerAttributes =
-    props.marker === "background-work-wake"
-      ? { "data-background-work-wake": true }
-      : { "data-bash-monitor-wake": true };
+  const markerAttributes = { [`data-${props.marker}`]: true };
 
   return (
     <div

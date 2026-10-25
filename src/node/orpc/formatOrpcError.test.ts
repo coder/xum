@@ -12,7 +12,7 @@ describe("formatOrpcError", () => {
           path: ["slots", 0, "preset"],
         },
       ],
-      data: { version: 2, slots: [] },
+      invalidData: { version: 2, slots: [] },
     });
 
     const error = new ORPCError("INTERNAL_SERVER_ERROR", {
@@ -24,12 +24,12 @@ describe("formatOrpcError", () => {
       prefix: "/orpc",
       request: {
         method: "GET",
-        url: new URL("http://localhost/orpc/uiLayouts/getAll"),
+        url: new URL("http://localhost/orpc/config/getConfig"),
         headers: { authorization: "Bearer secret" },
       },
     });
 
-    expect(formatted.message).toContain("GET /orpc/uiLayouts/getAll");
+    expect(formatted.message).toContain("GET /orpc/config/getConfig");
     expect(formatted.message).toContain("INTERNAL_SERVER_ERROR");
     expect(formatted.message).toContain("Output validation failed");
     expect(formatted.message).toContain("slots[0].preset");

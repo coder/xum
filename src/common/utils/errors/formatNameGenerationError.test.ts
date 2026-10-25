@@ -44,30 +44,10 @@ describe("formatNameGenerationError", () => {
     expect(result.hint).toContain("Check your API key");
   });
 
-  test("returns gateway-specific guidance for mux-gateway api_key_missing", () => {
-    const result = formatNameGenerationError({
-      type: "authentication",
-      authKind: "api_key_missing",
-      provider: "mux-gateway",
-    });
-    expect(result.title).toBe("Shux Gateway not connected");
-    expect(result.hint).toContain("Shux Gateway");
-    expect(result.docsPath).toBe("/getting-started/mux-gateway");
-  });
-
   test("formats permission_denied as access denied", () => {
     const formatted = format({ type: "permission_denied", provider: "openai" });
 
     expect(formatted.title).toBe("Access denied");
-  });
-
-  test("returns policy-specific guidance for policy errors", () => {
-    const result = formatNameGenerationError({
-      type: "policy",
-      provider: "openai",
-    });
-    expect(result.title).toBe("Blocked by policy");
-    expect(result.hint).toContain("administrator");
   });
 
   test("formats rate_limit with waiting hint", () => {

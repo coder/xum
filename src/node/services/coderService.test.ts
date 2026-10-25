@@ -1,6 +1,7 @@
+import assert from "node:assert";
 import { EventEmitter } from "events";
 import { Readable } from "stream";
-import { describe, it, expect, vi, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, it, expect, vi, beforeEach, afterEach, spyOn, setSystemTime } from "bun:test";
 import { CoderService, compareVersions } from "./coderService";
 import * as childProcess from "child_process";
 import * as muxSshConfigWriter from "@/node/runtime/muxSshConfigWriter";
@@ -149,7 +150,6 @@ describe("CoderService", () => {
   });
 
   afterEach(() => {
-    service.clearCache();
     execAsyncSpy?.mockRestore();
     execAsyncSpy = null;
     execFileAsyncSpy?.mockRestore();
@@ -757,6 +757,35 @@ describe("CoderService", () => {
         "coder ssh --wait failed (exit 1): Connection refused"
       );
     });
+
+    // Live stderr (2026-10-17): the CLI prints its version-mismatch notice before the cause, so
+    // the joined message buried "agent is shutting down" at the end.
+    it("leads the failure with the CLI's final error line and drops version notices", async () => {
+      const stderr = [
+        "the server is running a development version of Coder (v2.38.0-devel+54ba766f77)",
+        "version mismatch: client v2.36.6+165de21, server v2.38.0-devel+54ba766f77",
+        "download v2.38.0-devel+54ba766f77 with: 'curl -fsSL https://dogfood.cdr.dev/install.sh | sh'",
+        'Encountered an error running "coder ssh", see "coder ssh --help" for more information',
+        "error: agent is shutting down",
+      ].join("\n");
+      mockCoderCommandResult({ exitCode: 1, stderr: `${stderr}\n` });
+
+      let thrown: unknown;
+      try {
+        for await (const _line of service.waitForStartupScripts("my-ws")) {
+          // drain
+        }
+      } catch (error) {
+        thrown = error;
+      }
+
+      assert(thrown instanceof Error, "waitForStartupScripts must throw an Error");
+      expect(thrown.message).toBe(
+        'coder ssh --wait failed (exit 1): agent is shutting down | Encountered an error running "coder ssh", see "coder ssh --help" for more information'
+      );
+      // The log keeps every stderr line, notices included.
+      expect((thrown as Error & { stderr?: string }).stderr).toBe(stderr);
+    });
   });
 
   describe("provisioning sessions", () => {
@@ -791,6 +820,29 @@ describe("CoderService", () => {
 
       await service.disposeProvisioningSession("ws");
       expect(execFileAsyncSpy).toHaveBeenCalledTimes(2);
+    });
+
+    // #5113: a session left by a creation that never reached init must not hand a retry a token
+    // that has expired (or is about to) on the deployment.
+    it("replaces a provisioning session older than its token lifetime", async () => {
+      mockTokenCommands();
+      const start = Date.now();
+      try {
+        setSystemTime(new Date(start));
+        const stale = await service.ensureProvisioningSession("ws");
+        setSystemTime(new Date(start + 5 * 60_000));
+        const fresh = await service.ensureProvisioningSession("ws");
+
+        expect(fresh).not.toBe(stale);
+        expect(service.takeProvisioningSession("ws")).toBe(fresh);
+        // The stale token is deleted on the deployment, best-effort.
+        const deletes = execFileAsyncSpy!.mock.calls.filter(
+          ([file, args]) => file === "coder" && args?.[0] === "tokens" && args[1] === "delete"
+        );
+        expect(deletes).toHaveLength(1);
+      } finally {
+        setSystemTime();
+      }
     });
 
     it("takeProvisioningSession returns and clears the session", async () => {
@@ -1204,10 +1256,6 @@ describe("deleteWorkspace", () => {
   beforeEach(() => {
     service = new CoderService();
     vi.clearAllMocks();
-  });
-
-  afterEach(() => {
-    service.clearCache();
   });
 
   // deleteWorkspace is a thin wrapper around deleteWorkspaceEventually.

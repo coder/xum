@@ -23,8 +23,7 @@ interface ProfileChatInputTypingOptions {
  */
 export async function profileChatInputTyping(options: ProfileChatInputTypingOptions) {
   const input =
-    options.input ??
-    options.page.getByRole("textbox", { name: /Message Claude|Edit your last message/ });
+    options.input ?? options.page.getByRole("textbox", { name: /^(Message|Edit message)$/ });
   const initialValue = options.initialValue ?? "";
 
   await expect(input).toBeVisible({ timeout: 20_000 });

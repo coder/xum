@@ -1,28 +1,36 @@
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { getErrorMessage } from "@/common/utils/errors";
 import { Command } from "cmdk";
 import { useCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
-import { useAPI } from "@/browser/contexts/API";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import { getAgentSkillsStore, useInvocableSkills } from "@/browser/stores/AgentSkillsStore";
 import type { CommandAction } from "@/browser/contexts/CommandRegistryContext";
 import {
   formatKeybind,
   KEYBINDS,
   isEditableElement,
+  isDesktopViewportFocused,
   matchesKeybind,
 } from "@/browser/utils/ui/keybinds";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { resolveSlashCommandExperimentValue } from "@/browser/utils/slashCommands/experimentVisibility";
-import { getSlashCommandSuggestions } from "@/browser/utils/slashCommands/suggestions";
+import { paletteSlashCommands } from "./LazyCommandPalette";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
+import {
+  COMMAND_PALETTE_INPUT_CLASSES,
+  COMMAND_PALETTE_OVERLAY_CLASSES,
+  COMMAND_PALETTE_PANEL_CLASSES,
+  COMMAND_PALETTE_PLACEHOLDER,
+} from "./commandPaletteChrome";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { getDisableWorkspaceAgentsKey, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
 import { filterCommandsByPrefix } from "@/browser/utils/commandPaletteFiltering";
 import { rankByPaletteQuery } from "@/browser/utils/commandPaletteRanking";
 
+const { getSlashCommandSuggestions, resolveSlashCommandExperimentValue } = paletteSlashCommands;
+
 interface CommandPaletteProps {
   getSlashContext?: () => { workspaceId?: string };
+  /** Focus to restore on close, captured before the first open's loading input took focus. */
+  openOrigin?: HTMLElement | null;
 }
 
 type PromptDef = NonNullable<NonNullable<CommandAction["prompt"]>>;
@@ -30,7 +38,7 @@ type PromptField = PromptDef["fields"][number];
 
 function getCommandInputPlaceholder(field: PromptField | null): string {
   if (!field) {
-    return "Switch workspaces or type > for all commands, / for slash commands…";
+    return COMMAND_PALETTE_PLACEHOLDER;
   }
 
   if (field.type === "text") {
@@ -57,30 +65,53 @@ interface PaletteGroup {
   items: PaletteItem[];
 }
 
-export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext }) => {
-  const { api } = useAPI();
+/**
+ * What a select prompt shows instead of options; undefined when it has results. `alert` marks a
+ * failed load, which screen readers announce: it appears after the prompt opened.
+ */
+function selectPromptEmptyText(state: {
+  isLoadingOptions: boolean;
+  resultCount: number;
+  optionCount: number;
+  optionsError: string | null;
+}): { text: string | undefined; alert: boolean } {
+  if (state.isLoadingOptions) return { text: "Loading options...", alert: false };
+  if (state.resultCount > 0) return { text: undefined, alert: false };
+  if (state.optionCount > 0) return { text: "No results", alert: false };
+  return state.optionsError != null
+    ? { text: `Could not load options: ${state.optionsError}`, alert: true }
+    : { text: "No options", alert: false };
+}
 
-  const workspaceHeartbeatsExperimentEnabled = useExperimentValue(
-    EXPERIMENT_IDS.WORKSPACE_HEARTBEATS
+function PaletteEmptyText(props: { text: string | undefined; alert: boolean }) {
+  return (
+    <div
+      role={props.alert ? "alert" : undefined}
+      className="p-4 text-[13px] text-[var(--color-command-subdued)]"
+    >
+      {props.text ?? "No results"}
+    </div>
   );
+}
+
+export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext, openOrigin }) => {
   const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationExperimentEnabled = useExperimentValue(
     EXPERIMENT_IDS.MEMORY_CONSOLIDATION
   );
+  const rlmExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.RLM);
+  const ptcExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const slashContext = getSlashContext?.();
   const slashWorkspaceId = slashContext?.workspaceId;
 
-  const [disableWorkspaceAgents] = usePersistedState<boolean>(
-    getDisableWorkspaceAgentsKey(slashWorkspaceId ?? GLOBAL_SCOPE_ID),
-    false,
-    { listener: true }
-  );
-
-  const [agentSkills, setAgentSkills] = useState<AgentSkillDescriptor[]>([]);
-  const agentSkillsCacheRef = useRef<Map<string, AgentSkillDescriptor[]>>(new Map());
   const commandPanelRef = useRef<HTMLDivElement | null>(null);
-  const paletteOpenOriginRef = useRef<HTMLElement | null>(null);
+  const paletteOpenOriginRef = useRef<HTMLElement | null>(openOrigin ?? null);
   const { isOpen, initialQuery, close, getActions, addRecent, recent } = useCommandRegistry();
+  const agentSkills = useInvocableSkills(
+    isOpen && slashWorkspaceId
+      ? { workspaceId: slashWorkspaceId, disableWorkspaceAgents: false }
+      : null
+  );
   const [query, setQuery] = useState("");
   const [activePrompt, setActivePrompt] = useState<null | {
     title?: string;
@@ -111,6 +142,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   // Close palette with Escape
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (matchesKeybind(e, KEYBINDS.CANCEL) && isOpen) {
         // Intercept Escape in capture phase so it doesn't reach global bubble handlers
         // (e.g., stream interrupt).
@@ -135,55 +167,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
     }
   }, [isOpen, initialQuery, resetPaletteState]);
 
-  useEffect(() => {
-    const clearAgentSkillsCache = () => {
-      agentSkillsCacheRef.current.clear();
-    };
-
-    window.addEventListener("focus", clearAgentSkillsCache);
-    window.addEventListener(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED, clearAgentSkillsCache);
-
-    return () => {
-      window.removeEventListener("focus", clearAgentSkillsCache);
-      window.removeEventListener(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED, clearAgentSkillsCache);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!isOpen || !api || !slashWorkspaceId) {
-      setAgentSkills([]);
-      return;
-    }
-
-    const cacheKey = `${slashWorkspaceId}:${disableWorkspaceAgents ? "project" : "worktree"}`;
-
-    const cached = agentSkillsCacheRef.current.get(cacheKey);
-    if (cached) {
-      setAgentSkills(cached);
-      return;
-    }
-
-    let cancelled = false;
-    api.agentSkills
-      .list({
-        workspaceId: slashWorkspaceId,
-        disableWorkspaceAgents: disableWorkspaceAgents || undefined,
-      })
-      .then((skills) => {
-        if (cancelled) return;
-        agentSkillsCacheRef.current.set(cacheKey, skills);
-        setAgentSkills(skills);
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setAgentSkills([]);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [api, isOpen, slashWorkspaceId, disableWorkspaceAgents]);
-
   const rawActions = getActions();
 
   const recentIndex = useMemo(() => {
@@ -204,27 +187,6 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
       values: {},
     });
   }, []);
-
-  // Listen for EXECUTE_COMMAND events
-  useEffect(() => {
-    const handleExecuteCommand = (e: Event) => {
-      const customEvent = e as CustomEvent<{ commandId: string }>;
-      const { commandId } = customEvent.detail;
-
-      const action = getActions().find((a) => a.id === commandId);
-      if (!action) {
-        console.warn(`Command not found: ${commandId}`);
-        return;
-      }
-
-      // Run the action directly
-      void action.run();
-      addRecent(action.id);
-    };
-
-    window.addEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
-    return () => window.removeEventListener(CUSTOM_EVENTS.EXECUTE_COMMAND, handleExecuteCommand);
-  }, [getActions, startPrompt, addRecent]);
 
   const handlePromptValue = useCallback(
     (value: string) => {
@@ -278,12 +240,20 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   const handleQueryChange = useCallback(
     (value: string) => {
+      // The list may be shared with the skills hat; entering slash mode asks
+      // again if it missed a source, as typing `/` in the composer does.
+      if (slashWorkspaceId && value.trim().startsWith("/") && !query.trim().startsWith("/")) {
+        getAgentSkillsStore().ensureFresh({
+          workspaceId: slashWorkspaceId,
+          disableWorkspaceAgents: false,
+        });
+      }
       setQuery(value);
       if (activePrompt) {
         setPromptError(null);
       }
     },
-    [activePrompt]
+    [activePrompt, query, slashWorkspaceId]
   );
 
   const generalResults = useMemo(() => {
@@ -296,9 +266,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
         variant: ctx.workspaceId ? "workspace" : "creation",
         isExperimentEnabled: (experimentId) =>
           resolveSlashCommandExperimentValue(experimentId, {
-            workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
             memory: memoryExperimentEnabled,
             memoryConsolidation: memoryConsolidationExperimentEnabled,
+            rlm: rlmExperimentEnabled,
+            programmaticToolCalling: ptcExperimentEnabled,
           }),
       });
       const section = "Slash Commands";
@@ -372,9 +343,10 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
     recentIndex,
     getSlashContext,
     agentSkills,
-    workspaceHeartbeatsExperimentEnabled,
     memoryExperimentEnabled,
     memoryConsolidationExperimentEnabled,
+    rlmExperimentEnabled,
+    ptcExperimentEnabled,
   ]);
 
   useEffect(() => {
@@ -393,6 +365,9 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
     Array<{ id: string; label: string; keywords?: string[] }>
   >([]);
   const [isLoadingOptions, setIsLoadingOptions] = useState(false);
+  // Why the current select prompt has no options: shown in the open palette, where a toast would
+  // render under the overlay.
+  const [optionsError, setOptionsError] = useState<string | null>(null);
 
   const currentField: PromptField | null = activePrompt
     ? (activePrompt.fields[activePrompt.idx] ?? null)
@@ -456,6 +431,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
       }
 
       setIsLoadingOptions(true);
+      setOptionsError(null);
       try {
         const rawOptions = await Promise.resolve(
           currentField.getOptions(activePrompt?.values ?? {})
@@ -472,6 +448,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
         if (!cancelled) {
           console.error("Failed to resolve prompt select options", error);
           setSelectOptions([]);
+          setOptionsError(getErrorMessage(error));
         }
       } finally {
         if (!cancelled) {
@@ -489,6 +466,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
 
   let groups: PaletteGroup[] = generalResults.groups;
   let emptyText: string | undefined = generalResults.emptyText;
+  let emptyIsAlert = false;
 
   if (currentField) {
     const promptTitle = activePrompt?.title ?? currentField.label ?? "Provide details";
@@ -515,15 +493,12 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
           })),
         },
       ];
-      if (isLoadingOptions) {
-        emptyText = "Loading options...";
-      } else if (rankedOptions.length > 0) {
-        emptyText = undefined;
-      } else if (selectOptions.length > 0) {
-        emptyText = "No results";
-      } else {
-        emptyText = "No options";
-      }
+      ({ text: emptyText, alert: emptyIsAlert } = selectPromptEmptyText({
+        isLoadingOptions,
+        resultCount: rankedOptions.length,
+        optionCount: selectOptions.length,
+        optionsError,
+      }));
     } else {
       const typed = query.trim();
       const fallbackHint = currentField.placeholder ?? "Type value and press Enter";
@@ -558,20 +533,17 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
   const hasAnyItems = groupsWithItems.length > 0;
 
   return (
-    <div
-      className="fixed inset-0 z-[2000] flex items-start justify-center bg-black/40 pt-[10vh]"
-      onMouseDown={dismissPalette}
-    >
+    <div className={COMMAND_PALETTE_OVERLAY_CLASSES} onMouseDown={dismissPalette}>
       <Command
         label={currentField?.label ?? "Command palette"}
         ref={commandPanelRef}
-        className="font-primary w-[min(720px,92vw)] overflow-hidden rounded-lg border border-[var(--color-command-border)] bg-[var(--color-command-surface)] text-[var(--color-command-foreground)] shadow-[0_10px_40px_rgba(0,0,0,0.4)]"
+        className={COMMAND_PALETTE_PANEL_CLASSES}
         onMouseDown={(e: React.MouseEvent) => e.stopPropagation()}
         onKeyDown={trapPromptFocus}
         shouldFilter={false}
       >
         <Command.Input
-          className="w-full border-b border-[var(--color-command-input-border)] bg-[var(--color-command-input)] px-3.5 py-3 text-sm text-[var(--color-command-foreground)] outline-none placeholder:text-[var(--color-command-subdued)]"
+          className={COMMAND_PALETTE_INPUT_CLASSES}
           value={query}
           onValueChange={handleQueryChange}
           placeholder={getCommandInputPlaceholder(currentField)}
@@ -669,11 +641,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({ getSlashContext 
               })}
             </Command.Group>
           ))}
-          {!hasAnyItems && (
-            <div className="p-4 text-[13px] text-[var(--color-command-subdued)]">
-              {emptyText ?? "No results"}
-            </div>
-          )}
+          {!hasAnyItems && <PaletteEmptyText text={emptyText} alert={emptyIsAlert} />}
         </Command.List>
       </Command>
     </div>

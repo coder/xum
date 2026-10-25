@@ -29,6 +29,7 @@ import React, {
   useEffect,
   useMemo,
   useCallback,
+  useLayoutEffect,
   useRef,
   useSyncExternalStore,
 } from "react";
@@ -45,6 +46,8 @@ import { InlineReviewNote, type ReviewActionCallbacks } from "../../Shared/Inlin
 import { ReviewControls } from "./ReviewControls";
 import { preloadHighlightedDiff } from "../../Shared/DiffRenderer";
 import { ImmersiveReviewView } from "./ImmersiveReviewView";
+import { listExistingRevisions } from "./reviewBaseRefs";
+import { preserveHunkReferences } from "./preserveHunkReferences";
 import { FileTree } from "./FileTree";
 import { UntrackedStatus } from "./UntrackedStatus";
 import { shellQuote } from "@/common/utils/shell";
@@ -61,6 +64,8 @@ import {
   usePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { STORAGE_KEYS, WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { useProjectReviewBase, useWorkspaceDiffBase } from "@/browser/utils/reviewDefaultBase";
 import { useReviewState } from "@/browser/hooks/useReviewState";
 import { useReviews } from "@/browser/hooks/useReviews";
 import { useHunkFirstSeen } from "@/browser/hooks/useHunkFirstSeen";
@@ -71,12 +76,11 @@ import {
 } from "@/browser/utils/RefreshController";
 import { parseDiff, extractAllHunks, buildGitDiffCommand } from "@/common/utils/git/diffParser";
 import {
+  getReviewFileFilterKey,
   getReviewImmersiveKey,
-  getReviewDefaultBaseKey,
   getReviewSelectedHunkKey,
   getReviewSearchStateKey,
-  REVIEW_INCLUDE_UNCOMMITTED_KEY,
-  REVIEW_SORT_ORDER_KEY,
+  REVIEW_SEARCH_STATE_MAX_CHARS,
 } from "@/common/constants/storage";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
 import { parseNumstat, buildFileTree, extractNewPath } from "@/common/utils/git/numstatParser";
@@ -87,7 +91,6 @@ import type {
   DiffHunk,
   ReviewFilters as ReviewFiltersType,
   ReviewNoteData,
-  ReviewSortOrder,
 } from "@/common/types/review";
 import type { FileTreeNode } from "@/common/utils/git/numstatParser";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
@@ -106,6 +109,7 @@ import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
 import { workspaceStore, useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import { invalidateGitStatus } from "@/browser/stores/GitStatusStore";
 import { getErrorMessage } from "@/common/utils/errors";
+import { runWithCatch, runWithCatchFinally } from "@/browser/utils/compilerSafeControlFlow";
 
 /** Stats reported to parent for tab display */
 interface ReviewPanelStats {
@@ -168,31 +172,8 @@ const LARGE_REVIEW_COLLAPSE_OUTPUT_BYTES = 250_000;
 
 const REVIEW_PANEL_CACHE_MAX_ENTRIES = 20;
 const REVIEW_PANEL_CACHE_MAX_SIZE_BYTES = 20 * 1024 * 1024; // 20MB
-
-/**
- * Preserve object references for unchanged hunks to prevent re-renders.
- * Compares by ID and content - if a hunk exists in prev with same content, reuse it.
- */
-function preserveHunkReferences(prev: DiffHunk[], next: DiffHunk[]): DiffHunk[] {
-  if (prev.length === 0) return next;
-
-  const prevById = new Map(prev.map((h) => [h.id, h]));
-  let allSame = prev.length === next.length;
-
-  const result = next.map((hunk, i) => {
-    const prevHunk = prevById.get(hunk.id);
-    // Fast path: same ID and content means unchanged (content hash is part of ID)
-    if (prevHunk?.content === hunk.content) {
-      if (allSame && prev[i]?.id !== hunk.id) allSame = false;
-      return prevHunk;
-    }
-    allSame = false;
-    return hunk;
-  });
-
-  // If all hunks are reused in same order, return prev array to preserve top-level reference
-  return allSame ? prev : result;
-}
+/** Stable empty list for the immersive view while review state hydrates. */
+const NO_HUNKS: DiffHunk[] = [];
 
 interface ReviewPanelDiffCacheValue {
   hunks: DiffHunk[];
@@ -551,24 +532,6 @@ export function buildReviewDiffPathFilterSpecs(params: {
   }));
 }
 
-export function buildReviewDiffPathFilter(params: {
-  isImmersive: boolean;
-  assistedOnly: boolean;
-  assistedHunks: readonly AssistedReviewHunk[];
-  selectedFilePath: string | null;
-  selectedDiffPath: string;
-  workspaceMetadata: Pick<FrontendWorkspaceMetadata, "projects"> | null | undefined;
-  repoRootProjectPath: string | null | undefined;
-  pathContext?: ProjectRelativePathContext;
-}): string {
-  return (
-    buildReviewDiffPathFilterSpecs({
-      ...params,
-      projectPath: params.repoRootProjectPath ?? "",
-    })[0]?.pathFilter ?? ""
-  );
-}
-
 export function getEffectiveReviewIncludeUncommitted(params: {
   assistedOnly: boolean;
   includeUncommitted: boolean;
@@ -603,7 +566,7 @@ export function getEffectiveReviewFrontendFilters(params: {
   return { showReadHunks: effectiveShowRead, searchTerm: params.searchTerm };
 }
 
-function getReviewPanelPathContext(params: {
+export function getReviewPanelPathContext(params: {
   workspaceMetadata:
     | Pick<FrontendWorkspaceMetadata, "projectPath" | "subProjectPath">
     | null
@@ -615,17 +578,6 @@ function getReviewPanelPathContext(params: {
     projectPath,
     executionRootPath: params.workspaceMetadata?.subProjectPath ?? projectPath,
   };
-}
-
-export function normalizeReviewPanelAssistedHunks(params: {
-  assistedHunks: readonly AssistedReviewHunk[];
-  workspaceMetadata:
-    | Pick<FrontendWorkspaceMetadata, "projectPath" | "subProjectPath">
-    | null
-    | undefined;
-  projectPath: string;
-}): AssistedReviewHunk[] {
-  return normalizeAssistedReviewHunks(params.assistedHunks, getReviewPanelPathContext(params));
 }
 
 interface ReviewAssistedStatsReporterProps {
@@ -666,17 +618,9 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
     [assistedHunks, reviewPathContext]
   );
 
-  const projectDefaultBaseKey = getReviewDefaultBaseKey(projectPath);
-  const workspaceDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
-  const [defaultBase] = usePersistedState<string>(
-    projectDefaultBaseKey,
-    WORKSPACE_DEFAULTS.reviewBase,
-    { listener: true }
-  );
-  const [diffBase] = usePersistedState(workspaceDiffBaseKey, defaultBase, { listener: true });
-  const [includeUncommitted] = usePersistedState(REVIEW_INCLUDE_UNCOMMITTED_KEY, false, {
-    listener: true,
-  });
+  const [diffBase] = useWorkspaceDiffBase(workspaceId, projectPath);
+  const includeUncommitted =
+    useUserPreferences((preferences) => preferences.review?.includeUncommitted) ?? false;
 
   useEffect(() => {
     if (normalizedAssistedHunks.length === 0) {
@@ -842,16 +786,31 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     workspaceStore.getFileModifyingToolMs(workspaceId) !== undefined
   );
 
-  // Unified search state (per-workspace persistence)
-  const [searchState, setSearchState] = usePersistedState<ReviewSearchState>(
-    getReviewSearchStateKey(workspaceId),
+  // Unified search state (per-workspace persistence). The persisted copy is bounded by its key
+  // budget: a search too long for it stays live in memory and persists with an empty input, so the
+  // box keeps accepting input (a refused write would freeze it) but the search is not restored on
+  // reload. A truncated input would restore a different (possibly invalid) regex.
+  const searchStateKey = getReviewSearchStateKey(workspaceId);
+  const [persistedSearchState, setPersistedSearchState] = usePersistedState<ReviewSearchState>(
+    searchStateKey,
     { input: "", useRegex: false, matchCase: false }
   );
+  const [liveSearchState, setLiveSearchState] = useState<{
+    key: string;
+    value: ReviewSearchState;
+  } | null>(null);
+  const searchState =
+    liveSearchState?.key === searchStateKey ? liveSearchState.value : persistedSearchState;
+  const setSearchState = (next: ReviewSearchState) => {
+    setLiveSearchState({ key: searchStateKey, value: next });
+    const fits = JSON.stringify(next).length <= REVIEW_SEARCH_STATE_MAX_CHARS;
+    setPersistedSearchState(fits ? next : { ...next, input: "" });
+  };
   const [debouncedSearchTerm, setDebouncedSearchTerm] = useState("");
 
   // Persist file filter per workspace
   const [selectedFilePath, setSelectedFilePath] = usePersistedState<string | null>(
-    `review-file-filter:${workspaceId}`,
+    getReviewFileFilterKey(workspaceId),
     null
   );
 
@@ -866,38 +825,20 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     selectedRepoRootProjectPath
   );
 
-  const projectDefaultBaseKey = getReviewDefaultBaseKey(projectPath);
   const workspaceDiffBaseKey = STORAGE_KEYS.reviewDiffBase(workspaceId);
 
-  // Per-project default base (shared across workspaces in the same project).
-  // Falls back to a static value only if trunk detection fails.
-  const [defaultBase, setDefaultBase] = usePersistedState<string>(
-    projectDefaultBaseKey,
-    WORKSPACE_DEFAULTS.reviewBase,
-    { listener: true }
-  );
+  // Per-project default base (shared across workspaces in the same project), set only by the user.
+  const projectReviewBase = useProjectReviewBase(projectPath);
 
-  // Persist diff base per workspace (falls back to project default)
-  // Uses listener: true to sync with GitStatusIndicator base selector
-  const [diffBase, setDiffBase] = usePersistedState(workspaceDiffBaseKey, defaultBase, {
-    listener: true,
-  });
+  // Persist diff base per workspace (falls back to project default); syncs with GitStatusIndicator.
+  const [diffBase, setDiffBase] = useWorkspaceDiffBase(workspaceId, projectPath);
 
-  // Persist includeUncommitted flag globally
-  const [includeUncommitted, setIncludeUncommitted] = usePersistedState(
-    REVIEW_INCLUDE_UNCOMMITTED_KEY,
-    false,
-    { listener: true }
-  );
-
-  // Persist showReadHunks flag globally
-  const [showReadHunks, setShowReadHunks] = usePersistedState("review-show-read", true);
-
-  // Persist sort order globally
-  const [sortOrder, setSortOrder] = usePersistedState<ReviewSortOrder>(
-    REVIEW_SORT_ORDER_KEY,
-    "last-edit"
-  );
+  // ReviewControls writes these global preferences; filters always show their current values.
+  const includeUncommitted =
+    useUserPreferences((preferences) => preferences.review?.includeUncommitted) ?? false;
+  const showReadHunks = useUserPreferences((preferences) => preferences.review?.showRead) ?? true;
+  const sortOrder =
+    useUserPreferences((preferences) => preferences.review?.sortOrder) ?? "last-edit";
 
   // Auto-detect trunk for new review base keys so repos using master/develop
   // don't start on the hard-coded fallback. Existing user selections are preserved.
@@ -906,78 +847,85 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   // the repository's canonical trunk. So we only apply metadata trunk to the workspace-
   // scoped diff base, while the project default comes from listBranches().recommendedTrunk.
   useEffect(() => {
-    const projectBaseIsPersisted = readPersistedString(projectDefaultBaseKey) !== undefined;
-    const workspaceBaseIsPersisted = readPersistedString(workspaceDiffBaseKey) !== undefined;
-    const shouldInitializeWorkspaceBase = !workspaceBaseIsPersisted;
+    if (readPersistedString(workspaceDiffBaseKey) !== undefined) {
+      return;
+    }
 
     const metadataTrunkBase = toMetadataDiffBase(
       workspaceMetadata.get(workspaceId)?.taskTrunkBranch
     );
-    const initializedWorkspaceFromMetadata =
-      shouldInitializeWorkspaceBase && metadataTrunkBase != null;
-    if (initializedWorkspaceFromMetadata) {
+    if (metadataTrunkBase != null) {
       setDiffBase(metadataTrunkBase);
+      return;
     }
 
-    if (projectBaseIsPersisted || !api) {
+    // The detected trunk is repository data, not a preference: it seeds only this workspace's
+    // base, and an explicit project default makes detection unnecessary. Before the first config
+    // snapshot that default is unknown, and a detected base persisted then would mask it.
+    if (projectReviewBase !== null || !api) {
       return;
     }
 
     let cancelled = false;
-    void (async () => {
-      try {
+    void runWithCatch(
+      async () => {
         const branchResult = await api.projects.listBranches({ projectPath });
-        const detectedBase = toOriginDiffBase(branchResult.recommendedTrunk);
+        const originBase = toOriginDiffBase(branchResult.recommendedTrunk);
+        // The recommended trunk is a local branch, so it always exists. Prefer its origin copy,
+        // but only when that ref exists: a repo without an `origin` remote opened Review on a
+        // raw `git` error (#5682).
+        const localBase = toMetadataDiffBase(branchResult.recommendedTrunk);
+        const existing =
+          originBase == null ? null : await listExistingRevisions(api, workspaceId, [originBase]);
         if (cancelled) {
           return;
         }
-        if (!detectedBase) {
-          // Persist fallback once so repeated metadata updates don't keep re-trying
-          // trunk detection for repos that currently have no usable recommended trunk.
-          if (readPersistedString(projectDefaultBaseKey) === undefined) {
-            setDefaultBase(WORKSPACE_DEFAULTS.reviewBase);
-          }
-          return;
+        const detectedBase =
+          originBase != null && existing?.has(originBase) === false ? localBase : originBase;
+        // Persist the fallback too so metadata updates don't keep re-running detection.
+        if (readPersistedString(workspaceDiffBaseKey) === undefined) {
+          setDiffBase(detectedBase ?? WORKSPACE_DEFAULTS.reviewBase);
         }
-
-        if (readPersistedString(projectDefaultBaseKey) === undefined) {
-          setDefaultBase(detectedBase);
-        }
-        if (shouldInitializeWorkspaceBase && !initializedWorkspaceFromMetadata) {
-          const currentWorkspaceBase = readPersistedString(workspaceDiffBaseKey);
-          if (currentWorkspaceBase === undefined) {
-            setDiffBase(detectedBase);
-          }
-        }
-      } catch {
+      },
+      () => {
         // Best effort only; keep WORKSPACE_DEFAULTS.reviewBase when detection fails.
       }
-    })();
+    );
 
     return () => {
       cancelled = true;
     };
   }, [
     api,
-    projectDefaultBaseKey,
+    projectReviewBase,
     projectPath,
-    setDefaultBase,
     setDiffBase,
     workspaceDiffBaseKey,
     workspaceId,
     workspaceMetadata,
   ]);
 
-  // Initialize review state hook
-  const { isRead, toggleRead, markAsRead, markAsUnread } = useReviewState(workspaceId);
+  // Initialize review state hook. `isLoaded` gates the hunk list: review state lives in the
+  // backend, and rendering before it hydrates would run auto-collapse against empty maps.
+  const {
+    isRead,
+    toggleRead,
+    markAsRead,
+    markAsUnread,
+    isLoaded: reviewStateLoaded,
+  } = useReviewState(workspaceId);
 
   // Refs for values that change frequently but are only read at callback invocation time.
   // Using refs allows callbacks to stay stable (same reference) while still accessing current values.
   // This prevents all HunkViewer components from re-rendering when these values change.
+  // Refs are synced in layout effects (same task as the commit) because React Compiler
+  // rejects ref writes during render; the same applies to the other latest-value refs below.
   const isReadRef = useRef(isRead);
-  isReadRef.current = isRead;
   const selectedHunkIdRef = useRef(selectedHunkId);
-  selectedHunkIdRef.current = selectedHunkId;
+  useLayoutEffect(() => {
+    isReadRef.current = isRead;
+    selectedHunkIdRef.current = selectedHunkId;
+  });
 
   useEffect(() => {
     updatePersistedState(selectedHunkStorageKey, selectedHunkId);
@@ -1108,7 +1056,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   // Defaulting to `false` makes the "Read:" toggle behave as the user expects
   // when Assisted is on — marking an assisted pin as read clears it from the
   // view. A user who wants to inspect already-read pins can flip it on.
-  const [filters, setFilters] = useState<ReviewFiltersType>({
+  const [filterState, setFilters] = useState<ReviewFiltersType>({
     showReadHunks: showReadHunks,
     assistedShowReadHunks: false,
     diffBase: diffBase,
@@ -1116,6 +1064,12 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     sortOrder: sortOrder,
     assistedOnly: false,
   });
+  const filters: ReviewFiltersType = {
+    ...filterState,
+    includeUncommitted,
+    showReadHunks,
+    sortOrder,
+  };
 
   // Subscribe to the agent's Assisted Review hunks for this workspace. The
   // aggregator returns a stable reference (only changes when review_pane_update
@@ -1206,9 +1160,12 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   // mirrored only `filters.showReadHunks`, which caused the panel to
   // navigate away from a hunk that was actually still visible whenever
   // Assisted's override forced show-read true.
-  showReadHunksRef.current = filters.assistedOnly
+  const effectiveShowReadHunks = filters.assistedOnly
     ? filters.assistedShowReadHunks
     : filters.showReadHunks;
+  useLayoutEffect(() => {
+    showReadHunksRef.current = effectiveShowReadHunks;
+  });
 
   // Track if user is drafting a review note (selection or editing an existing note).
   // We only pause scheduled refreshes while drafting so tool-driven refresh stays unified
@@ -1217,6 +1174,14 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   const isComposingReviewNoteRef = useRef(false);
   const composingHunksRef = useRef(new Set<string>());
   const editingReviewIdsRef = useRef(new Set<string>());
+
+  // Track if refresh button should be disabled (drafting or editing a review note)
+  const [isRefreshBlocked, setIsRefreshBlocked] = useState(false);
+
+  // RefreshController - handles debouncing, in-flight guards, etc.
+  // Created in useEffect to survive React StrictMode double-mount.
+  // (StrictMode calls cleanup then re-mounts; refs persist but controller would be disposed)
+  const controllerRef = useRef<RefreshController | null>(null);
 
   const updateRefreshBlockState = useCallback(() => {
     const wasComposing = isComposingReviewNoteRef.current;
@@ -1232,7 +1197,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     }
   }, []);
 
-  // Handler for when a hunk's composing state changes
   const handleHunkComposingChange = useCallback(
     (hunkId: string, isComposing: boolean) => {
       if (isComposing) {
@@ -1286,13 +1250,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   const [lastRefreshInfo, setLastRefreshInfo] = useState<LastRefreshInfo | null>(null);
   // Last refresh failure for UI display (tooltip showing latest refresh error)
   const [lastRefreshFailure, setLastRefreshFailure] = useState<RefreshFailureInfo | null>(null);
-  // Track if refresh button should be disabled (drafting or editing a review note)
-  const [isRefreshBlocked, setIsRefreshBlocked] = useState(false);
-
-  // RefreshController - handles debouncing, in-flight guards, etc.
-  // Created in useEffect to survive React StrictMode double-mount.
-  // (StrictMode calls cleanup then re-mounts; refs persist but controller would be disposed)
-  const controllerRef = useRef<RefreshController | null>(null);
 
   useEffect(() => {
     const controller = new RefreshController({
@@ -1409,7 +1366,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
 
     const loadFileTree = async () => {
       setIsLoadingTree(true);
-      try {
+      const fetchFileTree = async () => {
         await ensureOriginFetched({
           api,
           workspaceId,
@@ -1487,13 +1444,18 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
         if (cancelled) return;
         lastFileTreeRefreshTriggerRef.current = refreshTrigger;
         setFileTree(tree);
-      } catch (err) {
-        console.error("Failed to load file tree:", err);
-      } finally {
-        if (!cancelled) {
-          setIsLoadingTree(false);
+      };
+      await runWithCatchFinally(
+        fetchFileTree,
+        (err) => {
+          console.error("Failed to load file tree:", err);
+        },
+        () => {
+          if (!cancelled) {
+            setIsLoadingTree(false);
+          }
         }
-      }
+      );
     };
 
     void loadFileTree();
@@ -1699,21 +1661,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     isCreating,
     isImmersive,
   ]);
-
-  // Persist includeUncommitted when it changes
-  useEffect(() => {
-    setIncludeUncommitted(filters.includeUncommitted);
-  }, [filters.includeUncommitted, setIncludeUncommitted]);
-
-  // Persist showReadHunks when it changes
-  useEffect(() => {
-    setShowReadHunks(filters.showReadHunks);
-  }, [filters.showReadHunks, setShowReadHunks]);
-
-  // Persist sortOrder when it changes
-  useEffect(() => {
-    setSortOrder(filters.sortOrder);
-  }, [filters.sortOrder, setSortOrder]);
 
   // Record first-seen timestamps for new hunks
   useEffect(() => {
@@ -1967,7 +1914,9 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
       : false);
 
   // Keep ref in sync so callbacks can access current filtered list without dependency
-  filteredHunksRef.current = filteredHunks;
+  useLayoutEffect(() => {
+    filteredHunksRef.current = filteredHunks;
+  });
 
   // Ensure selectedHunkId is valid after filtering/sorting:
   // - If no selection or selection not in the validity list, select first visible hunk
@@ -2083,7 +2032,6 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
       // Find all hunks in the same file
       const fileHunkIds = hunks.filter((h) => h.filePath === hunk.filePath).map((h) => h.id);
 
-      // Mark all hunks in the file as read
       markAsRead(fileHunkIds);
 
       // If marking the selected hunk's file as read and hunks will be filtered out, navigate.
@@ -2293,6 +2241,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
         isImmersive={isImmersive}
         onToggleImmersive={toggleImmersive}
         projectPath={projectPath}
+        workspaceId={workspaceId}
         lastRefreshInfo={lastRefreshInfo}
         lastRefreshFailure={lastRefreshFailure}
         assistedCount={assistedHunks.length}
@@ -2323,7 +2272,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
             )}
           </div>
         )
-      ) : diffState.status === "loading" ? (
+      ) : diffState.status === "loading" || !reviewStateLoaded ? (
         <div className="text-muted flex h-full items-center justify-center text-sm">
           Loading diff...
         </div>
@@ -2640,9 +2589,13 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
             <ImmersiveReviewView
               workspaceId={workspaceId}
               fileTree={fileTree}
-              hunks={filteredHunks}
-              allHunks={hunks}
-              isLoading={diffState.status === "loading" || isLoadingTree}
+              // Withhold hunks until review state hydrates: the immersive view ignores
+              // isLoading once it has hunks, and would render (and accept keyboard actions)
+              // against empty read/note maps that then snap to the persisted ones.
+              hunks={reviewStateLoaded ? filteredHunks : NO_HUNKS}
+              allHunks={reviewStateLoaded ? hunks : NO_HUNKS}
+              isLoading={diffState.status === "loading" || isLoadingTree || !reviewStateLoaded}
+              loadError={diffState.status === "error" ? diffState.message : null}
               isRead={isRead}
               onToggleRead={handleToggleRead}
               onMarkFileAsRead={handleMarkFileAsRead}
@@ -2659,6 +2612,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
               assistedOnly={filters.assistedOnly}
               assistedCount={assistedHunks.length}
               assistedUnreadCount={unreadAssistedInDiff}
+              isMultiProjectWorkspace={(workspaceReviewMetadata?.projects?.length ?? 0) > 1}
             />,
             root
           );

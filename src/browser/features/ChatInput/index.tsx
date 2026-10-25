@@ -3,11 +3,11 @@ import React, {
   useRef,
   useCallback,
   useEffect,
-  useId,
-  useMemo,
   useLayoutEffect,
+  useMemo,
   useSyncExternalStore,
 } from "react";
+import { flushSync } from "react-dom";
 import {
   isInitialStagingLocked,
   subscribeInitialStagingLock,
@@ -15,59 +15,40 @@ import {
 import {
   CommandSuggestions,
   COMMAND_SUGGESTION_KEYS,
-  FILE_SUGGESTION_KEYS,
 } from "@/browser/features/ChatInput/CommandSuggestions";
 import type { Toast } from "@/browser/features/ChatInput/ChatInputToast";
 import { ConnectionStatusToast } from "@/browser/components/ConnectionStatusToast/ConnectionStatusToast";
 import { ChatInputToast } from "@/browser/features/ChatInput/ChatInputToast";
-import type { SendMessageError } from "@/common/types/errors";
+import { SendMessageErrorSchema } from "@/common/orpc/schemas/errors";
 import { createErrorToast } from "@/browser/features/ChatInput/ChatInputToasts";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import { parseCommand } from "@/browser/utils/slashCommands/parser";
-import {
-  readPersistedState,
-  usePersistedState,
-  updatePersistedState,
-  subscribePersistedStateWrites,
-} from "@/browser/hooks/usePersistedState";
+import { usePersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAgent } from "@/browser/contexts/AgentContext";
 import { ThinkingSelector } from "@/browser/components/ThinkingSelector/ThinkingSelector";
-import {
-  getAllowedRuntimeModesForUi,
-  isParsedRuntimeAllowedByPolicy,
-} from "@/browser/utils/policyUi";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { useAPI } from "@/browser/contexts/API";
-import { useReasoningMode } from "@/browser/hooks/useReasoningMode";
-import { useThinkingLevel } from "@/browser/hooks/useThinkingLevel";
+import { useAPI, type APIClient, useLiveAPI } from "@/browser/contexts/API";
+import { CONNECTION_LOST_MESSAGE } from "@/browser/contexts/connectionLink";
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import { normalizeSelectedModel } from "@/common/utils/ai/models";
+import { hasOpenAIApiKey } from "@/common/utils/providers/codexOauthRouting";
 import {
   useAdditionalSystemContextHydrated,
   useAdditionalSystemContextSnapshot,
 } from "@/browser/utils/additionalSystemContextStore";
-import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
+import {
+  useAutoRoutingSelection,
+  useSendMessageOptions,
+} from "@/browser/hooks/useSendMessageOptions";
 import { setWorkspaceModelWithOrigin } from "@/browser/utils/modelChange";
+import { readScopedAiDefault, writeScopedAiDefault } from "@/browser/utils/scopedAiDefaults";
+import { resolveWorkspaceAiSettingsForAgent } from "@/browser/utils/workspaceModeAi";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import {
-  clearPendingWorkspaceAiSettings,
-  markPendingWorkspaceAiSettings,
-} from "@/browser/utils/workspaceAiSettingsSync";
-import {
-  getModelKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-  getInputKey,
-  getInputAttachmentsKey,
-  AGENT_AI_DEFAULTS_KEY,
-  VIM_ENABLED_KEY,
-  RUNTIME_ENABLEMENT_KEY,
-  getProjectScopeId,
-  getPendingScopeId,
-  getDraftScopeId,
+  getCreationDraftScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
   getWorkspaceLastReadKey,
@@ -75,44 +56,32 @@ import {
 import {
   prepareCompactionMessage,
   processSlashCommand,
-  type SlashCommandContext,
+  type CommandAction,
+  type SlashCommandEnv,
 } from "@/browser/utils/chatCommands";
 import {
   addWorkflowRunCardMessageForRun,
   getWorkflowRunCardProjection,
 } from "@/browser/utils/workflowRunMessages";
 import { Button } from "@/browser/components/Button/Button";
-import { CUSTOM_EVENTS } from "@/common/constants/events";
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import { findAtMentionAtCursor } from "@/common/utils/atMentions";
 import {
-  extractInlineSkillReferenceCandidates,
-  findInlineSkillReferenceAtCursor,
-} from "@/browser/utils/agentSkills/inlineSkillReferences";
+  CUSTOM_EVENTS,
+  createCustomEvent,
+  type CustomEventPayloads,
+} from "@/common/constants/events";
+import { useChatErrorToasts } from "@/browser/utils/chatErrorToasts";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { extractInlineSkillReferenceCandidates } from "@/browser/utils/agentSkills/inlineSkillReferences";
 import {
   convertSymbolCommandAtCursor,
   convertTerminatedSymbolCommand,
-  findSymbolCommandAtCursor,
-  getSymbolSuggestions,
 } from "@/browser/features/ChatInput/symbolShortcuts";
-import {
-  getInlineSkillInsertionTrailingText,
-  getInlineSkillSuggestions,
-  shouldRefreshInlineSkillSuggestions,
-} from "@/browser/utils/agentSkills/inlineSkillSuggestions";
-import {
-  formatProjectHierarchyLabel,
-  resolveWorkspaceCreationScope,
-} from "@/common/utils/subProjects";
-import { SCRATCH_PROJECT_CONFIG_KEY, SCRATCH_PROJECT_NAME } from "@/common/constants/scratch";
+import { resolveWorkspaceCreationScope } from "@/common/utils/subProjects";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { CreationProjectSelect } from "./CreationProjectSelect";
-import { getCommandGhostHint } from "@/browser/utils/slashCommands/registry";
-import {
-  getSlashCommandSuggestions,
-  type SlashSuggestion,
-} from "@/browser/utils/slashCommands/suggestions";
-import { resolveSlashCommandExperimentValue } from "@/browser/utils/slashCommands/experimentVisibility";
+import { projectRuntimeEnablement } from "./creationDraftProject";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
+import { useComputerUse } from "@/browser/hooks/useComputerUse";
 import { AgentModePicker } from "@/browser/components/AgentModePicker/AgentModePicker";
 import { ContextUsageIndicatorButton } from "@/browser/components/ContextUsageIndicatorButton/ContextUsageIndicatorButton";
 import {
@@ -120,6 +89,15 @@ import {
   useWorkspaceStoreRaw,
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
+import {
+  flushUserPreferences,
+  getUserPreferences,
+  updateUserPreferences,
+  useAgentAiDefaults,
+  useAppConfig,
+  useUserPreferences,
+} from "@/browser/stores/AppConfigStore";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import { getPlaceholderTip } from "./placeholderTips";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
@@ -130,8 +108,13 @@ import {
   matchesKeybind,
   formatKeybind,
   KEYBINDS,
+  isDesktopViewportFocused,
+  isCommandPaletteTarget,
+  isDialogOpen,
   isEditableElement,
+  paneHandlesKeyEvent,
 } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import {
   hasBudgetedResumableGoal,
   modelHasPricingData,
@@ -146,42 +129,24 @@ import { useModelsFromSettings } from "@/browser/hooks/useModelsFromSettings";
 import { SendHorizontal } from "lucide-react";
 import { AttachFileButton } from "./AttachFileButton";
 import { VimTextArea } from "@/browser/components/VimTextArea/VimTextArea";
-import { ChatAttachments, type ChatAttachment } from "@/browser/features/ChatInput/ChatAttachments";
-import {
-  extractAttachmentsFromClipboard,
-  extractAttachmentsFromDrop,
-  chatAttachmentsToFileParts,
-  processAttachmentFiles,
-} from "@/browser/utils/attachmentsHandling";
+import { ChatAttachments } from "@/browser/features/ChatInput/ChatAttachments";
+import { chatAttachmentsToFileParts } from "@/browser/utils/attachmentsHandling";
 import {
   buildPendingFromRestoredInput,
+  getEditSendPrecondition,
+  type EditingMessageState,
   type PendingUserMessage,
 } from "@/browser/utils/chatEditing";
 
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
-import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
-import type { PluginSlashCommandDescriptor } from "@/common/orpc/schemas/agentPlugins";
-import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
-import {
-  coerceThinkingLevel,
-  type OpenAIReasoningMode,
-  type ThinkingLevel,
-} from "@/common/types/thinking";
-import {
-  DEFAULT_RUNTIME_ENABLEMENT,
-  normalizeRuntimeEnablement,
-  type CoderWorkspaceConfig,
-} from "@/common/types/runtime";
-import { resolveThinkingInput } from "@/common/utils/thinking/policy";
+import { type ThinkingLevel } from "@/common/types/thinking";
+import { normalizeRuntimeEnablement, RUNTIME_MODE } from "@/common/types/runtime";
 import {
   type AgentSkillReference,
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
-  prepareUserMessageForSend,
   withAgentSkillRefs,
   withMcpPromptRefs,
 } from "@/common/types/message";
-import type { Review } from "@/common/types/review";
 import {
   getModelCapabilities,
   getModelCapabilitiesResolved,
@@ -189,9 +154,9 @@ import {
 import { KNOWN_MODELS, MODEL_ABBREVIATION_EXAMPLES } from "@/common/constants/knownModels";
 import { useTelemetry } from "@/browser/hooks/useTelemetry";
 import { trackCommandUsed } from "@/common/telemetry";
-import type { FilePart, SendMessageOptions } from "@/common/orpc/types";
+import type { SendMessageOptions } from "@/common/orpc/types";
 
-import { CreationCenterContent } from "./CreationCenterContent";
+import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import { cn } from "@/common/lib/utils";
 import type {
   ChatInputProps,
@@ -201,19 +166,15 @@ import type {
 } from "./types";
 import { CreationControls } from "./CreationControls";
 import { SEND_DISPATCH_MODES } from "./sendDispatchModes";
-import { CodexOauthWarningBanner } from "./CodexOauthWarningBanner";
 import { useCreationWorkspace } from "./useCreationWorkspace";
+import { useCoderConfigChangeHandler } from "./useCoderConfigChangeHandler";
+import { useCreationProjectChangeHandler } from "./useCreationProjectChangeHandler";
 import { useCoderWorkspace } from "@/browser/hooks/useCoderWorkspace";
 import { useTutorial } from "@/browser/contexts/TutorialContext";
 import { useContextMenuPosition } from "@/browser/hooks/useContextMenuPosition";
 import { usePowerMode } from "@/browser/contexts/PowerModeContext";
 import { useVoiceInput } from "@/browser/hooks/useVoiceInput";
 import { VoiceInputButton } from "./VoiceInputButton";
-import {
-  estimatePersistedChatAttachmentsChars,
-  MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS,
-  readPersistedChatAttachments,
-} from "./draftAttachmentsStorage";
 import {
   formatPendingFileStagingError,
   getPendingFileAttachments,
@@ -230,14 +191,19 @@ import {
   resolveMcpPromptRefsForSend,
   validateCreationRuntime,
   filePartsToChatAttachments,
-  type MCPPromptInvocation,
-  type SkillInvocation,
   type SkillResolutionTarget,
 } from "./utils";
 import { normalizeAgentId } from "@/common/utils/agentIds";
 import { isGoalRunning } from "@/common/types/goal";
 import { appendStagedAttachmentNotice, getStagedAttachments } from "./stagedAttachments";
+import type { ChatAttachment } from "./ChatAttachments";
+import { hasDraftBlock, joinDraftText, takeSentText } from "@/common/utils/composerDraftText";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
+import {
+  consumeAiSelectionIntent,
+  getAiSelectionIntentForSendOptions,
+  markAiSelectionIntent,
+} from "@/browser/utils/aiSelectionIntent";
 import {
   COMPOSER_CONTROL_HEIGHT_CLASS,
   COMPOSER_ICON_ONLY_HIDE_CLASS,
@@ -246,43 +212,37 @@ import {
   CREATION_COLUMN_MAX_WIDTH_CLASS,
 } from "@/constants/layout";
 import { useChatDockColumnWidthClass } from "@/browser/components/ChatPane/chatDockColumn";
-
-// localStorage quotas are environment-dependent and relatively small.
-// Be conservative here so we can warn the user before writes start failing.
-
-// Normal typing usually has no active suggestion menu. Reuse the existing empty array
-// so suggestion effects do not schedule an avoidable second render on every keypress.
-function clearSuggestions(prev: SlashSuggestion[]): SlashSuggestion[] {
-  return prev.length === 0 ? prev : [];
-}
-
-function replaceSuggestions(prev: SlashSuggestion[], next: SlashSuggestion[]): SlashSuggestion[] {
-  return prev.length === 0 && next.length === 0 ? prev : next;
-}
-
-const PDF_MEDIA_TYPE = "application/pdf";
-
-function getBaseMediaType(mediaType: string): string {
-  return mediaType.toLowerCase().trim().split(";")[0];
-}
-
-function estimateBase64DataUrlBytes(dataUrl: string): number | null {
-  if (!dataUrl.startsWith("data:")) return null;
-
-  const commaIndex = dataUrl.indexOf(",");
-  if (commaIndex === -1) return null;
-
-  const header = dataUrl.slice("data:".length, commaIndex);
-  if (!header.includes(";base64")) return null;
-
-  const base64 = dataUrl.slice(commaIndex + 1);
-  const padding = base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0;
-  return Math.floor((base64.length * 3) / 4) - padding;
-}
-
-// Shared so the three "blocked while editing a message" attachment guards surface identical copy
-// and can't drift if one is reworded.
-const EDIT_MODE_ATTACHMENT_ERROR_MESSAGE = "Attachments cannot be added while editing a message.";
+import { prepareMessagePayload } from "./prepareMessagePayload";
+import {
+  estimateBase64DataUrlBytes,
+  isPdfAttachment,
+  useComposerAttachments,
+} from "./useComposerAttachments";
+import { useComposerDraft } from "./useComposerDraft";
+import { getDraftStore, type SendOutcome } from "@/browser/stores/DraftStore";
+import { useComposerTypingLock } from "./useComposerTypingLock";
+import { useSendMarkEditTracking } from "./useSendMarkEditTracking";
+import { useReportCreationSendBlocked } from "./useReportCreationSendBlocked";
+import { assert } from "@/common/utils/assert";
+import { acceptedSendIds, isEditSendAccepted } from "./sendAcceptance";
+import { createSendId } from "@/common/utils/drafts";
+import { useComposerSuggestions } from "./useComposerSuggestions";
+import { isRestoredDraftDurable } from "./restoredDraftDurability";
+import {
+  commandBypassesTranscriptBarrier,
+  isTranscriptMutationAllowed,
+} from "@/browser/utils/transcriptBarrier";
+import {
+  EDIT_RETRY_REFRESH_LABEL,
+  EDIT_TARGET_GONE_MESSAGE,
+  TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+} from "@/constants/transcriptBarrier";
+import type { HistoryEditPrecondition } from "@/common/orpc/types";
+import {
+  runWithCatch,
+  runWithCatchFinally,
+  runWithFinally,
+} from "@/browser/utils/compilerSafeControlFlow";
 
 export type { ChatInputProps, ChatInputAPI };
 
@@ -295,36 +255,147 @@ interface InternalSendOverrides extends SendOverrides {
   skipBoundaryEditConfirmation?: boolean;
 }
 
+/** Review notes captured for one send: their display data and the store ids to check off. */
+interface ReviewsForSend {
+  data: ReviewNoteDataForDisplay[] | undefined;
+  ids: string[];
+  /** The attached notes could not be loaded, so none are included (#5011). */
+  unavailable?: boolean;
+}
+
+/**
+ * Calls `onChange` for each provider config change until `signal` aborts.
+ * A plain function because React Compiler can't lower `for await` inside a component.
+ * Some oRPC iterators don't eagerly close on abort alone, so `onIterator` hands the
+ * iterator to the caller, whose cleanup must `return()` it so backend subscriptions
+ * release their EventEmitter listeners.
+ */
+async function forEachProviderConfigChange(
+  api: APIClient,
+  signal: AbortSignal,
+  onIterator: (iterator: AsyncIterator<unknown>) => void,
+  onChange: () => void
+): Promise<void> {
+  try {
+    const subscribedIterator = await api.providers.onConfigChanged(undefined, { signal });
+
+    if (signal.aborted) {
+      void subscribedIterator.return?.();
+      return;
+    }
+
+    onIterator(subscribedIterator);
+
+    for await (const _ of subscribedIterator) {
+      if (signal.aborted) break;
+      onChange();
+    }
+  } catch {
+    // Subscription cancelled via abort signal - expected on cleanup
+  }
+}
+
+/**
+ * Why a send waits for the transcript. Offline the transcript cannot catch up until the
+ * reconnect, so the toast says that instead of "still loading".
+ */
+function transcriptBarrierMessage(offline: boolean): string {
+  return offline ? CONNECTION_LOST_MESSAGE : TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE;
+}
+
+/**
+ * The toast that refuses a resolved send before any command runs, or null. The transcript
+ * barrier comes first (see the call site), then a skill mention inside /goal.
+ */
+function sendRefusalToast(input: {
+  parsed: ParsedCommand | null;
+  workspaceVariant: boolean;
+  transcriptAllowed: boolean;
+  offline: boolean;
+  attachmentCount: number;
+  skillRefs: readonly AgentSkillReference[];
+}): Omit<Toast, "id"> | null {
+  if (
+    input.workspaceVariant &&
+    !commandBypassesTranscriptBarrier(input.parsed) &&
+    !input.transcriptAllowed
+  ) {
+    return { type: "error", message: transcriptBarrierMessage(input.offline) };
+  }
+  return goalSkillMentionToast(input.parsed, input.attachmentCount, input.skillRefs);
+}
+
+/**
+ * #4126: /goal sends its objective to the model only as quoted text in the goal kickoff, so a
+ * `$skill` it mentions never loads (a normal message loads it). Refuse with the way to combine
+ * them instead of setting a goal whose skill silently does nothing. With attachments, /goal is
+ * sent as a normal message, which loads the skill, so it passes.
+ */
+function goalSkillMentionToast(
+  parsed: ParsedCommand | null,
+  attachmentCount: number,
+  skillRefs: readonly AgentSkillReference[]
+): Omit<Toast, "id"> | null {
+  const [ref] = skillRefs;
+  if (parsed?.type !== "goal-set" || attachmentCount > 0 || ref === undefined) return null;
+  const name = ref.skillName;
+  return {
+    type: "error",
+    title: "Skills do not load inside /goal",
+    message: `/goal sends $${name} to the model as plain text, so the skill does not run. Set the goal without it, then send /${name} (or a message with $${name}). To keep the text as written, wrap it in backticks.`,
+  };
+}
+
+/** Composer attachments for a restored or edited message (provider files, then staged files). */
+function pendingChatAttachments(
+  pending: PendingUserMessage,
+  attachmentKeyPrefix: string
+): ChatAttachment[] {
+  const providerAttachments = filePartsToChatAttachments(pending.fileParts, attachmentKeyPrefix);
+  const stagedAttachments = pending.stagedAttachments.map((attachment, index) => ({
+    ...attachment,
+    id: `${attachmentKeyPrefix}-staged-${index}`,
+  }));
+  return [...providerAttachments, ...stagedAttachments];
+}
+
+/** One edit, from entering edit mode until it is cancelled or its send is accepted (#5226). */
+interface EditSession {
+  id: string;
+  /** The unsent draft from before the edit, restored when the edit ends. */
+  preEditDraft: { text: string; attachments: ChatAttachment[] };
+  preEditReviews: ReviewNoteDataForDisplay[] | null;
+  /** Its draft was given back (cancel, or accepted send); it restores nothing again. */
+  settled: boolean;
+}
+
 const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const { api } = useAPI();
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
-  const runtimePolicy = useMemo(
-    () => getAllowedRuntimeModesForUi(effectivePolicy),
-    [effectivePolicy]
-  );
+  const liveApi = useLiveAPI();
+  // For refusals after an await: the send's closure holds the client from when it started.
+  const liveApiRef = useRef(liveApi);
+  useEffect(() => {
+    liveApiRef.current = liveApi;
+  }, [liveApi]);
   const { variant } = props;
+  // A /side chat composer is mounted next to the main one. Window shortcuts act only in the pane
+  // that owns the focused element, and unscoped palette events (open model selector, voice, toasts)
+  // belong to the main composer so they fire once.
+  const paneScope = useChatPaneScope();
   const { userProjects } = useProjectContext();
   const creationScope =
     variant === "creation"
       ? resolveWorkspaceCreationScope(props.projectPath, userProjects, props.pendingSubProjectPath)
       : null;
   const creationParentProjectPath = creationScope?.projectPath ?? "";
+  // The creation composer's AI choices belong to its draft (keyed by id, not project).
+  const creationDraftId = variant === "creation" ? (props.pendingDraftId ?? "") : "";
   const creationSubProjectPath = creationScope?.subProjectPath ?? undefined;
   const creationProject =
     variant === "creation" ? userProjects.get(creationParentProjectPath) : undefined;
-  const [thinkingLevel] = useThinkingLevel();
-  const [reasoningMode] = useReasoningMode();
-  const dynamicWorkflowsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.DYNAMIC_WORKFLOWS);
-  const workspaceHeartbeatsExperimentEnabled = useExperimentValue(
-    EXPERIMENT_IDS.WORKSPACE_HEARTBEATS
-  );
-  const memoryExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
-  const agentPluginsExperimentEnabled = useExperimentValue(EXPERIMENT_IDS.AGENT_PLUGINS);
-  const memoryConsolidationExperimentEnabled = useExperimentValue(
-    EXPERIMENT_IDS.MEMORY_CONSOLIDATION
-  );
+  // A sub-project draft keeps its parent's route, so files, skills and agents come from the parent
+  // (as for main's sidebar New chat on a sub-project). Following the sub-project instead makes the
+  // agent list, its defaults and the agent resets disagree.
   const atMentionProjectPath =
     variant === "creation" && props.kind !== "scratch" ? props.projectPath : null;
   const asyncCommandScopeRef = useRef<{ variant: typeof variant; workspaceId: string | null }>({
@@ -359,6 +430,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Extract workspace-specific props with defaults
   const disabled = (props.disabled ?? false) || initialStagingLocked;
   const editingMessage = variant === "workspace" ? props.editingMessage : undefined;
+  // Live edit target for callbacks that outlive the render they were created in (a transcript
+  // refresh outcome, the "Retry refresh" toast): they must not act on an edit the user has
+  // since cancelled or replaced.
+  const editingMessageIdRef = useRef<string | undefined>(editingMessage?.id);
+  // A failed conflict refresh keeps Send disabled (stale evidence is never re-sent blindly), so
+  // the retry must live in persistent edit-mode UI, not only in the dismissible toast.
+  const [editRefreshRetry, setEditRefreshRetry] = useState<{
+    editMessageId: string;
+    precondition: HistoryEditPrecondition;
+  } | null>(null);
+  // Assigned in a layout effect, not a passive one: a refresh that settles between a commit
+  // that changed the edit and a passive effect must already see the new edit as current.
+  // Layout effects run in the same task as the commit, so no callback can observe the gap.
+  useLayoutEffect(() => {
+    editingMessageIdRef.current = editingMessage?.id;
+  });
   const [pendingBoundaryEditConfirmation, setPendingBoundaryEditConfirmation] =
     useState<SendOverrides | null>(null);
   // Hide edit-mode chrome as soon as an edit send starts so the input doesn't sit blank
@@ -401,88 +488,27 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   }, [editingMessage?.id, optimisticallyDismissedEditId]);
   // runtimeType for telemetry - defaults to "worktree" if not provided
   const runtimeType = variant === "workspace" ? (props.runtimeType ?? "worktree") : "worktree";
+  const computerUse = useComputerUse(workspaceId);
 
   // Callback for model changes (both variants support this)
   const onModelChange = props.onModelChange;
 
-  // Storage keys differ by variant
-  const storageKeys = (() => {
-    if (variant === "creation") {
-      const pendingScopeId =
-        typeof props.pendingDraftId === "string" && props.pendingDraftId.trim().length > 0
-          ? getDraftScopeId(creationParentProjectPath, props.pendingDraftId)
-          : getPendingScopeId(creationParentProjectPath);
-      return {
-        inputKey: getInputKey(pendingScopeId),
-        attachmentsKey: getInputAttachmentsKey(pendingScopeId),
-        modelKey: getModelKey(getProjectScopeId(creationParentProjectPath)),
-      };
-    }
-    return {
-      inputKey: getInputKey(props.workspaceId),
-      attachmentsKey: getInputAttachmentsKey(props.workspaceId),
-      modelKey: getModelKey(props.workspaceId),
-    };
-  })();
-
   // User request: keep creation runtime controls synced with Settings enablement toggles.
-  const [rawRuntimeEnablement] = usePersistedState(
-    RUNTIME_ENABLEMENT_KEY,
-    DEFAULT_RUNTIME_ENABLEMENT,
-    { listener: true }
-  );
+  const rawRuntimeEnablement = useAppConfig((config) => config.runtimeEnablement);
   const runtimeEnablement = normalizeRuntimeEnablement(rawRuntimeEnablement);
 
-  const [input, setInput] = usePersistedState(storageKeys.inputKey, "", { listener: true });
-
-  // Keep a stable reference to the latest input value so event handlers don't need to rebind
-  // on same-length edits (e.g. selection-replace) to know the previous value.
-  const latestInputValueRef = useRef(input);
-  latestInputValueRef.current = input;
   // Track concurrent sends with a counter (not boolean) to handle queued follow-ups correctly.
   // When a follow-up is queued during stream-start, it resolves immediately but shouldn't
   // clear the "in flight" state until all sends complete.
   const [sendingCount, setSendingCount] = useState(0);
-  const isSending = sendingCount > 0;
   const sendModeMenuContainerRef = useRef<HTMLDivElement>(null);
   const [hideReviewsDuringSend, setHideReviewsDuringSend] = useState(false);
-  const [showAtMentionSuggestions, setShowAtMentionSuggestions] = useState(false);
-  const [atMentionSuggestions, setAtMentionSuggestions] = useState<SlashSuggestion[]>([]);
-  const [showSkillSuggestions, setShowSkillSuggestions] = useState(false);
-  const [skillSuggestions, setSkillSuggestions] = useState<SlashSuggestion[]>([]);
   const projectedWorkflowRunCardKeysRef = useRef(new Set<string>());
   const workflowsRequestIdRef = useRef(0);
-  const agentSkillsRequestIdRef = useRef(0);
-  const mcpPromptsRequestIdRef = useRef(0);
-  const mcpPromptsRequestRef = useRef<Promise<void> | null>(null);
-  const mcpPromptsLoadedAtRef = useRef(0);
-  const mcpPromptsWorkspaceRef = useRef<string | null>(null);
-  // Abandoned cold discovery would otherwise keep starting servers and
-  // waiting out prompts/list deadlines for a workspace we already left.
-  const mcpPromptsAbortRef = useRef<AbortController | null>(null);
-  const atMentionDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const atMentionRequestIdRef = useRef(0);
-  const lastAtMentionScopeIdRef = useRef<string | null>(null);
-  const lastAtMentionQueryRef = useRef<string | null>(null);
-  const lastAtMentionInputRef = useRef<string>(input);
-  const lastSkillInputRef = useRef<string | null>(null);
-  const lastSkillQueryRef = useRef<string | null>(null);
-  const lastSkillDescriptorsRef = useRef<AgentSkillDescriptor[] | null>(null);
-  const lastMcpPromptDescriptorsRef = useRef<MCPPromptDescriptor[] | null>(null);
-  const [showCommandSuggestions, setShowCommandSuggestions] = useState(false);
-
-  const [commandSuggestions, setCommandSuggestions] = useState<SlashSuggestion[]>([]);
-  // Backslash symbol-shortcut autocomplete (e.g. typing "\alpha" or "\leq").
-  const [showSymbolSuggestions, setShowSymbolSuggestions] = useState(false);
-  const [symbolSuggestions, setSymbolSuggestions] = useState<SlashSuggestion[]>([]);
-  const lastSymbolQueryRef = useRef<string>("");
-  const [agentSkillDescriptors, setAgentSkillDescriptors] = useState<AgentSkillDescriptor[]>([]);
-  const [mcpPromptDescriptors, setMcpPromptDescriptors] = useState<MCPPromptDescriptor[]>([]);
-  // Agent Plugins: manifest-contributed slash commands (empty when the experiment is off).
-  const [pluginCommandDescriptors, setPluginCommandDescriptors] = useState<
-    PluginSlashCommandDescriptor[]
-  >([]);
   const [toast, setToast] = useState<Toast | null>(null);
+  // The alert an edit's `history-changed` refusal raised. That edit's successful re-send clears
+  // it (only while it is still the shown toast), as a successful refresh retry clears its own.
+  const editConflictToastRef = useRef<{ editMessageId: string; toast: Toast } | null>(null);
   // State for destructive command confirmation modal (currently only /clear).
   const [pendingDestructiveCommand, setPendingDestructiveCommand] = useState(false);
   const pushToast = useCallback(
@@ -510,176 +536,73 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // late failures (e.g., slow devcontainer startup) still surface a toast.
   const pendingErrorKey =
     variant === "workspace" && workspaceId ? getPendingWorkspaceSendErrorKey(workspaceId) : null;
-  const [pendingError, setPendingError] = usePersistedState<SendMessageError | null>(
+  // Typed as unknown: localStorage can hold anything (another build, a hand edit), and an
+  // invalid error used to crash the workspace view in createErrorToast (#5007).
+  const [pendingError, setPendingError] = usePersistedState<unknown>(
     pendingErrorKey ?? "__unused__",
     null,
     { listener: true }
   );
   useEffect(() => {
-    if (!pendingErrorKey || !pendingError) return;
-    setToast(createErrorToast(pendingError));
+    if (!pendingErrorKey || pendingError == null) return;
+    const parsed = SendMessageErrorSchema.safeParse(pendingError);
+    if (parsed.success) {
+      setToast(createErrorToast(parsed.data));
+    } else {
+      // Self-heal: drop the malformed value (cleared below) instead of throwing.
+      console.warn("Dropping malformed pending send error:", parsed.error);
+    }
     setPendingError(null);
   }, [pendingErrorKey, pendingError, setPendingError]);
 
-  const handleToastDismiss = useCallback(() => {
+  const handleToastDismiss = () => {
     setToast(null);
-  }, []);
+  };
 
-  const attachmentDraftTooLargeToastKeyRef = useRef<string | null>(null);
-
-  const [attachments, setAttachmentsState] = useState<ChatAttachment[]>(() => {
-    return readPersistedChatAttachments(storageKeys.attachmentsKey);
+  const draft = useComposerDraft({
+    variant,
+    workspaceId,
+    pendingDraftId: creationDraftId,
+    attachedReviews: variant === "workspace" ? (props.attachedReviews ?? []) : [],
+    pushToast,
   });
-  const [processingAttachmentCount, setProcessingAttachmentCount] = useState(0);
-  // Reviews restored from edits/queued drafts override attached review state while active.
-  const [draftReviews, setDraftReviews] = useState<ReviewNoteDataForDisplay[] | null>(null);
-  // Distinguishes this component's own persisted writes from external ones
-  // (e.g. a creation-flow draft transfer landing after this composer mounted).
-  const selfAttachmentWriteRef = useRef(false);
-  const persistAttachments = useCallback(
-    (nextAttachments: ChatAttachment[]) => {
-      selfAttachmentWriteRef.current = true;
-      try {
-        if (nextAttachments.length === 0) {
-          attachmentDraftTooLargeToastKeyRef.current = null;
-          updatePersistedState<ChatAttachment[] | undefined>(storageKeys.attachmentsKey, undefined);
-          return;
-        }
-
-        const estimatedChars = estimatePersistedChatAttachmentsChars(nextAttachments);
-        if (estimatedChars > MAX_PERSISTED_ATTACHMENT_DRAFT_CHARS) {
-          // Clear persisted value to avoid restoring stale attachments on restart.
-          updatePersistedState<ChatAttachment[] | undefined>(storageKeys.attachmentsKey, undefined);
-
-          if (attachmentDraftTooLargeToastKeyRef.current !== storageKeys.attachmentsKey) {
-            attachmentDraftTooLargeToastKeyRef.current = storageKeys.attachmentsKey;
-            pushToast({
-              type: "error",
-              message:
-                "This draft attachment is too large to save. It will be lost when you switch workspaces or restart.",
-              duration: 5000,
-            });
-          }
-          return;
-        }
-
-        attachmentDraftTooLargeToastKeyRef.current = null;
-        updatePersistedState<ChatAttachment[] | undefined>(
-          storageKeys.attachmentsKey,
-          nextAttachments
-        );
-      } finally {
-        selfAttachmentWriteRef.current = false;
-      }
-    },
-    [storageKeys.attachmentsKey, pushToast]
-  );
-
-  // Keep attachment drafts in sync when the storage scope changes (e.g. switching creation projects).
-  useEffect(() => {
-    attachmentDraftTooLargeToastKeyRef.current = null;
-    setAttachmentsState(readPersistedChatAttachments(storageKeys.attachmentsKey));
-  }, [storageKeys.attachmentsKey]);
-
-  // Attachments live in local state (a too-large draft stays in memory after
-  // its persisted copy is cleared), so external writes to the draft key, such
-  // as a creation-flow transfer that lands after this composer mounted, must
-  // be synced in explicitly. Self-writes are skipped to keep that in-memory
-  // exception intact.
-  useEffect(() => {
-    return subscribePersistedStateWrites((event) => {
-      if (event.key !== storageKeys.attachmentsKey || selfAttachmentWriteRef.current) {
-        return;
-      }
-      setAttachmentsState(readPersistedChatAttachments(storageKeys.attachmentsKey));
-    });
-  }, [storageKeys.attachmentsKey]);
-  const setAttachments = useCallback(
-    (value: ChatAttachment[] | ((prev: ChatAttachment[]) => ChatAttachment[])) => {
-      setAttachmentsState((prev) => {
-        const next = value instanceof Function ? value(prev) : value;
-        persistAttachments(next);
-        return next;
-      });
-    },
-    [persistAttachments]
-  );
-  // Attached reviews come from parent via props (persisted in pendingReviews state).
+  const { input, setInput, attachments, setAttachments, draftReviews, setDraftReviews } = draft;
+  const { getDraft, setDraft } = draft;
+  const { reviewOverrideActive, reviewData, reviewIdsForCheck, reviewPanelItems } = draft;
+  const { removeDraftReview, updateDraftReviewNote, draftScope, latestInputValueRef } = draft;
+  const {
+    processingAttachmentCount,
+    handlePaste,
+    handleAttachFiles,
+    handleDragOver,
+    handleDrop,
+    handleRemoveAttachment,
+  } = useComposerAttachments({
+    variant,
+    workspaceId,
+    setAttachments,
+    editingMessage: editingMessageForUi != null,
+    pushToast,
+  });
   const workspaceIdForComposerClear = variant === "workspace" ? props.workspaceId : null;
   const onDetachAllReviewsForComposerClear =
     variant === "workspace" ? props.onDetachAllReviews : undefined;
-
-  // draftReviews takes precedence when restoring or editing message drafts.
-  const attachedReviews = variant === "workspace" ? (props.attachedReviews ?? []) : [];
-  const draftReviewIdsByValueRef = useRef(new WeakMap<ReviewNoteDataForDisplay, string>());
-  const nextDraftReviewIdRef = useRef(0);
-  const isDraftReviewData = (value: unknown): value is ReviewNoteDataForDisplay =>
-    typeof value === "object" && value !== null;
-  const getDraftReviewId = (review: ReviewNoteDataForDisplay): string => {
-    const existingId = draftReviewIdsByValueRef.current.get(review);
-    if (existingId) return existingId;
-    const newId = `draft-review-${nextDraftReviewIdRef.current++}`;
-    draftReviewIdsByValueRef.current.set(review, newId);
-    return newId;
-  };
-
-  const withDraftReview = (
-    reviewId: string,
-    update: (reviews: ReviewNoteDataForDisplay[], reviewIndex: number) => ReviewNoteDataForDisplay[]
-  ) =>
-    setDraftReviews((prev) => {
-      if (prev === null) return prev;
-      const reviewIndex = prev.findIndex(
-        (review) => isDraftReviewData(review) && getDraftReviewId(review) === reviewId
-      );
-      return reviewIndex === -1 ? prev : update(prev, reviewIndex);
-    });
-
-  const removeDraftReview = (reviewId: string) =>
-    withDraftReview(reviewId, (prev, reviewIndex) =>
-      prev.filter((_, index) => index !== reviewIndex)
-    );
-
-  const updateDraftReviewNote = (reviewId: string, newNote: string) =>
-    withDraftReview(reviewId, (prev, reviewIndex) => {
-      const review = prev[reviewIndex];
-      if (!review || review.userNote === newNote) return prev;
-      const next = [...prev];
-      const updatedReview = { ...review, userNote: newNote };
-      draftReviewIdsByValueRef.current.set(updatedReview, reviewId);
-      next[reviewIndex] = updatedReview;
-      return next;
-    });
+  const onAddReviewForRestore = variant === "workspace" ? props.onAddReview : undefined;
+  const onAcceptRestoredHeldInputs =
+    variant === "workspace" ? props.onAcceptRestoredHeldInputs : undefined;
 
   // Creation sends can resolve after navigation; guard draft clears on unmounted inputs.
   const isMountedRef = useRef(true);
   useEffect(() => {
     return () => {
       isMountedRef.current = false;
-      mcpPromptsAbortRef.current?.abort();
-      mcpPromptsAbortRef.current = null;
     };
   }, []);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // #6585: edits other than typing at the end stop a send in flight from cutting its text.
+  const sendMarkEdits = useSendMarkEditTracking(inputRef, draftScope);
   const modelSelectorRef = useRef<ModelSelectorRef>(null);
   const powerMode = usePowerMode();
-  const [atMentionCursorNonce, setAtMentionCursorNonce] = useState(0);
-  const lastAtMentionCursorRef = useRef<number | null>(null);
-  const handleAtMentionCursorActivity = useCallback(() => {
-    const el = inputRef.current;
-    if (!el) {
-      return;
-    }
-
-    const nextCursor = el.selectionStart ?? input.length;
-    if (lastAtMentionCursorRef.current === nextCursor) {
-      return;
-    }
-
-    lastAtMentionCursorRef.current = nextCursor;
-    setAtMentionCursorNonce((n) => n + 1);
-  }, [input.length]);
-
   const handleInputChange = useCallback(
     (next: string, caretFromEvent?: number) => {
       if (powerMode.enabled) {
@@ -725,86 +648,47 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const converted =
         convertSymbolCommandAtCursor(next, caret) ?? convertTerminatedSymbolCommand(next, caret);
       if (converted) {
-        setInput(converted.text);
-        const newCursor = converted.cursor;
-        requestAnimationFrame(() => {
-          const el = inputRef.current;
-          if (!el || el.disabled) {
-            return;
-          }
-          el.selectionStart = newCursor;
-          el.selectionEnd = newCursor;
-        });
-        return;
+        // #6944: commit the converted text now and put the caret after the symbol before the
+        // next key. Writing the value moves the caret to the end; a frame later was too late for
+        // a fast next key, which then landed at the end.
+        flushSync(() => setInput(converted.text));
+        const el = inputRef.current;
+        if (el && !el.disabled) {
+          el.selectionStart = converted.cursor;
+          el.selectionEnd = converted.cursor;
+        }
+        return { text: converted.text, cursor: converted.cursor };
       }
 
       setInput(next);
+      return { text: next, cursor: caret };
     },
-    [powerMode, setInput]
+    [latestInputValueRef, powerMode, setInput]
   );
 
-  // Draft state combines text input and attachments.
-  // Reviews are sourced separately via attachedReviews unless draftReviews overrides them.
-  interface DraftState {
-    text: string;
-    attachments: ChatAttachment[];
-  }
-  const getDraft = useCallback(
-    (): DraftState => ({ text: input, attachments }),
-    [input, attachments]
-  );
-  const setDraft = useCallback(
-    (draft: DraftState) => {
-      setInput(draft.text);
-      setAttachments(draft.attachments);
-    },
-    [setInput, setAttachments]
-  );
-  const preEditDraftRef = useRef<DraftState>({ text: "", attachments: [] });
-  const preEditReviewsRef = useRef<ReviewNoteDataForDisplay[] | null>(null);
   const { open } = useSettings();
-  const { selectedWorkspace, beginWorkspaceCreation } = useWorkspaceContext();
-  const { agentId, currentAgent } = useAgent();
+  const { selectedWorkspace, beginWorkspaceCreation, workspaceMetadata } = useWorkspaceContext();
+  const { agentId, currentAgent, agents, loaded: agentsLoaded } = useAgent();
 
   // Use current agent's uiColor, or neutral border until agents load
   const agentColor = currentAgent?.uiColor ?? "var(--color-border-light)";
   const composerSurfaceStyle: React.CSSProperties & { "--composer-focus-border": string } = {
     "--composer-focus-border": agentColor,
   };
-  const {
-    models,
-    hiddenModelsForSelector,
-    ensureModelInSettings,
-    defaultModel,
-    setDefaultModel,
-    codexOauthSet,
-    requiresCodexOauth,
-  } = useModelsFromSettings();
+  const { models, hiddenModelsForSelector, ensureModelInSettings, defaultModel, setDefaultModel } =
+    useModelsFromSettings();
 
-  const [agentAiDefaults] = usePersistedState<AgentAiDefaults>(
-    AGENT_AI_DEFAULTS_KEY,
-    {},
-    {
-      listener: true,
-    }
-  );
-  const atMentionListId = useId();
-  const skillListId = useId();
-  const commandListId = useId();
-  const symbolListId = useId();
+  const agentAiDefaults = useAgentAiDefaults();
   const telemetry = useTelemetry();
-  const [vimEnabled, setVimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, {
-    listener: true,
-  });
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
   const { startSequence: startTutorial } = useTutorial();
 
   // Track transcription provider prerequisites from Settings → Providers.
   const [openAIKeySet, setOpenAIKeySet] = useState(false);
   const [openAIProviderEnabled, setOpenAIProviderEnabled] = useState(true);
-  const [muxGatewayCouponSet, setMuxGatewayCouponSet] = useState(false);
-  const [muxGatewayEnabled, setMuxGatewayEnabled] = useState(true);
-  const isTranscriptionAvailable =
-    (openAIProviderEnabled && openAIKeySet) || (muxGatewayEnabled && muxGatewayCouponSet);
+  const isTranscriptionAvailable = openAIProviderEnabled && openAIKeySet;
 
   // Voice input - appends transcribed text to input
   const voiceInput = useVoiceInput({
@@ -820,11 +704,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     onSend: () => void handleSend(),
     isTranscriptionAvailable,
     useRecordingKeybinds: true,
-    api,
+    api: liveApi,
   });
 
   const voiceInputUnavailableMessage =
-    "Voice input requires a Shux Gateway login or an OpenAI API key. Configure in Settings → Providers.";
+    "Voice input requires an enabled OpenAI provider with an API key. Configure in Settings → Providers.";
 
   // Start creation tutorial when entering creation mode
   useEffect(() => {
@@ -839,9 +723,35 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Get current send message options from shared hook (must be at component top level)
   // For creation variant, use project-scoped key; for workspace, use workspace ID
-  const sendMessageOptions = useSendMessageOptions(
-    variant === "workspace" ? props.workspaceId : getProjectScopeId(creationParentProjectPath)
+  const sendOptionsScopeId =
+    variant === "workspace" ? props.workspaceId : getCreationDraftScopeId(creationDraftId);
+  const sendMessageOptions = useSendMessageOptions(sendOptionsScopeId);
+  const autoModelRoutingEnabled = useExperimentValue(EXPERIMENT_IDS.AUTO_MODEL_ROUTING);
+  const [autoModelRoutingActive, setAutoModelRoutingActive] = useAutoRoutingSelection(
+    sendOptionsScopeId,
+    "model"
   );
+  const [autoThinkingLevelActive, setAutoThinkingLevelActive] = useAutoRoutingSelection(
+    sendOptionsScopeId,
+    "thinkingLevel"
+  );
+  const composerSuggestions = useComposerSuggestions({
+    input,
+    setInput,
+    inputRef,
+    variant,
+    workspaceId,
+    projectPath: atMentionProjectPath,
+  });
+  const { agentSkillDescriptors, handleInputCaretChange, mcpPromptDescriptors } =
+    composerSuggestions;
+  const handleComposerInputChange = (next: string, caret?: number) => {
+    // Feed the suggestion seam the applied text/cursor: symbol auto-conversion
+    // can rewrite both, and caret state keyed to the pre-conversion text would
+    // fall back to end-of-input over the converted draft.
+    const applied = handleInputChange(next, caret);
+    handleInputCaretChange(applied.cursor, applied.text);
+  };
   const additionalSystemContext = useAdditionalSystemContextSnapshot(
     variant === "workspace" ? props.workspaceId : ""
   );
@@ -870,129 +780,66 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? calculateTokenMeterData(lastUsage, contextDisplayModel, use1M, false, providersConfig)
       : { segments: [], totalTokens: 0, totalPercentage: 0 };
   }, [lastUsage, contextDisplayModel, use1M, providersConfig]);
-  const { threshold: autoCompactThreshold, setThreshold: setAutoCompactThreshold } =
-    useAutoCompactionSettings(workspaceIdForUsage, contextDisplayModel);
-  const autoCompactionProps = useMemo(
-    () => ({ threshold: autoCompactThreshold, setThreshold: setAutoCompactThreshold }),
-    [autoCompactThreshold, setAutoCompactThreshold]
+  const autoCompactionSettings = useAutoCompactionSettings(
+    workspaceIdForUsage,
+    contextDisplayModel
   );
+  const autoCompactionProps = {
+    ...autoCompactionSettings,
+    modelContextLimit: contextUsageData.maxTokens,
+  };
 
   // Idle compaction settings (per-project, persisted to backend for idleCompactionService)
   const { hours: idleCompactionHours, setHours: setIdleCompactionHours } = useIdleCompactionHours({
     projectPath: selectedWorkspace?.projectPath ?? null,
   });
-  const idleCompactionProps = useMemo(
-    () => ({
-      hours: idleCompactionHours,
-      setHours: setIdleCompactionHours,
-    }),
-    [idleCompactionHours, setIdleCompactionHours]
-  );
+  const idleCompactionProps = {
+    hours: idleCompactionHours,
+    setHours: setIdleCompactionHours,
+  };
 
-  const setPreferredModel = useCallback(
-    (model: string) => {
-      type WorkspaceAISettingsByAgentCache = Partial<
-        Record<
-          string,
-          { model: string; thinkingLevel: ThinkingLevel; reasoningMode?: OpenAIReasoningMode }
-        >
-      >;
-
-      const selectedModel = normalizeSelectedModel(model);
-      if (
-        variant === "workspace" &&
-        hasBudgetedResumableGoal(workspaceGoal) &&
-        !modelHasPricingData(selectedModel, providersConfig)
-      ) {
-        setToast({
-          id: Date.now().toString(),
-          type: "error",
-          message: UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
-        });
-        return;
-      }
-
-      ensureModelInSettings(selectedModel); // Ensure model exists in Settings
-
-      if (onModelChange) {
-        // Notify parent of model change (for context switch warning + persisted model metadata).
-        // Called before early returns so warnings work even offline or with custom agents.
-        onModelChange(selectedModel);
-      } else {
-        const scopeId =
-          variant === "creation" ? getProjectScopeId(creationParentProjectPath) : workspaceId;
-        if (scopeId) {
-          setWorkspaceModelWithOrigin(scopeId, selectedModel, "user");
-        }
-      }
-
-      if (variant !== "workspace" || !workspaceId) {
-        return;
-      }
-
-      const normalizedAgentId = normalizeAgentId(agentId, "exec");
-
-      updatePersistedState<WorkspaceAISettingsByAgentCache>(
-        getWorkspaceAISettingsByAgentKey(workspaceId),
-        (prev) => {
-          const record: WorkspaceAISettingsByAgentCache =
-            prev && typeof prev === "object" ? prev : {};
-          return {
-            ...record,
-            // Include reasoningMode so a model change cannot wipe the persisted
-            // pro-mode choice (backend replaces the agent's settings wholesale).
-            [normalizedAgentId]: { model: selectedModel, thinkingLevel, reasoningMode },
-          };
-        },
-        {}
-      );
-
-      // Workspace variant: persist to backend for cross-device consistency.
-      if (!api) {
-        return;
-      }
-
-      markPendingWorkspaceAiSettings(workspaceId, normalizedAgentId, {
-        model: selectedModel,
-        thinkingLevel,
-        reasoningMode,
+  const setPreferredModel = (model: string) => {
+    const selectedModel = normalizeSelectedModel(model);
+    if (
+      variant === "workspace" &&
+      hasBudgetedResumableGoal(workspaceGoal) &&
+      !modelHasPricingData(selectedModel, providersConfig)
+    ) {
+      setToast({
+        id: Date.now().toString(),
+        type: "error",
+        message: UNPRICED_TARGET_MODEL_GOAL_MESSAGE,
       });
+      return;
+    }
 
-      api.workspace
-        .updateAgentAISettings({
-          workspaceId,
-          agentId: normalizedAgentId,
-          aiSettings: { model: selectedModel, thinkingLevel, reasoningMode },
-        })
-        .then((result) => {
-          if (!result.success) {
-            clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-          }
-        })
-        .catch(() => {
-          clearPendingWorkspaceAiSettings(workspaceId, normalizedAgentId);
-          // Best-effort only. If offline or backend is old, sendMessage will persist.
-        });
-    },
-    [
-      api,
-      agentId,
-      creationParentProjectPath,
-      ensureModelInSettings,
-      providersConfig,
-      onModelChange,
-      thinkingLevel,
-      reasoningMode,
-      variant,
-      workspaceGoal,
-      workspaceId,
-    ]
-  );
+    ensureModelInSettings(selectedModel); // Ensure model exists in Settings
+    // A concrete pick (selector, /model, or the cycle shortcut) always leaves Auto.
+    setAutoModelRoutingActive(false);
+
+    if (onModelChange) {
+      // Notify parent of model change (for context switch warning + persisted model metadata).
+      // Called before early returns so warnings work even offline or with custom agents.
+      onModelChange(selectedModel);
+    } else {
+      const scopeId =
+        variant === "creation" ? getCreationDraftScopeId(creationDraftId) : workspaceId;
+      if (scopeId) {
+        setWorkspaceModelWithOrigin(scopeId, selectedModel, "user");
+      }
+    }
+
+    // Marked after onModelChange so its explicit-switch record still sees the previous model;
+    // this also pins a same-model pick on a sub-agent once a message sends it.
+    if (variant === "workspace" && workspaceId) {
+      markAiSelectionIntent(workspaceId, "model", selectedModel);
+    }
+  };
 
   // Model cycling candidates: all visible models (custom + built-in, minus hidden).
   const cycleModels = models;
 
-  const cycleToNextModel = useCallback(() => {
+  const cycleToNextModel = () => {
     if (cycleModels.length < 2) {
       return;
     }
@@ -1003,20 +850,30 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     if (nextModel) {
       setPreferredModel(nextModel);
     }
-  }, [baseModel, cycleModels, setPreferredModel]);
+  };
+
+  // The global shortcut listener reads the latest handler through a ref so it isn't
+  // re-subscribed whenever the model list or selection changes.
+  const cycleToNextModelRef = useRef(cycleToNextModel);
+  useLayoutEffect(() => {
+    cycleToNextModelRef.current = cycleToNextModel;
+  });
 
   const openModelSelector = useCallback(() => {
     modelSelectorRef.current?.open();
   }, []);
-  const hasCreationRuntimeOverrides =
-    creationProject?.runtimeOverridesEnabled === true ||
-    Boolean(creationProject?.runtimeEnablement) ||
-    creationProject?.defaultRuntime !== undefined;
   // Keep workspace creation in sync with Settings → Runtimes project overrides.
   const creationRuntimeEnablement =
-    variant === "creation" && hasCreationRuntimeOverrides
-      ? normalizeRuntimeEnablement(creationProject?.runtimeEnablement)
+    variant === "creation"
+      ? projectRuntimeEnablement(creationProject, runtimeEnablement)
       : runtimeEnablement;
+  // Compiler-memoized in its own module; see useCreationProjectChangeHandler for why.
+  const changeCreationProject = useCreationProjectChangeHandler(
+    creationDraftId,
+    userProjects,
+    rawRuntimeEnablement,
+    beginWorkspaceCreation
+  );
   const [hasAttemptedCreateSend, setHasAttemptedCreateSend] = useState(false);
 
   // Creation-specific state (hook always called, but only used when variant === "creation")
@@ -1045,9 +902,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           subProjectPath: creationSubProjectPath,
           onWorkspaceCreated: props.onWorkspaceCreated,
           message: creationNameMessage,
-          dynamicWorkflowsEnabled: dynamicWorkflowsExperimentEnabled,
           draftId: props.pendingDraftId,
           userModel: preferredModel,
+          agentBaseById: new Map(agents.map((agent) => [agent.id, agent.base])),
         }
       : {
           // Dummy values for workspace variant (never used)
@@ -1060,26 +917,38 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Creation sends also pass through the async resolution phase guarded by
   // sendingCount, so include it alongside the creation-specific flag.
+  // A send whose acceptance is unresolved (the receiver answered unknown, or the lookup failed)
+  // keeps the composer in this same sending state while DraftStore retries it (idempotent sends).
+  const isSending = sendingCount > 0 || draft.unresolvedSendCount > 0;
   const isSendInFlight = variant === "creation" ? creationState.isSending || isSending : isSending;
   const sendInFlightBlocksInput =
     variant === "workspace" ? isSendInFlight && !isStreamStarting : isSendInFlight;
+  // #6259: typing stays on once a send has taken its draft; submission waits for it to settle.
+  const typingLock = useComposerTypingLock({
+    variant,
+    sendingCount,
+    isStreamStarting,
+    creationLocksTyping: sendInFlightBlocksInput,
+    inputRef,
+  });
+  const sendLocksTyping = typingLock.locksTyping;
+  // A creation Send takes one snapshot of the draft: a file still being read, or speech still
+  // being transcribed, would land after it.
+  const isProcessingAttachments =
+    processingAttachmentCount > 0 || (variant === "creation" && voiceInput.state !== "idle");
+  // Moving to or from Scratch opens another page (a new composer), which would drop a file read
+  // or a recording still in progress, so the project waits for them.
+  const creationProjectLocked = isSendInFlight || isProcessingAttachments;
 
   // Coder workspace state - config is owned by selectedRuntime.coder, this hook manages async data
   const currentRuntime = creationState.selectedRuntime;
   const coderRuntimeHost = currentRuntime.mode === "ssh" ? currentRuntime.host : null;
   const setCreationSelectedRuntime = creationState.setSelectedRuntime;
-  // Plain function: React Compiler stabilizes this handler from its primitive host
-  // and compiler-stable runtime setter dependencies.
-  const handleCoderConfigChange = (config: CoderWorkspaceConfig | null) => {
-    if (coderRuntimeHost == null) return;
-    // Existing Coder workspaces name the SSH host; new ones derive it later.
-    const computedHost = config?.workspaceName ? `${config.workspaceName}.coder` : coderRuntimeHost;
-    setCreationSelectedRuntime({
-      mode: "ssh",
-      host: computedHost,
-      coder: config ?? undefined,
-    });
-  };
+  // Compiler-memoized in its own module; see useCoderConfigChangeHandler for why.
+  const handleCoderConfigChange = useCoderConfigChangeHandler(
+    coderRuntimeHost,
+    setCreationSelectedRuntime
+  );
   const coderState = useCoderWorkspace({
     coderConfig: currentRuntime.mode === "ssh" ? (currentRuntime.coder ?? null) : null,
     onCoderConfigChange: handleCoderConfigChange,
@@ -1091,19 +960,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       ? validateCreationRuntime(creationState.selectedRuntime, coderState.presets.length)
       : null;
 
-  const creationRuntimePolicyError =
-    variant === "creation" &&
-    props.kind !== "scratch" &&
-    effectivePolicy?.runtimes != null &&
-    !isParsedRuntimeAllowedByPolicy(effectivePolicy, creationState.selectedRuntime)
-      ? creationState.selectedRuntime.mode === "ssh" &&
-        !creationState.selectedRuntime.coder &&
-        runtimePolicy.allowSshHost === false &&
-        runtimePolicy.allowSshCoder
-        ? "Host SSH runtimes are disabled by policy. Select the Coder runtime instead."
-        : "Selected runtime is disabled by policy."
-      : null;
-
   const runtimeFieldError =
     variant === "creation" && hasAttemptedCreateSend ? (creationRuntimeError?.mode ?? null) : null;
 
@@ -1111,7 +967,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     variant === "creation" && props.kind !== "scratch"
       ? ({
           branches: creationState.branches,
-          branchesLoaded: creationState.branchesLoaded,
+          branchLoad: creationState.branchLoad,
           trunkBranch: creationState.trunkBranch,
           onTrunkBranchChange: creationState.setTrunkBranch,
           selectedRuntime: creationState.selectedRuntime,
@@ -1119,7 +975,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           sshHostFallback: creationState.sshHostFallback,
           defaultRuntimeMode: creationState.defaultRuntimeMode,
           onSelectedRuntimeChange: creationState.setSelectedRuntime,
-          onSetDefaultRuntime: creationState.setDefaultRuntimeChoice,
           disabled: isSendInFlight,
           projectPath: creationParentProjectPath,
           // Surface the actually-targeted project (possibly a sub-project) to
@@ -1131,15 +986,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           // routes (deep link to a sub-project, or sidebar "+") collapse here.
           selectedProjectPath: creationSubProjectPath ?? props.projectPath,
           userProjects,
-          onSelectedProjectPathChange: beginWorkspaceCreation,
+          onSelectedProjectPathChange: changeCreationProject,
+          projectSelectDisabled: creationProjectLocked,
           projectName: props.projectName,
           nameState: creationState.nameState,
           runtimeAvailabilityState: creationState.runtimeAvailabilityState,
           runtimeEnablement: creationRuntimeEnablement,
-          allowedRuntimeModes: runtimePolicy.allowedModes,
-          allowSshHost: runtimePolicy.allowSshHost,
-          allowSshCoder: runtimePolicy.allowSshCoder,
-          runtimePolicyError: creationRuntimePolicyError,
           coderInfo: coderState.coderInfo,
           runtimeFieldError,
           // Pass coderProps when CLI is available/outdated, Coder is enabled, or still checking (so "Checking…" UI renders)
@@ -1168,37 +1020,56 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       : null;
   const hasTypedText = input.trim().length > 0;
   const hasImages = attachments.length > 0;
-  const reviewOverrideActive = draftReviews !== null;
-  const draftReviewItems = (draftReviews ?? []).filter(isDraftReviewData);
-  const reviewData = reviewOverrideActive
-    ? draftReviewItems.length > 0
-      ? draftReviewItems
-      : undefined
-    : attachedReviews.length > 0
-      ? attachedReviews.map((review) => review.data)
-      : undefined;
-  const reviewIdsForCheck = reviewOverrideActive ? [] : attachedReviews.map((review) => review.id);
-  const reviewPanelItems: Review[] = reviewOverrideActive
-    ? draftReviewItems.map((data) => ({
-        id: getDraftReviewId(data),
-        data,
-        status: "attached",
-        createdAt: 0,
-      }))
-    : attachedReviews;
   const hasReviews = reviewData !== undefined;
   // Disable send while Coder presets are loading (user could bypass preset validation)
-  const policyBlocksCreateSend = variant === "creation" && creationRuntimePolicyError != null;
   const coderPresetsLoading =
     coderState.enabled && !coderState.coderConfig?.existingWorkspace && coderState.loadingPresets;
-  const isProcessingAttachments = processingAttachmentCount > 0;
+  // #6033: the trunk branch stays empty until the branch list loads, and the backend refuses
+  // every runtime except local without one, so a creation send must wait for the list. A failed
+  // list keeps it closed too (#6055).
+  const creationBranchesLoading =
+    variant === "creation" &&
+    props.kind !== "scratch" &&
+    creationState.branchLoad !== "loaded" &&
+    creationState.selectedRuntime.mode !== RUNTIME_MODE.LOCAL;
+  const creationDraftNotSaved = variant === "creation" && draft.saveError !== null;
+  // #6423: the same blockers as canSend below, so "Run /init" is off whenever Send is.
+  useReportCreationSendBlocked(
+    {
+      disabled,
+      sendInFlight: sendInFlightBlocksInput,
+      processingAttachments: isProcessingAttachments,
+      coderPresetsLoading,
+      branchesNotLoaded: creationBranchesLoading,
+      draftNotSaved: creationDraftNotSaved,
+    },
+    props
+  );
+  const hasSendableDraft = hasTypedText || hasImages || hasReviews;
+  // Workspace sends/edits mutate history relative to the visible transcript, so they wait for
+  // the onChat replay to finish; the creation composer has no transcript to catch up with.
+  // Goal and settings commands act on backend/local state by id and stay usable meanwhile
+  // (a /goal with attachments becomes a message send, so it does not bypass).
+  const draftBypassesTranscriptBarrier =
+    hasTypedText &&
+    !hasImages &&
+    !hasReviews &&
+    commandBypassesTranscriptBarrier(parseCommand(input.trim()));
+  const transcriptBlocksSend =
+    variant === "workspace" && !isTranscriptCaughtUp && !draftBypassesTranscriptBarrier;
+  // A refused edit stays in edit mode with Send disabled until the transcript refresh hands
+  // back a fresh candidate (or the user leaves edit mode); nothing is re-sent automatically.
+  const editPreconditionInvalidated = editingMessageForUi?.preconditionInvalidated === true;
   const canSend =
-    (hasTypedText || hasImages || hasReviews) &&
+    hasSendableDraft &&
     !disabled &&
     !sendInFlightBlocksInput &&
     !isProcessingAttachments &&
     !coderPresetsLoading &&
-    !policyBlocksCreateSend;
+    !creationBranchesLoading &&
+    !creationDraftNotSaved &&
+    !transcriptBlocksSend &&
+    !editPreconditionInvalidated;
   const runningGoalActive =
     variant === "workspace" && isGoalRunning(workspaceGoal?.status ?? "paused");
 
@@ -1261,6 +1132,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   // Only treat *real* agent changes as explicit (origin "agent"); everything else is "sync".
   const prevCreationAgentIdRef = useRef<string | null>(null);
   const prevCreationScopeIdRef = useRef<string | null>(null);
+  const prevCreationProjectRef = useRef<string | null>(null);
   // Creation variant: keep the project-scoped model/thinking in sync with global agent defaults
   // so switching agents uses the configured defaults (and respects "inherit" semantics).
   useEffect(() => {
@@ -1271,43 +1143,72 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
 
-    const scopeId = getProjectScopeId(creationParentProjectPath);
-    const modelKey = getModelKey(scopeId);
-    const thinkingKey = getThinkingLevelKey(scopeId);
+    const scopeId = getCreationDraftScopeId(creationDraftId);
 
     const fallbackModel = defaultModel;
 
     const normalizedAgentId = normalizeAgentId(agentId, "exec");
 
+    // Defaults come from the agent's base chain, which needs the list.
+    if (!agentsLoaded) return;
+    const isFirstSync = prevCreationScopeIdRef.current !== scopeId;
+    // A project change resets the agent automatically: that is no pick of the user's.
     const isExplicitAgentSwitch =
-      prevCreationAgentIdRef.current !== null &&
-      prevCreationScopeIdRef.current === scopeId &&
+      !isFirstSync &&
+      prevCreationProjectRef.current === creationParentProjectPath &&
       prevCreationAgentIdRef.current !== normalizedAgentId;
 
     // Update refs for the next run (even if no model changes).
     prevCreationAgentIdRef.current = normalizedAgentId;
     prevCreationScopeIdRef.current = scopeId;
+    prevCreationProjectRef.current = creationParentProjectPath;
+    // The draft owns its choices: after the composer seeds them, only the user's agent pick applies
+    // agent defaults over them (not a move, its agent reset or an agent list reload).
+    if (!isFirstSync && !isExplicitAgentSwitch) return;
 
-    const existingModel = readPersistedState<string>(modelKey, fallbackModel);
-    const candidateModel = agentAiDefaults[normalizedAgentId]?.modelString ?? existingModel;
-    const resolvedModel =
-      typeof candidateModel === "string" && candidateModel.trim().length > 0
-        ? candidateModel
-        : fallbackModel;
-
-    const existingThinking = readPersistedState<ThinkingLevel>(thinkingKey, "off");
-    const candidateThinking =
-      agentAiDefaults[normalizedAgentId]?.thinkingLevel ?? existingThinking ?? "off";
-    const resolvedThinking = coerceThinkingLevel(candidateThinking) ?? "off";
-
+    const existingModel = readScopedAiDefault(scopeId, "model") ?? fallbackModel;
+    const existingThinking = readScopedAiDefault(scopeId, "thinkingLevel") ?? "off";
+    // Configured defaults (direct or base-chain, field-wise) must reach the
+    // first turn of a new workspace too, not just post-creation agent syncs:
+    // a custom agent inheriting model/thinking/pro from its base would
+    // otherwise send the first prompt with the ambient model and Pro gated off
+    // until WorkspaceModeAISync corrects the workspace.
+    const existingReasoning = getWorkspaceAiSelection(scopeId).reasoningMode;
+    const agentBaseById = new Map(agents.map((agent) => [agent.id, agent.base]));
+    const {
+      resolvedModel,
+      resolvedThinking,
+      resolvedReasoningMode: resolvedReasoning,
+    } = resolveWorkspaceAiSettingsForAgent({
+      agentId: normalizedAgentId,
+      agentAiDefaults,
+      fallbackModel,
+      existingModel,
+      existingThinking,
+      existingReasoningMode: existingReasoning,
+      agentBaseById,
+    });
     if (existingModel !== resolvedModel) {
       setWorkspaceModelWithOrigin(scopeId, resolvedModel, isExplicitAgentSwitch ? "agent" : "sync");
     }
 
     if (existingThinking !== resolvedThinking) {
-      updatePersistedState(thinkingKey, resolvedThinking);
+      writeScopedAiDefault(scopeId, "thinkingLevel", resolvedThinking);
     }
-  }, [agentAiDefaults, agentId, creationParentProjectPath, defaultModel, variant]);
+
+    if (existingReasoning !== resolvedReasoning) {
+      markAiSelectionIntent(scopeId, "reasoningMode", resolvedReasoning);
+    }
+  }, [
+    agentAiDefaults,
+    agentId,
+    agents,
+    agentsLoaded,
+    creationDraftId,
+    creationParentProjectPath,
+    defaultModel,
+    variant,
+  ]);
 
   const chatDockColumnWidthClass = useChatDockColumnWidthClass();
 
@@ -1343,17 +1244,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   const applyDraftFromPending = useCallback(
     (pending: PendingUserMessage, attachmentKeyPrefix: string) => {
-      const providerAttachments = filePartsToChatAttachments(
-        pending.fileParts,
-        attachmentKeyPrefix
-      );
-      const stagedAttachments = pending.stagedAttachments.map((attachment, index) => ({
-        ...attachment,
-        id: `${attachmentKeyPrefix}-staged-${index}`,
-      }));
       setDraft({
         text: pending.content,
-        attachments: [...providerAttachments, ...stagedAttachments],
+        attachments: pendingChatAttachments(pending, attachmentKeyPrefix),
       });
     },
     [setDraft]
@@ -1361,26 +1254,109 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Restore a full pending draft (text + attachments + reviews), e.g. queued message edits.
   const restoreDraft = useCallback(
-    (pending: PendingUserMessage) => {
-      applyDraftFromPending(pending, `restored-${Date.now()}`);
+    (pending: PendingUserMessage, options?: { retainedSendIds?: string[] }) => {
+      const retained = getDraftStore().getPendingSendIds(draftScope);
+      const sendIds = options?.retainedSendIds ?? [];
+      const retainedSendIds = sendIds.filter((id) => retained.has(id));
+      if (retainedSendIds.length === 0) {
+        applyDraftFromPending(pending, `restored-${Date.now()}`);
+      } else {
+        // The draft still retains these sends: they come back as not accepted (prepended to the
+        // composer text) once the backend no longer holds them. Inserting them here too would
+        // show them twice, so only the rest of the queued input (sends the draft does not
+        // retain, e.g. a backend-minted one) is inserted now.
+        if (draftScope.kind === "workspace") {
+          getDraftStore().triggerSendResolution(draftScope.workspaceId);
+        }
+        if (retainedSendIds.length < sendIds.length) {
+          const { text: restText, ...rest } = getDraftStore().withoutRetainedSends(
+            draftScope,
+            retainedSendIds,
+            { ...pending, text: pending.content }
+          );
+          // Merged in front, never replacing: the composer may already show a resolved send.
+          setInput((current) => joinDraftText(restText, current));
+          const restAttachments = pendingChatAttachments(
+            { ...rest, content: restText },
+            `restored-${Date.now()}`
+          );
+          if (restAttachments.length > 0) {
+            setAttachments((current) => [...restAttachments, ...current]);
+          }
+        }
+      }
       setDraftReviews(pending.reviews);
       focusMessageInput();
     },
-    [applyDraftFromPending, focusMessageInput, setDraftReviews]
+    [
+      applyDraftFromPending,
+      draftScope,
+      focusMessageInput,
+      setAttachments,
+      setDraftReviews,
+      setInput,
+    ]
   );
 
-  const restorePreEditDraft = useCallback(() => {
-    setDraft(preEditDraftRef.current);
-    setDraftReviews(preEditReviewsRef.current);
-  }, [setDraft, setDraftReviews]);
+  // The latest edit's session. Settled explicitly: the edit target also leaves the live
+  // transcript when the accepted edit replaces it (possibly before the send returns), and that
+  // is not a cancel.
+  const editSessionRef = useRef<EditSession | null>(null);
+  // Live review override for completions that settle after the render they started in.
+  const draftReviewsRef = useRef(draftReviews);
+  useLayoutEffect(() => {
+    draftReviewsRef.current = draftReviews;
+  });
+  const restorePreEditDraft = () => {
+    const session = editSessionRef.current;
+    if (!session || session.settled || session.id !== editingMessageIdRef.current) return;
+    session.settled = true;
+    setDraft(session.preEditDraft);
+    setDraftReviews(session.preEditReviews);
+  };
+
+  // Completing an edit sends the edited message; the unsent draft from before the edit comes
+  // back as on cancel, so typed input is never lost (#5155). Functional updates keep anything
+  // typed while the send was in flight, after the restored draft; restored notes join notes
+  // attached meanwhile. Not for an edit the user cancelled meanwhile: it got its draft back. No
+  // edit starts while the send is pending (#5226). `dropEditReviews`: an editing command's send
+  // leaves the edit's own notes in the composer; they are replaced, not merged.
+  const restorePreEditDraftAfterSend = (
+    session: EditSession | null,
+    dropEditReviews = false
+  ): boolean => {
+    if (!session || session.settled) return false;
+    session.settled = true;
+    const { preEditDraft, preEditReviews } = session;
+    if (dropEditReviews) setDraftReviews(null);
+    setInput((current) => joinDraftText(preEditDraft.text, current));
+    if (preEditDraft.attachments.length > 0) {
+      setAttachments((current) => [...preEditDraft.attachments, ...current]);
+    }
+    if (preEditReviews !== null) {
+      if ((dropEditReviews || draftReviewsRef.current === null) && onAddReviewForRestore) {
+        // The notes in effect live in the review store: add the restored ones there too.
+        for (const review of preEditReviews) onAddReviewForRestore(review);
+      } else {
+        setDraftReviews((current) => [...preEditReviews, ...(current ?? [])]);
+      }
+    }
+    return true;
+  };
+  // By identity, not row id: a row reopened after a cancel is a new edit.
+  const isOpenEditOrNone = (session: EditSession | null) =>
+    editingMessageIdRef.current === undefined || editSessionRef.current === session;
 
   // Method to restore text to input (used by compaction cancel)
   const restoreText = useCallback(
     (text: string) => {
+      // #6866: a replace is not typing, even when its text starts with the sent text: a send not
+      // yet taken removes nothing from it.
+      getDraftStore().markSendEdited(draftScope);
       setInput(() => text);
       focusMessageInput();
     },
-    [focusMessageInput, setInput]
+    [draftScope, focusMessageInput, setInput]
   );
 
   // Method to append text to input (used by Code Review notes)
@@ -1412,23 +1388,46 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   const onReady = props.onReady;
 
-  // Provide API to parent via callback
+  // Provide API to parent via callback. Latest-ref wrappers (see handleSendRef)
+  // keep the handed-out object stable even though the draft helpers are not
+  // identity-stable without manual memoization; re-invoking onReady per render
+  // would churn parent state.
+  const composerApiRef = useRef({ restoreText, restoreDraft, appendText, prependText });
+  useEffect(() => {
+    composerApiRef.current = { restoreText, restoreDraft, appendText, prependText };
+  });
   useEffect(() => {
     if (onReady) {
       onReady({
         focus: focusMessageInput,
         send,
-        restoreText,
-        restoreDraft,
-        appendText,
-        prependText,
+        restoreText: (text) => composerApiRef.current.restoreText(text),
+        restoreDraft: (pending, options) => composerApiRef.current.restoreDraft(pending, options),
+        appendText: (text) => composerApiRef.current.appendText(text),
+        prependText: (text) => composerApiRef.current.prependText(text),
       });
     }
-  }, [onReady, focusMessageInput, send, restoreText, restoreDraft, appendText, prependText]);
+  }, [onReady, focusMessageInput, send]);
+
+  // The creation composer shows the focus-chat hint too, but the only handler lived in the
+  // workspace view (useAIViewKeybinds), so the shortcut did nothing here (#5687). Same rules as
+  // there: capture phase, works from inputs, yields to remote desktops and open dialogs.
+  useEffect(() => {
+    if (variant !== "creation") return;
+    const handleFocusChat = (event: KeyboardEvent) => {
+      if (!matchesKeybind(event, KEYBINDS.FOCUS_CHAT) || isDesktopViewportFocused(event.target)) {
+        return;
+      }
+      event.preventDefault();
+      if (!isDialogOpen() && !isCommandPaletteTarget(event.target)) focusMessageInput();
+    };
+    window.addEventListener("keydown", handleFocusChat, { capture: true });
+    return () => window.removeEventListener("keydown", handleFocusChat, { capture: true });
+  }, [variant, focusMessageInput]);
 
   useEffect(() => {
     const handleGlobalKeyDown = (event: KeyboardEvent) => {
-      if (isEditableElement(event.target)) {
+      if (isEditableElement(event.target) || !paneHandlesKeyEvent(paneScope, event.target)) {
         return;
       }
 
@@ -1447,7 +1446,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       if (matchesKeybind(event, KEYBINDS.CYCLE_MODEL)) {
         event.preventDefault();
         focusMessageInput();
-        cycleToNextModel();
+        cycleToNextModelRef.current();
       }
     };
 
@@ -1455,333 +1454,56 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       window.removeEventListener("keydown", handleGlobalKeyDown);
     };
-  }, [cycleToNextModel, focusMessageInput, openModelSelector]);
+  }, [focusMessageInput, openModelSelector, paneScope]);
 
-  // When entering editing mode, save current draft and populate with message content
+  // When entering editing mode, save current draft and populate with message content.
+  // Runs once per edit target: the draft callbacks change identity as the user types, and
+  // re-applying would clobber the in-progress edit text. The applied-id ref makes that
+  // explicit instead of hiding the callbacks from the dependency list.
+  const appliedEditIdRef = useRef<string | null>(null);
+  const draftPayloadsLoaded = draft.payloadsLoaded;
   useEffect(() => {
-    if (editingMessage) {
-      preEditDraftRef.current = getDraft();
-      preEditReviewsRef.current = draftReviews;
-      applyDraftFromPending(editingMessage.pending, `edit-${editingMessage.id}`);
-      setDraftReviews(editingMessage.pending.reviews);
-      // Auto-resize textarea and focus
-      setTimeout(() => {
-        if (inputRef.current) {
-          inputRef.current.style.height = "auto";
-          inputRef.current.style.height =
-            Math.min(inputRef.current.scrollHeight, window.innerHeight * 0.5) + "px";
-          inputRef.current.focus();
-        }
-      }, 0);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only run when editingMessage changes
-  }, [editingMessage, applyDraftFromPending]);
-
-  // Watch input/cursor for @file mentions
-  useEffect(() => {
-    if (atMentionDebounceRef.current) {
-      clearTimeout(atMentionDebounceRef.current);
-      atMentionDebounceRef.current = null;
-    }
-
-    const inputChanged = lastAtMentionInputRef.current !== input;
-    lastAtMentionInputRef.current = input;
-
-    const atMentionScopeId = variant === "workspace" ? workspaceId : atMentionProjectPath;
-
-    if (!api || !atMentionScopeId) {
-      // Invalidate any in-flight completion request.
-      atMentionRequestIdRef.current++;
-      lastAtMentionScopeIdRef.current = null;
-      lastAtMentionQueryRef.current = null;
-      setAtMentionSuggestions(clearSuggestions);
-      setShowAtMentionSuggestions(false);
+    if (!editingMessage) {
+      appliedEditIdRef.current = null;
       return;
     }
-
-    const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-    const match = findAtMentionAtCursor(input, cursor);
-
-    if (!match) {
-      // Invalidate any in-flight completion request.
-      atMentionRequestIdRef.current++;
-      lastAtMentionScopeIdRef.current = null;
-      lastAtMentionQueryRef.current = null;
-      setAtMentionSuggestions(clearSuggestions);
-      setShowAtMentionSuggestions(false);
+    if (appliedEditIdRef.current === editingMessage.id) return;
+    if (!draftPayloadsLoaded) {
+      // Hydrated attachments have no payloads yet (the draft shows none). Snapshotting now would
+      // save an attachment-less draft on cancel, and the edit's full replacement would end the
+      // load. Enter edit mode once they load (re-requested here in case an earlier load failed).
+      getDraftStore()
+        .ensurePayloads(draftScope)
+        .catch((error: unknown) => console.warn("Failed to load draft attachments:", error));
       return;
     }
-
-    // If the user is moving the caret and we aren't already showing suggestions, don't re-open.
-    if (!inputChanged && !showAtMentionSuggestions) {
-      return;
-    }
-
-    // Avoid refetching on caret movement within the same token/query.
-    if (
-      !inputChanged &&
-      lastAtMentionScopeIdRef.current === atMentionScopeId &&
-      lastAtMentionQueryRef.current === match.query
-    ) {
-      return;
-    }
-
-    lastAtMentionScopeIdRef.current = atMentionScopeId;
-    lastAtMentionQueryRef.current = match.query;
-
-    const requestId = ++atMentionRequestIdRef.current;
-    const runRequest = () => {
-      void (async () => {
-        try {
-          const result =
-            variant === "workspace"
-              ? await api.workspace.getFileCompletions({
-                  workspaceId: atMentionScopeId,
-                  query: match.query,
-                  limit: 20,
-                })
-              : await api.projects.getFileCompletions({
-                  projectPath: atMentionScopeId,
-                  query: match.query,
-                  limit: 20,
-                });
-
-          if (atMentionRequestIdRef.current !== requestId) {
-            return;
-          }
-
-          const nextSuggestions = result.paths
-            // File @mentions are whitespace-delimited (extractAtMentions uses /@(\S+)/), so
-            // suggestions containing spaces would be inserted incorrectly (e.g. "@foo bar.ts").
-            .filter((p) => !/\s/.test(p))
-            .map((p) => {
-              // Determine file type from extension or mark as directory
-              const getFileType = (path: string): string => {
-                if (path.endsWith("/")) return "Directory";
-                const lastDot = path.lastIndexOf(".");
-                const lastSlash = path.lastIndexOf("/");
-                // Only use extension if it's after the last slash (in the filename)
-                if (lastDot > lastSlash && lastDot < path.length - 1) {
-                  return path.slice(lastDot + 1).toUpperCase();
-                }
-                return "File";
-              };
-              return {
-                id: `file:${p}`,
-                display: p,
-                description: getFileType(p),
-                replacement: `@${p}`,
-              };
-            });
-
-          setAtMentionSuggestions(nextSuggestions);
-          setShowAtMentionSuggestions(nextSuggestions.length > 0);
-        } catch {
-          if (atMentionRequestIdRef.current === requestId) {
-            setAtMentionSuggestions(clearSuggestions);
-            setShowAtMentionSuggestions(false);
-          }
-        }
-      })();
+    appliedEditIdRef.current = editingMessage.id;
+    editSessionRef.current = {
+      id: editingMessage.id,
+      preEditDraft: getDraft(),
+      preEditReviews: draftReviews,
+      settled: false,
     };
-
-    // Our backend autocomplete is cheap (indexed) and cached, so update suggestions on every
-    // character rather than waiting for a debounce window.
-    runRequest();
-  }, [
-    api,
-    input,
-    showAtMentionSuggestions,
-    variant,
-    workspaceId,
-    atMentionProjectPath,
-    atMentionCursorNonce,
-  ]);
-
-  useEffect(() => {
-    if (!api || variant !== "workspace" || !workspaceId) {
-      if (mcpPromptsWorkspaceRef.current !== null) {
-        mcpPromptsWorkspaceRef.current = null;
-        mcpPromptsLoadedAtRef.current = 0;
-        mcpPromptsRequestIdRef.current++;
-        mcpPromptsRequestRef.current = null;
-        mcpPromptsAbortRef.current?.abort();
-        mcpPromptsAbortRef.current = null;
-        setMcpPromptDescriptors([]);
+    applyDraftFromPending(editingMessage.pending, `edit-${editingMessage.id}`);
+    setDraftReviews(editingMessage.pending.reviews);
+    // Auto-resize textarea and focus
+    setTimeout(() => {
+      if (inputRef.current) {
+        inputRef.current.style.height = "auto";
+        inputRef.current.style.height =
+          Math.min(inputRef.current.scrollHeight, window.innerHeight * 0.5) + "px";
+        inputRef.current.focus();
       }
-      return;
-    }
-
-    if (mcpPromptsWorkspaceRef.current !== workspaceId) {
-      mcpPromptsWorkspaceRef.current = workspaceId;
-      mcpPromptsLoadedAtRef.current = 0;
-      mcpPromptsRequestIdRef.current++;
-      mcpPromptsRequestRef.current = null;
-      mcpPromptsAbortRef.current?.abort();
-      mcpPromptsAbortRef.current = null;
-      setMcpPromptDescriptors([]);
-    }
-
-    const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-    const opensPromptSurface =
-      input.trimStart().startsWith("/") || findInlineSkillReferenceAtCursor(input, cursor) !== null;
-    if (!opensPromptSurface || Date.now() - mcpPromptsLoadedAtRef.current < 30_000) return;
-    if (mcpPromptsRequestRef.current) return;
-
-    const requestId = ++mcpPromptsRequestIdRef.current;
-    const abortController = new AbortController();
-    mcpPromptsAbortRef.current = abortController;
-    const request = api.workspace.mcp.prompts
-      .list({ workspaceId }, { signal: abortController.signal })
-      .then((prompts) => {
-        if (
-          mcpPromptsWorkspaceRef.current !== workspaceId ||
-          mcpPromptsRequestIdRef.current !== requestId
-        ) {
-          return;
-        }
-        setMcpPromptDescriptors(prompts);
-        mcpPromptsLoadedAtRef.current = Date.now();
-      })
-      .catch(() => {
-        if (
-          mcpPromptsWorkspaceRef.current === workspaceId &&
-          mcpPromptsRequestIdRef.current === requestId
-        ) {
-          mcpPromptsLoadedAtRef.current = Date.now();
-        }
-      })
-      .finally(() => {
-        if (mcpPromptsRequestRef.current === request) {
-          mcpPromptsRequestRef.current = null;
-        }
-        if (mcpPromptsAbortRef.current === abortController) {
-          mcpPromptsAbortRef.current = null;
-        }
-      });
-    mcpPromptsRequestRef.current = request;
-    // Caret movement must retrigger discovery when the input text is unchanged.
-  }, [api, input, variant, workspaceId, atMentionCursorNonce]);
-
-  useEffect(() => {
-    if (showAtMentionSuggestions) {
-      // File mentions win precedence if an edge-case token could match both menus.
-      setSkillSuggestions((prev) => (prev.length === 0 ? prev : []));
-      setShowSkillSuggestions(false);
-      lastSkillQueryRef.current = null;
-      return;
-    }
-
-    const inputChanged = lastSkillInputRef.current !== input;
-    lastSkillInputRef.current = input;
-
-    const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-    const match = findInlineSkillReferenceAtCursor(input, cursor);
-
-    if (!match) {
-      setSkillSuggestions(clearSuggestions);
-      setShowSkillSuggestions(false);
-      lastSkillQueryRef.current = null;
-      return;
-    }
-
-    if (
-      !shouldRefreshInlineSkillSuggestions({
-        inputChanged,
-        previousPartial: lastSkillQueryRef.current,
-        partial: match.partial,
-        previousDescriptors: lastSkillDescriptorsRef.current,
-        descriptors: agentSkillDescriptors,
-        previousMcpPrompts: lastMcpPromptDescriptorsRef.current,
-        mcpPrompts: mcpPromptDescriptors,
-      })
-    ) {
-      return;
-    }
-
-    lastSkillQueryRef.current = match.partial;
-
-    const nextSuggestions = getInlineSkillSuggestions({
-      partial: match.partial,
-      descriptors: agentSkillDescriptors,
-      mcpPrompts: mcpPromptDescriptors,
-    });
-    lastSkillDescriptorsRef.current = agentSkillDescriptors;
-    lastMcpPromptDescriptorsRef.current = mcpPromptDescriptors;
-    setSkillSuggestions(nextSuggestions);
-    setShowSkillSuggestions(nextSuggestions.length > 0);
+    }, 0);
   }, [
-    input,
-    showAtMentionSuggestions,
-    agentSkillDescriptors,
-    mcpPromptDescriptors,
-    atMentionCursorNonce,
+    editingMessage,
+    draftPayloadsLoaded,
+    draftScope,
+    getDraft,
+    draftReviews,
+    applyDraftFromPending,
+    setDraftReviews,
   ]);
-
-  // Keep slash suggestions current before Enter can accept a stale item.
-  useLayoutEffect(() => {
-    const suggestions = getSlashCommandSuggestions(input, {
-      agentSkills: agentSkillDescriptors,
-      mcpPrompts: mcpPromptDescriptors,
-      pluginCommands: pluginCommandDescriptors,
-      variant,
-      isExperimentEnabled: (experimentId) =>
-        resolveSlashCommandExperimentValue(experimentId, {
-          workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-          dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-          memory: memoryExperimentEnabled,
-          memoryConsolidation: memoryConsolidationExperimentEnabled,
-        }),
-    });
-    setCommandSuggestions((prev) => replaceSuggestions(prev, suggestions));
-    setShowCommandSuggestions(suggestions.length > 0);
-  }, [
-    input,
-    agentSkillDescriptors,
-    mcpPromptDescriptors,
-    pluginCommandDescriptors,
-    variant,
-    workspaceHeartbeatsExperimentEnabled,
-    dynamicWorkflowsExperimentEnabled,
-    memoryExperimentEnabled,
-    memoryConsolidationExperimentEnabled,
-  ]);
-
-  // Watch input/cursor for `\symbol` backslash commands and surface the menu.
-  useLayoutEffect(() => {
-    if (showAtMentionSuggestions) {
-      // File mentions win precedence if an edge-case token could match both menus.
-      setSymbolSuggestions(clearSuggestions);
-      setShowSymbolSuggestions(false);
-      return;
-    }
-
-    const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-    const match = findSymbolCommandAtCursor(input, cursor);
-    if (!match) {
-      setSymbolSuggestions(clearSuggestions);
-      setShowSymbolSuggestions(false);
-      return;
-    }
-
-    const suggestions = getSymbolSuggestions(match.partial);
-    lastSymbolQueryRef.current = match.partial;
-    setSymbolSuggestions((prev) => replaceSuggestions(prev, suggestions));
-    setShowSymbolSuggestions(suggestions.length > 0);
-  }, [input, showAtMentionSuggestions, atMentionCursorNonce]);
-
-  // Derive ghost hint for slash-command argument syntax.
-  // Show only when suggestions are hidden and the input is exactly "/command " with no args yet.
-  const commandGhostHint = getCommandGhostHint(input, showCommandSuggestions, {
-    variant,
-    isExperimentEnabled: (experimentId) =>
-      resolveSlashCommandExperimentValue(experimentId, {
-        workspaceHeartbeats: workspaceHeartbeatsExperimentEnabled,
-        dynamicWorkflows: dynamicWorkflowsExperimentEnabled,
-        memory: memoryExperimentEnabled,
-        memoryConsolidation: memoryConsolidationExperimentEnabled,
-      }),
-  });
 
   // Project live workflow run cards for foreground slash invocations after reloads.
   useEffect(() => {
@@ -1789,40 +1511,43 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const requestId = ++workflowsRequestIdRef.current;
 
     const loadWorkflows = async () => {
-      if (!api || !dynamicWorkflowsExperimentEnabled) {
+      if (!api) {
         return;
       }
 
-      try {
-        const discoveryWorkspaceId = variant === "workspace" && workspaceId ? workspaceId : null;
-        const runs =
-          discoveryWorkspaceId != null && isTranscriptCaughtUp
-            ? await api.workflows.listRuns({ workspaceId: discoveryWorkspaceId })
-            : [];
-        if (!isMounted || workflowsRequestIdRef.current !== requestId) {
-          return;
-        }
-        if (discoveryWorkspaceId == null) {
-          return;
-        }
-        const muxMessages = store.getWorkspaceState(discoveryWorkspaceId).muxMessages;
-        for (const run of runs) {
-          const projection = getWorkflowRunCardProjection(muxMessages, run);
-          if (!projection.shouldProject) {
-            continue;
+      await runWithCatch(
+        async () => {
+          const discoveryWorkspaceId = variant === "workspace" && workspaceId ? workspaceId : null;
+          const runs =
+            discoveryWorkspaceId != null && isTranscriptCaughtUp
+              ? await api.workflows.listRuns({ workspaceId: discoveryWorkspaceId })
+              : [];
+          if (!isMounted || workflowsRequestIdRef.current !== requestId) {
+            return;
           }
-          const cardKey = `${discoveryWorkspaceId}:${run.id}:${run.updatedAt}:${run.status}`;
-          if (projectedWorkflowRunCardKeysRef.current.has(cardKey)) {
-            continue;
+          if (discoveryWorkspaceId == null) {
+            return;
           }
-          projectedWorkflowRunCardKeysRef.current.add(cardKey);
-          addWorkflowRunCardMessageForRun(discoveryWorkspaceId, run, {
-            existingMessage: projection.existingMessage,
-          });
+          const muxMessages = store.getWorkspaceState(discoveryWorkspaceId).muxMessages;
+          for (const run of runs) {
+            const projection = getWorkflowRunCardProjection(muxMessages, run);
+            if (!projection.shouldProject) {
+              continue;
+            }
+            const cardKey = `${discoveryWorkspaceId}:${run.id}:${run.updatedAt}:${run.status}`;
+            if (projectedWorkflowRunCardKeysRef.current.has(cardKey)) {
+              continue;
+            }
+            projectedWorkflowRunCardKeysRef.current.add(cardKey);
+            addWorkflowRunCardMessageForRun(discoveryWorkspaceId, run, {
+              existingMessage: projection.existingMessage,
+            });
+          }
+        },
+        (error) => {
+          console.error("Failed to project workflow run cards:", error);
         }
-      } catch (error) {
-        console.error("Failed to project workflow run cards:", error);
-      }
+      );
     };
 
     void loadWorkflows();
@@ -1830,109 +1555,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       isMounted = false;
     };
-  }, [
-    api,
-    variant,
-    workspaceId,
-    atMentionProjectPath,
-    dynamicWorkflowsExperimentEnabled,
-    isTranscriptCaughtUp,
-    store,
-  ]);
-
-  // Load agent skills for suggestions
-  useEffect(() => {
-    let isMounted = true;
-    const requestId = ++agentSkillsRequestIdRef.current;
-
-    const loadAgentSkills = async () => {
-      if (!api) {
-        if (isMounted && agentSkillsRequestIdRef.current === requestId) {
-          setAgentSkillDescriptors([]);
-        }
-        return;
-      }
-
-      const discoveryInput =
-        variant === "workspace" && workspaceId
-          ? {
-              workspaceId,
-              disableWorkspaceAgents:
-                sendMessageOptions.disableWorkspaceAgents === true ||
-                transferredDraftProjectDiscovery,
-            }
-          : variant === "creation" && atMentionProjectPath
-            ? { projectPath: atMentionProjectPath }
-            : null;
-
-      if (!discoveryInput) {
-        if (isMounted && agentSkillsRequestIdRef.current === requestId) {
-          setAgentSkillDescriptors([]);
-        }
-        return;
-      }
-
-      try {
-        const skills = await api.agentSkills.list(discoveryInput);
-        if (!isMounted || agentSkillsRequestIdRef.current !== requestId) {
-          return;
-        }
-        if (Array.isArray(skills)) {
-          setAgentSkillDescriptors(skills);
-        }
-      } catch (error) {
-        console.error("Failed to load agent skills:", error);
-        if (!isMounted || agentSkillsRequestIdRef.current !== requestId) {
-          return;
-        }
-        setAgentSkillDescriptors([]);
-      }
-    };
-
-    void loadAgentSkills();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [
-    api,
-    variant,
-    workspaceId,
-    atMentionProjectPath,
-    sendMessageOptions.disableWorkspaceAgents,
-    transferredDraftProjectDiscovery,
-    // The backend gates plugin-contributed skills on this experiment, so a
-    // toggle must refetch /skill suggestions like it reloads plugin commands.
-    agentPluginsExperimentEnabled,
-  ]);
-
-  // Agent Plugins: load manifest-contributed slash commands for suggestions.
-  // Subscribes to the reactive experiment value so toggling agent-plugins in
-  // Settings immediately loads/clears commands without remounting the composer
-  // (the backend also returns [] while the experiment is disabled).
-  useEffect(() => {
-    let isMounted = true;
-
-    const loadPluginCommands = async () => {
-      if (!api || variant !== "workspace" || !workspaceId || !agentPluginsExperimentEnabled) {
-        if (isMounted) setPluginCommandDescriptors([]);
-        return;
-      }
-      try {
-        const commands = await api.workspace.plugins.slashCommands.list({ workspaceId });
-        if (isMounted) setPluginCommandDescriptors(commands);
-      } catch {
-        // Plugin command discovery must never break the composer.
-        if (isMounted) setPluginCommandDescriptors([]);
-      }
-    };
-
-    void loadPluginCommands();
-
-    return () => {
-      isMounted = false;
-    };
-  }, [api, variant, workspaceId, agentPluginsExperimentEnabled]);
+  }, [api, variant, workspaceId, atMentionProjectPath, isTranscriptCaughtUp, store]);
 
   // Voice input: track transcription provider availability (subscribe to provider config changes)
   useEffect(() => {
@@ -1941,47 +1564,37 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const abortController = new AbortController();
     const { signal } = abortController;
 
-    // Some oRPC iterators don't eagerly close on abort alone.
-    // Ensure we `return()` them so backend subscriptions clean up EventEmitter listeners.
+    // Set by forEachProviderConfigChange; returned on cleanup.
     let iterator: AsyncIterator<unknown> | null = null;
 
-    const checkTranscriptionConfig = async () => {
-      try {
-        const config = await api.providers.getConfig();
-        if (!signal.aborted) {
-          setOpenAIKeySet(config?.openai?.apiKeySet ?? false);
-          setOpenAIProviderEnabled(config?.openai?.isEnabled ?? true);
-          setMuxGatewayCouponSet(config?.["mux-gateway"]?.couponCodeSet ?? false);
-          setMuxGatewayEnabled(config?.["mux-gateway"]?.isEnabled ?? true);
+    const checkTranscriptionConfig = () =>
+      runWithCatch(
+        async () => {
+          const config = await api.providers.getConfig();
+          if (!signal.aborted) {
+            // VoiceService resolves keys from config, key files and env vars alike. Codex OAuth
+            // alone cannot transcribe, so isConfigured is not enough.
+            setOpenAIKeySet(hasOpenAIApiKey(config?.openai));
+            setOpenAIProviderEnabled(config?.openai?.isEnabled ?? true);
+          }
+        },
+        () => {
+          // Ignore errors fetching config
         }
-      } catch {
-        // Ignore errors fetching config
-      }
-    };
+      );
 
     // Initial fetch
     void checkTranscriptionConfig();
 
     // Subscribe to provider config changes via oRPC
-    (async () => {
-      try {
-        const subscribedIterator = await api.providers.onConfigChanged(undefined, { signal });
-
-        if (signal.aborted) {
-          void subscribedIterator.return?.();
-          return;
-        }
-
+    void forEachProviderConfigChange(
+      api,
+      signal,
+      (subscribedIterator) => {
         iterator = subscribedIterator;
-
-        for await (const _ of subscribedIterator) {
-          if (signal.aborted) break;
-          void checkTranscriptionConfig();
-        }
-      } catch {
-        // Subscription cancelled via abort signal - expected on cleanup
-      }
-    })();
+      },
+      () => void checkTranscriptionConfig()
+    );
 
     return () => {
       abortController.abort();
@@ -1991,23 +1604,85 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Allow external components (e.g., CommandPalette, Queued message edits) to insert text
   useEffect(() => {
+    type UpdateDetail = CustomEventPayloads[typeof CUSTOM_EVENTS.UPDATE_CHAT_INPUT];
     const handler = (e: Event) => {
-      const customEvent = e as CustomEvent<{
-        text: string;
-        mode?: "append" | "replace";
-        fileParts?: FilePart[];
-        reviews?: ReviewNoteDataForDisplay[];
-        workspaceId?: string;
-      }>;
-
-      if (
-        customEvent.detail.workspaceId != null &&
-        workspaceIdForComposerClear !== customEvent.detail.workspaceId
-      ) {
+      const detail = (e as CustomEvent<UpdateDetail>).detail;
+      if (detail.workspaceId != null && workspaceIdForComposerClear !== detail.workspaceId) {
         return;
       }
-
-      const { text, mode = "append", fileParts, reviews } = customEvent.detail;
+      // Unscoped updates come from the palette / main UI; the side composer only takes updates
+      // addressed to its own workspace so text is never inserted into both composers.
+      if (detail.workspaceId == null && paneScope !== "main") {
+        return;
+      }
+      const { inputs } = detail;
+      if (detail.mode !== "restore" || inputs == null) {
+        applyUpdate(detail);
+        return;
+      }
+      // Idempotent sends: a restored send whose id the draft still retains (pendingSends) is not
+      // inserted again: once its held input is released, its entry resolves as not accepted and
+      // its text becomes visible from the draft. An id-less (foreign) input is inserted once, as
+      // before.
+      const retained = getDraftStore().getPendingSendIds(draftScope);
+      const parts = inputs.map((restored) => {
+        const retainedIds = restored.sendIds.filter((id) => retained.has(id));
+        if (retainedIds.length === 0) return { restored, insert: restored, hasRetained: false };
+        if (retainedIds.length === restored.sendIds.length) {
+          return { restored, insert: null, hasRetained: true };
+        }
+        // One input can join a retained send with one the draft does not retain (e.g. a
+        // backend-minted one): insert only the latter's part.
+        const rest = getDraftStore().withoutRetainedSends(draftScope, retainedIds, {
+          text: restored.text,
+          fileParts: restored.fileParts ?? [],
+        });
+        const insert = {
+          text: rest.text,
+          fileParts: rest.fileParts,
+          sendIds: restored.sendIds.filter((id) => !retained.has(id)),
+        };
+        return { restored, insert, hasRetained: true };
+      });
+      // An input with ids the draft no longer retains may be a late copy of a send the backend
+      // already accepted (e.g. two windows re-sent it after a restart): ask before inserting it,
+      // so accepted text never comes back to be sent again. A failed lookup inserts it (a
+      // visible duplicate beats a loss).
+      const restoreParts = (accepted: ReadonlySet<string>) => {
+        const isAcceptedCopy = (insert: { sendIds: string[] }) =>
+          insert.sendIds.length > 0 && insert.sendIds.every((id) => accepted.has(id));
+        const inserted = parts.flatMap(({ insert }) =>
+          insert && !isAcceptedCopy(insert) ? [insert] : []
+        );
+        // Notes come back per input: none for an input dropped as an accepted copy (they were
+        // sent). A retained send's notes do come back here: its draft entry keeps only its text
+        // and attachments.
+        const reviews = parts.flatMap(({ restored, insert, hasRetained }) =>
+          !hasRetained && insert && isAcceptedCopy(insert) ? [] : (restored.reviews ?? [])
+        );
+        applyUpdate({
+          ...detail,
+          inputs: undefined,
+          text: inserted
+            .map((restored) => restored.text)
+            .filter((part) => part.length > 0)
+            .join("\n"),
+          fileParts: inserted.flatMap((restored) => restored.fileParts ?? []),
+          reviews: reviews.length > 0 ? reviews : undefined,
+        });
+      };
+      const askIds = parts.flatMap(({ insert }) => insert?.sendIds ?? []);
+      if (askIds.length === 0 || workspaceIdForComposerClear == null || api == null) {
+        restoreParts(new Set());
+        return;
+      }
+      acceptedSendIds(api, workspaceIdForComposerClear, askIds)
+        .catch(() => new Set<string>())
+        .then(restoreParts)
+        .catch((error: unknown) => console.error("Failed to restore queued input:", error));
+    };
+    const applyUpdate = (detail: UpdateDetail) => {
+      const { text, mode = "append", fileParts, reviews } = detail;
       const restoredIdPrefix = `restored-${Date.now()}`;
       const restoredPending = buildPendingFromRestoredInput({
         content: text,
@@ -2019,10 +1694,79 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const hasStagedAttachments = restoredPending.stagedAttachments.length > 0;
       const hasReviews = restoredPending.reviews.length > 0;
 
-      if (mode === "replace") {
+      if (mode === "restore") {
+        // A queued message returned by Stop (#4431). It must not destroy a newer draft the user
+        // typed while it waited, so it goes in front of whatever the composer holds: it was
+        // written, and would have been sent, first. An empty composer ends up with exactly the
+        // restored message, as the old replace did. Functional updates merge with the current
+        // draft rather than the one this listener was registered with.
+        // Like "replace", never inject into a historical-message edit (e.g. canceling compaction
+        // enters edit mode before its interrupt restores the queue).
         if (editingMessageForUi) {
           return;
         }
+        const restoredAttachments = pendingChatAttachments(restoredPending, restoredIdPrefix);
+        // Merged from the stored draft, exactly as a functional setInput would, so the
+        // acknowledgement below can check that this exact value landed.
+        const mergedText = [restoredPending.content, getDraftStore().getText(draftScope)]
+          .filter((part) => part.trim().length > 0)
+          .join("\n\n");
+        setInput(mergedText);
+        if (restoredAttachments.length > 0) {
+          setAttachments((current) => [...restoredAttachments, ...current]);
+        }
+        // Ids the review store added; null when the notes went to the memory-only override.
+        let restoredReviewIds: string[] | null = [];
+        if (restoredPending.reviews.length > 0) {
+          if (draftReviews === null && onAddReviewForRestore) {
+            // The draft's notes live in the review store: add the restored ones there too, as
+            // new attached notes. A detached copy in the override would hide later store
+            // changes, and a send in flight checks off only the notes it captured, not these.
+            // Called here, not in a state updater, which may run more than once.
+            restoredReviewIds = restoredPending.reviews.map(
+              (review) => onAddReviewForRestore(review).id
+            );
+          } else {
+            // An active override (e.g. a queued-message edit) owns the composer's notes.
+            setDraftReviews((current) => [...restoredPending.reviews, ...(current ?? [])]);
+            restoredReviewIds = null;
+          }
+        }
+        // The backend keeps this input as held input until a composer takes it (#4448). Release
+        // that copy only once every restored part is durable; otherwise the "Not sent" banner
+        // stays next to the composer's copy: a visible duplicate beats a loss. Edit mode (above)
+        // takes nothing.
+        const heldInputIds = detail.heldInputIds ?? [];
+        if (heldInputIds.length > 0 && workspaceIdForComposerClear != null) {
+          // The backend copy is released only after the backend confirmed the restored draft
+          // write; a failed write keeps (and shows) the held input.
+          const draftDurable = isRestoredDraftDurable({
+            draftStore: getDraftStore(),
+            draftScope,
+            restoredAttachmentIds: restoredAttachments.map(({ id }) => id),
+            restoredReviewIds,
+          });
+          // Restored notes live in the backend review-state store: require its
+          // server-acknowledged copy too. A failed flush leaves the input held (fail closed; a
+          // visible duplicate beats a loss).
+          const durable =
+            restoredReviewIds !== null && restoredReviewIds.length > 0
+              ? Promise.all([
+                  draftDurable,
+                  getReviewStateStore()
+                    .areReviewsDurable(workspaceIdForComposerClear, restoredReviewIds)
+                    .catch(() => false),
+                ]).then(([draftOk, reviewsOk]) => draftOk && reviewsOk)
+              : draftDurable;
+          onAcceptRestoredHeldInputs?.(heldInputIds, durable);
+        }
+        focusMessageInput();
+      } else if (mode === "replace") {
+        if (editingMessageForUi) {
+          return;
+        }
+        // #6866: a replace is not typing (see restoreText), with or without files.
+        getDraftStore().markSendEdited(draftScope);
         if (hasFileParts || hasStagedAttachments || hasReviews) {
           restoreDraft(restoredPending);
         } else {
@@ -2053,6 +1797,16 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     getDraft,
     editingMessageForUi,
     workspaceIdForComposerClear,
+    setInput,
+    setAttachments,
+    draftReviews,
+    setDraftReviews,
+    onAddReviewForRestore,
+    onAcceptRestoredHeldInputs,
+    draftScope,
+    focusMessageInput,
+    api,
+    paneScope,
   ]);
 
   useEffect(() => {
@@ -2073,10 +1827,18 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     window.addEventListener(CUSTOM_EVENTS.CLEAR_CHAT_COMPOSER, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.CLEAR_CHAT_COMPOSER, handler as EventListener);
-  }, [onDetachAllReviewsForComposerClear, setAttachments, setInput, workspaceIdForComposerClear]);
+  }, [
+    onDetachAllReviewsForComposerClear,
+    setAttachments,
+    setDraftReviews,
+    setInput,
+    workspaceIdForComposerClear,
+  ]);
 
   // Allow external components to open the Model Selector
   useEffect(() => {
+    // Unscoped palette event: the main composer owns it (see paneScope).
+    if (paneScope !== "main") return;
     const handler = () => {
       // Open the inline ModelSelector and let it take focus itself
       modelSelectorRef.current?.open();
@@ -2084,7 +1846,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     window.addEventListener(CUSTOM_EVENTS.OPEN_MODEL_SELECTOR, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.OPEN_MODEL_SELECTOR, handler as EventListener);
-  }, []);
+  }, [paneScope]);
 
   // Show toast when thinking level is changed via command palette (workspace only)
   useEffect(() => {
@@ -2117,29 +1879,15 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       window.removeEventListener(CUSTOM_EVENTS.THINKING_LEVEL_TOAST, handler as EventListener);
   }, [variant, props, pushToast]);
 
-  // Show the backend's one-shot child-budget warning on the matching parent workspace.
-  useEffect(() => {
-    if (variant !== "workspace") return;
-
-    const handler = (event: Event) => {
-      const detail = (event as CustomEvent<{ workspaceId: string; message: string }>).detail;
-      if (detail?.workspaceId !== workspaceId || !detail.message) {
-        return;
-      }
-
-      pushToast({ type: "error", message: detail.message });
-    };
-
-    window.addEventListener(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, handler as EventListener);
-    return () =>
-      window.removeEventListener(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, handler as EventListener);
-  }, [variant, workspaceId, pushToast]);
+  useChatErrorToasts(workspaceId, toast?.message ?? null, pushToast);
 
   // Show toast feedback for analytics rebuild command palette action.
   useEffect(() => {
+    // Unscoped palette event: the main composer owns it so the toast shows once.
+    if (paneScope !== "main") return;
     const handler = (event: Event) => {
       const detail = (
-        event as CustomEvent<{ type: "success" | "error"; message: string; title?: string }>
+        event as CustomEvent<CustomEventPayloads[typeof CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST]>
       ).detail;
 
       if (!detail || (detail.type !== "success" && detail.type !== "error")) {
@@ -2150,17 +1898,20 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         type: detail.type,
         title: detail.title,
         message: detail.message,
+        copyText: detail.copyText,
+        duration: detail.duration,
       });
     };
 
     window.addEventListener(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, handler as EventListener);
     return () =>
       window.removeEventListener(CUSTOM_EVENTS.ANALYTICS_REBUILD_TOAST, handler as EventListener);
-  }, [pushToast]);
+  }, [pushToast, paneScope]);
 
   // Voice input: command palette toggle + global recording keybinds
   useEffect(() => {
-    if (!voiceInput.shouldShowUI) return;
+    // Unscoped palette event: only the main composer starts recording (see paneScope).
+    if (!voiceInput.shouldShowUI || paneScope !== "main") return;
 
     const handleToggle = () => {
       if (!voiceInput.isAvailable) {
@@ -2177,7 +1928,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     return () => {
       window.removeEventListener(CUSTOM_EVENTS.TOGGLE_VOICE_INPUT, handleToggle as EventListener);
     };
-  }, [voiceInput, pushToast, voiceInputUnavailableMessage]);
+  }, [voiceInput, pushToast, voiceInputUnavailableMessage, paneScope]);
 
   // Auto-focus chat input when workspace changes (workspace only).
   const workspaceIdForFocus = variant === "workspace" ? props.workspaceId : null;
@@ -2236,140 +1987,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     };
   }, [variant, workspaceIdForFocus, focusMessageInput, setChatInputAutoFocusState]);
 
-  const showResizeToast = useCallback(
-    (nextAttachments: ChatAttachment[]) => {
-      const resized = nextAttachments.filter(
-        (attachment): attachment is Extract<ChatAttachment, { kind: "provider" }> =>
-          attachment.kind === "provider" && attachment.resizeInfo != null
-      );
-      if (resized.length === 0) {
-        return;
-      }
-
-      const firstResizeInfo = resized[0].resizeInfo;
-      if (!firstResizeInfo) {
-        return;
-      }
-
-      // Tell users when we auto-resize so the attachment dimensions are never surprising.
-      const message =
-        resized.length === 1
-          ? `Image resized from ${firstResizeInfo.originalWidth}×${firstResizeInfo.originalHeight} to ${firstResizeInfo.newWidth}×${firstResizeInfo.newHeight}`
-          : `${resized.length} images resized to fit provider limits`;
-
-      pushToast({ type: "info", message });
-    },
-    [pushToast]
-  );
-
-  const processAttachmentFilesForComposer = useCallback(
-    (files: File[]): Promise<ChatAttachment[]> => {
-      setProcessingAttachmentCount((count) => count + 1);
-      return processAttachmentFiles(files, {
-        stageAttachment:
-          variant === "workspace"
-            ? async (file, dataBase64) => {
-                if (!api) {
-                  throw new Error("Not connected to server");
-                }
-                if (workspaceId == null) {
-                  throw new Error("Files can be staged after opening a workspace.");
-                }
-                const result = await api.workspace.stageAttachment({
-                  workspaceId,
-                  filename: file.name,
-                  mediaType: file.type || null,
-                  sizeBytes: file.size,
-                  dataBase64,
-                });
-                if (!result.success) {
-                  throw new Error(result.error);
-                }
-                return result.data;
-              }
-            : undefined,
-        holdNonProviderFiles: variant === "creation",
-      }).finally(() => {
-        setProcessingAttachmentCount((count) => Math.max(0, count - 1));
-      });
-    },
-    [api, variant, workspaceId]
-  );
-
-  const attachFiles = useCallback(
-    (files: File[]) => {
-      const results = files.map((file) =>
-        processAttachmentFilesForComposer([file]).then(
-          (attachments) => ({ ok: true as const, attachments }),
-          (error: unknown) => ({ ok: false as const, error })
-        )
-      );
-      void Promise.all(results).then((outcomes) => {
-        const successes = outcomes.flatMap((outcome) => (outcome.ok ? outcome.attachments : []));
-        if (successes.length > 0) {
-          setAttachments((prev) => [...prev, ...successes]);
-          showResizeToast(successes);
-        }
-        for (const outcome of outcomes) {
-          if (!outcome.ok) {
-            const message =
-              outcome.error instanceof Error
-                ? outcome.error.message
-                : "Failed to process attachment";
-            console.error("Failed to process attached file:", outcome.error);
-            pushToast({ type: "error", message });
-          }
-        }
-      });
-    },
-    [processAttachmentFilesForComposer, pushToast, setAttachments, showResizeToast]
-  );
-
-  // Handle paste events to extract attachments
-  const handlePaste = useCallback(
-    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      const items = e.clipboardData?.items;
-      if (!items) return;
-
-      const attachmentFiles = extractAttachmentsFromClipboard(items);
-      if (attachmentFiles.length === 0) return;
-
-      // When editing an existing message, we only allow changing the text.
-      // Don't preventDefault here so any clipboard text can still paste normally.
-      if (editingMessageForUi) {
-        pushToast({
-          type: "error",
-          message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE,
-        });
-        return;
-      }
-
-      e.preventDefault(); // Prevent default paste behavior for attachments
-
-      attachFiles(attachmentFiles);
-    },
-    [attachFiles, editingMessageForUi, pushToast]
-  );
-
-  // Handle removing an attachment
-  const handleRemoveAttachment = useCallback(
-    (id: string) => {
-      setAttachments((prev) => prev.filter((img) => img.id !== id));
-    },
-    [setAttachments]
-  );
-
-  const handleAttachFiles = (files: File[]) => {
-    if (editingMessageForUi) {
-      pushToast({
-        type: "error",
-        message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE,
-      });
-      return;
-    }
-    attachFiles(files);
-  };
-
   // Shared slash command execution for creation + workspace inputs.
   const commandWorkspaceId = variant === "workspace" ? props.workspaceId : undefined;
   const commandProjectPath =
@@ -2378,6 +1995,46 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
   // Keep this helper as a plain function so command wiring stays readable without a giant
   // dependency list; the React Compiler already handles memoization.
+  /**
+   * The composer's review notes for a send. Attached notes live in the backend review-state
+   * store; a send racing its hydration waits for it (normally already done) and reads them from
+   * the store, so neither a command (e.g. /compact's follow-up) nor a normal send is built from
+   * the empty loading view. After a failed subscription the store retries it (bounded, #5011);
+   * if the notes still cannot be read, none are included and `unavailable` is set, so the send
+   * path can say so (see warnIfReviewsUnavailable).
+   */
+  const readReviewsForSend = async (): Promise<ReviewsForSend> => {
+    const renderTime: ReviewsForSend = { data: reviewData, ids: reviewIdsForCheck };
+    if (variant !== "workspace" || !workspaceId || reviewOverrideActive) return renderTime;
+    const reviewStateStore = getReviewStateStore();
+    // Without an API client (backend reconnecting) hydration cannot finish, and waiting would
+    // hold this send in flight and fire it after reconnect; let the send path report
+    // "Not connected to server" instead.
+    if (!liveApi || reviewStateStore.isHydrated(workspaceId)) return renderTime;
+    const attached = await reviewStateStore.readAttachedReviewsForSend(workspaceId);
+    if (attached === null) {
+      // The render-time notes may be a stale cache; send none rather than a possibly wrong set.
+      return { data: undefined, ids: [], unavailable: true };
+    }
+    return {
+      data: attached.length > 0 ? attached.map((review) => review.data) : undefined,
+      ids: attached.map((review) => review.id),
+    };
+  };
+
+  /**
+   * Called only once a message that would carry the notes was accepted (a normal send, or
+   * /compact's check-reviews action), so a failed send or a command like /vim never shows it.
+   */
+  const warnIfReviewsUnavailable = (reviews: ReviewsForSend) => {
+    if (!reviews.unavailable) return;
+    pushToast({
+      type: "error",
+      message:
+        "Review notes could not be loaded, so none were attached. They are kept; send them once they load.",
+    });
+  };
+
   const executeParsedCommand = async (
     parsed: ParsedCommand | null,
     restoreInput: string,
@@ -2385,6 +2042,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       skipConfirmation?: boolean;
       queueDispatchMode?: QueueDispatchMode;
       goalInterventionPolicy?: GoalInterventionPolicy;
+      /** Hydrated review notes read by the send path; defaults to the render-time notes. */
+      reviews?: ReviewsForSend;
     }
   ): Promise<boolean> => {
     if (!parsed) {
@@ -2425,7 +2084,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return true;
     }
 
-    const reviewsData = reviewData;
+    const reviewsData = options?.reviews ? options.reviews.data : reviewData;
     const dispatchMode = options?.queueDispatchMode ?? "tool-end";
     // Thread dispatch mode into send options so queued command sends stay in sync with normal sends.
     const commandSendMessageOptions: SendMessageOptions = {
@@ -2438,62 +2097,131 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     // Prepare file parts for commands that need to send messages with attachments
     const commandFileParts = chatAttachmentsToFileParts(attachments, { validate: true });
     const asyncCommandToken = ++asyncCommandTokenRef.current;
-    const commandContext: SlashCommandContext = {
-      api,
+    const commandEnv: SlashCommandEnv = {
+      // Commands report "Not connected to server" themselves when there is no live client.
+      api: liveApi,
+      aiScopeId: sendOptionsScopeId,
       variant,
       workspaceId: commandWorkspaceId,
       projectPath: commandProjectPath,
       rawInput: restoreInput,
-      dynamicWorkflowsEnabled: dynamicWorkflowsExperimentEnabled,
-      openSettings: open,
       currentModel: workspaceSidebarState?.currentModel ?? null,
       sendMessageOptions: commandSendMessageOptions,
-      getInput: () => getDraft().text,
-      setInput,
-      setAttachments,
-      setSendingState: (increment: boolean) => setSendingCount((c) => c + (increment ? 1 : -1)),
-      setToast,
-      setPreferredModel,
-      setVimEnabled,
-      asyncCommandToken,
-      isAsyncCommandCurrent: (token, originWorkspaceId) => {
-        const scope = asyncCommandScopeRef.current;
-        return (
-          token === asyncCommandTokenRef.current &&
-          scope.variant === "workspace" &&
-          scope.workspaceId === originWorkspaceId
-        );
-      },
-      onResetContext: variant === "workspace" ? props.onResetContext : undefined,
-      onTruncateHistory: variant === "workspace" ? props.onTruncateHistory : undefined,
-      resetInputHeight: () => {
-        if (inputRef.current) {
-          inputRef.current.style.height = "";
-        }
-      },
+      resetContext: variant === "workspace" ? props.onResetContext : undefined,
+      truncateHistory: variant === "workspace" ? props.onTruncateHistory : undefined,
       editMessageId: editingMessageForUi?.id,
-      onCancelEdit: commandOnCancelEdit,
+      historyEditPrecondition: editingMessageForUi
+        ? getEditSendPrecondition(editingMessageForUi)
+        : undefined,
       reviews: reviewsData,
       attachments,
       fileParts: commandFileParts.length > 0 ? commandFileParts : undefined,
-      onMessageSent: variant === "workspace" ? props.onMessageSent : undefined,
-      onDetachAllReviews: variant === "workspace" ? props.onDetachAllReviews : undefined,
-      onCheckReviews: variant === "workspace" ? props.onCheckReviews : undefined,
-      attachedReviewIds: reviewIdsForCheck,
+      attachedReviewIds: options?.reviews ? options.reviews.ids : reviewIdsForCheck,
+      isSideChat:
+        commandWorkspaceId != null &&
+        workspaceMetadata.get(commandWorkspaceId)?.sideChatParentWorkspaceId != null,
+      isCurrent: () => {
+        const scope = asyncCommandScopeRef.current;
+        return (
+          asyncCommandToken === asyncCommandTokenRef.current &&
+          scope.variant === "workspace" &&
+          scope.workspaceId === commandWorkspaceId
+        );
+      },
     };
 
-    const result = await processSlashCommand(parsed, commandContext);
-
-    if (!result.clearInput) {
-      setInput(restoreInput);
-    } else {
-      setDraftReviews(null);
-      if (variant === "workspace" && parsed.type === "compact") {
-        if (reviewIdsForCheck.length > 0) {
-          props.onCheckReviews?.(reviewIdsForCheck);
+    // A completed edit restored its pre-edit draft, review notes included: keep them.
+    let restoredPreEditDraft = false;
+    const commandEditSession =
+      commandEnv.editMessageId !== undefined &&
+      editSessionRef.current?.id === commandEnv.editMessageId
+        ? editSessionRef.current
+        : null;
+    // An editing command whose edit gave its draft back (the user cancelled it) or is no longer
+    // the open edit: the composer holds another draft, so the command's clears must not touch it.
+    const editCancelled = () =>
+      commandEditSession?.settled === true || !isOpenEditOrNone(commandEditSession);
+    // Command actions stop at the caller's UI boundary; creation mode intentionally has its own applier.
+    const applyCommandActions = (actions: CommandAction[]) => {
+      for (const action of actions) {
+        switch (action.type) {
+          case "clear-input":
+            if (!editCancelled()) setInput("");
+            break;
+          case "reset-input-height":
+            if (inputRef.current) inputRef.current.style.height = "";
+            break;
+          case "show-toast":
+            setToast(action.toast);
+            break;
+          case "set-preferred-model":
+            setPreferredModel(action.model);
+            break;
+          case "toggle-vim":
+            updateUserPreferences({
+              appearance: { vimEnabled: getUserPreferences().appearance?.vimEnabled !== true },
+            });
+            break;
+          case "set-sending":
+            setSendingCount((count) => count + (action.sending ? 1 : -1));
+            break;
+          case "clear-attachments":
+            if (!editCancelled()) setAttachments([]);
+            break;
+          case "detach-reviews":
+            if (variant === "workspace") props.onDetachAllReviews?.();
+            break;
+          case "check-reviews":
+            if (variant === "workspace" && action.reviewIds.length > 0) {
+              props.onCheckReviews?.(action.reviewIds);
+            }
+            // Emitted once the command's message was accepted (/compact).
+            if (options?.reviews) warnIfReviewsUnavailable(options.reviews);
+            break;
+          case "message-sent":
+            if (variant === "workspace") props.onMessageSent?.(action.dispatchMode);
+            break;
+          case "cancel-edit":
+            // Emitted once an editing command (/compact) was accepted: the edit is complete.
+            restoredPreEditDraft = restorePreEditDraftAfterSend(commandEditSession, true);
+            if (isOpenEditOrNone(commandEditSession)) commandOnCancelEdit?.();
+            break;
+          case "edit-history-changed":
+            startEditTranscriptRefresh(action.editMessageId, action.precondition);
+            break;
         }
-        props.onMessageSent?.(dispatchMode);
       }
+    };
+
+    let result = await processSlashCommand(parsed, commandEnv);
+    while (result.kind === "phase") {
+      applyCommandActions(result.actions);
+      result = await result.continue();
+    }
+    applyCommandActions(result.actions);
+    if (result.backgroundTask) {
+      void result.backgroundTask().then(applyCommandActions);
+    }
+
+    switch (result.inputDisposition) {
+      case "consume":
+        // Commands clear the composer through their own clear-input actions;
+        // clearing again here would wipe a draft typed while phases ran.
+        if (!restoredPreEditDraft) setDraftReviews(null);
+        break;
+      case "restore":
+        setInput(restoreInput);
+        break;
+      case "restore-if-empty":
+        // Async phases can outlive the invoking render, so check the live
+        // draft: the getDraft closure captured here still reports
+        // this render's input and would refuse to restore over a newer draft.
+        if (draft.getLiveText().trim().length === 0) {
+          setInput(restoreInput);
+        } else {
+          setDraftReviews(null);
+        }
+        break;
     }
 
     return true;
@@ -2513,157 +2241,154 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setPendingDestructiveCommand(false);
   }, []);
 
-  // Handle drag over to allow drop
-  const handleDragOver = useCallback(
-    (e: React.DragEvent<HTMLTextAreaElement>) => {
-      // Check if drag contains files
-      if (e.dataTransfer.types.includes("Files")) {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = editingMessageForUi ? "none" : "copy";
-      }
-    },
-    [editingMessageForUi]
-  );
+  /**
+   * Conflict recovery after a `history-changed` refusal: one logical transcript refresh whose
+   * outcome updates the parent-owned editing state. Nothing here re-sends — the user's next
+   * explicit Send carries the refreshed candidate unchanged. Escape (cancel editing) stays
+   * available throughout and cancels the request through the editing-state owner.
+   */
+  const startEditTranscriptRefresh = (
+    editMessageId: string,
+    precondition: HistoryEditPrecondition
+  ): void => {
+    if (variant !== "workspace") return;
+    const targetWorkspaceId = props.workspaceId;
+    const onEditingMessageChange = props.onEditingMessageChange;
+    const onCancelEdit = props.onCancelEdit;
+    const patchEditing = (
+      patch: Pick<EditingMessageState, "preconditionInvalidated" | "pendingReconfirmation">
+    ) =>
+      onEditingMessageChange?.((current) =>
+        current.id === editMessageId ? { ...current, ...patch } : current
+      );
 
-  // Handle drop to extract attachments
-  const handleDrop = useCallback(
-    (e: React.DragEvent<HTMLTextAreaElement>) => {
-      e.preventDefault();
+    // Every outcome and the retry affordance are scoped to THIS edit: once the user cancels it
+    // or edits another row, a late outcome or a stale toast must not touch the new edit.
+    const isSameEdit = () => editingMessageIdRef.current === editMessageId;
 
-      const attachmentFiles = extractAttachmentsFromDrop(e.dataTransfer);
-      if (attachmentFiles.length === 0) return;
-
-      if (editingMessageForUi) {
-        pushToast({
-          type: "error",
-          message: EDIT_MODE_ATTACHMENT_ERROR_MESSAGE,
-        });
-        return;
-      }
-
-      attachFiles(attachmentFiles);
-    },
-    [attachFiles, editingMessageForUi, pushToast]
-  );
-
-  // Handle suggestion selection
-
-  const handleAtMentionSelect = useCallback(
-    (suggestion: SlashSuggestion) => {
-      const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-      const match = findAtMentionAtCursor(input, cursor);
-      if (!match) {
-        return;
-      }
-
-      // Add trailing space so user can continue typing naturally
-      const next =
-        input.slice(0, match.startIndex) +
-        suggestion.replacement +
-        " " +
-        input.slice(match.endIndex);
-
-      setInput(next);
-      setAtMentionSuggestions(clearSuggestions);
-      setShowAtMentionSuggestions(false);
-
-      requestAnimationFrame(() => {
-        const el = inputRef.current;
-        if (!el || el.disabled) {
-          return;
+    patchEditing({ preconditionInvalidated: true, pendingReconfirmation: undefined });
+    setEditRefreshRetry(null);
+    store
+      .requestTranscriptRefresh(targetWorkspaceId, {
+        throughSequence: precondition.rangeStartHistorySequence,
+        editMessageId,
+      })
+      .then((outcome) => {
+        // The editing state lives in the parent, so its updates apply even if this composer
+        // instance remounted meanwhile; only this instance's toasts need the mount guard.
+        switch (outcome.kind) {
+          case "refreshed":
+            patchEditing({
+              preconditionInvalidated: false,
+              pendingReconfirmation: outcome.candidate,
+            });
+            return;
+          case "target-not-found":
+            if (!isSameEdit()) return;
+            // Leave edit mode without restoring the pre-edit draft: the typed text stays in
+            // the composer as a normal draft.
+            onCancelEdit?.();
+            if (isMountedRef.current) {
+              pushToast({ type: "error", message: EDIT_TARGET_GONE_MESSAGE });
+            }
+            return;
+          case "failed":
+            // Draft and invalidated state stay; a failure is never read as exhausted history.
+            if (!isMountedRef.current || !isSameEdit()) return;
+            setEditRefreshRetry({ editMessageId, precondition });
+            setToast({
+              id: Date.now().toString(),
+              type: "error",
+              title: "Transcript refresh failed",
+              message: outcome.error,
+              solution: (
+                <button
+                  type="button"
+                  onClick={() => {
+                    // The toast belongs to the failed attempt: clear it before retrying so a
+                    // successful retry does not leave a stale failure (and its retry button)
+                    // behind. It can also outlive the edit; a click then only clears it.
+                    setToast(null);
+                    if (!isSameEdit()) return;
+                    startEditTranscriptRefresh(editMessageId, precondition);
+                  }}
+                  className="text-muted hover:text-accent-text cursor-pointer border-0 bg-transparent p-0 text-[10px] underline transition-colors"
+                >
+                  {EDIT_RETRY_REFRESH_LABEL}
+                </button>
+              ),
+            });
+            return;
+          case "superseded":
+          case "cancelled":
+            return;
         }
-
-        el.focus();
-        // +1 for the trailing space we added
-        const newCursor = match.startIndex + suggestion.replacement.length + 1;
-        el.selectionStart = newCursor;
-        el.selectionEnd = newCursor;
+      })
+      .catch((error: unknown) => {
+        if (!isMountedRef.current) return;
+        console.error("Transcript refresh failed:", error);
+        setToast(
+          createErrorToast({
+            type: "unknown",
+            raw: error instanceof Error ? error.message : "Transcript refresh failed",
+          })
+        );
       });
-    },
-    [input, setInput]
-  );
-  const handleSkillSelect = useCallback(
-    (suggestion: SlashSuggestion) => {
-      const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-      const match = findInlineSkillReferenceAtCursor(input, cursor);
-      if (!match) {
-        return;
-      }
+  };
 
-      // Add a separating space only when the following text does not already provide one.
-      const after = input.slice(match.endIndex);
-      const trailing = getInlineSkillInsertionTrailingText(after);
-      const next = input.slice(0, match.startIndex) + suggestion.replacement + trailing + after;
-
-      setInput(next);
-      setSkillSuggestions(clearSuggestions);
-      setShowSkillSuggestions(false);
-      lastSkillQueryRef.current = null;
-
-      requestAnimationFrame(() => {
-        const el = inputRef.current;
-        if (!el || el.disabled) {
-          return;
-        }
-
-        el.focus();
-        const newCursor = match.startIndex + suggestion.replacement.length + trailing.length;
-        el.selectionStart = newCursor;
-        el.selectionEnd = newCursor;
-      });
-    },
-    [input, setInput]
-  );
-
-  const handleCommandSelect = useCallback(
-    (suggestion: SlashSuggestion) => {
-      setInput(suggestion.replacement);
-      setShowCommandSuggestions(false);
-      inputRef.current?.focus();
-    },
-    [setInput]
-  );
-
-  const handleSymbolSelect = useCallback(
-    (suggestion: SlashSuggestion) => {
-      const cursor = Math.min(inputRef.current?.selectionStart ?? input.length, input.length);
-      const match = findSymbolCommandAtCursor(input, cursor);
-      if (!match) {
-        return;
-      }
-
-      // Replace the whole `\name` token with the symbol; no trailing space so the
-      // user can keep typing (e.g. another symbol, an exponent, or a number).
-      const next =
-        input.slice(0, match.startIndex) + suggestion.replacement + input.slice(match.endIndex);
-
-      setInput(next);
-      setSymbolSuggestions(clearSuggestions);
-      setShowSymbolSuggestions(false);
-
-      requestAnimationFrame(() => {
-        const el = inputRef.current;
-        if (!el || el.disabled) {
-          return;
-        }
-
-        el.focus();
-        const newCursor = match.startIndex + suggestion.replacement.length;
-        el.selectionStart = newCursor;
-        el.selectionEnd = newCursor;
-      });
-    },
-    [input, setInput]
-  );
-
+  // An edit send and a new edit never overlap (#5226): the transcript refuses to start an edit
+  // until the edit send settles, successfully or not.
   const handleSend = async (overrides?: InternalSendOverrides) => {
+    const onEditSendPendingChange =
+      variant === "workspace" && editingMessageForUi ? props.onEditSendPendingChange : undefined;
+    onEditSendPendingChange?.(true);
+    // #6405: the composer stays on from Enter for a plain message.
+    const releaseTyping = typingLock.keepTypingOn(input);
+    await runWithFinally(
+      () => sendComposerInput(overrides),
+      () => {
+        releaseTyping();
+        onEditSendPendingChange?.(false);
+      }
+    );
+  };
+  const sendComposerInput = async (overrides?: InternalSendOverrides) => {
+    // Checked before `canSend` (which also carries the barrier) so a refused Enter on a real
+    // draft explains itself instead of silently doing nothing. Reads the live store rather
+    // than the render-time prop so a keybind racing a workspace switch sees current state.
+    // Slash commands (/clear, /reset, /compact, edits) all enter through here as well.
+    if (
+      variant === "workspace" &&
+      hasSendableDraft &&
+      !draftBypassesTranscriptBarrier &&
+      !isTranscriptMutationAllowed(props.workspaceId)
+    ) {
+      pushToast({ type: "error", message: transcriptBarrierMessage(liveApiRef.current == null) });
+      return;
+    }
     if (!canSend) {
+      return;
+    }
+    if (!draft.payloadsLoaded) {
+      // Hydrated drafts carry attachment metadata only; sending now would drop the attachments.
+      pushToast({ type: "info", message: "Draft attachments are still loading. Try again." });
+      getDraftStore()
+        .ensurePayloads(draftScope)
+        .catch((error: unknown) => console.warn("Failed to load draft attachments:", error));
       return;
     }
 
     closeSendModeMenu();
+    // #6405: past the send gate only, so a refused Enter never moves the mark of a send in flight.
+    getDraftStore().markSendStart(draftScope, input);
 
-    const messageText = input.trim();
+    const trimmedInput = input.trim();
+    // #5695: a plain message keeps its first line's indentation (pasted code). Only leading
+    // blank lines and trailing whitespace go. Slash commands keep the fully trimmed text, so
+    // their parsing and stored rawCommand do not change.
+    const messageText = trimmedInput.startsWith("/")
+      ? trimmedInput
+      : input.replace(/^(?:[^\S\r\n]*\r?\n)+/, "").trimEnd();
     const skillDiscovery: SkillResolutionTarget | null =
       variant === "creation"
         ? atMentionProjectPath
@@ -2673,72 +2398,116 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           ? {
               kind: "workspace",
               workspaceId,
-              disableWorkspaceAgents:
-                sendMessageOptions.disableWorkspaceAgents === true ||
-                transferredDraftProjectDiscovery,
+              disableWorkspaceAgents: transferredDraftProjectDiscovery,
             }
           : null;
+    // Captured before command resolution so the row the new workspace opens with shows what was
+    // typed (skill sends are rewritten below) and is stamped with the Send time. Same routing as
+    // the creation branch below: an initial /goal without attachments sets a goal instead of
+    // sending a user turn, so it gets no row.
+    const creationFileParts = variant === "creation" ? chatAttachmentsToFileParts(attachments) : [];
+    const creationPendingUserMessage: PendingInitialUserMessage | null =
+      variant === "creation" &&
+      !(parseCommand(messageText)?.type === "goal-set" && attachments.length === 0)
+        ? {
+            content: messageText.length > 0 ? messageText : creationNameMessage,
+            fileParts: creationFileParts.length > 0 ? creationFileParts : undefined,
+            timestamp: Date.now(),
+          }
+        : null;
     // Resolving commands/references can include cold MCP server startup and
     // prompt discovery; mark the send in flight so a second Enter cannot start
     // a duplicate send against the same captured draft.
     setSendingCount((c) => c + 1);
-    sendResolutionAbortRef.current ??= new AbortController();
-    const resolutionSignal = sendResolutionAbortRef.current.signal;
+    const resolutionController = sendResolutionAbortRef.current ?? new AbortController();
+    sendResolutionAbortRef.current = resolutionController;
+    const resolutionSignal = resolutionController.signal;
     const isSendScopeCurrent = () =>
       !resolutionSignal.aborted &&
       asyncCommandScopeRef.current.variant === variant &&
       asyncCommandScopeRef.current.workspaceId === workspaceId;
-    let parsed: ParsedCommand;
-    let skillInvocation: SkillInvocation | null;
-    let mcpPromptInvocation: MCPPromptInvocation | null;
-    let combinedSkillRefs: AgentSkillReference[];
-    let mcpPromptRefsResult: Awaited<ReturnType<typeof resolveMcpPromptRefsForSend>>;
-    try {
-      const resolution = await parseCommandWithSkillInvocation({
-        messageText,
-        agentSkillDescriptors,
-        mcpPromptDescriptors,
-        api,
-        discovery: skillDiscovery,
-        signal: resolutionSignal,
-      });
-      if (!isSendScopeCurrent()) return;
-      parsed = resolution.parsed;
-      skillInvocation = resolution.skillInvocation;
-      mcpPromptInvocation = resolution.mcpPromptInvocation;
-      if (resolution.error) {
-        pushToast({ type: "error", message: resolution.error });
-        return;
-      }
-      const inlineReferenceCandidates = extractInlineSkillReferenceCandidates(messageText);
-      [combinedSkillRefs, mcpPromptRefsResult] = await Promise.all([
-        resolveInlineSkillRefsForSend({
+    const resolved = await runWithFinally(
+      async () => {
+        const resolution = await parseCommandWithSkillInvocation({
           messageText,
-          slashInvocation: skillInvocation,
           agentSkillDescriptors,
-          api,
+          mcpPromptDescriptors,
+          api: liveApi,
           discovery: skillDiscovery,
-          candidates: inlineReferenceCandidates,
-        }),
-        resolveMcpPromptRefsForSend({
-          messageText,
-          slashInvocation: mcpPromptInvocation,
-          descriptors: mcpPromptDescriptors,
-          api,
-          discovery: skillDiscovery,
-          candidates: inlineReferenceCandidates,
           signal: resolutionSignal,
-        }),
-      ]);
-      if (!isSendScopeCurrent()) return;
-      if (mcpPromptRefsResult.error) {
-        pushToast({ type: "error", message: mcpPromptRefsResult.error });
-        return;
-      }
-    } finally {
-      setSendingCount((c) => c - 1);
+        });
+        if (!isSendScopeCurrent()) return null;
+        if (resolution.error) {
+          pushToast({ type: "error", message: resolution.error });
+          return null;
+        }
+        const inlineReferenceCandidates = extractInlineSkillReferenceCandidates(messageText);
+        const [skillRefs, mcpPromptRefs] = await Promise.all([
+          resolveInlineSkillRefsForSend({
+            messageText,
+            slashInvocation: resolution.skillInvocation,
+            agentSkillDescriptors,
+            api: liveApi,
+            discovery: skillDiscovery,
+            candidates: inlineReferenceCandidates,
+          }),
+          resolveMcpPromptRefsForSend({
+            messageText,
+            slashInvocation: resolution.mcpPromptInvocation,
+            descriptors: mcpPromptDescriptors,
+            api: liveApi,
+            discovery: skillDiscovery,
+            candidates: inlineReferenceCandidates,
+            signal: resolutionSignal,
+          }),
+        ]);
+        if (!isSendScopeCurrent()) return null;
+        if (mcpPromptRefs.error) {
+          pushToast({ type: "error", message: mcpPromptRefs.error });
+          return null;
+        }
+        // Before any command runs, so commands and normal sends both get hydrated notes; inside
+        // this in-flight window so a second Enter cannot start a duplicate send meanwhile.
+        const reviewsForSend = await readReviewsForSend();
+        if (!isSendScopeCurrent()) return null;
+        return {
+          reviewsForSend,
+          parsed: resolution.parsed,
+          skillInvocation: resolution.skillInvocation,
+          mcpPromptInvocation: resolution.mcpPromptInvocation,
+          combinedSkillRefs: skillRefs,
+          combinedMcpPromptRefs: mcpPromptRefs.refs,
+        };
+      },
+      () => setSendingCount((c) => c - 1)
+    );
+    if (!resolved) return;
+    const {
+      reviewsForSend,
+      parsed,
+      skillInvocation,
+      mcpPromptInvocation,
+      combinedSkillRefs,
+      combinedMcpPromptRefs,
+    } = resolved;
+
+    // The barrier is re-checked here, after the resolution awaits and before any command runs:
+    // a reconnect can close it meanwhile, and handled commands (/compact, /fork, workflow
+    // starts, refinement actions) return before the plain-send re-check further down. Same
+    // bypass rule as the render-time term, evaluated on the RESOLVED command.
+    const refusal = sendRefusalToast({
+      parsed,
+      workspaceVariant: variant === "workspace",
+      // Only a workspace composer has a transcript (and a workspaceId) to wait for.
+      transcriptAllowed: variant !== "workspace" || isTranscriptMutationAllowed(props.workspaceId),
+      offline: liveApiRef.current == null,
+      attachmentCount: attachments.length,
+      skillRefs: combinedSkillRefs,
+    });
+    if (refusal) {
+      pushToast(refusal);
+      return;
     }
-    const combinedMcpPromptRefs = mcpPromptRefsResult.refs;
 
     // Route to creation handler for creation variant
     if (variant === "creation") {
@@ -2748,7 +2517,9 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const goalCommandBypassedForAttachments =
         parsed?.type === "goal-set" && attachments.length > 0;
       const initialSlashCommand =
-        parsed?.type === "goal-set" && !goalCommandBypassedForAttachments ? parsed : undefined;
+        parsed?.type === "goal-set" && !goalCommandBypassedForAttachments
+          ? { ...parsed, typedText: messageText }
+          : undefined;
       if (
         !initialSlashCommand &&
         !goalCommandBypassedForAttachments &&
@@ -2765,7 +2536,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       let creationOptionsOverride: Partial<SendMessageOptions> | undefined;
 
       if (skillInvocation) {
-        if (!api) {
+        if (!liveApi) {
           pushToast({ type: "error", message: "Not connected to server" });
           return;
         }
@@ -2807,14 +2578,14 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       }
 
       // Creation variant: simple message send + workspace creation
-      const creationFileParts = chatAttachmentsToFileParts(attachments);
       const creationPendingFiles = getPendingFileAttachments(attachments);
       const creationResult = await creationState.handleSend(
         creationMessageTextForSend,
         creationFileParts.length > 0 ? creationFileParts : undefined,
         creationOptionsOverride,
         initialSlashCommand,
-        creationPendingFiles.length > 0 ? creationPendingFiles : undefined
+        creationPendingFiles.length > 0 ? creationPendingFiles : undefined,
+        creationPendingUserMessage ?? undefined
       );
 
       if (creationResult.success) {
@@ -2849,7 +2620,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return;
     }
 
-    try {
+    const runWorkspaceSend = async () => {
       const modelOneShot = parsed?.type === "model-oneshot" ? parsed : null;
       // Mirror the creation-composer /goal bypass: with attachments present,
       // send the raw text as a normal message instead of processing the
@@ -2863,6 +2634,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           : await executeParsedCommand(parsed, input, {
               goalInterventionPolicy: overrides?.goalInterventionPolicy,
               queueDispatchMode: overrides?.queueDispatchMode,
+              reviews: reviewsForSend,
             });
       if (commandHandled) {
         return;
@@ -2882,7 +2654,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         mcpPromptInvocation?.userText ??
         messageText;
 
-      if (!api) {
+      if (!liveApi) {
         pushToast({ type: "error", message: "Not connected to server" });
         return;
       }
@@ -2893,7 +2665,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       let sendAttachments = attachments;
       const pendingFilesForSend = getPendingFileAttachments(attachments);
       if (pendingFilesForSend.length > 0) {
-        const stagingOutcome = await stagePendingFiles(api, props.workspaceId, pendingFilesForSend);
+        const stagingOutcome = await stagePendingFiles(
+          liveApi,
+          props.workspaceId,
+          pendingFilesForSend
+        );
         if (stagingOutcome.staged.length > 0) {
           sendAttachments = replacePendingFilesWithStaged(attachments, stagingOutcome.staged);
           // Swap staged chips into the composer so a later failure or retry
@@ -2932,11 +2708,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const policyModel = modelOverride ?? baseModel;
 
       // Preflight: if the message includes PDFs, ensure the selected model can accept them.
-      const pdfAttachments = attachments.filter(
-        (attachment): attachment is Extract<ChatAttachment, { kind: "provider" }> =>
-          attachment.kind === "provider" &&
-          getBaseMediaType(attachment.mediaType) === PDF_MEDIA_TYPE
-      );
+      const pdfAttachments = attachments.filter(isPdfAttachment);
       if (pdfAttachments.length > 0) {
         const caps = getModelCapabilitiesResolved(policyModel, providersConfig);
         if (caps && !caps.supportsPdfInput) {
@@ -2977,12 +2749,45 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           }
         }
       }
-      // Save current draft state for restoration on error
-      const preSendDraft = { ...getDraft(), attachments: sendAttachments };
+      // What this send took out of the composer, until it settles. A failed send puts it back
+      // merged with what the composer holds by then, never replacing it: text another window
+      // typed or a restore put in meanwhile stays (#5226 item 12).
+      // Null when the send failed before taking anything (nothing to put back) or succeeded.
+      let taken: { text: string } | null = null;
+      let releaseTakenDraft: () => void = () => undefined;
+      const putBackTaken = () => {
+        if (taken === null) return;
+        const { text } = taken;
+        taken = null;
+        // Put the text back unless the composer holds it again as a whole block: the clear can
+        // miss (the draft was replaced while the send was prepared), or the text can come back
+        // after it (another window that still held it saved it, #5501). A match inside a longer
+        // line is the user's own text, so the sent text comes back beside it: a duplicate
+        // beats a loss.
+        setInput((current) =>
+          hasDraftBlock(current, text) ? current : joinDraftText(text, current)
+        );
+        // On an id match the sent copy wins: it may be the staged version of a file that
+        // another window saved again as pending (#5501), and a retry must not stage it twice.
+        setAttachments((current) => {
+          const sentById = new Map(
+            sendAttachments.map((attachment) => [attachment.id, attachment])
+          );
+          const currentIds = new Set(current.map(({ id }) => id));
+          const missing = sendAttachments.filter(({ id }) => !currentIds.has(id));
+          const merged = current.map((attachment) => sentById.get(attachment.id) ?? attachment);
+          const changed = merged.some((attachment, index) => attachment !== current[index]);
+          return missing.length > 0 || changed ? [...missing, ...merged] : current;
+        });
+      };
       const preSendReviews = draftReviews;
       const editMessageForSend = editingMessageForUi;
+      const editSessionForSend =
+        editMessageForSend && editSessionRef.current?.id === editMessageForSend.id
+          ? editSessionRef.current
+          : null;
 
-      try {
+      const sendPreparedMessage = async () => {
         // Prepare file parts if any
         const fileParts = chatAttachmentsToFileParts(sendAttachments, { validate: true });
         const sendFileParts = editMessageForSend
@@ -2991,30 +2796,32 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             ? fileParts
             : undefined;
 
-        // Prepare reviews data (used for both compaction continueMessage and normal send)
-        const reviewsData = reviewData;
+        // Prepare reviews data (used for both compaction continueMessage and normal send),
+        // read after hydration by readReviewsForSend.
+        const reviewsData = reviewsForSend.data;
+        const reviewIdsToCheck = reviewsForSend.ids;
 
         // When editing a /compact command, regenerate the actual summarization request
         let actualMessageText = messageTextForSend;
         let muxMetadata: MuxMessageMetadata | undefined = skillMuxMetadata ?? promptMuxMetadata;
-        if (combinedSkillRefs.length > 0) {
-          muxMetadata = withAgentSkillRefs(muxMetadata, combinedSkillRefs);
-        }
-        if (combinedMcpPromptRefs.length > 0) {
-          muxMetadata = withMcpPromptRefs(muxMetadata, combinedMcpPromptRefs);
-        }
         let compactionOptions: Partial<SendMessageOptions> = {};
 
         let appendStagedNoticeToUserMessage = true;
         if (editMessageForSend && actualMessageText.startsWith("/")) {
           const parsed = parseCommand(messageText);
           if (parsed?.type === "compact") {
+            // Inline refs ride the follow-up message so their snapshots
+            // materialize after compaction, not on the summarization turn.
+            const followUpMuxMetadata = withMcpPromptRefs(
+              withAgentSkillRefs(undefined, combinedSkillRefs),
+              combinedMcpPromptRefs
+            );
             const {
               messageText: regeneratedText,
               metadata,
               sendOptions,
             } = prepareCompactionMessage({
-              api,
+              api: liveApi,
               workspaceId: props.workspaceId,
               maxOutputTokens: parsed.maxOutputTokens,
               // Include current attachments + reviews in followUpContent so they're queued
@@ -3023,7 +2830,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                 parsed.continueMessage ||
                 sendFileParts?.length ||
                 reviewsData?.length ||
-                getStagedAttachments(sendAttachments).length
+                getStagedAttachments(sendAttachments).length ||
+                followUpMuxMetadata
                   ? {
                       text: appendStagedAttachmentNotice(
                         parsed.continueMessage ?? "",
@@ -3031,6 +2839,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       ),
                       fileParts: sendFileParts,
                       reviews: reviewsData,
+                      ...(followUpMuxMetadata ? { muxMetadata: followUpMuxMetadata } : {}),
                     }
                   : undefined,
               model: parsed.model,
@@ -3043,51 +2852,126 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           }
         }
 
-        const userMessageText = appendStagedNoticeToUserMessage
-          ? appendStagedAttachmentNotice(actualMessageText, sendAttachments)
-          : actualMessageText;
-        const { finalText: finalMessageText, metadata: reviewMetadata } = prepareUserMessageForSend(
-          { text: userMessageText, reviews: reviewsData },
-          muxMetadata
+        const preparedMessage = prepareMessagePayload({
+          messageText,
+          messageTextForSend,
+          attachments: sendAttachments,
+          fileParts,
+          reviews: reviewsData,
+          reviewIds: reviewIdsToCheck,
+          editMessageId: editMessageForSend?.id,
+          // The refreshed candidate is sent exactly as handed back; nothing is re-captured here.
+          historyEditPrecondition: editMessageForSend
+            ? getEditSendPrecondition(editMessageForSend)
+            : undefined,
+          baseMetadata: muxMetadata,
+          agentSkillRefs: combinedSkillRefs,
+          mcpPromptRefs: combinedMcpPromptRefs,
+          sendMessageOptions,
+          compactionOptions,
+          compactionMessageText: actualMessageText,
+          appendStagedNotice: appendStagedNoticeToUserMessage,
+          modelOneShot,
+          policyModel,
+          transferredDraftProjectDiscovery,
+          additionalSystemContextHydrated,
+          additionalSystemContext,
+          goalInterventionPolicy: overrides?.goalInterventionPolicy,
+          queueDispatchMode: overrides?.queueDispatchMode,
+        });
+        const finalMessageText = preparedMessage.message;
+        const effectiveModel = preparedMessage.effectiveModel;
+        // Attach deliberate picks only while the sent values still equal them; the backend
+        // pins those fields on sub-agents so later reawakenings keep the user's choice.
+        const intentAgentId =
+          preparedMessage.options.agentId ?? agentId ?? WORKSPACE_DEFAULTS.agentId;
+        const aiSelection = getAiSelectionIntentForSendOptions(
+          props.workspaceId,
+          intentAgentId,
+          preparedMessage.options
         );
-        // When editing /compact, compactionOptions already includes the base sendMessageOptions.
-        // Avoid duplicating additionalSystemInstructions.
-        const additionalSystemInstructions =
-          compactionOptions.additionalSystemInstructions ??
-          sendMessageOptions.additionalSystemInstructions;
+        const sendOptions = aiSelection.intent
+          ? { ...preparedMessage.options, aiSelectionIntent: aiSelection.intent }
+          : preparedMessage.options;
+        const sentReviewIds = preparedMessage.sentReviewIds;
 
-        muxMetadata = reviewMetadata;
-
-        const effectiveModel = modelOverride ?? compactionOptions.model ?? sendMessageOptions.model;
-        // For one-shot overrides, store the original input as rawCommand so the
-        // command prefix (e.g., "/opus+high") stays visible in the user message.
-        const oneshotCommandPrefix = modelOneShot
-          ? messageText
-              .trim()
-              .slice(0, messageText.trim().length - modelOneShot.message.length)
-              .trimEnd()
-          : undefined;
-        const oneshotRawCommand = oneshotCommandPrefix
-          ? appendStagedAttachmentNotice(messageText.trim(), sendAttachments)
-          : undefined;
-        muxMetadata = muxMetadata
-          ? {
-              ...muxMetadata,
-              requestedModel: effectiveModel,
-              ...(oneshotRawCommand
-                ? { rawCommand: oneshotRawCommand, commandPrefix: oneshotCommandPrefix }
-                : {}),
+        // The backend reads this model's auto-compaction threshold from persisted user
+        // preferences when the stream starts, and the slider write reaches config.json
+        // asynchronously. Wait for the backend to accept that write so a send right after a
+        // slider change is not ordered ahead of it; a rejected save refuses the send visibly
+        // and leaves the draft untouched. (Since #4444 a failed disk write rejects too, so
+        // acceptance also means the preference landed.)
+        const preferencePersisted = await runWithCatch(
+          async () => {
+            await flushUserPreferences();
+            return true;
+          },
+          (error) => {
+            if (isSendScopeCurrent()) {
+              setToast(
+                createErrorToast({
+                  type: "unknown",
+                  raw: error instanceof Error ? error.message : "Settings could not be saved",
+                })
+              );
             }
-          : {
-              type: "normal",
-              requestedModel: effectiveModel,
-              ...(oneshotRawCommand
-                ? { rawCommand: oneshotRawCommand, commandPrefix: oneshotCommandPrefix }
-                : {}),
-            };
+            return false;
+          }
+        );
+        if (!preferencePersisted || !isSendScopeCurrent()) return;
 
-        // Capture review IDs before clearing (for marking as checked on success)
-        const sentReviewIds = reviewIdsForCheck;
+        // Last re-check before anything is cleared or sent: command/skill/MCP resolution and
+        // the persistence wait above are async, and the transcript can stop being current in
+        // the meantime (switch, reconnect). Draft, attachments and edit state stay intact; the
+        // outer `finally` releases sendingCount.
+        if (!isTranscriptMutationAllowed(props.workspaceId)) {
+          pushToast({
+            type: "error",
+            message: transcriptBarrierMessage(liveApiRef.current == null),
+          });
+          return;
+        }
+
+        // Idempotent sends: every send carries an id minted here; a retry reuses it with the same
+        // request, so the backend never appends it twice. Not covered (they carry no client id; the
+        // backend mints one): chatCommands.ts sends (/compact and friends) and the creation flow.
+        const sendId = createSendId();
+        // An edit keeps today's put-back: its pre-edit draft lives only in memory, so it gets no
+        // pending-send entry. Every other send keeps its text and attachments in the durable
+        // draft until the backend answers for its id.
+        const tracksSend = editMessageForSend == null;
+        const sendScope = { kind: "workspace" as const, workspaceId: props.workspaceId };
+        if (tracksSend) {
+          // The exact request, for retries (also after a reload); file parts are rebuilt from
+          // the retained attachments, so they are not stored twice.
+          const {
+            fileParts: _fileParts,
+            editMessageId: _editMessageId,
+            historyEditPrecondition: _historyEditPrecondition,
+            unfencedEdit: _unfencedEdit,
+            sendId: _sendId,
+            ...requestOptions
+          } = sendOptions;
+          try {
+            // The one durable draft write before the send: the composer hides what it took,
+            // and the draft keeps it until the backend answers for the id.
+            await getDraftStore().beginSend(sendScope, {
+              sendId,
+              text: input,
+              attachments: sendAttachments,
+              request: { message: finalMessageText, options: requestOptions },
+            });
+          } catch (error) {
+            // Nothing was taken or sent: the draft is as it was.
+            setToast(
+              createErrorToast({
+                type: "unknown",
+                raw: error instanceof Error ? error.message : "The draft could not be saved",
+              })
+            );
+            return;
+          }
+        }
 
         if (editMessageForSend) {
           setOptimisticallyDismissedEditId(editMessageForSend.id);
@@ -3096,73 +2980,102 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         // Clear input, images, and hide reviews immediately for responsive UI
         // Text/images are restored if send fails; reviews remain "attached" in state
         // so they'll reappear naturally on failure (we only call onCheckReviews on success)
-        setInput("");
-        setDraftReviews(null);
-        setAttachments([]);
+        // Clear only what this send took: a draft restored meanwhile (an edit completing while
+        // this send resolved its options) stays in the composer (#5226).
+        const sentAttachmentIds = new Set([...attachments, ...sendAttachments].map(({ id }) => id));
+        if (!tracksSend) {
+          // An edit send has no beginSend, which takes the mark of every other send (#6729).
+          // Read before the update below: takeSendMark ends the mark.
+          const take = getDraftStore().takeSendMark(draftScope, input);
+          setInput((current) => takeSentText(current, input, take));
+          taken = { text: input };
+        }
+        // Likewise for notes: drop the override this send captured, keeping notes an edit's
+        // completion put into it meanwhile.
+        setDraftReviews((current) => {
+          if (current === null || current === preSendReviews) return null;
+          const remaining = current.filter((review) => !preSendReviews?.includes(review));
+          return remaining.length > 0 ? remaining : null;
+        });
+        if (!tracksSend) {
+          setAttachments((current) => current.filter(({ id }) => !sentAttachmentIds.has(id)));
+        }
         setHideReviewsDuringSend(true);
         // Clear inline height style - VimTextArea's useLayoutEffect will handle sizing
         if (inputRef.current) {
           inputRef.current.style.height = "";
         }
-
-        // One-shot models/thinking shouldn't update the persisted session defaults.
-        // Resolve thinking level: numeric indices are model-relative (0 = model's lowest allowed level)
-        const rawThinkingOverride = modelOneShot?.thinkingLevel;
-        const thinkingOverride =
-          rawThinkingOverride != null
-            ? resolveThinkingInput(rawThinkingOverride, policyModel)
-            : undefined;
-        const goalInterventionPolicy = overrides?.goalInterventionPolicy;
-
-        const sendOptions = {
-          ...sendMessageOptions,
-          ...compactionOptions,
-          // Match the original creation send: project-scoped skill refs must
-          // resolve from the project path, not the new worktree.
-          ...(transferredDraftProjectDiscovery && hasProjectScopedSkillRef(combinedSkillRefs)
-            ? { disableWorkspaceAgents: true }
-            : {}),
-          ...(modelOverride ? { model: modelOverride } : {}),
-          ...(thinkingOverride ? { thinkingLevel: thinkingOverride } : {}),
-          ...(modelOneShot ? { skipAiSettingsPersistence: true } : {}),
-          ...(goalInterventionPolicy ? { goalInterventionPolicy } : {}),
-          ...(overrides?.queueDispatchMode
-            ? { queueDispatchMode: overrides.queueDispatchMode }
-            : {}),
-          // Honor the per-workspace "Chat Instructions" toggle: when the user
-          // has disabled the scratchpad, send an empty string so the backend
-          // doesn't fall back to reading the durable content from disk.
-          ...(additionalSystemContextHydrated
-            ? {
-                additionalSystemContext: additionalSystemContext.enabled
-                  ? additionalSystemContext.content
-                  : "",
-              }
-            : {}),
-          additionalSystemInstructions,
-          editMessageId: editMessageForSend?.id,
-          fileParts: sendFileParts,
-          muxMetadata,
-        };
+        // The draft is out of the composer: typing can resume (#6259).
+        releaseTakenDraft = typingLock.markDraftTaken(input);
 
         props.onMessageSendStarted?.(overrides?.queueDispatchMode ?? "tool-end");
 
-        const result = await api.workspace.sendMessage({
-          workspaceId: props.workspaceId,
-          message: finalMessageText,
-          options: sendOptions,
-        });
+        let result: Awaited<ReturnType<typeof liveApi.workspace.sendMessage>> | undefined;
+        let thrown: unknown;
+        try {
+          result = await liveApi.workspace.sendMessage({
+            workspaceId: props.workspaceId,
+            message: finalMessageText,
+            options: { ...sendOptions, sendId },
+          });
+        } catch (error) {
+          thrown = error;
+        }
+        // A failed reply does not mean the backend did not take the message: only the
+        // backend's answer for the id decides. Never inferred from the transcript text.
+        let accepted = result?.success === true;
+        if (tracksSend) {
+          // Resolves the draft entry too: accepted drops the retained text, not accepted makes it
+          // visible again, pending (queued or held) keeps it until its row.
+          const outcome = await getDraftStore()
+            .settleSend(sendScope, sendId)
+            .catch((): SendOutcome => "unresolved");
+          // A lost reply of a send the backend queued or runs is its send all the same. (An Ok
+          // reply stays a sent message even when the queue was cleared before the lookup: the
+          // clear restored it with its notes, a queue edit or Stop restore, so the notes this
+          // send took are checked off as for any queued send; its text comes back through its
+          // draft entry.)
+          if (outcome === "accepted" || outcome === "pending") accepted = true;
+        } else if (!accepted) {
+          accepted = await isEditSendAccepted(liveApi, props.workspaceId, sendId);
+        }
 
-        if (!result.success) {
+        if (!accepted) {
+          if (result === undefined) throw thrown;
+          assert(!result.success, "a successful send counts as accepted");
           // Log error for debugging
           console.error("Failed to send message:", result.error);
           // Show error using enhanced toast
-          setToast(createErrorToast(result.error));
-          // Restore draft on error so user can try again
+          const failureToast = createErrorToast(result.error);
+          setToast(failureToast);
+          // Restore draft on error so user can try again (a tracked send's text comes back
+          // through its draft entry instead)
           setOptimisticallyDismissedEditId(null);
-          setDraft(preSendDraft);
+          putBackTaken();
           setDraftReviews(preSendReviews);
+          // The rows this edit would delete changed after its evidence was captured. Stay in
+          // edit mode with the draft, block Send, and re-read the transcript so the user can
+          // review it and send again explicitly (never automatically).
+          if (
+            result.error.type === "history-changed" &&
+            editMessageForSend &&
+            sendOptions.historyEditPrecondition
+          ) {
+            editConflictToastRef.current = {
+              editMessageId: editMessageForSend.id,
+              toast: failureToast,
+            };
+            startEditTranscriptRefresh(editMessageForSend.id, sendOptions.historyEditPrecondition);
+          }
         } else {
+          // The backend took the text: nothing to put back.
+          taken = null;
+          const conflictToast = editConflictToastRef.current;
+          if (editMessageForSend && conflictToast?.editMessageId === editMessageForSend.id) {
+            editConflictToastRef.current = null;
+            setToast((current) => (current === conflictToast.toast ? null : current));
+          }
+          consumeAiSelectionIntent(props.workspaceId, intentAgentId, aiSelection);
           // Track telemetry for successful message send
           telemetry.messageSent(
             props.workspaceId,
@@ -3193,16 +3106,19 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           if (sentReviewIds.length > 0) {
             props.onCheckReviews?.(sentReviewIds);
           }
+          warnIfReviewsUnavailable(reviewsForSend);
 
           // Exit editing mode if we were editing
-          if (editMessageForSend && props.onCancelEdit) {
+          restorePreEditDraftAfterSend(editSessionForSend);
+          if (editMessageForSend && props.onCancelEdit && isOpenEditOrNone(editSessionForSend)) {
             props.onCancelEdit();
           } else if (editMessageForSend) {
             setOptimisticallyDismissedEditId(null);
           }
           props.onMessageSent?.(overrides?.queueDispatchMode ?? "tool-end");
         }
-      } catch (error) {
+      };
+      const restoreDraftOnError = (error: unknown) => {
         // Handle unexpected errors
         console.error("Unexpected error sending message:", error);
         setToast(
@@ -3213,18 +3129,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         );
         // Restore draft on error
         setOptimisticallyDismissedEditId(null);
-        setDraft(preSendDraft);
+        putBackTaken();
         setDraftReviews(preSendReviews);
-      } finally {
+      };
+      await runWithCatchFinally(sendPreparedMessage, restoreDraftOnError, () => {
         setSendingCount((c) => c - 1);
+        releaseTakenDraft();
         setHideReviewsDuringSend(false);
-      }
-    } finally {
-      // Always restore focus at the end
+      });
+    };
+    await runWithFinally(runWorkspaceSend, () => {
+      // /side may have handed focus to another composer while this command completed.
+      // Keep that handoff instead of pulling typing back into the main chat.
       setTimeout(() => {
-        inputRef.current?.focus();
+        if (paneHandlesKeyEvent(paneScope, document.activeElement)) inputRef.current?.focus();
       }, 0);
-    }
+    });
   };
 
   const handleBoundaryEditConfirm = async () => {
@@ -3243,8 +3163,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     setPendingBoundaryEditConfirmation(null);
   };
 
-  // Keep the imperative API pointing at the latest send handler.
-  handleSendRef.current = handleSend;
+  // Keep the imperative API pointing at the latest send handler. A layout effect (not a
+  // render-time write, which React Compiler rejects) updates it in the commit's own task.
+  useLayoutEffect(() => {
+    handleSendRef.current = handleSend;
+  });
 
   // Handler for Escape in vim normal mode - cancels edit if editing
   const handleEscapeInNormalMode = () => {
@@ -3323,20 +3246,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
     // Note: ESC handled by VimTextArea (for mode transitions) and CommandSuggestions (for dismissal)
 
-    const hasCommandSuggestionMenu = showCommandSuggestions && commandSuggestions.length > 0;
-    const hasAtMentionSuggestionMenu = showAtMentionSuggestions && atMentionSuggestions.length > 0;
-    const hasSkillSuggestionMenu = showSkillSuggestions && skillSuggestions.length > 0;
-    const hasSymbolSuggestionMenu = showSymbolSuggestions && symbolSuggestions.length > 0;
-
-    // Don't handle keys if suggestions are visible.
-    // Enter/Tab/arrows/Escape are handled by CommandSuggestions for slash, @file, $skill, and \symbol menus.
-    if (
-      (hasCommandSuggestionMenu && COMMAND_SUGGESTION_KEYS.includes(e.key)) ||
-      (hasAtMentionSuggestionMenu && FILE_SUGGESTION_KEYS.includes(e.key)) ||
-      (hasSkillSuggestionMenu && FILE_SUGGESTION_KEYS.includes(e.key)) ||
-      (hasSymbolSuggestionMenu && FILE_SUGGESTION_KEYS.includes(e.key))
-    ) {
-      return; // Let CommandSuggestions handle it
+    if (composerSuggestions.isVisible && COMMAND_SUGGESTION_KEYS.includes(e.key)) {
+      return;
     }
 
     const hasOnlyQueuedMessage =
@@ -3346,6 +3257,36 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       input.trim() === "" &&
       attachments.length === 0 &&
       reviewPanelItems.length === 0;
+
+    // Held-input shortcuts, like the queued ones, apply only from an empty composer (never while
+    // typing), and always to the oldest held input so the target is deterministic.
+    const heldInputId = variant === "workspace" ? props.heldInputId : undefined;
+    const heldAction = matchesKeybind(e, KEYBINDS.SEND_HELD_INPUT)
+      ? "send"
+      : matchesKeybind(e, KEYBINDS.DISCARD_HELD_INPUT)
+        ? "discard"
+        : null;
+    if (
+      heldAction != null &&
+      heldInputId != null &&
+      workspaceIdForComposerClear != null &&
+      !editingMessageForUi &&
+      input.trim() === "" &&
+      attachments.length === 0 &&
+      reviewPanelItems.length === 0
+    ) {
+      e.preventDefault();
+      stopKeyboardPropagation(e);
+      if (e.repeat) return;
+      window.dispatchEvent(
+        createCustomEvent(CUSTOM_EVENTS.HELD_INPUT_ACTION, {
+          workspaceId: workspaceIdForComposerClear,
+          heldInputId,
+          action: heldAction,
+        })
+      );
+      return;
+    }
 
     // Existing send keybinds edit the queued boundary when the composer itself is empty.
     if (hasOnlyQueuedMessage && matchesKeybind(e, KEYBINDS.SEND_QUEUED_MESSAGE_NOW)) {
@@ -3414,7 +3355,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
     if (disabled) {
       if (initialStagingLocked) {
-        return "Staging attached files...";
+        return "Sending attached files...";
       }
       const disabledReason = props.disabledReason;
       if (typeof disabledReason === "string" && disabledReason.trim().length > 0) {
@@ -3429,8 +3370,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     // Tip carousel: rotates the placeholder through a curated list of
-    // slash-command tricks on a wall-clock bucket so switching workspaces
-    // mid-bucket doesn't reroll the visible tip. See placeholderTips.ts.
+    // slash-command and capability tips on a wall-clock bucket so switching
+    // workspaces mid-bucket doesn't reroll the visible tip. See placeholderTips.ts.
     //
     if (isMobileTouch || props.kind === "scratch") {
       return "Type a message...";
@@ -3447,19 +3388,6 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   return (
     <Wrapper {...wrapperProps}>
       {creationState.trustDialog}
-      {/* Loading overlay during workspace creation */}
-      {variant === "creation" && (
-        <CreationCenterContent
-          projectName={props.projectName}
-          isSending={isSendInFlight}
-          workspaceName={
-            isSendInFlight && props.kind !== "scratch"
-              ? creationState.creatingWithIdentity?.name
-              : undefined
-          }
-          workspaceTitle={isSendInFlight ? creationState.creatingWithIdentity?.title : undefined}
-        />
-      )}
 
       {/* Input section - centered card for creation, bottom bar for workspace */}
       <div
@@ -3510,6 +3438,11 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
 
           {/* Creation header controls - shown above textarea for creation variant */}
           {creationControlsProps && <CreationControls {...creationControlsProps} />}
+          {creationDraftNotSaved && (
+            <div role="alert" className="text-error mb-2 text-xs">
+              Not saved: {draft.saveError}. Keep this window open.
+            </div>
+          )}
 
           {/* Scratch chats have no CreationControls, but mobile users still
               need the current scope visible and a way to reach a project's
@@ -3519,77 +3452,25 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
             <div className="mb-3 flex items-center" data-component="ScratchProjectGroup">
               <CreationProjectSelect
                 selected={SCRATCH_PROJECT_CONFIG_KEY}
-                selectedLabel={SCRATCH_PROJECT_NAME}
-                tooltip={SCRATCH_PROJECT_NAME}
-                options={[
-                  { value: SCRATCH_PROJECT_CONFIG_KEY, label: SCRATCH_PROJECT_NAME },
-                  ...Array.from(userProjects.keys()).map((path) => ({
-                    value: path,
-                    label: formatProjectHierarchyLabel(path, userProjects),
-                  })),
-                ]}
-                onChange={(path) => {
-                  if (path !== SCRATCH_PROJECT_CONFIG_KEY) {
-                    beginWorkspaceCreation(path);
-                  }
-                }}
+                userProjects={userProjects}
+                onChange={changeCreationProject}
+                disabled={creationProjectLocked}
               />
             </div>
           )}
 
-          <CodexOauthWarningBanner
-            requiresCodexOauth={requiresCodexOauth(baseModel)}
-            codexOauthSet={codexOauthSet}
-            onOpenProviders={() => open("providers", { expandProvider: "openai" })}
-          />
-
-          {/* File path suggestions (@src/foo.ts) */}
           <CommandSuggestions
-            suggestions={atMentionSuggestions}
-            onSelectSuggestion={handleAtMentionSelect}
-            onDismiss={() => setShowAtMentionSuggestions(false)}
-            isVisible={showAtMentionSuggestions}
-            ariaLabel="File path suggestions"
-            listId={atMentionListId}
+            suggestions={composerSuggestions.suggestions}
+            onSelectSuggestion={composerSuggestions.select}
+            onDismiss={composerSuggestions.dismiss}
+            isVisible={composerSuggestions.isVisible}
+            ariaLabel={composerSuggestions.ariaLabel}
+            listId={composerSuggestions.listId}
             anchorRef={variant === "creation" ? inputRef : undefined}
-            highlightQuery={lastAtMentionQueryRef.current ?? ""}
-            isFileSuggestion
-          />
-
-          {/* Skill suggestions ($deep-review) */}
-          <CommandSuggestions
-            suggestions={skillSuggestions}
-            onSelectSuggestion={handleSkillSelect}
-            onDismiss={() => setShowSkillSuggestions(false)}
-            isVisible={showSkillSuggestions}
-            ariaLabel="Skill suggestions"
-            listId={skillListId}
-            anchorRef={variant === "creation" ? inputRef : undefined}
-            highlightQuery={lastSkillQueryRef.current ?? ""}
-          />
-
-          {/* Slash command suggestions - available in both variants */}
-          {/* In creation mode, use portal (anchorRef) to escape overflow:hidden containers */}
-          <CommandSuggestions
-            suggestions={commandSuggestions}
-            onSelectSuggestion={handleCommandSelect}
-            onDismiss={() => setShowCommandSuggestions(false)}
-            isVisible={showCommandSuggestions}
-            ariaLabel="Slash command suggestions"
-            listId={commandListId}
-            anchorRef={variant === "creation" ? inputRef : undefined}
-          />
-
-          {/* Symbol shortcut suggestions (\alpha -> α, \leq -> ≤, \euro -> €) */}
-          <CommandSuggestions
-            suggestions={symbolSuggestions}
-            onSelectSuggestion={handleSymbolSelect}
-            onDismiss={() => setShowSymbolSuggestions(false)}
-            isVisible={showSymbolSuggestions}
-            ariaLabel="Symbol shortcuts"
-            listId={symbolListId}
-            anchorRef={variant === "creation" ? inputRef : undefined}
-            highlightQuery={lastSymbolQueryRef.current}
+            highlightQuery={composerSuggestions.highlightQuery}
+            isFileSuggestion={composerSuggestions.isFileSuggestion}
+            selectedIndex={composerSuggestions.selectedIndex}
+            onSelectedIndexChange={composerSuggestions.setSelectedIndex}
           />
 
           {/* Scope the focus border to the textarea so sibling controls do not trigger it. */}
@@ -3618,47 +3499,38 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                     ref={inputRef}
                     data-escape-interrupts-stream="true"
                     value={input}
-                    ghostHint={commandGhostHint}
-                    onChange={handleInputChange}
+                    ghostHint={composerSuggestions.ghostHint}
+                    onChange={handleComposerInputChange}
+                    // Write the draft when focus leaves instead of after the debounce; a failure
+                    // keeps the change in the draft store, which retries it.
+                    onBlur={() => {
+                      draft
+                        .flush()
+                        .catch((error: unknown) =>
+                          console.warn("Failed to save the draft:", error)
+                        );
+                    }}
                     onKeyDown={handleKeyDown}
                     onPaste={handlePaste}
-                    onKeyUp={handleAtMentionCursorActivity}
-                    onMouseUp={handleAtMentionCursorActivity}
-                    onSelect={handleAtMentionCursorActivity}
+                    onKeyUp={composerSuggestions.handleCursorActivity}
+                    onMouseUp={composerSuggestions.handleCursorActivity}
+                    onSelect={composerSuggestions.handleCursorActivity}
                     onDragOver={handleDragOver}
                     onDrop={handleDrop}
                     onEscapeInNormalMode={handleEscapeInNormalMode}
+                    onKeyEdit={sendMarkEdits.onKeyEdit}
                     suppressKeys={
-                      showAtMentionSuggestions
-                        ? FILE_SUGGESTION_KEYS
-                        : showSkillSuggestions
-                          ? FILE_SUGGESTION_KEYS
-                          : showSymbolSuggestions
-                            ? FILE_SUGGESTION_KEYS
-                            : showCommandSuggestions
-                              ? COMMAND_SUGGESTION_KEYS
-                              : undefined
+                      composerSuggestions.isVisible ? COMMAND_SUGGESTION_KEYS : undefined
                     }
                     placeholder={placeholder}
-                    disabled={!editingMessageForUi && (disabled || sendInFlightBlocksInput)}
-                    aria-label={editingMessageForUi ? "Edit your last message" : "Message Claude"}
+                    disabled={!editingMessageForUi && (disabled || sendLocksTyping)}
+                    aria-label={editingMessageForUi ? "Edit message" : "Message"}
+                    // No aria-expanded: the textbox role does not allow it (#5951), and a
+                    // textarea cannot take role="combobox" without screen readers treating
+                    // the multi-line composer as a single-line field.
                     aria-autocomplete="list"
                     aria-controls={
-                      showAtMentionSuggestions && atMentionSuggestions.length > 0
-                        ? atMentionListId
-                        : showSkillSuggestions && skillSuggestions.length > 0
-                          ? skillListId
-                          : showSymbolSuggestions && symbolSuggestions.length > 0
-                            ? symbolListId
-                            : showCommandSuggestions && commandSuggestions.length > 0
-                              ? commandListId
-                              : undefined
-                    }
-                    aria-expanded={
-                      (showCommandSuggestions && commandSuggestions.length > 0) ||
-                      (showAtMentionSuggestions && atMentionSuggestions.length > 0) ||
-                      (showSkillSuggestions && skillSuggestions.length > 0) ||
-                      (showSymbolSuggestions && symbolSuggestions.length > 0)
+                      composerSuggestions.isVisible ? composerSuggestions.listId : undefined
                     }
                     // Creation favors prompt space; workspaces keep a one-line floor because the
                     // user asked for a shorter chat box. Workspaces hide the shortcut hints, so a
@@ -3694,7 +3566,44 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               {/* Editing indicator - workspace only */}
               {variant === "workspace" && editingMessageForUi && (
                 <div className="text-edit-mode text-[11px] font-medium">
-                  Editing message{" "}
+                  {/* Send is disabled while a history-changed refresh is pending or failed;
+                      say why here since the toast can be dismissed — and after a failure keep
+                      the retry here too, so the edit is never stuck once the toast is gone. */}
+                  {editPreconditionInvalidated
+                    ? editRefreshRetry?.editMessageId === editingMessageForUi.id
+                      ? "Editing message — history changed, transcript refresh failed"
+                      : "Editing message — history changed, refreshing transcript"
+                    : "Editing message"}{" "}
+                  {editPreconditionInvalidated &&
+                    editRefreshRetry?.editMessageId === editingMessageForUi.id && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setToast(null);
+                          startEditTranscriptRefresh(
+                            editRefreshRetry.editMessageId,
+                            editRefreshRetry.precondition
+                          );
+                        }}
+                        className="cursor-pointer border-0 bg-transparent p-0 underline"
+                      >
+                        {EDIT_RETRY_REFRESH_LABEL}
+                      </button>
+                    )}{" "}
+                  {/* Escape is the only other way out, and touch screens have no Escape key (its
+                      hint is hidden there): keep a visible Cancel on every viewport. */}
+                  {props.onCancelEdit && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        restorePreEditDraft();
+                        props.onCancelEdit?.();
+                      }}
+                      className="cursor-pointer border-0 bg-transparent p-0 underline"
+                    >
+                      Cancel
+                    </button>
+                  )}{" "}
                   <span className="mobile-hide-shortcut-hints">
                     ({formatKeybind(KEYBINDS.CANCEL_EDIT)}
                     {vimEnabled ? "×2" : ""} to cancel)
@@ -3721,12 +3630,22 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                           : COMPOSER_ICON_ONLY_HIDE_CLASS
                       }
                       onComplete={() => inputRef.current?.focus()}
+                      computerUse={
+                        workspaceId == null
+                          ? undefined
+                          : {
+                              ...computerUse,
+                              runtimeEligible:
+                                runtimeType === "local" || runtimeType === "worktree",
+                            }
+                      }
                     />
                   </div>
 
+                  {/* Inset outlines preserve the boundary over hover backgrounds and in forced colors. */}
                   <div
                     className={cn(
-                      "border-border-light flex min-w-0 items-center gap-1.5 rounded-md border px-1.5 py-0.5",
+                      "outline-border-light flex min-w-0 items-center gap-1.5 rounded-md px-1.5 outline-1 -outline-offset-1",
                       COMPOSER_CONTROL_HEIGHT_CLASS
                     )}
                     data-component="ModelSelectorGroup"
@@ -3741,8 +3660,21 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       defaultModel={defaultModel}
                       onSetDefaultModel={setDefaultModel}
                       hiddenModels={hiddenModelsForSelector}
-                      onOpenSettings={() => open("models")}
+                      onOpenSettings={() => {
+                        // The dropdown's focused input unmounts; hand focus to the composer (as
+                        // onComplete does) so closing settings returns there.
+                        inputRef.current?.focus();
+                        open("models");
+                      }}
                       className="h-full max-w-[8rem] min-w-0"
+                      autoRouting={
+                        autoModelRoutingEnabled
+                          ? {
+                              active: autoModelRoutingActive,
+                              onSelect: () => setAutoModelRoutingActive(true),
+                            }
+                          : undefined
+                      }
                       tooltipExtraContent={
                         <>
                           <strong>Click to edit</strong>
@@ -3772,7 +3704,17 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       className="flex shrink-0 items-center"
                       data-component="ThinkingSelectorGroup"
                     >
-                      <ThinkingSelector modelString={baseModel} />
+                      <ThinkingSelector
+                        modelString={baseModel}
+                        autoRouting={
+                          autoModelRoutingEnabled
+                            ? {
+                                active: autoThinkingLevelActive,
+                                onSelect: () => setAutoThinkingLevelActive(true),
+                              }
+                            : undefined
+                        }
+                      />
                     </div>
                   </div>
 
@@ -3782,6 +3724,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       autoCompaction={autoCompactionProps}
                       idleCompaction={idleCompactionProps}
                       model={contextDisplayModel}
+                      historyLoaded={isTranscriptCaughtUp}
                     />
                   )}
                 </div>
@@ -3798,7 +3741,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                   >
                     <AttachFileButton
                       onFiles={handleAttachFiles}
-                      disabled={disabled || sendInFlightBlocksInput || !!editingMessageForUi}
+                      disabled={disabled || sendLocksTyping || !!editingMessageForUi}
                     />
                     <VoiceInputButton
                       state={voiceInput.state}
@@ -3806,7 +3749,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
                       shouldShowUI={voiceInput.shouldShowUI}
                       requiresSecureContext={voiceInput.requiresSecureContext}
                       onToggle={voiceInput.toggle}
-                      disabled={disabled || sendInFlightBlocksInput}
+                      disabled={disabled || sendLocksTyping}
                       agentColor={agentColor}
                     />
                   </div>

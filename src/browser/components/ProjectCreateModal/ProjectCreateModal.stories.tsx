@@ -7,12 +7,17 @@
  */
 
 import type { APIClient } from "@/browser/contexts/API";
-import { expandProjects, selectWorkspace } from "@/browser/stories/helpers/uiState";
+import {
+  expandLeftSidebar,
+  expandProjects,
+  selectWorkspace,
+} from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { openLeftSidebar } from "@/browser/stories/storyPlayHelpers";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
-import { within, userEvent, waitFor } from "@storybook/test";
+import { within, userEvent, waitFor } from "storybook/test";
 
 const meta = {
   ...appMeta,
@@ -29,6 +34,8 @@ function setupProjectCreateStory(): APIClient {
   const workspaces = [createWorkspace({ id: "ws-1", name: "main", projectName: "my-app" })];
   selectWorkspace(workspaces[0]);
   expandProjects(["/mock/my-app"]);
+  // The play functions need the sidebar's "Add project" button visible to open the modal.
+  expandLeftSidebar();
   return createMockORPCClient({
     projects: groupWorkspacesByProject(workspaces),
     workspaces,
@@ -40,6 +47,8 @@ async function openNewProjectModal(canvasElement: HTMLElement): Promise<void> {
   const canvas = within(canvasElement);
   const body = within(canvasElement.ownerDocument.body);
 
+  // Phones show the sidebar in a drawer that starts closed.
+  await openLeftSidebar(canvasElement);
   // Wait for the sidebar's "Add project" button to appear
   const addButton = await canvas.findByLabelText("Add project", {}, { timeout: 10000 });
   await userEvent.click(addButton);
@@ -58,6 +67,27 @@ export const LocalFolder: AppStory = {
     pixel: { matrix: PIXEL_DUAL_THEME },
   },
   // Integration: stories navigate via sidebar → "Add project" button to open the modal portal.
+  render: () => <AppWithMocks setup={setupProjectCreateStory} />,
+  play: async ({ canvasElement }) => {
+    await openNewProjectModal(canvasElement);
+  },
+};
+
+/**
+ * Three labeled modes must fit narrow dialogs without overflowing the right edge;
+ * the pinned phone viewport guards the wrap layout (dialogs portal to body, so a
+ * fixed-width decorator cannot constrain them).
+ */
+export const PhoneViewport: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    ...appMeta.parameters,
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
   render: () => <AppWithMocks setup={setupProjectCreateStory} />,
   play: async ({ canvasElement }) => {
     await openNewProjectModal(canvasElement);

@@ -1,12 +1,12 @@
 import { describe, expect, test } from "bun:test";
-import { SHUX_PRODUCT_NAME, SHUX_PRODUCT_SLUG } from "@/common/constants/product";
+import { XUM_PRODUCT_NAME, XUM_PRODUCT_SLUG } from "@/common/constants/product";
 import { getElectronAppIdentity } from "./electronAppIdentity";
 
 describe("getElectronAppIdentity", () => {
   test("keeps Linux desktop identity on the lowercase slug", () => {
     const identity = getElectronAppIdentity("linux");
 
-    expect(identity.appName).toBe(SHUX_PRODUCT_SLUG);
+    expect(identity.appName).toBe(XUM_PRODUCT_SLUG);
     expect(identity.appName).toBe(identity.userDataDirName);
     expect(identity.chromeDesktop).toBe(`${identity.appName}.desktop`);
   });
@@ -15,7 +15,7 @@ describe("getElectronAppIdentity", () => {
     for (const platform of ["darwin", "win32"] as const) {
       const identity = getElectronAppIdentity(platform);
 
-      expect(identity.appName).toBe(SHUX_PRODUCT_NAME);
+      expect(identity.appName).toBe(XUM_PRODUCT_NAME);
       expect(identity.appName).not.toBe(identity.userDataDirName);
       expect(identity.chromeDesktop).toBeUndefined();
     }
@@ -27,7 +27,7 @@ describe("getElectronAppIdentity", () => {
       (platform) => getElectronAppIdentity(platform).userDataDirName
     );
 
-    expect(new Set(userDataDirNames)).toEqual(new Set([SHUX_PRODUCT_SLUG]));
+    expect(new Set(userDataDirNames)).toEqual(new Set([XUM_PRODUCT_SLUG]));
     expect(getElectronAppIdentity("darwin").userDataDirName).not.toBe(
       getElectronAppIdentity("darwin").appName
     );

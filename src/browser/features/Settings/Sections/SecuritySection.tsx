@@ -1,12 +1,13 @@
 import { useRef, useState } from "react";
 import { ShieldCheck, ShieldOff } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
+import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
 import { useAPI } from "@/browser/contexts/API";
 
 /**
  * Security settings section — manages per-project trust state.
- * Trusted projects can run hooks and scripts (.mux/tool_env, tool_pre, tool_post, git hooks).
+ * Trusted projects can run hooks and scripts (.xum/tool_env, tool_pre, tool_post, git hooks).
  * Untrusted projects have all hook/script execution disabled.
  */
 export function SecuritySection() {
@@ -21,6 +22,7 @@ export function SecuritySection() {
     try {
       setPendingPath(projectPath);
       await api.projects.setTrust({ projectPath, trusted: !currentlyTrusted });
+      publishProjectTrustChanged();
       await refreshProjects();
     } catch {
       // Best-effort — config refresh will reflect actual state
@@ -54,7 +56,7 @@ export function SecuritySection() {
                 className="border-border-medium flex items-center gap-3 rounded-md border px-3 py-2"
               >
                 {trusted ? (
-                  <ShieldCheck className="text-success size-4 shrink-0" />
+                  <ShieldCheck className="text-success-text size-4 shrink-0" />
                 ) : (
                   <ShieldOff className="text-muted size-4 shrink-0" />
                 )}

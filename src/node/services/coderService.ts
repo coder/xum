@@ -1,6 +1,6 @@
 /**
  * Service for interacting with the Coder CLI.
- * Used to create/manage Coder workspaces as SSH targets for Shux workspaces.
+ * Used to create/manage Coder workspaces as SSH targets for Xum workspaces.
  */
 import { ensureMuxCoderSSHConfigFile } from "@/node/runtime/muxSshConfigWriter";
 import { execAsync, execFileAsync } from "@/node/utils/disposableExec";
@@ -129,6 +129,28 @@ function createGracefulTerminator(
 }
 
 /**
+ * Notices the coder CLI prints before any command when its version differs from the server's.
+ * They are not the failure, so a failure message drops them (the full stderr is kept apart).
+ */
+const CODER_VERSION_NOTICE_LINES = [
+  /^the server is running a development version of Coder \(/,
+  /^version mismatch: client \S+, server \S+$/,
+  /^download \S+ with: '/,
+];
+
+/**
+ * Stderr lines for a failure message: version notices dropped, and the CLI's final `error:`
+ * line (the actual cause, printed last) moved to the front without its prefix.
+ */
+function orderCoderStderrForMessage(lines: readonly string[]): string[] {
+  const kept = lines.filter((line) => !CODER_VERSION_NOTICE_LINES.some((re) => re.test(line)));
+  const causeIndex = kept.findLastIndex((line) => line.startsWith("error: "));
+  if (causeIndex === -1) return kept;
+  const cause = kept[causeIndex].slice("error: ".length);
+  return [cause, ...kept.slice(0, causeIndex), ...kept.slice(causeIndex + 1)];
+}
+
+/**
  * Stream output from a coder CLI command line by line.
  * Yields lines as they arrive from stdout/stderr.
  * Throws on non-zero exit with stderr content in the error message.
@@ -231,6 +253,7 @@ async function* streamCoderCommand(
     // Yield lines as they arrive
     while (!streamsDone || lineQueue.length > 0) {
       if (lineQueue.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         yield lineQueue.shift()!;
       } else if (!streamsDone) {
         await new Promise<void>((resolve) => {
@@ -247,8 +270,12 @@ async function* streamCoderCommand(
     }
 
     if (exitCode !== 0) {
-      const errorDetail = stderrLines.length > 0 ? `: ${stderrLines.join(" | ")}` : "";
-      throw new Error(`${errorPrefix} (exit ${String(exitCode)})${errorDetail}`);
+      const causeLines = orderCoderStderrForMessage(stderrLines);
+      const errorDetail = causeLines.length > 0 ? `: ${causeLines.join(" | ")}` : "";
+      // The message leads with the cause; `stderr` keeps every line for the log details.
+      throw Object.assign(new Error(`${errorPrefix} (exit ${String(exitCode)})${errorDetail}`), {
+        stderr: stderrLines.join("\n"),
+      });
     }
   } finally {
     terminator.cleanup();
@@ -315,11 +342,25 @@ function sanitizeCoderCliErrorForUi(error: unknown): string {
   );
 }
 
+/** Lifetime of the short-lived API tokens `createApiSession` requests. */
+const API_TOKEN_LIFETIME_MINUTES = 5;
+/**
+ * A provisioning session is reused only while its token has at least a minute left, so the
+ * provisioning step that takes it has time to use it.
+ */
+const PROVISIONING_SESSION_REUSE_MS = (API_TOKEN_LIFETIME_MINUTES - 1) * 60_000;
+
 export class CoderService {
   // Ephemeral API sessions scoped to workspace provisioning.
   // This keeps token reuse explicit without persisting anything to disk.
   private provisioningSessionPromises = new Map<string, Promise<CoderApiSession>>();
-  private provisioningSessions = new Map<string, CoderApiSession>();
+  private provisioningSessions = new Map<
+    string,
+    {
+      session: CoderApiSession;
+      /** Date.now() before the token was requested. */ createdAt: number;
+    }
+  >();
   private cachedInfo: CoderInfo | null = null;
   // Cache whoami results so later URL lookups can reuse the last CLI response.
   private cachedWhoami: CoderWhoamiData | null = null;
@@ -499,7 +540,7 @@ export class CoderService {
   private async createApiSession(tokenName: string): Promise<CoderApiSession> {
     using tokenProc = execFileAsync(
       "coder",
-      ["tokens", "create", "--lifetime", "5m", "--name", tokenName],
+      ["tokens", "create", "--lifetime", `${API_TOKEN_LIFETIME_MINUTES}m`, "--name", tokenName],
       { timeoutMs: 30_000 }
     );
     const { stdout: token } = await tokenProc.result;
@@ -536,7 +577,12 @@ export class CoderService {
   async ensureProvisioningSession(workspaceName: string): Promise<CoderApiSession> {
     const existing = this.provisioningSessions.get(workspaceName);
     if (existing) {
-      return existing;
+      // A creation that never reached init (a rollback, #5113) leaves its session here; a retry
+      // must not get a token that has expired, or will before provisioning can use it.
+      if (Date.now() - existing.createdAt < PROVISIONING_SESSION_REUSE_MS) {
+        return existing.session;
+      }
+      await this.disposeProvisioningSession(workspaceName);
     }
 
     const pending = this.provisioningSessionPromises.get(workspaceName);
@@ -544,10 +590,11 @@ export class CoderService {
       return pending;
     }
 
-    const tokenName = `mux-${workspaceName}-${Date.now().toString(36)}`;
+    const createdAt = Date.now();
+    const tokenName = `mux-${workspaceName}-${createdAt.toString(36)}`;
     const sessionPromise = this.createApiSession(tokenName)
       .then((session) => {
-        this.provisioningSessions.set(workspaceName, session);
+        this.provisioningSessions.set(workspaceName, { session, createdAt });
         this.provisioningSessionPromises.delete(workspaceName);
         return session;
       })
@@ -560,20 +607,20 @@ export class CoderService {
   }
 
   takeProvisioningSession(workspaceName: string): CoderApiSession | undefined {
-    const session = this.provisioningSessions.get(workspaceName);
-    if (session) {
+    const entry = this.provisioningSessions.get(workspaceName);
+    if (entry) {
       this.provisioningSessions.delete(workspaceName);
     }
-    return session;
+    return entry?.session;
   }
 
   async disposeProvisioningSession(workspaceName: string): Promise<void> {
-    const session = this.provisioningSessions.get(workspaceName);
-    if (!session) {
+    const entry = this.provisioningSessions.get(workspaceName);
+    if (!entry) {
       return;
     }
     this.provisioningSessions.delete(workspaceName);
-    await session.dispose();
+    await entry.session.dispose();
   }
 
   /**
@@ -582,14 +629,6 @@ export class CoderService {
    */
   async verifyAuthenticatedSession(): Promise<void> {
     await this.getWhoamiData({ useCache: false });
-  }
-
-  /**
-   * Clear cached Coder info. Used for testing.
-   */
-  clearCache(): void {
-    this.cachedInfo = null;
-    this.cachedWhoami = null;
   }
 
   // Preserve the old behavior: explicit whoami checks should hit the CLI even if cached.
@@ -1407,7 +1446,7 @@ export class CoderService {
     const startTime = Date.now();
 
     // Safety: never delete Coder workspaces mux didn't create.
-    // Shux-created workspaces always use the mux- prefix.
+    // Xum-created workspaces always use the mux- prefix.
     if (!name.startsWith("mux-")) {
       log.warn("Refusing to delete Coder workspace without mux- prefix", { name });
       return Ok(undefined);

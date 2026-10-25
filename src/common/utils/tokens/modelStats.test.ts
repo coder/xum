@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { listModelCatalogIds } from "./modelCatalog";
 import { getModelStats, getModelStatsResolved, type ModelStats } from "./modelStats";
 
 const DEFAULT_IMAGE_MODEL = "openai:gpt-image-2";
@@ -18,16 +19,30 @@ describe("getModelStats", () => {
     expect(expectStats(KNOWN_MODELS.GPT.id).max_input_tokens).toBeGreaterThan(0);
   });
 
+  test("resolves Muse Wonder's extra metadata without advertising Wonder Full", () => {
+    const stats = expectStats(KNOWN_MODELS.MUSE_WONDER.id);
+    expect(stats).toMatchObject({
+      max_input_tokens: 1048576,
+      max_output_tokens: 131072,
+      input_cost_per_token: 0.000004,
+      cache_read_input_token_cost: 0.0000002,
+      output_cost_per_token: 0.00002,
+    });
+    expect(stats.tiered_pricing_threshold_tokens).toBeUndefined();
+    expect(listModelCatalogIds()).toContain("meta:muse-wonder-1.0");
+    expect(getModelStats("meta:muse-wonder-full")).toBeNull();
+  });
+
   test("prefers models-extra overrides over models.json when both sources define a model", () => {
-    // gpt-5.2-codex exists in both sources; the 272k context proves the override won.
-    expect(expectStats("openai:gpt-5.2-codex").max_input_tokens).toBe(272000);
+    // claude-sonnet-4-6 exists in both sources; the 64k max output proves the override won.
+    expect(expectStats("anthropic:claude-sonnet-4-6").max_output_tokens).toBe(64000);
   });
 
   test.each([
     ["openai:gpt-5.5-2026-04-23", "openai:gpt-5.5"],
-    ["mux-gateway:openai/gpt-5.5-pro-2026-04-23", "openai:gpt-5.5-pro"],
-    ["mux-gateway:openai/gpt-5.4-mini-2026-03-11", "openai:gpt-5.4-mini"],
-    ["mux-gateway:openai/gpt-5.4-nano-2026-03-17", "openai:gpt-5.4-nano"],
+    ["coder:openai/gpt-5.5-pro-2026-04-23", "openai:gpt-5.5-pro"],
+    ["coder:openai/gpt-5.4-mini-2026-03-11", "openai:gpt-5.4-mini"],
+    ["coder:openai/gpt-5.4-nano-2026-03-17", "openai:gpt-5.4-nano"],
     ["openai:gpt-5.6-sol-2026-07-09", "openai:gpt-5.6-sol"],
   ])("falls back from %s to the published %s family entry", (datedModel, canonicalModel) => {
     expect(expectStats(datedModel)).toEqual(expectStats(canonicalModel));
@@ -39,22 +54,24 @@ describe("getModelStats", () => {
     expect(expectStats("openai:gpt-5.6")).toEqual(expectStats("openai:gpt-5.6-sol"));
   });
 
-  test("resolves Grok 4.6 family aliases and case variants for usage meters", () => {
-    const grok = expectStats(KNOWN_MODELS.GROK_46.id);
+  test("resolves Grok 4.7 family aliases and case variants for usage meters", () => {
+    const grok = expectStats(KNOWN_MODELS.GROK_47.id);
     expect(grok.max_input_tokens).toBe(500000);
     expect(grok.max_output_tokens).toBeUndefined();
-    expect(expectStats("xai:grok-4.6-latest")).toEqual(grok);
-    expect(expectStats("XAI:Grok-4.6")).toEqual(grok);
+    expect(expectStats("xai:grok-4.7-latest")).toEqual(grok);
+    expect(expectStats("XAI:Grok-4.7")).toEqual(grok);
   });
 
-  test("resolves Grok 4.6 pricing with its higher cached-input rate", () => {
-    const grok46 = expectStats("xai:grok-4.6");
-    expect(grok46.input_cost_per_token).toBe(0.000002);
-    expect(grok46.output_cost_per_token).toBe(0.000006);
-    expect(grok46.cache_read_input_token_cost).toBe(0.0000005);
-    expect(grok46.input_cost_per_token_above_200k_tokens).toBe(0.000004);
-    expect(grok46.output_cost_per_token_above_200k_tokens).toBe(0.000012);
-    expect(grok46.cache_read_input_token_cost_above_200k_tokens).toBe(0.000001);
+  test("resolves Grok 4.7 pricing, matching Grok 4.6's published rates", () => {
+    for (const model of ["xai:grok-4.7", "xai:grok-4.6"]) {
+      const grok = expectStats(model);
+      expect(grok.input_cost_per_token).toBe(0.000002);
+      expect(grok.output_cost_per_token).toBe(0.000006);
+      expect(grok.cache_read_input_token_cost).toBe(0.0000005);
+      expect(grok.input_cost_per_token_above_threshold).toBe(0.000004);
+      expect(grok.output_cost_per_token_above_threshold).toBe(0.000012);
+      expect(grok.cache_read_input_token_cost_above_threshold).toBe(0.000001);
+    }
 
     // Grok 4.5 keeps its distinct cheaper cache rate.
     const grok45 = expectStats("xai:grok-4.5");
@@ -67,47 +84,44 @@ describe("getModelStats", () => {
   });
 
   test.each([
-    // [model, input, output, cacheRead, cacheCreation]
-    ["openai:gpt-5.6-sol", 0.000005, 0.00003, 0.0000005, 0.00000625],
-    ["openai:gpt-5.6-terra", 0.000002, 0.000012, 0.0000002, 0.0000025],
-    ["openai:gpt-5.6-luna", 0.0000002, 0.0000012, 0.00000002, 0.00000025],
+    // [model, input, output, cacheRead, cacheCreation, maxInput]
+    ["openai:gpt-6.1-sol", 0.000002, 0.00001, 0.0000001, 0.0000025, 922000],
+    ["openai:gpt-6-luna", 0.0000001, 0.0000005, 0.00000001, 0.000000125, 922000],
+    ["openai:gpt-6-astra", 0.00001, 0.00005, 0.000001, 0.0000125, 1050000],
   ] as const)(
     "resolves %s with the GA pricing and limits",
-    (model, input, output, cacheRead, cacheCreation) => {
+    (model, input, output, cacheRead, cacheCreation, maxInput) => {
       const stats = expectStats(model);
       expect(stats.input_cost_per_token).toBe(input);
       expect(stats.output_cost_per_token).toBe(output);
       expect(stats.cache_read_input_token_cost).toBe(cacheRead);
       expect(stats.cache_creation_input_token_cost).toBe(cacheCreation);
-      // GA model pages list a 1.05M context window / 128K max output for every tier
-      // (Luna's 400K launch figure was stale and caused premature compaction).
-      expect(stats.max_input_tokens).toBe(1050000);
+      // GA model pages list a 128K max output for every tier.
+      expect(stats.max_input_tokens).toBe(maxInput);
       expect(stats.max_output_tokens).toBe(128000);
       // Long-context tier: >272K prompt tokens bill the full request at 2x
       // input / 1.5x output, with cache writes at 1.25x the active input rate
       // (so 2x their base rate). Assert the multipliers, not fresh constants.
       expect(stats.tiered_pricing_threshold_tokens).toBe(272000);
-      expect(stats.input_cost_per_token_above_200k_tokens).toBeCloseTo(input * 2, 12);
-      expect(stats.output_cost_per_token_above_200k_tokens).toBeCloseTo(output * 1.5, 12);
-      expect(stats.cache_read_input_token_cost_above_200k_tokens).toBeCloseTo(cacheRead * 2, 12);
-      expect(stats.cache_creation_input_token_cost_above_200k_tokens).toBeCloseTo(
+      expect(stats.input_cost_per_token_above_threshold).toBeCloseTo(input * 2, 12);
+      expect(stats.output_cost_per_token_above_threshold).toBeCloseTo(output * 1.5, 12);
+      expect(stats.cache_read_input_token_cost_above_threshold).toBeCloseTo(cacheRead * 2, 12);
+      expect(stats.cache_creation_input_token_cost_above_threshold).toBeCloseTo(
         cacheCreation * 2,
         12
       );
     }
   );
 
-  test("resolves GPT-5.4 nano with the published limits and pricing", () => {
-    const stats = expectStats(KNOWN_MODELS.GPT_54_NANO.id);
-    expect(stats.max_input_tokens).toBe(400000);
-    expect(stats.max_output_tokens).toBe(128000);
-    expect(stats.input_cost_per_token).toBe(0.0000002);
-    expect(stats.cache_read_input_token_cost).toBe(0.00000002);
-    expect(stats.output_cost_per_token).toBe(0.00000125);
-    expect(stats.tiered_pricing_threshold_tokens).toBeUndefined();
+  test("resolves GPT-6 Astra by alias, dated snapshot, and gateway prefix", () => {
+    const astra = expectStats(KNOWN_MODELS.GPT_6_ASTRA.id);
+    expect(expectStats("openai:gpt-6-astra-2026-09-30")).toEqual(astra);
+    expect(expectStats("coder:openai/gpt-6-astra")).toEqual(astra);
+    // OpenAI has published no Astra variants; do not resolve unknown ids to it.
+    expect(getModelStats("openai:gpt-6-astra-mini")).toBeNull();
   });
 
-  test("resolves Gemini 3.7 Flash with the billed introductory pricing and limits", () => {
+  test("resolves Gemini 3.8 Flash with the billed introductory pricing and limits", () => {
     const stats = expectStats(KNOWN_MODELS.GEMINI_FLASH.id);
     expect(stats.max_input_tokens).toBe(1048576);
     expect(stats.max_output_tokens).toBe(65536);
@@ -116,17 +130,43 @@ describe("getModelStats", () => {
     expect(stats.cache_read_input_token_cost).toBe(0.000000075);
   });
 
-  test("defaults tiered pricing threshold to 200K when metadata only ships *_above_200k rates", () => {
-    const stats = expectStats("google:gemini-3.1-pro-preview");
-    expect(stats.tiered_pricing_threshold_tokens).toBe(200000);
-    expect(stats.input_cost_per_token_above_200k_tokens).toBe(0.000004);
-    expect(stats.output_cost_per_token_above_200k_tokens).toBe(0.000018);
+  test("keeps Gemini 3.7 Flash resolvable as a custom model string with its introductory pricing", () => {
+    const stats = expectStats("google:gemini-3.7-flash");
+    expect(stats.max_input_tokens).toBe(1048576);
+    expect(stats.max_output_tokens).toBe(65536);
+    expect(stats.input_cost_per_token).toBe(0.00000075);
+    expect(stats.output_cost_per_token).toBe(0.00000375);
+    expect(stats.cache_read_input_token_cost).toBe(0.000000075);
   });
 
-  test("normalizes mux-gateway provider/model ids before lookup", () => {
-    expect(expectStats("mux-gateway:anthropic/claude-sonnet-4-5")).toEqual(
-      expectStats("anthropic:claude-sonnet-4-5")
-    );
+  test.each([
+    // [model, input, output, cacheRead]: the base models' introductory rates do not apply.
+    ["google-vertex:gemini-3.8-flash-cyber", 0.0000015, 0.0000075, 0.00000015],
+    ["google-vertex:gemini-4-argon-cyber-permissive", 0.000004, 0.00002, 0.0000002],
+  ] as const)(
+    "resolves the Vertex-only %s custom model with its list pricing and limits",
+    (model, input, output, cacheRead) => {
+      expect(expectStats(model)).toMatchObject({
+        max_input_tokens: 1048576,
+        max_output_tokens: 65536,
+        input_cost_per_token: input,
+        output_cost_per_token: output,
+        cache_read_input_token_cost: cacheRead,
+      });
+    }
+  );
+
+  test("reads the long-context threshold from LiteLLM's *_above_200k_tokens rate names", () => {
+    const stats = expectStats("google:gemini-3.1-pro-preview");
+    expect(stats.tiered_pricing_threshold_tokens).toBe(200000);
+    expect(stats.input_cost_per_token_above_threshold).toBe(0.000004);
+    expect(stats.output_cost_per_token_above_threshold).toBe(0.000018);
+  });
+
+  test("normalizes gateway provider/model ids before lookup", () => {
+    const sonnet = expectStats("anthropic:claude-sonnet-4-5");
+    expect(expectStats("openrouter:anthropic/claude-sonnet-4-5")).toEqual(sonnet);
+    expect(expectStats("bedrock:anthropic.claude-sonnet-4-5")).toEqual(sonnet);
   });
 
   test("supports bare model ids without a provider prefix", () => {
@@ -184,6 +224,28 @@ describe("getModelStats", () => {
     expect(expectStats("openrouter:moonshotai/kimi-k3")).toEqual(stats);
   });
 
+  test("gives custom Moonshot models the LiteLLM moonshot metadata", () => {
+    const builtIns = new Set<string>(Object.values(KNOWN_MODELS).map((model) => model.id));
+    const customIds = listModelCatalogIds()
+      .filter((id) => id.startsWith("moonshot:"))
+      .map((id) => `moonshotai:${id.slice("moonshot:".length)}`)
+      .filter((id) => !builtIns.has(id));
+    expect(customIds.length).toBeGreaterThan(0);
+    for (const id of customIds) {
+      expect(getModelStats(id)?.max_input_tokens ?? 0).toBeGreaterThan(0);
+    }
+  });
+
+  test("resolves GLM 5.3 Flash limits, list pricing, and supported inputs", () => {
+    const stats = expectStats("zai:glm-5.3-flash");
+
+    expect(stats.max_input_tokens).toBe(1_048_576);
+    expect(stats.max_output_tokens).toBe(131_072);
+    expect(stats.input_cost_per_token).toBe(0.00000015);
+    expect(stats.output_cost_per_token).toBe(0.0000005);
+    expect(stats.cache_read_input_token_cost).toBe(0.00000003);
+  });
+
   test("resolves the default image generation model pricing", () => {
     const stats = expectStats(DEFAULT_IMAGE_MODEL);
 
@@ -196,7 +258,7 @@ describe("getModelStats", () => {
   test("returns null for unknown models across direct and gateway forms", () => {
     expect(getModelStats("unknown:fake-model-9000")).toBeNull();
     expect(getModelStats("ollama:this-model-does-not-exist")).toBeNull();
-    expect(getModelStats("mux-gateway:anthropic/unknown-model-xyz")).toBeNull();
+    expect(getModelStats("openrouter:anthropic/unknown-model-xyz")).toBeNull();
   });
 });
 

@@ -3,7 +3,6 @@ import { fireEvent, waitFor, within } from "@testing-library/react";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
 import { STORAGE_KEYS } from "@/constants/workspaceDefaults";
-import { REVIEW_FILE_TREE_VIEW_MODE_KEY } from "@/common/constants/storage";
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import {
   cleanupSharedRepo,
@@ -35,7 +34,9 @@ describeIntegration("ReviewPanel FileTree view mode (UI + ORPC)", () => {
 
       // Force HEAD so the diff reflects the working tree.
       updatePersistedState(STORAGE_KEYS.reviewDiffBase(workspaceId), "HEAD");
-      updatePersistedState(REVIEW_FILE_TREE_VIEW_MODE_KEY, "structured");
+      await env.orpc.config.updateUserPreferences({
+        patches: [{ review: { fileTreeViewMode: "structured" } }],
+      });
 
       const bashRes = await env.orpc.workspace.executeBash({
         workspaceId,

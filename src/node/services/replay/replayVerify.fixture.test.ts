@@ -12,6 +12,7 @@
  */
 
 import { beforeAll, describe, expect, test } from "bun:test";
+import * as path from "node:path";
 import type { MuxMessage } from "@/common/types/message";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { HistoryService } from "@/node/services/historyService";
@@ -31,7 +32,10 @@ import {
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 
 async function readFixtureHistory(): Promise<MuxMessage[]> {
-  const historyService = new HistoryService({ getSessionDir: () => REPLAY_FIXTURE_DIR });
+  const historyService = new HistoryService({
+    getSessionDir: () => REPLAY_FIXTURE_DIR,
+    rootDir: path.dirname(REPLAY_FIXTURE_DIR),
+  });
   const result = await collectFullHistory(historyService, REPLAY_FIXTURE_WORKSPACE_ID);
   if (!result.success) {
     throw new Error(`fixture history read failed: ${result.error}`);
@@ -142,5 +146,23 @@ describe("replay fixture session", () => {
     expect(toolsetCause?.detail).toBe("added:bash");
     // input(1400) - cacheCreate(1300) = 100 fresh + 1300 cache-write.
     expect(audit[2].approxBustedTokens).toBe(1400);
+  });
+
+  test("the step prefix rule finds the fixture's one prefix break and names its first block", async () => {
+    const { stepPrefix } = await replayVerifySession({
+      sessionDir: REPLAY_FIXTURE_DIR,
+      workspaceId: REPLAY_FIXTURE_WORKSPACE_ID,
+      historyMessages: await readFixtureHistory(),
+    });
+    expect(stepPrefix.comparedPairs).toBe(2);
+    // Turn 1 extends turn 0. Turn 2 added the bash tool, which sorts before
+    // the system prompt edit, so the first differing block is that tool.
+    expect(stepPrefix.breaks).toMatchObject([
+      {
+        runId: "run-3",
+        boundary: "turn",
+        comparison: { section: "tools", blockIndex: 1, next: { toolName: "bash" } },
+      },
+    ]);
   });
 });

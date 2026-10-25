@@ -1,12 +1,87 @@
 import { describe, expect, it, mock } from "bun:test";
 
-import type { MuxMessage } from "@/common/types/message";
 import { Ok, Err } from "@/common/types/result";
-import type { AIService, StreamMessageOptions } from "@/node/services/aiService";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import type { StreamMessageOptions } from "@/node/services/aiService";
+import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
 
 const MODEL = "anthropic:claude-sonnet-4-5";
+
+describe("AgentSession.setActiveTurnServiceTier", () => {
+  it("isolates live speed picks, preserves thinking, and retires the pick with the turn", async () => {
+    let activeA: StreamMessageOptions | undefined;
+    const b = await createAgentSessionHarness({
+      workspaceId: "speed-chat-b",
+      aiServiceOverrides: {
+        streamMessage: (opts: StreamMessageOptions) => {
+          // A is still streaming while B starts. Changing A must not change B's
+          // next-call holder or either chat's independent reasoning preference.
+          expect(opts.muxProviderOptions?.openai?.serviceTier).toBe("flex");
+          expect(aSession.setActiveTurnServiceTier("ultrafast")).toEqual({ accepted: true });
+          expect(aSession.setActiveTurnServiceTier("default")).toEqual({ accepted: true });
+          expect(activeA?.activeTurnThinkingOverride?.serviceTier).toBe("default");
+          expect(activeA?.activeTurnThinkingOverride?.pending).toBe("high");
+          expect(opts.activeTurnThinkingOverride?.serviceTier).toBeUndefined();
+          expect(opts.activeTurnThinkingOverride?.manual).toBeUndefined();
+          return Promise.resolve(Ok(createStartedTurnHandle(b.session.closingSignal)));
+        },
+      },
+    });
+    let turn = 0;
+    const a = await createAgentSessionHarness({
+      workspaceId: "speed-chat-a",
+      aiServiceOverrides: {
+        streamMessage: async (opts: StreamMessageOptions) => {
+          if (turn++ === 0) {
+            activeA = opts;
+            expect(opts.muxProviderOptions?.openai?.serviceTier).toBe("default");
+            expect(opts.activeTurnThinkingOverride?.serviceTier).toBe("priority");
+            expect(opts.activeTurnThinkingOverride?.manual).toBeUndefined();
+            expect(a.session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: true });
+            const sent = await b.session.sendMessage("B", {
+              model: "openai:gpt-6-astra",
+              agentId: "exec",
+              serviceTier: "flex",
+            });
+            expect(sent.success).toBe(true);
+          } else {
+            expect(opts.activeTurnThinkingOverride).not.toBe(activeA?.activeTurnThinkingOverride);
+            expect(opts.activeTurnThinkingOverride?.serviceTier).toBeUndefined();
+          }
+          return Ok(createStartedTurnHandle(a.session.closingSignal));
+        },
+      },
+    });
+    const aSession = a.session;
+    try {
+      expect(a.session.setActiveTurnServiceTier("priority")).toEqual({ accepted: false });
+      const sent = await a.session.sendMessage(
+        "A",
+        {
+          model: "openai:gpt-6-astra",
+          agentId: "exec",
+          serviceTier: "default",
+          providerOptions: { openai: { serviceTier: "priority" } },
+        },
+        {
+          onAccepted: () => {
+            expect(a.session.setActiveTurnServiceTier("priority")).toEqual({ accepted: true });
+          },
+        }
+      );
+      expect(sent.success).toBe(true);
+      await Promise.all([a.session.waitForIdle(), b.session.waitForIdle()]);
+      expect(a.session.setActiveTurnServiceTier("priority")).toEqual({ accepted: false });
+      expect(
+        (await a.session.sendMessage("again", { model: MODEL, agentId: "exec" })).success
+      ).toBe(true);
+      await a.session.waitForIdle();
+    } finally {
+      await Promise.all([a.session.dispose(), b.session.dispose()]);
+      await Promise.all([a.cleanup(), b.cleanup()]);
+    }
+  });
+});
 
 describe("AgentSession.setActiveTurnThinkingLevel", () => {
   it("reports accepted:false while idle (persisted settings cover the next turn)", async () => {
@@ -16,7 +91,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
     try {
       expect(session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: false });
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -38,13 +113,15 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       expect(first).toEqual({ accepted: true });
       expect(second).toEqual({ accepted: true });
       expect(opts.activeTurnThinkingOverride?.pending).toBe("low");
-      return Promise.resolve(Ok(undefined));
+      // A slider write marks the turn as user-controlled, which disables Auto's escalation.
+      expect(opts.activeTurnThinkingOverride?.manual).toBe(true);
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "thinking-override-active",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
     sessionRef = session;
@@ -67,7 +144,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       expect(capturedHolders[1]).not.toBe(capturedHolders[0]);
       expect(capturedPendingAtStreamStart[1]).toBeUndefined();
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -76,13 +153,13 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
     let pendingSeenByStream: string | undefined;
     const streamMessage = mock((opts: StreamMessageOptions) => {
       pendingSeenByStream = opts.activeTurnThinkingOverride?.pending;
-      return Promise.resolve(Ok(undefined));
+      return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
 
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "thinking-override-preparing",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
 
@@ -104,7 +181,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       // holder (prepareStep runs before step 1).
       expect(pendingSeenByStream).toBe("high");
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
@@ -117,7 +194,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "thinking-override-prestream-failure",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
 
@@ -127,17 +204,19 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       await session.waitForIdle();
       expect(session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: false });
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });
 
   it("clears the holder when an onAccepted failure aborts the turn before streaming", async () => {
-    const streamMessage = mock((_history: MuxMessage[]) => Promise.resolve(Ok(undefined)));
+    const streamMessage = mock((_options: StreamMessageOptions) =>
+      Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)))
+    );
     const { session, cleanup } = await createAgentSessionHarness({
       workspaceId: "thinking-override-onaccepted-failure",
       aiServiceOverrides: {
-        streamMessage: streamMessage as unknown as AIService["streamMessage"],
+        streamMessage,
       },
     });
 
@@ -156,7 +235,7 @@ describe("AgentSession.setActiveTurnThinkingLevel", () => {
       expect(streamMessage.mock.calls).toHaveLength(0);
       expect(session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: false });
     } finally {
-      session.dispose();
+      await session.dispose();
       await cleanup();
     }
   });

@@ -18,8 +18,7 @@ import * as yaml from "yaml";
 
 const ARGS = new Set(process.argv.slice(2));
 const MODE = ARGS.has("check") ? "check" : "write";
-const SYNC_SHUX_DOCS_SKILL =
-  ARGS.has("--sync-shux-docs-skill") || ARGS.has("--sync-mux-docs-skill");
+const SYNC_XUM_DOCS_SKILL = ARGS.has("--sync-xum-docs-skill");
 
 const PROJECT_ROOT = path.join(import.meta.dir, "..");
 const BUILTIN_SKILLS_DIR = path.join(PROJECT_ROOT, "src", "node", "builtinSkills");
@@ -254,7 +253,7 @@ function resolveDocsPageFilePath(page: string): string {
     // macOS and Windows filesystems are commonly case-insensitive. `fs.existsSync()` will return
     // true even when the requested path casing does not match what's actually on disk.
     //
-    // This matters for shux docs generation because the docs tree is indexed by exact page IDs
+    // This matters for xum docs generation because the docs tree is indexed by exact page IDs
     // (e.g. "agents" vs "AGENTS"). If we accept case-insensitive matches, we can accidentally
     // resolve the wrong file (and produce platform-dependent output).
     let current = baseDir;
@@ -292,8 +291,8 @@ function resolveDocsPageFilePath(page: string): string {
 
 interface GenerateResult {
   output: string;
-  shuxDocsSkillWasUpdated: boolean;
-  shuxDocsSkillOutOfSync: boolean;
+  xumDocsSkillWasUpdated: boolean;
+  xumDocsSkillOutOfSync: boolean;
 }
 function renderJoinedLines(lines: string[], indent: string): string {
   const innerIndent = indent + "  ";
@@ -309,8 +308,8 @@ function generate(): GenerateResult {
 
   const fileMaps: Record<string, Record<string, string[]>> = {};
 
-  let shuxDocsSkillWasUpdated = false;
-  let shuxDocsSkillOutOfSync = false;
+  let xumDocsSkillWasUpdated = false;
+  let xumDocsSkillOutOfSync = false;
 
   for (const filename of skills) {
     const skillName = filename.slice(0, -3);
@@ -325,8 +324,8 @@ function generate(): GenerateResult {
     const supportDir = path.join(BUILTIN_SKILLS_DIR, skillName);
     if (directoryExists(supportDir)) {
       assert(
-        skillName !== "shux-docs",
-        "shux-docs embeds docs via special handling; do not add src/node/builtinSkills/shux-docs/"
+        skillName !== "xum-docs",
+        "xum-docs embeds docs via special handling; do not add src/node/builtinSkills/xum-docs/"
       );
 
       for (const relPath of walkRelativeFiles(supportDir)) {
@@ -336,8 +335,8 @@ function generate(): GenerateResult {
       }
     }
 
-    // shux-docs: embed docs site content as progressive-disclosure reference files.
-    if (skillName === "shux-docs") {
+    // xum-docs: embed docs site content as progressive-disclosure reference files.
+    if (skillName === "xum-docs") {
       const docsConfigPath = path.join(DOCS_DIR, "docs.json");
       const docsConfigRaw = fs.readFileSync(docsConfigPath, "utf-8");
       files["references/docs/docs.json"] = readFileLines(docsConfigPath);
@@ -373,12 +372,12 @@ function generate(): GenerateResult {
       );
       files["SKILL.md"] = updatedSkillContent.split("\n");
 
-      if (SYNC_SHUX_DOCS_SKILL && updatedSkillContent !== skillContent) {
+      if (SYNC_XUM_DOCS_SKILL && updatedSkillContent !== skillContent) {
         if (MODE === "check") {
-          shuxDocsSkillOutOfSync = true;
+          xumDocsSkillOutOfSync = true;
         } else {
           fs.writeFileSync(skillPath, updatedSkillContent, "utf-8");
-          shuxDocsSkillWasUpdated = true;
+          xumDocsSkillWasUpdated = true;
         }
       }
     }
@@ -404,11 +403,11 @@ function generate(): GenerateResult {
 
   output += "};\n";
 
-  return { output, shuxDocsSkillWasUpdated, shuxDocsSkillOutOfSync };
+  return { output, xumDocsSkillWasUpdated, xumDocsSkillOutOfSync };
 }
 
 async function main(): Promise<void> {
-  const { output: raw, shuxDocsSkillWasUpdated, shuxDocsSkillOutOfSync } = generate();
+  const { output: raw, xumDocsSkillWasUpdated, xumDocsSkillOutOfSync } = generate();
 
   const prettierConfig = await prettier.resolveConfig(OUTPUT_PATH);
   const formatted = await prettier.format(raw, {
@@ -419,16 +418,16 @@ async function main(): Promise<void> {
   const current = fs.existsSync(OUTPUT_PATH) ? fs.readFileSync(OUTPUT_PATH, "utf-8") : null;
   const outputOutOfSync = current !== formatted;
 
-  const shuxDocsSkillPath = path.join(BUILTIN_SKILLS_DIR, "shux-docs.md");
+  const xumDocsSkillPath = path.join(BUILTIN_SKILLS_DIR, "xum-docs.md");
 
   if (MODE === "check") {
-    if (!outputOutOfSync && !shuxDocsSkillOutOfSync) {
+    if (!outputOutOfSync && !xumDocsSkillOutOfSync) {
       console.log(`✓ ${path.relative(PROJECT_ROOT, OUTPUT_PATH)} is up-to-date`);
       return;
     }
 
-    if (shuxDocsSkillOutOfSync) {
-      console.error(`✗ ${path.relative(PROJECT_ROOT, shuxDocsSkillPath)} is out of sync`);
+    if (xumDocsSkillOutOfSync) {
+      console.error(`✗ ${path.relative(PROJECT_ROOT, xumDocsSkillPath)} is out of sync`);
     }
 
     if (outputOutOfSync) {
@@ -446,8 +445,8 @@ async function main(): Promise<void> {
     console.log(`✓ ${path.relative(PROJECT_ROOT, OUTPUT_PATH)} is up-to-date`);
   }
 
-  if (shuxDocsSkillWasUpdated) {
-    console.log(`✓ Updated ${path.relative(PROJECT_ROOT, shuxDocsSkillPath)}`);
+  if (xumDocsSkillWasUpdated) {
+    console.log(`✓ Updated ${path.relative(PROJECT_ROOT, xumDocsSkillPath)}`);
   }
 }
 

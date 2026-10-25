@@ -26,6 +26,7 @@ import {
   TEST_TIMEOUT_LOCAL_MS,
   TEST_TIMEOUT_SSH_MS,
   getTestRunner,
+  createStreamCollector,
 } from "../helpers";
 import {
   isDockerAvailable,
@@ -34,7 +35,14 @@ import {
   type SSHServerConfig,
 } from "../../runtime/test-fixtures/ssh-fixture";
 import type { RuntimeConfig } from "../../../src/common/types/runtime";
+import type { TestEnvironment } from "../setup";
 import { sshConnectionPool } from "../../../src/node/runtime/sshConnectionPool";
+import {
+  describeSsh,
+  initOutputLines,
+  runWatchedSshTest,
+  type SshStepContext,
+} from "../sshStepWatchdog";
 import { ssh2ConnectionPool } from "../../../src/node/runtime/SSH2ConnectionPool";
 import type { WorkspaceChatMessage } from "../../../src/common/orpc/types";
 import type { ToolPolicy } from "../../../src/common/utils/tools/toolPolicy";
@@ -127,8 +135,8 @@ describeIntegration("Runtime Bash Execution", () => {
   // Reset SSH connection pool state before each test to prevent backoff from one
   // test affecting subsequent tests. This allows tests to run concurrently.
   beforeEach(() => {
-    sshConnectionPool.clearAllHealth();
-    ssh2ConnectionPool.clearAllHealth();
+    sshConnectionPool.clearAllHealthForTests();
+    ssh2ConnectionPool.clearAllHealthForTests();
   });
 
   // Test matrix: Run tests for both local and SSH runtimes
@@ -154,9 +162,56 @@ describeIntegration("Runtime Bash Execution", () => {
       // SSH tests run serially to avoid Docker container overload
       const runTest = getTestRunner(type);
 
+      // #6588: each ssh test waits for init-end with its own budget and runs under the shared
+      // step watchdog (sshStepWatchdog.ts).
+      const SSH_INIT_BUDGET_MS = 40_000;
+      const SSH_WATCHDOG_MS = TEST_TIMEOUT_SSH_MS - 10_000;
+      /** Runs an ssh test body under the watchdog; local tests run unchanged. */
+      const watched = (body: (ctx: SshStepContext) => Promise<void>) => async (): Promise<void> => {
+        if (type !== "ssh") return body({ step: "setup", initLines: () => [] });
+        await runWatchedSshTest(SSH_WATCHDOG_MS, () => sshConfig, body);
+      };
+      /** Creates the workspace; for ssh, init-end must arrive within its budget. */
+      const createWorkspace = async (
+        env: TestEnvironment,
+        repo: string,
+        branchName: string,
+        ctx: SshStepContext
+      ) => {
+        ctx.step = "create workspace";
+        const created = await createWorkspaceWithInit(
+          env,
+          repo,
+          branchName,
+          getRuntimeConfig(branchName),
+          type !== "ssh" // local keeps the helper's short, soft init wait
+        );
+        if (type !== "ssh") return created;
+        ctx.step = "wait for init-end";
+        const collector = createStreamCollector(env.orpc, created.workspaceId);
+        collector.start();
+        ctx.initLines = () => initOutputLines(collector);
+        try {
+          const end = await collector.waitForEvent("init-end", SSH_INIT_BUDGET_MS);
+          if (end == null) {
+            const message = `ssh init did not end within ${SSH_INIT_BUDGET_MS} ms (#6588). ${describeSsh(sshConfig, ctx)}`;
+            // The caller never gets `cleanup` on this path, so remove the workspace here. Bounded:
+            // a removal that hangs too must not hide the init message behind the watchdog.
+            await Promise.race([
+              created.cleanup().catch(() => undefined),
+              new Promise((resolve) => setTimeout(resolve, 10_000)),
+            ]);
+            throw new Error(message);
+          }
+        } finally {
+          collector.stop();
+        }
+        return created;
+      };
+
       runTest(
         "should execute simple bash command",
-        async () => {
+        watched(async (ctx) => {
           const env = await createTestEnvironment();
           const tempGitRepo = await createTempGitRepo();
 
@@ -170,16 +225,14 @@ describeIntegration("Runtime Bash Execution", () => {
 
             // Create workspace
             const branchName = generateBranchName("bash-simple");
-            const runtimeConfig = getRuntimeConfig(branchName);
-            const { workspaceId, cleanup } = await createWorkspaceWithInit(
+            const { workspaceId, cleanup } = await createWorkspace(
               env,
               tempGitRepo,
               branchName,
-              runtimeConfig,
-              true, // waitForInit
-              type === "ssh"
+              ctx
             );
 
+            ctx.step = "turn";
             try {
               // Ask AI to run a simple command
               const events = await sendMessageAndWait(
@@ -209,19 +262,21 @@ describeIntegration("Runtime Bash Execution", () => {
               });
               expect(bashCall).toBeDefined();
             } finally {
+              ctx.step = "remove workspace";
               await cleanup();
             }
           } finally {
+            ctx.step = "clean up the test environment";
             await cleanupTempGitRepo(tempGitRepo);
             await cleanupTestEnvironment(env);
           }
-        },
+        }),
         type === "ssh" ? TEST_TIMEOUT_SSH_MS : TEST_TIMEOUT_LOCAL_MS
       );
 
       runTest(
         "should handle bash command with environment variables",
-        async () => {
+        watched(async (ctx) => {
           const env = await createTestEnvironment();
           const tempGitRepo = await createTempGitRepo();
 
@@ -235,16 +290,14 @@ describeIntegration("Runtime Bash Execution", () => {
 
             // Create workspace
             const branchName = generateBranchName("bash-env");
-            const runtimeConfig = getRuntimeConfig(branchName);
-            const { workspaceId, cleanup } = await createWorkspaceWithInit(
+            const { workspaceId, cleanup } = await createWorkspace(
               env,
               tempGitRepo,
               branchName,
-              runtimeConfig,
-              true, // waitForInit
-              type === "ssh"
+              ctx
             );
 
+            ctx.step = "turn";
             try {
               // Ask AI to run command that sets and uses env var
               const events = await sendMessageAndWait(
@@ -277,13 +330,15 @@ describeIntegration("Runtime Bash Execution", () => {
               });
               expect(bashCall).toBeDefined();
             } finally {
+              ctx.step = "remove workspace";
               await cleanup();
             }
           } finally {
+            ctx.step = "clean up the test environment";
             await cleanupTempGitRepo(tempGitRepo);
             await cleanupTestEnvironment(env);
           }
-        },
+        }),
         type === "ssh" ? TEST_TIMEOUT_SSH_MS : TEST_TIMEOUT_LOCAL_MS
       );
 
@@ -292,7 +347,7 @@ describeIntegration("Runtime Bash Execution", () => {
 
       runStdinTest(
         "should not hang on commands that read stdin without input",
-        async () => {
+        watched(async (ctx) => {
           const env = await createTestEnvironment();
           const tempGitRepo = await createTempGitRepo();
 
@@ -306,16 +361,14 @@ describeIntegration("Runtime Bash Execution", () => {
 
             // Create workspace
             const branchName = generateBranchName("bash-stdin");
-            const runtimeConfig = getRuntimeConfig(branchName);
-            const { workspaceId, cleanup } = await createWorkspaceWithInit(
+            const { workspaceId, cleanup } = await createWorkspace(
               env,
               tempGitRepo,
               branchName,
-              runtimeConfig,
-              true, // waitForInit
-              type === "ssh"
+              ctx
             );
 
+            ctx.step = "turn";
             try {
               // Test command that pipes a file through a stdin-reading command (grep)
               // This would hang forever if stdin.close() was used instead of stdin.abort()
@@ -354,19 +407,21 @@ describeIntegration("Runtime Bash Execution", () => {
               );
               expect(bashCalls.length).toBeGreaterThan(0);
             } finally {
+              ctx.step = "remove workspace";
               await cleanup();
             }
           } finally {
+            ctx.step = "clean up the test environment";
             await cleanupTempGitRepo(tempGitRepo);
             await cleanupTestEnvironment(env);
           }
-        },
+        }),
         type === "ssh" ? TEST_TIMEOUT_SSH_MS : TEST_TIMEOUT_LOCAL_MS
       );
 
       runTest(
         "should not hang on grep | head pattern over SSH",
-        async () => {
+        watched(async (ctx) => {
           const env = await createTestEnvironment();
           const tempGitRepo = await createTempGitRepo();
 
@@ -380,23 +435,21 @@ describeIntegration("Runtime Bash Execution", () => {
 
             // Create workspace
             const branchName = generateBranchName("bash-grep-head");
-            const runtimeConfig = getRuntimeConfig(branchName);
-            const { workspaceId, cleanup } = await createWorkspaceWithInit(
+            const { workspaceId, cleanup } = await createWorkspace(
               env,
               tempGitRepo,
               branchName,
-              runtimeConfig,
-              true, // waitForInit
-              type === "ssh"
+              ctx
             );
 
+            ctx.step = "turn";
             try {
               // Test grep | head pattern - this historically hangs over SSH
               // This is a regression test for the bash hang issue
               const events = await sendMessageAndWait(
                 env,
                 workspaceId,
-                'Use the bash tool with args: { script: "for i in {1..1000}; do echo \"terminal bench line $i\" >> testfile.txt; done && grep -n \"terminal bench\" testfile.txt | head -n 200", timeout_secs: 60, run_in_background: false, display_name: "grep-head" }. Do not spawn a sub-agent.',
+                'Use the bash tool with args: { script: "for i in {1..1000}; do echo "terminal bench line $i" >> testfile.txt; done && grep -n "terminal bench" testfile.txt | head -n 200", timeout_secs: 60, run_in_background: false, display_name: "grep-head" }. Do not spawn a sub-agent.',
                 HAIKU_MODEL,
                 BASH_ONLY,
                 streamTimeoutMs
@@ -431,13 +484,15 @@ describeIntegration("Runtime Bash Execution", () => {
               );
               expect(bashCalls.length).toBeGreaterThan(0);
             } finally {
+              ctx.step = "remove workspace";
               await cleanup();
             }
           } finally {
+            ctx.step = "clean up the test environment";
             await cleanupTempGitRepo(tempGitRepo);
             await cleanupTestEnvironment(env);
           }
-        },
+        }),
         type === "ssh" ? TEST_TIMEOUT_SSH_MS : TEST_TIMEOUT_LOCAL_MS
       );
     }

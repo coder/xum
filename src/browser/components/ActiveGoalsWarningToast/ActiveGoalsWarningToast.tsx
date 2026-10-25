@@ -3,8 +3,11 @@ import { useActiveGoalCount } from "@/browser/stores/WorkspaceStore";
 
 const ACTIVE_GOAL_WARNING_THRESHOLD = 3;
 const AUTO_DISMISS_MS = 5_000;
+// max() keeps the toast below the top safe area and clear of the side ones, such as the iPhone Duo
+// cover display's right-hand status column (viewport-fit=cover positions fixed elements against
+// the full screen).
 const wrapperClassName =
-  "pointer-events-none fixed top-4 right-4 z-[10000] max-w-[min(420px,calc(100vw-2rem))] [&>*]:pointer-events-auto";
+  "pointer-events-none fixed top-[max(1rem,env(safe-area-inset-top,0px))] right-[max(1rem,env(safe-area-inset-right,0px))] z-[10000] max-w-[min(420px,calc(100vw_-_max(1rem,env(safe-area-inset-left,0px))_-_max(1rem,env(safe-area-inset-right,0px))))] [&>*]:pointer-events-auto";
 
 interface ActiveGoalsWarningToastProps {
   activeGoalCount: number;

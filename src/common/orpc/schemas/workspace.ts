@@ -40,7 +40,7 @@ export const BestOfGroupSchema = z.object({
  * value for new goals in this workspace". A workspace with all three
  * fields null is semantically identical to no override at all — the
  * backend should drop the entire object in that case to keep
- * `~/.shux/config.json` tidy.
+ * `~/.xum/config.json` tidy.
  *
  * Mirrors the heartbeat pattern (per-workspace override of a global
  * default, persisted inside `WorkspaceConfigSchema`) so the
@@ -69,9 +69,21 @@ export const WorkspaceHeartbeatSettingsSchema = z.object({
   enabled: z.boolean().meta({
     description: "Whether scheduled workspace heartbeats are enabled for this workspace.",
   }),
-  intervalMs: z.number().int().min(HEARTBEAT_MIN_INTERVAL_MS).max(HEARTBEAT_MAX_INTERVAL_MS).meta({
-    description: "Heartbeat interval in milliseconds for this workspace.",
-  }),
+  // Optional (#5692): an absent interval follows the global default
+  // (`heartbeatDefaultIntervalMs`) at read time, so "Use default" is a real default
+  // that tracks later global changes. Older builds read an absent or invalid value as
+  // the global default too (normalizeWorkspaceMetadataHeartbeat), so this is
+  // downgrade-safe.
+  intervalMs: z
+    .number()
+    .int()
+    .min(HEARTBEAT_MIN_INTERVAL_MS)
+    .max(HEARTBEAT_MAX_INTERVAL_MS)
+    .optional()
+    .meta({
+      description:
+        "Heartbeat interval override in milliseconds for this workspace. Absent means the global default interval.",
+    }),
   message: z.string().optional().meta({
     description:
       "Optional custom instruction body appended after the fixed workspace heartbeat lead-in.",
@@ -116,6 +128,95 @@ export const WorkflowTaskMetadataSchema = z.object({
     description: "Optional JSON Schema subset required for this task's structured output.",
   }),
 });
+
+/**
+ * Shared description for the recipient-consent field on persisted config and published metadata.
+ * The value is an opaque revocation GENERATION, not a bearer credential: the sender never supplies
+ * it; the backend compares the generation captured at admission with the current one so an
+ * off→on flip cannot revive work queued under the previous consent. Absent means off. New root
+ * workspaces get a fresh generation once their creation setup is complete (on by default; for
+ * task-delegated targets, once their creating turn settles); the app's settings surface writes it — same-UID processes with config access can too, so it is an
+ * application-level opt-in, not an isolation boundary.
+ */
+export const UNRELATED_WORKSPACE_CONSENT_DESCRIPTION =
+  "Opaque consent generation allowing unrelated local workspaces (other task trees in this Xum instance) to discover this workspace and send it untrusted agent messages. New root workspaces start with one (task-delegated targets once their first turn ends, disposable ones never); absent means off; each off→on transition mints a new value, and an already-on workspace keeps its value. Never a bearer credential.";
+
+/**
+ * Fail-closed reader for the persisted consent generation. Config entries are loaded without
+ * per-field schema validation, so a corrupted, blank, or whitespace-padded value must read as
+ * "off" rather than as a permissive default — and must never make the workspace unloadable.
+ */
+export function getValidUnrelatedWorkspaceConsent(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.length === 0) {
+    return undefined;
+  }
+  return value.trim() === value ? value : undefined;
+}
+
+/**
+ * Shared description for the messaging tag on persisted config and published metadata.
+ * A root chat carries at most one tag (stored without the leading `@`); chats sharing a tag may
+ * message each other. No agent tool writes this field; it is set only through the local API
+ * (`workspace.setMessagingTag`), which carries the user's authority, so a shell-capable agent
+ * running as the same OS user can reach it too. Removing it revokes the link. Absent means untagged.
+ */
+export const MESSAGING_TAG_DESCRIPTION =
+  "Messaging tag (without the leading @) linking this root chat to other root chats that share the same tag so their agents can message each other. No agent tool can set or clear it; it changes only through the local workspace.setMessagingTag API, which acts with the user's authority. Absent means untagged, and removing it revokes the link.";
+
+const MESSAGING_TAG_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+
+/**
+ * Normalizes user-entered tag text: trims, strips one leading `@`, and lowercases. Returns null
+ * when the result is not a valid tag, so callers can reject it instead of persisting junk.
+ */
+export function normalizeMessagingTag(raw: string): string | null {
+  if (typeof raw !== "string") {
+    return null;
+  }
+  const trimmed = raw.trim();
+  const stripped = trimmed.startsWith("@") ? trimmed.slice(1) : trimmed;
+  const normalized = stripped.toLowerCase();
+  return MESSAGING_TAG_PATTERN.test(normalized) ? normalized : null;
+}
+
+/**
+ * Fail-closed reader for the persisted messaging tag. Config entries are loaded without
+ * per-field schema validation, so only an already-normalized valid tag is published; anything
+ * else (blank, padded, `@`-prefixed, uppercase, malformed) reads as untagged rather than
+ * making the workspace unloadable.
+ */
+export function getValidMessagingTag(value: unknown): string | undefined {
+  if (typeof value !== "string") {
+    return undefined;
+  }
+  const normalized = normalizeMessagingTag(value);
+  return normalized != null && normalized === value ? value : undefined;
+}
+
+/**
+ * Recipient-side delivery preference for agent messages that arrive while this workspace is busy:
+ * messages from sub-agents (upward), sibling tasks, and unrelated workspaces. Parent guidance to
+ * a sub-agent is not affected; sub-agent reports follow this preference. Absent means "tool-end" (deliver after the next tool call), because
+ * prompt delivery is what lets agents coordinate quickly; "turn-end" holds every such message until
+ * the current turn ends, even if the sender asked for tool-end.
+ */
+export const AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION =
+  'When agent messages (from sub-agents, sibling tasks, or unrelated workspaces) reach this workspace while it is busy: "tool-end" delivers after the next tool call (default when absent); "turn-end" waits for the current turn to end and overrides a sender\'s tool-end request. Sub-agent reports follow the same setting.';
+
+export const AgentMessageDispatchModeSchema = z.enum(["tool-end", "turn-end"]);
+export type AgentMessageDispatchMode = z.infer<typeof AgentMessageDispatchModeSchema>;
+
+/**
+ * Lenient reader for the persisted delivery preference. Config entries are loaded without
+ * per-field validation, so anything other than a known mode reads as absent (the tool-end default)
+ * rather than making the workspace unloadable.
+ */
+export function getValidAgentMessageDispatchMode(
+  value: unknown
+): AgentMessageDispatchMode | undefined {
+  const parsed = AgentMessageDispatchModeSchema.safeParse(value);
+  return parsed.success ? parsed.data : undefined;
+}
 
 export const WorkspaceMetadataSchema = z.object({
   kind: z.literal("scratch").optional().meta({
@@ -166,9 +267,26 @@ export const WorkspaceMetadataSchema = z.object({
     description:
       "Per-workspace overrides for goal creation defaults (budget, turn cap, explicit-budget). Layered on top of the global `goalDefaults` from app config.",
   }),
+  // Passed through from config so the settings UI reads consent from metadata instead of
+  // keeping a duplicate copy; only a validated (non-blank) generation is published.
+  unrelatedWorkspaceConsent: z.string().optional().meta({
+    description: UNRELATED_WORKSPACE_CONSENT_DESCRIPTION,
+  }),
+  // Passed through from config so API clients read the tag from metadata instead of keeping
+  // a duplicate copy; only a validated (normalized) tag is published.
+  messagingTag: z.string().optional().meta({
+    description: MESSAGING_TAG_DESCRIPTION,
+  }),
+  agentMessageDispatchMode: AgentMessageDispatchModeSchema.optional().meta({
+    description: AGENT_MESSAGE_DISPATCH_MODE_DESCRIPTION,
+  }),
   parentWorkspaceId: z.string().optional().meta({
     description:
       "If set, this workspace is a child workspace spawned from the parent workspaceId (enables nesting in UI and backend orchestration).",
+  }),
+  sideChatParentWorkspaceId: z.string().optional().meta({
+    description:
+      "If set, this workspace is an ephemeral /side chat forked from the given workspace: it shares that workspace's checkout, is hidden from the sidebar, and is discarded when the user leaves it.",
   }),
   agentType: z.string().optional().meta({
     description: 'If set, selects an agent preset for this workspace (e.g., "explore" or "exec").',
@@ -214,6 +332,10 @@ export const WorkspaceMetadataSchema = z.object({
   taskLaunchError: z.string().optional().meta({
     description: "Startup failure recorded before an agent task could begin streaming.",
   }),
+  delegatedCreationInterrupted: z.literal(true).optional().meta({
+    description:
+      "The delegated task that created this workspace died before its setup finished, so the task never started here and its owner cannot reach it (#4983). The user removes or keeps it.",
+  }),
   reportedAt: z.string().optional().meta({
     description: "ISO 8601 timestamp for when an agent task reported completion (optional).",
   }),
@@ -238,6 +360,11 @@ export const WorkspaceMetadataSchema = z.object({
   taskTrunkBranch: z.string().optional().meta({
     description:
       "Trunk branch used to create/init this agent task workspace (used for restart-safe init on queued tasks).",
+  }),
+  // Delegation changes the operator, not the computer; checkout isolation is independent.
+  taskDesktopOwnerWorkspaceId: z.string().optional().meta({
+    description:
+      "Ancestor owning the shared desktop. Absent means this workspace owns its desktop.",
   }),
   taskIsolation: z.enum(["fork", "none"]).optional().meta({
     description:
@@ -286,7 +413,7 @@ export const FrontendWorkspaceMetadataSchema = WorkspaceMetadataSchema.extend({
     .meta({ description: "Worktree path (uses workspace name as directory)" }),
   incompatibleRuntime: z.string().optional().meta({
     description:
-      "If set, this workspace has an incompatible runtime configuration (e.g., from a newer version of Shux). The workspace should be displayed but interactions should show this error message.",
+      "If set, this workspace has an incompatible runtime configuration (e.g., from a newer version of Xum). The workspace should be displayed but interactions should show this error message.",
   }),
   isRemoving: z.boolean().optional().meta({
     description: "True if this workspace is currently being deleted (deletion in progress).",
@@ -362,12 +489,6 @@ export const WorkspaceActivitySnapshotSchema = z.object({
   }),
 });
 
-export const PostCompactionStateSchema = z.object({
-  planPath: z.string().nullable(),
-  trackedFilePaths: z.array(z.string()),
-  excludedItems: z.array(z.string()),
-});
-
 export const GitStatusSchema = z.object({
   /** Current HEAD branch name (empty string if detached HEAD or not a git repo) */
   branch: z.string(),
@@ -390,4 +511,27 @@ export const GitStatusSchema = z.object({
   /** Line deltas for changes that exist on origin's primary branch but not locally */
   incomingAdditions: z.number(),
   incomingDeletions: z.number(),
+});
+
+export const WorkspaceRemovalDescendantSchema = z.object({
+  workspaceId: z.string(),
+  title: z.string(),
+  active: z.boolean(),
+});
+/**
+ * Something a successful (forced) removal could not clean up (#5143). Forced paths that skip the
+ * Force Delete dialog (bulk delete, cancel-creation, shift-click) show these to the user.
+ */
+export const WorkspaceRemoveWarningSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("leftover"),
+    /** Names the leftover (a path, or a container by label) and what the user should do. */
+    description: z.string(),
+  }),
+]);
+export const WorkspaceRemoveResultSchema = z.object({
+  success: z.boolean(),
+  error: z.string().optional(),
+  descendants: z.array(WorkspaceRemovalDescendantSchema).optional(),
+  warnings: z.array(WorkspaceRemoveWarningSchema).optional(),
 });

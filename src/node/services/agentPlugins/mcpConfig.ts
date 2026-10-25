@@ -1,41 +1,58 @@
+import {
+  isPluginMcpServerAllowed,
+  readPluginMcpPolicy,
+  PLUGIN_REGISTRY_FILE_NAME,
+} from "./registry";
 import { createHash } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 
-import type { MCPServerInfo, MCPStdioServerInfo } from "@/common/types/mcp";
+import { normalizeProjectMetadataIdentityPath } from "@/common/compat/legacyMux";
+import type {
+  MCPServerInfo,
+  MCPServerOAuthConfig,
+  MCPStdioServerInfo,
+  WorkspaceMCPOverrides,
+} from "@/common/types/mcp";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isCanonicalPluginServerKey } from "@/common/utils/mcp/pluginServerKey";
 import { isMultiProject } from "@/common/utils/multiProject";
 import { log } from "@/node/services/log";
 import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
 import type { AgentPluginContainer, AgentPluginDiagnostic, AgentPluginInfo } from "./discovery";
-import { computeAgentPluginContainers, discoverAgentPlugins } from "./discovery";
+import {
+  computeAgentPluginContainers,
+  discoverAgentPlugins,
+  MAX_PLUGIN_MANIFEST_BYTES,
+  readPluginFileWithinRootCapped,
+} from "./discovery";
+import { serverConsentFingerprint } from "./componentConsent";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
+import {
+  envNameKey,
+  isReservedPluginEnvName,
+  PLUGIN_MCP_CONFIG_PARSE_ERROR,
+  readOpenAIMcpAuth,
+  toServerOAuthConfig,
+  translateCodexMcpEntry,
+} from "./openaiMcpAuth";
 
 /**
- * Agent Plugins 1.0.0 MCP configuration (`mcp.json`, §7.2) → Shux MCPServerInfo.
- *
- * Loading rules follow §7.2.2 exactly:
- * - invalid JSON / bad top-level / `$schema` mismatch → MCP disabled for that
- *   plugin only (diagnostic), other components unaffected;
- * - an invalid or unsupported server entry → that entry skipped (diagnostic),
- *   siblings unaffected.
- *
- * Normalized servers are default-disabled, read-only config entries keyed by
- * `plugin:<instanceId>:<serverName>` where `instanceId` hashes the plugin's
- * stable installation identity (lexical location; see
- * computePluginInstanceId). The key is stable across manifest renames,
- * content updates, and symlink retargets, so workspace `enabledServers`
- * overrides and the `PLUGIN_DATA` directory survive plugin updates (§9.1).
+ * Agent Plugins MCP documents become default-disabled, read-only Xum servers.
+ * Invalid documents and entries are isolated, while stable instance IDs keep
+ * workspace enablement and PLUGIN_DATA across plugin updates and path migrations.
  */
 
 /** Canonical `$schema` const for Agent Plugins 1.0.0 mcp.json documents. */
 export const AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 =
   "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
 
-const PLUGIN_SERVER_KEY_PREFIX = "plugin:";
+export const PLUGIN_SERVER_KEY_PREFIX = "plugin:";
+// The canonical-key predicate lives in common so the renderer can share it.
+export { isCanonicalPluginServerKey };
 
 /**
  * Stable plugin-instance identity. Global plugins hash their LEXICAL
@@ -52,13 +69,100 @@ export function computePluginInstanceId(identity: string): string {
 }
 
 /** Client-managed persistent data directory for a plugin instance (§9.1). */
-export function getPluginDataPath(muxHome: string, instanceId: string): string {
-  assert(path.isAbsolute(muxHome), "getPluginDataPath: muxHome must be absolute");
-  return path.join(muxHome, "plugin-data", instanceId);
+export function getPluginDataPath(xumHome: string, instanceId: string): string {
+  assert(path.isAbsolute(xumHome), "getPluginDataPath: xumHome must be absolute");
+  return path.join(xumHome, "plugin-data", instanceId);
 }
 
 export function buildPluginServerKey(instanceId: string, serverName: string): string {
   return `${PLUGIN_SERVER_KEY_PREFIX}${instanceId}:${serverName}`;
+}
+
+/**
+ * Canonical uninstall-tombstone prefix shape: `plugin:<instanceId>:` where
+ * the instance ID is the 16-hex-char computePluginInstanceId output. Persisted
+ * tombstones are validated against this before being executed so a corrupted
+ * `plugins.json` prefix (e.g. `"g"`) can never destructively prune arbitrary
+ * workspace override keys.
+ */
+const CANONICAL_PLUGIN_KEY_PREFIX_PATTERN = /^plugin:[0-9a-f]{16}:$/;
+
+export function isCanonicalPluginServerKeyPrefix(prefix: string): boolean {
+  return CANONICAL_PLUGIN_KEY_PREFIX_PATTERN.test(prefix);
+}
+
+/**
+ * Plugin keys PER FIELD, not collapsed into one set: a stale key that only
+ * survives in toolAllowlist (e.g. a removed unmanaged dir's old tool
+ * selection) must not make that key's NEW appearance in enabledServers look
+ * like a no-op — enabling is the consent-relevant action.
+ */
+function collectPluginOverrideKeysByField(
+  overrides: WorkspaceMCPOverrides
+): Record<"enabledServers" | "disabledServers" | "toolAllowlist", Set<string>> {
+  // Canonical shape only (mirrors the pruning path): a user-defined global or
+  // project server may legitimately be NAMED "plugin:custom", and validating
+  // it against discovered plugin-server keys would reject the whole save.
+  const pluginKeys = (keys: readonly string[]): Set<string> =>
+    new Set(keys.filter(isCanonicalPluginServerKey));
+  return {
+    enabledServers: pluginKeys(overrides.enabledServers ?? []),
+    disabledServers: pluginKeys(overrides.disabledServers ?? []),
+    toolAllowlist: pluginKeys(Object.keys(overrides.toolAllowlist ?? {})),
+  };
+}
+
+/**
+ * Save-time validator for workspace MCP override writes: rejects NEWLY ADDED
+ * `plugin:` keys that do not name a currently-discoverable plugin server.
+ *
+ * Why additions-only, at write time: the overrides revision is content-derived,
+ * so a dialog opened while a default-disabled plugin had no override key sees
+ * the same revision ({} hash) before and after that plugin's uninstall — the
+ * CAS check alone cannot tell the snapshot is stale. Without this, the stale
+ * dialog could enable the ghost row, persist its key, and a later reinstall of
+ * the same instance ID would silently re-enable the server without consent.
+ *
+ * Validation source is the workspace's DISCOVERED plugin server keys — the
+ * same set the Workspace MCP modal lists from — so servers contributed by
+ * project containers, ~/.agents/plugins, and unmanaged global dirs stay
+ * enableable; the managed-install registry alone would reject them. Existing
+ * keys round-trip untouched so unrelated saves never break.
+ */
+export function buildAddedPluginKeyValidator(
+  listDiscoveredPluginServerKeys: () => Promise<Set<string>>
+): (current: WorkspaceMCPOverrides, incoming: WorkspaceMCPOverrides) => Promise<void> {
+  return async (current, incoming) => {
+    // Additions are computed PER FIELD so a key already present in one field
+    // (say a stale toolAllowlist entry) still validates when it newly enters
+    // another (enabledServers — the consent-relevant one).
+    const currentByField = collectPluginOverrideKeysByField(current);
+    const incomingByField = collectPluginOverrideKeysByField(incoming);
+    const addedKeys = [
+      ...new Set(
+        (Object.keys(incomingByField) as Array<keyof typeof incomingByField>).flatMap((field) =>
+          [...incomingByField[field]].filter((key) => !currentByField[field].has(key))
+        )
+      ),
+    ];
+    if (addedKeys.length === 0) {
+      return;
+    }
+    let discoveredKeys: Set<string>;
+    try {
+      discoveredKeys = await listDiscoveredPluginServerKeys();
+    } catch {
+      // Cannot confirm → reject the additions (never accept unverifiable keys).
+      discoveredKeys = new Set();
+    }
+    const staleKeys = addedKeys.filter((key) => !discoveredKeys.has(key));
+    if (staleKeys.length > 0) {
+      throw new Error(
+        `Cannot save: ${staleKeys.join(", ")} does not match any available plugin server. ` +
+          "Close and reopen this dialog to load the current server list."
+      );
+    }
+  };
 }
 
 export interface LoadPluginMcpServersResult {
@@ -71,8 +175,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 // Closed variants (§7.2.1): an unknown field makes the entry invalid.
-const STDIO_ENTRY_KEYS = new Set(["type", "command", "args", "env", "cwd"]);
-const REMOTE_ENTRY_KEYS = new Set(["type", "url", "headers"]);
+// `extensions` is not in the Agent Plugins 1.0.0 mcp schema; it is where
+// OpenAI documents per-server settings (`extensions["com.openai"].auth`).
+// Other namespaces stay opaque.
+const STDIO_ENTRY_KEYS = new Set(["type", "command", "args", "env", "cwd", "extensions"]);
+const REMOTE_ENTRY_KEYS = new Set(["type", "url", "headers", "extensions"]);
 
 // Canonical mcp.schema.json cwd pattern: `./…`, `${PLUGIN_ROOT}[/…]`, `${PLUGIN_DATA}[/…]`.
 const CWD_FORM_PATTERN = /^(?:\.\/|\$\{PLUGIN_ROOT\}(?:\/|$)|\$\{PLUGIN_DATA\}(?:\/|$))/;
@@ -167,7 +274,7 @@ async function ensureContainedAllowMissingRoot(root: string, candidate: string):
 
 /**
  * Display discriminator for a plugin installation: the container's last two
- * lexical segments plus the plugin dir, e.g. ".mux/plugins/demo" vs
+ * lexical segments plus the plugin dir, e.g. ".xum/plugins/demo" vs
  * ".agents/plugins/demo". Same-name plugins can only collide across sibling
  * containers of a scope, so this is unique per scope (cross-scope entries are
  * already distinguished by the displayed sourceScope).
@@ -184,6 +291,86 @@ interface NormalizeContext {
   plugin: AgentPluginInfo;
   dataPath: string;
   vars: PluginPlaceholderValues;
+}
+
+/**
+ * The variables Xum supplies to a plugin server's environment: the placeholder names of its
+ * dialect (PLUGIN_ROOT and PLUGIN_DATA, plus the two Claude names for a Claude `.mcp.json`,
+ * because Claude Code exports them and Claude servers read them).
+ */
+function suppliedPluginEnv(vars: PluginPlaceholderValues): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(vars).filter((entry): entry is [string, string] => entry[1] !== undefined)
+  );
+}
+
+/** The first problem of a stdio entry's `env` object, or undefined when it is valid. */
+function stdioEnvError(
+  env: Record<string, unknown>,
+  supplied: Record<string, string>
+): string | undefined {
+  for (const [key, value] of Object.entries(env)) {
+    if (isReservedPluginEnvName(key) || Object.hasOwn(supplied, envNameKey(key))) {
+      // §9.2: reserved names in `env` make the entry invalid; the client
+      // supplies these variables itself.
+      return `'env' must not contain reserved variable '${key}'`;
+    }
+    if (typeof value !== "string") {
+      return `'env.${key}' must be a string`;
+    }
+    if (key.includes("\0") || value.includes("\0")) {
+      // Same spawn constraint as args: env entries must be NUL-free.
+      return `'env' entry ${JSON.stringify(key)} must not contain NUL bytes`;
+    }
+    if (key.length === 0 || key.includes("=")) {
+      // As env_vars names (codexEnvVarName): a key `PLUGIN_DATA=/x` would set PLUGIN_DATA in
+      // the joined env block, and Windows sorts that block, so order cannot protect it (#6713).
+      // An empty key would be an unnamed `=value` entry.
+      return `'env' key ${JSON.stringify(key)} must be a non-empty name without '='`;
+    }
+  }
+  return undefined;
+}
+
+const CLAUDE_ROOT_COMMAND_PREFIX = "${CLAUDE_PLUGIN_ROOT}/";
+
+/**
+ * A Claude-dialect stdio entry in Xum's spelling:
+ * - A command of exactly `${CLAUDE_PLUGIN_ROOT}/<path>` becomes `./<path>`, so it goes through
+ *   the same `./` checks (containment, a file, executable). Every other form, including a quoted
+ *   or absolute one, stays unchanged and classifyCommandToken refuses it.
+ * - A cwd anchored at `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is anchored at the
+ *   matching Xum name, so the cwd form and containment checks apply unchanged.
+ * Args and env values expand the Claude names through the placeholder values instead.
+ */
+function claudeStdioEntry(entry: Record<string, unknown>): Record<string, unknown> {
+  const { command, cwd } = entry;
+  const rewritten = { ...entry };
+  if (
+    typeof command === "string" &&
+    command.startsWith(CLAUDE_ROOT_COMMAND_PREFIX) &&
+    command.length > CLAUDE_ROOT_COMMAND_PREFIX.length
+  ) {
+    rewritten.command = `./${command.slice(CLAUDE_ROOT_COMMAND_PREFIX.length)}`;
+  }
+  if (typeof cwd === "string") {
+    rewritten.cwd = cwd.replace(
+      /^\$\{CLAUDE_(PLUGIN_(?:ROOT|DATA))\}(?=\/|$)/,
+      (_match, name: string) => `\${${name}}`
+    );
+  }
+  return rewritten;
+}
+
+/** Placeholder values for a plugin's MCP file: the Claude names expand only in its dialect. */
+function pluginPlaceholderValues(
+  plugin: AgentPluginInfo,
+  dataPath: string
+): PluginPlaceholderValues {
+  const vars = { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath };
+  return plugin.mcpConfigDialect === "claude"
+    ? { ...vars, CLAUDE_PLUGIN_ROOT: plugin.rootPath, CLAUDE_PLUGIN_DATA: dataPath }
+    : vars;
 }
 
 /** Validate + normalize one stdio entry; returns null (with error) when invalid. */
@@ -223,20 +410,9 @@ async function normalizeStdioEntry(
     return { error: "'env' must be an object of strings" };
   }
   const env = entry.env ?? {};
-  for (const [key, value] of Object.entries(env)) {
-    if (key === "PLUGIN_ROOT" || key === "PLUGIN_DATA") {
-      // §9.2: reserved names in `env` make the entry invalid; the client
-      // supplies these variables itself.
-      return { error: `'env' must not contain reserved variable '${key}'` };
-    }
-    if (typeof value !== "string") {
-      return { error: `'env.${key}' must be a string` };
-    }
-    if (key.includes("\0") || value.includes("\0")) {
-      // Same spawn constraint as args: env entries must be NUL-free.
-      return { error: `'env' entry ${JSON.stringify(key)} must not contain NUL bytes` };
-    }
-  }
+  const supplied = suppliedPluginEnv(ctx.vars);
+  const envError = stdioEnvError(env, supplied);
+  if (envError !== undefined) return { error: envError };
 
   if (entry.cwd !== undefined && typeof entry.cwd !== "string") {
     return { error: "'cwd' must be a string" };
@@ -353,11 +529,7 @@ async function normalizeStdioEntry(
       args: expandedArgs,
       // §9.1 overlay order: configured env first, reserved variables last so
       // they can never be shadowed.
-      env: {
-        ...expandedEnv,
-        PLUGIN_ROOT: rootPath,
-        PLUGIN_DATA: ctx.dataPath,
-      },
+      env: { ...expandedEnv, ...supplied },
       cwd: resolvedCwd,
       disabled: true,
       plugin: {
@@ -411,7 +583,7 @@ function normalizeRemoteEntry(
 
     if (Object.keys(entry.headers).length > 0) {
       // §7.2.1 forbids forwarding configured headers cross-origin via
-      // redirects; Shux remote transports follow redirects, so entries with
+      // redirects; Xum remote transports follow redirects, so entries with
       // configured headers are skipped rather than risk leaking them.
       return {
         skip: "configured 'headers' are not supported yet (cross-origin redirect header forwarding cannot be prevented)",
@@ -435,14 +607,72 @@ function normalizeRemoteEntry(
 }
 
 /**
- * Load and normalize a plugin's `mcp.json` into default-disabled Shux server
+ * A remote server's OAuth settings: applies the usable ones to `info` and returns the warnings
+ * for the rest. Discovery + DCR cover what the config omits.
+ */
+function remoteOAuthMessages(
+  info: Exclude<MCPServerInfo, MCPStdioServerInfo>,
+  entry: Record<string, unknown>,
+  codex: { ignored: string[]; warnings: string[]; hasClientSecret?: boolean },
+  /** Where the OAuth service rereads a Codex client secret (see readPluginClientSecret). */
+  secretSource: NonNullable<MCPServerOAuthConfig["clientSecretSource"]>
+): string[] {
+  const auth = readOpenAIMcpAuth(entry.extensions);
+  const { config: oauth, ignored: unusable } = toServerOAuthConfig(auth.auth, {
+    serverUrl: info.url,
+    ...(codex.hasClientSecret === true ? { clientSecretSource: secretSource } : {}),
+  });
+  if (oauth !== undefined) info.oauth = oauth;
+  const ignored = [...codex.ignored, ...auth.ignored, ...unusable];
+  if (codex.hasClientSecret === true && oauth?.clientSecretSource === undefined)
+    ignored.push("oauth.client_secret (needs client_id)");
+  const messages = [...codex.warnings, ...auth.warnings];
+  if (ignored.length > 0) messages.push(`Xum's MCP OAuth ignores: ${ignored.join(", ")}`);
+  return messages;
+}
+
+/** Normalize one (translated) entry by its transport; a translation error skips it. */
+async function normalizeServerEntry(
+  translated: ReturnType<typeof translateCodexMcpEntry>,
+  ctx: NormalizeContext
+): Promise<{ info: MCPServerInfo } | { error: string } | { skip: string }> {
+  if (translated.error !== undefined) return { error: translated.error };
+  const entry = translated.entry;
+  if (entry.type === "streamable-http" || entry.type === "sse")
+    return normalizeRemoteEntry(entry, ctx);
+  if (entry.type !== "stdio")
+    return { error: `unknown server 'type' ${JSON.stringify(entry.type)}` };
+  const result = await normalizeStdioEntry(
+    ctx.plugin.mcpConfigDialect === "claude" ? claudeStdioEntry(entry) : entry,
+    ctx
+  );
+  if ("info" in result && translated.forwardEnv !== undefined)
+    result.info.forwardEnv = translated.forwardEnv;
+  return result;
+}
+
+/**
+ * Why a server entry cannot load at all, before dialect handling. `__proto__` is refused because
+ * the registry's consent record (a `z.record`) drops that key on parse (#6534): the server could
+ * never keep its review, so it is skipped with a diagnostic instead of staying unreviewable.
+ */
+function checkServerEntryShape(
+  serverName: string,
+  rawEntry: unknown
+): { rawEntry: Record<string, unknown> } | { error: string } {
+  if (serverName === "__proto__") return { error: "the server name '__proto__' is reserved" };
+  return isPlainObject(rawEntry) ? { rawEntry } : { error: "server entry must be an object" };
+}
+
+/**
+ * Load and normalize a plugin's `mcp.json` into default-disabled Xum server
  * records keyed by `plugin:<instanceId>:<serverName>`. The instance ID
  * defaults to hashing the canonical plugin root; callers pass an explicit
  * `instanceId` when a more stable identity exists (project plugins).
  */
 export async function loadPluginMcpServers(
   plugin: AgentPluginInfo,
-  ctx: { muxHome: string; instanceId?: string }
+  ctx: { xumHome: string; instanceId?: string }
 ): Promise<LoadPluginMcpServersResult> {
   assert(
     plugin.mcpConfigPath !== undefined && path.isAbsolute(plugin.mcpConfigPath),
@@ -451,10 +681,14 @@ export async function loadPluginMcpServers(
 
   const diagnostics: AgentPluginDiagnostic[] = [];
   const servers: Record<string, MCPServerInfo> = {};
+  // Name the real file (mcp.json, the Codex .mcp.json fallback, or a
+  // contributes.mcp path) in every message.
+  const fileLabel = path.basename(plugin.mcpConfigPath);
 
   const disableMcp = (message: string): LoadPluginMcpServersResult => {
     log.warn(`Agent plugin ${plugin.rootPath}: ${message}`);
     diagnostics.push({
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       path: plugin.mcpConfigPath!,
       scope: plugin.scope,
       severity: "error",
@@ -463,49 +697,99 @@ export async function loadPluginMcpServers(
     return { servers: {}, diagnostics };
   };
 
+  // Size-cap before parsing: server summaries built from this document
+  // (command lines, env assignments, URLs) reach the install consent
+  // preview's IPC/render path, so one unbounded string must not be able to
+  // freeze the app before consent (same ceiling as plugin.json). The bounded
+  // handle read also revalidates containment + file identity AFTER the open:
+  // this document defines spawnable commands, so a replacement symlink
+  // promoted between discovery and this read (see
+  // readPluginFileWithinRootCapped) would otherwise let an outside file be
+  // parsed as server config and its command spawned before the mutation-epoch
+  // post-check can retire the stale result.
+  let text: string;
+  try {
+    text = (
+      await readPluginFileWithinRootCapped({
+        filePath: plugin.mcpConfigPath,
+        pluginRoot: plugin.rootPath,
+        maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
+        label: fileLabel,
+      })
+    ).content;
+  } catch (error) {
+    return disableMcp(getErrorMessage(error));
+  }
   let raw: unknown;
   try {
-    raw = JSON.parse(await fsPromises.readFile(plugin.mcpConfigPath, "utf8")) as unknown;
-  } catch (error) {
-    // §7.2.2 rule 2: invalid JSON disables MCP for this plugin only.
-    return disableMcp(`mcp.json is not valid JSON: ${getErrorMessage(error)}`);
+    raw = JSON.parse(text) as unknown;
+  } catch {
+    // §7.2.2 rule 2: invalid JSON disables MCP for this plugin only. The parser message is
+    // not reported: it quotes source text, and a Codex `.mcp.json` holds `client_secret` (#6297).
+    return disableMcp(`${fileLabel}: ${PLUGIN_MCP_CONFIG_PARSE_ERROR}`);
   }
 
   if (!isPlainObject(raw)) {
-    return disableMcp("mcp.json must be a JSON object");
+    return disableMcp(`${fileLabel} must be a JSON object`);
   }
 
+  // Codex packages ship `.mcp.json` in their own dialect (no `$schema`,
+  // `type: "http"`, `oauth`/`scopes`/`oauth_resource`). Discovery marks it
+  // from the lexical selection (a contained symlink keeps the dialect); a
+  // root mcp.json stays strict. A Claude `.mcp.json` has the Codex shape, plus
+  // the Claude names for the two plugin variables (normalizeStdioEntry).
+  // Both dialects ("codex" and "claude") have the Codex shape.
+  const codexDialect = plugin.mcpConfigDialect !== undefined;
+  // Codex also accepts a flat `{ "<server>": {...} }` map without `mcpServers`.
+  const doc: Record<string, unknown> =
+    codexDialect && !("mcpServers" in raw)
+      ? (({ $schema, ...servers }) => ({
+          ...($schema !== undefined ? { $schema } : {}),
+          mcpServers: servers,
+        }))(raw)
+      : raw;
+
   // Closed top-level: exactly { $schema, mcpServers }, both required (§7.2.1).
-  for (const key of Object.keys(raw)) {
+  for (const key of Object.keys(doc)) {
     if (key !== "$schema" && key !== "mcpServers") {
-      return disableMcp(`mcp.json has unknown top-level field '${key}'`);
+      return disableMcp(`${fileLabel} has unknown top-level field '${key}'`);
     }
   }
-  if (raw.$schema !== AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0) {
+  if (
+    doc.$schema !== AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0 &&
+    !(codexDialect && doc.$schema === undefined)
+  ) {
     // Discovery only admits 1.0.0 manifests, so any other value is either an
     // unsupported version or a version mismatch with plugin.json — both
     // disable MCP for this plugin (§7.2.2 rule 2).
     return disableMcp(
-      `mcp.json '$schema' must be '${AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0}' (matching plugin.json's Agent Plugins version)`
+      `${fileLabel} '$schema' must be '${AGENT_PLUGIN_MCP_SCHEMA_ID_1_0_0}' (matching plugin.json's Agent Plugins version)`
     );
   }
-  if (!isPlainObject(raw.mcpServers)) {
-    return disableMcp("mcp.json 'mcpServers' is required and must be an object");
+  if (!isPlainObject(doc.mcpServers)) {
+    return disableMcp(`${fileLabel} 'mcpServers' is required and must be an object`);
   }
 
   const instanceId = ctx.instanceId ?? computePluginInstanceId(plugin.rootPath);
-  const dataPath = getPluginDataPath(ctx.muxHome, instanceId);
+  const dataPath = getPluginDataPath(ctx.xumHome, instanceId);
   const normalizeCtx: NormalizeContext = {
     plugin,
     dataPath,
-    vars: { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath },
+    vars: pluginPlaceholderValues(plugin, dataPath),
   };
 
-  for (const [serverName, entry] of Object.entries(raw.mcpServers)) {
+  for (const [serverName, rawEntryValue] of Object.entries(doc.mcpServers)) {
+    // Filter before registration: saved workspace overrides cannot resurrect an unimported server.
+    if (
+      plugin.importedComponents != null &&
+      !plugin.importedComponents.mcpServers.includes(serverName)
+    )
+      continue;
     const reportEntry = (severity: "warning" | "error", message: string): void => {
-      const fullMessage = `mcp.json server '${serverName}': ${message}; skipping this server`;
+      const fullMessage = `${fileLabel} server '${serverName}': ${message}; skipping this server`;
       log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
       diagnostics.push({
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         path: plugin.mcpConfigPath!,
         scope: plugin.scope,
         severity,
@@ -513,23 +797,33 @@ export async function loadPluginMcpServers(
       });
     };
 
-    if (!isPlainObject(entry)) {
-      reportEntry("error", "server entry must be an object");
+    const shape = checkServerEntryShape(serverName, rawEntryValue);
+    if ("error" in shape) {
+      reportEntry("error", shape.error);
       continue;
     }
+    const { rawEntry } = shape;
+    // Claude Code skips a remote entry without `type` as a configuration error, so Xum does not
+    // infer a transport for it as the Codex dialect does.
+    if (
+      plugin.mcpConfigDialect === "claude" &&
+      rawEntry.type === undefined &&
+      rawEntry.url !== undefined
+    ) {
+      reportEntry(
+        "warning",
+        "a 'url' entry needs a 'type' ('http' or 'sse') in a Claude .mcp.json"
+      );
+      continue;
+    }
+    const codex = codexDialect
+      ? translateCodexMcpEntry(rawEntry)
+      : { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };
+    const entry = codex.entry;
 
     // §7.2.2 rules 3-4: invalid entries and unknown transports are skipped
     // individually; sibling servers keep loading.
-    let result: { info: MCPServerInfo } | { error: string } | { skip: string };
-    if (entry.type === "stdio") {
-      result = await normalizeStdioEntry(entry, normalizeCtx);
-    } else if (entry.type === "streamable-http" || entry.type === "sse") {
-      result = normalizeRemoteEntry(entry, normalizeCtx);
-    } else {
-      reportEntry("error", `unknown server 'type' ${JSON.stringify(entry.type)}`);
-      continue;
-    }
-
+    const result = await normalizeServerEntry(codex, normalizeCtx);
     if ("error" in result) {
       reportEntry("error", result.error);
       continue;
@@ -540,11 +834,38 @@ export async function loadPluginMcpServers(
     }
 
     const info = result.info;
+    // Unusable settings only warn: the server still loads. Messages name fields, never values
+    // (see openaiMcpAuth's SECURITY AUDIT).
+    const messages =
+      info.transport === "stdio"
+        ? codex.warnings
+        : remoteOAuthMessages(info, entry, codex, {
+            pluginRoot: plugin.rootPath,
+            mcpConfigPath: plugin.mcpConfigPath,
+            serverName,
+          });
+    for (const message of messages) {
+      const fullMessage = `${fileLabel} server '${serverName}': ${message}`;
+      log.warn(`Agent plugin ${plugin.rootPath}: ${fullMessage}`);
+      diagnostics.push({
+        path: plugin.mcpConfigPath,
+        scope: plugin.scope,
+        severity: "warning",
+        message: fullMessage,
+      });
+    }
     assert(
       info.plugin !== undefined,
       "loadPluginMcpServers: normalized info must carry provenance"
     );
     info.plugin.serverName = serverName;
+    if (plugin.componentPolicy !== undefined) info.plugin.componentPolicy = plugin.componentPolicy;
+    // The fingerprint of what will launch (#6498). The lexical install path is a root spelling
+    // too: the install review normalized it, and a manifest can name it literally.
+    info.plugin.consentFingerprint = serverConsentFingerprint(info, {
+      rootPaths: [plugin.rootPath, path.join(plugin.containerPath, plugin.dirName)],
+      dataPaths: [dataPath],
+    });
     servers[buildPluginServerKey(instanceId, serverName)] = info;
   }
 
@@ -554,7 +875,7 @@ export async function loadPluginMcpServers(
 /**
  * Where and how plugin MCP discovery runs for a call.
  *
- * `projectRoot` is the host checkout whose `.mux/plugins` / `.agents/plugins`
+ * `projectRoot` is the host checkout whose `.xum/plugins` / `.agents/plugins`
  * containers are scanned. For workspace flows this is the ACTIVE worktree (so
  * plugin content follows the branch, matching skill discovery); for
  * project-level flows (Settings, workspace MCP modal) it is the project path.
@@ -609,39 +930,55 @@ export type AgentPluginsMcpProvider = (
 function computeProjectPluginInstanceId(args: {
   projectKey: string;
   projectRoot: string;
-  plugin: AgentPluginInfo;
+  plugin: Pick<AgentPluginInfo, "containerPath" | "dirName">;
 }): string {
-  // Lexical container-relative location, e.g. ".mux/plugins/hello-plugin".
-  const relativeLocation = path.join(
-    path.relative(args.projectRoot, args.plugin.containerPath),
-    args.plugin.dirName
+  const relativeLocation = normalizeProjectMetadataIdentityPath(
+    path.join(path.relative(args.projectRoot, args.plugin.containerPath), args.plugin.dirName)
   );
   return computePluginInstanceId(`${args.projectKey}\0${relativeLocation}`);
 }
 
 /**
- * Build the MCP server provider for Agent Plugins containers. Returns an empty
- * map when the agent-plugins experiment is off. Project-scope containers are
- * consulted only for trusted projects (mirroring repo `.mux/mcp.jsonc`).
- * Failures in one plugin never affect others (§11.3).
+ * The one instance ID of a discovered plugin. Plugin MCP server keys,
+ * `PLUGIN_DATA` and plugin hook settings all use it, so every consumer must
+ * call this instead of hashing a path itself: a second hashing rule would
+ * make hooks read a different server than the plugin's own.
+ * (Salvaged from the closed PR #6040.)
  */
-export function createAgentPluginsMcpProvider(ctx: {
-  muxHome: string;
-  isEnabled: () => boolean;
-}): AgentPluginsMcpProvider {
+export function resolvePluginInstanceId(
+  plugin: Pick<AgentPluginInfo, "scope" | "containerPath" | "dirName">,
+  ctx: AgentPluginsMcpContext
+): string {
+  if (plugin.scope === "project" && ctx.projectRoot !== undefined) {
+    return computeProjectPluginInstanceId({
+      projectKey: ctx.projectKey ?? ctx.projectRoot,
+      projectRoot: ctx.projectRoot,
+      plugin,
+    });
+  }
+  // Global scope: hash the LEXICAL installation location, not the canonical
+  // root. A symlinked plugin dir (e.g. a version-managed install) realpaths to
+  // a version-specific target, so hashing rootPath would rotate the server key
+  // and PLUGIN_DATA on every update, silently disabling workspace-enabled
+  // servers and orphaning their persistent data.
+  return computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName));
+}
+
+/**
+ * Build the MCP server provider for Agent Plugins containers. Project-scope
+ * containers are consulted only for trusted projects (mirroring repo
+ * `.xum/mcp.jsonc`). Failures in one plugin never affect others (§11.3).
+ */
+export function createAgentPluginsMcpProvider(ctx: { xumHome: string }): AgentPluginsMcpProvider {
   assert(
-    path.isAbsolute(ctx.muxHome),
-    "createAgentPluginsMcpProvider: muxHome must be an absolute path"
+    path.isAbsolute(ctx.xumHome),
+    "createAgentPluginsMcpProvider: xumHome must be an absolute path"
   );
 
   return async (args) => {
-    if (!ctx.isEnabled()) {
-      return {};
-    }
-
     const projectRoot = args.projectRoot;
     const containers: AgentPluginContainer[] = computeAgentPluginContainers({
-      muxHome: ctx.muxHome,
+      xumHome: ctx.xumHome,
       projectRoot,
       projectTrusted: args.trusted,
     });
@@ -653,7 +990,6 @@ export function createAgentPluginsMcpProvider(ctx: {
         if (plugin.mcpConfigPath === undefined) {
           continue;
         }
-        let instanceId: string;
         if (plugin.scope === "project" && projectRoot !== undefined) {
           // Project plugin roots keep the repo-symlink posture of repo config:
           // the plugin root itself must stay inside the scanned checkout.
@@ -665,23 +1001,14 @@ export function createAgentPluginsMcpProvider(ctx: {
             );
             continue;
           }
-          instanceId = computeProjectPluginInstanceId({
-            projectKey: args.projectKey ?? projectRoot,
-            projectRoot,
-            plugin,
-          });
-        } else {
-          // Global scope: hash the LEXICAL installation location, not the
-          // canonical root. A symlinked plugin dir (e.g. a version-managed
-          // install) realpaths to a version-specific target, so hashing
-          // rootPath would rotate the server key and PLUGIN_DATA on every
-          // update, silently disabling workspace-enabled servers and
-          // orphaning their persistent data.
-          instanceId = computePluginInstanceId(path.join(plugin.containerPath, plugin.dirName));
         }
+        const instanceId = resolvePluginInstanceId(plugin, {
+          projectRoot,
+          projectKey: args.projectKey,
+        });
         try {
           const { servers } = await loadPluginMcpServers(plugin, {
-            muxHome: ctx.muxHome,
+            xumHome: ctx.xumHome,
             instanceId,
           });
           Object.assign(merged, servers);
@@ -694,6 +1021,14 @@ export function createAgentPluginsMcpProvider(ctx: {
       }
     } catch (error) {
       log.warn(`Agent Plugins MCP discovery failed: ${getErrorMessage(error)}`);
+    }
+    // Descriptor reads await plugin files after discovery's registry read.
+    // Revoke against current consent before exposing any managed registration.
+    if (Object.values(merged).some((info) => info.plugin?.componentPolicy !== undefined)) {
+      const policy = await readPluginMcpPolicy(path.join(ctx.xumHome, PLUGIN_REGISTRY_FILE_NAME));
+      for (const [name, info] of Object.entries(merged)) {
+        if (!isPluginMcpServerAllowed(info.plugin, policy)) delete merged[name];
+      }
     }
     return merged;
   };

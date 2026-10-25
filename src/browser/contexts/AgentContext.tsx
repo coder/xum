@@ -12,16 +12,21 @@ import {
 } from "react";
 
 import { useAPI } from "@/browser/contexts/API";
-import { useWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
+import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import { subscribeAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { matchesKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { matchesKeybind, KEYBINDS, paneHandlesKeyEvent } from "@/browser/utils/ui/keybinds";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
+import { getProjectScopeId, GLOBAL_SCOPE_ID } from "@/common/constants/storage";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
-  getAgentIdKey,
-  getProjectScopeId,
-  getDisableWorkspaceAgentsKey,
-  GLOBAL_SCOPE_ID,
-} from "@/common/constants/storage";
+  readScopedAiDefault,
+  useScopedAiDefault,
+  writeScopedAiDefault,
+} from "@/browser/utils/scopedAiDefaults";
+import { setAgentBases } from "@/browser/utils/aiSelectionIntent";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { sortAgentsStable } from "@/browser/utils/agents";
 import { normalizeAgentId, resolveRemovedBuiltinAgentId } from "@/common/utils/agentIds";
@@ -39,12 +44,6 @@ export interface AgentContextValue {
   refresh: () => Promise<void>;
   /** True while a refresh is in progress */
   refreshing: boolean;
-  /**
-   * When true, agents are loaded from projectPath only (ignoring workspace worktree).
-   * Useful for unbricking when iterating on agent files in a workspace.
-   */
-  disableWorkspaceAgents: boolean;
-  setDisableWorkspaceAgents: Dispatch<SetStateAction<boolean>>;
   /** True when workspace metadata locks agent selection changes. */
   isAgentSelectionLocked?: boolean;
 }
@@ -56,6 +55,13 @@ type AgentProviderProps =
   | {
       workspaceId?: string;
       projectPath?: string;
+      /** Overrides the choice scope (a creation draft's scope; projectPath still lists agents). */
+      scopeId?: string;
+      /**
+       * For hosts without WorkspaceProvider (the VS Code webview, #4738): the workspace's persisted
+       * agent identity, so the sub-agent lock still applies. Ignored when metadata is available.
+       */
+      workspaceMetaFallback?: Pick<FrontendWorkspaceMetadata, "parentWorkspaceId" | "agentId">;
       children: ReactNode;
     };
 
@@ -78,59 +84,43 @@ export function AgentProvider(props: AgentProviderProps) {
 function AgentProviderWithState(props: {
   workspaceId?: string;
   projectPath?: string;
+  scopeId?: string;
+  workspaceMetaFallback?: Pick<FrontendWorkspaceMetadata, "parentWorkspaceId" | "agentId">;
   children: ReactNode;
 }) {
   const { api } = useAPI();
-  const { workspaceMetadata } = useWorkspaceMetadata();
-  const currentMeta = props.workspaceId ? workspaceMetadata.get(props.workspaceId) : undefined;
+  // The VS Code webview mounts no WorkspaceProvider (#4711). Without metadata the workspace is
+  // treated like one with no metadata entry: agent selection stays unlocked. The desktop app always
+  // mounts AgentProvider inside WorkspaceProvider, so its sub-agent lock is unchanged.
+  const workspaceMetadata = useOptionalWorkspaceMetadata()?.workspaceMetadata;
+  const currentMeta = props.workspaceId
+    ? workspaceMetadata
+      ? workspaceMetadata.get(props.workspaceId)
+      : props.workspaceMetaFallback
+    : undefined;
 
-  const scopeId = getScopeId(props.workspaceId, props.projectPath);
+  const scopeId = props.scopeId ?? getScopeId(props.workspaceId, props.projectPath);
   const isProjectScope = !props.workspaceId && Boolean(props.projectPath);
 
-  const [globalDefaultAgentId] = usePersistedState<string>(
-    getAgentIdKey(GLOBAL_SCOPE_ID),
-    WORKSPACE_DEFAULTS.agentId,
-    {
-      listener: true,
-    }
-  );
+  const globalDefaultAgentId =
+    useUserPreferences((preferences) => preferences.ai?.globalDefaults?.agentId) ??
+    WORKSPACE_DEFAULTS.agentId;
 
-  const [scopedAgentId, setAgentIdRaw] = usePersistedState<string | null>(
-    getAgentIdKey(scopeId),
-    isProjectScope ? null : WORKSPACE_DEFAULTS.agentId,
-    {
-      listener: true,
-    }
-  );
+  const scopedAgentId =
+    useScopedAiDefault(scopeId, "agentId") ?? (isProjectScope ? null : WORKSPACE_DEFAULTS.agentId);
   const explicitScopedAgentId =
     typeof scopedAgentId === "string" && scopedAgentId.trim().length > 0 ? scopedAgentId : null;
 
-  const [disableWorkspaceAgents, setDisableWorkspaceAgents] = usePersistedState<boolean>(
-    getDisableWorkspaceAgentsKey(scopeId),
-    false,
-    { listener: true }
-  );
-
-  // The UI toggle for disableWorkspaceAgents was removed — clear persisted
-  // true values so users who had it enabled aren't stranded with no way to
-  // re-enable workspace agents.
-  useEffect(() => {
-    if (disableWorkspaceAgents) {
-      setDisableWorkspaceAgents(false);
-    }
-  }, [disableWorkspaceAgents, setDisableWorkspaceAgents]);
-
   const setAgentId: Dispatch<SetStateAction<string>> = useCallback(
     (value) => {
-      setAgentIdRaw((prev) => {
-        const explicitPrevAgentId =
-          typeof prev === "string" && prev.trim().length > 0 ? prev : globalDefaultAgentId;
-        const previousAgentId = coerceAgentId(isProjectScope ? explicitPrevAgentId : prev);
-        const next = typeof value === "function" ? value(previousAgentId) : value;
-        return coerceAgentId(next);
-      });
+      const prev = readScopedAiDefault(scopeId, "agentId");
+      const explicitPrevAgentId =
+        typeof prev === "string" && prev.trim().length > 0 ? prev : globalDefaultAgentId;
+      const previousAgentId = coerceAgentId(isProjectScope ? explicitPrevAgentId : prev);
+      const next = typeof value === "function" ? value(previousAgentId) : value;
+      writeScopedAiDefault(scopeId, "agentId", coerceAgentId(next));
     },
-    [globalDefaultAgentId, isProjectScope, setAgentIdRaw]
+    [globalDefaultAgentId, isProjectScope, scopeId]
   );
 
   const [agents, setAgents] = useState<AgentDefinitionDescriptor[]>([]);
@@ -151,24 +141,26 @@ function AgentProviderWithState(props: {
   const fetchParamsRef = useRef({
     projectPath: props.projectPath,
     workspaceId: props.workspaceId,
-    disableWorkspaceAgents,
+    generation: 0,
   });
 
   const fetchAgents = useCallback(
     async (
       projectPath: string | undefined,
       workspaceId: string | undefined,
-      workspaceAgentsDisabled: boolean
+      agentScopeId: string
     ) => {
-      fetchParamsRef.current = {
-        projectPath,
-        workspaceId,
-        disableWorkspaceAgents: workspaceAgentsDisabled,
-      };
+      // Each fetch takes the next generation, and only the latest one commits. Two fetches of the
+      // same scope can overlap (a plugin-mutation refresh during the initial load, #6629), and an
+      // older answer must not replace a newer one.
+      const generation = fetchParamsRef.current.generation + 1;
+      fetchParamsRef.current = { projectPath, workspaceId, generation };
 
       if (!api || (!projectPath && !workspaceId)) {
         if (isMountedRef.current) {
-          setAgents([]);
+          // No setAgents([]): offline, keep the agents shown for this scope, the reconnect
+          // reloads them. A scope change (also to no scope) already cleared them in the load
+          // effect below.
           setLoaded(true);
           setLoadFailed(false);
         }
@@ -176,31 +168,19 @@ function AgentProviderWithState(props: {
       }
 
       try {
-        const result = await api.agents.list({
-          projectPath,
-          workspaceId,
-          disableWorkspaceAgents: workspaceAgentsDisabled || undefined,
-        });
-        const current = fetchParamsRef.current;
-        if (
-          current.projectPath === projectPath &&
-          current.workspaceId === workspaceId &&
-          current.disableWorkspaceAgents === workspaceAgentsDisabled &&
-          isMountedRef.current
-        ) {
+        const result = await api.agents.list({ projectPath, workspaceId });
+        if (fetchParamsRef.current.generation === generation && isMountedRef.current) {
           setAgents(result);
+          setAgentBases(agentScopeId, result);
           setLoadFailed(false);
           setLoaded(true);
         }
-      } catch {
-        const current = fetchParamsRef.current;
-        if (
-          current.projectPath === projectPath &&
-          current.workspaceId === workspaceId &&
-          current.disableWorkspaceAgents === workspaceAgentsDisabled &&
-          isMountedRef.current
-        ) {
+      } catch (error) {
+        // A lost connection (or the reconnect that replaced the client) is no load failure.
+        if (isConnectionLostError(error)) return;
+        if (fetchParamsRef.current.generation === generation && isMountedRef.current) {
           setAgents([]);
+          setAgentBases(agentScopeId, []);
           setLoadFailed(true);
           setLoaded(true);
         }
@@ -209,12 +189,19 @@ function AgentProviderWithState(props: {
     [api]
   );
 
+  // The scope whose agents are shown. Only a new scope clears them: a new client (reconnect)
+  // reloads the same scope behind the shown agents.
+  const shownScopeRef = useRef<string | null>(null);
   useEffect(() => {
-    setAgents([]);
-    setLoaded(false);
-    setLoadFailed(false);
-    void fetchAgents(props.projectPath, props.workspaceId, disableWorkspaceAgents);
-  }, [fetchAgents, props.projectPath, props.workspaceId, disableWorkspaceAgents]);
+    const scope = JSON.stringify([props.projectPath, props.workspaceId]);
+    if (shownScopeRef.current !== scope) {
+      shownScopeRef.current = scope;
+      setAgents([]);
+      setLoaded(false);
+      setLoadFailed(false);
+    }
+    void fetchAgents(props.projectPath, props.workspaceId, scopeId);
+  }, [fetchAgents, props.projectPath, props.workspaceId, scopeId]);
 
   const refresh = useCallback(async () => {
     if (!props.projectPath && !props.workspaceId) return;
@@ -222,13 +209,13 @@ function AgentProviderWithState(props: {
 
     setRefreshing(true);
     try {
-      await fetchAgents(props.projectPath, props.workspaceId, disableWorkspaceAgents);
+      await fetchAgents(props.projectPath, props.workspaceId, scopeId);
     } finally {
       if (isMountedRef.current) {
         setRefreshing(false);
       }
     }
-  }, [fetchAgents, props.projectPath, props.workspaceId, disableWorkspaceAgents]);
+  }, [fetchAgents, props.projectPath, props.workspaceId, scopeId]);
 
   // Project-scoped providers should inherit the global default agent until a
   // project-scoped preference is explicitly set. Child/subagent workspaces keep
@@ -258,19 +245,18 @@ function AgentProviderWithState(props: {
     if (
       !canResolveRemovedBuiltinAgentId ||
       effectiveAgentId === normalizedAgentId ||
-      (isProjectScope && explicitScopedAgentId == null)
+      isProjectScope
     ) {
       return;
     }
 
-    setAgentIdRaw(effectiveAgentId);
+    writeScopedAiDefault(scopeId, "agentId", effectiveAgentId);
   }, [
     canResolveRemovedBuiltinAgentId,
     effectiveAgentId,
     isProjectScope,
     normalizedAgentId,
-    explicitScopedAgentId,
-    setAgentIdRaw,
+    scopeId,
   ]);
 
   const selectableAgents = useMemo(
@@ -296,8 +282,13 @@ function AgentProviderWithState(props: {
     }
   }, [effectiveAgentId, isCurrentAgentLocked, selectableAgents, setAgentId]);
 
+  // The main chat and the /side chat tab each mount an AgentProvider; only the pane that owns the
+  // focused element reacts, so one keystroke never cycles both chats' agents. The picker this opens
+  // is routed by focus too (see AgentModePicker's OPEN_AGENT_PICKER listener).
+  const paneScope = useChatPaneScope();
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (!paneHandlesKeyEvent(paneScope, e.target)) return;
       if (matchesKeybind(e, KEYBINDS.TOGGLE_AGENT)) {
         e.preventDefault();
         if (!isCurrentAgentLocked) {
@@ -315,7 +306,7 @@ function AgentProviderWithState(props: {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [cycleToNextAgent, isCurrentAgentLocked]);
+  }, [cycleToNextAgent, isCurrentAgentLocked, paneScope]);
 
   useEffect(() => {
     const handleRefreshRequested = () => {
@@ -323,8 +314,12 @@ function AgentProviderWithState(props: {
     };
 
     window.addEventListener(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED, handleRefreshRequested);
-    return () =>
+    // A plugin install, update or component review changes which plugin agents load (#6629).
+    const unsubscribe = subscribeAgentPluginsMutated(handleRefreshRequested);
+    return () => {
       window.removeEventListener(CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED, handleRefreshRequested);
+      unsubscribe();
+    };
   }, [refresh]);
 
   const agentContextValue = useMemo(
@@ -337,8 +332,6 @@ function AgentProviderWithState(props: {
       loadFailed,
       refresh,
       refreshing,
-      disableWorkspaceAgents,
-      setDisableWorkspaceAgents,
       isAgentSelectionLocked: isCurrentAgentLocked,
     }),
     [
@@ -350,13 +343,15 @@ function AgentProviderWithState(props: {
       loadFailed,
       refresh,
       refreshing,
-      disableWorkspaceAgents,
-      setDisableWorkspaceAgents,
       isCurrentAgentLocked,
     ]
   );
 
   return <AgentContext.Provider value={agentContextValue}>{props.children}</AgentContext.Provider>;
+}
+
+export function useOptionalAgent(): AgentContextValue | undefined {
+  return useContext(AgentContext);
 }
 
 export function useAgent(): AgentContextValue {

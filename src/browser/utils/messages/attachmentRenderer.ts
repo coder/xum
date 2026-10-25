@@ -5,6 +5,8 @@ import type {
   LoadedSkillsSnapshotAttachment,
   EditedFilesReferenceAttachment,
   CompletedReportsIndexAttachment,
+  ReadFilesReferenceAttachment,
+  ArtifactsIndexAttachment,
 } from "@/common/types/attachment";
 import {
   AGENT_SKILL_BODY_TRUNCATION_NOTE,
@@ -21,31 +23,11 @@ function wrapSystemUpdate(content: string): string {
 }
 
 /**
- * Render a plan file reference attachment to content string.
- */
-function renderPlanFileReference(attachment: PlanFileReferenceAttachment): string {
-  return `A plan file exists from plan mode at: ${attachment.planFilePath}
-
-Plan contents:
-${attachment.planContent}
-
-If this plan is relevant to the current work and not already complete, continue working on it.`;
-}
-
-/**
  * Render a todo list attachment to a content string.
  */
 function renderTodoListAttachment(attachment: TodoListAttachment): string {
   const items = renderTodoItemsAsMarkdownList(attachment.todos);
   return `TODO list (persisted; \`todo_read\` will return this):\n${items || "- (empty)"}`;
-}
-
-function renderLoadedSkillsSnapshot(attachment: LoadedSkillsSnapshotAttachment): string {
-  const skillEntries = attachment.skills
-    .map((skill) => renderAgentSkillSnapshotText(skill))
-    .join("\n\n");
-
-  return `The following skills were loaded in this session:\n\n${skillEntries}`;
 }
 
 /**
@@ -76,17 +58,7 @@ function formatCompletedReportEntryLine(
 }
 
 /**
- * Render the completed-reports index. Lists re-fetchable handles only (no report
- * content): the full reports persist on disk and survive compaction, so the model
- * can recover them via task_await instead of re-running expensive work.
- */
-function renderCompletedReportsIndex(attachment: CompletedReportsIndexAttachment): string {
-  const lines = attachment.reports.map(formatCompletedReportEntryLine);
-  return `${COMPLETED_REPORTS_HEADER}${lines.join("\n")}${COMPLETED_REPORTS_FOOTER}`;
-}
-
-/**
- * Budget-aware variant: packs as many handles as fit (entries are newest-first, so
+ * Packs as many handles as fit (entries are newest-first, so
  * the oldest drop first) instead of omitting the whole block — losing every re-fetch
  * handle would defeat the recovery path this attachment exists for.
  */
@@ -124,40 +96,38 @@ function renderCompletedReportsIndexWithBudget(
 }
 
 /**
- * Render an edited files reference attachment to content string.
+ * SECURITY AUDIT: this attachment lands in a synthetic <system-update> block
+ * inside a USER-role post-compaction message — a high-trust channel that
+ * recurs on every turn after compaction summarized the original tool results
+ * away. File paths are repo-controlled bytes: tag-syntax escaping preserved
+ * instruction prose (Codex r48), and any charset allowlist still lets
+ * separator characters encode readable instructions
+ * (IGNORE_ALL_PREVIOUS_INSTRUCTIONS, r49). No filter renders attacker text
+ * safe in this channel, so NO path bytes are rendered at all — only the
+ * count, which is derived from list length, not attacker content. The model
+ * loses the per-path dedup hint and may re-read a file; that is the accepted
+ * cost of closing a persistent prompt-injection channel.
  */
-function renderEditedFilesReference(attachment: EditedFilesReferenceAttachment): string {
-  const fileEntries = attachment.files
-    .map((file) => {
-      const truncationNote = file.truncated ? " (truncated)" : "";
-      return `File: ${file.path}${truncationNote}
-\`\`\`diff
-${file.diff}
-\`\`\``;
-    })
-    .join("\n\n");
-
-  return `The following files were edited in this session:
-
-${fileEntries}`;
+function renderReadFilesReference(attachment: ReadFilesReferenceAttachment): string {
+  const count = attachment.paths.length;
+  return (
+    `${count} previously read file${count === 1 ? "" : "s"} had their contents ` +
+    `summarized away by compaction; re-read files when their contents are needed again.`
+  );
 }
 
 /**
- * Render a single post-compaction attachment to its content string.
+ * SECURITY AUDIT: same channel as renderReadFilesReference above. Artifact paths are file names
+ * the agent (or repo content it copied) chose, and labels are model-written text, so neither is
+ * rendered here: only the count, derived from list length. artifact_list returns the names and
+ * versions through a normal tool result when the model needs them.
  */
-export function renderAttachmentToContent(attachment: PostCompactionAttachment): string {
-  switch (attachment.type) {
-    case "plan_file_reference":
-      return renderPlanFileReference(attachment);
-    case "todo_list":
-      return renderTodoListAttachment(attachment);
-    case "loaded_skills_snapshot":
-      return renderLoadedSkillsSnapshot(attachment);
-    case "edited_files_reference":
-      return renderEditedFilesReference(attachment);
-    case "completed_reports_index":
-      return renderCompletedReportsIndex(attachment);
-  }
+function renderArtifactsIndex(attachment: ArtifactsIndexAttachment): string {
+  const count = attachment.artifacts.length;
+  return (
+    `${count} artifact${count === 1 ? " has" : "s have"} published versions in ` +
+    `$XUM_SCRATCH_DIR/artifacts; call artifact_list for names and versions.`
+  );
 }
 
 const PLAN_TRUNCATION_NOTE = "\n\n...(truncated)\n";
@@ -320,8 +290,10 @@ function sortAttachmentsForInjection(
     // Small, high-value handles go before the bulky skill/diff blocks so budget
     // truncation cannot drop them.
     completed_reports_index: 2,
-    loaded_skills_snapshot: 3,
-    edited_files_reference: 4,
+    read_files_reference: 3,
+    artifacts_index: 4,
+    loaded_skills_snapshot: 5,
+    edited_files_reference: 6,
   };
 
   return attachments
@@ -409,6 +381,24 @@ export function renderAttachmentsToContentWithBudget(
       omittedLoadedSkills += omittedSkills;
 
       if (content) {
+        addBlock(wrapSystemUpdate(content));
+      }
+      continue;
+    }
+
+    if (attachment.type === "read_files_reference") {
+      // Compact one-liner (paths only) — include whole or not at all.
+      const content = renderReadFilesReference(attachment);
+      if (content.length <= remainingForContent) {
+        addBlock(wrapSystemUpdate(content));
+      }
+      continue;
+    }
+
+    if (attachment.type === "artifacts_index") {
+      // Bounded list of handles — include whole or not at all.
+      const content = renderArtifactsIndex(attachment);
+      if (content.length <= remainingForContent) {
         addBlock(wrapSystemUpdate(content));
       }
       continue;

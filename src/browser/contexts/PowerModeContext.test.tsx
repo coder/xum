@@ -3,9 +3,15 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { GlobalWindow } from "happy-dom";
 
-import { POWER_MODE_ENABLED_KEY } from "@/common/constants/storage";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import { PowerModeEngine } from "@/browser/utils/powerMode/PowerModeEngine";
+import * as RealPowerModeOverlayModule from "@/browser/features/PowerMode/PowerModeOverlay";
+import { restoreModulesAfterSuite } from "../../../tests/ui/moduleMocks";
 
+// Restore the real overlay after this suite so the stub cannot leak into later files.
+restoreModulesAfterSuite([
+  ["@/browser/features/PowerMode/PowerModeOverlay", { ...RealPowerModeOverlayModule }],
+]);
 void mock.module("@/browser/features/PowerMode/PowerModeOverlay", () => ({
   // Overlay rendering is unrelated to caret alignment; keep tests focused on context behavior.
   PowerModeOverlay: () => null,
@@ -86,11 +92,14 @@ describe("PowerModeContext", () => {
     domGlobals.StorageEvent = dom.StorageEvent;
     domGlobals.CustomEvent = dom.CustomEvent;
 
-    window.localStorage.setItem(POWER_MODE_ENABLED_KEY, JSON.stringify(true));
+    getAppConfigStore().updateOptimistically({
+      userPreferences: { appearance: { powerModeEnabled: true } },
+    });
   });
 
   afterEach(() => {
     cleanup();
+    getAppConfigStore().updateOptimistically({ userPreferences: undefined });
     mock.restore();
     globalThis.getComputedStyle = originalGetComputedStyle;
     globalThis.window = originalWindow;

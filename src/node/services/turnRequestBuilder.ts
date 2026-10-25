@@ -1,0 +1,4071 @@
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
+import { withExecutionScope } from "./tools/withExecutionScope";
+import { getArtifactShelfRoot } from "@/node/services/artifactShelf";
+import { usesInstallationScopedPlans } from "@/common/utils/planStorage";
+import { resolvePlanFileLocation, withInstallationId } from "@/node/utils/runtime/planLocation";
+import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
+import { execBuffered } from "@/node/utils/runtime/helpers";
+import { shellQuote } from "@/common/utils/shell";
+import type { OnStepSettled } from "./streamManager";
+import { measureAssembledRequestBudgetForModel } from "./contextBudgetCounting";
+import { ContextBudgetExceededError } from "./contextBudgetError";
+import type { ContextBudgetExceeded } from "@/common/utils/compaction/contextBudget";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
+import { measureCompactionInputTokens } from "./compactionInputSizing";
+import {
+  anthropicBetweenToolsRouteAvailable,
+  anthropicNativeWebFetchRouteAvailable,
+  canSwitchToAnthropic1MContext,
+  isAnthropic1MEffectivelyEnabled,
+} from "@/common/utils/ai/providerOptions";
+import * as path from "path";
+import {
+  ensureScratchDirForSpec,
+  RemoteScratchDirCache,
+  resolveScratchDirSpec,
+} from "@/node/runtime/runtimeScratchDir";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import type { MemoryScopeAccess } from "@/common/constants/memory";
+import {
+  EXPERIMENT_IDS,
+  isTokenBudgetActive,
+  type ExperimentId,
+} from "@/common/constants/experiments";
+import assert from "@/common/utils/assert";
+import { type LanguageModel, type Tool } from "ai";
+
+import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types";
+import type { Result } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import type { WorkspaceMetadata } from "@/common/types/workspace";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
+
+import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
+
+import type { SendMessageError } from "@/common/types/errors";
+import type { GoalSyntheticMessageKind, TaskTurnKind } from "@/constants/goals";
+import type { TurnAcceptanceOrigin } from "./taskWorkspaceSeam";
+import type { MuxMessage, MuxMessageMetadata, SystemSectionRecords } from "@/common/types/message";
+import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
+import { createMuxMessage, SYSTEM_SECTION_RECORD_FIELDS } from "@/common/types/message";
+import type { MuxProviderOptions } from "@/common/types/providerOptions";
+import { secretsToRecord } from "@/common/types/secrets";
+import type { XumToolScope } from "@/common/types/toolScope";
+import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
+import {
+  deriveToolHookConfig,
+  getForcedXaiSearchToolNames,
+  getToolsForModel,
+  supportsAnthropicToolSearch,
+  type MCPPromptRuntime,
+  type ToolConfiguration,
+} from "@/common/utils/tools/tools";
+import type { Config, ProvidersConfigStore, SecretsStore } from "@/node/config";
+import { getRuntimeType, getXumEnv } from "@/node/runtime/initHook";
+import { type WorkspaceRuntimeContext } from "@/node/runtime/runtimeHelpers";
+import { AgentDefinitionRequestCache } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { prepareWorkspaceRequestHooks } from "./agentPlugins/requestHooks";
+import type { RequestAssemblySnapshot } from "./events/eventSpine";
+import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
+import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
+import { isRlmModeEnabled } from "@/node/services/branchSummary";
+import type { ProviderService } from "@/node/services/providerService";
+import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
+import { type DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
+import { formatMcpAppModelContextSection } from "@/node/services/mcpAppResultStore";
+import type { InitStateManager } from "./initStateManager";
+import { runLanguageModelCleanup } from "./languageModelCleanup";
+import { log } from "./log";
+import { prepareAgentInterfaceStatusPage } from "./agentInterfaceStatusPage";
+import { resolveArtifactsLocation } from "./artifactsOperations";
+import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
+import type { StreamManager } from "./streamManager";
+import {
+  type ModelFallbackOptions,
+  type TurnCompletion,
+  type TurnExecutionOptions,
+  type TurnStreamHandle,
+} from "./streamManager";
+import { emitTurnEnvelope } from "./turnEnvelope";
+
+import { normalizeToCanonical } from "@/common/utils/ai/models";
+import { listAvailableModels } from "@/common/utils/ai/selectableModels";
+import { DEFAULT_ROUTE_PRIORITY } from "@/common/routing";
+import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
+import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
+import type { DesktopNotifications } from "@/node/services/desktopNotifications/desktopNotifications";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
+import type { BashAiProxyService } from "@/node/services/bashAiProxy/bashAiProxyService";
+import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
+import type { DevToolsService } from "@/node/services/devToolsService";
+import type { ExperimentsService } from "@/node/services/experimentsService";
+import { resolveWorkspaceModelFallbackChain } from "@/node/services/taskUtils";
+import type { TelemetryService } from "@/node/services/telemetryService";
+import {
+  effectiveAdditionalSystemContext,
+  mergeAdditionalSystemInstructions,
+  readAdditionalSystemContext,
+} from "./additionalSystemContext";
+import type { HistoryService } from "./historyService";
+import type { SessionUsageService } from "./sessionUsageService";
+import { sideChatCapabilityGrants, withSideChatInstructions } from "./sideChat";
+import type { EvaluationService } from "./evaluation/evaluationService";
+import type { InstructionSources } from "@/common/types/instructions";
+import { extractToolInstructionsFromSources } from "./systemMessage";
+import { createAssistantMessageId } from "./utils/messageIds";
+import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
+
+import type { ProvidersConfig } from "@/common/config/schemas/providersConfig";
+import {
+  coderGatewayWireProtocol,
+  resolveCoderWireCanonicalModel,
+} from "@/common/constants/coderOAuth";
+import { PROVIDER_DEFINITIONS, type ProviderName } from "@/common/constants/providers";
+import type { MCPServerMap, WorkspaceMCPOverrides } from "@/common/types/mcp";
+import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
+import { resolveModelParameterOverrides } from "@/common/utils/ai/modelParameterOverrides";
+import {
+  buildProviderOptions,
+  buildRequestHeaders,
+  resolveProviderOptionsNamespaceKey,
+} from "@/common/utils/ai/providerOptions";
+import { uniqueSuffix } from "@/common/utils/hasher";
+import { isPlainObject } from "@/common/utils/isPlainObject";
+import { getProjects, isMultiProject } from "@/common/utils/multiProject";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
+import {
+  customProviderWireOrigin,
+  isCustomProviderConfig,
+} from "@/common/utils/providers/customProviders";
+import {
+  workspaceOverridesEqual,
+  type MCPServerManager,
+  type MCPWorkspaceStats,
+} from "@/node/services/mcpServerManager";
+import { type MemoryService, type MemorySessionContext } from "@/node/services/memoryService";
+import type { TaskService } from "@/node/services/taskService";
+import { resolveMemoryAccessPolicy, resolveMemoryScopes } from "@/node/services/tools/memory";
+import { skillIndexSectionFor } from "@/node/services/tools/agent_skill_read";
+import { isWorkspaceTrustedForSharedExecution } from "@/node/services/utils/workspaceTrust";
+import {
+  MCP_OVERRIDES_READ_TIMEOUT_MS,
+  type WorkspaceMcpOverridesService,
+} from "./workspaceMcpOverridesService";
+
+import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import {
+  THINKING_LEVEL_OFF,
+  type OpenAIReasoningMode,
+  type ThinkingLevel,
+} from "@/common/types/thinking";
+import { mergeGoalDefaults } from "@/common/utils/goals/resolveGoalSetIntent";
+import {
+  enforceThinkingPolicy,
+  isXaiGrokFastVariantSwap,
+  lookupMinThinkingLevelOverride,
+  assistantThinkingLevels,
+  resolveBetweenToolsThinkingLevel,
+  resolveEffectiveThinkingLevel,
+  resolveMinimumThinkingLevel,
+} from "@/common/utils/thinking/policy";
+import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults } from "@/constants/goals";
+import type {
+  RebuildFirstStepForThinkingLevel,
+  RebuildProviderOptionsForThinkingLevel,
+} from "@/node/services/thinkingOverride";
+
+import { isTerminalWorkflowRunStatus } from "@/common/types/workflow";
+import { getErrorMessage } from "@/common/utils/errors";
+import { isRuntimeReadFailure, isRuntimeTransportError } from "@/node/runtime/Runtime";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
+import {
+  computeActiveToolNames,
+  computeLoadedToolNames,
+  prepareToolSearch,
+  rebuildToolSearchState,
+  seedToolSearchActivationsFromMessages,
+  TOOL_SEARCH_TOOL_NAME,
+  type ToolCatalogOverviewMemo,
+  type ToolSearchRuntime,
+} from "@/common/utils/tools/toolCatalog";
+import {
+  buildWorkflowResultContextMessage,
+  WORKFLOW_RESULT_METADATA_TYPE,
+} from "@/common/utils/workflowRunMessages";
+import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
+import {
+  createPathSkillActivation,
+  loadedSnapshotSkillNames,
+} from "@/node/services/agentSkills/pathSkillActivation";
+import { eventSpine, type RequestAssembleContext } from "@/node/services/events/eventSpine";
+import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
+import type { PTCEventWithParent } from "@/node/services/tools/code_execution";
+import { createKernelFileLoader } from "@/node/services/tools/kernelFileLoad";
+import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import type { WorkflowArchiveAdmissionGuard } from "@/node/services/workflows/workflowArchiveAdmission";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
+import {
+  WorkflowService,
+  type WorkflowRunStatusChangedEvent,
+} from "@/node/services/workflows/WorkflowService";
+import {
+  createProductionWorkflowTaskAdapter,
+  DEFAULT_WORKFLOW_AGENT_ID,
+} from "@/node/services/workflows/WorkflowTaskServiceAdapter";
+import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
+import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
+import { isWorkspaceProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
+import { getAnthropicCacheTtl, supportsAnthropicCache } from "@/common/utils/ai/cacheStrategy";
+import { getLegacyModeForAgentMetadata, resolveAgentForStream } from "./agentResolution";
+import { DEVTOOLS_RUN_METADATA_ID_HEADER } from "./devToolsHeaderCapture";
+import type { OauthServiceBindings, ProviderModelFactory } from "./providerModelFactory";
+import {
+  assemblePromptPayload,
+  buildPlanInstructions,
+  buildContextWindowSection,
+  buildStreamSystemContext,
+  formatMcpWarningSection,
+  measureWholeVolatileSystemSuffix,
+  prepareProviderRequestMessages,
+  removeMemoryGuidance,
+  type PromptPayload,
+  selectActiveContextMessages,
+} from "./turnContextAssembler";
+import { resolveContextWindowIds } from "./contextWindowRollover";
+export { prepareProviderRequestMessages };
+import {
+  simulateContextLimitError,
+  simulateToolPolicyNoop,
+  type SimulationContext,
+} from "./streamSimulation";
+import { applyToolPolicyAndExperiments, captureMcpToolTelemetry } from "./toolAssembly";
+
+import { applyCapabilityGrants } from "@/common/utils/tools/capabilityGrants";
+import { isAgentToolsDisabled } from "@/node/utils/agentToolsDisabled";
+
+const STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS = 1_000;
+
+/** Structural equality of two server inventories (plain JSON-shaped config records). */
+function mcpServerMapsEqual(a: MCPServerMap | undefined, b: MCPServerMap | undefined): boolean {
+  if (a === b) return true;
+  if (a === undefined || b === undefined) return false;
+  const aKeys = Object.keys(a).sort();
+  const bKeys = Object.keys(b).sort();
+  if (aKeys.length !== bKeys.length) return false;
+  return aKeys.every(
+    (key, index) => key === bKeys[index] && JSON.stringify(a[key]) === JSON.stringify(b[key])
+  );
+}
+
+export function resolveMuxProjectRootForHostFs(
+  metadata: WorkspaceMetadata,
+  workspacePath: string
+): string {
+  const runtimeType = metadata.runtimeConfig.type;
+  return runtimeType === "ssh" || runtimeType === "docker" ? metadata.projectPath : workspacePath;
+}
+
+export function resolveXumToolScope(
+  config: Config,
+  metadata: WorkspaceMetadata,
+  workspacePath: string,
+  checkoutRoot?: string | null
+): XumToolScope {
+  const projectConfig = config.loadConfigOrDefault().projects.get(metadata.projectPath);
+  if (
+    projectConfig?.projectKind === "system" &&
+    metadata.projectPath !== MULTI_PROJECT_CONFIG_KEY
+  ) {
+    return { type: "global", xumHome: config.rootDir };
+  }
+  const runtimeType = metadata.runtimeConfig.type;
+  return {
+    type: "project",
+    xumHome: config.rootDir,
+    projectRoot: resolveMuxProjectRootForHostFs(metadata, workspacePath),
+    projectStorageAuthority:
+      runtimeType === "ssh" || runtimeType === "docker" ? "runtime" : "host-local",
+    ...(checkoutRoot != null ? { checkoutRoot } : {}),
+    // #6426: the project's own plugins contribute skills only once the project is trusted.
+    projectPluginsTrusted: isWorkspaceProjectTrusted(config, metadata),
+  };
+}
+
+import type { PostCompactionAttachment } from "@/common/types/attachment";
+import type { ErrorEvent } from "@/common/types/stream";
+import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import type { FileState } from "@/node/services/agentSession";
+import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
+import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
+
+/**
+ * Whether PTC actually ran for this assembly. Policy can stop it (#7028), and
+ * then the MCP tools are flat again, so tool search must treat the request as
+ * non-PTC. code_execution is only ever synthesized by the PTC branch, so its
+ * presence says PTC ran.
+ */
+function ptcRanForTools(ptcEnabled: boolean, tools: Record<string, Tool>): boolean {
+  return ptcEnabled && tools.code_execution !== undefined;
+}
+
+/** Options used to prepare and execute a turn. */
+export interface StreamMessageOptions {
+  messages: MuxMessage[];
+  workspaceId: string;
+  modelString: string;
+  thinkingLevel?: ThinkingLevel;
+  /** OpenAI pro reasoning mode; delivered via provider options (inert for unsupported models). */
+  reasoningMode?: OpenAIReasoningMode;
+  toolPolicy?: ToolPolicy;
+  abortSignal?: AbortSignal;
+  /** Live workspace scratchpad snapshot from the renderer; when present it wins over disk. */
+  additionalSystemContext?: string;
+  additionalSystemInstructions?: string;
+  maxOutputTokens?: number;
+  muxProviderOptions?: MuxProviderOptions;
+  /** Internal-only flag for Copilot billing attribution; never sourced from IPC schemas. */
+  agentInitiated?: boolean;
+  agentId?: string;
+  /** See SendMessageOptionsSchema.strictAgentResolution: explicit-agent sends fail loudly instead of falling back to exec. */
+  strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
+  /** ACP prompt correlation id used to match stream events to a specific request. */
+  acpPromptId?: string;
+  /** Auto-model-routing provenance for this turn; session-internal, never sourced from IPC. */
+  autoModelRouting?: AutoModelRoutingRecord;
+  /** Invoked with each fatal pre-start error event this call emits before returning Err. */
+  onPreStartError?: (event: ErrorEvent) => void;
+  /** Synchronous registration of the facade's handleless startup notification identity. */
+  onStreamStarting?: (messageId: string) => void;
+  /** Revalidate recorded admission after asynchronous startup, without acquiring new authority. */
+  assertAdmissionCurrent?: () => Promise<void>;
+  withAdmissionCurrent?: (construct: () => void) => Promise<void>;
+  /** See TurnExecutionOptions.stopFence; captured at the turn's admission by the session. */
+  stopFence?: () => boolean;
+  /** Tool names that should be delegated back to ACP clients for this request. */
+  delegatedToolNames?: string[];
+  recordFileState?: (filePath: string, state: FileState) => Promise<void>;
+  /** See ToolConfiguration.recordProposedPlan. */
+  recordProposedPlan?: (toolCallId: string, content: string) => void;
+  postCompactionAttachments?: PostCompactionAttachment[] | null;
+  /**
+   * Resolver for the session-segment memory context (memory experiment):
+   * index snapshot for the memory tool description.
+   * AgentSession caches the result per model/session segment. A callback
+   * (not a pre-resolved value) because it must be computed after
+   * runtime.ensureReady(): project-scope listing on a
+   * stopped Docker/remote workspace would otherwise cache an empty/partial
+   * context for the whole segment.
+   */
+  resolveMemoryContext?: (modelString: string) => Promise<MemorySessionContext | undefined>;
+  workspaceGoalService?: WorkspaceGoalService;
+  /** Backend-owned kind of an automatic goal turn; gates set_goal (see GoalToolContext). */
+  goalTurnKind?: GoalSyntheticMessageKind;
+  /** The goal an automatic goal turn was dispatched for (see GoalToolContext.goalId). */
+  goalTurnGoalId?: string;
+  /** Backend-owned provenance of an automatic sub-agent turn; gates set_goal too. */
+  taskTurnKind?: TaskTurnKind;
+  disableWorkspaceAgents?: boolean;
+  hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean;
+  getQueuedInputStopCause?: () => QueuedInputStopCause | undefined;
+  onStepSettled?: OnStepSettled;
+  /** Token Budget stage decision on the built request (#5286); see prepareTurnStartStage. */
+  onTurnStartStage?: OnTurnStartStage;
+  /**
+   * Whether a token-budget rollover could actually be sealed for this request (mode active and
+   * automatic rollover threshold below 100%). Gates the new_context tool so a request that
+   * nothing could honor is never persisted as a scheduled receipt.
+   */
+  contextBudgetRolloverAvailable?: boolean;
+  /** Internal rollover admission contract; never serialized into send options/history. */
+  requestAssemblySnapshot?: RequestAssemblySnapshot;
+  muxMetadata?: MuxMessageMetadata;
+  openaiTruncationModeOverride?: "auto" | "disabled";
+  /**
+   * Compaction requests only: the share of the compaction input budget to trim to (default 1).
+   * AgentSession passes 0.5 for the one retry after the request hit context_exceeded.
+   */
+  compactionInputBudgetScale?: number;
+  /**
+   * Compaction requests only: AgentSession still holds the one context_exceeded retry of this
+   * request (resolveCompactionRetryPlan). Without it, a model that could switch to 1M context is
+   * trimmed on this attempt too, since nothing would retry it at 1M.
+   */
+  compactionContextRetryAvailable?: boolean;
+  /**
+   * Model floor already resolved by AgentSession (config.json
+   * minThinkingLevelByModel → resolveMinimumThinkingLevel). Passed down so
+   * mid-turn overrides clamp against the same floor as the send-time level;
+   * internal callers may omit it (re-resolved from defaults).
+   */
+  minThinkingLevel?: ThinkingLevel;
+  /**
+   * Session-owned per-turn holder for mid-turn thinking-level overrides.
+   * When absent (compaction, sub-agent paths), the feature is inert for the
+   * stream. See src/node/services/thinkingOverride.ts.
+   */
+  activeTurnThinkingOverride?: ActiveTurnThinkingOverride;
+}
+
+// Exported for the replay builder: fallback requests append the refusal's
+// partial continuation the same way production does.
+export function replaceOrAppendMessageById(
+  messages: MuxMessage[],
+  replacement: MuxMessage
+): MuxMessage[] {
+  const index = messages.findIndex((message) => message.id === replacement.id);
+  if (index === -1) {
+    return [...messages, replacement];
+  }
+
+  const next = [...messages];
+  next[index] = replacement;
+  return next;
+}
+
+// ---------------------------------------------------------------------------
+// streamMessage options
+// ---------------------------------------------------------------------------
+
+/**
+ * Recursively merge user-provided provider extras under Xum-built provider options.
+ * Xum values win on leaf conflicts; both sides' non-conflicting nested fields are preserved.
+ */
+function mergeProviderExtrasUnderMux(
+  providerExtras: Record<string, unknown>,
+  muxProviderNamespace: Record<string, unknown>
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = { ...providerExtras };
+
+  for (const [key, muxValue] of Object.entries(muxProviderNamespace)) {
+    const extraValue = merged[key];
+    merged[key] =
+      isPlainObject(extraValue) && isPlainObject(muxValue)
+        ? mergeProviderExtrasUnderMux(extraValue, muxValue)
+        : muxValue;
+  }
+
+  return merged;
+}
+
+const WORKFLOW_CONTINUATION_RETRY_DELAY_MS = 1_000;
+const WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE = "Workspace is busy; idle-only send was skipped.";
+
+function isWorkspaceBusyIdleOnlySend(error: SendMessageError): boolean {
+  return error.type === "unknown" && error.raw.includes(WORKSPACE_BUSY_IDLE_ONLY_SEND_MESSAGE);
+}
+
+function waitForWorkflowContinuationRetry(clock: HostClock): Promise<void> {
+  return new Promise((resolve) => clock.setTimer(resolve, WORKFLOW_CONTINUATION_RETRY_DELAY_MS));
+}
+
+/**
+ * Pin the factory-resolved Coder instance into a fresh raw providers.jsonc
+ * read for consumers that need file-shaped config (modelParameters lookups).
+ * additionalProviders is the highest-precedence metadata source, so the
+ * pinned entry keeps metadata-dependent decisions (mappedToModel aliases,
+ * sampling gates) on the type the SDK model was created for even if a
+ * catalog refresh retyped the instance after creation.
+ */
+function pinCoderInstanceRawProvidersConfig(
+  view: ProvidersConfig | null,
+  rawModelString: string,
+  instance: { name: string; type: string } | undefined
+): ProvidersConfig | null {
+  if (!view || !instance || !rawModelString.startsWith("coder:")) {
+    return view;
+  }
+  return {
+    ...view,
+    coder: {
+      ...(view.coder ?? {}),
+      additionalProviders: [{ name: instance.name, type: instance.type }],
+    },
+  };
+}
+
+/**
+ * The estimated token budget a compaction request's history must fit (trimCompactionInput):
+ * SUMMARIZER_INPUT_FRACTION of the model's effective window, the share continuous compaction's
+ * summarizer uses, so the system prompt and the summary fit beside it. Per attempt, because a
+ * fallback model has its own window. Undefined, so nothing is trimmed, when the window is
+ * unknown, or when the model can still switch to 1M context and a retry is left
+ * (`contextRetryAvailable`): its context_exceeded retry does that and trims to the 1M window,
+ * which keeps more history than a trim to 200k would.
+ */
+export function resolveCompactionInputBudgetTokens(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  scale = 1,
+  contextRetryAvailable = true
+): number | undefined {
+  assert(scale > 0 && scale <= 1, "compaction input budget scale must be in (0, 1]");
+  if (retriesAt1MContext(modelString, providerOptions, providersConfig, contextRetryAvailable)) {
+    return undefined;
+  }
+  const limit = getEffectiveContextLimit(
+    modelString,
+    isAnthropic1MEffectivelyEnabled(modelString, providerOptions, providersConfig),
+    providersConfig,
+    { openaiWireFormat: providerOptions?.openai?.wireFormat }
+  );
+  return limit == null ? undefined : Math.floor(limit * SUMMARIZER_INPUT_FRACTION * scale);
+}
+
+/** The context_exceeded retry will switch this model to 1M context (see above). */
+function retriesAt1MContext(
+  modelString: string,
+  providerOptions: MuxProviderOptions | undefined,
+  providersConfig: ProvidersConfigMap | null | undefined,
+  contextRetryAvailable: boolean
+): boolean {
+  return (
+    contextRetryAvailable &&
+    canSwitchToAnthropic1MContext(modelString, providerOptions, providersConfig)
+  );
+}
+
+/**
+ * assemblePromptPayload's compaction budget option: set for compaction requests only. A retry
+ * (scale set) on a model whose window is unknown has no window to derive a budget from; it
+ * trims to `scale` of the history's own estimate instead, so it does not resend the history
+ * that just hit context_exceeded unchanged.
+ */
+async function compactionInputBudgetOption(
+  isCompactionRequest: boolean,
+  model: {
+    modelString: string;
+    providerOptions: MuxProviderOptions | undefined;
+    providersConfig: ProvidersConfigMap | null | undefined;
+  },
+  history: MuxMessage[],
+  scale: number | undefined,
+  contextRetryAvailable: boolean
+): Promise<{ compactionInputBudgetTokens?: number }> {
+  if (!isCompactionRequest) return {};
+  const budget =
+    resolveCompactionInputBudgetTokens(
+      model.modelString,
+      model.providerOptions,
+      model.providersConfig,
+      scale,
+      contextRetryAvailable
+    ) ?? (scale == null ? undefined : await retryBudgetFromHistory(history, model, scale));
+  return budget == null ? {} : { compactionInputBudgetTokens: budget };
+}
+
+/** `scale` of the history's model-aware size: the same measure the trim then fits to it. */
+async function retryBudgetFromHistory(
+  history: MuxMessage[],
+  model: { modelString: string },
+  scale: number
+): Promise<number | undefined> {
+  const size = await measureCompactionInputTokens(history, model.modelString);
+  const budget = Math.floor(size * scale);
+  return budget > 0 ? budget : undefined;
+}
+
+interface FoldedStreamState<TMessages, TTail> {
+  thinkingLevel: ThinkingLevel;
+  providerOptions: Record<string, unknown>;
+  messages: TMessages;
+  systemRecords: TTail;
+  systemMessageTokens: number;
+  /** The full estimate of `messages`, the stage decision's E (#5286). */
+  contextBudgetEstimate?: number;
+}
+
+/**
+ * Fold PREPARING-window pending thinking overrides into the ACTUAL request build, not just the
+ * envelope: message preparation is thinking-level-dependent (Anthropic signed-reasoning
+ * transforms), so recording the new level while streaming old-level messages would make wire and
+ * replay diverge — or send an invalid extended-thinking request. Consuming pending here (applied
+ * set below) is safe: createStreamAtomically seeds streamInfo.thinkingLevel from `applied`, and
+ * prepareStep simply sees no pending to re-apply. Loops until pending is quiescent:
+ * setActiveTurnThinkingLevel can write a NEW pending while the awaited message rebuild runs, and
+ * stamping the first level after the await would leave step 0 rebuilding only provider options
+ * while the messages stay at the stale level.
+ */
+async function foldPendingThinkingOverrides<TMessages, TTail>(
+  input: {
+    holder: ActiveTurnThinkingOverride | undefined;
+    computeRebuiltProviderOptions: (
+      level: ThinkingLevel,
+      currentLevel: ThinkingLevel,
+      beforeFirstStep: boolean
+    ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
+    rebuild: (level: ThinkingLevel) => Promise<{
+      messages: TMessages;
+      systemRecords: TTail;
+      systemMessageTokens: number;
+      contextBudgetEstimate?: number;
+    }>;
+    currentEffectiveLevelRef: { current: ThinkingLevel };
+    /** Leave pending changes for StreamManager's step 0 (after a published stage, #5286). */
+    skip?: boolean;
+  },
+  initial: FoldedStreamState<TMessages, TTail>
+): Promise<FoldedStreamState<TMessages, TTail> | { exceeded: ContextBudgetExceeded }> {
+  const { holder } = input;
+  let state = initial;
+  if (input.skip) return state;
+  while (holder?.pending != null) {
+    const pendingPreparingLevel = holder.pending;
+    holder.pending = undefined;
+    const folded = input.computeRebuiltProviderOptions(
+      pendingPreparingLevel,
+      state.thinkingLevel,
+      true
+    );
+    // No-op fold (same effective level / non-foldable variant swap):
+    // re-check pending — a change may have raced the previous rebuild.
+    if (folded == null) continue;
+    try {
+      const rebuilt = await input.rebuild(folded.effectiveLevel);
+      state = {
+        thinkingLevel: folded.effectiveLevel,
+        providerOptions: folded.providerOptions,
+        messages: rebuilt.messages,
+        systemRecords: rebuilt.systemRecords,
+        systemMessageTokens: rebuilt.systemMessageTokens,
+        contextBudgetEstimate: rebuilt.contextBudgetEstimate,
+      };
+    } catch (error) {
+      if (error instanceof ContextBudgetExceededError) return { exceeded: error.details };
+      throw error;
+    }
+    holder.applied = folded.effectiveLevel;
+    // Keep the mid-turn rebuild baseline in sync so a later identical
+    // request is correctly treated as a no-op.
+    input.currentEffectiveLevelRef.current = folded.effectiveLevel;
+    // Loop re-checks pending: a change during the awaits above re-folds
+    // against the level just applied.
+  }
+  return state;
+}
+
+/** Called once per primary start() with E, the full estimate of the built request (#5286). */
+export type OnTurnStartStage = (budget: {
+  estimate: number;
+  limit: number;
+  model: string;
+  /** The turn's history rows: their warning rows are this window's stage claims. */
+  messages: readonly MuxMessage[];
+}) => Promise<TurnStartStage | undefined>;
+/**
+ * A due, unclaimed stage. `publish` resolves false when the send lost its admission first, or
+ * when history holds a row the turn's history read did not see (AgentSession fences that).
+ */
+export interface TurnStartStage {
+  row: MuxMessage;
+  /** Whether E′, the count of the request with `row` appended, leaves the stage its reserve. */
+  fits: (estimate: number) => boolean;
+  publish: () => Promise<boolean>;
+}
+
+/** What a primary start dispatches: the built request, or the counted candidate with a stage. */
+interface TurnStartPayload<TMessages, TTail> {
+  messages: TMessages;
+  systemRecords: TTail;
+  systemMessageTokens: number;
+  requestHistorySequence: number;
+}
+
+/**
+ * Turn-start Token Budget stage (#5286). Decided on E, the count of the built request. The request
+ * is counted again with the warning row (E′) and the row is published only if E′ leaves the stage
+ * its reserve, so every published prompt is dispatched: the payload sent is the payload counted.
+ * The candidate carries the row in `messages`, so the fallback's and step 0's rebuilds carry it.
+ */
+async function applyTurnStartStage<TMessages, TTail>(input: {
+  onTurnStartStage: OnTurnStartStage | undefined;
+  estimate: number | undefined;
+  limit: number | undefined;
+  model: string;
+  messages: MuxMessage[];
+  rebuild: () => Promise<{
+    messages: TMessages;
+    systemRecords: TTail;
+    systemMessageTokens: number;
+    contextBudgetEstimate?: number;
+  }>;
+  abortSignal: AbortSignal;
+  current: TurnStartPayload<TMessages, TTail>;
+  /** A published stage holds later thinking changes until after its counted first request. */
+  thinkingOverride: ActiveTurnThinkingOverride | undefined;
+}): Promise<TurnStartPayload<TMessages, TTail>> {
+  const { onTurnStartStage, estimate, limit, messages, current } = input;
+  if (onTurnStartStage == null || estimate == null || limit == null) return current;
+  const stage = await onTurnStartStage({ estimate, limit, model: input.model, messages });
+  if (!stage) return current;
+  messages.push(stage.row);
+  const candidate = await countAndPublishStage(stage, input.rebuild, input.abortSignal);
+  if (!candidate) {
+    messages.pop();
+    return current;
+  }
+  holdThinkingChanges(input.thinkingOverride);
+  return {
+    messages: candidate.messages,
+    systemRecords: candidate.systemRecords,
+    systemMessageTokens: candidate.systemMessageTokens,
+    requestHistorySequence: stage.row.metadata?.historySequence ?? current.requestHistorySequence,
+  };
+}
+
+/** After a published stage, StreamManager applies thinking changes only after the first request. */
+function holdThinkingChanges(holder: ActiveTurnThinkingOverride | undefined): void {
+  if (holder) holder.holdBeforeFirstRequest = true;
+}
+
+/** Counts E′ with the row and publishes it only when it fits and the turn was not stopped. */
+async function countAndPublishStage<TCandidate extends { contextBudgetEstimate?: number }>(
+  stage: TurnStartStage,
+  rebuild: () => Promise<TCandidate>,
+  abortSignal: AbortSignal
+): Promise<TCandidate | undefined> {
+  let candidate: TCandidate;
+  try {
+    candidate = await rebuild();
+  } catch (error) {
+    // A candidate over the ceiling only means the stage does not fit.
+    if (error instanceof ContextBudgetExceededError) return undefined;
+    throw error;
+  }
+  const fits =
+    candidate.contextBudgetEstimate != null && stage.fits(candidate.contextBudgetEstimate);
+  if (!fits || abortSignal.aborted) return undefined;
+  return (await stage.publish()) ? candidate : undefined;
+}
+
+/**
+ * Shared assembly path for primary, fallback, and thinking-rebuild provider attempts.
+ * `contextBudgetEstimate` is the full estimate the check enforced (undefined when the budget is
+ * off or the limit is unknown).
+ */
+export async function assembleBudgetCheckedPromptPayload(
+  options: Parameters<typeof assemblePromptPayload>[0],
+  budget: {
+    enabled: boolean;
+    providerOptions?: MuxProviderOptions;
+    activeTools?: readonly string[];
+  }
+): Promise<
+  Awaited<ReturnType<typeof assemblePromptPayload>> & {
+    contextBudgetLimit?: number;
+    contextBudgetEstimate?: number;
+  }
+> {
+  const payload = await assemblePromptPayload(options);
+  let contextBudgetLimit: number | undefined;
+  let contextBudgetEstimate: number | undefined;
+  // Check after provider transforms and system/schema assembly: history-only
+  // estimates cannot prevent oversized requests from reaching the provider.
+  if (budget.enabled) {
+    contextBudgetLimit =
+      getEffectiveContextLimit(
+        options.modelString,
+        isAnthropic1MEffectivelyEnabled(
+          options.modelString,
+          budget.providerOptions,
+          options.providersConfig
+        ),
+        options.providersConfig,
+        { openaiWireFormat: budget.providerOptions?.openai?.wireFormat }
+      ) ?? undefined;
+    if (contextBudgetLimit == null) {
+      log.warn("Context budget preflight unavailable: model context limit is unknown", {
+        workspaceId: options.workspaceId,
+        model: options.modelString,
+      });
+    }
+    const measured = await measureAssembledRequestBudgetForModel(payload, {
+      model: options.modelString,
+      metadataModel: resolveModelForMetadata(options.modelString, options.providersConfig ?? null),
+      modelContextLimit: contextBudgetLimit,
+      activeTools: budget.activeTools,
+    });
+    contextBudgetEstimate = measured?.estimate;
+    if (measured?.exceeded) {
+      throw new ContextBudgetExceededError(measured.exceeded);
+    }
+  }
+  return { ...payload, contextBudgetLimit, contextBudgetEstimate };
+}
+
+/**
+ * The sent system content (PromptPayload.sentSystem) with its token count. The tail rows exist
+ * only in the request, so their text counts as system: history sizing (continuous compaction,
+ * context estimates) adds this count to the rows it sizes itself.
+ */
+async function measureSentSystem(
+  sentSystem: PromptPayload["sentSystem"],
+  liveSystem: string,
+  liveTokens: number,
+  tokenizerFor: () => ReturnType<typeof getTokenizerForModel>
+): Promise<{ system: string; volatileLength: number; tokens: number }> {
+  const { message, volatileSuffixLength, rowsText } = sentSystem;
+  if (message === liveSystem && rowsText === "") {
+    return { system: message, volatileLength: volatileSuffixLength, tokens: liveTokens };
+  }
+  const tokenizer = await tokenizerFor();
+  const tokens = await tokenizer.countTokens(message + rowsText);
+  return { system: message, volatileLength: volatileSuffixLength, tokens };
+}
+
+/**
+ * The system-section records for the turn's assistant row (volatile tail, custom
+ * instructions): what this request sent, or, when a refusal fallback continues this turn's
+ * row and sends nothing new, the record the row already holds (the rows of its earlier
+ * request stay in place before it). Both keys are always present, so spreading the result
+ * over metadata replaces an older record.
+ */
+function rowSystemRecords(
+  payload: SystemSectionRecords,
+  continuation: MuxMessage | undefined
+): SystemSectionRecords {
+  const records: SystemSectionRecords = {};
+  for (const field of SYSTEM_SECTION_RECORD_FIELDS) {
+    records[field] = payload[field] ?? continuation?.metadata?.[field];
+  }
+  return records;
+}
+
+/** The assistant row's records (MuxMetadata.volatileSystemTail etc.); absent records nothing. */
+function systemRecordsMetadata(records: SystemSectionRecords): SystemSectionRecords {
+  const present: SystemSectionRecords = {};
+  for (const field of SYSTEM_SECTION_RECORD_FIELDS) {
+    if (records[field] != null) present[field] = records[field];
+  }
+  return present;
+}
+
+function derivePromptCacheScope(metadata: WorkspaceMetadata): string {
+  return `${metadata.projectName}-${uniqueSuffix([metadata.projectPath])}`;
+}
+
+interface WorkflowResultContinuationSender {
+  isWorkflowInvocationCurrent(workspaceId: string, runId: string): Promise<boolean>;
+  sendMessage(
+    workspaceId: string,
+    message: string,
+    options: SendMessageOptions,
+    internal?: {
+      acceptanceOrigin?: TurnAcceptanceOrigin;
+      skipAutoResumeReset?: boolean;
+      synthetic?: boolean;
+      agentInitiated?: boolean;
+      /** When true, reject instead of queueing if the workspace is busy. */
+      requireIdle?: boolean;
+      startStreamInBackground?: boolean;
+    }
+  ): Promise<Result<void, SendMessageError>>;
+}
+
+interface TurnRequestBuildStartupState {
+  pendingRunMetadataId: string | null;
+  logSlowStreamStartup?: (details: Record<string, unknown>) => void;
+}
+
+export interface TurnRequestBuildContext {
+  abortSignal: AbortSignal;
+  syntheticMessageId: string;
+  startTime: number;
+  startupPhaseTimingsMs: Record<string, number>;
+  startupState: TurnRequestBuildStartupState;
+  recordStartupPhaseTiming: (phase: string, phaseStartedAt: number) => void;
+  admissionOnly?: boolean;
+}
+
+type TurnRequestBuildOutcome =
+  | { type: "finished"; result: Result<TurnStreamHandle, SendMessageError> }
+  | {
+      type: "ready";
+      turnExecutionOptions: TurnExecutionOptions;
+      assistantMessageId: string;
+      deleteAbortedPlaceholder: (messageId: string) => Promise<void>;
+      logStartOutcome: (outcome: "started" | "stream_start_failed", errorType?: string) => void;
+    };
+
+export interface PreparedStreamMessage extends AsyncDisposable {
+  start(options: StreamMessageOptions): Promise<Result<TurnStreamHandle, SendMessageError>>;
+}
+
+export interface PreparedTurnRequest extends AsyncDisposable {
+  start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
+}
+
+type PreparedTurnRequestOutcome =
+  | Extract<TurnRequestBuildOutcome, { type: "finished" }>
+  | { type: "prepared"; request: PreparedTurnRequest };
+
+export interface TurnRequestBuilderBindings extends OauthServiceBindings {
+  mcpServerManager?: MCPServerManager;
+  taskService?: TaskService;
+  workspaceTurnManager?: ToolConfiguration["workspaceTurnManager"];
+  memoryService?: MemoryService;
+  timelineService?: ToolConfiguration["timelineService"];
+  extraTools?: Record<string, Tool>;
+  onWorkflowRunStatusChanged?: (event: WorkflowRunStatusChangedEvent) => Promise<void> | void;
+  workflowResultContinuationSender?: WorkflowResultContinuationSender;
+  /** Archive gate for tool-started workflow admissions (the WorkspaceService). */
+  workflowArchiveAdmission?: WorkflowArchiveAdmissionGuard;
+  /** Workflow `evaluate()` support for tool-started runs; absent ⇒ the step fails closed. */
+  evaluationService?: EvaluationService;
+  /** Wakes the analytics sidecar after a headless usage row (workflow evaluation) lands. */
+  requestAnalyticsIngest?: (workspaceId: string) => void;
+  workspaceHeartbeatService?: ToolConfiguration["workspaceHeartbeatService"];
+  analyticsService?: { executeRawQuery(sql: string): Promise<unknown> };
+  desktopSessionManager?: DesktopSessionManager;
+  computerUseService?: ComputerUseService;
+  /** Routes AI calls from bash commands through Xum so their spend is accounted. */
+  bashAiProxy?: Pick<BashAiProxyService, "envFor" | "noteBlocked">;
+}
+
+/**
+ * Tool-started workflow runs share the WorkspaceService's archive gate. Core wiring binds it in
+ * the same stage as taskService, so a missing gate next to a bound taskService is a wiring bug.
+ */
+function requireWorkflowArchiveAdmission(
+  bindings: TurnRequestBuilderBindings
+): WorkflowArchiveAdmissionGuard {
+  const guard = bindings.workflowArchiveAdmission;
+  assert(
+    guard != null,
+    "TurnRequestBuilder: workflowArchiveAdmission must be bound with taskService"
+  );
+  return guard;
+}
+
+/**
+ * Host services that tools read through ToolConfiguration instead of importing host modules
+ * (local/no-host-imports). AILive passes the Node layers; an absent member means the tool's
+ * own Node default.
+ */
+export interface LoopHostServices {
+  desktopNotifications?: DesktopNotifications;
+  /** The host's files and paths: global instructions and the home clutter scan. */
+  hostFiles?: HostFiles;
+  hostPaths?: HostPaths;
+  /** The runtimes of AIService and the sessions. Absent: the Node layer (tests that build AIService by hand). */
+  runtimeFactory?: RuntimeFactory;
+}
+
+interface TurnRequestBuilderDependencies {
+  config: Config;
+  providersConfigStore: ProvidersConfigStore;
+  secretsStore: Pick<SecretsStore, "getEffectiveSecrets">;
+  historyService: HistoryService;
+  initStateManager: InitStateManager;
+  providerService: ProviderService;
+  providerModelFactory: ProviderModelFactory;
+  streamManager: StreamManager;
+  workspaceMcpOverridesService: WorkspaceMcpOverridesService;
+  telemetryService?: TelemetryService;
+  backgroundProcessManager?: BackgroundProcessManager;
+  sessionUsageService?: SessionUsageService;
+  devToolsService?: DevToolsService;
+  experimentsService?: Pick<ExperimentsService, "isExperimentEnabled">;
+  /** Only written here; AIService owns the bounded store and its reads. */
+  lastLlmRequestByWorkspace: {
+    set(workspaceId: string, snapshot: DebugLlmRequestSnapshot): unknown;
+  };
+  bindings: TurnRequestBuilderBindings;
+  hostServices: LoopHostServices;
+  /** AIService's runtime builders (its hostServices.runtimeFactory, or the Node layer). */
+  runtimeFactory: RuntimeFactory;
+  emit: (event: string, ...args: unknown[]) => boolean;
+  createAbortedTurnHandle: (messageId: string, signal?: AbortSignal) => TurnStreamHandle;
+  createSettledTurnHandle: (messageId: string, completion: TurnCompletion) => TurnStreamHandle;
+  getWorkspaceMetadata: (workspaceId: string) => Promise<Result<WorkspaceMetadata>>;
+  createWorkspaceRuntimeContext: (
+    workspaceId: string,
+    metadata: WorkspaceMetadata
+  ) => Result<
+    WorkspaceRuntimeContext & {
+      hostCheckoutRoot: string | null;
+      projectCheckoutRoot: string | null;
+    },
+    SendMessageError
+  >;
+  isClaudeSkillsCompatEnabled: () => boolean;
+  wrapToolsForDelegation: (
+    workspaceId: string,
+    tools: Record<string, Tool>,
+    delegatedToolNames?: string[]
+  ) => Record<string, Tool>;
+  durableEventJournalFor: (workspaceId: string) => DurableEventJournal;
+  shouldAllowLegacyInvalidWorkflowAgentOutputSchema: (
+    metadata: WorkspaceMetadata
+  ) => Promise<boolean>;
+  isStreaming: (workspaceId: string) => boolean;
+  trackPendingDevToolsRunMetadata: (
+    messageId: string,
+    workspaceId: string,
+    metadataId: string
+  ) => void;
+}
+
+export interface PrepareModelAttemptOptions {
+  rawModelString: string;
+  canonicalModelString: string;
+  canonicalProviderName: string;
+  effectiveModelString: string;
+  optionsModelString: string;
+  wireProviderName: string;
+  routeProvider?: ProviderName;
+  effectiveThinkingLevel: ThinkingLevel;
+  minThinkingLevel: ThinkingLevel;
+  providerRequestMessages: MuxMessage[];
+  muxProviderOptions: MuxProviderOptions;
+  workspaceId: string;
+  truncationMode: Parameters<typeof buildProviderOptions>[6];
+  providersConfigSnapshot: ProvidersConfigMap;
+  coderSelectedInstance?: { name: string; type: string };
+  promptCacheScope: string;
+  reasoningMode: Parameters<typeof buildProviderOptions>[10];
+  recordStartupPhaseTiming?: (phase: string, phaseStartedAt: number) => void;
+}
+
+interface PreparedModelAttempt {
+  providerOptions: Record<string, unknown>;
+  requestHeaders: Record<string, string> | undefined;
+  resolvedOverrides: ReturnType<typeof resolveModelParameterOverrides>;
+  currentEffectiveLevelRef: { current: ThinkingLevel };
+  /** `beforeFirstStep`: folding a pre-stream override, before any provider call ran. */
+  computeRebuiltProviderOptions: (
+    level: ThinkingLevel,
+    currentLevel: ThinkingLevel,
+    beforeFirstStep?: boolean
+  ) => { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null;
+  rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel;
+}
+
+/**
+ * Models per workspace that keep their own catalog overview (a primary plus a few fallbacks or
+ * switches). Past it, the least recently used model's overview is rebuilt on its next use.
+ */
+const MAX_TOOL_CATALOG_OVERVIEW_MODELS_PER_WORKSPACE = 4;
+
+export class TurnRequestBuilder {
+  /** Remote scratch dirs per workspace and runtime config (see RemoteScratchDirCache). */
+  private readonly remoteScratchDirs = new RemoteScratchDirCache();
+  /**
+   * The last deferred-tool catalog overview per workspace and model (ToolCatalogOverviewMemo).
+   * Per model because request.assemble hooks, policies and fallbacks can give each model its own
+   * catalog, and the prompt cache is per model too: one shared memo would let a model with fewer
+   * tools replace the overview another model's cache still holds. In memory only: a restart
+   * builds one fresh overview per model, which costs one cache rewrite. forgetWorkspace drops a
+   * removed or archived workspace's entry.
+   */
+  private readonly toolCatalogOverviews = new Map<string, Map<string, ToolCatalogOverviewMemo>>();
+
+  constructor(private readonly dependencies: TurnRequestBuilderDependencies) {}
+
+  /** Turn timings, record timestamps and retry delays share the stream's HostClock. */
+  private get hostClock(): HostClock {
+    return this.dependencies.streamManager.hostClock;
+  }
+
+  /** Drop a removed or archived workspace's in-memory request state, so it does not grow the map. */
+  forgetWorkspace(workspaceId: string): void {
+    this.toolCatalogOverviews.delete(workspaceId);
+  }
+
+  /**
+   * Keyed by the effective model string (the routed wire model), not the selected one: the
+   * prompt cache is per route and wire model, so two selections that reach the same wire model
+   * (an explicit gateway string and a direct string routed through that gateway) share one cache
+   * and must share one overview, or alternating between them rewrites that cache.
+   */
+  private toolCatalogOverviewMemo(
+    workspaceId: string,
+    modelString: string
+  ): ToolCatalogOverviewMemo {
+    let byModel = this.toolCatalogOverviews.get(workspaceId);
+    if (byModel === undefined) {
+      byModel = new Map();
+      this.toolCatalogOverviews.set(workspaceId, byModel);
+    }
+    const memo = byModel.get(modelString) ?? {};
+    // Least recently used goes first: re-insert on every use, evict from the front.
+    byModel.delete(modelString);
+    byModel.set(modelString, memo);
+    for (const model of byModel.keys()) {
+      if (byModel.size <= MAX_TOOL_CATALOG_OVERVIEW_MODELS_PER_WORKSPACE) break;
+      byModel.delete(model);
+    }
+    return memo;
+  }
+
+  private resolveOverridesIdentity(
+    rawModelString: string,
+    canonical: string,
+    canonicalProvider: string,
+    providersConfig: ProvidersConfigMap
+  ): { providerName: string; modelString: string; coderDerived: boolean } {
+    if (rawModelString.startsWith("coder:")) {
+      const metadataCanonical = resolveCoderGatewayMetadataModel(rawModelString, providersConfig);
+      if (metadataCanonical != null) {
+        const separator = metadataCanonical.indexOf(":");
+        return {
+          providerName: separator > 0 ? metadataCanonical.slice(0, separator) : canonicalProvider,
+          modelString: metadataCanonical,
+          coderDerived: true,
+        };
+      }
+      const coderSection = providersConfig.coder;
+      if (!isCustomProviderConfig(coderSection)) {
+        const wire = resolveCoderWireCanonicalModel(
+          rawModelString.slice("coder:".length),
+          coderSection as
+            | { discoveredProviders?: unknown; additionalProviders?: unknown }
+            | undefined
+        );
+        if (wire) {
+          return { providerName: "coder", modelString: rawModelString, coderDerived: false };
+        }
+      }
+    }
+    const separator = canonical.indexOf(":");
+    return {
+      providerName: separator > 0 ? canonical.slice(0, separator) : canonicalProvider,
+      modelString: canonical,
+      coderDerived: false,
+    };
+  }
+
+  /**
+   * Start this workspace's MCP servers exactly as a send's request build does (same inputs to
+   * MCPServerManager.getToolsForWorkspace), so the same servers start and no others. Codex plugin
+   * hooks on UserPromptSubmit run before request building and need their plugin's server, which
+   * after a restart is not running yet. Returns false when the workspace is not ready for MCP
+   * (init failed, unsanitized checkout, runtime not ready, no MCP manager) or is a side chat.
+   */
+  async startWorkspaceMcpServers(workspaceId: string, signal: AbortSignal): Promise<boolean> {
+    const mcpServerManager = this.dependencies.bindings.mcpServerManager;
+    if (mcpServerManager === undefined) return false;
+    const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
+    if (!metadataResult.success) return false;
+    const metadata = metadataResult.data;
+    // Like request building: a side chat never starts MCP servers (its local-read-only ceiling),
+    // so its prompt hooks fail open instead of reaching a possibly mutating MCP tool.
+    if (sideChatCapabilityGrants(metadata) != null) return false;
+    const runtimeContext = this.dependencies.createWorkspaceRuntimeContext(workspaceId, metadata);
+    if (!runtimeContext.success) return false;
+    const { runtime, workspacePath, hostCheckoutRoot } = runtimeContext.data;
+    await this.dependencies.initStateManager.waitForInit(workspaceId, signal);
+    if (this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId)) return false;
+    const ready = await runtime.ensureReady({ signal });
+    if (!ready.ready || signal.aborted) return false;
+    // Wall clock: MCPServerManager subtracts Date.now() from the deadline (#7282).
+    const readStartedAt = nodeClock.nowMs();
+    const read = await this.dependencies.workspaceMcpOverridesService
+      .getOverridesForWorkspace(workspaceId, {
+        timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
+        signal,
+        clock: this.hostClock,
+      })
+      .catch(() => ({ overrides: undefined, authoritative: false }));
+    const projectSecrets = isMultiProject(metadata)
+      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
+      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+    await mcpServerManager.getToolsForWorkspace(
+      {
+        workspaceId,
+        projectPath: metadata.projectPath,
+        runtime,
+        workspacePath,
+        trusted: isWorkspaceProjectTrusted(this.dependencies.config, metadata),
+        overrides: read.overrides,
+        overridesAuthoritative: read.authoritative,
+        ...(read.authoritative
+          ? {}
+          : { overridesReadDeadlineAt: readStartedAt + MCP_OVERRIDES_READ_TIMEOUT_MS }),
+        projectSecrets: await secretsToRecord(projectSecrets),
+        agentPlugins: hostCheckoutRoot
+          ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+          : null,
+      },
+      { signal }
+    );
+    return true;
+  }
+
+  prepareModelAttempt(options: PrepareModelAttemptOptions): PreparedModelAttempt {
+    const buildProviderOptionsStartedAt = this.hostClock.nowMs();
+    const providerOptions = buildProviderOptions(
+      options.optionsModelString,
+      options.effectiveThinkingLevel,
+      options.providerRequestMessages,
+      (id) => this.dependencies.streamManager.isResponseIdLost(id),
+      options.muxProviderOptions,
+      options.workspaceId,
+      options.truncationMode,
+      options.providersConfigSnapshot,
+      options.routeProvider,
+      options.promptCacheScope,
+      options.reasoningMode
+    ) as Record<string, unknown>;
+    options.recordStartupPhaseTiming?.("buildProviderOptionsMs", buildProviderOptionsStartedAt);
+    const buildRequestConfigStartedAt = this.hostClock.nowMs();
+    const requestHeaders = buildRequestHeaders(
+      options.optionsModelString,
+      options.muxProviderOptions,
+      options.workspaceId,
+      options.providersConfigSnapshot,
+      options.routeProvider
+    );
+    const overridesIdentity = this.resolveOverridesIdentity(
+      options.rawModelString,
+      options.canonicalModelString,
+      options.canonicalProviderName,
+      options.providersConfigSnapshot
+    );
+    const resolvedOverrides = resolveModelParameterOverrides(
+      pinCoderInstanceRawProvidersConfig(
+        this.dependencies.providersConfigStore.loadProvidersConfig(),
+        options.rawModelString,
+        options.coderSelectedInstance
+      ),
+      overridesIdentity.providerName,
+      overridesIdentity.modelString,
+      options.effectiveModelString
+    );
+    const namespaceKey = resolveProviderOptionsNamespaceKey(
+      options.wireProviderName,
+      options.routeProvider
+    );
+    const extrasWireCompatible =
+      !overridesIdentity.coderDerived || overridesIdentity.providerName === namespaceKey;
+    const mergeExtras = (builtOptions: Record<string, unknown>): Record<string, unknown> => {
+      if (!resolvedOverrides.providerExtras || !extrasWireCompatible) {
+        return builtOptions;
+      }
+      const muxProviderNamespace = builtOptions[namespaceKey];
+      return {
+        ...builtOptions,
+        [namespaceKey]: isPlainObject(muxProviderNamespace)
+          ? mergeProviderExtrasUnderMux(resolvedOverrides.providerExtras, muxProviderNamespace)
+          : resolvedOverrides.providerExtras,
+      };
+    };
+    const currentEffectiveLevelRef = { current: options.effectiveThinkingLevel };
+    const computeRebuiltProviderOptions = (
+      level: ThinkingLevel,
+      currentLevel: ThinkingLevel,
+      beforeFirstStep = false
+    ): { effectiveLevel: ThinkingLevel; providerOptions: Record<string, unknown> } | null => {
+      const clamped = enforceThinkingPolicy(
+        options.rawModelString,
+        level,
+        options.minThinkingLevel,
+        options.providersConfigSnapshot
+      );
+      // Sonnet 5.5 effort pin (#5086). Before the first provider call only the history
+      // counts, as at turn start; once a step ran, a switch to "off" changes the effort
+      // within the conversation, so it runs as "low" adaptive.
+      const effective = resolveBetweenToolsThinkingLevel(
+        resolveModelForMetadata(options.rawModelString, options.providersConfigSnapshot ?? null),
+        resolveEffectiveThinkingLevel(
+          options.rawModelString,
+          clamped,
+          options.providersConfigSnapshot
+        ),
+        beforeFirstStep &&
+          anthropicBetweenToolsRouteAvailable(
+            options.optionsModelString,
+            options.routeProvider,
+            options.providersConfigSnapshot
+          ),
+        assistantThinkingLevels(options.providerRequestMessages)
+      );
+      if (
+        effective === currentLevel ||
+        isXaiGrokFastVariantSwap(options.canonicalModelString, currentLevel, effective)
+      ) {
+        return null;
+      }
+      const rebuilt = buildProviderOptions(
+        options.optionsModelString,
+        effective,
+        options.providerRequestMessages,
+        (id) => this.dependencies.streamManager.isResponseIdLost(id),
+        options.muxProviderOptions,
+        options.workspaceId,
+        options.truncationMode,
+        options.providersConfigSnapshot,
+        options.routeProvider,
+        options.promptCacheScope,
+        options.reasoningMode
+      ) as Record<string, unknown>;
+      return { effectiveLevel: effective, providerOptions: mergeExtras(rebuilt) };
+    };
+    const rebuildProviderOptionsForThinkingLevel: RebuildProviderOptionsForThinkingLevel = (
+      level,
+      beforeFirstStep = false
+    ) => {
+      const result = computeRebuiltProviderOptions(
+        level,
+        currentEffectiveLevelRef.current,
+        beforeFirstStep
+      );
+      if (result != null) {
+        currentEffectiveLevelRef.current = result.effectiveLevel;
+      }
+      return result;
+    };
+    options.recordStartupPhaseTiming?.("buildRequestConfigMs", buildRequestConfigStartedAt);
+    return {
+      providerOptions: mergeExtras(providerOptions),
+      requestHeaders,
+      resolvedOverrides,
+      currentEffectiveLevelRef,
+      computeRebuiltProviderOptions,
+      rebuildProviderOptionsForThinkingLevel,
+    };
+  }
+
+  async build(
+    opts: StreamMessageOptions,
+    context: TurnRequestBuildContext
+  ): Promise<TurnRequestBuildOutcome> {
+    const prepared = await this.prepare(opts, context);
+    if (prepared.type === "finished") return prepared;
+    await using request = prepared.request;
+    return await request.start(opts.activeTurnThinkingOverride);
+  }
+
+  async prepare(
+    opts: StreamMessageOptions,
+    context: TurnRequestBuildContext
+  ): Promise<PreparedTurnRequestOutcome> {
+    try {
+      return await this.prepareOrThrow(opts, context);
+    } catch (error) {
+      // #4438/#4827: a failed read while loading instructions, agents or skills
+      // means the file could not be read, not that it is missing. Fail the turn
+      // before any provider request or assistant row exists.
+      if (!isRuntimeReadFailure(error)) throw error;
+      // A canceled read is a Stop, not a failure: SSH2 reports aborted execs as
+      // "network", so end the turn as aborted like other startup cancels.
+      if (context.abortSignal.aborted) {
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(
+              context.syntheticMessageId,
+              context.abortSignal
+            )
+          ),
+        };
+      }
+      if (!isRuntimeTransportError(error)) {
+        // Permission denied or an I/O error does not fix itself, so it is not
+        // retryable (unlike an unreachable host). The title is the text before
+        // the first "." (StreamErrorMessage), so it must not contain a path.
+        const errorMessage = `Startup file unreadable. ${getErrorMessage(error).trim()}`;
+        context.startupState.logSlowStreamStartup?.({
+          outcome: "startup_file_unreadable",
+          errorMessage,
+        });
+        return this.finishWithPreStartError(opts, context, "runtime_not_ready", errorMessage);
+      }
+      const errorMessage = `Remote workspace unreachable while loading startup files: ${getErrorMessage(error)}`;
+      context.startupState.logSlowStreamStartup?.({
+        outcome: "runtime_unreachable",
+        errorMessage,
+      });
+      return this.finishWithPreStartError(opts, context, "runtime_start_failed", errorMessage);
+    }
+  }
+
+  /**
+   * Fail a turn before any provider request or assistant row exists. The error
+   * event is what makes it visible: AgentSession renders a runtime_* failure
+   * only when it arrives as a pre-start error.
+   */
+  private finishWithPreStartError(
+    opts: Pick<StreamMessageOptions, "workspaceId" | "acpPromptId" | "onPreStartError">,
+    context: TurnRequestBuildContext,
+    errorType: "runtime_not_ready" | "runtime_start_failed",
+    errorMessage: string
+  ): Extract<PreparedTurnRequestOutcome, { type: "finished" }> {
+    // Emit error event so frontend receives it via stream subscription.
+    // This mirrors the context_exceeded pattern - the fire-and-forget sendMessage
+    // call in useCreationWorkspace.ts won't see the returned Err, but will receive
+    // this event through the workspace chat subscription.
+    const errorEvent = createErrorEvent(opts.workspaceId, {
+      // Generate message ID for the error event (frontend needs this for synthetic message)
+      messageId: createAssistantMessageId(),
+      error: errorMessage,
+      errorType,
+      acpPromptId: opts.acpPromptId,
+    });
+    if (!context.admissionOnly) this.dependencies.emit("error", errorEvent);
+    opts.onPreStartError?.(errorEvent);
+    return { type: "finished", result: Err({ type: errorType, message: errorMessage }) };
+  }
+
+  /**
+   * AI calls from bash commands bypass the chat stream. Point their SDKs at the local proxy so
+   * the spend lands in this workspace's ledger (Costs tab and Analytics). envFor() skips any
+   * provider that project secrets configure: secrets override xumEnv in the bash tool, and a
+   * proxy URL must never pair with a real key.
+   * Best effort: a proxy problem leaves bash without the pair and never fails the turn.
+   * Untrusted projects and the project-automation kill switch blank provider keys in bash
+   * (gitNoRepoAutomationEnv), so repo code there must not spend through the proxy either.
+   * Add nothing rather than a proxy URL whose key the bash tool then blanks.
+   */
+  private async bashAiProxyEnv(
+    workspaceId: string,
+    runtimeType: ReturnType<typeof getRuntimeType>,
+    secretKeys: readonly string[],
+    sharedExecutionTrusted: boolean
+  ): Promise<Record<string, string> | undefined> {
+    const bashAiProxy = this.dependencies.bindings.bashAiProxy;
+    if (!bashAiProxy) return undefined;
+    if (!sharedExecutionTrusted) {
+      // Say why bash gets no proxy variables, so a user who turned the switch on can find out.
+      bashAiProxy.noteBlocked(
+        workspaceId,
+        projectAutomationDisabled() ? "kill_switch" : "untrusted"
+      );
+      return undefined;
+    }
+    try {
+      return await bashAiProxy.envFor(workspaceId, runtimeType, secretKeys);
+    } catch (error) {
+      log.warn("[bash-ai-proxy] env setup failed; bash AI calls stay uncounted", {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
+  }
+
+  private async prepareOrThrow(
+    opts: StreamMessageOptions,
+    context: TurnRequestBuildContext
+  ): Promise<PreparedTurnRequestOutcome> {
+    const resources: { model?: LanguageModel; cleanupTemp?: () => Promise<void> } = {};
+    let retained = false;
+    let transferred = false;
+    const dispose = async () => {
+      if (transferred) return;
+      transferred = true;
+      runLanguageModelCleanup(resources.model);
+      try {
+        await resources.cleanupTemp?.();
+      } catch (error) {
+        log.warn("Failed to clean up unstarted request", { error });
+      }
+    };
+    await using _preparation = {
+      [Symbol.asyncDispose]: async () => {
+        if (!retained) await dispose();
+      },
+    };
+    const {
+      messages,
+      workspaceId,
+      thinkingLevel,
+      reasoningMode,
+      toolPolicy,
+      additionalSystemContext,
+      additionalSystemInstructions,
+      maxOutputTokens,
+      muxProviderOptions,
+      agentInitiated,
+      agentId,
+      strictAgentResolution,
+      acpPromptId,
+      onPreStartError,
+      delegatedToolNames,
+      recordFileState,
+      recordProposedPlan,
+      postCompactionAttachments,
+      resolveMemoryContext,
+      workspaceGoalService,
+      goalTurnKind,
+      goalTurnGoalId,
+      taskTurnKind,
+      disableWorkspaceAgents,
+      hasQueuedMessages,
+      getQueuedInputStopCause,
+      onStepSettled,
+      onTurnStartStage,
+      contextBudgetRolloverAvailable,
+      requestAssemblySnapshot,
+      openaiTruncationModeOverride,
+      compactionInputBudgetScale,
+      compactionContextRetryAvailable,
+      muxMetadata,
+      minThinkingLevel: providedMinThinkingLevel,
+    } = opts;
+    // Both can move once, below: an Auto-routed tier model that cannot be built falls back
+    // to the composer's model, and every later use of the pair follows that swap.
+    let modelString = opts.modelString;
+    let autoModelRouting = opts.autoModelRouting;
+    let activeTurnThinkingOverride = opts.activeTurnThinkingOverride;
+    // One read per flag for the whole turn: a toggle while the turn is prepared must not
+    // split dependent flags, such as token budget and the memory it requires.
+    const enabledExperiments = new Set(
+      Object.values(EXPERIMENT_IDS).filter(
+        (id) => this.dependencies.experimentsService?.isExperimentEnabled(id) === true
+      )
+    );
+    const isExperimentEnabled = (id: ExperimentId) => enabledExperiments.has(id);
+    const experiments = {
+      programmaticToolCalling: isExperimentEnabled(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
+      rlm: isExperimentEnabled(EXPERIMENT_IDS.RLM),
+      tokenBudget: isTokenBudgetActive(isExperimentEnabled),
+      continuousCompaction: isExperimentEnabled(EXPERIMENT_IDS.CONTINUOUS_COMPACTION),
+    };
+    const combinedAbortSignal = context.abortSignal;
+    const syntheticMessageId = context.syntheticMessageId;
+    const startTime = context.startTime;
+    const startupPhaseTimingsMs = context.startupPhaseTimingsMs;
+    const recordStartupPhaseTiming = context.recordStartupPhaseTiming;
+    let pendingRunMetadataId: string | null = context.startupState.pendingRunMetadataId;
+
+    const deleteAbortedPlaceholder = async (messageId: string): Promise<void> => {
+      const deleteResult = await this.dependencies.historyService.deleteMessage(
+        workspaceId,
+        messageId
+      );
+      if (!deleteResult.success) {
+        log.error(
+          "Failed to delete aborted assistant placeholder (" +
+            messageId +
+            "): " +
+            deleteResult.error
+        );
+      }
+    };
+    // Mode (plan|exec|compact) is derived from the selected agent definition.
+    const effectiveMuxProviderOptions: MuxProviderOptions = muxProviderOptions ?? {};
+    const userOpenAIWireFormat = effectiveMuxProviderOptions.openai?.wireFormat;
+    // A non-OpenAI attempt strips unsupported options from this mutable object.
+    // Preserve the chat's choice so an OpenAI fallback cannot re-inherit a global tier.
+    const userServiceTier = effectiveMuxProviderOptions.openai?.serviceTier;
+
+    const resolveToolsIdentity = (
+      raw: string,
+      effective: string,
+      canonical: string,
+      // The factory's wire snapshot — resolved from the SAME config read
+      // that created the SDK model. Re-reading the providers config here
+      // instead would race authoritative catalog refreshes: a mid-request
+      // type change would assemble another wire's tools/options for the
+      // already-created model. Shadowed prefixes and unknown instances have
+      // no snapshot, and their canonical form is the raw string.
+      coderWire:
+        | { origin: "anthropic" | "openai"; modelId: string; providerType: string }
+        | undefined,
+      // Snapshot the identity is resolved against; the refusal-fallback
+      // path passes ITS pinned snapshot, not the primary request's.
+      providersConfigSnapshot: ProvidersConfigMap
+    ): { modelString: string; openaiWireFormat?: "chatCompletions" | "responses" } => {
+      // Custom providers own their raw prefix (including shadowed built-in
+      // ids) and speak the wire their providerType selects: tool assembly
+      // must key on that wire so Responses-bound MCP schemas are sanitized
+      // and provider-native tools are offered. Chat-completions custom
+      // providers keep their generic identity.
+      const rawSeparator = raw.indexOf(":");
+      const rawPrefix = rawSeparator > 0 ? raw.slice(0, rawSeparator) : "";
+      const rawCustomEntry = rawPrefix ? providersConfigSnapshot[rawPrefix] : undefined;
+      if (isCustomProviderConfig(rawCustomEntry)) {
+        const wireOrigin = customProviderWireOrigin(rawCustomEntry.providerType);
+        if (wireOrigin === "openai") {
+          // The factory always creates provider.responses() for this type.
+          return {
+            modelString: `openai:${raw.slice(rawSeparator + 1)}`,
+            openaiWireFormat: "responses",
+          };
+        }
+        if (wireOrigin === "anthropic") {
+          return { modelString: `anthropic:${raw.slice(rawSeparator + 1)}` };
+        }
+        return { modelString: raw };
+      }
+      // A canonical selection that canonicalRoutes sends through Coder speaks
+      // the selected instance's wire, like the explicit coder: string.
+      if (!raw.startsWith("coder:") && !effective.startsWith("coder:")) {
+        return { modelString: raw };
+      }
+      if (!effective.startsWith("coder:")) {
+        // Fallback away from Coder. A PASSTHROUGH gateway fallback must
+        // normalize to the canonical wire identity: getToolsForModel only runs
+        // Anthropic/OpenAI-specific assembly (native web tools, MCP schema
+        // sanitization) for direct
+        // provider prefixes, and passthrough gateways forward origin-shaped
+        // payloads. Transforming gateways (openrouter) keep their own
+        // identity, same as a direct selection of that gateway.
+        const separator = effective.indexOf(":");
+        const effectiveProvider = separator > 0 ? effective.slice(0, separator) : "";
+        const definition = Object.hasOwn(PROVIDER_DEFINITIONS, effectiveProvider)
+          ? PROVIDER_DEFINITIONS[effectiveProvider as ProviderName]
+          : undefined;
+        const passthroughGateway =
+          definition?.kind === "gateway" &&
+          "passthrough" in definition &&
+          definition.passthrough === true;
+        return {
+          modelString: passthroughGateway ? normalizeToCanonical(effective) : effective,
+        };
+      }
+      if (!coderWire) {
+        return { modelString: canonical };
+      }
+      // The factory creates Coder instances from the wire alone (openai
+      // type and bedrock openai.* models → provider.responses, openai-chat
+      // types → provider.chat), so BOTH OpenAI wire kinds must override any
+      // pre-existing wireFormat: a refusal chain that starts on direct OpenAI
+      // Chat Completions and falls back to an openai-typed Coder instance
+      // would otherwise build Chat Completions tools/options for a Responses
+      // request.
+      const wireProtocol = coderGatewayWireProtocol(coderWire.providerType, coderWire.modelId);
+      return {
+        modelString: `${coderWire.origin}:${coderWire.modelId}`,
+        ...(wireProtocol === "openai-chat"
+          ? { openaiWireFormat: "chatCompletions" as const }
+          : wireProtocol === "openai-responses"
+            ? { openaiWireFormat: "responses" as const }
+            : {}),
+      };
+    };
+    // One scope per built turn: every model this turn creates (fallback hops included) shares it,
+    // so the prefix detector can tell a turn-boundary break from a mid-turn one.
+    const promptCacheScope = this.dependencies.providerModelFactory.createPromptCacheTurnScope(
+      workspaceId,
+      this.dependencies.bindings.timelineService ?? NOOP_TIMELINE_RECORDER
+    );
+    const prepareModelSeed = async (options: {
+      rawModelString: string;
+      requestedThinkingLevel: ThinkingLevel | undefined;
+      minimumThinkingLevelOverride: ThinkingLevel | undefined;
+      enforceMinimum: boolean;
+      recordTiming?: boolean;
+    }) => {
+      if (
+        options.enforceMinimum &&
+        effectiveMuxProviderOptions.openai?.wireFormat !== userOpenAIWireFormat
+      ) {
+        effectiveMuxProviderOptions.openai = {
+          ...(effectiveMuxProviderOptions.openai ?? {}),
+          wireFormat: userOpenAIWireFormat,
+        };
+      }
+
+      const requestedThinkingLevel = options.requestedThinkingLevel ?? THINKING_LEVEL_OFF;
+      // Routing, model creation, and the request view share ONE read: a
+      // re-read after creation could see a concurrent provider refresh and
+      // build tools and options for another wire than the created model.
+      const providersConfigSnapshot =
+        this.dependencies.providersConfigStore.loadProvidersConfig() ?? {};
+      const providersConfig = this.dependencies.providerService.getConfig(providersConfigSnapshot);
+      const preliminaryMinThinkingLevel = resolveMinimumThinkingLevel(
+        options.rawModelString,
+        options.minimumThinkingLevelOverride,
+        providersConfig
+      );
+      const preliminaryThinkingLevel = options.enforceMinimum
+        ? enforceThinkingPolicy(
+            options.rawModelString,
+            requestedThinkingLevel,
+            preliminaryMinThinkingLevel,
+            providersConfig
+          )
+        : resolveEffectiveThinkingLevel(
+            options.rawModelString,
+            requestedThinkingLevel,
+            providersConfig
+          );
+
+      const resolveAndCreateModelStartedAt = this.hostClock.nowMs();
+      const resolved = await this.dependencies.providerModelFactory.resolveAndCreateModel(
+        options.rawModelString,
+        preliminaryThinkingLevel,
+        effectiveMuxProviderOptions,
+        {
+          agentInitiated,
+          workspaceId,
+          providersConfig: providersConfigSnapshot,
+          getServiceTierOverride: () => activeTurnThinkingOverride?.serviceTier ?? userServiceTier,
+          promptCacheScope,
+        }
+      );
+      if (options.recordTiming) {
+        recordStartupPhaseTiming("resolveAndCreateModelMs", resolveAndCreateModelStartedAt);
+      }
+      if (!resolved.success) {
+        return resolved;
+      }
+
+      const minThinkingLevel = resolveMinimumThinkingLevel(
+        options.rawModelString,
+        options.minimumThinkingLevelOverride,
+        providersConfig
+      );
+      const policyThinkingLevel = options.enforceMinimum
+        ? enforceThinkingPolicy(
+            options.rawModelString,
+            requestedThinkingLevel,
+            minThinkingLevel,
+            providersConfig
+          )
+        : resolveEffectiveThinkingLevel(
+            options.rawModelString,
+            requestedThinkingLevel,
+            providersConfig
+          );
+      const toolsIdentity = resolveToolsIdentity(
+        options.rawModelString,
+        resolved.data.effectiveModelString,
+        resolved.data.canonicalModelString,
+        resolved.data.coderWire,
+        providersConfig
+      );
+      const optionsModelString =
+        options.rawModelString.startsWith("coder:") &&
+        !resolved.data.effectiveModelString.startsWith("coder:")
+          ? toolsIdentity.modelString
+          : options.rawModelString;
+      if (toolsIdentity.openaiWireFormat != null) {
+        effectiveMuxProviderOptions.openai = {
+          ...(effectiveMuxProviderOptions.openai ?? {}),
+          wireFormat: toolsIdentity.openaiWireFormat,
+        };
+      }
+
+      const capabilityModelString = resolveModelForMetadata(
+        options.rawModelString.startsWith("coder:")
+          ? options.rawModelString
+          : resolved.data.canonicalModelString,
+        providersConfig
+      );
+      // Sonnet 5.5 "off" is `between_tools`, pinned to effort low for the conversation
+      // (#5086). Decide here, not in buildProviderOptions, so the recorded level, message
+      // preparation and provider options all agree when it falls back to "low".
+      const effectiveThinkingLevel = resolveBetweenToolsThinkingLevel(
+        capabilityModelString,
+        policyThinkingLevel,
+        anthropicBetweenToolsRouteAvailable(
+          optionsModelString,
+          resolved.data.routeProvider,
+          providersConfig
+        ),
+        // The rows message preparation can send, not only the boundary slice: a
+        // model-hidden row or an excluded keep-recent tail never reaches the provider.
+        assistantThinkingLevels(selectActiveContextMessages(messages))
+      );
+
+      return Ok({
+        ...resolved.data,
+        rawModelString: options.rawModelString,
+        providersConfig,
+        minThinkingLevel,
+        effectiveThinkingLevel,
+        capabilityModelString,
+        toolsModelString: toolsIdentity.modelString,
+        optionsModelString,
+      });
+    };
+
+    let modelResult = await prepareModelSeed({
+      rawModelString: modelString,
+      requestedThinkingLevel: thinkingLevel,
+      minimumThinkingLevelOverride: providedMinThinkingLevel,
+      enforceMinimum: false,
+      recordTiming: true,
+    });
+    // Auto routing promises the composer's model whenever the tier model cannot run. The
+    // factory owns every reason it cannot be built (missing credentials, disabled or removed
+    // provider, catalog), so the fallback keys on its verdict here instead of pre-checking
+    // copies of those rules at classification time.
+    // Only the model reverts: the tier's thinking level (when Auto set it) is re-clamped for
+    // the fallback model here and recorded with the assembled request, like a refusal hop.
+    if (
+      !modelResult.success &&
+      autoModelRouting?.status === "routed" &&
+      autoModelRouting.model !== autoModelRouting.requestedFallbackModel
+    ) {
+      const routedRecord = autoModelRouting;
+      const tierModelError = modelResult.error;
+      const fallbackModelString = routedRecord.requestedFallbackModel;
+      const fallbackResult = await prepareModelSeed({
+        rawModelString: fallbackModelString,
+        requestedThinkingLevel: thinkingLevel,
+        minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
+          this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
+          fallbackModelString
+        ),
+        enforceMinimum: true,
+      });
+      if (!fallbackResult.success) {
+        // Neither model runs; the composer's own failure is the one the user can act on.
+        return { type: "finished", result: Err(fallbackResult.error) };
+      }
+      log.warn("Auto-routed tier model cannot be built; falling back to the composer's model", {
+        workspaceId,
+        tierModel: modelString,
+        fallbackModel: fallbackModelString,
+        error: tierModelError,
+      });
+      modelResult = fallbackResult;
+      modelString = fallbackModelString;
+      autoModelRouting = {
+        ...routedRecord,
+        model: fallbackModelString,
+        status: "fallback",
+        reason: formatSendMessageError(tierModelError).message,
+      };
+    }
+    if (!modelResult.success) {
+      return { type: "finished", result: Err(modelResult.error) };
+    }
+    resources.model = modelResult.data.model;
+    const {
+      canonicalModelString,
+      canonicalProviderName,
+      wireProviderName,
+      routeProvider,
+      providersConfig: requestProvidersConfig,
+      effectiveThinkingLevel,
+      capabilityModelString,
+    } = modelResult.data;
+
+    log.debug_obj(`${workspaceId}/1_original_messages.json`, messages);
+
+    // Context Boundary request slicing happens before empty-assistant filtering so
+    // provider-invisible reset rows can still bound the active context window.
+    // Message preparation keys on the WIRE provider (wireProviderName), not
+    // the config identity: a gateway-scoped coder:<instance>/<model> request
+    // sends Anthropic/OpenAI-shaped bytes, so wire-specific transforms must
+    // still run for it.
+    const { activeContextMessages, providerRequestMessages, contextBoundarySlicedCount } =
+      prepareProviderRequestMessages(messages, wireProviderName, effectiveThinkingLevel);
+    if (contextBoundarySlicedCount > 0) {
+      log.debug("Prepared provider history window", {
+        workspaceId,
+        originalCount: messages.length,
+        contextBoundarySlicedCount,
+        activeContextCount: activeContextMessages.length,
+      });
+    }
+    log.debug_obj(`${workspaceId}/1a_active_context_messages.json`, activeContextMessages);
+    log.debug(
+      `Filtered ${activeContextMessages.length - providerRequestMessages.length} empty assistant messages`
+    );
+    log.debug_obj(`${workspaceId}/1b_provider_request_messages.json`, providerRequestMessages);
+
+    // OpenAI-specific: Keep reasoning parts in history so each request can
+    // carry forward reasoning context without relying on previous_response_id.
+    if (wireProviderName === "openai") {
+      log.debug("Keeping reasoning parts for OpenAI (managed via explicit history)");
+    }
+    const getWorkspaceMetadataStartedAt = this.hostClock.nowMs();
+    const metadataResult = await this.dependencies.getWorkspaceMetadata(workspaceId);
+    recordStartupPhaseTiming("getWorkspaceMetadataMs", getWorkspaceMetadataStartedAt);
+    if (!metadataResult.success) {
+      return { type: "finished", result: Err({ type: "unknown", raw: metadataResult.error }) };
+    }
+
+    const metadata = metadataResult.data;
+    // Side chats share the main checkout: metadata, never a caller opt-in, imposes the
+    // local-read ceiling so agent/caller configuration cannot grant mutating capabilities.
+    const capabilityGrants = sideChatCapabilityGrants(metadata);
+    const isSideChat = capabilityGrants != null;
+    const workspaceLog = log.withFields({ workspaceId, workspaceName: metadata.name });
+    const logSlowStreamStartup = (details: Record<string, unknown>): void => {
+      const totalMs = this.hostClock.nowMs() - startTime;
+      if (totalMs < STREAM_STARTUP_DIAGNOSTIC_THRESHOLD_MS) {
+        return;
+      }
+
+      workspaceLog.info("[stream-startup] Slow pre-stream preparation", {
+        workspaceId,
+        modelString,
+        totalMs,
+        startupPhaseTimingsMs,
+        ...details,
+      });
+    };
+    // Exposed so the caller's catch path can log slow startups that fail after build().
+    context.startupState.logSlowStreamStartup = logSlowStreamStartup;
+
+    const emitStartupBreadcrumb = (
+      startupStage:
+        | "waiting_for_init"
+        | "checking_runtime"
+        | "loading_workspace_context"
+        | "loading_tools"
+        | "preparing_request"
+        | "starting_stream"
+    ): void => {
+      const breadcrumb =
+        startupStage === "waiting_for_init"
+          ? {
+              phase: "waiting" as const,
+              detail: "Waiting for workspace initialization...",
+            }
+          : startupStage === "checking_runtime"
+            ? {
+                phase: "starting" as const,
+                detail: "Checking workspace runtime...",
+              }
+            : startupStage === "loading_workspace_context"
+              ? {
+                  phase: "starting" as const,
+                  detail: "Loading workspace context...",
+                }
+              : startupStage === "loading_tools"
+                ? {
+                    phase: "starting" as const,
+                    detail: "Loading tools...",
+                  }
+                : startupStage === "preparing_request"
+                  ? {
+                      phase: "starting" as const,
+                      detail: "Preparing model request...",
+                    }
+                  : {
+                      phase: "starting" as const,
+                      detail: "Starting model stream...",
+                    };
+
+      workspaceLog.info("[stream-startup] Breadcrumb", {
+        startupStage,
+        phase: breadcrumb.phase,
+        detail: breadcrumb.detail,
+        elapsedMs: this.hostClock.nowMs() - startTime,
+      });
+      if (!context.admissionOnly)
+        this.dependencies.emit("runtime-status", {
+          type: "runtime-status",
+          workspaceId,
+          phase: breadcrumb.phase,
+          runtimeType: metadata.runtimeConfig.type,
+          source: "startup",
+          detail: breadcrumb.detail,
+        });
+    };
+
+    const runtimeContextResult = this.dependencies.createWorkspaceRuntimeContext(
+      workspaceId,
+      metadata
+    );
+    if (!runtimeContextResult.success) {
+      return { type: "finished", result: Err(runtimeContextResult.error) };
+    }
+    const { runtime, workspacePath, hostCheckoutRoot, projectCheckoutRoot } =
+      runtimeContextResult.data;
+
+    // Wait for init to complete before any runtime I/O operations
+    // (SSH/devcontainer may not be ready until init finishes pulling the container)
+    emitStartupBreadcrumb("waiting_for_init");
+    const waitForInitStartedAt = this.hostClock.nowMs();
+    await this.dependencies.initStateManager.waitForInit(workspaceId, combinedAbortSignal);
+    recordStartupPhaseTiming("waitForInitMs", waitForInitStartedAt);
+    // Metadata was read before the wait: a checkout whose launch sanitize failed meanwhile
+    // must not reach MCP startup below (#4674).
+    const unsanitized = this.dependencies.initStateManager.getUnsanitizedCheckoutError(workspaceId);
+    if (unsanitized) {
+      return {
+        type: "finished",
+        result: Err({ type: unsanitized.code, message: unsanitized.message }),
+      };
+    }
+    if (combinedAbortSignal.aborted) {
+      return {
+        type: "finished",
+        result: Ok(
+          this.dependencies.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal)
+        ),
+      };
+    }
+
+    // Verify runtime is actually reachable after init completes.
+    // For Docker workspaces, this checks the container exists and starts it if stopped.
+    // For Coder workspaces, this may start a stopped workspace and wait for it.
+    // If init failed during container creation, ensureReady() will return an error.
+    emitStartupBreadcrumb("checking_runtime");
+    const ensureReadyStartedAt = this.hostClock.nowMs();
+    const readyResult = await runtime.ensureReady({
+      signal: combinedAbortSignal,
+      statusSink: (status) => {
+        // Emit runtime-status events for frontend UX (StreamingBarrier)
+        if (!context.admissionOnly)
+          this.dependencies.emit("runtime-status", {
+            type: "runtime-status",
+            workspaceId,
+            phase: status.phase,
+            runtimeType: status.runtimeType,
+            source: "runtime",
+            detail: status.detail,
+          });
+      },
+    });
+    recordStartupPhaseTiming("ensureReadyMs", ensureReadyStartedAt);
+    if (!readyResult.ready) {
+      const runtimeType = metadata.runtimeConfig?.type ?? "local";
+      const runtimeLabel = runtimeType === "docker" ? "Container" : "Runtime";
+      const errorMessage = readyResult.error || `${runtimeLabel} unavailable.`;
+      const errorType = readyResult.errorType;
+
+      const finished = this.finishWithPreStartError(opts, context, errorType, errorMessage);
+      logSlowStreamStartup({
+        outcome: "runtime_not_ready",
+        runtimeType,
+        errorType,
+        errorMessage,
+      });
+      return finished;
+    }
+
+    // Memory context (memory experiment): resolved only after ensureReady so
+    // project-scope listing sees a running runtime (a stopped Docker/remote
+    // workspace would yield an empty/partial context, and AgentSession caches
+    // the result per model/session segment).
+    const memoryContext = resolveMemoryContext
+      ? await resolveMemoryContext(modelString)
+      : undefined;
+
+    const cfg = this.dependencies.config.loadConfigOrDefault();
+    const memoryExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.MEMORY);
+    const sessionHistoryEnabled = experiments.tokenBudget;
+    // Tool search is a host-level user setting (default on); sub-agents and CLI
+    // runs follow the same config.
+    const toolSearchEnabled = cfg.toolSearchEnabled !== false;
+    const artifactsExperimentEnabled = isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS);
+    const claudeSkillsCompatExperimentEnabled = this.dependencies.isClaudeSkillsCompatEnabled();
+    emitStartupBreadcrumb("loading_workspace_context");
+    // One cache per request: resolution, plan handoff, prompt body, and
+    // sub-agent discovery share definition reads; the next turn starts fresh.
+    const agentDefinitionCache = new AgentDefinitionRequestCache();
+    const resolveAgentForStreamStartedAt = this.hostClock.nowMs();
+    const agentResult = await resolveAgentForStream({
+      workspaceId,
+      metadata,
+      runtime,
+      workspacePath,
+      runtimeFactory: this.dependencies.runtimeFactory,
+      requestedAgentId: agentId,
+      strictAgentResolution,
+      // Goal kind survives retries, restart resumes and compaction follow-ups (#5402).
+      automaticGoalTurn: goalTurnKind != null,
+      disableWorkspaceAgents: disableWorkspaceAgents ?? false,
+      callerToolPolicy: toolPolicy,
+      cfg,
+      emitError: (event) => {
+        if (!context.admissionOnly) this.dependencies.emit("error", event);
+        onPreStartError?.(event);
+      },
+      agentDefinitionCache,
+    });
+    recordStartupPhaseTiming("resolveAgentForStreamMs", resolveAgentForStreamStartedAt);
+    if (!agentResult.success) {
+      return { type: "finished", result: Err(agentResult.error) };
+    }
+    const {
+      effectiveAgentId,
+      agentDefinition,
+      agentDiscoveryRuntime,
+      agentDiscoveryPath,
+      isSubagentWorkspace,
+      agentInheritanceChain,
+      agentIsPlanLike,
+      effectiveMode,
+      taskSettings,
+      taskDepth,
+      shouldDisableTaskToolsForDepth,
+      effectiveToolPolicy: agentToolPolicy,
+      switchableAgents: resolvedSwitchableAgents,
+    } = agentResult.data;
+    // Side conversations must not inherit completion requirements for work in the main chat.
+    // Grants cap the tools; keep normal enable/disable policy but never require recovery calls.
+    const effectiveToolPolicy = isSideChat
+      ? agentToolPolicy?.filter((rule) => rule.action !== "require")
+      : agentToolPolicy;
+    const switchableAgents = isSideChat
+      ? resolvedSwitchableAgents?.map((agent) => ({
+          ...agent,
+          toolPolicy: agent.toolPolicy.filter((rule) => rule.action !== "require"),
+        }))
+      : resolvedSwitchableAgents;
+    // Explicit summaries remain recovery operations, not token-budget turns.
+    // Inspect this request's last effective user row, never an older compact command.
+    const latestUserMessage = providerRequestMessages.findLast(
+      (message) => message.role === "user"
+    );
+    const isCompactionRequest =
+      effectiveAgentId === "compact" ||
+      muxMetadata?.type === "compaction-request" ||
+      latestUserMessage?.metadata?.muxMetadata?.type === "compaction-request";
+    // Before any request is sent: compaction prompts never extend the chat's prefix, and
+    // the baseline must clear even when the compaction model is not on an Anthropic route.
+    if (isCompactionRequest) promptCacheScope.markCompaction();
+    // The context the request is built from: a cleared or replaced history starts a new baseline.
+    promptCacheScope.setContextEpoch(providerRequestMessages[0]?.id);
+    const tokenBudgetEnabled =
+      !isCompactionRequest &&
+      sessionHistoryEnabled &&
+      !experiments.continuousCompaction &&
+      !isRlmModeEnabled(isExperimentEnabled);
+    const legacyModeForMetadata = getLegacyModeForAgentMetadata(effectiveAgentId, effectiveMode);
+    const memoryAccess: MemoryScopeAccess = resolveMemoryAccessPolicy({
+      planLike: agentIsPlanLike,
+      editingCapable: isExecLikeEditingCapableInResolvedChain(agentInheritanceChain),
+    });
+    const projectTrusted = isWorkspaceProjectTrusted(this.dependencies.config, metadata);
+    // projectAutomationDisabled: benchmark harnesses opt out of automatic
+    // repo hook execution (tool_env/tool_pre/tool_post) while keeping
+    // config trust for sub-agent delegation.
+    const sharedExecutionTrusted =
+      isWorkspaceTrustedForSharedExecution(metadata, cfg.projects) && !projectAutomationDisabled();
+    const effectiveGoalDefaults = mergeGoalDefaults(
+      normalizeGoalDefaults(cfg.goalDefaults ?? DEFAULT_GOAL_DEFAULTS),
+      metadata.goalDefaults ?? null
+    );
+    // Goal tools are registered whenever a goal service exists and gate at
+    // execution time on these per-turn inputs plus the live goal status, so the
+    // tool block does not change when the goal does (prompt caching, #5247).
+    const goalToolContext: GoalToolContext = {
+      parentWorkspaceId: metadata.parentWorkspaceId,
+      goalTurnKind,
+      ...(goalTurnKind != null && goalTurnGoalId != null ? { goalId: goalTurnGoalId } : {}),
+      agentId: effectiveAgentId,
+      agentIsPlanLike,
+      agentDiscoveryOverridden: disableWorkspaceAgents === true,
+      taskTurnKind,
+    };
+
+    // Fetch workspace MCP overrides (for filtering servers and tools)
+    // NOTE: Stored in <workspace>/.xum/mcp.local.jsonc (not ~/.xum/config.json).
+    let mcpOverrides: WorkspaceMCPOverrides | undefined;
+    // Not authoritative (indeterminate probe, unreadable document, failed
+    // inheritance, read error): the manager re-reads disk and fails the MCP
+    // serve closed if it cannot vouch for the enablement either — "no
+    // overrides" would re-enable a globally enabled server that only the
+    // unreadable document disables.
+    let mcpOverridesAuthoritative = false;
+    const loadWorkspaceMcpOverridesStartedAt = this.hostClock.nowMs();
+    // Wall clock: MCPServerManager subtracts Date.now() from this deadline (#7282).
+    const mcpOverridesReadDeadlineAt = nodeClock.nowMs() + MCP_OVERRIDES_READ_TIMEOUT_MS;
+    try {
+      // Bounded and cancellable: an inheriting child's resolution probes and
+      // reads every ancestor's document on that ancestor's runtime (SSH/Docker
+      // allow minutes per operation); a send must neither hang on it nor
+      // outlive its own interruption. A timeout yields a non-authoritative
+      // read (see above), never authoritative empty overrides.
+      const read = await this.dependencies.workspaceMcpOverridesService.getOverridesForWorkspace(
+        workspaceId,
+        {
+          timeoutMs: MCP_OVERRIDES_READ_TIMEOUT_MS,
+          signal: combinedAbortSignal,
+          clock: this.hostClock,
+        }
+      );
+      mcpOverrides = read.overrides;
+      mcpOverridesAuthoritative = read.authoritative;
+    } catch (error) {
+      log.warn("[MCP] Failed to load workspace MCP overrides; continuing without overrides", {
+        workspaceId,
+        error,
+      });
+      mcpOverrides = undefined;
+    }
+    if (combinedAbortSignal.aborted) {
+      // Interrupted during the (possibly long) resolution: end the send here
+      // instead of assembling a request nobody waits for.
+      return {
+        type: "finished",
+        result: Ok(
+          this.dependencies.createAbortedTurnHandle(syntheticMessageId, combinedAbortSignal)
+        ),
+      };
+    }
+    recordStartupPhaseTiming("loadWorkspaceMcpOverridesMs", loadWorkspaceMcpOverridesStartedAt);
+
+    // Agent Plugins: discovery follows the active checkout and is disabled
+    // for workspaces that exec off-host (SSH/Docker/devcontainer).
+    const agentPluginsMcpContext = hostCheckoutRoot
+      ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
+      : null;
+
+    // Tier-1 plugin hooks: reconcile discovered hooks.js modules with the
+    // event spine BEFORE request assembly so both request.assemble and
+    // tool.execute middleware are in place for this turn. Failure posture: a
+    // broken plugin never blocks a send.
+    if (!requestAssemblySnapshot) {
+      await prepareWorkspaceRequestHooks({
+        config: this.dependencies.config,
+        metadata,
+        hostCheckoutRoot,
+        journal: this.dependencies.durableEventJournalFor(workspaceId),
+        mcpServerManager: this.dependencies.bindings.mcpServerManager,
+        hostFiles: this.dependencies.hostServices.hostFiles,
+        hostPaths: this.dependencies.hostServices.hostPaths,
+      });
+    }
+
+    const listMcpServersStartedAt = this.hostClock.nowMs();
+    // The system prompt's MCP inventory. When the override read was not
+    // authoritative, a listing built from the fallback overrides could
+    // advertise servers the manager's serve excludes (it re-reads disk and
+    // fails closed when it cannot vouch) or omit servers disk enables. In that
+    // case the inventory is rebuilt below from the overrides the validated
+    // serve actually used, or omitted entirely when the serve failed closed.
+    let mcpServers =
+      !isSideChat && this.dependencies.bindings.mcpServerManager && mcpOverridesAuthoritative
+        ? await this.dependencies.bindings.mcpServerManager.listServers(
+            metadata.projectPath,
+            mcpOverrides,
+            projectTrusted,
+            agentPluginsMcpContext
+          )
+        : undefined;
+    recordStartupPhaseTiming("listMcpServersMs", listMcpServersStartedAt);
+
+    const loadAdditionalSystemContextStartedAt = this.hostClock.nowMs();
+    let workspaceAdditionalSystemContext = additionalSystemContext;
+    if (workspaceAdditionalSystemContext == null) {
+      try {
+        // Fall back to disk only when the renderer did not send a live snapshot.
+        // `effectiveAdditionalSystemContext` honors the `enabled` toggle: when
+        // the user has disabled the scratchpad, the persisted content is
+        // intentionally not injected.
+        const record = await readAdditionalSystemContext(
+          this.dependencies.config,
+          workspaceId,
+          this.dependencies.historyService.files
+        );
+        workspaceAdditionalSystemContext = effectiveAdditionalSystemContext(record);
+      } catch (error) {
+        // The scratchpad is user-editable state, so a transient read failure should not block a send.
+        log.warn("Failed to load workspace additional system context; continuing without it", {
+          workspaceId,
+          error,
+        });
+        workspaceAdditionalSystemContext = "";
+      }
+    }
+    // Side chats get their guardrails on every turn (including retries and resumes), so they do
+    // not depend on the renderer remembering to send them.
+    const scratchpadAdditionalSystemInstructions = withSideChatInstructions(
+      metadata,
+      mergeAdditionalSystemInstructions(
+        workspaceAdditionalSystemContext,
+        additionalSystemInstructions
+      )
+    );
+    recordStartupPhaseTiming("loadAdditionalSystemContextMs", loadAdditionalSystemContextStartedAt);
+
+    // Build plan-aware instructions and determine plan→exec transition content.
+    // IMPORTANT: Derive this from the same boundary-sliced message payload that is sent to
+    // the model so plan hints/handoffs cannot be suppressed by pre-boundary history.
+    const buildPlanInstructionsStartedAt = this.hostClock.nowMs();
+    // Where the plan lives (planLocation.ts). On SSH it needs this installation's identity
+    // (#5174); an unusable identity file fails the turn with its repair instructions. Loaded once
+    // for the turn, so this plan path and the ancestor paths listed below use one identity even if
+    // the identity file is replaced meanwhile.
+    const installationId = usesInstallationScopedPlans(metadata.runtimeConfig)
+      ? await this.dependencies.config.getInstallationId()
+      : undefined;
+    const planLocation = await resolvePlanFileLocation(
+      installationId === undefined
+        ? this.dependencies.config
+        : withInstallationId(this.dependencies.config, installationId),
+      runtime,
+      { ...metadata, id: workspaceId },
+      this.dependencies.historyService.locks
+    );
+    const { effectiveAdditionalInstructions, planFilePath, planContentForTransition } =
+      await buildPlanInstructions({
+        runtime,
+        runtimeFactory: this.dependencies.runtimeFactory,
+        metadata,
+        planLocation,
+        workspaceId,
+        workspacePath,
+        effectiveMode,
+        effectiveAgentId,
+        agentIsPlanLike,
+        agentDiscoveryRuntime,
+        agentDiscoveryPath,
+        additionalSystemInstructions: scratchpadAdditionalSystemInstructions,
+        shouldDisableTaskToolsForDepth,
+        taskDepth,
+        taskSettings,
+        requestPayloadMessages: providerRequestMessages,
+        agentDefinitionCache,
+        // #6426: from this turn's loaded config (no extra read).
+        projectPluginsTrusted: isWorkspaceProjectTrustedIn(cfg.projects, metadata),
+      });
+    recordStartupPhaseTiming("buildPlanInstructionsMs", buildPlanInstructionsStartedAt);
+
+    const xumScope = resolveXumToolScope(
+      this.dependencies.config,
+      metadata,
+      workspacePath,
+      projectCheckoutRoot
+    );
+
+    const workflowSkillStorageContext = resolveSkillStorageContext({
+      runtime,
+      workspacePath,
+      xumScope,
+      runtimeFactory: this.dependencies.runtimeFactory,
+    });
+
+    const desktopSessionManager = this.dependencies.bindings.desktopSessionManager;
+    let desktopCapabilityPromise: ReturnType<DesktopSessionManager["getCapability"]> | undefined;
+    const loadDesktopCapability =
+      desktopSessionManager == null
+        ? undefined
+        : () => {
+            // Reuse the same capability probe for every desktop-gated agent discovered during
+            // this request so discovery cannot trigger one desktop startup attempt per agent.
+            desktopCapabilityPromise ??= desktopSessionManager.getCapability(workspaceId);
+            return desktopCapabilityPromise;
+          };
+
+    // modelStringForSystem lets the refusal-fallback prepare() rebuild the
+    // system prompt for the fallback model (model-keyed instruction sections).
+    // Memory index eligibility mirrors memory tool registration (experiment +
+    // service); tool policy may still strip the tool, which forces a rebuild
+    // below so the prompt never advertises an absent tool.
+    const memoryToolEligible =
+      memoryExperimentEnabled && this.dependencies.bindings.memoryService !== undefined;
+    const runtimeType = getRuntimeType(metadata.runtimeConfig);
+    // The scratch dir lives where commands run: the host session dir for local/worktree, the
+    // remote host or container otherwise (runtimeScratchDir.ts). Undefined leaves
+    // XUM_SCRATCH_DIR unset, e.g. a devcontainer whose daemon cannot see host paths. Remote
+    // scratch dirs need the Artifacts experiment: resolving one is a remote exec, cached per
+    // workspace and runtime config so it is not repeated every turn.
+    const scratchOnHost = runtimeType === "local" || runtimeType === "worktree";
+    let scratchDir: string | undefined;
+    if (scratchOnHost || artifactsExperimentEnabled) {
+      const scratchSpec = await resolveScratchDirSpec({
+        runtimeConfig: metadata.runtimeConfig,
+        workspaceId,
+        sessionsDir: this.dependencies.config.sessionsDir,
+        runtime,
+        multiProject: isMultiProject(metadata),
+      });
+      scratchDir =
+        scratchSpec.kind === "host"
+          ? await ensureScratchDirForSpec(
+              runtime,
+              scratchSpec,
+              combinedAbortSignal,
+              this.dependencies.historyService.files
+            )
+          : await this.remoteScratchDirs.ensure({
+              workspaceId,
+              runtimeConfig: metadata.runtimeConfig,
+              runtime,
+              spec: scratchSpec,
+              abortSignal: combinedAbortSignal,
+              files: this.dependencies.historyService.files,
+            });
+    }
+    // Agent interface view: seed the status page the main pane shows before the model runs; the
+    // prompt tells the agent about the page under the same condition.
+    const agentInterfaceViewActive = await prepareAgentInterfaceStatusPage({
+      scratchDirSet: scratchDir !== undefined,
+      artifactsEnabled: artifactsExperimentEnabled,
+      agentInterfaceEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
+      sideChat: isSideChat,
+      compactionRequest: isCompactionRequest,
+      resolveLocation: () =>
+        resolveArtifactsLocation(
+          this.dependencies.config.sessionsDir,
+          workspaceId,
+          { ...metadata, namedWorkspacePath: workspacePath },
+          { createRuntime: () => runtime, abortSignal: combinedAbortSignal }
+        ),
+      abortSignal: combinedAbortSignal,
+    });
+    // Filled by the first build: later rebuilds in this turn (tool policy,
+    // model fallback) reuse the same instruction snapshot instead of re-reading.
+    const turnInstructionSources: { current?: InstructionSources } = {};
+    const buildStreamSystemContextForToolset = (
+      toolset: {
+        memoryToolAvailable: boolean;
+      },
+      modelStringForSystem: string = modelString
+    ) =>
+      buildStreamSystemContext({
+        runtime,
+        runtimeFactory: this.dependencies.runtimeFactory,
+        instructionHost: {
+          files: this.dependencies.hostServices.hostFiles,
+          paths: this.dependencies.hostServices.hostPaths,
+        },
+        metadata,
+        workspacePath,
+        workspaceId,
+        agentDefinition,
+        effectiveMode,
+        agentDiscoveryRuntime,
+        agentDiscoveryPath,
+        isSubagentWorkspace,
+        effectiveAdditionalInstructions,
+        planFilePath,
+        installationId,
+        modelString: modelStringForSystem,
+        cfg,
+        providersConfig: this.dependencies.providerService.getConfig(),
+        mcpServers,
+        xumScope,
+        loadDesktopCapability,
+        memoryToolAvailable: toolset.memoryToolAvailable,
+        tokenBudgetEnabled,
+        workspaceMemoryWritable: memoryAccess.workspace === "readwrite",
+        claudeSkillsCompatEnabled: claudeSkillsCompatExperimentEnabled,
+        instructionSources: turnInstructionSources.current,
+        agentDefinitionCache,
+        scratchDirSet: scratchDir !== undefined,
+        agentInterfaceView: agentInterfaceViewActive,
+      });
+
+    // Build provisional agent context before tool policy finalizes the toolset.
+    // Rebuild after policy application so guidance only describes available tools.
+    const buildStreamSystemContextStartedAt = this.hostClock.nowMs();
+    const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
+      memoryToolAvailable: memoryToolEligible,
+    });
+    // The MCP inventory the pre-policy context was built with; a later
+    // rebuild from the validated serve makes that context stale.
+    const mcpServersAtPrePolicy = mcpServers;
+    recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
+    const {
+      agentSystemPromptSections,
+      agentDefinitions,
+      availableSkills,
+      ancestorPlanFilePaths,
+      instructionSources,
+    } = prePolicyStreamSystemContext;
+    turnInstructionSources.current = instructionSources;
+    // The agent_skill_read index the tools are built with, found again by the assembler.
+    const skillIndexSection = skillIndexSectionFor(availableSkills);
+    let systemMessageTokens = prePolicyStreamSystemContext.systemMessageTokens;
+    let systemMessage = prePolicyStreamSystemContext.systemMessage;
+
+    const projectSecrets = isMultiProject(metadata)
+      ? mergeMultiProjectSecrets(metadata, this.dependencies.secretsStore)
+      : this.dependencies.secretsStore.getEffectiveSecrets(metadata.projectPath);
+
+    const streamToken = this.dependencies.streamManager.generateStreamToken();
+
+    let mcpTools: Record<string, Tool> | undefined;
+    let mcpToolServerNames: Record<string, string> | undefined;
+    let mcpStats: MCPWorkspaceStats | undefined;
+    let mcpPromptRuntime: MCPPromptRuntime | undefined;
+    let mcpSetupDurationMs = 0;
+
+    // Do not start external servers for a conversation that can never call their tools.
+    if (!isSideChat && this.dependencies.bindings.mcpServerManager) {
+      const mcpServerManager = this.dependencies.bindings.mcpServerManager;
+      const mcpToolSetupStartedAt = this.hostClock.nowMs();
+      try {
+        const result = await mcpServerManager.getToolsForWorkspace(
+          {
+            workspaceId,
+            projectPath: metadata.projectPath,
+            runtime,
+            workspacePath,
+            trusted: projectTrusted,
+            overrides: mcpOverrides,
+            overridesAuthoritative: mcpOverridesAuthoritative,
+            // A non-authoritative read that exhausted its budget (unreachable
+            // remote ancestor) must not be followed by a second full-length
+            // attempt inside the manager: it gets the remainder only.
+            ...(mcpOverridesAuthoritative
+              ? {}
+              : {
+                  overridesReadDeadlineAt: mcpOverridesReadDeadlineAt,
+                }),
+            projectSecrets: await secretsToRecord(projectSecrets),
+            agentPlugins: agentPluginsMcpContext,
+          },
+          // The manager's own authority re-read (cold/distrusted serve) is
+          // bounded like the read above and ends with this send's interruption.
+          { signal: combinedAbortSignal }
+        );
+
+        mcpTools = result.tools;
+        mcpToolServerNames = result.toolServerNames;
+        mcpStats = result.stats;
+        if (result.overridesUsed === undefined) {
+          // The serve failed closed (overrides invalidated mid-serve, or the
+          // manager could not vouch for them): no tools, no prompts — the
+          // prompt must not advertise servers the serve deliberately withheld.
+          mcpServers = undefined;
+        } else if (result.serversUsed !== undefined) {
+          // The prompt inventory must match the served tools, and every input
+          // to that inventory — not only the override snapshot but project
+          // trust and the global/project MCP config — can change between the
+          // pre-serve listing above and the validated serve. Take the
+          // inventory the serve derived its enablement from; keep the
+          // pre-serve object when it is structurally identical so the
+          // system context is not rebuilt for nothing.
+          if (!mcpServerMapsEqual(mcpServers, result.serversUsed)) {
+            mcpServers = result.serversUsed;
+          }
+        } else if (
+          !mcpOverridesAuthoritative ||
+          !workspaceOverridesEqual(result.overridesUsed, mcpOverrides)
+        ) {
+          // Manager without a validated inventory (test doubles): list from
+          // the overrides the validated serve used, so at least the override
+          // snapshot matches the served tools.
+          mcpServers = await mcpServerManager.listServers(
+            metadata.projectPath,
+            result.overridesUsed,
+            projectTrusted,
+            agentPluginsMcpContext
+          );
+        }
+        // Omit the tool when no prompts exist to avoid adding unused schema context.
+        if (result.promptDescriptors.length > 0) {
+          mcpPromptRuntime = {
+            prompts: result.promptDescriptors,
+            getPrompt: (serverName, promptName, args, options) =>
+              mcpServerManager.getPrompt(workspaceId, serverName, promptName, args, options),
+          };
+        }
+      } catch (error) {
+        // No tools were served (e.g. runWithStablePluginEpoch gave up on an
+        // unreadable epoch): the prompt must not advertise the pre-serve
+        // inventory either.
+        mcpServers = undefined;
+        workspaceLog.error("Failed to start MCP servers", { error });
+      } finally {
+        mcpSetupDurationMs = this.hostClock.nowMs() - mcpToolSetupStartedAt;
+        startupPhaseTimingsMs.mcpToolSetupMs = mcpSetupDurationMs;
+      }
+    }
+
+    // Tool search (user setting, default on): assembly-time gate. The runtime
+    // holder makes getToolsForModel create the tool_catalog_search tool; its `state`
+    // is assigned only after policy filtering builds the deferred catalog
+    // (see prepareToolSearch below). Without MCP tools there is nothing to
+    // defer, so the feature stays fully inactive.
+    const toolSearchRuntime: ToolSearchRuntime | undefined =
+      !isSideChat && toolSearchEnabled && Object.keys(mcpTools ?? {}).length > 0 ? {} : undefined;
+
+    const createTempDirForStreamStartedAt = this.hostClock.nowMs();
+    const runtimeTempDir = await this.dependencies.streamManager.createTempDirForStream(
+      streamToken,
+      runtime
+    );
+    resources.cleanupTemp = async () => {
+      const removed = await execBuffered(
+        runtime,
+        `rm -rf ${shellQuote(path.basename(runtimeTempDir))}`,
+        {
+          cwd: path.dirname(runtimeTempDir),
+          timeout: 10,
+        }
+      );
+      if (removed.exitCode !== 0)
+        log.warn("Failed to remove unstarted request directory", {
+          runtimeTempDir,
+          stderr: removed.stderr,
+        });
+    };
+    recordStartupPhaseTiming("createTempDirForStreamMs", createTempDirForStreamStartedAt);
+
+    const readToolInstructionsStartedAt = this.hostClock.nowMs();
+    // Same snapshot as the system message: no second AGENTS.md scan, and the
+    // prompt and tool descriptions cannot disagree about file contents.
+    const toolInstructions = extractToolInstructionsFromSources(
+      instructionSources,
+      capabilityModelString,
+      metadata,
+      agentSystemPromptSections
+    );
+    recordStartupPhaseTiming("readToolInstructionsMs", readToolInstructionsStartedAt);
+
+    // Calculate cumulative session costs for MUX_COSTS_USD env var
+    let sessionCostsUsd: number | undefined;
+    const loadSessionUsageStartedAt = this.hostClock.nowMs();
+    if (this.dependencies.sessionUsageService) {
+      const sessionUsage = await this.dependencies.sessionUsageService.getSessionUsage(workspaceId);
+      if (sessionUsage) {
+        const allUsage = sumUsageHistory(Object.values(sessionUsage.byModel));
+        sessionCostsUsd = getTotalCost(allUsage);
+      }
+    }
+    recordStartupPhaseTiming("loadSessionUsageMs", loadSessionUsageStartedAt);
+
+    emitStartupBreadcrumb("loading_tools");
+    assert(workspaceId.trim().length > 0, "streamMessage requires a non-empty workspaceId");
+    const xumEnv = getXumEnv(metadata.projectPath, runtimeType, metadata.name, {
+      workspaceId,
+      modelString,
+      thinkingLevel: thinkingLevel ?? "off",
+      costsUsd: sessionCostsUsd,
+      scratchDir,
+    });
+    const projectSecretsRecord = await secretsToRecord(projectSecrets);
+    Object.assign(
+      xumEnv,
+      await this.bashAiProxyEnv(
+        workspaceId,
+        runtimeType,
+        Object.keys(projectSecretsRecord),
+        sharedExecutionTrusted
+      )
+    );
+    const getWorkflowProjectTrusted = () =>
+      isWorkspaceProjectTrusted(this.dependencies.config, metadata);
+
+    const workflowProjectSearchRoot = projectCheckoutRoot ?? workspacePath;
+    const workflowService =
+      this.dependencies.bindings.taskService != null
+        ? new WorkflowService({
+            archiveAdmission: requireWorkflowArchiveAdmission(this.dependencies.bindings),
+            runStore: new WorkflowRunStore({
+              sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
+            }),
+            // This build's settled markers are keyed by the run's terminal generation, so
+            // a resumed run re-arms attention by itself; only the downgrade-compat stable
+            // marker needs clearing when the run leaves terminal state.
+            onRunStatusChanged: async (event) => {
+              if (!isTerminalWorkflowRunStatus(event.status)) {
+                await this.dependencies.bindings.taskService?.clearWorkflowRunDowngradeSettlement({
+                  ownerWorkspaceId: event.workspaceId,
+                  runId: event.runId,
+                });
+              }
+              await this.dependencies.bindings.onWorkflowRunStatusChanged?.(event);
+            },
+            runtimeFactory: new QuickJSRuntimeFactory(),
+            evaluationAdapter:
+              this.dependencies.bindings.evaluationService != null &&
+              this.dependencies.sessionUsageService != null
+                ? new WorkflowEvaluationAdapter({
+                    evaluationService: this.dependencies.bindings.evaluationService,
+                    aiService: this.dependencies.providerModelFactory,
+                    sessionUsageService: this.dependencies.sessionUsageService,
+                    config: this.dependencies.config,
+                    workspaceId,
+                    requestAnalyticsIngest: this.dependencies.bindings.requestAnalyticsIngest,
+                  })
+                : undefined,
+            taskAdapterFactory: (runId, workflowName) =>
+              createProductionWorkflowTaskAdapter({
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+                taskService: this.dependencies.bindings.taskService!,
+                parentWorkspaceId: workspaceId,
+                workflowRunId: runId,
+                workflowName,
+                defaultAgentId: DEFAULT_WORKFLOW_AGENT_ID,
+                patchToolConfig: {
+                  workspaceId,
+                  cwd: workspacePath,
+                  runtime,
+                  runtimeTempDir,
+                  workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
+                  trusted: getWorkflowProjectTrusted(),
+                  sessionLocks: this.dependencies.historyService.locks,
+                },
+                getProjectTrusted: getWorkflowProjectTrusted,
+              }),
+            resolveWorkflowScript: (scriptPath) =>
+              resolveWorkflowScript({
+                scriptPath,
+                runtime,
+                workspacePath,
+                projectSearchRoot: workflowProjectSearchRoot,
+                projectTrusted: getWorkflowProjectTrusted(),
+                skillStorageContext: workflowSkillStorageContext,
+                runtimeFactory: this.dependencies.runtimeFactory,
+              }),
+            assertStoredPluginWorkflowReviewed: (stored) =>
+              assertStoredPluginWorkflowReviewed({
+                ...stored,
+                runtime,
+                workspacePath,
+                projectSearchRoot: workflowProjectSearchRoot,
+                projectTrusted: getWorkflowProjectTrusted(),
+                skillStorageContext: workflowSkillStorageContext,
+                runtimeFactory: this.dependencies.runtimeFactory,
+              }),
+            // Background workflow tools outlive the model turn that started them. Feed the
+            // terminal result back as a hidden user turn so the parent agent continues
+            // instead of leaving the user staring at the workflow report payload.
+            onBackgroundRunTerminal: async ({ runId, status, result, run }) => {
+              if (run.parentWorkflow != null) {
+                return;
+              }
+              if (this.dependencies.bindings.taskService != null) {
+                this.dependencies.bindings.taskService.noteWorkflowRunTerminalAttention({
+                  ownerWorkspaceId: workspaceId,
+                  runId,
+                  status,
+                });
+                return;
+              }
+
+              const continuationSender =
+                this.dependencies.bindings.workflowResultContinuationSender;
+              if (continuationSender == null) {
+                log.warn("Workflow completed but no continuation sender is configured", {
+                  workspaceId,
+                  runId,
+                });
+                return;
+              }
+
+              const scriptPath = run.workflow.sourcePath ?? run.workflow.name;
+              const rawCommand = `workflow_run ${scriptPath}`;
+              const workflowResultMessage = buildWorkflowResultContextMessage({
+                rawCommand,
+                name: scriptPath,
+                runId,
+                status,
+                result,
+                run,
+              });
+              for (;;) {
+                const invocationCurrent = await continuationSender.isWorkflowInvocationCurrent(
+                  workspaceId,
+                  runId
+                );
+                if (!invocationCurrent) {
+                  if (this.dependencies.isStreaming(workspaceId)) {
+                    await waitForWorkflowContinuationRetry(this.hostClock);
+                    continue;
+                  }
+                  log.debug("Skipping superseded workflow continuation", { workspaceId, runId });
+                  return;
+                }
+
+                const sendResult = await continuationSender.sendMessage(
+                  workspaceId,
+                  workflowResultMessage,
+                  {
+                    model: modelString,
+                    thinkingLevel: effectiveThinkingLevel,
+                    // Carry the turn's pro mode so the workflow-result
+                    // continuation does not silently drop back to standard.
+                    reasoningMode,
+                    agentId: effectiveAgentId,
+                    // The caller's policy, not the composed one: the continuation
+                    // re-resolves the agent, and agent rules sent as caller rules
+                    // would refuse with the caller's text.
+                    toolPolicy,
+                    additionalSystemInstructions: scratchpadAdditionalSystemInstructions,
+                    maxOutputTokens,
+                    providerOptions: effectiveMuxProviderOptions,
+                    skipAiSettingsPersistence: true,
+                    muxMetadata: {
+                      type: WORKFLOW_RESULT_METADATA_TYPE,
+                      rawCommand,
+                      commandPrefix: "workflow_run",
+                      runId,
+                      requestedModel: modelString,
+                    },
+                  },
+                  {
+                    acceptanceOrigin: "automatic",
+                    skipAutoResumeReset: true,
+                    synthetic: true,
+                    agentInitiated: true,
+                    requireIdle: true,
+                    startStreamInBackground: true,
+                  }
+                );
+                if (sendResult.success) {
+                  return;
+                }
+                if (!isWorkspaceBusyIdleOnlySend(sendResult.error)) {
+                  log.warn("Failed to continue agent after workflow completion", {
+                    workspaceId,
+                    runId,
+                    error: sendResult.error,
+                  });
+                  return;
+                }
+                await waitForWorkflowContinuationRetry(this.hostClock);
+              }
+            },
+            getCurrentProjectTrusted: () =>
+              isWorkspaceProjectTrusted(this.dependencies.config, metadata),
+            runnerId: `workflow-runner:${workspaceId}`,
+          })
+        : undefined;
+
+    // Create assistant message ID early so nested tool events stay scoped to this specific
+    // assistant turn. The placeholder is appended to history below
+    // (after the abort check).
+    const assistantMessageId = createAssistantMessageId();
+    // Bind ownership before cached MCP tools are captured by the PTC bridge.
+    // A queued invocation must keep this turn's identity after a replacement starts.
+    const executionScope = { workspaceId, messageId: assistantMessageId, token: streamToken };
+    const allowLegacyInvalidWorkflowAgentOutputSchema =
+      await this.dependencies.shouldAllowLegacyInvalidWorkflowAgentOutputSchema(metadata);
+    // Codex hook fields: one turn ID for every tool call of this turn (its assistant message).
+    // One object for every attempt: each attempt sets the model it streams with, so a refusal
+    // fallback's tool calls, and the host-side hook config built once below (kernel file loads),
+    // report the fallback model (Codex PRRT_kwDOPxxmWM6sXvVm).
+    const hookTurn = { turnId: assistantMessageId, model: modelString };
+    // Hoisted so refusal fallback can rebuild tools without changing their context.
+    const toolsForModelConfig: ToolConfiguration = {
+      cwd: workspacePath,
+      clock: this.hostClock,
+      hookTurn,
+      runtime,
+      projects: getProjects(metadata),
+      secrets: projectSecretsRecord,
+      xumEnv,
+      runtimeTempDir,
+      ...(toolSearchRuntime ? { toolSearchRuntime } : {}),
+      capabilityModelString,
+      openaiWireFormat: effectiveMuxProviderOptions?.openai?.wireFormat,
+      xaiNativeToolsEnabled: routeProvider === "xai",
+      anthropicNativeWebFetchEnabled: anthropicNativeWebFetchRouteAvailable(
+        modelResult.data.rawModelString,
+        routeProvider,
+        requestProvidersConfig
+      ),
+      xaiSearchParameters: effectiveMuxProviderOptions.xai?.searchParameters,
+      backgroundProcessManager: this.dependencies.backgroundProcessManager,
+      hasQueuedMessages,
+      // Plan agent configuration for plan file access.
+      // - read: plan file is readable in all agents (useful context)
+      // - write: allowed in all agents; plan agents still lock other edits to the exact plan path
+      planFileOnly: agentIsPlanLike,
+      emitChatEvent: (event) => {
+        // Defensive: tools should only emit events for the workspace they belong to.
+        if ("workspaceId" in event && event.workspaceId !== workspaceId) {
+          return;
+        }
+        if (event.type === "workflow-run-attached") {
+          return this.dependencies.streamManager.attachWorkflowRunToToolCall(event).then(() => {
+            this.dependencies.emit(event.type, event as never);
+          });
+        }
+        this.dependencies.emit(event.type, event as never);
+      },
+      workspaceProjectPath: metadata.projectPath,
+      workspaceExecutionRootPath: metadata.subProjectPath ?? metadata.projectPath,
+      workspaceSessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
+      artifactShelfRoot: getArtifactShelfRoot(this.dependencies.config.rootDir),
+      planFilePath,
+      ancestorPlanFilePaths,
+      workspaceId,
+      agentId: effectiveAgentId,
+      strictAgentResolution,
+      xumScope,
+      timelineService: this.dependencies.bindings.timelineService,
+      desktopNotifications: this.dependencies.hostServices.desktopNotifications,
+      sessionLocks: this.dependencies.historyService.locks,
+      sessionFiles: this.dependencies.historyService.files,
+      runtimeFactory: this.dependencies.runtimeFactory,
+      hostFiles: this.dependencies.hostServices.hostFiles,
+      hostPaths: this.dependencies.hostServices.hostPaths,
+      // Agent-scheduled heartbeats start paid turns unattended, so they are user opt-in.
+      workspaceHeartbeatService:
+        this.dependencies.config.loadConfigOrDefault().agentHeartbeatsEnabled === true
+          ? this.dependencies.bindings.workspaceHeartbeatService
+          : undefined,
+      workflowService,
+      goalService: workspaceGoalService,
+      goalDefaults: effectiveGoalDefaults,
+      goalKickoffModel: modelString,
+      goalToolContext,
+      // Only child workspaces (tasks) can report to a parent.
+      enableAgentReport: Boolean(metadata.parentWorkspaceId),
+      scratchWorkspace: metadata.kind === "scratch",
+      // Workflow-owned workers are excluded: they hand results to WorkflowRunner through the
+      // journal path.
+      enableFamilyMessaging:
+        Boolean(metadata.parentWorkspaceId) &&
+        metadata.workflowTask == null &&
+        isRlmModeEnabled(isExperimentEnabled),
+      workflowAgentOutputSchema: metadata.workflowTask?.outputSchema,
+      allowLegacyInvalidWorkflowAgentOutputSchema,
+      recordFileState,
+      recordProposedPlan,
+      onConfigChanged: () => this.dependencies.providerService.notifyConfigChanged(),
+      taskService: this.dependencies.bindings.taskService,
+      workspaceTurnManager: this.dependencies.bindings.workspaceTurnManager,
+      // Read live backend state on every call (the tool object outlives config edits). Models are
+      // resolved on the Xum host, so this is the source even for SSH workspaces.
+      listAvailableModels: () => {
+        const appConfig = this.dependencies.config.loadConfigOrDefault();
+        return listAvailableModels(
+          {
+            providersConfig: this.dependencies.providerService.getConfig(),
+            routePriority: appConfig.routePriority ?? [...DEFAULT_ROUTE_PRIORITY],
+            routeOverrides: appConfig.routeOverrides ?? {},
+          },
+          (raw, reason) => log.debug(`[models_list] skipped ${raw}: ${reason}`)
+        );
+      },
+      analyticsService: this.dependencies.bindings.analyticsService,
+      desktopSessionManager: this.dependencies.bindings.desktopSessionManager,
+      computerUseService: this.dependencies.bindings.computerUseService,
+      // Agent memory (memory experiment): per-scope write policy derived from
+      // the agent class (exec-like / plan-like / read-only). Project memory is
+      // host-local under xumHome, keyed by the stable project identity.
+      historyService: this.dependencies.historyService,
+      memoryService: this.dependencies.bindings.memoryService,
+      memoryAccess,
+      memoryScopes: resolveMemoryScopes(tokenBudgetEnabled),
+      contextBudgetRolloverAvailable,
+      // Experiments for inheritance to subagents and workflow tool gating.
+      experiments: {
+        ...experiments,
+        memory: memoryExperimentEnabled,
+        artifacts: artifactsExperimentEnabled,
+        claudeSkillsCompat: claudeSkillsCompatExperimentEnabled,
+      },
+      // Dynamic context for tool descriptions (moved from system prompt for better model attention)
+      availableSubagents: agentDefinitions,
+      availableSkills,
+      // Built once per turn (refusal-fallback rebuilds reuse this config) from the
+      // context window, so path-scoped skills surface once per window.
+      pathSkillActivation: createPathSkillActivation({
+        skills: availableSkills,
+        messages: activeContextMessages,
+        // The first request after compaction re-injects loaded skills from this
+        // attachment, outside history: those skills need no pointer either.
+        loadedSkillNames: loadedSnapshotSkillNames(postCompactionAttachments),
+        cwd: workspacePath,
+        runtime,
+      }),
+      mcpPromptRuntime,
+      // Session-segment memory index advertised in the memory tool
+      // description (same disclosure mechanic as skills).
+      memoryIndexEntries: memoryContext?.indexEntries,
+      // Even a permitted read tool must not run mutating repo tool_pre/tool_post scripts.
+      // Ordinary chats retain the existing shared-runtime trust gate.
+      trusted: !isSideChat && sharedExecutionTrusted,
+    };
+    const emitNestedPtcToolEvent = (event: PTCEventWithParent) => {
+      if (event.type === "tool-call-start" || event.type === "tool-call-end") {
+        this.dependencies.streamManager.emitNestedToolEvent(executionScope, event);
+      }
+    };
+    const kernelFileLoader = createKernelFileLoader({
+      cwd: toolsForModelConfig.cwd,
+      runtime: toolsForModelConfig.runtime,
+      hooks: deriveToolHookConfig(toolsForModelConfig) ?? undefined,
+    });
+    const ptcEnabled = !isSideChat && experiments.programmaticToolCalling;
+    const mcpWarningSection = mcpStats
+      ? formatMcpWarningSection(mcpStats.failedServerCount, mcpStats.failedServerNames)
+      : undefined;
+    if (mcpWarningSection != null) {
+      workspaceLog.warn("MCP servers failed to start", {
+        failedNames: mcpStats?.failedServerNames.join(", "),
+      });
+    }
+    // SECURITY AUDIT: MCP Apps model context (ui/update-model-context) is view output, i.e.
+    // untrusted text from an MCP server, sent to the model. It is a request-only user-role row
+    // placed right before the newest user row (assemblePromptPayload). At the provider,
+    // mergeConsecutiveUserMessages joins the two, so the newest user message starts with the
+    // labeled <mcp-app-context> block and the user's text follows it. Never the system prompt:
+    // unlike plugin request.assemble text, no user reviewed it, so it must not outrank tool
+    // results, and a view update must not change the cached system prefix. It is never written
+    // to chat.jsonl. It goes in only (1) for servers this turn actually enabled (the validated
+    // inventory above; none when the serve failed closed), (2) attributed to the server and view
+    // named by the view's result record, inside the block, whose text cannot close a <view> or
+    // the block, so nothing after the host's own closing tag can pose as the user's text, and
+    // (3) after a durable hook-context row, so "model-visible => logged" holds.
+    // Each view's latest update replaces its previous one in the store, so only the last update
+    // before this request is sent. It is kept for later turns too, not cleared on use: the spec
+    // says "This context will be used in future turns" (MCP Apps 2026-01-26).
+    let mcpAppContextMessage: MuxMessage | undefined;
+    if (!isSideChat && mcpServers !== undefined && this.dependencies.bindings.mcpServerManager) {
+      const enabledServers = new Set(
+        Object.entries(mcpServers)
+          .filter(([, info]) => !info.disabled)
+          .map(([name]) => name)
+      );
+      try {
+        const section = formatMcpAppModelContextSection(
+          await this.dependencies.bindings.mcpServerManager.getMcpAppModelContexts(workspaceId),
+          enabledServers
+        );
+        if (section !== undefined) {
+          await this.dependencies
+            .durableEventJournalFor(workspaceId)
+            .publishWithBlob(section, (blobHash) => ({
+              workspaceId,
+              kind: "hook-context",
+              data: { hookId: "mcp-apps:model-context", placement: "user-context", blobHash },
+            }));
+          mcpAppContextMessage = createMuxMessage("mcp-app-context", "user", section, {
+            synthetic: true,
+          });
+        }
+      } catch (error) {
+        // Self-healing: an unreadable store or journal drops the context, never the turn.
+        workspaceLog.warn("Dropping MCP Apps model context from the request", { error });
+      }
+    }
+
+    type ModelSeed = typeof modelResult.data;
+    const prepareModelRequest = async (options: {
+      seed: ModelSeed;
+      sourceMessages: MuxMessage[];
+      providerRequestMessages?: MuxMessage[];
+      initializeToolSearch: boolean;
+      reusePrePolicySystemContext: boolean;
+      requestHistorySequence: () => number;
+      partialContinuationMessage?: MuxMessage;
+      recordTimings?: boolean;
+      cleanupModelOnError?: boolean;
+    }) => {
+      const { seed } = options;
+      hookTurn.model = seed.rawModelString;
+      try {
+        const attemptProviderRequestMessages =
+          options.providerRequestMessages ??
+          prepareProviderRequestMessages(
+            options.sourceMessages,
+            seed.wireProviderName,
+            seed.effectiveThinkingLevel
+          ).providerRequestMessages;
+
+        const getToolsStartedAt = this.hostClock.nowMs();
+        const allTools = await getToolsForModel(
+          seed.toolsModelString,
+          {
+            ...toolsForModelConfig,
+            hookTurn: { ...hookTurn },
+            capabilityModelString: seed.capabilityModelString,
+            // Per attempt: a fallback model that calls set_goal must price and
+            // kick off the goal on itself, not on the primary it replaced.
+            goalKickoffModel: seed.rawModelString,
+            openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
+            xaiNativeToolsEnabled: seed.routeProvider === "xai",
+            anthropicNativeWebFetchEnabled: anthropicNativeWebFetchRouteAvailable(
+              seed.rawModelString,
+              seed.routeProvider,
+              seed.providersConfig
+            ),
+          },
+          workspaceId,
+          this.dependencies.initStateManager,
+          toolInstructions,
+          mcpTools
+        );
+        if (options.recordTimings) {
+          recordStartupPhaseTiming("getToolsForModelMs", getToolsStartedAt);
+        }
+
+        const applyPolicyStartedAt = this.hostClock.nowMs();
+        let attemptTools = await applyToolPolicyAndExperiments({
+          capabilityGrants,
+          allTools: this.dependencies.wrapToolsForDelegation(
+            workspaceId,
+            withExecutionScope(allTools, executionScope),
+            delegatedToolNames
+          ),
+          // Runtime extras may shadow a granted built-in name with arbitrary execution.
+          extraTools: isSideChat ? undefined : this.dependencies.bindings.extraTools,
+          effectiveToolPolicy,
+          switchableAgentToolPolicies: switchableAgents?.map((agent) => agent.toolPolicy),
+          callerToolPolicy: toolPolicy,
+          activeAgentId: effectiveAgentId,
+          // Side chats expose granted reads directly, not an executable PTC/RLM bridge.
+          experiments: isSideChat
+            ? { ...experiments, programmaticToolCalling: false, rlm: false }
+            : experiments,
+          emitNestedToolEvent: emitNestedPtcToolEvent,
+          sandbox: {
+            workspaceId,
+            sessionDir: path.join(this.dependencies.config.sessionsDir, workspaceId),
+            kernelFileLoader,
+            locks: this.dependencies.historyService.locks,
+          },
+        });
+        if (options.recordTimings) {
+          recordStartupPhaseTiming("applyToolPolicyAndExperimentsMs", applyPolicyStartedAt);
+        }
+        // XUM_DISABLE_AGENT_TOOLS: drop every tool here, so tool search, the system prompt and the
+        // context budgets all see the toolless request that StreamManager sends.
+        if (isAgentToolsDisabled()) attemptTools = {};
+        const ptcActive = ptcRanForTools(ptcEnabled, attemptTools);
+
+        // Same predicate and model as the tools cache breakpoint
+        // (applyCacheControlToTools), so "caches the tools block" and "keeps the
+        // tool list stable" cannot disagree (#5250): these attempts use native
+        // Anthropic deferred loading instead of activeTools scoping (#5262).
+        // A request-level beta opt-out also makes the provider strip cache
+        // markers, and must keep defer_loading/tool_reference off the wire too.
+        // Claude models before 4.5 reject both, so they keep scoped search, as do
+        // transforming gateways, which ignore the anthropic providerOptions namespace.
+        // #5253: classify by every switchable agent's require rules, like PTC
+        // promotion, so a tool required in one mode is not deferred in another.
+        const toolSearchPolicy =
+          switchableAgents?.flatMap((agent) => agent.toolPolicy) ?? effectiveToolPolicy;
+        const toolSearchPromptCacheActive =
+          supportsAnthropicCache(seed.rawModelString, seed.providersConfig) &&
+          effectiveMuxProviderOptions.anthropic?.disableBetaFeatures !== true &&
+          supportsAnthropicToolSearch(seed.capabilityModelString.split(":")[1] ?? "") &&
+          resolveProviderOptionsNamespaceKey(seed.wireProviderName, seed.routeProvider) ===
+            "anthropic";
+        const toolCatalogOverviewMemo = this.toolCatalogOverviewMemo(
+          workspaceId,
+          seed.effectiveModelString
+        );
+        if (toolSearchRuntime) {
+          if (options.initializeToolSearch) {
+            const preparedSearch = prepareToolSearch({
+              tools: attemptTools,
+              mcpToolNames: Object.keys(mcpTools ?? {}),
+              mcpToolServers: mcpToolServerNames,
+              toolPolicy: toolSearchPolicy,
+              ptcEnabled: ptcActive,
+              promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
+            });
+            attemptTools = preparedSearch.tools;
+            if (preparedSearch.state) {
+              toolSearchRuntime.state = preparedSearch.state;
+            }
+          } else if (toolSearchRuntime.state) {
+            attemptTools = rebuildToolSearchState(toolSearchRuntime.state, {
+              tools: attemptTools,
+              mcpToolNames: Object.keys(mcpTools ?? {}),
+              mcpToolServers: mcpToolServerNames,
+              toolPolicy: toolSearchPolicy,
+              ptcEnabled: ptcActive,
+              promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
+            }).tools;
+          } else if (!(mcpTools && TOOL_SEARCH_TOOL_NAME in mcpTools)) {
+            const { [TOOL_SEARCH_TOOL_NAME]: _removed, ...rest } = attemptTools;
+            attemptTools = rest;
+          }
+        }
+
+        const memoryToolAvailable = attemptTools.memory !== undefined;
+        const canReuseSystemContext =
+          options.reusePrePolicySystemContext &&
+          mcpServers === mcpServersAtPrePolicy &&
+          memoryToolAvailable === memoryToolEligible;
+        const rebuildSystemStartedAt = this.hostClock.nowMs();
+        const systemContext = canReuseSystemContext
+          ? prePolicyStreamSystemContext
+          : await buildStreamSystemContextForToolset({ memoryToolAvailable }, seed.rawModelString);
+        if (options.recordTimings && !canReuseSystemContext) {
+          recordStartupPhaseTiming("rebuildStreamSystemContextMs", rebuildSystemStartedAt);
+        }
+        let attemptSystem = systemContext.systemMessage;
+        let attemptSystemTokens = systemContext.systemMessageTokens;
+        // Volatile sections (this warning, the context-window ids) go last so
+        // the stable prefix stays cacheable (#5251).
+        if (mcpWarningSection != null) {
+          attemptSystem = attemptSystem + mcpWarningSection;
+          const tokenizer = await getTokenizerForModel(
+            seed.rawModelString,
+            seed.capabilityModelString
+          );
+          attemptSystemTokens = await tokenizer.countTokens(attemptSystem);
+        }
+
+        if (requestAssemblySnapshot || eventSpine.hasMiddleware("request.assemble")) {
+          const assembleCtx: RequestAssembleContext = {
+            workspaceId,
+            modelString: seed.rawModelString,
+            systemMessage: attemptSystem,
+            tools: attemptTools,
+          };
+          // An admitted rollover must never drift back to the live registry, including fallbacks.
+          if (requestAssemblySnapshot) await requestAssemblySnapshot.run(assembleCtx);
+          else await eventSpine.run("request.assemble", assembleCtx);
+          attemptTools = assembleCtx.tools;
+          if (toolSearchRuntime?.state) {
+            attemptTools = rebuildToolSearchState(toolSearchRuntime.state, {
+              tools: attemptTools,
+              mcpToolNames: Object.keys(mcpTools ?? {}),
+              mcpToolServers: mcpToolServerNames,
+              toolPolicy: toolSearchPolicy,
+              ptcEnabled: ptcActive,
+              promptCacheActive: toolSearchPromptCacheActive,
+              overviewMemo: toolCatalogOverviewMemo,
+            }).tools;
+          }
+          // Middleware may filter tools too: drop the memory guidance it left
+          // describing a removed memory tool.
+          assembleCtx.systemMessage = removeMemoryGuidance(
+            assembleCtx.systemMessage,
+            attemptTools.memory !== undefined
+          );
+          if (assembleCtx.systemMessage !== attemptSystem) {
+            attemptSystem = assembleCtx.systemMessage;
+            const tokenizer = await getTokenizerForModel(
+              seed.rawModelString,
+              seed.capabilityModelString
+            );
+            attemptSystemTokens = await tokenizer.countTokens(attemptSystem);
+          }
+        }
+
+        // Assembly hooks (live or replayed) can replace the tool map. Reapply the metadata
+        // ceiling after every attempt's hooks, including fallbacks; never trust an injected
+        // code_execution, provider-native tool or mutator just because policy allowed it.
+        if (capabilityGrants) {
+          attemptTools = isAgentToolsDisabled()
+            ? {}
+            : applyCapabilityGrants(attemptTools, capabilityGrants);
+        }
+
+        // The window section goes last, resolved from the rows being sent, so start() can
+        // re-render it without rerunning assembly middleware or tool construction.
+        const baseSystem = attemptSystem;
+        const baseSystemTokens = attemptSystemTokens;
+        let attemptVolatileSystemSuffixLength = 0;
+        const renderContextWindowSection = async () => {
+          const ids = tokenBudgetEnabled
+            ? resolveContextWindowIds(options.sourceMessages)
+            : undefined;
+          attemptSystem = baseSystem;
+          attemptSystemTokens = baseSystemTokens;
+          const section = ids == null ? undefined : `\n\n${buildContextWindowSection(ids)}`;
+          if (section != null) {
+            attemptSystem += section;
+            const tokenizer = await getTokenizerForModel(
+              seed.rawModelString,
+              seed.capabilityModelString
+            );
+            attemptSystemTokens += await tokenizer.countTokens(section);
+          }
+          // Re-measured on every render: the window section can change length. A tail that
+          // middleware edited is not split at all (no rows either, see planSystemPrompt).
+          attemptVolatileSystemSuffixLength = measureWholeVolatileSystemSuffix(attemptSystem, [
+            mcpWarningSection,
+            section,
+          ]);
+        };
+        await renderContextWindowSection();
+
+        // Also on fallbacks: the rebuild drops activations the fallback cannot
+        // defer, so a fallback that defers them again must reseed prior-turn
+        // activations. Seeding only adds names, so repeating it is harmless.
+        if (toolSearchRuntime?.state) {
+          seedToolSearchActivationsFromMessages(
+            toolSearchRuntime.state,
+            attemptProviderRequestMessages
+          );
+        }
+        const toolNamesForSentinel = (
+          computeActiveToolNames(toolSearchRuntime?.state) ?? Object.keys(attemptTools)
+        ).sort();
+        // Native mode sends deferred tools unloaded, so an agent transition must
+        // not list them as callable before a search loads them.
+        const loadedToolNames =
+          computeLoadedToolNames(toolSearchRuntime?.state)?.sort() ?? toolNamesForSentinel;
+        const preparedAttempt = this.prepareModelAttempt({
+          rawModelString: seed.rawModelString,
+          canonicalModelString: seed.canonicalModelString,
+          canonicalProviderName: seed.canonicalProviderName,
+          effectiveModelString: seed.effectiveModelString,
+          optionsModelString: seed.optionsModelString,
+          wireProviderName: seed.wireProviderName,
+          routeProvider: seed.routeProvider,
+          effectiveThinkingLevel: seed.effectiveThinkingLevel,
+          minThinkingLevel: seed.minThinkingLevel,
+          providerRequestMessages: attemptProviderRequestMessages,
+          muxProviderOptions: effectiveMuxProviderOptions,
+          workspaceId,
+          truncationMode: openaiTruncationModeOverride,
+          providersConfigSnapshot: seed.providersConfig,
+          coderSelectedInstance: seed.coderSelectedInstance,
+          promptCacheScope: derivePromptCacheScope(metadata),
+          reasoningMode,
+          ...(options.recordTimings ? { recordStartupPhaseTiming } : {}),
+        });
+        // Manual cache markers must honor a TTL set through per-model
+        // providerOptions extras when the dedicated mux-level setting is
+        // unset, matching the pre-assembler request-config behavior.
+        const effectiveAnthropicCacheTtl =
+          effectiveMuxProviderOptions.anthropic?.cacheTtl ??
+          getAnthropicCacheTtl(preparedAttempt.providerOptions);
+        const forcedFirstStepToolNames =
+          seed.routeProvider === "xai"
+            ? getForcedXaiSearchToolNames(
+                seed.capabilityModelString,
+                effectiveMuxProviderOptions.xai?.searchParameters
+              )?.filter((toolName) => toolName in attemptTools)
+            : undefined;
+        const firstStepToolNames = new Set(
+          forcedFirstStepToolNames?.length ? forcedFirstStepToolNames : toolNamesForSentinel
+        );
+        // Recorded in the DevTools run so the replay verifier trims the same way.
+        const compactionInputBudget = await compactionInputBudgetOption(
+          isCompactionRequest,
+          {
+            modelString: seed.rawModelString,
+            providerOptions: effectiveMuxProviderOptions,
+            providersConfig: seed.providersConfig,
+          },
+          attemptProviderRequestMessages,
+          compactionInputBudgetScale,
+          compactionContextRetryAvailable === true
+        );
+        // What the latest assembly sent as system content (prompt-cache mechanism 10: a frozen
+        // tail plus tail rows). The envelope, debug views and stored token count describe it.
+        let sent = {
+          system: attemptSystem,
+          volatileLength: attemptVolatileSystemSuffixLength,
+          tokens: attemptSystemTokens,
+        };
+        // Shared by the initial build and thinking rebuilds so their assembly
+        // inputs cannot drift apart mid-turn.
+        const assemblePayloadForThinkingLevel = async (level: ThinkingLevel) => {
+          const payload = await assembleBudgetCheckedPromptPayload(
+            {
+              history: options.sourceMessages,
+              systemMessage: attemptSystem,
+              volatileSystemSuffixLength: attemptVolatileSystemSuffixLength,
+              instructionsSection: systemContext.instructionsSection,
+              tools: attemptTools,
+              skillIndexSection,
+              toolInstructions,
+              modelString: seed.rawModelString,
+              routeProvider: seed.routeProvider,
+              openaiWireFormat: effectiveMuxProviderOptions.openai?.wireFormat,
+              providerForMessages: seed.wireProviderName,
+              effectiveThinkingLevel: level,
+              effectiveAgentId,
+              toolNamesForSentinel: loadedToolNames,
+              planContentForTransition,
+              planFilePath,
+              postCompactionAttachments,
+              providersConfig: seed.providersConfig,
+              anthropicCacheTtl: effectiveAnthropicCacheTtl,
+              workspaceId,
+              tagHistoryItemIds: tokenBudgetEnabled,
+              ...compactionInputBudget,
+              requestContextMessage: mcpAppContextMessage,
+            },
+            {
+              enabled: tokenBudgetEnabled,
+              providerOptions: effectiveMuxProviderOptions,
+              // Native tool search sends deferred tools without loading them into context.
+              activeTools: forcedFirstStepToolNames?.length
+                ? forcedFirstStepToolNames
+                : (computeLoadedToolNames(toolSearchRuntime?.state) ?? [...firstStepToolNames]),
+            }
+          );
+          sent = await measureSentSystem(
+            payload.sentSystem,
+            attemptSystem,
+            attemptSystemTokens,
+            () => getTokenizerForModel(seed.rawModelString, seed.capabilityModelString)
+          );
+          return payload;
+        };
+        const prepareMessagesForProviderStartedAt = this.hostClock.nowMs();
+        const attemptPayload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
+        if (options.recordTimings) {
+          recordStartupPhaseTiming(
+            "prepareMessagesForProviderMs",
+            prepareMessagesForProviderStartedAt
+          );
+        }
+        const finalMessages = attemptPayload.messages;
+        const emitEnvelopeWith = async (
+          level: string,
+          providerOptionsForEnvelope: unknown
+        ): Promise<void> => {
+          await emitTurnEnvelope({
+            journal: this.dependencies.durableEventJournalFor(workspaceId),
+            workspaceId,
+            systemMessage: sent.system,
+            systemVolatileSuffixLength: sent.volatileLength,
+            tools: Object.fromEntries(
+              Object.entries(attemptTools).filter(([name]) => firstStepToolNames.has(name))
+            ),
+            modelString: seed.rawModelString,
+            thinkingLevel: level,
+            providerOptions: providerOptionsForEnvelope,
+            requestHistorySequence: options.requestHistorySequence(),
+            sentinelToolNames: loadedToolNames,
+            wireProviderName: seed.wireProviderName,
+            anthropicCacheTtl: effectiveAnthropicCacheTtl,
+            planContentForTransition,
+            planFilePath,
+            postCompactionAttachments,
+            partialContinuationMessage: options.partialContinuationMessage,
+            mcpAppModelContextMessage: mcpAppContextMessage,
+          });
+        };
+        // The level decides which reasoning-only rows are sent, and with them the tail rows:
+        // a rebuild returns its own tail record for the turn's row.
+        const rebuildMessagesForThinkingLevel = async (level: ThinkingLevel) => {
+          const rebuiltPayload = await assemblePayloadForThinkingLevel(level);
+          return {
+            messages: rebuiltPayload.messages,
+            contextBudgetEstimate: rebuiltPayload.contextBudgetEstimate,
+            systemMessageTokens: sent.tokens,
+            systemRecords: rowSystemRecords(rebuiltPayload, options.partialContinuationMessage),
+          };
+        };
+        const rebuildFirstStepForThinkingLevel: RebuildFirstStepForThinkingLevel = async (
+          level,
+          providerOptionsForEnvelope
+        ) => {
+          const rebuilt = await rebuildMessagesForThinkingLevel(level);
+          await emitEnvelopeWith(level, providerOptionsForEnvelope);
+          return rebuilt;
+        };
+
+        return {
+          ...seed,
+          providerRequestMessages: attemptProviderRequestMessages,
+          messages: finalMessages,
+          system: sent.system,
+          engineSystem: attemptPayload.system,
+          systemRecords: rowSystemRecords(attemptPayload, options.partialContinuationMessage),
+          contextBudgetLimit: attemptPayload.contextBudgetLimit,
+          contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
+          ...compactionInputBudget,
+          systemMessageTokens: sent.tokens,
+          tools: attemptTools,
+          engineTools: attemptPayload.tools ?? attemptTools,
+          toolNamesForSentinel,
+          forcedFirstStepToolNames,
+          providerOptions: preparedAttempt.providerOptions,
+          headers: preparedAttempt.requestHeaders,
+          resolvedOverrides: preparedAttempt.resolvedOverrides,
+          currentEffectiveLevelRef: preparedAttempt.currentEffectiveLevelRef,
+          computeRebuiltProviderOptions: preparedAttempt.computeRebuiltProviderOptions,
+          rebuildProviderOptionsForThinkingLevel:
+            preparedAttempt.rebuildProviderOptionsForThinkingLevel,
+          rebuildMessagesForThinkingLevel,
+          emitEnvelopeWith,
+          onStreamConstructed: () =>
+            emitEnvelopeWith(seed.effectiveThinkingLevel, preparedAttempt.providerOptions),
+          rebuildFirstStepForThinkingLevel,
+          rebuildAfterSequencing: async () => {
+            await renderContextWindowSection();
+            const payload = await assemblePayloadForThinkingLevel(seed.effectiveThinkingLevel);
+            return {
+              system: sent.system,
+              systemMessageTokens: sent.tokens,
+              engineSystem: payload.system,
+              systemRecords: rowSystemRecords(payload, options.partialContinuationMessage),
+              messages: payload.messages,
+              contextBudgetLimit: payload.contextBudgetLimit,
+              contextBudgetEstimate: payload.contextBudgetEstimate,
+            };
+          },
+        };
+      } catch (error) {
+        if (options.cleanupModelOnError) {
+          runLanguageModelCleanup(options.seed.model);
+        }
+        throw error;
+      }
+    };
+
+    let requestHistorySequence = providerRequestMessages.reduce(
+      (latest, message) => Math.max(latest, message.metadata?.historySequence ?? -1),
+      -1
+    );
+    emitStartupBreadcrumb("preparing_request");
+    let primaryRequest: Awaited<ReturnType<typeof prepareModelRequest>>;
+    try {
+      primaryRequest = await prepareModelRequest({
+        seed: modelResult.data,
+        sourceMessages: messages,
+        providerRequestMessages,
+        initializeToolSearch: true,
+        reusePrePolicySystemContext: true,
+        requestHistorySequence: () => requestHistorySequence,
+        recordTimings: true,
+      });
+    } catch (error) {
+      if (error instanceof ContextBudgetExceededError) {
+        runLanguageModelCleanup(modelResult.data.model);
+        return { type: "finished", result: Err(error.details) };
+      }
+      throw error;
+    }
+    const tools = primaryRequest.tools;
+    systemMessage = primaryRequest.system;
+    systemMessageTokens = primaryRequest.systemMessageTokens;
+
+    captureMcpToolTelemetry({
+      telemetryService: this.dependencies.telemetryService,
+      mcpStats,
+      mcpTools,
+      tools,
+      mcpSetupDurationMs,
+      workspaceId,
+      modelString,
+      effectiveAgentId,
+      metadata,
+      effectiveToolPolicy,
+    });
+
+    if (combinedAbortSignal.aborted) {
+      return {
+        type: "finished",
+        result: Ok(
+          this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+        ),
+      };
+    }
+
+    let started = false;
+    const start = async (
+      thinkingOverride?: ActiveTurnThinkingOverride
+    ): Promise<TurnRequestBuildOutcome> => {
+      assert(!started && !transferred, "Prepared request must be started once before disposal");
+      started = true;
+      activeTurnThinkingOverride = thinkingOverride;
+      if (context.admissionOnly) {
+        requestHistorySequence = messages.reduce(
+          (latest, row) => Math.max(latest, row.metadata?.historySequence ?? -1),
+          -1
+        );
+        // Rollover admission prepared before append sequenced these same rows, so the prompt
+        // lacked the window IDs and [id] markers. The re-assembly budget-checks them too.
+        try {
+          primaryRequest = {
+            ...primaryRequest,
+            ...(await primaryRequest.rebuildAfterSequencing()),
+          };
+        } catch (error) {
+          if (error instanceof ContextBudgetExceededError) {
+            runLanguageModelCleanup(modelResult.data.model);
+            return { type: "finished", result: Err(error.details) };
+          }
+          throw error;
+        }
+        systemMessage = primaryRequest.system;
+        systemMessageTokens = primaryRequest.systemMessageTokens;
+      }
+      const finalMessages = primaryRequest.messages;
+      const mergedProviderOptions = primaryRequest.providerOptions;
+      const currentEffectiveLevelRef = primaryRequest.currentEffectiveLevelRef;
+      const computeRebuiltProviderOptions = primaryRequest.computeRebuiltProviderOptions;
+      // Fold PREPARING-window pending thinking overrides into the ACTUAL
+      // request build, not just the envelope (see foldPendingThinkingOverrides).
+      // The fold runs before the assistant placeholder is appended, so a refusal leaves no row
+      // to delete, and a Token Budget stage is decided on the folded request (#5286). Only a
+      // change written during the append counts the request again (the refold below). A turn
+      // already stopped skips the rebuild.
+      if (combinedAbortSignal.aborted)
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      const foldInput = {
+        holder: activeTurnThinkingOverride,
+        computeRebuiltProviderOptions,
+        rebuild: primaryRequest.rebuildMessagesForThinkingLevel,
+        currentEffectiveLevelRef,
+      };
+      let streamState = await foldPendingThinkingOverrides(foldInput, {
+        thinkingLevel: effectiveThinkingLevel,
+        providerOptions: mergedProviderOptions,
+        messages: finalMessages,
+        systemRecords: primaryRequest.systemRecords,
+        systemMessageTokens,
+        contextBudgetEstimate: primaryRequest.contextBudgetEstimate,
+      });
+      if ("exceeded" in streamState) {
+        runLanguageModelCleanup(modelResult.data.model);
+        return { type: "finished", result: Err(streamState.exceeded) };
+      }
+      // Token Budget stage (#5286), decided on E, the count the turn-start check (or the fold)
+      // just took; see applyTurnStartStage.
+      const foldedLevel = streamState.thinkingLevel;
+      const unstaged = {
+        messages: streamState.messages,
+        systemRecords: streamState.systemRecords,
+        systemMessageTokens: streamState.systemMessageTokens,
+        requestHistorySequence,
+      };
+      const staged = await applyTurnStartStage({
+        onTurnStartStage,
+        estimate: streamState.contextBudgetEstimate,
+        limit: primaryRequest.contextBudgetLimit,
+        model: modelString,
+        messages,
+        rebuild: () => primaryRequest.rebuildMessagesForThinkingLevel(foldedLevel),
+        abortSignal: combinedAbortSignal,
+        current: unstaged,
+        thinkingOverride: activeTurnThinkingOverride,
+      });
+      const stagePublished = staged !== unstaged;
+      ({ requestHistorySequence } = staged);
+      streamState = {
+        ...streamState,
+        messages: staged.messages,
+        systemRecords: staged.systemRecords,
+        systemMessageTokens: staged.systemMessageTokens,
+      };
+      ({ systemMessageTokens } = streamState);
+      if (combinedAbortSignal.aborted)
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      const assistantMessage = createMuxMessage(assistantMessageId, "assistant", "", {
+        ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        timestamp: nodeClock.nowMs(),
+        model: canonicalModelString,
+        systemMessageTokens,
+        agentId: effectiveAgentId,
+      });
+
+      const appendResult = await this.dependencies.historyService.appendToHistory(
+        workspaceId,
+        assistantMessage
+      );
+      if (!appendResult.success) {
+        return { type: "finished", result: Err({ type: "unknown", raw: appendResult.error }) };
+      }
+      // A stop that arrived during the append wins over the refold below: a refused rebuild
+      // must not turn a stopped turn into a budget error.
+      if (combinedAbortSignal.aborted) {
+        await deleteAbortedPlaceholder(assistantMessageId);
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      }
+      // A change written while the append's file I/O ran still reaches the messages, as when
+      // the fold ran after the append. A published stage skips this refold: its counted payload
+      // is dispatched, and StreamManager holds the change until after that first request
+      // (holdBeforeFirstRequest), so a refusal cannot leave the warning unanswered (#5286).
+      streamState = await foldPendingThinkingOverrides(
+        { ...foldInput, skip: stagePublished },
+        streamState
+      );
+      if ("exceeded" in streamState) {
+        runLanguageModelCleanup(modelResult.data.model);
+        await deleteAbortedPlaceholder(assistantMessageId);
+        return { type: "finished", result: Err(streamState.exceeded) };
+      }
+      const {
+        thinkingLevel: streamThinkingLevel,
+        providerOptions: streamProviderOptions,
+        messages: streamFinalMessages,
+        systemRecords: streamSystemRecords,
+      } = streamState;
+      ({ systemMessageTokens } = streamState);
+      // Debug sinks pair systemMessage with the message list, so when the
+      // assembler embedded the system prompt as leading rows (engineSystem
+      // undefined; a cached stable row plus an optional volatile row), drop
+      // them to keep the system prompt single-sourced in captures. Taken from the dispatched
+      // messages, so a stage warning shows.
+      const leadingSystemRows = streamFinalMessages.findIndex(
+        (message) => message.role !== "system"
+      );
+      const debugViewMessages =
+        primaryRequest.engineSystem == null
+          ? streamFinalMessages.slice(
+              leadingSystemRows === -1 ? streamFinalMessages.length : leadingSystemRows
+            )
+          : streamFinalMessages;
+
+      const historySequence = assistantMessage.metadata?.historySequence ?? 0;
+
+      // Handle simulated stream scenarios (OpenAI SDK testing features).
+      // These emit synthetic stream events without calling an AI provider.
+      const forceContextLimitError =
+        modelString.startsWith("openai:") &&
+        effectiveMuxProviderOptions.openai?.forceContextLimitError === true;
+      const simulateToolPolicyNoopFlag =
+        modelString.startsWith("openai:") &&
+        effectiveMuxProviderOptions.openai?.simulateToolPolicyNoop === true;
+
+      if (forceContextLimitError || simulateToolPolicyNoopFlag) {
+        const simulationCtx: SimulationContext = {
+          workspaceId,
+          assistantMessageId,
+          canonicalModelString,
+          ...(routeProvider != null ? { routeProvider } : {}),
+          historySequence,
+          systemMessageTokens,
+          effectiveAgentId,
+          effectiveMode,
+          metadataMode: legacyModeForMetadata,
+          effectiveThinkingLevel: streamThinkingLevel,
+          emit: (event, data) => this.dependencies.emit(event, data),
+        };
+
+        // Simulations emit their synthetic events before returning, so the
+        // handle settles immediately with the matching terminal outcome.
+        if (forceContextLimitError) {
+          const streamError = await simulateContextLimitError(
+            simulationCtx,
+            this.dependencies.historyService
+          );
+          return {
+            type: "finished",
+            result: Ok(
+              this.dependencies.createSettledTurnHandle(assistantMessageId, {
+                status: "failed",
+                streamError,
+              })
+            ),
+          };
+        }
+        const streamEnd = await simulateToolPolicyNoop(
+          simulationCtx,
+          effectiveToolPolicy,
+          this.dependencies.historyService
+        );
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createSettledTurnHandle(assistantMessageId, {
+              status: "completed",
+              streamEnd,
+            })
+          ),
+        };
+      }
+
+      let requestHeaders = primaryRequest.headers;
+      const resolvedOverrides = primaryRequest.resolvedOverrides;
+      const rebuildProviderOptionsForThinkingLevel =
+        primaryRequest.rebuildProviderOptionsForThinkingLevel;
+      // Debug dump: Log the complete LLM request when MUX_DEBUG_LLM_REQUEST is set
+      if (resolveXumEnvironmentValue("DEBUG_LLM_REQUEST", process.env) === "1") {
+        log.info(
+          `[MUX_DEBUG_LLM_REQUEST] Full LLM request:\n${JSON.stringify(
+            {
+              workspaceId,
+              model: modelString,
+              systemMessage,
+              messages: debugViewMessages,
+              tools: Object.fromEntries(
+                Object.entries(tools).map(([n, t]) => [
+                  n,
+                  { description: t.description, inputSchema: t.inputSchema },
+                ])
+              ),
+              providerOptions: mergedProviderOptions,
+              thinkingLevel: effectiveThinkingLevel,
+              maxOutputTokens,
+              mode: legacyModeForMetadata,
+              agentId: effectiveAgentId,
+              toolPolicy: effectiveToolPolicy,
+            },
+            null,
+            2
+          )}`
+        );
+
+        if (resolvedOverrides.standard && Object.keys(resolvedOverrides.standard).length > 0) {
+          log.debug("Model parameter overrides (standard):", resolvedOverrides.standard);
+        }
+        if (resolvedOverrides.providerExtras) {
+          log.debug(
+            "Model parameter overrides (provider extras):",
+            resolvedOverrides.providerExtras
+          );
+        }
+      }
+
+      if (combinedAbortSignal.aborted) {
+        await deleteAbortedPlaceholder(assistantMessageId);
+        return {
+          type: "finished",
+          result: Ok(
+            this.dependencies.createAbortedTurnHandle(assistantMessageId, combinedAbortSignal)
+          ),
+        };
+      }
+
+      const snapshot: DebugLlmRequestSnapshot = {
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        capturedAt: nodeClock.nowMs(),
+        workspaceId,
+        messageId: assistantMessageId,
+        model: modelString,
+        providerName: canonicalProviderName,
+        thinkingLevel: effectiveThinkingLevel,
+        mode: legacyModeForMetadata,
+        agentId: effectiveAgentId,
+        maxOutputTokens,
+        systemMessage,
+        messages: debugViewMessages,
+      };
+
+      try {
+        this.dependencies.lastLlmRequestByWorkspace.set(workspaceId, structuredClone(snapshot));
+      } catch (error) {
+        const errMsg = getErrorMessage(error);
+        workspaceLog.warn("Failed to capture debug LLM request snapshot", { error: errMsg });
+      }
+      const toolsForStream = primaryRequest.engineTools;
+
+      const devToolsService = this.dependencies.devToolsService;
+      // Queues this turn's run metadata with a request's compaction budget: the primary's
+      // below, each refusal fallback's own one (another window) in modelFallback.prepare, so
+      // replay rebuilds the request each run sent.
+      let queueRunMetadata: (compactionInputBudgetTokens: number | undefined) => void = () =>
+        undefined;
+      const canQueueDevToolsRunMetadata =
+        devToolsService?.enabled === true &&
+        typeof modelResult.data.model !== "string" &&
+        modelResult.data.model.specificationVersion === "v4";
+
+      if (canQueueDevToolsRunMetadata) {
+        // Correlate pending run metadata with the specific request that reaches
+        // DevTools middleware to avoid cross-request policy leakage. Queue only
+        // when middleware is guaranteed to run (LanguageModelV3).
+        pendingRunMetadataId = String(streamToken);
+        context.startupState.pendingRunMetadataId = pendingRunMetadataId;
+        const metadataId = pendingRunMetadataId;
+        const runMetadata = {
+          toolPolicy:
+            effectiveToolPolicy != null && effectiveToolPolicy.length > 0
+              ? effectiveToolPolicy
+              : undefined,
+          // Join key for the replay verifier: re-anchors this recorded run to
+          // its turn-envelope row and assistant message (see DevToolsRun).
+          ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+          // Same epoch as the runtime prefix monitor: the replay audit resets its baseline on change.
+          ...(promptCacheScope.contextEpoch != null
+            ? { contextEpoch: promptCacheScope.contextEpoch }
+            : {}),
+        };
+        queueRunMetadata = (compactionInputBudgetTokens) =>
+          devToolsService.setPendingRunMetadata(workspaceId, metadataId, {
+            ...runMetadata,
+            // Undefined unless this is a budgeted compaction request (JSON drops the key).
+            compactionInputBudgetTokens,
+          });
+        queueRunMetadata(primaryRequest.compactionInputBudgetTokens);
+        this.dependencies.trackPendingDevToolsRunMetadata(
+          assistantMessageId,
+          workspaceId,
+          pendingRunMetadataId
+        );
+        requestHeaders = {
+          ...requestHeaders,
+          [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
+        };
+      }
+
+      // --- Refusal fallback chain ---
+      // Resolved from app config by the RAW selection (metadata-aware inside):
+      // a cross-typed Coder instance (coder:openai/x, type anthropic) must use
+      // its own gateway-scoped chain, never the direct provider's. Task
+      // children can opt out via taskOnRefusal: "fail" (see
+      // resolveWorkspaceModelFallbackChain).
+      const modelFallbackChain = resolveWorkspaceModelFallbackChain(
+        this.dependencies.config.loadConfigOrDefault(),
+        workspaceId,
+        modelString,
+        this.dependencies.providerService.getConfig()
+      );
+
+      // Lazily rebuilds the per-model slice of this pipeline (model creation,
+      // provider-specific message prep, provider options, headers, parameter
+      // overrides) when StreamManager swaps to a fallback model after a
+      // refusal. Reusing the original request verbatim would leak
+      // provider-specific options/messages across providers.
+      const modelFallback: ModelFallbackOptions | undefined =
+        modelFallbackChain.length > 0
+          ? {
+              chain: modelFallbackChain,
+              prepare: async (nextModelString, prepareOptions) => {
+                const sourceMessages = prepareOptions?.continuation
+                  ? replaceOrAppendMessageById(
+                      messages,
+                      prepareOptions.continuation.assistantMessage
+                    )
+                  : messages;
+                const nextSeedResult = await prepareModelSeed({
+                  rawModelString: nextModelString,
+                  requestedThinkingLevel:
+                    prepareOptions?.thinkingLevelOverride ?? effectiveThinkingLevel,
+                  minimumThinkingLevelOverride: lookupMinThinkingLevelOverride(
+                    this.dependencies.config.loadConfigOrDefault().minThinkingLevelByModel,
+                    nextModelString
+                  ),
+                  enforceMinimum: true,
+                });
+                if (!nextSeedResult.success) {
+                  return Err(formatSendMessageError(nextSeedResult.error).message);
+                }
+
+                // No Token Budget stage is decided here (#5286, maintainer's choice): the
+                // turn's placeholder row already exists, so a warning row cannot precede it,
+                // and handing the turn over to a Continue would need a new mechanism. The
+                // fallback request is sent as built. A stage it reaches comes at the next turn
+                // start that reaches it (applyTurnStartStage), one turn late.
+                let nextRequest: Awaited<ReturnType<typeof prepareModelRequest>>;
+                try {
+                  nextRequest = await prepareModelRequest({
+                    seed: nextSeedResult.data,
+                    sourceMessages,
+                    initializeToolSearch: false,
+                    reusePrePolicySystemContext: false,
+                    requestHistorySequence: () => requestHistorySequence,
+                    partialContinuationMessage: prepareOptions?.continuation?.assistantMessage,
+                    cleanupModelOnError: true,
+                  });
+                } catch (error) {
+                  if (error instanceof ContextBudgetExceededError) return Err(error.details);
+                  throw error;
+                }
+                let nextHeaders = nextRequest.headers;
+                if (pendingRunMetadataId != null) {
+                  // The fallback's run is created after this, under the same metadata ID.
+                  queueRunMetadata(nextRequest.compactionInputBudgetTokens);
+                  nextHeaders = {
+                    ...nextHeaders,
+                    [DEVTOOLS_RUN_METADATA_ID_HEADER]: pendingRunMetadataId,
+                  };
+                }
+
+                return Ok({
+                  onStreamConstructed: nextRequest.onStreamConstructed,
+                  rebuildFirstStepForThinkingLevel: nextRequest.rebuildFirstStepForThinkingLevel,
+                  model: nextRequest.model,
+                  modelString: nextModelString,
+                  messages: nextRequest.messages,
+                  system: nextRequest.engineSystem,
+                  tools: nextRequest.engineTools,
+                  contextBudgetLimit: nextRequest.contextBudgetLimit,
+                  providerOptions: nextRequest.providerOptions,
+                  headers: nextHeaders,
+                  callSettingsOverrides: nextRequest.resolvedOverrides.standard,
+                  thinkingLevel: nextRequest.effectiveThinkingLevel,
+                  forcedFirstStepToolNames: nextRequest.forcedFirstStepToolNames,
+                  rebuildProviderOptionsForThinkingLevel:
+                    nextRequest.rebuildProviderOptionsForThinkingLevel,
+                  providersConfig: nextRequest.providersConfig,
+                  initialMetadataPatch: {
+                    ...(nextRequest.routeProvider != null
+                      ? { routeProvider: nextRequest.routeProvider }
+                      : {}),
+                    systemMessageTokens: nextRequest.systemMessageTokens,
+                    // Exact: the fallback's request decides what the row recorded.
+                    ...nextRequest.systemRecords,
+                  },
+                });
+              },
+            }
+          : undefined;
+
+      const forcedFirstStepToolNames = primaryRequest.forcedFirstStepToolNames;
+
+      const emitPrimaryEnvelope = (): Promise<void> =>
+        primaryRequest.emitEnvelopeWith(streamThinkingLevel, streamProviderOptions);
+      emitStartupBreadcrumb("starting_stream");
+      const turnExecutionOptions: TurnExecutionOptions = {
+        workspaceId,
+        messages: streamFinalMessages,
+        model: modelResult.data.model,
+        modelString,
+        historySequence,
+        system: primaryRequest.engineSystem,
+        runtime,
+        messageId: assistantMessageId,
+        abortSignal: combinedAbortSignal,
+        tools: toolsForStream,
+        contextBudgetLimit: primaryRequest.contextBudgetLimit,
+        initialMetadata: {
+          ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
+          systemMessageTokens,
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          timestamp: nodeClock.nowMs(),
+          agentId: effectiveAgentId,
+          // Where this request sent the volatile system tail, so the next rebuild repeats it.
+          ...systemRecordsMetadata(streamSystemRecords),
+          ...(legacyModeForMetadata != null ? { mode: legacyModeForMetadata } : {}),
+          ...(routeProvider != null ? { routeProvider } : {}),
+          ...(muxMetadata !== undefined ? { muxMetadata } : {}),
+          ...(acpPromptId != null ? { acpPromptId } : {}),
+          // When Auto set the thinking level, the record names the level this request starts
+          // at: the tier's choice clamped to the model that runs (the composer's after a
+          // model-only fallback), not the raw tier value.
+          ...(autoModelRouting != null && {
+            autoModelRouting:
+              autoModelRouting.thinkingLevel != null
+                ? { ...autoModelRouting, thinkingLevel: streamThinkingLevel }
+                : autoModelRouting,
+          }),
+        },
+        providerOptions: streamProviderOptions,
+        maxOutputTokens,
+        toolPolicy: effectiveToolPolicy,
+        providedStreamToken: streamToken,
+        executionScope,
+        hasQueuedMessages,
+        getQueuedInputStopCause,
+        onStepSettled,
+        workspaceName: metadata.name,
+        thinkingLevel: streamThinkingLevel,
+        headers: requestHeaders,
+        callSettingsOverrides: resolvedOverrides.standard,
+        providedRuntimeTempDir: runtimeTempDir,
+        modelFallback,
+        toolSearchState: toolSearchRuntime?.state,
+        thinkingOverrideState: activeTurnThinkingOverride,
+        rebuildProviderOptionsForThinkingLevel,
+        forcedFirstStepToolNames,
+        providersConfigSnapshot: requestProvidersConfig,
+        onStreamConstructed: emitPrimaryEnvelope,
+        rebuildFirstStepForThinkingLevel: primaryRequest.rebuildFirstStepForThinkingLevel,
+      };
+
+      const logStartOutcome = (
+        outcome: "started" | "stream_start_failed",
+        errorType?: string
+      ): void => {
+        logSlowStreamStartup({
+          outcome,
+          providerName: canonicalProviderName,
+          routeProvider,
+          agentId: effectiveAgentId,
+          mode: legacyModeForMetadata,
+          runtimeType: metadata.runtimeConfig.type,
+          ...(errorType != null ? { errorType } : {}),
+          toolCount: Object.keys(toolsForStream).length,
+          mcpToolCount: Object.keys(mcpTools ?? {}).length,
+          mcpFailedServerCount: mcpStats?.failedServerCount ?? 0,
+          providerRequestMessageCount: providerRequestMessages.length,
+          finalMessageCount: finalMessages.length,
+        });
+      };
+
+      transferred = true;
+      return {
+        type: "ready",
+        turnExecutionOptions,
+        assistantMessageId,
+        deleteAbortedPlaceholder,
+        logStartOutcome,
+      };
+    };
+    retained = true;
+    return { type: "prepared", request: { start, [Symbol.asyncDispose]: dispose } };
+  }
+}

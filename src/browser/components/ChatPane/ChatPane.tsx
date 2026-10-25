@@ -8,24 +8,36 @@ import React, {
   useMemo,
 } from "react";
 import { Lightbulb } from "lucide-react";
+import { SideChatBanner } from "@/browser/components/SideChatBanner/SideChatBanner";
+import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
 import { MessageRenderer } from "@/browser/features/Messages/MessageRenderer";
-import { WorkBundleMessage } from "@/browser/features/Messages/WorkBundleMessage";
-import { OperationalBundleMessage } from "@/browser/features/Messages/OperationalBundleMessage";
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { useTranscriptContextMenu } from "@/browser/features/Messages/useTranscriptContextMenu";
-import type { UserMessageNavigation } from "@/browser/features/Messages/UserMessage";
 import { InterruptedBarrier } from "@/browser/features/Messages/ChatBarrier/InterruptedBarrier";
 import { useResumeStream } from "@/browser/hooks/useResumeStream";
 import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditCutoffBarrier";
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
 import { PinnedTodoList } from "../PinnedTodoList/PinnedTodoList";
+import { AskUserQuestionDock } from "./AskUserQuestionDock";
+import { useAcceptedAnswersVersion } from "@/browser/utils/messages/openAskUserQuestions";
+import {
+  AskUserQuestionPlacementProvider,
+  getTranscriptAskUserQuestionPlacement,
+} from "@/browser/features/Tools/AskUserQuestion/askUserQuestionPlacement";
 import { ChatInputDecorationStackLane, TranscriptTailStackLane } from "./LayoutStackLane";
 import { computeChatViewReveal, useChatViewDataReady } from "./useChatViewDataReady";
 import { TranscriptHydrationSkeleton } from "./TranscriptHydrationSkeleton";
+import { TranscriptBundleRows, useTranscriptBundles } from "./TranscriptBundles";
+import {
+  findTranscriptMessageElement,
+  getTranscriptRowProps,
+  useTranscriptRowDerivations,
+  useUserMessageNavigation,
+} from "./transcriptRowDerivations";
 import {
   createChatInputDecorationStackItem,
   createTranscriptTailStackItem,
@@ -33,29 +45,23 @@ import {
   type ChatInputDecorationStackItem,
   type TranscriptTailStackItem,
 } from "./layoutStack";
-import { VIM_ENABLED_KEY } from "@/common/constants/storage";
+import { getRetryBarrierDerivation } from "./retryBarrierDerivation";
 import { ChatInput, type ChatInputAPI } from "@/browser/features/ChatInput/index";
 import type { QueueDispatchMode } from "@/browser/features/ChatInput/types";
 import {
-  shouldShowInterruptedBarrier,
   mergeConsecutiveStreamErrors,
-  computeBashOutputGroupInfos,
   shouldBypassDeferredMessages,
 } from "@/browser/utils/messages/messageUtils";
-import { computeTaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
 import { BashCollapsedSummaryModeProvider } from "@/browser/features/Tools/BashCollapsedSummaryModeContext";
 import { BashOutputCollapsedIndicator } from "@/browser/features/Tools/BashOutputCollapsedIndicator";
-import {
-  getInterruptionContext,
-  getLastMainRetryCandidateMessage,
-  getLastNonDecorativeMessage,
-  isPreTokenInterruptedUserTurn,
-} from "@/common/utils/messages/retryEligibility";
+import { getLastNonDecorativeMessage } from "@/common/utils/messages/retryEligibility";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { formatKeybind, KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { useAutoScroll } from "@/browser/hooks/useAutoScroll";
+import { useBoundedTranscriptReveal } from "@/browser/hooks/useBoundedTranscriptReveal";
+import { TRANSCRIPT_MAX_MOUNTED_ROWS } from "@/common/constants/ui";
 import { useOpenInEditor } from "@/browser/hooks/useOpenInEditor";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
 import {
   useWorkspaceAggregator,
   useWorkspaceState,
@@ -63,21 +69,26 @@ import {
   useWorkspaceStoreRaw,
 } from "@/browser/stores/WorkspaceStore";
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
+import { useMainPaneAgentInterfaceView } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
+import type { AgentInterfaceView } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceViewState";
+import { AgentInterfaceStatusView } from "@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceStatusView";
 import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
 import type { DisplayedMessage, QueuedMessage as QueuedMessageData } from "@/common/types/message";
+import type { HeldInput as HeldInputData } from "@/common/orpc/types";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
 import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
+import { HeldInput } from "@/browser/features/Messages/HeldInput";
+import { DelegatedCreationInterruptedBanner } from "@/browser/components/DelegatedCreationInterruptedBanner/DelegatedCreationInterruptedBanner";
+import { LegacyPlanImportBanner } from "@/browser/components/LegacyPlanImportBanner/LegacyPlanImportBanner";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
-import {
-  ConcurrentLocalWarningDecoration,
-  useConcurrentLocalStreamingWorkspaceName,
-} from "../ConcurrentLocalWarning/ConcurrentLocalWarning";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
+import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
+import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
 import { cancelCompaction } from "@/browser/utils/compaction/handler";
 import type { ContextSwitchWarning } from "@/browser/utils/compaction/contextSwitchCheck";
 import { useProviderOptions } from "@/browser/hooks/useProviderOptions";
@@ -86,9 +97,16 @@ import { useContextSwitchWarning } from "@/browser/hooks/useContextSwitchWarning
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useSendMessageOptions } from "@/browser/hooks/useSendMessageOptions";
 import type { TerminalSessionCreateOptions } from "@/browser/utils/terminal";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFullWidth";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
+import { isTranscriptMutationAllowed } from "@/browser/utils/transcriptBarrier";
+import { publishChatError } from "@/browser/utils/chatErrorToasts";
+import { EDIT_NOT_HELD_MESSAGE } from "@/constants/transcriptBarrier";
+import {
+  TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+  TRANSCRIPT_REPLAY_FAILED_BANNER,
+} from "@/constants/transcriptBarrier";
 import {
   ChatDockColumnProvider,
   ChatDockSurface,
@@ -99,10 +117,7 @@ import { useReviews } from "@/browser/hooks/useReviews";
 import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
-import {
-  useBackgroundBashActions,
-  useBackgroundBashError,
-} from "@/browser/contexts/BackgroundBashContext";
+import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
 import {
   buildEditingStateFromDisplayed,
@@ -110,12 +125,13 @@ import {
   normalizeQueuedMessage,
   type EditingMessageState,
 } from "@/browser/utils/chatEditing";
-import {
-  computeOperationalBundleInfos,
-  computeWorkBundleInfos,
-} from "@/browser/utils/messages/transcriptRenderProjection";
+import { estimateTranscriptRowWeight } from "@/browser/utils/messages/transcriptRenderProjection";
 import { isBlockedPreStreamTaskStatus } from "@/browser/utils/ui/workspaceFiltering";
 import { PerfRenderMarker } from "@/browser/utils/perf/PerfRenderMarker";
+import { markChatSwitchMilestoneOnNextFrame } from "@/browser/utils/perf/chatSwitchTiming";
+import { runWithCatch } from "@/browser/utils/compilerSafeControlFlow";
+import { useWorkspaceViewHandoff } from "@/browser/features/StaticWorkspaceView/workspaceViewHandoff";
+import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
 import {
   CUSTOM_EVENTS,
   type CustomEventType,
@@ -124,18 +140,6 @@ import {
 
 const TRANSCRIPT_ONLY_NOTICE =
   "This workspace's worktree is no longer available. This is a read-only chat transcript kept for historical and usage-tracking reasons.";
-
-function findTailProposePlanToolId(messages: readonly DisplayedMessage[]): string | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message.type !== "tool") {
-      continue;
-    }
-    return message.toolName === "propose_plan" ? message.id : null;
-  }
-
-  return null;
-}
 
 function isPixelSnapshotEnvironment(): boolean {
   if (typeof window === "undefined") {
@@ -160,17 +164,32 @@ interface ChatPaneProps {
   workspaceName: string;
   namedWorkspacePath: string;
   leftSidebarCollapsed: boolean;
-  onToggleLeftSidebarCollapsed: () => void;
   runtimeConfig?: RuntimeConfig;
   onOpenTerminal: (options?: TerminalSessionCreateOptions) => void;
   /** Hide + inactivate chat pane while immersive review overlay is active. */
   immersiveHidden?: boolean;
+  /** Phones: show the hidden right sidebar full-screen (see WorkspaceShell). */
+  onOpenSidebar?: (returnFocusTo: HTMLElement | null) => void;
+  sidebarFullscreen?: boolean;
 }
 
-type ChatPaneContentProps = Omit<
+export type ChatPaneContentProps = Omit<
   ChatPaneProps,
-  "leftSidebarCollapsed" | "onToggleLeftSidebarCollapsed" | "immersiveHidden"
->;
+  "leftSidebarCollapsed" | "immersiveHidden" | "onOpenSidebar" | "sidebarFullscreen"
+> & {
+  /**
+   * Rendered inside another surface (the /side chat tab in the right sidebar) rather than as
+   * the page's main chat, so the touch-device header spacer does not apply.
+   */
+  embedded?: boolean;
+  /** Let an explicitly opened embedded chat claim focus when its composer mounts. */
+  onChatInputReady?: (api: ChatInputAPI) => void;
+  /**
+   * Agent interface view: which view the main pane shows, or null/absent when the workspace has
+   * no status page to show (or the experiment is off), which leaves the transcript as is.
+   */
+  agentInterfaceView?: AgentInterfaceView | null;
+};
 
 type ReviewsState = ReturnType<typeof useReviews>;
 
@@ -181,6 +200,87 @@ type ReviewsState = ReturnType<typeof useReviews>;
 // When unlocked (manual reading) we drop this so the browser anchors to an onscreen
 // row and preserves the reading position while off-screen content above settles.
 const TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE = { overflowAnchor: "none" } as const;
+
+/**
+ * Jump to bottom (also every send and edit) brings a detached slice (#4961 F20: its newest rows
+ * unmounted under the mounted-row cap) back to the live tail first.
+ */
+function jumpToLiveTail(isDetached: boolean, resetToLatest: () => void, jumpToBottom: () => void) {
+  if (isDetached) resetToLatest();
+  jumpToBottom();
+}
+
+/** The mounted rows [from, to) of the transcript (the same array when that is all of it). */
+function mountedSlice<Row>(rows: readonly Row[], from: number, to: number): readonly Row[] {
+  return from === 0 && to === rows.length ? rows : rows.slice(from, to);
+}
+
+const isInSlice = (index: number, from: number, to: number) => index >= from && index < to;
+
+/** Off the bottom, or detached: the bottom of the slice is not the live tail. */
+const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean, statusShown: boolean) =>
+  !statusShown && (!autoScroll || isDetached);
+
+/** Tab skips the transcript under the status page; the composer dock it holds stays reachable. */
+const transcriptTabIndex = (statusShown: boolean) => (statusShown ? -1 : 0);
+
+/** The last mounted transcript row and where it is now, for loadOlderAnchorRef. */
+function lastRowAnchor(scrollport: HTMLDivElement | null) {
+  const rows = scrollport?.querySelectorAll<HTMLElement>("[data-message-id]") ?? [];
+  const element = rows[rows.length - 1];
+  if (!scrollport || !element) return null;
+  return { element, top: element.getBoundingClientRect().top, scrollTop: scrollport.scrollTop };
+}
+
+/** History ids of the transcript rows inside the scrollport now (the reader's view). */
+function visibleHistoryIds(scrollport: HTMLDivElement | null): Set<string> {
+  const ids = new Set<string>();
+  if (!scrollport) return ids;
+  const view = scrollport.getBoundingClientRect();
+  for (const element of scrollport.querySelectorAll<HTMLElement>("[data-message-id]")) {
+    const rect = element.getBoundingClientRect();
+    const id = element.getAttribute("data-message-id");
+    if (id && rect.bottom > view.top && rect.top < view.bottom) ids.add(id);
+  }
+  return ids;
+}
+
+/** The ids of the displayed messages inside the scrollport now (see readVisibleMessageIds). */
+function visibleMessageIds(scrollport: HTMLDivElement | null, messages: DisplayedMessage[]) {
+  const seen = visibleHistoryIds(scrollport);
+  return messages
+    .filter((message) => "historyId" in message && seen.has(message.historyId))
+    .map((message) => message.id);
+}
+
+/**
+ * Load older walks past the cap without releasing the bottom lock, and a lock still on pins the
+ * bottom over Show newer's row anchor (DetachedPastCapLocked), so Show newer releases it first.
+ */
+function releaseBottomLock(lock: { autoScroll: boolean; disableAutoScroll: () => void }) {
+  if (lock.autoScroll) lock.disableAutoScroll();
+}
+
+/** Below a detached slice (#4961 F20): mounts the next newer rows (see revealNewer). */
+function ShowNewerMessagesButton(props: { visible: boolean; onClick: () => void }) {
+  if (!props.visible) return null;
+  return (
+    <div className="flex justify-center py-3">
+      <TooltipIfPresent
+        tooltip={`Show newer messages (${formatKeybind(KEYBINDS.SHOW_NEWER_MESSAGES)})`}
+        side="bottom"
+      >
+        <button
+          type="button"
+          onClick={props.onClick}
+          className="text-muted hover:text-foreground text-xs underline underline-offset-2 transition-colors"
+        >
+          Show newer messages
+        </button>
+      </TooltipIfPresent>
+    </div>
+  );
+}
 // The sentinel is the sole anchor candidate while locked.
 const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
 // The composer dock is normal scroll content (sticky to the scrollport bottom),
@@ -190,16 +290,9 @@ const TRANSCRIPT_BOTTOM_SENTINEL_STYLE = { overflowAnchor: "auto" } as const;
 // layout by a frame and tear. The dock must never be a scroll-anchoring
 // candidate: while locked the sentinel owns anchoring, and while released the
 // browser must anchor to a transcript row, not the sticky dock.
+const EMPTY_TRANSCRIPT: DisplayedMessage[] = [];
+const NO_HELD_INPUTS: readonly HeldInputData[] = [];
 const COMPOSER_DOCK_STYLE = { overflowAnchor: "none" } as const;
-
-function findTranscriptMessageElement(
-  scrollContainer: HTMLElement,
-  historyId: string
-): HTMLElement | undefined {
-  return Array.from(scrollContainer.querySelectorAll<HTMLElement>("[data-message-id]")).find(
-    (element) => element.getAttribute("data-message-id") === historyId
-  );
-}
 
 const TIMELINE_REVEAL_HIGHLIGHT_CLASS = "timeline-reveal-highlight";
 
@@ -267,15 +360,13 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   const meta = workspaceMetadata.get(workspaceId);
   const workspaceTitle = meta?.title ?? meta?.name ?? props.workspaceName;
 
+  const agentInterfaceView = useMainPaneAgentInterfaceView(workspaceId);
+
   return (
     <PerfRenderMarker id="chat-pane">
       <div
         ref={chatAreaRef}
         aria-hidden={immersiveHidden || undefined}
-        // Tells the app root that this column ends in a row (WorkspaceFooterBar) which reserves the
-        // bottom safe-area inset itself. Dropped while hidden so the inset stays with the root for
-        // whatever replaces the column.
-        data-bottom-inset-owner={immersiveHidden ? undefined : true}
         className={cn(
           "bg-surface-primary relative flex min-w-96 flex-1 flex-col",
           // Immersive review overlays the entire workspace, so hiding the chat pane removes
@@ -285,30 +376,46 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
           "[@media(max-width:768px)]:min-w-0"
         )}
       >
-        <PerfRenderMarker id="chat-pane.header">
-          <WorkspaceMenuBar
+        {/* The chat is the page's primary content, so it is the one `main` landmark in every
+            layout (landmark-one-main, #5956). The footer stays outside it so it remains the page's
+            contentinfo landmark, and the project and right sidebars stay outside too. The wrapper
+            keeps the column flex layout and adds no positioning context. */}
+        <main className="flex min-h-0 flex-1 flex-col">
+          <PerfRenderMarker id="chat-pane.header">
+            <WorkspaceMenuBar
+              workspaceId={workspaceId}
+              projectName={props.projectName}
+              projectPath={props.projectPath}
+              workspaceName={props.workspaceName}
+              workspaceTitle={workspaceTitle}
+              leftSidebarCollapsed={props.leftSidebarCollapsed}
+              namedWorkspacePath={props.namedWorkspacePath}
+              runtimeConfig={props.runtimeConfig}
+              onOpenTerminal={props.onOpenTerminal}
+              onOpenSidebar={props.onOpenSidebar}
+              sidebarFullscreen={props.sidebarFullscreen}
+            />
+          </PerfRenderMarker>
+
+          {meta?.sideChatParentWorkspaceId != null && (
+            <SideChatBanner
+              key={workspaceId}
+              workspaceId={workspaceId}
+              parentWorkspaceId={meta.sideChatParentWorkspaceId}
+            />
+          )}
+
+          <ChatPaneContent
             workspaceId={workspaceId}
-            projectName={props.projectName}
             projectPath={props.projectPath}
+            projectName={props.projectName}
             workspaceName={props.workspaceName}
-            workspaceTitle={workspaceTitle}
-            leftSidebarCollapsed={props.leftSidebarCollapsed}
-            onToggleLeftSidebarCollapsed={props.onToggleLeftSidebarCollapsed}
             namedWorkspacePath={props.namedWorkspacePath}
             runtimeConfig={props.runtimeConfig}
             onOpenTerminal={props.onOpenTerminal}
+            agentInterfaceView={agentInterfaceView}
           />
-        </PerfRenderMarker>
-
-        <ChatPaneContent
-          workspaceId={workspaceId}
-          projectPath={props.projectPath}
-          projectName={props.projectName}
-          workspaceName={props.workspaceName}
-          namedWorkspacePath={props.namedWorkspacePath}
-          runtimeConfig={props.runtimeConfig}
-          onOpenTerminal={props.onOpenTerminal}
-        />
+        </main>
 
         {/* Reset the footer's scroll and popover state because ChatPane remains mounted across
             workspace switches. */}
@@ -326,10 +433,21 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   );
 };
 
-const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
+/**
+ * The queued message the card's Edit may take back into the composer. None while another message
+ * is being edited (#5934): it would replace that edit, and a Cancel then lost it. The card shows
+ * Edit as blocked then; this also covers a click that races that render, before clearQueue runs.
+ */
+function queuedMessageToEdit(
+  queued: QueuedMessageData | null | undefined,
+  editing: EditingMessageState | undefined
+): QueuedMessageData | null | undefined {
+  return editing ? null : queued;
+}
+
+export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const {
     workspaceId,
-    projectPath,
     projectName,
     workspaceName,
     namedWorkspacePath,
@@ -340,13 +458,17 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const chatTranscriptFullWidth = useChatTranscriptFullWidth();
   const [transcriptDensity] = useTranscriptDensity();
   const { api } = useAPI();
+  const liveApi = useLiveAPI();
   const { workspaceMetadata } = useWorkspaceContext();
   const storeRaw = useWorkspaceStoreRaw();
   const aggregator = useWorkspaceAggregator(workspaceId);
   const workspaceUsage = useWorkspaceUsage(workspaceId);
   const reviews = useReviews(workspaceId);
-  const { autoBackgroundOnSend } = useBackgroundBashActions();
   const { clearError: clearBackgroundBashError } = useBackgroundBashError();
+
+  // Agent interface view: the transcript stays mounted (hidden) under the status page, so its
+  // scroll position survives a round trip; the status page unmounts while the transcript shows.
+  const showStatusView = props.agentInterfaceView === "status";
 
   // Transcript-only workspaces preserve historical chat and usage after the worktree is deleted,
   // so the transcript stays readable while new sends remain disabled.
@@ -364,11 +486,6 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       : null;
   const shouldShowQueuedAgentTaskPrompt =
     Boolean(queuedAgentTaskPrompt) && (workspaceState?.messages.length ?? 0) === 0;
-  const concurrentLocalStreamingWorkspaceName = useConcurrentLocalStreamingWorkspaceName({
-    workspaceId,
-    projectPath,
-    runtimeConfig,
-  });
 
   const { has1MContext } = useProviderOptions();
   // Resolve 1M context per-model (uses the pending model for the current workspace)
@@ -383,23 +500,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // after the transcript is visible.
   const chatViewDataReady = useChatViewDataReady(workspaceId);
 
-  const { threshold: autoCompactionThreshold } = useAutoCompactionSettings(
+  const { threshold: autoCompactionThreshold, rolloverEnabled } = useAutoCompactionSettings(
     workspaceId,
     pendingModel
   );
-
-  useEffect(() => {
-    if (!api) {
-      return;
-    }
-
-    // Keep backend session threshold in sync with the persisted per-model slider value.
-    const normalizedThreshold = Math.max(0.1, Math.min(1, autoCompactionThreshold / 100));
-    void api.workspace.setAutoCompactionThreshold({
-      workspaceId,
-      threshold: normalizedThreshold,
-    });
-  }, [api, workspaceId, autoCompactionThreshold]);
 
   const [queuedActionErrorState, setQueuedActionErrorState] = useState<{
     workspaceId: string;
@@ -420,13 +524,49 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     editingState.workspaceId === workspaceId ? editingState.message : undefined;
   const setEditingMessage = useCallback(
     (message: EditingMessageState | undefined) => {
+      // Any change of edit target ends the conflict recovery of the previous edit (no-op
+      // when none is pending); only the composer's own updater keeps a request alive.
+      storeRaw.cancelTranscriptRefresh(workspaceId);
       setEditingState({
         workspaceId,
         message: transcriptOnly ? undefined : message,
       });
     },
-    [workspaceId, transcriptOnly]
+    [storeRaw, workspaceId, transcriptOnly]
   );
+  const updateEditingMessage = (update: (current: EditingMessageState) => EditingMessageState) => {
+    setEditingState((previous) =>
+      previous.workspaceId === workspaceId && previous.message
+        ? { ...previous, message: update(previous.message) }
+        : previous
+    );
+  };
+  // The workspace with an unresolved edit send: no edit starts there meanwhile (#5226).
+  const [editSendPendingIn, setEditSendPendingIn] = useState<string | null>(null);
+  const editSendPending = editSendPendingIn === workspaceId;
+  const handleEditSendPendingChange = (pending: boolean) =>
+    setEditSendPendingIn((current) =>
+      pending ? workspaceId : current === workspaceId ? null : current
+    );
+  /**
+   * Enter edit mode with content evidence of the rows the edit deletes. A row the aggregator
+   * does not hold cannot be fenced (a real state, not a bug): stay out of edit mode and say so.
+   */
+  const beginEditingMessage = (message: EditingMessageState): boolean => {
+    if (editSendPending) return false;
+    const precondition = storeRaw.captureHistoryEditPrecondition(workspaceId, message.id);
+    if (!precondition) {
+      publishChatError(workspaceId, EDIT_NOT_HELD_MESSAGE);
+      return false;
+    }
+    setEditingMessage({ ...message, precondition });
+    return true;
+  };
+  // Cancelling a compaction edits its request row; the fence is captured before the interrupt,
+  // so rows the interruption settles inside the range surface as an explicit conflict.
+  const startEditingMessage = (message: EditingMessageState) => {
+    beginEditingMessage(message);
+  };
 
   // Transcript-only workspaces swap the composer for a read-only notice, so clear any
   // stale edit state instead of leaving the transcript stuck at an edit cutoff.
@@ -436,16 +576,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
   }, [editingMessage, transcriptOnly, workspaceId]);
 
-  // Track which bash_output groups are expanded (keyed by first message ID)
-  const [expandedBashGroups, setExpandedBashGroups] = useState<Set<string>>(new Set());
-
-  const [workBundleExpansionOverrides, setWorkBundleExpansionOverrides] = useState<
-    Map<string, boolean>
-  >(new Map());
-
-  const [operationalBundleExpansionOverrides, setOperationalBundleExpansionOverrides] = useState<
-    Map<string, boolean>
-  >(new Map());
+  // A navigation (prompt arrows, ArrowUp edit) targets a row by historyId. The tail-first
+  // reveal may not have mounted it yet, so the scroll runs from an effect once it is in the
+  // DOM instead of a one-shot requestAnimationFrame that would find nothing.
+  const [pendingScrollTarget, setPendingScrollTarget] = useState<{
+    workspaceId: string;
+    historyId: string;
+  } | null>(null);
 
   // Extract state from workspace state
 
@@ -463,13 +600,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     loading,
     isHydratingTranscript,
     isTranscriptCaughtUp,
+    transcriptReplayFailed,
     hasOlderHistory,
     loadingOlderHistory,
     activeBashMonitorCount,
   } = workspaceState;
   const shouldShowPinnedTodoList = workspaceState.todos.length > 0;
   const shouldShowReviewsBanner = reviews.reviews.length > 0;
-  const shouldRenderLoadOlderMessagesButton = hasOlderHistory && !isPixelSnapshotEnvironment();
   const loadOlderMessagesShortcutLabel = formatKeybind(KEYBINDS.LOAD_OLDER_MESSAGES);
 
   const {
@@ -529,67 +666,54 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [workspaceId, latestMessageId, onOpenTerminal]
   );
 
-  const taskReportLinking = useMemo(
-    () => computeTaskReportLinking(deferredMessages),
-    [deferredMessages]
-  );
+  const transcriptRowDerivations = useTranscriptRowDerivations({
+    workspaceId,
+    messages: deferredMessages,
+  });
+  const { bashOutputGroupInfos, expandedBashGroups, expandBashGroup } = transcriptRowDerivations;
 
-  // Precompute bash_output grouping once per message snapshot so row rendering stays O(n).
-  const bashOutputGroupInfos = useMemo(
-    () => computeBashOutputGroupInfos(deferredMessages),
-    [deferredMessages]
-  );
+  const transcriptBundles = useTranscriptBundles({
+    workspaceId,
+    messages: deferredMessages,
+    transcriptDensity,
+    isTurnActive: isStreamStarting || canInterrupt,
+  });
+  const {
+    workBundleInfos,
+    operationalBundleInfos,
+    workBundleExpansionOverrides,
+    operationalBundleExpansionOverrides,
+    setWorkBundleExpanded,
+    setOperationalBundleExpanded,
+  } = transcriptBundles;
 
-  const workBundleInfos = useMemo(
-    () => (transcriptDensity === "hyper" ? computeWorkBundleInfos(deferredMessages) : undefined),
-    [deferredMessages, transcriptDensity]
-  );
-
-  const operationalBundleInfos = useMemo(
-    () =>
-      computeOperationalBundleInfos(deferredMessages, {
-        isTurnActive: isStreamStarting || canInterrupt,
-        taskAwaitPollsOnly: transcriptDensity !== "hyper",
-      }),
-    [canInterrupt, deferredMessages, isStreamStarting, transcriptDensity]
-  );
-
-  // A tail propose_plan usually means the agent paused for user review; reveal only the
-  // containing hyper-density bundles by default so historical plans stay collapsed.
-  const tailProposePlanToolId =
-    transcriptDensity === "hyper" ? findTailProposePlanToolId(deferredMessages) : null;
-  const tailProposePlanIndex =
-    tailProposePlanToolId === null
-      ? -1
-      : deferredMessages.findIndex((message) => message.id === tailProposePlanToolId);
-  const tailProposePlanWorkBundleKey =
-    tailProposePlanIndex === -1 ? null : (workBundleInfos?.[tailProposePlanIndex]?.key ?? null);
-  const tailProposePlanOperationalBundleKey =
-    tailProposePlanIndex === -1
-      ? null
-      : (operationalBundleInfos?.[tailProposePlanIndex]?.key ?? null);
-
-  const autoCompactionResult = useMemo(
-    () =>
-      checkAutoCompaction(
-        workspaceUsage,
-        pendingModel,
-        use1M,
-        autoCompactionThreshold / 100,
-        undefined,
-        providersConfig
-      ),
-    [workspaceUsage, pendingModel, use1M, providersConfig, autoCompactionThreshold]
-  );
-
-  // Show warning when: shouldShowWarning flag is true AND not currently compacting.
-  // Context-switch warning takes priority so we don't show competing banners.
-  const shouldShowCompactionWarning =
-    !isCompacting && autoCompactionResult.shouldShowWarning && !contextSwitchWarning;
-
-  // Vim mode state - needed for keybind selection (Ctrl+C in vim, Esc otherwise)
-  const [vimEnabled] = usePersistedState<boolean>(VIM_ENABLED_KEY, false, { listener: true });
-
+  // Tail-first rendering: projections above are computed over the full array; only the
+  // mounted range starts at `revealFromIndex`. A cut is safe when the row is not inside a
+  // bundle or group (a head counts as safe), so bundles always mount whole.
+  const isSafeRevealCut = (index: number): boolean => {
+    const bashOutputGroup = bashOutputGroupInfos[index];
+    if (bashOutputGroup !== undefined && bashOutputGroup.position !== "first") return false;
+    const workBundle = workBundleInfos?.[index];
+    if (workBundle !== undefined && workBundle.position !== "head") return false;
+    const operationalBundle = operationalBundleInfos?.[index];
+    return operationalBundle === undefined || operationalBundle.position === "head";
+  };
+  // Keep rendering cached transcript rows during incremental (since) catch-up so workspace
+  // switches feel stable, even when they are known to be missing backend content: the server
+  // verified every row up to the cursor, and rows after it are swapped for the server's
+  // copies at caught-up, so the missing content mostly appends. Stale rows
+  // under a full replay hide behind the skeleton instead. The stream/monitor barrier
+  // lives in the composer dock, so it never vetoes the skeleton. The skeleton
+  // additionally holds until decoration data sources are known so the transcript and all
+  // composer decorations reveal in ONE commit — see useChatViewDataReady for the contract.
+  const { showHydrationPlaceholder: showTranscriptHydrationPlaceholder, revealDecorations } =
+    computeChatViewReveal({
+      isHydratingTranscript,
+      chatViewDataReady,
+      hasRenderableMessages: deferredMessages.length > 0,
+      isTranscriptStale: workspaceState.isTranscriptStale,
+      isIncrementalCatchUp: workspaceState.isIncrementalCatchUp,
+    });
   // Use auto-scroll hook for scroll management
   const {
     contentRef,
@@ -597,6 +721,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     autoScroll,
     disableAutoScroll,
     jumpToBottom,
+    setTranscriptDetached,
     handleScroll,
     markUserScrollIntent,
     handleScrollContainerWheel,
@@ -605,6 +730,108 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     handleScrollContainerMouseUp,
     handleScrollContainerKeyDown,
   } = useAutoScroll();
+
+  // While the skeleton owns the pane no row is mounted, so the reveal must not advance behind
+  // it: it would otherwise mount the whole transcript in the one commit that replaces the
+  // skeleton. Handing it no rows keeps it idle; the real transcript then starts tail-first.
+  const {
+    fromIndex: revealFromIndex,
+    toIndex: revealToIndex,
+    isDetached: isTranscriptDetached,
+    isFullyRevealed,
+    isRevealPaused,
+    revealMore,
+    revealThrough,
+    revealNewer,
+    resetToLatest,
+  } = useBoundedTranscriptReveal({
+    workspaceId,
+    messages: showTranscriptHydrationPlaceholder ? EMPTY_TRANSCRIPT : deferredMessages,
+    isSafeCut: isSafeRevealCut,
+    rowWeight: (index) => estimateTranscriptRowWeight(deferredMessages[index]),
+    // Bounds renderer heap on long read-backs (#4961 F20): past the cap the newest rows unmount
+    // ("detached") until Show newer or Jump to bottom brings them back.
+    maxMountedRows: TRANSCRIPT_MAX_MOUNTED_ROWS,
+    // A reader scrolled up keeps the rows they read: appends past the cap detach the slice instead.
+    followsTail: autoScroll,
+    // Read once, on the render where an edit deletes a detached slice's edge row: the DOM still
+    // shows the previous commit, so these are the rows the reader saw (refitDetached keeps them).
+    readVisibleMessageIds: () => visibleMessageIds(contentRef.current, deferredMessages),
+  });
+  useLayoutEffect(() => {
+    setTranscriptDetached(isTranscriptDetached);
+  }, [isTranscriptDetached, setTranscriptDetached]);
+  const revealedMessages = mountedSlice(deferredMessages, revealFromIndex, revealToIndex);
+  // An accepted non-blocking answer closes its question without any transcript change.
+  useAcceptedAnswersVersion();
+  // Open ask_user_question forms live in the composer dock (sticky to the bottom of the chat) and
+  // their transcript rows render as stubs.
+  const askUserQuestionPlacement = getTranscriptAskUserQuestionPlacement({
+    workspaceId,
+    transcriptOnly,
+    transcripts: [transformedMessages, deferredMessages],
+  });
+  const hasCommittedTranscriptRow =
+    !showTranscriptHydrationPlaceholder && revealedMessages.length > 0;
+  // Chat-switch User Timing (#4504): first transcript row painted after a switch. The commit
+  // before the store activates the workspace can hold cached rows that a synchronous re-render
+  // replaces with the skeleton before paint; the next-frame check drops those.
+  useEffect(() => {
+    if (!hasCommittedTranscriptRow) return;
+    return markChatSwitchMilestoneOnNextFrame(workspaceId, "first-row");
+  }, [workspaceId, hasCommittedTranscriptRow]);
+  // Settled: every row is mounted, or the automatic reveal paused at its rows budget (#4869;
+  // older rows then mount only on request) — either way no chunk is still mounting.
+  const revealSettled = isFullyRevealed || isRevealPaused;
+  const chatViewLoaded = !loading && !isHydratingTranscript && chatViewDataReady && revealSettled;
+  useWorkspaceViewHandoff(workspaceId, chatViewLoaded, transcriptReplayFailed); // T3 #5971
+  // Streaming rows render synchronously while older chunks still mount (see
+  // TranscriptBackfillContext). Gated on an active stream so a switch to an idle chat never
+  // flips the value, which would re-render every mounted markdown row once the reveal ends.
+  const isTranscriptBackfillingDuringStream = canInterrupt && !revealSettled;
+  // A paused reveal offers its unmounted rows first. Older server pages prepend above rows the
+  // reveal has not reached yet; offer them once it has.
+  const shouldRenderLoadOlderMessagesButton =
+    (isRevealPaused || (hasOlderHistory && isFullyRevealed)) && !isPixelSnapshotEnvironment();
+  // The server-page loading state never applies to mounting already-loaded rows.
+  const isLoadingOlderHistoryPage = loadingOlderHistory && !isRevealPaused;
+
+  // Rollover mode evaluates the clamped threshold, so the chat-input bar's visibility and
+  // text must use the same effective value the slider label advertises.
+  const autoCompactionResult = useMemo(() => {
+    const effectiveAutoCompactionThreshold = getEffectiveThreshold({
+      threshold: autoCompactionThreshold,
+      rolloverEnabled,
+      modelContextLimit: pendingModel
+        ? getEffectiveContextLimit(pendingModel, use1M, providersConfig)
+        : null,
+    });
+    return checkAutoCompaction(
+      workspaceUsage,
+      pendingModel,
+      use1M,
+      effectiveAutoCompactionThreshold / 100,
+      undefined,
+      providersConfig
+    );
+  }, [
+    workspaceUsage,
+    pendingModel,
+    use1M,
+    providersConfig,
+    autoCompactionThreshold,
+    rolloverEnabled,
+  ]);
+
+  // Show warning when: shouldShowWarning flag is true AND not currently compacting.
+  // Context-switch warning takes priority so we don't show competing banners.
+  const shouldShowCompactionWarning =
+    !isCompacting && autoCompactionResult.shouldShowWarning && !contextSwitchWarning;
+
+  // Vim mode state - needed for keybind selection (Ctrl+C in vim, Esc otherwise)
+  const vimEnabled = useUserPreferences(
+    (preferences) => preferences.appearance?.vimEnabled === true
+  );
 
   const [pendingTimelineReveal, setPendingTimelineReveal] = useState<
     CustomEventPayloads[typeof CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR] | null
@@ -633,7 +860,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     if (!pendingTimelineReveal) {
       return;
     }
-    if (pendingTimelineReveal.workspaceId !== workspaceId) {
+    // Like pendingScrollTarget: the tail being pinned again supersedes a reveal still waiting.
+    if (pendingTimelineReveal.workspaceId !== workspaceId || autoScroll) {
       setPendingTimelineReveal(null);
       return;
     }
@@ -644,17 +872,15 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
 
     const bashOutputGroup = bashOutputGroupInfos[targetIndex];
-    const bashGroupKey = bashOutputGroup
-      ? deferredMessages[bashOutputGroup.firstIndex]?.id
-      : undefined;
+    const bashGroupKey = bashOutputGroup?.groupKey;
     if (bashGroupKey && !expandedBashGroups.has(bashGroupKey)) {
-      setExpandedBashGroups((current) => new Set(current).add(bashGroupKey));
+      expandBashGroup(bashGroupKey);
       return;
     }
 
     const workBundle = workBundleInfos?.[targetIndex];
     if (workBundle && workBundleExpansionOverrides.get(workBundle.key) !== true) {
-      setWorkBundleExpansionOverrides((current) => new Map(current).set(workBundle.key, true));
+      setWorkBundleExpanded(workBundle.key, true);
       return;
     }
 
@@ -663,9 +889,15 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       operationalBundle &&
       operationalBundleExpansionOverrides.get(operationalBundle.key) !== true
     ) {
-      setOperationalBundleExpansionOverrides((current) =>
-        new Map(current).set(operationalBundle.key, true)
-      );
+      setOperationalBundleExpanded(operationalBundle.key, true);
+      return;
+    }
+
+    // The tail-first reveal mounts older rows in chunks; re-run once the target's chunk lands.
+    // The automatic reveal may have paused above the target, so ask it to reach the target. A
+    // target below a detached slice re-centers the slice on it.
+    if (!isInSlice(targetIndex, revealFromIndex, revealToIndex)) {
+      revealThrough(targetIndex);
       return;
     }
 
@@ -686,13 +918,20 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     targetElement.scrollIntoView({ behavior: "smooth", block: "center" });
     setPendingTimelineReveal(null);
   }, [
+    autoScroll,
     bashOutputGroupInfos,
     contentRef,
     deferredMessages,
+    expandBashGroup,
     expandedBashGroups,
     operationalBundleExpansionOverrides,
     operationalBundleInfos,
     pendingTimelineReveal,
+    revealFromIndex,
+    revealThrough,
+    revealToIndex,
+    setOperationalBundleExpanded,
+    setWorkBundleExpanded,
     workBundleExpansionOverrides,
     workBundleInfos,
     workspaceId,
@@ -739,52 +978,66 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     [handleScrollContainerKeyDown, isComposerDockEvent]
   );
 
-  const handleJumpToBottom = jumpToBottom;
+  const handleJumpToBottom = useCallback(
+    () => jumpToLiveTail(isTranscriptDetached, resetToLatest, jumpToBottom),
+    [isTranscriptDetached, resetToLatest, jumpToBottom]
+  );
 
   // Handler to navigate (scroll) to a specific message by historyId
   const handleNavigateToMessage = useCallback(
     (historyId: string) => {
       // Disable auto-scroll so the navigation isn't undone by streaming content
       disableAutoScroll();
-      requestAnimationFrame(() => {
-        const scrollContainer = contentRef.current;
-        if (!scrollContainer) return;
-        findTranscriptMessageElement(scrollContainer, historyId)?.scrollIntoView({
-          behavior: "smooth",
-          block: "center",
-        });
-      });
+      setPendingScrollTarget({ workspaceId, historyId });
     },
-    [contentRef, disableAutoScroll]
+    [disableAutoScroll, workspaceId]
   );
 
-  // Precompute per-user navigation objects so MessageRenderer rows receive stable prop
-  // references across non-message updates (usage bumps, stats updates, etc.).
-  const userMessageNavigationByHistoryId = useMemo(() => {
-    const userHistoryIds: string[] = [];
-    for (const message of deferredMessages) {
-      // Monitor wake events should not interrupt navigation between human prompts.
-      if (message.type === "user" && message.bashMonitorWake == null) {
-        userHistoryIds.push(message.historyId);
-      }
+  useEffect(() => {
+    if (pendingScrollTarget === null) return;
+    // Navigation disables auto-scroll first; the tail being pinned again (jump to bottom, a
+    // send, dismissing an edit, scrolling back down) supersedes a navigation still waiting
+    // for its row to mount, so the chunk mounting later cannot scroll away from the tail.
+    if (pendingScrollTarget.workspaceId !== workspaceId || autoScroll) {
+      setPendingScrollTarget(null);
+      return;
     }
-
-    if (userHistoryIds.length < 2) {
-      return null;
+    const scrollContainer = contentRef.current;
+    const target = scrollContainer
+      ? findTranscriptMessageElement(scrollContainer, pendingScrollTarget.historyId)
+      : undefined;
+    if (target) {
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      setPendingScrollTarget(null);
+      return;
     }
-
-    const navigationByHistoryId = new Map<string, UserMessageNavigation>();
-    for (let index = 0; index < userHistoryIds.length; index++) {
-      navigationByHistoryId.set(userHistoryIds[index], {
-        prevUserMessageId: index > 0 ? userHistoryIds[index - 1] : undefined,
-        nextUserMessageId:
-          index < userHistoryIds.length - 1 ? userHistoryIds[index + 1] : undefined,
-        onNavigate: handleNavigateToMessage,
-      });
+    // Not in the DOM: keep waiting only while the row exists below the reveal boundary, and
+    // ask the reveal to reach it (the automatic reveal may have paused above it). A row that
+    // is gone, or eligible but hidden inside a collapsed bundle, is dropped (the pre-reveal
+    // behavior for an unmounted target was a silent no-op too).
+    const targetIndex = deferredMessages.findIndex(
+      (message) => "historyId" in message && message.historyId === pendingScrollTarget.historyId
+    );
+    if (targetIndex === -1 || isInSlice(targetIndex, revealFromIndex, revealToIndex)) {
+      setPendingScrollTarget(null);
+      return;
     }
+    revealThrough(targetIndex);
+  }, [
+    autoScroll,
+    contentRef,
+    deferredMessages,
+    pendingScrollTarget,
+    revealFromIndex,
+    revealThrough,
+    revealToIndex,
+    workspaceId,
+  ]);
 
-    return navigationByHistoryId;
-  }, [deferredMessages, handleNavigateToMessage]);
+  const userMessageNavigationByHistoryId = useUserMessageNavigation({
+    messages: deferredMessages,
+    onNavigateToMessage: handleNavigateToMessage,
+  });
 
   // ChatInput API for focus management
   const chatInputAPI = useRef<ChatInputAPI | null>(null);
@@ -809,15 +1062,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
 
   useEffect(() => {
     setEditingState({ workspaceId, message: undefined });
-    setExpandedBashGroups(new Set());
-    setWorkBundleExpansionOverrides(new Map());
-    setOperationalBundleExpansionOverrides(new Map());
     setPendingTimelineReveal(null);
   }, [workspaceId]);
 
-  const handleChatInputReady = useCallback((api: ChatInputAPI) => {
+  const handleChatInputReady = (api: ChatInputAPI) => {
     chatInputAPI.current = api;
-  }, []);
+    props.onChatInputReady?.(api);
+  };
 
   // Handler for review notes from Code Review tab - adds review (starts attached)
   // Depend only on addReview (not whole reviews object) to keep callback stable
@@ -828,8 +1079,15 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       for (const id of ids) {
         checkReview(id);
       }
+      // These notes were just sent: persist them as checked now rather than after the store's
+      // flush debounce, so a crash right after the send cannot bring them back as attached.
+      getReviewStateStore()
+        .flush(workspaceId)
+        .catch((error: unknown) => {
+          console.warn("Failed to persist sent review notes; the store keeps retrying:", error);
+        });
     },
-    [checkReview]
+    [checkReview, workspaceId]
   );
   const handleReviewNote = useCallback(
     (data: ReviewNoteData) => {
@@ -840,12 +1098,13 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   );
 
   // Handlers for editing messages
-  const handleEditUserMessage = useCallback(
-    (message: EditingMessageState) => {
-      setEditingMessage(message);
-    },
-    [setEditingMessage]
-  );
+  const handleEditUserMessage = (message: EditingMessageState) => {
+    // Rows hide their Edit affordance while hydrating; this covers a click racing catch-up
+    // being lost (workspace switch, reconnect) so the composer never enters edit mode
+    // against a transcript that is not a verified copy of history.
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
+    beginEditingMessage(message);
+  };
 
   const restoreQueuedDraft = useCallback(
     async (queuedMessage: QueuedMessageData) => {
@@ -853,17 +1112,19 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       if (!inputApi) return;
 
       await api?.workspace.clearQueue({ workspaceId });
-      inputApi.restoreDraft(normalizeQueuedMessage(queuedMessage));
+      inputApi.restoreDraft(normalizeQueuedMessage(queuedMessage), {
+        retainedSendIds: queuedMessage.sendIds,
+      });
     },
     [api, workspaceId]
   );
 
-  const handleEditQueuedMessage = useCallback(async () => {
-    const queuedMessage = workspaceState?.queuedMessage;
+  const handleEditQueuedMessage = async () => {
+    const queuedMessage = queuedMessageToEdit(workspaceState?.queuedMessage, editingMessage);
     if (!queuedMessage) return;
 
     await restoreQueuedDraft(queuedMessage);
-  }, [restoreQueuedDraft, workspaceState?.queuedMessage]);
+  };
 
   const sendQueuedImmediatelyInFlightRef = useRef<string | null>(null);
 
@@ -889,7 +1150,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   };
 
   // Handler for sending queued message immediately (interrupt + send)
-  const handleSendQueuedImmediately = useCallback(async () => {
+  const handleSendQueuedImmediately = async () => {
     const queuedMessage = workspaceState?.queuedMessage;
     if (
       !api ||
@@ -909,29 +1170,32 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
         sendQueuedImmediatelyInFlightRef.current = null;
       }
     };
-    try {
-      // Set "interrupting" state immediately so UI shows "interrupting..." without flash.
-      storeRaw.setInterrupting(workspaceId);
-      const interruptResult = await api.workspace.interruptStream({
-        workspaceId,
-        options: { sendQueuedImmediately: true },
-      });
-      if (!interruptResult.success) {
+    const interruptResult = await runWithCatch(
+      () => {
+        // Set "interrupting" state immediately so UI shows "interrupting..." without flash.
+        storeRaw.setInterrupting(workspaceId);
+        return api.workspace.interruptStream({
+          workspaceId,
+          options: { sendQueuedImmediately: true },
+        });
+      },
+      (error) => {
         clearInFlightGuardIfCurrent();
-        throw new Error(interruptResult.error);
+        throw error;
       }
-    } catch (error) {
+    );
+    if (!interruptResult.success) {
       clearInFlightGuardIfCurrent();
-      throw error;
+      throw new Error(interruptResult.error);
     }
-  }, [api, workspaceId, workspaceState?.queuedMessage, workspaceState?.canInterrupt, storeRaw]);
+  };
 
   const handleQueuedDispatchModeChange = async (queueDispatchMode: QueueDispatchMode) => {
     clearQueuedActionError();
-    if (!api) {
+    if (!liveApi) {
       throw new Error("Workspace API is unavailable.");
     }
-    const result = await api.workspace.setQueuedMessageDispatchMode({
+    const result = await liveApi.workspace.setQueuedMessageDispatchMode({
       workspaceId,
       queueDispatchMode,
     });
@@ -943,26 +1207,31 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
   };
 
-  const handleCancelCompactionFromBarrier = useCallback(() => {
+  const handleCancelCompactionFromBarrier = () => {
     if (!api || !aggregator) {
       return;
     }
 
-    void cancelCompaction(api, workspaceId, aggregator, setEditingMessage);
-  }, [api, workspaceId, aggregator, setEditingMessage]);
+    void cancelCompaction(api, workspaceId, aggregator, startEditingMessage);
+  };
 
-  const handleEditLastUserMessage = useCallback(async () => {
+  const handleEditLastUserMessage = async () => {
     if (transcriptOnly) return;
 
     const current = workspaceStateRef.current;
     if (!current) return;
 
     if (current.queuedMessage) {
+      // A queued artifact send is the artifact's message, not a draft (its card has no Edit):
+      // restoring it would cancel the send and put its model-facing payload in the composer.
+      if (current.queuedMessage.artifactInteraction != null) return;
       await restoreQueuedDraft(current.queuedMessage);
       return;
     }
 
-    // Otherwise, edit last user message
+    // Otherwise, edit last user message. `current.messages` may be a cached/provisional view
+    // while the replay is still running, so ArrowUp must not enter edit mode until caught up.
+    if (!isTranscriptMutationAllowed(workspaceId)) return;
     const transformedMessages = mergeConsecutiveStreamErrors(current.messages);
     const lastUserMessage = [...transformedMessages]
       .reverse()
@@ -975,27 +1244,25 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       return;
     }
 
-    setEditingMessage(buildEditingStateFromDisplayed(lastUserMessage));
+    if (!beginEditingMessage(buildEditingStateFromDisplayed(lastUserMessage))) return;
     disableAutoScroll(); // Show jump-to-bottom indicator
 
-    // Scroll to the message being edited
-    requestAnimationFrame(() => {
-      const scrollContainer = contentRef.current;
-      if (!scrollContainer) return;
-      findTranscriptMessageElement(scrollContainer, lastUserMessage.historyId)?.scrollIntoView({
-        behavior: "smooth",
-        block: "center",
-      });
-    });
-  }, [restoreQueuedDraft, contentRef, disableAutoScroll, setEditingMessage, transcriptOnly]);
+    // Scroll to the message being edited once it is mounted (see pendingScrollTarget).
+    setPendingScrollTarget({ workspaceId, historyId: lastUserMessage.historyId });
+  };
 
-  const handleEditLastUserMessageClick = useCallback(() => {
+  const handleEditLastUserMessageClick = () => {
     void handleEditLastUserMessage();
-  }, [handleEditLastUserMessage]);
+  };
 
   const handleCancelEdit = useCallback(() => {
     setEditingMessage(undefined);
-  }, [setEditingMessage]);
+    // handleEditLastUserMessage disabled auto-scroll to keep the view centered
+    // on the edited message. Dismissing the edit hands scroll ownership back to
+    // the transcript tail; without this the view stays scrolled up until the
+    // user manually returns to the bottom.
+    handleJumpToBottom();
+  }, [handleJumpToBottom, setEditingMessage]);
 
   const handleMessageSendStarted = useCallback(() => {
     // Re-arm and pin before the send request crosses the IPC boundary. Waiting for
@@ -1005,34 +1272,34 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     handleJumpToBottom();
   }, [handleJumpToBottom]);
 
-  const handleMessageSent = useCallback(
-    (dispatchMode: QueueDispatchMode = "tool-end") => {
-      // Only background foreground bashes for "tool-end" sends (Enter).
-      // "turn-end" sends (Ctrl/Cmd+Enter) let the stream finish naturally —
-      // backgrounding would disrupt a foreground bash the user wants to complete.
-      if (dispatchMode === "tool-end") {
-        autoBackgroundOnSend();
-      }
-
-      // Slash-command send paths still report after backend success; keep this
-      // harmless duplicate pin so those paths also re-arm auto-scroll.
-      handleJumpToBottom();
-    },
-    [autoBackgroundOnSend, handleJumpToBottom]
-  );
-
   const handleClearHistory = useCallback(
     async (percentage = 1.0) => {
+      // Clearing acts on the transcript the user sees. The only caller is the /clear slash
+      // command, whose phase already turns thrown errors into a restore + error toast.
+      if (!isTranscriptMutationAllowed(workspaceId)) {
+        throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+      }
       // Re-arm the tail before clearing so the empty/starting state owns the bottom.
       handleJumpToBottom();
 
       // Truncate history in backend
-      await api?.workspace.truncateHistory({ workspaceId, percentage });
+      const result = await api?.workspace.truncateHistory({ workspaceId, percentage });
+      // A partial failure (history already deleted but durable cleanup —
+      // e.g. sandbox kernel invalidation — failed) carries the only warning
+      // that cleared state may reappear after a restart. Throw so callers
+      // (slash command, dialogs) surface it instead of reporting success.
+      if (result && !result.success) {
+        throw new Error(result.error);
+      }
     },
     [workspaceId, handleJumpToBottom, api]
   );
 
   const handleResetContext = useCallback(async (): Promise<"reset" | "noop"> => {
+    // Same contract as handleClearHistory: the /reset (soft clear) phase surfaces the throw.
+    if (!isTranscriptMutationAllowed(workspaceId)) {
+      throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+    }
     handleJumpToBottom();
 
     const result = await api?.workspace.resetContext({ workspaceId });
@@ -1058,120 +1325,67 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Reset transcript scroll ownership when switching workspaces. `jumpToBottom` both re-arms
   // the ref-backed auto-scroll flag and pins any cached rows before paint; if rows are still
   // hydrating, the next content resize owns the tail instead of showing the prior workspace's state.
+  // The stable `jumpToBottom`, not `handleJumpToBottom`: a switch restarts the reveal at the latest
+  // rows anyway, and an effect keyed on `handleJumpToBottom` would also re-run (and relock) on
+  // every render where its identity changes, or whenever the slice detaches (#6678 review).
   useLayoutEffect(() => {
-    handleJumpToBottom();
-  }, [hasLoadedTranscriptRows, handleJumpToBottom, workspaceId]);
+    jumpToBottom();
+  }, [hasLoadedTranscriptRows, jumpToBottom, workspaceId]);
 
-  // Compute showRetryBarrier once for both keybinds and UI.
-  // Track if last message was interrupted or errored (for RetryBarrier).
-  const interruption = workspaceState
-    ? getInterruptionContext(
-        workspaceState.messages,
-        workspaceState.pendingStreamStartTime,
-        workspaceState.runtimeStatus,
-        workspaceState.lastAbortReason
-      )
-    : null;
-
-  const hasInterruptedStream = interruption?.hasInterruptedStream ?? false;
   const shouldShowStreamingBarrier = isStreamStarting || canInterrupt;
   // An armed background bash monitor means the turn ended but the agent will be
   // woken on matching output. Keep the barrier mounted so StreamingBarrier can
   // show its "waiting on monitor" state instead of the chat looking idle.
   const shouldMountStreamingBarrier = shouldShowStreamingBarrier || activeBashMonitorCount > 0;
-  // Keep rendering cached transcript rows during incremental catch-up so workspace switches
-  // feel stable, but active stream-start/interrupt states should keep their barrier visible
-  // instead of flashing full-height transcript placeholders. The skeleton additionally holds
-  // until decoration data sources are known so the transcript and all composer decorations
-  // reveal in ONE commit — see useChatViewDataReady for the contract.
-  const { showHydrationPlaceholder: showTranscriptHydrationPlaceholder, revealDecorations } =
-    computeChatViewReveal({
-      isHydratingTranscript,
-      chatViewDataReady,
-      hasRenderableMessages: deferredMessages.length > 0,
-      // Any mounted barrier (including waiting-on-monitor) counts: a cleared
-      // transcript with an armed monitor must not flash placeholders under it.
-      shouldShowStreamingBarrier: shouldMountStreamingBarrier,
-    });
   const showEmptyTranscriptPlaceholder =
     deferredMessages.length === 0 &&
     !showTranscriptHydrationPlaceholder &&
     !shouldMountStreamingBarrier;
-  const showRetryBarrier =
-    !isHydratingTranscript && !shouldShowStreamingBarrier && hasInterruptedStream;
-  const isAutoRetryActive =
-    workspaceState.autoRetryStatus?.type === "auto-retry-scheduled" ||
-    workspaceState.autoRetryStatus?.type === "auto-retry-starting";
-
-  const lastRetryCandidateMessage = getLastMainRetryCandidateMessage(workspaceState.messages);
-  const suppressRetryBarrier =
-    lastRetryCandidateMessage?.type === "stream-error" &&
-    lastRetryCandidateMessage.errorType === "context_exceeded";
-  const shouldMountRetryBarrier = !suppressRetryBarrier;
-  const showRetryBarrierUI = showRetryBarrier && !suppressRetryBarrier;
-
-  // Derive inline transcript chrome once so row rendering and layout pinning share the exact same
-  // visibility decision. This keeps late interrupted markers from sneaking in through a second code
-  // path after hydration or auto-retry state changes.
-  const interruptedBarrierMessageIds = new Set<string>();
-  for (const message of deferredMessages) {
-    if (
-      shouldShowInterruptedBarrier(message, {
-        isHydratingTranscript,
-        isAutoRetryActive,
-      })
-    ) {
-      interruptedBarrierMessageIds.add(message.id);
-    }
-  }
-  // A turn interrupted before its first token leaves the user message as the tail
-  // with no assistant row, so the loop above never marks it. Mark it here (subject
-  // to the same hydration/auto-retry/streaming suppression) so the divider still
-  // offers to continue. interruptedTailResumable/render both key off this set.
-  if (
-    !isHydratingTranscript &&
-    !isAutoRetryActive &&
-    !shouldShowStreamingBarrier &&
-    lastRetryCandidateMessage != null &&
-    isPreTokenInterruptedUserTurn(lastRetryCandidateMessage, workspaceState.lastAbortReason)
-  ) {
-    interruptedBarrierMessageIds.add(lastRetryCandidateMessage.id);
-  }
+  // Compute retry/interrupted chrome once for both keybinds and UI. Interruption and the retry
+  // candidate come from the latest rows; dividers are placed on the rendered (deferred) rows.
+  const {
+    lastRetryCandidateMessage,
+    shouldMountRetryBarrier,
+    showRetryBarrierUI,
+    interruptedBarrierMessageIds,
+    interruptedTailResumable,
+  } = getRetryBarrierDerivation({
+    messages: workspaceState.messages,
+    renderedMessages: deferredMessages,
+    pendingStreamStartTime: workspaceState.pendingStreamStartTime,
+    runtimeStatus: workspaceState.runtimeStatus,
+    lastAbortReason: workspaceState.lastAbortReason,
+    autoRetryStatus: workspaceState.autoRetryStatus,
+    isHydratingTranscript,
+    isTurnActive: shouldShowStreamingBarrier,
+    transcriptOnly,
+  });
 
   // Owned here so the click and keybind paths share one resume/error. resetKey is
   // the resume target, so error/spinner reset when the interrupted turn changes.
   const { resume: resumeInterruptedStreamAsync, error: resumeInterruptedError } = useResumeStream(
     workspaceId,
-    lastRetryCandidateMessage?.id
+    lastRetryCandidateMessage?.id,
+    workspaceState.messages
   );
   const resumeInterruptedStream = () => void resumeInterruptedStreamAsync();
-  // Resumable only on the writable tail and only when RetryBarrier is suppressed
-  // (user-aborted case). When RetryBarrier is visible, its button owns resume.
-  const interruptedTailResumable =
-    !transcriptOnly &&
-    !showRetryBarrierUI &&
-    lastRetryCandidateMessage != null &&
-    interruptedBarrierMessageIds.has(lastRetryCandidateMessage.id);
+  // Live status belongs beside the input, below async decorations: neither history
+  // reveal nor banners arriving should bump the label and Stop across the screen.
+  const turnStatus = shouldMountStreamingBarrier ? (
+    <ChatDockSurface>
+      <StreamingBarrier
+        workspaceId={workspaceId}
+        vimEnabled={vimEnabled}
+        onCancelCompaction={handleCancelCompactionFromBarrier}
+      />
+    </ChatDockSurface>
+  ) : null;
   const transcriptTailItems: TranscriptTailStackItem[] = [];
   if (shouldMountRetryBarrier) {
     transcriptTailItems.push(
       createTranscriptTailStackItem({
         key: "retry-barrier",
         node: <RetryBarrier workspaceId={workspaceId} visible={showRetryBarrierUI} />,
-      })
-    );
-  }
-  if (shouldMountStreamingBarrier) {
-    transcriptTailItems.push(
-      createTranscriptTailStackItem({
-        key: "streaming-barrier",
-        node: (
-          <StreamingBarrier
-            workspaceId={workspaceId}
-            vimEnabled={vimEnabled}
-            onCancelCompaction={handleCancelCompactionFromBarrier}
-          />
-        ),
       })
     );
   }
@@ -1197,15 +1411,88 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       })
     );
   }
+  // Rows a paused reveal mounts on request land above the reading position (#4869). Native
+  // scroll anchoring keeps that position only while scrollTop > 0, and the Load-older button
+  // sits at scrollTop 0, so the first mounted row's viewport offset is pinned explicitly from
+  // the request until the reveal settles again. Offsets are viewport-relative and measured after
+  // layout, so a native anchoring adjustment is never applied twice.
+  const loadOlderAnchorRef = useRef<{
+    element: HTMLElement;
+    top: number;
+    /** scrollTop after the last correction; a scroll away from it moves `top` (see below). */
+    scrollTop: number;
+  } | null>(null);
+  useLayoutEffect(() => {
+    const anchor = loadOlderAnchorRef.current;
+    const scrollContainer = contentRef.current;
+    if (anchor === null || scrollContainer === null) return;
+    if (anchor.element.isConnected) {
+      const delta = anchor.element.getBoundingClientRect().top - anchor.top;
+      if (delta !== 0) scrollContainer.scrollTop += delta;
+      anchor.scrollTop = scrollContainer.scrollTop;
+    }
+    if (revealSettled || !anchor.element.isConnected) loadOlderAnchorRef.current = null;
+  }, [contentRef, revealFromIndex, revealSettled, shouldRenderLoadOlderMessagesButton]);
+  // Show newer unmounts rows above the reader. Chromium's native scroll anchoring holds the read row
+  // (DetachedPastCap); the explicit pin of the last mounted row does not depend on it.
+  const handleShowNewerMessages = () => {
+    releaseBottomLock({ autoScroll, disableAutoScroll });
+    loadOlderAnchorRef.current = lastRowAnchor(contentRef.current);
+    revealNewer();
+  };
+  const handleTranscriptScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    handleScroll(event);
+    // The reader scrolling while the requested rows mount moves the position to keep, so the
+    // next correction never undoes it. Shifted by the scroll distance rather than re-measured,
+    // so a correction's sub-pixel rounding never accumulates across chunks.
+    const anchor = loadOlderAnchorRef.current;
+    if (anchor !== null) {
+      const scrollTop = event.currentTarget.scrollTop;
+      anchor.top -= scrollTop - anchor.scrollTop;
+      anchor.scrollTop = scrollTop;
+    }
+  };
+
   const handleLoadOlderHistory = useCallback(() => {
-    if (!shouldRenderLoadOlderMessagesButton || loadingOlderHistory) {
+    if (!shouldRenderLoadOlderMessagesButton) {
+      return;
+    }
+    // Already-loaded rows above a paused reveal mount before any older server page is fetched.
+    // Requests made while those rows mount are ignored (the button is gone until the reveal
+    // pauses again), like presses while a server page loads.
+    if (isRevealPaused) {
+      // While locked to the bottom the sentinel keeps the tail in place instead.
+      const firstRow = autoScroll
+        ? null
+        : contentRef.current?.querySelector<HTMLElement>("[data-message-id]");
+      loadOlderAnchorRef.current =
+        firstRow && contentRef.current
+          ? {
+              element: firstRow,
+              top: firstRow.getBoundingClientRect().top,
+              scrollTop: contentRef.current.scrollTop,
+            }
+          : null;
+      revealMore();
+      return;
+    }
+    if (loadingOlderHistory) {
       return;
     }
 
     storeRaw.loadOlderHistory(workspaceId).catch((error) => {
       console.warn(`[ChatPane] Failed to load older history for ${workspaceId}:`, error);
     });
-  }, [loadingOlderHistory, shouldRenderLoadOlderMessagesButton, storeRaw, workspaceId]);
+  }, [
+    autoScroll,
+    contentRef,
+    isRevealPaused,
+    loadingOlderHistory,
+    revealMore,
+    shouldRenderLoadOlderMessagesButton,
+    storeRaw,
+    workspaceId,
+  ]);
 
   // Handle keyboard shortcuts (using optional refs that are safe even if not initialized)
   useAIViewKeybinds({
@@ -1213,14 +1500,17 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     // Allow interrupt keybind even while waiting for stream-start ("starting...").
     canInterrupt:
       (workspaceState?.canInterrupt ?? false) || (workspaceState?.isStreamStarting ?? false),
-    showRetryBarrier,
+    // The visible barrier, not the raw interruption: a context_exceeded error hides the barrier,
+    // and Esc must not send a Stop (persisting an auto-retry opt-out) for nothing visible (#5111).
+    showRetryBarrier: showRetryBarrierUI,
     chatInputAPI,
     jumpToBottom: handleJumpToBottom,
     loadOlderHistory: shouldRenderLoadOlderMessagesButton ? handleLoadOlderHistory : null,
+    showNewerMessages: isTranscriptDetached ? handleShowNewerMessages : null,
     handleOpenTerminal: onOpenTerminal,
     handleOpenInEditor,
     aggregator,
-    setEditingMessage,
+    setEditingMessage: startEditingMessage,
     vimEnabled,
     canResumeInterruptedStream: interruptedTailResumable,
     resumeInterruptedStream,
@@ -1230,6 +1520,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   // Must be before early return to satisfy React Hooks rules
   useEffect(() => {
     if (!workspaceState || !editingMessage) return;
+    // Conflict recovery re-reads the transcript (a full replay empties the aggregator first,
+    // a pre-window range discards cached pages); the refresh outcome decides whether the
+    // edited row is gone, not the transient absence of its row.
+    if (editingMessage.preconditionInvalidated === true) return;
 
     const transformedMessages = mergeConsecutiveStreamErrors(workspaceState.messages);
     const editCutoffHistoryId = transformedMessages.find(
@@ -1278,36 +1572,20 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     }
   }
 
-  const setWorkBundleExpanded = (key: string, expanded: boolean) => {
-    setWorkBundleExpansionOverrides((prev) => new Map(prev).set(key, expanded));
-  };
-
-  const setOperationalBundleExpanded = (key: string, expanded: boolean) => {
-    setOperationalBundleExpansionOverrides((prev) => new Map(prev).set(key, expanded));
-  };
-
-  const toggleBashOutputGroup = (groupKey: string) => {
-    setExpandedBashGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupKey)) {
-        next.delete(groupKey);
-      } else {
-        next.add(groupKey);
-      }
-      return next;
-    });
-  };
-
   const renderMessageAtIndex = (
     message: DisplayedMessage,
     index: number,
     options: { key: string; className?: string }
   ): React.ReactNode => {
-    const bashOutputGroup = bashOutputGroupInfos[index];
-    const groupKey = bashOutputGroup ? deferredMessages[bashOutputGroup.firstIndex]?.id : undefined;
-    const isGroupExpanded = groupKey ? expandedBashGroups.has(groupKey) : false;
+    const rowProps = getTranscriptRowProps({
+      derivations: transcriptRowDerivations,
+      userMessageNavigationByHistoryId,
+      message,
+      index,
+    });
+    const { bashOutputGroup, bashGroupKey } = rowProps;
 
-    if (bashOutputGroup?.position === "middle" && !isGroupExpanded) {
+    if (rowProps.hidden) {
       return null;
     }
 
@@ -1318,17 +1596,17 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
       message.type !== "compaction-boundary" &&
       message.historyId === editCutoffHistoryId;
 
-    const taskReportLinkingForMessage =
-      message.type === "tool" && (message.toolName === "task" || message.toolName === "task_await")
-        ? taskReportLinking
-        : undefined;
-
     const messageNode = (
       <MessageRenderer
         message={message}
-        onEditUserMessage={transcriptOnly ? undefined : handleEditUserMessage}
+        // No onEdit → UserMessage omits its Edit button; provisional (not caught-up) rows
+        // must not offer an edit whose truncation point the backend may not agree with.
+        onEditUserMessage={
+          transcriptOnly || !isTranscriptCaughtUp ? undefined : handleEditUserMessage
+        }
         workspaceId={workspaceId}
         isCompacting={isCompacting}
+        editSendPending={editSendPending}
         onReviewNote={handleReviewNote}
         isLatestProposePlan={
           message.type === "tool" &&
@@ -1336,24 +1614,20 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
           message.id === latestProposePlanId
         }
         bashOutputGroup={bashOutputGroup}
-        taskReportLinking={taskReportLinkingForMessage}
-        userMessageNavigation={
-          message.type === "user"
-            ? userMessageNavigationByHistoryId?.get(message.historyId)
-            : undefined
-        }
+        taskReportLinking={rowProps.taskReportLinking}
+        userMessageNavigation={rowProps.userMessageNavigation}
       />
     );
 
     return (
       <React.Fragment key={options.key}>
         {options.className ? <div className={options.className}>{messageNode}</div> : messageNode}
-        {bashOutputGroup?.position === "first" && groupKey && (
+        {bashOutputGroup?.position === "first" && bashGroupKey && (
           <BashOutputCollapsedIndicator
             processId={bashOutputGroup.processId}
             collapsedCount={bashOutputGroup.collapsedCount}
-            isExpanded={isGroupExpanded}
-            onToggle={() => toggleBashOutputGroup(groupKey)}
+            isExpanded={rowProps.isBashGroupExpanded}
+            onToggle={() => transcriptRowDerivations.toggleBashOutputGroup(bashGroupKey)}
           />
         )}
         {isAtCutoff && <EditCutoffBarrier />}
@@ -1375,7 +1649,21 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             The composer dock is IN-FLOW scroll content (sticky to the scrollport
             bottom), so this region — and therefore the scrollport's clientHeight —
             never resizes when the composer grows or shrinks. */}
-        <div className="mobile-header-spacer relative flex-1 overflow-hidden">
+        <div
+          className={cn(
+            "relative flex-1 overflow-hidden",
+            props.embedded !== true && "mobile-header-spacer"
+          )}
+        >
+          {/* Before the scrollport, which holds the composer dock, so Tab reaches the page
+              before the composer below it. */}
+          <AgentInterfaceStatusView
+            key={workspaceId}
+            workspaceId={workspaceId}
+            view={props.agentInterfaceView}
+            dockRef={composerDockRef}
+            composerApiRef={chatInputAPI}
+          />
           <div
             ref={contentRef}
             onWheel={handleTranscriptWheel}
@@ -1384,14 +1672,16 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             onMouseUp={handleScrollContainerMouseUp}
             onTouchMove={handleTranscriptTouchMove}
             onKeyDown={handleTranscriptKeyDown}
-            onScroll={handleScroll}
+            onScroll={handleTranscriptScroll}
             onContextMenu={transcriptContextMenu.onContextMenu}
-            tabIndex={0}
+            tabIndex={transcriptTabIndex(showStatusView)}
             data-testid="message-window"
             // Settled marker for perf tests and story play helpers: includes
-            // decoration data readiness so waiting on it observes the chat
-            // view's final (post-reveal) layout.
-            data-loaded={!loading && !isHydratingTranscript && chatViewDataReady}
+            // decoration data readiness AND the tail-first reveal having settled
+            // (fully revealed or paused at the automatic budget), so waiting on it
+            // observes the chat view's final layout rather than a tail whose
+            // earlier chunks are still committing.
+            data-loaded={chatViewLoaded}
             // Browser scroll anchoring stays ENABLED on the scrollport; the
             // overflow-anchor policy lives on the inner content (opt rows out while
             // locked so the bottom sentinel is the sole anchor). No bottom padding:
@@ -1403,7 +1693,14 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             // for visibility — using a container query rather than a viewport media
             // query means sidebars opening/closing correctly hide the TOC even when
             // the viewport width is unchanged. See `.plan-toc-aside` in globals.css.
-            className="@container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto px-[15px] pt-[15px] leading-[1.5] break-words whitespace-pre-wrap"
+            // `--chat-reserved-inline-end`: room a layout floats over the chat's right edge (the
+            // collapsed right sidebar's overview card, see globals.css). Padding by it centers the
+            // column, and the composer under it, in the space left of the overlay, so the column
+            // sits as far from the overlay as from the left edge. The transcript container query
+            // measures the content box, so the plan TOC sees the narrower gutters too.
+            // `chat-reserved-inline-end-scrollport`: globals.css eases the padding with the
+            // sidebar's width slide.
+            className="chat-reserved-inline-end-scrollport @container/transcript flex h-full flex-col overflow-x-hidden overflow-y-auto pt-[15px] pr-[calc(15px+var(--chat-reserved-inline-end,0px))] pl-[15px] leading-[1.5] break-words whitespace-pre-wrap"
           >
             <div
               // While locked, opt the whole transcript subtree out of scroll
@@ -1411,7 +1708,9 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
               // sentinel below — native anchoring then pins the bottom on append.
               style={autoScroll ? TRANSCRIPT_CONTENT_NO_ANCHOR_STYLE : undefined}
               role="log"
-              aria-live={canInterrupt ? "polite" : "off"}
+              // Live only once the historical reveal has settled: chunks of replayed history
+              // mounting during a stream would otherwise be announced as fresh output.
+              aria-live={canInterrupt && revealSettled ? "polite" : "off"}
               aria-busy={canInterrupt || isHydratingTranscript}
               aria-label="Conversation transcript"
               className={cn(
@@ -1421,20 +1720,21 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // overlap content or get clipped by `overflow-x-hidden`.
                 // `w-full` is required in the centered mode because auto cross-axis
                 // margins disable flex-item stretch.
-                chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-4xl mx-auto w-full",
-                // `flex-1` pushes the dock to the scrollport bottom for short
-                // transcripts; `pb-[15px]` keeps the original gap between the last
-                // message and the composer.
-                "flex-1 pb-[15px]",
+                chatTranscriptFullWidth ? "w-full" : "plan-toc-aware max-w-chat mx-auto w-full",
+                // Push the dock to the bottom for short transcripts without reserving
+                // loading space: cached replay overlays the dock edge, not transcript rows.
+                "flex-1",
                 // Only the empty/centered placeholder fills height (as a flex column
                 // so the placeholder's flex-1 centering works). The hydration
                 // skeleton renders in normal top-aligned transcript flow so it sits
                 // where real messages will, avoiding a jump when hydration completes.
-                showEmptyTranscriptPlaceholder && "flex flex-col"
+                showEmptyTranscriptPlaceholder && "flex flex-col",
+                // Under the status page: hidden but laid out, so its scroll position survives.
+                { invisible: showStatusView }
               )}
             >
               {showTranscriptHydrationPlaceholder ? (
-                <TranscriptHydrationSkeleton />
+                <TranscriptHydrationSkeleton workspaceId={workspaceId} />
               ) : showEmptyTranscriptPlaceholder ? (
                 <div className="text-placeholder flex h-full flex-1 flex-col items-center justify-center text-center [&_h3]:m-0 [&_h3]:mb-2.5 [&_h3]:text-base [&_h3]:font-medium [&_p]:m-0 [&_p]:text-[13px]">
                   <h3>No Messages Yet</h3>
@@ -1445,7 +1745,7 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       <span>
                         Tip: Add a{" "}
                         <code className="bg-inline-code-dark-bg text-code-string rounded-[3px] px-1.5 py-0.5 font-mono text-[11px]">
-                          .mux/init
+                          .xum/init
                         </code>{" "}
                         hook to your project to run setup commands
                         <br />
@@ -1456,7 +1756,10 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 </div>
               ) : (
                 <BashCollapsedSummaryModeProvider>
-                  <MessageListProvider value={messageListContextValue}>
+                  <MessageListProvider
+                    value={messageListContextValue}
+                    isTranscriptBackfilling={isTranscriptBackfillingDuringStream}
+                  >
                     {shouldRenderLoadOlderMessagesButton && (
                       <div className="flex justify-center py-3">
                         <TooltipIfPresent
@@ -1466,159 +1769,27 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                           <button
                             type="button"
                             onClick={handleLoadOlderHistory}
-                            disabled={loadingOlderHistory}
+                            disabled={isLoadingOlderHistoryPage}
                             className="text-muted hover:text-foreground text-xs underline underline-offset-2 transition-colors disabled:opacity-50"
                           >
-                            {loadingOlderHistory ? "Loading..." : "Load older messages"}
+                            {isLoadingOlderHistoryPage ? "Loading..." : "Load older messages"}
                           </button>
                         </TooltipIfPresent>
                       </div>
                     )}
-                    {deferredMessages.map((msg, index) => {
-                      const workBundle = workBundleInfos?.[index];
-                      const operationalBundle = workBundle
-                        ? undefined
-                        : operationalBundleInfos?.[index];
-                      const workBundleOverride = workBundle
-                        ? workBundleExpansionOverrides.get(workBundle.key)
-                        : undefined;
-                      const defaultRevealTailPlanWorkBundle =
-                        tailProposePlanWorkBundleKey !== null &&
-                        workBundle?.key === tailProposePlanWorkBundleKey;
-                      const isWorkBundleExpanded = workBundle
-                        ? (workBundleOverride ??
-                          (defaultRevealTailPlanWorkBundle || workBundle.defaultExpanded))
-                        : false;
-
-                      const keepCollapsedWorkBundleMemberVisible =
-                        msg.type === "user" ||
-                        (msg.type === "assistant" && workBundle?.position === "final");
-                      if (
-                        (workBundle?.position === "member" || workBundle?.position === "final") &&
-                        (isWorkBundleExpanded || !keepCollapsedWorkBundleMemberVisible)
-                      ) {
-                        return null;
-                      }
-
-                      const renderWorkBundle = workBundle?.position === "head";
-                      const renderMessageBeforeWorkBundle = renderWorkBundle && msg.type === "user";
-                      const renderMessageAfterWorkBundle = !renderWorkBundle;
-                      const operationalBundleOverride = operationalBundle
-                        ? operationalBundleExpansionOverrides.get(operationalBundle.key)
-                        : undefined;
-                      const defaultRevealTailPlanOperationalBundle =
-                        tailProposePlanOperationalBundleKey !== null &&
-                        operationalBundle?.key === tailProposePlanOperationalBundleKey;
-                      const isOperationalBundleExpanded = operationalBundle
-                        ? operationalBundle.summary.tone !== undefined ||
-                          (operationalBundleOverride ??
-                            (defaultRevealTailPlanOperationalBundle ||
-                              operationalBundle.defaultExpanded))
-                        : false;
-
-                      if (
-                        operationalBundle?.position === "member" &&
-                        !isOperationalBundleExpanded
-                      ) {
-                        return null;
-                      }
-
-                      const renderOperationalBundle = operationalBundle?.position === "head";
-                      const renderMessageAfterOperationalBundle =
-                        renderMessageAfterWorkBundle &&
-                        (!renderOperationalBundle || isOperationalBundleExpanded);
-
-                      return (
-                        <React.Fragment key={`${workspaceId}:${msg.id}`}>
-                          {renderMessageBeforeWorkBundle &&
-                            renderMessageAtIndex(msg, index, {
-                              key: `${workspaceId}:${msg.id}:message`,
-                            })}
-                          {renderWorkBundle && workBundle && (
-                            <WorkBundleMessage
-                              item={workBundle}
-                              expanded={isWorkBundleExpanded}
-                              onToggle={() =>
-                                setWorkBundleExpanded(workBundle.key, !isWorkBundleExpanded)
-                              }
-                            />
-                          )}
-                          {renderWorkBundle &&
-                            workBundle &&
-                            isWorkBundleExpanded &&
-                            workBundle.entries.map((entry) => {
-                              const nestedOperationalBundle =
-                                operationalBundleInfos?.[entry.originalIndex];
-                              const nestedOverride = nestedOperationalBundle
-                                ? operationalBundleExpansionOverrides.get(
-                                    nestedOperationalBundle.key
-                                  )
-                                : undefined;
-                              const defaultRevealTailPlanNestedBundle =
-                                tailProposePlanOperationalBundleKey !== null &&
-                                nestedOperationalBundle?.key ===
-                                  tailProposePlanOperationalBundleKey;
-                              const isNestedExpanded = nestedOperationalBundle
-                                ? nestedOperationalBundle.summary.tone !== undefined ||
-                                  (nestedOverride ??
-                                    (defaultRevealTailPlanNestedBundle ||
-                                      nestedOperationalBundle.defaultExpanded))
-                                : false;
-
-                              if (
-                                nestedOperationalBundle?.position === "member" &&
-                                !isNestedExpanded
-                              ) {
-                                return null;
-                              }
-
-                              const renderNestedBundle =
-                                nestedOperationalBundle?.position === "head";
-                              const renderNestedMessage = !renderNestedBundle || isNestedExpanded;
-
-                              return (
-                                <React.Fragment
-                                  key={`${workspaceId}:${workBundle.key}:${entry.message.id}`}
-                                >
-                                  {renderNestedBundle && nestedOperationalBundle && (
-                                    <OperationalBundleMessage
-                                      item={nestedOperationalBundle}
-                                      expanded={isNestedExpanded}
-                                      onToggle={() =>
-                                        setOperationalBundleExpanded(
-                                          nestedOperationalBundle.key,
-                                          !isNestedExpanded
-                                        )
-                                      }
-                                    />
-                                  )}
-                                  {renderNestedMessage &&
-                                    renderMessageAtIndex(entry.message, entry.originalIndex, {
-                                      key: `${workspaceId}:${workBundle.key}:${entry.message.id}:message`,
-                                    })}
-                                </React.Fragment>
-                              );
-                            })}
-                          {renderOperationalBundle && operationalBundle && (
-                            <OperationalBundleMessage
-                              item={operationalBundle}
-                              expanded={isOperationalBundleExpanded}
-                              onToggle={() =>
-                                setOperationalBundleExpanded(
-                                  operationalBundle.key,
-                                  !isOperationalBundleExpanded
-                                )
-                              }
-                            />
-                          )}
-                          {renderMessageAfterOperationalBundle &&
-                            renderMessageAtIndex(msg, index, {
-                              key: `${workspaceId}:${msg.id}:message`,
-                              className: operationalBundle ? "ml-4" : undefined,
-                            })}
-                        </React.Fragment>
-                      );
-                    })}
+                    <AskUserQuestionPlacementProvider value={askUserQuestionPlacement}>
+                      <TranscriptBundleRows
+                        workspaceId={workspaceId}
+                        messages={revealedMessages}
+                        indexOffset={revealFromIndex}
+                        bundles={transcriptBundles}
+                        renderMessageAtIndex={renderMessageAtIndex}
+                      />
+                    </AskUserQuestionPlacementProvider>
+                    <ShowNewerMessagesButton
+                      visible={isTranscriptDetached}
+                      onClick={handleShowNewerMessages}
+                    />
                   </MessageListProvider>
                 </BashCollapsedSummaryModeProvider>
               )}
@@ -1646,7 +1817,8 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   --composer-h channel to lag a frame behind and tear), while
                   `sticky` keeps the composer visually pinned over the transcript
                   when the user scrolls up. `mx-[-15px]` cancels the scrollport's
-                  horizontal padding so the dock stays full-bleed; `whitespace-normal
+                  gutter so the dock reaches the edges (short of any reserved overlay
+                  room on the right); `whitespace-normal
                   break-normal` reset the transcript text inheritance. clientHeight
                   of the scrollport never changes with dock height (send-flash
                   invariant). `bg-surface-primary` keeps transcript content from
@@ -1658,7 +1830,22 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   className="bg-surface-primary sticky bottom-0 z-10 mx-[-15px] break-normal whitespace-normal"
                   style={COMPOSER_DOCK_STYLE}
                 >
-                  {!autoScroll && (
+                  {/* An active turn does not mean history has loaded. Keep the dock shimmer
+                      visible alongside turn controls whenever the full skeleton is absent. */}
+                  {isHydratingTranscript && !showTranscriptHydrationPlaceholder && (
+                    <div
+                      role="status"
+                      data-testid="transcript-loading-status"
+                      className="pointer-events-none absolute inset-x-0 top-0 z-20 h-1 overflow-hidden"
+                    >
+                      <Skeleton
+                        variant="shimmer"
+                        className="bg-muted/30 block h-full w-full rounded-none"
+                      />
+                      <span className="sr-only">Loading messages...</span>
+                    </div>
+                  )}
+                  {offersJumpToBottom(autoScroll, isTranscriptDetached, showStatusView) && (
                     <button
                       onClick={handleJumpToBottom}
                       type="button"
@@ -1675,9 +1862,24 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                   {transcriptOnly ? (
                     // Transcript-only workspaces keep their historical transcript, but the whole
                     // composer surface is replaced with a single read-only notice.
-                    <TranscriptOnlyNoticePane />
+                    <>
+                      {turnStatus}
+                      {/* A failed cleanup can leave a flagged row whose checkout is gone (#4983). */}
+                      {meta?.delegatedCreationInterrupted === true && (
+                        <DelegatedCreationInterruptedBanner
+                          key={workspaceId}
+                          workspaceId={workspaceId}
+                          workspaceName={workspaceName}
+                        />
+                      )}
+                      <TranscriptOnlyNoticePane
+                        workspaceId={workspaceId}
+                        heldInputs={workspaceState?.heldInputs ?? NO_HELD_INPUTS}
+                      />
+                    </>
                   ) : (
                     <ChatInputPane
+                      turnStatus={turnStatus}
                       kind={meta?.kind}
                       workspaceId={workspaceId}
                       projectName={projectName}
@@ -1685,31 +1887,36 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       revealDecorations={revealDecorations}
                       isStreamStarting={isStreamStarting}
                       isTranscriptCaughtUp={isTranscriptCaughtUp}
+                      transcriptReplayFailed={transcriptReplayFailed}
                       runtimeConfig={runtimeConfig}
                       isPreStreamAgentTask={isPreStreamAgentTask}
+                      delegatedCreationInterrupted={meta?.delegatedCreationInterrupted === true}
                       preStreamAgentTaskStatus={
                         meta?.taskStatus === "starting" ? "starting" : "queued"
                       }
                       isCompacting={isCompacting}
                       shouldShowPinnedTodoList={shouldShowPinnedTodoList}
                       shouldShowReviewsBanner={shouldShowReviewsBanner}
-                      concurrentLocalStreamingWorkspaceName={concurrentLocalStreamingWorkspaceName}
                       canInterrupt={canInterrupt}
                       autoCompactionResult={autoCompactionResult}
                       shouldShowCompactionWarning={shouldShowCompactionWarning}
+                      rolloverEnabled={rolloverEnabled}
                       contextSwitchWarning={contextSwitchWarning}
                       onContextSwitchCompact={handleContextSwitchCompact}
                       onContextSwitchDismiss={handleContextSwitchDismiss}
                       onModelChange={handleModelChange}
                       onMessageSendStarted={handleMessageSendStarted}
-                      onMessageSent={handleMessageSent}
+                      onMessageSent={handleJumpToBottom}
                       onResetContext={handleResetContext}
                       onTruncateHistory={handleClearHistory}
                       editingMessage={editingMessage}
                       onCancelEdit={handleCancelEdit}
+                      onEditingMessageChange={updateEditingMessage}
                       onEditLastUserMessage={handleEditLastUserMessageClick}
+                      onEditSendPendingChange={handleEditSendPendingChange}
                       onChatInputReady={handleChatInputReady}
                       queuedMessage={workspaceState?.queuedMessage ?? null}
+                      heldInputs={workspaceState?.heldInputs ?? NO_HELD_INPUTS}
                       onEditQueuedMessage={() => void handleEditQueuedMessage()}
                       onSendQueuedImmediately={
                         workspaceState?.canInterrupt ? handleSendQueuedImmediately : undefined
@@ -1733,45 +1940,66 @@ const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   );
 };
 
-const TranscriptOnlyNoticePane: React.FC = () => {
+const TranscriptOnlyNoticePane: React.FC<{
+  workspaceId: string;
+  heldInputs: readonly HeldInputData[];
+}> = (props) => {
   const columnWidthClass = useChatDockColumnWidthClass();
 
   return (
-    <div
-      className={cn("bg-surface-primary border-border-light border-t pb-2", CHAT_DOCK_GUTTER_CLASS)}
-    >
-      <div className={cn("py-4", columnWidthClass)}>
-        <p role="note" className="text-muted text-sm leading-6">
-          {TRANSCRIPT_ONLY_NOTICE}
-        </p>
+    <div className="bg-surface-primary border-border-light border-t pb-2">
+      {/* #4770: held inputs (e.g. a queued follow-up Stop returned while archiving) would be
+          invisible here, since the composer that shows them is not rendered. Discard only: a
+          transcript-only workspace cannot run a turn. The oldest banner owns the Discard shortcut.
+          Outside the gutter below: HeldInput's ChatDockSurface applies its own. */}
+      {props.heldInputs.map((heldInput, index) => (
+        <HeldInput
+          key={heldInput.id}
+          workspaceId={props.workspaceId}
+          heldInput={heldInput}
+          isShortcutTarget={index === 0}
+          canSend={false}
+        />
+      ))}
+      <div className={CHAT_DOCK_GUTTER_CLASS}>
+        <div className={cn("py-4", columnWidthClass)}>
+          <p role="note" className="text-muted text-sm leading-6">
+            {TRANSCRIPT_ONLY_NOTICE}
+          </p>
+        </div>
       </div>
     </div>
   );
 };
 
 interface ChatInputPaneProps {
+  turnStatus: React.ReactNode;
   kind?: "scratch";
   workspaceId: string;
   projectName: string;
   workspaceName: string;
   /**
    * False until the chat view's one-commit reveal (transcript + decorations
-   * together). The decoration lane stays empty before that so a decoration
-   * can never mount after paint and shift the transcript.
+   * together). Async decorations stay hidden before that so they cannot
+   * mount after paint and shift the transcript.
    */
   revealDecorations: boolean;
   runtimeConfig?: RuntimeConfig;
   isPreStreamAgentTask: boolean;
+  /** The delegated task that created this workspace died before its setup finished (#4983). */
+  delegatedCreationInterrupted: boolean;
   preStreamAgentTaskStatus: "queued" | "starting";
   isCompacting: boolean;
   isStreamStarting: boolean;
   isTranscriptCaughtUp: boolean;
+  /** Last history replay failed; the store keeps cached rows and retries with backoff. */
+  transcriptReplayFailed: boolean;
   shouldShowPinnedTodoList: boolean;
   shouldShowReviewsBanner: boolean;
-  concurrentLocalStreamingWorkspaceName: string | null;
   canInterrupt: boolean;
   autoCompactionResult: ReturnType<typeof checkAutoCompaction>;
   shouldShowCompactionWarning: boolean;
+  rolloverEnabled: boolean;
   contextSwitchWarning: ContextSwitchWarning | null;
   onContextSwitchCompact: () => void;
   onContextSwitchDismiss: () => void;
@@ -1782,9 +2010,12 @@ interface ChatInputPaneProps {
   onTruncateHistory: (percentage?: number) => Promise<void>;
   editingMessage: EditingMessageState | undefined;
   onCancelEdit: () => void;
+  onEditingMessageChange: (update: (current: EditingMessageState) => EditingMessageState) => void;
   onEditLastUserMessage: () => void;
+  onEditSendPendingChange: (pending: boolean) => void;
   onChatInputReady: (api: ChatInputAPI) => void;
   queuedMessage: QueuedMessageData | null;
+  heldInputs: readonly HeldInputData[];
   onEditQueuedMessage: () => void;
   onSendQueuedImmediately: (() => Promise<void>) | undefined;
   onQueuedDispatchModeChange: (mode: QueueDispatchMode) => Promise<void>;
@@ -1797,6 +2028,7 @@ interface ChatInputPaneProps {
 
 const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   const { reviews } = props;
+  const storeRaw = useWorkspaceStoreRaw();
 
   // Keep optional banners/warnings on one shared lane so the seam right above the textarea is
   // owned by a single component boundary. That lets hydration reserve only the volatile
@@ -1819,12 +2051,49 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
           <QueuedMessage
             message={props.queuedMessage}
             onEdit={() => void props.onEditQueuedMessage()}
+            editBlocked={props.editingMessage !== undefined}
             onChangeDispatchMode={props.onQueuedDispatchModeChange}
             onActionError={props.onQueuedActionError}
             actionError={props.queuedActionError}
             onActionStart={props.onClearQueuedActionError}
             onSendImmediately={props.onSendQueuedImmediately}
           />
+        ),
+      })
+    );
+  }
+  // Refused queued messages sit next to the queued one: they are the user's unsent input too, and
+  // the backend replays them as synchronous chat state, so they bypass the hydration reveal gate.
+  for (const [index, heldInput] of props.heldInputs.entries()) {
+    decorationEntries.push(
+      createChatInputDecorationStackItem({
+        key: `held-input-${heldInput.id}`,
+        revealBeforeReady: true,
+        node: (
+          <HeldInput
+            workspaceId={props.workspaceId}
+            heldInput={heldInput}
+            // The composer's held-input shortcuts act on the oldest one (see ChatInput).
+            isShortcutTarget={index === 0}
+          />
+        ),
+      })
+    );
+  }
+  if (props.transcriptReplayFailed) {
+    decorationEntries.push(
+      createChatInputDecorationStackItem({
+        key: "transcript-replay-failed",
+        // Hydration never completes while replays keep failing, so this must bypass the
+        // decoration reveal gate like the queued message does. Plain text: the shimmer above
+        // already signals activity, and the closed send barrier explains itself on dispatch.
+        revealBeforeReady: true,
+        node: (
+          <ChatDockSurface>
+            <p role="status" className="text-muted py-1 text-xs">
+              {TRANSCRIPT_REPLAY_FAILED_BANNER}
+            </p>
+          </ChatDockSurface>
         ),
       })
     );
@@ -1838,6 +2107,7 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
             usagePercentage={props.autoCompactionResult.usagePercentage}
             thresholdPercentage={props.autoCompactionResult.thresholdPercentage}
             isStreaming={props.canInterrupt}
+            rolloverEnabled={props.rolloverEnabled}
           />
         </ChatDockSurface>
       ),
@@ -1857,36 +2127,33 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       ),
     });
   }
-  // User rationale: keeping this warning inside the transcript tail made every appended
-  // message insert above a live tail row, so bottom-lock had to correct after layout and
-  // visibly flashed while another local agent was active. Pin it with composer decorations
-  // instead; new transcript rows no longer move the warning.
-  if (props.concurrentLocalStreamingWorkspaceName) {
-    addDecorationEntry({
-      key: "concurrent-local-warning",
-      node: (
-        <ConcurrentLocalWarningDecoration
-          streamingWorkspaceName={props.concurrentLocalStreamingWorkspaceName}
-        />
-      ),
-    });
-  }
+  // Match Codex’s behavior: shared local checkouts intentionally have no concurrency warning.
 
   if (props.shouldShowPinnedTodoList) {
     addDecorationEntry({
       key: "pinned-todo-list",
-      node: <PinnedTodoList workspaceId={props.workspaceId} />,
+      // Keyed by workspace: ChatPane stays mounted across workspace switches, and the panel's
+      // scroll position (set to the current item on open) must not carry over to another chat.
+      node: <PinnedTodoList key={props.workspaceId} workspaceId={props.workspaceId} />,
     });
   }
   addDecorationEntry({
     key: "sub-agent-tasks",
     // Durable sub-agents live with their parent chat instead of relying only on nested sidebar rows.
     // The decoration is collapsed by default, so inactive task history is available without noise.
-    node: <SubAgentTasksDecoration workspaceId={props.workspaceId} />,
+    // Keyed by workspace: ChatPane stays mounted across workspace switches, and the decoration
+    // retains observed workflow-run refs that must never leak into another chat's tray.
+    node: <SubAgentTasksDecoration key={props.workspaceId} workspaceId={props.workspaceId} />,
   });
   addDecorationEntry({
     key: "background-processes",
     node: <BackgroundProcessesBanner workspaceId={props.workspaceId} />,
+  });
+  // Self-gating: only an SSH workspace from before #5174 with a plan to import shows it. Keyed by
+  // workspace so one workspace's offer, error or pending import never carries over to another.
+  addDecorationEntry({
+    key: "legacy-plan-import",
+    node: <LegacyPlanImportBanner key={props.workspaceId} workspaceId={props.workspaceId} />,
   });
   // The Chat Instructions decoration is intentionally self-gating: it renders
   // nothing when the scratchpad is empty or disabled, so it can always be in
@@ -1899,6 +2166,20 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
     addDecorationEntry({
       key: "reviews-banner",
       node: <ReviewsBanner workspaceId={props.workspaceId} />,
+    });
+  }
+  if (props.delegatedCreationInterrupted) {
+    addDecorationEntry({
+      key: "delegated-creation-interrupted",
+      node: (
+        <DelegatedCreationInterruptedBanner
+          // Keyed by workspace: ChatPane stays mounted across switches, and one workspace's
+          // pending Remove/Keep or its error must not carry over to another's banner.
+          key={props.workspaceId}
+          workspaceId={props.workspaceId}
+          workspaceName={props.workspaceName}
+        />
+      ),
     });
   }
   if (props.isPreStreamAgentTask) {
@@ -1915,19 +2196,27 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       ),
     });
   }
-  // The decoration lane lives inside the in-flow sticky composer dock, so a
-  // decoration mounting/unmounting reflows the transcript clearance in the same
-  // layout pass; the bottom stays pinned via native anchoring plus the
-  // scrollport-children ResizeObserver in useAutoScroll. Until the one-commit
-  // reveal the lane renders empty: readiness is monotonic per mounted
-  // workspace, so this only ever delays the initial mount — it never unmounts
-  // visible decorations.
+  // Open questions sit closest to the composer: they wait on the user, like the next message.
+  // Self-gating (renders nothing without an open question) and keyed by workspace, since the
+  // dock retains closed cards for the visit (see AskUserQuestionDock). Like the queued message it
+  // is synchronous chat state, and it must not wait for the reveal: the transcript stubs these
+  // rows from the first render, so the form never moves between instances mid-answer.
+  decorationEntries.push(
+    createChatInputDecorationStackItem({
+      key: "ask-user-question",
+      revealBeforeReady: true,
+      node: <AskUserQuestionDock key={props.workspaceId} workspaceId={props.workspaceId} />,
+    })
+  );
+  // Keep decorations in the in-flow composer dock so height changes reserve
+  // transcript clearance in the same layout pass.
 
   return (
     <>
       <ChatInputDecorationStackLane
         items={selectVisibleChatInputDecorations(decorationEntries, props.revealDecorations)}
       />
+      {props.turnStatus}
       <ChatInput
         key={props.workspaceId}
         variant="workspace"
@@ -1952,14 +2241,21 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         isCompacting={props.isCompacting}
         editingMessage={props.editingMessage}
         onCancelEdit={props.onCancelEdit}
+        onEditingMessageChange={props.onEditingMessageChange}
         onEditLastUserMessage={props.onEditLastUserMessage}
+        onEditSendPendingChange={props.onEditSendPendingChange}
         canInterrupt={props.canInterrupt}
         queuedMessage={props.queuedMessage}
         onQueuedDispatchModeChange={props.onQueuedDispatchModeChange}
         onQueuedActionError={props.onQueuedActionError}
         onSendQueuedImmediately={props.onSendQueuedImmediately}
+        heldInputId={props.heldInputs[0]?.id}
         onReady={props.onChatInputReady}
         attachedReviews={reviews.attachedReviews}
+        onAddReview={reviews.addReview}
+        onAcceptRestoredHeldInputs={(heldInputIds, durable) =>
+          storeRaw.acceptRestoredHeldInputs(props.workspaceId, heldInputIds, durable)
+        }
         onDetachReview={reviews.detachReview}
         onDetachAllReviews={reviews.detachAllAttached}
         onCheckReview={reviews.checkReview}

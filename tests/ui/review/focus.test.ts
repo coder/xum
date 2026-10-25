@@ -35,24 +35,38 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
       try {
         await setupWorkspaceView(view, metadata, workspaceId);
 
+        // The strip holds only opened tabs: open Stats, then Review (tabs 1 and 2).
+        await view.selectTab("costs");
+        await view.selectTab("review");
+
+        // While the workspace is still in setup, the Review tab shows a placeholder without the
+        // panel, and Ctrl+2 then has nothing to focus (#7436). Wait for the real panel, which
+        // mounts when setup ends: setupWorkspaceView does not wait for setup.
+        await waitFor(
+          () => {
+            if (!view.container.querySelector('[data-testid="review-panel"]')) {
+              throw new Error("Review panel not mounted (workspace setup not finished)");
+            }
+          },
+          { timeout: 30_000 }
+        );
+
         // Ensure focus starts outside the review panel.
         await view.selectTab("costs");
-        const costsTab = view.container.querySelector(
+        const costsTab = view.container.querySelector<HTMLElement>(
           '[role="tab"][aria-controls*="costs"]'
-        ) as HTMLElement | null;
+        );
         expect(costsTab).not.toBeNull();
         costsTab?.focus();
 
-        // Trigger the tab shortcut for the 2nd right-sidebar tab (default: Review).
+        // Trigger the tab shortcut for the 2nd right-sidebar tab (Review).
         // Use ctrlKey so this works regardless of OS detection (matchesKeybind treats
         // Ctrl/Cmd as equivalent on macOS).
         fireEvent.keyDown(window, { key: "2", ctrlKey: true });
 
         await waitFor(
           () => {
-            const reviewPanel = view.container.querySelector(
-              '[data-testid="review-panel"]'
-            ) as HTMLElement | null;
+            const reviewPanel = view.container.querySelector('[data-testid="review-panel"]');
             if (!reviewPanel) {
               throw new Error("Review panel not mounted");
             }
@@ -66,11 +80,14 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
               throw new Error("Review panel not focused");
             }
           },
-          { timeout: 10_000 }
+          { timeout: 30_000 }
         );
       } finally {
         await cleanupView(view, cleanupDom);
       }
     });
-  }, 30_000);
+    // 120s total (like undo.test.ts): CI runners under merge-queue load inflate wall
+    // clock enough that a 30s budget covering workspace setup + render was exceeded
+    // while sibling suites passed at 100s+ (merge-queue run 32715740782).
+  }, 120_000);
 });

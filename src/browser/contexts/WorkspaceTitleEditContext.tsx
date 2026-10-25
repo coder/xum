@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useCallback, useRef } from "react";
 import type { Result } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
+import { getVisibleWorkspaceIds } from "@/browser/utils/ui/workspaceDomNav";
 
 interface TitleEditResult {
   success: boolean;
@@ -30,25 +31,49 @@ interface TitleEditProviderProps {
   ) => Promise<{ success: boolean; error?: string }>;
 }
 
+/**
+ * Whether the edit in progress refuses a request for another workspace. An edit whose row the
+ * sidebar does not render (an inactive sub-agent, a collapsed project: F2 or the menu bar's Edit
+ * title can start one) has no input to finish it, so it must not block the next edit (#6202).
+ */
+function blocksOtherEdits(editingWorkspaceId: string | null, workspaceId: string): boolean {
+  if (editingWorkspaceId === null || editingWorkspaceId === workspaceId) return false;
+  return getVisibleWorkspaceIds().includes(editingWorkspaceId);
+}
+
+/** The one open title edit. One value, so a save can tell whether it is still the open edit. */
+function useOpenEdit() {
+  const [edit, setEdit] = useState<{ workspaceId: string; originalTitle: string } | null>(null);
+  // A save settles after its await: by then the user can have moved on to another workspace's
+  // edit (blocksOtherEdits lets one start while the saving row is hidden). Close only our own.
+  const finishEdit = useCallback((workspaceId: string) => {
+    setEdit((current) => (current?.workspaceId === workspaceId ? null : current));
+  }, []);
+  return {
+    editingWorkspaceId: edit?.workspaceId ?? null,
+    originalTitle: edit?.originalTitle ?? "",
+    setEdit,
+    finishEdit,
+  };
+}
+
 export const TitleEditProvider: React.FC<TitleEditProviderProps> = ({
   children,
   onUpdateTitle,
 }) => {
-  const [editingWorkspaceId, setEditingWorkspaceId] = useState<string | null>(null);
-  const [originalTitle, setOriginalTitle] = useState<string>("");
+  const { editingWorkspaceId, originalTitle, setEdit, finishEdit } = useOpenEdit();
 
   const requestEdit = useCallback(
     (workspaceId: string, currentTitle: string): boolean => {
-      // Only allow one workspace to be edited at a time
-      if (editingWorkspaceId !== null && editingWorkspaceId !== workspaceId) {
+      // Only allow one workspace to be edited at a time.
+      if (blocksOtherEdits(editingWorkspaceId, workspaceId)) {
         return false;
       }
 
-      setEditingWorkspaceId(workspaceId);
-      setOriginalTitle(currentTitle);
+      setEdit({ workspaceId, originalTitle: currentTitle });
       return true;
     },
-    [editingWorkspaceId]
+    [editingWorkspaceId, setEdit]
   );
 
   const confirmEdit = useCallback(
@@ -57,8 +82,7 @@ export const TitleEditProvider: React.FC<TitleEditProviderProps> = ({
 
       // Short-circuit if title hasn't changed
       if (trimmedTitle === originalTitle) {
-        setEditingWorkspaceId(null);
-        setOriginalTitle("");
+        finishEdit(workspaceId);
         return { success: true };
       }
 
@@ -69,19 +93,17 @@ export const TitleEditProvider: React.FC<TitleEditProviderProps> = ({
       const result = await onUpdateTitle(workspaceId, trimmedTitle);
 
       if (result.success) {
-        setEditingWorkspaceId(null);
-        setOriginalTitle("");
+        finishEdit(workspaceId);
       }
 
       return result;
     },
-    [originalTitle, onUpdateTitle]
+    [originalTitle, onUpdateTitle, finishEdit]
   );
 
   const cancelEdit = useCallback(() => {
-    setEditingWorkspaceId(null);
-    setOriginalTitle("");
-  }, []);
+    setEdit(null);
+  }, [setEdit]);
 
   // --- Generate title loading state ---
   const [generatingTitleWorkspaceIds, setGeneratingTitleWorkspaceIds] = useState<Set<string>>(

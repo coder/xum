@@ -32,6 +32,7 @@ const SCOPE_LABELS: Record<MemoryScope, string> = {
   global: "Global",
   project: "Project",
   workspace: "Workspace",
+  session: "Session",
 };
 
 /** File name shown in the list: path relative to its scope root. */
@@ -54,8 +55,10 @@ interface MemoryBrowserProps {
  * list + whole-file editor. Consumed by the right-sidebar Memory tab (all
  * scopes) and Settings → Memory (global scope only, no workspace).
  *
- * SECURITY: memory file contents and descriptions are attacker-influenceable,
- * so everything renders as plain React text — never through innerHTML-family sinks.
+ * SECURITY: memory file contents and descriptions are attacker-influenceable.
+ * Descriptions and paths render as plain React text; file contents also render
+ * through the shared Markdown pipeline (sanitized and hardened, raw HTML shown
+ * as text). Neither reaches innerHTML-family sinks directly.
  */
 export function MemoryBrowser(props: MemoryBrowserProps) {
   const { api } = useAPI();
@@ -444,13 +447,13 @@ function MemoryFileRow(props: MemoryFileRowProps) {
         >
           <span className="truncate">{base}</span>
           {props.agentEdited && (
-            <span className="bg-accent/15 text-accent shrink-0 rounded px-1.5 py-px text-[10px] font-medium">
+            <span className="bg-accent/15 text-accent-text shrink-0 rounded px-1.5 py-px text-[10px] font-medium">
               agent edited
             </span>
           )}
         </button>
         {props.file.pinned && (
-          <Pin className="text-accent h-3.5 w-3.5 shrink-0 fill-current" aria-hidden="true" />
+          <Pin className="text-accent-text h-3.5 w-3.5 shrink-0 fill-current" aria-hidden="true" />
         )}
         {/* Reserved-width actions revealed on hover/focus so rows stay quiet
             at rest without layout shift. */}

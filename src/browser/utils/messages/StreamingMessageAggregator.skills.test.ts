@@ -1,12 +1,16 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import type { AgentSkillScope } from "@/common/types/agentSkill";
 import {
   createMuxMessage,
   type AgentSkillReference,
   type DisplayedUserMessage,
   type MCPPromptReference,
+  type MuxMessage,
 } from "@/common/types/message";
-import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import {
+  AgentSkillSnapshotMetadataSchema,
+  StreamingMessageAggregator,
+} from "./StreamingMessageAggregator";
 
 const TEST_CREATED_AT = "2024-01-01T00:00:00.000Z";
 const WORKSPACE_ID = "test-workspace";
@@ -231,6 +235,27 @@ describe("Loaded skills tracking", () => {
     ]);
   });
 
+  it("tracks a qualified <plugin>:<skill> read under its qualified name", () => {
+    // The SkillIndicator must mark `pstack:tdd` loaded, not a different skill named `tdd`.
+    const aggregator = createAggregator();
+    startStream(aggregator);
+    emitSkillReadResult(aggregator, {
+      toolCallId: "tool-1",
+      skillName: "pstack:tdd",
+      result: {
+        success: true,
+        skill: {
+          scope: "global",
+          directoryName: "tdd",
+          frontmatter: { name: "tdd", description: "Plugin tdd" },
+          body: "# Content",
+        },
+      },
+    });
+
+    expect(aggregator.getLoadedSkills().map((skill) => skill.name)).toEqual(["pstack:tdd"]);
+  });
+
   it("tracks skills from agentSkillSnapshot messages via handleMessage", () => {
     const aggregator = createAggregator();
     const snapshot = createSkillSnapshotMessage({ skillName: "pull-requests" });
@@ -252,6 +277,52 @@ describe("Loaded skills tracking", () => {
 
     aggregator.loadHistoricalMessages([snapshot]);
 
+    expect(aggregator.getLoadedSkills()).toEqual([
+      {
+        name: "pull-requests",
+        description: "(loaded via /pull-requests)",
+        scope: "project",
+      },
+    ]);
+  });
+
+  it("parses agentSkillSnapshot metadata only for replayed rows that carry one", () => {
+    // Replay runs once per history row; parsing a missing snapshot builds a ZodError per
+    // row, which made the caught-up task take seconds on 500k+ row chats (#4869).
+    const aggregator = createAggregator();
+    const plainRows = Array.from({ length: 200 }, (_, index) =>
+      createMuxMessage(`plain-${index}`, index % 2 === 0 ? "user" : "assistant", `row ${index}`, {
+        historySequence: index + 1,
+        timestamp: 0,
+      })
+    );
+    const validSnapshot = createSkillSnapshotMessage({
+      id: "snapshot-valid",
+      skillName: "pull-requests",
+      historySequence: 201,
+    });
+    // Missing skillName: the schema must still reject it.
+    const malformedSnapshotMetadata: unknown = { scope: "project" };
+    const malformedSnapshot = createMuxMessage("snapshot-malformed", "user", "<agent-skill>", {
+      historySequence: 202,
+      timestamp: 0,
+      synthetic: true,
+      agentSkillSnapshot: malformedSnapshotMetadata as NonNullable<
+        MuxMessage["metadata"]
+      >["agentSkillSnapshot"],
+    });
+
+    const safeParseSpy = spyOn(AgentSkillSnapshotMetadataSchema, "safeParse");
+    try {
+      aggregator.loadHistoricalMessages([...plainRows, validSnapshot, malformedSnapshot]);
+
+      expect(safeParseSpy.mock.calls.map(([snapshot]) => snapshot)).toEqual([
+        validSnapshot.metadata?.agentSkillSnapshot,
+        malformedSnapshot.metadata?.agentSkillSnapshot,
+      ]);
+    } finally {
+      safeParseSpy.mockRestore();
+    }
     expect(aggregator.getLoadedSkills()).toEqual([
       {
         name: "pull-requests",
@@ -283,7 +354,7 @@ describe("Loaded skills tracking", () => {
     const skillDefs = [
       { name: "tests", description: "Testing skill", scope: "project" as const },
       { name: "pull-requests", description: "PR guidelines", scope: "project" as const },
-      { name: "shux-docs", description: "Documentation", scope: "built-in" as const },
+      { name: "xum-docs", description: "Documentation", scope: "built-in" as const },
     ];
 
     for (const [index, skill] of skillDefs.entries()) {
@@ -299,8 +370,8 @@ describe("Loaded skills tracking", () => {
     expect(skills).toHaveLength(3);
     expect(skills.map((skill) => skill.name).sort()).toEqual([
       "pull-requests",
-      "shux-docs",
       "tests",
+      "xum-docs",
     ]);
   });
 

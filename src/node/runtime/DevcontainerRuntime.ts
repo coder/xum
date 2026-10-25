@@ -1,5 +1,9 @@
+import * as fs from "fs/promises";
+import { canBindMountHostPathsIntoContainers } from "./runtimeScratchDir";
 import * as path from "path";
-import { Readable, Writable } from "stream";
+import { Writable } from "stream";
+import assert from "@/common/utils/assert";
+import { nodeReadableToWeb } from "@/node/utils/nodeReadableToWeb";
 import type {
   RuntimeCreateFlags,
   WorkspaceCreationParams,
@@ -13,11 +17,14 @@ import type {
   EnsureReadyResult,
   EnsureReadyOptions,
   FileStat,
+  ReadFileOptions,
+  RuntimeLocation,
 } from "./Runtime";
 import { RuntimeError, WORKSPACE_REPO_MISSING_ERROR } from "./Runtime";
+import { buildGuardedCommand, buildShellPathExport } from "./shellEnv";
 import { LocalBaseRuntime } from "./LocalBaseRuntime";
+import { isContainerUnavailableExit } from "./containerExecFailure";
 import { WorktreeManager } from "@/node/worktree/WorktreeManager";
-import { expandTildeForSSH } from "./tildeExpansion";
 import { shescape, streamToString } from "./streamUtils";
 import {
   readHostGitconfig,
@@ -28,8 +35,13 @@ import {
   resolveSshAgentForwarding,
   type BindMount,
 } from "./credentialForwarding";
-import { devcontainerUp, devcontainerDown, spawnDevcontainer } from "./devcontainerCli";
-import { runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
+import {
+  devcontainerUp,
+  devcontainerDown,
+  spawnDevcontainer,
+  type DevcontainerStopResult,
+} from "./devcontainerCli";
+import { findInitHookRelativePath, runInitHookOnRuntime, runWorkspaceInitHook } from "./initHook";
 import { DisposableProcess, forceCloseStdio, killProcessTree } from "@/node/utils/disposableExec";
 import { EXIT_CODE_ABORTED, EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import { NON_INTERACTIVE_ENV_VARS } from "@/common/constants/env";
@@ -37,11 +49,38 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { isGitRepository, stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { getAtomicWriteTempPath } from "./atomicWriteTempPath";
+import {
+  createExecMarker,
+  PendingStops,
+  stopMarkedCommand,
+  withoutExecMarkerKey,
+  type ExecMarker,
+} from "./remoteExecMarker";
+import {
+  buildRegularFileReadCommand,
+  CAT_VIA_EXEC_COMMAND,
+  ensureDirViaExec,
+  readAttemptTimeoutSecs,
+  readFileViaExec,
+  statViaExec,
+  writeFileViaExec,
+  STAT_VIA_EXEC_COMMAND,
+} from "./execFileIO";
+
+const FILE_PATH_ENV = "XUM_INTERNAL_FILE_PATH";
+const TEMP_FILE_PATH_ENV = "XUM_INTERNAL_TEMP_FILE_PATH";
 
 export interface DevcontainerRuntimeOptions {
   srcBaseDir: string;
   configPath: string;
   shareCredentials?: boolean;
+  /**
+   * Host session scratch dir to bind-mount at the same path (the workspace's $XUM_SCRATCH_DIR).
+   * Set by the runtime factory only when it knows the workspace id and the container daemon can
+   * see host paths (canBindMountHostPathsIntoContainers). Mounts apply when a container is
+   * created; an existing container keeps its mounts until rebuilt.
+   */
+  scratchMountDir?: string;
 }
 
 /**
@@ -56,13 +95,26 @@ export interface DevcontainerRuntimeOptions {
  * - File I/O → host fs (worktree is bind-mounted into container)
  * - ensureReady → devcontainer up (starts/rebuilds container as needed)
  */
+/** Names a workspace's devcontainer by the host-path label Docker matches it with. */
+export function containerLabel(workspacePath: string): string {
+  return `devcontainer container labeled devcontainer.local_folder=${workspacePath}`;
+}
+
 export class DevcontainerRuntime extends LocalBaseRuntime {
+  override get location(): RuntimeLocation {
+    return "devcontainer";
+  }
+
   private readonly worktreeManager: WorktreeManager;
   private readonly configPath: string;
+  /** In-container stops started by aborts and timeouts and not finished yet (#6923). */
+  private readonly pendingStops = new PendingStops();
 
   // Cached env used for credential forwarding
   private lastCredentialEnv?: Record<string, string>;
   private readonly shareCredentials: boolean;
+  private readonly scratchMountDir?: string;
+  private scratchMountReady = false;
 
   // Cached container requirements (mounts + env), computed by computeContainerRequirements()
   private containerMounts: BindMount[] = [];
@@ -100,6 +152,12 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     const gitdirMount = resolveGitdirMount(workspacePath);
     if (gitdirMount) mounts.push(gitdirMount);
 
+    // Scratch dir at the same path inside the container, once prepareScratchMount() created it
+    // and confirmed the daemon sees host paths.
+    if (this.scratchMountDir && this.scratchMountReady) {
+      mounts.push({ source: this.scratchMountDir, target: this.scratchMountDir });
+    }
+
     if (this.shareCredentials) {
       // Forward host credential env (GIT_ASKPASS, GIT_SSH_COMMAND, CODER_*, git identity)
       Object.assign(env, resolveHostCredentialEnv());
@@ -122,6 +180,62 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     this.containerMounts = mounts;
     this.containerEnv = env;
+  }
+
+  /**
+   * Decide whether the next `devcontainer up` mounts the scratch dir. Docker refuses a missing
+   * bind source, and a daemon that cannot see host paths (tcp://, ssh://) would fail the whole
+   * `up`, so the mount is added only after both checks pass; otherwise scratch stays unavailable.
+   */
+  private async prepareScratchMount(): Promise<void> {
+    this.scratchMountReady = false;
+    if (!this.scratchMountDir) return;
+    if (!(await canBindMountHostPathsIntoContainers())) return;
+    try {
+      await fs.mkdir(this.scratchMountDir, { recursive: true });
+      this.scratchMountReady = true;
+    } catch (error) {
+      log.warn(
+        `Could not create the devcontainer scratch dir ${this.scratchMountDir}: ${getErrorMessage(error)}`
+      );
+    }
+  }
+
+  /**
+   * `devcontainer up` with the cached mounts and env. A VM-backed local daemon (Docker Desktop,
+   * Colima) can still refuse the scratch bind source when XUM_ROOT is outside its file sharing,
+   * and scratch is optional: a failure that names the scratch dir (the daemon's refusal, or the
+   * CLI's failed `docker run` command line) retries once without that mount. Build failures do
+   * not name it and are not retried. Scratch then stays unavailable (the mount probe fails).
+   */
+  private async upWithOptionalScratchMount(
+    options: Omit<Parameters<typeof devcontainerUp>[0], "additionalMounts" | "remoteEnv">
+  ): ReturnType<typeof devcontainerUp> {
+    const up = () =>
+      devcontainerUp({
+        ...options,
+        additionalMounts: this.containerMounts.length > 0 ? this.containerMounts : undefined,
+        remoteEnv: Object.keys(this.containerEnv).length > 0 ? this.containerEnv : undefined,
+      });
+    try {
+      return await up();
+    } catch (error) {
+      const scratchMountDir = this.scratchMountDir;
+      if (
+        !this.scratchMountReady ||
+        scratchMountDir === undefined ||
+        options.abortSignal?.aborted === true ||
+        !getErrorMessage(error).includes(scratchMountDir)
+      ) {
+        throw error;
+      }
+      log.warn(
+        `devcontainer up failed with the scratch mount ${scratchMountDir}; retrying without it: ${getErrorMessage(error)}`
+      );
+      this.scratchMountReady = false;
+      this.refreshContainerRequirements();
+      return await up();
+    }
   }
 
   /**
@@ -184,13 +298,6 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     }
 
     return this.mapContainerPathToHost(filePath);
-  }
-
-  private quoteForContainer(filePath: string): string {
-    if (filePath === "~" || filePath.startsWith("~/")) {
-      return expandTildeForSSH(filePath);
-    }
-    return shescape.quote(filePath);
   }
 
   /**
@@ -286,178 +393,11 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     }
   }
 
-  private readFileViaExec(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
-    return new ReadableStream<Uint8Array>({
-      start: async (controller) => {
-        try {
-          const stream = await this.exec(`cat ${this.quoteForContainer(filePath)}`, {
-            cwd: this.getContainerBasePath(),
-            timeout: 300,
-            abortSignal,
-          });
-
-          const reader = stream.stdout.getReader();
-          const exitCodePromise = stream.exitCode;
-
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
-          }
-
-          const code = await exitCodePromise;
-          if (code !== 0) {
-            const stderr = await streamToString(stream.stderr);
-            throw new RuntimeError(`Failed to read file ${filePath}: ${stderr}`, "file_io");
-          }
-
-          controller.close();
-        } catch (err) {
-          if (err instanceof RuntimeError) {
-            controller.error(err);
-          } else {
-            controller.error(
-              new RuntimeError(
-                `Failed to read file ${filePath}: ${getErrorMessage(err)}`,
-                "file_io",
-                err instanceof Error ? err : undefined
-              )
-            );
-          }
-        }
-      },
-    });
+  private mapPathForExec(filePath: string): string {
+    // Issue #3709: paths embedded in exec scripts must use the container namespace.
+    return this.mapHostPathToContainer(filePath) ?? filePath;
   }
 
-  private writeFileViaExec(
-    filePath: string,
-    abortSignal?: AbortSignal
-  ): WritableStream<Uint8Array> {
-    const quotedPath = this.quoteForContainer(filePath);
-    const tempPath = getAtomicWriteTempPath(filePath);
-    const quotedTempPath = this.quoteForContainer(tempPath);
-    const writeCommand = `mkdir -p $(dirname ${quotedPath}) && cat > ${quotedTempPath} && mv ${quotedTempPath} ${quotedPath}`;
-
-    let execPromise: Promise<ExecStream> | null = null;
-    const writeAbortController = new AbortController();
-    const abortWrite = () => writeAbortController.abort();
-    if (abortSignal?.aborted) {
-      writeAbortController.abort();
-    } else {
-      abortSignal?.addEventListener("abort", abortWrite, { once: true });
-    }
-    const cleanupAbortForwarder = () => {
-      abortSignal?.removeEventListener("abort", abortWrite);
-    };
-
-    const getExecStream = () => {
-      execPromise ??= this.exec(writeCommand, {
-        cwd: this.getContainerBasePath(),
-        timeout: 300,
-        abortSignal: writeAbortController.signal,
-      });
-      return execPromise;
-    };
-
-    return new WritableStream<Uint8Array>({
-      write: async (chunk) => {
-        const stream = await getExecStream();
-        const writer = stream.stdin.getWriter();
-        try {
-          await writer.write(chunk);
-        } finally {
-          writer.releaseLock();
-        }
-      },
-      close: async () => {
-        try {
-          const stream = await getExecStream();
-          await stream.stdin.close();
-          const exitCode = await stream.exitCode;
-
-          if (exitCode !== 0) {
-            const stderr = await streamToString(stream.stderr);
-            throw new RuntimeError(`Failed to write file ${filePath}: ${stderr}`, "file_io");
-          }
-        } finally {
-          cleanupAbortForwarder();
-        }
-      },
-      abort: async (reason?: unknown) => {
-        writeAbortController.abort();
-        if (execPromise) {
-          try {
-            const stream = await execPromise;
-            await stream.stdin.abort(reason).catch(() => undefined);
-            await stream.exitCode.catch(() => undefined);
-          } finally {
-            cleanupAbortForwarder();
-          }
-        } else {
-          cleanupAbortForwarder();
-        }
-        throw new RuntimeError(`Failed to write file ${filePath}: ${String(reason)}`, "file_io");
-      },
-    });
-  }
-
-  private async ensureDirViaExec(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
-    const stream = await this.exec(`mkdir -p ${this.quoteForContainer(dirPath)}`, {
-      cwd: "/",
-      timeout: 10,
-      abortSignal,
-    });
-
-    await stream.stdin.close();
-
-    const [stdout, stderr, exitCode] = await Promise.all([
-      streamToString(stream.stdout),
-      streamToString(stream.stderr),
-      stream.exitCode,
-    ]);
-
-    if (exitCode !== 0) {
-      const extra = stderr.trim() || stdout.trim();
-      throw new RuntimeError(
-        `Failed to create directory ${dirPath}: exit code ${exitCode}${extra ? `: ${extra}` : ""}`,
-        "file_io"
-      );
-    }
-  }
-
-  private async statViaExec(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
-    // -L follows symlinks so symlinked paths report the target's type
-    const stream = await this.exec(`stat -L -c '%s %Y %F' ${this.quoteForContainer(filePath)}`, {
-      cwd: this.getContainerBasePath(),
-      timeout: 10,
-      abortSignal,
-    });
-
-    const [stdout, stderr, exitCode] = await Promise.all([
-      streamToString(stream.stdout),
-      streamToString(stream.stderr),
-      stream.exitCode,
-    ]);
-
-    if (exitCode !== 0) {
-      throw new RuntimeError(`Failed to stat ${filePath}: ${stderr}`, "file_io");
-    }
-
-    const parts = stdout.trim().split(" ");
-    if (parts.length < 3) {
-      throw new RuntimeError(`Failed to parse stat output for ${filePath}: ${stdout}`, "file_io");
-    }
-
-    const size = parseInt(parts[0], 10);
-    const mtime = parseInt(parts[1], 10);
-    const fileType = parts.slice(2).join(" ");
-
-    return {
-      size,
-      modifiedTime: new Date(mtime * 1000),
-      isDirectory: fileType === "directory",
-    };
-  }
   private mapHostPathToContainer(hostPath: string): string | null {
     if (!this.remoteWorkspaceFolder || !this.currentWorkspacePath) return null;
 
@@ -478,6 +418,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
    * Only uses options.cwd if it looks like a valid container path (POSIX absolute, no Windows drive letters).
    */
   private resolveContainerCwd(optionsCwd: string | undefined, workspaceFolder: string): string {
+    // The CLI enters the configured container workspace. Cleanup must not run `up` just to learn this path.
+    if (!this.remoteWorkspaceFolder && optionsCwd === workspaceFolder) return ".";
     if (optionsCwd && this.looksLikeContainerPath(optionsCwd)) {
       return optionsCwd;
     }
@@ -501,6 +443,7 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     this.worktreeManager = new WorktreeManager(options.srcBaseDir);
     this.configPath = options.configPath;
     this.shareCredentials = options.shareCredentials ?? false;
+    this.scratchMountDir = options.scratchMountDir;
   }
 
   getWorkspacePath(projectPath: string, workspaceName: string): string {
@@ -531,16 +474,15 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     this.lastCredentialEnv = env;
     this.currentWorkspacePath = workspacePath;
+    await this.prepareScratchMount();
     this.refreshContainerRequirements(env);
 
     try {
-      const result = await devcontainerUp({
+      const result = await this.upWithOptionalScratchMount({
         workspaceFolder: workspacePath,
         configPath: this.configPath,
         initLogger,
         abortSignal,
-        additionalMounts: this.containerMounts.length > 0 ? this.containerMounts : undefined,
-        remoteEnv: Object.keys(this.containerEnv).length > 0 ? this.containerEnv : undefined,
       });
 
       // Cache container info
@@ -558,21 +500,22 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
   }
 
   /**
-   * Run .mux/init hook inside the devcontainer.
+   * Run .xum/init hook inside the devcontainer.
    */
   async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
     return runWorkspaceInitHook({
       params,
       runtimeType: "devcontainer",
-      hookCheckPath: params.workspacePath,
-      runHook: async ({ shuxEnv, initLogger, abortSignal }) => {
+      findHookRelativePath: () =>
+        findInitHookRelativePath(this, this.remoteWorkspaceFolder ?? params.workspacePath),
+      runHook: async ({ hookRelativePath, xumEnv, initLogger, abortSignal }) => {
         const containerWorkspacePath = this.remoteWorkspaceFolder ?? params.workspacePath;
-        const hookPath = `${containerWorkspacePath}/.mux/init`;
+        const hookPath = `${containerWorkspacePath}/${hookRelativePath}`;
         await runInitHookOnRuntime(
           this,
           hookPath,
           containerWorkspacePath,
-          shuxEnv,
+          xumEnv,
           initLogger,
           abortSignal
         );
@@ -581,10 +524,38 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
   }
 
   /**
+   * Stops the processes of an aborted or timed-out exec inside the container (#6923). The
+   * abort's or timeout's result does not wait for it, so a slow or broken container cannot delay
+   * that answer; failures are logged. Not for the stop command itself (`enabled` false): its own
+   * timeout would start another stop, every 10 s, while the container engine hangs.
+   */
+  private stopInContainer(marker: ExecMarker, workspaceFolder: string, enabled: boolean): void {
+    if (!enabled) return;
+    this.pendingStops.track(
+      stopMarkedCommand(
+        (script) => this.exec(script, { cwd: workspaceFolder, timeout: 10 }, false),
+        marker,
+        "Devcontainer"
+      ),
+      "Devcontainer"
+    );
+  }
+
+  /** Resolves once every in-container stop started so far has finished. */
+  awaitPendingStops(): Promise<void> {
+    return this.pendingStops.settled();
+  }
+
+  /**
    * Execute a command inside the devcontainer.
    * Overrides LocalBaseRuntime.exec() to use `devcontainer exec`.
    */
-  override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+  override exec(
+    command: string,
+    options: ExecOptions,
+    // Internal: `false` for the stop command itself (see stopInContainer).
+    stopOnCleanup = true
+  ): Promise<ExecStream> {
     const startTime = performance.now();
 
     // Short-circuit if already aborted
@@ -606,16 +577,43 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
 
     // Merge cached container credential env + caller env + non-interactive vars.
     // Spread order: container env (lowest) < caller env < NON_INTERACTIVE (highest).
-    const envVars = { ...this.containerEnv, ...options.env, ...NON_INTERACTIVE_ENV_VARS };
+    // The marker key is reserved: a caller's value would hide the command from a stop (#6923).
+    const mappedPathEnv = withoutExecMarkerKey(
+      Object.fromEntries(
+        Object.entries(options.pathEnv ?? {}).map(([key, value]) => [
+          key,
+          this.mapPathForExec(value),
+        ])
+      )
+    );
+    const envVars = withoutExecMarkerKey({
+      ...this.containerEnv,
+      ...options.env,
+      ...mappedPathEnv,
+      ...NON_INTERACTIVE_ENV_VARS,
+    });
     for (const [key, value] of Object.entries(envVars)) {
       args.push("--remote-env", `${key}=${value}`);
     }
+    // Every process of this exec in the container carries the marker, so an abort or timeout can
+    // stop them: killing the local `devcontainer exec` leaves them running (#6923).
+    const marker = createExecMarker();
+    args.push("--remote-env", marker);
 
     // Build the full command with cd
     // Map host workspace path to container path; fall back to container workspace if unmappable
     const mappedCwd = options.cwd ? this.mapHostPathToContainer(options.cwd) : null;
     const cwd = mappedCwd ?? this.resolveContainerCwd(options.cwd, workspaceFolder);
-    const fullCommand = `cd ${shescape.quote(cwd)} && ${command}`;
+    const pathEnvPrelude = Object.entries(mappedPathEnv)
+      .map(([key, value]) =>
+        buildShellPathExport(key, value, (envValue) => shescape.quote(envValue))
+      )
+      .join(" && ");
+    // A failed cd/export skips every line of the command (#5192).
+    const fullCommand = buildGuardedCommand(
+      [`cd ${shescape.quote(cwd)}`, pathEnvPrelude].filter(Boolean),
+      command
+    );
     args.push("--", "bash", "-c", fullCommand);
 
     const childProcess = spawnDevcontainer(args, {
@@ -632,15 +630,17 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
       if (childProcess.pid === undefined) return;
       killProcessTree(childProcess.pid);
       forceCloseStdio(childProcess);
+      this.stopInContainer(marker, workspaceFolder, stopOnCleanup);
     });
 
-    // Convert Node.js streams to Web Streams (casts required for ExecStream compatibility)
+    // Convert Node.js streams to Web Streams. Not Readable.toWeb: on Bun 1.4.3 it can throw an
+    // uncaught error when the bash tool cancels a reader on output overflow (nodeReadableToWeb).
+    assert(childProcess.stdout, "spawned with piped stdout");
+    assert(childProcess.stderr, "spawned with piped stderr");
+    const stdout = nodeReadableToWeb(childProcess.stdout);
+    const stderr = nodeReadableToWeb(childProcess.stderr);
     // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stdout = Readable.toWeb(childProcess.stdout!) as unknown as ReadableStream<Uint8Array>;
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stderr = Readable.toWeb(childProcess.stderr!) as unknown as ReadableStream<Uint8Array>;
-    // eslint-disable-next-line local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
-    const stdin = Writable.toWeb(childProcess.stdin!) as unknown as WritableStream<Uint8Array>;
+    const stdin = Writable.toWeb(childProcess.stdin!) as unknown as WritableStream<Uint8Array>; // eslint-disable-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
 
     let timedOut = false;
     let aborted = false;
@@ -712,12 +712,35 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     });
   }
 
-  override readFile(filePath: string, abortSignal?: AbortSignal): ReadableStream<Uint8Array> {
+  override readFile(
+    filePath: string,
+    abortSignal?: AbortSignal,
+    options?: ReadFileOptions
+  ): ReadableStream<Uint8Array> {
     const hostPath = this.resolveHostPathForMounted(filePath);
     if (hostPath) {
-      return super.readFile(hostPath, abortSignal);
+      return super.readFile(hostPath, abortSignal, options);
     }
-    return this.readFileViaExec(filePath, abortSignal);
+    return readFileViaExec(
+      filePath,
+      (signal, attempt) =>
+        // Unmounted paths only exist inside the container, so the regular-file
+        // check must run there too (env-var quoting as for the plain cat). The
+        // retry reads only a regular file: see readFileViaExec's StartReadExec.
+        this.exec(
+          options?.requireRegularFile === true || attempt > 0
+            ? buildRegularFileReadCommand(`"$${FILE_PATH_ENV}"`)
+            : `${CAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`,
+          {
+            cwd: this.getContainerBasePath(),
+            pathEnv: { [FILE_PATH_ENV]: filePath },
+            timeout: readAttemptTimeoutSecs(attempt, 300),
+            abortSignal: signal,
+          }
+        ),
+      abortSignal,
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr)
+    );
   }
 
   override writeFile(filePath: string, abortSignal?: AbortSignal): WritableStream<Uint8Array> {
@@ -725,23 +748,62 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     if (hostPath) {
       return super.writeFile(hostPath, abortSignal);
     }
-    return this.writeFileViaExec(filePath, abortSignal);
+    return writeFileViaExec(
+      filePath,
+      (signal) =>
+        this.exec(
+          `mkdir -p "$(dirname "$${FILE_PATH_ENV}")" && cat > "$${TEMP_FILE_PATH_ENV}" && mv "$${TEMP_FILE_PATH_ENV}" "$${FILE_PATH_ENV}"`,
+          {
+            cwd: this.getContainerBasePath(),
+            pathEnv: {
+              [FILE_PATH_ENV]: filePath,
+              [TEMP_FILE_PATH_ENV]: getAtomicWriteTempPath(filePath),
+            },
+            timeout: 300,
+            abortSignal: signal,
+          }
+        ),
+      abortSignal
+    );
   }
 
-  override async stat(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
+  override stat(filePath: string, abortSignal?: AbortSignal): Promise<FileStat> {
     const hostPath = this.resolveHostPathForMounted(filePath);
     if (hostPath) {
       return super.stat(hostPath, abortSignal);
     }
-    return this.statViaExec(filePath, abortSignal);
+    return statViaExec(
+      filePath,
+      (attempt) =>
+        this.exec(`${STAT_VIA_EXEC_COMMAND} "$${FILE_PATH_ENV}"`, {
+          cwd: this.getContainerBasePath(),
+          pathEnv: { [FILE_PATH_ENV]: filePath },
+          timeout: readAttemptTimeoutSecs(attempt, 10),
+          abortSignal,
+        }),
+      (exitCode, stderr) => this.isTransportFailureExit(exitCode, stderr),
+      abortSignal
+    );
   }
 
-  override async ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
+  /** See Runtime.isTransportFailureExit: a stopped or missing container is not a missing file. */
+  isTransportFailureExit(exitCode: number, stderr: string): boolean {
+    return isContainerUnavailableExit(exitCode, stderr);
+  }
+
+  override ensureDir(dirPath: string, abortSignal?: AbortSignal): Promise<void> {
     const hostPath = this.resolveHostPathForMounted(dirPath);
     if (hostPath) {
       return super.ensureDir(hostPath, abortSignal);
     }
-    return this.ensureDirViaExec(dirPath, abortSignal);
+    return ensureDirViaExec(dirPath, () =>
+      this.exec(`mkdir -p "$${FILE_PATH_ENV}"`, {
+        cwd: this.getContainerBasePath(),
+        pathEnv: { [FILE_PATH_ENV]: dirPath },
+        timeout: 10,
+        abortSignal,
+      })
+    );
   }
 
   override async resolvePath(filePath: string): Promise<string> {
@@ -776,8 +838,8 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     }
 
     const tmpPath = this.remoteWorkspaceFolder
-      ? path.posix.join(workspaceRoot, ".mux", "tmp")
-      : path.join(workspaceRoot, ".mux", "tmp");
+      ? path.posix.join(workspaceRoot, ".xum", "tmp")
+      : path.join(workspaceRoot, ".xum", "tmp");
     return Promise.resolve(tmpPath);
   }
 
@@ -837,14 +899,13 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
         },
       };
 
+      await this.prepareScratchMount();
       this.refreshContainerRequirements();
-      const result = await devcontainerUp({
+      const result = await this.upWithOptionalScratchMount({
         workspaceFolder: this.currentWorkspacePath,
         configPath: this.configPath,
         initLogger: silentLogger,
         abortSignal: options?.signal,
-        additionalMounts: this.containerMounts.length > 0 ? this.containerMounts : undefined,
-        remoteEnv: Object.keys(this.containerEnv).length > 0 ? this.containerEnv : undefined,
       });
 
       // Update cached info (container may have been rebuilt)
@@ -873,20 +934,39 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     oldName: string,
     newName: string,
     _abortSignal?: AbortSignal,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed?: boolean }
+    | { success: false; error: string }
   > {
-    // Stop container before rename (container labels reference old path)
+    // Remove the container before the rename: its labels reference the old path. A stopped one
+    // is removed too, and a failed removal refuses the rename before the worktree moves (#5137):
+    // the container would otherwise survive with this workspace's files, including its plan, and
+    // a later workspace at the old path would reuse it.
     const oldPath = this.getWorkspacePath(projectPath, oldName);
-    await devcontainerDown(oldPath, this.configPath);
+    const containerStop = await devcontainerDown(oldPath, this.configPath, {
+      includeStopped: true,
+    }).catch(
+      (error: unknown): DevcontainerStopResult => ({
+        kind: "error",
+        message: getErrorMessage(error),
+      })
+    );
+    if (containerStop.kind === "error") {
+      return {
+        success: false,
+        error: `Failed to remove the ${containerLabel(oldPath)}: ${containerStop.message}`,
+      };
+    }
 
     // Rename worktree on host
     const result = await this.worktreeManager.renameWorkspace(
       projectPath,
       oldName,
       newName,
-      trusted
+      trusted,
+      options
     );
 
     if (result.success) {
@@ -904,19 +984,82 @@ export class DevcontainerRuntime extends LocalBaseRuntime {
     workspaceName: string,
     force: boolean,
     _abortSignal?: AbortSignal,
-    trusted?: boolean
-  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
+  ): Promise<
+    | { success: true; deletedPath: string }
+    | { success: false; error: string; leftoverPaths?: string[] }
+  > {
     const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
 
-    // Stop and remove container (best-effort)
-    try {
-      await devcontainerDown(workspacePath, this.configPath);
-    } catch (error) {
-      log.debug("devcontainerDown failed (container may not exist):", { error });
+    // Stop and remove the container, which is labeled with the host path. A stopped one is
+    // removed too (#5124): it still holds the workspace's files, and a later workspace at this
+    // path would reuse it.
+    const containerStop = await devcontainerDown(workspacePath, this.configPath, {
+      includeStopped: true,
+    }).catch(
+      (error: unknown): DevcontainerStopResult => ({
+        kind: "error",
+        message: getErrorMessage(error),
+      })
+    );
+
+    const containerLeftover = containerLabel(workspacePath);
+    // A container that is still there is not a clean delete: removal and rollbacks report it, and
+    // name it so the user can remove it (#5120); a later workspace at this path would reuse it.
+    // A non-forced delete then stops before the host worktree, so the caller keeps the workspace
+    // and a retry deletes both: deleting the worktree first would drop its branch mapping, and a
+    // retry would then fall back to deleting the branch named after the workspace, which may not
+    // be this workspace's. A forced delete (rollbacks, forced removal) is not retried on the same
+    // entry, so it still removes the worktree.
+    // The message names the container and what forcing would leave (#5143): the user sees it
+    // before choosing a forced removal, which deletes the worktree and so can no longer reach the
+    // container to delete the plan inside it.
+    if (containerStop.kind === "error" && !force) {
+      return {
+        success: false,
+        error: `Failed to remove the ${containerLeftover}: ${containerStop.message}. A forced removal deletes the workspace but leaves this container, which may still hold its plan file; remove the container afterwards.`,
+        leftoverPaths: [containerLeftover],
+      };
     }
 
     // Delete worktree on host
-    return this.worktreeManager.deleteWorkspace(projectPath, workspaceName, force, trusted);
+    const hostResult = await this.worktreeManager.deleteWorkspace(
+      projectPath,
+      workspaceName,
+      force,
+      trusted,
+      options
+    );
+    if (containerStop.kind !== "error") return hostResult;
+
+    const errors = [`Failed to remove the devcontainer: ${containerStop.message}`];
+    const leftoverPaths = [containerLeftover];
+    if (!hostResult.success) {
+      errors.push(hostResult.error);
+      leftoverPaths.push(workspacePath);
+    }
+    return { success: false, error: errors.join("; "), leftoverPaths };
+  }
+
+  /**
+   * Remove only the host worktree, without `devcontainer down`. For a creation rollback before
+   * init: no container exists yet, and `devcontainer down` matches containers by path (#4775).
+   */
+  deleteHostWorktree(
+    projectPath: string,
+    workspaceName: string,
+    force: boolean,
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
+  ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
+    return this.worktreeManager.deleteWorkspace(
+      projectPath,
+      workspaceName,
+      force,
+      trusted,
+      options
+    );
   }
 
   async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {

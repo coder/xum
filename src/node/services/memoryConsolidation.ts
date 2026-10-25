@@ -86,6 +86,109 @@ function classifyMutation(input: MemoryCommandInput): MutationTarget | null {
 }
 
 /**
+ * Run-scoped mutation budget. Check + reservation happen in ONE synchronous
+ * call (tryConsume): the AI SDK runs parallel tool calls concurrently, so an
+ * await between check and increment would let two calls at budget-1 both
+ * pass. Shared so the refine pass (r11) can charge memory AND skill mutations
+ * against a single budget.
+ */
+export interface MutationBudget {
+  readonly limit: number;
+  used(): number;
+  /** Reserve one mutation; false when the budget is exhausted. */
+  tryConsume(): boolean;
+}
+
+export function createMutationBudget(limit: number): MutationBudget {
+  let used = 0;
+  return {
+    limit,
+    used: () => used,
+    tryConsume: () => {
+      if (used >= limit) return false;
+      used++;
+      return true;
+    },
+  };
+}
+
+/**
+ * Non-mutating validation for staged (dry-run) mutations, mirroring what the
+ * real write path enforces: executeMemoryCommand's required-arg checks (same
+ * error strings), then MemoryService.validateMutation, which simulates the
+ * RESULTING file against the write cap (reading the current target for
+ * state-dependent commands — a small insert into a near-cap file must fail
+ * staging even though the new text alone is tiny) plus the occurrence,
+ * exists/type, and containment checks the real command runs.
+ */
+async function validateMutationForStaging(
+  memoryService: MemoryService,
+  ctx: MemoryScopeContext,
+  input: MemoryCommandInput
+): Promise<string | null> {
+  switch (input.command) {
+    case "create": {
+      if (input.path == null || input.file_text == null) {
+        return "create requires 'path' and 'file_text'";
+      }
+      const result = await memoryService.validateMutation(ctx, {
+        command: "create",
+        path: input.path,
+        file_text: input.file_text,
+      });
+      return result.ok ? null : result.error;
+    }
+    case "str_replace": {
+      if (input.path == null || input.old_str == null) {
+        return "str_replace requires 'path' and 'old_str'";
+      }
+      const result = await memoryService.validateMutation(ctx, {
+        command: "str_replace",
+        path: input.path,
+        old_str: input.old_str,
+        new_str: input.new_str ?? "",
+      });
+      return result.ok ? null : result.error;
+    }
+    case "insert": {
+      if (input.path == null || input.insert_line == null || input.insert_text == null) {
+        return "insert requires 'path', 'insert_line' and 'insert_text'";
+      }
+      const result = await memoryService.validateMutation(ctx, {
+        command: "insert",
+        path: input.path,
+        insert_line: input.insert_line,
+        insert_text: input.insert_text,
+      });
+      return result.ok ? null : result.error;
+    }
+    case "delete": {
+      if (input.path == null) return "delete requires 'path'";
+      const result = await memoryService.validateMutation(ctx, {
+        command: "delete",
+        path: input.path,
+      });
+      return result.ok ? null : result.error;
+    }
+    case "rename": {
+      // classifyMutation already required these (same old_path ?? path rule).
+      const oldPath = input.old_path ?? input.path;
+      if (oldPath == null || input.new_path == null) {
+        return "rename requires 'old_path' (or 'path') and 'new_path'";
+      }
+      const result = await memoryService.validateMutation(ctx, {
+        command: "rename",
+        path: oldPath,
+        new_path: input.new_path,
+      });
+      return result.ok ? null : result.error;
+    }
+    default:
+      return null;
+  }
+}
+
+/**
  * Build the guarded memory tool for one consolidation run. Exported separately
  * from runMemoryConsolidation so the rails are testable without a model.
  */
@@ -96,9 +199,36 @@ export function createConsolidationMemoryTool(args: {
   dryRun: boolean;
   /** Run-scoped journal; the tool appends every mutating command to it. */
   journal: MemoryConsolidationOp[];
+  /** Injectable budget (refine shares one across memory + skill tools). */
+  budget?: MutationBudget;
+  /**
+   * Invoked for every mutation ACCEPTED in dry-run mode (guard + budget
+   * passed, nothing applied). The refine staging flow uses this to capture
+   * the full command input for a later explicit apply; the plain dream
+   * dry-run ignores it.
+   */
+  onStagedMutation?: (input: MemoryCommandInput, toolCallId: string) => void;
+  /**
+   * Refine apply only (r55 deletes, r58 inserts): staging-time target
+   * fingerprints keyed by toolCallId, re-verified by MemoryService INSIDE
+   * its target mutation lock immediately before the write — a delete has no
+   * command-level conflict semantics, and an insert's numeric line position
+   * silently lands in the wrong place on contents edited after staging.
+   */
+  expectedTargetFingerprints?: ReadonlyMap<string, string>;
+  /**
+   * Caller-teardown guard (r59): tool executions receive no hard
+   * cancellation, so a run wedged in filesystem I/O is eventually detached
+   * by the caller's bounded drain — and would otherwise commit durable
+   * memory (and journal into a deleted session directory, recreating it)
+   * once the I/O unblocks after workspace teardown. Checked at execute
+   * entry AND re-verified by MemoryService inside its target mutation lock
+   * immediately before the first durable write.
+   */
+  abortSignal?: AbortSignal;
 }): { tool: Tool; getMutationCount: () => number } {
   const { memoryService, metaService, ctx, dryRun, journal } = args;
-  let mutationCount = 0;
+  const budget = args.budget ?? createMutationBudget(MEMORY_CONSOLIDATION_OP_BUDGET);
 
   const guard = async (target: MutationTarget): Promise<string | null> => {
     // Whitelist, not blacklist, so scopes added later stay out of bounds by default.
@@ -114,6 +244,11 @@ export function createConsolidationMemoryTool(args: {
     // Deletes/renames may target a directory (MemoryService removes
     // recursively), so reject when the path itself OR anything under it is
     // pinned — otherwise `delete dir/` would silently destroy dir/pinned.md.
+    // This pre-check gives the model (and dry-run staging) early feedback;
+    // the AUTHORITATIVE check runs inside MemoryService's mutation lock
+    // against the owner the command's store is actually bound to
+    // (`rejectPinned` below): the owner resolved here can differ from the
+    // command's when config.json is transiently unreadable in between.
     if (target.command === "delete" || target.command === "rename") {
       const { scope, relPath } = parseMemoryPath(target.path);
       assert(
@@ -123,7 +258,11 @@ export function createConsolidationMemoryTool(args: {
       const entries = await metaService.getEntries();
       const key = memoryLogicalKey(scope, relPath, {
         projectPath: ctx.projectPath,
-        workspaceId: ctx.workspaceId,
+        // Sidecar keys follow the shared store's owner (MemoryService.logicalKeyFor).
+        workspaceId:
+          ctx.workspaceId === ""
+            ? ""
+            : memoryService.resolveWorkspaceMemoryOwnerId(ctx.workspaceId),
       });
       const subtreePrefix = `${key}/`;
       for (const [entryKey, entry] of entries) {
@@ -141,11 +280,19 @@ export function createConsolidationMemoryTool(args: {
       "Manage the persistent memory directory you are consolidating. " +
       TOOL_DEFINITIONS.memory.description,
     inputSchema: TOOL_DEFINITIONS.memory.schema,
-    execute: async (input): Promise<MemoryToolResult> => {
+    // toolCallId is threaded into the r2 refinement journal rows so callers
+    // (refine, r11) can correlate this run's edits to their journaled ids.
+    execute: async (input, { toolCallId }): Promise<MemoryToolResult> => {
+      // r59: a cancelled pass must not start new work — the in-service
+      // pre-commit recheck (below) is what stops executions that were
+      // already in flight when the caller was torn down.
+      if (args.abortSignal?.aborted === true) {
+        return { success: false, error: "Consolidation pass was cancelled" };
+      }
       const target = classifyMutation(input);
       if (target === null) {
         // Reads (and malformed inputs, which fail validation inside) pass through.
-        return executeMemoryCommand(memoryService, ctx, input, () => null);
+        return executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId);
       }
 
       let rejection: string | null;
@@ -160,24 +307,37 @@ export function createConsolidationMemoryTool(args: {
         return { success: false, error: rejection };
       }
 
-      // Budget check + reservation in ONE synchronous block: the AI SDK runs
-      // parallel tool calls concurrently, so an await between check and
-      // increment would let two calls at budget-1 both pass. Budget is
-      // consumed by every accepted mutation — including dry-run and dispatch
-      // failures — so dry-run mirrors a real run.
-      if (mutationCount >= MEMORY_CONSOLIDATION_OP_BUDGET) {
-        const note = `Mutation budget exhausted (${MEMORY_CONSOLIDATION_OP_BUDGET} per run); stop and summarize.`;
+      // Budget is consumed by every accepted mutation — including dry-run and
+      // dispatch failures — so dry-run mirrors a real run (check+reserve
+      // atomicity lives in MutationBudget.tryConsume).
+      if (!budget.tryConsume()) {
+        const note = `Mutation budget exhausted (${budget.limit} per run); stop and summarize.`;
         journal.push({ ...target, applied: false, note });
         return { success: false, error: note };
       }
-      mutationCount++;
 
       if (dryRun) {
+        // Validate BEFORE staging: the real write path enforces
+        // command-specific required args (executeMemoryCommand) and the
+        // memory file cap (MemoryService) — skipping them here let an
+        // invalid/oversized proposal be staged, rendered in full into chat,
+        // and only rejected by the real handler at /refine apply AFTER the
+        // user approved, consuming the staged set as a silent no-op.
+        const invalid = await validateMutationForStaging(memoryService, ctx, input);
+        if (invalid !== null) {
+          journal.push({ ...target, applied: false, note: invalid });
+          return { success: false, error: invalid };
+        }
         journal.push({ ...target, applied: false, note: "dry-run" });
+        args.onStagedMutation?.(input, toolCallId);
         return { success: true, output: `[dry-run] recorded ${target.command} ${target.path}` };
       }
 
-      const result = await executeMemoryCommand(memoryService, ctx, input, () => null);
+      const result = await executeMemoryCommand(memoryService, ctx, input, () => null, toolCallId, {
+        expectedTargetFingerprint: args.expectedTargetFingerprints?.get(toolCallId),
+        abortSignal: args.abortSignal,
+        rejectPinned: true,
+      });
       journal.push({
         ...target,
         applied: result.success,
@@ -186,7 +346,7 @@ export function createConsolidationMemoryTool(args: {
       return result;
     },
   });
-  return { tool: memoryTool, getMutationCount: () => mutationCount };
+  return { tool: memoryTool, getMutationCount: () => budget.used() };
 }
 
 /**
@@ -221,6 +381,8 @@ export async function runMemoryConsolidation(args: {
     usage: LanguageModelV2Usage,
     providerMetadata?: Record<string, unknown>
   ) => Promise<void>;
+  /** Pricing identity of `model`; its long-context threshold sets each step's tier. */
+  pricingModel?: string;
 }): Promise<MemoryConsolidationResult> {
   assert(args.agentBody.trim().length > 0, "dream agent body must not be empty");
   const journal: MemoryConsolidationOp[] = [];
@@ -230,6 +392,10 @@ export async function runMemoryConsolidation(args: {
     ctx: args.ctx,
     dryRun: args.dryRun,
     journal,
+    // r59: workspace removal aborts this signal — a tool execution wedged in
+    // filesystem I/O must not commit durable memory (or recreate the deleted
+    // session directory via its journal row) once the I/O unblocks.
+    abortSignal: args.abortSignal,
   });
 
   const finalPassPrompt =
@@ -276,7 +442,10 @@ export async function runMemoryConsolidation(args: {
         inputTokens: totalUsage.inputTokens ?? 0,
         outputTokens: totalUsage.outputTokens ?? 0,
       };
-      await args.recordUsage?.(totalUsage, accumulateStepsProviderMetadata(await stream.steps));
+      await args.recordUsage?.(
+        totalUsage,
+        accumulateStepsProviderMetadata(await stream.steps, args.pricingModel)
+      );
     } catch {
       usage = undefined;
     }

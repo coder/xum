@@ -5,7 +5,11 @@ import type { TaskReportLinking } from "@/browser/utils/messages/taskReportLinki
 import type { ReviewNoteData } from "@/common/types/review";
 import type { EditingMessageState } from "@/browser/utils/chatEditing";
 import { UserMessage, type UserMessageNavigation } from "./UserMessage";
+import { AgentPeerMessage } from "./AgentPeerMessage";
 import { BashMonitorWakeMessage } from "./BashMonitorWakeMessage";
+import { CollapsibleMachineMessage } from "./CollapsibleMachineMessage";
+import { AlertTriangle, ListTodo, MessageSquare } from "lucide-react";
+import { classifyTodoTurnEndNudgePrompt } from "@/common/utils/machineTurnPrompts";
 import {
   BackgroundWorkWakeMessage,
   getBackgroundWorkWakeSummary,
@@ -17,8 +21,8 @@ import { StreamErrorMessage } from "./StreamErrorMessage";
 import { CompactionBoundaryMessage } from "./CompactionBoundaryMessage";
 import { HistoryHiddenMessage } from "./HistoryHiddenMessage";
 import { InitMessage } from "./InitMessage";
-import { ProposePlanToolCall } from "../Tools/ProposePlanToolCall";
-import { removeEphemeralMessage } from "@/browser/stores/WorkspaceStore";
+import { LazyProposePlanToolCall } from "../Tools/Shared/ToolCardsLoad";
+import { removeEphemeralMessage, useStreamingMessageDelta } from "@/browser/stores/WorkspaceStore";
 import { TranscriptMessageBoundary, TranscriptQuoteRoot } from "./TranscriptQuoteBoundary";
 
 interface MessageRendererProps {
@@ -28,6 +32,8 @@ interface MessageRendererProps {
   onEditQueuedMessage?: () => void;
   workspaceId?: string;
   isCompacting?: boolean;
+  /** An edit send is unresolved: user messages cannot start another edit. */
+  editSendPending?: boolean;
   /** Handler for adding review notes from inline diffs */
   onReviewNote?: (data: ReviewNoteData) => void;
   /** Whether this message is the latest propose_plan tool call (for external edit detection) */
@@ -38,6 +44,13 @@ interface MessageRendererProps {
   taskReportLinking?: TaskReportLinking;
   /** Navigation info for user messages (backward/forward between user messages) */
   userMessageNavigation?: UserMessageNavigation;
+  /**
+   * Closes an ephemeral row (plan-display). Hosts that keep their own aggregator (the VS Code
+   * webview) pass it because the default path acts on WorkspaceStore's aggregator.
+   */
+  onCloseEphemeral?: (historyId: string) => void;
+  /** "Load all" handler for history-hidden rows; same reason as onCloseEphemeral. */
+  onShowAllHistory?: () => void;
 }
 
 function getMessageHistoryId(message: DisplayedMessage): string | undefined {
@@ -76,17 +89,21 @@ function getTranscriptQuoteText(message: DisplayedMessage): string | null {
 // Memoized to prevent unnecessary re-renders when parent (AIView) updates
 export const MessageRenderer = React.memo<MessageRendererProps>(
   ({
-    message,
+    message: messageProp,
     className,
     onEditUserMessage,
     workspaceId,
     isCompacting,
+    editSendPending,
     onReviewNote,
     isLatestProposePlan,
     bashOutputGroup,
     taskReportLinking,
     userMessageNavigation,
+    onCloseEphemeral,
+    onShowAllHistory,
   }) => {
+    const message = useStreamingMessageDelta(workspaceId, messageProp);
     let renderedMessage: React.ReactNode;
 
     // Route based on message type
@@ -94,9 +111,52 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
       case "user": {
         const backgroundWorkWakeSummary =
           message.isSynthetic === true ? getBackgroundWorkWakeSummary(message.content) : null;
+        const todoNudgeKind =
+          message.isSynthetic === true ? classifyTodoTurnEndNudgePrompt(message.content) : null;
         renderedMessage =
-          message.bashMonitorWake != null ? (
+          message.contextBudgetWarning != null ? (
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary={
+                message.contextBudgetWarning.final
+                  ? "Context window ending: final handoff"
+                  : message.contextBudgetWarning.handoff
+                    ? "Context handoff requested"
+                    : "Context budget warning"
+              }
+              icon={<AlertTriangle aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="context-budget-warning"
+              className={className}
+            />
+          ) : message.bashMonitorWake != null ? (
             <BashMonitorWakeMessage message={message} className={className} />
+          ) : message.agentPeerMessageTrigger != null ? (
+            // The wake trigger is backend-generated control text: a full user bubble would
+            // falsely present it as human input (the payload renders separately as the
+            // assistant-side agent-message card).
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary="Agent message notification"
+              icon={<MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="agent-peer-message-trigger"
+              className={className}
+            />
+          ) : todoNudgeKind != null ? (
+            // Xum's turn-end TODO nudge is constant control text, not user input. Exact match
+            // only: a nudge joined to a plugin's turn.stop prompt keeps the full bubble so the
+            // plugin's text stays visible. The current nudge keeps the turn's tools and can do real
+            // work, so its summary says so; rows from #6720 were todo_write-only list updates.
+            <CollapsibleMachineMessage
+              content={message.content}
+              summary={
+                todoNudgeKind === "current"
+                  ? "Asked the agent to update its TODO list and finish open items"
+                  : "Asked the agent to update its TODO list"
+              }
+              icon={<ListTodo aria-hidden="true" className="size-3.5 shrink-0" />}
+              marker="todo-turn-end-nudge"
+              className={className}
+            />
           ) : backgroundWorkWakeSummary != null ? (
             <BackgroundWorkWakeMessage
               message={message}
@@ -109,20 +169,26 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
               className={className}
               onEdit={onEditUserMessage}
               isCompacting={isCompacting}
+              editSendPending={editSendPending}
               navigation={userMessageNavigation}
             />
           );
         break;
       }
       case "assistant":
-        renderedMessage = (
-          <AssistantMessage
-            message={message}
-            className={className}
-            workspaceId={workspaceId}
-            isCompacting={isCompacting}
-          />
-        );
+        // Peer message payloads are assistant-role synthetic rows (peer bytes never gain
+        // user-role authority); backend-attached metadata gates the card presentation.
+        renderedMessage =
+          message.agentPeerMessage != null ? (
+            <AgentPeerMessage message={message} className={className} />
+          ) : (
+            <AssistantMessage
+              message={message}
+              className={className}
+              workspaceId={workspaceId}
+              isCompacting={isCompacting}
+            />
+          );
         break;
       case "tool":
         renderedMessage = (
@@ -150,7 +216,12 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         break;
       case "history-hidden":
         renderedMessage = (
-          <HistoryHiddenMessage message={message} className={className} workspaceId={workspaceId} />
+          <HistoryHiddenMessage
+            message={message}
+            className={className}
+            workspaceId={workspaceId}
+            onShowAll={onShowAllHistory}
+          />
         );
         break;
       case "workspace-init":
@@ -158,14 +229,16 @@ export const MessageRenderer = React.memo<MessageRendererProps>(
         break;
       case "plan-display":
         renderedMessage = (
-          <ProposePlanToolCall
+          <LazyProposePlanToolCall
             args={{}}
             isEphemeralPreview={true}
             content={message.content}
             path={message.path}
             workspaceId={workspaceId}
             onClose={() => {
-              if (workspaceId) {
+              if (onCloseEphemeral) {
+                onCloseEphemeral(message.historyId);
+              } else if (workspaceId) {
                 removeEphemeralMessage(workspaceId, message.historyId);
               }
             }}

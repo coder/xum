@@ -9,8 +9,7 @@ import userEvent from "@testing-library/user-event";
 
 import { CUSTOM_EVENTS } from "@/common/constants/events";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { getModelKey } from "@/common/constants/storage";
-import { readPersistedState } from "@/browser/hooks/usePersistedState";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
 
 import { shouldRunIntegrationTests } from "../../testUtils";
@@ -20,9 +19,10 @@ import { createAppHarness } from "../harness";
 const describeIntegration = shouldRunIntegrationTests() ? describe : describe.skip;
 
 const SOL_MODEL = KNOWN_MODELS.GPT.id;
-// Pro mode is family-wide across GPT-5.6 (incl. Luna), so the hidden case
-// uses a pre-5.6 OpenAI model that can still exercise the fast-mode row.
-const NON_PRO_MODEL = KNOWN_MODELS.GPT_PRO.id;
+// Every supported GPT built-in (GPT-6 Astra/Luna, GPT-6.1 Sol) supports Pro mode, so the
+// hidden case uses a custom direct OpenAI model that can still exercise the fast-mode row.
+const NON_PRO_PROVIDER_MODEL_ID = "some-custom-model";
+const NON_PRO_MODEL = `openai:${NON_PRO_PROVIDER_MODEL_ID}`;
 
 async function openModelSelector(container: HTMLElement): Promise<HTMLInputElement> {
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.OPEN_MODEL_SELECTOR));
@@ -55,7 +55,7 @@ async function selectModel(
   fireEvent.click(option);
 
   await waitFor(() => {
-    const persisted = readPersistedState(getModelKey(workspaceId), "");
+    const persisted = getWorkspaceAiSelection(workspaceId).model;
     if (persisted !== model) {
       throw new Error(`Expected model ${model} but got ${persisted}`);
     }
@@ -96,6 +96,11 @@ describeIntegration("Thinking selector", () => {
       branchPrefix: "thinking-selector",
       beforeRenderEnvironment: async (env) => {
         await setupProviders(env, { xai: { apiKey: "dummy" } });
+        const result = await env.orpc.providers.setModels({
+          provider: "openai",
+          models: [NON_PRO_PROVIDER_MODEL_ID],
+        });
+        if (!result.success) throw new Error(`Failed to seed custom OpenAI model: ${result.error}`);
       },
     });
 
@@ -130,7 +135,7 @@ describeIntegration("Thinking selector", () => {
       });
 
       const proToggle = within(menu).getByRole("button", { name: /Pro mode/i });
-      const fastToggle = within(menu).getByRole("button", { name: /Fast mode/i });
+      const fastToggle = within(menu).getByRole("button", { name: /^Fast mode/i });
       await expectPressed(proToggle, false);
       await expectPressed(fastToggle, false);
 
@@ -161,8 +166,8 @@ describeIntegration("Thinking selector", () => {
         }
       });
 
-      // GPT-5.5 Pro does not support reasoning.mode=pro, but fast mode remains
-      // available because it is a direct OpenAI service-tier option.
+      // A custom OpenAI model does not support reasoning.mode=pro, but fast mode
+      // remains available because it is a direct OpenAI service-tier option.
       await selectModel(container, harness.workspaceId, NON_PRO_MODEL);
       menu = await openThinkingSelector(container);
       if (menu.querySelector('[data-component="ProModeToggle"]')) {
@@ -171,19 +176,38 @@ describeIntegration("Thinking selector", () => {
       if (!menu.querySelector('[data-component="FastModeToggle"]')) {
         throw new Error("Fast mode should remain available for direct OpenAI models");
       }
+      if (menu.querySelector('[data-component="UltrafastModeToggle"]')) {
+        throw new Error("Ultrafast toggle should not render for a model without Ultrafast");
+      }
       fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
 
-      // Workspace-scoped Pro state survives model switches; OpenAI fast mode remains
-      // in its provider config and becomes active again when returning to OpenAI.
+      // Workspace-scoped Pro and Fast state survive model switches, like the thinking level.
       await selectModel(container, harness.workspaceId, SOL_MODEL);
       menu = await openThinkingSelector(container);
       await expectPressed(within(menu).getByRole("button", { name: /Pro mode/i }), true);
-      await expectPressed(within(menu).getByRole("button", { name: /Fast mode/i }), true);
+      await expectPressed(within(menu).getByRole("button", { name: /^Fast mode/i }), true);
+
+      // Ultrafast sits next to Fast mode; the two premium tiers are mutually exclusive.
+      const ultrafastToggle = within(menu).getByRole("button", { name: /^Ultrafast mode/i });
+      await expectPressed(ultrafastToggle, false);
+      fireEvent.click(ultrafastToggle);
+      await expectPressed(ultrafastToggle, true);
+      await expectPressed(within(menu).getByRole("button", { name: /^Fast mode/i }), false);
+      await waitFor(() => {
+        if (!container.querySelector("[data-ultrafast-mode-indicator]")) {
+          throw new Error("Ultrafast indicator was not rendered");
+        }
+        if (container.querySelector("[data-fast-mode-indicator]")) {
+          throw new Error("Fast indicator should clear when Ultrafast replaces it");
+        }
+      });
+      fireEvent.click(ultrafastToggle);
+      await expectPressed(ultrafastToggle, false);
       fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
 
       // Grok uses the same thinking selector with its native low/medium/high/xhigh
-      // ladder, while Fast mode writes xAI's priority tier instead of OpenAI's.
-      await selectModel(container, harness.workspaceId, KNOWN_MODELS.GROK_46.id);
+      // ladder; its Fast toggle reads and writes the same chat speed as OpenAI's.
+      await selectModel(container, harness.workspaceId, KNOWN_MODELS.GROK_47.id);
       menu = await openThinkingSelector(container);
       if (menu.querySelector('[data-component="ProModeToggle"]')) {
         throw new Error("Pro toggle should not render for Grok");
@@ -195,13 +219,19 @@ describeIntegration("Thinking selector", () => {
       within(menu).getByRole("option", { name: "High" });
       within(menu).getByRole("option", { name: "Extra High" });
 
-      const grokFastToggle = within(menu).getByRole("button", { name: /Fast mode/i });
+      const grokFastToggle = within(menu).getByRole("button", { name: /^Fast mode/i });
       await expectPressed(grokFastToggle, false);
       fireEvent.click(grokFastToggle);
       await expectPressed(grokFastToggle, true);
       if (!container.querySelector("[data-fast-mode-indicator]")) {
         throw new Error("Grok fast-mode indicator was not rendered");
       }
+      fireEvent.click(container.querySelector("[data-thinking-selector-trigger]")!);
+
+      // The chat's Fast pick follows it back to OpenAI instead of the provider's setting.
+      await selectModel(container, harness.workspaceId, SOL_MODEL);
+      menu = await openThinkingSelector(container);
+      await expectPressed(within(menu).getByRole("button", { name: /^Fast mode/i }), true);
     } finally {
       await harness.dispose();
     }

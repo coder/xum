@@ -2,10 +2,10 @@ import React, { useEffect } from "react";
 import { ArrowLeftRight, Github, MessageCircle } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { GIT_STATUS_INDICATOR_MODE_KEY } from "@/common/constants/storage";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import type { GitStatusIndicatorMode } from "../GitStatusIndicatorView/GitStatusIndicatorView";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { isDevcontainerRuntime, type RuntimeConfig } from "@/common/types/runtime";
+import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
+import type { ProjectConfig } from "@/common/types/project";
 import { getDevcontainerStatusChip } from "@/browser/utils/runtimeUi";
 import { formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
 import { hasWorkspaceRepository } from "@/browser/utils/workspaceCapabilities";
@@ -20,6 +20,7 @@ import {
   useWorkspaceUsage,
 } from "@/browser/stores/WorkspaceStore";
 import { useGitStatus } from "@/browser/stores/GitStatusStore";
+import { useNarrowViewport } from "@/browser/hooks/useNarrowViewport";
 import { useWorkspacePR } from "@/browser/stores/PRStatusStore";
 import { useRuntimeStatus } from "@/browser/stores/RuntimeStatusStore";
 import { useProjectContext } from "@/browser/contexts/ProjectContext";
@@ -54,6 +55,7 @@ function WorkspaceDriftIndicator(props: {
   projectPath: string;
   isWorking: boolean;
   showMultiProjectStatus: boolean;
+  isNarrow: boolean;
 }) {
   const gitStatus = useGitStatus(props.workspaceId);
 
@@ -66,33 +68,40 @@ function WorkspaceDriftIndicator(props: {
         workspaceId={props.workspaceId}
         tooltipPosition="bottom"
         isWorking={props.isWorking}
+        compact={props.isNarrow}
       />
     );
   }
 
   return (
     <div className="flex shrink-0 items-center gap-1.5">
-      <DriftModeToggle />
+      {/* Phones drop the label to save width; the diff numbers themselves toggle the mode. */}
+      <DriftModeToggle showLabel={!props.isNarrow} />
       <GitStatusIndicator
         gitStatus={gitStatus}
         workspaceId={props.workspaceId}
         projectPath={props.projectPath}
         tooltipPosition="bottom"
         isWorking={props.isWorking}
+        tapTogglesMode={props.isNarrow}
       />
     </div>
   );
 }
 
-/** Shares the divergence dialog's persisted mode key so both surfaces stay in sync. */
-function DriftModeToggle() {
-  const [mode, setMode] = usePersistedState<GitStatusIndicatorMode>(
-    GIT_STATUS_INDICATOR_MODE_KEY,
-    "line-delta",
-    { listener: true }
-  );
+/**
+ * Shares the divergence dialog's mode preference so both surfaces stay in sync. Stays mounted
+ * without its label so the keyboard shortcut works at every width.
+ */
+function DriftModeToggle(props: { showLabel: boolean }) {
+  const mode =
+    useUserPreferences((preferences) => preferences.appearance?.gitStatusIndicatorMode) ??
+    "line-delta";
   const isLineDelta = mode === "line-delta";
-  const toggleMode = () => setMode((prev) => (prev === "line-delta" ? "divergence" : "line-delta"));
+  const toggleMode = () =>
+    updateUserPreferences({
+      appearance: { gitStatusIndicatorMode: isLineDelta ? "divergence" : "line-delta" },
+    });
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -104,6 +113,10 @@ function DriftModeToggle() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   });
+
+  if (!props.showLabel) {
+    return null;
+  }
 
   return (
     <Tooltip>
@@ -125,33 +138,51 @@ function DriftModeToggle() {
   );
 }
 
+type DevcontainerChip = ReturnType<typeof getDevcontainerStatusChip>;
+
 function WorkspaceBranchControls(props: {
   workspaceId: string;
   workspaceName: string;
-  devcontainerChip: ReturnType<typeof getDevcontainerStatusChip>;
+  devcontainerChip: DevcontainerChip;
+  isNarrow: boolean;
 }) {
+  // The branch truncates rather than push the row past a phone screen (#5769). Phones give it only
+  // the width the other items leave, so a short repo label stays whole, but never less than a touch
+  // target, so a full row truncates the repo label rather than clip the branch button. Phones also
+  // drop the copy button, whose touch target would take the name's room (the header's details
+  // popover still copies the branch), and the wrapper, so the devcontainer chip keeps its width.
   return (
-    <div className="flex shrink-0 items-center gap-1">
+    <div className={props.isNarrow ? "contents" : "flex min-w-0 items-center gap-1"}>
       <BranchSelector
         key={props.workspaceId}
         workspaceId={props.workspaceId}
         workspaceName={props.workspaceName}
+        className={props.isNarrow ? "max-w-max min-w-11 grow basis-0" : "min-w-0"}
+        showCopyButton={!props.isNarrow}
       />
-      {props.devcontainerChip && (
-        <span
-          className={cn(
-            "shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-tight font-medium",
-            props.devcontainerChip.className
-          )}
-        >
-          {props.devcontainerChip.label}
-        </span>
-      )}
+      {props.devcontainerChip && <FooterDevcontainerChip chip={props.devcontainerChip} />}
     </div>
   );
 }
 
-function FooterRepositoryLabel(props: { workspaceId: string; projectLabel: string }) {
+function FooterDevcontainerChip(props: { chip: NonNullable<DevcontainerChip> }) {
+  return (
+    <span
+      className={cn(
+        "shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-tight font-medium",
+        props.chip.className
+      )}
+    >
+      {props.chip.label}
+    </span>
+  );
+}
+
+function FooterRepositoryLabel(props: {
+  workspaceId: string;
+  projectLabel: string;
+  isNarrow: boolean;
+}) {
   const workspacePR = useWorkspacePR(props.workspaceId);
 
   if (!workspacePR) {
@@ -169,10 +200,15 @@ function FooterRepositoryLabel(props: { workspaceId: string; projectLabel: strin
           target="_blank"
           rel="noopener noreferrer"
           data-testid="workspace-footer-repository"
-          className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 shrink-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1"
+          className={cn(
+            "text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-5 min-w-0 items-center gap-1 rounded-md px-1.5 transition-colors focus-visible:ring-1",
+            // Phones cap a long owner/repo like the project label, so the branch keeps some room.
+            props.isNarrow && "max-w-40"
+          )}
         >
           <Github className="h-3 w-3 shrink-0" aria-hidden="true" />
-          <span className="font-mono">{slug}</span>
+          {/* Truncates like the branch name, so a long owner/repo fits a phone screen (#5769). */}
+          <span className="truncate font-mono">{slug}</span>
         </a>
       </TooltipTrigger>
       <TooltipContent side="top">Open on GitHub</TooltipContent>
@@ -220,7 +256,7 @@ function FooterLastPrompt(props: { workspaceId: string }) {
   const revealOperationRef = React.useRef(0);
   const lastPromptMessageId = lastPrompt?.messageId;
   const [revealState, setRevealState] = React.useState<
-    "idle" | "revealing" | "not-found" | "error"
+    "idle" | "revealing" | "not-found" | "not-loaded" | "error"
   >("idle");
 
   useEffect(() => {
@@ -353,6 +389,8 @@ function FooterLastPrompt(props: { workspaceId: string }) {
         </button>
         {revealState === "not-found" ? (
           <div className="text-muted mt-1.5 text-[10px]">Prompt not found in the transcript</div>
+        ) : revealState === "not-loaded" ? (
+          <div className="text-muted mt-1.5 text-[10px]">Prompt is too far back to reveal</div>
         ) : revealState === "error" ? (
           <div className="text-muted mt-1.5 text-[10px]">Reveal unavailable</div>
         ) : null}
@@ -361,22 +399,28 @@ function FooterLastPrompt(props: { workspaceId: string }) {
   );
 }
 
+// Metadata uses the top-level project name, so include a known sub-project path to preserve
+// the workspace's full project context.
+function getFooterProjectLabel(
+  workspaceEntry: FrontendWorkspaceMetadata | undefined,
+  userProjects: Map<string, ProjectConfig>,
+  projectName: string
+): string {
+  if (workspaceEntry?.kind === "scratch") return SCRATCH_PROJECT_NAME;
+  const subProjectPath = workspaceEntry?.subProjectPath;
+  return subProjectPath && userProjects.has(subProjectPath)
+    ? formatProjectHierarchyLabel(subProjectPath, userProjects)
+    : projectName;
+}
+
 export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => {
   const { workspaceMetadata } = useWorkspaceContext();
   const workspaceEntry = workspaceMetadata.get(props.workspaceId);
   const hasRepository = hasWorkspaceRepository(workspaceEntry);
   const showMultiProjectStatus = workspaceEntry != null && isMultiProject(workspaceEntry);
 
-  // Metadata uses the top-level project name, so include a known sub-project path to preserve
-  // the workspace's full project context.
   const { userProjects } = useProjectContext();
-  const subProjectPath = workspaceEntry?.subProjectPath;
-  const projectLabel =
-    workspaceEntry?.kind === "scratch"
-      ? SCRATCH_PROJECT_NAME
-      : subProjectPath && userProjects.has(subProjectPath)
-        ? formatProjectHierarchyLabel(subProjectPath, userProjects)
-        : props.projectName;
+  const projectLabel = getFooterProjectLabel(workspaceEntry, userProjects, props.projectName);
 
   const { canInterrupt, isStarting, awaitingUserQuestion } = useWorkspaceSidebarState(
     props.workspaceId
@@ -387,6 +431,9 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
   const devcontainerChip = isDevcontainerRuntime(props.runtimeConfig)
     ? getDevcontainerStatusChip(runtimeStatus)
     : null;
+  // One JS source for the phone layout, so the hidden drift label and the tap-to-toggle diff
+  // numbers can never disagree about the width.
+  const isNarrow = useNarrowViewport();
 
   return (
     // Narrow layouts drop the app root's bottom inset, so this row owns it: a capped clearance for
@@ -394,11 +441,11 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
     // reclaiming. Wider layouts still take their clearance from the root.
     <footer
       data-testid="workspace-footer-bar"
-      className="bg-sidebar border-border-light shrink-0 border-t [@media(max-width:768px)]:pb-[min(env(safe-area-inset-bottom,0px),8px)]"
+      className="bg-sidebar border-border-light shrink-0 border-t"
     >
       {/* min-h rather than a fixed height: mobile raises these buttons to 44px touch targets, and a
         capped row would clip them along the same axis overflow-x-auto makes scrollable. */}
-      <div className="scrollbar-none flex min-h-7 items-center gap-2 overflow-x-auto px-2 text-xs whitespace-nowrap">
+      <div className="scrollbar-none scroll-fade-x flex min-h-7 items-center gap-2 overflow-x-auto px-2 text-xs whitespace-nowrap">
         <RuntimeBadge
           runtimeConfig={props.runtimeConfig}
           isWorking={isWorking}
@@ -419,18 +466,30 @@ export const WorkspaceFooterBar: React.FC<WorkspaceFooterBarProps> = (props) => 
               projectPath={props.projectPath}
               isWorking={isWorking}
               showMultiProjectStatus={showMultiProjectStatus}
+              isNarrow={isNarrow}
             />
-            <FooterRepositoryLabel workspaceId={props.workspaceId} projectLabel={projectLabel} />
+            <FooterRepositoryLabel
+              workspaceId={props.workspaceId}
+              projectLabel={projectLabel}
+              isNarrow={isNarrow}
+            />
             <WorkspaceBranchControls
               workspaceId={props.workspaceId}
               workspaceName={props.workspaceName}
               devcontainerChip={devcontainerChip}
+              isNarrow={isNarrow}
             />
           </>
         )}
         {!hasRepository && <FooterProjectLabel projectLabel={projectLabel} />}
-        <FooterUsageStats workspaceId={props.workspaceId} />
-        <FooterLastPrompt workspaceId={props.workspaceId} />
+        {/* Not mounted on phones, so the last-prompt shortcuts cannot open a popover anchored
+          to a hidden trigger. */}
+        {!isNarrow && (
+          <>
+            <FooterUsageStats workspaceId={props.workspaceId} />
+            <FooterLastPrompt workspaceId={props.workspaceId} />
+          </>
+        )}
       </div>
     </footer>
   );

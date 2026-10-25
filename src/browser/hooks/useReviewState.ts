@@ -1,36 +1,15 @@
 /**
  * Hook for managing hunk read state
- * Provides interface for tracking which hunks have been reviewed with localStorage persistence
+ * Provides interface for tracking which hunks have been reviewed, persisted in the
+ * backend review-state store (review-state.json). The per-workspace cap is enforced by
+ * the shared merge helper on both client and server.
  */
 
-import { useCallback, useMemo, useEffect, useState } from "react";
-import { usePersistedState } from "./usePersistedState";
-import type { ReviewState, HunkReadState } from "@/common/types/review";
-import { getReviewStateKey } from "@/common/constants/storage";
+import { useCallback, useMemo } from "react";
+import type { HunkReadState } from "@/common/types/review";
+import { getReviewStateStore, useReviewStateSelector } from "@/browser/stores/ReviewStateStore";
 
-/**
- * Maximum number of read states to keep per workspace (LRU eviction)
- */
-const MAX_READ_STATES = 1024;
-
-/**
- * Evict oldest read states if count exceeds max
- * Keeps the newest MAX_READ_STATES entries
- * Exported for testing
- */
-export function evictOldestReviews(
-  readState: Record<string, HunkReadState>,
-  maxCount: number
-): Record<string, HunkReadState> {
-  const entries = Object.entries(readState);
-  if (entries.length <= maxCount) return readState;
-
-  // Sort by timestamp descending (newest first)
-  entries.sort((a, b) => b[1].timestamp - a[1].timestamp);
-
-  // Keep only the newest maxCount
-  return Object.fromEntries(entries.slice(0, maxCount));
-}
+const EMPTY_READ_STATE: Record<string, HunkReadState> = {};
 
 export interface UseReviewStateReturn {
   /** Check if a hunk is marked as read */
@@ -45,50 +24,31 @@ export interface UseReviewStateReturn {
   clearAll: () => void;
   /** Number of hunks marked as read */
   readCount: number;
+  /** False until the backend review state has hydrated */
+  isLoaded: boolean;
 }
 
 /**
  * Hook for managing hunk read state for a workspace
- * Persists read states to localStorage with automatic LRU eviction
  */
 export function useReviewState(workspaceId: string): UseReviewStateReturn {
-  const [reviewState, setReviewState] = usePersistedState<ReviewState>(
-    getReviewStateKey(workspaceId),
-    {
-      workspaceId,
-      readState: {},
-      lastUpdated: Date.now(),
-    },
-    // Multiple Review surfaces can read/write the same state: the panel marks
-    // hunks read, while the always-mounted sidebar reporter updates the Review
-    // tab badge. Listener mode keeps those hook instances synchronized.
-    { listener: true }
+  // Multiple Review surfaces read/write the same state (the panel marks hunks read, the
+  // always-mounted sidebar reporter updates the Review tab badge); the shared store keeps
+  // every hook instance synchronized.
+  const readState = useReviewStateSelector(
+    workspaceId,
+    (view) => view.sections.readState ?? EMPTY_READ_STATE
   );
-
-  // Apply LRU eviction on initial load
-  const [hasAppliedEviction, setHasAppliedEviction] = useState(false);
-  useEffect(() => {
-    if (!hasAppliedEviction) {
-      setHasAppliedEviction(true);
-      const evicted = evictOldestReviews(reviewState.readState, MAX_READ_STATES);
-      if (Object.keys(evicted).length !== Object.keys(reviewState.readState).length) {
-        setReviewState((prev) => ({
-          ...prev,
-          readState: evicted,
-          lastUpdated: Date.now(),
-        }));
-      }
-    }
-  }, [hasAppliedEviction, reviewState.readState, setReviewState]);
+  const isLoaded = useReviewStateSelector(workspaceId, (view) => view.isReady);
 
   /**
    * Check if a hunk is marked as read
    */
   const isRead = useCallback(
     (hunkId: string): boolean => {
-      return reviewState.readState[hunkId]?.isRead ?? false;
+      return readState[hunkId]?.isRead ?? false;
     },
-    [reviewState.readState]
+    [readState]
   );
 
   /**
@@ -101,28 +61,17 @@ export function useReviewState(workspaceId: string): UseReviewStateReturn {
       if (ids.length === 0) return;
 
       const timestamp = Date.now();
-      setReviewState((prev) => {
-        // Check if any IDs actually need updating (not already read)
-        const needsUpdate = ids.some((id) => !prev.readState[id]?.isRead);
-        if (!needsUpdate) return prev; // Early return - no state change
-
-        // Only spread if we're actually changing something
-        const newReadState = { ...prev.readState };
+      getReviewStateStore().mutate(workspaceId, "readState", (prev) => {
+        const set: Record<string, HunkReadState> = {};
         for (const hunkId of ids) {
-          newReadState[hunkId] = {
-            hunkId,
-            isRead: true,
-            timestamp,
-          };
+          if (!prev[hunkId]?.isRead) {
+            set[hunkId] = { hunkId, isRead: true, timestamp };
+          }
         }
-        return {
-          ...prev,
-          readState: newReadState,
-          lastUpdated: timestamp,
-        };
+        return { set };
       });
     },
-    [setReviewState]
+    [workspaceId]
   );
 
   /**
@@ -130,19 +79,11 @@ export function useReviewState(workspaceId: string): UseReviewStateReturn {
    */
   const markAsUnread = useCallback(
     (hunkId: string) => {
-      setReviewState((prev) => {
-        // Early return if not currently read
-        if (!prev.readState[hunkId]) return prev;
-
-        const { [hunkId]: _, ...rest } = prev.readState;
-        return {
-          ...prev,
-          readState: rest,
-          lastUpdated: Date.now(),
-        };
-      });
+      getReviewStateStore().mutate(workspaceId, "readState", (prev) =>
+        prev[hunkId] ? { delete: [hunkId] } : null
+      );
     },
-    [setReviewState]
+    [workspaceId]
   );
 
   /**
@@ -163,19 +104,17 @@ export function useReviewState(workspaceId: string): UseReviewStateReturn {
    * Clear all read states
    */
   const clearAll = useCallback(() => {
-    setReviewState((prev) => ({
-      ...prev,
-      readState: {},
-      lastUpdated: Date.now(),
+    getReviewStateStore().mutate(workspaceId, "readState", (prev) => ({
+      delete: Object.keys(prev),
     }));
-  }, [setReviewState]);
+  }, [workspaceId]);
 
   /**
    * Calculate number of read hunks
    */
   const readCount = useMemo(() => {
-    return Object.values(reviewState.readState).filter((state) => state.isRead).length;
-  }, [reviewState.readState]);
+    return Object.values(readState).filter((state) => state.isRead).length;
+  }, [readState]);
 
   return {
     isRead,
@@ -184,5 +123,6 @@ export function useReviewState(workspaceId: string): UseReviewStateReturn {
     toggleRead,
     clearAll,
     readCount,
+    isLoaded,
   };
 }

@@ -62,7 +62,7 @@ describeIntegration("terminal PTY", () => {
         await new Promise((resolve) => setTimeout(resolve, 500));
 
         // Send a command that echoes a unique marker
-        client.terminal.sendInput({
+        await client.terminal.sendInput({
           sessionId: session.sessionId,
           data: "echo TERMINAL_TEST_SUCCESS\n",
         });
@@ -125,7 +125,7 @@ describeIntegration("terminal PTY", () => {
         await new Promise((resolve) => setTimeout(resolve, 300));
 
         // Send exit command to cleanly close the shell
-        client.terminal.sendInput({
+        await client.terminal.sendInput({
           sessionId: session.sessionId,
           data: "exit 0\n",
         });
@@ -191,7 +191,7 @@ describeIntegration("terminal PTY", () => {
 
         await new Promise((resolve) => setTimeout(resolve, 300));
 
-        client.terminal.sendInput({
+        await client.terminal.sendInput({
           sessionId: session.sessionId,
           data: "echo RESIZE_TEST_OK\n",
         });
@@ -238,7 +238,7 @@ describeIntegration("terminal PTY", () => {
         await new Promise((resolve) => setTimeout(resolve, 500));
 
         // Use attach endpoint - first message should be screenState
-        const messages: Array<{ type: "screenState" | "output"; data: string }> = [];
+        const messages: { type: "screenState" | "output"; data: string }[] = [];
         const attachPromise = (async () => {
           const iterator = await client.terminal.attach({ sessionId: session.sessionId });
           for await (const msg of iterator) {
@@ -260,7 +260,7 @@ describeIntegration("terminal PTY", () => {
         await new Promise((resolve) => setTimeout(resolve, 100));
 
         // Send command
-        client.terminal.sendInput({
+        await client.terminal.sendInput({
           sessionId: session.sessionId,
           data: "echo ATTACH_TEST\\n",
         });
@@ -315,19 +315,19 @@ describeIntegration("terminal PTY", () => {
         await new Promise((resolve) => setTimeout(resolve, 500));
 
         // First, send some commands to populate terminal state
-        client.terminal.sendInput({
+        await client.terminal.sendInput({
           sessionId: session.sessionId,
           data: "echo LINE1\\n",
         });
         await new Promise((resolve) => setTimeout(resolve, 200));
-        client.terminal.sendInput({
+        await client.terminal.sendInput({
           sessionId: session.sessionId,
           data: "echo LINE2\\n",
         });
         await new Promise((resolve) => setTimeout(resolve, 200));
 
         // Now attach and send more lines - verify order is preserved
-        const messages: Array<{ type: "screenState" | "output"; data: string }> = [];
+        const messages: { type: "screenState" | "output"; data: string }[] = [];
         const attachPromise = (async () => {
           const iterator = await client.terminal.attach({ sessionId: session.sessionId });
           for await (const msg of iterator) {
@@ -345,12 +345,12 @@ describeIntegration("terminal PTY", () => {
 
         // After attach starts, send more lines
         await new Promise((resolve) => setTimeout(resolve, 100));
-        client.terminal.sendInput({
+        await client.terminal.sendInput({
           sessionId: session.sessionId,
           data: "echo LINE3\\n",
         });
         await new Promise((resolve) => setTimeout(resolve, 100));
-        client.terminal.sendInput({
+        await client.terminal.sendInput({
           sessionId: session.sessionId,
           data: "echo LINE4\\n",
         });
@@ -424,7 +424,7 @@ describeIntegration("terminal PTY", () => {
           }
         })();
 
-        client.terminal.sendInput({
+        await client.terminal.sendInput({
           sessionId: session.sessionId,
           data: "echo REATTACH_TEST\n",
         });
@@ -437,7 +437,7 @@ describeIntegration("terminal PTY", () => {
         ]);
 
         // Now use attach to reattach - simulating what happens on workspace switch
-        const attachMessages: Array<{ type: "screenState" | "output"; data: string }> = [];
+        const attachMessages: { type: "screenState" | "output"; data: string }[] = [];
         const attachPromise = (async () => {
           const iterator = await client.terminal.attach({ sessionId: session.sessionId });
           for await (const msg of iterator) {
@@ -461,7 +461,7 @@ describeIntegration("terminal PTY", () => {
         const screenState = attachMessages[0].data;
         expect(screenState.length).toBeGreaterThan(0);
         // Should contain escape sequences
-        expect(screenState).toMatch(/\x1b\[/);
+        expect(screenState).toContain("\x1b[");
 
         await client.terminal.close({ sessionId: session.sessionId });
         await client.workspace.remove({ workspaceId });

@@ -3,15 +3,22 @@ import React, { useContext, useEffect, useId, useRef, useState } from "react";
 import mermaid from "mermaid";
 import { StreamingContext } from "./StreamingContext";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import { isDesktopViewportFocused } from "@/browser/utils/ui/keybinds";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { transcriptMermaidSources } from "@/browser/utils/messages/transcriptQuoteAttributes";
+import { MERMAID_DIAGRAM_ZOOM_KEY } from "@/common/constants/storage";
+import {
+  MERMAID_CONTAINER_STYLE,
+  MERMAID_FRAME_STYLE,
+  MERMAID_PENDING_STYLE,
+  MERMAID_PENDING_TEXT,
+} from "./MermaidPendingFrame";
 
-const MIN_HEIGHT = 300;
 const DEFAULT_ZOOM = 1;
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 3;
 const ZOOM_STEP = 0.1;
 
-// Initialize mermaid
 mermaid.initialize({
   startOnLoad: false,
   theme: "dark",
@@ -87,7 +94,11 @@ function canonicalizeUrlForSchemeCheck(value: string): string {
   for (const char of normalized) {
     const charCode = char.charCodeAt(0);
     const isAsciiControl = charCode <= 0x1f || charCode === 0x7f;
-    if (isAsciiControl || /\s/.test(char)) {
+    // The HTML parser turns an invalid numeric reference (java&#1114112;script:) into U+FFFD
+    // before this check sees the value. Drop it like the other separators, so the check fails
+    // closed and never depends on how a parser decodes such a reference.
+    const isReplacementChar = charCode === 0xfffd;
+    if (isAsciiControl || isReplacementChar || /\s/.test(char)) {
       continue;
     }
 
@@ -219,6 +230,7 @@ const DiagramModal: React.FC<{ children: ReactNode; onClose: () => void }> = ({
 }) => {
   useEffect(() => {
     const handleEscape = (e: KeyboardEvent) => {
+      if (isDesktopViewportFocused(e.target)) return;
       if (e.key !== "Escape") return;
       e.preventDefault();
       e.stopPropagation();
@@ -284,8 +296,11 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   const modalContainerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
-  const [svg, setSvg] = useState<string>("");
-  const lastValidSvgRef = useRef<string>("");
+  // Keep the source and SVG together while a newer chart is pending or invalid.
+  const [renderedDiagram, setRenderedDiagram] = useState<{ svg: string; chart: string } | null>(
+    null
+  );
+  const svg = renderedDiagram?.svg ?? "";
   const stableId = useId();
 
   // Debounce chart changes to avoid flickering during streaming
@@ -298,7 +313,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   }, [chart]);
 
   const [storedDiagramZoom, setStoredDiagramZoom] = usePersistedState(
-    "mermaid-diagram-zoom",
+    MERMAID_DIAGRAM_ZOOM_KEY,
     DEFAULT_ZOOM,
     { listener: true }
   );
@@ -339,8 +354,7 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
           throw new Error("Mermaid returned invalid SVG output");
         }
 
-        lastValidSvgRef.current = sanitizedSvg;
-        setSvg(sanitizedSvg);
+        setRenderedDiagram({ svg: sanitizedSvg, chart: debouncedChart });
         setError(null);
       } catch (err) {
         if (cancelled) return;
@@ -385,20 +399,12 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
   // Keep one stable diagram frame while streaming or while the async Mermaid render is pending.
   // When no SVG has rendered yet, reserve the normal minimum diagram height so the transcript
   // doesn't expand from a short placeholder to a full diagram after debounce/parse/render.
-  const displaySvg = svg || (isStreaming ? lastValidSvgRef.current : "");
+  const displaySvg = svg;
   const showPendingPlaceholder = !displaySvg;
 
   return (
     <>
-      <div
-        style={{
-          position: "relative",
-          margin: "1em 0",
-          background: "var(--color-code-bg)",
-          borderRadius: "4px",
-          padding: "16px",
-        }}
-      >
+      <div style={MERMAID_FRAME_STYLE}>
         <div
           style={{
             position: "absolute",
@@ -426,27 +432,22 @@ export const Mermaid: React.FC<{ chart: string }> = ({ chart }) => {
         </div>
         <div
           className="mermaid-container"
+          ref={(element) => {
+            if (!element) return;
+            if (renderedDiagram) transcriptMermaidSources.set(element, renderedDiagram.chart);
+            else transcriptMermaidSources.delete(element);
+          }}
           style={{
-            maxWidth: "70%",
-            margin: "0 auto",
+            ...MERMAID_CONTAINER_STYLE,
             ["--diagram-zoom" as string]: `${diagramZoom}`,
-            minHeight: `${MIN_HEIGHT}px`,
-            ...(showPendingPlaceholder
-              ? {
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  color: "var(--color-text-secondary)",
-                  fontStyle: "italic",
-                }
-              : {}),
+            ...(showPendingPlaceholder ? MERMAID_PENDING_STYLE : {}),
           }}
           // SECURITY AUDIT: displaySvg is produced by sanitizeMermaidSvg(), which strips
           // active SVG/HTML content before insertion. React children are used for the
           // pending placeholder so untrusted chart text is never rendered as HTML.
           {...(!showPendingPlaceholder ? { dangerouslySetInnerHTML: { __html: displaySvg } } : {})}
         >
-          {showPendingPlaceholder ? "Rendering diagram..." : null}
+          {showPendingPlaceholder ? MERMAID_PENDING_TEXT : null}
         </div>
       </div>
       {isModalOpen && (

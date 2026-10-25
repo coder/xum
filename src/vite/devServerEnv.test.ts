@@ -2,17 +2,17 @@ import { describe, expect, test } from "bun:test";
 import { resolveViteDevServerEnv } from "./devServerEnv";
 
 describe("resolveViteDevServerEnv", () => {
-  test("prefers canonical SHUX values when legacy aliases are also set", () => {
+  test("prefers canonical XUM values when legacy aliases are also set", () => {
     const env = resolveViteDevServerEnv({
-      SHUX_VITE_HOST: "10.0.0.8",
+      XUM_VITE_HOST: "10.0.0.8",
       MUX_VITE_HOST: "10.0.0.9",
-      SHUX_VITE_PORT: "5180",
+      XUM_VITE_PORT: "5180",
       MUX_VITE_PORT: "5181",
-      SHUX_BACKEND_HOST: "10.1.0.8",
+      XUM_BACKEND_HOST: "10.1.0.8",
       MUX_BACKEND_HOST: "10.1.0.9",
-      SHUX_BACKEND_PORT: "3100",
+      XUM_BACKEND_PORT: "3100",
       MUX_BACKEND_PORT: "3101",
-      SHUX_ENABLE_TUTORIALS_IN_SANDBOX: "1",
+      XUM_ENABLE_TUTORIALS_IN_SANDBOX: "1",
       MUX_ENABLE_TUTORIALS_IN_SANDBOX: "0",
     });
 
@@ -23,7 +23,7 @@ describe("resolveViteDevServerEnv", () => {
     expect(env.enableTutorialsInSandbox).toBe("1");
   });
 
-  test("falls back to leftover MUX values when SHUX is unset", () => {
+  test("falls back to leftover MUX values when XUM is unset", () => {
     const env = resolveViteDevServerEnv({
       MUX_VITE_HOST: "10.0.0.9",
       MUX_VITE_PORT: "5181",

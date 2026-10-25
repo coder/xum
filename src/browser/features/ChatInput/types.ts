@@ -1,9 +1,13 @@
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { TelemetryRuntimeType } from "@/common/telemetry/payload";
-import type { Review } from "@/common/types/review";
+import type { Review, ReviewNoteData } from "@/common/types/review";
 import type { EditingMessageState, PendingUserMessage } from "@/browser/utils/chatEditing";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { QueuedMessage } from "@/common/types/message";
+import type {
+  PendingCreationInit,
+  PendingInitialUserMessage,
+} from "@/browser/utils/messages/pendingInitialUserMessage";
 
 export type GoalInterventionPolicy = NonNullable<SendMessageOptions["goalInterventionPolicy"]>;
 export type QueueDispatchMode = NonNullable<SendMessageOptions["queueDispatchMode"]>;
@@ -12,7 +16,12 @@ export interface ChatInputAPI {
   focus: () => void;
   send: () => Promise<void>;
   restoreText: (text: string) => void;
-  restoreDraft: (pending: PendingUserMessage) => void;
+  /**
+   * `retainedSendIds`: the restored input is sends whose text and attachments the draft still
+   * retains under these ids (idempotent sends). Only the reviews are restored here; the rest
+   * becomes visible when the sends resolve as not accepted, so nothing is inserted twice.
+   */
+  restoreDraft: (pending: PendingUserMessage, options?: { retainedSendIds?: string[] }) => void;
   appendText: (text: string) => void;
   prependText: (text: string) => void;
 }
@@ -24,6 +33,10 @@ export interface WorkspaceCreatedOptions {
   pendingStreamModel?: string | null;
   /** Set false when creation does not immediately enqueue an initial user send. */
   markPendingInitialSend?: boolean;
+  /** First message shown as a transcript row until the backend persists it. */
+  pendingUserMessage?: PendingInitialUserMessage;
+  /** Creation card shown until the backend's init events arrive (omitted when no init runs). */
+  pendingCreationInit?: PendingCreationInit;
 }
 
 // Workspace variant: full functionality for existing workspaces
@@ -44,7 +57,15 @@ export interface ChatInputWorkspaceVariant {
   isStreamStarting?: boolean;
   editingMessage?: EditingMessageState;
   onCancelEdit?: () => void;
+  /**
+   * Functional update of the editing state the parent owns (conflict recovery marks the
+   * precondition invalidated and later stores the refreshed candidate). The updater receives
+   * the current state and must return it unchanged when it targets a different message.
+   */
+  onEditingMessageChange?: (update: (current: EditingMessageState) => EditingMessageState) => void;
   onEditLastUserMessage?: () => void;
+  /** An edit send started (true) or settled (false); no new edit may start meanwhile. */
+  onEditSendPendingChange?: (pending: boolean) => void;
   canInterrupt?: boolean;
   disabled?: boolean;
   /** Queued follow-up currently waiting during an active workspace stream. */
@@ -52,11 +73,20 @@ export interface ChatInputWorkspaceVariant {
   onQueuedDispatchModeChange?: (mode: QueueDispatchMode) => Promise<void>;
   onQueuedActionError?: (error: unknown) => void;
   onSendQueuedImmediately?: () => Promise<void>;
+  /** Oldest held (refused, unsent) input: the one the held-input shortcuts act on. */
+  heldInputId?: string;
   /** Optional explanation displayed when input is disabled */
   disabledReason?: string;
   onReady?: (api: ChatInputAPI) => void;
   /** Reviews currently attached to chat (from useReviews hook) */
   attachedReviews?: Review[];
+  /** Add a review to the workspace's review store, attached to chat input */
+  onAddReview?: (data: ReviewNoteData) => Review;
+  /**
+   * The composer applied a restore naming these backend held inputs; release them once `durable`
+   * resolves true, i.e. the backend confirmed the restored draft (#4448)
+   */
+  onAcceptRestoredHeldInputs?: (heldInputIds: string[], durable: Promise<boolean>) => void;
   /** Detach a review from chat input (sets status to pending) */
   onDetachReview?: (reviewId: string) => void;
   /** Detach all attached reviews from chat input */
@@ -88,6 +118,8 @@ export interface ChatInputCreationVariant {
   onModelChange?: (model: string) => void;
   disabled?: boolean;
   onReady?: (api: ChatInputAPI) => void;
+  /** #6038: whether this composer cannot send yet (its branch list is loading or failed). */
+  onCreationSendBlockedChange?: (blocked: boolean) => void;
 }
 
 export type ChatInputProps = ChatInputWorkspaceVariant | ChatInputCreationVariant;

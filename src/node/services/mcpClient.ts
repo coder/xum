@@ -1,5 +1,6 @@
 import {
   Client,
+  InsufficientScopeError,
   SSEClientTransport,
   StreamableHTTPClientTransport,
   type OAuthClientProvider,
@@ -8,12 +9,35 @@ import {
 } from "@modelcontextprotocol/client";
 import { dynamicTool, jsonSchema, type JSONSchema7, type Tool } from "ai";
 import assert from "@/common/utils/assert";
+import {
+  advertisedMCPSettingsToolNames,
+  parseMCPSettingsCapability,
+  type MCPSettingsCapability,
+  type MCPSettingsToolAction,
+} from "@/common/utils/mcpSettings";
+import {
+  isModelVisibleTool,
+  MCP_APP_MIME_TYPE,
+  MCP_APPS_EXTENSION_ID,
+  MCP_APP_TOOL_NAME_MAX_CHARS,
+  mcpAppEntrypointTitle,
+  parseMCPAppEntrypoints,
+  parseMCPToolUiMeta,
+  type MCPAppEntrypointType,
+  type MCPToolUi,
+} from "@/common/utils/mcpApps";
+import { log } from "@/node/services/log";
+import {
+  MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS,
+  MCP_APP_CATALOG_RELIST_MAX_RETRIES,
+} from "@/constants/mcp";
+import { coalesceCatalogChanges } from "./mcpCatalogChanges";
 
 /**
  * MCP client adapter over the official TypeScript SDK v2
  * (@modelcontextprotocol/client).
  *
- * Shux previously used @ai-sdk/mcp, which only speaks MCP protocol revisions up
+ * Xum previously used @ai-sdk/mcp, which only speaks MCP protocol revisions up
  * to 2025-11-25 (initialize handshake + Mcp-Session-Id sessions) and has no
  * support for the stateless 2026-07-28 revision (SEP-2575/2567). The official
  * SDK v2 client implements both revisions; its default connect sequence is the
@@ -25,7 +49,7 @@ import assert from "@/common/utils/assert";
  */
 
 /** Client identity sent to servers (initialize request / clientInfo _meta). */
-const CLIENT_INFO = { name: "shux", version: "1.0.0" };
+const CLIENT_INFO = { name: "xum", version: "1.0.0" };
 
 /**
  * Maximum time a single MCP tool call may run.
@@ -39,15 +63,19 @@ export const MCP_TOOL_CALL_TIMEOUT_MS = 300_000;
  * SDK-level timeout for tools/call requests.
  *
  * @ai-sdk/mcp had no per-request timeouts; the official SDK defaults to 60s,
- * which would cut long-running tool calls that Shux intentionally allows (up to
+ * which would cut long-running tool calls that Xum intentionally allows (up to
  * MCP_TOOL_CALL_TIMEOUT_MS). Keep the SDK timeout slightly above the wrapper
  * deadline so wrapMCPTools' MCPDeadlineError (which drives client recycling)
  * always wins the race, while the SDK still cleans up abandoned requests.
  */
 const SDK_TOOL_CALL_TIMEOUT_MS = MCP_TOOL_CALL_TIMEOUT_MS + 5_000;
 const PROMPT_GET_TIMEOUT_MS = 30_000;
+/** resources/read for MCP Apps views blocks opening the view, so keep it short. */
+const RESOURCE_READ_TIMEOUT_MS = 30_000;
+/** tools/call issued by an MCP Apps view (not by the model). */
+const APP_TOOL_CALL_TIMEOUT_MS = 120_000;
 // One hung server must not stall the whole slash/inline prompt catalog.
-const PROMPT_LIST_TIMEOUT_MS = 10_000;
+export const PROMPT_LIST_TIMEOUT_MS = 10_000;
 
 export interface MCPHttpTransportConfig {
   type: "http" | "sse";
@@ -56,6 +84,11 @@ export interface MCPHttpTransportConfig {
   /** Custom fetch (e.g. WWW-Authenticate capture during server tests). */
   fetch?: typeof fetch;
   authProvider?: OAuthClientProvider;
+  /**
+   * Called with the sanitized scope names when the server refuses a tool call with 403
+   * `insufficient_scope` (#6622). The stored tokens stay: tools that need less keep working.
+   */
+  onInsufficientScope?: (scopes: string[]) => void;
 }
 
 /**
@@ -82,10 +115,42 @@ export interface MCPClientConfig {
    * plain initialize handshake directly.
    */
   prior?: PriorDiscovery;
+  /**
+   * MCP Apps host support (mcp-apps experiment, read at connect time): announce the
+   * `io.modelcontextprotocol/ui` extension, keep tool `_meta.ui`, and leave tools whose
+   * visibility lacks "model" out of tools(). When false the client behaves exactly as before.
+   */
+  mcpApps?: boolean;
+  /**
+   * Called when the server sends notifications/tools/list_changed (MCP App entry points follow
+   * the catalog). A plain handler: it opens no `subscriptions/listen` stream, so it hears what
+   * the server sends unasked. The SDK still evicts its cached tools/list either way.
+   */
+  onToolsListChanged?: () => void;
 }
 
 export type MCPPrompt = Awaited<ReturnType<Client["listPrompts"]>>["prompts"][number];
 export type MCPGetPromptResult = Awaited<ReturnType<Client["getPrompt"]>>;
+export type MCPReadResourceResult = Awaited<ReturnType<Client["readResource"]>>;
+export type MCPRawCallToolResult = Awaited<ReturnType<Client["callTool"]>>;
+
+// `_meta.ui` of the tools() result, read by wrapMCPTools. A WeakMap keeps it off the Tool
+// objects the AI SDK serializes for providers.
+const toolUiByTool = new WeakMap<Tool, MCPToolUi>();
+
+/** MCP Apps view metadata of a tool built by tools(), if any. */
+export function getMCPToolUi(tool: Tool): MCPToolUi | undefined {
+  return toolUiByTool.get(tool);
+}
+
+/** A tool of the latest tools/list that declares MCP App entry points (it always has a view). */
+export interface MCPAppEntrypointTool {
+  toolName: string;
+  /** The spec's entry point title: `title`, then `annotations.title`, then `name`. */
+  title: string;
+  resourceUri: string;
+  types: MCPAppEntrypointType[];
+}
 
 export interface MCPClientHandle {
   /** Fetch tools/list and build AI SDK tools whose execute calls tools/call. */
@@ -102,11 +167,67 @@ export interface MCPClientHandle {
    * the legacy initialize fallback).
    */
   negotiatedProtocolVersion(): string | undefined;
+  /** Self-reported display metadata; never an authorization identity. */
+  serverInfo(): unknown;
   /**
    * Persistable era verdict for this connection, suitable for `prior` on a
    * later connect against the same server config.
    */
   priorDiscovery(): PriorDiscovery;
+  /**
+   * MCP Apps only: `_meta.ui` of a tool from the latest tools() listing, including tools hidden
+   * from the model. Undefined when the tool is unknown or declares no view.
+   */
+  toolUi(name: string): MCPToolUi | undefined;
+  /** MCP Apps only: whether the latest tools() listing contained `name` (hidden tools included). */
+  hasTool(name: string): boolean;
+  /** MCP Apps only: the entry point tools of the latest tools() listing (hidden tools included). */
+  appEntrypoints(): readonly MCPAppEntrypointTool[];
+  /** MCP Apps only: tools/call on behalf of a view; returns the raw CallToolResult. */
+  callToolForApp(
+    name: string,
+    args: Record<string, unknown>,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPRawCallToolResult>;
+  /**
+   * tools/call for a Codex-format plugin hook (mcp_tool handler); returns the raw CallToolResult.
+   * The caller owns the deadline through `signal`.
+   */
+  callToolForHook(
+    name: string,
+    args: Record<string, unknown>,
+    options: { signal: AbortSignal }
+  ): Promise<MCPRawCallToolResult>;
+  /** MCP Apps only: resources/read for a view's ui:// resource or a view's own read. */
+  readResource(uri: string, options?: { signal?: AbortSignal }): Promise<MCPReadResourceResult>;
+  /** The server's `openai/settings` capability, read once at connect. */
+  settingsCapability(): MCPSettingsCapability | undefined;
+  /**
+   * tools/call for the host's settings UI only (the model never sees these
+   * tools). `meta` becomes the request `_meta`.
+   */
+  callSettingsTool(
+    name: string,
+    args: Record<string, unknown>,
+    meta: Record<string, unknown>,
+    options?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<MCPRawCallToolResult>;
+  /**
+   * A tool of the latest tools() listing as a settings layout tool action (hidden tools
+   * included, settings tools excluded). Undefined when the listing has no such tool.
+   */
+  settingsToolAction(name: string): MCPSettingsToolAction | undefined;
+  /**
+   * Re-list the server's tools (tools/list), so settingsToolAction reflects the current catalog.
+   * Settings actions call it before a dispatch on a connection without another refresh.
+   */
+  relistTools(): Promise<void>;
+  /** tools/call for a settings layout tool action, with the spec's `{}` arguments. */
+  callSettingsActionTool(
+    name: string,
+    meta: Record<string, unknown>,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPRawCallToolResult>;
   close(): Promise<void>;
 }
 
@@ -121,14 +242,94 @@ function isHttpTransportConfig(
   return "type" in transport && (transport.type === "http" || transport.type === "sse");
 }
 
+/**
+ * Scope names Xum repeats to the agent and in Settings. Narrower than RFC 6749 §3.3 (which also
+ * allows markup and quotes): real scopes are names, URLs and URNs (`files.write`,
+ * `api://app/.default`, `https://www.googleapis.com/auth/drive`). Other tokens are dropped.
+ */
+const SCOPE_TOKEN = /^[A-Za-z0-9._:/~+-]{1,200}$/;
+const MAX_REPORTED_SCOPES = 20;
+
+/** The scope names of a 403 `insufficient_scope` challenge, without any other server text. */
+export function insufficientScopeNames(requiredScope: string | undefined): string[] {
+  return (requiredScope ?? "")
+    .split(/\s+/)
+    .filter((token) => SCOPE_TOKEN.test(token))
+    .slice(0, MAX_REPORTED_SCOPES);
+}
+
+/**
+ * The error a refused tool call reports to the agent (#6622). For 403 `insufficient_scope` it
+ * names only the scopes: the SDK error also carries the server's `error_description`, which is
+ * server-controlled text and must not reach the model.
+ */
+function toolCallError(
+  error: unknown,
+  onInsufficientScope: ((scopes: string[]) => void) | undefined
+): unknown {
+  if (!(error instanceof InsufficientScopeError)) return error;
+  const scopes = insufficientScopeNames(error.requiredScope);
+  onInsufficientScope?.(scopes);
+  return new Error(
+    `The MCP server refused this tool call: it needs ${scopesNeeded(scopes)}. The user must sign in to this MCP server again and grant it.`
+  );
+}
+
+function scopesNeeded(scopes: string[]): string {
+  return scopes.length > 0 ? `the OAuth scope "${scopes.join(" ")}"` : "more OAuth permissions";
+}
+
+/**
+ * A 403 `insufficient_scope` of any other request (listing, resource read, transport error),
+ * with only the scope names (#6739). The SDK message quotes the server's raw `scope` value, and
+ * the renderer and the logs show these errors.
+ */
+function cleanScopeError<E>(error: E): E | Error {
+  if (!(error instanceof InsufficientScopeError)) return error;
+  return new Error(
+    `The MCP server refused this request: it needs ${scopesNeeded(insufficientScopeNames(error.requiredScope))}.`
+  );
+}
+
+function withCleanScopeError<T>(request: Promise<T>): Promise<T> {
+  return request.catch((error: unknown) => {
+    throw cleanScopeError(error);
+  });
+}
+
+/** An agent's tool call; a 403 `insufficient_scope` becomes toolCallError's message. */
+async function callModelTool(
+  client: Client,
+  call: { name: string; arguments: Record<string, unknown> },
+  signal: AbortSignal | undefined,
+  onInsufficientScope: ((scopes: string[]) => void) | undefined
+): Promise<MCPRawCallToolResult> {
+  try {
+    return await client.callTool(call, {
+      timeout: SDK_TOOL_CALL_TIMEOUT_MS,
+      ...(signal !== undefined ? { signal } : {}),
+    });
+  } catch (error) {
+    throw toolCallError(error, onInsufficientScope);
+  }
+}
+
+function insufficientScopeHandler(
+  transport: MCPClientConfig["transport"]
+): ((scopes: string[]) => void) | undefined {
+  return isHttpTransportConfig(transport) ? transport.onInsufficientScope : undefined;
+}
+
 function createHttpTransport(config: MCPHttpTransportConfig): Transport {
   const url = new URL(config.url);
-  // MCP server URLs are user-configured and already trusted to execute tools,
-  // so follow HTTP redirects (http->https, trailing slash) to avoid breaking
-  // existing setups. Note undici's fetch follows redirects by default; this
-  // pins the behavior explicitly.
+  // The SDK's default redirect policy (since 2.3.0) follows only redirects that stay on the
+  // request's origin and keep the method (307/308, or any redirect of a GET), plus http->https on
+  // the same host with default ports, so trailing-slash and https upgrades keep working. It
+  // refuses a redirect to another origin, so custom headers (API keys) and request bodies never
+  // reach a host the user did not configure (CVE-2026-111769, #7384). Do not set
+  // `redirectPolicy: "follow"`: it restores that leak. A server that moves to another origin
+  // needs its new URL in the config.
   const requestInit: RequestInit = {
-    redirect: "follow",
     ...(config.headers !== undefined ? { headers: config.headers } : {}),
   };
 
@@ -136,6 +337,10 @@ function createHttpTransport(config: MCPHttpTransportConfig): Transport {
     requestInit,
     ...(config.fetch !== undefined ? { fetch: config.fetch } : {}),
     ...(config.authProvider !== undefined ? { authProvider: config.authProvider } : {}),
+    // The SDK default ("reauthorize") reaches the background provider's interactive redirect,
+    // which deletes the stored tokens and signs every tool of the server out. Throw instead, so
+    // only the refused call fails and Settings → MCP prompts a sign-in (#6622).
+    onInsufficientScope: "throw" as const,
   };
 
   // Custom headers in requestInit are merged into every request by both
@@ -147,12 +352,36 @@ function createHttpTransport(config: MCPHttpTransportConfig): Transport {
 }
 
 /**
+ * Record one tools/list entry as a settings layout tool action. The title follows the settings
+ * spec's display name order with the same cleaning as entry point titles; a tool whose name
+ * cleans to nothing is left out.
+ */
+function addSettingsToolAction(
+  actions: Map<string, MCPSettingsToolAction>,
+  definition: Awaited<ReturnType<Client["listTools"]>>["tools"][number],
+  ui: MCPToolUi | undefined
+): void {
+  const title = mcpAppEntrypointTitle(
+    [definition.title, definition.annotations?.title],
+    definition.name
+  );
+  if (title === undefined) return;
+  actions.set(definition.name, {
+    title,
+    readOnly: definition.annotations?.readOnlyHint === true,
+    // Parsed even without MCP Apps (where `ui` is undefined): an app tool must not run as a
+    // regular tool without its view (the manager gives it no action then).
+    opensApp: (ui ?? parseMCPToolUiMeta(definition._meta))?.resourceUri !== undefined,
+  });
+}
+
+/**
  * MCP CallToolResult -> AI SDK tool-result output for the model.
  *
  * Mirrors @ai-sdk/mcp's mcpToModelOutput so model-visible tool results stay
  * identical across the SDK swap.
  */
-function mcpToModelOutput({
+export function mcpToModelOutput({
   output,
 }: {
   output: unknown;
@@ -164,7 +393,7 @@ function mcpToModelOutput({
   };
   // mcpServerManager's wrapMCPTools runs transformMCPResult over execute
   // results first — the single conversion layer for MCP binary content
-  // (image/audio/blob resources, size guard included) — producing Shux's
+  // (image/audio/blob resources, size guard included) — producing Xum's
   // canonical { type: "content", value: [text | media] } shape. Map its
   // media parts to model-output file parts here.
   if (
@@ -214,6 +443,28 @@ function mcpToModelOutput({
   return { type: "content", value: convertedContent };
 }
 
+/** List a connected server's prompts; a server without the prompts capability has none. */
+async function listServerPrompts(
+  client: Client,
+  signal: AbortSignal | undefined
+): Promise<MCPPrompt[]> {
+  // The SDK also returns [] for such a server, but prints a console.debug line
+  // on each call. Xum lists prompts often (composer, tool descriptions), so that
+  // line flooded the server log.
+  if (!client.getServerCapabilities()?.prompts) return [];
+  // Cursorless listPrompts() aggregates pages up to ClientOptions.listMaxPages
+  // and forwards these options to each request; the integration test covers
+  // page two.
+  const result = await withCleanScopeError(
+    client.listPrompts(undefined, {
+      timeout: PROMPT_LIST_TIMEOUT_MS,
+      ...(signal !== undefined ? { signal } : {}),
+    })
+  );
+  assert(Array.isArray(result.prompts), "MCP prompts/list result must carry a prompts array");
+  return result.prompts;
+}
+
 /**
  * Connect to an MCP server and return a handle for tools and prompts.
  *
@@ -223,34 +474,154 @@ function mcpToModelOutput({
  * to a pre-2026 client — on anything but definitive modern evidence. A
  * `prior` verdict skips the probe entirely.
  */
+/**
+ * Hand the server's tools/list_changed notifications to `onChanged` (MCPClientConfig), after a
+ * re-list: a legacy-era instance has no other catalog refresh, so its entry points and app tool
+ * checks would keep the startup listing. Coalesced (coalesceCatalogChanges), so a flood costs
+ * at most one tools/list per interval. Returns the stop for the client's close.
+ */
+function reportToolsListChanged(
+  client: Client,
+  relist: () => Promise<unknown>,
+  onChanged: (() => void) | undefined
+): () => void {
+  if (onChanged === undefined) return () => undefined;
+  const changes = coalesceCatalogChanges({
+    relist,
+    report: onChanged,
+    minIntervalMs: MCP_APP_CATALOG_CHANGE_MIN_INTERVAL_MS,
+    maxRetries: MCP_APP_CATALOG_RELIST_MAX_RETRIES,
+  });
+  client.setNotificationHandler("notifications/tools/list_changed", () => changes.notify());
+  return changes.dispose;
+}
+
+/** What one tools/list showed, for the handle's lookups. */
+interface ListedCatalog {
+  /** Which tools/list call (in start order) produced it. */
+  listing: number;
+  /** Every listed tool (hidden ones included) -> its `_meta.ui`, if any. */
+  tools: Map<string, MCPToolUi | undefined>;
+  entrypoints: readonly MCPAppEntrypointTool[];
+  settingsActions: Map<string, MCPSettingsToolAction>;
+}
+
+/**
+ * The catalog to keep after a listing answers (#6611): overlapping listings (relistTools, a
+ * send) can answer out of order, and a late, older response must not overwrite a newer catalog.
+ */
+function newerCatalog(current: ListedCatalog, answered: ListedCatalog): ListedCatalog {
+  return answered.listing > current.listing ? answered : current;
+}
+
 export async function createMCPClient(config: MCPClientConfig): Promise<MCPClientHandle> {
+  const mcpApps = config.mcpApps === true;
+  const onInsufficientScope = insufficientScopeHandler(config.transport);
+  // App, hook and settings calls report a refused scope the same way as model tools (#6622).
+  const callAnyTool = (...args: Parameters<Client["callTool"]>) =>
+    client.callTool(...args).catch((error: unknown) => {
+      throw toolCallError(error, onInsufficientScope);
+    });
   const client = new Client(CLIENT_INFO, {
     versionNegotiation: {
       mode: "auto",
       probe: { timeoutMs: NEGOTIATION_PROBE_TIMEOUT_MS },
     },
+    // Advertise only what is implemented: text/html views (MCP Apps, SEP-1865).
+    ...(mcpApps
+      ? {
+          capabilities: {
+            extensions: { [MCP_APPS_EXTENSION_ID]: { mimeTypes: [MCP_APP_MIME_TYPE] } },
+          },
+        }
+      : {}),
   });
+  let catalog: ListedCatalog = {
+    listing: 0,
+    tools: new Map(),
+    entrypoints: [],
+    settingsActions: new Map(),
+  };
+  // tools/list calls started; `catalog.listing` is the newest one applied (newerCatalog).
+  let listingsStarted = 0;
 
   if (config.onUncaughtError) {
     const onUncaughtError = config.onUncaughtError;
-    client.onerror = (error) => onUncaughtError(error);
+    client.onerror = (error) => onUncaughtError(cleanScopeError(error));
   }
+  // Set once the handle exists. A notification before then needs no re-list: the first tools()
+  // call lists the current catalog.
+  let relist: () => Promise<unknown> = () => Promise.resolve();
+  const stopCatalogChanges = reportToolsListChanged(
+    client,
+    () => relist(),
+    config.onToolsListChanged
+  );
 
   const transport = isHttpTransportConfig(config.transport)
     ? createHttpTransport(config.transport)
     : config.transport;
 
-  await client.connect(transport, config.prior !== undefined ? { prior: config.prior } : {});
+  await withCleanScopeError(
+    client.connect(transport, config.prior !== undefined ? { prior: config.prior } : {})
+  );
+  const settings = parseMCPSettingsCapability(client.getServerCapabilities());
+  // Only the host reads and writes settings: hiding the tools keeps the model
+  // from changing what the user configured.
+  // Every advertised name, even from a half-malformed capability: hiding stays on.
+  const settingsTools = new Set(advertisedMCPSettingsToolNames(client.getServerCapabilities()));
 
-  return {
+  const handle: MCPClientHandle = {
     tools: async () => {
-      const listResult = await client.listTools();
+      const listing = ++listingsStarted;
+      const listResult = await withCleanScopeError(client.listTools());
       assert(Array.isArray(listResult.tools), "MCP tools/list result must carry a tools array");
 
       const tools: Record<string, Tool> = {};
+      const listed = new Map<string, MCPToolUi | undefined>();
+      const entrypoints: MCPAppEntrypointTool[] = [];
+      const settingsActions = new Map<string, MCPSettingsToolAction>();
       for (const definition of listResult.tools) {
+        // Settings tools are host-only: left out of the listing too, so an MCP App view
+        // cannot call them through callToolForApp (hasTool is false for them).
+        if (settingsTools.has(definition.name)) continue;
+        const ui = mcpApps ? parseMCPToolUiMeta(definition._meta) : undefined;
+        listed.set(definition.name, ui);
+        addSettingsToolAction(settingsActions, definition, ui);
+        // Read before the visibility filter below: entry points ignore visibility.
+        if (ui?.resourceUri !== undefined) {
+          const { types, skippedFile } = parseMCPAppEntrypoints(definition._meta);
+          if (skippedFile) {
+            log.debug("[MCP Apps] Skipping a file entry point (not supported)", {
+              tool: definition.name,
+            });
+          }
+          const title = mcpAppEntrypointTitle(
+            [definition.title, definition.annotations?.title],
+            definition.name
+          );
+          // The routes take 1 to MCP_APP_TOOL_NAME_MAX_CHARS characters (see the constant).
+          const routable =
+            definition.name.length > 0 && definition.name.length <= MCP_APP_TOOL_NAME_MAX_CHARS;
+          if (!routable) {
+            log.debug("[MCP Apps] Skipping an entry point whose tool name the routes refuse", {
+              nameLength: definition.name.length,
+            });
+          }
+          if (types.length > 0 && title !== undefined && routable) {
+            entrypoints.push({
+              toolName: definition.name,
+              title,
+              resourceUri: ui.resourceUri,
+              types,
+            });
+          }
+        }
+        // MCP Apps: "Host MUST NOT include tools in the agent's tool list" when visibility
+        // lacks "model". Such tools stay callable by their views (callToolForApp).
+        if (!isModelVisibleTool(ui)) continue;
         const inputSchema = definition.inputSchema ?? { type: "object" };
-        tools[definition.name] = dynamicTool({
+        const tool = dynamicTool({
           description: definition.description,
           title: definition.title ?? definition.annotations?.title,
           // Server-provided JSON schemas are runtime data; the SDK types them
@@ -266,48 +637,96 @@ export async function createMCPClient(config: MCPClientConfig): Promise<MCPClien
           } as JSONSchema7),
           execute: async (args: unknown, options: { abortSignal?: AbortSignal }) => {
             options.abortSignal?.throwIfAborted();
-            return await client.callTool(
-              {
-                name: definition.name,
-                arguments: args as Record<string, unknown>,
-              },
-              {
-                timeout: SDK_TOOL_CALL_TIMEOUT_MS,
-                ...(options.abortSignal !== undefined ? { signal: options.abortSignal } : {}),
-              }
+            return await callModelTool(
+              client,
+              { name: definition.name, arguments: args as Record<string, unknown> },
+              options.abortSignal,
+              onInsufficientScope
             );
           },
           toModelOutput: mcpToModelOutput,
         });
+        if (ui !== undefined) toolUiByTool.set(tool, ui);
+        tools[definition.name] = tool;
       }
+      // Its tools still go to its caller, even when a newer listing's catalog stays.
+      catalog = newerCatalog(catalog, { listing, tools: listed, entrypoints, settingsActions });
       return tools;
     },
-    prompts: async (options) => {
-      // Cursorless listPrompts() aggregates pages up to ClientOptions.listMaxPages
-      // and forwards these options to each request; the integration test covers
-      // page two.
-      const result = await client.listPrompts(undefined, {
-        timeout: PROMPT_LIST_TIMEOUT_MS,
-        ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-      });
-      assert(Array.isArray(result.prompts), "MCP prompts/list result must carry a prompts array");
-      return result.prompts;
-    },
+    prompts: (options) => listServerPrompts(client, options?.signal),
     getPrompt: (name, args, options) =>
-      client.getPrompt(
-        { name, arguments: args },
-        {
-          // Prompt expansion blocks send preparation, so use a shorter timeout than
-          // tool calls and honor send cancellation.
-          timeout: PROMPT_GET_TIMEOUT_MS,
-          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-        }
+      withCleanScopeError(
+        client.getPrompt(
+          { name, arguments: args },
+          {
+            // Prompt expansion blocks send preparation, so use a shorter timeout than
+            // tool calls and honor send cancellation.
+            timeout: PROMPT_GET_TIMEOUT_MS,
+            ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+          }
+        )
       ),
     negotiatedProtocolVersion: () => client.getNegotiatedProtocolVersion(),
+    serverInfo: () => client.getServerVersion(),
     priorDiscovery: (): PriorDiscovery => {
       const discover = client.getDiscoverResult();
       return discover !== undefined ? { kind: "modern", discover } : { kind: "legacy" };
     },
-    close: () => client.close(),
+    toolUi: (name) => catalog.tools.get(name),
+    hasTool: (name) => catalog.tools.has(name),
+    appEntrypoints: () => catalog.entrypoints,
+    callToolForApp: (name, args, options) => {
+      assert(mcpApps, "callToolForApp requires an MCP Apps connection");
+      return callAnyTool(
+        { name, arguments: args },
+        {
+          timeout: APP_TOOL_CALL_TIMEOUT_MS,
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      );
+    },
+    callToolForHook: (name, args, options) =>
+      callAnyTool({ name, arguments: args }, { signal: options.signal }),
+    readResource: (uri, options) => {
+      assert(mcpApps, "readResource requires an MCP Apps connection");
+      return withCleanScopeError(
+        client.readResource(
+          { uri },
+          {
+            timeout: RESOURCE_READ_TIMEOUT_MS,
+            ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+          }
+        )
+      );
+    },
+    settingsCapability: () => settings,
+    callSettingsTool: (name, args, meta, options) => {
+      assert(settingsTools.has(name), "callSettingsTool only calls the advertised settings tools");
+      return callAnyTool(
+        { name, arguments: args, _meta: meta },
+        {
+          timeout: options?.timeoutMs ?? APP_TOOL_CALL_TIMEOUT_MS,
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        }
+      );
+    },
+    settingsToolAction: (name) => catalog.settingsActions.get(name),
+    relistTools: async () => {
+      await handle.tools();
+    },
+    callSettingsActionTool: (name, meta, options) => {
+      assert(catalog.settingsActions.has(name), "callSettingsActionTool only calls listed tools");
+      // The spec's layout tool accepts `{}`.
+      return callAnyTool(
+        { name, arguments: {}, _meta: meta },
+        { ...options, timeout: APP_TOOL_CALL_TIMEOUT_MS }
+      );
+    },
+    close: () => {
+      stopCatalogChanges();
+      return client.close();
+    },
   };
+  relist = () => handle.tools();
+  return handle;
 }

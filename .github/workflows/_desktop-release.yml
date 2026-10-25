@@ -35,7 +35,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - name: Patch package.json version
         if: inputs.version_override != ''
@@ -75,10 +75,10 @@ jobs:
           # which breaks reruns. Force-upload all macOS assets with --clobber
           # so reruns reliably attach artifacts to the release.
           gh release upload "$RELEASE_TAG" \
-            release/shux-*.dmg \
-            release/shux-*.dmg.blockmap \
-            release/shux-*.zip \
-            release/shux-*.zip.blockmap \
+            release/xum-*.dmg \
+            release/xum-*.dmg.blockmap \
+            release/xum-*.zip \
+            release/xum-*.zip.blockmap \
             release/mux-*.dmg \
             release/mux-*.dmg.blockmap \
             release/mux-*.zip \
@@ -102,7 +102,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - name: Patch package.json version
         if: inputs.version_override != ''
@@ -128,7 +128,7 @@ jobs:
         run: |
           # Same electron-builder 2-hour staleness workaround as macOS.
           gh release upload "$RELEASE_TAG" \
-            release/shux-*.AppImage \
+            release/xum-*.AppImage \
             release/mux-*.AppImage \
             release/*-linux.yml \
             --clobber
@@ -155,7 +155,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - name: Patch package.json version
         if: inputs.version_override != ''
@@ -180,8 +180,8 @@ jobs:
           # Upload only the AppImage (not latest-linux.yml) to avoid
           # overwriting the auto-update manifest produced by the x64 job.
           gh release upload "$RELEASE_TAG" \
-            release/shux-*-arm64.AppImage \
-            release/mux-*-arm64.AppImage \
+            release/xum-*-arm64-linux.AppImage \
+            release/mux-*-arm64-linux.AppImage \
             --clobber
 
   build-windows:
@@ -201,7 +201,7 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       - name: Add MSYS2 make to PATH
         shell: pwsh
@@ -257,8 +257,8 @@ jobs:
         run: |
           # Same electron-builder 2-hour staleness workaround as macOS.
           gh release upload "$RELEASE_TAG" \
-            release/shux-*.exe \
-            release/shux-*.exe.blockmap \
+            release/xum-*.exe \
+            release/xum-*.exe.blockmap \
             release/mux-*.exe \
             release/mux-*.exe.blockmap \
             release/*.yml \
@@ -288,14 +288,14 @@ jobs:
         run: |
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
-            --pattern "shux-*-x86_64.AppImage" \
-            --pattern "shux-*-arm64.AppImage" \
-            --pattern "mux-*-x86_64.AppImage" \
-            --pattern "mux-*-arm64.AppImage" \
+            --pattern "xum-*-x86_64-linux.AppImage" \
+            --pattern "xum-*-arm64-linux.AppImage" \
+            --pattern "mux-*-x86_64-linux.AppImage" \
+            --pattern "mux-*-arm64-linux.AppImage" \
             --dir artifacts
 
           cd artifacts
-          for file in shux-*.AppImage mux-*.AppImage; do
+          for file in xum-*.AppImage mux-*.AppImage; do
             sha256sum "$file" > "${file}.sha256"
           done
 

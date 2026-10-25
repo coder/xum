@@ -163,6 +163,49 @@ describe("TimelinePanel", () => {
     ).not.toBeNull();
   });
 
+  test("renders a prompt-cache break's section, boundary and both block summaries", () => {
+    const cacheBreak = (
+      id: string,
+      seq: number,
+      promptCacheBreak: NonNullable<NonNullable<TimelineEvent["data"]>["promptCacheBreak"]>
+    ) =>
+      makeEvent(id, "cache.prefix_break", seq, {
+        data: { description: "Prompt cache prefix broke in messages at block 6", promptCacheBreak },
+      });
+    const view = renderTimeline({
+      events: [
+        cacheBreak("turn-break", 1, {
+          section: "messages",
+          boundary: "turn",
+          blockIndex: 6,
+          previousBlockCount: 7,
+          nextBlockCount: 7,
+          previous: { role: "user", type: "tool_result", length: 16_820, toolName: "read_file" },
+          next: { role: "user", type: "tool_result", length: 12_043, toolName: "read_file" },
+        }),
+        cacheBreak("step-break", 2, {
+          section: "system",
+          boundary: "step",
+          blockIndex: 2,
+          previousBlockCount: 13,
+          nextBlockCount: 2,
+          previous: { role: "system", type: "text", length: 512 },
+        }),
+      ],
+    });
+
+    const turnRow = view.container.querySelector('[data-timeline-event-id="turn-break"]');
+    expect(turnRow?.textContent).toContain("Prompt cache broke in messages");
+    expect(turnRow?.textContent).toContain("Turn boundary · 6 of 7 blocks matched");
+    expect(turnRow?.textContent).toContain("user · tool_result · read_file · 16,820 chars");
+    expect(turnRow?.textContent).toContain("user · tool_result · read_file · 12,043 chars");
+    const stepRow = view.container.querySelector('[data-timeline-event-id="step-break"]');
+    expect(stepRow?.textContent).toContain("Step boundary · 2 of 13 blocks matched");
+    // No tool name on a system block, and a shorter next request has no block to show.
+    expect(stepRow?.textContent).toContain("system · text · 512 chars");
+    expect(stepRow?.textContent).toContain("Request ended here");
+  });
+
   test("category filters narrow the feed and isolate agent events", () => {
     const events = [
       makeEvent("turn", "turn.user", 1),
@@ -709,9 +752,11 @@ describe("TimelinePanel", () => {
     });
     fireEvent.click(revealButton);
 
+    // Older history remains past the page cap, so the target is "too far back", not missing.
     await waitFor(() => {
-      expect(view.getByTestId("timeline-reveal-not-found")).not.toBeNull();
+      expect(view.getByTestId("timeline-reveal-not-loaded")).not.toBeNull();
     });
+    expect(view.queryByTestId("timeline-reveal-not-found")).toBeNull();
 
     expect(loadOlderHistory).toHaveBeenCalledTimes(10);
     expect(loadOlderHistory).toHaveBeenCalledWith(WORKSPACE_ID);
@@ -824,6 +869,35 @@ describe("TimelinePanel", () => {
       await waitFor(() => {
         if (revealed.length === 0) throw new Error("Reveal was not dispatched");
       });
+    } finally {
+      window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+    }
+  });
+
+  test("ignores the reveal shortcut in a panel hidden behind an open modal", async () => {
+    // A CSS-hidden sidebar keeps its panel mounted while a modal is open; Radix marks content
+    // outside the open modal aria-hidden. The hidden panel's window-level shortcut listener must
+    // not fire a reveal behind the modal.
+    const event = makeEvent("anchored", "turn.completed", 1, {
+      anchor: { messageId: "loaded-message" },
+    });
+    const view = renderTimeline({ events: [event] });
+    view.workspaceState.messages = [{ historyId: "loaded-message" }];
+    const revealed: unknown[] = [];
+    const listener = (revealEvent: Event) => revealed.push(revealEvent);
+    window.addEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
+
+    try {
+      fireEvent.click(view.container.querySelector('[data-timeline-event-id="anchored"]')!);
+      const revealButton = await waitFor(() => view.getByTestId("timeline-reveal"));
+
+      view.container.setAttribute("aria-hidden", "true");
+      fireEvent.keyDown(window, { key: "Enter", ctrlKey: true, shiftKey: true });
+
+      // The guard rejects synchronously, so the button never enters the revealing state.
+      expect(revealButton.textContent).toBe("Reveal in transcript");
+      await Promise.resolve();
+      expect(revealed).toHaveLength(0);
     } finally {
       window.removeEventListener(CUSTOM_EVENTS.REVEAL_TIMELINE_ANCHOR, listener);
     }

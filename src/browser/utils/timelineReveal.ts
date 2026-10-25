@@ -10,7 +10,11 @@ export interface TimelineRevealStore {
   loadOlderHistory: (workspaceId: string) => Promise<HistoryLoadResult>;
 }
 
-export type TimelineRevealResult = "revealed" | "not-found" | "error" | "cancelled";
+/**
+ * `not-loaded`: the page budget ran out while older history remains, so the target may exist
+ * further back. `not-found`: history was read back to its start without the target.
+ */
+export type TimelineRevealResult = "revealed" | "not-found" | "not-loaded" | "error" | "cancelled";
 
 export interface TimelineRevealTarget {
   messageId?: string;
@@ -88,8 +92,12 @@ export async function revealTimelineTarget(options: {
     }
   }
 
+  // Pages are bounded windowed slices (#4961), so the budget bounds what a jump loads. Past it the
+  // target may still exist further back: report that, rather than claiming it is gone.
+  let reachedHistoryStart = false;
   for (let page = 0; page < maxHistoryPages; page++) {
     if (!workspaceStore.getWorkspaceState(workspaceId).hasOlderHistory) {
+      reachedHistoryStart = true;
       break;
     }
 
@@ -119,9 +127,12 @@ export async function revealTimelineTarget(options: {
       }
     }
     if (loadResult === "exhausted") {
+      reachedHistoryStart = true;
       break;
     }
   }
 
-  return "not-found";
+  return reachedHistoryStart || !workspaceStore.getWorkspaceState(workspaceId).hasOlderHistory
+    ? "not-found"
+    : "not-loaded";
 }

@@ -6,11 +6,13 @@ import { capitalize } from "../capitalize";
 
 /** Compact labels preserve the distinguishing model tier when the shared family prefix would truncate it. */
 export function formatCompactModelDisplayName(modelName: string): string {
-  // GPT-5.6's durable tier name carries more information than the shared family prefix when the
-  // composer is space-constrained. Keep the full model name everywhere else.
-  const gptTierMatch = /^gpt-\d+(?:\.\d+)?-(sol|terra|luna)(?:-\d{8}|-\d{4}-\d{2}-\d{2})?$/.exec(
-    modelName.toLowerCase()
-  );
+  // OpenAI's durable tier names (GPT-5.6 Sol/Terra/Luna, GPT-6 Astra) carry more information than
+  // the shared family prefix when the composer is space-constrained. Keep the full model name
+  // everywhere else.
+  const gptTierMatch =
+    /^gpt-\d+(?:\.\d+)?-(sol|terra|luna|astra)(?:-\d{8}|-\d{4}-\d{2}-\d{2})?$/.exec(
+      modelName.toLowerCase()
+    );
   if (gptTierMatch) {
     return capitalize(gptTierMatch[1]);
   }
@@ -44,11 +46,22 @@ export function formatModelDisplayName(modelName: string): string {
     modelName = bedrockParsed;
   }
 
+  // Strip a vendor or gateway provider prefix before any family branch reads the name: a Coder
+  // provider name can look like a model ("claude-aws-us-east-2/claude-haiku-4-5", #5661).
+  const bareModel = withoutGatewayPrefix(modelName);
+  if (bareModel !== undefined) {
+    return formatModelDisplayName(bareModel);
+  }
+
   const lower = modelName.toLowerCase();
 
-  // Claude models - extract the model tier and version
+  // Claude models - extract the model tier and version. A trailing snapshot date
+  // ("claude-haiku-4-5-20251001") is not part of the version.
   if (lower.startsWith("claude-")) {
-    const parts = lower.replace("claude-", "").split("-");
+    const parts = lower
+      .replace("claude-", "")
+      .replace(/-\d{8}$/, "")
+      .split("-");
 
     // Known tiers for Claude models. Fable / Mythos are the Mythos-class tier that
     // sits above Opus (e.g. "claude-fable-5" -> "Fable 5", "claude-mythos-5" -> "Mythos 5").
@@ -62,9 +75,9 @@ export function formatModelDisplayName(modelName: string): string {
       return `${tier} ${version}`;
     }
 
-    // Format: claude-{major}-{minor}-{tier} (older naming like claude-3-5-sonnet)
-    // e.g., "claude-3-5-sonnet" -> "Sonnet 3.5"
-    if (parts.length >= 3) {
+    // Format: claude-{major}[-{minor}]-{tier} (older naming like claude-3-5-sonnet)
+    // e.g., "claude-3-5-sonnet" -> "Sonnet 3.5", "claude-3-haiku-20240307" -> "Haiku 3"
+    if (parts.length >= 2) {
       const tierIdx = parts.findIndex((p) => tiers.includes(p));
       if (tierIdx > 0) {
         const tier = capitalize(parts[tierIdx]);
@@ -79,6 +92,12 @@ export function formatModelDisplayName(modelName: string): string {
       const tier = capitalize(parts[0]);
       return `${tier} ${parts[1]}`;
     }
+  }
+
+  // GLM models
+  if (lower.startsWith("glm-")) {
+    const parts = lower.slice("glm-".length).split("-");
+    return `GLM ${parts.map(capitalize).join(" ")}`;
   }
 
   // GPT models
@@ -203,16 +222,22 @@ export function formatModelDisplayName(modelName: string): string {
     return `${formatted.trim()} (${size.toUpperCase()})`;
   }
 
-  // Gateway-scoped vendor/model pattern (e.g., "meta-llama/llama-3.1-405b")
-  if (modelName.includes("/")) {
-    const slashIdx = modelName.indexOf("/");
-    const bareModel = modelName.slice(slashIdx + 1);
-    // Try formatting the bare model name through existing handlers.
-    return formatModelDisplayName(bareModel);
-  }
-
   // Fallback: capitalize first letter of each dash-separated part
   return modelName.split("-").map(capitalize).join(" ");
+}
+
+/**
+ * The model name after a gateway-scoped "vendor/" or "provider/" prefix
+ * ("meta-llama/llama-3.1-405b" -> "llama-3.1-405b"), or undefined without one. Ollama
+ * "name:tag" ids keep their slash: the tag branch formats them whole.
+ */
+function withoutGatewayPrefix(modelName: string): string | undefined {
+  const slashIdx = modelName.indexOf("/");
+  // A trailing slash leaves no model name: format the id as it is, not as an empty label.
+  if (slashIdx === -1 || slashIdx === modelName.length - 1 || modelName.includes(":")) {
+    return undefined;
+  }
+  return modelName.slice(slashIdx + 1);
 }
 
 /**
@@ -240,7 +265,6 @@ function parseBedrockModelName(modelId: string): string | null {
     return null;
   }
 
-  // Split by dot to get parts
   const dotParts = modelId.split(".");
 
   // Need at least vendor.modelName (2 parts)

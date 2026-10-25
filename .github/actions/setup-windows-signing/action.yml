@@ -43,16 +43,34 @@ runs:
           exit 0
         }
 
+        # Signing requires a GCP access token for Cloud KMS. Fail closed when
+        # auth produced no token (e.g. skipped because no workload identity
+        # provider was configured) so a certificate-bearing release can never
+        # ship unsigned.
+        if (-not $env:GCLOUD_ACCESS_TOKEN) {
+          Write-Host "::error::EV certificate provided but GCP signing auth produced no access token - failing closed"
+          exit 1
+        }
+
         # Save EV certificate to temp file
         $certPath = Join-Path $env:TEMP "ev_cert.pem"
         Set-Content -Path $certPath -Value $env:EV_SIGNING_CERT
         Add-Content -Path $env:GITHUB_ENV -Value "EV_CERTIFICATE_PATH=$certPath"
 
-        # Download jsign
+        # Download jsign, pinned by checksum: this job holds the signing token. The 6.0 release
+        # predates the digests GitHub computes at upload, and its jar is unchanged since its
+        # upload on 2024-01-17. A version bump needs the checksum of your own download, checked
+        # against the digest GitHub reports for the new release asset.
         $jsignPath = Join-Path $env:TEMP "jsign-6.0.jar"
         Invoke-WebRequest -Uri "https://github.com/ebourg/jsign/releases/download/6.0/jsign-6.0.jar" -OutFile $jsignPath
+        $jsignSha256 = (Get-FileHash -Algorithm SHA256 -Path $jsignPath).Hash
+        if ($jsignSha256 -ne "05ca18d4ab7b8c2183289b5378d32860f0ea0f3bdab1f1b8cae5894fb225fa8a") {
+          Write-Host "::error::jsign-6.0.jar has SHA-256 $jsignSha256, not the pinned checksum - failing closed"
+          exit 1
+        }
         Add-Content -Path $env:GITHUB_ENV -Value "JSIGN_PATH=$jsignPath"
 
         Write-Host "✅ Windows EV code signing configured"
       env:
         EV_SIGNING_CERT: ${{ inputs.ev_signing_cert }}
+        GCLOUD_ACCESS_TOKEN: ${{ steps.gcloud_auth.outputs.access_token }}

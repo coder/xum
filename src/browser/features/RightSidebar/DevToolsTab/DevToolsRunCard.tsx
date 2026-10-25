@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { AlertCircle, ChevronRight, Loader2 } from "lucide-react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
 import { cn } from "@/common/lib/utils";
 import type { DevToolsRunSummary, DevToolsStep } from "@/common/types/devtools";
 import { formatDuration } from "@/common/utils/formatDuration";
@@ -12,44 +13,69 @@ interface DevToolsRunCardProps {
   liveSteps?: DevToolsStep[];
 }
 
-export function DevToolsRunCard(props: DevToolsRunCardProps) {
-  const { api } = useAPI();
+type RunDetailRead =
+  | { status: "ok"; steps: DevToolsStep[] }
+  | { status: "error"; error: string }
+  /** Cut off by a lost connection (ConnectionLostError): not an error, the next client retries. */
+  | { status: "lost" };
 
-  const [expanded, setExpanded] = useState(false);
+async function readRunDetail(
+  api: APIClient,
+  workspaceId: string,
+  runId: string
+): Promise<RunDetailRead> {
+  try {
+    const result = await api.devtools.getRunDetail({ workspaceId, runId });
+    return { status: "ok", steps: result?.steps ?? [] };
+  } catch (error: unknown) {
+    if (isConnectionLostError(error)) return { status: "lost" };
+    return {
+      status: "error",
+      error: error instanceof Error ? error.message : "Failed to load run detail",
+    };
+  }
+}
+
+/**
+ * The run's steps, read while the card is expanded and has none yet. A read cut off by a lost
+ * connection keeps the spinner, and the next client (a new `api`: the runs list stays mounted
+ * across a reconnect) reads it again instead of the card keeping a connection error.
+ */
+function useRunDetail(expanded: boolean, workspaceId: string, runId: string) {
+  const { api } = useAPI();
   const [steps, setSteps] = useState<DevToolsStep[] | null>(null);
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const needsDetail = expanded && steps === null;
+  useEffect(() => {
+    if (!needsDetail || !api) {
+      return;
+    }
+    let cancelled = false;
+    setError(null);
+    void readRunDetail(api, workspaceId, runId).then((read) => {
+      if (cancelled || read.status === "lost") return;
+      if (read.status === "ok") {
+        setSteps(read.steps);
+      } else {
+        setError(read.error);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [api, needsDetail, workspaceId, runId]);
+
+  return { steps, error };
+}
+
+export function DevToolsRunCard(props: DevToolsRunCardProps) {
+  const [expanded, setExpanded] = useState(false);
+  const { steps, error } = useRunDetail(expanded, props.workspaceId, props.run.id);
   const displaySteps = mergeDisplaySteps(steps, props.liveSteps);
 
   const handleToggle = () => {
-    const nextExpanded = !expanded;
-    setExpanded(nextExpanded);
-
-    if (!nextExpanded || steps !== null || !api) {
-      return;
-    }
-
-    setLoading(true);
-    setError(null);
-    api.devtools
-      .getRunDetail({
-        workspaceId: props.workspaceId,
-        runId: props.run.id,
-      })
-      .then((result) => {
-        if (!result) {
-          setSteps([]);
-          return;
-        }
-        setSteps(result.steps);
-      })
-      .catch((detailError: unknown) => {
-        setError(detailError instanceof Error ? detailError.message : "Failed to load run detail");
-      })
-      .finally(() => {
-        setLoading(false);
-      });
+    setExpanded(!expanded);
   };
 
   return (
@@ -82,7 +108,9 @@ export function DevToolsRunCard(props: DevToolsRunCardProps) {
 
       {expanded && (
         <div className="border-border-light min-w-0 border-t px-2 py-1.5">
-          {loading && steps === null ? (
+          {/* No steps and no error: the detail is loading, or waits for a client (it loads
+              once Xum reconnects), so this never claims "No steps recorded" too early. */}
+          {steps === null && error === null ? (
             <div className="flex justify-center py-2">
               <Loader2 className="text-muted h-4 w-4 animate-spin" />
             </div>

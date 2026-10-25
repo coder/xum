@@ -12,11 +12,13 @@ import {
 } from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { ProviderIcon, ProviderWithIcon } from "@/browser/components/ProviderIcon/ProviderIcon";
 import { formatModelDisplayName } from "@/common/utils/ai/modelDisplay";
+import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
 import { cn } from "@/common/lib/utils";
 import type { AvailableRoute } from "@/common/routing";
 import { getModelStatsResolved, type ModelStats } from "@/common/utils/tokens/modelStats";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
+import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import {
   getAvailableThinkingLevels,
   getThinkingPolicyForModel,
@@ -155,7 +157,7 @@ function ContextWindowSlider(props: {
           <span
             className={cn(
               "rounded-full px-1.5 py-0.5 font-mono text-[10px] leading-none font-bold transition-colors",
-              props.enabled ? "bg-accent/20 text-accent" : "text-muted"
+              props.enabled ? "bg-accent/20 text-accent-text" : "text-muted"
             )}
           >
             1M
@@ -234,6 +236,10 @@ export interface ModelRowProps {
 export function ModelRow(props: ModelRowProps) {
   const providersConfig = props.providersConfig ?? null;
   const stats = getModelStatsResolved(props.mappedToModel ?? props.fullId, providersConfig);
+  const providerDisplayName = formatProviderDisplayName(
+    props.provider,
+    providersConfig?.[props.provider]
+  );
 
   const contextBaseTokens = props.customContextWindowTokens ?? stats?.max_input_tokens ?? null;
   const mappedProvider = props.mappedToModel ? props.mappedToModel.split(":")[0] || null : null;
@@ -254,12 +260,15 @@ export function ModelRow(props: ModelRowProps) {
   const routeSelectValue =
     props.resolvedRoute && !props.resolvedRoute.isAuto ? props.resolvedRoute.route : "auto";
 
-  // Per-model minimum thinking: only models Shux explicitly recognizes as reasoning models
+  // Per-model minimum thinking: only models Xum explicitly recognizes as reasoning models
   // (with more than one level to choose from) expose a floor control. Unrecognized /
   // non-reasoning models and single-level models (e.g. gpt-5-pro) keep the legacy behavior
   // with no selector. The dropdown lists the model's full capability so users can pick any
   // floor, including off/low.
   const thinkingCapability = getThinkingPolicyForModel(props.fullId, providersConfig);
+  // Label xhigh/max from the mapped target the ladder comes from, as the chat's thinking
+  // selector does: the raw alias id would label both "xhigh" on a native-max target.
+  const thinkingLabelModel = resolveModelForMetadata(props.fullId, providersConfig);
   const supportsMinThinking =
     hasExplicitThinkingPolicy(props.fullId, providersConfig) && thinkingCapability.length > 1;
   // The selected value is the effective floor shown as a plain level (no "Default" wording).
@@ -312,7 +321,7 @@ export function ModelRow(props: ModelRowProps) {
                 size="icon"
                 onClick={props.onSaveEdit}
                 disabled={props.saving}
-                className="text-accent hover:text-accent-dark h-6 w-6"
+                className="text-accent-text hover:text-accent-dark h-6 w-6"
                 title="Save changes (Enter)"
               >
                 <Check className="h-3.5 w-3.5" />
@@ -358,9 +367,18 @@ export function ModelRow(props: ModelRowProps) {
       {/* Model ID + Provider + Aliases */}
       <td className="min-w-0 py-1.5 pr-2 pl-2 md:pl-3">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="shrink-0" title={props.provider}>
-            <ProviderIcon provider={props.provider} className="text-muted h-3.5 w-3.5" />
-          </span>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <span className="shrink-0" role="img" aria-label={providerDisplayName}>
+                {/* Some provider SVGs carry a <title>, which would add a native tooltip. */}
+                <ProviderIcon
+                  provider={props.provider}
+                  className="text-muted pointer-events-none h-3.5 w-3.5"
+                />
+              </span>
+            </TooltipTrigger>
+            <TooltipContent side="top">{providerDisplayName}</TooltipContent>
+          </Tooltip>
           <span className="text-foreground min-w-0 truncate font-mono text-xs">
             {props.modelId}
           </span>
@@ -459,7 +477,7 @@ export function ModelRow(props: ModelRowProps) {
             <SelectContent>
               {thinkingCapability.map((level) => (
                 <SelectItem key={level} value={level}>
-                  {getThinkingOptionLabel(level, props.fullId)}
+                  {getThinkingOptionLabel(level, thinkingLabelModel)}
                 </SelectItem>
               ))}
             </SelectContent>

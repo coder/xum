@@ -66,6 +66,12 @@ interface UseImmersiveOverlayDataInput {
    * refresh) without busting it when a hunk is merely filtered out by mark-read.
    */
   fileContentVersion: string;
+  /**
+   * Multi-project workspaces read from the shared container root, whose per-project
+   * entries are symlinks; their reads must anchor symlink containment to the resolved
+   * project root instead of the container cwd.
+   */
+  isMultiProjectWorkspace?: boolean;
 }
 
 interface UseImmersiveOverlayInput extends UseImmersiveOverlayDataInput {
@@ -440,6 +446,7 @@ function useImmersiveOverlayData(input: UseImmersiveOverlayDataInput) {
           script: buildReadFileScript(resolvedFilePath, {
             maxSizeBytes: MAX_FULL_FILE_CONTEXT_BYTES,
             maxLineCount: MAX_FULL_FILE_CONTEXT_LINES,
+            containmentAnchor: input.isMultiProjectWorkspace ? "first-segment" : "cwd",
           }),
         })
       );
@@ -478,19 +485,18 @@ function useImmersiveOverlayData(input: UseImmersiveOverlayDataInput) {
         const hydratedOverlay = buildOverlayFromFileContent(content, resolvedFileHunks);
         if (hydratedOverlay.lineHunkIds.length <= MAX_HIGHLIGHTED_DIFF_LINES) {
           // Preload syntax tokens before swapping compact hunks to full-file context so
-          // users do not see plain fallback rows flash into colored Shiki spans.
-          const preloadResult = await withFullFileContextTimeout(
+          // users do not see plain fallback rows flash into colored Shiki spans. Best effort:
+          // a highlighter that is slow (a cold worker start takes 5-20 s) or fails must not cost
+          // the file that was read. The context then shows with plain rows, which color in once
+          // the highlight lands (#6303).
+          await withFullFileContextTimeout(
             preloadHighlightedDiff({
               content: hydratedOverlay.content,
               filePath: resolvedFilePath,
               themeMode: resolvedTheme,
-            })
+            }).catch(() => undefined)
           );
           if (cancelled) {
-            return;
-          }
-          if (preloadResult === FULL_FILE_CONTEXT_TIMEOUT) {
-            settleLoadedContent(null, false);
             return;
           }
         }
@@ -510,6 +516,7 @@ function useImmersiveOverlayData(input: UseImmersiveOverlayDataInput) {
     activeFileContentCacheKey,
     input.activeFilePath,
     input.api,
+    input.isMultiProjectWorkspace,
     input.theme,
     input.workspaceId,
     shouldLoadFullFileContext,

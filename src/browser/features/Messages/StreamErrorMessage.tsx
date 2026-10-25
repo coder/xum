@@ -4,7 +4,6 @@ import { Button } from "@/browser/components/Button/Button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
 import { useCompactAndRetry } from "@/browser/hooks/useCompactAndRetry";
 import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { MUX_GATEWAY_ORIGIN } from "@/common/constants/muxGatewayOAuth";
 import { cn } from "@/common/lib/utils";
 import { getModelProvider } from "@/common/utils/ai/models";
 import type { DisplayedMessage } from "@/common/types/message";
@@ -57,6 +56,20 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
     </Tooltip>
   );
 
+  // Perf harness (XUM_REPLAY_TAPES): the backend refused to replay this workspace's tape. No
+  // model or stream was involved, so no error pill and no LLM request debug action.
+  if (message.errorType === "session_tape_replay") {
+    return (
+      <div className={cn("bg-error-bg border border-error rounded px-5 py-4 my-3", className)}>
+        <div className="font-primary text-error mb-2 flex items-center gap-2 text-[13px] font-semibold">
+          <AlertTriangle aria-hidden="true" className="h-4 w-4" />
+          <span>Session tape replay refused</span>
+        </div>
+        <div className="text-foreground/80 text-[13px] leading-relaxed">{message.error}</div>
+      </div>
+    );
+  }
+
   // Runtime unavailable gets a distinct, friendlier presentation.
   // This is a permanent failure (container/runtime doesn't exist), not a transient stream error.
   // The backend sends "Container unavailable..." for Docker or "Runtime unavailable..." for others.
@@ -65,7 +78,7 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
     const title = message.error?.split(".")[0] ?? "Runtime Unavailable";
     return (
       <div className={cn("bg-error-bg border border-error rounded px-5 py-4 my-3", className)}>
-        <div className="font-primary text-error mb-2 flex items-center gap-2 text-[13px] font-semibold">
+        <div className="font-primary text-error mb-2 flex flex-wrap items-center gap-2 text-[13px] font-semibold">
           <AlertTriangle aria-hidden="true" className="h-4 w-4" />
           <span>{title}</span>
           <div className="ml-auto flex items-center">{debugAction}</div>
@@ -85,39 +98,19 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
   // Terminal refusal: distinct from network/empty-output messaging because retrying
   // the same request will refuse again (no auto-retry is scheduled for this type).
   const isModelRefusalError = message.errorType === "model_refusal";
-  // Gateway quota failures need explicit attribution so users know mux gateway credits,
-  // not a provider quota, are blocking the request.
-  const isMuxGatewayQuotaError =
-    message.errorType === "quota" && message.routedThroughGateway === true;
 
-  const title = isMuxGatewayQuotaError
-    ? "Shux Gateway credits depleted"
-    : isAnthropicOverloaded
-      ? "Service overloaded"
-      : isEmptyOutputError
-        ? "No assistant output"
-        : isMaxOutputTokensError
-          ? "Response truncated"
-          : isModelRefusalError
-            ? "Model refused to respond"
-            : "Stream Error";
+  const title = isAnthropicOverloaded
+    ? "Service overloaded"
+    : isEmptyOutputError
+      ? "No assistant output"
+      : isMaxOutputTokensError
+        ? "Response truncated"
+        : isModelRefusalError
+          ? "Model refused to respond"
+          : "Stream Error";
   const pill = isAnthropicOverloaded ? "overloaded" : message.errorType;
-  const body = isMuxGatewayQuotaError
-    ? "Your Shux Gateway credits have been depleted. Add credits or configure another provider to continue."
-    : message.error;
 
-  const ctaAction = isMuxGatewayQuotaError ? (
-    <Button
-      asChild
-      variant="ghost"
-      size="sm"
-      className="text-error/80 hover:text-error h-6 px-2 text-[10px]"
-    >
-      <a href={MUX_GATEWAY_ORIGIN} target="_blank" rel="noopener noreferrer">
-        Add credits <ExternalLink className="ml-1 h-3 w-3" />
-      </a>
-    </Button>
-  ) : isAnthropicOverloaded ? (
+  const ctaAction = isAnthropicOverloaded ? (
     <Button
       asChild
       variant="ghost"
@@ -134,13 +127,15 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
 
   return (
     <div className={cn("bg-error-bg border border-error rounded px-5 py-4 my-3", className)}>
-      <div className="font-primary text-error mb-3 flex items-center gap-2.5 text-[13px] font-semibold tracking-wide">
+      {/* Wraps so the actions drop to their own line in a narrow pane (VS Code sidebar, #5151)
+          instead of overflowing the transcript horizontally. */}
+      <div className="font-primary text-error mb-3 flex flex-wrap items-center gap-2.5 text-[13px] font-semibold tracking-wide">
         <span className="text-base leading-none">●</span>
         <span>{title}</span>
         <code className="bg-foreground/5 text-foreground/80 border-foreground/10 rounded-sm border px-2 py-0.5 font-mono text-[10px] tracking-wider uppercase">
           {pill}
         </code>
-        <div className="ml-auto flex items-center gap-2">
+        <div className="ml-auto flex flex-wrap items-center gap-2">
           {showCount && (
             <span className="text-error rounded-sm bg-red-500/15 px-2 py-0.5 font-mono text-[10px] font-semibold tracking-wide">
               ×{message.errorCount}
@@ -151,7 +146,7 @@ const StreamErrorMessageBase: React.FC<StreamErrorMessageBaseProps> = (props) =>
         </div>
       </div>
       <div className="text-foreground font-mono text-[13px] leading-relaxed break-words whitespace-pre-wrap">
-        {body}
+        {message.error}
       </div>
       {compactionDetails}
       {compactRetryAction ? (

@@ -1,12 +1,12 @@
 /**
- * API CLI subcommand - delegates to a running shux server via HTTP.
+ * API CLI subcommand - delegates to a running xum server via HTTP.
  *
  * This module is loaded lazily to avoid pulling in ESM-only dependencies
  * (trpc-cli) when running other commands like the desktop app.
  *
  * Server discovery priority:
- * 1. SHUX_SERVER_URL env var (explicit override; MUX_SERVER_URL is accepted)
- * 2. Lockfile at ~/.shux/server.lock (running Electron or shux server)
+ * 1. XUM_SERVER_URL env var (explicit override; MUX_SERVER_URL is accepted)
+ * 2. Lockfile at ~/.xum/server.lock (running Electron or xum server)
  * 3. Fallback to http://localhost:3000
  */
 
@@ -14,8 +14,8 @@ import { createCli } from "trpc-cli";
 import { router } from "@/node/orpc/router";
 import { proxifyOrpc } from "./proxifyOrpc";
 import { ServerLockfile } from "@/node/services/serverLockfile";
-import { resolveShuxEnvironmentValue } from "@/common/compat/legacyMux";
-import { getShuxHome } from "@/common/constants/paths";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
+import { getXumHome } from "@/common/constants/paths";
 import { getArgsAfterSplice } from "./argv";
 
 // index.ts already splices "api" from argv before importing this module,
@@ -29,8 +29,8 @@ interface ServerDiscovery {
 
 async function discoverServer(): Promise<ServerDiscovery> {
   // Priority 1: Explicit env vars override everything
-  const serverUrl = resolveShuxEnvironmentValue("SERVER_URL", process.env);
-  const authToken = resolveShuxEnvironmentValue("SERVER_AUTH_TOKEN", process.env);
+  const serverUrl = resolveXumEnvironmentValue("SERVER_URL", process.env);
+  const authToken = resolveXumEnvironmentValue("SERVER_AUTH_TOKEN", process.env);
   if (serverUrl) {
     return {
       baseUrl: serverUrl,
@@ -38,9 +38,9 @@ async function discoverServer(): Promise<ServerDiscovery> {
     };
   }
 
-  // Priority 2: Try lockfile discovery (running Electron or shux server)
+  // Priority 2: Try lockfile discovery (running Electron or xum server)
   try {
-    const lockfile = new ServerLockfile(getShuxHome());
+    const lockfile = new ServerLockfile(getXumHome());
     const data = await lockfile.read();
     if (data) {
       return {
@@ -69,8 +69,8 @@ async function discoverServer(): Promise<ServerDiscovery> {
   // run() sets exitOverride on root, uses parseAsync, and handles process exit properly
   const { run } = createCli({
     router: proxiedRouter,
-    name: "shux api",
-    description: "Interact with the shux API via a running server",
+    name: "xum api",
+    description: "Interact with the xum API via a running server",
   });
 
   try {

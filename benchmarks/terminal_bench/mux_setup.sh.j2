@@ -29,9 +29,47 @@ ensure_tool python3
 export BUN_INSTALL="${BUN_INSTALL:-/root/.bun}"
 export PATH="${BUN_INSTALL}/bin:${PATH}"
 
+# The repo's Bun (package.json packageManager) from its GitHub release, checked against the
+# digests GitHub computed at upload rather than piping bun.sh/install into bash. A version bump
+# needs every digest again: compare `gh api repos/oven-sh/bun/releases/tags/bun-v<version> --jq
+# '.assets[] | .name + " " + .digest'` with a `sha256sum` of your own download of each asset.
+install_bun() {
+  local version="1.4.3" target sha256 tmp
+  case "$(uname -m)" in
+    aarch64 | arm64) target=linux-aarch64 ;;
+    x86_64) target=linux-x64 ;;
+    *)
+      printf 'No pinned Bun build for %s\n' "$(uname -m)" >&2
+      return 1
+      ;;
+  esac
+  # The build bun.sh/install would pick: musl on Alpine, baseline on an x64 CPU without AVX2.
+  if [[ -f /etc/alpine-release ]]; then
+    target="${target}-musl"
+  elif [[ "$target" == linux-x64 ]] && ! grep -q avx2 /proc/cpuinfo; then
+    target=linux-x64-baseline
+  fi
+  case "$target" in
+    linux-x64) sha256=3e730528d89775f03f87f05c06787c4df4099d0a37f3f252e7b829cb23816e18 ;;
+    linux-x64-baseline) sha256=1fc2edac843102909e3a1be1d8d9802cc6071cf074e67e88231f4ffe0f8b397b ;;
+    linux-x64-musl) sha256=6e9ea98554ea0d05efda5840ae292618aaa3adefd66b0853520c5c86a37eac9c ;;
+    linux-aarch64) sha256=efa9813da5ed72423bf847f916e8d2c47c0d776add972354026a75e10da9aa21 ;;
+    linux-aarch64-musl) sha256=8de8a0003cc2707bb555887e3d450e24e1edf3f605f491393e89ed61a8853420 ;;
+  esac
+  tmp=$(mktemp -d)
+  curl -fsSL --retry 3 -o "${tmp}/bun.zip" \
+    "https://github.com/oven-sh/bun/releases/download/bun-v${version}/bun-${target}.zip"
+  echo "${sha256}  ${tmp}/bun.zip" | sha256sum -c -
+  unzip -q "${tmp}/bun.zip" -d "${tmp}"
+  mkdir -p "${BUN_INSTALL}/bin"
+  mv "${tmp}/bun-${target}/bun" "${BUN_INSTALL}/bin/bun"
+  ln -sf bun "${BUN_INSTALL}/bin/bunx"
+  rm -rf "${tmp}"
+}
+
 if ! command -v bun >/dev/null 2>&1; then
   log "installing bun"
-  curl -fsSL "${MUX_BUN_INSTALL_URL:-https://bun.sh/install}" | bash
+  install_bun
 fi
 
 MUX_APP_ROOT="${MUX_APP_ROOT:-/opt/mux-app}"
@@ -58,7 +96,7 @@ if [[ -d "node_modules" ]]; then
   log "node_modules already present, skipping bun install"
 else
   log "installing mux production dependencies via bun"
-  MUX_HEADLESS=1 bun install --production --frozen-lockfile
+  bun install --production --frozen-lockfile
 fi
 
 mkdir -p "${MUX_CONFIG_ROOT}"

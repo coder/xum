@@ -16,7 +16,7 @@ export interface FlattenToolHookEnvOptions {
    * Maximum length for any single env var value.
    *
    * If a value exceeds this limit, the env var is omitted (we do not truncate).
-   * Hooks can use `SHUX_TOOL_INPUT_PATH`/`SHUX_TOOL_RESULT_PATH` for full JSON.
+   * Hooks can use `XUM_TOOL_INPUT_PATH`/`XUM_TOOL_RESULT_PATH` for full JSON.
    */
   maxValueLength?: number;
 
@@ -75,18 +75,27 @@ const LEGACY_ENV_ALIASES: ReadonlyArray<{ canonical: string; legacy: string }> =
 ];
 
 /**
+ * We intentionally do not truncate values. If an env var doesn't fit, omit it
+ * and let hooks use the JSON file (`XUM_TOOL_INPUT_PATH`/`XUM_TOOL_RESULT_PATH`).
+ * A NUL byte never fits: spawn rejects the whole env, so the hook would not run.
+ */
+function fitsInEnv(value: string, maxValueLength: number): boolean {
+  return value.length <= maxValueLength && !value.includes("\0");
+}
+
+/**
  * Flatten a tool input/result value into env vars.
  *
  * Example:
- *   flattenToolHookValueToEnv({ path: "a.ts" }, "SHUX_TOOL_INPUT")
- *     -> { SHUX_TOOL_INPUT_PATH: "a.ts", SHUX_TOOL_INPUT_FILE_PATH: "a.ts" }
+ *   flattenToolHookValueToEnv({ path: "a.ts" }, "XUM_TOOL_INPUT")
+ *     -> { XUM_TOOL_INPUT_PATH: "a.ts", XUM_TOOL_INPUT_FILE_PATH: "a.ts" }
  */
 export function flattenToolHookValueToEnv(
   value: unknown,
   prefix: string,
   options?: FlattenToolHookEnvOptions
 ): Record<string, string> {
-  // Guard: Our hooks already have env vars like SHUX_TOOL_INPUT/SHUX_TOOL_RESULT.
+  // Guard: Our hooks already have env vars like XUM_TOOL_INPUT/XUM_TOOL_RESULT.
   // We only want to create prefixed sub-keys.
   if (typeof value !== "object" || value === null) {
     return {};
@@ -105,9 +114,7 @@ export function flattenToolHookValueToEnv(
   function trySet(key: string, rawValue: string): void {
     if (varCount >= maxVars) return;
 
-    // We intentionally do not truncate values. If an env var doesn't fit, omit it
-    // and let hooks use the JSON file (`SHUX_TOOL_INPUT_PATH`/`SHUX_TOOL_RESULT_PATH`).
-    if (rawValue.length > maxValueLength) return;
+    if (!fitsInEnv(rawValue, maxValueLength)) return;
 
     out[key] = rawValue;
     varCount += 1;

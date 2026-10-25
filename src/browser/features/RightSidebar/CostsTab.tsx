@@ -9,15 +9,16 @@ import {
 import { formatModelStringForDisplay } from "@/common/utils/ai/models";
 import { normalizeUsageModelKey } from "@/common/utils/providers/modelEntries";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
+import { updateUserPreferences, useUserPreferences } from "@/browser/stores/AppConfigStore";
 import { ToggleGroup, type ToggleOption } from "@/browser/components/ToggleGroup/ToggleGroup";
 import { TOKEN_COMPONENT_COLORS, formatTokens } from "@/common/utils/tokens/tokenMeterUtils";
+import { getSessionCacheHealth } from "@/common/utils/tokens/cacheHealth";
+import { PromptCacheHealth } from "./PromptCacheHealth";
 
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/browser/components/Tooltip/Tooltip";
+import type { UsageViewMode } from "@/common/config/schemas/userPreferences";
 
-type ViewMode = "last-request" | "session";
-
-const VIEW_MODE_OPTIONS: Array<ToggleOption<ViewMode>> = [
+const VIEW_MODE_OPTIONS: Array<ToggleOption<UsageViewMode>> = [
   { value: "session", label: "Session" },
   { value: "last-request", label: "Last Request" },
 ];
@@ -29,7 +30,8 @@ interface CostsTabProps {
 const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   const usage = useWorkspaceUsage(workspaceId);
   const { config: providersConfig } = useProvidersConfig();
-  const [viewMode, setViewMode] = usePersistedState<ViewMode>("costsTab:viewMode", "session");
+  const viewMode =
+    useUserPreferences((preferences) => preferences.ui?.costsTabViewMode) ?? "session";
 
   // Session usage for cost calculation
   // Uses sessionTotal (pre-computed) + liveCostUsage (cumulative during streaming)
@@ -60,6 +62,7 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
       const existing = merged.get(key);
       merged.set(
         key,
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
         existing ? sumUsageHistory([existing, usage.liveCostUsage])! : usage.liveCostUsage
       );
     }
@@ -85,7 +88,8 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
   if (!hasCostData) {
     return (
       <div className="text-light font-primary text-[13px] leading-relaxed">
-        <div className="text-secondary px-5 py-10 text-center">
+        {/* text-muted: text-secondary is below WCAG AA here in the dark themes (#6010). */}
+        <div className="text-muted px-5 py-10 text-center">
           <p>No messages yet.</p>
           <p>Send a message to see cost statistics.</p>
         </div>
@@ -185,7 +189,9 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
                   <ToggleGroup
                     options={VIEW_MODE_OPTIONS}
                     value={viewMode}
-                    onChange={setViewMode}
+                    onChange={(costsTabViewMode) =>
+                      updateUserPreferences({ ui: { costsTabViewMode } })
+                    }
                   />
                 </div>
                 <span className="text-muted flex items-center gap-1 text-xs tabular-nums">
@@ -327,6 +333,15 @@ const CostsTabComponent: React.FC<CostsTabProps> = ({ workspaceId }) => {
               </tbody>
             </table>
           )}
+          {/* Hidden for sessions that never touched a prompt cache (e.g. most non-Anthropic
+              providers report no cache tokens), where a 0% read share is noise. */}
+          {sessionUsage !== undefined &&
+            sessionUsage.cached.tokens + sessionUsage.cacheCreate.tokens > 0 && (
+              <PromptCacheHealth
+                session={getSessionCacheHealth(usage.sessionByModel, usage.liveCostUsage)}
+                turns={usage.recentTurnCacheHealth ?? []}
+              />
+            )}
         </div>
       </div>
     </div>

@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { AlertTriangle, Check } from "lucide-react";
 import React, { useEffect, useCallback } from "react";
+import { CopyButton } from "@/browser/components/CopyButton/CopyButton";
 import { cn } from "@/common/lib/utils";
 
 const toastTypeStyles: Record<"success" | "error", string> = {
@@ -15,6 +16,8 @@ export interface Toast {
   message: string;
   solution?: ReactNode;
   duration?: number;
+  /** Adds a copy button (e.g. a saved file path); the toast then stays until dismissed. */
+  copyText?: string;
 }
 
 interface ChatInputToastProps {
@@ -62,8 +65,11 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
     const defaultSuccessDuration = window.api?.isE2E ? e2eDuration : 3000;
 
     // Auto-dismiss when duration is explicitly provided, regardless of toast type.
-    // Otherwise, only success toasts auto-dismiss.
-    const duration = toast.duration ?? (toast.type === "success" ? defaultSuccessDuration : null);
+    // Otherwise, only success toasts without copyable text auto-dismiss: the user needs
+    // time to copy (e.g. the only place a "Report slowness" bundle path is shown).
+    const duration =
+      toast.duration ??
+      (toast.type === "success" && toast.copyText === undefined ? defaultSuccessDuration : null);
     if (duration !== null) {
       const timer = setTimeout(() => {
         handleDismiss();
@@ -95,7 +101,9 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
         <AlertTriangle aria-hidden="true" className="mt-0.5 h-4 w-4 shrink-0" />
         <div className="flex-1">
           {toast.title && <div className="mb-1.5 font-semibold">{toast.title}</div>}
-          <div className="text-light mt-1.5 leading-[1.4]">{toast.message}</div>
+          <div className="text-light mt-1.5 max-h-[25vh] overflow-y-auto leading-[1.4]">
+            {toast.message}
+          </div>
           {toast.solution && (
             <div className="bg-dark font-monospace text-code-type mt-2 rounded px-2 py-1.5 text-[11px]">
               {toast.solution}
@@ -132,7 +140,12 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
         )}
         {toast.title && <span className="flex-1 text-[11px] font-semibold">{toast.title}</span>}
         {!toast.title && <span className="flex-1" />}
-        {toast.type === "error" && (
+        {toast.copyText !== undefined && <CopyButton text={toast.copyText} className="h-4" />}
+        {/* A success toast with an explicit duration is long-lived (e.g. the session tapes
+            folder path in server mode, #5599), so it can be closed before it expires. */}
+        {(toast.type === "error" ||
+          toast.copyText !== undefined ||
+          toast.duration !== undefined) && (
           <button
             onClick={handleDismiss}
             aria-label="Dismiss"
@@ -143,7 +156,13 @@ export const ChatInputToast: React.FC<ChatInputToastProps> = ({
         )}
       </div>
       {/* Message on its own line */}
-      <div className="mt-1.5 opacity-90">{toast.message}</div>
+      {/* wrap-anywhere: a saved report path is one long unbroken token on narrow screens. The
+          height cap scrolls a long message (a plugin hook notice in wide glyphs on a phone) and
+          keeps the dismiss button above it on screen (Codex PRRT_kwDOPxxmWM6rRJDd). 25vh: the
+          toast sits above the composer, whose draft can grow to half the screen. */}
+      <div className="mt-1.5 max-h-[25vh] overflow-y-auto wrap-anywhere opacity-90">
+        {toast.message}
+      </div>
     </div>
   );
 

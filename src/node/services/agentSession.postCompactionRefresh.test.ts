@@ -1,14 +1,16 @@
+import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { describe, expect, test, mock, afterEach } from "bun:test";
-import { AgentSession } from "./agentSession";
-import type { Config } from "@/node/config";
-import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
+import type { AgentSessionAIService } from "./agentSession";
+import { InitStateManager } from "./initStateManager";
 import type { BackgroundProcessManager } from "./backgroundProcessManager";
+import { Err } from "@/common/types/result";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
 import type { StreamEndEvent } from "@/common/types/stream";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 // NOTE: These tests focus on the event wiring (tool-call-end -> callback).
 // The actual post-compaction state computation is covered elsewhere.
@@ -85,7 +87,7 @@ describe("AgentSession post-compaction refresh trigger", () => {
       },
     };
 
-    aiEmitter.emit("stream-end", streamEnd);
+    void runSessionTerminalPolicy(session, aiEmitter, streamEnd);
 
     await waitForCondition(() => {
       expect(onCompactionComplete).toHaveBeenCalledTimes(1);
@@ -109,11 +111,11 @@ describe("AgentSession post-compaction refresh trigger", () => {
       text: "The user prefers concise tests.",
     });
 
-    aiEmitter.emit("stream-end", streamEnd);
+    void runSessionTerminalPolicy(session, aiEmitter, streamEnd);
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(onCompactionComplete).toHaveBeenCalledTimes(1);
 
-    session.dispose();
+    await session.dispose();
   });
 
   test("reports failed compaction continuation dispatch to lifecycle consumers", async () => {
@@ -126,94 +128,98 @@ describe("AgentSession post-compaction refresh trigger", () => {
       workspaceId,
       createMuxMessage("before-failed-follow-up", "user", "Preserve this context")
     );
-    await historyService.appendToHistory(
-      workspaceId,
-      createMuxMessage("failed-follow-up-request", "user", "Please compact", {
-        muxMetadata: {
-          type: "compaction-request",
-          rawCommand: "/compact",
-          parsed: {
-            followUpContent: {
-              text: "Continue delegated work",
-              model: "openai:gpt-4o",
-              agentId: "exec",
-            },
-          },
-        },
-      })
-    );
-
     const internals = session as unknown as {
-      activeCompactionRequest?: { id: string; modelString: string };
       dispatchPendingFollowUp: () => Promise<boolean>;
-    };
-    internals.activeCompactionRequest = {
-      id: "failed-follow-up-request",
-      modelString: "openai:gpt-4o",
     };
     internals.dispatchPendingFollowUp = mock(() =>
       Promise.reject(new Error("follow-up startup failed"))
     );
-    const decision = session.waitForPendingCompactionCompletionDecision("failed-follow-up-summary");
+    // A real compaction turn owns the decision: only the operation that streamed a message may
+    // register a wait for it (#5326), so start one and supply its stream identity.
+    const summaryId = "test-assistant-message";
+    const compacting = await session.sendMessage("Please compact", {
+      model: "openai:gpt-4o",
+      agentId: "compact",
+      muxMetadata: {
+        type: "compaction-request",
+        rawCommand: "/compact",
+        parsed: {
+          followUpContent: {
+            text: "Continue delegated work",
+            model: "openai:gpt-4o",
+            agentId: "exec",
+          },
+        },
+      },
+    });
+    expect(compacting.success).toBe(true);
+    aiEmitter.emit("stream-start", {
+      type: "stream-start",
+      workspaceId,
+      messageId: summaryId,
+      model: "openai:gpt-4o",
+      historySequence: 1,
+      startTime: Date.now(),
+    });
+    const decision = session.waitForPendingCompactionCompletionDecision(summaryId);
 
-    aiEmitter.emit("stream-end", {
+    void runSessionTerminalPolicy(session, aiEmitter, {
       type: "stream-end",
       workspaceId,
-      messageId: "failed-follow-up-summary",
+      messageId: summaryId,
       metadata: { model: "openai:gpt-4o", agentId: "compact", finishReason: "stop" },
       parts: [{ type: "text", text: "Compacted context" }],
     } satisfies StreamEndEvent);
 
     expect(await decision).toBe(false);
     expect(internals.dispatchPendingFollowUp).toHaveBeenCalledTimes(1);
-    session.dispose();
+    await session.dispose();
   });
 
   test("triggers callback on file_edit_* tool-call-end", async () => {
     const handlers = new Map<string, (...args: unknown[]) => void>();
 
-    const aiService: AIService = {
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        handlers.set(String(eventName), listener);
-        return this;
+    const modelUnavailable = () =>
+      Promise.resolve(
+        Err({ type: "unknown" as const, raw: "Test AI service cannot create models" })
+      );
+    const aiService: AgentSessionAIService = {
+      ...createStreamLifecycleMocks(),
+      runtimeFactory: nodeRuntimeFactory,
+      on(eventName: string, listener: (...args: unknown[]) => void) {
+        handlers.set(eventName, listener);
       },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
+      off(_eventName: string, _listener: (...args: unknown[]) => void) {
+        return undefined;
       },
-      stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-    } as unknown as AIService;
+      createModelWithPinnedOptions: mock(modelUnavailable),
+      getWorkspaceMetadata: mock((workspaceId: string) =>
+        Promise.resolve(Err(`Workspace ${workspaceId} not found`))
+      ),
+      getProvidersConfig: mock(() => null),
+      isExperimentEnabled: mock(() => false),
+      streamMessage: mock(() =>
+        Promise.resolve(Err({ type: "unknown" as const, raw: "no stream in this test" }))
+      ),
+    };
 
-    const { historyService, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService({
+      files: SessionFilesMemory,
+    });
     historyCleanup = cleanup;
-
-    const initStateManager: InitStateManager = {
-      on(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-      off(_eventName: string | symbol, _listener: (...args: unknown[]) => void) {
-        return this;
-      },
-    } as unknown as InitStateManager;
-
-    const backgroundProcessManager: BackgroundProcessManager = {
-      setMessageQueued: mock(() => undefined),
-      cleanup: mock(() => Promise.resolve()),
-    } as unknown as BackgroundProcessManager;
-
-    const config: Config = {
-      srcDir: "/tmp",
-      getSessionDir: mock(() => "/tmp"),
-    } as unknown as Config;
 
     const onPostCompactionStateChange = mock(() => undefined);
 
-    const session = new AgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId: "ws",
       config,
       historyService,
       aiService,
-      initStateManager,
-      backgroundProcessManager,
+      initStateManager: new InitStateManager(config),
+      backgroundProcessManager: {
+        getForegroundToolCallIds: mock(() => []),
+        cleanup: mock(() => Promise.resolve()),
+      } as unknown as BackgroundProcessManager,
       onPostCompactionStateChange,
     });
 
@@ -252,6 +258,6 @@ describe("AgentSession post-compaction refresh trigger", () => {
 
     expect(onPostCompactionStateChange).toHaveBeenCalledTimes(2);
 
-    session.dispose();
+    await session.dispose();
   });
 });

@@ -1,43 +1,14 @@
-// Re-export all schemas from subdirectory modules
-// This file serves as the single entry point for all schema imports
-
-// Result helper
-export { ResultSchema } from "./schemas/result";
+// Schemas re-exported for consumers that import from "@/common/orpc/schemas".
 
 // Runtime schemas
 export {
   RuntimeConfigSchema,
   RuntimeModeSchema,
   RuntimeEnablementIdSchema,
-  RuntimeAvailabilitySchema,
-  RuntimeAvailabilityStatusSchema,
-  DevcontainerConfigInfoSchema,
 } from "./schemas/runtime";
 
 // Project schemas
 export { ProjectConfigSchema, WorkspaceConfigSchema } from "./schemas/project";
-
-// Goal schemas
-export {
-  GoalBoardAddUpcomingInputSchema,
-  GoalBoardArchiveInputSchema,
-  GoalBoardEntrySchema,
-  GoalBoardGetInputSchema,
-  GoalBoardPromoteInputSchema,
-  GoalBoardReorderInputSchema,
-  GoalBoardReviveInputSchema,
-  GoalBoardUpdateUpcomingInputSchema,
-  GoalBoardSectionSchema,
-  GoalBoardSnapshotSchema,
-  GoalBoardV1Schema,
-  GoalClearInputSchema,
-  GoalGetInputSchema,
-  GoalRecordV1Schema,
-  GoalSetErrorSchema,
-  GoalSetInputSchema,
-  GoalSnapshotSchema,
-  GoalStatusSchema,
-} from "./schemas/goal";
 
 // Workspace schemas
 export { WorkspaceAISettingsSchema } from "./schemas/workspaceAiSettings";
@@ -46,7 +17,6 @@ export {
   FrontendWorkspaceMetadataSchema,
   GitStatusSchema,
   ProjectRefSchema,
-  WorkflowTaskMetadataSchema,
   WorkspaceActivitySnapshotSchema,
   WorkspaceGoalDefaultsOverrideSchema,
   WorkspaceHeartbeatSettingsSchema,
@@ -54,102 +24,59 @@ export {
 } from "./schemas/workspace";
 
 // Workspace stats schemas
-export {
-  ActiveStreamStatsSchema,
-  CompletedStreamStatsSchema,
-  ModelTimingStatsSchema,
-  SessionTimingFileSchema,
-  SessionTimingStatsSchema,
-  TimingAnomalySchema,
-  WorkspaceStatsSnapshotSchema,
-} from "./schemas/workspaceStats";
+export { WorkspaceStatsSnapshotSchema } from "./schemas/workspaceStats";
 
-// Analytics schemas
+// Workspace review-state schemas
 export {
-  AgentCostRowSchema,
-  EventRowSchema,
-  HistogramBucketSchema,
-  SpendByModelRowSchema,
-  SpendByProjectRowSchema,
-  SpendOverTimeRowSchema,
-  SummaryRowSchema,
-  TimingPercentilesRowSchema,
-} from "./schemas/analytics";
-export type {
-  AgentCostRow,
-  EventRow,
-  HistogramBucket,
-  SpendByModelRow,
-  SpendByProjectRow,
-  SpendOverTimeRow,
-  SummaryRow,
-  TimingPercentilesRow,
-} from "./schemas/analytics";
+  ReviewStateDeltaSchema,
+  ReviewStateEventSchema,
+  ReviewStateImportLegacyOutputSchema,
+  ReviewStateSectionsSchema,
+  ReviewStateSnapshotSchema,
+} from "./schemas/reviewState";
 
 // Chat stats schemas
-export {
-  ChatStatsSchema,
-  ChatUsageComponentSchema,
-  ChatUsageDisplaySchema,
-  SessionUsageFileSchema,
-  TokenConsumerSchema,
-} from "./schemas/chatStats";
+export { ChatStatsSchema, TokenConsumerSchema } from "./schemas/chatStats";
 
 // Agent Skill schemas
 export {
   AgentSkillDescriptorSchema,
   AgentSkillFrontmatterSchema,
   AgentSkillIssueSchema,
+  AgentSkillListResultSchema,
   AgentSkillPackageSchema,
   AgentSkillScopeSchema,
+  AgentSkillUnavailableSourceSchema,
   SkillNameSchema,
   resolveSkillAdvertise,
   resolveSkillUserInvocable,
   resolveSkillWhenToUse,
 } from "./schemas/agentSkill";
 
-// Agent Plugins schemas (contributed slash commands + composition inspector)
-export {
-  PluginSlashCommandDescriptorSchema,
-  WorkspaceCompositionDiagnosticSchema,
-  WorkspaceCompositionEntrySchema,
-  WorkspaceCompositionPluginSchema,
-  WorkspaceCompositionSchema,
-} from "./schemas/agentPlugins";
-
 // Workflow schemas
 export {
   AvailableWorkflowSchema,
-  JsonValueSchema,
   StructuredTaskOutputSchema,
   WorkflowArgSummarySchema,
+  WorkflowDeclaredPhaseSchema,
+  WorkflowPhaseManifestSchema,
+  WORKFLOW_DECLARED_PHASES_MAX,
+  WORKFLOW_PHASE_DESCRIPTION_MAX_LENGTH,
+  WORKFLOW_PHASE_NAME_MAX_LENGTH,
   WorkflowScriptDescriptorSchema,
   WorkflowMetadataSchema,
   WorkflowScriptScopeSchema,
   WorkflowEventSequenceSchema,
-  WorkflowNameSchema,
   WorkflowResultSchema,
   WorkflowRunEventSchema,
   WorkflowRunIdSchema,
   WorkflowRunParentSchema,
   WorkflowRunRecordSchema,
   WorkflowRunStatusSchema,
-  WorkflowRunStatusTransitionSchema,
   WorkflowRunStreamEventSchema,
   WorkflowStepRecordSchema,
   WorkflowStepStatusSchema,
 } from "./schemas/workflow";
-
-// Instruction context schemas (AGENTS.md, CLAUDE.md, …)
-export {
-  AdditionalSystemContextSchema,
-  INSTRUCTION_SCOPE,
-  InstructionFileSchema,
-  InstructionScopeSchema,
-  InstructionSetSchema,
-  InstructionSourcesSchema,
-  WorkspaceInstructionsSchema,
-} from "./schemas/instructions";
 
 // Error schemas
 // Agent Definition schemas
@@ -165,57 +92,16 @@ export {
   SendMessageErrorSchema,
   StreamErrorTypeSchema,
   NameGenerationErrorSchema,
+  PlanReviewErrorSchema,
 } from "./schemas/errors";
-
-// Tool schemas
-export { BashToolResultSchema, FileTreeNodeSchema } from "./schemas/tools";
-
-// Memory schemas (Memory tab)
-export {
-  MemoryChangeEventSchema,
-  MemoryFileInfoSchema,
-  MemorySaveErrorSchema,
-} from "./schemas/memory";
-export type { MemoryFileInfo, MemorySaveError } from "./schemas/memory";
 
 // Secrets schemas
 export { SecretSchema } from "./schemas/secrets";
 
-// Policy schemas
-export {
-  PolicyFileSchema,
-  PolicySourceSchema,
-  PolicyStatusSchema,
-  EffectivePolicySchema,
-  PolicyGetResponseSchema,
-  PolicyRuntimeIdSchema,
-} from "./schemas/policy";
 // Provider options schemas
 export { MuxProviderOptionsSchema } from "./schemas/providerOptions";
 
-// MCP schemas
-export {
-  MCPAddParamsSchema,
-  MCPRemoveParamsSchema,
-  MCPServerMapSchema,
-  MCPSetEnabledParamsSchema,
-  MCPTestParamsSchema,
-  MCPTestResultSchema,
-} from "./schemas/mcp";
-
 export { backup } from "./schemas/backup";
-
-// UI Layouts schemas
-export {
-  KeybindSchema,
-  LayoutPresetSchema,
-  LayoutPresetsConfigSchema,
-  LayoutSlotSchema,
-  RightSidebarLayoutPresetNodeSchema,
-  RightSidebarLayoutPresetStateSchema,
-  RightSidebarPresetTabSchema,
-  RightSidebarWidthPresetSchema,
-} from "./schemas/uiLayouts";
 // Terminal schemas
 export {
   TerminalCreateParamsSchema,
@@ -226,43 +112,34 @@ export {
 // Message schemas
 export {
   BranchListResultSchema,
-  DynamicToolPartAvailableSchema,
   DynamicToolPartPendingSchema,
-  DynamicToolPartRedactedSchema,
   DynamicToolPartSchema,
   FilePartSchema,
-  MuxFilePartSchema,
-  MuxMessageSchema,
-  MuxReasoningPartSchema,
-  MuxTextPartSchema,
   MuxToolPartSchema,
 } from "./schemas/message";
-export type { FilePart, MuxFilePart } from "./schemas/message";
+export type { FilePart } from "./schemas/message";
 
 // Stream event schemas
 export {
-  AutoCompactionCompletedEventSchema,
-  AutoCompactionTriggeredEventSchema,
   AutoRetryAbandonedEventSchema,
   AutoRetryScheduledEventSchema,
   AutoRetryStartingEventSchema,
   CaughtUpMessageSchema,
   ChatMuxMessageSchema,
-  CompletedMessagePartSchema,
   DeleteMessageSchema,
   ErrorEventSchema,
   GoalBudgetLimitedEventSchema,
-  LanguageModelV2UsageSchema,
-  QueuedMessageChangedEventSchema,
+  PluginHookNoticeEventSchema,
+  OnChatDowngradeReasonSchema,
   ReasoningDeltaEventSchema,
   ReasoningEndEventSchema,
-  RestoreToInputEventSchema,
   RuntimeStatusEventSchema,
   SendMessageOptionsSchema,
+  AcpPromptCorrelationSchema,
+  HistoryEditPreconditionSchema,
   StreamAbortReasonSchema,
   StreamAbortEventSchema,
   StreamLifecycleEventSchema,
-  StreamLifecyclePhaseSchema,
   StreamLifecycleSnapshotSchema,
   StreamDeltaEventSchema,
   StreamEndEventSchema,
@@ -275,30 +152,13 @@ export {
   BashOutputEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
-  AdvisorOutputEventSchema,
-  AdvisorReasoningOutputEventSchema,
-  AdvisorPhaseEventSchema,
+  RestartBlockerSchema,
   UpdateStatusSchema,
   UsageDeltaEventSchema,
   WorkspaceChatMessageSchema,
+  OnChatEventSchema,
   WorkspaceInitEventSchema,
 } from "./schemas/stream";
-
-export {
-  TIMELINE_EVENT_KINDS,
-  TimelineAnchorSchema,
-  TimelineEventDataSchema,
-  TimelineEventDraftSchema,
-  TimelineEventKindSchema,
-  TimelineEventSchema,
-  TimelineListInputSchema,
-  TimelinePageSchema,
-  TimelinePreviewInputSchema,
-  TimelinePreviewSchema,
-  TimelineSourceSchema,
-  TimelineStatusSchema,
-  TimelineSubscriptionEventSchema,
-} from "./schemas/timeline";
 
 // API router schemas
 export {
@@ -306,20 +166,14 @@ export {
   AWSCredentialStatusSchema,
   analytics,
   coder,
-  CoderInfoSchema,
-  CoderPresetSchema,
-  CoderTemplateSchema,
-  CoderWorkspaceConfigSchema,
-  CoderWorkspaceSchema,
-  CoderWorkspaceStatusSchema,
   config,
   browser,
   devtools,
-  uiLayouts,
-  debug,
+  drafts,
   desktop,
   general,
   menu,
+  agentPlugins,
   agentSkills,
   agents,
   workflows,
@@ -328,17 +182,21 @@ export {
   mcpOauth,
   mcp,
   memory,
+  artifacts,
+  agentResourceLimits,
+  mcpApps,
+  refinements,
   secrets,
   CustomProviderMutationErrorSchema,
   ProviderConfigInfoSchema,
+  ProviderModelDiscoveryResultSchema,
   ProviderModelEntrySchema,
-  muxGateway,
-  muxGatewayOauth,
+  ModelCatalogEntrySchema,
+  ModelCatalogSearchInputSchema,
+  ModelCatalogSearchResultSchema,
   copilotOauth,
-  muxGovernorOauth,
   codexOauth,
   coderOauth,
-  policy,
   providers,
   ProvidersConfigMapSchema,
   server,
@@ -347,8 +205,12 @@ export {
   splashScreens,
   tasks,
   experiments,
+  computerUse,
   telemetry,
-  TelemetryEventSchema,
+  perf,
+  perfCaptures,
+  perfReports,
+  sessionTapes,
   ssh,
   terminal,
   tokenizer,

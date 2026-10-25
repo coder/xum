@@ -1,3 +1,4 @@
+import type { PrefixSwapInvalidatedEventSchema } from "@/common/orpc/schemas/stream";
 /**
  * Event types emitted by AIService
  */
@@ -5,8 +6,6 @@
 import type { z } from "zod";
 import type { MuxReasoningPart, MuxTextPart, MuxToolPart } from "./message";
 import type {
-  AutoCompactionCompletedEventSchema,
-  AutoCompactionTriggeredEventSchema,
   AutoRetryAbandonedEventSchema,
   AutoRetryScheduledEventSchema,
   AutoRetryStartingEventSchema,
@@ -16,7 +15,6 @@ import type {
   StreamAbortReasonSchema,
   StreamAbortEventSchema,
   StreamLifecycleEventSchema,
-  StreamLifecyclePhaseSchema,
   StreamLifecycleSnapshotSchema,
   StreamDeltaEventSchema,
   StreamEndEventSchema,
@@ -26,11 +24,8 @@ import type {
   ToolCallExecutionStartEventSchema,
   ToolCallStartEventSchema,
   BashOutputEventSchema,
-  AdvisorOutputEventSchema,
-  AdvisorReasoningOutputEventSchema,
   TaskCreatedEventSchema,
   WorkflowRunAttachedEventSchema,
-  AdvisorPhaseEventSchema,
   UsageDeltaEventSchema,
   RuntimeStatusEventSchema,
 } from "../orpc/schemas";
@@ -45,7 +40,6 @@ export type StreamStartEvent = z.infer<typeof StreamStartEventSchema>;
 export type StreamDeltaEvent = z.infer<typeof StreamDeltaEventSchema>;
 export type StreamEndEvent = z.infer<typeof StreamEndEventSchema>;
 export type StreamAbortReason = z.infer<typeof StreamAbortReasonSchema>;
-export type StreamLifecyclePhase = z.infer<typeof StreamLifecyclePhaseSchema>;
 export type StreamLifecycleSnapshot = z.infer<typeof StreamLifecycleSnapshotSchema>;
 export type StreamLifecycleEvent = z.infer<typeof StreamLifecycleEventSchema>;
 
@@ -68,11 +62,8 @@ export type StreamAbortEvent = z.infer<typeof StreamAbortEventSchema>;
 export type ErrorEvent = z.infer<typeof ErrorEventSchema>;
 
 export type BashOutputEvent = z.infer<typeof BashOutputEventSchema>;
-export type AdvisorOutputEvent = z.infer<typeof AdvisorOutputEventSchema>;
-export type AdvisorReasoningOutputEvent = z.infer<typeof AdvisorReasoningOutputEventSchema>;
 export type TaskCreatedEvent = z.infer<typeof TaskCreatedEventSchema>;
 export type WorkflowRunAttachedEvent = z.infer<typeof WorkflowRunAttachedEventSchema>;
-export type AdvisorPhaseEvent = z.infer<typeof AdvisorPhaseEventSchema>;
 export type ToolCallStartEvent = z.infer<typeof ToolCallStartEventSchema>;
 export type ToolCallExecutionStartEvent = z.infer<typeof ToolCallExecutionStartEventSchema>;
 export type ToolCallDeltaEvent = z.infer<typeof ToolCallDeltaEventSchema>;
@@ -87,9 +78,6 @@ export type ReasoningEndEvent = z.infer<typeof ReasoningEndEventSchema>;
  */
 export type UsageDeltaEvent = z.infer<typeof UsageDeltaEventSchema>;
 
-export type AutoCompactionTriggeredEvent = z.infer<typeof AutoCompactionTriggeredEventSchema>;
-export type AutoCompactionCompletedEvent = z.infer<typeof AutoCompactionCompletedEventSchema>;
-
 export type AutoRetryScheduledEvent = z.infer<typeof AutoRetryScheduledEventSchema>;
 export type AutoRetryStartingEvent = z.infer<typeof AutoRetryStartingEventSchema>;
 export type AutoRetryAbandonedEvent = z.infer<typeof AutoRetryAbandonedEventSchema>;
@@ -99,3 +87,5 @@ export type AutoRetryAbandonedEvent = z.infer<typeof AutoRetryAbandonedEventSche
  * Used for both runtime readiness and generic startup breadcrumbs in the barrier UI.
  */
 export type RuntimeStatusEvent = z.infer<typeof RuntimeStatusEventSchema>;
+
+export type PrefixSwapInvalidatedEvent = z.infer<typeof PrefixSwapInvalidatedEventSchema>;

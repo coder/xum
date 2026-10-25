@@ -3,13 +3,10 @@
  *
  * Mirrors the send path's provider-option gating so the UI never offers a toggle that
  * cannot affect the request:
- * - model must be pro-capable (the GPT-5.6 family — openaiSupportsProMode);
+ * - model must be pro-capable (see openaiSupportsProMode);
  * - pro mode is a Responses API field, so `wireFormat: "chatCompletions"` disables it;
- * - only the direct `openai:` route delivers the mode. Gateways hide it:
- *   non-passthrough ones use another provider schema, and mux-gateway currently
- *   drops `providerOptions.openai.reasoningMode` server-side (verified empirically —
- *   the Responses API echoed `mode: "standard"`), so it fails closed until the
- *   gateway forwards the field;
+ * - direct OpenAI and Coder's OpenAI Responses instances deliver the mode.
+ *   Other gateways hide it: they use another provider schema;
  * - Codex OAuth routes strip `reasoning.mode` before calling the stricter ChatGPT
  *   backend, so when OAuth is the effective auth path, pro mode is unavailable too.
  *
@@ -18,29 +15,68 @@
  * modelEntries → models); adding it to models.ts would create a cycle.
  */
 
+import { resolveCoderWireCanonicalModel } from "@/common/constants/coderOAuth";
 import { openaiSupportsProMode } from "@/common/types/thinking";
+import { isCustomProviderConfig } from "@/common/utils/providers/customProviders";
+import { resolveCoderGatewayMetadataModel } from "@/common/utils/providers/coderGatewayMetadata";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import {
   openaiDirectProviderOptionsAvailable,
+  resolveProviderOptionsRoute,
   type OpenAIDirectProviderOptionsAvailability,
 } from "@/common/utils/ai/openaiProviderOptionsAvailability";
+import { resolveCoderRouteGatewayModelId } from "@/common/utils/providers/gatewayModelCatalog";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 
-export interface ProModeAvailabilityOptions extends OpenAIDirectProviderOptionsAvailability {
-  /** Overrides the providersConfig-derived OpenAI wire format when provided. */
-  openaiWireFormat?: "responses" | "chatCompletions" | null;
-}
+export type ProModeAvailabilityOptions = OpenAIDirectProviderOptionsAvailability & {
+  /** Authoritative raw-selection route, including explicit gateways and catalog fallback. */
+  effectiveRouteProvider?: string | null;
+};
 
 export function openaiProModeAvailable(
   modelString: string,
   options?: ProModeAvailabilityOptions
 ): boolean {
+  // Callers already resolved explicit gateway precedence. Do not resurrect a
+  // rejected Coder route from its persisted catalog.
+  const route =
+    options?.effectiveRouteProvider ?? resolveProviderOptionsRoute(modelString, options);
+  if (route === "coder") {
+    if (isCustomProviderConfig(options?.providersConfig?.coder)) {
+      return false;
+    }
+    // Coder forwards native Responses bodies. Resolve the actual instance type
+    // before name-based canonicalization; the direct OpenAI wire format and
+    // Codex credentials do not govern this route.
+    const gatewayModelId = resolveCoderRouteGatewayModelId(
+      modelString,
+      options?.providersConfig ?? null
+    );
+    const wire =
+      gatewayModelId == null
+        ? null
+        : resolveCoderWireCanonicalModel(gatewayModelId, options?.providersConfig?.coder);
+    return (
+      wire?.providerType === "openai" &&
+      openaiSupportsProMode(
+        resolveModelForMetadata(
+          modelString.startsWith("coder:") ? modelString : `openai:${wire.modelId}`,
+          options?.providersConfig ?? null
+        )
+      )
+    );
+  }
+
   const wireFormat =
     options?.openaiWireFormat ?? options?.providersConfig?.openai?.wireFormat ?? "responses";
   if (wireFormat === "chatCompletions") {
     return false;
   }
-  const normalized = normalizeToCanonical(modelString);
+  // An unavailable custom-named Coder instance can fall back to its real upstream.
+  // Keep unknown/compatible instances scoped rather than guessing from their name.
+  const normalized = modelString.startsWith("coder:")
+    ? (resolveCoderGatewayMetadataModel(modelString, options?.providersConfig) ?? modelString)
+    : normalizeToCanonical(modelString);
   const [origin] = normalized.split(":", 2);
   if (origin !== "openai") {
     return false;
@@ -53,5 +89,8 @@ export function openaiProModeAvailable(
     return false;
   }
 
-  return openaiDirectProviderOptionsAvailable(modelString, options);
+  return openaiDirectProviderOptionsAvailable(normalized, {
+    ...options,
+    resolvedRouteProvider: route,
+  });
 }

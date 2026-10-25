@@ -1,14 +1,16 @@
 import assert from "@/common/utils/assert";
-import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
-import { MUX_GATEWAY_SESSION_EXPIRED_MESSAGE } from "@/common/constants/muxGatewayOAuth";
+import { CUSTOM_EVENTS } from "@/common/constants/events";
+import { publishChatError } from "@/browser/utils/chatErrorToasts";
 import type { DeleteMessage, StreamErrorMessage, WorkspaceChatMessage } from "@/common/orpc/types";
 import {
   isBashOutputEvent,
   isCaughtUpMessage,
   isDeleteMessage,
   isGoalBudgetLimitedEvent,
+  isPluginHookNoticeEvent,
   isInitEnd,
   isInitOutput,
+  isInitProgress,
   isInitStart,
   isMuxMessage,
   isQueuedMessageChanged,
@@ -89,21 +91,18 @@ export interface WorkspaceChatEventAggregator {
   clearTokenState(messageId: string): void;
 }
 
+/**
+ * Desktop perf harness (XUM_REPLAY_TAPES, exposed by preload): chat events come from a recorded
+ * session tape, so they must not trigger app side effects (skill refreshes, child-goal toasts,
+ * git/review refreshes).
+ */
+export function isSessionTapeReplayRenderer(): boolean {
+  return typeof window !== "undefined" && window.api?.isSessionTapeReplay === true;
+}
+
 function dispatchSkillsRefreshRequested(): void {
   if (typeof window === "undefined") return;
   window.dispatchEvent(new CustomEvent(CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED));
-}
-
-function dispatchGoalChildBudgetToast(workspaceId: string, message: string): void {
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(
-    createCustomEvent(CUSTOM_EVENTS.GOAL_CHILD_BUDGET_TOAST, { workspaceId, message })
-  );
-}
-
-function dispatchMuxGatewaySessionExpired(): void {
-  if (typeof window === "undefined") return;
-  window.dispatchEvent(createCustomEvent(CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED));
 }
 
 /**
@@ -114,6 +113,19 @@ function dispatchMuxGatewaySessionExpired(): void {
  * - "immediate": state changed and callers should update UI immediately
  * - "ignored": event does not affect the aggregator
  */
+/**
+ * A hook's systemMessage can be up to 16 KiB, and an error toast stays until dismissed: show only
+ * the start of it. ChatInputToast also caps the message's height, since 500 wide glyphs still wrap
+ * to many lines on a phone.
+ */
+const PLUGIN_HOOK_NOTICE_MAX_CHARS = 500;
+
+function boundPluginHookNotice(message: string): string {
+  if (message.length <= PLUGIN_HOOK_NOTICE_MAX_CHARS) return message;
+  // Cut by code point so the cut never splits a surrogate pair.
+  return `${Array.from(message).slice(0, PLUGIN_HOOK_NOTICE_MAX_CHARS).join("").trimEnd()}…`;
+}
+
 export function applyWorkspaceChatEventToAggregator(
   aggregator: WorkspaceChatEventAggregator,
   event: WorkspaceChatMessage,
@@ -125,7 +137,7 @@ export function applyWorkspaceChatEventToAggregator(
     "applyWorkspaceChatEventToAggregator requires event object"
   );
 
-  const allowSideEffects = options?.allowSideEffects !== false;
+  const allowSideEffects = options?.allowSideEffects !== false && !isSessionTapeReplayRenderer();
 
   if (isStreamStart(event)) {
     aggregator.handleStreamStart(event);
@@ -151,12 +163,6 @@ export function applyWorkspaceChatEventToAggregator(
   }
 
   if (isStreamError(event)) {
-    if (allowSideEffects && event.error === MUX_GATEWAY_SESSION_EXPIRED_MESSAGE) {
-      // Dispatch session-expired event; useGateway() listens for it and
-      // optimistically marks the gateway as unconfigured to stop routing.
-      dispatchMuxGatewaySessionExpired();
-    }
-
     aggregator.handleStreamError(event);
     // Match stream-end / stream-abort: drop the per-message deltaHistory entry
     // so a subsequent stream isn't influenced by leaked TPS/token state from
@@ -186,7 +192,10 @@ export function applyWorkspaceChatEventToAggregator(
     if (
       allowSideEffects &&
       event.replay !== true &&
-      (event.toolName === "agent_skill_read" || event.toolName === "agent_skill_list")
+      (event.toolName === "agent_skill_read" ||
+        event.toolName === "agent_skill_list" ||
+        event.toolName === "agent_skill_write" ||
+        event.toolName === "agent_skill_delete")
     ) {
       dispatchSkillsRefreshRequested();
     }
@@ -204,9 +213,19 @@ export function applyWorkspaceChatEventToAggregator(
     return "immediate";
   }
 
+  if (isPluginHookNoticeEvent(event)) {
+    // A plugin hook's systemMessage: a toast for the user, never a transcript row.
+    if (allowSideEffects)
+      publishChatError(
+        event.workspaceId,
+        `Plugin ${event.plugin}: ${boundPluginHookNotice(event.message)}`
+      );
+    return "ignored";
+  }
+
   if (isGoalBudgetLimitedEvent(event)) {
     if (allowSideEffects && event.causedByChild) {
-      dispatchGoalChildBudgetToast(event.workspaceId, event.message);
+      publishChatError(event.workspaceId, event.message);
     }
     return "ignored";
   }
@@ -232,8 +251,14 @@ export function applyWorkspaceChatEventToAggregator(
     return "immediate";
   }
 
-  // init-* and ChatShuxMessage are handled via the aggregator's unified handleMessage.
-  if (isMuxMessage(event) || isInitStart(event) || isInitOutput(event) || isInitEnd(event)) {
+  // init-* and ChatXumMessage are handled via the aggregator's unified handleMessage.
+  if (
+    isMuxMessage(event) ||
+    isInitStart(event) ||
+    isInitOutput(event) ||
+    isInitProgress(event) ||
+    isInitEnd(event)
+  ) {
     aggregator.handleMessage(event);
     return "immediate";
   }

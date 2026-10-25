@@ -22,8 +22,6 @@ export interface ResolveToolPolicyOptions {
   agents: readonly AgentLikeForPolicy[];
   isSubagent: boolean;
   disableTaskToolsForDepth: boolean;
-  /** Whether the advisor tool is eligible for this agent (experiment on + per-agent config) */
-  advisorEnabled?: boolean;
 }
 
 // Tools that are never allowed in autonomous sub-agent flows.
@@ -64,9 +62,9 @@ function matchesSubagentHardDeniedTool(pattern: string): boolean {
  * 2. Runtime restrictions (subagent limits, depth limits) applied last
  *
  * Example: ask (base: exec)
- * - exec has add: [.*], remove: [propose_plan, ask_user_question]
+ * - exec has add: [.*], remove: [propose_plan]
  * - ask has remove: [file_edit_.*]
- * - Result: deny-all → enable .* → disable propose_plan → disable ask_user_question → disable file_edit_.*
+ * - Result: deny-all → enable .* → disable propose_plan → disable file_edit_.*
  *
  * Subagent completion tool is mode-dependent:
  * - plan-like subagents: enable `propose_plan`, disable `agent_report`
@@ -75,7 +73,8 @@ function matchesSubagentHardDeniedTool(pattern: string): boolean {
 export function resolveToolPolicyForAgent(options: ResolveToolPolicyOptions): ToolPolicy {
   const { agents, isSubagent, disableTaskToolsForDepth } = options;
 
-  // Start with deny-all baseline
+  // History recovery uses the deny-all baseline too: enabling its experiment
+  // must not widen a deliberately narrow agent allowlist.
   const agentPolicy: ToolPolicy = [{ regex_match: ".*", action: "disable" }];
 
   // Process inheritance chain: base → child
@@ -151,14 +150,6 @@ export function resolveToolPolicyForAgent(options: ResolveToolPolicyOptions): To
       runtimePolicy.push({ regex_match: "propose_plan", action: "disable" });
       runtimePolicy.push({ regex_match: "agent_report", action: "enable" });
     }
-  }
-
-  // Advisor tool gating: enable only when explicitly eligible, disable otherwise.
-  // This rule is last so it overrides broad inherited patterns like add: [".*"].
-  if (options.advisorEnabled) {
-    runtimePolicy.push({ regex_match: "advisor", action: "enable" });
-  } else {
-    runtimePolicy.push({ regex_match: "advisor", action: "disable" });
   }
 
   return [...agentPolicy, ...runtimePolicy];

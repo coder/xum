@@ -1,5 +1,5 @@
 /**
- * Shared shux:// deep-link payload types. The legacy mux:// scheme normalizes to
+ * Shared xum:// deep-link payload types. The legacy mux:// scheme normalizes to
  * this same shape so compatibility stays at the parsing/registration boundary.
  */
 export interface DeepLinkPayload {

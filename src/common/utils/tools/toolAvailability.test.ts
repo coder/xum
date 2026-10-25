@@ -1,32 +1,23 @@
 import { describe, expect, test } from "bun:test";
 
-import { getGoalToolAvailability, getToolAvailabilityOptions } from "./toolAvailability";
+import {
+  getGoalToolAvailability,
+  getSetGoalRefusalReason,
+  getToolAvailabilityOptions,
+} from "./toolAvailability";
 import type { GoalStatus } from "@/common/types/goal";
-
-const execAgent = {
-  id: "exec" as const,
-  tools: { add: [".*"], remove: ["propose_plan"] },
-};
-const exploreAgent = {
-  id: "explore" as const,
-  tools: { remove: ["file_edit_.*", "task_apply_git_patch"] },
-};
-const execBaseForExplore = {
-  id: "exec" as const,
-  tools: { add: [".*"], remove: ["propose_plan"] },
-};
+import type { TaskTurnKind } from "@/constants/goals";
 
 function availableGoalToolNames(input: {
   goalStatus: GoalStatus | null;
-  editingCapable: boolean;
   parentWorkspaceId?: string | null;
-  allowAgentSetGoal?: boolean;
+  taskTurnKind?: TaskTurnKind;
 }): string[] {
   const availability = getGoalToolAvailability({
     goalStatus: input.goalStatus,
     parentWorkspaceId: input.parentWorkspaceId,
-    allowAgentSetGoal: input.allowAgentSetGoal,
-    agentInheritanceChain: input.editingCapable ? [execAgent] : [exploreAgent, execBaseForExplore],
+    agentId: "exec",
+    taskTurnKind: input.taskTurnKind,
   });
 
   return [
@@ -37,114 +28,142 @@ function availableGoalToolNames(input: {
 }
 
 describe("goal tool availability", () => {
-  test("allows set_goal for a continuation-capable parent editing agent when no goal is set", () => {
-    expect(
-      availableGoalToolNames({
-        goalStatus: null,
-        editingCapable: true,
-        allowAgentSetGoal: true,
-      })
-    ).toEqual(["set_goal"]);
+  test("allows set_goal in a top-level workspace when no goal is set", () => {
+    expect(availableGoalToolNames({ goalStatus: null })).toEqual(["set_goal"]);
   });
 
   test.each(["active", "budget_limited", "paused", "complete"] as const)(
-    "allows set_goal for %s goals in parent editing sessions",
+    "allows set_goal for %s goals in top-level workspaces",
     (goalStatus) => {
-      expect(
-        availableGoalToolNames({
-          goalStatus,
-          editingCapable: true,
-          allowAgentSetGoal: true,
-        })
-      ).toContain("set_goal");
+      expect(availableGoalToolNames({ goalStatus })).toContain("set_goal");
     }
   );
 
-  test("withholds set_goal from child workspaces", () => {
+  // Sub-agents own goals: a user or delegated turn in a child may set one, but no turn
+  // TaskService drove automatically may (it would reset the child goal's caps).
+  test("allows set_goal on a child's own turns but not its automatic task turns", () => {
+    expect(availableGoalToolNames({ goalStatus: null, parentWorkspaceId: "parent" })).toEqual([
+      "set_goal",
+    ]);
     expect(
       availableGoalToolNames({
-        goalStatus: null,
-        editingCapable: true,
+        goalStatus: "active",
         parentWorkspaceId: "parent",
-        allowAgentSetGoal: true,
+        taskTurnKind: "goal_continuation",
       })
-    ).not.toContain("set_goal");
+    ).toEqual(["get_goal", "complete_goal"]);
   });
 
-  test("withholds set_goal from non-editing agents", () => {
-    expect(
-      availableGoalToolNames({
-        goalStatus: null,
-        editingCapable: false,
-        allowAgentSetGoal: true,
-      })
-    ).not.toContain("set_goal");
+  test("allows get_goal for complete goals when set_goal is available for safe replacement", () => {
+    expect(availableGoalToolNames({ goalStatus: "complete" })).toEqual(["set_goal", "get_goal"]);
   });
 
-  test("withholds set_goal from non-continuation-capable one-shot hosts", () => {
+  test("omits goal tools for complete goals on a child's automatic task turns", () => {
     expect(
       availableGoalToolNames({
-        goalStatus: null,
-        editingCapable: true,
-        allowAgentSetGoal: false,
+        goalStatus: "complete",
+        parentWorkspaceId: "parent",
+        taskTurnKind: "recovery",
       })
     ).toEqual([]);
   });
 
-  test.each(["paused", "complete"] as const)(
-    "allows get_goal for %s goals when set_goal is available for safe replacement",
-    (goalStatus) => {
-      expect(
-        availableGoalToolNames({
-          goalStatus,
-          editingCapable: true,
-          allowAgentSetGoal: true,
-        })
-      ).toEqual(["set_goal", "get_goal"]);
-    }
-  );
-
-  test.each(["paused", "complete"] as const)(
-    "omits goal tools for %s goals when set_goal is unavailable",
-    (goalStatus) => {
-      expect(
-        availableGoalToolNames({
-          goalStatus,
-          editingCapable: true,
-          allowAgentSetGoal: false,
-        })
-      ).toEqual([]);
-    }
-  );
-
-  test("allows get_goal only for active goals with a non-editing agent", () => {
+  // The work can finish while the loop is paused, so completing needs no resume.
+  test("allows completing a paused goal on every turn", () => {
+    expect(availableGoalToolNames({ goalStatus: "paused" })).toEqual([
+      "set_goal",
+      "get_goal",
+      "complete_goal",
+    ]);
     expect(
       availableGoalToolNames({
-        goalStatus: "active",
-        editingCapable: false,
-        allowAgentSetGoal: true,
+        goalStatus: "paused",
+        parentWorkspaceId: "parent",
+        taskTurnKind: "recovery",
       })
-    ).toEqual(["get_goal"]);
+    ).toEqual(["get_goal", "complete_goal"]);
   });
 
-  test("allows all goal tools for active goals with a parent editing agent", () => {
-    expect(
-      availableGoalToolNames({
-        goalStatus: "active",
-        editingCapable: true,
-        allowAgentSetGoal: true,
-      })
-    ).toEqual(["set_goal", "get_goal", "complete_goal"]);
+  test("allows all goal tools for active goals in top-level workspaces", () => {
+    expect(availableGoalToolNames({ goalStatus: "active" })).toEqual([
+      "set_goal",
+      "get_goal",
+      "complete_goal",
+    ]);
   });
 
   test("allows get_goal and complete_goal for budget-limited goals without set_goal", () => {
     expect(
       availableGoalToolNames({
         goalStatus: "budget_limited",
-        editingCapable: true,
-        allowAgentSetGoal: false,
+        parentWorkspaceId: "parent",
+        taskTurnKind: "goal_budget_limit",
       })
     ).toEqual(["get_goal", "complete_goal"]);
+  });
+});
+
+describe("set_goal refusal for plan and compact turns", () => {
+  // Automatic goal turns would run plan/compact as exec: the turn's agent id decides.
+  test.each(["plan", "compact"])("refuses set_goal on a top-level %s turn", (agentId) => {
+    const context = { parentWorkspaceId: null, agentId };
+    expect(getSetGoalRefusalReason(context)).toBe("non_goal_agent");
+    expect(getGoalToolAvailability({ ...context, goalStatus: null }).setGoal).toBe(false);
+  });
+
+  test("refuses set_goal on a top-level custom plan-like turn", () => {
+    const context = {
+      parentWorkspaceId: null,
+      agentId: "my-planner",
+      agentIsPlanLike: true,
+    };
+    expect(getSetGoalRefusalReason(context)).toBe("non_goal_agent");
+    expect(getSetGoalRefusalReason({ ...context, agentIsPlanLike: false })).toBeNull();
+  });
+
+  test("refuses set_goal when the turn disabled workspace agent definitions", () => {
+    // Goal continuations and recovery resolve agents without the per-turn override,
+    // so a same-id workspace definition could run them instead.
+    const context = {
+      parentWorkspaceId: null,
+      agentId: "exec",
+      agentDiscoveryOverridden: true,
+    };
+    expect(getSetGoalRefusalReason(context)).toBe("agent_discovery_override");
+    expect(getGoalToolAvailability({ ...context, goalStatus: null }).setGoal).toBe(false);
+    expect(getSetGoalRefusalReason({ ...context, agentDiscoveryOverridden: false })).toBeNull();
+  });
+
+  // Plan-like goal turns only re-plan, in a child as much as at the top level.
+  test("refuses set_goal on a plan child's own turn", () => {
+    expect(getSetGoalRefusalReason({ parentWorkspaceId: "parent", agentId: "plan" })).toBe(
+      "non_goal_agent"
+    );
+  });
+
+  test("allows set_goal for a read-only agent", () => {
+    expect(getSetGoalRefusalReason({ parentWorkspaceId: null, agentId: "explore" })).toBeNull();
+  });
+});
+
+describe("getSetGoalRefusalReason", () => {
+  // Every automatic task turn of a child refuses set_goal; a persisted malformed kind replays as
+  // "recovery" (coerceTaskTurnKind fails closed), so it refuses too.
+  test.each(["required_report", "recovery", "goal_continuation", "goal_budget_limit"] as const)(
+    "refuses set_goal on a child's %s turn",
+    (taskTurnKind) => {
+      expect(
+        getSetGoalRefusalReason({ parentWorkspaceId: "parent", agentId: "exec", taskTurnKind })
+      ).toBe("automatic_task_turn");
+    }
+  );
+
+  test("allows set_goal on a child's own (non-automatic) turn", () => {
+    expect(getSetGoalRefusalReason({ parentWorkspaceId: "parent", agentId: "exec" })).toBeNull();
+  });
+
+  test("ignores task turn provenance outside sub-agents", () => {
+    expect(getSetGoalRefusalReason({ agentId: "exec", taskTurnKind: "recovery" })).toBeNull();
   });
 });
 

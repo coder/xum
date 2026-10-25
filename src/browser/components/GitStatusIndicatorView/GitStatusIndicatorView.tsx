@@ -1,5 +1,6 @@
 import React from "react";
 import type { GitStatus } from "@/common/types/workspace";
+import type { GitStatusIndicatorMode } from "@/common/constants/storage";
 import type { GitCommit, GitBranchHeader } from "@/common/utils/git/parseGitLog";
 import { cn } from "@/common/lib/utils";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
@@ -39,7 +40,39 @@ function formatCountAbbrev(count: number): string {
   return `${count < 0 ? "-" : ""}${normalized}m`;
 }
 
-export type GitStatusIndicatorMode = "divergence" | "line-delta";
+function otherMode(mode: GitStatusIndicatorMode): GitStatusIndicatorMode {
+  return mode === "divergence" ? "line-delta" : "divergence";
+}
+
+function hasModeContent(mode: GitStatusIndicatorMode, gitStatus: GitStatus): boolean {
+  if (gitStatus.dirty) return true;
+  if (mode === "divergence") return gitStatus.ahead > 0 || gitStatus.behind > 0;
+  return (
+    gitStatus.outgoingAdditions +
+      gitStatus.outgoingDeletions +
+      gitStatus.incomingAdditions +
+      gitStatus.incomingDeletions >
+    0
+  );
+}
+
+/**
+ * Tap-toggle triggers stay tappable when only the other mode has content, so the user can never
+ * get stuck on an empty mode with nothing to tap.
+ */
+function getTriggerVisibility(
+  mode: GitStatusIndicatorMode,
+  gitStatus: GitStatus,
+  tapTogglesMode: boolean
+): "content" | "zero-count" | "empty" {
+  if (hasModeContent(mode, gitStatus)) return "content";
+  return tapTogglesMode && hasModeContent(otherMode(mode), gitStatus) ? "zero-count" : "empty";
+}
+
+function getTriggerAriaLabel(mode: GitStatusIndicatorMode, tapTogglesMode: boolean): string {
+  if (!tapTogglesMode) return "View git divergence details";
+  return mode === "divergence" ? "Show lines" : "Show commits";
+}
 
 export interface GitStatusIndicatorViewProps {
   gitStatus: GitStatus | null;
@@ -58,10 +91,14 @@ export interface GitStatusIndicatorViewProps {
   // Base ref for divergence (shared with review panel)
   baseRef: string;
   onBaseChange: (value: string) => void;
+  /** Lets the base selector offer only refs that exist in this workspace. */
+  workspaceId?: string;
   /** When true, shows blue pulsing styling to indicate agent is working */
   isWorking?: boolean;
   /** When true, shows shimmer effect to indicate git status is refreshing */
   isRefreshing?: boolean;
+  /** When true, a tap switches between line delta and commit divergence instead of opening the dialog. */
+  tapTogglesMode?: boolean;
 }
 
 const CounterPill: React.FC<{ children: React.ReactNode }> = ({ children }) => (
@@ -91,32 +128,30 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
   onModeChange,
   baseRef,
   onBaseChange,
+  workspaceId,
   isWorking = false,
   isRefreshing = false,
+  tapTogglesMode = false,
 }) => {
   // Handle null gitStatus (initial loading state)
   if (!gitStatus) {
     return (
       <span
-        className="text-accent relative flex items-center gap-1 font-mono text-[11px]"
+        className="text-accent-text relative flex items-center gap-1 font-mono text-[11px]"
         aria-hidden="true"
       />
     );
   }
 
-  const outgoingLines = gitStatus.outgoingAdditions + gitStatus.outgoingDeletions;
   const incomingLines = gitStatus.incomingAdditions + gitStatus.incomingDeletions;
 
-  // Render empty placeholder when nothing to show (prevents layout shift)
-  const isEmpty =
-    mode === "divergence"
-      ? gitStatus.ahead === 0 && gitStatus.behind === 0 && !gitStatus.dirty
-      : outgoingLines === 0 && !gitStatus.dirty && incomingLines === 0;
+  const visibility = getTriggerVisibility(mode, gitStatus, tapTogglesMode);
 
-  if (isEmpty) {
+  // Render empty placeholder when nothing to show (prevents layout shift)
+  if (visibility === "empty") {
     return (
       <span
-        className="text-accent relative flex items-center gap-1 font-mono text-[11px]"
+        className="text-accent-text relative flex items-center gap-1 font-mono text-[11px]"
         aria-hidden="true"
       />
     );
@@ -193,7 +228,6 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
     );
   };
 
-  // Render tooltip content
   const renderTooltipContent = () => {
     if (isLoading) {
       return "Loading...";
@@ -216,7 +250,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
             <div key={`${commit.hash}-${index}`} className="flex flex-col gap-0.5">
               <div className="flex gap-2 font-mono leading-snug">
                 {renderIndicators(commit.indicators)}
-                <span className="text-accent shrink-0 select-all">{commit.hash}</span>
+                <span className="text-accent-text shrink-0 select-all">{commit.hash}</span>
                 <span className="text-muted-light shrink-0">{commit.date}</span>
                 <span className="text-foreground flex-1 break-words">{commit.subject}</span>
               </div>
@@ -232,10 +266,10 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
 
   // Dynamic color based on working state
   // Idle: muted/grayscale, Working: original accent colors
-  const statusColor = isWorking ? "text-accent" : "text-muted";
+  const statusColor = isWorking ? "text-accent-text" : "text-muted";
   const dirtyColor = isWorking ? "text-git-dirty" : "text-muted";
-  const additionsColor = isWorking ? "text-success-light" : "text-muted";
-  const deletionsColor = isWorking ? "text-warning-light" : "text-muted";
+  const additionsColor = isWorking ? "text-success-light-text" : "text-muted";
+  const deletionsColor = isWorking ? "text-warning-light-text" : "text-muted";
 
   // Dialog content with git divergence details
   const dialogContent = (
@@ -264,7 +298,7 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
 
         <div className="flex items-center gap-2">
           <span className="text-muted-light">Base:</span>
-          <BaseSelectorPopover value={baseRef} onChange={onBaseChange} />
+          <BaseSelectorPopover value={baseRef} workspaceId={workspaceId} onChange={onBaseChange} />
         </div>
 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]">
@@ -305,6 +339,13 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
 
   const triggerContent = (
     <>
+      {visibility === "zero-count" && (
+        <CounterPill>
+          <span className="flex items-center px-1.5 font-normal">
+            {mode === "divergence" ? "↑0" : "+0"}
+          </span>
+        </CounterPill>
+      )}
       {mode === "divergence" ? (
         hasCommitDivergence && (
           <CounterPill>
@@ -365,11 +406,15 @@ export const GitStatusIndicatorView: React.FC<GitStatusIndicatorViewProps> = ({
           statusColor,
           isRefreshing && "animate-pulse"
         )}
-        aria-label="View git divergence details"
+        aria-label={getTriggerAriaLabel(mode, tapTogglesMode)}
         onKeyDown={stopKeyboardPropagation}
         onClick={(e) => {
           e.stopPropagation();
-          onOpenChange(true);
+          if (tapTogglesMode) {
+            onModeChange(otherMode(mode));
+          } else {
+            onOpenChange(true);
+          }
         }}
       >
         {triggerContent}

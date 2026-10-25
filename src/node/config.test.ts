@@ -1,32 +1,41 @@
-import * as fs from "fs";
-import * as os from "os";
 import * as path from "path";
+import { afterEach, beforeEach, describe, expect, it, jest, spyOn } from "bun:test";
+import * as fs from "fs";
+// writeFileAtomic reads fs through the CommonJS module object (the default import); a spy
+// on the `import * as fs` namespace would not reach it.
+import cjsFs from "fs";
+import * as os from "os";
+import { log } from "@/node/services/log";
 import { Config } from "./config";
 import {
-  CODER_ARCHIVE_BEHAVIORS,
-  DEFAULT_CODER_ARCHIVE_BEHAVIOR,
-} from "@/common/config/coderArchiveBehavior";
+  projectRegistrationLockFilePath,
+  withProjectRegistrationLock,
+} from "./config/projectRegistrationLock";
+import { acquireProcessFileLock } from "./utils/concurrency/fileLock";
+import { AppConfigOnDiskSchema } from "@/common/config/schemas/appConfigOnDisk";
+import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
 import {
-  DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR,
-  WORKTREE_ARCHIVE_BEHAVIORS,
-} from "@/common/config/worktreeArchiveBehavior";
+  PREVIOUS_TASK_SETTINGS_DEFAULTS,
+  TASK_SETTINGS_LIMITS,
+} from "@/common/config/schemas/taskSettings";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
+import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS } from "@/common/constants/workspace";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { secretsToRecord } from "@/common/types/secrets";
+
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 describe("Config", () => {
   let tempDir: string;
   let config: Config;
 
   beforeEach(() => {
-    // Create a temporary directory for each test
     tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-"));
     config = new Config(tempDir);
   });
 
   afterEach(() => {
-    // Clean up temporary directory
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
@@ -37,6 +46,778 @@ describe("Config", () => {
   async function flushConfigEdits(): Promise<void> {
     await config.editConfig((cfg) => cfg);
   }
+
+  it("preserves the npm update channel through save and reload", async () => {
+    await config.setUpdateChannel("npm");
+    expect(new Config(tempDir).getUpdateChannel()).toBe("npm");
+    await config.setUpdateChannel("nightly");
+    expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+  });
+
+  // Layout presets were removed: an old config that still has them must load, and the next
+  // save drops only that key (the user chose this over keeping it for downgrades).
+  it("loads a config with legacy layoutPresets and drops only that key on save", async () => {
+    const configFile = path.join(tempDir, "config.json");
+    fs.writeFileSync(
+      configFile,
+      JSON.stringify({
+        projects: [],
+        defaultProjectDir: "/home/user/code",
+        layoutPresets: { version: 2, slots: [{ slot: 1, preset: { id: "p1", name: "Old" } }] },
+      })
+    );
+
+    expect(config.loadConfigOrDefault().defaultProjectDir).toBe("/home/user/code");
+    expect(config.getConfigLoadError()).toBeNull();
+
+    await config.setUpdateChannel("npm");
+
+    const persisted = JSON.parse(fs.readFileSync(configFile, "utf-8")) as Record<string, unknown>;
+    expect(persisted.layoutPresets).toBeUndefined();
+    expect(persisted.defaultProjectDir).toBe("/home/user/code");
+  });
+
+  describe("hidden-model preferences", () => {
+    const unrelated = "openrouter:openai/gpt-5";
+
+    it.each(
+      [
+        undefined,
+        null,
+        "invalid",
+        {},
+        [null],
+        [""],
+        ["  "],
+        ["invalid"],
+        ["openai:"],
+        [42, false, {}],
+      ].map((hiddenModels) => ({ hiddenModels }))
+    )("reopens preference recovery for malformed hides: %j", async ({ hiddenModels }) => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          hiddenModels,
+          migrations: { hiddenModelsInitialized: true },
+        })
+      );
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).getClientConfig();
+      expect(reloaded.hiddenModels).toBeUndefined();
+      expect(reloaded.hiddenModelsInitialized).toBe(false);
+
+      await config.updateModelPreferences({ hiddenModels: [] });
+      const recovered = new Config(tempDir).getClientConfig();
+      expect(recovered.hiddenModels).toEqual([]);
+      expect(recovered.hiddenModelsInitialized).toBe(true);
+    });
+
+    it("preserves valid hides when discarding malformed entries", async () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          hiddenModels: [null, unrelated, ""],
+          migrations: { hiddenModelsInitialized: true },
+        })
+      );
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).getClientConfig();
+      expect(reloaded.hiddenModels).toEqual([unrelated]);
+      expect(reloaded.hiddenModelsInitialized).toBe(true);
+    });
+
+    it.each<{ name: string; persisted: boolean; hiddenModels?: string[] }>([
+      { name: "fresh install", persisted: false, hiddenModels: undefined },
+      { name: "existing backend preferences", persisted: true, hiddenModels: [unrelated] },
+    ])("loads $name without seeding hides and persists later choices", async (scenario) => {
+      if (scenario.persisted) {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [],
+            defaultModel: KNOWN_MODELS.GPT.id,
+            hiddenModels: scenario.hiddenModels,
+          })
+        );
+      }
+      const loaded = config.getClientConfig();
+      expect(loaded.hiddenModels).toEqual(scenario.hiddenModels);
+      // Load must not claim initialization, or the client skips importing legacy local hides.
+      expect(loaded.hiddenModelsInitialized).toBe(false);
+      await flushConfigEdits();
+
+      for (const hidden of [[unrelated, KNOWN_MODELS.GPT_6_LUNA.id], []]) {
+        await config.updateModelPreferences({ hiddenModels: hidden });
+        const reloaded = new Config(tempDir).getClientConfig();
+        expect(reloaded.hiddenModels).toEqual(hidden);
+        expect(reloaded.hiddenModelsInitialized).toBe(true);
+        expect(reloaded.defaultModel).toBe(loaded.defaultModel);
+      }
+    });
+  });
+
+  describe("loadConfigOrDefault corrupt config recovery", () => {
+    function configFilePath(): string {
+      return path.join(tempDir, "config.json");
+    }
+
+    function corruptBackups(): string[] {
+      return fs
+        .readdirSync(tempDir)
+        .filter((name) => name.startsWith("config.json.corrupt-"))
+        .map((name) => path.join(tempDir, name));
+    }
+
+    it("preserves malformed JSON and falls back to defaults", () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.size).toBe(0);
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(corruptData);
+      const backups = corruptBackups();
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(backups[0])).toEqual(Buffer.from(corruptData));
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(String(errorSpy.mock.calls[0]?.[0])).toContain(configFile);
+      errorSpy.mockRestore();
+    });
+
+    it("heals invalid fields in an object without creating a backup", () => {
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          apiServerPort: "abc",
+          defaultModel: "openai:gpt-4o",
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+            persistentSubagentsDefaulted: true,
+          },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.apiServerPort).toBeUndefined();
+      expect(loaded.defaultModel).toBe("openai:gpt-4o");
+      expect(corruptBackups()).toHaveLength(0);
+    });
+
+    it("treats a missing config as a silent fresh install", () => {
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.size).toBe(0);
+      expect(corruptBackups()).toHaveLength(0);
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+    });
+
+    it("keeps the corrupt bytes after a settings edit rewrites config.json", async () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      config.loadConfigOrDefault();
+      const [backupPath] = corruptBackups();
+      await config.setUpdateChannel("nightly");
+
+      const rewritten = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        updateChannel?: unknown;
+      };
+      expect(rewritten.updateChannel).toBe("nightly");
+      expect(fs.readFileSync(backupPath)).toEqual(Buffer.from(corruptData));
+      errorSpy.mockRestore();
+    });
+
+    // #5757: an unreadable (not corrupt) file must be reported as unreadable, both by the edit
+    // refusal and by getConfigLoadError, which callers use instead of "not found".
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "reports an unreadable config as unreadable, not corrupt",
+      async () => {
+        const configFile = configFilePath();
+        await config.setUpdateChannel("stable");
+        // Warm the snapshot, as a running server has: chmod keeps its stat key.
+        config.loadConfigOrDefault();
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        fs.chmodSync(configFile, 0o000);
+        try {
+          const refused = await config.setUpdateChannel("nightly").then(
+            () => null,
+            (e: unknown) => String(e)
+          );
+          expect(refused).toMatch(/could not be read/);
+          expect(refused).not.toMatch(/corrupt/);
+          expect(config.getConfigLoadError()).toMatch(/could not be read/);
+        } finally {
+          fs.chmodSync(configFile, 0o600);
+          errorSpy.mockRestore();
+        }
+        await config.setUpdateChannel("nightly");
+        expect(config.getConfigLoadError()).toBeNull();
+      }
+    );
+
+    it("reports a malformed config through getConfigLoadError", () => {
+      fs.writeFileSync(configFilePath(), '{ "projects": ');
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      config.loadConfigOrDefault();
+      expect(config.getConfigLoadError()).toMatch(/could not be parsed/);
+      errorSpy.mockRestore();
+    });
+
+    // A short-lived Config (e.g. runtimeFactory's) that fails a read must not make a healthy
+    // instance report that failure: the failure map is shared by path.
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "reports only load failures this instance observed",
+      async () => {
+        const configFile = configFilePath();
+        await config.setUpdateChannel("stable");
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          // This instance fails once and then recovers on its own read.
+          fs.chmodSync(configFile, 0o000);
+          config.loadConfigOrDefault();
+          expect(config.getConfigLoadError()).toMatch(/could not be read/);
+          fs.chmodSync(configFile, 0o600);
+          config.loadConfigOrDefault();
+          expect(config.getConfigLoadError()).toBeNull();
+
+          fs.chmodSync(configFile, 0o000);
+          const shortLived = new Config(tempDir);
+          shortLived.loadConfigOrDefault();
+          expect(shortLived.getConfigLoadError()).toMatch(/could not be read/);
+          // chmod keeps the stat key, so the recovered instance still serves its snapshot.
+          expect(config.loadConfigOrDefault().updateChannel).toBe("stable");
+          expect(config.getConfigLoadError()).toBeNull();
+
+          // Instances whose own last load failed share one state and both report it.
+          const failedMain = new Config(tempDir);
+          failedMain.loadConfigOrDefault();
+          new Config(tempDir).loadConfigOrDefault();
+          expect(failedMain.getConfigLoadError()).toMatch(/could not be read/);
+        } finally {
+          fs.chmodSync(configFile, 0o600);
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "does not point to a .corrupt- backup that could not be written",
+      () => {
+        fs.writeFileSync(configFilePath(), '{ "projects": ');
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        // A read-only config dir makes the sidecar write fail.
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          config.loadConfigOrDefault();
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+        const loadError = config.getConfigLoadError();
+        expect(loadError).toMatch(/could not be parsed/);
+        expect(loadError).not.toMatch(/restore it from/);
+      }
+    );
+
+    it("backs up malformed JSON before rethrowing for cleanup guards", () => {
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFilePath(), corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      expect(() => config.loadConfigOrDefault({ throwOnError: true })).toThrow();
+
+      const backups = corruptBackups();
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(backups[0])).toEqual(Buffer.from(corruptData));
+      errorSpy.mockRestore();
+    });
+
+    it("does not overwrite the corrupt config through edits until a backup is confirmed", async () => {
+      const configFile = configFilePath();
+      const corruptData = '{ "projects": ';
+      fs.writeFileSync(configFile, corruptData);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const origWrite = fs.writeFileSync.bind(fs);
+      const writeSpy = spyOn(fs, "writeFileSync").mockImplementation((file, data, options) => {
+        if (typeof file === "string" && file.includes(".corrupt-")) {
+          throw new Error("disk full");
+        }
+        origWrite(file, data, options);
+      });
+
+      // Callers must see the blocked write as a failure, not a silent success.
+      const blockedError = await config.setUpdateChannel("nightly").then(
+        () => null,
+        (e: unknown) => e
+      );
+      expect(String(blockedError)).toContain("no confirmed backup yet");
+
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(corruptData);
+      expect(corruptBackups()).toHaveLength(0);
+
+      writeSpy.mockRestore();
+
+      await config.setUpdateChannel("nightly");
+
+      const backups = corruptBackups();
+      expect(backups).toHaveLength(1);
+      expect(fs.readFileSync(backups[0])).toEqual(Buffer.from(corruptData));
+      const rewritten = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        updateChannel?: unknown;
+      };
+      expect(rewritten.updateChannel).toBe("nightly");
+      errorSpy.mockRestore();
+    });
+
+    it("creates sidecars with owner-only permissions", () => {
+      if (process.platform === "win32") {
+        return;
+      }
+      const configFile = configFilePath();
+      // Pin a permissive umask: under a 0077 umask this assertion would pass vacuously.
+      const prevUmask = process.umask(0o022);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(configFile, '{ "projects": ');
+        config.loadConfigOrDefault();
+
+        const [backup] = corruptBackups();
+        // Sidecars can hold credentials; peer file proves the narrowing is not ambient.
+        expect(fs.statSync(backup).mode & 0o777).toBe(0o600);
+        expect(fs.statSync(configFile).mode & 0o777).toBe(0o644);
+      } finally {
+        process.umask(prevUmask);
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("aborts an edit write when the corrupt file changed after the edit loaded it", async () => {
+      const configFile = configFilePath();
+      const corruptA = '{ "projects": ';
+      const corruptB = '{ "taskSettings": ';
+      fs.writeFileSync(configFile, corruptA);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+
+      // Simulate a concurrent writer replacing the file between this edit's load and write.
+      const raceError = await config
+        .editConfig((cfg) => {
+          fs.writeFileSync(configFile, corruptB);
+          return cfg;
+        })
+        .then(
+          () => null,
+          (e: unknown) => e
+        );
+      expect(String(raceError)).toContain("changed after this edit loaded it");
+
+      // The write was skipped: B is still on disk instead of a defaults rewrite.
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(corruptB);
+
+      // The next edit's own load backs up B, so it may proceed.
+      await config.setUpdateChannel("nightly");
+      const contents = corruptBackups().map((p) => fs.readFileSync(p, "utf-8"));
+      expect(contents).toContain(corruptA);
+      expect(contents).toContain(corruptB);
+      const rewritten = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        updateChannel?: unknown;
+      };
+      expect(rewritten.updateChannel).toBe("nightly");
+      errorSpy.mockRestore();
+    });
+  });
+
+  describe("saveConfig under partial writes", () => {
+    // Regression for coder/xum#4197: while a disk was filling up, a single write(2)
+    // accepted only part of the serialized config without reporting an error, and the
+    // npm write-file-atomic package renamed that truncated temp file over the good
+    // config.json. The next load then rejected it and fell back to an empty registry.
+    type BufferWrite = (
+      fd: number,
+      buffer: NodeJS.ArrayBufferView,
+      offset: number,
+      length: number,
+      position: number | null,
+      callback: (
+        error: NodeJS.ErrnoException | null,
+        written: number,
+        buffer: NodeJS.ArrayBufferView
+      ) => void
+    ) => void;
+
+    let configFile: string;
+    let seededContents: string;
+    let errorSpy: ReturnType<typeof spyOn<typeof log, "error">>;
+
+    beforeEach(async () => {
+      configFile = path.join(tempDir, "config.json");
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/repo", {
+          workspaces: [{ path: "/repo/a", id: "aaaaaaaaaa", name: "a" }],
+        });
+        return cfg;
+      });
+      seededContents = fs.readFileSync(configFile, "utf-8");
+      errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+    });
+
+    afterEach(() => {
+      errorSpy.mockRestore();
+    });
+
+    // Mirrors the kernel contract: a short count is not an error, and any failure only
+    // surfaces on the following write.
+    function mockFsWrite(
+      behavior: (call: number, original: BufferWrite, args: Parameters<BufferWrite>) => void
+    ): { restore: () => void; callCount: () => number } {
+      const original: BufferWrite = cjsFs.write.bind(cjsFs);
+      let calls = 0;
+      const spy = spyOn(cjsFs, "write").mockImplementation(((...args: Parameters<BufferWrite>) => {
+        calls += 1;
+        behavior(calls, original, args);
+      }) as typeof cjsFs.write);
+      // mockRestore() also clears the spy's recorded calls, so count them here.
+      return { restore: () => spy.mockRestore(), callCount: () => calls };
+    }
+
+    function writeHalf(original: BufferWrite, args: Parameters<BufferWrite>): void {
+      const [fd, buffer, offset, length, position, callback] = args;
+      original(fd, buffer, offset, Math.floor(length / 2), position, callback);
+    }
+
+    function configFiles(): string[] {
+      return fs.readdirSync(tempDir).filter((name) => name.startsWith("config.json"));
+    }
+
+    it("keeps the previous config when the disk fills up after a short write", async () => {
+      const fsWrite = mockFsWrite((call, original, args) => {
+        if (call === 1) {
+          writeHalf(original, args);
+          return;
+        }
+        const error: NodeJS.ErrnoException = new Error("ENOSPC: no space left on device");
+        error.code = "ENOSPC";
+        args[5](error, 0, args[1]);
+      });
+      let notifications = 0;
+      const unsubscribe = config.onConfigChanged(() => {
+        notifications += 1;
+      });
+      let saveError: unknown;
+      try {
+        saveError = await config.setUpdateChannel("nightly").catch((error: unknown) => error);
+      } finally {
+        fsWrite.restore();
+        unsubscribe();
+      }
+
+      expect(fsWrite.callCount()).toBeGreaterThan(0);
+      // The caller learns the edit is not durable (#4444) instead of a silent drop.
+      expect(saveError).toMatchObject({ code: "ENOSPC" });
+      expect(errorSpy).toHaveBeenCalledWith(
+        "Error saving config:",
+        expect.objectContaining({ code: "ENOSPC" })
+      );
+      expect(notifications).toBe(0);
+      // The same instance reads what is on disk, not the failed edit.
+      expect(config.getUpdateChannel()).not.toBe("nightly");
+      // The good config survives byte for byte.
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(seededContents);
+      const reloaded = new Config(tempDir);
+      expect(reloaded.loadConfigOrDefault().projects.has("/repo")).toBe(true);
+      expect(reloaded.getUpdateChannel()).not.toBe("nightly");
+      // No temp file left behind and no corrupt sidecar needed on reload.
+      expect(configFiles()).toEqual(["config.json"]);
+    });
+
+    it("completes a short write so the saved config is whole", async () => {
+      const fsWrite = mockFsWrite((call, original, args) => {
+        if (call === 1) {
+          writeHalf(original, args);
+          return;
+        }
+        original(...args);
+      });
+      try {
+        await config.setUpdateChannel("nightly");
+      } finally {
+        fsWrite.restore();
+      }
+
+      expect(fsWrite.callCount()).toBeGreaterThan(0);
+      expect(errorSpy).not.toHaveBeenCalled();
+      const reloaded = new Config(tempDir);
+      expect(reloaded.getUpdateChannel()).toBe("nightly");
+      expect(reloaded.loadConfigOrDefault().projects.has("/repo")).toBe(true);
+      expect(configFiles()).toEqual(["config.json"]);
+    });
+
+    it("refuses to publish a temp file whose size disagrees with the payload", async () => {
+      // Independent of the retry loop: a write that reports the full length but stores
+      // less must still be caught before the rename.
+      const fsWrite = mockFsWrite((_call, original, args) => {
+        const [fd, buffer, offset, length, position, callback] = args;
+        original(fd, buffer, offset, Math.floor(length / 2), position, (error) =>
+          callback(error, length, buffer)
+        );
+      });
+      let saveError: unknown;
+      try {
+        saveError = await config.setUpdateChannel("nightly").catch((error: unknown) => error);
+      } finally {
+        fsWrite.restore();
+      }
+
+      expect(fsWrite.callCount()).toBeGreaterThan(0);
+      expect(saveError).toBeInstanceOf(Error);
+      expect((saveError as Error).message).toContain("Incomplete write");
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(seededContents);
+      expect(new Config(tempDir).loadConfigOrDefault().projects.has("/repo")).toBe(true);
+      expect(configFiles()).toEqual(["config.json"]);
+    });
+
+    it("a failed save does not wedge later edits or the registration lock (#4444)", async () => {
+      const failOnce = mockFsWrite((call, original, args) => {
+        if (call === 1) {
+          const error: NodeJS.ErrnoException = new Error("ENOSPC: no space left on device");
+          error.code = "ENOSPC";
+          args[5](error, 0, args[1]);
+          return;
+        }
+        original(...args);
+      });
+      try {
+        const gatedError = await config
+          .setUpdateChannel("nightly")
+          .catch((error: unknown) => error);
+        expect(gatedError).toMatchObject({ code: "ENOSPC" });
+      } finally {
+        failOnce.restore();
+      }
+      // The failed edit released its queue slot and the file lock: the next one lands.
+      await config.setUpdateChannel("nightly");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+
+      // Same inside a registration window: the held edit rejects, and the window's lock is
+      // still released for the edit that follows it.
+      const failHeld = mockFsWrite((_call, _original, args) => {
+        const error: NodeJS.ErrnoException = new Error("ENOSPC: no space left on device");
+        error.code = "ENOSPC";
+        args[5](error, 0, args[1]);
+      });
+      try {
+        const heldError = await withProjectRegistrationLock(tempDir, (lock) =>
+          config.editConfig((value) => ({ ...value, updateChannel: "stable" }), {
+            withinRegistrationLock: lock,
+          })
+        ).catch((error: unknown) => error);
+        expect(heldError).toMatchObject({ code: "ENOSPC" });
+      } finally {
+        failHeld.restore();
+      }
+      expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+      await config.setUpdateChannel("stable");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("stable");
+      expect(configFiles()).toEqual(["config.json"]);
+    });
+
+    it("a config that cannot be serialized rejects the edit (#4444)", async () => {
+      const cyclic: Record<string, unknown> = {};
+      cyclic.self = cyclic;
+      const saveError = await config
+        .editConfig((value) => ({
+          ...value,
+          settingsBackup: cyclic as unknown as NonNullable<typeof value.settingsBackup>,
+        }))
+        .catch((error: unknown) => error);
+
+      expect(saveError).toBeInstanceOf(TypeError);
+      expect(fs.readFileSync(configFile, "utf-8")).toBe(seededContents);
+      expect(configFiles()).toEqual(["config.json"]);
+    });
+  });
+
+  // #5929: a writer that skips the registration lock (a manual editor, an older build) can
+  // replace config.json between an edit's fresh read and its save. The save then refuses to
+  // overwrite the bytes it did not read.
+  describe("saveConfig after an outside write", () => {
+    const outside = JSON.stringify({ projects: [], updateChannel: "npm", note: "outside" });
+
+    async function editWithOutsideWrite(writeOutside: (file: string) => void): Promise<unknown> {
+      const configFile = path.join(tempDir, "config.json");
+      return config
+        .editConfig((value) => {
+          // The transform runs after the edit's fresh read: write the way an outside writer would.
+          writeOutside(configFile);
+          return { ...value, updateChannel: "nightly" };
+        })
+        .then(
+          () => null,
+          (error: unknown) => error
+        );
+    }
+
+    beforeEach(async () => {
+      await config.setUpdateChannel("stable");
+    });
+
+    const writers: Array<[string, (file: string) => void]> = [
+      [
+        "an atomic rename",
+        (file) => {
+          fs.writeFileSync(`${file}.outside`, outside);
+          fs.renameSync(`${file}.outside`, file);
+        },
+      ],
+      ["an in-place write", (file) => fs.writeFileSync(file, outside)],
+    ];
+    for (const [name, writeOutside] of writers) {
+      it(`rejects the edit and keeps the outside bytes after ${name}`, async () => {
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          const error = await editWithOutsideWrite(writeOutside);
+          expect(String(error)).toContain("config.json changed on disk");
+          expect(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")).toBe(outside);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+    }
+
+    it("a refused save records no own-write stamp: listeners still hear the outside write", async () => {
+      // A watched config (a listener is subscribed). A refused save must not record the
+      // outside bytes' stamp as its own write, or the watcher would treat their event as the
+      // echo of an own save and stay silent.
+      const notified = Promise.withResolvers<"notified">();
+      const unsubscribe = config.onConfigChanged(() => notified.resolve("notified"));
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const configFile = path.join(tempDir, "config.json");
+      // The outside write lands while the save is in flight (as the atomic writer resolves its
+      // target), so the watcher holds its event until the save ends, refused.
+      const realRealpath = cjsFs.realpath.bind(cjsFs);
+      const realpathSpy = spyOn(cjsFs, "realpath").mockImplementation(((
+        file: fs.PathLike,
+        callback: (error: NodeJS.ErrnoException | null, resolved?: string) => void
+      ) => {
+        if (String(file) === configFile) {
+          fs.writeFileSync(`${configFile}.outside`, outside);
+          fs.renameSync(`${configFile}.outside`, configFile);
+        }
+        realRealpath(file, callback);
+      }) as unknown as typeof cjsFs.realpath);
+      try {
+        const error = await config.setUpdateChannel("nightly").then(
+          () => null,
+          (caught: unknown) => caught
+        );
+        realpathSpy.mockRestore();
+        expect(String(error)).toContain("config.json changed on disk");
+        // The bound only ends a failing run: the watcher event normally arrives at once.
+        const timeout = new Promise<"silent">((resolve) =>
+          setTimeout(() => resolve("silent"), 5_000)
+        );
+        expect(await Promise.race([notified.promise, timeout])).toBe("notified");
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        realpathSpy.mockRestore();
+        errorSpy.mockRestore();
+        unsubscribe();
+      }
+    });
+
+    it("rejects the edit when config.json appears after a read that found none", async () => {
+      fs.rmSync(path.join(tempDir, "config.json"));
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const error = await editWithOutsideWrite((file) => fs.writeFileSync(file, outside));
+        expect(String(error)).toContain("config.json changed on disk");
+        expect(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")).toBe(outside);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("rejects the edit when the config.json symlink is retargeted during the save", async () => {
+      const configFile = path.join(tempDir, "config.json");
+      const first = path.join(tempDir, "first.json");
+      const second = path.join(tempDir, "second.json");
+      fs.renameSync(configFile, first);
+      fs.symlinkSync(first, configFile);
+      fs.writeFileSync(second, outside);
+      // Retarget the link right after the atomic writer resolved it, so it renames onto `first`,
+      // which config.json no longer names.
+      // writeFileAtomic reads fs through the CommonJS object, so spy on that one.
+      const realRealpath = cjsFs.realpath.bind(cjsFs);
+      const realpathSpy = spyOn(cjsFs, "realpath").mockImplementation(((
+        file: fs.PathLike,
+        callback: (error: NodeJS.ErrnoException | null, resolved?: string) => void
+      ) => {
+        realRealpath(file, (error, resolved) => {
+          if (String(file) === configFile) {
+            fs.rmSync(configFile);
+            fs.symlinkSync(second, configFile);
+          }
+          callback(error, resolved);
+        });
+      }) as unknown as typeof cjsFs.realpath);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const error = await config.setUpdateChannel("nightly").then(
+          () => null,
+          (caught: unknown) => caught
+        );
+        expect(String(error)).toContain("config.json changed on disk");
+        expect(fs.readFileSync(configFile, "utf-8")).toBe(outside);
+      } finally {
+        realpathSpy.mockRestore();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("saves two edits in a row without an outside write", async () => {
+      // The second edit reads the bytes the first one renamed into place, so its own check holds.
+      await config.setUpdateChannel("nightly");
+      await config.setUpdateChannel("npm");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("npm");
+    });
+
+    it("saves a retry on the same Config after a refusal, and memory matches disk", async () => {
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        const error = await editWithOutsideWrite((file) => fs.writeFileSync(file, outside));
+        expect(String(error)).toContain("config.json changed on disk");
+      } finally {
+        errorSpy.mockRestore();
+      }
+      // No restart: the retry reads the outside bytes fresh and saves on top of them.
+      await config.setUpdateChannel("nightly");
+      const saved = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        updateChannel?: string;
+        note?: string;
+      };
+      expect(saved.updateChannel).toBe("nightly");
+      expect(config.getUpdateChannel()).toBe("nightly");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+    });
+
+    it("saves an edit that reads the outside bytes first", async () => {
+      fs.writeFileSync(path.join(tempDir, "config.json"), outside);
+      await config.setUpdateChannel("nightly");
+      expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+    });
+  });
 
   describe("loadConfigOrDefault settingsBackup sanitizing", () => {
     it("degrades a malformed settingsBackup instead of returning it", () => {
@@ -73,6 +854,124 @@ describe("Config", () => {
         branch: "main",
         path: "mux",
       });
+    });
+  });
+
+  describe("agent heartbeats opt-in migration", () => {
+    function writeLegacyHeartbeatsExperiment(enabled: boolean) {
+      fs.writeFileSync(
+        path.join(tempDir, "feature_flags.json"),
+        JSON.stringify({
+          version: 1,
+          experiments: {},
+          overrides: { "workspace-heartbeats": enabled },
+        })
+      );
+    }
+
+    it.each([
+      ["enabled", true, true],
+      ["disabled", false, false],
+      ["never set", undefined, false],
+    ] as const)(
+      "seeds the opt-in from the %s heartbeat experiment",
+      async (_label, experimentEnabled, expected) => {
+        if (experimentEnabled !== undefined) writeLegacyHeartbeatsExperiment(experimentEnabled);
+        const configFile = path.join(tempDir, "config.json");
+        fs.writeFileSync(configFile, JSON.stringify({ projects: [] }));
+
+        expect(config.loadConfigOrDefault().agentHeartbeatsEnabled === true).toBe(expected);
+        await flushConfigEdits();
+
+        const persisted = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+          agentHeartbeatsEnabled?: boolean;
+          migrations?: { agentHeartbeatsSeeded?: boolean };
+        };
+        expect(persisted.agentHeartbeatsEnabled === true).toBe(expected);
+        expect(persisted.migrations?.agentHeartbeatsSeeded).toBe(true);
+      }
+    );
+
+    it("seeds the opt-in when config.json is missing", async () => {
+      writeLegacyHeartbeatsExperiment(true);
+
+      expect(config.loadConfigOrDefault().agentHeartbeatsEnabled).toBe(true);
+      await config.updateAgentHeartbeatsEnabled(false);
+
+      expect(new Config(tempDir).loadConfigOrDefault().agentHeartbeatsEnabled).toBeUndefined();
+    });
+
+    it("keeps a later opt-out even though the legacy experiment stays enabled", async () => {
+      writeLegacyHeartbeatsExperiment(true);
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify({ projects: [] }));
+      expect(config.loadConfigOrDefault().agentHeartbeatsEnabled).toBe(true);
+      await flushConfigEdits();
+
+      await config.updateAgentHeartbeatsEnabled(false);
+
+      expect(new Config(tempDir).loadConfigOrDefault().agentHeartbeatsEnabled).toBeUndefined();
+    });
+  });
+
+  describe("bash AI proxy setting", () => {
+    // Off by default: with the proxy vars set, `claude -p` bills the API key, not a subscription.
+    it("is off until the user opts in, and opting out removes the key", async () => {
+      expect(config.loadConfigOrDefault().bashAiProxyEnabled).toBeUndefined();
+
+      await config.updateBashAiProxyEnabled(true);
+      expect(new Config(tempDir).loadConfigOrDefault().bashAiProxyEnabled).toBe(true);
+
+      await config.updateBashAiProxyEnabled(false);
+      const persisted = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        bashAiProxyEnabled?: boolean;
+      };
+      expect(persisted.bashAiProxyEnabled).toBeUndefined();
+      expect(new Config(tempDir).loadConfigOrDefault().bashAiProxyEnabled).toBeUndefined();
+    });
+  });
+
+  describe("agent resource limits setting", () => {
+    const readPersisted = () =>
+      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        agentResourceLimits?: unknown;
+        agentResourceLimitsEnabled?: unknown;
+      };
+
+    it("saves the limits that are set and removes the key once none is", async () => {
+      await config.updateAgentResourceLimits({ cpuCores: 2.5, memoryGiB: 8 });
+      expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimits).toEqual({
+        cpuCores: 2.5,
+        memoryGiB: 8,
+      });
+
+      await config.updateAgentResourceLimits({ memoryGiB: 8 });
+      expect(readPersisted().agentResourceLimits).toEqual({ memoryGiB: 8 });
+
+      await config.updateAgentResourceLimits({});
+      expect(readPersisted().agentResourceLimits).toBeUndefined();
+      expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimits).toBeUndefined();
+    });
+
+    it("is off until turned on, and keeps the limits saved while off", async () => {
+      expect(config.loadConfigOrDefault().agentResourceLimitsEnabled).toBeUndefined();
+      await config.updateAgentResourceLimits({ cpuCores: 2 });
+
+      await config.updateAgentResourceLimitsEnabled(true);
+      expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimitsEnabled).toBe(true);
+
+      await config.updateAgentResourceLimitsEnabled(false);
+      expect(readPersisted().agentResourceLimitsEnabled).toBeUndefined();
+      expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimits).toEqual({
+        cpuCores: 2,
+      });
+    });
+
+    it("ignores a hand-edited value outside the allowed range", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [], agentResourceLimits: { cpuCores: 0, memoryGiB: 8 } })
+      );
+      expect(new Config(tempDir).loadConfigOrDefault().agentResourceLimits).toBeUndefined();
     });
   });
 
@@ -127,6 +1026,96 @@ describe("Config", () => {
     });
   });
 
+  describe("raised task-limit defaults migration", () => {
+    const writeTaskSettings = (
+      taskSettings: Record<string, unknown> | undefined,
+      migrations?: Record<string, boolean>
+    ) => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [], taskSettings, migrations })
+      );
+    };
+    const readPersisted = () =>
+      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        taskSettings?: { maxParallelAgentTasks?: number; maxTaskNestingDepth?: number };
+        migrations?: { taskSettingsDefaultsRaised?: boolean };
+      };
+
+    it("moves limits Xum wrote at the previous defaults to the new defaults once", async () => {
+      writeTaskSettings({ ...PREVIOUS_TASK_SETTINGS_DEFAULTS });
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.taskSettings?.maxParallelAgentTasks).toBe(
+        TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+      );
+      expect(loaded.taskSettings?.maxTaskNestingDepth).toBe(
+        TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+      );
+
+      await flushConfigEdits();
+      const persisted = readPersisted();
+      expect(persisted.taskSettings?.maxParallelAgentTasks).toBe(
+        TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+      );
+      expect(persisted.taskSettings?.maxTaskNestingDepth).toBe(
+        TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+      );
+      expect(persisted.migrations?.taskSettingsDefaultsRaised).toBe(true);
+    });
+
+    it.each([
+      [8, 2],
+      [64, 4],
+      // One field at the old default, the other explicit: only the old default moves.
+      [PREVIOUS_TASK_SETTINGS_DEFAULTS.maxParallelAgentTasks, 1],
+    ] as const)("keeps an explicit choice (%d parallel, depth %d)", async (parallel, depth) => {
+      writeTaskSettings({ maxParallelAgentTasks: parallel, maxTaskNestingDepth: depth });
+
+      config.loadConfigOrDefault();
+      await flushConfigEdits();
+
+      const persisted = readPersisted();
+      const expectedParallel =
+        parallel === PREVIOUS_TASK_SETTINGS_DEFAULTS.maxParallelAgentTasks
+          ? TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+          : parallel;
+      expect(persisted.taskSettings?.maxParallelAgentTasks).toBe(expectedParallel);
+      expect(persisted.taskSettings?.maxTaskNestingDepth).toBe(depth);
+      expect(new Config(tempDir).loadConfigOrDefault().taskSettings?.maxTaskNestingDepth).toBe(
+        depth
+      );
+    });
+
+    it("keeps the previous default values a user sets after the migration ran", () => {
+      writeTaskSettings(
+        { ...PREVIOUS_TASK_SETTINGS_DEFAULTS },
+        { taskSettingsDefaultsRaised: true }
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.taskSettings?.maxParallelAgentTasks).toBe(
+        PREVIOUS_TASK_SETTINGS_DEFAULTS.maxParallelAgentTasks
+      );
+      expect(loaded.taskSettings?.maxTaskNestingDepth).toBe(
+        PREVIOUS_TASK_SETTINGS_DEFAULTS.maxTaskNestingDepth
+      );
+    });
+
+    it("gives a fresh install the new defaults and records the migration on first save", async () => {
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.taskSettings?.maxParallelAgentTasks).toBe(
+        TASK_SETTINGS_LIMITS.maxParallelAgentTasks.default
+      );
+      expect(loaded.taskSettings?.maxTaskNestingDepth).toBe(
+        TASK_SETTINGS_LIMITS.maxTaskNestingDepth.default
+      );
+
+      await flushConfigEdits();
+      expect(readPersisted().migrations?.taskSettingsDefaultsRaised).toBe(true);
+    });
+  });
+
   describe("loadConfigOrDefault with trailing slash migration", () => {
     it("should strip trailing slashes from project paths on load", () => {
       // Create config file with trailing slashes in project paths
@@ -150,6 +1139,1266 @@ describe("Config", () => {
       expect(projectPaths).toContain("/home/user/clean");
       expect(projectPaths).not.toContain("/home/user/project/");
       expect(projectPaths).not.toContain("/home/user/another//");
+    });
+
+    // #5917: the root has no trailing slash to strip. Normalizing "/" to "" made the next save
+    // write a "" key, which the following load rejected together with every workspace row.
+    it("keeps a project at / and its workspace rows through a save and a reload", async () => {
+      const workspacePath = path.join(config.srcDir, "root", "feature");
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/", { workspaces: [{ path: workspacePath, id: "ws-root", name: "feature" }] }],
+          ],
+        })
+      );
+
+      // A settings edit on the workspace: load, mutate, save. Find the row by id, so the edit
+      // does not depend on which key the loader chose for the project.
+      await config.editConfig((cfg) => {
+        const row = [...cfg.projects.values()]
+          .flatMap((project) => project.workspaces)
+          .find((workspace) => workspace.id === "ws-root");
+        if (!row) throw new Error("expected the workspace row after load");
+        row.title = "edited";
+        return cfg;
+      });
+
+      // The save keeps the key as "/". It used to write "", which the next load rejects.
+      const saved = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        projects: Array<[string, unknown]>;
+      };
+      expect(saved.projects.map(([projectPath]) => projectPath)).toEqual(["/"]);
+
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      expect(Array.from(reloaded.projects.keys())).toEqual(["/"]);
+      expect(reloaded.projects.get("/")?.workspaces).toMatchObject([
+        { id: "ws-root", path: workspacePath, title: "edited" },
+      ]);
+    });
+
+    // Self-healing for configs that an earlier save already wrote with the root as "".
+    it("loads a project stored under an empty key as / with its workspace rows", () => {
+      const workspacePath = path.join(config.srcDir, "root", "feature");
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["", { workspaces: [{ path: workspacePath, id: "ws-root", name: "feature" }] }],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(Array.from(loaded.projects.keys())).toEqual(["/"]);
+      expect(loaded.projects.get("/")?.workspaces).toMatchObject([
+        { id: "ws-root", path: workspacePath },
+      ]);
+    });
+
+    // The restored root must not become every other project's parent: the load-time hierarchy
+    // merge would move their workspace rows into the root's bucket.
+    it("keeps other projects and their rows separate from a restored root project", async () => {
+      const rootWorkspace = path.join(config.srcDir, "root", "feature");
+      const repoWorkspace = path.join(config.srcDir, "repo", "main");
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["", { workspaces: [{ path: rootWorkspace, id: "ws-root", name: "feature" }] }],
+            [
+              "/home/user/repo",
+              { workspaces: [{ path: repoWorkspace, id: "ws-repo", name: "main" }] },
+            ],
+          ],
+        })
+      );
+
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      const repo = reloaded.projects.get("/home/user/repo");
+      expect(repo?.parentProjectPath).toBeUndefined();
+      expect(repo?.workspaces.map((workspace) => workspace.id)).toEqual(["ws-repo"]);
+      expect(reloaded.projects.get("/")?.workspaces.map((workspace) => workspace.id)).toEqual([
+        "ws-root",
+      ]);
+    });
+
+    // #5919: a drive-root project must not become the parent of every project on that drive:
+    // the load-time hierarchy merge would move their workspace rows into the root's bucket.
+    it("keeps other projects on the drive separate from a drive-root project", async () => {
+      const driveWorkspace = path.join(config.srcDir, "drive", "feature");
+      const repoWorkspace = path.join(config.srcDir, "repo", "main");
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["C:\\", { workspaces: [{ path: driveWorkspace, id: "ws-drive", name: "feature" }] }],
+            [
+              "C:\\Users\\me\\repo",
+              { workspaces: [{ path: repoWorkspace, id: "ws-repo", name: "main" }] },
+            ],
+          ],
+        })
+      );
+
+      await flushConfigEdits();
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      const repo = reloaded.projects.get("C:\\Users\\me\\repo");
+      expect(repo?.parentProjectPath).toBeUndefined();
+      expect(repo?.workspaces.map((workspace) => workspace.id)).toEqual(["ws-repo"]);
+      // The drive-root key loads as "C:" today; its spelling is tracked separately. Find the
+      // drive-root bucket without depending on that spelling.
+      const driveRows = [...reloaded.projects]
+        .filter(([projectPath]) => projectPath !== "C:\\Users\\me\\repo")
+        .flatMap(([, project]) => project.workspaces.map((workspace) => workspace.id));
+      expect(driveRows).toEqual(["ws-drive"]);
+    });
+  });
+
+  // #6485: on Windows, an id-less legacy row's checkout path uses backslashes. The old session
+  // layout keys its metadata by the checkout basename, so the lookup must split on "\\" too. The
+  // backend helper reads process.platform once at import, so the Windows cases run on Windows
+  // only (CI's "Test / Windows" job runs this describe).
+  describe("legacy rows with a Windows checkout path", () => {
+    const onWindows = process.platform === "win32" ? it : it.skip;
+    const offWindows = process.platform === "win32" ? it.skip : it;
+
+    function seedBasenameLayout(projectPath: string, checkout: string, id: string): void {
+      // The old layout: sessions/<checkout basename>/metadata.json names the stable id.
+      const dir = path.join(config.sessionsDir, "feature-x");
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, "metadata.json"), JSON.stringify({ id, projectPath }));
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ projects: [[projectPath, { workspaces: [{ path: checkout }] }]] })
+      );
+    }
+
+    const winProject = "C:\\Users\\u\\repo";
+    const winCheckout = "C:\\Users\\u\\.xum\\src\\repo\\feature-x";
+
+    onWindows(
+      "resolves the stable id from the basename metadata in the metadata build",
+      async () => {
+        seedBasenameLayout(winProject, winCheckout, "stable-1");
+        const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+        expect(metadata.map((meta) => meta.id)).toEqual(["stable-1"]);
+      }
+    );
+
+    onWindows("finds the workspace by the stable id from the basename metadata", () => {
+      seedBasenameLayout(winProject, winCheckout, "stable-1");
+      expect(config.findWorkspace("stable-1")?.workspacePath).toBe(winCheckout);
+    });
+
+    // POSIX keeps today's basename: the helper splits only on "/" off Windows.
+    offWindows("keeps the POSIX basename lookup unchanged", () => {
+      const posixCheckout = "/home/u/.xum/src/repo/feature-x";
+      seedBasenameLayout("/home/u/repo", posixCheckout, "stable-2");
+      expect(config.findWorkspace("stable-2")?.workspacePath).toBe(posixCheckout);
+    });
+  });
+
+  // Stored keys that normalize to the same project path ("aliases", e.g. "/repo" and "/repo/").
+  // The loader used to build `new Map(pairs)`, so the last alias silently replaced the others
+  // and the next save dropped their workspace rows.
+  describe("loadConfigOrDefault with aliased project keys", () => {
+    type StoredRow = Record<string, unknown> & { id: string };
+    type StoredPair = [string, Record<string, unknown> & { workspaces: StoredRow[] }];
+
+    function row(id: string, extra: Record<string, unknown> = {}): StoredRow {
+      return { id, name: id, path: path.join(config.srcDir, "repo", id), ...extra };
+    }
+
+    function writeProjects(projects: StoredPair[]): void {
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify({ projects }));
+    }
+
+    function readSavedProjects(): StoredPair[] {
+      const saved = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        projects: StoredPair[];
+      };
+      return saved.projects;
+    }
+
+    function savedRowIds(): Array<[string, string[]]> {
+      return readSavedProjects().map(([key, project]) => [
+        key,
+        project.workspaces.map((w) => w.id),
+      ]);
+    }
+
+    for (const order of ["canonical first", "alias first"] as const) {
+      it(`merges the rows of two aliases into one project (${order})`, async () => {
+        const canonical: StoredPair = ["/home/u/repo", { workspaces: [row("ws-one")] }];
+        const alias: StoredPair = ["/home/u/repo/", { workspaces: [row("ws-two")] }];
+        writeProjects(order === "canonical first" ? [canonical, alias] : [alias, canonical]);
+
+        await flushConfigEdits();
+
+        const ids = order === "canonical first" ? ["ws-one", "ws-two"] : ["ws-two", "ws-one"];
+        expect(savedRowIds()).toEqual([["/home/u/repo", ids]]);
+        const reloaded = new Config(tempDir).loadConfigOrDefault();
+        expect(reloaded.projects.get("/home/u/repo")?.workspaces.map((w) => w.id)).toEqual(ids);
+      });
+    }
+
+    it("merges three aliases and keeps one copy of a byte-identical duplicate row", async () => {
+      writeProjects([
+        ["/home/u/repo//", { workspaces: [row("ws-dup"), row("ws-a")] }],
+        ["/home/u/repo", { workspaces: [row("ws-b")] }],
+        ["/home/u/repo/", { workspaces: [row("ws-dup"), row("ws-c")] }],
+      ]);
+
+      await flushConfigEdits();
+
+      expect(savedRowIds()).toEqual([["/home/u/repo", ["ws-dup", "ws-a", "ws-b", "ws-c"]]]);
+    });
+
+    it("lists merged rows under the canonical project in workspace metadata", async () => {
+      writeProjects([
+        ["/home/u/repo/", { workspaces: [row("ws-two")] }],
+        ["/home/u/repo", { workspaces: [row("ws-one")] }],
+      ]);
+
+      const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+      expect(
+        metadata
+          .map((meta) => [meta.id, meta.projectPath])
+          .sort(([a], [b]) => String(a).localeCompare(String(b)))
+      ).toEqual([
+        ["ws-one", "/home/u/repo"],
+        ["ws-two", "/home/u/repo"],
+      ]);
+    });
+
+    it("trusts a merged project only when every alias was trusted", () => {
+      writeProjects([
+        ["/home/u/both", { trusted: true, workspaces: [row("ws-1")] }],
+        ["/home/u/both/", { trusted: true, workspaces: [row("ws-2")] }],
+        ["/home/u/mixed", { trusted: true, workspaces: [row("ws-3")] }],
+        ["/home/u/mixed/", { trusted: false, workspaces: [row("ws-4")] }],
+        ["/home/u/missing/", { trusted: true, workspaces: [row("ws-5")] }],
+        ["/home/u/missing", { workspaces: [row("ws-6")] }],
+      ]);
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.projects.get("/home/u/both")?.trusted).toBe(true);
+      expect(loaded.projects.get("/home/u/mixed")?.trusted).not.toBe(true);
+      expect(loaded.projects.get("/home/u/missing")?.trusted).not.toBe(true);
+      expect(loaded.projects.get("/home/u/missing")?.workspaces.map((w) => w.id)).toEqual([
+        "ws-5",
+        "ws-6",
+      ]);
+    });
+
+    it("keeps one copy of a byte-identical legacy row without an id", () => {
+      const legacy = { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") };
+      const other = { name: "other", path: path.join(config.srcDir, "repo", "other") };
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/home/u/repo", { workspaces: [legacy] }],
+            ["/home/u/repo/", { workspaces: [legacy, other] }],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.projects.get("/home/u/repo")?.workspaces.map((w) => w.name)).toEqual([
+        "legacy",
+        "other",
+      ]);
+    });
+
+    // #5929: the same row with its properties in another order is one row, not a conflict.
+    // Comparing rows as raw JSON text called it a conflict, and the group then kept only its
+    // last entry, dropping the rows that only an earlier alias held.
+    function reordered(source: StoredRow): StoredRow {
+      return Object.fromEntries(Object.entries(source).reverse()) as StoredRow;
+    }
+
+    for (const order of ["canonical first", "alias first"] as const) {
+      it(`keeps every row when a shared row only differs in property order (${order})`, async () => {
+        const same = row("ws-same");
+        const aliases: StoredPair[] = [
+          ["/home/u/repo", { workspaces: [same, row("ws-one")] }],
+          ["/home/u/repo/", { workspaces: [reordered(same), row("ws-two")] }],
+        ];
+        writeProjects(order === "canonical first" ? aliases : [aliases[1], aliases[0]]);
+
+        await flushConfigEdits();
+        const saved = readSavedProjects();
+        expect(saved.map(([key]) => key)).toEqual(["/home/u/repo"]);
+        const ids = saved[0][1].workspaces.map((workspace) => workspace.id);
+        expect([...ids].sort()).toEqual(["ws-one", "ws-same", "ws-two"]);
+        // The reload reads the merged file back unchanged.
+        config.loadConfigOrDefault();
+        await flushConfigEdits();
+        expect(readSavedProjects()).toEqual(saved);
+      });
+    }
+
+    it("keeps every row across three aliases that share a row in different property orders", async () => {
+      const same = row("ws-same");
+      writeProjects([
+        ["/home/u/repo", { workspaces: [same, row("ws-one")] }],
+        ["/home/u/repo/", { workspaces: [reordered(same), row("ws-two")] }],
+        ["/home/u/repo//", { workspaces: [{ ...same }, row("ws-three")] }],
+      ]);
+
+      const expectedIds = ["ws-one", "ws-same", "ws-three", "ws-two"];
+      const loaded = config.loadConfigOrDefault();
+      const ids = loaded.projects.get("/home/u/repo")?.workspaces.map((w) => w.id) ?? [];
+      expect([...ids].sort()).toEqual(expectedIds);
+      // One row per workspace id: the single-row metadata read agrees with the full build.
+      const all = await config.getAllWorkspaceMetadata();
+      expect(all.map((meta) => meta.id).sort()).toEqual(expectedIds);
+      const one = await config.findWorkspaceMetadata("ws-same");
+      expect(one).toEqual(all.find((meta) => meta.id === "ws-same") ?? null);
+    });
+
+    it("keeps one copy of a legacy row without an id that only differs in property order", () => {
+      const legacy = { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") };
+      const other = { name: "other", path: path.join(config.srcDir, "repo", "other") };
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/home/u/repo", { workspaces: [legacy] }],
+            ["/home/u/repo/", { workspaces: [{ path: legacy.path, name: legacy.name }, other] }],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.projects.get("/home/u/repo")?.workspaces.map((w) => w.name)).toEqual([
+        "legacy",
+        "other",
+      ]);
+    });
+
+    // A conflicting group holds two different rows with the same id. The merge keeps every other
+    // row, and keeps the last alias's variant of the conflicting row. A sidecar keeps the original
+    // bytes, with every variant (#5929).
+    function aliasConflictBackups(): string[] {
+      return fs
+        .readdirSync(tempDir)
+        .filter((name) => name.startsWith("config.json.alias-conflict-"))
+        .map((name) => path.join(tempDir, name));
+    }
+
+    /** The variant of `id` that the last stored entry holding it has. */
+    function lastVariant(stored: StoredPair[], id: string): StoredRow {
+      const variant = stored
+        .flatMap(([, project]) => project.workspaces)
+        .filter((w) => w.id === id)
+        .at(-1);
+      if (variant === undefined) throw new Error(`no stored row with id ${id}`);
+      return variant;
+    }
+
+    // Builders: row() needs the per-test config, which exists only inside a test.
+    const conflictCases: Array<[string, () => StoredPair[]]> = [
+      [
+        "a same-id conflict, canonical first",
+        () => [
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
+          ["/home/u/repo/", { workspaces: [row("ws-same", { title: "second" }), row("ws-two")] }],
+        ],
+      ],
+      [
+        "a same-id conflict, alias first",
+        () => [
+          ["/home/u/repo/", { workspaces: [row("ws-same", { title: "second" }), row("ws-two")] }],
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
+        ],
+      ],
+      [
+        "a same-id conflict with another project in between",
+        () => [
+          ["/home/u/repo/", { workspaces: [row("ws-same", { title: "second" }), row("ws-two")] }],
+          ["/home/u/other", { workspaces: [row("ws-other")] }],
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
+        ],
+      ],
+      [
+        // Two checkouts under one workspace id are a real conflict, not a property-order one.
+        "a same-id conflict on a different checkout path",
+        () => [
+          ["/home/u/repo", { workspaces: [row("ws-same"), row("ws-one")] }],
+          [
+            "/home/u/repo/",
+            {
+              workspaces: [
+                row("ws-same", { path: path.join(config.srcDir, "repo", "elsewhere") }),
+                row("ws-two"),
+              ],
+            },
+          ],
+        ],
+      ],
+      [
+        "the same stored key twice with a same-id conflict",
+        () => [
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "second" }), row("ws-two")] }],
+        ],
+      ],
+    ];
+    for (const [name, buildStored] of conflictCases) {
+      it(`keeps the last variant and backs up the original bytes for ${name}`, async () => {
+        const stored = buildStored();
+        writeProjects(stored);
+        const original = fs.readFileSync(path.join(tempDir, "config.json"));
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await flushConfigEdits();
+          const saved = readSavedProjects().flatMap(([, project]) => project.workspaces);
+          expect(saved.filter((w) => w.id === "ws-same")).toEqual([lastVariant(stored, "ws-same")]);
+
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          expect(fs.readFileSync(backups[0])).toEqual(original);
+          expect(fs.statSync(backups[0]).mode & 0o777).toBe(0o600);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+    }
+
+    it("reuses one backup when the same conflicting bytes load again", () => {
+      writeProjects(conflictCases[0][1]());
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      try {
+        config.loadConfigOrDefault();
+        new Config(tempDir).loadConfigOrDefault();
+        expect(aliasConflictBackups()).toHaveLength(1);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "keeps config.json and refuses edits while the conflict backup fails",
+      async () => {
+        const stored = conflictCases[0][1]();
+        writeProjects(stored);
+        const configFile = path.join(tempDir, "config.json");
+        const original = fs.readFileSync(configFile);
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        // A read-only config dir makes the sidecar write fail.
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          // Reads get the merged view, not the defaults a failed load returns.
+          const ids = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+          expect(ids?.map((w) => w.id).sort()).toEqual(["ws-one", "ws-same", "ws-two"]);
+          const blocked = await config.setUpdateChannel("nightly").then(
+            () => null,
+            (error: unknown) => error
+          );
+          expect(String(blocked)).toContain("could not back them up");
+          expect(fs.readFileSync(configFile)).toEqual(original);
+          // The load is not cached, so every read retries the backup, but the same bytes and
+          // error log once.
+          const logged = () =>
+            errorSpy.mock.calls.filter(([message]) => String(message).includes("the backup of"))
+              .length;
+          const before = logged();
+          config.loadConfigOrDefault();
+          config.loadConfigOrDefault();
+          expect(before).toBe(1);
+          expect(logged()).toBe(1);
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+        }
+        try {
+          // The next load backs the bytes up, and the edit goes through.
+          await config.setUpdateChannel("nightly");
+          expect(aliasConflictBackups()).toHaveLength(1);
+          expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+        } finally {
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "lets edits through again once the conflicting config is gone",
+      async () => {
+        writeProjects(conflictCases[0][1]());
+        const configFile = path.join(tempDir, "config.json");
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          config.loadConfigOrDefault();
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+        }
+        try {
+          // The user moves the conflicting file aside: nothing is left to protect.
+          fs.renameSync(configFile, path.join(tempDir, "moved-aside.json"));
+          await config.setUpdateChannel("nightly");
+          expect(new Config(tempDir).getUpdateChannel()).toBe("nightly");
+        } finally {
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    // #5929 repro: a same-id conflict must not cost the rows that only one alias holds.
+    for (const [name, buildStored] of conflictCases) {
+      it(`keeps the rows outside the conflict for ${name}`, async () => {
+        const stored = buildStored();
+        writeProjects(stored);
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await flushConfigEdits();
+          const storedIds = new Set(
+            stored.flatMap(([, project]) => project.workspaces.map((w) => w.id))
+          );
+          const savedIds = new Set(
+            readSavedProjects().flatMap(([, project]) => project.workspaces.map((w) => w.id))
+          );
+          expect([...savedIds].sort()).toEqual([...storedIds].sort());
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+    }
+
+    // #5929: a degraded load (the backup keeps failing) logs once per distinct content.
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "logs a failed backup once per distinct content",
+      () => {
+        const contentA = conflictCases[0][1]();
+        const contentB = conflictCases[1][1]();
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        const logged = () =>
+          errorSpy.mock.calls.filter(([message]) => String(message).includes("the backup of"))
+            .length;
+        writeProjects(contentA);
+        // A read-only config dir makes the sidecar write fail. config.json itself stays
+        // writable, so the test can still change its contents.
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          config.loadConfigOrDefault();
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(1);
+
+          writeProjects(contentB);
+          config.loadConfigOrDefault();
+          writeProjects(contentA);
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(2);
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    // #6595: the logged-signature set holds at most 16 per file and drops the oldest first, so
+    // a content that comes back after 16 newer failures logs again.
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "logs a failed backup again once 16 newer contents pushed it out of the set",
+      () => {
+        // 17 distinct conflicting contents: same rows, a different title on the shared id.
+        const content = (index: number): StoredPair[] => [
+          ["/home/u/repo", { workspaces: [row("ws-same", { title: "first" }), row("ws-one")] }],
+          [
+            "/home/u/repo/",
+            { workspaces: [row("ws-same", { title: `v${index}` }), row("ws-two")] },
+          ],
+        ];
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        const logged = () =>
+          errorSpy.mock.calls.filter(([message]) => String(message).includes("the backup of"))
+            .length;
+        // config.json must exist before the dir turns read-only: later writes replace it in place.
+        writeProjects(content(0));
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          for (let index = 0; index < 17; index++) {
+            writeProjects(content(index));
+            config.loadConfigOrDefault();
+          }
+          expect(logged()).toBe(17);
+          // Content 16 is still in the set; content 0 was dropped as the oldest.
+          writeProjects(content(16));
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(17);
+          writeProjects(content(0));
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(18);
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "logs a failed backup again after a load without the conflict ends the failure",
+      () => {
+        const content = conflictCases[0][1]();
+        const configFile = path.join(tempDir, "config.json");
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        const logged = () =>
+          errorSpy.mock.calls.filter(([message]) => String(message).includes("the backup of"))
+            .length;
+        writeProjects(content);
+        fs.chmodSync(tempDir, 0o500);
+        try {
+          config.loadConfigOrDefault();
+          // The file goes away, then comes back with the same bytes: a new failure episode.
+          fs.chmodSync(tempDir, 0o700);
+          fs.renameSync(configFile, `${configFile}.moved`);
+          config.loadConfigOrDefault();
+          fs.renameSync(`${configFile}.moved`, configFile);
+          fs.chmodSync(tempDir, 0o500);
+          config.loadConfigOrDefault();
+          expect(logged()).toBe(2);
+        } finally {
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+      }
+    );
+
+    // Each degraded load searches for an identical backup again: a search that failed found
+    // nothing, and an identical backup it missed must still be reused later.
+    (process.getuid?.() === 0 ? it.skip : it)(
+      "scans again after a reuse scan that failed, and reuses the backup it then finds",
+      async () => {
+        writeProjects(conflictCases[0][1]());
+        const configFile = path.join(tempDir, "config.json");
+        const existing = `${configFile}.alias-conflict-1`;
+        fs.writeFileSync(existing, fs.readFileSync(configFile), { mode: 0o600 });
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        // A read-only config dir makes every new sidecar fail, so only a reuse can succeed.
+        fs.chmodSync(tempDir, 0o500);
+        const readdirSpy = spyOn(fs, "readdirSync").mockImplementationOnce(() => {
+          throw Object.assign(new Error("EIO: i/o error, scandir"), { code: "EIO" });
+        });
+        let blocked: unknown;
+        try {
+          config.loadConfigOrDefault();
+          config.loadConfigOrDefault();
+          blocked = await config.setUpdateChannel("nightly").then(
+            () => null,
+            (error: unknown) => error
+          );
+        } finally {
+          readdirSpy.mockRestore();
+          fs.chmodSync(tempDir, 0o700);
+          errorSpy.mockRestore();
+        }
+        // The second load found the existing backup, so the alias gate no longer refuses edits.
+        expect(String(blocked)).not.toContain("could not back them up");
+        expect(aliasConflictBackups()).toEqual([existing]);
+      }
+    );
+
+    // Perf contract (#5929): the alias merge adds no file reads or directory listings to a load
+    // without a legacy-copy shape, with or without aliases.
+    for (const [name, stored] of [
+      ["no aliases", () => [["/home/u/repo", { workspaces: [row("ws-one")] }]] as StoredPair[]],
+      [
+        "two aliases with distinct rows",
+        () =>
+          [
+            ["/home/u/repo", { workspaces: [row("ws-one")] }],
+            ["/home/u/repo/", { workspaces: [row("ws-two")] }],
+          ] as StoredPair[],
+      ],
+      [
+        // #6595: the single-key check runs, but no id row shares the legacy row's path.
+        "one key with a legacy row on its own path",
+        () =>
+          [
+            [
+              "/home/u/repo",
+              {
+                workspaces: [
+                  row("ws-one"),
+                  { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") },
+                ],
+              },
+            ],
+          ] as unknown as StoredPair[],
+      ],
+      [
+        // #6869: the alias group's legacy check runs before the merge, but no id row in any alias
+        // shares the legacy row's path, so no legacy id is resolved.
+        "two aliases with a legacy row on its own path",
+        () =>
+          [
+            ["/home/u/repo", { workspaces: [row("ws-one")] }],
+            [
+              "/home/u/repo/",
+              {
+                workspaces: [
+                  row("ws-two"),
+                  { name: "legacy", path: path.join(config.srcDir, "repo", "legacy") },
+                ],
+              },
+            ],
+          ] as unknown as StoredPair[],
+      ],
+      [
+        // #6717: the duplicate-id check runs over these ids and finds none.
+        "one key with several rows and unique ids",
+        () =>
+          [
+            ["/home/u/repo", { workspaces: [row("ws-one"), row("ws-two"), row("ws-three")] }],
+          ] as StoredPair[],
+      ],
+    ] as const) {
+      it(`reads no session metadata and lists no directory on a load with ${name}`, () => {
+        writeProjects(stored());
+        const readSpy = spyOn(fs, "readFileSync");
+        const readdirSpy = spyOn(fs, "readdirSync");
+        const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
+        try {
+          config.loadConfigOrDefault();
+          // feature_flags.json is the existing legacy heartbeat probe, not the alias merge.
+          expect(readSpy.mock.calls.map(([file]) => path.basename(String(file))).sort()).toEqual([
+            "config.json",
+            "feature_flags.json",
+          ]);
+          expect(readdirSpy).not.toHaveBeenCalled();
+        } finally {
+          readSpy.mockRestore();
+          readdirSpy.mockRestore();
+          warnSpy.mockRestore();
+        }
+      });
+    }
+
+    // #5929: an id-less legacy row in one alias and an id row in another, on one checkout path.
+    describe("an id-less row and an id row on the same path", () => {
+      // StoredPair rows need an id, so this writes the id-less row as plain JSON.
+      function writeLegacyAndIdRows(checkout: string, id: string): void {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              ["/home/u/repo/", { workspaces: [{ name: "x", path: checkout }] }],
+              ["/home/u/repo", { workspaces: [{ id, name: "x", path: checkout }] }],
+            ],
+          })
+        );
+      }
+
+      function checkoutPath(): string {
+        return path.join(config.srcDir, "repo", "x");
+      }
+
+      function writeLegacyMetadata(checkout: string, id: string): string {
+        const dir = path.join(
+          config.sessionsDir,
+          config.generateLegacyId("/home/u/repo", checkout)
+        );
+        fs.mkdirSync(dir, { recursive: true });
+        const file = path.join(dir, "metadata.json");
+        fs.writeFileSync(file, JSON.stringify({ id, name: "x", projectPath: "/home/u/repo" }));
+        return file;
+      }
+
+      async function savedIdsOnCheckout(checkout: string): Promise<Array<string | undefined>> {
+        await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+        await flushConfigEdits();
+        return readSavedProjects()
+          .flatMap(([, project]) => project.workspaces)
+          .filter((w) => w.path === checkout)
+          .map((w) => (w as { id?: string }).id);
+      }
+
+      const sameWorkspaceCases: Array<[string, (checkout: string) => string]> = [
+        [
+          "the id row has the legacy id",
+          (checkout) => config.generateLegacyId("/home/u/repo", checkout),
+        ],
+        [
+          "the legacy metadata.json names the id row's id",
+          (checkout) => {
+            writeLegacyMetadata(checkout, "stable-1");
+            return "stable-1";
+          },
+        ],
+      ];
+      for (const [name, idForCheckout] of sameWorkspaceCases) {
+        it(`keeps one row and backs up the original bytes when ${name}`, async () => {
+          const checkout = checkoutPath();
+          const id = idForCheckout(checkout);
+          writeLegacyAndIdRows(checkout, id);
+          const original = fs.readFileSync(path.join(tempDir, "config.json"));
+          const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+          try {
+            expect(await savedIdsOnCheckout(checkout)).toEqual([id]);
+            const backups = aliasConflictBackups();
+            expect(backups).toHaveLength(1);
+            expect(fs.readFileSync(backups[0])).toEqual(original);
+          } finally {
+            errorSpy.mockRestore();
+          }
+        });
+      }
+
+      // #6595: a legacy metadata.json that parses but names no id leaves the row's identity
+      // unknown, so the merge keeps both rows.
+      it("keeps both rows when the legacy metadata.json names no id", () => {
+        const checkout = checkoutPath();
+        const dir = path.join(
+          config.sessionsDir,
+          config.generateLegacyId("/home/u/repo", checkout)
+        );
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "metadata.json"), "{}");
+        writeLegacyAndIdRows(checkout, config.generateLegacyId("/home/u/repo", checkout));
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+        expect(aliasConflictBackups()).toHaveLength(0);
+      });
+
+      // #6595: only the old layout's sessions/<checkout basename>/metadata.json exists and names
+      // the id row's id: the legacy row is that workspace, so the merge keeps one row.
+      it("keeps one row when only the basename metadata.json names the id row's id", async () => {
+        const checkout = checkoutPath();
+        const dir = path.join(config.sessionsDir, path.basename(checkout));
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "metadata.json"), JSON.stringify({ id: "stable-1" }));
+        writeLegacyAndIdRows(checkout, "stable-1");
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          expect(await savedIdsOnCheckout(checkout)).toEqual(["stable-1"]);
+          expect(aliasConflictBackups()).toHaveLength(1);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      it("keeps both rows when the two legacy metadata files name different ids", () => {
+        const checkout = checkoutPath();
+        writeLegacyMetadata(checkout, "stable-1");
+        // The old layout's sessions/<checkout basename>/metadata.json names a second identity.
+        const basenameDir = path.join(config.sessionsDir, path.basename(checkout));
+        fs.mkdirSync(basenameDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(basenameDir, "metadata.json"),
+          JSON.stringify({ id: "other-1" })
+        );
+        writeLegacyAndIdRows(checkout, "stable-1");
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+        expect(aliasConflictBackups()).toHaveLength(0);
+      });
+
+      it("keeps both rows and loads normally when the rows have no path", () => {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              ["/home/u/repo/", { workspaces: [{ name: "x" }] }],
+              ["/home/u/repo", { workspaces: [{ id: "stable-1", name: "x" }] }],
+            ],
+          })
+        );
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.map((w) => w.id)).toEqual([undefined, "stable-1"]);
+        expect(config.getConfigLoadError()).toBeNull();
+      });
+
+      // #6595: the same legacy copy under ONE stored key (no alias group).
+      function writeSingleKeyLegacyAndIdRows(checkout: string, id: string): void {
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo",
+                {
+                  workspaces: [
+                    { name: "x", path: checkout },
+                    { id, name: "x", path: checkout },
+                  ],
+                },
+              ],
+            ],
+          })
+        );
+      }
+
+      // #6717: an earlier build already saved two rows with one id under one stored key. The
+      // loader keeps the first row per id (the row every lookup already used, #4550) and backs
+      // up the original bytes first, also for an identical copy.
+      // Builders: row() and config exist only inside a test. `kept` is a value the kept row holds.
+      const duplicateIdCases: Array<
+        [string, () => { rows: Array<Record<string, unknown>>; kept: string }]
+      > = [
+        ["an identical copy", () => ({ rows: [row("ws-1"), row("ws-1")], kept: "ws-1" })],
+        [
+          "a copy that differs",
+          () => ({
+            rows: [row("ws-1", { title: "first" }), row("ws-1", { title: "second" })],
+            kept: "first",
+          }),
+        ],
+        [
+          "a copy on another checkout path",
+          () => {
+            const elsewhere = path.join(config.srcDir, "repo", "elsewhere");
+            return { rows: [row("ws-1", { path: elsewhere }), row("ws-1")], kept: elsewhere };
+          },
+        ],
+      ];
+      for (const [name, build] of duplicateIdCases) {
+        it(`keeps one row per id and backs up the bytes for ${name} under one key`, async () => {
+          const { rows: stored, kept } = build();
+          fs.writeFileSync(
+            path.join(tempDir, "config.json"),
+            JSON.stringify({
+              projects: [["/home/u/repo", { workspaces: [...stored, row("ws-2")] }]],
+            })
+          );
+          const original = fs.readFileSync(path.join(tempDir, "config.json"));
+          const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+          try {
+            await flushConfigEdits();
+            const saved = readSavedProjects()[0][1].workspaces;
+            expect(saved.map((w) => w.id)).toEqual(["ws-1", "ws-2"]);
+            const keptRow = saved[0] as Record<string, unknown>;
+            expect([keptRow.id, keptRow.title, keptRow.path]).toContain(kept);
+            const backups = aliasConflictBackups();
+            expect(backups).toHaveLength(1);
+            expect(fs.readFileSync(backups[0])).toEqual(original);
+          } finally {
+            errorSpy.mockRestore();
+          }
+        });
+      }
+
+      // #6717/#4550: every row lookup and the task index resolve a repeated id to its first row,
+      // so the heal keeps that row. Keeping the second would turn this root into a child of ws-2.
+      it("keeps the first row's title and parent for a repeated id, and backs up the second", async () => {
+        const second = row("ws-1", { title: "child", parentWorkspaceId: "ws-2" });
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo",
+                { workspaces: [row("ws-1", { title: "root" }), second, row("ws-2")] },
+              ],
+            ],
+          })
+        );
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await flushConfigEdits();
+          const saved = readSavedProjects()[0][1].workspaces as Array<Record<string, unknown>>;
+          expect(saved.map((w) => [w.id, w.title, w.parentWorkspaceId])).toEqual([
+            ["ws-1", "root", undefined],
+            ["ws-2", undefined, undefined],
+          ]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          const backedUp = JSON.parse(fs.readFileSync(backups[0], "utf-8")) as {
+            projects: StoredPair[];
+          };
+          expect(backedUp.projects[0][1].workspaces).toContainEqual(second);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      it("keeps one row and backs up the bytes for an identical copy inside one alias", async () => {
+        // The alias merge keeps an identical copy once and records no conflict of its own.
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              ["/home/u/repo", { workspaces: [row("ws-1"), row("ws-1")] }],
+              ["/home/u/repo/", { workspaces: [row("ws-2")] }],
+            ],
+          })
+        );
+        const original = fs.readFileSync(path.join(tempDir, "config.json"));
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          await flushConfigEdits();
+          const saved = readSavedProjects();
+          expect(saved).toHaveLength(1);
+          expect(saved[0][1].workspaces.map((w) => w.id)).toEqual(["ws-1", "ws-2"]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          expect(fs.readFileSync(backups[0])).toEqual(original);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      (process.getuid?.() === 0 ? it.skip : it)(
+        "keeps config.json and refuses edits while the duplicate-id backup fails",
+        async () => {
+          const configFile = path.join(tempDir, "config.json");
+          fs.writeFileSync(
+            configFile,
+            JSON.stringify({
+              projects: [["/home/u/repo", { workspaces: [row("ws-1"), row("ws-1")] }]],
+            })
+          );
+          const original = fs.readFileSync(configFile);
+          const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+          fs.chmodSync(tempDir, 0o500);
+          try {
+            const blocked = await config.setUpdateChannel("nightly").then(
+              () => null,
+              (error: unknown) => error
+            );
+            expect(String(blocked)).toContain("could not back them up");
+            expect(fs.readFileSync(configFile)).toEqual(original);
+          } finally {
+            fs.chmodSync(tempDir, 0o700);
+            errorSpy.mockRestore();
+          }
+        }
+      );
+
+      it("writes no backup and makes no save on a load with unique ids under one key", async () => {
+        writeProjects([["/home/u/repo", { workspaces: [row("ws-1"), row("ws-2")] }]]);
+        // One save first, so config.json is canonical and the load runs no one-time migration.
+        await flushConfigEdits();
+        const fresh = new Config(tempDir);
+        const save = spyOn(
+          fresh as unknown as { saveConfig: (...args: unknown[]) => Promise<void> },
+          "saveConfig"
+        );
+        try {
+          fresh.loadConfigOrDefault();
+          // A clean load schedules no save of its own (perf condition d). Edits run one at a
+          // time in order, so once this identity edit is done, any save the load queued is done
+          // too: exactly one save means the load queued none.
+          await fresh.editConfig((cfg) => cfg);
+          expect(save).toHaveBeenCalledTimes(1);
+          expect(aliasConflictBackups()).toHaveLength(0);
+        } finally {
+          save.mockRestore();
+        }
+      });
+
+      it("keeps one row and backs up the bytes for a legacy copy under one key", async () => {
+        const checkout = checkoutPath();
+        const id = config.generateLegacyId("/home/u/repo", checkout);
+        writeSingleKeyLegacyAndIdRows(checkout, id);
+        const original = fs.readFileSync(path.join(tempDir, "config.json"));
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          expect(await savedIdsOnCheckout(checkout)).toEqual([id]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          expect(fs.readFileSync(backups[0])).toEqual(original);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      // #6717: the heal keeps the first copy, on the other path, so the legacy row must be
+      // matched against the dropped copy first. Else the id migration gives it the same id again.
+      it("drops a legacy copy of a repeated id before it keeps the copy on another path", async () => {
+        const checkout = checkoutPath();
+        const id = config.generateLegacyId("/home/u/repo", checkout);
+        const elsewhere = path.join(config.srcDir, "repo", "elsewhere");
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo",
+                {
+                  workspaces: [
+                    { id, name: "x", path: elsewhere },
+                    { id, name: "x", path: checkout },
+                    { name: "x", path: checkout },
+                  ],
+                },
+              ],
+            ],
+          })
+        );
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          expect(await savedIdsOnCheckout(checkout)).toEqual([]);
+          const saved = readSavedProjects()[0][1].workspaces;
+          expect(saved.map((w) => [w.id, w.path])).toEqual([[id, elsewhere]]);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      // #6869: the alias merge keeps the copy on the other path, so the legacy row must be
+      // matched against every alias's rows before the merge. Else the id migration gives it the
+      // same id again: Xum saves config.json with two rows of one id, and the next load repairs
+      // it with a second backup.
+      it("drops a legacy copy of a repeated id before the alias merge keeps the copy on another path", async () => {
+        const checkout = checkoutPath();
+        const id = config.generateLegacyId("/home/u/repo", checkout);
+        const elsewhere = path.join(config.srcDir, "repo", "elsewhere");
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({
+            projects: [
+              [
+                "/home/u/repo/",
+                {
+                  workspaces: [
+                    { id, name: "x", path: checkout },
+                    { name: "x", path: checkout },
+                  ],
+                },
+              ],
+              ["/home/u/repo", { workspaces: [{ id, name: "x", path: elsewhere }] }],
+            ],
+          })
+        );
+        const original = fs.readFileSync(path.join(tempDir, "config.json"));
+        const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+        try {
+          expect(await savedIdsOnCheckout(checkout)).toEqual([]);
+          const saved = readSavedProjects();
+          expect(saved).toHaveLength(1);
+          expect(saved[0][1].workspaces.map((w) => [w.id, w.path])).toEqual([[id, elsewhere]]);
+          const backups = aliasConflictBackups();
+          expect(backups).toHaveLength(1);
+          expect(fs.readFileSync(backups[0])).toEqual(original);
+        } finally {
+          errorSpy.mockRestore();
+        }
+      });
+
+      it("keeps both rows under one key when the legacy row resolves to another id", () => {
+        const checkout = checkoutPath();
+        writeSingleKeyLegacyAndIdRows(checkout, "stable-1");
+        const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+        expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+        expect(aliasConflictBackups()).toHaveLength(0);
+      });
+
+      it("keeps both rows when the legacy row resolves to another id", async () => {
+        const checkout = checkoutPath();
+        writeLegacyAndIdRows(checkout, "stable-1");
+        const ids = await savedIdsOnCheckout(checkout);
+        expect(ids).toHaveLength(2);
+        expect(ids).toContain("stable-1");
+        expect(aliasConflictBackups()).toHaveLength(0);
+      });
+
+      (process.getuid?.() === 0 ? it.skip : it)(
+        "keeps both rows when the legacy metadata.json cannot be read",
+        () => {
+          const checkout = checkoutPath();
+          const metadataFile = writeLegacyMetadata(checkout, "stable-1");
+          fs.chmodSync(metadataFile, 0o000);
+          writeLegacyAndIdRows(checkout, "stable-1");
+          try {
+            const rows = config.loadConfigOrDefault().projects.get("/home/u/repo")?.workspaces;
+            expect(rows?.filter((w) => w.path === checkout)).toHaveLength(2);
+          } finally {
+            fs.chmodSync(metadataFile, 0o600);
+          }
+        }
+      );
+    });
+
+    it("gives merged legacy rows without an id distinct workspace ids", async () => {
+      const first = { name: "first", path: path.join(config.srcDir, "repo", "first") };
+      const second = { name: "second", path: path.join(config.srcDir, "repo", "second") };
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            ["/home/u/repo/", { workspaces: [first] }],
+            ["/home/u/repo", { workspaces: [first, second] }],
+          ],
+        })
+      );
+
+      const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: false });
+
+      const ids = metadata.map((meta) => meta.id);
+      expect(ids).toHaveLength(2);
+      expect(new Set(ids).size).toBe(2);
+      expect(metadata.every((meta) => meta.projectPath === "/home/u/repo")).toBe(true);
+    });
+
+    // Project settings come from the last entry, as the previous loader's `new Map` did. A
+    // setting that only an earlier alias holds may be one the user cleared since, so merging it
+    // back would revive it.
+    for (const order of ["canonical last", "alias last"] as const) {
+      const [earlierKey, lastKey] =
+        order === "canonical last"
+          ? ["/home/u/repo/", "/home/u/repo"]
+          : ["/home/u/repo", "/home/u/repo/"];
+
+      it(`drops a setting that only an earlier alias sets (${order})`, async () => {
+        writeProjects([
+          [
+            earlierKey,
+            {
+              customInstructions: "stale",
+              runtimeOverridesEnabled: true,
+              workspaces: [row("ws-early")],
+            },
+          ],
+          [lastKey, { workspaces: [row("ws-last")] }],
+        ]);
+
+        await flushConfigEdits();
+        const [[key, project]] = readSavedProjects();
+        expect(key).toBe("/home/u/repo");
+        expect(project.customInstructions).toBeUndefined();
+        expect(project.runtimeOverridesEnabled).toBeUndefined();
+        expect(project.workspaces.map((w) => w.id)).toEqual(["ws-early", "ws-last"]);
+
+        const reloaded = new Config(tempDir).loadConfigOrDefault().projects.get("/home/u/repo");
+        expect(reloaded?.customInstructions).toBeUndefined();
+        expect(reloaded?.runtimeOverridesEnabled).toBeUndefined();
+      });
+
+      it(`keeps the last alias's settings, even when an earlier alias differs (${order})`, async () => {
+        writeProjects([
+          [earlierKey, { customInstructions: "old", workspaces: [row("ws-early")] }],
+          [lastKey, { customInstructions: "current", workspaces: [row("ws-last")] }],
+        ]);
+
+        await flushConfigEdits();
+        const [[key, project]] = readSavedProjects();
+        expect(key).toBe("/home/u/repo");
+        expect(project.customInstructions).toBe("current");
+        expect(project.workspaces.map((w) => w.id)).toEqual(["ws-early", "ws-last"]);
+
+        const reloaded = new Config(tempDir).loadConfigOrDefault().projects.get("/home/u/repo");
+        expect(reloaded?.customInstructions).toBe("current");
+      });
+    }
+
+    it("writes the same projects on a second load and save after a merge", async () => {
+      writeProjects([
+        ["/home/u/repo/", { workspaces: [row("ws-two")] }],
+        ["/home/u/repo", { workspaces: [row("ws-one")] }],
+      ]);
+      await flushConfigEdits();
+      const first = JSON.stringify(readSavedProjects());
+
+      await new Config(tempDir).editConfig((cfg) => cfg);
+
+      // Every save writes a fresh writeId, so compare the projects, not the whole file.
+      expect(JSON.stringify(readSavedProjects())).toBe(first);
+      expect(savedRowIds()).toEqual([["/home/u/repo", ["ws-two", "ws-one"]]]);
     });
   });
 
@@ -178,6 +2427,79 @@ describe("Config", () => {
       expect(loaded.projects.get("/home/user/valid")?.customInstructions).toBe(
         "Keep this guidance."
       );
+    });
+
+    it("discards malformed non-string codeWorkspaceSyncPath and keeps valid ones", () => {
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            ["/home/user/number", { workspaces: [], codeWorkspaceSyncPath: 42 }],
+            ["/home/user/blank", { workspaces: [], codeWorkspaceSyncPath: "   " }],
+            ["/home/user/valid", { workspaces: [], codeWorkspaceSyncPath: "a.code-workspace" }],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.get("/home/user/number")?.codeWorkspaceSyncPath).toBeUndefined();
+      expect(loaded.projects.get("/home/user/blank")?.codeWorkspaceSyncPath).toBeUndefined();
+      expect(loaded.projects.get("/home/user/valid")?.codeWorkspaceSyncPath).toBe(
+        "a.code-workspace"
+      );
+    });
+
+    it("discards a malformed project agentResourceLimits and keeps a valid one", () => {
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            ["/home/user/zero", { workspaces: [], agentResourceLimits: { cpuCores: 0 } }],
+            ["/home/user/text", { workspaces: [], agentResourceLimits: "14 cores" }],
+            ["/home/user/empty", { workspaces: [], agentResourceLimits: {} }],
+            [
+              "/home/user/valid",
+              { workspaces: [], agentResourceLimits: { cpuCores: 14, memoryGiB: 32 } },
+            ],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.get("/home/user/zero")?.agentResourceLimits).toBeUndefined();
+      expect(loaded.projects.get("/home/user/text")?.agentResourceLimits).toBeUndefined();
+      expect(loaded.projects.get("/home/user/empty")?.agentResourceLimits).toBeUndefined();
+      expect(loaded.projects.get("/home/user/valid")?.agentResourceLimits).toEqual({
+        cpuCores: 14,
+        memoryGiB: 32,
+      });
+    });
+
+    it("discards malformed icons and keeps any icon name string", () => {
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            ["/home/user/number", { workspaces: [], icon: 42 }],
+            ["/home/user/blank", { workspaces: [], icon: "   " }],
+            ["/home/user/valid", { workspaces: [], icon: "rocket" }],
+            // A newer version's icon survives a downgrade; the sidebar shows the initial for it.
+            ["/home/user/unknown", { workspaces: [], icon: "not-an-icon" }],
+          ],
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+
+      expect(loaded.projects.get("/home/user/number")?.icon).toBeUndefined();
+      expect(loaded.projects.get("/home/user/blank")?.icon).toBeUndefined();
+      expect(loaded.projects.get("/home/user/valid")?.icon).toBe("rocket");
+      expect(loaded.projects.get("/home/user/unknown")?.icon).toBe("not-an-icon");
     });
   });
 
@@ -230,6 +2552,1269 @@ describe("Config", () => {
     });
   });
 
+  describe("pending default consent marker", () => {
+    it("keeps only `true` and drops malformed values while loading", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    path: "/repo/a",
+                    id: "ws-true",
+                    name: "a",
+                    unrelatedWorkspaceConsentPending: true,
+                  },
+                  {
+                    path: "/repo/b",
+                    id: "ws-false",
+                    name: "b",
+                    unrelatedWorkspaceConsentPending: false,
+                  },
+                  {
+                    path: "/repo/c",
+                    id: "ws-str",
+                    name: "c",
+                    unrelatedWorkspaceConsentPending: "yes",
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+
+      const pending = (config.loadConfigOrDefault().projects.get("/repo")?.workspaces ?? []).map(
+        (workspace) => [workspace.id, Object.hasOwn(workspace, "unrelatedWorkspaceConsentPending")]
+      );
+
+      expect(pending).toEqual([
+        ["ws-true", true],
+        ["ws-false", false],
+        ["ws-str", false],
+      ]);
+    });
+  });
+
+  describe("delegated creation mark (#4983)", () => {
+    it("keeps a well-formed mark and drops malformed ones while loading", () => {
+      const mark = { handleId: "wst_1", ownerWorkspaceId: "owner" };
+      const rows = [
+        ["ws-ok", mark],
+        ["ws-flagged", { ...mark, interruptedAt: "2026-09-29T00:00:00.000Z" }],
+        ["ws-str", "wst_1"],
+        ["ws-no-owner", { handleId: "wst_1" }],
+      ] as const;
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: rows.map(([id, delegatedCreation]) => ({
+                  path: `/repo/${id}`,
+                  id,
+                  name: id,
+                  delegatedCreation,
+                })),
+              },
+            ],
+          ],
+        })
+      );
+
+      const kept = (config.loadConfigOrDefault().projects.get("/repo")?.workspaces ?? []).map(
+        (workspace) => [workspace.id, Object.hasOwn(workspace, "delegatedCreation")]
+      );
+
+      expect(kept).toEqual([
+        ["ws-ok", true],
+        ["ws-flagged", true],
+        ["ws-str", false],
+        ["ws-no-owner", false],
+      ]);
+    });
+  });
+
+  describe("birth stamp of a root created without delegation (#5569)", () => {
+    const row = (id: string, extra: Record<string, unknown>) => ({
+      path: `/repo/${id}`,
+      id,
+      name: id,
+      createdAt: "2025-01-01T00:00:00.000Z",
+      runtimeConfig: { type: "local" as const },
+      ...extra,
+    });
+    const stamped = (cfg: Config) =>
+      (cfg.loadConfigOrDefault().projects.get("/repo")?.workspaces ?? []).map((workspace) => [
+        workspace.id,
+        Object.hasOwn(workspace, "bornWithoutDelegation"),
+      ]);
+
+    it("keeps only `true` on a row without a creation mark while loading", () => {
+      const mark = { handleId: "wst_1", ownerWorkspaceId: "owner" };
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  row("ws-true", { bornWithoutDelegation: true }),
+                  row("ws-false", { bornWithoutDelegation: false }),
+                  row("ws-str", { bornWithoutDelegation: "yes" }),
+                  // Only a hand edit writes both; the stamp then reads as absent.
+                  row("ws-marked", { bornWithoutDelegation: true, delegatedCreation: mark }),
+                  row("ws-bad-mark", { bornWithoutDelegation: true, delegatedCreation: "wst_1" }),
+                ],
+              },
+            ],
+          ],
+        })
+      );
+
+      expect(stamped(config)).toEqual([
+        ["ws-true", true],
+        ["ws-false", false],
+        ["ws-str", false],
+        ["ws-marked", false],
+        ["ws-bad-mark", false],
+      ]);
+    });
+
+    it("a metadata write keeps a stored stamp and never adds one", async () => {
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/repo", {
+          workspaces: [row("born", { bornWithoutDelegation: true }), row("plain", {})],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      for (const metadata of await reloaded.getAllWorkspaceMetadata()) {
+        // Metadata never carries the stamp. Production never builds this input: it only proves
+        // addWorkspace reads the stamp from the stored row, not from its metadata argument.
+        const withStamp: WorkspaceMetadata & { bornWithoutDelegation: true } = {
+          ...metadata,
+          bornWithoutDelegation: true,
+        };
+        await reloaded.addWorkspace("/repo", { ...withStamp, title: "Renamed" });
+      }
+      const plain = (await reloaded.getAllWorkspaceMetadata()).find((m) => m.id === "plain");
+      if (plain == null) throw new Error("plain row missing from metadata");
+      // A new row registered from metadata (fork, legacy re-registration) is never stamped.
+      const copy: WorkspaceMetadata & { bornWithoutDelegation: true } = {
+        ...plain,
+        id: "copy",
+        name: "copy",
+        bornWithoutDelegation: true,
+      };
+      await reloaded.addWorkspace("/repo", copy);
+
+      expect(stamped(new Config(tempDir))).toEqual([
+        ["born", true],
+        ["plain", false],
+        ["copy", false],
+      ]);
+    });
+  });
+
+  describe("downgrade-safe Cyber reasoning mode", () => {
+    const writeRawConfig = (doc: unknown) =>
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(doc));
+    const cyberSettings = { model: "openai:gpt-6.1-sol", thinkingLevel: "high" as const };
+
+    it("never writes reasoning mode cyber to disk and restores it on reload", async () => {
+      writeRawConfig({
+        projects: [
+          [
+            "/repo",
+            {
+              workspaces: [
+                {
+                  path: "/repo/ws",
+                  id: "ws",
+                  name: "ws",
+                  aiSettings: { ...cyberSettings, reasoningMode: "cyber" },
+                  aiSettingsByAgent: { exec: { ...cyberSettings, reasoningMode: "cyber" } },
+                  taskAiPins: { reasoningMode: "cyber" },
+                },
+              ],
+            },
+          ],
+        ],
+        agentAiDefaults: { exec: { reasoningMode: "cyber", subagent: { reasoningMode: "cyber" } } },
+      });
+      await flushConfigEdits();
+
+      // Older builds validate reasoning modes as standard|pro and reject any other value.
+      expect(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")).not.toContain('"cyber"');
+
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      const workspace = reloaded.projects.get("/repo")?.workspaces[0];
+      expect([
+        workspace?.aiSettings?.reasoningMode,
+        workspace?.aiSettingsByAgent?.exec?.reasoningMode,
+        workspace?.taskAiPins?.reasoningMode,
+        reloaded.agentAiDefaults?.exec?.reasoningMode,
+        reloaded.agentAiDefaults?.exec?.subagent?.reasoningMode,
+      ]).toEqual(["cyber", "cyber", "cyber", "cyber", "cyber"]);
+    });
+
+    it("keeps Cyber in runtime state after a save that encodes it", async () => {
+      // The only Cyber slot is nested: the save must find it, encode it on disk, and leave the
+      // settings object it shares with runtime state untouched.
+      let edited: ReturnType<Config["loadConfigOrDefault"]> | undefined;
+      await config.editConfig((cfg) => {
+        edited = {
+          ...cfg,
+          projects: new Map([
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    path: "/repo/ws",
+                    id: "ws",
+                    name: "ws",
+                    taskAiPins: { reasoningMode: "cyber" },
+                  },
+                ],
+              },
+            ],
+          ]),
+        };
+        return edited;
+      });
+
+      const raw = fs.readFileSync(path.join(tempDir, "config.json"), "utf-8");
+      expect(raw).not.toContain('"cyber"');
+      const onDisk = JSON.parse(raw) as {
+        projects: Array<[string, { workspaces: Array<{ taskAiPins?: unknown }> }]>;
+      };
+      expect(onDisk.projects[0][1].workspaces[0].taskAiPins).toEqual({ cyberReasoningMode: true });
+      expect(edited?.projects.get("/repo")?.workspaces[0].taskAiPins?.reasoningMode).toBe("cyber");
+    });
+
+    // The save shares settings objects with runtime state and only clones them when a slot holds
+    // Cyber, so it must serialize before its first suspension. Pause the save at its first await
+    // (the atomic write's realpath), change the supplied settings, then let it finish: the file
+    // must still hold the state the edit returned.
+    for (const withCyber of [false, true]) {
+      it(`writes the returned state even if settings change mid-save (${withCyber ? "Cyber" : "no Cyber"})`, async () => {
+        const execSettings: Record<string, unknown> = { ...cyberSettings, reasoningMode: "pro" };
+        const pins: Record<string, unknown> = withCyber ? { reasoningMode: "cyber" } : {};
+        const paused = Promise.withResolvers<void>();
+        const resume = Promise.withResolvers<void>();
+        const realRealpath = cjsFs.realpath.bind(cjsFs);
+        let pausedOnce = false;
+        const spy = spyOn(cjsFs, "realpath").mockImplementation(((
+          target: string,
+          callback: (error: NodeJS.ErrnoException | null, resolved: string) => void
+        ) => {
+          if (!pausedOnce && path.basename(String(target)) === "config.json") {
+            pausedOnce = true;
+            paused.resolve();
+            void resume.promise.then(() => realRealpath(target, callback));
+            return;
+          }
+          realRealpath(target, callback);
+        }) as unknown as typeof cjsFs.realpath);
+        try {
+          const edit = config.editConfig((cfg) => ({
+            ...cfg,
+            projects: new Map([
+              [
+                "/repo",
+                {
+                  workspaces: [
+                    {
+                      path: "/repo/ws",
+                      id: "ws",
+                      name: "ws",
+                      aiSettingsByAgent: { exec: execSettings as never },
+                      taskAiPins: pins as never,
+                    },
+                  ],
+                },
+              ],
+            ]),
+          }));
+          // Race the edit so a save that never reaches the paused realpath fails the
+          // `pausedOnce` check below instead of hanging until the test timeout.
+          await Promise.race([paused.promise, edit]);
+          execSettings.reasoningMode = "cyber";
+          execSettings.model = "openai:mutated-mid-save";
+          resume.resolve();
+          await edit;
+        } finally {
+          spy.mockRestore();
+        }
+
+        expect(pausedOnce).toBe(true);
+        const onDisk = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+          projects: Array<
+            [string, { workspaces: Array<{ aiSettingsByAgent?: unknown; taskAiPins?: unknown }> }]
+          >;
+        };
+        const workspace = onDisk.projects[0][1].workspaces[0];
+        expect(workspace.aiSettingsByAgent).toEqual({
+          exec: { ...cyberSettings, reasoningMode: "pro" },
+        });
+        expect(workspace.taskAiPins).toEqual(withCyber ? { cyberReasoningMode: true } : {});
+      });
+    }
+
+    it("lets a mode written by an older build win over a stale Cyber marker", () => {
+      writeRawConfig({
+        projects: [
+          [
+            "/repo",
+            {
+              workspaces: [
+                {
+                  path: "/repo/ws",
+                  id: "ws",
+                  name: "ws",
+                  aiSettings: { ...cyberSettings, reasoningMode: "pro", cyberReasoningMode: true },
+                },
+              ],
+            },
+          ],
+        ],
+      });
+
+      const workspace = config.loadConfigOrDefault().projects.get("/repo")?.workspaces[0];
+      expect(workspace?.aiSettings).toEqual({ ...cyberSettings, reasoningMode: "pro" });
+    });
+  });
+
+  it("drops a leftover taskExperiments snapshot at load time", () => {
+    fs.writeFileSync(
+      path.join(tempDir, "config.json"),
+      JSON.stringify({
+        projects: [
+          [
+            "/repo",
+            {
+              workspaces: [
+                {
+                  path: "/repo/task-ws",
+                  id: "task-ws-1",
+                  name: "task-ws",
+                  taskExperiments: { rlm: true, programmaticToolCalling: true },
+                },
+              ],
+            },
+          ],
+        ],
+      })
+    );
+
+    const workspace = config.loadConfigOrDefault().projects.get("/repo")?.workspaces[0];
+    expect(workspace?.id).toBe("task-ws-1");
+    expect(workspace != null && Object.hasOwn(workspace, "taskExperiments")).toBe(false);
+  });
+
+  it("keeps notify-on-response entries while a workspace row has no ID yet", () => {
+    fs.writeFileSync(
+      path.join(tempDir, "config.json"),
+      JSON.stringify({
+        projects: [["/repo", { workspaces: [{ path: "/repo/legacy", name: "legacy" }] }]],
+        userPreferences: { notifications: { notifyOnResponseByWorkspace: { "legacy-id": true } } },
+      })
+    );
+
+    expect(config.loadConfigOrDefault().userPreferences).toEqual({
+      notifications: { notifyOnResponseByWorkspace: { "legacy-id": true } },
+    });
+  });
+
+  it("drops notify-on-response entries of removed workspaces at load time", () => {
+    fs.writeFileSync(
+      path.join(tempDir, "config.json"),
+      JSON.stringify({
+        projects: [["/repo", { workspaces: [{ path: "/repo/ws", id: "ws-kept", name: "ws" }] }]],
+        userPreferences: {
+          notifications: { notifyOnResponseByWorkspace: { "ws-kept": true, "ws-removed": true } },
+        },
+      })
+    );
+
+    expect(config.loadConfigOrDefault().userPreferences).toEqual({
+      notifications: { notifyOnResponseByWorkspace: { "ws-kept": true } },
+    });
+  });
+
+  describe("deferred change notifications", () => {
+    it("flushes slow sequential edits and unrelated edits once", async () => {
+      let notifications = 0;
+      const unsubscribe = config.onConfigChanged(() => {
+        notifications += 1;
+      });
+      const paused = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const operation = config.withDeferredChangeNotifications(async () => {
+        await config.setUpdateChannel("npm");
+        paused.resolve();
+        await resume.promise;
+        await config.setUpdateChannel("nightly");
+        return "complete";
+      });
+      await paused.promise;
+      expect(notifications).toBe(0);
+      await config.editConfig((value) => value);
+      expect(notifications).toBe(0);
+      resume.resolve();
+      expect(await operation).toBe("complete");
+      expect(notifications).toBe(1);
+      expect(config.getUpdateChannel()).toBe("nightly");
+      await config.setUpdateChannel("npm");
+      expect(notifications).toBe(2);
+      unsubscribe();
+    });
+
+    it("flushes nested partial failures only after the outer scope ends", async () => {
+      let notifications = 0;
+      const unsubscribe = config.onConfigChanged(() => {
+        notifications += 1;
+      });
+      const failure = await config
+        .withDeferredChangeNotifications(async () => {
+          await config.setUpdateChannel("npm");
+          const nestedFailure = await config
+            .withDeferredChangeNotifications(async () => {
+              await config.setUpdateChannel("nightly");
+              throw new Error("nested failure");
+            })
+            .catch((error: unknown) => error);
+          expect(nestedFailure).toEqual(new Error("nested failure"));
+          expect(notifications).toBe(0);
+          throw new Error("outer failure");
+        })
+        .catch((error: unknown) => error);
+      expect(failure).toEqual(new Error("outer failure"));
+      expect(notifications).toBe(1);
+      expect(config.getUpdateChannel()).toBe("nightly");
+      await config.withDeferredChangeNotifications(() => Promise.resolve());
+      expect(notifications).toBe(1);
+      await config.setUpdateChannel("npm");
+      expect(notifications).toBe(2);
+      unsubscribe();
+    });
+  });
+
+  describe("change notifications from another process", () => {
+    // A second Config on the same root stands in for another Xum backend: it shares no
+    // in-memory state with `config`, so only the file watcher can carry its edits over.
+    function nextNotification(target: Config): { promise: Promise<void>; unsubscribe: () => void } {
+      const fired = Promise.withResolvers<void>();
+      const unsubscribe = target.onConfigChanged(() => fired.resolve());
+      return { promise: fired.promise, unsubscribe };
+    }
+
+    it("notifies listeners when another process rewrites config.json", async () => {
+      await config.setUpdateChannel("npm");
+      const next = nextNotification(config);
+      await new Config(tempDir).setUpdateChannel("nightly");
+      await next.promise;
+      next.unsubscribe();
+      expect(config.getUpdateChannel()).toBe("nightly");
+    });
+
+    it("notifies for another process's rewrite of a symlinked config.json", async () => {
+      // writeFileAtomic renames over the link's target, so the event lands in the target dir.
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      try {
+        fs.writeFileSync(path.join(targetDir, "config.json"), JSON.stringify({ projects: [] }));
+        fs.symlinkSync(path.join(targetDir, "config.json"), path.join(tempDir, "config.json"));
+        const next = nextNotification(config);
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("follows a config.json symlink that is pointed at another directory", async () => {
+      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-a-"));
+      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-b-"));
+      try {
+        const link = path.join(tempDir, "config.json");
+        fs.writeFileSync(path.join(dirA, "config.json"), JSON.stringify({ projects: [] }));
+        fs.writeFileSync(
+          path.join(dirB, "config.json"),
+          JSON.stringify({ projects: [], updateChannel: "npm" })
+        );
+        fs.symlinkSync(path.join(dirA, "config.json"), link);
+        // One subscription for the whole test: a fresh one would start a fresh watch.
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        // Replace the link atomically, as a dotfiles manager does.
+        fs.symlinkSync(path.join(dirB, "config.json"), `${link}.tmp`);
+        fs.renameSync(`${link}.tmp`, link);
+        await notified.promise;
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(dirA, { recursive: true, force: true });
+        fs.rmSync(dirB, { recursive: true, force: true });
+      }
+    });
+
+    it("follows a config.json symlink to a sibling file that is pointed at another sibling", async () => {
+      const link = path.join(tempDir, "config.json");
+      fs.writeFileSync(path.join(tempDir, "config.a.json"), JSON.stringify({ projects: [] }));
+      fs.writeFileSync(
+        path.join(tempDir, "config.b.json"),
+        JSON.stringify({ projects: [], updateChannel: "npm" })
+      );
+      fs.symlinkSync(path.join(tempDir, "config.a.json"), link);
+      let notified = Promise.withResolvers<void>();
+      const unsubscribe = config.onConfigChanged(() => notified.resolve());
+      fs.symlinkSync(path.join(tempDir, "config.b.json"), `${link}.tmp`);
+      fs.renameSync(`${link}.tmp`, link);
+      await notified.promise;
+      notified = Promise.withResolvers<void>();
+      await new Config(tempDir).setUpdateChannel("nightly");
+      await notified.promise;
+      unsubscribe();
+      expect(config.getUpdateChannel()).toBe("nightly");
+    });
+
+    it("follows a symlink replaced while the watch starts", async () => {
+      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-a-"));
+      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-b-"));
+      const link = path.join(tempDir, "config.json");
+      const realWatch = fs.watch;
+      let relinked = false;
+      // The link changes after the target is resolved and before the root watch exists, so no
+      // watch event reports it.
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (!relinked) {
+          relinked = true;
+          fs.symlinkSync(path.join(dirB, "config.json"), `${link}.tmp`);
+          fs.renameSync(`${link}.tmp`, link);
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      try {
+        fs.writeFileSync(path.join(dirA, "config.json"), JSON.stringify({ projects: [] }));
+        fs.writeFileSync(path.join(dirB, "config.json"), JSON.stringify({ projects: [] }));
+        fs.symlinkSync(path.join(dirA, "config.json"), link);
+        let notifications = 0;
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => {
+          notifications += 1;
+          notified.resolve();
+        });
+        // The startup check reports the relink itself (another file is config.json now).
+        expect(relinked).toBe(true);
+        expect(notifications).toBe(1);
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        watchSpy.mockRestore();
+        fs.rmSync(dirA, { recursive: true, force: true });
+        fs.rmSync(dirB, { recursive: true, force: true });
+      }
+    });
+
+    /** Replace a symlink atomically, as a dotfiles manager does. */
+    function repointLink(link: string, target: string): void {
+      fs.symlinkSync(target, `${link}.tmp`);
+      fs.renameSync(`${link}.tmp`, link);
+    }
+
+    it("notifies when the missing target of a dangling config.json symlink appears", async () => {
+      const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      try {
+        // Neither the target nor its folder exists yet.
+        const target = path.join(targetRoot, "dotfiles", "xum.json");
+        fs.symlinkSync(target, path.join(tempDir, "config.json"));
+        const next = nextNotification(config);
+        fs.mkdirSync(path.dirname(target));
+        fs.writeFileSync(target, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(targetRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("follows a repointed symlinked folder in the config.json target path", async () => {
+      const dotfiles = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-dotfiles-"));
+      try {
+        for (const [name, updateChannel] of [
+          ["a", undefined],
+          ["b", "npm"],
+        ] as const) {
+          fs.mkdirSync(path.join(dotfiles, name));
+          fs.writeFileSync(
+            path.join(dotfiles, name, "xum.json"),
+            JSON.stringify({ projects: [], updateChannel })
+          );
+        }
+        const current = path.join(dotfiles, "current");
+        fs.symlinkSync(path.join(dotfiles, "a"), current);
+        fs.symlinkSync(path.join(current, "xum.json"), path.join(tempDir, "config.json"));
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        // Only `current` changes: config.json and both target folders stay as they were.
+        repointLink(current, path.join(dotfiles, "b"));
+        await notified.promise;
+        expect(config.getUpdateChannel()).toBe("npm");
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(dotfiles, { recursive: true, force: true });
+      }
+    });
+
+    it("follows a second relink that lands while the watches are reinstalled", async () => {
+      const dirs = ["a", "b", "c1", "c2"].map((name) =>
+        fs.mkdtempSync(path.join(os.tmpdir(), `mux-test-target-${name}-`))
+      );
+      const [dirA, dirB, dirC1, dirC2] = dirs;
+      const link = path.join(tempDir, "config.json");
+      // A second link in dirB: dirB gets its first watch in the reinstall, so a repoint of
+      // this link before that watch exists produces no event at all.
+      const innerLink = path.join(dirB, "link.json");
+      const realWatch = fs.watch;
+      // Armed after the first setup: the second relink belongs to the reinstall.
+      let armed = false;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (armed && fs.realpathSync(String(args[0])) === fs.realpathSync(dirB)) {
+          armed = false;
+          repointLink(innerLink, path.join(dirC2, "config.json"));
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      try {
+        for (const dir of [dirA, dirC1, dirC2]) {
+          fs.writeFileSync(path.join(dir, "config.json"), JSON.stringify({ projects: [] }));
+        }
+        fs.symlinkSync(path.join(dirC1, "config.json"), innerLink);
+        fs.symlinkSync(path.join(dirA, "config.json"), link);
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        armed = true;
+        repointLink(link, innerLink);
+        await notified.promise;
+        expect(armed).toBe(false);
+        notified = Promise.withResolvers<void>();
+        // The save lands in dirC2: only a watch on dirC2 sees it.
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        watchSpy.mockRestore();
+        for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps watching after the target folder's watch fails", async () => {
+      const dirA = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-a-"));
+      const dirB = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-b-"));
+      const link = path.join(tempDir, "config.json");
+      const watchers = new Map<string, fs.FSWatcher>();
+      const realWatch = fs.watch;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        const watcher = realWatch(...args);
+        watchers.set(fs.realpathSync(String(args[0])), watcher);
+        return watcher;
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(path.join(dirA, "config.json"), JSON.stringify({ projects: [] }));
+        fs.writeFileSync(
+          path.join(dirB, "config.json"),
+          JSON.stringify({ projects: [], updateChannel: "npm" })
+        );
+        fs.symlinkSync(path.join(dirA, "config.json"), link);
+        let notified = Promise.withResolvers<void>();
+        const unsubscribe = config.onConfigChanged(() => notified.resolve());
+        const targetWatcher = watchers.get(fs.realpathSync(dirA));
+        if (!targetWatcher) throw new Error("expected a watch on the target dir");
+        // A transient failure: the link and dirA stay as they were.
+        targetWatcher.emit("error", new Error("EPERM: operation not permitted"));
+        // The save lands in dirA, so only a reopened watch on dirA sees it.
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await notified.promise;
+        expect(config.getUpdateChannel()).toBe("nightly");
+        // The config dir watch still follows a relink.
+        notified = Promise.withResolvers<void>();
+        repointLink(link, path.join(dirB, "config.json"));
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(dirA, { recursive: true, force: true });
+        fs.rmSync(dirB, { recursive: true, force: true });
+      }
+    });
+
+    it("logs a throwing listener's error on another process's edit and still notifies the rest", async () => {
+      await config.setUpdateChannel("npm");
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      // Subscribed first, so an unguarded emit would stop before the next listener.
+      const unsubscribeThrowing = config.onConfigChanged(() => {
+        throw new Error("listener failed");
+      });
+      const next = nextNotification(config);
+      try {
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await next.promise;
+        expect(errorSpy).toHaveBeenCalled();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        next.unsubscribe();
+        unsubscribeThrowing();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("keeps the listener guard for another process's edit deferred by a batch", async () => {
+      await config.setUpdateChannel("npm");
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const unsubscribeThrowing = config.onConfigChanged(() => {
+        throw new Error("listener failed");
+      });
+      const next = nextNotification(config);
+      // The watcher reads the stamp right before it notifies, in the same callback.
+      const realStamp = config.configFileStamp.bind(config);
+      const stampRead = Promise.withResolvers<void>();
+      const stampSpy = spyOn(config, "configFileStamp").mockImplementation(() => {
+        const stamp = realStamp();
+        stampRead.resolve();
+        return stamp;
+      });
+      try {
+        // The batch makes no edit of its own, so its flush carries only the foreign edit.
+        await config.withDeferredChangeNotifications(async () => {
+          await new Config(tempDir).setUpdateChannel("nightly");
+          await stampRead.promise;
+        });
+        await next.promise;
+        expect(errorSpy).toHaveBeenCalled();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        stampSpy.mockRestore();
+        next.unsubscribe();
+        unsubscribeThrowing();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("keeps the listener guard for a batch that holds an own edit and a foreign edit", async () => {
+      await config.setUpdateChannel("npm");
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      const unsubscribeThrowing = config.onConfigChanged(() => {
+        throw new Error("listener failed");
+      });
+      const next = nextNotification(config);
+      // The watcher reads the stamp right before it notifies, in the same callback.
+      const realStamp = config.configFileStamp.bind(config);
+      const seenStamps = new Set<string>();
+      let stampSeen = Promise.withResolvers<void>();
+      const stampSpy = spyOn(config, "configFileStamp").mockImplementation(() => {
+        const stamp = realStamp();
+        seenStamps.add(stamp);
+        stampSeen.resolve();
+        return stamp;
+      });
+      try {
+        await config.withDeferredChangeNotifications(async () => {
+          await config.setUpdateChannel("nightly");
+          await new Config(tempDir).setUpdateChannel("npm");
+          const foreignStamp = realStamp();
+          while (!seenStamps.has(foreignStamp)) {
+            await stampSeen.promise;
+            stampSeen = Promise.withResolvers<void>();
+          }
+        });
+        await next.promise;
+        expect(errorSpy).toHaveBeenCalled();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        stampSpy.mockRestore();
+        next.unsubscribe();
+        unsubscribeThrowing();
+        errorSpy.mockRestore();
+      }
+    });
+
+    it("retries a failed folder watch on a read of a changed config.json", async () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      const target = path.join(targetDir, "config.json");
+      const realWatch = fs.watch;
+      let failing = true;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (failing && fs.realpathSync(String(args[0])) === fs.realpathSync(targetDir)) {
+          throw Object.assign(new Error("ENOSPC: inotify watch limit reached"), { code: "ENOSPC" });
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(target, JSON.stringify({ projects: [] }));
+        fs.symlinkSync(target, path.join(tempDir, "config.json"));
+        let notified = Promise.withResolvers<void>();
+        let notifications = 0;
+        const unsubscribe = config.onConfigChanged(() => {
+          notifications += 1;
+          notified.resolve();
+        });
+        failing = false;
+        // No await until the read: no event from the config dir watch can retry the watch.
+        fs.writeFileSync(target, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+        expect(config.getUpdateChannel()).toBe("nightly");
+        expect(notifications).toBe(1);
+        // The retried watch on targetDir sees the next save there.
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("npm");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("starts the watches on a read of a changed config.json after every watch failed", async () => {
+      const realWatch = fs.watch;
+      let failing = true;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (failing) {
+          throw Object.assign(new Error("ENOSPC: inotify watch limit reached"), { code: "ENOSPC" });
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        await config.setUpdateChannel("npm");
+        let notified = Promise.withResolvers<void>();
+        let notifications = 0;
+        const unsubscribe = config.onConfigChanged(() => {
+          notifications += 1;
+          notified.resolve();
+        });
+        failing = false;
+        // No await until the read: no watch exists that could report this edit.
+        fs.writeFileSync(
+          path.join(tempDir, "config.json"),
+          JSON.stringify({ projects: [], updateChannel: "nightly" })
+        );
+        expect(config.getUpdateChannel()).toBe("nightly");
+        expect(notifications).toBe(1);
+        // The started watch sees the next save.
+        notified = Promise.withResolvers<void>();
+        await new Config(tempDir).setUpdateChannel("npm");
+        await notified.promise;
+        unsubscribe();
+        expect(config.getUpdateChannel()).toBe("npm");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+      }
+    });
+
+    it("rebuilds the watches once per config.json change for an error every new watch raises", () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      const target = path.join(targetDir, "config.json");
+      const watchers = new Map<string, fs.FSWatcher>();
+      const listeners = new Map<string, (event: string, filename: string) => void>();
+      let watchCalls = 0;
+      const realWatch = fs.watch;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        watchCalls += 1;
+        const watcher = realWatch(...args);
+        watchers.set(fs.realpathSync(String(args[0])), watcher);
+        // Config passes (dir, options, listener); the typed overloads end at two parameters.
+        const listener: unknown = (args as unknown[])[2];
+        if (typeof listener === "function") {
+          listeners.set(
+            fs.realpathSync(String(args[0])),
+            listener as (event: string, filename: string) => void
+          );
+        }
+        return watcher;
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      const failTargetWatch = () => {
+        const watcher = watchers.get(fs.realpathSync(targetDir));
+        if (!watcher) throw new Error("expected a watch on the target dir");
+        watcher.emit("error", new Error("EPERM: operation not permitted"));
+      };
+      try {
+        fs.writeFileSync(target, JSON.stringify({ projects: [] }));
+        fs.symlinkSync(target, path.join(tempDir, "config.json"));
+        const unsubscribe = config.onConfigChanged(() => undefined);
+        const started = watchCalls;
+        failTargetWatch();
+        const rebuilt = watchCalls;
+        expect(rebuilt).toBeGreaterThan(started);
+        // The new watch fails the same way. config.json did not change, so no rebuild.
+        failTargetWatch();
+        expect(watchCalls).toBe(rebuilt);
+        // A read of the changed file rebuilds once more.
+        fs.writeFileSync(target, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+        expect(config.getUpdateChannel()).toBe("nightly");
+        const reread = watchCalls;
+        expect(reread).toBeGreaterThan(rebuilt);
+        // The read's retry does not use up the error's: an error of the new watch rebuilds once.
+        failTargetWatch();
+        const recovered = watchCalls;
+        expect(recovered).toBeGreaterThan(reread);
+        failTargetWatch();
+        expect(watchCalls).toBe(recovered);
+        // An unrelated event in another watched dir proves nothing about the failed watch.
+        listeners.get(fs.realpathSync(tempDir))?.("rename", "unrelated.txt");
+        failTargetWatch();
+        expect(watchCalls).toBe(recovered);
+        // An event from the target dir's own watch shows it works: its next error rebuilds.
+        listeners.get(fs.realpathSync(targetDir))?.("rename", "unrelated.txt");
+        failTargetWatch();
+        expect(watchCalls).toBeGreaterThan(recovered);
+        unsubscribe();
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("stops resolving a config.json symlink loop at the link limit", async () => {
+      const loopA = path.join(tempDir, "loop-a");
+      const loopB = path.join(tempDir, "loop-b");
+      fs.symlinkSync(loopB, loopA);
+      fs.symlinkSync(loopA, loopB);
+      const link = path.join(tempDir, "config.json");
+      fs.symlinkSync(loopA, link);
+      // Record the walk's symlink reads, so the test can tell the 40-link cap from an earlier stop.
+      const loopPaths = new Set([link, loopA, loopB]);
+      const linkReads: string[] = [];
+      const realReadlink = fs.readlinkSync;
+      const readlinkSpy = spyOn(fs, "readlinkSync").mockImplementation(((
+        target: fs.PathLike,
+        ...rest: unknown[]
+      ) => {
+        if (loopPaths.has(String(target))) linkReads.push(String(target));
+        return (realReadlink as (...args: unknown[]) => unknown)(target, ...rest);
+      }) as typeof fs.readlinkSync);
+      // Without the link limit, resolving the loop never ends and this call hangs.
+      const next = nextNotification(config);
+      readlinkSpy.mockRestore();
+      // Each walk starts at config.json and follows 40 links (the kernel's ELOOP bound) before
+      // it stops: config.json once, then 39 loop links.
+      const walks = linkReads.join("\n").split(link).slice(1);
+      expect(walks.length).toBeGreaterThan(0);
+      for (const walk of walks) expect(walk.split("\n").filter(Boolean)).toHaveLength(39);
+      // The config dir watch still sees a real file that replaces the loop.
+      const replacement = path.join(tempDir, "replacement.json");
+      fs.writeFileSync(replacement, JSON.stringify({ projects: [], updateChannel: "nightly" }));
+      fs.renameSync(replacement, link);
+      await next.promise;
+      next.unsubscribe();
+      expect(config.getUpdateChannel()).toBe("nightly");
+    });
+
+    it("follows a config.json path through a symlink to the filesystem root", async () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      try {
+        const target = path.join(targetDir, "config.json");
+        fs.writeFileSync(target, JSON.stringify({ projects: [] }));
+        const { root } = path.parse(target);
+        const rootLink = path.join(tempDir, "root");
+        fs.symlinkSync(root, rootLink);
+        // config.json -> root/<target without the root>: the walk goes on from the root.
+        fs.symlinkSync(
+          path.join(rootLink, target.slice(root.length)),
+          path.join(tempDir, "config.json")
+        );
+        const next = nextNotification(config);
+        // The save lands in targetDir: only a watch there sees it.
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("retries a target folder watch that failed to start", async () => {
+      const targetDir = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      const realWatch = fs.watch;
+      let failed = false;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (!failed && fs.realpathSync(String(args[0])) === fs.realpathSync(targetDir)) {
+          failed = true;
+          throw Object.assign(new Error("ENOSPC: inotify watch limit reached"), { code: "ENOSPC" });
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      const debugSpy = spyOn(log, "debug").mockImplementation(() => undefined);
+      try {
+        fs.writeFileSync(path.join(targetDir, "config.json"), JSON.stringify({ projects: [] }));
+        fs.symlinkSync(path.join(targetDir, "config.json"), path.join(tempDir, "config.json"));
+        const next = nextNotification(config);
+        expect(failed).toBe(true);
+        // The save lands in targetDir: only a retried watch there sees it.
+        await new Config(tempDir).setUpdateChannel("nightly");
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        debugSpy.mockRestore();
+        watchSpy.mockRestore();
+        fs.rmSync(targetDir, { recursive: true, force: true });
+      }
+    });
+
+    it("notifies when a file in a dangling target's folder path is replaced by the folder", async () => {
+      const targetRoot = fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-target-"));
+      try {
+        const current = path.join(targetRoot, "current");
+        fs.writeFileSync(current, "not a folder");
+        fs.symlinkSync(path.join(current, "xum.json"), path.join(tempDir, "config.json"));
+        const next = nextNotification(config);
+        fs.rmSync(current);
+        fs.mkdirSync(current);
+        fs.writeFileSync(
+          path.join(current, "xum.json"),
+          JSON.stringify({ projects: [], updateChannel: "nightly" })
+        );
+        await next.promise;
+        next.unsubscribe();
+        expect(config.getUpdateChannel()).toBe("nightly");
+      } finally {
+        fs.rmSync(targetRoot, { recursive: true, force: true });
+      }
+    });
+
+    it("stops watching for good once stopWatchingConfigFile runs", () => {
+      const watchers: fs.FSWatcher[] = [];
+      const realWatch = fs.watch;
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        const watcher = realWatch(...args);
+        watchers.push(watcher);
+        return watcher;
+      }) as typeof fs.watch);
+      try {
+        const unsubscribe = config.onConfigChanged(() => undefined);
+        expect(watchers.length).toBeGreaterThan(0);
+        const closes = watchers.map((watcher) => spyOn(watcher, "close"));
+        config.stopWatchingConfigFile();
+        for (const close of closes) expect(close).toHaveBeenCalledTimes(1);
+        // A later subscriber (a service still running during teardown) starts no new watch.
+        const started = watchers.length;
+        const unsubscribeLate = config.onConfigChanged(() => undefined);
+        expect(watchers.length).toBe(started);
+        unsubscribeLate();
+        unsubscribe();
+      } finally {
+        watchSpy.mockRestore();
+      }
+    });
+
+    it("notifies when another process creates the config dir with its first save", async () => {
+      const rootDir = path.join(tempDir, "fresh-root");
+      const fresh = new Config(rootDir);
+      const next = nextNotification(fresh);
+      await new Config(rootDir).setUpdateChannel("nightly");
+      await next.promise;
+      next.unsubscribe();
+      expect(fresh.getUpdateChannel()).toBe("nightly");
+    });
+
+    it("notifies for a rewrite that lands while the watch starts", async () => {
+      await config.setUpdateChannel("npm");
+      const realWatch = fs.watch;
+      let rewrote = false;
+      // The rewrite lands after the subscriber's own read and before the watch is installed,
+      // so no watch event reports it.
+      const watchSpy = spyOn(fs, "watch").mockImplementation(((
+        ...args: Parameters<typeof fs.watch>
+      ) => {
+        if (!rewrote) {
+          rewrote = true;
+          fs.writeFileSync(
+            path.join(tempDir, "config.json"),
+            JSON.stringify({ projects: [], updateChannel: "nightly" })
+          );
+        }
+        return realWatch(...args);
+      }) as typeof fs.watch);
+      try {
+        let notifications = 0;
+        const unsubscribe = config.onConfigChanged(() => {
+          notifications += 1;
+        });
+        expect(rewrote).toBe(true);
+        expect(notifications).toBe(1);
+        unsubscribe();
+      } finally {
+        watchSpy.mockRestore();
+      }
+    });
+
+    it("notifies once for its own edit", async () => {
+      await config.setUpdateChannel("npm");
+      let notifications = 0;
+      const unsubscribe = config.onConfigChanged(() => {
+        notifications += 1;
+      });
+      await config.setUpdateChannel("nightly");
+      expect(notifications).toBe(1);
+      // The watcher handles events in order, so once the foreign edit arrives, any echo of
+      // the own edit would have arrived first.
+      const next = nextNotification(config);
+      await new Config(tempDir).setUpdateChannel("npm");
+      await next.promise;
+      next.unsubscribe();
+      expect(notifications).toBe(2);
+      unsubscribe();
+    });
+  });
+
+  describe("read-only workspace metadata", () => {
+    it("getWorkspaceMetadataById with persistMigrations: false fills defaults without writing", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      fs.mkdirSync(projectPath, { recursive: true });
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            [
+              projectPath,
+              {
+                workspaces: [
+                  // Legacy entry: no runtimeConfig, so a default build records a migration.
+                  { id: "ws-legacy", name: "legacy", path: path.join(projectPath, "legacy") },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      // Flush load-time (non-workspace) migrations so only the metadata build can write below.
+      await flushConfigEdits();
+      const editSpy = spyOn(config, "editConfig");
+
+      const readOnly = await config.getWorkspaceMetadataById("ws-legacy", {
+        persistMigrations: false,
+      });
+      expect(readOnly?.runtimeConfig).toBeDefined();
+      expect(editSpy).not.toHaveBeenCalled();
+      const persistedAfterReadOnly = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        projects: Array<[string, { workspaces: Array<{ runtimeConfig?: unknown }> }]>;
+      };
+      expect(persistedAfterReadOnly.projects[0]?.[1].workspaces[0]?.runtimeConfig).toBeUndefined();
+
+      // Default behavior is unchanged: the migration is persisted.
+      const migrating = await config.getWorkspaceMetadataById("ws-legacy");
+      expect(migrating?.runtimeConfig).toEqual(readOnly?.runtimeConfig);
+      expect(editSpy).toHaveBeenCalled();
+      await flushConfigEdits();
+      const persisted = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+        projects: Array<[string, { workspaces: Array<{ runtimeConfig?: unknown }> }]>;
+      };
+      expect(persisted.projects[0]?.[1].workspaces[0]?.runtimeConfig).toEqual(
+        readOnly?.runtimeConfig
+      );
+    });
+
+    it("a failed migration persist does not fail the metadata read (#4444)", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      fs.mkdirSync(projectPath, { recursive: true });
+      const configFile = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configFile,
+        JSON.stringify({
+          projects: [
+            [
+              projectPath,
+              {
+                workspaces: [
+                  { id: "ws-legacy", name: "legacy", path: path.join(projectPath, "legacy") },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      await flushConfigEdits();
+      const before = fs.readFileSync(configFile, "utf-8");
+      const warnSpy = spyOn(log, "warn").mockImplementation(() => undefined);
+      const errorSpy = spyOn(log, "error").mockImplementation(() => undefined);
+      // Fail only the rename that publishes config.json: a real failed save.
+      const realRename = cjsFs.rename.bind(cjsFs);
+      const renameSpy = spyOn(cjsFs, "rename").mockImplementation(((
+        from: cjsFs.PathLike,
+        to: cjsFs.PathLike,
+        callback: cjsFs.NoParamCallback
+      ) => {
+        if (path.basename(String(to)) === "config.json") {
+          callback(Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" }));
+          return;
+        }
+        realRename(from, to, callback);
+      }) as typeof cjsFs.rename);
+      try {
+        // Startup and every workspace list read go through here: a write failure must not
+        // turn a read into a rejection.
+        const all = await config.getAllWorkspaceMetadata();
+        expect(all.find((meta) => meta.id === "ws-legacy")?.runtimeConfig).toBeDefined();
+        expect(renameSpy).toHaveBeenCalled();
+        expect(warnSpy).toHaveBeenCalled();
+        expect(fs.readFileSync(configFile, "utf-8")).toBe(before);
+      } finally {
+        renameSpy.mockRestore();
+        errorSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+  });
+
   describe("editConfig", () => {
     it("serializes concurrent edits so no update is lost", async () => {
       // Regression: editConfig used to be a non-serialized read-modify-write
@@ -263,6 +3848,159 @@ describe("Config", () => {
         .projects.get("/repo")?.workspaces;
       expect(workspaces?.map((w) => w.taskStatus)).toEqual(["running", "running"]);
     });
+
+    it("keeps call order for edits that waited for the registration lock", async () => {
+      // Another process holds the registration file lock; edits issued meanwhile step out of
+      // the queue to wait for it. Each polls the lock, which is not fair, so left to
+      // themselves a later edit could take it first and an earlier edit then overwrite it:
+      // rapid true→false preference updates would persist true.
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      // Real writes, recorded: each edit spreads a new object, so the recorded arguments
+      // keep the value each write carried.
+      const saveConfig = spyOn(
+        config as unknown as {
+          saveConfig: (cfg: { heartbeatDefaultIntervalMs?: number }) => unknown;
+        },
+        "saveConfig"
+      );
+      const setInterval = (value: number) =>
+        config.editConfig((cfg) => ({ ...cfg, heartbeatDefaultIntervalMs: value * 60_000 }));
+      // Three edits while the first is still in its slot, three more once it has stepped out
+      // and is waiting; the order must hold across both.
+      const edits = [setInterval(1), setInterval(2), setInterval(3)];
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(saveConfig).not.toHaveBeenCalled();
+      edits.push(setInterval(4), setInterval(5), setInterval(6));
+      await otherProcess[Symbol.asyncDispose]();
+      await Promise.all(edits);
+
+      expect(saveConfig.mock.calls.map(([cfg]) => cfg.heartbeatDefaultIntervalMs)).toEqual([
+        60_000, 120_000, 180_000, 240_000, 300_000, 360_000,
+      ]);
+      expect(new Config(tempDir).loadConfigOrDefault().heartbeatDefaultIntervalMs).toBe(360_000);
+    });
+
+    it("invokes the edit callback exactly once, with or without waiting for the lock", async () => {
+      // Callbacks are not pure: TaskService.editWorkspaceEntry runs a caller-supplied updater
+      // inside one, and others record results into captured state. A discarded first run
+      // would let those side effects escape twice.
+      let calls = 0;
+      const count = (cfg: Parameters<Parameters<Config["editConfig"]>[0]>[0]) => {
+        calls += 1;
+        return cfg;
+      };
+      await config.editConfig(count);
+      expect(calls).toBe(1);
+
+      const otherProcess = await acquireProcessFileLock({
+        lockPath: projectRegistrationLockFilePath(tempDir),
+        timeoutMs: 5_000,
+        label: "test holder",
+      });
+      const waiting = config.editConfig(count);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(calls).toBe(1);
+      await otherProcess[Symbol.asyncDispose]();
+      await waiting;
+      expect(calls).toBe(2);
+    });
+  });
+
+  describe("configFileWriteGeneration", () => {
+    it("differs between two saves of the same content", async () => {
+      const configFile = path.join(tempDir, "config.json");
+      const withoutStamp = () => {
+        const { writeId, ...rest } = JSON.parse(fs.readFileSync(configFile, "utf-8")) as {
+          writeId: unknown;
+        };
+        expect(typeof writeId).toBe("string");
+        return rest;
+      };
+      // The first save also persists load-time migrations; the two compared are steady-state.
+      await flushConfigEdits();
+      await config.editConfig((cfg) => cfg);
+      const first = await config.configFileWriteGeneration();
+      const firstContent = withoutStamp();
+      await config.editConfig((cfg) => cfg);
+      // Nothing but the stamp changed, and the stamp is what tells the two writes apart — a
+      // reader comparing generations around a window sees the second save even where mtime
+      // granularity and inode reuse would make the file look untouched.
+      expect(withoutStamp()).toEqual(firstContent);
+      expect(await config.configFileWriteGeneration()).not.toBe(first);
+      expect(
+        await new Config(
+          fs.mkdtempSync(path.join(os.tmpdir(), "mux-test-"))
+        ).configFileWriteGeneration()
+      ).toBe("absent");
+    });
+  });
+
+  describe("display-only legacy AI settings", () => {
+    it.each([false, true])(
+      "does not persist synthesized buckets (legacy metadata: %s)",
+      async (legacyMetadata) => {
+        const projectPath = path.join(tempDir, "repo");
+        const legacySettings = { model: "openai:gpt-5.2", thinkingLevel: "high" as const };
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, {
+            workspaces: [
+              {
+                path: projectPath,
+                ...(legacyMetadata ? {} : { id: "legacy-ai", name: "legacy-ai" }),
+                agentId: "plan",
+                aiSettings: legacySettings,
+              },
+            ],
+          });
+          return cfg;
+        });
+        if (legacyMetadata) {
+          const sessionDir = path.join(config.sessionsDir, "repo");
+          fs.mkdirSync(sessionDir, { recursive: true });
+          fs.writeFileSync(
+            path.join(sessionDir, "metadata.json"),
+            JSON.stringify({ id: "legacy-ai", name: "legacy-ai" })
+          );
+        }
+        const metadata = await config.getAllWorkspaceMetadata();
+        expect(metadata[0]?.aiSettingsByAgent).toEqual({
+          exec: legacySettings,
+          plan: legacySettings,
+        });
+        expect(
+          config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0].aiSettingsByAgent
+        ).toBeUndefined();
+        expect((await config.getAllWorkspaceMetadata())[0]?.aiSettingsByAgent).toEqual(
+          metadata[0]?.aiSettingsByAgent
+        );
+        expect(
+          config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0].aiSettingsByAgent
+        ).toBeUndefined();
+      }
+    );
+
+    it("still migrates genuine per-agent settings from legacy metadata", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      const exec = { model: "openai:gpt-5.2", thinkingLevel: "high" as const };
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { workspaces: [{ path: projectPath }] });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "repo");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "metadata.json"),
+        JSON.stringify({ id: "legacy-ai", name: "legacy-ai", aiSettingsByAgent: { exec } })
+      );
+      await config.getAllWorkspaceMetadata();
+      expect(
+        config.loadConfigOrDefault().projects.get(projectPath)?.workspaces[0].aiSettingsByAgent
+      ).toEqual({ exec });
+    });
   });
 
   describe("workspace tags", () => {
@@ -286,6 +4024,288 @@ describe("Config", () => {
       const metadata = await new Config(tempDir).getAllWorkspaceMetadata();
       const tagged = metadata.find((m) => m.id === "tagged-ws-1");
       expect(tagged?.tags).toEqual({ workItemKey: "issue-1-investigate" });
+    });
+  });
+
+  describe("strict structural validation (throwOnError)", () => {
+    // Destructive callers (extension-metadata pruning, orphan session-dir
+    // cleanup) must never receive a lenient-normalized empty/partial workspace
+    // view for a parseable but structurally invalid config: they would treat
+    // the omitted live workspaces as removed and delete their data.
+    const invalidShapes: Array<[string, unknown]> = [
+      ["non-array projects", { projects: {} }],
+      ["non-pair projects entry", { projects: ["not-a-pair"] }],
+      ["non-object project config", { projects: [["/repo", null]] }],
+      ["non-array workspaces", { projects: [["/repo", { workspaces: "bogus" }]] }],
+      // ProjectConfigSchema always persists `workspaces`; a present project
+      // entry without the key is mangled state that raw evidence flags as
+      // incomplete — strict mode must not vouch "authoritatively empty" for
+      // it (the prune would delete every snapshot of that project).
+      ["missing workspaces key", { projects: [["/repo", {}]] }],
+      // The lenient path-filter silently drops the WHOLE project for
+      // non-string keys (an empty key loads as "/" since #5917, but strict
+      // mode still fails closed on it), and an id-less legacy workspace inside it is
+      // raw-invisible too (its stable id lives only in session
+      // metadata.json) — strict mode must fail closed rather than hand the
+      // prune an id set missing that workspace.
+      ["null project key", { projects: [[null, { workspaces: [] }]] }],
+      ["empty-string project key", { projects: [["", { workspaces: [] }]] }],
+      // A truthy non-string workspace id would ride getAllWorkspaceMetadata's
+      // modern-entry branch as the authoritative id, omitting the workspace's
+      // REAL string identity from the prune's known set; non-object entries
+      // have no establishable identity at all.
+      ["non-object workspace entry", { projects: [["/repo", { workspaces: ["bogus"] }]] }],
+      [
+        "numeric workspace id",
+        { projects: [["/repo", { workspaces: [{ id: 42, path: "/repo/ws" }] }]] },
+      ],
+      [
+        "empty-string workspace id",
+        { projects: [["/repo", { workspaces: [{ id: "", path: "/repo/ws" }] }]] },
+      ],
+    ];
+
+    for (const [label, shape] of invalidShapes) {
+      it(`rejects ${label} in strict mode while lenient mode still loads`, async () => {
+        fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(shape));
+        const strictConfig = new Config(tempDir);
+        expect(() => strictConfig.loadConfigOrDefault({ throwOnError: true })).toThrow();
+        // try/catch instead of rejects.toThrow: the node-side type-aware lint
+        // flags awaiting bun's expect() chain as await-thenable.
+        let strictMetadataRejected = false;
+        try {
+          await new Config(tempDir).getAllWorkspaceMetadata({ throwOnError: true });
+        } catch {
+          strictMetadataRejected = true;
+        }
+        expect(strictMetadataRejected).toBe(true);
+        // Ordinary loads keep the historical self-healing behavior: they
+        // never throw for these shapes (normalized stubs may survive).
+        expect(() => new Config(tempDir).loadConfigOrDefault()).not.toThrow();
+      });
+    }
+
+    it("accepts an absent projects key in strict mode (healthy empty config)", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({ defaultProjectDir: "/tmp" })
+      );
+      const loaded = new Config(tempDir).loadConfigOrDefault({ throwOnError: true });
+      expect(loaded.projects.size).toBe(0);
+    });
+
+    it("keeps the canonical legacy identity when a secondary alias file is unreadable in lenient loads", async () => {
+      // An id-less legacy entry with a HEALTHY canonical (generated-legacy)
+      // metadata file and an unreadable basename-backed second candidate:
+      // lenient loads must keep the canonical identity instead of
+      // discarding it for skeletal path-id fallback metadata (which would
+      // surface the workspace under the WRONG id with its session history
+      // apparently missing). Strict enumeration still fails closed — the
+      // unreadable alias may hide a registered identity.
+      const projectPath = "/repo";
+      const workspacePath = "/repo/legacy-ws";
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [[projectPath, { workspaces: [{ path: workspacePath }] }]],
+          // Migration flags pre-seeded so the first load never schedules the
+          // async settings-migration persist mid-test.
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: { persistentSubagentsDefaulted: true, defaultModelFallbacksSeeded: true },
+        })
+      );
+      const config = new Config(tempDir);
+      const canonicalId = (
+        config as unknown as {
+          generateLegacyId(projectPath: string, workspacePath: string): string;
+        }
+      ).generateLegacyId(projectPath, workspacePath);
+      const canonicalDir = path.join(config.sessionsDir, canonicalId);
+      fs.mkdirSync(canonicalDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(canonicalDir, "metadata.json"),
+        JSON.stringify({ id: "stable-canonical-id", name: "legacy-ws" })
+      );
+      // Basename-backed second candidate is unreadable: a directory at the
+      // metadata.json path fails reads with EISDIR (non-ENOENT).
+      fs.mkdirSync(path.join(config.sessionsDir, "legacy-ws", "metadata.json"), {
+        recursive: true,
+      });
+
+      let strictRejected = false;
+      try {
+        await config.getAllWorkspaceMetadata({ throwOnError: true });
+      } catch {
+        strictRejected = true;
+      }
+      expect(strictRejected).toBe(true);
+
+      const lenient = await config.getAllWorkspaceMetadata();
+      const lenientIds = lenient.map((metadata) => metadata.id);
+      expect(lenientIds).toContain("stable-canonical-id");
+      expect(lenientIds).not.toContain(canonicalId);
+    });
+  });
+
+  describe("readPersistedWorkspaceIdSuperset", () => {
+    it("ignores nested workspaces arrays inside workspace entries", () => {
+      // Workspace entries (and unknown newer-build extension objects) can
+      // carry nested `workspaces`-keyed fields whose ids reference OTHER —
+      // including removed — workspaces. Treating them as registered would
+      // lift removed ids' tombstones and recreate stale metadata
+      // indefinitely; only `projects[*][1].workspaces` direct entries are
+      // registration evidence.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    id: "real-ws",
+                    path: "/repo/ws",
+                    workspaces: [{ id: "phantom-ws", path: "/x" }],
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      const evidence = new Config(tempDir).readPersistedWorkspaceIdEvidence();
+      expect([...evidence.ids]).toEqual(["real-ws"]);
+      expect(evidence.hasWorkspaceEntriesWithoutIds).toBe(false);
+    });
+
+    it("collects ids from entries that lenient normalization discards", () => {
+      // `[null, ...]` fails the project-path filter and vanishes from the
+      // normalized view; the raw superset must still surface its workspace id
+      // so destructive callers never treat that live workspace as removed.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [null, { workspaces: [{ id: "live-discarded", path: "/tmp/x" }] }],
+            ["/repo", { workspaces: [{ id: "live-normal", path: "/repo/ws", name: "ws" }] }],
+          ],
+        })
+      );
+      const superset = new Config(tempDir).readPersistedWorkspaceIdSuperset();
+      expect(superset.has("live-discarded")).toBe(true);
+      expect(superset.has("live-normal")).toBe(true);
+    });
+
+    it("resolves empty for a missing file and throws on unparseable content", () => {
+      expect(new Config(tempDir).readPersistedWorkspaceIdSuperset().size).toBe(0);
+      fs.writeFileSync(path.join(tempDir, "config.json"), "{not json");
+      expect(() => new Config(tempDir).readPersistedWorkspaceIdSuperset()).toThrow();
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(["array-root"]));
+      expect(() => new Config(tempDir).readPersistedWorkspaceIdSuperset()).toThrow();
+    });
+
+    it("collects only workspace-entry ids, not nested id-bearing objects", () => {
+      // Workspace entries carry nested id-bearing objects (e.g.
+      // taskPendingGuidance items) whose ids can reference OTHER — including
+      // removed — workspaces. Treating those as registered would corrupt
+      // registration evidence (aborted deletions, lifted tombstones) and
+      // unbound the activity scope.
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [
+            [
+              "/repo",
+              {
+                workspaces: [
+                  {
+                    id: "ws-live",
+                    path: "/repo/ws",
+                    taskPendingGuidance: [{ id: "removed-workspace-id", message: "hi" }],
+                    parentWorkspaceId: "some-parent",
+                  },
+                ],
+              },
+            ],
+          ],
+        })
+      );
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(["ws-live"]),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
+    });
+
+    it("reports whether any workspace entry lacks an inline id", () => {
+      // Completeness signal for registration evidence: with inline ids
+      // everywhere, the raw view is complete and callers may skip the
+      // per-workspace authoritative enumeration; a single id-less (legacy)
+      // entry means a raw-invisible stable id may exist.
+      const configPath = path.join(tempDir, "config.json");
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({
+          projects: [["/repo", { workspaces: [{ id: "modern", path: "/repo/ws" }] }]],
+        })
+      );
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(["modern"]),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
+      fs.writeFileSync(
+        configPath,
+        JSON.stringify({
+          projects: [
+            ["/repo", { workspaces: [{ id: "modern", path: "/repo/ws" }, { path: "/repo/old" }] }],
+          ],
+        })
+      );
+      const evidence = new Config(tempDir).readPersistedWorkspaceIdEvidence();
+      expect(evidence.hasWorkspaceEntriesWithoutIds).toBe(true);
+      expect(evidence.ids.has("modern")).toBe(true);
+      // A PRESENT but malformed (non-array) container is uninterpretable:
+      // the original entries may have been mangled, so the id set must not
+      // be treated as complete evidence for destructive decisions.
+      for (const malformed of [null, "mangled", 7]) {
+        fs.writeFileSync(
+          configPath,
+          JSON.stringify({ projects: [["/repo", { workspaces: malformed }]] })
+        );
+        expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+          ids: new Set(),
+          hasWorkspaceEntriesWithoutIds: true,
+        });
+      }
+      // Missing file: healthy empty evidence (fresh install).
+      fs.rmSync(configPath);
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
+      // Malformed OUTER structure is incomplete evidence too: a mangled
+      // projects container / pair / project config may be the remnant of
+      // real registrations. Only an absent projects key is healthy empty.
+      for (const projects of [
+        null,
+        {},
+        "mangled",
+        [null],
+        ["not-a-pair"],
+        [["/repo", null]],
+        [["/repo", ["array-config"]]],
+        [["/repo", {}]], // project config with no workspaces key at all
+      ]) {
+        fs.writeFileSync(configPath, JSON.stringify({ projects }));
+        expect(
+          new Config(tempDir).readPersistedWorkspaceIdEvidence().hasWorkspaceEntriesWithoutIds
+        ).toBe(true);
+      }
+      fs.writeFileSync(configPath, JSON.stringify({ defaultProjectDir: "/tmp" }));
+      expect(new Config(tempDir).readPersistedWorkspaceIdEvidence()).toEqual({
+        ids: new Set(),
+        hasWorkspaceEntriesWithoutIds: false,
+      });
     });
   });
 
@@ -538,10 +4558,8 @@ describe("Config", () => {
       });
 
       const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        migrations?: { userPreferencesInitialized?: unknown };
         userPreferences?: unknown;
       };
-      expect(raw.migrations?.userPreferencesInitialized).toBe(true);
       expect(raw.userPreferences).toEqual({
         appearance: { theme: "dark" },
         navigation: { projectOrder: ["/repo"] },
@@ -572,20 +4590,6 @@ describe("Config", () => {
       expect(raw.llmDebugLogs).toBe(true);
     });
 
-    it("treats existing user preferences as initialized for cross-origin sync", () => {
-      fs.writeFileSync(
-        path.join(tempDir, "config.json"),
-        JSON.stringify({
-          projects: [],
-          userPreferences: {
-            appearance: { theme: "flexoki-dark" },
-          },
-        })
-      );
-
-      expect(config.loadConfigOrDefault().migrations?.userPreferencesInitialized).toBe(true);
-    });
-
     it("normalizes invalid user preference values on load", () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
@@ -593,86 +4597,229 @@ describe("Config", () => {
           projects: [],
           userPreferences: {
             appearance: { theme: "legacy-light", transcriptDensity: "wide" },
-            notifications: { notifyOnResponseByWorkspace: { "ws-1": true, "ws-2": "yes" } },
+            review: { defaultBaseByProject: { "/repo/a": "main", "/repo/b": 42 } },
           },
         })
       );
 
       expect(config.loadConfigOrDefault().userPreferences).toEqual({
-        appearance: { theme: "light" },
-        notifications: { notifyOnResponseByWorkspace: { "ws-1": true } },
+        review: { defaultBaseByProject: { "/repo/a": "main" } },
       });
     });
-  });
 
-  describe("chat transcript settings", () => {
-    it("persists the full-width transcript flag", async () => {
-      await config.editConfig((cfg) => {
-        cfg.chatTranscriptFullWidth = true;
-        return cfg;
-      });
-
-      const restartedConfig = new Config(tempDir);
-      expect(restartedConfig.loadConfigOrDefault().chatTranscriptFullWidth).toBe(true);
-
-      const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        chatTranscriptFullWidth?: unknown;
-      };
-      expect(raw.chatTranscriptFullWidth).toBe(true);
-    });
-
-    it("omits the full-width transcript flag when disabled", async () => {
-      await config.editConfig((cfg) => {
-        cfg.chatTranscriptFullWidth = false;
-        return cfg;
-      });
-
-      const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        chatTranscriptFullWidth?: unknown;
-      };
-      expect(raw.chatTranscriptFullWidth).toBeUndefined();
-    });
-
-    it("ignores invalid full-width transcript values on load", () => {
+    // zod >= 4.5 strips `__proto__` keys in object and record parsers. JSON.parse makes
+    // such a key an own property, so a hand-edited config.json can carry one. Lenient
+    // loading must still drop only the bad entries and must not adopt the key as a
+    // prototype (no inherited project defaults, no polluted Object.prototype).
+    it("drops __proto__ keys and invalid entries from persisted preference records", () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
-        JSON.stringify({
-          projects: [],
-          chatTranscriptFullWidth: "yes",
-        })
+        `{
+          "projects": [],
+          "userPreferences": {
+            "__proto__": { "polluted": true },
+            "ai": {
+              "projectDefaults": {
+                "__proto__": { "agentId": "plan" },
+                "/repo": { "agentId": "exec" }
+              },
+              "autoCompactionThresholdByModel": { "__proto__": 70, "openai:gpt-4.1": 75, "bad": 101 }
+            }
+          }
+        }`
       );
 
-      expect(config.loadConfigOrDefault().chatTranscriptFullWidth).toBeUndefined();
+      const preferences = config.loadConfigOrDefault().userPreferences;
+
+      expect(preferences).toEqual({
+        ai: {
+          projectDefaults: { "/repo": { agentId: "exec" } },
+          autoCompactionThresholdByModel: { "openai:gpt-4.1": 75 },
+        },
+      });
+      const projectDefaults = preferences?.ai?.projectDefaults;
+      expect(projectDefaults && Object.getPrototypeOf(projectDefaults)).toBe(Object.prototype);
+      expect(Object.keys(projectDefaults ?? {})).toEqual(["/repo"]);
+      expect(Object.prototype).not.toHaveProperty("polluted");
     });
   });
 
-  describe("api server settings", () => {
-    it("should persist apiServerBindHost, apiServerPort, and apiServerServeWebUi", async () => {
-      await config.editConfig((cfg) => {
-        cfg.apiServerBindHost = "0.0.0.0";
-        cfg.apiServerPort = 3000;
-        cfg.apiServerServeWebUi = true;
-        return cfg;
+  it.each([
+    {
+      advisorModelString: "openai:gpt-5.6",
+      advisorThinkingLevel: "high",
+      advisorReasoningMode: "pro",
+      advisorMaxUsesPerTurn: 2,
+      advisorMaxOutputTokens: 1024,
+      advisorCyberReasoningMode: false,
+    },
+    {
+      advisorModelString: 42,
+      advisorThinkingLevel: { invalid: true },
+      advisorReasoningMode: "invalid",
+      advisorMaxUsesPerTurn: -1,
+      advisorMaxOutputTokens: "invalid",
+      advisorCyberReasoningMode: true,
+    },
+    {
+      advisorModelString: "openai:gpt-5.6",
+      advisorThinkingLevel: "high",
+      advisorReasoningMode: "standard",
+      advisorMaxUsesPerTurn: null,
+      advisorMaxOutputTokens: null,
+    },
+  ])("ignores legacy advisor settings without losing unrelated config: %j", async (legacy) => {
+    const doc = {
+      projects: [["/repo", { workspaces: [] }]],
+      defaultModel: "openai:gpt-5.6-sol",
+      userPreferences: { appearance: { theme: "flexoki-light" as const } },
+      agentAiDefaults: {
+        exec: {
+          modelString: "openai:gpt-5.6-sol",
+          enabled: true,
+          advisorEnabled:
+            legacy.advisorMaxUsesPerTurn != null && legacy.advisorMaxUsesPerTurn > 0
+              ? false
+              : "invalid",
+          subagent: { thinkingLevel: "high" },
+        },
+        plan: { advisorEnabled: true },
+      },
+      ...legacy,
+    };
+    // The removed feature needs no migration: generic disk-schema passthrough still
+    // preserves unknown root keys for config-tool writes and downgrade compatibility.
+    expect(AppConfigOnDiskSchema.parse(doc)).toMatchObject(legacy);
+    fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(doc));
+
+    const loaded = config.loadConfigOrDefault({ throwOnError: true });
+    expect(loaded.projects.has("/repo")).toBe(true);
+    expect(loaded.defaultModel).toBe(doc.defaultModel);
+    expect(loaded.userPreferences).toEqual(doc.userPreferences);
+    expect(loaded.agentAiDefaults?.exec).toMatchObject({
+      modelString: "openai:gpt-5.6-sol",
+      enabled: true,
+      subagent: { thinkingLevel: "high" },
+    });
+    expect(loaded.agentAiDefaults?.exec).not.toHaveProperty("advisorEnabled");
+    expect(loaded.agentAiDefaults).not.toHaveProperty("plan");
+    for (const key of Object.keys(legacy)) {
+      expect(loaded).not.toHaveProperty(key);
+      expect(config.getClientConfig()).not.toHaveProperty(key);
+    }
+
+    await config.saveUserConfig({ taskSettings: { maxParallelAgentTasks: 4 } });
+    const saved = new Config(tempDir).loadConfigOrDefault({ throwOnError: true });
+    expect(saved.projects.has("/repo")).toBe(true);
+    expect(saved.defaultModel).toBe(doc.defaultModel);
+    expect(saved.userPreferences).toEqual(doc.userPreferences);
+    expect(saved.agentAiDefaults).toEqual(loaded.agentAiDefaults);
+    expect(saved.taskSettings?.maxParallelAgentTasks).toBe(4);
+    const readDisk = () =>
+      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        agentAiDefaults: Record<string, Record<string, unknown>>;
+      };
+    const persisted = readDisk();
+    expect(persisted).toMatchObject(legacy);
+    expect(persisted.agentAiDefaults.exec.advisorEnabled).toEqual(
+      doc.agentAiDefaults.exec.advisorEnabled
+    );
+    expect(persisted.agentAiDefaults.plan).toEqual(doc.agentAiDefaults.plan);
+    expect(persisted).not.toHaveProperty("legacyAdvisorSettings");
+    expect(config.getClientConfig()).not.toHaveProperty("legacyAdvisorSettings");
+
+    // A fresh instance must recapture compatibility data while still allowing edits
+    // to the current defaults; neither advisor-only entries nor malformed flags run.
+    const reopened = new Config(tempDir);
+    await reopened.editConfig((current) => ({
+      ...current,
+      agentAiDefaults: {
+        ...current.agentAiDefaults,
+        exec: { ...current.agentAiDefaults?.exec, thinkingLevel: "medium" },
+      },
+    }));
+    const rewritten = readDisk();
+    expect(rewritten).toMatchObject(legacy);
+    expect(rewritten.agentAiDefaults.exec).toMatchObject({
+      thinkingLevel: "medium",
+      advisorEnabled: doc.agentAiDefaults.exec.advisorEnabled,
+    });
+    expect(rewritten.agentAiDefaults.plan).toEqual(doc.agentAiDefaults.plan);
+    const reloaded = new Config(tempDir).loadConfigOrDefault({ throwOnError: true });
+    expect(reloaded.agentAiDefaults?.exec?.thinkingLevel).toBe("medium");
+    expect(reloaded.agentAiDefaults?.exec).not.toHaveProperty("advisorEnabled");
+    expect(reloaded.agentAiDefaults).not.toHaveProperty("plan");
+  });
+
+  describe("API config mutations", () => {
+    it("normalizes saves while preserving omitted settings", async () => {
+      await config.editConfig((current) => ({
+        ...current,
+        userPreferences: { appearance: { theme: "flexoki-light" } },
+        taskSettings: {
+          ...DEFAULT_TASK_SETTINGS,
+          preserveSubagentsUntilArchive: true,
+          proposePlanImplementReplacesChatHistory: true,
+        },
+      }));
+
+      await config.saveUserConfig({
+        taskSettings: { maxParallelAgentTasks: 4, maxTaskNestingDepth: 5 },
+        agentAiDefaults: {
+          foo: {
+            modelString: "anthropic:claude-3-5-sonnet",
+            thinkingLevel: "high",
+            enabled: true,
+            subagent: {
+              modelString: "openai:gpt-5.6-sol",
+              thinkingLevel: "xhigh",
+              reasoningMode: "pro",
+            },
+          },
+        },
       });
 
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.apiServerBindHost).toBe("0.0.0.0");
-      expect(loaded.apiServerPort).toBe(3000);
-      expect(loaded.apiServerServeWebUi).toBe(true);
+      const saved = config.loadConfigOrDefault();
+      expect(saved.userPreferences).toEqual({ appearance: { theme: "flexoki-light" } });
+      expect(saved.taskSettings).toMatchObject({
+        maxParallelAgentTasks: 4,
+        maxTaskNestingDepth: 5,
+        preserveSubagentsUntilArchive: true,
+        proposePlanImplementReplacesChatHistory: true,
+      });
+      expect(saved.agentAiDefaults?.foo?.subagent?.reasoningMode).toBe("pro");
     });
 
-    it("should ignore invalid apiServerPort values on load", () => {
-      const configFile = path.join(tempDir, "config.json");
-      fs.writeFileSync(
-        configFile,
-        JSON.stringify({
-          projects: [],
-          apiServerPort: 70000,
-        })
-      );
+    it("normalizes model and runtime mutations", async () => {
+      await config.updateModelPreferences({
+        defaultModel: " openai:gpt-5.6-sol ",
+        hiddenModels: ["anthropic:claude-sonnet-4-5", "anthropic:claude-sonnet-4-5", ""],
+      });
+      await config.updateRuntimeEnablement({
+        runtimeEnablement: { local: true, worktree: false },
+        defaultRuntime: "worktree",
+      });
 
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.apiServerPort).toBeUndefined();
+      const saved = config.loadConfigOrDefault();
+      expect(saved.defaultModel).toBe("openai:gpt-5.6-sol");
+      expect(saved.hiddenModels).toEqual(["anthropic:claude-sonnet-4-5"]);
+      expect(saved.runtimeEnablement).toEqual({ worktree: false });
+      expect(saved.defaultRuntime).toBe("worktree");
+    });
+
+    it("rejects invalid route overrides before saving", async () => {
+      let thrown: unknown;
+      try {
+        await config.updateRoutePreferences({
+          routePriority: ["openai"],
+          routeOverrides: { "openai:gpt-5.6-sol": "missing" },
+          validateRouteOverrides: () => ({ success: false, error: "invalid route" }),
+        });
+      } catch (error) {
+        thrown = error;
+      }
+      expect((thrown as Error).message).toBe("invalid route");
+      expect(config.loadConfigOrDefault().routePriority).toBeUndefined();
     });
   });
 
@@ -706,7 +4853,7 @@ describe("Config", () => {
 
   describe("legacy Chat with Mux cleanup", () => {
     const shippedProjectPath = "/home/user/.mux/system/Mux";
-    const shuxProjectPath = "/home/user/.shux/system/Shux";
+    const xumProjectPath = "/home/user/.xum/system/Xum";
 
     function shippedMuxChatWorkspace(projectPath: string) {
       return {
@@ -718,13 +4865,13 @@ describe("Config", () => {
       };
     }
 
-    function shuxGenerationChatWorkspace(projectPath: string) {
+    function xumGenerationChatWorkspace(projectPath: string) {
       return {
         path: projectPath,
         id: "mux-chat",
-        name: "chat-with-shux",
-        title: "Chat with Shux",
-        agentId: "shux",
+        name: "chat-with-xum",
+        title: "Chat with Xum",
+        agentId: "xum",
       };
     }
 
@@ -755,16 +4902,16 @@ describe("Config", () => {
       expect(persisted).not.toContain("mux-chat");
     });
 
-    it("removes later shux-branded leftovers as well", () => {
+    it("removes later xum-branded leftovers as well", () => {
       const configFile = path.join(tempDir, "config.json");
       fs.writeFileSync(
         configFile,
         JSON.stringify({
           projects: [
             [
-              shuxProjectPath,
+              xumProjectPath,
               {
-                workspaces: [shuxGenerationChatWorkspace(shuxProjectPath)],
+                workspaces: [xumGenerationChatWorkspace(xumProjectPath)],
                 projectKind: "system",
               },
             ],
@@ -773,7 +4920,7 @@ describe("Config", () => {
       );
 
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.projects.has(shuxProjectPath)).toBe(false);
+      expect(loaded.projects.has(xumProjectPath)).toBe(false);
     });
 
     it("removes stale entries left under other mux roots", () => {
@@ -937,7 +5084,10 @@ describe("Config", () => {
         JSON.stringify({
           projects: [],
           // Keep this test focused on normalization, not default seeding.
-          migrations: { defaultModelFallbacksSeeded: true },
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
           modelFallbacks: {
             // Gateway-prefixed key + non-string chain entries + unknown trigger.
             "openrouter:anthropic/claude-opus-4-6": {
@@ -967,14 +5117,25 @@ describe("Config", () => {
 
   describe("default model fallbacks seeding", () => {
     const FABLE = KNOWN_MODELS.FABLE.id;
-    const OPUS = KNOWN_MODELS.OPUS.id;
+    const LEGACY_FABLE = "anthropic:claude-fable-5";
+    // The shipped chain target is pinned to Opus 5, not the moving
+    // KNOWN_MODELS.OPUS alias (see DEFAULT_MODEL_FALLBACKS).
+    const OPUS = "anthropic:claude-opus-5";
+    // Fresh-install-only chain (#5087): both ids are pinned literals.
+    const SONNET_5_5 = "anthropic:claude-sonnet-5-5";
+    const SONNET_5 = "anthropic:claude-sonnet-5";
     const configFilePath = () => path.join(tempDir, "config.json");
 
     it("seeds the default chain once on first load and persists the migration flag", async () => {
       fs.writeFileSync(configFilePath(), JSON.stringify({ projects: [] }));
 
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.modelFallbacks).toEqual({ [FABLE]: { models: [OPUS] } });
+      // The original seed pass also carries the legacy Fable 5 chain so a
+      // downgraded build (whose FABLE is Fable 5) still finds its default.
+      expect(loaded.modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE]: { models: [OPUS] },
+      });
       expect(loaded.migrations?.defaultModelFallbacksSeeded).toBe(true);
 
       // Seed is written back so the flag survives restarts even without saves.
@@ -983,7 +5144,10 @@ describe("Config", () => {
         modelFallbacks?: unknown;
         migrations?: { defaultModelFallbacksSeeded?: unknown };
       };
-      expect(raw.modelFallbacks).toEqual({ [FABLE]: { models: [OPUS] } });
+      expect(raw.modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE]: { models: [OPUS] },
+      });
       expect(raw.migrations?.defaultModelFallbacksSeeded).toBe(true);
     });
 
@@ -992,11 +5156,68 @@ describe("Config", () => {
         configFilePath(),
         JSON.stringify({
           projects: [],
-          migrations: { defaultModelFallbacksSeeded: true },
+          migrations: {
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
         })
       );
 
       expect(config.loadConfigOrDefault().modelFallbacks).toBeUndefined();
+    });
+
+    it("seeds the Fable 5.1 chain once for configs seeded before the 5.1 promotion", async () => {
+      // Pre-5.1 configs carry a chain only for the old source key
+      // (anthropic:claude-fable-5); the promoted FABLE key must get its own
+      // one-time seed without touching the legacy chain (the legacy default
+      // is only added while the original seed pass itself runs).
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          migrations: { defaultModelFallbacksSeeded: true },
+          modelFallbacks: {
+            "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
+          },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.modelFallbacks).toEqual({
+        "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
+        [FABLE]: { models: [OPUS] },
+      });
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
+
+      await flushConfigEdits();
+      const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
+        modelFallbacks?: unknown;
+        migrations?: { defaultModelFallbacksSeededFable51?: unknown };
+      };
+      expect(raw.modelFallbacks).toEqual({
+        "anthropic:claude-fable-5": { models: ["anthropic:claude-opus-4-8"] },
+        [FABLE]: { models: [OPUS] },
+      });
+      expect(raw.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
+    });
+
+    it("does not overwrite an existing Fable 5.1 chain during the 5.1 re-seed", () => {
+      fs.writeFileSync(
+        configFilePath(),
+        JSON.stringify({
+          projects: [],
+          migrations: { defaultModelFallbacksSeeded: true },
+          modelFallbacks: {
+            [FABLE]: { models: ["openai:gpt-5.5"] },
+          },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.modelFallbacks).toEqual({
+        [FABLE]: { models: ["openai:gpt-5.5"] },
+      });
+      expect(loaded.migrations?.defaultModelFallbacksSeededFable51).toBe(true);
     });
 
     it("merges the seeded default with pre-existing chains for other source models", async () => {
@@ -1013,6 +5234,7 @@ describe("Config", () => {
       const loaded = config.loadConfigOrDefault();
       expect(loaded.modelFallbacks).toEqual({
         "anthropic:claude-opus-4-6": { models: ["openai:gpt-5.5"] },
+        [LEGACY_FABLE]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
       });
 
@@ -1024,6 +5246,7 @@ describe("Config", () => {
       };
       expect(raw.modelFallbacks).toEqual({
         "anthropic:claude-opus-4-6": { models: ["openai:gpt-5.5"] },
+        [LEGACY_FABLE]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
       });
       expect(raw.migrations?.defaultModelFallbacksSeeded).toBe(true);
@@ -1035,7 +5258,7 @@ describe("Config", () => {
         JSON.stringify({
           projects: [],
           modelFallbacks: {
-            "openrouter:anthropic/claude-fable-5": { models: ["openai:gpt-5.5"] },
+            "openrouter:anthropic/claude-fable-5-1": { models: ["openai:gpt-5.5"] },
           },
         })
       );
@@ -1044,6 +5267,7 @@ describe("Config", () => {
       // the seed must treat it as configured and leave the user's chain alone.
       expect(config.loadConfigOrDefault().modelFallbacks).toEqual({
         [FABLE]: { models: ["openai:gpt-5.5"] },
+        [LEGACY_FABLE]: { models: [OPUS] },
       });
     });
 
@@ -1061,10 +5285,15 @@ describe("Config", () => {
       const loaded = config.loadConfigOrDefault();
       // The entry sanitizes to nothing at runtime (no fallback fires), but it
       // is still user intent: the seed must not replace it with an enabled
-      // default chain, and the raw on-disk form must survive.
-      expect(loaded.modelFallbacks).toBeUndefined();
+      // default chain, and the raw on-disk form must survive. Only the
+      // untouched legacy key gets seeded.
+      expect(loaded.modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
+      });
       expect(loaded.migrations?.defaultModelFallbacksSeeded).toBe(true);
 
+      // Raw file read before the async write-back flushes: the tombstone's
+      // on-disk form must survive untouched.
       const raw = JSON.parse(fs.readFileSync(configFilePath(), "utf-8")) as {
         modelFallbacks?: unknown;
       };
@@ -1105,13 +5334,16 @@ describe("Config", () => {
       const loaded = config.loadConfigOrDefault();
       expect(loaded.modelFallbacks).toEqual({
         [FABLE]: { enabled: false, models: ["openai:gpt-5.5"] },
+        [LEGACY_FABLE]: { models: [OPUS] },
       });
       expect(loaded.migrations?.defaultModelFallbacksSeeded).toBe(true);
     });
 
     it("applies the defaults to fresh installs and locks the flag on first save", async () => {
       expect(config.loadConfigOrDefault().modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
         [FABLE]: { models: [OPUS] },
+        [SONNET_5_5]: { models: [SONNET_5] },
       });
 
       await config.editConfig((cfg) => cfg);
@@ -1120,372 +5352,71 @@ describe("Config", () => {
         modelFallbacks?: unknown;
         migrations?: { defaultModelFallbacksSeeded?: unknown };
       };
-      expect(raw.modelFallbacks).toEqual({ [FABLE]: { models: [OPUS] } });
+      expect(raw.modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE]: { models: [OPUS] },
+        [SONNET_5_5]: { models: [SONNET_5] },
+      });
       expect(raw.migrations?.defaultModelFallbacksSeeded).toBe(true);
-    });
-  });
 
-  describe("update channel preference", () => {
-    it("defaults to stable when no channel is configured", () => {
-      expect(config.getUpdateChannel()).toBe("stable");
-    });
-
-    it("persists nightly channel selection", async () => {
-      await config.setUpdateChannel("nightly");
-
-      const restartedConfig = new Config(tempDir);
-      expect(restartedConfig.getUpdateChannel()).toBe("nightly");
-
-      const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        updateChannel?: unknown;
-      };
-      expect(raw.updateChannel).toBe("nightly");
-    });
-
-    it("persists explicit stable channel selection", async () => {
-      await config.setUpdateChannel("nightly");
-      await config.setUpdateChannel("stable");
-
-      const restartedConfig = new Config(tempDir);
-      expect(restartedConfig.getUpdateChannel()).toBe("stable");
-
-      const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        updateChannel?: unknown;
-      };
-      expect(raw.updateChannel).toBe("stable");
-    });
-  });
-
-  describe("server GitHub owner auth setting", () => {
-    it("persists serverAuthGithubOwner", async () => {
-      await config.editConfig((cfg) => {
-        cfg.serverAuthGithubOwner = "octocat";
-        return cfg;
+      // A later load (e.g. after a downgrade and re-upgrade) keeps exactly
+      // the one chain per source model; nothing is re-seeded or duplicated.
+      expect(new Config(tempDir).loadConfigOrDefault().modelFallbacks).toEqual({
+        [LEGACY_FABLE]: { models: [OPUS] },
+        [FABLE]: { models: [OPUS] },
+        [SONNET_5_5]: { models: [SONNET_5] },
       });
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.serverAuthGithubOwner).toBe("octocat");
-      expect(config.getServerAuthGithubOwner()).toBe("octocat");
     });
 
-    it("ignores empty serverAuthGithubOwner values on load", () => {
-      const configFile = path.join(tempDir, "config.json");
+    it.each([
+      [
+        "fully seeded",
+        { defaultModelFallbacksSeeded: true, defaultModelFallbacksSeededFable51: true },
+      ],
+      ["seeded before the Fable 5.1 promotion", { defaultModelFallbacksSeeded: true }],
+      ["never seeded", undefined],
+    ])("does not add the Sonnet 5.5 chain to an existing %s config", (_label, migrations) => {
+      // Maintainer decision on #5087: the Sonnet 5.5 chain ships to fresh
+      // installs only, with no migration and no new flag. The one-time
+      // seed passes that existing configs still run must not carry it.
       fs.writeFileSync(
-        configFile,
+        configFilePath(),
         JSON.stringify({
           projects: [],
-          serverAuthGithubOwner: "   ",
+          ...(migrations ? { migrations } : {}),
+          modelFallbacks: { [FABLE]: { models: ["openai:gpt-5.5"] } },
         })
       );
 
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.serverAuthGithubOwner).toBeUndefined();
+      expect(loaded.modelFallbacks?.[SONNET_5_5]).toBeUndefined();
+      expect(loaded.modelFallbacks?.[FABLE]).toEqual({ models: ["openai:gpt-5.5"] });
     });
   });
 
-  describe("top-level settings loading", () => {
-    it("loads top-level settings even when projects is missing", () => {
-      const configFile = path.join(tempDir, "config.json");
-      fs.writeFileSync(
-        configFile,
-        JSON.stringify({
-          muxGovernorUrl: "https://governor.example.com",
-          terminalDefaultShell: "zsh",
-        })
-      );
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.projects.size).toBe(0);
-      expect(loaded.muxGovernorUrl).toBe("https://governor.example.com");
-      expect(loaded.terminalDefaultShell).toBe("zsh");
-    });
-
-    it("round-trips the legacy 1Password account name across unrelated saves", async () => {
-      const configFile = path.join(tempDir, "config.json");
-      fs.writeFileSync(
-        configFile,
-        JSON.stringify({ onePasswordAccountName: "my-team.1password.com" })
-      );
-
-      await config.editConfig((current) => ({
-        ...current,
-        terminalDefaultShell: "zsh",
-      }));
-
-      const raw = JSON.parse(fs.readFileSync(configFile, "utf-8")) as Record<string, unknown>;
-      expect(raw.onePasswordAccountName).toBe("my-team.1password.com");
-      expect(raw.terminalDefaultShell).toBe("zsh");
-    });
-  });
-
-  describe("coderWorkspaceArchiveBehavior", () => {
-    const readRawArchiveConfig = () =>
-      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        coderWorkspaceArchiveBehavior?: unknown;
-        stopCoderWorkspaceOnArchive?: unknown;
-        terminalDefaultShell?: unknown;
+  describe("agent AI defaults canonical shape", () => {
+    it("round-trips explicit Exec overrides even when they equal global defaults", async () => {
+      const profile = {
+        modelString: "openai:gpt-5.6-sol",
+        thinkingLevel: "high" as const,
+        reasoningMode: "standard" as const,
       };
-
-    const legacyBooleanForBehavior = (behavior: string): false | undefined =>
-      behavior === "keep" ? false : undefined;
-
-    for (const behavior of CODER_ARCHIVE_BEHAVIORS) {
-      it(`loads the new enum value ${behavior}`, () => {
-        fs.writeFileSync(
-          path.join(tempDir, "config.json"),
-          JSON.stringify({
-            projects: [],
-            coderWorkspaceArchiveBehavior: behavior,
-          })
-        );
-
-        const loaded = config.loadConfigOrDefault();
-        expect(loaded.coderWorkspaceArchiveBehavior).toBe(behavior);
-        expect(loaded.stopCoderWorkspaceOnArchive).toBe(legacyBooleanForBehavior(behavior));
-      });
-    }
-
-    it("resolves legacy false to keep when the enum is missing", () => {
-      fs.writeFileSync(
-        path.join(tempDir, "config.json"),
-        JSON.stringify({
-          projects: [],
-          stopCoderWorkspaceOnArchive: false,
-        })
+      await config.updateAgentAiDefaults({ exec: { ...profile, subagent: profile } });
+      expect(new Config(tempDir).loadConfigOrDefault().agentAiDefaults?.exec?.subagent).toEqual(
+        profile
       );
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.coderWorkspaceArchiveBehavior).toBe("keep");
-      expect(loaded.stopCoderWorkspaceOnArchive).toBe(false);
-    });
-
-    it("resolves legacy true or undefined to stop when the enum is missing", () => {
-      fs.writeFileSync(
-        path.join(tempDir, "config.json"),
-        JSON.stringify({
-          projects: [],
-          stopCoderWorkspaceOnArchive: true,
-        })
-      );
-      expect(config.loadConfigOrDefault().coderWorkspaceArchiveBehavior).toBe(
-        DEFAULT_CODER_ARCHIVE_BEHAVIOR
-      );
-
-      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify({ projects: [] }));
-      expect(config.loadConfigOrDefault().coderWorkspaceArchiveBehavior).toBe(
-        DEFAULT_CODER_ARCHIVE_BEHAVIOR
+      await config.editConfig((cfg) => cfg);
+      expect(new Config(tempDir).loadConfigOrDefault().agentAiDefaults?.exec?.subagent).toEqual(
+        profile
       );
     });
 
-    it("prefers the new enum when both fields are present", () => {
-      fs.writeFileSync(
-        path.join(tempDir, "config.json"),
-        JSON.stringify({
-          projects: [],
-          coderWorkspaceArchiveBehavior: "delete",
-          stopCoderWorkspaceOnArchive: false,
-        })
-      );
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.coderWorkspaceArchiveBehavior).toBe("delete");
-      expect(loaded.stopCoderWorkspaceOnArchive).toBeUndefined();
-    });
-
-    it("falls back to stop when the enum value is invalid", () => {
-      fs.writeFileSync(
-        path.join(tempDir, "config.json"),
-        JSON.stringify({
-          projects: [],
-          coderWorkspaceArchiveBehavior: "hibernate",
-          terminalDefaultShell: "zsh",
-        })
-      );
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.coderWorkspaceArchiveBehavior).toBe(DEFAULT_CODER_ARCHIVE_BEHAVIOR);
-      expect(loaded.stopCoderWorkspaceOnArchive).toBeUndefined();
-      expect(loaded.terminalDefaultShell).toBe("zsh");
-    });
-
-    it("enum field takes precedence over legacy boolean on save", async () => {
-      // Simulate: user had "keep" (legacy false), then switches to "stop" via the new enum.
-      await config.editConfig((c) => ({
-        ...c,
-        coderWorkspaceArchiveBehavior: "stop",
-        stopCoderWorkspaceOnArchive: false,
-      }));
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.coderWorkspaceArchiveBehavior).toBe("stop");
-    });
-
-    it("round-trips each behavior with the enum field and legacy shim", async () => {
-      for (const behavior of CODER_ARCHIVE_BEHAVIORS) {
-        await config.editConfig((cfg) => {
-          cfg.coderWorkspaceArchiveBehavior = behavior;
-          cfg.stopCoderWorkspaceOnArchive = legacyBooleanForBehavior(behavior);
-          return cfg;
-        });
-
-        const raw = readRawArchiveConfig();
-        expect(raw.coderWorkspaceArchiveBehavior).toBe(behavior);
-        expect(raw.stopCoderWorkspaceOnArchive).toBe(legacyBooleanForBehavior(behavior));
-
-        const reloaded = new Config(tempDir).loadConfigOrDefault();
-        expect(reloaded.coderWorkspaceArchiveBehavior).toBe(behavior);
-        expect(reloaded.stopCoderWorkspaceOnArchive).toBe(legacyBooleanForBehavior(behavior));
-      }
-    });
-  });
-
-  describe("worktreeArchiveBehavior", () => {
-    const readRawArchiveConfig = () =>
-      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        worktreeArchiveBehavior?: unknown;
-        deleteWorktreeOnArchive?: unknown;
-      };
-
-    for (const behavior of WORKTREE_ARCHIVE_BEHAVIORS) {
-      it(`loads the new enum value ${behavior}`, () => {
-        fs.writeFileSync(
-          path.join(tempDir, "config.json"),
-          JSON.stringify({
-            projects: [],
-            worktreeArchiveBehavior: behavior,
-          })
-        );
-
-        const loaded = config.loadConfigOrDefault();
-        expect(loaded.worktreeArchiveBehavior).toBe(behavior);
-        expect(loaded.deleteWorktreeOnArchive).toBe(behavior === "delete");
-      });
-    }
-
-    it("resolves legacy delete boolean when the enum is missing", () => {
-      fs.writeFileSync(
-        path.join(tempDir, "config.json"),
-        JSON.stringify({
-          projects: [],
-          deleteWorktreeOnArchive: true,
-        })
-      );
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.worktreeArchiveBehavior).toBe("delete");
-      expect(loaded.deleteWorktreeOnArchive).toBe(true);
-    });
-
-    it("defaults to keep when the enum is missing and the legacy boolean is false/undefined", () => {
-      fs.writeFileSync(
-        path.join(tempDir, "config.json"),
-        JSON.stringify({
-          projects: [],
-          deleteWorktreeOnArchive: false,
-        })
-      );
-      expect(config.loadConfigOrDefault().worktreeArchiveBehavior).toBe(
-        DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR
-      );
-
-      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify({ projects: [] }));
-      expect(config.loadConfigOrDefault().worktreeArchiveBehavior).toBe(
-        DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR
-      );
-    });
-
-    it("round-trips each behavior with the enum field and legacy shim", async () => {
-      for (const behavior of WORKTREE_ARCHIVE_BEHAVIORS) {
-        await config.editConfig((cfg) => {
-          cfg.worktreeArchiveBehavior = behavior;
-          cfg.deleteWorktreeOnArchive = behavior === "delete";
-          return cfg;
-        });
-
-        const raw = readRawArchiveConfig();
-        expect(raw.worktreeArchiveBehavior).toBe(behavior);
-        expect(raw.deleteWorktreeOnArchive).toBe(behavior === "delete");
-
-        const reloaded = new Config(tempDir).loadConfigOrDefault();
-        expect(reloaded.worktreeArchiveBehavior).toBe(behavior);
-        expect(reloaded.deleteWorktreeOnArchive).toBe(behavior === "delete");
-      }
-    });
-  });
-
-  describe("model preferences", () => {
-    it("should preserve explicit gateway-scoped defaultModel and hiddenModels", async () => {
-      await config.editConfig((cfg) => {
-        cfg.defaultModel = "mux-gateway:openai/gpt-4o";
-        cfg.hiddenModels = [
-          " mux-gateway:openai/gpt-4o-mini ",
-          "invalid-model",
-          "openai:gpt-4o-mini",
-        ];
-        return cfg;
-      });
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.defaultModel).toBe("mux-gateway:openai/gpt-4o");
-      expect(loaded.hiddenModels).toEqual(["mux-gateway:openai/gpt-4o-mini", "openai:gpt-4o-mini"]);
-    });
-
-    it("preserves explicit gateway-prefixed model strings on load", () => {
-      const configFile = path.join(tempDir, "config.json");
-      fs.writeFileSync(
-        configFile,
-        JSON.stringify({
-          projects: [],
-          defaultModel: "mux-gateway:openai/gpt-4o",
-          hiddenModels: ["mux-gateway:openai/gpt-4o-mini"],
-        })
-      );
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.defaultModel).toBe("mux-gateway:openai/gpt-4o");
-      expect(loaded.hiddenModels).toEqual(["mux-gateway:openai/gpt-4o-mini"]);
-    });
-
-    it("rejects malformed mux-gateway model strings on load", () => {
-      const configFile = path.join(tempDir, "config.json");
-      fs.writeFileSync(
-        configFile,
-        JSON.stringify({
-          projects: [],
-          defaultModel: "mux-gateway:openai", // missing "/model"
-          hiddenModels: ["mux-gateway:openai", "openai:gpt-4o-mini"],
-        })
-      );
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.defaultModel).toBeUndefined();
-      expect(loaded.hiddenModels).toEqual(["openai:gpt-4o-mini"]);
-    });
-
-    it("ignores invalid model preference values on load", () => {
-      const configFile = path.join(tempDir, "config.json");
-      fs.writeFileSync(
-        configFile,
-        JSON.stringify({
-          projects: [],
-          defaultModel: "gpt-4o", // missing provider
-          hiddenModels: ["openai:gpt-4o-mini", "bad"],
-        })
-      );
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.defaultModel).toBeUndefined();
-      expect(loaded.hiddenModels).toEqual(["openai:gpt-4o-mini"]);
-    });
-  });
-
-  describe("agent AI defaults model normalization", () => {
     it("preserves explicit gateway-scoped model strings in nested AI defaults", async () => {
       await config.editConfig((cfg) => {
         cfg.agentAiDefaults = {
           exec: { modelString: " openrouter:openai/gpt-5 ", thinkingLevel: "high" },
           worker: {
-            modelString: " mux-gateway:anthropic/claude-haiku-4-5 ",
+            modelString: " github-copilot:claude-haiku-4.5 ",
             thinkingLevel: "low",
           },
         };
@@ -1493,35 +5424,35 @@ describe("Config", () => {
       });
 
       const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        agentAiDefaults?: Record<string, { modelString?: string }>;
-        subagentAiDefaults?: Record<string, { modelString?: string }>;
+        agentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: string }>;
+        subagentAiDefaults?: Record<string, { modelString?: string; thinkingLevel?: string }>;
       };
 
       expect(raw.agentAiDefaults).toEqual({
         exec: { modelString: "openrouter:openai/gpt-5", thinkingLevel: "high" },
         worker: {
-          modelString: "mux-gateway:anthropic/claude-haiku-4-5",
+          modelString: "github-copilot:claude-haiku-4.5",
           thinkingLevel: "low",
         },
       });
+      // Downgrade projection mirrors the effective delegated profile for
+      // non-built-in agents so old builds keep resolving delegated runs.
       expect(raw.subagentAiDefaults).toEqual({
         worker: {
-          modelString: "mux-gateway:anthropic/claude-haiku-4-5",
+          modelString: "github-copilot:claude-haiku-4.5",
           thinkingLevel: "low",
         },
       });
 
       const loaded = config.loadConfigOrDefault();
       expect(loaded.agentAiDefaults?.exec?.modelString).toBe("openrouter:openai/gpt-5");
-      expect(loaded.agentAiDefaults?.worker?.modelString).toBe(
-        "mux-gateway:anthropic/claude-haiku-4-5"
-      );
-      expect(loaded.subagentAiDefaults?.worker?.modelString).toBe(
-        "mux-gateway:anthropic/claude-haiku-4-5"
-      );
+      expect(loaded.agentAiDefaults?.worker?.modelString).toBe("github-copilot:claude-haiku-4.5");
+      // The mirrored projection folds back into nothing: equal delegated
+      // fields are pruned rather than frozen as overrides.
+      expect(loaded.agentAiDefaults?.worker?.subagent).toBeUndefined();
     });
 
-    it("removes mirrored exec subagent fields on first load", async () => {
+    it("folds mirrored legacy subagent entries away on load", () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({
@@ -1537,20 +5468,16 @@ describe("Config", () => {
       );
 
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.subagentAiDefaults?.exec).toBeUndefined();
-      expect(loaded.subagentAiDefaults?.worker?.modelString).toBe("openai:gpt-5.2");
-      expect(loaded.migrations?.execSubagentDefaultsSplit).toBe(true);
-
-      await flushConfigEdits();
-      const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        subagentAiDefaults?: Record<string, unknown>;
-        migrations?: { execSubagentDefaultsSplit?: boolean };
-      };
-      expect(raw.subagentAiDefaults?.exec).toBeUndefined();
-      expect(raw.migrations?.execSubagentDefaultsSplit).toBe(true);
+      expect(loaded.agentAiDefaults?.exec?.subagent).toBeUndefined();
+      // Legacy-only delegated data stays a delegated override; it is not
+      // promoted to the interactive profile.
+      expect(loaded.agentAiDefaults?.worker?.modelString).toBeUndefined();
+      expect(loaded.agentAiDefaults?.worker?.subagent).toEqual({
+        modelString: "openai:gpt-5.2",
+      });
     });
 
-    it("preserves session usage cache when only exec-split cleanup modifies config", async () => {
+    it("preserves session usage cache when loading a legacy dual-map config", () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({
@@ -1565,27 +5492,19 @@ describe("Config", () => {
         })
       );
 
-      const usagePath = path.join(config.getSessionDir("workspace-1"), "session-usage.json");
+      const usagePath = path.join(
+        path.join(config.sessionsDir, "workspace-1"),
+        "session-usage.json"
+      );
       fs.mkdirSync(path.dirname(usagePath), { recursive: true });
       fs.writeFileSync(usagePath, JSON.stringify({ totalCost: 1.23 }));
-      expect(fs.existsSync(usagePath)).toBe(true);
 
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.subagentAiDefaults?.exec).toBeUndefined();
-      expect(loaded.subagentAiDefaults?.worker?.modelString).toBe("openai:gpt-5.2");
-      expect(loaded.migrations?.execSubagentDefaultsSplit).toBe(true);
-
-      await flushConfigEdits();
-      const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        subagentAiDefaults?: Record<string, unknown>;
-        migrations?: { execSubagentDefaultsSplit?: boolean };
-      };
-      expect(raw.subagentAiDefaults?.exec).toBeUndefined();
-      expect(raw.migrations?.execSubagentDefaultsSplit).toBe(true);
+      expect(loaded.agentAiDefaults?.exec?.subagent).toBeUndefined();
       expect(fs.existsSync(usagePath)).toBe(true);
     });
 
-    it("preserves differing exec subagent defaults on first load", () => {
+    it("preserves differing legacy exec subagent defaults under the nested profile", () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({
@@ -1600,14 +5519,13 @@ describe("Config", () => {
       );
 
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.subagentAiDefaults?.exec).toEqual({
+      expect(loaded.agentAiDefaults?.exec?.subagent).toEqual({
         modelString: "anthropic:claude-haiku-4-5",
         thinkingLevel: "off",
       });
-      expect(loaded.migrations?.execSubagentDefaultsSplit).toBe(true);
     });
 
-    it("removes only mirrored exec subagent fields during first-load cleanup", () => {
+    it("keeps only differing fields from a partially mirrored legacy exec entry", () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({
@@ -1622,30 +5540,75 @@ describe("Config", () => {
       );
 
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.subagentAiDefaults?.exec).toEqual({
+      expect(loaded.agentAiDefaults?.exec?.subagent).toEqual({
         thinkingLevel: "off",
       });
     });
 
-    it("preserves intentionally equal exec subagent defaults after migration marker is set", () => {
+    it("keeps a differing legacy exec subagent reasoning mode", () => {
+      // UI Exec pro + sub-agent standard share a model: the fold may drop the
+      // mirrored model but must keep the explicit standard override (deleting
+      // it would silently flip the sub-agent to pro after restart).
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({
           projects: [],
-          migrations: { execSubagentDefaultsSplit: true },
           agentAiDefaults: {
-            exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+            exec: { modelString: "openai:gpt-5.3-codex", reasoningMode: "pro" },
           },
           subagentAiDefaults: {
-            exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+            exec: { modelString: "openai:gpt-5.3-codex", reasoningMode: "standard" },
           },
         })
       );
 
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.subagentAiDefaults?.exec).toEqual({
-        modelString: "openai:gpt-5.3-codex",
-        thinkingLevel: "xhigh",
+      expect(loaded.agentAiDefaults?.exec?.subagent).toEqual({
+        reasoningMode: "standard",
+      });
+    });
+
+    it("prunes a mirrored legacy exec subagent reasoning mode", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          agentAiDefaults: {
+            exec: { modelString: "openai:gpt-5.3-codex", reasoningMode: "pro" },
+          },
+          subagentAiDefaults: {
+            exec: { modelString: "openai:gpt-5.3-codex", reasoningMode: "pro" },
+          },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.agentAiDefaults?.exec?.subagent).toBeUndefined();
+    });
+
+    it("prefers nested subagent fields over the legacy projection on load", () => {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [],
+          agentAiDefaults: {
+            exec: {
+              modelString: "openai:gpt-5.3-codex",
+              subagent: { thinkingLevel: "high" },
+            },
+          },
+          subagentAiDefaults: {
+            exec: { modelString: "anthropic:claude-haiku-4-5", thinkingLevel: "off" },
+          },
+        })
+      );
+
+      const loaded = config.loadConfigOrDefault();
+      expect(loaded.agentAiDefaults?.exec?.subagent).toEqual({
+        // Canonical nested value wins; the legacy map only fills fields the
+        // nested profile leaves unset.
+        thinkingLevel: "high",
+        modelString: "anthropic:claude-haiku-4-5",
       });
     });
 
@@ -1661,64 +5624,108 @@ describe("Config", () => {
       );
 
       const loaded = config.loadConfigOrDefault();
-      expect(loaded.agentAiDefaults?.exec).toBeUndefined();
-      expect(loaded.subagentAiDefaults?.exec).toEqual({
+      expect(loaded.agentAiDefaults?.exec?.modelString).toBeUndefined();
+      expect(loaded.agentAiDefaults?.exec?.subagent).toEqual({
         modelString: "openai:gpt-5.3-codex",
         thinkingLevel: "xhigh",
       });
     });
 
-    it("preserves existing exec subagent defaults when saving derived legacy defaults", async () => {
-      fs.writeFileSync(
-        path.join(tempDir, "config.json"),
-        JSON.stringify({
-          projects: [],
-          migrations: { execSubagentDefaultsSplit: true },
-          agentAiDefaults: {
-            exec: { modelString: "openai:gpt-5.2", thinkingLevel: "medium" },
-          },
-          subagentAiDefaults: {
-            exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
-          },
-        })
-      );
-
+    it("writes a downgrade-compatible legacy projection on save", async () => {
       await config.editConfig((cfg) => {
         cfg.agentAiDefaults = {
-          ...cfg.agentAiDefaults,
-          worker: { modelString: "anthropic:claude-haiku-4-5", thinkingLevel: "off" },
+          exec: {
+            modelString: "openai:gpt-5.2",
+            thinkingLevel: "medium",
+            subagent: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+          },
+          plan: { modelString: "anthropic:claude-opus-4-6" },
+          worker: {
+            modelString: "anthropic:claude-haiku-4-5",
+            subagent: { thinkingLevel: "off" },
+          },
         };
         return cfg;
       });
 
       const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
         subagentAiDefaults?: Record<string, unknown>;
+        migrations?: { execSubagentDefaultsSplit?: boolean };
       };
       expect(raw.subagentAiDefaults).toEqual({
+        // Exec projects only sparse overrides (old builds treat the exec key
+        // as canonical delegated storage).
         exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+        // Other agents project the effective delegated profile; plan/compact
+        // stay excluded for parity with old builds.
         worker: { modelString: "anthropic:claude-haiku-4-5", thinkingLevel: "off" },
+      });
+      expect(raw.migrations?.execSubagentDefaultsSplit).toBe(true);
+    });
+
+    it("round-trips distinct interactive and delegated exec profiles through downgrade save", async () => {
+      await config.editConfig((cfg) => {
+        cfg.agentAiDefaults = {
+          exec: {
+            modelString: "openai:gpt-5.2",
+            thinkingLevel: "medium",
+            reasoningMode: "pro",
+            subagent: {
+              modelString: "openai:gpt-5.3-codex",
+              thinkingLevel: "xhigh",
+              reasoningMode: "standard",
+            },
+          },
+        };
+        return cfg;
+      });
+
+      // Simulate a downgrade save: old builds strip the nested subagent
+      // profile from agentAiDefaults but keep the legacy root map.
+      const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        agentAiDefaults?: Record<string, Record<string, unknown>>;
+        subagentAiDefaults?: Record<string, unknown>;
+      };
+      const execEntry = raw.agentAiDefaults?.exec ?? {};
+      delete execEntry.subagent;
+      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(raw));
+
+      const reloaded = new Config(tempDir).loadConfigOrDefault();
+      expect(reloaded.agentAiDefaults?.exec).toEqual({
+        modelString: "openai:gpt-5.2",
+        thinkingLevel: "medium",
+        reasoningMode: "pro",
+        enabled: undefined,
+        subagent: {
+          modelString: "openai:gpt-5.3-codex",
+          thinkingLevel: "xhigh",
+          reasoningMode: "standard",
+        },
       });
     });
 
-    it("allows an explicit empty exec subagent default to delete the preserved value", async () => {
+    it("clearing the delegated exec profile removes the legacy exec projection on save", async () => {
       fs.writeFileSync(
         path.join(tempDir, "config.json"),
         JSON.stringify({
           projects: [],
-          migrations: { execSubagentDefaultsSplit: true },
           agentAiDefaults: {
-            exec: { modelString: "openai:gpt-5.2", thinkingLevel: "medium" },
-          },
-          subagentAiDefaults: {
-            exec: { modelString: "openai:gpt-5.3-codex", thinkingLevel: "xhigh" },
+            exec: {
+              modelString: "openai:gpt-5.2",
+              thinkingLevel: "medium",
+              subagent: { modelString: "openai:gpt-5.3-codex" },
+            },
           },
         })
       );
 
-      await config.editConfig((cfg) => ({
-        ...cfg,
-        subagentAiDefaults: {},
-      }));
+      await config.editConfig((cfg) => {
+        const exec = cfg.agentAiDefaults?.exec;
+        if (exec) {
+          delete exec.subagent;
+        }
+        return cfg;
+      });
 
       const raw = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
         subagentAiDefaults?: Record<string, unknown>;
@@ -1799,7 +5806,7 @@ describe("Config", () => {
           projects: [],
           routeOverrides: {
             "openrouter:anthropic/claude-opus-4-6": "direct",
-            "mux-gateway:anthropic/claude-opus-4-6": "openrouter",
+            "coder:anthropic/claude-opus-4-6": "openrouter",
           },
         })
       );
@@ -1833,188 +5840,6 @@ describe("Config", () => {
       expect(loaded.routePriority).toEqual(expectedPriority);
       expect(loaded.routeOverrides).toEqual(expectedOverrides);
       expect(loaded.apiServerPort).toBe(4000);
-    });
-  });
-
-  describe("legacy gateway migration preserves downgrade compatibility", () => {
-    const writeRawConfig = (value: Record<string, unknown>) => {
-      fs.writeFileSync(path.join(tempDir, "config.json"), JSON.stringify(value));
-    };
-
-    const writeProvidersConfig = (value: Record<string, unknown>) => {
-      fs.writeFileSync(path.join(tempDir, "providers.jsonc"), JSON.stringify(value, null, 2));
-    };
-
-    const readRawConfig = () =>
-      JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
-        muxGatewayEnabled?: boolean;
-        muxGatewayModels?: string[];
-        routePriority?: string[];
-        routeOverrides?: Record<string, string>;
-      };
-
-    for (const { name, rawConfig, expectedOverrides } of [
-      {
-        name: "translates a single legacy allowlisted model into a mux-gateway routeOverride",
-        rawConfig: {
-          muxGatewayEnabled: true,
-          muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-        },
-        expectedOverrides: { "anthropic:claude-sonnet-4-6": "mux-gateway" },
-      },
-      {
-        name: "translates multiple legacy models and merges them with existing routeOverrides",
-        rawConfig: {
-          muxGatewayEnabled: true,
-          muxGatewayModels: ["anthropic:claude-sonnet-4-6", "openrouter:anthropic/claude-opus-4-6"],
-          routeOverrides: { "openai:gpt-4o": "direct" },
-        },
-        expectedOverrides: {
-          "openai:gpt-4o": "direct",
-          "anthropic:claude-sonnet-4-6": "mux-gateway",
-          "anthropic:claude-opus-4-6": "mux-gateway",
-        },
-      },
-      {
-        name: "keeps existing routeOverrides when a legacy model normalizes to the same canonical key",
-        rawConfig: {
-          muxGatewayEnabled: true,
-          muxGatewayModels: ["openrouter:anthropic/claude-opus-4-6"],
-          routeOverrides: { "anthropic:claude-opus-4-6": "openrouter" },
-        },
-        expectedOverrides: { "anthropic:claude-opus-4-6": "openrouter" },
-      },
-      {
-        name: "synthesizes direct-only priority when the legacy allowlist is empty",
-        rawConfig: { muxGatewayEnabled: true, muxGatewayModels: [] },
-        expectedOverrides: undefined,
-      },
-      {
-        name: "synthesizes direct-only priority when the legacy gateway flag is disabled",
-        rawConfig: {
-          muxGatewayEnabled: false,
-          muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-        },
-        expectedOverrides: undefined,
-      },
-    ] as const) {
-      it(name, () => {
-        writeRawConfig(rawConfig);
-
-        const loaded = config.loadConfigOrDefault();
-
-        expect(loaded.routePriority).toEqual(["direct"]);
-        if (expectedOverrides === undefined) {
-          expect(loaded.routeOverrides).toBeUndefined();
-        } else {
-          expect(loaded.routeOverrides).toEqual(expectedOverrides);
-        }
-      });
-    }
-
-    it("preserves legacy fields on disk alongside synthesized modern routing state", async () => {
-      writeRawConfig({
-        muxGatewayEnabled: true,
-        muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-      });
-      writeProvidersConfig({
-        "mux-gateway": { couponCode: "test-coupon" },
-      });
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.routePriority).toEqual(["mux-gateway", "direct"]);
-      expect(loaded.routeOverrides).toEqual({
-        "anthropic:claude-sonnet-4-6": "mux-gateway",
-      });
-
-      await flushConfigEdits();
-      expect(readRawConfig()).toMatchObject({
-        muxGatewayEnabled: true,
-        muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-        routePriority: ["mux-gateway", "direct"],
-        routeOverrides: {
-          "anthropic:claude-sonnet-4-6": "mux-gateway",
-        },
-      });
-    });
-
-    it("seeds routePriority from other configured gateways for legacy configs", () => {
-      writeRawConfig({
-        muxGatewayEnabled: true,
-        muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-      });
-      writeProvidersConfig({
-        openrouter: { apiKey: "test-openrouter-key" },
-      });
-
-      const loaded = config.loadConfigOrDefault();
-
-      expect(loaded.routePriority).toEqual(["openrouter", "direct"]);
-      expect(loaded.routeOverrides).toEqual({
-        "anthropic:claude-sonnet-4-6": "mux-gateway",
-      });
-    });
-
-    it("excludes mux-gateway from seeded priority when legacy muxGatewayEnabled is false", () => {
-      writeRawConfig({
-        muxGatewayEnabled: false,
-        muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-      });
-      writeProvidersConfig({
-        "mux-gateway": { couponCode: "test-coupon" },
-        openrouter: { apiKey: "test-openrouter-key" },
-      });
-
-      const loaded = config.loadConfigOrDefault();
-
-      expect(loaded.routePriority).toEqual(["openrouter", "direct"]);
-      expect(loaded.routeOverrides).toBeUndefined();
-    });
-
-    it("clears stale muxGatewayEnabled disables when routePriority already includes mux-gateway", async () => {
-      writeRawConfig({
-        muxGatewayEnabled: false,
-        routePriority: ["mux-gateway", "direct"],
-      });
-
-      const loaded = config.loadConfigOrDefault();
-
-      expect(loaded.routePriority).toEqual(["mux-gateway", "direct"]);
-      expect(loaded.muxGatewayEnabled).toBeUndefined();
-      await flushConfigEdits();
-      expect(readRawConfig().muxGatewayEnabled).toBeUndefined();
-      expect(new Config(tempDir).loadConfigOrDefault().muxGatewayEnabled).toBeUndefined();
-    });
-
-    it("does not rewrite configs that already include routePriority", () => {
-      const configFile = path.join(tempDir, "config.json");
-      fs.writeFileSync(
-        configFile,
-        JSON.stringify({
-          muxGatewayEnabled: true,
-          muxGatewayModels: ["anthropic/claude-sonnet-4-6"],
-          routePriority: ["openrouter", "direct"],
-          routeOverrides: {
-            "openai:gpt-4o": "direct",
-          },
-          // Without this flag the one-time default-fallbacks seed would write
-          // the file, which is not the rewrite this test guards against.
-          migrations: { defaultModelFallbacksSeeded: true },
-        })
-      );
-
-      const preservedTime = new Date("2000-01-01T00:00:00.000Z");
-      fs.utimesSync(configFile, preservedTime, preservedTime);
-      const beforeMtimeMs = fs.statSync(configFile).mtimeMs;
-
-      const loaded = config.loadConfigOrDefault();
-      expect(loaded.routePriority).toEqual(["openrouter", "direct"]);
-      expect(loaded.routeOverrides).toEqual({
-        "openai:gpt-4o": "direct",
-      });
-
-      const afterMtimeMs = fs.statSync(configFile).mtimeMs;
-      expect(afterMtimeMs).toBe(beforeMtimeMs);
     });
   });
 
@@ -2061,21 +5886,20 @@ describe("Config", () => {
 
     it("seeds routePriority on fresh installs when a gateway is configured", () => {
       writeProvidersConfig({
-        // mux-gateway is configured by couponCode/voucher rather than apiKey.
-        "mux-gateway": { couponCode: "test-coupon" },
+        openrouter: { apiKey: "test-openrouter-key" },
       });
 
       const loaded = config.loadConfigOrDefault();
-      const muxGatewayIndex = loaded.routePriority?.indexOf("mux-gateway") ?? -1;
+      const openrouterIndex = loaded.routePriority?.indexOf("openrouter") ?? -1;
       const directIndex = loaded.routePriority?.indexOf("direct") ?? -1;
 
-      expect(muxGatewayIndex).toBeGreaterThanOrEqual(0);
-      expect(directIndex).toBeGreaterThan(muxGatewayIndex);
+      expect(openrouterIndex).toBeGreaterThanOrEqual(0);
+      expect(directIndex).toBeGreaterThan(openrouterIndex);
     });
 
     it("does not seed routePriority when a configured gateway is disabled", () => {
       writeProvidersConfig({
-        "mux-gateway": { couponCode: "test-coupon", enabled: false },
+        openrouter: { apiKey: "test-openrouter-key", enabled: false },
       });
 
       const loaded = config.loadConfigOrDefault();
@@ -2103,55 +5927,12 @@ describe("Config", () => {
         JSON.stringify({ routePriority: ["direct"] })
       );
       writeProvidersConfig({
-        // mux-gateway is configured by couponCode/voucher rather than apiKey.
-        "mux-gateway": { couponCode: "test-coupon" },
+        openrouter: { apiKey: "test-openrouter-key" },
       });
 
       const loaded = config.loadConfigOrDefault();
 
       expect(loaded.routePriority).toEqual(["direct"]);
-    });
-  });
-
-  describe("config change notifications", () => {
-    it("emits for editConfig saves and stops after unsubscribe", async () => {
-      let notifications = 0;
-      const unsubscribe = config.onConfigChanged(() => {
-        notifications += 1;
-      });
-
-      await config.editConfig((cfg) => {
-        cfg.routePriority = ["openai:gpt-4o"];
-        return cfg;
-      });
-
-      expect(notifications).toBe(1);
-
-      unsubscribe();
-
-      await config.editConfig((cfg) => {
-        cfg.routeOverrides = { "openai:gpt-4o": "direct" };
-        return cfg;
-      });
-
-      expect(notifications).toBe(1);
-    });
-  });
-
-  describe("generateStableId", () => {
-    it("should generate a 10-character hex string", () => {
-      const id = config.generateStableId();
-      expect(id).toMatch(/^[0-9a-f]{10}$/);
-    });
-
-    it("should generate unique IDs", () => {
-      const id1 = config.generateStableId();
-      const id2 = config.generateStableId();
-      const id3 = config.generateStableId();
-
-      expect(id1).not.toBe(id2);
-      expect(id2).not.toBe(id3);
-      expect(id1).not.toBe(id3);
     });
   });
 
@@ -2191,6 +5972,143 @@ describe("Config", () => {
         pendingAutoTitle: undefined,
       });
     });
+
+    it("reports a scratch chat's kind", async () => {
+      await config.editConfig((cfg) => {
+        cfg.projects.set(SCRATCH_PROJECT_CONFIG_KEY, {
+          workspaces: [
+            {
+              kind: "scratch",
+              path: path.join(config.rootDir, "scratch", "chat"),
+              id: "scratch-1",
+              name: "chat",
+            },
+          ],
+          projectKind: "system",
+          trusted: true,
+        });
+        return cfg;
+      });
+
+      expect(config.findWorkspace("scratch-1")?.kind).toBe("scratch");
+    });
+  });
+
+  describe("shared-checkout task workspaces", () => {
+    const projectPath = "/fake/project";
+    const staleOwnerPath = "/fake/src/project/original";
+    const ownerPath = "/fake/src/project/renamed";
+
+    function writeWorkspaces(workspaces: Array<Record<string, unknown>>): void {
+      fs.writeFileSync(
+        path.join(tempDir, "config.json"),
+        JSON.stringify({
+          projects: [[projectPath, { workspaces }]],
+          // Other load-time migrations are done, so only the shared-checkout repair can write.
+          taskSettings: { preserveSubagentsUntilArchive: true },
+          migrations: {
+            persistentSubagentsDefaulted: true,
+            defaultModelFallbacksSeeded: true,
+            defaultModelFallbacksSeededFable51: true,
+          },
+        })
+      );
+    }
+
+    function readPersistedWorkspace(id: string): Record<string, unknown> | undefined {
+      const persisted = JSON.parse(fs.readFileSync(path.join(tempDir, "config.json"), "utf-8")) as {
+        projects: Array<[string, { workspaces: Array<Record<string, unknown>> }]>;
+      };
+      return persisted.projects[0]?.[1].workspaces.find((ws) => ws.id === id);
+    }
+
+    function sharedTask(id: string, parentWorkspaceId: string): Record<string, unknown> {
+      return {
+        id,
+        name: `${id}-name`,
+        path: staleOwnerPath,
+        parentWorkspaceId,
+        taskIsolation: "none",
+        taskTrunkBranch: "original",
+      };
+    }
+
+    it("resolve nested shared children to the owner's current checkout", async () => {
+      writeWorkspaces([
+        { id: "owner", name: "renamed", path: ownerPath },
+        sharedTask("child", "owner"),
+        sharedTask("grandchild", "child"),
+        {
+          id: "forked",
+          name: "forked-name",
+          path: "/fake/src/project/forked",
+          parentWorkspaceId: "owner",
+          taskTrunkBranch: "original",
+        },
+      ]);
+      const freshConfig = new Config(tempDir);
+
+      const metadataById = new Map(
+        (await freshConfig.getAllWorkspaceMetadata()).map((metadata) => [metadata.id, metadata])
+      );
+      for (const id of ["child", "grandchild"]) {
+        expect(freshConfig.findWorkspace(id)?.workspacePath).toBe(ownerPath);
+        expect(metadataById.get(id)?.namedWorkspacePath).toBe(ownerPath);
+        expect(metadataById.get(id)?.taskTrunkBranch).toBe("original");
+      }
+      expect(freshConfig.findWorkspace("forked")?.workspacePath).toBe("/fake/src/project/forked");
+    });
+
+    it("persist healed shared-child paths on load without another write", async () => {
+      writeWorkspaces([
+        { id: "owner", name: "renamed", path: ownerPath },
+        sharedTask("child", "owner"),
+      ]);
+      const freshConfig = new Config(tempDir);
+      freshConfig.loadConfigOrDefault();
+
+      let childOnDisk: Record<string, unknown> | undefined;
+      // Edits run in order: this sees disk after load's queued repair, before this edit writes.
+      await freshConfig.editConfig((cfg) => {
+        childOnDisk = readPersistedWorkspace("child");
+        return cfg;
+      });
+      expect(childOnDisk?.path).toBe(ownerPath);
+    });
+
+    it("persist the owner's new checkout for shared children when a write moves the owner", async () => {
+      writeWorkspaces([
+        { id: "owner", name: "original", path: staleOwnerPath },
+        sharedTask("child", "owner"),
+      ]);
+      const freshConfig = new Config(tempDir);
+
+      await freshConfig.editConfig((cfg) => {
+        const owner = cfg.projects.get(projectPath)?.workspaces.find((ws) => ws.id === "owner");
+        if (!owner) throw new Error("owner missing");
+        owner.name = "renamed";
+        owner.path = ownerPath;
+        return cfg;
+      });
+
+      expect(readPersistedWorkspace("child")).toMatchObject({
+        path: ownerPath,
+        taskTrunkBranch: "original",
+      });
+    });
+
+    it("keep persisted values when the owner chain is broken or cyclic", () => {
+      writeWorkspaces([
+        sharedTask("orphan", "missing-owner"),
+        sharedTask("cycle-a", "cycle-b"),
+        sharedTask("cycle-b", "cycle-a"),
+      ]);
+      const freshConfig = new Config(tempDir);
+
+      for (const id of ["orphan", "cycle-a", "cycle-b"]) {
+        expect(freshConfig.findWorkspace(id)?.workspacePath).toBe(staleOwnerPath);
+      }
+    });
   });
 
   describe("getAllWorkspaceMetadata with migration", () => {
@@ -2227,6 +6145,198 @@ describe("Config", () => {
       const workspace = projectConfig!.workspaces[0];
       expect(workspace.id).toBe("project-feature-branch");
       expect(workspace.name).toBe("feature-branch");
+    });
+
+    it.each(["owner", undefined])(
+      "preserves desktop ownership through metadata read/write (%s)",
+      async (owner) => {
+        const projectPath = path.join(tempDir, "project");
+        await config.editConfig((cfg) => {
+          cfg.projects.set(projectPath, {
+            workspaces: [
+              {
+                id: "child",
+                name: "child",
+                path: projectPath,
+                createdAt: "2025-01-01T00:00:00.000Z",
+                runtimeConfig: { type: "local" },
+                parentWorkspaceId: "owner",
+                agentId: "desktop",
+                taskDesktopOwnerWorkspaceId: owner,
+              },
+            ],
+          });
+          return cfg;
+        });
+        const reloaded = new Config(tempDir);
+        const [metadata] = await reloaded.getAllWorkspaceMetadata();
+        expect(metadata.taskDesktopOwnerWorkspaceId).toBe(owner);
+        await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed operator" });
+        const [saved] = await new Config(tempDir).getAllWorkspaceMetadata();
+        expect(saved.title).toBe("Renamed operator");
+        expect(saved.taskDesktopOwnerWorkspaceId).toBe(owner);
+      }
+    );
+
+    it("keeps a task's terminal-failure marker through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      const marker = { attemptId: "att_00000000000000a1", errorType: "model_refusal" };
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "child",
+              name: "child",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              parentWorkspaceId: "owner",
+              taskStatus: "interrupted",
+              taskAttemptId: marker.attemptId,
+              taskTerminalFailure: marker,
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      expect(row()?.taskTerminalFailure).toEqual(marker);
+      // Server-owned like the attempt identity: absent from metadata, kept by a metadata write.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({ title: "Renamed", taskTerminalFailure: marker });
+    });
+
+    it("keeps the messaging-tag revocation generation through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "tagged",
+              name: "tagged",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              messagingTag: "research",
+              messagingTagGeneration: "gen-1",
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      // The tag publishes on metadata; its server-owned generation never does.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      expect(metadata.messagingTag).toBe("research");
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({
+        title: "Renamed",
+        messagingTag: "research",
+        messagingTagGeneration: "gen-1",
+      });
+    });
+
+    it("publishes the config messaging tag for an id-less legacy workspace with metadata.json", async () => {
+      const projectPath = path.join(tempDir, "repo");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [{ path: projectPath, messagingTag: "research" }],
+        });
+        return cfg;
+      });
+      const sessionDir = path.join(config.sessionsDir, "repo");
+      fs.mkdirSync(sessionDir, { recursive: true });
+      // A stale or absent legacy-file tag must never override the config value.
+      fs.writeFileSync(
+        path.join(sessionDir, "metadata.json"),
+        JSON.stringify({ id: "legacy-tag", name: "legacy-tag", messagingTag: "stale" })
+      );
+      const [metadata] = await config.getAllWorkspaceMetadata();
+      expect(metadata).toMatchObject({ id: "legacy-tag", messagingTag: "research" });
+    });
+
+    it("keeps a parent's reservation tombstones through reload and a metadata write", async () => {
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              id: "owner",
+              name: "owner",
+              path: projectPath,
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "local" },
+              // A hand-edited non-string entry is dropped on load; the valid IDs survive.
+              taskReservationTombstones: ["child01", 7, "child02"] as unknown as string[],
+            },
+          ],
+        });
+        return cfg;
+      });
+      const reloaded = new Config(tempDir);
+      const row = () =>
+        new Config(tempDir).loadConfigOrDefault().projects.get(projectPath)?.workspaces[0];
+      expect(row()?.taskReservationTombstones).toEqual(["child01", "child02"]);
+      // W8: dropping them would let a stalled reservation's late commit publish again.
+      const [metadata] = await reloaded.getAllWorkspaceMetadata();
+      await reloaded.addWorkspace(projectPath, { ...metadata, title: "Renamed" });
+      expect(row()).toMatchObject({
+        title: "Renamed",
+        taskReservationTombstones: ["child01", "child02"],
+      });
+    });
+
+    it("stamps fixed-interval heartbeats that follow the default when the default changes (#5741)", async () => {
+      // Restart anchoring uses max(last firing, scheduleUpdatedAt): without a stamp, a heartbeat
+      // that fired under the old default could bypass the new one once.
+      const projectPath = "/fake/project";
+      const oldStamp = 1_700_000_000_000;
+      const heartbeats = {
+        follows: { enabled: true, trigger: "interval" },
+        ownInterval: { enabled: true, trigger: "interval", intervalMs: 30 * 60_000 },
+        idle: { enabled: true, trigger: "idle" },
+        disabled: { enabled: false, trigger: "interval" },
+      } as const;
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: Object.entries(heartbeats).map(([name, heartbeat]) => ({
+            path: path.join(config.srcDir, "project", name),
+            id: `workspace-${name}`,
+            name,
+            createdAt: "2025-01-01T00:00:00.000Z",
+            runtimeConfig: { type: "local" as const },
+            heartbeat: { ...heartbeat, scheduleUpdatedAt: oldStamp },
+          })),
+        });
+        return cfg;
+      });
+      const stamps = () => {
+        const byName: Record<string, number | null | undefined> = {};
+        const project = new Config(tempDir).loadConfigOrDefault().projects.get(projectPath);
+        for (const workspace of project?.workspaces ?? []) {
+          byName[workspace.name ?? workspace.path] = workspace.heartbeat?.scheduleUpdatedAt;
+        }
+        return byName;
+      };
+
+      const before = Date.now();
+      await config.updateHeartbeatDefaultIntervalMs(45 * 60_000);
+      const afterChange = stamps();
+      expect(afterChange.follows).toBeGreaterThanOrEqual(before);
+      expect([afterChange.ownInterval, afterChange.idle, afterChange.disabled]).toEqual([
+        oldStamp,
+        oldStamp,
+        oldStamp,
+      ]);
+
+      // The same value again is no schedule change, so nothing is stamped.
+      await config.updateHeartbeatDefaultIntervalMs(45 * 60_000);
+      expect(stamps()).toEqual(afterChange);
     });
 
     it("defaults sparse persisted heartbeat intervals in workspace metadata", async () => {
@@ -2308,7 +6418,7 @@ describe("Config", () => {
       // Test backward compatibility: Create metadata file using legacy ID format.
       // This simulates workspaces created before stable IDs were introduced.
       const legacyId = config.generateLegacyId(projectPath, workspacePath);
-      const sessionDir = config.getSessionDir(legacyId);
+      const sessionDir = path.join(config.sessionsDir, legacyId);
       fs.mkdirSync(sessionDir, { recursive: true });
       const metadataPath = path.join(sessionDir, "metadata.json");
       const existingMetadata = {
@@ -2347,6 +6457,94 @@ describe("Config", () => {
       expect(workspace.name).toBe(workspaceName);
       expect(workspace.createdAt).toBe("2025-01-01T00:00:00.000Z");
     });
+
+    it("enumerates basename-backed legacy stable ids like findWorkspace", async () => {
+      // Oldest layout: an id-less config entry whose stable id lives in
+      // sessions/<workspace-basename>/metadata.json. findWorkspace resolves
+      // it (basename candidate first), so the enumeration must report the
+      // same identity — destructive callers (the extension-metadata prune)
+      // classify ids as stale against the enumeration, and a mismatch would
+      // delete the live workspace's activity data.
+      const projectPath = "/fake/project";
+      const workspaceName = "old-feature";
+      const workspacePath = path.join(config.srcDir, "project", workspaceName);
+      fs.mkdirSync(workspacePath, { recursive: true });
+
+      const sessionDir = path.join(config.sessionsDir, workspaceName);
+      fs.mkdirSync(sessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(sessionDir, "metadata.json"),
+        JSON.stringify({
+          id: "stable-basename-id",
+          name: workspaceName,
+          projectName: "project",
+          projectPath,
+          createdAt: "2025-01-01T00:00:00.000Z",
+        })
+      );
+
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [{ path: workspacePath }],
+        });
+        return cfg;
+      });
+
+      const allMetadata = await config.getAllWorkspaceMetadata({ throwOnError: true });
+      expect(allMetadata.map((metadata) => metadata.id)).toContain("stable-basename-id");
+    });
+
+    it("surfaces the second resolvable compatibility file's id as a legacy alias", async () => {
+      // Both supported layouts exist with DIFFERENT ids (e.g. a stale
+      // basename-side file next to the live generated-legacy metadata).
+      // findWorkspace resolves either id, so destructive known-id sets must
+      // retain both — the GENERATED-LEGACY record stays canonical (its id
+      // feeds the read-time config migration; a stale basename-side primary
+      // would rewrite the persisted stable id on upgrade and orphan session
+      // history) while the basename id is reported through the
+      // legacyAliasIds out-parameter.
+      const projectPath = "/fake/project";
+      const workspaceName = "aliased-feature";
+      const workspacePath = path.join(config.srcDir, "project", workspaceName);
+      fs.mkdirSync(workspacePath, { recursive: true });
+
+      const basenameSessionDir = path.join(config.sessionsDir, workspaceName);
+      fs.mkdirSync(basenameSessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(basenameSessionDir, "metadata.json"),
+        JSON.stringify({ id: "stale-basename-id", name: workspaceName })
+      );
+      const legacyId = config.generateLegacyId(projectPath, workspacePath);
+      const legacySessionDir = path.join(config.sessionsDir, legacyId);
+      fs.mkdirSync(legacySessionDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(legacySessionDir, "metadata.json"),
+        JSON.stringify({ id: "live-generated-id", name: workspaceName })
+      );
+
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [{ path: workspacePath }],
+        });
+        return cfg;
+      });
+
+      const legacyAliasIds = new Set<string>();
+      const allMetadata = await config.getAllWorkspaceMetadata({
+        throwOnError: true,
+        legacyAliasIds,
+      });
+      expect(allMetadata.map((metadata) => metadata.id)).toContain("live-generated-id");
+      expect(legacyAliasIds.has("stale-basename-id")).toBe(true);
+      // The read-time migration must persist the CANONICAL id — a stale
+      // basename-side id here would change the workspace's stable identity
+      // on upgrade and make its session history appear missing.
+      const persisted = config
+        .loadConfigOrDefault()
+        .projects.get(projectPath)
+        ?.workspaces.find((workspace) => workspace.path === workspacePath);
+      expect(persisted?.id).toBe("live-generated-id");
+    });
   });
 
   describe("transcriptOnly derivation", () => {
@@ -2373,6 +6571,189 @@ describe("Config", () => {
       const [metadata] = await config.getAllWorkspaceMetadata();
 
       expect(metadata.transcriptOnly).toBeUndefined();
+    });
+
+    it("bounds stalled checkout probes with the last answered result until the probe answers", async () => {
+      const projectPath = "/fake/project";
+      const workspaceDir = (name: string) => path.join(config.srcDir, "project", name);
+      const worktreeEntry = (name: string) => ({
+        path: workspaceDir(name),
+        id: `workspace-${name}`,
+        name,
+        createdAt: "2025-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      });
+      const transcriptOnlyByName = async () =>
+        Object.fromEntries(
+          (await config.getAllWorkspaceMetadata()).map((m) => [m.name, m.transcriptOnly])
+        );
+
+      fs.mkdirSync(workspaceDir("present"), { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [worktreeEntry("present"), worktreeEntry("missing")],
+        });
+        return cfg;
+      });
+      expect(await transcriptOnlyByName()).toEqual({ present: undefined, missing: true });
+
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(worktreeEntry("unprobed"));
+        return cfg;
+      });
+
+      const answerStalledProbes: Array<() => void> = [];
+      let signalThreeProbes!: () => void;
+      const threeProbesStarted = new Promise<void>((resolve) => (signalThreeProbes = resolve));
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            answerStalledProbes.push(resolve);
+            if (answerStalledProbes.length === 3) signalThreeProbes();
+          })
+      );
+      try {
+        let stalledBuild: ReturnType<typeof transcriptOnlyByName>;
+        fakeTimers.useFakeTimers();
+        try {
+          stalledBuild = transcriptOnlyByName();
+          await threeProbesStarted;
+          fakeTimers.advanceTimersByTime(WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS);
+        } finally {
+          // Bun's per-test timeout cannot fire under fake timers, so restore before awaiting.
+          fakeTimers.useRealTimers();
+        }
+        expect(await stalledBuild).toEqual({
+          present: undefined,
+          missing: true,
+          unprobed: undefined,
+        });
+
+        // Still stalled: answers immediately without stacking another access on the stalled paths.
+        expect(await transcriptOnlyByName()).toEqual({
+          present: undefined,
+          missing: true,
+          unprobed: undefined,
+        });
+        expect(accessSpy).toHaveBeenCalledTimes(3);
+
+        for (const answer of answerStalledProbes) answer();
+        await new Promise((resolve) => setImmediate(resolve));
+      } finally {
+        accessSpy.mockRestore();
+      }
+
+      expect(await transcriptOnlyByName()).toEqual({
+        present: undefined,
+        missing: true,
+        unprobed: true,
+      });
+    });
+
+    it("classifies last-known checkouts from earlier answered probes without probing", async () => {
+      const projectPath = "/fake/project";
+      const worktreeEntry = (name: string) => ({
+        path: path.join(config.srcDir, "project", name),
+        id: `workspace-${name}`,
+        name,
+        createdAt: "2025-01-01T00:00:00.000Z",
+        runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+      });
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, { workspaces: [worktreeEntry("missing")] });
+        return cfg;
+      });
+      expect((await config.getAllWorkspaceMetadata())[0].transcriptOnly).toBe(true);
+      await config.editConfig((cfg) => {
+        cfg.projects.get(projectPath)!.workspaces.push(worktreeEntry("unprobed"));
+        return cfg;
+      });
+
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () => new Promise<void>(() => undefined)
+      );
+      try {
+        const metadata = await config.getAllWorkspaceMetadata({ probeCheckouts: "last-known" });
+        expect(Object.fromEntries(metadata.map((m) => [m.name, m.transcriptOnly]))).toEqual({
+          missing: true,
+          unprobed: undefined,
+        });
+        expect(accessSpy).not.toHaveBeenCalled();
+      } finally {
+        accessSpy.mockRestore();
+      }
+    });
+
+    it("joins overlapping publications onto the checkout probe already in flight", async () => {
+      const projectPath = "/fake/project";
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: [
+            {
+              path: path.join(config.srcDir, "project", "slow-mount"),
+              id: "workspace-slow-mount",
+              name: "slow-mount",
+              createdAt: "2025-01-01T00:00:00.000Z",
+              runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+            },
+          ],
+        });
+        return cfg;
+      });
+      let answerMissing!: () => void;
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            answerMissing = () => reject(new Error("ENOENT"));
+          })
+      );
+      try {
+        const publications = [config.getAllWorkspaceMetadata(), config.getAllWorkspaceMetadata()];
+        // No I/O precedes the probe, so one event-loop turn brings both builds to it.
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(accessSpy).toHaveBeenCalledTimes(1);
+
+        answerMissing();
+        const transcriptOnly = (await Promise.all(publications)).map(([m]) => m.transcriptOnly);
+        expect(transcriptOnly).toEqual([true, true]);
+      } finally {
+        accessSpy.mockRestore();
+      }
+    });
+
+    it("bounds the whole probe pass by one probe timeout however many checkouts stall", async () => {
+      const projectPath = "/fake/project";
+      const stalledCount = 64;
+      await config.editConfig((cfg) => {
+        cfg.projects.set(projectPath, {
+          workspaces: Array.from({ length: stalledCount }, (_, i) => ({
+            path: path.join(config.srcDir, "project", `stalled-${i}`),
+            id: `workspace-stalled-${i}`,
+            name: `stalled-${i}`,
+            createdAt: "2025-01-01T00:00:00.000Z",
+            runtimeConfig: { type: "worktree" as const, srcBaseDir: config.srcDir },
+          })),
+        });
+        return cfg;
+      });
+      const accessSpy = spyOn(fs.promises, "access").mockImplementation(
+        () => new Promise<void>(() => undefined)
+      );
+      // setImmediate stays real under fake timers, so a probe still waiting on its own timeout
+      // loses the race below instead of hanging the test.
+      const nextTurn = () => new Promise<void>((resolve) => setImmediate(resolve));
+      fakeTimers.useFakeTimers();
+      try {
+        const builtCount = config.getAllWorkspaceMetadata().then((metadata) => metadata.length);
+        await nextTurn();
+        fakeTimers.advanceTimersByTime(WORKSPACE_CHECKOUT_PROBE_TIMEOUT_MS);
+        expect(await Promise.race([builtCount, nextTurn().then(() => "pending")])).toBe(
+          stalledCount
+        );
+      } finally {
+        fakeTimers.useRealTimers();
+        accessSpy.mockRestore();
+      }
     });
 
     it("returns transcriptOnly for missing worktree checkouts even after unarchiving", async () => {
@@ -2448,567 +6829,6 @@ describe("Config", () => {
       const [metadata] = await config.getAllWorkspaceMetadata();
 
       expect(metadata.transcriptOnly).toBeUndefined();
-    });
-  });
-
-  describe("secrets", () => {
-    it("supports global secrets stored under a sentinel key", async () => {
-      await config.updateGlobalSecrets([{ key: "GLOBAL_A", value: "1" }]);
-
-      expect(config.getGlobalSecrets()).toEqual([{ key: "GLOBAL_A", value: "1" }]);
-
-      const raw = fs.readFileSync(path.join(tempDir, "secrets.json"), "utf-8");
-      const parsed = JSON.parse(raw) as { __global__?: unknown };
-      expect(parsed.__global__).toEqual([{ key: "GLOBAL_A", value: "1" }]);
-    });
-
-    it("preserves unsupported legacy entries on disk when saving unrelated secrets", async () => {
-      const secretsFile = path.join(tempDir, "secrets.json");
-      const legacyEntry = { key: "LEGACY_OP", value: { op: "op://Vault/Item/field" } };
-      fs.writeFileSync(
-        secretsFile,
-        JSON.stringify({
-          __global__: [legacyEntry, { key: "KEEP", value: "kept" }],
-          "/other/project": [legacyEntry],
-        })
-      );
-
-      // Legacy entries are hidden from runtime/UI views...
-      expect(config.getGlobalSecrets()).toEqual([{ key: "KEEP", value: "kept" }]);
-
-      await config.updateGlobalSecrets([
-        { key: "KEEP", value: "kept" },
-        { key: "NEW", value: "added" },
-      ]);
-
-      // ...but survive on disk so a downgrade can still read them, in both the
-      // updated bucket and untouched buckets.
-      const parsed = JSON.parse(fs.readFileSync(secretsFile, "utf-8")) as Record<string, unknown>;
-      expect(parsed.__global__).toEqual([
-        { key: "KEEP", value: "kept" },
-        { key: "NEW", value: "added" },
-        legacyEntry,
-      ]);
-      expect(parsed["/other/project"]).toEqual([legacyEntry]);
-    });
-
-    it("drops a preserved legacy entry when an update reuses its key", async () => {
-      const secretsFile = path.join(tempDir, "secrets.json");
-      fs.writeFileSync(
-        secretsFile,
-        JSON.stringify({
-          __global__: [{ key: "TOKEN", value: { op: "op://Vault/Item/field" } }],
-        })
-      );
-
-      await config.updateGlobalSecrets([{ key: "TOKEN", value: "replaced" }]);
-
-      const parsed = JSON.parse(fs.readFileSync(secretsFile, "utf-8")) as Record<string, unknown>;
-      expect(parsed.__global__).toEqual([{ key: "TOKEN", value: "replaced" }]);
-    });
-
-    it("preserves legacy entries from trailing-slash duplicate project buckets", async () => {
-      const secretsFile = path.join(tempDir, "secrets.json");
-      const legacyEntry = { key: "LEGACY_OP", value: { op: "op://Vault/Item/field" } };
-      fs.writeFileSync(secretsFile, JSON.stringify({ "/repo/": [legacyEntry] }));
-
-      await config.updateProjectSecrets("/repo", [{ key: "NEW", value: "added" }]);
-
-      const parsed = JSON.parse(fs.readFileSync(secretsFile, "utf-8")) as Record<string, unknown>;
-      expect(parsed["/repo/"]).toBeUndefined();
-      expect(parsed["/repo"]).toEqual([{ key: "NEW", value: "added" }, legacyEntry]);
-    });
-
-    it("does not inherit global secrets by default", async () => {
-      await config.updateGlobalSecrets([
-        { key: "TOKEN", value: "global" },
-        { key: "A", value: "1" },
-      ]);
-
-      const projectPath = "/fake/project";
-      await config.updateProjectSecrets(projectPath, [
-        { key: "TOKEN", value: "project" },
-        { key: "B", value: "2" },
-      ]);
-
-      const effective = config.getEffectiveSecrets(projectPath);
-      const record = await secretsToRecord(effective);
-
-      expect(record).toEqual({
-        TOKEN: "project",
-        B: "2",
-      });
-    });
-
-    it("injects global secrets with injectAll into any project's effective secrets", async () => {
-      await config.updateGlobalSecrets([
-        { key: "INJECTED", value: "everywhere", injectAll: true },
-        { key: "STORED_ONLY", value: "shared" },
-      ]);
-
-      const record = await secretsToRecord(config.getEffectiveSecrets("/fake/project"));
-      expect(record).toEqual({
-        INJECTED: "everywhere",
-      });
-    });
-
-    it("project secrets override injectAll global secrets", async () => {
-      await config.updateGlobalSecrets([{ key: "TOKEN", value: "global", injectAll: true }]);
-
-      const projectPath = "/fake/project";
-      await config.updateProjectSecrets(projectPath, [{ key: "TOKEN", value: "project" }]);
-
-      const record = await secretsToRecord(config.getEffectiveSecrets(projectPath));
-      expect(record).toEqual({
-        TOKEN: "project",
-      });
-    });
-
-    it("injects injectAll globals alongside project-specific secrets", async () => {
-      await config.updateGlobalSecrets([{ key: "GLOBAL_TOKEN", value: "global", injectAll: true }]);
-
-      const projectPath = "/fake/project";
-      await config.updateProjectSecrets(projectPath, [{ key: "LOCAL_TOKEN", value: "local" }]);
-
-      const record = await secretsToRecord(config.getEffectiveSecrets(projectPath));
-      expect(record).toEqual({
-        GLOBAL_TOKEN: "global",
-        LOCAL_TOKEN: "local",
-      });
-    });
-
-    it("returns only globally injected secrets for project settings visibility", async () => {
-      await config.updateGlobalSecrets([
-        { key: "GLOBAL_VISIBLE", value: "v", injectAll: true },
-        { key: "GLOBAL_HIDDEN", value: "h" },
-        { key: "SHARED", value: "global", injectAll: true },
-      ]);
-
-      const projectPath = "/fake/project";
-      await config.updateProjectSecrets(projectPath, [
-        { key: "LOCAL_ONLY", value: "local" },
-        { key: "SHARED", value: "project" },
-      ]);
-
-      expect(config.getInjectedGlobalSecrets(projectPath)).toEqual([
-        { key: "GLOBAL_VISIBLE", value: "v" },
-      ]);
-    });
-
-    it("does not inject global secrets unless injectAll is true", async () => {
-      await config.updateGlobalSecrets([
-        { key: "A", value: "1", injectAll: false },
-        { key: "B", value: "2" },
-        { key: "C", value: "3", injectAll: true },
-      ]);
-
-      const record = await secretsToRecord(config.getEffectiveSecrets("/fake/project"));
-      expect(record).toEqual({
-        C: "3",
-      });
-    });
-
-    it("uses last global duplicate to decide injectAll behavior", async () => {
-      await config.updateGlobalSecrets([
-        { key: "DUP", value: "first", injectAll: true },
-        { key: "DUP", value: "second", injectAll: false },
-      ]);
-
-      expect(await secretsToRecord(config.getEffectiveSecrets("/fake/project"))).toEqual({});
-
-      await config.updateGlobalSecrets([
-        { key: "DUP", value: "first", injectAll: false },
-        { key: "DUP", value: "second", injectAll: true },
-      ]);
-
-      expect(await secretsToRecord(config.getEffectiveSecrets("/fake/project"))).toEqual({
-        DUP: "second",
-      });
-    });
-
-    it('resolves project secret aliases to global secrets via {secret:"KEY"}', async () => {
-      await config.updateGlobalSecrets([{ key: "GLOBAL_TOKEN", value: "abc" }]);
-
-      const projectPath = "/fake/project";
-      await config.updateProjectSecrets(projectPath, [
-        { key: "TOKEN", value: { secret: "GLOBAL_TOKEN" } },
-      ]);
-
-      const record = await secretsToRecord(config.getEffectiveSecrets(projectPath));
-      expect(record).toEqual({
-        TOKEN: "abc",
-      });
-    });
-
-    it("resolves same-key project secret references to global values", async () => {
-      await config.updateGlobalSecrets([{ key: "OPENAI_API_KEY", value: "abc" }]);
-
-      const projectPath = "/fake/project";
-      await config.updateProjectSecrets(projectPath, [
-        { key: "OPENAI_API_KEY", value: { secret: "OPENAI_API_KEY" } },
-      ]);
-
-      const record = await secretsToRecord(config.getEffectiveSecrets(projectPath));
-      expect(record).toEqual({
-        OPENAI_API_KEY: "abc",
-      });
-    });
-
-    it("omits missing referenced secrets when resolving secretsToRecord", async () => {
-      const record = await secretsToRecord([
-        { key: "GLOBAL", value: "1" },
-        { key: "A", value: { secret: "MISSING" } },
-      ]);
-
-      expect(record).toEqual({ GLOBAL: "1" });
-    });
-
-    it("omits cyclic secret references when resolving secretsToRecord", async () => {
-      const record = await secretsToRecord([
-        { key: "A", value: { secret: "B" } },
-        { key: "B", value: { secret: "A" } },
-        { key: "OK", value: "y" },
-      ]);
-
-      expect(record).toEqual({ OK: "y" });
-    });
-
-    it("resolves mixed literal and { secret } values", async () => {
-      const record = await secretsToRecord([
-        { key: "LITERAL", value: "raw" },
-        { key: "GLOBAL_TOKEN", value: "abc" },
-        { key: "ALIAS", value: { secret: "GLOBAL_TOKEN" } },
-      ]);
-
-      expect(record).toEqual({
-        LITERAL: "raw",
-        GLOBAL_TOKEN: "abc",
-        ALIAS: "abc",
-      });
-    });
-    it("normalizes project paths so trailing slashes don't split secrets", async () => {
-      const projectPath = "/repo";
-      const projectPathWithSlash = "/repo/";
-
-      await config.updateProjectSecrets(projectPathWithSlash, [{ key: "A", value: "1" }]);
-
-      expect(config.getProjectSecrets(projectPath)).toEqual([{ key: "A", value: "1" }]);
-      expect(config.getProjectSecrets(projectPathWithSlash)).toEqual([{ key: "A", value: "1" }]);
-
-      const raw = fs.readFileSync(path.join(tempDir, "secrets.json"), "utf-8");
-      const parsed = JSON.parse(raw) as Record<string, unknown>;
-      expect(parsed[projectPath]).toEqual([{ key: "A", value: "1" }]);
-      expect(parsed[projectPathWithSlash]).toBeUndefined();
-    });
-
-    it("treats malformed store shapes as empty arrays", () => {
-      const secretsFile = path.join(tempDir, "secrets.json");
-      fs.writeFileSync(
-        secretsFile,
-        JSON.stringify({
-          __global__: { key: "NOPE", value: "1" },
-          "/repo": "not-an-array",
-          "/repo/": [{ key: "A", value: "1" }, null, { key: 123, value: "x" }],
-        })
-      );
-
-      expect(config.getGlobalSecrets()).toEqual([]);
-      expect(config.getProjectSecrets("/repo")).toEqual([{ key: "A", value: "1" }]);
-    });
-    it("sanitizes malformed injectAll values without dropping valid secrets", async () => {
-      const projectPath = "/repo";
-      const secretsFile = path.join(tempDir, "secrets.json");
-      fs.writeFileSync(
-        secretsFile,
-        JSON.stringify({
-          __global__: [{ key: "GLOBAL_TOKEN", value: "abc", injectAll: "true" }],
-          [projectPath]: [{ key: "TOKEN", value: { secret: "GLOBAL_TOKEN" } }],
-        })
-      );
-
-      expect(config.getGlobalSecrets()).toEqual([{ key: "GLOBAL_TOKEN", value: "abc" }]);
-      expect(await secretsToRecord(config.getEffectiveSecrets(projectPath))).toEqual({
-        TOKEN: "abc",
-      });
-    });
-  });
-
-  /**
-   * Simulate a crashed lock/lease holder: backdate every generation marker
-   * past the TTL and rewrite its owner PID to one that provably does not
-   * exist (stale-breaking requires BOTH — a live process's lock is never
-   * broken).
-   */
-  function markCrashedHolder(lockPath: string, ttlMs: number): void {
-    const staleTime = new Date(Date.now() - ttlMs - 1_000);
-    for (const entry of fs.readdirSync(lockPath)) {
-      const entryPath = path.join(lockPath, entry);
-      fs.writeFileSync(entryPath, "999999999");
-      fs.utimesSync(entryPath, staleTime, staleTime);
-    }
-  }
-
-  describe("tryAcquireCoderOauthClientLease", () => {
-    const TTL_MS = 60_000;
-
-    it("is exclusive until released, including for a second Config on the same root", () => {
-      const release = config.tryAcquireCoderOauthClientLease(TTL_MS);
-      expect(release).not.toBeNull();
-
-      // Same file root = same lease, even from another Config instance
-      // (stands in for another Shux process sharing providers.jsonc).
-      const otherProcess = new Config(tempDir);
-      expect(otherProcess.tryAcquireCoderOauthClientLease(TTL_MS)).toBeNull();
-
-      release!();
-      const reacquired = otherProcess.tryAcquireCoderOauthClientLease(TTL_MS);
-      expect(reacquired).not.toBeNull();
-      reacquired!();
-    });
-
-    it("breaks a stale lease left behind by a crashed holder", () => {
-      const leasePath = path.join(tempDir, "providers.jsonc.coder-client.lock");
-      fs.mkdirSync(leasePath, { recursive: true });
-      const staleTime = new Date(Date.now() - TTL_MS - 1_000);
-      fs.utimesSync(leasePath, staleTime, staleTime);
-
-      const release = config.tryAcquireCoderOauthClientLease(TTL_MS);
-      expect(release).not.toBeNull();
-      release!();
-      expect(fs.existsSync(leasePath)).toBe(false);
-    });
-
-    it("judges staleness by the holder's generation marker, not the lease directory", () => {
-      const leasePath = path.join(tempDir, "providers.jsonc.coder-client.lock");
-
-      const release = config.tryAcquireCoderOauthClientLease(TTL_MS);
-      expect(release).not.toBeNull();
-
-      // A breaker that judged staleness by the directory alone could destroy
-      // a live successor generation created between its check and its remove
-      // (check/remove TOCTOU). Binding staleness to the marker file makes the
-      // destructive steps conditional: a fresh marker keeps the lease held
-      // even when the directory timestamp looks stale.
-      const staleTime = new Date(Date.now() - TTL_MS - 1_000);
-      fs.utimesSync(leasePath, staleTime, staleTime);
-
-      const otherProcess = new Config(tempDir);
-      expect(otherProcess.tryAcquireCoderOauthClientLease(TTL_MS)).toBeNull();
-      release!();
-    });
-
-    it("does not stale-break a lease whose holder process is still alive", () => {
-      const leasePath = path.join(tempDir, "providers.jsonc.coder-client.lock");
-
-      const release = config.tryAcquireCoderOauthClientLease(TTL_MS);
-      expect(release).not.toBeNull();
-
-      // The holder outlives the TTL but its process (this one) is alive —
-      // e.g. a suspended laptop or a stalled event loop. Breaking it would
-      // let a second flow enter the same critical section and race the
-      // resumed original; contenders must fail acquisition instead.
-      const staleTime = new Date(Date.now() - TTL_MS - 1_000);
-      for (const entry of fs.readdirSync(leasePath)) {
-        fs.utimesSync(path.join(leasePath, entry), staleTime, staleTime);
-      }
-
-      const otherProcess = new Config(tempDir);
-      expect(otherProcess.tryAcquireCoderOauthClientLease(TTL_MS)).toBeNull();
-      release!();
-    });
-
-    it("does not release a lease that was stale-broken and reacquired by another process", () => {
-      const leasePath = path.join(tempDir, "providers.jsonc.coder-client.lock");
-
-      const originalRelease = config.tryAcquireCoderOauthClientLease(TTL_MS);
-      expect(originalRelease).not.toBeNull();
-
-      // The lease crosses the staleness boundary and its holder "crashes"
-      // (staleness binds to the holder's generation marker + a gone owner
-      // PID); another process breaks it and acquires its own generation of
-      // the same path.
-      markCrashedHolder(leasePath, TTL_MS);
-      const otherProcess = new Config(tempDir);
-      const otherRelease = otherProcess.tryAcquireCoderOauthClientLease(TTL_MS);
-      expect(otherRelease).not.toBeNull();
-
-      // The original holder's late release must NOT remove the new owner's
-      // lease — otherwise a third flow could acquire it concurrently and two
-      // flows would clobber the stored client's single redirect slot.
-      originalRelease!();
-      expect(fs.existsSync(leasePath)).toBe(true);
-      expect(config.tryAcquireCoderOauthClientLease(TTL_MS)).toBeNull();
-
-      // The rightful owner can still release it.
-      otherRelease!();
-      expect(fs.existsSync(leasePath)).toBe(false);
-    });
-
-    it("reclaims a dead-owner lease immediately, before the TTL elapses", () => {
-      // Regression: a crashed holder's PID is deterministically dead, so
-      // contenders must recover the orphan right away. Gating recovery on
-      // the mtime TTL (which exceeds every acquisition timeout) would make
-      // the first operation after a crash always fail despite the owner
-      // being provably gone.
-      const leasePath = path.join(tempDir, "providers.jsonc.coder-client.lock");
-      fs.mkdirSync(leasePath, { recursive: true });
-      // Fresh mtime (NOT backdated) + dead owner PID.
-      fs.writeFileSync(path.join(leasePath, "owner-crashed"), "999999999");
-
-      const release = config.tryAcquireCoderOauthClientLease(TTL_MS);
-      expect(release).not.toBeNull();
-      release!();
-    });
-
-    it("reclaims an EMPTY orphaned lease directory immediately, before the TTL elapses", () => {
-      // Regression: acquisition installs the owner marker atomically with the
-      // lock directory (staged rename), so an empty directory can only be a
-      // crash remnant — never a live acquisition. A fresh-mtime empty orphan
-      // previously read as live until the TTL, and every acquisition timeout
-      // is shorter than its TTL, so the first operation after such a crash
-      // always failed.
-      const leasePath = path.join(tempDir, "providers.jsonc.coder-client.lock");
-      fs.mkdirSync(leasePath, { recursive: true }); // Fresh mtime, no marker.
-
-      const release = config.tryAcquireCoderOauthClientLease(TTL_MS);
-      expect(release).not.toBeNull();
-      release!();
-      expect(fs.existsSync(leasePath)).toBe(false);
-    });
-
-    it("sweeps stage directories abandoned by a crashed acquisition", () => {
-      const leasePath = path.join(tempDir, "providers.jsonc.coder-client.lock");
-      const abandonedStage = `${leasePath}.stage-deadbeef`;
-      fs.mkdirSync(abandonedStage, { recursive: true });
-      fs.writeFileSync(path.join(abandonedStage, "owner-orphan"), "999999999");
-      const staleTime = new Date(Date.now() - TTL_MS - 1_000);
-      fs.utimesSync(abandonedStage, staleTime, staleTime);
-      // A FRESH stage may belong to a concurrent in-flight acquisition and
-      // must survive the sweep.
-      const freshStage = `${leasePath}.stage-cafebabe`;
-      fs.mkdirSync(freshStage, { recursive: true });
-
-      const release = config.tryAcquireCoderOauthClientLease(TTL_MS);
-      expect(release).not.toBeNull();
-      release!();
-
-      expect(fs.existsSync(abandonedStage)).toBe(false);
-      expect(fs.existsSync(freshStage)).toBe(true);
-    });
-  });
-
-  describe("withProvidersFileLock", () => {
-    it("acquires over a dead-owner lock immediately, before the TTL elapses", async () => {
-      // Same regression as the lease variant: withDirLock's acquisition
-      // timeout (5s) is shorter than its staleness TTL (10s), so a fresh
-      // crash orphan must be reclaimed via the dead-PID check or the first
-      // config write after the crash would always time out.
-      const lockPath = path.join(tempDir, "providers.jsonc.lock");
-      fs.mkdirSync(lockPath, { recursive: true });
-      fs.writeFileSync(path.join(lockPath, "owner-crashed"), "999999999");
-
-      const startedAt = Date.now();
-      const result = await config.withProvidersFileLock(() => "ran");
-      expect(result).toBe("ran");
-      // Well under the 5s acquisition timeout: the orphan was reclaimed on
-      // the first contention check, not waited out.
-      expect(Date.now() - startedAt).toBeLessThan(2_000);
-      expect(fs.existsSync(lockPath)).toBe(false);
-    });
-
-    it("acquires over an EMPTY orphaned lock directory immediately, before the TTL elapses", async () => {
-      // Regression: acquisition installs the owner marker atomically with the
-      // lock directory (staged rename), so an empty directory can only be a
-      // crash remnant — never a live acquisition. Previously a fresh-mtime
-      // empty orphan read as live until the 10s TTL, and the 5s acquisition
-      // timeout always fired first, so the first config write after such a
-      // crash always timed out.
-      const lockPath = path.join(tempDir, "providers.jsonc.lock");
-      fs.mkdirSync(lockPath, { recursive: true }); // Fresh mtime, no marker.
-
-      const startedAt = Date.now();
-      const result = await config.withProvidersFileLock(() => "ran");
-      expect(result).toBe("ran");
-      expect(Date.now() - startedAt).toBeLessThan(2_000);
-      expect(fs.existsSync(lockPath)).toBe(false);
-    });
-  });
-
-  describe("withCoderOauthRefreshLock", () => {
-    it("serializes critical sections, including across Config instances on the same root", async () => {
-      // A second Config on the same root stands in for another Shux process
-      // sharing providers.jsonc.
-      const otherProcess = new Config(tempDir);
-      const events: string[] = [];
-      let releaseFirst!: () => void;
-      const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
-      let firstEntered!: () => void;
-      const firstEnteredPromise = new Promise<void>((resolve) => (firstEntered = resolve));
-
-      const first = config.withCoderOauthRefreshLock(async () => {
-        events.push("first:enter");
-        firstEntered();
-        await firstGate;
-        events.push("first:exit");
-      });
-      await firstEnteredPromise;
-
-      const second = otherProcess.withCoderOauthRefreshLock(() => {
-        events.push("second:enter");
-      });
-      // The second section must not start while the first holds the lock.
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      expect(events).toEqual(["first:enter"]);
-
-      releaseFirst();
-      await Promise.all([first, second]);
-      expect(events).toEqual(["first:enter", "first:exit", "second:enter"]);
-    });
-
-    it("does not release a successor's lock after being stale-broken mid-section", async () => {
-      // A holder that outlives staleLockMs (suspended process, stalled event
-      // loop) can be stale-broken and the lock reacquired before its release
-      // runs. That release must only remove its OWN generation — deleting the
-      // successor's lock would let a third process into the critical section
-      // (for the refresh lock, the concurrent rotating-refresh-token race).
-      const lockPath = path.join(tempDir, "providers.jsonc.coder-refresh.lock");
-      const otherProcess = new Config(tempDir);
-
-      let releaseFirst!: () => void;
-      const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
-      let firstEntered!: () => void;
-      const firstEnteredPromise = new Promise<void>((resolve) => (firstEntered = resolve));
-      const first = config.withCoderOauthRefreshLock(async () => {
-        firstEntered();
-        await firstGate;
-      });
-      await firstEnteredPromise;
-
-      // The first holder's process "crashes" past the staleness boundary
-      // (backdated marker + gone owner PID) while its release closure is
-      // still pending, and a second process stale-breaks + reacquires.
-      markCrashedHolder(lockPath, 120_000);
-      let releaseSecond!: () => void;
-      const secondGate = new Promise<void>((resolve) => (releaseSecond = resolve));
-      let secondEntered!: () => void;
-      const secondEnteredPromise = new Promise<void>((resolve) => (secondEntered = resolve));
-      const second = otherProcess.withCoderOauthRefreshLock(async () => {
-        secondEntered();
-        await secondGate;
-      });
-      await secondEnteredPromise;
-
-      // The original holder finishes while the successor still holds the
-      // lock: its release must keep the successor's generation in place.
-      releaseFirst();
-      await first;
-      expect(fs.existsSync(lockPath)).toBe(true);
-      expect(fs.readdirSync(lockPath).length).toBe(1);
-
-      releaseSecond();
-      await second;
-      // The successor's own release still cleans up normally.
-      expect(fs.existsSync(lockPath)).toBe(false);
     });
   });
 });

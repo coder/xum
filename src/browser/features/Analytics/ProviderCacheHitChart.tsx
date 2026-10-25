@@ -23,6 +23,7 @@ const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   anthropic: "Anthropic",
   openai: "OpenAI",
   google: "Google",
+  "google-vertex": "Google Vertex AI",
   xai: "xAI",
   unknown: "Unknown",
 };
@@ -76,7 +77,8 @@ function ProviderCacheHitTooltipContent(props: {
         <span className="text-foreground font-mono">{formatPercent(row.cacheHitRatio)}</span>
       </div>
       <div className="text-muted flex items-center justify-between gap-2">
-        <span>Responses</span>
+        {/* Chat turns only: background rows are not counted yet (#5778). */}
+        <span>Chat responses</span>
         <span className="text-foreground font-mono">{formatCompactNumber(row.responseCount)}</span>
       </div>
     </div>

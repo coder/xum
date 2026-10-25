@@ -4,19 +4,16 @@ import AnthropicIcon from "@/browser/assets/icons/anthropic.svg?react";
 import OpenAIIcon from "@/browser/assets/icons/openai.svg?react";
 import GoogleIcon from "@/browser/assets/icons/google.svg?react";
 import XAIIcon from "@/browser/assets/icons/xai.svg?react";
+import MetaIcon from "@/browser/assets/icons/meta.svg?react";
 import OpenRouterIcon from "@/browser/assets/icons/openrouter.svg?react";
 import OllamaIcon from "@/browser/assets/icons/ollama.svg?react";
 import DeepSeekIcon from "@/browser/assets/icons/deepseek.svg?react";
 import MoonshotAIIcon from "@/browser/assets/icons/moonshotai.svg?react";
+import ZaiIcon from "@/browser/assets/icons/zai.svg?react";
 import AWSIcon from "@/browser/assets/icons/aws.svg?react";
 import GitHubIcon from "@/browser/assets/icons/github.svg?react";
 import CoderIcon from "@/browser/assets/icons/coder.svg?react";
-import { GatewayIcon } from "@/browser/components/icons/GatewayIcon/GatewayIcon";
-import {
-  PROVIDER_DEFINITIONS,
-  PROVIDER_DISPLAY_NAMES,
-  type ProviderName,
-} from "@/common/constants/providers";
+import { PROVIDER_DISPLAY_NAMES, type ProviderName } from "@/common/constants/providers";
 import { cn } from "@/common/lib/utils";
 
 /**
@@ -27,13 +24,15 @@ const PROVIDER_ICONS: Partial<Record<ProviderName, React.FC>> = {
   anthropic: AnthropicIcon,
   openai: OpenAIIcon,
   google: GoogleIcon,
+  "google-vertex": GoogleIcon,
   xai: XAIIcon,
+  meta: MetaIcon,
   deepseek: DeepSeekIcon,
   moonshotai: MoonshotAIIcon,
+  zai: ZaiIcon,
   openrouter: OpenRouterIcon,
   bedrock: AWSIcon,
   ollama: OllamaIcon,
-  "mux-gateway": GatewayIcon,
   "github-copilot": GitHubIcon,
   coder: CoderIcon,
 };
@@ -58,17 +57,12 @@ export function ProviderIcon(props: ProviderIconProps) {
   const providerName = props.provider as ProviderName;
   const IconComponent = PROVIDER_ICONS[providerName];
 
-  // Check if this provider uses stroke-based icon styling (from PROVIDER_DEFINITIONS).
-  // Unknown custom providers use the fallback lucide icon, which is stroke based.
-  const def = PROVIDER_DEFINITIONS[providerName] as { strokeBasedIcon?: boolean } | undefined;
-  const isStrokeBased = IconComponent ? (def?.strokeBasedIcon ?? false) : true;
-
   return (
     <span
       className={cn(
         "inline-block h-[1em] w-[1em] align-[-0.125em] [&_svg]:block [&_svg]:h-full [&_svg]:w-full",
-        // Stroke-based icons (like GatewayIcon) use stroke for color, others use fill.
-        isStrokeBased
+        // The lucide fallback for custom providers is stroke based; provider SVGs use fill.
+        IconComponent == null
           ? "[&_svg]:stroke-current [&_svg]:fill-none"
           : "[&_svg]:fill-current [&_svg_.st0]:fill-current",
         props.className

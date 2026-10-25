@@ -1,5 +1,31 @@
+/**
+ * Provider configuration service (providers.jsonc + provider-relevant main
+ * config state).
+ *
+ * Mutation internals are Effect-native: each fallible pipeline is an
+ * `Effect.gen` program and the public Promise methods are thin
+ * `Effect.runPromise` facades, so pre-Effect callers (OAuth services, tests)
+ * keep working unchanged while oRPC routes ride `handlerGen` directly. Every
+ * mutation pipeline is uninterruptible (see `asAtomicMutation`), so a client
+ * abort defers until the write and its post-write consistency steps finish —
+ * matching the pre-Effect Promise chains, which aborts never cancelled.
+ * The wire `Result` unions stay in the success
+ * channel — callers branch on `success`, not on thrown errors — and the only
+ * typed failure is `ProviderPersistenceError`, which carries the
+ * `getErrorMessage` string each facade folds into its own wire error shape
+ * (`persistence_failed` codes / `Failed to ...` strings), exactly like the
+ * old per-method try/catch blocks did.
+ *
+ * Synchronous read paths (`list`, `getConfig`, `validateRouteOverrides`) stay
+ * plain methods: they compose no async work, so an Effect conversion would
+ * add fiber overhead without composition benefit.
+ */
+import { discoverProviderModels } from "./providerModelDiscovery";
+import { discoverBedrockModels } from "./bedrockModelDiscovery";
 import { EventEmitter } from "events";
-import type { Config, ProjectsConfig } from "@/node/config";
+import { Effect, Schema } from "effect";
+import type { Config, ProjectsConfig, ProvidersConfig } from "@/node/config";
+import { FileLeaseManager, ProvidersConfigStore } from "@/node/config";
 import {
   PROVIDER_DEFINITIONS,
   SUPPORTED_PROVIDERS,
@@ -8,27 +34,32 @@ import {
 import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig";
 import type { Result } from "@/common/types/result";
 import type {
-  AddCustomOpenAICompatibleProviderInput,
-  AWSCredentialStatus,
+  AddCustomProviderInput,
   CustomProviderMutationError,
   ProviderConfigInfo,
   ProviderModelEntry,
+  ProviderModelDiscoveryResult,
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 import { isProviderDisabledInConfig } from "@/common/utils/providers/isProviderDisabled";
 import { modelStringStartsWithProvider } from "@/common/utils/providers/modelString";
 import { resolveConfigBaseUrl } from "@/common/utils/providers/baseUrl";
+import { sessionHeaderNameError } from "@/common/utils/providers/sessionHeader";
 import {
-  getCustomOpenAICompatibleProviderIds,
-  getShadowedCustomOpenAICompatibleProviderIds,
+  baseUrlQueryFragmentError,
+  getCustomProviderIds,
+  getShadowedCustomProviderIds,
   isBuiltInProvider,
-  isCustomOpenAICompatibleProviderConfig,
+  isCustomProviderConfig,
+  isCustomProviderType,
+  validateCustomProviderBaseUrl,
   validateCustomProviderId,
   type ProvidersConfigWithProviderType,
 } from "@/common/utils/providers/customProviders";
 import {
   getProviderModelEntryId,
   normalizeProviderModelEntries,
+  userManagedModelEntries,
 } from "@/common/utils/providers/modelEntries";
 import { log } from "@/node/services/log";
 import {
@@ -36,44 +67,23 @@ import {
   isLegacyOpApiKey,
   isProviderAutoRouteEligible,
   resolveProviderCredentials,
+  resolveCustomProviderCredentials,
+  resolveGoogleVertexEnvSettings,
 } from "@/node/utils/providerRequirements";
 import { parseCodexOauthAuth } from "@/node/utils/codexOauthAuth";
 import {
   normalizeCoderDeploymentUrl,
+  parseCoderCanonicalRoutes,
   parseCoderGatewayProviders,
 } from "@/common/constants/coderOAuth";
 import { parseCoderOauthAuth } from "@/node/utils/coderOauthAuth";
-import type { PolicyService } from "@/node/services/policyService";
 import { getErrorMessage } from "@/common/utils/errors";
+import { MODEL_DISCOVERY_BASE_URLS } from "@/constants/modelDiscovery";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 
-// Re-export types for backward compatibility
-export type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap };
-
-function filterProviderModelsByPolicy(
-  models: ProviderModelEntry[] | undefined,
-  allowedModels: string[] | null
-): ProviderModelEntry[] | undefined {
-  if (!models) {
-    return undefined;
-  }
-
-  if (!Array.isArray(allowedModels)) {
-    return models;
-  }
-
-  return models.filter((entry) => allowedModels.includes(getProviderModelEntryId(entry)));
-}
-
-function buildCustomProviderConfigInfo(
-  config: BaseProviderConfig,
-  policy?: { forcedBaseUrl?: string; allowedModels?: string[] | null }
-): ProviderConfigInfo {
-  const baseUrl = policy?.forcedBaseUrl ?? resolveConfigBaseUrl(config);
-  const models = filterProviderModelsByPolicy(
-    normalizeProviderModelEntries(config.models),
-    policy?.allowedModels ?? null
-  );
+function buildCustomProviderConfigInfo(config: BaseProviderConfig): ProviderConfigInfo {
+  const baseUrl = resolveConfigBaseUrl(config);
+  const models = normalizeProviderModelEntries(config.models);
   // Legacy op:// references are ignored at runtime, so report them as "not set".
   const apiKeySet =
     typeof config.apiKey === "string" &&
@@ -87,23 +97,65 @@ function buildCustomProviderConfigInfo(
     apiKeyFile,
     apiKeySource: apiKeySet ? "config" : apiKeyFile ? "file" : "keyless",
     baseUrl,
+    // providers.jsonc loads without schema validation; a non-string would
+    // throw in the request path (see sessionHeader.ts).
+    sessionHeader: typeof config.sessionHeader === "string" ? config.sessionHeader : undefined,
     models,
     displayName: config.displayName,
-    providerType: "openai-compatible",
+    providerType: config.providerType ?? "openai-compatible",
     isCustom: true,
     isEnabled,
     isConfigured: isEnabled && baseUrl !== undefined,
   };
 }
 
+function nonBlankString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
+}
+
+/**
+ * Vertex settings for the UI: the service-account key file path is reported only
+ * as set/unset. Blank saved values count as unset (runtime ignores them too), and
+ * env-sourced values are reported separately so Settings can show where they come from.
+ */
+function googleVertexCredentialStatus(
+  config: { project?: unknown; location?: unknown; keyFilename?: unknown },
+  env: Record<string, string | undefined>
+): NonNullable<ProviderConfigInfo["googleVertex"]> {
+  const project = nonBlankString(config.project);
+  const location = nonBlankString(config.location);
+  const keyFilenameSet = nonBlankString(config.keyFilename) != null;
+  const envSettings = resolveGoogleVertexEnvSettings(env);
+  return {
+    project,
+    location,
+    envProject: project == null ? envSettings.project : undefined,
+    envLocation: location == null ? envSettings.location : undefined,
+    keyFilenameSet,
+    envKeyFilenameSet: !keyFilenameSet && envSettings.keyFilename != null,
+  };
+}
+
 const DENIED_KEY_PATH_SEGMENTS = new Set(["__proto__", "prototype", "constructor"]);
 
-type CustomProviderMutationResult<T> = Result<T, CustomProviderMutationError>;
-
-interface ProviderPolicy {
-  forcedBaseUrl?: string;
-  allowedModels?: string[] | null;
+/** Value-only guards that run before the lock. "" always passes: it clears the key. */
+function configEditValueError(keyPath: string[], value: string | boolean): string | null {
+  if (keyPath.length !== 1 || value === "") return null;
+  const key = keyPath[0];
+  // No SDK adapter survives a query/fragment in its base URL (endpoint paths
+  // are raw-appended). `baseURL` is the legacy SDK-style alias.
+  if (key === "baseUrl" || key === "baseURL") {
+    return typeof value === "string" ? baseUrlQueryFragmentError(value) : null;
+  }
+  if (key === "sessionHeader") {
+    return typeof value === "string"
+      ? sessionHeaderNameError(value)
+      : "Session header must be a header name.";
+  }
+  return null;
 }
+
+type CustomProviderMutationResult<T> = Result<T, CustomProviderMutationError>;
 
 function addErrorReason<T extends CustomProviderMutationError>(
   error: T,
@@ -116,15 +168,6 @@ function addErrorReason<T extends CustomProviderMutationError>(
   return { ...error, reason };
 }
 
-function isValidHttpBaseUrl(baseUrl: string): boolean {
-  try {
-    const url = new URL(baseUrl);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
 function getProviderConfigRecord(config: unknown): Record<string, BaseProviderConfig> {
   if (typeof config !== "object" || config === null || Array.isArray(config)) {
     return {};
@@ -133,8 +176,35 @@ function getProviderConfigRecord(config: unknown): Record<string, BaseProviderCo
   return config as Record<string, BaseProviderConfig>;
 }
 
+/**
+ * Typed failure for providers.jsonc / main-config write pipelines. `message`
+ * carries `getErrorMessage(cause)` so each facade folds it into its wire
+ * error shape without reformatting. A single tag is deliberate: no caller
+ * branches on WHICH write failed, only on the folded wire `Result`.
+ */
+class ProviderPersistenceError extends Schema.TaggedError<ProviderPersistenceError>()(
+  "ProviderPersistenceError",
+  { message: Schema.String }
+) {}
+
+function toPersistenceError(error: unknown): ProviderPersistenceError {
+  return new ProviderPersistenceError({ message: getErrorMessage(error) });
+}
+
+/**
+ * Provider mutations must run their write + post-write consistency steps
+ * (change notification, gateway routePriority sync, durable-reference
+ * repair) to completion once started: a client abort interrupting the
+ * handler fiber mid-lock would otherwise persist the callback's write while
+ * skipping the follow-ups, leaving observers and routing state inconsistent.
+ * The pre-Effect implementation had exactly these semantics — an aborted
+ * oRPC request never cancelled the running Promise chain.
+ */
+function asAtomicMutation<A, E>(effect: Effect.Effect<A, E>): Effect.Effect<A, E> {
+  return Effect.uninterruptible(effect);
+}
+
 export class ProviderService {
-  private readonly policyService: PolicyService | null;
   private readonly emitter = new EventEmitter();
   private lastWarnedShadowedCustomProviderIds: Set<string> | null = null;
   private readonly stopWatchingProvidersFile: () => void;
@@ -146,13 +216,17 @@ export class ProviderService {
   // granularity (FAT, some network mounts) can collide on mtimeMs across
   // distinct writes, and an external edit that produces byte-identical
   // contents is a no-op anyway.
+  public readonly providersConfigStore: ProvidersConfigStore;
+  public readonly fileLeaseManager: FileLeaseManager;
   private lastSelfWriteFingerprint: string | null = null;
 
   constructor(
     private readonly config: Config,
-    policyService?: PolicyService
+    providersConfigStore?: ProvidersConfigStore,
+    fileLeaseManager?: FileLeaseManager
   ) {
-    this.policyService = policyService ?? null;
+    this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
+    this.fileLeaseManager = fileLeaseManager ?? new FileLeaseManager(config.rootDir);
     // The provider config subscription may have many concurrent listeners (e.g. multiple windows).
     // Avoid noisy MaxListenersExceededWarning for normal usage.
     this.emitter.setMaxListeners(50);
@@ -164,9 +238,9 @@ export class ProviderService {
     // the fingerprint captured by notifyFromMutation(); any external
     // edit that changes the bytes between the in-app save and the
     // watcher fire produces a different fingerprint and is forwarded.
-    this.stopWatchingProvidersFile = this.config.watchProvidersFile(() => {
+    this.stopWatchingProvidersFile = this.providersConfigStore.watchProvidersFile(() => {
       const expected = this.lastSelfWriteFingerprint;
-      const current = this.config.getProvidersFileFingerprint();
+      const current = this.providersConfigStore.getProvidersFileFingerprint();
       if (expected !== null && current !== null && current === expected) {
         // This watcher fire corresponds to our own write (or a benign
         // no-op external save with identical bytes). Clear the
@@ -199,7 +273,7 @@ export class ProviderService {
   /**
    * Notify subscribers that provider-relevant config has changed.
    * Called internally on provider config edits, and externally when
-   * main config changes affect provider availability (e.g. muxGatewayEnabled).
+   * other config changes affect provider availability.
    */
   notifyConfigChanged(): void {
     this.lastWarnedShadowedCustomProviderIds = null;
@@ -215,18 +289,33 @@ export class ProviderService {
    * accidentally suppressed.
    */
   private notifyFromMutation(): void {
-    this.lastSelfWriteFingerprint = this.config.getProvidersFileFingerprint();
+    this.lastSelfWriteFingerprint = this.providersConfigStore.getProvidersFileFingerprint();
     this.notifyConfigChanged();
   }
 
-  private listBuiltInProviders(): ProviderName[] {
-    const providers = [...SUPPORTED_PROVIDERS];
+  /**
+   * `notifyFromMutation` with a synchronously throwing subscriber routed into
+   * the error channel — the pre-Effect mutation methods invoked it inside
+   * their try/catch, so a subscriber throw folded into the wire error.
+   */
+  private notifyFromMutationEffect(): Effect.Effect<void, ProviderPersistenceError> {
+    return Effect.try({ try: () => this.notifyFromMutation(), catch: toPersistenceError });
+  }
 
-    if (this.policyService?.isEnforced()) {
-      return providers.filter((p) => this.policyService!.isProviderAllowed(p));
-    }
-
-    return providers;
+  /**
+   * Run a providers.jsonc read-modify-write callback under the cross-process
+   * lock (see FileLeaseManager.withProvidersFileLock). Lock acquisition
+   * failures and callback throws land in the error channel.
+   */
+  private providersFileLockEffect<T>(
+    callback: () => Promise<T> | T
+  ): Effect.Effect<T, ProviderPersistenceError> {
+    return Effect.tryPromise({
+      // async thunk: mirrors the old `await this.fileLeaseManager...`, which
+      // coerces non-Promise returns (e.g. a test double's synchronous lock).
+      try: async () => this.fileLeaseManager.withProvidersFileLock(callback),
+      catch: toPersistenceError,
+    });
   }
 
   private hasSameWarnedShadowedProviderIds(shadowedProviderIds: Set<string>): boolean {
@@ -250,9 +339,7 @@ export class ProviderService {
   private detectAndLogShadowedProviders(
     providersConfig: ProvidersConfigWithProviderType
   ): Set<string> {
-    const shadowedProviderIds = new Set(
-      getShadowedCustomOpenAICompatibleProviderIds(providersConfig)
-    );
+    const shadowedProviderIds = new Set(getShadowedCustomProviderIds(providersConfig));
 
     // list() and getConfig() can run during one UI render, so remember the
     // last detected shadow set to avoid duplicate warning noise for that cycle.
@@ -275,14 +362,10 @@ export class ProviderService {
 
   public list(): string[] {
     try {
-      const providers = this.listBuiltInProviders();
-      const providersConfig = this.config.loadProvidersConfig() ?? {};
-      const customProviderIds = getCustomOpenAICompatibleProviderIds(providersConfig);
+      const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
+      const customProviderIds = getCustomProviderIds(providersConfig);
       this.detectAndLogShadowedProviders(providersConfig);
-      const allowedCustomProviderIds = this.policyService?.isEnforced()
-        ? customProviderIds.filter((p) => this.policyService?.isProviderAllowed(p) ?? false)
-        : customProviderIds;
-      return Array.from(new Set([...providers, ...allowedCustomProviderIds]));
+      return Array.from(new Set([...SUPPORTED_PROVIDERS, ...customProviderIds]));
     } catch (error) {
       log.error("Failed to list providers:", error);
       return [];
@@ -292,13 +375,14 @@ export class ProviderService {
   /**
    * Get the full providers config with safe info (no actual API keys)
    */
-  public getConfig(): ProvidersConfigMap {
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
-    const mainConfig = this.config.loadConfigOrDefault();
+  public getConfig(snapshot?: ProvidersConfig): ProvidersConfigMap {
+    // Request builders can project their creation-time snapshot without racing
+    // a second disk read that changes instance types or scoped model aliases.
+    const providersConfig = snapshot ?? this.providersConfigStore.loadProvidersConfig() ?? {};
     const result: ProvidersConfigMap = {};
     const shadowedCustomProviderIds = this.detectAndLogShadowedProviders(providersConfig);
 
-    for (const provider of this.listBuiltInProviders()) {
+    for (const provider of SUPPORTED_PROVIDERS) {
       if (shadowedCustomProviderIds.has(provider)) {
         continue;
       }
@@ -313,7 +397,9 @@ export class ProviderService {
         wireFormat?: string;
         store?: unknown;
         webSocketTransportEnabled?: unknown;
+        cyberModelEnabled?: unknown;
         cacheTtl?: unknown;
+        speed?: unknown;
         disableBetaFeatures?: unknown;
         /** OpenAI-only: default auth precedence for Codex-OAuth-allowed models. */
         codexOauthDefaultAuth?: unknown;
@@ -323,6 +409,10 @@ export class ProviderService {
         bearerToken?: string;
         accessKeyId?: string;
         secretAccessKey?: string;
+        /** Google Vertex AI-only: GCP project, location, and service-account key file. */
+        project?: string;
+        location?: string;
+        keyFilename?: string;
         /** Persisted provider toggle: only `false` is stored; missing means enabled. */
         enabled?: unknown;
         /** OpenAI-only: stored Codex OAuth tokens (never sent to frontend). */
@@ -333,33 +423,22 @@ export class ProviderService {
         coderOauth?: unknown;
         /** Coder-only: model IDs discovered from the deployment's AI Bridge. */
         discoveredModels?: unknown;
-        /** Coder-only: model IDs the user explicitly removed. */
+        /** Coder-only: legacy routing tombstones (see providersConfig.ts). */
         removedModels?: unknown;
         /** Coder-only: discovered AI Gateway provider instances ({name, type}). */
         discoveredProviders?: unknown;
         /** Coder-only: user-declared AI Gateway provider instances ({name, type}). */
         additionalProviders?: unknown;
+        /** Coder-only: canonical provider -> gateway instance mapping. */
+        canonicalRoutes?: unknown;
       };
-
-      const forcedBaseUrl = this.policyService?.isEnforced()
-        ? this.policyService.getForcedBaseUrl(provider)
-        : undefined;
-
-      const allowedModels = this.policyService?.isEnforced()
-        ? (this.policyService.getEffectivePolicy()?.providerAccess?.find((p) => p.id === provider)
-            ?.allowedModels ?? null)
-        : null;
 
       const normalizedModels =
         config.models === undefined ? undefined : normalizeProviderModelEntries(config.models);
-      const filteredModels = filterProviderModelsByPolicy(normalizedModels, allowedModels);
 
       const codexOauthSet =
         provider === "openai" && parseCodexOauthAuth(config.codexOauth) !== null;
-      let isEnabled = !isProviderDisabledInConfig(config);
-      if (provider === "mux-gateway" && mainConfig.muxGatewayEnabled === false) {
-        isEnabled = false;
-      }
+      const isEnabled = !isProviderDisabledInConfig(config);
 
       const explicitBaseUrl = resolveConfigBaseUrl(config);
 
@@ -369,9 +448,9 @@ export class ProviderService {
         // Users can disable providers without removing credentials from providers.jsonc.
         isEnabled,
         isConfigured: false, // computed below
-        baseUrl: forcedBaseUrl ?? explicitBaseUrl,
+        baseUrl: explicitBaseUrl,
         apiKeyFile: typeof config.apiKeyFile === "string" ? config.apiKeyFile : undefined,
-        models: filteredModels,
+        models: normalizedModels,
       };
 
       // Provider processing tier. OpenAI and xAI share the service_tier field,
@@ -382,7 +461,8 @@ export class ProviderService {
         (serviceTier === "auto" ||
           serviceTier === "default" ||
           serviceTier === "flex" ||
-          serviceTier === "priority");
+          serviceTier === "priority" ||
+          serviceTier === "ultrafast");
       const validXAIServiceTier =
         provider === "xai" && (serviceTier === "default" || serviceTier === "priority");
       if (validOpenAIServiceTier || validXAIServiceTier) {
@@ -395,6 +475,7 @@ export class ProviderService {
         (fastModePreviousServiceTier === "auto" ||
           fastModePreviousServiceTier === "default" ||
           fastModePreviousServiceTier === "flex" ||
+          fastModePreviousServiceTier === "ultrafast" ||
           fastModePreviousServiceTier === "unset");
       const validXAIFastModePreviousTier =
         provider === "xai" &&
@@ -422,10 +503,19 @@ export class ProviderService {
         providerInfo.webSocketTransportEnabled = config.webSocketTransportEnabled;
       }
 
+      if (provider === "openai" && typeof config.cyberModelEnabled === "boolean") {
+        providerInfo.cyberModelEnabled = config.cyberModelEnabled;
+      }
+
       // Anthropic-specific fields
       const cacheTtl = config.cacheTtl;
       if (provider === "anthropic" && (cacheTtl === "5m" || cacheTtl === "1h")) {
         providerInfo.cacheTtl = cacheTtl;
+      }
+
+      // Anthropic-specific: Fast mode preference (only "fast" changes requests).
+      if (provider === "anthropic" && config.speed === "fast") {
+        providerInfo.speed = "fast";
       }
 
       // Anthropic-specific: disable all beta features for ZDR orgs.
@@ -452,21 +542,19 @@ export class ProviderService {
         };
       }
 
+      if (provider === "google-vertex") {
+        providerInfo.googleVertex = googleVertexCredentialStatus(config, process.env);
+      }
+
       // Coder-specific fields: deployment URL + OAuth connection status.
       // "Connected" only when the stored tokens were minted by the deployment
       // actually used for routing (tokens are issuer-bound; see
-      // coderOauthAuth.ts). Policy can force that URL, in which case the raw
-      // editable field is ignored here exactly like it is for routing (see
-      // coderEffectiveProviderConfig in providerModelFactory.ts) — otherwise
-      // editing the unlocked field would report "Not connected" while
-      // requests keep working against the forced deployment.
+      // coderOauthAuth.ts).
       if (provider === "coder") {
         const coderOauth = parseCoderOauthAuth(config.coderOauth);
-        const effectiveDeploymentUrl = forcedBaseUrl ?? config.deploymentUrl;
+        const deploymentUrl = config.deploymentUrl;
         const configuredDeploymentUrl =
-          typeof effectiveDeploymentUrl === "string"
-            ? normalizeCoderDeploymentUrl(effectiveDeploymentUrl)
-            : null;
+          typeof deploymentUrl === "string" ? normalizeCoderDeploymentUrl(deploymentUrl) : null;
         providerInfo.coderOauthSet =
           coderOauth !== null &&
           configuredDeploymentUrl !== null &&
@@ -476,28 +564,21 @@ export class ProviderService {
         // (a full-privilege credential on its own issuer) must remain
         // disconnectable/revocable from the UI without restoring the URL.
         providerInfo.coderOauthCredentialStored = coderOauth !== null;
-        if (typeof effectiveDeploymentUrl === "string" && effectiveDeploymentUrl) {
-          providerInfo.deploymentUrl = effectiveDeploymentUrl;
+        if (typeof deploymentUrl === "string" && deploymentUrl) {
+          providerInfo.deploymentUrl = deploymentUrl;
         }
         // The discovered AI Bridge catalog gates gateway routing (see
         // gatewayModelCatalog.ts); the frontend needs it to mirror the
         // backend's accessibility decisions. Presence matters (present []
         // means "authoritatively empty"), so only a missing key is dropped.
-        // The persisted catalog is policy-unfiltered by design (a temporary
-        // policy must not carve models out of durable state); the CURRENT
-        // policy is applied here at exposure time, like `models` above.
         if (Array.isArray(config.discoveredModels)) {
-          const discovered = config.discoveredModels.filter(
+          providerInfo.discoveredModels = config.discoveredModels.filter(
             (id): id is string => typeof id === "string"
           );
-          providerInfo.discoveredModels = Array.isArray(allowedModels)
-            ? discovered.filter((id) => allowedModels.includes(id))
-            : discovered;
         }
         // Gateway provider instance metadata ({name, type}): option/header
         // builders and the frontend derive the wire protocol for
-        // gateway-scoped coder:<name>/<model> strings from these. Not policy
-        // filtered — instance metadata is routing plumbing, not model access.
+        // gateway-scoped coder:<name>/<model> strings from these.
         const discoveredProviders = parseCoderGatewayProviders(config.discoveredProviders);
         if (discoveredProviders.length > 0) {
           providerInfo.discoveredProviders = discoveredProviders;
@@ -506,10 +587,13 @@ export class ProviderService {
         if (additionalProviders.length > 0) {
           providerInfo.additionalProviders = additionalProviders;
         }
-        // Durable user removals gate accessibility even while the discovered
-        // catalog is unknown (see gatewayModelCatalog.ts); the frontend needs
-        // them to mirror the backend's routing decisions. No policy filter:
-        // removals are user intent, not catalog content.
+        const canonicalRoutes = parseCoderCanonicalRoutes(config.canonicalRoutes);
+        if (Object.keys(canonicalRoutes).length > 0) {
+          providerInfo.canonicalRoutes = canonicalRoutes;
+        }
+        // Legacy removal tombstones gate accessibility even while the
+        // discovered catalog is unknown (see gatewayModelCatalog.ts); the
+        // frontend needs them to mirror the backend's routing decisions.
         if (Array.isArray(config.removedModels)) {
           const removed = config.removedModels.filter((id): id is string => typeof id === "string");
           if (removed.length > 0) {
@@ -518,33 +602,12 @@ export class ProviderService {
         }
       }
 
-      // Shux Gateway-specific fields (check couponCode first, fallback to legacy voucher).
-      // Gateway stores enabled/models in the global config (~/.shux/config.json), not
-      // in providers.jsonc, so override the generic isEnabled with the gateway-specific value.
-      if (provider === "mux-gateway") {
-        const muxConfig = config as { couponCode?: string; voucher?: string };
-        providerInfo.couponCodeSet = !!(muxConfig.couponCode ?? muxConfig.voucher);
-        const globalConfig = this.config.loadConfigOrDefault();
-        providerInfo.isEnabled = globalConfig.muxGatewayEnabled !== false;
-        providerInfo.gatewayModels = globalConfig.muxGatewayModels ?? [];
-      }
-
       // Compute isConfigured using shared utility (checks config + env vars).
       // Disabled providers intentionally surface as not configured in the UI.
-      // Use providerInfo.isEnabled (not the local `isEnabled`) because gateway
-      // overrides it from global config — using the providers.jsonc value would
-      // make a disabled gateway appear configured.
-      // Coder credentials are issuer-bound: when policy forces the base URL,
-      // configured-state must resolve against that URL (mirroring routing),
-      // not the raw editable deploymentUrl field.
-      const effectiveCheckConfig =
-        provider === "coder" && forcedBaseUrl !== undefined
-          ? { ...config, deploymentUrl: forcedBaseUrl }
-          : config;
-      const configCheck = checkProviderConfigured(provider, effectiveCheckConfig);
-      providerInfo.isConfigured = providerInfo.isEnabled && configCheck.isConfigured;
+      const configCheck = checkProviderConfigured(provider, config);
+      providerInfo.isConfigured = isEnabled && configCheck.isConfigured;
       providerInfo.apiKeySource = configCheck.apiKeySource;
-      if (forcedBaseUrl === undefined && configCheck.baseUrlSource && configCheck.baseUrlResolved) {
+      if (configCheck.baseUrlSource && configCheck.baseUrlResolved) {
         providerInfo.baseUrlSource = configCheck.baseUrlSource;
         providerInfo.baseUrlResolved = configCheck.baseUrlResolved;
       }
@@ -556,119 +619,125 @@ export class ProviderService {
       result[provider] = providerInfo;
     }
 
-    for (const providerId of getCustomOpenAICompatibleProviderIds(providersConfig)) {
+    for (const providerId of getCustomProviderIds(providersConfig)) {
       const providerConfig = providersConfig[providerId];
-      if (!isCustomOpenAICompatibleProviderConfig(providerConfig)) {
+      if (!isCustomProviderConfig(providerConfig)) {
         continue;
       }
 
-      if (this.policyService?.isEnforced() && !this.policyService.isProviderAllowed(providerId)) {
-        continue;
-      }
-
-      // Reuse getProviderPolicy() so the "lookup providerAccess entry → narrow to
-      // { forcedBaseUrl, allowedModels }" shape lives in one place. When policy is
-      // not enforced, it returns {}, which buildCustomProviderConfigInfo handles
-      // identically (both forcedBaseUrl and allowedModels fall back to defaults).
-      result[providerId] = buildCustomProviderConfigInfo(
-        providerConfig,
-        this.getProviderPolicy(providerId)
-      );
-    }
-
-    // A policy that denies coder hides the provider entirely (above), but a
-    // stored OAuth credential is still live on its deployment. Surface its
-    // PRESENCE so the Disconnect command stays reachable — otherwise the
-    // full-privilege credential would have no revocation path until the
-    // policy broadens. Presence only: no URL/models/config leaks, the entry
-    // is unconfigured/disabled, and the policy-filtered Providers UI still
-    // hides the card (this map key is consumed by the palette command's
-    // visibility gate). Skipped when a custom provider shadows "coder" —
-    // that entry owns the key and has no OAuth flow.
-    if (!result.coder && !shadowedCustomProviderIds.has("coder")) {
-      const coderOauth = parseCoderOauthAuth(
-        (providersConfig.coder as { coderOauth?: unknown } | undefined)?.coderOauth
-      );
-      if (coderOauth !== null) {
-        result.coder = {
-          apiKeySet: false,
-          isEnabled: false,
-          isConfigured: false,
-          coderOauthCredentialStored: true,
-        };
-      }
+      result[providerId] = buildCustomProviderConfigInfo(providerConfig);
     }
 
     return result;
   }
 
-  private getProviderPolicy(provider: string): ProviderPolicy {
-    if (!this.policyService?.isEnforced()) {
-      return {};
+  public discoverModels(
+    provider: string,
+    signal?: AbortSignal
+  ): Promise<ProviderModelDiscoveryResult> {
+    // Autocomplete must never persist a catalog or change routing/user-managed models.
+    if (provider === "bedrock") {
+      return discoverBedrockModels(() => {
+        const config = this.providersConfigStore.loadProvidersConfig()?.[provider] ?? {};
+        return { config, enabled: !isProviderDisabledInConfig(config) };
+      }, signal);
     }
-
-    const providerPolicy = this.policyService
-      .getEffectivePolicy()
-      ?.providerAccess?.find((entry) => entry.id === provider);
-    return {
-      forcedBaseUrl: providerPolicy?.forcedBaseUrl,
-      allowedModels: providerPolicy?.allowedModels ?? null,
-    };
+    return discoverProviderModels(() => {
+      const config = this.providersConfigStore.loadProvidersConfig()?.[provider] ?? {};
+      const custom = isCustomProviderConfig(config) ? config.providerType : undefined;
+      const defaultBaseUrl = isBuiltInProvider(provider)
+        ? MODEL_DISCOVERY_BASE_URLS[provider]
+        : undefined;
+      // Legacy shadowed built-ins remain unavailable, never inheriting official environment keys.
+      if (custom ? !validateCustomProviderId(provider).ok : !defaultBaseUrl)
+        return { status: "unsupported" };
+      if (isProviderDisabledInConfig(config)) return { status: "not-configured" };
+      let apiKey: string | undefined, baseUrl: string | undefined, organization: string | undefined;
+      if (custom) {
+        const credentials = resolveCustomProviderCredentials(provider, config);
+        if (!credentials.ok)
+          return credentials.error.code === "missing_base_url"
+            ? { status: "not-configured" }
+            : { status: "error", reason: "request-failed" };
+        apiKey = credentials.apiKey;
+        baseUrl = credentials.baseURL;
+      } else {
+        if (!isBuiltInProvider(provider)) return { status: "unsupported" };
+        const credentials = resolveProviderCredentials(provider, config);
+        // Use this provider's resolved credentials, never a Codex OAuth or ambient SDK token.
+        if (!credentials.isConfigured) return { status: "not-configured" };
+        apiKey = credentials.apiKey;
+        baseUrl = credentials.baseUrl ?? resolveConfigBaseUrl(config) ?? defaultBaseUrl;
+        organization = credentials.organization;
+      }
+      if (!baseUrl) return { status: "not-configured" };
+      const format = custom
+        ? custom === "anthropic-messages"
+          ? "anthropic"
+          : "openai"
+        : provider === "anthropic" ||
+            provider === "google" ||
+            provider === "ollama" ||
+            provider === "openrouter"
+          ? provider
+          : "openai";
+      return Object.freeze({
+        provider,
+        providerType: custom,
+        format,
+        conditional: Boolean(custom) || provider === "zai",
+        baseUrl,
+        apiKey,
+        organization,
+        headers: Object.freeze({ ...config.headers }),
+      });
+    }, signal);
   }
 
-  private getPolicyDeniedError(message: string, reason?: string): CustomProviderMutationError {
-    return addErrorReason({ code: "policy_denied", message }, reason);
-  }
-
-  private getDisallowedModelsByPolicy(provider: string, models: ProviderModelEntry[]): string[] {
-    if (!this.policyService?.isEnforced()) {
-      return [];
-    }
-
-    const allowedModels = this.getProviderPolicy(provider).allowedModels ?? null;
-    if (!Array.isArray(allowedModels)) {
-      return [];
-    }
-
-    return models
-      .map((entry) => getProviderModelEntryId(entry))
-      .filter((modelId) => !allowedModels.includes(modelId));
-  }
-
-  public async addCustomOpenAICompatibleProvider(
-    input: AddCustomOpenAICompatibleProviderInput
+  public addCustomProvider(
+    input: AddCustomProviderInput
   ): Promise<CustomProviderMutationResult<ProviderConfigInfo>> {
+    return Effect.runPromise(this.addCustomProviderEffect(input));
+  }
+
+  public addCustomProviderEffect(
+    input: AddCustomProviderInput
+  ): Effect.Effect<CustomProviderMutationResult<ProviderConfigInfo>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
     const provider = input.provider.trim();
-    if (isBuiltInProvider(provider)) {
-      return {
-        success: false,
-        error: {
-          code: "built_in_provider",
-          message: `Provider ${provider} is built in and cannot be added as custom.`,
-        },
-      };
-    }
+    return Effect.gen(function* () {
+      if (isBuiltInProvider(provider)) {
+        return {
+          success: false as const,
+          error: {
+            code: "built_in_provider" as const,
+            message: `Provider ${provider} is built in and cannot be added as custom.`,
+          },
+        };
+      }
 
-    const validation = validateCustomProviderId(provider);
-    if (!validation.ok) {
-      return {
-        success: false,
-        error: addErrorReason(
-          { code: "invalid_provider_id", message: "Invalid custom provider id." },
-          validation.reason
-        ),
-      };
-    }
+      const validation = validateCustomProviderId(provider);
+      if (!validation.ok) {
+        return {
+          success: false as const,
+          error: addErrorReason(
+            { code: "invalid_provider_id" as const, message: "Invalid custom provider id." },
+            validation.reason
+          ),
+        };
+      }
 
-    const baseUrl = input.baseUrl.trim();
+      const baseUrl = input.baseUrl.trim();
 
-    try {
       // Read-modify-write under the cross-process lock so concurrent writers
       // (other windows, CLI processes) cannot clobber each other's saves.
       // The callback returns an error result to bail, or null once saved.
-      const lockError = await this.config.withProvidersFileLock(
+      const lockError = yield* self.providersFileLockEffect(
         (): CustomProviderMutationResult<ProviderConfigInfo> | null => {
-          const providersConfig = getProviderConfigRecord(this.config.loadProvidersConfig() ?? {});
+          const providersConfig = getProviderConfigRecord(
+            self.providersConfigStore.loadProvidersConfig() ?? {}
+          );
           if (Object.hasOwn(providersConfig, provider)) {
             return {
               success: false,
@@ -679,52 +748,26 @@ export class ProviderService {
             };
           }
 
-          if (!baseUrl || !isValidHttpBaseUrl(baseUrl)) {
+          const baseUrlValidation = validateCustomProviderBaseUrl(baseUrl);
+          if (!baseUrlValidation.ok) {
             return {
               success: false,
               error: {
                 code: "invalid_base_url",
-                message: "Custom OpenAI-compatible providers require an HTTP or HTTPS base URL.",
+                message: baseUrlValidation.reason,
               },
             };
           }
 
-          if (this.policyService?.isEnforced() && !this.policyService.isProviderAllowed(provider)) {
-            return {
-              success: false,
-              error: this.getPolicyDeniedError(`Provider ${provider} is not allowed by policy.`),
-            };
-          }
-
-          const providerPolicy = this.getProviderPolicy(provider);
-          const persistedBaseUrl = providerPolicy.forcedBaseUrl ?? baseUrl;
-          if (providerPolicy.forcedBaseUrl && baseUrl !== providerPolicy.forcedBaseUrl) {
-            return {
-              success: false,
-              error: this.getPolicyDeniedError(
-                `Provider ${provider} base URL is locked by policy.`,
-                `Expected ${providerPolicy.forcedBaseUrl}.`
-              ),
-            };
-          }
-
           const normalizedModels = normalizeProviderModelEntries(input.models);
-          const disallowedModels = this.getDisallowedModelsByPolicy(provider, normalizedModels);
-          if (disallowedModels.length > 0) {
-            return {
-              success: false,
-              error: this.getPolicyDeniedError(
-                `One or more models are not allowed by policy: ${disallowedModels.join(", ")}`
-              ),
-            };
-          }
 
           const displayName = input.displayName?.trim();
           const apiKey = input.apiKey?.trim();
           const apiKeyFile = input.apiKeyFile?.trim();
+          const providerType = input.providerType ?? "openai-compatible";
           const providerConfig: BaseProviderConfig = {
-            providerType: "openai-compatible",
-            baseUrl: persistedBaseUrl,
+            providerType,
+            baseUrl,
             enabled: true,
             ...(displayName ? { displayName } : {}),
             ...(apiKey ? { apiKey } : {}),
@@ -733,7 +776,7 @@ export class ProviderService {
           };
 
           providersConfig[provider] = providerConfig;
-          this.config.saveProvidersConfig(providersConfig);
+          self.providersConfigStore.saveProvidersConfig(providersConfig);
           return null;
         }
       );
@@ -741,138 +784,177 @@ export class ProviderService {
         return lockError;
       }
 
-      const providerInfo = this.getConfig()[provider];
-      if (!providerInfo) {
-        return {
+      // Reload + notify stay inside the guarded region: the pre-Effect
+      // try/catch covered them, so a throwing reload or subscriber folds
+      // into the persistence_failed wire error below.
+      return yield* Effect.try({
+        try: (): CustomProviderMutationResult<ProviderConfigInfo> => {
+          const providerInfo = self.getConfig()[provider];
+          if (!providerInfo) {
+            return {
+              success: false,
+              error: {
+                code: "persistence_failed",
+                message: `Provider ${provider} was saved but could not be reloaded.`,
+              },
+            };
+          }
+
+          self.notifyFromMutation();
+          return { success: true, data: providerInfo };
+        },
+        catch: toPersistenceError,
+      });
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<CustomProviderMutationResult<ProviderConfigInfo>>({
           success: false,
+          error: addErrorReason(
+            { code: "persistence_failed", message: `Failed to add provider ${provider}.` },
+            error.message
+          ),
+        })
+      ),
+      asAtomicMutation
+    );
+  }
+
+  public removeCustomProvider(providerInput: string): Promise<CustomProviderMutationResult<void>> {
+    return Effect.runPromise(this.removeCustomProviderEffect(providerInput));
+  }
+
+  public removeCustomProviderEffect(
+    providerInput: string
+  ): Effect.Effect<CustomProviderMutationResult<void>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const provider = providerInput.trim();
+      const providersConfig = getProviderConfigRecord(
+        self.providersConfigStore.loadProvidersConfig() ?? {}
+      );
+      const providerConfig = providersConfig[provider];
+      // Manual providers.jsonc edits can shadow a built-in id. Removing that entry
+      // restores the built-in default, so only reject bona fide built-in configs.
+      const isShadowedCustomProvider =
+        isBuiltInProvider(provider) && isCustomProviderConfig(providerConfig);
+
+      if (isBuiltInProvider(provider) && !isShadowedCustomProvider) {
+        return {
+          success: false as const,
           error: {
-            code: "persistence_failed",
-            message: `Provider ${provider} was saved but could not be reloaded.`,
+            code: "built_in_provider" as const,
+            message: `Provider ${provider} is built in and cannot be removed as custom.`,
           },
         };
       }
 
-      this.notifyFromMutation();
-      return { success: true, data: providerInfo };
-    } catch (error) {
-      return {
-        success: false,
-        error: addErrorReason(
-          { code: "persistence_failed", message: `Failed to add provider ${provider}.` },
-          getErrorMessage(error)
-        ),
-      };
-    }
-  }
+      if (!isShadowedCustomProvider) {
+        const validation = validateCustomProviderId(provider);
+        if (!validation.ok) {
+          return {
+            success: false as const,
+            error: addErrorReason(
+              { code: "invalid_provider_id" as const, message: "Invalid custom provider id." },
+              validation.reason
+            ),
+          };
+        }
+      }
 
-  public async removeCustomProvider(
-    providerInput: string
-  ): Promise<CustomProviderMutationResult<void>> {
-    const provider = providerInput.trim();
-    const providersConfig = getProviderConfigRecord(this.config.loadProvidersConfig() ?? {});
-    const providerConfig = providersConfig[provider];
-    // Manual providers.jsonc edits can shadow a built-in id. Removing that entry
-    // restores the built-in default, so only reject bona fide built-in configs.
-    const isShadowedCustomProvider =
-      isBuiltInProvider(provider) && isCustomOpenAICompatibleProviderConfig(providerConfig);
-
-    if (isBuiltInProvider(provider) && !isShadowedCustomProvider) {
-      return {
-        success: false,
-        error: {
-          code: "built_in_provider",
-          message: `Provider ${provider} is built in and cannot be removed as custom.`,
-        },
-      };
-    }
-
-    if (!isShadowedCustomProvider) {
-      const validation = validateCustomProviderId(provider);
-      if (!validation.ok) {
+      if (!Object.hasOwn(providersConfig, provider)) {
         return {
-          success: false,
-          error: addErrorReason(
-            { code: "invalid_provider_id", message: "Invalid custom provider id." },
-            validation.reason
-          ),
+          success: false as const,
+          error: {
+            code: "unknown_provider" as const,
+            message: `Provider ${provider} does not exist.`,
+          },
         };
       }
-    }
 
-    if (!Object.hasOwn(providersConfig, provider)) {
-      return {
-        success: false,
-        error: { code: "unknown_provider", message: `Provider ${provider} does not exist.` },
-      };
-    }
+      if (!isCustomProviderConfig(providersConfig[provider])) {
+        return {
+          success: false as const,
+          error: {
+            code: "not_custom_provider" as const,
+            message: `Provider ${provider} is not a custom provider.`,
+          },
+        };
+      }
 
-    if (!isCustomOpenAICompatibleProviderConfig(providersConfig[provider])) {
-      return {
-        success: false,
-        error: {
-          code: "not_custom_provider",
-          message: `Provider ${provider} is not a custom OpenAI-compatible provider.`,
-        },
-      };
-    }
-
-    try {
       // Re-validate and delete under the cross-process lock (see setConfigValue).
-      const lockError = await this.config.withProvidersFileLock(
-        (): CustomProviderMutationResult<void> | null => {
+      // A lock/save failure folds into persistence_failed here — narrower than
+      // the whole-pipeline fold because the repair step below owns a different
+      // wire error code.
+      const lockOutcome = yield* self
+        .providersFileLockEffect((): CustomProviderMutationResult<void> | null => {
           const latestProvidersConfig = getProviderConfigRecord(
-            this.config.loadProvidersConfig() ?? {}
+            self.providersConfigStore.loadProvidersConfig() ?? {}
           );
-          if (!isCustomOpenAICompatibleProviderConfig(latestProvidersConfig[provider])) {
+          if (!isCustomProviderConfig(latestProvidersConfig[provider])) {
             return {
               success: false,
               error: {
                 code: "not_custom_provider",
-                message: `Provider ${provider} is not a custom OpenAI-compatible provider.`,
+                message: `Provider ${provider} is not a custom provider.`,
               },
             };
           }
 
           delete latestProvidersConfig[provider];
-          this.config.saveProvidersConfig(latestProvidersConfig);
+          self.providersConfigStore.saveProvidersConfig(latestProvidersConfig);
           return null;
-        }
-      );
-      if (lockError) {
-        return lockError;
+        })
+        .pipe(
+          Effect.catchTag("ProviderPersistenceError", (error) =>
+            Effect.succeed<CustomProviderMutationResult<void> | null>({
+              success: false,
+              error: addErrorReason(
+                { code: "persistence_failed", message: `Failed to remove provider ${provider}.` },
+                error.message
+              ),
+            })
+          )
+        );
+      if (lockOutcome) {
+        return lockOutcome;
       }
-    } catch (error) {
-      return {
-        success: false,
-        error: addErrorReason(
-          { code: "persistence_failed", message: `Failed to remove provider ${provider}.` },
-          getErrorMessage(error)
-        ),
-      };
-    }
 
-    try {
-      await this.config.editConfig((config) =>
-        this.repairRemovedCustomProviderReferences(config, provider)
+      const repairOutcome = yield* Effect.tryPromise({
+        // async thunk: a synchronously throwing editConfig mock still lands in
+        // the error channel, mirroring the old `await` + try/catch.
+        try: async () =>
+          self.config.editConfig((config) =>
+            self.repairRemovedCustomProviderReferences(config, provider)
+          ),
+        catch: toPersistenceError,
+      }).pipe(
+        Effect.map((): CustomProviderMutationResult<void> | null => null),
+        Effect.catchTag("ProviderPersistenceError", (error) =>
+          Effect.sync((): CustomProviderMutationResult<void> | null => {
+            // The provider is already deleted from providers.jsonc. Notify subscribers so they
+            // re-sync even when durable model reference cleanup needs another attempt.
+            self.notifyFromMutation();
+            return {
+              success: false,
+              error: addErrorReason(
+                {
+                  code: "config_repair_failed",
+                  message: `Provider ${provider} was removed, but saved model references could not be repaired.`,
+                },
+                error.message
+              ),
+            };
+          })
+        )
       );
-    } catch (error) {
-      // The provider is already deleted from providers.jsonc. Notify subscribers so they
-      // re-sync even when durable model reference cleanup needs another attempt.
-      this.notifyFromMutation();
-      return {
-        success: false,
-        error: addErrorReason(
-          {
-            code: "config_repair_failed",
-            message: `Provider ${provider} was removed, but saved model references could not be repaired.`,
-          },
-          getErrorMessage(error)
-        ),
-      };
-    }
+      if (repairOutcome) {
+        return repairOutcome;
+      }
 
-    this.notifyFromMutation();
-    return { success: true, data: undefined };
+      self.notifyFromMutation();
+      return { success: true as const, data: undefined };
+    }).pipe(asAtomicMutation);
   }
 
   private repairRemovedCustomProviderReferences(
@@ -915,13 +997,8 @@ export class ProviderService {
         if (modelStringStartsWithProvider(entry.modelString, provider)) {
           delete entry.modelString;
         }
-      }
-    }
-
-    if (config.subagentAiDefaults) {
-      for (const entry of Object.values(config.subagentAiDefaults)) {
-        if (modelStringStartsWithProvider(entry.modelString, provider)) {
-          delete entry.modelString;
+        if (entry.subagent && modelStringStartsWithProvider(entry.subagent.modelString, provider)) {
+          delete entry.subagent.modelString;
         }
       }
     }
@@ -948,6 +1025,16 @@ export class ProviderService {
             }
           }
         }
+
+        // A pinned model of the removed provider would keep a reawakened sub-agent on a
+        // model that no longer resolves; unpin it so current defaults apply again.
+        if (
+          typeof workspace.taskAiPins?.model === "string" &&
+          modelStringStartsWithProvider(workspace.taskAiPins.model, provider)
+        ) {
+          const { model: _removedModel, ...remainingPins } = workspace.taskAiPins;
+          workspace.taskAiPins = remainingPins;
+        }
       }
     }
 
@@ -955,86 +1042,54 @@ export class ProviderService {
   }
 
   /**
-   * Policy validation for a models edit. Returns a denial message or null.
-   * MUST run inside the locked mutation, not merely before it: another
-   * process can hold the cross-process providers lock for seconds, and
-   * policy can refresh while the mutation waits — a check done before the
-   * wait could persist models a newer policy denies (same pattern as the
-   * Coder OAuth commit predicate).
-   */
-  private validateModelsEditPolicy(
-    provider: string,
-    normalizedModels: ProviderModelEntry[]
-  ): string | null {
-    if (!this.policyService?.isEnforced()) {
-      return null;
-    }
-
-    if (!this.policyService.isProviderAllowed(provider)) {
-      return `Provider ${provider} is not allowed by policy`;
-    }
-
-    const allowedModels =
-      this.policyService.getEffectivePolicy()?.providerAccess?.find((p) => p.id === provider)
-        ?.allowedModels ?? null;
-
-    if (Array.isArray(allowedModels)) {
-      const disallowed = normalizedModels
-        .map((entry) => getProviderModelEntryId(entry))
-        .filter((modelId) => !allowedModels.includes(modelId));
-      if (disallowed.length > 0) {
-        return `One or more models are not allowed by policy: ${disallowed.join(", ")}`;
-      }
-    }
-
-    return null;
-  }
-
-  /**
    * Set custom models for a provider
    */
-  public async setModels(
+  public setModels(provider: string, models: ProviderModelEntry[]): Promise<Result<void, string>> {
+    return Effect.runPromise(this.setModelsEffect(provider, models));
+  }
+
+  public setModelsEffect(
     provider: string,
     models: ProviderModelEntry[]
-  ): Promise<Result<void, string>> {
-    try {
-      const normalizedModels = normalizeProviderModelEntries(models);
+  ): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const normalizedModels = yield* Effect.try({
+        try: () => normalizeProviderModelEntries(models),
+        catch: toPersistenceError,
+      });
 
       // Read-modify-write under the cross-process lock (see setConfigValue).
-      // The callback returns a policy denial to bail, or null once saved.
-      const policyDenial = await this.config.withProvidersFileLock((): string | null => {
-        const denial = this.validateModelsEditPolicy(provider, normalizedModels);
-        if (denial != null) {
-          return denial;
-        }
-
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+      yield* self.providersFileLockEffect(() => {
+        const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
 
         if (!providersConfig[provider]) {
           providersConfig[provider] = {};
         }
 
         if (provider === "coder") {
-          this.applyCoderModelEdit(
+          self.applyCoderModelEdit(
             providersConfig.coder as Record<string, unknown>,
             normalizedModels
           );
         } else {
           providersConfig[provider].models = normalizedModels;
         }
-        this.config.saveProvidersConfig(providersConfig);
-        return null;
+        self.providersConfigStore.saveProvidersConfig(providersConfig);
       });
-      if (policyDenial != null) {
-        return { success: false, error: policyDenial };
-      }
-      this.notifyFromMutation();
+      yield* self.notifyFromMutationEffect();
 
-      return { success: true, data: undefined };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return { success: false, error: `Failed to set models: ${message}` };
-    }
+      return { success: true as const, data: undefined };
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<Result<void, string>>({
+          success: false,
+          error: `Failed to set models: ${error.message}`,
+        })
+      ),
+      asAtomicMutation
+    );
   }
 
   /**
@@ -1042,21 +1097,19 @@ export class ProviderService {
    * a plain overwrite because its persisted state is deliberately richer than
    * what the editor sees:
    *
-   * - Policy-hidden entries are preserved: getConfig() exposes only the
-   *   current policy's allowed subset, so the caller's list cannot contain
-   *   entries the policy hides. Overwriting would carve those out of the
-   *   policy-unfiltered persisted list until the next login even after the
-   *   policy broadens (policy is applied at exposure/routing, not storage).
-   * - Every deleted entry is recorded in `removedModels` so catalog
-   *   refreshes and re-logins do not resurrect it. Tracking keys off the
-   *   PRIOR persisted list, not just the current `discoveredModels`:
-   *   provenance is lossy (a discovered model with a user-authored object
-   *   override survives a catalog that temporarily omits its ID, but only
-   *   `models` still knows it) — a deletion made in that state must still be
-   *   excluded when a later catalog lists the ID again. The set is
-   *   recomputed from the final list each edit, so re-adding a model clears
-   *   its exclusion; prior exclusions survive edits made while the catalog
-   *   is unknown (discoveredModels absent).
+   * - Legacy `removedModels` tombstones (written while discovery still merged
+   *   the catalog into `models`, when deleting a row was the only way to
+   *   route that model directly) are honored by routing, so re-adding a model
+   *   clears its tombstone. Nothing new is ever recorded: removing a row only
+   *   removes the row (the catalog keeps routing it; the per-model Route
+   *   override steers routing).
+   * - The edit stamps `discoveredModelsUnlisted`: `models` is user-managed
+   *   under the new contract, so an add made before the one-shot migration
+   *   ran must never be stripped by it later. If that migration has not run
+   *   yet (skipped, or failed at startup), Settings shows the legacy merged
+   *   list and the edit resubmits its catalog rows, so the rows the migration
+   *   would strip from the persisted list are separated first; otherwise the
+   *   stamp would keep them forever. Rows new in this edit are kept.
    *
    * Runs under the providers-file lock (called from setModels).
    */
@@ -1064,33 +1117,28 @@ export class ProviderService {
     section: Record<string, unknown>,
     normalizedModels: ProviderModelEntry[]
   ): void {
-    const allowedModels = this.policyService?.isEnforced()
-      ? (this.policyService.getEffectivePolicy()?.providerAccess?.find((p) => p.id === "coder")
-          ?.allowedModels ?? null)
-      : null;
-
-    const visibleIds = new Set(normalizedModels.map((entry) => getProviderModelEntryId(entry)));
-    const hiddenPreserved = Array.isArray(allowedModels)
-      ? normalizeProviderModelEntries(section.models).filter((entry) => {
-          const id = getProviderModelEntryId(entry);
-          return !allowedModels.includes(id) && !visibleIds.has(id);
-        })
-      : [];
-    const finalModels = [...normalizedModels, ...hiddenPreserved];
+    // Same eligibility as the migration: a catalog marker without the flag
+    // means old code merged the persisted list.
+    const legacyCatalogRows = new Set<string>();
+    if (
+      section.discoveredModelsUnlisted !== true &&
+      (Array.isArray(section.discoveredModels) || Array.isArray(section.staleDiscoveredModels))
+    ) {
+      const userManaged = new Set(userManagedModelEntries(section));
+      for (const entry of normalizeProviderModelEntries(section.models)) {
+        // Only plain strings are ever classified as catalog rows.
+        if (typeof entry === "string" && !userManaged.has(entry)) legacyCatalogRows.add(entry);
+      }
+    }
+    const finalModels = normalizedModels.filter(
+      (entry) => typeof entry !== "string" || !legacyCatalogRows.has(entry)
+    );
     const finalIds = new Set(finalModels.map((entry) => getProviderModelEntryId(entry)));
 
-    const discovered = Array.isArray(section.discoveredModels)
-      ? section.discoveredModels.filter((id): id is string => typeof id === "string")
-      : [];
     const priorRemoved = Array.isArray(section.removedModels)
       ? section.removedModels.filter((id): id is string => typeof id === "string")
       : [];
-    const priorModelIds = normalizeProviderModelEntries(section.models).map((entry) =>
-      getProviderModelEntryId(entry)
-    );
-    const removed = [...new Set([...priorRemoved, ...discovered, ...priorModelIds])].filter(
-      (id) => !finalIds.has(id)
-    );
+    const removed = priorRemoved.filter((id) => !finalIds.has(id));
 
     section.models = finalModels;
     if (removed.length > 0) {
@@ -1098,6 +1146,7 @@ export class ProviderService {
     } else {
       delete section.removedModels;
     }
+    section.discoveredModelsUnlisted = true;
   }
 
   /**
@@ -1107,82 +1156,65 @@ export class ProviderService {
    * Gateways that are explicitly disabled or fully deconfigured are removed;
    * configured-but-not-auto-eligible gateways keep any manual route.
    */
-  private async syncGatewayLifecycle(provider: string): Promise<void> {
-    if (!(provider in PROVIDER_DEFINITIONS)) return;
-    const providerName = provider as ProviderName;
-    const def = PROVIDER_DEFINITIONS[providerName];
-    if (def.kind !== "gateway") return;
+  private syncGatewayLifecycleEffect(
+    provider: string
+  ): Effect.Effect<void, ProviderPersistenceError> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      if (!(provider in PROVIDER_DEFINITIONS)) return;
+      const providerName = provider as ProviderName;
+      const def = PROVIDER_DEFINITIONS[providerName];
+      if (def.kind !== "gateway") return;
 
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
-    const rawProviderConfig = providersConfig[providerName] ?? {};
-    // Coder credentials are issuer-bound and its deploymentUrl field stays
-    // editable under an enforced forcedBaseUrl: lifecycle checks must resolve
-    // against the forced URL (mirroring getConfig and routing), or editing
-    // the unlocked field would evict coder from routePriority while Settings
-    // and runtime model creation stay connected to the forced deployment.
-    const forcedBaseUrl = this.policyService?.isEnforced()
-      ? this.policyService.getForcedBaseUrl(providerName)
-      : undefined;
-    const providerConfig =
-      providerName === "coder" && forcedBaseUrl !== undefined
-        ? { ...rawProviderConfig, deploymentUrl: forcedBaseUrl }
-        : rawProviderConfig;
-    const isAutoRouteEligible = isProviderAutoRouteEligible(providerName, providerConfig);
-    const config = this.config.loadConfigOrDefault();
-    const priority = config.routePriority ?? ["direct"];
+      // Everything up to the branch decision is synchronous config
+      // reading; one Effect.try keeps a thrown read in the error channel
+      // exactly like the old `await this.syncGatewayLifecycle(...)` inside
+      // the callers' try/catch. It returns the main-config edit to apply,
+      // or null when routePriority already matches.
+      const edit = yield* Effect.try({
+        try: (): ((c: ProjectsConfig) => ProjectsConfig) | null => {
+          const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
+          const providerConfig = providersConfig[providerName] ?? {};
+          const isAutoRouteEligible = isProviderAutoRouteEligible(providerName, providerConfig);
+          const config = self.config.loadConfigOrDefault();
+          const priority = config.routePriority ?? ["direct"];
 
-    if (isAutoRouteEligible && !priority.includes(providerName)) {
-      // Insert before "direct" to stay reachable while preserving the
-      // relative order of any user-configured routes already present.
-      const directIndex = priority.indexOf("direct");
-      const insertIndex = directIndex === -1 ? priority.length : directIndex;
-      const nextPriority = [...priority];
-      nextPriority.splice(insertIndex, 0, providerName);
-      await this.config.editConfig((c) => ({
-        ...c,
-        routePriority: nextPriority,
-        // Clear legacy disable — routePriority presence is now the authoritative
-        // routing signal, so a stale muxGatewayEnabled: false must not veto it.
-        ...(providerName === "mux-gateway" ? { muxGatewayEnabled: undefined } : {}),
-      }));
-    } else if (!isAutoRouteEligible && priority.includes(providerName)) {
-      // Only remove a gateway from routePriority when it is truly deconfigured
-      // or explicitly disabled. Configured-but-not-auto-eligible providers
-      // (e.g., Bedrock with IAM role auth that has no observable credentials)
-      // should keep any manually added route.
-      const credentials = resolveProviderCredentials(providerName, providerConfig);
-      const shouldRemove = !credentials.isConfigured || isProviderDisabledInConfig(providerConfig);
-      if (shouldRemove) {
-        await this.config.editConfig((c) => ({
-          ...c,
-          routePriority: priority.filter((p) => p !== providerName),
-        }));
+          if (isAutoRouteEligible && !priority.includes(providerName)) {
+            // Insert before "direct" to stay reachable while preserving the
+            // relative order of any user-configured routes already present.
+            const directIndex = priority.indexOf("direct");
+            const insertIndex = directIndex === -1 ? priority.length : directIndex;
+            const nextPriority = [...priority];
+            nextPriority.splice(insertIndex, 0, providerName);
+            return (c) => ({ ...c, routePriority: nextPriority });
+          } else if (!isAutoRouteEligible && priority.includes(providerName)) {
+            // Only remove a gateway from routePriority when it is truly deconfigured
+            // or explicitly disabled. Configured-but-not-auto-eligible providers
+            // (e.g., Bedrock with IAM role auth that has no observable credentials)
+            // should keep any manually added route.
+            const credentials = resolveProviderCredentials(providerName, providerConfig);
+            const shouldRemove =
+              !credentials.isConfigured || isProviderDisabledInConfig(providerConfig);
+            if (shouldRemove) {
+              return (c) => ({
+                ...c,
+                routePriority: priority.filter((p) => p !== providerName),
+              });
+            }
+          }
+          return null;
+        },
+        catch: toPersistenceError,
+      });
+
+      if (edit !== null) {
+        yield* Effect.tryPromise({
+          try: async () => self.config.editConfig(edit),
+          catch: toPersistenceError,
+        });
       }
-    }
-  }
-
-  /**
-   * Policy validation for a provider key-path edit. Returns a denial message
-   * or null. MUST run inside the locked mutation for the same reason as
-   * validateModelsEditPolicy.
-   */
-  private validateProviderEditPolicy(provider: string, keyPath: string[]): string | null {
-    if (!this.policyService?.isEnforced()) {
-      return null;
-    }
-
-    if (!this.policyService.isProviderAllowed(provider)) {
-      return `Provider ${provider} is not allowed by policy`;
-    }
-
-    const forcedBaseUrl = this.policyService.getForcedBaseUrl(provider);
-    const isBaseUrlEdit =
-      keyPath.length === 1 && (keyPath[0] === "baseUrl" || keyPath[0] === "baseURL");
-    if (isBaseUrlEdit && forcedBaseUrl) {
-      return `Provider ${provider} base URL is locked by policy`;
-    }
-
-    return null;
+    });
   }
 
   /**
@@ -1191,29 +1223,33 @@ export class ProviderService {
    * Intended for persisted auth blobs (e.g. Codex OAuth tokens) that should never
    * cross the frontend boundary.
    */
-  public async setConfigValue(
+  public setConfigValue(
     provider: string,
     keyPath: string[],
     value: unknown
   ): Promise<Result<void, string>> {
-    const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
-    if (deniedSegment) {
-      // Match the agentic config mutation path so legacy ORPC callers cannot write into prototypes.
-      return { success: false, error: `Denied key path segment: "${deniedSegment}"` };
-    }
+    return Effect.runPromise(this.setConfigValueEffect(provider, keyPath, value));
+  }
 
-    try {
+  private setConfigValueEffect(
+    provider: string,
+    keyPath: string[],
+    value: unknown
+  ): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
+      if (deniedSegment) {
+        // Match the agentic config mutation path so legacy ORPC callers cannot write into prototypes.
+        return { success: false as const, error: `Denied key path segment: "${deniedSegment}"` };
+      }
+
       // Read-modify-write under the cross-process lock: every providers.jsonc
       // writer must cooperate or a whole-file save from one process could
       // resurrect credentials another process just rotated/cleared.
-      // The callback returns a policy denial to bail, or null once saved.
-      const policyDenial = await this.config.withProvidersFileLock((): string | null => {
-        const denial = this.validateProviderEditPolicy(provider, keyPath);
-        if (denial != null) {
-          return denial;
-        }
-
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+      yield* self.providersFileLockEffect(() => {
+        const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
 
         // Ensure provider exists
         if (!providersConfig[provider]) {
@@ -1249,20 +1285,21 @@ export class ProviderService {
         }
 
         // Save updated config
-        this.config.saveProvidersConfig(providersConfig);
-        return null;
+        self.providersConfigStore.saveProvidersConfig(providersConfig);
       });
-      if (policyDenial != null) {
-        return { success: false, error: policyDenial };
-      }
-      this.notifyFromMutation();
-      await this.syncGatewayLifecycle(provider);
+      yield* self.notifyFromMutationEffect();
+      yield* self.syncGatewayLifecycleEffect(provider);
 
-      return { success: true, data: undefined };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return { success: false, error: `Failed to set provider config: ${message}` };
-    }
+      return { success: true as const, data: undefined };
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<Result<void, string>>({
+          success: false,
+          error: `Failed to set provider config: ${error.message}`,
+        })
+      ),
+      asAtomicMutation
+    );
   }
 
   /**
@@ -1275,29 +1312,38 @@ export class ProviderService {
    * compare-and-set used for credential writes that race concurrent
    * logins/refreshes (e.g. Coder OAuth token rotation across the desktop app
    * and `mux run`/`mux workflow`).
-   *
-   * Unlike setConfigValue, this path skips policy gating: it is an internal
-   * credential-management primitive (clearing dead tokens, persisting
-   * rotations), not a user-driven config edit.
    */
-  public async updateConfigValue(
+  public updateConfigValue(
     provider: string,
     keyPath: string[],
     update: (current: unknown) => { value: unknown } | null
   ): Promise<Result<{ applied: boolean }, string>> {
-    const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
-    if (deniedSegment) {
-      return { success: false, error: `Denied key path segment: "${deniedSegment}"` };
-    }
-    if (keyPath.length === 0) {
-      return { success: false, error: "updateConfigValue requires a non-empty key path" };
-    }
+    return Effect.runPromise(this.updateConfigValueEffect(provider, keyPath, update));
+  }
 
-    try {
-      const applied = await this.config.withProvidersFileLock(() => {
+  private updateConfigValueEffect(
+    provider: string,
+    keyPath: string[],
+    update: (current: unknown) => { value: unknown } | null
+  ): Effect.Effect<Result<{ applied: boolean }, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
+      if (deniedSegment) {
+        return { success: false as const, error: `Denied key path segment: "${deniedSegment}"` };
+      }
+      if (keyPath.length === 0) {
+        return {
+          success: false as const,
+          error: "updateConfigValue requires a non-empty key path",
+        };
+      }
+
+      const applied = yield* self.providersFileLockEffect(() => {
         // Load, decide, and write under the lock — no awaits in between, so
         // the predicate result cannot be invalidated by any cooperating writer.
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+        const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
         let current: unknown = providersConfig[provider];
         for (const key of keyPath) {
           current =
@@ -1329,16 +1375,21 @@ export class ProviderService {
           target[lastKey] = decision.value;
         }
 
-        this.config.saveProvidersConfig(providersConfig);
+        self.providersConfigStore.saveProvidersConfig(providersConfig);
         return true;
       });
 
-      await this.afterAppliedMutation(provider, applied);
-      return { success: true, data: { applied } };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return { success: false, error: `Failed to update provider config: ${message}` };
-    }
+      yield* self.afterAppliedMutationEffect(provider, applied);
+      return { success: true as const, data: { applied } };
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<Result<{ applied: boolean }, string>>({
+          success: false,
+          error: `Failed to update provider config: ${error.message}`,
+        })
+      ),
+      asAtomicMutation
+    );
   }
 
   /**
@@ -1350,16 +1401,22 @@ export class ProviderService {
    * any non-success result, which would strand a credential that IS stored
    * (and reported as connected) in a revoked state.
    */
-  private async afterAppliedMutation(provider: string, applied: boolean): Promise<void> {
-    if (!applied) {
-      return;
-    }
-    try {
-      this.notifyFromMutation();
-      await this.syncGatewayLifecycle(provider);
-    } catch (error) {
-      log.error(`Post-write route sync failed for provider ${provider}:`, error);
-    }
+  private afterAppliedMutationEffect(provider: string, applied: boolean): Effect.Effect<void> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      if (!applied) {
+        return;
+      }
+      yield* self.notifyFromMutationEffect();
+      yield* self.syncGatewayLifecycleEffect(provider);
+    }).pipe(
+      Effect.catch((error) =>
+        Effect.sync(() => {
+          log.error(`Post-write route sync failed for provider ${provider}:`, error);
+        })
+      )
+    );
   }
 
   /**
@@ -1370,19 +1427,27 @@ export class ProviderService {
    * e.g. Coder OAuth commits a discovered model catalog only while the login
    * that fetched it is still the stored credential, and disconnect clears
    * tokens + models in one write.
-   *
-   * Internal credential-management primitive: skips policy gating like
-   * updateConfigValue.
    */
-  public async updateProviderSection(
+  public updateProviderSection(
     provider: string,
     update: (
       section: Record<string, unknown> | undefined
     ) => { value: Record<string, unknown> } | null
   ): Promise<Result<{ applied: boolean }, string>> {
-    try {
-      const applied = await this.config.withProvidersFileLock(() => {
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
+    return Effect.runPromise(this.updateProviderSectionEffect(provider, update));
+  }
+
+  private updateProviderSectionEffect(
+    provider: string,
+    update: (
+      section: Record<string, unknown> | undefined
+    ) => { value: Record<string, unknown> } | null
+  ): Effect.Effect<Result<{ applied: boolean }, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const applied = yield* self.providersFileLockEffect(() => {
+        const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
         const section = providersConfig[provider] as Record<string, unknown> | undefined;
 
         const decision = update(section);
@@ -1398,58 +1463,82 @@ export class ProviderService {
         }
 
         providersConfig[provider] = decision.value as BaseProviderConfig;
-        this.config.saveProvidersConfig(providersConfig);
+        self.providersConfigStore.saveProvidersConfig(providersConfig);
         return true;
       });
 
       // Best-effort: a landed write must not be reported as failed (see
-      // afterAppliedMutation).
-      await this.afterAppliedMutation(provider, applied);
-      return { success: true, data: { applied } };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return { success: false, error: `Failed to update provider config: ${message}` };
-    }
+      // afterAppliedMutationEffect).
+      yield* self.afterAppliedMutationEffect(provider, applied);
+      return { success: true as const, data: { applied } };
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<Result<{ applied: boolean }, string>>({
+          success: false,
+          error: `Failed to update provider config: ${error.message}`,
+        })
+      ),
+      asAtomicMutation
+    );
   }
 
-  public async setConfig(
+  public setConfig(
     provider: string,
     keyPath: string[],
     value: string | boolean
   ): Promise<Result<void, string>> {
-    const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
-    if (deniedSegment) {
-      // Match the agentic config mutation path so legacy ORPC callers cannot write into prototypes.
-      return { success: false, error: `Denied key path segment: "${deniedSegment}"` };
-    }
+    return Effect.runPromise(this.setConfigEffect(provider, keyPath, value));
+  }
 
-    try {
-      const isOpenAICompatibleProviderTypeEdit =
-        keyPath.length === 1 && keyPath[0] === "providerType" && value === "openai-compatible";
-      if (isOpenAICompatibleProviderTypeEdit) {
-        const validation = validateCustomProviderId(provider);
-        if (!validation.ok) {
-          return { success: false, error: `Invalid custom provider id: ${validation.reason}` };
-        }
+  public setConfigEffect(
+    provider: string,
+    keyPath: string[],
+    value: string | boolean
+  ): Effect.Effect<Result<void, string>> {
+    // eslint-disable-next-line @typescript-eslint/no-this-alias -- Effect.gen generator bodies do not inherit `this`
+    const self = this;
+    return Effect.gen(function* () {
+      const deniedSegment = keyPath.find((segment) => DENIED_KEY_PATH_SEGMENTS.has(segment));
+      if (deniedSegment) {
+        // Match the agentic config mutation path so legacy ORPC callers cannot write into prototypes.
+        return { success: false as const, error: `Denied key path segment: "${deniedSegment}"` };
+      }
+
+      const isProviderTypeEdit = keyPath.length === 1 && keyPath[0] === "providerType";
+      if (isProviderTypeEdit && !isCustomProviderType(value)) {
+        return { success: false as const, error: `Invalid custom provider type: ${String(value)}` };
+      }
+
+      // Value-only guards shared by every provider (base URL, session header).
+      const valueError = configEditValueError(keyPath, value);
+      if (valueError != null) {
+        return { success: false as const, error: valueError };
       }
 
       // Read-modify-write under the cross-process lock (see setConfigValue).
-      // The callback returns a policy denial to bail, or null once saved.
-      const policyDenial = await this.config.withProvidersFileLock((): string | null => {
-        const denial = this.validateProviderEditPolicy(provider, keyPath);
-        if (denial != null) {
-          return denial;
+      // The callback returns a denial to bail, or null once saved.
+      const denial = yield* self.providersFileLockEffect((): string | null => {
+        const providersConfig = self.providersConfigStore.loadProvidersConfig() ?? {};
+
+        // The add-time id collision rule applies only when this write would
+        // CONVERT a non-custom entry into a custom provider. An entry that is
+        // already custom stays editable even when its id shadows a built-in
+        // (upgraded installs deliberately preserve such entries). Checked
+        // against the config read INSIDE the lock: a pre-lock read could race
+        // another process removing the entry and recreate it as custom.
+        if (isProviderTypeEdit && !isCustomProviderConfig(providersConfig[provider])) {
+          if (providersConfig[provider] == null) {
+            // A providerType write must never CREATE an entry: a queued or
+            // late UI edit racing a removal would otherwise resurrect the
+            // provider as an unconfigured skeleton. Creation goes through
+            // addCustomProvider.
+            return `Provider ${provider} does not exist.`;
+          }
+          const validation = validateCustomProviderId(provider);
+          if (!validation.ok) {
+            return `Invalid custom provider id for ${String(value)}: ${validation.reason}`;
+          }
         }
-
-        const providersConfig = this.config.loadProvidersConfig() ?? {};
-
-        // Track if this is first time setting couponCode for mux-gateway
-        const isFirstMuxGatewayCoupon =
-          provider === "mux-gateway" &&
-          keyPath.length === 1 &&
-          keyPath[0] === "couponCode" &&
-          value !== "" &&
-          !providersConfig[provider]?.couponCode;
 
         // Ensure provider exists
         if (!providersConfig[provider]) {
@@ -1491,41 +1580,42 @@ export class ProviderService {
           }
         }
 
-        // Add default models when setting up mux-gateway for the first time
-        if (isFirstMuxGatewayCoupon) {
-          const providerConfig = providersConfig[provider] as Record<string, unknown>;
-          const existingModels = normalizeProviderModelEntries(providerConfig.models);
-          if (existingModels.length === 0) {
-            providerConfig.models = [
-              "anthropic/claude-sonnet-5",
-              "anthropic/claude-opus-5",
-              "openai/gpt-5.5",
-            ];
-          }
-        }
-
         // Save updated config
-        this.config.saveProvidersConfig(providersConfig);
+        self.providersConfigStore.saveProvidersConfig(providersConfig);
         return null;
       });
-      if (policyDenial != null) {
-        return { success: false, error: policyDenial };
+      if (denial != null) {
+        return { success: false as const, error: denial };
       }
-      this.notifyFromMutation();
-      await this.syncGatewayLifecycle(provider);
+      yield* self.notifyFromMutationEffect();
+      yield* self.syncGatewayLifecycleEffect(provider);
 
-      return { success: true, data: undefined };
-    } catch (error) {
-      const message = getErrorMessage(error);
-      return { success: false, error: `Failed to set provider config: ${message}` };
-    }
+      return { success: true as const, data: undefined };
+    }).pipe(
+      Effect.catchTag("ProviderPersistenceError", (error) =>
+        Effect.succeed<Result<void, string>>({
+          success: false,
+          error: `Failed to set provider config: ${error.message}`,
+        })
+      ),
+      asAtomicMutation
+    );
+  }
+
+  updateRoutePreferences(
+    input: Omit<Parameters<Config["updateRoutePreferences"]>[0], "validateRouteOverrides">
+  ): Promise<void> {
+    return this.config.updateRoutePreferences({
+      ...input,
+      validateRouteOverrides: (overrides) => this.validateRouteOverrides(overrides),
+    });
   }
 
   public validateRouteOverrides(routeOverrides: Record<string, string>): Result<void, string> {
-    const providersConfig = this.config.loadProvidersConfig() ?? {};
+    const providersConfig = this.providersConfigStore.loadProvidersConfig() ?? {};
     for (const routeTarget of Object.values(routeOverrides)) {
       const targetConfig = providersConfig[routeTarget];
-      if (isCustomOpenAICompatibleProviderConfig(targetConfig)) {
+      if (isCustomProviderConfig(targetConfig)) {
         return {
           success: false,
           error: `Custom providers are direct-only and cannot be the target of a routeOverride: ${routeTarget}.`,

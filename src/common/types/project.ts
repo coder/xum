@@ -7,17 +7,19 @@ import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchive
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import type {
   AppConfigMigrations,
+  EvaluationDefaults,
   ModelFallbacks,
   UpdateChannel,
 } from "@/common/config/schemas/appConfigOnDisk";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import type { SettingsBackup } from "@/common/config/schemas/settingsBackup";
+import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
 import type { z } from "zod";
 import type { ProjectConfigSchema, WorkspaceConfigSchema } from "../orpc/schemas";
 import type { AgentAiDefaults } from "./agentAiDefaults";
+import type { AutoModelRoutingConfig } from "./autoModelRouting";
 import type { RuntimeEnablementId } from "./runtime";
-import type { TaskSettings, SubagentAiDefaults } from "./tasks";
-import type { LayoutPresetsConfig } from "./uiLayouts";
+import type { TaskSettings } from "./tasks";
 import type { ThinkingLevel } from "./thinking";
 import type { GoalDefaults } from "@/constants/goals";
 
@@ -72,33 +74,52 @@ export interface ProjectsConfig {
   /**
    * Default parent directory for new projects (cloning and bare-name creation).
    *
-   * When unset, falls back to getShuxProjectsDir() (~/.shux/projects).
+   * When unset, falls back to getXumProjectsDir() (~/.xum/projects).
    */
   defaultProjectDir?: string;
   /** IDs of splash screens that have been viewed */
   viewedSplashScreens?: string[];
-  /** User preferences shared across local browser origins through ~/.shux/config.json. */
+  /** User preferences shared across local browser origins through ~/.xum/config.json. */
   userPreferences?: UserPreferences;
   /** Global task settings (agent sub-workspaces, queue limits, nesting depth) */
   taskSettings?: TaskSettings;
-  /** UI layout presets + hotkeys (shared via ~/.shux/config.json). */
-  layoutPresets?: LayoutPresetsConfig;
   /** Let chat transcripts use the full chat pane width instead of the default readable column. */
   chatTranscriptFullWidth?: boolean;
-  /**
-   * Shux Gateway routing preferences (shared via ~/.shux/config.json).
-   * Mirrors browser localStorage so switching server ports doesn't reset the UI.
-   */
-  muxGatewayEnabled?: boolean;
-  /** Enable recording AI SDK devtools logs to ~/.shux/sessions/<workspace>/devtools.jsonl */
+  /** Enable recording AI SDK devtools logs to ~/.xum/sessions/<workspace>/devtools.jsonl */
   llmDebugLogs?: boolean;
+  /**
+   * Desktop only: keep the display (and system) awake while any local workspace is
+   * streaming or waiting on background bash / workflow activity. Absent = off.
+   */
+  keepScreenAwake?: boolean;
+  /**
+   * Defer MCP tool definitions out of the model-visible tool list until the model
+   * discovers them via tool_catalog_search. Absent = on; only `false` disables it.
+   */
+  toolSearchEnabled?: boolean;
+  /**
+   * Route Anthropic/OpenAI calls from bash tool commands through Xum's local proxy so their
+   * spend shows in the Costs tab and Analytics. Absent = off: with it on, agent CLIs such as
+   * `claude -p` bill the Xum API key instead of a subscription login.
+   */
+  bashAiProxyEnabled?: boolean;
+  /**
+   * Expose the `heartbeat` tool so agents can schedule their own recurring (paid) turns.
+   * Absent = off; users opt in from Settings.
+   */
+  agentHeartbeatsEnabled?: boolean;
   /** Default heartbeat prompt used when a workspace heartbeat does not set its own message. */
   heartbeatDefaultPrompt?: string;
   /** Default heartbeat interval used when a workspace heartbeat does not set its own cadence. */
   heartbeatDefaultIntervalMs?: number;
+  /** CPU and memory that all local agent processes share (Linux cgroup v2). Absent = no limit. */
+  agentResourceLimits?: AgentResourceLimits;
+  /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
+  agentResourceLimitsEnabled?: boolean;
   /** Global defaults for new workspace goals. */
   goalDefaults?: GoalDefaults;
-  muxGatewayModels?: string[];
+  /** Default evaluation model for workflow `evaluate()` steps (Settings → Tasks & Workflows). */
+  evaluationDefaults?: EvaluationDefaults;
   routePriority?: string[];
   routeOverrides?: Record<string, string>;
   /**
@@ -114,42 +135,23 @@ export interface ProjectsConfig {
    */
   modelFallbacks?: ModelFallbacks;
 
-  /**
-   * Default model used for new workspaces (shared via ~/.shux/config.json).
-   * Mirrors the browser localStorage cache (DEFAULT_MODEL_KEY).
-   */
+  /** Difficulty tiers for the auto-model-routing experiment; always normalized on load. */
+  autoModelRouting?: AutoModelRoutingConfig;
+
+  /** Default model used for new workspaces (shared via ~/.xum/config.json). */
   defaultModel?: string;
-  /** Global advisor model override for the experimental advisor tool. */
-  advisorModelString?: string;
-  /** Global advisor reasoning override for the experimental advisor tool. */
-  advisorThinkingLevel?: ThinkingLevel;
-  /** Positive per-turn advisor cap; null/undefined means unlimited. */
-  advisorMaxUsesPerTurn?: number | null;
-  /** Positive max-output-tokens cap for advisor responses; null/undefined means unlimited. */
-  advisorMaxOutputTokens?: number | null;
-  /**
-   * Hidden model IDs (shared via ~/.shux/config.json).
-   * Mirrors the browser localStorage cache (HIDDEN_MODELS_KEY).
-   */
+  /** Hidden model IDs (shared via ~/.xum/config.json). */
   hiddenModels?: string[];
-  /** Default model + thinking overrides per agentId (applies to UI agents and subagents). */
-  agentAiDefaults?: AgentAiDefaults;
   /**
-   * Sparse per-agent override that wins over agentAiDefaults when an agent runs as a
-   * sub-agent. The exec key is canonical storage for the sub-agent Exec slot.
-   * Other keys are kept for legacy mirror compatibility, but new code should write
-   * to agentAiDefaults instead.
+   * Default model/thinking/reasoning overrides per agentId. Base fields are the
+   * interactive profile; the sparse nested `subagent` profile holds
+   * delegated-run differences (see AgentAiDefaultsEntrySchema).
    */
-  subagentAiDefaults?: SubagentAiDefaults;
+  agentAiDefaults?: AgentAiDefaults;
   /** Internal one-time migration markers. Not surfaced in user-facing config UI. */
   migrations?: AppConfigMigrations;
   /** Use built-in SSH2 library instead of system OpenSSH for remote connections (non-Windows only) */
   useSSH2Transport?: boolean;
-
-  /** Shux Governor server URL (normalized origin, no trailing slash) */
-  muxGovernorUrl?: string;
-  /** Shux Governor OAuth access token (secret - never return to UI) */
-  muxGovernorToken?: string;
 
   /**
    * What to do with a dedicated mux-created Coder workspace when its chat is archived.
@@ -197,7 +199,7 @@ export interface ProjectsConfig {
   terminalDefaultShell?: string;
 
   /**
-   * Runtime enablement overrides (shared via ~/.shux/config.json).
+   * Runtime enablement overrides (shared via ~/.xum/config.json).
    * Defaults to enabled; store `false` only to keep config.json minimal.
    */
   runtimeEnablement?: Partial<Record<RuntimeEnablementId, false>>;

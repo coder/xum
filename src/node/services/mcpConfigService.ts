@@ -1,9 +1,19 @@
+import { ClaudeDesignService } from "./claudeDesignService";
+import { getOwn } from "@/common/utils/getOwn";
+import { CLAUDE_DESIGN_SERVER_NAME } from "@/common/constants/claudeDesign";
 import * as fs from "fs";
 import * as path from "path";
 import * as jsonc from "jsonc-parser";
-import writeFileAtomic from "write-file-atomic";
+import { isDeepStrictEqual } from "node:util";
+import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
+import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { findDuplicateProperty } from "@/node/utils/main/jsoncDuplicates";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
+import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import type {
   MCPConfig,
+  MCPConfigProblem,
   MCPHeaderValue,
   MCPServerInfo,
   MCPServerTransport,
@@ -16,35 +26,315 @@ import type {
   AgentPluginsMcpContext,
   AgentPluginsMcpProvider,
 } from "@/node/services/agentPlugins/mcpConfig";
+import {
+  isCanonicalPluginServerKey,
+  isCanonicalPluginServerKeyPrefix,
+} from "@/node/services/agentPlugins/mcpConfig";
 import { log } from "@/node/services/log";
+import { projectAutomationDisabled } from "@/node/utils/projectAutomation";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { AIService } from "@/node/services/aiService";
+import type { TelemetryService } from "@/node/services/telemetryService";
+import { createRuntimeForWorkspace, resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
+import { resolveAgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
+import { roundToBase2 } from "@/common/telemetry/utils";
+import { isSecretReferenceValue } from "@/common/types/secrets";
+import { getMcpServerUrlError } from "@/common/utils/mcp/serverUrl";
+import { formatMcpConfigProblem } from "@/common/utils/mcp/configProblem";
+import { parseMcpConfigServers } from "@/node/services/mcpConfigParse";
+
+/**
+ * Canonical `plugin:<16-hex>:<server>` keys are RESERVED for Agent Plugin
+ * servers: a plugin uninstall prunes workspace overrides for these keys by
+ * shape, so an ordinary user-configured server occupying one would shadow
+ * the plugin server (user layers win on key collision) yet lose its own
+ * enablement/allowlist state during that plugin's uninstall. Reserved keys
+ * found in user config are ignored at runtime — the on-disk entry is
+ * preserved verbatim (loss-preserving rewrites) but never listed or started.
+ */
+function omitReservedPluginKeys(
+  servers: Record<string, MCPServerInfo>,
+  layer: "global" | "project"
+): Record<string, MCPServerInfo> {
+  const result: Record<string, MCPServerInfo> = {};
+  for (const [name, info] of Object.entries(servers)) {
+    if (isCanonicalPluginServerKey(name)) {
+      log.debug(
+        `[MCP] Ignoring ${layer} MCP server '${name}': the canonical plugin key namespace is reserved for Agent Plugin servers`
+      );
+      continue;
+    }
+    result[name] = info;
+  }
+  return result;
+}
+
+const PLUGIN_ENABLEMENT_FIELDS = new Set(["enabledPluginServers"]);
+
+/** Ambiguous or malformed consent must never grant enablement or survive a prune. */
+function parsePluginEnablement(raw: string): unknown[] {
+  const errors: jsonc.ParseError[] = [];
+  const root = jsonc.parseTree(raw, errors, { allowEmptyContent: true });
+  if (errors.length > 0 || (root !== undefined && root.type !== "object")) {
+    throw new Error("Invalid MCP config document");
+  }
+  // Empty/comment-only configuration contains no consent to preserve or revoke.
+  if (root === undefined) return [];
+  if (findDuplicateProperty(root, PLUGIN_ENABLEMENT_FIELDS)) {
+    throw new Error("Duplicate enabledPluginServers in MCP config");
+  }
+  const field = jsonc.findNodeAtLocation(root, ["enabledPluginServers"]);
+  if (!field) return [];
+  if (field.type !== "array") throw new Error("enabledPluginServers must be an array");
+  return jsonc.getNodeValue(field) as unknown[];
+}
+
+function canonicalPluginKeys(values: unknown[]): string[] {
+  return values.filter(
+    (key): key is string => typeof key === "string" && isCanonicalPluginServerKey(key)
+  );
+}
+
+/** Shared by MCP mutations, admission fences, and backup restore's consent revocation. */
+export function acquireGlobalMcpConfigLock(
+  muxRoot: string,
+  options: { signal?: AbortSignal; timeoutMs?: number } = {}
+): Promise<() => Promise<void>> {
+  return acquireCrossProcessLock({
+    lockPath: path.join(muxRoot, "mcp-config.lock"),
+    acquireTimeoutMs: options.timeoutMs ?? 60_000,
+    staleMs: 5 * 60_000,
+    timeoutMessage:
+      "Another Mux process is currently updating MCP settings. Wait for it to finish and try again.",
+    signal: options.signal,
+  });
+}
+
+/** A config file as read, with what Xum skipped in it (#2060). */
+type ReadMCPConfig = MCPConfig & { problems: MCPConfigProblem[] };
+
+/**
+ * A save rewrites the whole file from the parsed servers, so a skipped entry would be lost: the
+ * user fixes the file first (#2060).
+ */
+function refuseSaveWithProblems(filePath: string, problems: MCPConfigProblem[]): void {
+  const [problem] = problems;
+  if (problem !== undefined) {
+    throw new Error(`Fix ${filePath} first. ${formatMcpConfigProblem(problem)}`);
+  }
+}
+
+/** A fresh value: callers edit the servers they get. */
+const noConfig = (): ReadMCPConfig => ({ servers: {}, enabledPluginServers: [], problems: [] });
+
+/**
+ * A skipped entry stays as a disabled server, so it still shadows a lower layer (a global server,
+ * Claude Design) and an earlier duplicate, as when jsonc.parse normalized it: a typo must never
+ * start another command (#2060). The problem list says why it is there.
+ */
+const skippedServer = (): MCPServerInfo => ({ transport: "stdio", command: "", disabled: true });
 
 export class MCPConfigService {
   private readonly config: Config;
+  readonly claudeDesign: ClaudeDesignService;
   /**
-   * Agent Plugins (agent-plugins experiment): read-only extra server source
-   * merged into listings. Plugin servers are never persisted — every mutation
-   * below operates on the on-disk global config only, so `plugin:*` keys
-   * naturally fail with "not found".
+   * Agent Plugin definitions are discovered, never persisted. Only global
+   * enablement keys are saved; workspace overrides still take precedence.
    */
   private readonly agentPluginsMcpProvider: AgentPluginsMcpProvider | null;
+  private readonly telemetryService: Pick<TelemetryService, "capture"> | null;
+  private readonly workspaceMetadataProvider: Pick<AIService, "getWorkspaceMetadata"> | null;
 
-  constructor(config: Config, options?: { agentPluginsMcpProvider?: AgentPluginsMcpProvider }) {
+  constructor(
+    config: Config,
+    options?: {
+      agentPluginsMcpProvider?: AgentPluginsMcpProvider;
+      claudeDesign?: ClaudeDesignService;
+      telemetryService?: Pick<TelemetryService, "capture">;
+      workspaceMetadataProvider?: Pick<AIService, "getWorkspaceMetadata">;
+    }
+  ) {
     assert(
       typeof config.rootDir === "string" && config.rootDir.trim().length > 0,
       "MCPConfigService: config.rootDir must be a non-empty string"
     );
 
     this.config = config;
+    this.claudeDesign =
+      options?.claudeDesign ??
+      new ClaudeDesignService({ rootDir: config.rootDir, isEnabled: () => false });
     this.agentPluginsMcpProvider = options?.agentPluginsMcpProvider ?? null;
+    this.telemetryService = options?.telemetryService ?? null;
+    this.workspaceMetadataProvider = options?.workspaceMetadataProvider ?? null;
+  }
+
+  async listForApi(input: {
+    projectPath?: string | null;
+    workspaceId?: string | null;
+  }): Promise<Record<string, MCPServerInfo>> {
+    const projectPath = input.projectPath ?? undefined;
+    const layers = await this.listServerLayers(
+      projectPath,
+      isProjectTrusted(this.config, projectPath),
+      {
+        agentPlugins: await this.resolveWorkspaceAgentPluginsContext(
+          input.workspaceId,
+          projectPath
+        ),
+      }
+    );
+    // Tag the owning user layer (#4297) so the UI can attribute `disabled`
+    // without re-deriving precedence. Plugin and managed entries stay untagged.
+    return Object.fromEntries(
+      Object.entries(await this.mergeServerLayers(layers)).map(([name, info]) => {
+        const configLayer: MCPServerInfo["configLayer"] = Object.hasOwn(layers.project, name)
+          ? "project"
+          : Object.hasOwn(layers.global, name)
+            ? "global"
+            : undefined;
+        return [name, configLayer ? { ...info, configLayer } : info];
+      })
+    );
+  }
+
+  async addForApi(input: {
+    name: string;
+    transport?: MCPServerTransport;
+    command?: string;
+    url?: string;
+    headers?: Record<string, MCPHeaderValue>;
+  }): Promise<Result<void>> {
+    const existingServer = getOwn(await this.listServers(), input.name);
+    if (existingServer?.transport !== "stdio" && existingServer?.managed)
+      return Err("Claude Design is managed in its settings card");
+    const transport = input.transport ?? "stdio";
+
+    const result = await this.addServer(input.name, {
+      transport,
+      command: input.command,
+      url: input.url,
+      headers: input.headers,
+    });
+    if (result.success) {
+      const action = !existingServer
+        ? "add"
+        : existingServer.transport !== "stdio" &&
+            transport !== "stdio" &&
+            existingServer.transport === transport &&
+            existingServer.url === input.url &&
+            JSON.stringify(existingServer.headers ?? {}) !== JSON.stringify(input.headers ?? {})
+          ? "set_headers"
+          : "edit";
+      this.captureConfigChange(action, transport, input.headers);
+    }
+    return result;
+  }
+
+  async removeForApi(name: string): Promise<Result<void>> {
+    const server = getOwn(await this.listServers(), name);
+    const result = await this.removeServer(name);
+    if (result.success && server) {
+      this.captureConfigChange(
+        "remove",
+        server.transport,
+        server.transport === "stdio" ? undefined : server.headers
+      );
+    }
+    return result;
+  }
+
+  async setEnabledForApi(name: string, enabled: boolean): Promise<Result<void>> {
+    const server = getOwn(await this.listServers(), name);
+    const result = await this.setServerEnabled(name, enabled);
+    if (result.success && server) {
+      this.captureConfigChange(
+        enabled ? "enable" : "disable",
+        server.transport,
+        server.transport === "stdio" ? undefined : server.headers
+      );
+    }
+    return result;
+  }
+
+  async setToolAllowlistForApi(name: string, toolAllowlist: string[]): Promise<Result<void>> {
+    const server = getOwn(await this.listServers(), name);
+    const result = await this.setToolAllowlist(name, toolAllowlist);
+    if (result.success && server) {
+      this.captureConfigChange(
+        "set_tool_allowlist",
+        server.transport,
+        server.transport === "stdio" ? undefined : server.headers,
+        {
+          tool_allowlist_size_b2: roundToBase2(toolAllowlist.length),
+        }
+      );
+    }
+    return result;
+  }
+
+  /** Preserves the resolver's null sentinel: null suppresses plugin discovery for off-host workspaces. */
+  async resolveWorkspaceAgentPluginsContext(
+    workspaceId: string | null | undefined,
+    projectPath: string | null | undefined
+  ): Promise<AgentPluginsMcpContext | null | undefined> {
+    const trimmed = workspaceId?.trim();
+    if (!trimmed || !this.workspaceMetadataProvider) {
+      return undefined;
+    }
+    try {
+      const metadataResult = await this.workspaceMetadataProvider.getWorkspaceMetadata(trimmed);
+      if (!metadataResult.success) {
+        return undefined;
+      }
+      const metadata = metadataResult.data;
+      if (metadata.projectPath !== projectPath?.trim()) {
+        log.debug("Ignoring Agent Plugins workspace context for mismatched project", {
+          workspaceId: trimmed,
+          requestedProjectPath: projectPath,
+          workspaceProjectPath: metadata.projectPath,
+        });
+        return undefined;
+      }
+      const runtime = createRuntimeForWorkspace(metadata);
+      return resolveAgentPluginsMcpContext(metadata, resolveWorkspaceRootPath(metadata, runtime));
+    } catch (error) {
+      log.debug("Failed to resolve Agent Plugins MCP context for workspace", {
+        workspaceId: trimmed,
+        error,
+      });
+      return undefined;
+    }
+  }
+
+  private captureConfigChange(
+    action: "add" | "edit" | "set_headers" | "remove" | "enable" | "disable" | "set_tool_allowlist",
+    transport: MCPServerTransport,
+    headers?: Record<string, MCPHeaderValue>,
+    extra: Record<string, number> = {}
+  ): void {
+    this.telemetryService?.capture({
+      event: "mcp_server_config_changed",
+      properties: {
+        action,
+        transport,
+        has_headers: Boolean(headers && Object.keys(headers).length > 0),
+        uses_secret_headers: Boolean(
+          headers && Object.values(headers).some((value) => isSecretReferenceValue(value))
+        ),
+        ...extra,
+      },
+    });
   }
 
   private getGlobalConfigPath(): string {
     return path.join(this.config.rootDir, "mcp.jsonc");
   }
 
-  private getRepoOverridePath(projectPath: string): string {
-    return path.join(projectPath, ".mux", "mcp.jsonc");
+  private getRepoOverridePaths(projectPath: string): string[] {
+    return listProjectMetadataRelativePaths("mcp.jsonc").map((relativePath) =>
+      path.join(projectPath, relativePath)
+    );
   }
 
   private async pathExists(targetPath: string): Promise<boolean> {
@@ -140,45 +430,85 @@ export class MCPConfigService {
     };
   }
 
-  private async readConfigFile(filePath: string): Promise<MCPConfig> {
+  private async readConfigFile(filePath: string): Promise<ReadMCPConfig> {
     try {
       const exists = await this.pathExists(filePath);
       if (!exists) {
-        return { servers: {} };
+        return noConfig();
       }
 
       const raw = await fs.promises.readFile(filePath, "utf-8");
-      const parsed = jsonc.parse(raw) as { servers?: Record<string, unknown> } | undefined;
 
-      if (!parsed || typeof parsed !== "object" || !parsed.servers) {
-        return { servers: {} };
+      let enabledPluginServers: string[] = [];
+      try {
+        enabledPluginServers = canonicalPluginKeys(parsePluginEnablement(raw));
+      } catch {
+        // Corrupt consent fails closed without hiding ordinary server definitions.
       }
 
-      // Normalize all entries on read
+      // A field-only plugin toggle need not create a servers property. A broken entry is
+      // reported and kept disabled (skippedServer), never as a usable server without a command (#2060).
+      const parsed = parseMcpConfigServers(raw);
       const servers: Record<string, MCPServerInfo> = {};
-      for (const [name, entry] of Object.entries(parsed.servers)) {
-        servers[name] = this.normalizeEntry(entry);
+      for (const entry of parsed.entries) {
+        servers[entry.name] =
+          "skipped" in entry ? skippedServer() : this.normalizeEntry(entry.value);
       }
-      return { servers };
+      this.warnConfigProblems(filePath, parsed.problems);
+      return {
+        servers,
+        enabledPluginServers,
+        problems: parsed.problems,
+      };
     } catch (error) {
       // Defensive: never crash on startup due to corrupt config.
       log.error("Failed to read MCP config", { filePath, error });
-      return { servers: {} };
+      // The errno code only: the message can hold other paths.
+      const code = (error as NodeJS.ErrnoException).code ?? "error";
+      // A problem too, so no Settings write replaces a file Xum could not read.
+      const problems = [
+        { line: null, column: null, server: null, message: `Xum cannot read this file (${code})` },
+      ];
+      this.warnConfigProblems(filePath, problems);
+      return { ...noConfig(), problems };
     }
   }
 
-  private async getGlobalConfig(): Promise<MCPConfig> {
+  /** The last problems logged per file: a config is read on every listing, so warn on change. */
+  private readonly loggedProblems = new Map<string, string>();
+
+  private warnConfigProblems(filePath: string, problems: MCPConfigProblem[]): void {
+    const signature = JSON.stringify(problems);
+    if (this.loggedProblems.get(filePath) === signature) return;
+    this.loggedProblems.set(filePath, signature);
+    if (problems.length === 0) return;
+    log.warn(`[MCP] Xum skipped part of ${filePath}`, {
+      problems: problems.map(formatMcpConfigProblem),
+    });
+  }
+
+  /** Syntax errors and invalid entries in the global mcp.jsonc, for Settings → MCP. */
+  async getConfigProblems(): Promise<{ path: string; problems: MCPConfigProblem[] }> {
+    const { problems } = await this.getGlobalConfig();
+    return { path: this.getGlobalConfigPath(), problems };
+  }
+
+  private async getGlobalConfig(): Promise<ReadMCPConfig> {
     return this.readConfigFile(this.getGlobalConfigPath());
   }
 
-  private async getRepoOverrideConfig(projectPath: string): Promise<MCPConfig> {
-    return this.readConfigFile(this.getRepoOverridePath(projectPath));
+  private async getRepoOverrideConfig(projectPath: string): Promise<ReadMCPConfig> {
+    for (const filePath of this.getRepoOverridePaths(projectPath)) {
+      if (await this.pathExists(filePath)) return this.readConfigFile(filePath);
+    }
+    return noConfig();
   }
 
-  private async saveGlobalConfig(config: MCPConfig): Promise<void> {
-    await this.ensureMuxRootDir();
-
+  /** Caller must hold runExclusive; never acquires the lock itself. */
+  private async saveGlobalConfig(config: ReadMCPConfig): Promise<void> {
     const filePath = this.getGlobalConfigPath();
+    refuseSaveWithProblems(filePath, config.problems);
+    await this.ensureMuxRootDir();
 
     // Write minimal format:
     // - string for stdio servers without extra settings
@@ -219,11 +549,141 @@ export class MCPConfigService {
       output[name] = obj;
     }
 
-    await writeFileAtomic(filePath, JSON.stringify({ servers: output }, null, 2), {
-      encoding: "utf-8",
-      mode: 0o600,
-    });
+    await writeFileAtomic(
+      filePath,
+      JSON.stringify(
+        {
+          servers: output,
+          ...(config.enabledPluginServers.length
+            ? { enabledPluginServers: config.enabledPluginServers }
+            : {}),
+        },
+        null,
+        2
+      ),
+      { encoding: "utf-8", mode: 0o600 }
+    );
     this.globalConfigGeneration += 1;
+  }
+
+  /**
+   * Every mutation takes this non-reentrant lock exactly once, across discovery,
+   * read and write. Otherwise an ordinary stale save could resurrect consent
+   * after uninstall's prune, including from another process sharing this root.
+   */
+  private writeQueue: Promise<unknown> = Promise.resolve();
+
+  private async acquireGlobalConfigLock(
+    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<() => Promise<void>> {
+    await this.ensureMuxRootDir();
+    return acquireGlobalMcpConfigLock(this.config.rootDir, options);
+  }
+
+  private runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const locked = async (): Promise<T> => {
+      const release = await this.acquireGlobalConfigLock();
+      try {
+        return await fn();
+      } finally {
+        await release();
+      }
+    };
+    const next = this.writeQueue.then(locked, locked);
+    this.writeQueue = next.catch(() => undefined);
+    return next;
+  }
+
+  /** Hold the writer's lock from a fresh consent read until invocation starts, not until it finishes. */
+  async acquireGlobalPluginEnablementFence(
+    name: string,
+    options: { signal?: AbortSignal; timeoutMs: number }
+  ): Promise<() => Promise<void>> {
+    assert(isCanonicalPluginServerKey(name), "Plugin server must have a canonical key");
+    const deadlineAt = Date.now() + options.timeoutMs;
+    const checkActive = () => {
+      if (options.signal?.aborted) throw new Error(`MCP request for '${name}' was aborted`);
+      if (Date.now() >= deadlineAt)
+        throw new Error(
+          `MCP server '${name}' is unavailable: global consent could not be read in time`
+        );
+    };
+    const bounded = async <T>(work: Promise<T>): Promise<T> => {
+      work.catch(() => undefined);
+      const result = await raceWithAbortAndTimeout(work, {
+        timeoutMs: Math.max(0, deadlineAt - Date.now()),
+        signal: options.signal,
+      });
+      checkActive();
+      if (result.kind !== "ok")
+        throw new Error(`MCP server '${name}' is unavailable: global consent could not be read`);
+      return result.value;
+    };
+    checkActive();
+    const acquisition = this.acquireGlobalConfigLock(options);
+    let release: () => Promise<void>;
+    try {
+      release = await bounded(acquisition);
+    } catch (error) {
+      acquisition.then((lateRelease) => lateRelease()).catch(() => undefined);
+      throw error;
+    }
+    try {
+      // A process-local generation cannot revoke another backend's held tool.
+      // Open the document only AFTER acquisition; an older open inode is stale.
+      const raw = await bounded(
+        fs.promises.readFile(this.getGlobalConfigPath(), "utf-8").catch((error: unknown) => {
+          if (hasErrorCode(error, "ENOENT")) return "{}";
+          throw error;
+        })
+      );
+      if (!canonicalPluginKeys(parsePluginEnablement(raw)).includes(name))
+        throw new Error(`MCP server '${name}' is disabled globally`);
+      return release;
+    } catch (error) {
+      await release();
+      throw error;
+    }
+  }
+
+  /** Caller must hold runExclusive; never acquires the lock itself. */
+  private async updateEnabledPluginServersLocked(
+    update: (current: string[]) => string[]
+  ): Promise<void> {
+    const filePath = this.getGlobalConfigPath();
+    const raw = await fs.promises.readFile(filePath, "utf-8").catch((error: unknown) => {
+      if (hasErrorCode(error, "ENOENT")) return "{}";
+      throw error;
+    });
+    const current = canonicalPluginKeys(parsePluginEnablement(raw));
+    const next = update(current);
+    assert(
+      next.every(isCanonicalPluginServerKey),
+      "Plugin enablement must contain only canonical keys"
+    );
+    if (isDeepStrictEqual(current, next)) return;
+
+    // jsonc.modify's formatter also rewrites neighboring properties; preserve their bytes.
+    const edited = jsonc.applyEdits(
+      raw,
+      jsonc.modify(raw, ["enabledPluginServers"], next.length ? next : undefined, {})
+    );
+    assert(
+      isDeepStrictEqual(parsePluginEnablement(edited), next),
+      "MCP enablement edit did not apply"
+    );
+    await writeFileAtomic(filePath, edited, { encoding: "utf-8", mode: 0o600 });
+    this.globalConfigGeneration += 1;
+  }
+
+  /** Called after the plugin tree leaves discovery; failure aborts uninstall. */
+  pruneEnabledPluginServers(keyPrefix: string): Promise<void> {
+    assert(isCanonicalPluginServerKeyPrefix(keyPrefix), "Invalid plugin server key prefix");
+    return this.runExclusive(() =>
+      this.updateEnabledPluginServersLocked((keys) =>
+        keys.filter((key) => !key.startsWith(keyPrefix))
+      )
+    );
   }
 
   /**
@@ -233,15 +693,15 @@ export class MCPConfigService {
   private globalConfigGeneration = 0;
 
   get configGeneration(): number {
-    return this.globalConfigGeneration;
+    return this.globalConfigGeneration + this.claudeDesign.generation;
   }
 
   /**
    * List configured servers.
    *
-   * - When no projectPath is provided: returns global servers from <muxHome>/mcp.jsonc
+   * - When no projectPath is provided: returns global servers from <xumHome>/mcp.jsonc
    * - When projectPath is provided and trusted=false: returns only global servers
-   * - When projectPath is provided and trusted=true: merges global + <projectPath>/.mux/mcp.jsonc
+   * - When projectPath is provided and trusted=true: merges global + <projectPath>/.xum/mcp.jsonc
    * - Agent Plugins servers (when the experiment provider is wired) are merged
    *   at the lowest precedence: user config always wins on key collisions.
    *
@@ -255,9 +715,19 @@ export class MCPConfigService {
     trusted = false,
     options?: { agentPlugins?: AgentPluginsMcpContext | null }
   ): Promise<Record<string, MCPServerInfo>> {
-    const layers = await this.listServerLayers(projectPath, trusted, options);
+    return this.mergeServerLayers(await this.listServerLayers(projectPath, trusted, options));
+  }
+
+  private async mergeServerLayers(
+    layers: Awaited<ReturnType<MCPConfigService["listServerLayers"]>>
+  ): Promise<Record<string, MCPServerInfo>> {
     // Repo overrides win by server name over global config, which wins over plugin servers.
-    return { ...layers.plugin, ...layers.global, ...layers.project };
+    const servers = { ...layers.plugin, ...layers.global, ...layers.project };
+    const design = await this.claudeDesign.serverInfo();
+    // Never replace an existing user/plugin server or lend it credentials.
+    if (design && !Object.hasOwn(servers, CLAUDE_DESIGN_SERVER_NAME))
+      servers[CLAUDE_DESIGN_SERVER_NAME] = design;
+    return servers;
   }
 
   /**
@@ -289,16 +759,38 @@ export class MCPConfigService {
     }
 
     const globalCfg = await this.getGlobalConfig();
+    // Only locally discovered global definitions can inherit global consent.
+    // Copy both levels so a provider's default-disabled map remains untouched.
+    pluginServers = { ...pluginServers };
+    for (const key of globalCfg.enabledPluginServers) {
+      const server = pluginServers[key];
+      if (server?.plugin?.sourceScope === "global") {
+        pluginServers[key] = { ...server, disabled: false };
+      }
+    }
+    const globalServers = omitReservedPluginKeys(globalCfg.servers, "global");
 
-    if (!projectPath || !trusted) {
+    // projectAutomationDisabled: benchmark harness kill-switch: dataset
+    // repos keep config trust for delegation, but repo-configured MCP
+    // servers must not start with provider credentials in the environment.
+    const projectConfigAllowed = trusted && !projectAutomationDisabled();
+    if (!projectPath || !projectConfigAllowed) {
       if (projectPath && !trusted) {
         log.debug("[MCP] Skipping project-local MCP config for untrusted project", { projectPath });
+      } else if (projectPath) {
+        log.debug("[MCP] Skipping project-local MCP config (project automation disabled)", {
+          projectPath,
+        });
       }
-      return { plugin: pluginServers, global: globalCfg.servers, project: {} };
+      return { plugin: pluginServers, global: globalServers, project: {} };
     }
 
     const repoCfg = await this.getRepoOverrideConfig(projectPath);
-    return { plugin: pluginServers, global: globalCfg.servers, project: repoCfg.servers };
+    return {
+      plugin: pluginServers,
+      global: globalServers,
+      project: omitReservedPluginKeys(repoCfg.servers, "project"),
+    };
   }
 
   async addServer(
@@ -310,49 +802,41 @@ export class MCPConfigService {
       headers?: Record<string, MCPHeaderValue>;
     }
   ): Promise<Result<void>> {
-    if (!name.trim()) {
-      return Err("Server name is required");
-    }
-
-    const transport: MCPServerTransport = input.transport ?? "stdio";
-
-    if (transport === "stdio") {
-      if (!input.command?.trim()) {
-        return Err("Command is required");
-      }
-    } else {
-      if (!input.url?.trim()) {
-        return Err("URL is required");
-      }
-    }
-
-    const cfg = await this.getGlobalConfig();
-    const existing = cfg.servers[name];
-
-    const base = {
-      disabled: existing?.disabled ?? false,
-      toolAllowlist: existing?.toolAllowlist,
-    };
-
-    const next: MCPServerInfo =
-      transport === "stdio"
-        ? {
-            transport: "stdio",
-            command: input.command!,
-            ...base,
-          }
-        : {
-            transport,
-            url: input.url!,
-            headers: input.headers,
-            ...base,
-          };
-
-    cfg.servers[name] = next;
-
     try {
-      await this.saveGlobalConfig(cfg);
-      return Ok(undefined);
+      return await this.runExclusive(async () => {
+        if (!name.trim()) return Err("Server name is required");
+        // A plain-object key cannot hold "__proto__": the entry would vanish on save (#5740).
+        if (name.trim() === "__proto__") return Err('"__proto__" cannot be used as a server name');
+        if (isCanonicalPluginServerKey(name.trim())) {
+          // See omitReservedPluginKeys: user definitions must not occupy plugin keys.
+          return Err(
+            "Server names of the form 'plugin:<id>:<name>' are reserved for Agent Plugins"
+          );
+        }
+        const transport: MCPServerTransport = input.transport ?? "stdio";
+        if (transport === "stdio") {
+          if (!input.command?.trim()) return Err("Command is required");
+        } else {
+          if (!input.url?.trim()) return Err("URL is required");
+          const urlError = getMcpServerUrlError(input.url);
+          if (urlError !== null) return Err(urlError);
+        }
+
+        const cfg = await this.getGlobalConfig();
+        const existing = getOwn(cfg.servers, name);
+        const base = {
+          disabled: existing?.disabled ?? false,
+          toolAllowlist: existing?.toolAllowlist,
+        };
+        cfg.servers[name] =
+          transport === "stdio"
+            ? // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+              { transport: "stdio", command: input.command!, ...base }
+            : // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+              { transport, url: input.url!, headers: input.headers, ...base };
+        await this.saveGlobalConfig(cfg);
+        return Ok(undefined);
+      });
     } catch (error) {
       log.error("Failed to save MCP server", { name, error });
       return Err(getErrorMessage(error));
@@ -360,15 +844,30 @@ export class MCPConfigService {
   }
 
   async setServerEnabled(name: string, enabled: boolean): Promise<Result<void>> {
-    const cfg = await this.getGlobalConfig();
-    const entry = cfg.servers[name];
-    if (!entry) {
-      return Err(`Server ${name} not found`);
-    }
-    cfg.servers[name] = { ...entry, disabled: !enabled };
     try {
-      await this.saveGlobalConfig(cfg);
-      return Ok(undefined);
+      return await this.runExclusive(async () => {
+        const managed = getOwn(await this.listServers(), name);
+        if (managed?.plugin) {
+          assert(isCanonicalPluginServerKey(name), "Plugin server must have a canonical key");
+          if (managed.plugin.sourceScope !== "global") {
+            return Err("Repo plugin servers are enabled per workspace");
+          }
+          await this.updateEnabledPluginServersLocked((keys) =>
+            enabled ? [...new Set([...keys, name])] : keys.filter((key) => key !== name)
+          );
+          return Ok(undefined);
+        }
+        if (managed?.transport !== "stdio" && managed?.managed === "claude-design") {
+          await this.claudeDesign.configure({ serverEnabled: enabled });
+          return Ok(undefined);
+        }
+        const cfg = await this.getGlobalConfig();
+        const entry = getOwn(cfg.servers, name);
+        if (!entry || isCanonicalPluginServerKey(name)) return Err(`Server ${name} not found`);
+        cfg.servers[name] = { ...entry, disabled: !enabled };
+        await this.saveGlobalConfig(cfg);
+        return Ok(undefined);
+      });
     } catch (error) {
       log.error("Failed to update MCP server enabled state", { name, error });
       return Err(getErrorMessage(error));
@@ -376,14 +875,15 @@ export class MCPConfigService {
   }
 
   async removeServer(name: string): Promise<Result<void>> {
-    const cfg = await this.getGlobalConfig();
-    if (!cfg.servers[name]) {
-      return Err(`Server ${name} not found`);
-    }
-    delete cfg.servers[name];
     try {
-      await this.saveGlobalConfig(cfg);
-      return Ok(undefined);
+      return await this.runExclusive(async () => {
+        if (isCanonicalPluginServerKey(name)) return Err("Agent Plugin definitions are read-only");
+        const cfg = await this.getGlobalConfig();
+        if (!getOwn(cfg.servers, name)) return Err(`Server ${name} not found`);
+        delete cfg.servers[name];
+        await this.saveGlobalConfig(cfg);
+        return Ok(undefined);
+      });
     } catch (error) {
       log.error("Failed to remove MCP server", { name, error });
       return Err(getErrorMessage(error));
@@ -391,21 +891,22 @@ export class MCPConfigService {
   }
 
   async setToolAllowlist(name: string, toolAllowlist: string[]): Promise<Result<void>> {
-    const cfg = await this.getGlobalConfig();
-    const entry = cfg.servers[name];
-    if (!entry) {
-      return Err(`Server ${name} not found`);
-    }
-
-    // [] = no tools allowed, [...tools] = those tools allowed
-    cfg.servers[name] = {
-      ...entry,
-      toolAllowlist,
-    };
-
     try {
-      await this.saveGlobalConfig(cfg);
-      return Ok(undefined);
+      return await this.runExclusive(async () => {
+        if (isCanonicalPluginServerKey(name)) return Err("Agent Plugin definitions are read-only");
+        const managed = getOwn(await this.listServers(), name);
+        if (managed?.transport !== "stdio" && managed?.managed === "claude-design") {
+          await this.claudeDesign.configure({ toolAllowlist });
+          return Ok(undefined);
+        }
+        const cfg = await this.getGlobalConfig();
+        const entry = getOwn(cfg.servers, name);
+        if (!entry) return Err(`Server ${name} not found`);
+        // [] = no tools allowed, [...tools] = those tools allowed
+        cfg.servers[name] = { ...entry, toolAllowlist };
+        await this.saveGlobalConfig(cfg);
+        return Ok(undefined);
+      });
     } catch (error) {
       log.error("Failed to update MCP server tool allowlist", { name, error });
       return Err(getErrorMessage(error));

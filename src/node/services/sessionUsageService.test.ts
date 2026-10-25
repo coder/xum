@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import * as path from "path";
+import { describe, it, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { SessionUsageService, type SessionUsageTokenStatsCacheV1 } from "./sessionUsageService";
 import type { HistoryService } from "./historyService";
 import type { Config } from "@/node/config";
@@ -11,9 +12,11 @@ import {
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
+import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 import { existsSync } from "fs";
 import * as fs from "fs/promises";
-import * as path from "path";
 
 function createUsage(input: number, output: number): ChatUsageDisplay {
   return {
@@ -328,7 +331,10 @@ describe("SessionUsageService", () => {
         runtimeConfig: { type: "local" },
       });
 
-      const usagePath = path.join(config.getSessionDir(parentWorkspaceId), "session-usage.json");
+      const usagePath = path.join(
+        path.join(config.sessionsDir, parentWorkspaceId),
+        "session-usage.json"
+      );
       await fs.mkdir(path.dirname(usagePath), { recursive: true });
       await fs.writeFile(
         usagePath,
@@ -400,19 +406,19 @@ describe("SessionUsageService", () => {
     it("keeps mixed-model session totals separate while lastRequest follows the latest write", async () => {
       const workspaceId = "test-workspace";
       const parentModel = "openai:gpt-5.2";
-      const advisorModel = "anthropic:claude-sonnet-4-20250514";
+      const nestedToolModel = "anthropic:claude-sonnet-4-20250514";
       const parentUsage = createUsage(100, 50);
-      const advisorUsage = createUsage(40, 10);
+      const nestedToolUsage = createUsage(40, 10);
 
       await service.recordUsage(workspaceId, parentModel, parentUsage);
-      await service.recordUsage(workspaceId, advisorModel, advisorUsage);
+      await service.recordUsage(workspaceId, nestedToolModel, nestedToolUsage);
 
       const result = await service.getSessionUsage(workspaceId);
       expect(result).toBeDefined();
       expect(result?.byModel[parentModel]).toEqual(parentUsage);
-      expect(result?.byModel[advisorModel]).toEqual(advisorUsage);
-      expect(result?.lastRequest?.model).toBe(advisorModel);
-      expect(result?.lastRequest?.usage).toEqual(advisorUsage);
+      expect(result?.byModel[nestedToolModel]).toEqual(nestedToolUsage);
+      expect(result?.lastRequest?.model).toBe(nestedToolModel);
+      expect(result?.lastRequest?.usage).toEqual(nestedToolUsage);
     });
 
     it("should update lastRequest with each recordUsage call", async () => {
@@ -433,6 +439,32 @@ describe("SessionUsageService", () => {
   });
 
   describe("recordHeadlessUsage", () => {
+    it("refuses writes for a removed workspace (r62)", async () => {
+      // A foreign backend's dream/harvest run survives the remover's
+      // process-local cancellation; its late usage write must not recreate
+      // the deleted session directory.
+      const workspaceId = "removed-workspace";
+      const tombstonePath = workspaceRemovalTombstonePath(config.rootDir, workspaceId);
+      await fs.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await fs.writeFile(tombstonePath, JSON.stringify({ workspaceId, removedAt: Date.now() }));
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        "anthropic:claude-haiku-4-5",
+        { inputTokens: 40, outputTokens: 10, totalTokens: 50 },
+        undefined,
+        { analyticsSource: "memory_consolidation" }
+      );
+      expect(recorded).toBeUndefined();
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
+      expect(
+        await fs.access(sessionDir).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    });
+
     it("accumulates into byModel without replacing lastRequest", async () => {
       const workspaceId = "test-workspace";
       const agentModel = "anthropic:claude-sonnet-4-20250514";
@@ -476,7 +508,10 @@ describe("SessionUsageService", () => {
     it("appends to the headless-usage sidecar only when an analyticsSource is given", async () => {
       const workspaceId = "test-workspace";
       const model = "anthropic:claude-sonnet-4-20250514";
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
 
       // No analytics source means no sidecar entry.
       await service.recordHeadlessUsage(workspaceId, model, {
@@ -504,7 +539,7 @@ describe("SessionUsageService", () => {
     it("still appends the analytics sidecar when the usage ledger is corrupt", async () => {
       const workspaceId = "test-workspace";
       const model = "anthropic:claude-sonnet-4-20250514";
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(sessionDir, { recursive: true });
       // Corrupt ledger: readFile throws on bad JSON (non-ENOENT), which must
       // not block the sidecar — headless spend has no chat-row fallback.
@@ -543,7 +578,7 @@ describe("SessionUsageService", () => {
       // (directory at the path) must abort BEFORE the ledger update.
       const workspaceId = "test-workspace";
       const model = "anthropic:claude-sonnet-4-20250514";
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.mkdir(path.join(sessionDir, "headless-usage.jsonl"), { recursive: true });
 
       const recorded = await service.recordHeadlessUsage(
@@ -582,7 +617,10 @@ describe("SessionUsageService", () => {
       // and would leave cost_usd undefined.
       expect(recorded?.usage.input.cost_usd).toBeGreaterThan(0);
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
         string,
         unknown
@@ -616,7 +654,10 @@ describe("SessionUsageService", () => {
       expect(recorded?.model).toBe("anthropic:claude-sonnet-4-20250514");
       expect(recorded?.usage.input.cost_usd).toBeGreaterThan(0);
 
-      const sidecarPath = path.join(config.getSessionDir(workspaceId), "headless-usage.jsonl");
+      const sidecarPath = path.join(
+        path.join(config.sessionsDir, workspaceId),
+        "headless-usage.jsonl"
+      );
       const record = JSON.parse((await fs.readFile(sidecarPath, "utf-8")).trim()) as Record<
         string,
         unknown
@@ -633,10 +674,24 @@ describe("SessionUsageService", () => {
 
       await service.recordUsage(workspaceId, model, createUsageWithCosts(100, 50, 0.12, 0.08));
 
-      await service.resetSessionUsage(workspaceId);
+      await service.resetSessionUsage(workspaceId, 1_000);
 
       const result = await service.getSessionUsage(workspaceId);
-      expect(result).toEqual({ byModel: {}, version: 1 });
+      expect(result).toEqual({ byModel: {}, version: 1, forkedAt: 1_000 });
+    });
+
+    it("keeps the fork marker as the fork records its own usage", async () => {
+      const workspaceId = "forked-workspace";
+      await service.resetSessionUsage(workspaceId, 1_000);
+      await service.recordUsage(
+        workspaceId,
+        "claude-sonnet-4-20250514",
+        createUsageWithCosts(100, 50, 0.12, 0.08)
+      );
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result?.forkedAt).toBe(1_000);
+      expect(Object.keys(result?.byModel ?? {})).toHaveLength(1);
     });
   });
 
@@ -695,6 +750,53 @@ describe("SessionUsageService", () => {
     });
   });
 
+  describe("peekTokenStatsCache", () => {
+    const workspaceId = "peek-workspace";
+    const cache: SessionUsageTokenStatsCacheV1 = {
+      version: 1,
+      computedAt: 1,
+      model: "gpt-4",
+      tokenizerName: "approx-4",
+      history: { messageCount: 1 },
+      consumers: [{ name: "User", tokens: 3, percentage: 100 }],
+      totalTokens: 3,
+      source: { historyReceipt: "receipt", inputsKey: "inputs" },
+    };
+    const writeUsageFile = async (contents: string) => {
+      const dir = path.join(config.sessionsDir, workspaceId);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "session-usage.json"), contents);
+    };
+
+    it("returns the persisted cache, source included", async () => {
+      await writeUsageFile(JSON.stringify({ byModel: {}, version: 1, tokenStatsCache: cache }));
+      expect(await service.peekTokenStatsCache(workspaceId)).toEqual(cache);
+    });
+
+    for (const [name, contents] of [
+      ["a missing file", null],
+      ["corrupt JSON", "{ not json"],
+      ["a JSON null file", "null"],
+      [
+        "a bad cache schema",
+        JSON.stringify({ byModel: {}, version: 1, tokenStatsCache: { version: 2 } }),
+      ],
+    ] as const) {
+      it(`returns undefined for ${name} and never rebuilds from history`, async () => {
+        // A history row would make the getSessionUsage path rebuild; peek must not.
+        await historyService.appendToHistory(workspaceId, createMuxMessage("m", "user", "hi"));
+        if (contents !== null) await writeUsageFile(contents);
+        const iterateSpy = spyOn(historyService, "iterateFullHistoryUnderLock");
+        try {
+          expect(await service.peekTokenStatsCache(workspaceId)).toBeUndefined();
+          expect(iterateSpy).not.toHaveBeenCalled();
+        } finally {
+          iterateSpy.mockRestore();
+        }
+      });
+    }
+  });
+
   describe("getSessionUsage", () => {
     it("should rebuild from messages when file missing (ENOENT)", async () => {
       const workspaceId = "test-workspace";
@@ -715,7 +817,7 @@ describe("SessionUsageService", () => {
       );
 
       // Delete session-usage.json but keep session dir (appendToHistory created it)
-      const usagePath = path.join(config.getSessionDir(workspaceId), "session-usage.json");
+      const usagePath = path.join(config.sessionsDir, workspaceId, "session-usage.json");
       await fs.rm(usagePath, { force: true });
 
       const result = await service.getSessionUsage(workspaceId);
@@ -739,7 +841,7 @@ describe("SessionUsageService", () => {
       );
 
       // Overwrite session-usage.json with corrupted JSON
-      const sessionDir = config.getSessionDir(workspaceId);
+      const sessionDir = path.join(config.sessionsDir, workspaceId);
       await fs.writeFile(path.join(sessionDir, "session-usage.json"), "{ invalid json");
 
       const result = await service.getSessionUsage(workspaceId);
@@ -763,7 +865,7 @@ describe("SessionUsageService", () => {
         anthropic: { cacheCreationInputTokens: 10 },
       };
       const toolUsage = {
-        toolName: "advisor",
+        toolName: "nested_tool",
         toolCallId: "tool-call-1",
         timestamp: Date.now(),
         model,
@@ -820,6 +922,28 @@ describe("SessionUsageService", () => {
       );
     });
 
+    it("rebuilds a legacy multi-step turn at the context tier of its steps", async () => {
+      // Haiku 5.5 bills a request at 5x once its prompt passes 100K tokens. This row predates
+      // per-request shares: two 85K steps sum to 170K, but its last step is under the threshold.
+      const workspaceId = "legacy-tier-rebuild-workspace";
+      const model = "anthropic:claude-haiku-5-5";
+      const assistantMessage = createMuxMessage("msg-legacy-tier", "assistant", "Hello", {
+        historySequence: 1,
+        timestamp: Date.now(),
+        model,
+        usage: { inputTokens: 170_000, outputTokens: 1_000, totalTokens: 171_000 },
+        contextUsage: { inputTokens: 85_000, outputTokens: 500, totalTokens: 85_500 },
+        stepStartPartIndices: [0, 1],
+      });
+
+      await service.rebuildFromMessages(workspaceId, [assistantMessage]);
+
+      const result = await service.getSessionUsage(workspaceId);
+      const usage = result?.byModel[normalizeToCanonical(model)];
+      expect(usage?.input.cost_usd).toBeCloseTo(170_000 * 0.1e-6, 12);
+      expect(usage?.output.cost_usd).toBeCloseTo(1_000 * 0.5e-6, 12);
+    });
+
     it("keys recovered Coder usage by the persisted metadata model", async () => {
       // Recovery runs AFTER mutable instance metadata may have changed: here
       // the custom instance is gone from providers config entirely, so
@@ -831,7 +955,7 @@ describe("SessionUsageService", () => {
       const rawModel = "coder:prod-anthropic/claude-opus-4-5";
       const metadataModel = "anthropic:claude-opus-4-5";
       const toolUsage = {
-        toolName: "advisor",
+        toolName: "nested_tool",
         toolCallId: "tool-call-coder-1",
         timestamp: Date.now(),
         model: rawModel,
@@ -858,6 +982,49 @@ describe("SessionUsageService", () => {
       expect(result?.lastRequest?.model).toBe(metadataModel);
     });
 
+    it("skips zero-usage refusal markers but keeps billed refusal usage during rebuild", async () => {
+      // Zero-usage model_fallback_refusal entries are analytics-only markers:
+      // the live path never records them in the session ledger, so a rebuild
+      // must not surface 0-token/$0 Costs rows for models that only refused.
+      const workspaceId = "tool-usage-rebuild-skips-zero-refusals";
+      const answeringModel = "anthropic:claude-opus-4-5";
+      const refusedZeroModel = "anthropic:claude-sonnet-4-20250514";
+      const refusedBilledModel = "openai:gpt-5.2";
+      const assistantMessage = createMuxMessage("msg-zero-refusal", "assistant", "Hello", {
+        historySequence: 1,
+        timestamp: Date.now(),
+        model: answeringModel,
+        usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+      });
+      Object.assign((assistantMessage.metadata ??= {}), {
+        toolModelUsages: [
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: Date.now(),
+            model: refusedZeroModel,
+            usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+          },
+          {
+            toolName: "model_fallback_refusal",
+            timestamp: Date.now(),
+            model: refusedBilledModel,
+            usage: { inputTokens: 40, outputTokens: 0, totalTokens: 40 },
+          },
+        ],
+      });
+
+      await service.rebuildFromMessages(workspaceId, [assistantMessage]);
+
+      const result = await service.getSessionUsage(workspaceId);
+      expect(result).toBeDefined();
+      const models = Object.keys(result?.byModel ?? {});
+      // Billed refusal usage still merges (live path records it too)…
+      expect(models).toContain(normalizeToCanonical(answeringModel));
+      expect(models).toContain(normalizeToCanonical(refusedBilledModel));
+      // …but the zero-usage marker leaves no ledger entry.
+      expect(models).not.toContain(normalizeToCanonical(refusedZeroModel));
+    });
+
     it("should skip malformed tool model usage entries during rebuild", async () => {
       const workspaceId = "tool-usage-rebuild-skips-malformed";
       const sameModel = "openai:gpt-4";
@@ -877,7 +1044,7 @@ describe("SessionUsageService", () => {
         },
       };
       const validOtherModelToolUsage = {
-        toolName: "advisor",
+        toolName: "nested_tool",
         toolCallId: "tool-call-valid-2",
         timestamp: 1_700_000_000_050,
         model: otherModel,
@@ -951,7 +1118,7 @@ describe("SessionUsageService", () => {
         usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
       });
 
-      // Add historicalUsage - this field was removed from ShuxMetadata type
+      // Add historicalUsage - this field was removed from XumMetadata type
       // but may still exist in persisted data from before the change
       (compactionSummary.metadata as Record<string, unknown>).historicalUsage = createUsage(
         5000,
@@ -970,7 +1137,7 @@ describe("SessionUsageService", () => {
       await historyService.appendToHistory(workspaceId, postCompactionMsg);
 
       // Delete session-usage.json to trigger rebuild from messages
-      const usagePath = path.join(config.getSessionDir(workspaceId), "session-usage.json");
+      const usagePath = path.join(config.sessionsDir, workspaceId, "session-usage.json");
       await fs.rm(usagePath, { force: true });
 
       const result = await service.getSessionUsage(workspaceId);
@@ -985,5 +1152,91 @@ describe("SessionUsageService", () => {
       expect(result!.byModel["anthropic:claude-sonnet-4-5"]).toBeDefined();
       expect(result!.byModel["anthropic:claude-sonnet-4-5"].input.tokens).toBe(300); // 100 + 200
     });
+  });
+});
+
+describe("SessionUsageService on the HistoryService's SessionFiles", () => {
+  it("refuses a headless write when the tombstone exists only in its memory volume", async () => {
+    const memory = await createTestHistoryService({ files: SessionFilesMemory });
+    try {
+      const service = new SessionUsageService(memory.config, memory.historyService);
+      const workspaceId = "removed-in-memory";
+      const tombstonePath = workspaceRemovalTombstonePath(memory.config.rootDir, workspaceId);
+      await memory.files.promises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await memory.files.promises.writeFile(
+        tombstonePath,
+        JSON.stringify({ workspaceId, removedAt: Date.now() })
+      );
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        "anthropic:claude-haiku-4-5",
+        { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+        undefined,
+        { analyticsSource: "memory_consolidation" }
+      );
+      expect(recorded).toBeUndefined();
+      expect(
+        await memory.files.promises.access(path.join(memory.config.sessionsDir, workspaceId)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    } finally {
+      await memory.cleanup();
+    }
+  });
+
+  it("keeps the ledger, the in-flight files and the headless sidecar in its memory volume", async () => {
+    // The session-usage files are session files: with memory SessionFiles they live in the
+    // memory volume, and the session dir on disk is never created.
+    const memory = await createTestHistoryService({ files: SessionFilesMemory });
+    try {
+      const service = new SessionUsageService(memory.config, memory.historyService);
+      const workspaceId = "usage-in-memory";
+      const model = "anthropic:claude-sonnet-4-5";
+      const sessionDir = path.join(memory.config.sessionsDir, workspaceId);
+
+      await service.recordUsage(workspaceId, model, createUsage(100, 10));
+      await service.recordInFlightUsage(workspaceId, "key-a", "msg-a", model, createUsage(20, 2));
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        "anthropic:claude-haiku-4-5",
+        { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+        undefined,
+        { analyticsSource: "memory_consolidation" }
+      );
+      expect(recorded).toBeDefined();
+
+      const names = await memory.files.promises.readdir(sessionDir);
+      for (const name of [
+        "session-usage.json",
+        "session-usage.in-flight",
+        HEADLESS_USAGE_FILE_NAME,
+      ]) {
+        expect(names).toContain(name);
+      }
+      expect(
+        await memory.files.promises.readdir(path.join(sessionDir, "session-usage.in-flight"))
+      ).toEqual(["key-a.json"]);
+
+      // A restarted service folds the killed stream's in-flight file into the ledger: the
+      // readdir, the read and the delete all go to the memory volume.
+      const restarted = new SessionUsageService(memory.config, memory.historyService);
+      const result = await restarted.getSessionUsage(workspaceId);
+      expect(result?.byModel[model]?.input.tokens).toBe(120);
+      expect(result?.byModel["anthropic:claude-haiku-4-5"]?.input.tokens).toBe(40);
+      expect(
+        await memory.files.promises.readdir(path.join(sessionDir, "session-usage.in-flight"))
+      ).toEqual([]);
+      expect(
+        await fs.access(sessionDir).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    } finally {
+      await memory.cleanup();
+    }
   });
 });

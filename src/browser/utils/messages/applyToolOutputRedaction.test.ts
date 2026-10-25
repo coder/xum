@@ -34,6 +34,49 @@ describe("applyToolOutputRedaction", () => {
     expect(part.output).toEqual({ success: true, answer: "continue" });
   });
 
+  // #6658: the in-turn result carried the model-only notes as its last key, after the wrapper
+  // ran over the tool's own output. The rebuild re-attaches them in the same place, still
+  // drops `ui_only`, and keeps the persisted part field out of the request.
+  it("re-attaches model-only notes where the in-turn result had them", () => {
+    const notes = ["<notification>Update the TODO list.</notification>"];
+    const messages: MuxMessage[] = [
+      {
+        id: "assistant-notes",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "tool-1",
+            toolName: "ask_user_question",
+            input: {},
+            state: "output-available",
+            output: {
+              success: true,
+              answer: "continue",
+              ui_only: { ask_user_question: { questions: [], answers: {} } },
+            },
+            modelOnlyNotifications: notes,
+          },
+        ],
+      },
+    ];
+
+    const result = applyToolOutputRedaction(messages);
+    const part = result[0]?.parts[0];
+    if (part?.type !== "dynamic-tool" || part.state !== "output-available") {
+      throw new Error("Expected dynamic tool output");
+    }
+
+    expect(Object.entries(part.output as Record<string, unknown>)).toEqual([
+      ["success", true],
+      ["answer", "continue"],
+      ["__mux_notifications", notes],
+    ]);
+    expect("modelOnlyNotifications" in part).toBe(false);
+    // Persisted history is untouched.
+    expect(messages[0]?.parts[0]).toHaveProperty("modelOnlyNotifications", notes);
+  });
+
   it("strips workflow run attachment hints from provider-bound tool parts", () => {
     const messages: MuxMessage[] = [
       {
@@ -283,5 +326,42 @@ describe("applyToolOutputRedaction", () => {
     expect(nestedOutput?.success).toBe(false);
     expect(nestedOutput?.error).not.toBe("Nested bad body \u0000");
     expect(nestedOutput?.error).toEqual(expect.stringContaining("nul=1"));
+  });
+
+  it("replays long tool output strings in full for top-level and nested tools", () => {
+    // In-turn steps send the tool's full string, so the rebuild must not cut it either.
+    const longText = "line\n".repeat(5_000);
+    const messages: MuxMessage[] = [
+      {
+        id: "assistant-1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "tool-1",
+            toolName: "code_execution",
+            input: {},
+            state: "output-available",
+            output: { success: true, content: longText },
+            nestedCalls: [
+              {
+                toolCallId: "nested-tool-1",
+                toolName: "file_read",
+                input: {},
+                state: "output-available",
+                output: { success: true, content: longText },
+              },
+            ],
+          },
+        ],
+      },
+    ];
+
+    const part = applyToolOutputRedaction(messages)[0]?.parts[0];
+    if (part?.type !== "dynamic-tool" || part.state !== "output-available") {
+      throw new Error("Expected dynamic tool output");
+    }
+    expect(part.output).toEqual({ success: true, content: longText });
+    expect(part.nestedCalls?.[0]?.output).toEqual({ success: true, content: longText });
   });
 });

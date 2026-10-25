@@ -1,6 +1,7 @@
-import { waitFor, within } from "@storybook/test";
+import { expect, waitFor, within } from "storybook/test";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import type { DevToolsStep } from "@/common/types/devtools";
+import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { PIXEL_DISABLED, StoryUiShell } from "@/browser/stories/meta";
 import { DevToolsStepCard } from "./DevToolsStepCard";
 
@@ -66,7 +67,7 @@ const debugStep: DevToolsStep = {
       parameters: { type: "object", properties: { query: { type: "string" } } },
     })),
     prompt: [
-      { role: "system", content: "You are Shux." },
+      { role: "system", content: "You are Xum." },
       { role: "user", content: "Find the latest information about evaluations." },
       { role: "assistant", content: "I will search the web and summarize the results." },
       {
@@ -114,6 +115,7 @@ const debugStep: DevToolsStep = {
   responseHeaders: null,
   rawResponse: { finishReason: "SAFETY" },
   rawChunks: null,
+  inputTransformations: null,
 };
 
 export const NarrowExpanded: Story = {
@@ -133,10 +135,51 @@ export const NarrowExpanded: Story = {
 
     const container = canvas.getByTestId("narrow-debug-card");
     assertNoDebugCardOverflow(container);
+    // No input_transformations reported, so no dropped-thinking pill.
+    if (canvas.queryByRole("button", { name: /Dropped thinking/ }) != null) {
+      throw new Error("Dropped thinking pill rendered for a step without entries");
+    }
 
     canvas.getByRole("button", { name: /12 policy rules/ }).click();
     await waitFor(() => canvas.getByText(LONG_POLICY_REGEX));
     assertNoDebugCardOverflow(container);
+
+    // The green role and policy chips are success text on a green tint (#6882).
+    const greenChips = [...canvas.getAllByText("assistant"), ...canvas.getAllByText("enable")];
+    await expect(textsBelowAaInThemes(() => greenChips).join("\n")).toBe("");
+  },
+};
+
+const anthropicStep: DevToolsStep = {
+  ...debugStep,
+  id: "step-3",
+  stepNumber: 3,
+  modelId: "claude-fable-5-1",
+  provider: "anthropic.messages",
+  output: { finishReason: "stop", textParts: [{ id: "text-1", text: "Done." }] },
+  usage: { inputTokens: 9_200, outputTokens: 410, totalTokens: 9_610 },
+  inputTransformations: [
+    { type: "thinking_dropped", path: "messages.3.content.0", reason: "prefix_binding_mismatch" },
+    { type: "thinking_dropped", path: "messages.11.content.0", reason: "model_binding_mismatch" },
+    {
+      type: "thinking_mismatch_allowed",
+      path: "messages.15.content.2",
+      reason: "prefix_binding_mismatch",
+    },
+  ],
+};
+
+/** Anthropic preserved thinking: each replayed block the API dropped is listed by path. */
+export const DroppedThinking: Story = {
+  args: { step: anthropicStep },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    canvas.getByRole("button", { name: /Step 3/ }).click();
+    const pill = await waitFor(() => canvas.getByRole("button", { name: "Dropped thinking · 2" }));
+    pill.click();
+    await waitFor(() => canvas.getByText("messages.3.content.0 · prefix_binding_mismatch"));
+    canvas.getByText("messages.15.content.2 · thinking_mismatch_allowed · prefix_binding_mismatch");
+    assertNoDebugCardOverflow(canvas.getByTestId("narrow-debug-card"));
   },
 };
 

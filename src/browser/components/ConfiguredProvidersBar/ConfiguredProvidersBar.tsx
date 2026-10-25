@@ -1,8 +1,9 @@
 import { Check, Settings } from "lucide-react";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import { formatProviderDisplayName } from "@/common/utils/providers/customProviders";
-import { usePolicy } from "@/browser/contexts/PolicyContext";
-import { getAllowedProvidersForUi } from "@/browser/utils/policyUi";
+import {
+  formatProviderDisplayName,
+  getProviderIdsForUi,
+} from "@/common/utils/providers/customProviders";
 import { hasProviderIcon, ProviderIcon } from "../ProviderIcon/ProviderIcon";
 import { useSettings } from "@/browser/contexts/SettingsContext";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../Tooltip/Tooltip";
@@ -16,10 +17,7 @@ interface ConfiguredProvidersBarProps {
  * Displayed above ChatInput on the Project page.
  */
 export function ConfiguredProvidersBar(props: ConfiguredProvidersBarProps) {
-  const policyState = usePolicy();
-  const effectivePolicy =
-    policyState.status.state === "enforced" ? (policyState.policy ?? null) : null;
-  const visibleProviders = getAllowedProvidersForUi(effectivePolicy, props.providersConfig);
+  const visibleProviders = getProviderIdsForUi(props.providersConfig);
 
   const settings = useSettings();
   const configuredProviders = visibleProviders.filter(
@@ -39,7 +37,7 @@ export function ConfiguredProvidersBar(props: ConfiguredProvidersBarProps) {
       <Tooltip>
         <TooltipTrigger asChild>
           <span className="border-border/50 hover:border-border inline-flex items-center gap-1.5 rounded border px-2 py-1 text-sm transition-colors">
-            <Check className="text-success h-3.5 w-3.5" />
+            <Check className="text-success-text h-3.5 w-3.5" />
             <span className="flex items-center gap-1">
               {configuredProviders.map((provider) =>
                 hasProviderIcon(provider) ? (

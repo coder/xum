@@ -1,15 +1,15 @@
 #!/usr/bin/env bun
 /**
- * `shux workflow` - Headless CLI runner for durable workflow scripts.
+ * `xum workflow` - Headless CLI runner for durable workflow scripts.
  */
 
+import { EffectRunnerTag } from "@/node/services/di/effectRunner";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
 import { Command } from "commander";
 
-import { EXPERIMENT_IDS } from "@/common/constants/experiments";
-import type { ProjectConfig } from "@/common/types/project";
+import type { ExperimentId } from "@/common/constants/experiments";
 import { parseRuntimeModeAndHost, RUNTIME_MODE, type RuntimeConfig } from "@/common/types/runtime";
 import {
   DEFAULT_THINKING_LEVEL,
@@ -18,33 +18,45 @@ import {
   type ParsedThinkingInput,
 } from "@/common/types/thinking";
 import assert from "@/common/utils/assert";
-import { resolveModelAlias, defaultModel } from "@/common/utils/ai/models";
+import { defaultModel } from "@/common/utils/ai/models";
+import { normalizeModelInput } from "@/common/utils/ai/normalizeModelInput";
 import { getErrorMessage } from "@/common/utils/errors";
 import { resolveThinkingInput } from "@/common/utils/thinking/policy";
-import { Config } from "@/node/config";
+import { createConfigStores } from "@/node/config";
+import type { Config, ConfigStores } from "@/node/config";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
 import { AgentSession } from "@/node/services/agentSession";
 import { CodexOauthService } from "@/node/services/codexOauthService";
 import { CoderOauthService } from "@/node/services/coderOauthService";
-import { PolicyService } from "@/node/services/policyService";
 import { ProviderService } from "@/node/services/providerService";
-import { createCoreServices } from "@/node/services/coreServices";
+import { createCoreServices } from "@/node/services/coreServicesRoot";
+import {
+  collectHeadlessExperiments,
+  createHeadlessExperimentsService,
+} from "./headlessExperiments";
+import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRuntime";
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
-import { resolveWorkflowScript } from "@/node/services/workflows/workflowScriptResolver";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import {
+  assertStoredPluginWorkflowReviewed,
+  resolveWorkflowScript,
+} from "@/node/services/workflows/workflowScriptResolver";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { WorkflowService } from "@/node/services/workflows/WorkflowService";
+import { WorkflowEvaluationAdapter } from "@/node/services/workflows/WorkflowEvaluationAdapter";
 import {
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
 } from "@/node/services/workflows/WorkflowTaskServiceAdapter";
 import { hasAnyConfiguredProvider, buildProvidersFromEnv } from "@/node/utils/providerRequirements";
+import { runBestEffortCleanup } from "./runCleanup";
 import { getParseOptions } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
-import { resolveProjectDir, resolveProjectTrusted } from "./trust";
+import { replaceRunConfig, resolveProjectDir, resolveProjectTrusted } from "./trust";
 
-const VALID_EXPERIMENT_IDS = new Set<string>(Object.values(EXPERIMENT_IDS));
 const THINKING_LABELS_LIST = [...new Set(Object.values(THINKING_DISPLAY_LABELS))].join(", ");
 
 export interface ParseWorkflowArgsInput {
@@ -60,6 +72,7 @@ interface WorkflowCLIOptions {
   runtime: string;
   model: string;
   thinking: string;
+  evaluationModel?: string;
   verbose?: boolean;
   logLevel?: string;
   json?: boolean;
@@ -68,7 +81,7 @@ interface WorkflowCLIOptions {
   argsJson?: string;
   argsFile?: string;
   argsStdin?: boolean;
-  experiment: string[];
+  experiment: ExperimentId[];
 }
 
 type WorkflowServices = ReturnType<typeof createCoreServices>;
@@ -87,7 +100,7 @@ interface WorkflowContext {
   codexOauthService: CodexOauthService;
   coderOauthService: CoderOauthService;
   realProviderService: ProviderService;
-  policyService: PolicyService;
+  agentResourceLimits: AgentResourceLimitsService;
 }
 
 export async function parseWorkflowArgs(input: ParseWorkflowArgsInput): Promise<unknown> {
@@ -163,27 +176,17 @@ async function gatherStdin(): Promise<string> {
   return Buffer.concat(chunks).toString("utf-8");
 }
 
-function collectExperiments(value: string, previous: string[]): string[] {
-  const experimentId = value.trim().toLowerCase();
-  if (!VALID_EXPERIMENT_IDS.has(experimentId)) {
-    throw new Error(
-      `Unknown experiment "${value}". Valid experiments: ${[...VALID_EXPERIMENT_IDS].join(", ")}`
-    );
-  }
-  return previous.includes(experimentId) ? previous : [...previous, experimentId];
-}
-
 function parseRuntimeConfig(value: string | undefined): RuntimeConfig {
   if (!value) return { type: "local" };
   const parsed = parseRuntimeModeAndHost(value);
   if (!parsed) {
     throw new Error(
-      `Invalid runtime: '${value}'. Use 'local'. Other runtimes are not supported by shux workflow yet.`
+      `Invalid runtime: '${value}'. Use 'local'. Other runtimes are not supported by xum workflow yet.`
     );
   }
   if (parsed.mode !== RUNTIME_MODE.LOCAL) {
     throw new Error(
-      `shux workflow currently supports only local runtime. Unsupported runtime: ${parsed.mode}`
+      `xum workflow currently supports only local runtime. Unsupported runtime: ${parsed.mode}`
     );
   }
   return { type: "local" };
@@ -200,115 +203,95 @@ function generateWorkspaceId(): string {
   return `workflow-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-async function copyPersistentConfig(realConfig: Config, config: Config): Promise<void> {
-  const existingProviders = realConfig.loadProvidersConfig();
-  if (existingProviders != null && hasAnyConfiguredProvider(existingProviders)) {
-    config.saveProvidersConfig(existingProviders);
+async function copyPersistentConfig(
+  realStores: ConfigStores,
+  runStores: ConfigStores
+): Promise<void> {
+  const realConfig = realStores.config;
+  const config = runStores.config;
+  const realProvidersStore = realStores.providersConfigStore;
+  const existingProviders = realProvidersStore.loadProvidersConfig();
+  // Copy every entry, not only configured chat providers: the evaluation-only
+  // `typesafe` key never counts as a chat provider, yet an evaluate()-only
+  // workflow needs it in the run's providers copy.
+  if (existingProviders != null && Object.keys(existingProviders).length > 0) {
+    runStores.providersConfigStore.saveProvidersConfig(existingProviders);
   }
-  const existingSecrets = realConfig.loadSecretsConfig();
+  const existingSecrets = realStores.secretsStore.loadSecretsConfig();
   if (Object.keys(existingSecrets).length > 0) {
-    await config.saveSecretsConfig(existingSecrets);
+    await runStores.secretsStore.saveSecretsConfig(existingSecrets);
   }
 
-  const existingConfig = realConfig.loadConfigOrDefault();
-  const trustOnlyProjects = new Map<string, ProjectConfig>();
-  for (const [projectPath, projectConfig] of existingConfig.projects) {
-    if (projectConfig.trusted !== undefined) {
-      trustOnlyProjects.set(projectPath, { workspaces: [], trusted: projectConfig.trusted });
-    }
-  }
-  if (trustOnlyProjects.size > 0) {
-    // Config.saveConfig is private (lost-update safety); route through the queue.
-    await config.editConfig((cfg) => ({ ...cfg, projects: trustOnlyProjects }));
-  }
-}
-
-function buildExperimentsObject(experimentIds: readonly string[]) {
-  return {
-    programmaticToolCalling: experimentIds.includes(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING),
-    programmaticToolCallingExclusive: experimentIds.includes(
-      EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE
-    ),
-    // Invoking `shux workflow` is an explicit opt-in, so the dynamic-workflows
-    // experiment is enabled implicitly for this invocation (never persisted).
-    dynamicWorkflows: true,
-    workspaceHeartbeats: experimentIds.includes(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS),
-    // Loading third-party plugin code stays an explicit per-invocation opt-in.
-    agentPlugins: experimentIds.includes(EXPERIMENT_IDS.AGENT_PLUGINS),
-  };
+  await replaceRunConfig(realConfig, config);
 }
 
 async function disposeWorkflowResources(input: {
   tempDir: DisposableTempDir;
+  config: Config;
   services?: WorkflowServices;
   session?: AgentSession;
   codexOauthService?: CodexOauthService;
   coderOauthService?: CoderOauthService;
   realProviderService?: ProviderService;
-  policyService?: PolicyService;
+  agentResourceLimits?: AgentResourceLimitsService;
 }): Promise<void> {
-  // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
-  // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
-  input.services?.backgroundProcessManager.beginShutdown();
-  try {
-    input.session?.dispose();
-  } catch (error) {
-    log.warn("shux workflow: failed to dispose session", { error: getErrorMessage(error) });
-  }
-  try {
-    input.services?.mcpServerManager.dispose();
-  } catch (error) {
-    log.warn("shux workflow: failed to dispose MCP server manager", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.codexOauthService?.dispose();
-  } catch (error) {
-    log.warn("shux workflow: failed to dispose Codex OAuth service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.coderOauthService?.dispose();
-  } catch (error) {
-    log.warn("shux workflow: failed to dispose Coder OAuth service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    input.realProviderService?.dispose();
-  } catch (error) {
-    log.warn("shux workflow: failed to dispose real-config provider service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    input.policyService?.dispose();
-  } catch (error) {
-    log.warn("shux workflow: failed to dispose policy service", {
-      error: getErrorMessage(error),
-    });
-  }
-  try {
-    await input.services?.backgroundProcessManager.terminateAll();
-  } catch (error) {
-    log.warn("shux workflow: failed to terminate background processes", {
-      error: getErrorMessage(error),
-    });
-  }
+  const services = input.services;
+  // Same shape as `xum run`'s list: every step is contained, reported, and
+  // timed as a `[shutdown]` line; a failing step never skips the ones after it.
+  await runBestEffortCleanup(
+    [
+      // First: stop the config.json watches before the services go, so no watch callback
+      // reaches a torn-down service. A failed setup stops them too.
+      { name: "config.stopWatchingConfigFile", run: () => input.config.stopWatchingConfigFile() },
+      { name: "agentResourceLimits.dispose", run: () => input.agentResourceLimits?.dispose() },
+      ...(services
+        ? [
+            // Suppress monitor:stopped before session.dispose() triggers cleanup() so persisted
+            // armed-monitor registry records survive shutdown (post-restart "monitor lost" wakes).
+            {
+              name: "backgroundProcessManager.beginShutdown",
+              run: () => services.backgroundProcessManager.beginShutdown(),
+            },
+            // Interrupt + await the runtime's supervised fibers while their dependencies
+            // are still alive (same slot as ServiceContainer.dispose); never rejects.
+            { name: "appFiberScope.close", run: () => closeScopeBounded(services.appFiberScope) },
+          ]
+        : []),
+      // The service guardian joins disposal inside closeScopeBounded. After a timeout,
+      // only initiate cleanup here: a second unbounded join would prevent CLI exit.
+      { name: "session.dispose", run: () => input.session?.beginDispose() },
+      { name: "mcpServerManager.dispose", run: () => services?.mcpServerManager.dispose() },
+      { name: "codexOauthService.dispose", run: () => input.codexOauthService?.dispose() },
+      { name: "coderOauthService.dispose", run: () => input.coderOauthService?.dispose() },
+      { name: "realProviderService.dispose", run: () => input.realProviderService?.dispose() },
+      {
+        name: "backgroundProcessManager.terminateAll",
+        run: () => services?.backgroundProcessManager.terminateAll(),
+      },
+      // Last: release the Effect runtime that owns the core graph; never rejects.
+      ...(services
+        ? [{ name: "appRuntime.dispose", run: () => disposeAppRuntime(services.runtime.managed) }]
+        : []),
+    ],
+    (stepName, error) => {
+      log.warn(`xum workflow: cleanup step failed: ${stepName}`, {
+        error: getErrorMessage(error),
+      });
+    }
+  );
   input.tempDir[Symbol.dispose]();
 }
 
 async function disposeWorkflowContext(ctx: WorkflowContext): Promise<void> {
   await disposeWorkflowResources({
     tempDir: ctx.tempDir,
+    config: ctx.config,
     services: ctx.services,
     session: ctx.session,
     codexOauthService: ctx.codexOauthService,
     coderOauthService: ctx.coderOauthService,
     realProviderService: ctx.realProviderService,
-    policyService: ctx.policyService,
+    agentResourceLimits: ctx.agentResourceLimits,
   });
 }
 
@@ -317,69 +300,94 @@ async function createWorkflowContext(options: {
   projectDir: string;
 }): Promise<WorkflowContext> {
   const tempDir = new DisposableTempDir("mux-workflow");
+  // Outside the try: the stores only build paths, and the setup-failure cleanup below needs
+  // the run config to stop its config.json watches.
+  const runStores = createConfigStores(tempDir.path);
+  const config = runStores.config;
   let services: WorkflowServices | undefined;
   let session: AgentSession | undefined;
   let codexOauthService: CodexOauthService | undefined;
   let coderOauthService: CoderOauthService | undefined;
   let realProviderService: ProviderService | undefined;
-  let policyService: PolicyService | undefined;
+  let agentResourceLimits: AgentResourceLimitsService | undefined;
   try {
-    const realConfig = new Config();
-    const config = new Config(tempDir.path);
-    await copyPersistentConfig(realConfig, config);
+    const realStores = createConfigStores();
+    const realConfig = realStores.config;
+    await copyPersistentConfig(realStores, runStores);
 
-    const existingProviders = realConfig.loadProvidersConfig();
+    const realProvidersStore = realStores.providersConfigStore;
+    const realFileLeaseManager = realStores.fileLeaseManager;
+    const runProvidersStore = runStores.providersConfigStore;
+    const existingProviders = realProvidersStore.loadProvidersConfig();
     if (!hasAnyConfiguredProvider(existingProviders)) {
       const providersFromEnv = buildProvidersFromEnv();
       if (hasAnyConfiguredProvider(providersFromEnv)) {
-        config.saveProvidersConfig(providersFromEnv);
+        // Merge over the copied file so evaluation-only entries (typesafe)
+        // survive chat-provider hydration from the environment.
+        runProvidersStore.saveProvidersConfig({ ...existingProviders, ...providersFromEnv });
       }
     }
 
     const workspaceId = generateWorkspaceId();
-    assert(workspaceId.length > 0, "shux workflow generated an empty workspace id");
+    assert(workspaceId.length > 0, "xum workflow generated an empty workspace id");
     const runtimeConfig = parseRuntimeConfig(options.opts.runtime);
     const projectTrusted = await resolveProjectTrusted(realConfig, options.projectDir);
 
-    // Enforce managed policy (MUX_POLICY_FILE / Shux Governor) in headless
-    // workflows too, matching the desktop wiring: without this, `shux workflow`
-    // would keep using providers/models/credentials that providerAccess now
-    // denies. Bind to the REAL config so governor enrollment settings
-    // (muxGovernorUrl/Token) are honored.
-    policyService = new PolicyService(realConfig);
-    await policyService.initialize();
-
     services = createCoreServices({
-      config,
-      policyService,
+      ...runStores,
       extensionMetadataPath: path.join(tempDir.path, "extensionMetadata.json"),
       mcpConfig: realConfig,
+      experimentsService: await createHeadlessExperimentsService(
+        tempDir.path,
+        options.opts.experiment
+      ),
     });
-    codexOauthService = new CodexOauthService(config, services.providerService);
-    services.aiService.setCodexOauthService(codexOauthService);
+    codexOauthService = new CodexOauthService(runProvidersStore, services.providerService);
+    services.turnRequestBuilderBindings.codexOauthService = codexOauthService;
     // Bind Coder OAuth to the REAL config (not the ephemeral tempDir copy):
     // Coder rotates the refresh token on every use, so persisting rotations
-    // only to tempDir would strand ~/.shux/providers.jsonc with a consumed
+    // only to tempDir would strand ~/.xum/providers.jsonc with a consumed
     // (dead) refresh token once this CLI session exits.
-    realProviderService = new ProviderService(realConfig, policyService);
+    realProviderService = new ProviderService(realConfig, realProvidersStore, realFileLeaseManager);
     coderOauthService = new CoderOauthService(
-      realConfig,
-      realProviderService,
-      undefined,
-      // Policy-aware: an enforced forcedBaseUrl overrides the deployment URL
-      // for token refreshes/issuer checks, and denied providers fail closed.
-      policyService
+      realProvidersStore,
+      realFileLeaseManager,
+      realProviderService
     );
-    services.aiService.setCoderOauthService(coderOauthService);
+    services.turnRequestBuilderBindings.coderOauthService = coderOauthService;
+    // The workflow's agent commands start from this process, so it applies the limits that
+    // Settings saved in the real config, as the server does.
+    agentResourceLimits = new AgentResourceLimitsService(realConfig);
+    await agentResourceLimits.start();
 
+    // Const capture: `services` is a `let`, so the deferred sanitize closure
+    // below would lose TypeScript's definite-assignment narrowing.
+    const workspaceServiceForSanitize = services.workspaceService;
     session = new AgentSession({
+      contextManagement: services.contextManagement,
+      effectRunner: services.runtime.get(EffectRunnerTag),
+      appFiberScope: services.appFiberScope,
       workspaceId,
       config,
       historyService: services.historyService,
       aiService: services.aiService,
+      streamManager: services.streamManager,
       initStateManager: services.initStateManager,
       backgroundProcessManager: services.backgroundProcessManager,
       workspaceGoalService: services.workspaceGoalService,
+      // Direct CLI registration bypasses WorkspaceService.create, so a
+      // preserved checkout could carry a stale `plugin:` MCP override into a
+      // same-name reinstall on the first send; sanitize before announcing.
+      // realConfig: the ephemeral CLI config has no workspace records, so the
+      // live-sibling scan needs the persistent one or it would prune enables a
+      // desktop workspace on this checkout still owns.
+      sanitizeCliWorkspaceRegistration: (args) =>
+        workspaceServiceForSanitize.sanitizeCliRegisteredWorkspace(
+          args.workspaceId,
+          args.workspacePath,
+          args.runtimeConfig,
+          realConfig
+        ),
     });
     services.workspaceService.registerSession(workspaceId, session);
 
@@ -389,7 +397,7 @@ async function createWorkflowContext(options: {
       projectName: path.basename(options.projectDir),
       runtimeConfig,
     });
-    assert(workspacePath.length > 0, "shux workflow workspace path must be non-empty");
+    assert(workspacePath.length > 0, "xum workflow workspace path must be non-empty");
 
     return {
       realConfig,
@@ -405,17 +413,18 @@ async function createWorkflowContext(options: {
       codexOauthService,
       coderOauthService,
       realProviderService,
-      policyService,
+      agentResourceLimits,
     };
   } catch (error) {
     await disposeWorkflowResources({
       tempDir,
+      config,
       services,
       session,
       codexOauthService,
       coderOauthService,
       realProviderService,
-      policyService,
+      agentResourceLimits,
     });
     throw error;
   }
@@ -427,24 +436,36 @@ function createWorkflowService(input: {
   model: string;
   thinkingLevel: ParsedThinkingInput;
 }): WorkflowService {
-  const experiments = buildExperimentsObject(input.opts.experiment);
   const runtime = createRuntime(input.ctx.runtimeConfig, {
     projectPath: input.ctx.projectDir,
     workspaceName: input.ctx.workspaceId,
     workspacePath: input.ctx.workspacePath,
   });
-  const workspaceSessionDir = input.ctx.config.getSessionDir(input.ctx.workspaceId);
+  const workspaceSessionDir = path.join(input.ctx.config.sessionsDir, input.ctx.workspaceId);
 
   return new WorkflowService({
+    archiveAdmission: input.ctx.services.workspaceService,
     runStore: new WorkflowRunStore({ sessionDir: workspaceSessionDir }),
     runtimeFactory: new QuickJSRuntimeFactory(),
+    evaluationAdapter: new WorkflowEvaluationAdapter({
+      evaluationService: input.ctx.services.evaluationService,
+      aiService: input.ctx.services.aiService,
+      sessionUsageService: input.ctx.services.sessionUsageService,
+      // The ephemeral run config copies only providers/secrets/trust/tool search, so the
+      // Settings default (`evaluationDefaults.model`) must be read from the
+      // real config. Precedence: per-call `model` > --evaluation-model > Settings.
+      config: input.ctx.realConfig,
+      workspaceId: input.ctx.workspaceId,
+      ...(input.opts.evaluationModel !== undefined
+        ? { evaluationModelOverride: input.opts.evaluationModel }
+        : {}),
+    }),
     taskAdapterFactory: (runId) =>
       new WorkflowTaskServiceAdapter({
         taskService: input.ctx.services.taskService,
         parentWorkspaceId: input.ctx.workspaceId,
         workflowRunId: runId,
         defaultAgentId: DEFAULT_WORKFLOW_AGENT_ID,
-        experiments,
         modelString: input.model,
         thinkingLevel: input.thinkingLevel,
         getProjectTrusted: () => input.ctx.projectTrusted,
@@ -452,9 +473,10 @@ function createWorkflowService(input: {
           workspaceId: input.ctx.workspaceId,
           cwd: input.ctx.workspacePath,
           runtime,
-          runtimeTempDir: runtime.normalizePath(".mux/tmp", input.ctx.workspacePath),
+          runtimeTempDir: runtime.normalizePath(".xum/tmp", input.ctx.workspacePath),
           workspaceSessionDir,
           trusted: input.ctx.projectTrusted,
+          sessionLocks: input.ctx.services.historyService.locks,
         },
       }),
     resolveWorkflowScript: (scriptPath) =>
@@ -463,7 +485,17 @@ function createWorkflowService(input: {
         runtime,
         workspacePath: input.ctx.workspacePath,
         projectTrusted: input.ctx.projectTrusted,
-        includeAgentPlugins: experiments.agentPlugins,
+        // Outside the agent loop: the headless CLI builds host runtimes.
+        runtimeFactory: nodeRuntimeFactory,
+      }),
+    assertStoredPluginWorkflowReviewed: (stored) =>
+      assertStoredPluginWorkflowReviewed({
+        ...stored,
+        runtime,
+        workspacePath: input.ctx.workspacePath,
+        projectTrusted: input.ctx.projectTrusted,
+        // Outside the agent loop: the headless CLI builds host runtimes.
+        runtimeFactory: nodeRuntimeFactory,
       }),
     getCurrentProjectTrusted: () => input.ctx.projectTrusted,
     runnerId: input.ctx.workspaceId,
@@ -483,8 +515,21 @@ async function runWorkflow(scriptPath: string, options: WorkflowCLIOptions): Pro
     argsFile: options.argsFile,
     argsStdin: options.argsStdin,
   });
-  const model = resolveModelAlias(options.model);
+  // Shared normalization (alias resolution + gateway migration + format
+  // validation); an unrecognized -m value fails up front.
+  const model = normalizeModelInput(options.model).model;
+  if (model == null) {
+    throw new Error(
+      `Invalid model "${options.model}". Expected "provider:model-id" or a known alias`
+    );
+  }
   const thinkingLevel = resolveThinkingInput(parseThinkingLevel(options.thinking), model);
+  // Passed verbatim like a per-call `model`; the evaluation resolver reports
+  // unknown/unsupported models per step. Only a blank value is rejected here
+  // (it would otherwise shadow the Settings default with nothing).
+  if (options.evaluationModel?.trim().length === 0) {
+    throw new Error('Invalid --evaluation-model: expected a non-blank "provider:model-id"');
+  }
   const suppressHuman = options.json === true || options.quiet === true;
   const writeLine = (line = "") => {
     if (!suppressHuman) process.stdout.write(`${line}\n`);
@@ -507,7 +552,8 @@ async function runWorkflow(scriptPath: string, options: WorkflowCLIOptions): Pro
       runtime,
       workspacePath: ctx.workspacePath,
       projectTrusted: ctx.projectTrusted,
-      includeAgentPlugins: buildExperimentsObject(options.experiment).agentPlugins,
+      // Outside the agent loop: the headless CLI builds host runtimes.
+      runtimeFactory: nodeRuntimeFactory,
     });
     const result = await workflowService.startWorkflow({
       script,
@@ -561,10 +607,8 @@ function configureLogging(options: Pick<WorkflowCLIOptions, "logLevel" | "verbos
 export async function main(): Promise<number> {
   const program = new Command();
   program
-    .name("shux workflow")
-    .description(
-      "Run shux workflow scripts by explicit script path.\n\nExperimental: invoking this command implicitly enables the dynamic-workflows\nexperiment for this invocation only."
-    )
+    .name("xum workflow")
+    .description("Run xum workflow scripts by explicit script path.")
     .option("-d, --dir <path>", "project directory")
     .option("-r, --runtime <runtime>", "runtime type (currently only local is supported)", "local")
     .option("-m, --model <model>", "model to use for workflow-owned agents", defaultModel)
@@ -572,6 +616,10 @@ export async function main(): Promise<number> {
       "-t, --thinking <level>",
       `thinking level: ${THINKING_LABELS_LIST}`,
       THINKING_DISPLAY_LABELS[DEFAULT_THINKING_LEVEL]
+    )
+    .option(
+      "--evaluation-model <model>",
+      "model for evaluate() steps without a per-call model (overrides the Settings default)"
     )
     .option("--json", "emit JSON/NDJSON output")
     .option("-q, --quiet", "only output final result")
@@ -587,7 +635,7 @@ export async function main(): Promise<number> {
     .option(
       "-e, --experiment <id>",
       "enable an additional experiment for workflow-owned child agents (can be repeated)",
-      collectExperiments,
+      collectHeadlessExperiments,
       []
     )
     .option("-v, --verbose", "show info-level logs")

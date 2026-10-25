@@ -7,6 +7,7 @@ import {
   resolveSkillUserInvocable,
   resolveSkillWhenToUse,
 } from "@/common/orpc/schemas";
+import { resolveSkillPaths } from "@/common/utils/skills/skillPaths";
 import { parseSkillMarkdown } from "./parseSkillMarkdown";
 import { BUILTIN_SKILL_FILES } from "./builtInSkillContent.generated";
 
@@ -15,7 +16,7 @@ import { BUILTIN_SKILL_FILES } from "./builtInSkillContent.generated";
  *
  * Source of truth is:
  * - src/node/builtinSkills/*.md (SKILL.md content)
- * - docs/ (embedded for shux-docs)
+ * - docs/ (embedded for xum-docs)
  *
  * Content is generated into builtInSkillContent.generated.ts via scripts/gen_builtin_skills.ts.
  */
@@ -67,6 +68,7 @@ export function getBuiltInSkillDescriptors(): AgentSkillDescriptor[] {
     userInvocable: resolveSkillUserInvocable(pkg.frontmatter),
     argumentHint: pkg.frontmatter["argument-hint"],
     whenToUse: resolveSkillWhenToUse(pkg.frontmatter),
+    paths: resolveSkillPaths(pkg.frontmatter),
   }));
 }
 

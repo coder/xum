@@ -1,0 +1,126 @@
+import { z } from "zod";
+
+import {
+  AGENT_PLUGIN_NAME_MAX_LENGTH,
+  AGENT_PLUGIN_NAME_PATTERN,
+  isValidAgentPluginName,
+} from "@/common/utils/agentPluginName";
+
+/**
+ * Managed Agent Plugin install registry — persisted as `~/.mux/plugins.json`
+ * with the shape `{ plugins: AgentPluginInstallEntry[] }`.
+ *
+ * A standalone file (not a `~/.mux/config.json` section) on purpose: older
+ * builds rebuild config.json from known fields on every save, so a downgrade
+ * would silently drop an embedded registry. A file older builds never touch
+ * survives upgrade↔downgrade round-trips. The install service additionally
+ * rewrites the file from its RAW entry list (entries validated per-element
+ * on read, matched by `name` on mutation), so entries and fields written by
+ * newer builds survive mutations on this build.
+ *
+ * Semantics (mirroring lazy.nvim / Claude Code): `source.ref` is the tracking
+ * channel and `lockedSha` is what is actually on disk and runs. Install
+ * resolves ref → SHA and records both; the runtime never follows a branch
+ * implicitly — updates apply only on explicit user action.
+ *
+ * The registry records provenance and optional component imports. Plugin discovery
+ * (src/node/services/agentPlugins/discovery.ts) remains the source of truth
+ * for what loads, so drift between registry and disk self-heals: directories
+ * without a registry entry show as "unmanaged", entries without a directory
+ * show as "missing".
+ */
+
+export const AgentPluginGitSourceSchema = z.object({
+  type: z.literal("git"),
+  /** Normalized clone URL (https or ssh) derived from the user's input. */
+  url: z.string().min(1),
+  /** Tracking ref: branch name, tag name, or full 40-hex commit SHA. */
+  ref: z.string().min(1),
+  /**
+   * How `ref` is treated by update checks: branches track their remote tip,
+   * tags are pinned but warn when the tag moves, commits are fully pinned.
+   */
+  refType: z.enum(["branch", "tag", "commit"]),
+  /**
+   * Repo-relative directory of the plugin for monorepo installs (normalized
+   * `a/b/c`). Only this folder is fetched (sparse checkout) and installed as
+   * the plugin root; updates track the same folder at the new commit.
+   */
+  subpath: z.string().optional(),
+});
+
+/**
+ * Tagged union so future source kinds (`path`, `archive`, `catalog`) slot in
+ * without a registry migration.
+ */
+export const AgentPluginInstallSourceSchema = z.discriminatedUnion("type", [
+  AgentPluginGitSourceSchema,
+]);
+
+/** Absent on legacy installs (import everything); present arrays are exact allowlists. */
+export const AgentPluginImportedComponentsSchema = z.object({
+  skills: z.array(z.string()),
+  mcpServers: z.array(z.string()),
+});
+export type AgentPluginImportedComponents = z.infer<typeof AgentPluginImportedComponentsSchema>;
+
+/** Reviewed fingerprints by component name (see `componentConsent` below). */
+export const AgentPluginComponentConsentSchema = z.object({
+  skills: z.record(z.string(), z.string()),
+  mcpServers: z.record(z.string(), z.string()),
+  // Workflow scripts by file name (#6629). Absent in a record from before #6629: no workflow
+  // is reviewed, so each such plugin needs one review (no backfill). An older build strips
+  // the key on read and keeps it on save (installService mergeRawConsent).
+  workflows: z.record(z.string(), z.string()).default({}),
+  // Agents by ID (#6629), with the same upgrade rules as workflows.
+  agents: z.record(z.string(), z.string()).default({}),
+  // Slash commands by name (#6629), with the same upgrade rules as workflows.
+  slashCommands: z.record(z.string(), z.string()).default({}),
+});
+
+export const AgentPluginInstallEntrySchema = z.object({
+  /**
+   * plugin.json `name`; also the directory name under `~/.mux/plugins`.
+   * Pattern-enforced because it is joined into filesystem paths that
+   * uninstall deletes recursively — `.`/`..`/separators must never validate.
+   */
+  name: z
+    .string()
+    .max(AGENT_PLUGIN_NAME_MAX_LENGTH)
+    .regex(AGENT_PLUGIN_NAME_PATTERN)
+    // Full validator on top of the grammar: also rejects Windows-reserved
+    // device names, which pattern+length alone admit.
+    .refine(isValidAgentPluginName, { message: "reserved or invalid plugin name" }),
+  /** v1 installs are global-only; the installer never writes into project checkouts. */
+  scope: z.literal("global"),
+  source: AgentPluginInstallSourceSchema,
+  /** Commit SHA of the tree installed on disk (what actually runs). */
+  lockedSha: z.string().min(1),
+  /** ISO-8601 install timestamp. */
+  installedAt: z.string().min(1),
+  /** ISO-8601 timestamp of the most recent applied update. */
+  updatedAt: z.string().optional(),
+  /** Cached manifest metadata so the list UI works offline / when the dir is missing. */
+  manifest: z
+    .object({
+      version: z.string().optional(),
+      description: z.string().optional(),
+    })
+    .optional(),
+  importedComponents: AgentPluginImportedComponentsSchema.optional(),
+  /**
+   * Reviewed fingerprint of each imported component, by name (#6498). A component loads only when
+   * its current fingerprint matches, so a newer build that parses more of the package cannot load
+   * a changed component under an approved name. Top-level, not under importedComponents: older
+   * builds spread importedComponents on save and would keep a nested record stale. Absent on
+   * older installs, which then need a review (no backfill). `z.record` drops a `__proto__` key on
+   * parse, so the plugin MCP loader refuses that server name (mcpConfig.ts checkServerEntryShape).
+   */
+  componentConsent: AgentPluginComponentConsentSchema.optional(),
+  /** Reserved: per-plugin opt-in auto-update. Unused in v1 — updates are badge + manual. */
+  autoUpdate: z.boolean().optional(),
+});
+
+export type AgentPluginGitSource = z.infer<typeof AgentPluginGitSourceSchema>;
+export type AgentPluginInstallSource = z.infer<typeof AgentPluginInstallSourceSchema>;
+export type AgentPluginInstallEntry = z.infer<typeof AgentPluginInstallEntrySchema>;

@@ -6,11 +6,11 @@ name: NPM Publish (Reusable)
 # OIDC TRUSTED PUBLISHING SETUP (on npmjs.com):
 #   New packages must be published manually once before npm allows trusted publisher setup.
 #   Repository renames do not update npm settings; reconfigure every existing package.
-#   For each package (@coder/shux, mux, @coder/mux-chat-components):
+#   For each package (@coder/xum, mux, @coder/mux-chat-components):
 #   1. Go to package settings → Trusted Publisher → GitHub Actions
 #   2. Configure:
 #      - Owner: coder
-#      - Repository: shux
+#      - Repository: xum
 #      - Workflow filename: publish-npm.yml  (the caller, NOT this reusable)
 #      - Allowed action: npm publish
 #      - Environment: (leave blank)
@@ -51,7 +51,7 @@ jobs:
           fetch-depth: 0 # Required for git describe to find tags
           persist-credentials: false
 
-      - uses: ./.github/actions/setup-mux
+      - uses: ./.github/actions/setup-xum
 
       # Setup Node.js 24+ for npm v11+ required by OIDC trusted publishing.
       # Node 22 ships with npm 10.x which does NOT support OIDC.
@@ -120,7 +120,7 @@ jobs:
           echo "version=${NPM_VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=${NPM_TAG}" >> "$GITHUB_OUTPUT"
 
-          # Keep the canonical @coder/shux package and legacy mux forwarding package in lockstep.
+          # Keep the canonical @coder/xum package and legacy mux forwarding package in lockstep.
           node ./scripts/set-package-version.js "$NPM_VERSION"
 
           echo "Updated package versions to ${NPM_VERSION}"
@@ -129,17 +129,25 @@ jobs:
         run: ./scripts/generate-version.sh
 
       - name: Generate npm shrinkwrap
-        run: ./scripts/generate-npm-shrinkwrap.sh
+        run: bun scripts/generate-npm-shrinkwrap.ts
 
       - name: Build application
         run: make build
 
-      - name: Pack npm package for smoke test
+      - name: Pack npm package
         id: pack
         run: |
           TARBALL=$(./scripts/pack-npm-package.sh)
           echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
           echo "Found package: $TARBALL"
+
+      - name: Upload npm package for the unlocked smoke test
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: npm-package
+          path: ${{ steps.pack.outputs.tarball }}
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Run smoke test
         env:
@@ -165,38 +173,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      # Run a second smoke test without npm-shrinkwrap.json to catch dependency
-      # resolution issues that affect `bun x mux@latest` and other tools that
-      # don't respect shrinkwrap. Uses a different port to avoid conflicts.
-      - name: Run smoke test (without shrinkwrap)
-        env:
-          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
-          SERVER_PORT: 3001
-          SERVER_HOST: localhost
-          STARTUP_TIMEOUT: 30
-          SKIP_SHRINKWRAP: "1"
-        run: |
-          ./scripts/smoke-test.sh
-
-      - name: Upload server logs on no-shrinkwrap smoke test failure
-        if: failure()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
-        with:
-          name: smoke-test-no-shrinkwrap-logs
-          path: |
-            /tmp/mux-smoke-test-*/server.log
-          if-no-files-found: warn
-          retention-days: 7
-
-      - name: Clean up tarball
-        if: always()
-        env:
-          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
-        run: |
-          if [ -n "$PACKAGE_TARBALL" ]; then
-            rm -f "$PACKAGE_TARBALL"
-          fi
-
       - name: Check if version exists
         id: check-exists
         run: |
@@ -213,10 +189,13 @@ jobs:
         env:
           STEPS_VERSION_OUTPUTS_VERSION: ${{ steps.version.outputs.version }}
 
+      # Publish the smoke-tested tarball: publishing the checkout would re-pack its manifest,
+      # including the dev-only patchedDependencies that pack-npm-package.sh strips.
       - name: Publish to NPM
         if: steps.check-exists.outputs.exists == 'false'
-        run: npm publish --tag "$STEPS_VERSION_OUTPUTS_TAG"
+        run: npm publish "$PACKAGE_TARBALL" --tag "$STEPS_VERSION_OUTPUTS_TAG"
         env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
           STEPS_VERSION_OUTPUTS_TAG: ${{ steps.version.outputs.tag }}
 
       - name: Skip (version already exists)
@@ -225,6 +204,15 @@ jobs:
           echo "Version ${STEPS_VERSION_OUTPUTS_VERSION} already exists on npm; skipping publish."
         env:
           STEPS_VERSION_OUTPUTS_VERSION: ${{ steps.version.outputs.version }}
+
+      - name: Clean up tarball
+        if: always()
+        env:
+          PACKAGE_TARBALL: ${{ steps.pack.outputs.tarball }}
+        run: |
+          if [ -n "$PACKAGE_TARBALL" ]; then
+            rm -f "$PACKAGE_TARBALL"
+          fi
 
       - name: Verify legacy mux compatibility package
         working-directory: packages/mux-compat
@@ -293,6 +281,9 @@ jobs:
 
       - name: Build chat-components package
         working-directory: packages/chat-components
+        # Vite chunk rendering exceeds Node's default heap on ubuntu-latest.
+        env:
+          NODE_OPTIONS: --max-old-space-size=8192
         run: bun run build
 
       - name: Check if chat-components version exists
@@ -325,3 +316,39 @@ jobs:
           echo "Version ${STEPS_CHAT_COMPONENTS_VERSION} already exists on npm; skipping publish."
         env:
           STEPS_CHAT_COMPONENTS_VERSION: ${{ steps.chat-components-version.outputs.version }}
+
+  # A second smoke test without npm-shrinkwrap.json catches dependency resolution issues that
+  # affect `bun x mux@latest` and other tools that don't respect shrinkwrap. That install runs
+  # whatever the registry serves at the time, so it runs here, away from the publish job's
+  # id-token and from the tarball before its upload (#7227). It does not gate the publish, since
+  # such a failure affects the previous release just as much.
+  smoke-unlocked:
+    name: Smoke test without shrinkwrap
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-package
+          path: ${{ runner.temp }}/npm-package
+
+      - name: Run smoke test (without shrinkwrap)
+        env:
+          SERVER_PORT: 3001
+          SERVER_HOST: localhost
+          STARTUP_TIMEOUT: 30
+          SKIP_SHRINKWRAP: "1"
+        run: |
+          PACKAGE_TARBALL=$(echo "$RUNNER_TEMP"/npm-package/*.tgz) ./scripts/smoke-test.sh

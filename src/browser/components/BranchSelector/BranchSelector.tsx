@@ -7,14 +7,19 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { useCopyToClipboard } from "@/browser/hooks/useCopyToClipboard";
 import { clearGitStatus, invalidateGitStatus, useGitStatus } from "@/browser/stores/GitStatusStore";
 import { createLRUCache } from "@/browser/utils/lruCache";
+import {
+  BRANCH_CACHE_ENTRY_PREFIX,
+  BRANCH_CACHE_INDEX_KEY,
+  BRANCH_CACHE_MAX_ENTRIES,
+} from "@/common/constants/storage";
 import { buildCheckoutCommand, buildRemoteBranchListCommand } from "./branchCommands";
 import { repoRootBashOptions } from "@/browser/utils/executeBash";
 
 // LRU cache for persisting branch names across app restarts
 const branchCache = createLRUCache<string>({
-  entryPrefix: "branch:",
-  indexKey: "branchIndex",
-  maxEntries: 100,
+  entryPrefix: BRANCH_CACHE_ENTRY_PREFIX,
+  indexKey: BRANCH_CACHE_INDEX_KEY,
+  maxEntries: BRANCH_CACHE_MAX_ENTRIES,
   // No TTL - cached branch info seeds the selector until passive git status refreshes arrive.
 });
 
@@ -23,6 +28,7 @@ interface BranchSelectorProps {
   /** Fallback name to display if not in a git repo (workspace name) */
   workspaceName: string;
   className?: string;
+  showCopyButton?: boolean;
 }
 
 // Max branches to fetch
@@ -41,7 +47,12 @@ interface RemoteState {
  * If not in a git repo, shows the workspace name without interactive features.
  * Remotes appear as expandable groups that lazy-load their branches.
  */
-export function BranchSelector({ workspaceId, workspaceName, className }: BranchSelectorProps) {
+export function BranchSelector({
+  workspaceId,
+  workspaceName,
+  className,
+  showCopyButton = true,
+}: BranchSelectorProps) {
   const { api } = useAPI();
   // null = branch is not known yet (for example a stopped runtime with no passive git data),
   // false = explicitly confirmed not a git repo, string = current branch.
@@ -59,7 +70,6 @@ export function BranchSelector({ workspaceId, workspaceName, className }: Branch
   const [isLoading, setIsLoading] = useState(false);
   const [isSwitching, setIsSwitching] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { copied, copyToClipboard } = useCopyToClipboard();
 
   // Subscribe to GitStatusStore for branch changes detected during periodic refresh
   // (e.g., focus events, file-modifying tools). This keeps the branch selector in sync
@@ -340,13 +350,6 @@ export function BranchSelector({ workspaceId, workspaceName, className }: Branch
     }
   }, [isOpen]);
 
-  const handleCopy = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (typeof currentBranch === "string") {
-      void copyToClipboard(currentBranch);
-    }
-  };
-
   // Display name: actual git branch if available, otherwise workspace name
   const displayName = typeof currentBranch === "string" ? currentBranch : workspaceName;
 
@@ -386,7 +389,8 @@ export function BranchSelector({ workspaceId, workspaceName, className }: Branch
   if (currentBranch === false) {
     return (
       <div className={cn("group flex items-center gap-0.5", className)}>
-        <div className="text-muted-light flex max-w-[180px] min-w-0 items-center gap-1 px-1 py-0.5 font-mono text-[11px]">
+        {/* text-muted, not text-muted-light: the light theme's muted-light is 2.7:1 on the footer (#5980). */}
+        <div className="text-muted flex max-w-[180px] min-w-0 items-center gap-1 px-1 py-0.5 font-mono text-[11px]">
           <span className="truncate">{workspaceName}</span>
         </div>
       </div>
@@ -400,7 +404,7 @@ export function BranchSelector({ workspaceId, workspaceName, className }: Branch
           <button
             disabled={isSwitching}
             className={cn(
-              "text-muted-light hover:bg-hover hover:text-foreground flex min-w-0 max-w-[180px] items-center gap-1 rounded-sm px-1 py-0.5 font-mono text-[11px] transition-colors",
+              "text-muted hover:bg-hover hover:text-foreground flex min-w-0 max-w-[180px] items-center gap-1 rounded-sm px-1 py-0.5 font-mono text-[11px] transition-colors",
               isRefreshing && "animate-pulse" // Show pulse during switch instead of replacing content
             )}
           >
@@ -532,23 +536,44 @@ export function BranchSelector({ workspaceId, workspaceName, className }: Branch
         </PopoverContent>
       </Popover>
 
-      {/* Copy button - only show on hover once the real branch name is known. */}
-      {typeof currentBranch === "string" && (
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <button
-              onClick={handleCopy}
-              className="text-muted hover:text-foreground flex h-3.5 w-3.5 shrink-0 items-center justify-center opacity-0 transition-opacity group-hover:opacity-100"
-              aria-label="Copy branch name"
-            >
-              {copied ? <Check className="h-2.5 w-2.5" /> : <Copy className="h-2.5 w-2.5" />}
-            </button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">{copied ? "Copied!" : "Copy branch name"}</TooltipContent>
-        </Tooltip>
+      {showCopyButton && typeof currentBranch === "string" && (
+        <BranchCopyButton branch={currentBranch} />
       )}
 
       {error && <span className="text-danger-soft truncate text-[10px]">{error}</span>}
     </div>
+  );
+}
+
+/**
+ * Mouse users reveal it on hover. Touch users have no hover, so coarse pointers always show it,
+ * and it stays visible while the check icon confirms a copy (the "Copied!" tooltip needs hover too).
+ */
+function BranchCopyButton(props: { branch: string }) {
+  const { copied, copyToClipboard } = useCopyToClipboard();
+
+  const handleCopy = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    void copyToClipboard(props.branch);
+  };
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          onClick={handleCopy}
+          className={cn(
+            "text-muted hover:text-foreground flex h-3.5 w-3.5 shrink-0 items-center justify-center transition-opacity",
+            copied
+              ? "opacity-100"
+              : "opacity-0 group-hover:opacity-100 [@media(hover:none)_and_(pointer:coarse)]:opacity-100"
+          )}
+          aria-label="Copy branch name"
+        >
+          {copied ? <Check className="h-2.5 w-2.5" /> : <Copy className="h-2.5 w-2.5" />}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="bottom">{copied ? "Copied!" : "Copy branch name"}</TooltipContent>
+    </Tooltip>
   );
 }

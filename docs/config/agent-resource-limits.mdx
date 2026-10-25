@@ -1,0 +1,160 @@
+---
+title: Agent Resource Limits
+description: Set a CPU and memory limit that all local agent commands share, and a limit for single projects inside it
+---
+
+Agents that run in parallel on one machine can use all of its CPU and memory, which slows down Xum and everything else on the machine. A resource limit caps what all local agent commands use together. Xum enforces it with a Linux cgroup v2, so it works only on Linux.
+
+## Set the limits
+
+In **Settings → Agents → Resource limits**, turn on the switch. Then enter a **CPU limit** in cores (fractions such as `2.5` work) and a **Memory limit** in GiB. An empty field means no limit. The value saves when you leave the field.
+
+The line under the fields shows the result:
+
+- **Active**: agent commands share the limits. The line names the cgroup they run in.
+- **Not applied**: the line gives the reason. Fix the cause (see [Status messages](#status-messages)), then click **Try again**.
+
+While the switch is off, Xum checks what the limits would take where it runs, without changing anything. If it must first get its cgroup with sudo, the line says so (see [Xum delegates the cgroup with sudo](#xum-delegates-the-cgroup-with-sudo)). If the limits cannot apply there, the line gives the reason. On macOS, Windows, and Linux without cgroup v2, you cannot turn on the switch.
+
+A changed limit applies at once to agent commands that already run under the limit. Commands that started while no limit applied keep running without one.
+
+To stop the limits for a while, turn off the switch. The limits stop at once, also for agent commands that already run under them. Xum keeps the values, and they apply again when you turn the switch back on.
+
+## Limit one project
+
+A project can get its own CPU and memory limit inside the limit that all projects share. For example, all projects together get 28 cores and 64 GiB, and the project `pharos` gets at most 14 cores and 32 GiB of that. The other projects get only the shared limit.
+
+1. In **Settings → Agents → Resource limits**, set the limit for all projects, or leave it empty.
+2. In **Project**, select the project.
+3. Enter its **CPU limit** and **Memory limit**. An empty field means that the project has no limit of its own for that resource.
+
+To edit the shared limit again, select **All projects**. The one switch turns all limits on and off, the project limits too.
+
+The kernel applies the lower of the two limits. A project limit above the shared limit does not give the project more, and Settings says so under the fields. When a project goes over its memory limit, the out-of-memory killer stops processes of that project only.
+
+A new project limit applies to the commands of the project that start after you save it. Commands of the project that already run keep only the shared limit until they end. A changed project limit applies at once to the commands that already run under it.
+
+A sub-project cannot get a limit of its own. Its workspaces use the checkout of the parent project, so their commands share the parent project's limit.
+
+A project limit covers the same commands as the shared limit (see [What the limit covers](#what-the-limit-covers)), for the workspaces of that project. These commands can get only the shared limit:
+
+- The MCP server test in Settings, and the commands that load skills and agent definitions.
+- `xum run` and `xum workflow`, when their directory is not the path of a project in Xum.
+
+Xum saves a project limit with the project in `~/.xum/config.json` (`agentResourceLimits`). A repository cannot set it.
+
+## What the limit covers
+
+The limit covers the commands of local and worktree workspaces: bash tool commands in the foreground and background, tool hooks, init and lifecycle hooks, MCP servers that run as local commands, and the other commands Xum runs in the workspace for the agent.
+
+It does not cover:
+
+- Terminals that you open.
+- The desktop that desktop tools start, and the programs that the desktop starts.
+- Xum itself, including the git commands it runs to create and remove worktrees, and repository hooks such as `post-checkout` that those commands run.
+- Docker, dev container, SSH, and Coder workspaces. Their commands run in the container or on the remote machine.
+
+While the switch is on, `xum run` and `xum workflow` apply the saved limits to their commands too. Their commands share one limit with the agents of a running Xum only when both use the same base cgroup (see [How Xum sets up the cgroup](#how-xum-sets-up-the-cgroup)), for example when you start them from a shell in `xum-app`.
+
+Things to know about the limits:
+
+- The CPU limit is a quota: with `2.5`, agent commands together get 250 ms of CPU time in each 100 ms period, on any number of CPUs. Programs built with Go 1.25 or later set their default `GOMAXPROCS` from it, unless their `go.mod` names an earlier Go version.
+- The memory limit covers RAM, not swap. If the machine has swap, agent commands can still use it.
+- If you lower the memory limit below what agent commands use now, the kernel reclaims memory and can stop agent processes with the out-of-memory killer.
+
+## How Xum sets up the cgroup
+
+A user can move a process into a cgroup only inside a cgroup tree that is delegated to that user. Xum therefore uses the cgroup it runs in, which this page calls the base cgroup. When you set a limit, Xum:
+
+1. Enables the `cpu` and `memory` controllers for the base cgroup's children. A cgroup that does this cannot hold processes itself, so Xum first moves the processes of the base cgroup into a child named `xum-app`.
+2. Creates the child `xum-agents` and writes the limits to its `cpu.max` and `memory.max`.
+3. Moves each new agent command into `xum-agents` before the command runs.
+
+Xum moves the processes before it enables any controller. The kernel lets a cgroup that holds processes enable a threaded controller, such as `cpu`, `pids`, or `cpuset`. That cgroup then becomes a thread root, and the kernel refuses to move a process into its child `xum-agents`. An older Xum with only a CPU limit could leave the base cgroup in this state. Xum repairs such a cgroup by itself. If `cpu` is the only controller on and no child is threaded, Xum turns `cpu` off, moves the processes into `xum-app`, and then enables the controllers that the limits need. In any other case, Xum changes nothing and reports why, because turning a controller off resets its settings in every child (see [Status messages](#status-messages)).
+
+If your user cannot manage the base cgroup, Xum can first give it to your user with sudo (see [Xum delegates the cgroup with sudo](#xum-delegates-the-cgroup-with-sudo)).
+
+When you clear the limits or turn off the switch, Xum writes `max` to both files. It does not move processes back or delete `xum-app` or `xum-agents`. After the first setup, start other processes in `xum-app`, not in the base cgroup. A Xum that you restart from a shell in `xum-app` uses the same base cgroup again.
+
+### Project cgroups
+
+While a project has a limit of its own, `xum-agents` has children:
+
+- `p-<hash>` for each project with a limit, where `<hash>` is the first 12 hex digits of the SHA-256 of the project path. The limits of the project are in its `cpu.max` and `memory.max`.
+- `default` for the agent commands of all other projects.
+
+`xum-agents` then enables the `cpu` and `memory` controllers for its children, so it cannot hold processes itself. Xum first moves the agent commands that run in `xum-agents` into `default`.
+
+When a project loses its limit, Xum writes `max` to its child. When the last project limit goes, Xum also turns off the controllers of the children, and new agent commands join `xum-agents` again. The children stay, without a limit, as long as any limit applies: another Xum server that has not seen the change yet can still send commands to them, and those commands stay inside the shared limit. When no limit applies any more, Xum deletes each child once its commands exit. A child whose commands still run stays until a later apply removes it.
+
+CAUTION: While project cgroups exist, do not run an older Xum on the same base cgroup. The kernel refuses to move its agent commands into `xum-agents`, so they run with no limit and print the warning below.
+
+All Xum servers that use one base cgroup share its `xum-agents`, for example all servers that you start in one Coder workspace. The limits that a server applied last bind the agent commands of all of them, while the other servers still show their own limits. This applies to project limits too: a server with another config writes `max` to the project cgroups that it does not know.
+
+## Start Xum in a delegated cgroup
+
+If the status says that Xum cannot manage its cgroup, start Xum in a cgroup that your user owns.
+
+### Xum delegates the cgroup with sudo
+
+On a Linux host without systemd, such as a Coder workspace, Xum usually runs in a top-level cgroup that root owns, for example `/init.scope`. If `sudo -n` works there without a password, Xum gives that cgroup to its user before the setup:
+
+```bash
+sudo -n chown <uid> <dir> <dir>/cgroup.procs <dir>/cgroup.subtree_control <dir>/cgroup.threads
+```
+
+`<uid>` is the user ID of the user that runs Xum, and `<dir>` is the directory of the cgroup, for example `/sys/fs/cgroup/init.scope`. The setup then moves every process of the cgroup into `xum-app`, also the processes of root and of other users, for example the container's PID 1 and `dockerd`. Because `xum-app` and `xum-agents` are children of the cgroup, the limits on the cgroup still apply to every process in it, Xum and its agents included. Your user then also controls those processes: any process of your user, agent commands included, can freeze, stop, or limit them through `xum-app`. Xum does this only where your user can already run sudo without a password, so this gives your user nothing that sudo did not. While the switch is off, Settings names the cgroup and says that Xum will move its processes. To leave the other processes where they are, start Xum with the [sudo steps](#with-sudo-containers-and-coder-workspaces) instead.
+
+After the setup, the kernel refuses to move a process into the cgroup itself (`Device or resource busy`). Start other processes in `xum-app`, and stop scripts that move processes back into the cgroup. Xum does not revert the setup: the cgroup stays with Xum's user and the processes stay in `xum-app` until root reverts it or the machine or container restarts.
+
+Xum does this only when the switch is on and a limit is set. It runs sudo when it applies the limits at startup, for your action in Settings (the switch, a saved limit, or **Try again**), and when another Xum on the same config changes the limits. Config changes that keep the limits do not run sudo; the status keeps the last sudo error. If sudo fails, the status adds the sudo error to the message. Xum stops sudo after 10 seconds, and the status then says `sudo did not finish within 10 seconds.`
+
+Xum does not use sudo on a host with systemd, or when its cgroup is not a top-level cgroup, for example in a container whose cgroup is `/docker/<id>`. In those cases, use the steps below. If sudo asks for a password, the [sudo steps](#with-sudo-containers-and-coder-workspaces) work only from a shell where you can type that password before you start Xum. If you cannot, ask an admin to put them in the workspace's startup script.
+
+### With systemd
+
+Start Xum in a scope with delegation:
+
+```bash
+systemd-run --user --scope -p Delegate=yes xum server
+```
+
+If the status then says that the `cpu` controller is not available, the systemd user manager does not have it. To delegate it, create `/etc/systemd/system/user@.service.d/delegate.conf` with:
+
+```ini
+[Service]
+Delegate=cpu memory pids
+```
+
+Then run `sudo systemctl daemon-reload` and log in again.
+
+### With sudo (containers and Coder workspaces)
+
+Without a systemd user manager, create the cgroup as root, give it to the user that runs Xum, and start Xum from a shell that root moved into it. Replace `coder` with that user:
+
+```bash
+sudo mkdir /sys/fs/cgroup/xum
+sudo chown coder /sys/fs/cgroup/xum /sys/fs/cgroup/xum/cgroup.procs \
+  /sys/fs/cgroup/xum/cgroup.subtree_control /sys/fs/cgroup/xum/cgroup.threads
+echo $$ | sudo tee /sys/fs/cgroup/xum/cgroup.procs
+xum server
+```
+
+Root must move the shell: a user can move a process only when it may write `cgroup.procs` of the closest cgroup that contains both the old and the new cgroup, and here that is the root cgroup. `/sys/fs/cgroup/xum/cgroup.controllers` must list `cpu` and `memory`. If it does not, enable them in the parent's `cgroup.subtree_control` as root. In a Coder workspace, put these steps in the startup script before Xum starts.
+
+The user controls only this cgroup and its children. Limits on its parents still apply.
+
+## Status messages
+
+| Message                                                        | What to do                                                                                                                                                                                                                                                                          |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Agent resource limits need Linux with cgroup v2.               | Limits are not available on macOS, Windows, or Linux with cgroup v1.                                                                                                                                                                                                                |
+| xum runs in cgroup …, which the user running xum cannot manage | [Start Xum in a delegated cgroup](#start-xum-in-a-delegated-cgroup). If the message ends with `Delegating … with sudo failed: …`, Xum tried to give its cgroup to its user with sudo, and sudo failed, for example because it needs a password or did not finish within 10 seconds. |
+| The cpu (or memory) controller is not available in cgroup …    | Enable the controller in the parent's `cgroup.subtree_control`, or delegate it with systemd.                                                                                                                                                                                        |
+| xum runs in the root cgroup.                                   | Start Xum in a cgroup of its own. Xum does not move every process of the machine.                                                                                                                                                                                                   |
+| … the agent cgroup of another xum …                            | This Xum runs inside an agent command of another Xum, whose limits already apply to it.                                                                                                                                                                                             |
+| … holds processes and enables … for its children               | Xum does not turn these controllers off, because that resets their settings in every child. [Start Xum in a cgroup of its own](#start-xum-in-a-delegated-cgroup) with the sudo or systemd steps, or have root turn the controllers off.                                             |
+| A test command ran in cgroup …                                 | Another program moved Xum's test command to a different cgroup. Stop that program from moving Xum's processes.                                                                                                                                                                      |
+| Could not remove the limits from the agent cgroup: …           | Agent commands that still run in `xum-agents` keep the old limits. Fix the cause, then click **Try again**.                                                                                                                                                                         |
+
+If a command prints `xum: could not apply the agent resource limit to this command`, the command ran without the limit, for example because the `xum-agents` cgroup was removed. Click **Try again** in Settings, or restart Xum.

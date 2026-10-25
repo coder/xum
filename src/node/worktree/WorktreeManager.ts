@@ -1,12 +1,15 @@
+import { randomUUID } from "crypto";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 import type {
+  PendingMaterialization,
   WorkspaceCreationResult,
   WorkspaceForkParams,
   WorkspaceForkResult,
   InitLogger,
 } from "@/node/runtime/Runtime";
 import { listLocalBranches, cleanStaleLock, getCurrentBranch } from "@/node/git";
+import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { execAsync, execFileAsync, type ExecFileAsyncOptions } from "@/node/utils/disposableExec";
 import { getBashPath } from "@/node/utils/main/bashPath";
 import { getProjectName } from "@/node/utils/runtime/helpers";
@@ -15,10 +18,18 @@ import { shellQuote } from "@/common/utils/shell";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import { toPosixPath } from "@/node/utils/paths";
 import { log } from "@/node/services/log";
-import { GIT_NO_HOOKS_ENV } from "@/node/utils/gitNoHooksEnv";
-import { WORKTREE_DELETE_GIT_TIMEOUT_MS } from "@/constants/terminationTimeouts";
+import {
+  gitHooksAllowed,
+  gitNoRepoAutomationEnv,
+  gitNoRepoAutomationEnvForLocalRepo,
+} from "@/node/utils/gitNoHooksEnv";
+import {
+  WORKTREE_CREATE_FETCH_TIMEOUT_MS,
+  WORKTREE_DELETE_GIT_TIMEOUT_MS,
+} from "@/constants/terminationTimeouts";
 import { syncLocalGitSubmodules } from "@/node/runtime/submoduleSync";
-import { syncMuxignoreFiles } from "./muxignore";
+import { syncXumignoreFiles } from "./xumignore";
+import { GitProgressParser, isGitProgressLine } from "./gitProgress";
 
 type GitExecOptions = Pick<ExecFileAsyncOptions, "env" | "signal" | "timeoutMs"> | undefined;
 
@@ -26,15 +37,51 @@ function isAbortError(_error: unknown, signal?: AbortSignal): boolean {
   return signal?.aborted ?? false;
 }
 
+/**
+ * `git --version` capability results keyed by the PATH the probe inherits. Every sub-agent fork
+ * creates a workspace, and each probe is a process spawn that blocks the event loop on a large
+ * backend. WorktreeManager is constructed per runtime instance, so the cache is module-level.
+ * `git` resolves through PATH, so the same PATH means the same binary for the backend's
+ * lifetime; replacing git in place at the same path needs a backend restart to re-probe (an
+ * upgrade just keeps the safe eager-creation path until then). Probe errors and cancellations
+ * are not cached, so a missing git is probed again next time.
+ */
+const nativeHookRunnerSupportByPath = new Map<string, boolean>();
+// Distinguish an unset PATH from an empty one; NUL cannot appear in an environment value.
+const UNSET_PATH_KEY = "\u0000unset";
+
+/** What a deferred origin sync's notes report when it leaves the reserved branch alone. */
+const DEFERRED_SYNC_FALLBACK = "keeping the branch at its current commit";
+
+/**
+ * Per repository; module-level because each runtime constructs its own manager. Serializes
+ * rewrites of the workspace branch map, which is written whole, and `git branch -m`, which moves
+ * a branch's reflog through one fixed temporary file (logs/refs/.tmp-renamed-log): two at once
+ * drop a mapping or fail one rename. Worktree creations named in the backend rename their branch
+ * as soon as their checkout is done, so their renames can meet.
+ */
+const branchRefLocks = new MutexMap<string>();
+
+interface OriginSyncParams {
+  projectPath: string;
+  branchName: string;
+  trunkBranch: string;
+  initLogger: InitLogger;
+  abortSignal?: AbortSignal;
+  checkoutAbortSignal?: AbortSignal;
+}
+
 const PROTECTED_BRANCH_NAMES = ["main", "master", "trunk", "develop", "default"];
 const MISSING_WORKTREE_ERROR_PATTERNS = ["not a working tree", "does not exist", "no such file"];
 
 export class WorktreeManager {
   private readonly srcBaseDir: string;
+  private readonly fetchTimeoutMs: number;
 
-  constructor(srcBaseDir: string) {
+  constructor(srcBaseDir: string, options?: { fetchTimeoutMs?: number }) {
     // Expand tilde to actual home directory path for local file system operations
     this.srcBaseDir = expandTilde(srcBaseDir);
+    this.fetchTimeoutMs = options?.fetchTimeoutMs ?? WORKTREE_CREATE_FETCH_TIMEOUT_MS;
   }
 
   getWorkspacePath(projectPath: string, workspaceName: string): string {
@@ -42,9 +89,37 @@ export class WorktreeManager {
     return path.join(this.srcBaseDir, projectName, workspaceName);
   }
 
-  private getGitExecOptions(trusted?: boolean, signal?: AbortSignal): GitExecOptions {
-    const env = trusted ? undefined : GIT_NO_HOOKS_ENV;
+  private async getGitExecOptions(
+    projectPath: string,
+    trusted?: boolean,
+    signal?: AbortSignal
+  ): Promise<GitExecOptions> {
+    const env = gitHooksAllowed(trusted)
+      ? undefined
+      : await gitNoRepoAutomationEnvForLocalRepo(projectPath, signal);
     return env || signal ? { ...(env ? { env } : {}), ...(signal ? { signal } : {}) } : undefined;
+  }
+
+  private async supportsNativeHookRunner(signal?: AbortSignal): Promise<boolean> {
+    signal?.throwIfAborted();
+    const cacheKey = process.env.PATH ?? UNSET_PATH_KEY;
+    const cached = nativeHookRunnerSupportByPath.get(cacheKey);
+    if (cached !== undefined) return cached;
+    try {
+      using proc = execFileAsync("git", ["--version"], { signal });
+      const { stdout } = await proc.result;
+      signal?.throwIfAborted();
+      const version = /^git version (\d+)\.(\d+)/.exec(stdout.trim());
+      const supported =
+        version !== null &&
+        (Number(version[1]) > 2 || (Number(version[1]) === 2 && Number(version[2]) >= 36));
+      nativeHookRunnerSupportByPath.set(cacheKey, supported);
+      return supported;
+    } catch (error) {
+      // Unknown/older Git retains eager creation; cancellation must still stop creation.
+      if (signal?.aborted) throw error;
+      return false;
+    }
   }
 
   private async pruneWorktreesBestEffort(
@@ -79,10 +154,19 @@ export class WorktreeManager {
     abortSignal?: AbortSignal;
     env?: Record<string, string>;
     trusted?: boolean;
+    /** See WorkspaceCreationParams.deferMaterialization. */
+    deferMaterialization?: boolean;
   }): Promise<WorkspaceCreationResult> {
     const { projectPath, branchName, trunkBranch, initLogger } = params;
-    // Disable git hooks for untrusted projects (prevents post-checkout execution)
-    const noHooksEnv = this.getGitExecOptions(params.trusted, params.abortSignal);
+    // Disable git hooks for untrusted projects (prevents post-checkout execution).
+    // Filter discovery is fail-closed, but creation callers consume a
+    // structured result, so translate preflight failures at this boundary.
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, params.trusted, params.abortSignal);
+    } catch (error) {
+      return { success: false, error: getErrorMessage(error) };
+    }
     const workspaceName = params.directoryName ?? branchName;
     const workspacePath =
       params.workspacePathOverride ?? this.getWorkspacePath(projectPath, workspaceName);
@@ -122,76 +206,98 @@ export class WorktreeManager {
       const localBranches = await listLocalBranches(projectPath);
       const branchExists = localBranches.includes(branchName);
 
-      // Fetch origin before creating worktree (best-effort)
-      // This ensures new branches start from the latest origin state
-      const fetchedOrigin = skipRemoteSync
-        ? false
-        : await this.fetchOriginTrunk(projectPath, trunkBranch, initLogger, noHooksEnv);
-
-      // Determine best base for new branches: use origin if local can fast-forward to it,
-      // otherwise preserve local state (user may have unpushed work)
-      const shouldUseOrigin =
-        !skipRemoteSync &&
-        fetchedOrigin &&
-        (await this.canFastForwardToOrigin(
-          projectPath,
-          trunkBranch,
-          initLogger,
-          params.abortSignal
-        ));
-
-      // Create worktree (git worktree is typically fast)
-      if (branchExists) {
-        // Branch exists, just add a worktree pointing to the existing ref without rewriting it.
-        using proc = execFileAsync(
-          "git",
-          ["-C", projectPath, "worktree", "add", workspacePath, branchName],
-          noHooksEnv
+      // Remote configuration can select executable upload-pack/helper
+      // commands. When repo automation is disallowed, stay entirely on local
+      // refs instead of executing any repo-configured fetch behavior.
+      const remoteSyncAllowed = !skipRemoteSync && gitHooksAllowed(params.trusted);
+      if (!skipRemoteSync && !remoteSyncAllowed) {
+        initLogger.logStep(
+          "Skipping origin fetch while project automation is disabled; using local state."
         );
-        await proc.result;
-      } else {
-        // Branch doesn't exist, create from the requested start point when provided. Restore flows
-        // use this to recreate archived branches from exact saved commits instead of fetching origin.
-        const newBranchBase =
-          startPoint ?? (shouldUseOrigin ? `origin/${trunkBranch}` : trunkBranch);
-        using proc = execFileAsync(
-          "git",
-          ["-C", projectPath, "worktree", "add", "-b", branchName, workspacePath, newBranchBase],
-          noHooksEnv
-        );
-        await proc.result;
-        createdBranch = true;
       }
-      worktreeCreated = true;
-
-      initLogger.logStep("Worktree created successfully");
-
-      // Sync gitignored files declared in .muxignore (e.g. .env)
-      // before init hooks run so they have access to secrets/config
-      initLogger.logStep("Syncing .muxignore files...");
-      await syncMuxignoreFiles(projectPath, workspacePath);
-
-      // For existing branches, fast-forward to latest origin (best-effort)
-      // Only if local can fast-forward (preserves unpushed work)
-      if (!skipRemoteSync && shouldUseOrigin && branchExists) {
-        await this.fastForwardToOrigin(workspacePath, trunkBranch, initLogger, noHooksEnv);
-      }
-
-      // Worktree creation is responsible for materializing the checkout completely.
-      // Skills, docs, and other repo-managed files may live inside submodules, so make
-      // them available before any runtime-specific provisioning or init hooks run.
-      await syncLocalGitSubmodules({
-        workspacePath,
+      // A deferred creation is announced as soon as this returns, and the origin fetch can take
+      // seconds on a remote server, so the reservation reads local refs only and
+      // materializeWorkspace fetches before the checkout, streaming to the creation card.
+      const deferOriginSync = params.deferMaterialization === true && remoteSyncAllowed;
+      const shouldUseOrigin = await this.chooseOriginBase({
+        projectPath,
+        trunkBranch,
         initLogger,
-        abortSignal: params.abortSignal,
-        env: params.env,
-        trusted: params.trusted,
+        noHooksEnv,
+        remoteSyncAllowed,
+        deferOriginSync,
       });
 
+      // Files are populated by a separate checkout (materializeWorkspace) so large repositories
+      // can stream progress, and so callers may announce the workspace before populating it.
+      // Restore flows may supply an exact saved commit instead of the current trunk.
+      const newBranchBase = startPoint ?? (shouldUseOrigin ? `origin/${trunkBranch}` : trunkBranch);
+      using addProc = execFileAsync(
+        "git",
+        [
+          "-C",
+          projectPath,
+          "worktree",
+          "add",
+          "--no-checkout",
+          ...(branchExists
+            ? [workspacePath, branchName]
+            : ["-b", branchName, workspacePath, newBranchBase]),
+        ],
+        noHooksEnv
+      );
+      const addResult = await addProc.result;
+      createdBranch = !branchExists;
+      worktreeCreated = true;
+      // git reports routine progress ("Preparing worktree", "Updating files") on stderr;
+      // failures surface through the thrown error below, so none of this is error output.
+      for (const line of `${addResult.stdout}\n${addResult.stderr}`.split(/[\r\n]/)) {
+        if (line) initLogger.logStdout(line);
+      }
+
+      const pending = await this.pendingMaterializationFor({
+        projectPath,
+        branchName,
+        branchExists,
+        startPoint,
+        shouldUseOrigin,
+        deferOriginSync,
+        noHooksEnv,
+      });
+      // Older Git needs the legacy hook checkout, which briefly changes HEAD. Keep it
+      // before announcement so an immediate fork cannot observe its unborn placeholder.
+      const nativeHookRunner =
+        !gitHooksAllowed(params.trusted) ||
+        (await this.supportsNativeHookRunner(params.abortSignal));
+      if (params.deferMaterialization && nativeHookRunner) {
+        await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
+        return { success: true, workspacePath, pendingMaterialization: pending, createdBranch };
+      }
+
+      await this.materializeWorkspace(
+        {
+          projectPath,
+          workspacePath,
+          branchName,
+          trunkBranch,
+          initLogger,
+          abortSignal: params.abortSignal,
+          env: params.env,
+          trusted: params.trusted,
+        },
+        pending,
+        { legacyHookCheckout: !nativeHookRunner }
+      );
+
       await this.persistWorkspaceBranchMapping(projectPath, workspaceName, branchName);
-      return { success: true, workspacePath };
+      return { success: true, workspacePath, createdBranch };
     } catch (error) {
       const errorMessage = getErrorMessage(error);
+      if (!isAbortError(error, params.abortSignal)) {
+        for (const line of errorMessage.split(/\r?\n/)) {
+          if (line) initLogger.logStderr(line);
+        }
+      }
 
       if (!worktreeCreated) {
         return {
@@ -221,6 +327,377 @@ export class WorktreeManager {
     }
   }
 
+  /**
+   * Whether a new branch should start from origin/<trunk> rather than local trunk: only when
+   * local trunk can fast-forward to it (otherwise the user may have unpushed work). A deferred
+   * sync checks the last fetched origin/<trunk> quietly; its post-fetch check reports notes.
+   */
+  private async chooseOriginBase(args: {
+    projectPath: string;
+    trunkBranch: string;
+    initLogger: InitLogger;
+    noHooksEnv: GitExecOptions;
+    remoteSyncAllowed: boolean;
+    deferOriginSync: boolean;
+  }): Promise<boolean> {
+    const { projectPath, trunkBranch, noHooksEnv } = args;
+    if (args.deferOriginSync) {
+      return this.trunkCanFastForwardToOrigin(projectPath, trunkBranch, noHooksEnv?.signal);
+    }
+    if (!args.remoteSyncAllowed) return false;
+    return (
+      (await this.fetchOriginTrunk(projectPath, trunkBranch, args.initLogger, noHooksEnv)) &&
+      this.canFastForwardToOrigin(projectPath, trunkBranch, args.initLogger, noHooksEnv?.signal)
+    );
+  }
+
+  /** The decisions a reserved worktree hands to materializeWorkspace. */
+  private async pendingMaterializationFor(args: {
+    projectPath: string;
+    branchName: string;
+    branchExists: boolean;
+    startPoint: string | undefined;
+    shouldUseOrigin: boolean;
+    deferOriginSync: boolean;
+    noHooksEnv: GitExecOptions;
+  }): Promise<PendingMaterialization> {
+    // Fast-forward existing branches to origin only when local trunk can fast-forward too
+    // (preserves unpushed work).
+    if (!args.deferOriginSync) {
+      return { fastForwardFromOrigin: args.shouldUseOrigin && args.branchExists };
+    }
+    // A deferred sync decides the fast-forward after its fetch.
+    const pending: PendingMaterialization = { fastForwardFromOrigin: false };
+    if (args.branchExists) {
+      return { ...pending, deferredOriginSync: { existingBranch: true, createdFromOrigin: false } };
+    }
+    // An explicit start point is the base the caller asked for; the sync leaves it alone.
+    if (args.startPoint !== undefined) return pending;
+    using tipProc = execFileAsync(
+      "git",
+      ["-C", args.projectPath, "rev-parse", `refs/heads/${args.branchName}`],
+      args.noHooksEnv
+    );
+    return {
+      ...pending,
+      deferredOriginSync: {
+        existingBranch: false,
+        createdBranchTip: (await tipProc.result).stdout.trim(),
+        createdFromOrigin: args.shouldUseOrigin,
+      },
+    };
+  }
+
+  /**
+   * Populate a worktree reserved by createWorkspace: the origin sync a deferred reservation
+   * skipped, streamed checkout, .xumignore sync, optional fast-forward, submodules. Throws on
+   * failure without touching the worktree; a deferred checkout is already registered, so its
+   * owner decides what happens to it.
+   * abortSignal cancels every phase; when checkoutAbortSignal is given it is the only signal
+   * the file checkout honours, so an owner that keeps a cancelled worktree gets complete files
+   * (at the reserved base, when the cancellation lands during the origin sync) while
+   * everything after them still stops.
+   */
+  async materializeWorkspace(
+    params: {
+      projectPath: string;
+      workspacePath: string;
+      branchName: string;
+      trunkBranch: string;
+      initLogger: InitLogger;
+      abortSignal?: AbortSignal;
+      checkoutAbortSignal?: AbortSignal;
+      env?: Record<string, string>;
+      trusted?: boolean;
+    },
+    pending: PendingMaterialization,
+    options?: { legacyHookCheckout?: boolean }
+  ): Promise<void> {
+    const { projectPath, workspacePath, branchName, trunkBranch, initLogger } = params;
+    const noHooksEnv = await this.getGitExecOptions(
+      projectPath,
+      params.trusted,
+      params.abortSignal
+    );
+
+    const fastForwardFromOrigin = await this.syncOriginBeforeCheckout(params, pending, noHooksEnv);
+
+    initLogger.logStep("Checking out files...");
+    // Git's stderr mixes progress with diagnostics. Progress streams live; diagnostics are
+    // held until the exit status is known so a failure is reported as error output once,
+    // rather than streamed as output and then repeated as the error.
+    const output: string[] = [];
+    const progress = new GitProgressParser(
+      (stage, percent) => initLogger.logProgress?.(stage, percent),
+      (line) => output.push(line)
+    );
+    const stdout: string[] = [];
+    const checkoutOptions = {
+      ...noHooksEnv,
+      onStderrData: (chunk: string) => progress.push(chunk),
+      // Smudge filters and hooks inherit git's pipes; cancelling must not hang on them.
+      killTreeOnTermination: true,
+    };
+    let restoreHeadOnFailure = false;
+    try {
+      // Populate the files while HEAD still holds the branch, so no other worktree can claim it
+      // for as long as the checkout streams. Hooks stay off here and run separately below.
+      // Submodule repos do not exist yet in a linked worktree, so recursion would fail;
+      // syncLocalGitSubmodules materializes them below, like `git worktree add` does.
+      // No --force: a deferred checkout runs in an announced workspace, so anything written
+      // there meanwhile (a terminal, an editor) must fail the checkout, not be overwritten.
+      using populateProc = execFileAsync(
+        "git",
+        [
+          "-C",
+          workspacePath,
+          "-c",
+          "core.hooksPath=/dev/null",
+          "checkout",
+          "--quiet",
+          "--progress",
+          "--no-recurse-submodules",
+          branchName,
+        ],
+        {
+          ...checkoutOptions,
+          signal: params.checkoutAbortSignal ?? params.abortSignal,
+          // git delays progress output by 2s, which hides it for most checkouts.
+          env: { ...noHooksEnv?.env, GIT_PROGRESS_DELAY: "0" },
+        }
+      );
+      stdout.push((await populateProc.result).stdout);
+      if (gitHooksAllowed(params.trusted)) {
+        if (options?.legacyHookCheckout !== true) {
+          // Announced worktrees can be forked while hooks run. Invoke Git's hook runner
+          // with the new-worktree arguments without ever releasing or changing HEAD.
+          using tipProc = execFileAsync(
+            "git",
+            ["-C", workspacePath, "rev-parse", "HEAD"],
+            noHooksEnv
+          );
+          const tip = (await tipProc.result).stdout.trim();
+          // A failing hook may move HEAD; retain the legacy restoration guarantee.
+          restoreHeadOnFailure = true;
+          using hookProc = execFileAsync(
+            "git",
+            [
+              "-C",
+              workspacePath,
+              "hook",
+              "run",
+              "--ignore-missing",
+              "post-checkout",
+              "--",
+              "0".repeat(tip.length),
+              tip,
+              "1",
+            ],
+            checkoutOptions
+          );
+          stdout.push((await hookProc.result).stdout);
+        } else {
+          // The files are in place; switch onto the branch from an unborn ref so trusted
+          // post-checkout hooks receive the same arguments as a plain `git worktree add` (null old
+          // commit, new-worktree flag). Nothing is written, so the branch is unclaimed only for the
+          // instant between these two commands.
+          using unbornProc = execFileAsync(
+            "git",
+            ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/xum-unborn-${randomUUID()}`],
+            noHooksEnv
+          );
+          await unbornProc.result;
+          restoreHeadOnFailure = true;
+          using switchProc = execFileAsync(
+            "git",
+            ["-C", workspacePath, "checkout", "--no-recurse-submodules", branchName],
+            checkoutOptions
+          );
+          stdout.push((await switchProc.result).stdout);
+        }
+      }
+      progress.flush();
+      for (const line of [...output, ...stdout.flatMap((text) => text.split(/[\r\n]/))]) {
+        if (line) initLogger.logStdout(line);
+      }
+    } catch (error) {
+      progress.flush();
+      // A retained (deferred) workspace must not be left on the placeholder ref or with the
+      // empty pre-checkout index: a later commit would land on the placeholder or record every
+      // tracked file as deleted. Put HEAD back on the branch and rebuild the index from it,
+      // leaving the working tree alone. Runs without the caller's signal because an aborted
+      // checkout needs the restore most.
+      const restoreOptions = noHooksEnv?.env ? { env: noHooksEnv.env } : undefined;
+      try {
+        if (restoreHeadOnFailure) {
+          // If another worktree claimed the branch during that instant, re-attaching would
+          // leave two worktrees on it; detach at the tip instead and let the error report it.
+          const claimedElsewhere = (await this.listWorktreeBlocks(projectPath, restoreOptions))
+            .filter((block) => this.findWorktreeBlockByPath([block], workspacePath) === undefined)
+            .some((block) => this.getWorktreeBranchName(block) === branchName);
+          using restoreProc = execFileAsync(
+            "git",
+            claimedElsewhere
+              ? [
+                  "-C",
+                  workspacePath,
+                  "update-ref",
+                  "--no-deref",
+                  "HEAD",
+                  `refs/heads/${branchName}`,
+                ]
+              : ["-C", workspacePath, "symbolic-ref", "HEAD", `refs/heads/${branchName}`],
+            restoreOptions
+          );
+          await restoreProc.result;
+        }
+        using resetProc = execFileAsync(
+          "git",
+          ["-C", workspacePath, "reset", "--quiet"],
+          restoreOptions
+        );
+        await resetProc.result;
+      } catch {
+        // The checkout error below is the one worth reporting.
+      }
+      const diagnostics = output.filter((line) => !isGitProgressLine(line));
+      throw new Error(diagnostics.length > 0 ? diagnostics.join("\n") : getErrorMessage(error));
+    }
+
+    initLogger.logStep("Worktree created successfully");
+
+    // Sync gitignored files declared in .xumignore (e.g. .env)
+    // before init hooks run so they have access to secrets/config
+    initLogger.logStep("Syncing .xumignore files...");
+    await syncXumignoreFiles(projectPath, workspacePath, params.abortSignal);
+
+    if (fastForwardFromOrigin) {
+      await this.fastForwardToOrigin(workspacePath, trunkBranch, initLogger, noHooksEnv);
+    }
+
+    // Worktree creation is responsible for materializing the checkout completely.
+    // Skills, docs, and other repo-managed files may live inside submodules, so make
+    // them available before any runtime-specific provisioning or init hooks run.
+    await syncLocalGitSubmodules({
+      workspacePath,
+      initLogger,
+      abortSignal: params.abortSignal,
+      env: params.env,
+      trusted: params.trusted,
+    });
+  }
+
+  /**
+   * The origin sync a deferred reservation skipped, run before the checkout so a new branch
+   * starts from the fetched trunk. Returns whether the existing branch should fast-forward
+   * after the checkout. Every fallback keeps the reserved base.
+   */
+  private async syncOriginBeforeCheckout(
+    params: OriginSyncParams,
+    pending: PendingMaterialization,
+    noHooksEnv: GitExecOptions
+  ): Promise<boolean> {
+    const sync = pending.deferredOriginSync;
+    if (sync === undefined) return pending.fastForwardFromOrigin;
+    try {
+      return await this.fetchAndAdvanceBranch(params, sync, noHooksEnv);
+    } catch (error) {
+      // Archive aborts init but not the file checkout, and parks whatever this leaves, so it
+      // skips the rest of the sync and checks out complete files at the reserved base.
+      // Removal aborts the checkout too and still cancels here.
+      if (params.abortSignal?.aborted === true && params.checkoutAbortSignal?.aborted === false) {
+        log.debug("Deferred origin sync cancelled by archive; checking out the reserved base", {
+          projectPath: params.projectPath,
+          branchName: params.branchName,
+        });
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  private async fetchAndAdvanceBranch(
+    params: OriginSyncParams,
+    sync: NonNullable<PendingMaterialization["deferredOriginSync"]>,
+    noHooksEnv: GitExecOptions
+  ): Promise<boolean> {
+    const { projectPath, trunkBranch, initLogger } = params;
+    const fetched = await this.fetchOriginTrunk(
+      projectPath,
+      trunkBranch,
+      initLogger,
+      noHooksEnv,
+      DEFERRED_SYNC_FALLBACK
+    );
+    if (
+      !fetched ||
+      !(await this.canFastForwardToOrigin(
+        projectPath,
+        trunkBranch,
+        initLogger,
+        params.abortSignal,
+        DEFERRED_SYNC_FALLBACK
+      ))
+    ) {
+      return false;
+    }
+    if (sync.existingBranch) return true;
+    if (sync.createdBranchTip !== undefined) {
+      await this.moveCreatedBranchToOrigin(params, sync.createdBranchTip, sync, noHooksEnv);
+    }
+    return false;
+  }
+
+  /**
+   * No checkout exists yet, so moving the ref is all it takes. The compare-and-swap leaves a
+   * branch that something else moved since the reservation alone.
+   */
+  private async moveCreatedBranchToOrigin(
+    params: OriginSyncParams,
+    reservedTip: string,
+    sync: { createdFromOrigin: boolean },
+    noHooksEnv: GitExecOptions
+  ): Promise<void> {
+    const { projectPath, branchName, trunkBranch, initLogger } = params;
+    try {
+      using moveProc = execFileAsync(
+        "git",
+        [
+          "-C",
+          projectPath,
+          "update-ref",
+          `refs/heads/${branchName}`,
+          `refs/remotes/origin/${trunkBranch}`,
+          reservedTip,
+        ],
+        noHooksEnv
+      );
+      await moveProc.result;
+    } catch (error) {
+      if (isAbortError(error, params.abortSignal)) throw error;
+      initLogger.logStderr(
+        `Note: Could not move ${branchName} to the fetched origin/${trunkBranch} (${getErrorMessage(error)}), ${DEFERRED_SYNC_FALLBACK}`
+      );
+      return;
+    }
+    initLogger.logStep(`Started ${branchName} from the latest origin/${trunkBranch}`);
+    if (sync.createdFromOrigin) return;
+    // An eager creation would have branched from origin/<trunk> and tracked it.
+    try {
+      using upstreamProc = execFileAsync(
+        "git",
+        ["-C", projectPath, "branch", `--set-upstream-to=origin/${trunkBranch}`, branchName],
+        noHooksEnv
+      );
+      await upstreamProc.result;
+    } catch (error) {
+      if (isAbortError(error, params.abortSignal)) throw error;
+      initLogger.logStderr(
+        `Note: Could not set origin/${trunkBranch} as the upstream of ${branchName} (${getErrorMessage(error)})`
+      );
+    }
+  }
+
   private async rollbackFailedWorkspaceCreation(args: {
     projectPath: string;
     workspacePath: string;
@@ -228,7 +705,7 @@ export class WorktreeManager {
     createdBranch: boolean;
     trusted?: boolean;
   }): Promise<void> {
-    const noHooksEnv = this.getGitExecOptions(args.trusted);
+    const noHooksEnv = await this.getGitExecOptions(args.projectPath, args.trusted);
 
     try {
       using removeProc = execFileAsync(
@@ -263,37 +740,56 @@ export class WorktreeManager {
   /**
    * Fetch trunk branch from origin before worktree creation.
    * Returns true if fetch succeeded (origin is available for branching).
+   * `fallback` overrides what the notes say happens instead (a deferred sync keeps the
+   * reserved base, which may be the last fetched origin/<trunk> rather than local trunk).
    */
   private async fetchOriginTrunk(
     projectPath: string,
     trunkBranch: string,
     initLogger: InitLogger,
-    noHooksEnv: GitExecOptions
+    noHooksEnv: GitExecOptions,
+    fallback = "using local branch state"
   ): Promise<boolean> {
+    // A credential helper such as Coder's askpass can block the fetch indefinitely while it waits
+    // for external authentication, and even a killed fetch leaves helpers holding the stdio pipes.
+    // Bound the fetch separately from caller cancellation so a deadline falls back to the local
+    // trunk while an explicit abort still cancels creation.
+    const deadline = AbortSignal.timeout(this.fetchTimeoutMs);
+    const callerSignal = noHooksEnv?.signal;
     try {
       initLogger.logStep(`Fetching latest from origin/${trunkBranch}...`);
 
-      using fetchProc = execFileAsync(
-        "git",
-        ["-C", projectPath, "fetch", "origin", trunkBranch],
-        noHooksEnv
-      );
+      using fetchProc = execFileAsync("git", ["-C", projectPath, "fetch", "origin", trunkBranch], {
+        ...noHooksEnv,
+        signal: callerSignal ? AbortSignal.any([callerSignal, deadline]) : deadline,
+        killTreeOnTermination: true,
+      });
       await fetchProc.result;
 
       initLogger.logStep("Fetched latest from origin");
       return true;
     } catch (error) {
-      if (isAbortError(error, noHooksEnv?.signal)) {
+      if (isAbortError(error, callerSignal)) {
         throw error;
+      }
+      if (deadline.aborted) {
+        const seconds = Math.round(this.fetchTimeoutMs / 1000);
+        initLogger.logStderr(
+          `Note: Fetch from origin did not finish within ${seconds}s (Git may be waiting on a credential helper or external authentication); ${fallback}`
+        );
+        log.warn(`Worktree creation fetch timed out; ${fallback}`, {
+          projectPath,
+          trunkBranch,
+          timeoutMs: this.fetchTimeoutMs,
+        });
+        return false;
       }
       const errorMsg = getErrorMessage(error);
       // Branch doesn't exist on origin (common for subagent local-only branches)
       if (errorMsg.includes("couldn't find remote ref")) {
-        initLogger.logStep(`Branch "${trunkBranch}" not found on origin; using local state.`);
+        initLogger.logStep(`Branch "${trunkBranch}" not found on origin; ${fallback}.`);
       } else {
-        initLogger.logStderr(
-          `Note: Could not fetch from origin (${errorMsg}), using local branch state`
-        );
+        initLogger.logStderr(`Note: Could not fetch from origin (${errorMsg}), ${fallback}`);
       }
       return false;
     }
@@ -308,6 +804,20 @@ export class WorktreeManager {
     projectPath: string,
     trunkBranch: string,
     initLogger: InitLogger,
+    abortSignal?: AbortSignal,
+    fallback = "using local state"
+  ): Promise<boolean> {
+    if (await this.trunkCanFastForwardToOrigin(projectPath, trunkBranch, abortSignal)) return true;
+    initLogger.logStderr(
+      `Note: Local ${trunkBranch} is ahead of or diverged from origin, ${fallback}`
+    );
+    return false;
+  }
+
+  /** canFastForwardToOrigin without the note; also false when origin/<trunk> is missing. */
+  private async trunkCanFastForwardToOrigin(
+    projectPath: string,
+    trunkBranch: string,
     abortSignal?: AbortSignal
   ): Promise<boolean> {
     try {
@@ -325,9 +835,6 @@ export class WorktreeManager {
         throw error;
       }
       // Local is ahead or diverged - preserve local state
-      initLogger.logStderr(
-        `Note: Local ${trunkBranch} is ahead of or diverged from origin, using local state`
-      );
       return false;
     }
   }
@@ -366,15 +873,22 @@ export class WorktreeManager {
     projectPath: string,
     oldName: string,
     newName: string,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { renameBranch?: boolean }
   ): Promise<
-    { success: true; oldPath: string; newPath: string } | { success: false; error: string }
+    | { success: true; oldPath: string; newPath: string; branchRenamed: boolean }
+    | { success: false; error: string }
   > {
     // Clean up stale lock before git operations on main repo
     cleanStaleLock(projectPath);
 
     // Disable git hooks for untrusted projects
-    const noHooksEnv = this.getGitExecOptions(trusted);
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      return { success: false, error: `Failed to rename workspace: ${getErrorMessage(error)}` };
+    }
 
     // Compute workspace paths using canonical method
     const oldPath = this.getWorkspacePath(projectPath, oldName);
@@ -391,17 +905,21 @@ export class WorktreeManager {
 
       // Rename the tracked branch only when workspace identity still follows the old workspace
       // name. Diverged workspaces keep their original branch and must not rename unrelated refs.
+      // An undo passes renameBranch instead: the names alone cannot tell whether the rename it
+      // reverses moved the branch (a diverged branch may equal the new name, #4779).
       const originalBranchName =
         (await this.getPersistedWorkspaceBranchName(projectPath, oldName)) ?? oldName;
       let renamedBranchName = originalBranchName;
-      if (originalBranchName === oldName) {
+      if (options?.renameBranch ?? originalBranchName === oldName) {
         try {
-          using branchProc = execFileAsync(
-            "git",
-            ["-C", newPath, "branch", "-m", oldName, newName],
-            noHooksEnv
-          );
-          await branchProc.result;
+          await branchRefLocks.withLock(projectPath, async () => {
+            using branchProc = execFileAsync(
+              "git",
+              ["-C", newPath, "branch", "-m", oldName, newName],
+              noHooksEnv
+            );
+            await branchProc.result;
+          });
           renamedBranchName = newName;
         } catch {
           // Branch rename failed - this is fine, the directory was still moved.
@@ -409,9 +927,66 @@ export class WorktreeManager {
       }
 
       await this.updateWorkspaceBranchMapping(projectPath, oldName, newName, renamedBranchName);
-      return { success: true, oldPath, newPath };
+      return {
+        success: true,
+        oldPath,
+        newPath,
+        branchRenamed: renamedBranchName !== originalBranchName,
+      };
     } catch (error) {
       return { success: false, error: `Failed to rename workspace: ${getErrorMessage(error)}` };
+    }
+  }
+
+  /**
+   * Rename only the branch of a workspace, leaving its directory and name alone. `git branch -m`
+   * also moves the HEAD of the linked worktree that has the branch checked out and its
+   * `branch.<name>.*` config. It refuses an existing target branch. Deletion finds the branch
+   * through the persisted mapping, so the mapping moves first and moves back if the rename
+   * fails. A crash between the two then leaves the mapping on the new name, which no branch has,
+   * rather than on the provisional one, which a later branch could take and deletion would
+   * then remove.
+   */
+  async renameWorkspaceBranch(
+    projectPath: string,
+    workspaceName: string,
+    oldBranchName: string,
+    newBranchName: string,
+    trusted?: boolean
+  ): Promise<{ success: true } | { success: false; error: string }> {
+    cleanStaleLock(projectPath);
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      return { success: false, error: getErrorMessage(error) };
+    }
+    try {
+      await this.persistWorkspaceBranchMapping(projectPath, workspaceName, newBranchName);
+    } catch (error) {
+      return { success: false, error: getErrorMessage(error) };
+    }
+    try {
+      await branchRefLocks.withLock(projectPath, async () => {
+        using branchProc = execFileAsync(
+          "git",
+          ["-C", projectPath, "branch", "-m", oldBranchName, newBranchName],
+          noHooksEnv
+        );
+        await branchProc.result;
+      });
+      return { success: true };
+    } catch (error) {
+      const renameError = getErrorMessage(error);
+      try {
+        await this.persistWorkspaceBranchMapping(projectPath, workspaceName, oldBranchName);
+      } catch (revertError) {
+        return {
+          success: false,
+          error: `${renameError} (restoring the branch mapping to ${oldBranchName} failed: ${getErrorMessage(revertError)})`,
+        };
+      }
+      return { success: false, error: renameError };
     }
   }
 
@@ -423,7 +998,6 @@ export class WorktreeManager {
     // Match deleteWorkspace() semantics so preflight stays idempotent and non-destructive.
     cleanStaleLock(projectPath);
 
-    const noHooksEnv = this.getGitExecOptions(trusted);
     const workspacePath = this.getWorkspacePath(projectPath, workspaceName);
     const isInPlace = projectPath === workspaceName;
 
@@ -435,6 +1009,20 @@ export class WorktreeManager {
 
     if (isInPlace) {
       return { success: true };
+    }
+
+    // Resolve the git environment only after the idempotent checks above:
+    // repo-aware filter discovery fails closed when the main checkout is
+    // missing or corrupted, and preflight must keep returning its declared
+    // result so stale workspaces stay deletable (via force).
+    let noHooksEnv: GitExecOptions;
+    try {
+      noHooksEnv = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      return {
+        success: false,
+        error: `Failed to inspect worktree before deletion: ${getErrorMessage(error)}`,
+      };
     }
 
     try {
@@ -494,14 +1082,27 @@ export class WorktreeManager {
     projectPath: string,
     workspaceName: string,
     force: boolean,
-    trusted?: boolean
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
   ): Promise<{ success: true; deletedPath: string } | { success: false; error: string }> {
     // Clean up stale lock before git operations on main repo
     cleanStaleLock(projectPath);
 
     // Disable git hooks for untrusted projects and bound every git cleanup command.
+    let repoInspectionError: string | null = null;
+    let gitExecOptions: GitExecOptions;
+    try {
+      gitExecOptions = await this.getGitExecOptions(projectPath, trusted);
+    } catch (error) {
+      // Repo-aware filter discovery fails closed when the main checkout is
+      // missing or corrupted. Cleanup must still work, so fall back to the
+      // static automation-off environment; content-inspecting git commands
+      // are skipped below while this error is set.
+      repoInspectionError = getErrorMessage(error);
+      gitExecOptions = { env: gitNoRepoAutomationEnv() };
+    }
     const noHooksEnv: GitExecOptions = {
-      ...(this.getGitExecOptions(trusted) ?? {}),
+      ...gitExecOptions,
       timeoutMs: WORKTREE_DELETE_GIT_TIMEOUT_MS,
     };
 
@@ -512,10 +1113,22 @@ export class WorktreeManager {
     const branchName = isInPlace
       ? null
       : await this.getPersistedWorkspaceBranchName(projectPath, workspaceName);
-    // Preserve legacy cleanup semantics for workspaces that predate branch-map persistence.
-    // Those older workspaces always used workspaceName === branchName, so if this specific
-    // workspace has no stored mapping we can safely fall back to the workspace name.
-    const allowWorkspaceNameFallback = !branchName && !isInPlace;
+    // Preserve legacy cleanup semantics for workspaces that predate branch-map persistence:
+    // those always used workspaceName === branchName. Fall back to the workspace name only while
+    // git still registers this workspace's checkout on that branch, which proves the branch is
+    // ours. Without a map entry or a checkout nothing does: a removal retry is exactly that state
+    // (the first attempt removed the checkout and dropped the entry, then deregistration or a
+    // later runtime step failed), and `git branch -D <name>` would delete an unrelated user
+    // branch named like the workspace directory.
+    const allowWorkspaceNameFallback =
+      !branchName &&
+      !isInPlace &&
+      (await this.isWorkspaceCheckoutOnBranch(
+        projectPath,
+        deletedPath,
+        workspaceName.trim(),
+        noHooksEnv
+      ));
     const branchDeleteArgs = {
       projectPath,
       workspaceName,
@@ -529,7 +1142,7 @@ export class WorktreeManager {
       if (pruneWorktrees) {
         await this.pruneWorktreesBestEffort(projectPath, noHooksEnv);
       }
-      await this.deleteWorkspaceBranchIfSafe(branchDeleteArgs);
+      if (!options?.keepBranch) await this.deleteWorkspaceBranchIfSafe(branchDeleteArgs);
       await this.deletePersistedWorkspaceBranchMapping(projectPath, workspaceName);
       return { success: true as const, deletedPath };
     };
@@ -544,6 +1157,26 @@ export class WorktreeManager {
     // The workspace directory itself is the user's real project checkout.
     if (isInPlace) {
       return { success: true, deletedPath };
+    }
+
+    if (repoInspectionError !== null) {
+      // Without repo-aware filter overrides, git worktree remove must not run:
+      // its dirty-worktree check refreshes the index, which can execute
+      // repo-configured clean filters. Force removal bypasses git content
+      // inspection entirely; non-force deletion reports the blocker instead.
+      if (!force) {
+        return { success: false, error: `Failed to remove worktree: ${repoInspectionError}` };
+      }
+      try {
+        await this.pruneWorktreesBestEffort(projectPath, noHooksEnv);
+        await this.forceRemoveWorkspaceDirectory(deletedPath);
+        return deleteBranchAndSucceed();
+      } catch (rmError) {
+        return {
+          success: false,
+          error: `Failed to remove worktree via git and rm: ${getErrorMessage(rmError)}`,
+        };
+      }
     }
 
     try {
@@ -601,6 +1234,29 @@ export class WorktreeManager {
     });
   }
 
+  /** Whether git registers a worktree at workspacePath with branchName checked out. */
+  private async isWorkspaceCheckoutOnBranch(
+    projectPath: string,
+    workspacePath: string,
+    branchName: string,
+    noHooksEnv: GitExecOptions
+  ): Promise<boolean> {
+    try {
+      const block = this.findWorktreeBlockByPath(
+        await this.listWorktreeBlocks(projectPath, noHooksEnv),
+        workspacePath
+      );
+      return block !== undefined && this.getWorktreeBranchName(block) === branchName;
+    } catch (error) {
+      // Unproven ownership keeps the branch.
+      log.debug("Failed to list worktrees; skipping the workspace-name branch fallback", {
+        projectPath,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
+  }
+
   private getWorktreeBranchName(worktreeBlock: string): string | null {
     const branchLine = worktreeBlock
       .split("\n")
@@ -615,9 +1271,11 @@ export class WorktreeManager {
   ): Promise<void> {
     // Divergent workspace and branch names rely on this mapping for safe stale-worktree
     // cleanup, so callers must see persistence failures instead of silently proceeding.
-    const branchMap = await this.readWorkspaceBranchMap(projectPath);
-    branchMap[workspaceName] = branchName;
-    await this.writeWorkspaceBranchMap(projectPath, branchMap);
+    await branchRefLocks.withLock(projectPath, async () => {
+      const branchMap = await this.readWorkspaceBranchMap(projectPath);
+      branchMap[workspaceName] = branchName;
+      await this.writeWorkspaceBranchMap(projectPath, branchMap);
+    });
   }
 
   private async updateWorkspaceBranchMapping(
@@ -628,13 +1286,15 @@ export class WorktreeManager {
   ): Promise<void> {
     // Rename can leave the branch name different from the workspace directory, so keep the
     // mapping update on the main control path rather than silently ignoring write failures.
-    const branchMap = await this.readWorkspaceBranchMap(projectPath);
-    const resolvedBranchName = branchName?.trim() ?? branchMap[oldWorkspaceName]?.trim();
-    delete branchMap[oldWorkspaceName];
-    if (resolvedBranchName) {
-      branchMap[newWorkspaceName] = resolvedBranchName;
-    }
-    await this.writeWorkspaceBranchMap(projectPath, branchMap);
+    await branchRefLocks.withLock(projectPath, async () => {
+      const branchMap = await this.readWorkspaceBranchMap(projectPath);
+      const resolvedBranchName = branchName?.trim() ?? branchMap[oldWorkspaceName]?.trim();
+      delete branchMap[oldWorkspaceName];
+      if (resolvedBranchName) {
+        branchMap[newWorkspaceName] = resolvedBranchName;
+      }
+      await this.writeWorkspaceBranchMap(projectPath, branchMap);
+    });
   }
 
   private async getPersistedWorkspaceBranchName(
@@ -650,12 +1310,14 @@ export class WorktreeManager {
     workspaceName: string
   ): Promise<void> {
     try {
-      const branchMap = await this.readWorkspaceBranchMap(projectPath);
-      if (!(workspaceName in branchMap)) {
-        return;
-      }
-      delete branchMap[workspaceName];
-      await this.writeWorkspaceBranchMap(projectPath, branchMap);
+      await branchRefLocks.withLock(projectPath, async () => {
+        const branchMap = await this.readWorkspaceBranchMap(projectPath);
+        if (!(workspaceName in branchMap)) {
+          return;
+        }
+        delete branchMap[workspaceName];
+        await this.writeWorkspaceBranchMap(projectPath, branchMap);
+      });
     } catch (error) {
       log.debug("Failed to delete workspace branch mapping", {
         projectPath,
@@ -902,7 +1564,6 @@ export class WorktreeManager {
   ): Promise<WorkspaceForkResult> {
     const { projectPath, sourceWorkspaceName, newWorkspaceName, initLogger } = params;
 
-    // Get source workspace path
     const sourceWorkspacePath =
       options?.sourceWorkspacePath ?? this.getWorkspacePath(projectPath, sourceWorkspaceName);
 
@@ -946,6 +1607,7 @@ export class WorktreeManager {
         success: true,
         workspacePath: createResult.workspacePath,
         sourceBranch,
+        createdBranch: createResult.createdBranch,
       };
     } catch (error) {
       return {

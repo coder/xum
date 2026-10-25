@@ -1,9 +1,15 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, spyOn } from "bun:test";
 import * as fs from "fs/promises";
 import * as path from "path";
 import * as os from "os";
 import * as net from "net";
-import { ServerService, computeNetworkBaseUrls, getTailscaleBindHosts } from "./serverService";
+import {
+  ServerService,
+  computeNetworkBaseUrls,
+  getTailscaleBindHosts,
+  setApiServerSettings,
+  setServerSshHost,
+} from "./serverService";
 import type { ORPCContext } from "@/node/orpc/context";
 import { Config } from "@/node/config";
 import { ServerLockDataSchema } from "./serverLockfile";
@@ -78,20 +84,46 @@ describe("ServerService.startServer", () => {
     });
   }
 
+  test("refuses to start in session tape replay mode, which serves only desktop windows", async () => {
+    const service = new ServerService();
+    const saved = process.env.XUM_REPLAY_TAPES;
+    process.env.XUM_REPLAY_TAPES = JSON.stringify({ ws: "/tapes/ws.jsonl" });
+    try {
+      let thrownError: unknown = null;
+      try {
+        await service.startServer({
+          xumHome: tempDir,
+          context: stubContext,
+          authToken: "test-token",
+          port: 0,
+        });
+      } catch (err) {
+        thrownError = err;
+      }
+      expect((thrownError as Error | null)?.message).toMatch(/replay mode/);
+      expect(service.isServerRunning()).toBe(false);
+      // No lockfile either: nothing may advertise a server that does not exist.
+      expect(await fs.stat(path.join(tempDir, "server.lock")).catch(() => null)).toBeNull();
+    } finally {
+      if (saved === undefined) delete process.env.XUM_REPLAY_TAPES;
+      else process.env.XUM_REPLAY_TAPES = saved;
+    }
+  });
+
   test("cleans up server when lockfile acquisition fails", async () => {
     const service = new ServerService();
 
-    // Make muxHome a *file* (not a directory) so lockfile.acquire() fails reliably,
+    // Make xumHome a *file* (not a directory) so lockfile.acquire() fails reliably,
     // even when tests run as root (chmod-based tests don't fail for root).
-    const muxHomeFile = path.join(tempDir, "muxHome-not-a-dir");
-    await fs.writeFile(muxHomeFile, "not a directory");
+    const xumHomeFile = path.join(tempDir, "xumHome-not-a-dir");
+    await fs.writeFile(xumHomeFile, "not a directory");
 
     let thrownError: unknown = null;
 
     try {
       // Start server - this should fail when trying to write lockfile
       await service.startServer({
-        muxHome: muxHomeFile,
+        xumHome: xumHomeFile,
         context: stubContext,
         authToken: "test-token",
         port: 0, // random port
@@ -129,7 +161,7 @@ describe("ServerService.startServer", () => {
     let thrownError: Error | null = null;
     try {
       await service.startServer({
-        muxHome: tempDir,
+        xumHome: tempDir,
         context: stubContext,
         authToken: "test-token",
         port: 0,
@@ -155,7 +187,7 @@ describe("ServerService.startServer", () => {
     const service = new ServerService();
 
     const info = await service.startServer({
-      muxHome: tempDir,
+      xumHome: tempDir,
       context: stubContext,
       authToken: "test-token",
       port: 0,
@@ -193,7 +225,7 @@ test("supports non-CLI allow-http-origin opt-in via MUX_SERVER_ALLOW_HTTP_ORIGIN
 
   try {
     const info = await service.startServer({
-      muxHome: tempDir,
+      xumHome: tempDir,
       context: stubContext,
       authToken: "",
       port: 0,
@@ -416,5 +448,118 @@ describe("computeNetworkBaseUrls", () => {
     expect(computeNetworkBaseUrls({ bindHost: "2001:db8::1", port: 3000 })).toEqual([
       "http://[2001:db8::1]:3000",
     ]);
+  });
+});
+
+describe("server settings writes (#4444)", () => {
+  let tempDir: string;
+  let config: Config;
+
+  beforeEach(async () => {
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "server-settings-test-"));
+    config = new Config(tempDir);
+  });
+
+  afterEach(async () => {
+    await fs.rm(tempDir, { recursive: true, force: true });
+  });
+
+  test("a failed SSH host write leaves the in-memory host unchanged", async () => {
+    const serverService = new ServerService();
+    serverService.setSshHost("old-host");
+    spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+    const context = { config, serverService } as unknown as ORPCContext;
+
+    const error = await setServerSshHost(context, "new-host").catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(Error);
+    expect(String(error)).toContain("EACCES");
+
+    expect(serverService.getSshHost()).toBe("old-host");
+  });
+
+  function fakeServer(options: { stopError?: Error; startErrors?: Error[] } = {}) {
+    const state = {
+      running: true,
+      stops: 0,
+      starts: [] as Array<{ host: string; port: number }>,
+    };
+    const startErrors = [...(options.startErrors ?? [])];
+    const serverService = {
+      isServerRunning: () => state.running,
+      stopServer: () => {
+        state.stops += 1;
+        if (options.stopError) return Promise.reject(options.stopError);
+        state.running = false;
+        return Promise.resolve();
+      },
+      startServer: (start: { host: string; port: number }) => {
+        state.starts.push({ host: start.host, port: start.port });
+        const error = startErrors.shift();
+        if (error) return Promise.reject(error);
+        state.running = true;
+        return Promise.resolve();
+      },
+      getApiAuthToken: () => "token",
+      getServerInfo: () => null,
+      getTailscaleBindHosts: () => [],
+    };
+    return { state, context: { config, serverService } as unknown as ORPCContext };
+  }
+
+  async function seedApiServerSettings(): Promise<void> {
+    await config.editConfig((value) => ({
+      ...value,
+      apiServerBindHost: "127.0.0.1",
+      apiServerPort: 4321,
+    }));
+  }
+
+  test("a failed settings write leaves a running server untouched (#4748)", async () => {
+    await seedApiServerSettings();
+    const { state, context } = fakeServer();
+    spyOn(config, "editConfig").mockRejectedValueOnce(new Error("EACCES: permission denied"));
+
+    const error = await setApiServerSettings(context, { bindHost: "0.0.0.0", port: 9999 }).catch(
+      (caught: unknown) => caught
+    );
+
+    expect(String(error)).toContain("EACCES");
+    expect(state).toEqual({ running: true, stops: 0, starts: [] });
+    expect(config.loadConfigOrDefault().apiServerBindHost).toBe("127.0.0.1");
+  });
+
+  test("a failed stop puts the previous settings back on disk (#4748)", async () => {
+    await seedApiServerSettings();
+    const { state, context } = fakeServer({ stopError: new Error("close failed") });
+
+    const error = await setApiServerSettings(context, { bindHost: "0.0.0.0", port: 9999 }).catch(
+      (caught: unknown) => caught
+    );
+
+    expect(String(error)).toContain("close failed");
+    // The old server is still up, so disk must describe it, not the requested settings.
+    expect(state.running).toBe(true);
+    expect(config.loadConfigOrDefault().apiServerBindHost).toBe("127.0.0.1");
+    expect(config.loadConfigOrDefault().apiServerPort).toBe(4321);
+  });
+
+  test("a failed rollback write keeps the start error and still restarts the previous server (#4748)", async () => {
+    await seedApiServerSettings();
+    const { state, context } = fakeServer({ startErrors: [new Error("EADDRINUSE")] });
+    const realEdit = config.editConfig.bind(config);
+    spyOn(config, "editConfig")
+      .mockImplementationOnce(realEdit)
+      .mockImplementationOnce(() => Promise.reject(new Error("rollback write failed")));
+
+    const error = await setApiServerSettings(context, { bindHost: "0.0.0.0", port: 9999 }).catch(
+      (caught: unknown) => caught
+    );
+
+    expect(String(error)).toContain("EADDRINUSE");
+    expect(state.starts).toEqual([
+      { host: "0.0.0.0", port: 9999 },
+      { host: "127.0.0.1", port: 4321 },
+    ]);
+    expect(state.running).toBe(true);
   });
 });

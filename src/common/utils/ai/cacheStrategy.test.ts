@@ -8,6 +8,7 @@ import type { ProvidersConfigMap } from "@/common/orpc/types";
 import {
   supportsAnthropicCache,
   applyCacheControl,
+  getAnthropicCacheTtl,
   createCachedSystemMessage,
   createOpenAICachedSystemMessage,
   openaiExplicitPromptCachingAvailable,
@@ -40,8 +41,7 @@ describe("cacheStrategy", () => {
     });
 
     it("should return true for gateway providers routing to Anthropic", () => {
-      expect(supportsAnthropicCache("mux-gateway:anthropic/claude-opus-4-5")).toBe(true);
-      expect(supportsAnthropicCache("mux-gateway:anthropic/claude-sonnet-4-5-20250514")).toBe(true);
+      expect(supportsAnthropicCache("bedrock:anthropic.claude-opus-4-5")).toBe(true);
       expect(supportsAnthropicCache("openrouter:anthropic/claude-3.5-sonnet")).toBe(true);
     });
 
@@ -49,7 +49,7 @@ describe("cacheStrategy", () => {
       expect(supportsAnthropicCache("openai:gpt-4")).toBe(false);
       expect(supportsAnthropicCache("google:gemini-2.0")).toBe(false);
       expect(supportsAnthropicCache("openrouter:meta-llama/llama-3.1")).toBe(false);
-      expect(supportsAnthropicCache("mux-gateway:openai/gpt-5.2")).toBe(false);
+      expect(supportsAnthropicCache("openrouter:openai/gpt-5.2")).toBe(false);
     });
 
     // Coder gateway instances: the wire comes from instance metadata, not the
@@ -74,6 +74,36 @@ describe("cacheStrategy", () => {
       expect(supportsAnthropicCache("coder:unknown-instance/model", config)).toBe(false);
     });
 
+    it("classifies custom providers by their API format", () => {
+      const config = {
+        zen: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "anthropic-messages" as const,
+        },
+        zap: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "openai-responses" as const,
+        },
+        zim: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          isCustom: true,
+          providerType: "openai-compatible" as const,
+        },
+      };
+
+      expect(supportsAnthropicCache("zen:claude-opus-4-5", config)).toBe(true);
+      expect(supportsAnthropicCache("zap:gpt-5", config)).toBe(false);
+      expect(supportsAnthropicCache("zim:claude-opus-4-5", config)).toBe(false);
+    });
+
     // ZDR: disableBetaFeatures must reject cache eligibility itself — the
     // provider fetch wrapper only skips injecting markers, it never strips
     // ones these helpers already serialized.
@@ -93,7 +123,7 @@ describe("cacheStrategy", () => {
         },
       };
       expect(supportsAnthropicCache("anthropic:claude-opus-4-5", config)).toBe(false);
-      expect(supportsAnthropicCache("mux-gateway:anthropic/claude-opus-4-5", config)).toBe(false);
+      expect(supportsAnthropicCache("bedrock:anthropic.claude-opus-4-5", config)).toBe(false);
       expect(supportsAnthropicCache("coder:prod-anthropic/claude-opus-4-5", config)).toBe(false);
       expect(supportsAnthropicCache("coder:anthropic/claude-opus-4-5", config)).toBe(false);
     });
@@ -214,6 +244,29 @@ describe("cacheStrategy", () => {
       }); // Last part has cache control
     });
 
+    it("merges cache options into existing part providerOptions", () => {
+      // The tool-search dedupe projection stashes restoration data on the last
+      // part's providerOptions; adding cache control must not delete it.
+      const raw: unknown = {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-1",
+            toolName: "tool_catalog_search",
+            output: { type: "text", value: "repeat status" },
+            providerOptions: { mux: { rawToolSearchOutput: "{}" } },
+          },
+        ],
+      };
+      const result = applyCacheControl([raw as ModelMessage], "anthropic:claude-3-5-sonnet");
+      const content = result[0].content as Array<{ providerOptions?: unknown }>;
+      expect(content[0].providerOptions).toEqual({
+        mux: { rawToolSearchOutput: "{}" },
+        anthropic: { cacheControl: { type: "ephemeral" } },
+      });
+    });
+
     it("should include cache TTL when provided", () => {
       const messages: ModelMessage[] = [{ role: "user", content: "Hello" }];
       const result = applyCacheControl(messages, "anthropic:claude-3-5-sonnet", "1h");
@@ -301,33 +354,32 @@ describe("cacheStrategy", () => {
   describe("openaiExplicitPromptCachingAvailable", () => {
     const config = openaiProvidersConfig();
 
-    it("accepts every GPT-5.6 tier on the direct official OpenAI route", () => {
+    it("accepts every GPT-6 tier on the direct official OpenAI route", () => {
       for (const model of [
-        "openai:gpt-5.6",
-        "openai:gpt-5.6-sol",
-        "openai:gpt-5.6-terra",
-        "openai:gpt-5.6-luna",
-        "openai:gpt-5.6-sol-2026-07-09",
+        "openai:gpt-6-astra",
+        "openai:gpt-6.1-sol",
+        "openai:gpt-6-luna",
+        "openai:gpt-6.1-sol-2026-09-29",
       ]) {
         expect(openaiExplicitPromptCachingAvailable(model, "openai", config)).toBe(true);
       }
     });
 
-    it("accepts openai: aliases mapped to GPT-5.6 targets", () => {
+    it("accepts openai: aliases mapped to GPT-6 targets", () => {
       const aliasConfig = openaiProvidersConfig({
-        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
+        models: [{ id: "team-sol", mappedToModel: "openai:gpt-6.1-sol" }],
       });
       expect(openaiExplicitPromptCachingAvailable("openai:team-sol", "openai", aliasConfig)).toBe(
         true
       );
     });
 
-    it("rejects aliases whose resolved target is not OpenAI GPT-5.6", () => {
+    it("rejects aliases whose resolved target is not an OpenAI GPT-6 tier", () => {
       const aliasConfig = openaiProvidersConfig({
         models: [
           { id: "team-old", mappedToModel: "openai:gpt-5.2" },
           { id: "team-claude", mappedToModel: "anthropic:claude-opus-4-6" },
-          { id: "team-bare", mappedToModel: "gpt-5.6-sol" },
+          { id: "team-bare", mappedToModel: "gpt-6.1-sol" },
         ],
       });
       for (const alias of ["openai:team-old", "openai:team-claude", "openai:team-bare"]) {
@@ -337,24 +389,30 @@ describe("cacheStrategy", () => {
 
     it("rejects raw unprefixed and non-OpenAI-origin model strings", () => {
       for (const model of [
-        "gpt-5.6-sol", // raw unprefixed: never infer a provider
+        "gpt-6.1-sol", // raw unprefixed: never infer a provider
         "anthropic:claude-opus-4-6",
-        "openrouter:openai/gpt-5.6-sol",
-        "github-copilot:gpt-5.6-sol",
+        "openrouter:openai/gpt-6.1-sol",
+        "github-copilot:gpt-6.1-sol",
       ]) {
         expect(openaiExplicitPromptCachingAvailable(model, "openai", config)).toBe(false);
       }
     });
 
     it("rejects older OpenAI models and near-miss ids", () => {
-      for (const model of ["openai:gpt-5.2", "openai:gpt-5.5", "openai:gpt-5.61"]) {
+      for (const model of [
+        "openai:gpt-5.2",
+        "openai:gpt-5.5",
+        "openai:gpt-5.6-sol",
+        "openai:gpt-6-sol",
+        "openai:gpt-5.61",
+      ]) {
         expect(openaiExplicitPromptCachingAvailable(model, "openai", config)).toBe(false);
       }
     });
 
     it("rejects missing, unknown, and gateway routes", () => {
-      for (const route of [undefined, "unknown", "mux-gateway", "openrouter", "github-copilot"]) {
-        expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", route, config)).toBe(
+      for (const route of [undefined, "unknown", "openrouter", "github-copilot"]) {
+        expect(openaiExplicitPromptCachingAvailable("openai:gpt-6.1-sol", route, config)).toBe(
           false
         );
       }
@@ -364,7 +422,7 @@ describe("cacheStrategy", () => {
       // OAuth tokens without an API key: OAuth wins.
       expect(
         openaiExplicitPromptCachingAvailable(
-          "openai:gpt-5.6-sol",
+          "openai:gpt-6.1-sol",
           "openai",
           openaiProvidersConfig({ apiKeySet: false, apiKeySource: undefined, codexOauthSet: true })
         )
@@ -372,7 +430,7 @@ describe("cacheStrategy", () => {
       // OAuth tokens + API key with default precedence: OAuth still wins.
       expect(
         openaiExplicitPromptCachingAvailable(
-          "openai:gpt-5.6-sol",
+          "openai:gpt-6.1-sol",
           "openai",
           openaiProvidersConfig({ codexOauthSet: true })
         )
@@ -380,18 +438,40 @@ describe("cacheStrategy", () => {
       // Explicit apiKey precedence restores API-key routing.
       expect(
         openaiExplicitPromptCachingAvailable(
-          "openai:gpt-5.6-sol",
+          "openai:gpt-6.1-sol",
           "openai",
           openaiProvidersConfig({ codexOauthSet: true, codexOauthDefaultAuth: "apiKey" })
         )
       ).toBe(true);
     });
 
+    it("accepts a request-level Chat Completions wire format that falls back to the API key", () => {
+      // Stored config prefers OAuth and leaves wireFormat unset; the request selects
+      // Chat Completions, which Codex OAuth cannot serve, so the API key is used.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-6.1-sol",
+          "openai",
+          openaiProvidersConfig({ codexOauthSet: true }),
+          { openaiWireFormat: "chatCompletions" }
+        )
+      ).toBe(true);
+      // The stored wire format wins over the request-level value.
+      expect(
+        openaiExplicitPromptCachingAvailable(
+          "openai:gpt-6.1-sol",
+          "openai",
+          openaiProvidersConfig({ codexOauthSet: true, wireFormat: "responses" }),
+          { openaiWireFormat: "chatCompletions" }
+        )
+      ).toBe(false);
+    });
+
     it("rejects when the providers config view is unavailable", () => {
-      expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", "openai", null)).toBe(
+      expect(openaiExplicitPromptCachingAvailable("openai:gpt-6.1-sol", "openai", null)).toBe(
         false
       );
-      expect(openaiExplicitPromptCachingAvailable("openai:gpt-5.6-sol", "openai", {})).toBe(false);
+      expect(openaiExplicitPromptCachingAvailable("openai:gpt-6.1-sol", "openai", {})).toBe(false);
     });
 
     it("accepts official explicit and env-resolved base URLs", () => {
@@ -403,7 +483,7 @@ describe("cacheStrategy", () => {
       ]) {
         expect(
           openaiExplicitPromptCachingAvailable(
-            "openai:gpt-5.6-sol",
+            "openai:gpt-6.1-sol",
             "openai",
             openaiProvidersConfig(overrides)
           )
@@ -426,7 +506,7 @@ describe("cacheStrategy", () => {
       ]) {
         expect(
           openaiExplicitPromptCachingAvailable(
-            "openai:gpt-5.6-sol",
+            "openai:gpt-6.1-sol",
             "openai",
             openaiProvidersConfig(overrides)
           )
@@ -441,7 +521,7 @@ describe("cacheStrategy", () => {
     it("returns the exact typed system-message shape for eligible requests", () => {
       const result = createOpenAICachedSystemMessage(
         "You are a helpful assistant",
-        "openai:gpt-5.6-luna",
+        "openai:gpt-6-luna",
         "openai",
         config
       );
@@ -458,9 +538,7 @@ describe("cacheStrategy", () => {
     });
 
     it("returns null for empty system content", () => {
-      expect(createOpenAICachedSystemMessage("", "openai:gpt-5.6-luna", "openai", config)).toBe(
-        null
-      );
+      expect(createOpenAICachedSystemMessage("", "openai:gpt-6-luna", "openai", config)).toBe(null);
     });
 
     it("returns null for ineligible models and routes", () => {
@@ -468,10 +546,10 @@ describe("cacheStrategy", () => {
         createOpenAICachedSystemMessage("prompt", "openai:gpt-5.2", "openai", config)
       ).toBeNull();
       expect(
-        createOpenAICachedSystemMessage("prompt", "openai:gpt-5.6-luna", "mux-gateway", config)
+        createOpenAICachedSystemMessage("prompt", "openai:gpt-6-luna", "openrouter", config)
       ).toBeNull();
       expect(
-        createOpenAICachedSystemMessage("prompt", "openai:gpt-5.6-luna", undefined, config)
+        createOpenAICachedSystemMessage("prompt", "openai:gpt-6-luna", undefined, config)
       ).toBeNull();
     });
   });
@@ -631,9 +709,40 @@ describe("cacheStrategy", () => {
       expect(result.readFile).toEqual(toolsWithDynamicTool.readFile);
     });
 
-    it("preserves the built-in task marker when recreating the last function tool", () => {
-      // Cache control recreates the last function tool via createTool(). Built-in explore-task
-      // parallelism depends on a symbol marker surviving that recreation; if it were dropped the
+    it("puts the breakpoint on the last non-deferred tool and keeps its hooks and options", () => {
+      // Anthropic rejects cache_control on a defer_loading tool (#5262).
+      const toModelOutput = () => ({ type: "text" as const, value: "ok" });
+      const searchTool: Tool = {
+        ...tool({
+          description: "search",
+          inputSchema: z.object({ query: z.string() }),
+          execute: () => Promise.resolve("ok"),
+        }),
+        toModelOutput,
+        providerOptions: { anthropic: { eagerInputStreaming: true } },
+      };
+      const deferredTool: Tool = {
+        ...mockTools.writeFile,
+        providerOptions: { anthropic: { deferLoading: true } },
+      };
+      const result = applyCacheControlToTools(
+        { readFile: mockTools.readFile, tool_catalog_search: searchTool, zulip_send: deferredTool },
+        "anthropic:claude-3-5-sonnet",
+        "1h"
+      );
+
+      expect(result.zulip_send).toBe(deferredTool);
+      expect(result.readFile).toBe(mockTools.readFile);
+      expect(result.tool_catalog_search.providerOptions).toEqual({
+        anthropic: { eagerInputStreaming: true, cacheControl: { type: "ephemeral", ttl: "1h" } },
+      });
+      expect(result.tool_catalog_search.toModelOutput).toBe(toModelOutput);
+      expect(result.tool_catalog_search.execute).toBe(searchTool.execute);
+    });
+
+    it("preserves the built-in task marker when cloning the last function tool", () => {
+      // Cache control clones the last function tool. Built-in explore-task
+      // parallelism depends on a symbol marker surviving that copy; if it were dropped the
       // task tool would silently fall back to serialized execution.
       const taskTool = markBuiltInTaskTool(
         tool({
@@ -653,5 +762,21 @@ describe("cacheStrategy", () => {
       // A recreated tool is a different object; sanity-check the marker rode along on the copy.
       expect(result.task).not.toBe(taskTool);
     });
+  });
+});
+
+describe("getAnthropicCacheTtl", () => {
+  it("recovers a valid ttl from merged provider options", () => {
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "1h" } } })).toBe("1h");
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "5m" } } })).toBe("5m");
+  });
+
+  it("returns undefined for missing or malformed shapes", () => {
+    expect(getAnthropicCacheTtl(undefined)).toBeUndefined();
+    expect(getAnthropicCacheTtl({})).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: "1h" })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: "1h" } })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: "2h" } } })).toBeUndefined();
+    expect(getAnthropicCacheTtl({ anthropic: { cacheControl: { ttl: 300 } } })).toBeUndefined();
   });
 });

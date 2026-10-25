@@ -4,6 +4,7 @@ import { ChevronDown, ChevronRight, FileText, RefreshCw } from "lucide-react";
 import { useAPI } from "@/browser/contexts/API";
 import { ErrorBoundary } from "@/browser/components/ErrorBoundary/ErrorBoundary";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
+import { MarkdownFilePreview } from "@/browser/features/Messages/MarkdownFilePreview";
 import { ChatInstructionsPanel } from "./AdditionalSystemContextScratchpad";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import { setWorkspaceInstructionsFileCount } from "@/browser/utils/workspaceInstructionsStore";
@@ -25,7 +26,7 @@ interface InstructionsTabProps {
 /**
  * The Instructions panel renders the structured `WorkspaceInstructions` payload
  * returned by `workspace.getInstructions`. The same `InstructionFile` objects
- * the agent sees are rendered here — type-system parity with `buildSystemMessage`
+ * the agent sees are rendered here — type-system parity with `buildSystemMessageFromSources`
  * is enforced by sharing `@/common/types/instructions`.
  */
 export function InstructionsTab(props: InstructionsTabProps) {
@@ -79,7 +80,9 @@ function InstructionsTabImpl(props: InstructionsTabProps) {
       <div className="min-h-0 flex-1 overflow-y-auto">
         <ChatInstructionsPanel workspaceId={props.workspaceId} />
         {error && <ErrorBanner message={error} />}
-        {!error && !loading && data?.files.length === 0 && <EmptyState />}
+        {/* Not gated on `loading`: a reload (refresh, or a new API client after a reconnect)
+            keeps the empty state on screen, as it keeps a file list. */}
+        {!error && data?.files.length === 0 && <EmptyState />}
         {data && data.files.length > 0 && <InstructionsBody data={data} />}
         {loading && !data && <LoadingState />}
       </div>
@@ -130,8 +133,8 @@ function Header({ totalTokens, fileCount, loading, onRefresh }: HeaderProps) {
 function InstructionsBody({ data }: { data: WorkspaceInstructions }) {
   // Render structured groups so the panel layout reflects the prompt structure.
   const groups: Array<{ title: string; sets: InstructionSet[] }> = [];
-  if (data.sources.global) {
-    groups.push({ title: "Global (~/.shux)", sets: [data.sources.global] });
+  if (data.sources.global.length > 0) {
+    groups.push({ title: "Global", sets: data.sources.global });
   }
   const workspaceSets = data.sources.context.filter((s) => s.scope === INSTRUCTION_SCOPE.WORKSPACE);
   if (workspaceSets.length > 0) {
@@ -214,9 +217,9 @@ function FileRow({ file, projectName }: FileRowProps) {
               )}
             </span>
             <ScopeBadge scope={file.scope} projectName={projectName} />
-            {/* Shux-dedicated files (~/.shux/AGENTS.md, <dir>/.mux/AGENTS.md) are the
+            {/* Xum-dedicated files (~/.xum/AGENTS.md, <dir>/.xum/AGENTS.md) are the
                 only sources where scoped Model:/Mode: directives are honored. */}
-            {file.muxOnly && (
+            {file.xumOnly && (
               <span className="text-muted bg-muted/20 shrink-0 rounded px-1.5 py-0.5 text-[9px] tracking-wider uppercase">
                 mux-only
               </span>
@@ -231,14 +234,14 @@ function FileRow({ file, projectName }: FileRowProps) {
           </div>
         </div>
       </button>
-      {/* The body's left padding is calibrated so the text inside its <pre>
+      {/* The body's left padding is calibrated so the text inside its boxes
           starts exactly where the column inside the button starts — at
           `px-3 (12px) + icon h-3.5 (14px) + gap-2 (8px) = 34px` from the row
-          edge. We give the body wrapper `pl-[26px]` and the inner <pre>s a
+          edge. We give the body wrapper `pl-[26px]` and the inner boxes a
           matching `px-2 py-1` so:
             - text x-position = 26px + 8px = 34px (matches the column)
             - text y-position is identical between preview and expanded
-              because both <pre>s share the same `mt-1 px-2 py-1`.
+              because both boxes share the same `mt-1 px-2 py-1`.
           The preview keeps an invisible border so its box height matches the
           expanded box exactly, eliminating any vertical jump. Putting the
           body outside the <button> also lets users select/scroll long files
@@ -250,9 +253,9 @@ function FileRow({ file, projectName }: FileRowProps) {
           </pre>
         )}
         {expanded && (
-          <pre className="bg-muted/10 border-border/50 mt-1 max-h-[60vh] overflow-auto rounded border px-2 py-1 font-mono text-[11px] whitespace-pre-wrap">
-            {file.content}
-          </pre>
+          <div className="bg-muted/10 border-border/50 mt-1 max-h-[60vh] overflow-auto rounded border px-2 py-1">
+            <MarkdownFilePreview content={file.content} className="compact-report-markdown" />
+          </div>
         )}
       </div>
     </li>
@@ -284,7 +287,7 @@ function EmptyState() {
       <p>No instruction files loaded for this workspace.</p>
       <p className="text-[10px]">
         Add an <code className="bg-muted/30 rounded px-1">AGENTS.md</code> at the workspace root or
-        in <code className="bg-muted/30 rounded px-1">~/.shux/</code> to provide context.
+        in <code className="bg-muted/30 rounded px-1">~/.xum/</code> to provide context.
       </p>
     </div>
   );

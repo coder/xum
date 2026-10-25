@@ -3,6 +3,7 @@ import {
   addUsage,
   accumulateProviderMetadata,
   accumulateStepsProviderMetadata,
+  getAnthropicCacheWrite1hTokens,
   normalizeUsage,
   withCacheWriteMetadata,
 } from "./usageHelpers";
@@ -212,6 +213,23 @@ describe("accumulateProviderMetadata", () => {
     expect(accumulateProviderMetadata(existing, step)).toBe(step);
   });
 
+  test("keeps the costliest reported OpenAI service tier across steps (#4352)", () => {
+    // A ramp downgrade mid-turn: the aggregate must not price earlier Fast steps at Standard.
+    const downgraded = accumulateProviderMetadata(
+      { openai: { serviceTier: "priority", responseId: "resp_1" } },
+      { openai: { serviceTier: "default", responseId: "resp_2" } }
+    );
+    expect(downgraded).toEqual({ openai: { serviceTier: "priority", responseId: "resp_2" } });
+
+    const upgradedFromFlex = { openai: { serviceTier: "default", responseId: "resp_4" } };
+    expect(
+      accumulateProviderMetadata(
+        { openai: { serviceTier: "flex", responseId: "resp_3" } },
+        upgradedFromFlex
+      )
+    ).toBe(upgradedFromFlex);
+  });
+
   test("sums cache creation tokens when both have them", () => {
     const existing = { anthropic: { cacheCreationInputTokens: 100 } };
     const step = { anthropic: { cacheCreationInputTokens: 50 } };
@@ -340,29 +358,97 @@ describe("accumulateProviderMetadata", () => {
   });
 });
 
+describe("Anthropic 1h-TTL cache-write share", () => {
+  const step = (fiveMinute: number, oneHour: number) => ({
+    anthropic: {
+      cacheCreationInputTokens: fiveMinute + oneHour,
+      usage: {
+        cache_creation: {
+          ephemeral_5m_input_tokens: fiveMinute,
+          ephemeral_1h_input_tokens: oneHour,
+        },
+      },
+    },
+  });
+
+  test("sums each step's 1h share across a multi-step turn", () => {
+    // The raw usage of the last step replaces the earlier one, so the sum must be carried.
+    const turn = accumulateProviderMetadata(step(1_000, 3_000), step(500, 1_500));
+    expect(getAnthropicCacheWrite1hTokens(turn, 6_000)).toBe(4_500);
+    const threeSteps = accumulateProviderMetadata(turn, step(2_000, 0));
+    expect(getAnthropicCacheWrite1hTokens(threeSteps, 8_000)).toBe(4_500);
+  });
+
+  // Pre-fix multi-step rows kept the summed total but only the last step's raw split.
+  const oldRow = (fiveMinute: number, oneHour: number) => ({
+    anthropic: { ...step(fiveMinute, oneHour).anthropic, cacheCreationInputTokens: 9_000 },
+  });
+
+  test("prices all of an old multi-step row's writes as 1h when its last step wrote only 1h", () => {
+    expect(getAnthropicCacheWrite1hTokens(oldRow(0, 2_000), 9_000)).toBe(9_000);
+    // A split that covers the whole total is exact and still priced as reported.
+    expect(getAnthropicCacheWrite1hTokens(step(1_000, 1_000), 2_000)).toBe(1_000);
+  });
+
+  test("keeps an old multi-step row at the 5m price when its last step wrote any 5m", () => {
+    expect(getAnthropicCacheWrite1hTokens(oldRow(500, 1_500), 9_000)).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(oldRow(2_000, 0), 9_000)).toBe(0);
+  });
+
+  test("keeps the 5m price when the last step wrote more 1h than the whole turn", () => {
+    expect(getAnthropicCacheWrite1hTokens(oldRow(0, 10_000), 9_000)).toBe(0);
+  });
+
+  test("a malformed 5m share keeps the 5m price instead of scaling the 1h share", () => {
+    const malformed = (fiveMinute: unknown) => ({
+      anthropic: {
+        cacheCreationInputTokens: 100,
+        usage: {
+          cache_creation: { ephemeral_5m_input_tokens: fiveMinute, ephemeral_1h_input_tokens: 10 },
+        },
+      },
+    });
+    expect(getAnthropicCacheWrite1hTokens(malformed(-1), 100)).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(malformed("90"), 100)).toBe(0);
+    // An absent 5m share still means the whole reported split is 1h.
+    expect(getAnthropicCacheWrite1hTokens(malformed(undefined), 10)).toBe(10);
+  });
+
+  test("reports no 1h share without a split", () => {
+    expect(
+      getAnthropicCacheWrite1hTokens({ anthropic: { cacheCreationInputTokens: 900 } }, 900)
+    ).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(undefined, 900)).toBe(0);
+    expect(getAnthropicCacheWrite1hTokens(step(0, 900), 0)).toBe(0);
+  });
+});
+
 describe("accumulateStepsProviderMetadata", () => {
   test("returns undefined for streams that never reported metadata", () => {
-    expect(accumulateStepsProviderMetadata([])).toBeUndefined();
-    expect(accumulateStepsProviderMetadata([{}, {}])).toBeUndefined();
+    expect(accumulateStepsProviderMetadata([], undefined)).toBeUndefined();
+    expect(accumulateStepsProviderMetadata([{}, {}], undefined)).toBeUndefined();
   });
 
   test("sums cache-write tokens across steps (last-step metadata alone would drop them)", () => {
-    const result = accumulateStepsProviderMetadata([
-      { providerMetadata: { anthropic: { cacheCreationInputTokens: 1000 } } },
-      { providerMetadata: { anthropic: { cacheCreationInputTokens: 500 } } },
-      // Final step reads from cache only — its own metadata reports 0 writes.
-      { providerMetadata: { anthropic: { cacheCreationInputTokens: 0 } } },
-    ]);
+    const result = accumulateStepsProviderMetadata(
+      [
+        { providerMetadata: { anthropic: { cacheCreationInputTokens: 1000 } } },
+        { providerMetadata: { anthropic: { cacheCreationInputTokens: 500 } } },
+        // Final step reads from cache only — its own metadata reports 0 writes.
+        { providerMetadata: { anthropic: { cacheCreationInputTokens: 0 } } },
+      ],
+      undefined
+    );
     expect(
       (result?.anthropic as { cacheCreationInputTokens: number }).cacheCreationInputTokens
     ).toBe(1500);
   });
 
   test("keeps earlier metadata when a later step reports none", () => {
-    const result = accumulateStepsProviderMetadata([
-      { providerMetadata: { anthropic: { cacheCreationInputTokens: 300 } } },
-      {},
-    ]);
+    const result = accumulateStepsProviderMetadata(
+      [{ providerMetadata: { anthropic: { cacheCreationInputTokens: 300 } } }, {}],
+      undefined
+    );
     expect(
       (result?.anthropic as { cacheCreationInputTokens: number }).cacheCreationInputTokens
     ).toBe(300);

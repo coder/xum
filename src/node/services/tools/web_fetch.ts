@@ -1,8 +1,8 @@
 import { tool } from "ai";
+import { clockOf, type HostClock } from "@/node/utils/hostClock";
 import { Window } from "happy-dom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
-import * as net from "node:net";
 import type { WebFetchToolResult } from "@/common/types/tools";
 import { shellQuote } from "@/common/utils/shell";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -11,12 +11,22 @@ import {
   WEB_FETCH_TIMEOUT_SECS,
   WEB_FETCH_MAX_OUTPUT_BYTES,
   WEB_FETCH_MAX_HTML_BYTES,
+  WEB_FETCH_MAX_ADDRESS_ATTEMPTS,
 } from "@/common/constants/toolLimits";
 import { EXIT_CODE_TIMEOUT } from "@/common/constants/exitCodes";
 import * as runtimeHelpers from "@/node/utils/runtime/helpers";
 import { getErrorMessage } from "@/common/utils/errors";
+import { assert } from "@/common/utils/assert";
+import type { Runtime } from "@/node/runtime/Runtime";
+import { log } from "@/node/services/log";
+import { isIP } from "@/node/utils/ipAddress";
+import {
+  isBlockedHostname,
+  isBlockedIpAddress,
+  normalizeHostname,
+} from "@/node/utils/network/blockedTargets";
 
-const USER_AGENT = "Shux/1.0 (https://github.com/coder/mux; web-fetch tool)";
+const USER_AGENT = "Xum/1.0 (https://github.com/coder/mux; web-fetch tool)";
 const WEB_FETCH_MAX_REDIRECTS = 10;
 const WEB_FETCH_RESOLVE_TIMEOUT_SECS = 5;
 const WEB_FETCH_RUNTIME_TIMEOUT_GRACE_SECS = 1;
@@ -25,26 +35,54 @@ const WEB_FETCH_BLOCKED_TARGET_ERROR =
   "Blocked URL: web_fetch cannot access loopback, private, link-local, or internal network targets";
 const WEB_FETCH_RESOLVE_ERROR = "Failed to fetch URL: Could not resolve host";
 const WEB_FETCH_TIMEOUT_ERROR = "Failed to fetch URL: Operation timed out";
-const WEB_FETCH_BLOCKED_HOSTNAMES = new Set([
-  "localhost",
-  "metadata",
-  "metadata.google.internal",
-  "host.docker.internal",
-  "gateway.docker.internal",
-  "kubernetes.default.svc",
-]);
+const WEB_FETCH_CURL_PROBE_ERROR = "Failed to fetch URL: could not determine the curl version";
+const CURL_ROUTE_MARKER = "XUM_CURL_ROUTE=";
 
 class WebFetchValidationError extends Error {}
+
+// parseHtmlDocument answers every request that happy-dom tries to send with this
+// status instead of sending it.
+const WEB_FETCH_REFUSED_STATUS = 403;
+const WEB_FETCH_REFUSED_STATUS_TEXT = "Forbidden";
+
+/**
+ * Remove every `<tagName ...>...</tagName>` block, with the same matches as
+ * /<tagName\b[^>]*>[\s\S]*?<\/tagName\s*>/gi. That regex restarts its scan at
+ * every opener that has no ">" or no closer after it, so it takes quadratic
+ * time on untrusted HTML full of unclosed openers. This scan runs in linear
+ * time: each search starts where the last match ended, and the first failed
+ * search ends the scan, because a later start cannot succeed where an earlier
+ * one failed.
+ */
+function stripElementBlocks(html: string, tagName: string): string {
+  assert(/^[a-z]+$/.test(tagName), `stripElementBlocks: unsupported tag name ${tagName}`);
+  const opener = new RegExp(`<${tagName}\\b`, "gi");
+  const closer = new RegExp(`<\\/${tagName}\\s*>`, "gi");
+  const kept: string[] = [];
+  let keptFrom = 0;
+  for (let open = opener.exec(html); open !== null; open = opener.exec(html)) {
+    const openerEnd = html.indexOf(">", opener.lastIndex);
+    if (openerEnd === -1) break;
+    // mutation-equivalent: a closer starts with "</", and html[openerEnd] is ">",
+    // so a search from openerEnd - 1 or openerEnd finds the same closer.
+    closer.lastIndex = openerEnd + 1;
+    if (closer.exec(html) === null) break;
+    kept.push(html.slice(keptFrom, open.index));
+    keptFrom = closer.lastIndex;
+    opener.lastIndex = keptFrom;
+  }
+  kept.push(html.slice(keptFrom));
+  return kept.join("");
+}
 
 /**
  * Strip <style> and <script> blocks before happy-dom parsing. Large minified
  * blocks add substantial parsing work, while Readability only needs DOM
  * structure and visible text.
  */
-function stripHeavyTags(html: string): string {
-  return html
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "")
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
+// Exported for web_fetch.test.ts, which checks the matches and the linear time.
+export function stripHeavyTags(html: string): string {
+  return stripElementBlocks(stripElementBlocks(html, "style"), "script");
 }
 
 // Exported for web_fetch.bundle.test.ts: the no-subresource-fetch guarantee
@@ -54,10 +92,18 @@ export function parseHtmlDocument(html: string, url: string): Document {
   // SECURITY: the HTML is untrusted. Parsing must never trigger network
   // fetches from the Mux backend (subresources like iframes or external
   // stylesheets would bypass the SSRF checks in assertWebFetchTargetAllowed).
-  // JavaScript evaluation is already disabled by default in happy-dom.
+  // The settings below turn off the loaders we know about, and the fetch
+  // interceptor refuses every HTTP request: happy-dom sends all of them
+  // (fetch, XMLHttpRequest, sendBeacon, <link> elements, stylesheets,
+  // scripts, frames) through Fetch/SyncFetch, which call the interceptor
+  // before they open a connection, so a refused request never reaches the
+  // network and never follows a redirect. WebSocket is the one happy-dom
+  // network path that skips the interceptor, and only script can open one:
+  // keep JavaScript evaluation off (happy-dom's default, also set here).
   const window = new Window({
     url,
     settings: {
+      enableJavaScriptEvaluation: false,
       disableJavaScriptFileLoading: true,
       disableCSSFileLoading: true,
       navigation: {
@@ -65,202 +111,36 @@ export function parseHtmlDocument(html: string, url: string): Document {
         disableChildFrameNavigation: true,
         disableChildPageNavigation: true,
       },
+      fetch: {
+        interceptor: {
+          beforeAsyncRequest: ({ window: requestWindow }) =>
+            Promise.resolve(
+              new requestWindow.Response(null, {
+                status: WEB_FETCH_REFUSED_STATUS,
+                statusText: WEB_FETCH_REFUSED_STATUS_TEXT,
+              })
+            ),
+          beforeSyncRequest: ({ window: requestWindow, request }) => ({
+            status: WEB_FETCH_REFUSED_STATUS,
+            statusText: WEB_FETCH_REFUSED_STATUS_TEXT,
+            ok: false,
+            url: request.url,
+            redirected: false,
+            headers: new requestWindow.Headers(),
+            body: null,
+          }),
+        },
+      },
     },
   });
+  // Do not strip preload links from the raw HTML before this write: a regex
+  // cannot tell a tag from text inside a quoted attribute, so it would cut
+  // into the containing tag and drop the page content after it. The
+  // interceptor above already refuses their requests.
   window.document.write(html);
   // happy-dom's Document is structurally DOM-compatible but uses its own type declarations.
   const document: unknown = window.document;
   return document as Document;
-}
-
-function normalizeHostname(hostname: string): string {
-  const trimmed = hostname.trim();
-  const withoutBrackets =
-    trimmed.startsWith("[") && trimmed.endsWith("]") ? trimmed.slice(1, -1) : trimmed;
-  return withoutBrackets.replace(/\.$/, "").toLowerCase();
-}
-
-function parseIpv4Octets(address: string): number[] | null {
-  if (net.isIP(address) !== 4) {
-    return null;
-  }
-
-  const octets = address.split(".").map((part) => Number.parseInt(part, 10));
-  if (
-    octets.length !== 4 ||
-    octets.some((octet) => Number.isNaN(octet) || octet < 0 || octet > 255)
-  ) {
-    return null;
-  }
-
-  return octets;
-}
-
-function normalizeIpv6Address(address: string): string {
-  let normalized = address.trim().toLowerCase();
-  const zoneIndex = normalized.indexOf("%");
-  if (zoneIndex !== -1) {
-    normalized = normalized.slice(0, zoneIndex);
-  }
-  if (normalized.startsWith("[") && normalized.endsWith("]")) {
-    normalized = normalized.slice(1, -1);
-  }
-  return normalized;
-}
-
-function parseIpv6Segments(address: string): number[] | null {
-  let normalized = normalizeIpv6Address(address);
-  if (net.isIP(normalized) !== 6) {
-    return null;
-  }
-
-  if (normalized.includes(".")) {
-    const lastColonIndex = normalized.lastIndexOf(":");
-    if (lastColonIndex === -1) {
-      return null;
-    }
-
-    const ipv4Octets = parseIpv4Octets(normalized.slice(lastColonIndex + 1));
-    if (!ipv4Octets) {
-      return null;
-    }
-
-    normalized = `${normalized.slice(0, lastColonIndex)}:${((ipv4Octets[0] << 8) | ipv4Octets[1]).toString(16)}:${((ipv4Octets[2] << 8) | ipv4Octets[3]).toString(16)}`;
-  }
-
-  const pieces = normalized.split("::");
-  if (pieces.length > 2) {
-    return null;
-  }
-
-  const head = pieces[0] ? pieces[0].split(":") : [];
-  const tail = pieces.length === 2 && pieces[1] ? pieces[1].split(":") : [];
-  if (pieces.length === 1 && head.length !== 8) {
-    return null;
-  }
-
-  const missingSegmentCount = 8 - head.length - tail.length;
-  if (missingSegmentCount < 0) {
-    return null;
-  }
-
-  const rawSegments =
-    pieces.length === 2
-      ? [...head, ...Array.from({ length: missingSegmentCount }, () => "0"), ...tail]
-      : head;
-  if (rawSegments.length !== 8) {
-    return null;
-  }
-
-  const segments: number[] = [];
-  for (const segment of rawSegments) {
-    if (!/^[0-9a-f]{1,4}$/i.test(segment)) {
-      return null;
-    }
-    segments.push(Number.parseInt(segment, 16));
-  }
-
-  return segments;
-}
-
-// URL parsing canonicalizes dotted IPv4 tails (for example ::127.0.0.1 becomes ::7f00:1),
-// so block checks need to recognize both deprecated IPv4-compatible ::/96 and
-// IPv4-mapped ::ffff:0:0/96 forms from their normalized IPv6 segments.
-function ipv4FromEmbeddedIpv6Segments(segments: number[]): string | null {
-  if (
-    segments.length !== 8 ||
-    !segments.slice(0, 5).every((segment) => segment === 0) ||
-    (segments[5] !== 0 && segments[5] !== 0xffff)
-  ) {
-    return null;
-  }
-
-  return [segments[6] >> 8, segments[6] & 0xff, segments[7] >> 8, segments[7] & 0xff].join(".");
-}
-
-function isBlockedIpv4Address(address: string): boolean {
-  const octets = parseIpv4Octets(address);
-  if (!octets) {
-    return false;
-  }
-
-  const [first, second] = octets;
-  if (first === 0 || first === 10 || first === 127) {
-    return true;
-  }
-  if (first === 100 && second >= 64 && second <= 127) {
-    return true;
-  }
-  if (first === 169 && second === 254) {
-    return true;
-  }
-  if (first === 172 && second >= 16 && second <= 31) {
-    return true;
-  }
-  if (first === 192 && second === 168) {
-    return true;
-  }
-  if (first === 198 && (second === 18 || second === 19)) {
-    return true;
-  }
-  if (first >= 224) {
-    return true;
-  }
-
-  return false;
-}
-
-function isBlockedIpv6Address(address: string): boolean {
-  const segments = parseIpv6Segments(address);
-  if (!segments) {
-    return false;
-  }
-
-  const embeddedIpv4 = ipv4FromEmbeddedIpv6Segments(segments);
-  if (embeddedIpv4) {
-    return isBlockedIpAddress(embeddedIpv4);
-  }
-
-  if (segments.every((segment) => segment === 0)) {
-    return true;
-  }
-  if (segments.slice(0, 7).every((segment) => segment === 0) && segments[7] === 1) {
-    return true;
-  }
-
-  const firstSegment = segments[0];
-  if ((firstSegment & 0xfe00) === 0xfc00) {
-    return true;
-  }
-  if ((firstSegment & 0xffc0) === 0xfe80) {
-    return true;
-  }
-  if ((firstSegment & 0xffc0) === 0xfec0) {
-    return true;
-  }
-  if ((firstSegment & 0xff00) === 0xff00) {
-    return true;
-  }
-
-  return false;
-}
-
-function isBlockedIpAddress(address: string): boolean {
-  return isBlockedIpv4Address(address) || isBlockedIpv6Address(address);
-}
-
-function isBlockedHostname(hostname: string): boolean {
-  const normalized = normalizeHostname(hostname);
-  if (!normalized) {
-    return true;
-  }
-
-  return (
-    WEB_FETCH_BLOCKED_HOSTNAMES.has(normalized) ||
-    normalized.endsWith(".localhost") ||
-    normalized.endsWith(".local") ||
-    normalized.endsWith(".internal")
-  );
 }
 
 function assertSupportedWebFetchProtocol(url: URL): void {
@@ -271,8 +151,12 @@ function assertSupportedWebFetchProtocol(url: URL): void {
   }
 }
 
-function getRemainingWebFetchTimeoutSecs(deadlineMs: number, maxTimeoutSecs?: number): number {
-  const remainingMs = deadlineMs - Date.now();
+function getRemainingWebFetchTimeoutSecs(
+  clock: HostClock,
+  deadlineMs: number,
+  maxTimeoutSecs?: number
+): number {
+  const remainingMs = deadlineMs - clock.nowMs();
   if (remainingMs <= 0) {
     throw new WebFetchValidationError(WEB_FETCH_TIMEOUT_ERROR);
   }
@@ -375,7 +259,7 @@ function parseResolvedAddresses(output: string): string[] {
     }
 
     const normalizedAddress = normalizeHostname(value);
-    if (net.isIP(normalizedAddress) === 0) {
+    if (isIP(normalizedAddress) === 0) {
       throw new WebFetchValidationError(WEB_FETCH_RESOLVE_ERROR);
     }
 
@@ -392,12 +276,13 @@ async function resolveHostnameInRuntime(
   abortSignal?: AbortSignal
 ): Promise<string[]> {
   const resolveTimeoutSecs = getRemainingWebFetchTimeoutSecs(
+    clockOf(config),
     deadlineMs,
     WEB_FETCH_RESOLVE_TIMEOUT_SECS
   );
 
   // Resolve hostnames inside the target runtime so DNS checks match the curl path,
-  // including redirected hosts that may resolve differently from local Shux.
+  // including redirected hosts that may resolve differently from local Xum.
   const result = await runtimeHelpers.execBuffered(
     config.runtime,
     buildResolveHostnameCommand(hostname),
@@ -417,12 +302,78 @@ async function resolveHostnameInRuntime(
   return parseResolvedAddresses(result.stdout);
 }
 
+// One probe per runtime instance, shared by concurrent first fetches. It resolves to
+// whether curl reports %{proxy_used} (8.7+). A failed probe is not cached, so a later
+// fetch probes again; this fetch refuses before any request.
+const curlReportsProxyUsedByRuntime = new WeakMap<Runtime, Promise<boolean>>();
+
+function probeCurlReportsProxyUsed(config: ToolConfiguration): Promise<boolean> {
+  const cached = curlReportsProxyUsedByRuntime.get(config.runtime);
+  if (cached) return cached;
+  const probe = (async () => {
+    // No abort signal: concurrent fetches share this probe, so one caller's abort must
+    // not fail the others. The fixed timeout bounds it instead.
+    const result = await runtimeHelpers.execBuffered(config.runtime, "curl -q --version", {
+      cwd: config.cwd,
+      timeout: WEB_FETCH_RESOLVE_TIMEOUT_SECS,
+    });
+    const match = /^curl (\d+)\.(\d+)\.\d+/.exec(result.stdout);
+    if (result.exitCode !== 0 || !match) {
+      throw new WebFetchValidationError(WEB_FETCH_CURL_PROBE_ERROR);
+    }
+    // No version floor: a curl without --connect-to rejects the unknown option (exit 2)
+    // before it connects, so the pin cannot be skipped silently.
+    const [major, minor] = [Number(match[1]), Number(match[2])];
+    const reportsProxyUsed = major > 8 || (major === 8 && minor >= 7);
+    if (!reportsProxyUsed) {
+      log.debug("web_fetch: curl before 8.7 has no %{proxy_used}; skipping the route check");
+    }
+    return reportsProxyUsed;
+  })();
+  curlReportsProxyUsedByRuntime.set(config.runtime, probe);
+  probe.catch(() => {
+    if (curlReportsProxyUsedByRuntime.get(config.runtime) === probe) {
+      curlReportsProxyUsedByRuntime.delete(config.runtime);
+    }
+  });
+  return probe;
+}
+
+interface WebFetchTarget {
+  url: URL;
+  /**
+   * The validated addresses this URL may connect to, in resolver order, or just the IP
+   * literal. Each request pins one of them; never curl's own DNS (#5966).
+   */
+  addresses: string[];
+  /** False for IP-literal URLs, which curl connects to without resolving. */
+  pinned: boolean;
+}
+
+/**
+ * `--connect-to <host>:<port>:<addr>:<port>` for one validated address. curl matches the
+ * pin against the request's host and port exactly and silently ignores a mismatch (then
+ * curl, or a proxy, resolves the hostname again), so build the key from the same URL the
+ * command fetches and refuse anything that would not match. The hostname stays the URL's
+ * for Host, SNI and certificate checks; only the TCP route is pinned.
+ */
+function buildConnectToPin(url: URL, address: string): string {
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  // The hostname goes into the pin verbatim (trailing dot and punycode included): the
+  // command fetches url.toString(), whose host is this same string.
+  if (url.hostname.length === 0 || /[:[\]]/.test(url.hostname) || !/^\d+$/.test(port)) {
+    throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
+  }
+  const routedAddress = isIP(address) === 6 ? `[${address}]` : address;
+  return `${url.hostname}:${port}:${routedAddress}:${port}`;
+}
+
 async function assertWebFetchTargetAllowed(
   config: ToolConfiguration,
   rawUrl: string,
   deadlineMs: number,
   abortSignal?: AbortSignal
-): Promise<URL> {
+): Promise<WebFetchTarget> {
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(rawUrl);
@@ -437,11 +388,11 @@ async function assertWebFetchTargetAllowed(
     throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
   }
 
-  if (net.isIP(hostname) !== 0) {
+  if (isIP(hostname) !== 0) {
     if (isBlockedIpAddress(hostname)) {
       throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
     }
-    return parsedUrl;
+    return { url: parsedUrl, addresses: [hostname], pinned: false };
   }
 
   const resolvedAddresses = await resolveHostnameInRuntime(
@@ -456,7 +407,8 @@ async function assertWebFetchTargetAllowed(
     }
   }
 
-  return parsedUrl;
+  assert(resolvedAddresses.length > 0, "web_fetch: resolver returned no addresses");
+  return { url: parsedUrl, addresses: resolvedAddresses, pinned: true };
 }
 
 /** Parse curl -i output into headers and body */
@@ -512,9 +464,15 @@ function isRedirectStatusCode(statusCode: number): boolean {
   );
 }
 
-function buildCurlCommand(url: string, timeoutSecs: number): string {
+function buildCurlCommand(
+  url: string,
+  timeoutSecs: number,
+  connectTo: string | null,
+  reportsProxyUsed: boolean
+): string {
   return [
     "curl",
+    "-q", // Must be first: ignore .curlrc (a `location` there would skip per-hop checks)
     "-sS", // Silent but show errors
     "-i", // Include headers in output
     "--fail-with-body", // Return exit code 22 for HTTP 4xx/5xx but still output body
@@ -533,23 +491,104 @@ function buildCurlCommand(url: string, timeoutSecs: number): string {
     shellQuote(
       "Accept: text/markdown, text/x-markdown, text/plain, text/html, application/xhtml+xml"
     ),
+    // Pin the validated address (#5966 security finding): curl must not resolve the
+    // hostname again. --proxytunnel makes a configured proxy CONNECT to the pinned IP
+    // instead of resolving the hostname itself.
+    "--proxytunnel",
+    // Keep the proxy's CONNECT reply out of the -i output, or it parses as the response.
+    "--suppress-connect-headers",
+    ...(connectTo != null ? ["--connect-to", shellQuote(connectTo)] : []),
+    // Older curl only warns about an unknown %{proxy_used}, so ask for it only on 8.7+.
+    ...(reportsProxyUsed
+      ? ["-w", shellQuote(`%{stderr}${CURL_ROUTE_MARKER}%{remote_ip};%{proxy_used}\n`)]
+      : []),
     shellQuote(url),
   ].join(" ");
 }
 
-async function executeWebFetchRequest(
-  config: ToolConfiguration,
-  rawUrl: string,
-  abortSignal?: AbortSignal
-): Promise<{ result: runtimeHelpers.ExecResult; finalUrl: string }> {
-  const deadlineMs = Date.now() + WEB_FETCH_TIMEOUT_SECS * 1000;
-  let currentUrl = await assertWebFetchTargetAllowed(config, rawUrl, deadlineMs, abortSignal);
+/** curl's route report: the address it connected to and whether a proxy was used. */
+interface CurlRoute {
+  remoteIp: string;
+  proxyUsed: boolean;
+}
 
-  for (let redirectCount = 0; redirectCount <= WEB_FETCH_MAX_REDIRECTS; redirectCount++) {
-    const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(deadlineMs);
-    const result = await runtimeHelpers.execBuffered(
+/** Remove curl's route line from stderr; `route` is null when it is missing or malformed. */
+function takeCurlRouteLine(stderr: string): { route: CurlRoute | null; stderr: string } {
+  const lines = stderr.split("\n");
+  const index = lines.findLastIndex((line) => line.startsWith(CURL_ROUTE_MARKER));
+  if (index === -1) return { route: null, stderr: stderr.trim() };
+  const fields = lines[index].slice(CURL_ROUTE_MARKER.length).split(";");
+  lines.splice(index, 1);
+  const [remoteIp, proxyUsed] = fields;
+  const wellFormed = fields.length === 2 && (proxyUsed === "0" || proxyUsed === "1");
+  return {
+    route: wellFormed ? { remoteIp, proxyUsed: proxyUsed === "1" } : null,
+    stderr: lines.join("\n").trim(),
+  };
+}
+
+/**
+ * Remove curl's route line from stderr and check it. This is an invariant check, NOT the
+ * SSRF defense: it runs after curl already connected, so it can only keep a wrong route's
+ * response out of the result; pinning prevents the connection. It needs %{proxy_used}
+ * (curl 8.7+) and checks direct connections only: through a proxy, %{remote_ip} is the
+ * proxy. A missing or malformed route line with a response is treated as a wrong route,
+ * and so is a direct connection that produced a response but reports no address (#5990).
+ * An empty address with no response is curl failing before it connected: its own error
+ * is reported instead.
+ */
+function checkCurlRoute(
+  result: runtimeHelpers.ExecResult,
+  expectedAddress: string
+): { result: runtimeHelpers.ExecResult; route: CurlRoute | null } {
+  const { route, stderr } = takeCurlRouteLine(result.stderr);
+  const hasResponse = result.stdout.length > 0;
+  const wrongRoute =
+    route === null
+      ? hasResponse
+      : !route.proxyUsed &&
+        (route.remoteIp === ""
+          ? hasResponse
+          : normalizeHostname(route.remoteIp) !== normalizeHostname(expectedAddress));
+  if (wrongRoute) {
+    throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
+  }
+  return { result: { ...result, stderr }, route };
+}
+
+/**
+ * #5977: whether the pinned address itself was unreachable. curl exits 7 also when a proxy
+ * refuses the tunnel or is down, but then it reports proxy_used=1. Only a direct attempt
+ * that got no response at all qualifies.
+ */
+function isPinnedAddressUnreachable(
+  result: runtimeHelpers.ExecResult,
+  route: CurlRoute | null
+): boolean {
+  return route?.proxyUsed === false && result.exitCode === 7 && result.stdout.length === 0;
+}
+
+/**
+ * One request for one target. A later validated address is tried only when the pinned one
+ * was unreachable (#5977): at most once each, at most WEB_FETCH_MAX_ADDRESS_ATTEMPTS in
+ * total, inside the same deadline, never unpinned.
+ * Without the route line (curl before 8.7) a refused CONNECT looks the same as a dead
+ * address, so that curl makes one attempt only.
+ */
+async function fetchTargetFromValidatedAddresses(
+  config: ToolConfiguration,
+  target: WebFetchTarget,
+  deadlineMs: number,
+  reportsProxyUsed: boolean,
+  abortSignal?: AbortSignal
+): Promise<runtimeHelpers.ExecResult> {
+  let result: runtimeHelpers.ExecResult | undefined;
+  for (const address of target.addresses.slice(0, WEB_FETCH_MAX_ADDRESS_ATTEMPTS)) {
+    const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(clockOf(config), deadlineMs);
+    const connectTo = target.pinned ? buildConnectToPin(target.url, address) : null;
+    const raw = await runtimeHelpers.execBuffered(
       config.runtime,
-      buildCurlCommand(currentUrl.toString(), curlTimeoutSecs),
+      buildCurlCommand(target.url.toString(), curlTimeoutSecs, connectTo, reportsProxyUsed),
       {
         cwd: config.cwd,
         abortSignal,
@@ -557,6 +596,37 @@ async function executeWebFetchRequest(
         // letting each curl invocation block for a fresh full timeout.
         timeout: curlTimeoutSecs + WEB_FETCH_RUNTIME_TIMEOUT_GRACE_SECS,
       }
+    );
+    if (!reportsProxyUsed) return raw;
+    const checked = checkCurlRoute(raw, address);
+    result = checked.result;
+    if (!isPinnedAddressUnreachable(result, checked.route) || abortSignal?.aborted) {
+      return result;
+    }
+    log.debug("web_fetch: pinned address unreachable, trying the next validated one");
+  }
+  assert(result, "web_fetch: a target always has at least one address");
+  return result;
+}
+
+async function executeWebFetchRequest(
+  config: ToolConfiguration,
+  rawUrl: string,
+  abortSignal?: AbortSignal
+): Promise<{ result: runtimeHelpers.ExecResult; finalUrl: string }> {
+  const deadlineMs = clockOf(config).nowMs() + WEB_FETCH_TIMEOUT_SECS * 1000;
+  let target = await assertWebFetchTargetAllowed(config, rawUrl, deadlineMs, abortSignal);
+  // A curl that cannot be classified refuses here, before any HTTP request.
+  const reportsProxyUsed = await probeCurlReportsProxyUsed(config);
+
+  for (let redirectCount = 0; redirectCount <= WEB_FETCH_MAX_REDIRECTS; redirectCount++) {
+    const currentUrl = target.url;
+    const result = await fetchTargetFromValidatedAddresses(
+      config,
+      target,
+      deadlineMs,
+      reportsProxyUsed,
+      abortSignal
     );
 
     if (result.exitCode !== 0) {
@@ -578,7 +648,7 @@ async function executeWebFetchRequest(
       throw new WebFetchValidationError("Failed to fetch URL: Too many redirects");
     }
 
-    currentUrl = await assertWebFetchTargetAllowed(
+    target = await assertWebFetchTargetAllowed(
       config,
       new URL(redirectLocation, currentUrl).toString(),
       deadlineMs,
@@ -718,7 +788,7 @@ export const createWebFetchTool: ToolFactory = (config: ToolConfiguration) => {
           };
         }
 
-        // Parse HTML with happy-dom locally in Shux, not over SSH. Strip heavy
+        // Parse HTML with happy-dom locally in Xum, not over SSH. Strip heavy
         // tags first because Readability does not need them for extraction.
         const document = parseHtmlDocument(stripHeavyTags(body), finalUrl);
 

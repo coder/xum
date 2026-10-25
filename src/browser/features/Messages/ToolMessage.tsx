@@ -3,7 +3,8 @@ import type { DisplayedMessage } from "@/common/types/message";
 import type { ReviewNoteData } from "@/common/types/review";
 import type { BashOutputGroupInfo } from "@/browser/utils/messages/messageUtils";
 import type { TaskReportLinking } from "@/browser/utils/messages/taskReportLinking";
-import { getToolComponent } from "../Tools/Shared/getToolComponent";
+import { useToolCards } from "../Tools/Shared/toolCardsStore";
+import { ToolCardFallback } from "../Tools/Shared/ToolCardsLoad";
 import {
   HookOutputDisplay,
   extractHookOutput,
@@ -23,6 +24,11 @@ interface ToolMessageProps {
   bashOutputGroup?: BashOutputGroupInfo;
   /** Optional task report linking context (computed at render-time) */
   taskReportLinking?: TaskReportLinking;
+  /**
+   * False where another surface owns the row's hook output: the ask_user_question dock renders
+   * the same row as the transcript, so its hook output stays with the transcript row.
+   */
+  showHookOutput?: boolean;
 }
 
 export const ToolMessage: React.FC<ToolMessageProps> = ({
@@ -33,11 +39,21 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
   isLatestProposePlan,
   bashOutputGroup,
   taskReportLinking,
+  showHookOutput = true,
 }) => {
   const { toolName, args, result, status, toolCallId } = message;
 
+  // The cards load lazily (see toolCardsStore). The outer div stays across the swap.
+  const cards = useToolCards();
+  if (!cards) {
+    return (
+      <div className={className}>
+        <ToolCardFallback toolName={toolName} status={status} />
+      </div>
+    );
+  }
   // Get the component from the registry (validates args, falls back to GenericToolCall)
-  const ToolComponent = getToolComponent(toolName, args);
+  const ToolComponent = cards.getToolComponent(toolName, args, result);
 
   // Compute tool-specific extras
   const groupPosition =
@@ -46,7 +62,7 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
       : undefined;
 
   // Extract hook output if present (only shown when hook produced output)
-  const hookOutput = extractHookOutput(result);
+  const hookOutput = showHookOutput ? extractHookOutput(result) : undefined;
   const hookDuration = extractHookDuration(result);
   return (
     <div className={className}>
@@ -61,9 +77,11 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
           // Identity props (used by bash for live output, ask_user_question for caching)
           workspaceId={workspaceId}
           toolCallId={toolCallId}
+          // Tells apart rows that reuse a tool call id (ask_user_question answers and drafts)
+          rowId={message.id}
           // Workflow-specific
           workflowRunHint={message.workflowRun}
-          // Elapsed timers (bash/advisor/task_await): start when execute() actually
+          // Elapsed timers (bash/task_await): start when execute() actually
           // began running, not when the model emitted the call — parallel tool calls
           // run sequentially, so queued calls must not accumulate elapsed time.
           startedAt={message.executionStartedAt}
@@ -81,6 +99,8 @@ export const ToolMessage: React.FC<ToolMessageProps> = ({
           taskReportLinking={taskReportLinking}
           // CodeExecution-specific
           nestedCalls={message.nestedCalls}
+          // MCP tools (GenericToolCall): frozen per-call server identity
+          mcpServer={message.mcpServer}
         />
       </ToolNameProvider>
       {hookOutput && <HookOutputDisplay output={hookOutput} durationMs={hookDuration} />}

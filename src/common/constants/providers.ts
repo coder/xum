@@ -10,17 +10,23 @@
  * Simple providers (requiresApiKey + standard factory pattern) need NO aiService.ts changes.
  */
 
+import type { OpenAIProviderSettings } from "@ai-sdk/openai";
+import { META_API_BASE_URL } from "@/constants/modelDiscovery";
+import { normalizeOpenAICompatibleBaseURL } from "@/common/utils/providers/baseUrl";
+
 /**
  * Union type of all supported provider names
  */
 export type ProviderName =
-  | "mux-gateway"
   | "anthropic"
   | "openai"
   | "google"
+  | "google-vertex"
   | "xai"
+  | "meta"
   | "deepseek"
   | "moonshotai"
+  | "zai"
   | "openrouter"
   | "github-copilot"
   | "coder"
@@ -46,8 +52,6 @@ interface ProviderDefinition {
   fromGatewayModelId?: (gatewayModelId: string) => { origin: string; modelId: string } | null;
   /** True when gateway is a transparent proxy and preserves canonical identity */
   passthrough?: boolean;
-  /** Whether this provider uses stroke-based icon styling instead of fill */
-  strokeBasedIcon?: boolean;
 }
 
 const toSlashSeparatedGatewayModelId = (origin: string, modelId: string): string =>
@@ -57,7 +61,9 @@ const fromSlashSeparatedGatewayModelId = (
   gatewayModelId: string
 ): { origin: string; modelId: string } | null => {
   const separatorIndex = gatewayModelId.indexOf("/");
-  if (separatorIndex === -1) {
+  // Reject leading/trailing separators: an empty origin or model id would
+  // otherwise canonicalize to invalid ":model" / "origin:" identities.
+  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
     return null;
   }
 
@@ -92,7 +98,9 @@ const fromDotSeparatedGatewayModelId = (
   gatewayModelId: string
 ): { origin: string; modelId: string } | null => {
   const separatorIndex = gatewayModelId.indexOf(".");
-  if (separatorIndex <= 0) {
+  // Reject leading/trailing separators (empty origin or model id) — see
+  // fromSlashSeparatedGatewayModelId.
+  if (separatorIndex <= 0 || separatorIndex === gatewayModelId.length - 1) {
     return null;
   }
 
@@ -104,18 +112,6 @@ const fromDotSeparatedGatewayModelId = (
 
 // Order determines display order in UI (Settings, model selectors, etc.)
 export const PROVIDER_DEFINITIONS = {
-  "mux-gateway": {
-    displayName: "Shux Gateway",
-    import: () => import("ai"),
-    factoryName: "createGateway",
-    requiresApiKey: true, // Uses couponCode
-    kind: "gateway",
-    routes: ["anthropic", "openai", "google", "xai"],
-    passthrough: true,
-    toGatewayModelId: toSlashSeparatedGatewayModelId,
-    fromGatewayModelId: fromSlashSeparatedGatewayModelId,
-    strokeBasedIcon: true,
-  },
   anthropic: {
     displayName: "Anthropic",
     import: () => import("@ai-sdk/anthropic"),
@@ -137,10 +133,34 @@ export const PROVIDER_DEFINITIONS = {
     requiresApiKey: true,
     kind: "direct",
   },
+  "google-vertex": {
+    displayName: "Google Vertex AI",
+    // Node-only; browser bundles alias it to src/common/mocks/googleVertexStub.ts.
+    import: () => import("@ai-sdk/google-vertex"),
+    factoryName: "createVertex",
+    requiresApiKey: false, // Google ADC by default; an API key selects express mode
+    kind: "direct",
+  },
   xai: {
     displayName: "xAI",
     import: () => import("@ai-sdk/xai"),
     factoryName: "createXai",
+    requiresApiKey: true,
+    kind: "direct",
+  },
+  meta: {
+    displayName: "Meta",
+    // Adapt the endpoint, not the SDK namespace: encrypted reasoning uses the
+    // existing openai persistence/replay path without inheriting OpenAI settings.
+    import: () =>
+      import("@ai-sdk/openai").then(({ createOpenAI }) => ({
+        createMeta: (config: OpenAIProviderSettings) =>
+          createOpenAI({
+            ...config,
+            baseURL: normalizeOpenAICompatibleBaseURL(config.baseURL ?? META_API_BASE_URL),
+          }),
+      })),
+    factoryName: "createMeta",
     requiresApiKey: true,
     kind: "direct",
   },
@@ -158,12 +178,20 @@ export const PROVIDER_DEFINITIONS = {
     requiresApiKey: true,
     kind: "direct",
   },
+  zai: {
+    displayName: "Z.ai",
+    import: () => import("@ai-sdk/zai"),
+    factoryName: "createZai",
+    requiresApiKey: true,
+    kind: "direct",
+  },
   openrouter: {
     displayName: "OpenRouter",
     import: () => import("@openrouter/ai-sdk-provider"),
     factoryName: "createOpenRouter",
     requiresApiKey: true,
     kind: "gateway",
+    // OpenRouter uses the hyphenated vendor slug "z-ai", so direct "zai" routing is not inferred.
     routes: ["anthropic", "openai", "google", "xai", "deepseek", "moonshotai"],
     passthrough: false,
     toGatewayModelId: toSlashSeparatedGatewayModelId,
@@ -219,6 +247,9 @@ export const PROVIDER_DEFINITIONS = {
   },
 } as const satisfies Record<ProviderName, ProviderDefinition>;
 
+/** Vertex serves Gemini 3.x from the global endpoint, so it is the default location. */
+export const GOOGLE_VERTEX_DEFAULT_LOCATION = "global";
+
 export const GATEWAY_PROVIDERS = Object.entries(PROVIDER_DEFINITIONS)
   .filter(([, def]) => def.kind === "gateway")
   .map(([name]) => name as ProviderName);
@@ -248,5 +279,7 @@ export const PROVIDER_REGISTRY = Object.fromEntries(
  * Type guard to check if a string is a valid provider name
  */
 export function isValidProvider(provider: string): provider is ProviderName {
-  return provider in PROVIDER_REGISTRY;
+  // Own-property check: `in` also matches inherited Object.prototype keys such as
+  // "toString", "constructor", and "__proto__".
+  return Object.hasOwn(PROVIDER_REGISTRY, provider);
 }

@@ -1,15 +1,15 @@
 ---
 title: ACP (Editor Integrations)
 sidebarTitle: ACP (Editors)
-description: Connect Shux to Zed, Neovim, and JetBrains via the Agent Client Protocol
+description: Connect Xum to Zed, Neovim, and JetBrains via the Agent Client Protocol
 ---
 
-Shux implements the [Agent Client Protocol (ACP)](https://agentclientprotocol.org/) to integrate
-with editors that support it. The `shux acp` command starts a stdio bridge that any
+Xum implements the [Agent Client Protocol (ACP)](https://agentclientprotocol.org/) to integrate
+with editors that support it. The `xum acp` command starts a stdio bridge that any
 ACP-compatible editor can spawn as a subprocess.
 
 <Info>
-  ACP is the "LSP for agents" and provides session management, tool delegation, and streaming. Shux
+  ACP is the "LSP for agents" and provides session management, tool delegation, and streaming. Xum
   uses ACP (not MCP) for its editor bridge.
 </Info>
 
@@ -22,9 +22,9 @@ Open **Settings** (`Cmd+,`) and add:
 ```json
 {
   "agent_servers": {
-    "Shux": {
+    "Xum": {
       "type": "custom",
-      "command": "shux",
+      "command": "xum",
       "args": ["acp"]
     }
   }
@@ -36,10 +36,10 @@ Open **Settings** (`Cmd+,`) and add:
 ```json
 {
   "agent_servers": {
-    "Shux": {
+    "Xum": {
       "type": "custom",
       "command": "npx",
-      "args": ["-y", "@coder/shux", "acp"]
+      "args": ["-y", "@coder/xum", "acp"]
     }
   }
 }
@@ -54,21 +54,21 @@ Pass `--server-url` and `--auth-token` in `args`:
 ```json
 {
   "agent_servers": {
-    "Shux": {
+    "Xum": {
       "type": "custom",
-      "command": "shux",
-      "args": ["acp", "--server-url", "https://shux.example.com", "--auth-token", "<token>"]
+      "command": "xum",
+      "args": ["acp", "--server-url", "https://xum.example.com", "--auth-token", "<token>"]
     }
   }
 }
 ```
 
-Or set environment variables for any `shux acp` process:
+Or set environment variables for any `xum acp` process:
 
 ```bash
-SHUX_SERVER_URL=https://shux.example.com \
-SHUX_SERVER_AUTH_TOKEN=<token> \
-shux acp
+XUM_SERVER_URL=https://xum.example.com \
+XUM_SERVER_AUTH_TOKEN=<token> \
+xum acp
 ```
 
 ## Neovim
@@ -83,19 +83,19 @@ v17.18. Add the adapter in your `lazy.nvim` config:
 ```lua
 require("codecompanion").setup({
   adapters = {
-    shux = function()
+    xum = function()
       return require("codecompanion.adapters").extend("acp", {
-        name = "shux",
+        name = "xum",
         schema = {
-          model = { default = "shux" },
+          model = { default = "xum" },
         },
-        args = { "shux", "acp" },
+        args = { "xum", "acp" },
       })
     end,
   },
   strategies = {
-    chat = { adapter = "shux" },
-    inline = { adapter = "shux" },
+    chat = { adapter = "xum" },
+    inline = { adapter = "xum" },
   },
 })
 ```
@@ -114,8 +114,8 @@ Requires Neovim 0.11 or newer. Add via `lazy.nvim`:
   "carlos-algms/agentic.nvim",
   opts = {
     agents = {
-      shux = {
-        cmd = "shux",
+      xum = {
+        cmd = "xum",
         args = { "acp" },
       },
     },
@@ -129,13 +129,13 @@ JetBrains ACP support requires the **AI Assistant** plugin (2025.3 or newer).
 
 1. Open the **AI Chat** tool window
 2. Click **More** (`...`) then **Add Custom Agent**
-3. Add the Shux entry to the `acp.json` that opens:
+3. Add the Xum entry to the `acp.json` that opens:
 
 ```json
 {
   "agent_servers": {
-    "Shux": {
-      "command": "shux",
+    "Xum": {
+      "command": "xum",
       "args": ["acp"]
     }
   }
@@ -149,27 +149,27 @@ information.
 
 ## Flags and environment variables
 
-| Flag                   | Environment variable     | Description                                                                |
-| ---------------------- | ------------------------ | -------------------------------------------------------------------------- |
-| `--server-url <url>`   | `SHUX_SERVER_URL`        | URL of a running Shux server                                               |
-| `--auth-token <token>` | `SHUX_SERVER_AUTH_TOKEN` | Bearer token for authenticated connections                                 |
-| `--log-file <path>`    | —                        | Write ACP logs to a file (useful when your editor hides subprocess stderr) |
+| Flag                   | Environment variable    | Description                                                                |
+| ---------------------- | ----------------------- | -------------------------------------------------------------------------- |
+| `--server-url <url>`   | `XUM_SERVER_URL`        | URL of a running Xum server                                                |
+| `--auth-token <token>` | `XUM_SERVER_AUTH_TOKEN` | Bearer token for authenticated connections                                 |
+| `--log-file <path>`    | —                       | Write ACP logs to a file (useful when your editor hides subprocess stderr) |
 
-<Warning>`SHUX_AUTH_TOKEN` is not read by `shux acp`. Use `SHUX_SERVER_AUTH_TOKEN`.</Warning>
+<Warning>`XUM_AUTH_TOKEN` is not read by `xum acp`. Use `XUM_SERVER_AUTH_TOKEN`.</Warning>
 
-If no `--server-url` is provided, `shux acp` first attempts to discover a running server via the
-lockfile in `~/.shux/`, then starts an in-process server automatically when needed.
+If no `--server-url` is provided, `xum acp` first attempts to discover a running server via the
+lockfile in `~/.xum/`, then starts an in-process server automatically when needed.
 
 ## Troubleshooting
 
-- **Logs hidden by your editor:** use `--log-file /tmp/shux-acp.log` to capture ACP stderr output.
-- **Connection refused:** ensure Shux is running (`shux server` or the desktop app), or omit
+- **Logs hidden by your editor:** use `--log-file /tmp/xum-acp.log` to capture ACP stderr output.
+- **Connection refused:** ensure Xum is running (`xum server` or the desktop app), or omit
   `--server-url` to let ACP auto-start in-process.
 - **Tool calls are not delegated:** the editor must advertise filesystem or terminal capabilities,
   and the workspace must use `local` runtime mode.
 
 ## Related
 
-- [CLI Reference — `shux acp`](/reference/cli#shux-acp)
+- [CLI Reference — `xum acp`](/reference/cli#xum-acp)
 - [VS Code Extension](/integrations/vscode-extension)
 - [Workspaces](/workspaces)

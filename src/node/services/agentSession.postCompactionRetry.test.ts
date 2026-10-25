@@ -1,18 +1,28 @@
 import { describe, expect, test, mock, afterEach, spyOn } from "bun:test";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
-import * as os from "os";
 import * as path from "path";
 
-import { AgentSession } from "./agentSession";
-import type { Config } from "@/node/config";
-import type { AIService } from "./aiService";
-import type { InitStateManager } from "./initStateManager";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
+import { Err } from "@/common/types/result";
 
 import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createTestHistoryService } from "./testHistoryService";
+import {
+  createAgentSessionHarness,
+  createFailedTurnHandle,
+  createStartedTurnHandle,
+} from "./agentSession.testHarness";
+
+function contextExceededResult(messageId: string) {
+  return {
+    success: true as const,
+    data: createFailedTurnHandle(messageId, {
+      error: "Context length exceeded",
+      errorType: "context_exceeded",
+    }),
+  };
+}
 
 function createPersistedPostCompactionState(options: {
   filePath: string;
@@ -33,9 +43,18 @@ describe("AgentSession post-compaction context retry", () => {
     await historyCleanup?.();
   });
 
+  /** Real Config/HistoryService pair plus this workspace's session dir. */
+  async function createSessionsFixture(workspaceId: string) {
+    const { historyService, config, cleanup } = await createTestHistoryService();
+    historyCleanup = cleanup;
+    const sessionDir = path.join(config.sessionsDir, workspaceId);
+    await fsPromises.mkdir(sessionDir, { recursive: true });
+    return { historyService, config, sessionDir };
+  }
+
   test("retries once without post-compaction injection on context_exceeded", async () => {
     const workspaceId = "ws";
-    const sessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
     const postCompactionPath = path.join(sessionDir, "post-compaction.json");
 
     await createPersistedPostCompactionState({
@@ -64,8 +83,6 @@ describe("AgentSession post-compaction context retry", () => {
       },
     ];
 
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
     for (const msg of history) {
       await historyService.appendToHistory(workspaceId, msg);
     }
@@ -91,53 +108,26 @@ describe("AgentSession post-compaction context retry", () => {
           errorType: "context_exceeded",
         });
 
-        return Promise.resolve({ success: true as const, data: undefined });
+        return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
       }
 
       resolveSecondCall?.();
-      return Promise.resolve({ success: true as const, data: undefined });
+      return Promise.resolve({
+        success: true as const,
+        data: createStartedTurnHandle(session.closingSignal, "assistant-retry"),
+      });
     });
 
-    const aiService: AIService = {
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.on(String(eventName), listener);
-        return this;
-      },
-      off(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.off(String(eventName), listener);
-        return this;
-      },
-      streamMessage,
-      getWorkspaceMetadata: mock(() => Promise.resolve({ success: false as const, error: "nope" })),
-      stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-    } as unknown as AIService;
-
-    const initStateManager: InitStateManager = {
-      on() {
-        return this;
-      },
-      off() {
-        return this;
-      },
-    } as unknown as InitStateManager;
-
-    const backgroundProcessManager: BackgroundProcessManager = {
-      setMessageQueued: mock(() => undefined),
-      cleanup: mock(() => Promise.resolve()),
-    } as unknown as BackgroundProcessManager;
-
-    const config: Config = {
-      srcDir: "/tmp",
-      getSessionDir: mock(() => sessionDir),
-    } as unknown as Config;
-
-    const session = new AgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage,
+        // No workspace metadata: the retry path must not depend on a runtime.
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
     });
 
     const options: SendMessageOptions = {
@@ -145,12 +135,8 @@ describe("AgentSession post-compaction context retry", () => {
       agentId: "exec",
     } as unknown as SendMessageOptions;
 
-    // Call streamWithHistory directly (private) to avoid needing a full user send pipeline.
-    await (
-      session as unknown as {
-        streamWithHistory: (m: string, o: SendMessageOptions) => Promise<unknown>;
-      }
-    ).streamWithHistory(options.model, options);
+    // Exercise the public resume facade so retry preparation has a real admitted owner.
+    await session.resumeStream(options);
 
     // Wait for the retry call to happen.
     await Promise.race([
@@ -193,7 +179,7 @@ describe("AgentSession post-compaction context retry", () => {
     }
     expect(exists).toBe(false);
 
-    session.dispose();
+    await session.dispose();
   });
 
   // Waiters (task/workspace-turn stream-error settlement) treat the resolved
@@ -202,14 +188,12 @@ describe("AgentSession post-compaction context retry", () => {
   // event) leave a child task running until the parent times out.
   test("recovery decision resolves only after the context retry startup outcome is known", async () => {
     const workspaceId = "ws-decision";
-    const sessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
     await createPersistedPostCompactionState({
       filePath: path.join(sessionDir, "post-compaction.json"),
       diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
     });
 
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
     await historyService.appendToHistory(workspaceId, {
       id: "user-1",
       role: "user",
@@ -237,7 +221,7 @@ describe("AgentSession post-compaction context retry", () => {
           error: "Context length exceeded",
           errorType: "context_exceeded",
         });
-        return { success: true as const, data: undefined };
+        return contextExceededResult("assistant-ctx-exceeded");
       }
       // Retry startup in flight: hold it until the test releases, then fail
       // pre-stream (e.g. commitPartial / history read failure).
@@ -249,47 +233,16 @@ describe("AgentSession post-compaction context retry", () => {
       };
     });
 
-    const aiService: AIService = {
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.on(String(eventName), listener);
-        return this;
-      },
-      off(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.off(String(eventName), listener);
-        return this;
-      },
-      streamMessage,
-      getWorkspaceMetadata: mock(() => Promise.resolve({ success: false as const, error: "nope" })),
-      stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-      isStreaming: mock(() => false),
-    } as unknown as AIService;
-
-    const initStateManager: InitStateManager = {
-      on() {
-        return this;
-      },
-      off() {
-        return this;
-      },
-    } as unknown as InitStateManager;
-
-    const backgroundProcessManager: BackgroundProcessManager = {
-      setMessageQueued: mock(() => undefined),
-      cleanup: mock(() => Promise.resolve()),
-    } as unknown as BackgroundProcessManager;
-
-    const config: Config = {
-      srcDir: "/tmp",
-      getSessionDir: mock(() => sessionDir),
-    } as unknown as Config;
-
-    const session = new AgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage,
+        // No workspace metadata: the retry path must not depend on a runtime.
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
     });
 
     const options: SendMessageOptions = {
@@ -297,11 +250,7 @@ describe("AgentSession post-compaction context retry", () => {
       agentId: "exec",
     } as unknown as SendMessageOptions;
 
-    await (
-      session as unknown as {
-        streamWithHistory: (m: string, o: SendMessageOptions) => Promise<unknown>;
-      }
-    ).streamWithHistory(options.model, options);
+    await session.resumeStream(options);
 
     // The error event began a recovery decision and kicked off the retry.
     await Promise.race([
@@ -336,7 +285,7 @@ describe("AgentSession post-compaction context retry", () => {
     expect(session.isPreparingTurn()).toBe(false);
     expect(callCount).toBe(2);
 
-    session.dispose();
+    await session.dispose();
   });
 
   // Overlapping recovery episodes: a retry stream can emit its own error
@@ -346,14 +295,12 @@ describe("AgentSession post-compaction context retry", () => {
   // settlement convinced the (dead) retry is still carrying the turn.
   test("a retry that starts and then fails terminally records separate per-attempt outcomes", async () => {
     const workspaceId = "ws-overlap";
-    const sessionDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "mux-agentSession-"));
+    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
     await createPersistedPostCompactionState({
       filePath: path.join(sessionDir, "post-compaction.json"),
       diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
     });
 
-    const { historyService, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
     await historyService.appendToHistory(workspaceId, {
       id: "user-1",
       role: "user",
@@ -372,7 +319,7 @@ describe("AgentSession post-compaction context retry", () => {
           error: "Context length exceeded",
           errorType: "context_exceeded",
         });
-        return Promise.resolve({ success: true as const, data: undefined });
+        return Promise.resolve(contextExceededResult("assistant-attempt-1"));
       }
       // The retry's startup succeeds, but the stream dies immediately with a
       // terminal error — emitted before the original retry path resumes.
@@ -382,50 +329,25 @@ describe("AgentSession post-compaction context retry", () => {
         error: "The model refused to continue",
         errorType: "model_refusal",
       });
-      return Promise.resolve({ success: true as const, data: undefined });
+      return Promise.resolve({
+        success: true as const,
+        data: createFailedTurnHandle("assistant-attempt-2", {
+          error: "The model refused to continue",
+          errorType: "model_refusal",
+        }),
+      });
     });
 
-    const aiService: AIService = {
-      on(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.on(String(eventName), listener);
-        return this;
-      },
-      off(eventName: string | symbol, listener: (...args: unknown[]) => void) {
-        aiEmitter.off(String(eventName), listener);
-        return this;
-      },
-      streamMessage,
-      getWorkspaceMetadata: mock(() => Promise.resolve({ success: false as const, error: "nope" })),
-      stopStream: mock(() => Promise.resolve({ success: true as const, data: undefined })),
-      isStreaming: mock(() => false),
-    } as unknown as AIService;
-
-    const initStateManager: InitStateManager = {
-      on() {
-        return this;
-      },
-      off() {
-        return this;
-      },
-    } as unknown as InitStateManager;
-
-    const backgroundProcessManager: BackgroundProcessManager = {
-      setMessageQueued: mock(() => undefined),
-      cleanup: mock(() => Promise.resolve()),
-    } as unknown as BackgroundProcessManager;
-
-    const config: Config = {
-      srcDir: "/tmp",
-      getSessionDir: mock(() => sessionDir),
-    } as unknown as Config;
-
-    const session = new AgentSession({
+    const { session } = await createAgentSessionHarness({
       workspaceId,
       config,
       historyService,
-      aiService,
-      initStateManager,
-      backgroundProcessManager,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage,
+        // No workspace metadata: the retry path must not depend on a runtime.
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
     });
 
     const options: SendMessageOptions = {
@@ -433,11 +355,7 @@ describe("AgentSession post-compaction context retry", () => {
       agentId: "exec",
     } as unknown as SendMessageOptions;
 
-    await (
-      session as unknown as {
-        streamWithHistory: (m: string, o: SendMessageOptions) => Promise<unknown>;
-      }
-    ).streamWithHistory(options.model, options);
+    await session.resumeStream(options);
 
     const withTimeout = <T>(promise: Promise<T>, label: string): Promise<T> =>
       Promise.race([
@@ -463,6 +381,6 @@ describe("AgentSession post-compaction context retry", () => {
     ).toBe("terminal");
     expect(callCount).toBe(2);
 
-    session.dispose();
+    await session.dispose();
   });
 });

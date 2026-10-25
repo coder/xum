@@ -4,7 +4,6 @@ import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit
 
 const OPTIONS = {
   providersConfig: null,
-  policy: null,
   routePriority: ["direct"],
   routeOverrides: {},
 };
@@ -76,7 +75,6 @@ describe("checkContextSwitch", () => {
           models: [{ id: "custom-context-model", contextWindowTokens: 100_000 }],
         },
       },
-      policy: null,
       routePriority: ["direct"],
       routeOverrides: {},
     });
@@ -107,8 +105,8 @@ describe("checkContextSwitch", () => {
     expect(warning?.targetModel).toBe(targetModel);
   });
 
-  test("still suppresses passthrough gateway aliases of the same model", () => {
-    const targetModel = "mux-gateway:openai/gpt-5.2-codex";
+  test("still suppresses gateway aliases that normalize to the same model", () => {
+    const targetModel = "openrouter:openai/gpt-5.2-codex";
     const canonical = "openai:gpt-5.2-codex";
     const limit = getEffectiveContextLimit(canonical, false);
     expect(limit).not.toBeNull();

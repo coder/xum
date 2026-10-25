@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
 import assert from "node:assert";
 
-import { getShuxHome } from "shux/common/constants/paths";
-import { ServerLockfile } from "shux/node/services/serverLockfile";
+import { getXumHome } from "xum/common/constants/paths";
+import { ServerLockfile } from "xum/node/services/serverLockfile";
 
-import { getAllWorkspacesFromApi } from "../shuxConfig";
+import { getAllWorkspacesFromApi } from "../xumConfig";
 import { createApiClient } from "./client";
 import { checkAuth, checkServerReachable } from "./connectionCheck";
 
@@ -14,7 +14,7 @@ const integrationTestOrSkip = integrationTest ? test : test.skip;
 integrationTestOrSkip(
   "connects to mux oRPC server (via lockfile discovery) and lists workspaces",
   async () => {
-    const lockfile = new ServerLockfile(getShuxHome());
+    const lockfile = new ServerLockfile(getXumHome());
     const lock = await lockfile.read();
 
     assert(

@@ -28,12 +28,12 @@ const IS_PRODUCTION = BUNDLED_LIB_DIR != null;
 const LIB_DIR = BUNDLED_LIB_DIR ?? path.dirname(require.resolve("typescript/lib/lib.d.ts"));
 
 export const WRAPPER_PREFIX = "function __agent__() {\n";
-const SHUX_TYPES_FILE = "shux.d.ts";
-const ROOT_FILE_NAMES = ["agent.ts", SHUX_TYPES_FILE];
+const XUM_TYPES_FILE = "xum.d.ts";
+const ROOT_FILE_NAMES = ["agent.ts", XUM_TYPES_FILE];
 
-// Cache lib and shux type SourceFiles across validations to avoid re-parsing.
+// Cache lib and xum type SourceFiles across validations to avoid re-parsing.
 const libSourceFileCache = new Map<string, ts.SourceFile>();
-const shuxSourceFileCache = new Map<string, ts.SourceFile>();
+const xumSourceFileCache = new Map<string, ts.SourceFile>();
 
 function wrapAgentCode(code: string): string {
   return `${WRAPPER_PREFIX}${code}\n}\n`;
@@ -59,16 +59,13 @@ function getCachedLibSourceFile(
   return sourceFile;
 }
 
-function getCachedShuxSourceFile(
-  shuxTypes: string,
-  languageVersion: ts.ScriptTarget
-): ts.SourceFile {
-  const key = `${languageVersion}:${shuxTypes}`;
-  const cached = shuxSourceFileCache.get(key);
+function getCachedXumSourceFile(xumTypes: string, languageVersion: ts.ScriptTarget): ts.SourceFile {
+  const key = `${languageVersion}:${xumTypes}`;
+  const cached = xumSourceFileCache.get(key);
   if (cached) return cached;
 
-  const sourceFile = ts.createSourceFile(SHUX_TYPES_FILE, shuxTypes, languageVersion, true);
-  shuxSourceFileCache.set(key, sourceFile);
+  const sourceFile = ts.createSourceFile(XUM_TYPES_FILE, xumTypes, languageVersion, true);
+  xumSourceFileCache.set(key, sourceFile);
   return sourceFile;
 }
 /** Resolve lib file path, accounting for .d.ts rename in production */
@@ -80,7 +77,7 @@ const resolveLibPath = (fileName: string): string => {
 
 function createProgramForCode(
   wrappedCode: string,
-  shuxTypes: string,
+  xumTypes: string,
   compilerOptions: ts.CompilerOptions
 ): {
   program: ts.Program;
@@ -90,7 +87,7 @@ function createProgramForCode(
 } {
   const scriptTarget = compilerOptions.target ?? ts.ScriptTarget.ES2020;
   let sourceFile = ts.createSourceFile("agent.ts", wrappedCode, scriptTarget, true);
-  const shuxSourceFile = getCachedShuxSourceFile(shuxTypes, scriptTarget);
+  const xumSourceFile = getCachedXumSourceFile(xumTypes, scriptTarget);
   const setSourceFile = (newWrappedCode: string) => {
     sourceFile = ts.createSourceFile("agent.ts", newWrappedCode, scriptTarget, true);
   };
@@ -109,7 +106,7 @@ function createProgramForCode(
     const target =
       typeof languageVersionOrOptions === "number" ? languageVersionOrOptions : scriptTarget;
     if (fileName === "agent.ts") return sourceFile;
-    if (fileName === SHUX_TYPES_FILE) return shuxSourceFile;
+    if (fileName === XUM_TYPES_FILE) return xumSourceFile;
 
     const isLibFile = fileName.includes("lib.") && fileName.endsWith(".d.ts");
     if (isLibFile) {
@@ -131,7 +128,7 @@ function createProgramForCode(
     );
   };
   host.fileExists = (fileName) => {
-    if (fileName === "agent.ts" || fileName === SHUX_TYPES_FILE) return true;
+    if (fileName === "agent.ts" || fileName === XUM_TYPES_FILE) return true;
     // In production, check bundled lib directory for lib files
     if (IS_PRODUCTION && fileName.includes("lib.") && fileName.endsWith(".d.ts")) {
       return fs.existsSync(resolveLibPath(fileName));
@@ -139,7 +136,7 @@ function createProgramForCode(
     return originalFileExists(fileName);
   };
   host.readFile = (fileName) => {
-    if (fileName === SHUX_TYPES_FILE) return shuxTypes;
+    if (fileName === XUM_TYPES_FILE) return xumTypes;
     // In production, read lib files from bundled directory
     if (IS_PRODUCTION && fileName.includes("lib.") && fileName.endsWith(".d.ts")) {
       const libPath = resolveLibPath(fileName);
@@ -186,10 +183,10 @@ export interface TypeValidationResult {
 }
 
 /**
- * Validate JavaScript code against shux type definitions using TypeScript.
+ * Validate JavaScript code against xum type definitions using TypeScript.
  *
  * @param code - JavaScript code to validate
- * @param shuxTypes - Generated `.d.ts` content from generateShuxTypes()
+ * @param xumTypes - Generated `.d.ts` content from generateXumTypes()
  * @returns Validation result with errors if any
  */
 
@@ -268,10 +265,10 @@ function getEnclosingFunctionLikeContainer(node: ts.Node, sourceFile: ts.SourceF
  * We track by Symbol (not identifier text) so shadowed variables don't leak
  * bag-ness across scopes.
  *
- * Excludes `shux`/`mux` to preserve shadowing detection.
+ * Excludes `xum`/`mux` to preserve shadowing detection.
  */
 function isScriptingNamespaceName(name: string): boolean {
-  return name === "shux" || name === "mux";
+  return name === "xum" || name === "mux";
 }
 
 function findDynamicEmptyObjectBagFirstWritePosByContainer(
@@ -550,7 +547,7 @@ function preprocessEmptyArrays(code: string, neverArrayStarts: Set<number>): str
   return result;
 }
 
-export function validateTypes(code: string, shuxTypes: string): TypeValidationResult {
+export function validateTypes(code: string, xumTypes: string): TypeValidationResult {
   const compilerOptions: ts.CompilerOptions = {
     noEmit: true,
     strict: false, // Don't require explicit types on everything
@@ -571,7 +568,7 @@ export function validateTypes(code: string, shuxTypes: string): TypeValidationRe
     host,
     getSourceFile,
     setSourceFile,
-  } = createProgramForCode(originalWrappedCode, shuxTypes, compilerOptions);
+  } = createProgramForCode(originalWrappedCode, xumTypes, compilerOptions);
   const originalSourceFile = getSourceFile();
   const neverArrayStarts = getNeverArrayLiteralStarts(
     code,
@@ -581,7 +578,7 @@ export function validateTypes(code: string, shuxTypes: string): TypeValidationRe
   const preprocessedCode = preprocessEmptyArrays(code, neverArrayStarts);
 
   // Wrap code in function to allow return statements (matches runtime behavior)
-  // Note: We don't use async because Asyncify makes shux.* calls appear synchronous
+  // Note: We don't use async because Asyncify makes xum.* calls appear synchronous
   // Types live in a separate virtual file so error line numbers match agent code directly.
   const wrappedCode = wrapAgentCode(preprocessedCode);
 
@@ -613,13 +610,13 @@ export function validateTypes(code: string, shuxTypes: string): TypeValidationRe
     .filter((d) => !d.file || d.file.fileName === "agent.ts")
     .filter((d) => !ts.flattenDiagnosticMessageText(d.messageText, "").includes("console"))
     // Allow dynamic property WRITES on empty object literals - Claude frequently uses
-    // `const results = {}; results.foo = shux.file_read(...)` to collate parallel reads.
+    // `const results = {}; results.foo = xum.file_read(...)` to collate parallel reads.
     // Only suppress when the property access is on the LEFT side of an assignment.
     .filter((d) => !isEmptyObjectWriteError(d, sourceFile))
     // Allow dot-notation READS on variables that are "dynamic bags" (empty literal + bracket
     // writes). These are valid JS patterns like `r[key] = val; return r.key` that TS can't
     // track. Does NOT suppress reads on plain `{}` without bracket writes (catches typos),
-    // union types containing `{}`, or `shux`/`mux` shadowing.
+    // union types containing `{}`, or `xum`/`mux` shadowing.
     .filter(
       (d) => !isDynamicBagReadError(d, sourceFile, checker, dynamicBagFirstWritePosByContainer)
     )
@@ -631,7 +628,7 @@ export function validateTypes(code: string, shuxTypes: string): TypeValidationRe
         // TS line is 0-indexed. Wrapper adds 1 line before agent code, so:
         // TS line 0 = wrapper, TS line 1 = agent line 1, TS line 2 = agent line 2, etc.
         // This means TS 0-indexed line number equals agent 1-indexed line number.
-        // Only report if within agent code bounds (filter out wrapper and shuxTypes)
+        // Only report if within agent code bounds (filter out wrapper and xumTypes)
         const agentCodeLines = code.split("\n").length;
         if (line >= 1 && line <= agentCodeLines) {
           return { message, line, column: character + 1 };

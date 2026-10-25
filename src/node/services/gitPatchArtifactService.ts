@@ -1,8 +1,8 @@
 import * as path from "node:path";
+import { isProjectTrustedIn } from "@/node/utils/projectTrust";
 import assert from "node:assert/strict";
-import * as fsPromises from "fs/promises";
 
-import type { Config } from "@/node/config";
+import type { Config, ProjectsConfig } from "@/node/config";
 import type {
   SubagentGitPatchArtifact,
   SubagentGitProjectPatchArtifact,
@@ -15,6 +15,7 @@ import {
   findWorkspaceEntry,
 } from "@/node/services/taskUtils";
 import { log } from "@/node/services/log";
+import { isActiveWorkspaceTurnTaskStatus } from "@/node/services/taskHandleStore";
 import { readAgentDefinition } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isExecLikeEditingCapableInResolvedChain } from "@/common/utils/agentTools";
@@ -33,14 +34,18 @@ import {
   upsertSubagentGitPatchArtifact,
 } from "@/node/services/subagentGitPatchArtifacts";
 import { shellQuote } from "@/common/utils/shell";
-import { streamToString } from "@/node/runtime/streamUtils";
 import { getErrorMessage } from "@/common/utils/errors";
 import { PlatformPaths } from "@/common/utils/paths";
+import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import {
   getWorkspaceProjectRepos,
   getWorkspaceProjectStorageKeys,
 } from "@/node/services/workspaceProjectRepos";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { taskGitPatchEngine } from "@/node/services/taskGitPatchEngine";
+// Outside the agent loop: GitPatchArtifactService passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /** Callback invoked after patch generation completes (success or failure). */
 export type OnPatchGenerationComplete = (childWorkspaceId: string) => Promise<void>;
@@ -54,34 +59,7 @@ function isPathInsideDir(dirPath: string, filePath: string): boolean {
   );
 }
 
-async function writeReadableStreamToLocalFile(
-  stream: ReadableStream<Uint8Array>,
-  filePath: string
-): Promise<void> {
-  assert(filePath.length > 0, "writeReadableStreamToLocalFile: filePath must be non-empty");
-
-  await fsPromises.mkdir(path.dirname(filePath), { recursive: true });
-
-  const fileHandle = await fsPromises.open(filePath, "w");
-  try {
-    const reader = stream.getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value) {
-          await fileHandle.write(value);
-        }
-      }
-    } finally {
-      reader.releaseLock();
-    }
-  } finally {
-    await fileHandle.close();
-  }
-}
-
-function getPrimaryProjectName(projectPath: string, projects?: ProjectRef[]): string {
+export function getPrimaryProjectName(projectPath: string, projects?: ProjectRef[]): string {
   const matchingProjectName = projects
     ?.find((project) => project.projectPath.trim() === projectPath.trim())
     ?.projectName?.trim();
@@ -126,6 +104,7 @@ async function resolveAgentEditingCapability(args: {
   discoveryContexts: readonly WorkspaceRuntimeContext[];
   agentId: string;
   workspaceId: string;
+  projectPluginsTrusted: boolean;
 }): Promise<{ editingCapable: boolean; projectScoped: boolean } | undefined> {
   const parsedAgentId = AgentIdSchema.safeParse(args.agentId);
   if (!parsedAgentId.success) {
@@ -139,7 +118,8 @@ async function resolveAgentEditingCapability(args: {
       const agentDefinition = await readAgentDefinition(
         discovery.runtime,
         discovery.workspacePath,
-        parsedAgentId.data
+        parsedAgentId.data,
+        { projectPluginsTrusted: args.projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
       );
       const chain = await resolveAgentInheritanceChain({
         runtime: discovery.runtime,
@@ -147,6 +127,8 @@ async function resolveAgentEditingCapability(args: {
         agentId: agentDefinition.id,
         agentDefinition,
         workspaceId: args.workspaceId,
+        projectPluginsTrusted: args.projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
 
       if (agentDefinition.scope === "project") {
@@ -169,7 +151,7 @@ async function resolveAgentEditingCapability(args: {
       };
 }
 
-function buildTaskBaseCommitShaByProjectPath(params: {
+export function buildTaskBaseCommitShaByProjectPath(params: {
   projectPath: string;
   projects?: ProjectRef[];
   taskBaseCommitSha?: string;
@@ -340,7 +322,11 @@ export class GitPatchArtifactService {
   private readonly operationLocks = new MutexMap<string>();
   private readonly pendingJobsByTaskId = new Map<string, Promise<void>>();
 
-  constructor(private readonly config: Config) {}
+  constructor(
+    private readonly config: Config,
+    /** The workspace FIFO of the parent's patch artifact index writes (phase 4: SessionLocks). */
+    private readonly locks: SessionLocks
+  ) {}
 
   withOperationLock<T>(childWorkspaceId: string, operation: () => Promise<T>): Promise<T> {
     assert(childWorkspaceId.length > 0, "withOperationLock: childWorkspaceId must be non-empty");
@@ -358,12 +344,14 @@ export class GitPatchArtifactService {
    *
    * @param onComplete - called after generation finishes (success *or* failure),
    *   typically used to trigger reported-leaf-task cleanup.
+   * @param options.config - config snapshot to resolve the child/parent entries from; callers that
+   *   iterate many tasks (startup recovery) pass one instead of reloading config.json per task.
    */
   async maybeStartGeneration(
     parentWorkspaceId: string,
     childWorkspaceId: string,
     onComplete: OnPatchGenerationComplete,
-    options?: { refreshForContinuation?: boolean }
+    options?: { refreshForContinuation?: boolean; config?: ProjectsConfig }
   ): Promise<void> {
     return await this.withOperationLock(childWorkspaceId, async () => {
       await this.maybeStartGenerationUnlocked(
@@ -379,7 +367,7 @@ export class GitPatchArtifactService {
     parentWorkspaceId: string,
     childWorkspaceId: string,
     onComplete: OnPatchGenerationComplete,
-    options?: { refreshForContinuation?: boolean }
+    options?: { refreshForContinuation?: boolean; config?: ProjectsConfig }
   ): Promise<void> {
     assert(
       parentWorkspaceId.length > 0,
@@ -394,22 +382,32 @@ export class GitPatchArtifactService {
       await this.waitForGeneration(childWorkspaceId);
     }
 
-    const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
+    const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
+    const existingArtifact = await readSubagentGitPatchArtifact(parentSessionDir, childWorkspaceId);
+    // Only continuations regenerate settled artifacts; skip discovery and rewrites on restart.
+    if (
+      options?.refreshForContinuation !== true &&
+      existingArtifact != null &&
+      existingArtifact.status !== "pending"
+    ) {
+      return;
+    }
 
     // Write a pending marker before we attempt cleanup, so the reported task workspace isn't deleted
     // while we're still reading commits from it.
     const nowMs = Date.now();
-    const cfg = this.config.loadConfigOrDefault();
+    const cfg = options?.config ?? this.config.loadConfigOrDefault();
     const childEntry = findWorkspaceEntry(cfg, childWorkspaceId);
 
-    if (childEntry?.workspace.kind === "scratch") {
+    // No entry: no persisted agent id, so no patch (#6426 narrows it once for the trust read).
+    if (childEntry == null || childEntry.workspace.kind === "scratch") {
       return;
     }
 
     // Only exec-like subagents are expected to make commits that should be handed back to the parent.
     // NOTE: Custom agents can inherit from exec (base: exec). Those should also generate patches,
     // but read-only subagents (e.g. explore) should not.
-    const childAgentIds = resolvePersistedAgentIdCandidates(childEntry?.workspace);
+    const childAgentIds = resolvePersistedAgentIdCandidates(childEntry.workspace);
     if (childAgentIds.length === 0) {
       return;
     }
@@ -425,6 +423,8 @@ export class GitPatchArtifactService {
         discoveryContexts,
         agentId: childAgentId,
         workspaceId: childWorkspaceId,
+        // #6426: from the config loaded above (no extra read).
+        projectPluginsTrusted: isProjectTrustedIn(cfg.projects, childEntry.projectPath),
       });
       if (editingCapability == null) {
         continue;
@@ -433,8 +433,22 @@ export class GitPatchArtifactService {
       break;
     }
 
-    if (!shouldGeneratePatch || !childEntry) {
+    if (!shouldGeneratePatch) {
       return;
+    }
+
+    if (options?.config != null) {
+      // The caller's snapshot can predate a client removing or reactivating this task. Only a
+      // task with no artifact yet or a crash-left pending one would actually be generated below
+      // (a completed artifact is left untouched), so re-read config for exactly those. A removed
+      // task gets no artifact, and a reactivated one (live execution handle, so its checkout is
+      // changing again) is left to the continuation refresh that runs when that execution settles.
+      if (existingArtifact == null || existingArtifact.status === "pending") {
+        const live = findWorkspaceEntry(this.config.loadConfigOrDefault(), childWorkspaceId);
+        if (live == null || isActiveWorkspaceTurnTaskStatus(live.workspace.taskExecutionStatus)) {
+          return;
+        }
+      }
     }
 
     const pendingProjectArtifacts = buildPendingProjectArtifacts({
@@ -446,6 +460,7 @@ export class GitPatchArtifactService {
 
     const artifact = await upsertSubagentGitPatchArtifact({
       workspaceId: parentWorkspaceId,
+      locks: this.locks,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childWorkspaceId,
       updater: (existing) => {
@@ -495,6 +510,7 @@ export class GitPatchArtifactService {
           try {
             await upsertSubagentGitPatchArtifact({
               workspaceId: parentWorkspaceId,
+              locks: this.locks,
               workspaceSessionDir: parentSessionDir,
               childTaskId: childWorkspaceId,
               updater: (existing) => {
@@ -529,6 +545,7 @@ export class GitPatchArtifactService {
     } catch (error: unknown) {
       await upsertSubagentGitPatchArtifact({
         workspaceId: parentWorkspaceId,
+        locks: this.locks,
         workspaceSessionDir: parentSessionDir,
         childTaskId: childWorkspaceId,
         updater: (existing) => {
@@ -574,13 +591,14 @@ export class GitPatchArtifactService {
     assert(parentWorkspaceId.length > 0, "generate: parentWorkspaceId must be non-empty");
     assert(childWorkspaceId.length > 0, "generate: childWorkspaceId must be non-empty");
 
-    const parentSessionDir = this.config.getSessionDir(parentWorkspaceId);
+    const parentSessionDir = path.join(this.config.sessionsDir, parentWorkspaceId);
 
     const updateArtifact = async (
       updater: Parameters<typeof upsertSubagentGitPatchArtifact>[0]["updater"]
     ): Promise<SubagentGitPatchArtifact> => {
       return await upsertSubagentGitPatchArtifact({
         workspaceId: parentWorkspaceId,
+        locks: this.locks,
         workspaceSessionDir: parentSessionDir,
         childTaskId: childWorkspaceId,
         updater,
@@ -663,7 +681,8 @@ export class GitPatchArtifactService {
         return;
       }
 
-      const fallbackName = workspacePath.split("/").pop() ?? workspacePath.split("\\").pop() ?? "";
+      // process.platform aware: the common helper reads navigator, which Node 20 lacks (#6714).
+      const fallbackName = NodePlatformPaths.basename(workspacePath);
       const workspaceName = coerceNonEmptyString(ws.name) ?? coerceNonEmptyString(fallbackName);
       if (!workspaceName) {
         await updateArtifact((existing) =>
@@ -696,6 +715,8 @@ export class GitPatchArtifactService {
       });
 
       const projectRepos = getWorkspaceProjectRepos({
+        // Outside the agent loop: the host's runtimes.
+        runtimeFactory: nodeRuntimeFactory,
         workspaceId: childWorkspaceId,
         workspaceName,
         workspacePath,
@@ -866,23 +887,14 @@ export class GitPatchArtifactService {
             continue;
           }
 
-          const formatPatchStream = await runtime.exec(
-            `git format-patch --stdout --binary ${baseCommitSha}..${headCommitSha}`,
-            { cwd: projectRepo.repoCwd, timeout: 120 }
-          );
-          await formatPatchStream.stdin.close();
-
-          const stderrPromise = streamToString(formatPatchStream.stderr);
-          const writePromise = writeReadableStreamToLocalFile(formatPatchStream.stdout, patchPath);
-
-          const [exitCode, stderr] = await Promise.all([
-            formatPatchStream.exitCode,
-            stderrPromise,
-            writePromise,
-          ]);
-
-          if (exitCode !== 0) {
-            await fsPromises.rm(patchPath, { force: true });
+          const generation = await taskGitPatchEngine.generatePatch({
+            runtime,
+            repoCwd: projectRepo.repoCwd,
+            baseCommitSha,
+            headCommitSha,
+            patchPath,
+          });
+          if (!generation.success) {
             await ensureProjectArtifact({
               projectPath: projectRepo.projectPath,
               projectName: projectRepo.projectName,
@@ -891,7 +903,7 @@ export class GitPatchArtifactService {
               baseCommitSha,
               headCommitSha,
               commitCount,
-              error: `git format-patch failed (exitCode=${exitCode}): ${stderr.trim() || "unknown error"}`,
+              error: generation.error,
             });
             continue;
           }

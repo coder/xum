@@ -11,17 +11,21 @@
  * same bucket and you still see the same tip. The bucket boundary is the
  * only thing that advances the carousel.
  *
- * Every tip in this list must surface a real, always-available input feature:
+ * Every tip in this list must surface a real, always-available feature:
  * a slash command (registry or built-in skill) that is ungated by experiments
  * (no `experimentGate` on the command definition), a backslash symbol shortcut
- * (see `symbolShortcuts.ts`, which is always on), or an always-available global
- * keybind from `KEYBINDS` (ungated by experiments). Advertising an unimplemented
- * or feature-flag-locked command sends the user into an unknown-command /
- * experiment-required dead end the moment they follow the suggestion. When
- * adding a slash-command tip, grep
+ * (see `symbolShortcuts.ts`, which is always on), an always-available global
+ * keybind from `KEYBINDS` (ungated by experiments), or a natural-language
+ * request for an agent capability that is available with every experiment off.
+ * Advertising an unimplemented or feature-flag-locked feature sends the user
+ * into an unknown-command / experiment-required dead end the moment they
+ * follow the suggestion. When adding a slash-command tip, grep
  * `src/browser/utils/slashCommands/registry.ts` for `experimentGate` to make
  * sure the command you're surfacing isn't gated. Keybind tips are rendered via
  * `formatKeybind` so they stay platform-correct (⌘ on macOS, Ctrl elsewhere).
+ * A tip may mention a gated feature only in a variant selected by the caller's
+ * experiment state (see `selfExtensionTip`); both variants must keep the list
+ * length and order identical so the wall-clock rotation stays aligned.
  */
 
 import { KEYBINDS, formatKeybind } from "@/browser/utils/ui/keybinds";
@@ -45,8 +49,12 @@ const TIP_ROTATION_INTERVAL_MS = 20 * 60 * 1000; // 20 minutes
  */
 const STORYBOOK_PINNED_TIP_INDEX = 0;
 
+// Users rarely realize Xum can extend and debug itself: it can author skills
+// (`.xum/skills/<name>/SKILL.md`), author durable workflows (built-in
+// `workflow-authoring` skill), and investigate its own behavior from session logs.
 export const PLACEHOLDER_TIPS: readonly string[] = [
   "Try /orchestrate to coordinate sub-agents and integrate their patches",
+  "Ask Xum to write a skill or durable workflow, or to investigate an issue in Xum",
   "Try /spawn <task> to offload it to a single sub-agent and preserve context",
   "Try /haiku <msg> to send just this message on a different model",
   "Try /+high <msg> to crank up reasoning for this message only",
@@ -77,25 +85,22 @@ function isStorybookRuntime(): boolean {
 /**
  * Return the tip for the current wall-clock bucket.
  *
- * The bucket index is `floor(now / 20min)` modulo the tip list, so every
- * caller in the same 20-minute window sees the same tip regardless of
- * workspace, tab, or user-message count. `nowMs` is exposed for testing
- * — production callers should let it default to `Date.now()`.
+ * The bucket index is `floor(Date.now() / 20min)` modulo the tip list, so
+ * every caller in the same 20-minute window sees the same tip regardless of
+ * workspace, tab, or user-message count.
  *
- * Non-finite or negative inputs fall back to the lead tip so the carousel
+ * A non-finite or negative clock falls back to the lead tip so the carousel
  * still surfaces a real, discoverable command in degenerate states (clock
  * skew, mocked timers returning weird values, etc.).
  *
- * Under Storybook, default-arg calls return a fixed tip
- * (`STORYBOOK_PINNED_TIP_INDEX`) so visual baselines are insulated from
- * tip-list reordering. Explicit `nowMs` arguments always use rotation, so
- * tests stay meaningful.
+ * Under Storybook the tip is fixed (`STORYBOOK_PINNED_TIP_INDEX`) so visual
+ * baselines are insulated from tip-list reordering.
  */
-export function getPlaceholderTip(nowMs?: number): string {
-  if (nowMs === undefined && isStorybookRuntime()) {
+export function getPlaceholderTip(): string {
+  if (isStorybookRuntime()) {
     return PLACEHOLDER_TIPS[STORYBOOK_PINNED_TIP_INDEX];
   }
-  const ts = nowMs ?? Date.now();
+  const ts = Date.now();
   if (!Number.isFinite(ts) || ts < 0) {
     return PLACEHOLDER_TIPS[0];
   }

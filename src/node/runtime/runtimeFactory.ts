@@ -1,4 +1,5 @@
 import * as fs from "fs/promises";
+import { getWorkspaceScratchDir } from "./workspaceScratchDir";
 import * as path from "path";
 import type { Runtime, WorkspaceInitParams, WorkspaceInitResult } from "./Runtime";
 import { LocalRuntime } from "./LocalRuntime";
@@ -8,12 +9,14 @@ import { CoderSSHRuntime } from "./CoderSSHRuntime";
 import { createSSHTransport } from "./transports";
 import { DockerRuntime, getContainerName } from "./DockerRuntime";
 import { DevcontainerRuntime } from "./DevcontainerRuntime";
-import { SHUX_PRODUCT_NAME } from "@/common/constants/product";
+import { XUM_PRODUCT_NAME } from "@/common/constants/product";
 import type { RuntimeConfig, RuntimeMode, RuntimeAvailabilityStatus } from "@/common/types/runtime";
 import { hasSrcBaseDir } from "@/common/types/runtime";
 import { isIncompatibleRuntimeConfig } from "@/common/utils/runtimeCompatibility";
-import { execFileAsync } from "@/node/utils/disposableExec";
+import { detectContainerEngine, isEngineResponsive } from "./containerCli";
 import type { CoderService } from "@/node/services/coderService";
+import type { WorkspaceUseLeases } from "@/node/services/workspaceUseLeases";
+import { log } from "@/node/services/log";
 import { Config } from "@/node/config";
 import { checkDevcontainerCliVersion } from "./devcontainerCli";
 import { buildDevcontainerConfigInfo, scanDevcontainerConfigs } from "./devcontainerConfigs";
@@ -50,21 +53,71 @@ export async function runFullInit(
 /**
  * Fire-and-forget init with standardized error handling.
  * Use this for background init after workspace creation (workspaceService, taskService).
+ *
+ * Returns a promise that SETTLES (never rejects) when init terminates, so
+ * error paths that must tear down the checkout can await termination first —
+ * deleting a worktree while init still runs against it races its writes and
+ * open handles. Callers that never tear down may ignore it with `void`.
+ *
+ * #4857: the init hook runs in the checkout, so it holds this backend's "init" use lease until
+ * it ends, and another backend sharing the Xum root refuses to rename or remove the workspace
+ * meanwhile. The lease is released before the returned promise settles, so a caller awaiting
+ * the settlement (archive, remove) no longer sees it. While another backend mutates the
+ * workspace, the init does not run and fails like any other init failure.
  */
-
 export function runBackgroundInit(
   runtime: Runtime,
   params: WorkspaceInitParams,
   workspaceId: string,
+  useLeases: Pick<WorkspaceUseLeases, "hold">,
   // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
   logger?: { error: (msg: string, ctx: object) => void }
-): void {
-  void runFullInit(runtime, params).catch((error: unknown) => {
-    const errorMsg = getErrorMessage(error);
-    logger?.error(`Workspace init failed for ${workspaceId}:`, { error });
-    params.initLogger.logStderr(`Initialization failed: ${errorMsg}`);
-    params.initLogger.logComplete(-1);
-  });
+): Promise<void> {
+  return withInitUseLease(useLeases, workspaceId, () => runFullInit(runtime, params)).then(
+    () => undefined,
+    (error: unknown) => {
+      const errorMsg = getErrorMessage(error);
+      logger?.error(`Workspace init failed for ${workspaceId}:`, { error });
+      params.initLogger.logStderr(`Initialization failed: ${errorMsg}`);
+      params.initLogger.logComplete(-1);
+    }
+  );
+}
+
+/**
+ * Run a background init under this backend's "init" use lease for the workspace (#4857; see
+ * runBackgroundInit). Throws WorkspaceMutationInProgressError, without running `init`, while
+ * another backend mutates the workspace. The lease is released before the returned promise
+ * settles. Multi-project creation runs its per-project inits through this directly.
+ */
+export async function withInitUseLease<T>(
+  useLeases: Pick<WorkspaceUseLeases, "hold">,
+  workspaceId: string,
+  init: () => Promise<T>
+): Promise<T> {
+  const lease = await useLeases.hold(workspaceId, "init");
+  try {
+    return await init();
+  } finally {
+    // A failed release leaves the lease file held (fail closed); never fail the init for it.
+    await lease.release().catch((error: unknown) => {
+      log.warn(`Failed to release the init use lease for ${workspaceId}`, {
+        error: getErrorMessage(error),
+      });
+    });
+  }
+}
+
+/**
+ * Whether new devcontainer runtimes bind-mount the workspace scratch dir. Only with the Artifacts
+ * experiment, like remote scratch dirs in agent turns and terminals (turnRequestBuilder,
+ * TerminalService): a daemon that refuses the mount source must never break `devcontainer up` for
+ * users who did not opt in. Registered by the layer that owns ExperimentsService; off until then.
+ */
+let isDevcontainerScratchMountEnabled: () => boolean = () => false;
+
+export function setDevcontainerScratchMountGate(gate: () => boolean): void {
+  isDevcontainerScratchMountEnabled = gate;
 }
 
 function shouldUseSSH2Runtime(): boolean {
@@ -79,7 +132,7 @@ function shouldUseSSH2Runtime(): boolean {
 
 /**
  * Error thrown when a workspace has an incompatible runtime configuration,
- * typically from a newer version of Shux that added new runtime types.
+ * typically from a newer version of Xum that added new runtime types.
  */
 export class IncompatibleRuntimeError extends Error {
   constructor(message: string) {
@@ -109,6 +162,11 @@ export interface CreateRuntimeOptions {
    */
   workspacePath?: string;
   /**
+   * Workspace id, when known. Devcontainers use it to bind-mount the workspace's host scratch
+   * dir (see DevcontainerRuntimeOptions.scratchMountDir).
+   */
+  workspaceId?: string;
+  /**
    * Coder service - required for SSH runtimes with Coder configuration.
    * When provided and config has coder field, returns a Coder SSH runtime (SSH/SSH2).
    */
@@ -129,8 +187,8 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
   // Check for incompatible configs from newer versions
   if (isIncompatibleRuntimeConfig(config)) {
     throw new IncompatibleRuntimeError(
-      `This workspace uses a runtime configuration from a newer version of ${SHUX_PRODUCT_NAME}. ` +
-        `Please upgrade ${SHUX_PRODUCT_NAME} to use this workspace.`
+      `This workspace uses a runtime configuration from a newer version of ${XUM_PRODUCT_NAME}. ` +
+        `Please upgrade ${XUM_PRODUCT_NAME} to use this workspace.`
     );
   }
 
@@ -208,10 +266,15 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
     case "devcontainer": {
       // Devcontainer uses worktrees on host + container exec
       // srcBaseDir sourced from config to honor MUX_ROOT and dev-mode suffixes
+      const xumConfig = new Config();
       const runtime = new DevcontainerRuntime({
-        srcBaseDir: new Config().srcDir,
+        srcBaseDir: xumConfig.srcDir,
         configPath: config.configPath,
         shareCredentials: config.shareCredentials,
+        scratchMountDir:
+          options?.workspaceId != null && isDevcontainerScratchMountEnabled()
+            ? getWorkspaceScratchDir(xumConfig.sessionsDir, options.workspaceId)
+            : undefined,
       });
       // Set workspace path for existing workspaces
       // For existing workspaces, prefer the persisted workspacePath — Docker labels
@@ -248,25 +311,6 @@ async function isGitRepository(projectPath: string): Promise<boolean> {
   }
 }
 
-/**
- * Check if Docker daemon is running and accessible.
- */
-async function isDockerAvailable(): Promise<boolean> {
-  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-  try {
-    using proc = execFileAsync("docker", ["info"]);
-    const timeout = new Promise<never>((_, reject) => {
-      timeoutHandle = setTimeout(() => reject(new Error("timeout")), 5000);
-    });
-    await Promise.race([proc.result, timeout]);
-    return true;
-  } catch {
-    return false;
-  } finally {
-    if (timeoutHandle) clearTimeout(timeoutHandle);
-  }
-}
-
 type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 
 /**
@@ -276,12 +320,17 @@ type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 export async function checkRuntimeAvailability(
   projectPath: string
 ): Promise<RuntimeAvailabilityMap> {
-  const [isGit, dockerAvailable, devcontainerCliInfo, devcontainerConfigs] = await Promise.all([
-    isGitRepository(projectPath),
-    isDockerAvailable(),
-    checkDevcontainerCliVersion(),
-    scanDevcontainerConfigs(projectPath),
-  ]);
+  const [isGit, containerEngine, dockerResponsive, devcontainerCliInfo, devcontainerConfigs] =
+    await Promise.all([
+      isGitRepository(projectPath),
+      detectContainerEngine(),
+      // The devcontainer CLI shells out to the literal `docker` binary regardless
+      // of which engine the Docker runtime resolved (e.g. an XUM_CONTAINER_CLI
+      // override), so Dev Container availability needs its own docker probe.
+      isEngineResponsive("docker"),
+      checkDevcontainerCliVersion(),
+      scanDevcontainerConfigs(projectPath),
+    ]);
 
   const devcontainerConfigInfo = buildDevcontainerConfigInfo(devcontainerConfigs);
 
@@ -296,8 +345,11 @@ export async function checkRuntimeAvailability(
       available: false,
       reason: "Dev Container CLI not installed. Run: npm install -g @devcontainers/cli",
     };
-  } else if (!dockerAvailable) {
-    devcontainerAvailability = { available: false, reason: "Docker daemon not running" };
+  } else if (!dockerResponsive) {
+    devcontainerAvailability = {
+      available: false,
+      reason: "Dev Containers require Docker; Docker daemon not running",
+    };
   } else if (devcontainerConfigInfo.length === 0) {
     devcontainerAvailability = { available: false, reason: "No devcontainer.json found" };
   } else {
@@ -314,8 +366,8 @@ export async function checkRuntimeAvailability(
     ssh: isGit ? { available: true } : { available: false, reason: gitRequiredReason },
     docker: !isGit
       ? { available: false, reason: gitRequiredReason }
-      : !dockerAvailable
-        ? { available: false, reason: "Docker daemon not running" }
+      : !containerEngine.available
+        ? { available: false, reason: containerEngine.reason }
         : { available: true },
     devcontainer: devcontainerAvailability,
   };

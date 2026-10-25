@@ -23,6 +23,8 @@ export interface StreamTimeline {
 export interface WorkspaceUI {
   readonly projects: {
     openFirstWorkspace(): Promise<void>;
+    /** Select a workspace row in the sidebar by ID (expands the first project if needed). */
+    openWorkspaceById(workspaceId: string): Promise<void>;
   };
   readonly chat: {
     waitForTranscript(): Promise<void>;
@@ -30,6 +32,7 @@ export interface WorkspaceUI {
     setThinkingLevel(value: number): Promise<void>;
     sendMessage(message: string): Promise<void>;
     expectTranscriptContains(text: string): Promise<void>;
+    expectTurnSettled(): Promise<void>;
     expectActionButtonVisible(label: string): Promise<void>;
     clickActionButton(label: string): Promise<void>;
     expectStatusMessageContains(text: string): Promise<void>;
@@ -99,30 +102,35 @@ function transcriptLocator(page: Page): Locator {
 }
 
 export function createWorkspaceUI(page: Page, context: DemoProjectConfig): WorkspaceUI {
+  /** Workspace rows of the first project, expanding it when collapsed. */
+  async function firstProjectWorkspaceRows(): Promise<Locator> {
+    const navigation = page.getByRole("navigation", { name: "Projects" });
+    await expect(navigation).toBeVisible();
+
+    const projectItems = navigation.locator('[role="button"][aria-controls]');
+    const projectItem = projectItems.first();
+    await expect(projectItem).toBeVisible();
+
+    const workspaceListId = await projectItem.getAttribute("aria-controls");
+    if (!workspaceListId) {
+      throw new Error("Project item is missing aria-controls attribute");
+    }
+
+    const workspaceItems = page.locator(`#${workspaceListId} > div[role="button"]`);
+    const workspaceItem = workspaceItems.first();
+    const isVisible = await workspaceItem.isVisible().catch(() => false);
+    if (!isVisible) {
+      // Click the expand/collapse button within the project item
+      const expandButton = projectItem.getByRole("button", { name: /expand project/i });
+      await expandButton.click();
+      await workspaceItem.waitFor({ state: "visible" });
+    }
+    return workspaceItems;
+  }
+
   const projects = {
     async openFirstWorkspace(): Promise<void> {
-      const navigation = page.getByRole("navigation", { name: "Projects" });
-      await expect(navigation).toBeVisible();
-
-      const projectItems = navigation.locator('[role="button"][aria-controls]');
-      const projectItem = projectItems.first();
-      await expect(projectItem).toBeVisible();
-
-      const workspaceListId = await projectItem.getAttribute("aria-controls");
-      if (!workspaceListId) {
-        throw new Error("Project item is missing aria-controls attribute");
-      }
-
-      const workspaceItems = page.locator(`#${workspaceListId} > div[role="button"]`);
-      const workspaceItem = workspaceItems.first();
-      const isVisible = await workspaceItem.isVisible().catch(() => false);
-      if (!isVisible) {
-        // Click the expand/collapse button within the project item
-        const expandButton = projectItem.getByRole("button", { name: /expand project/i });
-        await expandButton.click();
-        await workspaceItem.waitFor({ state: "visible" });
-      }
-
+      const workspaceItem = (await firstProjectWorkspaceRows()).first();
       await workspaceItem.click();
 
       // Startup can land on a project page or a restored workspace. After clicking a
@@ -133,6 +141,15 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         timeout: 20_000,
       });
 
+      await chat.waitForTranscript();
+    },
+
+    async openWorkspaceById(workspaceId: string): Promise<void> {
+      const workspaceItem = (await firstProjectWorkspaceRows()).and(
+        page.locator(`[data-workspace-id="${workspaceId}"]`)
+      );
+      await workspaceItem.click();
+      await expect(workspaceItem).toHaveAttribute("aria-current", "true");
       await chat.waitForTranscript();
     },
   };
@@ -202,7 +219,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         throw new Error("Message must not be empty");
       }
       const input = page.getByRole("textbox", {
-        name: /Message Claude|Edit your last message/,
+        name: /^(Message|Edit message)$/,
       });
       await expect(input).toBeVisible();
       await input.fill(message);
@@ -211,11 +228,22 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       if (message.startsWith("/")) {
         await page.keyboard.press("Escape");
       }
+      // A send is refused (toast, draft kept) until the transcript is verified caught-up;
+      // wait for the send affordance like a user would instead of racing the replay.
+      await expect(page.getByRole("button", { name: "Send message" })).toBeEnabled({
+        timeout: 30_000,
+      });
       await page.keyboard.press("Enter");
     },
 
     async expectTranscriptContains(text: string): Promise<void> {
       await expect(transcriptLocator(page)).toContainText(text, { timeout: 45_000 });
+    },
+
+    async expectTurnSettled(): Promise<void> {
+      await expect(page.getByRole("button", { name: "Stop streaming" })).toBeHidden({
+        timeout: 45_000,
+      });
     },
 
     async expectActionButtonVisible(label: string): Promise<void> {
@@ -248,7 +276,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         throw new Error("sendCommandAndExpectStatus expects a slash command");
       }
       const input = page.getByRole("textbox", {
-        name: /Message Claude|Edit your last message/,
+        name: /^(Message|Edit message)$/,
       });
       await expect(input).toBeVisible();
 
@@ -262,9 +290,12 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       });
 
       // Send the command. Dismiss suggestion menu first so Enter sends instead of
-      // accepting a completion.
+      // accepting a completion, and wait for the send affordance (transcript caught-up).
       await input.fill(command);
       await page.keyboard.press("Escape");
+      await expect(page.getByRole("button", { name: "Send message" })).toBeEnabled({
+        timeout: 30_000,
+      });
       await page.keyboard.press("Enter");
 
       // Wait for the toast we started watching for
@@ -278,7 +309,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
       const timeoutMs = options?.timeoutMs ?? 30_000;
       const workspaceId = context.workspaceId;
       await page.evaluate((id: string) => {
-        type StreamCaptureEvent = {
+        interface StreamCaptureEvent {
           type: string;
           timestamp: number;
           delta?: string;
@@ -288,11 +319,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           toolCallId?: string;
           args?: unknown;
           result?: unknown;
-        };
-        type StreamCapture = {
+        }
+        interface StreamCapture {
           events: StreamCaptureEvent[];
           unsubscribe: () => void;
-        };
+        }
 
         const win = window as unknown as {
           __muxStreamCapture?: Record<string, StreamCapture>;
@@ -409,13 +440,18 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         };
       }, workspaceId);
 
-      let actionError: unknown;
+      // Boxed so a caught value keeps its `unknown` type (a truthiness check would narrow it).
+      let actionFailure: { error: unknown } | undefined;
       try {
         await action();
         await page.waitForFunction(
           (id: string) => {
-            type StreamCaptureEvent = { type: string };
-            type StreamCapture = { events: StreamCaptureEvent[] };
+            interface StreamCaptureEvent {
+              type: string;
+            }
+            interface StreamCapture {
+              events: StreamCaptureEvent[];
+            }
             const win = window as unknown as {
               __muxStreamCapture?: Record<string, StreamCapture>;
             };
@@ -432,11 +468,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           { timeout: timeoutMs }
         );
       } catch (error) {
-        actionError = error;
+        actionFailure = { error };
       }
 
       const events = await page.evaluate((id: string) => {
-        type StreamCaptureEvent = {
+        interface StreamCaptureEvent {
           type: string;
           timestamp: number;
           delta?: string;
@@ -446,11 +482,11 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
           toolCallId?: string;
           args?: unknown;
           result?: unknown;
-        };
-        type StreamCapture = {
+        }
+        interface StreamCapture {
           events: StreamCaptureEvent[];
           unsubscribe: () => void;
-        };
+        }
         const win = window as unknown as {
           __muxStreamCapture?: Record<string, StreamCapture>;
         };
@@ -466,21 +502,51 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
         return capture.events.slice();
       }, workspaceId);
 
-      if (actionError) {
-        throw actionError;
+      if (actionFailure) {
+        throw actionFailure.error;
       }
 
       return { events };
     },
   };
 
+  /**
+   * Open a tool from the right sidebar's New tab launcher. The strip's "+" button first adds or
+   * shows the New tab.
+   */
+  async function openFromNewTab(toolName: string): Promise<void> {
+    const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
+    // Tools are opt-in now: wait for either the collapsed sidebar's toggle or the open strip.
+    const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
+    const newTabButton = sidebar.getByRole("button", { name: "New tab", exact: true }).first();
+    await expect(expandButton.or(newTabButton)).toBeVisible();
+    if (await expandButton.isVisible()) await expandButton.click();
+    await expect(newTabButton).toBeVisible();
+    await newTabButton.click();
+    const row = sidebar.getByRole("tabpanel").getByRole("button", { name: toolName, exact: true });
+    await expect(row).toBeVisible();
+    await row.click();
+  }
+
   const metaSidebar = {
     async expectVisible(): Promise<void> {
-      await expect(page.getByRole("complementary", { name: "Workspace insights" })).toBeVisible();
+      // Collapsed (a fresh workspace's state), the sidebar is 0px wide and only its toggle shows
+      // (the overview card floats outside the sidebar's box), so either state counts.
+      const sidebar = page.getByRole("complementary", { name: "Workspace insights" });
+      const expandButton = page.getByRole("button", { name: "Expand right sidebar", exact: true });
+      await expect
+        .poll(async () => (await sidebar.isVisible()) || (await expandButton.isVisible()), {
+          message: "neither the expanded right sidebar nor its Expand toggle is visible",
+        })
+        .toBe(true);
     },
 
     async selectTab(label: string): Promise<void> {
       const tab = page.getByRole("tab", { name: label });
+      // The strip shows only opened tabs; open a missing tool from a New tab's launcher.
+      if (!(await tab.isVisible())) {
+        await openFromNewTab(label);
+      }
       await expect(tab).toBeVisible();
       await tab.click();
       const selected = await tab.getAttribute("aria-selected");
@@ -490,15 +556,13 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
 
     async addTerminal(): Promise<void> {
-      // Click the "+" button to add a new terminal tab
-      const addButton = page.getByRole("button", { name: "New terminal" });
-      await expect(addButton).toBeVisible();
-      await addButton.click();
+      // A New tab's launcher (opened with the strip's "+") has the Terminal row.
+      await openFromNewTab("Terminal");
       // Wait for a terminal tab to appear (name may be "Terminal" or include cwd path)
-      // and be selected. Use a locator that matches tabs containing "Terminal" or terminal icon.
+      // and be selected. Only terminal tabs have a "Close terminal" button.
       const terminalTab = page
         .locator('[role="tab"]')
-        .filter({ has: page.locator("svg") })
+        .filter({ has: page.getByRole("button", { name: "Close terminal" }) })
         .last();
       await expect(terminalTab).toBeVisible({ timeout: 5000 });
       await expect(terminalTab).toHaveAttribute("aria-selected", "true");
@@ -605,6 +669,7 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
   };
 
+  const settingsDialog = page.getByRole("dialog", { name: "Settings" });
   const settings = {
     async open(): Promise<void> {
       // Click the settings gear button in the title bar.
@@ -615,53 +680,34 @@ export function createWorkspaceUI(page: Page, context: DemoProjectConfig): Works
     },
 
     async close(): Promise<void> {
-      const closeControl = page
-        .getByRole("button", { name: /Close settings|Back to previous page/i })
-        .first();
-
+      const closeControl = settingsDialog.getByRole("button", { name: "Close settings" });
       await expect(closeControl).toBeVisible({ timeout: 5000 });
       await closeControl.click();
       await settings.expectClosed();
     },
 
     async expectOpen(): Promise<void> {
-      const dialog = page.getByRole("dialog", { name: "Settings" });
-      const routeCloseControl = page
-        .getByRole("button", { name: /Close settings|Back to previous page/i })
-        .first();
-
-      await expect
-        .poll(async () => (await dialog.isVisible()) || (await routeCloseControl.isVisible()), {
-          timeout: 5000,
-        })
-        .toBe(true);
+      await expect(settingsDialog).toBeVisible({ timeout: 5000 });
     },
 
     async expectClosed(): Promise<void> {
-      const dialog = page.getByRole("dialog", { name: "Settings" });
-      const routeCloseControl = page
-        .getByRole("button", { name: /Close settings|Back to previous page/i })
-        .first();
-
-      await expect
-        .poll(async () => !(await dialog.isVisible()) && !(await routeCloseControl.isVisible()), {
-          timeout: 5000,
-        })
-        .toBe(true);
+      await expect(settingsDialog).toBeHidden({ timeout: 5000 });
     },
 
     async selectSection(section: "General" | "Providers" | "Models"): Promise<void> {
-      const sectionButton = page.getByRole("button", { name: section, exact: true });
+      const sectionButton = settingsDialog.getByRole("button", { name: section, exact: true });
       await expect(sectionButton).toBeVisible();
       await sectionButton.click();
     },
 
     async expandProvider(providerName: string): Promise<void> {
-      const providerButton = page.getByRole("button", { name: new RegExp(providerName, "i") });
+      const providerButton = settingsDialog.getByRole("button", {
+        name: new RegExp(providerName, "i"),
+      });
       await expect(providerButton).toBeVisible();
       await providerButton.click();
       // Wait for expansion - look for the "Base URL" label which is more unique
-      await expect(page.getByText(/Base URL/)).toBeVisible({ timeout: 5000 });
+      await expect(settingsDialog.getByText(/Base URL/)).toBeVisible({ timeout: 5000 });
     },
   };
 

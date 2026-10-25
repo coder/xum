@@ -72,7 +72,7 @@ export const DebugLlmRequestModal: React.FC<DebugLlmRequestModalProps> = ({
   const handleDownload = () => {
     if (!snapshot) return;
     const timestamp = new Date(snapshot.capturedAt).toISOString().replace(/[:.]/g, "-");
-    const fileName = `shux-llm-request-${workspaceId}-${timestamp}.json`;
+    const fileName = `xum-llm-request-${workspaceId}-${timestamp}.json`;
     void downloadBlob(new Blob([json], { type: "application/json" }), fileName);
   };
 

@@ -3,7 +3,7 @@
 process.umask(0o077);
 
 /**
- * Shux CLI entry point.
+ * Xum CLI entry point.
  *
  * LAZY LOADING REQUIREMENT:
  * We manually route subcommands before calling program.parse() to avoid
@@ -20,7 +20,7 @@ process.umask(0o077);
  *
  * ARGV OFFSET:
  * In development (`electron .`), argv = [electron, ".", ...args] so first arg is at index 2.
- * In packaged apps (`./shux.AppImage`), argv = [app, ...args] so first arg is at index 1.
+ * In packaged apps (`./xum.AppImage`), argv = [app, ...args] so first arg is at index 1.
  * process.defaultApp is true in dev mode and undefined in packaged apps.
  */
 import "@/node/compat/installLegacyMuxEnvironment";
@@ -35,16 +35,20 @@ import {
   isElectronLaunchArg,
 } from "./argv";
 import { exitAfterStdoutFlush } from "./processExit";
+import { warnIfUnsupportedNode } from "./nodeVersion";
 
-import { cleanupObsoleteShuxBinArtifacts } from "@/common/constants/paths";
-import { initializeShuxHomeTransition } from "@/node/compat/shuxTransition";
+import { cleanupObsoleteXumBinArtifacts } from "@/common/constants/paths";
+import { initializeXumHomeTransition } from "@/node/compat/xumTransition";
 
 void bootstrapCli();
 
 async function bootstrapCli(): Promise<void> {
   try {
-    const transition = await initializeShuxHomeTransition();
-    cleanupObsoleteShuxBinArtifacts(transition.activePath);
+    // One stderr line on a Node older than xum server supports (#6968) or affected by
+    // CVE-2026-111497. It never exits.
+    warnIfUnsupportedNode();
+    const transition = await initializeXumHomeTransition();
+    cleanupObsoleteXumBinArtifacts(transition.activePath);
   } catch {
     // Startup-time compatibility work must never stop the CLI or corrupt command output.
   }
@@ -64,20 +68,20 @@ function startCli(): void {
 
   if (subcommand === "run") {
     if (!isCommandAvailable("run", env)) {
-      console.error("The 'run' command is only available via the CLI (bun shux run).");
+      console.error("The 'run' command is only available via the CLI (bun xum run).");
       console.error("It is not bundled in Electron.");
       process.exit(1);
     }
-    process.argv.splice(env.firstArgIndex, 1); // Remove "run" since run.ts defines .name("shux run")
+    process.argv.splice(env.firstArgIndex, 1); // Remove "run" since run.ts defines .name("xum run")
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     require("./run");
   } else if (subcommand === "workflow" || subcommand === "wf") {
     if (!isCommandAvailable("workflow", env)) {
-      console.error("The 'workflow' command is only available via the CLI (bun shux workflow).");
+      console.error("The 'workflow' command is only available via the CLI (bun xum workflow).");
       console.error("It is not bundled in Electron.");
       process.exit(1);
     }
-    process.argv.splice(env.firstArgIndex, 1); // Remove "workflow"/"wf" since workflow.ts defines .name("shux workflow")
+    process.argv.splice(env.firstArgIndex, 1); // Remove "workflow"/"wf" since workflow.ts defines .name("xum workflow")
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const workflowCli = require("./workflow") as { main: () => Promise<number> };
     void workflowCli
@@ -89,11 +93,11 @@ function startCli(): void {
       });
   } else if (subcommand === "trust") {
     if (!isCommandAvailable("trust", env)) {
-      console.error("The 'trust' command is only available via the CLI (bun shux trust).");
+      console.error("The 'trust' command is only available via the CLI (bun xum trust).");
       console.error("It is not bundled in Electron.");
       process.exit(1);
     }
-    process.argv.splice(env.firstArgIndex, 1); // Remove "trust" since trust.ts defines .name("shux trust")
+    process.argv.splice(env.firstArgIndex, 1); // Remove "trust" since trust.ts defines .name("xum trust")
     // eslint-disable-next-line @typescript-eslint/no-require-imports
     const trustCli = require("./trust") as { main: () => Promise<number> };
     void trustCli
@@ -122,7 +126,7 @@ function startCli(): void {
     subcommand === "desktop" ||
     (env.isElectron && (subcommand === undefined || isElectronLaunchArg(subcommand, env)))
   ) {
-    // Explicit `shux desktop`, or Electron runtime with no subcommand / Electron launch args
+    // Explicit `xum desktop`, or Electron runtime with no subcommand / Electron launch args
     if (!isCommandAvailable("desktop", env)) {
       console.error("The 'desktop' command requires Electron to be installed.");
       console.error("When installed via npm, use the packaged desktop app instead.");
@@ -146,8 +150,8 @@ function startCli(): void {
     // Global flags are defined in CLI_GLOBAL_FLAGS (argv.ts) for routing logic.
     // Commander auto-adds --help/-h. We define --version/-v below.
     program
-      .name("shux")
-      .description("Shux - AI agent orchestration")
+      .name("xum")
+      .description("Xum - AI agent orchestration")
       .version(`${gitDescribe} (${gitCommit})`, "-v, --version");
 
     // Sanity check: ensure version flags match CLI_GLOBAL_FLAGS
@@ -169,14 +173,14 @@ function startCli(): void {
       program
         .command("workflow")
         .alias("wf")
-        .description("Run workflow scripts by explicit script path (experimental)");
+        .description("Run workflow scripts by explicit script path");
     }
     if (isCommandAvailable("trust", env)) {
       program.command("trust").description("Trust a project so repo-controlled automation can run");
     }
     program.command("server").description("Start the HTTP/WebSocket ORPC server");
     program.command("acp").description("ACP stdio interface for editor integration");
-    program.command("api").description("Interact with the shux API via a running server");
+    program.command("api").description("Interact with the xum API via a running server");
     if (isCommandAvailable("desktop", env)) {
       program
         .command("desktop")

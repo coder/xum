@@ -1,0 +1,7 @@
+{
+  "version": 3,
+  "file": "shared-BBBBBBBB.js",
+  "sources": ["../node_modules/shared-dep/index.js"],
+  "names": [],
+  "mappings": ""
+}

@@ -47,9 +47,9 @@ export function GitInitBanner(props: GitInitBannerProps) {
         className="flex items-center gap-3 rounded-lg border border-green-500/30 bg-green-500/10 px-4 py-3"
         data-testid="git-init-banner"
       >
-        <Check className="h-5 w-5 shrink-0 text-green-500" />
+        <Check className="text-success-text h-5 w-5 shrink-0" />
         <div className="flex flex-1 flex-col gap-0.5">
-          <span className="text-sm font-medium text-green-500" data-testid="git-init-success">
+          <span className="text-success-text text-sm font-medium" data-testid="git-init-success">
             Git repository initialized
           </span>
           <span className="text-muted-foreground text-xs">
@@ -84,7 +84,7 @@ export function GitInitBanner(props: GitInitBannerProps) {
         type="button"
         onClick={() => void handleGitInit()}
         disabled={isLoading}
-        className="bg-accent hover:bg-accent/80 text-accent-foreground inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50"
+        className="bg-accent hover:bg-accent-button-hover text-accent-foreground inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:opacity-50"
         data-testid="git-init-button"
       >
         {isLoading ? (

@@ -1,9 +1,50 @@
-import { describe, expect, it } from "@jest/globals";
+import { describe, expect, it, jest } from "@jest/globals";
 import type { ModelMessage, ToolResultPart } from "ai";
+import { convertToModelMessages } from "ai";
 import sharp from "sharp";
-import { MAX_IMAGE_DIMENSION } from "@/common/constants/imageAttachments";
+import type { MuxMessage } from "@/common/types/message";
+import {
+  MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST,
+  MAX_IMAGE_DIMENSION,
+} from "@/common/constants/imageAttachments";
 import { expectContentOutputValue } from "./testToolOutputHelpers";
+import * as toolResultAttachments from "./toolResultAttachments";
+import { createOmittedToolAttachmentText } from "./toolResultAttachments";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "./extractToolMediaAsUserMessagesFromModelMessages";
+
+/** One MCP call whose result keeps its images inline, as mcpToModelOutput emits them. */
+function mcpImageCall(index: number, images: string[]): ModelMessage[] {
+  return [
+    {
+      role: "assistant",
+      content: [{ type: "tool-call", toolCallId: `mcp-${index}`, toolName: "shot", input: {} }],
+    },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: `mcp-${index}`,
+          toolName: "shot",
+          output: {
+            type: "content",
+            value: images.map((data) => ({
+              type: "file",
+              mediaType: "image/png",
+              data: { type: "data", data },
+            })),
+          },
+        } as unknown as ToolResultPart,
+      ],
+    },
+  ];
+}
+
+/** A real PNG: the extraction replaces unreadable image bytes with a note. */
+async function pngBase64(width: number): Promise<string> {
+  const image = sharp({ create: { width, height: 10, channels: 3, background: "red" } });
+  return (await image.png().toBuffer()).toString("base64");
+}
 
 describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
   it("rewrites attach_file image output for prepareStep messages", async () => {
@@ -273,6 +314,526 @@ describe("extractToolMediaAsUserMessagesFromModelMessages", () => {
     expect(
       rewrittenValue.some((part) => (part as { type?: unknown }).type === "display_file")
     ).toBe(false);
+  });
+
+  it("scrubs display-only bytes from code_execution carrier values", async () => {
+    const payload = Buffer.from("display-only secret bytes").toString("base64");
+    const displayPart = {
+      type: "display_file" as const,
+      mediaType: "text/markdown",
+      data: payload,
+      filename: "notes.md",
+      providerOptions: { mux: { displayOnly: true as const, size: 25 } },
+    };
+    const carrierOutput = {
+      success: true,
+      result: { copied: displayPart },
+      toolCalls: [],
+      consoleOutput: [],
+      duration_ms: 2,
+      attachments: [displayPart],
+    };
+    const input: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-display-carrier",
+            toolName: "code_execution",
+            output: carrierOutput as unknown as ToolResultPart["output"],
+          },
+        ],
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(input);
+    expect(rewritten).toHaveLength(1);
+    expect(JSON.stringify(rewritten)).not.toContain(payload);
+    expect(JSON.stringify(rewritten)).toContain("File shown to user only");
+    expect(JSON.stringify(input)).toContain(payload);
+  });
+
+  it("evicts oldest synthetic tool media instead of omitting a fresh extraction", async () => {
+    // r34: history-level extraction can saturate the request-wide cap with
+    // synthetic tool media. Those parts must be evictable (oldest-first) so a
+    // screenshot produced by the CURRENT tool call still reaches the next
+    // step. The history runs through convertToModelMessages and this same
+    // extractor, so the marker it sets (providerOptions) is what's validated.
+    // PDFs pass through provider preparation unchanged (no raster decode),
+    // giving distinct real file parts after conversion.
+    const oldPayload = (i: number) =>
+      Buffer.from(`old-${String(i).padStart(2, "0")}`).toString("base64");
+    const historyInput: MuxMessage[] = [
+      {
+        id: "a1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolCallId: "call-history",
+            toolName: "mcp__shots__take",
+            input: {},
+            state: "output-available",
+            output: {
+              type: "content",
+              value: Array.from({ length: MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST }, (_, i) => ({
+                type: "media",
+                mediaType: "application/pdf",
+                data: oldPayload(i),
+              })),
+            },
+          },
+        ],
+        metadata: { timestamp: 1 },
+      },
+    ];
+    const historyMessages = await extractToolMediaAsUserMessagesFromModelMessages(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-argument
+      await convertToModelMessages(historyInput as any)
+    );
+    const syntheticHistoryMedia = historyMessages
+      .flatMap((message): unknown[] => (Array.isArray(message.content) ? message.content : []))
+      .filter(
+        (part) =>
+          (part as { type?: unknown }).type === "file" ||
+          (part as { type?: unknown }).type === "image"
+      );
+    expect(syntheticHistoryMedia).toHaveLength(MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST);
+
+    const stepMessages: ModelMessage[] = [
+      ...historyMessages,
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-current",
+            toolName: "attach_file",
+            output: {
+              type: "content",
+              value: [
+                {
+                  type: "media",
+                  mediaType: "application/pdf",
+                  data: Buffer.from("fresh-shot").toString("base64"),
+                },
+              ],
+            } as unknown as ToolResultPart["output"],
+          },
+        ],
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(stepMessages);
+    const rewrittenJson = JSON.stringify(rewritten);
+    // The fresh attachment survives; the OLDEST synthetic part is evicted
+    // behind a bounded note, keeping total media at the cap.
+    expect(rewrittenJson).toContain(Buffer.from("fresh-shot").toString("base64"));
+    expect(rewrittenJson).not.toContain(oldPayload(0));
+    expect(rewrittenJson).toContain(oldPayload(1));
+    expect(rewrittenJson).toContain("1 extracted media attachment(s) omitted");
+    const mediaParts = rewritten
+      .flatMap((message): unknown[] => (Array.isArray(message.content) ? message.content : []))
+      .filter(
+        (part) =>
+          (part as { type?: unknown }).type === "file" ||
+          (part as { type?: unknown }).type === "image"
+      );
+    expect(mediaParts).toHaveLength(MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST);
+  });
+
+  it("never evicts genuine user uploads at saturation", async () => {
+    // Unmarked media (actual user attachments) reserves the allowance: with
+    // the cap fully consumed by user uploads, the new extraction is omitted
+    // and every upload is preserved untouched (r31 + r34).
+    const userUploads = Array.from(
+      { length: MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST },
+      (_, i) =>
+        ({
+          type: "file",
+          mediaType: "image/png",
+          data: `QUJD${i}`,
+        }) as const
+    );
+    const input: ModelMessage[] = [
+      { role: "user", content: [{ type: "text", text: "uploads" }, ...userUploads] },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call1",
+            toolName: "attach_file",
+            output: {
+              type: "content",
+              value: [
+                {
+                  type: "media",
+                  mediaType: "image/svg+xml",
+                  data: Buffer.from(
+                    `<svg xmlns="http://www.w3.org/2000/svg"><title>fresh-shot</title></svg>`
+                  ).toString("base64"),
+                },
+              ],
+            } as unknown as ToolResultPart["output"],
+          },
+        ],
+      },
+    ];
+
+    const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(input);
+    // All user uploads intact (same parts, same message).
+    const userMessage = rewritten[0];
+    expect(Array.isArray(userMessage.content) ? userMessage.content : []).toHaveLength(
+      1 + MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST
+    );
+    const rewrittenJson = JSON.stringify(rewritten);
+    expect(rewrittenJson).toContain("1 extracted media attachment(s) omitted");
+    expect(rewrittenJson).not.toContain("fresh-shot");
+  });
+
+  describe("after a provider-executed tool call", () => {
+    const shotOutput = {
+      type: "content",
+      value: [
+        { type: "text", text: "shot" },
+        {
+          type: "media",
+          mediaType: "application/pdf",
+          data: Buffer.from("shot").toString("base64"),
+        },
+      ],
+    } as unknown as ToolResultPart["output"];
+
+    function stepMessages(serverToolResolved: boolean): ModelMessage[] {
+      return [
+        { role: "user", content: "search and screenshot" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "tool-call",
+              toolCallId: "srvtoolu_1",
+              toolName: "web_search",
+              input: { query: "xum" },
+              providerExecuted: true,
+            },
+            ...(serverToolResolved
+              ? [
+                  {
+                    type: "tool-result" as const,
+                    toolCallId: "srvtoolu_1",
+                    toolName: "web_search",
+                    output: { type: "json" as const, value: [] },
+                  },
+                ]
+              : []),
+            { type: "tool-call", toolCallId: "call1", toolName: "attach_file", input: {} },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "call1",
+              toolName: "attach_file",
+              output: shotOutput,
+            },
+          ],
+        },
+      ];
+    }
+
+    it("keeps the media inside the tool result while the server tool's result is deferred", async () => {
+      // Anthropic runs a server tool called alongside a client tool only after the client
+      // results arrive; anything after the tool_result blocks ends the turn and the request
+      // fails with "`web_search` tool use ... without a corresponding web_search_tool_result".
+      const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(stepMessages(false));
+      expect(rewritten.map((message) => message.role)).toEqual(["user", "assistant", "tool"]);
+      const toolMessage = rewritten[2] as Extract<ModelMessage, { role: "tool" }>;
+      const result = toolMessage.content[0];
+      if (result.type !== "tool-result" || result.output.type !== "content") {
+        throw new Error("Expected a content tool result");
+      }
+      const files = result.output.value.filter((item) => item.type === "file");
+      expect(files).toHaveLength(1);
+      expect(JSON.stringify(files[0])).toContain(Buffer.from("shot").toString("base64"));
+      expect(JSON.stringify(result.output)).toContain("[Attachment attached:");
+
+      // Later steps rerun the transform on this prefix: it must not change.
+      expect(await extractToolMediaAsUserMessagesFromModelMessages(rewritten)).toEqual(rewritten);
+    });
+
+    it("evicts media kept inside a deferred tool result oldest-first at the cap", async () => {
+      const newer = Array.from(
+        { length: MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST },
+        (_, i): ModelMessage[] => [
+          {
+            role: "assistant",
+            content: [{ type: "tool-call", toolCallId: `new-${i}`, toolName: "t", input: {} }],
+          },
+          {
+            role: "tool",
+            content: [
+              {
+                type: "tool-result",
+                toolCallId: `new-${i}`,
+                toolName: "t",
+                output: {
+                  type: "content",
+                  value: [{ type: "media", data: `JVBERi${i}AAA`, mediaType: "application/pdf" }],
+                },
+              } as unknown as ToolResultPart,
+            ],
+          },
+        ]
+      ).flat();
+      const shot = Buffer.from("shot").toString("base64");
+      // An in-turn step sees the deferred result already inlined; a rebuild extracts it again.
+      const inTurn = [
+        ...(await extractToolMediaAsUserMessagesFromModelMessages(stepMessages(false))),
+        ...newer,
+      ];
+      const rebuild = [...stepMessages(false), ...newer];
+
+      for (const messages of [inTurn, rebuild]) {
+        const serialized = JSON.stringify(
+          await extractToolMediaAsUserMessagesFromModelMessages(messages)
+        );
+        // Both drop the oldest item, the inlined screenshot, and keep every newer one.
+        expect(serialized).not.toContain(shot);
+        expect(serialized).toContain("JVBERi0AAA");
+        expect(serialized).toContain(createOmittedToolAttachmentText(1));
+      }
+    });
+
+    it("still moves the media to a user message once the server tool has its result", async () => {
+      const rewritten = await extractToolMediaAsUserMessagesFromModelMessages(stepMessages(true));
+      expect(rewritten.map((message) => message.role)).toEqual([
+        "user",
+        "assistant",
+        "tool",
+        "user",
+      ]);
+    });
+  });
+
+  // mcpToModelOutput keeps MCP images inside the tool result as `file` parts, which this
+  // extraction leaves in place. They still count toward the request-wide cap, oldest evicted
+  // first, or a screenshot loop could replay more images than the provider accepts.
+  it("evicts the oldest MCP images kept inside tool results at the cap", async () => {
+    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 2;
+    // Distinct widths keep every image's bytes distinct.
+    const pngs = await Promise.all(Array.from({ length: total }, (_, i) => pngBase64(i + 1)));
+    const mcpCall = (index: number): ModelMessage[] => [
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: `call-${index}`, toolName: "shot", input: {} }],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: `call-${index}`,
+            toolName: "shot",
+            output: {
+              type: "content",
+              value: [
+                { type: "text", text: `shot ${index}` },
+                {
+                  type: "file",
+                  mediaType: "image/png",
+                  data: { type: "data", data: pngs[index] },
+                },
+              ],
+            },
+          } as unknown as ToolResultPart,
+        ],
+      },
+    ];
+    const messages = Array.from({ length: total }, (_, i) => mcpCall(i)).flat();
+
+    const result = await extractToolMediaAsUserMessagesFromModelMessages(messages);
+
+    const values = result
+      .filter((message) => message.role === "tool")
+      .map((message) => JSON.stringify(message.content));
+    expect(values.filter((value) => value.includes('"type":"file"'))).toHaveLength(
+      MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST
+    );
+    // The two oldest images are gone, with the cap note in their place.
+    for (const index of [0, 1]) {
+      expect(values[index]).not.toContain(pngs[index]);
+      expect(values[index]).toContain(createOmittedToolAttachmentText(1));
+      expect(values[index]).toContain(`shot ${index}`);
+    }
+    expect(values[2]).toContain(pngs[2]);
+    // A request at the cap is a fixed point, so every later step keeps the same prefix.
+    expect(await extractToolMediaAsUserMessagesFromModelMessages(result)).toEqual(result);
+  });
+
+  // MCP images skip extraction, so the request must still resize oversized ones and replace
+  // unreadable ones, or a persisted bad screenshot fails every later request.
+  // StreamManager runs this transform before every step on the same growing message list, so
+  // a screenshot loop would otherwise decode every earlier image again on each step.
+  it("prepares each inline MCP image once across steps", async () => {
+    const step1 = mcpImageCall(0, [await pngBase64(10)]);
+    const step2 = [...step1, ...mcpImageCall(1, [await pngBase64(11)])];
+    const prepare = jest.spyOn(toolResultAttachments, "prepareExtractedToolAttachmentForProvider");
+    try {
+      await extractToolMediaAsUserMessagesFromModelMessages(step1);
+      await extractToolMediaAsUserMessagesFromModelMessages(step2);
+      expect(prepare).toHaveBeenCalledTimes(2);
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
+  // Only media that can still reach the provider is worth decoding: a long screenshot history
+  // (or a hostile MCP server) must not make a rebuild inspect hundreds of evicted images.
+  it("prepares only the inline MCP images the cap keeps", async () => {
+    const total = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST + 8;
+    const png = await pngBase64(10);
+    // Distinct item objects with the same bytes: the cache must not hide the extra work.
+    const messages = Array.from({ length: total }, (_, i) => mcpImageCall(i, [png])).flat();
+    const prepare = jest.spyOn(toolResultAttachments, "prepareExtractedToolAttachmentForProvider");
+    try {
+      await extractToolMediaAsUserMessagesFromModelMessages(messages);
+      expect(prepare).toHaveBeenCalledTimes(MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST);
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
+  // The SDK can carry the transformed messages into the next step, so a resized image arrives
+  // as the rewritten item: it must not be read again.
+  it("does not prepare a resized MCP image again on the next step", async () => {
+    const step1 = await extractToolMediaAsUserMessagesFromModelMessages(
+      mcpImageCall(0, [await pngBase64(9001)])
+    );
+    const prepare = jest.spyOn(toolResultAttachments, "prepareExtractedToolAttachmentForProvider");
+    try {
+      await extractToolMediaAsUserMessagesFromModelMessages(step1);
+      expect(prepare).not.toHaveBeenCalled();
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
+  // Past the preparation rounds, an image the cap keeps but nothing prepared must not reach
+  // the provider: an oversized or unreadable one would fail every later request.
+  it("never sends an unprepared inline image after the preparation rounds", async () => {
+    const cap = MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST;
+    const oversized = await pngBase64(9001);
+    const messages = [
+      ...Array.from({ length: cap }, (_, i) => mcpImageCall(i, [oversized])).flat(),
+      // Three cap-sized batches of corrupt images, newest last: each round frees a batch of slots.
+      ...Array.from({ length: 3 * cap }, (_, i) => mcpImageCall(cap + i, ["bm90LWEtcG5n"])).flat(),
+    ];
+
+    const result = await extractToolMediaAsUserMessagesFromModelMessages(messages);
+
+    expect(JSON.stringify(result)).not.toContain(oversized);
+  });
+
+  // A corrupt image becomes a text note, so it takes no media slot and must not evict one.
+  it("keeps every valid MCP image at the cap when a newer one is unreadable", async () => {
+    const valid = await Promise.all(
+      Array.from({ length: MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST }, (_, i) => pngBase64(i + 1))
+    );
+    const messages = [
+      ...valid.flatMap((data, i) => mcpImageCall(i, [data])),
+      ...mcpImageCall(valid.length, ["bm90LWEtcG5n"]),
+    ];
+
+    const serialized = JSON.stringify(
+      await extractToolMediaAsUserMessagesFromModelMessages(messages)
+    );
+
+    for (const data of valid) expect(serialized).toContain(data);
+    expect(serialized).not.toContain(createOmittedToolAttachmentText(1));
+    expect(serialized).toContain("Image attachment omitted");
+  });
+
+  it("self-heals MCP images kept inside tool results", async () => {
+    const valid = await pngBase64(10);
+    const oversized = await pngBase64(9001);
+    const mcpImage = (data: string) => ({
+      type: "file",
+      mediaType: "image/png",
+      data: { type: "data", data },
+    });
+    const messages: ModelMessage[] = [
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "call-mcp",
+            toolName: "mcp__shots__take",
+            output: {
+              type: "content",
+              value: [mcpImage(valid), mcpImage(oversized), mcpImage("bm90LWEtcG5n")],
+            },
+          } as unknown as ToolResultPart,
+        ],
+      },
+    ];
+
+    const result = await extractToolMediaAsUserMessagesFromModelMessages(messages);
+
+    const part = (result[0] as Extract<ModelMessage, { role: "tool" }>).content[0];
+    if (part.type !== "tool-result") throw new Error("Expected tool-result part");
+    const [kept, resized, unreadable] = expectContentOutputValue(part.output);
+    // A valid image keeps its bytes, so the in-turn step and the rebuild send the same prefix.
+    expect(kept).toEqual(mcpImage(valid));
+    const resizedData = (resized as { data: { data: string } }).data.data;
+    const metadata = await sharp(Buffer.from(resizedData, "base64")).metadata();
+    expect(metadata.width).toBe(MAX_IMAGE_DIMENSION);
+    expect(unreadable).toMatchObject({ type: "text" });
+    expect((unreadable as { text: string }).text).toContain("Image attachment omitted");
+    expect(await extractToolMediaAsUserMessagesFromModelMessages(result)).toEqual(result);
+  });
+
+  it("drops the oldest media first across extracted and MCP images", async () => {
+    const call = (index: number, value: unknown[]): ModelMessage[] => [
+      {
+        role: "assistant",
+        content: [{ type: "tool-call", toolCallId: `call-${index}`, toolName: "t", input: {} }],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: `call-${index}`,
+            toolName: "t",
+            output: { type: "content", value },
+          } as unknown as ToolResultPart,
+        ],
+      },
+    ];
+    const attach = (index: number) =>
+      call(index, [{ type: "media", data: `JVBERi${index}AAA`, mediaType: "application/pdf" }]);
+    const older = Array.from({ length: MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST }, (_, i) =>
+      attach(i)
+    ).flat();
+    const latestPng = await pngBase64(10);
+    const latestMcp = call(MAX_EXTRACTED_TOOL_MEDIA_PARTS_PER_REQUEST, [
+      { type: "file", mediaType: "image/png", data: { type: "data", data: latestPng } },
+    ]);
+
+    const serialized = JSON.stringify(
+      await extractToolMediaAsUserMessagesFromModelMessages([...older, ...latestMcp])
+    );
+
+    // The newest image (the MCP screenshot) stays; the oldest extraction is omitted instead.
+    expect(serialized).toContain(latestPng);
+    expect(serialized).not.toContain("JVBERi0AAA");
+    expect(serialized).toContain("JVBERi1AAA");
   });
 
   it("is a no-op when there is no media", async () => {

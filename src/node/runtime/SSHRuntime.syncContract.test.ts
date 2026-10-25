@@ -38,6 +38,11 @@ function createMockTransport(config: SSHRuntimeConfig): SSHTransport {
     createPtySession(_params: PtySessionParams): Promise<PtyHandle> {
       return Promise.reject(new Error("Unexpected PTY creation in SSHRuntime sync contract test"));
     },
+    openReverseForward(): Promise<never> {
+      return Promise.reject(
+        new Error("Unexpected reverse forward in SSHRuntime sync contract test")
+      );
+    },
   };
 }
 

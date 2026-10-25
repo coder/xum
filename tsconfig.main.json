@@ -25,7 +25,10 @@
   "exclude": [
     "**/*.test.ts",
     "**/*.test.tsx",
+    "**/*.bench.ts",
     "**/*.testHarness.ts",
+    "**/*.hostProof.ts",
+    "src/node/services/testHistoryService.ts",
     "src/browser/**/*",
     "src/cli/debug/**/*",
     "src/node/builtinWorkflowActions/**/*",

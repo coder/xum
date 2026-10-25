@@ -1,10 +1,12 @@
 import * as fsPromises from "fs/promises";
 import * as path from "node:path";
 
-import writeFileAtomic from "write-file-atomic";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
+import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /**
  * Durable terminal-failure artifacts for sub-agent tasks.
@@ -103,16 +105,63 @@ export async function readSubagentFailureArtifact(
   }
 
   // Self-healing: drop malformed entries instead of surfacing partial data.
-  if (
-    typeof entry.errorMessage !== "string" ||
-    entry.errorMessage.length === 0 ||
-    typeof entry.errorType !== "string" ||
-    !isStringArray(entry.ancestorWorkspaceIds)
-  ) {
-    return null;
-  }
+  return isWellFormedFailureArtifact(entry) ? entry : null;
+}
 
-  return entry;
+function isWellFormedFailureArtifact(entry: SubagentFailureArtifact): boolean {
+  return (
+    typeof entry.errorMessage === "string" &&
+    entry.errorMessage.length > 0 &&
+    typeof entry.errorType === "string" &&
+    isStringArray(entry.ancestorWorkspaceIds)
+  );
+}
+
+/**
+ * Fail-closed read for attempt classification (G2): unlike readSubagentFailureArtifact, which
+ * self-heals a damaged file to "no failure", a present but unparseable file or entry is
+ * `unreadable`, so a terminal failure is never mistaken for an attempt that merely ended.
+ */
+export async function readSubagentFailureArtifactStrict(
+  workspaceSessionDir: string,
+  childTaskId: string
+): Promise<
+  | { kind: "found"; artifact: SubagentFailureArtifact }
+  | { kind: "not_found" }
+  | { kind: "unreadable"; error: string }
+> {
+  let raw: string;
+  try {
+    raw = await fsPromises.readFile(
+      getSubagentFailureArtifactsFilePath(workspaceSessionDir),
+      "utf-8"
+    );
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return { kind: "not_found" };
+    }
+    return { kind: "unreadable", error: getErrorMessage(error) };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return { kind: "unreadable", error: getErrorMessage(error) };
+  }
+  const file = parsed as { version?: unknown; failuresByChildTaskId?: unknown } | null;
+  if (
+    file?.version !== SUBAGENT_FAILURE_ARTIFACTS_FILE_VERSION ||
+    file.failuresByChildTaskId == null ||
+    typeof file.failuresByChildTaskId !== "object"
+  ) {
+    return { kind: "unreadable", error: "unexpected failure artifacts file shape" };
+  }
+  const failures = file.failuresByChildTaskId as Record<string, SubagentFailureArtifact>;
+  if (!Object.hasOwn(failures, childTaskId)) return { kind: "not_found" };
+  const artifact = failures[childTaskId];
+  return artifact != null && typeof artifact === "object" && isWellFormedFailureArtifact(artifact)
+    ? { kind: "found", artifact }
+    : { kind: "unreadable", error: "malformed failure artifact entry" };
 }
 
 export async function upsertSubagentFailureArtifact(params: {
@@ -127,8 +176,12 @@ export async function upsertSubagentFailureArtifact(params: {
   workflowOwnedAncestorWorkspaceIds?: string[];
   model?: string;
   nowMs?: number;
+  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
+  locks?: SessionLocks;
 }): Promise<void> {
-  await workspaceFileLocks.withLock(params.workspaceId, async () => {
+  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
+  const fileLocks = (params.locks ?? nodeSessionLocks).workspaceFiles;
+  await fileLocks.withLock(params.workspaceId, async () => {
     const nowMs = params.nowMs ?? Date.now();
 
     const file = await readSubagentFailureArtifactsFile(params.workspaceSessionDir);

@@ -1,10 +1,10 @@
-import * as fs from "fs/promises";
 import * as path from "path";
-import writeFileAtomic from "write-file-atomic";
+import * as fs from "fs/promises";
+import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
 import type { Config } from "@/node/config";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { log } from "@/node/services/log";
 import { getErrorMessage } from "@/common/utils/errors";
 
@@ -16,6 +16,11 @@ export interface SessionFileWriteOptions {
    * If it returns false, the write is skipped.
    */
   shouldWrite?: () => boolean;
+  /**
+   * Optional step awaited after the workspace file lock is acquired, before `shouldWrite`: the
+   * write keeps its place in the per-workspace queue while it runs.
+   */
+  beforeWrite?: () => Promise<void>;
 }
 
 /**
@@ -23,20 +28,25 @@ export interface SessionFileWriteOptions {
  * Provides consistent file locking, error handling, and path resolution.
  *
  * Used by HistoryService partial persistence, InitStateManager, and other services that need
- * to persist state to ~/.shux/sessions/{workspaceId}/.
+ * to persist state to ~/.xum/sessions/{workspaceId}/.
  */
 export class SessionFileManager<T> {
   private readonly config: Config;
   private readonly fileName: string;
-  private readonly fileLocks = workspaceFileLocks;
+  private readonly fileLocks: SessionLocks["workspaceFiles"];
 
-  constructor(config: Config, fileName: string) {
+  /**
+   * `locks` gives the workspace FIFO (phase 4: SessionLocks). No default: a caller that holds
+   * injected locks must not fall back to the Node FIFO by omission.
+   */
+  constructor(config: Config, fileName: string, locks: SessionLocks) {
     this.config = config;
     this.fileName = fileName;
+    this.fileLocks = locks.workspaceFiles;
   }
 
   private getFilePath(workspaceId: string): string {
-    return path.join(this.config.getSessionDir(workspaceId), this.fileName);
+    return path.join(this.config.sessionsDir, workspaceId, this.fileName);
   }
 
   /**
@@ -72,11 +82,12 @@ export class SessionFileManager<T> {
   ): Promise<Result<void>> {
     return this.fileLocks.withLock(workspaceId, async () => {
       try {
+        await options?.beforeWrite?.();
         if (options?.shouldWrite && !options.shouldWrite()) {
           return Ok(undefined);
         }
 
-        const sessionDir = this.config.getSessionDir(workspaceId);
+        const sessionDir = path.join(this.config.sessionsDir, workspaceId);
         await fs.mkdir(sessionDir, { recursive: true });
         const filePath = this.getFilePath(workspaceId);
         // Atomic write prevents corruption if app crashes mid-write

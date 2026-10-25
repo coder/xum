@@ -1,4 +1,4 @@
-import { resolveShuxEnvironmentValue } from "@/common/compat/legacyMux";
+import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { createOrpcServer, type OrpcServer, type OrpcServerOptions } from "@/node/orpc/server";
 import { ServerLockfile } from "./serverLockfile";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -10,6 +10,7 @@ import * as childProcess from "node:child_process";
 import { VERSION } from "@/version";
 import { buildMuxMdnsServiceOptions, MdnsAdvertiserService } from "./mdnsAdvertiserService";
 import type { AppRouter } from "@/node/orpc/router";
+import { isSessionTapeReplayMode } from "@/node/services/sessionTapes/sessionTapeReplaySource";
 
 export interface ServerInfo {
   /** Base URL that is always connectable from the local machine (loopback for wildcard binds). */
@@ -25,8 +26,8 @@ export interface ServerInfo {
 }
 
 export interface StartServerOptions {
-  /** Path to shux home directory (for lockfile) */
-  muxHome: string;
+  /** Path to xum home directory (for lockfile) */
+  xumHome: string;
   /** oRPC context with services */
   context: ORPCContext;
   /** Host/interface to bind to (default: "127.0.0.1") */
@@ -88,7 +89,7 @@ function buildHttpBaseUrl(host: string, port: number): string {
 }
 
 function resolveAllowHttpOriginEnvFlag(): boolean {
-  const raw = resolveShuxEnvironmentValue("SERVER_ALLOW_HTTP_ORIGIN", process.env);
+  const raw = resolveXumEnvironmentValue("SERVER_ALLOW_HTTP_ORIGIN", process.env);
   if (!raw) {
     return false;
   }
@@ -297,6 +298,19 @@ export class ServerService {
   private serverInfo: ServerInfo | null = null;
   private readonly mdnsAdvertiser = new MdnsAdvertiserService();
   private sshHost: string | undefined = undefined;
+  private shuttingDown = false;
+
+  /**
+   * Process teardown has begun. The HTTP/WS server keeps accepting connections until stopServer()
+   * runs last, so the RPC layer consults this to refuse new procedure calls in the meantime.
+   */
+  beginShutdown(): void {
+    this.shuttingDown = true;
+  }
+
+  isShuttingDown(): boolean {
+    return this.shuttingDown;
+  }
 
   /**
    * Set the launch project path
@@ -350,15 +364,21 @@ export class ServerService {
     if (this.server) {
       throw new Error("Server already running in this process");
     }
+    // Session tape replay mode (perf harness) serves tapes only to desktop windows, whose
+    // network egress desktop main blocks. A browser or CLI client of this server would render
+    // recorded content (remote images) outside that block, so replay mode runs no API server.
+    if (isSessionTapeReplayMode()) {
+      throw new Error("The API server is disabled in session tape replay mode (XUM_REPLAY_TAPES)");
+    }
 
     // Create lockfile instance for checking - don't store yet
-    const lockfile = new ServerLockfile(options.muxHome);
+    const lockfile = new ServerLockfile(options.xumHome);
 
     // Check for existing server (another process)
     const existing = await lockfile.read();
     if (existing) {
       throw new Error(
-        `Another shux server is already running at ${existing.baseUrl} (PID: ${existing.pid})`
+        `Another xum server is already running at ${existing.baseUrl} (PID: ${existing.pid})`
       );
     }
 
@@ -439,7 +459,7 @@ export class ServerService {
 
     // "auto" mode: only advertise when the bind host is reachable from other devices.
     if (mdnsAdvertisementEnabled !== false && !isLoopbackHost(bindHost)) {
-      const instanceName = options.context.config.getMdnsServiceName() ?? `shux-${os.hostname()}`;
+      const instanceName = options.context.config.getMdnsServiceName() ?? `xum-${os.hostname()}`;
       const serviceOptions = buildMuxMdnsServiceOptions({
         bindHost,
         port: server.port,
@@ -451,7 +471,7 @@ export class ServerService {
       try {
         await this.mdnsAdvertiser.start(serviceOptions);
       } catch (err) {
-        log.warn("Failed to advertise shux API server via mDNS:", err);
+        log.warn("Failed to advertise xum API server via mDNS:", err);
       }
     } else if (mdnsAdvertisementEnabled === true && isLoopbackHost(bindHost)) {
       log.warn(
@@ -511,4 +531,117 @@ export class ServerService {
   getLockfilePath(): string | null {
     return this.lockfile?.getLockPath() ?? null;
   }
+}
+
+type ServerSettingsContext = ORPCContext;
+
+function getApiServerStatusSnapshot(context: ServerSettingsContext) {
+  const config = context.config.loadConfigOrDefault();
+  const info = context.serverService.getServerInfo();
+  return {
+    running: info !== null,
+    baseUrl: info?.baseUrl ?? null,
+    bindHost: info?.bindHost ?? null,
+    port: info?.port ?? null,
+    networkBaseUrls: info?.networkBaseUrls ?? [],
+    tailscaleBindHosts: context.serverService.getTailscaleBindHosts(),
+    token: info?.token ?? null,
+    configuredBindHost: config.apiServerBindHost ?? null,
+    configuredPort: config.apiServerPort ?? null,
+    configuredServeWebUi: config.apiServerServeWebUi === true,
+  };
+}
+
+export async function setServerSshHost(
+  context: ServerSettingsContext,
+  sshHost: string | null | undefined
+): Promise<void> {
+  // Write first (#4444): a rejected write must not leave the in-memory host ahead of disk.
+  await context.config.editConfig((config) => ({ ...config, serverSshHost: sshHost ?? undefined }));
+  context.serverService.setSshHost(sshHost ?? undefined);
+}
+
+export function getApiServerStatus(context: ServerSettingsContext) {
+  return getApiServerStatusSnapshot(context);
+}
+
+export async function setApiServerSettings(
+  context: ServerSettingsContext,
+  input: { bindHost?: string | null; serveWebUi?: boolean | null; port?: number | null }
+) {
+  const prevConfig = context.config.loadConfigOrDefault();
+  const prevBindHost = prevConfig.apiServerBindHost;
+  const prevServeWebUi = prevConfig.apiServerServeWebUi;
+  const prevPort = prevConfig.apiServerPort;
+  const wasRunning = context.serverService.isServerRunning();
+  const bindHost = input.bindHost?.trim() ? input.bindHost.trim() : undefined;
+  const serveWebUi =
+    input.serveWebUi === undefined ? prevServeWebUi : input.serveWebUi === true ? true : undefined;
+  const port = input.port === null || input.port === 0 ? undefined : input.port;
+  // Best effort: a failed restore must not replace the error the caller needs to see (#4748).
+  const restorePreviousSettings = async (): Promise<void> => {
+    try {
+      await context.config.editConfig((config) => {
+        config.apiServerServeWebUi = prevServeWebUi;
+        config.apiServerBindHost = prevBindHost;
+        config.apiServerPort = prevPort;
+        return config;
+      });
+    } catch (restoreError) {
+      log.warn("Failed to restore previous API server settings", { error: restoreError });
+    }
+  };
+
+  // Write before stopping (#4748): a rejected write then leaves the running server untouched,
+  // instead of stopped while disk keeps the old settings. If the stop itself fails, put the
+  // previous settings back so disk matches the server that is still running.
+  await context.config.editConfig((config) => {
+    config.apiServerServeWebUi = serveWebUi;
+    config.apiServerBindHost = bindHost;
+    config.apiServerPort = port;
+    return config;
+  });
+  if (wasRunning) {
+    try {
+      await context.serverService.stopServer();
+    } catch (error) {
+      await restorePreviousSettings();
+      throw error;
+    }
+  }
+
+  if (resolveXumEnvironmentValue("NO_API_SERVER", process.env) !== "1") {
+    const authToken = context.serverService.getApiAuthToken();
+    if (!authToken) throw new Error("API server auth token not initialized");
+    const envPortRaw = resolveXumEnvironmentValue("SERVER_PORT", process.env);
+    const envPort = envPortRaw ? Number.parseInt(envPortRaw, 10) : undefined;
+    try {
+      await context.serverService.startServer({
+        xumHome: context.config.rootDir,
+        context,
+        authToken,
+        serveStatic: serveWebUi === true,
+        host: bindHost ?? "127.0.0.1",
+        port: envPort ?? port ?? 0,
+      });
+    } catch (error) {
+      await restorePreviousSettings();
+      if (wasRunning) {
+        try {
+          await context.serverService.startServer({
+            xumHome: context.config.rootDir,
+            context,
+            serveStatic: prevServeWebUi === true,
+            authToken,
+            host: prevBindHost ?? "127.0.0.1",
+            port: envPort ?? prevPort ?? 0,
+          });
+        } catch {
+          // Best effort: preserve the original settings error.
+        }
+      }
+      throw error;
+    }
+  }
+  return getApiServerStatusSnapshot(context);
 }

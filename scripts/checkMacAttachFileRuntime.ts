@@ -12,6 +12,12 @@ import { resolveMacPackagedAppNames } from "../src/common/compat/macPackagedApp"
 const { productFilename: EXECUTABLE_NAME, appBundleName: APP_NAME } = resolveMacPackagedAppNames(
   packageJson.build
 );
+type MacAppArchitecture = "x64" | "arm64";
+
+const MAC_APP_RUNTIME_PACKAGES: Record<MacAppArchitecture, { binding: string; libvips: string }> = {
+  x64: { binding: "sharp-darwin-x64", libvips: "sharp-libvips-darwin-x64" },
+  arm64: { binding: "sharp-darwin-arm64", libvips: "sharp-libvips-darwin-arm64" },
+};
 const RELEASE_DIR = path.join(process.cwd(), "release");
 const APP_ASAR_UNPACKED_NODE_MODULES = [
   ["node_modules", "sharp"],
@@ -113,7 +119,10 @@ async function findFileMatching(rootDir: string, pattern: RegExp): Promise<strin
   return await walk(rootDir);
 }
 
-async function verifyUnpackedSharpAssets(appBundlePath: string): Promise<void> {
+async function verifyUnpackedSharpAssets(
+  appBundlePath: string,
+  architectures: readonly MacAppArchitecture[]
+): Promise<void> {
   const unpackedRoot = path.join(appBundlePath, "Contents", "Resources", "app.asar.unpacked");
   for (const segments of APP_ASAR_UNPACKED_NODE_MODULES) {
     const requiredPath = path.join(unpackedRoot, ...segments);
@@ -121,18 +130,37 @@ async function verifyUnpackedSharpAssets(appBundlePath: string): Promise<void> {
     assert(stat?.isDirectory(), `Missing unpacked runtime directory: ${requiredPath}`);
   }
 
-  const unpackedNodeModules = path.join(unpackedRoot, "node_modules");
-  const sharpBinaryPath = await findFileMatching(unpackedNodeModules, /sharp.*\.node$/);
-  assert(
-    sharpBinaryPath != null,
-    `Missing unpacked sharp native binary under ${unpackedNodeModules}`
-  );
+  const unpackedImgDir = path.join(unpackedRoot, "node_modules", "@img");
+  // Issue #3338: checking for any sharp binary let the x64 app ship with only arm64 assets.
+  for (const architecture of architectures) {
+    const runtimePackages = MAC_APP_RUNTIME_PACKAGES[architecture];
+    const bindingDir = path.join(unpackedImgDir, runtimePackages.binding);
+    const bindingStat = await fs.stat(bindingDir).catch(() => null);
+    assert(
+      bindingStat?.isDirectory(),
+      `Missing ${architecture} sharp binding directory: ${bindingDir}`
+    );
 
-  const libvipsPath = await findFileMatching(unpackedNodeModules, /libvips-cpp\..*\.dylib$/);
-  assert(libvipsPath != null, `Missing unpacked libvips dylib under ${unpackedNodeModules}`);
+    // sharp 0.35 names the binary with its version (sharp-darwin-arm64-0.35.5.node).
+    const sharpBinaryPath = await findFileMatching(
+      bindingDir,
+      new RegExp(`${runtimePackages.binding}(?:-\\d+\\.\\d+\\.\\d+)?\\.node$`)
+    );
+    assert(
+      sharpBinaryPath != null,
+      `Missing ${architecture} sharp native binary under ${bindingDir}`
+    );
 
-  console.log(`[attach-file-smoke] unpacked sharp binary: ${sharpBinaryPath}`);
-  console.log(`[attach-file-smoke] unpacked libvips dylib: ${libvipsPath}`);
+    const libvipsDir = path.join(unpackedImgDir, runtimePackages.libvips);
+    const libvipsStat = await fs.stat(libvipsDir).catch(() => null);
+    assert(libvipsStat?.isDirectory(), `Missing ${architecture} libvips directory: ${libvipsDir}`);
+
+    const libvipsPath = await findFileMatching(libvipsDir, /libvips-cpp\..*\.dylib$/);
+    assert(libvipsPath != null, `Missing ${architecture} libvips dylib under ${libvipsDir}`);
+
+    console.log(`[attach-file-smoke] ${architecture} sharp binary: ${sharpBinaryPath}`);
+    console.log(`[attach-file-smoke] ${architecture} libvips dylib: ${libvipsPath}`);
+  }
 }
 
 async function createFixtureImages(
@@ -181,6 +209,59 @@ async function resolvePackagedMacExecutable(appBundlePath: string): Promise<stri
   return path.join(macOsDir, match.name);
 }
 
+// `lipo` only reads the Mach-O header, but /usr/bin/lipo is an xcrun shim that first locates the
+// developer tool, which can be slow on a loaded macOS runner. The previous 10 s limit timed out
+// there (#4940; that job's cleanup found an orphaned xcodebuild). A longer limit plus one retry on
+// ETIMEDOUT only absorbs that stall; every other lipo failure stays fatal.
+const LIPO_TIMEOUT_MS = 60_000;
+
+function runLipoArchs(executablePath: string) {
+  const run = () =>
+    spawnSync("lipo", ["-archs", executablePath], { encoding: "utf8", timeout: LIPO_TIMEOUT_MS });
+  const first = run();
+  if ((first.error as NodeJS.ErrnoException | undefined)?.code !== "ETIMEDOUT") return first;
+  console.warn(
+    `[attach-file-smoke] lipo timed out after ${LIPO_TIMEOUT_MS} ms for ${executablePath}; retrying once`
+  );
+  return run();
+}
+
+async function getPackagedAppArchitectures(appBundlePath: string): Promise<MacAppArchitecture[]> {
+  const executablePath = await resolvePackagedMacExecutable(appBundlePath);
+  const result = runLipoArchs(executablePath);
+
+  if (result.error != null) {
+    throw result.error;
+  }
+  if (result.signal != null) {
+    throw new Error(`lipo was terminated by signal ${result.signal} for ${executablePath}`);
+  }
+  assert(
+    result.status === 0,
+    `lipo failed for ${executablePath} with exit code ${result.status}: ${result.stderr.trim()}`
+  );
+
+  const architectures = result.stdout
+    .trim()
+    .split(/\s+/)
+    .map((architecture): MacAppArchitecture | null => {
+      if (architecture === "x86_64") {
+        return "x64";
+      }
+      if (architecture === "arm64") {
+        return "arm64";
+      }
+      return null;
+    })
+    .filter((architecture): architecture is MacAppArchitecture => architecture != null);
+  const uniqueArchitectures = [...new Set(architectures)];
+  assert(
+    uniqueArchitectures.length > 0,
+    `No supported macOS architecture found in ${executablePath}. lipo reported: ${result.stdout.trim()}`
+  );
+  return uniqueArchitectures;
+}
+
 async function runPackagedSmokeApp(
   appBundlePath: string,
   fixturePaths: { pngPath: string; jpegPath: string }
@@ -223,18 +304,76 @@ async function runPackagedSmokeApp(
 async function main(): Promise<void> {
   assert(process.platform === "darwin", "checkMacAttachFileRuntime.ts only runs on macOS");
 
-  const requestedAppBundle = process.argv[2];
-  const appBundlePath = requestedAppBundle ?? (await chooseDefaultAppBundle());
-  const appStat = await fs.stat(appBundlePath).catch(() => null);
-  assert(appStat?.isDirectory(), `macOS app bundle not found: ${appBundlePath}`);
+  // `--arch <x64|arm64>` checks a single-architecture build (CI builds each arch on its
+  // own runner). Only the host's native arch is launched for the smoke run; other arches
+  // get the static sharp-asset verification, matching the two-arch default below, which
+  // likewise only launches the native bundle.
+  const args = process.argv.slice(2);
+  const archFlagIndex = args.indexOf("--arch");
+  let requestedArchitecture: MacAppArchitecture | null = null;
+  if (archFlagIndex !== -1) {
+    const value = args[archFlagIndex + 1];
+    assert(value === "x64" || value === "arm64", `--arch expects x64 or arm64, got ${value}`);
+    requestedArchitecture = value;
+    args.splice(archFlagIndex, 2);
+  }
+  const requestedAppBundle = args[0];
+  let appBundles: string[];
+  let smokeAppBundle: string;
+  if (requestedAppBundle != null) {
+    appBundles = [requestedAppBundle];
+    smokeAppBundle = requestedAppBundle;
+  } else {
+    const { matches, seen } = await findAppBundles(RELEASE_DIR);
+    assert(
+      matches.length > 0,
+      `No ${APP_NAME} found under ${RELEASE_DIR}. Run make dist-mac first. Stored .app names: ${
+        seen.length > 0 ? seen.join(", ") : "(none)"
+      }`
+    );
+    appBundles = matches;
+    smokeAppBundle = await chooseDefaultAppBundle();
+  }
 
-  console.log(`[attach-file-smoke] using app bundle ${appBundlePath}`);
-  await verifyUnpackedSharpAssets(appBundlePath);
+  const verifiedArchitectures = new Set<MacAppArchitecture>();
+  for (const appBundlePath of appBundles) {
+    const appStat = await fs.stat(appBundlePath).catch(() => null);
+    assert(appStat?.isDirectory(), `macOS app bundle not found: ${appBundlePath}`);
+
+    const architectures = await getPackagedAppArchitectures(appBundlePath);
+    console.log(
+      `[attach-file-smoke] verifying app bundle ${appBundlePath} (${architectures.join(", ")})`
+    );
+    await verifyUnpackedSharpAssets(appBundlePath, architectures);
+    for (const architecture of architectures) {
+      verifiedArchitectures.add(architecture);
+    }
+  }
+
+  if (requestedAppBundle == null) {
+    const requiredArchitectures: readonly MacAppArchitecture[] =
+      requestedArchitecture != null ? [requestedArchitecture] : ["x64", "arm64"];
+    for (const requiredArchitecture of requiredArchitectures) {
+      assert(
+        verifiedArchitectures.has(requiredArchitecture),
+        `Missing ${requiredArchitecture} macOS app bundle under ${RELEASE_DIR}. Verified architectures: ${
+          verifiedArchitectures.size > 0 ? [...verifiedArchitectures].join(", ") : "(none)"
+        }`
+      );
+    }
+  }
+
+  if (requestedArchitecture != null && requestedArchitecture !== process.arch) {
+    console.log(
+      `[attach-file-smoke] skipping launch of non-native ${requestedArchitecture} bundle on ${process.arch}`
+    );
+    return;
+  }
 
   const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "mux-attach-file-smoke-"));
   try {
     const fixturePaths = await createFixtureImages(tempDir);
-    await runPackagedSmokeApp(appBundlePath, fixturePaths);
+    await runPackagedSmokeApp(smokeAppBundle, fixturePaths);
   } finally {
     await fs.rm(tempDir, { recursive: true, force: true });
   }

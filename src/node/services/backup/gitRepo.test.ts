@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -161,10 +162,21 @@ describe("BackupRepoCache", () => {
     await fs.writeFile(path.join(seed, "mux", "AGENTS.md"), "managed\n", "utf-8");
     await fs.writeFile(path.join(seed, "outside", "history.txt"), "0\n", "utf-8");
     await commitAll(seed, "seed");
+    // One fast-import process writes the 200 commits. Two git processes per commit (add + commit)
+    // took ~8 s on a busy host, past the default 5 s test timeout (#6091).
+    const branch = await runGit(["-C", seed, "symbolic-ref", "HEAD"]);
+    const data = (text: string) => `data ${Buffer.byteLength(text)}\n${text}\n`;
+    let stream = "";
     for (let index = 1; index <= 200; index++) {
-      await fs.writeFile(path.join(seed, "outside", "history.txt"), `${index}\n`, "utf-8");
-      await commitAll(seed, `outside history ${index}`);
+      stream += `commit ${branch}\ncommitter Xum <mux@example.com> ${1_700_000_000 + index} +0000\n`;
+      stream += data(`outside history ${index}`);
+      if (index === 1) stream += `from ${branch}^0\n`;
+      stream += `M 100644 inline outside/history.txt\n${data(`${index}\n`)}`;
     }
+    const fastImport = spawnSync("git", ["-C", seed, "fast-import", "--quiet"], { input: stream });
+    expect(fastImport.stderr.toString()).toBe("");
+    expect(fastImport.status).toBe(0);
+    expect(await runGit(["-C", seed, "rev-list", "--count", "HEAD"])).toBe("201");
     await runGit(["-C", seed, "push", "origin", "HEAD:main"]);
 
     const repo = createRepo();
@@ -369,7 +381,7 @@ exec "$REAL_GIT" "$@"
       "-c",
       "user.email=mux@example.com",
       "-c",
-      "user.name=Shux",
+      "user.name=Xum",
       "commit",
       "-m",
       "add gitlink",
@@ -796,7 +808,7 @@ exec "$REAL_GIT" "$@"
 
   it("materializes only the managed path and preserves the rest of the branch", async () => {
     // Nothing outside the managed path may reach the filesystem, because a name this
-    // platform cannot create (say `linux/CON` on Windows) would fail the checkout before Shux
+    // platform cannot create (say `linux/CON` on Windows) would fail the checkout before Xum
     // reads its own directory. A scoped commit must still leave that file in the tree.
     const seed = path.join(tempDir, "seed");
     await fs.mkdir(path.join(seed, "outside"), { recursive: true });
@@ -1107,7 +1119,7 @@ exec "$REAL_GIT" "$@"
     ]);
     await runGit(["-C", seed, "push", "-q", originPath, "HEAD:refs/heads/main"]);
 
-    // Shux may be launched from a git hook or alias, where these are exported. Git reads them
+    // Xum may be launched from a git hook or alias, where these are exported. Git reads them
     // ahead of `-C`, so without stripping, checkout materializes under the outside worktree
     // and `clean -fdx -- mux` deletes the victim file there.
     const outside = path.join(tempDir, "outside-repo");
@@ -1553,7 +1565,7 @@ exec "$REAL_GIT" "$@"
     await repo.ensureCache();
 
     // A user-level rewrite: `remote get-url` reports the rewritten spelling while the
-    // stored value stays what Shux wrote, so an effective-url comparison rejected every
+    // stored value stays what Xum wrote, so an effective-url comparison rejected every
     // operation for this user.
     const globalConfig = path.join(tempDir, "gitconfig");
     await fs.writeFile(

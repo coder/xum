@@ -29,10 +29,29 @@ export const ChatUsageDisplaySchema = z.object({
   input: ChatUsageComponentSchema,
   cached: ChatUsageComponentSchema,
   cacheCreate: ChatUsageComponentSchema,
+  // Without it, the schema would strip the 1h-TTL share and repricing would drop its premium.
+  cacheCreate1hTokens: z.number().optional(),
   output: ChatUsageComponentSchema,
   reasoning: ChatUsageComponentSchema,
   model: z.string().optional(),
   costsIncluded: z.boolean().optional(),
+  // Without it, the schema would strip the tier and repricing would drop the premium (#4787).
+  serviceTier: z.enum(["flex", "fast", "ultrafast", "unknown", "mixed"]).optional(),
+  // Without it, repricing could not keep each request's context tier. A malformed share is
+  // dropped rather than rejecting the whole usage file; the aggregate then keeps its costs.
+  longContextTokens: z
+    .object({
+      input: z.number(),
+      cached: z.number(),
+      cacheCreate: z.number(),
+      cacheCreate1h: z.number(),
+      output: z.number(),
+    })
+    .optional()
+    .catch(undefined),
+  // Merged sums of unpriced requests hold numeric partial costs, so only this flag keeps the
+  // unknown-pricing warning across IPC.
+  hasUnknownCosts: z.boolean().optional(),
 });
 
 export const ChatStatsSchema = z.object({
@@ -78,6 +97,11 @@ export const SessionUsageTokenStatsCacheSchema = z.object({
     .array(TopFilePathSchema)
     .optional()
     .meta({ description: "Top 10 files by token count aggregated across all file tools" }),
+  // Non-strict object: an older build strips this on downgrade and simply recounts.
+  source: z
+    .object({ historyReceipt: z.string(), inputsKey: z.string() })
+    .optional()
+    .meta({ description: "History receipt + inputs digest this cache was counted from" }),
 });
 
 export const RolledUpChildEntrySchema = z.object({
@@ -97,8 +121,19 @@ export type RolledUpChildEntry = z.infer<typeof RolledUpChildEntrySchema>;
 
 /**
  * Cumulative session usage file format.
- * Stored in ~/.shux/sessions/{workspaceId}/session-usage.json
+ * Stored in ~/.xum/sessions/{workspaceId}/session-usage.json
  */
+/** Clock skew tolerated between the machine that wrote a fork marker and this one. */
+const FORK_BOUNDARY_MAX_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000;
+
+function isPlausibleForkBoundary(timestamp: number): boolean {
+  return (
+    Number.isSafeInteger(timestamp) &&
+    timestamp >= 0 &&
+    timestamp <= Date.now() + FORK_BOUNDARY_MAX_FUTURE_SKEW_MS
+  );
+}
+
 export const SessionUsageFileSchema = z.object({
   byModel: z.record(z.string(), ChatUsageDisplaySchema),
   lastRequest: z
@@ -116,5 +151,15 @@ export const SessionUsageFileSchema = z.object({
     .record(z.string(), z.union([z.literal(true), RolledUpChildEntrySchema]))
     .optional(),
   tokenStatsCache: SessionUsageTokenStatsCacheSchema.optional(),
+  /**
+   * Set when a fork reset this ledger: the newest timestamp (ms since epoch) among the rows
+   * the fork copied from its parent. Rows at or before it are inherited, so per-turn views
+   * skip them; every row the fork writes itself is newer. A timestamp, not a history
+   * sequence: editing an inherited message in the fork reuses lower sequences.
+   * Self-healing: a value that cannot be a real timestamp (fractional, negative, or later
+   * than now plus clock skew, which would hide every turn) is dropped, and the workspace
+   * then shows every turn, as old forks without the marker do.
+   */
+  forkedAt: z.number().refine(isPlausibleForkBoundary).optional().catch(undefined),
   version: z.literal(1),
 });

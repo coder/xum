@@ -1,3 +1,4 @@
+import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import type {
   WorkspaceComposition,
   WorkspaceCompositionEntry,
@@ -9,13 +10,16 @@ import { discoverAgentDefinitions } from "@/node/services/agentDefinitions/agent
 import {
   discoverAgentSkills,
   getDefaultAgentSkillsRoots,
+  requireReachableSkills,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import { discoverWorkflowScripts } from "@/node/services/workflows/workflowScriptDiscovery";
 
 import { joinPathLike } from "@/node/services/hooks";
+import { isPluginSlashCommandConsented } from "./componentConsent";
 import { discoverWorkspaceAgentPlugins, type AgentPluginInfo } from "./discovery";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /**
  * Workspace composition inspector (the `--dump-config` analog): computes the
@@ -24,10 +28,7 @@ import { discoverWorkspaceAgentPlugins, type AgentPluginInfo } from "./discovery
  *
  * The composition reuses the production loaders (skill/agent/workflow
  * discovery, MCP config layers) rather than forking parallel loading paths, so
- * what it reports is what streams actually load. Plugin discovery/validation
- * itself is NOT experiment-gated — the `plugins` and `diagnostics` sections
- * are always populated — but plugin artifacts only join the per-kind layers
- * when the agent-plugins experiment is enabled, mirroring load behavior.
+ * what it reports is what streams actually load.
  */
 export interface BuildWorkspaceCompositionArgs {
   runtime: Runtime;
@@ -36,14 +37,15 @@ export interface BuildWorkspaceCompositionArgs {
   /**
    * Host checkout root anchoring plugin containers, or null for off-host
    * runtimes (SSH/Docker). Plugin discovery is host-filesystem-only and
-   * production never loads plugin containers off-host, so a null suppresses
-   * it — passing the remote workspacePath instead would report host files
-   * production never loads.
+   * production loads no project plugin containers off-host, so a null
+   * suppresses the plugin summaries (MCP servers, slash commands, hooks) —
+   * passing the remote workspacePath instead would report host files
+   * production never loads. Global host plugin skills and agents still load
+   * off-host, and the runtime-based skill/agent loaders below report them.
    */
   hostCheckoutRoot: string | null;
-  muxHome: string;
+  xumHome: string;
   projectTrusted: boolean;
-  agentPluginsEnabled: boolean;
   /** MCP servers split by config layer (see MCPConfigService.listServerLayers). */
   listMcpServerLayers: () => Promise<{
     plugin: Record<string, MCPServerInfo>;
@@ -76,7 +78,7 @@ function markShadowed(entries: WorkspaceCompositionEntry[]): WorkspaceCompositio
 
 function summarizePlugin(plugin: AgentPluginInfo): WorkspaceCompositionPlugin {
   const components: string[] = [
-    ...(plugin.skillsDir !== undefined ? ["skills"] : []),
+    ...(plugin.skillsDirs !== undefined ? ["skills"] : []),
     ...(plugin.mcpConfigPath !== undefined ? ["mcp"] : []),
     ...(plugin.agentsDir !== undefined ? ["agents"] : []),
     ...(plugin.workflowsDir !== undefined ? ["workflows"] : []),
@@ -92,7 +94,7 @@ function summarizePlugin(plugin: AgentPluginInfo): WorkspaceCompositionPlugin {
   };
 }
 
-/** Shell tool hooks (hooks.ts): project .mux/<file> shadows user ~/.mux/<file>. */
+/** Shell tool hooks: project Xum metadata shadows the runtime user's Xum home. */
 const SHELL_HOOK_FILENAMES = ["tool_hook", "tool_pre", "tool_post"] as const;
 
 async function collectShellHookEntries(
@@ -100,16 +102,16 @@ async function collectShellHookEntries(
   workspacePath: string
 ): Promise<WorkspaceCompositionEntry[]> {
   const entries: WorkspaceCompositionEntry[] = [];
-  // Same resolution as production hooks.ts: both layers live in the WORKSPACE
-  // runtime's filesystem (project .mux + the runtime user's ~/.mux) — host
-  // fs.stat/os.homedir would miss real remote hooks and could report
-  // unrelated host files for SSH/Docker workspaces.
-  const layers: Array<{ dir: string; source: string }> = [
-    { dir: joinPathLike(workspacePath, ".mux"), source: "project" },
-  ];
+  // Match production hook resolution on the workspace runtime filesystem.
+  const layers: Array<{ dir: string; source: string }> = listProjectMetadataRelativePaths("").map(
+    (relativePath) => ({
+      dir: joinPathLike(workspacePath, relativePath),
+      source: "project",
+    })
+  );
   try {
-    const homeDir = await runtime.resolvePath("~");
-    layers.push({ dir: joinPathLike(homeDir, ".mux"), source: "global" });
+    const homeDir = await runtime.resolvePath(runtime.getXumHome());
+    layers.push({ dir: homeDir, source: "global" });
   } catch {
     // Home resolution failed (e.g. dead SSH connection) — skip the user layer,
     // matching hooks.ts's best-effort fallback.
@@ -143,23 +145,16 @@ function workflowSourceLabel(scope: string, canonicalScriptPath?: string): strin
 export async function buildWorkspaceComposition(
   args: BuildWorkspaceCompositionArgs
 ): Promise<WorkspaceComposition> {
-  // Plugin discovery + manifest validation runs unconditionally for host
-  // workspaces (inspection is not experiment-gated); only the per-kind layers
-  // below honor the experiment gate. Off-host (null root) discovers nothing,
-  // matching production's hostCheckoutRoot gating.
+  // Off-host (null root) discovers no plugin summaries, matching production's
+  // hostCheckoutRoot gating for plugin MCP servers, slash commands, and hooks.
   const { plugins, diagnostics } =
     args.hostCheckoutRoot != null
       ? await discoverWorkspaceAgentPlugins({
           workspacePath: args.hostCheckoutRoot,
-          muxHome: args.muxHome,
+          xumHome: args.xumHome,
           projectTrusted: args.projectTrusted,
         })
       : { plugins: [], diagnostics: [] };
-
-  // Off-host also suppresses plugin roots in the runtime-based loaders below:
-  // they gate on runtime class internally (RemoteRuntime), but the null host
-  // root is the authoritative off-host signal here.
-  const includeAgentPlugins = args.agentPluginsEnabled && args.hostCheckoutRoot != null;
 
   // Production (skillStorageContext.buildProjectLocalRoots) anchors plugin
   // SKILL containers at the CHECKOUT root: for subProjectPath workspaces the
@@ -167,17 +162,25 @@ export async function buildWorkspaceComposition(
   // Ordinary skill roots stay at the execution path. Agents and workflows
   // below intentionally keep execution-path defaults — production derives
   // their plugin containers from the discovery path, so checkout-anchoring
-  // them here would report artifacts production never loads.
-  const defaultSkillRoots = includeAgentPlugins
-    ? getDefaultAgentSkillsRoots(args.runtime, args.workspacePath, { includeAgentPlugins: true })
-    : undefined;
+  // them here would report artifacts production never loads. Like production,
+  // these runtime-based loaders give RemoteRuntime only the global host plugin
+  // roots (no project plugin roots).
+  const defaultSkillRoots =
+    args.hostCheckoutRoot != null
+      ? getDefaultAgentSkillsRoots(args.runtime, args.workspacePath, {
+          projectPluginsTrusted: args.projectTrusted,
+        })
+      : undefined;
   const checkoutSkillRoots =
     defaultSkillRoots?.projectPluginRoots != null && args.hostCheckoutRoot != null
       ? {
           roots: {
             ...defaultSkillRoots,
             projectPluginRoots: [
-              args.runtime.normalizePath(".mux/plugins", args.hostCheckoutRoot),
+              ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+                // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+                args.runtime.normalizePath(relativePath, args.hostCheckoutRoot!)
+              ),
               args.runtime.normalizePath(".agents/plugins", args.hostCheckoutRoot),
             ],
           },
@@ -188,11 +191,17 @@ export async function buildWorkspaceComposition(
         }
       : undefined;
 
-  const skillDescriptors = await discoverAgentSkills(args.runtime, args.workspacePath, {
-    dedupeByName: false,
-    includeAgentPlugins,
-    ...(checkoutSkillRoots ?? {}),
-  });
+  // Outside the agent loop: the plugin composition inspector reads through the host's runtimes.
+  const runtimeFactory = nodeRuntimeFactory;
+  // Like the turn's skill index, the inspector must not report a composition
+  // that silently lost a project root to an unreachable host.
+  const skillDescriptors = requireReachableSkills(
+    await discoverAgentSkills(args.runtime, args.workspacePath, {
+      dedupeByName: false,
+      ...(checkoutSkillRoots ?? {}),
+      runtimeFactory,
+    })
+  );
   const skills = markShadowed(
     skillDescriptors.map((skill) => ({
       name: skill.name,
@@ -203,7 +212,8 @@ export async function buildWorkspaceComposition(
 
   const agentDescriptors = await discoverAgentDefinitions(args.runtime, args.workspacePath, {
     dedupeById: false,
-    includeAgentPlugins,
+    projectPluginsTrusted: args.projectTrusted,
+    runtimeFactory,
   });
   const agents = markShadowed(
     agentDescriptors.map((agent) => ({
@@ -221,7 +231,7 @@ export async function buildWorkspaceComposition(
       runtime: args.runtime,
       workspacePath: args.workspacePath,
       projectTrusted: args.projectTrusted,
-      includeAgentPlugins,
+      runtimeFactory,
     });
     workflows = availableWorkflows.map((workflow) => ({
       name: workflow.descriptor.name,
@@ -251,37 +261,34 @@ export async function buildWorkspaceComposition(
     ...Object.entries(serverLayers.plugin).map(([key, info]) => mcpEntry(key, info, "plugin")),
   ]);
 
-  // Contributed slash commands load only when the experiment is enabled. The
-  // loading path (collectPluginSlashCommands) applies the same first-wins rule;
-  // here every declaration is listed so duplicate names show up as shadowed.
-  const slashCommands = includeAgentPlugins
-    ? markShadowed(
-        plugins.flatMap((plugin) =>
-          (plugin.manifest.contributes?.slashCommands ?? []).map((command) => ({
-            name: command.name,
-            source: `plugin:${plugin.name}`,
-            ...(command.description !== undefined ? { description: command.description } : {}),
-          }))
-        )
-      )
-    : [];
+  // The loading path (collectPluginSlashCommands) applies the same first-wins
+  // rule; here every declaration is listed so duplicate names show up as shadowed.
+  // An unreviewed managed command is not offered (#6629), so it neither wins nor shadows.
+  const slashCommands = markShadowed(
+    plugins.flatMap((plugin) =>
+      (plugin.manifest.contributes?.slashCommands ?? [])
+        .filter((command) => isPluginSlashCommandConsented(plugin.componentConsent, command))
+        .map((command) => ({
+          name: command.name,
+          source: `plugin:${plugin.name}`,
+          ...(command.description !== undefined ? { description: command.description } : {}),
+        }))
+    )
+  );
 
   const hooks = [
     ...markShadowed(await collectShellHookEntries(args.runtime, args.workspacePath)),
     // Plugin hooks all run (no shadowing between plugins).
-    ...(includeAgentPlugins
-      ? plugins
-          .filter((plugin) => plugin.hooksPath !== undefined)
-          .map((plugin) => ({
-            name: "hooks.js",
-            source: `plugin:${plugin.name}`,
-            description: "sandboxed plugin hooks",
-          }))
-      : []),
+    ...plugins
+      .filter((plugin) => plugin.hooksPath !== undefined)
+      .map((plugin) => ({
+        name: "hooks.js",
+        source: `plugin:${plugin.name}`,
+        description: "sandboxed plugin hooks",
+      })),
   ];
 
   return {
-    agentPluginsEnabled: args.agentPluginsEnabled,
     plugins: plugins.map(summarizePlugin),
     diagnostics: diagnostics.map((diagnostic) => ({
       path: diagnostic.path,

@@ -3,7 +3,7 @@
  *
  * Represents allowed thinking levels for a model as a simple subset.
  * The policy naturally expresses model capabilities:
- * - ["high"] = Fixed policy (e.g., gpt-5-pro only supports HIGH)
+ * - ["high"] = Fixed policy (only one supported level)
  * - ["off"] = No reasoning capability
  * - ["off", "low", "medium", "high"] = Fully selectable
  *
@@ -13,15 +13,20 @@
  */
 
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import type { MuxMessage } from "@/common/types/message";
 import {
   THINKING_LEVELS,
   DEFAULT_THINKING_LEVEL,
   THINKING_LEVEL_OFF,
   anthropicRejectsDisabledThinking,
+  anthropicSupportsBetweenToolsThinking,
   anthropicSupportsNativeXhigh,
-  isGrok46Model,
+  grokSupportsNativeXhigh,
   isGrokFrontierModel,
+  isGlm53Model,
   isKimiK3Model,
+  isMuseWonderModel,
+  openaiRejectsDisabledReasoning,
   openaiSupportsNativeMaxEffort,
   stripModelProviderPrefixes,
   type ThinkingLevel,
@@ -50,7 +55,36 @@ export function isGeminiFlashThinkingLevelModelName(modelName: string): boolean 
       !normalized.startsWith("gemini-3.5-flash-lite")) ||
     (normalized.startsWith("gemini-3.6-flash") &&
       !normalized.startsWith("gemini-3.6-flash-lite")) ||
-    (normalized.startsWith("gemini-3.7-flash") && !normalized.startsWith("gemini-3.7-flash-lite"))
+    (normalized.startsWith("gemini-3.7-flash") &&
+      !normalized.startsWith("gemini-3.7-flash-lite")) ||
+    isGeminiFlashMinimalRejectingModelName(normalized)
+  );
+}
+
+/**
+ * True for Gemini Flash thinking-level models that reject `thinkingLevel: "minimal"`.
+ * Gemini 3.8 Flash only accepts low/medium/high; sending MINIMAL returns an API
+ * validation error ("Thinking level MINIMAL is not supported for this model"), so Xum
+ * cannot expose "off" for it the way it does for 3–3.7 Flash.
+ * @param modelName Provider model ID without the provider prefix.
+ */
+export function isGeminiFlashMinimalRejectingModelName(modelName: string): boolean {
+  const normalized = modelName.trim().toLowerCase();
+  return (
+    normalized.startsWith("gemini-3.8-flash") && !normalized.startsWith("gemini-3.8-flash-lite")
+  );
+}
+
+/**
+ * True for Gemini models whose thinking levels are only low/medium/high, so Xum cannot
+ * expose "off": Gemini 3.8 Flash (rejects minimal) and Gemini 4 Argon (documents no
+ * minimal level and defaults to medium).
+ * @param modelName Provider model ID without the provider prefix.
+ */
+function isGeminiLowMediumHighModelName(modelName: string): boolean {
+  return (
+    isGeminiFlashMinimalRejectingModelName(modelName) ||
+    modelName.trim().toLowerCase().startsWith("gemini-4-argon")
   );
 }
 
@@ -58,26 +92,23 @@ export function isGeminiFlashThinkingLevelModelName(modelName: string): boolean 
  * Returns the thinking policy for a given model.
  *
  * Rules:
- * - openai:gpt-5.1-codex-max → ["off", "low", "medium", "high", "xhigh"] (5 levels including xhigh)
- * - openai:gpt-5.2-codex → ["off", "low", "medium", "high", "xhigh"] (5 levels including xhigh)
- * - openai:gpt-5.3-codex / Spark variants →
- *   ["off", "low", "medium", "high", "xhigh"] (5 levels including xhigh)
- * - openai:gpt-5.2 / openai:gpt-5.5 → ["off", "low", "medium", "high", "xhigh"]
- * - openai:gpt-5.6 family (Sol/Terra/Luna and the bare alias) →
- *   ["off", "low", "medium", "high", "xhigh", "max"] (6 levels; native max at GA)
- * - openai:gpt-5.2-pro / openai:gpt-5.5-pro → ["medium", "high", "xhigh"] (3 levels)
- * - openai:gpt-5-pro → ["high"] (only supported level, legacy)
- * - Gemini Flash chat variants → ["off", "low", "medium", "high"]
+ * - openai:gpt-6-astra / openai:gpt-6.1-sol → ["low", "medium", "high", "xhigh", "max"]
+ *   (native max; the API rejects "none", so reasoning cannot be disabled)
+ * - openai:gpt-6-luna → ["off", "low", "medium", "high", "xhigh", "max"] (6 levels)
+ * - openai:gpt-5.6 / -sol / -terra / -luna → ["off", "low", "medium", "high", "xhigh", "max"]
+ * - Gemini 3.8 Flash / Gemini 4 Argon → ["low", "medium", "high"] (no minimal, so no "off")
+ * - Older Gemini Flash chat variants → ["off", "low", "medium", "high"]
  * - gemini-3 Pro variants → ["low", "high"] (thinking level only)
- * - xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
+ * - xai:grok-4.7 / xai:grok-4.6 → ["low", "medium", "high", "xhigh"] (reasoning cannot be disabled)
  * - xai:grok-4.5 → ["low", "medium", "high"] (reasoning cannot be disabled)
+ * - zai:glm-5.3-flash → ["low", "high", "max"] (reasoning cannot be disabled)
  * - default → ["off", "low", "medium", "high"] (standard 4 levels; xhigh is opt-in per model)
  *
- * Tolerates version suffixes (e.g., gpt-5-pro-2025-10-06).
- * Does NOT match gpt-5-pro-mini (uses negative lookahead).
+ * Tolerates version suffixes (e.g., gpt-6-astra-2026-09-30).
+ * Does NOT match unannounced variants like gpt-6-astra-mini.
  *
  * Pass `providersConfig` so configured aliases (`mappedToModel`, e.g.
- * `openai:team-sol` -> `openai:gpt-5.6-sol`) resolve to their capability model
+ * `openai:team-sol` -> `openai:gpt-6.1-sol`) resolve to their capability model
  * before rule matching — matching how `buildProviderOptions` /
  * `openaiProModeAvailable` detect capabilities. Without it, mapped aliases fall
  * through to the default 4-level policy and clamping strips levels (e.g. native
@@ -96,25 +127,39 @@ export function getThinkingPolicyForModel(
  * Shared by both standard reasoning models and non-reasoning models, so it is NOT a
  * reliable "supports reasoning" signal on its own (see getDefaultMinimumThinkingLevel).
  */
+// These families share the same always-on, five-level ladder. Reuse the matchers
+// when resolving an unset level so tracked thinking matches the request's effort.
+const ALWAYS_ON_FIVE_LEVEL_MODELS = [
+  anthropicRejectsDisabledThinking,
+  openaiRejectsDisabledReasoning,
+  isMuseWonderModel,
+];
+
 const DEFAULT_THINKING_POLICY: ThinkingPolicy = ["off", "low", "medium", "high"];
 
 /**
  * Returns the policy for a model that matches an explicit reasoning rule, or `null`
  * when the model falls through to {@link DEFAULT_THINKING_POLICY}.
  *
- * A non-null result means Shux explicitly recognizes the model as a reasoning model,
+ * A non-null result means Xum explicitly recognizes the model as a reasoning model,
  * which is the signal used to decide whether to apply a default thinking floor.
  */
 function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
   // Normalize to be robust to provider prefixes, whitespace, gateway wrappers, and version
   // suffixes. Strips both a `provider:` prefix and any upstream-provider path segment that
-  // proxies encode (e.g. `mux-gateway:openai/gpt-5.5-pro` -> `gpt-5.5-pro`).
+  // proxies encode (e.g. `openrouter:openai/gpt-6-astra` -> `gpt-6-astra`).
   const withoutProviderNamespace = stripModelProviderPrefixes(modelString);
 
-  // Mythos-class models (Fable/Mythos) cannot disable thinking — the API rejects
-  // `thinking: { type: "disabled" }` and always thinks (adaptive by default) — so
-  // "off" is not offered and requests for it clamp up to "low".
-  if (anthropicRejectsDisabledThinking(modelString)) {
+  // Claude Sonnet 5.5 rejects `disabled` too, but its "off" maps to `between_tools`
+  // (#5086), so it keeps every level. Checked before the always-thinking rule below.
+  if (anthropicSupportsBetweenToolsThinking(modelString)) {
+    return ["off", "low", "medium", "high", "xhigh", "max"];
+  }
+
+  // Mythos-class models (Fable/Mythos) and Opus 5.5 cannot disable thinking — the
+  // API rejects `thinking: { type: "disabled" }` and always thinks (adaptive by
+  // default) — so "off" is not offered and requests for it clamp up to "low".
+  if (ALWAYS_ON_FIVE_LEVEL_MODELS.some((matches) => matches(modelString))) {
     return ["low", "medium", "high", "xhigh", "max"];
   }
 
@@ -131,44 +176,18 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["off", "low", "medium", "high", "xhigh"];
   }
 
-  // GPT-5.1-Codex-Max supports 5 reasoning levels including xhigh (Extra High)
-  if (
-    withoutProviderNamespace.startsWith("gpt-5.1-codex-max") ||
-    withoutProviderNamespace.startsWith("codex-max")
-  ) {
-    return ["off", "low", "medium", "high", "xhigh"];
-  }
-
-  // GPT-5.2/5.3 Codex models (including Spark) support 5 reasoning levels.
-  if (/^gpt-5\.[23]-codex(?:-spark)?(?!-[a-z])/.test(withoutProviderNamespace)) {
-    return ["off", "low", "medium", "high", "xhigh"];
-  }
-
-  // The GPT-5.6 family (Sol/Terra/Luna and the bare gpt-5.6 alias) supports
-  // the native "max" reasoning effort introduced at GA.
+  // GPT-6 Luna and the GPT-5.6 family support both disabled reasoning and native max.
   if (openaiSupportsNativeMaxEffort(withoutProviderNamespace)) {
     return ["off", "low", "medium", "high", "xhigh", "max"];
   }
 
-  // gpt-5.2-pro and gpt-5.5-pro support medium, high, xhigh reasoning levels
-  if (/^gpt-5\.(?:2|5)-pro(?!-[a-z])/.test(withoutProviderNamespace)) {
-    return ["medium", "high", "xhigh"];
+  // Gemini 3.8 Flash and Gemini 4 Argon have no "minimal" level, so thinking cannot be
+  // disabled; "off" clamps to "low".
+  if (isGeminiLowMediumHighModelName(withoutProviderNamespace)) {
+    return ["low", "medium", "high"];
   }
 
-  // gpt-5.2, gpt-5.5 and the gpt-5.4-mini / gpt-5.4-nano variants support 5 reasoning levels including xhigh.
-  if (
-    /^gpt-5\.2(?!-[a-z])/.test(withoutProviderNamespace) ||
-    /^gpt-5\.(?:4|5)(?:-(?:mini|nano))?(?!-[a-z])/.test(withoutProviderNamespace)
-  ) {
-    return ["off", "low", "medium", "high", "xhigh"];
-  }
-
-  // gpt-5-pro (legacy) only supports high
-  if (/^gpt-5-pro(?!-[a-z])/.test(withoutProviderNamespace)) {
-    return ["high"];
-  }
-
-  // Gemini Flash chat models support minimal/low/medium/high. Shux exposes minimal as "off".
+  // Older Gemini Flash chat models support minimal/low/medium/high. Xum exposes minimal as "off".
   if (isGeminiFlashThinkingLevelModelName(withoutProviderNamespace)) {
     return ["off", "low", "medium", "high"];
   }
@@ -178,13 +197,23 @@ function getExplicitThinkingPolicy(modelString: string): ThinkingPolicy | null {
     return ["low", "high"];
   }
 
-  // Frontier Grok models always reason. Grok 4.6 adds native xhigh effort;
+  // Grok Fast switches model variants: it has reasoning off/on, not graded effort.
+  if (withoutProviderNamespace === "grok-4-1-fast") {
+    return ["off", "high"];
+  }
+
+  // Frontier Grok models always reason. Grok 4.6/4.7 support native xhigh effort;
   // Grok 4.5 supports configurable low/medium/high.
-  if (isGrok46Model(withoutProviderNamespace)) {
+  if (grokSupportsNativeXhigh(withoutProviderNamespace)) {
     return ["low", "medium", "high", "xhigh"];
   }
   if (isGrokFrontierModel(withoutProviderNamespace)) {
     return ["low", "medium", "high"];
+  }
+
+  // GLM 5.3 always reasons and exposes exactly the effort values accepted by Z.ai.
+  if (isGlm53Model(withoutProviderNamespace)) {
+    return ["low", "high", "max"];
   }
 
   // Kimi K3 always reasons and supports only the max reasoning effort, so the
@@ -202,10 +231,15 @@ function thinkingLevelIndex(level: ThinkingLevel): number {
   return THINKING_LEVELS.indexOf(level);
 }
 
+/** Claude Haiku of any generation, tolerating provider prefixes and Bedrock's `anthropic.` prefix. */
+function isClaudeHaikuModel(modelString: string): boolean {
+  return /(?:^|\.)claude-haiku-/.test(stripModelProviderPrefixes(modelString));
+}
+
 /**
  * Default *minimum* thinking level (floor) for a model.
  *
- * Most users never want off/low thinking, so models Shux explicitly recognizes as
+ * Most users never want off/low thinking, so models Xum explicitly recognizes as
  * reasoning models default to a "medium" floor — hiding off/low in the thinking slider
  * so cycling is more efficient.
  *
@@ -221,13 +255,25 @@ export function getDefaultMinimumThinkingLevel(
   modelString: string,
   providersConfig?: ProvidersConfigMap | null
 ): ThinkingLevel {
+  // A binary model must retain its off option unless the user explicitly raises the floor.
+  const policy = getThinkingPolicyForModel(modelString, providersConfig);
+  if (policy.length === 2 && policy[0] === "off") return THINKING_LEVEL_OFF;
+  // Haiku is the cheap, fast tier: `/haiku+0` and stored "off" must keep thinking off.
+  // Haiku 4.5 got that from the default policy; Haiku 5.5 matches an explicit policy
+  // (native xhigh), which would otherwise raise the default floor to medium.
+  if (
+    policy[0] === "off" &&
+    isClaudeHaikuModel(resolveModelForMetadata(modelString, providersConfig ?? null))
+  ) {
+    return THINKING_LEVEL_OFF;
+  }
   return hasExplicitThinkingPolicy(modelString, providersConfig)
     ? DEFAULT_THINKING_LEVEL
     : THINKING_LEVEL_OFF;
 }
 
 /**
- * True when Shux explicitly recognizes the model's reasoning levels (i.e. it matches a
+ * True when Xum explicitly recognizes the model's reasoning levels (i.e. it matches a
  * specific rule rather than falling through to the shared default policy).
  *
  * Used to gate the per-model minimum-thinking control: only recognized reasoning models
@@ -289,17 +335,13 @@ export function lookupMinThinkingLevelOverride(
  * Resolve the effective thinking level for an outgoing stream request.
  *
  * Most models treat an unset level as "off". Models that reject disabled
- * thinking (Mythos-class Anthropic, see {@link anthropicRejectsDisabledThinking})
- * clamp unset/legacy "off" up through the thinking policy instead, so the
- * level Shux tracks (provider options, replay transforms, metadata) matches the
- * provider's actual always-thinking behavior. Without this, the wire request
- * would run adaptive thinking while the message pipeline skips the Anthropic
- * thinking replay transforms (`anthropicThinkingEnabled` keys off "off"),
- * losing required signed thinking context on follow-up requests.
+ * thinking clamp unset/legacy "off" through their policy so Xum's tracked level
+ * matches the provider's always-thinking behavior. This keeps provider options,
+ * reasoning metadata, and provider-specific replay transforms consistent.
  *
  * Pass `providersConfig` so configured aliases (`mappedToModel`, e.g.
  * `anthropic:internal-fable` -> `anthropic:claude-fable-5`) are resolved to
- * their capability model before the Mythos check — matching how
+ * their capability model before the forced-thinking check, matching how
  * `buildProviderOptions` detects capabilities.
  */
 export function resolveEffectiveThinkingLevel(
@@ -309,9 +351,48 @@ export function resolveEffectiveThinkingLevel(
 ): ThinkingLevel {
   const level = requested ?? THINKING_LEVEL_OFF;
   const capabilityModel = resolveModelForMetadata(modelString, providersConfig ?? null);
-  return anthropicRejectsDisabledThinking(capabilityModel)
+  // Gemini 3.8 Flash rejects "minimal" and GPT-6 Astra rejects "none", so an
+  // unset/"off" level must clamp here too; otherwise the tracked level would say
+  // "off" while the adapter sends "low". Gemini 4 Argon has no "off" either: an
+  // unclamped "off" sends no thinkingConfig and Argon thinks at its medium default.
+  return ALWAYS_ON_FIVE_LEVEL_MODELS.some((matches) => matches(capabilityModel)) ||
+    isGlm53Model(capabilityModel) ||
+    isGeminiLowMediumHighModelName(stripModelProviderPrefixes(capabilityModel))
     ? enforceThinkingPolicy(capabilityModel, level)
     : level;
+}
+
+/** Levels recorded on the assistant turns of a request history (undefined for other rows). */
+export function assistantThinkingLevels(
+  messages: readonly MuxMessage[]
+): Array<ThinkingLevel | undefined> {
+  return messages.map((message) =>
+    message.role === "assistant" ? message.metadata?.thinkingLevel : undefined
+  );
+}
+
+/**
+ * Keep "off" only where `between_tools` can be sent; otherwise run the turn at
+ * "low" adaptive thinking, the #4978 clamp. Other levels and models pass through.
+ *
+ * Maintainer decision on #5086: `between_tools` (sent at effort low) only while
+ * the conversation's effort stayed pinned. Any earlier assistant turn recorded
+ * above "low" means the effort changed, so the turn falls back to low adaptive.
+ * Rows without a recorded level are ignored; rows from every model count.
+ */
+export function resolveBetweenToolsThinkingLevel(
+  capabilityModel: string,
+  level: ThinkingLevel,
+  routeSupportsBetweenTools: boolean,
+  priorThinkingLevels: ReadonlyArray<ThinkingLevel | undefined>
+): ThinkingLevel {
+  if (level !== "off" || !anthropicSupportsBetweenToolsThinking(capabilityModel)) {
+    return level;
+  }
+  const effortChanged = priorThinkingLevels.some(
+    (prior) => prior !== undefined && prior !== "off" && prior !== "low"
+  );
+  return routeSupportsBetweenTools && !effortChanged ? "off" : "low";
 }
 
 /**
@@ -374,6 +455,9 @@ export function enforceThinkingPolicy(
     return requested;
   }
 
+  // Legacy low/medium values meant "on" for binary models, not nearest-to-off.
+  if (allowed.length === 2 && allowed[0] === "off" && allowed[1] === "high") return "high";
+
   const orderedAllowed = [...allowed].sort(
     (left, right) => THINKING_LEVELS.indexOf(left) - THINKING_LEVELS.indexOf(right)
   );
@@ -423,8 +507,8 @@ export function isXaiGrokFastVariantSwap(
  *
  * Named levels are returned as-is (the backend's enforceThinkingPolicy will
  * clamp if needed). Numeric indices are mapped into the model's sorted allowed
- * levels — so 0 always means the model's lowest allowed level (e.g., "medium"
- * for gpt-5.5-pro, "off" for most other models), and the highest index means
+ * levels — so 0 always means the model's lowest allowed level (e.g., "low"
+ * for gpt-6-astra, "off" for most other models), and the highest index means
  * the model's highest level. Out-of-range indices clamp to min/max.
  */
 export function resolveThinkingInput(
@@ -437,7 +521,7 @@ export function resolveThinkingInput(
 
   // Numeric: index into the model's allowed levels (sorted lowest → highest).
   // providersConfig resolves mapped aliases (mappedToModel) to their target's
-  // policy so indices map into the real ladder (e.g. GPT-5.6 native max).
+  // policy so indices map into the real ladder (e.g. GPT-6 native max).
   const policy = getThinkingPolicyForModel(modelString, providersConfig);
   const sorted = [...policy].sort(
     (a, b) => THINKING_LEVELS.indexOf(a) - THINKING_LEVELS.indexOf(b)

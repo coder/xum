@@ -4,8 +4,34 @@ import { type FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isDevcontainerRuntime } from "@/common/types/runtime";
 import { MapStore } from "./MapStore";
 import { RefreshController } from "@/browser/utils/RefreshController";
+import { getStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
 
 export type RuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
+
+/**
+ * Whether a metadata update can change the status of a displayed devcontainer workspace.
+ * Every workspace metadata event (title, tag, AI settings, ...) delivers a new Map, and the store's
+ * requestImmediate bypasses the debounce and the hidden-window check (#5573). So refresh only when
+ * such a workspace appeared, its runtime inputs changed, or its task status changed: launching or
+ * resuming a task starts a stopped container, and no other event tells this store.
+ */
+function hasDisplayedRuntimeChange(
+  previous: ReadonlyMap<string, FrontendWorkspaceMetadata>,
+  next: ReadonlyMap<string, FrontendWorkspaceMetadata>,
+  isSubscribed: (workspaceId: string) => boolean
+): boolean {
+  const changedWorkspaceIds = getStatusInputChanges(previous, next, isSubscribed);
+  for (const [workspaceId, workspace] of next) {
+    const before = previous.get(workspaceId);
+    if (before != null && before.taskStatus !== workspace.taskStatus) {
+      changedWorkspaceIds.push(workspaceId);
+    }
+  }
+  return changedWorkspaceIds.some(
+    (workspaceId) =>
+      isSubscribed(workspaceId) && isDevcontainerRuntime(next.get(workspaceId)?.runtimeConfig)
+  );
+}
 
 export class RuntimeStatusStore {
   private statuses = new MapStore<string, RuntimeStatus | null>();
@@ -28,6 +54,11 @@ export class RuntimeStatusStore {
   }
 
   setClient(client: APIClient | null): void {
+    // AppLoader re-applies the same client on every workspace metadata event (#5573); only a new
+    // client (first connect or reconnect) warrants a refresh.
+    if (client === this.client) {
+      return;
+    }
     this.client = client;
 
     if (!client) {
@@ -66,10 +97,16 @@ export class RuntimeStatusStore {
   }
 
   syncWorkspaces(metadata: Map<string, FrontendWorkspaceMetadata>): void {
-    if (!this.isActive && metadata.size > 0) {
+    const reactivated = !this.isActive && metadata.size > 0;
+    if (reactivated) {
       this.isActive = true;
     }
 
+    const needsRefresh = hasDisplayedRuntimeChange(
+      this.workspaceMetadata,
+      metadata,
+      (workspaceId) => this.statuses.hasKeySubscribers(workspaceId)
+    );
     this.workspaceMetadata = metadata;
 
     for (const workspaceId of Array.from(this.statusCache.keys())) {
@@ -81,7 +118,9 @@ export class RuntimeStatusStore {
     }
 
     this.refreshController.bindListeners();
-    this.refreshController.requestImmediate();
+    if (reactivated || needsRefresh) {
+      this.refreshController.requestImmediate();
+    }
   }
 
   invalidateWorkspace(workspaceId: string): void {

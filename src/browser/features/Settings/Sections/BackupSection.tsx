@@ -1,19 +1,30 @@
 import { useEffect, useRef, useState } from "react";
-import { ArchiveRestore, CheckCircle2, CloudUpload, RefreshCw, TriangleAlert } from "lucide-react";
+import { ArchiveRestore, CloudUpload, RefreshCw, TriangleAlert } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { ConfirmationModal } from "@/browser/components/ConfirmationModal/ConfirmationModal";
 import { Input } from "@/browser/components/Input/Input";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
+import { useExperimentValue } from "@/browser/hooks/useExperiments";
 import {
   formatKeybind,
   isDialogOpen,
   isEditableElement,
   KEYBINDS,
   matchesKeybind,
+  type Keybind,
 } from "@/browser/utils/ui/keybinds";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { SettingsBackupInput } from "@/common/orpc/schemas/backup";
+import {
+  BACKUP_CONTENT_DEFAULTS,
+  BACKUP_CONTENT_FLAGS,
+  resolveBackupContents,
+  type BackupContentFlag,
+  type BackupContents,
+} from "@/common/config/schemas/settingsBackup";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { BACKUP_CREDENTIAL_LABELS } from "@/constants/backup";
 
 type BackupRoute = keyof APIClient["backup"];
 type BackupRouteOutput<Route extends BackupRoute> = Awaited<ReturnType<APIClient["backup"][Route]>>;
@@ -24,7 +35,15 @@ type BackupSuccessData<Route extends Exclude<BackupRoute, "getSettings">> = Extr
 type BackupValidation = BackupSuccessData<"validate">;
 type BackupPreview = BackupSuccessData<"preview">;
 type BackupCommandApproval = BackupPreview["commandApprovals"][number];
+type BackupProjectImport = BackupPreview["projectImports"][number];
+type BackupProjectImportResult = BackupSuccessData<"restore">["projectImportResults"][number];
 type BackupOperationError = Extract<BackupRouteOutput<"push">, { success: false }>["error"];
+
+/** Per-candidate approval state, keyed by the candidate's content-bound token. */
+interface ProjectImportSelection {
+  approved: boolean;
+  targetPath: string;
+}
 
 const BACKUP_SHORTCUTS = [
   ["save", KEYBINDS.SETTINGS_BACKUP_SAVE],
@@ -39,29 +58,126 @@ const BACKUP_SHORTCUTS = [
 type BackupShortcutAction = (typeof BACKUP_SHORTCUTS)[number][0];
 type BackupShortcutHandlers = Record<BackupShortcutAction, () => void | Promise<void>>;
 
-const INCLUDED_SETTINGS = [
-  "Global instructions",
-  "Agent definitions",
-  "Agent skills",
-  "Global memory",
-  "MCP server configuration",
-  "Portable preferences",
-] as const;
+interface BackupContentOption {
+  flag: BackupContentFlag;
+  label: string;
+  description?: string;
+  /** Rendered indented under this flag and disabled while it is off. */
+  parent?: BackupContentFlag;
+  shortcut: Keybind;
+}
 
-type BackupDraft = SettingsBackupInput;
+/** One selection governs both directions: what a push publishes and what a restore writes. */
+const BACKUP_CONTENT_OPTIONS: readonly BackupContentOption[] = [
+  {
+    flag: "includeInstructions",
+    label: "Global instructions",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_INSTRUCTIONS,
+  },
+  {
+    flag: "includeAgents",
+    label: "Agent definitions",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_AGENTS,
+  },
+  {
+    flag: "includeSkills",
+    label: "Agent skills",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_SKILLS,
+  },
+  {
+    flag: "includeGlobalMemory",
+    label: "Global memory",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_GLOBAL_MEMORY,
+  },
+  {
+    flag: "includePreferences",
+    label: "Portable preferences",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PREFERENCES,
+  },
+  {
+    flag: "includeMcp",
+    label: "MCP server configuration",
+    description:
+      "URLs are copied as written; one that looks like it carries a credential waits for your review before publishing.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_MCP,
+  },
+  {
+    flag: "includeMcpHeaders",
+    parent: "includeMcp",
+    label: "HTTP header values",
+    description:
+      "Copied as written, so a token in a header travels with the backup. Leave off to keep header values on this device.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_MCP_HEADERS,
+  },
+  {
+    flag: "includeMcpCommands",
+    parent: "includeMcp",
+    label: "stdio commands",
+    description:
+      "Copied as written, so a token in a command line travels with the backup. Leave off to keep commands on this device.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_MCP_COMMANDS,
+  },
+  {
+    flag: "includeProjects",
+    label: "Project list & project memories",
+    description:
+      "Adds your project list and per-project memories to the backup, and lets a restore reimport them on another machine.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_PROJECTS,
+  },
+  {
+    // Project shelves travel with the project bundle above; this covers only the global shelf.
+    flag: "includeGlobalArtifacts",
+    label: "Pinned global artifacts",
+    description:
+      "Artifacts are not settings. Include pinned global artifacts in the backup? Project shelves travel with the project bundle. Files over 8 MiB are skipped and listed.",
+    shortcut: KEYBINDS.SETTINGS_BACKUP_TOGGLE_GLOBAL_ARTIFACTS,
+  },
+];
+
+/**
+ * The projects row's copy while the Artifacts experiment is on: project shelves travel with the
+ * project bundle (adapters.ts), so the row says so and turning it on is informed consent to
+ * back up pinned project artifacts too.
+ */
+const PROJECTS_WITH_ARTIFACTS_COPY = {
+  label: "Project list, project memories & pinned project artifacts",
+  description:
+    "Adds your project list, per-project memories and each project's pinned artifacts to the backup, and lets a restore reimport them on another machine.",
+} as const;
+
+type BackupDraft = SettingsBackupInput & BackupContents;
 
 const DEFAULT_DRAFT: BackupDraft = {
   repoUrl: "",
   branch: "main",
-  path: "shux/",
+  path: "xum/",
+  ...BACKUP_CONTENT_DEFAULTS,
 };
 
 function toDraft(settings: SettingsBackupInput): BackupDraft {
-  return { repoUrl: settings.repoUrl, branch: settings.branch, path: settings.path };
+  return {
+    repoUrl: settings.repoUrl,
+    branch: settings.branch,
+    path: settings.path,
+    ...resolveBackupContents(settings),
+  };
 }
 
 function draftsEqual(left: BackupDraft, right: BackupDraft): boolean {
-  return left.repoUrl === right.repoUrl && left.branch === right.branch && left.path === right.path;
+  return (
+    left.repoUrl === right.repoUrl &&
+    left.branch === right.branch &&
+    left.path === right.path &&
+    BACKUP_CONTENT_FLAGS.every((flag) => left[flag] === right[flag])
+  );
+}
+
+/** The save error for the first required field the draft leaves blank, or null. */
+function getMissingFieldError(draft: BackupDraft): string | null {
+  if (draft.repoUrl.trim() === "") return "Repository URL is required.";
+  if (draft.branch.trim() === "") return "Branch is required.";
+  if (draft.path.trim() === "") return "Subdirectory is required.";
+  return null;
 }
 
 function getOperationErrorMessage(error: BackupOperationError): string {
@@ -69,21 +185,53 @@ function getOperationErrorMessage(error: BackupOperationError): string {
   return `${error.message}: ${error.files.join(", ")}`;
 }
 
-function getCredentialLabel(credential: BackupValidation["credential"]): string {
-  switch (credential) {
-    case "ssh":
-      return "SSH key or agent";
-    case "gh":
-      return "GitHub CLI";
-    case "ambient":
-      return "system git credentials";
-  }
-}
-
 /**
  * Preferences restore through config rather than a file, so a run that only changed
  * preferences reports zero files. Saying "no files changed" avoids reading as a no-op.
  */
+/**
+ * An import that skipped conflicting files is not a success: no origin was recorded for it and
+ * the candidate is offered again, so the same screen must not call it imported in green while
+ * asking for another approval.
+ */
+function importResultLabel(result: BackupProjectImportResult): string {
+  if (result.status === "failed") return "Failed";
+  return result.skippedFiles.length > 0 ? "Partially imported" : "Imported";
+}
+
+function importResultTone(result: BackupProjectImportResult): string {
+  if (result.status === "failed") return "text-error";
+  return result.skippedFiles.length > 0 ? "text-warning" : "text-success-text";
+}
+
+/**
+ * Results of a later restore run merged over the earlier ones, per import. The files an
+ * earlier attempt added stay listed — a retry finds them in place and reports only what it
+ * added itself — and a registration the earlier attempt made stays marked, since neither is
+ * covered by the safety snapshot and both are what undoing the import means removing.
+ */
+function mergeImportResults(
+  previous: readonly BackupProjectImportResult[],
+  next: readonly BackupProjectImportResult[]
+): BackupProjectImportResult[] {
+  const key = (result: BackupProjectImportResult) => `${result.sourcePath}\0${result.targetPath}`;
+  const merged = new Map(previous.map((result) => [key(result), result]));
+  for (const result of next) {
+    const earlier = merged.get(key(result));
+    merged.set(
+      key(result),
+      earlier === undefined
+        ? result
+        : {
+            ...result,
+            writtenFiles: [...new Set([...earlier.writtenFiles, ...result.writtenFiles])],
+            registered: earlier.registered || result.registered,
+          }
+    );
+  }
+  return [...merged.values()];
+}
+
 function describeRestoredFiles(count: number): string {
   if (count === 0) return "settings; no files changed";
   return `${count} file${count === 1 ? "" : "s"}`;
@@ -93,17 +241,21 @@ function ChangeList(props: {
   title: string;
   emptyLabel: string;
   changes: BackupPreview["pushChanges"];
+  /** Replaces the list when this half of the preview could not be computed. */
+  error?: string | null;
 }) {
   return (
     <div className="border-border-light min-w-0 rounded-md border p-3">
       <h4 className="text-foreground text-xs font-medium">{props.title}</h4>
-      {props.changes.length === 0 ? (
+      {props.error != null ? (
+        <p className="text-error mt-2 text-xs break-words">{props.error}</p>
+      ) : props.changes.length === 0 ? (
         <p className="text-muted mt-2 text-xs">{props.emptyLabel}</p>
       ) : (
         <ul className="mt-2 space-y-1.5">
           {props.changes.map((change) => (
             <li key={`${change.status}:${change.path}`} className="flex min-w-0 gap-2 text-xs">
-              <span className="text-accent w-5 shrink-0 font-mono">{change.status}</span>
+              <span className="text-accent-text w-5 shrink-0 font-mono">{change.status}</span>
               <span className="text-muted min-w-0 break-all">{change.path}</span>
             </li>
           ))}
@@ -113,8 +265,32 @@ function ChangeList(props: {
   );
 }
 
+// Inside the Settings dialog isDialogOpen() is always true, so ownership is scoped to focus: act
+// only while focus is in the dialog hosting this section, never in a nested dialog or popover.
+// A nested dialog without a trigger drops focus to the body when it closes; the section owns the
+// keys again once its host is the topmost (last portaled) dialog.
+function ownsBackupShortcuts(root: HTMLElement | null, target: EventTarget | null): boolean {
+  const hostDialog = root?.closest('[role="dialog"]');
+  if (!hostDialog) return !isDialogOpen();
+  if (target === document.body) {
+    const dialogs = document.querySelectorAll('[role="dialog"]');
+    return dialogs[dialogs.length - 1] === hostDialog;
+  }
+  return target instanceof Element && target.closest('[role="dialog"]') === hostDialog;
+}
+
 export function BackupSection() {
   const { api } = useAPI();
+  // The global artifact shelf only exists with the Artifacts experiment: without it the row is
+  // hidden and its shortcut does nothing.
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const contentOptions = artifactsEnabled
+    ? BACKUP_CONTENT_OPTIONS.map((option) =>
+        option.flag === "includeProjects" ? { ...option, ...PROJECTS_WITH_ARTIFACTS_COPY } : option
+      )
+    : BACKUP_CONTENT_OPTIONS.filter((option) => option.flag !== "includeGlobalArtifacts");
+  const contentOptionsRef = useRef(contentOptions);
+  contentOptionsRef.current = contentOptions;
   const [draft, setDraft] = useState<BackupDraft>(DEFAULT_DRAFT);
   const [savedDraft, setSavedDraft] = useState<BackupDraft>(DEFAULT_DRAFT);
   const [loading, setLoading] = useState(true);
@@ -132,18 +308,37 @@ export function BackupSection() {
   const [secretScanApproval, setSecretScanApproval] = useState<string | null>(null);
   const [commandApprovals, setCommandApprovals] = useState<BackupCommandApproval[]>([]);
   const [approveCommands, setApproveCommands] = useState(false);
+  const [projectImports, setProjectImports] = useState<BackupProjectImport[]>([]);
+  const [projectImportSelections, setProjectImportSelections] = useState<
+    Record<string, ProjectImportSelection>
+  >({});
+  const [projectImportResults, setProjectImportResults] = useState<BackupProjectImportResult[]>([]);
+  const [projectBundleSkipped, setProjectBundleSkipped] = useState(false);
+  // Pinned artifacts the last preview, push, or restore left out, each with its reason.
+  const [shelfSkipped, setShelfSkipped] = useState<string[]>([]);
   const [restoreConfirmationOpen, setRestoreConfirmationOpen] = useState(false);
   const refreshGenerationRef = useRef(0);
   const draftRef = useRef(draft);
   const savedDraftRef = useRef(savedDraft);
+  const settingsLoadedRef = useRef(false);
   const refreshRef = useRef<((options?: { markFresh?: boolean }) => Promise<void>) | null>(null);
   draftRef.current = draft;
   savedDraftRef.current = savedDraft;
 
   const isDirty = !draftsEqual(draft, savedDraft);
+  // What the repository operations act on. With the Artifacts experiment off the global shelf
+  // is left out even when the saved setting includes it: the row is hidden, so the user could
+  // not see or change it. The saved setting itself is kept for when the experiment returns.
+  const requestDraft: BackupDraft = artifactsEnabled
+    ? savedDraft
+    : { ...savedDraft, includeGlobalArtifacts: false };
   const configured = settingsFresh && savedDraft.repoUrl.trim() !== "";
   const saving = activeAction === "save";
   const busy = activeAction !== null;
+  // A settings read is pending (a reconnect keeps the form on screen while it reloads). Save
+  // waits for it: the draft's untouched fields would overwrite changes made on the server.
+  const [reading, setReading] = useState(false);
+  const saveBlocked = busy || reading;
 
   useEffect(() => {
     if (!api) {
@@ -159,13 +354,16 @@ export function BackupSection() {
     // Liveness belongs to this API subscription. An older effect can finish after its
     // replacement starts, so sharing this flag across generations creates stale writes.
     let streamLive = false;
-    setLoading(true);
+    // Only the first load hides the form: a new client (reconnect) reloads behind the shown
+    // settings. Destructive actions still wait until the reload is fresh.
+    if (!settingsLoadedRef.current) setLoading(true);
     setSettingsFresh(false);
     setSaveError(null);
 
     const refresh = async (options?: { markFresh?: boolean }) => {
       const version = (refreshGenerationRef.current += 1);
       setSettingsFresh(false);
+      setReading(true);
 
       try {
         const settings = await api.backup.getSettings();
@@ -178,6 +376,7 @@ export function BackupSection() {
           setDraft(nextDraft);
         }
         savedDraftRef.current = nextDraft;
+        settingsLoadedRef.current = true;
         setSavedDraft(nextDraft);
         if (options?.markFresh !== false && streamLive) setSettingsFresh(true);
         setSaveError(null);
@@ -190,6 +389,10 @@ export function BackupSection() {
           setSecretScanApproval(null);
           setCommandApprovals([]);
           setApproveCommands(false);
+          setProjectImports([]);
+          setProjectImportSelections({});
+          setProjectBundleSkipped(false);
+          setShelfSkipped([]);
           setRestoreConfirmationOpen(false);
           setActionError(null);
           setStatusMessage(null);
@@ -201,6 +404,7 @@ export function BackupSection() {
       } finally {
         if (!signal.aborted && version === refreshGenerationRef.current) {
           setLoading(false);
+          setReading(false);
         }
       }
     };
@@ -258,17 +462,10 @@ export function BackupSection() {
   }, [api]);
 
   async function handleSave() {
-    if (!api || activeAction !== null) return;
-    if (draft.repoUrl.trim() === "") {
-      setSaveError("Repository URL is required.");
-      return;
-    }
-    if (draft.branch.trim() === "") {
-      setSaveError("Branch is required.");
-      return;
-    }
-    if (draft.path.trim() === "") {
-      setSaveError("Subdirectory is required.");
+    if (!api || saveBlocked) return;
+    const missingField = getMissingFieldError(draft);
+    if (missingField != null) {
+      setSaveError(missingField);
       return;
     }
 
@@ -282,6 +479,7 @@ export function BackupSection() {
         repoUrl: draft.repoUrl.trim(),
         branch: draft.branch.trim(),
         path: draft.path.trim(),
+        ...resolveBackupContents(draft),
       });
       if (!result.success) {
         setSaveError(getOperationErrorMessage(result.error));
@@ -297,8 +495,15 @@ export function BackupSection() {
       setPreview(null);
       // With the preview: they describe the repository that was previewed, and carrying
       // them past a save would show, and resend on restore, another repository's approvals.
+      // Import results are not among them: they describe files added and projects
+      // registered on this machine, which changing a setting does not undo, and are the only
+      // record of what undoing an import means removing.
       setCommandApprovals([]);
       setApproveCommands(false);
+      setProjectImports([]);
+      setProjectImportSelections({});
+      setProjectBundleSkipped(false);
+      setShelfSkipped([]);
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setStatusMessage("Backup settings saved.");
@@ -336,7 +541,7 @@ export function BackupSection() {
     setValidation(null);
 
     try {
-      const result = await api.backup.validate(savedDraft);
+      const result = await api.backup.validate(requestDraft);
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
         return;
@@ -359,9 +564,17 @@ export function BackupSection() {
     setStatusMessage(null);
     setPreview(null);
     setOverrideSecretScan(false);
+    // The project half of the preview is cleared with the rest of it: left standing through
+    // a failed preview, the old cards would offer a plan the repository no longer describes.
+    // Import results are not part of the preview and stay: they list what earlier restores
+    // wrote and registered, which the user needs to undo an import and a preview does not
+    // change.
+    setProjectImports([]);
+    setProjectBundleSkipped(false);
+    setShelfSkipped([]);
 
     try {
-      const result = await api.backup.preview(savedDraft);
+      const result = await api.backup.preview(requestDraft);
       if (!result.success) {
         setActionError(getOperationErrorMessage(result.error));
         return;
@@ -376,6 +589,22 @@ export function BackupSection() {
         nextApprovals.every((approval, index) => commandApprovals[index]?.token === approval.token);
       setCommandApprovals(nextApprovals);
       if (!sameCommands) setApproveCommands(false);
+      const nextImports = result.data.projectImports;
+      setProjectImports(nextImports);
+      // Tokens are content-bound, so a selection carried over by token still describes the
+      // exact entry the user approved; anything else starts unapproved.
+      setProjectImportSelections((current) => {
+        const next: Record<string, ProjectImportSelection> = {};
+        for (const candidate of nextImports) {
+          next[candidate.token] = current[candidate.token] ?? {
+            approved: false,
+            targetPath: "",
+          };
+        }
+        return next;
+      });
+      setProjectBundleSkipped(result.data.projectBundleSkipped);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
       setStatusMessage("Preview refreshed.");
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -392,7 +621,7 @@ export function BackupSection() {
 
     try {
       const result = await api.backup.push({
-        ...savedDraft,
+        ...requestDraft,
         // The digest from the block the user is looking at, so approval cannot carry over to
         // a payload another window changed in between. Sent only while the control is visible.
         approvedSecretDigest:
@@ -413,8 +642,14 @@ export function BackupSection() {
       setOverrideSecretScan(false);
       setSecretScanBlocked(false);
       setSecretScanApproval(null);
+      // The push replaced the remote bundle the candidates and the skipped flag described;
+      // their tokens no longer match anything, so a restore would only be refused.
+      setProjectImports([]);
+      setProjectImportSelections({});
+      setProjectBundleSkipped(false);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
       setStatusMessage(
-        `Backed up settings at ${result.data.commit} using ${getCredentialLabel(result.data.credential)}.`
+        `Backed up settings at ${result.data.commit} using ${BACKUP_CREDENTIAL_LABELS[result.data.credential]}.`
       );
     } catch (error) {
       setActionError(getErrorMessage(error));
@@ -431,8 +666,16 @@ export function BackupSection() {
 
     try {
       const result = await api.backup.restore({
-        ...savedDraft,
+        ...requestDraft,
         approvedCommandTokens: approveCommands ? commandApprovals.map((item) => item.token) : [],
+        // Only candidates the user explicitly checked; the backend re-verifies each token
+        // against the checked-out payload and validates the target path.
+        projectImports: projectImports
+          .filter((candidate) => projectImportSelections[candidate.token]?.approved === true)
+          .map((candidate) => ({
+            token: candidate.token,
+            targetPath: projectImportSelections[candidate.token]?.targetPath.trim() ?? "",
+          })),
       });
       if (!result.success) {
         // A failure after the snapshot completed may have overwritten files already; the
@@ -450,6 +693,17 @@ export function BackupSection() {
           setCommandApprovals(result.error.commandApprovals ?? []);
           setApproveCommands(false);
         }
+        // Same round trip for project imports: stale tokens come back with the current
+        // candidate list, which needs fresh approvals.
+        if (result.error.code === "PROJECT_IMPORT_APPROVAL_REQUIRED") {
+          const nextImports = result.error.projectImports ?? [];
+          setProjectImports(nextImports);
+          setProjectImportSelections(
+            Object.fromEntries(
+              nextImports.map((candidate) => [candidate.token, { approved: false, targetPath: "" }])
+            )
+          );
+        }
         return;
       }
       setPreview(null);
@@ -457,8 +711,26 @@ export function BackupSection() {
       setSecretScanBlocked(false);
       setCommandApprovals([]);
       setApproveCommands(false);
+      // Candidates the restore left out for lack of approval stay on offer with their fresh
+      // tokens, so a restore run without a preview never hides backed-up projects.
+      const unapproved = result.data.unapprovedProjectImports;
+      setProjectImports(unapproved);
+      setProjectImportSelections(
+        Object.fromEntries(
+          unapproved.map((candidate) => [candidate.token, { approved: false, targetPath: "" }])
+        )
+      );
+      setProjectImportResults((previous) =>
+        mergeImportResults(previous, result.data.projectImportResults)
+      );
+      setProjectBundleSkipped(result.data.projectBundleSkipped);
+      setShelfSkipped(result.data.shelfSkipped ?? []);
       setStatusMessage(
-        `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}`
+        `Restored ${describeRestoredFiles(result.data.changedFiles.length)}. Safety snapshot: ${result.data.snapshotPath}${
+          unapproved.length === 0
+            ? ""
+            : ` ${unapproved.length} backed-up ${unapproved.length === 1 ? "project was" : "projects were"} not imported; approve them below to import.`
+        }`
       );
       setRestoreConfirmationOpen(false);
     } catch (error) {
@@ -494,18 +766,33 @@ export function BackupSection() {
       }
     },
   };
+  const rootRef = useRef<HTMLDivElement>(null);
+  const toggleContentRef = useRef<(option: BackupContentOption) => void>(() => undefined);
+  toggleContentRef.current = (option) => {
+    if (busy) return;
+    setDraft((current) => {
+      // Mirrors the checkbox: a sub-option is inert while its parent is off.
+      if (option.parent !== undefined && !current[option.parent]) return current;
+      return { ...current, [option.flag]: !current[option.flag] };
+    });
+  };
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (isDialogOpen() || isEditableElement(event.target)) return;
+      if (!ownsBackupShortcuts(rootRef.current, event.target)) return;
+      if (isEditableElement(event.target)) return;
 
       const shortcut = BACKUP_SHORTCUTS.find(([, keybind]) => matchesKeybind(event, keybind));
       const action = shortcut && actionsRef.current?.[shortcut[0]];
-      if (!action) return;
+      const option = contentOptionsRef.current.find((candidate) =>
+        matchesKeybind(event, candidate.shortcut)
+      );
+      if (!action && !option) return;
 
       event.preventDefault();
       event.stopPropagation();
-      void action();
+      if (action) void action();
+      else if (option) toggleContentRef.current(option);
     };
 
     window.addEventListener("keydown", onKeyDown);
@@ -517,7 +804,7 @@ export function BackupSection() {
   }
 
   return (
-    <div className="space-y-6">
+    <div ref={rootRef} className="space-y-6">
       <div className="bg-warning/10 border-warning/30 text-warning flex items-start gap-2 rounded-md border px-3 py-2 text-xs">
         <TriangleAlert aria-hidden="true" className="mt-0.5 h-3.5 w-3.5 shrink-0" />
         <p>
@@ -529,7 +816,7 @@ export function BackupSection() {
       <div>
         <h3 className="text-foreground text-sm font-medium">Settings backup</h3>
         <p className="text-muted mt-1 text-xs">
-          Back up portable Shux settings to a git repository using credentials already available on
+          Back up portable Xum settings to a git repository using credentials already available on
           this machine.
         </p>
       </div>
@@ -565,17 +852,59 @@ export function BackupSection() {
               onChange={(event) =>
                 setDraft((current) => ({ ...current, path: event.target.value }))
               }
-              placeholder="shux/"
+              placeholder="xum/"
               disabled={busy}
             />
           </label>
         </div>
 
+        <fieldset className="space-y-2">
+          <legend className="text-foreground text-xs font-medium">
+            What to back up and restore
+          </legend>
+          {contentOptions.map((option) => {
+            const parentOff = option.parent !== undefined && !draft[option.parent];
+            return (
+              <label
+                key={option.flag}
+                className={`flex items-start gap-2 ${option.parent ? "ml-6" : ""}`}
+              >
+                <Checkbox
+                  checked={draft[option.flag] && !parentOff}
+                  onCheckedChange={(checked) =>
+                    setDraft((current) => ({ ...current, [option.flag]: checked === true }))
+                  }
+                  disabled={busy || parentOff}
+                  aria-label={option.label}
+                />
+                <span className="min-w-0">
+                  <span className="text-foreground block text-xs font-medium">
+                    {option.label}
+                    {/* Shortcut hint only; the shortcut itself stays bound on every viewport. */}
+                    <span className="text-muted ml-1 hidden font-normal sm:inline">
+                      ({formatKeybind(option.shortcut)})
+                    </span>
+                  </span>
+                  {option.description ? (
+                    <span className="text-muted mt-0.5 block text-xs">{option.description}</span>
+                  ) : null}
+                </span>
+              </label>
+            );
+          })}
+          <p className="text-muted text-xs">
+            Provider key files and dedicated secret files are never backed up. Anything selected
+            here is copied as written; deselecting it later does not remove earlier copies from the
+            repository&apos;s git history. Inside skills and memory, only documentation is published
+            automatically; any other file waits for you to review it.
+          </p>
+        </fieldset>
+
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
           <Button
             size="sm"
             onClick={() => void handleSave()}
-            disabled={busy || !isDirty}
+            disabled={saveBlocked || !isDirty}
             tooltip={`Save settings (${formatKeybind(KEYBINDS.SETTINGS_BACKUP_SAVE)})`}
             className="w-full sm:w-auto"
           >
@@ -586,33 +915,12 @@ export function BackupSection() {
         {saveError ? <p className="text-error text-xs">{saveError}</p> : null}
       </section>
 
-      <section className="space-y-3">
-        <div>
-          <h3 className="text-foreground text-sm font-medium">Included</h3>
-          <p className="text-muted mt-1 text-xs">Only portable, allowlisted settings are copied.</p>
-        </div>
-        <ul className="grid gap-2 sm:grid-cols-2">
-          {INCLUDED_SETTINGS.map((item) => (
-            <li key={item} className="text-muted flex items-center gap-2 text-xs">
-              <CheckCircle2 className="text-success h-3.5 w-3.5 shrink-0" />
-              {item}
-            </li>
-          ))}
-        </ul>
-        <p className="text-foreground text-xs font-medium">
-          Provider key files and dedicated secret files have no export path. MCP commands and URLs
-          are included verbatim; credential-like URL components require review, while literal MCP
-          header values are redacted. Inside skills and memory, only documentation is published
-          automatically; any other file waits for you to review it.
-        </p>
-      </section>
-
       <section className="border-border-light space-y-3 rounded-md border p-4">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
             <h3 className="text-foreground text-sm font-medium">Repository access</h3>
             <p className="text-muted mt-1 text-xs">
-              Shux tries SSH, GitHub CLI credentials, then system git credentials.
+              Xum tries SSH, GitHub CLI credentials, then system git credentials.
             </p>
           </div>
           <Button
@@ -630,7 +938,7 @@ export function BackupSection() {
         {validation ? (
           <div className="bg-background-secondary rounded-md px-3 py-2 text-xs">
             <div className="text-foreground">
-              Credential used: {getCredentialLabel(validation.credential)}
+              Credential used: {BACKUP_CREDENTIAL_LABELS[validation.credential]}
             </div>
             <div className="text-muted mt-1">
               {validation.empty
@@ -668,6 +976,7 @@ export function BackupSection() {
                 title="Backup to repository"
                 emptyLabel="No repository changes."
                 changes={preview.pushChanges}
+                error={preview.pushError}
               />
               <ChangeList
                 title="Restore to this device"
@@ -690,11 +999,17 @@ export function BackupSection() {
             ) : null}
 
             <div className="border-border-light rounded-md border p-3">
-              <h4 className="text-foreground text-xs font-medium">
-                Redacted from repository backup
-              </h4>
-              {preview.redactions.length === 0 ? (
-                <p className="text-muted mt-2 text-xs">No MCP values were redacted.</p>
+              <h4 className="text-foreground text-xs font-medium">Kept on this device</h4>
+              {!savedDraft.includeMcp ? (
+                <p className="text-muted mt-2 text-xs">
+                  MCP server configuration is not in the backup, so all of it stays here.
+                </p>
+              ) : preview.pushError ? (
+                <p className="text-muted mt-2 text-xs">
+                  Not computed because the export preview failed.
+                </p>
+              ) : preview.redactions.length === 0 ? (
+                <p className="text-muted mt-2 text-xs">Every MCP value is in the backup.</p>
               ) : (
                 <ul className="text-muted mt-2 space-y-1 text-xs">
                   {preview.redactions.map((redaction) => (
@@ -708,7 +1023,7 @@ export function BackupSection() {
           </div>
         ) : (
           <div className="border-border-light text-muted rounded-md border border-dashed p-4 text-xs">
-            Run a preview to compare both directions and inspect redactions.
+            Run a preview to compare both directions and see which MCP values stay local.
           </div>
         )}
       </section>
@@ -739,7 +1054,7 @@ export function BackupSection() {
       ) : null}
 
       {actionError ? <div className="text-error text-xs">{actionError}</div> : null}
-      {statusMessage ? <div className="text-success text-xs">{statusMessage}</div> : null}
+      {statusMessage ? <div className="text-success-text text-xs">{statusMessage}</div> : null}
 
       <section className="border-border-light flex flex-col gap-3 border-t pt-4 sm:flex-row sm:items-center">
         <Button
@@ -777,7 +1092,7 @@ export function BackupSection() {
                 Approve the listed executable MCP command changes
               </span>
               <span className="text-muted mt-0.5 block text-xs">
-                Restoring writes these commands, and Shux runs them when the server starts. Restore
+                Restoring writes these commands, and Xum runs them when the server starts. Restore
                 is blocked until you approve them.
               </span>
               <ul className="mt-2 space-y-1.5">
@@ -793,11 +1108,151 @@ export function BackupSection() {
         </div>
       ) : null}
 
+      {projectBundleSkipped ? (
+        <div className="border-border-light text-muted rounded-md border p-3 text-xs">
+          This backup carries a project bundle, but project backup is disabled here, so it was
+          skipped. Enable “Include project list &amp; project memories” and save to restore it.
+        </div>
+      ) : null}
+
+      {shelfSkipped.length > 0 ? (
+        <div className="border-border-light text-muted rounded-md border p-3 text-xs">
+          Some pinned artifacts were left out:
+          <ul className="mt-1 list-disc pl-4">
+            {shelfSkipped.map((notice) => (
+              <li key={notice}>{notice}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+
+      {projectImports.length > 0 ? (
+        <div className="border-border-light space-y-3 rounded-md border p-3">
+          <div>
+            <h4 className="text-foreground text-xs font-medium">Projects to reimport</h4>
+            <p className="text-muted mt-1 text-xs">
+              These backed-up projects are not registered here at their recorded paths. Nothing is
+              written for them unless you approve an import: clone or locate the project directory
+              yourself, enter its local path, and check the project. Approving registers the project
+              and adds its memories without overwriting existing files.
+            </p>
+          </div>
+          <ul className="space-y-3">
+            {projectImports.map((candidate) => {
+              const selection = projectImportSelections[candidate.token] ?? {
+                approved: false,
+                targetPath: "",
+              };
+              return (
+                <li key={candidate.token} className="border-border-light rounded-md border p-3">
+                  <label className="flex items-start gap-2">
+                    <Checkbox
+                      checked={selection.approved}
+                      onCheckedChange={(checked) =>
+                        setProjectImportSelections((current) => ({
+                          ...current,
+                          [candidate.token]: { ...selection, approved: checked === true },
+                        }))
+                      }
+                      disabled={busy}
+                      aria-label={`Import project ${candidate.name}`}
+                    />
+                    <span className="min-w-0 flex-1">
+                      {/* break-all: the name is repository-controlled and may be one long token. */}
+                      <span className="text-foreground block text-xs font-medium break-all">
+                        {candidate.name}
+                        <span className="text-muted ml-1 font-normal">
+                          ({candidate.memoryFileCount} memory{" "}
+                          {candidate.memoryFileCount === 1 ? "file" : "files"})
+                        </span>
+                      </span>
+                      <span className="text-muted mt-0.5 block text-xs break-all">
+                        Backed up from: {candidate.sourcePath}
+                      </span>
+                      {/* Inert text on purpose: the remote is repository-controlled data,
+                          never a link and never executed. */}
+                      {candidate.gitRemote != null ? (
+                        <span className="text-muted mt-0.5 block text-xs break-all">
+                          Remote: {candidate.gitRemote}
+                        </span>
+                      ) : null}
+                    </span>
+                  </label>
+                  <label className="mt-2 block space-y-1.5">
+                    <span className="text-foreground text-xs font-medium">
+                      Local project directory
+                    </span>
+                    <Input
+                      value={selection.targetPath}
+                      onChange={(event) =>
+                        setProjectImportSelections((current) => ({
+                          ...current,
+                          [candidate.token]: { ...selection, targetPath: event.target.value },
+                        }))
+                      }
+                      // Never prefilled from the backup: the recorded path is repository-
+                      // controlled, and on Windows a UNC path merely probed by the restore
+                      // would start SMB authentication. The user names a local directory.
+                      placeholder="Absolute path of the local checkout"
+                      disabled={busy}
+                    />
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      ) : null}
+
+      {projectImportResults.length > 0 ? (
+        <div className="border-border-light space-y-2 rounded-md border p-3">
+          <h4 className="text-foreground text-xs font-medium">Project import results</h4>
+          <ul className="space-y-2">
+            {projectImportResults.map((importResult) => (
+              <li
+                key={`${importResult.sourcePath}:${importResult.targetPath}`}
+                className="min-w-0 text-xs"
+              >
+                <span className={`${importResultTone(importResult)} block break-all`}>
+                  {importResultLabel(importResult)}: {importResult.name} → {importResult.targetPath}
+                </span>
+                {importResult.message != null ? (
+                  <span className="text-muted block break-all">{importResult.message}</span>
+                ) : null}
+                {importResult.writtenFiles.length > 0 ? (
+                  <span className="text-muted block break-all">
+                    Added memory {importResult.writtenFiles.length === 1 ? "file" : "files"}:{" "}
+                    {importResult.writtenFiles.join(", ")}
+                  </span>
+                ) : null}
+                {importResult.registered ? (
+                  <span className="text-muted block break-all">Newly registered project</span>
+                ) : null}
+                {importResult.skippedFiles.length > 0 ? (
+                  <span className="text-warning block break-all">
+                    Kept existing files with different content:{" "}
+                    {importResult.skippedFiles.join(", ")}
+                  </span>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          <p className="text-muted text-xs">
+            The safety snapshot does not cover imported memory files or project registrations. To
+            undo an import, delete the added files
+            {projectImportResults.some((importResult) => importResult.registered)
+              ? " and remove the projects marked as newly registered"
+              : ""}
+            .
+          </p>
+        </div>
+      ) : null}
+
       <ConfirmationModal
         isOpen={restoreConfirmationOpen}
         title="Restore settings backup?"
         description="This overwrites local files and portable preferences that are present in the backup. Local-only files are kept."
-        warning="Shux will create a safety snapshot first, but restoring can immediately change settings in open windows."
+        warning="Xum will create a safety snapshot first, but restoring can immediately change settings in open windows."
         confirmLabel={activeAction === "restore" ? "Restoring..." : "Restore settings"}
         confirmVariant="destructive"
         onConfirm={handleRestore}

@@ -1,13 +1,9 @@
 import { useRef, useEffect, useState, useCallback, useLayoutEffect } from "react";
 import { init, Terminal, FitAddon } from "ghostty-web";
 import { useAPI } from "@/browser/contexts/API";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  DEFAULT_TERMINAL_FONT_CONFIG,
-  TERMINAL_FONT_CONFIG_KEY,
-  normalizeTerminalFontConfig,
-  type TerminalFontConfig,
-} from "@/common/constants/storage";
+import { isStreamFailure } from "@/browser/contexts/connectionLink";
+import { useUserPreferences } from "@/browser/stores/AppConfigStore";
+import { normalizeTerminalFontConfig } from "@/common/constants/storage";
 import { useTerminalRouter } from "@/browser/terminal/TerminalRouterContext";
 import {
   appendTerminalIconFallback,
@@ -19,6 +15,8 @@ import {
   TERMINAL_ICON_FALLBACK_FAMILY,
 } from "@/browser/terminal/terminalFontFamily";
 import { TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
+import { TerminalBadgeOverlay } from "@/browser/components/TerminalView/TerminalBadgeOverlay";
+import { getTerminalTabFallbackName } from "@/browser/types/rightSidebar";
 
 function canLoadFontFamily(primary: string, fontSize: number): boolean {
   const family = stripOuterQuotes(primary).trim();
@@ -31,6 +29,26 @@ function canLoadFontFamily(primary: string, fontSize: number): boolean {
   }
 
   return isFontFamilyAvailableInBrowser(family, fontSize);
+}
+
+/**
+ * Undoes the focus ghostty-web takes when it opens a terminal that must not take it. Blurring
+ * alone leaves focus on the page body, where keystrokes reach the chat: for example after the
+ * right sidebar's toggle expanded a sidebar showing a terminal, the toggle loses focus. Focus goes
+ * back to the element that had it, unless something else took it since.
+ */
+function blurAndRestoreFocus(terminal: Terminal, container: HTMLElement, previous: Element | null) {
+  const terminalHadFocus = container.contains(document.activeElement);
+  terminal.blur();
+  if (
+    terminalHadFocus &&
+    previous instanceof HTMLElement &&
+    previous !== document.body &&
+    previous.isConnected &&
+    !container.contains(previous)
+  ) {
+    previous.focus({ preventScroll: true });
+  }
 }
 
 function resolveTerminalFontFamily(fontFamily: string, fontSize: number): string {
@@ -104,6 +122,34 @@ async function preloadTerminalWebfonts(
   }
 }
 
+/** RIS (full reset): clears the screen, the scrollback and the modes inside the VT itself. */
+const FULL_RESET = "\x1bc";
+
+/**
+ * Writes a full screen from the server (may be empty for new sessions).
+ *
+ * `replace` is set after a reconnect, when the router reattaches and sends the full screen again
+ * (TerminalSessionRouter). clear() keeps the scrollback, so writing on top would repeat it: the
+ * screen is written after a full reset instead, in one write, so no empty frame shows.
+ *
+ * Not Terminal.reset(): in ghostty-web it frees the WASM terminal and makes a new one, but the
+ * selection manager and input handler keep the freed one, and the next write after a second
+ * reconnect failed with "memory access out of bounds" and garbled the screen.
+ */
+export function writeScreenState(
+  term: Pick<Terminal, "write">,
+  state: string,
+  replace: boolean
+): void {
+  if (!replace && !state) return;
+  try {
+    term.write(replace ? FULL_RESET + state : state);
+  } catch (err) {
+    // xterm WASM can throw "memory access out of bounds" intermittently
+    console.warn("[TerminalView] Error writing screenState:", err);
+  }
+}
+
 interface TerminalViewProps {
   workspaceId: string;
   /** Session ID to connect to (required - must be created before mounting) */
@@ -129,6 +175,21 @@ interface TerminalViewProps {
   autoFocus?: boolean;
   /** Called when the terminal process exits. */
   onExit?: (exitCode: number) => void;
+  /**
+   * Workspace/tab identity for the badge overlay. When omitted (pop-out
+   * window), workspace names are resolved via the API and the tab name
+   * falls back to the latest OSC title.
+   */
+  workspaceName?: string;
+  projectName?: string;
+  tabName?: string;
+  /** 0-based tab position for the badge's {index} token; unknown in pop-out windows. */
+  tabIndex?: number;
+  /**
+   * OSC title carried over from before a pop-out handoff, so the badge doesn't
+   * reset to "Terminal" until the shell emits another title.
+   */
+  initialTitle?: string;
 }
 
 export function TerminalView({
@@ -140,6 +201,11 @@ export function TerminalView({
   onAutoFocusConsumed,
   autoFocus = true,
   onExit,
+  workspaceName,
+  projectName,
+  tabName,
+  tabIndex,
+  initialTitle,
 }: TerminalViewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -157,10 +223,8 @@ export function TerminalView({
   // Track whether we've received the initial screen state from backend
   const [isLoading, setIsLoading] = useState(true);
 
-  const [rawTerminalFontConfig] = usePersistedState<TerminalFontConfig>(
-    TERMINAL_FONT_CONFIG_KEY,
-    DEFAULT_TERMINAL_FONT_CONFIG,
-    { listener: true }
+  const rawTerminalFontConfig = useUserPreferences(
+    (preferences) => preferences.appearance?.terminalFontConfig
   );
   const terminalFontConfig = normalizeTerminalFontConfig(rawTerminalFontConfig);
   const { api } = useAPI();
@@ -171,6 +235,16 @@ export function TerminalView({
   routerRef.current = router;
   sessionIdRef.current = sessionId;
 
+  // Pop-out windows have no WorkspaceProvider, so the badge overlay's
+  // workspace identity is resolved here alongside the window title.
+  const [resolvedNames, setResolvedNames] = useState<{
+    workspaceName: string;
+    projectName: string;
+  } | null>(null);
+  // Latest OSC 0/1/2 title; badge fallback for pop-out windows where the
+  // sidebar's per-tab title map is unavailable.
+  const [oscTitle, setOscTitle] = useState<string | null>(initialTitle ?? null);
+
   // Set window title (dedicated terminal window only)
   useEffect(() => {
     if (!api || !setDocumentTitle) return;
@@ -180,6 +254,7 @@ export function TerminalView({
         const workspace = workspaces.find((ws) => ws.id === workspaceId);
         if (workspace) {
           document.title = `Terminal — ${workspace.projectName}/${workspace.name}`;
+          setResolvedNames({ workspaceName: workspace.name, projectName: workspace.projectName });
         } else {
           document.title = `Terminal — ${workspaceId}`;
         }
@@ -224,7 +299,9 @@ export function TerminalView({
   }, [autoFocus]);
 
   useEffect(() => {
-    if (!autoFocus || !visible || !terminalReady || autoFocusConsumedRef.current) {
+    // Wait for the first screen: until then the container is visibility:hidden, so focus taken
+    // now does not last, yet the check below would already consume autoFocus (T3, #5971).
+    if (!autoFocus || !visible || !terminalReady || isLoading || autoFocusConsumedRef.current) {
       return;
     }
 
@@ -270,7 +347,7 @@ export function TerminalView({
       cancelled = true;
       cancelAnimationFrame(rafId);
     };
-  }, [autoFocus, visible, terminalReady, consumeAutoFocus]);
+  }, [autoFocus, visible, terminalReady, isLoading, consumeAutoFocus]);
 
   // Reset loading state when session changes
   useEffect(() => {
@@ -294,8 +371,9 @@ export function TerminalView({
           }
           break;
         }
-      } catch {
-        if (!controller.signal.aborted) {
+      } catch (error) {
+        // A lost connection is not an exit: the next client runs this effect again.
+        if (isStreamFailure(error, controller.signal)) {
           // Treat failed subscriptions as exits (session ended before listener attached).
           handleExit(0);
         }
@@ -337,16 +415,8 @@ export function TerminalView({
           console.warn("[TerminalView] Error writing output:", err);
         }
       },
-      onScreenState: (state) => {
-        // Write screen state (may be empty for new sessions)
-        if (state) {
-          try {
-            term.write(state);
-          } catch (err) {
-            // xterm WASM can throw "memory access out of bounds" intermittently
-            console.warn("[TerminalView] Error writing screenState:", err);
-          }
-        }
+      onScreenState: (state, options) => {
+        writeScreenState(term, state, options?.replace === true);
         // Mark loading complete - we now have valid content to show
         setIsLoading(false);
       },
@@ -355,7 +425,7 @@ export function TerminalView({
 
     // Send initial resize to sync PTY dimensions
     const { cols, rows } = term;
-    void router.resize(sessionId, cols, rows);
+    router.syncSize(sessionId, cols, rows);
 
     return unsubscribe;
   }, [visible, terminalReady, sessionId, router, handleExit]);
@@ -462,6 +532,8 @@ export function TerminalView({
         const fitAddon = new FitAddon();
         terminal.loadAddon(fitAddon);
 
+        // open() focuses the terminal; without autoFocus, focus goes back to this below.
+        const focusBeforeOpen = document.activeElement;
         terminal.open(containerEl);
         fitAddon.fit();
 
@@ -534,12 +606,12 @@ export function TerminalView({
             textarea.focus();
           }
         } else {
-          // Blur immediately
-          terminal.blur();
-          // Counter the delayed focus() in ghostty-web
           const termToBlur = terminal;
+          // Blur immediately
+          blurAndRestoreFocus(termToBlur, containerEl, focusBeforeOpen);
+          // Counter the delayed focus() in ghostty-web
           setTimeout(() => {
-            termToBlur.blur();
+            blurAndRestoreFocus(termToBlur, containerEl, focusBeforeOpen);
           }, 0);
         }
 
@@ -556,6 +628,7 @@ export function TerminalView({
         // Terminal title changes (from OSC escape sequences like "echo -ne '\033]0;Title\007'")
         // Use ref to always get latest callback
         disposeOnTitleChange = terminal.onTitleChange((title: string) => {
+          setOscTitle(title);
           onTitleChangeRef.current?.(title);
         });
 
@@ -887,6 +960,14 @@ export function TerminalView({
         >
           <span className="text-muted animate-pulse text-sm">Connecting...</span>
         </div>
+      )}
+      {!showLoading && (
+        <TerminalBadgeOverlay
+          workspaceName={workspaceName ?? resolvedNames?.workspaceName ?? workspaceId}
+          projectName={projectName ?? resolvedNames?.projectName ?? ""}
+          tabName={tabName ?? oscTitle ?? getTerminalTabFallbackName(0)}
+          tabIndex={tabIndex}
+        />
       )}
     </div>
   );

@@ -1,11 +1,12 @@
 import React from "react";
-import { Check, Clock, Coins, Play, RotateCcw, Square, Workflow } from "lucide-react";
+import { Check, ChevronRight, Clock, Coins, Play, RotateCcw, Square, Workflow } from "lucide-react";
 
-import { useAPI } from "@/browser/contexts/API";
+import { useLiveAPI } from "@/browser/contexts/API";
 import type { WorkflowRunRecord } from "@/common/types/workflow";
 import { canRetryWorkflowFromCheckpoint } from "@/common/utils/workflowRetryEligibility";
 
 import { WorkflowScopeBadge, WorkflowStatusPill } from "./WorkflowBadges";
+import { WorkflowLongText } from "./WorkflowLongText";
 import type { WorkflowRunView } from "./projectWorkflowRun";
 import {
   formatWorkflowCost,
@@ -16,7 +17,7 @@ import {
 const BTN_BASE =
   "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs font-medium transition-colors disabled:cursor-default disabled:opacity-50";
 const BTN_DEFAULT = `${BTN_BASE} border-border bg-surface-secondary text-foreground hover:bg-hover`;
-const BTN_ACCENT = `${BTN_BASE} border-accent bg-accent text-white hover:opacity-90`;
+const BTN_ACCENT = `${BTN_BASE} border-accent bg-accent text-accent-foreground hover:bg-accent-button-hover`;
 
 function isInlineWorkflowPath(scriptPath: string): boolean {
   return scriptPath.startsWith("inline://");
@@ -47,8 +48,11 @@ interface WorkflowRunHeaderProps {
 }
 
 export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
-  const { api } = useAPI();
+  // Run actions need a live connection. While Xum reconnects the run stays on screen, but its
+  // actions are disabled (`blocked`), so a click never silently does nothing.
+  const api = useLiveAPI();
   const [busy, setBusy] = React.useState(false);
+  const blocked = busy || api == null;
   const [actionError, setActionError] = React.useState<string | null>(null);
 
   const run = props.run;
@@ -61,7 +65,7 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
   const canRerun = rerunScriptPath != null;
 
   const runAction = async (action: () => Promise<unknown>) => {
-    if (api == null || busy) {
+    if (blocked) {
       return;
     }
     setBusy(true);
@@ -80,14 +84,17 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
   // guard + error state) so they satisfy onClick's void-return contract.
   const interrupt = () => {
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.interrupt({ workspaceId: props.workspaceId, runId: run.id })
     );
   };
   const resume = () => {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
     void runAction(() => api!.workflows.resume({ workspaceId: props.workspaceId, runId: run.id }));
   };
   const retry = () => {
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.retryFromCheckpoint({ workspaceId: props.workspaceId, runId: run.id })
     );
   };
@@ -96,6 +103,7 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
       return;
     }
     void runAction(() =>
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       api!.workflows.start({
         workspaceId: props.workspaceId,
         scriptPath: rerunScriptPath,
@@ -110,7 +118,7 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
   return (
     <div className="border-border flex flex-col gap-2.5 border-b pb-3.5">
       <div className="flex items-center gap-2">
-        <span className="text-accent flex min-w-0 items-center gap-2">
+        <span className="text-accent-text flex min-w-0 items-center gap-2">
           <Workflow className="h-[15px] w-[15px] shrink-0" />
           <span className="text-content-primary truncate text-[15px] font-semibold">
             {run.workflow.name}
@@ -127,13 +135,69 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
           {view.argEntries.map((entry, index) => (
             <div
               key={entry.key ?? index}
-              className="border-border bg-surface-secondary text-content-secondary flex gap-1.5 rounded-md border px-2 py-1 text-xs"
+              className="border-border bg-surface-secondary text-content-secondary flex min-w-0 gap-1.5 rounded-md border px-2 py-1 text-xs"
             >
-              {entry.key != null && (
-                <span className="text-muted shrink-0 font-mono text-[11px]">{entry.key}</span>
+              {entry.stages != null ? (
+                // Keep the step stream visible until details are requested; launch metadata
+                // describes a plan, not evidence of runtime progress.
+                <details className="group/stages min-w-0 flex-1">
+                  <summary className="focus-visible:outline-accent cursor-pointer list-none rounded focus-visible:outline-2 [&::-webkit-details-marker]:hidden">
+                    <span className="text-muted flex items-center gap-1 font-medium">
+                      <ChevronRight className="h-3 w-3 shrink-0 group-open/stages:rotate-90" />
+                      <span>Planned stages</span>
+                      <span className="counter-nums">· {entry.stages.length}</span>
+                    </span>
+                    <span className="text-content-primary mt-1 flex flex-wrap gap-x-3 gap-y-1 group-open/stages:hidden">
+                      {entry.stages.map((stage, stageIndex) => (
+                        <span key={stageIndex} className="max-w-full min-w-0 break-words">
+                          <span className="text-muted counter-nums">{stageIndex + 1}.</span>{" "}
+                          {stage.name}
+                        </span>
+                      ))}
+                    </span>
+                  </summary>
+                  <ol
+                    aria-label="Planned stages"
+                    className="counter-nums mt-2 list-decimal space-y-2 pl-5"
+                  >
+                    {entry.stages.map((stage, stageIndex) => (
+                      <li key={stageIndex} className="min-w-0 space-y-0.5 break-words">
+                        <div className="text-content-primary font-medium">{stage.name}</div>
+                        {stage.role && <div className="text-muted">{stage.role}</div>}
+                        {stage.brief && (
+                          <WorkflowLongText
+                            text={stage.brief}
+                            title={`Stage ${stageIndex + 1}: ${stage.name}`}
+                          />
+                        )}
+                      </li>
+                    ))}
+                  </ol>
+                  <details className="group mt-2 min-w-0">
+                    <summary className="text-muted hover:text-foreground focus-visible:outline-accent flex cursor-pointer list-none items-center gap-1 rounded focus-visible:outline-2 [&::-webkit-details-marker]:hidden">
+                      <ChevronRight className="h-3 w-3 shrink-0 group-open:rotate-90" />
+                      Original argument
+                    </summary>
+                    <WorkflowLongText
+                      className="mt-1"
+                      text={entry.value}
+                      title="Argument: stages"
+                    />
+                  </details>
+                </details>
+              ) : (
+                <>
+                  {entry.key != null && (
+                    <span className="text-muted shrink-0 font-mono text-[11px]">{entry.key}</span>
+                  )}
+                  {/* Long values preview-truncate; expand inline or open the full view. */}
+                  <WorkflowLongText
+                    className="flex-1"
+                    text={entry.value}
+                    title={entry.key != null ? `Argument: ${entry.key}` : "Workflow argument"}
+                  />
+                </>
               )}
-              {/* Wrap long values across lines so the full arg is visible, not truncated to one row. */}
-              <span className="min-w-0 break-words whitespace-pre-wrap">{entry.value}</span>
             </div>
           ))}
         </div>
@@ -161,16 +225,16 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
 
       <div className="flex flex-wrap gap-2">
         {isLive ? (
-          <button type="button" className={BTN_DEFAULT} onClick={interrupt} disabled={busy}>
+          <button type="button" className={BTN_DEFAULT} onClick={interrupt} disabled={blocked}>
             <Square className="h-3 w-3" /> Interrupt
           </button>
         ) : run.status === "interrupted" ? (
           <>
-            <button type="button" className={BTN_ACCENT} onClick={resume} disabled={busy}>
+            <button type="button" className={BTN_ACCENT} onClick={resume} disabled={blocked}>
               <Play className="h-3 w-3" /> Resume
             </button>
             {canRerun && (
-              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={busy}>
+              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={blocked}>
                 <RotateCcw className="h-3 w-3" /> Re-run
               </button>
             )}
@@ -178,12 +242,12 @@ export const WorkflowRunHeader: React.FC<WorkflowRunHeaderProps> = (props) => {
         ) : (
           <>
             {canRetry && (
-              <button type="button" className={BTN_ACCENT} onClick={retry} disabled={busy}>
+              <button type="button" className={BTN_ACCENT} onClick={retry} disabled={blocked}>
                 <Play className="h-3 w-3" /> Retry from checkpoint
               </button>
             )}
             {canRerun && (
-              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={busy}>
+              <button type="button" className={BTN_DEFAULT} onClick={rerun} disabled={blocked}>
                 <RotateCcw className="h-3 w-3" /> Re-run
               </button>
             )}

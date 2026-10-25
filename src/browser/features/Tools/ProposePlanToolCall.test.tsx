@@ -1,36 +1,44 @@
-import type { ComponentProps } from "react";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import type { ComponentProps, ReactNode } from "react";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { installDom } from "../../../../tests/ui/dom";
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 
-import * as APIModule from "@/browser/contexts/API";
+import { APIContext, APIProvider, type APIClient } from "@/browser/contexts/API";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as UseOpenInEditorModule from "@/browser/hooks/useOpenInEditor";
 import * as UseReviewsModule from "@/browser/hooks/useReviews";
 import * as UseStartHereModule from "@/browser/hooks/useStartHere";
 import * as DiffRendererModule from "@/browser/features/Shared/DiffRenderer";
 import * as ReviewTypesModule from "@/common/types/review";
-import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import { AgentProvider } from "@/browser/contexts/AgentContext";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import {
-  AGENT_AI_DEFAULTS_KEY,
-  getAgentIdKey,
-  getModelKey,
-  getPlanContentKey,
-  getThinkingLevelKey,
-  getWorkspaceAISettingsByAgentKey,
-} from "@/common/constants/storage";
+  getPendingAiSelection,
+  getWorkspaceAgentId,
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+  setWorkspaceAiMetadata,
+} from "@/browser/utils/aiSelectionIntent";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
+import {
+  createTestApiClient,
+  createTestConfig,
+  type TestClientConfig,
+  resetTestExperiments,
+  setTestAgentAiDefaults,
+  setTestExperiment,
+} from "@/browser/testUtils";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { DEFAULT_TASK_SETTINGS } from "@/common/types/tasks";
+import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 
 import { ProposePlanToolCall } from "./ProposePlanToolCall";
 
-interface SendMessageArgs {
-  workspaceId: string;
-  message: string;
-  options: SendMessageOptions;
-}
+type SendMessageArgs = Parameters<APIClient["workspace"]["sendMessage"]>[0];
 
 type GetPlanContentResult =
   | { success: true; data: { content: string; path: string } }
@@ -38,15 +46,7 @@ type GetPlanContentResult =
 
 type ResultVoid = { success: true; data: undefined } | { success: false; error: string };
 
-interface GetConfigResult {
-  taskSettings: {
-    maxParallelAgentTasks: number;
-    maxTaskNestingDepth: number;
-    proposePlanImplementReplacesChatHistory?: boolean;
-  };
-  agentAiDefaults: Record<string, unknown>;
-  subagentAiDefaults: Record<string, unknown>;
-}
+type GetConfigResult = TestClientConfig;
 
 interface MockApi {
   config: {
@@ -60,7 +60,7 @@ interface MockApi {
       mode?: "destructive" | "append-compaction-boundary" | null;
       deletePlanFile?: boolean;
     }) => Promise<ResultVoid>;
-    sendMessage: (args: SendMessageArgs) => Promise<{ success: true; data: undefined }>;
+    sendMessage: (args: SendMessageArgs) => ReturnType<APIClient["workspace"]["sendMessage"]>;
   };
 }
 
@@ -74,6 +74,10 @@ let startHereCalls: Array<{
 }> = [];
 
 let selectableDiffRendererCalls: Array<{ filePath?: string }> = [];
+
+// Selected workspace reported by the optional workspace context; null means no context (the
+// VS Code webview has none).
+let selectedWorkspaceIdForTest: string | null = null;
 
 const useStartHereMock = mock(
   (
@@ -95,7 +99,6 @@ const useStartHereMock = mock(
 );
 
 const actualUseStartHereModule = { ...UseStartHereModule };
-const actualAPIModule = { ...APIModule };
 const actualUseOpenInEditorModule = { ...UseOpenInEditorModule };
 const actualWorkspaceContextModule = { ...WorkspaceContextModule };
 const actualUseReviewsModule = { ...UseReviewsModule };
@@ -107,10 +110,6 @@ async function installProposePlanModuleMocks() {
     ...actualUseStartHereModule,
     useStartHere: useStartHereMock,
   }));
-  await mock.module("@/browser/contexts/API", () => ({
-    ...actualAPIModule,
-    useAPI: () => ({ api: mockApi, status: "connected" as const, error: null }),
-  }));
   await mock.module("@/browser/hooks/useOpenInEditor", () => ({
     ...actualUseOpenInEditorModule,
     useOpenInEditor: () => () => Promise.resolve({ success: true } as const),
@@ -120,6 +119,13 @@ async function installProposePlanModuleMocks() {
     useWorkspaceContext: () => ({
       workspaceMetadata: new Map<string, { runtimeConfig?: unknown }>(),
     }),
+    useOptionalWorkspaceContext: () =>
+      selectedWorkspaceIdForTest === null
+        ? null
+        : {
+            workspaceMetadata: new Map<string, { runtimeConfig?: unknown }>(),
+            selectedWorkspace: { workspaceId: selectedWorkspaceIdForTest },
+          },
   }));
   await mock.module("@/browser/hooks/useReviews", () => ({
     ...actualUseReviewsModule,
@@ -174,7 +180,6 @@ async function restoreProposePlanModuleMocks() {
   // Bun's mock.module() has no disposer, and mock.restore() does not undo module mocks.
   // Restore real exports so this test's renderer stubs do not leak into review suites.
   await mock.module("@/browser/hooks/useStartHere", () => actualUseStartHereModule);
-  await mock.module("@/browser/contexts/API", () => actualAPIModule);
   await mock.module("@/browser/hooks/useOpenInEditor", () => actualUseOpenInEditorModule);
   await mock.module("@/browser/contexts/WorkspaceContext", () => actualWorkspaceContextModule);
   await mock.module("@/browser/hooks/useReviews", () => actualUseReviewsModule);
@@ -186,11 +191,9 @@ const WORKSPACE_ID = "ws-123";
 const PLAN_PATH = "~/.mux/plans/demo/ws-123.md";
 const PLAN_CONTENT = "# My Plan\n\nDo the thing.";
 
-const DEFAULT_CONFIG: GetConfigResult = {
-  taskSettings: { maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
-  agentAiDefaults: {},
-  subagentAiDefaults: {},
-};
+const DEFAULT_CONFIG: GetConfigResult = createTestConfig({
+  taskSettings: { ...DEFAULT_TASK_SETTINGS, maxParallelAgentTasks: 3, maxTaskNestingDepth: 3 },
+});
 
 function createTestAgent(
   id: string,
@@ -217,8 +220,8 @@ const noop = () => {
   // intentional noop for tests
 };
 
-function renderToolCall(content: JSX.Element, agentId = "plan") {
-  return render(
+function wrapToolCall(content: JSX.Element, agentId = "plan") {
+  return (
     <AgentProvider
       value={{
         agentId,
@@ -229,13 +232,37 @@ function renderToolCall(content: JSX.Element, agentId = "plan") {
         loadFailed: false,
         refresh: () => Promise.resolve(),
         refreshing: false,
-        disableWorkspaceAgents: false,
-        setDisableWorkspaceAgents: noop,
       }}
     >
       <TooltipProvider>{content}</TooltipProvider>
     </AgentProvider>
   );
+}
+
+// Inject the client through the real provider: a module mock of contexts/API is process-wide
+// and leaks into later-evaluated suites. The wrapper reads mockApi at render time (tests assign
+// it after beforeEach) and view.rerender() keeps it. A null mockApi means no backend client.
+function ApiWrapper(props: { children: ReactNode }) {
+  if (mockApi === null) {
+    return (
+      <APIContext.Provider
+        value={{
+          status: "connecting",
+          api: null,
+          error: null,
+          authenticate: () => undefined,
+          retry: () => undefined,
+        }}
+      >
+        {props.children}
+      </APIContext.Provider>
+    );
+  }
+  return <APIProvider client={createTestApiClient(mockApi)}>{props.children}</APIProvider>;
+}
+
+function renderToolCall(content: JSX.Element, agentId = "plan") {
+  return render(wrapToolCall(content, agentId), { wrapper: ApiWrapper });
 }
 
 type ProposePlanProps = ComponentProps<typeof ProposePlanToolCall>;
@@ -249,7 +276,18 @@ function createMockApi(
   } = {}
 ): MockApi {
   return {
-    config: { getConfig: () => Promise.resolve(overrides.config ?? DEFAULT_CONFIG) },
+    // APIProvider connects AppConfigStore, whose fetch must keep the agent defaults and
+    // experiments a test seeded.
+    config: {
+      getConfig: () =>
+        Promise.resolve(
+          overrides.config ?? {
+            ...DEFAULT_CONFIG,
+            agentAiDefaults: getAppConfigStore().getSnapshot()?.agentAiDefaults ?? {},
+            experiments: getAppConfigStore().getSnapshot()?.experiments ?? {},
+          }
+        ),
+    },
     workspace: {
       getPlanContent:
         overrides.getPlanContent ??
@@ -260,8 +298,7 @@ function createMockApi(
           })),
       replaceChatHistory:
         overrides.replaceChatHistory ?? (() => Promise.resolve({ success: true, data: undefined })),
-      sendMessage:
-        overrides.sendMessage ?? (() => Promise.resolve({ success: true, data: undefined })),
+      sendMessage: overrides.sendMessage ?? (() => Promise.resolve({ success: true, data: {} })),
     },
   };
 }
@@ -282,16 +319,21 @@ function renderCompletedPlan(props: Partial<ProposePlanProps> = {}) {
   });
 }
 
-function startInPlanMode(workspaceId = WORKSPACE_ID, model?: string, thinkingLevel?: string) {
-  window.localStorage.setItem(getAgentIdKey(workspaceId), JSON.stringify("plan"));
-  if (model) updatePersistedState(getModelKey(workspaceId), model);
-  if (thinkingLevel) updatePersistedState(getThinkingLevelKey(workspaceId), thinkingLevel);
+function startInPlanMode(
+  workspaceId = WORKSPACE_ID,
+  model?: string,
+  thinkingLevel: ThinkingLevel = "off"
+) {
+  setWorkspaceAiMetadata(workspaceId, {
+    agentId: "plan",
+    ...(model ? { aiSettingsByAgent: { plan: { model, thinkingLevel } } } : {}),
+  });
 }
 
 function recordSendMessage(calls: SendMessageArgs[]): MockApi["workspace"]["sendMessage"] {
   return (args) => {
     calls.push(args);
-    return Promise.resolve({ success: true, data: undefined });
+    return Promise.resolve({ success: true, data: {} });
   };
 }
 
@@ -307,6 +349,12 @@ function expectSingleQuoteRoot(view: { container: HTMLElement }, text: string) {
 
 describe("ProposePlanToolCall", () => {
   let cleanupDom: (() => void) | null = null;
+  // Plan sends go through the transcript mutation barrier, which reads the singleton store's
+  // caught-up flag through the exported `workspaceStore` wrapper. Pin it open by default;
+  // barrier tests flip it through this spy. (Spying on the wrapper, not the raw instance,
+  // survives sibling suites that overlay `useWorkspaceStoreRaw` with a Proxy.)
+  let transcriptCaughtUp = true;
+  let barrierSpy: { mockRestore: () => void } | null = null;
 
   afterAll(async () => {
     await restoreProposePlanModuleMocks();
@@ -315,14 +363,24 @@ describe("ProposePlanToolCall", () => {
   beforeEach(async () => {
     startHereCalls = [];
     selectableDiffRendererCalls = [];
+    selectedWorkspaceIdForTest = null;
     mockApi = null;
+    transcriptCaughtUp = true;
+    barrierSpy = spyOn(workspaceStore, "isWorkspaceTranscriptCaughtUp").mockImplementation(
+      () => transcriptCaughtUp
+    );
     cleanupDom = installDom();
     await installProposePlanModuleMocks();
   });
 
   afterEach(async () => {
+    resetTestExperiments();
+    resetAiSelectionIntentForTests();
+    setTestAgentAiDefaults(undefined);
     cleanup();
     await restoreProposePlanModuleMocks();
+    barrierSpy?.mockRestore();
+    barrierSpy = null;
     mock.restore();
     cleanupDom?.();
     cleanupDom = null;
@@ -331,12 +389,10 @@ describe("ProposePlanToolCall", () => {
   test("does not claim plan is in chat when Start Here content is a placeholder", () => {
     renderPlanToolCall({ result: { success: true, planPath: PLAN_PATH } });
 
-    expect(startHereCalls.length).toBe(1);
-    expect(startHereCalls[0]?.content).toContain("*Plan saved to");
-    expect(startHereCalls[0]?.content).not.toContain(
-      "Note: This chat already contains the full plan"
-    );
-    expect(startHereCalls[0]?.content).toContain("Read the plan file below");
+    const startHere = startHereCalls.at(-1);
+    expect(startHere?.content).toContain("*Plan saved to");
+    expect(startHere?.content).not.toContain("Note: This chat already contains the full plan");
+    expect(startHere?.content).toContain("Read the plan file below");
   });
   test("keeps plan file on disk and includes plan path note in Start Here content", () => {
     renderPlanToolCall({
@@ -345,14 +401,14 @@ describe("ProposePlanToolCall", () => {
       result: { success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT },
     });
 
-    expect(startHereCalls.length).toBe(1);
-    expect(startHereCalls[0]?.options).toEqual({ sourceAgentId: "plan" });
-    expect(startHereCalls[0]?.isCompacted).toBe(false);
+    const startHere = startHereCalls.at(-1);
+    expect(startHere?.options).toEqual({ sourceAgentId: "plan" });
+    expect(startHere?.isCompacted).toBe(false);
 
     // The Start Here message should explicitly tell the user the plan file remains on disk.
-    expect(startHereCalls[0]?.content).toContain("*Plan file preserved at:*");
-    expect(startHereCalls[0]?.content).toContain("Note: This chat already contains the full plan");
-    expect(startHereCalls[0]?.content).toContain(PLAN_PATH);
+    expect(startHere?.content).toContain("*Plan file preserved at:*");
+    expect(startHere?.content).toContain("Note: This chat already contains the full plan");
+    expect(startHere?.content).toContain(PLAN_PATH);
   });
 
   test.each([
@@ -397,11 +453,9 @@ describe("ProposePlanToolCall", () => {
     );
   });
 
-  test("hides Annotate button when completed propose_plan result is an error", () => {
-    updatePersistedState(getPlanContentKey(WORKSPACE_ID), {
-      content: "# Cached Plan\n\nDo the thing.",
-      path: PLAN_PATH,
-    });
+  test("hides Annotate button when completed propose_plan result is an error", async () => {
+    // Fresh plan content from disk still renders for the latest card; Annotate must stay hidden.
+    mockApi = createMockApi();
 
     const view = renderPlanToolCall({
       status: "completed",
@@ -409,7 +463,42 @@ describe("ProposePlanToolCall", () => {
       isLatest: true,
     });
 
+    await waitFor(() => expectSingleQuoteRoot(view, PLAN_CONTENT));
     expect(view.queryByRole("button", { name: "Annotate" })).toBeNull();
+  });
+
+  test("keeps latest plan content in memory only: placeholder after reload, instant on remount", async () => {
+    // Own workspace ID: the in-memory cache is module-level and outlives other tests' renders.
+    const workspaceId = "ws-plan-cache";
+    const props: Partial<ProposePlanProps> = {
+      workspaceId,
+      status: "completed",
+      result: { success: true, planPath: PLAN_PATH },
+      isLatest: true,
+    };
+    let resolveFirstFetch: ((result: GetPlanContentResult) => void) | undefined;
+    mockApi = createMockApi({
+      getPlanContent: () =>
+        new Promise<GetPlanContentResult>((resolve) => {
+          resolveFirstFetch = resolve;
+        }),
+    });
+
+    // Reload case (empty cache): placeholder until the backend fetch resolves.
+    const firstView = renderPlanToolCall(props);
+    expectSingleQuoteRoot(firstView, `*Plan saved to ${PLAN_PATH}*`);
+    await waitFor(() => expect(resolveFirstFetch).toBeDefined());
+    resolveFirstFetch?.({ success: true, data: { content: PLAN_CONTENT, path: PLAN_PATH } });
+    await waitFor(() => expectSingleQuoteRoot(firstView, PLAN_CONTENT));
+    for (let index = 0; index < window.localStorage.length; index++) {
+      expect(window.localStorage.key(index)).not.toStartWith("planContent:");
+    }
+    firstView.unmount();
+
+    // Remount (e.g. switching back to the workspace): the fetched content paints immediately,
+    // before the refetch (which never resolves here) returns.
+    mockApi = createMockApi({ getPlanContent: () => new Promise<GetPlanContentResult>(noop) });
+    expectSingleQuoteRoot(renderPlanToolCall(props), PLAN_CONTENT);
   });
 
   test("annotate mode and raw mode are mutually exclusive", () => {
@@ -484,7 +573,7 @@ describe("ProposePlanToolCall", () => {
     const execThinking = "low";
 
     startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {
+    setTestAgentAiDefaults({
       exec: { modelString: execModel, thinkingLevel: execThinking },
     });
 
@@ -500,36 +589,94 @@ describe("ProposePlanToolCall", () => {
     expect(sendMessageCalls[0]?.options.agentId).toBe("exec");
     expect(sendMessageCalls[0]?.options.model).toBe(execModel);
     expect(sendMessageCalls[0]?.options.thinkingLevel).toBe(execThinking);
+    // Both explicit choices opt out of composer Auto, per dimension.
+    expect(sendMessageCalls[0]?.options.autoModelRouting).toBe(false);
+    expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
 
     // Clicking Implement should switch the workspace agent to exec.
-    //
-    // Note: some tests in this repo mock the `usePersistedState` module globally. In that case,
-    // `updatePersistedState` won't actually write to localStorage here, so we assert the call.
-    const agentKey = getAgentIdKey(WORKSPACE_ID);
-    const modelKey = getModelKey(WORKSPACE_ID);
-    const thinkingKey = getThinkingLevelKey(WORKSPACE_ID);
-    const updatePersistedStateMaybeMock = updatePersistedState as unknown as {
-      mock?: { calls: unknown[][] };
-    };
-    if (updatePersistedStateMaybeMock.mock) {
-      expect(updatePersistedState).toHaveBeenCalledWith(agentKey, "exec");
-      expect(updatePersistedState).toHaveBeenCalledWith(modelKey, execModel);
-      expect(updatePersistedState).toHaveBeenCalledWith(thinkingKey, execThinking);
-    } else {
-      expect(JSON.parse(window.localStorage.getItem(agentKey)!)).toBe("exec");
-      expect(JSON.parse(window.localStorage.getItem(modelKey)!)).toBe(execModel);
-      expect(JSON.parse(window.localStorage.getItem(thinkingKey)!)).toBe(execThinking);
-    }
+    expect(getWorkspaceAgentId(WORKSPACE_ID)).toBe("exec");
+  });
+
+  test("Implement sends the unsent Exec pick and ends it once it is saved", async () => {
+    const pickedModel = "openai:gpt-5.2-pro";
+    // Picked while Exec was the agent, then the workspace switched to Plan.
+    markAiSelectionIntent(WORKSPACE_ID, "model", pickedModel);
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.model).toBe(pickedModel);
+    setWorkspaceAiMetadata(WORKSPACE_ID, {
+      agentId: "exec",
+      aiSettingsByAgent: { exec: { model: pickedModel, thinkingLevel: "high" } },
+    });
+    await waitFor(() =>
+      expect(getPendingAiSelection(WORKSPACE_ID, "exec", "model")).toBeUndefined()
+    );
+    // The handoff's agent pick ended with the save too, so a later agent change applies.
+    setWorkspaceAiMetadata(WORKSPACE_ID, { agentId: "plan" });
+    expect(getWorkspaceAgentId(WORKSPACE_ID)).toBe("plan");
+  });
+
+  test("Implement keeps the exec model when the composer has Auto routing selected", async () => {
+    // Same model in plan and exec: the agent switch persists nothing, so only the send can
+    // drop the Auto flag.
+    const execModel = "openai:gpt-5.2";
+    startInPlanMode(WORKSPACE_ID, execModel, "high");
+    setTestAgentAiDefaults({ exec: { modelString: execModel } });
+    setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
+    setAutoRoutingChoice(WORKSPACE_ID, "model", true);
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.model).toBe(execModel);
+    expect(sendMessageCalls[0]?.options.autoModelRouting).not.toBe(true);
+  });
+
+  test("Implement sends unrouted but saves exec's Auto default for its later sends", async () => {
+    const execModel = "openai:gpt-5.2";
+    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
+    setTestAgentAiDefaults({
+      exec: { modelString: execModel, autoModelRouting: true, autoThinkingLevel: true },
+    });
+    setTestExperiment(EXPERIMENT_IDS.AUTO_MODEL_ROUTING, true);
+
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() => expect(sendMessageCalls.length).toBe(1));
+    expect(sendMessageCalls[0]?.options.model).toBe(execModel);
+    expect(sendMessageCalls[0]?.options.autoModelRouting).toBe(false);
+    expect(sendMessageCalls[0]?.options.autoThinkingLevel).toBe(false);
+    expect(sendMessageCalls[0]?.options.savedAutoRouting).toEqual({
+      model: true,
+      thinkingLevel: true,
+    });
   });
 
   test("uses workspace-by-agent override for Implement when exec defaults inherit", async () => {
     const execWorkspaceModel = "openai:gpt-5.2-pro";
     const execWorkspaceThinking = "medium";
 
-    startInPlanMode(WORKSPACE_ID, "anthropic:claude-sonnet-4-5", "high");
-    updatePersistedState(AGENT_AI_DEFAULTS_KEY, {});
-    updatePersistedState(getWorkspaceAISettingsByAgentKey(WORKSPACE_ID), {
-      exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
+    setTestAgentAiDefaults({});
+    setWorkspaceAiMetadata(WORKSPACE_ID, {
+      agentId: "plan",
+      aiSettingsByAgent: {
+        plan: { model: "anthropic:claude-sonnet-4-5", thinkingLevel: "high" },
+        exec: { model: execWorkspaceModel, thinkingLevel: execWorkspaceThinking },
+      },
     });
 
     const sendMessageCalls: SendMessageArgs[] = [];
@@ -570,7 +717,7 @@ describe("ProposePlanToolCall", () => {
       sendMessage: (args) => {
         calls.push("sendMessage");
         sendMessageCalls.push(args);
-        return Promise.resolve({ success: true, data: undefined });
+        return Promise.resolve({ success: true, data: {} });
       },
     });
 
@@ -601,6 +748,262 @@ describe("ProposePlanToolCall", () => {
     expect(summaryMessage.parts?.[0]?.text).toContain(PLAN_PATH);
   });
 
+  test("disables Implement while the transcript is not caught up", async () => {
+    startInPlanMode();
+    transcriptCaughtUp = false;
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+
+    const view = renderCompletedPlan();
+
+    const implement = view.getByRole("button", { name: "Implement" }) as HTMLButtonElement;
+    expect(implement.disabled).toBe(true);
+    fireEvent.click(implement);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sendMessageCalls).toHaveLength(0);
+  });
+
+  test("refuses Implement when the barrier closes before dispatch", async () => {
+    startInPlanMode();
+    const sendMessageCalls: SendMessageArgs[] = [];
+    let configReads = 0;
+    let closeBarrierOnConfigRead = true;
+    mockApi = createMockApi({
+      sendMessage: recordSendMessage(sendMessageCalls),
+    });
+    // The click passes the render-time gate; the transcript stops being current during the
+    // config read that precedes the send, so the dispatch-time re-check must refuse.
+    mockApi.config.getConfig = () => {
+      configReads += 1;
+      if (closeBarrierOnConfigRead) {
+        transcriptCaughtUp = false;
+      }
+      return Promise.resolve(DEFAULT_CONFIG);
+    };
+
+    const planElement = (
+      <ProposePlanToolCall
+        args={{}}
+        workspaceId={WORKSPACE_ID}
+        status="completed"
+        result={{ success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT }}
+        isLatest
+      />
+    );
+    const view = renderToolCall(planElement);
+    const implement = view.getByRole("button", { name: "Implement" }) as HTMLButtonElement;
+    expect(implement.disabled).toBe(false);
+    fireEvent.click(implement);
+
+    await waitFor(() => expect(configReads).toBe(1));
+    // Let the handler's remaining microtasks settle before asserting nothing was sent.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sendMessageCalls).toHaveLength(0);
+
+    // Control: with the barrier open again the same click path dispatches. The spy flip does
+    // not notify the store, so re-render to re-read the render-time gate.
+    transcriptCaughtUp = true;
+    closeBarrierOnConfigRead = false;
+    view.rerender(wrapToolCall(planElement));
+    const implementAgain = view.getByRole("button", { name: "Implement" }) as HTMLButtonElement;
+    expect(implementAgain.disabled).toBe(false);
+    fireEvent.click(implementAgain);
+    await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+    expect(sendMessageCalls[0]?.message).toBe("Implement the plan");
+  });
+
+  test("shows a rejected Implement send in the card", async () => {
+    startInPlanMode();
+    let sends = 0;
+    mockApi = createMockApi({
+      sendMessage: () => {
+        sends += 1;
+        return Promise.resolve({
+          success: false,
+          error: { type: "invalid_model_string", message: "Model openai:gpt-5.2 is not allowed" },
+        });
+      },
+    });
+
+    const view = renderCompletedPlan();
+    fireEvent.click(view.getByRole("button", { name: "Implement" }));
+
+    await waitFor(() =>
+      expect(view.getByRole("alert").textContent).toContain("Model openai:gpt-5.2 is not allowed")
+    );
+    expect(sends).toBe(1);
+  });
+
+  test("shows a failed Continue in Auto send in the card and clears it on retry", async () => {
+    startInPlanMode();
+    let failNext = true;
+    const sendMessageCalls: SendMessageArgs[] = [];
+    mockApi = createMockApi({
+      sendMessage: (args) => {
+        sendMessageCalls.push(args);
+        if (failNext) {
+          failNext = false;
+          return Promise.reject(new Error("connection lost"));
+        }
+        return Promise.resolve({ success: true, data: {} });
+      },
+    });
+
+    const view = renderToolCall(
+      <ProposePlanToolCall
+        args={{}}
+        workspaceId={WORKSPACE_ID}
+        status="completed"
+        result={{ success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT }}
+        isLatest
+      />,
+      "auto"
+    );
+    fireEvent.click(view.getByRole("button", { name: "Continue in Auto" }));
+    await waitFor(() => expect(view.getByRole("alert").textContent).toContain("connection lost"));
+
+    fireEvent.click(view.getByRole("button", { name: "Continue in Auto" }));
+    await waitFor(() => expect(sendMessageCalls).toHaveLength(2));
+    await waitFor(() => expect(view.queryByRole("alert")).toBeNull());
+  });
+
+  describe("latest plan shortcut and palette request (#4963)", () => {
+    function pressShortcut(target: Element = document.body) {
+      fireEvent.keyDown(target, { key: "Enter", altKey: true });
+    }
+
+    function addComposer(value: string): HTMLTextAreaElement {
+      const composer = document.createElement("textarea");
+      composer.value = value;
+      document.body.appendChild(composer);
+      composer.focus();
+      return composer;
+    }
+
+    test("implements from an empty composer, never while typing", async () => {
+      startInPlanMode();
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      renderCompletedPlan();
+      const composer = addComposer("half-written reply");
+
+      pressShortcut(composer);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sendMessageCalls).toHaveLength(0);
+
+      composer.value = "";
+      pressShortcut(composer);
+      await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+      expect(sendMessageCalls[0]?.message).toBe("Implement the plan");
+      expect(sendMessageCalls[0]?.options.agentId).toBe("exec");
+      composer.remove();
+    });
+
+    test("leaves Alt+Enter to a focused control that already handled it", async () => {
+      startInPlanMode();
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      renderCompletedPlan();
+      // Like the agent picker, which treats Alt+Enter as Enter and prevents the default.
+      const picker = document.createElement("div");
+      picker.addEventListener("keydown", (event) => event.preventDefault());
+      document.body.appendChild(picker);
+
+      pressShortcut(picker);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sendMessageCalls).toHaveLength(0);
+      picker.remove();
+    });
+
+    test("continues in Auto in Auto mode", async () => {
+      startInPlanMode();
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      renderToolCall(
+        <ProposePlanToolCall
+          args={{}}
+          workspaceId={WORKSPACE_ID}
+          status="completed"
+          result={{ success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT }}
+          isLatest
+        />,
+        "auto"
+      );
+
+      pressShortcut();
+      await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+      expect(sendMessageCalls[0]?.options.agentId).toBe("auto");
+    });
+
+    test("does nothing while the button is disabled (transcript not caught up)", async () => {
+      startInPlanMode();
+      transcriptCaughtUp = false;
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      renderCompletedPlan();
+
+      pressShortcut();
+      const request = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
+        workspaceId: WORKSPACE_ID,
+        handled: false,
+      });
+      window.dispatchEvent(request);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(request.detail.handled).toBe(false);
+      expect(sendMessageCalls).toHaveLength(0);
+    });
+
+    test("ignores the shortcut when another workspace is selected", async () => {
+      startInPlanMode();
+      selectedWorkspaceIdForTest = "some-other-workspace";
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      const view = renderCompletedPlan();
+
+      pressShortcut();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(sendMessageCalls).toHaveLength(0);
+
+      // Control: selecting the plan's workspace makes the same shortcut run.
+      selectedWorkspaceIdForTest = WORKSPACE_ID;
+      view.rerender(
+        wrapToolCall(
+          <ProposePlanToolCall
+            args={{}}
+            workspaceId={WORKSPACE_ID}
+            status="completed"
+            result={{ success: true, planPath: PLAN_PATH, planContent: PLAN_CONTENT }}
+            isLatest
+          />
+        )
+      );
+      pressShortcut();
+      await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+    });
+
+    test("a palette request for this workspace runs the action and is marked handled", async () => {
+      startInPlanMode();
+      const sendMessageCalls: SendMessageArgs[] = [];
+      mockApi = createMockApi({ sendMessage: recordSendMessage(sendMessageCalls) });
+      renderCompletedPlan();
+
+      const otherWorkspace = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
+        workspaceId: "some-other-workspace",
+        handled: false,
+      });
+      window.dispatchEvent(otherWorkspace);
+      expect(otherWorkspace.detail.handled).toBe(false);
+
+      const request = createCustomEvent(CUSTOM_EVENTS.RUN_LATEST_PLAN_ACTION, {
+        workspaceId: WORKSPACE_ID,
+        handled: false,
+      });
+      window.dispatchEvent(request);
+      expect(request.detail.handled).toBe(true);
+      await waitFor(() => expect(sendMessageCalls).toHaveLength(1));
+    });
+  });
+
   test("renders a plan table of contents derived from the plan's markdown headings", () => {
     // Note: we deliberately don't assert against rendered <h1>/<h2> elements here
     // because some sibling test files mock MarkdownCore at file scope (file-scope
@@ -621,6 +1024,9 @@ describe("ProposePlanToolCall", () => {
     ].join("\n");
 
     const view = renderCompletedPlan({
+      // Own workspace ID: earlier tests leave WORKSPACE_ID's fetched plan in the in-memory
+      // latest-plan cache, which takes precedence over the result's embedded content.
+      workspaceId: "ws-plan-toc",
       result: { success: true, planPath: PLAN_PATH, planContent },
     });
 
@@ -647,6 +1053,7 @@ describe("ProposePlanToolCall", () => {
     // (the plan title) and never shows up as a list item.
     const planContent = "# A\n\nbody\n\n## B\n\nmore\n\n## C\n\nmore";
     const view = renderCompletedPlan({
+      workspaceId: "ws-plan-toc-annotate", // See the in-memory cache note above.
       result: { success: true, planPath: PLAN_PATH, planContent },
     });
 

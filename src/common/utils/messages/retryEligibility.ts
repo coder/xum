@@ -35,17 +35,40 @@ function isForceAllRetryableEnabled(): boolean {
  * Error types that should NOT be auto-retried because they require user action
  * These errors won't resolve on their own - the user must fix the underlying issue
  */
-const NON_RETRYABLE_STREAM_ERRORS = [
+const PROVIDER_CONFIG_FIXABLE_STREAM_ERRORS = [
   "authentication", // Bad API key - user must fix credentials
   "quota", // Billing/usage limits - user must upgrade or wait for reset
+] as const satisfies readonly StreamErrorType[];
+
+const PROVIDER_CONFIG_FIXABLE_SEND_ERRORS = [
+  "api_key_not_found",
+  "oauth_not_connected",
+  "provider_disabled",
+] as const;
+
+const NON_RETRYABLE_STREAM_ERRORS = [
+  ...PROVIDER_CONFIG_FIXABLE_STREAM_ERRORS,
   "model_not_found", // Invalid model - user must select different model
   "context_exceeded", // Message too long - user must reduce context
+  "context_budget_blocked", // Local preflight failed; retrying unchanged cannot fit
   "aborted", // User cancelled - should not auto-retry
   "runtime_not_ready", // Container/runtime unavailable - permanent failure
   "model_refusal", // Provider declined to answer - retrying the same request will refuse again
+  "agent_resolution", // Strict explicit-agent contract failure - deterministic, retrying reproduces it
+  "reasoning_rejected", // In-stream repair failed or was unsafe; repeating the same input cannot recover
+  "session_tape_replay", // The tape cannot be served; a retry is refused again
+  "plugin_blocked", // The plugin refuses the same message again
 ] as const satisfies readonly StreamErrorType[];
 
 const NON_RETRYABLE_STREAM_ERROR_SET = new Set<string>(NON_RETRYABLE_STREAM_ERRORS);
+const PROVIDER_CONFIG_FIXABLE_ERROR_SET = new Set<string>([
+  ...PROVIDER_CONFIG_FIXABLE_STREAM_ERRORS,
+  ...PROVIDER_CONFIG_FIXABLE_SEND_ERRORS,
+]);
+
+export function isProviderConfigFixableError(type: string): boolean {
+  return PROVIDER_CONFIG_FIXABLE_ERROR_SET.has(type);
+}
 
 /**
  * Check if a SendMessageError (from resumeStream failures) is non-retryable
@@ -56,16 +79,22 @@ export function isNonRetryableSendError(error: { type: string }): boolean {
     return false;
   }
 
+  if (PROVIDER_CONFIG_FIXABLE_ERROR_SET.has(error.type)) {
+    return true;
+  }
+
   switch (error.type) {
-    case "api_key_not_found": // Missing API key - user must configure
-    case "oauth_not_connected": // Missing OAuth connection - user must connect/sign in
-    case "provider_disabled": // Provider disabled in settings - user must re-enable
     case "provider_not_supported": // Unsupported provider - user must switch
     case "model_not_available": // Model missing from fetched provider catalog - user must refresh or switch
     case "invalid_model_string": // Bad model format - user must fix
     case "incompatible_workspace": // Workspace from newer mux version - user must upgrade
     case "runtime_not_ready": // Container doesn't exist - user must recreate workspace
-    case "policy_denied": // Policy blocks won't resolve automatically
+    case "task_checkout_unsanitized": // Permanent until the task is removed (#4674)
+    case "context_budget_exceeded": // Parent may roll over explicitly; never retry the oversized request
+    case "context_budget_blocked":
+    case "plan_review_feedback_edit_blocked": // Feedback rows never become editable
+    case "session_tape_replay": // Replay mode refuses every turn until the process restarts
+    case "plugin_blocked": // The plugin refuses the same message again; never auto-retried
       return true;
     case "runtime_start_failed": // Runtime is starting - transient, worth retrying
     case "unknown":
@@ -107,7 +136,9 @@ export function isPreTokenInterruptedUserTurn(
   tail: DisplayedMessage | undefined,
   lastAbortReason: StreamAbortReasonSnapshot | null | undefined
 ): boolean {
-  return tail?.type === "user" && shouldSuppressAutoRetry(lastAbortReason);
+  return (
+    tail?.type === "user" && !tail.contextBudgetRejected && shouldSuppressAutoRetry(lastAbortReason)
+  );
 }
 
 function isDecorativeTranscriptMessage(message: DisplayedMessage): boolean {
@@ -134,6 +165,7 @@ export function getLastNonDecorativeMessage(
 function isDisplayOnlyCompletedSubagentReport(message: DisplayedMessage): boolean {
   return (
     message.type === "user" &&
+    !message.contextBudgetRejected &&
     message.isSynthetic === true &&
     message.isUiVisible === true &&
     isCompletedSubagentReportEnvelope(message.content)
@@ -150,6 +182,12 @@ export function getLastMainRetryCandidateMessage(
       isDisplayOnlyCompletedSubagentReport(candidate)
     ) {
       continue;
+    }
+    if (candidate.type === "user" && candidate.contextBudgetWarning != null) {
+      // A warning is never the request: prefer the older user row it annotates. Otherwise keep
+      // it, so an interrupted stream before a pending hidden Continue still shows its barrier.
+      const older = getLastMainRetryCandidateMessage(messages.slice(0, i));
+      return older?.type === "user" ? older : candidate;
     }
     return candidate;
   }
@@ -188,6 +226,7 @@ function computeHasInterruptedStream(
 
   const lastMessage = getLastMainRetryCandidateMessage(messages);
   if (!lastMessage) return false;
+  if (lastMessage.type === "user" && lastMessage.contextBudgetRejected) return false;
 
   // Don't show retry barrier if workspace init is still running AND no error has occurred yet.
   // The backend waits for init to complete before starting the stream.
@@ -225,9 +264,16 @@ function computeHasInterruptedStream(
     return false;
   }
 
-  // Don't show retry barrier for runtime_not_ready - requires workspace recreation.
-  // StreamErrorMessage already shows a distinct "Runtime Unavailable" UI for this case.
-  if (lastMessage.type === "stream-error" && lastMessage.errorType === "runtime_not_ready") {
+  // These terminal failures require a new request or workspace, not replaying the same turn.
+  // plugin_blocked: a blocked queued send saved no row (its draft returns to the composer), so a
+  // resume would replay the previous accepted turn instead of the blocked message.
+  if (
+    lastMessage.type === "stream-error" &&
+    (lastMessage.errorType === "runtime_not_ready" ||
+      lastMessage.errorType === "context_budget_blocked" ||
+      lastMessage.errorType === "session_tape_replay" ||
+      lastMessage.errorType === "plugin_blocked")
+  ) {
     return false;
   }
 
@@ -283,35 +329,4 @@ export function getInterruptionContext(
 
   // Other interrupted states (partial messages, user messages) are auto-retryable
   return { hasInterruptedStream: true, isEligibleForAutoRetry: true };
-}
-
-export function hasInterruptedStream(
-  messages: DisplayedMessage[],
-  pendingStreamStartTime: number | null = null,
-  runtimeStatus: RuntimeStatusEvent | null = null,
-  lastAbortReason: StreamAbortReasonSnapshot | null = null
-): boolean {
-  return getInterruptionContext(messages, pendingStreamStartTime, runtimeStatus, lastAbortReason)
-    .hasInterruptedStream;
-}
-
-/**
- * Check if messages are eligible for automatic retry
- *
- * Used by retry status consumers to determine if a stream interruption is auto-retry eligible.
- * Returns false for errors that require user action (authentication, quota, etc.),
- * but still allows manual retry via RetryBarrier UI.
- *
- * This separates auto-retry logic from manual retry UI:
- * - Manual retry: Always available for any error (hasInterruptedStream)
- * - Auto retry: Only for transient errors that might resolve on their own
- */
-export function isEligibleForAutoRetry(
-  messages: DisplayedMessage[],
-  pendingStreamStartTime: number | null = null,
-  runtimeStatus: RuntimeStatusEvent | null = null,
-  lastAbortReason: StreamAbortReasonSnapshot | null = null
-): boolean {
-  return getInterruptionContext(messages, pendingStreamStartTime, runtimeStatus, lastAbortReason)
-    .isEligibleForAutoRetry;
 }

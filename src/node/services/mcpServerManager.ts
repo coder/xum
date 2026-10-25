@@ -1,20 +1,76 @@
+import { MCP_TOOL_ORIGIN } from "@/node/services/agentPlugins/codexToolNames";
+import { cloneToolPreservingDescriptors } from "@/common/utils/tools/cloneToolPreservingDescriptors";
+import { isPluginMcpServerAllowed, type PluginMcpPolicy } from "./agentPlugins/registry";
+import { getOwn } from "@/common/utils/getOwn";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import type { OAuthClientProvider, PriorDiscovery } from "@modelcontextprotocol/client";
-import type { Tool } from "ai";
+import { jsonSchema, type Tool } from "ai";
+import { getExecutionScope } from "./tools/withExecutionScope";
+import { MCPIconRegistry, type MCPIconOwner } from "./mcpIconRegistry";
+import { resolveServerIcon } from "./mcpServerIcon";
+import {
+  buildToolCallDisplay,
+  describeConnection,
+  displayConnectionKey,
+  normalizeServerIdentity,
+  takeStandardDisplayMeta,
+  type IconCandidate,
+  type NormalizedServerIdentity,
+} from "./mcpServerIdentity";
+import { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import {
   createMCPClient,
+  getMCPToolUi,
   isModernEra,
   MCP_TOOL_CALL_TIMEOUT_MS,
   type MCPClientHandle,
   type MCPGetPromptResult,
   type MCPPrompt,
+  type MCPRawCallToolResult,
+  PROMPT_LIST_TIMEOUT_MS,
 } from "@/node/services/mcpClient";
+import {
+  MCP_SETTINGS_WORKSPACE_META_KEY,
+  boundMCPSettingsToolResult,
+  MAX_MCP_SETTINGS_TOOL_RESULT,
+  filterMCPSettingValues,
+  MCP_SETTINGS_READ_TIMEOUT_MS,
+  parseMCPSettingsReadResult,
+  validateMCPSettingValue,
+  type MCPSettingValue,
+  type MCPSettingsReadSnapshot,
+  type MCPSettingsAppView,
+  type MCPSettingsGroup,
+  type MCPSettingsSnapshot,
+  type MCPSettingsToolAction,
+} from "@/common/utils/mcpSettings";
+import type {
+  McpAppModelContext,
+  McpAppResultRecord,
+  McpAppResultStore,
+} from "@/node/services/mcpAppResultStore";
+import { extractMcpAppResource, type McpAppResource } from "@/node/services/mcpAppResource";
+import type { McpAppEntrypoint, McpAppToolCallResult } from "@/common/orpc/schemas/mcpApps";
+import {
+  isAppCallableTool,
+  isMcpAppResourceUri,
+  isModelVisibleTool,
+  MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS,
+  MCP_APP_TOOL_CALL_WINDOW_MS,
+  MCP_APP_TOOL_CALLS_PER_WINDOW,
+  mcpAppEntrypointKey,
+  mcpSettingsAppKey,
+  type MCPAppEntrypointType,
+} from "@/common/utils/mcpApps";
+import { sanitizeText } from "@/common/utils/mcp/displayText";
 import { log } from "@/node/services/log";
-import { MCPStdioTransport } from "@/node/services/mcpStdioTransport";
+import { MCPStdioTransport, MCP_STDIO_KILL_JOIN_MS } from "@/node/services/mcpStdioTransport";
 import type {
   BearerChallenge,
   MCPHeaderValue,
+  MCPConnectionRef,
+  MCPServerIdentity,
   MCPServerInfo,
   MCPServerMap,
   MCPServerTransport,
@@ -23,12 +79,22 @@ import type {
   WorkspaceMCPOverrides,
 } from "@/common/types/mcp";
 import assert from "@/common/utils/assert";
+import * as crypto from "crypto";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
 import { shellQuote } from "@/common/utils/shell";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { requiredPropertyNames, schemaAcceptsNull } from "@/common/utils/tools/schemaSanitizer";
+import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
 import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import type { AgentPluginsMcpContext } from "@/node/services/agentPlugins/mcpConfig";
-import type { PolicyService } from "@/node/services/policyService";
+import { isMutationEpochUnreadable } from "@/node/services/agentPlugins/journals";
+import { envNameKey } from "@/node/services/agentPlugins/openaiMcpAuth";
+import { SecretsStore, type Config } from "@/node/config";
+import type { TelemetryService } from "@/node/services/telemetryService";
+import { secretsToRecord } from "@/common/types/secrets";
+import { roundToBase2 } from "@/common/telemetry/utils";
+import { isProjectTrusted } from "@/node/utils/projectTrust";
 import type { MCPConfigService } from "@/node/services/mcpConfigService";
 import {
   parseBearerWwwAuthenticate,
@@ -37,6 +103,7 @@ import {
 } from "@/node/services/mcpOauthService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import {
+  omitMCPProtocolMeta,
   transformMCPResult,
   truncateUtf8Bytes,
   type MCPCallToolResult,
@@ -63,9 +130,19 @@ import { AsyncSemaphore } from "@/node/utils/concurrency/asyncSemaphore";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
+import { isWorkspaceOverridesEpochUnreadable } from "@/node/services/workspaceMcpOverridesService";
+import {
+  MCP_IDLE_CHECK_INTERVAL_MS,
+  MCP_IDLE_TIMEOUT_MS,
+  MCP_LAUNCH_INITIATION_FENCE_MS,
+  MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS,
+  MCP_STARTUP_CONCURRENCY,
+  MCP_STARTUP_TIMEOUT_MS,
+  MCP_STDIO_LAUNCH_FENCE_MS,
+  MCP_TEST_ERROR_MAX_CHARS,
+} from "@/constants/mcp";
 
 const TEST_TIMEOUT_MS = 10_000;
-const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Freshness horizon for cached *legacy* era verdicts.
@@ -76,12 +153,37 @@ const IDLE_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
  * are re-probed after this horizon to notice server upgrades.
  */
 const LEGACY_ERA_VERDICT_TTL_MS = 24 * 60 * 60 * 1000;
-const IDLE_CHECK_INTERVAL_MS = 60 * 1000; // Check every minute
-const MCP_STARTUP_TIMEOUT_MS = 60_000; // 60s — generous for npx package downloads
-// Bounded so a burst of stdio spawns (npx downloads) cannot thrash the host,
-// while several unhealthy servers' startup deadlines overlap instead of stacking.
-const MCP_STARTUP_CONCURRENCY = 4;
-const MCP_STARTUP_CLEANUP_WAIT_TIMEOUT_MS = 5_000; // fail-safe so timeout error cannot hang forever
+/**
+ * Timed-out servers are restarted from the cached same-signature path, and
+ * each restart blocks the turn for up to MCP_STARTUP_TIMEOUT_MS. Without
+ * backoff a server that never comes up costs every turn a full startup
+ * timeout. Every timeout, the initial startup included, counts as a failure:
+ * a UAT with an immediate first retry and a 5 s base measured the full
+ * timeout on 4 of 8 turns at human cadence, because a wait shorter than the
+ * timeout it gates is no wait at all. The base equals the startup timeout so
+ * a retry is never spent sooner than it would cost, each further consecutive
+ * timeout doubles it, capped so a server that does recover is picked up
+ * within a few minutes. Reset when the retry succeeds, when the entry is
+ * replaced by a config change, or when a plugin invalidation re-queues the
+ * server (markServersForRetry).
+ */
+const TIMED_OUT_RETRY_BACKOFF_BASE_MS = MCP_STARTUP_TIMEOUT_MS;
+const TIMED_OUT_RETRY_BACKOFF_MAX_MS = 5 * 60_000;
+
+interface TimedOutRetryBackoff {
+  retryTimeouts: number;
+  /** When the latest timed-out attempt finished, not when its batch settled. */
+  lastAttemptAtMs: number;
+}
+
+/** Wait required after `retryTimeouts` consecutive failed retries before the next attempt. */
+function timedOutRetryBackoffMs(retryTimeouts: number): number {
+  if (retryTimeouts <= 0) return 0;
+  return Math.min(
+    TIMED_OUT_RETRY_BACKOFF_BASE_MS * 2 ** (retryTimeouts - 1),
+    TIMED_OUT_RETRY_BACKOFF_MAX_MS
+  );
+}
 
 /** Detect errors from the MCP SDK indicating the client/transport is closed.
  *  We match on known message patterns rather than error classes so wrapped or
@@ -196,46 +298,152 @@ function shouldRecycleClientAfterToolError(error: unknown): boolean {
 }
 
 /**
- * Top-level parameter names the tool's input schema marks as required.
+ * Drop arguments the model emitted to mean "not provided" for optional
+ * parameters, walking nested objects and arrays alongside the server's schema.
  *
- * MCP tools built by mcpClient carry their server-declared JSON schema via
- * the AI SDK's jsonSchema() wrapper ({ jsonSchema: <raw schema> }); anything
- * else (or a malformed schema) yields an empty set.
+ * - "": LLMs often fill optional parameters with "" instead of omitting them,
+ *   and strict REST-backed MCP servers (e.g. GitLab) treat present-but-empty
+ *   as invalid and reject the call with 400 (#2887).
+ * - null the schema does not accept: schemaSanitizer widens optional
+ *   properties to nullable so OpenAI strict mode can omit them, so this null
+ *   is our own artifact, never a value the server can take. A null the schema
+ *   does accept passes through: servers may mean "clear this field".
+ *
+ * A required parameter keeps its value so a genuinely intended empty value is
+ * never silently dropped. Empty arrays pass through ("no filter").
  */
-function requiredParamsFromSchema(inputSchema: unknown): ReadonlySet<string> {
-  if (inputSchema !== null && typeof inputSchema === "object" && "jsonSchema" in inputSchema) {
-    const raw = (inputSchema as { jsonSchema: unknown }).jsonSchema;
-    if (raw !== null && typeof raw === "object" && "required" in raw) {
-      const required = (raw as { required: unknown }).required;
-      if (Array.isArray(required)) {
-        return new Set(required.filter((entry): entry is string => typeof entry === "string"));
+function sanitizeMCPToolArgs(args: unknown, schema: unknown): unknown {
+  if (!isPlainObject(args)) {
+    return args;
+  }
+  const required = requiredPropertyNames(schema);
+  const properties =
+    isPlainObject(schema) && isPlainObject(schema.properties) ? schema.properties : undefined;
+  const entries: Array<[string, unknown]> = [];
+  for (const [key, value] of Object.entries(args)) {
+    const propertySchema =
+      properties !== undefined && Object.hasOwn(properties, key) ? properties[key] : undefined;
+    if (!required.has(key)) {
+      if (value === "") {
+        continue;
+      }
+      if (value === null && propertySchema !== undefined && !schemaAcceptsNull(propertySchema)) {
+        continue;
       }
     }
+    entries.push([key, sanitizeNestedMCPToolArgs(value, propertySchema)]);
   }
-  return new Set();
+  return Object.fromEntries(entries);
 }
 
 /**
- * Drop top-level empty-string arguments the model emitted for optional
- * parameters.
- *
- * LLMs often fill optional parameters with "" instead of omitting them, and
- * strict REST-backed MCP servers (e.g. GitLab) treat present-but-empty as
- * invalid and reject the call with 400 (#2887). A required parameter keeps
- * its "" so a genuinely intended empty value is never silently dropped.
- * Explicit null and empty arrays pass through untouched: servers may assign
- * them meaning ("clear this field" / "no filter").
+ * Descend into arrays via `items` and into objects only when the schema
+ * declares `properties`; a free-form object (env vars, labels) keeps every
+ * value the model chose.
  */
-function sanitizeMCPToolArgs(args: unknown, inputSchema: unknown): unknown {
-  if (args === null || typeof args !== "object" || Array.isArray(args)) {
-    return args;
+function sanitizeNestedMCPToolArgs(value: unknown, schema: unknown): unknown {
+  if (!isPlainObject(schema)) {
+    return value;
   }
-  const entries = Object.entries(args as Record<string, unknown>);
-  if (!entries.some(([, value]) => value === "")) {
-    return args;
+  if (Array.isArray(value)) {
+    const items = schema.items;
+    return isPlainObject(items)
+      ? value.map((item) => sanitizeNestedMCPToolArgs(item, items))
+      : value;
   }
-  const required = requiredParamsFromSchema(inputSchema);
-  return Object.fromEntries(entries.filter(([key, value]) => value !== "" || required.has(key)));
+  return isPlainObject(schema.properties) ? sanitizeMCPToolArgs(value, schema) : value;
+}
+
+/**
+ * MCP tools built by mcpClient carry their server-declared JSON schema via
+ * the AI SDK's jsonSchema() wrapper ({ jsonSchema: <raw schema> }); anything
+ * else yields undefined, and sanitizeMCPToolArgs then only applies the
+ * schema-free "" rule.
+ */
+function rawInputSchema(inputSchema: unknown): unknown {
+  return isPlainObject(inputSchema) ? inputSchema.jsonSchema : undefined;
+}
+
+/**
+ * MCP Apps visibility rules for a view-initiated tools/call: unknown tools and tools whose
+ * visibility lacks "app" are rejected ("Host MUST reject"); tools also visible to the model
+ * need the user's consent for each call. Returns null when the call may proceed.
+ */
+export function checkMcpAppToolCall(
+  apps: Pick<MCPClientHandle, "toolUi" | "hasTool">,
+  toolName: string,
+  consented: boolean,
+  /** Effective project/workspace tool allowlist for this server; null when none is set. */
+  allowlist: ReadonlySet<string> | null
+): Exclude<McpAppToolCallResult, { status: "ok" }> | null {
+  if (!apps.hasTool(toolName)) {
+    return { status: "rejected", reason: `Unknown tool '${toolName}'` };
+  }
+  // Views must not reach tools the user removed from the agent: a configured allowlist
+  // applies to view-initiated calls too (app-only tools included).
+  if (allowlist !== null && !allowlist.has(toolName)) {
+    return { status: "rejected", reason: `Tool '${toolName}' is not in the tool allowlist` };
+  }
+  const ui = apps.toolUi(toolName);
+  if (!isAppCallableTool(ui)) {
+    return { status: "rejected", reason: `Tool '${toolName}' is not available to apps` };
+  }
+  if (isModelVisibleTool(ui) && !consented) {
+    return { status: "consent_required" };
+  }
+  return null;
+}
+
+/**
+ * Effective tool allowlist for one server:
+ * - If both exist: intersection (workspace restricts further)
+ * - If only project: use project
+ * - If only workspace: use workspace
+ * - If neither: null (no filtering)
+ */
+export function effectiveToolAllowlist(
+  serverName: string,
+  projectAllowlist: string[] | undefined,
+  workspaceOverrides: WorkspaceMCPOverrides | undefined
+): Set<string> | null {
+  // Own-property read: a server may be named "constructor" (#5740).
+  const workspaceAllowlist =
+    workspaceOverrides?.toolAllowlist != null
+      ? getOwn(workspaceOverrides.toolAllowlist, serverName)
+      : undefined;
+  if (projectAllowlist && workspaceAllowlist) {
+    const projectSet = new Set(projectAllowlist);
+    return new Set(workspaceAllowlist.filter((t) => projectSet.has(t)));
+  }
+  if (projectAllowlist) return new Set(projectAllowlist);
+  if (workspaceAllowlist) return new Set(workspaceAllowlist);
+  return null;
+}
+
+function requireAppsConnection(
+  instance: MCPServerInstance
+): NonNullable<MCPServerInstance["apps"]> {
+  if (!instance.apps) {
+    throw new Error(
+      `MCP server '${instance.name}' was connected before MCP Apps support was enabled; restart it`
+    );
+  }
+  return instance.apps;
+}
+
+/** The AI SDK tool call's abort signal, if its execution context carries one. */
+function toolCallAbortSignal(context: unknown): AbortSignal | undefined {
+  return context && typeof context === "object" && "abortSignal" in context
+    ? (context as { abortSignal?: AbortSignal }).abortSignal
+    : undefined;
+}
+
+/**
+ * How an MCP App tool call without a result ended, kept in its result record. A deadline is a
+ * failure, not a user interrupt: only the call's own abort signal counts as interrupted.
+ */
+function failedCallOutcome(signal: AbortSignal | undefined): "failed" | "interrupted" {
+  return signal?.aborted === true ? "interrupted" : "failed";
 }
 
 /**
@@ -244,7 +452,24 @@ function sanitizeMCPToolArgs(args: unknown, inputSchema: unknown): unknown {
  */
 export function wrapMCPTools(
   tools: Record<string, Tool>,
-  options?: { onActivity?: () => void; onClosed?: () => void }
+  options?: {
+    onActivity?: () => void;
+    onClosed?: () => void;
+    display?: {
+      connection: MCPConnectionRef;
+      identity?: MCPServerIdentity;
+      /** Handshake icons, used only when a call falls back to the connection identity. */
+      iconCandidates?: readonly IconCandidate[];
+      registry: ToolCallDisplayRegistry;
+      /** One owner per connected generation; without this, snapshots carry no iconRef. */
+      icons?: { registry: MCPIconRegistry; owner: MCPIconOwner };
+    };
+    /**
+     * MCP Apps (mcp-apps experiment): host-only store for the raw results of tools that
+     * declare a view. Omitted when the experiment was off at connect time.
+     */
+    appResults?: { serverName: string; store: McpAppResultStore };
+  }
 ): Record<string, Tool> {
   const { onActivity, onClosed } = options ?? {};
   const wrapped: Record<string, Tool> = {};
@@ -256,6 +481,9 @@ export function wrapMCPTools(
     }
 
     const originalExecute = tool.execute;
+    // Only a tool that declares a view gets a result record and an "Open in Artifacts" link;
+    // a visibility-only `_meta.ui` (app helper) has nothing to open.
+    const appResourceUri = options?.appResults ? getMCPToolUi(tool)?.resourceUri : undefined;
     wrapped[toolName] = {
       ...tool,
       execute: async (args: Parameters<typeof originalExecute>[0], context) => {
@@ -263,19 +491,105 @@ export function wrapMCPTools(
         // calls (including closed-client races) still count as activity.
         onActivity?.();
 
+        // Set once a result's snapshot is published, so the failure path never
+        // replaces response metadata with the weaker connection identity.
+        let published = false;
+        // MCP Apps: hoisted so a failed call can still record its invocation, and so that
+        // record never replaces a successful call's full one.
+        let sanitizedArgs: unknown;
+        let argsSanitized = false;
+        let appResultRecorded = false;
+        // Hoisted so the failure path can tell an interrupted call from a failed one.
+        const abortSignal = toolCallAbortSignal(context);
         try {
-          const abortSignal =
-            context && typeof context === "object" && "abortSignal" in context
-              ? (context as { abortSignal?: AbortSignal }).abortSignal
-              : undefined;
-
-          const sanitizedArgs = sanitizeMCPToolArgs(args, tool.inputSchema);
+          sanitizedArgs = sanitizeMCPToolArgs(args, rawInputSchema(tool.inputSchema));
+          argsSanitized = true;
           const result: unknown = await runMCPToolWithDeadline(
             () => Promise.resolve(originalExecute(sanitizedArgs, context)) as Promise<unknown>,
             { toolName, timeoutMs: MCP_TOOL_CALL_TIMEOUT_MS, signal: abortSignal }
           );
-          return transformMCPResult(result as MCPCallToolResult);
+          // Protocol `_meta` is host-only for newly produced results: the
+          // standard key feeds the UI badge, and the rest has no consumer.
+          // Output is replayed verbatim to the model on later turns and counts
+          // toward the size caps, so none of it is kept (existing history is
+          // not migrated).
+          const { rest, displayKeyValue } = takeStandardDisplayMeta(result);
+          const response = normalizeServerIdentity(displayKeyValue);
+          const identity = response?.identity ?? options?.display?.identity;
+          const scope = getExecutionScope(context);
+          if (scope && appResourceUri !== undefined && options?.appResults) {
+            // The view gets this raw copy; the model copy below stays stripped and capped.
+            await options.appResults.store.record(scope.workspaceId, {
+              toolCallId: context.toolCallId,
+              serverName: options.appResults.serverName,
+              toolName,
+              resourceUri: appResourceUri,
+              arguments: sanitizedArgs,
+              result,
+            });
+            appResultRecorded = true;
+          }
+          if (scope && identity && options?.display) {
+            const { display } = options;
+            // A result that names its own identity also owns its artwork: a
+            // response identity without icons stays unbranded instead of
+            // borrowing the handshake's. Registration only mints the ref;
+            // resolution runs in the background and is never awaited here.
+            const candidates = response ? response.iconCandidates : (display.iconCandidates ?? []);
+            const iconRef = display.icons?.registry.ensure(
+              display.icons.owner,
+              candidates,
+              display.connection
+            );
+            const snapshot = buildToolCallDisplay({
+              connection: display.connection,
+              identity,
+              source: response ? "response" : "connection",
+              ...(iconRef ? { iconRef } : {}),
+              ...(appResourceUri !== undefined ? { app: { resourceUri: appResourceUri } } : {}),
+            });
+            if (snapshot) {
+              published = display.registry.set(scope, context.toolCallId, snapshot);
+            }
+          }
+          return transformMCPResult(omitMCPProtocolMeta(rest) as MCPCallToolResult);
         } catch (error) {
+          // A call that throws or hits its deadline produced no result metadata,
+          // but the failed part still belongs to a known server: publish the
+          // handshake identity for it before the client may be recycled. Only
+          // here, not before every call, so a successful result's own identity
+          // is still the first and only snapshot for its call.
+          const scope = getExecutionScope(context);
+          if (!published && scope && options?.display?.identity) {
+            const snapshot = buildToolCallDisplay({
+              connection: options.display.connection,
+              identity: options.display.identity,
+              source: "connection",
+              // A failed or interrupted call still opens its view (the card shows it as
+              // cancelled; the view opens with tool input only).
+              ...(appResourceUri !== undefined ? { app: { resourceUri: appResourceUri } } : {}),
+            });
+            if (snapshot) options.display.registry.set(scope, context.toolCallId, snapshot);
+          }
+          if (
+            !appResultRecorded &&
+            argsSanitized &&
+            scope &&
+            appResourceUri !== undefined &&
+            options?.appResults
+          ) {
+            // The view of a failed call is still bound to the server-local tool name and the
+            // sanitized arguments the server received; there is no result. record() never throws.
+            await options.appResults.store.record(scope.workspaceId, {
+              toolCallId: context.toolCallId,
+              serverName: options.appResults.serverName,
+              toolName,
+              resourceUri: appResourceUri,
+              arguments: sanitizedArgs,
+              result: null,
+              outcome: failedCallOutcome(abortSignal),
+            });
+          }
           if (shouldRecycleClientAfterToolError(error)) {
             try {
               onClosed?.();
@@ -294,6 +608,61 @@ export function wrapMCPTools(
 type ResolvedHeaders = Record<string, string> | undefined;
 
 type ResolvedTransport = "stdio" | "http" | "sse";
+
+/** How long a served tool call waits for a publication's enablement repair before failing closed. */
+const PENDING_REPAIR_WAIT_MS = 10_000;
+/**
+ * Bounds one send's wait for first prompt lists (awaitFirstPromptLists): two prompts/list
+ * timeouts, the worst case of the earlier two-round wait.
+ */
+export const FIRST_PROMPT_LIST_WAIT_MS = 2 * PROMPT_LIST_TIMEOUT_MS;
+/**
+ * ONE deadline for a served tool call's complete authorization gate: every
+ * wait in it (repair waits, disk re-reads, re-serves, lock acquisition, epoch
+ * reads, across all retry iterations) draws from this single budget, so the
+ * gate as a whole — not each helper — is bounded.
+ */
+const CALL_GATE_TIMEOUT_MS = 30_000;
+
+/**
+ * How long listing or opening MCP App entry points waits for a server's tools/list refresh
+ * (tools/list_changed) before it uses the catalog it holds: one stalled server must not hold
+ * back the launcher. A fresh list answers from the SDK's response cache at once.
+ */
+export const MCP_APP_CATALOG_REFRESH_TIMEOUT_MS = 2_000;
+/** Iterations a served tool call spends waiting for override state to settle before failing closed. */
+const CALL_GATE_MAX_ATTEMPTS = 5;
+
+/**
+ * Whether two request options derive the same server enablement: same
+ * workspace and project, same trust, same (normalized) overrides, same Agent
+ * Plugin context. Secrets and identity are irrelevant to authorization.
+ */
+function authorizationStateEqual(
+  a: MCPWorkspaceRequestOptions,
+  b: MCPWorkspaceRequestOptions
+): boolean {
+  return (
+    a.workspaceId === b.workspaceId &&
+    a.projectPath === b.projectPath &&
+    (a.trusted ?? false) === (b.trusted ?? false) &&
+    // A non-authoritative record is a different authorization state even
+    // with an identical override value: the latest serve established that
+    // the state could NOT be verified, and an overlapping authoritative
+    // serve must not hand out tools on the strength of the same value.
+    (a.overridesAuthoritative !== false) === (b.overridesAuthoritative !== false) &&
+    workspaceOverridesEqual(a.overrides, b.overrides) &&
+    JSON.stringify(a.agentPlugins ?? null) === JSON.stringify(b.agentPlugins ?? null)
+  );
+}
+
+/** Structural equality of override snapshots (both sides are normalized by the service). */
+export function workspaceOverridesEqual(
+  a: WorkspaceMCPOverrides | undefined,
+  b: WorkspaceMCPOverrides | undefined
+): boolean {
+  return JSON.stringify(a ?? {}) === JSON.stringify(b ?? {});
+}
 
 function secretRecordsEqual(
   a: Record<string, string> | undefined,
@@ -384,6 +753,32 @@ function extractHttpStatusCode(error: unknown): number | null {
 function shouldAutoFallbackToSse(error: unknown): boolean {
   const status = extractHttpStatusCode(error);
   return status === 400 || status === 404 || status === 405;
+}
+
+const HTML_DOCUMENT_PATTERN = /<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]/i;
+
+/**
+ * User-facing message for a failed connection test (#5678). MCP clients embed
+ * the raw response body in their errors ("Error POSTing to endpoint: <body>"),
+ * and a URL that serves a web page answers with a whole HTML document. That
+ * body is untrusted server text: replace an HTML page with its status.
+ * MCPServerManager.test bounds the length of every failure message.
+ */
+function formatServerTestError(error: unknown): string {
+  const message = getErrorMessage(error);
+  if (HTML_DOCUMENT_PATTERN.test(message)) {
+    const status = extractHttpStatusCode(error) ?? /\bHTTP (\d{3})\b/.exec(message)?.[1];
+    const prefix = status != null ? `HTTP ${status}: the server` : "The server";
+    return `${prefix} returned an HTML page instead of an MCP response. Check the server URL.`;
+  }
+  return message;
+}
+
+function boundServerTestError(message: string): string {
+  if (message.length <= MCP_TEST_ERROR_MAX_CHARS) {
+    return message;
+  }
+  return `${message.slice(0, MCP_TEST_ERROR_MAX_CHARS - 1)}…`;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -530,19 +925,24 @@ async function extractBearerOauthChallenge(options: {
   };
 }
 
-export type { MCPTestResult } from "@/common/types/mcp";
-
 /** Shell command + exec options composed for a stdio server launch. */
 interface StdioLaunch {
   command: string;
   cwd?: string;
   env?: Record<string, string>;
+  /**
+   * #6509: a plugin server gets only the minimal host environment plus its
+   * declared env, so the user's shell secrets are not passed to it. Not a sandbox:
+   * the server runs as the same OS user (see docs/config/mcp-servers.mdx). User-configured
+   * servers keep the full environment.
+   */
+  hostEnv: NonNullable<ExecOptions["hostEnv"]>;
 }
 
 /**
  * mkdir -p that self-heals corrupted plugin data state: when the target or one
  * of its ancestors exists as a non-directory (a stray file where
- * `~/.shux/plugin-data` or an instance dir should be), the offending entry is
+ * `~/.xum/plugin-data` or an instance dir should be), the offending entry is
  * quarantined (renamed aside) and the mkdir retried, instead of ENOTDIR/EEXIST
  * permanently bricking every test/launch until the user repairs disk state by
  * hand. Renaming preserves whatever data the file held.
@@ -592,6 +992,26 @@ async function mkdirSelfHealing(target: string): Promise<void> {
 }
 
 /**
+ * Codex `env_vars`: copy only the named host variables (unset ones are skipped, as in
+ * codex-rs create_env_for_mcp_server). Configured env wins, so PLUGIN_ROOT/PLUGIN_DATA stay put.
+ */
+function withForwardedHostEnv(
+  forwardEnv: string[] | undefined,
+  env: Record<string, string> | undefined
+): Record<string, string> | undefined {
+  // Own properties only: `constructor` would read an inherited function. Object.fromEntries
+  // keeps a host variable named `__proto__`, which an assignment would drop.
+  // A configured key wins: on Windows names compare without case, so drop a forwarded name that
+  // matches one there, or both keys would reach the same variable (#6713).
+  const configured = new Set(Object.keys(env ?? {}).map(envNameKey));
+  const forwarded = (forwardEnv ?? []).flatMap((name): Array<[string, string]> => {
+    const value = Object.hasOwn(process.env, name) ? process.env[name] : undefined;
+    return typeof value === "string" && !configured.has(envNameKey(name)) ? [[name, value]] : [];
+  });
+  return forwarded.length > 0 ? { ...Object.fromEntries(forwarded), ...env } : env;
+}
+
+/**
  * Compose the shell command string and exec options for a stdio server.
  *
  * Servers with `args` set (Agent Plugins) run in argv mode: `command` and each
@@ -607,7 +1027,9 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
   const command =
     info.args !== undefined ? [info.command, ...info.args].map(shellQuote).join(" ") : info.command;
 
+  let hostEnv: StdioLaunch["hostEnv"] = "inherit";
   if (info.plugin !== undefined) {
+    hostEnv = "minimal";
     const dataPath = info.env?.PLUGIN_DATA;
     assert(
       dataPath !== undefined && path.isAbsolute(dataPath),
@@ -631,20 +1053,24 @@ export async function prepareStdioLaunch(info: MCPStdioServerInfo): Promise<Stdi
     }
   }
 
+  const env = withForwardedHostEnv(info.forwardEnv, info.env);
+
   return {
     command,
     ...(info.cwd !== undefined ? { cwd: info.cwd } : {}),
-    ...(info.env !== undefined ? { env: info.env } : {}),
+    ...(env !== undefined ? { env } : {}),
+    hostEnv,
   };
 }
 
 /**
  * Run a test connection to an MCP server.
- * Connects, fetches tools, then closes.
+ * Connects, fetches tools, then closes; a successful connection then has its
+ * handshake icon resolved (bounded by the icon resolver's own deadline).
  */
 async function runServerTest(
   server:
-    | { transport: "stdio"; command: string; cwd?: string; env?: Record<string, string> }
+    | ({ transport: "stdio" } & StdioLaunch)
     | {
         transport: "http" | "sse" | "auto";
         url: string;
@@ -652,7 +1078,9 @@ async function runServerTest(
         authProvider?: OAuthClientProvider;
       },
   projectPath: string,
-  logContext: string
+  logContext: string,
+  /** Configured server key the icon binding is described under. */
+  connectionKey: string
 ): Promise<MCPTestResult> {
   // Resettable deadline: the fragile-legacy stdio respawn below restarts the
   // clock so the compatibility retry gets a full test window instead of
@@ -674,10 +1102,16 @@ async function runServerTest(
   };
   armTestDeadline();
 
+  // Captured by the connection attempt for the icon step below, which runs
+  // only after the race has produced a success verdict.
+  const observed: { current?: { identity: NormalizedServerIdentity; binding: MCPConnectionRef } } =
+    {};
+
   const testPromise = (async (): Promise<MCPTestResult> => {
     let stdioTransport: MCPStdioTransport | null = null;
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;
     let getCapturedWwwAuthenticateHeader: (() => string | null) | null = null;
+    let actualTransport: "http" | "sse" | undefined;
 
     try {
       if (server.transport === "stdio") {
@@ -688,6 +1122,7 @@ async function runServerTest(
           const execStream = await runtime.exec(server.command, {
             cwd: server.cwd ?? projectPath,
             ...(server.env !== undefined ? { env: server.env } : {}),
+            hostEnv: server.hostEnv,
             timeout: TEST_TIMEOUT_MS / 1000,
           });
 
@@ -752,12 +1187,15 @@ async function runServerTest(
 
         if (server.transport === "http") {
           client = await tryHttp();
+          actualTransport = "http";
         } else if (server.transport === "sse") {
           client = await trySse();
+          actualTransport = "sse";
         } else {
           // auto
           try {
             client = await tryHttp();
+            actualTransport = "http";
           } catch (error) {
             if (!shouldAutoFallbackToSse(error)) {
               throw error;
@@ -766,6 +1204,7 @@ async function runServerTest(
               status: extractHttpStatusCode(error),
             });
             client = await trySse();
+            actualTransport = "sse";
           }
         }
       }
@@ -773,6 +1212,22 @@ async function runServerTest(
       const tools = await client.tools();
       const toolNames = Object.keys(tools);
       const protocolVersion = client.negotiatedProtocolVersion();
+      const normalizedIdentity = normalizeServerIdentity(client.serverInfo());
+      const serverInfo = normalizedIdentity?.identity;
+      if (normalizedIdentity) {
+        // Remote icons are bound to the configured URL's origin (never a
+        // reported website), on the transport that actually connected.
+        observed.current = {
+          identity: normalizedIdentity,
+          binding: describeConnection(
+            connectionKey,
+            server.transport === "stdio"
+              ? { transport: "stdio", command: server.command, disabled: false }
+              : { transport: server.transport, url: server.url, disabled: false },
+            actualTransport
+          ),
+        };
+      }
 
       await client.close();
       client = null;
@@ -790,9 +1245,13 @@ async function runServerTest(
         success: true,
         tools: toolNames,
         ...(protocolVersion !== undefined ? { protocolVersion } : {}),
+        ...(serverInfo ? { serverInfo } : {}),
       };
     } catch (error) {
-      const message = getErrorMessage(error);
+      // Only remote servers answer with web pages. A stdio parse error that quotes an
+      // HTML-looking line keeps its own (bounded) message.
+      const message =
+        server.transport === "stdio" ? getErrorMessage(error) : formatServerTestError(error);
       log.warn(`[MCP] ${logContext} test failed`, { error: message });
 
       if (client) {
@@ -826,7 +1285,33 @@ async function runServerTest(
     }
   })();
 
-  return Promise.race([testPromise, timeoutPromise]);
+  let result: MCPTestResult;
+  try {
+    result = await Promise.race([testPromise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+  // Icon work starts only after a successful, in-deadline connection: awaiting
+  // it inside the race would turn a slow-but-good handshake into a timeout,
+  // and a failed or timed-out test has no identity worth decorating.
+  if (!result.success || !observed.current) {
+    return result;
+  }
+  // The test returns the image bytes directly and never exposes a ref, so it
+  // resolves through the process-wide resolver (same gate, deadline, and
+  // origin binding as tool calls) without admitting anything into the
+  // historical icon registry, whose entries belong to chat history.
+  const { identity, binding } = observed.current;
+  if (identity.iconCandidates.length === 0) {
+    return result;
+  }
+  let icon: unknown = null;
+  try {
+    icon = await resolveServerIcon(identity.iconCandidates, binding);
+  } catch {
+    // Icon failures never fail a successful connection test.
+  }
+  return isPngDataUrl(icon) ? { ...result, icon } : result;
 }
 
 type MCPPromptContent = MCPGetPromptResult["messages"][number]["content"];
@@ -952,12 +1437,33 @@ export function normalizePromptCatalog(prompts: MCPPrompt[], serverName: string)
 
 interface MCPServerInstance {
   name: string;
+  identity?: MCPServerIdentity;
+  connectionRef: MCPConnectionRef;
   /** Resolved transport actually used (auto may fall back to sse). */
   resolvedTransport: ResolvedTransport;
   autoFallbackUsed: boolean;
   tools: Record<string, Tool>;
   prompts: MCPPrompt[];
   getPrompt: MCPClientHandle["getPrompt"];
+  /** Codex plugin hooks (see MCPServerManager.callToolForPluginHook). */
+  callToolForHook: MCPClientHandle["callToolForHook"];
+  /**
+   * MCP Apps (mcp-apps experiment): present only when the connection announced the
+   * extension. Tool metadata includes tools hidden from the model.
+   */
+  apps?: Pick<
+    MCPClientHandle,
+    "toolUi" | "hasTool" | "callToolForApp" | "readResource" | "appEntrypoints"
+  >;
+  /** OpenAI structured settings (`openai/settings`); its tools are hidden from the model. */
+  settings?: Pick<
+    MCPClientHandle,
+    | "settingsCapability"
+    | "callSettingsTool"
+    | "settingsToolAction"
+    | "callSettingsActionTool"
+    | "relistTools"
+  >;
   /** True once the underlying MCP client/transport has been closed. */
   isClosed: boolean;
   /**
@@ -966,7 +1472,8 @@ interface MCPServerInstance {
    * list results carry ttlMs/cacheScope freshness hints: a still-fresh cached
    * list is served with zero round trips, a stale one refetches. Legacy
    * connections keep the previous instance-lifetime tool caching (their list
-   * results carry no freshness hints).
+   * results carry no freshness hints). Invoked off the send path
+   * (refreshInstanceToolsInBackground), never awaited by a turn.
    */
   refreshTools?: () => Promise<void>;
   /** Fetches prompts/list without mutating instance state; refreshInstancePrompts alone normalizes and stores the catalog. */
@@ -996,6 +1503,24 @@ export interface MCPWorkspaceRequestOptions {
   workspacePath: string;
   trusted?: boolean;
   overrides?: WorkspaceMCPOverrides;
+  /**
+   * `false` when the caller could not establish `overrides` authoritatively
+   * (indeterminate probe, unreadable document, failed inheritance): the
+   * manager then re-reads disk itself and fails the serve CLOSED if that read
+   * is not authoritative either. "No overrides" is not "no servers" — a
+   * globally enabled server disabled only by an unreadable document would
+   * otherwise start. Omitted means authoritative (internal callers).
+   */
+  overridesAuthoritative?: boolean;
+  /**
+   * Absolute deadline (epoch ms) of the caller's own override read, set when
+   * that read was NOT authoritative. Had it exhausted the budget (an
+   * unreachable SSH/Docker ancestor), the manager's disk re-read gets only
+   * what remains of it — never a fresh full deadline of its own, which would
+   * double the request's wait and leave a second uncancellable remote probe
+   * behind. Nothing remaining → the serve fails closed without a re-read.
+   */
+  overridesReadDeadlineAt?: number;
   projectSecrets?: Record<string, string>;
   agentPlugins?: AgentPluginsMcpContext | null;
 }
@@ -1012,16 +1537,71 @@ interface MCPToolsForWorkspaceResult {
   stats: MCPWorkspaceStats;
   /** Prompt descriptors for model-facing discovery, from the same enabled/stale gates as getPromptsForWorkspace. */
   promptDescriptors: MCPPromptDescriptor[];
+  /**
+   * The validated workspace overrides this serve's enablement was derived
+   * from (disk-authoritative when the caller's snapshot was not); absent when
+   * the serve failed closed. Callers rebuild prompt-facing listings from these
+   * whenever their own snapshot was not authoritative or differs from them (a
+   * publication replaced the caller's snapshot mid-serve).
+   */
+  overridesUsed?: WorkspaceMCPOverrides;
+  /**
+   * The validated server inventory the serve's enablement was derived from —
+   * config, project trust, and overrides as of the last repair. Trust
+   * and global/project config can change independently of the override
+   * snapshot, so callers list the prompt-facing inventory from this rather
+   * than from their own pre-serve `listServers` call.
+   */
+  serversUsed?: MCPServerMap;
+  /**
+   * Internal: the recorded options the served entry's enablement was derived
+   * from; absent when the serve failed closed. getPrompt compares it with the
+   * recorded options at dispatch time (see serveResult).
+   */
+  enablementDerivedFrom?: MCPWorkspaceRequestOptions;
 }
 interface WorkspaceServers {
+  /** Removed selections are detached immediately, but leased calls keep their client alive. */
+  retiredPluginInstances?: Set<MCPServerInstance>;
   configSignature: string;
   instances: Map<string, MCPServerInstance>;
   /** Filters prompts while leased restarts can leave disabled clients cached. */
   enabledServerNames: Set<string>;
+  /**
+   * The validated server inventory `enabledServerNames` was derived from
+   * (config + trust + overrides at derivation time). Returned to
+   * callers as `serversUsed` so the prompt's MCP listing is built from the
+   * same authorization state as the served tools.
+   */
+  enabledServers: MCPServerMap;
+  /**
+   * `configService.configGeneration` read BEFORE the config read
+   * `enabledServers` was derived from. Global mutations (mcp.setEnabled, a
+   * global/project toolAllowlist edit) bump the generation without replacing
+   * recorded options; the call-time gate compares this with the current
+   * generation and re-derives the inventory when it moved, so a tool object
+   * handed out earlier never dispatches on a stale allowlist.
+   */
+  enabledServersGeneration: number;
   stats: MCPWorkspaceStats;
   timedOutServerNames: string[];
-  /** Prevent concurrent cached retries from stacking startup attempts for the same server. */
-  retryingTimedOutServerNames: Set<string>;
+  /**
+   * In-flight cached retries by server name; prevents concurrent cached
+   * retries from stacking startup attempts for the same server. A batch of
+   * explicit re-queues only (plugin invalidation restart; no backoff record)
+   * carries a promise settling when its retry finishes, which concurrent
+   * serves join instead of serving without the server (#4539). A batch with a
+   * timed-out server's retry carries none: concurrent serves skip it rather
+   * than wait on a possibly hanging startup.
+   */
+  retryingTimedOutServerNames: Map<string, Promise<void> | undefined>;
+  /**
+   * Consecutive startup timeouts (initial start included) per server still in
+   * `timedOutServerNames`, gating getTimedOutServerNamesToRetry (see
+   * TIMED_OUT_RETRY_BACKOFF_BASE_MS). No record (plugin re-queue) means the
+   * next serve retries immediately.
+   */
+  timedOutRetryBackoff?: Map<string, TimedOutRetryBackoff>;
   /** Blocks prompt invocation on stale clients while an active lease defers restart. */
   stalePromptServerNames?: Set<string>;
   /** Dedupes send-path background prompt refreshes so streams never stack them. */
@@ -1034,13 +1614,121 @@ interface WorkspaceServers {
 }
 
 export interface MCPServerManagerOptions {
+  toolCallDisplayRegistry?: ToolCallDisplayRegistry;
+  config?: Config;
+  telemetryService?: Pick<TelemetryService, "capture">;
   /** Inline stdio servers to use (merged with config file servers by default) */
   inlineServers?: Record<string, string>;
   /** If true, ignore config file servers and use only inline servers */
   ignoreConfigFile?: boolean;
+  /**
+   * Cross-process Agent Plugin invalidation. stopServersWithKeyPrefix only
+   * recycles THIS process's instances; a sibling process sharing the same
+   * home (ALLOW_MULTIPLE_INSTANCES, desktop app alongside `xum server`) would
+   * otherwise keep serving servers launched from a plugin tree that an
+   * update/uninstall replaced — the key and command signature are unchanged,
+   * so nothing else notices. `readToken` reads the installer's on-disk
+   * mutation epoch; when it changes between serves, every cached instance
+   * whose key starts with `keyPrefix` is retired before being served again.
+   */
+  pluginInvalidation?: {
+    keyPrefix: string;
+    readToken: () => Promise<string | undefined>;
+    /** Atomic plugins.json content, independent of tree replacement and override epochs. */
+    readComponentPolicy?: () => Promise<PluginMcpPolicy>;
+    /** Same writer lock as plugins.json mutations. Must try once, never queue/wait. */
+    tryAcquireComponentPolicyLock?: (options: {
+      signal?: AbortSignal;
+    }) => Promise<() => Promise<void>>;
+
+    /**
+     * Disk-authoritative workspace override read. A sibling's uninstall also
+     * pruned plugin keys from workspace override FILES; the sweep uses this
+     * to refresh every cached override snapshot (latestWorkspaceOverrides
+     * and lastWorkspaceRequestOptions) so no pre-prune enable survives in
+     * memory. When absent or failing, the affected cached state is dropped
+     * instead.
+     */
+    /**
+     * Disk-authoritative override reader. Resolves `undefined` when the state
+     * could NOT be established authoritatively (unreachable/indeterminate
+     * checkout); callers must then treat the read as failed, never as "no
+     * overrides".
+     */
+    readWorkspaceOverrides?: (
+      workspaceId: string,
+      /**
+       * Bound/cancel the read (the service applies its own default deadline
+       * when `timeoutMs` is omitted). A timed-out or aborted read resolves
+       * `undefined`, i.e. fails closed, never "no overrides".
+       */
+      options?: { timeoutMs?: number; signal?: AbortSignal }
+    ) => Promise<WorkspaceMCPOverrides | undefined>;
+    /**
+     * Cross-process override-write epoch (WorkspaceMcpOverridesService bumps
+     * it under its write lock after every save/prune). Two backends sharing
+     * one home publish only into their own caches; when a sibling's token
+     * changes, every cached override snapshot here is refreshed from disk (or
+     * evicted) so a stale in-memory overlay can never supersede a fresh
+     * authoritative request read.
+     */
+    readOverridesEpoch?: () => Promise<string | undefined>;
+    /**
+     * Acquire the override WRITER's lock (the service's in-process queue plus
+     * the cross-process `mcp-overrides.lock`); resolves with the release. A
+     * served tool call holds it from its final epoch read through the
+     * synchronous invocation start, so a sibling process's revocation either
+     * lands before that read (observed) or after the dispatch — never in the
+     * promise continuations between them (see gateServedToolOnEnablement).
+     */
+    acquireOverridesLock?: (options?: {
+      /** Give up (without ever holding the lock) once aborted or past `timeoutMs`. */
+      signal?: AbortSignal;
+      timeoutMs?: number;
+    }) => Promise<() => Promise<void>>;
+  };
+}
+
+/** Drop a workspace's entries from a map keyed `<workspaceId>\0<key>`. */
+function deleteWorkspaceKeys(map: Map<string, unknown>, workspaceId: string): void {
+  for (const key of map.keys()) {
+    if (key.startsWith(`${workspaceId}\0`)) map.delete(key);
+  }
+}
+
+function categorizeMcpTestError(error: string): "timeout" | "connect" | "http_status" | "unknown" {
+  const lower = error.toLowerCase();
+  if (lower.includes("timed out")) return "timeout";
+  if (
+    lower.includes("econnrefused") ||
+    lower.includes("econnreset") ||
+    lower.includes("enotfound") ||
+    lower.includes("ehostunreach")
+  ) {
+    return "connect";
+  }
+  if (/\b(400|401|403|404|405|500|502|503)\b/.test(lower)) return "http_status";
+  return "unknown";
+}
+
+interface MCPServerTestOptions {
+  projectPath: string;
+  /** Whether repo-local MCP config is allowed for this project. */
+  trusted?: boolean;
+  name?: string;
+  command?: string;
+  transport?: MCPServerTransport;
+  url?: string;
+  headers?: Record<string, MCPHeaderValue>;
+  projectSecrets?: Record<string, string>;
+  /** Agent Plugins discovery context for named-server lookups (null = no plugin servers). */
+  agentPlugins?: AgentPluginsMcpContext | null;
 }
 
 export class MCPServerManager {
+  private readonly toolCallDisplayRegistry: ToolCallDisplayRegistry;
+  /** Session-local server artwork behind the opaque `iconRef`s on tool-call snapshots. */
+  private readonly iconRegistry = new MCPIconRegistry(resolveServerIcon);
   private readonly workspaceServers = new Map<string, WorkspaceServers>();
   // Survives idle cleanup so an explicit prompt invocation can revive reaped
   // servers at send time; forgotten only on workspace removal.
@@ -1055,12 +1743,42 @@ export class MCPServerManager {
    * cached or recorded state to repair, so stale caller snapshots can be overlaid.
    */
   private readonly latestWorkspaceOverrides = new Map<string, WorkspaceMCPOverrides | undefined>();
+  /**
+   * Publication enablement repairs in flight (applyWorkspaceOverrides awaits
+   * listServers before it can rewrite `entry.enabledServerNames`). Served tool
+   * invocations wait for the pending repair before their call-time gate.
+   */
+  private readonly pendingEnablementRepairs = new Map<string, Promise<void>>();
   private readonly latestProjectTrust = new Map<string, boolean>();
   private readonly workspaceRestartLocks = new MutexMap<string>();
+  /** Instances whose prompts/list settled at least once; see awaitFirstPromptLists. */
+  private readonly promptListSettledInstances = new WeakSet<MCPServerInstance>();
   /** Orders racing prompt refresh completions per instance; see refreshInstancePrompts. */
   private readonly promptRefreshSequences = new WeakMap<
     MCPServerInstance,
     { started: number; applied: number }
+  >();
+  /** Dedupes send-path background tool refreshes per instance; see refreshInstanceToolsInBackground. */
+  private readonly toolRefreshesInFlight = new WeakMap<MCPServerInstance, Promise<boolean>>();
+  /**
+   * Prompt catalogs of idle-stopped servers, by workspace, with the start
+   * config they were fetched under. The restart seeds each restarted
+   * instance's catalog from here before its awaited prompts/list, so a list
+   * that fails or times out (10 s) keeps the previous catalog instead of an
+   * empty one. Otherwise the `mcp_prompt_get` description loses that server's
+   * prompts for a turn, and the changed tools section rewrites the whole
+   * cached Anthropic prompt (seen live: Notion prompts dropped after an idle
+   * restart). Consumed by the next cold start; dropped on removal-style stops
+   * and plugin key-prefix invalidations.
+   */
+  private readonly idleStoppedPromptCatalogs = new Map<
+    string,
+    {
+      configSignature: string;
+      prompts: Map<string, MCPPrompt[]>;
+      /** Servers whose catalog had settled a prompts/list (see awaitFirstPromptLists). */
+      listedServerNames: Set<string>;
+    }
   >();
   // Bumped by removal-style stops (stopServers without retainRestartOptions).
   // Startups run outside any lock shared with removal, so an abort-abandoned
@@ -1077,9 +1795,39 @@ export class MCPServerManager {
    * probed against.
    */
   private readonly eraVerdicts = new Map<string, { prior: PriorDiscovery; cachedAtMs: number }>();
+  /**
+   * Monotonic clock for key-prefix invalidations (stopServersWithKeyPrefix).
+   * getToolsForWorkspace snapshots it before reading config; any prefix
+   * invalidated after that snapshot marks the startup's matching instances
+   * stale, because they may have launched from a plugin tree that was
+   * swapped/deleted mid-startup.
+   */
+  private prefixInvalidationClock = 0;
+  /** Latest invalidation epoch per key prefix. */
+  private readonly prefixInvalidations = new Map<string, number>();
+  /** See MCPServerManagerOptions.pluginInvalidation. */
+  private readonly pluginInvalidation?: MCPServerManagerOptions["pluginInvalidation"];
+  private componentPolicy: PluginMcpPolicy | undefined;
+  private componentPolicyRevision = 0;
+  /** Current shared hold of the component-policy writer lock; see acquireSharedComponentPolicyLock. */
+  private componentPolicyLockShare:
+    | { acquisition: Promise<() => Promise<void>>; holders: number }
+    | undefined;
+  private componentPolicyLockReleasing: Promise<void> = Promise.resolve();
+  private readonly managedPluginServers = new Map<string, NonNullable<MCPServerInfo["plugin"]>>();
+  private readonly managedPluginInstances = new Map<
+    string,
+    NonNullable<NonNullable<MCPServerInfo["plugin"]>["componentPolicy"]>
+  >();
+  private pluginInvalidationTokenSeen = false;
+  private lastPluginInvalidationToken: string | undefined;
+  private lastOverridesEpochToken: string | undefined;
+  /** Serializes cross-process invalidation checks (see retireCrossProcessPluginInstances). */
+  private pluginInvalidationQueue: Promise<unknown> = Promise.resolve();
   private readonly idleCheckInterval: ReturnType<typeof setInterval>;
   private inlineServers: Record<string, string> = {};
-  private readonly policyService: PolicyService | null;
+  private readonly config: Config | null;
+  private readonly telemetryService: Pick<TelemetryService, "capture"> | null;
   private mcpOauthService: McpOauthService | null = null;
   private secretsResolver: MCPWorkspaceSecretsResolver | null = null;
   private ignoreConfigFile = false;
@@ -1091,13 +1839,52 @@ export class MCPServerManager {
   setSecretsResolver(resolver: MCPWorkspaceSecretsResolver): void {
     this.secretsResolver = resolver;
   }
+
+  private mcpApps: { isEnabled: () => boolean; store: McpAppResultStore } | null = null;
+
+  /** MCP Apps host support, gated by the mcp-apps experiment (read at each connect). */
+  setMcpApps(apps: { isEnabled: () => boolean; store: McpAppResultStore }): void {
+    this.mcpApps = apps;
+  }
+
+  /** The side store when MCP Apps is on for a connection starting now, else null. */
+  private mcpAppsStoreForConnect(): McpAppResultStore | null {
+    return this.mcpApps?.isEnabled() === true ? this.mcpApps.store : null;
+  }
+
+  /**
+   * Whether a live connection was made under the other MCP Apps setting. The extension
+   * announcement and app-only tool filtering are fixed per connection (`apps` is recorded at
+   * connect), so toggling the experiment needs a reconnect. Kept out of the config signature,
+   * which is a per-server map of launch settings: a mismatch is handled like a closed client.
+   */
+  private connectedUnderOtherMcpAppsSetting(instance: MCPServerInstance): boolean {
+    if (this.mcpApps === null) return false;
+    return (instance.apps !== undefined) !== this.mcpApps.isEnabled();
+  }
+
+  /**
+   * A closed client, or (with no stream holding the clients) one connected under the other
+   * MCP Apps setting. Under a lease the toggle waits for the next idle serve rather than
+   * closing healthy clients out from under the stream.
+   */
+  private instanceNeedsRestart(instance: MCPServerInstance, leaseCount: number): boolean {
+    return (
+      instance.isClosed || (leaseCount === 0 && this.connectedUnderOtherMcpAppsSetting(instance))
+    );
+  }
   constructor(
     private readonly configService: MCPConfigService,
-    options?: MCPServerManagerOptions,
-    policyService?: PolicyService
+    options?: MCPServerManagerOptions
   ) {
-    this.policyService = policyService ?? null;
-    this.idleCheckInterval = setInterval(() => this.cleanupIdleServers(), IDLE_CHECK_INTERVAL_MS);
+    this.toolCallDisplayRegistry =
+      options?.toolCallDisplayRegistry ?? new ToolCallDisplayRegistry();
+    this.config = options?.config ?? null;
+    this.telemetryService = options?.telemetryService ?? null;
+    this.idleCheckInterval = setInterval(
+      () => this.cleanupIdleServers(),
+      MCP_IDLE_CHECK_INTERVAL_MS
+    );
     this.idleCheckInterval.unref?.();
     if (options?.inlineServers) {
       this.inlineServers = options.inlineServers;
@@ -1105,6 +1892,666 @@ export class MCPServerManager {
     if (options?.ignoreConfigFile) {
       this.ignoreConfigFile = options.ignoreConfigFile;
     }
+    this.pluginInvalidation = options?.pluginInvalidation;
+  }
+
+  /** Call after the atomic selection write and after releasing the install lock. */
+  async reconcilePluginComponents(): Promise<void> {
+    await this.retireCrossProcessPluginInstances(true);
+  }
+
+  private componentAllowed(
+    name: string,
+    info?: MCPServerInfo,
+    policy = this.componentPolicy
+  ): boolean {
+    if (this.pluginInvalidation?.readComponentPolicy === undefined) return true;
+    return isPluginMcpServerAllowed(this.managedPluginServers.get(name) ?? info?.plugin, policy);
+  }
+
+  private async readComponentPolicy(): Promise<PluginMcpPolicy | undefined> {
+    const read = this.pluginInvalidation?.readComponentPolicy;
+    if (read === undefined) return undefined;
+    try {
+      const result = await raceWithAbortAndTimeout(read(), { timeoutMs: CALL_GATE_TIMEOUT_MS });
+      if (result.kind === "ok") return result.value;
+    } catch (error) {
+      log.debug("MCP component policy unavailable", { error });
+    }
+    return { registryPath: this.componentPolicy?.registryPath ?? "", imports: null, consent: null };
+  }
+
+  private async withPluginAdmissionFence<T>(
+    name: string,
+    info: MCPServerInfo | undefined,
+    dispatch: () => T,
+    options: { signal?: AbortSignal; timeoutMs?: number; workspaceId?: string } = {}
+  ): Promise<{ pending: T }> {
+    const deadlineAt = Date.now() + (options.timeoutMs ?? CALL_GATE_TIMEOUT_MS);
+    // A named connection test is an explicit user action, not workspace admission.
+    const release =
+      options.workspaceId === undefined
+        ? await this.acquireComponentPolicyFence(name, info, options)
+        : await this.acquirePluginAdmissionFence(name, info, options);
+    try {
+      if (options.signal?.aborted) throw new Error(`MCP request for '${name}' was aborted`);
+      if (Date.now() >= deadlineAt)
+        throw new Error(`MCP server '${name}' is unavailable: admission timed out`);
+      const pending = dispatch();
+      // Observe early rejection while admission locks are being released.
+      Promise.resolve(pending).catch(() => undefined);
+      return { pending };
+    } finally {
+      await release();
+    }
+  }
+
+  private async acquirePluginAdmissionFence(
+    name: string,
+    info: MCPServerInfo | undefined,
+    options: { signal?: AbortSignal; timeoutMs?: number; workspaceId?: string }
+  ): Promise<() => Promise<void>> {
+    const deadlineAt = Date.now() + (options.timeoutMs ?? CALL_GATE_TIMEOUT_MS);
+    const remainingMs = () => Math.max(0, deadlineAt - Date.now());
+    const workspaceId = options.workspaceId;
+    const plugin =
+      info?.plugin ??
+      (workspaceId !== undefined
+        ? this.workspaceServers.get(workspaceId)?.enabledServers[name]?.plugin
+        : undefined);
+    // Without explicit workspace consent, every global-plugin admission must
+    // establish current global consent, including startup without a cached entry.
+    const requiresGlobalConsent =
+      plugin?.sourceScope === "global" &&
+      !(
+        workspaceId !== undefined &&
+        this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides?.enabledServers?.includes(name)
+      );
+    const releaseGlobal = requiresGlobalConsent
+      ? await this.configService.acquireGlobalPluginEnablementFence(name, {
+          signal: options.signal,
+          timeoutMs: remainingMs(),
+        })
+      : undefined;
+    try {
+      // Global consent is locked before the component try-lock. Uninstall can
+      // hold the component writer lock while pruning global consent, so this
+      // inner acquisition must remain non-blocking to avoid an inverted wait.
+      const release = await this.acquireComponentPolicyFence(name, info, {
+        signal: options.signal,
+        timeoutMs: remainingMs(),
+      });
+      return async () => {
+        try {
+          await release();
+        } finally {
+          await releaseGlobal?.();
+        }
+      };
+    } catch (error) {
+      await releaseGlobal?.();
+      throw error;
+    }
+  }
+
+  private async acquireComponentPolicyFence(
+    name: string,
+    info: MCPServerInfo | undefined,
+    options: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<() => Promise<void>> {
+    // Ownership comes from the served provenance, never an unfenced policy read:
+    // a missing registry row must not turn a managed client into a legacy one.
+    const plugin = this.managedPluginServers.get(name) ?? info?.plugin;
+    if (plugin?.componentPolicy === undefined) return () => Promise.resolve();
+    const read = this.pluginInvalidation?.readComponentPolicy;
+    const acquire = this.pluginInvalidation?.tryAcquireComponentPolicyLock;
+    const unavailable = () =>
+      new Error(
+        `MCP server '${name}' is unavailable while plugin components are being updated; retry`
+      );
+    if (read === undefined || acquire === undefined) throw unavailable();
+    const deadlineAt = Date.now() + (options.timeoutMs ?? CALL_GATE_TIMEOUT_MS);
+    const checkActive = () => {
+      if (options.signal?.aborted) throw new Error(`MCP request for '${name}' was aborted`);
+      if (Date.now() >= deadlineAt) throw unavailable();
+    };
+    const bounded = async <V>(work: Promise<V>): Promise<V> => {
+      // A pre-aborted race does not subscribe to work; still observe late rejection.
+      work.catch(() => undefined);
+      const result = await raceWithAbortAndTimeout(work, {
+        timeoutMs: Math.max(0, deadlineAt - Date.now()),
+        signal: options.signal,
+      });
+      checkActive();
+      if (result.kind !== "ok") throw unavailable();
+      return result.value;
+    };
+    checkActive();
+    // Overrides are locked first. Uninstall takes the plugin lock and then prunes
+    // overrides, so waiting here would deadlock. A contended try-lock fails closed
+    // and lets the outer finally release overrides; no admission retry loop.
+    // Sibling admissions of this manager share one hold (see the share field).
+    const acquisition = this.acquireSharedComponentPolicyLock(acquire);
+    let release: () => Promise<void>;
+    try {
+      release = await bounded(acquisition);
+    } catch {
+      acquisition.then((lateRelease) => lateRelease()).catch(() => undefined);
+      checkActive();
+      throw unavailable();
+    }
+    try {
+      // Atomic rename alone is insufficient: readFile may still own the old inode.
+      // Acquire BEFORE opening policy; the caller releases after admission.
+      checkActive();
+      const policy = await bounded(read());
+      checkActive();
+      if (!this.componentAllowed(name, info, policy))
+        throw new Error(`MCP server '${name}' is disabled by component policy`);
+      return release;
+    } catch (error) {
+      await release();
+      throw error;
+    }
+  }
+
+  /**
+   * Share one component-policy writer-lock hold across overlapping admissions
+   * of this manager (#4513). The injected try-lock is the installer's mutation
+   * lock, exclusive even within one process, but admissions only READ policy:
+   * sibling launches started concurrently by one serve must not fence each
+   * other out. The first admission try-locks; overlapping admissions join that
+   * same attempt (and its failure), and the last holder releases the lock.
+   * Plugin install/update/uninstall still take the lock exclusively, so they
+   * exclude, and are excluded by, every sharer. Admissions hold it only through
+   * launch initiation, so joiners cannot pin it indefinitely.
+   *
+   * No caller signal reaches the shared attempt: one caller's abort must not
+   * fail its joiners. Callers bound their own wait (see `bounded`).
+   */
+  private acquireSharedComponentPolicyLock(
+    tryAcquire: (options: { signal?: AbortSignal }) => Promise<() => Promise<void>>
+  ): Promise<() => Promise<void>> {
+    let share = this.componentPolicyLockShare;
+    if (share === undefined) {
+      // Wait for the previous share's release: a try-lock racing it would read
+      // this manager's own departing hold as a concurrent plugin update.
+      const acquisition = this.componentPolicyLockReleasing.then(() => tryAcquire({}));
+      const created = { acquisition, holders: 0 };
+      share = created;
+      this.componentPolicyLockShare = created;
+      acquisition.catch(() => {
+        if (this.componentPolicyLockShare === created) this.componentPolicyLockShare = undefined;
+      });
+    }
+    const joined = share;
+    joined.holders++;
+    return joined.acquisition.then((release) => {
+      let released = false;
+      return async () => {
+        if (released) return;
+        released = true;
+        joined.holders--;
+        assert(joined.holders >= 0, "component policy lock share released more than acquired");
+        if (joined.holders > 0) return;
+        if (this.componentPolicyLockShare === joined) this.componentPolicyLockShare = undefined;
+        const releasing = release();
+        this.componentPolicyLockReleasing = releasing.catch(() => undefined);
+        await releasing;
+      };
+    });
+  }
+
+  private async refreshComponentPolicy(): Promise<Error | undefined> {
+    let cleanupError: Error | undefined;
+    const previous = this.componentPolicy;
+    const policy = await this.readComponentPolicy();
+    if (JSON.stringify(policy) !== JSON.stringify(this.componentPolicy)) {
+      this.componentPolicy = policy;
+      this.componentPolicyRevision++;
+    }
+    for (const [workspaceId, entry] of this.workspaceServers) {
+      const readded = [...this.managedPluginServers.keys()].filter(
+        (name) =>
+          !this.componentAllowed(name, undefined, previous) &&
+          this.componentAllowed(name) &&
+          !entry.instances.has(name) &&
+          Object.hasOwn(JSON.parse(entry.configSignature) as object, name)
+      );
+      this.markServersForRetry(entry, readded);
+      const denied = new Set(
+        [...entry.enabledServerNames, ...entry.instances.keys()].filter(
+          (name) => !this.componentAllowed(name, entry.enabledServers[name])
+        )
+      );
+      for (const name of denied) {
+        entry.enabledServerNames.delete(name);
+        delete entry.enabledServers[name];
+        entry.retryingTimedOutServerNames?.delete(name);
+      }
+      entry.timedOutServerNames =
+        entry.timedOutServerNames?.filter((name) => this.componentAllowed(name)) ?? [];
+      entry.stats = this.createWorkspaceStats(
+        entry.enabledServerNames.size,
+        new Map([...entry.instances].filter(([name]) => entry.enabledServerNames.has(name))),
+        entry.stats.failedServerNames.filter((name) => this.componentAllowed(name))
+      );
+      for (const name of denied) {
+        const instance = entry.instances.get(name);
+        if (!instance) continue;
+        entry.instances.delete(name);
+        (entry.retiredPluginInstances ??= new Set()).add(instance);
+      }
+      // Keep admitted leased calls alive without letting a readd overwrite
+      // their retired client. Only active instances participate in retention.
+      if (this.getLeaseCount(workspaceId) > 0) continue;
+      const retired = entry.retiredPluginInstances;
+      for (const instance of retired ?? []) {
+        try {
+          await instance.close();
+          retired?.delete(instance);
+        } catch (error) {
+          cleanupError ??= error instanceof Error ? error : new Error(getErrorMessage(error));
+          log.warn("Failed to close removed plugin component", { name: instance.name, error });
+        }
+      }
+      if (retired?.size === 0) delete entry.retiredPluginInstances;
+    }
+    return cleanupError;
+  }
+
+  /**
+   * Retire cached plugin instances when a SIBLING process mutated a plugin
+   * (see MCPServerManagerOptions.pluginInvalidation). Runs before every
+   * serve; must precede the caller's prefixInvalidationClock snapshot so
+   * in-flight startups integrate with the existing invalidation machinery.
+   * The first read only records the token: no plugin instance can predate it
+   * because this method guards every serve path.
+   */
+  private async retireCrossProcessPluginInstances(reportCleanupErrors = false): Promise<void> {
+    const invalidation = this.pluginInvalidation;
+    if (invalidation === undefined) {
+      return;
+    }
+    // Serialize the whole check+sweep AND publish the observed token only
+    // AFTER the sweep finishes: a concurrent serve that merely compared the
+    // token could otherwise observe it as handled while the sweep is still
+    // closing instances sequentially, and return a server running from the
+    // replaced tree. Queued serves wait for the in-flight sweep, then see the
+    // published token and proceed; a failed sweep leaves the token
+    // unpublished so the next serve retries it.
+    let cleanupError: Error | undefined;
+    const run = async (): Promise<void> => {
+      if (invalidation.readComponentPolicy !== undefined)
+        cleanupError = await this.refreshComponentPolicy();
+      const [token, overridesEpoch] = await Promise.all([
+        invalidation.readToken(),
+        invalidation.readOverridesEpoch?.(),
+      ]);
+      if (!this.pluginInvalidationTokenSeen) {
+        this.pluginInvalidationTokenSeen = true;
+        this.lastPluginInvalidationToken = token;
+        this.lastOverridesEpochToken = overridesEpoch;
+        // Cache state can predate the first token observation (in-process
+        // publications for never-served workspaces), and a sibling's write may
+        // already have superseded it: nothing vouches for that state relative
+        // to the accepted baseline, so evict it and let serves re-read disk.
+        if (
+          invalidation.readOverridesEpoch !== undefined &&
+          (this.latestWorkspaceOverrides.size > 0 || this.lastWorkspaceRequestOptions.size > 0)
+        ) {
+          this.forgetAllWorkspaceOverrides();
+        }
+        return;
+      }
+      if (
+        overridesEpoch !== this.lastOverridesEpochToken ||
+        isWorkspaceOverridesEpochUnreadable(overridesEpoch)
+      ) {
+        // A sibling process wrote workspace overrides: our caches were never
+        // notified. Evict every snapshot (invalidation markers) and let each
+        // workspace re-read disk lazily on its next serve — an eager re-read
+        // here would cost one full config enumeration per cached workspace
+        // while every other serve waits on this queue. An UNREADABLE epoch
+        // counts as changed on every observation: nothing can prove it did
+        // not change, so nothing cached may be trusted while it persists.
+        log.info(
+          "[MCP] Cross-process workspace override write detected; evicting cached overrides"
+        );
+        this.forgetAllWorkspaceOverrides();
+        this.lastOverridesEpochToken = overridesEpoch;
+      }
+      if (token === this.lastPluginInvalidationToken) {
+        return;
+      }
+      log.info("[MCP] Cross-process plugin mutation detected; recycling plugin servers");
+      // A sibling's uninstall also PRUNED plugin keys from workspace override
+      // files on disk. Disk is authoritative after a cross-process mutation
+      // (every override write persists before publishing), so refresh every
+      // cached override snapshot from it — BOTH caches: a stale
+      // latestWorkspaceOverrides entry would shadow the pruned disk state on
+      // the next serve, and a stale lastWorkspaceRequestOptions entry would
+      // feed a pre-prune enable into getPrompt()'s refresh, starting a
+      // same-name reinstall's replacement server without new consent.
+      await this.refreshCachedOverridesFromDisk();
+      await this.stopServersWithKeyPrefix(invalidation.keyPrefix);
+      this.lastPluginInvalidationToken = token;
+    };
+    const next = this.pluginInvalidationQueue.then(run, run);
+    this.pluginInvalidationQueue = next.catch(() => undefined);
+    // Explicit saves report cleanup failures only after publishing policy/epoch work.
+    // Automatic MCP boundaries keep retained clients usable and retry retired clients later.
+    if (reportCleanupErrors) {
+      await next;
+      if (cleanupError !== undefined) throw cleanupError;
+    }
+    return next;
+  }
+
+  /**
+   * Workspaces whose cached AND recorded override snapshots were invalidated by
+   * forgetWorkspaceOverrides, keyed to an invalidation generation. A disk read
+   * retires only the generation it observed before starting, so a newer
+   * invalidation landing mid-read is never acknowledged by the older result.
+   */
+  private readonly overridesInvalidationGenerations = new Map<string, number>();
+  private overridesInvalidationClock = 0;
+  /**
+   * Bumped by forgetAllWorkspaceOverrides: a cold serve (present in neither
+   * map yet) cannot be named by a global eviction, so its first read compares
+   * this clock instead and fails closed when an eviction landed mid-read.
+   */
+  private globalOverridesEvictionGeneration = 0;
+
+  /** Remove only Agent Plugin keys when disk-authoritative overrides cannot be read. */
+  private scrubPluginOverrideKeys(
+    overrides: WorkspaceMCPOverrides | undefined
+  ): WorkspaceMCPOverrides | undefined {
+    if (overrides === undefined) {
+      return undefined;
+    }
+    const prefix = this.pluginInvalidation?.keyPrefix;
+    if (prefix === undefined) {
+      return overrides;
+    }
+    return {
+      ...overrides,
+      ...(overrides.enabledServers !== undefined
+        ? { enabledServers: overrides.enabledServers.filter((key) => !key.startsWith(prefix)) }
+        : {}),
+      ...(overrides.disabledServers !== undefined
+        ? { disabledServers: overrides.disabledServers.filter((key) => !key.startsWith(prefix)) }
+        : {}),
+      ...(overrides.toolAllowlist !== undefined
+        ? {
+            toolAllowlist: Object.fromEntries(
+              Object.entries(overrides.toolAllowlist).filter(([key]) => !key.startsWith(prefix))
+            ),
+          }
+        : {}),
+    };
+  }
+
+  /**
+   * Reload cached workspace override snapshots from disk after a sibling
+   * process's plugin mutation. When disk state cannot be read (no reader
+   * wired, read failure), scrub only plugin keys from both caches instead of
+   * deleting recorded request options: getPrompt's local fallback must not
+   * resurrect a stale plugin enable, while unrelated MCP settings remain
+   * usable. Off-host workspaces (SSH/devcontainer) are skipped: plugin servers
+   * are never offered there, and reading their override files would exec
+   * remotely inside the serialized sweep.
+   */
+  private async refreshCachedOverridesFromDisk(): Promise<void> {
+    const readOverrides = this.pluginInvalidation?.readWorkspaceOverrides;
+    for (const [workspaceId, recorded] of [...this.lastWorkspaceRequestOptions]) {
+      const execsOffHost =
+        recorded.runtime instanceof RemoteRuntime ||
+        recorded.runtime instanceof DevcontainerRuntime;
+      if (execsOffHost) {
+        continue;
+      }
+      let fresh: WorkspaceMCPOverrides | undefined;
+      let readFailed = readOverrides === undefined;
+      // A forget landing while the read below is in flight makes its result
+      // pre-change state (same hazard as loadFirstServeWorkspaceOverrides).
+      const generationBefore = this.overridesInvalidationGenerations.get(workspaceId);
+      if (readOverrides !== undefined) {
+        try {
+          fresh = await readOverrides(workspaceId);
+          // Non-authoritative read: keep the scrub fallback, not a guess.
+          if (fresh === undefined) readFailed = true;
+        } catch (error) {
+          readFailed = true;
+          log.warn("[MCP] Failed to reload workspace overrides after sibling plugin mutation", {
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        }
+      }
+      const latest = this.lastWorkspaceRequestOptions.get(workspaceId);
+      if (latest !== recorded) {
+        // An authoritative publication (or a serve) replaced the recorded
+        // options while the read was in flight: it is newer than both the
+        // snapshot and whatever disk state this read observed, so committing
+        // the read would restore pre-publication enablement over it. Keep the
+        // newer state; only scrub plugin keys from it (a publication carries
+        // disk truth, which the sibling's prune already cleaned, so this is a
+        // no-op for it — a serve's stale caller snapshot loses them).
+        if (latest !== undefined) {
+          this.lastWorkspaceRequestOptions.set(workspaceId, {
+            ...latest,
+            overrides: this.scrubPluginOverrideKeys(latest.overrides),
+          });
+          if (this.latestWorkspaceOverrides.has(workspaceId)) {
+            this.latestWorkspaceOverrides.set(
+              workspaceId,
+              this.scrubPluginOverrideKeys(this.latestWorkspaceOverrides.get(workspaceId))
+            );
+          }
+          this.bumpWorkspaceOptionsMutationCount(workspaceId);
+        }
+        continue;
+      }
+      const authoritative = readFailed ? this.scrubPluginOverrideKeys(recorded.overrides) : fresh;
+      const supersededMidRead =
+        this.overridesInvalidationGenerations.get(workspaceId) !== generationBefore;
+      if (
+        this.overridesInvalidationGenerations.has(workspaceId) &&
+        (readFailed || supersededMidRead)
+      ) {
+        // The recorded snapshot of an invalidated workspace is exactly what is
+        // being distrusted (and a value read before a mid-read forget is no
+        // better): scrub it, but do not repopulate the overlay cache from it —
+        // that would bypass the pending disk re-read. The marker stays live.
+        this.latestWorkspaceOverrides.delete(workspaceId);
+      } else {
+        // Either disk was read authoritatively with no forget in between (the
+        // cache now holds disk truth, so retire any marker), or there was no
+        // invalidation to retire in the first place.
+        this.latestWorkspaceOverrides.set(workspaceId, authoritative);
+        this.overridesInvalidationGenerations.delete(workspaceId);
+      }
+      this.lastWorkspaceRequestOptions.set(workspaceId, {
+        ...recorded,
+        overrides: authoritative,
+      });
+      // In-flight prompt refresh loops must re-run against the new state.
+      this.bumpWorkspaceOptionsMutationCount(workspaceId);
+    }
+    // Entries without recorded options carry no runtime/identity to reload;
+    // scrub their plugin keys in place so stale caller snapshots cannot win.
+    for (const [workspaceId, overrides] of [...this.latestWorkspaceOverrides]) {
+      if (!this.lastWorkspaceRequestOptions.has(workspaceId)) {
+        this.latestWorkspaceOverrides.set(workspaceId, this.scrubPluginOverrideKeys(overrides));
+        this.bumpWorkspaceOptionsMutationCount(workspaceId);
+      }
+    }
+  }
+
+  /**
+   * Authoritative overrides for a workspace's FIRST serve on this manager.
+   * The caller's snapshot may have been read from disk BEFORE a sibling
+   * process's uninstall + same-name reinstall pruned its plugin keys, and
+   * the epoch bracket cannot catch that staleness here: a cold manager's
+   * first token observation records the already-advanced token, and later
+   * sweeps refresh only workspaces with recorded options — a never-served
+   * workspace has none. Disk is authoritative (every override write
+   * persists before publishing), so read it now; when it cannot be read,
+   * scrub plugin keys from the caller snapshot so a stale enable can never
+   * override a replacement server's default-disabled state — and under
+   * cross-process override-epoch tracking, fail the serve closed, since the
+   * same staleness applies to ordinary servers (offered on every runtime,
+   * so off-host workspaces read too, at the cost of one remote exec per
+   * cold serve).
+   */
+  private async loadFirstServeWorkspaceOverrides(
+    requestOptions: MCPWorkspaceRequestOptions,
+    /** Re-read disk even though recorded options exist (see ensureWorkspaceServers). */
+    revalidate = false,
+    readSignal?: AbortSignal
+  ): Promise<{
+    overrides: WorkspaceMCPOverrides | undefined;
+    /**
+     * True when this serve belongs to an invalidated workspace whose overrides
+     * could not be re-read authoritatively: MCP dispatch for THIS serve fails
+     * CLOSED (no servers). The recorded snapshot predates the change that
+     * triggered the invalidation, so serving from it could keep a just-revoked
+     * server running. Per-serve by construction — concurrent serves of one
+     * workspace must not observe each other's availability.
+     */
+    unavailable: boolean;
+    /** Generations observed before the read; callers recheck them after resuming. */
+    observed: { workspace: number | undefined; global: number };
+    /**
+     * Invalidation generation this (authoritative, un-superseded) read
+     * satisfies. NOT retired here: the caller retires it in the same
+     * synchronous block that records the fresh options, so an overlapping
+     * serve can never find the marker gone while stale options are still the
+     * recorded ones.
+     */
+    satisfiesInvalidation?: number;
+    /**
+     * True when `overrides` is a fresh, un-superseded disk read. The caller
+     * records it as authoritative regardless of what the request claimed:
+     * leaving a repaired snapshot marked non-authoritative would make every
+     * later serve re-enter this read (remote probes on SSH/devcontainer).
+     * getPrompt alone distrusts the recorded options on purpose, once per
+     * dispatch (see promptDispatchOptions).
+     */
+    fromDisk: boolean;
+  }> {
+    const { workspaceId } = requestOptions;
+    const invalidationGeneration = this.overridesInvalidationGenerations.get(workspaceId);
+    const observed = {
+      workspace: invalidationGeneration,
+      global: this.globalOverridesEvictionGeneration,
+    };
+    const invalidated = invalidationGeneration !== undefined;
+    // A caller snapshot that is not authoritative (see overridesAuthoritative)
+    // is distrusted exactly like an invalidated recorded one: disk must vouch
+    // for the enablement or the serve fails closed.
+    const distrusted = invalidated || requestOptions.overridesAuthoritative === false || revalidate;
+    if (
+      this.pluginInvalidation === undefined ||
+      (this.lastWorkspaceRequestOptions.has(workspaceId) && !distrusted)
+    ) {
+      return {
+        overrides: requestOptions.overrides,
+        unavailable: this.pluginInvalidation === undefined && distrusted,
+        observed,
+        fromDisk: false,
+      };
+    }
+    // Every runtime re-reads disk here, off-host (SSH/devcontainer) included:
+    // besides guarding plugin keys (never offered off-host), this read is what
+    // vouches for a COLD serve relative to the override epoch baseline
+    // retireCrossProcessPluginInstances just accepted. The caller's snapshot
+    // may predate a sibling process's write that landed before our first
+    // epoch observation — there was no cache to evict, the snapshot claims
+    // authority, and the postflight sees an unchanged token — so ordinary
+    // remote servers revoked by that sibling would otherwise serve this turn.
+    // Reading after the baseline observation bounds the state to it.
+    const readOverrides = this.pluginInvalidation.readWorkspaceOverrides;
+    if (readOverrides !== undefined) {
+      try {
+        // Bounded by what remains of the caller's read budget (its own
+        // read was already bounded; see overridesReadDeadlineAt), else by the
+        // reader's default deadline, and cancelled with the caller's turn: a
+        // mandatory second read must not wait for a remote parent's command
+        // timeout (a timed-out/aborted read is `undefined` → fail closed).
+        const remainingMs =
+          requestOptions.overridesReadDeadlineAt === undefined
+            ? undefined
+            : Math.max(0, requestOptions.overridesReadDeadlineAt - Date.now());
+        const fresh =
+          remainingMs === 0
+            ? undefined
+            : await readOverrides(workspaceId, {
+                ...(remainingMs !== undefined ? { timeoutMs: remainingMs } : {}),
+                ...(readSignal !== undefined ? { signal: readSignal } : {}),
+              });
+        if (fresh !== undefined) {
+          // Compare even when no invalidation existed before the read: a
+          // forget that STARTED during a cold serve's read is just as
+          // superseding as one that advanced an existing generation.
+          const superseded =
+            this.overridesInvalidationGenerations.get(workspaceId) !== invalidationGeneration ||
+            this.globalOverridesEvictionGeneration !== observed.global;
+          if (superseded) {
+            // A forget landed while this read was in flight: the value read is
+            // pre-change state. It must neither retire the newer invalidation
+            // nor be served — fail closed for this serve, and make sure a
+            // marker exists so the NEXT serve re-reads (a global eviction
+            // alone leaves none for a cold workspace, yet this serve is about
+            // to record the stale snapshot as its options).
+            log.warn(
+              "[MCP] Workspace overrides read superseded by a newer invalidation; disabling MCP for this serve",
+              { workspaceId }
+            );
+            if (!this.overridesInvalidationGenerations.has(workspaceId)) {
+              this.markOverridesInvalidated(workspaceId);
+            }
+            return {
+              overrides: this.scrubPluginOverrideKeys(fresh),
+              unavailable: true,
+              observed,
+              fromDisk: false,
+            };
+          }
+          return {
+            overrides: fresh,
+            unavailable: false,
+            observed,
+            fromDisk: true,
+            ...(invalidated ? { satisfiesInvalidation: invalidationGeneration } : {}),
+          };
+        }
+      } catch (error) {
+        log.warn("[MCP] Failed to load workspace overrides for a first serve", {
+          workspaceId: requestOptions.workspaceId,
+          error: getErrorMessage(error),
+        });
+      }
+    }
+    // Fail closed when the snapshot is exactly what is being distrusted, and
+    // likewise for a cold serve under cross-process epoch tracking: the
+    // snapshot's authority is only relative to the caller's read, which the
+    // accepted epoch baseline cannot vouch for (see above). Without a reader
+    // (or epoch tracking) there is nothing more to establish; serve it.
+    const unavailable = distrusted || this.pluginInvalidation.readOverridesEpoch !== undefined;
+    if (unavailable) {
+      log.warn(
+        "[MCP] Workspace overrides could not be established authoritatively; disabling MCP for this serve",
+        { workspaceId, invalidated }
+      );
+    }
+    return {
+      overrides: this.scrubPluginOverrideKeys(requestOptions.overrides),
+      unavailable,
+      observed,
+      fromDisk: false,
+    };
   }
 
   /**
@@ -1135,29 +2582,77 @@ export class MCPServerManager {
     this.eraVerdicts.set(key, { prior, cachedAtMs: Date.now() });
   }
 
-  private async refreshModernInstanceTools(
-    instances: Map<string, MCPServerInstance>
-  ): Promise<void> {
-    await Promise.all(
-      [...instances.values()].map(async (instance) => {
-        if (instance.isClosed || !instance.refreshTools) return;
-        try {
-          await instance.refreshTools();
-        } catch (error) {
-          log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
-            name: instance.name,
-            error: getErrorMessage(error),
-          });
-        }
+  /**
+   * Send-path tool freshness is stale-while-revalidate, like prompts below.
+   * Every cached instance already holds the catalog fetched at startup, and a
+   * blocking tools/list to every modern server on every turn cost hundreds of
+   * milliseconds per turn on real setups (and up to the SDK timeout when one
+   * server hangs). The turn serves the held catalog; the refresh routes
+   * through the SDK's SEP-2549 response cache, so a still-fresh list costs no
+   * round trip, a stale one (ttlMs elapsed or evicted by
+   * notifications/tools/list_changed) refetches here and lands for the next
+   * turn. Deduped per instance so stacked turns cannot pile up requests on a
+   * slow server; only servers still enabled after the concurrent-mutation
+   * repair are queried because a detached refresh cannot be cancelled.
+   */
+  private refreshInstanceToolsInBackground(entry: WorkspaceServers): void {
+    for (const [serverName, instance] of entry.instances) {
+      if (!entry.enabledServerNames.has(serverName)) continue;
+      if (instance.isClosed || !instance.refreshTools) continue;
+      if (this.toolRefreshesInFlight.has(instance)) continue;
+      log.debug("[MCP] Serving cached tool catalog; refreshing in background", {
+        name: instance.name,
+        toolCount: Object.keys(instance.tools).length,
+      });
+      void this.refreshInstanceTools(instance);
+    }
+  }
+
+  /**
+   * One deduped tools/list refresh of a modern-era instance; never rejects (a failed refresh
+   * keeps the cached tools). Resolves false when the refresh failed. Legacy instances have no
+   * refresh and resolve true at once (tools/list_changed re-lists them).
+   */
+  private refreshInstanceTools(instance: MCPServerInstance): Promise<boolean> {
+    const inFlight = this.toolRefreshesInFlight.get(instance);
+    if (inFlight !== undefined) return inFlight;
+    if (instance.isClosed || !instance.refreshTools) return Promise.resolve(true);
+    const previousToolCount = Object.keys(instance.tools).length;
+    const refresh = instance
+      .refreshTools()
+      .then(() => {
+        // Counts per refetch show whether a remote server's tool list drifts between
+        // fetches (which used to change the tool_catalog_search overview).
+        log.debug("[MCP] Refreshed tool catalog", {
+          name: instance.name,
+          previousToolCount,
+          toolCount: Object.keys(instance.tools).length,
+        });
+        return true;
       })
-    );
+      .catch((error: unknown) => {
+        log.debug("[MCP] Tool list refresh failed; keeping cached tools", {
+          name: instance.name,
+          error: getErrorMessage(error),
+        });
+        return false;
+      })
+      .finally(() => {
+        if (this.toolRefreshesInFlight.get(instance) === refresh) {
+          this.toolRefreshesInFlight.delete(instance);
+        }
+      });
+    this.toolRefreshesInFlight.set(instance, refresh);
+    return refresh;
   }
 
   /**
    * Send-path prompt freshness is stale-while-revalidate: prompts/list can
-   * hang for its full timeout on servers that ignore prompt requests, and a
-   * message send must never wait on it. Streams serve the cached catalog and
-   * the refreshed one lands for the next stream.
+   * hang for its full timeout on servers that ignore prompt requests, so a
+   * send does not wait on a refresh of a listed catalog. Streams serve the
+   * cached catalog and the refreshed one lands for the next stream. The one
+   * exception is an instance that never listed: the send waits for its first
+   * list, bounded and abortable (see awaitFirstPromptLists).
    */
   private refreshInstancePromptsInBackground(entry: WorkspaceServers): void {
     if (entry.promptRefreshInFlight !== undefined) {
@@ -1169,6 +2664,41 @@ export class MCPServerManager {
       }
     });
     entry.promptRefreshInFlight = refresh;
+  }
+
+  /**
+   * Give servers restarted after an idle stop the catalog they had before it
+   * (see idleStoppedPromptCatalogs). Only under the identical start config:
+   * any config change (server added, removed, edited, signed in) starts
+   * empty as before. The awaited refresh still replaces the seed on success.
+   */
+  private seedPromptsFromIdleStop(
+    workspaceId: string,
+    configSignature: string,
+    instances: Map<string, MCPServerInstance>
+  ): void {
+    const saved = this.idleStoppedPromptCatalogs.get(workspaceId);
+    if (saved === undefined) return;
+    this.idleStoppedPromptCatalogs.delete(workspaceId);
+    if (saved.configSignature !== configSignature) return;
+    for (const [serverName, instance] of instances) {
+      const prompts = saved.prompts.get(serverName);
+      if (prompts !== undefined && instance.prompts.length === 0) {
+        instance.prompts = prompts;
+        // A restored catalog is a stale value: serve it while revalidating. A catalog that was
+        // never listed (warmed, then stopped idle) stays unlisted.
+        this.restorePromptListSettled(instance, saved.listedServerNames.has(serverName));
+      }
+    }
+  }
+
+  /** A replaced plugin tree can serve other prompts under the same start config. */
+  private forgetIdleStoppedPrompts(serverKeyPrefix: string): void {
+    for (const saved of this.idleStoppedPromptCatalogs.values()) {
+      for (const serverName of [...saved.prompts.keys()]) {
+        if (serverName.startsWith(serverKeyPrefix)) saved.prompts.delete(serverName);
+      }
+    }
   }
 
   private async refreshInstancePrompts(
@@ -1199,9 +2729,89 @@ export class MCPServerManager {
             name: instance.name,
             error: getErrorMessage(error),
           });
+        } finally {
+          this.markPromptListSettled(instance, signal);
         }
       })
     );
+  }
+
+  private markPromptListSettled(instance: MCPServerInstance, signal: AbortSignal | undefined) {
+    // A canceled list says nothing about the server: the next send still waits for one.
+    if (signal?.aborted !== true) this.promptListSettledInstances.add(instance);
+  }
+
+  private restorePromptListSettled(instance: MCPServerInstance, listed: boolean): void {
+    if (listed) this.promptListSettledInstances.add(instance);
+  }
+
+  /** Whether a served instance of the workspace never settled a prompts/list. */
+  private hasUnlistedPromptInstances(workspaceId: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    return (
+      entry !== undefined &&
+      [...this.promptEligibleInstances(entry).values()].some(
+        (instance) => !this.promptListSettledInstances.has(instance)
+      )
+    );
+  }
+
+  /**
+   * Wait for the first prompts/list of the workspace's served instances. Returns true when the
+   * serve that just ran used a catalog that was never listed (`unlistedAtServe`, or found now),
+   * so the caller must serve again, unless `signal` (the send's Stop) aborted.
+   *
+   * Sends serve a cached entry's prompts stale-while-revalidate. An entry started without a
+   * prompt list (an MCP App entry point warm-up, a prompt dispatch) has an empty catalog, which
+   * is no value rather than a stale one. The first send after a Xum restart then had no
+   * mcp_prompt_get and the next one had it, and that tools change made Anthropic reject the
+   * replayed thinking blocks. A server whose list failed is not waited for again.
+   */
+  private async awaitFirstPromptLists(
+    workspaceId: string,
+    unlistedAtServe: boolean,
+    signal: AbortSignal | undefined
+  ): Promise<boolean> {
+    // The serve's own background refresh can settle before this check runs.
+    if (!unlistedAtServe && !this.hasUnlistedPromptInstances(workspaceId)) return false;
+    // A deadline, not a round count: overlapping warm-ups can keep adding unlisted instances
+    // (#6599). Stop ends the wait too.
+    const deadline = Date.now() + FIRST_PROMPT_LIST_WAIT_MS;
+    const attempted = new Set<MCPServerInstance>();
+    for (
+      let round = this.joinFirstPromptListRound(workspaceId, attempted, deadline);
+      round !== undefined;
+      round = this.joinFirstPromptListRound(workspaceId, attempted, deadline)
+    ) {
+      const timeoutMs = deadline - Date.now();
+      if ((await raceWithAbortAndTimeout(round, { signal, timeoutMs })).kind === "aborted") break;
+    }
+    // A stopped send needs no second serve.
+    return signal?.aborted !== true;
+  }
+
+  /**
+   * Share the entry's deduped background refresh with every concurrent send, and return it, or
+   * undefined when no instance is left to wait for or `deadline` passed. A refresh that was
+   * already in flight covers only the instances it started with, so the next round lists an
+   * instance added since then. An instance that a refresh this send started did not list (it
+   * closed or cannot list) is not waited for again, so rounds cannot spin.
+   */
+  private joinFirstPromptListRound(
+    workspaceId: string,
+    attempted: Set<MCPServerInstance>,
+    deadline: number
+  ): Promise<void> | undefined {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined || Date.now() >= deadline) return undefined;
+    const eligible = [...this.promptEligibleInstances(entry).values()];
+    const waiting = eligible.filter((instance) => !this.promptListSettledInstances.has(instance));
+    if (waiting.every((instance) => attempted.has(instance))) return undefined;
+    if (entry.promptRefreshInFlight === undefined) {
+      for (const instance of eligible) attempted.add(instance);
+    }
+    this.refreshInstancePromptsInBackground(entry);
+    return entry.promptRefreshInFlight;
   }
 
   /**
@@ -1229,6 +2839,14 @@ export class MCPServerManager {
 
     if (current === 1) {
       this.workspaceLeases.delete(workspaceId);
+      if (this.pluginInvalidation?.readComponentPolicy !== undefined) {
+        this.retireCrossProcessPluginInstances().catch((error: unknown) => {
+          log.warn("Failed to reconcile plugin components after lease release", {
+            workspaceId,
+            error,
+          });
+        });
+      }
       return;
     }
 
@@ -1245,8 +2863,9 @@ export class MCPServerManager {
 
   private cleanupIdleServers(): void {
     const now = Date.now();
+    let retryRetiredComponents = false;
     for (const [workspaceId, entry] of this.workspaceServers) {
-      if (entry.instances.size === 0) continue;
+      if (entry.instances.size === 0 && !entry.retiredPluginInstances?.size) continue;
 
       // Never tear down a workspace's MCP servers while a stream is running.
       if (this.getLeaseCount(workspaceId) > 0) {
@@ -1254,13 +2873,35 @@ export class MCPServerManager {
       }
 
       const idleMs = now - entry.lastActivity;
-      if (idleMs >= IDLE_TIMEOUT_MS) {
+      if (idleMs >= MCP_IDLE_TIMEOUT_MS) {
+        // Do not evict retry ownership while retired clients still fail to close.
+        // Once they close, a later idle sweep resumes normal workspace eviction.
+        if (entry.retiredPluginInstances?.size) {
+          retryRetiredComponents = true;
+          continue;
+        }
         log.info("[MCP] Stopping idle servers", {
           workspaceId,
           idleMinutes: Math.round(idleMs / 60_000),
         });
+        this.idleStoppedPromptCatalogs.set(workspaceId, {
+          configSignature: entry.configSignature,
+          prompts: new Map(
+            [...entry.instances].map(([serverName, instance]) => [serverName, instance.prompts])
+          ),
+          listedServerNames: new Set(
+            [...entry.instances]
+              .filter(([, instance]) => this.promptListSettledInstances.has(instance))
+              .map(([serverName]) => serverName)
+          ),
+        });
         void this.stopServers(workspaceId, { retainRestartOptions: true });
       }
+    }
+    if (retryRetiredComponents) {
+      this.retireCrossProcessPluginInstances().catch((error: unknown) => {
+        log.warn("Failed to retry idle plugin component cleanup", { error });
+      });
     }
   }
 
@@ -1307,12 +2948,91 @@ export class MCPServerManager {
     entry: WorkspaceServers,
     enabledServers: MCPServerMap
   ): string[] {
-    return entry.timedOutServerNames.filter(
-      (serverName) =>
-        enabledServers[serverName] !== undefined &&
-        !entry.instances.has(serverName) &&
-        !entry.retryingTimedOutServerNames.has(serverName)
+    const now = Date.now();
+    return entry.timedOutServerNames.filter((serverName) => {
+      if (
+        !Object.hasOwn(enabledServers, serverName) ||
+        entry.instances.has(serverName) ||
+        entry.retryingTimedOutServerNames.has(serverName)
+      ) {
+        return false;
+      }
+      const retryAfterMs = this.timedOutRetryWaitMs(entry, serverName, now);
+      if (retryAfterMs <= 0) return true;
+      // Info, not debug: this is the only evidence that a turn ran without
+      // the server on purpose rather than the server silently vanishing.
+      log.info("[MCP] Skipping timed-out server retry during backoff", {
+        serverName,
+        retryTimeouts: entry.timedOutRetryBackoff?.get(serverName)?.retryTimeouts,
+        retryAfterMs,
+      });
+      return false;
+    });
+  }
+
+  /** Milliseconds until `serverName` may be retried; 0 when no backoff is pending. */
+  private timedOutRetryWaitMs(entry: WorkspaceServers, serverName: string, now: number): number {
+    const backoff = entry.timedOutRetryBackoff?.get(serverName);
+    if (backoff === undefined) return 0;
+    return Math.max(
+      0,
+      backoff.lastAttemptAtMs + timedOutRetryBackoffMs(backoff.retryTimeouts) - now
     );
+  }
+
+  /**
+   * Backoff state to carry into a same-signature full restart forced by a
+   * closed companion instance. That restart replaces the cache entry, so
+   * without this a backed-off server would be started again at once and
+   * charge another startup timeout every time a companion dies, and one whose
+   * window had already elapsed would restart its schedule from the base
+   * instead of continuing it. `records` keeps every still-enabled, still-down
+   * server's history for the outcome accounting of the new batch; `waiting`
+   * names the ones still inside their window, which stay out of that batch.
+   */
+  private timedOutRetryBackoffToCarry(
+    entry: WorkspaceServers,
+    enabledServers: MCPServerMap
+  ): { records: Map<string, TimedOutRetryBackoff>; waiting: Set<string> } {
+    const records = new Map<string, TimedOutRetryBackoff>();
+    const waiting = new Set<string>();
+    const now = Date.now();
+    for (const [serverName, backoff] of entry.timedOutRetryBackoff ?? []) {
+      if (!Object.hasOwn(enabledServers, serverName) || entry.instances.has(serverName)) continue;
+      records.set(serverName, backoff);
+      if (this.timedOutRetryWaitMs(entry, serverName, now) > 0) waiting.add(serverName);
+    }
+    return { records, waiting };
+  }
+
+  /**
+   * Record startup outcomes for backoff, from the initial start, cached-path
+   * retries, and closed-client restarts alike. A timeout lengthens the wait,
+   * measured from when that server's attempt finished (startups run four at a
+   * time, so a batch can settle long after its first wave timed out); any
+   * other outcome (started, hard failure that leaves the retry list,
+   * plugin-tree invalidation) clears it.
+   */
+  private recordStartupTimeoutOutcomes(
+    entry: WorkspaceServers,
+    attempted: Iterable<string>,
+    timedOutNames: Iterable<string>,
+    timedOutAtMs?: ReadonlyMap<string, number>
+  ): void {
+    const timedOut = new Set(timedOutNames);
+    const now = Date.now();
+    for (const serverName of attempted) {
+      if (!timedOut.has(serverName)) {
+        entry.timedOutRetryBackoff?.delete(serverName);
+        continue;
+      }
+      entry.timedOutRetryBackoff ??= new Map();
+      const previous = entry.timedOutRetryBackoff.get(serverName);
+      entry.timedOutRetryBackoff.set(serverName, {
+        retryTimeouts: (previous?.retryTimeouts ?? 0) + 1,
+        lastAttemptAtMs: timedOutAtMs?.get(serverName) ?? now,
+      });
+    }
   }
 
   /**
@@ -1332,7 +3052,21 @@ export class MCPServerManager {
     for (const [name, command] of Object.entries(this.inlineServers)) {
       inlineAsInfo[name] = { transport: "stdio", command, disabled: false };
     }
-    return { ...configServers, ...inlineAsInfo };
+    const servers = { ...configServers, ...inlineAsInfo };
+    for (const [name, info] of Object.entries(servers)) {
+      const plugin = info.plugin;
+      if (plugin === undefined) continue;
+      // The logical instance prefix includes scope/alias identity. Remember
+      // the installation, so a vanished row cannot expose previously hidden siblings.
+      const instanceKey = name.slice(0, -plugin.serverName.length);
+      const owner = plugin.componentPolicy ?? this.managedPluginInstances.get(instanceKey);
+      if (owner === undefined) continue;
+      this.managedPluginInstances.set(instanceKey, { ...owner });
+      this.managedPluginServers.set(name, { ...plugin, componentPolicy: { ...owner } });
+    }
+    return Object.fromEntries(
+      Object.entries(servers).filter(([name, info]) => this.componentAllowed(name, info))
+    );
   }
 
   /**
@@ -1355,27 +3089,10 @@ export class MCPServerManager {
     trusted = false,
     agentPlugins?: AgentPluginsMcpContext | null
   ): Promise<MCPServerMap> {
+    if (this.pluginInvalidation?.readComponentPolicy !== undefined)
+      await this.retireCrossProcessPluginInstances();
     const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
-    const enabled = this.applyServerOverrides(allServers, overrides);
-    return this.filterServersByPolicy(enabled);
-  }
-
-  /**
-   * Filter servers based on the effective policy (e.g. disallow stdio/remote).
-   */
-  private filterServersByPolicy(servers: MCPServerMap): MCPServerMap {
-    if (!this.policyService?.isEnforced()) {
-      return servers;
-    }
-
-    const filtered: MCPServerMap = {};
-    for (const [name, info] of Object.entries(servers)) {
-      if (this.policyService.isMcpTransportAllowed(info.transport)) {
-        filtered[name] = info;
-      }
-    }
-
-    return filtered;
+    return this.applyServerOverrides(allServers, overrides);
   }
 
   /**
@@ -1395,6 +3112,9 @@ export class MCPServerManager {
 
     const result: MCPServerMap = {};
     for (const [name, info] of Object.entries(servers)) {
+      // Checkout-local overrides can be tracked by an untrusted contributor. They
+      // must not grant access to borrowed credentials without backend user enablement.
+      if (info.transport !== "stdio" && info.managed === "claude-design" && info.disabled) continue;
       // Workspace overrides take precedence
       if (enabledSet.has(name)) {
         // Explicitly enabled at workspace level (overrides project disabled)
@@ -1423,7 +3143,7 @@ export class MCPServerManager {
    *
    * @param serverName - Name of the MCP server (used for allowlist lookup)
    * @param tools - Record of tool name -> Tool (NOT namespaced)
-   * @param projectAllowlist - Optional project-level tool allowlist (from .mux/mcp.jsonc)
+   * @param projectAllowlist - Optional project-level tool allowlist (from .xum/mcp.jsonc)
    * @param workspaceOverrides - Optional workspace MCP overrides containing toolAllowlist
    * @returns Filtered tools record
    */
@@ -1433,24 +3153,15 @@ export class MCPServerManager {
     projectAllowlist?: string[],
     workspaceOverrides?: WorkspaceMCPOverrides
   ): Record<string, Tool> {
-    const workspaceAllowlist = workspaceOverrides?.toolAllowlist?.[serverName];
-
-    // Determine effective allowlist:
-    // - If both exist: intersection (workspace restricts further)
-    // - If only project: use project
-    // - If only workspace: use workspace
-    // - If neither: no filtering
-    let effectiveAllowlist: Set<string> | null = null;
-
-    if (projectAllowlist && projectAllowlist.length > 0 && workspaceAllowlist) {
-      // Intersection of both allowlists
-      const projectSet = new Set(projectAllowlist);
-      effectiveAllowlist = new Set(workspaceAllowlist.filter((t) => projectSet.has(t)));
-    } else if (projectAllowlist && projectAllowlist.length > 0) {
-      effectiveAllowlist = new Set(projectAllowlist);
-    } else if (workspaceAllowlist) {
-      effectiveAllowlist = new Set(workspaceAllowlist);
-    }
+    const workspaceAllowlist =
+      workspaceOverrides?.toolAllowlist != null
+        ? getOwn(workspaceOverrides.toolAllowlist, serverName)
+        : undefined;
+    const effectiveAllowlist = effectiveToolAllowlist(
+      serverName,
+      projectAllowlist,
+      workspaceOverrides
+    );
 
     if (!effectiveAllowlist) {
       // No allowlist => return all tools
@@ -1477,28 +3188,270 @@ export class MCPServerManager {
     return filtered;
   }
 
+  /**
+   * Run a server operation only when the plugin mutation epoch is stable
+   * across its complete publication/query window. The preflight retires any
+   * instances invalidated by a sibling process before the operation starts;
+   * the post-read catches a mutation that began after that preflight. Every
+   * server-starting path (tools, prompt listing, prompt invocation) uses this
+   * same bracket so none can publish or query a stale plugin instance through
+   * a direct ensureWorkspaceServers call.
+   */
+  private async runWithStablePluginEpoch<T>(operation: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      await this.retireCrossProcessPluginInstances();
+      // Snapshot the baselines THIS operation runs under. The postflight must
+      // compare against them, not against the live fields: a concurrent
+      // serve's preflight can observe a sibling's newer epoch, evict, and
+      // advance the live baseline while this operation is still in flight —
+      // the live field would then match the fresh read and accept a result
+      // derived from pre-eviction state.
+      const componentPolicyUsed = JSON.stringify(this.componentPolicy);
+      const componentRevisionUsed = this.componentPolicyRevision;
+      const pluginTokenUsed = this.lastPluginInvalidationToken;
+      const overridesEpochUsed = this.lastOverridesEpochToken;
+      const result = await operation();
+      if (this.pluginInvalidation === undefined || !this.pluginInvalidationTokenSeen) {
+        return result;
+      }
+      // Bracket the operation with BOTH cross-process tokens: a sibling's
+      // override write landing mid-serve changes no process-local
+      // authorization state, so only this recheck can catch it. The retry's
+      // preflight evicts the caches and the operation re-reads disk. An
+      // unreadable epoch never matches: it cannot vouch for anything.
+      // Sequential, override epoch LAST: it is the fence for the served
+      // tool gate, so it must be the final read before the result is
+      // accepted — a parallel read could capture the old epoch while the
+      // slower token read settles, accepting a pair a sibling revocation
+      // completed in between.
+      const componentPolicy =
+        this.pluginInvalidation.readComponentPolicy !== undefined
+          ? await this.readComponentPolicy()
+          : undefined;
+      const token = await this.pluginInvalidation.readToken();
+      const overridesEpoch = await this.pluginInvalidation.readOverridesEpoch?.();
+      if (
+        componentPolicyUsed === JSON.stringify(componentPolicy) &&
+        componentRevisionUsed === this.componentPolicyRevision &&
+        token === pluginTokenUsed &&
+        overridesEpoch === overridesEpochUsed &&
+        !isWorkspaceOverridesEpochUnreadable(overridesEpoch)
+      ) {
+        return result;
+      }
+      if (attempt >= 5) {
+        throw new Error(
+          "MCP startup kept racing concurrent plugin or workspace override mutations; retry once they settle"
+        );
+      }
+      await this.retireCrossProcessPluginInstances();
+    }
+  }
+
   async getToolsForWorkspace(
-    options: MCPWorkspaceRequestOptions
+    options: MCPWorkspaceRequestOptions,
+    /** Cancels the serve's own disk re-read (see loadFirstServeWorkspaceOverrides). */
+    callOptions?: { signal?: AbortSignal }
   ): Promise<MCPToolsForWorkspaceResult> {
-    return this.ensureWorkspaceServers(options, true);
+    const result = await this.getToolsForWorkspaceInternal(options, callOptions?.signal);
+    // The epoch postflight awaits readToken() AFTER serveResult's gate: a
+    // publication or eviction landing in that await is not covered by it.
+    // Re-apply the same check at the very last point before the tools leave
+    // the manager. Beyond this point the served instances stay connected for
+    // the stream's duration (see the leased-restart path), but every tool
+    // invocation re-checks enablement (gateServedToolsOnEnablement). A
+    // non-empty result without provenance cannot be vouched for either.
+    const { workspaceId } = options;
+    if (!this.isServeAuthorizationCurrent(workspaceId, result.enablementDerivedFrom)) {
+      // Regardless of result size: even a zero-surface serve (only enabled
+      // server failed to start) carries `overridesUsed`, from which the
+      // caller rebuilds its prompt inventory — stale provenance must not
+      // leave the manager either.
+      if (Object.keys(result.tools).length > 0 || result.promptDescriptors.length > 0) {
+        log.warn(
+          "[MCP] Workspace overrides changed after the serve completed; disabling MCP for this serve",
+          { workspaceId }
+        );
+      }
+      return this.failClosedResult();
+    }
+    // Internal provenance; not part of the caller-facing result.
+    const { enablementDerivedFrom: _derivedFrom, ...served } = result;
+    return served;
   }
 
   /**
-   * Skips tools/list refreshes on cached instances so an unrelated server's
-   * 60-second SDK timeout cannot block prompt paths.
+   * getToolsForWorkspace that RETAINS the serve's provenance. Recursive
+   * serves inside ensureWorkspaceServers (timed-out retries, lost restart
+   * ownership) must use this one: the public wrapper strips the provenance,
+   * and a result without it can no longer be checked by the outer wrapper.
+   */
+  private getToolsForWorkspaceInternal(
+    options: MCPWorkspaceRequestOptions,
+    readSignal?: AbortSignal
+  ): Promise<MCPToolsForWorkspaceResult> {
+    return this.serveWithFirstPromptLists(
+      options.workspaceId,
+      () =>
+        this.runWithStablePluginEpoch(() => this.ensureWorkspaceServers(options, true, readSignal)),
+      readSignal
+    );
+  }
+
+  /** Run `serve`, and again after awaitFirstPromptLists waited, so the result has the catalog. */
+  private async serveWithFirstPromptLists(
+    workspaceId: string,
+    serve: () => Promise<MCPToolsForWorkspaceResult>,
+    signal: AbortSignal | undefined
+  ): Promise<MCPToolsForWorkspaceResult> {
+    const unlistedAtServe = this.hasUnlistedPromptInstances(workspaceId);
+    const stopEpoch = this.workspaceStopEpochs.get(workspaceId) ?? 0;
+    const result = await serve();
+    if (!(await this.awaitFirstPromptLists(workspaceId, unlistedAtServe, signal))) return result;
+    // A removal-style stop since the first serve began owns the workspace: never start its
+    // servers again. Return what the first serve returned, as before the wait existed.
+    if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpoch) return result;
+    // The second serve also picks up the current entry and enablement.
+    return serve();
+  }
+
+  /**
+   * Whether enablement derived from `derivedFrom` is still what this
+   * workspace's recorded options and invalidation state describe:
+   * - a publication (or serve/refresh/stop) replaces the recorded options, so
+   *   identity must match;
+   * - a forgetWorkspaceOverrides leaves them in place and only sets the
+   *   invalidation marker, so no marker may be live;
+   * - no provenance means enablement could not be derived at all.
+   * Every point that hands out tools or dispatches a prompt checks this.
+   */
+  private isServeAuthorizationCurrent(
+    workspaceId: string,
+    derivedFrom: MCPWorkspaceRequestOptions | undefined
+  ): boolean {
+    if (derivedFrom === undefined || this.overridesInvalidationGenerations.has(workspaceId)) {
+      return false;
+    }
+    const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+    // Equivalence, not identity: two ordinary serves of one workspace that
+    // overlap (prompt discovery while a send assembles) each record their own
+    // options object with the SAME authorization state, and the first to
+    // finish must not be failed closed as if a publication had revoked it. A
+    // publication or trust change records different overrides/trust and is
+    // still detected.
+    return recorded !== undefined && authorizationStateEqual(recorded, derivedFrom);
+  }
+
+  private failClosedResult(): MCPToolsForWorkspaceResult {
+    return {
+      tools: {},
+      toolServerNames: {},
+      stats: this.createWorkspaceStats(0, new Map(), []),
+      promptDescriptors: [],
+    };
+  }
+
+  /**
+   * `refreshToolCatalogs` false (prompt paths) skips the background tool and
+   * prompt catalog refreshes on cached instances entirely.
    */
   private async ensureWorkspaceServers(
     requestOptions: MCPWorkspaceRequestOptions,
-    refreshToolCatalogs: boolean
+    refreshToolCatalogs: boolean,
+    /** Cancels this serve's disk re-read of the overrides (the caller's request/turn signal). */
+    readSignal?: AbortSignal
   ): Promise<MCPToolsForWorkspaceResult> {
+    // runWithStablePluginEpoch performs the sibling-mutation preflight BEFORE
+    // entering this method, so refreshed disk overrides are visible to the
+    // overlay below and every caller gets the same post-publication bracket.
+
     // Cold workspaces have no recorded state for applyWorkspaceOverrides to repair.
     // Overlay the newest overrides over a caller snapshot that may predate the mutation.
-    let options = this.latestWorkspaceOverrides.has(requestOptions.workspaceId)
-      ? {
-          ...requestOptions,
-          overrides: this.latestWorkspaceOverrides.get(requestOptions.workspaceId),
+    let options: MCPWorkspaceRequestOptions;
+    // Per-serve fail-closed marker (see loadFirstServeWorkspaceOverrides).
+    let overridesUnavailable = false;
+    let satisfiesInvalidation: number | undefined;
+    // A caller whose own read could not establish the current document
+    // (overridesAuthoritative false: unreadable/invalid file) must not be
+    // served from the cache either: the cached publication predates whatever
+    // made the document unreadable, so nothing vouches for it now. Re-read
+    // disk (fail closed if it cannot vouch) and revalidate the entry.
+    const distrustedCaller = requestOptions.overridesAuthoritative === false;
+    const hadCached = this.latestWorkspaceOverrides.has(requestOptions.workspaceId);
+    const cachedBefore = this.latestWorkspaceOverrides.get(requestOptions.workspaceId);
+    // The cache is a repair hint for caller snapshots that predate a save, not
+    // an authority over a LATER authoritative read: a direct edit of the
+    // JSONC file bumps no epoch and publishes nothing, so a cache entry that
+    // disagrees with an authoritative caller snapshot cannot be told apart
+    // from a stale snapshot without disk. Re-read disk whenever they differ
+    // (steady state agrees, so this costs nothing then); disk decides, a
+    // publication landing mid-read still wins, and an unreadable disk fails
+    // closed. Without a reader the cache stays authoritative as before.
+    const cacheDiffersFromCaller =
+      hadCached &&
+      !distrustedCaller &&
+      this.pluginInvalidation?.readWorkspaceOverrides !== undefined &&
+      requestOptions.overrides !== undefined &&
+      !workspaceOverridesEqual(cachedBefore, requestOptions.overrides);
+    const revalidating = distrustedCaller || cacheDiffersFromCaller;
+    if (hadCached && !revalidating) {
+      options = { ...requestOptions, overrides: cachedBefore };
+    } else {
+      const firstServe = await this.loadFirstServeWorkspaceOverrides(
+        requestOptions,
+        cacheDiffersFromCaller,
+        readSignal
+      );
+      // Recheck AFTER the await: an MCP settings save completing while the
+      // disk read was in flight published newer state into the cache, and
+      // recording the read's older result would expose a just-disabled
+      // server for this send (the save's repair path only patches recorded
+      // options, which do not exist yet on a first serve). An authoritative
+      // publication also supersedes this serve's fail-closed verdict. For a
+      // distrusted caller only a NEW publication counts — the entry that was
+      // already there is exactly what is being revalidated.
+      const cachedAfter = this.latestWorkspaceOverrides.get(requestOptions.workspaceId);
+      if (
+        this.latestWorkspaceOverrides.has(requestOptions.workspaceId) &&
+        (!hadCached || cachedAfter !== cachedBefore)
+      ) {
+        // A publication is disk truth: record it as authoritative even for a
+        // caller whose own read was not (see fromDisk).
+        options = { ...requestOptions, overrides: cachedAfter, overridesAuthoritative: true };
+      } else {
+        options = { ...requestOptions, overrides: firstServe.overrides };
+        satisfiesInvalidation = firstServe.satisfiesInvalidation;
+        // The read's own comparison ran before this continuation resumed; a
+        // forget/eviction squeezed into that gap finds no cache entry to
+        // remove yet, so it is only observable here. Fail closed when seen.
+        // (A publication that retired the generation meanwhile also replaced
+        // the cache, which the branch above already took.)
+        const currentGeneration = this.overridesInvalidationGenerations.get(
+          requestOptions.workspaceId
+        );
+        const supersededAfterRead =
+          currentGeneration !== undefined && currentGeneration !== firstServe.observed.workspace;
+        const globallyEvictedAfterRead =
+          this.globalOverridesEvictionGeneration !== firstServe.observed.global;
+        overridesUnavailable =
+          firstServe.unavailable || supersededAfterRead || globallyEvictedAfterRead;
+        if (globallyEvictedAfterRead && currentGeneration === undefined) {
+          // Same retry guarantee as inside the read: the options recorded
+          // below are pre-eviction state and must be re-read next time.
+          this.markOverridesInvalidated(requestOptions.workspaceId);
         }
-      : requestOptions;
+        if (firstServe.fromDisk && !overridesUnavailable) {
+          options = { ...options, overridesAuthoritative: true };
+        }
+        if (revalidating && hadCached && !overridesUnavailable) {
+          // Disk vouched for the revalidation and nothing superseded the
+          // read (no publication — same object — no forget, no eviction):
+          // the cached entry is revalidated with disk truth. Otherwise it is
+          // left alone (still the newest publication this process knows).
+          this.latestWorkspaceOverrides.set(requestOptions.workspaceId, firstServe.overrides);
+        }
+      }
+    }
     // Same cold-workspace gap for project trust: a revocation landing while a
     // stream's pre-await trusted snapshot is still in flight has no recorded
     // options to repair, so overlay the newest trust the manager has seen.
@@ -1507,6 +3460,13 @@ export class MCPServerManager {
     );
     if (latestTrust !== undefined && (options.trusted ?? false) !== latestTrust) {
       options = { ...options, trusted: latestTrust };
+    }
+    // The caller's read deadline is request-scoped (see
+    // overridesReadDeadlineAt): the recorded options are re-used by later
+    // distrusted re-reads (prompt dispatch, invalidation repair), which must
+    // get the reader's default budget, not one that expired with this send.
+    if (options.overridesReadDeadlineAt !== undefined) {
+      options = { ...options, overridesReadDeadlineAt: undefined };
     }
     const {
       workspaceId,
@@ -1520,11 +3480,38 @@ export class MCPServerManager {
     } = options;
 
     this.lastWorkspaceRequestOptions.set(workspaceId, options);
+    // Retire the invalidation the disk read satisfied ONLY now that its fresh
+    // options are the recorded ones (same synchronous block), and only if no
+    // newer forget advanced it meanwhile. Retiring inside the read would open
+    // a window in which an overlapping serve sees no marker while the stale
+    // pre-read options are still recorded — and installs them as current.
+    if (
+      satisfiesInvalidation !== undefined &&
+      !overridesUnavailable &&
+      this.overridesInvalidationGenerations.get(workspaceId) === satisfiesInvalidation
+    ) {
+      // Cache the recovered (authoritative) overrides BEFORE retiring the
+      // marker: a later serve carrying a stale pre-save caller snapshot would
+      // otherwise take the fast path and record that snapshot as current.
+      this.latestWorkspaceOverrides.set(workspaceId, overrides);
+      this.overridesInvalidationGenerations.delete(workspaceId);
+    }
 
     // Global mutations (mcp.setEnabled / mcp.remove) bump the config
     // generation without replacing recorded options; capture it before config
     // reads so enablement repair can detect them.
     const configGenerationUsed = this.configService.configGeneration;
+    // Likewise a forgetWorkspaceOverrides landing during getAllServers() or
+    // server startup only advances this marker (the recorded options above
+    // stay the same object, so the repair below sees nothing to redo). The
+    // serve is checked against it before returning (see serveResult).
+    const overridesGenerationUsed = this.overridesInvalidationGenerations.get(workspaceId);
+
+    // Snapshot BEFORE reading config: a plugin swap that lands after this
+    // point may invalidate instances this call starts (see
+    // closeInvalidatedInstances).
+    const startupEpoch = this.prefixInvalidationClock;
+    const signatureBeforeConfigRead = this.workspaceServers.get(workspaceId)?.configSignature;
 
     // Fetch full server info for project-level allowlists and server filtering
     const allServers = await this.getAllServers(projectPath, trusted, agentPlugins);
@@ -1536,18 +3523,25 @@ export class MCPServerManager {
     // container even though it extends LocalBaseRuntime.
     const fullServerInfo: Record<string, MCPServerInfo> = {};
     const execsOffHost = runtime instanceof RemoteRuntime || runtime instanceof DevcontainerRuntime;
+    const pluginEpochUnreadable = isMutationEpochUnreadable(this.lastPluginInvalidationToken);
     for (const [name, info] of Object.entries(allServers)) {
-      if (info.plugin !== undefined && execsOffHost) {
-        log.debug("[MCP] Skipping Agent Plugin server on off-host runtime", { workspaceId, name });
+      if (info.plugin !== undefined && (execsOffHost || pluginEpochUnreadable)) {
+        log.debug(
+          execsOffHost
+            ? "[MCP] Skipping Agent Plugin server on off-host runtime"
+            : "[MCP] Skipping Agent Plugin server while mutation epoch is unreadable",
+          { workspaceId, name }
+        );
         continue;
       }
       fullServerInfo[name] = info;
     }
 
-    // Apply server-level overrides (enabled/disabled) before caching
-    const enabledServers = this.filterServersByPolicy(
-      this.applyServerOverrides(fullServerInfo, overrides)
-    );
+    // Apply server-level overrides (enabled/disabled) before caching. An
+    // invalidated workspace whose overrides could not be re-read fails closed.
+    const enabledServers = overridesUnavailable
+      ? {}
+      : this.applyServerOverrides(fullServerInfo, overrides);
     const enabledEntries = Object.entries(enabledServers).sort(([a], [b]) => a.localeCompare(b));
 
     const enabledServerNames = new Set(enabledEntries.map(([name]) => name));
@@ -1558,21 +3552,48 @@ export class MCPServerManager {
     const signature = JSON.stringify(signatureEntries);
 
     const existing = this.workspaceServers.get(workspaceId);
+    if (
+      existing &&
+      signatureBeforeConfigRead !== undefined &&
+      existing.configSignature !== signatureBeforeConfigRead &&
+      existing.configSignature !== signature
+    ) {
+      // Another request published while this config read was pending. Re-read
+      // before treating its additions as removals and restarting healthy clients.
+      return this.ensureWorkspaceServers(options, refreshToolCatalogs, readSignal);
+    }
     if (existing && existing.timedOutServerNames === undefined) {
       existing.timedOutServerNames = [];
     }
     if (existing && existing.retryingTimedOutServerNames === undefined) {
-      existing.retryingTimedOutServerNames = new Set();
+      existing.retryingTimedOutServerNames = new Map();
     }
     const leaseCount = this.getLeaseCount(workspaceId);
 
     const hasClosedInstance =
-      existing && [...existing.instances.values()].some((instance) => instance.isClosed);
+      existing &&
+      [...existing.instances.values()].some((instance) =>
+        this.instanceNeedsRestart(instance, leaseCount)
+      );
 
     if (existing?.configSignature === signature && !hasClosedInstance) {
       existing.lastActivity = Date.now();
       delete existing.stalePromptServerNames;
+      // The signature only covers START config, so a leased serve that
+      // deferred a restart may have narrowed `enabledServerNames` under this
+      // same signature (a server disabled mid-stream). This serve's options
+      // re-derive the set; without this the re-enabled server's tools would
+      // stay filtered out until an unrelated publication repaired the entry.
+      existing.enabledServerNames = enabledServerNames;
+      existing.enabledServers = enabledServers;
+      existing.enabledServersGeneration = configGenerationUsed;
 
+      // Another serve's in-flight retry (e.g. a plugin-invalidation restart)
+      // of a server this serve enables: join it rather than returning without
+      // that server's tools (#4539). Captured before this serve marks its own.
+      const joinedRetries = [...existing.retryingTimedOutServerNames]
+        .filter(([name]) => Object.hasOwn(enabledServers, name) && !existing.instances.has(name))
+        .flatMap(([, retry]) => (retry === undefined ? [] : [retry]));
       const timedOutServerNamesToRetry = this.getTimedOutServerNamesToRetry(
         existing,
         enabledServers
@@ -1585,7 +3606,7 @@ export class MCPServerManager {
 
         const serversToRetry: MCPServerMap = {};
         for (const serverName of timedOutServerNamesToRetry) {
-          const info = enabledServers[serverName];
+          const info = getOwn(enabledServers, serverName);
           if (info) {
             serversToRetry[serverName] = info;
           }
@@ -1594,15 +3615,26 @@ export class MCPServerManager {
         const retryingServerNames = new Set(timedOutServerNamesToRetry);
         // Mark retries before awaiting startup so concurrent same-signature calls do not
         // stack duplicate retry attempts while the previous timeout is still unwinding.
+        // Joinable only when the whole batch is restarts: the batch settles as
+        // one, so a timed-out retry in it would pin joiners to its startup.
+        const retryDone = Promise.withResolvers<void>();
+        const joinable = [...retryingServerNames].every(
+          (serverName) => existing.timedOutRetryBackoff?.has(serverName) !== true
+        );
         for (const serverName of retryingServerNames) {
-          existing.retryingTimedOutServerNames.add(serverName);
+          existing.retryingTimedOutServerNames.set(
+            serverName,
+            joinable ? retryDone.promise : undefined
+          );
         }
 
         try {
+          await this.assertOverridesEpochUnmovedBeforeStart();
           const {
             instances: retriedInstances,
             failedServerNames: retryFailedNames,
             timedOutServerNames: retryTimedOutNames = [],
+            timedOutAtMs: retryTimedOutAtMs,
           } = await this.startServers(
             serversToRetry,
             runtime,
@@ -1637,32 +3669,88 @@ export class MCPServerManager {
               }
             }
 
-            return this.getToolsForWorkspace(options);
+            return this.getToolsForWorkspaceInternal(options, readSignal);
           }
 
-          for (const [serverName, instance] of retriedInstances) {
-            existing.instances.set(serverName, instance);
-          }
+          // Drop retried instances whose plugin tree was swapped mid-startup;
+          // they rejoin the retry list below so the next call restarts them
+          // from the new tree (the filter would otherwise drop them: they
+          // were in retryingServerNames but have no live instance). The merge
+          // into the published entry happens inside the stable-clock callback
+          // so no invalidation can land between the final scan and the merge.
+          let retryOwnershipLost = false;
+          await this.closeInvalidatedInstancesThenPublish(
+            retriedInstances,
+            startupEpoch,
+            workspaceId,
+            (invalidatedRetryKeys, failedRetirements) => {
+              // Recheck ownership INSIDE the synchronous callback: a
+              // removal-style stopServers (or config-change replacement)
+              // landing while the awaited invalidation scan yielded has
+              // deleted/replaced the cache entry and closed its instances —
+              // merging into the detached `existing` would leave these
+              // clients with no cache owner to ever clean them up.
+              if (this.workspaceServers.get(workspaceId) !== existing) {
+                retryOwnershipLost = true;
+                return;
+              }
+              for (const instance of failedRetirements)
+                (existing.retiredPluginInstances ??= new Set()).add(instance);
+              for (const [serverName, instance] of retriedInstances) {
+                existing.instances.set(serverName, instance);
+              }
 
-          existing.timedOutServerNames = [
-            ...existing.timedOutServerNames.filter(
-              (serverName) =>
-                enabledServerNames.has(serverName) &&
-                !retryingServerNames.has(serverName) &&
-                !existing.instances.has(serverName)
-            ),
-            ...retryTimedOutNames,
-          ];
+              // Additive publication can extend this same entry during a retry.
+              // Update only attempted names, preserving the additions' retry markers.
+              existing.timedOutServerNames = [
+                ...existing.timedOutServerNames.filter(
+                  (serverName) =>
+                    !retryingServerNames.has(serverName) && !existing.instances.has(serverName)
+                ),
+                ...retryTimedOutNames,
+                ...invalidatedRetryKeys,
+              ];
+              this.recordStartupTimeoutOutcomes(
+                existing,
+                retryingServerNames,
+                retryTimedOutNames,
+                retryTimedOutAtMs
+              );
+            }
+          );
+          if (retryOwnershipLost) {
+            for (const instance of retriedInstances.values()) {
+              try {
+                await instance.close();
+              } catch (error) {
+                log.warn("Failed to stop orphaned retried MCP server", {
+                  error,
+                  name: instance.name,
+                });
+              }
+            }
+            // Removed workspace: return empty instead of recursing, which
+            // would resurrect servers the removal just stopped. A replaced
+            // entry (config change) recomputes against the new entry.
+            if (this.workspaceServers.get(workspaceId) === undefined) {
+              return {
+                tools: {},
+                toolServerNames: {},
+                stats: this.createWorkspaceStats(enabledEntries.length, new Map(), []),
+                promptDescriptors: [],
+              };
+            }
+            return this.getToolsForWorkspaceInternal(options, readSignal);
+          }
 
           const failedServerNames = [
             ...existing.stats.failedServerNames.filter(
-              (serverName) =>
-                enabledServerNames.has(serverName) && !retryingServerNames.has(serverName)
+              (serverName) => !retryingServerNames.has(serverName)
             ),
             ...retryFailedNames,
           ];
           existing.stats = this.createWorkspaceStats(
-            enabledEntries.length,
+            existing.stats.enabledServerCount,
             existing.instances,
             failedServerNames
           );
@@ -1670,7 +3758,24 @@ export class MCPServerManager {
           for (const serverName of retryingServerNames) {
             existing.retryingTimedOutServerNames.delete(serverName);
           }
+          retryDone.resolve();
         }
+      }
+
+      if (joinedRetries.length > 0) {
+        // Never rejects: each owner resolves its retry in `finally`.
+        await Promise.all(joinedRetries);
+        // The owner may have lost the entry meanwhile; mirror its handling.
+        const current = this.workspaceServers.get(workspaceId);
+        if (current === undefined) {
+          return {
+            tools: {},
+            toolServerNames: {},
+            stats: this.createWorkspaceStats(enabledEntries.length, new Map(), []),
+            promptDescriptors: [],
+          };
+        }
+        if (current !== existing) return this.getToolsForWorkspaceInternal(options, readSignal);
       }
 
       log.debug("[MCP] Using cached servers", {
@@ -1678,15 +3783,10 @@ export class MCPServerManager {
         serverCount: enabledEntries.length,
       });
 
-      if (refreshToolCatalogs) {
-        // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
-        await this.refreshModernInstanceTools(existing.instances);
-      }
-
       // A trust or settings mutation can land while getAllServers() runs above;
       // re-derive enablement so this cached return cannot leave a revoked
       // repo-local server invocable.
-      await this.repairEnablementAfterConcurrentMutation(
+      const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
         existing,
@@ -1696,24 +3796,34 @@ export class MCPServerManager {
       // Spawned after the repair: a detached refresh cannot be cancelled, so
       // it must never target servers a concurrent mutation just revoked.
       if (refreshToolCatalogs) {
+        this.refreshInstanceToolsInBackground(existing);
         this.refreshInstancePromptsInBackground(existing);
       }
 
-      return {
-        ...this.collectTools(existing.instances, fullServerInfo, overrides),
-        stats: existing.stats,
-        promptDescriptors: this.promptDescriptorsFor(existing),
-      };
+      // Additions may publish while a cached refresh/retry is awaiting. This
+      // snapshot lacks their allowlists, so leave them for a fresh config read.
+      return this.serveResult(
+        workspaceId,
+        existing,
+        new Map([...existing.instances].filter(([name]) => enabledServerNames.has(name))),
+        overrides,
+        existing.stats,
+        overridesGenerationUsed,
+        enablementDerivedFrom,
+        overridesUnavailable
+      );
     }
 
-    let restartFailedNames: string[] = [];
-    let restartTimedOutNames: string[] = [];
+    const additiveServerNames = existing
+      ? this.getRetainableServerAdditions(existing, signatureEntries)
+      : undefined;
 
     // If a stream is actively running, avoid closing MCP clients out from under it.
     //
     // Note: AIService may fetch tools before StreamManager interrupts an existing stream,
     // so closing servers here can hand out tool objects backed by a client that's about to close.
-    if (existing && leaseCount > 0) {
+    if (existing && leaseCount > 0 && additiveServerNames === undefined) {
+      const retainedSignature = existing.configSignature;
       existing.lastActivity = Date.now();
 
       if (hasClosedInstance) {
@@ -1732,7 +3842,7 @@ export class MCPServerManager {
 
         const serversToRestart: MCPServerMap = {};
         for (const serverName of closedServerNames) {
-          const info = enabledServers[serverName];
+          const info = getOwn(enabledServers, serverName);
           if (info) {
             serversToRestart[serverName] = info;
           }
@@ -1754,10 +3864,12 @@ export class MCPServerManager {
           }
         }
 
+        await this.assertOverridesEpochUnmovedBeforeStart();
         const {
           instances: restartedInstances,
           failedServerNames: failedNames,
           timedOutServerNames: timedOutNames = [],
+          timedOutAtMs: restartTimedOutAtMs,
         } = await this.startServers(
           serversToRestart,
           runtime,
@@ -1767,12 +3879,79 @@ export class MCPServerManager {
           () => this.markActivity(workspaceId),
           workspaceId
         );
-        restartFailedNames = failedNames;
-        restartTimedOutNames = timedOutNames;
 
-        for (const [serverName, instance] of restartedInstances) {
-          existing.instances.set(serverName, instance);
+        // Drop restarted instances whose plugin tree was swapped mid-startup;
+        // route them through the retry list so the entry (kept under its
+        // unchanged signature) restarts them on the next call. The merge into
+        // the published entry happens inside the stable-clock callback so no
+        // invalidation can land between the final scan and the merge.
+        let restartOwnershipLost = false;
+        await this.closeInvalidatedInstancesThenPublish(
+          restartedInstances,
+          startupEpoch,
+          workspaceId,
+          (invalidatedRestartKeys, failedRetirements) => {
+            // Same ownership recheck as the timed-out retry path: a removal
+            // or replacement landing during the awaited scan must not let
+            // this merge revive clients on a detached entry.
+            if (this.workspaceServers.get(workspaceId) !== existing) {
+              restartOwnershipLost = true;
+              return;
+            }
+
+            for (const instance of failedRetirements)
+              (existing.retiredPluginInstances ??= new Set()).add(instance);
+            for (const [serverName, instance] of restartedInstances) {
+              existing.instances.set(serverName, instance);
+            }
+            existing.timedOutServerNames = [
+              ...existing.timedOutServerNames.filter((name) => !closedServerNames.includes(name)),
+              ...timedOutNames,
+              ...invalidatedRestartKeys,
+            ];
+            this.recordStartupTimeoutOutcomes(
+              existing,
+              Object.keys(serversToRestart),
+              timedOutNames,
+              restartTimedOutAtMs
+            );
+            existing.stats = this.createWorkspaceStats(
+              existing.stats.enabledServerCount,
+              existing.instances,
+              [...new Set([...existing.stats.failedServerNames, ...failedNames])]
+            );
+          }
+        );
+        if (restartOwnershipLost) {
+          for (const instance of restartedInstances.values()) {
+            try {
+              await instance.close();
+            } catch (error) {
+              log.warn("Failed to stop orphaned restarted MCP server", {
+                error,
+                name: instance.name,
+              });
+            }
+          }
+          // Removed workspace: return empty instead of recursing, which would
+          // resurrect servers the removal just stopped. A replaced entry
+          // (config change) recomputes against the new entry.
+          if (this.workspaceServers.get(workspaceId) === undefined) {
+            return {
+              tools: {},
+              toolServerNames: {},
+              stats: this.createWorkspaceStats(enabledEntries.length, new Map(), []),
+              promptDescriptors: [],
+            };
+          }
+          return this.getToolsForWorkspaceInternal(options, readSignal);
         }
+      }
+
+      // An addition may have published while closed-client recovery was pending.
+      // Re-read its config rather than overwriting the new entry's catalogs/stats.
+      if (existing.configSignature !== retainedSignature) {
+        return this.ensureWorkspaceServers(options, refreshToolCatalogs, readSignal);
       }
 
       log.info("[MCP] Deferring MCP server restart while stream is active", {
@@ -1782,27 +3961,20 @@ export class MCPServerManager {
       // Recompute lease-visible stats from the currently enabled server set so stale
       // failures and tool metadata from newly-disabled servers do not leak into the
       // next stream while an existing lease is still active.
-      existing.timedOutServerNames = [
-        ...existing.timedOutServerNames.filter(
-          (serverName) => enabledServerNames.has(serverName) && !existing.instances.has(serverName)
-        ),
-        ...restartTimedOutNames,
-      ];
+      existing.timedOutServerNames = existing.timedOutServerNames.filter(
+        (serverName) => enabledServerNames.has(serverName) && !existing.instances.has(serverName)
+      );
 
       // Even while deferring restarts, ensure new tool lists and stats reflect the latest
-      // enabled/disabled server set. We cannot revoke tools already captured by an in-flight
-      // stream, but we can avoid exposing tools from newly-disabled servers to the next stream.
+      // enabled/disabled server set. Tool objects already captured by an in-flight stream
+      // stay connected but fail at call time once their server is disabled (see
+      // gateServedToolsOnEnablement); this keeps them out of the next stream entirely.
       const instancesForTools = new Map(
-        [...existing.instances].filter(([serverName]) => enabledServers[serverName] !== undefined)
+        [...existing.instances].filter(([serverName]) => Object.hasOwn(enabledServers, serverName))
       );
-      const failedServerNames = [
-        ...new Set([
-          ...existing.stats.failedServerNames.filter((serverName) =>
-            enabledServerNames.has(serverName)
-          ),
-          ...restartFailedNames,
-        ]),
-      ];
+      const failedServerNames = existing.stats.failedServerNames.filter((serverName) =>
+        enabledServerNames.has(serverName)
+      );
       const leasedStats = this.createWorkspaceStats(
         enabledEntries.length,
         instancesForTools,
@@ -1810,6 +3982,8 @@ export class MCPServerManager {
       );
       existing.stats = leasedStats;
       existing.enabledServerNames = enabledServerNames;
+      existing.enabledServers = enabledServers;
+      existing.enabledServersGeneration = configGenerationUsed;
 
       // The deferred restart retains same-named instances with the old config,
       // so record which servers changed to block prompt invocation on them.
@@ -1827,44 +4001,53 @@ export class MCPServerManager {
       }
 
       // Runs after the staleness recompute so the delete above cannot clobber
-      // staleness detected from a mutation newer than this call's config read.
-      await this.repairEnablementAfterConcurrentMutation(
+      // staleness detected from a mutation newer than this call's config read:
+      // a publication landing during an await replaces the recorded options
+      // while its own listServers is still pending, so
+      // `existing.enabledServerNames` is only trustworthy once the repair has
+      // re-derived it here — the serve's last await before return.
+      const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
         existing,
         configGenerationUsed
       );
 
+      // Spawned after the repair so the uncancellable detached refresh cannot
+      // target servers a concurrent mutation just revoked.
       if (refreshToolCatalogs) {
-        // Honor SEP-2549 freshness hints instead of caching tool lists for the instance lifetime.
+        this.refreshInstanceToolsInBackground(existing);
         this.refreshInstancePromptsInBackground(existing);
-        await this.refreshModernInstanceTools(instancesForTools);
       }
 
-      return {
-        ...this.collectTools(instancesForTools, fullServerInfo, overrides),
-        stats: leasedStats,
-        promptDescriptors: this.promptDescriptorsFor(existing),
-      };
+      return this.serveResult(
+        workspaceId,
+        existing,
+        instancesForTools,
+        overrides,
+        leasedStats,
+        overridesGenerationUsed,
+        enablementDerivedFrom,
+        overridesUnavailable
+      );
     }
 
     // Serialize restarts so concurrent callers cannot overwrite cached servers
     // without closing discarded instances. Same-signature retries remain outside
     // this lock because their replacement path reconciles concurrent changes.
-    return this.workspaceRestartLocks.withLock(workspaceId, async () => {
+    const stopEpochAtQueue = this.workspaceStopEpochs.get(workspaceId) ?? 0;
+    const result = await this.workspaceRestartLocks.withLock(workspaceId, async () => {
       const stopEpochBefore = this.workspaceStopEpochs.get(workspaceId) ?? 0;
       const current = this.workspaceServers.get(workspaceId);
       if (current !== undefined) {
-        const currentHasClosedInstance = [...current.instances.values()].some(
-          (instance) => instance.isClosed
+        const currentLeaseCount = this.getLeaseCount(workspaceId);
+        const currentHasClosedInstance = [...current.instances.values()].some((instance) =>
+          this.instanceNeedsRestart(instance, currentLeaseCount)
         );
         if (current.configSignature === signature && !currentHasClosedInstance) {
           current.lastActivity = Date.now();
-          if (refreshToolCatalogs) {
-            await this.refreshModernInstanceTools(current.instances);
-          }
           // Repair again in case a mutation landed after the concurrent starter's check.
-          await this.repairEnablementAfterConcurrentMutation(
+          const enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
             workspaceId,
             options,
             current,
@@ -1873,20 +4056,49 @@ export class MCPServerManager {
           // Spawned after the repair so the uncancellable detached refresh
           // cannot target servers a concurrent mutation just revoked.
           if (refreshToolCatalogs) {
+            this.refreshInstanceToolsInBackground(current);
             this.refreshInstancePromptsInBackground(current);
           }
-          return {
-            ...this.collectTools(current.instances, fullServerInfo, overrides),
-            stats: current.stats,
-            promptDescriptors: this.promptDescriptorsFor(current),
-          };
+          return this.serveResult(
+            workspaceId,
+            current,
+            current.instances,
+            overrides,
+            current.stats,
+            overridesGenerationUsed,
+            enablementDerivedFrom,
+            overridesUnavailable
+          );
         }
       }
 
-      if (enabledEntries.length > 0) {
+      const addedServerNames = current
+        ? this.getRetainableServerAdditions(current, signatureEntries)
+        : undefined;
+      if (additiveServerNames !== undefined && addedServerNames === undefined) {
+        // A newer additive request may have won the lock. Never roll it back
+        // with this older snapshot, or revive a workspace removed while queued.
+        return undefined;
+      }
+      const retained = addedServerNames !== undefined ? current : undefined;
+      // Reaching here with the same signature means a closed companion forced
+      // a full restart; backed-off servers keep their schedule across it. A
+      // changed signature is a config change and starts everything afresh.
+      const carriedBackoff =
+        retained === undefined && current?.configSignature === signature
+          ? this.timedOutRetryBackoffToCarry(current, enabledServers)
+          : { records: new Map<string, TimedOutRetryBackoff>(), waiting: new Set<string>() };
+      const serversToStart = addedServerNames
+        ? Object.fromEntries(enabledEntries.filter(([name]) => addedServerNames.includes(name)))
+        : carriedBackoff.waiting.size === 0
+          ? enabledServers
+          : Object.fromEntries(
+              Object.entries(enabledServers).filter(([name]) => !carriedBackoff.waiting.has(name))
+            );
+      if (Object.keys(serversToStart).length > 0) {
         log.info("[MCP] Starting servers", {
           workspaceId,
-          servers: enabledEntries.map(([name]) => name),
+          servers: Object.keys(serversToStart),
         });
       }
 
@@ -1896,14 +4108,19 @@ export class MCPServerManager {
 
       // Internal restart: retain the recorded request options so getPrompt can
       // still revive servers reaped later; only workspace removal forgets them.
-      await this.stopServers(workspaceId, { retainRestartOptions: true });
+      // Selective plugin imports may honor an older enable override. Add only
+      // those new servers without disrupting already-running (also non-plugin) clients.
+      if (retained) retained.lastActivity = Date.now();
+      else await this.stopServers(workspaceId, { retainRestartOptions: true });
 
+      await this.assertOverridesEpochUnmovedBeforeStart();
       const {
         instances,
-        failedServerNames: startFailedNames,
+        failedServerNames: startedFailedNames,
         timedOutServerNames: startTimedOutNames = [],
+        timedOutAtMs: startTimedOutAtMs,
       } = await this.startServers(
-        enabledServers,
+        serversToStart,
         runtime,
         projectPath,
         workspacePath,
@@ -1911,9 +4128,11 @@ export class MCPServerManager {
         () => this.markActivity(workspaceId),
         workspaceId
       );
+      // Still-waiting servers were not attempted this time but are still down.
+      const startFailedNames = [...startedFailedNames, ...carriedBackoff.waiting];
+      this.seedPromptsFromIdleStop(workspaceId, signature, instances);
 
-      const allFailedNames = [...restartFailedNames, ...startFailedNames];
-      const stats = this.createWorkspaceStats(enabledEntries.length, instances, allFailedNames);
+      const stats = this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames);
 
       // A removal-style stop landing mid-startup found no cache entry to
       // close, so caching now would leave the removed workspace's processes
@@ -1932,42 +4151,174 @@ export class MCPServerManager {
         return { tools: {}, toolServerNames: {}, stats, promptDescriptors: [] };
       }
 
-      const entry: WorkspaceServers = {
-        configSignature: signature,
+      // A plugin update/uninstall can swap the tree while startServers was
+      // running; its stopServersWithKeyPrefix scan cannot see instances that
+      // are not published yet, so close them here instead of publishing. The
+      // removed keys join the retry list: this entry is published under the
+      // full (unchanged) config signature, so without a retry marker the
+      // cached path would serve the reduced map indefinitely. Publication
+      // happens inside the stable-clock callback so no invalidation can land
+      // between the final scan and workspaceServers.set (see
+      // closeInvalidatedInstancesThenPublish).
+      let entry: WorkspaceServers | undefined;
+      await this.closeInvalidatedInstancesThenPublish(
         instances,
-        enabledServerNames,
-        stats,
-        timedOutServerNames: startTimedOutNames,
-        retryingTimedOutServerNames: new Set(),
-        lastActivity: Date.now(),
-      };
-      this.workspaceServers.set(workspaceId, entry);
+        startupEpoch,
+        workspaceId,
+        (invalidatedKeys, failedRetirements) => {
+          // Recheck the removal-stop epoch INSIDE the synchronous publication
+          // callback: a stopServers(workspaceId) landing while the awaited
+          // invalidation scan yielded found no cache entry to close, so
+          // publishing now would resurrect processes for a removed workspace
+          // until idle cleanup. Skip publication; the late close runs below.
+          if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpochBefore) {
+            return;
+          }
+          if (retained) {
+            if (this.workspaceServers.get(workspaceId) !== retained) return;
+            for (const instance of failedRetirements)
+              (retained.retiredPluginInstances ??= new Set()).add(instance);
+            for (const [name, instance] of instances) retained.instances.set(name, instance);
+            retained.configSignature = signature;
+            retained.enabledServerNames = enabledServerNames;
+            retained.enabledServers = enabledServers;
+            retained.enabledServersGeneration = configGenerationUsed;
+            retained.timedOutServerNames.push(...startTimedOutNames, ...invalidatedKeys);
+            // Config signature moved: give every pending retry a fresh start,
+            // then count this start's timeouts as their first failure.
+            delete retained.timedOutRetryBackoff;
+            this.recordStartupTimeoutOutcomes(
+              retained,
+              Object.keys(serversToStart),
+              startTimedOutNames,
+              startTimedOutAtMs
+            );
+            retained.stats = this.createWorkspaceStats(enabledEntries.length, retained.instances, [
+              ...retained.stats.failedServerNames,
+              ...startFailedNames,
+            ]);
+            retained.lastActivity = Date.now();
+            delete retained.stalePromptServerNames;
+            entry = retained;
+            return;
+          }
+          entry = {
+            configSignature: signature,
+            instances,
+            ...(failedRetirements.size > 0 ? { retiredPluginInstances: failedRetirements } : {}),
+            enabledServerNames,
+            enabledServers,
+            enabledServersGeneration: configGenerationUsed,
+            stats: this.createWorkspaceStats(enabledEntries.length, instances, startFailedNames),
+            timedOutServerNames: [
+              ...carriedBackoff.waiting,
+              ...startTimedOutNames,
+              ...invalidatedKeys,
+            ],
+            retryingTimedOutServerNames: new Map(),
+            lastActivity: Date.now(),
+            ...(carriedBackoff.records.size > 0
+              ? { timedOutRetryBackoff: new Map(carriedBackoff.records) }
+              : {}),
+          };
+          // Attempted names, not just timed-out ones: a carried record whose
+          // server came up this time must clear rather than linger.
+          this.recordStartupTimeoutOutcomes(
+            entry,
+            Object.keys(serversToStart),
+            startTimedOutNames,
+            startTimedOutAtMs
+          );
+          this.workspaceServers.set(workspaceId, entry);
+        }
+      );
+      if (entry === undefined) {
+        for (const instance of instances.values()) {
+          try {
+            await instance.close();
+          } catch (error) {
+            log.warn("Failed to stop late MCP server for removed workspace", {
+              error,
+              name: instance.name,
+            });
+          }
+        }
+        return { tools: {}, toolServerNames: {}, stats, promptDescriptors: [] };
+      }
 
       // Repair first so the awaited refresh never queries a server revoked
       // during startup, then again after it so mutations landing during the
       // slow refresh cannot leak stale descriptors.
-      await this.repairEnablementAfterConcurrentMutation(
+      let enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
         workspaceId,
         options,
         entry,
         configGenerationUsed
       );
       if (refreshToolCatalogs) {
-        await this.refreshInstancePrompts(this.promptEligibleInstances(entry));
-        await this.repairEnablementAfterConcurrentMutation(
+        const promptInstances = this.promptEligibleInstances(entry);
+        // Retained catalogs stay stale-while-revalidate; only new servers need
+        // the initial awaited fetch. Do not wait on an old background refresh.
+        // New servers' tools were fetched by startServers, so tools need no
+        // awaited fetch here at all.
+        await this.refreshInstancePrompts(
+          retained
+            ? new Map([...promptInstances].filter(([name]) => instances.has(name)))
+            : promptInstances
+        );
+        enablementDerivedFrom = await this.repairEnablementAfterConcurrentMutation(
           workspaceId,
           options,
           entry,
           configGenerationUsed
         );
+        if (retained) {
+          this.refreshInstanceToolsInBackground(entry);
+          this.refreshInstancePromptsInBackground(entry);
+        }
       }
 
-      return {
-        ...this.collectTools(instances, fullServerInfo, overrides),
-        stats,
-        promptDescriptors: this.promptDescriptorsFor(entry),
-      };
+      // entry.stats, not the pre-publication `stats`: invalidated instances
+      // were closed before publication and must not count as started.
+      // entry.instances, not `instances`: an additive publication only started
+      // the new servers; the retained entry still serves the older ones.
+      return this.serveResult(
+        workspaceId,
+        entry,
+        entry.instances,
+        overrides,
+        entry.stats,
+        overridesGenerationUsed,
+        enablementDerivedFrom,
+        overridesUnavailable
+      );
     });
+    if (result !== undefined) return result;
+    if ((this.workspaceStopEpochs.get(workspaceId) ?? 0) !== stopEpochAtQueue) {
+      return {
+        tools: {},
+        toolServerNames: {},
+        promptDescriptors: [],
+        stats: this.createWorkspaceStats(0, new Map(), []),
+      };
+    }
+    return this.ensureWorkspaceServers(options, refreshToolCatalogs, readSignal);
+  }
+
+  /**
+   * Start (or reuse) the workspace's servers and record its request options, without awaiting
+   * a prompts/list or tools/list refresh. MCP App entry points list and refresh the catalogs
+   * they need themselves, so one server that stalls prompts/list must not hold them.
+   */
+  async warmWorkspaceServers(
+    options: MCPWorkspaceRequestOptions,
+    callOptions?: { signal?: AbortSignal }
+  ): Promise<void> {
+    // `false`: no awaited catalog refresh (getToolsForWorkspace awaits prompts/list on a cold
+    // start). Inside the epoch bracket like every other serve.
+    await this.runWithStablePluginEpoch(() =>
+      this.ensureWorkspaceServers(options, false, callOptions?.signal)
+    );
   }
 
   async getPromptsForWorkspace(
@@ -1985,18 +4336,66 @@ export class MCPServerManager {
     for (;;) {
       const optionsMutationsBefore = this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0;
       const generationBefore = this.configService.configGeneration;
-      const currentOptions = this.lastWorkspaceRequestOptions.get(workspaceId) ?? options;
+      // Recorded options carry save-time repairs, but the caller's snapshot is
+      // a LATER read: its authority verdict (a document that could not be
+      // read) and any disagreement with the recorded overrides must reach
+      // ensureWorkspaceServers, which revalidates against disk — otherwise a
+      // warmed workspace would keep advertising a server its current document
+      // revokes.
+      const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+      const currentOptions =
+        recorded === undefined
+          ? options
+          : options.overridesAuthoritative === false ||
+              (options.overrides !== undefined &&
+                !workspaceOverridesEqual(recorded.overrides, options.overrides))
+            ? {
+                ...recorded,
+                overrides: options.overrides,
+                overridesAuthoritative: options.overridesAuthoritative,
+              }
+            : recorded;
       const secretsUsed = await this.resolveSecretsForRefresh(
         workspaceId,
         currentOptions.projectPath
       );
       const refreshed = await raceWithAbortAndTimeout(
-        this.ensureWorkspaceServers(
-          secretsUsed !== undefined
-            ? { ...currentOptions, projectSecrets: secretsUsed }
-            : currentOptions,
-          false
-        ),
+        this.runWithStablePluginEpoch(async () => {
+          const served = await this.ensureWorkspaceServers(
+            secretsUsed !== undefined
+              ? { ...currentOptions, projectSecrets: secretsUsed }
+              : currentOptions,
+            false,
+            callOptions?.signal
+          );
+          // A serve that failed closed (overrides not verifiable — an
+          // inherited parent unreachable, a document unreadable) leaves the
+          // warmed entry cached but vouches for none of its servers: querying
+          // their prompt catalogs would advertise prompts from servers whose
+          // current authorization is unknown. Discover nothing instead.
+          if (served.enablementDerivedFrom === undefined) {
+            return undefined;
+          }
+          const entry = this.workspaceServers.get(workspaceId);
+          if (entry === undefined) {
+            return undefined;
+          }
+          // Include the prompt catalog query inside the epoch bracket: a
+          // sibling swap that lands after startup but before prompts/list
+          // must retire the stale instance and retry the whole operation.
+          await this.refreshInstancePrompts(
+            this.promptEligibleInstances(entry),
+            callOptions?.signal
+          );
+          // The secret re-resolution belongs inside the bracket too: it is
+          // the last await before the stability check, and a sibling's
+          // override write landing during it changes neither counter below.
+          const secretsNow = await this.resolveSecretsForRefresh(
+            workspaceId,
+            currentOptions.projectPath
+          );
+          return { entry, secretsNow, served };
+        }),
         {
           ...(callOptions?.signal !== undefined ? { signal: callOptions.signal } : {}),
         }
@@ -2004,19 +4403,24 @@ export class MCPServerManager {
       if (refreshed.kind === "aborted") {
         throw new Error("MCP prompt discovery was aborted");
       }
-      const entry = this.workspaceServers.get(workspaceId);
-      if (!entry) return [];
-
-      latestEntry = entry;
-      await this.refreshInstancePrompts(this.promptEligibleInstances(entry), callOptions?.signal);
-      const secretsNow = await this.resolveSecretsForRefresh(
-        workspaceId,
-        currentOptions.projectPath
-      );
+      if (refreshed.kind === "timeout") {
+        throw new Error("MCP prompt discovery timed out");
+      }
+      if (refreshed.value === undefined) {
+        return [];
+      }
+      latestEntry = refreshed.value.entry;
+      // An ordinary serve landing during prompts/list (a direct edit of the
+      // override document, a disk re-read) can replace the entry or the
+      // recorded options without moving either counter: the captured entry
+      // must still be the published one and the serve's provenance current,
+      // or the descriptors below would come from detached pre-edit state.
       if (
         (this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0) === optionsMutationsBefore &&
         this.configService.configGeneration === generationBefore &&
-        secretRecordsEqual(secretsUsed, secretsNow)
+        secretRecordsEqual(secretsUsed, refreshed.value.secretsNow) &&
+        this.workspaceServers.get(workspaceId) === latestEntry &&
+        this.isServeAuthorizationCurrent(workspaceId, refreshed.value.served.enablementDerivedFrom)
       ) {
         break;
       }
@@ -2113,6 +4517,29 @@ export class MCPServerManager {
     return descriptors;
   }
 
+  private getRetainableServerAdditions(
+    entry: WorkspaceServers,
+    next: Record<string, unknown>
+  ): string[] | undefined {
+    if ([...entry.instances.values()].some((instance) => instance.isClosed)) return undefined;
+    // Signatures are in-process JSON of launch settings, including resolved secrets.
+    const previous = JSON.parse(entry.configSignature) as Record<string, unknown>;
+    const added = Object.keys(next).filter((name) => !Object.hasOwn(previous, name));
+    const removed = Object.keys(previous).filter((name) => !Object.hasOwn(next, name));
+    if (added.length === 0 && removed.length === 0) return undefined;
+    // Only selection removals are non-disruptive. Unrelated configuration
+    // changes retain the existing full-restart/deferred-restart behavior.
+    if (removed.some((name) => this.componentAllowed(name))) return undefined;
+    if (
+      Object.keys(previous).some(
+        (name) =>
+          Object.hasOwn(next, name) && JSON.stringify(previous[name]) !== JSON.stringify(next[name])
+      )
+    )
+      return undefined;
+    return added;
+  }
+
   private async computeSignatureEntries(
     enabledEntries: Array<[string, MCPServerInfo]>,
     projectSecrets: Record<string, string> | undefined
@@ -2126,19 +4553,32 @@ export class MCPServerManager {
           command: info.command,
           args: info.args ?? null,
           env: info.env ?? null,
+          // JSON.stringify drops it when unset, so other servers keep their signature.
+          forwardEnv: info.forwardEnv,
           cwd: info.cwd ?? null,
         };
         continue;
       }
 
+      if (info.managed === "claude-design") {
+        signatureEntries[name] = {
+          transport: "http",
+          managed: info.managed,
+          generation: this.configService.claudeDesign.generation,
+        };
+        continue;
+      }
       // OAuth status affects whether we can attach authProvider during server start.
       // Include this (redacted) information in the signature so we retry starting
       // remote servers after a user logs in/out.
       let hasOauthTokens = false;
       if (this.mcpOauthService) {
         try {
+          // Client-bound like getAuthProviderForServer: tokens of another client must not
+          // count, or signing in as the configured client would not recycle the instance.
           hasOauthTokens = await this.mcpOauthService.hasAuthTokens({
             serverUrl: info.url,
+            ...(info.oauth !== undefined ? { oauth: info.oauth } : {}),
           });
         } catch (error) {
           log.debug("[MCP] Failed to resolve MCP OAuth status", { name, error });
@@ -2152,6 +4592,9 @@ export class MCPServerManager {
           url: info.url,
           headers,
           hasOauthTokens,
+          // Plugin OAuth settings are captured by the auth provider at start:
+          // a change must recycle the instance. Holds no secret value.
+          oauth: info.oauth ?? null,
         };
       } catch {
         // Missing secrets or invalid header config. Keep signature stable but avoid leaking details.
@@ -2160,6 +4603,7 @@ export class MCPServerManager {
           url: info.url,
           headers: null,
           hasOauthTokens,
+          oauth: info.oauth ?? null,
         };
       }
     }
@@ -2169,15 +4613,23 @@ export class MCPServerManager {
   /**
    * Settings changes during startup can miss cache synchronization. Re-derive
    * enablement and mark reconfigured clients stale before prompt dispatch.
+   *
+   * Returns the recorded options `entry.enabledServerNames` was derived from
+   * (captured synchronously with that derivation). serveResult compares it
+   * with the recorded options at return time: a publication landing in the
+   * microtask gap between this method resolving and the caller resuming has
+   * replaced them, and the derived enablement is stale for that serve.
+   * `undefined` means enablement could NOT be (re-)derived — the repair
+   * failed, or there are no recorded options — and the serve fails closed.
    */
   private async repairEnablementAfterConcurrentMutation(
     workspaceId: string,
     optionsUsed: MCPWorkspaceRequestOptions,
     entry: WorkspaceServers,
     configGenerationUsed: number
-  ): Promise<void> {
+  ): Promise<MCPWorkspaceRequestOptions | undefined> {
+    let recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
     try {
-      let recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
       // Workspace mutations replace recorded options; global mutations only bump a
       // generation. Either can invalidate derived enablement.
       let needsRepair =
@@ -2197,6 +4649,8 @@ export class MCPServerManager {
         const latest = this.lastWorkspaceRequestOptions.get(workspaceId);
         if (latest === recorded && this.configService.configGeneration === generationRead) {
           entry.enabledServerNames = new Set(Object.keys(enabled));
+          entry.enabledServers = enabled;
+          entry.enabledServersGeneration = generationRead;
           // configSignature is always in-process JSON.stringify output, so parsing cannot fail.
           const previousEntries = JSON.parse(entry.configSignature) as Record<string, unknown>;
           const reconfigured = Object.keys(signatureEntries).filter(
@@ -2208,16 +4662,63 @@ export class MCPServerManager {
             for (const name of reconfigured) stale.add(name);
             entry.stalePromptServerNames = stale;
           }
-          return;
+          return recorded;
         }
         recorded = latest;
         needsRepair = true;
       }
+      return recorded;
     } catch (error) {
       log.debug("[MCP] Failed to repair enablement after concurrent settings change", {
         workspaceId,
         error: getErrorMessage(error),
       });
+      // Enablement was not re-derived: `entry.enabledServerNames` may still
+      // permit a server the newer options revoked. No verdict → fail closed.
+      return undefined;
+    }
+  }
+
+  /**
+   * Drop a workspace's cached override snapshot so its next request re-reads
+   * disk. Used when a publisher could not establish the workspace's effective
+   * overrides authoritatively (unreachable checkout): caching a guess would
+   * overlay every later request until restart, while a deleted entry simply
+   * defers to the fresh per-request read.
+   */
+  forgetWorkspaceOverrides(workspaceId: string): void {
+    this.latestWorkspaceOverrides.delete(workspaceId);
+    // The marker supersedes any publication repair still in flight (a bounded
+    // publisher evicts exactly because that repair stalled): served tools
+    // must not wait on it before observing the invalidation. Its late result
+    // is discarded by the repair's own fence.
+    this.pendingEnablementRepairs.delete(workspaceId);
+    // Recorded options carry the last served snapshot too, and the prompt
+    // paths (prompt listing, getPrompt) serve from them without a chat send.
+    // Flag them so the next serve of ANY kind re-reads overrides from disk
+    // instead of trusting that snapshot (see loadFirstServeWorkspaceOverrides).
+    this.markOverridesInvalidated(workspaceId);
+    this.bumpWorkspaceOptionsMutationCount(workspaceId);
+  }
+
+  /** Start (or advance) a workspace's invalidation generation. */
+  private markOverridesInvalidated(workspaceId: string): void {
+    this.overridesInvalidationClock += 1;
+    this.overridesInvalidationGenerations.set(workspaceId, this.overridesInvalidationClock);
+  }
+
+  /**
+   * forgetWorkspaceOverrides for every workspace this manager holds any
+   * snapshot for. Used when a publisher could not enumerate the workspace
+   * graph after a write and therefore cannot name the affected descendants.
+   */
+  forgetAllWorkspaceOverrides(): void {
+    this.globalOverridesEvictionGeneration += 1;
+    for (const workspaceId of new Set([
+      ...this.latestWorkspaceOverrides.keys(),
+      ...this.lastWorkspaceRequestOptions.keys(),
+    ])) {
+      this.forgetWorkspaceOverrides(workspaceId);
     }
   }
 
@@ -2227,27 +4728,81 @@ export class MCPServerManager {
     overrides: WorkspaceMCPOverrides | undefined
   ): Promise<void> {
     this.latestWorkspaceOverrides.set(workspaceId, overrides);
+    // An authoritative publication supersedes any pending invalidation: the
+    // cache now holds disk truth, so later serves neither re-read nor fail
+    // closed on its account.
+    this.overridesInvalidationGenerations.delete(workspaceId);
     this.bumpWorkspaceOptionsMutationCount(workspaceId);
     const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
-    if (recorded) {
-      this.lastWorkspaceRequestOptions.set(workspaceId, { ...recorded, overrides });
-    }
+    if (!recorded) return;
+    const published: MCPWorkspaceRequestOptions = { ...recorded, overrides };
+    this.lastWorkspaceRequestOptions.set(workspaceId, published);
     const entry = this.workspaceServers.get(workspaceId);
-    if (!entry || !recorded) return;
-    try {
-      const enabled = await this.listServers(
-        recorded.projectPath,
-        overrides,
-        recorded.trusted ?? false,
-        recorded.agentPlugins
-      );
-      entry.enabledServerNames = new Set(Object.keys(enabled));
-    } catch (error) {
-      log.debug("[MCP] Failed to sync workspace overrides into cached state", {
-        workspaceId,
-        error: getErrorMessage(error),
-      });
-    }
+    if (!entry) return;
+    await this.repairEnablement(workspaceId, published, entry);
+  }
+
+  /**
+   * Re-derive a live entry's enabled set from freshly recorded options (an
+   * override publication, a project trust change). Registered synchronously
+   * in pendingEnablementRepairs so a tool invocation racing the mutation
+   * waits for the repaired enablement instead of passing the gate on the
+   * pre-mutation set (see gateServedToolOnEnablement); never rejects.
+   */
+  private repairEnablement(
+    workspaceId: string,
+    published: MCPWorkspaceRequestOptions,
+    entry: WorkspaceServers
+  ): Promise<void> {
+    const repair = (async () => {
+      try {
+        const generationRead = this.configService.configGeneration;
+        const enabled = await this.listServers(
+          published.projectPath,
+          published.overrides,
+          published.trusted ?? false,
+          published.agentPlugins
+        );
+        // Fence: the publisher may have given up on this repair (bounded
+        // publication) and a later save, serve, or invalidation may have
+        // replaced the recorded options meanwhile — each derives enablement
+        // from state at least as new as this one, so a late completion must
+        // not restore the older enabled set on the live entry (a served tool
+        // would pass the call-time gate for a server the later save disabled).
+        if (
+          this.lastWorkspaceRequestOptions.get(workspaceId) !== published ||
+          this.workspaceServers.get(workspaceId) !== entry ||
+          this.overridesInvalidationGenerations.has(workspaceId)
+        ) {
+          log.debug("[MCP] Discarding a superseded publication repair", { workspaceId });
+          return;
+        }
+        entry.enabledServerNames = new Set(Object.keys(enabled));
+        entry.enabledServers = enabled;
+        entry.enabledServersGeneration = generationRead;
+      } catch (error) {
+        // The recorded overrides now say one thing and `entry.enabledServerNames`
+        // another (the old set), and the per-call disk comparison would find
+        // disk equal to the recorded value: nothing would ever repair the
+        // entry. Invalidate the workspace so every served tool call and the
+        // next serve re-derive enablement from disk (fail closed until then).
+        log.warn("[MCP] Failed to sync workspace overrides into cached state; invalidating", {
+          workspaceId,
+          error: getErrorMessage(error),
+        });
+        if (this.lastWorkspaceRequestOptions.get(workspaceId) === published) {
+          this.forgetWorkspaceOverrides(workspaceId);
+        }
+      }
+    })();
+    this.pendingEnablementRepairs.set(workspaceId, repair);
+    // Attached before any waiter can observe `repair`, so the registration is
+    // cleared before a gated tool call awaiting it resumes (reaction order).
+    return repair.finally(() => {
+      if (this.pendingEnablementRepairs.get(workspaceId) === repair) {
+        this.pendingEnablementRepairs.delete(workspaceId);
+      }
+    });
   }
 
   /**
@@ -2268,11 +4823,24 @@ export class MCPServerManager {
     for (const [path, trusted] of trustByPath) {
       this.latestProjectTrust.set(path, trusted);
     }
-    for (const [workspaceId, options] of this.lastWorkspaceRequestOptions) {
+    for (const [workspaceId, options] of [...this.lastWorkspaceRequestOptions]) {
       const trusted = trustByPath.get(stripTrailingSlashes(options.projectPath));
       if (trusted === undefined || (options.trusted ?? false) === trusted) continue;
-      this.lastWorkspaceRequestOptions.set(workspaceId, { ...options, trusted });
+      const published: MCPWorkspaceRequestOptions = { ...options, trusted };
+      this.lastWorkspaceRequestOptions.set(workspaceId, published);
       this.bumpWorkspaceOptionsMutationCount(workspaceId);
+      // The live entry's enabled set was derived under the OLD trust, and the
+      // call-time gate evaluates the server info captured at serve time: a
+      // project-local server the user just distrusted would keep dispatching
+      // from an already-prepared stream. Repair the enabled set like an
+      // override publication does (registered synchronously, so a racing
+      // tool call waits for it); the repair's own catch invalidates the
+      // workspace when re-derivation fails.
+      const entry = this.workspaceServers.get(workspaceId);
+      if (entry !== undefined) {
+        // Tracked in pendingEnablementRepairs and self-clearing; it never rejects.
+        this.repairEnablement(workspaceId, published, entry).catch(() => undefined);
+      }
     }
   }
 
@@ -2300,6 +4868,21 @@ export class MCPServerManager {
     }
   }
 
+  /**
+   * getPrompt has no caller snapshot: it dispatches from the RECORDED options,
+   * which a direct edit of an override document (the child's, or the parent
+   * document an inheriting child reads through) never touches — no epoch
+   * bump, no publication. Distrust them for the dispatch so
+   * ensureWorkspaceServers re-reads disk (and fails closed when it cannot
+   * vouch); a fresh read is recorded authoritative again. Without a reader the
+   * recorded options stay authoritative, as everywhere else.
+   */
+  private promptDispatchOptions(recorded: MCPWorkspaceRequestOptions): MCPWorkspaceRequestOptions {
+    return this.pluginInvalidation?.readWorkspaceOverrides !== undefined
+      ? { ...recorded, overridesAuthoritative: false }
+      : recorded;
+  }
+
   async getPrompt(
     workspaceId: string,
     serverName: string,
@@ -2307,24 +4890,1406 @@ export class MCPServerManager {
     args: Record<string, string>,
     options?: { signal?: AbortSignal }
   ): Promise<{ text: string; description?: string }> {
-    // Refresh cached state because it can outlive configuration changes. Race
-    // startup with cancellation, but let a losing startup finish into the cache
-    // so idle cleanup can close it.
-    const lastOptions = this.lastWorkspaceRequestOptions.get(workspaceId);
-    if (lastOptions) {
-      const refresh = async (projectSecrets: Record<string, string> | undefined): Promise<void> => {
-        // Re-read after the resolver await: a settings mutation recorded while
-        // secrets resolved must not be clobbered by a pre-await options snapshot.
-        const currentOptions = this.lastWorkspaceRequestOptions.get(workspaceId) ?? lastOptions;
-        await this.ensureWorkspaceServers(
-          projectSecrets !== undefined ? { ...currentOptions, projectSecrets } : currentOptions,
-          false
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP prompt request for '${serverName}/${promptName}'`,
+      (instance) => instance.getPrompt(promptName, args, options),
+      (result) => {
+        const text = flattenMcpPrompt(result);
+        if (text.trim().length === 0) {
+          // Providers can reject empty user content, so fail expansion up
+          // front rather than persisting an empty synthetic user message.
+          throw new Error(`MCP prompt '${serverName}/${promptName}' returned no text content`);
+        }
+        return {
+          // Cap here because both composer expansion and mcp_prompt_get use this path.
+          text: truncateUtf8Bytes(text, MCP_PROMPT_MAX_TEXT_BYTES, MCP_PROMPT_TRUNCATION_MARKER),
+          ...(result.description !== undefined ? { description: result.description } : {}),
+        };
+      },
+      options
+    );
+  }
+
+  /**
+   * tools/call for a Codex-format plugin hook, on a server that is ALREADY running and enabled in
+   * this workspace. It never starts or reconnects a server (Codex: hooks use an existing
+   * connection), so a hook whose server is off, excluded or not yet started fails, and the
+   * runner fails open. The caller builds `serverKey` from the hook's own plugin instance, so a
+   * hook can never reach another plugin's or the user's servers.
+   *
+   * The cached enabled set only gates the cheap early refusal. The dispatch itself goes through
+   * invokeServerOperation (Codex PRRT_kwDOPxxmWM6rNIIg), like an MCP Apps tool call: it re-reads
+   * the overrides and runs inside the epoch and admission fences, so a server that another
+   * backend or a direct settings edit disabled after the last serve is refused.
+   */
+  async callToolForPluginHook(
+    workspaceId: string,
+    serverKey: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    options: { signal: AbortSignal }
+  ): Promise<unknown> {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (!entry?.enabledServerNames.has(serverKey)) {
+      throw new Error(`MCP server '${serverKey}' is not enabled in this workspace`);
+    }
+    const instance = entry.instances.get(serverKey);
+    if (instance === undefined || instance.isClosed) {
+      throw new Error(`MCP server '${serverKey}' is not running`);
+    }
+    // The served-tool gate (Codex PRRT_kwDOPxxmWM6rN775, PRRT_kwDOPxxmWM6rN8uX): it re-derives
+    // enablement and the project/workspace tool allowlists at the call, inside the epoch and
+    // admission fences, like a model's MCP tool call. `reconcile: false`: where a model's call
+    // would re-serve (and so start or reconnect servers), a hook call is refused instead.
+    const hookTool: Tool = {
+      inputSchema: jsonSchema({ type: "object" }),
+      execute: () => {
+        // Dispatch-time instance: the gate's checks ran synchronously before this.
+        const current = this.workspaceServers.get(workspaceId)?.instances.get(serverKey);
+        if (current === undefined || current.isClosed) {
+          throw new Error(`MCP server '${serverKey}' is not running`);
+        }
+        this.markActivity(workspaceId);
+        return current.callToolForHook(toolName, args, options);
+      },
+    };
+    const gated = this.gateServedToolOnEnablement(
+      workspaceId,
+      serverKey,
+      toolName,
+      hookTool,
+      entry.enabledServers[serverKey],
+      { reconcile: false }
+    );
+    assert(gated.execute !== undefined, "the gate keeps execute");
+    return await gated.execute(args, {
+      toolCallId: `plugin-hook:${toolName}`,
+      messages: [],
+      abortSignal: options.signal,
+      context: undefined,
+    });
+  }
+
+  /**
+   * Whether callToolForPluginHook would dispatch `toolName` on `serverKey` now, from cached state
+   * only (no disk read, no serve): enabled (an override publication repairs this set) and running,
+   * not invalidated, and allowed by the project and workspace tool allowlists. The runner asks
+   * before it denies a call that is too large for the hook to check.
+   */
+  canCallToolForPluginHook(workspaceId: string, serverKey: string, toolName: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    const info = entry?.enabledServers[serverKey];
+    const instance = entry?.instances.get(serverKey);
+    if (
+      entry === undefined ||
+      info === undefined ||
+      instance === undefined ||
+      instance.isClosed ||
+      !entry.enabledServerNames.has(serverKey) ||
+      this.overridesInvalidationGenerations.has(workspaceId)
+    ) {
+      return false;
+    }
+    const overrides = this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides;
+    const allowlist = effectiveToolAllowlist(serverKey, info.toolAllowlist, overrides);
+    return allowlist === null || allowlist.has(toolName);
+  }
+
+  /**
+   * Whether a send or prompt discovery recorded this workspace's request options. Without them
+   * server operations cannot start servers (invokeServerOperation), e.g. right after a restart.
+   */
+  hasWorkspaceRequestOptions(workspaceId: string): boolean {
+    return this.lastWorkspaceRequestOptions.has(workspaceId);
+  }
+
+  /**
+   * Last settings values per server instance, then workspace. Memory only: the server persists
+   * them. Keyed by the instance that returned them, so a replaced, recycled or removed server
+   * (every path that drops an instance) can never serve the old instance's values.
+   */
+  private readonly settingsCache = new WeakMap<
+    MCPServerInstance,
+    Map<string, Record<string, MCPSettingValue>>
+  >();
+
+  /**
+   * Hook-time settings reads, per server instance and then workspace: in flight or settled.
+   * Concurrent hook calls join the same read, and a settled one (values, or undefined after a
+   * failure) is not repeated. Keyed by instance like settingsCache, so a recycled or replaced
+   * server is read again.
+   */
+  private readonly hookSettingsReads = new WeakMap<
+    MCPServerInstance,
+    Map<string, Promise<Record<string, MCPSettingValue> | undefined>>
+  >();
+
+  /**
+   * Settings for plugin hooks: every connected, enabled server of this
+   * workspace whose config key starts with `keyPrefix` (one plugin instance)
+   * and that has `openai/settings`, keyed by the plugin's own server name.
+   * Uses the cache; an empty cache is read once with a short timeout (all
+   * misses concurrently), and a failed read yields the current cache or `{}`.
+   * Never starts servers and never throws: hooks must not stall or break the turn.
+   */
+  async getSettingsForPluginHooks(
+    workspaceId: string,
+    keyPrefix: string,
+    timeoutMs: number
+  ): Promise<Record<string, Record<string, MCPSettingValue>>> {
+    // Null prototype: a plugin server named "__proto__" stays an own key (JSON keeps it).
+    const settings = Object.create(null) as Record<string, Record<string, MCPSettingValue>>;
+    // Only awaits when a repair is pending: without one, the reads start synchronously.
+    const pendingRepair = this.pendingEnablementRepairs.get(workspaceId);
+    if (pendingRepair !== undefined && !(await this.awaitRepairForHooks(pendingRepair, timeoutMs)))
+      return settings;
+    // After a repair wait, cached values only (#6186): the wait already spent the hook's budget,
+    // and a read given only the rest could time out and stay memoized as failed for the instance.
+    // The next hook call reads the misses with the full timeout.
+    const mayRead = pendingRepair === undefined;
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined) return settings;
+    const sources: Array<{
+      name: string;
+      instance: MCPServerInstance;
+      pluginServerName: string;
+      read?: Promise<Record<string, MCPSettingValue> | undefined>;
+    }> = [];
+    for (const [name, instance] of entry.instances) {
+      const pluginServerName = name.startsWith(keyPrefix)
+        ? this.hookSettingsServerName(workspaceId, name, instance)
+        : undefined;
+      if (pluginServerName === undefined) continue;
+      const cached = this.settingsCache.get(instance)?.get(workspaceId);
+      sources.push({
+        name,
+        instance,
+        pluginServerName,
+        ...(cached === undefined && mayRead
+          ? { read: this.readSettingsForHooks(instance, workspaceId, timeoutMs) }
+          : {}),
+      });
+    }
+    // Concurrently: misses on several servers share one timeout window instead of adding up.
+    const reads = await Promise.all(
+      sources.map((source) => source.read ?? Promise.resolve(undefined))
+    );
+    sources.forEach((source, index) => {
+      // Recheck every collected server, cached ones too (#6186): a server disabled, removed or
+      // replaced during any read must not hand its settings to the hook.
+      if (!this.isHookSettingsSourceCurrent(workspaceId, source.name, source.instance)) return;
+      // The cache first: a save that settled during a failed or older read holds newer values.
+      settings[source.pluginServerName] =
+        this.settingsCache.get(source.instance)?.get(workspaceId) ?? reads[index] ?? {};
+    });
+    return settings;
+  }
+
+  /** Enablement repairs a hook already waited on until its timeout (see awaitRepairForHooks). */
+  private readonly hookTimedOutRepairs = new WeakSet<Promise<void>>();
+
+  /**
+   * An override change waiting for repairEnablement can disable a server the entry still lists
+   * as enabled (#6186). Waits for it, bounded by the hook timeout. False when it did not settle
+   * in time: the hook then gets no settings (fail closed). A repair that already outlasted one
+   * hook's wait is not waited on again, so serial plugin hooks of one dispatch (or later ones)
+   * do not add one timeout each.
+   */
+  private async awaitRepairForHooks(repair: Promise<void>, timeoutMs: number): Promise<boolean> {
+    if (this.hookTimedOutRepairs.has(repair)) return false;
+    if ((await raceWithAbortAndTimeout(repair, { timeoutMs })).kind === "ok") return true;
+    this.hookTimedOutRepairs.add(repair);
+    return false;
+  }
+
+  /**
+   * The plugin's own name for server `name` when `instance` can give a hook settings now: a
+   * plugin server that is current (isHookSettingsSourceCurrent) and has `openai/settings`.
+   */
+  private hookSettingsServerName(
+    workspaceId: string,
+    name: string,
+    instance: MCPServerInstance
+  ): string | undefined {
+    const pluginServerName =
+      this.workspaceServers.get(workspaceId)?.enabledServers[name]?.plugin?.serverName;
+    if (
+      pluginServerName === undefined ||
+      !this.isHookSettingsSourceCurrent(workspaceId, name, instance) ||
+      instance.settings?.settingsCapability() === undefined
+    )
+      return undefined;
+    return pluginServerName;
+  }
+
+  /**
+   * Whether `instance` may give its settings to a hook now: still this workspace's running
+   * instance for `name` and enabled, with no override invalidation or enablement repair pending
+   * (as canCallToolForPluginHook: hooks fail closed instead of re-deriving enablement).
+   */
+  private isHookSettingsSourceCurrent(
+    workspaceId: string,
+    name: string,
+    instance: MCPServerInstance
+  ): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    return (
+      entry?.instances.get(name) === instance &&
+      entry.enabledServerNames.has(name) &&
+      !instance.isClosed &&
+      !this.overridesInvalidationGenerations.has(workspaceId) &&
+      !this.pendingEnablementRepairs.has(workspaceId)
+    );
+  }
+
+  private readSettingsForHooks(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    timeoutMs: number
+  ): Promise<Record<string, MCPSettingValue> | undefined> {
+    const byWorkspace =
+      this.hookSettingsReads.get(instance) ??
+      new Map<string, Promise<Record<string, MCPSettingValue> | undefined>>();
+    this.hookSettingsReads.set(instance, byWorkspace);
+    let read = byWorkspace.get(workspaceId);
+    if (read === undefined) {
+      read = (async () => {
+        try {
+          const requestId = this.takeSettingsRequestId(instance, workspaceId);
+          const parsed = parseMCPSettingsReadResult(
+            await this.callSettingsTool(instance, workspaceId, "readTool", {}, { timeoutMs })
+          );
+          if ("error" in parsed) throw new Error(parsed.error);
+          // A newer request (a save or dialog read) began meanwhile: its cached values win.
+          if (this.cacheSettings(instance, workspaceId, requestId, parsed.values))
+            return parsed.values;
+          return this.settingsCache.get(instance)?.get(workspaceId) ?? parsed.values;
+        } catch (error) {
+          log.warn(
+            `[MCP] Settings read for plugin hooks failed for '${instance.name}'; passing the cached values or {}`,
+            {
+              workspaceId,
+              error: getErrorMessage(error),
+            }
+          );
+          return undefined;
+        }
+      })();
+      byWorkspace.set(workspaceId, read);
+    }
+    return read;
+  }
+
+  /** Last settings values read or saved for this workspace's current server instance, if any. */
+  getCachedSettings(
+    workspaceId: string,
+    serverName: string
+  ): Record<string, MCPSettingValue> | undefined {
+    const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
+    return instance === undefined ? undefined : this.settingsCache.get(instance)?.get(workspaceId);
+  }
+
+  /**
+   * Latest settings request (read or update) per server instance, then workspace. A request
+   * takes its ID before dispatch, and its result is cached only while that ID is still the
+   * latest: an older read that settles last never overwrites a newer read or update.
+   */
+  private readonly settingsRequestIds = new WeakMap<MCPServerInstance, Map<string, number>>();
+  private settingsRequestCount = 0;
+
+  private takeSettingsRequestId(instance: MCPServerInstance, workspaceId: string): number {
+    const byWorkspace = this.settingsRequestIds.get(instance) ?? new Map<string, number>();
+    this.settingsRequestIds.set(instance, byWorkspace);
+    byWorkspace.set(workspaceId, ++this.settingsRequestCount);
+    return this.settingsRequestCount;
+  }
+
+  /** Caches `values` when `requestId` is still the latest request; returns whether it did. */
+  private cacheSettings(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    requestId: number,
+    values: Record<string, MCPSettingValue>
+  ): boolean {
+    if (this.settingsRequestIds.get(instance)?.get(workspaceId) !== requestId) return false;
+    const byWorkspace =
+      this.settingsCache.get(instance) ?? new Map<string, Record<string, MCPSettingValue>>();
+    byWorkspace.set(workspaceId, values);
+    this.settingsCache.set(instance, byWorkspace);
+    return true;
+  }
+
+  /** Calls a settings tool with the workspace `_meta`; returns its structuredContent. */
+  private async callSettingsTool(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    pick: "readTool" | "updateTool",
+    args: Record<string, unknown>,
+    options?: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<unknown> {
+    const capability = instance.settings?.settingsCapability();
+    if (instance.settings === undefined || capability === undefined)
+      throw new Error(`MCP server '${instance.name}' has no settings`);
+    const result = await instance.settings.callSettingsTool(
+      capability[pick],
+      args,
+      { [MCP_SETTINGS_WORKSPACE_META_KEY]: workspaceId },
+      options
+    );
+    if (result.isError === true) {
+      const text = Array.isArray(result.content)
+        ? result.content.map((part) => (part.type === "text" ? part.text : "")).join(" ")
+        : "";
+      throw new Error(text.trim() || `MCP server '${instance.name}' refused the settings request`);
+    }
+    return result.structuredContent;
+  }
+
+  /**
+   * Read and validate a server's structured settings for one workspace
+   * (cached on success). Null when the server has no `openai/settings`.
+   */
+  /**
+   * Whether this workspace runs the server now (enabled, connected). The
+   * workspace MCP dialog reads settings on open only then, so opening it never
+   * starts a server; Fetch Tools does.
+   */
+  isWorkspaceServerConnected(workspaceId: string, serverName: string): boolean {
+    const entry = this.workspaceServers.get(workspaceId);
+    const instance = entry?.instances.get(serverName);
+    return (
+      entry?.enabledServerNames.has(serverName) === true &&
+      instance !== undefined &&
+      !instance.isClosed
+    );
+  }
+
+  /** Random per server instance; see MCPSettingsReadSnapshot. */
+  private readonly settingsInstanceTokens = new WeakMap<MCPServerInstance, string>();
+
+  private settingsInstanceToken(instance: MCPServerInstance): string {
+    let token = this.settingsInstanceTokens.get(instance);
+    if (token === undefined) {
+      token = crypto.randomUUID();
+      this.settingsInstanceTokens.set(instance, token);
+    }
+    return token;
+  }
+
+  async readSettings(
+    workspaceId: string,
+    serverName: string,
+    /** `noStart`: read only a running instance; never start or restart the server. */
+    options?: { signal?: AbortSignal; timeoutMs?: number; noStart?: boolean }
+  ): Promise<MCPSettingsReadSnapshot | null> {
+    // The catalog refresh after the read shares the read's deadline (#6611).
+    const startedAt = Date.now();
+    const noSettings = Symbol("no settings");
+    let source: { instance: MCPServerInstance; requestId: number } | undefined;
+    const snapshot = await this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings read for '${serverName}'`,
+      (instance) => {
+        if (instance.settings?.settingsCapability() === undefined)
+          return Promise.resolve(noSettings);
+        source = { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
+        return this.callSettingsTool(instance, workspaceId, "readTool", {}, options);
+      },
+      (content) => {
+        if (content === noSettings) return null;
+        const parsed = parseMCPSettingsReadResult(content);
+        if ("error" in parsed) throw new Error(`MCP server '${serverName}': ${parsed.error}`);
+        return parsed;
+      },
+      options
+    );
+    if (snapshot === null) return null;
+    for (const warning of snapshot.warnings)
+      log.warn(`[MCP] Settings of '${serverName}': ${warning}`, { workspaceId });
+    assert(source !== undefined, "a settings snapshot comes from a server instance");
+    this.cacheSettings(source.instance, workspaceId, source.requestId, snapshot.values);
+    const { instance } = source;
+    const instanceToken = this.settingsInstanceToken(instance);
+    const read = {
+      ...snapshot,
+      layout: await this.withSettingsToolActions(
+        instance,
+        workspaceId,
+        serverName,
+        snapshot.layout,
+        options,
+        startedAt
+      ),
+    };
+    // The hash covers what this read returns (its layout carries the tool actions), the same
+    // object a save's fresh read is compared with (runSettingsSave).
+    this.rememberSettingsSchema(workspaceId, serverName, instanceToken, read, source.requestId);
+    const readId = this.rememberSettingsReadTools(
+      crypto.randomUUID(),
+      workspaceId,
+      serverName,
+      instanceToken,
+      read
+    );
+    return { ...read, instanceToken, readId };
+  }
+
+  /**
+   * The layout with each tool item's action (see settingsToolAction). The catalog is refreshed
+   * first, as before a dispatch (refreshSettingsActionTools, so a legacy catalog is re-listed
+   * too): after tools/list_changed the held catalog would show a new tool as unavailable and
+   * keep a removed one runnable. Bounded by the read's own deadline (#6611, see
+   * settingsCatalogRefreshBudgetMs). Unlike a dispatch, a refresh that fails or times out keeps
+   * the held catalog: the dispatch refreshes again and refuses on a stale one. Its actions then
+   * ask for a confirmation (knownWritability): a held "read-only" flag can be stale.
+   */
+  private async withSettingsToolActions(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    layout: MCPSettingsGroup[],
+    options: { signal?: AbortSignal; timeoutMs?: number } | undefined,
+    readStartedAt: number
+  ): Promise<MCPSettingsGroup[]> {
+    const refreshed =
+      !layout.some((group) => group.items.some((item) => item.kind === "tool")) ||
+      (await this.refreshSettingsActionToolsWithin(
+        instance,
+        options?.signal,
+        settingsCatalogRefreshBudgetMs(readStartedAt, options)
+      ));
+    return layout.map((group) => ({
+      ...group,
+      items: group.items.map((item) => {
+        if (item.kind !== "tool") return item;
+        const action = this.settingsToolAction(instance, workspaceId, serverName, item.tool);
+        return action === undefined
+          ? item
+          : { ...item, action: knownWritability(action, refreshed) };
+      }),
+    }));
+  }
+
+  /**
+   * A layout tool item's action: a tool the server lists and the tool allowlist allows. An MCP
+   * App tool needs MCP Apps (the mcp-apps experiment and an apps connection): without them it
+   * has no action, so it is never run as a regular tool without its view.
+   */
+  private settingsToolAction(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string
+  ): MCPSettingsToolAction | undefined {
+    const action = instance.settings?.settingsToolAction(toolName);
+    const allowlist = this.appToolAllowlist(workspaceId, serverName);
+    if (allowlist !== null && !allowlist.has(toolName)) return undefined;
+    return action?.opensApp === true && !this.canOpenApps(instance) ? undefined : action;
+  }
+
+  /** MCP Apps work on this instance now: the experiment is on and it has an apps connection. */
+  private canOpenApps(instance: MCPServerInstance): boolean {
+    return this.mcpApps?.isEnabled() === true && instance.apps !== undefined;
+  }
+
+  /**
+   * A fresh tools/list for a settings action: a modern instance refreshes through its response
+   * cache (refreshInstanceTools). A legacy instance has no such refresh, and without MCP Apps
+   * nothing re-lists it on tools/list_changed, so it lists again here. Resolves false on failure.
+   */
+  private refreshSettingsActionTools(instance: MCPServerInstance): Promise<boolean> {
+    if (instance.refreshTools !== undefined || instance.settings === undefined)
+      return this.refreshInstanceTools(instance);
+    return instance.settings.relistTools().then(
+      () => true,
+      (error: unknown) => {
+        log.debug("[MCP] Tool list refresh for a settings action failed", {
+          name: instance.name,
+          error: getErrorMessage(error),
+        });
+        return false;
+      }
+    );
+  }
+
+  /**
+   * Refresh the running instance's catalog before a settings action dispatch (bounded). Fails
+   * closed: when the refresh times out or fails, the held catalog can be stale (a tool that
+   * became writable still reads as read-only and would run without the user's confirmation),
+   * so the dispatch is refused instead of falling back to it.
+   */
+  private async refreshSettingsActionCatalog(
+    workspaceId: string,
+    serverName: string,
+    signal: AbortSignal | undefined
+  ): Promise<void> {
+    const instance = this.workspaceServers.get(workspaceId)?.instances.get(serverName);
+    if (instance === undefined || instance.isClosed) return;
+    const refreshed = await this.refreshSettingsActionToolsWithin(
+      instance,
+      signal,
+      MCP_APP_CATALOG_REFRESH_TIMEOUT_MS
+    );
+    if (!refreshed) throw new Error(`Could not refresh ${serverName}'s tools; try again`);
+  }
+
+  /** refreshSettingsActionTools, bounded: false when it failed, timed out or was aborted. */
+  private async refreshSettingsActionToolsWithin(
+    instance: MCPServerInstance,
+    signal: AbortSignal | undefined,
+    timeoutMs: number
+  ): Promise<boolean> {
+    const refreshed = await raceWithAbortAndTimeout(this.refreshSettingsActionTools(instance), {
+      ...(signal !== undefined ? { signal } : {}),
+      timeoutMs,
+    });
+    return refreshed.kind === "ok" && refreshed.value;
+  }
+
+  /**
+   * Run a settings layout tool action: the spec calls the same-server tool with `{}` and shows
+   * the text of its result. Refused when the server instance is not the one the dialog read,
+   * when the tool has no action (see settingsToolAction) or opens an MCP App, and when a tool
+   * without `readOnlyHint: true` runs without the user's confirmation.
+   */
+  async runSettingsTool(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    /** The dialog's read: its server instance, and the read whose layout offered the tool. */
+    read: SettingsActionRead,
+    options: { confirmed: boolean; signal?: AbortSignal }
+  ): Promise<{ text: string; isError: boolean }> {
+    // A tool that tools/list_changed removed since the dialog read is refused.
+    await this.refreshSettingsActionCatalog(workspaceId, serverName, options.signal);
+    // One-shot dispatch, like callMcpAppTool: an epoch retry must not run the tool twice.
+    let dispatched: Promise<MCPRawCallToolResult> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings tool '${serverName}/${toolName}'`,
+      (instance) => {
+        if (dispatched !== null) return dispatched;
+        const refusal = this.settingsToolRefusal(instance, workspaceId, serverName, toolName, {
+          read,
+          confirmed: options.confirmed,
+          opensApp: false,
+        });
+        if (refusal !== null) return Promise.reject(refusal);
+        assert(instance.settings !== undefined, "a settings tool action has a settings client");
+        log.info("[MCP] Settings tool action", { workspaceId, serverName, toolName });
+        dispatched = instance.settings.callSettingsActionTool(
+          toolName,
+          { [MCP_SETTINGS_WORKSPACE_META_KEY]: workspaceId },
+          options
         );
-      };
-      // Refresh until both mutation counters and resolved secrets remain stable
-      // so neither a settings mutation nor a secret rotation completing during
-      // the refresh leaves this dispatch on pre-mutation state. Later mutations
-      // race with the in-flight request and cannot be prevented here.
+        return dispatched;
+      },
+      settingsToolResultText,
+      options
+    );
+  }
+
+  /**
+   * Why runSettingsTool (`opensApp: false`) or openSettingsApp (`opensApp: true`) refuses to
+   * call the tool on this instance; null when it may. Each path takes only its own kind of tool.
+   */
+  private settingsToolRefusal(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    request: { read: SettingsActionRead; confirmed: boolean; opensApp: boolean }
+  ): Error | null {
+    const unread = this.settingsReadRefusal(
+      instance,
+      workspaceId,
+      serverName,
+      toolName,
+      request.read
+    );
+    if (unread !== null) return unread;
+    const action = this.settingsToolAction(instance, workspaceId, serverName, toolName);
+    if (action === undefined) return new Error(`'${serverName}' has no tool named '${toolName}'`);
+    if (action.opensApp !== request.opensApp)
+      return new Error(
+        `'${action.title}' ${action.opensApp ? "opens an MCP App" : "has no MCP App"}`
+      );
+    if (!action.readOnly && !request.confirmed)
+      return new Error(`'${action.title}' runs only after a confirmation`);
+    return null;
+  }
+
+  /**
+   * Why a tool action fails the dialog's read: the read is unknown, foreign, or named with
+   * another read's instance token; the instance is not the one read and does not show that very
+   * read's schema (a restart); or that read's layout does not offer the tool (#6611). A crafted
+   * renderer call must not run a listed, allowed tool the settings never showed, and a second
+   * window's newer read must not widen what the first window's read may run.
+   */
+  private settingsReadRefusal(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    read: SettingsActionRead
+  ): Error | null {
+    const offered = this.settingsReadTools.get(read.readId);
+    // A forgotten (bounded) read, or one of another workspace or server: the dialog must read
+    // again. It gets its own text, since no restart happened (#6821).
+    if (offered?.key !== settingsSaveKey(workspaceId, serverName))
+      return new Error("This dialog's settings are out of date. Reopen the dialog.");
+    // A mismatched read, or an instance that no longer shows this read's schema.
+    if (
+      offered.instanceToken !== read.instanceToken ||
+      !this.isSettingsReadCurrent(workspaceId, serverName, instance, offered)
+    )
+      return staleSettingsInstanceError(serverName);
+    return offered.tools.has(toolName)
+      ? null
+      : new Error(`'${serverName}' settings do not offer '${toolName}'`);
+  }
+
+  /** settingsToolRefusal for an app open, then the entry point budget (an open calls the tool). */
+  private settingsAppRefusal(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    request: { read: SettingsActionRead; confirmed: boolean }
+  ): Error | null {
+    const refusal = this.settingsToolRefusal(instance, workspaceId, serverName, toolName, {
+      ...request,
+      opensApp: true,
+    });
+    if (refusal !== null) return refusal;
+    return this.allowEntrypointCall(workspaceId, serverName)
+      ? null
+      : new Error(`Too many app opens for '${serverName}'; try again shortly`);
+  }
+
+  /**
+   * Open a settings layout tool action's MCP App (the spec shows it in a modal on top of the
+   * settings): call the tool with `{}` and store the result as the view record under
+   * mcpSettingsAppKey, as an entry point open does, so the modal mounts it through
+   * getMcpAppView. The same checks as runSettingsTool apply, and the entry point budget.
+   */
+  async openSettingsApp(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    /** The dialog's read (runSettingsTool). */
+    read: SettingsActionRead,
+    options: { confirmed: boolean; signal?: AbortSignal }
+  ): Promise<MCPSettingsAppView> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    const store = this.mcpApps.store;
+    // A tool that tools/list_changed removed or changed since the dialog read is refused.
+    await this.refreshSettingsActionCatalog(workspaceId, serverName, options.signal);
+    // One-shot dispatch, as in callMcpAppTool: an epoch retry must not call the tool twice.
+    let dispatched: Promise<MCPSettingsAppView> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings app '${serverName}/${toolName}'`,
+      (instance): Promise<MCPSettingsAppView> => {
+        if (dispatched !== null) return dispatched;
+        const refusal = this.settingsAppRefusal(instance, workspaceId, serverName, toolName, {
+          read,
+          confirmed: options.confirmed,
+        });
+        if (refusal !== null) return Promise.reject(refusal);
+        const resourceUri = requireAppsConnection(instance).toolUi(toolName)?.resourceUri;
+        const settings = instance.settings;
+        const title = settings?.settingsToolAction(toolName)?.title;
+        assert(settings && resourceUri !== undefined && title !== undefined, "an app has a view");
+        log.info("[MCP Apps] Opening a settings app", { workspaceId, serverName, toolName });
+        const viewKey = mcpSettingsAppKey(serverName, toolName);
+        const order = ++this.entrypointOpenCount;
+        // Through the settings action path: `{}` plus the workspace `_meta` every settings call
+        // carries, so a server that scopes its settings by workspace sees the right one.
+        const call = settings.callSettingsActionTool(
+          toolName,
+          { [MCP_SETTINGS_WORKSPACE_META_KEY]: workspaceId },
+          options
+        );
+        dispatched = call.then(async (result) => {
+          const stored = await this.storeEntrypointResult(store, workspaceId, order, {
+            toolCallId: viewKey,
+            serverName,
+            toolName,
+            resourceUri,
+            arguments: {},
+            result,
+            // Not a tool call's view: a chat card or restored tab never resolves to it.
+            entrypoint: true,
+          });
+          // The key is stable per server and tool: an unstored result would open the view
+          // with the previous open's result, so the open fails instead.
+          assertSettingsAppStored(stored, title);
+          const serverLabel = this.appServerLabel(workspaceId, serverName);
+          return { viewKey, serverName, serverLabel, toolName, title, resourceUri };
+        });
+        return dispatched;
+      },
+      (result) => result,
+      options
+    );
+  }
+
+  /** Saves in flight per workspace and server (settingsSavesSettled). */
+  private readonly pendingSettingsSaves = new Map<string, Set<Promise<unknown>>>();
+
+  /**
+   * Resolves once this server's saves in flight settled. The dialog's reads wait for it: a
+   * dialog reopened during a save must not show the values from before the save. Resolves to
+   * the part of `timeoutMs` left (at least 1 ms), so the read that follows shares one deadline
+   * with the wait instead of starting a second full one.
+   */
+  async settingsSavesSettled(
+    workspaceId: string,
+    serverName: string,
+    /**
+     * The read's own deadline and abort: a stalled save (tool calls time out after minutes) must
+     * not hold the dialog's bulk read. Past either, the read goes ahead without waiting.
+     */
+    options: { signal?: AbortSignal; timeoutMs: number }
+  ): Promise<number> {
+    const saves = this.pendingSettingsSaves.get(settingsSaveKey(workspaceId, serverName));
+    if (saves === undefined) return options.timeoutMs;
+    const started = Date.now();
+    // A failed save is the save's own error; a read only waits for it.
+    await raceUntilAborted(Promise.allSettled([...saves]), [
+      AbortSignal.timeout(options.timeoutMs),
+      ...(options.signal !== undefined ? [options.signal] : []),
+    ]);
+    return Math.max(1, options.timeoutMs - (Date.now() - started));
+  }
+
+  /**
+   * The schema each recent instance token was read with, as a hash, per workspace and server: a
+   * save whose token names a restarted instance (idle stop, crash restart) still lands when the
+   * new instance shows the same schema. Keyed by server too, so a token read from one server
+   * never passes the check of a save to another. Bounded: the oldest entry is forgotten first,
+   * and its save is refused.
+   */
+  private readonly settingsSchemaHashes = new Map<string, string>();
+  /**
+   * The request ID of the read each settingsSchemaHashes entry came from (same keys and bound),
+   * so an older read that settles last does not replace a newer read's hash.
+   */
+  private readonly settingsSchemaRequestIds = new Map<string, number>();
+  /**
+   * The tools each read's layout offered, by the read's readId (settingsReadRefusal), with its
+   * workspace and server key. Bounded like settingsSchemaHashes: the oldest read goes first.
+   */
+  private readonly settingsReadTools = new Map<string, SettingsReadRecord>();
+
+  /**
+   * Whether the read still applies to `instance`: the same instance, or a restarted one whose
+   * latest read showed this very read's schema (not another window's later read, #6611).
+   */
+  private isSettingsReadCurrent(
+    workspaceId: string,
+    serverName: string,
+    instance: MCPServerInstance,
+    read: SettingsReadRecord
+  ): boolean {
+    const currentToken = this.settingsInstanceToken(instance);
+    if (currentToken === read.instanceToken) return true;
+    const current = this.settingsSchemaHashes.get(
+      settingsSchemaKey(workspaceId, serverName, currentToken)
+    );
+    return current === read.schemaHash;
+  }
+
+  /**
+   * Whether a request that names `requestToken` (the dialog's read) may act on this workspace
+   * and server's instance with `currentToken`: the same instance, or a restarted one (idle stop,
+   * crash restart) whose last read showed the same schema. Saves (runSettingsSave, right after a
+   * fresh read) and tool actions (settingsToolRefusal, against the instance's last read) share
+   * this rule. An instance no read has seen yet has no hash and is refused. Both lookups use the
+   * workspace and server, so a token read from another server never matches.
+   */
+  private isSettingsTokenAccepted(
+    workspaceId: string,
+    serverName: string,
+    currentToken: string,
+    requestToken: string
+  ): boolean {
+    if (currentToken === requestToken) return true;
+    const hashOf = (token: string) =>
+      this.settingsSchemaHashes.get(settingsSchemaKey(workspaceId, serverName, token));
+    const current = hashOf(currentToken);
+    return current !== undefined && current === hashOf(requestToken);
+  }
+
+  private rememberSettingsSchema(
+    workspaceId: string,
+    serverName: string,
+    instanceToken: string,
+    snapshot: MCPSettingsSnapshot,
+    requestId: number
+  ): void {
+    const key = settingsSchemaKey(workspaceId, serverName, instanceToken);
+    // Each newer read overwrites its token's hash and tools together: the latest schema of an
+    // instance is the one a save validated against (the dialog shows that read). An older read
+    // that settles last changes neither (#6611), so both always describe the same read.
+    if (isNewerSettingsRead(this.settingsSchemaRequestIds.get(key), requestId)) return;
+    this.settingsSchemaHashes.delete(key);
+    this.settingsSchemaHashes.set(key, settingsSchemaHash(snapshot));
+    this.settingsSchemaRequestIds.set(key, requestId);
+    this.forgetOldestSettingsReadPastBound();
+  }
+
+  /** Bounds settingsSchemaHashes (and settingsSchemaRequestIds with it): the oldest goes first. */
+  private forgetOldestSettingsReadPastBound(): void {
+    if (this.settingsSchemaHashes.size <= MAX_REMEMBERED_SETTINGS_SCHEMAS) return;
+    const oldest = this.settingsSchemaHashes.keys().next().value;
+    if (oldest === undefined) return;
+    this.settingsSchemaHashes.delete(oldest);
+    this.settingsSchemaRequestIds.delete(oldest);
+  }
+
+  /** Remember read `readId` for its tool actions (settingsReadRefusal); returns `readId`. */
+  private rememberSettingsReadTools(
+    readId: string,
+    workspaceId: string,
+    serverName: string,
+    instanceToken: string,
+    snapshot: MCPSettingsSnapshot
+  ): string {
+    this.settingsReadTools.set(readId, {
+      key: settingsSaveKey(workspaceId, serverName),
+      instanceToken,
+      schemaHash: settingsSchemaHash(snapshot),
+      tools: settingsLayoutToolNames(snapshot.layout),
+    });
+    if (this.settingsReadTools.size > MAX_REMEMBERED_SETTINGS_SCHEMAS) {
+      const oldest = this.settingsReadTools.keys().next().value;
+      if (oldest !== undefined) this.settingsReadTools.delete(oldest);
+    }
+    return readId;
+  }
+
+  /**
+   * The workspace MCP dialog's save: validate `set` against a fresh read, send it, and return
+   * the snapshot the server shows afterwards (its schema can change with the values). Refused
+   * when the server instance is not the one the dialog read (`instanceToken`).
+   */
+  async saveSettings(
+    workspaceId: string,
+    serverName: string,
+    set: Record<string, MCPSettingValue>,
+    instanceToken: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPSettingsReadSnapshot> {
+    const key = settingsSaveKey(workspaceId, serverName);
+    const save = this.runSettingsSave(workspaceId, serverName, set, instanceToken, options);
+    const saves = this.pendingSettingsSaves.get(key) ?? new Set<Promise<unknown>>();
+    saves.add(save);
+    this.pendingSettingsSaves.set(key, saves);
+    try {
+      return await save;
+    } finally {
+      saves.delete(save);
+      if (saves.size === 0 && this.pendingSettingsSaves.get(key) === saves)
+        this.pendingSettingsSaves.delete(key);
+    }
+  }
+
+  private async runSettingsSave(
+    workspaceId: string,
+    serverName: string,
+    set: Record<string, MCPSettingValue>,
+    instanceToken: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<MCPSettingsReadSnapshot> {
+    // Validate against a fresh read: the renderer's schema can be stale. Each read has the
+    // dialog's read deadline (#6611), so a hung server fails the save instead of holding it.
+    const readOptions = { ...options, timeoutMs: MCP_SETTINGS_READ_TIMEOUT_MS };
+    const prior = await this.readSettings(workspaceId, serverName, readOptions);
+    if (prior === null) throw new Error(`MCP server '${serverName}' has no settings`);
+    // Another instance (restarted or replaced since the dialog read): the save still lands when
+    // it shows the schema the dialog validated against, else the user must reopen.
+    if (!this.isSettingsTokenAccepted(workspaceId, serverName, prior.instanceToken, instanceToken))
+      throw staleSettingsInstanceError(serverName);
+    const values = await this.updateSettings(
+      workspaceId,
+      serverName,
+      set,
+      prior,
+      prior.instanceToken
+    );
+    try {
+      const after = await this.readSettings(workspaceId, serverName, readOptions);
+      if (after !== null) return after;
+    } catch (error) {
+      // The update landed: report it as saved with the schema from before.
+      log.warn(`[MCP] Settings read after the update of '${serverName}' failed`, {
+        workspaceId,
+        error: getErrorMessage(error),
+      });
+    }
+    return { ...prior, values };
+  }
+
+  /**
+   * Send changed settings (`{set}`) and cache the server's returned values.
+   * `prior` is the read the caller validated `set` against (its schema and values).
+   */
+  async updateSettings(
+    workspaceId: string,
+    serverName: string,
+    set: Record<string, MCPSettingValue>,
+    prior: Pick<MCPSettingsSnapshot, "properties" | "values">,
+    /** The instance `prior` came from: another instance refuses the update. */
+    expectedInstanceToken: string
+  ): Promise<Record<string, MCPSettingValue>> {
+    const { properties } = prior;
+    for (const [name, value] of Object.entries(set)) {
+      const schema = Object.hasOwn(properties, name) ? properties[name] : undefined;
+      const error = schema === undefined ? "is unknown" : validateMCPSettingValue(schema, value);
+      if (error !== null) throw new Error(`Setting '${name}' ${error}`);
+    }
+    // One-shot dispatch, like callMcpAppTool: an epoch retry must not send the update twice.
+    let dispatched: Promise<unknown> | null = null;
+    let source: { instance: MCPServerInstance; requestId: number } | undefined;
+    const values = await this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP settings update for '${serverName}'`,
+      (instance) => {
+        source ??= { instance, requestId: this.takeSettingsRequestId(instance, workspaceId) };
+        return (dispatched ??= this.sendSettingsUpdate(
+          instance,
+          workspaceId,
+          set,
+          expectedInstanceToken
+        ));
+      },
+      (content) => {
+        const warnings: string[] = [];
+        const raw = content !== null && typeof content === "object" ? content : {};
+        const result = filterMCPSettingValues(properties, Reflect.get(raw, "values"), warnings);
+        for (const warning of warnings)
+          log.warn(`[MCP] Settings update of '${serverName}': ${warning}`, { workspaceId });
+        // A property the result omits or sends invalid keeps its prior value: resetting it
+        // would show a false or empty control and forget what the server stores.
+        return { ...prior.values, ...result };
+      }
+    );
+    if (source !== undefined)
+      this.cacheSettings(source.instance, workspaceId, source.requestId, values);
+    return values;
+  }
+
+  /** The update tool call; refused when `expectedInstanceToken` names another instance. */
+  private sendSettingsUpdate(
+    instance: MCPServerInstance,
+    workspaceId: string,
+    set: Record<string, MCPSettingValue>,
+    expectedInstanceToken: string
+  ): Promise<unknown> {
+    // The caller validated `set` against the schema of the instance that sent it.
+    if (this.settingsInstanceToken(instance) !== expectedInstanceToken)
+      return Promise.reject(staleSettingsInstanceError(instance.name));
+    return this.callSettingsTool(instance, workspaceId, "updateTool", { set });
+  }
+
+  /** Host-only MCP Apps record (raw tool result) for a tool call, or null when missing. */
+  async getMcpAppResult(
+    workspaceId: string,
+    toolCallId: string
+  ): Promise<McpAppResultRecord | null> {
+    return (await this.mcpApps?.store.get(workspaceId, toolCallId)) ?? null;
+  }
+
+  /** ui/update-model-context of the view of `record` (its result record binds the server). */
+  async setMcpAppModelContext(
+    workspaceId: string,
+    record: McpAppResultRecord,
+    text: string
+  ): Promise<void> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    await this.mcpApps.store.setModelContext(workspaceId, {
+      toolCallId: record.toolCallId,
+      serverName: record.serverName,
+      toolName: record.toolName,
+      text,
+    });
+  }
+
+  /** window.openai widget state of the view of a result record; see McpAppResultStore. */
+  async setMcpAppWidgetState(
+    workspaceId: string,
+    toolCallId: string,
+    binding: string,
+    state: unknown
+  ): Promise<void> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    await this.mcpApps.store.setWidgetState(workspaceId, toolCallId, binding, state);
+  }
+
+  /** The views' latest model context, newest first; none while MCP Apps is off. */
+  async getMcpAppModelContexts(workspaceId: string): Promise<readonly McpAppModelContext[]> {
+    if (this.mcpApps?.isEnabled() !== true) return [];
+    return this.mcpApps.store.getModelContexts(workspaceId);
+  }
+
+  /** resources/read for an MCP Apps view, validated (mime, encoding, size). */
+  async readMcpAppResource(
+    workspaceId: string,
+    serverName: string,
+    uri: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<McpAppResource> {
+    assert(isMcpAppResourceUri(uri), "MCP Apps views are only read from ui:// URIs");
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP Apps view request for '${serverName}'`,
+      (instance) => requireAppsConnection(instance).readResource(uri, options),
+      (result) => extractMcpAppResource(result, uri),
+      options
+    );
+  }
+
+  /**
+   * resources/read issued by an MCP Apps view of `serverName` (the caller passes the view's own
+   * server, so reads never cross servers). Returns the server's raw ReadResourceResult. Any URI
+   * the server serves is allowed: the view is that server's own UI, so it reads nothing the
+   * server could not already hand it through a tool result.
+   */
+  async readMcpAppServerResource(
+    workspaceId: string,
+    serverName: string,
+    uri: string,
+    options?: { signal?: AbortSignal }
+  ): Promise<unknown> {
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP Apps resource read for '${serverName}'`,
+      (instance) => requireAppsConnection(instance).readResource(uri, options),
+      (result): unknown => result,
+      options
+    );
+  }
+
+  /**
+   * tools/call on behalf of an MCP Apps view of `serverName` (the caller passes the view's own
+   * server, so calls never cross servers). Enforces the spec's visibility rules: tools whose
+   * visibility lacks "app" are rejected, and tools also visible to the model need the user's
+   * consent for each call.
+   */
+  async callMcpAppTool(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    options: { consented: boolean; signal?: AbortSignal }
+  ): Promise<McpAppToolCallResult> {
+    // One-shot dispatch (Codex PRRT_kwDOPxxmWM6oPSHx): invokeServerOperation runs the operation
+    // inside runWithStablePluginEpoch, whose postflight re-runs it when a sibling's plugin or
+    // override mutation moved the epoch. That retry was built for read-only requests; an
+    // approved tool call may mutate, so a re-run returns the first dispatch instead of calling
+    // the tool again. Every attempt before the first dispatch still runs the checks below.
+    let dispatched: Promise<McpAppToolCallResult> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP Apps tool call '${serverName}/${toolName}'`,
+      (instance): Promise<McpAppToolCallResult> => {
+        if (dispatched !== null) return dispatched;
+        const apps = requireAppsConnection(instance);
+        // Read synchronously at dispatch, from the same state the served-tool gate uses.
+        const allowlist = this.appToolAllowlist(workspaceId, serverName);
+        const refusal = checkMcpAppToolCall(apps, toolName, options.consented, allowlist);
+        if (refusal !== null) return Promise.resolve(refusal);
+        log.info("[MCP Apps] View-initiated tools/call", { workspaceId, serverName, toolName });
+        dispatched = apps
+          .callToolForApp(toolName, args, options)
+          .then((result) => ({ status: "ok" as const, result }));
+        return dispatched;
+      },
+      (result) => result,
+      options
+    );
+  }
+
+  /**
+   * MCP App entry points of the workspace's enabled, connected servers. The tool allowlist
+   * applies (opening one calls the tool); `_meta.ui.visibility` does not (spec).
+   */
+  async listMcpAppEntrypoints(
+    workspaceId: string,
+    signal?: AbortSignal
+  ): Promise<McpAppEntrypoint[]> {
+    if (this.mcpApps?.isEnabled() !== true) return [];
+    await this.refreshAppCatalogs(this.appInstances(workspaceId), signal);
+    // Read again: the servers can stop or restart while the refresh runs.
+    return this.appInstances(workspaceId).flatMap(({ serverName, apps }) => {
+      const allowlist = this.appToolAllowlist(workspaceId, serverName);
+      const serverLabel = this.appServerLabel(workspaceId, serverName);
+      return apps
+        .appEntrypoints()
+        .filter((tool) => allowlist === null || allowlist.has(tool.toolName))
+        .flatMap((tool) =>
+          tool.types.map((type) => ({
+            serverName,
+            serverLabel,
+            toolName: tool.toolName,
+            title: tool.title,
+            resourceUri: tool.resourceUri,
+            type,
+            viewKey: mcpAppEntrypointKey(serverName, tool.toolName, type),
+          }))
+        );
+    });
+  }
+
+  /**
+   * The send path refreshes tool catalogs in the background, so after tools/list_changed the
+   * held catalog is stale until the next send. Wait for a refresh, bounded per server by the
+   * signal and MCP_APP_CATALOG_REFRESH_TIMEOUT_MS: a server that has not answered by then keeps
+   * the catalog it holds. Through the SDK's response cache a still-fresh list costs no round trip.
+   */
+  private async refreshAppCatalogs(
+    instances: ReadonlyArray<{ instance: MCPServerInstance }>,
+    signal: AbortSignal | undefined
+  ): Promise<void> {
+    await Promise.all(
+      instances.map(({ instance }) =>
+        raceWithAbortAndTimeout(this.refreshInstanceTools(instance), {
+          ...(signal !== undefined ? { signal } : {}),
+          timeoutMs: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS,
+        })
+      )
+    );
+  }
+
+  /** The workspace's enabled, open instances with an MCP Apps connection. */
+  private appInstances(workspaceId: string): Array<{
+    serverName: string;
+    instance: MCPServerInstance;
+    apps: NonNullable<MCPServerInstance["apps"]>;
+  }> {
+    const entry = this.workspaceServers.get(workspaceId);
+    if (entry === undefined) return [];
+    return [...entry.instances].flatMap(([serverName, instance]) =>
+      entry.enabledServerNames.has(serverName) && !instance.isClosed && instance.apps
+        ? [{ serverName, instance, apps: instance.apps }]
+        : []
+    );
+  }
+
+  /**
+   * Open an entry point: call its tool with `{}` (the spec's entry point arguments) on
+   * `serverName` only, and store the result as the view record under the entry point's key, so
+   * its tab mounts (and remounts after a reload) through getMcpAppView. No chat row is written.
+   * Rate limited like a view's own tool calls, per workspace and server.
+   */
+  async openMcpAppEntrypoint(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    type: MCPAppEntrypointType,
+    options?: { signal?: AbortSignal }
+  ): Promise<McpAppEntrypoint> {
+    assert(this.mcpApps, "MCP Apps support is not configured");
+    const store = this.mcpApps.store;
+    // The dispatch below reads the server's catalog: refresh it first, so an entry point that
+    // tools/list_changed removed is refused. A cold server lists its tools as it starts.
+    await this.refreshAppCatalogs(
+      this.appInstances(workspaceId).filter((app) => app.serverName === serverName),
+      options?.signal
+    );
+    // One-shot dispatch, as in callMcpAppTool: an epoch retry must not call the tool twice.
+    let dispatched: Promise<McpAppEntrypoint> | null = null;
+    return this.invokeServerOperation(
+      workspaceId,
+      serverName,
+      `MCP Apps entry point '${serverName}/${toolName}'`,
+      (instance): Promise<McpAppEntrypoint> => {
+        if (dispatched !== null) return dispatched;
+        const apps = requireAppsConnection(instance);
+        const tool = apps
+          .appEntrypoints()
+          .find((candidate) => candidate.toolName === toolName && candidate.types.includes(type));
+        const allowlist = this.appToolAllowlist(workspaceId, serverName);
+        if (tool === undefined || (allowlist !== null && !allowlist.has(toolName))) {
+          return Promise.reject(
+            new Error(`'${serverName}' has no ${type} entry point named '${toolName}'`)
+          );
+        }
+        // Budgeted only once the entry point is known to exist, so the budget map holds only
+        // servers the workspace runs (an unknown name never adds an entry).
+        if (!this.allowEntrypointCall(workspaceId, serverName)) {
+          return Promise.reject(
+            new Error(`Too many entry point opens for '${serverName}'; try again shortly`)
+          );
+        }
+        log.info("[MCP Apps] Opening an entry point", { workspaceId, serverName, toolName, type });
+        const viewKey = mcpAppEntrypointKey(serverName, toolName, type);
+        const order = ++this.entrypointOpenCount;
+        dispatched = apps.callToolForApp(toolName, {}, options).then(async (result) => {
+          await this.storeEntrypointResult(store, workspaceId, order, {
+            toolCallId: viewKey,
+            serverName,
+            toolName,
+            resourceUri: tool.resourceUri,
+            arguments: {},
+            result,
+            entrypoint: true,
+          });
+          return {
+            serverName,
+            serverLabel: this.appServerLabel(workspaceId, serverName),
+            toolName,
+            title: tool.title,
+            resourceUri: tool.resourceUri,
+            type,
+            viewKey,
+          };
+        });
+        return dispatched;
+      },
+      (result) => result,
+      options
+    );
+  }
+
+  /**
+   * What a user sees for a server: a plugin server's key carries an internal instance ID
+   * (`plugin:<hex>:<server>`), so it shows as "<plugin> · <server>" from its provenance.
+   * Other servers show their (display-sanitized) key.
+   */
+  private appServerLabel(workspaceId: string, serverName: string): string {
+    const plugin = this.workspaceServers.get(workspaceId)?.enabledServers[serverName]?.plugin;
+    // Both parts come from plugin files: cleaned like entry point titles, so bidi or control
+    // characters cannot reorder or wrap the label. A part that cleans to nothing falls back to
+    // the key's display form.
+    const parts = [plugin?.pluginName, plugin?.serverName].map((part) =>
+      sanitizeText(part, MCP_APP_ENTRYPOINT_TITLE_MAX_CHARS)
+    );
+    return parts.every((part) => part !== undefined)
+      ? parts.join(" · ")
+      : displayConnectionKey(serverName);
+  }
+
+  private readonly appCatalogListeners = new Set<(workspaceId: string) => void>();
+
+  /**
+   * Calls `listener` with the workspace of an MCP Apps server that sent tools/list_changed: its
+   * entry points can have changed (mcpApps.onEntrypointsChanged). Returns the unsubscribe.
+   */
+  onMcpAppCatalogChanged(listener: (workspaceId: string) => void): () => void {
+    this.appCatalogListeners.add(listener);
+    return () => this.appCatalogListeners.delete(listener);
+  }
+
+  /** The client option that reports a connection's tools/list_changed (MCP Apps only). */
+  private appCatalogChangeOption(
+    appResultStore: McpAppResultStore | null,
+    workspaceId: string | undefined
+  ): { onToolsListChanged?: () => void } {
+    if (appResultStore === null || workspaceId === undefined) return {};
+    return {
+      onToolsListChanged: () => {
+        for (const listener of [...this.appCatalogListeners]) listener(workspaceId);
+      },
+    };
+  }
+
+  /** Effective tool allowlist of a server for MCP Apps calls (read at dispatch). */
+  private appToolAllowlist(workspaceId: string, serverName: string): Set<string> | null {
+    return effectiveToolAllowlist(
+      serverName,
+      this.workspaceServers.get(workspaceId)?.enabledServers[serverName]?.toolAllowlist,
+      this.lastWorkspaceRequestOptions.get(workspaceId)?.overrides
+    );
+  }
+
+  private readonly entrypointCallWindows = new Map<string, { start: number; count: number }>();
+  /** Entry point opens dispatched so far: orders overlapping opens of one entry point. */
+  private entrypointOpenCount = 0;
+  /**
+   * The newest open that started storing its result, and that write's outcome, by workspace and
+   * entry point view key.
+   */
+  private readonly entrypointStoredOpens = new Map<
+    string,
+    { order: number; stored: Promise<boolean> }
+  >();
+
+  /** Entry point budgets of a stopped workspace would otherwise outlive it. */
+  private dropEntrypointBudgets(workspaceId: string): void {
+    deleteWorkspaceKeys(this.entrypointCallWindows, workspaceId);
+    deleteWorkspaceKeys(this.entrypointStoredOpens, workspaceId);
+  }
+
+  /**
+   * Store an entry point open's result as its view record. Two windows can open one entry point
+   * at once: a call that finishes after a newer call's result was stored must not overwrite it,
+   * so the tab shows the latest open. Records are written in the order of this check (the
+   * store queues its writes).
+   */
+  private async storeEntrypointResult(
+    store: McpAppResultStore,
+    workspaceId: string,
+    order: number,
+    record: Parameters<McpAppResultStore["record"]>[1]
+  ): Promise<boolean> {
+    const key = `${workspaceId}\0${record.toolCallId}`;
+    // A newer open's result is stored: this view shows it, so this open shares that write's
+    // outcome (#6611). A failed newer write fails this open too: the key may still hold a record
+    // older than both opens.
+    const newest = this.entrypointStoredOpens.get(key);
+    if (newest !== undefined && newest.order > order) return newest.stored;
+    const stored = store.record(workspaceId, record);
+    this.entrypointStoredOpens.set(key, { order, stored });
+    return stored;
+  }
+
+  /** The view tool-call budget (mcpAppHost), applied per workspace and server. */
+  private allowEntrypointCall(workspaceId: string, serverName: string): boolean {
+    const key = `${workspaceId}\0${serverName}`;
+    const now = Date.now();
+    const window = this.entrypointCallWindows.get(key);
+    if (window === undefined || now - window.start >= MCP_APP_TOOL_CALL_WINDOW_MS) {
+      this.entrypointCallWindows.set(key, { start: now, count: 1 });
+      return true;
+    }
+    window.count += 1;
+    return window.count <= MCP_APP_TOOL_CALLS_PER_WINDOW;
+  }
+
+  /**
+   * Run one request against a workspace's connected server through the same stabilization,
+   * dispatch fence and provenance checks as prompts/get (shared by getPrompt and the MCP Apps
+   * resources/read and tools/call paths). `label` names the request in errors.
+   */
+  private async invokeServerOperation<R, T>(
+    workspaceId: string,
+    serverName: string,
+    label: string,
+    operation: (instance: MCPServerInstance) => Promise<R>,
+    finalize: (result: R) => T,
+    /** `noStart`: skip the startup path, so only an already running instance is used. */
+    options?: { signal?: AbortSignal; noStart?: boolean }
+  ): Promise<T> {
+    const lastOptions =
+      options?.noStart === true ? undefined : this.lastWorkspaceRequestOptions.get(workspaceId);
+    let stableSecrets: Record<string, string> | undefined;
+    if (lastOptions !== undefined) {
+      // First stabilize cached startup state against settings/trust/secret
+      // mutations. Prompt materialization happens only AFTER this loop, so a
+      // cold-start config edit repairs and retries instead of surfacing the
+      // transient stalePrompt marker to the user.
       for (;;) {
         const optionsMutationsBefore = this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0;
         const generationBefore = this.configService.configGeneration;
@@ -2332,51 +6297,403 @@ export class MCPServerManager {
           workspaceId,
           lastOptions.projectPath
         );
-        const refreshed = await raceWithAbortAndTimeout(refresh(secretsUsed), {
-          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-        });
-        if (refreshed.kind === "aborted") {
-          throw new Error(`MCP prompt request for '${serverName}/${promptName}' was aborted`);
-        }
-        const secretsNow = await this.resolveSecretsForRefresh(
-          workspaceId,
-          lastOptions.projectPath
+        const refreshed = await raceWithAbortAndTimeout(
+          this.runWithStablePluginEpoch(async () => {
+            // Re-read after the resolver await: a settings mutation recorded
+            // while secrets resolved must not be clobbered by a pre-await
+            // options snapshot.
+            const currentOptions = this.promptDispatchOptions(
+              this.lastWorkspaceRequestOptions.get(workspaceId) ?? lastOptions
+            );
+            await this.ensureWorkspaceServers(
+              secretsUsed !== undefined
+                ? { ...currentOptions, projectSecrets: secretsUsed }
+                : currentOptions,
+              false,
+              options?.signal
+            );
+            // Inside the bracket like getPromptsForWorkspace: the last await
+            // before the stability check must be covered by the postflight.
+            return this.resolveSecretsForRefresh(workspaceId, lastOptions.projectPath);
+          }),
+          { ...(options?.signal !== undefined ? { signal: options.signal } : {}) }
         );
+        if (refreshed.kind === "aborted") {
+          throw new Error(`${label} was aborted`);
+        }
+        if (refreshed.kind === "timeout") {
+          throw new Error(`${label} timed out`);
+        }
+        const secretsNow = refreshed.value;
         if (
           (this.workspaceOptionsMutationCounts.get(workspaceId) ?? 0) === optionsMutationsBefore &&
           this.configService.configGeneration === generationBefore &&
           secretRecordsEqual(secretsUsed, secretsNow)
         ) {
+          stableSecrets = secretsNow;
           break;
         }
       }
     }
-    const entry = this.workspaceServers.get(workspaceId);
-    if (entry && !entry.enabledServerNames.has(serverName)) {
-      throw new Error(`MCP server '${serverName}' is disabled`);
-    }
-    if (entry?.stalePromptServerNames?.has(serverName)) {
-      throw new Error(
-        `MCP server '${serverName}' was reconfigured while this request was being prepared; retry`
+
+    // Bounded like the served-tool gate: a global settings change landing
+    // during an attempt re-runs the bracket (whose serve re-derives the
+    // inventory), and sustained churn fails closed instead of spinning.
+    for (let attempt = 0; attempt < CALL_GATE_MAX_ATTEMPTS; attempt++) {
+      const invoked = await raceWithAbortAndTimeout(
+        this.runWithStablePluginEpoch(async () => {
+          // Re-run startup inside the SAME bracket as prompts/get: a sibling
+          // mutation detected by the preflight may have retired the instance
+          // stabilized above, and the operation must rebuild before querying.
+          let served: MCPToolsForWorkspaceResult | undefined;
+          if (lastOptions !== undefined) {
+            const currentOptions = this.promptDispatchOptions(
+              this.lastWorkspaceRequestOptions.get(workspaceId) ?? lastOptions
+            );
+            served = await this.ensureWorkspaceServers(
+              stableSecrets !== undefined
+                ? { ...currentOptions, projectSecrets: stableSecrets }
+                : currentOptions,
+              false,
+              options?.signal
+            );
+          }
+          // The serve fails closed (serveResult) when the workspace was
+          // invalidated or re-published mid-serve, but it does not rewrite the
+          // cached entry — consume that verdict here instead of dispatching
+          // through the stale entry. Re-running the SAME check (identity AND
+          // marker) right before dispatch also covers a publication or forget
+          // squeezed between the serve's gate and this continuation.
+          // Synchronous from the last check to the invocation start. A global
+          // settings change (mcp.setEnabled, a config edit) that landed while
+          // this request waited — for the lock below, or an epoch read — only
+          // advances the config generation: it moves neither the provenance
+          // nor the override epoch, so like the served-tool gate the entry's
+          // inventory must be as new as the current generation, or the whole
+          // bracket re-runs (its serve re-derives the inventory).
+          const dispatch = (): Promise<R> | "retry" => {
+            if (
+              served !== undefined &&
+              !this.isServeAuthorizationCurrent(workspaceId, served.enablementDerivedFrom)
+            ) {
+              throw new Error(
+                `MCP server '${serverName}' is unavailable while workspace MCP settings are being updated; retry`
+              );
+            }
+            const entry = this.workspaceServers.get(workspaceId);
+            // Only a serve (recorded options) can re-derive the inventory, so
+            // the check is meaningful only when this request ran one.
+            if (
+              served !== undefined &&
+              entry !== undefined &&
+              entry.enabledServersGeneration !== this.configService.configGeneration
+            ) {
+              return "retry";
+            }
+            if (entry && !entry.enabledServerNames.has(serverName)) {
+              throw new Error(`MCP server '${serverName}' is disabled`);
+            }
+            if (entry?.stalePromptServerNames?.has(serverName)) {
+              throw new Error(
+                `MCP server '${serverName}' was reconfigured while this request was being prepared; retry`
+              );
+            }
+            const instance = entry?.instances.get(serverName);
+            if (!instance || instance.isClosed) {
+              throw new Error(`MCP server '${serverName}' is not connected`);
+            }
+            this.markActivity(workspaceId);
+            // Include prompts/get itself inside the mutation-epoch bracket. A
+            // sibling update that lands after startup but before materialization
+            // retires the stale instance and retries this read-only operation.
+            return operation(instance);
+          };
+          // Same dispatch fence as served tool calls (see
+          // gateServedToolOnEnablement): a sibling process's disabling save
+          // persists first and bumps the epoch only after its publication
+          // budget, so a postflight alone can still observe the old token and
+          // hand out content from the now-disabled server. Hold the WRITER's
+          // lock from a final epoch read through the synchronous invocation
+          // start; a moved (or unreadable) epoch makes the bracket's postflight
+          // retry this read-only operation instead of dispatching.
+          const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
+          const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
+          let pending: Promise<R> | "retry";
+          if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
+            ({ pending } = await this.withPluginAdmissionFence(serverName, undefined, dispatch, {
+              ...options,
+              workspaceId,
+            }));
+          } else {
+            // ONE deadline for acquisition and the fenced epoch read: the outer
+            // abort race cannot stop this callback, so a stalled home filesystem
+            // must not keep the writer's lock held (blocking every settings
+            // save and prune) past the budget — release it and fail closed.
+            const fenceDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
+            const release = await acquireOverridesLock({
+              timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+              ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+            });
+            try {
+              const epochRead = await raceWithAbortAndTimeout(readOverridesEpoch(), {
+                timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+                ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+              });
+              if (epochRead.kind !== "ok") {
+                throw new Error(
+                  epochRead.kind === "aborted"
+                    ? `${label} was aborted`
+                    : `MCP server '${serverName}' is unavailable: the workspace MCP settings marker could not be read in time; retry`
+                );
+              }
+              const epochNow = epochRead.value;
+              if (
+                epochNow !== this.lastOverridesEpochToken ||
+                isWorkspaceOverridesEpochUnreadable(epochNow)
+              ) {
+                return { epochMoved: true } as const;
+              }
+              ({ pending } = await this.withPluginAdmissionFence(serverName, undefined, dispatch, {
+                workspaceId,
+                signal: options?.signal,
+                timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+              }));
+            } finally {
+              await release();
+            }
+          }
+          if (pending === "retry") {
+            return { generationMoved: true } as const;
+          }
+          const result = await pending;
+          return {
+            prompt: finalize(result),
+            derivedFrom: served?.enablementDerivedFrom,
+          };
+        }),
+        { ...(options?.signal !== undefined ? { signal: options.signal } : {}) }
       );
+      if (invoked.kind === "aborted") {
+        throw new Error(`${label} was aborted`);
+      }
+      if (invoked.kind === "timeout") {
+        throw new Error(`${label} timed out`);
+      }
+      if ("generationMoved" in invoked.value) {
+        continue;
+      }
+      if ("epochMoved" in invoked.value) {
+        // The bracket retries a moved epoch itself; reaching here means the
+        // token settled back on the value the fence compared against (or the
+        // bracket ran without epoch tracking). Nothing vouches for the dispatch.
+        throw new Error(
+          `MCP server '${serverName}' is unavailable while workspace MCP settings are being updated; retry`
+        );
+      }
+      // Same final gate as getToolsForWorkspace: a same-process save that
+      // disables the server after the pre-dispatch check — while the bracket's
+      // postflight token reads were in flight — publishes new recorded options
+      // without moving the token those reads captured. Re-check the serve's
+      // provenance right before handing the content out.
+      if (
+        invoked.value.derivedFrom !== undefined &&
+        !this.isServeAuthorizationCurrent(workspaceId, invoked.value.derivedFrom)
+      ) {
+        throw new Error(
+          `MCP server '${serverName}' is unavailable while workspace MCP settings are being updated; retry`
+        );
+      }
+      return invoked.value.prompt;
     }
-    const instance = entry?.instances.get(serverName);
-    if (!instance || instance.isClosed) {
-      throw new Error(`MCP server '${serverName}' is not connected`);
+    throw new Error(
+      `MCP server '${serverName}' is unavailable while MCP settings keep changing; retry`
+    );
+  }
+
+  /**
+   * Recycle every workspace's server set that includes a running server whose
+   * config key starts with `prefix` (e.g. `plugin:<instanceId>:`).
+   *
+   * Used by the Agent Plugin installer on update/uninstall: plugin content
+   * can change behind an unchanged stdio command line, which the config
+   * signature (command/args/env/cwd) cannot detect — so recycling must be
+   * explicit. Stopped servers restart on the workspace's next MCP use.
+   */
+  async stopServersWithKeyPrefix(prefix: string): Promise<void> {
+    assert(prefix.length > 0, "stopServersWithKeyPrefix: prefix must be non-empty");
+    // Record the invalidation FIRST: a getToolsForWorkspace call currently
+    // inside startServers has not published its instances yet, so the scan
+    // below cannot see them — the publish paths compare their pre-startup
+    // epoch snapshot against this record and close matching instances
+    // instead of publishing them.
+    this.prefixInvalidations.set(prefix, ++this.prefixInvalidationClock);
+    this.forgetIdleStoppedPrompts(prefix);
+
+    // Close ONLY the matching instances. The rest of the workspace's servers
+    // stay running: a live agent stream may hold a lease or be mid tool call
+    // on an unrelated healthy client, so tearing down the whole workspace
+    // set here would close it underneath them.
+    for (const [workspaceId, entry] of this.workspaceServers) {
+      // Tree replacement also stops deselected clients held by active leases,
+      // but those clients must never become restart candidates.
+      for (const instance of entry.retiredPluginInstances ?? []) {
+        if (!instance.name.startsWith(prefix)) continue;
+        try {
+          await instance.close();
+          entry.retiredPluginInstances?.delete(instance);
+        } catch (error) {
+          log.warn("Failed to stop retired MCP server", { error, name: instance.name });
+        }
+      }
+      if (entry.retiredPluginInstances?.size === 0) delete entry.retiredPluginInstances;
+      const removedKeys: string[] = [];
+      for (const [serverKey, instance] of [...entry.instances]) {
+        if (!serverKey.startsWith(prefix)) {
+          continue;
+        }
+        entry.instances.delete(serverKey);
+        removedKeys.push(serverKey);
+        try {
+          await instance.close();
+        } catch (error) {
+          log.warn("Failed to stop MCP server", { error, name: instance.name });
+        }
+      }
+      if (removedKeys.length === 0) {
+        continue;
+      }
+
+      log.info("[MCP] Stopped plugin servers for key prefix", { workspaceId, removedKeys });
+      // The workspace entry survives under its unchanged config signature, so
+      // subsequent calls hit the same-signature cache path — mark the removed
+      // servers for the timed-out retry machinery so that path restarts them
+      // (from the new plugin tree) instead of serving the reduced map forever.
+      this.markServersForRetry(entry, removedKeys);
     }
-    this.markActivity(workspaceId);
-    const result = await instance.getPrompt(promptName, args, options);
-    const text = flattenMcpPrompt(result);
-    if (text.trim().length === 0) {
-      // Providers can reject empty user content, so fail expansion up front
-      // rather than persisting an empty synthetic user message.
-      throw new Error(`MCP prompt '${serverName}/${promptName}' returned no text content`);
+  }
+
+  /**
+   * Queue server keys for restart on the next same-signature
+   * getToolsForWorkspace call. Reuses the timed-out retry machinery: entries
+   * in `timedOutServerNames` that are enabled but have no live instance are
+   * restarted by the cached path (see getTimedOutServerNamesToRetry).
+   */
+  private markServersForRetry(entry: WorkspaceServers, serverKeys: string[]): void {
+    const pending = new Set(entry.timedOutServerNames);
+    for (const serverKey of serverKeys) {
+      if (!pending.has(serverKey)) {
+        entry.timedOutServerNames.push(serverKey);
+      }
+      // An explicit re-queue (plugin tree swap, component re-add) is a new
+      // configuration for the server, not another failure: retry at once.
+      entry.timedOutRetryBackoff?.delete(serverKey);
     }
-    return {
-      // Cap here because both composer expansion and mcp_prompt_get use this path.
-      text: truncateUtf8Bytes(text, MCP_PROMPT_MAX_TEXT_BYTES, MCP_PROMPT_TRUNCATION_MARKER),
-      ...(result.description !== undefined ? { description: result.description } : {}),
-    };
+  }
+
+  /**
+   * Close and drop instances whose keys match a prefix invalidated after
+   * `startedAtEpoch` (the caller's pre-startup snapshot of the invalidation
+   * clock). Such instances may be running code from a plugin tree that was
+   * swapped or deleted while they were starting; the returned keys MUST be
+   * queued for retry by the caller (markServersForRetry) so the next MCP use
+   * restarts them from the current tree — publishing the reduced map under
+   * the unchanged config signature would otherwise cache them away forever.
+   */
+  private async closeInvalidatedInstances(
+    instances: Map<string, MCPServerInstance>,
+    startedAtEpoch: number,
+    workspaceId: string
+  ): Promise<string[]> {
+    const removedKeys: string[] = [];
+    for (const [serverKey, instance] of [...instances]) {
+      let invalidated = false;
+      for (const [prefix, epoch] of this.prefixInvalidations) {
+        if (epoch > startedAtEpoch && serverKey.startsWith(prefix)) {
+          invalidated = true;
+          break;
+        }
+      }
+      if (!invalidated) {
+        continue;
+      }
+
+      instances.delete(serverKey);
+      removedKeys.push(serverKey);
+      log.info("[MCP] Closing instance invalidated during startup (plugin tree swapped)", {
+        workspaceId,
+        serverKey,
+      });
+      try {
+        await instance.close();
+      } catch (error) {
+        log.warn("Failed to close invalidated MCP server instance", { error, serverKey });
+      }
+    }
+    return removedKeys;
+  }
+
+  /**
+   * Scan for invalidated instances until the invalidation clock is stable
+   * across a full scan, then invoke `publish` SYNCHRONOUSLY in the same
+   * continuation as the final clock check.
+   *
+   * Why the loop + sync callback: closeInvalidatedInstances is awaited, so
+   * there is a microtask yield between its final scan and any code that runs
+   * after it. A stopServersWithKeyPrefix continuation scheduled into that
+   * yield records its epoch AFTER the scan checked it and scans the published
+   * map BEFORE the caller publishes these instances — both mechanisms miss,
+   * and a server started from a removed/replaced plugin tree would stay
+   * alive. Re-checking the clock in the caller's continuation and publishing
+   * synchronously (no await between check and publish) closes the window:
+   * any invalidation that lands after the check runs its own scan strictly
+   * after publication, so it sees the published entry and closes matches.
+   *
+   * `publish` MUST NOT await; it receives every key closed across all scans
+   * and must queue them for retry (see closeInvalidatedInstances docs). Failed
+   * component closes transfer to the published entry's retired-client set so
+   * they remain retryable without exposing their tools or blocking a readd.
+   */
+  private async closeInvalidatedInstancesThenPublish(
+    instances: Map<string, MCPServerInstance>,
+    startedAtEpoch: number,
+    workspaceId: string,
+    publish: (invalidatedKeys: string[], failedRetirements: Set<MCPServerInstance>) => void
+  ): Promise<void> {
+    const invalidatedKeys: string[] = [];
+    const removedComponents: string[] = [];
+    const failedRetirements = new Set<MCPServerInstance>();
+    for (;;) {
+      if (this.pluginInvalidation?.readComponentPolicy !== undefined)
+        await this.retireCrossProcessPluginInstances();
+      for (const [name, instance] of instances) {
+        if (this.componentAllowed(name)) continue;
+        instances.delete(name);
+        removedComponents.push(name);
+        // Even remove->readd during awaited cleanup requires a fresh startup;
+        // equality of the final content snapshot alone cannot detect that ABA.
+        this.componentPolicyRevision++;
+        try {
+          await instance.close();
+        } catch (error) {
+          failedRetirements.add(instance);
+          log.warn("Failed to close removed plugin startup", { name, error });
+        }
+      }
+      if (removedComponents.length > 0) await this.retireCrossProcessPluginInstances();
+      const clockBeforeScan = this.prefixInvalidationClock;
+      invalidatedKeys.push(
+        ...(await this.closeInvalidatedInstances(instances, startedAtEpoch, workspaceId))
+      );
+      // Terminates: the clock only advances on stopServersWithKeyPrefix
+      // calls, which are finite user-driven plugin update/uninstall events.
+      if (this.prefixInvalidationClock === clockBeforeScan) {
+        publish(
+          [...invalidatedKeys, ...removedComponents].filter((name) => this.componentAllowed(name)),
+          failedRetirements
+        );
+        return;
+      }
+    }
   }
 
   async stopServers(
@@ -2391,7 +6708,9 @@ export class MCPServerManager {
       this.lastWorkspaceRequestOptions.delete(workspaceId);
       this.workspaceOptionsMutationCounts.delete(workspaceId);
       this.latestWorkspaceOverrides.delete(workspaceId);
+      this.idleStoppedPromptCatalogs.delete(workspaceId);
     }
+    this.dropEntrypointBudgets(workspaceId);
     const entry = this.workspaceServers.get(workspaceId);
     if (!entry) return;
 
@@ -2399,13 +6718,113 @@ export class MCPServerManager {
     // client that is in the middle of closing.
     this.workspaceServers.delete(workspaceId);
 
-    for (const instance of entry.instances.values()) {
-      try {
-        await instance.close();
-      } catch (error) {
-        log.warn("Failed to stop MCP server", { error, name: instance.name });
-      }
+    // Concurrently: a stdio close can wait out an exit grace before killing (#4760), and
+    // removal awaits this whole stop before deleting the checkout.
+    await Promise.all(
+      [...entry.instances.values(), ...(entry.retiredPluginInstances ?? [])].map(
+        async (instance) => {
+          try {
+            await instance.close();
+          } catch (error) {
+            log.warn("Failed to stop MCP server", { error, name: instance.name });
+          }
+        }
+      )
+    );
+  }
+
+  /**
+   * Resolve an `iconRef` from a tool-call snapshot to its bounded PNG data
+   * URL. Lookup only: unknown, expired, or evicted refs yield null without
+   * any network or decode work.
+   */
+  getIcon(iconRef: string): Promise<string | null> {
+    return this.iconRegistry.get(iconRef);
+  }
+
+  /** Bulk form of getIcon: one registry lookup per distinct ref, still never a fetch. */
+  async getIcons(iconRefs: readonly string[]): Promise<Record<string, string | null>> {
+    const distinct = [...new Set(iconRefs)];
+    const icons = await Promise.all(distinct.map((iconRef) => this.iconRegistry.get(iconRef)));
+    return Object.fromEntries(distinct.map((iconRef, index) => [iconRef, icons[index]]));
+  }
+
+  async testForApi(
+    input: {
+      projectPath?: string;
+      workspaceId?: string;
+      name?: string;
+      command?: string;
+      transport?: MCPServerTransport;
+      url?: string;
+      headers?: Record<string, MCPHeaderValue>;
+    },
+    options: { includeAgentPlugins?: boolean } = {}
+  ): Promise<MCPTestResult> {
+    assert(this.config, "MCPServerManager.testForApi requires config");
+    const start = Date.now();
+    const projectPathProvided =
+      typeof input.projectPath === "string" && input.projectPath.trim().length > 0;
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+    const resolvedProjectPath = projectPathProvided ? input.projectPath! : this.config.rootDir;
+    const trusted = projectPathProvided
+      ? isProjectTrusted(this.config, resolvedProjectPath)
+      : false;
+    let transport: MCPServerTransport = input.command ? "stdio" : (input.transport ?? "auto");
+    let result: MCPTestResult;
+    try {
+      const secretsStore = new SecretsStore(this.config.rootDir);
+      const projectSecrets = await secretsToRecord(
+        projectPathProvided
+          ? secretsStore.getEffectiveSecrets(resolvedProjectPath)
+          : secretsStore.getGlobalSecrets()
+      );
+      const agentPlugins =
+        options.includeAgentPlugins === false
+          ? undefined
+          : await this.configService.resolveWorkspaceAgentPluginsContext(
+              input.workspaceId,
+              projectPathProvided ? resolvedProjectPath : undefined
+            );
+      const configuredTransport = input.name
+        ? getOwn(
+            await this.configService.listServers(
+              projectPathProvided ? resolvedProjectPath : undefined,
+              trusted,
+              { agentPlugins }
+            ),
+            input.name
+          )?.transport
+        : undefined;
+      transport = configuredTransport ?? transport;
+
+      result = await this.test({
+        projectPath: resolvedProjectPath,
+        trusted,
+        name: input.name,
+        command: input.command,
+        transport: input.transport,
+        url: input.url,
+        headers: input.headers,
+        projectSecrets,
+        agentPlugins,
+      });
+    } catch (error) {
+      // Preparation (secrets, plugin context, config listing) can reject before test() runs.
+      // Report it as a bounded failed test instead of a raw rejection (#5678).
+      result = { success: false, error: boundServerTestError(getErrorMessage(error)) };
     }
+    const errorCategory = result.success ? undefined : categorizeMcpTestError(result.error);
+    this.telemetryService?.capture({
+      event: "mcp_server_tested",
+      properties: {
+        transport,
+        success: result.success,
+        duration_ms_b2: roundToBase2(Date.now() - start),
+        ...(errorCategory ? { error_category: errorCategory } : {}),
+      },
+    });
+    return result;
   }
 
   /**
@@ -2416,22 +6835,22 @@ export class MCPServerManager {
    * - `command` to test an arbitrary stdio command, OR
    * - `url`+`transport` to test an arbitrary HTTP/SSE endpoint.
    */
-  async test(options: {
-    projectPath: string;
-    /** Whether repo-local MCP config is allowed for this project. */
-    trusted?: boolean;
-    name?: string;
-    command?: string;
-    transport?: MCPServerTransport;
-    url?: string;
-    headers?: Record<string, MCPHeaderValue>;
-    projectSecrets?: Record<string, string>;
-    /** Agent Plugins discovery context for named-server lookups (null = no plugin servers). */
-    agentPlugins?: AgentPluginsMcpContext | null;
-  }): Promise<MCPTestResult> {
-    const isTransportAllowed = (t: MCPServerTransport): boolean => {
-      return !this.policyService?.isEnforced() || this.policyService.isMcpTransportAllowed(t);
-    };
+  /**
+   * Every failure leaves through here, so the length bound covers the errors raised
+   * before a connection starts too (missing secrets, unknown names) (#5678).
+   */
+  async test(options: MCPServerTestOptions): Promise<MCPTestResult> {
+    let result: MCPTestResult;
+    try {
+      result = await this.testUnbounded(options);
+    } catch (error) {
+      // Setup steps (config listing, plugin data dirs) can reject; report them as a failed test.
+      result = { success: false, error: getErrorMessage(error) };
+    }
+    return result.success ? result : { ...result, error: boundServerTestError(result.error) };
+  }
+
+  private async testUnbounded(options: MCPServerTestOptions): Promise<MCPTestResult> {
     const {
       projectPath,
       trusted = false,
@@ -2447,22 +6866,31 @@ export class MCPServerManager {
 
     if (trimmedName && !command?.trim() && !url?.trim()) {
       const servers = await this.configService.listServers(projectPath, trusted, { agentPlugins });
-      const server = servers[trimmedName];
+      const server = getOwn(servers, trimmedName);
       if (!server) {
         return { success: false, error: `Server "${trimmedName}" not found in configuration` };
       }
 
-      if (!isTransportAllowed(server.transport)) {
-        return { success: false, error: "MCP transport is disabled by policy" };
+      if (server.transport !== "stdio" && server.managed === "claude-design") {
+        return this.configService.claudeDesign.test();
       }
-
+      const testNamedServer = async (
+        launch: Parameters<typeof runServerTest>[0]
+      ): Promise<MCPTestResult> => {
+        // Admit the named test after disk/OAuth preparation, before its connection
+        // deadline starts. Ad-hoc drafts never carry managed plugin provenance.
+        try {
+          const { pending } = await this.withPluginAdmissionFence(trimmedName, server, () =>
+            runServerTest(launch, projectPath, `server "${trimmedName}"`, trimmedName)
+          );
+          return await pending;
+        } catch (error) {
+          return { success: false, error: getErrorMessage(error) };
+        }
+      };
       if (server.transport === "stdio") {
         const launch = await prepareStdioLaunch(server);
-        return runServerTest(
-          { transport: "stdio", ...launch },
-          projectPath,
-          `server "${trimmedName}"`
-        );
+        return testNamedServer({ transport: "stdio", ...launch });
       }
 
       try {
@@ -2471,18 +6899,15 @@ export class MCPServerManager {
         const authProvider = await this.mcpOauthService?.getAuthProviderForServer({
           serverName: trimmedName,
           serverUrl: server.url,
+          oauth: server.oauth,
         });
 
-        return runServerTest(
-          {
-            transport: server.transport,
-            url: server.url,
-            headers: resolved.headers,
-            ...(authProvider ? { authProvider } : {}),
-          },
-          projectPath,
-          `server "${trimmedName}"`
-        );
+        return testNamedServer({
+          transport: server.transport,
+          url: server.url,
+          headers: resolved.headers,
+          ...(authProvider ? { authProvider } : {}),
+        });
       } catch (error) {
         const message = getErrorMessage(error);
         return { success: false, error: message };
@@ -2490,10 +6915,12 @@ export class MCPServerManager {
     }
 
     if (command?.trim()) {
-      if (!isTransportAllowed("stdio")) {
-        return { success: false, error: "MCP transport is disabled by policy" };
-      }
-      return runServerTest({ transport: "stdio", command }, projectPath, "command");
+      return runServerTest(
+        { transport: "stdio", command, hostEnv: "inherit" },
+        projectPath,
+        "command",
+        trimmedName ?? "command"
+      );
     }
 
     if (url?.trim()) {
@@ -2501,10 +6928,6 @@ export class MCPServerManager {
 
       if (transport !== "http" && transport !== "sse" && transport !== "auto") {
         return { success: false, error: "transport must be http|sse|auto when testing by url" };
-      }
-
-      if (!isTransportAllowed(transport)) {
-        return { success: false, error: "MCP transport is disabled by policy" };
       }
 
       try {
@@ -2524,7 +6947,8 @@ export class MCPServerManager {
             ...(authProvider ? { authProvider } : {}),
           },
           projectPath,
-          trimmedName ? `server "${trimmedName}" (url)` : "url"
+          trimmedName ? `server "${trimmedName}" (url)` : "url",
+          trimmedName ?? "url"
         );
       } catch (error) {
         const message = getErrorMessage(error);
@@ -2539,15 +6963,498 @@ export class MCPServerManager {
    * Collect tools from all server instances, applying tool allowlists.
    *
    * @param instances - Map of server instances
-   * @param serverInfo - Project-level server info (for project-level tool allowlists)
    * @param workspaceOverrides - Optional workspace MCP overrides for tool allowlists
    * @returns Aggregated tools record with provider-safe namespaced names, plus
    *   a tool name → server name map so callers can advertise the catalog by server
    */
+  /**
+   * Final gate of a serve, after repairEnablementAfterConcurrentMutation. A
+   * forgetWorkspaceOverrides (parent save that could not resolve this
+   * workspace authoritatively, plugin prune, global eviction) that landed
+   * after this serve selected its options leaves those recorded options in
+   * place and only advances the invalidation marker — so the repair, which
+   * keys on option identity and config generation, re-derives nothing. The
+   * recorded snapshot is exactly what is being distrusted: fail THIS serve
+   * closed (no tools, no prompts); the next one re-reads disk. A publication
+   * that superseded the forget retired the marker and replaced the recorded
+   * options, so it reaches the repaired result below instead.
+   */
+  private serveResult(
+    workspaceId: string,
+    entry: WorkspaceServers,
+    instances: Map<string, MCPServerInstance>,
+    fallbackOverrides: WorkspaceMCPOverrides | undefined,
+    stats: MCPWorkspaceStats,
+    overridesGenerationUsed: number | undefined,
+    /** Recorded options the last repair derived `entry.enabledServerNames` from. */
+    enablementDerivedFrom: MCPWorkspaceRequestOptions | undefined,
+    /** Per-serve fail-closed marker (see ensureWorkspaceServers). */
+    overridesUnavailable: boolean
+  ): MCPToolsForWorkspaceResult {
+    const failClosed = (reason: string): MCPToolsForWorkspaceResult => {
+      log.warn(`[MCP] ${reason}; disabling MCP for this serve`, { workspaceId });
+      return this.failClosedResult();
+    };
+    if (overridesUnavailable) {
+      // The serve enabled nothing because neither the caller nor disk could
+      // vouch for the overrides. The recorded options still hold the caller's
+      // unverified fallback; reporting it as `overridesUsed` would let the
+      // prompt inventory advertise a server the unreadable document hides.
+      return failClosed("Workspace overrides could not be verified");
+    }
+    if (this.overridesInvalidationGenerations.get(workspaceId) !== overridesGenerationUsed) {
+      return failClosed("Workspace overrides invalidated while a serve was in flight");
+    }
+    if (enablementDerivedFrom === undefined) {
+      return failClosed("Workspace enablement could not be re-derived after a concurrent mutation");
+    }
+    // An authoritative publication that landed after the last repair (its own
+    // listServers still pending) replaced the recorded options and retired
+    // any marker, but `entry.enabledServerNames` still reflects the older
+    // options: the publication's own completion repairs the entry for later
+    // serves; this one must not filter through the stale set.
+    if (!this.isServeAuthorizationCurrent(workspaceId, enablementDerivedFrom)) {
+      return failClosed("Workspace overrides changed while a serve was completing");
+    }
+    return {
+      ...this.collectServedTools(workspaceId, entry, instances, fallbackOverrides),
+      stats,
+      promptDescriptors: this.promptDescriptorsFor(entry),
+      ...(enablementDerivedFrom !== undefined
+        ? {
+            enablementDerivedFrom,
+            overridesUsed: enablementDerivedFrom.overrides ?? {},
+            serversUsed: entry.enabledServers,
+          }
+        : {}),
+    };
+  }
+
+  /**
+   * collectTools for a serve's return value AFTER repairEnablementAfterConcurrentMutation:
+   * a settings mutation (or an inherited publication) that landed mid-startup
+   * has already repaired `entry.enabledServerNames` and the recorded options,
+   * but the caller still holds the pre-mutation instance map and overrides.
+   * Serving those would expose a just-revoked server's tools to this stream.
+   */
+  private collectServedTools(
+    workspaceId: string,
+    entry: WorkspaceServers,
+    instances: Map<string, MCPServerInstance>,
+    fallbackOverrides: WorkspaceMCPOverrides | undefined
+  ): { tools: Record<string, Tool>; toolServerNames: Record<string, string> } {
+    const served = new Map(
+      [...instances].filter(([serverName]) => entry.enabledServerNames.has(serverName))
+    );
+    const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+    // The REPAIRED inventory (same derivation as `enabledServerNames`), not
+    // the pre-mutation server info the caller started from: a project tool
+    // allowlist narrowed mid-startup must filter the tools handed to the
+    // model, or it receives tools the gate rejects only after selection.
+    const serverInfo = entry.enabledServers;
+    return this.collectTools(
+      served,
+      serverInfo,
+      recorded ? recorded.overrides : fallbackOverrides,
+      (serverName, toolName, tool) =>
+        this.gateServedToolOnEnablement(
+          workspaceId,
+          serverName,
+          toolName,
+          tool,
+          serverInfo[serverName]
+        )
+    );
+  }
+
+  /**
+   * Wait for a publication's enablement repair still in flight, bounded: the
+   * publisher gives up on a stalled repair and evicts (which also drops it
+   * from the map), and a call that grabbed the promise before that must not
+   * hang the stream — fail closed instead, like getPrompt.
+   */
+  private async awaitPendingRepair(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    abortSignal: AbortSignal | undefined,
+    /** Remaining gate budget; the wait never outlives the gate's own deadline. */
+    remainingMs: number
+  ): Promise<void> {
+    const pendingRepair = this.pendingEnablementRepairs.get(workspaceId);
+    if (pendingRepair === undefined) {
+      return;
+    }
+    // Abort-aware like the revalidation itself: Escape must not be ignored
+    // for the whole bound and then misreported as a settings-update error.
+    const raced = await raceWithAbortAndTimeout(pendingRepair, {
+      timeoutMs: Math.max(0, Math.min(PENDING_REPAIR_WAIT_MS, remainingMs)),
+      ...(abortSignal !== undefined ? { signal: abortSignal } : {}),
+    });
+    if (raced.kind === "aborted") {
+      throw new Error(`MCP tool '${serverName}/${toolName}' call was aborted`);
+    }
+    if (raced.kind === "timeout") {
+      throw new Error(
+        `MCP server '${serverName}' is unavailable while workspace MCP settings are being updated; retry`
+      );
+    }
+  }
+
+  /**
+   * Tool objects leave the manager before the stream that uses them starts
+   * (TurnRequestBuilder assembles the request first; StreamManager acquires
+   * its lease later), and a publication landing in between — or mid-stream —
+   * repairs the cached entry but cannot retract objects already handed out.
+   * Rather than shrinking that window, every invocation re-derives the
+   * server's CURRENT authorization for the workspace, so a server (or tool)
+   * revoked after the serve fails at call time regardless of when the change
+   * landed:
+   * - a pending publication repair is awaited first (applyWorkspaceOverrides);
+   * - inside the cross-process epoch bracket, the effective overrides on disk
+   *   are compared with the recorded ones (direct edits) and an invalidation
+   *   marker (forgetWorkspaceOverrides: descendant/off-host publications and
+   *   cross-process epoch changes publish no overrides, only the marker) means
+   *   the recorded enablement can no longer be trusted: re-serve from the
+   *   recorded options so disk re-derives it (a leased entry is repaired in
+   *   place), and reject if the marker survives or the re-read fails;
+   * - a global mutation (mcp.setEnabled, a global/project toolAllowlist edit)
+   *   bumps the config generation without touching recorded options or the
+   *   overrides on disk: the entry's inventory is re-derived when its
+   *   generation is behind (repairEnablementAfterConcurrentMutation);
+   * - the server must be enabled by the LATEST recorded overrides (evaluated
+   *   directly, so a publication that started meanwhile counts even before
+   *   its repair lands), a repair started meanwhile is awaited, the entry's
+   *   CURRENT validated inventory must still hold the server, and the tool
+   *   must pass that inventory's project allowlist intersected with the
+   *   current workspace tool allowlist. The server info captured at serve
+   *   time (`servedInfo`) never authorizes a dispatch — its allowlist is as
+   *   old as the tool object; it only stands in for the early revocation
+   *   check while a publication's repair is pending and the entry's
+   *   inventory is empty (failed closed), so that check still waits for the
+   *   repair instead of rejecting a server the publication re-enables.
+   * Recorded-options identity is deliberately not compared: it changes on
+   * every serve and would fail healthy in-flight tool calls.
+   */
+  private gateServedToolOnEnablement(
+    workspaceId: string,
+    serverName: string,
+    toolName: string,
+    tool: Tool,
+    servedInfo: MCPServerInfo | undefined,
+    /** false (plugin hooks): refuse instead of re-serving, so the gate never starts a server. */
+    gateOptions: { reconcile: boolean } = { reconcile: true }
+  ): Tool {
+    if (!tool.execute) {
+      return tool;
+    }
+    const originalExecute = tool.execute;
+    const revoked = (what: string) =>
+      new Error(
+        `MCP ${what} was disabled for this workspace after the request was prepared; it is unavailable`
+      );
+    return {
+      ...tool,
+      execute: async (args: Parameters<typeof originalExecute>[0], context) => {
+        const abortSignal =
+          context && typeof context === "object" && "abortSignal" in context
+            ? (context as { abortSignal?: AbortSignal }).abortSignal
+            : undefined;
+        // Bound and abort the authorization work itself: on SSH/Docker the
+        // disk re-read goes through the remote runtime (minutes per op), and
+        // the wrapped tool's own deadline/Escape only start once this returns.
+        // One absolute deadline for the whole gate: every wait below (and
+        // every retry iteration) is given only what remains of it, so
+        // sustained settings contention cannot keep an invocation in this
+        // gate for several helper timeouts in a row.
+        const gateDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
+        const remainingMs = () => Math.max(0, gateDeadlineAt - Date.now());
+        const bounded = async <T>(work: Promise<T>): Promise<T> => {
+          const raced = await raceWithAbortAndTimeout(work, {
+            timeoutMs: remainingMs(),
+            ...(abortSignal !== undefined ? { signal: abortSignal } : {}),
+          });
+          if (raced.kind === "aborted") {
+            throw new Error(`MCP tool '${serverName}/${toolName}' call was aborted`);
+          }
+          if (raced.kind === "timeout") {
+            throw new Error(
+              `MCP server '${serverName}' is unavailable: its workspace MCP settings could not be re-read in time; retry`
+            );
+          }
+          return raced.value;
+        };
+        // Every await below opens a gap in which a publication can install
+        // new recorded options and start a repair. The decision is therefore
+        // taken in a loop: an iteration whose state moved during an await
+        // starts over; only checks that ran in the same synchronous block as
+        // the dispatch authorize it, so no publication can interleave between
+        // the checks and the call.
+        // The server's CURRENT validated info comes from the live entry's
+        // inventory (refreshed by every serve and repair), never from the
+        // serve that produced this tool object.
+        const currentInfo = (): MCPServerInfo | undefined => {
+          const entry = this.workspaceServers.get(workspaceId);
+          return entry === undefined ? undefined : getOwn(entry.enabledServers, serverName);
+        };
+        const enabledBy = (
+          info: MCPServerInfo | undefined,
+          overrides: WorkspaceMCPOverrides | undefined
+        ): boolean =>
+          info !== undefined &&
+          // Own key, not `in`: "constructor" is in every object (#5755).
+          Object.hasOwn(this.applyServerOverrides({ [serverName]: info }, overrides), serverName);
+        for (let attempt = 0; attempt < CALL_GATE_MAX_ATTEMPTS; attempt++) {
+          const recorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+          if (recorded === undefined) {
+            throw revoked(`server '${serverName}'`);
+          }
+          if (this.pendingEnablementRepairs.has(workspaceId)) {
+            // A publication is in flight: its recorded overrides are an
+            // in-process save (disk truth) and authoritative for a revocation
+            // even before its enablement repair lands — decide that without
+            // waiting; otherwise wait for the repair and start over.
+            if (!enabledBy(currentInfo() ?? servedInfo, recorded.overrides)) {
+              throw revoked(`server '${serverName}'`);
+            }
+            await this.awaitPendingRepair(
+              workspaceId,
+              serverName,
+              toolName,
+              abortSignal,
+              remainingMs()
+            );
+            continue;
+          }
+          // A global settings mutation since the inventory was derived: no
+          // recorded options changed and disk holds the same overrides, so
+          // neither check below would notice a narrowed global/project
+          // allowlist or a globally disabled server. Re-derive first.
+          const staleEntry = this.workspaceServers.get(workspaceId);
+          if (
+            staleEntry !== undefined &&
+            staleEntry.enabledServersGeneration !== this.configService.configGeneration
+          ) {
+            const repaired = await bounded(
+              this.repairEnablementAfterConcurrentMutation(
+                workspaceId,
+                recorded,
+                staleEntry,
+                staleEntry.enabledServersGeneration
+              )
+            );
+            if (repaired === undefined) {
+              throw new Error(
+                `MCP server '${serverName}' is unavailable because its enablement could not be re-derived after a settings change; retry`
+              );
+            }
+            continue;
+          }
+          // Same cross-process bracket as every serve: a sibling process's
+          // override write bumps only the on-disk epoch, and without a new
+          // serve in THIS process nothing would ever observe it — the preflight
+          // turns it into invalidation markers, the marker path re-derives
+          // from disk, and the postflight retries if the epoch moved meanwhile.
+          // Direct edits of an override document (the workspace's own, or the
+          // parent document an inheriting child reads through) move neither
+          // the epoch nor any process-local state: compare the effective
+          // overrides on disk with the recorded ones and treat a difference
+          // (or an unreadable document) as an invalidation of this workspace.
+          try {
+            await bounded(
+              this.runWithStablePluginEpoch(async () => {
+                const readOverrides = this.pluginInvalidation?.readWorkspaceOverrides;
+                if (
+                  readOverrides !== undefined &&
+                  !this.overridesInvalidationGenerations.has(workspaceId)
+                ) {
+                  const fresh = await readOverrides(
+                    workspaceId,
+                    abortSignal !== undefined ? { signal: abortSignal } : undefined
+                  );
+                  // Equivalence, like decide() below: an overlapping serve
+                  // whose snapshot predates the disk edit records an
+                  // EQUIVALENT object meanwhile; identity would skip the
+                  // invalidation here while dispatch accepts the replacement,
+                  // letting a revoked tool run. A genuinely different record
+                  // (a publication) is left alone: it already re-derived.
+                  const latestRecorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+                  if (
+                    (fresh === undefined || !workspaceOverridesEqual(fresh, recorded.overrides)) &&
+                    latestRecorded !== undefined &&
+                    authorizationStateEqual(latestRecorded, recorded)
+                  ) {
+                    this.forgetWorkspaceOverrides(workspaceId);
+                  }
+                }
+                // Without reconciling, the live marker makes decide() refuse the call.
+                if (
+                  gateOptions.reconcile &&
+                  this.overridesInvalidationGenerations.has(workspaceId)
+                ) {
+                  const latest = this.lastWorkspaceRequestOptions.get(workspaceId);
+                  if (latest !== undefined) {
+                    await this.ensureWorkspaceServers(latest, false, abortSignal);
+                  }
+                }
+              })
+            );
+          } catch (error) {
+            // The read or re-serve failed (unreachable parent checkout, config
+            // read error, epoch churn, deadline): nothing vouches for the
+            // cached enablement, so the call fails closed and the next serve
+            // re-reads.
+            log.debug("[MCP] Re-derivation before a tool call failed; rejecting the call", {
+              workspaceId,
+              serverName,
+              error: getErrorMessage(error),
+            });
+            this.forgetWorkspaceOverrides(workspaceId);
+            throw error instanceof Error && error.message.includes("aborted")
+              ? error
+              : new Error(
+                  `MCP server '${serverName}' is unavailable because its workspace MCP settings could not be re-read; retry`
+                );
+          }
+          // Decide only on state read NOW (synchronously), and only if nothing
+          // moved since this iteration's snapshot — every await above and
+          // below opens a gap in which a publication can install new recorded
+          // options or start a repair; "retry" restarts the loop on them.
+          const decide = (): "dispatch" | "retry" => {
+            // Equivalence, not identity (see isServeAuthorizationCurrent): an
+            // overlapping ordinary serve (prompt discovery, a concurrent send)
+            // records a fresh options object with the SAME authorization
+            // state; a burst of those must not exhaust the attempts and
+            // reject an authorized call. A publication or trust change
+            // records different overrides/trust and still retries.
+            const latestRecorded = this.lastWorkspaceRequestOptions.get(workspaceId);
+            if (
+              latestRecorded === undefined ||
+              !authorizationStateEqual(latestRecorded, recorded) ||
+              this.pendingEnablementRepairs.has(workspaceId)
+            ) {
+              return "retry";
+            }
+            if (this.overridesInvalidationGenerations.has(workspaceId)) {
+              throw revoked(`server '${serverName}'`);
+            }
+            const entry = this.workspaceServers.get(workspaceId);
+            if (entry === undefined) {
+              throw revoked(`server '${serverName}'`);
+            }
+            if (entry.enabledServersGeneration !== this.configService.configGeneration) {
+              // A global mutation landed during an await above: re-derive.
+              return "retry";
+            }
+            const overrides = recorded.overrides;
+            const info = getOwn(entry.enabledServers, serverName);
+            if (
+              info === undefined ||
+              !enabledBy(info, overrides) ||
+              !entry.enabledServerNames.has(serverName)
+            ) {
+              throw revoked(`server '${serverName}'`);
+            }
+            // Object.hasOwn, not `in`: a tool named after an Object.prototype member
+            // (constructor, toString) would otherwise pass an allowlist that excludes it (Codex
+            // PRRT_kwDOPxxmWM6rb5ps).
+            if (
+              !Object.hasOwn(
+                this.applyToolAllowlist(
+                  serverName,
+                  { [toolName]: tool },
+                  info.toolAllowlist,
+                  overrides
+                ),
+                toolName
+              )
+            ) {
+              throw revoked(`tool '${serverName}/${toolName}'`);
+            }
+            return "dispatch";
+          };
+          if (decide() === "retry") {
+            continue;
+          }
+          // Recheck live authorization synchronously after the fenced read.
+          const dispatch = (): Promise<unknown> | "retry" =>
+            decide() === "retry" ? "retry" : Promise.resolve(originalExecute(args, context));
+          const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
+          const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
+          if (acquireOverridesLock === undefined || readOverridesEpoch === undefined) {
+            const { pending } = await this.withPluginAdmissionFence(
+              serverName,
+              servedInfo,
+              dispatch,
+              { workspaceId, signal: abortSignal, timeoutMs: remainingMs() }
+            );
+            if (pending === "retry") continue;
+            return await pending;
+          }
+          // Cross-process fence. The bracket's postflight epoch read and this
+          // invocation are separated by promise continuations, and a sibling
+          // process's revocation completing in that gap leaves no
+          // process-local marker to observe. Hold the WRITER's lock from a
+          // final epoch read through the synchronous invocation start: a
+          // sibling write either committed (and bumped the epoch) before the
+          // read — observed here, retried by the next preflight — or waits
+          // for the release, by which time the call is already dispatched
+          // under authorization that was current at dispatch. The lock is
+          // released as soon as the invocation has STARTED; the tool's own
+          // execution never runs under it.
+          // The acquisition itself is given the gate's remaining budget and
+          // abort signal: an abandoned call must not stay queued in the
+          // writer's lock queue and briefly hold the lock later, delaying
+          // every settings save queued behind it.
+          const acquisition = acquireOverridesLock({
+            timeoutMs: remainingMs(),
+            ...(abortSignal !== undefined ? { signal: abortSignal } : {}),
+          });
+          let release: () => Promise<void>;
+          try {
+            release = await bounded(acquisition);
+          } catch (error) {
+            // Belt and braces: should the acquisition still succeed after the
+            // race was lost, it must not leave the lock held.
+            acquisition.then((lateRelease) => lateRelease()).catch(() => undefined);
+            throw error;
+          }
+          let pending: Promise<unknown> | "retry";
+          try {
+            const epochNow = await bounded(readOverridesEpoch());
+            if (
+              epochNow !== this.lastOverridesEpochToken ||
+              isWorkspaceOverridesEpochUnreadable(epochNow)
+            ) {
+              // A sibling wrote since the epoch this iteration derived from
+              // (an unreadable epoch vouches for nothing): the next
+              // iteration's preflight evicts and re-derives from disk.
+              continue;
+            }
+            ({ pending } = await this.withPluginAdmissionFence(serverName, servedInfo, dispatch, {
+              workspaceId,
+              signal: abortSignal,
+              timeoutMs: remainingMs(),
+            }));
+          } finally {
+            await release();
+          }
+          if (pending === "retry") continue;
+          return await pending;
+        }
+        throw new Error(
+          `MCP server '${serverName}' is unavailable while workspace MCP settings keep changing; retry`
+        );
+      },
+    };
+  }
+
   private collectTools(
     instances: Map<string, MCPServerInstance>,
     serverInfo: Record<string, MCPServerInfo>,
-    workspaceOverrides?: WorkspaceMCPOverrides
+    workspaceOverrides?: WorkspaceMCPOverrides,
+    /** Per-tool call-time gate (see gateServedToolOnEnablement); identity when absent. */
+    gate: (serverName: string, toolName: string, tool: Tool) => Tool = (_s, _t, tool) => tool
   ): { tools: Record<string, Tool>; toolServerNames: Record<string, string> } {
     const aggregated: Record<string, Tool> = {};
     const toolServerNames: Record<string, string> = {};
@@ -2559,6 +7466,8 @@ export class MCPServerManager {
     const sortedInstances = [...instances.values()].sort((a, b) => a.name.localeCompare(b.name));
 
     for (const instance of sortedInstances) {
+      // A withdrawal can close an instance while the catalog is awaiting other servers.
+      if (instance.isClosed) continue;
       // Get project-level allowlist for this server
       const projectAllowlist = serverInfo[instance.name]?.toolAllowlist;
       // Apply tool allowlist filtering (project-level + workspace-level)
@@ -2610,12 +7519,45 @@ export class MCPServerManager {
           });
         }
 
-        aggregated[result.toolName] = tool;
+        // Tag a copy with its origin for Codex plugin hooks: the served tool can be frozen, and
+        // the instance's own tool must stay as wrapRawTools built it.
+        const served = cloneToolPreservingDescriptors(gate(instance.name, toolName, tool));
+        Object.defineProperty(served, MCP_TOOL_ORIGIN, {
+          value: { serverName: instance.name, toolName },
+          enumerable: true,
+        });
+        aggregated[result.toolName] = served;
         toolServerNames[result.toolName] = instance.name;
       }
     }
 
     return { tools: aggregated, toolServerNames };
+  }
+
+  /**
+   * Fence process startup against a sibling process's override write. The
+   * writer persists the document and bumps the epoch BEFORE spending its
+   * publication budget (see writeOverridesLocked), so a serve that derived
+   * its enabled set before that write observes the moved epoch here and
+   * fails closed instead of launching a server whose revocation is already
+   * durable — its repository-configured command must not execute after the
+   * revocation. The bracket's postflight alone would only close the server
+   * after it had started. The next serve's preflight re-derives from disk.
+   */
+  private async assertOverridesEpochUnmovedBeforeStart(): Promise<void> {
+    const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
+    if (readOverridesEpoch === undefined || !this.pluginInvalidationTokenSeen) {
+      return;
+    }
+    const epochNow = await readOverridesEpoch();
+    if (
+      epochNow !== this.lastOverridesEpochToken ||
+      isWorkspaceOverridesEpochUnreadable(epochNow)
+    ) {
+      throw new Error(
+        "Workspace MCP settings changed in another process (or their change marker is unreadable) while MCP servers were about to start; retry"
+      );
+    }
   }
 
   private async startServers(
@@ -2630,10 +7572,13 @@ export class MCPServerManager {
     instances: Map<string, MCPServerInstance>;
     failedServerNames: string[];
     timedOutServerNames: string[];
+    /** When each timed-out attempt finished; the batch itself settles later. */
+    timedOutAtMs: Map<string, number>;
   }> {
     const instances = new Map<string, MCPServerInstance>();
     const failedServerNames: string[] = [];
     const timedOutServerNames: string[] = [];
+    const timedOutAtMs = new Map<string, number>();
     const entries = Object.entries(servers);
 
     // Bounded concurrency so one unresponsive server's 60s startup deadline
@@ -2659,6 +7604,7 @@ export class MCPServerManager {
           failedServerNames.push(name);
           if (isMCPStartupTimeoutError(error)) {
             timedOutServerNames.push(name);
+            timedOutAtMs.set(name, Date.now());
           }
           return null;
         } finally {
@@ -2675,7 +7621,7 @@ export class MCPServerManager {
       }
     }
 
-    return { instances, failedServerNames, timedOutServerNames };
+    return { instances, failedServerNames, timedOutServerNames, timedOutAtMs };
   }
 
   private async startSingleServer(
@@ -2842,7 +7788,8 @@ export class MCPServerManager {
             onActivity,
             signal,
             onAbortCleanup,
-            prior
+            prior,
+            workspaceId
           );
           if (started === null) {
             return null;
@@ -2879,7 +7826,169 @@ export class MCPServerManager {
       }
     }
 
-    return this.startRemoteInstance(name, info, projectSecrets, onActivity, signal, onAbortCleanup);
+    return this.startRemoteInstance(
+      name,
+      info,
+      projectSecrets,
+      onActivity,
+      signal,
+      onAbortCleanup,
+      workspaceId
+    );
+  }
+
+  /**
+   * Fence a stdio process launch against the override WRITER (the read-only
+   * check in assertOverridesEpochUnmovedBeforeStart still leaves the gap
+   * between its read and the spawn): hold the writer's lock from a final
+   * epoch read through the exec that spawns the repository-configured
+   * command. A sibling's revocation therefore either committed (and bumped
+   * the epoch) before the read — observed here, the launch refused — or
+   * waits until the process exists, after which the bracket's postflight
+   * closes it. The lock is released as soon as exec returned; the MCP
+   * handshake never runs under it. Global consent and managed-component
+   * admission use the same fence as tool/prompt calls, through that launch
+   * interval. Untracked ordinary servers retain their plain launch path.
+   */
+  private async launchUnderOverrideFence<T>(
+    name: string,
+    info: MCPServerInfo,
+    /** `launchSignal` aborts with the startup signal AND at an `abortAfterMs` deadline. */
+    launch: (launchSignal: AbortSignal) => Promise<T>,
+    signal: AbortSignal,
+    options?: {
+      workspaceId?: string;
+      /**
+       * Release the lock once `launch` has settled OR this many ms have
+       * passed, whichever comes first. Remote (HTTP/SSE) connections: the
+       * launch IS the handshake (bounded only by the startup deadline) and
+       * cannot hold every settings writer for that long, while its first
+       * request — the traffic the fence exists for — leaves within the first
+       * moments.
+       */
+      releaseAfterMs?: number;
+      /**
+       * stdio: ABORT the launch (via `launchSignal`) when it has not handed
+       * back its exec stream within this many ms, and fail the start as a
+       * timeout (`serverName` names it). Releasing instead would let an SSH
+       * exec still awaiting its connection send the command AFTER a sibling's
+       * revocation committed — the postflight can close a process, not undo
+       * its execution. The SSH2 transport re-checks the signal right before
+       * `client.exec`, so an aborted launch never reaches the remote shell.
+       */
+      abortAfterMs?: { ms: number; serverName: string };
+    }
+  ): Promise<T> {
+    const acquireOverridesLock = this.pluginInvalidation?.acquireOverridesLock;
+    const readOverridesEpoch = this.pluginInvalidation?.readOverridesEpoch;
+    const trackOverrides =
+      acquireOverridesLock !== undefined &&
+      readOverridesEpoch !== undefined &&
+      this.pluginInvalidationTokenSeen;
+    const plugin = this.managedPluginServers.get(name) ?? info.plugin;
+    if (
+      !trackOverrides &&
+      plugin?.componentPolicy === undefined &&
+      plugin?.sourceScope !== "global"
+    )
+      return launch(signal);
+    // ONE deadline for acquisition and the fenced reads (see getPrompt).
+    const fenceDeadlineAt = Date.now() + CALL_GATE_TIMEOUT_MS;
+    const release = trackOverrides
+      ? await acquireOverridesLock({
+          timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+          signal,
+        })
+      : () => Promise.resolve();
+    let released = false;
+    const releaseOnce = async () => {
+      if (!released) {
+        released = true;
+        await release();
+      }
+    };
+    let pending: Promise<T> | undefined;
+    let releaseAdmission: (() => Promise<void>) | undefined;
+    try {
+      if (trackOverrides) {
+        const epochRead = await raceWithAbortAndTimeout(readOverridesEpoch(), {
+          timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+          signal,
+        });
+        if (epochRead.kind !== "ok") {
+          throw new Error(
+            epochRead.kind === "aborted"
+              ? "MCP server startup was aborted"
+              : "MCP server startup could not read the workspace MCP settings marker in time; retry"
+          );
+        }
+        if (
+          epochRead.value !== this.lastOverridesEpochToken ||
+          isWorkspaceOverridesEpochUnreadable(epochRead.value)
+        ) {
+          throw new Error(
+            "Workspace MCP settings changed in another process (or their change marker is unreadable) while MCP servers were about to start; retry"
+          );
+        }
+      }
+      // The same consent decision gates calls and launches, but startup holds
+      // it through actual exec/connection initiation, not only the callback.
+      releaseAdmission = await this.acquirePluginAdmissionFence(name, info, {
+        workspaceId: options?.workspaceId,
+        signal,
+        timeoutMs: Math.max(0, fenceDeadlineAt - Date.now()),
+      });
+      if (signal.aborted) throw new Error("MCP server startup was aborted");
+      if (Date.now() >= fenceDeadlineAt)
+        throw new Error("MCP server startup admission timed out; retry");
+      if (options?.abortAfterMs !== undefined) {
+        const { ms, serverName } = options.abortAfterMs;
+        const launchAbort = new AbortController();
+        const forwardAbort = () => launchAbort.abort();
+        signal.addEventListener("abort", forwardAbort, { once: true });
+        if (signal.aborted) forwardAbort();
+        pending = launch(launchAbort.signal);
+        try {
+          const settled = await raceWithAbortAndTimeout(
+            pending.then(
+              () => undefined,
+              () => undefined
+            ),
+            { timeoutMs: ms }
+          );
+          if (settled.kind === "timeout") {
+            launchAbort.abort();
+            // The aborted launch's own rejection is superseded by the timeout.
+            pending.catch(() => undefined);
+            throw new MCPStartupTimeoutError(serverName, ms);
+          }
+        } finally {
+          signal.removeEventListener("abort", forwardAbort);
+        }
+        return await pending;
+      }
+      pending = launch(signal);
+      if (options?.releaseAfterMs === undefined) {
+        return await pending;
+      }
+      await raceWithAbortAndTimeout(
+        pending.then(
+          () => undefined,
+          () => undefined
+        ),
+        { timeoutMs: options.releaseAfterMs }
+      );
+    } finally {
+      // Released here — BEFORE the remaining wait on a still-pending remote
+      // handshake below: every settings save and prune would otherwise queue
+      // behind an endpoint-controlled request for the whole startup deadline.
+      try {
+        await releaseAdmission?.();
+      } finally {
+        await releaseOnce();
+      }
+    }
+    return await pending;
   }
 
   /**
@@ -2894,19 +8003,83 @@ export class MCPServerManager {
     onActivity: () => void,
     signal: AbortSignal,
     onAbortCleanup: ((cleanupPromise: Promise<void>) => void) | undefined,
-    prior: PriorDiscovery | undefined
+    prior: PriorDiscovery | undefined,
+    workspaceId?: string
   ): Promise<{ instance: MCPServerInstance; prior: PriorDiscovery } | null> {
     {
       log.debug("[MCP] Spawning stdio server", { name });
       const launch = await prepareStdioLaunch(info);
-      const execStream = await runtime.exec(launch.command, {
-        cwd: launch.cwd ?? workspacePath,
-        ...(launch.env !== undefined ? { env: launch.env } : {}),
-        timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
-        abortSignal: signal,
-      });
+      // Lets the transport's close() kill a server that ignores stdin EOF (#4760).
+      const processAbort = new AbortController();
+      // #4857: the server runs in the checkout, so another backend sharing this Xum root must
+      // refuse to rename or remove the workspace while it lives. Held from before the spawn (a
+      // refusal while a mutation runs fails this start) until the process exits, like a
+      // terminal's PTY: close() and the idle sweep only ask it to exit.
+      const useLease =
+        this.config != null && workspaceId != null
+          ? await workspaceUseLeasesFor(this.config).hold(workspaceId, "mcp")
+          : undefined;
+      // #4953: a startup aborted while its exec is pending (the startup timeout) must not
+      // surface before a process the exec still hands back has been killed and has exited.
+      // The timeout waits (bounded) for a cleanup registered synchronously by the abort, so
+      // register the exec's settlement while it is pending; the abort branch below resolves it.
+      const execSettled = Promise.withResolvers<void>();
+      const registerExecCleanup = () => onAbortCleanup?.(execSettled.promise);
+      signal.addEventListener("abort", registerExecCleanup, { once: true });
+      let execStream: ExecStream;
+      try {
+        execStream = await this.launchUnderOverrideFence(
+          name,
+          info,
+          (launchSignal) =>
+            runtime.exec(launch.command, {
+              cwd: launch.cwd ?? workspacePath,
+              ...(launch.env !== undefined ? { env: launch.env } : {}),
+              hostEnv: launch.hostEnv,
+              timeout: 60 * 60 * 24, // 24 hours — process lifetime, not startup
+              abortSignal: AbortSignal.any([launchSignal, processAbort.signal]),
+            }),
+          signal,
+          // A host-local exec resolves once the process exists; an SSH exec
+          // can stall on connection acquisition. The writer's lock must not be
+          // held for the whole startup deadline, and the launch must not be
+          // released to send its command after a revocation: abort it instead
+          // (see launchUnderOverrideFence).
+          { workspaceId, abortAfterMs: { ms: MCP_STDIO_LAUNCH_FENCE_MS, serverName: name } }
+        );
+      } catch (error) {
+        // No process was handed back to watch; a launch that failed started nothing.
+        signal.removeEventListener("abort", registerExecCleanup);
+        execSettled.resolve();
+        await useLease?.release();
+        throw error;
+      }
+      signal.removeEventListener("abort", registerExecCleanup);
+      if (useLease != null) {
+        const releaseUseLease = () =>
+          useLease.release().catch((error: unknown) => {
+            log.warn("[MCP] Failed to release the workspace use lease", {
+              name,
+              workspaceId,
+              error: getErrorMessage(error),
+            });
+          });
+        // A rejected exit observation does not prove the process stopped: ask it to exit and keep
+        // the lease (fail closed) until this backend exits.
+        void execStream.exitCode.then(releaseUseLease, (error: unknown) => {
+          processAbort.abort();
+          log.warn("[MCP] Stdio server exit unconfirmed; keeping its workspace use lease", {
+            name,
+            workspaceId,
+            error: getErrorMessage(error),
+          });
+        });
+      }
 
       const cleanupSpawnedExecStream = async () => {
+        // The launch fence stops forwarding the startup signal once it returns, so kill the
+        // process explicitly: closing stdio alone leaves a server that ignores EOF running.
+        processAbort.abort();
         try {
           await execStream.stdin.close();
         } catch (error) {
@@ -2924,16 +8097,36 @@ export class MCPServerManager {
         } catch (error) {
           log.debug("[MCP] Error canceling stderr during startup abort cleanup", { name, error });
         }
+        // Join the killed process's exit, bounded like MCPStdioTransport.close(): on remote
+        // runtimes the abort only starts a SIGTERM-then-dispose sequence (#4953).
+        // A rejected exit observation does not prove the process stopped (as for the use lease
+        // above): keep waiting out the bound, then report the exit as unconfirmed.
+        const exited = await raceWithAbortAndTimeout(
+          execStream.exitCode.catch(() => new Promise<never>(() => undefined)),
+          { timeoutMs: MCP_STDIO_KILL_JOIN_MS }
+        );
+        if (exited.kind !== "ok") {
+          log.warn("[MCP] Killed stdio server did not report its exit after a startup abort", {
+            name,
+            workspaceId,
+            timeoutMs: MCP_STDIO_KILL_JOIN_MS,
+          });
+        }
       };
 
       if (signal.aborted) {
         // runtime.exec() can return after abort when the process was already spawned.
         // Explicitly close/cancel stdio so the spawned process is not left running.
-        await cleanupSpawnedExecStream();
+        try {
+          await cleanupSpawnedExecStream();
+        } finally {
+          execSettled.resolve();
+        }
         return null;
       }
+      execSettled.resolve();
 
-      const transport = new MCPStdioTransport(execStream);
+      const transport = new MCPStdioTransport(execStream, { kill: () => processAbort.abort() });
 
       const instanceRef: { current: MCPServerInstance | null } = { current: null };
       let transportClosed = false;
@@ -3008,6 +8201,8 @@ export class MCPServerManager {
       };
       signal.addEventListener("abort", onAbort, { once: true });
 
+      // Read once per connect (see the HTTP path).
+      const appResultStore = this.mcpAppsStoreForConnect();
       try {
         await transport.start();
         if (signal.aborted) {
@@ -3019,6 +8214,8 @@ export class MCPServerManager {
           client = await createMCPClient({
             transport,
             ...(prior !== undefined ? { prior } : {}),
+            mcpApps: appResultStore !== null,
+            ...this.appCatalogChangeOption(appResultStore, workspaceId),
           });
         } catch (error) {
           // The connect failure may have been the negotiation probe killing a
@@ -3042,8 +8239,22 @@ export class MCPServerManager {
           return null;
         }
 
+        const normalizedIdentity = normalizeServerIdentity(readyClient.serverInfo());
+        const identity = normalizedIdentity?.identity;
+        const connectionRef = describeConnection(name, info, "stdio");
+        // One icon owner per connected generation: tool refreshes reuse it,
+        // a reconnect gets a fresh one so historical refs are never relabeled.
+        const iconOwner: MCPIconOwner = {};
         const wrapRawTools = (raw: Record<string, Tool>) =>
           wrapMCPTools(raw, {
+            display: {
+              connection: connectionRef,
+              identity,
+              iconCandidates: normalizedIdentity?.iconCandidates,
+              registry: this.toolCallDisplayRegistry,
+              icons: { registry: this.iconRegistry, owner: iconOwner },
+            },
+            ...(appResultStore ? { appResults: { serverName: name, store: appResultStore } } : {}),
             onActivity,
             onClosed: () => {
               if (instanceRef.current) instanceRef.current.isClosed = true;
@@ -3063,12 +8274,18 @@ export class MCPServerManager {
 
         const instance: MCPServerInstance = {
           name,
+          identity,
+          connectionRef,
           resolvedTransport: "stdio",
           autoFallbackUsed: false,
           tools,
           prompts: [],
           getPrompt: (promptName, args, options) =>
             readyClient.getPrompt(promptName, args, options),
+          callToolForHook: (toolName, args, options) =>
+            readyClient.callToolForHook(toolName, args, options),
+          ...(appResultStore ? { apps: readyClient } : {}),
+          settings: readyClient,
           refreshPrompts: (options) => readyClient.prompts(options),
           isClosed: transportClosed,
           ...(isModernEra(negotiatedPrior)
@@ -3112,6 +8329,18 @@ export class MCPServerManager {
     }
   }
 
+  /** A refused tool call keeps the tokens and asks for a sign-in in Settings (#6622). */
+  private insufficientScopeOption(
+    serverUrl: string,
+    authProvider: unknown
+  ): { onInsufficientScope?: (scopes: string[]) => void } {
+    const oauthService = this.mcpOauthService;
+    if (authProvider === undefined || oauthService == null) return {};
+    return {
+      onInsufficientScope: (scopes) => oauthService.recordInsufficientScope({ serverUrl, scopes }),
+    };
+  }
+
   /**
    * Connect an HTTP/SSE MCP server (with auto http→sse fallback and one
    * stale-modern-verdict retry). Returns null when aborted.
@@ -3122,17 +8351,23 @@ export class MCPServerManager {
     projectSecrets: Record<string, string> | undefined,
     onActivity: () => void,
     signal: AbortSignal,
-    onAbortCleanup?: (cleanupPromise: Promise<void>) => void
+    onAbortCleanup?: (cleanupPromise: Promise<void>) => void,
+    workspaceId?: string
   ): Promise<MCPServerInstance | null> {
     const { headers } = resolveHeaders(info.headers, projectSecrets);
+    const design = info.managed === "claude-design" ? this.configService.claudeDesign : undefined;
+    const designGeneration = design?.generation;
 
     // Only attach authProvider when we have stored OAuth tokens for this server.
     // Passing an authProvider with no tokens can trigger user-interactive auth flows
     // on background MCP calls (undesirable).
-    const authProvider = await this.mcpOauthService?.getAuthProviderForServer({
-      serverName: name,
-      serverUrl: info.url,
-    });
+    const authProvider = design
+      ? undefined
+      : await this.mcpOauthService?.getAuthProviderForServer({
+          serverName: name,
+          serverUrl: info.url,
+          oauth: info.oauth,
+        });
 
     if (signal.aborted) {
       return null;
@@ -3154,34 +8389,62 @@ export class MCPServerManager {
       }
     };
 
-    const transportBase = {
-      url: info.url,
-      headers,
-      ...(authProvider ? { authProvider } : {}),
-    };
+    const transportBase = design
+      ? design.transport(headers)
+      : {
+          url: info.url,
+          headers,
+          ...(authProvider ? { authProvider } : {}),
+          ...this.insufficientScopeOption(info.url, authProvider),
+        };
 
     const verdictKey = JSON.stringify(["remote", name, info.transport, info.url, headers ?? null]);
-    let prior = this.getCachedEraVerdict(verdictKey);
+    // Read once per connect: the extension announcement and tool metadata stay consistent for
+    // the connection's lifetime even if the experiment flips meanwhile.
+    const appResultStore = this.mcpAppsStoreForConnect();
+    let prior = design ? { kind: "legacy" as const } : this.getCachedEraVerdict(verdictKey);
 
-    const tryHttp = async () =>
-      createMCPClient({
-        transport: {
-          type: "http",
-          ...transportBase,
-        },
-        onUncaughtError,
-        ...(prior !== undefined ? { prior } : {}),
-      });
+    // Connection initiation is fenced like a stdio spawn (see
+    // launchUnderOverrideFence): the authenticated handshake must not start
+    // after a sibling's revocation is durable — the postflight can close the
+    // client but cannot undo traffic or credentials already sent.
+    const tryHttp = () =>
+      this.launchUnderOverrideFence(
+        name,
+        info,
+        () =>
+          createMCPClient({
+            transport: {
+              type: "http",
+              ...transportBase,
+            },
+            onUncaughtError,
+            ...(prior !== undefined ? { prior } : {}),
+            mcpApps: appResultStore !== null,
+            ...this.appCatalogChangeOption(appResultStore, workspaceId),
+          }),
+        signal,
+        { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
+      );
 
-    const trySse = async () =>
-      createMCPClient({
-        transport: {
-          type: "sse",
-          ...transportBase,
-        },
-        onUncaughtError,
-        ...(prior !== undefined ? { prior } : {}),
-      });
+    const trySse = () =>
+      this.launchUnderOverrideFence(
+        name,
+        info,
+        () =>
+          createMCPClient({
+            transport: {
+              type: "sse",
+              ...transportBase,
+            },
+            onUncaughtError,
+            ...(prior !== undefined ? { prior } : {}),
+            mcpApps: appResultStore !== null,
+            ...this.appCatalogChangeOption(appResultStore, workspaceId),
+          }),
+        signal,
+        { workspaceId, releaseAfterMs: MCP_LAUNCH_INITIATION_FENCE_MS }
+      );
 
     let client: Awaited<ReturnType<typeof createMCPClient>> | null = null;
     let resolvedTransport: ResolvedTransport = "http";
@@ -3251,11 +8514,13 @@ export class MCPServerManager {
       }
     };
 
+    // Observe sibling shutdown throughout cold startup, including tools/list.
+    const unsubscribeStartupDesign = design?.onChange(cleanupStartupClient);
     try {
       try {
         client = await establishClient();
       } catch (error) {
-        if (prior === undefined) {
+        if (prior === undefined || design) {
           throw error;
         }
         // A cached verdict of either kind can go stale without a config
@@ -3292,8 +8557,21 @@ export class MCPServerManager {
 
       let clientClosed = false;
 
+      const normalizedIdentity = normalizeServerIdentity(activeClient.serverInfo());
+      const identity = normalizedIdentity?.identity;
+      const connectionRef = describeConnection(name, info, resolvedTransport);
+      // One icon owner per connected generation (see the stdio path).
+      const iconOwner: MCPIconOwner = {};
       const wrapRawTools = (raw: Record<string, Tool>) =>
         wrapMCPTools(raw, {
+          display: {
+            connection: connectionRef,
+            identity,
+            iconCandidates: normalizedIdentity?.iconCandidates,
+            registry: this.toolCallDisplayRegistry,
+            icons: { registry: this.iconRegistry, owner: iconOwner },
+          },
+          ...(appResultStore ? { appResults: { serverName: name, store: appResultStore } } : {}),
           onActivity,
           onClosed: () => {
             if (instanceRef.current) instanceRef.current.isClosed = true;
@@ -3313,13 +8591,20 @@ export class MCPServerManager {
         protocolVersion: activeClient.negotiatedProtocolVersion(),
       });
 
+      let unsubscribeDesign: (() => void) | undefined;
       const instance: MCPServerInstance = {
         name,
+        identity,
+        connectionRef,
         resolvedTransport,
         autoFallbackUsed,
         tools,
         prompts: [],
         getPrompt: (promptName, args, options) => activeClient.getPrompt(promptName, args, options),
+        callToolForHook: (toolName, args, options) =>
+          activeClient.callToolForHook(toolName, args, options),
+        ...(appResultStore ? { apps: activeClient } : {}),
+        settings: activeClient,
         refreshPrompts: (options) => activeClient.prompts(options),
         isClosed: transportErrored || clientClosed,
         ...(isModernEra(negotiatedPrior)
@@ -3331,6 +8616,7 @@ export class MCPServerManager {
             }
           : {}),
         close: async () => {
+          unsubscribeDesign?.();
           // Mark closed first to prevent any new tool calls from being treated as
           // valid by higher-level caching logic.
           if (!clientClosed) {
@@ -3348,6 +8634,16 @@ export class MCPServerManager {
       };
 
       instanceRef.current = instance;
+      if (design) {
+        // Revalidate before publication even when filesystem notifications are unavailable.
+        await design.getStatus();
+        if (designGeneration !== design.generation) {
+          await instance.close();
+          return null;
+        }
+        unsubscribeDesign = design.onChange(() => instance.close());
+        design.markConnected(design.generation);
+      }
       return instance;
     } catch (error) {
       await cleanupStartupClient();
@@ -3356,7 +8652,127 @@ export class MCPServerManager {
       }
       throw error;
     } finally {
+      unsubscribeStartupDesign?.();
       signal.removeEventListener("abort", onAbort);
     }
   }
+}
+
+/**
+ * A settings action as the dialog shows it. When the catalog refresh did not finish, the held
+ * flag can be stale (a tool that became writable still reads as read-only), so the action asks
+ * for a confirmation (#6611). The dispatch refreshes again either way.
+ */
+function knownWritability(
+  action: MCPSettingsToolAction,
+  refreshed: boolean
+): MCPSettingsToolAction {
+  return refreshed ? action : { ...action, readOnly: false };
+}
+
+/**
+ * How long a settings read's catalog refresh may take: MCP_APP_CATALOG_REFRESH_TIMEOUT_MS, and
+ * no longer than the read's own deadline leaves (at least 1 ms), so a read near its limit does
+ * not run about 2 s past it (#6611).
+ */
+function settingsCatalogRefreshBudgetMs(
+  readStartedAt: number,
+  options: { timeoutMs?: number } | undefined
+): number {
+  if (options?.timeoutMs === undefined) return MCP_APP_CATALOG_REFRESH_TIMEOUT_MS;
+  const left = Math.max(1, readStartedAt + options.timeoutMs - Date.now());
+  return Math.min(MCP_APP_CATALOG_REFRESH_TIMEOUT_MS, left);
+}
+
+function assertSettingsAppStored(stored: boolean, title: string): void {
+  if (!stored) throw new Error(`Xum could not keep the result of '${title}'. Try again.`);
+}
+
+/** A CallToolResult content part's text; "" for any other part. */
+function textPartOf(part: unknown): string {
+  if (part === null || typeof part !== "object" || Reflect.get(part, "type") !== "text") return "";
+  return String(Reflect.get(part, "text"));
+}
+
+/** A settings tool action's result for the dialog: its text parts, bounded. */
+function settingsToolResultText(result: MCPRawCallToolResult): { text: string; isError: boolean } {
+  const parts: unknown[] = Array.isArray(result.content) ? result.content : [];
+  // Collected only up to the bound (one unit past it, so the bound still marks the cut): many
+  // or huge server parts must not build an unbounded string first.
+  let text = "";
+  for (const part of parts) {
+    if (text.length > MAX_MCP_SETTINGS_TOOL_RESULT) break;
+    const partText = textPartOf(part);
+    if (partText === "") continue;
+    const room = MAX_MCP_SETTINGS_TOOL_RESULT + 1 - text.length;
+    text += (text.length > 0 ? "\n" : "") + partText.slice(0, room);
+  }
+  return { text: boundMCPSettingsToolResult(text), isError: result.isError === true };
+}
+
+/** Instance tokens whose settings schema is remembered (settingsSchemaHashes). */
+const MAX_REMEMBERED_SETTINGS_SCHEMAS = 256;
+
+function settingsSaveKey(workspaceId: string, serverName: string): string {
+  return `${workspaceId}\0${serverName}`;
+}
+
+/** Wait for `work` or the first abort of `signals`, then drop the abort listener. */
+async function raceUntilAborted(work: Promise<unknown>, signals: AbortSignal[]): Promise<void> {
+  const stop = AbortSignal.any(signals);
+  const onStop = Promise.withResolvers<void>();
+  const resolve = () => onStop.resolve();
+  if (stop.aborted) resolve();
+  stop.addEventListener("abort", resolve, { once: true });
+  try {
+    await Promise.race([work, onStop.promise]);
+  } finally {
+    stop.removeEventListener("abort", resolve);
+  }
+}
+
+function settingsSchemaKey(workspaceId: string, serverName: string, token: string): string {
+  return `${settingsSaveKey(workspaceId, serverName)}\0${token}`;
+}
+
+/** One settings read, for its tool actions: its server, instance, schema and offered tools. */
+interface SettingsReadRecord {
+  key: string;
+  instanceToken: string;
+  schemaHash: string;
+  tools: ReadonlySet<string>;
+}
+
+/** What a settings tool action names of the dialog's read (MCPSettingsReadSnapshot). */
+type SettingsActionRead = Pick<MCPSettingsReadSnapshot, "instanceToken" | "readId">;
+
+/** Whether `known` (a request ID) is newer than `requestId` (so its entry stays). */
+function isNewerSettingsRead(known: number | undefined, requestId: number): boolean {
+  return known !== undefined && known > requestId;
+}
+
+/** The tools a settings layout offers (its tool items). */
+function settingsLayoutToolNames(layout: MCPSettingsGroup[]): ReadonlySet<string> {
+  return new Set(
+    layout.flatMap((group) =>
+      group.items.flatMap((item) => (item.kind === "tool" ? [item.tool] : []))
+    )
+  );
+}
+
+/**
+ * What a save or a tool action checks a restarted instance against (isSettingsTokenAccepted):
+ * the schema and its layout, tool actions included, never the values.
+ */
+function settingsSchemaHash(snapshot: Pick<MCPSettingsSnapshot, "properties" | "layout">): string {
+  return crypto
+    .createHash("sha256")
+    .update(JSON.stringify([snapshot.properties, snapshot.layout]))
+    .digest("hex");
+}
+
+function staleSettingsInstanceError(serverName: string): Error {
+  return new Error(
+    `MCP server '${serverName}' was restarted or replaced since its settings were read. Reopen the dialog to see its current settings.`
+  );
 }

@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import { AlertTriangle, Check, ChevronDown, Database, Pin, Play, X } from "lucide-react";
 import { Button } from "@/browser/components/Button/Button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/browser/components/Popover/Popover";
 import { useAnalyticsRawQuery } from "@/browser/hooks/useAnalytics";
 import { cn } from "@/common/lib/utils";
 import type { SavedQuery } from "@/common/types/savedQueries";
@@ -28,6 +29,27 @@ export const SAMPLE_QUERIES = [
   {
     label: "Tokens by Thinking Level",
     sql: "SELECT thinking_level, sum(input_tokens + output_tokens + reasoning_tokens + cached_tokens + cache_create_tokens) as total_tokens\nFROM events\nWHERE thinking_level IS NOT NULL\nGROUP BY thinking_level\nORDER BY total_tokens DESC;",
+  },
+  // Refusal analytics: 'model_fallback_refusal' rows are refused fallback hops
+  // on committed turns; 'headless:refused_stream' rows are refusals on turns
+  // that never committed (terminal refusals, aborted/errored refusal turns).
+  {
+    label: "Refusals per Day",
+    sql: "SELECT date, model, count(*) as refusals\nFROM events\nWHERE tool_name IN ('model_fallback_refusal', 'headless:refused_stream')\nGROUP BY date, model\nORDER BY date ASC;",
+  },
+  {
+    label: "Refusal Downgrades (Requested → Answered)",
+    sql: "SELECT requested_model, model as answered_model, count(*) as turns\nFROM events\nWHERE requested_model IS NOT NULL AND tool_name IS NULL\nGROUP BY requested_model, model\nORDER BY turns DESC;",
+  },
+  {
+    // Every events row is one recorded invocation of `model` (committed turns,
+    // tool-internal calls, and billed errored/aborted/refused attempts via
+    // headless:* rows), so attempts = count(*) per model and refusal rows are
+    // a subset — billed non-refusal failures count in the denominator instead
+    // of inflating refusal_pct. Refusal rows already carry the refused model,
+    // so requested_model must not be coalesced in (double-count).
+    label: "Refusal Rate by Model",
+    sql: "WITH attempts AS (\n  SELECT model, count(*) as n FROM events\n  WHERE model IS NOT NULL GROUP BY model\n),\nrefused AS (\n  SELECT model, count(*) as n FROM events\n  WHERE tool_name IN ('model_fallback_refusal', 'headless:refused_stream')\n    AND model IS NOT NULL GROUP BY model\n)\nSELECT a.model,\n  COALESCE(r.n, 0) as refusals,\n  a.n as attempts,\n  ROUND(100.0 * COALESCE(r.n, 0) / a.n, 2) as refusal_pct\nFROM attempts a LEFT JOIN refused r USING (model)\nORDER BY refusals DESC;",
   },
 ];
 
@@ -123,39 +145,42 @@ export function SqlExplorer(props: SqlExplorerProps) {
           <Database className="text-muted size-4" />
           <h2 className="text-sm font-semibold">SQL Explorer</h2>
         </div>
-        <div className="relative">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setShowSamples(!showSamples)}
-            className="text-muted hover:text-foreground h-7 gap-1 px-2 text-[11px]"
-          >
-            Sample Queries
-            <ChevronDown
-              className={cn("size-3 transition-transform", showSamples && "rotate-180")}
-            />
-          </Button>
-          {showSamples && (
-            <div className="bg-dark border-border-medium absolute top-full right-0 z-50 mt-1 w-64 rounded-md border p-1 shadow-lg">
-              {SAMPLE_QUERIES.map((sample) => (
-                <button
-                  key={sample.label}
-                  onClick={() => {
-                    setSql(sample.sql);
-                    setShowSamples(false);
-                  }}
-                  className="hover:bg-accent hover:text-accent-foreground w-full rounded px-2 py-1.5 text-left text-[11px] transition-colors"
-                >
-                  {sample.label}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
+        {/* A Radix popover (not an inline div) is its own dismissable layer inside the Analytics
+            dialog, so Escape and outside clicks close only this menu, not the whole modal. It is
+            modal so the dialog underneath ignores that outside click (as with Settings stacked
+            over Analytics); a non-modal popover lets one overlay click close both layers. */}
+        <Popover modal open={showSamples} onOpenChange={setShowSamples}>
+          <PopoverTrigger asChild>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-muted hover:text-foreground h-7 gap-1 px-2 text-[11px]"
+            >
+              Sample Queries
+              <ChevronDown
+                className={cn("size-3 transition-transform", showSamples && "rotate-180")}
+              />
+            </Button>
+          </PopoverTrigger>
+          <PopoverContent align="end" aria-label="Sample queries" className="w-64 p-1">
+            {SAMPLE_QUERIES.map((sample) => (
+              <button
+                key={sample.label}
+                onClick={() => {
+                  setSql(sample.sql);
+                  setShowSamples(false);
+                }}
+                className="hover:bg-accent hover:text-accent-foreground w-full rounded px-2 py-1.5 text-left text-[11px] transition-colors"
+              >
+                {sample.label}
+              </button>
+            ))}
+          </PopoverContent>
+        </Popover>
       </div>
 
       <div className="flex flex-col gap-2">
-        <div className="relative">
+        <div>
           <textarea
             value={sql}
             onChange={(event) => setSql(event.target.value)}
@@ -171,8 +196,11 @@ export function SqlExplorer(props: SqlExplorerProps) {
               }
             }}
           />
-          <div className="absolute right-2 bottom-2 flex items-center gap-2">
-            <span className="text-muted text-[10px]">Ctrl/Cmd+Enter to run</span>
+          {/* Below the editor, not over it: on a phone the overlay hid the last lines of SQL. */}
+          <div className="mt-2 flex items-center justify-end gap-2">
+            <span className="text-muted mobile-hide-shortcut-hints text-[10px]">
+              Ctrl/Cmd+Enter to run
+            </span>
             <Button
               size="sm"
               onClick={() => {
@@ -189,7 +217,7 @@ export function SqlExplorer(props: SqlExplorerProps) {
 
         <div className="text-muted text-[10px]">
           Use <code className="text-foreground">{TIME_FILTER_PLACEHOLDER}</code> in a WHERE clause
-          to filter by the selected date range (7D/30D/90D/All).
+          to filter by the selected date range.
         </div>
 
         {error && (

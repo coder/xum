@@ -10,33 +10,50 @@ import {
 import { Button } from "@/browser/components/Button/Button";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { isEditableElement, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import { getErrorMessage } from "@/common/utils/errors";
 
 interface StartHereModalProps {
   isOpen: boolean;
   onClose: () => void;
+  /** Rejects (never silently resolves) when the operation was refused, so the dialog stays open. */
   onConfirm: () => void | Promise<void>;
+  /**
+   * Confirmation is not currently possible (the transcript stopped being a verified copy of
+   * history while the dialog was open): OK renders disabled and the confirm keybind is inert.
+   */
+  confirmDisabled?: boolean;
 }
 
-export const StartHereModal: React.FC<StartHereModalProps> = ({ isOpen, onClose, onConfirm }) => {
+export const StartHereModal: React.FC<StartHereModalProps> = ({
+  isOpen,
+  onClose,
+  onConfirm,
+  confirmDisabled = false,
+}) => {
   const [isExecuting, setIsExecuting] = useState(false);
+  // Why the last confirmation was refused; shown until the next attempt or cancel.
+  const [error, setError] = useState<string | undefined>(undefined);
 
   const handleCancel = useCallback(() => {
     if (!isExecuting) {
+      setError(undefined);
       onClose();
     }
   }, [isExecuting, onClose]);
 
   const handleConfirm = useCallback(async () => {
-    if (isExecuting) return;
+    if (isExecuting || confirmDisabled) return;
     setIsExecuting(true);
+    setError(undefined);
     try {
       await onConfirm();
       onClose();
-    } catch (error) {
-      console.error("Start Here error:", error);
+    } catch (confirmError) {
+      setError(getErrorMessage(confirmError));
+    } finally {
       setIsExecuting(false);
     }
-  }, [isExecuting, onConfirm, onClose]);
+  }, [isExecuting, confirmDisabled, onConfirm, onClose]);
 
   const handleOpenChange = useCallback(
     (open: boolean) => {
@@ -77,6 +94,11 @@ export const StartHereModal: React.FC<StartHereModalProps> = ({ isOpen, onClose,
             This will start a new context from this message and preserve earlier chat history.
           </DialogDescription>
         </DialogHeader>
+        {error && (
+          <div role="alert" className="bg-error-bg text-error rounded p-2 px-3 text-[13px]">
+            {error}
+          </div>
+        )}
         <DialogFooter className="justify-center">
           <Button variant="secondary" onClick={handleCancel} disabled={isExecuting}>
             Cancel
@@ -87,7 +109,7 @@ export const StartHereModal: React.FC<StartHereModalProps> = ({ isOpen, onClose,
               N
             </span>
           </Button>
-          <Button onClick={() => void handleConfirm()} disabled={isExecuting}>
+          <Button onClick={() => void handleConfirm()} disabled={isExecuting || confirmDisabled}>
             {isExecuting ? "Starting..." : "OK"}
             <span
               aria-hidden="true"

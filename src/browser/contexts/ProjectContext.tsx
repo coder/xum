@@ -8,23 +8,21 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useAPI } from "@/browser/contexts/API";
+import { useAPI, useLiveAPI, type APIClient } from "@/browser/contexts/API";
 import type { ProjectConfig } from "@/common/types/project";
 import type { BranchListResult } from "@/common/orpc/types";
 import type { z } from "zod";
 import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { Result } from "@/common/types/result";
-import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-  deleteWorkspaceStorage,
-  getDraftScopeId,
-} from "@/common/constants/storage";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
+import { isConnectionLostError } from "@/browser/contexts/connectionLink";
+import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
 import { getFirstTopLevelProjectPath } from "@/common/utils/subProjects";
+import type { ProjectIconName } from "@/common/constants/projectIcons";
 import {
   normalizeProjectPathForComparison,
   resolveProjectPathFromProjectQuery,
@@ -79,6 +77,11 @@ export interface ProjectContext {
   refreshProjects: () => Promise<void>;
   addProject: (normalizedPath: string, projectConfig: ProjectConfig) => void;
   removeProject: (path: string, options?: { force?: boolean }) => Promise<ProjectRemoveResult>;
+  /**
+   * Read-only removal preflight (no pruning/deletion side effects). Needed by
+   * the delete confirmation because projects.list excludes archived workspaces.
+   */
+  getRemovalBlockers: (path: string) => Promise<ProjectWorkspaceCounts>;
 
   // Project creation modal
   projectCreateInitialPath?: string;
@@ -97,9 +100,14 @@ export interface ProjectContext {
   updateSecrets: (projectPath: string, secrets: Secret[]) => Promise<void>;
   updateDisplayName: (projectPath: string, displayName: string | null) => Promise<Result<void>>;
   updateColor: (projectPath: string, color: string | null) => Promise<Result<void>>;
+  updateIcon: (projectPath: string, icon: ProjectIconName | null) => Promise<Result<void>>;
   updateCustomInstructions: (
     projectPath: string,
     customInstructions: string | null
+  ) => Promise<Result<void>>;
+  updateCodeWorkspaceSyncPath: (
+    projectPath: string,
+    codeWorkspaceSyncPath: string | null
   ) => Promise<Result<void>>;
 
   assignWorkspaceToSubProject: (
@@ -129,8 +137,31 @@ function toNonEmptyTrimmed(value?: string | null): string | null {
   return trimmed && trimmed.length > 0 ? trimmed : null;
 }
 
+function findSystemProjectPath(projects: Map<string, ProjectConfig>): string | null {
+  return [...projects.entries()].find(([, cfg]) => cfg.projectKind === "system")?.[0] ?? null;
+}
+
+/** One project-settings write followed by a project list refresh, as a Result. */
+async function runProjectMutation(
+  liveApi: APIClient | null,
+  refreshProjects: () => Promise<void>,
+  mutate: (api: APIClient) => Promise<void>
+): Promise<Result<void>> {
+  if (!liveApi) return { success: false, error: "API not connected" };
+  try {
+    await mutate(liveApi);
+    await refreshProjects();
+    return { success: true, data: undefined };
+  } catch (error) {
+    return { success: false, error: getErrorMessage(error) };
+  }
+}
+
 export function ProjectProvider(props: { children: ReactNode }) {
   const { api } = useAPI();
+  // Handlers use only the live client: offline they keep returning their result (for example
+  // { success: false }), even while useAPI() keeps the last client during a reconnect.
+  const liveApi = useLiveAPI();
   const [allProjectsInternal, setAllProjectsInternal] = useState<Map<string, ProjectConfig>>(
     new Map()
   );
@@ -139,9 +170,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
     [allProjectsInternal]
   );
   const systemProjectPath = useMemo(
-    () =>
-      [...allProjectsInternal.entries()].find(([, cfg]) => cfg.projectKind === "system")?.[0] ??
-      null,
+    () => findSystemProjectPath(allProjectsInternal),
     [allProjectsInternal]
   );
   const [loading, setLoading] = useState(true);
@@ -160,51 +189,56 @@ export function ProjectProvider(props: { children: ReactNode }) {
   });
   const workspaceModalProjectRef = useRef<string | null>(null);
 
-  // Used to guard against refreshProjects() races.
-  //
-  // Example: the initial refresh (on mount) can start before a workspace fork, then
-  // resolve after a fork-triggered refresh. Without this guard, the stale response
-  // could overwrite the newer project list and make the forked workspace disappear
-  // from the sidebar again.
-  const projectsRefreshSeqRef = useRef(0);
-  const latestAppliedProjectsRefreshSeqRef = useRef(0);
+  const projectsRefreshRef = useRef<{
+    api: typeof api;
+    pending: boolean;
+    promise: Promise<void> | null;
+  }>({ api, pending: false, promise: null });
 
-  const refreshProjects = useCallback(async () => {
+  const refreshProjects = useCallback((): Promise<void> => {
+    const refresh = projectsRefreshRef.current;
+    if (refresh.api !== api) return Promise.resolve();
     if (!api) {
-      setLoaded(false);
+      // Keep `loaded` and the shown projects: the reconnect reloads them (stale-while-revalidate).
       setLoadError("API not connected");
-      return;
+      return Promise.resolve();
     }
 
-    const refreshSeq = projectsRefreshSeqRef.current + 1;
-    projectsRefreshSeqRef.current = refreshSeq;
-
-    try {
-      const projectsList = await api.projects.list();
-
-      // Ignore out-of-date refreshes so an older response can't clobber a newer success.
-      if (refreshSeq < latestAppliedProjectsRefreshSeqRef.current) {
-        return;
+    // Cascade events share one request. Later invalidations require a trailing request.
+    refresh.pending = true;
+    refresh.promise ??= Promise.resolve().then(async () => {
+      try {
+        while (refresh.pending && refresh.api) {
+          refresh.pending = false;
+          const requestApi = refresh.api;
+          try {
+            const projectsList = await requestApi.projects.list();
+            if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
+            setAllProjectsInternal(new Map(projectsList));
+            setLoaded(true);
+            setLoadError(null);
+          } catch (error) {
+            if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
+            // A lost connection is no load error: the reconnect reloads.
+            if (isConnectionLostError(error)) continue;
+            // Keep successful data when a later refresh fails.
+            console.error("Failed to load projects:", error);
+            setLoadError(getErrorMessage(error));
+          }
+        }
+      } finally {
+        refresh.promise = null;
       }
-
-      latestAppliedProjectsRefreshSeqRef.current = refreshSeq;
-      setAllProjectsInternal(new Map(projectsList));
-      setLoaded(true);
-      setLoadError(null);
-    } catch (error) {
-      // Ignore out-of-date refreshes so an older error can't clobber a newer success.
-      if (refreshSeq < latestAppliedProjectsRefreshSeqRef.current) {
-        return;
-      }
-
-      // Keep the previous project list on error so scoped user preferences are not pruned.
-      console.error("Failed to load projects:", error);
-      setLoadError(getErrorMessage(error));
-    }
+    });
+    // All callers await the trailing request, not only the response already in flight.
+    return refresh.promise;
   }, [api]);
 
   useEffect(() => {
     let cancelled = false;
+    // A disconnected transport must not block the replacement client.
+    const refresh: typeof projectsRefreshRef.current = { api, pending: false, promise: null };
+    projectsRefreshRef.current = refresh;
     setLoading(true);
 
     const initialRefresh = async () => {
@@ -224,8 +258,10 @@ export function ProjectProvider(props: { children: ReactNode }) {
 
     return () => {
       cancelled = true;
+      refresh.api = null;
+      refresh.pending = false;
     };
-  }, [refreshProjects]);
+  }, [api, refreshProjects]);
 
   useEffect(() => {
     const onConfigChanged = api?.config?.onConfigChanged;
@@ -273,14 +309,14 @@ export function ProjectProvider(props: { children: ReactNode }) {
 
   const removeProject = useCallback(
     async (path: string, options?: { force?: boolean }): Promise<ProjectRemoveResult> => {
-      if (!api) {
+      if (!liveApi) {
         return {
           success: false,
           error: { type: "unknown", message: "API not connected" },
         };
       }
       try {
-        const result = await api.projects.remove({
+        const result = await liveApi.projects.remove({
           projectPath: path,
           force: options?.force,
         });
@@ -291,33 +327,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
             return next;
           });
 
-          // Clean up any UI-only workspace drafts for this project.
-          const draftsValue = readPersistedState<unknown>(WORKSPACE_DRAFTS_BY_PROJECT_KEY, {});
-          if (draftsValue && typeof draftsValue === "object") {
-            const record = draftsValue as Record<string, unknown>;
-            const drafts = record[path];
-            if (drafts !== undefined) {
-              if (Array.isArray(drafts)) {
-                for (const draft of drafts) {
-                  if (!draft || typeof draft !== "object") continue;
-                  const draftId = (draft as { draftId?: unknown }).draftId;
-                  if (typeof draftId === "string" && draftId.trim().length > 0) {
-                    deleteWorkspaceStorage(getDraftScopeId(path, draftId));
-                  }
-                }
-              }
-
-              updatePersistedState<Record<string, unknown>>(
-                WORKSPACE_DRAFTS_BY_PROJECT_KEY,
-                (prev) => {
-                  const next = prev && typeof prev === "object" ? { ...prev } : {};
-                  delete next[path];
-                  return next;
-                },
-                {}
-              );
-            }
-          }
+          // The backend deleted the project's creation drafts (by their project field).
+          getCreationDraftStore().forgetProject(path);
 
           await refreshProjects();
           return { success: true };
@@ -341,7 +352,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
         };
       }
     },
-    [api, refreshProjects]
+    [liveApi, refreshProjects]
   );
 
   const resolveProjectPath = useCallback(
@@ -425,10 +436,10 @@ export function ProjectProvider(props: { children: ReactNode }) {
 
   const getBranchesForProject = useCallback(
     async (projectPath: string): Promise<BranchListResult> => {
-      if (!api) {
+      if (!liveApi) {
         return { branches: [], recommendedTrunk: "" };
       }
-      const branchResult = await api.projects.listBranches({ projectPath });
+      const branchResult = await liveApi.projects.listBranches({ projectPath });
       const branches = branchResult.branches;
       const sanitizedBranches = Array.isArray(branches)
         ? branches.filter((branch): branch is string => typeof branch === "string")
@@ -445,7 +456,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
         recommendedTrunk: recommended,
       };
     },
-    [api]
+    [liveApi]
   );
 
   const openWorkspaceModal = useCallback(
@@ -509,63 +520,63 @@ export function ProjectProvider(props: { children: ReactNode }) {
 
   const getSecrets = useCallback(
     async (projectPath: string): Promise<Secret[]> => {
-      if (!api) return [];
-      return await api.secrets.get({ projectPath });
+      if (!liveApi) return [];
+      return await liveApi.secrets.get({ projectPath });
     },
-    [api]
+    [liveApi]
   );
 
   const updateSecrets = useCallback(
     async (projectPath: string, secrets: Secret[]) => {
-      if (!api) return;
-      const result = await api.secrets.update({ projectPath, secrets });
+      if (!liveApi) return;
+      const result = await liveApi.secrets.update({ projectPath, secrets });
       if (!result.success) {
         console.error("Failed to update secrets:", result.error);
       }
     },
-    [api]
+    [liveApi]
   );
 
   const updateDisplayName = useCallback(
     async (projectPath: string, displayName: string | null): Promise<Result<void>> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
       try {
-        await api.projects.setDisplayName({ projectPath, displayName });
+        await liveApi.projects.setDisplayName({ projectPath, displayName });
         await refreshProjects();
         return { success: true, data: undefined };
       } catch (error) {
         return { success: false, error: getErrorMessage(error) };
       }
     },
-    [api, refreshProjects]
+    [liveApi, refreshProjects]
   );
 
   const updateColor = useCallback(
     async (projectPath: string, color: string | null): Promise<Result<void>> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
       try {
-        await api.projects.setColor({ projectPath, color });
+        await liveApi.projects.setColor({ projectPath, color });
         await refreshProjects();
         return { success: true, data: undefined };
       } catch (error) {
         return { success: false, error: getErrorMessage(error) };
       }
     },
-    [api, refreshProjects]
+    [liveApi, refreshProjects]
   );
 
   const updateCustomInstructions = useCallback(
     async (projectPath: string, customInstructions: string | null): Promise<Result<void>> => {
-      if (!api) return { success: false, error: "API not connected" };
+      if (!liveApi) return { success: false, error: "API not connected" };
       try {
-        await api.projects.setCustomInstructions({ projectPath, customInstructions });
+        await liveApi.projects.setCustomInstructions({ projectPath, customInstructions });
         await refreshProjects();
         return { success: true, data: undefined };
       } catch (error) {
         return { success: false, error: getErrorMessage(error) };
       }
     },
-    [api, refreshProjects]
+    [liveApi, refreshProjects]
   );
 
   const assignWorkspaceToSubProject = useCallback(
@@ -574,8 +585,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
       workspaceId: string,
       subProjectPath: string | null
     ): Promise<Result<void>> => {
-      if (!api) return { success: false, error: "API not connected" };
-      const result = await api.projects.subProjects.assignWorkspace({
+      if (!liveApi) return { success: false, error: "API not connected" };
+      const result = await liveApi.projects.subProjects.assignWorkspace({
         projectPath,
         workspaceId,
         subProjectPath,
@@ -585,7 +596,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
       }
       return result;
     },
-    [api, refreshProjects]
+    [liveApi, refreshProjects]
   );
 
   const value = useMemo<ProjectContext>(
@@ -596,12 +607,21 @@ export function ProjectProvider(props: { children: ReactNode }) {
       hasAnyProject,
       resolveNewChatProjectPath,
       getProjectConfig,
-      loading,
+      // Only the first load counts: a reload after a reconnect keeps the loaded projects shown.
+      loading: loading && !loaded,
       loaded,
       loadError,
       refreshProjects,
       addProject,
       removeProject,
+      // Inline (not useCallback-wrapped): `liveApi` is already a dependency of
+      // this provider value memo, mirroring the other inline actions below.
+      getRemovalBlockers: async (path: string): Promise<ProjectWorkspaceCounts> => {
+        if (!liveApi) {
+          throw new Error("API not connected");
+        }
+        return liveApi.projects.getRemovalBlockers({ projectPath: path });
+      },
       projectCreateInitialPath,
       isProjectCreateModalOpen,
       openProjectCreateModal: (options?: { initialPath?: string }) => {
@@ -621,6 +641,16 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateDisplayName,
       updateColor,
       updateCustomInstructions,
+      // Defined inline (not useCallback): the repo bans new manual useCallback
+      // memoization, and inlining keeps exhaustive-deps satisfied via `liveApi`.
+      updateIcon: (projectPath: string, icon: ProjectIconName | null) =>
+        runProjectMutation(liveApi, refreshProjects, (api) =>
+          api.projects.setIcon({ projectPath, icon })
+        ),
+      updateCodeWorkspaceSyncPath: (projectPath: string, codeWorkspaceSyncPath: string | null) =>
+        runProjectMutation(liveApi, refreshProjects, (api) =>
+          api.projects.setCodeWorkspaceSyncPath({ projectPath, codeWorkspaceSyncPath })
+        ),
       assignWorkspaceToSubProject,
     }),
     [
@@ -647,6 +677,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
       updateDisplayName,
       updateColor,
       updateCustomInstructions,
+      liveApi,
       assignWorkspaceToSubProject,
     ]
   );

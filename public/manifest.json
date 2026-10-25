@@ -1,6 +1,6 @@
 {
-  "name": "shux - coding agent multiplexer",
-  "short_name": "shux",
+  "name": "xum - coding agent multiplexer",
+  "short_name": "xum",
   "description": "Parallel agentic development with Electron + React",
   "start_url": ".",
   "display": "standalone",

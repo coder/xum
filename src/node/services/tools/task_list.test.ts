@@ -4,9 +4,10 @@ import { describe, it, expect, mock } from "bun:test";
 import type { ToolExecutionOptions } from "ai";
 
 import { createTaskListTool } from "./task_list";
-import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { TestTempDir, createFakeWorkspaceTurnManager, createTestToolConfig } from "./testHelpers";
 import { Config, type Workspace } from "@/node/config";
-import type { AgentTaskStatus, TaskService } from "@/node/services/taskService";
+import type { TaskService } from "@/node/services/taskService";
+import type { AgentTaskStatus } from "@/node/services/taskWorkspaceSeam";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type {
   WorkspaceTurnTaskHandleRecord,
@@ -332,9 +333,11 @@ describe("task_list tool", () => {
           },
         })
       ),
-      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
     } as unknown as TaskService;
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+    });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     expect(
       await Promise.resolve(tool.execute!({ statuses: ["running"] }, mockToolCallOptions))
@@ -382,9 +385,11 @@ describe("task_list tool", () => {
             },
           })
       ),
-      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
     } as unknown as TaskService;
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({
+      listWorkspaceTurnTasks: mock(() => Promise.resolve([])),
+    });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const result = (await Promise.resolve(
       tool.execute!({ statuses: ["failed", "interrupted"] }, mockToolCallOptions)
@@ -453,9 +458,9 @@ describe("task_list tool", () => {
       isDescendantAgentTask: mock((_ancestorWorkspaceId: string, candidateWorkspaceId: string) =>
         Promise.resolve(candidateWorkspaceId === "child-agent")
       ),
-      listWorkspaceTurnTasks,
     } as unknown as TaskService;
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ listWorkspaceTurnTasks });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     expect(
       await Promise.resolve(tool.execute!({ statuses: ["completed"] }, mockToolCallOptions))
@@ -467,27 +472,29 @@ describe("task_list tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const listDescendantAgentTasks = mock(() => []);
-    const listWorkspaceTurnTasks = mock(() => [
-      {
-        kind: "workspace_turn" as const,
-        handleId: "wst_turn",
-        ownerWorkspaceId: "root-workspace",
-        workspaceId: "child-workspace",
-        turnId: "turn-1",
-        status: "running" as const,
-        createdAt: "2026-06-19T00:00:00.000Z",
-        updatedAt: "2026-06-19T00:00:01.000Z",
-        createdWorkspace: true,
-        disposableWorkspace: false,
-        title: "Summary",
-      },
-    ]);
+    const listWorkspaceTurnTasks = mock(() =>
+      Promise.resolve([
+        {
+          kind: "workspace_turn" as const,
+          handleId: "wst_turn",
+          ownerWorkspaceId: "root-workspace",
+          workspaceId: "child-workspace",
+          turnId: "turn-1",
+          status: "running" as const,
+          createdAt: "2026-06-19T00:00:00.000Z",
+          updatedAt: "2026-06-19T00:00:01.000Z",
+          createdWorkspace: true,
+          disposableWorkspace: false,
+          title: "Summary",
+        },
+      ])
+    );
     const taskService = {
       listDescendantAgentTasks,
-      listWorkspaceTurnTasks,
     } as unknown as TaskService;
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ listWorkspaceTurnTasks });
 
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ statuses: ["running"] }, mockToolCallOptions)
@@ -538,18 +545,20 @@ describe("task_list tool", () => {
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
 
     const listDescendantAgentTasks = mock(() => []);
-    const listWorkspaceTurnTasks = mock(() => [
-      buildWorkspaceTurn("turn-archived-completed", "archived-turn-workspace", "completed"),
-      buildWorkspaceTurn("turn-archived-running", "archived-running-workspace", "running"),
-      buildWorkspaceTurn("turn-ancestor-error", "ancestor-archived-turn-workspace", "error"),
-      buildWorkspaceTurn("turn-open-completed", "open-turn-workspace", "completed"),
-      buildWorkspaceTurn("turn-missing-completed", "missing-turn-workspace", "completed"),
-    ]);
+    const listWorkspaceTurnTasks = mock(() =>
+      Promise.resolve([
+        buildWorkspaceTurn("turn-archived-completed", "archived-turn-workspace", "completed"),
+        buildWorkspaceTurn("turn-archived-running", "archived-running-workspace", "running"),
+        buildWorkspaceTurn("turn-ancestor-error", "ancestor-archived-turn-workspace", "error"),
+        buildWorkspaceTurn("turn-open-completed", "open-turn-workspace", "completed"),
+        buildWorkspaceTurn("turn-missing-completed", "missing-turn-workspace", "completed"),
+      ])
+    );
     const taskService = {
       listDescendantAgentTasks,
-      listWorkspaceTurnTasks,
     } as unknown as TaskService;
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ listWorkspaceTurnTasks });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const result: unknown = await Promise.resolve(
       tool.execute!({ statuses: ["completed", "failed", "running"] }, mockToolCallOptions)
@@ -586,16 +595,18 @@ describe("task_list tool", () => {
     ]);
     const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "root-workspace" });
     const listDescendantAgentTasks = mock(() => []);
-    const listWorkspaceTurnTasks = mock(() => [
-      buildWorkspaceTurn("turn-archived-completed", "archived-turn-workspace", "completed"),
-      buildWorkspaceTurn("turn-ancestor-error", "ancestor-archived-turn-workspace", "error"),
-      buildWorkspaceTurn("turn-open-completed", "open-turn-workspace", "completed"),
-    ]);
+    const listWorkspaceTurnTasks = mock(() =>
+      Promise.resolve([
+        buildWorkspaceTurn("turn-archived-completed", "archived-turn-workspace", "completed"),
+        buildWorkspaceTurn("turn-ancestor-error", "ancestor-archived-turn-workspace", "error"),
+        buildWorkspaceTurn("turn-open-completed", "open-turn-workspace", "completed"),
+      ])
+    );
     const taskService = {
       listDescendantAgentTasks,
-      listWorkspaceTurnTasks,
     } as unknown as TaskService;
-    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const workspaceTurnManager = createFakeWorkspaceTurnManager({ listWorkspaceTurnTasks });
+    const tool = createTaskListTool({ ...baseConfig, taskService, workspaceTurnManager });
 
     const defaultResult: unknown = await Promise.resolve(
       tool.execute!({ statuses: ["completed", "failed"] }, mockToolCallOptions)
@@ -895,5 +906,544 @@ describe("task_list tool", () => {
         },
       ],
     });
+  });
+
+  function buildTreeTaskService() {
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootTitle: "Root workspace",
+      rootRelationship: "ancestor" as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+        {
+          ...buildAgentTask("task-sib", "running", "tree-root"),
+          relationship: "sibling" as const,
+        },
+        {
+          ...buildAgentTask("task-done", "reported", "tree-root"),
+          relationship: "sibling" as const,
+        },
+      ],
+    }));
+    return {
+      listTaskTreeAgents,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    };
+  }
+
+  it.each(["main_chat", "side_chat"] as const)(
+    "lists direct %s links only in tree scope, with workspace filtering and no ownership fields",
+    async (relationship) => {
+      using tempDir = new TestTempDir("test-task-list-linked-chat");
+      const listTaskTreeAgents = mock(() => ({
+        rootWorkspaceId: "caller",
+        rootRelationship: "self" as const,
+        tasks: [],
+        relatedChats: [{ workspaceId: "linked-chat", title: "Linked", relationship }],
+      }));
+      const tool = createTaskListTool({
+        ...createTestToolConfig(tempDir.path, { workspaceId: "caller" }),
+        taskService: {
+          listTaskTreeAgents,
+          listDescendantAgentTasks: mock(() => []),
+        } as unknown as TaskService,
+      });
+      const expectedRows = [
+        { taskId: "caller", status: "workspace", relationship: "self", depth: 0 },
+        { taskId: "linked-chat", status: "workspace", title: "Linked", relationship, depth: 0 },
+      ];
+      expect(await tool.execute!({ scope: "tree" }, mockToolCallOptions)).toMatchObject({
+        tasks: expectedRows,
+      });
+      expect(
+        await tool.execute!({ scope: "tree", statuses: ["workspace"] }, mockToolCallOptions)
+      ).toMatchObject({
+        tasks: expectedRows,
+      });
+      expect(
+        await tool.execute!({ scope: "tree", statuses: ["running"] }, mockToolCallOptions)
+      ).toMatchObject({
+        tasks: [],
+      });
+      expect(await tool.execute!({}, mockToolCallOptions)).toEqual({ tasks: [] });
+      expect(listTaskTreeAgents).toHaveBeenCalledTimes(3);
+      // Compare whole rows so a fake parent/execution handle cannot sneak into these addresses.
+      const parsed = (await tool.execute!({ scope: "tree" }, mockToolCallOptions)) as {
+        tasks: unknown[];
+      };
+      expect(parsed.tasks).toEqual(expectedRows);
+    }
+  );
+
+  it("tree scope includes the root row by default and filters inactive rows", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-default");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    const { listTaskTreeAgents, taskService } = buildTreeTaskService();
+
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    );
+
+    expect(listTaskTreeAgents).toHaveBeenCalledWith("task-self");
+    // Default statuses: the root "workspace" row plus active rows; reported rows stay hidden.
+    expect(taskIds(result)).toEqual(["tree-root", "task-self", "task-sib"]);
+    const parsed = result as {
+      tasks: Array<{
+        taskId: string;
+        status: string;
+        title?: string;
+        relationship?: string;
+        depth: number;
+      }>;
+      note?: string;
+    };
+    expect(parsed.tasks[0]).toEqual({
+      taskId: "tree-root",
+      status: "workspace",
+      title: "Root workspace",
+      relationship: "ancestor",
+      depth: 0,
+    });
+    expect(parsed.tasks[1].relationship).toBe("self");
+  });
+
+  it("tree scope does not advertise queued reawakenings on peer rows", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-reawakening");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootRelationship: "ancestor" as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+        // Sibling with a QUEUED reawakening: peer admission only accepts a running execution
+        // mirror, so the row must keep its stable terminal status (which the note marks
+        // unaddressable) instead of advertising an addressable-looking "queued".
+        {
+          ...buildAgentTask("task-sib-requeued", "reported", "tree-root"),
+          executionTaskId: "wtt-sib",
+          executionStatus: "queued" as const,
+          relationship: "sibling" as const,
+        },
+        // A RUNNING reawakened sibling stays overlaid: it genuinely accepts peer messages.
+        {
+          ...buildAgentTask("task-sib-live", "reported", "tree-root"),
+          executionTaskId: "wtt-live",
+          executionStatus: "running" as const,
+          relationship: "sibling" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const parsed = (await Promise.resolve(
+      tool.execute!(
+        { scope: "tree", statuses: ["workspace", "running", "queued", "reported"] },
+        mockToolCallOptions
+      )
+    )) as { tasks: Array<{ taskId: string; status: string }> };
+
+    const statusById = new Map(parsed.tasks.map((task) => [task.taskId, task.status]));
+    expect(statusById.get("task-sib-requeued")).toBe("reported");
+    expect(statusById.get("task-sib-live")).toBe("running");
+  });
+
+  it("tree scope hides initially queued peers that peer sends would refuse", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-initially-queued");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootRelationship: "ancestor" as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+        // Initially queued/starting siblings (launch capacity) carry a nonterminal STABLE
+        // status with no execution overlay, but sendAgentPeerMessage refuses those statuses
+        // outright — advertising them would break the note's addressability claim.
+        {
+          ...buildAgentTask("task-sib-queued", "queued", "tree-root"),
+          relationship: "sibling" as const,
+        },
+        {
+          ...buildAgentTask("task-sib-starting", "starting", "tree-root"),
+          relationship: "sibling" as const,
+        },
+        // Queued DESCENDANTS stay visible: parent guidance may target them.
+        {
+          ...buildAgentTask("task-child-queued", "queued", "task-self"),
+          relationship: "descendant" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!(
+        { scope: "tree", statuses: ["workspace", "running", "queued", "starting"] },
+        mockToolCallOptions
+      )
+    );
+    expect(taskIds(result)).toEqual(["tree-root", "task-self", "task-child-queued"]);
+  });
+
+  it("tree scope hides peers and swaps the note for restricted callers", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-restricted");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-cand-child" });
+    // A best-of candidate (or workflow-owned) caller cannot message the root or any peer:
+    // listTaskTreeAgents already omits those rows and flags the caller, and the tool must not
+    // advertise the root row or the standard addressability note.
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootTitle: "Root workspace",
+      rootRelationship: "ancestor" as const,
+      callerPeerMessagingRestricted: true as const,
+      tasks: [
+        {
+          ...buildAgentTask("task-cand-child", "running", "task-cand"),
+          relationship: "self" as const,
+        },
+        {
+          ...buildAgentTask("task-cand-grandchild", "running", "task-cand-child"),
+          relationship: "descendant" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result = (await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    )) as { tasks: Array<{ taskId: string }>; note?: string };
+    expect(result.tasks.map((task) => task.taskId)).toEqual([
+      "task-cand-child",
+      "task-cand-grandchild",
+    ]);
+    expect(result.note).toContain("cannot send or receive peer messages");
+  });
+
+  it("tree scope omits an archived root from discovery", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-archived-root");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    // Peer sends refuse archived targets, so an archived root must not be published as an
+    // addressable "workspace" row.
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "tree-root",
+      rootTitle: "Root workspace",
+      rootRelationship: "ancestor" as const,
+      rootArchived: true as const,
+      tasks: [
+        { ...buildAgentTask("task-self", "running", "tree-root"), relationship: "self" as const },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    );
+    expect(taskIds(result)).toEqual(["task-self"]);
+  });
+
+  it("tree scope omits a missing root from discovery", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-missing-root");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    // A retained descendant whose parent chain ends at a removed/corrupted workspace: sends to
+    // that ID return not_found, so the root row must not be published as addressable.
+    const listTaskTreeAgents = mock(() => ({
+      rootWorkspaceId: "vanished-root",
+      rootRelationship: "ancestor" as const,
+      rootMissing: true as const,
+      tasks: [
+        {
+          ...buildAgentTask("task-self", "running", "vanished-root"),
+          relationship: "self" as const,
+        },
+      ],
+    }));
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: { listTaskTreeAgents } as unknown as TaskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree" }, mockToolCallOptions)
+    );
+    expect(taskIds(result)).toEqual(["task-self"]);
+  });
+
+  function buildInstanceTaskService(overrides?: {
+    nextOffset?: number;
+    callerPeerMessagingRestricted?: true;
+    rows?: Array<{
+      workspaceId: string;
+      title?: string;
+      name?: string;
+      projectPath: string;
+      createdAt?: string;
+      relationship: "self" | "ancestor" | "unrelated";
+      busy: boolean;
+    }>;
+  }) {
+    const rows = overrides?.rows ?? [
+      {
+        workspaceId: "ws-self",
+        title: "Coordinator",
+        name: "coordinator",
+        projectPath: "/home/alice/projects/mux",
+        createdAt: "2026-06-24T00:00:00.000Z",
+        relationship: "self" as const,
+        busy: true,
+      },
+      {
+        workspaceId: "ws-other",
+        name: "release-cut",
+        projectPath: "/home/alice/projects/api",
+        createdAt: "2026-06-23T00:00:00.000Z",
+        relationship: "unrelated" as const,
+        busy: false,
+      },
+    ];
+    const listInstanceWorkspaces = mock(() => ({
+      rows: overrides?.callerPeerMessagingRestricted === true ? [] : rows,
+      totalMatching: overrides?.callerPeerMessagingRestricted === true ? 0 : rows.length + 5,
+      ...(overrides?.nextOffset != null ? { nextOffset: overrides.nextOffset } : {}),
+      ...(overrides?.callerPeerMessagingRestricted === true
+        ? { callerPeerMessagingRestricted: true as const }
+        : {}),
+    }));
+    return {
+      listInstanceWorkspaces,
+      taskService: { listInstanceWorkspaces } as unknown as TaskService,
+    };
+  }
+
+  interface InstanceScopeResult {
+    tasks: Array<{
+      taskId: string;
+      status: string;
+      workspaceName?: string;
+      title?: string;
+      createdAt?: string;
+      projectPath?: string;
+      activity?: string;
+      relationship?: string;
+      depth: number;
+    }>;
+    note?: string;
+    nextOffset?: number;
+  }
+
+  it("instance scope forwards paging inputs and maps root rows onto workspace rows", async () => {
+    using tempDir = new TestTempDir("test-task-list-instance-map");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "ws-self" });
+    const { listInstanceWorkspaces, taskService } = buildInstanceTaskService({ nextOffset: 7 });
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+
+    const result = (await Promise.resolve(
+      tool.execute!({ scope: "instance", query: "alice", limit: 2, offset: 5 }, mockToolCallOptions)
+    )) as InstanceScopeResult;
+
+    expect(listInstanceWorkspaces).toHaveBeenCalledWith("ws-self", {
+      query: "alice",
+      limit: 2,
+      offset: 5,
+    });
+    expect(result.tasks).toEqual([
+      {
+        taskId: "ws-self",
+        status: "workspace",
+        workspaceName: "coordinator",
+        title: "Coordinator",
+        createdAt: "2026-06-24T00:00:00.000Z",
+        projectPath: "/home/alice/projects/mux",
+        activity: "busy",
+        relationship: "self",
+        depth: 0,
+      },
+      {
+        taskId: "ws-other",
+        status: "workspace",
+        workspaceName: "release-cut",
+        createdAt: "2026-06-23T00:00:00.000Z",
+        projectPath: "/home/alice/projects/api",
+        activity: "idle",
+        relationship: "unrelated",
+        depth: 0,
+      },
+    ]);
+    // Truncated page: the cursor is surfaced and the note gains paging guidance.
+    expect(result.nextOffset).toBe(7);
+    expect(result.note).toBeDefined();
+  });
+
+  it("instance scope omits the cursor and paging guidance when the page is complete", async () => {
+    using tempDir = new TestTempDir("test-task-list-instance-complete");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "ws-self" });
+    const truncated = createTaskListTool({
+      ...baseConfig,
+      taskService: buildInstanceTaskService({ nextOffset: 2 }).taskService,
+    });
+    const complete = createTaskListTool({
+      ...baseConfig,
+      taskService: buildInstanceTaskService().taskService,
+    });
+
+    const truncatedResult = (await Promise.resolve(
+      truncated.execute!({ scope: "instance" }, mockToolCallOptions)
+    )) as InstanceScopeResult;
+    const completeResult = (await Promise.resolve(
+      complete.execute!({ scope: "instance" }, mockToolCallOptions)
+    )) as InstanceScopeResult;
+
+    expect(completeResult.nextOffset).toBeUndefined();
+    expect(completeResult.note).toBeDefined();
+    // Same rows, but only the truncated page tells the model how to continue.
+    expect(truncatedResult.note).not.toBe(completeResult.note);
+    expect(truncatedResult.note?.startsWith(completeResult.note ?? "\u0000")).toBe(true);
+  });
+
+  it("instance scope treats null paging inputs as absent", async () => {
+    using tempDir = new TestTempDir("test-task-list-instance-null");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "ws-self" });
+    const { listInstanceWorkspaces, taskService } = buildInstanceTaskService();
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+
+    const result = (await Promise.resolve(
+      tool.execute!(
+        { scope: "instance", query: null, limit: null, offset: null },
+        mockToolCallOptions
+      )
+    )) as InstanceScopeResult;
+
+    expect(listInstanceWorkspaces).toHaveBeenCalledTimes(1);
+    const [, options] = listInstanceWorkspaces.mock.calls[0] as unknown as [
+      string,
+      { query?: string | null; limit?: number | null; offset?: number | null },
+    ];
+    expect(options.query ?? undefined).toBeUndefined();
+    expect(options.limit ?? undefined).toBeUndefined();
+    expect(options.offset ?? undefined).toBeUndefined();
+    expect(taskIds(result)).toEqual(["ws-self", "ws-other"]);
+  });
+
+  it("instance scope applies the workspace status filter before paging", async () => {
+    using tempDir = new TestTempDir("test-task-list-instance-statuses");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "ws-self" });
+    const { listInstanceWorkspaces, taskService } = buildInstanceTaskService({ nextOffset: 2 });
+    const tool = createTaskListTool({ ...baseConfig, taskService });
+
+    // Instance rows are plain workspaces: statuses that exclude "workspace" match nothing, so
+    // no page is fetched and no cursor is advertised (a cursor would imply more rows exist).
+    const excluded = (await Promise.resolve(
+      tool.execute!({ scope: "instance", statuses: ["running"] }, mockToolCallOptions)
+    )) as InstanceScopeResult;
+    expect(excluded.tasks).toEqual([]);
+    expect(excluded.nextOffset).toBeUndefined();
+    expect(listInstanceWorkspaces).not.toHaveBeenCalled();
+
+    const included = (await Promise.resolve(
+      tool.execute!({ scope: "instance", statuses: ["running", "workspace"] }, mockToolCallOptions)
+    )) as InstanceScopeResult;
+    expect(taskIds(included)).toEqual(["ws-self", "ws-other"]);
+    expect(included.nextOffset).toBe(2);
+  });
+
+  it("instance scope lists no rows and swaps the note for restricted callers", async () => {
+    using tempDir = new TestTempDir("test-task-list-instance-restricted");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "ws-cand" });
+    const unrestricted = createTaskListTool({
+      ...baseConfig,
+      taskService: buildInstanceTaskService().taskService,
+    });
+    const restricted = createTaskListTool({
+      ...baseConfig,
+      taskService: buildInstanceTaskService({ callerPeerMessagingRestricted: true }).taskService,
+    });
+
+    const unrestrictedResult = (await Promise.resolve(
+      unrestricted.execute!({ scope: "instance" }, mockToolCallOptions)
+    )) as InstanceScopeResult;
+    const restrictedResult = (await Promise.resolve(
+      restricted.execute!({ scope: "instance" }, mockToolCallOptions)
+    )) as InstanceScopeResult;
+
+    expect(restrictedResult.tasks).toEqual([]);
+    expect(restrictedResult.nextOffset).toBeUndefined();
+    // The standard note promises addressable rows, which would be false for a restricted caller.
+    expect(restrictedResult.note).toBeDefined();
+    expect(restrictedResult.note).not.toBe(unrestrictedResult.note);
+  });
+
+  it.each([
+    { scope: undefined, field: "query", args: { query: "alice" } },
+    { scope: "tree" as const, field: "limit", args: { limit: 5 } },
+    { scope: "descendants" as const, field: "offset", args: { offset: 0 } },
+  ])(
+    "rejects $field outside instance scope (scope $scope) instead of ignoring it",
+    async ({ scope, field, args }) => {
+      using tempDir = new TestTempDir(`test-task-list-instance-only-${field}`);
+      const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "ws-self" });
+      const { listInstanceWorkspaces } = buildInstanceTaskService();
+      const { listTaskTreeAgents } = buildTreeTaskService();
+      const tool = createTaskListTool({
+        ...baseConfig,
+        taskService: { listInstanceWorkspaces, listTaskTreeAgents } as unknown as TaskService,
+      });
+
+      let thrown: unknown;
+      try {
+        await tool.execute!({ ...(scope != null ? { scope } : {}), ...args }, mockToolCallOptions);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).toBeInstanceOf(Error);
+      // The error must name the offending parameter so the model can correct the call.
+      expect((thrown as Error).message).toMatch(new RegExp(field));
+      expect(listInstanceWorkspaces).not.toHaveBeenCalled();
+      expect(listTaskTreeAgents).not.toHaveBeenCalled();
+    }
+  );
+
+  it("accepts null paging inputs outside instance scope as absent", async () => {
+    using tempDir = new TestTempDir("test-task-list-instance-null-elsewhere");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: buildTreeTaskService().taskService,
+    });
+
+    const result: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree", query: null, limit: null, offset: null }, mockToolCallOptions)
+    );
+    expect(taskIds(result)).toEqual(["tree-root", "task-self", "task-sib"]);
+  });
+
+  it("tree scope filters the root row like any other row when explicit statuses are passed", async () => {
+    using tempDir = new TestTempDir("test-task-list-tree-explicit");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "task-self" });
+
+    const tool = createTaskListTool({
+      ...baseConfig,
+      taskService: buildTreeTaskService().taskService,
+    });
+
+    const withoutWorkspaceStatus: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree", statuses: ["running"] }, mockToolCallOptions)
+    );
+    expect(taskIds(withoutWorkspaceStatus)).toEqual(["task-self", "task-sib"]);
+
+    const withWorkspaceStatus: unknown = await Promise.resolve(
+      tool.execute!({ scope: "tree", statuses: ["workspace", "reported"] }, mockToolCallOptions)
+    );
+    expect(taskIds(withWorkspaceStatus)).toEqual(["tree-root", "task-done"]);
   });
 });

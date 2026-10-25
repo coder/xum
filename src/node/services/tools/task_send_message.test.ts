@@ -3,13 +3,19 @@ import type { ToolExecutionOptions } from "ai";
 
 import { Err, Ok, type Result } from "@/common/types/result";
 import type {
-  SendAgentTaskMessageError,
+  AgentTreeTargetRelation,
   SendAgentTaskMessageResult,
+  SendAgentTreeMessageError,
   TaskService,
 } from "@/node/services/taskService";
 
 import { createTaskSendMessageTool } from "./task_send_message";
 import { createTestToolConfig, TestTempDir } from "./testHelpers";
+
+type TreeSendResult = Result<
+  SendAgentTaskMessageResult & { relation: AgentTreeTargetRelation },
+  SendAgentTreeMessageError
+>;
 
 const toolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "task-send-message-call",
@@ -18,13 +24,15 @@ const toolCallOptions: ToolExecutionOptions<unknown> = {
 };
 
 describe("task_send_message tool", () => {
-  it("defaults to tool-end dispatch and returns the service acceptance outcome", async () => {
+  it("passes the raw dispatch mode through and maps the routing relation onto the result", async () => {
     using tempDir = new TestTempDir("task-send-message-delivery");
-    const sendMessageToDescendantAgentTask = mock(
-      (): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> =>
-        Promise.resolve(Ok({ delivery: "queued", queueDispatchMode: "tool-end" }))
+    const sendAgentTreeMessage = mock(
+      (): Promise<TreeSendResult> =>
+        Promise.resolve(
+          Ok({ delivery: "queued", queueDispatchMode: "tool-end", relation: "target_descendant" })
+        )
     );
-    const taskService = { sendMessageToDescendantAgentTask } as unknown as TaskService;
+    const taskService = { sendAgentTreeMessage } as unknown as TaskService;
     const tool = createTaskSendMessageTool({
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent" }),
       taskService,
@@ -34,26 +42,132 @@ describe("task_send_message tool", () => {
       tool.execute!({ task_id: "child", message: "Use the API response type." }, toolCallOptions)
     );
 
-    expect(sendMessageToDescendantAgentTask).toHaveBeenCalledWith(
+    // The default dispatch mode is relation-dependent, so the tool must not apply one itself.
+    expect(sendAgentTreeMessage).toHaveBeenCalledWith(
       "parent",
       "child",
       "Use the API response type.",
-      "tool-end"
+      undefined
     );
     expect(result).toEqual({
       status: "queued",
       taskId: "child",
       queueDispatchMode: "tool-end",
+      targetRelation: "descendant",
+    });
+  });
+
+  it("labels sibling deliveries with the peer relation", async () => {
+    using tempDir = new TestTempDir("task-send-message-sibling");
+    const sendAgentTreeMessage = mock(
+      (): Promise<TreeSendResult> => Promise.resolve(Ok({ delivery: "accepted", relation: "peer" }))
+    );
+    const taskService = { sendAgentTreeMessage } as unknown as TaskService;
+    const tool = createTaskSendMessageTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "sib-a" }),
+      taskService,
+    });
+
+    expect(
+      await Promise.resolve(
+        tool.execute!({ task_id: "sib-b", message: "Schema changed." }, toolCallOptions)
+      )
+    ).toEqual({ status: "accepted", taskId: "sib-b", targetRelation: "sibling" });
+  });
+
+  it.each([
+    { relation: "target_main_chat", targetRelation: "main_chat" },
+    { relation: "target_side_chat", targetRelation: "side_chat" },
+  ] as const)(
+    "labels $relation without implying task ancestry",
+    async ({ relation, targetRelation }) => {
+      using tempDir = new TestTempDir("task-send-message-linked-chat");
+      const outcomes: TreeSendResult[] = [
+        Ok({ delivery: "accepted", relation }),
+        Ok({ delivery: "queued", queueDispatchMode: "turn-end", relation }),
+      ];
+      const tool = createTaskSendMessageTool({
+        ...createTestToolConfig(tempDir.path, { workspaceId: "sender" }),
+        taskService: {
+          sendAgentTreeMessage: mock(
+            (): Promise<TreeSendResult> => Promise.resolve(outcomes.shift()!)
+          ),
+        } as unknown as TaskService,
+      });
+      const args = { task_id: "linked-chat", message: "Please explain the decision." };
+      expect(await tool.execute!(args, toolCallOptions)).toEqual({
+        status: "accepted",
+        taskId: args.task_id,
+        targetRelation,
+      });
+      expect(await tool.execute!(args, toolCallOptions)).toEqual({
+        status: "queued",
+        taskId: args.task_id,
+        targetRelation,
+        queueDispatchMode: "turn-end",
+      });
+    }
+  );
+
+  it("labels cross-tree deliveries as unrelated on accepted and queued results", async () => {
+    using tempDir = new TestTempDir("task-send-message-unrelated");
+    const outcomes: TreeSendResult[] = [
+      Ok({ delivery: "accepted", relation: "target_unrelated" }),
+      Ok({ delivery: "queued", queueDispatchMode: "turn-end", relation: "target_unrelated" }),
+      Ok({ delivery: "queued", relation: "target_unrelated", awaitsDelegatedTurn: true }),
+    ];
+    const taskService = {
+      sendAgentTreeMessage: mock((): Promise<TreeSendResult> => Promise.resolve(outcomes.shift()!)),
+    } as unknown as TaskService;
+    const tool = createTaskSendMessageTool({
+      ...createTestToolConfig(tempDir.path, { workspaceId: "ws-root-a" }),
+      taskService,
+    });
+
+    expect(
+      await Promise.resolve(
+        tool.execute!({ task_id: "ws-root-b", message: "Release cut at 17:00." }, toolCallOptions)
+      )
+    ).toEqual({ status: "accepted", taskId: "ws-root-b", targetRelation: "unrelated" });
+
+    // The service resolves the mode (here a recipient that holds messages); the tool echoes it.
+    expect(
+      await Promise.resolve(
+        tool.execute!({ task_id: "ws-root-b", message: "Release cut at 17:00." }, toolCallOptions)
+      )
+    ).toEqual({
+      status: "queued",
+      taskId: "ws-root-b",
+      queueDispatchMode: "turn-end",
+      targetRelation: "unrelated",
+    });
+
+    // The target runs a delegated turn the sender does not own: the message waits for it.
+    expect(
+      await Promise.resolve(
+        tool.execute!({ task_id: "ws-root-b", message: "Release cut at 17:00." }, toolCallOptions)
+      )
+    ).toEqual({
+      status: "queued",
+      taskId: "ws-root-b",
+      targetRelation: "unrelated",
+      awaitsDelegatedTurn: true,
     });
   });
 
   it("maps inactive child reawakening without exposing the internal execution handle", async () => {
     using tempDir = new TestTempDir("task-send-message-reactivated");
-    const sendMessageToDescendantAgentTask = mock(
-      (): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> =>
-        Promise.resolve(Ok({ delivery: "reactivated", executionTaskId: "wst_internal_execution" }))
+    const sendAgentTreeMessage = mock(
+      (): Promise<TreeSendResult> =>
+        Promise.resolve(
+          Ok({
+            delivery: "reactivated",
+            executionTaskId: "wst_internal_execution",
+            relation: "target_descendant",
+          })
+        )
     );
-    const taskService = { sendMessageToDescendantAgentTask } as unknown as TaskService;
+    const taskService = { sendAgentTreeMessage } as unknown as TaskService;
     const tool = createTaskSendMessageTool({
       ...createTestToolConfig(tempDir.path, { workspaceId: "parent" }),
       taskService,
@@ -69,16 +183,17 @@ describe("task_send_message tool", () => {
     ).toEqual({ status: "reactivated", taskId: "child" });
   });
 
-  it("maps scope and task-state failures to actionable results", async () => {
+  it("maps scope, task-state, and throttle failures to actionable results", async () => {
     using tempDir = new TestTempDir("task-send-message-errors");
-    const outcomes: SendAgentTaskMessageError[] = [
+    const outcomes: SendAgentTreeMessageError[] = [
       { code: "invalid_scope" },
       { code: "not_active", taskStatus: "reported" },
+      { code: "refused", reason: "Best-of candidates cannot send or receive peer messages." },
+      { code: "rate_limited", retryAfterMs: 1500.4 },
     ];
     const taskService = {
-      sendMessageToDescendantAgentTask: mock(
-        (): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> =>
-          Promise.resolve(Err(outcomes.shift()!))
+      sendAgentTreeMessage: mock(
+        (): Promise<TreeSendResult> => Promise.resolve(Err(outcomes.shift()!))
       ),
     } as unknown as TaskService;
     const tool = createTaskSendMessageTool({
@@ -101,7 +216,26 @@ describe("task_send_message tool", () => {
       status: "not_active",
       taskId: "finished",
       taskStatus: "reported",
-      error: "Task is reported and cannot accept updated guidance.",
+      error: "Task is reported and cannot accept messages.",
+    });
+
+    const refusedResult: unknown = await Promise.resolve(
+      tool.execute!({ task_id: "cand", message: "Correction" }, toolCallOptions)
+    );
+    expect(refusedResult).toEqual({
+      status: "refused",
+      taskId: "cand",
+      reason: "Best-of candidates cannot send or receive peer messages.",
+    });
+
+    // Fractional retry hints round up so the schema's integer contract holds.
+    const rateLimitedResult: unknown = await Promise.resolve(
+      tool.execute!({ task_id: "busy", message: "Correction" }, toolCallOptions)
+    );
+    expect(rateLimitedResult).toEqual({
+      status: "rate_limited",
+      taskId: "busy",
+      retryAfterMs: 1501,
     });
   });
 });

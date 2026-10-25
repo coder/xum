@@ -1,15 +1,59 @@
-import type { Runtime, BackgroundHandle } from "@/node/runtime/Runtime";
-import { spawnProcess } from "./backgroundProcessExecutor";
+import type { Dirent, Stats } from "node:fs";
+import * as fsPromises from "node:fs/promises";
+import * as nodePath from "node:path";
+import type {
+  Runtime,
+  BackgroundHandle,
+  BackgroundMonitorProbeResult,
+  OutputReadOptions,
+} from "@/node/runtime/Runtime";
+import {
+  spawnProcess,
+  localBgWorkspaceDir,
+  legacyMigratedBgRecordsRoot,
+  spawnRecordsAreHostLocal,
+  quotePathForShell,
+  BG_META_FILENAME,
+  BG_EXIT_CODE_FILENAME,
+  BG_OUTPUT_SUBDIR,
+} from "./backgroundProcessExecutor";
+import { execBuffered } from "@/node/utils/runtime/helpers";
+import { Ok, Err, type Result } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "./log";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { BASH_MAX_LINE_BYTES } from "@/common/constants/toolLimits";
+import { BASH_MAX_LINE_BYTES, BASH_MAX_TOTAL_BYTES } from "@/common/constants/toolLimits";
 import { stripAnsiControlChars } from "@/node/utils/ansi";
-import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
+import { truncateUtf8Prefix } from "@/node/utils/utf8";
+import type { BashMonitorFailedOperation } from "@/common/types/message";
+import {
+  boundBashMonitorRegistryScript,
+  type BashMonitorTerminalSummary,
+} from "./bashMonitorRegistryStore";
+import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMonitorWakeReconciler";
+import { isErrnoWithCode } from "@/node/utils/fs";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 
 const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
 const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
+// Host file lock serializing background spawns per workspace across backends (#4873).
+// A regular file inside the workspace records root: record scanners only read directories.
+export const SPAWN_NAME_LOCK_FILENAME = ".spawn-name.lock";
+// Held from the name probe until the new record's meta.json is written (one local spawn).
+const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
+// Candidate names one non-host claim exec tries in order (#5485): a name used in k earlier
+// sessions costs ceil((k + 1) / batch) exec round-trips instead of k + 1.
+const RUNTIME_SPAWN_NAME_CLAIM_BATCH = 8;
+// Upper bound on a fail-closed cleanup() (archive, removal) waiting for pending spawns and
+// migrations, shared by both of its drains (#5477). Each wait is normally bounded by its own
+// steps (the 30 s name lock, 10 s claim execs), but a hung runtime probe or spawnProcess call
+// is not; archive and removal must then fail closed and keep the checkout instead of waiting as
+// long as that call hangs.
+const PENDING_ADMISSION_DRAIN_TIMEOUT_MS = 60_000;
+const SPAWN_REFUSED_WHILE_SEALED_ERROR =
+  "This workspace's background processes are being stopped (archive, removal or session cleanup); the process was not started.";
 const MONITOR_POLL_INTERVAL_MS_LOCAL = 100;
 const MONITOR_POLL_INTERVAL_MS_REMOTE = 1_000;
 const MONITOR_MAX_PENDING_LINES = 50;
@@ -17,8 +61,12 @@ const MONITOR_MAX_LAST_LINES = 20;
 const MONITOR_MAX_PROMPT_LINE_BYTES = Math.min(BASH_MAX_LINE_BYTES, 8_192);
 const MONITOR_MAX_INCOMPLETE_MATCH_BYTES = 1_000_000;
 const MONITOR_TRUNCATION_MARKER = "… [truncated] …";
+// Bounded recent-output tail included in a settlement wake so the agent sees the process's
+// final lines (e.g. the actual failure message) without a follow-up task_await round-trip.
+const MONITOR_SETTLEMENT_TAIL_BYTES = 4_096;
+const MONITOR_SETTLEMENT_TAIL_MAX_LINES = 10;
 
-export function computeTailStartOffset(fileSizeBytes: number, tailBytes: number): number {
+function computeTailStartOffset(fileSizeBytes: number, tailBytes: number): number {
   assert(
     Number.isFinite(fileSizeBytes) && fileSizeBytes >= 0,
     `computeTailStartOffset expected fileSizeBytes >= 0 (got ${fileSizeBytes})`
@@ -29,6 +77,123 @@ export function computeTailStartOffset(fileSizeBytes: number, tailBytes: number)
   );
 
   return Math.max(0, fileSizeBytes - tailBytes);
+}
+
+/**
+ * Enforce a byte bound on already-read tail content. Runtime-backed handles degrade a transient
+ * size-query failure to 0, which turns an offset-based tail read into a full-file read; the
+ * transfer has happened by then, but this cut keeps downstream line processing and the persisted
+ * wake bounded. `startedMidContent` reports whether the result begins inside the original content
+ * (callers drop the leading partial line, matching a mid-file read offset). A cut can split a
+ * multi-byte character; the resulting replacement char lands in that dropped partial line.
+ */
+export function boundTailContent(
+  content: string,
+  tailBytes: number
+): { content: string; startedMidContent: boolean } {
+  assert(
+    Number.isFinite(tailBytes) && tailBytes > 0,
+    `boundTailContent expected tailBytes > 0 (got ${tailBytes})`
+  );
+  const buf = Buffer.from(content, "utf8");
+  if (buf.length <= tailBytes) {
+    return { content, startedMidContent: false };
+  }
+  return {
+    content: buf.subarray(buf.length - tailBytes).toString(),
+    startedMidContent: true,
+  };
+}
+
+/**
+ * Narrow a persisted meta.json spawn record to the fields the crash-orphan probe needs.
+ * Records are written by this app but can be truncated by a crash mid-write; anything
+ * malformed is treated as absent rather than trusted.
+ */
+export function parseSpawnRecordMeta(raw: string): { pid: number; status: string } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  if (!("pid" in parsed) || !("status" in parsed)) return null;
+  const { pid, status } = parsed;
+  if (typeof pid !== "number" || !Number.isInteger(pid)) return null;
+  if (typeof status !== "string") return null;
+  return { pid, status };
+}
+
+/**
+ * Host-local name probe for a new spawn or migrated record, called while holding the
+ * per-workspace spawn-name lock: a name is free only if its record directory does not exist
+ * (or was just pruned, see below). Existing directories are never reused in place, even settled
+ * ones (exit marker, non-running status, dead PID). Two backends on one XUM_ROOT (desktop + `xum server`) cannot see each other's
+ * in-memory process maps, so a settled record may still be tracked by the other backend, and
+ * reusing it would make that backend's output/status reads describe the new command (#4882).
+ * A crash orphan's directory is skipped the same way, and a fresh directory never inherits a
+ * stale exit marker. Cost: a name used before gets a suffix until its old record is removed,
+ * so an existing record that pruneOldSettledRecord() can safely delete frees the name (#4893).
+ * Throws when the directory cannot be probed, so callers fail closed instead of looping over
+ * candidates.
+ */
+async function recordDirIsFree(recordDir: string): Promise<boolean> {
+  let stat: Stats;
+  try {
+    stat = await fsPromises.lstat(recordDir);
+  } catch (error) {
+    if (isErrnoWithCode(error, "ENOENT")) return true;
+    throw error;
+  }
+  return stat.isDirectory() && (await pruneOldSettledRecord(recordDir));
+}
+
+// A settled record is pruned only once its exit marker is at least this old (#4893).
+const SETTLED_RECORD_PRUNE_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Delete a record that blocks a candidate name, but only when no backend can still write to it.
+ * Called by recordDirIsFree under the spawn-name lock, so no spawn or migration can claim the
+ * name meanwhile, and only for a directory that collides with a candidate (no sweep: records
+ * with unique names still accumulate until reboot, as before #4892).
+ *
+ * Nothing on disk says which backend spawned a record (#4892 rejected an owner field), so:
+ * - The exit marker must exist: it is the settlement proof recordRootHoldsOrphan trusts. A
+ *   SIGKILLed orphan without one keeps blocking its name.
+ * - meta.json must read non-running. Every status transition sets the in-memory status before
+ *   rewriting meta.json, so the backend that spawned it (if alive) now treats it as settled:
+ *   its terminate() returns early and its status refresh skips it, so it never writes into the
+ *   directory again. With meta still "running" (exit not observed yet, or a crash), that
+ *   backend's later terminate() would stamp exit_code and meta.json onto the reused record.
+ * - The marker and meta.json must both be older than SETTLED_RECORD_PRUNE_AGE_MS. That is the
+ *   only protection for the other backend's reads: a backend still tracking a record pruned after this age reads
+ *   the new command's output past its old offset. Read-only, and only for such old records.
+ * Any failure keeps the record (the caller moves on to a suffixed name).
+ */
+async function pruneOldSettledRecord(recordDir: string): Promise<boolean> {
+  try {
+    // Regular files only (lstat): never follow a symlink planted in the shared temp records
+    // root, and never block on a FIFO while holding the spawn-name lock.
+    const metaPath = nodePath.join(recordDir, BG_META_FILENAME);
+    if (!(await fsPromises.lstat(metaPath)).isFile()) return false;
+    const meta = parseSpawnRecordMeta(await fsPromises.readFile(metaPath, "utf-8"));
+    if (meta == null || meta.status === "running") return false;
+    // meta.json is rewritten when the owner observes the exit (getProcess, list, monitor), which
+    // may be long after the marker was written and just before it reads the output: age both.
+    // Stat meta.json AFTER reading it, so a rewrite racing the read shows up as a fresh mtime.
+    const metaStat = await fsPromises.lstat(metaPath);
+    const marker = await fsPromises.lstat(nodePath.join(recordDir, BG_EXIT_CODE_FILENAME));
+    if (!marker.isFile() || !metaStat.isFile()) return false;
+    const settledAtMs = Math.max(marker.mtimeMs, metaStat.mtimeMs);
+    // Wall clock: settledAtMs is a file mtime (#7282).
+    if (nodeClock.nowMs() - settledAtMs < SETTLED_RECORD_PRUNE_AGE_MS) return false;
+    await fsPromises.rm(recordDir, { recursive: true });
+    return true;
+  } catch (error) {
+    log.debug(`Keeping background record ${recordDir}: ${getErrorMessage(error)}`);
+    return false;
+  }
 }
 
 import { EventEmitter } from "events";
@@ -53,6 +218,12 @@ export interface BackgroundProcessMonitorConfig {
   exclude: boolean;
   maxEvents?: number;
   cooldownMs: number;
+  /**
+   * Also wake when the monitored process settles (exit, kill, timeout), not only on matching
+   * lines. An armed monitor means "wake me on this condition — and always at settlement,
+   * because after that the condition can never occur". Defaults to true when omitted.
+   */
+  wakeOnExit?: boolean;
 }
 
 export interface BackgroundProcessMonitorSnapshot {
@@ -66,6 +237,18 @@ export interface BackgroundProcessMonitorSnapshot {
   stopped: boolean;
 }
 
+/** Terminal disposition attached to a settlement wake payload. */
+export interface MonitorTerminalStatus {
+  status: "exited" | "killed" | "failed";
+  exitCode?: number;
+}
+
+/**
+ * Payload for a "monitor:match" event. Despite the name this is a monitor *update*: it carries
+ * matched output lines, a process-settlement notice, or both coalesced into one payload (pending
+ * matched lines still unflushed when the process settles ride along with the terminal metadata so
+ * a single wake turn reports "matched output, then exited").
+ */
 export interface MonitorMatchPayload {
   processId: string;
   taskId: string;
@@ -78,22 +261,53 @@ export interface MonitorMatchPayload {
   droppedLines?: number;
   timestamp: number;
   /**
+   * Contextual output tail carried by settlement payloads, kept separate from `lines` so the
+   * wake store can dedupe it against already-persisted pending matches (a match flushed to disk
+   * while the owner was busy is absent from the in-memory pending lines but can still sit inside
+   * the final tail window).
+   */
+  tailLines?: string[];
+  /**
    * File byte offset at the end of the last matched line, carried so the drain can re-check it
    * against the settled shown-frontier at delivery time. The emit-time suppression in
    * emitMonitorMatch is only a point-in-time fast path; drainBashMonitorWakes is authoritative.
+   *
+   * Present iff the payload carries undelivered matched lines. Settlement payloads whose matched
+   * lines were already shown (or that never matched) omit it — `lines` then holds only the
+   * synthetic settle line plus the output tail, which must never be offset-suppressed.
    */
-  matchedThroughOffset: number;
+  matchedThroughOffset?: number;
+  /** Present on settlement payloads: the process reached a terminal status. */
+  terminal?: MonitorTerminalStatus;
 }
 
 /** Emitted when a spawn arms a monitor; drives the persisted armed-monitor registry. */
 export type MonitorWakeDeliveryState =
   | { status: "blocked"; readSettled: Promise<void> }
-  | { status: "settled"; shownThroughOffset: number };
+  | { status: "settled"; shownThroughOffset: number; terminalStatusShown: boolean };
+
+interface MonitorRetainedMatchBatch {
+  lines: string[];
+  totalMatches: number;
+  droppedLines: number;
+  matchedThroughOffset: number;
+}
+
+interface MonitorSettlementDisposition extends BashMonitorTerminalSummary {
+  tailLines: readonly BashMonitorTailLine[];
+}
 
 export interface OutputShownPayload {
   processId: string;
   processStartTime: number;
   shownThroughOffset: number;
+  /**
+   * True once a model-visible read (task_await / bash_output) has reported the process's
+   * terminal status. Filtered reads count too: status/exitCode are never filtered out of tool
+   * results, and a zero-output or filtered post-exit read does not advance the shown offset, so
+   * queued settlement wakes need this explicit signal to be retracted.
+   */
+  terminalStatusShown: boolean;
 }
 
 export interface MonitorArmedPayload {
@@ -107,20 +321,54 @@ export interface MonitorArmedPayload {
   createdAt: string;
 }
 
-/** Emitted when a monitor retires normally (not during shutdown); deletes its registry record. */
+/** Matched output that must survive failed monitor retirement. */
+export interface MonitorFailedMatchPayload {
+  lines: string[];
+  totalMatches: number;
+  droppedLines: number;
+  matchedThroughOffset?: number;
+}
+
 export interface MonitorStoppedPayload {
   processId: string;
-  /** Explicit cancellation discards pending matches; missing/normal retirement preserves them. */
-  reason?: "completed" | "canceled";
+  /** Explicit cancellation discards pending matches; failed retirement needs a durable lost wake. */
+  reason?: "completed" | "canceled" | "failed";
+  failureMessage?: string;
+  failedOperations?: BashMonitorFailedOperation[];
+  armMetadata?: MonitorArmedPayload;
+  failedMatch?: MonitorFailedMatchPayload;
+  terminal?: BashMonitorTerminalSummary;
+}
+
+// One or two misses can be transient; three means that capability cannot serve the monitor.
+const MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES = 3;
+
+interface MonitorProbeFailureState {
+  consecutiveFailures: number;
+  message: string;
+}
+
+class MonitorPollingFailure extends Error {
+  constructor(
+    message: string,
+    readonly failedOperations: readonly BashMonitorFailedOperation[]
+  ) {
+    super(message);
+    this.name = "MonitorPollingFailure";
+  }
 }
 
 export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorConfig {
+  armMetadata: MonitorArmedPayload;
+  /** Resolved settlement-wake policy (config default: true). */
+  wakeOnExit: boolean;
   matchesCount: number;
   pendingLines: string[];
   droppedLines: number;
   totalDroppedLines: number;
   lastLines: string[];
-  flushTimer?: ReturnType<typeof setTimeout>;
+  /** Cancels the pending cooldown flush (HostClock.setTimer). */
+  flushTimer?: () => void;
   lastReadOffset: number;
   /**
    * File byte offset at the end of the last complete line that produced a match. Unlike
@@ -129,9 +377,26 @@ export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorC
    * agent's shown-read offset to suppress wakes for output already delivered inline.
    */
   matchedThroughOffset: number;
+  retainedMatches: MonitorRetainedMatchBatch[];
+  settlementDisposition?: MonitorSettlementDisposition;
   pollIntervalMs: number;
   incompleteLineBuffer: string;
   stopped: boolean;
+  probeFailures: Partial<Record<BashMonitorFailedOperation, MonitorProbeFailureState>>;
+  /**
+   * Settlement claim latch. Set synchronously (single-threaded event loop makes the plain flag
+   * race-safe) by claimMonitorSettlement; once held, normal flush/stop triggers are suspended
+   * (accumulation-only mode) and the reservation owner performs the ONLY final combined emit and
+   * "completed" retirement. Explicit cancellation still wins: stopMonitor(canceled) sets
+   * `stopped`, which the settlement helper re-checks after every await.
+   */
+  settled: boolean;
+}
+
+/** Exclusive right to emit the single combined settlement wake for one monitor. */
+interface MonitorSettlementReservation {
+  proc: BackgroundProcess;
+  monitor: BackgroundProcessMonitorState;
 }
 
 /**
@@ -164,6 +429,13 @@ export interface BackgroundProcess {
    */
   shownThroughOffset: number;
   /**
+   * True once a model-visible getOutput caller (task_await / bash_output) has been returned a
+   * terminal status for this process. shownThroughOffset alone cannot express this: a zero-output
+   * process has EOF = 0 = shownThroughOffset, and filtered reads never advance the offset, yet
+   * both still report status/exitCode. Consulted when suppressing settlement wakes.
+   */
+  terminalStatusShownToAgent: boolean;
+  /**
    * Resolves when the current read that must block same-process monitor delivery settles. This
    * includes unfiltered reads, which may advance shownThroughOffset, and filtered task_await reads,
    * which a monitor wake must not interrupt. Filtered reads from other callers remain untracked so
@@ -175,8 +447,22 @@ export interface BackgroundProcess {
   outputLock: AsyncMutex;
   /** Tracks how many times getOutput() has been called (for polling detection) */
   getOutputCallCount: number;
-  /** Buffer for incomplete lines (no trailing newline) from previous read */
+  /**
+   * Output already consumed from output.log that no read has returned yet: the incomplete
+   * trailing line, plus every line after a capped (or interrupted) read's cut.
+   */
   incompleteLineBuffer: string;
+  /**
+   * Set when incompleteLineBuffer starts with the tail of a line a read split: a kept line over
+   * BASH_MAX_TOTAL_BYTES, or a line that ran past the read window (see takeLinePastWindow). The
+   * next read keeps ("kept") or drops ("dropped") that tail without testing the filter: the tail
+   * alone can match differently from its whole line.
+   */
+  unreadLineDecision?: SplitLineDecision;
+  /** The filter (see filterKey) unreadLineDecision was made under; another filter clears it. */
+  unreadLineFilter?: string;
+  /** True when the last getOutput read was capped: the next read is paging, not polling. */
+  lastReadCapped?: boolean;
   /** Optional write-time monitor that wakes the agent on matching output lines. */
   monitor?: BackgroundProcessMonitorState;
 }
@@ -224,6 +510,538 @@ export interface BackgroundProcessManagerEvents {
   "monitor:stopped": [workspaceId: string, payload: MonitorStoppedPayload];
 }
 
+/** The filter decision a split line's unread tail inherits from the part already read. */
+type SplitLineDecision = "kept" | "dropped";
+
+interface BackgroundOutputPage {
+  /** What this read returns (lines joined by "\n"). */
+  output: string;
+  /** How many lines `output` holds (an empty line counts). */
+  shownLines: number;
+  /** Raw output this read leaves for the next one; it starts at the first line not returned. */
+  unread: string;
+  /** True when the read stopped at the cap with complete lines still unread. */
+  capped: boolean;
+  /** Set when `unread` starts with the tail of a line split by this read or an earlier one. */
+  unreadLineDecision: SplitLineDecision | undefined;
+  /** True when this read decided a line longer than the window on its head. */
+  decidedOnHead?: boolean;
+}
+
+/**
+ * Cut one getOutput read to foreground bash's byte cap (BASH_MAX_TOTAL_BYTES), so the tool
+ * result has the same bound in-turn and on replay. Nothing is dropped: the raw rest stays unread
+ * for the next read. No line cap: the byte cap already bounds the context cost, and a line cap
+ * would multiply the reads for logs of short lines. A single line over the byte cap returns
+ * its head and leaves its tail as the first unread line; `decision` tells the next read to
+ * keep (or drop) that tail whatever the filter says, because its whole line was kept (dropped).
+ *
+ * `raw` ends at the read cursor; `reachedEnd` is false when output.log goes on past it. The last
+ * element of the split is an incomplete fragment (or "" after a trailing newline), which stays
+ * unread, except on exit at the end of the file: then every line counts and, as before, empty
+ * lines are not returned.
+ */
+function takeBackgroundOutputPage(
+  raw: string,
+  exited: boolean,
+  reachedEnd: boolean,
+  decision: SplitLineDecision | undefined,
+  keepLine: (line: string) => boolean
+): BackgroundOutputPage {
+  if (!reachedEnd && !raw.includes("\n")) return takeLinePastWindow(raw, decision, keepLine);
+  const lines = raw.split("\n");
+  const fragment = exited && reachedEnd ? null : (lines.pop() ?? "");
+  const lineCount = lines.length;
+  const { shown, rest, splitLine } = takeLinesWithinByteCap(
+    lines,
+    pageLineFilter(exited, decision, keepLine)
+  );
+  const capped = rest.length > 0;
+  const unreadLineDecision = nextLineDecision(splitLine, rest.length === lineCount, decision);
+  if (fragment != null) rest.push(fragment);
+  return {
+    output: shown.join("\n"),
+    shownLines: shown.length,
+    unread: rest.join("\n"),
+    capped,
+    unreadLineDecision,
+  };
+}
+
+/**
+ * The decision the first unread line inherits: "kept" after splitting a kept line; the current
+ * one when the page took no line (the split line is still the first unread line); else none.
+ */
+function nextLineDecision(
+  splitLine: boolean,
+  tookNoLine: boolean,
+  decision: SplitLineDecision | undefined
+): SplitLineDecision | undefined {
+  if (splitLine) return "kept";
+  return tookNoLine ? decision : undefined;
+}
+
+/**
+ * A read window that ends inside its only line (a line longer than the window, see
+ * MAX_RETAINED_UNREAD_BYTES): decide that line on its head now, so each read makes progress and
+ * memory stays bounded. A kept line returns its head; the rest of the line inherits the decision.
+ */
+function takeLinePastWindow(
+  line: string,
+  decision: SplitLineDecision | undefined,
+  keepLine: (line: string) => boolean
+): BackgroundOutputPage {
+  const kept = decision != null ? decision === "kept" : keepLine(line);
+  const head = kept ? truncateUtf8Prefix(line, BASH_MAX_TOTAL_BYTES) : line;
+  return {
+    output: kept ? head : "",
+    shownLines: kept ? 1 : 0,
+    unread: line.slice(head.length),
+    capped: true,
+    unreadLineDecision: kept ? "kept" : "dropped",
+    decidedOnHead: decision == null,
+  };
+}
+
+/** Which lines a page keeps: the tail of a split line as decided, then the filter's picks. */
+function pageLineFilter(
+  exited: boolean,
+  decision: SplitLineDecision | undefined,
+  keepLine: (line: string) => boolean
+): (line: string, index: number) => boolean {
+  return (line, index) => {
+    if (index === 0 && decision != null) return decision === "kept";
+    // On exit, empty lines are not returned (the trailing "" of a final newline included).
+    return (!exited || line.length > 0) && keepLine(line);
+  };
+}
+
+/**
+ * Leading kept lines whose "\n"-joined size fits BASH_MAX_TOTAL_BYTES, and every line after
+ * them. When the first kept line alone is over the cap, its head is shown and its tail becomes
+ * the first remaining line, so each read makes progress.
+ */
+function takeLinesWithinByteCap(
+  lines: string[],
+  keepLine: (line: string, index: number) => boolean
+): { shown: string[]; rest: string[]; splitLine: boolean } {
+  const shown: string[] = [];
+  let bytes = 0;
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index];
+    if (!keepLine(line, index)) continue;
+    const lineBytes = Buffer.byteLength(line, "utf8") + (shown.length > 0 ? 1 : 0);
+    if (bytes + lineBytes <= BASH_MAX_TOTAL_BYTES) {
+      shown.push(line);
+      bytes += lineBytes;
+      continue;
+    }
+    if (shown.length > 0) return { shown, rest: lines.slice(index), splitLine: false };
+    const head = truncateUtf8Prefix(line, BASH_MAX_TOTAL_BYTES);
+    const tail = [line.slice(head.length), ...lines.slice(index + 1)];
+    return { shown: [head], rest: tail, splitLine: true };
+  }
+  return { shown, rest: [], splitLine: false };
+}
+
+/** Identifies a read's filter mode, so a split line's decision is reused only under it. */
+function filterKey(filter: string | undefined, filterExclude: boolean | undefined): string {
+  if (filter == null) return "";
+  return `${filterExclude === true ? "exclude" : "match"}:${filter}`;
+}
+
+/**
+ * The filter arguments of the next-read call. The exact call, filter mode included: a read
+ * without filter_exclude would keep the lines this read dropped and drop the ones it kept.
+ */
+function formatFilterArgs(filter: string | undefined, filterExclude: boolean | undefined): string {
+  if (filter == null) return "";
+  return `, filter: ${JSON.stringify(filter)}${filterExclude === true ? ", filter_exclude: true" : ""}`;
+}
+
+/** Tells the model how to read what a capped getOutput read left unread. */
+function formatCappedReadNote(
+  processId: string,
+  unreadBytes: number,
+  continuesLine: boolean,
+  toolName: string,
+  filter: string | undefined,
+  filterExclude: boolean | undefined
+): string {
+  const filterArgs = formatFilterArgs(filter, filterExclude);
+  const call =
+    toolName === "task_await"
+      ? `task_await(task_ids: ["bash:${processId}"], timeout_secs: 0${filterArgs})`
+      : `${toolName}(process_id: "${processId}", timeout_secs: 0${filterArgs})`;
+  // Says how the parts join, so line-oriented output (JSONL) can be rebuilt exactly.
+  const join = continuesLine ? "continues the current line" : "starts a new line";
+  return (
+    `Output capped at ${BASH_MAX_TOTAL_BYTES} bytes per read; ` +
+    `${unreadBytes} more bytes are unread. Read the next part with ${call}. The next part ${join}.`
+  );
+}
+
+/**
+ * The read window: getOutput holds at most this many bytes of output in memory between reads
+ * (plus the few bytes that finish a UTF-8 character). An unfiltered read loads at most one page
+ * (BASH_MAX_TOTAL_BYTES), and only as much as the window has room for. A filtered read scans in
+ * larger chunks and drops the lines its filter rejects at once (see scanFilteredOutput). The
+ * cursor never moves back, so paging through a log reads each byte once (a filtered chunk whose
+ * kept lines overflow the window is read again in a smaller read). The bound counts raw bytes
+ * from output.log: their decoded text never has more UTF-16 code units than that.
+ */
+const MAX_RETAINED_UNREAD_BYTES = 4 * BASH_MAX_TOTAL_BYTES;
+
+/**
+ * Largest chunk a filtered scan loads per handle read. Each remote read costs exec round trips,
+ * so a sparse filter over a large remote log needs big chunks to finish in one call. The chunk
+ * doubles from one page, so a dense region overflows (and rereads) at most about what it read.
+ */
+const FILTERED_SCAN_CHUNK_BYTES = 1024 * 1024;
+
+/** Said when a filtered read decided a line longer than the window on its head. */
+const DECIDED_ON_HEAD_NOTE = `A line over ${MAX_RETAINED_UNREAD_BYTES} bytes was filtered on its first ${MAX_RETAINED_UNREAD_BYTES} bytes.`;
+
+const OUTPUT_POLL_INTERVAL_MS = 100;
+
+function sleepMs(clock: HostClock, ms: number): Promise<void> {
+  return new Promise((resolve) => clock.setTimer(resolve, ms));
+}
+
+/** What getOutput's read collected: see readOutputWindow. */
+interface OutputWindow {
+  /** Output read but not returned yet; it ends at the cursor. */
+  pending: string;
+  decision: SplitLineDecision | undefined;
+  /** False when output.log goes on past the cursor. */
+  reachedEnd: boolean;
+  /** The size of output.log at the last read. */
+  fileSize: number;
+  status: BackgroundProcess["status"];
+  /** True once this call's window held a complete line. */
+  sawCompleteLine: boolean;
+  /** True once this call decided a line longer than the window on its head. */
+  decidedOnHead: boolean;
+}
+
+interface OutputWaitOptions {
+  keepLine: (line: string) => boolean;
+  filtered: boolean;
+  filterExclude: boolean;
+  timeoutMs: number;
+  abortSignal: AbortSignal | undefined;
+  hasQueuedMessages: ((dispatchMode?: "tool-end" | "turn-end") => boolean) | undefined;
+}
+
+/** Read the next bytes of output.log into the window. Returns false when there were none. */
+async function readIntoWindow(proc: BackgroundProcess, window: OutputWindow): Promise<boolean> {
+  const offset = proc.outputBytesRead;
+  const result = await proc.handle.readOutput(
+    offset,
+    outputReadBytes(window.pending),
+    finalReadOptions(window)
+  );
+  assert(result.newOffset >= offset, "BackgroundHandle.readOutput moved the cursor back");
+  // The cursor only moves forward: every byte read stays in `pending` until a page takes it.
+  window.pending += result.content;
+  proc.outputBytesRead = result.newOffset;
+  const advanced = result.newOffset > offset;
+  // A read that returned nothing counts as the end, so a file that shrank under the read (or a
+  // probe that came back empty) cannot spin the wait loop or decide on a line it never read.
+  window.reachedEnd = !advanced || result.newOffset >= result.fileSize;
+  window.fileSize = result.fileSize;
+  // A remainder of a character's size is a character held back (the process is writing it) or
+  // a short tail: read again, so a held character reads as the end instead of a capped page.
+  if (!window.reachedEnd && result.fileSize - result.newOffset <= MAX_HELD_BACK_BYTES) {
+    await readIntoWindow(proc, window);
+  }
+  return advanced;
+}
+
+/** Most bytes a bounded read holds back: an incomplete UTF-8 character's first 3 bytes. */
+const MAX_HELD_BACK_BYTES = 3;
+
+/**
+ * A bounded read holds back a character the process may still be writing (see
+ * BackgroundHandle.readOutput). Once the process has ended, no write can complete it, so reads
+ * take it, and the drain after exit reaches the end of the file.
+ */
+function finalReadOptions(window: OutputWindow): OutputReadOptions {
+  return { final: window.status !== "running" };
+}
+
+/** The window ends inside a line and has room: read on before deciding on that line. */
+function lineRunsOnInWindow(window: OutputWindow): boolean {
+  return (
+    !window.reachedEnd &&
+    !window.pending.includes("\n") &&
+    Buffer.byteLength(window.pending, "utf8") < MAX_RETAINED_UNREAD_BYTES
+  );
+}
+
+/** UTF-8 size of the complete lines in `pending` (everything up to its last "\n"). */
+function completeLineBytes(pending: string): number {
+  return Buffer.byteLength(pending.slice(0, pending.lastIndexOf("\n") + 1), "utf8");
+}
+
+/** A full page of complete lines, or a full window: a filtered read stops reading there. */
+function windowIsFull(pending: string): boolean {
+  return (
+    completeLineBytes(pending) >= BASH_MAX_TOTAL_BYTES ||
+    Buffer.byteLength(pending, "utf8") >= MAX_RETAINED_UNREAD_BYTES
+  );
+}
+
+/**
+ * Whether getOutput's wait can stop. Unfiltered: a complete line, or a full window. Filtered (the
+ * scan already dropped the rejected lines): a full window, or the page it gives. filter_exclude
+ * waits for a line that is not blank (or a kept split line's tail); the blank lines stay in the
+ * window and are returned with it. filter waits for a matching line or, as before reads were
+ * bounded, for any complete line.
+ */
+function windowHasOutputToReturn(window: OutputWindow, options: OutputWaitOptions): boolean {
+  if (!options.filtered) return !window.reachedEnd || window.pending.includes("\n");
+  if (windowIsFull(window.pending)) return true;
+  const page = takeBackgroundOutputPage(
+    window.pending,
+    window.status !== "running",
+    window.reachedEnd,
+    window.decision,
+    options.keepLine
+  );
+  if (!options.filterExclude) return page.shownLines > 0 || window.sawCompleteLine;
+  return page.output.trim().length > 0 || (window.decision === "kept" && page.shownLines > 0);
+}
+
+/** What a filtered scan keeps of `raw`: see dropRejectedLines. */
+interface FilteredOutput {
+  pending: string;
+  decision: SplitLineDecision | undefined;
+  sawCompleteLine: boolean;
+  decidedOnHead: boolean;
+}
+
+/**
+ * Drop the complete lines of `raw` the page would not return, keeping the rest (and the trailing
+ * fragment) for it. A line longer than the window is decided on its head, whether a chunk holds
+ * all of it (onWindowHead) or the window ends inside it (takeLinePastWindow): dropped, its tail is
+ * dropped too; kept, the page returns it in pieces.
+ */
+function dropRejectedLines(
+  raw: string,
+  exited: boolean,
+  reachedEnd: boolean,
+  decision: SplitLineDecision | undefined,
+  keepLine: (line: string) => boolean
+): FilteredOutput {
+  const complete = exited && reachedEnd;
+  if (!complete && !raw.includes("\n")) return decideFragment(raw, reachedEnd, decision, keepLine);
+  const lines = raw.split("\n");
+  // On exit at the end of the file the last element is a line too; "" stands in as the fragment.
+  const fragment = complete ? "" : (lines.pop() ?? "");
+  const headFilter = onWindowHead(keepLine);
+  const kept = lines.filter(pageLineFilter(exited, decision, headFilter.keepLine));
+  return {
+    pending: [...kept, fragment].join("\n"),
+    // A kept split line stays the first line; any other decision belonged to a dropped line.
+    decision: decision === "kept" ? "kept" : undefined,
+    sawCompleteLine: true,
+    decidedOnHead: headFilter.decidedOnHead(),
+  };
+}
+
+/** `keepLine` on at most a window's worth of each line, noting when a line was longer. */
+function onWindowHead(keepLine: (line: string) => boolean): {
+  keepLine: (line: string) => boolean;
+  decidedOnHead: () => boolean;
+} {
+  let decidedOnHead = false;
+  return {
+    keepLine: (line) => {
+      if (Buffer.byteLength(line, "utf8") <= MAX_RETAINED_UNREAD_BYTES) return keepLine(line);
+      decidedOnHead = true;
+      return keepLine(truncateUtf8Prefix(line, MAX_RETAINED_UNREAD_BYTES));
+    },
+    decidedOnHead: () => decidedOnHead,
+  };
+}
+
+/** `raw` has no complete line: keep it, unless it fills the window (see dropRejectedLines). */
+function decideFragment(
+  raw: string,
+  reachedEnd: boolean,
+  decision: SplitLineDecision | undefined,
+  keepLine: (line: string) => boolean
+): FilteredOutput {
+  const undecided = { pending: raw, decision, sawCompleteLine: false, decidedOnHead: false };
+  if (reachedEnd || Buffer.byteLength(raw, "utf8") < MAX_RETAINED_UNREAD_BYTES) return undecided;
+  const page = takeLinePastWindow(raw, decision, keepLine);
+  const decidedOnHead = page.decidedOnHead === true;
+  if (page.unreadLineDecision === "kept") return { ...undecided, decidedOnHead };
+  return { pending: "", decision: "dropped", sawCompleteLine: false, decidedOnHead };
+}
+
+/**
+ * A filtered getOutput read: scan output.log from the cursor up to the file size the first read
+ * saw (output that arrives meanwhile waits for the next call), or until the window is full. Each
+ * handle read loads a chunk that doubles up to FILTERED_SCAN_CHUNK_BYTES, and the rejected lines
+ * are dropped at once, so memory stays within the window. A chunk whose kept lines overflow the
+ * window is read again with only the room the window has. Returns false when interrupted.
+ */
+async function scanFilteredOutput(
+  proc: BackgroundProcess,
+  window: OutputWindow,
+  keepLine: (line: string) => boolean,
+  isInterrupted: () => boolean
+): Promise<boolean> {
+  let chunkBytes = BASH_MAX_TOTAL_BYTES;
+  let targetOffset = Infinity;
+  while (true) {
+    const offset = proc.outputBytesRead;
+    const room = Math.max(1, MAX_RETAINED_UNREAD_BYTES - Buffer.byteLength(window.pending, "utf8"));
+    // Never past the file size the first read saw (plus the bytes that finish a character).
+    const readBytes = Math.max(1, Math.min(chunkBytes, targetOffset - offset));
+    const result = await proc.handle.readOutput(offset, readBytes, finalReadOptions(window));
+    assert(result.newOffset >= offset, "BackgroundHandle.readOutput moved the cursor back");
+    targetOffset = Math.min(targetOffset, result.fileSize);
+    const advanced = result.newOffset > offset;
+    const reachedEnd = !advanced || result.newOffset >= result.fileSize;
+    const kept = dropRejectedLines(
+      window.pending + result.content,
+      window.status !== "running",
+      reachedEnd,
+      window.decision,
+      keepLine
+    );
+    if (readBytes > room && Buffer.byteLength(kept.pending, "utf8") > MAX_RETAINED_UNREAD_BYTES) {
+      chunkBytes = room;
+      continue;
+    }
+    proc.outputBytesRead = result.newOffset;
+    commitScannedChunk(window, kept, reachedEnd, result.fileSize);
+    if (reachedEnd || scanReachedStop(window, result.newOffset, targetOffset)) return true;
+    if (isInterrupted()) return false;
+    chunkBytes = Math.min(chunkBytes * 2, FILTERED_SCAN_CHUNK_BYTES);
+  }
+}
+
+/**
+ * The interrupted return shows nothing, so keep what this call read for the next one; otherwise
+ * the next getOutput() would resume past it and silently drop it. This matters now that
+ * task_await aborts a still-pending bash read once min_completed is satisfied. (A filtered scan
+ * has already dropped the lines its filter rejected, as a completed filtered read does.)
+ */
+function keepInterruptedWindow(proc: BackgroundProcess, window: OutputWindow): null {
+  proc.incompleteLineBuffer = window.pending;
+  proc.unreadLineDecision = window.decision;
+  return null;
+}
+
+/** Add DECIDED_ON_HEAD_NOTE when a filtered read decided a line on its head (window or page). */
+function appendDecidedOnHeadNote(
+  note: string | undefined,
+  filtered: boolean,
+  sources: Array<{ decidedOnHead?: boolean }>
+): string | undefined {
+  if (!filtered || !sources.some((source) => source.decidedOnHead === true)) return note;
+  return note == null ? DECIDED_ON_HEAD_NOTE : `${note} ${DECIDED_ON_HEAD_NOTE}`;
+}
+
+/** A filtered scan stops at the file size its first read saw, or with a full window. */
+function scanReachedStop(window: OutputWindow, offset: number, targetOffset: number): boolean {
+  return offset >= targetOffset || windowIsFull(window.pending);
+}
+
+/** Take a scanned chunk's kept output into the window (see scanFilteredOutput). */
+function commitScannedChunk(
+  window: OutputWindow,
+  kept: FilteredOutput,
+  reachedEnd: boolean,
+  fileSize: number
+): void {
+  window.pending = kept.pending;
+  window.decision = kept.decision;
+  window.reachedEnd = reachedEnd;
+  window.fileSize = fileSize;
+  window.sawCompleteLine ||= kept.sawCompleteLine;
+  window.decidedOnHead ||= kept.decidedOnHead;
+}
+
+/** One read of getOutput's wait loop. Returns false when a filtered scan was interrupted. */
+async function readOutputStep(
+  proc: BackgroundProcess,
+  window: OutputWindow,
+  options: OutputWaitOptions,
+  isInterrupted: () => boolean
+): Promise<boolean> {
+  if (options.filtered) return scanFilteredOutput(proc, window, options.keepLine, isInterrupted);
+  await readIntoWindow(proc, window);
+  return true;
+}
+
+/** What getOutput's wait does after a read that found nothing to return. */
+function nextWaitStep(
+  window: OutputWindow,
+  elapsedMs: number,
+  timeoutMs: number
+): "sleep" | "stop" {
+  if (window.status !== "running") return "stop";
+  return elapsedMs < timeoutMs ? "sleep" : "stop";
+}
+
+/**
+ * If the process exited at the end of the file, do a final drain of output.
+ *
+ * Rationale: stdout/stderr writes can land just after we observe that the process has exited.
+ * Without a final drain, we can return "exited" with empty output even though output becomes
+ * available moments later.
+ */
+async function drainAfterExit(
+  proc: BackgroundProcess,
+  window: OutputWindow,
+  clock: HostClock
+): Promise<void> {
+  if (window.status === "running") return;
+  // A read made before the exit was seen can have held back a split character: this read
+  // (bounded by the window's room) takes it, even when the window is not at the end.
+  if ((await readIntoWindow(proc, window)) || !window.reachedEnd) return;
+  // We didn't observe any new output: wait one poll interval and try once more.
+  await sleepMs(clock, OUTPUT_POLL_INTERVAL_MS);
+  await readIntoWindow(proc, window);
+}
+
+/** How many bytes the next getOutput read loads, given the output already in memory. */
+function outputReadBytes(pending: string): number {
+  // The decoded size is at least the raw size, so the window holds at most its bound. At least
+  // one byte: a full window still learns whether output.log goes on.
+  const room = MAX_RETAINED_UNREAD_BYTES - Buffer.byteLength(pending, "utf8");
+  return Math.max(1, Math.min(BASH_MAX_TOTAL_BYTES, room));
+}
+
+/** Polling guidance for getOutput (see the callers' 3+ call heuristics). */
+function formatPollingNote(
+  callCount: number,
+  filterExclude: boolean | undefined,
+  running: boolean,
+  pollingToolName: string
+): string | undefined {
+  if (callCount < 3 || !running) return undefined;
+  if (!filterExclude) {
+    return (
+      `STOP POLLING. You've called ${pollingToolName} 3+ times on this process. ` +
+      "This wastes tokens and clutters the conversation. " +
+      "Instead, make ONE call with: filter='⏳|progress|waiting|\\\\\\.\\\\\\.\\\\\\.', " +
+      "filter_exclude=true, timeout_secs=120. This blocks until meaningful output arrives."
+    );
+  }
+  return (
+    "You're using filter_exclude but still polling frequently. " +
+    "Your filter pattern may not be matching the actual output. " +
+    "Try a broader pattern like: filter='\\\\.|\\\\d+%|running|progress|pending|⏳|waiting'. " +
+    "Wait for the FULL timeout before checking again."
+  );
+}
+
 export class BackgroundProcessManager extends EventEmitter<BackgroundProcessManagerEvents> {
   // NOTE: This map is in-memory only. Background processes use nohup/setsid so they
   // could survive app restarts, but we kill all tracked processes on shutdown via
@@ -232,20 +1050,54 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // so cleanup is automatic when the process is removed from this map.
   private processes = new Map<string, BackgroundProcess>();
 
+  // Process IDs claimed by in-flight spawns that have not yet registered in `processes`.
+  // Allocation must be race-free across the awaits between choosing an ID and registering
+  // the process: two concurrent same-name spawns sharing one directory would also share
+  // meta.json/exit_code, and the first exit would settle the record while the other process
+  // still writes — blinding the crash-orphan archive gates. Reserved synchronously when a
+  // candidate is chosen; released when the spawn registers or fails.
+  private readonly reservedProcessIds = new Set<string>();
+  /**
+   * Commands on their way into `processes`, by workspace: foreground commands mid-migration
+   * (#4805), which have left foreground tracking but register only once migrateToBackground's
+   * file setup returns, and background spawns from admission to registration (B2: a spawn can
+   * wait for its record name, then start its child, before it registers). cleanup() waits for
+   * them so a removal or archive cannot delete the checkout under a command that registers
+   * afterwards.
+   */
+  private readonly pendingAdmissions = new Map<string, Set<Promise<void>>>();
+  /**
+   * Pending entries of migrations whose command is being terminated (refused or failed): they
+   * never register, and they stay pending until the command's exit is confirmed, which may be
+   * never (#5589). Only cleanups that delete the checkout afterwards wait for them.
+   */
+  private readonly stoppingAdmissions = new WeakSet<Promise<void>>();
+  /** Resolved and replaced on each markStopping(), so a disposal drain already waiting re-checks. */
+  private stoppingMarked = Promise.withResolvers<void>();
+  /**
+   * Open admission seals per workspace (#4967), counted: while any is held, beginMigration() and
+   * spawn() refuse. cleanup() holds one for its own duration; a removal or archive holds one
+   * until it settles.
+   */
+  private readonly admissionSeals = new Map<string, number>();
+
   // Base directory for process output files
   private readonly bgOutputDir: string;
   // Tracks foreground processes (started via runtime.exec) that can be backgrounded
   // Key is toolCallId to support multiple parallel foreground processes per workspace
   private foregroundProcesses = new Map<string, ForegroundProcess>();
-  // Tracks workspaces with queued messages (for bash_output to return early)
-  private queuedMessageWorkspaces = new Set<string>();
 
   // Once set, stopMonitor() suppresses "monitor:stopped" so the persisted armed-monitor
   // registry survives shutdown and the next startup can notify owners their monitors
   // were lost. Never reset: the manager does not outlive a shutdown.
   private shuttingDown = false;
 
-  constructor(bgOutputDir: string) {
+  // Agent-loop time (timestamps, polls, cooldowns, deadlines) reads this clock, so tests can
+  // drive it with a TestClock. The default is today's Date.now() and setTimeout().
+  constructor(
+    bgOutputDir: string,
+    private readonly hostClock: HostClock = nodeClock
+  ) {
     super();
     // Background bash status can have many concurrent subscribers (e.g. multiple workspaces).
     // Raise the default listener cap to avoid noisy MaxListenersExceededWarning.
@@ -253,39 +1105,33 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     this.bgOutputDir = bgOutputDir;
   }
 
-  /**
-   * Mark whether a workspace has a queued user message.
-   * Used by bash_output to return early when user has sent a new message.
-   */
-  setMessageQueued(workspaceId: string, queued: boolean): void {
-    if (queued) {
-      this.queuedMessageWorkspaces.add(workspaceId);
-    } else {
-      this.queuedMessageWorkspaces.delete(workspaceId);
-    }
-  }
-
-  /**
-   * Check if a workspace has a queued user message.
-   */
-  hasQueuedMessage(workspaceId: string): boolean {
-    return this.queuedMessageWorkspaces.has(workspaceId);
-  }
-
   /** Emit a change event for a workspace */
   private emitChange(workspaceId: string): void {
     this.emit("change", workspaceId);
   }
 
+  /**
+   * Nudge background-bash subscribers after a monitor wake-state transition (pending,
+   * delivered, or consumed). Wake state lives in WorkspaceService's reconciler, but
+   * subscribers observe it through this manager's "change" stream, so the owner needs
+   * a way to request an emit when only wake state — not process state — changed.
+   */
+  notifyMonitorWakeStateChanged(workspaceId: string): void {
+    assert(workspaceId.length > 0, "notifyMonitorWakeStateChanged requires a workspaceId");
+    this.emitChange(workspaceId);
+  }
+
   private createMonitorState(
     config: BackgroundProcessMonitorConfig,
-    options: { pollIntervalMs: number }
+    options: { pollIntervalMs: number; armMetadata: MonitorArmedPayload }
   ): BackgroundProcessMonitorState {
     assert(config.filter.length > 0, "BackgroundProcessMonitorConfig requires a filter");
     assert(config.cooldownMs >= 0, "BackgroundProcessMonitorConfig cooldown must be non-negative");
     assert(options.pollIntervalMs > 0, "monitor poll interval must be positive");
     return {
       ...config,
+      armMetadata: options.armMetadata,
+      wakeOnExit: config.wakeOnExit ?? true,
       matchesCount: 0,
       pendingLines: [],
       droppedLines: 0,
@@ -293,8 +1139,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       lastLines: [],
       lastReadOffset: 0,
       matchedThroughOffset: 0,
+      retainedMatches: [],
       incompleteLineBuffer: "",
       stopped: false,
+      probeFailures: {},
+      settled: false,
       pollIntervalMs: options.pollIntervalMs,
     };
   }
@@ -338,9 +1187,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
   private emitMonitorMatch(proc: BackgroundProcess, monitor: BackgroundProcessMonitorState): void {
     if (monitor.pendingLines.length === 0) return;
+    // A claimed settlement suspends normal flushes: pending lines accumulate until the
+    // reservation owner emits the single combined settlement payload.
+    if (monitor.settled) return;
 
     if (monitor.flushTimer) {
-      clearTimeout(monitor.flushTimer);
+      monitor.flushTimer();
       monitor.flushTimer = undefined;
     }
 
@@ -364,6 +1216,62 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     monitor.pendingLines = [];
     monitor.droppedLines = 0;
 
+    this.emitMonitorUpdate(proc, monitor, {
+      lines,
+      droppedLines,
+      matchedThroughOffset: monitor.matchedThroughOffset,
+    });
+  }
+
+  private retainMonitorMatch(
+    monitor: BackgroundProcessMonitorState,
+    update: { lines: readonly string[]; droppedLines: number; matchedThroughOffset: number }
+  ): void {
+    monitor.retainedMatches.push({
+      lines: [...update.lines],
+      totalMatches: monitor.matchesCount,
+      droppedLines: update.droppedLines,
+      matchedThroughOffset: update.matchedThroughOffset,
+    });
+    let retainedLineCount = monitor.retainedMatches.reduce(
+      (total, batch) => total + batch.lines.length,
+      0
+    );
+    while (retainedLineCount > MONITOR_MAX_PENDING_LINES) {
+      const first = monitor.retainedMatches[0];
+      const removeCount = Math.min(
+        retainedLineCount - MONITOR_MAX_PENDING_LINES,
+        first.lines.length
+      );
+      first.lines.splice(0, removeCount);
+      first.droppedLines += removeCount;
+      retainedLineCount -= removeCount;
+      if (first.lines.length === 0 && monitor.retainedMatches.length > 1) {
+        const removed = monitor.retainedMatches.shift();
+        if (removed != null) monitor.retainedMatches[0].droppedLines += removed.droppedLines;
+      }
+    }
+  }
+
+  /** Low-level "monitor:match" emitter shared by normal flushes and settlement payloads. */
+  private emitMonitorUpdate(
+    proc: BackgroundProcess,
+    monitor: BackgroundProcessMonitorState,
+    update: {
+      lines: string[];
+      tailLines?: string[];
+      droppedLines: number;
+      matchedThroughOffset?: number;
+      terminal?: MonitorTerminalStatus;
+    }
+  ): void {
+    if (update.matchedThroughOffset !== undefined && update.lines.length > 0) {
+      this.retainMonitorMatch(monitor, {
+        lines: update.lines,
+        droppedLines: update.droppedLines,
+        matchedThroughOffset: update.matchedThroughOffset,
+      });
+    }
     this.emit("monitor:match", proc.workspaceId, {
       processId: proc.id,
       taskId: `bash:${proc.id}`,
@@ -371,11 +1279,16 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       ...(proc.displayName !== undefined ? { displayName: proc.displayName } : {}),
       filter: monitor.filter,
       filterExclude: monitor.exclude,
-      lines,
+      lines: update.lines,
+      ...(update.tailLines !== undefined ? { tailLines: update.tailLines } : {}),
       totalMatches: monitor.matchesCount,
-      ...(droppedLines > 0 ? { droppedLines } : {}),
-      timestamp: Date.now(),
-      matchedThroughOffset: monitor.matchedThroughOffset,
+      ...(update.droppedLines > 0 ? { droppedLines: update.droppedLines } : {}),
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      timestamp: nodeClock.nowMs(),
+      ...(update.matchedThroughOffset !== undefined
+        ? { matchedThroughOffset: update.matchedThroughOffset }
+        : {}),
+      ...(update.terminal !== undefined ? { terminal: update.terminal } : {}),
     });
     this.emitChange(proc.workspaceId);
   }
@@ -393,29 +1306,86 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   private stopMonitor(
     proc: BackgroundProcess,
     flushPending: boolean,
-    reason: NonNullable<MonitorStoppedPayload["reason"]> = "completed"
+    reason: NonNullable<MonitorStoppedPayload["reason"]> = "completed",
+    failure?: { message: string; failedOperations?: BashMonitorFailedOperation[] }
   ): void {
     const monitor = proc.monitor;
     if (!monitor || monitor.stopped) return;
 
+    // Same shown-frontier gate as the normal flush: matches an unfiltered read already delivered
+    // must not resurface as fresh output through the failure wake.
+    const failedMatchHasUnshownLines =
+      monitor.pendingLines.length > 0 && proc.shownThroughOffset < monitor.matchedThroughOffset;
+    const failedMatch: MonitorFailedMatchPayload | undefined =
+      failure != null
+        ? {
+            lines: failedMatchHasUnshownLines ? [...monitor.pendingLines] : [],
+            totalMatches: monitor.matchesCount,
+            droppedLines: failedMatchHasUnshownLines ? monitor.droppedLines : 0,
+            ...(failedMatchHasUnshownLines
+              ? { matchedThroughOffset: monitor.matchedThroughOffset }
+              : {}),
+          }
+        : undefined;
     monitor.stopped = true;
     if (monitor.flushTimer) {
-      clearTimeout(monitor.flushTimer);
+      monitor.flushTimer();
       monitor.flushTimer = undefined;
     }
-    if (flushPending) {
+    if (reason === "failed") {
+      if (failedMatch?.matchedThroughOffset != null && failedMatch.lines.length > 0) {
+        this.retainMonitorMatch(monitor, {
+          lines: failedMatch.lines,
+          droppedLines: failedMatch.droppedLines,
+          matchedThroughOffset: failedMatch.matchedThroughOffset,
+        });
+      }
+      monitor.pendingLines = [];
+      monitor.droppedLines = 0;
+    } else if (flushPending) {
       this.emitMonitorMatch(proc, monitor);
     } else {
       // Explicit cancellation means the caller no longer wants this condition to produce a wake.
       // Drop coalesced matches rather than letting monitor teardown create the late wake itself.
       monitor.pendingLines = [];
       monitor.droppedLines = 0;
+      monitor.retainedMatches = [];
+      monitor.settlementDisposition = undefined;
     }
     // A monitor retiring while the app is alive means the agent no longer wants wakes for
     // this process, so its armed-registry record must go. During shutdown the record must
     // survive so the next startup can deliver the "monitor lost" notice.
     if (!this.shuttingDown) {
-      this.emit("monitor:stopped", proc.workspaceId, { processId: proc.id, reason });
+      this.emit("monitor:stopped", proc.workspaceId, {
+        processId: proc.id,
+        reason,
+        armMetadata: monitor.armMetadata,
+        ...(monitor.settlementDisposition != null
+          ? {
+              terminal: {
+                status: monitor.settlementDisposition.status,
+                ...(monitor.settlementDisposition.exitCode !== undefined
+                  ? { exitCode: monitor.settlementDisposition.exitCode }
+                  : {}),
+                settledAt: monitor.settlementDisposition.settledAt,
+                wakeOnExit: monitor.settlementDisposition.wakeOnExit,
+                terminalStatusShown: monitor.settlementDisposition.terminalStatusShown,
+                ...(monitor.settlementDisposition.matchedThroughOffset != null
+                  ? { matchedThroughOffset: monitor.settlementDisposition.matchedThroughOffset }
+                  : {}),
+              },
+            }
+          : {}),
+        ...(failure != null
+          ? {
+              failureMessage: failure.message,
+              ...(failure.failedOperations != null
+                ? { failedOperations: failure.failedOperations }
+                : {}),
+              ...(failedMatch != null ? { failedMatch } : {}),
+            }
+          : {}),
+      });
     }
     // Armed -> stopped is workspace-visible state (sidebar "watching" indicator), and not
     // every stop path also changes process status or flushes a match (e.g. maxEvents
@@ -434,9 +1404,199 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // A match may already have retired the monitor and queued a synthetic wake. Explicit process
     // cancellation must still retract that undelivered wake, so emit a cancellation notification
     // even though the in-memory monitor has no remaining timer or pending lines to clear.
+    monitor.retainedMatches = [];
+    monitor.settlementDisposition = undefined;
     if (!this.shuttingDown) {
-      this.emit("monitor:stopped", proc.workspaceId, { processId: proc.id, reason: "canceled" });
+      this.emit("monitor:stopped", proc.workspaceId, {
+        processId: proc.id,
+        reason: "canceled",
+        armMetadata: monitor.armMetadata,
+      });
     }
+  }
+
+  /**
+   * Synchronously claim exclusive settlement ownership for a monitor. Returns null when the
+   * monitor is missing, already stopped (canceled / maxEvents-retired), already claimed, or the
+   * manager is shutting down (the persisted registry record must survive shutdown so the next
+   * startup can deliver the "monitor lost" notice; callers fall back to the legacy flush).
+   *
+   * Claiming (a) ends tail-loop ownership — its post-await guards return on the latch — and
+   * (b) switches the monitor to accumulation-only mode: cooldown flushes, cooldown_ms=0 immediate
+   * emits, and maxEvents retirement are all suppressed so the matched-lines emit can never split
+   * from the terminal emit. The reservation owner performs the ONLY final combined emit and the
+   * ONLY "completed" retirement, via emitClaimedMonitorSettlement.
+   */
+  private claimMonitorSettlement(proc: BackgroundProcess): MonitorSettlementReservation | null {
+    const monitor = proc.monitor;
+    if (!monitor || monitor.stopped || monitor.settled || this.shuttingDown) return null;
+    monitor.settled = true;
+    // A stale cooldown timer must not fire while the settlement helper awaits its final reads.
+    if (monitor.flushTimer) {
+      monitor.flushTimer();
+      monitor.flushTimer = undefined;
+    }
+    return { proc, monitor };
+  }
+
+  /**
+   * Emit the single combined settlement wake for a claimed monitor, then retire it.
+   *
+   * The payload coalesces (in order): pending matched lines still undelivered at settlement, a
+   * synthetic settle line (the downgrade fallback: older builds strip the `terminal` field but
+   * still deliver an actionable match-shaped wake), and a bounded recent-output tail. It is
+   * emitted BEFORE "monitor:stopped" so the retained wake state is observable before the
+   * armed-monitor registry record gains its terminal summary (both WorkspaceService listeners
+   * enqueue their work onto the same per-workspace mutex synchronously and in FIFO emit order).
+   *
+   * Cancellation wins during the claimed window: explicit cancel (task_stop, workspace cleanup)
+   * sets monitor.stopped and emits "monitor:stopped"(canceled); this helper re-checks that state
+   * after every await and no-ops, so no terminal wake and no duplicate "monitor:stopped" fire.
+   */
+  private async emitClaimedMonitorSettlement(
+    reservation: MonitorSettlementReservation,
+    terminal: MonitorTerminalStatus
+  ): Promise<void> {
+    const { proc, monitor } = reservation;
+    assert(monitor.settled, "emitClaimedMonitorSettlement requires a claimed settlement");
+
+    // stdout/stderr redirection can lag exit-code observation by a tick (same redirect-lag sleep
+    // the tail loop used before settlement centralized the final scan here).
+    //
+    // Every post-await guard below also rechecks shuttingDown: beginShutdown() can land while
+    // this helper sleeps or reads, after claimMonitorSettlement's own guard already passed.
+    // Emitting then would let WorkspaceService persist or queue a synthetic turn during
+    // ServiceContainer.dispose; returning instead leaves the armed registry record for the
+    // restart monitor-lost recovery (in-memory pending matches are lost, crash-equivalent).
+    await sleepMs(this.hostClock, monitor.pollIntervalMs);
+    if (monitor.stopped || this.shuttingDown) return;
+
+    // Final monitor scan: matches printed after the last poll (or sitting in the chunk the tail
+    // loop read but deliberately did not process before claiming) accumulate under settlement
+    // mode. Scan failure must not drop the wake.
+    try {
+      const finalChunkStartOffset = monitor.lastReadOffset;
+      const finalRead = await proc.handle.readOutput(finalChunkStartOffset);
+      if (monitor.stopped || this.shuttingDown) return;
+      if (finalRead.newOffset >= finalChunkStartOffset) {
+        monitor.lastReadOffset = finalRead.newOffset;
+        this.processMonitorContent(proc, finalRead.content, {
+          chunkStartOffset: finalChunkStartOffset,
+          includeIncompleteLine: true,
+        });
+      }
+    } catch (error) {
+      log.debug(
+        `BackgroundProcessManager: settlement scan for ${proc.id} failed: ${getErrorMessage(error)}`
+      );
+    }
+    // A rejected scan read skips the success-path guard above, and the wake_on_exit=false branch
+    // below has no later guard of its own — recheck here so cancellation or a mid-scan
+    // beginShutdown can never leak a pending-match emit past this point.
+    if (monitor.stopped || this.shuttingDown) return;
+
+    let tailLines: BashMonitorTailLine[] = [];
+    if (monitor.wakeOnExit) {
+      try {
+        tailLines = await this.readSettlementTailLines(proc);
+      } catch (error) {
+        // Tail-read failure must not drop the wake; the synthetic settle line still delivers.
+        log.debug(
+          `BackgroundProcessManager: settlement tail read for ${proc.id} failed: ${getErrorMessage(error)}`
+        );
+      }
+      if (monitor.stopped || this.shuttingDown) return;
+    }
+
+    const pendingLines = monitor.pendingLines;
+    const droppedLines = monitor.droppedLines;
+    monitor.pendingLines = [];
+    monitor.droppedLines = 0;
+    // The shown fast-path applies ONLY to whether pending matched lines are included; it must
+    // never skip the settle emit while an unshown terminal notice exists. matchedThroughOffset is
+    // carried iff undelivered matched lines are actually included, so a terminal-only payload can
+    // never be offset-suppressed downstream (a zero-output process has EOF = 0 = shown offset).
+    const includeMatched =
+      pendingLines.length > 0 && proc.shownThroughOffset < monitor.matchedThroughOffset;
+
+    const retainedMatch = monitor.retainedMatches[monitor.retainedMatches.length - 1];
+    const retainedMatchedThroughOffset = includeMatched
+      ? monitor.matchedThroughOffset
+      : retainedMatch?.matchedThroughOffset;
+    monitor.settlementDisposition = {
+      status: terminal.status,
+      ...(terminal.exitCode !== undefined ? { exitCode: terminal.exitCode } : {}),
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      settledAt: new Date(nodeClock.nowMs()).toISOString(),
+      wakeOnExit: monitor.wakeOnExit,
+      terminalStatusShown: proc.terminalStatusShownToAgent,
+      ...(retainedMatchedThroughOffset != null
+        ? { matchedThroughOffset: retainedMatchedThroughOffset }
+        : {}),
+      tailLines,
+    };
+
+    if (!monitor.wakeOnExit) {
+      // wake_on_exit=false degrades to the legacy exit flush: matched lines only, no terminal
+      // metadata, no synthetic/tail lines.
+      if (includeMatched) {
+        this.emitMonitorUpdate(proc, monitor, {
+          lines: pendingLines,
+          droppedLines,
+          matchedThroughOffset: monitor.matchedThroughOffset,
+        });
+      }
+    } else {
+      this.emitMonitorUpdate(proc, monitor, {
+        lines: includeMatched ? pendingLines : [],
+        ...(tailLines.length > 0 ? { tailLines: tailLines.map((entry) => entry.line) } : {}),
+        droppedLines: includeMatched ? droppedLines : 0,
+        ...(includeMatched ? { matchedThroughOffset: monitor.matchedThroughOffset } : {}),
+        terminal,
+      });
+    }
+
+    // Retire AFTER the settlement emit so the wake persists before the registry record is
+    // deleted. emitMonitorMatch no-ops under the settled latch, so flushPending=true cannot
+    // produce a second, split emit here.
+    this.stopMonitor(proc, true);
+  }
+
+  /**
+   * Bounded tail of output.log for the settlement wake: last complete lines within the final
+   * ~4 KB, sanitized and middle-truncated like matched lines. Read failure propagates to the
+   * caller, which treats it as an empty tail.
+   */
+  private async readSettlementTailLines(proc: BackgroundProcess): Promise<BashMonitorTailLine[]> {
+    const fileSizeBytes = await proc.handle.getOutputFileSize();
+    const windowStart = computeTailStartOffset(fileSizeBytes, MONITOR_SETTLEMENT_TAIL_BYTES);
+    const offset = Math.max(windowStart, proc.shownThroughOffset);
+    const startedAtLineBoundary = offset === proc.shownThroughOffset;
+    const result = await proc.handle.readOutput(offset);
+    const bounded = boundTailContent(result.content, MONITOR_SETTLEMENT_TAIL_BYTES);
+    const startedMidLine = (offset > 0 && !startedAtLineBoundary) || bounded.startedMidContent;
+    const segments = bounded.content.split("\n");
+    let cursor = result.newOffset - Buffer.byteLength(bounded.content, "utf8");
+    const positioned = segments.map((line, index) => {
+      cursor += Buffer.byteLength(line, "utf8");
+      if (index < segments.length - 1) cursor += 1;
+      return { line, endOffset: cursor };
+    });
+    const rawLines = startedMidLine ? positioned.slice(1) : positioned;
+    const lines = rawLines
+      .map((entry) => ({ ...entry, line: this.sanitizeMonitorLine(entry.line) }))
+      .filter((entry) => entry.line.length > 0)
+      .slice(-MONITOR_SETTLEMENT_TAIL_MAX_LINES)
+      .map((entry) => ({ ...entry, line: this.truncateMonitorLine(entry.line) }));
+    if (lines.length > 0 || !startedMidLine) return lines;
+    const fragment = this.sanitizeMonitorLine(segments[0] ?? "");
+    if (fragment.length === 0) return [];
+    return [
+      {
+        line: this.truncateMonitorLine(`${MONITOR_TRUNCATION_MARKER}${fragment}`),
+        endOffset: result.newOffset,
+      },
+    ];
   }
 
   private scheduleMonitorFlush(
@@ -448,26 +1608,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       return;
     }
 
-    monitor.flushTimer ??= setTimeout(() => {
+    monitor.flushTimer ??= this.hostClock.setTimer(() => {
       monitor.flushTimer = undefined;
-      if (!monitor.stopped) {
+      if (!monitor.stopped && !monitor.settled) {
         this.emitMonitorMatch(proc, monitor);
       }
     }, monitor.cooldownMs);
-  }
-
-  private truncateUtf8Prefix(value: string, maxBytes: number): string {
-    assert(maxBytes > 0, "truncateUtf8Prefix requires a positive byte limit");
-    let bytes = 0;
-    let endIndex = 0;
-    for (const char of value) {
-      const charBytes = Buffer.byteLength(char, "utf8");
-      if (bytes + charBytes > maxBytes) break;
-      bytes += charBytes;
-      endIndex += char.length;
-    }
-
-    return value.slice(0, endIndex);
   }
 
   private truncateUtf8Suffix(value: string, maxBytes: number): string {
@@ -494,7 +1640,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const remainingBytes = Math.max(1, maxBytes - markerBytes);
     const prefixBytes = Math.floor(remainingBytes / 2);
     const suffixBytes = remainingBytes - prefixBytes;
-    return `${this.truncateUtf8Prefix(value, prefixBytes)}${MONITOR_TRUNCATION_MARKER}${this.truncateUtf8Suffix(value, suffixBytes)}`;
+    return `${truncateUtf8Prefix(value, prefixBytes)}${MONITOR_TRUNCATION_MARKER}${this.truncateUtf8Suffix(value, suffixBytes)}`;
   }
 
   private sanitizeMonitorLine(line: string): string {
@@ -526,6 +1672,18 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     const monitor = proc.monitor;
     if (!monitor || monitor.stopped) return;
 
+    // Settlement accumulation still honors max_events: the cap silences wakes after N matches,
+    // so final-chunk matches beyond it must not swell the combined settlement payload or report
+    // totalMatches above the configured limit (the non-settled path can never exceed the cap
+    // because retirement below fires exactly at it).
+    if (
+      monitor.settled &&
+      monitor.maxEvents !== undefined &&
+      monitor.matchesCount >= monitor.maxEvents
+    ) {
+      return;
+    }
+
     const boundedLine = this.truncateMonitorLine(line);
     monitor.matchesCount++;
     monitor.pendingLines.push(boundedLine);
@@ -543,6 +1701,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       monitor.droppedLines++;
       monitor.totalDroppedLines++;
     }
+
+    // Settlement accumulation mode: once a settlement claim is held, matches in the final
+    // chunk(s) only accumulate. No cooldown flush (a cooldown_ms=0 match must not emit ahead of
+    // the combined settlement payload) and no maxEvents retirement (stopMonitor would delete the
+    // registry record before the settlement wake persists).
+    if (monitor.settled) return;
 
     this.scheduleMonitorFlush(proc, monitor);
 
@@ -611,16 +1775,130 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
   }
 
+  private recordMonitorProbeSuccess(
+    monitor: BackgroundProcessMonitorState,
+    operation: BashMonitorFailedOperation
+  ): void {
+    delete monitor.probeFailures[operation];
+  }
+
+  private recordMonitorProbeFailure(
+    monitor: BackgroundProcessMonitorState,
+    operation: BashMonitorFailedOperation,
+    message: string
+  ): MonitorPollingFailure | null {
+    const previous = monitor.probeFailures[operation];
+    const current: MonitorProbeFailureState = {
+      consecutiveFailures: (previous?.consecutiveFailures ?? 0) + 1,
+      message,
+    };
+    monitor.probeFailures[operation] = current;
+
+    const otherOperation: BashMonitorFailedOperation =
+      operation === "readOutput" ? "getExitCode" : "readOutput";
+    const otherFailure = monitor.probeFailures[otherOperation];
+    if (otherFailure != null) {
+      return new MonitorPollingFailure(
+        `Background process monitor probes failed (${operation}: ${message}; ${otherOperation}: ${otherFailure.message})`,
+        [operation, otherOperation]
+      );
+    }
+    if (current.consecutiveFailures >= MAX_CONSECUTIVE_MONITOR_PROBE_FAILURES) {
+      return new MonitorPollingFailure(
+        `Background process monitor probe failed ${current.consecutiveFailures} consecutive times (${operation}: ${message})`,
+        [operation]
+      );
+    }
+    return null;
+  }
+
+  private async runMonitorProbe<T>(
+    monitor: BackgroundProcessMonitorState,
+    operation: BashMonitorFailedOperation,
+    probe: () => Promise<BackgroundMonitorProbeResult<T>>,
+    fallback: T
+  ): Promise<T> {
+    let result: BackgroundMonitorProbeResult<T>;
+    try {
+      result = await probe();
+    } catch (error) {
+      result = { success: false, error: getErrorMessage(error) };
+    }
+    if (result.success) {
+      this.recordMonitorProbeSuccess(monitor, operation);
+      return result.value;
+    }
+    const failure = this.recordMonitorProbeFailure(monitor, operation, result.error);
+    if (failure != null) throw failure;
+    return fallback;
+  }
+
+  private readOutputForMonitor(
+    proc: BackgroundProcess,
+    monitor: BackgroundProcessMonitorState,
+    offset: number
+  ): Promise<{ content: string; newOffset: number }> {
+    const probe = proc.handle.readOutputForMonitor?.bind(proc.handle);
+    return this.runMonitorProbe(
+      monitor,
+      "readOutput",
+      probe != null
+        ? () => probe(offset)
+        : async () => {
+            try {
+              return { success: true, value: await proc.handle.readOutput(offset) };
+            } catch (error) {
+              return { success: false, error: getErrorMessage(error) };
+            }
+          },
+      { content: "", newOffset: offset }
+    );
+  }
+
+  private getExitCodeForMonitor(
+    proc: BackgroundProcess,
+    monitor: BackgroundProcessMonitorState
+  ): Promise<number | null> {
+    const probe = proc.handle.getExitCodeForMonitor?.bind(proc.handle);
+    return this.runMonitorProbe(
+      monitor,
+      "getExitCode",
+      probe != null
+        ? () => probe()
+        : async () => {
+            try {
+              return { success: true, value: await proc.handle.getExitCode() };
+            } catch (error) {
+              return { success: false, error: getErrorMessage(error) };
+            }
+          },
+      null
+    );
+  }
+
   private startMonitorTail(proc: BackgroundProcess): void {
     void this.monitorTailLoop(proc.id).catch((error: unknown) => {
       const current = this.processes.get(proc.id);
-      if (current?.monitor && !current.monitor.stopped) {
-        // Route through stopMonitor so the retirement also clears any pending flush timer,
-        // emits "monitor:stopped" (registry cleanup), and broadcasts the change event so
-        // activity consumers see the armed-monitor count drop. No flush: the loop failed.
-        this.stopMonitor(current, false);
+      // Identity check: a stale tail from a removed generation must not retire the monitor of a
+      // newer process that reused this display-name-derived ID. A claimed settlement also wins:
+      // its owner emits the deterministic terminal wake, so a late probe rejection must not
+      // convert a settling monitor into a runtime failure.
+      if (
+        current === proc &&
+        current.monitor &&
+        !current.monitor.stopped &&
+        !current.monitor.settled
+      ) {
+        // No observer remains after this loop rejects. Stopping also makes later settlement claims
+        // no-op, so this failure wake is the only lifecycle notice even if the process exits later.
+        this.stopMonitor(current, true, "failed", {
+          message: getErrorMessage(error),
+          ...(error instanceof MonitorPollingFailure
+            ? { failedOperations: [...error.failedOperations] }
+            : {}),
+        });
       }
-      log.debug(
+      log.warn(
         `BackgroundProcessManager: monitor tail for ${proc.id} failed: ${getErrorMessage(error)}`
       );
     });
@@ -630,25 +1908,49 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     while (true) {
       const proc = this.processes.get(processId);
       const monitor = proc?.monitor;
-      if (!proc || !monitor || monitor.stopped) return;
+      if (!proc || !monitor || monitor.stopped || monitor.settled) return;
 
       const chunkStartOffset = monitor.lastReadOffset;
-      const read = await proc.handle.readOutput(chunkStartOffset);
+      const read = await this.readOutputForMonitor(proc, monitor, chunkStartOffset);
+      // A settlement claim (e.g. a timeout terminate) during the await owns every remaining
+      // byte; leave lastReadOffset untouched so its final scan re-reads this chunk.
+      if (monitor.stopped || monitor.settled) return;
       if (read.newOffset < chunkStartOffset) {
         log.debug(`BackgroundProcessManager: monitor read offset moved backwards for ${processId}`);
         this.stopMonitor(proc, true);
         return;
       }
 
-      monitor.lastReadOffset = read.newOffset;
-      this.processMonitorContent(proc, read.content, { chunkStartOffset });
+      // Check for exit BEFORE processing the just-read chunk: a matching line in the very chunk
+      // that accompanies the exit must coalesce into the single settlement payload instead of
+      // triggering a cooldown_ms=0 emit or maxEvents retirement ahead of it.
+      let exitCode: number | null;
+      try {
+        exitCode = await this.getExitCodeForMonitor(proc, monitor);
+      } catch (error) {
+        // The exit-probe escalation retires the monitor through the tail catch, but the read
+        // above already succeeded: fold its chunk into monitor state first, or the matched
+        // lines would vanish from the failure payload (unrecoverable if the process
+        // generation dies before the suggested task_await).
+        if (!monitor.stopped && !monitor.settled) {
+          monitor.lastReadOffset = read.newOffset;
+          this.processMonitorContent(proc, read.content, { chunkStartOffset });
+        }
+        throw error;
+      }
+      if (monitor.stopped || monitor.settled) return;
 
-      const exitCode = await proc.handle.getExitCode();
       if (exitCode !== null) {
+        // Claim synchronously before any further await so a pending cooldown timer cannot fire
+        // during the redirect-lag sleep and a concurrent terminate cannot double-settle. The
+        // claimed helper re-reads from lastReadOffset, so the unprocessed chunk above is scanned
+        // exactly once, under settlement accumulation mode.
+        const reservation = this.claimMonitorSettlement(proc);
         if (proc.status === "running") {
           proc.status = "exited";
           proc.exitCode = exitCode;
-          proc.exitTime = Date.now();
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          proc.exitTime = nodeClock.nowMs();
           await this.updateMetaFile(proc).catch((err: unknown) => {
             log.debug(
               `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -657,20 +1959,173 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           this.emitChange(proc.workspaceId);
         }
 
-        // stdout/stderr redirection can lag exit-code observation by a tick.
-        await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
-        const finalChunkStartOffset = monitor.lastReadOffset;
-        const finalRead = await proc.handle.readOutput(finalChunkStartOffset);
-        monitor.lastReadOffset = finalRead.newOffset;
-        this.processMonitorContent(proc, finalRead.content, {
-          chunkStartOffset: finalChunkStartOffset,
-          includeIncompleteLine: true,
+        if (!reservation) {
+          // Shutdown suppressed the claim: keep the legacy exit flush so pending matched lines
+          // still persist (mergeable with the restart monitor-lost notice); no terminal payload.
+          monitor.lastReadOffset = read.newOffset;
+          this.processMonitorContent(proc, read.content, { chunkStartOffset });
+          // stdout/stderr redirection can lag exit-code observation by a tick.
+          await sleepMs(this.hostClock, monitor.pollIntervalMs);
+          const finalChunkStartOffset = monitor.lastReadOffset;
+          const finalRead = await proc.handle.readOutput(finalChunkStartOffset);
+          monitor.lastReadOffset = finalRead.newOffset;
+          this.processMonitorContent(proc, finalRead.content, {
+            chunkStartOffset: finalChunkStartOffset,
+            includeIncompleteLine: true,
+          });
+          this.stopMonitor(proc, true);
+          return;
+        }
+
+        await this.emitClaimedMonitorSettlement(reservation, {
+          // The status-update branch above narrowed "running" to "exited"; a concurrent
+          // terminate may have set "killed"/"failed" instead — report whichever settled.
+          status: proc.status,
+          ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
         });
-        this.stopMonitor(proc, true);
         return;
       }
 
-      await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
+      monitor.lastReadOffset = read.newOffset;
+      this.processMonitorContent(proc, read.content, { chunkStartOffset });
+
+      await sleepMs(this.hostClock, monitor.pollIntervalMs);
+    }
+  }
+
+  /**
+   * Mark a foreground command as migrating to the background in `workspaceId`. Begin it before
+   * the command leaves foreground tracking and dispose it once the command is registered (or
+   * terminated after a failed migration); cleanup() waits for it in between.
+   *
+   * While the workspace is sealed (sealAdmissions) the migration is not `admitted`: the caller
+   * must terminate the command as on a failed migration. It is still tracked until disposed, so
+   * a running cleanup() also waits for that termination.
+   *
+   * `markStopping()` says the command is being terminated and will never register: a removal or
+   * archive cleanup keeps waiting for it (and fails closed at its deadline), but session disposal,
+   * which deletes nothing, does not (#5589).
+   */
+  beginMigration(
+    workspaceId: string
+  ): Disposable & { readonly admitted: boolean; markStopping(): void } {
+    const admitted = !this.admissionSeals.has(workspaceId);
+    const pending = this.trackPendingAdmission(workspaceId);
+    return {
+      admitted,
+      markStopping: () => {
+        this.stoppingAdmissions.add(pending.settled);
+        this.stoppingMarked.resolve();
+        this.stoppingMarked = Promise.withResolvers<void>();
+      },
+      [Symbol.dispose]: () => pending[Symbol.dispose](),
+    };
+  }
+
+  /**
+   * B2: admit a background spawn into `workspaceId`, or return null while the workspace is
+   * sealed. An admitted spawn stays pending (cleanup() waits for it) until the returned handle
+   * is disposed, which spawn() does once the process is registered in `processes` or the spawn
+   * failed, so a spawn still waiting for its record name cannot register after cleanup() looked.
+   */
+  private admitSpawn(workspaceId: string): Disposable | null {
+    if (this.admissionSeals.has(workspaceId)) return null;
+    return this.trackPendingAdmission(workspaceId);
+  }
+
+  /** Counts a command as pending in `workspaceId` until the returned handle is disposed. */
+  private trackPendingAdmission(
+    workspaceId: string
+  ): Disposable & { readonly settled: Promise<void> } {
+    const settled = Promise.withResolvers<void>();
+    let pending = this.pendingAdmissions.get(workspaceId);
+    if (pending === undefined) {
+      pending = new Set();
+      this.pendingAdmissions.set(workspaceId, pending);
+    }
+    pending.add(settled.promise);
+    return {
+      settled: settled.promise,
+      [Symbol.dispose]: () => {
+        const current = this.pendingAdmissions.get(workspaceId);
+        current?.delete(settled.promise);
+        if (current?.size === 0) this.pendingAdmissions.delete(workspaceId);
+        settled.resolve();
+      },
+    };
+  }
+
+  /**
+   * Refuse new migrations and spawns in `workspaceId` until the returned seal is disposed
+   * (#4967, B2). A command that was still before beginMigration or spawn() when cleanup() looked
+   * (claiming its record name, or in the exit grace) would otherwise register afterwards and
+   * outlive the cleanup.
+   */
+  sealAdmissions(workspaceId: string): Disposable {
+    this.admissionSeals.set(workspaceId, (this.admissionSeals.get(workspaceId) ?? 0) + 1);
+    let released = false;
+    return {
+      [Symbol.dispose]: () => {
+        if (released) return;
+        released = true;
+        const count = this.admissionSeals.get(workspaceId) ?? 0;
+        assert(count > 0, `admission seal count underflow for ${workspaceId}`);
+        if (count === 1) this.admissionSeals.delete(workspaceId);
+        else this.admissionSeals.set(workspaceId, count - 1);
+      },
+    };
+  }
+
+  /**
+   * Waits until no migration or spawn is pending in `workspaceId`, including later ones. With a
+   * `deadline` (epoch ms), throws once it passes (#5477), so a caller that deletes the checkout
+   * afterwards (archive, removal) fails closed instead of hanging with a stuck runtime call.
+   * Without one (session disposal, which deletes nothing), it skips migrations whose command is
+   * stopping: their exit may never be confirmed, and waiting would hang disposal with its admission
+   * seal held (#5589). They stay pending, so removal and archive still wait for them.
+   */
+  private async drainPendingAdmissions(
+    workspaceId: string,
+    deadline: number | null
+  ): Promise<void> {
+    if (deadline === null) {
+      for (
+        let pending = this.pendingAdmissions.get(workspaceId);
+        pending !== undefined;
+        pending = this.pendingAdmissions.get(workspaceId)
+      ) {
+        const registering = [...pending].filter((entry) => !this.stoppingAdmissions.has(entry));
+        if (registering.length === 0) return;
+        // A migration may become stopping while this waits (disposal can start before a migration
+        // fails): wake up and re-check rather than wait on an entry that may never settle.
+        await Promise.race([Promise.all(registering), this.stoppingMarked.promise]);
+      }
+      return;
+    }
+    let cancelTimer: (() => void) | undefined;
+    const timedOut = new Promise<"timed-out">((resolve) => {
+      cancelTimer = this.hostClock.setTimer(
+        () => resolve("timed-out"),
+        Math.max(0, deadline - this.hostClock.nowMs())
+      );
+    });
+    try {
+      for (
+        let pending = this.pendingAdmissions.get(workspaceId);
+        pending !== undefined;
+        pending = this.pendingAdmissions.get(workspaceId)
+      ) {
+        const settled = await Promise.race([Promise.all([...pending]), timedOut]);
+        if (settled === "timed-out") {
+          throw new Error(
+            `A background process start or migration in this workspace did not settle within ${
+              PENDING_ADMISSION_DRAIN_TIMEOUT_MS / 1000
+            } s (a runtime call may be hung); its background processes were not all stopped. Retry once the runtime responds.`
+          );
+        }
+      }
+    } finally {
+      cancelTimer?.();
     }
   }
 
@@ -697,12 +2152,92 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
 
     let processId = baseId;
     let suffix = 1;
-    while (this.processes.has(processId)) {
+    while (this.processes.has(processId) || this.reservedProcessIds.has(processId)) {
       processId = `${baseId} (${suffix})`;
       suffix++;
     }
 
     return processId;
+  }
+
+  /**
+   * Claim a unique process name for foreground-to-background migration.
+   *
+   * Migrated records live under `<bgOutputDir>/<workspaceId>/<processId>`. Two backends on one
+   * XUM_ROOT (desktop + `xum server`) have separate managers, so an in-memory reservation
+   * alone let both migrate a same-named command into one directory and share its
+   * output.log/exit marker (#4878). The claim therefore holds the same per-workspace host file
+   * lock as spawn() and only picks a name whose directory does not exist yet (recordDirIsFree).
+   * A fresh directory also never inherits a previous session's exit marker, which would make
+   * the live migrated command read as exited to name probes and crash-orphan archive gating.
+   *
+   * The caller keeps the claim (lock) until migrateToBackground() has created the directory,
+   * after which every other backend's probe reads the name as held, then disposes it. The
+   * in-memory name reservation is released separately via releaseName(): on success once the
+   * process is registered (the processes map then holds the name), on failure only once the
+   * process's exit settles, so an unverifiable survivor keeps its name for the session.
+   */
+  async claimMigrationProcessId(
+    workspaceId: string,
+    displayName: string
+  ): Promise<
+    | ({ success: true; processId: string; releaseName: () => void } & AsyncDisposable)
+    | { success: false; error: string }
+  > {
+    assert(workspaceId.length > 0, "claimMigrationProcessId requires workspaceId");
+    const workspaceDir = nodePath.join(this.bgOutputDir, workspaceId);
+    let lock: AsyncDisposable;
+    try {
+      lock = await acquireProcessFileLock({
+        lockPath: nodePath.join(workspaceDir, SPAWN_NAME_LOCK_FILENAME),
+        timeoutMs: SPAWN_NAME_LOCK_TIMEOUT_MS,
+        label: "background migration lock",
+      });
+    } catch (error) {
+      return {
+        success: false,
+        error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
+      };
+    }
+    // Each candidate is reserved in the same tick it is chosen (see reservedProcessIds), so a
+    // concurrent spawn() in this manager cannot pick it during the directory probes below.
+    let processId = this.generateUniqueProcessId(displayName);
+    this.reservedProcessIds.add(processId);
+    try {
+      let suffix = 2;
+      while (!(await recordDirIsFree(nodePath.join(workspaceDir, processId)))) {
+        this.reservedProcessIds.delete(processId);
+        do {
+          processId = `${displayName} (${suffix})`;
+          suffix++;
+        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        this.reservedProcessIds.add(processId);
+      }
+    } catch (error) {
+      this.reservedProcessIds.delete(processId);
+      await lock[Symbol.asyncDispose]();
+      return {
+        success: false,
+        error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
+      };
+    }
+    const claimedId = processId;
+    let nameReleased = false;
+    let unlocked = false;
+    return {
+      success: true,
+      processId: claimedId,
+      releaseName: () => {
+        if (nameReleased) return;
+        nameReleased = true;
+        this.reservedProcessIds.delete(claimedId);
+      },
+      [Symbol.asyncDispose]: async () => {
+        if (unlocked) return;
+        unlocked = true;
+        await lock[Symbol.asyncDispose]();
+      },
+    };
   }
 
   /**
@@ -723,6 +2258,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     config: {
       cwd: string;
       env?: Record<string, string>;
+      pathEnv?: Record<string, string>;
       /** Human-readable name for the process - used to generate the process ID */
       displayName: string;
       /** If true, process is foreground (being waited on). Default: false (background) */
@@ -738,7 +2274,130 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   > {
     log.debug(`BackgroundProcessManager.spawn() called for workspace ${workspaceId}`);
 
-    const processId = this.generateUniqueProcessId(config.displayName);
+    // B2: no spawn may start while the workspace is sealed (cleanup, archive, removal), and an
+    // admitted one is pending until this method returns: disposed last (declared first), after
+    // the name lock and after the process is registered in `processes` or the spawn failed.
+    using admission = this.admitSpawn(workspaceId);
+    if (admission === null) return { success: false, error: SPAWN_REFUSED_WHILE_SEALED_ERROR };
+
+    let processId = this.generateUniqueProcessId(config.displayName);
+    // Reserved synchronously in the same tick each candidate is chosen (see
+    // reservedProcessIds): the awaits below would otherwise let a concurrent same-name spawn
+    // allocate the same directory. Released when this spawn registers or returns — the
+    // disposer reads the current processId, which the disk loop keeps in sync. Failed
+    // non-host-record spawns keep their reservation for the app session (see below).
+    this.reservedProcessIds.add(processId);
+    let retainReservationAfterFailure = false;
+    using _reservation = {
+      [Symbol.dispose]: () => {
+        if (!retainReservationAfterFailure) {
+          this.reservedProcessIds.delete(processId);
+        }
+      },
+    };
+    // Restart-unique directories: the in-memory allocator resets with the app, so skip names
+    // whose durable directory already exists. Reusing a surviving crash orphan's directory
+    // would hand two live processes one meta.json/exit_code and blind archive gating, and
+    // reusing a settled one may clobber a record the other backend still tracks (see
+    // recordDirIsFree). Host-local records are probed on the local filesystem; all other
+    // layouts (SSH/Coder, Docker, devcontainer) live in the runtime's exec namespace and are
+    // claimed through the runtime with an atomic mkdir instead (claimRuntimeSpawnDir).
+    // Cross-process claim (#4873): two backends on one XUM_ROOT (desktop + `xum server`) have
+    // separate in-memory reservations but share the host records root, so both could probe a
+    // name as free and spawn into one directory. Host-local spawns therefore hold a
+    // per-workspace host file lock from the probe below until meta.json records the new
+    // process as running (end of this method), after which every other backend's probe reads
+    // the name as held. Holding it across the whole spawn adds no pre-spawn on-disk state, and
+    // spawnProcess's own failure cleanup runs while no one else can claim the name.
+    let claimLock: AsyncDisposable | null = null;
+    if (spawnRecordsAreHostLocal(runtime)) {
+      try {
+        claimLock = await acquireProcessFileLock({
+          lockPath: nodePath.join(localBgWorkspaceDir(workspaceId), SPAWN_NAME_LOCK_FILENAME),
+          timeoutMs: SPAWN_NAME_LOCK_TIMEOUT_MS,
+          label: "background spawn lock",
+        });
+      } catch (error) {
+        return {
+          success: false,
+          error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
+        };
+      }
+    }
+    await using _claimLock = claimLock;
+    if (spawnRecordsAreHostLocal(runtime)) {
+      let suffix = 2;
+      try {
+        while (
+          !(await recordDirIsFree(nodePath.join(localBgWorkspaceDir(workspaceId), processId)))
+        ) {
+          this.reservedProcessIds.delete(processId);
+          do {
+            processId = `${config.displayName} (${suffix})`;
+            suffix++;
+          } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+          this.reservedProcessIds.add(processId);
+        }
+      } catch (error) {
+        // Unprobeable records root: nothing was written under this name, so the reservation
+        // is safe to release.
+        return {
+          success: false,
+          error: `Failed to reserve background process name: ${getErrorMessage(error)}`,
+        };
+      }
+    } else {
+      let suffix = 2;
+      for (;;) {
+        // One exec tries a batch of candidates (#5485). Every candidate is reserved before the
+        // await, like processId itself, so a concurrent same-name spawn in this backend never
+        // targets one of them and never releases a name this spawn claimed.
+        const candidates = [processId];
+        while (candidates.length < RUNTIME_SPAWN_NAME_CLAIM_BATCH) {
+          let candidate: string;
+          do {
+            candidate = `${config.displayName} (${suffix})`;
+            suffix++;
+          } while (this.processes.has(candidate) || this.reservedProcessIds.has(candidate));
+          this.reservedProcessIds.add(candidate);
+          candidates.push(candidate);
+        }
+        const claim = await this.claimRuntimeSpawnDir(runtime, workspaceId, candidates);
+        // Keep only the claimed name reserved (processId on error: the disposer releases it).
+        const kept = typeof claim === "number" ? candidates[claim] : processId;
+        for (const candidate of candidates) {
+          if (candidate !== kept) this.reservedProcessIds.delete(candidate);
+        }
+        if (typeof claim === "number") {
+          processId = kept;
+          break;
+        }
+        if (claim !== "held") {
+          // Unreachable/garbled reply: abort rather than loop forever against a dead host.
+          // Releasing the reservations is safe even if a mkdir landed before the reply was
+          // lost: a same-session retry then finds the directory and takes a suffix.
+          return { success: false, error: claim.error };
+        }
+        this.reservedProcessIds.delete(processId);
+        do {
+          processId = `${config.displayName} (${suffix})`;
+          suffix++;
+        } while (this.processes.has(processId) || this.reservedProcessIds.has(processId));
+        this.reservedProcessIds.add(processId);
+      }
+    }
+
+    // B2: a cleanup that sealed the workspace while this spawn waited for its name is waiting
+    // for it; refuse rather than start a child that cleanup would only have to stop.
+    if (this.admissionSeals.has(workspaceId)) {
+      // A non-host claim already created the (empty) record directory: drop it so it neither
+      // holds the name nor fails the remote crash-orphan probe closed for the archive or
+      // removal that sealed the workspace.
+      if (!spawnRecordsAreHostLocal(runtime)) {
+        await this.releaseRuntimeSpawnDir(runtime, workspaceId, processId);
+      }
+      return { success: false, error: SPAWN_REFUSED_WHILE_SEALED_ERROR };
+    }
 
     // Spawn via executor with background infrastructure
     // spawnProcess uses runtime.tempDir() internally for output directory
@@ -747,15 +2406,26 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       workspaceId,
       processId,
       env: config.env,
+      pathEnv: config.pathEnv,
+      recordDirClaimed: !spawnRecordsAreHostLocal(runtime),
     });
 
     if (!result.success) {
       log.debug(`BackgroundProcessManager: Failed to spawn: ${result.error}`);
+      // Non-host record layouts: a failed spawn may leave the record directory holding a
+      // live detached process (preserved ambiguous PID echo, post-dispatch transport throw,
+      // or a failed best-effort cleanup), and the local disk probe above cannot see those
+      // layouts for a same-session retry. Retain the name reservation for this app session
+      // so a retry of the same display name allocates a fresh directory instead of
+      // truncating the survivor's output and sharing its exit marker (fail closed — the
+      // only cost is a suffixed name).
+      retainReservationAfterFailure = !spawnRecordsAreHostLocal(runtime);
       return { success: false, error: result.error };
     }
 
     const { handle, pid, outputDir } = result;
-    const startTime = Date.now();
+    // Process start time: stored in meta.json, shown and compared with wake origins (#7282).
+    const startTime = nodeClock.nowMs();
 
     // Write meta.json with process info
     const meta: BackgroundProcessMeta = {
@@ -766,7 +2436,25 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       status: "running",
       displayName: config.displayName,
     };
-    await handle.writeMeta(JSON.stringify(meta, null, 2));
+    try {
+      await handle.writeMeta(JSON.stringify(meta, null, 2));
+    } catch (error) {
+      // The durable spawn record is what lets crash-orphan archive gating see this process
+      // after an unclean restart — a process that cannot be recorded must not run (fail
+      // closed). terminate() also writes the exit_code marker, so even this directory reads
+      // as exited to the unreadable-record probe; if termination fails too, the markerless
+      // directory keeps failing that probe closed.
+      await handle.terminate();
+      await handle.dispose();
+      // Same retention rationale as the spawn-failure path above: if the termination also
+      // failed (e.g. the same transport fault that broke writeMeta), a non-host record
+      // directory may still hold the live process.
+      retainReservationAfterFailure = !spawnRecordsAreHostLocal(runtime);
+      return {
+        success: false,
+        error: `Failed to persist the spawn record (meta.json): ${getErrorMessage(error)}`,
+      };
+    }
 
     const proc: BackgroundProcess = {
       id: processId,
@@ -781,6 +2469,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       isForeground: config.isForeground ?? false,
       outputBytesRead: 0,
       shownThroughOffset: 0,
+      terminalStatusShownToAgent: false,
       outputLock: new AsyncMutex(),
       getOutputCallCount: 0,
       incompleteLineBuffer: "",
@@ -790,24 +2479,28 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     this.processes.set(processId, proc);
 
     if (config.monitor && !proc.isForeground) {
-      const pollIntervalMs =
-        runtime instanceof LocalBaseRuntime
-          ? MONITOR_POLL_INTERVAL_MS_LOCAL
-          : MONITOR_POLL_INTERVAL_MS_REMOTE;
-      proc.monitor = this.createMonitorState(config.monitor, { pollIntervalMs });
-      this.startMonitorTail(proc);
-      // spawn() is the only place monitors are ever armed (registerMigratedProcess never
-      // sets one), so this single emit keeps the persisted armed-monitor registry complete.
-      this.emit("monitor:armed", workspaceId, {
+      // The fast tick is only affordable when the handle probes host-local record files with
+      // fs (see spawnProcess); devcontainer records need a docker exec per probe, so they
+      // poll at the remote cadence like SSH.
+      const pollIntervalMs = spawnRecordsAreHostLocal(runtime)
+        ? MONITOR_POLL_INTERVAL_MS_LOCAL
+        : MONITOR_POLL_INTERVAL_MS_REMOTE;
+      const armMetadata: MonitorArmedPayload = {
         processId,
         taskId: `bash:${processId}`,
         workspaceId,
         displayName: config.displayName,
-        filter: proc.monitor.filter,
-        filterExclude: proc.monitor.exclude,
+        filter: config.monitor.filter,
+        filterExclude: config.monitor.exclude,
         script,
-        createdAt: new Date().toISOString(),
-      });
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        createdAt: new Date(nodeClock.nowMs()).toISOString(),
+      };
+      proc.monitor = this.createMonitorState(config.monitor, { pollIntervalMs, armMetadata });
+      this.startMonitorTail(proc);
+      // spawn() is the only place monitors are ever armed (registerMigratedProcess never
+      // sets one), so this single emit keeps the persisted armed-monitor registry complete.
+      this.emit("monitor:armed", workspaceId, armMetadata);
     }
 
     log.debug(
@@ -817,7 +2510,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // Schedule auto-termination for background processes with timeout
     const timeoutSecs = config.timeoutSecs;
     if (!config.isForeground && timeoutSecs !== undefined && timeoutSecs > 0) {
-      setTimeout(() => {
+      this.hostClock.setTimer(() => {
         void this.terminate(processId, { monitorDisposition: "flush" }).then((result) => {
           if (result.success) {
             log.debug(`Process ${processId} auto-terminated after ${timeoutSecs}s timeout`);
@@ -898,7 +2591,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     outputDir: string,
     displayName?: string
   ): void {
-    const startTime = Date.now();
+    // Process start time: stored in meta.json, shown and compared with wake origins (#7282).
+    const startTime = nodeClock.nowMs();
 
     const proc: BackgroundProcess = {
       id: processId,
@@ -913,6 +2607,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       isForeground: false, // Now in background
       outputBytesRead: 0,
       shownThroughOffset: 0,
+      terminalStatusShownToAgent: false,
       outputLock: new AsyncMutex(),
       getOutputCallCount: 0,
       incompleteLineBuffer: "",
@@ -994,6 +2689,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     await proc.handle.writeMeta(metaJson);
   }
 
+  /** Return the in-memory process without probing its runtime handle. */
+  peekProcess(processId: string): BackgroundProcess | null {
+    return this.processes.get(processId) ?? null;
+  }
+
   /**
    * Get a background process by ID.
    * Refreshes status if the process is still marked as running.
@@ -1010,7 +2710,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         log.debug(`Background process ${proc.id} has exited`);
         proc.status = "exited";
         proc.exitCode = exitCode;
-        proc.exitTime = Date.now();
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        proc.exitTime = nodeClock.nowMs();
         await this.updateMetaFile(proc).catch((err: unknown) => {
           log.debug(
             `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -1061,17 +2762,135 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * `originNotAfterMs` binds the answer to the process instance that produced the wake. Process IDs
    * are reclaimed across restarts, so a newer instance must not suppress an older instance's wake.
    */
-  async getMonitorWakeDeliveryState(
+  pullMonitorWakeSignals(ownerWorkspaceId: string): readonly BashMonitorProcessSnapshot[] {
+    const snapshots: BashMonitorProcessSnapshot[] = [];
+    for (const proc of this.processes.values()) {
+      const monitor = proc.monitor;
+      if (proc.workspaceId !== ownerWorkspaceId || monitor == null) continue;
+      const match =
+        monitor.retainedMatches.length === 0
+          ? undefined
+          : {
+              batches: monitor.retainedMatches.map((batch) => ({
+                throughOffset: batch.matchedThroughOffset,
+                lines: [...batch.lines],
+                totalMatches: batch.totalMatches,
+                droppedLines: batch.droppedLines,
+              })),
+              throughOffset:
+                monitor.retainedMatches[monitor.retainedMatches.length - 1].matchedThroughOffset,
+              lines: monitor.retainedMatches.flatMap((batch) => batch.lines),
+              totalMatches:
+                monitor.retainedMatches[monitor.retainedMatches.length - 1].totalMatches,
+              droppedLines: monitor.retainedMatches.reduce(
+                (total, batch) => total + batch.droppedLines,
+                0
+              ),
+            };
+      snapshots.push({
+        processId: proc.id,
+        taskId: monitor.armMetadata.taskId,
+        ownerWorkspaceId: proc.workspaceId,
+        ...(proc.displayName !== undefined ? { displayName: proc.displayName } : {}),
+        filter: monitor.filter,
+        filterExclude: monitor.exclude,
+        script: boundBashMonitorRegistryScript(proc.script),
+        createdAt: monitor.armMetadata.createdAt,
+        ...(match != null
+          ? {
+              match: {
+                batches: match.batches,
+                throughOffset: match.throughOffset,
+                lines: [...match.lines],
+                totalMatches: match.totalMatches,
+                ...(match.droppedLines > 0 ? { droppedLines: match.droppedLines } : {}),
+              },
+            }
+          : {}),
+        ...(monitor.settlementDisposition != null
+          ? {
+              terminal: {
+                status: monitor.settlementDisposition.status,
+                ...(monitor.settlementDisposition.exitCode !== undefined
+                  ? { exitCode: monitor.settlementDisposition.exitCode }
+                  : {}),
+                settledAt: monitor.settlementDisposition.settledAt,
+                wakeOnExit: monitor.settlementDisposition.wakeOnExit,
+                terminalStatusShown: monitor.settlementDisposition.terminalStatusShown,
+                ...(monitor.settlementDisposition.matchedThroughOffset != null
+                  ? { matchedThroughOffset: monitor.settlementDisposition.matchedThroughOffset }
+                  : {}),
+                tailLines: monitor.settlementDisposition.tailLines.map((entry) => ({ ...entry })),
+              },
+            }
+          : {}),
+        retired: monitor.stopped,
+      });
+    }
+    return snapshots;
+  }
+
+  acknowledgeMonitorWake(
+    processId: string,
+    originNotAfterMs: number,
+    matchedThroughOffset?: number,
+    terminalSettledAt?: string
+  ): void {
+    if (matchedThroughOffset != null) {
+      this.dropMonitorMatchedLineBatchesThrough(processId, originNotAfterMs, matchedThroughOffset);
+    }
+    if (terminalSettledAt != null) {
+      const proc = this.processes.get(processId);
+      if (
+        proc != null &&
+        proc.startTime <= originNotAfterMs &&
+        proc.monitor?.settlementDisposition?.settledAt === terminalSettledAt
+      ) {
+        proc.monitor.settlementDisposition = undefined;
+      }
+    }
+  }
+
+  dropRetiredMonitor(processId: string, createdAt: string): void {
+    const proc = this.processes.get(processId);
+    if (proc?.monitor?.stopped && proc.monitor.armMetadata.createdAt === createdAt) {
+      proc.monitor = undefined;
+    }
+  }
+
+  dropMonitorMatchedLineBatchesThrough(
+    processId: string,
+    originNotAfterMs: number,
+    matchedThroughOffset: number
+  ): void {
+    const proc = this.processes.get(processId);
+    if (proc == null || !(proc.startTime <= originNotAfterMs)) return;
+    const monitor = proc.monitor;
+    if (monitor == null) return;
+    monitor.retainedMatches = monitor.retainedMatches.filter(
+      (batch) => batch.matchedThroughOffset > matchedThroughOffset
+    );
+  }
+
+  getMonitorWakeDeliveryState(
     processId: string,
     originNotAfterMs?: number
   ): Promise<MonitorWakeDeliveryState | undefined> {
-    const proc = await this.getProcess(processId);
-    if (!proc) return undefined;
-    if (originNotAfterMs != null && proc.startTime > originNotAfterMs) return undefined;
-    if (proc.monitorWakeBlockingReadSettled) {
-      return { status: "blocked", readSettled: proc.monitorWakeBlockingReadSettled };
+    const proc = this.processes.get(processId);
+    if (proc == null || (originNotAfterMs != null && !(proc.startTime <= originNotAfterMs))) {
+      return Promise.resolve(undefined);
     }
-    return { status: "settled", shownThroughOffset: proc.shownThroughOffset };
+    if (proc.monitorWakeBlockingReadSettled) {
+      return Promise.resolve({
+        status: "blocked",
+        readSettled: proc.monitorWakeBlockingReadSettled,
+      });
+    }
+    return Promise.resolve({
+      status: "settled",
+      shownThroughOffset: proc.shownThroughOffset,
+      terminalStatusShown: proc.terminalStatusShownToAgent,
+    });
   }
 
   /**
@@ -1098,8 +2917,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * @param filterExclude When true, invert filter to exclude matching lines instead of keeping them
    * @param timeout Seconds to wait for output if none available (default 0 = non-blocking)
    * @param abortSignal Optional signal to abort waiting early (e.g., when stream is cancelled)
-   * @param workspaceId Optional workspace ID to check for queued messages (return early to process them)
+   * @param workspaceId Optional caller workspace ID for output-consumption attribution
    * @param noteToolName Optional tool name to use in polling guidance notes
+   * @param hasQueuedMessages Live caller queue decision; returning true interrupts only this wait
    */
   async getOutput(
     processId: string,
@@ -1108,7 +2928,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     timeout?: number,
     abortSignal?: AbortSignal,
     workspaceId?: string,
-    noteToolName?: string
+    noteToolName?: string,
+    hasQueuedMessages?: (dispatchMode?: "tool-end" | "turn-end") => boolean
   ): Promise<
     | {
         success: true;
@@ -1145,8 +2966,11 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // await to settle, then remains deliverable if its matched output was filtered out.
     using _readTracker = this.trackMonitorWakeBlockingRead(proc, filter, noteToolName);
 
-    // Track call count for polling detection
-    proc.getOutputCallCount++;
+    // Track call count for polling detection. Reading what a capped read left unread is paging,
+    // not polling, so it does not count.
+    if (proc.lastReadCapped !== true && !proc.incompleteLineBuffer.includes("\n")) {
+      proc.getOutputCallCount++;
+    }
     const callCount = proc.getOutputCallCount;
 
     log.debug(
@@ -1162,162 +2986,73 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         return { success: false, error: `Invalid filter regex: ${getErrorMessage(e)}` };
       }
     }
+    const keepLine = (line: string) =>
+      !filterRegex || filterRegex.test(line) !== (filterExclude === true);
+    // A split line's stored decision holds only under the filter that made it: an unfiltered
+    // read after a filtered one must not skip the tail of a line that filter dropped.
+    const lineFilter = filterKey(filter, filterExclude);
+    if (proc.unreadLineFilter !== lineFilter) proc.unreadLineDecision = undefined;
+    proc.unreadLineFilter = lineFilter;
 
-    // Apply filtering to complete lines only
-    // Incomplete line fragments (no trailing newline) are kept in buffer for next read
-    const applyFilter = (lines: string[]): string => {
-      if (!filterRegex) return lines.join("\n");
-      const filtered = filterExclude
-        ? lines.filter((line) => !filterRegex.test(line))
-        : lines.filter((line) => filterRegex.test(line));
-      return filtered.join("\n");
-    };
-
-    // Blocking wait loop: poll for output up to timeout seconds
-    const startTime = Date.now();
-    const timeoutMs = timeoutSecs * 1000;
-    const pollIntervalMs = 100;
-    let accumulatedRaw = "";
-    let currentStatus = proc.status;
-
-    // Track the previous buffer to prepend to accumulated output
-    const previousBuffer = proc.incompleteLineBuffer;
+    const startTime = this.hostClock.nowMs();
     // File offset where this read's processable content begins (start cursor minus the buffered
-    // fragment that cursor already advanced past). Used below to detect a gap left by a prior
+    // output that cursor already advanced past). Used below to detect a gap left by a prior
     // filtered read so the shown-frontier never jumps over lines this read never showed.
-    const readStartOffset = proc.outputBytesRead;
-
-    while (true) {
-      // Read new content via the handle (works for both local and SSH runtimes)
-      // Output is already unified in output.log (stdout + stderr via 2>&1)
-      const result = await proc.handle.readOutput(proc.outputBytesRead);
-      accumulatedRaw += result.content;
-
-      // Update read position
-      proc.outputBytesRead = result.newOffset;
-
-      // Refresh process status
-      const refreshedProc = await this.getProcess(processId);
-      currentStatus = refreshedProc?.status ?? proc.status;
-
-      // Line-buffered filtering: prepend incomplete line from previous call
-      const rawWithBuffer = previousBuffer + accumulatedRaw;
-      const allLines = rawWithBuffer.split("\n");
-
-      // Drop the last element: it's either empty (content ended with "\n") or the incomplete
-      // trailing fragment, which is buffered for the next read -- so it's never a complete line.
-      const completeLines = allLines.slice(0, -1);
-
-      // When using filter_exclude, check if we have meaningful (non-excluded) output.
-      // We only consider complete lines as "meaningful" here; fragments are buffered for the next read.
-      const filteredOutput = applyFilter(completeLines);
-      const hasMeaningfulOutput = filterExclude
-        ? filteredOutput.trim().length > 0
-        : completeLines.length > 0;
-
-      // Return immediately if:
-      // 1. We have meaningful output (after filtering if filter_exclude is set)
-      // 2. Timeout elapsed
-      // 3. Abort signal received (user sent a new message)
-      if (hasMeaningfulOutput) {
-        break;
-      }
-
-      // If the process is no longer running (exited/killed/failed), do one last read
-      // to avoid dropping output that arrives between our readOutput() call and
-      // the status refresh.
-      if (currentStatus !== "running") {
-        while (true) {
-          const finalRead = await proc.handle.readOutput(proc.outputBytesRead);
-          if (finalRead.content.length === 0) {
-            break;
-          }
-
-          // Defensive: avoid infinite loops if a handle returns inconsistent offsets.
-          if (finalRead.newOffset <= proc.outputBytesRead) {
-            break;
-          }
-
-          accumulatedRaw += finalRead.content;
-          proc.outputBytesRead = finalRead.newOffset;
-        }
-
-        break;
-      }
-
-      if (abortSignal?.aborted || (workspaceId && this.hasQueuedMessage(workspaceId))) {
-        // We already advanced outputBytesRead while reading this iteration, so any bytes consumed
-        // so far live only in accumulatedRaw. The interrupted path returns without flushing them,
-        // so preserve them in the line buffer; otherwise the next getOutput() would resume past
-        // this content and silently drop it. This matters now that task_await aborts a still-
-        // pending bash read once min_completed is satisfied (not just on user interrupt).
-        proc.incompleteLineBuffer = previousBuffer + accumulatedRaw;
-        const elapsed_ms = Date.now() - startTime;
-        return {
-          success: true,
-          status: "interrupted",
-          output: "(waiting interrupted)",
-          elapsed_ms,
-        };
-      }
-
-      const elapsed = Date.now() - startTime;
-      if (elapsed >= timeoutMs) {
-        break;
-      }
-
-      // Sleep before next poll
-      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    const shownRegionStart =
+      proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
+    const window = await this.readOutputWindow(proc, {
+      keepLine,
+      filtered: filterRegex != null,
+      filterExclude: filterExclude === true,
+      timeoutMs: timeoutSecs * 1000,
+      abortSignal,
+      hasQueuedMessages,
+    });
+    if (window == null) {
+      return {
+        success: true,
+        status: "interrupted",
+        output: "(waiting interrupted)",
+        elapsed_ms: this.hostClock.nowMs() - startTime,
+      };
     }
+    const currentStatus = window.status;
 
-    // Final line processing with buffer from previous call
-
-    // If the process exited, do a final drain of output.
-    //
-    // Rationale: stdout/stderr writes can land just after we observe that the process
-    // has exited. Without a final drain, we can return "exited" with empty output
-    // even though output becomes available moments later.
-    if (currentStatus !== "running") {
-      const offsetBeforeDrain = proc.outputBytesRead;
-
-      while (true) {
-        const extra = await proc.handle.readOutput(proc.outputBytesRead);
-        if (extra.content.length === 0) {
-          break;
-        }
-        accumulatedRaw += extra.content;
-        proc.outputBytesRead = extra.newOffset;
-      }
-
-      // If we didn't observe any new output, wait one poll interval and try once more.
-      if (proc.outputBytesRead === offsetBeforeDrain) {
-        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
-
-        while (true) {
-          const extra = await proc.handle.readOutput(proc.outputBytesRead);
-          if (extra.content.length === 0) {
-            break;
-          }
-          accumulatedRaw += extra.content;
-          proc.outputBytesRead = extra.newOffset;
-        }
-      }
-    }
-    const rawWithBuffer = previousBuffer + accumulatedRaw;
-    const allLines = rawWithBuffer.split("\n");
-    const hasTrailingNewline = rawWithBuffer.endsWith("\n");
-
-    // On process exit, include incomplete line; otherwise keep it buffered
-    const linesToReturn =
-      currentStatus !== "running"
-        ? allLines.filter((l) => l.length > 0) // Include all non-empty lines on exit
-        : allLines.slice(0, -1); // While running, drop the trailing fragment (buffered for next read)
-
-    // Update buffer for next call (clear on exit, keep incomplete line otherwise)
-    proc.incompleteLineBuffer =
-      currentStatus === "running" && !hasTrailingNewline ? allLines[allLines.length - 1] : "";
-
+    // On exit at the end of the file, include the incomplete line; otherwise keep it buffered.
+    // The page also leaves everything past the per-read cap buffered for the next call.
+    const page = takeBackgroundOutputPage(
+      window.pending,
+      currentStatus !== "running",
+      window.reachedEnd,
+      window.decision,
+      keepLine
+    );
+    // Capped too when output.log goes on past the window.
+    const capped = page.capped || !window.reachedEnd;
+    proc.incompleteLineBuffer = page.unread;
+    proc.unreadLineDecision = page.unreadLineDecision;
+    proc.lastReadCapped = capped;
+    // What stays in memory plus what output.log holds past the cursor.
+    const unreadBytes =
+      Buffer.byteLength(page.unread, "utf8") + Math.max(window.fileSize - proc.outputBytesRead, 0);
     const shownThroughOffsetBeforeRead = proc.shownThroughOffset;
+    const terminalStatusShownBeforeRead = proc.terminalStatusShownToAgent;
+
+    // Wake suppression must track what the OWNER workspace's agent saw: task_await lets an
+    // ancestor workspace read a descendant agent's bash task, and marking the frontier or
+    // terminal status shown on such a cross-workspace read would suppress the owner's wake even
+    // though the owning agent never saw the report (it would stay idle instead of resuming).
+    // A missing workspaceId (internal/test callers; both model-visible tools pass one) counts as
+    // the owner: over-marking there can only suppress, so default to the historical behavior.
+    const consumerIsOwner = workspaceId == null || workspaceId === proc.workspaceId;
+
+    // A read that reports a terminal status has shown the settlement to the agent — filtered or
+    // not (status/exitCode are never filtered out of tool results, and the exit drain above
+    // returned all remaining output). getOutput's only callers are model-visible (task_await and
+    // bash_output); UI previews go through peekOutput/list, which never mark.
+    if (currentStatus !== "running" && consumerIsOwner) {
+      proc.terminalStatusShownToAgent = true;
+    }
 
     // Advance the monitor's "shown through" mark only on unfiltered reads. A filtered read may have
     // dropped matched lines, so it must not count as having shown them. End-of-last-complete-line =
@@ -1330,67 +3065,106 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // and those skipped lines were never shown to the agent. Advancing across that gap would let a
     // wake for filtered-out output be wrongly suppressed, so only advance when this read's content
     // is contiguous with the frontier. A gap pins the frontier low (safe: it can only over-wake).
-    if (!filter) {
-      const shownRegionStart = readStartOffset - Buffer.byteLength(previousBuffer, "utf8");
-      if (shownRegionStart <= proc.shownThroughOffset) {
-        const shownThrough =
-          proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
-        proc.shownThroughOffset = Math.max(proc.shownThroughOffset, shownThrough);
-      }
+    if (!filter && consumerIsOwner && shownRegionStart <= proc.shownThroughOffset) {
+      const shownThrough =
+        proc.outputBytesRead - Buffer.byteLength(proc.incompleteLineBuffer, "utf8");
+      proc.shownThroughOffset = Math.max(proc.shownThroughOffset, shownThrough);
     }
 
     log.debug(
-      `BackgroundProcessManager.getOutput: read rawLen=${accumulatedRaw.length}, completeLines=${linesToReturn.length}`
+      `BackgroundProcessManager.getOutput: read through offset ${proc.outputBytesRead}, returnedChars=${page.output.length}, capped=${capped}`
     );
 
-    const filteredOutput = applyFilter(linesToReturn);
-
-    if (proc.shownThroughOffset > shownThroughOffsetBeforeRead) {
+    if (
+      proc.shownThroughOffset > shownThroughOffsetBeforeRead ||
+      (proc.terminalStatusShownToAgent && !terminalStatusShownBeforeRead)
+    ) {
       // A wake can queue between sequential task_await reads. Notify the workspace after each
       // frontier advance so it can retract that queued wake before the next turn accepts it.
+      // The terminal-shown transition emits too: a filtered post-exit read or a zero-output exit
+      // never advances the offset, yet must still retract a queued settlement wake.
       this.emit("output:shown", proc.workspaceId, {
         processId: proc.id,
         processStartTime: proc.startTime,
         shownThroughOffset: proc.shownThroughOffset,
+        terminalStatusShown: proc.terminalStatusShownToAgent,
       });
     }
 
-    // Suggest filter_exclude if polling too frequently on a running process
-    const shouldSuggestFilterExclude =
-      callCount >= 3 && !filterExclude && currentStatus === "running";
-
-    // Suggest better pattern if using filter_exclude but still polling frequently
-    const shouldSuggestBetterPattern =
-      callCount >= 3 && filterExclude && currentStatus === "running";
-
     const pollingToolName = noteToolName ?? "bash_output";
-
-    let note: string | undefined;
-    if (shouldSuggestFilterExclude) {
-      note =
-        `STOP POLLING. You've called ${pollingToolName} 3+ times on this process. ` +
-        "This wastes tokens and clutters the conversation. " +
-        "Instead, make ONE call with: filter='⏳|progress|waiting|\\\\\\.\\\\\\.\\\\\\.', " +
-        "filter_exclude=true, timeout_secs=120. This blocks until meaningful output arrives.";
-    } else if (shouldSuggestBetterPattern) {
-      note =
-        "You're using filter_exclude but still polling frequently. " +
-        "Your filter pattern may not be matching the actual output. " +
-        "Try a broader pattern like: filter='\\\\.|\\\\d+%|running|progress|pending|⏳|waiting'. " +
-        "Wait for the FULL timeout before checking again.";
-    }
+    // A capped read must say how to read the rest; polling advice would contradict it.
+    const note = capped
+      ? formatCappedReadNote(
+          processId,
+          unreadBytes,
+          page.unreadLineDecision === "kept",
+          pollingToolName,
+          filter,
+          filterExclude
+        )
+      : formatPollingNote(callCount, filterExclude, currentStatus === "running", pollingToolName);
 
     return {
       success: true,
       status: currentStatus,
-      output: filteredOutput,
+      output: page.output,
       exitCode:
         currentStatus !== "running"
           ? ((await this.getProcess(processId))?.exitCode ?? undefined)
           : undefined,
-      elapsed_ms: Date.now() - startTime,
-      note,
+      elapsed_ms: this.hostClock.nowMs() - startTime,
+      note: appendDecidedOnHeadNote(note, filterRegex != null, [window, page]),
     };
+  }
+
+  /**
+   * getOutput's read: what earlier reads left unread, then output.log from the cursor, in
+   * bounded handle reads (see MAX_RETAINED_UNREAD_BYTES), until there is output to return, the
+   * process ends, or the timeout elapses. Returns null when interrupted; the output read so far
+   * then stays buffered for the next call.
+   */
+  private async readOutputWindow(
+    proc: BackgroundProcess,
+    options: OutputWaitOptions
+  ): Promise<OutputWindow | null> {
+    const startTime = this.hostClock.nowMs();
+    const window: OutputWindow = {
+      pending: proc.incompleteLineBuffer,
+      decision: proc.unreadLineDecision,
+      reachedEnd: true,
+      fileSize: proc.outputBytesRead,
+      status: proc.status,
+      sawCompleteLine: false,
+      decidedOnHead: false,
+    };
+    const isInterrupted = () => this.isWaitInterrupted(options);
+
+    // Blocking wait loop: poll for output up to the timeout
+    while (true) {
+      if (!(await readOutputStep(proc, window, options, isInterrupted))) {
+        return keepInterruptedWindow(proc, window);
+      }
+      window.status = await this.refreshedStatus(proc);
+      if (!options.filtered && lineRunsOnInWindow(window)) continue;
+      if (windowHasOutputToReturn(window, options)) break;
+      if (nextWaitStep(window, this.hostClock.nowMs() - startTime, options.timeoutMs) === "stop")
+        break;
+      if (isInterrupted()) return keepInterruptedWindow(proc, window);
+      await sleepMs(this.hostClock, OUTPUT_POLL_INTERVAL_MS);
+    }
+    await drainAfterExit(proc, window, this.hostClock);
+    return window;
+  }
+
+  /** The process status, refreshed (an exit may have been recorded since `proc` was read). */
+  private async refreshedStatus(proc: BackgroundProcess): Promise<BackgroundProcess["status"]> {
+    return (await this.getProcess(proc.id))?.status ?? proc.status;
+  }
+
+  /** True when the user sent a message or the caller stopped waiting. */
+  private isWaitInterrupted(options: OutputWaitOptions): boolean {
+    if (options.abortSignal?.aborted === true) return true;
+    return options.hasQueuedMessages?.("tool-end") === true;
   }
 
   /**
@@ -1459,6 +3233,378 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     };
   }
 
+  getRestartBlockingProcessCount(durableMonitorGenerations?: ReadonlyMap<string, string>): number {
+    let count = 0;
+    for (const process of this.processes.values()) {
+      if (process.status !== "running") continue;
+      if (
+        !process.isForeground &&
+        process.monitor != null &&
+        !process.monitor.stopped &&
+        // Registry recovery cannot restore match lines awaiting flush or wake acceptance.
+        process.monitor.pendingLines.length === 0 &&
+        process.monitor.retainedMatches.length === 0 &&
+        durableMonitorGenerations?.get(process.id) === process.monitor.armMetadata.createdAt
+      ) {
+        continue;
+      }
+      count++;
+    }
+    return count;
+  }
+
+  /**
+   * Synchronous snapshot: whether any tracked background (non-foreground) process for the
+   * workspace is still marked running. Statuses refresh lazily (see list()), so a just-exited
+   * process may briefly read as running; archive admission gates treat that as fail-safe
+   * over-refusal — callers wanting fresh statuses should await list() first.
+   */
+  hasRunningBackgroundProcesses(workspaceId: string): boolean {
+    assert(workspaceId.length > 0, "hasRunningBackgroundProcesses requires workspaceId");
+    return Array.from(this.processes.values()).some(
+      (p) => !p.isForeground && p.workspaceId === workspaceId && p.status === "running"
+    );
+  }
+
+  /**
+   * Crash-orphan probe: whether a durable spawn record shows a still-running process for this
+   * workspace that this manager does not track. Processes run under nohup/setsid, so they
+   * survive an unclean app shutdown while the in-memory map resets; without this probe the
+   * archive gates would report "no background processes" after a restart and a model-driven
+   * snapshot archive could remove the checkout while the surviving process still writes to it.
+   * The spawn layout persists per-process meta.json plus an exit_code file written by the
+   * wrapper's exit trap even when the app is gone, so orphans stay detectable: a record still
+   * marked running with no exit_code file and a live PID fails the gate closed.
+   *
+   * Host filesystem only: remote (SSH/Docker) spawn records live on the remote host, and the
+   * checkout-deletion hazard this guards is limited to local managed worktrees. Devcontainer
+   * records live inside the container under `<workspace>/.xum/tmp` — host-visible through the
+   * workspace bind mount — so callers pass that root via extraRecordDirs; its PIDs are
+   * container-namespace and cannot be probed from the host, so any running record there is
+   * treated as live. A recycled PID can cause a false positive, which errs on the safe side —
+   * the model-facing caller routes to user-mediated archive.
+   */
+  async hasOrphanedRunningBackgroundProcesses(
+    workspaceId: string,
+    options?: { extraRecordDirs?: string[] }
+  ): Promise<boolean> {
+    assert(workspaceId.length > 0, "hasOrphanedRunningBackgroundProcesses requires workspaceId");
+    const candidates: Array<{
+      dir: string;
+      pidsAreHostNamespace: boolean;
+      skipTrackedNames: boolean;
+    }> = [
+      // Local spawns and (in production) migrations: the shared host root.
+      { dir: localBgWorkspaceDir(workspaceId), pidsAreHostNamespace: true, skipTrackedNames: true },
+      // This manager's own migrations (bgOutputDir is the shared root in production).
+      {
+        dir: nodePath.join(this.bgOutputDir, workspaceId),
+        pidsAreHostNamespace: true,
+        skipTrackedNames: true,
+      },
+      // Builds before the shared root migrated under os.tmpdir() (macOS /var/folders/...,
+      // TMPDIR): keep their live commands visible across an upgrade. Nothing this manager tracks
+      // lives here unless it is also one of the roots above (deduplicated below, first wins), so
+      // a tracked name must not hide another backend's same-named record.
+      {
+        dir: nodePath.join(legacyMigratedBgRecordsRoot(), workspaceId),
+        pidsAreHostNamespace: true,
+        skipTrackedNames: false,
+      },
+      ...(options?.extraRecordDirs ?? []).map((dir) => ({
+        dir,
+        pidsAreHostNamespace: false,
+        skipTrackedNames: true,
+      })),
+    ];
+    // Deduplicate by filesystem identity, not spelling: TMPDIR=/private/tmp on macOS (where
+    // /tmp -> /private/tmp) names the shared root again, and rescanning it without the tracked
+    // name skip would read this manager's own migrated command as foreign evidence.
+    const seen = new Set<string>();
+    for (const root of candidates) {
+      const identity = await fsPromises.realpath(root.dir).catch(() => nodePath.resolve(root.dir));
+      if (seen.has(identity)) continue;
+      seen.add(identity);
+      if (
+        await this.recordRootHoldsOrphan(
+          workspaceId,
+          root.dir,
+          root.pidsAreHostNamespace,
+          root.skipTrackedNames
+        )
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** One record root's scan for hasOrphanedRunningBackgroundProcesses. */
+  private async recordRootHoldsOrphan(
+    workspaceId: string,
+    workspaceDir: string,
+    pidsAreHostNamespace: boolean,
+    skipTrackedNames: boolean
+  ): Promise<boolean> {
+    let entries: Dirent[];
+    try {
+      entries = await fsPromises.readdir(workspaceDir, { withFileTypes: true });
+    } catch (error) {
+      if (isErrnoWithCode(error, "ENOENT") || isErrnoWithCode(error, "ENOTDIR")) {
+        // No spawn records under this root (never spawned there, or cleaned up).
+        return false;
+      }
+      // EACCES/EIO/...: the records exist but cannot be read, so absence of a surviving
+      // process is unprovable — fail closed (the model-facing caller routes to
+      // user-mediated archive).
+      return true;
+    }
+    const trackedPids = new Set<number>();
+    const trackedProcessIds = new Set<string>();
+    for (const proc of this.processes.values()) {
+      if (proc.workspaceId === workspaceId) {
+        trackedPids.add(proc.pid);
+        trackedProcessIds.add(proc.id);
+      }
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      // Tracked processes (directory name = process ID) are covered by the in-memory
+      // live-activity gates, whose statuses refresh via list(); this probe only reports
+      // processes nobody tracks. ID-based so migrated records (pid 0) are matched too.
+      if (skipTrackedNames && trackedProcessIds.has(entry.name)) continue;
+      const processDir = nodePath.join(workspaceDir, entry.name);
+      let meta: { pid: number; status: string } | null = null;
+      try {
+        meta = parseSpawnRecordMeta(
+          await fsPromises.readFile(nodePath.join(processDir, BG_META_FILENAME), "utf-8")
+        );
+      } catch {
+        // Missing/unreadable record: handled with the parse-failure case below.
+      }
+      if (meta == null) {
+        // A record we cannot read or parse cannot prove its process exited: spawn aborts
+        // (and terminates the process, writing the exit marker) when the initial record
+        // fails to persist, and cleanly failed spawns remove their directory — ambiguous
+        // launches (spawn succeeded but the PID echo was garbled) intentionally keep
+        // theirs — so a markerless meta-less record is a crash artifact or untracked
+        // launch whose process may still be alive. Trust only the exit marker; otherwise
+        // fail closed (the model-facing caller routes to user-mediated archive).
+        try {
+          await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
+          continue;
+        } catch {
+          return true;
+        }
+      }
+      if (meta.status !== "running") continue;
+      try {
+        await fsPromises.access(nodePath.join(processDir, BG_EXIT_CODE_FILENAME));
+        continue; // The exit marker settles the record (wrapper trap or migrated handle).
+      } catch {
+        // No exit marker yet — fall through to the PID checks.
+      }
+      if (!pidsAreHostNamespace) {
+        // Container-namespace PID (devcontainer record): nothing on the host can probe it,
+        // and a host kill(pid, 0) would answer for an unrelated host process — treat the
+        // running record as a live orphan (fail closed; over-refusal routes to
+        // user-mediated archive).
+        return true;
+      }
+      if (meta.pid <= 1) {
+        // Migrated processes record pid 0 (exec streams expose no PID) and their exit
+        // marker is written by the in-process handle, not a detached trap. The child can
+        // outlive an unclean shutdown on Unix, and nothing can probe it afterwards — fail
+        // closed rather than skip. Clean shutdowns and natural exits rewrite the record
+        // (status via updateMetaFile, or the exit marker above), so only genuine
+        // unclean-exit survivors reach this branch.
+        return true;
+      }
+      if (trackedPids.has(meta.pid)) continue;
+      try {
+        process.kill(meta.pid, 0);
+        return true; // Alive and untracked: a crash orphan.
+      } catch (error) {
+        if (!isErrnoWithCode(error, "ESRCH")) {
+          // EPERM etc.: the PID exists but is not ours to signal — treat as alive (recycled
+          // PIDs over-refuse, never under-refuse).
+          return true;
+        }
+        // ESRCH: the process is gone (e.g. SIGKILL skipped the exit trap, or a reboot).
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Counterpart of spawn()'s host-local name probe (recordDirIsFree) for runtimes whose spawn
+   * records are NOT host-local (SSH/Coder, Docker, devcontainer, multi-project — see
+   * spawnRecordsAreHostLocal): the record layout lives in the runtime's exec namespace, so the
+   * name is claimed through the runtime. No host file lock can serialise backends there, so
+   * the claim is a plain `mkdir` (no -p) of the record directory: it is atomic on the target
+   * filesystem, so of two backends spawning the same name (or one spawning after the other)
+   * exactly one creates the directory, and the other moves on to a suffixed name (#4889).
+   *
+   * An existing directory is never reused, not even a settled one with an exit marker: nothing
+   * on the runtime says which backend spawned it, another backend on this Xum root may still
+   * track it (its output/status reads would then describe the new command), and a markerless
+   * one may hold a live detached process from a previous session or a preserved ambiguous
+   * spawn. Cost: a name used before gets a suffix until its old record is removed (the
+   * host-local age-based prune needs the name lock, which remote runtimes lack, #5485).
+   *
+   * The script tries `candidates` in order and stops at the first directory it creates, so
+   * taken names cost no extra round-trips (#5485). Returns the claimed candidate's index, or
+   * "held" when every candidate exists.
+   *
+   * Marker matching is substring-based because SSH login banners can prefix stdout (the same
+   * garbling that produces ambiguous PID echoes); a reply with neither marker or a failed
+   * exec is an error so callers abort instead of looping forever against a dead host.
+   */
+  private async claimRuntimeSpawnDir(
+    runtime: Runtime,
+    workspaceId: string,
+    candidates: readonly string[]
+  ): Promise<number | "held" | { error: string }> {
+    assert(candidates.length > 0, "claimRuntimeSpawnDir requires at least one candidate");
+    const firstName = JSON.stringify(candidates[0]);
+    try {
+      const tempDir = await runtime.tempDir();
+      const workspaceDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+      // `[ -L ]` too: a dangling symlink planted at the name makes mkdir fail but `[ -e ]` false.
+      // Any other mkdir failure exits 1, so the caller aborts instead of skipping the name.
+      const script = [
+        `mkdir -p ${quotePathForShell(workspaceDir)} || exit 1`,
+        `claim() {`,
+        `  if mkdir "$1" 2>/dev/null; then echo "__MUX_SPAWN_NAME_CLAIMED__:$2:"; exit 0; fi`,
+        `  [ -e "$1" ] || [ -L "$1" ] || exit 1`,
+        `}`,
+        ...candidates.map(
+          (candidate, index) =>
+            `claim ${quotePathForShell(`${workspaceDir}/${candidate}`)} ${index}`
+        ),
+        `echo __MUX_SPAWN_NAME_HELD__`,
+      ].join("\n");
+      const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 10 });
+      if (result.exitCode === 0) {
+        const claimed = /__MUX_SPAWN_NAME_CLAIMED__:(\d+):/.exec(result.stdout);
+        if (claimed) {
+          const index = Number(claimed[1]);
+          assert(
+            Number.isInteger(index) && index >= 0 && index < candidates.length,
+            `claimRuntimeSpawnDir: claimed index ${claimed[1]} out of range`
+          );
+          return index;
+        }
+        if (result.stdout.includes("__MUX_SPAWN_NAME_HELD__")) return "held";
+      }
+      return {
+        error: `Could not claim background process name ${firstName} on the runtime (exit ${result.exitCode}): ${result.stderr || result.stdout}`,
+      };
+    } catch (error) {
+      return {
+        error: `Could not claim background process name ${firstName} on the runtime: ${getErrorMessage(error)}`,
+      };
+    }
+  }
+
+  /**
+   * Undo claimRuntimeSpawnDir for a spawn that is refused before anything ran. `rmdir` removes
+   * only an empty directory, so it cannot delete output another process wrote. Best-effort: a
+   * leftover empty directory only costs a suffixed name and fails the remote orphan probe closed.
+   */
+  private async releaseRuntimeSpawnDir(
+    runtime: Runtime,
+    workspaceId: string,
+    processId: string
+  ): Promise<void> {
+    try {
+      const tempDir = await runtime.tempDir();
+      const processDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}/${processId}`;
+      await execBuffered(runtime, `rmdir ${quotePathForShell(processDir)}`, {
+        cwd: "/tmp",
+        timeout: 10,
+      });
+    } catch (error) {
+      log.debug(`Keeping claimed background record ${processId}: ${getErrorMessage(error)}`);
+    }
+  }
+
+  /**
+   * Remote counterpart of the crash-orphan probe for SSH/Coder targets, executed through the
+   * runtime because those spawn records live on the remote host. Called before a
+   * model-driven archive stops a running Coder workspace: stopping the VM would kill any
+   * detached job that survived an unclean Xum exit. Trusts only exit markers and
+   * remote-namespace liveness — a markerless meta-less record (a preserved ambiguous or
+   * transport-failure spawn) or a running-status record whose PID is alive (or unprobeable,
+   * including recycled-PID EPERM via /proc) reports Ok(true); a garbled or failed probe
+   * reports Err so the caller fails closed. Marker matching is substring-based because SSH
+   * login banners can prefix stdout.
+   */
+  async hasUnsettledRemoteSpawnRecords(
+    runtime: Runtime,
+    workspaceId: string
+  ): Promise<Result<boolean>> {
+    assert(workspaceId.length > 0, "hasUnsettledRemoteSpawnRecords requires workspaceId");
+    try {
+      const tempDir = await runtime.tempDir();
+      const root = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
+      // One POSIX-shell pass over the per-process record dirs (see recordRootHoldsOrphan for the
+      // host-local equivalent of these rules):
+      // - exit marker present → settled; missing meta.json (or one without a "status" field,
+      //   i.e. torn/unreadable) → unsettled; non-"running" status → settled.
+      // - running status: dead PID means SIGKILL/reboot skipped the trap → settled; a live or
+      //   recycled PID (kill -0 success, or /proc entry on EPERM) → unsettled.
+      // Process IDs derive from display names, which may legally start with "." (only "." and
+      // ".." themselves are rejected), so also enumerate hidden record dirs — a bare "*/" glob
+      // would silently skip them and report CLEAR under a live dot-named job.
+      // Only a genuinely absent root proves no records: an existing root that is not a
+      // readable+searchable directory (ownership/permission change, or replaced by a file)
+      // would leave the glob unmatched and read as CLEAR while records may sit beneath it,
+      // so those cases emit UNREADABLE and fail the probe closed. `test -e` also returns
+      // false when an ancestor is unsearchable, so absence is only trusted when the parent
+      // directory itself is traversable.
+      const script = [
+        `root=${quotePathForShell(root)}`,
+        `if [ -d "$root" ]; then`,
+        `  if [ ! -r "$root" ] || [ ! -x "$root" ]; then echo __MUX_BG_REMOTE_UNREADABLE__; exit 0; fi`,
+        `elif [ -e "$root" ] || [ -L "$root" ]; then`,
+        `  echo __MUX_BG_REMOTE_UNREADABLE__; exit 0`,
+        `else`,
+        `  parent=$(dirname "$root")`,
+        `  if [ -d "$parent" ] && { [ ! -r "$parent" ] || [ ! -x "$parent" ]; }; then echo __MUX_BG_REMOTE_UNREADABLE__; exit 0; fi`,
+        `  echo __MUX_BG_REMOTE_CLEAR__; exit 0`,
+        `fi`,
+        `unsettled=0`,
+        `for p in "$root"/*/ "$root"/.*/; do`,
+        `  case "$p" in */./|*/../) continue ;; esac`,
+        `  [ -d "$p" ] || continue`,
+        `  [ -e "$p/${BG_EXIT_CODE_FILENAME}" ] && continue`,
+        `  if ! grep -q '"status"' "$p/${BG_META_FILENAME}" 2>/dev/null; then unsettled=1; break; fi`,
+        `  grep -q '"status"[[:space:]]*:[[:space:]]*"running"' "$p/${BG_META_FILENAME}" 2>/dev/null || continue`,
+        `  pid=$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' "$p/${BG_META_FILENAME}" 2>/dev/null | head -n 1)`,
+        `  if [ -z "$pid" ] || [ "$pid" -le 1 ]; then unsettled=1; break; fi`,
+        `  if kill -0 "$pid" 2>/dev/null || [ -e "/proc/$pid" ]; then unsettled=1; break; fi`,
+        `done`,
+        `if [ "$unsettled" = 1 ]; then echo __MUX_BG_REMOTE_UNSETTLED__; else echo __MUX_BG_REMOTE_CLEAR__; fi`,
+      ].join("\n");
+      const result = await execBuffered(runtime, script, { cwd: "/tmp", timeout: 15 });
+      if (result.exitCode === 0) {
+        if (result.stdout.includes("__MUX_BG_REMOTE_UNREADABLE__")) {
+          return Err(
+            `remote spawn-record root ${root} exists but is not a readable directory; cannot verify background jobs are settled`
+          );
+        }
+        if (result.stdout.includes("__MUX_BG_REMOTE_UNSETTLED__")) return Ok(true);
+        if (result.stdout.includes("__MUX_BG_REMOTE_CLEAR__")) return Ok(false);
+      }
+      return Err(
+        `remote spawn-record probe failed (exit ${result.exitCode}): ${result.stderr || result.stdout}`
+      );
+    } catch (error) {
+      return Err(`remote spawn-record probe failed: ${getErrorMessage(error)}`);
+    }
+  }
+
   /**
    * List background processes (not including foreground ones being waited on).
    * Optionally filtered by workspace.
@@ -1489,7 +3635,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         log.debug(`Background process ${proc.id} has exited`);
         proc.status = "exited";
         proc.exitCode = exitCode;
-        proc.exitTime = Date.now();
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        proc.exitTime = nodeClock.nowMs();
         await this.updateMetaFile(proc).catch((err: unknown) => {
           log.debug(
             `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -1505,10 +3652,10 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    */
   async terminate(
     processId: string,
-    options?: { monitorDisposition?: "discard" | "flush" }
+    options: { monitorDisposition: "discard" | "flush" }
   ): Promise<{ success: true } | { success: false; error: string }> {
     log.debug(`BackgroundProcessManager.terminate(${processId}) called`);
-    const shouldFlushMonitor = options?.monitorDisposition === "flush";
+    const shouldFlushMonitor = options.monitorDisposition === "flush";
 
     // Get process from Map
     const proc = this.processes.get(processId);
@@ -1519,7 +3666,17 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // If already terminated, return success (idempotent) after resolving any pending monitor flush.
     if (proc.status === "exited" || proc.status === "killed" || proc.status === "failed") {
       if (shouldFlushMonitor) {
-        this.stopMonitor(proc, true);
+        const reservation = this.claimMonitorSettlement(proc);
+        if (reservation) {
+          await this.emitClaimedMonitorSettlement(reservation, {
+            status: proc.status,
+            ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
+          });
+        } else if (!proc.monitor?.settled) {
+          // Shutdown or already-stopped monitor: legacy flush (no-op when stopped). A held claim
+          // instead means the tail loop (or a concurrent terminate) owns the settlement emit.
+          this.stopMonitor(proc, true);
+        }
       } else {
         this.cancelMonitor(proc);
       }
@@ -1527,26 +3684,46 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       return { success: true };
     }
 
-    try {
-      if (shouldFlushMonitor) {
-        this.stopMonitor(proc, true);
-      } else {
-        this.cancelMonitor(proc);
-      }
+    // Claim settlement synchronously BEFORE the kill so the tail loop cannot settle concurrently
+    // and the kill's terminal payload is deterministic. Discard-mode termination (task_stop,
+    // workspace cleanup) is an explicit cancellation: it must never produce a settlement wake.
+    const reservation = shouldFlushMonitor ? this.claimMonitorSettlement(proc) : null;
+    if (!shouldFlushMonitor) {
+      this.cancelMonitor(proc);
+    } else if (!reservation && !proc.monitor?.settled) {
+      // Shutdown suppressed the claim: keep the legacy pre-kill flush (registry survives for the
+      // restart monitor-lost notice).
+      this.stopMonitor(proc, true);
+    }
 
+    try {
       await proc.handle.terminate();
 
       // Update process status and exit code
       proc.status = "killed";
       proc.exitCode = (await proc.handle.getExitCode()) ?? undefined;
-      proc.exitTime ??= Date.now();
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      proc.exitTime ??= nodeClock.nowMs();
 
       // Update meta.json
       await this.updateMetaFile(proc).catch((err: unknown) => {
         log.debug(`BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`);
       });
 
-      // Dispose of the handle
+      // Settle before dispose: the settlement helper still reads output.log through the handle.
+      // The "killed" disposition mirrors proc.status, which terminate() force-sets on the same
+      // best-effort semantics task_await/bash_output have always reported (runtime handles
+      // swallow transport/kill failures). The wake's own claims stay accurate either way: the
+      // monitor IS stopped (no further wakes) and Xum's bookkeeping considers the task killed.
+      // Verifying that a remote kill actually landed belongs to the RuntimeBackgroundHandle
+      // layer, where any improvement flows into every status surface at once.
+      if (reservation) {
+        await this.emitClaimedMonitorSettlement(reservation, {
+          status: "killed",
+          ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
+        });
+      }
+
       await proc.handle.dispose();
 
       log.debug(`Process ${processId} terminated successfully`);
@@ -1557,11 +3734,19 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       log.debug(`Error terminating process ${processId}: ${errorMessage}`);
       // Mark as killed even if there was an error (process likely already dead)
       proc.status = "killed";
-      proc.exitTime ??= Date.now();
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      proc.exitTime ??= nodeClock.nowMs();
       // Update meta.json
       await this.updateMetaFile(proc).catch((err: unknown) => {
         log.debug(`BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`);
       });
+      // The force-marked kill still settles: the claimed reservation owns the only wake emit.
+      if (reservation) {
+        await this.emitClaimedMonitorSettlement(reservation, {
+          status: "killed",
+          ...(proc.exitCode !== undefined ? { exitCode: proc.exitCode } : {}),
+        });
+      }
       // Ensure handle is cleaned up even on error
       await proc.handle.dispose();
       this.emitChange(proc.workspaceId);
@@ -1591,14 +3776,37 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * Terminates running processes and removes from memory.
    * Output directories are left on disk (cleaned by OS for /tmp, or on workspace deletion for local).
    */
-  async cleanup(workspaceId: string): Promise<void> {
+  async cleanup(
+    workspaceId: string,
+    options?: {
+      /**
+       * Archive and removal (they delete the checkout afterwards): throw instead of waiting
+       * longer than PENDING_ADMISSION_DRAIN_TIMEOUT_MS for pending spawns and migrations
+       * (#5477). Session disposal keeps waiting: it lifts the seal on return, so a spawn it gave
+       * up on could register afterwards with no cleanup left to stop it.
+       */
+      failClosedAfterDrainTimeout?: boolean;
+    }
+  ): Promise<void> {
     log.debug(`BackgroundProcessManager.cleanup(${workspaceId}) called`);
+    const drainDeadline =
+      options?.failClosedAfterDrainTimeout === true
+        ? this.hostClock.nowMs() + PENDING_ADMISSION_DRAIN_TIMEOUT_MS
+        : null;
+    // #4967, B2: no migration or spawn may begin while cleanup runs; a migration that tries is
+    // refused and its command terminated, a spawn is refused. The seal lifts when cleanup
+    // returns, so session disposal leaves the workspace able to background commands again; a
+    // removal or archive holds its own seal until it settles.
+    using _seal = this.sealAdmissions(workspaceId);
+    // A migrating command registers in `processes` once its migration settles (#4805), an
+    // admitted spawn once its child runs (B2).
+    await this.drainPendingAdmissions(workspaceId, drainDeadline);
     const matching = Array.from(this.processes.values()).filter(
       (p) => p.workspaceId === workspaceId
     );
 
     // Terminate all running processes
-    await Promise.all(matching.map((p) => this.terminate(p.id)));
+    await Promise.all(matching.map((p) => this.terminate(p.id, { monitorDisposition: "discard" })));
 
     // Remove from memory (output dirs left on disk for OS/workspace cleanup)
     // All per-process state (outputBytesRead, outputLock) is stored in the
@@ -1606,6 +3814,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     for (const p of matching) {
       this.processes.delete(p.id);
     }
+    // Commands refused by the seal meanwhile are still stopping; wait for them too.
+    await this.drainPendingAdmissions(workspaceId, drainDeadline);
 
     log.debug(`Cleaned up ${matching.length} process(es) for workspace ${workspaceId}`);
   }

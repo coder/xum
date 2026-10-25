@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { Effect } from "effect";
 
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -7,7 +8,10 @@ import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-
 
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { createMuxMessage } from "@/common/types/message";
-import type { MemoryConsolidationStatusChangeEventPayload } from "@/common/orpc/schemas/memory";
+import type {
+  MemoryConsolidationStatusChangeEventPayload,
+  MemoryHarvestRecordPayload,
+} from "@/common/orpc/schemas/memory";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import {
@@ -17,15 +21,23 @@ import {
 import { Ok } from "@/common/types/result";
 import { Config } from "@/node/config";
 import {
+  HARVEST_MAX_ATTEMPTS,
   MemoryConsolidationService,
   resolveDreamAgentBody,
   resolveDreamModelString,
+  resolveHeadlessAgentModelString,
+  resolveHeadlessAgentSettings,
+  resolveHeadlessAgentBody,
+  resolveHeadlessAgentDefinition,
 } from "./memoryConsolidationService";
 import { memoryLogicalKey, MemoryMetaService } from "./memoryMeta";
 import { HistoryService } from "./historyService";
 import { MemoryService } from "./memoryService";
 import { SessionUsageService } from "./sessionUsageService";
 import { TestTempDir } from "./tools/testHelpers";
+import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /**
  * Behavior under test: the orchestration rails around the runner —
@@ -188,7 +200,7 @@ function projectMutationModel(): MockLanguageModelV3 {
 }
 
 interface Fixture extends Disposable {
-  muxHome: string;
+  xumHome: string;
   config: Config;
   service: MemoryConsolidationService;
   historyService: HistoryService;
@@ -199,7 +211,10 @@ interface Fixture extends Disposable {
   setEnabled: (enabled: boolean) => void;
   /** When true, scripted runs emit a fatal stream error instead of finishing. */
   setStreamFailing: (failing: boolean) => void;
-  addWorkspace: (id: string, opts?: { archivedAt?: string }) => Promise<void>;
+  addWorkspace: (
+    id: string,
+    opts?: { archivedAt?: string; parentWorkspaceId?: string }
+  ) => Promise<void>;
   addMultiProjectWorkspace: (id: string, opts?: { bucket?: string }) => Promise<void>;
 }
 
@@ -211,10 +226,10 @@ async function createFixture(options?: {
   withSessionUsage?: boolean;
 }): Promise<Fixture> {
   const tempDir = new TestTempDir("test-memory-consolidation-service");
-  const muxHome = path.join(tempDir.path, "mux-home");
-  await fsPromises.mkdir(path.join(muxHome, "memory"), { recursive: true });
+  const xumHome = path.join(tempDir.path, "mux-home");
+  await fsPromises.mkdir(path.join(xumHome, "memory"), { recursive: true });
 
-  const config = new Config(muxHome);
+  const config = new Config(xumHome);
   // Register a workspace so config.findWorkspace resolves it.
   await config.editConfig((cfg) => {
     cfg.projects.set("/projects/demo", {
@@ -224,7 +239,7 @@ async function createFixture(options?: {
   });
 
   const historyService = new HistoryService(config);
-  const metaService = new MemoryMetaService(muxHome);
+  const metaService = new MemoryMetaService(xumHome);
   const memoryService = new MemoryService(config, metaService);
 
   let enabled = true;
@@ -257,7 +272,7 @@ async function createFixture(options?: {
   );
 
   return {
-    muxHome,
+    xumHome,
     config,
     service,
     historyService,
@@ -278,6 +293,7 @@ async function createFixture(options?: {
           name: id,
           path: `/projects/demo/${id}`,
           archivedAt: opts?.archivedAt,
+          parentWorkspaceId: opts?.parentWorkspaceId,
         });
         return cfg;
       });
@@ -341,6 +357,174 @@ async function seedCompactionEpoch(
 }
 
 describe("MemoryConsolidationService", () => {
+  it("teardown blocks follow-on consolidation runs (r61)", async () => {
+    // The one-shot abort loop cannot reach runs registered after it (the
+    // post-harvest sweep, retryable-harvest recovery): entry must refuse
+    // once teardown began, locally or via a foreign backend's durable
+    // removal tombstone.
+    using fixture = await createFixture();
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    const followOn = await fixture.service.maybeRun("ws-dream", "manual");
+    expect(followOn.success).toBe(false);
+    if (!followOn.success) expect(followOn.error).toContain("being removed");
+
+    // Durable tombstone alone (removal performed by another backend).
+    await fixture.addWorkspace("ws-foreign");
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-foreign");
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: "ws-foreign", removedAt: Date.now() })
+    );
+    const foreign = await fixture.service.maybeRun("ws-foreign", "manual");
+    expect(foreign.success).toBe(false);
+    if (!foreign.success) expect(foreign.error).toContain("being removed");
+  });
+
+  it("workspace removal aborts and drains an in-flight consolidation run (r60)", async () => {
+    // Removal only ever raced the run's hard timeout before: the drain must
+    // abort the stream itself, settle the run, and return promptly so
+    // removal is never wedged behind an open provider stream.
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => (streamStarted = resolve));
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            streamStarted();
+            // Emits nothing and never closes; like a real provider stream it
+            // errors only when the request's abort signal fires.
+            return Promise.resolve({
+              stream: new ReadableStream<LanguageModelV3StreamPart>({
+                start(controller) {
+                  options.abortSignal?.addEventListener("abort", () => {
+                    controller.error(new Error("request aborted"));
+                  });
+                },
+              }),
+            });
+          },
+        }),
+    });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const childMetadata = await seedCompactionEpoch(fixture, "ws-sub");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [childMetadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: childMetadata.summaryMessageId,
+              compactionEpoch: childMetadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: childMetadata,
+            },
+          },
+        },
+      })
+    );
+    const run = fixture.service.maybeRun("ws-dream", "manual");
+    await started;
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    // The run settled (abort surfaced as a stream failure) instead of
+    // holding the in-flight lock until its multi-minute timeout.
+    const result = await run;
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error).toContain("stream failed");
+    }
+    // The cancelled owner's continuation must not start recovery of a
+    // sub-agent's retryable harvest (work outside the drained registry).
+    const childRecords = (
+      JSON.parse(
+        await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
+      ) as { harvestsByWorkspace: Record<string, Record<string, { attemptCount: number }>> }
+    ).harvestsByWorkspace["ws-sub"];
+    expect(Object.values(childRecords).map((record) => record.attemptCount)).toEqual([1]);
+    // Idempotent with nothing in flight (the phantom-metadata removal path).
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+  });
+
+  it("a sub-agent's removal drain aborts the owner-keyed run made on its behalf", async () => {
+    // A child's trigger (and the post-harvest sweep) runs the OWNER's
+    // consolidation; a cancelled child harvest deliberately falls through to
+    // that sweep. The child's removal drain must still reach the owner-keyed
+    // run, or it would keep mutating the shared notebook after removal.
+    let streamStarted!: () => void;
+    const started = new Promise<void>((resolve) => (streamStarted = resolve));
+    using fixture = await createFixture({
+      modelFactory: () =>
+        new MockLanguageModelV3({
+          doStream: (options) => {
+            streamStarted();
+            return Promise.resolve({
+              stream: new ReadableStream<LanguageModelV3StreamPart>({
+                start(controller) {
+                  options.abortSignal?.addEventListener("abort", () => {
+                    controller.error(new Error("request aborted"));
+                  });
+                },
+              }),
+            });
+          },
+        }),
+    });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    await fixture.addWorkspace("ws-sib", { parentWorkspaceId: "ws-dream" });
+    const siblingMetadata = await seedCompactionEpoch(fixture, "ws-sib");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sib": {
+            [siblingMetadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: siblingMetadata.summaryMessageId,
+              compactionEpoch: siblingMetadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: siblingMetadata,
+            },
+          },
+        },
+      })
+    );
+    const run = fixture.service.maybeRun("ws-sub", "manual");
+    await started;
+    await fixture.service.cancelInFlightConsolidation("ws-sub");
+    const result = await run;
+    expect(result.success).toBe(false);
+    if (!result.success) expect(result.error).toContain("stream failed");
+    // The run was keyed by the owner, but the ACTING child is the one being
+    // torn down: its continuation must not start recovery of a sibling's
+    // retryable harvest (fresh provider work during the child's teardown).
+    const siblingRecords = (
+      JSON.parse(
+        await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
+      ) as { harvestsByWorkspace: Record<string, Record<string, { attemptCount: number }>> }
+    ).harvestsByWorkspace["ws-sib"];
+    expect(Object.values(siblingRecords).map((record) => record.attemptCount)).toEqual([1]);
+    // Locally cancelled child: neither its own trigger nor an owner run made
+    // on its behalf may start while teardown is under way.
+    const refused = await fixture.service.maybeRun("ws-dream", "manual", {
+      actingWorkspaceId: "ws-sub",
+    });
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("being removed");
+  });
+
   it("runs, persists the journal record, and reports it via getRecord", async () => {
     using fixture = await createFixture();
     const result = await fixture.service.maybeRun("ws-dream", "compaction");
@@ -354,7 +538,7 @@ describe("MemoryConsolidationService", () => {
     expect(record?.trigger).toBe("compaction");
     // Persisted to the sidecar, not just memory.
     const raw = await fsPromises.readFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       "utf-8"
     );
     expect(raw).toContain("ws-dream");
@@ -395,7 +579,7 @@ describe("MemoryConsolidationService", () => {
     // the sweep itself must request the ingest.
     expect(ingests).toEqual([{ workspaceId: "ws-dream" }]);
     const sidecar = await fsPromises.readFile(
-      path.join(fixture.config.getSessionDir("ws-dream"), "headless-usage.jsonl"),
+      path.join(fixture.config.sessionsDir, "ws-dream", "headless-usage.jsonl"),
       "utf-8"
     );
     expect(sidecar).toContain('"source":"memory_consolidation"');
@@ -408,7 +592,7 @@ describe("MemoryConsolidationService", () => {
     expect(result.success).toBe(true);
 
     const raw = JSON.parse(
-      await fsPromises.readFile(path.join(fixture.muxHome, "memory-consolidation.json"), "utf-8")
+      await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
     ) as { projects?: Record<string, unknown> };
     expect(raw.projects?.["/projects/demo"]).toBeDefined();
   });
@@ -421,7 +605,7 @@ describe("MemoryConsolidationService", () => {
     expect(result.success).toBe(true);
 
     const raw = JSON.parse(
-      await fsPromises.readFile(path.join(fixture.muxHome, "memory-consolidation.json"), "utf-8")
+      await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
     ) as { projects?: Record<string, unknown>; workspaces?: Record<string, unknown> };
     expect(raw.workspaces?.["ws-multi"]).toBeDefined();
     expect(raw.projects?.["/projects/demo"]).toBeUndefined();
@@ -441,7 +625,7 @@ describe("MemoryConsolidationService", () => {
     }
 
     const raw = JSON.parse(
-      await fsPromises.readFile(path.join(fixture.muxHome, "memory-consolidation.json"), "utf-8")
+      await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
     ) as { projects?: Record<string, unknown>; workspaces?: Record<string, unknown> };
     expect(raw.workspaces?.["ws-task"]).toBeDefined();
     expect(raw.projects?.["/projects/demo"]).toBeUndefined();
@@ -466,7 +650,7 @@ describe("MemoryConsolidationService", () => {
   it("does not treat older workspace-only records as project coverage", async () => {
     using fixture = await createFixture();
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {
           "ws-dream": {
@@ -489,7 +673,7 @@ describe("MemoryConsolidationService", () => {
   it("preserves consolidation status when a harvest sidecar record is malformed", async () => {
     using fixture = await createFixture();
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {
           "ws-dream": {
@@ -561,14 +745,14 @@ describe("MemoryConsolidationService", () => {
       ])
     );
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({ workspaces: {}, harvestsByWorkspace: { "ws-dream": oldRecords } })
     );
 
     expect((await fixture.service.maybeHarvestThenSweep(metadata)).success).toBe(true);
 
     const raw = JSON.parse(
-      await fsPromises.readFile(path.join(fixture.muxHome, "memory-consolidation.json"), "utf-8")
+      await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
     ) as { harvestsByWorkspace?: Record<string, Record<string, unknown>> };
     const records = raw.harvestsByWorkspace?.["ws-dream"] ?? {};
     expect(Object.keys(records).length).toBeLessThanOrEqual(20);
@@ -981,7 +1165,7 @@ describe("MemoryConsolidationService", () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     const metadata = await seedCompactionEpoch(fixture);
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {},
         harvestsByWorkspace: {
@@ -1015,7 +1199,7 @@ describe("MemoryConsolidationService", () => {
     using fixture = await createFixture({ modelFactory: harvestCandidateModel });
     const metadata = await seedCompactionEpoch(fixture);
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {},
         harvestsByWorkspace: {
@@ -1148,7 +1332,7 @@ describe("MemoryConsolidationService", () => {
 
   it("self-heals a corrupt sidecar instead of failing every later read", async () => {
     using fixture = await createFixture();
-    const sidecarPath = path.join(fixture.muxHome, "memory-consolidation.json");
+    const sidecarPath = path.join(fixture.xumHome, "memory-consolidation.json");
     // typeof null === "object": this once passed a hand-rolled validity check
     // and then blew up getRecord/saveRecord with a TypeError forever.
     await fsPromises.writeFile(sidecarPath, JSON.stringify({ workspaces: null }));
@@ -1164,20 +1348,20 @@ describe("MemoryConsolidationService", () => {
     using fixture = await createFixture();
     // Resolution is rooted at the provided mux root (Config.rootDir), never a
     // hardcoded ~/.mux — the fixture root proves the isolation.
-    const builtIn = await resolveDreamAgentBody(fixture.muxHome);
+    const builtIn = await resolveDreamAgentBody(fixture.xumHome);
     expect(builtIn).not.toBeNull();
 
-    const agentsDir = path.join(fixture.muxHome, "agents");
+    const agentsDir = path.join(fixture.xumHome, "agents");
     await fsPromises.mkdir(agentsDir, { recursive: true });
     await fsPromises.writeFile(
       path.join(agentsDir, "dream.md"),
       "---\nname: Dream\n---\n\nCustom dream body\n"
     );
-    expect(await resolveDreamAgentBody(fixture.muxHome)).toBe("Custom dream body");
+    expect(await resolveDreamAgentBody(fixture.xumHome)).toBe("Custom dream body");
 
     // Malformed override (missing frontmatter) falls back to the built-in.
     await fsPromises.writeFile(path.join(agentsDir, "dream.md"), "body without frontmatter\n");
-    expect(await resolveDreamAgentBody(fixture.muxHome)).toBe(builtIn);
+    expect(await resolveDreamAgentBody(fixture.xumHome)).toBe(builtIn);
   });
 
   it("does nothing when the experiment is disabled", async () => {
@@ -1210,6 +1394,216 @@ describe("MemoryConsolidationService", () => {
     await fixture.metaService.recordAccess("global:lesson2.md", { write: true });
     await fixture.service.runLaunchSweep(new Map([["ws-dream", now]]));
     expect(fixture.modelCalls).toHaveLength(1);
+  });
+
+  it("recovers a sub-agent's failed harvest through the owner's run", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [metadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: metadata.summaryMessageId,
+              compactionEpoch: metadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: metadata,
+            },
+          },
+        },
+      })
+    );
+
+    // The child's manual run redirects to the owner; the owner's recovery
+    // must still retry the CHILD's bucket (the launch sweep never visits it).
+    expect((await fixture.service.maybeRun("ws-sub", "manual")).success).toBe(true);
+    const status = await fixture.service.getStatus("ws-sub");
+    expect(status.latestHarvestRecord?.status).toBe("completed");
+    expect(status.latestHarvestRecord?.attemptCount).toBe(2);
+  });
+
+  it("redirects a sub-agent's Dream runs and status to the memory owner", async () => {
+    using fixture = await createFixture();
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+
+    // Launch sweep: a child's workspace write is keyed under the owner
+    // (MemoryService resolution), so the idle owner qualifies while the idle
+    // child is skipped even though it is listed.
+    await fixture.memoryService.create(
+      { runtime: null, checkoutCwd: "", workspaceId: "ws-sub", projectPath: "" },
+      "/memories/workspace/from-child.md",
+      "shared lesson",
+      "agent"
+    );
+    const dayAgo = Date.now() - 25 * 60 * 60 * 1000;
+    // A recently-used child keeps the whole tree's notebook "not idle": the
+    // owner must not be swept on its own stale recency.
+    await fixture.service.runLaunchSweep(
+      new Map([
+        ["ws-sub", Date.now()],
+        ["ws-dream", dayAgo],
+      ])
+    );
+    expect(fixture.modelCalls).toHaveLength(0);
+    await fixture.service.runLaunchSweep(
+      new Map([
+        ["ws-sub", dayAgo],
+        ["ws-dream", dayAgo],
+      ])
+    );
+    expect(fixture.modelCalls).toHaveLength(1);
+    expect(await fixture.service.getRecord("ws-sub")).toBeNull();
+    expect(await fixture.service.getRecord("ws-dream")).not.toBeNull();
+
+    // Manual/compaction runs from the child consolidate the OWNER's store
+    // under the owner's lock; the record lands on the owner and the child's
+    // status view reports it (the tab shows the shared store).
+    const manual = await fixture.service.maybeRun("ws-sub", "manual");
+    expect(manual.success).toBe(true);
+    expect(fixture.modelCalls).toHaveLength(2);
+    expect(await fixture.service.getRecord("ws-sub")).toBeNull();
+    expect((await fixture.service.getStatus("ws-sub")).workspaceRecord).toEqual(
+      await fixture.service.getRecord("ws-dream")
+    );
+
+    // Archive is the owner's own one-shot promotion pass: a child archive is
+    // refused instead of running it.
+    const archive = await fixture.service.maybeRun("ws-sub", "archive");
+    expect(archive.success).toBe(false);
+    if (!archive.success) expect(archive.error).toContain("owner");
+    expect(fixture.modelCalls).toHaveLength(2);
+
+    // A child mid-teardown must not start an owner run: locally cancelled
+    // (the child's removal drain could never cancel an owner-keyed run) or
+    // tombstoned by another backend.
+    await fixture.addWorkspace("ws-sub-gone", { parentWorkspaceId: "ws-dream" });
+    const tombstonePath = workspaceRemovalTombstonePath(fixture.xumHome, "ws-sub-gone");
+    await fsPromises.mkdir(path.dirname(tombstonePath), { recursive: true });
+    await fsPromises.writeFile(
+      tombstonePath,
+      JSON.stringify({ workspaceId: "ws-sub-gone", removedAt: Date.now() })
+    );
+    const tombstoned = await fixture.service.maybeRun("ws-sub-gone", "manual");
+    expect(tombstoned.success).toBe(false);
+    if (!tombstoned.success) expect(tombstoned.error).toContain("being removed");
+    await fixture.service.cancelInFlightConsolidation("ws-sub");
+    const cancelled = await fixture.service.maybeRun("ws-sub", "manual");
+    expect(cancelled.success).toBe(false);
+    if (!cancelled.success) expect(cancelled.error).toContain("being removed");
+    expect(fixture.modelCalls).toHaveLength(2);
+
+    // A dangling parent chain resolves to a PRIVATE store (owner == self), so
+    // that workspace consolidates itself rather than being orphaned forever.
+    await fixture.addWorkspace("ws-orphan", { parentWorkspaceId: "ws-gone" });
+    const orphan = await fixture.service.maybeRun("ws-orphan", "manual");
+    expect(orphan.success).toBe(true);
+    expect(await fixture.service.getRecord("ws-orphan")).not.toBeNull();
+    expect(fixture.modelCalls).toHaveLength(3);
+  });
+
+  it("releases the teardown gate when a removal aborts before its point of no return", async () => {
+    using fixture = await createFixture();
+    // The removal drain marks the workspace; every trigger is refused...
+    await fixture.service.cancelInFlightConsolidation("ws-dream");
+    const refused = await fixture.service.maybeRun("ws-dream", "manual");
+    expect(refused.success).toBe(false);
+    if (!refused.success) expect(refused.error).toContain("being removed");
+    expect(fixture.modelCalls).toHaveLength(0);
+    // ...until the aborted removal (no tombstone, workspace intact) lifts it.
+    fixture.service.releaseRemovalCancellation("ws-dream");
+    expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+    expect(fixture.modelCalls).toHaveLength(1);
+  });
+
+  it("finalizes a removed workspace's retryable harvest records so they are never retried", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    await fsPromises.writeFile(
+      path.join(fixture.xumHome, "memory-consolidation.json"),
+      JSON.stringify({
+        workspaces: {},
+        harvestsByWorkspace: {
+          "ws-sub": {
+            [metadata.summaryMessageId]: {
+              status: "failed",
+              startedAt: Date.now() - 10_000,
+              completedAt: Date.now() - 9_000,
+              attemptCount: 1,
+              boundaryKey: metadata.summaryMessageId,
+              compactionEpoch: metadata.compactionEpoch,
+              acceptedCandidates: 0,
+              skippedCandidates: 0,
+              error: "crashed mid-harvest",
+              completionMetadata: metadata,
+            },
+          },
+        },
+      })
+    );
+    await fixture.service.finalizeHarvestsForRemoval("ws-sub");
+    const record = (await fixture.service.getStatus("ws-sub")).latestHarvestRecord;
+    expect(record?.status).toBe("failed");
+    expect(record?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    // The owner's run no longer sees a retryable child bucket.
+    expect((await fixture.service.maybeRun("ws-dream", "manual")).success).toBe(true);
+    expect((await fixture.service.getStatus("ws-sub")).latestHarvestRecord?.attemptCount).toBe(
+      HARVEST_MAX_ATTEMPTS
+    );
+  });
+
+  it("keeps a removal-finalized harvest record terminal against residual retryable writes", async () => {
+    using fixture = await createFixture({ modelFactory: harvestCandidateModel });
+    await fixture.addWorkspace("ws-sub", { parentWorkspaceId: "ws-dream" });
+    const metadata = await seedCompactionEpoch(fixture, "ws-sub");
+    const boundaryKey = metadata.summaryMessageId;
+    const base = {
+      startedAt: Date.now() - 10_000,
+      attemptCount: 1,
+      boundaryKey,
+      compactionEpoch: metadata.compactionEpoch,
+      acceptedCandidates: 0,
+      skippedCandidates: 0,
+      completionMetadata: metadata,
+    };
+    // Residual runs of the bounded cancellation drain record through the same
+    // path as the live harvest; reach it directly to interleave with finalization.
+    const save = (record: MemoryHarvestRecordPayload) =>
+      Effect.runPromise(
+        (
+          fixture.service as unknown as {
+            saveHarvestRecordEffect: (
+              workspaceId: string,
+              boundaryKey: string,
+              record: MemoryHarvestRecordPayload,
+              projectPath: string
+            ) => Effect.Effect<void>;
+          }
+        ).saveHarvestRecordEffect("ws-sub", boundaryKey, record, "")
+      );
+    await save({ ...base, status: "pending" });
+    await fixture.service.finalizeHarvestsForRemoval("ws-sub");
+    const latest = async () => (await fixture.service.getStatus("ws-sub")).latestHarvestRecord;
+    expect((await latest())?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+
+    // A residual retryable failure landing after finalization must not reopen the bucket...
+    await save({ ...base, status: "failed", completedAt: Date.now(), error: "residual failure" });
+    expect((await latest())?.attemptCount).toBe(HARVEST_MAX_ATTEMPTS);
+    expect((await latest())?.error).toContain("workspace removed");
+    // ...while a residual completion (its writes really landed) is kept as the truth,
+    // and finalization never demotes a completed record.
+    await save({ ...base, status: "completed", completedAt: Date.now(), acceptedCandidates: 1 });
+    await fixture.service.finalizeHarvestsForRemoval("ws-sub");
+    expect((await latest())?.status).toBe("completed");
   });
 
   it("launch sweep skips archived workspaces and caps runs per launch", async () => {
@@ -1274,7 +1668,7 @@ describe("MemoryConsolidationService", () => {
     const dayAgo = Date.now() - 25 * 60 * 60 * 1000;
     const recentProjectRunAt = Date.now() - 60_000;
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {},
         projects: {
@@ -1324,7 +1718,7 @@ describe("MemoryConsolidationService", () => {
     // project write older than that legacy run still needs one project pass.
     const projectWriteAt = recentWorkspaceRunAt - 1_000;
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({
         workspaces: {
           "ws-dream": {
@@ -1341,7 +1735,7 @@ describe("MemoryConsolidationService", () => {
       workspaceId: "ws-dream",
     });
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-meta.json"),
+      path.join(fixture.xumHome, "memory-meta.json"),
       JSON.stringify({
         entries: {
           [logicalKey]: {
@@ -1358,7 +1752,7 @@ describe("MemoryConsolidationService", () => {
 
     expect(fixture.modelCalls).toHaveLength(1);
     const raw = JSON.parse(
-      await fsPromises.readFile(path.join(fixture.muxHome, "memory-consolidation.json"), "utf-8")
+      await fsPromises.readFile(path.join(fixture.xumHome, "memory-consolidation.json"), "utf-8")
     ) as { projects?: Record<string, unknown> };
     expect(raw.projects?.["/projects/demo"]).toBeDefined();
   });
@@ -1395,7 +1789,7 @@ describe("MemoryConsolidationService", () => {
     );
     recency.set("ws-eligible", dayAgo);
     await fsPromises.writeFile(
-      path.join(fixture.muxHome, "memory-consolidation.json"),
+      path.join(fixture.xumHome, "memory-consolidation.json"),
       JSON.stringify({ workspaces: sidecarWorkspaces })
     );
 
@@ -1440,6 +1834,185 @@ describe("MemoryConsolidationService", () => {
     expect(fixture.modelCalls).toHaveLength(1);
   });
 
+  it("resolves headless effort independently from model with workspace, global, definition, and off precedence", async () => {
+    using fixture = await createFixture();
+    const resolve = (definitionAiDefaults?: { thinkingLevel: "low" }) =>
+      resolveHeadlessAgentSettings(
+        fixture.config,
+        "ws-dream",
+        "dream",
+        "coder:private-route",
+        definitionAiDefaults
+      );
+    expect(resolve().thinkingLevel).toBe("off");
+    expect(resolve({ thinkingLevel: "low" }).thinkingLevel).toBe("low");
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults = { dream: { thinkingLevel: "high" } };
+      return cfg;
+    });
+    expect(resolve({ thinkingLevel: "low" })).toMatchObject({
+      model: "coder:private-route",
+      thinkingLevel: "high",
+    });
+    await fixture.config.editConfig((cfg) => {
+      cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent = {
+        dream: { model: "coder:workspace-recall", thinkingLevel: "off" },
+      };
+      return cfg;
+    });
+    expect(resolve({ thinkingLevel: "low" })).toMatchObject({
+      model: "coder:workspace-recall",
+      thinkingLevel: "off",
+    });
+  });
+
+  it.each([false, true])(
+    "pins the resolved selected agent route ahead of stale buckets (Plan bucket: %s)",
+    async (stalePlan) => {
+      using fixture = await createFixture();
+      const selected = "private:exec-global";
+      await fixture.config.editConfig((cfg) => {
+        const workspace = cfg.projects.get("/projects/demo")!.workspaces[0];
+        workspace.agentId = "exec";
+        workspace.aiSettingsByAgent = stalePlan
+          ? { plan: { model: "openai:stale-plan", thinkingLevel: "off" } }
+          : {};
+        delete workspace.aiSettings;
+        cfg.agentAiDefaults = { exec: { modelString: selected } };
+        return cfg;
+      });
+      const resolve = () =>
+        resolveHeadlessAgentModelString(fixture.config, "ws-dream", "dream", selected);
+      expect(resolve()).toBe(selected);
+      await fixture.config.editConfig((cfg) => {
+        cfg.agentAiDefaults!.dream = { modelString: "openai:dream-global" };
+        return cfg;
+      });
+      expect(resolve()).toBe("openai:dream-global");
+      await fixture.config.editConfig((cfg) => {
+        cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent!.dream = {
+          model: "private:dream-workspace",
+          thinkingLevel: "off",
+        };
+        return cfg;
+      });
+      expect(resolve()).toBe("private:dream-workspace");
+    }
+  );
+
+  it.each([true, false])(
+    "resolves headless self-inheritance with append=%s without reading project overrides",
+    async (append) => {
+      using fixture = await createFixture();
+      const builtin = await resolveHeadlessAgentDefinition(
+        fixture.xumHome,
+        "dream",
+        runtimeFactory
+      );
+      if (!builtin) throw new Error("Expected built-in dream");
+      const globals = path.join(fixture.xumHome, "agents");
+      const projects = path.join(fixture.xumHome, ".xum", "agents");
+      await fsPromises.mkdir(globals, { recursive: true });
+      await fsPromises.mkdir(projects, { recursive: true });
+      await fsPromises.writeFile(
+        path.join(projects, "dream.md"),
+        "---\nname: Untrusted\nai:\n  model: public:wrong-route\n---\nProject prompt must not load."
+      );
+      await fsPromises.writeFile(
+        path.join(globals, "dream.md"),
+        `---\nname: Dream\nbase: dream\ndisabled: true\nprompt:\n  append: ${append}\nai:\n  model: private:dream\n---\nLocal memory guidance.`
+      );
+      const resolved = await resolveHeadlessAgentDefinition(
+        fixture.xumHome,
+        "dream",
+        runtimeFactory
+      );
+      expect(resolved?.body).toBe(
+        append ? `${builtin.body}\n\nLocal memory guidance.` : "Local memory guidance."
+      );
+      expect(resolved?.frontmatter).toMatchObject({
+        disabled: true,
+        ai: { model: "private:dream" },
+      });
+      expect(
+        resolveHeadlessAgentModelString(
+          fixture.config,
+          "ws-dream",
+          "dream",
+          "openai:parent",
+          resolved?.frontmatter.ai
+        )
+      ).toBe("private:dream");
+    }
+  );
+
+  it("resolves headless inherited AI and enablement with workspace/config/definition/parent precedence", async () => {
+    using fixture = await createFixture();
+    const globals = path.join(fixture.xumHome, "agents");
+    await fsPromises.mkdir(globals, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(globals, "private-base.md"),
+      "---\nname: Private base\ndisabled: true\nai:\n  model: private:inherited\n---\nInherited protocol."
+    );
+    await fsPromises.writeFile(
+      path.join(globals, "dream.md"),
+      "---\nname: Dream\nbase: private-base\n---\nLocal guidance."
+    );
+    const resolved = await resolveHeadlessAgentDefinition(fixture.xumHome, "dream", runtimeFactory);
+    expect(resolved?.body).toBe("Inherited protocol.\n\nLocal guidance.");
+    expect(resolved?.frontmatter.disabled).toBe(true);
+    const resolveModel = () =>
+      resolveHeadlessAgentModelString(
+        fixture.config,
+        "ws-dream",
+        "dream",
+        "openai:parent",
+        resolved?.frontmatter.ai
+      );
+    expect(resolveModel()).toBe("private:inherited");
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults = { dream: { modelString: "private:configured", enabled: true } };
+      return cfg;
+    });
+    expect(resolveModel()).toBe("private:configured");
+    await fixture.config.editConfig((cfg) => {
+      cfg.projects.get("/projects/demo")!.workspaces[0].aiSettingsByAgent = {
+        dream: { model: "private:workspace", thinkingLevel: "off" },
+      };
+      return cfg;
+    });
+    expect(resolveModel()).toBe("private:workspace");
+  });
+
+  it("fails closed on headless inheritance cycles rather than falling back to another model", async () => {
+    using fixture = await createFixture();
+    const globals = path.join(fixture.xumHome, "agents");
+    await fsPromises.mkdir(globals, { recursive: true });
+    await fsPromises.writeFile(
+      path.join(globals, "dream.md"),
+      "---\nname: Dream\nbase: loop\n---\nChild."
+    );
+    await fsPromises.writeFile(
+      path.join(globals, "loop.md"),
+      "---\nname: Loop\nbase: dream\nai:\n  model: private:cycle\n---\nBase."
+    );
+    expect(
+      await resolveHeadlessAgentDefinition(fixture.xumHome, "dream", runtimeFactory)
+    ).toBeNull();
+    expect(await resolveHeadlessAgentBody(fixture.xumHome, "dream")).toBeNull();
+  });
+
+  it("falls back from an empty headless body override and rejects traversal", async () => {
+    using fixture = await createFixture();
+    const builtin = await resolveHeadlessAgentBody(fixture.xumHome, "dream");
+    expect(builtin).not.toBeNull();
+    const agents = path.join(fixture.xumHome, "agents");
+    await fsPromises.mkdir(agents, { recursive: true });
+    await fsPromises.writeFile(path.join(agents, "dream.md"), "---\nname: Empty\n---\n");
+    expect(await resolveHeadlessAgentBody(fixture.xumHome, "dream")).toBe(builtin);
+    expect(resolveHeadlessAgentBody(fixture.xumHome, "../outside")).rejects.toThrow();
+  });
+
   it("resolves the dream model via the inherit cascade", async () => {
     using fixture = await createFixture();
     // No overrides anywhere => app default.
@@ -1452,5 +2025,46 @@ describe("MemoryConsolidationService", () => {
       return cfg;
     });
     expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("anthropic:claude-test-dream");
+  });
+
+  it("keeps the dream fallback on the workspace's selected route (r31 security)", async () => {
+    using fixture = await createFixture();
+    // The workspace's CURRENT model lives in the selected agent's per-agent
+    // bucket; legacy aiSettings is stale (updateAgentAISettings never rewrites
+    // it). Without a dream override the fallback must follow the selected
+    // route, not the stale legacy model or the built-in default.
+    await fixture.config.editConfig((cfg) => {
+      cfg.agentAiDefaults = {};
+      for (const project of cfg.projects.values()) {
+        const workspace = project.workspaces.find((entry) => entry.id === "ws-dream");
+        if (workspace) {
+          workspace.agentId = "exec";
+          workspace.aiSettingsByAgent = {
+            exec: { model: "coder:private-gw/claude-sonnet", thinkingLevel: "off" },
+          };
+          workspace.aiSettings = { model: "anthropic:stale-legacy", thinkingLevel: "off" };
+        }
+      }
+      return cfg;
+    });
+    expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe(
+      "coder:private-gw/claude-sonnet"
+    );
+
+    // An explicit per-workspace dream override remains higher-precedence
+    // consent for a different route.
+    await fixture.config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        const workspace = project.workspaces.find((entry) => entry.id === "ws-dream");
+        if (workspace?.aiSettingsByAgent) {
+          workspace.aiSettingsByAgent.dream = {
+            model: "anthropic:explicit-dream",
+            thinkingLevel: "off",
+          };
+        }
+      }
+      return cfg;
+    });
+    expect(resolveDreamModelString(fixture.config, "ws-dream")).toBe("anthropic:explicit-dream");
   });
 });

@@ -1,4 +1,89 @@
-import { userEvent, waitFor } from "@storybook/test";
+import { userEvent, waitFor, within } from "storybook/test";
+
+/**
+ * Open (or show) the New tab of the right sidebar pane inside `scope` with the "+" button after
+ * its tabs.
+ */
+export async function openSidebarNewTab(scope: HTMLElement): Promise<void> {
+  await userEvent.click(await within(scope).findByRole("button", { name: "New tab" }));
+}
+
+/**
+ * Open Settings from the titlebar button and return the Settings dialog. The page behind the
+ * modal stays mounted, so plays should query within the dialog rather than the whole canvas.
+ */
+export async function openSettingsDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
+  await openLeftSidebar(canvasElement);
+  await userEvent.click(within(canvasElement).getByTestId("settings-button"));
+  return findSettingsDialog(canvasElement.ownerDocument);
+}
+
+/**
+ * Open the left sidebar when it is collapsed, so plays can reach its controls (the titlebar's
+ * settings button, project rows). At phone widths (Pixel's phone and tablet variants) the sidebar
+ * is a drawer that starts closed each time a story mounts, whatever `expandLeftSidebar()` saved.
+ */
+export async function openLeftSidebar(canvasElement: HTMLElement): Promise<void> {
+  const canvas = within(canvasElement);
+  const openToggle = () => canvas.queryByRole("button", { name: "Open sidebar menu" });
+  await waitFor(
+    () => {
+      if (!canvas.queryByTestId("settings-button") && !openToggle()) {
+        throw new Error("Neither the sidebar nor its open toggle rendered yet");
+      }
+    },
+    { timeout: 10000 }
+  );
+  const toggle = canvas.queryByTestId("settings-button") ? null : openToggle();
+  if (toggle) {
+    // A native click: userEvent's synthetic hover could leave the toggle's tooltip in a snapshot.
+    toggle.click();
+    await canvas.findByTestId("settings-button", {}, { timeout: 10000 });
+  }
+}
+
+/**
+ * Find the open Settings dialog once it takes clicks. Settings is lazy-loaded, so its first open
+ * commits when the chunk arrives, not inside the opening event. Radix's modal layer then sets
+ * `pointer-events: none` on the body in an effect and sets `auto` on the dialog one render later,
+ * so a click right after the dialog appears can hit `pointer-events: none`.
+ */
+export async function findSettingsDialog(doc: Document = document): Promise<HTMLElement> {
+  const dialog = await within(doc.body).findByRole(
+    "dialog",
+    { name: "Settings" },
+    { timeout: 10000 }
+  );
+  // Inline `auto` is Radix's own signal that this modal layer is registered and on top.
+  await waitFor(() => {
+    if (dialog.style.pointerEvents !== "auto") {
+      throw new Error("Settings dialog does not take pointer events yet");
+    }
+  });
+  return dialog;
+}
+
+export function getSettingsDialog(): HTMLElement {
+  return within(document.body).getByRole("dialog", { name: "Settings" });
+}
+
+/**
+ * Wait until AppLoader's fade-in has committed. Motion cancels the finished WAAPI fade a frame
+ * before it writes the final opacity, so for that frame the app shell reads opacity 0 and a
+ * direct toBeVisible on any element inside it fails.
+ */
+export async function waitForAppFadeInDone(element: Element): Promise<void> {
+  await waitFor(
+    () => {
+      for (let node: Element | null = element; node; node = node.parentElement) {
+        if (getComputedStyle(node).opacity !== "1" || node.getAnimations().length > 0) {
+          throw new Error("App shell is still fading in");
+        }
+      }
+    },
+    { timeout: 5000 }
+  );
+}
 
 /**
  * Wait for chat messages to finish loading.
@@ -39,61 +124,6 @@ export async function waitForChatInputAutofocusDone(canvasElement: HTMLElement):
 
 export function blurActiveElement(): void {
   (document.activeElement as HTMLElement | null)?.blur?.();
-}
-
-/**
- * Replace the contents of a controlled `<input>` / `<textarea>` deterministically.
- *
- * Why this exists: in play functions, the naive sequence
- *
- *     await userEvent.clear(input);
- *     await userEvent.type(input, "2");
- *
- * is a classic flake source for controlled inputs. `userEvent.clear` (and
- * the implicit click that `userEvent.type` performs before keystrokes) can
- * leave the field transiently empty between the two steps. When the input
- * has an `onBlur` handler that normalizes/resets the value (a very common
- * pattern for numeric settings), any blur landing in that window resets
- * the draft to a default; the subsequent `type("2")` then appends to it
- * ("42" instead of "2"), and `toHaveValue("2")` fails non-deterministically.
- *
- * This helper avoids that by overwriting the existing contents atomically:
- *
- *   1. Click the input (explicit focus + matches user-event's normal click
- *      semantics, so no surprise implicit click happens later that would
- *      collapse our selection).
- *   2. `setSelectionRange(0, length)` so the entire current value is selected
- *      AFTER the click. (We can't `input.select()` before the click — the
- *      click would collapse that selection. We also can't rely on
- *      `userEvent.type`'s `initialSelectionStart`/`End` options being
- *      preserved across user-event versions.)
- *   3. `userEvent.keyboard(value)` — keyboard dispatches to the focused
- *      element without performing another click, so the selection persists
- *      and the typed value replaces it in one shot. No transient empty
- *      state, no opportunity for an onBlur normalizer to reset the field.
- *   4. Wait for the DOM to settle on the expected value.
- *
- * Prefer this over raw `clear` + `type` whenever you need to assert the final
- * input value or trigger validation tied to a specific value.
- */
-export async function replaceInputValue(
-  input: HTMLElement,
-  value: string,
-  expectedValue: string = value
-): Promise<void> {
-  if (!(input instanceof HTMLInputElement || input instanceof HTMLTextAreaElement)) {
-    throw new Error("replaceInputValue: element is not an input or textarea");
-  }
-  await userEvent.click(input);
-  input.setSelectionRange(0, input.value.length);
-  await userEvent.keyboard(value);
-  await waitFor(() => {
-    if (input.value !== expectedValue) {
-      throw new Error(
-        `replaceInputValue: expected value ${JSON.stringify(expectedValue)}, got ${JSON.stringify(input.value)}`
-      );
-    }
-  });
 }
 
 /**

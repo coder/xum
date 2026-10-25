@@ -3,7 +3,7 @@
  * Start an isolated Electron dev instance (Vite + Electron main process).
  *
  * Why:
- * - Electron uses the shux home directory (SHUX_ROOT / ~/.shux-dev) for config,
+ * - Electron uses the xum home directory (XUM_ROOT / ~/.xum-dev) for config,
  *   sessions, worktrees, etc.
  * - Running multiple Electron instances against the same mux root is noisy and
  *   risky during development.
@@ -22,14 +22,14 @@
  *   - --help
  *
  * Optional env vars:
- *   - SEED_SHUX_ROOT=/path/to/shux/home # where to copy providers.jsonc/config.json from
- *   - SEED_MUX_ROOT=/path/to/mux/home   # legacy alias for SEED_SHUX_ROOT
- *   - KEEP_SANDBOX=1                   # don't delete temp SHUX_ROOT on exit
- *   - SHUX_VITE_PORT / VITE_PORT       # override picked Vite port
+ *   - SEED_XUM_ROOT=/path/to/xum/home # where to copy providers.jsonc/config.json from
+ *   - SEED_MUX_ROOT=/path/to/mux/home   # legacy alias for SEED_XUM_ROOT
+ *   - KEEP_SANDBOX=1                   # don't delete temp XUM_ROOT on exit
+ *   - XUM_VITE_PORT / VITE_PORT       # override picked Vite port
  *   - VITE_READY_TIMEOUT_MS=60000      # override Vite readiness timeout
  *   - ELECTRON_DEBUG_PORT=9223         # override picked Electron remote debugging port
  *   - ELECTRON_DEBUG_PORT=0            # disable Electron remote debugging port entirely
- *   - SHUX_ENABLE_TUTORIALS_IN_SANDBOX=1 # re-enable tutorials inside the sandbox
+ *   - XUM_ENABLE_TUTORIALS_IN_SANDBOX=1 # re-enable tutorials inside the sandbox
  *   - MAKE=gmake                       # override make binary
  */
 
@@ -39,9 +39,9 @@ import * as os from "os";
 import * as path from "path";
 
 import {
-  assignShuxEnvironmentValue,
-  resolveShuxEnvironmentValue,
-} from "../src/common/compat/shuxEnv";
+  assignXumEnvironmentValue,
+  resolveXumEnvironmentValue,
+} from "../src/common/compat/xumEnv";
 import {
   chooseSeedSources,
   copyConfigClearingProjectsIfExists,
@@ -85,11 +85,11 @@ Optional CLI flags:
   --clean-projects    Do not import projects from config.json (projects will be empty)
 
 Optional env vars:
-  SHUX_ENABLE_TUTORIALS_IN_SANDBOX=1  Re-enable tutorials inside the sandbox
+  XUM_ENABLE_TUTORIALS_IN_SANDBOX=1  Re-enable tutorials inside the sandbox
 
 Examples:
   make dev-desktop-sandbox DEV_DESKTOP_SANDBOX_ARGS="--clean-providers --clean-projects"
-  SHUX_ENABLE_TUTORIALS_IN_SANDBOX=1 SHUX_VITE_PORT=5175 ELECTRON_DEBUG_PORT=9223 make dev-desktop-sandbox`);
+  XUM_ENABLE_TUTORIALS_IN_SANDBOX=1 XUM_VITE_PORT=5175 ELECTRON_DEBUG_PORT=9223 make dev-desktop-sandbox`);
 }
 
 function parseElectronDebugPort(
@@ -167,7 +167,7 @@ async function main(): Promise<number> {
   const seedSources = shouldSeed ? chooseSeedSources() : { providersPath: null, configPath: null };
 
   const vitePortOverride = parseOptionalPort(
-    resolveShuxEnvironmentValue("VITE_PORT", process.env) ?? process.env.VITE_PORT
+    resolveXumEnvironmentValue("VITE_PORT", process.env) ?? process.env.VITE_PORT
   );
   const debugPortConfig = parseElectronDebugPort(process.env.ELECTRON_DEBUG_PORT);
 
@@ -215,7 +215,7 @@ async function main(): Promise<number> {
       : false;
 
     console.log("\nStarting mux desktop sandbox...");
-    console.log(`  SHUX_ROOT:       ${muxRoot}`);
+    console.log(`  XUM_ROOT:       ${muxRoot}`);
     console.log(`  Seed config:     ${copiedConfig && seedConfigPath ? seedConfigPath : "(none)"}`);
     console.log(
       `  Seed providers:  ${copiedProviders && seedProvidersPath ? seedProvidersPath : "(none)"}`
@@ -242,12 +242,12 @@ async function main(): Promise<number> {
       seededProvidersPath: copiedProviders ? sandboxProvidersPath : null,
     });
     childEnv.NODE_ENV = "development";
-    assignShuxEnvironmentValue(childEnv, "ROOT", muxRoot);
-    assignShuxEnvironmentValue(childEnv, "VITE_PORT", String(vitePort));
-    assignShuxEnvironmentValue(
+    assignXumEnvironmentValue(childEnv, "ROOT", muxRoot);
+    assignXumEnvironmentValue(childEnv, "VITE_PORT", String(vitePort));
+    assignXumEnvironmentValue(
       childEnv,
       "ENABLE_TUTORIALS_IN_SANDBOX",
-      resolveShuxEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", process.env) ?? "0"
+      resolveXumEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", process.env) ?? "0"
     );
 
     devProc = spawn(makeCmd, ["dev"], {
@@ -305,22 +305,22 @@ async function main(): Promise<number> {
     }
     electronArgs.push(".");
 
-    // Keep sandboxed desktop launches profile-ready; callers can set SHUX_PROFILE_REACT=0
+    // Keep sandboxed desktop launches profile-ready; callers can set XUM_PROFILE_REACT=0
     // to compare against an uninstrumented renderer.
-    assignShuxEnvironmentValue(
+    assignXumEnvironmentValue(
       childEnv,
       "PROFILE_REACT",
-      resolveShuxEnvironmentValue("PROFILE_REACT", process.env) ?? "1"
+      resolveXumEnvironmentValue("PROFILE_REACT", process.env) ?? "1"
     );
-    assignShuxEnvironmentValue(childEnv, "DEVSERVER_HOST", "127.0.0.1");
-    assignShuxEnvironmentValue(childEnv, "DEVSERVER_PORT", String(vitePort));
+    assignXumEnvironmentValue(childEnv, "DEVSERVER_HOST", "127.0.0.1");
+    assignXumEnvironmentValue(childEnv, "DEVSERVER_PORT", String(vitePort));
     // If config.json pins apiServerPort, multiple sandboxes can collide; default to 0.
-    assignShuxEnvironmentValue(
+    assignXumEnvironmentValue(
       childEnv,
       "SERVER_PORT",
-      resolveShuxEnvironmentValue("SERVER_PORT", process.env) ?? "0"
+      resolveXumEnvironmentValue("SERVER_PORT", process.env) ?? "0"
     );
-    assignShuxEnvironmentValue(childEnv, "ALLOW_MULTIPLE_INSTANCES", "1");
+    assignXumEnvironmentValue(childEnv, "ALLOW_MULTIPLE_INSTANCES", "1");
     childEnv.CMUX_ALLOW_MULTIPLE_INSTANCES = "1";
 
     electronProc = spawn("bunx", electronArgs, {

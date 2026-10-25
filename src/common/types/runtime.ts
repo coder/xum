@@ -4,7 +4,7 @@
 
 import type { z } from "zod";
 import type { RuntimeConfigSchema } from "../orpc/schemas";
-import { RuntimeEnablementIdSchema, RuntimeModeSchema } from "../orpc/schemas";
+import { RuntimeEnablementIdSchema, RuntimeModeSchema } from "../orpc/schemas/runtime";
 import type { CoderWorkspaceConfig } from "../orpc/schemas/coder";
 
 // Re-export CoderWorkspaceConfig type from schema (single source of truth)
@@ -113,7 +113,7 @@ export type ParsedRuntime =
   | { mode: "devcontainer"; configPath: string; shareCredentials?: boolean };
 
 /**
- * Parse runtime string from localStorage or UI input into structured result.
+ * Parse runtime string from a CLI flag or UI input into structured result.
  * Format: "ssh <host>" -> { mode: "ssh", host: "<host>" }
  *         "docker <image>" -> { mode: "docker", image: "<image>" }
  *         "worktree" -> { mode: "worktree" }
@@ -121,7 +121,6 @@ export type ParsedRuntime =
  *         undefined/null -> { mode: "worktree" } (default)
  *
  * Note: "ssh" or "docker" without arguments returns null (invalid).
- * Use this for UI state management (localStorage, form inputs).
  */
 export function parseRuntimeModeAndHost(runtime: string | null | undefined): ParsedRuntime | null {
   if (!runtime) {
@@ -283,8 +282,9 @@ export function isWorktreeRuntime(
   | Extract<RuntimeConfig, { type: "local"; srcBaseDir: string }> {
   if (!config) return false;
   if (config.type === "worktree") return true;
-  // Legacy: "local" with srcBaseDir is treated as worktree
-  if (config.type === "local" && "srcBaseDir" in config && config.srcBaseDir) return true;
+  // Legacy: "local" with srcBaseDir is treated as worktree. Any string counts, including a legacy
+  // empty one, because createRuntime builds a WorktreeRuntime for it (#5118).
+  if (config.type === "local" && hasSrcBaseDir(config)) return true;
   return false;
 }
 
@@ -295,8 +295,8 @@ export function isLocalProjectRuntime(
   config: RuntimeConfig | undefined
 ): config is Extract<RuntimeConfig, { type: "local"; srcBaseDir?: never }> {
   if (!config) return false;
-  // "local" without srcBaseDir is project-dir runtime
-  return config.type === "local" && !("srcBaseDir" in config && config.srcBaseDir);
+  // "local" without srcBaseDir is project-dir runtime (same string test as createRuntime, #5118)
+  return config.type === "local" && !hasSrcBaseDir(config);
 }
 
 /**

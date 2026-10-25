@@ -24,9 +24,8 @@ import {
 import { generateBranchName } from "../../ipc/helpers";
 import { detectDefaultTrunkBranch } from "../../../src/node/git";
 
-import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
-import { cleanupView, openProjectCreationView, setupWorkspaceView } from "../helpers";
+import { cleanupView, openProjectCreationView, setupTestDom, setupWorkspaceView } from "../helpers";
 
 async function findQuickArchiveButton(params: {
   container: HTMLElement;
@@ -34,9 +33,9 @@ async function findQuickArchiveButton(params: {
 }): Promise<HTMLButtonElement> {
   return waitFor(
     () => {
-      const button = params.container.querySelector(
+      const button = params.container.querySelector<HTMLButtonElement>(
         `button[aria-label="Archive workspace ${params.title}"]`
-      ) as HTMLButtonElement | null;
+      );
       if (!button) {
         throw new Error(`Quick archive button not found for ${params.title}`);
       }
@@ -60,7 +59,10 @@ describeIntegration("Workspace Creation (UI)", () => {
   test("workspace selection persists after clicking workspace in sidebar", async () => {
     // Use withSharedWorkspace to get a properly created workspace
     await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
-      const cleanupDom = installDom();
+      // setupTestDom (here and in every render below) turns the first-run tutorial off: its
+      // bubble opens 300 ms after the workspace view mounts and takes focus, which closed an open
+      // workspace actions menu before the test could click Archive (#7436).
+      const cleanupDom = setupTestDom();
 
       const view = renderApp({
         apiClient: env.orpc,
@@ -71,9 +73,7 @@ describeIntegration("Workspace Creation (UI)", () => {
         await setupWorkspaceView(view, metadata, workspaceId);
 
         // Click the workspace again to simulate navigation
-        const wsElement = view.container.querySelector(
-          `[data-workspace-id="${workspaceId}"]`
-        ) as HTMLElement;
+        const wsElement = view.container.querySelector(`[data-workspace-id="${workspaceId}"]`)!;
         fireEvent.click(wsElement);
 
         // Give React time to process the navigation
@@ -155,7 +155,7 @@ describeIntegration("Workspace Archive (UI)", () => {
     const secondWorkspace = secondResult.metadata;
     const firstDisplayTitle = firstWorkspace.title ?? firstWorkspace.name;
 
-    const cleanupDom = installDom();
+    const cleanupDom = setupTestDom();
     const view = renderApp({
       apiClient: env.orpc,
       metadata: firstWorkspace,
@@ -226,7 +226,7 @@ describeIntegration("Workspace Archive (UI)", () => {
       const projectPath = metadata.projectPath;
       const displayTitle = metadata.title ?? metadata.name;
 
-      const cleanupDom = installDom();
+      const cleanupDom = setupTestDom();
       const view = renderApp({
         apiClient: env.orpc,
         metadata,
@@ -252,7 +252,7 @@ describeIntegration("Workspace Archive (UI)", () => {
           () => {
             const btn = view.container.querySelector(
               `[aria-label="Workspace actions for ${displayTitle}"]`
-            ) as HTMLElement;
+            )!;
             if (!btn) throw new Error("Workspace actions menu button not found");
             return btn;
           },
@@ -264,9 +264,9 @@ describeIntegration("Workspace Archive (UI)", () => {
         const archiveButton = await waitFor(
           () => {
             // The archive button is inside a popover, search the whole document
-            // Look for the button containing "Archive chat" text
+            // Look for the button containing "Archive workspace" text
             const buttons = Array.from(document.querySelectorAll("button"));
-            const archiveBtn = buttons.find((b) => b.textContent?.includes("Archive chat"));
+            const archiveBtn = buttons.find((b) => b.textContent?.includes("Archive workspace"));
             if (!archiveBtn) throw new Error("Archive button not found in menu");
             return archiveBtn as HTMLElement;
           },
@@ -350,7 +350,7 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
     // Archive the first workspace so the archive section will be visible
     await env.orpc.workspace.archive({ workspaceId: firstWorkspace.id });
 
-    const cleanupDom = installDom();
+    const cleanupDom = setupTestDom();
     const view = renderApp({
       apiClient: env.orpc,
       metadata: secondWorkspace,
@@ -377,7 +377,7 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
         () => {
           const btn = view.container.querySelector(
             `[aria-label="Workspace actions for ${secondDisplayTitle}"]`
-          ) as HTMLElement;
+          )!;
           if (!btn) throw new Error("Workspace actions menu button not found for second workspace");
           return btn;
         },
@@ -389,7 +389,7 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
       const archiveButton = await waitFor(
         () => {
           const buttons = Array.from(document.querySelectorAll("button"));
-          const archiveBtn = buttons.find((b) => b.textContent?.includes("Archive chat"));
+          const archiveBtn = buttons.find((b) => b.textContent?.includes("Archive workspace"));
           if (!archiveBtn) throw new Error("Archive button not found in menu");
           return archiveBtn as HTMLElement;
         },
@@ -402,12 +402,10 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
       // since workspace views also have textareas and we might still be there briefly.
       const expandArchivedButton = await waitFor(
         () => {
-          const expand = view.container.querySelector(
-            '[aria-label="Expand archived workspaces"]'
-          ) as HTMLElement | null;
+          const expand = view.container.querySelector('[aria-label="Expand archived workspaces"]');
           const collapse = view.container.querySelector(
             '[aria-label="Collapse archived workspaces"]'
-          ) as HTMLElement | null;
+          );
 
           if (!expand && !collapse) {
             throw new Error(
@@ -497,7 +495,7 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
 
     await env.orpc.workspace.archive({ workspaceId });
 
-    const cleanupDom = installDom();
+    const cleanupDom = setupTestDom();
     const view = renderApp({
       apiClient: env.orpc,
       metadata,
@@ -509,12 +507,10 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
       // ArchivedWorkspaces is collapsed by default; expand so archived rows are visible.
       const expandArchivedButton = await waitFor(
         () => {
-          const expand = view.container.querySelector(
-            '[aria-label="Expand archived workspaces"]'
-          ) as HTMLElement | null;
+          const expand = view.container.querySelector('[aria-label="Expand archived workspaces"]');
           const collapse = view.container.querySelector(
             '[aria-label="Collapse archived workspaces"]'
-          ) as HTMLElement | null;
+          );
 
           if (!expand && !collapse) {
             throw new Error("Archived workspaces toggle not found");
@@ -546,7 +542,7 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
         () => {
           const btn = view.container.querySelector(
             `[aria-label="Delete workspace ${displayTitle}"]`
-          ) as HTMLElement;
+          )!;
           if (!btn) throw new Error("Delete button not found in archived list");
           return btn;
         },
@@ -601,7 +597,7 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
 
     await env.orpc.workspace.archive({ workspaceId });
 
-    const cleanupDom = installDom();
+    const cleanupDom = setupTestDom();
     const view = renderApp({
       apiClient: env.orpc,
       metadata,
@@ -613,12 +609,10 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
       // ArchivedWorkspaces is collapsed by default; expand so archived rows are visible.
       const expandArchivedButton = await waitFor(
         () => {
-          const expand = view.container.querySelector(
-            '[aria-label="Expand archived workspaces"]'
-          ) as HTMLElement | null;
+          const expand = view.container.querySelector('[aria-label="Expand archived workspaces"]');
           const collapse = view.container.querySelector(
             '[aria-label="Collapse archived workspaces"]'
-          ) as HTMLElement | null;
+          );
 
           if (!expand && !collapse) {
             throw new Error("Archived workspaces toggle not found");
@@ -650,7 +644,7 @@ describeIntegration("Workspace Delete from Archive (UI)", () => {
         () => {
           const btn = view.container.querySelector(
             `[aria-label="Delete workspace ${displayTitle}"]`
-          ) as HTMLElement;
+          )!;
           if (!btn) throw new Error("Delete button not found in archived list");
           return btn;
         },

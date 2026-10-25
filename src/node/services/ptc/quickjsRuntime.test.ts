@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from "bun:test";
+import { CONSOLE_CAPTURE_BUDGET_BYTES } from "@/constants/kernelOutput";
 import { QuickJSRuntime, QuickJSRuntimeFactory } from "./quickjsRuntime";
 import type { PTCEvent } from "./types";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
@@ -172,6 +173,113 @@ describe("QuickJSRuntime", () => {
       expect(result.toolCalls).toHaveLength(1);
       expect(result.toolCalls[0].toolName).toBe("fileRead");
     });
+
+    it("sync methods are callable from post-await continuations", async () => {
+      // Asyncified methods cannot be called after `await capability()` (the
+      // asyncify stack is gone); sync namespace methods must keep working
+      // there — this is the contract mux.events() relies on.
+      const queue: unknown[] = [{ type: "task-terminal", taskId: "t1" }];
+      runtime.registerPromiseFunction("cap", () => Promise.resolve("ok"));
+      runtime.registerObject("mux", {}, { events: () => queue.splice(0, queue.length) });
+
+      const result = await runtime.eval(`
+        return (async () => {
+          await cap();
+          return mux.events();
+        })();
+      `);
+      expect(result.success).toBe(true);
+      expect(result.result).toEqual([{ type: "task-terminal", taskId: "t1" }]);
+    });
+
+    it("sync methods dispatch late-bound: saved references see re-registration", async () => {
+      runtime.registerObject("mux", {}, { events: () => ["old"] });
+      const save = await runtime.eval("globalThis.saved = mux.events; return saved();");
+      expect(save.result).toEqual(["old"]);
+
+      runtime.registerObject("mux", {}, { events: () => ["new"] });
+      const result = await runtime.eval("return saved();");
+      expect(result.success).toBe(true);
+      expect(result.result).toEqual(["new"]);
+    });
+
+    it("rejects a name registered as both async and sync method", () => {
+      expect(() =>
+        runtime.registerObject("mux", { events: () => Promise.resolve(1) }, { events: () => 2 })
+      ).toThrow(/both async and sync/);
+    });
+  });
+
+  describe("setVarsProperty", () => {
+    it("writes into vars from a host function mid-eval; recreates a clobbered vars", async () => {
+      // Host-side write during an asyncified host call — the window mux.load
+      // uses to place bulk content into the kernel without transiting records.
+      runtime.registerFunction("hostWrite", (...args: unknown[]) => {
+        runtime.setVarsProperty(String(args[0]), String(args[1]));
+        return Promise.resolve(true);
+      });
+      const result = await runtime.eval(`
+        globalThis.vars = {};
+        hostWrite("a", "hello");
+        const first = vars.a;
+        vars = null; // guest clobbers the namespace
+        hostWrite("b", "world");
+        return { first, second: vars.b };
+      `);
+      expect(result.success).toBe(true);
+      expect(result.result).toEqual({ first: "hello", second: "world" });
+    });
+
+    it("throws when a guest Proxy vars swallows the write (r29)", async () => {
+      // Lying set/defineProperty traps "accept" the write while storing
+      // nothing — without the read-back verify the host reported success for
+      // a key that never existed (mux.load then advertised a fake record).
+      runtime.registerFunction("hostWrite", (...args: unknown[]) => {
+        runtime.setVarsProperty(String(args[0]), String(args[1]));
+        return Promise.resolve(true);
+      });
+      const result = await runtime.eval(`
+        vars = new Proxy({}, {
+          set: function () { return true; },
+          defineProperty: function () { return true; },
+        });
+        try {
+          hostWrite("a", "hello");
+          return "stored";
+        } catch (e) {
+          return String(e);
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(String(result.result)).toContain("did not store");
+    });
+
+    it("throws when a guest Proxy vars hides the write from serialization (r54)", async () => {
+      // A default set trap stores into the target, so the identity read-back
+      // passes — but ownKeys omits the key, so JSON.stringify(vars) (exactly
+      // what the durable snapshot persists) drops the load: after a restart
+      // the advertised key is gone. The write must fail loudly instead.
+      runtime.registerFunction("hostWrite", (...args: unknown[]) => {
+        runtime.setVarsProperty(String(args[0]), String(args[1]));
+        return Promise.resolve(true);
+      });
+      const result = await runtime.eval(`
+        vars = new Proxy({}, {
+          ownKeys: function () { return []; },
+        });
+        try {
+          hostWrite("a", "hello");
+          return "stored";
+        } catch (e) {
+          return String(e);
+        }
+      `);
+      expect(result.success).toBe(true);
+      expect(String(result.result)).toContain("did not store");
+      // The verification temp global must not linger in the guest realm.
+      const leak = await runtime.eval(`return typeof globalThis.__xumVarsWriteVerify;`);
+      expect(leak.result).toBe("undefined");
+    });
   });
 
   describe("console capture", () => {
@@ -200,6 +308,76 @@ describe("QuickJSRuntime", () => {
       expect(result.consoleOutput[0].level).toBe("log");
       expect(result.consoleOutput[1].level).toBe("warn");
       expect(result.consoleOutput[2].level).toBe("error");
+    });
+
+    it("bounds retained console output at capture time (host memory O(budget), not O(output))", async () => {
+      // r15: a guest loop console.log-ing large values for the whole timeout
+      // used to retain EVERY dumped record host-side before any post-eval cap
+      // ran, so a prompt-influenced program could exhaust process memory.
+      // ~30MB of guest output; retention must stay bounded by the budget.
+      const result = await runtime.eval(`
+        for (let i = 0; i < 300; i++) { console.log("x".repeat(100000)); }
+        return "done";
+      `);
+      expect(result.success).toBe(true);
+      expect(result.result).toBe("done");
+
+      let retainedBytes = 0;
+      for (const record of result.consoleOutput) {
+        retainedBytes += Buffer.byteLength(JSON.stringify(record.args) ?? "", "utf8");
+      }
+      // Budget + small slack for the marker record itself.
+      expect(retainedBytes).toBeLessThanOrEqual(CONSOLE_CAPTURE_BUDGET_BYTES + 4096);
+      expect(result.consoleOutput.length).toBeLessThan(300);
+
+      // The drop is explicit, never silent: the final record is a marker
+      // carrying an accurate dropped-record count.
+      const marker = result.consoleOutput[result.consoleOutput.length - 1];
+      expect(marker.level).toBe("warn");
+      expect(String(marker.args[0])).toContain("console output truncated at capture");
+      expect(String(marker.args[0])).toMatch(/2\d\d record\(s\) dropped/);
+    });
+
+    it("treats unserializable console records as over budget (BigInt bypass)", async () => {
+      // r17: a BARE BigInt arg survives dump as a real BigInt (objects
+      // containing one stringify to "[object Object]"), so JSON.stringify of
+      // the args array throws — charging such records zero bytes would
+      // retain the sibling payload arg for free, letting a guest grow host
+      // memory unbounded past the capture budget by pairing every large
+      // payload with one BigInt arg.
+      const result = await runtime.eval(`
+        for (let i = 0; i < 300; i++) { console.log(1n, "x".repeat(100000)); }
+        return "done";
+      `);
+      expect(result.success).toBe(true);
+      expect(result.result).toBe("done");
+
+      // Unserializable records must be dropped, not retained: total retained
+      // record count stays O(1) (the marker plus at most a few pre-trip
+      // records), never the 300 the guest logged.
+      expect(result.consoleOutput.length).toBeLessThanOrEqual(2);
+      const marker = result.consoleOutput[result.consoleOutput.length - 1];
+      expect(String(marker.args[0])).toContain("console output truncated at capture");
+      expect(String(marker.args[0])).toMatch(/(299|300) record\(s\) dropped/);
+    });
+
+    it("events for dropped console records are not emitted (bounded capture, bounded stream)", async () => {
+      const events: PTCEvent[] = [];
+      runtime.onEvent((event) => events.push(event));
+      const result = await runtime.eval(`
+        for (let i = 0; i < 50; i++) { console.log("y".repeat(100000)); }
+        return true;
+      `);
+      expect(result.success).toBe(true);
+      const consoleEvents = events.filter((event) => event.type === "console");
+      // 50 * 100KB = 5MB > budget: only the retained records streamed.
+      expect(consoleEvents.length).toBeLessThan(50);
+      expect(consoleEvents.length).toBe(
+        // Marker records are pushed host-side without an event.
+        result.consoleOutput.filter(
+          (record) => !String(record.args[0]).includes("truncated at capture")
+        ).length
+      );
     });
   });
 
@@ -363,11 +541,6 @@ describe("QuickJSRuntime", () => {
       // First call may complete, but second should be aborted
       // (timing dependent, but abort should eventually take effect)
       expect(callCount).toBeLessThanOrEqual(2);
-    });
-
-    it("abort method exists and can be called", () => {
-      // Basic sanity test that abort() is callable
-      expect(() => runtime.abort()).not.toThrow();
     });
   });
 
@@ -999,6 +1172,67 @@ describe("QuickJSRuntime", () => {
       expect(removed.result).toBe("mux.bash is no longer available in this sandbox");
     });
 
+    it("re-registering the same method reuses the guest function identity", async () => {
+      runtime.registerObject("mux", { bash: () => Promise.resolve("one") });
+      const before = await runtime.eval("globalThis.savedBash = mux.bash; return 0;");
+      expect(before.success).toBe(true);
+
+      runtime.registerObject("mux", { bash: () => Promise.resolve("two") });
+      const identity = await runtime.eval("return globalThis.savedBash === mux.bash;");
+      expect(identity.success).toBe(true);
+      expect(identity.result).toBe(true);
+      // Reuse must not pin the old implementation (late-bound dispatch).
+      const rewired = await runtime.eval("return mux.bash();");
+      expect(rewired.result).toBe("two");
+    });
+
+    it("a method removed and later re-added dispatches to the new implementation", async () => {
+      runtime.registerObject("mux", { bash: () => Promise.resolve("original") });
+      runtime.registerObject("mux", {});
+      runtime.registerObject("mux", { bash: () => Promise.resolve("back") });
+      const result = await runtime.eval("return mux.bash();");
+      expect(result.success).toBe(true);
+      expect(result.result).toBe("back");
+    });
+
+    it("a method that flips between async and sync kinds is replaced, not reused", async () => {
+      runtime.registerObject("mux", { ping: () => Promise.resolve("was-async") });
+      const first = await runtime.eval("return mux.ping();");
+      expect(first.result).toBe("was-async");
+
+      runtime.registerObject("mux", {}, { ping: () => "now-sync" });
+      const second = await runtime.eval("return mux.ping();");
+      expect(second.success).toBe(true);
+      expect(second.result).toBe("now-sync");
+
+      runtime.registerObject("mux", { ping: () => Promise.resolve("async-again") });
+      const third = await runtime.eval("return mux.ping();");
+      expect(third.success).toBe(true);
+      expect(third.result).toBe("async-again");
+    });
+
+    it("heavy re-registration does not exhaust the 16-bit host-function id space", async () => {
+      // QuickJS stores host-function ids in a signed 16-bit slot, so one
+      // context can only ever mint 65,536 ids. Without handle reuse, the
+      // registrations below wrap the C-side id and victim.hello dispatches
+      // to an unrelated old closure (the observed kernel corruption where
+      // every xum.* call landed on the wrong tool).
+      const CHUNK = 256;
+      for (let c = 0; c < 260; c++) {
+        const obj: Record<string, (...args: unknown[]) => Promise<unknown>> = {};
+        for (let i = 0; i < CHUNK; i++) {
+          const tag = `burn-${c}-${i}`;
+          obj[`m${i}`] = () => Promise.resolve(tag);
+        }
+        runtime.registerObject("burn", obj);
+      }
+
+      runtime.registerObject("victim", { hello: () => Promise.resolve("HELLO") });
+      const result = await runtime.eval("return victim.hello();");
+      expect(result.success).toBe(true);
+      expect(result.result).toBe("HELLO");
+    });
+
     it("still reports a genuinely stuck pending Promise", async () => {
       const result = await runtime.eval("return new Promise(() => {});");
       expect(result.success).toBe(false);
@@ -1039,11 +1273,6 @@ describe("QuickJSRuntime", () => {
     it("can be disposed multiple times safely", () => {
       runtime.dispose();
       runtime.dispose(); // Should not throw
-    });
-
-    it("supports Symbol.dispose", () => {
-      expect(typeof runtime[Symbol.dispose]).toBe("function");
-      runtime[Symbol.dispose]();
     });
   });
 

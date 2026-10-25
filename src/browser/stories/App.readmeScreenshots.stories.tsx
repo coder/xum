@@ -35,14 +35,14 @@ import {
 } from "./mocks/workspaces";
 import { createMockORPCClient, type MockSessionUsage } from "./mocks/orpc";
 import {
-  GIT_STATUS_INDICATOR_MODE_KEY,
   LEFT_SIDEBAR_COLLAPSED_KEY,
-  RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getRightSidebarLayoutKey,
 } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
 import { deriveTodoStatus } from "@/common/utils/todoList";
+import type { TabType } from "@/browser/types/rightSidebar";
+import type { RightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 
 export default {
   ...appMeta,
@@ -64,7 +64,7 @@ export default {
   },
 };
 
-const README_PROJECT_NAME = "shux";
+const README_PROJECT_NAME = "xum";
 const README_PROJECT_PATH = "/home/user/projects/mux";
 
 const IPHONE_17_PRO_MAX = {
@@ -262,6 +262,22 @@ function createReadmeGitDivergenceExecutor(gitStatus: Map<string, GitStatusFixtu
   };
 }
 
+/**
+ * The right sidebar shows only opened tabs (a fresh workspace has just the New tab). Seed the tool
+ * tabs the README screenshots have always shown, with `activeTab` selected.
+ */
+function seedReadmeSidebarTabs(workspaceId: string, activeTab: TabType): void {
+  const tabs: TabType[] = ["costs", "review", "instructions", "workflows", "timeline", "goal"];
+  const layout: RightSidebarLayoutState = {
+    version: 1,
+    openTabsOnly: true,
+    nextId: 2,
+    focusedTabsetId: "tabset-1",
+    root: { type: "tabset", id: "tabset-1", tabs, activeTab },
+  };
+  window.localStorage.setItem(getRightSidebarLayoutKey(workspaceId), JSON.stringify(layout));
+}
+
 // README: docs/img/code-review.webp
 // Left sidebar collapsed, 50/50 split between chat and review pane, rich multi-turn chat.
 export const CodeReview: AppStory = {
@@ -281,9 +297,8 @@ export const CodeReview: AppStory = {
         window.localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(true));
 
         // 50/50 split: 950px review pane out of 1900px viewport.
-        window.localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("review"));
         window.localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "950");
-        window.localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
+        seedReadmeSidebarTabs(workspaceId, "review");
 
         const REVIEW_DIFF = `diff --git a/src/browser/components/WorkspaceShell.tsx b/src/browser/components/WorkspaceShell.tsx
 index aaa1111..bbb2222 100644
@@ -302,7 +317,7 @@ index aaa1111..bbb2222 100644
 +
 +  return (
 +    <div className="shell">
-+      <header className="shell-header" aria-label="Workspace">Shux</header>
++      <header className="shell-header" aria-label="Workspace">Xum</header>
 +      <main className="shell-content" style={{ marginRight: sidebarWidth }} />
 +      <aside className="shell-sidebar" style={{ width: sidebarWidth }} />
 +    </div>
@@ -367,7 +382,7 @@ index 0000000..def5678
                       createFileReadTool(
                         "call-read-1",
                         "src/browser/components/WorkspaceShell.tsx",
-                        'import React from \'react\';\nimport { useRightSidebarLayout } from \'../hooks/useRightSidebarLayout\';\nimport { clamp } from \'../utils/layout\';\n\nexport function WorkspaceShell(props: WorkspaceShellProps) {\n  const layout = useRightSidebarLayout(props.workspaceId);\n  const sidebarWidth = clamp(layout.width, 200, 800);\n  return (\n    <div className="shell">\n      <header className="shell-header" aria-label="Workspace">Shux</header>\n      <main className="shell-content" style={{ marginRight: sidebarWidth }} />\n      <aside className="shell-sidebar" style={{ width: sidebarWidth }} />\n    </div>\n  );\n}'
+                        'import React from \'react\';\nimport { useRightSidebarLayout } from \'../hooks/useRightSidebarLayout\';\nimport { clamp } from \'../utils/layout\';\n\nexport function WorkspaceShell(props: WorkspaceShellProps) {\n  const layout = useRightSidebarLayout(props.workspaceId);\n  const sidebarWidth = clamp(layout.width, 200, 800);\n  return (\n    <div className="shell">\n      <header className="shell-header" aria-label="Workspace">Xum</header>\n      <main className="shell-content" style={{ marginRight: sidebarWidth }} />\n      <aside className="shell-sidebar" style={{ width: sidebarWidth }} />\n    </div>\n  );\n}'
                       ),
                       createFileReadTool(
                         "call-read-2",
@@ -487,7 +502,7 @@ index 0000000..def5678
         expandProjects([README_PROJECT_PATH]);
         selectWorkspace(workspace);
 
-        expandRightSidebar();
+        expandRightSidebar(workspaceId);
         return client;
       }}
     />
@@ -696,7 +711,6 @@ export const GitStatusPopover: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        window.localStorage.setItem(GIT_STATUS_INDICATOR_MODE_KEY, JSON.stringify("line-delta"));
         window.localStorage.setItem(LEFT_SIDEBAR_COLLAPSED_KEY, JSON.stringify(false));
 
         const workspaces = [
@@ -864,14 +878,12 @@ export const PlanMermaidWithCosts: AppStory = {
           projectPath: README_PROJECT_PATH,
         });
 
-        window.localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        window.localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         window.localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "500");
-        window.localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
+        seedReadmeSidebarTabs(workspaceId, "costs");
 
         expandProjects([README_PROJECT_PATH]);
         selectWorkspace(workspace);
-        expandRightSidebar();
+        expandRightSidebar(workspaceId);
 
         const sessionUsage = new Map([[workspaceId, createMultiModelSessionUsage(1.84)]]);
 
@@ -975,14 +987,12 @@ export const CostsTabRich: AppStory = {
           projectPath: README_PROJECT_PATH,
         });
 
-        window.localStorage.setItem(RIGHT_SIDEBAR_TAB_KEY, JSON.stringify("costs"));
-        window.localStorage.setItem("costsTab:viewMode", JSON.stringify("session"));
         window.localStorage.setItem(RIGHT_SIDEBAR_WIDTH_KEY, "500");
-        window.localStorage.removeItem(getRightSidebarLayoutKey(workspaceId));
+        seedReadmeSidebarTabs(workspaceId, "costs");
 
         expandProjects([README_PROJECT_PATH]);
         selectWorkspace(workspace);
-        expandRightSidebar();
+        expandRightSidebar(workspaceId);
 
         return createMockORPCClient({
           projects: groupWorkspacesByProject([workspace]),
@@ -1181,7 +1191,7 @@ export const MobileServerMode: AppStory = {
                 createStaticChatHandler([
                   createUserMessage(
                     "msg-1",
-                    "Can I use Shux server mode from my phone when I’m away from my laptop?",
+                    "Can I use Xum server mode from my phone when I’m away from my laptop?",
                     {
                       historySequence: 1,
                       timestamp: STABLE_TIMESTAMP - 45_000,

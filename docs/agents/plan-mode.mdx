@@ -19,44 +19,93 @@ Plan mode lets you review and refine the agent's approach before any code change
 
 ## External Edit Detection
 
-When you edit the plan file externally and send a message, Shux automatically detects the changes and informs the agent with a diff. This uses a timestamp-based polling approach:
+When you edit the plan file externally and send a message, Xum automatically detects the changes and informs the agent with a diff. This uses a timestamp-based polling approach:
 
 1. **State Tracking**: When `propose_plan` runs, it records the plan file's content and modification time.
-2. **Change Detection**: Before each LLM query, Shux checks if the file's mtime has changed.
-3. **Diff Injection**: If modified, Shux computes a diff and injects it into the context so the agent sees exactly what changed.
+2. **Change Detection**: Before each LLM query, Xum checks if the file's mtime has changed.
+3. **Diff Injection**: If modified, Xum computes a diff and injects it into the context so the agent sees exactly what changed.
 
-This means you can make edits in your preferred editor, return to Shux, send a message, and the agent will incorporate your changes.
+This means you can make edits in your preferred editor, return to Xum, send a message, and the agent will incorporate your changes.
 
 ## Plan File Location
 
-Plans are stored in a dedicated directory under your Shux home:
+Plans are stored in a dedicated directory under your Xum home:
 
 ```
-~/.shux/plans/<project>/<workspace-name>.md
+~/.xum/plans/<project>/<workspace-name>.md
 ```
 
 Notes:
 
 - `<workspace-name>` includes the random suffix (e.g. `feature-x7k2`), so it’s globally unique with high probability.
 
-## ask_user_question (Plan Mode Only)
+### SSH and Coder workspaces
 
-In plan mode, the agent may call `ask_user_question` to ask up to 4 structured multiple-choice questions when it needs clarification before finalizing a plan.
+Plans of SSH and Coder workspaces live on the remote host, in a tree of their own for each Xum installation:
+
+```
+~/.mux/plans/installation-<installation-id>/<project-id>/<workspace-name>.md
+```
+
+- `<installation-id>` is a random ID that Xum creates on first use in the `installation_id` file of its data root (`~/.xum` by default). Two Xum installations that use one host (two machines, or two data roots on one machine) get separate trees, so a clear or delete in one never removes the other's plan.
+- `<project-id>` is the same ID that names the project's remote checkout under `srcBaseDir`.
+- One data root holds each installation ID. If you move a data root and stop using the old one, it keeps its ID and its remote plans. If both the original and a copy stay usable, the copy must get a new ID before it opens an SSH or Coder workspace, even if the two never run at the same time. Xum does not detect copies. Two roots with one ID share one tree, so one root can delete a plan that the other still shows, and an older plan can come back after a clear. See [Give a copied data root its own ID](#give-a-copied-data-root-its-own-id).
+- If the `installation_id` file is unreadable or is not a UUID, Xum refuses to read, write or delete remote plans until you restore the file from a backup or delete it. A deleted file gets a new ID, and plans under the old ID stay on the host unused.
+
+Older builds kept SSH plans in files that every installation on the host shared. Xum moves a workspace created before the upgrade to the new tree once, on its first plan access:
+
+- If the workspace has a plan at `~/.mux/plans/<workspace-id>.md`, Xum copies it into the new tree. That file belongs to this workspace only.
+- Xum does not import `~/.mux/plans/<project>/<workspace-name>.md` automatically, because another installation can own that file. If that is the only old plan, a notice above the chat input shows its path with an **Import plan** button. The command palette has the same action, **Import plan from an older Xum**. Importing copies the file into the new tree. It never replaces a plan that is already there. Until you import that plan or write a new one, Xum refuses to rename the workspace, because the old file is named after the workspace.
+- Xum never moves, edits or deletes either old file.
+
+After the move, Xum uses only the new tree. If the plan there is missing later (for example after you delete the `installation_id` file), Xum shows no plan. It does not go back to the old files.
+
+If you downgrade, the older build reads only the old paths. It shows the plan from before the upgrade, or no plan, not the newer copy. To keep the newer plan, copy it on the host from the `installation-<installation-id>` tree to `~/.mux/plans/<project>/<workspace-name>.md` before you downgrade. Edits that the older build makes there are not imported when you upgrade again. If you rename the workspace while you run the older build, the upgraded build looks for the plan under the new name: rename `<workspace-name>.md` in the `installation-<installation-id>` tree on the host to match.
+
+### Give a copied data root its own ID
+
+Do this on the copy. The original keeps its ID. These steps copy plans and never move, replace or delete a file on the host.
+
+1. Stop Xum on the copy.
+2. Read the old ID: `cat <copy-root>/installation_id`.
+3. Write a new ID in lowercase, because Xum uses the lowercase form in paths: `uuidgen | tr 'A-Z' 'a-z' > <copy-root>/installation_id`. If `uuidgen` is missing, use `python3 -c 'import uuid; print(uuid.uuid4())' > <copy-root>/installation_id` instead.
+4. On every SSH or Coder host that the copy uses, copy the old tree to the new one. The command does nothing if there is no old tree, or if the new tree already exists, so it never replaces a file:
+
+   ```bash
+   old=$(printf %s '<old-id>' | tr 'A-Z' 'a-z'); new=$(printf %s '<new-id>' | tr 'A-Z' 'a-z')
+   plans=~/.mux/plans
+   if [ -d "$plans/installation-$old" ] && [ ! -e "$plans/installation-$new" ]; then
+     cp -Rp "$plans/installation-$old" "$plans/installation-$new"
+   fi
+   ```
+
+5. Start Xum on the copy.
+
+Step 4 matters for workspaces that already moved to the new tree (their `remotePlanMigrated` field in `config.json` is `true`). Without it, the copy shows no plan for them, because Xum does not go back to other files. Workspaces that did not move yet move on their first plan access in the copy, as described above. If step 4 already put a plan for such a workspace into the new tree, the move keeps that plan.
+
+After these steps, each root has its own tree, and a clear in one leaves the other's plan unchanged. The steps do not undo changes that the two roots made to each other's plans while they shared one ID.
+
+## ask_user_question
+
+In Plan and Exec modes, the agent may call `ask_user_question` to ask up to 4 structured multiple-choice questions when it needs clarification (for example, before finalizing a plan or when an implementation choice depends on your preference).
+
+- **Plan Mode** waits for your answers before it continues.
+- **Exec Mode** does not wait. The agent keeps working on its best assumption, and the questions stay open in the chat. When you submit answers, Xum sends them to the agent as a message after its current step, or starts a new turn if the agent has already finished. Typing a normal chat message does not cancel these questions. When several sets of questions are open, they appear as one form in the panel above the chat input, and **Submit answers** sends all the answers in one message. Questions still open when a compaction or **Start Here** removes them from the agent's context close unanswered.
 
 What you’ll see:
 
-- An inline “tool call card” in the chat with a small form (single-select or multi-select).
+- A small form (single-select or multi-select) in the panel above the chat input, and a short card in the chat where the agent asked.
 - An always-available **Other** option for free-form answers.
 
 How to respond:
 
 - **Recommended:** answer in the form and click **Submit answers**.
-- **Optional:** you can also just type a normal chat message. This will **cancel** the pending `ask_user_question` tool call and your message will be sent as a regular chat message.
+- **Optional (Plan Mode):** you can also just type a normal chat message. This will **cancel** the pending `ask_user_question` tool call and your message will be sent as a regular chat message.
 
 Availability:
 
-- `ask_user_question` is only registered for the agent in **Plan Mode**.
-- In Exec Mode, the agent cannot call `ask_user_question`.
+- `ask_user_question` is available to top-level agents in **Plan Mode** and **Exec Mode**.
+- Sub-agents, headless `xum run` sessions, and ACP editor prompts cannot call `ask_user_question`, since they have no way to answer it.
 
 ## UI Features
 
@@ -71,7 +120,7 @@ The `propose_plan` tool call in chat includes:
 ## Customizing Plan Mode Behavior
 
 Use [scoped `Mode:` instructions](/agents/instruction-files#mode-prompts) to customize how the
-agent behaves in plan mode. Add the following to `.mux/AGENTS.md` (or `~/.shux/AGENTS.md`):
+agent behaves in plan mode. Add the following to `.xum/AGENTS.md` (or `~/.xum/AGENTS.md`):
 
 ```markdown
 ## Mode: Plan
@@ -88,7 +137,7 @@ When planning:
 Plan mode is also available via the CLI:
 
 ```bash
-shux run --mode plan "Design a caching strategy for the API"
+xum run --mode plan "Design a caching strategy for the API"
 ```
 
 See [CLI documentation](/guides/cli) for more options.

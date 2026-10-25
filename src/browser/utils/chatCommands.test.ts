@@ -1,27 +1,49 @@
-import { describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
-import type { SendMessageOptions } from "@/common/orpc/types";
-import { EXPERIMENT_IDS, getExperimentKey } from "@/common/constants/experiments";
+import { afterEach, describe, expect, test, beforeEach, mock, spyOn } from "bun:test";
+import type {
+  HistoryEditPrecondition,
+  ProvidersConfigMap,
+  SendMessageOptions,
+} from "@/common/orpc/types";
+import { getProvidersConfigStore } from "@/browser/stores/ProvidersConfigStore";
+import { getProjectScopeId, MODEL_KEY_MAX_CHARS } from "@/common/constants/storage";
+import { getWorkspaceAiSelection } from "./workspaceAiSettingsSync";
 import {
+  markAiSelectionIntent,
+  resetAiSelectionIntentForTests,
+  setWorkspaceAgentPick,
+  setWorkspaceAiMetadata,
+} from "./aiSelectionIntent";
+import { setWorkspaceServiceTier } from "./fastModeServiceTier";
+import {
+  createNewWorkspace,
+  executeCompaction,
   parseRuntimeString,
   prepareCompactionMessage,
-  handlePlanShowCommand,
-  handlePlanOpenCommand,
-  handleCompactCommand,
   WORKFLOW_FREEFORM_ARGS_ERROR_MESSAGE,
   processSlashCommand,
+  type CommandAction,
+  type CommandInputDisposition,
+  type CommandResult,
+  type SlashCommandEnv,
 } from "./chatCommands";
 import { parseCommand } from "./slashCommands/parser";
-import type { CommandHandlerContext, SlashCommandContext } from "./chatCommands";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceStoreRaw, workspaceStore } from "@/browser/stores/WorkspaceStore";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { createTestApiClient } from "@/browser/testUtils";
+import type { RuntimeConfig, RuntimeEnablementId } from "@/common/types/runtime";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { HEARTBEAT_DEFAULT_INTERVAL_MS } from "@/constants/heartbeat";
+import {
+  EDIT_HISTORY_CHANGED_MESSAGE,
+  EDIT_NOT_HELD_MESSAGE,
+  TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+} from "@/constants/transcriptBarrier";
 
-// Simple mock for localStorage to satisfy resolveCompactionModel and experiment gating.
+// Simple mock for localStorage to satisfy resolveCompactionModel.
 // Note: command helpers read from window.localStorage, so we set both globalThis.localStorage
 // and window.localStorage for test isolation.
 beforeEach(() => {
-  // Ensure `window` exists for browser-environment functions like isExperimentEnabled.
+  // Ensure `window` exists for browser-environment functions.
   if (typeof globalThis.window === "undefined") {
     (globalThis as unknown as { window: typeof globalThis }).window = globalThis;
   }
@@ -112,1434 +134,1634 @@ function ensureWindowDispatchEvent(): void {
   Object.defineProperty(window, "dispatchEvent", { value: mock(() => true), configurable: true });
 }
 
-function createSlashCommandContext(
-  overrides: Partial<SlashCommandContext> & Pick<SlashCommandContext, "api">
-): SlashCommandContext {
+const sendMessageOptions: SendMessageOptions = {
+  model: "anthropic:claude-sonnet-4-6",
+  thinkingLevel: "off",
+  toolPolicy: [],
+  agentId: "exec",
+};
+
+function createEnv(overrides: Partial<SlashCommandEnv> = {}): SlashCommandEnv {
   return {
+    api: null,
     workspaceId: "test-ws",
     variant: "workspace",
     projectPath: "/tmp/project",
-    setPreferredModel: mock(() => undefined),
-    setVimEnabled: mock((cb: (prev: boolean) => boolean) => cb(false)),
-    resetInputHeight: mock(() => undefined),
-    onTruncateHistory: mock(() => Promise.resolve(undefined)),
-    sendMessageOptions: {
-      model: "anthropic:claude-sonnet-4-6",
-      thinkingLevel: "off",
-      toolPolicy: [],
-      agentId: "exec",
-    },
-    setInput: mock(() => undefined),
-    setToast: mock(() => undefined),
-    setAttachments: mock(() => undefined),
-    setSendingState: mock(() => undefined),
+    sendMessageOptions,
     ...overrides,
   };
 }
 
-function createGoalCommandContext(api: SlashCommandContext["api"]): SlashCommandContext {
-  return createSlashCommandContext({
-    api,
-    workspaceId: "goal-ws",
-    onMessageSent: mock(() => undefined),
-    onCheckReviews: mock(() => undefined),
-    attachedReviewIds: [],
-    openSettings: mock(() => undefined),
-  });
+type CompleteCommandResult = Extract<CommandResult, { kind: "complete" }>;
+
+async function finishCommand(result: CommandResult): Promise<{
+  batches: CommandAction[][];
+  result: CompleteCommandResult;
+}> {
+  const batches: CommandAction[][] = [];
+  while (result.kind === "phase") {
+    batches.push(result.actions);
+    result = await result.continue();
+  }
+  batches.push(result.actions);
+  return { batches, result };
 }
 
-describe("processSlashCommand - workflow", () => {
-  test("rejects workflow execution when dynamic workflows are disabled", async () => {
+function expectDisposition(result: CompleteCommandResult, expected: CommandInputDisposition): void {
+  expect(result.inputDisposition).toBe(expected);
+}
+
+function expectToast(
+  actions: CommandAction[],
+  expected: { type: "success" | "error"; message: string; title?: string }
+): void {
+  const action = actions.find(
+    (candidate): candidate is Extract<CommandAction, { type: "show-toast" }> =>
+      candidate.type === "show-toast"
+  );
+  expect(action?.toast.type).toBe(expected.type);
+  expect(action?.toast.message).toBe(expected.message);
+  if (expected.title) expect(action?.toast.title).toBe(expected.title);
+}
+
+/**
+ * The transcript mutation barrier reads the store's caught-up flag at dispatch time. Pin it for
+ * the duration of `fn` instead of driving a full onChat replay through the singleton store.
+ */
+async function withTranscriptBarrier<T>(open: boolean, fn: () => Promise<T> | T): Promise<T> {
+  const spy = spyOn(workspaceStore, "isWorkspaceTranscriptCaughtUp").mockReturnValue(open);
+  try {
+    return await fn();
+  } finally {
+    spy.mockRestore();
+  }
+}
+
+const completedWorkflowRun = {
+  id: "wfr_123",
+  workspaceId: "test-ws",
+  workflow: {
+    name: "skill://deep-research/workflow.js",
+    description: "Deep research",
+    scope: "built-in",
+    executable: true,
+  },
+  source: "export default function workflow() { return null; }",
+  sourceHash: "sha256:test",
+  args: { input: "mux" },
+  status: "completed" as const,
+  createdAt: "2026-05-29T00:00:00.000Z",
+  updatedAt: "2026-05-29T00:00:01.000Z",
+  events: [],
+  steps: [],
+};
+
+describe("processSlashCommand workflow results", () => {
+  test("returns validation failures without starting a workflow", async () => {
     const start = mock(() =>
       Promise.resolve({ runId: "wfr_123", status: "running", result: null })
     );
-    const context = createSlashCommandContext({
-      api: {
-        workflows: { start },
-      } as unknown as SlashCommandContext["api"],
-      dynamicWorkflowsEnabled: false,
-    });
-
-    const result = await processSlashCommand(
+    const invalidArgs = await processSlashCommand(
       {
         type: "workflow-run",
         scriptPath: "skill://deep-research/workflow.js",
-        argsText: '{"input":"mux"}',
+        argsText: "freeform arguments",
       },
-      context
+      createEnv({
+        api: { workflows: { start } } as unknown as SlashCommandEnv["api"],
+      })
     );
-
-    expect(result).toEqual({ clearInput: false, toastShown: true });
-    expect(start).not.toHaveBeenCalled();
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({ type: "error", message: "Dynamic workflows are disabled" })
-    );
-  });
-
-  test("rejects freeform workflow slash arguments", async () => {
-    const start = mock(() =>
-      Promise.resolve({ runId: "wfr_123", status: "running", result: null })
-    );
-    const context = createSlashCommandContext({
-      api: {
-        workflows: { start },
-      } as unknown as SlashCommandContext["api"],
-      dynamicWorkflowsEnabled: true,
+    expect(invalidArgs.kind).toBe("complete");
+    if (invalidArgs.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(invalidArgs, "restore");
+    expectToast(invalidArgs.actions, {
+      type: "error",
+      message: WORKFLOW_FREEFORM_ARGS_ERROR_MESSAGE,
     });
-
-    const result = await processSlashCommand(
-      { type: "workflow-run", scriptPath: "skill://deep-research/workflow.js", argsText: "mux" },
-      context
-    );
-
-    expect(result).toEqual({ clearInput: false, toastShown: true });
     expect(start).not.toHaveBeenCalled();
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({ type: "error", message: WORKFLOW_FREEFORM_ARGS_ERROR_MESSAGE })
-    );
   });
 
-  test.each([
-    ['"hello"', "hello"],
-    ["123", 123],
-  ] as const)(
-    "passes JSON scalar workflow slash arguments from %p",
-    async (argsText, expectedArgs) => {
-      const start = mock(() =>
-        Promise.resolve({
-          runId: "wfr_123",
-          status: "running",
-          result: null,
-          invocationMessagePersisted: true,
-        })
-      );
-      const context = createSlashCommandContext({
-        api: {
-          workflows: { start },
-        } as unknown as SlashCommandContext["api"],
-        rawInput: `/workflow ./echo.js ${argsText}`,
-        dynamicWorkflowsEnabled: true,
-      });
-
-      const result = await processSlashCommand(
-        { type: "workflow-run", scriptPath: "./echo.js", argsText },
-        context
-      );
-
-      expect(result).toEqual({ clearInput: true, toastShown: true });
-      expect(start).toHaveBeenCalledWith(
-        expect.objectContaining({
-          args: expectedArgs,
-          rawCommand: `/workflow ./echo.js ${argsText}`,
-        })
-      );
-    }
-  );
-
-  test("sends completed workflow slash output to the main agent as hidden context", async () => {
+  test("keeps each workflow await behind a lazy phase", async () => {
     const workflowResult = {
       reportMarkdown: "# Research\n\nFindings",
       structuredOutput: { confidence: "high" },
     };
     const start = mock(() =>
-      Promise.resolve({
-        runId: "wfr_123",
-        status: "completed",
-        result: workflowResult,
-      })
+      Promise.resolve({ runId: "wfr_123", status: "completed" as const, result: workflowResult })
     );
-    const getRun = mock(() =>
-      Promise.resolve({
-        id: "wfr_123",
-        workspaceId: "test-ws",
-        workflow: {
-          name: "skill://deep-research/workflow.js",
-          description: "Deep research",
-          scope: "built-in",
-          executable: true,
-        },
-        source: "export default function workflow() { return null; }",
-        sourceHash: "sha256:test",
-        args: { input: "mux" },
-        status: "completed",
-        createdAt: "2026-05-29T00:00:00.000Z",
-        updatedAt: "2026-05-29T00:00:01.000Z",
-        events: [
-          {
-            sequence: 1,
-            type: "result",
-            at: "2026-05-29T00:00:01.000Z",
-            result: workflowResult,
-          },
-        ],
-        steps: [],
-      })
-    );
-    interface SentWorkflowMessage {
-      message: string;
-      options: { muxMetadata?: { type?: string; rawCommand?: string; commandPrefix?: string } };
-    }
-    const sentMessages: SentWorkflowMessage[] = [];
-    const sendMessage = mock((input: SentWorkflowMessage) => {
+    const getRun = mock(() => Promise.resolve(completedWorkflowRun));
+    const sentMessages: Array<{ message: string; options: { muxMetadata?: { type?: string } } }> =
+      [];
+    const sendMessage = mock((input: (typeof sentMessages)[number]) => {
       sentMessages.push(input);
       return Promise.resolve({ success: true });
     });
-    const onMessageSent = mock(() => undefined);
-    const context = createSlashCommandContext({
-      api: {
-        workflows: { start, getRun },
-        workspace: { sendMessage },
-      } as unknown as SlashCommandContext["api"],
-      rawInput: '/deep-research {"input":"mux"}',
-      dynamicWorkflowsEnabled: true,
-      onMessageSent,
-    });
-
-    const result = await processSlashCommand(
+    const initial = await processSlashCommand(
       {
         type: "workflow-run",
         scriptPath: "skill://deep-research/workflow.js",
         argsText: '{"input":"mux"}',
       },
-      context
+      createEnv({
+        api: {
+          workflows: { start, getRun },
+          workspace: { sendMessage },
+        } as unknown as SlashCommandEnv["api"],
+        rawInput: '/deep-research {"input":"mux"}',
+      })
     );
+    expect(initial.kind).toBe("phase");
+    if (initial.kind !== "phase") throw new Error("expected phase result");
+    expect(initial.actions).toEqual([
+      { type: "clear-input" },
+      { type: "set-sending", sending: true },
+    ]);
+    expect(start).not.toHaveBeenCalled();
 
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(start).toHaveBeenCalledWith({
-      workspaceId: "test-ws",
-      scriptPath: "skill://deep-research/workflow.js",
-      runInBackground: true,
-      args: { input: "mux" },
-      rawCommand: '/deep-research {"input":"mux"}',
-      continuationOptions: context.sendMessageOptions,
-    });
-    expect(getRun).toHaveBeenCalledWith({ workspaceId: "test-ws", runId: "wfr_123" });
-    expect(sendMessage).toHaveBeenCalledTimes(1);
-    const sendInput = sentMessages[0];
-    expect(sendInput).toBeDefined();
-    expect(sendInput.message).toContain('/deep-research {"input":"mux"}');
-    expect(sendInput.message).toContain("<mux_workflow_result>");
-    expect(sendInput.message).toContain("Findings");
-    expect(sendInput.message).toContain("confidence");
-    expect(sendInput.options.muxMetadata?.type).toBe("workflow-result");
-    expect(sendInput.options.muxMetadata?.rawCommand).toBe('/deep-research {"input":"mux"}');
-    expect(sendInput.options.muxMetadata?.commandPrefix).toBe("/deep-research");
-    expect(context.setSendingState).toHaveBeenNthCalledWith(1, true);
-    expect(context.setSendingState).toHaveBeenNthCalledWith(2, false);
-    expect(context.setSendingState).toHaveBeenNthCalledWith(3, true);
-    expect(context.setSendingState).toHaveBeenNthCalledWith(4, false);
-    expect(onMessageSent).toHaveBeenCalledWith("tool-end");
+    const afterStart = await initial.continue();
+    expect(afterStart.kind).toBe("phase");
+    if (afterStart.kind !== "phase") throw new Error("expected phase result");
+    expect(afterStart.actions).toEqual([{ type: "set-sending", sending: false }]);
+    expect(getRun).not.toHaveBeenCalled();
+
+    const afterPoll = await afterStart.continue();
+    expect(afterPoll.kind).toBe("phase");
+    if (afterPoll.kind !== "phase") throw new Error("expected phase result");
+    expect(afterPoll.actions).toEqual([{ type: "set-sending", sending: true }]);
+    expect(sendMessage).not.toHaveBeenCalled();
+
+    const complete = await afterPoll.continue();
+    expect(complete.kind).toBe("complete");
+    if (complete.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(complete, "consume");
+    expect(complete.actions.slice(0, 2)).toEqual([
+      { type: "set-sending", sending: false },
+      { type: "message-sent", dispatchMode: "tool-end" },
+    ]);
+    expect(complete.actions[2]).toMatchObject({ type: "show-toast", toast: { type: "success" } });
+    expect(sentMessages[0]?.message).toContain("<mux_workflow_result>");
+    expect(sentMessages[0]?.message).toContain("Findings");
+    expect(sentMessages[0]?.options.muxMetadata?.type).toBe("workflow-result");
   });
 
-  test("leaves slash workflow continuation to backend when invocation is persisted", async () => {
+  test("completes after start when the invocation message is already persisted", async () => {
     const start = mock(() =>
       Promise.resolve({
         runId: "wfr_123",
-        status: "running",
+        status: "running" as const,
         result: null,
         invocationMessagePersisted: true,
       })
     );
-    const getRun = mock(() => Promise.resolve(null));
-    const sendMessage = mock(() => Promise.resolve({ success: true }));
-    const context = createSlashCommandContext({
-      api: {
-        workflows: { start, getRun },
-        workspace: { sendMessage },
-      } as unknown as SlashCommandContext["api"],
-      rawInput: '/deep-research {"input":"mux"}',
-      dynamicWorkflowsEnabled: true,
-    });
-
-    const result = await processSlashCommand(
-      {
-        type: "workflow-run",
-        scriptPath: "skill://deep-research/workflow.js",
-        argsText: '{"input":"mux"}',
-      },
-      context
-    );
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(start).toHaveBeenCalledWith({
-      workspaceId: "test-ws",
-      scriptPath: "skill://deep-research/workflow.js",
-      runInBackground: true,
-      args: { input: "mux" },
-      rawCommand: '/deep-research {"input":"mux"}',
-      continuationOptions: context.sendMessageOptions,
-    });
-    expect(getRun).not.toHaveBeenCalled();
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "success",
-        message: "Workflow skill://deep-research/workflow.js started",
+    const initial = await processSlashCommand(
+      { type: "workflow-run", scriptPath: "skill://flow/workflow.js", argsText: "{}" },
+      createEnv({
+        api: { workflows: { start } } as unknown as SlashCommandEnv["api"],
       })
     );
-    expect(context.setSendingState).toHaveBeenNthCalledWith(1, true);
-    expect(context.setSendingState).toHaveBeenNthCalledWith(2, false);
+    const settled = await finishCommand(initial);
+    expectDisposition(settled.result, "consume");
+    expect(settled.batches).toHaveLength(2);
+    expectToast(settled.result.actions, {
+      type: "success",
+      message: "Workflow skill://flow/workflow.js started",
+    });
   });
 
-  test("does not send terminal workflow results for superseded slash commands", async () => {
-    const workflowResult = { reportMarkdown: "done" };
+  test("returns consume without continuation actions when polling is superseded", async () => {
     const start = mock(() =>
-      Promise.resolve({
-        runId: "wfr_completed",
-        status: "completed",
-        result: workflowResult,
+      Promise.resolve({ runId: "wfr_123", status: "completed" as const, result: null })
+    );
+    const getRun = mock(() => Promise.resolve(completedWorkflowRun));
+    const initial = await processSlashCommand(
+      { type: "workflow-run", scriptPath: "skill://flow/workflow.js", argsText: "{}" },
+      createEnv({
+        api: {
+          workflows: { start, getRun },
+          workspace: { sendMessage: mock(() => Promise.resolve({ success: true })) },
+        } as unknown as SlashCommandEnv["api"],
+        isCurrent: () => false,
       })
     );
-    const getRun = mock(() =>
-      Promise.resolve({
-        id: "wfr_completed",
-        workspaceId: "test-ws",
-        workflow: {
-          name: "skill://deep-research/workflow.js",
-          description: "Deep research",
-          scope: "built-in",
-          executable: true,
-        },
-        source: "export default function workflow() { return null; }",
-        sourceHash: "sha256:test",
-        args: { input: "mux" },
-        status: "completed",
-        createdAt: "2026-05-29T00:00:00.000Z",
-        updatedAt: "2026-05-29T00:00:01.000Z",
-        events: [
-          { sequence: 1, type: "result", at: "2026-05-29T00:00:01.000Z", result: workflowResult },
-        ],
-        steps: [],
-      })
-    );
-    const sendMessage = mock(() => Promise.resolve({ success: true }));
-    const context = createSlashCommandContext({
-      api: {
-        workflows: { start, getRun },
-        workspace: { sendMessage },
-      } as unknown as SlashCommandContext["api"],
-      rawInput: '/deep-research {"input":"mux"}',
-      dynamicWorkflowsEnabled: true,
-      asyncCommandToken: 1,
-      isAsyncCommandCurrent: mock(() => false),
-    });
-
-    const result = await processSlashCommand(
-      {
-        type: "workflow-run",
-        scriptPath: "skill://deep-research/workflow.js",
-        argsText: '{"input":"mux"}',
-      },
-      context
-    );
-
-    expect(result).toEqual({ clearInput: true, toastShown: false });
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(context.setToast).not.toHaveBeenCalled();
+    const settled = await finishCommand(initial);
+    expectDisposition(settled.result, "consume");
+    expect(settled.result.actions).toEqual([]);
   });
 
-  test("does not restore a superseded workflow slash command", async () => {
-    const start = mock(() =>
-      Promise.resolve({
-        runId: "wfr_running",
-        status: "running",
-        result: null,
+  test("uses restore-if-empty for workflow failures", async () => {
+    const initial = await processSlashCommand(
+      { type: "workflow-run", scriptPath: "skill://flow/workflow.js", argsText: "{}" },
+      createEnv({
+        api: {
+          workflows: { start: mock(() => Promise.reject(new Error("workflow failed"))) },
+        } as unknown as SlashCommandEnv["api"],
       })
     );
-    const getRun = mock(() =>
-      Promise.resolve({
-        id: "wfr_running",
-        workspaceId: "test-ws",
-        workflow: {
-          name: "skill://deep-research/workflow.js",
-          description: "Deep research",
-          scope: "built-in",
-          executable: true,
-        },
-        source: "export default function workflow() { return null; }",
-        sourceHash: "sha256:test",
-        args: { input: "mux" },
-        status: "running",
-        createdAt: "2026-05-29T00:00:00.000Z",
-        updatedAt: "2026-05-29T00:00:01.000Z",
-        events: [],
-        steps: [],
-      })
-    );
-    const sendMessage = mock(() => Promise.resolve({ success: true }));
-    const context = createSlashCommandContext({
-      api: {
-        workflows: { start, getRun },
-        workspace: { sendMessage },
-      } as unknown as SlashCommandContext["api"],
-      rawInput: '/deep-research {"input":"mux"}',
-      dynamicWorkflowsEnabled: true,
-      asyncCommandToken: 1,
-      isAsyncCommandCurrent: mock(() => false),
-    });
-
-    const result = await processSlashCommand(
-      {
-        type: "workflow-run",
-        scriptPath: "skill://deep-research/workflow.js",
-        argsText: '{"input":"mux"}',
-      },
-      context
-    );
-
-    expect(result).toEqual({ clearInput: true, toastShown: false });
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(context.setToast).not.toHaveBeenCalled();
+    const settled = await finishCommand(initial);
+    expectDisposition(settled.result, "restore-if-empty");
+    expectToast(settled.result.actions, { type: "error", message: "workflow failed" });
+    expect(settled.result.actions[0]).toEqual({ type: "set-sending", sending: false });
   });
 
-  test("does not restore failed workflow slash commands over newer drafts", async () => {
-    const start = mock(() =>
-      Promise.resolve({
-        runId: "wfr_failed_send",
-        status: "completed",
-        result: { reportMarkdown: "done" },
-      })
-    );
-    const getRun = mock(() =>
-      Promise.resolve({
-        id: "wfr_failed_send",
-        workspaceId: "test-ws",
-        workflow: {
-          name: "skill://deep-research/workflow.js",
-          description: "Deep research",
-          scope: "built-in",
-          executable: true,
-        },
-        source: "export default function workflow() { return null; }",
-        sourceHash: "sha256:test",
-        args: { input: "mux" },
-        status: "completed",
-        createdAt: "2026-05-29T00:00:00.000Z",
-        updatedAt: "2026-05-29T00:00:01.000Z",
-        events: [],
-        steps: [],
-      })
-    );
-    const sendMessage = mock(() => Promise.resolve({ success: false }));
-    const context = createSlashCommandContext({
-      api: {
-        workflows: { start, getRun },
-        workspace: { sendMessage },
-      } as unknown as SlashCommandContext["api"],
-      rawInput: '/deep-research {"input":"mux"}',
-      dynamicWorkflowsEnabled: true,
-      getInput: mock(() => "newer draft"),
-    });
-
-    const result = await processSlashCommand(
-      {
-        type: "workflow-run",
-        scriptPath: "skill://deep-research/workflow.js",
-        argsText: '{"input":"mux"}',
-      },
-      context
-    );
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "error",
-        message: "Failed to send workflow result to the agent",
-      })
-    );
-  });
-
-  test("does not continue the agent after an interrupted workflow slash run", async () => {
-    const start = mock(() =>
-      Promise.resolve({
-        runId: "wfr_interrupted",
-        status: "interrupted",
-        result: null,
-      })
-    );
-    const getRun = mock(() =>
-      Promise.resolve({
-        id: "wfr_interrupted",
-        workspaceId: "test-ws",
-        workflow: {
-          name: "skill://deep-research/workflow.js",
-          description: "Deep research",
-          scope: "built-in",
-          executable: true,
-        },
-        source: "export default function workflow() { return null; }",
-        sourceHash: "sha256:test",
-        args: { input: "mux" },
-        status: "interrupted",
-        createdAt: "2026-05-29T00:00:00.000Z",
-        updatedAt: "2026-05-29T00:00:01.000Z",
-        events: [],
-        steps: [],
-      })
-    );
+  test("does not send an interrupted workflow result to the agent", async () => {
     const sendMessage = mock(() => Promise.resolve({ success: true }));
-    const onMessageSent = mock(() => undefined);
-    const context = createSlashCommandContext({
-      api: {
-        workflows: { start, getRun },
-        workspace: { sendMessage },
-      } as unknown as SlashCommandContext["api"],
-      rawInput: '/deep-research {"input":"mux"}',
-      dynamicWorkflowsEnabled: true,
-      onMessageSent,
+    const start = mock(() =>
+      Promise.resolve({ runId: "wfr_123", status: "interrupted" as const, result: null })
+    );
+    const getRun = mock(() =>
+      Promise.resolve({ ...completedWorkflowRun, status: "interrupted" as const })
+    );
+    const settled = await finishCommand(
+      await processSlashCommand(
+        { type: "workflow-run", scriptPath: "skill://flow/workflow.js", argsText: "{}" },
+        createEnv({
+          api: {
+            workflows: { start, getRun },
+            workspace: { sendMessage },
+          } as unknown as SlashCommandEnv["api"],
+        })
+      )
+    );
+    expectDisposition(settled.result, "consume");
+    expectToast(settled.result.actions, {
+      type: "success",
+      message: "Workflow skill://flow/workflow.js interrupted",
     });
-
-    const result = await processSlashCommand(
-      {
-        type: "workflow-run",
-        scriptPath: "skill://deep-research/workflow.js",
-        argsText: '{"input":"mux"}',
-      },
-      context
-    );
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
     expect(sendMessage).not.toHaveBeenCalled();
-    expect(onMessageSent).not.toHaveBeenCalled();
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "success",
-        message: "Workflow skill://deep-research/workflow.js interrupted",
-      })
-    );
   });
 });
 
-describe("processSlashCommand - clear", () => {
-  function createClearContext(overrides: Partial<SlashCommandContext> = {}): SlashCommandContext {
-    return createSlashCommandContext({
-      api: null,
-      onDetachAllReviews: mock(() => undefined),
-      onResetContext: mock(() => Promise.resolve("reset" as const)),
-      ...overrides,
+describe("processSlashCommand clear results", () => {
+  test("hard clear returns actions around truncation", async () => {
+    const truncateHistory = mock(() => Promise.resolve());
+    const initial = await processSlashCommand(
+      { type: "clear", mode: "hard" },
+      createEnv({ truncateHistory })
+    );
+    expect(initial.kind).toBe("phase");
+    if (initial.kind !== "phase") throw new Error("expected phase result");
+    expect(initial.actions).toEqual([{ type: "clear-input" }, { type: "reset-input-height" }]);
+    expect(truncateHistory).not.toHaveBeenCalled();
+    const complete = await initial.continue();
+    expect(complete.kind).toBe("complete");
+    if (complete.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(complete, "consume");
+    expect(complete.actions.slice(0, 2)).toEqual([
+      { type: "clear-attachments" },
+      { type: "detach-reviews" },
+    ]);
+    expect(truncateHistory).toHaveBeenCalledWith(1);
+  });
+
+  test("soft clear preserves attachments for no-op and restores on failure", async () => {
+    const noOp = await finishCommand(
+      await processSlashCommand(
+        { type: "clear", mode: "soft" },
+        createEnv({ resetContext: () => Promise.resolve("noop") })
+      )
+    );
+    expectDisposition(noOp.result, "consume");
+    expect(noOp.result.actions).not.toContainEqual({ type: "clear-attachments" });
+    expectToast(noOp.result.actions, {
+      type: "success",
+      message: "No context to reset",
     });
+
+    const failure = await finishCommand(
+      await processSlashCommand(
+        { type: "clear", mode: "soft" },
+        createEnv({
+          resetContext: () => Promise.reject(new Error("reset failed")),
+        })
+      )
+    );
+    expectDisposition(failure.result, "restore");
+    expectToast(failure.result.actions, { type: "error", message: "reset failed" });
+  });
+
+  test("missing clear capabilities consume without a toast", async () => {
+    const soft = await processSlashCommand({ type: "clear", mode: "soft" }, createEnv());
+    expect(soft).toEqual({ kind: "complete", actions: [], inputDisposition: "consume" });
+    const hard = await finishCommand(
+      await processSlashCommand({ type: "clear", mode: "hard" }, createEnv())
+    );
+    expectDisposition(hard.result, "consume");
+    expect(hard.result.actions).toEqual([]);
+  });
+});
+
+describe("processSlashCommand speed toggles", () => {
+  beforeEach(() => resetAiSelectionIntentForTests());
+  afterEach(() => resetAiSelectionIntentForTests());
+  const store = getProvidersConfigStore();
+  let config: ProvidersConfigMap;
+
+  beforeEach(() => {
+    const provider = { apiKeySet: true, isEnabled: true, isConfigured: true, models: [] };
+    config = {
+      openai: { ...provider, serviceTier: "flex" },
+      anthropic: { ...provider },
+      xai: { ...provider },
+      openrouter: { ...provider },
+    };
+    // Pin routing/cache state without opening app-wide backend subscriptions in these unit tests.
+    spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({ routePriority: ["direct"] });
+    spyOn(store, "getConfig").mockImplementation(() => config);
+    spyOn(store, "refresh").mockResolvedValue(undefined);
+    spyOn(store, "updateOptimistically").mockImplementation((provider, patch) => {
+      config = { ...config, [provider]: { ...config[provider], ...patch } };
+    });
+  });
+
+  afterEach(() => mock.restore());
+
+  function setup(model = "openai:gpt-6-astra") {
+    const setProviderConfig = mock(() =>
+      Promise.resolve({ success: true as const, data: undefined })
+    );
+    const getConfig = mock(() => Promise.resolve(config));
+    const setActiveTurnServiceTier = mock<
+      NonNullable<SlashCommandEnv["api"]>["workspace"]["setActiveTurnServiceTier"]
+    >(() => Promise.resolve({ success: true as const, data: { accepted: true } }));
+    const api = createTestApiClient({
+      providers: { getConfig, setProviderConfig },
+      workspace: { setActiveTurnServiceTier },
+    });
+    const sendMessage = spyOn(api.workspace, "sendMessage");
+    const env = createEnv({ api, sendMessageOptions: { ...sendMessageOptions, model } });
+    const run = async (command: string, overrides: Partial<SlashCommandEnv> = {}) =>
+      finishCommand(await processSlashCommand(parseCommand(command), { ...env, ...overrides }));
+    return { run, setProviderConfig, getConfig, setActiveTurnServiceTier, sendMessage };
   }
 
-  test("hard clear truncates history", async () => {
-    const context = createClearContext();
-
-    const result = await processSlashCommand({ type: "clear", mode: "hard" }, context);
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(context.onTruncateHistory).toHaveBeenCalledWith(1.0);
-    expect(context.setAttachments).toHaveBeenCalledWith([]);
-    expect(context.onDetachAllReviews).toHaveBeenCalled();
-    expect(context.onResetContext).not.toHaveBeenCalled();
-  });
-
-  test("soft clear resets context without truncating history", async () => {
-    const context = createClearContext();
-
-    const result = await processSlashCommand({ type: "clear", mode: "soft" }, context);
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(context.onResetContext).toHaveBeenCalled();
-    expect(context.setAttachments).toHaveBeenCalledWith([]);
-    expect(context.onDetachAllReviews).toHaveBeenCalled();
-    expect(context.onTruncateHistory).not.toHaveBeenCalled();
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({ message: "Context reset; history preserved", type: "success" })
-    );
-  });
-
-  test("soft clear preserves attachments when reset is a no-op", async () => {
-    const context = createClearContext({
-      onResetContext: mock(() => Promise.resolve("noop" as const)),
-    });
-
-    const result = await processSlashCommand({ type: "clear", mode: "soft" }, context);
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(context.setAttachments).not.toHaveBeenCalled();
-    expect(context.onDetachAllReviews).not.toHaveBeenCalled();
-  });
-
-  test("soft clear reports errors without clearing composer state", async () => {
-    const context = createClearContext({
-      onResetContext: mock(() => Promise.reject(new Error("reset failed"))),
-    });
-    const consoleErrorSpy = spyOn(console, "error").mockImplementation(() => undefined);
-
-    try {
-      const result = await processSlashCommand({ type: "clear", mode: "soft" }, context);
-
-      expect(result).toEqual({ clearInput: false, toastShown: true });
-      expect(context.setInput).not.toHaveBeenCalled();
-      expect(context.setAttachments).not.toHaveBeenCalled();
-      expect(context.onDetachAllReviews).not.toHaveBeenCalled();
-      expect(context.setToast).toHaveBeenCalledWith(
-        expect.objectContaining({ message: "reset failed", type: "error" })
-      );
-    } finally {
-      consoleErrorSpy.mockRestore();
+  test.each(["workspace", "creation"] as const)(
+    "switches chat-local tiers without sending a message in %s",
+    async (variant) => {
+      const { run, setProviderConfig, setActiveTurnServiceTier, sendMessage } = setup();
+      const scopeId = variant === "workspace" ? "test-ws" : getProjectScopeId("/tmp/project");
+      for (const [command, tier] of [
+        ["/fast", "priority"],
+        ["/ultrafast", "ultrafast"],
+        ["/ultrafast", "default"],
+        ["/fast", "priority"],
+        ["/fast", "default"],
+      ] as const) {
+        const { batches, result } = await run(command, {
+          variant,
+          currentModel: "google:gemini-3-pro",
+        });
+        expectDisposition(result, "consume");
+        expect(batches[0]).toContainEqual({ type: "clear-input" });
+        expect(getWorkspaceAiSelection(scopeId).serviceTier).toBe(tier);
+        expect(config.openai.serviceTier).toBe("flex");
+        expect(setProviderConfig).not.toHaveBeenCalled();
+        expect(sendMessage).not.toHaveBeenCalled();
+        if (variant === "workspace") {
+          expect(setActiveTurnServiceTier).toHaveBeenLastCalledWith({
+            workspaceId: "test-ws",
+            serviceTier: tier,
+          });
+        } else {
+          expect(setActiveTurnServiceTier).not.toHaveBeenCalled();
+        }
+      }
     }
+  );
+
+  test("shares picker selections without changing another chat or a premium global default", async () => {
+    const { run, setActiveTurnServiceTier, setProviderConfig } = setup();
+    config.openai.serviceTier = "priority";
+    const settings = { model: "openai:gpt-6-astra", thinkingLevel: "high" as const };
+    setWorkspaceAiMetadata("test-ws", {
+      aiSettingsByAgent: { exec: { ...settings, serviceTier: "default" } },
+    });
+    setWorkspaceAiMetadata("other-chat", {
+      aiSettingsByAgent: { exec: { ...settings, serviceTier: "ultrafast" } },
+    });
+    expectDisposition((await run("/fast")).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("priority");
+    // Same path as the picker; the slash handler must read it, not its old send-options snapshot.
+    setWorkspaceServiceTier(null, "test-ws", "ultrafast");
+    expectDisposition((await run("/ultrafast")).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("default");
+    expect(getWorkspaceAiSelection("other-chat").serviceTier).toBe("ultrafast");
+    expect(getWorkspaceAiSelection("test-ws", "plan").serviceTier).toBeUndefined();
+    expect(setActiveTurnServiceTier.mock.calls).toEqual([
+      [{ workspaceId: "test-ws", serviceTier: "priority" }],
+      [{ workspaceId: "test-ws", serviceTier: "default" }],
+    ]);
+    expect(setProviderConfig).not.toHaveBeenCalled();
+    expect(config.openai.serviceTier).toBe("priority");
   });
 
-  test("soft clear reports no-op resets", async () => {
-    const context = createClearContext({
-      onResetContext: mock(() => Promise.resolve("noop" as const)),
-    });
-
-    const result = await processSlashCommand({ type: "clear", mode: "soft" }, context);
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({ message: "No context to reset", type: "success" })
-    );
-  });
-});
-
-describe("processSlashCommand - model-set", () => {
-  const createModelSetContext = (api: SlashCommandContext["api"]): SlashCommandContext =>
-    createSlashCommandContext({
-      api,
-      onMessageSent: mock(() => undefined),
-      onCheckReviews: mock(() => undefined),
-      attachedReviewIds: [],
-      openSettings: mock(() => undefined),
-    });
-
-  test("reports backend verification failure for custom providers when config loading fails", async () => {
-    const getConfig = mock(() => Promise.reject(new Error("backend offline")));
-    const context = createModelSetContext({
-      providers: {
-        getConfig,
-      },
-    } as unknown as SlashCommandContext["api"]);
-    const consoleErrorSpy = spyOn(console, "error").mockImplementation(() => undefined);
-
-    try {
-      const result = await processSlashCommand(
-        { type: "model-set", modelString: "local-vllm:qwen3-coder" },
-        context
-      );
-
-      expect(result).toEqual({ clearInput: false, toastShown: true });
-      expect(context.setToast).toHaveBeenCalledWith(
-        expect.objectContaining({
-          type: "error",
-          message: 'Could not verify provider "local-vllm": backend unreachable. Please retry.',
+  test("uses the owning creation AI scope for sub-projects and sends no active-turn update", async () => {
+    const { run, setActiveTurnServiceTier, setProviderConfig } = setup();
+    const scopeId = getProjectScopeId("/tmp/project");
+    expectDisposition(
+      (
+        await run("/fast", {
+          variant: "creation",
+          workspaceId: undefined,
+          projectPath: "/tmp/project/sub-project",
+          aiScopeId: scopeId,
+          isCurrent: () => false, // The composer's existing callback is workspace-only.
         })
-      );
-      expect(context.setToast).not.toHaveBeenCalledWith(
-        expect.objectContaining({ message: 'Unknown provider "local-vllm"' })
-      );
-    } finally {
-      consoleErrorSpy.mockRestore();
+      ).result,
+      "consume"
+    );
+    expect(getWorkspaceAiSelection(scopeId).serviceTier).toBe("priority");
+    expect(
+      getWorkspaceAiSelection(getProjectScopeId("/tmp/project/sub-project")).serviceTier
+    ).toBeUndefined();
+    expect(setActiveTurnServiceTier).not.toHaveBeenCalled();
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
+
+  test("respects a picker speed change while capabilities load", async () => {
+    const { run, getConfig, setActiveTurnServiceTier } = setup();
+    const pending = Promise.withResolvers<ProvidersConfigMap>();
+    getConfig.mockReturnValueOnce(pending.promise);
+    const command = run("/fast");
+    await Promise.resolve();
+    setWorkspaceServiceTier(null, "test-ws", "priority");
+    pending.resolve(config);
+    expectDisposition((await command).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("default");
+    expect(setActiveTurnServiceTier).toHaveBeenCalledWith({
+      workspaceId: "test-ws",
+      serviceTier: "default",
+    });
+  });
+
+  test.each(["agent", "model", "workspace"] as const)(
+    "does not apply to a changed %s after loading capabilities",
+    async (change) => {
+      const { run, getConfig, setActiveTurnServiceTier, setProviderConfig } = setup();
+      const pending = Promise.withResolvers<ProvidersConfigMap>();
+      getConfig.mockReturnValueOnce(pending.promise);
+      let current = true;
+      const command = run("/fast", { isCurrent: () => current });
+      await Promise.resolve();
+      if (change === "agent") setWorkspaceAgentPick("test-ws", "plan");
+      if (change === "model") markAiSelectionIntent("test-ws", "model", "google:gemini-3-pro");
+      if (change === "workspace") current = false;
+      pending.resolve(config);
+      expectDisposition((await command).result, "restore-if-empty");
+      expect(getWorkspaceAiSelection("test-ws").serviceTier).toBeUndefined();
+      expect(setActiveTurnServiceTier).not.toHaveBeenCalled();
+      expect(setProviderConfig).not.toHaveBeenCalled();
     }
-  });
+  );
 
-  test("refuses switching budgeted active goals to an unpriced model", async () => {
-    ensureWindowDispatchEvent();
-    const setPreferredModel = mock(() => undefined);
-    const context = createModelSetContext({
-      providers: {
-        getConfig: mock(() => Promise.resolve({})),
-        setModels: mock(() => Promise.resolve(undefined)),
-      },
-      workspace: {
-        getGoal: mock(() =>
-          Promise.resolve({
-            goal: {
-              goalId: "11111111-1111-4111-8111-111111111111",
-              status: "active",
-              budgetCents: 500,
-            },
-          })
-        ),
-      },
-    } as unknown as SlashCommandContext["api"]);
-    context.setPreferredModel = setPreferredModel;
-
-    const result = await processSlashCommand(
-      { type: "model-set", modelString: "openai:not-priced-model" },
-      context
-    );
-
-    expect(result).toEqual({ clearInput: false, toastShown: true });
-    expect(setPreferredModel).not.toHaveBeenCalled();
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "error",
-        message: "Target model has no pricing data. Pick a priced model before switching.",
-      })
-    );
-  });
-
-  test("allows switching unbudgeted active goals to an unpriced model", async () => {
-    const setPreferredModel = mock(() => undefined);
-    const context = createModelSetContext({
-      providers: {
-        getConfig: mock(() => Promise.resolve({})),
-        setModels: mock(() => Promise.resolve(undefined)),
-      },
-      workspace: {
-        getGoal: mock(() =>
-          Promise.resolve({
-            goal: {
-              goalId: "11111111-1111-4111-8111-111111111111",
-              status: "active",
-              budgetCents: null,
-            },
-          })
-        ),
-      },
-    } as unknown as SlashCommandContext["api"]);
-    context.setPreferredModel = setPreferredModel;
-
-    const result = await processSlashCommand(
-      { type: "model-set", modelString: "openai:not-priced-model" },
-      context
-    );
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(setPreferredModel).toHaveBeenCalledWith("openai:not-priced-model");
-  });
-});
-
-describe("processSlashCommand - workspace command gating", () => {
-  test("shows goal parse errors during workspace creation", async () => {
-    const context = createGoalCommandContext(null);
-    context.variant = "creation";
-
-    const result = await processSlashCommand(
-      { type: "command-unknown-flag", command: "goal", flag: "--bogus" },
-      context
-    );
-
-    expect(result).toEqual({ clearInput: false, toastShown: true });
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({ message: "Unknown flag for /goal: --bogus" })
-    );
-  });
-});
-
-describe("processSlashCommand - goal optimistic concurrency", () => {
-  test("retries once after a goal conflict and reapplies the slash command intent", async () => {
-    ensureWindowDispatchEvent();
-    const getGoal = mock()
-      .mockResolvedValueOnce({
-        goal: {
-          goalId: "11111111-1111-4111-8111-111111111111",
-          objective: "old objective",
-        },
-      })
-      .mockResolvedValueOnce({
-        goal: {
-          goalId: "22222222-2222-4222-8222-222222222222",
-          objective: "fresh objective",
-        },
+  test.each(["anthropic:claude-opus-5-5", "xai:grok-4.7"])(
+    "keeps %s speed on the chat instead of the provider",
+    async (model) => {
+      const { run, setProviderConfig, setActiveTurnServiceTier } = setup(model);
+      expectDisposition((await run("/fast")).result, "consume");
+      expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("priority");
+      expect(getWorkspaceAiSelection("other-chat").serviceTier).toBeUndefined();
+      expect(setActiveTurnServiceTier).toHaveBeenLastCalledWith({
+        workspaceId: "test-ws",
+        serviceTier: "priority",
       });
-    const setGoal = mock()
-      .mockResolvedValueOnce({
-        success: false,
-        error: {
-          type: "goal_conflict",
-          expectedGoalId: "11111111-1111-4111-8111-111111111111",
-          actualGoalId: "22222222-2222-4222-8222-222222222222",
-        },
-      })
-      .mockResolvedValueOnce({
-        success: true,
-        data: {
-          goalId: "33333333-3333-4333-8333-333333333333",
-          objective: "new objective",
-        },
-      });
-    const context = createGoalCommandContext({
-      workspace: { getGoal, setGoal, clearGoal: mock() },
-    } as unknown as SlashCommandContext["api"]);
+      expectDisposition((await run("/fast")).result, "consume");
+      expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("default");
+      expect(setProviderConfig).not.toHaveBeenCalled();
+    }
+  );
 
-    const result = await processSlashCommand(
-      { type: "goal-set", objective: "new objective" },
-      context
-    );
+  test("turns an inherited provider Fast default off for this chat only", async () => {
+    const { run, setProviderConfig } = setup("anthropic:claude-opus-5-5");
+    config.anthropic.speed = "fast";
+    expectDisposition((await run("/fast")).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("default");
+    expect(config.anthropic.speed).toBe("fast");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
 
-    expect(result).toEqual({ clearInput: true, toastShown: false });
-    expect(getGoal).toHaveBeenCalledTimes(2);
-    expect(setGoal).toHaveBeenNthCalledWith(1, {
-      workspaceId: "goal-ws",
-      objective: "new objective",
-      budgetCents: 200,
-      turnCap: null,
-      expectedGoalId: "11111111-1111-4111-8111-111111111111",
+  test.each([
+    ["/fast", "google:gemini-3-pro"],
+    ["/ultrafast", "openrouter:openai/gpt-6-astra"],
+    ["/ultrafast", "openai:gpt-6-luna"],
+    ["/ultrafast", "anthropic:claude-opus-5-5"],
+    ["/ultrafast", "xai:grok-4.7"],
+  ])("rejects %s for unsupported model/route %s without writing", async (command, model) => {
+    const { run, setProviderConfig } = setup(model);
+    const { result } = await run(command);
+    expectDisposition(result, "restore-if-empty");
+    const toast = result.actions.find((action) => action.type === "show-toast");
+    expect(toast?.toast.type).toBe("error");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
+
+  test("honors route overrides and wire format restrictions", async () => {
+    const { run, setProviderConfig } = setup();
+    spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({
+      routeOverrides: { "openai:gpt-6-astra": "openrouter" },
     });
-    expect(setGoal).toHaveBeenNthCalledWith(2, {
-      workspaceId: "goal-ws",
-      objective: "new objective",
-      budgetCents: 200,
-      turnCap: null,
-      expectedGoalId: "22222222-2222-4222-8222-222222222222",
-    });
-    expect(context.setToast).not.toHaveBeenCalled();
+    expectDisposition((await run("/ultrafast")).result, "restore-if-empty");
+    spyOn(getAppConfigStore(), "getSnapshot").mockReturnValue({ routePriority: ["direct"] });
+    config.openai.wireFormat = "chatCompletions";
+    expectDisposition((await run("/ultrafast")).result, "restore-if-empty");
+    expect(setProviderConfig).not.toHaveBeenCalled();
   });
 
-  test("surfaces a toast and stops after two consecutive goal conflicts", async () => {
-    ensureWindowDispatchEvent();
-    const getGoal = mock()
-      .mockResolvedValueOnce({
-        goal: {
-          goalId: "11111111-1111-4111-8111-111111111111",
-          objective: "old objective",
-        },
-      })
-      .mockResolvedValueOnce({
-        goal: {
-          goalId: "22222222-2222-4222-8222-222222222222",
-          objective: "fresh objective",
-        },
-      });
-    const setGoal = mock()
-      .mockResolvedValueOnce({
-        success: false,
-        error: {
-          type: "goal_conflict",
-          expectedGoalId: "11111111-1111-4111-8111-111111111111",
-          actualGoalId: "22222222-2222-4222-8222-222222222222",
-        },
-      })
-      .mockResolvedValueOnce({
-        success: false,
-        error: {
-          type: "goal_conflict",
-          expectedGoalId: "22222222-2222-4222-8222-222222222222",
-          actualGoalId: "33333333-3333-4333-8333-333333333333",
-        },
-      });
-    const context = createGoalCommandContext({
-      workspace: { getGoal, setGoal, clearGoal: mock() },
-    } as unknown as SlashCommandContext["api"]);
+  test("refreshes after a failed config read and releases the toggle guard", async () => {
+    const { run, getConfig } = setup("xai:grok-4.7");
+    getConfig.mockRejectedValueOnce(new Error("read failed"));
+    expectDisposition((await run("/fast")).result, "restore-if-empty");
+    expect(store.refresh).toHaveBeenCalledTimes(1);
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBeUndefined();
+    expectDisposition((await run("/fast")).result, "consume");
+  });
 
+  test("rejects disconnected, side-chat, and invalid commands before reading config", async () => {
+    const { run, getConfig } = setup();
+    for (const command of ["/fast", "/ultrafast"]) {
+      expectDisposition((await run(command, { api: null })).result, "restore");
+      expectDisposition((await run(command, { isSideChat: true })).result, "restore");
+      expectDisposition((await run(`${command} on`)).result, "restore");
+    }
+    expect(getConfig).not.toHaveBeenCalled();
+  });
+
+  test("does not race duplicate submissions while provider config loads", async () => {
+    const { run, getConfig, setProviderConfig } = setup();
+    const pending = Promise.withResolvers<ProvidersConfigMap>();
+    getConfig.mockReturnValueOnce(pending.promise);
+    const first = run("/fast");
+    // Let the command's lazy phase enter its config read before submitting again.
+    await Promise.resolve();
+    const second = await run("/ultrafast");
+    expectDisposition(second.result, "restore");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+    pending.resolve(config);
+    expectDisposition((await first).result, "consume");
+    expect(getWorkspaceAiSelection("test-ws").serviceTier).toBe("priority");
+    expect(config.openai.serviceTier).toBe("flex");
+    expect(setProviderConfig).not.toHaveBeenCalled();
+  });
+});
+
+describe("processSlashCommand model and gating results", () => {
+  test("reports provider verification failure through result data", async () => {
     const result = await processSlashCommand(
-      { type: "goal-set", objective: "new objective" },
-      context
-    );
-
-    expect(result).toEqual({ clearInput: false, toastShown: true });
-    expect(getGoal).toHaveBeenCalledTimes(2);
-    expect(setGoal).toHaveBeenCalledTimes(2);
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "error",
-        message: "Goal changed in another window. Please try again.",
+      { type: "model-set", modelString: "custom:model" },
+      createEnv({
+        api: {
+          providers: { getConfig: mock(() => Promise.reject(new Error("offline"))) },
+        } as unknown as SlashCommandEnv["api"],
       })
+    );
+    expect(result.kind).toBe("complete");
+    if (result.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(result, "restore");
+    expectToast(result.actions, {
+      type: "error",
+      message: 'Could not verify provider "custom": backend unreachable. Please retry.',
+    });
+  });
+
+  // A selected model longer than the per-workspace model key would be lost on restart.
+  test("refuses a model ID too long to persist without adding or selecting it", async () => {
+    const setModels = mock(() => Promise.resolve());
+    const result = await processSlashCommand(
+      { type: "model-set", modelString: `openai:${"m".repeat(MODEL_KEY_MAX_CHARS)}` },
+      createEnv({
+        api: {
+          providers: {
+            getConfig: mock(() => Promise.resolve({ openai: { models: [] } })),
+            setModels,
+          },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    expect(result.kind).toBe("complete");
+    if (result.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(result, "restore");
+    expect(result.actions[0]).toMatchObject({ type: "show-toast", toast: { type: "error" } });
+    expect(result.actions.some((action) => action.type === "set-preferred-model")).toBe(false);
+    expect(setModels).not.toHaveBeenCalled();
+  });
+
+  test("refuses an unpriced model for a budgeted active goal", async () => {
+    const result = await processSlashCommand(
+      { type: "model-set", modelString: "openai:unpriced-model" },
+      createEnv({
+        api: {
+          providers: { getConfig: mock(() => Promise.resolve({ openai: { models: [] } })) },
+          workspace: {
+            getGoal: mock(() =>
+              Promise.resolve({
+                goal: { objective: "ship", status: "active", budgetCents: 500 },
+              })
+            ),
+          },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    expect(result.kind).toBe("complete");
+    if (result.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(result, "restore");
+    expect(result.actions[0]).toMatchObject({ type: "show-toast", toast: { type: "error" } });
+  });
+
+  test("returns model and vim actions", async () => {
+    const model = await processSlashCommand(
+      { type: "model-set", modelString: "anthropic:claude-sonnet-4-6" },
+      createEnv({
+        api: {
+          providers: {
+            getConfig: mock(() => Promise.resolve({})),
+            setModels: mock(() => Promise.resolve()),
+          },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    expect(model.kind).toBe("complete");
+    if (model.kind !== "complete") throw new Error("expected complete result");
+    expect(model.actions).toContainEqual({
+      type: "set-preferred-model",
+      model: "anthropic:claude-sonnet-4-6",
+    });
+    const vim = await processSlashCommand({ type: "vim-toggle" }, createEnv());
+    expect(vim).toEqual({
+      kind: "complete",
+      actions: [{ type: "clear-input" }, { type: "toggle-vim" }],
+      inputDisposition: "consume",
+    });
+  });
+
+  test("returns goal parse errors during creation", async () => {
+    const result = await processSlashCommand(
+      { type: "command-missing-args", command: "goal", usage: "/goal <objective>" },
+      createEnv({ variant: "creation", workspaceId: undefined })
+    );
+    expect(result.kind).toBe("complete");
+    if (result.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(result, "restore");
+    expectToast(result.actions, {
+      type: "error",
+      message: "/goal requires arguments",
+    });
+  });
+
+  test("returns require-client and workspace-creation guard results", async () => {
+    const disconnected = await processSlashCommand(
+      { type: "idle-compaction", hours: 2 },
+      createEnv({ api: null })
+    );
+    if (disconnected.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(disconnected, "restore");
+    expectToast(disconnected.actions, { type: "error", message: "Not connected to server" });
+
+    const guarded = await processSlashCommand(
+      { type: "clear", mode: "soft" },
+      createEnv({ variant: "creation", workspaceId: undefined })
+    );
+    if (guarded.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(guarded, "restore");
+    expectToast(guarded.actions, {
+      type: "error",
+      message: "Command not available during workspace creation",
+    });
+  });
+
+  test("side chats gate every workspace operation before any early handler runs", async () => {
+    const forbidden = mock(() => Promise.reject(new Error("must not reach backend")));
+    const env = createEnv({
+      isSideChat: true,
+      api: createTestApiClient({
+        workflows: { start: forbidden },
+        projects: { idleCompaction: { set: forbidden } },
+        workspace: { createSideChat: forbidden, heartbeat: { get: forbidden, set: forbidden } },
+      }),
+    });
+    for (const parsed of [
+      parseCommand("/side"),
+      parseCommand("/btw"),
+      parseCommand("/fork"),
+      parseCommand("/new"),
+      parseCommand("/idle 2"),
+      parseCommand("/heartbeat 10"),
+      { type: "workflow-run", scriptPath: "skill://flow/workflow.js", argsText: "{}" } as const,
+      {
+        type: "command-invalid-args",
+        command: "workflow",
+        input: "bad",
+        usage: "/workflow",
+      } as const,
+      parseCommand("/idle bad"),
+      parseCommand("/heartbeat bad"),
+      parseCommand("/goal"),
+    ]) {
+      const result = await processSlashCommand(parsed, env);
+      if (result.kind !== "complete") throw new Error("expected gate before async handler");
+      expectDisposition(result, "restore");
+      expect(
+        result.actions.some(
+          (action) => action.type === "show-toast" && action.toast.type === "error"
+        )
+      ).toBe(true);
+    }
+    expect(forbidden).not.toHaveBeenCalled();
+
+    // Conversation-local preferences stay usable; they do not start a workspace operation.
+    const vim = await processSlashCommand({ type: "vim-toggle" }, env);
+    if (vim.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(vim, "consume");
+    expect(vim.actions).toContainEqual({ type: "toggle-vim" });
+    const model = await processSlashCommand(
+      { type: "model-set", modelString: "anthropic:claude-sonnet-4-6" },
+      createEnv({ isSideChat: true })
+    );
+    if (model.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(model, "consume");
+    expect(model.actions).toContainEqual({
+      type: "set-preferred-model",
+      model: "anthropic:claude-sonnet-4-6",
+    });
+  });
+
+  test("/side and /btw open a blank side chat without sending a first message", async () => {
+    ensureWindowDispatchEvent();
+    const sendMessage = mock(() => Promise.reject(new Error("must not auto-send")));
+    const createSideChat = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        metadata: {
+          id: "side-id",
+          name: "side",
+          projectName: "project",
+          projectPath: "/tmp/project",
+          namedWorkspacePath: "/tmp/side",
+          runtimeConfig: { type: "local" as const },
+          sideChatParentWorkspaceId: "test-ws",
+        },
+      })
+    );
+    const env = createEnv({
+      api: createTestApiClient({ workspace: { createSideChat, sendMessage } }),
+    });
+    for (const input of ["/side", "/btw"]) {
+      const { result } = await finishCommand(await processSlashCommand(parseCommand(input), env));
+      expectDisposition(result, "consume");
+    }
+    expect(createSideChat).toHaveBeenCalledTimes(2);
+    expect(createSideChat).toHaveBeenCalledWith({ parentWorkspaceId: "test-ws" });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("arguments to /side and /btw preserve the input and never create or send", async () => {
+    const forbidden = mock(() => Promise.reject(new Error("must not reach backend")));
+    const env = createEnv({
+      api: createTestApiClient({
+        workspace: { createSideChat: forbidden, sendMessage: forbidden },
+      }),
+    });
+    for (const input of ["/side why?", "/btw --help"]) {
+      const { result, batches } = await finishCommand(
+        await processSlashCommand(parseCommand(input), env)
+      );
+      expectDisposition(result, "restore");
+      expect(batches.flat().some((action) => action.type === "clear-input")).toBe(false);
+    }
+    expect(forbidden).not.toHaveBeenCalled();
+  });
+
+  test("/side starts a side chat of the current workspace and restores input on failure", async () => {
+    const createSideChat = mock((_input: { parentWorkspaceId: string }) =>
+      Promise.resolve({ success: false as const, error: "Side chats cannot be nested." })
+    );
+    const { batches, result } = await finishCommand(
+      await processSlashCommand(
+        { type: "side" },
+        createEnv({ api: createTestApiClient({ workspace: { createSideChat } }) })
+      )
+    );
+    expect(createSideChat).toHaveBeenCalledWith({ parentWorkspaceId: "test-ws" });
+    expect(batches[0]).toContainEqual({ type: "clear-input" });
+    expectDisposition(result, "restore");
+    expectToast(result.actions, { type: "error", message: "Side chats cannot be nested." });
+  });
+
+  test("returns idle-compaction and debug actions", async () => {
+    const setIdleCompaction = mock(() => Promise.resolve({ success: true, data: undefined }));
+    const idle = await processSlashCommand(
+      { type: "idle-compaction", hours: 2 },
+      createEnv({
+        api: {
+          projects: { idleCompaction: { set: setIdleCompaction } },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    if (idle.kind !== "phase") throw new Error("expected phase result");
+    expect(idle.actions).toEqual([{ type: "clear-input" }]);
+    expect(setIdleCompaction).not.toHaveBeenCalled();
+    const idleComplete = await idle.continue();
+    if (idleComplete.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(idleComplete, "consume");
+    expectToast(idleComplete.actions, {
+      type: "success",
+      message: "Idle compaction set to 2 hours",
+    });
+
+    ensureWindowDispatchEvent();
+    const debug = await processSlashCommand({ type: "debug-llm-request" }, createEnv());
+    expect(debug).toEqual({
+      kind: "complete",
+      actions: [{ type: "clear-input" }],
+      inputDisposition: "consume",
+    });
+    expect(window.dispatchEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "mux:openDebugLlmRequest" })
     );
   });
 });
 
-describe("processSlashCommand - goal lifecycle commands", () => {
-  test("surfaces invalid transition messages for lifecycle commands", async () => {
-    ensureWindowDispatchEvent();
-    const context = createGoalCommandContext({
-      workspace: {
-        getGoal: mock(() => Promise.resolve({ goal: null })),
-        setGoal: mock(() =>
-          Promise.resolve({
-            success: false,
-            error: { type: "invalid_transition", message: "Cannot pause a missing goal." },
-          })
-        ),
-        clearGoal: mock(),
+function createGoalEnv(api: SlashCommandEnv["api"]): SlashCommandEnv {
+  return createEnv({ api, workspaceId: "goal-ws" });
+}
+
+describe("processSlashCommand goal results", () => {
+  // #5461: a conflict means the goal was replaced; retrying would pause the replacement.
+  test("surfaces a conflict as a restore result without retrying", async () => {
+    const conflict = {
+      success: false as const,
+      error: {
+        type: "goal_conflict" as const,
+        expectedGoalId: "11111111-1111-4111-8111-111111111111",
+        actualGoalId: "22222222-2222-4222-8222-222222222222",
       },
-    } as unknown as SlashCommandContext["api"]);
-
-    const result = await processSlashCommand({ type: "goal-pause" }, context);
-
-    expect(result).toEqual({ clearInput: false, toastShown: true });
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({ type: "error", message: "Cannot pause a missing goal." })
+    };
+    const setGoal = mock(() => Promise.resolve(conflict));
+    const settled = await finishCommand(
+      await processSlashCommand(
+        { type: "goal-pause" },
+        createGoalEnv({
+          workspace: {
+            getGoal: mock(() =>
+              Promise.resolve({
+                goal: { goalId: "11111111-1111-4111-8111-111111111111", status: "active" },
+              })
+            ),
+            setGoal,
+          },
+        } as unknown as SlashCommandEnv["api"])
+      )
     );
+    expect(setGoal).toHaveBeenCalledTimes(1);
+    expectDisposition(settled.result, "restore");
+    expectToast(settled.result.actions, {
+      type: "error",
+      message: "Goal changed in another window. Please try again.",
+    });
   });
 
-  test("dispatches pause, resume, and complete goal commands", async () => {
+  test("passes configured defaults and multiline objectives to the backend", async () => {
     ensureWindowDispatchEvent();
+    const objective = "Implement PRD\n\nRead first:\n- CONTEXT.md\n- PRD.md";
+    const parsed = parseCommand("/goal " + objective);
+    if (parsed?.type !== "goal-set") throw new Error("expected goal-set");
     const setGoal = mock(() =>
       Promise.resolve({
         success: true,
-        data: { goalId: "33333333-3333-4333-8333-333333333333", objective: "goal" },
+        data: { goalId: "33333333-3333-4333-8333-333333333333", objective },
       })
     );
-    const context = createGoalCommandContext({
-      providers: { getConfig: mock(() => Promise.resolve({})) },
-      workspace: {
-        getGoal: mock(() => Promise.resolve({ goal: { status: "paused", budgetCents: null } })),
-        setGoal,
-        clearGoal: mock(),
-      },
-    } as unknown as SlashCommandContext["api"]);
-
-    await processSlashCommand({ type: "goal-pause" }, context);
-    await processSlashCommand({ type: "goal-resume" }, context);
-    await processSlashCommand({ type: "goal-complete", summary: "Done." }, context);
-
-    expect(setGoal).toHaveBeenNthCalledWith(1, {
-      workspaceId: "goal-ws",
-      expectedGoalId: null,
-      status: "paused",
-    });
-    expect(setGoal).toHaveBeenNthCalledWith(2, {
-      workspaceId: "goal-ws",
-      status: "active",
-      expectedGoalId: null,
-    });
-    expect(setGoal).toHaveBeenNthCalledWith(3, {
-      workspaceId: "goal-ws",
-      status: "complete",
-      completionSummary: "Done.",
-      expectedGoalId: null,
-    });
-  });
-
-  test("refuses to resume a budgeted goal on an unpriced current model", async () => {
-    ensureWindowDispatchEvent();
-    const setGoal = mock(() => Promise.resolve({ success: true, data: {} }));
-    const context = createGoalCommandContext({
-      providers: { getConfig: mock(() => Promise.resolve({})) },
-      workspace: {
-        getGoal: mock(() =>
-          Promise.resolve({
-            goal: {
-              goalId: "11111111-1111-4111-8111-111111111111",
-              status: "paused",
-              budgetCents: 500,
-            },
-          })
-        ),
-        setGoal,
-        clearGoal: mock(),
-      },
-    } as unknown as SlashCommandContext["api"]);
-    context.sendMessageOptions.model = "custom:unpriced-model";
-
-    const result = await processSlashCommand({ type: "goal-resume" }, context);
-
-    expect(result).toEqual({ clearInput: false, toastShown: true });
-    expect(setGoal).not.toHaveBeenCalled();
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "error",
-        message:
-          "Current model has no pricing data. Pick a priced model, use -b 0 with a turn cap, or change goal budget defaults in Settings.",
-      })
+    const settled = await finishCommand(
+      await processSlashCommand(
+        parsed,
+        createGoalEnv({
+          config: {
+            getConfig: mock(() =>
+              Promise.resolve({
+                goalDefaults: {
+                  defaultBudgetCents: 350,
+                  defaultTurnCap: 25,
+                  alwaysRequireExplicitBudget: true,
+                },
+              })
+            ),
+          },
+          workspace: {
+            getGoal: mock(() => Promise.resolve({ goal: null })),
+            setGoal,
+          },
+        } as unknown as SlashCommandEnv["api"])
+      )
     );
-  });
-});
-
-describe("processSlashCommand - goal budgets", () => {
-  test("applies configured defaults when budget and turn cap are omitted", async () => {
-    ensureWindowDispatchEvent();
-    const setGoal = mock().mockResolvedValueOnce({
-      success: true,
-      data: { goalId: "33333333-3333-4333-8333-333333333333", objective: "new objective" },
-    });
-    const context = createGoalCommandContext({
-      config: {
-        getConfig: mock(() =>
-          Promise.resolve({
-            goalDefaults: {
-              defaultBudgetCents: 350,
-              defaultTurnCap: 25,
-              alwaysRequireExplicitBudget: true,
-            },
-          })
-        ),
-      },
-      workspace: {
-        getGoal: mock(() => Promise.resolve({ goal: null })),
-        setGoal,
-        clearGoal: mock(),
-      },
-    } as unknown as SlashCommandContext["api"]);
-
-    await processSlashCommand({ type: "goal-set", objective: "new objective" }, context);
-
+    expectDisposition(settled.result, "consume");
     expect(setGoal).toHaveBeenCalledWith({
       workspaceId: "goal-ws",
-      objective: "new objective",
+      objective,
       expectedGoalId: null,
       budgetCents: 350,
       turnCap: 25,
     });
   });
 
-  test("passes parsed multiline goal objectives through to setGoal", async () => {
-    ensureWindowDispatchEvent();
-    const objective = "Implement PRD\n\nRead first:\n- CONTEXT.md\n- PRD.md";
-    const setGoal = mock().mockResolvedValueOnce({
-      success: true,
-      data: { goalId: "33333333-3333-4333-8333-333333333333", objective },
-    });
-    const context = createGoalCommandContext({
-      config: { getConfig: mock(() => Promise.resolve({})) },
-      workspace: {
-        getGoal: mock(() => Promise.resolve({ goal: null })),
-        setGoal,
-        clearGoal: mock(),
-      },
-    } as unknown as SlashCommandContext["api"]);
-
-    const parsed = parseCommand("/goal Implement PRD\n\nRead first:\n- CONTEXT.md\n- PRD.md");
-    if (parsed?.type !== "goal-set") {
-      throw new Error("expected multiline /goal to parse as goal-set");
-    }
-
-    const result = await processSlashCommand(parsed, context);
-
-    expect(result).toEqual({ clearInput: true, toastShown: false });
-    expect(setGoal).toHaveBeenCalledWith({
-      workspaceId: "goal-ws",
-      objective,
-      expectedGoalId: null,
-      budgetCents: 200,
-      turnCap: null,
-    });
-    expect(context.setToast).not.toHaveBeenCalled();
-    expect(window.dispatchEvent).toHaveBeenCalledWith(
-      expect.objectContaining({ type: "mux:openGoalTab" })
-    );
-  });
-
-  test("passes explicit no-budget and turn cap through to setGoal", async () => {
-    ensureWindowDispatchEvent();
-    const setGoal = mock().mockResolvedValueOnce({
-      success: true,
-      data: { goalId: "33333333-3333-4333-8333-333333333333", objective: "new objective" },
-    });
-    const context = createGoalCommandContext({
-      config: { getConfig: mock(() => Promise.resolve({})) },
-      workspace: {
-        getGoal: mock(() => Promise.resolve({ goal: null })),
-        setGoal,
-        clearGoal: mock(),
-      },
-    } as unknown as SlashCommandContext["api"]);
-
-    await processSlashCommand(
-      { type: "goal-set", objective: "new objective", budgetCents: null, turnCap: 10 },
-      context
-    );
-
-    expect(setGoal).toHaveBeenCalledWith({
-      workspaceId: "goal-ws",
-      objective: "new objective",
-      expectedGoalId: null,
-      budgetCents: null,
-      turnCap: 10,
-    });
-  });
-
-  test("updates an existing goal budget without applying defaults", async () => {
-    ensureWindowDispatchEvent();
-    const currentGoal = {
-      goalId: "11111111-1111-4111-8111-111111111111",
-      objective: "existing objective",
-    };
-    const setGoal = mock().mockResolvedValueOnce({
-      success: true,
-      data: { ...currentGoal, budgetCents: 500 },
-    });
-    const context = createGoalCommandContext({
-      config: {
-        getConfig: mock(() =>
-          Promise.resolve({
-            goalDefaults: {
-              defaultBudgetCents: 350,
-              defaultTurnCap: 25,
-              alwaysRequireExplicitBudget: true,
+  // The backend lets the user move a completed goal to paused (a revive); /goal pause must not.
+  test.each(["complete", "paused", null] as const)(
+    "refuses /goal pause without a running goal (%p)",
+    async (status) => {
+      const setGoal = mock();
+      const settled = await finishCommand(
+        await processSlashCommand(
+          { type: "goal-pause" },
+          createGoalEnv({
+            workspace: {
+              getGoal: mock(() =>
+                Promise.resolve({ goal: status == null ? null : { goalId: "id", status } })
+              ),
+              setGoal,
             },
-          })
-        ),
-      },
-      workspace: {
-        getGoal: mock(() => Promise.resolve({ goal: currentGoal })),
-        setGoal,
-        clearGoal: mock(),
-      },
-    } as unknown as SlashCommandContext["api"]);
+          } as unknown as SlashCommandEnv["api"])
+        )
+      );
+      expect(setGoal).not.toHaveBeenCalled();
+      expectDisposition(settled.result, "restore");
+      expect(settled.result.actions[0]).toMatchObject({
+        type: "show-toast",
+        toast: { type: "error" },
+      });
+    }
+  );
 
-    await processSlashCommand({ type: "goal-budget", budgetCents: 500 }, context);
+  test.each([
+    { status: "paused", opensForm: true },
+    { status: "complete", opensForm: false },
+    { status: null, opensForm: false },
+  ] as const)(
+    "/goal complete without a summary opens the form only for a completable goal ($status)",
+    async ({ status, opensForm }) => {
+      ensureWindowDispatchEvent();
+      const settled = await finishCommand(
+        await processSlashCommand(
+          { type: "goal-complete" },
+          createGoalEnv({
+            workspace: {
+              getGoal: mock(() =>
+                Promise.resolve({ goal: status == null ? null : { goalId: "id", status } })
+              ),
+            },
+          } as unknown as SlashCommandEnv["api"])
+        )
+      );
+      expectDisposition(settled.result, opensForm ? "consume" : "restore");
+      if (!opensForm) {
+        expect(settled.result.actions[0]).toMatchObject({
+          type: "show-toast",
+          toast: { type: "error" },
+        });
+      }
+    }
+  );
 
-    expect(setGoal).toHaveBeenCalledWith({
-      workspaceId: "goal-ws",
-      budgetCents: 500,
-      expectedGoalId: currentGoal.goalId,
-    });
-  });
-
-  test("passes no-budget budget updates through on unpriced current model", async () => {
-    ensureWindowDispatchEvent();
-    const currentGoal = {
-      goalId: "11111111-1111-4111-8111-111111111111",
-      objective: "existing objective",
-    };
-    const setGoal = mock().mockResolvedValueOnce({
-      success: true,
-      data: { ...currentGoal, budgetCents: null },
-    });
-    const context = createGoalCommandContext({
-      config: { getConfig: mock(() => Promise.resolve({})) },
-      workspace: {
-        getGoal: mock(() => Promise.resolve({ goal: currentGoal })),
-        setGoal,
-        clearGoal: mock(),
-      },
-    } as unknown as SlashCommandContext["api"]);
-    context.sendMessageOptions.model = "custom-provider:no-price-model";
-
-    await processSlashCommand({ type: "goal-budget", budgetCents: null }, context);
-
-    expect(setGoal).toHaveBeenCalledWith({
-      workspaceId: "goal-ws",
-      budgetCents: null,
-      expectedGoalId: currentGoal.goalId,
-    });
-  });
-
-  test("passes zero-dollar budget updates through on unpriced current model", async () => {
-    ensureWindowDispatchEvent();
-    const currentGoal = {
-      goalId: "11111111-1111-4111-8111-111111111111",
-      objective: "existing objective",
-    };
-    const setGoal = mock().mockResolvedValueOnce({
-      success: true,
-      data: { ...currentGoal, budgetCents: null },
-    });
-    const context = createGoalCommandContext({
-      config: { getConfig: mock(() => Promise.resolve({})) },
-      workspace: {
-        getGoal: mock(() => Promise.resolve({ goal: currentGoal })),
-        setGoal,
-        clearGoal: mock(),
-      },
-    } as unknown as SlashCommandContext["api"]);
-    context.sendMessageOptions.model = "custom-provider:no-price-model";
-
-    await processSlashCommand({ type: "goal-budget", budgetCents: 0 }, context);
-
-    expect(setGoal).toHaveBeenCalledWith({
-      workspaceId: "goal-ws",
-      budgetCents: 0,
-      expectedGoalId: currentGoal.goalId,
-    });
-  });
-
-  test("refuses budgeted goals on an unpriced current model", async () => {
-    ensureWindowDispatchEvent();
-    const setGoal = mock();
-    const context = createGoalCommandContext({
-      config: { getConfig: mock(() => Promise.resolve({})) },
-      workspace: {
-        getGoal: mock(() => Promise.resolve({ goal: null })),
-        setGoal,
-        clearGoal: mock(),
-      },
-    } as unknown as SlashCommandContext["api"]);
-    context.sendMessageOptions.model = "custom-provider:no-price-model";
-
-    const result = await processSlashCommand(
-      { type: "goal-set", objective: "new objective", budgetCents: 500 },
-      context
+  test("returns lifecycle success and pricing failure actions", async () => {
+    const paused = await finishCommand(
+      await processSlashCommand(
+        { type: "goal-pause" },
+        createGoalEnv({
+          workspace: {
+            getGoal: mock(() => Promise.resolve({ goal: { goalId: "id", status: "active" } })),
+            setGoal: mock(() =>
+              Promise.resolve({ success: true, data: { goalId: "id", status: "paused" } })
+            ),
+          },
+        } as unknown as SlashCommandEnv["api"])
+      )
     );
+    expectDisposition(paused.result, "consume");
+    expectToast(paused.result.actions, { type: "success", message: "Goal paused" });
 
-    expect(result).toEqual({ clearInput: false, toastShown: true });
-    expect(setGoal).not.toHaveBeenCalled();
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "error",
-        message:
-          "Current model has no pricing data. Pick a priced model, use -b 0 with a turn cap, or change goal budget defaults in Settings.",
-      })
+    const resume = await finishCommand(
+      await processSlashCommand(
+        { type: "goal-resume" },
+        createGoalEnv({
+          providers: { getConfig: mock(() => Promise.resolve({})) },
+          workspace: {
+            getGoal: mock(() => Promise.resolve({ goal: { status: "paused", budgetCents: 500 } })),
+          },
+        } as unknown as SlashCommandEnv["api"])
+      )
     );
+    expectDisposition(resume.result, "restore");
+    expect(resume.result.actions[0]).toMatchObject({
+      type: "show-toast",
+      toast: { type: "error" },
+    });
   });
 });
 
-describe("processSlashCommand - heartbeat-set", () => {
-  const HEARTBEAT_EXPERIMENT_KEY = getExperimentKey(EXPERIMENT_IDS.WORKSPACE_HEARTBEATS);
+describe("processSlashCommand heartbeat results", () => {
+  test("returns a missing-workspace error before a phase", async () => {
+    const api = {
+      workspace: { heartbeat: { get: mock(), set: mock() } },
+    } as unknown as SlashCommandEnv["api"];
+    const missing = await processSlashCommand(
+      { type: "heartbeat-set", minutes: 30 },
+      createEnv({ api, workspaceId: undefined })
+    );
+    expect(missing.kind).toBe("complete");
+    if (missing.kind !== "complete") throw new Error("expected complete result");
+    expectToast(missing.actions, { type: "error", message: "No workspace selected" });
+  });
 
-  function setHeartbeatExperiment(enabled: boolean) {
-    globalThis.localStorage.setItem(HEARTBEAT_EXPERIMENT_KEY, JSON.stringify(enabled));
-  }
+  test("preserves saved heartbeat fields and returns success", async () => {
+    const heartbeatGet = mock(() =>
+      Promise.resolve({
+        enabled: true as const,
+        intervalMs: 45 * 60 * 1000,
+        message: "Review the workspace status before taking action.",
+      })
+    );
+    const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
+    const initial = await processSlashCommand(
+      { type: "heartbeat-set", minutes: 30 },
+      createEnv({
+        api: {
+          workspace: { heartbeat: { get: heartbeatGet, set: heartbeatSet } },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    expect(initial.kind).toBe("phase");
+    if (initial.kind !== "phase") throw new Error("expected phase result");
+    expect(initial.actions).toEqual([{ type: "clear-input" }]);
+    const complete = await initial.continue();
+    expect(complete.kind).toBe("complete");
+    if (complete.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(complete, "consume");
+    expect(heartbeatSet).toHaveBeenCalledWith({
+      workspaceId: "test-ws",
+      enabled: true,
+      intervalMs: 30 * 60 * 1000,
+      message: "Review the workspace status before taking action.",
+    });
+    expectToast(complete.actions, {
+      type: "success",
+      message: "Heartbeat set to every 30 minutes",
+    });
+  });
 
-  const createSlashCommandContext = (options?: {
-    api?: SlashCommandContext["api"] | null;
-    workspaceId?: string;
-    variant?: SlashCommandContext["variant"];
-  }): SlashCommandContext => {
-    const setInput = mock(() => undefined);
-    const setToast = mock(() => undefined);
+  // Disabling must not save an interval: a workspace without one follows the global default,
+  // and writing the built-in default would silently pin it (#5692).
+  test("leaves the interval unset when disabling without saved settings", async () => {
+    const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
+    const settled = await finishCommand(
+      await processSlashCommand(
+        { type: "heartbeat-set", minutes: null },
+        createEnv({
+          api: {
+            workspace: {
+              heartbeat: {
+                get: mock(() => Promise.reject(new Error("missing"))),
+                set: heartbeatSet,
+              },
+            },
+          } as unknown as SlashCommandEnv["api"],
+        })
+      )
+    );
+    expectDisposition(settled.result, "consume");
+    expect(heartbeatSet).toHaveBeenCalledWith({
+      workspaceId: "test-ws",
+      enabled: false,
+    });
+  });
 
-    return {
-      api: options?.api ?? null,
-      workspaceId:
-        options && Object.hasOwn(options, "workspaceId") ? options.workspaceId : "test-ws",
-      variant: options?.variant ?? "workspace",
-      projectPath: "/tmp/project",
-      setPreferredModel: mock(() => undefined),
-      setVimEnabled: mock((cb: (prev: boolean) => boolean) => cb(false)),
-      resetInputHeight: mock(() => undefined),
-      onTruncateHistory: mock(() => Promise.resolve(undefined)),
-      onMessageSent: mock(() => undefined),
-      onCheckReviews: mock(() => undefined),
-      attachedReviewIds: [],
-      openSettings: mock(() => undefined),
-      sendMessageOptions: {
-        model: "anthropic:claude-sonnet-4-6",
-        thinkingLevel: "off",
-        toolPolicy: [],
-        agentId: "exec",
+  test("returns backend update failures with restore disposition", async () => {
+    const settled = await finishCommand(
+      await processSlashCommand(
+        { type: "heartbeat-set", minutes: 30 },
+        createEnv({
+          api: {
+            workspace: {
+              heartbeat: {
+                get: mock(() => Promise.resolve({ enabled: false, intervalMs: 1 })),
+                set: mock(() =>
+                  Promise.resolve({ success: false, error: "Heartbeat update failed" })
+                ),
+              },
+            },
+          } as unknown as SlashCommandEnv["api"],
+        })
+      )
+    );
+    expectDisposition(settled.result, "restore");
+    expectToast(settled.result.actions, {
+      type: "error",
+      message: "Heartbeat update failed",
+    });
+  });
+});
+
+describe("detached command work", () => {
+  test("dream returns immediately and maps success and rejection to settle actions", async () => {
+    const consolidate = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        data: { ops: [{ applied: true }, { applied: false }] },
+      })
+    );
+    const result = await processSlashCommand(
+      { type: "dream" },
+      createEnv({
+        api: { memory: { consolidate } } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    expect(result.kind).toBe("complete");
+    if (result.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(result, "consume");
+    expect(result.actions).toEqual([{ type: "clear-input" }]);
+    expect(consolidate).not.toHaveBeenCalled();
+    const successActions = await result.backgroundTask?.();
+    expect(successActions).toBeDefined();
+    expectToast(successActions ?? [], {
+      type: "success",
+      message: "Memory consolidated: 1 change(s)",
+    });
+
+    const failed = await processSlashCommand(
+      { type: "dream" },
+      createEnv({
+        api: {
+          memory: {
+            consolidate: mock(() =>
+              Promise.resolve({ success: false as const, error: "backend refused" })
+            ),
+          },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    if (failed.kind !== "complete") throw new Error("expected complete result");
+    const failedActions = await failed.backgroundTask?.();
+    expectToast(failedActions ?? [], {
+      type: "error",
+      message: "Memory consolidation failed: backend refused",
+    });
+
+    const rejected = await processSlashCommand(
+      { type: "dream" },
+      createEnv({
+        api: {
+          memory: { consolidate: mock(() => Promise.reject(new Error("offline"))) },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    if (rejected.kind !== "complete") throw new Error("expected complete result");
+    const rejectedActions = await rejected.backgroundTask?.();
+    expectToast(rejectedActions ?? [], {
+      type: "error",
+      message: "Memory consolidation failed: Error: offline",
+    });
+  });
+
+  test("refine returns immediate validation or detached settle actions", async () => {
+    const missingProposal = await processSlashCommand(
+      { type: "refine", apply: true },
+      createEnv({
+        api: { refinements: {} } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    if (missingProposal.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(missingProposal, "consume");
+    expect(missingProposal.backgroundTask).toBeUndefined();
+    expect(missingProposal.actions[0]).toEqual({ type: "clear-input" });
+    expect(missingProposal.actions[1]).toMatchObject({
+      type: "show-toast",
+      toast: { type: "error" },
+    });
+
+    const run = mock(() =>
+      Promise.resolve({
+        success: true as const,
+        data: { applied: [], staged: [{ path: "src/a.ts" }], failed: [], noOp: false },
+      })
+    );
+    const result = await processSlashCommand(
+      { type: "refine", apply: false },
+      createEnv({
+        api: { refinements: { run } } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    if (result.kind !== "complete") throw new Error("expected complete result");
+    expect(run).not.toHaveBeenCalled();
+    const actions = await result.backgroundTask?.();
+    expectToast(actions ?? [], {
+      type: "success",
+      message: "Refine: 1 edit(s) staged — approve with /refine apply",
+    });
+
+    const failed = await processSlashCommand(
+      { type: "refine", apply: false },
+      createEnv({
+        api: {
+          refinements: {
+            run: mock(() => Promise.resolve({ success: false as const, error: "backend refused" })),
+          },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    if (failed.kind !== "complete") throw new Error("expected complete result");
+    expectToast((await failed.backgroundTask?.()) ?? [], {
+      type: "error",
+      message: "Refine failed: backend refused",
+    });
+
+    const rejected = await processSlashCommand(
+      { type: "refine", apply: false },
+      createEnv({
+        api: {
+          refinements: { run: mock(() => Promise.reject(new Error("offline"))) },
+        } as unknown as SlashCommandEnv["api"],
+      })
+    );
+    if (rejected.kind !== "complete") throw new Error("expected complete result");
+    expectToast((await rejected.backgroundTask?.()) ?? [], {
+      type: "error",
+      message: "Refine failed: Error: offline",
+    });
+  });
+});
+
+describe("compact and plan command results", () => {
+  test("compact returns phased composer actions and terminal review actions", async () => {
+    const reviews: ReviewNoteData[] = [
+      {
+        filePath: "src/test.ts",
+        lineRange: "10-15",
+        selectedCode: "const x = 1;",
+        userNote: "Please fix this bug",
       },
-      setInput,
-      setToast,
-      setAttachments: mock(() => undefined),
-      setSendingState: mock(() => undefined),
+    ];
+    const sentMessages: Array<{
+      options?: {
+        historyEditPrecondition?: HistoryEditPrecondition;
+        muxMetadata?: { parsed?: { followUpContent?: { reviews?: ReviewNoteData[] } } };
+      };
+    }> = [];
+    const sendMessage = mock((input: (typeof sentMessages)[number]) => {
+      sentMessages.push(input);
+      return Promise.resolve({ success: true });
+    });
+    const historyEditPrecondition: HistoryEditPrecondition = {
+      editMessageId: "edit-id",
+      rangeStartMessageId: "edit-id",
+      rangeStartHistorySequence: 1,
+      newestMessageId: "newest-id",
+      newestHistorySequence: 2,
+      rangeRowCount: 2,
+      rangeFingerprint: "feedface",
     };
+    // Editing compaction rewrites history, so it only dispatches through an open barrier.
+    const complete = await withTranscriptBarrier(true, async () => {
+      const initial = await processSlashCommand(
+        { type: "compact" },
+        createEnv({
+          api: { workspace: { sendMessage } } as unknown as SlashCommandEnv["api"],
+          reviews,
+          editMessageId: "edit-id",
+          historyEditPrecondition,
+          attachedReviewIds: ["review-1"],
+          sendMessageOptions: { ...sendMessageOptions, queueDispatchMode: "turn-end" },
+        })
+      );
+      expect(initial.kind).toBe("phase");
+      if (initial.kind !== "phase") throw new Error("expected phase result");
+      expect(initial.actions).toEqual([
+        { type: "clear-input" },
+        { type: "set-sending", sending: true },
+      ]);
+      return initial.continue();
+    });
+    expect(complete.kind).toBe("complete");
+    if (complete.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(complete, "consume");
+    // Attachments are cleared only once compaction actually started.
+    expect(complete.actions).toContainEqual({ type: "clear-attachments" });
+    expect(complete.actions).toContainEqual({ type: "cancel-edit" });
+    expect(complete.actions).toContainEqual({ type: "check-reviews", reviewIds: ["review-1"] });
+    expect(complete.actions).toContainEqual({ type: "message-sent", dispatchMode: "turn-end" });
+    expect(sentMessages[0]?.options?.muxMetadata?.parsed?.followUpContent?.reviews).toEqual(
+      reviews
+    );
+    // The composer's edit fence rides the compaction send unchanged.
+    expect(sentMessages[0]?.options?.historyEditPrecondition).toEqual(historyEditPrecondition);
+  });
+
+  test("compact edit refuses through the slash error path while the transcript is not caught up", async () => {
+    const sendMessage = mock(() => Promise.resolve({ success: true }));
+    const settled = await withTranscriptBarrier(false, async () =>
+      finishCommand(
+        await processSlashCommand(
+          { type: "compact" },
+          createEnv({
+            api: { workspace: { sendMessage } } as unknown as SlashCommandEnv["api"],
+            editMessageId: "edit-id",
+          })
+        )
+      )
+    );
+    expect(sendMessage).not.toHaveBeenCalled();
+    expectDisposition(settled.result, "restore");
+    expectToast(settled.result.actions, {
+      type: "error",
+      message: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE,
+    });
+    expect(settled.result.actions).toContainEqual({ type: "set-sending", sending: false });
+    expect(settled.result.actions).not.toContainEqual({ type: "cancel-edit" });
+  });
+
+  test("compact edit refused with history-changed stays in edit mode and starts the transcript refresh", async () => {
+    const sendMessage = mock(() =>
+      Promise.resolve({ success: false as const, error: { type: "history-changed" as const } })
+    );
+    const historyEditPrecondition: HistoryEditPrecondition = {
+      editMessageId: "edit-id",
+      rangeStartMessageId: "edit-id",
+      rangeStartHistorySequence: 1,
+      newestMessageId: "newest-id",
+      newestHistorySequence: 2,
+      rangeRowCount: 2,
+      rangeFingerprint: "feedface",
+    };
+    const settled = await withTranscriptBarrier(true, async () =>
+      finishCommand(
+        await processSlashCommand(
+          { type: "compact" },
+          createEnv({
+            api: { workspace: { sendMessage } } as unknown as SlashCommandEnv["api"],
+            editMessageId: "edit-id",
+            historyEditPrecondition,
+          })
+        )
+      )
+    );
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expectDisposition(settled.result, "restore");
+    expect(settled.result.actions).toContainEqual({
+      type: "edit-history-changed",
+      editMessageId: "edit-id",
+      precondition: historyEditPrecondition,
+    });
+    expect(settled.result.actions).not.toContainEqual({ type: "cancel-edit" });
+    // The whole draft comes back for review: no phase or completion action dropped the files.
+    expect(settled.batches.flat()).not.toContainEqual({ type: "clear-attachments" });
+  });
+
+  test("compact validation errors restore without starting a phase", async () => {
+    const result = await processSlashCommand(
+      { type: "compact", model: "invalid" },
+      createEnv({ api: {} as unknown as SlashCommandEnv["api"] })
+    );
+    expect(result.kind).toBe("complete");
+    if (result.kind !== "complete") throw new Error("expected complete result");
+    expectDisposition(result, "restore");
+    expect(result.actions[0]).toMatchObject({ type: "show-toast", toast: { type: "error" } });
+  });
+
+  test("plan show replaces its singleton preview", async () => {
+    const workspaceId = "test-workspace-id";
+    const store = useWorkspaceStoreRaw();
+    store.dispose();
+    const metadata: FrontendWorkspaceMetadata = {
+      id: workspaceId,
+      name: "test-workspace",
+      title: "Test Workspace",
+      projectName: "Project",
+      projectPath: "/tmp/project",
+      namedWorkspacePath: "/tmp/project/test-workspace",
+      runtimeConfig: { type: "local" },
+      createdAt: "2026-08-05T00:00:00.000Z",
+    };
+    workspaceStore.addWorkspace(metadata);
+    try {
+      for (const content of ["# First plan", "# Updated plan"]) {
+        const settled = await finishCommand(
+          await processSlashCommand(
+            { type: "plan-show" },
+            createEnv({
+              workspaceId,
+              api: {
+                workspace: {
+                  getPlanContent: mock(() =>
+                    Promise.resolve({
+                      success: true,
+                      data: { content, path: "/path/to/plan.md" },
+                    })
+                  ),
+                },
+              } as unknown as SlashCommandEnv["api"],
+            })
+          )
+        );
+        expectDisposition(settled.result, "consume");
+      }
+      const previews = store
+        .getWorkspaceState(workspaceId)
+        .messages.filter((message) => message.type === "plan-display");
+      expect(previews).toHaveLength(1);
+      expect(previews[0]).toMatchObject({ content: "# Updated plan" });
+    } finally {
+      store.dispose();
+    }
+  });
+
+  test("plan show missing result consumes with an error toast", async () => {
+    const settled = await finishCommand(
+      await processSlashCommand(
+        { type: "plan-show" },
+        createEnv({
+          api: {
+            workspace: {
+              getPlanContent: mock(() =>
+                Promise.resolve({ success: false, error: "No plan found" })
+              ),
+            },
+          } as unknown as SlashCommandEnv["api"],
+        })
+      )
+    );
+    expectDisposition(settled.result, "consume");
+    expectToast(settled.result.actions, {
+      type: "error",
+      message: "No plan found for this workspace",
+    });
+  });
+
+  test("plan open with no plan consumes with an error toast and skips the editor", async () => {
+    const getInfo = mock(() => Promise.resolve(null));
+    const settled = await finishCommand(
+      await processSlashCommand(
+        { type: "plan-open" },
+        createEnv({
+          api: {
+            workspace: {
+              getPlanContent: mock(() =>
+                Promise.resolve({ success: false, error: "No plan found" })
+              ),
+              getInfo,
+            },
+          } as unknown as SlashCommandEnv["api"],
+        })
+      )
+    );
+    expectDisposition(settled.result, "consume");
+    expectToast(settled.result.actions, {
+      type: "error",
+      message: "No plan found for this workspace",
+    });
+    expect(getInfo).not.toHaveBeenCalled();
+  });
+
+  test("plan open surfaces an editor-open failure as an error toast", async () => {
+    const getPlanContent = mock(() =>
+      Promise.resolve({ success: true, data: { content: "# My Plan", path: "/path/to/plan.md" } })
+    );
+    const getInfo = mock(() =>
+      Promise.resolve({ runtimeConfig: { type: "local" } } as unknown as FrontendWorkspaceMetadata)
+    );
+    // openInEditor opens a blank placeholder window before its awaits; give it a
+    // live stub so the flow reaches the recordEditorOpen admission check, whose
+    // refusal is the deterministic failure path independent of deep-link launch.
+    const windowWithOpen = window as unknown as { open?: (...args: unknown[]) => unknown };
+    const previousOpen = windowWithOpen.open;
+    windowWithOpen.open = () => ({
+      closed: false,
+      close: () => undefined,
+      location: { href: "" },
+    });
+    // This suite aliases window to globalThis, which turns the tests/setup.ts
+    // location getter (window.location fallback) into infinite recursion when
+    // deep-link code reads location. Pin an own-value location for this test.
+    const previousLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+    Object.defineProperty(globalThis, "location", {
+      configurable: true,
+      value: { href: "http://localhost/", hostname: "localhost" },
+    });
+    try {
+      const settled = await finishCommand(
+        await processSlashCommand(
+          { type: "plan-open" },
+          createEnv({
+            api: {
+              workspace: { getPlanContent, getInfo },
+              general: {
+                recordEditorOpen: mock(() =>
+                  Promise.resolve({ success: false, error: "Archive in progress" })
+                ),
+              },
+            } as unknown as SlashCommandEnv["api"],
+          })
+        )
+      );
+      expectDisposition(settled.result, "consume");
+      expectToast(settled.result.actions, { type: "error", message: "Archive in progress" });
+      expect(getPlanContent).toHaveBeenCalledWith({ workspaceId: "test-ws" });
+      expect(getInfo).toHaveBeenCalledWith({ workspaceId: "test-ws" });
+    } finally {
+      windowWithOpen.open = previousOpen;
+      if (previousLocation) {
+        Object.defineProperty(globalThis, "location", previousLocation);
+      }
+    }
+  });
+});
+
+describe("executeCompaction transcript barrier", () => {
+  const editFence: HistoryEditPrecondition = {
+    editMessageId: "edit-id",
+    rangeStartMessageId: "edit-id",
+    rangeStartHistorySequence: 3,
+    newestMessageId: "newest-id",
+    newestHistorySequence: 5,
+    rangeRowCount: 3,
+    rangeFingerprint: "0badf00d",
+  };
+  const runCompaction = (
+    editMessageId: string | undefined,
+    historyEditPrecondition?: HistoryEditPrecondition
+  ) => {
+    const sendMessage = mock(
+      (_input: { workspaceId: string; options?: { editMessageId?: string } }) =>
+        Promise.resolve({ success: true })
+    );
+    const result = executeCompaction({
+      api: { workspace: { sendMessage } } as unknown as Parameters<
+        typeof executeCompaction
+      >[0]["api"],
+      workspaceId: "test-ws",
+      sendMessageOptions,
+      editMessageId,
+      historyEditPrecondition,
+    });
+    return { sendMessage, result };
   };
 
-  test("shows an error toast when the heartbeat experiment is disabled", async () => {
-    const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
-    const context = createSlashCommandContext({
-      api: {
-        workspace: {
-          heartbeat: {
-            set: heartbeatSet,
-          },
-        },
-      } as unknown as SlashCommandContext["api"],
+  test("refuses an editing compaction while the transcript is not caught up", async () => {
+    const { sendMessage, result } = await withTranscriptBarrier(false, async () => {
+      const run = runCompaction("edit-id", editFence);
+      return { sendMessage: run.sendMessage, result: await run.result };
     });
-
-    setHeartbeatExperiment(false);
-
-    const result = await processSlashCommand({ type: "heartbeat-set", minutes: 30 }, context);
-
-    expect(result).toEqual({ clearInput: false, toastShown: true });
-    expect(heartbeatSet).not.toHaveBeenCalled();
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "error",
-        message:
-          "Heartbeat configuration requires the Workspace Heartbeats experiment to be enabled",
-      })
-    );
+    expect(result).toEqual({ success: false, error: TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE });
+    expect(sendMessage).not.toHaveBeenCalled();
   });
 
-  test("shows an error toast when no workspace is selected", async () => {
-    const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
-    const context = createSlashCommandContext({
-      api: {
-        workspace: {
-          heartbeat: {
-            set: heartbeatSet,
-          },
-        },
-      } as unknown as SlashCommandContext["api"],
-      workspaceId: undefined,
+  test("dispatches a fenced editing compaction once the transcript is caught up", async () => {
+    const { sendMessage, result } = await withTranscriptBarrier(true, async () => {
+      const run = runCompaction("edit-id", editFence);
+      return { sendMessage: run.sendMessage, result: await run.result };
     });
-
-    setHeartbeatExperiment(true);
-
-    const result = await processSlashCommand({ type: "heartbeat-set", minutes: 30 }, context);
-
-    expect(result).toEqual({ clearInput: false, toastShown: true });
-    expect(heartbeatSet).not.toHaveBeenCalled();
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "error",
-        message: "No workspace selected",
-      })
-    );
-  });
-
-  test("enables workspace heartbeats with the requested interval without clearing the saved message", async () => {
-    const heartbeatGet = mock(() =>
-      Promise.resolve({
-        enabled: true as const,
-        intervalMs: 45 * 60 * 1000,
-        message: "Review the workspace status before taking action.",
-      })
-    );
-    const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
-    const context = createSlashCommandContext({
-      api: {
-        workspace: {
-          heartbeat: {
-            get: heartbeatGet,
-            set: heartbeatSet,
-          },
-        },
-      } as unknown as SlashCommandContext["api"],
+    expect(result).toEqual({ success: true });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(sendMessage.mock.calls[0]?.[0]).toMatchObject({
       workspaceId: "test-ws",
-    });
-
-    setHeartbeatExperiment(true);
-
-    const result = await processSlashCommand({ type: "heartbeat-set", minutes: 30 }, context);
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(context.setInput).toHaveBeenCalledWith("");
-    expect(heartbeatGet).toHaveBeenCalledWith({ workspaceId: "test-ws" });
-    expect(heartbeatSet).toHaveBeenCalledWith({
-      workspaceId: "test-ws",
-      enabled: true,
-      intervalMs: 30 * 60 * 1000,
-      message: "Review the workspace status before taking action.",
-    });
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "success",
-        message: "Heartbeat set to every 30 minutes",
-      })
-    );
-  });
-
-  test("still updates the interval when reading current heartbeat settings fails", async () => {
-    const heartbeatGet = mock(() => Promise.reject(new Error("Corrupted heartbeat settings")));
-    const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
-    const context = createSlashCommandContext({
-      api: {
-        workspace: {
-          heartbeat: {
-            get: heartbeatGet,
-            set: heartbeatSet,
-          },
-        },
-      } as unknown as SlashCommandContext["api"],
-      workspaceId: "test-ws",
-    });
-
-    setHeartbeatExperiment(true);
-
-    const result = await processSlashCommand({ type: "heartbeat-set", minutes: 30 }, context);
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(heartbeatGet).toHaveBeenCalledWith({ workspaceId: "test-ws" });
-    expect(heartbeatSet).toHaveBeenCalledWith({
-      workspaceId: "test-ws",
-      enabled: true,
-      intervalMs: 30 * 60 * 1000,
-    });
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "success",
-        message: "Heartbeat set to every 30 minutes",
-      })
-    );
-  });
-
-  test("preserves the configured interval and message when disabling workspace heartbeats", async () => {
-    const heartbeatGet = mock(() =>
-      Promise.resolve({
-        enabled: true as const,
-        intervalMs: 45 * 60 * 1000,
-        message: "Review the workspace status before taking action.",
-      })
-    );
-    const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
-    const context = createSlashCommandContext({
-      api: {
-        workspace: {
-          heartbeat: {
-            get: heartbeatGet,
-            set: heartbeatSet,
-          },
-        },
-      } as unknown as SlashCommandContext["api"],
-      workspaceId: "test-ws",
-    });
-
-    setHeartbeatExperiment(true);
-
-    const result = await processSlashCommand({ type: "heartbeat-set", minutes: null }, context);
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(heartbeatGet).toHaveBeenCalledWith({ workspaceId: "test-ws" });
-    expect(heartbeatSet).toHaveBeenCalledWith({
-      workspaceId: "test-ws",
-      enabled: false,
-      intervalMs: 45 * 60 * 1000,
-      message: "Review the workspace status before taking action.",
-    });
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "success",
-        message: "Heartbeat disabled",
-      })
-    );
-  });
-
-  test("uses the default interval when disabling heartbeats without saved settings", async () => {
-    const heartbeatGet = mock(() => Promise.resolve(null));
-    const heartbeatSet = mock(() => Promise.resolve({ success: true, data: undefined }));
-    const context = createSlashCommandContext({
-      api: {
-        workspace: {
-          heartbeat: {
-            get: heartbeatGet,
-            set: heartbeatSet,
-          },
-        },
-      } as unknown as SlashCommandContext["api"],
-      workspaceId: "test-ws",
-    });
-
-    setHeartbeatExperiment(true);
-
-    const result = await processSlashCommand({ type: "heartbeat-set", minutes: null }, context);
-
-    expect(result).toEqual({ clearInput: true, toastShown: true });
-    expect(heartbeatGet).toHaveBeenCalledWith({ workspaceId: "test-ws" });
-    expect(heartbeatSet).toHaveBeenCalledWith({
-      workspaceId: "test-ws",
-      enabled: false,
-      intervalMs: HEARTBEAT_DEFAULT_INTERVAL_MS,
+      options: { editMessageId: "edit-id", historyEditPrecondition: editFence },
     });
   });
 
-  test("surfaces backend heartbeat update failures", async () => {
-    const heartbeatGet = mock(() =>
-      Promise.resolve({
-        enabled: true as const,
-        intervalMs: 45 * 60 * 1000,
-        message: "Review the workspace status before taking action.",
+  test("refuses an editing compaction whose edited row could not be fenced", async () => {
+    // The caller could not capture evidence (row not held): refuse before the RPC does.
+    const { sendMessage, result } = await withTranscriptBarrier(true, async () => {
+      const run = runCompaction("edit-id");
+      return { sendMessage: run.sendMessage, result: await run.result };
+    });
+    expect(result).toEqual({ success: false, error: EDIT_NOT_HELD_MESSAGE });
+    expect(sendMessage).not.toHaveBeenCalled();
+  });
+
+  test("surfaces a history-changed refusal as its user-facing message and keeps the typed refusal", async () => {
+    const sendMessage = mock(() =>
+      Promise.resolve({ success: false as const, error: { type: "history-changed" as const } })
+    );
+    const result = await withTranscriptBarrier(true, () =>
+      executeCompaction({
+        api: { workspace: { sendMessage } } as unknown as Parameters<
+          typeof executeCompaction
+        >[0]["api"],
+        workspaceId: "test-ws",
+        sendMessageOptions,
+        editMessageId: "edit-id",
+        historyEditPrecondition: editFence,
       })
     );
-    const heartbeatSet = mock(() =>
-      Promise.resolve({ success: false as const, error: "Heartbeat update failed" })
-    );
-    const context = createSlashCommandContext({
-      api: {
-        workspace: {
-          heartbeat: {
-            get: heartbeatGet,
-            set: heartbeatSet,
-          },
-        },
-      } as unknown as SlashCommandContext["api"],
-      workspaceId: "test-ws",
+    expect(result).toEqual({
+      success: false,
+      error: EDIT_HISTORY_CHANGED_MESSAGE,
+      historyChanged: true,
     });
+  });
 
-    setHeartbeatExperiment(true);
-
-    const result = await processSlashCommand({ type: "heartbeat-set", minutes: 30 }, context);
-
-    expect(result).toEqual({ clearInput: false, toastShown: true });
-    expect(heartbeatSet).toHaveBeenCalledWith({
-      workspaceId: "test-ws",
-      enabled: true,
-      intervalMs: 30 * 60 * 1000,
-      message: "Review the workspace status before taking action.",
+  test("append-only compaction is not gated by the transcript barrier", async () => {
+    // No editMessageId: nothing visible is rewritten, so auto/idle/model-switch compaction
+    // must keep working while a transcript is still hydrating.
+    const { sendMessage, result } = await withTranscriptBarrier(false, async () => {
+      const run = runCompaction(undefined);
+      return { sendMessage: run.sendMessage, result: await run.result };
     });
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "error",
-        message: "Heartbeat update failed",
-      })
-    );
+    expect(result).toEqual({ success: true });
+    expect(sendMessage).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -1580,6 +1802,32 @@ describe("prepareCompactionMessage", () => {
     expect(metadata.parsed.followUpContent?.text).toBe("Keep building");
     expect(metadata.parsed.followUpContent?.model).toBe("anthropic:claude-sonnet-4-6");
     expect(metadata.parsed.followUpContent?.agentId).toBe("exec");
+  });
+
+  test("compaction recovery keeps the persisted follow-up's restrictions when retry options lack them", () => {
+    // Retrying a failed compaction passes the already-persisted follow-up together with
+    // storage-derived send options, which never carry a caller toolPolicy. The preserved
+    // restrictions must survive that recomposition or the recovered follow-up resumes with
+    // unrestricted caller tools.
+    const recoveredFollowUp = {
+      text: "Keep building",
+      model: "openai:gpt-4o",
+      agentId: "code",
+      toolPolicy: [{ regex_match: "^bash$", action: "disable" as const }],
+      disableWorkspaceAgents: true,
+    };
+    const { metadata } = prepareCompactionMessage({
+      workspaceId: "ws-1",
+      followUpContent: recoveredFollowUp,
+      sendMessageOptions: { model: "anthropic:claude-sonnet-4-6", agentId: "exec" },
+    });
+
+    expectCompactionMetadata(metadata);
+    expect(metadata.parsed.followUpContent?.toolPolicy).toEqual(recoveredFollowUp.toolPolicy);
+    expect(metadata.parsed.followUpContent?.disableWorkspaceAgents).toBe(true);
+    // Existing model/agentId still win over the retry-time options.
+    expect(metadata.parsed.followUpContent?.model).toBe("openai:gpt-4o");
+    expect(metadata.parsed.followUpContent?.agentId).toBe("code");
   });
 
   test("does not create followUpContent when no text or images provided", () => {
@@ -1821,278 +2069,38 @@ describe("prepareCompactionMessage", () => {
   });
 });
 
-describe("handlePlanShowCommand", () => {
-  const createMockContext = (
-    getPlanContentResult:
-      | { success: true; data: { content: string; path: string } }
-      | { success: false; error: string }
-  ): CommandHandlerContext => {
-    const setInput = mock(() => undefined);
-    const setToast = mock(() => undefined);
-
-    return {
-      workspaceId: "test-workspace-id",
-      setInput,
-      setToast,
-      api: {
-        workspace: {
-          getPlanContent: mock(() => Promise.resolve(getPlanContentResult)),
-        },
-        general: {},
-      } as unknown as CommandHandlerContext["api"],
-      // Required fields for CommandHandlerContext
-      sendMessageOptions: {
-        model: "anthropic:claude-sonnet-4-6",
-        thinkingLevel: "off",
-        toolPolicy: [],
-        agentId: "exec",
-      },
-      setAttachments: mock(() => undefined),
-      setSendingState: mock(() => undefined),
-    };
-  };
-
-  test("shows error toast when no plan exists", async () => {
-    const context = createMockContext({ success: false, error: "No plan found" });
-
-    const result = await handlePlanShowCommand(context);
-
-    expect(result.clearInput).toBe(true);
-    expect(result.toastShown).toBe(true);
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "error",
-        message: "No plan found for this workspace",
-      })
-    );
+describe("createNewWorkspace", () => {
+  afterEach(() => {
+    getAppConfigStore().updateOptimistically({ defaultRuntime: undefined });
   });
 
-  test("replaces the previous plan preview instead of stacking another tail row", async () => {
-    const workspaceId = "test-workspace-id";
-    const store = useWorkspaceStoreRaw();
-    store.dispose();
-    const metadata: FrontendWorkspaceMetadata = {
-      id: workspaceId,
-      name: "test-workspace",
-      title: "Test Workspace",
-      projectName: "Project",
-      projectPath: "/tmp/project",
-      namedWorkspacePath: "/tmp/project/test-workspace",
-      runtimeConfig: { type: "local" },
-      createdAt: "2026-08-05T00:00:00.000Z",
-    };
-    workspaceStore.addWorkspace(metadata);
+  test("/new applies only a configured local default runtime, the project's first", async () => {
+    const runtimeConfigs: Array<RuntimeConfig | undefined> = [];
+    let projectDefaultRuntime: RuntimeEnablementId | undefined;
+    const client = createTestApiClient({
+      projects: {
+        list: () =>
+          Promise.resolve([["/repo", { workspaces: [], defaultRuntime: projectDefaultRuntime }]]),
+      },
+      workspace: {
+        create: (input: { runtimeConfig?: RuntimeConfig }) => {
+          runtimeConfigs.push(input.runtimeConfig);
+          return Promise.resolve({ success: false as const, error: "stop after create" });
+        },
+      },
+    });
 
-    try {
-      await handlePlanShowCommand(
-        createMockContext({
-          success: true,
-          data: { content: "# First plan", path: "/path/to/plan.md" },
-        })
-      );
-      await handlePlanShowCommand(
-        createMockContext({
-          success: true,
-          data: { content: "# Updated plan", path: "/path/to/plan.md" },
-        })
-      );
-
-      const previews = store
-        .getWorkspaceState(workspaceId)
-        .messages.filter((message) => message.type === "plan-display");
-      expect(previews).toHaveLength(1);
-      expect(previews[0]).toMatchObject({ content: "# Updated plan" });
-    } finally {
-      store.dispose();
+    for (const [globalDefault, projectDefault] of [
+      ["local", undefined],
+      ["ssh", undefined],
+      ["local", "worktree"],
+      ["worktree", "local"],
+    ] as const) {
+      getAppConfigStore().updateOptimistically({ defaultRuntime: globalDefault });
+      projectDefaultRuntime = projectDefault;
+      await createNewWorkspace({ client, projectPath: "/repo", trunkBranch: "main" });
     }
-  });
 
-  test("clears input when plan is found", async () => {
-    const context = createMockContext({
-      success: true,
-      data: { content: "# My Plan\n\nStep 1", path: "/path/to/plan.md" },
-    });
-
-    const result = await handlePlanShowCommand(context);
-
-    expect(result.clearInput).toBe(true);
-    expect(result.toastShown).toBe(false);
-    expect(context.setInput).toHaveBeenCalledWith("");
-    expect(context.api.workspace.getPlanContent).toHaveBeenCalledWith({
-      workspaceId: "test-workspace-id",
-    });
-  });
-});
-
-describe("handlePlanOpenCommand", () => {
-  const createMockContext = (
-    getPlanContentResult:
-      | { success: true; data: { content: string; path: string } }
-      | { success: false; error: string },
-    openInEditorResult?: { success: true; data: undefined } | { success: false; error: string }
-  ): CommandHandlerContext => {
-    const setInput = mock(() => undefined);
-    const setToast = mock(() => undefined);
-
-    return {
-      workspaceId: "test-workspace-id",
-      setInput,
-      setToast,
-      api: {
-        workspace: {
-          getPlanContent: mock(() => Promise.resolve(getPlanContentResult)),
-          getInfo: mock(() => Promise.resolve(null)),
-        },
-        general: {
-          openInEditor: mock(() =>
-            Promise.resolve(openInEditorResult ?? { success: true, data: undefined })
-          ),
-        },
-      } as unknown as CommandHandlerContext["api"],
-      // Required fields for CommandHandlerContext
-      sendMessageOptions: {
-        model: "anthropic:claude-sonnet-4-6",
-        thinkingLevel: "off",
-        toolPolicy: [],
-        agentId: "exec",
-      },
-      setAttachments: mock(() => undefined),
-      setSendingState: mock(() => undefined),
-    };
-  };
-
-  test("shows error toast when no plan exists", async () => {
-    const context = createMockContext({ success: false, error: "No plan found" });
-
-    const result = await handlePlanOpenCommand(context);
-
-    expect(result.clearInput).toBe(true);
-    expect(result.toastShown).toBe(true);
-    expect(context.setToast).toHaveBeenCalledWith(
-      expect.objectContaining({
-        type: "error",
-        message: "No plan found for this workspace",
-      })
-    );
-    expect(context.api.workspace.getInfo).not.toHaveBeenCalled();
-    // Should not attempt to open editor
-    expect(context.api.general.openInEditor).not.toHaveBeenCalled();
-  });
-
-  test("opens plan in editor when plan exists", async () => {
-    const context = createMockContext(
-      { success: true, data: { content: "# My Plan", path: "/path/to/plan.md" } },
-      { success: true, data: undefined }
-    );
-
-    const result = await handlePlanOpenCommand(context);
-
-    expect(result.clearInput).toBe(true);
-    expect(context.setInput).toHaveBeenCalledWith("");
-    expect(context.api.workspace.getPlanContent).toHaveBeenCalledWith({
-      workspaceId: "test-workspace-id",
-    });
-    expect(context.api.workspace.getInfo).toHaveBeenCalledWith({
-      workspaceId: "test-workspace-id",
-    });
-    // Note: Built-in editors (VS Code/Cursor/Zed) now use deep links directly
-    // via window.open(), not the backend API. The backend API is only used
-    // for custom editors.
-  });
-
-  // Note: The "editor fails to open" test was removed because built-in editors
-  // (VS Code/Cursor/Zed) now use deep links that open via window.open() and
-  // always succeed from the app's perspective. Failures happen in the external
-  // editor, not in our code path.
-});
-
-describe("handleCompactCommand", () => {
-  const createMockContext = (
-    sendMessageResult: { success: true } | { success: false; error?: string },
-    options?: { reviews?: ReviewNoteData[] }
-  ): CommandHandlerContext => {
-    const setInput = mock(() => undefined);
-    const setToast = mock(() => undefined);
-    const setAttachments = mock(() => undefined);
-    const setSendingState = mock(() => undefined);
-
-    // Track the options passed to sendMessage
-    const sendMessageMock = mock(() => Promise.resolve(sendMessageResult));
-
-    return {
-      workspaceId: "test-workspace-id",
-      setInput,
-      setToast,
-      setAttachments,
-      setSendingState,
-      reviews: options?.reviews,
-      api: {
-        workspace: {
-          sendMessage: sendMessageMock,
-        },
-      } as unknown as CommandHandlerContext["api"],
-      sendMessageOptions: {
-        model: "anthropic:claude-sonnet-4-6",
-        thinkingLevel: "off",
-        toolPolicy: [],
-        agentId: "exec",
-      },
-    };
-  };
-
-  test("passes reviews to followUpContent when reviews are attached", async () => {
-    const reviews: ReviewNoteData[] = [
-      {
-        filePath: "src/test.ts",
-        lineRange: "10-15",
-        selectedCode: "const x = 1;",
-        userNote: "Please fix this bug",
-      },
-    ];
-
-    const context = createMockContext({ success: true }, { reviews });
-
-    await handleCompactCommand({ type: "compact" }, context);
-
-    // Verify sendMessage was called with reviews in the metadata
-    const sendMessageMock = context.api.workspace.sendMessage as ReturnType<typeof mock>;
-    expect(sendMessageMock).toHaveBeenCalled();
-
-    const callArgs = sendMessageMock.mock.calls[0][0] as {
-      options?: { muxMetadata?: { parsed?: { followUpContent?: { reviews?: ReviewNoteData[] } } } };
-    };
-    const followUpContent = callArgs?.options?.muxMetadata?.parsed?.followUpContent;
-
-    expect(followUpContent).toBeDefined();
-    expect(followUpContent?.reviews).toHaveLength(1);
-    expect(followUpContent?.reviews?.[0].userNote).toBe("Please fix this bug");
-  });
-
-  test("creates followUpContent with only reviews (no text)", async () => {
-    const reviews: ReviewNoteData[] = [
-      {
-        filePath: "src/test.ts",
-        lineRange: "10",
-        selectedCode: "x = 1",
-        userNote: "Check this",
-      },
-    ];
-
-    const context = createMockContext({ success: true }, { reviews });
-
-    // No followUpContent text, just reviews
-    await handleCompactCommand({ type: "compact" }, context);
-
-    const sendMessageMock = context.api.workspace.sendMessage as ReturnType<typeof mock>;
-    expect(sendMessageMock).toHaveBeenCalled();
-
-    const callArgs = sendMessageMock.mock.calls[0][0] as {
-      options?: { muxMetadata?: { parsed?: { followUpContent?: { reviews?: ReviewNoteData[] } } } };
-    };
-    const followUpContent = callArgs?.options?.muxMetadata?.parsed?.followUpContent;
-
-    // Should have followUpContent even without text, because reviews are present
-    expect(followUpContent).toBeDefined();
-    expect(followUpContent?.reviews).toHaveLength(1);
+    expect(runtimeConfigs).toEqual([{ type: "local" }, undefined, undefined, { type: "local" }]);
   });
 });

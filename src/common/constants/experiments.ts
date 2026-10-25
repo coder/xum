@@ -1,32 +1,51 @@
+export const EXPERIMENTS_WRITE_TIMEOUT_MS = 10_000;
+
 /**
  * Experiments System
  *
  * Global feature flags for experimental features.
- * State is persisted in localStorage as `experiment:${experimentId}`.
+ * State is persisted by the backend ExperimentsService in `feature_flags.json`.
  */
 
 export const EXPERIMENT_IDS = {
   PROGRAMMATIC_TOOL_CALLING: "programmatic-tool-calling",
-  PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE: "programmatic-tool-calling-exclusive",
+  RLM: "rlm-mode",
   CONFIGURABLE_BIND_URL: "configurable-bind-url",
-  MUX_GOVERNOR: "mux-governor",
   MULTI_PROJECT_WORKSPACES: "multi-project-workspaces",
   AGENT_BROWSER: "agent-browser",
-  ADVISOR_TOOL: "advisor-tool",
-  WORKSPACE_HEARTBEATS: "workspace-heartbeats",
   PORTABLE_DESKTOP: "portable-desktop",
-  DYNAMIC_WORKFLOWS: "dynamic-workflows",
   MEMORY: "memory",
-  MEMORY_HOT_SET: "memory-hot-set",
   MEMORY_CONSOLIDATION: "memory-consolidation",
-  TOOL_SEARCH: "tool-search",
   CLAUDE_SKILLS_COMPAT: "claude-skills-compat",
-  AGENT_PLUGINS: "agent-plugins",
+  CLAUDE_DESIGN_MCP: "claude-design-mcp",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
-  TIMELINE: "timeline",
+  ARTIFACTS: "artifacts",
+  ARTIFACTS_AGENT_INTERFACE: "artifacts-agent-interface",
+  MCP_APPS: "mcp-apps",
+  CONTINUOUS_COMPACTION: "continuous-compaction",
+  TOKEN_BUDGET: "tokenBudget",
+  AUTO_MODEL_ROUTING: "auto-model-routing",
+  SESSION_TAPES: "sessionTapes",
+  PERF_FLIGHT_RECORDER: "perfFlightRecorder",
 } as const;
 
 export type ExperimentId = (typeof EXPERIMENT_IDS)[keyof typeof EXPERIMENT_IDS];
+
+/**
+ * Former experiment IDs whose features are now always on or retired. CLI `-e`
+ * parsing accepts them as no-ops so existing automation (for example terminal-bench)
+ * keeps working instead of failing on an unknown experiment.
+ */
+export const PROMOTED_EXPERIMENT_IDS: ReadonlySet<string> = new Set([
+  "advisor-tool", // Retired; accepted only for CLI compatibility.
+  "agent-plugins",
+  "dynamic-workflows",
+  "memory-hot-set", // Retired; accepted only for CLI compatibility.
+  "memory-intuition", // Retired; accepted only for CLI compatibility.
+  "timeline",
+  "tool-search",
+  "workspace-heartbeats",
+]);
 
 export interface ExperimentDefinition {
   id: ExperimentId;
@@ -51,17 +70,46 @@ export interface ExperimentDefinition {
  * Use Record<ExperimentId, ExperimentDefinition> to ensure exhaustive coverage.
  */
 export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
-  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: {
-    id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
-    name: "Programmatic Tool Calling",
-    description: "Enable code_execution tool for multi-tool workflows in a sandboxed JS runtime",
+  [EXPERIMENT_IDS.TOKEN_BUDGET]: {
+    id: EXPERIMENT_IDS.TOKEN_BUDGET,
+    name: "Token-budget context windows",
+    description:
+      "Start fresh context windows instead of automatic summaries, with session_history for retrieval and a /memories/session/ checkpoint. Requires Agent Memory and session_history; continuous compaction and RLM take precedence.",
+    enabledByDefault: false,
+    // Configured together with Continuous Compaction in Settings → General.
+    showInSettings: false,
+  },
+  [EXPERIMENT_IDS.CLAUDE_DESIGN_MCP]: {
+    id: EXPERIMENT_IDS.CLAUDE_DESIGN_MCP,
+    name: "Claude Design MCP",
+    description:
+      "Optionally reuse Claude Code credentials read-only for Claude Design. Configure credential access separately in MCP settings; Claude Code owns login, consent, and refresh.",
     enabledByDefault: false,
     showInSettings: true,
   },
-  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE]: {
-    id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING_EXCLUSIVE,
-    name: "PTC Exclusive Mode",
-    description: "Replace all tools with code_execution (forces PTC usage)",
+  [EXPERIMENT_IDS.CONTINUOUS_COMPACTION]: {
+    id: EXPERIMENT_IDS.CONTINUOUS_COMPACTION,
+    name: "Continuous Compaction",
+    description: "Compact older context between turns while preserving recent messages verbatim",
+    enabledByDefault: false,
+    showInSettings: false,
+  },
+  [EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING]: {
+    id: EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+    name: "Programmatic Tool Calling",
+    description:
+      "Replace the standard toolset with a sandboxed code_execution tool; bridged tools are called as xum.<tool>(...) from JS",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  // Sub-experiment of Programmatic Tool Calling (flat flag, gated on the PTC
+  // parent at call sites; Settings nests it under the PTC toggle). Without a
+  // PTC flag the option is inert: code_execution is never assembled.
+  [EXPERIMENT_IDS.RLM]: {
+    id: EXPERIMENT_IDS.RLM,
+    name: "RLM Mode",
+    description:
+      "Kernel-first exclusive toolset: code_execution becomes the primary tool, backed by a persistent sandbox kernel (vars survive across calls/turns, bulk file loads, result handles, fire-and-forget sub-agents). Requires Programmatic Tool Calling.",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -69,14 +117,7 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     id: EXPERIMENT_IDS.CONFIGURABLE_BIND_URL,
     name: "Expose API server on LAN/VPN",
     description:
-      "Allow Shux to listen on a non-localhost address so other devices on your LAN/VPN can connect. Anyone on your network with the auth token can access your Shux API. HTTP only; use only on trusted networks (Tailscale recommended).",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.MUX_GOVERNOR]: {
-    id: EXPERIMENT_IDS.MUX_GOVERNOR,
-    name: "Shux Governor",
-    description: "Remote policy delivery for enterprise Shux Governor service",
+      "Allow Xum to listen on a non-localhost address so other devices on your LAN/VPN can connect. Anyone on your network with the auth token can access your Xum API. HTTP only; use only on trusted networks (Tailscale recommended).",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -95,20 +136,6 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     enabledByDefault: false,
     showInSettings: true,
   },
-  [EXPERIMENT_IDS.ADVISOR_TOOL]: {
-    id: EXPERIMENT_IDS.ADVISOR_TOOL,
-    name: "Advisor Tool",
-    description: "Enable the experimental client-side advisor tool foundation",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.WORKSPACE_HEARTBEATS]: {
-    id: EXPERIMENT_IDS.WORKSPACE_HEARTBEATS,
-    name: "Workspace Heartbeats",
-    description: "Persist per-workspace heartbeat settings for future background follow-ups",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
   [EXPERIMENT_IDS.PORTABLE_DESKTOP]: {
     id: EXPERIMENT_IDS.PORTABLE_DESKTOP,
     name: "Portable Desktop",
@@ -117,29 +144,11 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     platformRestriction: ["linux"],
     showInSettings: true,
   },
-  [EXPERIMENT_IDS.DYNAMIC_WORKFLOWS]: {
-    id: EXPERIMENT_IDS.DYNAMIC_WORKFLOWS,
-    name: "Dynamic Workflows",
-    description: "Enable durable JavaScript workflow orchestration for delegated agent tasks",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
   [EXPERIMENT_IDS.MEMORY]: {
     id: EXPERIMENT_IDS.MEMORY,
     name: "Agent Memory",
     description:
-      "Enable the agent memory tool and memory index (global / project / workspace scopes)",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  // Sub-experiment of Agent Memory (flat flag, gated on the parent at the call
-  // site; Settings nests it under the Agent Memory toggle). Without it, memories
-  // stay pull-based like skills: index advertised in the memory tool description,
-  // contents fetched on demand.
-  [EXPERIMENT_IDS.MEMORY_HOT_SET]: {
-    id: EXPERIMENT_IDS.MEMORY_HOT_SET,
-    name: "Memory Hot Set",
-    description: "Preload pinned and frequently used memory files into the system prompt",
+      "Enable the agent memory tool and memory index (global / project / workspace scopes, plus a session scope in token-budget mode)",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -154,27 +163,11 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     enabledByDefault: false,
     showInSettings: true,
   },
-  [EXPERIMENT_IDS.TOOL_SEARCH]: {
-    id: EXPERIMENT_IDS.TOOL_SEARCH,
-    name: "Tool Search",
-    description:
-      "Defer MCP tool definitions out of the model-visible tool list until the model discovers them via the tool_catalog_search tool",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
   [EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT]: {
     id: EXPERIMENT_IDS.CLAUDE_SKILLS_COMPAT,
-    name: "Claude skills compatibility",
+    name: "Claude compatibility",
     description:
-      "Also discover Agent Skills from .claude/skills and ~/.claude/skills (read-only, lowest precedence within each scope)",
-    enabledByDefault: false,
-    showInSettings: true,
-  },
-  [EXPERIMENT_IDS.AGENT_PLUGINS]: {
-    id: EXPERIMENT_IDS.AGENT_PLUGINS,
-    name: "Agent Plugins",
-    description:
-      "Discover Agent Plugins (agent-plugins.org 1.0.0) from .mux/plugins, .agents/plugins, ~/.shux/plugins, and ~/.agents/plugins: plugin skills join skill discovery and plugin MCP servers appear disabled by default",
+      "Also read skills from .claude/skills and ~/.claude/skills, plus global instructions from ~/.claude/CLAUDE.md (read-only, lowest precedence)",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -186,11 +179,53 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     enabledByDefault: false,
     showInSettings: true,
   },
-  [EXPERIMENT_IDS.TIMELINE]: {
-    id: EXPERIMENT_IDS.TIMELINE,
-    name: "Timeline",
+  [EXPERIMENT_IDS.ARTIFACTS]: {
+    id: EXPERIMENT_IDS.ARTIFACTS,
+    name: "Artifacts",
     description:
-      "Record a durable birds-eye timeline per workspace: prompts, agent events, goals, heartbeats, sub-agents, and workflows",
+      "Show files the agent writes to $XUM_SCRATCH_DIR/artifacts in an Artifacts tab, with previews for Markdown, JSON, CSV, images, diffs, Mermaid and sandboxed HTML/SVG. Works on every runtime with a scratch dir (devcontainers need a local Docker daemon).",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  // Sub-experiment of Artifacts (flat flag, gated on the parent at call sites; Settings nests it
+  // under the Artifacts toggle): the main pane shows the agent's status page by default.
+  [EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE]: {
+    id: EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+    name: "Agent interface view",
+    description:
+      "Show the agent's status page (status.html) instead of the chat transcript by default. Switch back to the chat at any time; the message box stays at the bottom.",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.MCP_APPS]: {
+    id: EXPERIMENT_IDS.MCP_APPS,
+    name: "MCP Apps",
+    description:
+      "Show the interactive views (ui:// resources) that MCP server tools declare, each in its own right-sidebar tab, plus the server entry points in the menu bar and command palette. Views run sandboxed and cannot reach the network unless you approve their domains.",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: {
+    id: EXPERIMENT_IDS.AUTO_MODEL_ROUTING,
+    name: "Auto model routing",
+    description:
+      "Add Auto entries to the composer model and thinking selectors. Prompts sent with Auto are classified by difficulty with your chosen AI SDK evaluation model and run on the model and thinking level mapped to the chosen tier",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.SESSION_TAPES]: {
+    id: EXPERIMENT_IDS.SESSION_TAPES,
+    name: "Session tapes",
+    description:
+      "Record each chat subscription as a JSONL tape under the Xum home (perf/tapes) for local performance replay. Tapes are not masked: they contain the full chat, tool data and metadata, so treat them as sensitive. They stay on the machine running the Xum backend this window is connected to (this machine for the desktop app) and are never uploaded or included in diagnostics. Do not share them. Applies to chats opened after you enable it.",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  [EXPERIMENT_IDS.PERF_FLIGHT_RECORDER]: {
+    id: EXPERIMENT_IDS.PERF_FLIGHT_RECORDER,
+    name: "Performance flight recorder",
+    description:
+      "Record event-loop delay, garbage collection, heap and long-frame samples in memory to help diagnose slowness. After a detected stall it also writes a short CPU profile of the activity that follows (not the stall itself) to perf/captures in the Xum home folder (~/.xum by default). Starting a profile pauses the backend for a moment (over a second on a busy machine). Samples and profiles stay on the machine running the Xum backend this window is connected to (this machine for the desktop app); nothing is sent to any other service",
     enabledByDefault: false,
     showInSettings: true,
   },
@@ -207,6 +242,14 @@ function getPlatformDisplayName(platform: NodeJS.Platform): string {
     default:
       return platform;
   }
+}
+
+/**
+ * Token budget hard-depends on Agent Memory: an agent keeps its rollover checkpoint in the
+ * /memories/session/ scope, so without the memory tool a fresh window could not recover its state.
+ */
+export function isTokenBudgetActive(isEnabled: (id: ExperimentId) => boolean): boolean {
+  return isEnabled(EXPERIMENT_IDS.TOKEN_BUDGET) && isEnabled(EXPERIMENT_IDS.MEMORY);
 }
 
 export function isExperimentSupportedOnPlatform(
@@ -243,14 +286,6 @@ export function getExperimentPlatformRestrictionLabel(
 
   const lastPlatform = platformLabels[platformLabels.length - 1];
   return `Only available on ${platformLabels.slice(0, -1).join(", ")}, and ${lastPlatform}`;
-}
-
-/**
- * Get localStorage key for an experiment.
- * Format: "experiment:{experimentId}"
- */
-export function getExperimentKey(experimentId: ExperimentId): string {
-  return `experiment:${experimentId}`;
 }
 
 /**

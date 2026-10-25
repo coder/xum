@@ -5,7 +5,7 @@ import {
 } from "@/common/constants/providers";
 import { getExplicitGatewayPrefix, normalizeToCanonical } from "@/common/utils/ai/models";
 
-import type { AvailableRoute, RouteContext } from "./types";
+import type { AvailableRoute, GatewayModelIdResolver, RouteContext } from "./types";
 
 interface RoutingProviderDefinition {
   displayName: string;
@@ -22,6 +22,12 @@ interface ParsedRoutingInput {
 }
 
 type GatewayModelAccessibility = (gateway: string, modelId: string) => boolean;
+
+/**
+ * Route priority used when config.json has none persisted. Shared by the browser
+ * (useRouting) and the backend (models_list) so both resolve the same routes.
+ */
+export const DEFAULT_ROUTE_PRIORITY: string[] = ["direct"];
 
 function getProviderDefinition(provider: string): RoutingProviderDefinition | undefined {
   if (!(provider in PROVIDER_DEFINITIONS)) {
@@ -89,28 +95,35 @@ function explicitGatewayRouteContext(
   };
 }
 
+// A provided resolver is authoritative for routed gateway contexts; without
+// one, the static PROVIDER_DEFINITIONS route table decides.
 function getGatewayRouteModelId(
   parsed: ReturnType<typeof parseRoutingInput>,
-  gateway: ProviderName
-): string {
+  gateway: string,
+  resolveGatewayModelId?: GatewayModelIdResolver
+): string | null {
+  if (resolveGatewayModelId) {
+    return resolveGatewayModelId(gateway, parsed.origin, parsed.originModelId);
+  }
   const definition = getProviderDefinition(gateway);
-  const toGatewayModelId = definition?.toGatewayModelId;
-  return toGatewayModelId
-    ? toGatewayModelId(parsed.origin, parsed.originModelId)
-    : parsed.originModelId;
+  if (!definition?.toGatewayModelId || !definition.routes?.includes(parsed.origin)) {
+    return null;
+  }
+  return definition.toGatewayModelId(parsed.origin, parsed.originModelId);
 }
 
 function gatewayRouteContext(
   _modelInput: string,
   parsed: ReturnType<typeof parseRoutingInput>,
-  gateway: ProviderName
+  gateway: ProviderName,
+  routeModelId: string
 ): RouteContext {
   return {
     canonical: getCanonicalRouteKey(parsed),
     origin: parsed.origin,
     originModelId: parsed.originModelId,
     routeProvider: gateway,
-    routeModelId: getGatewayRouteModelId(parsed, gateway),
+    routeModelId,
   };
 }
 
@@ -164,24 +177,22 @@ function getConfiguredGatewayRouteContext(
   parsed: ReturnType<typeof parseRoutingInput>,
   gateway: string,
   isConfigured: (provider: string) => boolean,
-  isGatewayModelAccessible?: GatewayModelAccessibility
+  isGatewayModelAccessible?: GatewayModelAccessibility,
+  resolveGatewayModelId?: GatewayModelIdResolver
 ): RouteContext | null {
-  const definition = getProviderDefinition(gateway);
-  if (
-    definition?.kind !== "gateway" ||
-    !definition.toGatewayModelId ||
-    !definition.routes?.includes(parsed.origin) ||
-    !isConfigured(gateway)
-  ) {
+  if (getProviderDefinition(gateway)?.kind !== "gateway") {
+    return null;
+  }
+  const routeModelId = getGatewayRouteModelId(parsed, gateway, resolveGatewayModelId);
+  if (routeModelId == null || !isConfigured(gateway)) {
     return null;
   }
 
-  const routeModelId = getGatewayRouteModelId(parsed, gateway as ProviderName);
   if (isGatewayModelAccessible && !isGatewayModelAccessible(gateway, routeModelId)) {
     return null;
   }
 
-  return gatewayRouteContext(modelInput, parsed, gateway as ProviderName);
+  return gatewayRouteContext(modelInput, parsed, gateway as ProviderName, routeModelId);
 }
 
 // Keep active-route discovery separate from resolveRoute's last-resort fallback
@@ -192,7 +203,8 @@ function findActiveRouteContext(
   routePriority: string[],
   routeOverrides: Record<string, string>,
   isConfigured: (provider: string) => boolean,
-  isGatewayModelAccessible?: GatewayModelAccessibility
+  isGatewayModelAccessible?: GatewayModelAccessibility,
+  resolveGatewayModelId?: GatewayModelIdResolver
 ): RouteContext | null {
   // Explicit gateway is a preferred first candidate, not a dead-end.
   // If the gateway itself is configured, use it; otherwise fall through
@@ -235,7 +247,8 @@ function findActiveRouteContext(
       parsed,
       override,
       isConfigured,
-      isGatewayModelAccessible
+      isGatewayModelAccessible,
+      resolveGatewayModelId
     );
     if (viaOverride) {
       return viaOverride;
@@ -263,7 +276,8 @@ function findActiveRouteContext(
       parsed,
       route,
       isConfigured,
-      isGatewayModelAccessible
+      isGatewayModelAccessible,
+      resolveGatewayModelId
     );
     if (viaPriority) {
       return viaPriority;
@@ -282,7 +296,8 @@ export function resolveRoute(
   routePriority: string[],
   routeOverrides: Record<string, string>,
   isConfigured: (provider: string) => boolean,
-  isGatewayModelAccessible?: GatewayModelAccessibility
+  isGatewayModelAccessible?: GatewayModelAccessibility,
+  resolveGatewayModelId?: GatewayModelIdResolver
 ): RouteContext {
   const parsed = parseRoutingInput(modelInput);
   const resolved = findActiveRouteContext(
@@ -291,7 +306,8 @@ export function resolveRoute(
     routePriority,
     routeOverrides,
     isConfigured,
-    isGatewayModelAccessible
+    isGatewayModelAccessible,
+    resolveGatewayModelId
   );
   if (resolved) {
     return resolved;
@@ -307,7 +323,8 @@ export function isModelAvailable(
   routePriority: string[],
   routeOverrides: Record<string, string>,
   isConfigured: (provider: string) => boolean,
-  isGatewayModelAccessible?: GatewayModelAccessibility
+  isGatewayModelAccessible?: GatewayModelAccessibility,
+  resolveGatewayModelId?: GatewayModelIdResolver
 ): boolean {
   const parsed = parseRoutingInput(modelInput);
   return (
@@ -317,7 +334,8 @@ export function isModelAvailable(
       routePriority,
       routeOverrides,
       isConfigured,
-      isGatewayModelAccessible
+      isGatewayModelAccessible,
+      resolveGatewayModelId
     ) != null
   );
 }
@@ -326,23 +344,22 @@ export function isModelAvailable(
 export function availableRoutes(
   modelInput: string,
   isConfigured: (provider: string) => boolean,
-  isGatewayModelAccessible?: GatewayModelAccessibility
+  isGatewayModelAccessible?: GatewayModelAccessibility,
+  resolveGatewayModelId?: GatewayModelIdResolver
 ): AvailableRoute[] {
   const parsed = parseRoutingInput(modelInput);
   const routes: AvailableRoute[] = [];
 
   // Add gateways that can route this origin
   for (const gateway of GATEWAY_PROVIDERS) {
-    const definition = getProviderDefinition(gateway);
+    const routeModelId = getGatewayRouteModelId(parsed, gateway, resolveGatewayModelId);
     if (
-      definition?.routes?.includes(parsed.origin) &&
-      definition.toGatewayModelId &&
-      (!isGatewayModelAccessible ||
-        isGatewayModelAccessible(gateway, getGatewayRouteModelId(parsed, gateway)))
+      routeModelId != null &&
+      (!isGatewayModelAccessible || isGatewayModelAccessible(gateway, routeModelId))
     ) {
       routes.push({
         route: gateway,
-        displayName: definition.displayName,
+        displayName: PROVIDER_DEFINITIONS[gateway].displayName,
         isConfigured: isConfigured(gateway),
       });
     }

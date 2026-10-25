@@ -56,7 +56,7 @@ describeIntegration("sendMessage heavy/load tests", () => {
 
           const errorEvent = await collector.waitForEvent("stream-error", 30000);
           expect(errorEvent).not.toBeNull();
-          if (!errorEvent || errorEvent.type !== "stream-error") {
+          if (errorEvent?.type !== "stream-error") {
             throw new Error("Expected stream-error event");
           }
 

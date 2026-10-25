@@ -1,38 +1,17 @@
 import { matchesNameBySegmentPrefix } from "@/browser/utils/suggestionMatching";
 import type { SlashSuggestion } from "@/browser/utils/slashCommands/types";
-import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
+import type { InvocableSkill } from "@/common/types/agentSkill";
 import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 
 interface InlineSkillSuggestionContext {
   /** The token typed after `$`. Empty string is allowed (just typed `$`). */
   partial: string;
   /** Already-loaded descriptors for current discovery target. */
-  descriptors: AgentSkillDescriptor[];
-  mcpPrompts?: MCPPromptDescriptor[];
-}
-
-interface InlineSkillSuggestionRefreshContext {
-  inputChanged: boolean;
-  previousPartial: string | null;
-  partial: string;
-  previousDescriptors: AgentSkillDescriptor[] | null;
-  descriptors: AgentSkillDescriptor[];
-  previousMcpPrompts?: MCPPromptDescriptor[] | null;
+  descriptors: InvocableSkill[];
   mcpPrompts?: MCPPromptDescriptor[];
 }
 
 const INLINE_SKILL_INSERT_EXISTING_SEPARATOR_RE = /[\s.,;:!?)\]}>"'`]/;
-
-export function shouldRefreshInlineSkillSuggestions(
-  context: InlineSkillSuggestionRefreshContext
-): boolean {
-  return (
-    context.inputChanged ||
-    context.previousPartial !== context.partial ||
-    context.previousDescriptors !== context.descriptors ||
-    context.previousMcpPrompts !== context.mcpPrompts
-  );
-}
 
 export function getInlineSkillInsertionTrailingText(after: string): "" | " " {
   // At end-of-input, add a space so the cursor is ready for continued typing.

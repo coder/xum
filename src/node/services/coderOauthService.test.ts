@@ -3,12 +3,11 @@ import * as crypto from "crypto";
 
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
-import type { Config, ProvidersConfig } from "@/node/config";
+import type { FileLeaseManager, ProvidersConfig, ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
 import type { ProviderModelEntry } from "@/common/config/schemas/providerModelEntry";
 import type { CoderOauthAuth } from "@/node/utils/coderOauthAuth";
-import type { PolicyService } from "@/node/services/policyService";
 import { CODER_GATEWAY_DEFAULT_PROVIDER_NAMES } from "@/common/constants/coderOAuth";
 import { CoderOauthService } from "./coderOauthService";
 
@@ -126,24 +125,23 @@ function createMockDeps(): MockDeps {
   };
 }
 
-function createMockConfig(
+function createMockProvidersConfigStore(
   deps: MockDeps
-): Pick<
-  Config,
-  | "loadProvidersConfig"
-  | "getProvidersFileFingerprint"
-  | "tryAcquireCoderOauthClientLease"
-  | "withCoderOauthRefreshLock"
-  | "withCoderOauthLoginCommitLock"
-> {
+): Pick<ProvidersConfigStore, "loadProvidersConfig" | "getProvidersFileFingerprint"> {
   return {
     loadProvidersConfig: () => deps.providersConfig,
-    // Mirrors Config.getProvidersFileFingerprint (content hash): changes
-    // whenever the in-memory providers config changes, exactly like the real
-    // file fingerprint changes on every persisted write.
     getProvidersFileFingerprint: () => JSON.stringify(deps.providersConfig),
-    // Mirrors Config.tryAcquireCoderOauthClientLease: non-blocking, exclusive,
-    // released via the returned function.
+  };
+}
+
+function createMockFileLeaseManager(
+  deps: MockDeps,
+  overrides?: Partial<FileLeaseManager>
+): Pick<
+  FileLeaseManager,
+  "tryAcquireCoderOauthClientLease" | "withCoderOauthRefreshLock" | "withCoderOauthLoginCommitLock"
+> {
+  return {
     tryAcquireCoderOauthClientLease: () => {
       if (deps.coderClientLeaseHeld) {
         return null;
@@ -153,17 +151,16 @@ function createMockConfig(
         deps.coderClientLeaseHeld = false;
       };
     },
-    // Single-process tests do not contend on the cross-process locks; the
-    // two-process race tests wire shared serializing locks instead.
     withCoderOauthRefreshLock: async <T>(fn: () => Promise<T> | T): Promise<T> => await fn(),
     withCoderOauthLoginCommitLock: async <T>(fn: () => Promise<T> | T): Promise<T> => await fn(),
+    ...overrides,
   };
 }
 
 /**
  * A shared, serializing implementation of Config's cross-process locks
  * (withCoderOauthRefreshLock / withCoderOauthLoginCommitLock) for tests that
- * simulate two Shux processes contending on the same providers file.
+ * simulate two Xum processes contending on the same providers file.
  */
 function createSharedCrossProcessLock(): <T>(fn: () => Promise<T> | T) => Promise<T> {
   let busy = false;
@@ -226,7 +223,8 @@ async function mockUpdateConfigValue(
 /**
  * Mirrors ProviderService.updateProviderSection: applies the section update to
  * the in-memory config and records model-list changes in setModelsCalls so
- * tests can assert on catalog writes.
+ * tests can assert that catalog/credential writes never touch the
+ * user-managed `models` list.
  */
 function mockUpdateProviderSection(
   deps: MockDeps,
@@ -286,7 +284,8 @@ function createMockWindowService(deps: MockDeps): Pick<WindowService, "focusMain
 
 function createService(deps: MockDeps): CoderOauthService {
   return new CoderOauthService(
-    createMockConfig(deps) as Config,
+    createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+    createMockFileLeaseManager(deps) as FileLeaseManager,
     createMockProviderService(deps) as ProviderService,
     createMockWindowService(deps) as WindowService
   );
@@ -349,7 +348,7 @@ describe("CoderOauthService", () => {
       // config-change notification, which rides on fs.watch —
       // Config.watchProvidersFile degrades to a no-op on unsupported mounts
       // and can silently die after a watcher error. A long-lived headless
-      // process would then keep serving a token another Shux process
+      // process would then keep serving a token another Xum process
       // disconnected or replaced until it expired. The cache must verify the
       // providers file fingerprint on every read, independent of watcher
       // delivery.
@@ -585,7 +584,7 @@ describe("CoderOauthService", () => {
     });
 
     it("serializes cross-process refreshes so a losing invalid_grant cannot clear the winner's rotation", async () => {
-      // Two Shux processes refresh the same expired credential. Without
+      // Two Xum processes refresh the same expired credential. Without
       // cross-process serialization the loser's invalid_grant response can
       // arrive while the winner's rotation is still in flight; the loser's
       // compare-and-clear then deletes the (still-old) credential, the
@@ -599,10 +598,10 @@ describe("CoderOauthService", () => {
       const sharedLock = createSharedCrossProcessLock();
       const makeProcess = (): CoderOauthService =>
         new CoderOauthService(
-          {
-            ...createMockConfig(deps),
+          createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+          createMockFileLeaseManager(deps, {
             withCoderOauthRefreshLock: sharedLock,
-          } as Config,
+          }) as FileLeaseManager,
           createMockProviderService(deps) as ProviderService,
           createMockWindowService(deps) as WindowService
         );
@@ -703,10 +702,10 @@ describe("CoderOauthService", () => {
         return await fn();
       };
       service = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthRefreshLock: lockSimulatingEdit,
-        } as Config,
+        }) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -789,7 +788,8 @@ describe("CoderOauthService", () => {
           Promise.resolve(Err("Failed to update provider config: disk full")),
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         failingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -824,7 +824,7 @@ describe("CoderOauthService", () => {
     });
 
     it("serves credentials written by another process after a config-change notification", async () => {
-      // Another Shux process sharing providers.jsonc re-logs in to the SAME
+      // Another Xum process sharing providers.jsonc re-logs in to the SAME
       // deployment: the deployment URL still matches, so only the config
       // change notification (file watcher) can tell this process its cached
       // token is stale. getValidAuth must serve the new on-disk credential,
@@ -894,9 +894,10 @@ describe("CoderOauthService", () => {
       }
     });
 
-    it("completes the full flow: DCR, PKCE exchange, persistence, and model fetch", async () => {
+    it("completes the full flow: DCR, PKCE exchange, persistence, and provider discovery", async () => {
       const registerCalls: unknown[] = [];
       let exchangeBody: URLSearchParams | null = null;
+      const catalogRequests: string[] = [];
 
       mockFetch((input, init) => {
         const url = fetchUrl(input);
@@ -936,16 +937,16 @@ describe("CoderOauthService", () => {
           );
         }
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
-          return Promise.resolve(aiProvidersResponse());
-        }
-        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
           return Promise.resolve(
-            jsonResponse({ data: [{ id: "claude-sonnet-4-5" }, { id: "claude-opus-4-1" }] })
+            jsonResponse([
+              { name: "claude-aws-us-east-2", type: "anthropic", enabled: true },
+              { name: "openai", type: "openai", enabled: true },
+            ])
           );
         }
-        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
-          // One upstream unavailable: must be tolerated.
-          return Promise.resolve(new Response("aibridge not entitled", { status: 404 }));
+        if (url.endsWith("/v1/models")) {
+          catalogRequests.push(url);
+          return Promise.resolve(jsonResponse({ data: [{ id: "claude-sonnet-4-5" }] }));
         }
         return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
       });
@@ -1008,18 +1009,18 @@ describe("CoderOauthService", () => {
       expect(persistedAuth.clientSecret).toBe("secret_new");
       expect(persistedAuth.registrationAccessToken).toBe("reg_token_new");
 
-      // Model list fetched from the reachable upstream only (openai 404 is a
-      // conclusive "unavailable", not a transient error). The exchange resets
-      // the catalog to unknown atomically with the new auth (no models write
-      // recorded — there was no previous catalog), then discovery (after the
-      // flow resolves) persists the fresh one.
-      await waitUntil(() => deps.setModelsCalls.length >= 1);
-      const discoveryCall = deps.setModelsCalls[deps.setModelsCalls.length - 1];
-      expect(discoveryCall.provider).toBe("coder");
-      expect(discoveryCall.models).toEqual([
-        "anthropic/claude-sonnet-4-5",
-        "anthropic/claude-opus-4-1",
+      // Login discovers provider instances only: the catalog stays unloaded
+      // (absent, so routing fails open) until the user loads it explicitly.
+      const currentCoderSection = () => deps.providersConfig.coder as Record<string, unknown>;
+      await waitUntil(() => Array.isArray(currentCoderSection().discoveredProviders));
+      expect(currentCoderSection().discoveredProviders).toEqual([
+        { name: "claude-aws-us-east-2", type: "anthropic" },
+        { name: "openai", type: "openai" },
       ]);
+      expect(catalogRequests).toEqual([]);
+      expect(currentCoderSection().discoveredModels).toBeUndefined();
+      expect(currentCoderSection().models).toBeUndefined();
+      expect(deps.setModelsCalls).toEqual([]);
 
       expect(deps.focusCalls).toBe(1);
     });
@@ -1107,207 +1108,6 @@ describe("CoderOauthService", () => {
       await service.cancelDesktopFlow(result.data.flowId);
     });
 
-    it("rejects login without any network call when policy denies the coder provider", async () => {
-      // Regression: a deny-all/provider-restricted policy must stop direct
-      // backend RPCs from registering OAuth clients or minting credentials —
-      // not merely hide the login UI.
-      service = new CoderOauthService(
-        createMockConfig(deps) as Config,
-        createMockProviderService(deps) as ProviderService,
-        createMockWindowService(deps) as WindowService,
-        {
-          isEnforced: () => true,
-          isProviderAllowed: (provider: string) => provider !== "coder",
-          getForcedBaseUrl: () => undefined,
-        } as unknown as PolicyService
-      );
-
-      let fetchCalls = 0;
-      mockFetch(() => {
-        fetchCalls++;
-        return Promise.resolve(new Response("should not be called", { status: 500 }));
-      });
-
-      const result = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
-      expect(result.success).toBe(false);
-      if (!result.success) {
-        expect(result.error).toContain("not allowed");
-      }
-      expect(fetchCalls).toBe(0);
-    });
-
-    it("refuses to commit a login when policy denies coder mid-flow", async () => {
-      // Policy can refresh while the browser authorization is pending: a
-      // flow started under a permissive policy must not persist a credential
-      // after coder was denied, and the exchanged tokens must be revoked.
-      let coderAllowed = true;
-      service = new CoderOauthService(
-        createMockConfig(deps) as Config,
-        createMockProviderService(deps) as ProviderService,
-        createMockWindowService(deps) as WindowService,
-        {
-          isEnforced: () => true,
-          isProviderAllowed: () => coderAllowed,
-          getForcedBaseUrl: () => undefined,
-        } as unknown as PolicyService
-      );
-
-      const revokedTokens: string[] = [];
-      mockFetch(async (input, init) => {
-        const url = fetchUrl(input);
-        if (url.startsWith("http://127.0.0.1")) {
-          return originalFetch(input, init);
-        }
-        if (url === `${DEPLOYMENT_URL}/api/v2/buildinfo`) {
-          return jsonResponse({ version: "v2.99.0" });
-        }
-        if (url === `${DEPLOYMENT_URL}/.well-known/oauth-authorization-server`) {
-          return discoveryResponse();
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/register`) {
-          return jsonResponse({ client_id: "client_new", client_secret: "secret_new" });
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/tokens`) {
-          return jsonResponse({
-            access_token: "at_denied",
-            refresh_token: "rt_denied",
-            expires_in: 86400,
-            token_type: "Bearer",
-          });
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
-          revokedTokens.push(new URLSearchParams(fetchBodyText(init)).get("token") ?? "");
-          return new Response(null, { status: 200 });
-        }
-        return new Response(`unexpected url: ${url}`, { status: 500 });
-      });
-
-      const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
-      expect(startResult.success).toBe(true);
-      if (!startResult.success) return;
-      const { flowId, authorizeUrl } = startResult.data;
-
-      // The policy flips to deny while the user is authorizing in the browser.
-      coderAllowed = false;
-
-      const callbackUrl = new URL(new URL(authorizeUrl).searchParams.get("redirect_uri")!);
-      callbackUrl.searchParams.set("code", "auth_code_denied");
-      callbackUrl.searchParams.set("state", flowId);
-      const callbackResponse = await originalFetch(callbackUrl).catch(() => null);
-      // The browser callback surfaces the failure (HTTP 400), not a success page.
-      expect(callbackResponse?.status).toBe(400);
-
-      const waitResult = await service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
-      expect(waitResult.success).toBe(false);
-      if (!waitResult.success) {
-        expect(waitResult.error).toContain("not allowed");
-      }
-
-      // Nothing persisted, and the raced tokens were revoked.
-      expect(
-        (deps.providersConfig.coder as Record<string, unknown> | undefined)?.coderOauth
-      ).toBeUndefined();
-      await waitUntil(() => revokedTokens.includes("rt_denied"));
-    });
-
-    it("refuses to persist when policy denies coder while the write waits for the file lock", async () => {
-      // Regression: the policy checks must run INSIDE the synchronous write
-      // predicate, not merely before the mutation. Another process can hold
-      // the providers-file lock for seconds, and the policy can refresh to
-      // deny coder during that wait — checks done only before the mutation
-      // would persist a credential under the obsolete policy.
-      let coderAllowed = true;
-      let releasePersist!: () => void;
-      const persistGate = new Promise<void>((resolve) => (releasePersist = resolve));
-      let persistStarted!: () => void;
-      const persistStartedPromise = new Promise<void>((resolve) => (persistStarted = resolve));
-      let sectionCalls = 0;
-
-      // Gate BEFORE the mutation runs: models the file lock being held by
-      // another process while this flow's persist waits.
-      const gatedProviderService = {
-        ...createMockProviderService(deps),
-        updateProviderSection: async (
-          provider: string,
-          update: (
-            section: Record<string, unknown> | undefined
-          ) => { value: Record<string, unknown> } | null
-        ) => {
-          if (++sectionCalls === 1) {
-            persistStarted();
-            await persistGate;
-          }
-          return mockUpdateProviderSection(deps, provider, update);
-        },
-      };
-      service = new CoderOauthService(
-        createMockConfig(deps) as Config,
-        gatedProviderService as ProviderService,
-        createMockWindowService(deps) as WindowService,
-        {
-          isEnforced: () => true,
-          isProviderAllowed: () => coderAllowed,
-          getForcedBaseUrl: () => undefined,
-        } as unknown as PolicyService
-      );
-
-      const revokedTokens: string[] = [];
-      mockFetch(async (input, init) => {
-        const url = fetchUrl(input);
-        if (url.startsWith("http://127.0.0.1")) {
-          return originalFetch(input, init);
-        }
-        if (url === `${DEPLOYMENT_URL}/api/v2/buildinfo`) {
-          return jsonResponse({ version: "v2.99.0" });
-        }
-        if (url === `${DEPLOYMENT_URL}/.well-known/oauth-authorization-server`) {
-          return discoveryResponse();
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/register`) {
-          return jsonResponse({ client_id: "client_new", client_secret: "secret_new" });
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/tokens`) {
-          return jsonResponse({
-            access_token: "at_lockwait",
-            refresh_token: "rt_lockwait",
-            expires_in: 86400,
-            token_type: "Bearer",
-          });
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
-          revokedTokens.push(new URLSearchParams(fetchBodyText(init)).get("token") ?? "");
-          return new Response(null, { status: 200 });
-        }
-        return new Response(`unexpected url: ${url}`, { status: 500 });
-      });
-
-      const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
-      expect(startResult.success).toBe(true);
-      if (!startResult.success) return;
-      const { flowId, authorizeUrl } = startResult.data;
-
-      const callbackUrl = new URL(new URL(authorizeUrl).searchParams.get("redirect_uri")!);
-      callbackUrl.searchParams.set("code", "auth_code_lockwait");
-      callbackUrl.searchParams.set("state", flowId);
-      const callbackPromise = originalFetch(callbackUrl).catch(() => null);
-
-      // The persist is waiting on the "file lock"; policy refreshes to deny.
-      await persistStartedPromise;
-      coderAllowed = false;
-      releasePersist();
-
-      const callbackResponse = await callbackPromise;
-      expect(callbackResponse?.status).toBe(400);
-      const waitResult = await service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
-      expect(waitResult.success).toBe(false);
-
-      // Nothing persisted; the exchanged tokens were revoked.
-      expect(
-        (deps.providersConfig.coder as Record<string, unknown> | undefined)?.coderOauth
-      ).toBeUndefined();
-      await waitUntil(() => revokedTokens.includes("rt_lockwait"));
-    });
-
     it("disconnect waits for a foreign commit's critical section before clearing", async () => {
       // Regression: a commit persists its login and announces success as ONE
       // critical section under the cross-process commit lock, but disconnect
@@ -1354,18 +1154,18 @@ describe("CoderOauthService", () => {
         },
       };
       const serviceA = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthLoginCommitLock: sharedCommitLock,
-        } as Config,
+        }) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
       const serviceB = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthLoginCommitLock: sharedCommitLock,
-        } as Config,
+        }) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1447,80 +1247,8 @@ describe("CoderOauthService", () => {
       }
     });
 
-    it("refuses to commit when the policy-forced deployment URL changes mid-flow", async () => {
-      // Policy can refresh its forcedBaseUrl while the browser authorization
-      // is pending: a credential minted by deployment A must not be persisted
-      // once routing resolves against B — it would be stored, issuer-
-      // mismatched, and reported as a successful login. The exchanged tokens
-      // must be revoked against their own issuer instead.
-      let forcedUrl: string | undefined = undefined;
-      service = new CoderOauthService(
-        createMockConfig(deps) as Config,
-        createMockProviderService(deps) as ProviderService,
-        createMockWindowService(deps) as WindowService,
-        {
-          isEnforced: () => true,
-          isProviderAllowed: () => true,
-          getForcedBaseUrl: () => forcedUrl,
-        } as unknown as PolicyService
-      );
-
-      const revokedTokens: string[] = [];
-      mockFetch(async (input, init) => {
-        const url = fetchUrl(input);
-        if (url.startsWith("http://127.0.0.1")) {
-          return originalFetch(input, init);
-        }
-        if (url === `${DEPLOYMENT_URL}/api/v2/buildinfo`) {
-          return jsonResponse({ version: "v2.99.0" });
-        }
-        if (url === `${DEPLOYMENT_URL}/.well-known/oauth-authorization-server`) {
-          return discoveryResponse();
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/register`) {
-          return jsonResponse({ client_id: "client_new", client_secret: "secret_new" });
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/tokens`) {
-          return jsonResponse({
-            access_token: "at_forced_change",
-            refresh_token: "rt_forced_change",
-            expires_in: 86400,
-            token_type: "Bearer",
-          });
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
-          revokedTokens.push(new URLSearchParams(fetchBodyText(init)).get("token") ?? "");
-          return new Response(null, { status: 200 });
-        }
-        return new Response(`unexpected url: ${url}`, { status: 500 });
-      });
-
-      const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
-      expect(startResult.success).toBe(true);
-      if (!startResult.success) return;
-      const { flowId, authorizeUrl } = startResult.data;
-
-      // The policy pins a DIFFERENT deployment while authorization is pending.
-      forcedUrl = "https://locked-elsewhere.example.com";
-
-      const callbackUrl = new URL(new URL(authorizeUrl).searchParams.get("redirect_uri")!);
-      callbackUrl.searchParams.set("code", "auth_code_forced_change");
-      callbackUrl.searchParams.set("state", flowId);
-      const callbackResponse = await originalFetch(callbackUrl).catch(() => null);
-      expect(callbackResponse?.status).toBe(400);
-
-      const waitResult = await service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
-      expect(waitResult.success).toBe(false);
-
-      // Nothing persisted, and the mismatched credential was revoked.
-      expect(
-        (deps.providersConfig.coder as Record<string, unknown> | undefined)?.coderOauth
-      ).toBeUndefined();
-      await waitUntil(() => revokedTokens.includes("rt_forced_change"));
-    });
-
     it("a disconnect in another process blocks a pending login's commit via the tombstone", async () => {
-      // cancelAll/disconnectGeneration are process-local. Simulate two Shux
+      // cancelAll/disconnectGeneration are process-local. Simulate two Xum
       // processes sharing providers.jsonc with two service instances over the
       // same deps: service A's login persist is gated mid-commit while
       // service B (a different "process": A's flow is invisible to it)
@@ -1560,12 +1288,14 @@ describe("CoderOauthService", () => {
         },
       };
       const serviceA = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
       const serviceB = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1637,61 +1367,6 @@ describe("CoderOauthService", () => {
         await serviceA.dispose();
         await serviceB.dispose();
       }
-    });
-
-    it("logs in to the policy-forced deployment instead of the requested URL", async () => {
-      const FORCED_URL = "http://locked.coder.test";
-      service = new CoderOauthService(
-        createMockConfig(deps) as Config,
-        createMockProviderService(deps) as ProviderService,
-        createMockWindowService(deps) as WindowService,
-        {
-          isEnforced: () => true,
-          isProviderAllowed: () => true,
-          getForcedBaseUrl: (provider: string) =>
-            provider === "coder" ? `${FORCED_URL}/` : undefined,
-        } as unknown as PolicyService
-      );
-
-      let requestedHostCalls = 0;
-      mockFetch((input) => {
-        const url = fetchUrl(input);
-        if (url.startsWith(DEPLOYMENT_URL)) {
-          requestedHostCalls++;
-          return Promise.resolve(new Response("should not be called", { status: 500 }));
-        }
-        if (url === `${FORCED_URL}/api/v2/buildinfo`) {
-          return Promise.resolve(jsonResponse({ version: "v2.99.0" }));
-        }
-        if (url === `${FORCED_URL}/.well-known/oauth-authorization-server`) {
-          return Promise.resolve(
-            jsonResponse({
-              authorization_endpoint: `${FORCED_URL}/oauth2/authorize`,
-              token_endpoint: `${FORCED_URL}/oauth2/tokens`,
-              registration_endpoint: `${FORCED_URL}/oauth2/register`,
-              code_challenge_methods_supported: ["S256"],
-            })
-          );
-        }
-        if (url === `${FORCED_URL}/oauth2/register`) {
-          return Promise.resolve(jsonResponse({ client_id: "c_locked", client_secret: "s" }));
-        }
-        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
-      });
-
-      // User asks for DEPLOYMENT_URL; policy must reroute the login.
-      const result = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
-      expect(result.success).toBe(true);
-      if (!result.success) return;
-
-      expect(requestedHostCalls).toBe(0);
-      expect(new URL(result.data.authorizeUrl).origin).toBe(FORCED_URL);
-      // Nothing persisted at flow start: the (forced) URL is committed
-      // atomically with the auth blob only when the flow completes.
-      const urlCall = deps.setConfigValueCalls.find((c) => c.keyPath[0] === "deploymentUrl");
-      expect(urlCall).toBeUndefined();
-
-      await service.cancelDesktopFlow(result.data.flowId);
     });
 
     it("registers a fresh client when logging in to a different deployment", async () => {
@@ -1883,7 +1558,8 @@ describe("CoderOauthService", () => {
           Promise.resolve({ success: false as const, error: "providers.jsonc is unwritable" }),
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         failingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -1947,11 +1623,11 @@ describe("CoderOauthService", () => {
       // task: the flow must finish with the error immediately (not hang until
       // the five-minute timeout) and the exchanged tokens must be revoked.
       service = new CoderOauthService(
-        {
-          ...createMockConfig(deps),
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps, {
           withCoderOauthLoginCommitLock: <T>(_fn: () => Promise<T> | T): Promise<T> =>
             Promise.reject(new Error("EACCES: permission denied, mkdir lock")),
-        } as Config,
+        }) as FileLeaseManager,
         createMockProviderService(deps) as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2105,7 +1781,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2200,7 +1877,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2300,7 +1978,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2405,7 +2084,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2593,7 +2273,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         gatedProviderService as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -2740,10 +2421,10 @@ describe("CoderOauthService", () => {
           },
         };
         const service = new CoderOauthService(
-          {
-            ...createMockConfig(deps),
+          createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+          createMockFileLeaseManager(deps, {
             withCoderOauthLoginCommitLock: sharedCommitLock,
-          } as Config,
+          }) as FileLeaseManager,
           gatedProviderService as unknown as ProviderService,
           createMockWindowService(deps) as WindowService
         );
@@ -3030,7 +2711,7 @@ describe("CoderOauthService", () => {
 
     it("registers a fresh client when another process holds the stored-client lease", async () => {
       // The stored-client reservation is a cross-process filesystem lease:
-      // a concurrent login flow in ANOTHER Shux process sharing providers.jsonc
+      // a concurrent login flow in ANOTHER Xum process sharing providers.jsonc
       // would clobber the stored client's single redirect slot just like an
       // in-process one. When the lease is unavailable, the flow must fall
       // back to a fresh client and leave the stored client untouched.
@@ -3278,7 +2959,8 @@ describe("CoderOauthService", () => {
         updateProviderSection: () => Promise.resolve(Err("disk full")),
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         failingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -3312,90 +2994,14 @@ describe("CoderOauthService", () => {
       expect(deps.coderClientLeaseHeld).toBe(true);
     });
 
-    it("persists the complete discovered catalog even when a policy restricts models", async () => {
-      // Policies refresh remotely: a temporarily restrictive policy must not
-      // carve models out of the DURABLE catalog, or they would stay
-      // unroutable until the next login even after the policy broadens.
-      // Policy is applied at exposure time instead (getConfig filtering,
-      // routing checks, per-model factory enforcement).
-      service = new CoderOauthService(
-        createMockConfig(deps) as Config,
-        createMockProviderService(deps) as ProviderService,
-        createMockWindowService(deps) as WindowService,
-        {
-          isEnforced: () => true,
-          isProviderAllowed: () => true,
-          getForcedBaseUrl: () => undefined,
-          isModelAllowed: (_provider: string, modelId: string) =>
-            modelId === "anthropic/allowed-model",
-        } as unknown as PolicyService
-      );
-
-      mockFetch(async (input, init) => {
-        const url = fetchUrl(input);
-        if (url.startsWith("http://127.0.0.1")) {
-          return originalFetch(input, init);
-        }
-        if (url === `${DEPLOYMENT_URL}/api/v2/buildinfo`) {
-          return jsonResponse({ version: "v2.99.0" });
-        }
-        if (url === `${DEPLOYMENT_URL}/.well-known/oauth-authorization-server`) {
-          return discoveryResponse();
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/register`) {
-          return jsonResponse({ client_id: "client_new", client_secret: "secret_new" });
-        }
-        if (url === `${DEPLOYMENT_URL}/oauth2/tokens`) {
-          return jsonResponse({
-            access_token: "at_policy",
-            refresh_token: "rt_policy",
-            expires_in: 86400,
-            token_type: "Bearer",
-          });
-        }
-        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
-          return Promise.resolve(aiProvidersResponse());
-        }
-        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
-          return jsonResponse({ data: [{ id: "allowed-model" }, { id: "blocked-model" }] });
-        }
-        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
-          return new Response("aibridge not entitled", { status: 404 });
-        }
-        return new Response(`unexpected url: ${url}`, { status: 500 });
-      });
-
-      const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
-      expect(startResult.success).toBe(true);
-      if (!startResult.success) return;
-      const { flowId, authorizeUrl } = startResult.data;
-
-      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
-      const callbackUrl = new URL(new URL(authorizeUrl).searchParams.get("redirect_uri")!);
-      callbackUrl.searchParams.set("code", "auth_code_policy");
-      callbackUrl.searchParams.set("state", flowId);
-      await originalFetch(callbackUrl);
-      const waitResult = await waitPromise;
-      expect(waitResult.success).toBe(true);
-
-      await waitUntil(() => {
-        const section = deps.providersConfig.coder as Record<string, unknown> | undefined;
-        return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
-      });
-      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      // Both models persisted — including the one the current policy blocks.
-      expect(coderSection.discoveredModels).toEqual([
-        "anthropic/allowed-model",
-        "anthropic/blocked-model",
-      ]);
-      expect(coderSection.models).toEqual(["anthropic/allowed-model", "anthropic/blocked-model"]);
-    });
-
-    it("does not resurrect user-removed discovered models on re-login", async () => {
-      // The user removed a discovered model in Models settings (recorded in
-      // removedModels by setModels). A re-login rebuilds the catalog from the
-      // deployment — which still serves that model — but the merge must honor
-      // the recorded exclusion instead of resurrecting the deleted entry.
+    it("re-login and refresh leave the user-managed models list untouched", async () => {
+      // `models` is user-managed: a re-login plus catalog load rebuilds the catalog from the
+      // deployment — which serves a model that is NOT in the list (and carries
+      // a legacy removal tombstone) — but neither the login commit nor the
+      // catalog write may add to or remove from `models`. The tombstone is
+      // legacy data: honored by routing, never rewritten here. The flag marks
+      // the list as written under the new contract (legacy merged lists are
+      // covered separately).
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
@@ -3403,6 +3009,7 @@ describe("CoderOauthService", () => {
           models: ["anthropic/kept-model"],
           discoveredModels: ["anthropic/kept-model", "anthropic/removed-model"],
           removedModels: ["anthropic/removed-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -3456,26 +3063,26 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
-      await waitUntil(() => {
-        const section = deps.providersConfig.coder as Record<string, unknown> | undefined;
-        return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
-      });
+      // Login discovers provider instances only; the catalog loads on demand.
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      // The removed model stays excluded from the visible list even though
-      // the fresh catalog still contains it; the exclusion itself persists.
+      // The list is byte-for-byte what the user had; the catalog is complete;
+      // the legacy tombstone is untouched; both writes flag the new contract.
       expect(coderSection.models).toEqual(["anthropic/kept-model"]);
       expect(coderSection.discoveredModels).toEqual([
         "anthropic/kept-model",
         "anthropic/removed-model",
       ]);
       expect(coderSection.removedModels).toEqual(["anthropic/removed-model"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      expect(deps.setModelsCalls).toEqual([]);
     });
 
     it("preserves user-edited settings on discovered models across a re-login", async () => {
-      // A discovered model the user edited in Models settings (context window
-      // override / model mapping) becomes an object entry while its ID stays
-      // recorded in discoveredModels. Re-login + catalog merge must keep the
-      // object (user-authored data), not collapse it back to a plain string.
+      // A configured model the user edited in Models settings (context window
+      // override / model mapping) is an object entry whose ID the catalog also
+      // lists. Re-login + catalog write must leave `models` byte-for-byte
+      // unchanged: neither collapse the object nor reorder/re-add entries.
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
@@ -3485,6 +3092,7 @@ describe("CoderOauthService", () => {
             "anthropic/plain-model",
           ],
           discoveredModels: ["anthropic/tuned-model", "anthropic/plain-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -3538,17 +3146,15 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
-      await waitUntil(() => {
-        const section = deps.providersConfig.coder as Record<string, unknown> | undefined;
-        return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
-      });
+      // Login discovers provider instances only; the catalog loads on demand.
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      // The edited entry survived (ahead of the fresh catalog, no duplicate);
-      // the unedited discovered entry was reset to the plain catalog string.
+      // `models` untouched (no write at all); only the catalog was refreshed.
       expect(coderSection.models).toEqual([
         { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
         "anthropic/plain-model",
       ]);
+      expect(deps.setModelsCalls).toEqual([]);
       expect(coderSection.discoveredModels).toEqual([
         "anthropic/tuned-model",
         "anthropic/plain-model",
@@ -3713,7 +3319,23 @@ describe("CoderOauthService", () => {
       releaseRevokeA();
     });
 
-    it("clears the persisted model catalog when the new deployment has no catalogs", async () => {
+    it("clears the previous catalog and never probes catalogs when the listing is forbidden", async () => {
+      // A previous deployment's catalog plus one user-configured model.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          models: ["anthropic/manual-model"],
+          discoveredModels: ["anthropic/old-model"],
+        },
+      };
+      // Count only this login's listings: a committed login's discovery fiber outlives its
+      // test and calls whichever fetch mock is installed, so an earlier test's retries land
+      // here under load (#5758). A wait on the raw count could overshoot and never match.
+      let ownListingRequests = 0;
+      let ownListingStarted!: () => void;
+      const loginDiscoveryListing = new Promise<void>((resolve) => (ownListingStarted = resolve));
+      const probeRequests: string[] = [];
+      let afterLoginDiscovery: { probes: string[]; coder: Record<string, unknown> } | undefined;
       mockFetch(async (input, init) => {
         const url = fetchUrl(input);
         if (url.startsWith("http://127.0.0.1")) {
@@ -3736,13 +3358,26 @@ describe("CoderOauthService", () => {
             token_type: "Bearer",
           });
         }
-        // Provider listing unavailable (member RBAC / older coderd): discovery
-        // falls back to probing the default provider names.
+        // Provider listing unavailable (member RBAC / older coderd).
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          if (new Headers(init?.headers).get("authorization") !== "Bearer at_no_catalog") {
+            return new Response("forbidden", { status: 403 });
+          }
+          ownListingRequests++;
+          if (ownListingRequests === 1) ownListingStarted();
+          // The second listing is the explicit catalog load, queued behind the
+          // login's discovery on the refresh mutex: capture what login left.
+          if (ownListingRequests === 2) {
+            afterLoginDiscovery = {
+              probes: [...probeRequests],
+              coder: structuredClone(deps.providersConfig.coder as Record<string, unknown>),
+            };
+          }
           return new Response("forbidden", { status: 403 });
         }
         // Every probed route absent (e.g. AI Gateway not entitled).
         if (url.includes("/api/v2/aibridge/")) {
+          probeRequests.push(url);
           return new Response("aibridge not entitled", { status: 404 });
         }
         return new Response(`unexpected url: ${url}`, { status: 500 });
@@ -3761,28 +3396,91 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
-      // A previous deployment's catalog must not survive the re-login: the
-      // list is overwritten with the (empty) catalog of the new deployment.
-      await waitUntil(() => deps.setModelsCalls.length > 0);
-      expect(deps.setModelsCalls[0].provider).toBe("coder");
-      expect(deps.setModelsCalls[0].models).toEqual([]);
+      // Login-time discovery never falls back to per-instance /models probes:
+      // probing is a catalog load, which only the user triggers. A previous
+      // deployment's catalog does not survive the re-login (unknown, not
+      // empty), and the user-configured list is left alone.
+      // The login's discovery holds the catalog refresh mutex while it lists, so the explicit
+      // load below queues behind it. Wait for that listing itself, not a wall-clock poll.
+      await loginDiscoveryListing;
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
+
+      expect(afterLoginDiscovery?.probes).toEqual([]);
+      expect(afterLoginDiscovery?.coder.discoveredModels).toBeUndefined();
+      expect(afterLoginDiscovery?.coder.discoveredProviders).toBeUndefined();
+      expect(afterLoginDiscovery?.coder.models).toEqual(["anthropic/manual-model"]);
+      expect(deps.setModelsCalls).toEqual([]);
+
+      // The explicit load still probes and records the (empty, but known) catalog.
+      expect(probeRequests.length).toBeGreaterThan(0);
+      expect((deps.providersConfig.coder as Record<string, unknown>).discoveredModels).toEqual([]);
     });
 
-    it("preserves manually added models across a re-login and catalog refresh", async () => {
-      // Users can append model IDs to the coder section's models list (see
-      // docs/config/providers.mdx). Those entries are user-managed data:
-      // a re-login resets only the DISCOVERED catalog (discoveredModels
-      // bookkeeping), and the post-login discovery merges manual entries
-      // ahead of the fresh catalog instead of overwriting the whole list.
-      deps.providersConfig = {
-        coder: {
-          deploymentUrl: DEPLOYMENT_URL,
-          coderOauth: validAuth({ sessionId: "session_prior" }),
-          models: ["anthropic/my-manual-model", "anthropic/old-model"],
-          discoveredModels: ["anthropic/old-model"],
-        },
-      };
+    // #5762: dispose() stops a committed login's discovery. Before, its retries outlived the
+    // service and reached whichever fetch mock the next test installed (#5758).
+    it("stops a committed login's provider discovery on dispose", async () => {
+      deps.providersConfig = { coder: { deploymentUrl: DEPLOYMENT_URL } };
+      let listingRequests = 0;
+      let listingSignal: AbortSignal | undefined;
+      let firstListing!: () => void;
+      const listingStarted = new Promise<void>((resolve) => (firstListing = resolve));
+      mockFetch(async (input, init) => {
+        const url = fetchUrl(input);
+        if (url.startsWith("http://127.0.0.1")) {
+          return originalFetch(input, init);
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/buildinfo`) {
+          return jsonResponse({ version: "v2.99.0" });
+        }
+        if (url === `${DEPLOYMENT_URL}/.well-known/oauth-authorization-server`) {
+          return discoveryResponse();
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/register`) {
+          return jsonResponse({ client_id: "client_new", client_secret: "secret_new" });
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/tokens`) {
+          return jsonResponse({
+            access_token: "at_dispose",
+            refresh_token: "rt_dispose",
+            expires_in: 86400,
+            token_type: "Bearer",
+          });
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          if (new Headers(init?.headers).get("authorization") !== "Bearer at_dispose") {
+            return new Response("forbidden", { status: 403 });
+          }
+          listingRequests++;
+          listingSignal = init?.signal ?? undefined;
+          firstListing();
+          // Hang until the request is aborted, like a stalled deployment.
+          return new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+          });
+        }
+        return new Response(`unexpected url: ${url}`, { status: 500 });
+      });
 
+      const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+      const { flowId, authorizeUrl } = startResult.data;
+      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
+      const callbackUrl = new URL(new URL(authorizeUrl).searchParams.get("redirect_uri")!);
+      callbackUrl.searchParams.set("code", "auth_code_dispose");
+      callbackUrl.searchParams.set("state", flowId);
+      await originalFetch(callbackUrl);
+      expect((await waitPromise).success).toBe(true);
+
+      await listingStarted;
+      await service.dispose();
+      // dispose() waits for the interrupted discovery, which aborted its request.
+      expect(listingSignal?.aborted).toBe(true);
+      expect(listingRequests).toBe(1);
+    });
+
+    /** Re-login fetch mock whose post-login discovery lists exactly one anthropic model. */
+    function mockReLoginFetch(): void {
       mockFetch(async (input, init) => {
         const url = fetchUrl(input);
         if (url.startsWith("http://127.0.0.1")) {
@@ -3819,10 +3517,13 @@ describe("CoderOauthService", () => {
         }
         return new Response(`unexpected url: ${url}`, { status: 500 });
       });
+    }
 
+    /** Drive a desktop login to completion, then load the catalog explicitly. */
+    async function completeReLogin(): Promise<Record<string, unknown>> {
       const startResult = await service.startDesktopFlow({ deploymentUrl: DEPLOYMENT_URL });
       expect(startResult.success).toBe(true);
-      if (!startResult.success) return;
+      if (!startResult.success) throw new Error(startResult.error);
       const { flowId, authorizeUrl } = startResult.data;
 
       const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
@@ -3833,18 +3534,76 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
-      // The commit kept the manual entry (dropping only the old discovered
-      // one), then discovery merged it ahead of the fresh catalog.
-      await waitUntil(() => {
-        const section = deps.providersConfig.coder as Record<string, unknown> | undefined;
-        return Array.isArray(section?.discoveredModels) && section.discoveredModels.length > 0;
-      });
-      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      // Login discovers provider instances only; the catalog loads on demand.
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
+      return deps.providersConfig.coder as Record<string, unknown>;
+    }
+
+    it("preserves manually added models across a re-login and catalog refresh", async () => {
+      // Users can append model IDs to the coder section's models list (see
+      // docs/config/providers.mdx). Those entries are user-managed data: a
+      // re-login resets only the DISCOVERED catalog (discoveredModels), and the
+      // post-login discovery rewrites only the catalog — the list stays
+      // byte-for-byte, including an entry the new catalog no longer lists.
+      // The flag marks the list as written under the new contract (an
+      // unflagged list next to a catalog marker is legacy merged data; see the
+      // test below).
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth({ sessionId: "session_prior" }),
+          models: ["anthropic/my-manual-model", "anthropic/old-model"],
+          discoveredModels: ["anthropic/old-model"],
+          discoveredModelsUnlisted: true,
+        },
+      };
+      mockReLoginFetch();
+
+      const coderSection = await completeReLogin();
+
+      // Neither the commit nor discovery touched `models`; only the catalog
+      // was replaced.
+      expect(coderSection.models).toEqual(["anthropic/my-manual-model", "anthropic/old-model"]);
+      expect(deps.setModelsCalls).toEqual([]);
+      expect(coderSection.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
+
+    it("finishes a skipped discovered-models migration before resetting the catalog on re-login", async () => {
+      // The startup migration (separateDiscoveredModelsOnce) can be skipped
+      // or fail transiently, leaving old code's merged list without the flag.
+      // The login commit stamps the flag, so it must separate the list itself
+      // — otherwise the merged catalog entries would be frozen into `models`
+      // and every later startup would skip the migration. Only entries the
+      // OLD markers list are catalog data; the edited object and the manual
+      // ID survive, and the new catalog no longer lists the stripped IDs.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth({ sessionId: "session_prior" }),
+          models: [
+            "anthropic/my-manual-model",
+            "anthropic/old-model",
+            { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+            "openai/stale-model",
+          ],
+          discoveredModels: ["anthropic/old-model", "anthropic/tuned-model"],
+          staleDiscoveredModels: ["openai/stale-model"],
+          removedModels: ["anthropic/legacy-removed"],
+        },
+      };
+      mockReLoginFetch();
+
+      const coderSection = await completeReLogin();
+
       expect(coderSection.models).toEqual([
         "anthropic/my-manual-model",
-        "anthropic/claude-sonnet-4-5",
+        { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
       ]);
       expect(coderSection.discoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
     });
 
     it("fetches origin catalogs concurrently so a stalled origin cannot starve a healthy one", async () => {
@@ -3883,6 +3642,14 @@ describe("CoderOauthService", () => {
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
           return Promise.resolve(aiProvidersResponse());
         }
+        // Earlier tests can finish their OAuth flow before post-login catalog discovery settles.
+        // Keep those stale requests from participating in this flow's concurrency gate.
+        if (
+          url.includes("/api/v2/aibridge/") &&
+          new Headers(init?.headers).get("Authorization") !== "Bearer at_concurrent"
+        ) {
+          return new Response("stale test flow", { status: 404 });
+        }
         if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
           catalogSignals.push(init?.signal);
           await anthropicGate; // Stalled until openai is queried.
@@ -3910,10 +3677,12 @@ describe("CoderOauthService", () => {
       expect(waitResult.success).toBe(true);
 
       // Both catalogs land, in deterministic origin order, despite the stall.
-      // (The first models write is the login commit's atomic catalog clear.)
-      await waitUntil(() => deps.setModelsCalls.some((call) => call.models.length > 0));
-      const catalogWrite = deps.setModelsCalls.find((call) => call.models.length > 0)!;
-      expect(catalogWrite.models).toEqual(["anthropic/claude-sonnet-4-5", "openai/gpt-5"]);
+      expect(await service.refreshModels()).toEqual(Ok(undefined));
+      const currentCoderSection = () => deps.providersConfig.coder as Record<string, unknown>;
+      expect(currentCoderSection().discoveredModels).toEqual([
+        "anthropic/claude-sonnet-4-5",
+        "openai/gpt-5",
+      ]);
       // Every catalog request was time-bounded.
       expect(catalogSignals).toHaveLength(2);
       for (const signal of catalogSignals) {
@@ -3922,9 +3691,9 @@ describe("CoderOauthService", () => {
     });
 
     it("leaves the catalog unknown when discovery keeps failing transiently", async () => {
-      // A re-login where every /models request 500s: the commit resets the
-      // catalog to unknown (deleting the previous deployment's list), and
-      // discovery must retry, then SKIP the write — persisting [] would be
+      // A re-login followed by a catalog load where every /models request
+      // 500s: the commit resets the catalog to unknown (deleting the previous
+      // deployment's list), and the load must retry, then SKIP the write — persisting [] would be
       // read as an authoritative empty catalog and block Coder routing until
       // the next login even after the bridge recovers.
       deps.providersConfig = {
@@ -3933,6 +3702,7 @@ describe("CoderOauthService", () => {
           coderOauth: validAuth({ sessionId: "session_prior" }),
           models: ["anthropic/prior-model"],
           discoveredModels: ["anthropic/prior-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -3986,12 +3756,14 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
+      expect((await service.refreshModels()).success).toBe(false);
       // Each origin was retried (2 origins x 3 attempts).
-      await waitUntil(() => catalogRequests >= 6, 5000);
+      expect(catalogRequests).toBe(6);
       // The catalog stays UNKNOWN: the previous deployment's discovered list
       // is gone (reset by the commit) and no authoritative list was written.
+      // The user-managed list is not the commit's to reset.
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      expect(coderSection.models).toBeUndefined();
+      expect(coderSection.models).toEqual(["anthropic/prior-model"]);
       expect(coderSection.discoveredModels).toBeUndefined();
       expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_relogin");
     });
@@ -4008,6 +3780,7 @@ describe("CoderOauthService", () => {
           coderOauth: validAuth({ sessionId: "session_prior" }),
           models: ["anthropic/prior-model"],
           discoveredModels: ["anthropic/prior-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -4060,18 +3833,19 @@ describe("CoderOauthService", () => {
       const waitResult = await waitPromise;
       expect(waitResult.success).toBe(true);
 
+      expect((await service.refreshModels()).success).toBe(false);
       // Each origin was retried like other transient failures (2 x 3).
-      await waitUntil(() => catalogRequests >= 6, 5000);
+      expect(catalogRequests).toBe(6);
       // The catalog stays UNKNOWN (routing fails open): no authoritative
-      // list was persisted from the rejected requests.
+      // list was persisted from the rejected requests; `models` is untouched.
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       expect(coderSection.discoveredModels).toBeUndefined();
-      expect(coderSection.models).toBeUndefined();
+      expect(coderSection.models).toEqual(["anthropic/prior-model"]);
       expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_unauth");
     });
 
-    it("skips the model catalog write when the login was superseded during discovery", async () => {
-      // Gate the catalog fetch so a newer login can land while discovery runs.
+    it("skips the provider write when the login was superseded during discovery", async () => {
+      // Gate the provider listing so a newer login can land while discovery runs.
       let releaseCatalog!: () => void;
       const catalogGate = new Promise<void>((resolve) => (releaseCatalog = resolve));
       let catalogStarted!: () => void;
@@ -4100,12 +3874,9 @@ describe("CoderOauthService", () => {
           });
         }
         if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
-          return aiProvidersResponse();
-        }
-        if (url.includes("/api/v2/aibridge/")) {
           catalogStarted();
           await catalogGate;
-          return jsonResponse({ data: [{ id: "stale-model" }] });
+          return aiProvidersResponse();
         }
         return new Response(`unexpected url: ${url}`, { status: 500 });
       });
@@ -4133,14 +3904,217 @@ describe("CoderOauthService", () => {
       };
       releaseCatalog();
 
-      // The stale discovery must not commit its catalog over the newer login's.
-      // (The exchange-time atomic clear writes [], but the stale-model list
-      // fetched by the superseded discovery must never land.)
+      // The stale discovery must not commit its providers over the newer
+      // login's section, which stays as it was.
       await new Promise((resolve) => setTimeout(resolve, 100));
-      const staleWrite = deps.setModelsCalls.find((c) =>
-        (c.models as unknown as string[]).some((m) => String(m).includes("stale-model"))
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.discoveredProviders).toBeUndefined();
+      expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_newer_login");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // startServerFlow / handleServerCallback (browser + remote Xum server)
+  // -------------------------------------------------------------------------
+
+  describe("startServerFlow", () => {
+    const SERVER_REDIRECT_URI = "https://xum.example.com/auth/coder/callback";
+
+    /** Deployment mocks for the server flow; `onTokens` customizes the exchange. */
+    function mockServerFlowDeployment(opts: {
+      registerCalls?: unknown[];
+      onTokens?: (init?: RequestInit) => Promise<Response>;
+      onRevoke?: (init?: RequestInit) => void;
+    }): void {
+      mockFetch(async (input, init) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/buildinfo`) {
+          return jsonResponse({ version: "v2.99.0" });
+        }
+        if (url === `${DEPLOYMENT_URL}/.well-known/oauth-authorization-server`) {
+          return discoveryResponse();
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/register`) {
+          opts.registerCalls?.push(JSON.parse(fetchBodyText(init)));
+          return jsonResponse({ client_id: "client_srv", client_secret: "secret_srv" });
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/tokens`) {
+          if (opts.onTokens) return opts.onTokens(init);
+          return jsonResponse({
+            access_token: "at_srv",
+            refresh_token: "rt_srv",
+            expires_in: 86400,
+            token_type: "Bearer",
+          });
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
+          opts.onRevoke?.(init);
+          return new Response(null, { status: 200 });
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return aiProvidersResponse();
+        }
+        if (url.startsWith(`${DEPLOYMENT_URL}/api/v2/aibridge/`)) {
+          return jsonResponse({ data: [{ id: "claude-sonnet-4-5" }] });
+        }
+        // No loopback listener may be involved: any 127.0.0.1 request is a bug.
+        return new Response(`unexpected url: ${url}`, { status: 500 });
+      });
+    }
+
+    it("registers the server callback URL instead of a loopback listener and commits via handleServerCallback", async () => {
+      const registerCalls: unknown[] = [];
+      let exchangeBody: URLSearchParams | null = null;
+      mockServerFlowDeployment({
+        registerCalls,
+        onTokens: (init) => {
+          exchangeBody = new URLSearchParams(fetchBodyText(init));
+          return Promise.resolve(
+            jsonResponse({
+              access_token: "at_srv",
+              refresh_token: "rt_srv",
+              expires_in: 86400,
+              token_type: "Bearer",
+            })
+          );
+        },
+      });
+
+      const flowId = "server-flow-0123456789abcdef";
+      const startResult = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        flowId,
+        redirectUri: SERVER_REDIRECT_URI,
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+
+      const authorize = new URL(startResult.data.authorizeUrl);
+      expect(startResult.data.flowId).toBe(flowId);
+      expect(authorize.searchParams.get("state")).toBe(flowId);
+      // Exact redirect URI matching: the server route URL is what gets
+      // registered and what the authorize request names.
+      expect(authorize.searchParams.get("redirect_uri")).toBe(SERVER_REDIRECT_URI);
+      expect((registerCalls[0] as { redirect_uris: string[] }).redirect_uris).toEqual([
+        SERVER_REDIRECT_URI,
+      ]);
+
+      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
+
+      // Unknown state is refused before any exchange.
+      const unknown = await service.handleServerCallback({
+        state: "not-a-registered-flow",
+        code: "code",
+        error: null,
+      });
+      expect(unknown.success).toBe(false);
+
+      // The callback route's outcome is the committed login.
+      const callbackResult = await service.handleServerCallback({
+        state: flowId,
+        code: "auth_code_srv",
+        error: null,
+      });
+      expect(callbackResult).toEqual(Ok(undefined));
+      expect(await waitPromise).toEqual(Ok(undefined));
+
+      expect(exchangeBody!.get("code")).toBe("auth_code_srv");
+      expect(exchangeBody!.get("redirect_uri")).toBe(SERVER_REDIRECT_URI);
+      expect(sha256Base64Url(exchangeBody!.get("code_verifier")!)).toBe(
+        authorize.searchParams.get("code_challenge")!
       );
-      expect(staleWrite).toBeUndefined();
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect((coderSection.coderOauth as CoderOauthAuth).access).toBe("at_srv");
+      expect(coderSection.deploymentUrl).toBe(DEPLOYMENT_URL);
+
+      // An authorization code is single-use; so is its delivery. The finished
+      // flow is gone from the manager, so a replayed redirect is refused.
+      const replay = await service.handleServerCallback({
+        state: flowId,
+        code: "auth_code_srv",
+        error: null,
+      });
+      expect(replay.success).toBe(false);
+    });
+
+    it("fails the flow when the redirect carries an OAuth error", async () => {
+      mockServerFlowDeployment({});
+      const startResult = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        redirectUri: SERVER_REDIRECT_URI,
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+      const { flowId } = startResult.data;
+      const waitPromise = service.waitForDesktopFlow(flowId, { timeoutMs: 5000 });
+
+      const callbackResult = await service.handleServerCallback({
+        state: flowId,
+        code: null,
+        error: "access_denied",
+        errorDescription: "User declined",
+      });
+      expect(callbackResult).toEqual(Err("access_denied: User declined"));
+      expect(await waitPromise).toEqual(Err("access_denied: User declined"));
+      expect(deps.providersConfig.coder?.coderOauth).toBeUndefined();
+    });
+
+    it("settles the pending callback request when the flow is cancelled mid-exchange", async () => {
+      let releaseExchange!: () => void;
+      const exchangeGate = new Promise<void>((resolve) => (releaseExchange = resolve));
+      let exchangeStarted!: () => void;
+      const exchangeStartedPromise = new Promise<void>((resolve) => (exchangeStarted = resolve));
+      let revokeBody: URLSearchParams | null = null;
+      mockServerFlowDeployment({
+        onTokens: async () => {
+          exchangeStarted();
+          await exchangeGate;
+          return jsonResponse({
+            access_token: "at_raced",
+            refresh_token: "rt_raced",
+            expires_in: 86400,
+            token_type: "Bearer",
+          });
+        },
+        onRevoke: (init) => {
+          revokeBody = new URLSearchParams(fetchBodyText(init));
+        },
+      });
+
+      const startResult = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        redirectUri: SERVER_REDIRECT_URI,
+      });
+      expect(startResult.success).toBe(true);
+      if (!startResult.success) return;
+      const { flowId } = startResult.data;
+
+      // The Express route awaits this; Cancel must resolve it rather than
+      // leave the browser tab hanging until the flow timeout.
+      const callbackPromise = service.handleServerCallback({
+        state: flowId,
+        code: "auth_code_raced",
+        error: null,
+      });
+      await exchangeStartedPromise;
+      await service.cancelDesktopFlow(flowId);
+      const callbackResult = await callbackPromise;
+      expect(callbackResult.success).toBe(false);
+      releaseExchange();
+
+      await waitUntil(() => revokeBody !== null);
+      expect(revokeBody!.get("token")).toBe("rt_raced");
+      expect(deps.providersConfig.coder?.coderOauth).toBeUndefined();
+    });
+
+    it("rejects a non-http(s) redirect URI without network calls", async () => {
+      mockFetch(() => Promise.reject(new Error("network must not be reached")));
+      const result = await service.startServerFlow({
+        deploymentUrl: DEPLOYMENT_URL,
+        redirectUri: "javascript:alert(1)",
+      });
+      expect(result).toEqual(Err("Invalid OAuth redirect URI"));
     });
   });
 
@@ -4187,6 +4161,34 @@ describe("CoderOauthService", () => {
       expect(result.success).toBe(false);
       if (!result.success) {
         expect(result.error).toContain("Login with Coder");
+      }
+    });
+
+    // #5659: the error names each provider whose model list keeps failing, with its status, so a
+    // user can tell a deployment problem from a Xum problem.
+    it("names the failing provider and its status when one model list keeps failing", async () => {
+      deps.providersConfig = {
+        coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
+      };
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(aiProvidersResponse());
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(new Response("bad gateway", { status: 502 }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "gpt-5" }] }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      const result = await service.refreshModels();
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error).toContain("anthropic (HTTP 502)");
+        expect(result.error).not.toContain("openai");
       }
     });
 
@@ -4298,7 +4300,7 @@ describe("CoderOauthService", () => {
 
     it("refuses to commit when another process committed a catalog mid-flight", async () => {
       // The in-process catalogRefreshMutex cannot order refreshes from OTHER
-      // Shux processes sharing providers.jsonc. The persisted
+      // Xum processes sharing providers.jsonc. The persisted
       // coderCatalogGeneration counter must: a refresh that began before
       // another process committed (same session, same deployment) would
       // otherwise overwrite the newer catalog with stale fetches.
@@ -4412,18 +4414,124 @@ describe("CoderOauthService", () => {
       ]);
     });
 
+    it("refreshProviders re-lists instances without fetching catalogs or touching routing preferences", async () => {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          discoveredModels: [
+            "anthropic/claude-sonnet-4-5",
+            "prod-anthropic/claude-opus-5-5",
+            "openai/gpt-5",
+            "removed/gpt-5",
+            "retyped/gpt-5",
+          ],
+          // openai is absent: its catalog came from probing the default name.
+          discoveredProviders: [
+            { name: "anthropic", type: "anthropic" },
+            { name: "prod-anthropic", type: "anthropic" },
+            { name: "removed", type: "openai" },
+            { name: "retyped", type: "openai" },
+          ],
+          canonicalRoutes: { anthropic: "claude-aws-us-east-2" },
+        },
+      };
+      const listed = [
+        { name: "anthropic", type: "anthropic" },
+        { name: "prod-anthropic", type: "anthropic" },
+        { name: "openai", type: "openai" },
+        { name: "retyped", type: "openai-compat" },
+        { name: "claude-aws-us-east-2", type: "anthropic" },
+      ];
+      const catalogUrls: string[] = [];
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(
+            jsonResponse(listed.map((provider) => ({ ...provider, enabled: true })))
+          );
+        }
+        catalogUrls.push(url);
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect(await service.refreshProviders()).toEqual(Ok(undefined));
+
+      expect(catalogUrls).toEqual([]);
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.discoveredProviders).toEqual(listed);
+      // Removed and retyped instances' models must stop passing the catalog gate.
+      expect(coderSection.discoveredModels).toEqual([
+        "anthropic/claude-sonnet-4-5",
+        "prod-anthropic/claude-opus-5-5",
+        "openai/gpt-5",
+      ]);
+      expect(coderSection.canonicalRoutes).toEqual({ anthropic: "claude-aws-us-east-2" });
+      expect(coderSection.coderCatalogGeneration).toBe(1);
+    });
+
+    it("refreshProviders refuses to commit when another process committed mid-flight", async () => {
+      deps.providersConfig = {
+        coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
+      };
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          const section = deps.providersConfig.coder as Record<string, unknown>;
+          section.coderCatalogGeneration = 1;
+          section.discoveredProviders = [{ name: "newer", type: "anthropic" }];
+          return Promise.resolve(
+            jsonResponse([{ name: "stale", type: "anthropic", enabled: true }])
+          );
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect((await service.refreshProviders()).success).toBe(false);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.discoveredProviders).toEqual([{ name: "newer", type: "anthropic" }]);
+      expect(coderSection.coderCatalogGeneration).toBe(1);
+    });
+
+    it("refreshProviders persists nothing and probes nothing when the listing is forbidden", async () => {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          discoveredProviders: [{ name: "prior", type: "anthropic" }],
+        },
+      };
+      const catalogUrls: string[] = [];
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(new Response("forbidden", { status: 403 }));
+        }
+        catalogUrls.push(url);
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect((await service.refreshProviders()).success).toBe(false);
+
+      expect(catalogUrls).toEqual([]);
+      expect((deps.providersConfig.coder as Record<string, unknown>).discoveredProviders).toEqual([
+        { name: "prior", type: "anthropic" },
+      ]);
+    });
+
     it("keeps a fresh catalog unknown when any provider fails transiently", async () => {
       // Fresh login state: discoveredModels absent (catalog unknown, routing
       // fails open). One provider succeeds, the other errors after retries.
       // Persisting the partial list as discoveredModels would read as an
       // authoritative catalog and block every model of the failed provider
       // until the next refresh; the authoritative marker must stay absent so
-      // routing stays fail-open. The healthy provider's fetched entries stay
-      // USER-VISIBLE in models (flagged via staleDiscoveredModels so they
-      // remain classified as catalog data). The authoritative provider
-      // LISTING is conclusive independently of the catalogs, so it is still
-      // persisted — custom-named instances must stay resolvable for manually
-      // added models.
+      // routing stays fail-open. The healthy provider's fetched entries are
+      // carried in staleDiscoveredModels (never in the user-managed models
+      // list) so a later inconclusive refresh can carry them forward. The
+      // authoritative provider LISTING is conclusive independently of the
+      // catalogs, so it is still persisted — custom-named instances must stay
+      // resolvable for manually added models.
       deps.providersConfig = {
         coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
       };
@@ -4452,8 +4560,9 @@ describe("CoderOauthService", () => {
 
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       expect(coderSection.discoveredModels).toBeUndefined();
-      expect(coderSection.models).toEqual(["prod-anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.models).toBeUndefined();
       expect(coderSection.staleDiscoveredModels).toEqual(["prod-anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
       expect(coderSection.discoveredProviders).toEqual([
         { name: "prod-anthropic", type: "anthropic" },
         { name: "openai", type: "openai" },
@@ -4510,6 +4619,7 @@ describe("CoderOauthService", () => {
           ],
           discoveredModels: ["anthropic/claude-old-2"],
           discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -4538,14 +4648,15 @@ describe("CoderOauthService", () => {
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       // Catalog unknown: vertex models stay reachable through fail-open routing.
       expect(coderSection.discoveredModels).toBeUndefined();
-      // Manual (user-edited) entries survive, and the healthy provider's
-      // fresh catalog stays user-visible (flagged stale so disconnect and
-      // future refreshes keep classifying it as discovered data).
+      // The user-managed list is untouched (edited object AND the plain entry
+      // the fresh fetch no longer lists); the healthy provider's fetched
+      // catalog is carried in the stale marker only.
       expect(coderSection.models).toEqual([
         { id: "anthropic/claude-old", contextWindowTokens: 100000 },
-        "anthropic/claude-new",
+        "anthropic/claude-old-2",
       ]);
       expect(coderSection.staleDiscoveredModels).toEqual(["anthropic/claude-new"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
       // The authoritative listing (including the new instance) is persisted.
       expect(coderSection.discoveredProviders).toEqual([
         { name: "anthropic", type: "anthropic" },
@@ -4558,7 +4669,7 @@ describe("CoderOauthService", () => {
       // probe-derived metadata is only the name === type default, which
       // routing applies without persistence — no provider metadata or
       // authoritative catalog to write. The healthy probe's fetched models
-      // still become user-visible (flagged stale).
+      // are carried in the stale marker only.
       deps.providersConfig = {
         coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
       };
@@ -4583,7 +4694,7 @@ describe("CoderOauthService", () => {
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       expect(coderSection.discoveredModels).toBeUndefined();
       expect(coderSection.discoveredProviders).toBeUndefined();
-      expect(coderSection.models).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.models).toBeUndefined();
       expect(coderSection.staleDiscoveredModels).toEqual(["anthropic/claude-sonnet-4-5"]);
     });
 
@@ -4633,17 +4744,17 @@ describe("CoderOauthService", () => {
       ]);
     });
 
-    it("retains stale display entries across consecutive inconclusive refreshes", async () => {
+    it("retains stale catalog entries across consecutive inconclusive refreshes", async () => {
       // After an inconclusive refresh the authoritative catalog is gone and
       // only staleDiscoveredModels remains. A second refresh where the same
-      // provider flakes again must keep those entries user-visible (Settings
-      // and the selector) instead of dropping them: the stale marker is the
-      // carry-forward source, while the catalog stays fail-open.
+      // provider flakes again must carry those entries forward instead of
+      // dropping them: the stale marker is the carry-forward source, while
+      // the catalog stays fail-open. The user-managed list plays no part.
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
           coderOauth: validAuth(),
-          models: ["prod-anthropic/claude-sonnet-4-5", "openai/gpt-5"],
+          models: ["openai/my-manual-model"],
           staleDiscoveredModels: ["prod-anthropic/claude-sonnet-4-5", "openai/gpt-5"],
           discoveredProviders: [
             { name: "prod-anthropic", type: "anthropic" },
@@ -4675,10 +4786,10 @@ describe("CoderOauthService", () => {
       expect(result.success).toBe(false);
 
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      // Catalog still unknown (fail-open), but the healthy provider's fresh
-      // list and the flaky provider's stale entries stay user-visible.
+      // Catalog still unknown (fail-open); the healthy provider's fresh list
+      // and the flaky provider's stale entries are carried in the marker.
       expect(coderSection.discoveredModels).toBeUndefined();
-      expect(coderSection.models).toEqual(["prod-anthropic/claude-opus-4-6", "openai/gpt-5"]);
+      expect(coderSection.models).toEqual(["openai/my-manual-model"]);
       expect(coderSection.staleDiscoveredModels).toEqual([
         "prod-anthropic/claude-opus-4-6",
         "openai/gpt-5",
@@ -4686,15 +4797,16 @@ describe("CoderOauthService", () => {
     });
 
     it("clears stale-flagged catalog entries on disconnect", async () => {
-      // Entries retained through an inconclusive refresh are catalog data,
-      // not user-managed: without the stale marker they would classify as
-      // manual and survive logout.
+      // Entries carried through an inconclusive refresh are catalog data of
+      // the disconnected deployment; the user-managed list is untouched even
+      // where it overlaps the stale marker.
       deps.providersConfig = {
         coder: {
           deploymentUrl: DEPLOYMENT_URL,
           coderOauth: validAuth(),
           models: ["anthropic/my-manual-model", "anthropic/retained-model"],
           staleDiscoveredModels: ["anthropic/retained-model"],
+          discoveredModelsUnlisted: true,
         },
       };
 
@@ -4710,8 +4822,12 @@ describe("CoderOauthService", () => {
       expect(result.success).toBe(true);
 
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      expect(coderSection.models).toEqual(["anthropic/my-manual-model"]);
+      expect(coderSection.models).toEqual([
+        "anthropic/my-manual-model",
+        "anthropic/retained-model",
+      ]);
       expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.discoveredModels).toEqual([]);
     });
 
     it("carries a provider's previous models forward through a transient catalog failure", async () => {
@@ -4908,6 +5024,116 @@ describe("CoderOauthService", () => {
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
       expect(coderSection.discoveredModels).toEqual(["llm-proxy/llama-3.3-70b"]);
     });
+
+    /**
+     * Legacy merged list whose startup migration was skipped or failed (no
+     * flag). A refresh stamps the flag, so it must strip the entries the OLD
+     * markers list (including ones the fresh catalog no longer lists) before
+     * replacing the catalog; edited objects, manual IDs and the legacy
+     * tombstone survive.
+     */
+    function seedUnmigratedMergedList(): void {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: [
+            "anthropic/my-manual-model",
+            "anthropic/old-model",
+            { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+            "openai/stale-model",
+          ],
+          discoveredModels: ["anthropic/old-model", "anthropic/tuned-model"],
+          staleDiscoveredModels: ["openai/stale-model"],
+          discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+          removedModels: ["anthropic/legacy-removed"],
+        },
+      };
+    }
+    const SEPARATED_USER_MANAGED_LIST = [
+      "anthropic/my-manual-model",
+      { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+    ];
+
+    it("finishes a skipped discovered-models migration on a conclusive refresh", async () => {
+      seedUnmigratedMergedList();
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(aiProvidersResponse());
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "claude-new" }] }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
+          return Promise.resolve(new Response("aibridge not entitled", { status: 404 }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect((await service.refreshModels()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(SEPARATED_USER_MANAGED_LIST);
+      expect(coderSection.discoveredModels).toEqual(["anthropic/claude-new"]);
+      expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
+
+    it("finishes a skipped discovered-models migration on an inconclusive refresh", async () => {
+      // A newly listed provider's first fetch fails: the catalog flips to
+      // unknown (see the fail-open test above), but the write still stamps
+      // the flag and therefore still has to separate the merged list.
+      seedUnmigratedMergedList();
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(
+            jsonResponse([
+              { name: "anthropic", type: "anthropic", enabled: true },
+              { name: "vertex", type: "google", enabled: true },
+            ])
+          );
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "claude-new" }] }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/vertex/v1/models`) {
+          return Promise.resolve(new Response("gateway overloaded", { status: 500 }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect((await service.refreshModels()).success).toBe(false);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(SEPARATED_USER_MANAGED_LIST);
+      expect(coderSection.discoveredModels).toBeUndefined();
+      expect(coderSection.staleDiscoveredModels).toEqual(["anthropic/claude-new"]);
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
+
+    it("finishes a skipped discovered-models migration before a provider refresh prunes the catalog", async () => {
+      seedUnmigratedMergedList();
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(
+            jsonResponse([{ name: "claude-aws-us-east-2", type: "anthropic", enabled: true }])
+          );
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      expect(await service.refreshProviders()).toEqual(Ok(undefined));
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(SEPARATED_USER_MANAGED_LIST);
+      expect(coderSection.discoveredModels).toEqual([]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
   });
 
   // -------------------------------------------------------------------------
@@ -4915,9 +5141,14 @@ describe("CoderOauthService", () => {
   // -------------------------------------------------------------------------
 
   describe("disconnect", () => {
-    it("revokes best-effort, clears stored auth, and clears models", async () => {
+    it("revokes best-effort, clears stored auth, and clears the catalog", async () => {
       deps.providersConfig = {
-        coder: { deploymentUrl: DEPLOYMENT_URL, coderOauth: validAuth() },
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          discoveredModels: ["anthropic/claude-sonnet-4-5"],
+          discoveredProviders: [{ name: "anthropic", type: "anthropic" }],
+        },
       };
 
       let revokeBody: URLSearchParams | null = null;
@@ -4936,12 +5167,16 @@ describe("CoderOauthService", () => {
       expect(revokeBody).not.toBeNull();
       expect(revokeBody!.get("token")).toBe("rt_test");
 
-      // Tokens and models are cleared in one atomic section write; the
+      // Tokens and catalog are cleared in one atomic section write; the
       // now-empty discoveredModels stays present as the authoritative-empty
-      // catalog marker.
-      expect((deps.providersConfig.coder as Record<string, unknown>).coderOauth).toBeUndefined();
-      expect(deps.setModelsCalls).toEqual([{ provider: "coder", models: [] }]);
-      expect((deps.providersConfig.coder as Record<string, unknown>).discoveredModels).toEqual([]);
+      // catalog marker. The user-managed list is not written at all.
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.coderOauth).toBeUndefined();
+      expect(coderSection.discoveredModels).toEqual([]);
+      expect(coderSection.discoveredProviders).toEqual([]);
+      expect(coderSection.models).toBeUndefined();
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      expect(deps.setModelsCalls).toEqual([]);
     });
 
     it("advances a malformed persisted disconnect generation so the tombstone self-heals", async () => {
@@ -4981,18 +5216,7 @@ describe("CoderOauthService", () => {
       expect(after).toBe(1);
     });
 
-    it("keeps manually added models when disconnecting", async () => {
-      // Discovered catalog entries are meaningless without credentials, but
-      // manually added ones are user-managed data and must survive.
-      deps.providersConfig = {
-        coder: {
-          deploymentUrl: DEPLOYMENT_URL,
-          coderOauth: validAuth(),
-          models: ["anthropic/my-manual-model", "anthropic/discovered-model"],
-          discoveredModels: ["anthropic/discovered-model"],
-        },
-      };
-
+    function mockRevokeOnlyFetch(): void {
       mockFetch((input) => {
         const url = fetchUrl(input);
         if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
@@ -5000,13 +5224,95 @@ describe("CoderOauthService", () => {
         }
         return Promise.resolve(new Response("unexpected", { status: 500 }));
       });
+    }
+
+    it("keeps configured models when disconnecting", async () => {
+      // The catalog is meaningless without credentials, but every configured
+      // entry is user-managed data and must survive — including one whose ID
+      // the catalog also lists (the user explicitly added it under the new
+      // contract, which stamps the flag).
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: ["anthropic/my-manual-model", "anthropic/discovered-model"],
+          discoveredModels: ["anthropic/discovered-model"],
+          discoveredModelsUnlisted: true,
+        },
+      };
+      mockRevokeOnlyFetch();
 
       const result = await service.disconnect();
       expect(result.success).toBe(true);
 
       const coderSection = deps.providersConfig.coder as Record<string, unknown>;
-      expect(coderSection.models).toEqual(["anthropic/my-manual-model"]);
+      expect(coderSection.models).toEqual([
+        "anthropic/my-manual-model",
+        "anthropic/discovered-model",
+      ]);
       expect(coderSection.discoveredModels).toEqual([]);
+      expect(deps.setModelsCalls).toEqual([]);
+    });
+
+    it("keeps a list that never had a catalog marker when disconnecting", async () => {
+      // No marker means old code never merged into this list (it is
+      // user-managed by construction), so a disconnect preserves it verbatim
+      // while stamping the flag like every new-code writer.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: ["anthropic/my-manual-model"],
+        },
+      };
+      mockRevokeOnlyFetch();
+
+      expect((await service.disconnect()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(["anthropic/my-manual-model"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      expect(deps.setModelsCalls).toEqual([]);
+    });
+
+    it("finishes a skipped discovered-models migration before clearing the catalog", async () => {
+      // Legacy merged list whose startup migration was skipped or failed (no
+      // flag): the disconnect stamps the flag, so it must strip the catalog
+      // entries the OLD markers list first — or the merged list would be
+      // frozen and every later startup would skip the migration. Edited
+      // objects, manual IDs and the legacy tombstone survive.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: [
+            "anthropic/my-manual-model",
+            "anthropic/discovered-model",
+            { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+            "openai/stale-model",
+          ],
+          discoveredModels: ["anthropic/discovered-model", "anthropic/tuned-model"],
+          staleDiscoveredModels: ["openai/stale-model"],
+          removedModels: ["anthropic/legacy-removed"],
+        },
+      };
+      mockRevokeOnlyFetch();
+
+      expect((await service.disconnect()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual([
+        "anthropic/my-manual-model",
+        { id: "anthropic/tuned-model", contextWindowTokens: 200_000 },
+      ]);
+      expect(coderSection.discoveredModels).toEqual([]);
+      expect(coderSection.staleDiscoveredModels).toBeUndefined();
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      // A later start finds the flag and does nothing.
+      const afterDisconnect = JSON.stringify(deps.providersConfig);
+      await service.separateDiscoveredModelsOnce();
+      expect(JSON.stringify(deps.providersConfig)).toBe(afterDisconnect);
     });
 
     it("does not clear a newer login that completed while revocation was pending", async () => {
@@ -5045,7 +5351,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         injectingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -5096,7 +5403,8 @@ describe("CoderOauthService", () => {
         },
       };
       service = new CoderOauthService(
-        createMockConfig(deps) as Config,
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
         injectingProviderService as unknown as ProviderService,
         createMockWindowService(deps) as WindowService
       );
@@ -5120,6 +5428,168 @@ describe("CoderOauthService", () => {
       expect(result.success).toBe(true);
 
       expect((deps.providersConfig.coder as Record<string, unknown>).coderOauth).toBeUndefined();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // separateDiscoveredModelsOnce (one-shot startup migration)
+  // -------------------------------------------------------------------------
+
+  describe("separateDiscoveredModelsOnce", () => {
+    it("strips catalog-derived plain entries once, keeping edited objects and manual IDs", async () => {
+      // Old-code shape: discovery merged the catalog into `models`. Only
+      // plain-string entries whose ID the catalog marker lists are catalog
+      // data; an object entry is user-edited even when its ID is listed, and
+      // IDs outside the catalog were added by hand.
+      // Compare against the seeded expiry, not a new timestamp after migration.
+      const auth = validAuth();
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: auth,
+          models: [
+            "anthropic/manual-model",
+            "anthropic/catalog-a",
+            { id: "anthropic/catalog-b", contextWindowTokens: 200_000 },
+            "openai/catalog-c",
+          ],
+          discoveredModels: ["anthropic/catalog-a", "anthropic/catalog-b"],
+          staleDiscoveredModels: ["openai/catalog-c"],
+          removedModels: ["anthropic/legacy-removed"],
+          coderCatalogGeneration: 7,
+        },
+      };
+
+      await service.separateDiscoveredModelsOnce();
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual([
+        "anthropic/manual-model",
+        { id: "anthropic/catalog-b", contextWindowTokens: 200_000 },
+      ]);
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+      // Not a catalog commit: markers, legacy tombstones, and generation
+      // counters are left exactly as found.
+      expect(coderSection.discoveredModels).toEqual(["anthropic/catalog-a", "anthropic/catalog-b"]);
+      expect(coderSection.staleDiscoveredModels).toEqual(["openai/catalog-c"]);
+      expect(coderSection.removedModels).toEqual(["anthropic/legacy-removed"]);
+      expect(coderSection.coderCatalogGeneration).toBe(7);
+      expect(coderSection.coderOauth).toEqual(auth);
+
+      // Second start: the flag short-circuits — no write at all.
+      const afterFirstRun = JSON.stringify(deps.providersConfig);
+      const writesAfterFirstRun = deps.setModelsCalls.length;
+      await service.separateDiscoveredModelsOnce();
+      expect(JSON.stringify(deps.providersConfig)).toBe(afterFirstRun);
+      expect(deps.setModelsCalls).toHaveLength(writesAfterFirstRun);
+    });
+
+    it("deletes the list when every entry was catalog-derived", async () => {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          models: ["anthropic/catalog-a"],
+          discoveredModels: ["anthropic/catalog-a"],
+        },
+      };
+
+      await service.separateDiscoveredModelsOnce();
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toBeUndefined();
+      expect(coderSection.discoveredModelsUnlisted).toBe(true);
+    });
+
+    it("leaves sections without a catalog marker alone", async () => {
+      // Old code only merged when it wrote discoveredModels or
+      // staleDiscoveredModels; without either, `models` is user-managed by
+      // construction (e.g. a hand-written section that never logged in) and
+      // must not be flagged as migrated either — the first new-code write
+      // sets the flag.
+      deps.providersConfig = {
+        coder: { deploymentUrl: DEPLOYMENT_URL, models: ["anthropic/manual-model"] },
+      };
+      const before = JSON.stringify(deps.providersConfig);
+
+      await service.separateDiscoveredModelsOnce();
+
+      expect(JSON.stringify(deps.providersConfig)).toBe(before);
+      expect(deps.setModelsCalls).toEqual([]);
+    });
+
+    it("does not create a coder section when none exists", async () => {
+      deps.providersConfig = { anthropic: { apiKey: "sk-test" } };
+
+      await service.separateDiscoveredModelsOnce();
+
+      expect(deps.providersConfig.coder).toBeUndefined();
+    });
+
+    it("does not strip an explicitly added catalog ID once the flag is set", async () => {
+      // A user who added a catalog model under the new contract has the flag
+      // set (every new-code write sets it). The migration must not reclassify
+      // that explicit entry as merged catalog data, and a later refresh or
+      // disconnect must leave it in place too.
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          coderOauth: validAuth(),
+          models: ["anthropic/claude-sonnet-4-5"],
+          discoveredModels: ["anthropic/claude-sonnet-4-5"],
+          discoveredModelsUnlisted: true,
+        },
+      };
+      mockFetch((input) => {
+        const url = fetchUrl(input);
+        if (url === `${DEPLOYMENT_URL}/api/v2/ai/providers`) {
+          return Promise.resolve(aiProvidersResponse());
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/anthropic/v1/models`) {
+          return Promise.resolve(jsonResponse({ data: [{ id: "claude-sonnet-4-5" }] }));
+        }
+        if (url === `${DEPLOYMENT_URL}/api/v2/aibridge/openai/v1/models`) {
+          return Promise.resolve(new Response("aibridge not entitled", { status: 404 }));
+        }
+        if (url === `${DEPLOYMENT_URL}/oauth2/revoke`) {
+          return Promise.resolve(new Response(null, { status: 200 }));
+        }
+        return Promise.resolve(new Response(`unexpected url: ${url}`, { status: 500 }));
+      });
+
+      await service.separateDiscoveredModelsOnce();
+      expect((await service.refreshModels()).success).toBe(true);
+      expect((await service.disconnect()).success).toBe(true);
+
+      const coderSection = deps.providersConfig.coder as Record<string, unknown>;
+      expect(coderSection.models).toEqual(["anthropic/claude-sonnet-4-5"]);
+      expect(coderSection.discoveredModels).toEqual([]);
+      expect(deps.setModelsCalls).toEqual([]);
+    });
+
+    it("never throws when the write fails", async () => {
+      deps.providersConfig = {
+        coder: {
+          deploymentUrl: DEPLOYMENT_URL,
+          models: ["anthropic/catalog-a"],
+          discoveredModels: ["anthropic/catalog-a"],
+        },
+      };
+      service = new CoderOauthService(
+        createMockProvidersConfigStore(deps) as ProvidersConfigStore,
+        createMockFileLeaseManager(deps) as FileLeaseManager,
+        {
+          ...createMockProviderService(deps),
+          updateProviderSection: () => Promise.reject(new Error("lock timeout")),
+        } as unknown as ProviderService,
+        createMockWindowService(deps) as WindowService
+      );
+
+      // A rejection here would fail the test: the startup step must resolve.
+      await service.separateDiscoveredModelsOnce();
+      // Nothing landed; the next start retries.
+      expect((deps.providersConfig.coder as Record<string, unknown>).models).toEqual([
+        "anthropic/catalog-a",
+      ]);
     });
   });
 });

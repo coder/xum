@@ -17,7 +17,7 @@
  *
  * The tool-execution pipeline is around-style: `run("tool.execute", ctx,
  * terminal)` composes middleware around a terminal that executes the tool.
- * This models the legacy `.mux/tool_hook` protocol (which inherently wraps
+ * This models the legacy `.xum/tool_hook` protocol (which inherently wraps
  * execution) with the same primitive as pre/post hooks. The handoff's
  * `tool.execute.before` / `tool.execute.after` vocabulary is exposed as
  * first-class registration sugar that composes onto the around pipeline.
@@ -27,7 +27,9 @@ import assert from "node:assert";
 import { EventEmitter } from "node:events";
 import type { Tool } from "ai";
 import type { Runtime } from "@/node/runtime/Runtime";
+import type { HostClock } from "@/node/utils/hostClock";
 import { log } from "@/node/services/log";
+import { getErrorMessage } from "@/common/utils/errors";
 
 // ---------------------------------------------------------------------------
 // Observer events (read-only fan-out)
@@ -42,6 +44,8 @@ export interface ObserverEventMap {
    * lifecycle is observer-only for now; a waterfall variant can be added when a
    * mutating consumer lands. */
   "session.start": { workspaceId: string };
+  /** A plugin hook's systemMessage for the user (AgentSession shows it; never the model). */
+  "plugin.hook.notice": { workspaceId: string; pluginName: string; message: string };
   "session.end": { workspaceId: string };
   "stream.start": { workspaceId: string; messageId: string };
   "stream.end": { workspaceId: string; messageId: string };
@@ -52,8 +56,17 @@ export interface ObserverEventMap {
 // ---------------------------------------------------------------------------
 
 /** Host execution context a tool runs in (shell hooks need all of these). */
+/** The model turn a tool call belongs to, as plugin hooks see it (Codex `turn_id`, `model`). */
+export interface HookTurn {
+  /** The turn's assistant message ID. */
+  turnId: string;
+  model: string;
+}
+
 export interface ToolExecutionHost {
   runtime: Runtime;
+  /** Absent for calls outside a model turn. */
+  turn?: HookTurn;
   /** Runtime temp dir for hook scratch files (paths in the runtime's context). */
   runtimeTempDir: string;
   /** Working directory where hooks are discovered. */
@@ -61,14 +74,33 @@ export interface ToolExecutionHost {
   workspaceId: string;
   /** Additional environment variables to pass to hooks. */
   env?: Record<string, string>;
+  /** The session's HostClock (hook durations). Absent: nodeClock. */
+  clock?: HostClock;
 }
+
+/** Outcome of ToolExecuteContext.parseInput: on success, the value the tool runs with. */
+export type ToolInputParseResult = { success: true; value: unknown } | { success: false };
 
 export interface ToolExecuteContext {
   readonly toolName: string;
+  /**
+   * The call's ID (Codex `tool_use_id`): the AI SDK `toolCallId`, or a generated one for a
+   * host-side call that has none, so a PreToolUse and its PostToolUse share it.
+   */
+  readonly toolCallId?: string;
   /** Mutable before the terminal runs: middleware may rewrite tool args. */
   args: unknown;
   readonly host: ToolExecutionHost;
   readonly abortSignal?: AbortSignal;
+  /** The tool's input JSON schema, when the caller holds the Tool (validates hook rewrites). */
+  readonly inputJsonSchema?: () => unknown;
+  /**
+   * The tool's own input parser, when the caller holds a Tool whose schema has one (Zod): a hook
+   * rewrite must pass it too, since the JSON schema omits refinements and defaults.
+   */
+  readonly parseInput?: (value: unknown) => Promise<ToolInputParseResult>;
+  /** Server and original name of an MCP tool (Codex hooks match `mcp__<server>__<tool>`). */
+  readonly mcpOrigin?: { serverName: string; toolName: string };
   /** Set by the terminal after the tool actually executed. */
   executed: boolean;
   /** Set by the terminal; mutable after next() returns (middleware may augment). */
@@ -79,6 +111,14 @@ export interface ToolExecuteContext {
    * must not call next().
    */
   blocked?: { result: unknown };
+  /**
+   * Set by middleware AFTER the tool ran, when a post hook blocks its result (Codex PostToolUse
+   * `decision: "block"`). The model still sees `result` (the hook's feedback replaces the
+   * output), but a nested caller that runs the tool on its own behalf (mux.load, memory index
+   * authorization) must treat the call as blocked and keep the original output from its caller:
+   * runThroughToolHookPipeline reports it as a block.
+   */
+  postBlocked?: true;
 }
 
 export interface RequestAssembleContext {
@@ -90,15 +130,84 @@ export interface RequestAssembleContext {
   tools: Record<string, Tool>;
 }
 
+/** A deliberately separate projection: callbacks cannot obtain the live tool objects. */
+export type RequestContextOnly = Omit<RequestAssembleContext, "tools">;
+
+export interface RequestAssemblySnapshot {
+  readonly workspaceId: string;
+  readonly preservesToolset: boolean;
+  run(ctx: RequestAssembleContext): Promise<void>;
+}
+
+interface RegistrationOptions {
+  order?: number;
+  workspaceId?: string;
+}
+
 export interface CompactionPrepareContext {
   readonly workspaceId: string;
-  readonly reason: "on-send" | "mid-stream";
+  readonly reason: "on-send" | "mid-stream" | "continuous-eager";
+}
+
+/**
+ * Why Xum is sending a message (prompt-hook input). Derived by AgentSession from the send's own
+ * provenance signals (see resolveMessageSendOrigin).
+ */
+export type MessageSendOrigin = "user" | "task" | "goal" | "plan-review" | "system";
+
+/**
+ * `message.send` (the Codex UserPromptSubmit event): middleware sees each new message before Xum
+ * saves it. A compaction request's own prompt never reaches it (only texts queued behind it). It
+ * cannot rewrite the text (Codex hooks cannot either); it may add model-visible context for this
+ * turn, or block the send.
+ */
+export interface MessageSendContext {
+  readonly workspaceId: string;
+  readonly origin: MessageSendOrigin;
+  readonly text: string;
+  /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
+  readonly cwd?: string;
+  /**
+   * The send's cancel signal. A withdrawn send ends its pending hook calls instead of waiting for
+   * the hook timeout (Codex PRRT_kwDOPxxmWM6rkl9A). The hooks run before any history write, so a
+   * send whose signal fired is always cancelled after them, and an ended hook cannot let it
+   * through.
+   */
+  readonly signal?: AbortSignal;
+  /** Appended by middleware, in chain order; saved on the user row (pluginHookContext). */
+  readonly additionalContext: Array<{ pluginId: string; text: string }>;
+  /** Set to refuse the send. useBefore skips the rest of the chain (first block wins). */
+  blocked?: { pluginName: string; reason: string };
+}
+
+/**
+ * `turn.stop` (the Codex Stop event): middleware sees each turn that finished normally, before
+ * Xum picks the next turn. Every consumer runs (none can skip the rest). Interrupted, failed and
+ * compaction turns never reach it, and neither do sub-agent turns (Codex SubagentStop).
+ */
+export interface TurnStopContext {
+  readonly workspaceId: string;
+  readonly messageId: string;
+  /** The workspace path (Codex common field `cwd`), when Xum could resolve it. */
+  readonly cwd?: string;
+  /** The model the turn streamed with (Codex common field `model`). */
+  readonly model?: string;
+  /** The reply's trailing text, or null when the turn ended on a tool call or without text. */
+  readonly lastAssistantMessage: string | null;
+  /** True when Stop already continued this turn (Codex stop_hook_active). */
+  readonly stopHookActive: boolean;
+  /** Continuation prompts (Codex `decision: "block"` reasons), in chain order. */
+  readonly continueReasons: string[];
+  /** Set by a consumer whose output said `continue: false`: it overrides every continuation. */
+  halted?: { pluginName: string };
 }
 
 export interface WaterfallPointMap {
   "tool.execute": ToolExecuteContext;
   "request.assemble": RequestAssembleContext;
   "compaction.prepare": CompactionPrepareContext;
+  "message.send": MessageSendContext;
+  "turn.stop": TurnStopContext;
 }
 
 export type WaterfallNext = () => Promise<void>;
@@ -109,13 +218,53 @@ export type WaterfallMiddleware<C> = (ctx: C, next: WaterfallNext) => void | Pro
 export type HookCallback<C> = (ctx: C) => void | Promise<void>;
 
 interface Registration {
-  // Stored type-erased; `use()` is the only writer and it is fully typed.
+  // Stored type-erased; the registration helpers are fully typed.
   middleware: WaterfallMiddleware<unknown>;
   order: number;
   seq: number;
+  workspaceId?: string;
+  preservesToolset: boolean;
 }
 
-/** Duck-check for contexts that support blocking (currently tool.execute). */
+/**
+ * Per isolated point: snapshot what a consumer may change, and return its undo. The arrays and
+ * their entries are copied: a consumer can also remove earlier entries or change them in place
+ * before it throws, and an undo by length alone would then leave holes for the later readers.
+ * Cost: O(n) per consumer, where n is the number of entries so far. Nothing bounds n except
+ * what consumers push (the context cap applies after the chain, in runMessageSendHooks).
+ */
+const ISOLATED_CONSUMERS = {
+  "message.send": (ctx: MessageSendContext) => {
+    const { blocked } = ctx;
+    const context = ctx.additionalContext.map((entry) => ({ ...entry }));
+    return () => {
+      ctx.blocked = blocked;
+      restoreArray(ctx.additionalContext, context);
+    };
+  },
+  "turn.stop": (ctx: TurnStopContext) => {
+    const { halted } = ctx;
+    const reasons = [...ctx.continueReasons];
+    return () => {
+      ctx.halted = halted;
+      restoreArray(ctx.continueReasons, reasons);
+    };
+  },
+} satisfies Partial<{ [K in keyof WaterfallPointMap]: (ctx: WaterfallPointMap[K]) => () => void }>;
+
+/**
+ * Put `snapshot` back into `target` in place (the context holds the array). Index assignment,
+ * not `splice(0, n, ...snapshot)`: spreading a large array into call arguments can throw a
+ * RangeError in the very catch path that runs this.
+ */
+function restoreArray<T>(target: T[], snapshot: readonly T[]): void {
+  target.length = snapshot.length;
+  snapshot.forEach((item, index) => {
+    target[index] = item;
+  });
+}
+
+/** Duck-check for contexts that support blocking (tool.execute, message.send). */
 function isBlocked(ctx: unknown): boolean {
   return (
     typeof ctx === "object" &&
@@ -175,14 +324,27 @@ export class EventSpine {
   use<K extends keyof WaterfallPointMap>(
     point: K,
     middleware: WaterfallMiddleware<WaterfallPointMap[K]>,
-    opts?: { order?: number }
+    opts?: RegistrationOptions
   ): () => void {
+    return this.register(point, middleware, opts, false);
+  }
+
+  private register<K extends keyof WaterfallPointMap>(
+    point: K,
+    middleware: WaterfallMiddleware<WaterfallPointMap[K]>,
+    opts: RegistrationOptions | undefined,
+    preservesToolset: boolean
+  ): () => void {
+    if (opts?.workspaceId != null)
+      assert(opts.workspaceId.length > 0, "Workspace scope must not be empty");
     const registrations = this.waterfalls.get(point) ?? [];
-    const registration: Registration = {
+    const registration: Registration = Object.freeze({
       middleware: middleware as WaterfallMiddleware<unknown>,
       order: opts?.order ?? 0,
       seq: this.registrationSeq++,
-    };
+      workspaceId: opts?.workspaceId,
+      preservesToolset,
+    });
     registrations.push(registration);
     // Stable order: explicit order first, then registration sequence.
     registrations.sort((a, b) => a.order - b.order || a.seq - b.seq);
@@ -204,12 +366,32 @@ export class EventSpine {
   useBefore<K extends keyof WaterfallPointMap>(
     point: K,
     callback: HookCallback<WaterfallPointMap[K]>,
-    opts?: { order?: number }
+    opts?: RegistrationOptions
   ): () => void {
     return this.use(
       point,
       async (ctx, next) => {
-        await callback(ctx);
+        const isolate = ISOLATED_CONSUMERS[point as keyof typeof ISOLATED_CONSUMERS] as
+          | ((ctx: WaterfallPointMap[K]) => () => void)
+          | undefined;
+        if (isolate !== undefined) {
+          // Prompt-hook consumers are independent plugin guards: one that throws is logged and
+          // skipped, so it cannot end the chain before a later plugin's decision. Isolated here
+          // because only the spine dispatches per consumer; the runners see one chain. Whatever
+          // the failed consumer changed before it threw is undone: a failed hook fails open as
+          // a whole (Codex PRRT_kwDOPxxmWM6rQd9y, PRRT_kwDOPxxmWM6rQeuF, PRRT_kwDOPxxmWM6rQfGc).
+          const restore = isolate(ctx);
+          try {
+            await callback(ctx);
+          } catch (error) {
+            restore();
+            log.warn(`Prompt hooks: a ${point} consumer failed; running the next one`, {
+              error: getErrorMessage(error),
+            });
+          }
+        } else {
+          await callback(ctx);
+        }
         if (!isBlocked(ctx)) {
           await next();
         }
@@ -221,7 +403,7 @@ export class EventSpine {
   useAfter<K extends keyof WaterfallPointMap>(
     point: K,
     callback: HookCallback<WaterfallPointMap[K]>,
-    opts?: { order?: number }
+    opts?: RegistrationOptions
   ): () => void {
     return this.use(
       point,
@@ -235,10 +417,62 @@ export class EventSpine {
     );
   }
 
+  /** Toolset preservation is by construction, not a claim made by arbitrary middleware. */
+  useRequestContext(
+    callback: HookCallback<RequestContextOnly>,
+    opts?: RegistrationOptions
+  ): () => void {
+    return this.register(
+      "request.assemble",
+      async (ctx, next) => {
+        const projection: RequestContextOnly = {
+          workspaceId: ctx.workspaceId,
+          modelString: ctx.modelString,
+          systemMessage: ctx.systemMessage,
+        };
+        await callback(projection);
+        assert(typeof projection.systemMessage === "string", "Request context must remain text");
+        ctx.systemMessage = projection.systemMessage;
+        await next();
+      },
+      opts,
+      true
+    );
+  }
+
+  captureRequestAssembly(workspaceId: string): RequestAssemblySnapshot {
+    assert(workspaceId.length > 0, "Request assembly snapshot requires a workspace");
+    const registrations = Object.freeze(
+      this.applicableRegistrations("request.assemble", workspaceId)
+    );
+    return Object.freeze({
+      workspaceId,
+      preservesToolset: registrations.every((registration) => registration.preservesToolset),
+      run: async (ctx: RequestAssembleContext) => {
+        assert(ctx.workspaceId === workspaceId, "Request assembly snapshot workspace mismatch");
+        await this.runRegistrations("request.assemble", registrations, ctx);
+      },
+    });
+  }
+
+  private applicableRegistrations(
+    point: keyof WaterfallPointMap,
+    workspaceId: string
+  ): Registration[] {
+    return (this.waterfalls.get(point) ?? []).filter(
+      (registration) => registration.workspaceId == null || registration.workspaceId === workspaceId
+    );
+  }
+
   /** True when at least one middleware is registered on the point. Lets hot
    * paths skip context construction entirely when the pipeline is empty. */
   hasMiddleware(point: keyof WaterfallPointMap): boolean {
     return (this.waterfalls.get(point)?.length ?? 0) > 0;
+  }
+
+  /** hasMiddleware for one workspace: global middleware and middleware scoped to it. */
+  hasMiddlewareFor(point: keyof WaterfallPointMap, workspaceId: string): boolean {
+    return this.applicableRegistrations(point, workspaceId).length > 0;
   }
 
   /**
@@ -251,16 +485,29 @@ export class EventSpine {
     ctx: WaterfallPointMap[K],
     terminal?: (ctx: WaterfallPointMap[K]) => void | Promise<void>
   ): Promise<void> {
-    const registrations = this.waterfalls.get(point) ?? [];
+    await this.runRegistrations(point, this.waterfalls.get(point) ?? [], ctx, terminal);
+  }
+
+  private async runRegistrations<K extends keyof WaterfallPointMap>(
+    point: K,
+    registrations: readonly Registration[],
+    ctx: WaterfallPointMap[K],
+    terminal?: (ctx: WaterfallPointMap[K]) => void | Promise<void>
+  ): Promise<void> {
+    const workspaceId = "host" in ctx ? ctx.host.workspaceId : ctx.workspaceId;
     const dispatch = async (index: number): Promise<void> => {
       if (index < registrations.length) {
+        const registration = registrations[index];
+        if (registration.workspaceId != null && registration.workspaceId !== workspaceId) {
+          return dispatch(index + 1);
+        }
         let nextCalled = false;
         const next: WaterfallNext = () => {
           assert(!nextCalled, `EventSpine '${point}' middleware called next() more than once`);
           nextCalled = true;
           return dispatch(index + 1);
         };
-        await registrations[index].middleware(ctx, next);
+        await registration.middleware(ctx, next);
         return;
       }
       if (terminal && !isBlocked(ctx)) {

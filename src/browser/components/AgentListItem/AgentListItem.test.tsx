@@ -4,19 +4,33 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { cleanup, render, within } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
+import { APIContext } from "@/browser/contexts/API";
+import { ThemeProvider } from "@/browser/contexts/ThemeContext";
+import * as RealProjectContextModule from "@/browser/contexts/ProjectContext";
 import type * as ReactDndModuleType from "react-dnd";
 import type * as ReactDndHtml5BackendModuleType from "react-dnd-html5-backend";
-import type * as APIModuleType from "@/browser/contexts/API";
-import type * as ProjectContextModuleType from "@/browser/contexts/ProjectContext";
-import type * as WorkspaceTitleEditContextModuleType from "@/browser/contexts/WorkspaceTitleEditContext";
-import type * as ContextMenuPositionModuleType from "@/browser/hooks/useContextMenuPosition";
-import type * as ExperimentsModuleType from "@/browser/hooks/useExperiments";
-import type * as WorkspaceFallbackModelModuleType from "@/browser/hooks/useWorkspaceFallbackModel";
 import type * as WorkspaceUnreadModule from "@/browser/hooks/useWorkspaceUnread";
-import type * as RuntimeStatusStoreModuleType from "@/browser/stores/RuntimeStatusStore";
 import type * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import * as TooltipModule from "../Tooltip/Tooltip";
 import * as WorkspaceStatusIndicatorModule from "../WorkspaceStatusIndicator/WorkspaceStatusIndicator";
+import * as RealWorkspaceHeartbeatModalModule from "@/browser/components/WorkspaceHeartbeatModal";
+import * as RealReactDndModule from "react-dnd";
+import * as RealReactDndHtml5BackendModule from "react-dnd-html5-backend";
+import * as RealWorkspaceTitleEditContextModule from "@/browser/contexts/WorkspaceTitleEditContext";
+import * as RealContextMenuPositionModule from "@/browser/hooks/useContextMenuPosition";
+import * as RealWorkspaceUnreadModule from "@/browser/hooks/useWorkspaceUnread";
+import * as RealRuntimeStatusStoreModule from "@/browser/stores/RuntimeStatusStore";
+import * as RealWorkspaceFallbackModelModule from "@/browser/hooks/useWorkspaceFallbackModel";
+import * as RealWorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+
+// The heartbeat modal stub below replaces the modal's index module for the whole process.
+// When an earlier suite has already linked that index (WorkspaceMenuBar renders the real
+// modal), bun patches the live re-export binding, which also empties the modal's own module
+// and blanks WorkspaceHeartbeatModal.test.tsx. Restore the real exports once this suite ends.
+restoreModulesAfterSuite([
+  ["@/browser/components/WorkspaceHeartbeatModal", { ...RealWorkspaceHeartbeatModalModule }],
+]);
 import type {
   AgentRowRenderMeta,
   WorkspaceDelegatedActivity,
@@ -26,6 +40,34 @@ import type { StreamAbortReasonSnapshot } from "@/common/types/stream";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { WorkspaceSelection } from "./AgentListItem";
 import type { AgentListItem as AgentListItemComponent } from "./AgentListItem";
+
+// Snapshot the real exports at file scope, before any test mocks the modules. Do not load second
+// copies with require("...?real=1"): Bun's LCOV keeps only the last-loaded copy of a file, so a
+// later second copy replaces the coverage that the module's own tests recorded in the shard.
+const realProjectContext = { ...RealProjectContextModule };
+const realWorkspaceTitleEditContext = { ...RealWorkspaceTitleEditContextModule };
+const realContextMenuPosition = { ...RealContextMenuPositionModule };
+const realWorkspaceUnread = { ...RealWorkspaceUnreadModule };
+const realRuntimeStatusStore = { ...RealRuntimeStatusStoreModule };
+const realWorkspaceFallbackModel = { ...RealWorkspaceFallbackModelModule };
+const realWorkspaceStore = { ...RealWorkspaceStoreModule };
+
+// Restore the provider contexts after the suite; partial row stubs must not
+// replace the real contexts used by later full Settings renders.
+restoreModulesAfterSuite([
+  ["@/browser/contexts/ProjectContext", realProjectContext],
+  // installAgentListItemTestDoubles() re-registers these from beforeEach with overridden
+  // exports, and `mock.restore()` does not undo mock.module, so the overrides otherwise leak
+  // into every later test file (#4639).
+  ["react-dnd", { ...RealReactDndModule }],
+  ["react-dnd-html5-backend", { ...RealReactDndHtml5BackendModule }],
+  ["@/browser/contexts/WorkspaceTitleEditContext", realWorkspaceTitleEditContext],
+  ["@/browser/hooks/useContextMenuPosition", realContextMenuPosition],
+  ["@/browser/hooks/useWorkspaceUnread", realWorkspaceUnread],
+  ["@/browser/stores/RuntimeStatusStore", realRuntimeStatusStore],
+  ["@/browser/hooks/useWorkspaceFallbackModel", realWorkspaceFallbackModel],
+  ["@/browser/stores/WorkspaceStore", realWorkspaceStore],
+]);
 
 let AgentListItem!: typeof AgentListItemComponent;
 
@@ -47,7 +89,7 @@ const SUBAGENT_ROW_META: AgentRowRenderMeta = {
 type MockWorkspaceUnreadState = ReturnType<typeof WorkspaceUnreadModule.useWorkspaceUnread>;
 type MockWorkspaceSidebarState = ReturnType<typeof WorkspaceStoreModule.useWorkspaceSidebarState>;
 
-let mockWorkspaceHeartbeatsEnabled = false;
+let latestUseDragSpec: (() => { item?: () => Record<string, unknown> }) | null = null;
 let mockWorkspaceUnreadState: MockWorkspaceUnreadState;
 let mockWorkspaceSidebarState: MockWorkspaceSidebarState;
 
@@ -141,6 +183,14 @@ function installAgentListItemTestDoubles() {
   spyOn(TooltipModule, "TooltipContent").mockImplementation(((props: { children: ReactNode }) => (
     <>{props.children}</>
   )) as unknown as typeof TooltipModule.TooltipContent);
+  spyOn(TooltipModule, "TooltipIfPresent").mockImplementation(((props: {
+    children: ReactNode;
+    tooltip?: string;
+  }) => (
+    <span data-testid="badge-tooltip" data-tooltip-content={props.tooltip}>
+      {props.children}
+    </span>
+  )) as unknown as typeof TooltipModule.TooltipIfPresent);
   spyOn(WorkspaceStatusIndicatorModule, "WorkspaceStatusIndicator").mockImplementation(((props: {
     workspaceId: string;
   }) => (
@@ -151,45 +201,27 @@ function installAgentListItemTestDoubles() {
   const actualReactDnd = require("react-dnd?real=1") as typeof ReactDndModuleType;
   const actualReactDndHtml5Backend =
     require("react-dnd-html5-backend?real=1") as typeof ReactDndHtml5BackendModuleType;
-  const actualApi = require("@/browser/contexts/API?real=1") as typeof APIModuleType;
-  const actualProjectContext =
-    require("@/browser/contexts/ProjectContext?real=1") as typeof ProjectContextModuleType;
-  const actualWorkspaceTitleEditContext =
-    require("@/browser/contexts/WorkspaceTitleEditContext?real=1") as typeof WorkspaceTitleEditContextModuleType;
-  const actualContextMenuPosition =
-    require("@/browser/hooks/useContextMenuPosition?real=1") as typeof ContextMenuPositionModuleType;
-  const actualExperiments =
-    require("@/browser/hooks/useExperiments?real=1") as typeof ExperimentsModuleType;
-  const actualWorkspaceUnread =
-    require("@/browser/hooks/useWorkspaceUnread?real=1") as typeof WorkspaceUnreadModule;
-  const actualRuntimeStatusStore =
-    require("@/browser/stores/RuntimeStatusStore?real=1") as typeof RuntimeStatusStoreModuleType;
-  const actualWorkspaceFallbackModel =
-    require("@/browser/hooks/useWorkspaceFallbackModel?real=1") as typeof WorkspaceFallbackModelModuleType;
-  const actualWorkspaceStore =
-    require("@/browser/stores/WorkspaceStore?real=1") as typeof WorkspaceStoreModule;
   /* eslint-enable @typescript-eslint/no-require-imports */
+  const actualProjectContext = realProjectContext;
+  const actualWorkspaceTitleEditContext = realWorkspaceTitleEditContext;
+  const actualContextMenuPosition = realContextMenuPosition;
+  const actualWorkspaceUnread = realWorkspaceUnread;
+  const actualRuntimeStatusStore = realRuntimeStatusStore;
+  const actualWorkspaceFallbackModel = realWorkspaceFallbackModel;
+  const actualWorkspaceStore = realWorkspaceStore;
 
   void mock.module("react-dnd", () => ({
     ...actualReactDnd,
-    useDrag: () => [{ isDragging: false }, passthroughRef, () => undefined] as const,
+    useDrag: (spec: () => { item?: () => Record<string, unknown> }) => {
+      latestUseDragSpec = spec;
+      return [{ isDragging: false }, passthroughRef, () => undefined] as const;
+    },
     useDrop: () => [{ isPinnedReorderTarget: false }, passthroughRef] as const,
   }));
 
   void mock.module("react-dnd-html5-backend", () => ({
     ...actualReactDndHtml5Backend,
     getEmptyImage: () => new Image(),
-  }));
-
-  void mock.module("@/browser/contexts/API", () => ({
-    ...actualApi,
-    useAPI: () => ({
-      api: null,
-      status: "error" as const,
-      error: "API unavailable",
-      authenticate: () => undefined,
-      retry: () => undefined,
-    }),
   }));
 
   void mock.module("@/browser/contexts/ProjectContext", () => ({
@@ -212,7 +244,7 @@ function installAgentListItemTestDoubles() {
     }),
   }));
 
-  void mock.module("../WorkspaceHeartbeatModal", () => ({
+  void mock.module("@/browser/components/WorkspaceHeartbeatModal", () => ({
     WorkspaceHeartbeatModal: () => null,
   }));
 
@@ -231,11 +263,6 @@ function installAgentListItemTestDoubles() {
       suppressClickIfLongPress: () => false,
       close: () => undefined,
     }),
-  }));
-
-  void mock.module("@/browser/hooks/useExperiments", () => ({
-    ...actualExperiments,
-    useExperimentValue: () => mockWorkspaceHeartbeatsEnabled,
   }));
 
   void mock.module("@/browser/hooks/useWorkspaceUnread", () => ({
@@ -259,6 +286,27 @@ function installAgentListItemTestDoubles() {
   }));
 }
 
+// Rows render without a backend: inject an unavailable API through the real context
+// instead of mocking the API module (process-wide module mocks leak into later suites).
+// Rows always render under the app's ThemeProvider, so the tests provide one too.
+function RowProvidersWrapper(props: { children: ReactNode }) {
+  return (
+    <ThemeProvider forcedTheme="dark">
+      <APIContext.Provider
+        value={{
+          api: null,
+          status: "error",
+          error: "API unavailable",
+          authenticate: () => undefined,
+          retry: () => undefined,
+        }}
+      >
+        {props.children}
+      </APIContext.Provider>
+    </ThemeProvider>
+  );
+}
+
 function renderWorkspaceItem(
   options: {
     metadata?: FrontendWorkspaceMetadata;
@@ -275,6 +323,8 @@ function renderWorkspaceItem(
     completedChildrenExpanded?: boolean;
     onToggleCompletedChildren?: (workspaceId: string) => void;
     onSelectWorkspace?: (selection: WorkspaceSelection) => void;
+    projectBadgeName?: string;
+    projectBadgeIcon?: string;
   } = {}
 ) {
   const metadata = options.metadata ?? createMetadata();
@@ -283,6 +333,8 @@ function renderWorkspaceItem(
       metadata={metadata}
       projectPath={metadata.projectPath}
       projectName={metadata.projectName}
+      projectBadgeName={options.projectBadgeName}
+      projectBadgeIcon={options.projectBadgeIcon}
       isSelected={options.isSelected ?? false}
       isArchiving={options.isArchiving}
       depth={options.depth ?? options.rowRenderMeta?.depth}
@@ -299,7 +351,8 @@ function renderWorkspaceItem(
       onForkWorkspace={() => Promise.resolve()}
       onArchiveWorkspace={() => Promise.resolve()}
       onCancelCreation={() => Promise.resolve()}
-    />
+    />,
+    { wrapper: RowProvidersWrapper }
   );
 
   return {
@@ -320,7 +373,6 @@ describe("AgentListItem", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
-    mockWorkspaceHeartbeatsEnabled = false;
     mockWorkspaceUnreadState = createWorkspaceUnreadState();
     mockWorkspaceSidebarState = createWorkspaceSidebarState();
     installAgentListItemTestDoubles();
@@ -336,6 +388,144 @@ describe("AgentListItem", () => {
     cleanupDom?.();
     cleanupDom = null;
     mock.restore();
+  });
+
+  test("an avatar row shows the project's monogram and the full name in the shared tooltip", () => {
+    // The 22px avatar shows one letter, so the shared tooltip must carry the whole
+    // hierarchical "Parent / Sub" name.
+    const badgeName = "parent Project With A Long Name / Frontend";
+    const { view } = renderWorkspaceItem({ projectBadgeName: badgeName });
+
+    const avatar = view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`);
+    expect(avatar.textContent).toBe("P");
+    const tooltip = avatar.closest('[data-testid="badge-tooltip"]');
+    expect(tooltip?.getAttribute("data-tooltip-content")).toBe(badgeName);
+    // tests/ui drive the row menu through this label in both layouts.
+    expect(
+      view.getByRole("button", { name: `Workspace actions for ${TEST_WORKSPACE_TITLE}` })
+    ).toBeTruthy();
+  });
+
+  test.each([
+    {
+      rowKind: "chat",
+      renderRow: () =>
+        renderWorkspaceItem({ projectBadgeName: "Project", projectBadgeIcon: "rocket" }).view,
+      avatarTestId: `workspace-project-avatar-${TEST_WORKSPACE_ID}`,
+    },
+    {
+      rowKind: "draft",
+      renderRow: () =>
+        render(
+          <AgentListItem
+            variant="draft"
+            projectPath="/projects/demo"
+            isSelected={false}
+            projectBadgeName="Project"
+            projectBadgeIcon="rocket"
+            draft={{
+              draftId: "icon-draft",
+              draftNumber: 1,
+              title: "Draft",
+              promptPreview: "",
+              onOpen: () => undefined,
+              onDelete: () => undefined,
+            }}
+          />,
+          { wrapper: RowProvidersWrapper }
+        ),
+      avatarTestId: "workspace-project-avatar-draft-icon-draft",
+    },
+  ])("a $rowKind avatar row shows the project's chosen icon instead of the monogram", (row) => {
+    const view = row.renderRow();
+
+    const avatar = view.getByTestId(row.avatarTestId);
+    expect(avatar.querySelector("svg")).not.toBeNull();
+    expect(avatar.textContent).toBe("");
+  });
+
+  test("an avatar row with an unknown icon name falls back to the monogram", () => {
+    // config.json is hand-editable and a newer version may add icons this one lacks.
+    const { view } = renderWorkspaceItem({
+      projectBadgeName: "Project",
+      projectBadgeIcon: "not-an-icon",
+    });
+
+    const avatar = view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`);
+    expect(avatar.querySelector("svg")).toBeNull();
+    expect(avatar.textContent).toBe("P");
+  });
+
+  test("pinned rows show the inline pin icon only outside the avatar layout", () => {
+    // Flat (avatar) rows show pinning by their Pinned section; grouped rows keep the icon.
+    const metadata = createMetadata({ pinnedAt: "2026-01-01T00:00:00.000Z" });
+    const grouped = renderWorkspaceItem({ metadata });
+    expect(grouped.view.queryByRole("img", { name: "Pinned" })).not.toBeNull();
+    cleanup();
+
+    const flat = renderWorkspaceItem({ metadata, projectBadgeName: "Project" });
+    expect(flat.view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`)).toBeTruthy();
+    expect(flat.view.queryByRole("img", { name: "Pinned" })).toBeNull();
+  });
+
+  test.each([
+    { state: "unread idle", unread: true, sidebar: {}, dot: ".bg-surface-invert-secondary" },
+    {
+      state: "streaming",
+      unread: false,
+      sidebar: { canInterrupt: true },
+      dot: ".workspace-status-dot-active",
+    },
+    {
+      state: "question",
+      unread: false,
+      sidebar: { awaitingUserQuestion: true },
+      dot: ".bg-border-pending",
+    },
+    {
+      state: "error",
+      unread: false,
+      sidebar: { lastAbortReason: { reason: "system" as const, at: 0 } },
+      dot: ".bg-content-destructive",
+    },
+    {
+      state: "waiting",
+      unread: false,
+      sidebar: { activeBashMonitorCount: 1 },
+      dot: ".bg-backgrounded",
+    },
+  ])("pinned avatar rows hide only the idle dot: $state", (testCase) => {
+    const renderAvatarRow = (pinnedAt?: string) => {
+      mockWorkspaceUnreadState = createWorkspaceUnreadState({ isUnread: testCase.unread });
+      mockWorkspaceSidebarState = createWorkspaceSidebarState(testCase.sidebar);
+      const { view } = renderWorkspaceItem({
+        metadata: createMetadata({ pinnedAt }),
+        projectBadgeName: "Project",
+      });
+      expect(view.getByTestId(`workspace-project-avatar-${TEST_WORKSPACE_ID}`)).toBeTruthy();
+      return view.container.querySelector(testCase.dot);
+    };
+
+    expect(renderAvatarRow()).not.toBeNull();
+    cleanup();
+    const pinnedDot = renderAvatarRow("2026-01-01T00:00:00.000Z");
+    if (testCase.state === "unread idle") {
+      expect(pinnedDot).toBeNull();
+    } else {
+      expect(pinnedDot).not.toBeNull();
+    }
+  });
+
+  test("falls back to the row's sub-project scope for drag section identity", () => {
+    // Flat rows omit the sectionId prop (it also drives section indentation),
+    // so the drag item must carry metadata.subProjectPath instead; drop zones
+    // rely on it to treat same-section drops as no-ops.
+    renderWorkspaceItem({
+      metadata: createMetadata({ subProjectPath: "/tmp/project/features" }),
+    });
+    const item = latestUseDragSpec?.().item?.();
+    expect(item?.workspaceId).toBe(TEST_WORKSPACE_ID);
+    expect(item?.currentSectionId).toBe("/tmp/project/features");
   });
 
   test("suppresses best-of member titles that repeat the group header (D8)", () => {
@@ -530,7 +720,7 @@ describe("AgentListItem", () => {
     const rowView = within(row);
 
     expect(row.querySelector(".bg-border-pending.border-surface-sky")).toBeTruthy();
-    expect(rowView.getByText("Shux has a few questions")).toBeTruthy();
+    expect(rowView.getByText("Xum has a few questions")).toBeTruthy();
     expect(rowView.queryByText("Workflow running · 1 sub-agent active")).toBeNull();
   });
 
@@ -871,7 +1061,6 @@ describe("AgentListItem", () => {
   });
 
   test("does not render a goal target pill in the workspace row", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
     mockWorkspaceSidebarState = createWorkspaceSidebarState({
       goal: {
         goalId: "11111111-1111-4111-8111-111111111111",
@@ -890,9 +1079,7 @@ describe("AgentListItem", () => {
     expect(within(row).queryByTestId(`workspace-goal-pill-${TEST_WORKSPACE_ID}`)).toBeNull();
   });
 
-  test("renders a heartbeat icon directly in the leading slot for seen rows when the heartbeat experiment is enabled", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
-
+  test("renders a heartbeat icon directly in the leading slot for seen rows", () => {
     const { row } = renderWorkspaceItem({
       metadata: createHeartbeatMetadata(),
     });
@@ -957,8 +1144,6 @@ describe("AgentListItem", () => {
   });
 
   test("does not render a heartbeat icon fallback when completed children indicator is shown", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
-
     const { row, metadata } = renderWorkspaceItem({
       metadata: createHeartbeatMetadata(),
       rowRenderMeta: {
@@ -987,19 +1172,15 @@ describe("AgentListItem", () => {
   });
 
   test.each([
-    ["the heartbeat experiment is disabled", false, createHeartbeatMetadata()],
-    ["heartbeat is disabled", true, createHeartbeatMetadata({ enabled: false })],
-    ["heartbeat settings are missing", true, createMetadata()],
-  ])("does not render a heartbeat icon fallback when %s", (_name, experimentEnabled, metadata) => {
-    mockWorkspaceHeartbeatsEnabled = experimentEnabled;
-
+    ["heartbeat is disabled", createHeartbeatMetadata({ enabled: false })],
+    ["heartbeat settings are missing", createMetadata()],
+  ])("does not render a heartbeat icon fallback when %s", (_name, metadata) => {
     const { row } = renderWorkspaceItem({ metadata });
 
     expect(within(row).queryByTestId("heartbeat-icon")).toBeNull();
   });
 
   test("keeps the unread idle status dot when heartbeat is enabled", () => {
-    mockWorkspaceHeartbeatsEnabled = true;
     mockWorkspaceUnreadState = createWorkspaceUnreadState({ isUnread: true });
 
     const { row } = renderWorkspaceItem({
@@ -1024,7 +1205,7 @@ describe("AgentListItem", () => {
         onCancelCreation={() => Promise.resolve()}
       />
     );
-    const view = render(renderItem());
+    const view = render(renderItem(), { wrapper: RowProvidersWrapper });
     const getRow = () =>
       view.container.querySelector<HTMLElement>(
         `[data-workspace-id="${metadata.id}"][role="button"]`
@@ -1069,7 +1250,7 @@ describe("AgentListItem", () => {
       name: "question rows",
       sidebarState: createWorkspaceSidebarState({ awaitingUserQuestion: true }),
       expectedSelector: ".bg-border-pending.border-surface-sky",
-      expectedText: "Shux has a few questions",
+      expectedText: "Xum has a few questions",
     },
     {
       name: "error rows",
@@ -1080,7 +1261,6 @@ describe("AgentListItem", () => {
   ])(
     "leaves $name unchanged when heartbeat is enabled",
     ({ sidebarState, expectedSelector, expectedText }) => {
-      mockWorkspaceHeartbeatsEnabled = true;
       mockWorkspaceSidebarState = sidebarState;
 
       const { row } = renderWorkspaceItem({

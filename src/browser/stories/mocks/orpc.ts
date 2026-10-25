@@ -5,40 +5,68 @@
  */
 import { DEFAULT_GOAL_DEFAULTS, normalizeGoalDefaults, type GoalDefaults } from "@/constants/goals";
 import type { GoalBoardSnapshot } from "@/common/types/goal";
+import type { MCPSettingValue, MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
+import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
+import type { AgentResourceLimitsState } from "@/common/orpc/schemas/agentResourceLimits";
+import type { AgentResourceLimits } from "@/common/config/schemas/agentResourceLimits";
+import type { ExperimentId } from "@/common/constants/experiments";
 import type {
   MemoryConsolidationRecordPayload,
   MemoryConsolidationStatusPayload,
   MemoryFileInfo,
 } from "@/common/orpc/schemas/memory";
+import type {
+  ArtifactListing,
+  ArtifactReadResult,
+  ArtifactShelfListing,
+  ArtifactVersion,
+  PinnedArtifactFile,
+} from "@/common/orpc/schemas/artifacts";
+import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
+import type { McpAppToolCallResult, McpAppView } from "@/common/orpc/schemas/mcpApps";
 import type { APIClient } from "@/browser/contexts/API";
+import { createMockReviewStateApi } from "./reviewState";
+import { createMockDraftsApi } from "./drafts";
 import type {
   AgentDefinitionDescriptor,
   AgentDefinitionPackage,
 } from "@/common/types/agentDefinition";
-import type { AgentSkillDescriptor, AgentSkillIssue } from "@/common/types/agentSkill";
+import type {
+  AgentSkillDescriptor,
+  AgentSkillIssue,
+  AgentSkillUnavailableSource,
+} from "@/common/types/agentSkill";
 import type {
   FrontendWorkspaceMetadata,
   WorkspaceActivitySnapshot,
 } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/node/config";
-import {
-  DEFAULT_LAYOUT_PRESETS_CONFIG,
-  normalizeLayoutPresetsConfig,
-  type LayoutPresetsConfig,
-} from "@/common/types/uiLayouts";
 import type {
+  ModelCatalogSearchInput,
   WorkspaceChatMessage,
   ProvidersConfigMap,
   WorkspaceStatsSnapshot,
   ServerAuthSession,
+  UpdateStatus,
 } from "@/common/orpc/types";
+import type { UpdateChannel } from "@/common/types/project";
 import type { ProjectGitStatusResult as ApiProjectGitStatusResult } from "@/common/orpc/schemas/api";
 import type { MuxMessage } from "@/common/types/message";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import type { DebugLlmRequestSnapshot } from "@/common/types/debugLlmRequest";
 import type { NameGenerationError } from "@/common/types/errors";
 import type { Secret } from "@/common/types/secrets";
-import type { MCPHttpServerInfo, MCPServerInfo } from "@/common/types/mcp";
+import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/common/types/mcp";
+import type {
+  AgentPluginInstallMethod,
+  AgentPluginInstallPreview,
+  AgentPluginMarketplaceListing,
+  AgentPluginListItem,
+  AgentPluginUpdateCheck,
+  AgentPluginUpdateReview,
+  AgentPluginHooks,
+  AgentPluginPendingSignOuts,
+} from "@/common/orpc/schemas/agentPlugins";
 import type { MCPOAuthAuthStatus } from "@/common/types/mcpOauth";
 import type { ChatStats } from "@/common/types/chatStats";
 import {
@@ -49,9 +77,7 @@ import {
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 import {
   DEFAULT_TASK_SETTINGS,
-  normalizeSubagentAiDefaults,
   normalizeTaskSettings,
-  type SubagentAiDefaults,
   type TaskSettings,
 } from "@/common/types/tasks";
 import { normalizeAgentAiDefaults, type AgentAiDefaults } from "@/common/types/agentAiDefaults";
@@ -71,9 +97,14 @@ import {
   normalizeUserPreferences,
   type UserPreferences,
 } from "@/common/config/schemas/userPreferences";
-import type { z } from "zod";
-import type { ProjectRemoveErrorSchema } from "@/common/orpc/schemas/errors";
+import { applyMergePatch } from "@/common/utils/applyMergePatch";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { searchModelCatalog } from "@/common/utils/tokens/modelCatalogSearch";
+import {
+  normalizeAutoModelRoutingConfig,
+  type AutoModelRoutingConfig,
+} from "@/common/types/autoModelRouting";
+import { getProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 
 /** Session usage data structure matching SessionUsageFileSchema */
 export interface MockSessionUsage {
@@ -124,11 +155,31 @@ type MockBackupData<Route extends Exclude<MockBackupRoute, "getSettings">> = Ext
 >["data"];
 type MockBackupSettings = NonNullable<MockBackupRouteOutput<"getSettings">>;
 
-type ProjectRemoveError = z.infer<typeof ProjectRemoveErrorSchema>;
-
 export interface MockORPCClientOptions {
-  /** Layout presets config for Settings → Layouts stories */
-  layoutPresets?: LayoutPresetsConfig;
+  /** Agent Plugin installer mock data (Settings → Plugins). */
+  agentPlugins?: {
+    items?: AgentPluginListItem[];
+    updateChecks?: AgentPluginUpdateCheck[];
+    /** Returned by agentPlugins.preview; omit to make preview fail. */
+    preview?: AgentPluginInstallPreview;
+    /** Returned by agentPlugins.preview for an "Install as" method; others get `preview`. */
+    previewsByMethod?: Partial<Record<AgentPluginInstallMethod["kind"], AgentPluginInstallPreview>>;
+    /** Returned by agentPlugins.preview without a method: a Claude Code marketplace listing. */
+    marketplace?: AgentPluginMarketplaceListing;
+    /** Returned by agentPlugins.preview for a marketplace entry, by entry name. */
+    previewsByEntry?: Record<string, AgentPluginInstallPreview>;
+    /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
+    updateReview?: AgentPluginUpdateReview;
+    /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
+    hooks?: Record<string, AgentPluginHooks>;
+    /** Returned by agentPlugins.pendingSignOuts; omit for no record. */
+    pendingSignOuts?: AgentPluginPendingSignOuts;
+    /**
+     * Returned by agentPlugins.previewComponentReview for the named plugin. Confirming clears the
+     * plugin's reviewRequiredCount in `items`, like the backend does.
+     */
+    componentReview?: AgentPluginUpdateReview;
+  };
   projects?: Map<string, ProjectConfig>;
   workspaces?: FrontendWorkspaceMetadata[];
   /** Pre-seeded multi-project git status rows keyed by workspace ID. */
@@ -143,14 +194,16 @@ export interface MockORPCClientOptions {
   agentAiDefaults?: AgentAiDefaults;
   /** Agent definitions to expose via agents.list */
   agentDefinitions?: AgentDefinitionDescriptor[];
-  /** Initial per-subagent AI defaults for config.getConfig (e.g., Settings → Tasks section) */
-  subagentAiDefaults?: SubagentAiDefaults;
   /** Coder lifecycle preferences for config.getConfig (e.g., Settings → Coder section) */
   coderWorkspaceArchiveBehavior?: CoderWorkspaceArchiveBehavior;
-  /** What to do with shux-managed worktrees when archiving a chat. */
+  /** What to do with xum-managed worktrees when archiving a chat. */
   worktreeArchiveBehavior?: WorktreeArchiveBehavior;
   /** Initial full-width transcript toggle for config.getConfig */
   chatTranscriptFullWidth?: boolean;
+  /** Initial backend experiment values for config.getConfig; experiments.set updates them. */
+  experiments?: Partial<Record<ExperimentId, boolean>>;
+  /** Initial keep-screen-awake toggle for config.getConfig */
+  keepScreenAwake?: boolean;
   /** Initial runtime enablement for config.getConfig */
   runtimeEnablement?: Record<string, boolean>;
   /** Initial default runtime for config.getConfig (global) */
@@ -161,6 +214,10 @@ export interface MockORPCClientOptions {
   heartbeatDefaultIntervalMs?: number;
   /** Initial global goal defaults for config.getConfig */
   goalDefaults?: GoalDefaults;
+  /** Agent resource limits and their status (Settings → Agents); off when omitted. */
+  agentResourceLimits?: AgentResourceLimitsState;
+  /** Initial auto-model-routing tiers for config.getConfig (defaults when omitted). */
+  autoModelRouting?: AutoModelRoutingConfig;
   /**
    * Pre-seeded goal-board snapshots per workspaceId. Stories that want
    * the GoalTab's Upcoming / Completed / Archived sections to render
@@ -168,6 +225,8 @@ export interface MockORPCClientOptions {
    * keyed by the workspace ID the story uses.
    */
   goalBoardSnapshots?: Map<string, GoalBoardSnapshot>;
+  /** Pre-seeded timeline events served to workspace.timeline.list/subscribe for every workspace. */
+  timelineEvents?: TimelineEvent[];
   /**
    * Pre-seeded memory files for memory.list (Memory tab / Settings → Memory
    * stories). read/save/delete/setPinned operate on this in-memory set.
@@ -177,6 +236,42 @@ export interface MockORPCClientOptions {
   memoryConsolidationStatus?: MemoryConsolidationStatusPayload;
   /** Optional file contents for memory.read keyed by virtual path. */
   memoryFileContents?: Map<string, string>;
+  /**
+   * Artifacts tab: listing for artifacts.list and read results keyed by relative path. The
+   * mock's artifact id is the path, so version contents are keyed by `${path}@${version}`.
+   */
+  artifacts?: {
+    listing: ArtifactListing;
+    files: Record<string, ArtifactReadResult>;
+    /** artifacts.capabilities answer; omitted means unknown (null). */
+    agentBrowserAvailable?: boolean | null;
+    /** Stored versions per artifact path, newest first. */
+    versions?: Record<string, ArtifactVersion[]>;
+    versionFiles?: Record<string, ArtifactReadResult>;
+    pinned?: PinnedArtifactFile[];
+    pinnedFiles?: Record<string, ArtifactReadResult>;
+    /** Shelf (M5c) listing and read results keyed by `${scope}:${name}`. */
+    shelf?: ArtifactShelfListing;
+    shelfFiles?: Record<string, ArtifactReadResult>;
+    /** Persisted window.xum.state per artifact path (artifacts.getState); default null. */
+    states?: Record<string, unknown>;
+    /** When set, artifacts.sendInteraction fails with this error (the strip's error state). */
+    sendInteractionError?: string;
+  };
+  /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
+  /** When set, mcpApps.listViewDomains fails with this error (Settings' load error). */
+  mcpAppViewDomainsListError?: string;
+  mcpApps?: {
+    views: Record<string, McpAppView>;
+    callTool?: (input: { toolName: string; consented: boolean }) => McpAppToolCallResult;
+    /** When set, every approveViewDomains call fails with this error. */
+    approveViewDomainsError?: string;
+  };
+  /** Initial updater status for update.onStatus (About dialog stories). */
+  updateStatus?: UpdateStatus;
+  /** Release channel for update.getChannel. */
+  updateChannel?: UpdateChannel;
+  updateChannels?: UpdateChannel[];
   /** Initial route priority for config.getConfig */
   routePriority?: string[];
   /** Initial per-model route overrides for config.getConfig */
@@ -192,12 +287,12 @@ export interface MockORPCClientOptions {
   providersConfig?: ProvidersConfigMap;
   /** List of available provider names */
   providersList?: string[];
+  /** Splash screens already seen. Default: all of them, so no splash covers the story. */
+  viewedSplashScreens?: string[];
   /** Server auth sessions for Settings → Server Access stories */
   serverAuthSessions?: ServerAuthSession[];
   /** Mock for projects.remove - return typed error to simulate failure */
-  onProjectRemove?: (
-    projectPath: string
-  ) => { success: true; data: undefined } | { success: false; error: ProjectRemoveError };
+  onProjectRemove?: (projectPath: string) => Awaited<ReturnType<APIClient["projects"]["remove"]>>;
   /** Override for nameGeneration.generate result (default: success) */
   nameGenerationResult?: { success: false; error: NameGenerationError };
   /** Background processes per workspace */
@@ -246,11 +341,55 @@ export interface MockORPCClientOptions {
       toolAllowlist?: Record<string, string[]>;
     }
   >;
-  /** MCP test results - maps server name to tools list or error */
-  mcpTestResults?: Map<
-    string,
-    { success: true; tools: string[] } | { success: false; error: string }
-  >;
+  /** MCP test results - maps server name to tools list (optionally with serverInfo) or error */
+  mcpTestResults?: Map<string, MockMcpTestResult>;
+  /** OpenAI structured settings per server name (mcp.settings.read; update merges `set`). */
+  mcpSettings?: Map<string, MCPSettingsSnapshot>;
+  /** Servers the workspace runs: `ifConnected` reads see only these; a plain read connects. */
+  mcpSettingsConnected?: Set<string>;
+  /** Every mcp.settings.read call's server names, in order (stories assert batching). */
+  mcpSettingsReads?: string[][];
+  /** Records the workspace of each settings read (the order of mcpSettingsReads). */
+  mcpSettingsReadWorkspaces?: string[];
+  /** Servers whose settings read fails with this message. */
+  mcpSettingsReadErrors?: Map<string, string>;
+  /**
+   * When set, settings updates wait for this promise (stories hold a save in flight). A list
+   * holds each update on its own gate, in call order.
+   */
+  mcpSettingsUpdateGate?: { promise: Promise<void> } | Array<{ promise: Promise<void> }>;
+  /**
+   * Per server: the snapshot the server shows after its next update (the update's values are
+   * merged in). Stories use it for a schema that changes with the values.
+   */
+  mcpSettingsAfterUpdate?: Map<string, MCPSettingsSnapshot>;
+  /** When set, the first settings read takes its values, then waits for this promise. */
+  mcpSettingsFirstReadGate?: { promise: Promise<void> };
+  /**
+   * Per server: the snapshot its first read returns, instead of `mcpSettings` (a catalog the
+   * server changed after the dialog read it). Runs and opens check `mcpSettings`, like the
+   * backend's refreshed catalog: a tool without `readOnly` there needs `confirmed`.
+   */
+  mcpSettingsStaleFirstRead?: Map<string, MCPSettingsSnapshot>;
+  /**
+   * Records every settings tool action run or app open. A run returns "<tool> finished"; an app
+   * opens the view `settings:<server>:<tool>` (`ui://<server>/<tool>`) of `mcpApps.views`.
+   */
+  mcpSettingsToolRuns?: Array<{ toolName: string; confirmed: boolean }>;
+  /** When set, the first settings tool run waits for this promise (a run held in flight). */
+  mcpSettingsToolRunGate?: { promise: Promise<void> };
+  /** Per tool name: the setting values a run of it writes on the server (a reset, an import). */
+  mcpSettingsToolRunSets?: Map<string, Record<string, MCPSettingValue>>;
+  /** Tools whose runs report an MCP error (`isError`) after they wrote their values. */
+  mcpSettingsToolRunErrors?: Set<string>;
+  /** Tools whose runs fail (a disconnect after the dispatch) after they wrote their values. */
+  mcpSettingsToolRunFailures?: Set<string>;
+  /** Servers that restart after their first settings read: later reads have a new instanceToken. */
+  mcpSettingsRestartAfterFirstRead?: Set<string>;
+  /** When set, mcp.test waits for this promise (stories hold a Fetch Tools in flight). */
+  mcpTestGate?: { promise: Promise<void> };
+  /** Session icon registry for mcp.icon - maps iconRef to a PNG data URL (unknown refs resolve null) */
+  mcpIcons?: Map<string, string>;
   /** Custom listBranches implementation (for testing non-git repos) */
   listBranches?: (input: {
     projectPath: string;
@@ -289,16 +428,8 @@ export interface MockORPCClientOptions {
   agentSkills?: AgentSkillDescriptor[];
   /** Agent skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
   invalidAgentSkills?: AgentSkillIssue[];
-  /** Shux Governor URL (null = not enrolled) */
-  muxGovernorUrl?: string | null;
-  /** Whether enrolled with Shux Governor */
-  muxGovernorEnrolled?: boolean;
-  /** Policy response for policy.get */
-  policyResponse?: {
-    source: "none" | "env" | "governor";
-    status: { state: "disabled" | "enforced" | "blocked"; reason?: string };
-    policy: unknown;
-  };
+  /** Skills roots that could not be read (e.g. the SSH host did not answer) */
+  unavailableAgentSkillSources?: AgentSkillUnavailableSource[];
   /** Mock log entries for Output tab (subscribeLogs snapshot) */
   logEntries?: Array<{
     timestamp: number;
@@ -338,7 +469,14 @@ interface MockMcpOverrides {
   toolAllowlist?: Record<string, string[]>;
 }
 
-type MockMcpTestResult = { success: true; tools: string[] } | { success: false; error: string };
+type MockMcpTestResult =
+  | { success: true; tools: string[]; serverInfo?: MCPServerIdentity; icon?: string }
+  | { success: false; error: string };
+
+// Backend commit revisions of the mock's view-domain approvals, shared by every mock client: the
+// renderer's approval store outlives a story and keeps the list with the newest revision
+// (mcpAppViewDomainsStore.ts). Not time-based, since .storybook/preview.tsx freezes Date.
+let mockViewDomainsRevision = 0;
 
 /**
  * Creates a mock ORPC client for Storybook.
@@ -349,7 +487,7 @@ type MockMcpTestResult = { success: true; tools: string[] } | { success: false; 
  *   projects: new Map([...]),
  *   workspaces: [...],
  *   onChat: (wsId, emit) => {
- *     emit({ type: "caught-up" });
+ *     emit({ type: "caught-up", historyReplayStatus: "complete" });
  *     // optionally return cleanup function
  *   },
  * });
@@ -358,6 +496,10 @@ type MockMcpTestResult = { success: true; tools: string[] } | { success: false; 
  * ```
  */
 export function createMockORPCClient(options: MockORPCClientOptions = {}): APIClient {
+  const mockViewDomains = new Map<
+    string,
+    { projectPath: string; serverName: string; origins: string[] }
+  >();
   const {
     projects: providedProjects = new Map<string, ProjectConfig>(),
     workspaces = [],
@@ -366,6 +508,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     onChat,
     executeBash,
     providersConfig = { anthropic: { apiKeySet: true, isEnabled: true, isConfigured: true } },
+    viewedSplashScreens = ["onboarding-wizard-v1"],
     providersList = [],
     serverAuthSessions: initialServerAuthSessions = [],
     onProjectRemove,
@@ -383,26 +526,56 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     projectSecrets = new Map<string, Secret[]>(),
     terminalSessions: initialTerminalSessions = [],
     globalMcpServers = {},
+    agentPlugins: agentPluginsMock,
     mcpServers = new Map<string, MockMcpServers>(),
     mcpOverrides = new Map<string, MockMcpOverrides>(),
     mcpTestResults = new Map<string, MockMcpTestResult>(),
+    mcpSettings,
+    mcpSettingsConnected = new Set<string>(),
+    mcpSettingsReads,
+    mcpSettingsReadWorkspaces,
+    mcpSettingsReadErrors,
+    mcpSettingsUpdateGate,
+    mcpSettingsAfterUpdate,
+    mcpSettingsFirstReadGate,
+    mcpSettingsStaleFirstRead,
+    mcpSettingsToolRuns,
+    mcpSettingsToolRunGate,
+    mcpSettingsToolRunSets,
+    mcpSettingsToolRunErrors,
+    mcpSettingsToolRunFailures,
+    mcpSettingsRestartAfterFirstRead,
+    mcpTestGate,
+    mcpIcons = new Map<string, string>(),
     mcpOauthAuthStatus = new Map<string, MCPOAuthAuthStatus>(),
     userPreferences: initialUserPreferences,
     taskSettings: initialTaskSettings,
-    subagentAiDefaults: initialSubagentAiDefaults,
     agentAiDefaults: initialAgentAiDefaults,
     coderWorkspaceArchiveBehavior: initialCoderWorkspaceArchiveBehavior = "stop",
     worktreeArchiveBehavior: initialWorktreeArchiveBehavior = "keep",
     chatTranscriptFullWidth: initialChatTranscriptFullWidth = false,
+    experiments: initialExperiments = {},
+    keepScreenAwake: initialKeepScreenAwake = false,
     runtimeEnablement: initialRuntimeEnablement,
     defaultRuntime: initialDefaultRuntime,
     heartbeatDefaultPrompt: initialHeartbeatDefaultPrompt,
     heartbeatDefaultIntervalMs: initialHeartbeatDefaultIntervalMs,
     goalDefaults: initialGoalDefaults,
+    agentResourceLimits: initialAgentResourceLimits,
+    autoModelRouting: initialAutoModelRouting,
     goalBoardSnapshots = new Map<string, GoalBoardSnapshot>(),
+    timelineEvents = [],
     memoryFiles = [],
     memoryConsolidationStatus,
     memoryFileContents = new Map<string, string>(),
+    artifacts = {
+      listing: { available: true, dir: "/scratch/artifacts", entries: [], truncated: false },
+      files: {},
+    },
+    mcpApps,
+    updateStatus,
+    updateChannel = "stable",
+    updateChannels = ["stable", "nightly"],
     routePriority: initialRoutePriority = ["direct"],
     routeOverrides: initialRouteOverrides = {},
     agentDefinitions: initialAgentDefinitions,
@@ -416,16 +589,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderTemplatesResult,
     coderPresetsResult = new Map<string, CoderListPresetsResult>(),
     coderWorkspacesResult,
-    layoutPresets: initialLayoutPresets,
     agentSkills = [],
     invalidAgentSkills = [],
-    muxGovernorUrl = null,
-    muxGovernorEnrolled = false,
-    policyResponse = {
-      source: "none" as const,
-      status: { state: "disabled" as const },
-      policy: null,
-    },
+    unavailableAgentSkillSources = [],
     logEntries = [],
     backupSettings: initialBackupSettings,
     backupValidation,
@@ -438,6 +604,19 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   const projects = new Map(providedProjects);
   const workspaceMap = new Map(workspaces.map((w) => [w.id, w]));
+  // Metadata pushes for handlers that change persisted workspace settings (mirrors the
+  // backend's emitCurrentWorkspaceMetadata so metadata-driven controls update in stories).
+  interface MetadataEvent {
+    workspaceId: string;
+    metadata: FrontendWorkspaceMetadata | null;
+  }
+  const metadataListeners = new Set<(event: MetadataEvent) => void>();
+  const publishWorkspaceMetadata = (metadata: FrontendWorkspaceMetadata) => {
+    workspaceMap.set(metadata.id, metadata);
+    for (const listener of metadataListeners) {
+      listener({ workspaceId: metadata.id, metadata });
+    }
+  };
 
   // Terminal sessions are used by RightSidebar and TerminalView.
   // Stories can seed deterministic sessions (with screenState) to make the embedded terminal look
@@ -475,6 +654,22 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   };
 
   let createdWorkspaceCounter = 0;
+  let mcpSettingsReadCount = 0;
+  /** Servers read once already: a server in mcpSettingsRestartAfterFirstRead restarts after it. */
+  const readSettingsServers = new Set<string>();
+  const readToken = (serverName: string) => {
+    const restarted =
+      mcpSettingsRestartAfterFirstRead?.has(serverName) === true &&
+      readSettingsServers.has(serverName);
+    readSettingsServers.add(serverName);
+    return restarted ? `mock-instance-2:${serverName}` : mockSettingsToken(serverName);
+  };
+  /** A settings tool action writes its mcpSettingsToolRunSets values on the server. */
+  const applyMockSettingsToolRunSet = (input: { serverName: string; toolName: string }) => {
+    const stored = mcpSettings?.get(input.serverName);
+    const set = mcpSettingsToolRunSets?.get(input.toolName);
+    if (stored !== undefined && set !== undefined) stored.values = { ...stored.values, ...set };
+  };
 
   const agentDefinitions: AgentDefinitionDescriptor[] =
     initialAgentDefinitions ??
@@ -517,19 +712,26 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     ] satisfies AgentDefinitionDescriptor[]);
 
-  let userPreferences = normalizeUserPreferences(initialUserPreferences);
-  let userPreferencesInitialized = initialUserPreferences !== undefined;
+  // Stories paint dark by default, so the theme preference shown in Settings matches.
+  // Tutorials are off so their overlays cannot cover a story.
+  let userPreferences = normalizeUserPreferences(
+    applyMergePatch(
+      { appearance: { theme: "dark" }, ui: { tutorialState: { disabled: true } } },
+      initialUserPreferences ?? {}
+    )
+  );
   let taskSettings = normalizeTaskSettings(initialTaskSettings ?? DEFAULT_TASK_SETTINGS);
 
-  let agentAiDefaults = normalizeAgentAiDefaults(
-    initialAgentAiDefaults ?? ({ ...(initialSubagentAiDefaults ?? {}) } as const)
-  );
+  let agentAiDefaults = normalizeAgentAiDefaults(initialAgentAiDefaults ?? {});
 
-  let muxGatewayEnabled: boolean | undefined = undefined;
-  let muxGatewayModels: string[] | undefined = undefined;
   let coderWorkspaceArchiveBehavior = initialCoderWorkspaceArchiveBehavior;
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
+  let experiments = initialExperiments;
+  let keepScreenAwake = initialKeepScreenAwake;
+  let toolSearchEnabled = true;
+  let bashAiProxyEnabled = false;
+  let agentHeartbeatsEnabled = false;
   let runtimeEnablement: Record<string, boolean> = initialRuntimeEnablement ?? {
     local: true,
     worktree: true,
@@ -542,7 +744,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let defaultRuntime: RuntimeEnablementId | null = initialDefaultRuntime ?? null;
   let heartbeatDefaultPrompt = initialHeartbeatDefaultPrompt;
   let heartbeatDefaultIntervalMs = initialHeartbeatDefaultIntervalMs;
+  let agentResourceLimitsState =
+    initialAgentResourceLimits ?? mockAgentResourceLimitsState(false, {});
   let goalDefaults = normalizeGoalDefaults(initialGoalDefaults ?? DEFAULT_GOAL_DEFAULTS);
+  let autoModelRouting = normalizeAutoModelRoutingConfig(initialAutoModelRouting);
   let routePriority = [...initialRoutePriority];
   let routeOverrides = { ...initialRouteOverrides };
   const configChangeSubscribers = new Set<(value: void) => void>();
@@ -552,6 +757,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     }
   };
   let globalSecretsState: Secret[] = [...globalSecrets];
+  // signOutPluginServers deletes the pending sign-out record, as the backend does.
+  let pluginSignOutsCleared = false;
   const getInjectedGlobalSecretKeys = (projectPath: string): string[] => {
     const normalizedProjectPath = projectPath.trim();
     if (!normalizedProjectPath) {
@@ -601,17 +808,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     ...session,
   }));
 
-  const deriveSubagentAiDefaults = () => {
-    const raw: Record<string, unknown> = {};
-    for (const [agentId, entry] of Object.entries(agentAiDefaults)) {
-      if (agentId === "plan" || agentId === "exec" || agentId === "compact") {
-        continue;
-      }
-      raw[agentId] = entry;
-    }
-    return normalizeSubagentAiDefaults(raw);
-  };
-
   let backupSettings: MockBackupSettings | null = initialBackupSettings ?? null;
   const backupValidationResult: MockBackupData<"validate"> = backupValidation ?? {
     reachable: true,
@@ -624,6 +820,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     localOnlyFiles: [],
     redactions: [],
     commandApprovals: [],
+    projectImports: [],
+    projectBundleSkipped: false,
+    pushError: null,
   };
   const backupPushResult: MockBackupData<"push"> = backupPush ?? {
     commit: "abc1234",
@@ -636,10 +835,10 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     snapshotPath: "/tmp/mux-backup-snapshot",
     changedFiles: [],
     localOnlyFiles: [],
+    projectImportResults: [],
+    projectBundleSkipped: false,
+    unapprovedProjectImports: [],
   };
-
-  let layoutPresets = initialLayoutPresets ?? DEFAULT_LAYOUT_PRESETS_CONFIG;
-  let subagentAiDefaults = deriveSubagentAiDefaults();
 
   const mockStats: ChatStats = {
     consumers: [],
@@ -695,7 +894,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       status: () => Promise.resolve({ enabled: true, explicit: false }),
     },
     splashScreens: {
-      getViewedSplashScreens: () => Promise.resolve(["onboarding-wizard-v1"]),
+      getViewedSplashScreens: () => Promise.resolve(viewedSplashScreens),
       markSplashScreenViewed: () => Promise.resolve(undefined),
     },
     server: {
@@ -749,25 +948,19 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       restore: (_input: Parameters<APIClient["backup"]["restore"]>[0]) =>
         Promise.resolve({ success: true as const, data: backupRestoreResult }),
     },
-    // Settings → Layouts (layout presets)
-    // Stored in-memory for Storybook only.
-    // Frontend code normalizes the response defensively, but we normalize here too so
-    // stories remain stable even if they mutate the config.
-    uiLayouts: {
-      getAll: () => Promise.resolve(layoutPresets),
-      saveAll: (input: { layoutPresets: unknown }) => {
-        layoutPresets = normalizeLayoutPresetsConfig(input.layoutPresets);
+    drafts: createMockDraftsApi(),
+    experiments: {
+      set: (input: { experimentId: ExperimentId; enabled?: boolean | null }) => {
+        experiments = { ...experiments, [input.experimentId]: input.enabled === true };
+        notifyConfigChanged();
         return Promise.resolve(undefined);
       },
     },
     config: {
       getConfig: () =>
         Promise.resolve({
-          userPreferencesInitialized,
           userPreferences,
           taskSettings,
-          muxGatewayEnabled,
-          muxGatewayModels,
           routePriority,
           routeOverrides,
           coderWorkspaceArchiveBehavior,
@@ -775,46 +968,37 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           runtimeEnablement,
           defaultRuntime,
           agentAiDefaults,
-          subagentAiDefaults,
-          muxGovernorUrl,
           heartbeatDefaultPrompt,
           heartbeatDefaultIntervalMs,
           goalDefaults,
+          autoModelRouting,
           chatTranscriptFullWidth,
-          muxGovernorEnrolled,
           llmDebugLogs: false,
+          keepScreenAwake,
+          toolSearchEnabled,
+          bashAiProxyEnabled,
+          agentHeartbeatsEnabled,
+          experiments,
         }),
-      saveConfig: (input: {
-        taskSettings?: unknown;
-        userPreferences?: unknown;
-        agentAiDefaults?: unknown;
-        subagentAiDefaults?: unknown;
-      }) => {
+      saveConfig: (input: { taskSettings?: unknown; agentAiDefaults?: unknown }) => {
         if (input.taskSettings != null) {
           taskSettings = normalizeTaskSettings(input.taskSettings);
         }
 
-        if (input.userPreferences !== undefined) {
-          userPreferences = normalizeUserPreferences(input.userPreferences);
-          userPreferencesInitialized = true;
-        }
-
         if (input.agentAiDefaults !== undefined) {
           agentAiDefaults = normalizeAgentAiDefaults(input.agentAiDefaults);
-          subagentAiDefaults = deriveSubagentAiDefaults();
         }
 
-        if (input.subagentAiDefaults !== undefined) {
-          subagentAiDefaults = normalizeSubagentAiDefaults(input.subagentAiDefaults);
-
-          const nextAgentAiDefaults: Record<string, unknown> = { ...agentAiDefaults };
-          for (const [agentType, entry] of Object.entries(subagentAiDefaults)) {
-            nextAgentAiDefaults[agentType] = entry;
-          }
-
-          agentAiDefaults = normalizeAgentAiDefaults(nextAgentAiDefaults);
-        }
-
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateUserPreferences: (input: { patches: unknown[] }) => {
+        userPreferences = normalizeUserPreferences(
+          input.patches.reduce<unknown>(
+            (prefs, patch) => applyMergePatch(prefs, patch),
+            userPreferences
+          )
+        );
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
@@ -838,18 +1022,42 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateAgentAiDefaults: (input: { agentAiDefaults: unknown }) => {
         agentAiDefaults = normalizeAgentAiDefaults(input.agentAiDefaults);
-        subagentAiDefaults = deriveSubagentAiDefaults();
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
-      updateMuxGatewayPrefs: (input: {
-        muxGatewayEnabled: boolean;
-        muxGatewayModels: string[];
-      }) => {
-        muxGatewayEnabled = input.muxGatewayEnabled ? undefined : false;
-        muxGatewayModels = input.muxGatewayModels.length > 0 ? input.muxGatewayModels : undefined;
+      updateAutoModelRouting: (input: { autoModelRouting: unknown }) => {
+        autoModelRouting = normalizeAutoModelRoutingConfig(input.autoModelRouting);
         notifyConfigChanged();
         return Promise.resolve(undefined);
+      },
+      getAutoModelRoutingEvaluationStatus: (input?: { evaluationModel?: string }) =>
+        Promise.resolve({
+          evaluationModel: input?.evaluationModel ?? autoModelRouting.evaluationModel,
+          available: true,
+        }),
+      previewAutoModelRouting: (input: { prompt: string; config?: AutoModelRoutingConfig }) => {
+        // Deterministic stand-in for the evaluation model: longer prompts land on later tiers.
+        const { tiers } = input.config ?? autoModelRouting;
+        const index = Math.min(tiers.length - 1, Math.floor(input.prompt.length / 40));
+        const chosen = tiers[index];
+        const probabilities = Object.fromEntries(
+          tiers.map((tier, tierIndex) => [
+            tier.id,
+            tierIndex === index ? 0.7 : 0.3 / (tiers.length - 1),
+          ])
+        );
+        return Promise.resolve({
+          success: true as const,
+          data: {
+            tierId: chosen.id,
+            tierLabel: chosen.label,
+            confidence: 0.7,
+            probabilities,
+            evaluationModel: input.config?.evaluationModel ?? autoModelRouting.evaluationModel,
+            ...(chosen.model != null ? { model: chosen.model } : {}),
+            ...(chosen.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
+          },
+        });
       },
       updateRoutePreferences: (input: {
         routePriority: string[];
@@ -862,6 +1070,26 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       updateChatTranscriptFullWidth: (input: { enabled: boolean }) => {
         chatTranscriptFullWidth = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateKeepScreenAwake: (input: { enabled: boolean }) => {
+        keepScreenAwake = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateToolSearchEnabled: (input: { enabled: boolean }) => {
+        toolSearchEnabled = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateBashAiProxyEnabled: (input: { enabled: boolean }) => {
+        bashAiProxyEnabled = input.enabled;
+        notifyConfigChanged();
+        return Promise.resolve(undefined);
+      },
+      updateAgentHeartbeatsEnabled: (input: { enabled: boolean }) => {
+        agentHeartbeatsEnabled = input.enabled;
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
@@ -969,7 +1197,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         notifyConfigChanged();
         return Promise.resolve(undefined);
       },
-      unenrollMuxGovernor: () => Promise.resolve(undefined),
     },
     agents: {
       list: (_input: {
@@ -1006,10 +1233,20 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve(agentPackage);
       },
     },
+    workflows: {
+      // The tray's cold-mount discovery and nested-run liveness poll run in any
+      // story that renders chat input; resolve empty so no groups are seeded.
+      getRunStatuses: () => Promise.resolve([]),
+      listActiveRuns: () => Promise.resolve([]),
+      listRuns: () => Promise.resolve([]),
+    },
     agentSkills: {
-      list: () => Promise.resolve(agentSkills),
-      listDiagnostics: () =>
-        Promise.resolve({ skills: agentSkills, invalidSkills: invalidAgentSkills }),
+      list: () =>
+        Promise.resolve({
+          skills: agentSkills,
+          invalidSkills: invalidAgentSkills,
+          unavailableSources: unavailableAgentSkillSources,
+        }),
       get: () =>
         Promise.resolve({
           scope: "built-in" as const,
@@ -1021,18 +1258,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     providers: {
       list: () => Promise.resolve(providersList),
       getConfig: () => Promise.resolve(providersConfig),
+      discoverModels: () => Promise.resolve({ status: "unsupported" }),
+      searchModelCatalog: (input: ModelCatalogSearchInput) =>
+        Promise.resolve(searchModelCatalog(input)),
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
-    },
-    muxGateway: {
-      getAccountStatus: () =>
-        Promise.resolve({
-          success: true,
-          data: {
-            remaining_microdollars: 134_598_127,
-            ai_gateway_concurrent_requests_per_user: 20,
-          },
-        }),
     },
     analytics: {
       getDelegationSummary: (_input: {
@@ -1128,7 +1358,242 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         return Promise.resolve({ success: true, data: undefined });
       },
     },
+    agentPlugins: {
+      list: () => Promise.resolve({ success: true, data: agentPluginsMock?.items ?? [] }),
+      containerLocation: () => Promise.resolve("~/.mux/plugins"),
+      listForSettings: () =>
+        Promise.resolve({
+          list: { success: true as const, data: agentPluginsMock?.items ?? [] },
+          pendingSignOuts: (pluginSignOutsCleared
+            ? undefined
+            : agentPluginsMock?.pendingSignOuts) ?? { kind: "none" as const },
+        }),
+      pendingSignOuts: () =>
+        Promise.resolve(
+          (pluginSignOutsCleared ? undefined : agentPluginsMock?.pendingSignOuts) ?? {
+            kind: "none" as const,
+          }
+        ),
+      signOutPluginServers: () => {
+        pluginSignOutsCleared = true;
+        return Promise.resolve({ success: true as const });
+      },
+      getComponents: () =>
+        Promise.resolve({
+          success: false,
+          error: "No component inventory configured in this story",
+        }),
+      setComponents: () =>
+        Promise.resolve({
+          success: false,
+          error: "No component selection configured in this story",
+        }),
+      getHooks: (input: { name: string }) => {
+        const hooks = agentPluginsMock?.hooks?.[input.name];
+        return Promise.resolve(
+          hooks
+            ? { success: true as const, data: hooks }
+            : { success: false as const, error: `No hooks mock for '${input.name}'` }
+        );
+      },
+      setHookTrust: (input: {
+        name: string;
+        key: string;
+        state: "trusted" | "disabled" | null;
+      }) => {
+        const hooks = agentPluginsMock?.hooks?.[input.name];
+        if (hooks) {
+          hooks.hooks = hooks.hooks.map((hook) =>
+            hook.key === input.key ? { ...hook, review: input.state ?? "new" } : hook
+          );
+        }
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
+      checkUpdates: () =>
+        Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
+      preview: (input: { method?: AgentPluginInstallMethod | null }) => {
+        const method = input.method;
+        if (method == null && agentPluginsMock?.marketplace !== undefined) {
+          return Promise.resolve({
+            success: true as const,
+            data: { kind: "marketplace" as const, marketplace: agentPluginsMock.marketplace },
+          });
+        }
+        const preview =
+          method?.kind === "claude-marketplace"
+            ? agentPluginsMock?.previewsByEntry?.[method.entry]
+            : ((method != null ? agentPluginsMock?.previewsByMethod?.[method.kind] : null) ??
+              agentPluginsMock?.preview);
+        return preview
+          ? Promise.resolve({ success: true as const, data: { kind: "plugin" as const, preview } })
+          : Promise.resolve({
+              success: false as const,
+              error: "No preview configured in this story",
+            });
+      },
+      // Like the backend's command, from the typed source (the backend normalizes it first).
+      skillsCliCommand: (input: { source: string; skills: string[] }) =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            command: [
+              "cd ~ && npx --yes skills@1.7.4 add",
+              input.source,
+              ...input.skills.map((skill) => `--skill ${skill}`),
+              "--global --agent codex --copy",
+            ].join(" "),
+          },
+        }),
+      install: (input: { source: AgentPluginInstallPreview["source"]; expectedSha: string }) =>
+        Promise.resolve({
+          success: true,
+          data: {
+            name: agentPluginsMock?.preview?.manifest.name ?? "plugin",
+            scope: "global" as const,
+            source: input.source,
+            lockedSha: input.expectedSha,
+            installedAt: new Date().toISOString(),
+          },
+        }),
+      uninstall: () => Promise.resolve({ success: true, data: undefined }),
+      previewUpdate: (input: { name: string }) =>
+        agentPluginsMock?.updateReview && agentPluginsMock.updateReview.name === input.name
+          ? Promise.resolve({ success: true, data: agentPluginsMock.updateReview })
+          : Promise.resolve({ success: false, error: `No update review mock for '${input.name}'` }),
+      update: (input: { name: string }) =>
+        Promise.resolve({ success: false, error: `No update mock for '${input.name}'` }),
+      previewComponentReview: (input: { name: string }) =>
+        agentPluginsMock?.componentReview?.name === input.name
+          ? Promise.resolve({ success: true, data: agentPluginsMock.componentReview })
+          : Promise.resolve({
+              success: false,
+              error: `No component review mock for '${input.name}'`,
+            }),
+      confirmComponentReview: (input: { name: string; expectedLockedSha: string }) => {
+        const item = agentPluginsMock?.items?.find((entry) => entry.name === input.name);
+        if (item === undefined) {
+          return Promise.resolve({ success: false, error: `No plugin '${input.name}'` });
+        }
+        item.reviewRequiredCount = 0;
+        return Promise.resolve({
+          success: true,
+          data: {
+            entry: {
+              name: item.name,
+              scope: "global" as const,
+              source: item.source ?? {
+                type: "git" as const,
+                url: "",
+                ref: "main",
+                refType: "branch" as const,
+              },
+              lockedSha: input.expectedLockedSha,
+              installedAt: item.installedAt ?? new Date().toISOString(),
+            },
+          },
+        });
+      },
+    },
     mcp: {
+      settings: {
+        // A copy, like IPC: a dialog that keeps an old read must not see later updates.
+        read: async (input: {
+          workspaceId: string;
+          serverNames: string[];
+          ifConnected?: boolean;
+        }) => {
+          const first = (mcpSettingsReadCount += 1) === 1;
+          mcpSettingsReads?.push(input.serverNames);
+          mcpSettingsReadWorkspaces?.push(input.workspaceId);
+          const readOne = (serverName: string) => {
+            if (input.ifConnected === true && !mcpSettingsConnected.has(serverName))
+              return { success: true, data: { notConnected: true } };
+            mcpSettingsConnected.add(serverName);
+            const readError = mcpSettingsReadErrors?.get(serverName);
+            if (readError !== undefined) return { success: false, error: readError };
+            const stale = mcpSettingsStaleFirstRead?.get(serverName);
+            mcpSettingsStaleFirstRead?.delete(serverName);
+            const snapshot = stale ?? mcpSettings?.get(serverName);
+            return {
+              success: true,
+              data:
+                snapshot === undefined
+                  ? null
+                  : {
+                      ...structuredClone(snapshot),
+                      instanceToken: readToken(serverName),
+                      readId: `mock-read-${serverName}`,
+                    },
+            };
+          };
+          const result = Object.fromEntries(input.serverNames.map((name) => [name, readOne(name)]));
+          if (first) await mcpSettingsFirstReadGate?.promise;
+          return result;
+        },
+        update: async (input: {
+          serverName: string;
+          set: Record<string, MCPSettingValue>;
+          instanceToken: string;
+        }) => {
+          await (Array.isArray(mcpSettingsUpdateGate)
+            ? mcpSettingsUpdateGate.shift()?.promise
+            : mcpSettingsUpdateGate?.promise);
+          const stored = mcpSettings?.get(input.serverName);
+          if (stored === undefined) return { success: false, error: "No settings mock" };
+          if (input.instanceToken !== mockSettingsToken(input.serverName))
+            return { success: false, error: "The server was replaced. Reopen the dialog." };
+          const after = mcpSettingsAfterUpdate?.get(input.serverName);
+          mcpSettingsAfterUpdate?.delete(input.serverName);
+          const snapshot = after === undefined ? stored : structuredClone(after);
+          snapshot.values = { ...stored.values, ...snapshot.values, ...input.set };
+          mcpSettings?.set(input.serverName, snapshot);
+          return {
+            success: true,
+            data: {
+              ...structuredClone(snapshot),
+              instanceToken: mockSettingsToken(input.serverName),
+              readId: `mock-read-${input.serverName}`,
+            },
+          };
+        },
+        openApp: (input: { serverName: string; toolName: string; confirmed: boolean }) => {
+          const refusal = mockSettingsToolRefusal(mcpSettings, input);
+          if (refusal !== null) return Promise.resolve({ success: false, error: refusal });
+          mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
+          applyMockSettingsToolRunSet(input);
+          // The backend titles the view with the action's display name.
+          const action = mockSettingsToolItem(mcpSettings, input);
+          return Promise.resolve({
+            success: true,
+            data: {
+              viewKey: `settings:${input.serverName}:${input.toolName}`,
+              serverName: input.serverName,
+              // A plugin server's label, as the backend gives one (it differs from the key).
+              serverLabel: `cad-plugin · ${input.serverName}`,
+              toolName: input.toolName,
+              title: action?.action?.title ?? input.toolName,
+              resourceUri: `ui://${input.serverName}/${input.toolName}`,
+            },
+          });
+        },
+        runTool: async (input: { serverName: string; toolName: string; confirmed: boolean }) => {
+          const refusal = mockSettingsToolRefusal(mcpSettings, input);
+          if (refusal !== null) return { success: false, error: refusal };
+          const gated = mcpSettingsToolRuns?.length === 0 ? mcpSettingsToolRunGate : undefined;
+          mcpSettingsToolRuns?.push({ toolName: input.toolName, confirmed: input.confirmed });
+          await gated?.promise;
+          applyMockSettingsToolRunSet(input);
+          if (mcpSettingsToolRunFailures?.has(input.toolName) === true)
+            return { success: false, error: `${input.toolName} disconnected` };
+          return {
+            success: true,
+            data: {
+              text: `${input.toolName} finished`,
+              isError: mcpSettingsToolRunErrors?.has(input.toolName) === true,
+            },
+          };
+        },
+      },
       list: (input?: { projectPath?: string }) => {
         const projectPath = typeof input?.projectPath === "string" ? input.projectPath.trim() : "";
         if (projectPath) {
@@ -1167,14 +1632,22 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         delete globalMcpServersState[input.name];
         return Promise.resolve({ success: true, data: undefined });
       },
-      test: (input: { projectPath?: string; name?: string }) => {
+      test: async (input: { projectPath?: string; name?: string }) => {
+        await mcpTestGate?.promise;
         if (input.name && mcpTestResults.has(input.name)) {
-          return Promise.resolve(mcpTestResults.get(input.name)!);
+          return mcpTestResults.get(input.name)!;
         }
 
         // Default: return empty tools.
-        return Promise.resolve({ success: true, tools: [] });
+        return { success: true, tools: [] };
       },
+      icon: (input: { iconRef: string }) => Promise.resolve(mcpIcons.get(input.iconRef) ?? null),
+      icons: (input: { iconRefs: string[] }) =>
+        Promise.resolve(
+          Object.fromEntries(
+            input.iconRefs.map((iconRef) => [iconRef, mcpIcons.get(iconRef) ?? null])
+          )
+        ),
       setEnabled: (input: { name: string; enabled: boolean }) => {
         const server = globalMcpServersState[input.name];
         if (server) {
@@ -1200,6 +1673,9 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
     mcpOauth: {
+      onInsufficientScope: async function* (): AsyncGenerator<string> {
+        // Stories record no prompts at runtime.
+      },
       getAuthStatus: (input: { serverUrl: string }) => {
         const status = mcpOauthAuthStatus.get(input.serverUrl);
         return Promise.resolve(
@@ -1318,14 +1794,27 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
     },
     projects: {
-      list: () => Promise.resolve(Array.from(projects.entries())),
+      // Mirror the server-side read projection: projects.list excludes archived
+      // workspaces (the UI loads them on demand via workspace.list({archived:true})).
+      list: () =>
+        Promise.resolve(
+          Array.from(projects.entries()).map(([projectPath, project]): [string, ProjectConfig] => [
+            projectPath,
+            {
+              ...project,
+              workspaces: project.workspaces.filter(
+                (workspace) => !isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)
+              ),
+            },
+          ])
+        ),
       create: () =>
         Promise.resolve({
           success: true,
           data: { projectConfig: { workspaces: [] }, normalizedPath: "/mock/project" },
         }),
       pickDirectory: () => Promise.resolve(null),
-      getDefaultProjectDir: () => Promise.resolve("~/.shux/projects"),
+      getDefaultProjectDir: () => Promise.resolve("~/.xum/projects"),
       setDefaultProjectDir: () => Promise.resolve(),
       clone: () =>
         Promise.resolve(
@@ -1366,11 +1855,27 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }
         return Promise.resolve({ success: true as const });
       },
-      remove: (input: { projectPath: string }) => {
+      // Read-only preflight used by the delete confirmation dialog.
+      getRemovalBlockers: (input: { projectPath: string }) => {
+        const project = projects.get(input.projectPath);
+        return Promise.resolve(getProjectWorkspaceCounts(project?.workspaces ?? []));
+      },
+      remove: (input: { projectPath: string; force?: boolean | null }) => {
         if (onProjectRemove) {
           return Promise.resolve(onProjectRemove(input.projectPath));
         }
-        return Promise.resolve({ success: true, data: undefined });
+        // Mirror the real backend: a non-forced removal of a project that still
+        // has workspaces is rejected with authoritative blocker counts, which
+        // the sidebar uses to populate the delete confirmation dialog.
+        const project = projects.get(input.projectPath);
+        const counts = getProjectWorkspaceCounts(project?.workspaces ?? []);
+        if (input.force !== true && counts.activeCount + counts.archivedCount > 0) {
+          return Promise.resolve({
+            success: false,
+            error: { type: "workspace_blockers", ...counts },
+          });
+        }
+        return Promise.resolve({ success: true, data: { removedCreationDrafts: [] } });
       },
       setTrust: (input: { projectPath: string; trusted: boolean }) => {
         const project = projects.get(input.projectPath);
@@ -1502,6 +2007,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           workspaces.filter((w) => !isWorkspaceArchived(w.archivedAt, w.unarchivedAt))
         );
       },
+      listKnownIdsForStorageGc: () =>
+        Promise.resolve({ workspaceIds: workspaces.map((workspace) => workspace.id) }),
       preflightArchive: () => Promise.resolve({ success: true, data: { kind: "ready" as const } }),
       archive: () => Promise.resolve({ success: true }),
       unarchive: () => Promise.resolve({ success: true }),
@@ -1514,12 +2021,22 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         get: () => Promise.resolve(null),
         set: () => Promise.resolve({ success: true, data: undefined }),
       },
+      plugins: {
+        slashCommands: {
+          list: () => Promise.resolve([]),
+        },
+      },
       timeline: {
-        list: () => Promise.resolve({ events: [], nextCursor: null, hasOlder: false }),
+        list: () => Promise.resolve({ events: timelineEvents, nextCursor: null, hasOlder: false }),
         subscribe: () =>
           Promise.resolve(
             (function* () {
-              yield { type: "snapshot" as const, events: [], nextCursor: null, hasOlder: false };
+              yield {
+                type: "snapshot" as const,
+                events: timelineEvents,
+                nextCursor: null,
+                hasOlder: false,
+              };
             })()
           ),
         preview: () => Promise.resolve(null),
@@ -1565,6 +2082,8 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             projectName: input.projectPath.split("/").pop() ?? "project",
             namedWorkspacePath: `/mock/workspace/${input.branchName}`,
             runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+            // The frontend rejects created workspaces without createdAt as a contract violation.
+            createdAt: new Date(Date.now()).toISOString(),
           },
         });
       },
@@ -1596,14 +2115,54 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }),
       fork: () => Promise.resolve({ success: false, error: "Not implemented in mock" }),
       sendMessage: () => Promise.resolve({ success: true, data: undefined }),
+      // Idempotent sends: every story send is accepted at once.
+      getSendStatus: (input: { sendIds: string[] }) =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            receiverId: "storybook-receiver",
+            statuses: input.sendIds.map((sendId) => ({ sendId, status: "accepted" as const })),
+          },
+        }),
       resumeStream: () => Promise.resolve({ success: true, data: { started: true } }),
       setAutoRetryEnabled: () =>
         Promise.resolve({
           success: true,
           data: { previousEnabled: true, enabled: true },
         }),
-      getStartupAutoRetryModel: () => Promise.resolve({ success: true, data: null }),
-      setAutoCompactionThreshold: () => Promise.resolve({ success: true, data: undefined }),
+      setUnrelatedWorkspaceConsent: (input: { workspaceId: string; enabled: boolean }) => {
+        const current = workspaceMap.get(input.workspaceId);
+        if (!current) {
+          return Promise.resolve({ success: false as const, error: "Workspace not found" });
+        }
+        // Same generation rules as the backend: off deletes, off→on mints, on→on retains.
+        const { unrelatedWorkspaceConsent: _previous, ...rest } = current;
+        const next: FrontendWorkspaceMetadata = input.enabled
+          ? {
+              ...rest,
+              unrelatedWorkspaceConsent:
+                current.unrelatedWorkspaceConsent ??
+                `mock-consent-${workspaceMap.size}-${Date.now()}`,
+            }
+          : rest;
+        publishWorkspaceMetadata(next);
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
+      setAgentMessageDispatchMode: (input: {
+        workspaceId: string;
+        mode: "tool-end" | "turn-end";
+      }) => {
+        const current = workspaceMap.get(input.workspaceId);
+        if (!current) {
+          return Promise.resolve({ success: false as const, error: "Workspace not found" });
+        }
+        // Same storage rule as the backend: the tool-end default is an absent field.
+        const { agentMessageDispatchMode: _previous, ...rest } = current;
+        publishWorkspaceMetadata(
+          input.mode === "turn-end" ? { ...rest, agentMessageDispatchMode: "turn-end" } : rest
+        );
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       interruptStream: () => Promise.resolve({ success: true, data: undefined }),
       setQueuedMessageDispatchMode: () => Promise.resolve({ success: true, data: true }),
       clearQueue: () => Promise.resolve({ success: true, data: undefined }),
@@ -1620,6 +2179,12 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         Promise.resolve(subagentTranscripts.get(input.taskId) ?? { messages: [] }),
       getPostCompactionState: () =>
         Promise.resolve({ planPath: null, trackedFilePaths: [], excludedItems: [] }),
+      getImportableLegacyPlan: () => Promise.resolve({ success: true as const, data: null }),
+      importLegacyPlan: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { status: "nothing_to_import" as const, planPath: "" },
+        }),
       setPostCompactionExclusion: () =>
         Promise.resolve({ success: true as const, data: undefined }),
       executeBash: async (input: { workspaceId: string; script: string }) => {
@@ -1651,7 +2216,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         if (!onChat) {
           // Default mock behavior: subscriptions should remain open.
           // If this ends, WorkspaceStore will retry and reset state, which flakes stories.
-          const caughtUp: WorkspaceChatMessage = { type: "caught-up", hasOlderHistory: false };
+          const caughtUp: WorkspaceChatMessage = {
+            type: "caught-up",
+            historyReplayStatus: "complete",
+            hasOlderHistory: false,
+          };
           yield caughtUp;
 
           await new Promise<void>((resolve) => {
@@ -1676,10 +2245,36 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           cleanup?.();
         }
       },
-      onMetadata: async function* () {
-        // No metadata updates in the mock, but keep the subscription open.
-        yield* [];
-        await new Promise<void>(() => undefined);
+      onMetadata: async function* (input?: { archived?: boolean }) {
+        // Deliver pushes from settings handlers; otherwise keep the subscription open.
+        const queue: MetadataEvent[] = [];
+        let wake: (() => void) | null = null;
+        const listener = (event: MetadataEvent) => {
+          queue.push(event);
+          wake?.();
+        };
+        metadataListeners.add(listener);
+        try {
+          // Like the server: a snapshot equal to workspace.list(input) first, then updates.
+          yield {
+            type: "snapshot" as const,
+            workspaces: workspaces.filter(
+              (w) =>
+                isWorkspaceArchived(w.archivedAt, w.unarchivedAt) === (input?.archived === true)
+            ),
+          };
+          while (true) {
+            while (queue.length > 0) {
+              yield queue.shift()!;
+            }
+            await new Promise<void>((resolve) => {
+              wake = resolve;
+            });
+            wake = null;
+          }
+        } finally {
+          metadataListeners.delete(listener);
+        }
       },
       activity: {
         list: () => Promise.resolve(workspaceActivitySnapshots),
@@ -1720,6 +2315,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         },
         sendToBackground: () => Promise.resolve({ success: true, data: undefined }),
       },
+      reviewState: createMockReviewStateApi(),
       stats: {
         subscribe: async function* (input: { workspaceId: string }) {
           const snapshot = workspaceStatsSnapshots.get(input.workspaceId);
@@ -1750,7 +2346,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             content: "",
             enabled: true,
           },
-          sources: { global: null, context: [] },
+          sources: { global: [], context: [] },
           files: [],
           totalTokens: null,
         }),
@@ -1775,10 +2371,22 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       mcp: {
         get: (input: { workspaceId: string }) =>
-          Promise.resolve(mcpOverrides.get(input.workspaceId) ?? {}),
-        set: (input: { workspaceId: string; overrides: MockMcpOverrides }) => {
+          Promise.resolve({
+            overrides: mcpOverrides.get(input.workspaceId) ?? {},
+            revision: "mock-revision",
+          }),
+        set: (input: {
+          workspaceId: string;
+          overrides: MockMcpOverrides;
+          expectedRevision: string;
+        }) => {
           mcpOverrides.set(input.workspaceId, input.overrides);
           return Promise.resolve({ success: true, data: undefined });
+        },
+        // The composer lists MCP prompts for slash suggestions; without this, typing "/" in a
+        // story crashed the chat pane (#5991). Stories configure no MCP servers, so none exist.
+        prompts: {
+          list: (_input: { workspaceId: string }) => Promise.resolve<MCPPromptDescriptor[]>([]),
         },
       },
       getFileCompletions: (input: { workspaceId: string; query: string; limit?: number }) => {
@@ -1937,19 +2545,204 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       download: () => Promise.resolve(undefined),
       install: () => Promise.resolve(undefined),
       onStatus: async function* () {
-        yield* [];
+        if (updateStatus) yield updateStatus;
         await new Promise<void>(() => undefined);
       },
-      getChannel: () => Promise.resolve("stable" as const),
+      getChannel: () =>
+        Promise.resolve({ channel: updateChannel, supportedChannels: updateChannels }),
       setChannel: () => Promise.resolve(undefined),
     },
-    policy: {
-      get: () => Promise.resolve(policyResponse),
-      onChanged: async function* () {
-        yield* [];
-        await new Promise<void>(() => undefined);
+    artifacts: {
+      list: () => Promise.resolve({ success: true as const, data: artifacts.listing }),
+      read: (input: { workspaceId: string; path: string }) => {
+        const file = artifacts.files[input.path];
+        return Promise.resolve(
+          file
+            ? { success: true as const, data: file }
+            : { success: false as const, error: `Artifact not found: ${input.path}` }
+        );
       },
-      refreshNow: () => Promise.resolve({ success: true as const, value: policyResponse }),
+      capabilities: () =>
+        Promise.resolve({ agentBrowserAvailable: artifacts.agentBrowserAvailable ?? null }),
+      listVersions: (input: { workspaceId: string; path: string }) =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            artifactId: input.path,
+            path: input.path,
+            pin: null,
+            versions: artifacts.versions?.[input.path] ?? [],
+          },
+        }),
+      readVersion: (input: { workspaceId: string; artifactId: string; version: number }) => {
+        const file = artifacts.versionFiles?.[`${input.artifactId}@${input.version}`];
+        return Promise.resolve(
+          file
+            ? { success: true as const, data: file }
+            : { success: false as const, error: `Version not found: v${input.version}` }
+        );
+      },
+      listPinned: () =>
+        Promise.resolve({
+          success: true as const,
+          data: { available: true as const, files: artifacts.pinned ?? [] },
+        }),
+      readPinned: (input: { workspaceId: string; path: string }) => {
+        const file = artifacts.pinnedFiles?.[input.path];
+        return Promise.resolve(
+          file
+            ? { success: true as const, data: file }
+            : { success: false as const, error: `Pinned file not found: ${input.path}` }
+        );
+      },
+      pinFile: (input: { workspaceId: string; path: string }) =>
+        Promise.resolve({ success: true as const, data: { path: input.path } }),
+      unpinFile: () => Promise.resolve({ success: true as const, data: undefined }),
+      listShelf: () =>
+        Promise.resolve({
+          success: true as const,
+          data: artifacts.shelf ?? {
+            project: { available: true as const, entries: [] },
+            global: [],
+          },
+        }),
+      readShelf: (input: { workspaceId: string; scope: string; name: string }) => {
+        const file = artifacts.shelfFiles?.[`${input.scope}:${input.name}`];
+        return Promise.resolve(
+          file
+            ? { success: true as const, data: file }
+            : { success: false as const, error: `Shelf entry not found: ${input.name}` }
+        );
+      },
+      pinToShelf: (input: { artifactId: string }) =>
+        Promise.resolve({ success: true as const, data: { name: input.artifactId } }),
+      unpinShelf: () => Promise.resolve({ success: true as const, data: undefined }),
+      getState: (input: { workspaceId: string; path: string }) =>
+        Promise.resolve({
+          success: true as const,
+          data: { state: artifacts.states?.[input.path] ?? null },
+        }),
+      setState: () => Promise.resolve({ success: true as const, data: undefined }),
+      sendInteraction: () =>
+        Promise.resolve(
+          artifacts.sendInteractionError != null
+            ? { success: false as const, error: artifacts.sendInteractionError }
+            : { success: true as const, data: { id: "story-interaction" } }
+        ),
+    },
+    mcpApps: {
+      getView: (input: { toolCallId: string }) => {
+        const view = mcpApps?.views[input.toolCallId];
+        return Promise.resolve(
+          view
+            ? {
+                success: true as const,
+                // Read now, like the backend: newer than every approval published so far.
+                data: {
+                  ...view,
+                  approvedDomainsRevision:
+                    view.approvedDomainsRevision ?? ++mockViewDomainsRevision,
+                },
+              }
+            : { success: false as const, error: `No view for ${input.toolCallId}` }
+        );
+      },
+      // Kept like the backend's project config, so listViewDomains (Settings' list) reports
+      // what the story approved.
+      approveViewDomains: (input: {
+        toolCallId: string;
+        serverName: string;
+        origins: string[];
+      }) => {
+        if (mcpApps?.approveViewDomainsError != null) {
+          return Promise.resolve({
+            success: false as const,
+            error: mcpApps.approveViewDomainsError,
+          });
+        }
+        const view = mcpApps?.views[input.toolCallId];
+        const entry = {
+          projectPath: view?.approvalProjectPath ?? "",
+          serverName: view?.invocation?.serverName ?? input.serverName,
+          origins: [] as string[],
+        };
+        const key = JSON.stringify([entry.projectPath, entry.serverName]);
+        entry.origins = [
+          ...new Set([...(mockViewDomains.get(key)?.origins ?? []), ...input.origins]),
+        ];
+        mockViewDomains.set(key, entry);
+        return Promise.resolve({
+          success: true as const,
+          data: { approvedDomains: entry.origins, revision: ++mockViewDomainsRevision },
+        });
+      },
+      setWidgetState: () => Promise.resolve({ success: true as const, data: {} }),
+      listViewDomains: () =>
+        options.mcpAppViewDomainsListError != null
+          ? Promise.reject(new Error(options.mcpAppViewDomainsListError))
+          : Promise.resolve([...mockViewDomains.values()]),
+      readViewDomains: () =>
+        Promise.resolve({
+          revision: ++mockViewDomainsRevision,
+          approvals: [...mockViewDomains.values()],
+        }),
+      revokeViewDomains: (input: { projectPath: string; serverName: string }) => {
+        mockViewDomains.delete(JSON.stringify([input.projectPath, input.serverName]));
+        return Promise.resolve({ revision: ++mockViewDomainsRevision });
+      },
+      // Story views are always in the story transcript, so no record lookup finds one.
+      getViewRecords: (input: { toolCallIds: string[] }) =>
+        Promise.resolve({
+          success: true as const,
+          data: input.toolCallIds.map((toolCallId) => ({ toolCallId, view: null })),
+        }),
+      callTool: (input: { toolName: string; consented: boolean }) =>
+        Promise.resolve({
+          success: true as const,
+          data: mcpApps?.callTool?.(input) ?? {
+            status: "rejected" as const,
+            reason: `Unknown tool: ${input.toolName}`,
+          },
+        }),
+    },
+    agentResourceLimits: {
+      get: () => Promise.resolve(agentResourceLimitsState),
+      set: (limits: AgentResourceLimits) => {
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          agentResourceLimitsState.enabled,
+          limits,
+          agentResourceLimitsState.projects
+        );
+        return Promise.resolve(agentResourceLimitsState);
+      },
+      setEnabled: ({ enabled }: { enabled: boolean }) => {
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          enabled,
+          agentResourceLimitsState.limits,
+          agentResourceLimitsState.projects
+        );
+        return Promise.resolve(agentResourceLimitsState);
+      },
+      setProject: ({
+        projectPath,
+        limits,
+      }: {
+        projectPath: string;
+        limits: AgentResourceLimits;
+      }) => {
+        const projects = { ...agentResourceLimitsState.projects };
+        if (limits.cpuCores === undefined && limits.memoryGiB === undefined) {
+          delete projects[projectPath];
+        } else {
+          projects[projectPath] = { limits };
+        }
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          agentResourceLimitsState.enabled,
+          agentResourceLimitsState.limits,
+          projects
+        );
+        return Promise.resolve(agentResourceLimitsState);
+      },
     },
     // Memory curation surfaces (Memory tab / Settings → Memory). Backed by
     // the `memoryFiles` option; mutations update the in-memory set so
@@ -2014,20 +2807,57 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         await new Promise<void>(() => undefined);
       },
     },
-    muxGovernorOauth: {
-      startDesktopFlow: () =>
-        Promise.resolve({
-          success: true as const,
-          value: {
-            flowId: "mock-flow-id",
-            authorizeUrl: "https://governor.example.com/oauth/authorize",
-            redirectUri: "http://localhost:12345/callback",
-          },
-        }),
-      waitForDesktopFlow: () =>
-        // Never resolves - user would complete in browser
-        new Promise(() => undefined),
-      cancelDesktopFlow: () => Promise.resolve(undefined),
-    },
   } as unknown as APIClient;
+}
+
+function mockAgentResourceLimitsState(
+  enabled: boolean,
+  limits: AgentResourceLimits,
+  savedProjects: AgentResourceLimitsState["projects"] = {}
+): AgentResourceLimitsState {
+  const limited =
+    enabled &&
+    (limits.cpuCores !== undefined ||
+      limits.memoryGiB !== undefined ||
+      Object.keys(savedProjects).length > 0);
+  // Like the backend: a project's cgroup shows only while the limits are active.
+  const projects: AgentResourceLimitsState["projects"] = {};
+  for (const [projectPath, project] of Object.entries(savedProjects)) {
+    projects[projectPath] = limited
+      ? { limits: project.limits, cgroup: `/xum/xum-agents/p-${projectPath.length}` }
+      : { limits: project.limits };
+  }
+  return {
+    enabled,
+    limits,
+    projects,
+    status: limited ? { state: "active", cgroup: "/xum/xum-agents" } : { state: "off" },
+    support: { state: "ready", cgroup: "/xum" },
+  };
+}
+
+/** The layout tool item of a settings tool action, in the server's current mock settings. */
+function mockSettingsToolItem(
+  settings: Map<string, MCPSettingsSnapshot> | undefined,
+  input: { serverName: string; toolName: string }
+) {
+  for (const group of settings?.get(input.serverName)?.layout ?? [])
+    for (const item of group.items)
+      if (item.kind === "tool" && item.tool === input.toolName) return item;
+  return undefined;
+}
+
+/** The backend's confirmation rule: a tool that is not read-only runs only when confirmed. */
+function mockSettingsToolRefusal(
+  settings: Map<string, MCPSettingsSnapshot> | undefined,
+  input: { serverName: string; toolName: string; confirmed: boolean }
+): string | null {
+  const action = mockSettingsToolItem(settings, input)?.action;
+  if (action === undefined || action.readOnly || input.confirmed) return null;
+  return `'${action.title}' runs only after a confirmation`;
+}
+
+/** The mock's settings servers never restart: one instance token per server name. */
+function mockSettingsToken(serverName: string): string {
+  return `mock-instance:${serverName}`;
 }

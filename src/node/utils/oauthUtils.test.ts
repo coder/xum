@@ -157,26 +157,6 @@ describe("renderOAuthCallbackHtml", () => {
     expect(html).toContain("<p>&lt;b&gt;Error detail&lt;/b&gt;</p>");
   });
 
-  it("includes extraHead when provided", () => {
-    const html = renderOAuthCallbackHtml({
-      title: "Test",
-      message: "msg",
-      success: true,
-      extraHead: '<link rel="stylesheet" href="/style.css">',
-    });
-    expect(html).toContain('<link rel="stylesheet" href="/style.css">');
-  });
-
-  it("omits extraHead when not provided", () => {
-    const html = renderOAuthCallbackHtml({
-      title: "Test",
-      message: "msg",
-      success: true,
-    });
-    // No extra link tag should be present
-    expect(html).not.toContain('<link rel="stylesheet"');
-  });
-
   it("shows different muted text for success vs failure", () => {
     const successHtml = renderOAuthCallbackHtml({
       title: "T",
@@ -188,8 +168,8 @@ describe("renderOAuthCallbackHtml", () => {
       message: "M",
       success: false,
     });
-    expect(successHtml).toContain("Shux should now be in the foreground");
-    expect(failureHtml).not.toContain("Shux should now be in the foreground");
+    expect(successHtml).toContain("Xum should now be in the foreground");
+    expect(failureHtml).not.toContain("Xum should now be in the foreground");
     expect(failureHtml).toContain("You can close this tab.");
   });
 });

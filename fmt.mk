@@ -3,11 +3,13 @@
 # This file contains all code formatting logic.
 # Included by the main Makefile.
 
-.PHONY: fmt fmt-check fmt-prettier fmt-prettier-check fmt-shell fmt-shell-check fmt-nix fmt-nix-check fmt-python fmt-python-check fmt-sync-docs fmt-sync-docs-check update-flake-hash flake-hash-check
+.PHONY: fmt fmt-check fmt-prettier fmt-prettier-check fmt-shell fmt-shell-check fmt-nix fmt-nix-check fmt-python fmt-python-check fmt-sync-docs fmt-sync-docs-check
 
 # Centralized patterns - single source of truth
 PRETTIER_PATTERNS := 'src/**/*.{ts,tsx,json}' 'src/node/workflowRuntime/*.js' 'scripts/lib/*.js' 'tests/**/*.ts' 'docs/**/*.mdx' 'package.json' 'tsconfig*.json' 'README.md'
-SHELL_SCRIPTS := scripts
+# shfmt also walks node_modules trees (scripts/mintlify/node_modules holds Mintlify's own
+# scripts), so the recipes format only the shell files it finds outside them.
+SHELL_SCRIPTS = $$(shfmt -f scripts | grep -v '/node_modules/')
 PYTHON_DIRS := benchmarks
 
 # Always use bun x prettier for reproducibility (uses package.json version)
@@ -16,7 +18,8 @@ PRETTIER := bun x prettier
 # Tool availability checks
 SHFMT := $(shell command -v shfmt 2>/dev/null)
 NIX := $(shell command -v nix 2>/dev/null)
-UVX := $(shell command -v uvx 2>/dev/null || (test -x $(HOME)/.local/bin/uvx && echo $(HOME)/.local/bin/uvx))
+NIX_FILES := flake.nix nix/package.nix
+UV := $(shell command -v uv 2>/dev/null || (test -x $(HOME)/.local/bin/uv && echo $(HOME)/.local/bin/uv))
 
 fmt: fmt-prettier fmt-shell fmt-python fmt-nix fmt-sync-docs
 	@echo "==> All formatting complete!"
@@ -50,20 +53,21 @@ else
 	@shfmt -i 2 -ci -bn -d $(SHELL_SCRIPTS)
 endif
 
-# Helper target to check for uvx
-.check-uvx:
-ifeq ($(UVX),)
-	@echo "Error: uvx not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh"
+# Helper target to check for uv
+.check-uv:
+ifeq ($(UV),)
+	@echo "Error: uv not found. Install it: https://docs.astral.sh/uv/getting-started/installation/"
 	@exit 1
 endif
 
-fmt-python: .check-uvx
+# ruff comes from the ruff group in pyproject.toml, installed as uv.lock pins it.
+fmt-python: .check-uv
 	@echo "Formatting Python files..."
-	@$(UVX) ruff format --quiet $(PYTHON_DIRS)
+	@$(UV) run --locked --quiet --only-group ruff ruff format --quiet $(PYTHON_DIRS)
 
-fmt-python-check: .check-uvx
+fmt-python-check: .check-uv
 	@echo "Checking Python formatting..."
-	@$(UVX) ruff format --quiet --check $(PYTHON_DIRS)
+	@$(UV) run --locked --quiet --only-group ruff ruff format --quiet --check $(PYTHON_DIRS)
 
 fmt-nix:
 ifeq ($(NIX),)
@@ -71,8 +75,8 @@ ifeq ($(NIX),)
 else ifeq ($(wildcard flake.nix),)
 	@echo "flake.nix not found; skipping Nix formatting"
 else
-	@echo "Formatting Nix flake..."
-	@nix fmt -- flake.nix
+	@echo "Formatting Nix files..."
+	@nix fmt -- $(NIX_FILES)
 endif
 
 fmt-nix-check:
@@ -81,42 +85,26 @@ ifeq ($(NIX),)
 else ifeq ($(wildcard flake.nix),)
 	@echo "flake.nix not found; skipping Nix format check"
 else
-	@echo "Checking flake.nix formatting..."
+	@echo "Checking Nix formatting..."
 	@tmp_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/fmt-nix-check.XXXXXX"); \
 	trap "rm -rf $$tmp_dir" EXIT; \
-	cp flake.nix flake.lock package.json bun.lock "$$tmp_dir/"; \
-	(cd "$$tmp_dir" && nix fmt -- flake.nix >/dev/null 2>&1); \
-	if ! cmp -s flake.nix "$$tmp_dir/flake.nix"; then \
-		echo "flake.nix is not formatted correctly. Run 'make fmt-nix' to fix."; \
-		diff -u flake.nix "$$tmp_dir/flake.nix" || true; \
-		exit 1; \
-	fi
-endif
-
-update-flake-hash: ## Update flake.nix offlineCache outputHash from nix build output
-ifeq ($(NIX),)
-	@echo "Nix not found; skipping flake hash update"
-else ifeq ($(wildcard flake.nix),)
-	@echo "flake.nix not found; skipping flake hash update"
-else
-	@./scripts/update_flake_hash.sh
-endif
-
-flake-hash-check: ## Verify flake.nix offlineCache outputHash is current
-ifeq ($(NIX),)
-	@echo "Nix not found; skipping flake hash check"
-else ifeq ($(wildcard flake.nix),)
-	@echo "flake.nix not found; skipping flake hash check"
-else
-	@./scripts/update_flake_hash.sh --check
+	cp -r flake.nix flake.lock package.json bun.lock nix "$$tmp_dir/"; \
+	(cd "$$tmp_dir" && nix fmt -- $(NIX_FILES) >/dev/null 2>&1); \
+	for f in $(NIX_FILES); do \
+		if ! cmp -s "$$f" "$$tmp_dir/$$f"; then \
+			echo "$$f is not formatted correctly. Run 'make fmt-nix' to fix."; \
+			diff -u "$$f" "$$tmp_dir/$$f" || true; \
+			exit 1; \
+		fi; \
+	done
 endif
 
 fmt-sync-docs:
 	@bun scripts/gen_docs.ts
-	@bun scripts/gen_builtin_skills.ts --sync-shux-docs-skill
+	@bun scripts/gen_builtin_skills.ts --sync-xum-docs-skill
 	@bun scripts/gen_workflow_runtime_sources.ts
 
 fmt-sync-docs-check:
 	@bun scripts/gen_docs.ts check
-	@bun scripts/gen_builtin_skills.ts check --sync-shux-docs-skill
+	@bun scripts/gen_builtin_skills.ts check --sync-xum-docs-skill
 	@bun scripts/gen_workflow_runtime_sources.ts check

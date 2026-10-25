@@ -8,6 +8,15 @@ module.exports = {
   testMatch: ["<rootDir>/src/**/*.test.ts", "<rootDir>/tests/**/*.test.ts"],
   collectCoverageFrom: [
     "src/**/*.ts",
+    // React code too: `make crap` and Quality / CRAP score .tsx functions from this
+    // lcov, and without .tsx records every component tests/ui exercises scores 0%.
+    "src/**/*.tsx",
+    // Storybook and bun:test files and their helpers are not app code.
+    "!src/**/*.stories.tsx",
+    "!src/browser/stories/**",
+    "!src/**/*StoryUtils.tsx",
+    "!src/**/*.test.tsx",
+    "!src/**/*.testHarness.tsx",
     "!src/**/*.d.ts",
     "!src/desktop/preload.ts",
     "!src/browser/api.ts",
@@ -23,6 +32,10 @@ module.exports = {
     // lottie-web probes canvas on import, which crashes in happy-dom/jsdom
     "^lottie-react$": "<rootDir>/tests/__mocks__/lottieReactMock.js",
     "^chalk$": "<rootDir>/tests/__mocks__/chalk.js",
+    // remend 1.4.0 ships only an ESM "import" export, which Jest's CJS resolver cannot pick.
+    // babel-jest transforms node_modules, so point it at the ESM file. Streamdown's nested
+    // remend copy resolves here too; Xum never lets Streamdown run it (parseIncompleteMarkdown).
+    "^remend$": "<rootDir>/node_modules/remend/dist/index.js",
     // Mock static assets for full App rendering
     "\\.css$": "<rootDir>/tests/__mocks__/styleMock.js",
     "\\.txt$": "<rootDir>/tests/__mocks__/textMock.js",
@@ -30,7 +43,13 @@ module.exports = {
   },
   // Storybook UI tests and the DOM-harness isolation guards use bun:test and
   // are run via `bun test`, so Jest must skip them.
-  testPathIgnorePatterns: ["<rootDir>/tests/ui/storybook/", "<rootDir>/tests/ui/domIsolation\\.test\\.ts"],
+  // tests/bugbash/ and tests/stories/ unit tests run under bun (test-unit-ci.sh tooling roots).
+  testPathIgnorePatterns: [
+    "<rootDir>/tests/ui/storybook/",
+    "<rootDir>/tests/ui/domIsolation\\.test\\.ts",
+    "<rootDir>/tests/bugbash/",
+    "<rootDir>/tests/stories/",
+  ],
   // Avoid haste module collision with vscode extension
   modulePathIgnorePatterns: ["<rootDir>/vscode/"],
   transform: {
@@ -44,6 +63,12 @@ module.exports = {
     "node_modules/(?!\\.pnpm)(?!.*)",
   ],
   maxWorkers,
+  // Integration suites leak memory across test files (app harnesses, DuckDB analytics
+  // workers), so a long-lived worker accumulates heap until it dies at V8's ~4GB cap
+  // ("Jest worker ran out of memory and crashed", PR #3939 CI run 32720490232). The
+  // fewer workers the budget selects, the more files each one runs and the sooner it
+  // crashes. Recycle any worker still holding >2GB when idle between test files.
+  workerIdleMemoryLimit: "2GB",
   // Force exit after tests complete to avoid hanging on lingering handles
   forceExit: true,
   // 10 minute timeout for integration tests, 10s for unit tests

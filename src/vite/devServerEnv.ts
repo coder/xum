@@ -1,4 +1,4 @@
-import { resolveShuxEnvironmentValue, type ShuxEnvironment } from "../common/compat/shuxEnv";
+import { resolveXumEnvironmentValue, type XumEnvironment } from "../common/compat/xumEnv";
 
 export const DEFAULT_VITE_DEV_HOST = "127.0.0.1";
 export const DEFAULT_VITE_DEV_PORT = 5173;
@@ -44,28 +44,27 @@ function parseAllowedHosts(raw: string | undefined, host: string): true | string
   return defaults;
 }
 
-/** Resolve Vite/dev-server env with SHUX_* winning over leftover MUX_* aliases. */
-export function resolveViteDevServerEnv(env: ShuxEnvironment): ViteDevServerEnv {
-  const host = resolveShuxEnvironmentValue("VITE_HOST", env) ?? DEFAULT_VITE_DEV_HOST;
-  const port = parsePort(resolveShuxEnvironmentValue("VITE_PORT", env), DEFAULT_VITE_DEV_PORT);
+/** Resolve Vite/dev-server env with XUM_* winning over leftover MUX_* aliases. */
+export function resolveViteDevServerEnv(env: XumEnvironment): ViteDevServerEnv {
+  const host = resolveXumEnvironmentValue("VITE_HOST", env) ?? DEFAULT_VITE_DEV_HOST;
+  const port = parsePort(resolveXumEnvironmentValue("VITE_PORT", env), DEFAULT_VITE_DEV_PORT);
   const previewPort = parsePort(
-    resolveShuxEnvironmentValue("VITE_PREVIEW_PORT", env),
+    resolveXumEnvironmentValue("VITE_PREVIEW_PORT", env),
     DEFAULT_VITE_PREVIEW_PORT
   );
-  const backendHost =
-    resolveShuxEnvironmentValue("BACKEND_HOST", env) ?? DEFAULT_BACKEND_PROXY_HOST;
+  const backendHost = resolveXumEnvironmentValue("BACKEND_HOST", env) ?? DEFAULT_BACKEND_PROXY_HOST;
   const backendPort = parsePort(
-    resolveShuxEnvironmentValue("BACKEND_PORT", env),
+    resolveXumEnvironmentValue("BACKEND_PORT", env),
     DEFAULT_BACKEND_PROXY_PORT
   );
 
   return {
     host,
     port,
-    allowedHosts: parseAllowedHosts(resolveShuxEnvironmentValue("VITE_ALLOWED_HOSTS", env), host),
+    allowedHosts: parseAllowedHosts(resolveXumEnvironmentValue("VITE_ALLOWED_HOSTS", env), host),
     previewPort,
     backendHost,
     backendPort,
-    enableTutorialsInSandbox: resolveShuxEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", env),
+    enableTutorialsInSandbox: resolveXumEnvironmentValue("ENABLE_TUTORIALS_IN_SANDBOX", env),
   };
 }

@@ -2,6 +2,8 @@ import fsPromises from "fs/promises";
 import path from "path";
 import { type Page, type TestInfo } from "@playwright/test";
 import type { CDPSession } from "playwright";
+import type { PageMilestones } from "./pageMilestones";
+import type { ChatSwitchPerfSummary } from "./chatSwitchSummary";
 
 const PERF_ARTIFACTS_ROOT = path.resolve(__dirname, "..", "..", "..", "artifacts", "perf");
 const DEFAULT_TRACE_CATEGORIES = [
@@ -166,11 +168,12 @@ export async function withChromeProfiles(
   const startedAt = new Date().toISOString();
   const startTime = Date.now();
 
-  let actionError: unknown;
+  // Boxed so a caught value keeps its `unknown` type (a truthiness check would narrow it).
+  let actionFailure: { error: unknown } | undefined;
   try {
     await action();
   } catch (error) {
-    actionError = error;
+    actionFailure = { error };
   }
 
   const endedAt = new Date().toISOString();
@@ -211,8 +214,8 @@ export async function withChromeProfiles(
     ]);
   }
 
-  if (actionError) {
-    throw actionError;
+  if (actionFailure) {
+    throw actionFailure.error;
   }
 
   return {
@@ -267,6 +270,19 @@ export async function readReactProfileSnapshot(
   });
 }
 
+export interface TapeReplayPerfSummary {
+  /** Events on the replayed tape. */
+  eventCount: number;
+  /** The tape's recorded duration (trailer offset). */
+  durationMs: number;
+  /** From the workspace click until the first history row rendered. */
+  firstRowMs: number;
+  /** From the workspace click until the streamed turn's final text rendered. */
+  lastRowMs: number;
+  /** Probe image requests the renderer egress block cancelled. */
+  blockedRequests: number;
+}
+
 async function writeJsonFile(filePath: string, payload: unknown): Promise<void> {
   await fsPromises.writeFile(filePath, JSON.stringify(payload, null, 2), "utf-8");
 }
@@ -277,6 +293,12 @@ export async function writePerfArtifacts(args: {
   chromeProfile: ChromeProfileCapture;
   reactProfile: unknown;
   historyProfile: unknown;
+  /** In-page milestone timings, for scenarios that record them (see pageMilestones.ts). */
+  milestones?: PageMilestones;
+  /** Per-switch chat-switch timings and medians (perf.chatSwitch.spec.ts, #4504). */
+  chatSwitch?: ChatSwitchPerfSummary;
+  /** Session tape replay timings (perf.tapeReplay.spec.ts). */
+  tapeReplay?: TapeReplayPerfSummary;
 }): Promise<string> {
   const timestamp = new Date().toISOString().replace(/[.:]/g, "-");
   const runDirName = `${sanitizeForPath(args.runLabel)}-${timestamp}`;
@@ -308,6 +330,10 @@ export async function writePerfArtifacts(args: {
       retry: args.testInfo.retry,
     },
     historyProfile: args.historyProfile,
+    // Additive field: schemaVersion stays 1 because existing readers ignore unknown keys.
+    ...(args.milestones ? { milestones: args.milestones } : {}),
+    ...(args.chatSwitch ? { chatSwitch: args.chatSwitch } : {}),
+    ...(args.tapeReplay ? { tapeReplay: args.tapeReplay } : {}),
     chromeProfile: {
       label: args.chromeProfile.label,
       startedAt: args.chromeProfile.startedAt,

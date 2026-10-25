@@ -25,7 +25,7 @@ import {
  * InstructionsService — exposes the instruction context (AGENTS.md, CLAUDE.md,
  * AGENTS.local.md, …) loaded for a workspace as a structured payload.
  *
- * Sharing types with `buildSystemMessage` (via `@/common/types/instructions`)
+ * Sharing types with `buildSystemMessageFromSources` (via `@/common/types/instructions`)
  * guarantees the right-sidebar Instructions tab and the actual prompt builder
  * stay in lockstep — the same `InstructionFile`s the panel renders are the
  * ones the agent sees.
@@ -88,7 +88,8 @@ export class InstructionsService {
       metadata,
       runtime,
       workspaceRootPath,
-      this.config.loadConfigOrDefault().projects
+      this.config.loadConfigOrDefault().projects,
+      this.aiService.isClaudeSkillsCompatEnabled()
     );
 
     const trimmedOverride = modelOverride?.trim();
@@ -131,7 +132,7 @@ export class InstructionsService {
     });
 
     const annotatedSources: InstructionSources = {
-      global: sources.global ? annotateSet(sources.global) : null,
+      global: sources.global.map(annotateSet),
       context: sources.context.map(annotateSet),
     };
     const annotatedFiles = flattenInstructionFiles(annotatedSources);

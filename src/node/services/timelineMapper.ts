@@ -12,6 +12,7 @@ import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { GOAL_BUDGET_LIMIT_KIND, GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { classifyMachineTurnPromptKind } from "@/common/utils/machineTurnPrompts";
 import { getContextBoundaryKind } from "@/common/utils/messages/compactionBoundary";
+import { isPlanReviewRecordMessage } from "@/common/utils/planReview/planReviewEnvelope";
 import {
   SUBAGENT_FAILURE_ENVELOPE_TAG,
   parseSubagentReportEnvelope,
@@ -233,7 +234,7 @@ function mapMessage(
   const epoch = event.metadata?.compactionEpoch;
 
   if (event.role === "user") {
-    // A /compact request is persisted as a user message, but it is Shux asking for a summary, not a
+    // A /compact request is persisted as a user message, but it is Xum asking for a summary, not a
     // prompt the human wrote, so it must not appear among their prompts.
     if (readMuxMetadataField(event.metadata, "type") === "compaction-request") {
       const compactionSource = readMuxMetadataField(event.metadata, "source");
@@ -248,6 +249,12 @@ function mapMessage(
           ...(compactionSource != null ? { data: { reason: compactionSource } } : {}),
         },
       ];
+    }
+
+    // Snapshot/resolve/reopen records are state-only UI rows, not turns; authentic feedback is a
+    // real user message and stays on the feed.
+    if (isPlanReviewRecordMessage(event)) {
+      return [];
     }
 
     const machineAuthored = isMachineAuthoredTurn(event.metadata);

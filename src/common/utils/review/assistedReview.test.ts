@@ -1,12 +1,11 @@
 import { describe, expect, it } from "bun:test";
-import type { DiffHunk } from "@/common/types/review";
+import type { AssistedReviewHunk, DiffHunk } from "@/common/types/review";
 import {
+  buildAssistedReviewPathCandidates,
   deriveProjectRelativePath,
   findAssistedCandidateMatch,
-  findAssistedMatch,
   formatAssistedFilter,
   getToolPathProjectRelativeCandidates,
-  hunkMatchesAssisted,
   normalizeAssistedReviewHunk,
   normalizeToolPathToProjectRelative,
   parseAssistedFilter,
@@ -143,40 +142,40 @@ describe("parseAssistedFilter", () => {
   });
 });
 
-describe("hunkMatchesAssisted", () => {
+describe("findAssistedCandidateMatch", () => {
+  const findMatch = (hunk: DiffHunk, assisted: AssistedReviewHunk[]) =>
+    findAssistedCandidateMatch(hunk, buildAssistedReviewPathCandidates(assisted));
+
   it("matches whole-file filter regardless of range", () => {
-    expect(hunkMatchesAssisted(baseHunk(), { path: "src/foo.ts" })).toBe(true);
+    expect(findMatch(baseHunk(), [{ path: "src/foo.ts" }])?.index).toBe(0);
   });
 
   it("matches overlapping new-side range", () => {
     expect(
-      hunkMatchesAssisted(baseHunk(), { path: "src/foo.ts", range: { start: 12, end: 13 } })
-    ).toBe(true);
+      findMatch(baseHunk(), [{ path: "src/foo.ts", range: { start: 12, end: 13 } }])
+    ).not.toBeNull();
   });
 
   it("rejects non-overlapping range", () => {
     expect(
-      hunkMatchesAssisted(baseHunk(), { path: "src/foo.ts", range: { start: 100, end: 200 } })
-    ).toBe(false);
+      findMatch(baseHunk(), [{ path: "src/foo.ts", range: { start: 100, end: 200 } }])
+    ).toBeNull();
   });
 
   it("falls back to old-side span for pure deletions", () => {
     const deletion = baseHunk({ newLines: 0, oldStart: 50, oldLines: 4 });
     expect(
-      hunkMatchesAssisted(deletion, { path: "src/foo.ts", range: { start: 52, end: 52 } })
-    ).toBe(true);
+      findMatch(deletion, [{ path: "src/foo.ts", range: { start: 52, end: 52 } }])
+    ).not.toBeNull();
   });
 
   it("matches via oldPath when file was renamed", () => {
     const renamed = baseHunk({ filePath: "src/new.ts", oldPath: "src/old.ts" });
-    expect(hunkMatchesAssisted(renamed, { path: "src/old.ts" })).toBe(true);
+    expect(findMatch(renamed, [{ path: "src/old.ts" }])?.entry.path).toBe("src/old.ts");
   });
-});
 
-describe("findAssistedMatch", () => {
   it("returns first match with its declared index", () => {
-    const hunk = baseHunk();
-    const result = findAssistedMatch(hunk, [
+    const result = findMatch(baseHunk(), [
       { path: "src/other.ts" },
       { path: "src/foo.ts", range: { start: 10, end: 14 }, comment: "Look here" },
       { path: "src/foo.ts" },
@@ -186,7 +185,7 @@ describe("findAssistedMatch", () => {
   });
 
   it("returns null when nothing matches", () => {
-    expect(findAssistedMatch(baseHunk(), [{ path: "src/other.ts" }])).toBeNull();
+    expect(findMatch(baseHunk(), [{ path: "src/other.ts" }])).toBeNull();
   });
 });
 

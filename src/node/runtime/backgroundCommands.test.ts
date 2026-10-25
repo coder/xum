@@ -1,6 +1,8 @@
-import { describe, it, expect } from "bun:test";
-import { execSync } from "child_process";
+import { afterEach, beforeEach, describe, it, expect } from "bun:test";
+import { execFileSync, execSync, spawnSync } from "child_process";
 import * as fs from "fs/promises";
+import * as os from "os";
+import * as path from "path";
 import {
   shellQuote,
   buildWrapperScript,
@@ -9,6 +11,7 @@ import {
   parseExitCode,
   parsePid,
 } from "./backgroundCommands";
+import { MISSING_CWD_COMMANDS, MULTI_LINE_COMMAND_CASES } from "./testRemoteRuntime";
 
 describe("backgroundCommands", () => {
   describe("shellQuote", () => {
@@ -34,15 +37,14 @@ describe("backgroundCommands", () => {
   });
 
   describe("buildWrapperScript", () => {
-    it("builds script with trap, cd, and user script joined by &&", () => {
+    it("builds script with trap and cd joined by &&, then runs the script argument in a child bash", () => {
       const result = buildWrapperScript({
         exitCodePath: "/tmp/exit_code",
         cwd: "/home/user/project",
-        script: "echo hello",
       });
 
       expect(result).toBe(
-        `__MUX_EXIT_CODE_PATH='/tmp/exit_code' && trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT && cd '/home/user/project' && echo hello`
+        `__MUX_EXIT_CODE_PATH='/tmp/exit_code' && set -- "$1" "$0" "$BASH" && trap 'echo $? > "$__MUX_EXIT_CODE_PATH"' EXIT && trap 'exit 143' TERM && cd '/home/user/project' || exit; trap 'exit $?' TERM; "$3" -c "$1" "$2"`
       );
     });
 
@@ -51,7 +53,6 @@ describe("backgroundCommands", () => {
         exitCodePath: "/tmp/exit_code",
         cwd: "/home/user",
         env: { FOO: "bar", BAZ: "qux" },
-        script: "env",
       });
 
       expect(result).toContain("export FOO='bar'");
@@ -62,7 +63,6 @@ describe("backgroundCommands", () => {
       const result = buildWrapperScript({
         exitCodePath: "/tmp/my dir/exit_code",
         cwd: "/home/user/my project",
-        script: "ls",
       });
 
       expect(result).toContain("'/tmp/my dir/exit_code'");
@@ -78,7 +78,6 @@ describe("backgroundCommands", () => {
       const result = buildWrapperScript({
         exitCodePath,
         cwd: "/tmp",
-        script: "exit 42",
       });
 
       // The wrapper script should be valid bash - execute it and verify exit code is captured
@@ -87,7 +86,7 @@ describe("backgroundCommands", () => {
       await fs.rm(exitCodePath, { force: true });
 
       try {
-        execSync(`bash -c ${shellQuote(result)}`, { stdio: "pipe" });
+        execSync(`bash -c ${shellQuote(result)} bash 'exit 42'`, { stdio: "pipe" });
       } catch {
         // Expected - script exits with 42
       }
@@ -104,10 +103,68 @@ describe("backgroundCommands", () => {
         exitCodePath: "/tmp/exit_code",
         cwd: "/home",
         env: { MSG: "it's a test" },
-        script: "echo $MSG",
       });
 
       expect(result).toContain("export MSG='it'\"'\"'s a test'");
+    });
+
+    describe("multi-line scripts", () => {
+      let root: string;
+
+      beforeEach(async () => {
+        root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "bg-wrapper-lines-")));
+        await fs.mkdir(path.join(root, "workspace"));
+      });
+
+      afterEach(async () => {
+        await fs.rm(root, { recursive: true, force: true });
+      });
+
+      // Runs the wrapper the way buildSpawnCommand does, from `root`, which stands in for the
+      // spawn command's fallback cwd.
+      const runWrapper = async (script: string, cwd: string) => {
+        const exitCodePath = path.join(root, "exit_code");
+        const wrapper = buildWrapperScript({
+          exitCodePath,
+          cwd,
+          env: { XUM_TEST_VAR: "set" },
+        });
+        const child = spawnSync("bash", ["-c", wrapper, "bash", script], {
+          cwd: root,
+          encoding: "utf-8",
+        });
+        const recorded = await fs.readFile(exitCodePath, "utf-8");
+        return { status: child.status, stdout: child.stdout, recorded: recorded.trim() };
+      };
+
+      it.skipIf(process.platform === "win32")(
+        "a missing cwd fails the script instead of running later lines in the fallback cwd",
+        async () => {
+          for (const command of MISSING_CWD_COMMANDS) {
+            const result = await runWrapper(command, path.join(root, "missing"));
+            expect({
+              command,
+              failed: result.status !== 0,
+              recordedFailure: result.recorded !== "0",
+              stdout: result.stdout,
+            }).toEqual({ command, failed: true, recordedFailure: true, stdout: "" });
+          }
+        }
+      );
+
+      for (const c of MULTI_LINE_COMMAND_CASES) {
+        it.skipIf(process.platform === "win32")(
+          `keeps output and exit code: ${c.name}`,
+          async () => {
+            const result = await runWrapper(c.command, path.join(root, "workspace"));
+            expect(result).toEqual({
+              status: c.exitCode,
+              stdout: c.stdout,
+              recorded: String(c.exitCode),
+            });
+          }
+        );
+      }
     });
   });
 
@@ -115,6 +172,7 @@ describe("backgroundCommands", () => {
     it("uses set -m, nohup, unified output with 2>&1, and echoes PID", () => {
       const result = buildSpawnCommand({
         wrapperScript: "echo hello",
+        script: "true",
         outputPath: "/tmp/output.log",
       });
 
@@ -127,6 +185,7 @@ describe("backgroundCommands", () => {
     it("uses custom bash path (including paths with spaces)", () => {
       const result = buildSpawnCommand({
         wrapperScript: "echo hello",
+        script: "true",
         outputPath: "/tmp/output.log",
         bashPath: "/c/Program Files/Git/bin/bash.exe",
       });
@@ -134,13 +193,16 @@ describe("backgroundCommands", () => {
       expect(result).toContain("'/c/Program Files/Git/bin/bash.exe' -c");
     });
 
-    it("quotes the wrapper script", () => {
+    it("quotes the wrapper script and passes the quoted script after it as $1", () => {
       const result = buildSpawnCommand({
         wrapperScript: "echo 'hello world'",
+        script: "echo 'hi'",
         outputPath: "/tmp/output.log",
       });
 
-      expect(result).toContain("-c 'echo '\"'\"'hello world'\"'\"''");
+      expect(result).toContain(
+        "-c 'echo '\"'\"'hello world'\"'\"'' 'bash' 'echo '\"'\"'hi'\"'\"'' >"
+      );
     });
   });
 
@@ -168,6 +230,99 @@ describe("backgroundCommands", () => {
 
       expect(result).toContain('"$HOME/mux/exit_code"');
     });
+  });
+
+  // Spawns the script the way BackgroundProcessExecutor does and reads the exit_code file the
+  // monitor polls. A missing file reads as "running" until the lifetime timeout kills the process.
+  describe.skipIf(process.platform === "win32")("exit_code of a spawned script", () => {
+    let root: string;
+    let pids: number[];
+
+    beforeEach(async () => {
+      root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "bg-exit-code-")));
+      pids = [];
+    });
+
+    afterEach(async () => {
+      for (const pid of pids) {
+        try {
+          process.kill(-pid, "SIGKILL");
+        } catch {
+          // Already exited.
+        }
+      }
+      await fs.rm(root, { recursive: true, force: true });
+    });
+
+    const spawnScript = (script: string, env?: Record<string, string>) => {
+      const exitCodePath = path.join(root, "exit_code");
+      const outputPath = path.join(root, "output.log");
+      const spawnCommand = buildSpawnCommand({
+        wrapperScript: buildWrapperScript({ exitCodePath, cwd: root, env }),
+        script,
+        outputPath,
+      });
+      const pid = parsePid(execFileSync("bash", ["-c", spawnCommand], { encoding: "utf-8" }));
+      if (pid == null) throw new Error("the spawn command printed no PID");
+      pids.push(pid);
+      return { pid, exitCodePath, outputPath };
+    };
+
+    const waitForFile = async (filePath: string, contains: string): Promise<string | null> => {
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline) {
+        const content = await fs.readFile(filePath, "utf-8").catch(() => "");
+        if (content.includes(contains)) return content;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return null;
+    };
+
+    // Returns null when no code is recorded in time.
+    const recordedExitCode = async (exitCodePath: string) =>
+      parseExitCode((await waitForFile(exitCodePath, "\n")) ?? "");
+
+    const cases: ReadonlyArray<{ name: string; script: string; exitCode: number }> = [
+      { name: "exec as the last command", script: "exec sh -c 'exit 7'", exitCode: 7 },
+      {
+        name: "exec with a trailing comment",
+        script: "exec sh -c 'exit 7' # trailing comment",
+        exitCode: 7,
+      },
+      {
+        name: "exec with a trailing heredoc",
+        script: "exec sh -s <<'EOF'\nexit 6\nEOF",
+        exitCode: 6,
+      },
+      { name: "exit with a code", script: "echo before\nexit 5\necho after", exitCode: 5 },
+      { name: "a script with its own EXIT trap", script: "trap 'true' EXIT\nexit 4", exitCode: 4 },
+    ];
+
+    for (const c of cases) {
+      it(`records the exit code: ${c.name}`, async () => {
+        const { exitCodePath } = spawnScript(c.script);
+        expect(await recordedExitCode(exitCodePath)).toBe(c.exitCode);
+      });
+    }
+
+    it("runs the script with the wrapper's bash whatever the env exports", async () => {
+      // Env entries come from project secrets: none of them can pick the program that runs the
+      // script, or print its value in a "command not found" error.
+      const { exitCodePath, outputPath } = spawnScript("echo ran\nexit 3", {
+        BASH: "secret-value",
+        __MUX_BASH: "secret-value",
+        PATH: "/nonexistent",
+      });
+      expect(await recordedExitCode(exitCodePath)).toBe(3);
+      expect(await fs.readFile(outputPath, "utf-8")).toBe("ran\n");
+    });
+
+    it("records 143 when terminated during an exec", async () => {
+      const { pid, exitCodePath, outputPath } = spawnScript("echo started\nexec sleep 30");
+      expect(await waitForFile(outputPath, "started")).not.toBeNull();
+      execFileSync("bash", ["-c", buildTerminateCommand(pid, exitCodePath)]);
+      expect(await recordedExitCode(exitCodePath)).toBe(143);
+    }, 10000);
   });
 
   describe("parseExitCode", () => {

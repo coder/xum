@@ -1,4 +1,4 @@
-import React, {
+import {
   createContext,
   useCallback,
   useContext,
@@ -8,7 +8,9 @@ import React, {
   useState,
   type ReactNode,
 } from "react";
-import { readPersistedString, usePersistedState } from "@/browser/hooks/usePersistedState";
+import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
+import { updateUserPreferences, useAppConfig } from "@/browser/stores/AppConfigStore";
+import { ThemePreferenceSchema } from "@/common/config/schemas/userPreferences";
 import { UI_THEME_KEY } from "@/common/constants/storage";
 import { CHROME_COLORS } from "@/common/constants/chromeColors";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
@@ -25,27 +27,15 @@ export const THEME_OPTIONS: Array<{ value: ThemePreference; label: string }> = [
 ];
 
 const MANUAL_THEME_VALUES: ThemeMode[] = ["light", "dark", "flexoki-light", "flexoki-dark"];
-const THEME_PREFERENCE_VALUES = THEME_OPTIONS.map((theme) => theme.value);
 
-function normalizeThemePreference(value: unknown): ThemePreference | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
+/** The paint cache that index.html reads before React loads; config.json holds the preference. */
+function readCachedThemePreference(): ThemePreference {
+  const parsed = ThemePreferenceSchema.safeParse(readPersistedState<unknown>(UI_THEME_KEY, null));
+  return parsed.success ? parsed.data : "auto";
+}
 
-  if (THEME_PREFERENCE_VALUES.includes(value as ThemePreference)) {
-    return value as ThemePreference;
-  }
-
-  // Preserve intent for removed themes (e.g. legacy solarized-light/dark).
-  if (value.endsWith("-light")) {
-    return "light";
-  }
-
-  if (value.endsWith("-dark")) {
-    return "dark";
-  }
-
-  return undefined;
+function setTheme(themePreference: ThemePreference): void {
+  updateUserPreferences({ appearance: { theme: themePreference } });
 }
 
 interface ThemeContextValue {
@@ -53,7 +43,7 @@ interface ThemeContextValue {
   theme: ThemeMode;
   /** Persisted user preference shown in settings/selector (includes explicit `auto`). */
   themePreference: ThemePreference;
-  setTheme: React.Dispatch<React.SetStateAction<ThemePreference>>;
+  setTheme: (themePreference: ThemePreference) => void;
   toggleTheme: () => void;
   /** True if this provider has a forcedTheme - nested providers should not override */
   isForced: boolean;
@@ -134,19 +124,11 @@ export function ThemeProvider({
   const parentContext = useContext(ThemeContext);
   const isNestedUnderForcedProvider = parentContext?.isForced ?? false;
 
-  const [persistedThemePreference, setTheme] = usePersistedState<ThemePreference>(
-    UI_THEME_KEY,
-    "auto",
-    {
-      listener: true,
-    }
+  // undefined until the store's first snapshot, the only time the paint cache is read.
+  const serverThemePreference = useAppConfig(
+    (config) => config.userPreferences && (config.userPreferences.appearance?.theme ?? "auto")
   );
-
-  // Keep the explicit user preference (`auto`/manual) separate from the concrete theme we apply.
-  // This lets existing UI consumers keep using a resolved theme while settings can still show `auto`.
-  const storedThemePreference = readPersistedString(UI_THEME_KEY) ?? persistedThemePreference;
-  const parsedPersistedThemePreference = normalizeThemePreference(storedThemePreference);
-  const normalizedThemePreference = parsedPersistedThemePreference ?? "auto";
+  const normalizedThemePreference = serverThemePreference ?? readCachedThemePreference();
 
   const [systemTheme, setSystemTheme] = useState<"light" | "dark">(() => resolveSystemTheme());
 
@@ -209,33 +191,24 @@ export function ThemeProvider({
       return;
     }
 
-    // Self-heal legacy or invalid theme preferences persisted in localStorage.
-    if (forcedTheme === undefined && parsedPersistedThemePreference !== storedThemePreference) {
-      setTheme(normalizedThemePreference);
-    }
-
     applyThemeToDocument(theme);
-  }, [
-    forcedTheme,
-    isNestedUnderForcedProvider,
-    normalizedThemePreference,
-    parsedPersistedThemePreference,
-    setTheme,
-    storedThemePreference,
-    theme,
-  ]);
+  }, [isNestedUnderForcedProvider, theme]);
+
+  useEffect(() => {
+    if (serverThemePreference !== undefined) {
+      updatePersistedState(UI_THEME_KEY, serverThemePreference);
+    }
+  }, [serverThemePreference]);
 
   const toggleTheme = useCallback(() => {
     if (!isNestedUnderForcedProvider) {
-      setTheme((currentPreference) => {
-        const currentTheme = currentPreference === "auto" ? theme : currentPreference;
-        const currentIndex = MANUAL_THEME_VALUES.indexOf(currentTheme);
-        const safeCurrentIndex = currentIndex >= 0 ? currentIndex : 0;
-        const nextIndex = (safeCurrentIndex + 1) % MANUAL_THEME_VALUES.length;
-        return MANUAL_THEME_VALUES[nextIndex];
-      });
+      const currentTheme = themePreference === "auto" ? theme : themePreference;
+      const currentIndex = MANUAL_THEME_VALUES.indexOf(currentTheme);
+      const safeCurrentIndex = currentIndex >= 0 ? currentIndex : 0;
+      const nextIndex = (safeCurrentIndex + 1) % MANUAL_THEME_VALUES.length;
+      setTheme(MANUAL_THEME_VALUES[nextIndex]);
     }
-  }, [isNestedUnderForcedProvider, setTheme, theme]);
+  }, [isNestedUnderForcedProvider, theme, themePreference]);
 
   const value = useMemo<ThemeContextValue>(
     () => ({
@@ -245,7 +218,7 @@ export function ThemeProvider({
       toggleTheme,
       isForced,
     }),
-    [isForced, setTheme, theme, themePreference, toggleTheme]
+    [isForced, theme, themePreference, toggleTheme]
   );
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;

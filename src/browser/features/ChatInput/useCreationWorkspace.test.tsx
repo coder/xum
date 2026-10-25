@@ -1,30 +1,35 @@
-import type { APIClient } from "@/browser/contexts/API";
-import * as APIModule from "@/browser/contexts/API";
+import { getDraftStore } from "@/browser/stores/DraftStore";
+import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
+import { APIProvider, type APIClient } from "@/browser/contexts/API";
+import { createTestApiClient } from "@/browser/testUtils";
+import { createConnectionHarness, GAP_MODES } from "@/browser/contexts/connection.testHarness";
+import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import {
+  getAutoRoutingPick,
+  resetAiSelectionIntentForTests,
+  setAutoRoutingPick,
+  setWorkspaceAiMetadata,
+} from "@/browser/utils/aiSelectionIntent";
+import { getWorkspaceAiSelection } from "@/browser/utils/workspaceAiSettingsSync";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import type { UserPreferences } from "@/common/config/schemas/userPreferences";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as RouterContextModule from "@/browser/contexts/RouterContext";
 import type { DraftWorkspaceSettings } from "@/browser/hooks/useDraftWorkspaceSettings";
 import * as PersistedStateModule from "@/browser/hooks/usePersistedState";
 import * as DraftWorkspaceSettingsModule from "@/browser/hooks/useDraftWorkspaceSettings";
+import * as ChatCommandsModule from "@/browser/utils/chatCommands";
 import type { ProjectConfig } from "@/common/types/project";
 import {
-  GLOBAL_SCOPE_ID,
-  getAgentIdKey,
-  getInputKey,
-  getInputAttachmentsKey,
-  getModelKey,
-  getPendingScopeId,
   getPendingDraftSkillDiscoveryKey,
   getPendingWorkspaceSendErrorKey,
-  getProjectScopeId,
-  getThinkingLevelKey,
+  getCreationDraftScopeId,
 } from "@/common/constants/storage";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import type { DraftEvent, DraftUpdateInput } from "@/common/orpc/schemas/drafts";
+import { toDraftAttachmentMetadata } from "@/common/utils/drafts";
 
-import {
-  CODER_RUNTIME_PLACEHOLDER,
-  type CoderWorkspaceConfig,
-  type ParsedRuntime,
-} from "@/common/types/runtime";
+import type { CoderWorkspaceConfig, ParsedRuntime } from "@/common/types/runtime";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import type {
   FrontendWorkspaceMetadata,
@@ -32,6 +37,7 @@ import type {
 } from "@/common/types/workspace";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { restoreDomGlobals, saveDomGlobals } from "../../../../tests/ui/domGlobals";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { isInitialStagingLocked } from "@/browser/features/ChatInput/initialStagingLock";
 import { GlobalWindow } from "happy-dom";
@@ -39,8 +45,67 @@ import type { PendingFileChatAttachment } from "./ChatAttachments";
 import type { WorkspaceCreatedOptions } from "./types";
 import { useCreationWorkspace, type CreationSendResult } from "./useCreationWorkspace";
 
+// Composer drafts live in the (singleton) draft store; each test starts from empty drafts.
+const workspaceDraft = () =>
+  getDraftStore().getView({ kind: "workspace", workspaceId: TEST_WORKSPACE_ID });
+/** The creation composer's draft (null once Send deleted it). */
+let creationDraftId = "";
+const pendingDraft = () => getCreationDraftStore().getView(creationDraftId).draft;
+/** Draft texts the backend confirmed, by workspace id (the store's writes land here). */
+const savedWorkspaceDraftText = new Map<string, string>();
+/** Set to make the backend refuse workspace draft writes (a failed hand-off save). */
+let failWorkspaceDraftSaves = false;
+/** Holds creation draft saves (a slow flush at Send). */
+let creationSaveGate: Promise<void> | null = null;
+let failCreationSaves = false;
+const draftBackend = createTestApiClient({
+  drafts: {
+    subscribe: (_input: void, opts?: { signal?: AbortSignal }) =>
+      Promise.resolve(
+        (async function* (): AsyncGenerator<DraftEvent> {
+          yield { type: "snapshot", drafts: [] };
+          await new Promise<void>((resolve) =>
+            opts?.signal?.addEventListener("abort", () => resolve(), { once: true })
+          );
+        })()
+      ),
+    update: (input: DraftUpdateInput) => {
+      if (input.scope.kind === "workspace" && failWorkspaceDraftSaves) {
+        return Promise.reject(new Error("draft save failed"));
+      }
+      if (input.scope.kind === "workspace" && input.text !== undefined) {
+        savedWorkspaceDraftText.set(input.scope.workspaceId, input.text);
+      }
+      return Promise.resolve({
+        revision: Date.now(),
+        text: input.text ?? "",
+        attachments: (input.attachments ?? []).map(toDraftAttachmentMetadata),
+      });
+    },
+    delete: () => Promise.resolve({ revision: Date.now() }),
+    listCreation: () => Promise.resolve({ drafts: [] }),
+    updateCreation: async (input) => {
+      await creationSaveGate;
+      if (failCreationSaves) throw new Error("draft save refused");
+      return {
+        draftId: input.scope.draftId,
+        projectPath: input.projectPath ?? TEST_PROJECT_PATH,
+        subProjectPath: null,
+        createdAt: 0,
+        manualName: input.manualName ?? "",
+        preview: "",
+      };
+    },
+    deleteCreation: () => Promise.resolve(),
+  },
+});
+
 const readPersistedStateCalls: Array<[string, unknown]> = [];
 let persistedPreferences: Record<string, unknown> = {};
+
+function setPreferences(userPreferences: UserPreferences | undefined): void {
+  getAppConfigStore().updateOptimistically({ userPreferences });
+}
 const readPersistedStateMock = mock((key: string, defaultValue: unknown) => {
   readPersistedStateCalls.push([key, defaultValue]);
   if (Object.prototype.hasOwnProperty.call(persistedPreferences, key)) {
@@ -61,16 +126,17 @@ const readPersistedStateMock = mock((key: string, defaultValue: unknown) => {
 });
 
 const updatePersistedStateCalls: Array<[string, unknown]> = [];
-const updatePersistedStateMock = mock((key: string, value: unknown) => {
+const updatePersistedStateMock = mock((key: string, value: unknown): boolean => {
   updatePersistedStateCalls.push([key, value]);
   if (typeof window === "undefined" || !window.localStorage) {
-    return;
+    return false;
   }
   if (value === undefined || value === null) {
     window.localStorage.removeItem(key);
-    return;
+    return true;
   }
   window.localStorage.setItem(key, JSON.stringify(value));
+  return true;
 });
 
 const readPersistedStringMock = mock((key: string) => {
@@ -136,7 +202,6 @@ const useDraftWorkspaceSettingsMock = mock(
   }
 );
 
-const actualAPIModule = { ...APIModule };
 const actualDraftWorkspaceSettingsModule = { ...DraftWorkspaceSettingsModule };
 const actualProjectContextModule = { ...ProjectContextModule };
 const actualRouterContextModule = { ...RouterContextModule };
@@ -173,19 +238,6 @@ async function installUseCreationWorkspaceModuleMocks() {
       pendingSectionId: null,
       pendingDraftId: routerState.pendingDraftId,
     }),
-  }));
-  await mock.module("@/browser/contexts/API", () => ({
-    ...actualAPIModule,
-    useAPI: () => {
-      if (!currentORPCClient) {
-        return { api: null, status: "connecting" as const, error: null };
-      }
-      return {
-        api: currentORPCClient as APIClient,
-        status: "connected" as const,
-        error: null,
-      };
-    },
   }));
   await mock.module("@/browser/contexts/ProjectContext", () => ({
     ...actualProjectContextModule,
@@ -228,7 +280,6 @@ async function restoreUseCreationWorkspaceModuleMocks() {
     () => actualDraftWorkspaceSettingsModule
   );
   await mock.module("@/browser/contexts/RouterContext", () => actualRouterContextModule);
-  await mock.module("@/browser/contexts/API", () => actualAPIModule);
   await mock.module("@/browser/contexts/ProjectContext", () => actualProjectContextModule);
 }
 
@@ -459,6 +510,7 @@ const setupWindow = ({
         success: true,
         data: {
           name: "test-workspace",
+          title: "Test workspace",
           modelUsed: "anthropic:claude-haiku-4-5",
         },
       } as NameGenerationResult);
@@ -515,6 +567,9 @@ const setupWindow = ({
 
   const windowInstance = new GlobalWindow();
   globalThis.window = windowInstance as unknown as WindowWithApi;
+  // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+  // saveDomGlobals() in beforeEach puts the previous CustomEvent back.
+  globalThis.CustomEvent = windowInstance.CustomEvent as unknown as typeof CustomEvent;
   const windowWithApi = globalThis.window as WindowWithApi;
 
   const apiMock: WindowApi = {
@@ -642,32 +697,106 @@ describe("useCreationWorkspace", () => {
   });
 
   beforeEach(async () => {
+    saveDomGlobals();
     await installUseCreationWorkspaceModuleMocks();
     restorePersistedStateMocks = installPersistedStateMocks();
     mockProjectConfigMap = new Map([[TEST_PROJECT_PATH, { workspaces: [], trusted: true }]]);
     persistedPreferences = {};
+    setPreferences(undefined);
+    getAppConfigStore().updateOptimistically({ agentAiDefaults: undefined });
     readPersistedStateCalls.length = 0;
     updatePersistedStateCalls.length = 0;
     draftSettingsInvocations = [];
     draftSettingsState = createDraftSettingsHarness();
     routerState.currentWorkspaceId = null;
     routerState.currentProjectId = null;
-    routerState.pendingDraftId = null;
+    getDraftStore().forgetWorkspace(TEST_WORKSPACE_ID);
+    getCreationDraftStore().forgetProject(TEST_PROJECT_PATH);
+    savedWorkspaceDraftText.clear();
+    failWorkspaceDraftSaves = false;
+    creationSaveGate = null;
+    failCreationSaves = false;
+    getDraftStore().setClient(draftBackend);
+    await getDraftStore().whenReady();
+    getCreationDraftStore().setClient(draftBackend);
+    // The creation composer's draft (the routed one); a created workspace must clear it.
+    creationDraftId = getCreationDraftStore().create(TEST_PROJECT_PATH, null, {
+      text: "creation draft",
+    });
+    routerState.pendingDraftId = creationDraftId;
   });
 
   afterEach(async () => {
+    resetAiSelectionIntentForTests();
+    getAppConfigStore().updateOptimistically({ experiments: undefined });
+    getDraftStore().setClient(null);
+    getCreationDraftStore().setClient(null);
     cleanup();
     restorePersistedStateMocks?.();
     restorePersistedStateMocks = null;
     await restoreUseCreationWorkspaceModuleMocks();
     mock.restore();
     // Reset global window/document/localStorage between tests
-    // @ts-expect-error - test cleanup
-    globalThis.window = undefined;
-    // @ts-expect-error - test cleanup
-    globalThis.document = undefined;
-    // @ts-expect-error - test cleanup
-    globalThis.localStorage = undefined;
+    restoreDomGlobals();
+  });
+
+  // A reconnect reloads branches and runtime availability through the new client. The creation
+  // controls keep the shown values until the reload answers. `branchLoad` is the send barrier
+  // (#6033), so it is "loading" until the new branch list answers.
+  describe.each([...GAP_MODES])("reload after a reconnect (%s)", (mode) => {
+    test("keeps the shown branches and runtimes, and blocks the send, until the reload answers", async () => {
+      setupWindow({
+        listBranches: mock(() => Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })),
+      });
+      const harness = createConnectionHarness(mode, () => currentORPCClient ?? {});
+      const resultRef: { current: ReturnType<typeof useCreationWorkspace> | null } = {
+        current: null,
+      };
+      function Harness() {
+        resultRef.current = useCreationWorkspace({
+          projectPath: TEST_PROJECT_PATH,
+          onWorkspaceCreated: () => undefined,
+          message: "",
+        });
+        return null;
+      }
+      render(
+        <harness.Wrapper>
+          <Harness />
+        </harness.Wrapper>
+      );
+      await waitFor(() => expect(resultRef.current?.branchLoad).toBe("loaded"));
+      await waitFor(() =>
+        expect(resultRef.current?.runtimeAvailabilityState.status).toBe("loaded")
+      );
+
+      let answerBranches: (() => void) | null = null;
+      const branchesAnswered = new Promise<void>((resolve) => (answerBranches = resolve));
+      const previous = currentORPCClient;
+      if (!previous) throw new Error("setupWindow() sets the client");
+      currentORPCClient = {
+        ...previous,
+        projects: {
+          ...previous.projects,
+          listBranches: () =>
+            branchesAnswered.then(() => ({ branches: ["main", "next"], recommendedTrunk: "main" })),
+          runtimeAvailability: () => new Promise(() => undefined),
+        },
+      };
+      await harness.drop();
+      harness.reconnect();
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+      });
+
+      expect(resultRef.current?.branchLoad).toBe("loading");
+      expect(resultRef.current?.branches).toEqual(["main"]);
+      expect(resultRef.current?.runtimeAvailabilityState.status).toBe("loaded");
+
+      act(() => answerBranches?.());
+      await waitFor(() => expect(resultRef.current?.branches).toEqual(["main", "next"]));
+      expect(resultRef.current?.branchLoad).toBe("loaded");
+    });
   });
 
   test("loads branches when projectPath is provided", async () => {
@@ -841,7 +970,11 @@ describe("useCreationWorkspace", () => {
       (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
         Promise.resolve({
           success: true,
-          data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+          data: {
+            name: "generated-name",
+            title: "Generated name",
+            modelUsed: "anthropic:claude-haiku-4-5",
+          },
         } as NameGenerationResult)
     );
     const { workspaceApi, nameGenerationApi } = setupWindow({
@@ -851,9 +984,10 @@ describe("useCreationWorkspace", () => {
       nameGeneration: nameGenerationMock,
     });
 
-    persistedPreferences[getAgentIdKey(getProjectScopeId(TEST_PROJECT_PATH))] = "plan";
-    // Set model preference for the project scope (read by getSendOptionsFromStorage)
-    persistedPreferences[getModelKey(getProjectScopeId(TEST_PROJECT_PATH))] = "gpt-4";
+    // Project defaults are read by getSendOptionsFromStorage.
+    setPreferences({
+      ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "plan", model: "gpt-4" } } },
+    });
 
     draftSettingsState = createDraftSettingsHarness({
       selectedRuntime: { mode: "ssh", host: "example.com" },
@@ -870,15 +1004,14 @@ describe("useCreationWorkspace", () => {
 
     await waitFor(() => expect(getHook().branches).toEqual(["main"]));
 
-    // Wait for name generation to trigger (happens on debounce)
-    await waitFor(() => expect(nameGenerationApi.generate.mock.calls.length).toBe(1));
-
     let handleSendResult: CreationSendResult | undefined;
     await act(async () => {
       handleSendResult = await getHook().handleSend("launch workspace");
     });
 
     expect(handleSendResult).toEqual({ success: true });
+    // A non-worktree runtime waits for the generated name on Send.
+    expect(nameGenerationApi.generate.mock.calls.length).toBe(1);
 
     // workspace.create should be called with the generated name
     expect(workspaceApi.create.mock.calls.length).toBe(1);
@@ -892,7 +1025,7 @@ describe("useCreationWorkspace", () => {
     expect(createRequest?.runtimeConfig).toEqual({
       type: "ssh",
       host: "example.com",
-      // SSH remotes keep the stable ~/mux layout; local Shux home is separate.
+      // SSH remotes keep the stable ~/mux layout; local Xum home is separate.
       srcBaseDir: "~/mux",
     });
 
@@ -909,12 +1042,225 @@ describe("useCreationWorkspace", () => {
     await waitFor(() => expect(onWorkspaceCreated.mock.calls.length).toBe(1));
     expect(onWorkspaceCreated.mock.calls[0][0]).toEqual(TEST_METADATA);
 
-    const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);
-    const pendingInputKey = getInputKey(pendingScopeId);
-    const pendingImagesKey = getInputAttachmentsKey(pendingScopeId);
     // Thinking is workspace-scoped, but this test doesn't set a project-scoped thinking preference.
-    expect(updatePersistedStateCalls).toContainEqual([pendingInputKey, ""]);
-    expect(updatePersistedStateCalls).toContainEqual([pendingImagesKey, undefined]);
+    expect(pendingDraft()).toBeNull();
+  });
+
+  // Send waits for the draft to save: the composer is frozen from the start, and a second Send
+  // meanwhile creates nothing (a second workspace).
+  test("handleSend is frozen while the draft saves and refuses a second Send", async () => {
+    const { workspaceApi } = setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: mock(
+        (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+          Promise.resolve({ success: true as const, data: {} })
+      ),
+      create: mock(
+        (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+          Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+      ),
+    });
+    draftSettingsState = createDraftSettingsHarness({ selectedRuntime: { mode: "worktree" } });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+    const save = Promise.withResolvers<void>();
+    creationSaveGate = save.promise;
+    getCreationDraftStore().update(creationDraftId, { text: "launch workspace" });
+
+    // Two Enters before a render: both see the same (not yet sending) hook.
+    const handleSend = getHook().handleSend;
+    let first: Promise<CreationSendResult> | undefined;
+    let second: Promise<CreationSendResult> | undefined;
+    act(() => {
+      first = handleSend("launch workspace");
+      second = handleSend("launch workspace");
+    });
+    expect(getHook().isSending).toBe(true);
+    expect(workspaceApi.create.mock.calls.length).toBe(0);
+    await act(async () => {
+      save.resolve();
+      await first;
+    });
+
+    expect(await second).toEqual({ success: false });
+    expect(await first).toEqual({ success: true });
+    expect(workspaceApi.create.mock.calls.length).toBe(1);
+  });
+
+  test("a failed draft save stops the Send and keeps the draft", async () => {
+    const { workspaceApi } = setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+    });
+    draftSettingsState = createDraftSettingsHarness({ selectedRuntime: { mode: "worktree" } });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+    failCreationSaves = true;
+    getCreationDraftStore().update(creationDraftId, { text: "launch workspace" });
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("launch workspace");
+    });
+
+    expect(result).toEqual({ success: false });
+    expect(workspaceApi.create.mock.calls.length).toBe(0);
+    expect(pendingDraft()?.text).toBe("launch workspace");
+    expect(getHook().isSending).toBe(false);
+  });
+
+  test("handleSend uses a typed manual name as the branch and title", async () => {
+    const createMock = mock(
+      (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+        Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+    );
+    const { workspaceApi } = setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: mock(
+        (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+          Promise.resolve({ success: true as const, data: {} })
+      ),
+      create: createMock,
+    });
+    draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+    // Typing a name in the form: manual mode, then the text.
+    act(() => getHook().nameState.setAutoGenerate(false));
+    act(() => getHook().nameState.setName("my-feature"));
+
+    let handleSendResult: CreationSendResult | undefined;
+    await act(async () => {
+      handleSendResult = await getHook().handleSend("launch workspace");
+    });
+
+    expect(handleSendResult).toEqual({ success: true });
+    const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+    expect(createRequest?.branchName).toBe("my-feature");
+    expect(createRequest?.title).toBe("my-feature");
+    expect(createRequest?.nameGeneration).toBeUndefined();
+  });
+
+  describe("names the workspace on Send", () => {
+    const setupPendingName = (selectedRuntime: ParsedRuntime, message = "launch workspace") => {
+      const generation = Promise.withResolvers<NameGenerationResult>();
+      const nameGenerationMock = mock(
+        (_args: NameGenerationArgs): Promise<NameGenerationResult> => generation.promise
+      );
+      const { workspaceApi } = setupWindow({
+        listBranches: mock(
+          (): Promise<BranchListResult> =>
+            Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+        ),
+        sendMessage: mock(
+          (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+            Promise.resolve({ success: true as const, data: {} })
+        ),
+        create: mock(
+          (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+            Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+        ),
+        nameGeneration: nameGenerationMock,
+      });
+      draftSettingsState = createDraftSettingsHarness({ selectedRuntime, trunkBranch: "main" });
+      const getHook = renderUseCreationWorkspace({
+        projectPath: TEST_PROJECT_PATH,
+        onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+        message,
+      });
+      return { generation, nameGenerationMock, workspaceApi, getHook };
+    };
+    const generatedName: NameGenerationResult = {
+      success: true,
+      data: { name: "launch-a1b2", title: "Launch workspace", modelUsed: "test:model" },
+    };
+
+    test("a worktree creates at once and hands the naming to the backend", async () => {
+      const { nameGenerationMock, workspaceApi, getHook } = setupPendingName({ mode: "worktree" });
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+      let handleSendResult: CreationSendResult | undefined;
+      await act(async () => {
+        handleSendResult = await getHook().handleSend("launch workspace");
+      });
+
+      expect(handleSendResult).toEqual({ success: true });
+      const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+      expect(createRequest?.nameGeneration).toEqual({
+        message: "launch workspace",
+        candidates: [],
+      });
+      expect(createRequest?.branchName).toBeUndefined();
+      expect(createRequest?.title).toBeUndefined();
+      expect(nameGenerationMock.mock.calls.length).toBe(0);
+    });
+
+    test("an attachment-only send gets the fallback name, with no generation", async () => {
+      const { nameGenerationMock, workspaceApi, getHook } = setupPendingName(
+        { mode: "worktree" },
+        "Attached files: shot.png"
+      );
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+      const imagePart = {
+        type: "file" as const,
+        mediaType: "image/png",
+        url: "data:image/png;base64,iVBORw0KGgo=",
+        filename: "shot.png",
+      };
+      await act(async () => {
+        await getHook().handleSend("", [imagePart]);
+      });
+
+      const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+      expect(createRequest?.branchName).toBe("attached-files-shot-png");
+      expect(createRequest?.nameGeneration).toBeUndefined();
+      expect(nameGenerationMock.mock.calls.length).toBe(0);
+    });
+
+    test("a non-worktree runtime still waits for the generated name", async () => {
+      const { generation, nameGenerationMock, workspaceApi, getHook } = setupPendingName({
+        mode: "local",
+      });
+      await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+      let sendPromise: Promise<CreationSendResult> | undefined;
+      act(() => {
+        sendPromise = getHook().handleSend("launch workspace");
+      });
+      await waitFor(() => expect(nameGenerationMock.mock.calls.length).toBe(1));
+      expect(workspaceApi.create.mock.calls.length).toBe(0);
+
+      await act(async () => {
+        generation.resolve(generatedName);
+        await sendPromise;
+      });
+      const createRequest = workspaceApi.create.mock.calls[0]?.[0];
+      expect(createRequest?.branchName).toBe("launch-a1b2");
+      expect(createRequest?.title).toBe("Launch workspace");
+      expect(createRequest?.nameGeneration).toBeUndefined();
+    });
   });
 
   test("handleSend stages pending files after create and appends the attached-files notice", async () => {
@@ -1085,18 +1431,12 @@ describe("useCreationWorkspace", () => {
 
     // The transferred draft restores the original slash command so a retry
     // re-invokes the skill, and preserves the forced project-path discovery.
-    expect(updatePersistedStateCalls).toContainEqual([
-      getInputKey(TEST_WORKSPACE_ID),
-      "/review my files",
-    ]);
+    expect(workspaceDraft().text).toBe("/review my files");
     expect(updatePersistedStateCalls).toContainEqual([
       getPendingDraftSkillDiscoveryKey(TEST_WORKSPACE_ID),
       true,
     ]);
-    const attachmentsWrite = updatePersistedStateCalls.find(
-      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
-    );
-    expect(attachmentsWrite?.[1]).toEqual([
+    expect(workspaceDraft().attachments).toEqual([
       {
         kind: "staged",
         id: "p1",
@@ -1116,12 +1456,15 @@ describe("useCreationWorkspace", () => {
     // Navigation happens optimistically before staging; the pending-send
     // barrier is cleared once staging fails.
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
-    expect(onWorkspaceCreated.mock.calls[0][1]).toMatchObject({ markPendingInitialSend: true });
+    // The pending transcript row shows the typed command, not the rewritten skill text.
+    expect(onWorkspaceCreated.mock.calls[0][1]).toMatchObject({
+      markPendingInitialSend: true,
+      pendingUserMessage: { content: "/review my files" },
+    });
     expect(clearPendingInitialSendSpy.mock.calls).toContainEqual([TEST_WORKSPACE_ID]);
     clearPendingInitialSendSpy.mockRestore();
 
-    const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);
-    expect(updatePersistedStateCalls).toContainEqual([getInputKey(pendingScopeId), ""]);
+    expect(pendingDraft()).toBeNull();
   });
 
   test("handleSend transfers the staged draft when the first send fails after staging", async () => {
@@ -1163,14 +1506,8 @@ describe("useCreationWorkspace", () => {
 
     // Staged files live in the new workspace; the draft must be transferred so
     // the user can retry the send with the chips/notice intact.
-    expect(updatePersistedStateCalls).toContainEqual([
-      getInputKey(TEST_WORKSPACE_ID),
-      "send my files",
-    ]);
-    const attachmentsWrite = updatePersistedStateCalls.find(
-      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
-    );
-    expect(attachmentsWrite?.[1]).toEqual([
+    expect(workspaceDraft().text).toBe("send my files");
+    expect(workspaceDraft().attachments).toEqual([
       {
         kind: "staged",
         id: "p1",
@@ -1220,14 +1557,8 @@ describe("useCreationWorkspace", () => {
     expect(result).toMatchObject({ success: false });
     expect(workspaceApi.sendMessage.mock.calls.length).toBe(1);
 
-    expect(updatePersistedStateCalls).toContainEqual([
-      getInputKey(TEST_WORKSPACE_ID),
-      "send my files",
-    ]);
-    const attachmentsWrite = updatePersistedStateCalls.find(
-      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
-    );
-    expect(attachmentsWrite?.[1]).toEqual([
+    expect(workspaceDraft().text).toBe("send my files");
+    expect(workspaceDraft().attachments).toEqual([
       {
         kind: "staged",
         id: "p1",
@@ -1243,7 +1574,119 @@ describe("useCreationWorkspace", () => {
     expect(errorWrite?.[1]).toMatchObject({ type: "unknown", raw: "orpc disconnected" });
   });
 
-  test("handleSend keeps small retryable files when trimming an over-cap transfer", async () => {
+  test("handleSend hands a text-only draft to the new workspace when the first send fails", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({
+          success: false as const,
+          error: { type: "unknown", raw: "provider rejected the request" },
+        })
+    );
+    const { workspaceApi } = setupWindow({ sendMessage: sendMessageMock });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "fix the login bug",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("fix the login bug");
+    });
+
+    expect(result).toMatchObject({ success: false });
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(1);
+
+    // The user lands in the created workspace with nothing persisted; the text must be
+    // waiting in that composer so a model or provider fix can be followed by a plain resend.
+    expect(workspaceDraft().text).toBe("fix the login bug");
+    // The creation draft is already deleted: the hand-off is saved before handleSend returns
+    // (a hard close right after must not lose the prompt).
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("fix the login bug");
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({
+      type: "unknown",
+      raw: "provider rejected the request",
+    });
+  });
+
+  test("handleSend leaves a draft typed in the new workspace alone when the first send fails", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({
+          success: false as const,
+          error: { type: "unknown", raw: "provider rejected the request" },
+        })
+    );
+    setupWindow({ sendMessage: sendMessageMock });
+    // Text-only sends leave the new workspace composer unlocked while sendMessage waits on
+    // init, so the user may already have typed a follow-up there.
+    getDraftStore().setText({ kind: "workspace", workspaceId: TEST_WORKSPACE_ID }, "also check CI");
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "fix the login bug",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("fix the login bug");
+    });
+
+    expect(workspaceDraft().text).toBe("also check CI");
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({ type: "unknown" });
+  });
+
+  test("handleSend locks the new workspace composer while an image-bearing first send is in flight", async () => {
+    // Provider file parts are handed back to the workspace composer if the send fails, and that
+    // write replaces whatever attachments the composer holds, so the composer must be locked
+    // for the whole send exactly like a staged-files send.
+    const lockObservedDuringSend: boolean[] = [];
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> => {
+        lockObservedDuringSend.push(isInitialStagingLocked(TEST_WORKSPACE_ID));
+        return Promise.resolve({
+          success: false as const,
+          error: { type: "unknown", raw: "provider rejected the request" },
+        });
+      }
+    );
+    setupWindow({ sendMessage: sendMessageMock });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "describe this screenshot",
+    });
+
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const imagePart = {
+      type: "file" as const,
+      mediaType: "image/png",
+      url: "data:image/png;base64,iVBORw0KGgo=",
+      filename: "shot.png",
+    };
+    await act(async () => {
+      await getHook().handleSend("describe this screenshot", [imagePart]);
+    });
+
+    expect(lockObservedDuringSend).toEqual([true]);
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(false);
+    expect(workspaceDraft().attachments).toMatchObject([{ kind: "provider", url: imagePart.url }]);
+  });
+
+  test("handleSend transfers large attachments whole (drafts are no longer capped)", async () => {
     const stageAttachmentMock = mock(
       (_args: WorkspaceStageAttachmentArgs): Promise<WorkspaceStageAttachmentResult> =>
         Promise.resolve({ success: false, error: "disk full" } as WorkspaceStageAttachmentResult)
@@ -1266,7 +1709,7 @@ describe("useCreationWorkspace", () => {
       sizeBytes: 3,
       dataBase64: "Ymlu",
     };
-    // A provider attachment whose data URL alone exceeds the persistence cap.
+    // A provider attachment far above the old localStorage persistence cap.
     const oversizedFilePart = {
       type: "file" as const,
       url: `data:application/pdf;base64,${"a".repeat(4_000_001)}`,
@@ -1287,12 +1730,12 @@ describe("useCreationWorkspace", () => {
 
     expect(result).toEqual({ success: false });
 
-    // The trim drops only the oversized attachment; the small failed pending
-    // file survives so the user can retry staging it.
-    const attachmentsWrite = updatePersistedStateCalls.find(
-      ([key]) => key === getInputAttachmentsKey(TEST_WORKSPACE_ID)
-    );
-    expect(attachmentsWrite?.[1]).toEqual([failedPendingFile]);
+    // Both survive: the big attachment and the failed pending file the user can retry.
+    expect(workspaceDraft().attachments).toHaveLength(2);
+    expect(workspaceDraft().attachments).toContainEqual(failedPendingFile);
+    expect(
+      workspaceDraft().attachments.find((attachment) => attachment.kind === "provider")
+    ).toMatchObject({ url: oversizedFilePart.url });
   });
 
   test("handleSend creates workspace and applies initial goal command without sending chat text", async () => {
@@ -1314,14 +1757,10 @@ describe("useCreationWorkspace", () => {
     const { workspaceApi } = setupWindow({ setGoal: setGoalMock, sendMessage: sendMessageMock });
 
     const onWorkspaceCreated = mock(
-      (
-        metadata: FrontendWorkspaceMetadata,
-        options?: {
-          autoNavigate?: boolean;
-          pendingStreamModel?: string | null;
-          markPendingInitialSend?: boolean;
-        }
-      ) => ({ metadata, options })
+      (metadata: FrontendWorkspaceMetadata, options?: WorkspaceCreatedOptions) => ({
+        metadata,
+        options,
+      })
     );
     const getHook = renderUseCreationWorkspace({
       projectPath: TEST_PROJECT_PATH,
@@ -1337,6 +1776,7 @@ describe("useCreationWorkspace", () => {
         type: "goal-set",
         objective: "ship the feature",
         budgetCents: 500,
+        typedText: "/goal -b 5 ship the feature",
       });
     });
 
@@ -1358,11 +1798,219 @@ describe("useCreationWorkspace", () => {
       turnCap: null,
       expectedGoalId: null,
     });
+    // No user turn is queued, but the workspace still runs init, so the creation card is carried.
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
-      pendingStreamModel: "anthropic:claude-opus-5",
+      pendingStreamModel: "anthropic:claude-opus-5-5",
       markPendingInitialSend: false,
+      pendingUserMessage: undefined,
+      pendingCreationInit: {
+        workspaceName: "demo-branch",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: TEST_PROJECT_PATH,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
     });
+  });
+
+  test("an initial goal command saves the creation composer's Auto choices", async () => {
+    const { workspaceApi } = setupWindow({});
+    getAppConfigStore().updateOptimistically({
+      experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
+    });
+    setAutoRoutingPick(getCreationDraftScopeId(creationDraftId), "exec", "model", true);
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "/goal ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+
+    expect(workspaceApi.sendMessage.mock.calls.length).toBe(0);
+    expect(workspaceApi.updateAgentAISettings.mock.calls[0]?.[0]?.aiSettings).toEqual({
+      model: "gpt-4",
+      thinkingLevel: "medium",
+      reasoningMode: "standard",
+      autoModelRouting: true,
+    });
+  });
+
+  test("handleSend hands a refused initial goal command to the new workspace composer", async () => {
+    const setGoalMock = mock(
+      (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
+        Promise.resolve({
+          success: false,
+          error: { type: "invalid_transition", message: "goal refused" },
+        } as WorkspaceSetGoalResult)
+    );
+    setupWindow({ setGoal: setGoalMock });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        turnCap: 3,
+        typedText: "/goal --turns 3 ship the feature",
+      });
+    });
+
+    expect(result).toEqual({ success: false });
+    expect(setGoalMock.mock.calls.length).toBe(1);
+    // The app already left the creation view: the command as typed waits (saved) in the new
+    // workspace's composer, and that view shows the refusal.
+    expect(pendingDraft()).toBeNull();
+    expect(workspaceDraft().text).toBe("/goal --turns 3 ship the feature");
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("/goal --turns 3 ship the feature");
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({ type: "unknown" });
+    expect(String((errorWrite?.[1] as { raw?: string } | undefined)?.raw)).toContain(
+      "goal refused"
+    );
+  });
+
+  test("handleSend reports a thrown initial goal command as a goal failure, not a creation failure", async () => {
+    // #5493 item 1: the workspace exists and holds the typed command, so a command that throws
+    // must not surface as "Failed to create workspace".
+    // Reject lazily, when the command runs. Bun 1.2's mockRejectedValueOnce creates the rejected
+    // promise here, so it fails this test as an unhandled rejection before the hook calls the
+    // command, and the unconsumed mock then breaks later tests in the file (#5939).
+    spyOn(ChatCommandsModule, "processSlashCommand").mockImplementationOnce(() =>
+      Promise.reject(new Error("goal backend exploded"))
+    );
+    setupWindow({});
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      result = await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+
+    expect(result).toEqual({ success: false });
+    expect(getHook().toast?.message ?? "").not.toContain("Failed to create workspace");
+    expect(getHook().isSending).toBe(false);
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(false);
+    // The command still waits in the new workspace's composer, and that view shows the failure.
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("/goal ship the feature");
+    const errorWrite = updatePersistedStateCalls.find(
+      ([key]) => key === getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID)
+    );
+    expect(errorWrite?.[1]).toMatchObject({ type: "unknown" });
+    expect(String((errorWrite?.[1] as { raw?: string } | undefined)?.raw)).toBe(
+      "Initial goal request failed: goal backend exploded"
+    );
+  });
+
+  test("handleSend saves the initial goal command in the new workspace before running it", async () => {
+    let resolveSetGoal: ((result: WorkspaceSetGoalResult) => void) | undefined;
+    const setGoalMock = mock(
+      (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
+        new Promise((resolve) => {
+          resolveSetGoal = resolve;
+        })
+    );
+    setupWindow({ setGoal: setGoalMock });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    let sendPromise: Promise<CreationSendResult> | undefined;
+    act(() => {
+      sendPromise = getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+    await waitFor(() => expect(setGoalMock.mock.calls.length).toBe(1));
+    // The command has not accepted the objective yet: a quit now finds it saved in the new
+    // workspace, and that composer cannot send meanwhile.
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("/goal ship the feature");
+    expect(pendingDraft()).toBeNull();
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(true);
+    // Another window writes to the new workspace's draft while the command runs.
+    getDraftStore().setText({ kind: "workspace", workspaceId: TEST_WORKSPACE_ID }, (current) =>
+      [current, "also check CI"].join("\n\n")
+    );
+
+    let result: CreationSendResult | undefined;
+    await act(async () => {
+      resolveSetGoal?.({
+        success: true,
+        data: {
+          goalId: "33333333-3333-4333-8333-333333333333",
+          objective: "ship the feature",
+          status: "active",
+        },
+      } as WorkspaceSetGoalResult);
+      result = await sendPromise;
+    });
+    expect(result).toEqual({ success: true });
+    // Accepted: only the submitted command leaves the composer.
+    expect(workspaceDraft().text).toBe("also check CI");
+    expect(savedWorkspaceDraftText.get(TEST_WORKSPACE_ID)).toBe("also check CI");
+    expect(isInitialStagingLocked(TEST_WORKSPACE_ID)).toBe(false);
+  });
+
+  test("handleSend keeps the creation draft when the goal command hand-off is not saved", async () => {
+    failWorkspaceDraftSaves = true;
+    const setGoalMock = mock(
+      (_args: WorkspaceSetGoalArgs): Promise<WorkspaceSetGoalResult> =>
+        Promise.resolve({
+          success: false,
+          error: { type: "invalid_transition", message: "goal refused" },
+        } as WorkspaceSetGoalResult)
+    );
+    setupWindow({ setGoal: setGoalMock });
+    getCreationDraftStore().update(creationDraftId, { text: "/goal ship the feature" });
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "ship the feature",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("ship the feature", undefined, undefined, {
+        type: "goal-set",
+        objective: "ship the feature",
+        typedText: "/goal ship the feature",
+      });
+    });
+
+    expect(pendingDraft()?.text).toBe("/goal ship the feature");
+    expect(workspaceDraft().text).toBe("/goal ship the feature");
   });
 
   test("handleSend sends workflow-looking creation prompts to the agent", async () => {
@@ -1377,7 +2025,6 @@ describe("useCreationWorkspace", () => {
     const onWorkspaceCreated = mock((metadata: FrontendWorkspaceMetadata) => metadata);
     const getHook = renderUseCreationWorkspace({
       projectPath: TEST_PROJECT_PATH,
-      dynamicWorkflowsEnabled: true,
       onWorkspaceCreated,
       message: "/deep-research mux workflows",
     });
@@ -1433,7 +2080,6 @@ describe("useCreationWorkspace", () => {
     });
 
     await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
-    await waitFor(() => expect(nameGenerationApi.generate.mock.calls.length).toBe(1));
 
     let handleSendResult: CreationSendResult | undefined;
     await act(async () => {
@@ -1441,6 +2087,7 @@ describe("useCreationWorkspace", () => {
     });
 
     expect(handleSendResult).toEqual({ success: true });
+    expect(nameGenerationApi.generate.mock.calls.length).toBe(1);
     expect(workspaceApi.create.mock.calls.length).toBe(1);
     const createRequest = workspaceApi.create.mock.calls[0]?.[0];
     expect(createRequest?.branchName).toBe("security-scan");
@@ -1454,10 +2101,14 @@ describe("useCreationWorkspace", () => {
       (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
         Promise.resolve({
           success: true,
-          data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+          data: {
+            name: "generated-name",
+            title: "Generated name",
+            modelUsed: "anthropic:claude-haiku-4-5",
+          },
         } as NameGenerationResult)
     );
-    const { workspaceApi, nameGenerationApi } = setupWindow({
+    const { workspaceApi } = setupWindow({
       nameGeneration: nameGenerationMock,
     });
 
@@ -1471,7 +2122,6 @@ describe("useCreationWorkspace", () => {
     });
 
     await waitFor(() => expect(getHook().branches).toEqual(["main"]));
-    await waitFor(() => expect(nameGenerationApi.generate.mock.calls.length).toBe(1));
 
     let handleSendPromise: Promise<CreationSendResult> | null = null;
     act(() => {
@@ -1498,9 +2148,10 @@ describe("useCreationWorkspace", () => {
     const handleSendResult = await (handleSendPromise as unknown as Promise<CreationSendResult>);
     expect(handleSendResult).toEqual({ success: false });
     expect(workspaceApi.create.mock.calls.length).toBe(0);
+    expect(pendingDraft()?.text).toBe("creation draft");
   });
 
-  test("syncs global default agent to workspace when project agent is unset", async () => {
+  test("sends the global default agent when the project agent is unset", async () => {
     const listBranchesMock = mock(
       (): Promise<BranchListResult> =>
         Promise.resolve({
@@ -1526,7 +2177,11 @@ describe("useCreationWorkspace", () => {
       (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
         Promise.resolve({
           success: true,
-          data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+          data: {
+            name: "generated-name",
+            title: "Generated name",
+            modelUsed: "anthropic:claude-haiku-4-5",
+          },
         } as NameGenerationResult)
     );
     setupWindow({
@@ -1536,8 +2191,12 @@ describe("useCreationWorkspace", () => {
       nameGeneration: nameGenerationMock,
     });
 
-    persistedPreferences[getAgentIdKey(GLOBAL_SCOPE_ID)] = "ask";
-    persistedPreferences[getModelKey(getProjectScopeId(TEST_PROJECT_PATH))] = "gpt-4";
+    setPreferences({
+      ai: {
+        globalDefaults: { agentId: "ask" },
+        projectDefaults: { [TEST_PROJECT_PATH]: { model: "gpt-4" } },
+      },
+    });
 
     draftSettingsState = createDraftSettingsHarness({
       selectedRuntime: { mode: "ssh", host: "example.com" },
@@ -1554,7 +2213,6 @@ describe("useCreationWorkspace", () => {
     });
 
     await waitFor(() => expect(getHook().branches).toEqual(["main"]));
-    await waitFor(() => expect(nameGenerationMock.mock.calls.length).toBe(1));
 
     let handleSendResult: CreationSendResult | undefined;
     await act(async () => {
@@ -1562,7 +2220,6 @@ describe("useCreationWorkspace", () => {
     });
 
     expect(handleSendResult).toEqual({ success: true });
-    expect(updatePersistedStateCalls).toContainEqual([getAgentIdKey(TEST_WORKSPACE_ID), "ask"]);
 
     const sendCall = sendMessageMock.mock.calls[0];
     if (!sendCall) {
@@ -1570,6 +2227,138 @@ describe("useCreationWorkspace", () => {
     }
     const [sendRequest] = sendCall;
     expect(sendRequest?.options?.agentId).toBe("ask");
+  });
+
+  test("resolves a project default naming a removed built-in agent before copying it", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({ success: true as const, data: {} })
+    );
+    const updateAgentAISettingsMock = mock(
+      (_args: WorkspaceUpdateAgentAISettingsArgs): Promise<WorkspaceUpdateAgentAISettingsResult> =>
+        Promise.resolve({ success: true, data: undefined } as WorkspaceUpdateAgentAISettingsResult)
+    );
+    setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: sendMessageMock,
+      updateAgentAISettings: updateAgentAISettingsMock,
+      create: mock(
+        (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+          Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+      ),
+    });
+
+    setPreferences({
+      ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "mux", model: "gpt-4" } } },
+    });
+    draftSettingsState = createDraftSettingsHarness({ agentId: "mux" });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+      agentBaseById: new Map([
+        ["exec", undefined],
+        ["plan", undefined],
+      ]),
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+    await act(async () => {
+      await getHook().handleSend("launch workspace");
+    });
+
+    expect(updateAgentAISettingsMock.mock.calls[0]?.[0]?.agentId).toBe("exec");
+    expect(sendMessageMock.mock.calls[0]?.[0]?.options?.agentId).toBe("exec");
+  });
+
+  test("the first send carries the creation composer's Auto picks to the new workspace", async () => {
+    const sendMessageMock = mock(
+      (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+        Promise.resolve({ success: true as const, data: {} })
+    );
+    setupWindow({
+      listBranches: mock(
+        (): Promise<BranchListResult> =>
+          Promise.resolve({ branches: ["main"], recommendedTrunk: "main" })
+      ),
+      sendMessage: sendMessageMock,
+      create: mock(
+        (_args: WorkspaceCreateArgs): Promise<WorkspaceCreateResult> =>
+          Promise.resolve({ success: true, metadata: TEST_METADATA } as WorkspaceCreateResult)
+      ),
+    });
+
+    getAppConfigStore().updateOptimistically({
+      agentAiDefaults: { exec: { autoModelRouting: true } },
+      experiments: { [EXPERIMENT_IDS.AUTO_MODEL_ROUTING]: true },
+    });
+    setPreferences({
+      ai: { projectDefaults: { [TEST_PROJECT_PATH]: { agentId: "exec", model: "gpt-4" } } },
+    });
+    // Model Auto comes from the default; thinking Auto was picked in the creation composer.
+    setAutoRoutingPick(getCreationDraftScopeId(creationDraftId), "exec", "thinkingLevel", true);
+    draftSettingsState = createDraftSettingsHarness({ agentId: "exec" });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
+
+    await act(async () => {
+      await getHook().handleSend("launch workspace");
+    });
+
+    const options = sendMessageMock.mock.calls[0]?.[0]?.options;
+    expect(options?.autoModelRouting).toBe(true);
+    expect(options?.autoThinkingLevel).toBe(true);
+    // The workspace shows both creation choices until its metadata holds them.
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "model")).toBe(true);
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "thinkingLevel")).toBe(true);
+    setWorkspaceAiMetadata(TEST_WORKSPACE_ID, {
+      aiSettingsByAgent: {
+        exec: {
+          model: "gpt-4",
+          thinkingLevel: "medium",
+          autoModelRouting: true,
+          autoThinkingLevel: true,
+        },
+      },
+    });
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "model")).toBeUndefined();
+    expect(getAutoRoutingPick(TEST_WORKSPACE_ID, "exec", "thinkingLevel")).toBeUndefined();
+  });
+
+  test("the new workspace keeps the creation reasoning mode until its metadata holds it", async () => {
+    setupWindow({});
+    draftSettingsState = createDraftSettingsHarness({ agentId: "exec", reasoningMode: "pro" });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated: mock((metadata: FrontendWorkspaceMetadata) => metadata),
+      message: "launch workspace",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    await act(async () => {
+      await getHook().handleSend("launch workspace");
+    });
+
+    // The created metadata has no AI settings yet; project defaults hold no reasoning mode.
+    expect(getWorkspaceAiSelection(TEST_WORKSPACE_ID, "exec").reasoningMode).toBe("pro");
+    const save = (reasoningMode: DraftWorkspaceSettings["reasoningMode"]) =>
+      setWorkspaceAiMetadata(TEST_WORKSPACE_ID, {
+        aiSettingsByAgent: { exec: { model: "gpt-4", thinkingLevel: "medium", reasoningMode } },
+      });
+    save("pro");
+    // Another window's later change shows through.
+    save("standard");
+    expect(getWorkspaceAiSelection(TEST_WORKSPACE_ID, "exec").reasoningMode).toBe("standard");
   });
 
   test("handleSend returns failure when sendMessage fails and clears draft", async () => {
@@ -1599,7 +2388,11 @@ describe("useCreationWorkspace", () => {
       (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
         Promise.resolve({
           success: true,
-          data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+          data: {
+            name: "generated-name",
+            title: "Generated name",
+            modelUsed: "anthropic:claude-haiku-4-5",
+          },
         } as NameGenerationResult)
     );
     setupWindow({
@@ -1628,12 +2421,8 @@ describe("useCreationWorkspace", () => {
     expect(handleSendResult).toEqual({ success: false, error: sendError });
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
 
-    const pendingScopeId = getPendingScopeId(TEST_PROJECT_PATH);
-    const pendingInputKey = getInputKey(pendingScopeId);
-    const pendingImagesKey = getInputAttachmentsKey(pendingScopeId);
     const pendingErrorKey = getPendingWorkspaceSendErrorKey(TEST_WORKSPACE_ID);
-    expect(updatePersistedStateCalls).toContainEqual([pendingInputKey, ""]);
-    expect(updatePersistedStateCalls).toContainEqual([pendingImagesKey, undefined]);
+    expect(pendingDraft()).toBeNull();
     expect(updatePersistedStateCalls).toContainEqual([pendingErrorKey, sendError]);
   });
   test("onWorkspaceCreated is called before sendMessage resolves (no blocking)", async () => {
@@ -1665,7 +2454,11 @@ describe("useCreationWorkspace", () => {
       (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
         Promise.resolve({
           success: true,
-          data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+          data: {
+            name: "generated-name",
+            title: "Generated name",
+            modelUsed: "anthropic:claude-haiku-4-5",
+          },
         } as NameGenerationResult)
     );
     setupWindow({
@@ -1722,7 +2515,11 @@ describe("useCreationWorkspace", () => {
       (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
         Promise.resolve({
           success: true,
-          data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+          data: {
+            name: "generated-name",
+            title: "Generated name",
+            modelUsed: "anthropic:claude-haiku-4-5",
+          },
         } as NameGenerationResult)
     );
     setupWindow({
@@ -1735,14 +2532,7 @@ describe("useCreationWorkspace", () => {
     draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
     routerState.pendingDraftId = "different-draft";
     const onWorkspaceCreated = mock(
-      (
-        metadata: FrontendWorkspaceMetadata,
-        options?: {
-          autoNavigate?: boolean;
-          pendingStreamModel?: string | null;
-          markPendingInitialSend?: boolean;
-        }
-      ) => ({
+      (metadata: FrontendWorkspaceMetadata, options?: WorkspaceCreatedOptions) => ({
         metadata,
         options,
       })
@@ -1768,6 +2558,49 @@ describe("useCreationWorkspace", () => {
       autoNavigate: false,
       pendingStreamModel: null,
       markPendingInitialSend: true,
+      pendingUserMessage: {
+        content: "test message",
+        fileParts: undefined,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
+      pendingCreationInit: {
+        workspaceName: "demo-branch",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: TEST_PROJECT_PATH,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
+    });
+  });
+
+  test("handleSend reuses the pending row ChatInput showed while resolving the send", async () => {
+    const onWorkspaceCreated = mock(
+      (_metadata: FrontendWorkspaceMetadata, _options?: WorkspaceCreatedOptions) => undefined
+    );
+    setupWindow({
+      sendMessage: mock(
+        (_args: WorkspaceSendMessageArgs): Promise<WorkspaceSendMessageResult> =>
+          Promise.resolve({ success: true as const, data: {} })
+      ),
+    });
+
+    const getHook = renderUseCreationWorkspace({
+      projectPath: TEST_PROJECT_PATH,
+      onWorkspaceCreated,
+      message: "test message",
+    });
+    await waitFor(() => expect(getHook().branches).toEqual([FALLBACK_BRANCH]));
+
+    const draft = { content: "test message", fileParts: undefined, timestamp: 1_234 };
+    await act(async () => {
+      await getHook().handleSend("test message", undefined, undefined, undefined, undefined, draft);
+    });
+
+    expect(onWorkspaceCreated.mock.calls[0][1]).toMatchObject({
+      pendingUserMessage: draft,
+      pendingCreationInit: { timestamp: 1_234 },
     });
   });
 
@@ -1797,7 +2630,11 @@ describe("useCreationWorkspace", () => {
       (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
         Promise.resolve({
           success: true,
-          data: { name: "generated-name", modelUsed: "anthropic:claude-haiku-4-5" },
+          data: {
+            name: "generated-name",
+            title: "Generated name",
+            modelUsed: "anthropic:claude-haiku-4-5",
+          },
         } as NameGenerationResult)
     );
     setupWindow({
@@ -1810,14 +2647,10 @@ describe("useCreationWorkspace", () => {
     draftSettingsState = createDraftSettingsHarness({ trunkBranch: "main" });
     routerState.pendingDraftId = "draft-being-created";
     const onWorkspaceCreated = mock(
-      (
-        metadata: FrontendWorkspaceMetadata,
-        options?: {
-          autoNavigate?: boolean;
-          pendingStreamModel?: string | null;
-          markPendingInitialSend?: boolean;
-        }
-      ) => ({ metadata, options })
+      (metadata: FrontendWorkspaceMetadata, options?: WorkspaceCreatedOptions) => ({
+        metadata,
+        options,
+      })
     );
 
     const getHook = renderUseCreationWorkspace({
@@ -1838,8 +2671,22 @@ describe("useCreationWorkspace", () => {
     expect(onWorkspaceCreated.mock.calls.length).toBe(1);
     expect(onWorkspaceCreated.mock.calls[0][1]).toEqual({
       autoNavigate: true,
-      pendingStreamModel: "anthropic:claude-opus-5",
+      pendingStreamModel: "anthropic:claude-opus-5-5",
       markPendingInitialSend: true,
+      pendingUserMessage: {
+        content: "test message",
+        fileParts: undefined,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
+      pendingCreationInit: {
+        workspaceName: "demo-branch",
+        nameGenerated: true,
+        kind: undefined,
+        hookPath: TEST_PROJECT_PATH,
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+        timestamp: expect.any(Number),
+      },
     });
   });
 
@@ -1855,10 +2702,10 @@ describe("useCreationWorkspace", () => {
       (_args: NameGenerationArgs): Promise<NameGenerationResult> =>
         Promise.resolve({
           success: true,
-          data: { name: "test-name", modelUsed: "anthropic:claude-haiku-4-5" },
+          data: { name: "test-name", title: "Test name", modelUsed: "anthropic:claude-haiku-4-5" },
         } as NameGenerationResult)
     );
-    const { workspaceApi, nameGenerationApi } = setupWindow({
+    const { workspaceApi } = setupWindow({
       create: createMock,
       nameGeneration: nameGenerationMock,
     });
@@ -1871,8 +2718,7 @@ describe("useCreationWorkspace", () => {
       message: "make workspace",
     });
 
-    // Wait for name generation to trigger
-    await waitFor(() => expect(nameGenerationApi.generate.mock.calls.length).toBe(1));
+    await waitFor(() => expect(getHook().branches).toEqual(["main"]));
 
     await act(async () => {
       await getHook().handleSend("make workspace");
@@ -1882,12 +2728,8 @@ describe("useCreationWorkspace", () => {
     expect(onWorkspaceCreated.mock.calls.length).toBe(0);
     await waitFor(() => expect(getHook().toast?.message).toBe("backend exploded"));
     await waitFor(() => expect(getHook().isSending).toBe(false));
-
-    // Side effect: send-options reader may migrate thinking level into the project scope.
-    const thinkingKey = getThinkingLevelKey(getProjectScopeId(TEST_PROJECT_PATH));
-    if (updatePersistedStateCalls.length > 0) {
-      expect(updatePersistedStateCalls).toEqual([[thinkingKey, "off"]]);
-    }
+    expect(updatePersistedStateCalls).toEqual([]);
+    expect(pendingDraft()?.text).toBe("creation draft");
   });
 });
 
@@ -1900,6 +2742,7 @@ function createDraftSettingsHarness(
     runtimeString?: string | undefined;
     defaultRuntimeMode?: RuntimeChoice;
     agentId?: string;
+    reasoningMode?: DraftWorkspaceSettings["reasoningMode"];
     coderConfigFallback?: CoderWorkspaceConfig;
     sshHostFallback?: string;
   }>
@@ -1908,6 +2751,7 @@ function createDraftSettingsHarness(
     selectedRuntime: initial?.selectedRuntime ?? { mode: "local" as const },
     defaultRuntimeMode: initial?.defaultRuntimeMode ?? "worktree",
     agentId: initial?.agentId ?? "exec",
+    reasoningMode: initial?.reasoningMode ?? "standard",
     trunkBranch: initial?.trunkBranch ?? "main",
     runtimeString: initial?.runtimeString,
     coderConfigFallback: initial?.coderConfigFallback ?? { existingWorkspace: false },
@@ -1916,6 +2760,7 @@ function createDraftSettingsHarness(
     selectedRuntime: ParsedRuntime;
     defaultRuntimeMode: RuntimeChoice;
     agentId: string;
+    reasoningMode: DraftWorkspaceSettings["reasoningMode"];
     trunkBranch: string;
     runtimeString: string | undefined;
     coderConfigFallback: CoderWorkspaceConfig;
@@ -1939,39 +2784,9 @@ function createDraftSettingsHarness(
     }
   });
 
-  const setDefaultRuntimeChoice = mock((choice: RuntimeChoice) => {
-    state.defaultRuntimeMode = choice;
-    // Update selected runtime to match new default
-    if (choice === "coder") {
-      state.selectedRuntime = {
-        mode: "ssh",
-        host: CODER_RUNTIME_PLACEHOLDER,
-        coder: { existingWorkspace: false },
-      };
-      state.runtimeString = `ssh ${CODER_RUNTIME_PLACEHOLDER}`;
-      return;
-    }
-    if (choice === "ssh") {
-      const host = state.selectedRuntime.mode === "ssh" ? state.selectedRuntime.host : "";
-      state.selectedRuntime = { mode: "ssh", host };
-      state.runtimeString = host ? `ssh ${host}` : "ssh";
-    } else if (choice === "docker") {
-      const image = state.selectedRuntime.mode === "docker" ? state.selectedRuntime.image : "";
-      state.selectedRuntime = { mode: "docker", image };
-      state.runtimeString = image ? `docker ${image}` : "docker";
-    } else if (choice === "local") {
-      state.selectedRuntime = { mode: "local" };
-      state.runtimeString = undefined;
-    } else {
-      state.selectedRuntime = { mode: "worktree" };
-      state.runtimeString = undefined;
-    }
-  });
-
   return {
     state,
     setSelectedRuntime,
-    setDefaultRuntimeChoice,
     setTrunkBranch,
     getRuntimeString,
     snapshot(): {
@@ -1979,14 +2794,13 @@ function createDraftSettingsHarness(
       coderConfigFallback: CoderWorkspaceConfig;
       sshHostFallback: string;
       setSelectedRuntime: typeof setSelectedRuntime;
-      setDefaultRuntimeChoice: typeof setDefaultRuntimeChoice;
       setTrunkBranch: typeof setTrunkBranch;
       getRuntimeString: typeof getRuntimeString;
     } {
       const settings: DraftWorkspaceSettings = {
         model: "gpt-4",
         thinkingLevel: "medium",
-        reasoningMode: "standard",
+        reasoningMode: state.reasoningMode,
         agentId: state.agentId,
         selectedRuntime: state.selectedRuntime,
         defaultRuntimeMode: state.defaultRuntimeMode,
@@ -1997,7 +2811,6 @@ function createDraftSettingsHarness(
         coderConfigFallback: state.coderConfigFallback,
         sshHostFallback: state.sshHostFallback,
         setSelectedRuntime,
-        setDefaultRuntimeChoice,
         setTrunkBranch,
         getRuntimeString,
       };
@@ -2016,7 +2829,7 @@ interface HookOptions {
       markPendingInitialSend?: boolean;
     }
   ) => void;
-  dynamicWorkflowsEnabled?: boolean;
+  agentBaseById?: ReadonlyMap<string, string | undefined>;
   message?: string;
   draftId?: string | null;
 }
@@ -2029,12 +2842,22 @@ function renderUseCreationWorkspace(options: HookOptions) {
   function Harness(props: HookOptions) {
     resultRef.current = useCreationWorkspace({
       ...props,
+      draftId: props.draftId === undefined ? creationDraftId : props.draftId,
       message: props.message ?? "",
     });
     return null;
   }
 
-  render(<Harness {...options} />);
+  // Inject the client through the real provider; mocking the API module leaks
+  // process-wide into later suites.
+  if (!currentORPCClient) {
+    throw new Error("Tests must call setupWindow() before rendering the hook");
+  }
+  render(
+    <APIProvider client={createTestApiClient(currentORPCClient)}>
+      <Harness {...options} />
+    </APIProvider>
+  );
 
   return () => {
     if (!resultRef.current) {

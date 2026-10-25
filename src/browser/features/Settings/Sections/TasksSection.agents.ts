@@ -60,6 +60,7 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
         "task_retitle",
         "task_stop",
         "task_remove",
+        "task_workspace_lifecycle",
         "task_apply_git_patch",
         "propose_plan",
         "ask_user_question",
@@ -110,7 +111,10 @@ function compareAgentsByName(a: AgentDefinitionDescriptor, b: AgentDefinitionDes
 // via knownAgentIds below.
 function shouldShowAgentInTasksSettings(
   agent: AgentDefinitionDescriptor,
-  params: { portableDesktopEnabled: boolean; memoryConsolidationEnabled: boolean }
+  params: {
+    portableDesktopEnabled: boolean;
+    memoryConsolidationEnabled: boolean;
+  }
 ): boolean {
   if (agent.id === "desktop") return params.portableDesktopEnabled;
   if (agent.id === "dream") return params.memoryConsolidationEnabled;

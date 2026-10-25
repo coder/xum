@@ -1,0 +1,273 @@
+/**
+ * Memory route operations (Memory tab + Settings → Memory).
+ *
+ * Internals are Effect-native: each operation is an `Effect.gen` pipeline
+ * (the `*Effect` exports) that the router runs via `handlerGen`. Failures the client renders (workspace not found, scope
+ * unavailable, path errors) stay in the success channel as the wire
+ * `{ success: false }` unions. The Effect error channel carries only typed
+ * domain errors a caller can branch on (`MemoryWorkspaceNotFoundError`,
+ * `MemoryMetaWriteError`), and every operation handles them before the
+ * effect reaches the router, so the exported effects never fail.
+ */
+import { ORPCError } from "@orpc/server";
+import { Effect, Result, Schema } from "effect";
+import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { MEMORY_SCOPES } from "@/common/constants/memory";
+import type * as schemas from "@/common/orpc/schemas";
+import { getErrorMessage } from "@/common/utils/errors";
+import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
+import type { ORPCContext } from "@/node/orpc/context";
+import {
+  parseMemoryPath,
+  resolveMemoryProjectIdentity,
+  type MemoryScopeContext,
+} from "./memoryService";
+import { MemoryMetaWriteError, memoryLogicalKey } from "./memoryMeta";
+
+type MemoryContext = Pick<
+  ORPCContext,
+  | "experimentsService"
+  | "workspaceService"
+  | "memoryService"
+  | "memoryMetaService"
+  | "memoryConsolidationService"
+>;
+type Input<T extends { input: unknown }> = T["input"] extends { _input: infer I } ? I : never;
+
+export function assertMemoryEnabled(context: MemoryContext): void {
+  if (!context.experimentsService.isExperimentEnabled(EXPERIMENT_IDS.MEMORY)) {
+    throw new ORPCError("BAD_REQUEST", { message: "Agent memory is disabled" });
+  }
+}
+
+/**
+ * Typed failure: the request named a workspaceId that no longer resolves to a
+ * live workspace. Operations branch on the tag to map it onto their route's
+ * `{ success: false }` union (plain string vs MemorySaveError shape).
+ */
+export class MemoryWorkspaceNotFoundError extends Schema.TaggedError<MemoryWorkspaceNotFoundError>()(
+  "MemoryWorkspaceNotFoundError",
+  { workspaceId: Schema.NullOr(Schema.String) }
+) {}
+
+function workspaceNotFound(workspaceId: string | null | undefined): string {
+  return "Workspace not found: " + (workspaceId ?? "<none>");
+}
+
+interface ResolvedMemoryScope {
+  projectPath: string;
+  /** Task-tree root whose store backs workspace scope ("" without a workspace); keys sidecar pins/stats. */
+  ownerWorkspaceId: string;
+  scopeCtx: MemoryScopeContext;
+}
+
+/**
+ * Resolve the scope context that maps virtual /memories paths onto physical
+ * roots. A null/undefined workspaceId is the Settings → Memory case (global
+ * scope only), not an error; an unknown workspaceId is the typed failure.
+ */
+function resolveMemoryScope(
+  context: MemoryContext,
+  workspaceId: string | null | undefined
+): Effect.Effect<ResolvedMemoryScope, MemoryWorkspaceNotFoundError> {
+  return Effect.gen(function* () {
+    if (workspaceId == null)
+      return {
+        projectPath: "",
+        ownerWorkspaceId: "",
+        scopeCtx: { runtime: null, checkoutCwd: "", workspaceId: "", projectPath: "" },
+      };
+    const metadata = yield* Effect.promise(() => context.workspaceService.getInfo(workspaceId));
+    if (!metadata) return yield* Effect.fail(new MemoryWorkspaceNotFoundError({ workspaceId }));
+    const projectPath = resolveMemoryProjectIdentity(metadata);
+    const scopeCtx: MemoryScopeContext = {
+      runtime: createRuntimeForWorkspace(metadata),
+      checkoutCwd: "",
+      workspaceId,
+      projectPath,
+      // The Memory tab shows the workspace's own session checkpoint too.
+      scopes: MEMORY_SCOPES,
+    };
+    return {
+      projectPath,
+      // Same per-context resolution the store/notify paths use, so sidecar keys
+      // and the physical store never disagree about the owner within a request.
+      ownerWorkspaceId: context.memoryService.ownerWorkspaceIdFor(scopeCtx),
+      scopeCtx,
+    };
+  });
+}
+
+/** Map the typed workspace failure onto the routes' plain string error union. */
+const workspaceNotFoundAsStringError = (error: MemoryWorkspaceNotFoundError) =>
+  Effect.succeed({ success: false as const, error: workspaceNotFound(error.workspaceId) });
+
+export function listMemoryEffect(context: MemoryContext, input: Input<typeof schemas.memory.list>) {
+  return Effect.gen(function* () {
+    assertMemoryEnabled(context);
+    const resolved = yield* resolveMemoryScope(context, input.workspaceId);
+    const entries = yield* Effect.promise(() =>
+      context.memoryService.listIndexEntries(resolved.scopeCtx)
+    );
+    const meta = yield* context.memoryMetaService.effects.getEntries();
+    const ids = { projectPath: resolved.projectPath, workspaceId: resolved.ownerWorkspaceId };
+    // Session sidecar keys follow the acting workspace, not the owner (logicalKeyFor).
+    const sessionIds = { ...ids, workspaceId: resolved.scopeCtx.workspaceId };
+    return {
+      success: true as const,
+      data: {
+        files: entries.map((entry) => {
+          const stats = meta.get(
+            memoryLogicalKey(
+              entry.scope,
+              entry.relPath,
+              entry.scope === "session" ? sessionIds : ids
+            )
+          );
+          return {
+            path: entry.path,
+            scope: entry.scope,
+            description: entry.description,
+            pinned: stats?.pinned ?? false,
+            accessCount: stats?.accessCount ?? 0,
+            lastAccessedAt: stats?.lastAccessedAt ?? null,
+          };
+        }),
+      },
+    };
+  }).pipe(Effect.catchTag("MemoryWorkspaceNotFoundError", workspaceNotFoundAsStringError));
+}
+
+export function readMemoryEffect(context: MemoryContext, input: Input<typeof schemas.memory.read>) {
+  return Effect.gen(function* () {
+    assertMemoryEnabled(context);
+    const resolved = yield* resolveMemoryScope(context, input.workspaceId);
+    return yield* Effect.promise(() =>
+      context.memoryService.readFileWithSha(resolved.scopeCtx, input.path)
+    );
+  }).pipe(Effect.catchTag("MemoryWorkspaceNotFoundError", workspaceNotFoundAsStringError));
+}
+
+export function saveMemoryEffect(context: MemoryContext, input: Input<typeof schemas.memory.save>) {
+  return Effect.gen(function* () {
+    assertMemoryEnabled(context);
+    const resolved = yield* resolveMemoryScope(context, input.workspaceId);
+    return yield* Effect.promise(() =>
+      context.memoryService.saveFile(
+        resolved.scopeCtx,
+        input.path,
+        input.content,
+        input.expectedSha256,
+        "user"
+      )
+    );
+  }).pipe(
+    // save's wire error is MemorySaveError, not a plain string.
+    Effect.catchTag("MemoryWorkspaceNotFoundError", (error) =>
+      Effect.succeed({
+        success: false as const,
+        error: { kind: "error" as const, message: workspaceNotFound(error.workspaceId) },
+      })
+    )
+  );
+}
+
+export function deleteMemoryEffect(
+  context: MemoryContext,
+  input: Input<typeof schemas.memory.delete>
+) {
+  return Effect.gen(function* () {
+    assertMemoryEnabled(context);
+    const resolved = yield* resolveMemoryScope(context, input.workspaceId);
+    const result = yield* Effect.promise(() =>
+      context.memoryService.deletePath(resolved.scopeCtx, input.path, "user")
+    );
+    return result.success
+      ? { success: true as const, data: undefined }
+      : { success: false as const, error: result.error };
+  }).pipe(Effect.catchTag("MemoryWorkspaceNotFoundError", workspaceNotFoundAsStringError));
+}
+
+export function setMemoryPinnedEffect(
+  context: MemoryContext,
+  input: Input<typeof schemas.memory.setPinned>
+): Effect.Effect<{ success: true; data: undefined } | { success: false; error: string }> {
+  return Effect.gen(function* () {
+    // Sync ORPCError throw stays a runtime defect and reaches the client as
+    // the same BAD_REQUEST it does today from async handlers.
+    assertMemoryEnabled(context);
+    const resolved = yield* resolveMemoryScope(context, input.workspaceId);
+    const parsedResult = yield* Effect.result(
+      Effect.try({
+        try: () => parseMemoryPath(input.path),
+        catch: (error) => getErrorMessage(error),
+      })
+    );
+    if (Result.isFailure(parsedResult))
+      return { success: false as const, error: parsedResult.failure };
+    const { scope, relPath } = parsedResult.success;
+    if (scope === null || relPath === "")
+      return { success: false as const, error: "Cannot pin a directory: " + input.path };
+    if (input.workspaceId == null && scope !== "global")
+      return {
+        success: false as const,
+        error:
+          (scope === "project" ? "Project" : "Workspace") +
+          " memory is unavailable: no workspace is associated with this request",
+      };
+    if (scope === "project" && resolved.projectPath === "")
+      return {
+        success: false as const,
+        error: "Project memory is unavailable: no project is associated with this session",
+      };
+    // Sidecar write + change event, committed under the store's mutation
+    // lock by MemoryService (workspace scope).
+    return yield* Effect.tryPromise({
+      try: () => context.memoryService.setPinned(resolved.scopeCtx, input.path, input.pinned),
+      catch: (error: unknown) => error,
+    }).pipe(
+      Effect.map(() => ({ success: true as const, data: undefined })),
+      // Sidecar write failures (disk full, permissions) arrive as the typed
+      // MemoryMetaWriteError; lock timeouts and command errors map onto the
+      // same legacy string error channel instead of escaping as an untyped
+      // INTERNAL_SERVER_ERROR rejection.
+      Effect.catch((error) =>
+        Effect.succeed({
+          success: false as const,
+          error:
+            error instanceof MemoryMetaWriteError
+              ? `Failed to persist pin state: ${error.reason}`
+              : `Failed to update pin: ${getErrorMessage(error)}`,
+        })
+      )
+    );
+  }).pipe(Effect.catchTag("MemoryWorkspaceNotFoundError", workspaceNotFoundAsStringError));
+}
+
+export function getMemoryConsolidationStatusEffect(
+  context: MemoryContext,
+  input: Input<typeof schemas.memory.consolidationStatus>
+) {
+  return Effect.gen(function* () {
+    assertMemoryEnabled(context);
+    const data = yield* Effect.promise(() =>
+      context.memoryConsolidationService.getStatus(input.workspaceId)
+    );
+    return { success: true as const, data };
+  });
+}
+
+export function consolidateMemoryEffect(
+  context: MemoryContext,
+  input: Input<typeof schemas.memory.consolidate>
+) {
+  return Effect.gen(function* () {
+    assertMemoryEnabled(context);
+    const result = yield* Effect.promise(() =>
+      context.memoryConsolidationService.maybeRun(input.workspaceId, "manual")
+    );
+    return result.success
+      ? { success: true as const, data: result.data }
+      : { success: false as const, error: result.error };
+  });
+}

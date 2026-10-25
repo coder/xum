@@ -6,13 +6,14 @@ import type {
   EditedFilesReferenceAttachment,
   CompletedReportEntry,
   CompletedReportsIndexAttachment,
+  ReadFilesReferenceAttachment,
 } from "@/common/types/attachment";
 import { isNestedWorkflowRun, type WorkflowRunEvent } from "@/common/types/workflow";
-import { getPlanFilePath, getLegacyPlanFilePath } from "@/common/utils/planStorage";
 import type { FileEditDiff } from "@/common/utils/messages/extractEditedFiles";
 import assert from "@/common/utils/assert";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { readFileString } from "@/node/utils/runtime/helpers";
+import { planReadPaths, readFileString } from "@/node/utils/runtime/helpers";
+import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 import { expandTilde } from "@/node/runtime/tildeExpansion";
 import {
   MAX_POST_COMPACTION_PLAN_CHARS,
@@ -46,18 +47,18 @@ export class AttachmentService {
    * Falls back to legacy plan path if new path doesn't exist.
    */
   static async generatePlanFileReference(
-    workspaceName: string,
-    projectName: string,
-    workspaceId: string,
+    location: PlanFileLocation,
     runtime: Runtime
   ): Promise<PlanFileReferenceAttachment | null> {
-    const muxHome = runtime.getShuxHome();
-    const planFilePath = getPlanFilePath(workspaceName, projectName, muxHome);
-    const legacyPlanPath = getLegacyPlanFilePath(workspaceId, muxHome);
+    const { planPath: planFilePath, legacyIdPath: legacyPlanPath } = location;
+    // The plan path is user/agent-writable and this reader runs on every post-compaction turn:
+    // a FIFO (or other special file) there must fail like a missing plan instead of blocking the
+    // read — and, on Node, a libuv threadpool worker — indefinitely. Same guard as readPlanFile.
+    const planReadOptions = { requireRegularFile: true } as const;
 
     // Try new path first
     try {
-      const planContent = await readFileString(runtime, planFilePath);
+      const planContent = await readFileString(runtime, planFilePath, undefined, planReadOptions);
       if (planContent) {
         return {
           type: "plan_file_reference",
@@ -69,9 +70,10 @@ export class AttachmentService {
       // Plan file doesn't exist at new path, try legacy
     }
 
-    // Fall back to legacy path
+    // Fall back to legacy path (local and container rows; an SSH row has migrated, planLocation.ts)
+    if (legacyPlanPath === undefined) return null;
     try {
-      const planContent = await readFileString(runtime, legacyPlanPath);
+      const planContent = await readFileString(runtime, legacyPlanPath, undefined, planReadOptions);
       if (planContent) {
         return {
           type: "plan_file_reference",
@@ -229,6 +231,20 @@ export class AttachmentService {
     };
   }
 
+  /**
+   * Generate the RLM read-files attachment (paths only, newest-first).
+   * Returns null when nothing was tracked; callers gate on RLM mode.
+   */
+  static generateReadFilesAttachment(readFilePaths: string[]): ReadFilesReferenceAttachment | null {
+    if (readFilePaths.length === 0) {
+      return null;
+    }
+    return {
+      type: "read_files_reference",
+      paths: readFilePaths,
+    };
+  }
+
   static generateLoadedSkillsAttachment(
     loadedSkills: LoadedSkillSnapshot[],
     excludedItems: Set<string> = new Set<string>()
@@ -249,28 +265,18 @@ export class AttachmentService {
    * @param excludedItems - Set of item IDs to exclude ("plan", "skills", or "file:<path>")
    */
   static async generatePostCompactionAttachments(
-    workspaceName: string,
-    projectName: string,
-    workspaceId: string,
+    planLocation: PlanFileLocation,
     fileDiffs: FileEditDiff[],
     loadedSkills: LoadedSkillSnapshot[],
     runtime: Runtime,
     excludedItems: Set<string> = new Set<string>()
   ): Promise<PostCompactionAttachment[]> {
     const attachments: PostCompactionAttachment[] = [];
-    const muxHome = runtime.getShuxHome();
-    const planFilePath = getPlanFilePath(workspaceName, projectName, muxHome);
-    const legacyPlanPath = getLegacyPlanFilePath(workspaceId, muxHome);
 
     // Plan file reference (skip if excluded)
     let planRef: PlanFileReferenceAttachment | null = null;
     if (!excludedItems.has("plan")) {
-      planRef = await this.generatePlanFileReference(
-        workspaceName,
-        projectName,
-        workspaceId,
-        runtime
-      );
+      planRef = await this.generatePlanFileReference(planLocation, runtime);
       if (planRef) {
         attachments.push(planRef);
       }
@@ -281,15 +287,14 @@ export class AttachmentService {
       attachments.push(loadedSkillsAttachment);
     }
 
-    // Filter out excluded files
     const filteredDiffs = fileDiffs.filter((f) => !excludedItems.has(`file:${f.path}`));
 
     // Edited files reference - always filter out both new and legacy plan paths
     // to prevent plan file from appearing in the file diffs list
-    const editedFilesRef = this.generateEditedFilesAttachment(filteredDiffs, [
-      planFilePath,
-      legacyPlanPath,
-    ]);
+    const editedFilesRef = this.generateEditedFilesAttachment(
+      filteredDiffs,
+      planReadPaths(planLocation)
+    );
     if (editedFilesRef) {
       attachments.push(editedFilesRef);
     }

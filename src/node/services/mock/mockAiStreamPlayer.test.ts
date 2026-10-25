@@ -5,8 +5,14 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { HistoryService } from "@/node/services/historyService";
 import type { AIService } from "@/node/services/aiService";
-import type { StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
+import type { StreamDeltaEvent, StreamEndEvent, StreamStartEvent } from "@/common/types/stream";
+import { buildMockStreamEventsFromReply } from "./mockAiStreamAdapter";
 import { createTestHistoryService } from "../testHistoryService";
+import { DisposableTempDir } from "@/node/services/tempDir";
+import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
+import * as path from "node:path";
+import * as tokenizerModule from "@/node/utils/main/tokenizer";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 
 function readWorkspaceId(payload: unknown): string | undefined {
   if (!payload || typeof payload !== "object") return undefined;
@@ -59,6 +65,8 @@ describe("MockAiStreamPlayer", () => {
 
   test("appends assistant placeholder even when router turn ends with stream error", async () => {
     const aiServiceStub = new EventEmitter();
+    // Bare EventEmitters throw on unobserved "error" emits (production always subscribes).
+    aiServiceStub.on("error", () => undefined);
 
     const player = new MockAiStreamPlayer({
       historyService,
@@ -98,6 +106,8 @@ describe("MockAiStreamPlayer", () => {
       workspaceId
     );
     expect(secondResult.success).toBe(true);
+    if (!secondResult.success || !secondResult.data) throw new Error("expected a stream handle");
+    expect(await secondResult.data.completion).toMatchObject({ status: "failed" });
 
     // Read back all messages and check the assistant placeholders
     const allResult = await historyService.getLastMessages(workspaceId, 100);
@@ -188,13 +198,13 @@ describe("MockAiStreamPlayer", () => {
       aiService: aiServiceStub as unknown as AIService,
     });
 
-    const originalDeletePartial = historyService.deletePartial.bind(historyService);
+    const originalDeletePartial = historyService.commitPartial.bind(historyService);
     let deletePartialCallCount = 0;
     let releaseStopCleanup!: () => void;
     const stopCleanupGate = new Promise<void>((resolve) => {
       releaseStopCleanup = () => resolve();
     });
-    spyOn(historyService, "deletePartial").mockImplementation(async (workspaceIdToDelete) => {
+    spyOn(historyService, "commitPartial").mockImplementation(async (workspaceIdToDelete) => {
       deletePartialCallCount += 1;
       if (deletePartialCallCount === 1) {
         await stopCleanupGate;
@@ -347,7 +357,9 @@ describe("MockAiStreamPlayer", () => {
 
       await waitForCondition(() => writePartialCallCount >= 1, 1000);
 
-      await player.stop(workspaceId);
+      const stop = player.stop(workspaceId, { abandonPartial: true });
+      releaseFirstWrite();
+      await stop;
       expect(player.isStreaming(workspaceId)).toBe(false);
       expect(await historyService.readPartial(workspaceId)).toBeNull();
 
@@ -362,108 +374,44 @@ describe("MockAiStreamPlayer", () => {
     }
   });
 
-  test("does not let stale delayed-write cleanup delete a replacement stream partial", async () => {
-    const aiServiceStub = new EventEmitter();
-
+  test("replacement joins the old delayed write and captured partial finalization", async () => {
+    const emitter = new EventEmitter();
     const player = new MockAiStreamPlayer({
       historyService,
-      aiService: aiServiceStub as unknown as AIService,
+      aiService: emitter as unknown as AIService,
     });
-
-    const originalWritePartial = historyService.writePartial.bind(historyService);
-    let releaseFirstWrite!: () => void;
-    const firstWriteGate = new Promise<void>((resolve) => {
-      releaseFirstWrite = () => resolve();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const originalWrite = historyService.writePartial.bind(historyService);
+    spyOn(historyService, "writePartial").mockImplementationOnce(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      return originalWrite(...args);
     });
-    let writePartialCallCount = 0;
-    spyOn(historyService, "writePartial").mockImplementation(
-      async (workspaceIdToWrite, message) => {
-        writePartialCallCount += 1;
-        if (writePartialCallCount === 1) {
-          await firstWriteGate;
-        }
-        return await originalWritePartial(workspaceIdToWrite, message);
-      }
-    );
-
-    const originalDeletePartialIfMessageIdMatches =
-      historyService.deletePartialIfMessageIdMatches.bind(historyService);
-    let releaseStaleCleanup!: () => void;
-    const staleCleanupGate = new Promise<void>((resolve) => {
-      releaseStaleCleanup = () => resolve();
-    });
-    let deleteMatchingCallCount = 0;
-    spyOn(historyService, "deletePartialIfMessageIdMatches").mockImplementation(
-      async (workspaceIdToDelete, messageIdToDelete) => {
-        deleteMatchingCallCount += 1;
-        if (deleteMatchingCallCount === 1) {
-          await staleCleanupGate;
-        }
-        return await originalDeletePartialIfMessageIdMatches(
-          workspaceIdToDelete,
-          messageIdToDelete
-        );
-      }
-    );
-
-    const workspaceId = "workspace-stale-delayed-write-cleanup";
-    const streamStartMessageIds: string[] = [];
-    aiServiceStub.on("stream-start", (payload: unknown) => {
-      if (readWorkspaceId(payload) !== workspaceId) {
-        return;
-      }
-      const messageId = (payload as { messageId?: string }).messageId;
-      if (typeof messageId === "string") {
-        streamStartMessageIds.push(messageId);
-      }
-    });
-
-    const firstUserMessage = createMuxMessage(
-      "user-stale-delayed-write-first",
-      "user",
-      "[force] first stream before stale delayed-write cleanup",
-      {
-        timestamp: Date.now(),
-      }
-    );
-
+    const workspaceId = "mock-replacement-write-fence";
+    const user = createMuxMessage("user", "user", "[force] keep streaming");
+    let replacementStarted = false;
     try {
-      const firstPlayResult = await player.play([firstUserMessage], workspaceId);
-      expect(firstPlayResult.success).toBe(true);
-
-      await waitForCondition(() => writePartialCallCount >= 1, 1000);
-
-      const replacementUserMessage = createMuxMessage(
-        "user-stale-delayed-write-second",
-        "user",
-        "[force] replacement stream should keep its partial after stale cleanup",
-        {
-          timestamp: Date.now(),
-        }
-      );
-
-      const replacementPlayResult = await player.play([replacementUserMessage], workspaceId);
-      expect(replacementPlayResult.success).toBe(true);
-
-      await waitForCondition(() => streamStartMessageIds.length >= 2, 1000);
-      const replacementMessageId = streamStartMessageIds[1];
-
-      releaseFirstWrite();
-      await waitForCondition(() => deleteMatchingCallCount >= 1, 1000);
-
-      await waitForCondition(
-        async () => (await historyService.readPartial(workspaceId))?.id === replacementMessageId,
-        2000
-      );
-
-      releaseStaleCleanup();
-      await waitForCondition(
-        async () => (await historyService.readPartial(workspaceId))?.id === replacementMessageId,
-        1000
-      );
+      const first = await player.play([user], workspaceId);
+      if (!first.success || !first.data) throw new Error("Expected handle");
+      await entered.promise;
+      const replacement = player.play([user], workspaceId).then((result) => {
+        replacementStarted = true;
+        return result;
+      });
+      expect(replacementStarted).toBe(false);
+      release.resolve();
+      const next = await replacement;
+      if (!next.success || !next.data) throw new Error("Expected replacement");
+      expect(await first.data.completion).toMatchObject({
+        status: "aborted",
+        abortReason: "system",
+      });
+      const partial = await historyService.readPartial(workspaceId);
+      expect(partial?.id).not.toBe(first.data.messageId);
+      expect(next.data.messageId).not.toBe(first.data.messageId);
     } finally {
-      releaseFirstWrite();
-      releaseStaleCleanup();
+      release.resolve();
       await player.stop(workspaceId);
     }
   });
@@ -541,15 +489,19 @@ describe("MockAiStreamPlayer", () => {
       aiService: aiServiceStub as unknown as AIService,
     });
 
-    const originalDeletePartial = historyService.deletePartial.bind(historyService);
-    let deletePartialCallCount = 0;
-    spyOn(historyService, "deletePartial").mockImplementation(async (workspaceIdToDelete) => {
-      deletePartialCallCount += 1;
-      if (deletePartialCallCount === 1) {
-        await new Promise((resolve) => setTimeout(resolve, 300));
+    // Hold the error handler's partial write open, so the replacement cancels it mid-write.
+    // The API error streams no text, so the first write is the stream-error one.
+    const originalWritePartial = historyService.writePartial.bind(historyService);
+    let writePartialCallCount = 0;
+    spyOn(historyService, "writePartial").mockImplementation(
+      async (workspaceIdToWrite, message) => {
+        writePartialCallCount += 1;
+        if (writePartialCallCount === 1) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+        return await originalWritePartial(workspaceIdToWrite, message);
       }
-      return await originalDeletePartial(workspaceIdToDelete);
-    });
+    );
 
     const workspaceId = "workspace-stale-stream-error";
     const errorEvents: Array<{ messageId?: string }> = [];
@@ -572,7 +524,7 @@ describe("MockAiStreamPlayer", () => {
     const firstPlayResult = await player.play([firstUserMessage], workspaceId);
     expect(firstPlayResult.success).toBe(true);
 
-    await waitForCondition(() => deletePartialCallCount >= 1, 1000);
+    await waitForCondition(() => writePartialCallCount >= 1, 1000);
 
     const replacementUserMessage = createMuxMessage(
       "user-stream-error-second",
@@ -684,6 +636,8 @@ describe("MockAiStreamPlayer", () => {
     expect(playResult.success).toBe(true);
 
     await waitForCondition(() => !player.isStreaming(workspaceId), 2000);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    expect(await playResult.data.completion).toMatchObject({ status: "completed" });
 
     const partial = await historyService.readPartial(workspaceId);
     expect(partial).toBeNull();
@@ -693,6 +647,112 @@ describe("MockAiStreamPlayer", () => {
     const assistantMessage = historyMessages.find((message) => message.role === "assistant");
     expect(assistantMessage).toBeDefined();
     expect(extractText(assistantMessage)).toContain("Here are three programming languages");
+  });
+
+  test("keeps the streamed partial with its error details on stream error, like StreamManager", async () => {
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+
+    const workspaceId = "workspace-error-partial";
+    const userMessage = createMuxMessage(
+      "user-error-partial",
+      "user",
+      "[mock:error:context] Trigger context error",
+      { timestamp: Date.now() }
+    );
+
+    const playResult = await player.play([userMessage], workspaceId);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    const completion = await playResult.data.completion;
+    expect(completion).toMatchObject({ status: "failed" });
+
+    // StreamManager.persistStreamError keeps the partial with its error details. The mock used
+    // to delete it, which left an empty assistant row after a reload (#5700).
+    const partial = await historyService.readPartial(workspaceId);
+    if (completion.status !== "failed") throw new Error("expected a failed completion");
+    expect(partial?.id).toBe(completion.streamError.messageId);
+    expect(partial?.metadata).toMatchObject({
+      partial: true,
+      error: "Context length exceeded in mock stream.",
+      errorType: "context_exceeded",
+    });
+    expect(extractText(partial)).toBe("Streaming response before context limit.");
+  });
+
+  test("retries a request that ends with the error partial on the user message that started it", async () => {
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+
+    const workspaceId = "workspace-error-retry";
+    const userMessage = createMuxMessage(
+      "user-error-retry",
+      "user",
+      "[mock:error:context] Trigger context error",
+      { timestamp: Date.now() }
+    );
+    const first = await player.play([userMessage], workspaceId);
+    if (!first.success || !first.data) throw new Error("expected a stream handle");
+    await first.data.completion;
+    const partial = await historyService.readPartial(workspaceId);
+    if (!partial) throw new Error("expected the error partial");
+
+    // A retry or resume sends the history with the kept partial last. Real requests continue it
+    // (addInterruptedSentinel), so the mock must answer the same user prompt again, not refuse
+    // the request or echo a [CONTINUE] sentinel.
+    const retry = await player.play([userMessage, partial], workspaceId);
+    if (!retry.success || !retry.data) throw new Error("expected a stream handle for the retry");
+    expect(await retry.data.completion).toMatchObject({
+      status: "failed",
+      streamError: { error: "Context length exceeded in mock stream." },
+    });
+
+    // commitPartial keeps `partial: true` on an errored partial, so a second retry sends both
+    // partials. The mock must walk back past every one of them.
+    const secondPartial = await historyService.readPartial(workspaceId);
+    if (!secondPartial) throw new Error("expected the second error partial");
+    expect(secondPartial.id).not.toBe(partial.id);
+    const secondRetry = await player.play([userMessage, partial, secondPartial], workspaceId);
+    if (!secondRetry.success || !secondRetry.data) {
+      throw new Error("expected a stream handle for the second retry");
+    }
+    expect(await secondRetry.data.completion).toMatchObject({
+      status: "failed",
+      streamError: { error: "Context length exceeded in mock stream." },
+    });
+  });
+
+  test("passes the mock rate limit's Retry-After to the turn completion", async () => {
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+
+    const workspaceId = "workspace-rate-limit";
+    const userMessage = createMuxMessage(
+      "user-rate-limit",
+      "user",
+      "[mock:error:rate-limit] Trigger rate limit error",
+      { timestamp: Date.now() }
+    );
+
+    const playResult = await player.play([userMessage], workspaceId);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    // AgentSession schedules auto-retry from the completion's streamError, so the retry waits
+    // as long as the error text says, as with a real provider's Retry-After.
+    expect(await playResult.data.completion).toMatchObject({
+      status: "failed",
+      streamError: { errorType: "rate_limit", retryAfterMs: 60_000 },
+    });
   });
 
   test("preserves agent and workspace-turn metadata through mock stream completion", async () => {
@@ -727,9 +787,13 @@ describe("MockAiStreamPlayer", () => {
       muxMetadata,
     });
     expect(playResult.success).toBe(true);
-    await waitForCondition(() => !player.isStreaming(workspaceId), 2000);
+    if (!playResult.success || !playResult.data) throw new Error("Expected mock handle");
+    const completion = await playResult.data.completion;
+    expect(completion).toMatchObject({ status: "completed", streamEnd });
+    expect(player.isStreaming(workspaceId)).toBe(false);
 
-    expect(streamStart).toMatchObject({ agentId: "explore", thinkingLevel: "high" });
+    // Turn metadata must arrive at start so the renderer can classify the turn before deltas.
+    expect(streamStart).toMatchObject({ agentId: "explore", thinkingLevel: "high", muxMetadata });
     expect(streamEnd?.metadata).toMatchObject({
       agentId: "explore",
       thinkingLevel: "high",
@@ -743,6 +807,87 @@ describe("MockAiStreamPlayer", () => {
       agentId: "explore",
       thinkingLevel: "high",
       muxMetadata,
+    });
+  });
+
+  test("a canned todo_write writes its list only once its tool call completes", async () => {
+    using sessionsDir = new DisposableTempDir("mock-todo-write");
+    const emitter = new EventEmitter();
+    emitter.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: emitter as unknown as AIService,
+      sessionsDir: sessionsDir.path,
+    });
+    const workspaceId = "workspace-mock-todo-write";
+    const sessionDir = path.join(sessionsDir.path, workspaceId);
+    const user = (id: string, text: string) =>
+      createMuxMessage(id, "user", text, { timestamp: Date.now() });
+
+    // Aborted while its stream start is held: the todo_write never ran, so no list.
+    const abort = new AbortController();
+    const held = player.play(
+      [user("u-held", "[mock:wait-start] [mock:todo-nudge] held")],
+      workspaceId,
+      {
+        abortSignal: abort.signal,
+      }
+    );
+    abort.abort();
+    expect((await held).success).toBe(true);
+    expect(await readTodosForSessionDir(sessionDir, nodeSessionFiles)).toEqual([]);
+
+    // A finished stream leaves the list on disk before it ends (the turn-end nudge reads it).
+    const result = await player.play([user("u-done", "[mock:todo-nudge] go")], workspaceId);
+    if (!result.success || !result.data) throw new Error("expected a stream handle");
+    expect(await result.data.completion).toMatchObject({ status: "completed" });
+    expect(await readTodosForSessionDir(sessionDir, nodeSessionFiles)).toEqual([
+      { content: "Fixed the bug", status: "completed" },
+      { content: "Verify the fix", status: "pending" },
+    ]);
+  });
+
+  describe("a reply that holds its tool calls", () => {
+    async function playHeld(workspaceId: string) {
+      const emitter = new EventEmitter();
+      const player = new MockAiStreamPlayer({
+        historyService,
+        aiService: emitter as unknown as AIService,
+      });
+      const toolStarts: string[] = [];
+      emitter.on("tool-call-start", (payload: { toolCallId: string }) => {
+        toolStarts.push(payload.toolCallId);
+      });
+      const started = new Promise<void>((resolve) => emitter.once("stream-start", () => resolve()));
+      const user = createMuxMessage("user-held", "user", "[mock:tool:parallel-step] go", {
+        timestamp: Date.now(),
+      });
+      const result = await player.play([user], workspaceId);
+      if (!result.success || !result.data) throw new Error("expected a stream handle");
+      await started;
+      // Every timer of the reply is due by now; only the hold keeps the tool calls back.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      return { player, toolStarts, completion: result.data.completion };
+    }
+
+    test("streams with no tool call until released, then finishes", async () => {
+      const { player, toolStarts, completion } = await playHeld("workspace-held");
+      expect(player.isStreaming("workspace-held")).toBe(true);
+      expect(toolStarts).toEqual([]);
+
+      player.releaseToolCalls("workspace-held");
+      expect(await completion).toMatchObject({ status: "completed" });
+      expect(toolStarts).toEqual(["tool-parallel-step-a", "tool-parallel-step-b"]);
+    });
+
+    test("stop does not wait for a release", async () => {
+      const { player, toolStarts, completion } = await playHeld("workspace-held-stop");
+      await player.stop("workspace-held-stop");
+      expect(await completion).toMatchObject({ status: "aborted" });
+      expect(toolStarts).toEqual([]);
+      expect(() => player.releaseToolCalls("workspace-held-stop")).toThrow(
+        "No mock stream in workspace-held-stop holds its tool calls"
+      );
     });
   });
 
@@ -800,5 +945,360 @@ describe("MockAiStreamPlayer", () => {
 
     expect(deltaCount).toBe(deltasAtStop);
     expect(abortCount).toBe(1);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    expect(await playResult.data.completion).toMatchObject({ status: "aborted" });
+  });
+  test.each(["stream-end", "error"] as const)(
+    "a synchronous stop from %s cannot publish a second terminal",
+    async (eventName) => {
+      const emitter = new EventEmitter();
+      const player = new MockAiStreamPlayer({
+        historyService,
+        aiService: emitter as unknown as AIService,
+      });
+      const workspaceId = `mock-reentrant-${eventName}`;
+      let stop: Promise<void> | undefined;
+      let aborts = 0;
+      emitter.on("stream-abort", () => {
+        aborts++;
+      });
+      emitter.once(eventName, () => {
+        stop = player.stop(workspaceId, { abortReason: "user" });
+        throw new Error("terminal listener failed");
+      });
+      const played = await player.play(
+        [
+          createMuxMessage(
+            "user",
+            "user",
+            eventName === "error"
+              ? "[mock:error:api] Trigger API error"
+              : "[mock:list-languages] List 3 programming languages"
+          ),
+        ],
+        workspaceId
+      );
+      if (!played.success || !played.data) throw new Error("Expected mock handle");
+      try {
+        const completion = await played.data.completion;
+        expect(completion.status).toBe(eventName === "error" ? "failed" : "completed");
+        expect(stop).toBeDefined();
+        await stop;
+        expect(aborts).toBe(0);
+      } finally {
+        await player.stop(workspaceId);
+      }
+    }
+  );
+
+  test.each([false, true])(
+    "abort completion waits for partial deletion (reject=%s)",
+    async (rejectDelete) => {
+      const emitter = new EventEmitter();
+      const player = new MockAiStreamPlayer({
+        historyService,
+        aiService: emitter as unknown as AIService,
+      });
+      const workspaceId = "mock-abort-completion-barrier";
+      const delta = Promise.withResolvers<void>();
+      emitter.once("stream-delta", () => delta.resolve());
+      const played = await player.play(
+        [createMuxMessage("user", "user", "[force] keep streaming")],
+        workspaceId
+      );
+      if (!played.success || !played.data) throw new Error("Expected mock handle");
+      await delta.promise;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const deletePartial = historyService.deletePartialIfMessageIdMatches.bind(historyService);
+      const deletion = spyOn(
+        historyService,
+        "deletePartialIfMessageIdMatches"
+      ).mockImplementationOnce(async (id, messageId) => {
+        entered.resolve();
+        await release.promise;
+        if (rejectDelete) throw new Error("partial delete failed");
+        return deletePartial(id, messageId);
+      });
+      let settled = false;
+      const observed = played.data.completion.then(() => {
+        settled = true;
+      });
+      let terminal: unknown;
+      emitter.once("stream-abort", (payload) => {
+        terminal = payload;
+      });
+      const stop = player
+        .stop(workspaceId, { abandonPartial: true, abortReason: "user" })
+        .catch((error) => error as unknown);
+      try {
+        await entered.promise;
+        expect(player.isStreaming(workspaceId)).toBe(true);
+        expect(settled).toBe(false);
+        expect(terminal).toBeUndefined();
+        release.resolve();
+        await stop;
+        expect(await played.data.completion).toMatchObject({
+          status: "aborted",
+          streamAbort: terminal,
+        });
+        await observed;
+        if (!rejectDelete) expect(await historyService.readPartial(workspaceId)).toBeNull();
+      } finally {
+        release.resolve();
+        await stop;
+        deletion.mockRestore();
+      }
+    }
+  );
+  test("keeps its delta pacing and partial writes while the tokenizer is still loading", async () => {
+    // Regression (#7065): each stream-delta raced the tokenizer against a 150 ms fallback, so
+    // while the tokenizer loaded (~2 s cold in the e2e app) every 25 ms delta held the event
+    // queue for 150 ms. The throttled partial write queued behind that backlog, and partial.json
+    // first appeared ~1.9 s into a mock stream that the row already showed as streaming.
+    const tokenizerLoad = Promise.withResolvers<never>();
+    const tokenizerSpy = spyOn(tokenizerModule, "getTokenizerForModel").mockImplementation(
+      () => tokenizerLoad.promise
+    );
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+    const workspaceId = "workspace-cold-tokenizer";
+    let deltaCount = 0;
+    aiServiceStub.on("stream-delta", () => {
+      deltaCount++;
+    });
+
+    const user = createMuxMessage("user-1", "user", "[mock:long-stream] keep streaming", {
+      timestamp: Date.now(),
+    });
+    try {
+      const playResult = await player.play([user], workspaceId);
+      expect(playResult.success).toBe(true);
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      // The schedule has ~20 deltas due by now; a 150 ms wait per delta emits at most 4.
+      expect(deltaCount).toBeGreaterThanOrEqual(8);
+      await waitForCondition(
+        async () => (await historyService.readPartial(workspaceId)) !== null,
+        1000
+      );
+    } finally {
+      await player.stop(workspaceId);
+      // Later tests in this file must keep the real tokenizer.
+      tokenizerSpy.mockRestore();
+      tokenizerLoad.reject(new Error("test done"));
+    }
+  });
+
+  test("dispatches text deltas in schedule order when a later timer fires before an earlier one", async () => {
+    // Regression (tests/ui bottomLayoutShift under 4-worker load): each scheduled event has an
+    // independent setTimeout, and when several are overdue the runtime may fire the later-delay
+    // timer first. processQueue serializes handlers in *enqueue* order, so the deltas were emitted
+    // reversed; buildCompletedParts later replaced the accumulated text with the adapter's full
+    // text, hiding the wrong live order from persisted history. Drive the timers directly so the
+    // inversion is deterministic instead of load-dependent.
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+    const workspaceId = "workspace-timer-order";
+    const userText = "Seed idle target transcript";
+    const user = createMuxMessage("user-1", "user", userText, { timestamp: Date.now() });
+
+    // Derive the expected schedule from the adapter so the test follows chunking/delay constants.
+    const expectedEvents = buildMockStreamEventsFromReply(
+      { assistantText: `Mock response: ${userText}` },
+      { messageId: "expected" }
+    );
+    const expectedDeltas = expectedEvents.flatMap((event) =>
+      event.kind === "stream-delta" ? [event.text] : []
+    );
+    expect(expectedDeltas.length).toBeGreaterThanOrEqual(2);
+    const scheduledDelays = new Set(expectedEvents.map((event) => event.delay));
+
+    const emittedDeltas: string[] = [];
+    let deltasSeenAtStreamEnd = -1;
+    aiServiceStub.on("stream-delta", (event: StreamDeltaEvent) => {
+      emittedDeltas.push(event.delta);
+    });
+    aiServiceStub.on("stream-end", () => {
+      deltasSeenAtStreamEnd = emittedDeltas.length;
+    });
+
+    // Capture only the player's event timers (delays taken from the adapter schedule); every
+    // other timer (stream-start watchdog, lock retries, tokenizer fallback) keeps the real clock.
+    const captured: Array<{ delay: number; fire: () => void }> = [];
+    const scheduled = Promise.withResolvers<void>();
+    const realSetTimeout = globalThis.setTimeout;
+    const capturingSetTimeout = ((
+      callback: (...args: unknown[]) => void,
+      delay?: number,
+      ...args: unknown[]
+    ) => {
+      if (scheduledDelays.has(delay ?? 0)) {
+        captured.push({ delay: delay ?? 0, fire: () => callback(...args) });
+        if (captured.length === expectedEvents.length) scheduled.resolve();
+        return { ref: () => undefined, unref: () => undefined } as unknown as ReturnType<
+          typeof setTimeout
+        >;
+      }
+      return realSetTimeout(callback, delay, ...args);
+    }) as typeof setTimeout;
+
+    globalThis.setTimeout = capturingSetTimeout;
+    let playResult: Awaited<ReturnType<MockAiStreamPlayer["play"]>>;
+    try {
+      const playPromise = player.play([user], workspaceId);
+      // play() resolves only after stream-start fires; observe scheduling directly instead of polling.
+      await Promise.race([
+        scheduled.promise,
+        playPromise.then(() => {
+          throw new Error("Mock player returned before scheduling its event timers");
+        }),
+      ]);
+      expect(captured).toHaveLength(expectedEvents.length);
+      globalThis.setTimeout = realSetTimeout;
+
+      const byDelay = [...captured].sort((a, b) => a.delay - b.delay);
+      const [streamStart, ...rest] = byDelay;
+      const terminal = rest.pop();
+      if (!terminal) throw new Error("expected a terminal mock event");
+      // All deadlines are overdue by now; fire the deltas latest-first, as the loaded runtime did.
+      await new Promise<void>((resolve) => realSetTimeout(resolve, terminal.delay + 5));
+      streamStart.fire();
+      for (const timer of [...rest].reverse()) timer.fire();
+      terminal.fire();
+      playResult = await playPromise;
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
+
+    expect(playResult.success).toBe(true);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    const completion = await playResult.data.completion;
+    expect(completion.status).toBe("completed");
+
+    // Live emission must follow the adapter schedule with no duplicates, and the terminal event
+    // must not overtake the deltas.
+    expect(emittedDeltas).toEqual(expectedDeltas);
+    expect(deltasSeenAtStreamEnd).toBe(expectedDeltas.length);
+
+    await player.stop(workspaceId);
+  });
+
+  test("replays a mid-stream subscriber's missed events before the live tail, without duplicates", async () => {
+    // Chat-switch reconnects (#4542): a subscriber that joins mid-stream must see the stream's
+    // events so far (full replay) or only those after its cursor (incremental replay), then the
+    // live tail, with nothing duplicated, dropped, or interleaved.
+    const aiServiceStub = new EventEmitter();
+    aiServiceStub.on("error", () => undefined);
+    const player = new MockAiStreamPlayer({
+      historyService,
+      aiService: aiServiceStub as unknown as AIService,
+    });
+    const workspaceId = "workspace-mid-stream-replay";
+
+    interface SeenEvent {
+      type: string;
+      replay: boolean;
+      messageId: string;
+      delta?: string;
+      timestamp?: number;
+    }
+    const seen: SeenEvent[] = [];
+    for (const type of ["stream-start", "stream-delta", "usage-delta", "stream-end"]) {
+      aiServiceStub.on(
+        type,
+        (event: {
+          workspaceId: string;
+          messageId: string;
+          replay?: boolean;
+          delta?: string;
+          timestamp?: number;
+        }) => {
+          if (event.workspaceId !== workspaceId) return;
+          seen.push({
+            type,
+            replay: event.replay === true,
+            messageId: event.messageId,
+            delta: event.delta,
+            timestamp: event.timestamp,
+          });
+        }
+      );
+    }
+    const deltasOf = (events: SeenEvent[]) =>
+      events.filter((event) => event.type === "stream-delta");
+
+    // Long enough (~15 chunks) that the stream is still running when the subscriber joins.
+    const userText = "replay ".repeat(50).trim();
+    const expectedDeltas = buildMockStreamEventsFromReply(
+      { assistantText: `Mock response: ${userText}` },
+      { messageId: "expected" }
+    ).flatMap((event) => (event.kind === "stream-delta" ? [event.text] : []));
+
+    expect(player.getStreamInfo(workspaceId)).toBeUndefined();
+    const user = createMuxMessage("user-1", "user", userText, { timestamp: Date.now() });
+    const playResult = await player.play([user], workspaceId);
+    if (!playResult.success || !playResult.data) throw new Error("expected a stream handle");
+    const messageId = playResult.data.messageId;
+    await waitForCondition(() => deltasOf(seen).length >= 3, 5000);
+
+    const joinIndex = seen.length;
+    const deltasBeforeJoin = deltasOf(seen);
+    expect(deltasBeforeJoin.length).toBeLessThan(expectedDeltas.length);
+    // The reconnect cursor is StreamManager-shaped: the last part carries the newest delta time.
+    const info = player.getStreamInfo(workspaceId);
+    expect(info?.messageId).toBe(messageId);
+    expect(info?.parts.at(-1)?.timestamp).toBe(deltasBeforeJoin.at(-1)?.timestamp);
+
+    const cursor = deltasBeforeJoin[0].timestamp;
+    if (cursor === undefined) throw new Error("live deltas must carry timestamps");
+    // Subscriber A has no stream cursor (full replay); subscriber B saw only the first delta.
+    const fullReplay = player.replayStream(workspaceId);
+    const fullEnd = seen.length;
+    const incrementalReplay = player.replayStream(workspaceId, { afterTimestamp: cursor });
+    const incrementalEnd = seen.length;
+    await Promise.all([fullReplay, incrementalReplay]);
+
+    const full = seen.slice(joinIndex, fullEnd);
+    const incremental = seen.slice(fullEnd, incrementalEnd);
+    for (const replayed of [full, incremental]) {
+      expect(replayed.every((event) => event.replay && event.messageId === messageId)).toBe(true);
+      expect(replayed[0]?.type).toBe("stream-start");
+      expect(replayed.some((event) => event.type === "stream-end")).toBe(false);
+    }
+    const pick = (events: SeenEvent[]) =>
+      events.map(({ delta, timestamp }) => ({ delta, timestamp }));
+    expect(pick(deltasOf(full))).toEqual(pick(deltasBeforeJoin));
+    expect(pick(deltasOf(incremental))).toEqual(pick(deltasBeforeJoin.slice(1)));
+    // Incremental replays carry stream context only, never stale usage snapshots.
+    expect(incremental.some((event) => event.type === "usage-delta")).toBe(false);
+
+    const completion = await playResult.data.completion;
+    expect(completion.status).toBe("completed");
+    const tail = seen.slice(incrementalEnd);
+    expect(tail.every((event) => !event.replay)).toBe(true);
+
+    // Each subscriber's view: its replay, then the live tail. Together they are the whole reply.
+    for (const replayed of [full, [...deltasBeforeJoin.slice(0, 1), ...incremental]]) {
+      const view = [...deltasOf(replayed), ...deltasOf(tail)];
+      expect(view.map((event) => event.delta)).toEqual(expectedDeltas);
+      const timestamps = view.map((event) => event.timestamp ?? Number.NaN);
+      expect(
+        timestamps.every((timestamp, index) => index === 0 || timestamp > timestamps[index - 1])
+      ).toBe(true);
+    }
+
+    // A finished stream has nothing to replay.
+    expect(player.getStreamInfo(workspaceId)).toBeUndefined();
+    const afterEnd = seen.length;
+    await player.replayStream(workspaceId);
+    expect(seen.length).toBe(afterEnd);
   });
 });

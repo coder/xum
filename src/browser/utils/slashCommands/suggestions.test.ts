@@ -1,6 +1,7 @@
 import { describe, it, expect } from "bun:test";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import { getSlashCommandSuggestions } from "./suggestions";
+import { listInvocableSkills } from "@/common/utils/agentSkills/skillLookupName";
 import { resolveSlashCommandExperimentValue } from "./experimentVisibility";
 
 describe("resolveSlashCommandExperimentValue", () => {
@@ -9,15 +10,29 @@ describe("resolveSlashCommandExperimentValue", () => {
     // alone must not surface the command.
     expect(
       resolveSlashCommandExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION, {
-        workspaceHeartbeats: false,
         memoryConsolidation: true,
       })
     ).toBe(false);
     expect(
       resolveSlashCommandExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION, {
-        workspaceHeartbeats: false,
         memory: true,
         memoryConsolidation: true,
+      })
+    ).toBe(true);
+  });
+
+  it("requires the PTC parent flag for rlm-mode", () => {
+    // The backend refuses /refine unless RLM AND PTC are on, so the
+    // sub-flag alone must not surface the command.
+    expect(
+      resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
+        rlm: true,
+      })
+    ).toBe(false);
+    expect(
+      resolveSlashCommandExperimentValue(EXPERIMENT_IDS.RLM, {
+        rlm: true,
+        programmaticToolCalling: true,
       })
     ).toBe(true);
   });
@@ -28,6 +43,16 @@ describe("getSlashCommandSuggestions", () => {
     expect(getSlashCommandSuggestions("hello")).toEqual([]);
     expect(getSlashCommandSuggestions("")).toEqual([]);
   });
+
+  it.each(["workspace", "creation"] as const)(
+    "suggests speed toggles in %s composers",
+    (variant) => {
+      for (const mode of ["fast", "ultrafast"]) {
+        const suggestions = getSlashCommandSuggestions(`/${mode.slice(0, 2)}`, { variant });
+        expect(suggestions.map((suggestion) => suggestion.replacement)).toContain(`/${mode}`);
+      }
+    }
+  );
 
   it("filters workspace-only commands in creation mode", () => {
     const suggestions = getSlashCommandSuggestions("/", { variant: "creation" });
@@ -47,16 +72,17 @@ describe("getSlashCommandSuggestions", () => {
     });
     const labels = suggestions.map((s) => s.display);
 
-    expect(labels).not.toContain("/heartbeat");
+    expect(labels).toContain("/heartbeat");
     expect(labels).not.toContain("/dream");
+    expect(labels).not.toContain("/refine");
     // `/goal` graduated to GA — it must surface regardless of experiment state.
     expect(labels).toContain("/goal");
   });
 
   it("shows experiment-gated commands when their experiments are enabled", () => {
     const enabledExperiments = new Set<ExperimentId>([
-      EXPERIMENT_IDS.WORKSPACE_HEARTBEATS,
       EXPERIMENT_IDS.MEMORY_CONSOLIDATION,
+      EXPERIMENT_IDS.RLM,
     ]);
     const suggestions = getSlashCommandSuggestions("/", {
       isExperimentEnabled: (experimentId) => enabledExperiments.has(experimentId),
@@ -65,6 +91,7 @@ describe("getSlashCommandSuggestions", () => {
 
     expect(labels).toContain("/heartbeat");
     expect(labels).toContain("/dream");
+    expect(labels).toContain("/refine");
     // `/goal` is always available post-GA.
     expect(labels).toContain("/goal");
   });
@@ -159,6 +186,24 @@ describe("getSlashCommandSuggestions", () => {
     expect(skillSuggestion?.replacement).toBe("/fix-issue ");
   });
 
+  it("labels a display-name skill but inserts and matches only its ID", () => {
+    const agentSkills = [
+      {
+        name: "poteto-mode",
+        displayName: "Poteto Mode",
+        description: "poteto's style",
+        scope: "global" as const,
+      },
+    ];
+
+    const skillSuggestion = getSlashCommandSuggestions("/pot", { agentSkills }).find(
+      (s) => s.id === "skill:poteto-mode"
+    );
+    expect(skillSuggestion?.display).toBe("/poteto-mode");
+    expect(skillSuggestion?.description.startsWith("Poteto Mode")).toBe(true);
+    expect(skillSuggestion?.replacement).toBe("/poteto-mode ");
+  });
+
   it("matches hyphenated skill segments", () => {
     const suggestions = getSlashCommandSuggestions("/r", {
       agentSkills: [
@@ -186,6 +231,26 @@ describe("getSlashCommandSuggestions", () => {
     });
 
     expect(suggestions.map((s) => s.display)).toContain("/deep-review");
+  });
+
+  it("lists a shadowed plugin skill qualified and matches its skill segment", () => {
+    const tdd = { name: "tdd", description: "Test", scope: "global" as const };
+    const agentSkills = listInvocableSkills({
+      skills: [tdd],
+      shadowedPluginSkills: [
+        { ...tdd, pluginName: "pstack" },
+        { ...tdd, pluginName: "other" },
+      ],
+    });
+
+    // The bare name stays first, so `/tdd` + Enter still picks the global skill.
+    const tddLabels = getSlashCommandSuggestions("/tdd", { agentSkills }).map((s) => s.display);
+    expect(tddLabels).toEqual(["/tdd", "/other:tdd", "/pstack:tdd"]);
+    expect(
+      getSlashCommandSuggestions("/pstack:", { agentSkills }).find(
+        (s) => s.display === "/pstack:tdd"
+      )?.replacement
+    ).toBe("/pstack:tdd ");
   });
 
   it("filters top level commands by partial input", () => {

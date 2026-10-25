@@ -2,9 +2,12 @@ import type { Toast } from "./ChatInputToast";
 import { SolutionLabel } from "./ChatInputToast";
 import { DocsLink } from "@/browser/components/DocsLink/DocsLink";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
-import { SHUX_PRODUCT_NAME } from "@/common/constants/product";
+import { XUM_PRODUCT_NAME } from "@/common/constants/product";
 import type { SendMessageError as SendMessageErrorType } from "@/common/types/errors";
-import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
+import {
+  formatSendMessageError,
+  getCredentialSetupCopy,
+} from "@/common/utils/errors/formatSendError";
 
 export function createInvalidCompactModelToast(model: string): Toast {
   return {
@@ -127,11 +130,15 @@ export const createErrorToast = (error: SendMessageErrorType): Toast => {
   switch (error.type) {
     case "api_key_not_found": {
       const formatted = formatSendMessageError(error);
+      const { title, message } = getCredentialSetupCopy(error.provider) ?? {
+        title: "API Key Not Found",
+        message: `The ${error.provider} provider requires an API key to function.`,
+      };
       return {
         id: Date.now().toString(),
         type: "error",
-        title: "API Key Not Found",
-        message: `The ${error.provider} provider requires an API key to function.`,
+        title,
+        message,
         solution: (
           <>
             <SolutionLabel>Fix:</SolutionLabel>
@@ -222,7 +229,7 @@ export const createErrorToast = (error: SendMessageErrorType): Toast => {
         solution: (
           <>
             <SolutionLabel>Solution:</SolutionLabel>
-            Upgrade {SHUX_PRODUCT_NAME} to use this workspace, or delete it and create a new one.
+            Upgrade {XUM_PRODUCT_NAME} to use this workspace, or delete it and create a new one.
           </>
         ),
       };

@@ -27,23 +27,35 @@ describe("ProvidersConfigSchema", () => {
     expect(ProvidersConfigSchema.safeParse(valid).success).toBe(true);
   });
 
-  it("allows unknown provider keys with custom OpenAI-compatible metadata", () => {
-    const valid = {
-      "custom-provider": {
-        apiKey: "key",
-        baseUrl: "http://localhost:8080",
-        providerType: "openai-compatible",
-        displayName: "Custom Provider",
-      },
-    };
+  it("allows every custom provider API format", () => {
+    for (const providerType of [
+      "openai-compatible",
+      "openai-responses",
+      "anthropic-messages",
+    ] as const) {
+      const parsed = ProvidersConfigSchema.safeParse({
+        "custom-provider": {
+          apiKey: "key",
+          baseUrl: "http://localhost:8080",
+          providerType,
+          displayName: "Custom Provider",
+        },
+      });
 
-    const parsed = ProvidersConfigSchema.safeParse(valid);
-
-    expect(parsed.success).toBe(true);
-    if (parsed.success) {
-      expect(parsed.data["custom-provider"]?.providerType).toBe("openai-compatible");
-      expect(parsed.data["custom-provider"]?.displayName).toBe("Custom Provider");
+      expect(parsed.success).toBe(true);
+      if (parsed.success) {
+        expect(parsed.data["custom-provider"]?.providerType).toBe(providerType);
+        expect(parsed.data["custom-provider"]?.displayName).toBe("Custom Provider");
+      }
     }
+  });
+
+  it("rejects unknown custom provider API formats", () => {
+    expect(
+      ProvidersConfigSchema.safeParse({
+        "custom-provider": { providerType: "unknown-format" },
+      }).success
+    ).toBe(false);
   });
 
   it("rejects empty custom provider display names", () => {

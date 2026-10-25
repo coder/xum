@@ -1,6 +1,6 @@
 import { useState, type ComponentProps, type ReactNode, useEffect, useMemo } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { expect, fn, userEvent, within } from "@storybook/test";
+import { expect, fn, userEvent, within } from "storybook/test";
 import { APIProvider } from "@/browser/contexts/API";
 import { ProjectProvider } from "@/browser/contexts/ProjectContext";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
@@ -90,7 +90,6 @@ const BASE_ARGS = {
   value: RUNTIME_MODE.WORKTREE,
   defaultMode: RUNTIME_MODE.WORKTREE,
   onChange: fn(),
-  onSetDefault: fn(),
   runtimeAvailabilityState: getLoadedRuntimeAvailability({ available: true }),
 } satisfies RuntimeButtonGroupProps;
 
@@ -118,17 +117,17 @@ const DEVCONTAINER_BASE_CREATION_CONTROLS_PROPS: Omit<
   "selectedRuntime" | "onSelectedRuntimeChange" | "runtimeAvailabilityState"
 > = {
   branches: ["main", "develop"],
-  branchesLoaded: true,
+  branchLoad: "loaded",
   trunkBranch: "main",
   onTrunkBranchChange: fn(),
   coderConfigFallback: {},
   sshHostFallback: "devbox.internal",
   defaultRuntimeMode: RUNTIME_MODE.WORKTREE,
-  onSetDefaultRuntime: fn(),
   disabled: false,
   projectPath: "/home/user/projects/my-app",
   userProjects: new Map(),
   onSelectedProjectPathChange: fn(),
+  projectSelectDisabled: false,
   projectName: "my-app",
   nameState: {
     name: "devcontainer-story",
@@ -332,7 +331,7 @@ const BASE_CREATION_NAME_STATE: WorkspaceNameState = {
 
 const CREATION_ERROR_BASE_CONTROLS_PROPS = {
   branches: ["main"],
-  branchesLoaded: true,
+  branchLoad: "loaded",
   trunkBranch: "main",
   onTrunkBranchChange: fn(),
   selectedRuntime: { mode: RUNTIME_MODE.WORKTREE },
@@ -340,11 +339,11 @@ const CREATION_ERROR_BASE_CONTROLS_PROPS = {
   sshHostFallback: "devbox",
   defaultRuntimeMode: RUNTIME_MODE.WORKTREE,
   onSelectedRuntimeChange: fn(),
-  onSetDefaultRuntime: fn(),
   disabled: false,
   projectPath: CREATION_PROJECT_PATH,
   userProjects: new Map(),
   onSelectedProjectPathChange: fn(),
+  projectSelectDisabled: false,
   projectName: "my-project",
   runtimeAvailabilityState: BASE_ARGS.runtimeAvailabilityState,
   nameState: BASE_CREATION_NAME_STATE,
@@ -420,7 +419,6 @@ export const NameGenerationAuthError: Story = {
     ),
 };
 
-/** Manual naming validation error for characters outside the workspace-name policy. */
 export const NameValidationError: Story = {
   render: () =>
     renderCreationControls(
@@ -430,7 +428,7 @@ export const NameValidationError: Story = {
         error: {
           kind: "validation",
           message:
-            "Workspace names can only contain lowercase letters, numbers, hyphens, and underscores",
+            'Branch names can only contain lowercase letters, numbers, hyphens, underscores, and "/" separators',
         },
       })
     ),

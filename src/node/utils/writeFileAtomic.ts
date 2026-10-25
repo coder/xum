@@ -1,0 +1,501 @@
+/**
+ * Atomic file replacement: write to a sibling temp file, fsync, then rename over
+ * the destination so readers only ever see the old or the new contents.
+ *
+ * First-party replacement for the `write-file-atomic` npm package (same call
+ * shape: default async export plus `.sync`). That package issued a single
+ * write(2) and ignored the returned byte count; when a filesystem fills up,
+ * write(2) accepts a short count without reporting an error, so the truncated
+ * temp file was fsynced and renamed over the previous good file. In the
+ * coder/xum#4197 incident that turned config.json into a page-aligned prefix
+ * that later loaded as an empty registry. Shipping the fix as source (rather
+ * than a bun patch) is what reaches `npm install -g @coder/xum` users, whose
+ * dependencies come from the npm registry.
+ *
+ * Two independent defenses: the whole payload is written in a loop, and the
+ * temp file's size is compared with the payload before the rename.
+ */
+import * as crypto from "crypto";
+// Default import on purpose: it is the CommonJS module object that `require("fs")`
+// returns, which is what the replaced package used. Tests across the repo observe or
+// fail individual steps (fs.rename, fs.write, fs.writeSync) by spying on that object;
+// the `import * as fs` namespace is a separate binding that such spies never reach.
+import fs from "fs";
+import * as path from "path";
+import { promisify } from "util";
+import { threadId } from "worker_threads";
+import { getErrorMessage } from "@/common/utils/errors";
+import { log } from "@/node/services/log";
+
+/**
+ * The CommonJS fs members that writeFileAtomic calls. Another implementation (the in-memory
+ * session files) passes its own through `Options.fs`.
+ */
+export type WriteFileAtomicFs = Pick<
+  typeof fs,
+  | "chmod"
+  | "chmodSync"
+  | "chown"
+  | "chownSync"
+  | "close"
+  | "closeSync"
+  | "fstat"
+  | "fstatSync"
+  | "fsync"
+  | "fsyncSync"
+  | "open"
+  | "openSync"
+  | "realpath"
+  | "realpathSync"
+  | "rename"
+  | "renameSync"
+  | "stat"
+  | "statSync"
+  | "unlink"
+  | "unlinkSync"
+  | "write"
+  | "writeSync"
+>;
+
+export interface Options {
+  /** Encoding for string payloads (default utf8). */
+  encoding?: BufferEncoding;
+  /** File mode; defaults to the destination's current mode when it exists. */
+  mode?: number;
+  /** Owner to apply; defaults to the destination's current owner when it exists. */
+  chown?: { uid: number; gid: number };
+  /** Set to false to skip fsync before the rename (default true). */
+  fsync?: boolean;
+  /**
+   * Runs right before the rename, with the resolved target path. Throw to abort: the temp file is
+   * removed and the target stays untouched. Lets a caller refuse to replace bytes it did not read.
+   */
+  beforeRename?: (target: string) => void;
+  /**
+   * Runs once, right after the rename and before the parent directory fsync: the moment readers
+   * of the target see the new contents. Opt-in; the write still resolves only after the fsync.
+   * Lets a caller publish in-memory state at that moment (DraftService, #6728). A throw is logged
+   * and does not fail the write: the file is already replaced.
+   */
+  afterRename?: () => void;
+  /**
+   * The file system to write on (default: the CommonJS fs object, read on each call). The
+   * exit-time temp cleanup always uses the host fs.
+   */
+  fs?: WriteFileAtomicFs;
+}
+
+type ResolvedOptions = Options & {
+  encoding: BufferEncoding;
+  beforeRename: (target: string) => void;
+};
+
+/** Runs `afterRename`; a throw is logged, never raised (the rename already replaced the target). */
+function runAfterRename(options: ResolvedOptions, target: string): void {
+  if (!options.afterRename) return;
+  try {
+    options.afterRename();
+  } catch (error) {
+    log.error("writeFileAtomic: afterRename failed after the target was replaced", {
+      target,
+      error: getErrorMessage(error),
+    });
+  }
+}
+
+/** The beforeRename default: replace the target without a check. */
+function noCheck(): void {
+  // Intentionally empty: callers without a check replace the target unconditionally.
+}
+
+let invocations = 0;
+const pendingTempFiles = new Set<string>();
+// Serializes writes to the same destination within this process so two callers
+// cannot interleave their temp files and renames.
+const activeWrites = new Map<string, Promise<void>>();
+
+process.once("exit", () => {
+  for (const tempFile of pendingTempFiles) {
+    try {
+      // eslint-disable-next-line local/no-sync-fs-methods -- exit handlers cannot await.
+      fs.unlinkSync(tempFile);
+    } catch {
+      // Best-effort cleanup only.
+    }
+  }
+});
+
+function resolveOptions(options?: Options | BufferEncoding): ResolvedOptions {
+  if (typeof options === "string") {
+    return { encoding: options, beforeRename: noCheck };
+  }
+  return {
+    ...options,
+    encoding: options?.encoding ?? "utf8",
+    beforeRename: beforeRenameOf(options),
+  };
+}
+
+function beforeRenameOf(options: Options | undefined): (target: string) => void {
+  return options?.beforeRename ?? noCheck;
+}
+
+function toBuffer(data: string | Buffer, encoding: BufferEncoding): Buffer {
+  return typeof data === "string" ? Buffer.from(data, encoding) : data;
+}
+
+function tempPathFor(filename: string): string {
+  const suffix = crypto
+    .createHash("sha1")
+    .update(`${process.pid}|${threadId}|${++invocations}|${crypto.randomBytes(8).toString("hex")}`)
+    .digest("hex")
+    .slice(0, 12);
+  return `${filename}.${suffix}`;
+}
+
+function incompleteWriteError(tempFile: string, written: number, expected: number): Error {
+  const error: NodeJS.ErrnoException = new Error(
+    `Incomplete write to ${tempFile}: ${written} of ${expected} bytes`
+  );
+  error.code = "EIO";
+  return error;
+}
+
+// chown/chmod may legitimately fail for a non-root process on some filesystems
+// (mirrors graceful-fs). Everything else propagates.
+function isOwnershipErrorOk(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "ENOSYS") {
+    return true;
+  }
+  const nonRoot = !process.getuid || process.getuid() !== 0;
+  return nonRoot && (code === "EINVAL" || code === "EPERM");
+}
+
+function fillOptionsFromStats(options: ResolvedOptions, stats: fs.Stats | undefined): void {
+  if (!stats) {
+    return;
+  }
+  options.mode ??= stats.mode;
+  if (process.getuid) {
+    options.chown ??= { uid: stats.uid, gid: stats.gid };
+  }
+}
+
+// Callback fs API promisified at call time (not the promise API), so the spies above
+// see every step.
+function write(
+  files: WriteFileAtomicFs,
+  fd: number,
+  buffer: Buffer,
+  offset: number
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    files.write(fd, buffer, offset, buffer.length - offset, offset, (error, bytesWritten) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve(bytesWritten);
+      }
+    });
+  });
+}
+
+async function writeAll(
+  files: WriteFileAtomicFs,
+  fd: number,
+  buffer: Buffer,
+  tempFile: string
+): Promise<void> {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = await write(files, fd, buffer, offset);
+    if (!(written > 0)) {
+      throw incompleteWriteError(tempFile, offset, buffer.length);
+    }
+    offset += written;
+  }
+}
+
+function assertCompleteSize(size: number, expected: number, tempFile: string): void {
+  if (size !== expected) {
+    throw incompleteWriteError(tempFile, size, expected);
+  }
+}
+
+async function applyOwnership(
+  files: WriteFileAtomicFs,
+  tempFile: string,
+  options: ResolvedOptions
+): Promise<void> {
+  if (options.chown) {
+    try {
+      await promisify(files.chown)(tempFile, options.chown.uid, options.chown.gid);
+    } catch (error) {
+      if (!isOwnershipErrorOk(error)) throw error;
+    }
+  }
+  if (options.mode != null) {
+    // open() applies the umask to the requested mode; chmod pins the exact mode.
+    try {
+      await promisify(files.chmod)(tempFile, options.mode);
+    } catch (error) {
+      if (!isOwnershipErrorOk(error)) throw error;
+    }
+  }
+}
+
+// Windows reports these while another handle (an antivirus scanner, or an in-process reader such
+// as the unlocked history status scan) has the destination open. On POSIX they are persistent,
+// so retrying only delays an already-failing write by at most the budget, and one code path
+// keeps Linux CI exercising the logic Windows depends on.
+const RETRYABLE_RENAME_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const RENAME_RETRY_BUDGET_MS = 2000;
+const RENAME_RETRY_INITIAL_DELAY_MS = 10;
+const RENAME_RETRY_MAX_DELAY_MS = 100;
+
+/** Clock and sleep for the rename retry; tests replace them to run it in virtual time. */
+export const renameRetryTiming = {
+  now: (): number => performance.now(),
+  sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+async function renameWithRetry(
+  files: WriteFileAtomicFs,
+  tempFile: string,
+  target: string,
+  beforeRename: (target: string) => void
+): Promise<void> {
+  const deadline = renameRetryTiming.now() + RENAME_RETRY_BUDGET_MS;
+  let delay = RENAME_RETRY_INITIAL_DELAY_MS;
+  for (;;) {
+    // Before every attempt: the target can change during a retry sleep.
+    beforeRename(target);
+    try {
+      await promisify(files.rename)(tempFile, target);
+      return;
+    } catch (error) {
+      const remaining = deadline - renameRetryTiming.now();
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === undefined || !RETRYABLE_RENAME_CODES.has(code) || remaining <= 0) throw error;
+      await renameRetryTiming.sleep(Math.min(delay, remaining));
+      delay = Math.min(delay * 2, RENAME_RETRY_MAX_DELAY_MS);
+    }
+  }
+}
+
+// rename(2) is durable only once the parent directory entry reaches disk; a crash right after
+// the rename can otherwise bring back the old file on some filesystems (#5331). Windows cannot
+// fsync directory handles. Best effort: the new contents are already visible, so a failed
+// flush is logged instead of failing a write that did replace the file. Exported for other
+// rename-based publishers (publishCompactionFile, #5344).
+export async function fsyncParentDirectory(
+  target: string,
+  files: WriteFileAtomicFs = fs
+): Promise<void> {
+  if (process.platform === "win32") return;
+  let fd: number | undefined;
+  try {
+    fd = await promisify(files.open)(path.dirname(target), "r");
+    await promisify(files.fsync)(fd);
+  } catch (error) {
+    log.debug("parent directory fsync failed", {
+      target,
+      error: getErrorMessage(error),
+    });
+  } finally {
+    if (fd !== undefined) await promisify(files.close)(fd).catch(() => undefined);
+  }
+}
+
+async function writeFileAtomicUnserialized(
+  filename: string,
+  data: string | Buffer,
+  options: ResolvedOptions
+): Promise<void> {
+  const files = options.fs ?? fs;
+  // Follow symlinks so the rename replaces the link's target rather than the link.
+  const target = await promisify(files.realpath)(filename).catch(() => filename);
+  fillOptionsFromStats(options, await promisify(files.stat)(target).catch(() => undefined));
+  const buffer = toBuffer(data, options.encoding);
+  const tempFile = tempPathFor(target);
+  pendingTempFiles.add(tempFile);
+  let fd: number | undefined;
+  try {
+    fd = await promisify(files.open)(tempFile, "w", options.mode);
+    await writeAll(files, fd, buffer, tempFile);
+    if (options.fsync !== false) {
+      await promisify(files.fsync)(fd);
+    }
+    assertCompleteSize((await promisify(files.fstat)(fd)).size, buffer.length, tempFile);
+    await promisify(files.close)(fd);
+    fd = undefined;
+    await applyOwnership(files, tempFile, options);
+    await renameWithRetry(files, tempFile, target, options.beforeRename);
+    runAfterRename(options, target);
+    if (options.fsync !== false) {
+      await fsyncParentDirectory(target, files);
+    }
+  } finally {
+    if (fd !== undefined) {
+      await promisify(files.close)(fd).catch(() => undefined);
+    }
+    pendingTempFiles.delete(tempFile);
+    await promisify(files.unlink)(tempFile).catch(() => undefined);
+  }
+}
+
+/**
+ * Atomically replace `filename` with `data`. Resolves once the new contents are
+ * durably in place; rejects (leaving the previous file untouched) on any failure,
+ * including a write that stored fewer bytes than requested.
+ */
+export default async function writeFileAtomic(
+  filename: string,
+  data: string | Buffer,
+  options?: Options | BufferEncoding
+): Promise<void> {
+  const resolved = resolveOptions(options);
+  const key = path.resolve(filename);
+  const previous = activeWrites.get(key) ?? Promise.resolve();
+  const run = previous
+    .catch(() => undefined)
+    .then(() => writeFileAtomicUnserialized(filename, data, resolved));
+  const settled = run.then(
+    () => undefined,
+    () => undefined
+  );
+  activeWrites.set(key, settled);
+  try {
+    await run;
+  } finally {
+    if (activeWrites.get(key) === settled) {
+      activeWrites.delete(key);
+    }
+  }
+}
+
+// The synchronous variant exists for the two callers that must persist before returning
+// (providers.jsonc writers); it mirrors the async pipeline step for step.
+
+function writeAllSync(
+  files: WriteFileAtomicFs,
+  fd: number,
+  buffer: Buffer,
+  tempFile: string
+): void {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const written = files.writeSync(fd, buffer, offset, buffer.length - offset, offset);
+    if (!(written > 0)) {
+      throw incompleteWriteError(tempFile, offset, buffer.length);
+    }
+    offset += written;
+  }
+}
+
+function applyOwnershipSync(
+  files: WriteFileAtomicFs,
+  tempFile: string,
+  options: ResolvedOptions
+): void {
+  if (options.chown) {
+    try {
+      files.chownSync(tempFile, options.chown.uid, options.chown.gid);
+    } catch (error) {
+      if (!isOwnershipErrorOk(error)) throw error;
+    }
+  }
+  if (options.mode != null) {
+    try {
+      files.chmodSync(tempFile, options.mode);
+    } catch (error) {
+      if (!isOwnershipErrorOk(error)) throw error;
+    }
+  }
+}
+
+function fsyncParentDirectorySync(files: WriteFileAtomicFs, target: string): void {
+  if (process.platform === "win32") return;
+  let fd: number | undefined;
+  try {
+    fd = files.openSync(path.dirname(target), "r");
+    files.fsyncSync(fd);
+  } catch (error) {
+    log.debug("parent directory fsync failed", {
+      target,
+      error: getErrorMessage(error),
+    });
+  } finally {
+    if (fd !== undefined) {
+      try {
+        files.closeSync(fd);
+      } catch {
+        // Nothing to recover: the directory handle was read-only.
+      }
+    }
+  }
+}
+
+/** Synchronous variant of {@link writeFileAtomic}. */
+export function sync(
+  filename: string,
+  data: string | Buffer,
+  options?: Options | BufferEncoding
+): void {
+  const resolved = resolveOptions(options);
+  const files = resolved.fs ?? fs;
+  let target = filename;
+  try {
+    target = files.realpathSync(filename);
+  } catch {
+    // A destination that does not exist yet has no link to follow.
+  }
+  let stats: fs.Stats | undefined;
+  try {
+    stats = files.statSync(target);
+  } catch {
+    stats = undefined;
+  }
+  fillOptionsFromStats(resolved, stats);
+  const buffer = toBuffer(data, resolved.encoding);
+  const tempFile = tempPathFor(target);
+  pendingTempFiles.add(tempFile);
+  let fd: number | undefined;
+  try {
+    fd = files.openSync(tempFile, "w", resolved.mode);
+    writeAllSync(files, fd, buffer, tempFile);
+    if (resolved.fsync !== false) {
+      files.fsyncSync(fd);
+    }
+    assertCompleteSize(files.fstatSync(fd).size, buffer.length, tempFile);
+    files.closeSync(fd);
+    fd = undefined;
+    applyOwnershipSync(files, tempFile, resolved);
+    // No retry: a synchronous one would block the event loop, so an in-process reader holding
+    // the destination could never close it. Its callers write providers.jsonc, which no
+    // in-process reader holds open.
+    resolved.beforeRename(target);
+    files.renameSync(tempFile, target);
+    runAfterRename(resolved, target);
+    if (resolved.fsync !== false) {
+      fsyncParentDirectorySync(files, target);
+    }
+  } finally {
+    if (fd !== undefined) {
+      try {
+        files.closeSync(fd);
+      } catch {
+        // The failing call may already have closed it.
+      }
+    }
+    pendingTempFiles.delete(tempFile);
+    try {
+      files.unlinkSync(tempFile);
+    } catch {
+      // Already renamed away on success.
+    }
+  }
+}
+
+writeFileAtomic.sync = sync;

@@ -1,15 +1,15 @@
 ---
 title: AGENTS.md
-description: Agent instructions for AI assistants working on the Shux codebase
+description: Agent instructions for AI assistants working on the Xum codebase
 ---
 
 **Prime directive:** keep edits minimal and token-efficient—say only what conveys actionable signal.
 
 ## Project Snapshot
 
-- `shux`: Electron + React desktop app for parallel agent workflows; UX must be fast, responsive, predictable.
+- `xum`: Electron + React desktop app for parallel agent workflows; UX must be fast, responsive, predictable.
 - Minor breaking changes are expected, but critical flows must allow upgrade↔downgrade without friction; skip migrations when breakage is tightly scoped.
-- **Before creating or updating any PR, commit, or public issue**, you **MUST** read the `pull-requests` skill (`agent_skill_read`) for attribution footer requirements and workflow conventions. Do not skip this step.
+- **Before creating or updating any PR, commit, or public issue**, you **MUST** read the `pull-requests` skill (`agent_skill_read` in Xum; `.xum/skills/pull-requests/SKILL.md` elsewhere) for attribution footer requirements and workflow conventions. Do not skip this step.
 
 ## External Submissions
 
@@ -17,10 +17,10 @@ description: Agent instructions for AI assistants working on the Shux codebase
 
 ## Repo Reference
 
-- Core files: `src/main.ts`, `src/preload.ts`, `src/App.tsx`, `src/config.ts`.
-- Up-to-date model names: see `src/common/knownModels.ts` for current provider model IDs.
-- Persistent data: `~/.shux/config.json`, `~/.shux/src/<project>/<branch>` (worktrees), `~/.shux/sessions/<workspace>/chat.jsonl`.
-- Rename compatibility is centralized in `src/common/compat/legacyMux.ts` and `src/node/compat/shuxTransition.ts`; do not add scattered `mux` fallbacks. Project-local `.mux/`, stable external IDs, and documented aliases remain compatibility contracts.
+- Core files: `src/desktop/main.ts`, `src/desktop/preload.ts`, `src/browser/App.tsx`, `src/node/config/index.ts`.
+- Up-to-date model names: see `src/common/constants/knownModels.ts` for current provider model IDs.
+- Persistent data: `~/.xum/config.json`, `~/.xum/src/<project>/<branch>` (worktrees), `~/.xum/sessions/<workspace>/chat.jsonl`.
+- Rename compatibility is centralized in `src/common/compat/legacyMux.ts` and `src/node/compat/xumTransition.ts`; do not add scattered `mux` fallbacks. Project-local `.xum/` is canonical, `.mux/` is a read fallback, and stable external IDs remain compatibility contracts.
 
 ## Documentation Rules
 
@@ -28,7 +28,7 @@ description: Agent instructions for AI assistants working on the Shux codebase
   - Exception: the `rfc` folder contains human-written RFCs for implementation planning.
 - For planning artifacts, use the `propose_plan` tool or inline comments instead of ad-hoc docs.
 - Do not add new root-level docs without explicit request; during feature work rely on code + tests + inline comments.
-- External API docs already live inside `/tmp/ai-sdk-docs/**.mdx`; never browse `https://sdk.vercel.ai/docs/ai-sdk-core` directly.
+- Vercel AI SDK docs live in `/tmp/ai-sdk-docs/**.mdx` once `./scripts/update_vercel_docs.sh` has fetched them; never browse `https://sdk.vercel.ai/docs/ai-sdk-core` directly.
 
 ### Code Comments
 
@@ -38,22 +38,32 @@ description: Agent instructions for AI assistants working on the Shux codebase
 
 ## Key Features & Performance
 
-- Core UX: projects sidebar (left panel), workspace management (local git worktrees or SSH clones), config stored in `~/.shux/config.json`.
+- Core UX: projects sidebar (left panel), workspace management (local git worktrees or SSH clones), config stored in `~/.xum/config.json`.
 - Fetch bulk data in one IPC call—no O(n) frontend→backend loops.
 - **React Compiler enabled** — auto-memoization handles components/hooks; do not add manual `React.memo()`, `useMemo`, or `useCallback` for memoization purposes. Focus instead on fixing unstable object references that the compiler cannot optimize (e.g., `new Set()` in state setters, inline object literals as props).
-- **useEffect** — Before adding effects, consult the `react-effects` skill. Most effects for derived state, prop resets, or event-triggered logic are anti-patterns.
+- **useEffect** — Before adding effects, consult the `react-effects` skill (`.xum/skills/react-effects/SKILL.md`). Most effects for derived state, prop resets, or event-triggered logic are anti-patterns.
 
 ## Tooling & Commands
 
 - Package manager: bun only. Use `bun install`, `bun add`, `bun run` (which proxies to Make when relevant). Run `bun install` if modules/types go missing.
 - Makefile is source of truth (new commands land there, not `package.json`).
-- Primary targets: `make dev|start|build|lint|lint-fix|fmt|fmt-check|typecheck|test|test-integration|clean|help`.
-- Full `static-check` includes docs link checking via `mintlify broken-links`.
-- `.mux/tool_env` is sourced before every `bash` tool call. Use `run_and_report <step_name> <command...>` when running multiple validation steps in one call.
-- Do not pipe/redirect/wrap `run_and_report` output; keep helper markers intact so Shux can show clean step status.
+- Primary targets: `make dev|start|build|lint|lint-eslint|lint-fix|fmt|fmt-check|typecheck|test|test-integration|clean|help`.
+- `make lint` and `make static-check` run oxlint with `.oxlintrc.json`, which mirrors the `eslint.config.mjs` rules oxlint supports (seconds, under 1 GiB). When you change lint rules, change both configs; `make check-oxlint-config` (part of `static-check`) fails when they apply different rules to any file. Type-aware ESLint rules fail only in CI; to check them before pushing, run `make lint-eslint` (oxlint plus ESLint on the files changed since the merge base with origin/main, about 3 GiB). `make lint-full` lints all files with both and waits while another full ESLint run is active on the machine; use it only when you need full coverage, since one run takes minutes and ~8 GiB.
+- CI runs `make static-check-full`, which lints all files with oxlint and ESLint (`lint-full`) and adds the targets in its Makefile prerequisites (including docs link checking via `mintlify broken-links`) to the rest of `static-check`.
+- Xum sources `.xum/tool_env` before every `bash` tool call; in other harnesses, `source .xum/tool_env` first. Use `run_and_report <step_name> <command...>` when running multiple validation steps in one call.
+- Do not pipe/redirect/wrap `run_and_report` output; keep helper markers intact so Xum can show clean step status.
+- CRAP gate: `make crap-check` scores the functions you changed. When it (or the report after an agent `git commit`/`git push`) names a function, read the `crap-gate` skill (`.xum/skills/crap-gate/SKILL.md`) before fixing it. In block mode, `Quality / CRAP` violations fail `Required`. Agents must not add the `crap-debt` label or a `Crap-Debt:` trailer without the maintainer's explicit approval for that PR: the label skips every CI block (the trailer skips only local checks: the commit hook and `make crap-check`), and agent PRs run as the maintainer's account, so GitHub cannot tell who added them.
+- DRY and mutation gates: `make dry-check` reports near-duplicate functions that your change makes, and `make mutate-check` reports mutants in the functions you changed that the unit tests do not kill. CI warns unless the `DRY_MODE` or `MUTATION_MODE` repo variable is `block`. Before you fix a finding or accept one with a marker, read the `gauntlet` skill (`.xum/skills/gauntlet/SKILL.md`).
 - `./scripts/wait_pr_ready.sh <pr_number>` is the preferred tail-end helper after local validation and after you've exhausted useful local work.
 - `./scripts/wait_pr_checks.sh <pr_number>` is the checks watcher; `wait_pr_ready.sh` must execute `wait_pr_checks.sh --once` on each loop iteration.
 - `./scripts/wait_pr_codex.sh <pr_number>` is the Codex gate used by `wait_pr_ready.sh`.
+
+## Dependencies & Supply Chain
+
+- Every dependency comes from a lock: JS from `bun.lock` (the published package ships an `npm-shrinkwrap.json` generated from it), Python tools from the `pyproject.toml` dependency groups and `uv.lock`, Mintlify from `scripts/mintlify/bun.lock`, downloaded binaries by sha256, and GitHub Actions by commit SHA (`make pin-actions`).
+- Never add an unlocked install: `curl | sh`, `pip install`, `uvx`, `uv run --with`, `npx`/`bunx` of a package that no lockfile pins, `npm install -g`, or `bun install` without `--frozen-lockfile` in CI. Add the tool to a lockfile instead, and run Python tools with `uv run --locked --only-group <group>`.
+- New releases wait 7 days (`minimumReleaseAge` in each `bunfig.toml`, `exclude-newer` in `pyproject.toml`), exact pins included. Installs from an existing lock keep its versions. To take a newer release on purpose (a security fix), list the package in `minimumReleaseAgeExcludes` (bun) or `exclude-newer-package` (uv).
+- Pin a downloaded binary by the sha256 of your own download, and check it against the digest GitHub computed at upload (`gh api repos/<owner>/<repo>/releases/tags/<tag> --jq '.assets[] | .name + " " + .digest'`).
 
 ## Browser Automation
 
@@ -71,25 +81,43 @@ Core workflow:
 - When checking PR readiness, audit **all** PR reviews, review comments, and issue comments from every reviewer/bot (including `coder-agents-review`), not just Codex; address or explicitly resolve them before declaring readiness.
 - If a PR has `coder-agents-review` feedback, address it and reply before resolving: either reply inline on each finding or leave a PR comment that explicitly lists each finding and your response. Do not silently resolve those threads.
 - If a PR has Codex review comments, address + resolve them, then re-request review by commenting `@codex review` on the PR.
-- Prefer `gh` CLI for GitHub interactions over manual web/curl flows.
+- Prefer `gh` CLI for GitHub interactions over manual web/curl flows. Use `./scripts/wait_pr_ready.sh` for readiness: `gh pr checks` deduplicates names across check suites and can hide failures.
+- User preference: use `gh stack` to manage GitHub-native stacked PRs; keep every PR linked in the native stack, not just chained by base branches.
 
 - User preference: when work is already on an open PR, push branch updates at the end of each completed change set so the PR stays current.
 - **PR creation gate:** Do **not** open/create a pull request unless the user explicitly asks (e.g., "open a PR", "create PR", "submit this"). By default, complete local validation, commit/push branch updates as requested, and let the user review before deciding whether to open a PR.
 
 > PR readiness is mandatory. You MUST keep iterating until the PR is fully ready.
-> A PR is fully ready only when: (1) Codex confirms approval (thumbs-up reaction on the PR description or an approval comment like "Didn't find any major issues"), (2) all Codex review threads are resolved, and (3) all required CI checks pass.
-> You MUST NOT report success or stop the loop before these conditions are met.
+> A PR is fully ready only when: (1) Codex confirms approval (thumbs-up reaction on the PR description or an approval comment like "Didn't find any major issues"), (2) all review threads from every reviewer are resolved, and (3) all required CI checks pass.
+> You MUST NOT report success before these conditions are met. You MUST NOT stop the loop before these conditions are met, except in the early-stop cases below. An early stop is never success. Report it as incomplete.
 
-When a PR exists, you MUST remain in this loop until the PR is fully ready:
+When a PR exists, you MUST remain in this loop until the PR is fully ready or an early-stop case below applies:
 
-1. Push your latest fixes.
-2. Run local validation (`make static-check` and targeted tests as needed).
+1. Run local validation (`make static-check` and targeted tests as needed).
+2. Push your latest fixes.
 3. Request review with `@codex review`.
 4. Run `./scripts/wait_pr_ready.sh <pr_number>` (which must execute `./scripts/wait_pr_checks.sh <pr_number> --once` while checks are pending).
-5. If Codex leaves comments, address them, resolve threads with `./scripts/resolve_pr_comment.sh <thread_id>`, push, and repeat.
+5. If any reviewer leaves comments, address them (reply before resolving `coder-agents-review` findings, as above), resolve threads with `./scripts/resolve_pr_comment.sh <thread_id>`, push, and repeat.
 6. If checks/mergeability fail, fix issues locally, push, and repeat.
 
-The only early-stop exception is when the reviewer is clearly misunderstanding the intended change and further churn would be counterproductive. In that case, leave a clarifying PR comment and pause for human direction.
+Stop the loop early in four cases. In each case, leave a PR comment that states the reason, then pause for human direction:
+
+1. The reviewer misunderstands the intended change, and more rounds will only add churn.
+2. The loop does not converge. Each round must shrink the set of findings. If the same area produces new findings round after round, the design is the problem. Do not add more mechanism. Simplify the design or reduce the scope.
+3. The next fix grows the scope (see below). Report the state with a split proposal: what you fixed, what you deferred, and how to split the PR.
+4. The remaining blocker is one only a human can clear, such as a required approving review or Codex usage limits.
+
+### Review fixes and scope
+
+The PR must stay the change it started as. Before you fix a finding, compare the fix with the original change and classify it:
+
+1. If the fix repairs a defect that this PR introduced, fix it in this PR. Size does not matter here. If that fix needs a new module, on-disk artifact, persisted field, or subsystem, remove the surface from this PR instead of growing it.
+2. If the fix is small and stays inside the behavior and files of the original change, fix it in this PR.
+3. If the fix adds a new module, on-disk artifact, persisted field, or subsystem, do not fix it here. The same applies if the fix is larger than the original change and does not repair a defect that this PR introduced. This is scope growth. Reply on the thread with the intended fix and resolve the thread. Deliver the fix as a stacked PR (`gh stack`) or a tracked follow-up.
+4. If the finding needs corrupted persisted state, a narrow crash window, or a second racing backend (for example `XUM_ALLOW_MULTIPLE_INSTANCES`), classify the defect, not its trigger. If this PR added the failing code or removed a defense, fix it here. If the defect existed before this PR, defer it the same way.
+5. If the finding is wrong, or the behavior is intended, reply with the reason and resolve the thread. A reasoned rejection is a valid resolution.
+
+Deferred does not mean fixed. Every deferred fix must have a follow-up: a stacked PR, an issue, or a note in the PR description.
 
 ## Testing: HistoryService
 
@@ -114,15 +142,15 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 
 ## Command Palette & UI Access
 
-- Open palette with `Cmd+Shift+P` (mac) / `Ctrl+Shift+P` (win/linux) / `F4`; quick toggle via `Cmd+P` / `Ctrl+P`.
+- Palette shortcuts are `OPEN_COMMAND_PALETTE` and `OPEN_COMMAND_PALETTE_ACTIONS` (opens in `>` command mode) in `src/browser/utils/ui/keybinds.ts`.
 - Palette covers workspace mgmt, navigation, chat utils, mode/model switches, slash commands (`/` for suggestions, `>` for actions).
 
 ## Styling
 
 - Never use emoji characters as UI icons or status indicators; emoji rendering varies across platforms and fonts.
 - Prefer SVG icons (usually from `lucide-react`) or shared icon components under `src/browser/components/icons/`.
-- For tool call headers, use `ToolIcon` from `src/browser/components/tools/shared/ToolPrimitives.tsx`.
-- If a tool/agent provides an emoji string (e.g., todo-derived status or `displayStatus`), render via `EmojiIcon` (`src/browser/components/icons/EmojiIcon.tsx`) instead of rendering the emoji.
+- For tool call headers, use `ToolIcon` from `src/browser/features/Tools/Shared/ToolPrimitives.tsx`.
+- If a tool/agent provides an emoji string (e.g., todo-derived status or `displayStatus`), render via `EmojiIcon` (`src/browser/components/icons/EmojiIcon/EmojiIcon.tsx`) instead of rendering the emoji.
 - If a new emoji appears in tool output, extend `EmojiIcon` to map it to an SVG icon.
 - Colors defined in `src/browser/styles/globals.css` (`:root @theme` block). Reference via CSS variables (e.g., `var(--color-plan-mode)`), never hardcode hex values.
 - Tooltips must use the shared `Tooltip`/`TooltipIfPresent` components, not native `title` attributes. Native titles create duplicate OS tooltips and cannot be z-indexed; shared tooltips portal above clipped containers.
@@ -160,7 +188,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 ## Component State & Storage
 
 - Prefer **self-contained components** over utility functions + hook proliferation. A component that takes `workspaceId` and computes everything internally is better than one that requires 10 props drilled from parent hooks.
-- **Colocate subscriptions with consumers** — Don't pass frequently-updating values (streaming stats, live costs, timers) as props through intermediate components. Instead, have the leaf component that displays the value subscribe directly. This prevents re-renders from cascading through expensive sibling subtrees (e.g., terminal). See `CostsTabLabel`/`StatsTabLabel` for examples.
+- **Colocate subscriptions with consumers** — Don't pass frequently-updating values (streaming stats, live costs, timers) as props through intermediate components. Instead, have the leaf component that displays the value subscribe directly. This prevents re-renders from cascading through expensive sibling subtrees (e.g., terminal). See `StatsTabLabel` (`src/browser/features/RightSidebar/Tabs/TabLabels.tsx`) for an example.
 - Parent components own localStorage interactions; children announce intent only.
 - **Never call `localStorage` directly** — always use `usePersistedState`/`readPersistedState`/`updatePersistedState` helpers. This includes inside `useCallback`, event handlers, and non-React functions. The helpers handle JSON parsing, error recovery, and cross-component sync.
 - When a component needs to read persisted state it doesn't own (to avoid layout flash), use `readPersistedState` in `useState` initializer: `useState(() => readPersistedState(key, default))`.
@@ -170,6 +198,7 @@ HistoryService is pure local disk I/O with a single dependency (`getSessionDir`)
 ## Module Imports
 
 - Use static `import` statements at the top; resolve circular dependencies by extracting shared modules, inverting dependencies, or using DI. Dynamic `await import()` is not an acceptable workaround.
+- Exception: code-split a feature boundary with a module-top-level `React.lazy(() => import(...))` wrapped in `LazyFeature`, and keep the open condition outside the lazy module. This is not a circular-dependency workaround.
 
 ## Workspace Identity
 
@@ -193,12 +222,12 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 
 ## Debugging & Diagnostics
 
-- Debug CLI (`src/cli/debug/index.ts`): `bun run debug list-workspaces`, `bun run debug costs <workspace-id>`, `bun run debug send-message <workspace-id> [--edit <message-id>] [--message <text>]`. Workspace names live in `~/.shux/sessions/`. To inspect raw provider requests, enable API Debug Logs and read `~/.shux/sessions/<workspace>/devtools.jsonl`.
+- Debug CLI (`src/cli/debug/index.ts`): `bun run debug list-workspaces`, `bun run debug costs <workspace-id>`, `bun run debug send-message <workspace-id> [--edit <message-id>] [--message <text>]`. Workspace names live in `~/.xum/sessions/`. To inspect raw provider requests, enable API Debug Logs and read `~/.xum/sessions/<workspace>/devtools.jsonl`.
 
 ## UX Guardrails
 
 - Do not add UX flourishes (auto-dismiss, animations, tooltips, etc.) unless requested. Ship the simplest behavior that meets requirements.
-- Enforce DRY: if you repeat code/strings, factor a shared helper/constant (search first; if cross-layer, move to `src/constants/` or `src/types/`).
+- Enforce DRY: if you repeat code/strings, factor a shared helper/constant (search first; if cross-layer, move to `src/constants/` or `src/common/types/`).
 - Hooks that detect a condition should handle it directly when they already have the data—avoid unnecessary callback hop chains.
 - Every operation must have a keyboard shortcut. The keyboard shortcut should not be visible on mobile views.
 
@@ -225,6 +254,18 @@ Freely make breaking changes, and reorganize / cleanup IPC as needed.
 - E2E tests (tests/e2e) work with Radix but are slow (~2min startup); reserve for scenarios that truly need real Electron.
 - **Storybook responsive/Pixel validation:** Do not prove responsive snapshots by only resizing `iframe.html`; that bypasses the Pixel viewport matrix configuration. If a story depends on a breakpoint (wide gutters, mobile), pin an explicit `parameters.pixel.matrix.viewports` variant (named widths: phone 390, tablet 744, laptop 1200, desktop 1900), mirror it with story `globals.viewport` for local viewing, and validate through the Storybook manager or an equivalent viewport-pinned check. Pixel does not emulate touch, so `pointer: coarse` media queries never match in snapshots; touch-only affordances need play/static contracts instead. Add a play/static contract when a missing variant would silently snapshot the wrong UI. Caveat: the Storybook test-runner (CI `Test / Storybook`) applies neither `globals.viewport` nor Pixel matrix variants, plays execute at desktop window size, so breakpoint-dependent play assertions must force the narrow width themselves (fixed-width wrapper/decorator, as in `App.phoneViewports.stories.tsx`) or guard on the rendered width before asserting.
 - Only use `validateApiKeys()` in tests that actually make AI API calls.
+
+## Bug Bash and Repro Tests (tests/bugbash)
+
+- To run a bug bash, the MCP Apps suite, the story tests or the sandbox checks, read the `bug-bash` skill (`.xum/skills/bug-bash/SKILL.md`). It covers the host needs, the env, costs, options, results, exit codes and leftovers.
+- Host pause (#5714): model-driven runs (`make bug-bash`, `make mcp-apps-e2e`, `make test-stories`, any `e2e explore` and every e2e command with `e2e.mcpapps.config.ts`, `tests/stories/e2e.config.ts` or `tests/stories/e2e.electron.config.ts`) run only inside the bug-bash sandbox, one Docker container per job. A model-driven e2e process on the host refuses with exit 2 (`tests/bugbash/hostPause.ts`), and outside the sandbox an `agent.*` step fails with `MODEL_UNAVAILABLE`. No override exists.
+- The sandbox image is pinned by digest in `tests/bugbash/sandbox/image.json`. A change to `tests/bugbash/sandbox/Dockerfile`, `tests/bugbash/sandbox/build.sh` or the playwright-core version of `@e2e-dev/web` in `bun.lock` changes the inputs key (`make bugbash-sandbox-key`), and the runner then refuses the image until the manual "Bug-bash sandbox image" workflow publishes a new one and a PR updates `image.json`. One exception: with `BUGBASH_SANDBOX_BUILD_STALE=1`, which only CI's `Test / Bug-bash sandbox` job sets, the self-check and the exact-step repros build the image locally with `build.sh` and warn. So an image change lands in three steps: the Dockerfile PR passes CI on a local build, a maintainer runs the publish workflow on main, and an `image.json` PR pins the new digest. `make bug-bash`, `make mcp-apps-e2e`, `make test-stories` and their preflight always refuse a stale key.
+- Every model-driven job and every real-AI app run with `XUM_DISABLE_AGENT_TOOLS=1`, `XUM_DISABLE_TERMINALS=1` and `XUM_DISABLE_PROJECT_AUTOMATION=1`, because AI replies are untrusted input for the explorer. Do not turn them off for a bug bash without a security review. Callers with their own `streamText` tools (refinement, memory harvest, continuous compaction) do not check `XUM_DISABLE_AGENT_TOOLS`. None of them runs shell commands in the seeded app, so a new caller of that kind needs the same check. Settings can still add stdio MCP servers and custom editor commands, so charters must keep explorers out of them.
+- One reviewed exception (#7027, #7029): `BUGBASH_SCENARIO=scripted-tools` runs the app with agent tools on, so repros can see the real tool block. Its only model is a fixed loopback script (`tests/bugbash/scriptedModel.ts`) that ignores typed text and calls only `todo_write` and `file_read` of the seeded README.md. `startApp.ts` refuses it outside the sandbox, in a model-driven job and with a mounted proxy socket, and keeps terminals and project automation off. Only the exact-step sandbox job (`make test-bugbash-repros-sandbox`: no network, no proxy, no explorer model) selects its `tools-on` repros. Do not add tool calls to that script, or run it with a model, without a new security review.
+- A finding is a bug only once a repro fails for the reported reason. Put it in `tests/bugbash/repros/<slug>.e2e.ts` (tracked). Use exact `screen`/`browser`/`expect` steps where they work. A repro may use `agent.*` steps only when each of its tests has the `agent` tag (`tests/bugbash/reproRules.test.ts` enforces this): the free runs pass `--exclude-tag agent`, so only a model-driven sandbox job runs it: `make test-stories` (needs `BUGBASH_BUDGET_USD`). CI's `Stories` workflow (`.github/workflows/stories.yml`) runs that target with Sonnet 5.5 in the merge queue (pr.yml's `Test / Stories` job, which `Required` counts only when the repo variable `STORIES_MODE` is `block`), nightly on main and on demand, and with Haiku 5.5 on each push to a PR that is not a draft (`Test / Stories (Haiku)`, where Sonnet 5.5 judges the story tests' asserts and Haiku the agent repros', and which `Required` counts only when `STORIES_PR_MODE` is `block`). That target also runs the story tests, user stories that an agent drives in `tests/stories/*.e2e.ts`, and the Electron stories in `tests/stories/electron/*.e2e.ts` on Xum Electron under Xvfb (it runs `make electron-binary` first). Prove it: restore the bug in a scratch edit, rebuild, see `ASSERTION_FAILED` on the bug's own assertion, then restore and see it pass.
+- Tags: `bugbash` plus the bug ID. Add `mock-only` when the test needs a `[mock:...]` prompt or a terminal. Add `known-failure` plus the issue number for an open bug, and remove that tag in the PR that fixes it. Add `tools-on` when the test needs the scripted-tools scenario: only `make test-bugbash-repros-sandbox` selects it.
+- `make test-bugbash-repros` runs the repros (known failures excluded), and `make test-bugbash-known-failures` runs the open-bug repros. `make test-e2e` runs the repros after Playwright unless `BUGBASH_REPROS=0`. CI runs them once, on linux shard 1, with the mock: in the merge queue, and on PR pushes only when the PR changes `tests/e2e`, `tests/bugbash`, `playwright.config.ts`, `pr.yml`, `Makefile`, `package.json` or `bun.lock`. Locally they need Node 22.22.3+ or 24.8+ (`E2E_NODE`) and `node_modules/.bin/e2e-web install chromium`. With a provider key set, `BUGBASH_AI=auto` makes paid app-model calls (Haiku 5.5): use `BUGBASH_AI=mock` for none.
+- CI's `Test / Bug-bash sandbox` job runs `make bug-bash-sandbox-check` and `make test-bugbash-repros-sandbox` without secrets, and `Required` needs it. It runs in the merge queue, and on PR pushes only when the PR changes the same files. To run it (and the other queue-only jobs) before the queue, dispatch the PR workflow on the branch.
 
 ## Tool: todo_write
 

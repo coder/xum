@@ -1,215 +1,140 @@
 import { describe, expect, test } from "bun:test";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { getThinkingOptionLabel, type ThinkingLevel } from "@/common/types/thinking";
 import {
   getThinkingPolicyForModel,
   enforceThinkingPolicy,
   resolveThinkingInput,
   isGeminiFlashThinkingLevelModelName,
+  isGeminiFlashMinimalRejectingModelName,
   getDefaultMinimumThinkingLevel,
   lookupMinThinkingLevelOverride,
   resolveMinimumThinkingLevel,
   resolveEffectiveThinkingLevel,
   getAvailableThinkingLevels,
   isXaiGrokFastVariantSwap,
+  resolveBetweenToolsThinkingLevel,
+  hasExplicitThinkingPolicy,
 } from "./policy";
 
+describe("Muse Wonder thinking policy", () => {
+  test("clamps disabled reasoning while preserving native xhigh and max", () => {
+    for (const model of ["meta:muse-wonder-1.0", "openrouter:meta/muse-wonder-1.0"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("xhigh");
+      expect(enforceThinkingPolicy(model, "max")).toBe("max");
+      expect(getDefaultMinimumThinkingLevel(model)).toBe("medium");
+    }
+  });
+
+  test("does not infer Wonder capabilities for similarly named custom models", () => {
+    expect(enforceThinkingPolicy("meta:muse-wonder-1.0-custom", "off")).toBe("off");
+    expect(enforceThinkingPolicy("meta:muse-wonder-full", "max")).toBe("high");
+  });
+});
+
 describe("getThinkingPolicyForModel", () => {
-  test("returns 5 levels including xhigh for gpt-5.1-codex-max", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.1-codex-max")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
+  test.each(["gpt-6-luna"])("preserves off and native max for %s", (model) => {
+    for (const id of [
+      `openai:${model}`,
+      `coder:openai/${model}`,
+      `openrouter:openai/${model}-2026-09-22`,
+    ]) {
+      expect(getThinkingPolicyForModel(id)).toEqual([
+        "off",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+      ]);
+      expect(enforceThinkingPolicy(id, "off")).toBe("off");
+      expect(enforceThinkingPolicy(id, "max")).toBe("max");
+    }
+    expect(enforceThinkingPolicy(`openai:${model}-mini`, "max")).toBe("high");
   });
 
-  test("returns 5 levels for gpt-5.1-codex-max with version suffix", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.1-codex-max-2025-12-01")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
+  // Catalogue GPT-5.6 models are not built in, but OpenAI serves none through
+  // native max on the whole family, so they get the explicit 6-level policy (and
+  // with it the Settings → Models floor selector and default medium floor).
+  test("gives catalogue GPT-5.6 models off through native max and a default floor", () => {
+    const sixLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
+    for (const id of [
+      "openai:gpt-5.6",
+      "openai:gpt-5.6-sol",
+      "openai:gpt-5.6-terra",
+      "openai:gpt-5.6-luna",
+    ]) {
+      expect(getThinkingPolicyForModel(id)).toEqual(sixLevels);
+      expect(hasExplicitThinkingPolicy(id)).toBe(true);
+      expect(getDefaultMinimumThinkingLevel(id)).toBe("medium");
+      expect(enforceThinkingPolicy(id, "xhigh")).toBe("xhigh");
+      expect(enforceThinkingPolicy(id, "max")).toBe("max");
+    }
+    for (const id of ["openai:gpt-5.6-cyber", "openai:gpt-5.5"]) {
+      expect(getThinkingPolicyForModel(id)).toEqual(["off", "low", "medium", "high"]);
+      expect(hasExplicitThinkingPolicy(id)).toBe(false);
+      expect(enforceThinkingPolicy(id, "max")).toBe("high");
+    }
   });
 
-  test("returns 5 levels for bare gpt-5.1-codex-max without prefix", () => {
-    expect(getThinkingPolicyForModel("gpt-5.1-codex-max")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
+  // A duplicate label lists two identical floors or menu entries, and the policy matches
+  // these ids by name under any prefix.
+  test.each([
+    "openai:gpt-5.6-sol",
+    "gpt-5.6-sol",
+    "azure:gpt-5.6-sol",
+    "github-copilot:gpt-6-luna",
+    "openrouter:openai/gpt-6-astra",
+  ])("labels each level of %s's native-max ladder distinctly", (id) => {
+    const ladder = getThinkingPolicyForModel(id);
+    expect(ladder).toContain("max");
+    const labels = ladder.map((level) => getThinkingOptionLabel(level, id));
+    expect(new Set(labels).size).toBe(ladder.length);
   });
 
-  test("returns 5 levels for codex-max alias", () => {
-    expect(getThinkingPolicyForModel("codex-max")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
+  // GPT-6 Astra keeps native max but rejects effort "none" (HTTP 400), so "off"
+  // is not offered. Named variants and other GPT-6 ids stay outside the rule.
+  test("returns 5 levels (no off) including max for gpt-6-astra (direct, gateway, dated)", () => {
+    const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
+    expect(getThinkingPolicyForModel("openai:gpt-6-astra")).toEqual(fiveLevels);
+    expect(getThinkingPolicyForModel("coder:openai/gpt-6-astra")).toEqual(fiveLevels);
+    expect(getThinkingPolicyForModel("openrouter:openai/gpt-6-astra-2026-09-30")).toEqual(
+      fiveLevels
+    );
+    expect(enforceThinkingPolicy("openai:gpt-6-astra", "max")).toBe("max");
+    expect(enforceThinkingPolicy("openai:gpt-6-astra", "off")).toBe("low");
   });
 
-  test("returns 5 levels for gpt-5.1-codex-max with whitespace after colon", () => {
-    expect(getThinkingPolicyForModel("openai: gpt-5.1-codex-max")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
+  test("gpt-6.1-sol follows Astra: 5 levels (no off), off and unset clamp to low", () => {
+    const fiveLevels: ThinkingLevel[] = ["low", "medium", "high", "xhigh", "max"];
+    for (const id of ["openai:gpt-6.1-sol", "coder:openai/gpt-6.1-sol"]) {
+      expect(getThinkingPolicyForModel(id)).toEqual(fiveLevels);
+      expect(enforceThinkingPolicy(id, "off")).toBe("low");
+      expect(resolveEffectiveThinkingLevel(id, undefined)).toBe("low");
+      expect(resolveEffectiveThinkingLevel(id, "max")).toBe("max");
+    }
   });
 
-  test("returns medium/high/xhigh for gpt-5.2-pro", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.2-pro")).toEqual(["medium", "high", "xhigh"]);
+  test("gpt-6-astra named variants and other GPT-6 ids fall through to the default policy", () => {
+    const defaultPolicy: ThinkingLevel[] = ["off", "low", "medium", "high"];
+    expect(getThinkingPolicyForModel("openai:gpt-6-astra-mini")).toEqual(defaultPolicy);
+    expect(getThinkingPolicyForModel("openai:gpt-6")).toEqual(defaultPolicy);
+    expect(enforceThinkingPolicy("openai:gpt-6-astra-mini", "max")).toBe("high");
   });
 
-  test("returns medium/high/xhigh for gpt-5.2-pro behind mux-gateway", () => {
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.2-pro")).toEqual([
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns medium/high/xhigh for gpt-5.5-pro", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.5-pro")).toEqual(["medium", "high", "xhigh"]);
-  });
-
-  test("returns medium/high/xhigh for gpt-5.5-pro behind mux-gateway", () => {
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.5-pro")).toEqual([
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.3-codex", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.3-codex")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.3-codex behind mux-gateway", () => {
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.3-codex")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.3-codex-spark", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.3-codex-spark")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.3-codex-spark behind mux-gateway", () => {
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.3-codex-spark")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.2-codex", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.2-codex")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.2", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.2")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.2 behind mux-gateway", () => {
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.2")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.2 with version suffix", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.2-2025-12-11")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.5", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.5")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.5 with version suffix", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.5-2026-04-23")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.5", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.5")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 6 levels including max for gpt-5.6-sol", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.6-sol")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-    ]);
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.6-sol-2026-07-09")).toEqual([
-      "off",
-      "low",
+  test("gpt-6-astra clamps unset/off to low (forced thinking, like Mythos/GLM/3.8 Flash)", () => {
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", undefined)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "off")).toBe("low");
+    expect(resolveEffectiveThinkingLevel("coder:openai/gpt-6-astra", null)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-astra", "max")).toBe("max");
+    // Luna keeps a real "off" (wire effort "none"); the clamp is Astra/6.1 Sol-specific.
+    expect(resolveEffectiveThinkingLevel("openai:gpt-6-luna", undefined)).toBe("off");
+    // Recognized reasoning model: default medium floor applies like GPT-6 Luna.
+    expect(getDefaultMinimumThinkingLevel("openai:gpt-6-astra")).toBe("medium");
+    expect(getAvailableThinkingLevels("openai:gpt-6-astra", "medium")).toEqual([
       "medium",
       "high",
       "xhigh",
@@ -217,121 +142,29 @@ describe("getThinkingPolicyForModel", () => {
     ]);
   });
 
-  // Native max is family-wide at GA (Sol/Terra/Luna and the bare alias).
-  test("returns 6 levels including max for gpt-5.6-terra and gpt-5.6-luna", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.6-terra")).toEqual([
-      "off",
+  test("mappedToModel aliases inherit gpt-6-astra's 5-level ladder", () => {
+    const providersConfig: ProvidersConfigMap = {
+      openai: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
+      },
+    };
+    expect(getThinkingPolicyForModel("openai:team-astra", providersConfig)).toEqual([
       "low",
       "medium",
       "high",
       "xhigh",
       "max",
     ]);
-    expect(getThinkingPolicyForModel("openai:gpt-5.6-luna")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-    ]);
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.6-terra-2026-07-09")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-      "max",
-    ]);
-  });
-
-  test("gpt-5.6-sol named variants fall through to the default policy", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.6-sol-mini")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.4-mini", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.4-mini")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.4-mini-2026-03-11")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.4-nano", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.4-nano")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.4-nano-2026-03-17")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns 5 levels including xhigh for gpt-5.1-codex-max behind mux-gateway", () => {
-    expect(getThinkingPolicyForModel("mux-gateway:openai/gpt-5.1-codex-max")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-  test("returns medium/high/xhigh for gpt-5.2-pro with version suffix", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.2-pro-2025-12-11")).toEqual([
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns medium/high/xhigh for gpt-5.5-pro with version suffix", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5.5-pro-2026-04-23")).toEqual([
-      "medium",
-      "high",
-      "xhigh",
-    ]);
-  });
-
-  test("returns single HIGH for gpt-5-pro base model (legacy)", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5-pro")).toEqual(["high"]);
-  });
-
-  test("returns single HIGH for gpt-5-pro with version suffix (legacy)", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5-pro-2025-10-06")).toEqual(["high"]);
-  });
-
-  test("returns single HIGH for gpt-5-pro with whitespace after colon (legacy)", () => {
-    expect(getThinkingPolicyForModel("openai: gpt-5-pro")).toEqual(["high"]);
-  });
-
-  test("returns all levels for gpt-5-pro-mini (not a fixed policy)", () => {
-    expect(getThinkingPolicyForModel("openai:gpt-5-pro-mini")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-    ]);
+    expect(enforceThinkingPolicy("openai:team-astra", "max", null, providersConfig)).toBe("max");
+    expect(resolveEffectiveThinkingLevel("openai:team-astra", undefined, providersConfig)).toBe(
+      "low"
+    );
+    expect(getDefaultMinimumThinkingLevel("openai:team-astra", providersConfig)).toBe("medium");
+    // Without providers config the alias is unknown: default 4-level policy clamps max down.
+    expect(enforceThinkingPolicy("openai:team-astra", "max")).toBe("high");
   });
 
   test("returns all levels for other OpenAI models", () => {
@@ -377,7 +210,7 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
     ]);
     // Behind gateway
-    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-opus-4-6")).toEqual([
+    expect(getThinkingPolicyForModel("coder:anthropic/claude-opus-4-6")).toEqual([
       "off",
       "low",
       "medium",
@@ -443,7 +276,36 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
+    expect(getThinkingPolicyForModel("anthropic:claude-fable-5-1")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
     expect(getThinkingPolicyForModel("anthropic:claude-mythos-5")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    // Opus 5.5 is the first Opus that cannot disable thinking (Opus 5 still can).
+    expect(getThinkingPolicyForModel("anthropic:claude-opus-5-5")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("anthropic:claude-opus-5-5-20260922")).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(getThinkingPolicyForModel("anthropic:claude-mythos-5-1")).toEqual([
       "low",
       "medium",
       "high",
@@ -455,21 +317,46 @@ describe("getThinkingPolicyForModel", () => {
   test("clamps 'off' up to 'low' for Mythos-class models", () => {
     // A stored/legacy "off" selection must not reach the wire as disabled thinking.
     expect(enforceThinkingPolicy("anthropic:claude-fable-5", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-fable-5-1", "off")).toBe("low");
     expect(enforceThinkingPolicy("anthropic:claude-mythos-5", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-mythos-5-1", "off")).toBe("low");
+    expect(enforceThinkingPolicy("anthropic:claude-opus-5-5", "off")).toBe("low");
   });
 
-  test("resolveEffectiveThinkingLevel clamps unset/off for Mythos-class only", () => {
+  test("resolveEffectiveThinkingLevel clamps unset/off for forced-thinking models", () => {
     // Mythos-class cannot disable thinking: unset and "off" both resolve to "low"
     // so provider options, replay transforms, and metadata stay consistent with
     // the provider's always-thinking behavior.
     expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", undefined)).toBe("low");
     expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", "off")).toBe("low");
     expect(resolveEffectiveThinkingLevel("anthropic:claude-fable-5", "medium")).toBe("medium");
+    // Opus 5.5 always thinks; Opus 5 (and Bedrock-style ids) keep their own behavior.
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-5-5", undefined)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("bedrock:anthropic.claude-opus-5-5", "off")).toBe("low");
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-5", undefined)).toBe("off");
     // Other models keep legacy behavior: unset means "off", explicit levels pass through
     // unclamped (policy enforcement happens at the call sites that own it).
     expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-4-8", undefined)).toBe("off");
     expect(resolveEffectiveThinkingLevel("openai:gpt-5-pro", undefined)).toBe("off");
     expect(resolveEffectiveThinkingLevel("anthropic:claude-sonnet-4-5", "high")).toBe("high");
+  });
+
+  test("resolveEffectiveThinkingLevel clamps unset/off for Gemini 3.8 Flash and Argon but not older Flash", () => {
+    // 3.8 Flash rejects "minimal": the tracked level must already be "low" so the
+    // request envelope and debug snapshots agree with what the Google adapter sends.
+    // Argon has no "off" either; unclamped, it would run at its medium default.
+    for (const model of [
+      "google:gemini-3.8-flash",
+      "openrouter:google/gemini-3.8-flash",
+      "google:gemini-4-argon",
+    ]) {
+      expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("low");
+      expect(resolveEffectiveThinkingLevel(model, "off")).toBe("low");
+      expect(resolveEffectiveThinkingLevel(model, "high")).toBe("high");
+    }
+    // Older Flash tiers still express "off" as minimal, so nothing is forced.
+    expect(resolveEffectiveThinkingLevel("google:gemini-3.7-flash", undefined)).toBe("off");
+    expect(resolveEffectiveThinkingLevel("google:gemini-3.8-flash-lite", undefined)).toBe("off");
   });
 
   test("resolveEffectiveThinkingLevel resolves mappedToModel aliases before the Mythos check", () => {
@@ -495,7 +382,7 @@ describe("getThinkingPolicyForModel", () => {
   });
 
   test("policy path resolves mappedToModel aliases to the target's capability", () => {
-    // An alias mapped to a GPT-5.6 model must expose the target's 6-level
+    // An alias mapped to GPT-6 Luna must expose the target's 6-level
     // ladder (incl. native max) and clamp against it — otherwise AgentSession
     // strips "max" before buildProviderOptions can resolve the alias.
     const providersConfig: ProvidersConfigMap = {
@@ -503,10 +390,10 @@ describe("getThinkingPolicyForModel", () => {
         apiKeySet: true,
         isEnabled: true,
         isConfigured: true,
-        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
+        models: [{ id: "team-luna", mappedToModel: "openai:gpt-6-luna" }],
       },
     };
-    expect(getThinkingPolicyForModel("openai:team-sol", providersConfig)).toEqual([
+    expect(getThinkingPolicyForModel("openai:team-luna", providersConfig)).toEqual([
       "off",
       "low",
       "medium",
@@ -514,14 +401,14 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
-    expect(getAvailableThinkingLevels("openai:team-sol", null, providersConfig)).toContain("max");
-    expect(enforceThinkingPolicy("openai:team-sol", "max", null, providersConfig)).toBe("max");
+    expect(getAvailableThinkingLevels("openai:team-luna", null, providersConfig)).toContain("max");
+    expect(enforceThinkingPolicy("openai:team-luna", "max", null, providersConfig)).toBe("max");
     // Aliases inherit the target's default medium floor (recognized reasoning model).
-    expect(getDefaultMinimumThinkingLevel("openai:team-sol", providersConfig)).toBe("medium");
-    expect(resolveMinimumThinkingLevel("openai:team-sol", null, providersConfig)).toBe("medium");
+    expect(getDefaultMinimumThinkingLevel("openai:team-luna", providersConfig)).toBe("medium");
+    expect(resolveMinimumThinkingLevel("openai:team-luna", null, providersConfig)).toBe("medium");
     // Without providers config the alias is unknown: default 4-level policy clamps max down.
-    expect(enforceThinkingPolicy("openai:team-sol", "max")).toBe("high");
-    expect(getDefaultMinimumThinkingLevel("openai:team-sol")).toBe("off");
+    expect(enforceThinkingPolicy("openai:team-luna", "max")).toBe("high");
+    expect(getDefaultMinimumThinkingLevel("openai:team-luna")).toBe("off");
   });
 
   test("returns all 6 levels for Sonnet 5 (native xhigh)", () => {
@@ -544,7 +431,7 @@ describe("getThinkingPolicyForModel", () => {
       "max",
     ]);
     // Behind gateway
-    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-sonnet-5")).toEqual([
+    expect(getThinkingPolicyForModel("coder:anthropic/claude-sonnet-5")).toEqual([
       "off",
       "low",
       "medium",
@@ -552,6 +439,73 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
       "max",
     ]);
+  });
+
+  test("offers 'off' for Sonnet 5.5 (between_tools) but not for Opus 5.5", () => {
+    const allLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
+    for (const model of [
+      "anthropic:claude-sonnet-5-5",
+      "anthropic:claude-sonnet-5-5-20261001",
+      "coder:anthropic/claude-sonnet-5-5",
+      "bedrock:anthropic.claude-sonnet-5-5",
+    ]) {
+      expect({ model, policy: getThinkingPolicyForModel(model) }).toEqual({
+        model,
+        policy: allLevels,
+      });
+      expect(enforceThinkingPolicy(model, "off")).toBe("off");
+      expect(resolveEffectiveThinkingLevel(model, undefined)).toBe("off");
+    }
+    // Opus 5.5 has no between_tools, so "off" still clamps to low.
+    expect(resolveEffectiveThinkingLevel("anthropic:claude-opus-5-5", "off")).toBe("low");
+  });
+
+  test("offers all 6 levels for Haiku 5.5 but keeps Haiku 4.5 on the default ladder", () => {
+    // Haiku 5.5 supports every effort level and still accepts disabled thinking at
+    // effort high or below, so "off" survives while xhigh/max become available.
+    const allLevels: ThinkingLevel[] = ["off", "low", "medium", "high", "xhigh", "max"];
+    for (const model of [
+      "anthropic:claude-haiku-5-5",
+      "coder:anthropic/claude-haiku-5-5",
+      "bedrock:anthropic.claude-haiku-5-5",
+    ]) {
+      expect({ model, policy: getThinkingPolicyForModel(model) }).toEqual({
+        model,
+        policy: allLevels,
+      });
+      expect(enforceThinkingPolicy(model, "off")).toBe("off");
+    }
+    // Haiku stays the cheap tier: its default floor stays "off" (as for Haiku 4.5), so
+    // `/haiku+0` and a stored "off" still disable thinking, and an explicit floor still wins.
+    const mapped: ProvidersConfigMap = {
+      anthropic: {
+        apiKeySet: true,
+        isEnabled: true,
+        isConfigured: true,
+        models: [{ id: "team-haiku", mappedToModel: "anthropic:claude-haiku-5-5" }],
+      },
+    };
+    for (const [model, config] of [
+      ["anthropic:claude-haiku-5-5", null],
+      ["coder:anthropic/claude-haiku-5-5", null],
+      ["bedrock:anthropic.claude-haiku-5-5", null],
+      ["anthropic:team-haiku", mapped],
+    ] as const) {
+      const floor = resolveMinimumThinkingLevel(model, null, config);
+      expect({ model, floor }).toEqual({ model, floor: "off" });
+      expect(resolveThinkingInput(0, model, config)).toBe("off");
+      expect(enforceThinkingPolicy(model, "off", floor, config)).toBe("off");
+      expect(enforceThinkingPolicy(model, "off", "medium", config)).toBe("medium");
+      expect(getAvailableThinkingLevels(model, floor, config)).toEqual(allLevels);
+    }
+    // Haiku 4.5 (budget_tokens thinking, no effort) keeps the 4-level default.
+    expect(getThinkingPolicyForModel("anthropic:claude-haiku-4-5")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+    ]);
+    expect(getDefaultMinimumThinkingLevel("anthropic:claude-haiku-4-5")).toBe("off");
   });
 
   test("returns 5 levels including xhigh for Sonnet 4.6", () => {
@@ -570,7 +524,7 @@ describe("getThinkingPolicyForModel", () => {
       "xhigh",
     ]);
     // Behind gateway
-    expect(getThinkingPolicyForModel("mux-gateway:anthropic/claude-sonnet-4-6")).toEqual([
+    expect(getThinkingPolicyForModel("coder:anthropic/claude-sonnet-4-6")).toEqual([
       "off",
       "low",
       "medium",
@@ -583,14 +537,16 @@ describe("getThinkingPolicyForModel", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.1-pro-preview")).toEqual(["low", "high"]);
   });
 
+  test("returns low/medium/high (no off) for Gemini 4 Argon, unlike the Gemini 3 Pro set", () => {
+    for (const model of ["google:gemini-4-argon", "openrouter:google/gemini-4-argon"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "medium")).toBe("medium");
+    }
+  });
+
   test("returns off/low/medium/high for stable Gemini 3.5 Flash", () => {
     expect(getThinkingPolicyForModel("google:gemini-3.5-flash")).toEqual([
-      "off",
-      "low",
-      "medium",
-      "high",
-    ]);
-    expect(getThinkingPolicyForModel("mux-gateway:google/gemini-3.5-flash")).toEqual([
       "off",
       "low",
       "medium",
@@ -611,7 +567,7 @@ describe("getThinkingPolicyForModel", () => {
   test("returns off/low/medium/high for stable Gemini 3.6 Flash", () => {
     for (const model of [
       "google:gemini-3.6-flash",
-      "mux-gateway:google/gemini-3.6-flash",
+      "openrouter:google/gemini-3.6-flash",
       "google:gemini-3.6-flash-001",
     ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
@@ -621,11 +577,25 @@ describe("getThinkingPolicyForModel", () => {
   test("returns off/low/medium/high for stable Gemini 3.7 Flash", () => {
     for (const model of [
       "google:gemini-3.7-flash",
-      "mux-gateway:google/gemini-3.7-flash",
+      "openrouter:google/gemini-3.7-flash",
       "google:gemini-3.7-flash-001",
     ]) {
       expect(getThinkingPolicyForModel(model)).toEqual(["off", "low", "medium", "high"]);
     }
+  });
+
+  test("returns low/medium/high (no off) for Gemini 3.8 Flash, which rejects minimal", () => {
+    for (const model of [
+      "google:gemini-3.8-flash",
+      "openrouter:google/gemini-3.8-flash",
+      "google:gemini-3.8-flash-001",
+    ]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "medium", "high"]);
+      expect(enforceThinkingPolicy(model, "off")).toBe("low");
+      expect(enforceThinkingPolicy(model, "xhigh")).toBe("high");
+    }
+    // Still a recognized reasoning model: defaults to the medium floor like other Flash tiers.
+    expect(getDefaultMinimumThinkingLevel("google:gemini-3.8-flash")).toBe("medium");
   });
 
   test("returns off/low/medium/high for stable Gemini 3.5 Flash behind OpenRouter", () => {
@@ -695,35 +665,34 @@ describe("isGeminiFlashThinkingLevelModelName", () => {
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.5-flash-lite")).toBe(false);
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.6-flash-lite")).toBe(false);
     expect(isGeminiFlashThinkingLevelModelName("gemini-3.7-flash-lite")).toBe(false);
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash-lite")).toBe(false);
+  });
+
+  test("classifies stable Gemini 3.8 Flash IDs as Flash thinking-level chat models", () => {
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash")).toBe(true);
+    expect(isGeminiFlashThinkingLevelModelName("Gemini-3.8-Flash ")).toBe(true);
+    expect(isGeminiFlashThinkingLevelModelName("gemini-3.8-flash-001")).toBe(true);
+  });
+});
+
+describe("isGeminiFlashMinimalRejectingModelName", () => {
+  test("matches only Gemini 3.8 Flash chat IDs, not older Flash tiers or Lite variants", () => {
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("Gemini-3.8-Flash ")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash-001")).toBe(true);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.8-flash-lite")).toBe(false);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3.7-flash")).toBe(false);
+    expect(isGeminiFlashMinimalRejectingModelName("gemini-3-flash")).toBe(false);
   });
 });
 
 describe("enforceThinkingPolicy", () => {
-  describe("single-option policy models (gpt-5-pro)", () => {
-    test("enforces high for any requested level", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5-pro", "off")).toBe("high");
-      expect(enforceThinkingPolicy("openai:gpt-5-pro", "low")).toBe("high");
-      expect(enforceThinkingPolicy("openai:gpt-5-pro", "medium")).toBe("high");
-      expect(enforceThinkingPolicy("openai:gpt-5-pro", "high")).toBe("high");
-    });
-
-    test("enforces high for versioned gpt-5-pro", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5-pro-2025-10-06", "low")).toBe("high");
-    });
-  });
-
   describe("multi-option policy models", () => {
     test("allows requested level if in allowed set", () => {
       expect(enforceThinkingPolicy("anthropic:claude-opus-4", "off")).toBe("off");
       expect(enforceThinkingPolicy("anthropic:claude-opus-4", "low")).toBe("low");
       expect(enforceThinkingPolicy("anthropic:claude-opus-4", "medium")).toBe("medium");
       expect(enforceThinkingPolicy("anthropic:claude-opus-4", "high")).toBe("high");
-    });
-
-    test("falls back to medium when requested level not allowed", () => {
-      // Simulating behavior with gpt-5-pro (only allows "high")
-      // When requesting "low", falls back to first allowed level which is "high"
-      expect(enforceThinkingPolicy("openai:gpt-5-pro", "low")).toBe("high");
     });
   });
 
@@ -737,59 +706,6 @@ describe("enforceThinkingPolicy", () => {
 
     test("allows off for versioned model", () => {
       expect(enforceThinkingPolicy("anthropic:claude-opus-4-5-20251101", "off")).toBe("off");
-    });
-  });
-
-  describe("GPT-5.1-Codex-Max (5 levels including xhigh)", () => {
-    test("allows all 5 levels including xhigh", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5.1-codex-max", "off")).toBe("off");
-      expect(enforceThinkingPolicy("openai:gpt-5.1-codex-max", "low")).toBe("low");
-      expect(enforceThinkingPolicy("openai:gpt-5.1-codex-max", "medium")).toBe("medium");
-      expect(enforceThinkingPolicy("openai:gpt-5.1-codex-max", "high")).toBe("high");
-      expect(enforceThinkingPolicy("openai:gpt-5.1-codex-max", "xhigh")).toBe("xhigh");
-    });
-
-    test("allows xhigh for versioned model", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5.1-codex-max-2025-12-01", "xhigh")).toBe("xhigh");
-    });
-  });
-
-  describe("GPT-5.2 (5 levels including xhigh)", () => {
-    test("allows xhigh for base model", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5.2", "xhigh")).toBe("xhigh");
-    });
-
-    test("allows xhigh behind mux-gateway", () => {
-      expect(enforceThinkingPolicy("mux-gateway:openai/gpt-5.2", "xhigh")).toBe("xhigh");
-    });
-
-    test("allows xhigh for versioned model", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5.2-2025-12-11", "xhigh")).toBe("xhigh");
-    });
-  });
-
-  describe("GPT-5.5 (5 levels including xhigh)", () => {
-    test("allows xhigh for base model", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5.5", "xhigh")).toBe("xhigh");
-    });
-
-    test("allows xhigh for versioned model", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5.5-2026-04-23", "xhigh")).toBe("xhigh");
-    });
-
-    test("allows xhigh for mini and nano variants", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5.4-mini", "xhigh")).toBe("xhigh");
-      expect(enforceThinkingPolicy("openai:gpt-5.4-nano", "xhigh")).toBe("xhigh");
-    });
-  });
-
-  describe("GPT-5.5 Pro (medium/high/xhigh)", () => {
-    test("clamps low to medium", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5.5-pro", "low")).toBe("medium");
-    });
-
-    test("allows xhigh", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5.5-pro", "xhigh")).toBe("xhigh");
     });
   });
 
@@ -818,10 +734,6 @@ describe("enforceThinkingPolicy", () => {
       expect(enforceThinkingPolicy("anthropic:claude-opus-4-5", "xhigh")).toBe("high");
     });
 
-    test("falls back to high when xhigh requested on gpt-5-pro", () => {
-      expect(enforceThinkingPolicy("openai:gpt-5-pro", "xhigh")).toBe("high");
-    });
-
     test("clamps xhigh to high for standard Anthropic models", () => {
       expect(enforceThinkingPolicy("anthropic:claude-sonnet-4-5", "xhigh")).toBe("high");
     });
@@ -834,16 +746,14 @@ describe("resolveThinkingInput", () => {
   test("passes through named levels directly", () => {
     expect(resolveThinkingInput("off", "anthropic:claude-opus-4-1")).toBe("off");
     expect(resolveThinkingInput("high", "anthropic:claude-opus-4-1")).toBe("high");
-    expect(resolveThinkingInput("medium", "openai:gpt-5.5-pro")).toBe("medium");
+    expect(resolveThinkingInput("medium", "openai:gpt-6-astra")).toBe("medium");
   });
 
   test("numeric 0 maps to model's lowest allowed level", () => {
     // Default models: lowest = "off"
     expect(resolveThinkingInput(0, "anthropic:claude-opus-4-1")).toBe("off");
-    // gpt-5.5-pro: lowest = "medium"
-    expect(resolveThinkingInput(0, "openai:gpt-5.5-pro")).toBe("medium");
-    // gpt-5-pro: only "high"
-    expect(resolveThinkingInput(0, "openai:gpt-5-pro")).toBe("high");
+    // gpt-6-astra: lowest = "low"
+    expect(resolveThinkingInput(0, "openai:gpt-6-astra")).toBe("low");
     // gemini-3: lowest = "low"
     expect(resolveThinkingInput(0, "google:gemini-3")).toBe("low");
   });
@@ -855,34 +765,30 @@ describe("resolveThinkingInput", () => {
     expect(resolveThinkingInput(2, "anthropic:claude-sonnet-4-5")).toBe("medium");
     expect(resolveThinkingInput(3, "anthropic:claude-sonnet-4-5")).toBe("high");
 
-    // gpt-5.5-pro: [medium, high, xhigh] → 0=medium, 1=high, 2=xhigh
-    expect(resolveThinkingInput(0, "openai:gpt-5.5-pro")).toBe("medium");
-    expect(resolveThinkingInput(1, "openai:gpt-5.5-pro")).toBe("high");
-    expect(resolveThinkingInput(2, "openai:gpt-5.5-pro")).toBe("xhigh");
+    // gpt-6-astra: [low, medium, high, xhigh, max] → 0=low, 1=medium, ..., 4=max
+    expect(resolveThinkingInput(0, "openai:gpt-6-astra")).toBe("low");
+    expect(resolveThinkingInput(1, "openai:gpt-6-astra")).toBe("medium");
+    expect(resolveThinkingInput(4, "openai:gpt-6-astra")).toBe("max");
   });
 
   test("out-of-range numeric index clamps to model's highest level", () => {
     // Default has 4 levels, index 9 clamps to "high"
     expect(resolveThinkingInput(9, "anthropic:claude-sonnet-4-5")).toBe("high");
-    // gpt-5-pro only has "high", any index clamps to "high"
-    expect(resolveThinkingInput(5, "openai:gpt-5-pro")).toBe("high");
-    // gpt-5.5-pro has 3 levels, index 4 clamps to "xhigh"
-    expect(resolveThinkingInput(4, "openai:gpt-5.5-pro")).toBe("xhigh");
+    // gemini-3 has 2 levels, index 4 clamps to "high"
+    expect(resolveThinkingInput(4, "google:gemini-3")).toBe("high");
   });
 });
 
 describe("getDefaultMinimumThinkingLevel", () => {
   test("defaults to medium for explicitly-recognized reasoning models", () => {
     expect(getDefaultMinimumThinkingLevel("anthropic:claude-sonnet-4-6")).toBe("medium");
-    expect(getDefaultMinimumThinkingLevel("openai:gpt-5.2")).toBe("medium");
+    expect(getDefaultMinimumThinkingLevel("openai:gpt-6-luna")).toBe("medium");
   });
 
-  test("defaults to medium even when medium is not a native level (gemini-3, gpt-5-pro)", () => {
+  test("defaults to medium even when medium is not a native level (gemini-3)", () => {
     // gemini-3 capability is ["low","high"]; the default floor is still medium and the
     // available set resolves up to "high" via getAvailableThinkingLevels.
     expect(getDefaultMinimumThinkingLevel("google:gemini-3")).toBe("medium");
-    // gpt-5-pro is fixed to ["high"] but still supports reasoning.
-    expect(getDefaultMinimumThinkingLevel("openai:gpt-5-pro")).toBe("medium");
   });
 
   test("keeps off for the shared fallback policy (non-reasoning / unrecognized models)", () => {
@@ -938,6 +844,20 @@ describe("lookupMinThinkingLevelOverride", () => {
   });
 });
 
+describe("Grok 4.1 Fast thinking policy", () => {
+  test("offers a binary ladder without turning legacy non-Off effort off", () => {
+    const model = "xai:grok-4-1-fast";
+    expect(getThinkingPolicyForModel(model)).toEqual(["off", "high"]);
+    expect(getDefaultMinimumThinkingLevel(model)).toBe("off");
+    expect(enforceThinkingPolicy(model, "off")).toBe("off");
+    for (const level of ["low", "medium", "high", "xhigh", "max"] as const) {
+      expect(enforceThinkingPolicy(model, level)).toBe("high");
+    }
+    expect(resolveThinkingInput(1, model)).toBe("high");
+    expect(getAvailableThinkingLevels(model, "medium")).toEqual(["high"]);
+  });
+});
+
 describe("Grok 4.5 thinking policy", () => {
   test("offers only the reasoning efforts accepted by xAI", () => {
     expect(getThinkingPolicyForModel("xai:grok-4.5")).toEqual(["low", "medium", "high"]);
@@ -953,6 +873,38 @@ describe("Grok 4.6 thinking policy", () => {
     expect(getDefaultMinimumThinkingLevel("xai:grok-4.6")).toBe("medium");
     expect(enforceThinkingPolicy("xai:grok-4.6", "off")).toBe("low");
     expect(enforceThinkingPolicy("xai:grok-4.6", "max")).toBe("xhigh");
+  });
+});
+
+describe("Grok 4.7 thinking policy", () => {
+  test("keeps the native-xhigh frontier Grok ladder", () => {
+    expect(getThinkingPolicyForModel("xai:grok-4.7")).toEqual(["low", "medium", "high", "xhigh"]);
+    expect(getDefaultMinimumThinkingLevel("xai:grok-4.7")).toBe("medium");
+    expect(enforceThinkingPolicy("xai:grok-4.7", "off")).toBe("low");
+    expect(enforceThinkingPolicy("xai:grok-4.7", "max")).toBe("xhigh");
+  });
+});
+
+describe("GLM 5.3 thinking policy", () => {
+  test("offers only Z.ai's forced-thinking effort levels", () => {
+    for (const model of ["glm-5.3-flash", "zai:glm-5.3", "zai:glm-5.3-flash-2026-08-26"]) {
+      expect(getThinkingPolicyForModel(model)).toEqual(["low", "high", "max"]);
+    }
+
+    expect(enforceThinkingPolicy("zai:glm-5.3-flash", "off")).toBe("low");
+    expect(enforceThinkingPolicy("zai:glm-5.3-flash", "medium")).toBe("low");
+    expect(enforceThinkingPolicy("zai:glm-5.3-flash", "xhigh")).toBe("high");
+    expect(resolveEffectiveThinkingLevel("zai:glm-5.3-flash", undefined)).toBe("low");
+    expect(resolveEffectiveThinkingLevel("zai:glm-5.3-flash", "off")).toBe("low");
+  });
+
+  test("does not apply the GLM 5.3 policy to named variants", () => {
+    expect(getThinkingPolicyForModel("zai:glm-5.3-flashx")).toEqual([
+      "off",
+      "low",
+      "medium",
+      "high",
+    ]);
   });
 });
 
@@ -984,8 +936,8 @@ describe("getAvailableThinkingLevels", () => {
   });
 
   test("never returns empty: floor above the model's max locks to the highest level", () => {
-    // gpt-5.5-pro tops out at xhigh; a "max" floor locks to xhigh rather than emptying out.
-    expect(getAvailableThinkingLevels("openai:gpt-5.5-pro", "max")).toEqual(["xhigh"]);
+    // Opus 4.6 tops out at xhigh; a "max" floor locks to xhigh rather than emptying out.
+    expect(getAvailableThinkingLevels("anthropic:claude-opus-4-6", "max")).toEqual(["xhigh"]);
   });
 
   test("off floor leaves the full capability intact", () => {
@@ -1024,5 +976,25 @@ describe("isXaiGrokFastVariantSwap", () => {
     // Other models never swap instances on thinking-level changes.
     expect(isXaiGrokFastVariantSwap("xai:grok-4-1-fast-reasoning", "off", "high")).toBe(false);
     expect(isXaiGrokFastVariantSwap("anthropic:claude-sonnet-4-5", "off", "high")).toBe(false);
+  });
+});
+
+describe("resolveBetweenToolsThinkingLevel", () => {
+  const sonnet55 = "anthropic:claude-sonnet-5-5";
+  test.each([
+    // "off" and "low" turns ran at effort low; rows without a level are ignored.
+    { model: sonnet55, route: true, prior: ["off", undefined, "low"], expected: "off" },
+    { model: sonnet55, route: true, prior: ["off", "medium"], expected: "low" },
+    { model: sonnet55, route: true, prior: ["max"], expected: "low" },
+    { model: sonnet55, route: false, prior: [], expected: "low" },
+    { model: "anthropic:claude-sonnet-5", route: false, prior: ["high"], expected: "off" },
+  ] as const)("$model off, route=$route, prior=$prior → $expected", (testCase) => {
+    expect(
+      resolveBetweenToolsThinkingLevel(testCase.model, "off", testCase.route, testCase.prior)
+    ).toBe(testCase.expected);
+  });
+
+  test("leaves levels other than off unchanged", () => {
+    expect(resolveBetweenToolsThinkingLevel(sonnet55, "high", false, ["max"])).toBe("high");
   });
 });

@@ -1,9 +1,17 @@
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { buildSystemMessage, extractToolInstructions, readToolInstructions } from "./systemMessage";
+import {
+  buildSystemMessageFromSources,
+  extractToolInstructions,
+  extractToolInstructionsFromSources,
+  loadWorkspaceInstructionSources,
+  type BuildSystemMessageFromSourcesOptions,
+} from "./systemMessage";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
+import type { MCPServerMap } from "@/common/types/mcp";
+import type { Runtime } from "@/node/runtime/Runtime";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 
 const extractTagContent = (message: string, tagName: string): string | null => {
@@ -12,7 +20,67 @@ const extractTagContent = (message: string, tagName: string): string | null => {
   return match ? match[1].trim() : null;
 };
 import { describe, test, expect, beforeEach, afterEach, spyOn, type Mock } from "bun:test";
+import { randomUUID } from "node:crypto";
+import * as markdown from "@/node/utils/main/markdown";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import {
+  createMemoryHost,
+  MEMORY_USER_HOME,
+  MEMORY_XUM_HOME,
+} from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+import { CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY } from "@/node/utils/main/instructionFiles";
+
+// Stream startup loads one instruction-source snapshot (turnContextAssembler) and shares it
+// between the prompt and tool-instruction extraction (turnRequestBuilder). These helpers run
+// that same load-then-derive sequence so each test reads real files through the runtime.
+async function buildSystemMessage(
+  metadata: WorkspaceMetadata,
+  runtime: Runtime,
+  workspacePath: string,
+  additionalSystemInstructions?: string,
+  modelString?: string,
+  mcpServers?: MCPServerMap,
+  options?: BuildSystemMessageFromSourcesOptions & {
+    projectConfigs?: Map<string, ProjectConfig>;
+    claudeSkillsCompatEnabled?: boolean;
+  }
+): Promise<string> {
+  const sources = await loadWorkspaceInstructionSources(
+    metadata,
+    runtime,
+    workspacePath,
+    options?.projectConfigs,
+    options?.claudeSkillsCompatEnabled
+  );
+  return buildSystemMessageFromSources(
+    metadata,
+    sources,
+    workspacePath,
+    additionalSystemInstructions,
+    modelString,
+    mcpServers,
+    options
+  ).systemMessage;
+}
+
+async function readToolInstructions(
+  metadata: WorkspaceMetadata,
+  runtime: Runtime,
+  workspacePath: string,
+  modelString: string,
+  agentInstructions?: readonly string[],
+  projectConfigs?: Map<string, ProjectConfig>,
+  claudeSkillsCompatEnabled = false
+): Promise<Record<string, string>> {
+  const sources = await loadWorkspaceInstructionSources(
+    metadata,
+    runtime,
+    workspacePath,
+    projectConfigs,
+    claudeSkillsCompatEnabled
+  );
+  return extractToolInstructionsFromSources(sources, modelString, metadata, agentInstructions);
+}
 
 // Note: in this file we avoid tests that are merely tautological assertions of constants. Only
 // tests that verify branching logic should be here.
@@ -169,7 +237,7 @@ describe("buildSystemMessage", () => {
     await fs.mkdir(workspaceDir, { recursive: true });
     await fs.mkdir(globalDir, { recursive: true });
 
-    // Mock homedir to return our test directory (getSystemDirectory will append .mux)
+    // Mock homedir to return our test directory (getXumHome will append .mux)
     mockHomedir = spyOn(os, "homedir");
     mockHomedir.mockReturnValue(tempDir);
 
@@ -251,6 +319,286 @@ Use clear examples.
     const customInstructions = extractTagContent(systemMessage, "custom-instructions") ?? "";
     expect(customInstructions).toContain("Always be helpful.");
     expect(customInstructions).toContain("Use clear examples.");
+  });
+
+  test("promises $XUM_SCRATCH_DIR locally always and remotely only when it is set", async () => {
+    const base: WorkspaceMetadata = {
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const environmentFor = async (
+      runtimeConfig: WorkspaceMetadata["runtimeConfig"],
+      scratchDirSet: boolean
+    ) =>
+      extractTagContent(
+        await buildSystemMessage(
+          { ...base, runtimeConfig },
+          runtime,
+          workspaceDir,
+          undefined,
+          undefined,
+          undefined,
+          { scratchDirSet }
+        ),
+        "environment"
+      ) ?? "";
+
+    // Local/worktree use the host session dir, which always exists.
+    expect(await environmentFor(DEFAULT_RUNTIME_CONFIG, false)).toContain("$XUM_SCRATCH_DIR");
+    expect(await environmentFor({ type: "local" }, false)).toContain("$XUM_SCRATCH_DIR");
+    // Remote runtimes get one only with the Artifacts experiment and once the runtime confirmed
+    // it (runtimeScratchDir.ts): the line follows whether it is set this turn.
+    for (const remote of [
+      { type: "ssh", host: "example.test", srcBaseDir: "/srv/src" },
+      { type: "docker", image: "node:20" },
+      { type: "devcontainer", configPath: ".devcontainer/devcontainer.json" },
+    ] as const) {
+      expect(await environmentFor(remote, true)).toContain("$XUM_SCRATCH_DIR");
+      expect(await environmentFor(remote, false)).not.toContain("$XUM_SCRATCH_DIR");
+    }
+  });
+
+  test("describes the agent interface status page only while that view is active", async () => {
+    const metadata: WorkspaceMetadata = {
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    };
+    const agentInterfaceFor = async (agentInterfaceView: boolean | undefined) =>
+      extractTagContent(
+        await buildSystemMessage(metadata, runtime, workspaceDir, undefined, undefined, undefined, {
+          scratchDirSet: true,
+          agentInterfaceView,
+        }),
+        "agent-interface"
+      );
+
+    expect(await agentInterfaceFor(true)).toContain("$XUM_SCRATCH_DIR/artifacts/");
+    expect(await agentInterfaceFor(false)).toBeNull();
+    expect(await agentInterfaceFor(undefined)).toBeNull();
+  });
+
+  describe("Claude global instruction compatibility", () => {
+    const metadata = (): WorkspaceMetadata => ({
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    });
+
+    const buildWithCompat = (modelString?: string, modes?: readonly string[]): Promise<string> =>
+      buildSystemMessage(metadata(), runtime, workspaceDir, undefined, modelString, undefined, {
+        claudeSkillsCompatEnabled: true,
+        modes,
+      });
+
+    test("includes Claude instructions when compatibility is enabled", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(path.join(claudeDir, "CLAUDE.md"), "Claude global guidance.");
+
+      const customInstructions = extractTagContent(await buildWithCompat(), "custom-instructions");
+
+      expect(customInstructions).toContain("Claude global guidance.");
+    });
+
+    test("layers Claude instructions before native global instructions", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(path.join(claudeDir, "CLAUDE.md"), "Claude global guidance.");
+      await fs.writeFile(path.join(globalDir, "AGENTS.md"), "Native global guidance.");
+
+      const customInstructions = extractTagContent(await buildWithCompat(), "custom-instructions");
+
+      expect(customInstructions).not.toBeNull();
+      expect(customInstructions?.indexOf("Claude global guidance.")).toBeLessThan(
+        customInstructions?.indexOf("Native global guidance.") ?? -1
+      );
+    });
+
+    test("does not read Claude instructions when compatibility is disabled", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(path.join(claudeDir, "CLAUDE.md"), "Claude global guidance.");
+
+      const systemMessage = await buildSystemMessage(metadata(), runtime, workspaceDir);
+
+      expect(systemMessage).not.toContain("Claude global guidance.");
+    });
+
+    test("keeps Claude Model and Mode headings unscoped while native globals remain scoped", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(
+        path.join(claudeDir, "CLAUDE.md"),
+        `Claude general guidance.
+## Model: sonnet
+Claude model guidance stays shared.
+## Mode: plan
+Claude mode guidance stays shared.
+`
+      );
+      await fs.writeFile(
+        path.join(globalDir, "AGENTS.md"),
+        `Native general guidance.
+## Model: sonnet
+Native model guidance is scoped.
+## Mode: plan
+Native mode guidance is scoped.
+`
+      );
+
+      const systemMessage = await buildWithCompat("anthropic:claude-3.5-sonnet", ["plan"]);
+      const customInstructions = extractTagContent(systemMessage, "custom-instructions") ?? "";
+      const modelInstructions =
+        extractTagContent(systemMessage, "model-anthropic-claude-3-5-sonnet") ?? "";
+      const modeInstructions = extractTagContent(systemMessage, "mode-plan") ?? "";
+
+      expect(customInstructions).toContain("Claude model guidance stays shared.");
+      expect(customInstructions).toContain("Claude mode guidance stays shared.");
+      expect(customInstructions).not.toContain("Native model guidance is scoped.");
+      expect(customInstructions).not.toContain("Native mode guidance is scoped.");
+      expect(modelInstructions).toContain("Native model guidance is scoped.");
+      expect(modelInstructions).not.toContain("Claude model guidance stays shared.");
+      expect(modeInstructions).toContain("Native mode guidance is scoped.");
+      expect(modeInstructions).not.toContain("Claude mode guidance stays shared.");
+    });
+
+    test("leaves the prompt unchanged when the Claude directory is missing", async () => {
+      const withoutCompat = await buildSystemMessage(metadata(), runtime, workspaceDir);
+      const withCompat = await buildWithCompat();
+
+      expect(withCompat).toBe(withoutCompat);
+    });
+
+    test("includes Tool sections from Claude global instructions", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(
+        path.join(claudeDir, "CLAUDE.md"),
+        "## Tool: bash\nUse the Claude-compatible shell guidance.\n"
+      );
+
+      const toolInstructions = await readToolInstructions(
+        metadata(),
+        runtime,
+        workspaceDir,
+        "anthropic:claude-sonnet-4-20250514",
+        undefined,
+        undefined,
+        true
+      );
+
+      expect(toolInstructions.bash).toBe("Use the Claude-compatible shell guidance.");
+    });
+
+    test("joins native global Tool sections before Claude compat Tool sections", async () => {
+      const claudeDir = path.join(tempDir, ".claude");
+      await fs.mkdir(claudeDir);
+      await fs.writeFile(
+        path.join(claudeDir, "CLAUDE.md"),
+        "## Tool: bash\nClaude compat shell guidance.\n"
+      );
+      await fs.writeFile(
+        path.join(globalDir, "AGENTS.md"),
+        "## Tool: bash\nNative shell guidance.\n"
+      );
+
+      const toolInstructions = await readToolInstructions(
+        metadata(),
+        runtime,
+        workspaceDir,
+        "anthropic:claude-sonnet-4-20250514",
+        undefined,
+        undefined,
+        true
+      );
+
+      // Tool extraction is highest-precedence first, so native global guidance
+      // must precede the compat source even though the prompt orders compat first.
+      expect(toolInstructions.bash).toBe(
+        ["Native shell guidance.", "Claude compat shell guidance."].join("\n\n")
+      );
+    });
+  });
+
+  describe("readToolInstructions parse cache", () => {
+    const metadata = (): WorkspaceMetadata => ({
+      id: "test-workspace",
+      name: "test-workspace",
+      projectName: "test-project",
+      projectPath: projectDir,
+      runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+    });
+    const model = "anthropic:claude-sonnet-4-20250514";
+    let extractToolSectionSpy: Mock<typeof markdown.extractToolSection>;
+
+    beforeEach(() => {
+      extractToolSectionSpy = spyOn(markdown, "extractToolSection");
+    });
+
+    afterEach(() => {
+      extractToolSectionSpy.mockRestore();
+    });
+
+    test("parses once for byte-identical sources and re-parses when content or model changes", async () => {
+      // Unique token keeps this test independent of cache entries left by other tests.
+      const guidance = `Shell guidance ${randomUUID()}.`;
+      const agentsPath = path.join(workspaceDir, "AGENTS.md");
+      await fs.writeFile(agentsPath, `## Tool: bash\n${guidance}\n`);
+
+      const first = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(first.bash).toBe(guidance);
+      const parseCallsAfterFirst = extractToolSectionSpy.mock.calls.length;
+      expect(parseCallsAfterFirst).toBeGreaterThan(0);
+
+      const second = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(second).toEqual(first);
+      expect(extractToolSectionSpy.mock.calls.length).toBe(parseCallsAfterFirst);
+
+      // Cached results must not alias each other: mutating one call's result
+      // cannot leak into the next.
+      second.bash = "mutated";
+      const third = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(third.bash).toBe(guidance);
+      expect(extractToolSectionSpy.mock.calls.length).toBe(parseCallsAfterFirst);
+
+      // Changing the model changes the available tool set, so it must re-parse.
+      await readToolInstructions(metadata(), runtime, workspaceDir, "openai:gpt-5");
+      const parseCallsAfterModelChange = extractToolSectionSpy.mock.calls.length;
+      expect(parseCallsAfterModelChange).toBeGreaterThan(parseCallsAfterFirst);
+
+      // Editing the file on disk is picked up on the next call.
+      const updatedGuidance = `${guidance} Updated.`;
+      await fs.writeFile(agentsPath, `## Tool: bash\n${updatedGuidance}\n`);
+      const afterEdit = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(afterEdit.bash).toBe(updatedGuidance);
+      expect(extractToolSectionSpy.mock.calls.length).toBeGreaterThan(parseCallsAfterModelChange);
+    });
+
+    test("moving identical content between global and workspace scope invalidates the cache", async () => {
+      const guidance = `Scoped guidance ${randomUUID()}.`;
+      const section = `## Tool: bash\n${guidance}\n`;
+      const workspaceAgentsPath = path.join(workspaceDir, "AGENTS.md");
+      const globalAgentsPath = path.join(globalDir, "AGENTS.md");
+
+      await fs.writeFile(workspaceAgentsPath, section);
+      const fromWorkspace = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(fromWorkspace.bash).toBe(guidance);
+      const parseCallsAfterWorkspace = extractToolSectionSpy.mock.calls.length;
+
+      await fs.rm(workspaceAgentsPath);
+      await fs.writeFile(globalAgentsPath, section);
+      const fromGlobal = await readToolInstructions(metadata(), runtime, workspaceDir, model);
+      expect(fromGlobal.bash).toBe(guidance);
+      expect(extractToolSectionSpy.mock.calls.length).toBeGreaterThan(parseCallsAfterWorkspace);
+    });
   });
 
   test("includes parent project AGENTS.md alongside sub-project AGENTS.md when subProjectPath is set", async () => {
@@ -528,8 +876,8 @@ Respond to Sonnet tickets in two sentences max.
   });
 
   test("ignores Model sections in shared workspace AGENTS.md (breaking change)", async () => {
-    // Shared AGENTS.md is read by non-Shux agents too, so "Model:" headings
-    // there are no longer parsed as Shux directives — they stay plain markdown
+    // Shared AGENTS.md is read by non-Xum agents too, so "Model:" headings
+    // there are no longer parsed as Xum directives — they stay plain markdown
     // inside <custom-instructions>.
     await fs.writeFile(
       path.join(workspaceDir, "AGENTS.md"),
@@ -930,7 +1278,7 @@ OpenAI-only instructions.
 
     for (const scenario of scopingScenarios) {
       test(scenario.name, async () => {
-        // Scoped Model: sections only activate in Shux-dedicated files.
+        // Scoped Model: sections only activate in Xum-dedicated files.
         await fs.mkdir(path.join(workspaceDir, ".mux"), { recursive: true });
         await fs.writeFile(path.join(workspaceDir, ".mux", "AGENTS.md"), scenario.mdContent);
 
@@ -953,5 +1301,44 @@ OpenAI-only instructions.
         scenario.assert(systemMessage);
       });
     }
+  });
+});
+
+describe("loadWorkspaceInstructionSources host", () => {
+  test("reads the global instructions through the host files and paths it is given", async () => {
+    // The agent loop passes its HostFiles and HostPaths (phase 5), so a memory host gives the
+    // global instructions, never the Node home of the test process.
+    const host = createMemoryHost();
+    const claudeDir = path.join(MEMORY_USER_HOME, CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY);
+    await host.files.promises.mkdir(claudeDir, { recursive: true });
+    await host.files.promises.writeFile(path.join(claudeDir, "CLAUDE.md"), "Claude from memory.");
+    await host.files.promises.writeFile(
+      path.join(MEMORY_XUM_HOME, "AGENTS.md"),
+      "Xum from memory."
+    );
+    const projectConfigs = new Map<string, ProjectConfig>([
+      ["/ws", { workspaces: [], customInstructions: "Project settings." }],
+    ]);
+
+    const sources = await loadWorkspaceInstructionSources(
+      {
+        id: "ws",
+        name: "ws",
+        projectName: "p",
+        projectPath: "/ws",
+        runtimeConfig: DEFAULT_RUNTIME_CONFIG,
+      },
+      host.runtime,
+      "/ws",
+      projectConfigs,
+      true,
+      { files: host.files, paths: host.paths }
+    );
+
+    expect(sources.global.map((set) => set.combinedContent)).toEqual([
+      "Claude from memory.",
+      "Xum from memory.",
+    ]);
+    expect(sources.context.map((set) => set.directory)).toEqual([MEMORY_XUM_HOME]);
   });
 });

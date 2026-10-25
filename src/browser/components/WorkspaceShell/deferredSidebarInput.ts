@@ -1,0 +1,111 @@
+import { CUSTOM_EVENTS } from "@/common/constants/events";
+import {
+  isDialogOpen,
+  isEditableElement,
+  KEYBINDS,
+  matchesKeybind,
+  matchesNewSidebarTabKeybind,
+} from "@/browser/utils/ui/keybinds";
+import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+
+/** Replays one held input. WorkspaceShell queues these while the right sidebar's chunk loads. */
+export type HeldSidebarInput = () => void;
+
+// Input that only RightSidebar (or, on phones, WorkspaceMenuBar) acts on. Keep in sync with the
+// window listeners in RightSidebar.tsx. Not OPEN_SIDE_CHAT_TAB: its sender reads the dispatch result
+// at once and opens the side chat full-screen when no sidebar claims it, as on a narrow layout.
+const SIDEBAR_EVENTS = [
+  CUSTOM_EVENTS.OPEN_GOAL_TAB,
+  CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB,
+  CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB,
+  CUSTOM_EVENTS.OPEN_MCP_APP_VIEW,
+  CUSTOM_EVENTS.OPEN_ARTIFACT,
+  CUSTOM_EVENTS.OPEN_REVIEW_IMMERSIVE,
+  CUSTOM_EVENTS.OPEN_TOUCH_REVIEW_IMMERSIVE,
+];
+const SIDEBAR_KEYBINDS = [
+  ...([1, 2, 3, 4, 5, 6, 7, 8, 9] as const).map((n) => KEYBINDS[`SIDEBAR_TAB_${n}`]),
+  KEYBINDS.OPEN_ARTIFACTS_TAB,
+  KEYBINDS.CLOSE_TAB,
+];
+
+/**
+ * T3 #5971: RightSidebar is code-split, so its window listeners do not exist until its chunk
+ * loads. Until then this holds its input (a window capture listener runs before every other
+ * window listener, even at the window target) and queues a replay, so the input acts exactly
+ * once, after the sidebar mounts. Returns the cleanup.
+ */
+export function holdSidebarInput(held: HeldSidebarInput[]): () => void {
+  const holdKey = (e: KeyboardEvent) => {
+    const sidebarKey =
+      SIDEBAR_KEYBINDS.some((keybind) => matchesKeybind(e, keybind)) ||
+      matchesNewSidebarTabKeybind(e) || // its own matcher: AltGr does not count
+      // Shift+I types a letter in a text field, where the sidebar ignores it.
+      (matchesKeybind(e, KEYBINDS.TOGGLE_REVIEW_IMMERSIVE) && !isEditableElement(e.target));
+    if (!sidebarKey) return;
+    // Like RightSidebar: Cmd/Ctrl+W must not close the window, even while a dialog is open.
+    if (matchesKeybind(e, KEYBINDS.CLOSE_TAB)) e.preventDefault();
+    if (isDialogOpen()) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    // The replay keeps `repeat`: a held OPEN_ARTIFACTS_TAB key must not replay as fresh presses,
+    // each of which would flip the sidebar.
+    const { target, key, code, ctrlKey, shiftKey, altKey, metaKey, repeat } = e;
+    const init = {
+      key,
+      code,
+      ctrlKey,
+      shiftKey,
+      altKey,
+      metaKey,
+      repeat,
+      bubbles: true,
+      cancelable: true,
+    };
+    held.push(() => {
+      const node = target instanceof Node && target.isConnected ? target : window;
+      node.dispatchEvent(new window.KeyboardEvent("keydown", init));
+    });
+  };
+  const holdEvent = holdEventInto(held);
+  window.addEventListener("keydown", holdKey, true);
+  for (const type of SIDEBAR_EVENTS) window.addEventListener(type, holdEvent, true);
+  return () => {
+    window.removeEventListener("keydown", holdKey, true);
+    for (const type of SIDEBAR_EVENTS) window.removeEventListener(type, holdEvent, true);
+  };
+}
+
+function holdEventInto(held: HeldSidebarInput[]): (e: Event) => void {
+  return (e) => {
+    // While the layout hides the sidebar, RightSidebar ignores these two and WorkspaceMenuBar acts
+    // on them. Chromium may already have run the menu bar's listener (window listeners run in
+    // registration order at the window target), so a replay would act twice (#6208).
+    const menuBarEvent =
+      e.type === CUSTOM_EVENTS.OPEN_ARTIFACT || e.type === CUSTOM_EVENTS.OPEN_MCP_APP_VIEW;
+    if (
+      menuBarEvent &&
+      isWorkspaceRightSidebarHidden(document.querySelector("[data-workspace-shell]"))
+    )
+      return;
+    e.stopImmediatePropagation();
+    const detail: unknown = e instanceof window.CustomEvent ? e.detail : undefined;
+    held.push(() => window.dispatchEvent(new window.CustomEvent(e.type, { detail })));
+  };
+}
+
+/**
+ * After the sidebar chunk failed to load: RightSidebar never mounts, so keep its guards that stop
+ * its shortcuts' browser defaults (Cmd/Ctrl+W closes the window, Cmd/Ctrl+1-9 switch browser tabs).
+ * Not Shift+I: it types a letter and has no browser default. Returns the cleanup.
+ */
+export function guardSidebarKeys(): () => void {
+  const guard = (e: KeyboardEvent) => {
+    const sidebarKey =
+      SIDEBAR_KEYBINDS.some((keybind) => matchesKeybind(e, keybind)) ||
+      matchesNewSidebarTabKeybind(e);
+    if (sidebarKey) e.preventDefault();
+  };
+  window.addEventListener("keydown", guard);
+  return () => window.removeEventListener("keydown", guard);
+}

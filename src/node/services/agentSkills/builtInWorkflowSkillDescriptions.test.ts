@@ -19,9 +19,9 @@ function hasPackagedWorkflow(name: string): boolean {
 }
 
 describe("legacy built-in skill aliases", () => {
-  test("resolves mux skill names to canonical shux packages and files", () => {
-    expect(getBuiltInSkillByName("mux-docs")?.frontmatter.name).toBe("shux-docs");
-    expect(readBuiltInSkillFile("mux-docs", "SKILL.md").content).toContain("name: shux-docs");
+  test("resolves mux skill names to canonical xum packages and files", () => {
+    expect(getBuiltInSkillByName("mux-docs")?.frontmatter.name).toBe("xum-docs");
+    expect(readBuiltInSkillFile("mux-docs", "SKILL.md").content).toContain("name: xum-docs");
   });
 });
 

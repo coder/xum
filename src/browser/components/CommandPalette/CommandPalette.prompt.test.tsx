@@ -56,6 +56,59 @@ describe("CommandPalette inline goal prompts", () => {
     cleanupDom = null;
   });
 
+  test("a select prompt whose options fail to load shows the error in the palette", async () => {
+    const view = renderPalette({
+      id: "test-select",
+      title: "Pick something",
+      section: "Tests",
+      run: () => undefined,
+      prompt: {
+        fields: [
+          {
+            type: "select",
+            name: "choice",
+            label: "Choice",
+            getOptions: () => Promise.reject(new Error("backend busy")),
+          },
+        ],
+        onSubmit: mock(),
+      },
+    });
+    fireEvent.click(view.getByRole("button", { name: "Open palette" }));
+    fireEvent.click(await view.findByText("Pick something"));
+    // An alert: the failure appears after the prompt opened, so screen readers announce it.
+    expect((await view.findByRole("alert")).textContent).toContain(
+      "Could not load options: backend busy"
+    );
+  });
+
+  test("guest Escape leaves the host palette open", async () => {
+    const view = renderPalette({
+      id: "test-action",
+      title: "Test action",
+      section: "Tests",
+      run: () => undefined,
+    });
+    fireEvent.click(view.getByRole("button", { name: "Open palette" }));
+    const input = await view.findByRole("combobox");
+    const viewport = document.createElement("div");
+    viewport.setAttribute("data-desktop-viewport", "");
+    const canvas = document.createElement("canvas");
+    viewport.appendChild(canvas);
+    view.container.appendChild(viewport);
+    const event = new window.KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+    });
+    fireEvent(canvas, event);
+    expect(event.defaultPrevented).toBe(false);
+    expect(view.getByRole("combobox")).toBe(input);
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("combobox")).toBeNull());
+  });
+
   test("Goal: Set objective traps focus and restores it on dismissal", async () => {
     const action: CommandAction = {
       id: "goal:set-objective",

@@ -1,11 +1,17 @@
 import { z } from "zod";
+import { isMcpAppResourceUri } from "@/common/utils/mcpApps";
+import { MCP_IDENTITY_LIMITS } from "@/common/constants/mcpIdentity";
+import { MCP_ICON_LIMITS } from "@/common/constants/mcpIcon";
+import { isPngDataUrl } from "@/common/utils/mcp/pngDataUrl";
+import { isHttpsOrigin, isHttpsUrlWithoutUserinfo } from "@/common/utils/mcp/httpsUrl";
+import { enforceUtf8ByteBudget } from "@/common/utils/mcp/utf8ByteBudget";
 
 /**
  * Per-workspace MCP overrides.
  *
- * Stored per-workspace in <workspace>/.mux/mcp.local.jsonc (workspace-local, intended to be gitignored).
+ * Stored per-workspace in <workspace>/.xum/mcp.local.jsonc (workspace-local, intended to be gitignored).
  * Allows workspaces to disable servers or restrict tool allowlists
- * without modifying the project-level .mux/mcp.jsonc.
+ * without modifying the project-level .xum/mcp.jsonc.
  */
 export const WorkspaceMCPOverridesSchema = z.object({
   /** Server names to explicitly disable for this workspace. */
@@ -34,9 +40,12 @@ export const MCPServerPluginProvenanceSchema = z.object({
   pluginName: z.string(),
   serverName: z.string(),
   sourceScope: z.enum(["project", "global"]),
-  /** Installation location discriminator, e.g. ".mux/plugins/demo" (same-name plugins can sit in sibling containers). */
+  /** Installation location discriminator, e.g. ".xum/plugins/demo" (same-name plugins can sit in sibling containers). */
   sourceLocation: z.string(),
+  componentPolicy: z.object({ registryPath: z.string(), name: z.string() }).optional(),
 });
+
+const MCPConfigLayerSchema = z.enum(["global", "project"]);
 
 export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
   z.object({
@@ -48,14 +57,17 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("http"),
+    managed: z.literal("claude-design").optional(),
     url: z.string(),
     headers: MCPHeadersSchema.optional(),
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("sse"),
@@ -64,6 +76,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
   z.object({
     transport: z.literal("auto"),
@@ -72,6 +85,7 @@ export const MCPServerInfoSchema = z.discriminatedUnion("transport", [
     disabled: z.boolean(),
     toolAllowlist: z.array(z.string()).optional(),
     plugin: MCPServerPluginProvenanceSchema.optional(),
+    configLayer: MCPConfigLayerSchema.optional(),
   }),
 ]);
 
@@ -242,11 +256,104 @@ export const BearerChallengeSchema = z.object({
   resourceMetadataUrl: z.url().optional(),
 });
 
+/** Credential-free `https:` URL suitable for display and for opening externally. */
+export const HttpsUrlSchema = z
+  .string()
+  .max(MCP_IDENTITY_LIMITS.websiteUrlMaxChars)
+  .refine(isHttpsUrlWithoutUserinfo, { message: "must be an https URL without credentials" });
+
+/** Exactly serialized https origin (`https://host[:port]`), ASCII only. */
+export const HttpsOriginSchema = z
+  .string()
+  .max(MCP_IDENTITY_LIMITS.originMaxBytes)
+  .refine(isHttpsOrigin, { message: "must be an https origin" });
+
+/**
+ * Server-reported identity (MCP `Implementation`), display-only and never a
+ * verified identity: it must not drive namespacing, enablement, trust, or
+ * OAuth decisions. Required fields fail the whole value; optional fields that
+ * are malformed or over budget are dropped individually via `.catch`.
+ * Empty optional strings are dropped too, so `title ?? name` is always a
+ * usable display name.
+ */
+export const MCPServerIdentitySchema = z.object({
+  name: z.string().min(1).max(MCP_IDENTITY_LIMITS.nameMaxChars),
+  version: z.string().min(1).max(MCP_IDENTITY_LIMITS.versionMaxChars),
+  title: z.string().min(1).max(MCP_IDENTITY_LIMITS.titleMaxChars).optional().catch(undefined),
+  description: z
+    .string()
+    .min(1)
+    .max(MCP_IDENTITY_LIMITS.descriptionMaxChars)
+    .optional()
+    .catch(undefined),
+  websiteUrl: HttpsUrlSchema.optional().catch(undefined),
+});
+
+/**
+ * The configured connection an identity was observed on. Deliberately carries
+ * no command, args, path, query, headers, or userinfo — those can hold
+ * credentials and this value is persisted into chat history.
+ */
+export const MCPConnectionRefSchema = z.object({
+  /** Server key from mcp.jsonc. */
+  key: z.string().min(1).max(MCP_IDENTITY_LIMITS.connectionKeyMaxChars),
+  /** Actual transport in use (`auto` is resolved before a snapshot is taken). */
+  transport: z.enum(["stdio", "http", "sse"]),
+  /** http/sse only: origin of the configured URL when it is https. */
+  origin: HttpsOriginSchema.optional().catch(undefined),
+});
+
+export const MCPIconRefSchema = z.string().regex(/^[a-f0-9]{32}$/);
+export const PngDataUrlSchema = z
+  .string()
+  .max(MCP_ICON_LIMITS.pngDataUrlMaxChars)
+  .refine(isPngDataUrl);
+
+/**
+ * Per-tool-call identity snapshot authored by the host and frozen on the
+ * tool part. `source` records whether the identity came from this result's
+ * `_meta` or from the connection handshake. One aggregate byte budget bounds
+ * what every MCP tool call persists.
+ */
+export const MCPToolCallDisplaySchema = z
+  .object({
+    connection: MCPConnectionRefSchema,
+    identity: MCPServerIdentitySchema,
+    source: z.enum(["response", "connection"]),
+    /** Immutable session-local ref, never an icon URL or persisted image bytes. */
+    iconRef: MCPIconRefSchema.optional().catch(undefined),
+    /**
+     * MCP Apps (mcp-apps experiment): the tool declares a ui:// view. The server is
+     * `connection.key`; the card offers "Open in Artifacts".
+     */
+    app: z
+      .object({ resourceUri: z.string().refine(isMcpAppResourceUri) })
+      .optional()
+      .catch(undefined),
+  })
+  .superRefine(enforceUtf8ByteBudget(MCP_IDENTITY_LIMITS.displaySnapshotMaxBytes));
+
+/**
+ * Something in the global mcp.jsonc that Xum could not use (#2060): a JSONC syntax error or an
+ * entry that is not a server. Xum skips the broken entry and keeps the valid ones.
+ */
+export const MCPConfigProblemSchema = z.object({
+  /** 1-based position in the file; null when the problem has no position (an unreadable file). */
+  line: z.number().int().positive().nullable(),
+  column: z.number().int().positive().nullable(),
+  /** The server entry Xum skipped; null for a problem outside any entry. */
+  server: z.string().nullable(),
+  message: z.string(),
+});
+
 export const MCPTestResultSchema = z.discriminatedUnion("success", [
   z.object({
     success: z.literal(true),
     tools: z.array(z.string()),
     protocolVersion: z.string().optional(),
+    /** Handshake identity; optional so cached results from older builds still parse. */
+    serverInfo: MCPServerIdentitySchema.optional().catch(undefined),
+    icon: PngDataUrlSchema.optional().catch(undefined),
   }),
   z.object({
     success: z.literal(false),
@@ -254,3 +361,116 @@ export const MCPTestResultSchema = z.discriminatedUnion("success", [
     oauthChallenge: BearerChallengeSchema.optional(),
   }),
 ]);
+
+/**
+ * OpenAI structured settings (validated by common/utils/mcpSettings before it crosses IPC).
+ * These schemas are the one source of the snapshot types: common/utils/mcpSettings derives
+ * its types from them, so the IPC schema and the parser cannot drift apart.
+ */
+export const MCPSettingValueSchema = z.union([z.string(), z.number(), z.boolean()]);
+const MCPSettingSchemaBase = z.object({ title: z.string(), description: z.string().optional() });
+export const MCPSettingSchemaSchema = z.discriminatedUnion("type", [
+  MCPSettingSchemaBase.extend({ type: z.literal("boolean") }),
+  // No `pattern`: Xum never runs a server's regex (see parseSchema in mcpSettings).
+  MCPSettingSchemaBase.extend({
+    type: z.literal("string"),
+    enum: z.array(z.string()).optional(),
+    minLength: z.number().optional(),
+    maxLength: z.number().optional(),
+  }),
+  MCPSettingSchemaBase.extend({
+    type: z.enum(["number", "integer"]),
+    minimum: z.number().optional(),
+    maximum: z.number().optional(),
+    multipleOf: z.number().optional(),
+  }),
+]);
+/**
+ * What a layout tool item runs, resolved by Xum from the server's tools/list: the settings read
+ * names only the tool. The item has no action when the tool cannot run from settings (the
+ * server does not list it, or the tool allowlist excludes it).
+ */
+export const MCPSettingsToolActionSchema = z.object({
+  /** The spec's display name: `title`, then `annotations.title`, then `name` (cleaned). */
+  title: z.string(),
+  /** `annotations.readOnlyHint: true`. Any other tool asks the user before it runs. */
+  readOnly: z.boolean(),
+  /** An MCP App tool (a `ui://` view): the spec opens it in a modal (openSettingsApp). */
+  opensApp: z.boolean(),
+});
+export const MCPSettingsLayoutItemSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("property"), property: z.string() }),
+  z.object({
+    kind: z.literal("tool"),
+    tool: z.string(),
+    description: z.string().optional(),
+    /** Resolved by Xum from tools/list (MCPSettingsToolAction); none when it cannot run. */
+    action: MCPSettingsToolActionSchema.optional(),
+  }),
+]);
+export const MCPSettingsGroupSchema = z.object({
+  title: z.string(),
+  items: z.array(MCPSettingsLayoutItemSchema),
+});
+export const MCPSettingsSnapshotSchema = z.object({
+  properties: z.record(z.string(), MCPSettingSchemaSchema),
+  values: z.record(z.string(), MCPSettingValueSchema),
+  /** Layout groups in order; properties no group lists go last, in "Other settings". */
+  layout: z.array(MCPSettingsGroupSchema),
+  warnings: z.array(z.string()),
+  /** Schema properties dropped (unsupported schema, no valid value, or over a budget); the UI notes them. */
+  droppedSettingCount: z.number().int().nonnegative(),
+});
+/** A snapshot plus its server instance's token (MCPSettingsReadSnapshot). */
+export const MCPSettingsReadSnapshotSchema = MCPSettingsSnapshotSchema.extend({
+  instanceToken: z.string(),
+  /** This read's ID: a tool action names it, and only this read's layout tools may run. */
+  readId: z.string(),
+});
+export const MCPSettingsReadParamsSchema = z.object({
+  workspaceId: z.string(),
+  serverName: z.string(),
+});
+/** One call for every server the dialog shows (bulk data in one IPC call). */
+export const MCPSettingsReadInputSchema = z.object({
+  workspaceId: z.string(),
+  // No count limit: the dialog sends every enabled server, and each read has its own timeout.
+  serverNames: z.array(z.string()),
+  /**
+   * Read only servers the workspace already runs; never start or restart one
+   * (the workspace MCP dialog reads on open). Otherwise `{ notConnected: true }`.
+   */
+  ifConnected: z.boolean().optional(),
+});
+export const MCPSettingsUpdateParamsSchema = MCPSettingsReadParamsSchema.extend({
+  /** Changed values only. */
+  set: z.record(z.string(), MCPSettingValueSchema),
+  /** The read's instanceToken: a replaced or restarted server refuses the update. */
+  instanceToken: z.string(),
+});
+/** A settings layout tool action: the spec calls the tool with `{}`. */
+export const MCPSettingsRunToolParamsSchema = MCPSettingsReadParamsSchema.extend({
+  toolName: z.string(),
+  /** The read's instanceToken: the tool must belong to the server instance the user saw. */
+  instanceToken: z.string(),
+  /** The read's readId: that read's layout must offer the tool (#6611). */
+  readId: z.string(),
+  /** The user confirmed the run; required for a tool without `readOnlyHint: true`. */
+  confirmed: z.boolean(),
+});
+/** A settings layout tool action that opens an MCP App: the view to show in a modal. */
+export const MCPSettingsOpenAppResultSchema = z.object({
+  /** The view record's key (McpAppViewRef.toolCallId). */
+  viewKey: z.string().min(1),
+  serverName: z.string().min(1),
+  /** What the user sees for the server (a plugin server's key is internal). */
+  serverLabel: z.string(),
+  toolName: z.string().min(1),
+  title: z.string(),
+  resourceUri: z.string().refine(isMcpAppResourceUri),
+});
+/** The text parts of the tool result (bounded); `isError` when the tool reported an error. */
+export const MCPSettingsRunToolResultSchema = z.object({
+  text: z.string(),
+  isError: z.boolean(),
+});

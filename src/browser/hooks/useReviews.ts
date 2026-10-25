@@ -4,9 +4,8 @@
  */
 
 import { useCallback, useMemo } from "react";
-import { usePersistedState } from "./usePersistedState";
-import { getReviewsKey } from "@/common/constants/storage";
-import type { Review, ReviewsState, ReviewNoteData } from "@/common/types/review";
+import { getReviewStateStore, useReviewStateSelector } from "@/browser/stores/ReviewStateStore";
+import type { Review, ReviewNoteData, ReviewStatus } from "@/common/types/review";
 
 /**
  * Generate a unique ID for a review
@@ -14,6 +13,8 @@ import type { Review, ReviewsState, ReviewNoteData } from "@/common/types/review
 function generateReviewId(): string {
   return `review-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
 }
+
+const EMPTY_REVIEWS: Record<string, Review> = {};
 
 export interface UseReviewsReturn {
   /** All reviews (pending, attached, and checked) */
@@ -50,27 +51,27 @@ export interface UseReviewsReturn {
   clearAll: () => void;
   /** Get a review by ID */
   getReview: (reviewId: string) => Review | undefined;
+  /** False until the backend review state has hydrated */
+  isLoaded: boolean;
 }
 
 /**
  * Hook for managing reviews for a workspace
- * Persists reviews to localStorage
+ * Persists reviews in the backend review-state store (review-state.json), shared by every
+ * hook instance and browser window, so the banner updates when AIView adds reviews.
  */
 export function useReviews(workspaceId: string): UseReviewsReturn {
-  const [state, setState] = usePersistedState<ReviewsState>(
-    getReviewsKey(workspaceId),
-    {
-      workspaceId,
-      reviews: {},
-      lastUpdated: Date.now(),
-    },
-    { listener: true } // Enable cross-component sync so banner updates when AIView adds reviews
+  // Selected per section so hunk read/expand changes do not re-render the chat pane.
+  const stateReviews = useReviewStateSelector(
+    workspaceId,
+    (view) => view.sections.reviews ?? EMPTY_REVIEWS
   );
+  const isLoaded = useReviewStateSelector(workspaceId, (view) => view.isReady);
 
   // Convert reviews object to sorted array (oldest first - newest at end)
   const reviews = useMemo(() => {
-    return Object.values(state.reviews).sort((a, b) => a.createdAt - b.createdAt);
-  }, [state.reviews]);
+    return Object.values(stateReviews).sort((a, b) => a.createdAt - b.createdAt);
+  }, [stateReviews]);
 
   // Filter reviews by status
   const attachedReviews = useMemo(() => {
@@ -88,6 +89,24 @@ export function useReviews(workspaceId: string): UseReviewsReturn {
     return reviews.filter((r) => r.status === "checked").length;
   }, [reviews]);
 
+  // Updaters are pure over the latest composed view: before hydration the store replays
+  // them onto the server data instead of writing over it.
+  const setStatuses = useCallback(
+    (select: (review: Review) => boolean, status: ReviewStatus) => {
+      getReviewStateStore().mutate(workspaceId, "reviews", (prev) => {
+        const now = Date.now();
+        const set: Record<string, Review> = {};
+        for (const [id, review] of Object.entries(prev)) {
+          if (review.status !== status && select(review)) {
+            set[id] = { ...review, status, statusChangedAt: now };
+          }
+        }
+        return { set };
+      });
+    },
+    [workspaceId]
+  );
+
   const addReview = useCallback(
     (data: ReviewNoteData): Review => {
       const review: Review = {
@@ -97,213 +116,83 @@ export function useReviews(workspaceId: string): UseReviewsReturn {
         createdAt: Date.now(),
       };
 
-      setState((prev) => ({
-        ...prev,
-        reviews: {
-          ...prev.reviews,
-          [review.id]: review,
-        },
-        lastUpdated: Date.now(),
+      getReviewStateStore().mutate(workspaceId, "reviews", () => ({
+        set: { [review.id]: review },
       }));
 
       return review;
     },
-    [setState]
+    [workspaceId]
   );
 
   const attachReview = useCallback(
-    (reviewId: string) => {
-      setState((prev) => {
-        const review = prev.reviews[reviewId];
-        if (!review || review.status === "attached") return prev;
-
-        return {
-          ...prev,
-          reviews: {
-            ...prev.reviews,
-            [reviewId]: {
-              ...review,
-              status: "attached",
-              statusChangedAt: Date.now(),
-            },
-          },
-          lastUpdated: Date.now(),
-        };
-      });
-    },
-    [setState]
+    (reviewId: string) => setStatuses((review) => review.id === reviewId, "attached"),
+    [setStatuses]
   );
 
   const detachReview = useCallback(
-    (reviewId: string) => {
-      setState((prev) => {
-        const review = prev.reviews[reviewId];
-        if (review?.status !== "attached") return prev;
-
-        return {
-          ...prev,
-          reviews: {
-            ...prev.reviews,
-            [reviewId]: {
-              ...review,
-              status: "pending",
-              statusChangedAt: Date.now(),
-            },
-          },
-          lastUpdated: Date.now(),
-        };
-      });
-    },
-    [setState]
+    (reviewId: string) =>
+      setStatuses((review) => review.id === reviewId && review.status === "attached", "pending"),
+    [setStatuses]
   );
 
-  const attachAllPending = useCallback(() => {
-    setState((prev) => {
-      const now = Date.now();
-      const updated = { ...prev.reviews };
-      let hasChanges = false;
+  const attachAllPending = useCallback(
+    () => setStatuses((review) => review.status === "pending", "attached"),
+    [setStatuses]
+  );
 
-      for (const [id, review] of Object.entries(prev.reviews)) {
-        if (review.status === "pending") {
-          updated[id] = { ...review, status: "attached", statusChangedAt: now };
-          hasChanges = true;
-        }
-      }
-
-      if (!hasChanges) return prev;
-      return { ...prev, reviews: updated, lastUpdated: now };
-    });
-  }, [setState]);
-
-  const detachAllAttached = useCallback(() => {
-    setState((prev) => {
-      const now = Date.now();
-      const updated = { ...prev.reviews };
-      let hasChanges = false;
-
-      for (const [id, review] of Object.entries(prev.reviews)) {
-        if (review.status === "attached") {
-          updated[id] = { ...review, status: "pending", statusChangedAt: now };
-          hasChanges = true;
-        }
-      }
-
-      if (!hasChanges) return prev;
-      return { ...prev, reviews: updated, lastUpdated: now };
-    });
-  }, [setState]);
+  const detachAllAttached = useCallback(
+    () => setStatuses((review) => review.status === "attached", "pending"),
+    [setStatuses]
+  );
 
   const checkReview = useCallback(
-    (reviewId: string) => {
-      setState((prev) => {
-        const review = prev.reviews[reviewId];
-        if (!review || review.status === "checked") return prev;
-
-        return {
-          ...prev,
-          reviews: {
-            ...prev.reviews,
-            [reviewId]: {
-              ...review,
-              status: "checked",
-              statusChangedAt: Date.now(),
-            },
-          },
-          lastUpdated: Date.now(),
-        };
-      });
-    },
-    [setState]
+    (reviewId: string) => setStatuses((review) => review.id === reviewId, "checked"),
+    [setStatuses]
   );
 
   const uncheckReview = useCallback(
-    (reviewId: string) => {
-      setState((prev) => {
-        const review = prev.reviews[reviewId];
-        if (!review || review.status === "pending") return prev;
-
-        return {
-          ...prev,
-          reviews: {
-            ...prev.reviews,
-            [reviewId]: {
-              ...review,
-              status: "pending",
-              statusChangedAt: Date.now(),
-            },
-          },
-          lastUpdated: Date.now(),
-        };
-      });
-    },
-    [setState]
+    (reviewId: string) => setStatuses((review) => review.id === reviewId, "pending"),
+    [setStatuses]
   );
 
   const removeReview = useCallback(
     (reviewId: string) => {
-      setState((prev) => {
-        const { [reviewId]: _, ...rest } = prev.reviews;
-        return {
-          ...prev,
-          reviews: rest,
-          lastUpdated: Date.now(),
-        };
-      });
+      getReviewStateStore().mutate(workspaceId, "reviews", () => ({ delete: [reviewId] }));
     },
-    [setState]
+    [workspaceId]
   );
 
   const updateReviewNote = useCallback(
     (reviewId: string, newNote: string) => {
-      setState((prev) => {
-        const review = prev.reviews[reviewId];
-        if (!review) return prev;
-
-        return {
-          ...prev,
-          reviews: {
-            ...prev.reviews,
-            [reviewId]: {
-              ...review,
-              data: {
-                ...review.data,
-                userNote: newNote,
-              },
-            },
-          },
-          lastUpdated: Date.now(),
-        };
+      getReviewStateStore().mutate(workspaceId, "reviews", (prev) => {
+        const review = prev[reviewId];
+        if (!review) return null;
+        return { set: { [reviewId]: { ...review, data: { ...review.data, userNote: newNote } } } };
       });
     },
-    [setState]
+    [workspaceId]
   );
 
   const clearChecked = useCallback(() => {
-    setState((prev) => {
-      const filtered = Object.fromEntries(
-        Object.entries(prev.reviews).filter(([_, r]) => r.status !== "checked")
-      );
-      return {
-        ...prev,
-        reviews: filtered,
-        lastUpdated: Date.now(),
-      };
-    });
-  }, [setState]);
+    getReviewStateStore().mutate(workspaceId, "reviews", (prev) => ({
+      delete: Object.values(prev)
+        .filter((review) => review.status === "checked")
+        .map((review) => review.id),
+    }));
+  }, [workspaceId]);
 
   const clearAll = useCallback(() => {
-    setState((prev) => ({
-      ...prev,
-      reviews: {},
-      lastUpdated: Date.now(),
+    getReviewStateStore().mutate(workspaceId, "reviews", (prev) => ({
+      delete: Object.keys(prev),
     }));
-  }, [setState]);
+  }, [workspaceId]);
 
   const getReview = useCallback(
     (reviewId: string): Review | undefined => {
-      return state.reviews[reviewId];
+      return stateReviews[reviewId];
     },
-    [state.reviews]
+    [stateReviews]
   );
 
   return useMemo(
@@ -325,6 +214,7 @@ export function useReviews(workspaceId: string): UseReviewsReturn {
       clearChecked,
       clearAll,
       getReview,
+      isLoaded,
     }),
     [
       reviews,
@@ -344,6 +234,7 @@ export function useReviews(workspaceId: string): UseReviewsReturn {
       clearChecked,
       clearAll,
       getReview,
+      isLoaded,
     ]
   );
 }

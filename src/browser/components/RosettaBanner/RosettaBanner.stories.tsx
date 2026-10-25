@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { Meta, StoryObj } from "@storybook/react-vite";
-import { within } from "@storybook/test";
+import { within } from "storybook/test";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { RosettaBanner } from "./RosettaBanner.js";
 
@@ -51,7 +51,7 @@ export const BannerVisible: Story = {
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await canvas.findByText(/Shux is running under Rosetta/i);
+    await canvas.findByText(/Xum is running under Rosetta/i);
     await canvas.findByRole("button", { name: /dismiss rosetta warning/i });
   },
 };

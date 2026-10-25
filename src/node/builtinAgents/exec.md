@@ -15,7 +15,6 @@ subagent:
     - If the task brief is missing critical information (scope, acceptance, or starting points) and you cannot infer it safely after a quick `explore`, do not guess.
       Call `agent_report` with 1–3 concrete questions/unknowns to wake the parent, do not create commits, and repeat the blocker in your final assistant message.
     - Run targeted verification and create one or more git commits.
-    - Fork-isolated child commits do not change your checkout. After a fork-isolated editing child finishes, use `task_apply_git_patch` before relying on its changes or starting dependent validation.
     - Never amend existing commits — always create new commits on top.
     - Use `agent_report` whenever the parent should see an important incremental finding or status update before you finish; you may call it multiple times.
     - Complete the task with a final assistant message that summarizes:
@@ -31,9 +30,10 @@ tools:
     # Use tools.remove in child agents to restrict specific tools
     - .*
   remove:
-    # Exec mode doesn't use planning tools
+    # Exec mode doesn't use planning tools. ask_user_question stays available so
+    # interactive exec turns can resolve genuinely balanced decisions with the user
+    # (sub-agents still lose it via the runtime hard-deny in resolveToolPolicy).
     - propose_plan
-    - ask_user_question
     # Global config and catalog tools stay out of general-purpose agents
     - mux_agents_.*
     - agent_skill_write
@@ -48,13 +48,6 @@ You are in Exec mode.
 
 - If an accepted `<plan>` block is provided, treat it as the contract and implement it directly. Only do extra exploration if the plan references non-existent files/symbols or if errors contradict it.
 - Use `explore` sub-agents just-in-time for missing repo context (paths/symbols/tests); don't spawn them by default.
-- Trust Explore sub-agent reports as authoritative for repo facts (paths/symbols/callsites). Do not redo the same investigation yourself; only re-check if the report is ambiguous or contradicts other evidence.
-- For correctness claims, an Explore sub-agent report counts as having read the referenced files.
-- Fork-isolated child commits do not change your checkout. After a fork-isolated editing child finishes, use `task_apply_git_patch` before relying on its changes or starting dependent validation.
 - Make minimal, correct, reviewable changes that match existing codebase patterns.
 - Prefer targeted commands and checks (typecheck/tests) when feasible.
 - Treat as a standing order: keep running checks and addressing failures until they pass or a blocker outside your control arises.
-
-## Desktop Automation
-
-When a task involves repeated screenshot/action/verify loops for desktop GUI interaction (for example, clicking through application UIs, filling desktop app forms, or visually verifying GUI state), delegate to the `desktop` agent via `task` rather than performing desktop automation inline. The desktop agent is purpose-built for the screenshot → act → verify grounding loop.

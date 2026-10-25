@@ -15,15 +15,15 @@ import { join } from "node:path";
 import {
   LEGACY_CMUX_HOME_DIR_NAME,
   LEGACY_MUX_HOME_DIR_NAME,
-  getShuxHomeLegacyFallbackMarkerPath,
-  parseShuxHomeLegacyFallbackDirName,
-  resolveShuxEnvironmentValue,
+  getXumHomeLegacyFallbackMarkerPath,
+  parseXumHomeLegacyFallbackDirName,
+  resolveXumEnvironmentValue,
 } from "@/common/compat/legacyMux";
-import { SHUX_HOME_DIR_NAME } from "@/common/constants/product";
+import { XUM_HOME_DIR_NAME } from "@/common/constants/product";
 
 /**
  * Session-dir file holding the active chat history epoch (latest compaction
- * boundary onward). Example: ~/.shux/sessions/<workspace>/chat.jsonl
+ * boundary onward). Example: ~/.xum/sessions/<workspace>/chat.jsonl
  */
 export const CHAT_FILE_NAME = "chat.jsonl";
 
@@ -45,16 +45,16 @@ export const CHAT_ARCHIVE_FILE_NAME = "chat-archive.jsonl";
  */
 export const HEADLESS_USAGE_FILE_NAME = "headless-usage.jsonl";
 
-const OBSOLETE_SHUX_BIN_ARTIFACTS = ["agent-browser", "agent-browser.cmd"] as const;
+const OBSOLETE_XUM_BIN_ARTIFACTS = ["agent-browser", "agent-browser.cmd"] as const;
 
 /**
- * Remove obsolete shux-managed bin wrappers that are no longer created at startup.
+ * Remove obsolete xum-managed bin wrappers that are no longer created at startup.
  * Keep this startup cleanup narrow so we don't delete unrelated user-managed files.
  */
-export function cleanupObsoleteShuxBinArtifacts(rootDir?: string): void {
-  const binDir = join(rootDir ?? getShuxHome(), "bin");
+export function cleanupObsoleteXumBinArtifacts(rootDir?: string): void {
+  const binDir = join(rootDir ?? getXumHome(), "bin");
 
-  for (const artifactName of OBSOLETE_SHUX_BIN_ARTIFACTS) {
+  for (const artifactName of OBSOLETE_XUM_BIN_ARTIFACTS) {
     const artifactPath = join(binDir, artifactName);
 
     try {
@@ -123,7 +123,7 @@ function openReadOnlyRegularFile(path: string): SyncFileHandle {
 }
 
 /**
- * Trust boundary: `~/.shux.legacy-fallback` is untrusted if the home directory
+ * Trust boundary: `~/.xum.legacy-fallback` is untrusted if the home directory
  * is shared or the sibling marker is replaced. The writer only rename()s a
  * regular temp file, so this lookup accepts a regular file and refuses
  * FIFOs/sockets/directories/symlinks that could block startup or follow an
@@ -159,13 +159,13 @@ function readBoundedRegularFileSync(path: string, maxBytes: number): string | un
 function readMarkedLegacyHome(homeDir: string, suffix: string): string | undefined {
   try {
     const raw = readBoundedRegularFileSync(
-      getShuxHomeLegacyFallbackMarkerPath(homeDir, suffix),
+      getXumHomeLegacyFallbackMarkerPath(homeDir, suffix),
       MAX_LEGACY_FALLBACK_MARKER_BYTES
     );
     if (raw == null) {
       return undefined;
     }
-    const dirName = parseShuxHomeLegacyFallbackDirName(raw, suffix);
+    const dirName = parseXumHomeLegacyFallbackDirName(raw, suffix);
     return dirName == null ? undefined : join(homeDir, dirName);
   } catch {
     return undefined;
@@ -173,23 +173,23 @@ function readMarkedLegacyHome(homeDir: string, suffix: string): string | undefin
 }
 
 /**
- * Get the root directory for all shux configuration and data.
- * SHUX_ROOT is canonical; MUX_ROOT remains a downgrade-compatible alias.
+ * Get the root directory for all xum configuration and data.
+ * XUM_ROOT is canonical; MUX_ROOT remains a downgrade-compatible alias.
  * Appends '-dev' when NODE_ENV=development.
  *
  * Prefer a usable populated canonical directory, then a persisted leftover
  * fallback marker (written only with a known leftover name), then any healthy
  * canonical directory, then the first healthy leftover tree. A file or broken
- * symlink at ~/.shux is not a home. A genuinely empty unmarked home still
+ * symlink at ~/.xum is not a home. A genuinely empty unmarked home still
  * returns the canonical future path.
  *
  * Main-process only: this helper lives in constants/ for organization, but it
  * reads process.env / homedir and must not be imported from renderer code.
  * The lint disable below is the documented renderer-boundary exception.
  */
-export function getShuxHome(): string {
+export function getXumHome(): string {
   // eslint-disable-next-line no-restricted-globals, no-restricted-syntax -- main-only home resolution; see file comment
-  const explicitRoot = resolveShuxEnvironmentValue("ROOT", process.env);
+  const explicitRoot = resolveXumEnvironmentValue("ROOT", process.env);
   if (explicitRoot) {
     return explicitRoot;
   }
@@ -197,7 +197,7 @@ export function getShuxHome(): string {
   // eslint-disable-next-line no-restricted-globals, no-restricted-syntax -- main-only NODE_ENV suffix; see file comment
   const suffix = process.env.NODE_ENV === "development" ? "-dev" : "";
   const homeDir = os.homedir();
-  const canonicalPath = join(homeDir, SHUX_HOME_DIR_NAME + suffix);
+  const canonicalPath = join(homeDir, XUM_HOME_DIR_NAME + suffix);
   if (isHealthyDirectory(canonicalPath) && directoryHasEntries(canonicalPath)) {
     return canonicalPath;
   }
@@ -227,55 +227,74 @@ export function getShuxHome(): string {
 }
 
 /**
- * Get the directory where workspace git worktrees are stored.
- * Example: ~/.shux/src/my-project/feature-branch
- *
- * @param rootDir - Optional root directory (defaults to getShuxHome())
- */
-export function getShuxSrcDir(rootDir?: string): string {
-  const root = rootDir ?? getShuxHome();
-  return join(root, "src");
-}
-
-/**
  * Get the directory where session chat histories are stored.
- * Example: ~/.shux/sessions/workspace-id/chat.jsonl
+ * Example: ~/.xum/sessions/workspace-id/chat.jsonl
  *
- * @param rootDir - Optional root directory (defaults to getShuxHome())
+ * @param rootDir - Optional root directory (defaults to getXumHome())
  */
-export function getShuxSessionsDir(rootDir?: string): string {
-  const root = rootDir ?? getShuxHome();
+export function getXumSessionsDir(rootDir?: string): string {
+  const root = rootDir ?? getXumHome();
   return join(root, "sessions");
 }
 
 /**
  * Get the directory where mux backend logs are stored.
- * Example: ~/.shux/logs/mux.log
+ * Example: ~/.xum/logs/mux.log
  *
- * @param rootDir - Optional root directory (defaults to getShuxHome())
+ * @param rootDir - Optional root directory (defaults to getXumHome())
  */
-export function getShuxLogsDir(rootDir?: string): string {
-  const root = rootDir ?? getShuxHome();
+export function getXumLogsDir(rootDir?: string): string {
+  const root = rootDir ?? getXumHome();
   return join(root, "logs");
 }
 
 /**
- * Get the default directory for new projects created with bare names.
- * Example: ~/.shux/projects/my-project
- *
- * @param rootDir - Optional root directory (defaults to getShuxHome())
+ * Get the directory for perf session tapes (full-content onChat recordings, experiment
+ * `sessionTapes`). Local-only: tapes are never uploaded or committed.
  */
-export function getShuxProjectsDir(rootDir?: string): string {
-  const root = rootDir ?? getShuxHome();
+export function getXumPerfTapesDir(rootDir?: string): string {
+  return join(rootDir ?? getXumHome(), "perf", "tapes");
+}
+
+/**
+ * Get the directory where triggered perf CPU profiles are stored (experiment
+ * perfFlightRecorder). Example: ~/.xum/perf/captures/<id>.cpuprofile
+ *
+ * @param rootDir - Optional root directory (defaults to getXumHome())
+ */
+export function getXumPerfCapturesDir(rootDir?: string): string {
+  const root = rootDir ?? getXumHome();
+  return join(root, "perf", "captures");
+}
+
+/**
+ * Get the directory where "Report slowness" bundles are written (experiment
+ * perfFlightRecorder). Example: ~/.xum/perf/reports/<id>/snapshot.json
+ *
+ * @param rootDir - Optional root directory (defaults to getXumHome())
+ */
+export function getXumPerfReportsDir(rootDir?: string): string {
+  const root = rootDir ?? getXumHome();
+  return join(root, "perf", "reports");
+}
+
+/**
+ * Get the default directory for new projects created with bare names.
+ * Example: ~/.xum/projects/my-project
+ *
+ * @param rootDir - Optional root directory (defaults to getXumHome())
+ */
+export function getXumProjectsDir(rootDir?: string): string {
+  const root = rootDir ?? getXumHome();
   return join(root, "projects");
 }
 
 /**
  * Get the extension metadata file path (shared with VS Code extension).
  *
- * @param rootDir - Optional root directory (defaults to getShuxHome())
+ * @param rootDir - Optional root directory (defaults to getXumHome())
  */
-export function getShuxExtensionMetadataPath(rootDir?: string): string {
-  const root = rootDir ?? getShuxHome();
+export function getXumExtensionMetadataPath(rootDir?: string): string {
+  const root = rootDir ?? getXumHome();
   return join(root, "extensionMetadata.json");
 }

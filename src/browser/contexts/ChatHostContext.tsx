@@ -15,9 +15,20 @@ export interface ChatHostActions {
   openCommandPalette?: () => void;
 }
 
+/**
+ * Transcript mutation barrier supplied by a host that does not feed WorkspaceStore (the VS Code
+ * webview, #4942). `isAllowed` must read live state: dispatch sites call it after awaits.
+ */
+export interface HostTranscriptBarrier {
+  subscribe(workspaceId: string, listener: () => void): () => void;
+  isAllowed(workspaceId: string): boolean;
+}
+
 export interface ChatHostContextValue {
   uiSupport: Record<ChatUiFeatureId, ChatUiSupport>;
   actions: ChatHostActions;
+  /** Absent on desktop, where the barrier reads WorkspaceStore. */
+  transcriptBarrier?: HostTranscriptBarrier;
 }
 
 const DEFAULT_CHAT_UI_SUPPORT: Record<ChatUiFeatureId, ChatUiSupport> = CHAT_UI_FEATURE_IDS.reduce(
