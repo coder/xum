@@ -625,6 +625,7 @@ function wrapToolsWithModelOnlyNotifications(
       toolName,
       tool,
       engine,
+      // mutation-equivalent: clock is a HostClock object or undefined, so ?? and || agree
       config.clock ?? nodeClock
     );
   }

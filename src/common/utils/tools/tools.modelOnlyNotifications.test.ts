@@ -330,6 +330,12 @@ describe("getToolsForModel - model-only notifications", () => {
     // wall time, so a wall-clock `now` fails here.
     const clock = makeTestEffectRunner();
     const pollSpy = spyOn(NotificationEngine.prototype, "pollAfterToolCall");
+    const failingTool = {
+      // eslint-disable-next-line @typescript-eslint/require-await
+      execute: async () => {
+        throw new Error("boom");
+      },
+    } as unknown as Tool;
     try {
       const initStateManager = {
         waitForInit: () => Promise.resolve(),
@@ -346,10 +352,19 @@ describe("getToolsForModel - model-only notifications", () => {
           clock: clock.hostClock,
         },
         "ws-1",
-        initStateManager
+        initStateManager,
+        undefined,
+        { mcp_failing: failingTool }
       );
       await getExecute(tools.todo_read)();
-      expect(pollSpy.mock.calls.map(([ctx]) => ctx.now)).toEqual([TEST_CLOCK_START_MS]);
+      await clock.adjust(1_000);
+      await expect(getExecute(tools.mcp_failing)()).rejects.toThrow("boom");
+      expect(
+        pollSpy.mock.calls.map(([ctx]) => ({ now: ctx.now, succeeded: ctx.toolSucceeded }))
+      ).toEqual([
+        { now: TEST_CLOCK_START_MS, succeeded: true },
+        { now: TEST_CLOCK_START_MS + 1_000, succeeded: false },
+      ]);
     } finally {
       pollSpy.mockRestore();
       await clock.dispose();

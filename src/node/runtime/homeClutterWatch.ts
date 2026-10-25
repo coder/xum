@@ -110,6 +110,7 @@ export class ClutterScanner {
     const scan = snapshotClutterRoots(this.roots, this.readDir)
       .then((fresh) => {
         const merged = new Map(fresh);
+        // mutation-equivalent: last is a Map or null, and a Map is truthy, so ?? and || agree
         for (const [dir, names] of this.last ?? []) {
           if (!merged.has(dir)) merged.set(dir, names);
         }
@@ -117,6 +118,8 @@ export class ClutterScanner {
         return merged as ClutterSnapshot;
       })
       .finally(() => {
+        // mutation-equivalent: inFlight is set before this promise can settle and only this
+        // callback clears it, so it is never null here and ?. and . agree
         if (this.inFlight?.scan === scan) this.inFlight = null;
       });
     this.inFlight = { scan, startedAt: now };
