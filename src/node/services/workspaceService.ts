@@ -641,37 +641,6 @@ export function nameRestartBlockerWorkspaces(
  * whose registration write does not re-check it (#5181 and the rename race), registers between
  * the registry read and the delete. Their locked re-checks close it.
  */
-/**
- * What a runtime's removal reports to the user: what it kept on purpose for them to own
- * (#7100), or what a forced removal left behind (#5143). A container left behind still holds
- * this workspace's plan: the plan step cannot reach it once the worktree is gone. Forced paths
- * that skip the Force Delete dialog (bulk delete, cancel-creation, shift-click) never saw the
- * non-forced error that names it.
- */
-function runtimeRemovalWarnings(
-  deleteResult: Awaited<ReturnType<Runtime["deleteWorkspace"]>>,
-  planContainer: string | undefined,
-  workspaceId: string
-): WorkspaceRemoveWarning[] {
-  if (deleteResult.success) {
-    return deleteResult.notice ? [{ kind: "leftover", description: deleteResult.notice }] : [];
-  }
-  const leftovers = deleteResult.leftoverPaths ?? [];
-  if (leftovers.length > 0) {
-    log.warn("Forced removal left these behind; a container may still hold the plan", {
-      workspaceId,
-      leftovers,
-    });
-  }
-  return leftovers.map((leftover) => ({
-    kind: "leftover",
-    description:
-      leftover === planContainer
-        ? `The ${leftover} was left behind and may still hold this workspace's plan file; remove the container.`
-        : `${leftover} was left behind; remove it manually.`,
-  }));
-}
-
 function findWorkspaceSharingPlanPath(
   registry: readonly FrontendWorkspaceMetadata[],
   workspaceId: string,
@@ -1175,18 +1144,6 @@ function dedicatedRemoteBoxLabel(metadata: WorkspaceMetadata | undefined): strin
   return getDaytonaSandboxId(metadata?.runtimeConfig) ? "Daytona sandbox" : "Coder workspace";
 }
 
-/** The archive success value; warnings are outcomes that did not fail it (a sandbox kept). */
-function archivedResult(warnings: string[]): { kind: "archived"; warnings?: string[] } {
-  return warnings.length > 0 ? { kind: "archived", warnings } : { kind: "archived" };
-}
-
-function toBulkArchiveWarnings(
-  workspaceId: string,
-  warnings: string[] | undefined
-): Array<{ workspaceId: string; warning: string }> {
-  return (warnings ?? []).map((warning) => ({ workspaceId, warning }));
-}
-
 /** A Coder workspace Xum created for this workspace (not an existing one it connected to). */
 function isDedicatedCoderRuntime(runtimeConfig: RuntimeConfig | undefined): boolean {
   return (
@@ -1372,7 +1329,6 @@ interface ArchiveMergedInProjectResult {
   archivedWorkspaceIds: string[];
   skippedWorkspaceIds: string[];
   errors: Array<{ workspaceId: string; error: string }>;
-  warnings: Array<{ workspaceId: string; warning: string }>;
 }
 
 interface ProjectGitStatusResult {
@@ -8643,12 +8599,10 @@ export class WorkspaceService
           });
         } else {
           const projectPath = metadata.projectPath;
-          // The id lets a Daytona runtime tell whether other workspaces still use the sandbox.
           const runtime = createRuntime(metadata.runtimeConfig, {
             projectPath,
             workspaceName: metadata.name,
             workspacePath: persistedWorkspacePath,
-            workspaceId,
           });
 
           // Delete workspace from runtime first - if this fails with force=false, we abort
@@ -8682,12 +8636,28 @@ export class WorkspaceService
             log.error(
               `Failed to delete workspace from disk, but force=true. Removing from config. Error: ${deleteResult.error}`
             );
+            // A container left behind still holds this workspace's plan (#5143): the plan step
+            // below cannot reach it once the worktree is gone. Name it for the user's logs, and
+            // return it as a warning: forced paths that skip the Force Delete dialog (bulk delete,
+            // cancel-creation, shift-click) never saw the non-forced error that names it.
+            if (deleteResult.leftoverPaths?.length) {
+              log.warn("Forced removal left these behind; a container may still hold the plan", {
+                workspaceId,
+                leftovers: deleteResult.leftoverPaths,
+              });
+              const planContainer =
+                runtime instanceof DevcontainerRuntime
+                  ? containerLabel(runtime.getWorkspacePath(projectPath, metadata.name))
+                  : undefined;
+              removalWarnings = deleteResult.leftoverPaths.map((leftover) => ({
+                kind: "leftover",
+                description:
+                  leftover === planContainer
+                    ? `The ${leftover} was left behind and may still hold this workspace's plan file; remove the container.`
+                    : `${leftover} was left behind; remove it manually.`,
+              }));
+            }
           }
-          const planContainer =
-            runtime instanceof DevcontainerRuntime
-              ? containerLabel(runtime.getWorkspacePath(projectPath, metadata.name))
-              : undefined;
-          removalWarnings = runtimeRemovalWarnings(deleteResult, planContainer, workspaceId);
 
           // Note: Coder workspace deletion is handled by CoderSSHRuntime.deleteWorkspace()
         }
@@ -13295,7 +13265,6 @@ export class WorkspaceService
       //
       // NOTE: Archiving is typically a quick UI action, but it can fail if a hook needs to perform
       // cleanup (e.g., stopping a dedicated mux-created Coder workspace) and that cleanup fails.
-      const archiveWarnings: string[] = [];
       if (this.workspaceLifecycleHooks && beforeArchiveMetadata) {
         const hookResult = await this.workspaceLifecycleHooks.runBeforeArchive({
           workspaceId,
@@ -13304,7 +13273,6 @@ export class WorkspaceService
           // Model-facing archives (refuseLiveUserActivity) must not stop a running remote
           // workspace under a surviving detached job the host-local orphan scans cannot see.
           refuseStopUnderUnverifiedRemoteJobs: options?.refuseLiveUserActivity === true,
-          reportWarning: (warning) => archiveWarnings.push(warning),
         });
         if (!hookResult.success) {
           return Err(hookResult.error);
@@ -13499,7 +13467,7 @@ export class WorkspaceService
         subProjectPath: beforeArchiveMetadata?.subProjectPath,
       });
       eventSpine.emit("workspace.archived", { workspaceId });
-      return Ok(archivedResult(archiveWarnings));
+      return Ok({ kind: "archived" as const });
     } catch (error) {
       const message = getErrorMessage(error);
       return Err(`Failed to archive workspace: ${message}`);
@@ -14139,7 +14107,6 @@ export class WorkspaceService
     const archivedWorkspaceIds: string[] = [];
     const skippedWorkspaceIds: string[] = [];
     const errors: Array<{ workspaceId: string; error: string }> = [];
-    const warnings: Array<{ workspaceId: string; warning: string }> = [];
 
     try {
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -14234,19 +14201,16 @@ export class WorkspaceService
           continue;
         }
         archivedWorkspaceIds.push(workspaceId);
-        warnings.push(...toBulkArchiveWarnings(workspaceId, result.data.warnings));
       }
 
       archivedWorkspaceIds.sort();
       skippedWorkspaceIds.sort();
       errors.sort((a, b) => a.workspaceId.localeCompare(b.workspaceId));
-      warnings.sort((a, b) => a.workspaceId.localeCompare(b.workspaceId));
 
       return Ok({
         archivedWorkspaceIds,
         skippedWorkspaceIds,
         errors,
-        warnings,
       });
     } catch (error) {
       const message = getErrorMessage(error);

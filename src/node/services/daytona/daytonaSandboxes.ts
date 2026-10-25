@@ -1,7 +1,7 @@
 import * as path from "path";
 import type { DaytonaSandboxState } from "@/common/orpc/schemas/daytona";
 import { loadOrCreateInstallationId } from "@/node/config/installationIdentity";
-import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { log } from "@/node/services/log";
 import type { DaytonaAccount } from "./daytonaAccount";
 import {
   DaytonaApiError,
@@ -11,22 +11,10 @@ import {
   type DaytonaResizeRequest,
   type DaytonaSandbox,
 } from "./daytonaClient";
-import {
-  DAYTONA_READY_CACHE_MS,
-  type DaytonaEnsureReadyOptions,
-  type DaytonaReadiness,
-} from "./daytonaReadiness";
+import type { DaytonaEnsureReadyOptions, DaytonaReadiness } from "./daytonaReadiness";
 import type { DaytonaSsh } from "./daytonaSsh";
 
 export const DAYTONA_LABEL_INSTANCE = "xum.instance";
-
-/** Why a delete of a sandbox the workspace says Xum created kept it (see deleteSandbox). */
-export function notOwnedSandboxNotice(sandboxId: string): string {
-  return (
-    `Daytona sandbox "${sandboxId}" was kept: it does not carry this Xum install's ` +
-    `"${DAYTONA_LABEL_INSTANCE}" label, so Xum does not treat it as its own.`
-  );
-}
 export const DAYTONA_LABEL_WORKSPACE_ID = "xum.workspaceId";
 export const DAYTONA_LABEL_PROJECT = "xum.project";
 
@@ -34,12 +22,9 @@ export const DAYTONA_START_POLL_INTERVAL_MS = 2_000;
 
 /** Upper bound for bringing a stopped or archived sandbox back (archived restores are slow). */
 export const DAYTONA_START_TIMEOUT_MS = 180_000;
-/** How long a delete waits for a sandbox Daytona is already destroying to go away. */
-export const DAYTONA_DESTROY_WAIT_MS = 60_000;
 
 // Daytona documents "deleting" and "deleted"; "destroying" and "destroyed" are older spellings.
 const DESTROYING_STATE_NAMES = ["deleting", "deleted", "destroying", "destroyed"] as const;
-const DESTROYING_STATES = new Set<string>(DESTROYING_STATE_NAMES);
 
 type ObservedSandboxState = Exclude<DaytonaSandboxState, "missing">;
 
@@ -132,16 +117,6 @@ export class DaytonaSandboxes {
   private readonly rootDir: string;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
-  /**
-   * When this process last proved a sandbox carries this install's label (never one that does
-   * not). A turn reuses a proof within DAYTONA_READY_CACHE_MS, so a label someone else removed
-   * is seen within that window and a healthy sandbox pays one label read per window. Dropped
-   * with a delete, and with the account.
-   */
-  private readonly provenOwned = new Map<string, number>();
-  private readonly ownershipRequests = new Map<string, Promise<"owned" | "notOwned" | "missing">>();
-  /** Why a workspace's setup of the sandbox Xum created for it failed, for its later turns. */
-  private readonly setupFailures = new Map<string, string>();
 
   constructor(options: DaytonaSandboxesOptions) {
     this.account = options.account;
@@ -150,24 +125,6 @@ export class DaytonaSandboxes {
     this.rootDir = options.rootDir;
     this.now = options.now;
     this.sleep = options.sleep;
-  }
-
-  /** The settings changed: a label proof read in the old account says nothing about the new one. */
-  forgetOwnershipProofs(): void {
-    this.provenOwned.clear();
-  }
-
-  recordSetupFailure(workspaceId: string, reason: string): void {
-    this.setupFailures.set(workspaceId, reason);
-  }
-
-  getSetupFailure(workspaceId: string): string | undefined {
-    return this.setupFailures.get(workspaceId);
-  }
-
-  /** The workspace was removed: its id never comes back. */
-  clearSetupFailure(workspaceId: string): void {
-    this.setupFailures.delete(workspaceId);
   }
 
   /** Stable per Xum install, so the reconciler only ever touches this install's sandboxes. */
@@ -267,26 +224,6 @@ export class DaytonaSandboxes {
     await client.stopSandbox(sandboxId);
   }
 
-  /**
-   * Whether the sandbox is gone, waiting up to DAYTONA_DESTROY_WAIT_MS while Daytona destroys
-   * it (a failed setup deletes its sandbox while a removal of the workspace may already run).
-   * False for a sandbox in any other state, or one still being destroyed at the deadline.
-   */
-  async waitUntilDestroyed(sandboxId: string): Promise<boolean> {
-    const { client } = await this.account.getClient();
-    const deadline = this.now() + DAYTONA_DESTROY_WAIT_MS;
-    for (;;) {
-      const sandbox = await client.getSandbox(sandboxId).catch((error: unknown) => {
-        if (isDaytonaNotFound(error)) return undefined;
-        throw error;
-      });
-      if (!sandbox) return true;
-      const remaining = deadline - this.now();
-      if (!DESTROYING_STATES.has(sandbox.state ?? "") || remaining <= 0) return false;
-      await this.sleep(Math.min(DAYTONA_START_POLL_INTERVAL_MS, remaining));
-    }
-  }
-
   /** Stop and wait until Daytona reports the sandbox stopped (a resize of disk needs that). */
   async stopAndWait(sandboxId: string, deadline: number): Promise<void> {
     await this.stopSandbox(sandboxId);
@@ -309,75 +246,37 @@ export class DaytonaSandboxes {
 
   /**
    * Delete a sandbox Xum created and drop Xum's SSH access to it (token and include block). A
-   * sandbox that is already gone counts as deleted. `account` deletes it in the account it was
-   * created in, even after the settings changed to another one.
+   * sandbox that is already gone counts as deleted.
    *
-   * A workspace's config is not proof: a create of unknown outcome may have left it naming a
-   * sandbox someone else holds. So only a sandbox with this install's label is
-   * deleted; "notOwned" leaves it, and its access, to the caller.
+   * A workspace's config is not proof that Xum created the sandbox it names, so one without this
+   * install's label is kept (only Xum's access to it goes) and logged.
    */
-  async deleteSandbox(sandboxId: string): Promise<"deleted" | "notOwned"> {
+  async deleteSandbox(sandboxId: string): Promise<void> {
     const { client } = await this.account.getClient();
-    if ((await this.ownershipWith(client, sandboxId)) === "notOwned") return "notOwned";
-    this.provenOwned.delete(sandboxId);
+    const owned = await this.isOwned(client, sandboxId);
     // Revoke first: Daytona refuses to revoke a token of a sandbox that no longer exists.
     await this.ssh.releaseSshAccess(sandboxId);
+    if (!owned) {
+      log.warn("Keeping a Daytona sandbox without this install's label", { sandboxId });
+      return;
+    }
     try {
       await client.deleteSandbox(sandboxId);
     } catch (error) {
       if (!isDaytonaNotFound(error)) throw error;
     }
-    return "deleted";
   }
 
-  /**
-   * Whether a sandbox a workspace says Xum created carries this install's label. Asked before
-   * any step that changes it (a start, a checkout delete, a stop or a delete): a create of
-   * unknown outcome may have left the workspace naming someone else's sandbox.
-   */
-  async sandboxOwnership(
-    sandboxId: string,
-    options: { reuseProof?: boolean; signal?: AbortSignal } = {}
-  ): Promise<"owned" | "notOwned" | "missing"> {
-    // Only a turn or terminal reuses a proof: removals and archives read the label again.
-    if (!options.reuseProof)
-      return this.ownershipWith((await this.account.getClient()).client, sandboxId);
-    const provenAt = this.provenOwned.get(sandboxId);
-    if (provenAt !== undefined && this.now() - provenAt < DAYTONA_READY_CACHE_MS) return "owned";
-    // Concurrent checks share one read, so they reach the shared start together.
-    const request = this.ownershipRequests.get(sandboxId) ?? this.proveOwnership(sandboxId);
-    const raced = await raceWithAbortAndTimeout(request, { signal: options.signal });
-    if (raced.kind !== "ok") throw new Error("Aborted");
-    return raced.value;
-  }
-
-  private proveOwnership(sandboxId: string): Promise<"owned" | "notOwned" | "missing"> {
-    const request = (async () => {
-      const ownership = await this.ownershipWith(
-        (await this.account.getClient()).client,
-        sandboxId
-      );
-      if (ownership !== "owned") this.provenOwned.delete(sandboxId);
-      else this.provenOwned.set(sandboxId, this.now());
-      return ownership;
-    })().finally(() => this.ownershipRequests.delete(sandboxId));
-    this.ownershipRequests.set(sandboxId, request);
-    return request;
-  }
-
-  private async ownershipWith(
-    client: DaytonaClient,
-    sandboxId: string
-  ): Promise<"owned" | "notOwned" | "missing"> {
+  /** A sandbox that is already gone counts as owned: its delete is a no-op. */
+  private async isOwned(client: DaytonaClient, sandboxId: string): Promise<boolean> {
     let sandbox: DaytonaSandbox;
     try {
       sandbox = await client.getSandbox(sandboxId);
     } catch (error) {
-      if (isDaytonaNotFound(error)) return "missing";
+      if (isDaytonaNotFound(error)) return true;
       throw error;
     }
-    const owned = sandbox.labels?.[DAYTONA_LABEL_INSTANCE] === (await this.getInstanceId());
-    return owned ? "owned" : "notOwned";
+    return sandbox.labels?.[DAYTONA_LABEL_INSTANCE] === (await this.getInstanceId());
   }
 
   async refreshActivity(sandboxId: string): Promise<void> {
@@ -387,8 +286,8 @@ export class DaytonaSandboxes {
 
   /**
    * Bring the sandbox to `started` and make sure Xum can ssh into it (fresh token, include
-   * block). Concurrent callers for one sandbox share a single request; each still gets its own
-   * `onStarting` call. Throws a DaytonaApiError (`not_found` when the sandbox is gone).
+   * block). Concurrent callers for one sandbox share a single request; only the first hears
+   * `onStarting`. Throws a DaytonaApiError (`not_found` when the sandbox is gone).
    */
   ensureSandboxReady(sandboxId: string, options: DaytonaEnsureReadyOptions = {}): Promise<void> {
     return this.readiness.join(sandboxId, options, (onStarting) =>

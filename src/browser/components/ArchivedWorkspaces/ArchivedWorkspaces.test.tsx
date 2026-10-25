@@ -664,28 +664,6 @@ describe("ArchivedWorkspaces", () => {
     expect(status.textContent).toContain(workspace.name);
   });
 
-  // #7100: a plain removal can keep something on purpose (a Daytona sandbox another workspace
-  // attached), which the user then owns.
-  test("a plain delete shows what the removal kept", async () => {
-    const workspace = createWorkspace({ id: "parent", name: "parent" });
-    removeWorkspaceMock.mockResolvedValueOnce(successWithLeftover);
-    const view = render(
-      <ArchivedWorkspaces
-        projectPath={workspace.projectPath}
-        projectName={workspace.projectName}
-        workspaces={[workspace]}
-        onWorkspacesChanged={onWorkspacesChangedMock}
-      />
-    );
-    fireEvent.click(view.getByLabelText("Expand archived workspaces"));
-    fireEvent.click(await waitFor(() => view.getByLabelText("Delete workspace parent")));
-
-    const alert = await view.findByRole("alert");
-    expect(alert.textContent).toContain(leftover);
-    expect(removeWorkspaceMock).toHaveBeenCalledTimes(1);
-    expect(onWorkspacesChangedMock).toHaveBeenCalledTimes(1);
-  });
-
   test("Shift-click shows what the forced removal left behind", async () => {
     const workspace = createWorkspace({ id: "parent", name: "parent" });
     removeWorkspaceMock.mockResolvedValueOnce({

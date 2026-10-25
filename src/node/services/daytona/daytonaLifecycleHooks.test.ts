@@ -24,9 +24,9 @@ function metadata(daytona: DaytonaSandboxConfig): WorkspaceMetadata {
   };
 }
 
-function archive(workspaceMetadata: WorkspaceMetadata, reportWarning?: (warning: string) => void) {
+function archive(workspaceMetadata: WorkspaceMetadata) {
   const hook = createDaytonaArchiveHook({ daytonaService: rig.service });
-  return hook({ workspaceId: workspaceMetadata.id, workspaceMetadata, reportWarning });
+  return hook({ workspaceId: workspaceMetadata.id, workspaceMetadata });
 }
 
 describe("createDaytonaArchiveHook", () => {
@@ -55,18 +55,6 @@ describe("createDaytonaArchiveHook", () => {
 
     expect(rig.plane.find("sb-parent")?.state).toBe("started");
     expect(rig.plane.countCalls("DELETE /sandbox/sb-parent")).toBe(0);
-  });
-
-  it("never deletes a sandbox without this install's label on archive, and says why", async () => {
-    rig.plane.addSandbox({ id: "sb-foreign", labels: { "xum.instance": "another-install" } });
-    const warnings: string[] = [];
-
-    const result = await archive(metadata({ sandboxId: "sb-foreign" }), (w) => warnings.push(w));
-
-    expect(result.success).toBe(true);
-    expect(rig.plane.find("sb-foreign")?.state).toBe("started");
-    expect(rig.plane.countCalls("DELETE /sandbox/sb-foreign")).toBe(0);
-    expect(warnings.join(" ")).toContain("xum.instance");
   });
 
   it("archives a workspace whose sandbox is already gone", async () => {

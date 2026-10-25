@@ -62,7 +62,6 @@ export class DaytonaService {
 
   private async forgetAccount(previousClient: DaytonaClient | undefined): Promise<void> {
     this.readiness.invalidateAll();
-    this.sandboxes.forgetOwnershipProofs();
     await this.ssh.forgetAccount(previousClient);
   }
 }

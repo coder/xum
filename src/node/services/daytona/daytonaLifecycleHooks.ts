@@ -3,7 +3,7 @@ import { getDaytonaSandboxId, ownsDaytonaSandbox } from "@/common/types/runtime"
 import { getErrorMessage } from "@/common/utils/errors";
 import type { BeforeArchiveHook } from "@/node/services/workspaceLifecycleHooks";
 import type { DaytonaAccount } from "./daytonaAccount";
-import { notOwnedSandboxNotice, type DaytonaSandboxes } from "./daytonaSandboxes";
+import type { DaytonaSandboxes } from "./daytonaSandboxes";
 
 /**
  * Archiving the workspace that created a Daytona sandbox deletes the sandbox, whatever the
@@ -25,10 +25,7 @@ export function createDaytonaArchiveHook(options: DaytonaArchiveHookOptions): Be
         : undefined;
       if (!sandboxId) return Ok(undefined);
       try {
-        // Not Xum's after all (see deleteSandbox): it is kept.
-        if ((await options.daytonaService.sandboxes.deleteSandbox(sandboxId)) === "notOwned") {
-          args.reportWarning?.(notOwnedSandboxNotice(sandboxId));
-        }
+        await options.daytonaService.sandboxes.deleteSandbox(sandboxId);
         return Ok(undefined);
       } catch (error) {
         return Err(`Failed to delete Daytona sandbox "${sandboxId}": ${getErrorMessage(error)}`);

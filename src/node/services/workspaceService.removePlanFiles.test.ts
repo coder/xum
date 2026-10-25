@@ -348,35 +348,6 @@ describe("WorkspaceService removal deletes plan files (#5019)", () => {
     expect(sharesPlanStorage(coder("alpha"), coder("alpha"))).toBe(true);
   });
 
-  // #7100: a removal can keep something on purpose that the user then owns (a Daytona sandbox
-  // kept for a workspace that attached it, which Xum never deletes). The IPC result names it.
-  test("a removal's notice reaches the IPC result as a warning", async () => {
-    await withTempMuxRoot(async () => {
-      await addWorkspaceIn(projectPath, {
-        id: "ffffffff23",
-        name: "kept",
-        path: "~/xum/project/kept",
-        runtimeConfig: { type: "ssh", host: "box", srcBaseDir: "~/xum" },
-      });
-      // SSHRuntime's own result type has no notice; DaytonaSSHRuntime's does.
-      const kept = {
-        success: true as const,
-        deletedPath: "~/xum/project/kept",
-        notice: "sandbox kept",
-      };
-      spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue(kept);
-      spyRemotePlanDeletion();
-      const context = { workspaceService: service } as unknown as ORPCContext;
-
-      const result = WorkspaceRemoveResultSchema.parse(
-        await removeWorkspace(context, { workspaceId: "ffffffff23", options: {} })
-      );
-
-      expect(result.success ? "" : result.error).toBe("");
-      expect(result.warnings).toEqual([{ kind: "leftover", description: "sandbox kept" }]);
-    });
-  });
-
   // #5043 item 2: a devcontainer's plan is inside its container. A removal that confirmed the
   // container gone has nothing left to delete; otherwise the container survives with the plan,
   // and a later workspace at this path would reconnect to it, so the plan is deleted in there.

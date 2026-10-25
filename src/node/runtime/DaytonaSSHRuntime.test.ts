@@ -147,36 +147,6 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     expect(rig.writer.tokens.get("sb-stopped")).toBeDefined();
   });
 
-  it("never reports a start to a check cancelled while it waited for the shared one", async () => {
-    rig.plane.addSandbox({ id: "sb-slow", state: "stopped" });
-    let releaseState!: () => void;
-    const stateHeld = new Promise<void>((resolve) => (releaseState = resolve));
-    rig.plane.onRequest.set("GET /sandbox/sb-slow", () => {
-      rig.plane.onRequest.delete("GET /sandbox/sb-slow");
-      return stateHeld;
-    });
-    const cancelled: string[] = [];
-    const other: string[] = [];
-    const controller = new AbortController();
-    const cancelledCheck = makeRuntime({ sandboxId: "sb-slow" }).ensureReady({
-      signal: controller.signal,
-      statusSink: (event) => cancelled.push(event.phase),
-    });
-    const otherCheck = makeRuntime({ sandboxId: "sb-slow" }).ensureReady({
-      statusSink: (event) => other.push(event.phase),
-    });
-
-    // Cancelled while the state request is pending; the shared start then finds it stopped.
-    controller.abort();
-    expect((await cancelledCheck).ready).toBe(false);
-    releaseState();
-    expect(await otherCheck).toEqual({ ready: true });
-
-    expect(other).toContain("starting");
-    expect(cancelled).not.toContain("starting");
-    expect(cancelled.at(-1)).toBe("error");
-  });
-
   it("shares one start between concurrent checks", async () => {
     rig.plane.addSandbox({ id: "sb-archived", state: "archived" });
     const phases: string[][] = [[], []];
@@ -188,101 +158,10 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
       )
     );
     expect(results).toEqual([{ ready: true }, { ready: true }]);
-    // The second check joins the first one's start, so it reports that start too.
-    expect(phases.map((seen) => seen.includes("starting"))).toEqual([true, true]);
+    // The second check joins the first one's start; only the first reports it.
+    expect(phases.map((seen) => seen.includes("starting"))).toEqual([true, false]);
     expect(rig.plane.countCalls("POST /sandbox/sb-archived/start")).toBe(1);
     expect(rig.plane.countCalls("POST /sandbox/sb-archived/ssh-access")).toBe(1);
-  });
-
-  it("never starts, mints for or runs ssh in a sandbox without this install's label", async () => {
-    // After a restart: no setup failure is remembered for the workspace whose create lost the
-    // name to another install's sandbox.
-    rig.plane.addSandbox({
-      id: "xum-theirs",
-      state: "stopped",
-      labels: { "xum.instance": "another-install" },
-    });
-    let spawned = 0;
-    const local = localShellTransport(rig.rootDir);
-    const transport: SSHTransport = {
-      ...local,
-      spawnRemoteProcess: (command, options) => {
-        spawned++;
-        return local.spawnRemoteProcess(command, options);
-      },
-    };
-    const phases: string[] = [];
-
-    const result = await makeRuntime({ sandboxId: "xum-theirs" }, rig, {
-      transport,
-      projectPath: "/home/me/project",
-      workspaceName: "feature",
-    }).ensureReady({ statusSink: (event) => phases.push(event.phase) });
-
-    expect(result.ready).toBe(false);
-    if (!result.ready) {
-      expect(result.errorType).toBe("runtime_not_ready");
-      expect(result.error).toContain("xum.instance");
-    }
-    expect(phases.at(-1)).toBe("error");
-    expect(rig.plane.countCalls("POST /sandbox/xum-theirs/start")).toBe(0);
-    expect(rig.plane.countCalls("POST /sandbox/xum-theirs/ssh-access")).toBe(0);
-    expect(spawned).toBe(0);
-  });
-
-  it("refuses a sandbox without this install's label even while it is cached as ready", async () => {
-    rig.plane.addSandbox({ id: "xum-theirs", labels: { "xum.instance": "another-install" } });
-    rig.service.readiness.markSandboxReady("xum-theirs");
-    let spawned = 0;
-    const local = localShellTransport(rig.rootDir);
-    const transport: SSHTransport = {
-      ...local,
-      spawnRemoteProcess: (command, options) => {
-        spawned++;
-        return local.spawnRemoteProcess(command, options);
-      },
-    };
-
-    const result = await makeRuntime({ sandboxId: "xum-theirs" }, rig, {
-      transport,
-      projectPath: "/home/me/project",
-      workspaceName: "feature",
-    }).ensureReady();
-
-    expect(result.ready).toBe(false);
-    if (!result.ready) expect(result.error).toContain("xum.instance");
-    expect(spawned).toBe(0);
-  });
-
-  it("sees a label removed after a turn once the ready cache window has passed", async () => {
-    const sandbox = rig.plane.addSandbox({ id: "sb-handed-back" });
-    const turn = () => makeRuntime({ sandboxId: "sb-handed-back" }).ensureReady();
-    expect(await turn()).toEqual({ ready: true });
-
-    // The user (or another backend) hands the sandbox back by dropping the label.
-    sandbox.labels = {};
-    rig.clock.now += DAYTONA_READY_CACHE_MS / 2;
-    expect(await turn()).toEqual({ ready: true });
-    rig.clock.now += DAYTONA_READY_CACHE_MS;
-    const refused = await turn();
-    expect(refused.ready).toBe(false);
-    if (!refused.ready) expect(refused.error).toContain("xum.instance");
-  });
-
-  it("proves a sandbox is this install's once per ready cache window", async () => {
-    rig.plane.addSandbox({ id: "sb-own" });
-    const lookups = () => rig.plane.countCalls("GET /sandbox/sb-own");
-    const perCheck: number[] = [];
-    for (let check = 0; check < 2; check++) {
-      rig.service.readiness.invalidateSandboxReady("sb-own");
-      const before = lookups();
-      expect(await makeRuntime({ sandboxId: "sb-own" }).ensureReady()).toEqual({
-        ready: true,
-      });
-      perCheck.push(lookups() - before);
-    }
-    // The start's own state read, plus the label read on the first check only.
-    expect(perCheck).toEqual([2, 1]);
   });
 
   it("reports a sandbox removed outside Xum as runtime_not_ready and never recreates it", async () => {
@@ -596,17 +475,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
 
     expect(rig.plane.countCalls("POST /sandbox")).toBe(1);
     expect(rig.plane.find("xum-doomed")).toBeUndefined();
-
-    // A later turn learns why, not that the sandbox was "deleted outside Xum".
-    const ready = await makeRuntime({
-      sandboxId: "xum-doomed",
-      ...SMALL,
-    }).ensureReady();
-    expect(ready.ready).toBe(false);
-    if (!ready.ready) {
-      expect(ready.error).toContain("setup failed");
-      expect(ready.error).toContain("No space left on device");
-    }
   });
 
   it("keeps a sandbox its failed setup could not delete for the workspace removal to delete", async () => {
@@ -641,34 +509,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
         expect(removal.success).toBe(true);
         expect(rig.plane.find(sandboxId)).toBeUndefined();
       }
-    } finally {
-      sshDelete.mockRestore();
-    }
-  });
-
-  it("forgets a failed setup once its workspace is removed", async () => {
-    const sshDelete = spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
-      success: true,
-      deletedPath: "/path",
-    });
-    try {
-      const daytona = { sandboxId: "xum-left", ...SMALL };
-      rig.writer.writeError = new Error("No space left on device");
-      // eslint-disable-next-line @typescript-eslint/await-thenable
-      await expect(makeRuntime(daytona).postCreateSetup(initParams())).rejects.toThrow(
-        "setup failed"
-      );
-      rig.writer.writeError = undefined;
-      expect(rig.service.sandboxes.getSetupFailure("ws-1")).toContain("No space left on device");
-      expect(rig.service.sandboxes.getSetupFailure("ws-2")).toBeUndefined();
-
-      const removal = await makeRuntime(daytona).deleteWorkspace(
-        "/home/me/project",
-        "feature",
-        true
-      );
-      expect(removal.success).toBe(true);
-      expect(rig.service.sandboxes.getSetupFailure("ws-1")).toBeUndefined();
     } finally {
       sshDelete.mockRestore();
     }
@@ -738,49 +578,6 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     });
     expect(String(await setUp("xum-theirs"))).toContain("HTTP 500");
     expect(rig.plane.find("xum-theirs")).toBe(other);
-  });
-
-  it("never touches a sandbox without this install's label when the failed workspace is removed", async () => {
-    const sshDelete = spyOn(SSHRuntime.prototype, "deleteWorkspace").mockResolvedValue({
-      success: true,
-      deletedPath: "/path",
-    });
-    try {
-      // The create failed ambiguously while another install's sandbox held the name.
-      rig.plane.failingRoutes.add("POST /sandbox");
-      const other = rig.plane.addSandbox({
-        id: "sb-other",
-        name: "xum-theirs",
-        labels: { "xum.instance": "another-install", "xum.workspaceId": "ws-1" },
-      });
-      const daytona = { sandboxId: "xum-theirs", ...SMALL };
-      await makeRuntime(daytona)
-        .postCreateSetup(initParams())
-        .catch(() => undefined);
-      rig.plane.failingRoutes.clear();
-
-      // The persisted workspace still says Xum created it. Their sandbox may hold a checkout at
-      // this workspace's path: no removal starts it, checks it, deletes that checkout or it.
-      for (const state of ["started", "stopped"]) {
-        for (const force of [false, true]) {
-          other.state = state;
-          const removal = await makeRuntime(daytona).deleteWorkspace(
-            "/home/me/project",
-            "feature",
-            force
-          );
-          expect(removal.success).toBe(true);
-          if (removal.success) expect(removal.notice).toContain("xum.instance");
-          expect(rig.plane.find("xum-theirs")).toBe(other);
-          expect(other.state).toBe(state);
-        }
-      }
-      expect(sshDelete).not.toHaveBeenCalled();
-      expect(rig.plane.countCalls("POST /sandbox/xum-theirs/start")).toBe(0);
-      expect(rig.plane.countCalls("DELETE /sandbox/xum-theirs")).toBe(0);
-    } finally {
-      sshDelete.mockRestore();
-    }
   });
 });
 
@@ -867,14 +664,13 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     }).deleteWorkspace("/home/me/project", "ws-fork", true);
 
     expect(forced.success).toBe(true);
-    expect(forced.success ? forced.notice : forced.error).toContain("ssh: host unreachable");
     expect(rig.plane.find("sb-1")?.state).toBe("started");
     // The workspace that created the sandbox still uses Xum's access to it.
     expect(rig.writer.removed).not.toContain("sb-1");
   });
 
-  it("starts a stopped sandbox to run the dirty check and keeps a dirty workspace", async () => {
-    rig.plane.addSandbox({ id: "sb-dirty", state: "stopped" });
+  it("runs the dirty check on a running sandbox and keeps a dirty workspace", async () => {
+    rig.plane.addSandbox({ id: "sb-dirty" });
     sshDeleteSpy.mockResolvedValue({ success: false, error: "uncommitted changes" });
 
     const result = await makeRuntime({ sandboxId: "sb-dirty" }).deleteWorkspace(
@@ -884,13 +680,12 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     );
 
     expect(result).toEqual({ success: false, error: "uncommitted changes" });
-    expect(rig.plane.countCalls("POST /sandbox/sb-dirty/start")).toBe(1);
-    expect(sshDeleteSpy).toHaveBeenCalledTimes(1);
     expect(rig.plane.find("sb-dirty")).toBeDefined();
   });
 
   it("deletes an owned sandbox after a clean check and drops its ssh access", async () => {
-    rig.plane.addSandbox({ id: "sb-clean", state: "stopped" });
+    rig.plane.addSandbox({ id: "sb-clean" });
+    await rig.service.ssh.ensureSshAccess("sb-clean");
 
     const result = await makeRuntime({ sandboxId: "sb-clean" }).deleteWorkspace(
       "/home/me/project",
@@ -903,6 +698,31 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     expect(rig.plane.find("sb-clean")).toBeUndefined();
     expect(rig.writer.removed).toContain("sb-clean");
     expect(rig.plane.revokedTokens).toHaveLength(1);
+  });
+
+  it("never starts a stopped or archived sandbox for removal checks, as for Coder", async () => {
+    for (const state of ["stopped", "archived"]) {
+      const sandboxId = `sb-${state}`;
+      rig.plane.addSandbox({ id: sandboxId, state });
+
+      const fork = await makeRuntime({ sandboxId, forked: true }).deleteWorkspace(
+        "/home/me/project",
+        "feature-fork",
+        false
+      );
+      expect(fork.success).toBe(true);
+      expect(rig.plane.find(sandboxId)?.state).toBe(state);
+
+      const owner = await makeRuntime({ sandboxId }).deleteWorkspace(
+        "/home/me/project",
+        "feature",
+        false
+      );
+      expect(owner.success).toBe(true);
+      expect(rig.plane.find(sandboxId)).toBeUndefined();
+      expect(rig.plane.countCalls(`POST /sandbox/${sandboxId}/start`)).toBe(0);
+    }
+    expect(sshDeleteSpy).not.toHaveBeenCalled();
   });
 
   it("keeps the sandbox when a fork is removed, deletes it with the workspace that created it", async () => {
@@ -1009,26 +829,6 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     }
   });
 
-  it("waits for a sandbox Daytona is already deleting instead of refusing the delete", async () => {
-    // A failed setup deletes the sandbox it created while the workspace's removal runs.
-    // Daytona's documented state is "deleting"; "destroying" is the older spelling.
-    for (const [sandboxId, state] of [
-      ["sb-going", "deleting"],
-      ["sb-going-old", "destroying"],
-    ] as const) {
-      rig.plane.addSandbox({ id: sandboxId, state, pendingPolls: 2 });
-
-      const result = await makeRuntime({ sandboxId }).deleteWorkspace(
-        "/home/me/project",
-        "feature",
-        false
-      );
-
-      expect(result.success).toBe(true);
-      expect(rig.plane.find(sandboxId)).toBeUndefined();
-    }
-  });
-
   it("names the sandbox left behind when a forced delete cannot delete it", async () => {
     rig.plane.addSandbox({ id: "sb-stuck" });
     rig.plane.failingRoutes.add("DELETE /sandbox/sb-stuck");
@@ -1040,48 +840,6 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     );
 
     expect(result).toMatchObject({ success: false, leftoverPaths: ['Daytona sandbox "sb-stuck"'] });
-  });
-
-  it("never starts a stopped sandbox for the checks a forced removal skips", async () => {
-    rig.plane.addSandbox({ id: "sb-users", state: "stopped" });
-    const started = () =>
-      rig.plane.calls.filter((call) => call === "POST /sandbox/sb-users/start").length;
-
-    const fork = await makeRuntime({ sandboxId: "sb-users", forked: true }).deleteWorkspace(
-      "/home/me/project",
-      "feature-fork",
-      true
-    );
-    expect(fork.success).toBe(true);
-    expect(rig.plane.find("sb-users")?.state).toBe("stopped");
-    expect(rig.writer.removed).not.toContain("sb-users");
-
-    const owner = await makeRuntime({ sandboxId: "sb-users" }).deleteWorkspace(
-      "/home/me/project",
-      "feature",
-      true
-    );
-    expect(owner.success).toBe(true);
-    expect(rig.plane.find("sb-users")).toBeUndefined();
-    expect(started()).toBe(0);
-    expect(sshDeleteSpy).not.toHaveBeenCalled();
-  });
-
-  it("says where a forced removal left the checkout of a sandbox that was not running", async () => {
-    rig.plane.addSandbox({ id: "sb-users", state: "archived" });
-    const fork = { sandboxId: "sb-users", forked: true };
-    const forced = await makeRuntime(fork).deleteWorkspace("/home/me/project", "feature", true);
-    if (!forced.success) throw new Error(forced.error);
-    expect(forced.notice).toContain(forced.deletedPath);
-    expect(forced.notice).toContain('"sb-users"');
-
-    // Gone: no checkout was left anywhere.
-    const gone = await makeRuntime({ sandboxId: "sb-gone", forked: true }).deleteWorkspace(
-      "/home/me/project",
-      "feature",
-      true
-    );
-    expect(gone).toEqual({ success: true, deletedPath: expect.any(String) as string });
   });
 });
 

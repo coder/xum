@@ -15,26 +15,6 @@ export interface DaytonaEnsureReadyOptions {
   signal?: AbortSignal;
 }
 
-interface SandboxReadyRequest {
-  promise: Promise<void>;
-  onStarting: Set<() => void>;
-  starting: boolean;
-}
-
-/** Register a waiter's onStarting, calling it at once when the shared start already began. */
-function addStartingListener(
-  request: SandboxReadyRequest,
-  options: DaytonaEnsureReadyOptions
-): (() => void) | undefined {
-  const { onStarting, signal } = options;
-  if (!onStarting || signal?.aborted) return undefined;
-  // Per waiter, so the same callback passed twice is two waiters.
-  const listener = () => onStarting();
-  request.onStarting.add(listener);
-  if (request.starting) listener();
-  return listener;
-}
-
 /**
  * Which sandboxes passed a readiness check within DAYTONA_READY_CACHE_MS, and the readiness
  * request in flight per sandbox. The sandbox part runs the checks; a stop, a resize, a token
@@ -42,7 +22,7 @@ function addStartingListener(
  */
 export class DaytonaReadiness {
   private readonly readyAt = new Map<string, number>();
-  private readonly readyRequests = new Map<string, SandboxReadyRequest>();
+  private readonly readyRequests = new Map<string, Promise<void>>();
 
   constructor(private readonly now: () => number) {}
 
@@ -67,42 +47,24 @@ export class DaytonaReadiness {
 
   /**
    * Wait for the sandbox's readiness request, starting `run` as that request when none is in
-   * flight. Concurrent callers share a single request; each still gets its own `onStarting`
-   * call. `run` reports a start through the callback it gets.
+   * flight. Concurrent callers share a single request; only the caller that started it hears
+   * `onStarting`, through the callback `run` gets.
    */
   async join(
     sandboxId: string,
     options: DaytonaEnsureReadyOptions,
     run: (onStarting: () => void) => Promise<void>
   ): Promise<void> {
-    const request = this.readyRequests.get(sandboxId) ?? this.startRequest(sandboxId, run);
-    const listener = addStartingListener(request, options);
-    try {
-      const raced = await raceWithAbortAndTimeout(request.promise, { signal: options.signal });
-      if (raced.kind !== "ok") throw new Error("Aborted");
-    } finally {
-      // A waiter that stopped waiting (cancelled) hears no later start: nothing would report its end.
-      if (listener) request.onStarting.delete(listener);
+    let request = this.readyRequests.get(sandboxId);
+    if (!request) {
+      // A cancelled caller hears no later start: nothing would report its end.
+      request = run(() => {
+        if (!options.signal?.aborted) options.onStarting?.();
+      }).finally(() => this.readyRequests.delete(sandboxId));
+      this.readyRequests.set(sandboxId, request);
     }
-  }
-
-  private startRequest(
-    sandboxId: string,
-    run: (onStarting: () => void) => Promise<void>
-  ): SandboxReadyRequest {
-    const request: SandboxReadyRequest = {
-      promise: Promise.resolve(),
-      onStarting: new Set(),
-      starting: false,
-    };
-    request.promise = run(() => {
-      request.starting = true;
-      for (const listener of request.onStarting) listener();
-    }).finally(() => {
-      this.readyRequests.delete(sandboxId);
-    });
-    this.readyRequests.set(sandboxId, request);
-    return request;
+    const raced = await raceWithAbortAndTimeout(request, { signal: options.signal });
+    if (raced.kind !== "ok") throw new Error("Aborted");
   }
 
   /**
@@ -114,7 +76,7 @@ export class DaytonaReadiness {
     const request = this.readyRequests.get(sandboxId);
     if (!request) return;
     try {
-      await request.promise;
+      await request;
     } catch (error) {
       log.warn("Daytona sandbox readiness failed while another operation waited for it", {
         sandboxId,

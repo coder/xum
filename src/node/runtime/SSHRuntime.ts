@@ -509,39 +509,6 @@ async function fastReadGitHeadsRefs(projectPath: string): Promise<string | null>
 /** Trunk-like names SSH cleanups never `branch -D`, even when they look orphaned. */
 const PROTECTED_BRANCHES = ["main", "master", "trunk", "develop", "default"];
 
-/** Maps the exit code of checkWorkspaceDeletable's script; stderr is read only when needed. */
-async function interpretDeletableCheck(
-  checkExitCode: number,
-  readStderr: () => Promise<string>
-): Promise<"ok" | "missing" | { error: string }> {
-  if (checkExitCode === 3) {
-    return "missing";
-  }
-
-  if (checkExitCode === 1) {
-    return { error: "Workspace contains uncommitted changes. Use force flag to delete anyway." };
-  }
-
-  if (checkExitCode === 2) {
-    // stderr holds the unpushed commits output
-    const commitList = (await readStderr()).trim();
-    const errorMsg = commitList
-      ? `Workspace contains unpushed commits:\n\n${commitList}`
-      : "Workspace contains unpushed commits. Use force flag to delete anyway.";
-
-    return { error: errorMsg };
-  }
-
-  if (checkExitCode !== 0) {
-    // Unexpected error
-    const stderr = await readStderr();
-    return {
-      error: `Failed to check workspace state: ${stderr.trim() || `exit code ${checkExitCode}`}`,
-    };
-  }
-  return "ok";
-}
-
 export class SSHRuntime extends RemoteRuntime {
   private readonly config: SSHRuntimeConfig;
   private readonly transport: SSHTransport;
@@ -3264,119 +3231,6 @@ export class SSHRuntime extends RemoteRuntime {
     }
   }
 
-  /**
-   * The pre-delete safety check, one remote round trip: "missing" when the checkout is gone,
-   * an error for uncommitted changes or unpushed commits (force only checks existence).
-   * Throws when the command cannot run.
-   */
-  protected async checkWorkspaceDeletable(
-    deletedPath: string,
-    force: boolean,
-    trusted: boolean | undefined,
-    abortSignal?: AbortSignal
-  ): Promise<"ok" | "missing" | { error: string }> {
-    // Disable git hooks for untrusted projects
-    const nhp = gitNoHooksPrefix(trusted);
-    // quoteForRemote expands a leading ~ remotely: a deferred-access runtime (Coder, Daytona)
-    // keeps the unresolved `~/...` path, and a quoted `~` would make a dirty checkout look missing.
-    const deletedPathArg = this.quoteForRemote(deletedPath);
-    // Combine all pre-deletion checks into a single bash script to minimize round trips
-    // Exit codes: 0=ok to delete, 1=uncommitted changes, 2=unpushed commits, 3=doesn't exist
-    const checkScript = force
-      ? // When force=true, only check existence
-        `test -d ${deletedPathArg} || exit 3`
-      : // When force=false, perform all safety checks
-        `
-          test -d ${deletedPathArg} || exit 3
-          cd ${deletedPathArg} || exit 1
-          git diff --quiet --exit-code && git diff --quiet --cached --exit-code || exit 1
-          if git remote | grep -q .; then
-            # First, check the original condition: any commits not in any remote
-            unpushed=$(git log --branches --not --remotes --oneline)
-            if [ -n "$unpushed" ]; then
-              # Get current branch for better error messaging
-              BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
-
-              # Get default branch (prefer main/master over origin/HEAD since origin/HEAD
-              # might point to a feature branch in some setups)
-              if git rev-parse --verify origin/main >/dev/null 2>&1; then
-                DEFAULT="main"
-              elif git rev-parse --verify origin/master >/dev/null 2>&1; then
-                DEFAULT="master"
-              else
-                # Fallback to origin/HEAD if main/master don't exist
-                DEFAULT=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
-              fi
-
-              # Check for squash-merge: if all changed files match origin/$DEFAULT, content is merged
-              if [ -n "$DEFAULT" ]; then
-                # Fetch latest to ensure we have current remote state
-                # nhp disables git hooks for untrusted projects (reference-transaction, etc.)
-                ${nhp}git fetch origin "$DEFAULT" --quiet 2>/dev/null || true
-
-                # Get merge-base between current branch and default
-                MERGE_BASE=$(git merge-base "origin/$DEFAULT" HEAD 2>/dev/null)
-                if [ -n "$MERGE_BASE" ]; then
-                  # Get files changed on this branch since fork point
-                  CHANGED_FILES=$(git diff --name-only "$MERGE_BASE" HEAD 2>/dev/null)
-
-                  if [ -n "$CHANGED_FILES" ]; then
-                    # Check if all changed files match what's in origin/$DEFAULT
-                    ALL_MERGED=true
-                    while IFS= read -r f; do
-                      # Compare file content between HEAD and origin/$DEFAULT
-                      # If file doesn't exist in one but exists in other, they differ
-                      if ! git diff --quiet "HEAD:$f" "origin/$DEFAULT:$f" 2>/dev/null; then
-                        ALL_MERGED=false
-                        break
-                      fi
-                    done <<< "$CHANGED_FILES"
-
-                    if $ALL_MERGED; then
-                      # All changes are in default branch - safe to delete (squash-merge case)
-                      exit 0
-                    fi
-                  else
-                    # No changed files means nothing to merge - safe to delete
-                    exit 0
-                  fi
-                fi
-              fi
-
-              # If we get here, there are real unpushed changes
-              # Show helpful output for debugging
-              if [ -n "$BRANCH" ] && [ -n "$DEFAULT" ] && git show-branch "$BRANCH" "origin/$DEFAULT" >/dev/null 2>&1; then
-                echo "Branch status compared to origin/$DEFAULT:" >&2
-                echo "" >&2
-                git show-branch "$BRANCH" "origin/$DEFAULT" 2>&1 | head -20 >&2
-                echo "" >&2
-                echo "Note: Branch has changes not yet in origin/$DEFAULT." >&2
-              else
-                # Fallback to just showing the commit list
-                echo "$unpushed" | head -10 >&2
-              fi
-              exit 2
-            fi
-          fi
-          exit 0
-        `;
-
-    const checkStream = await this.exec(checkScript, {
-      cwd: this.config.srcBaseDir,
-      // Non-force path includes `git fetch origin` (network op) that can
-      // easily exceed 10s on slow SSH connections. Force path only checks
-      // existence, so a short timeout is fine.
-      timeout: force ? 10 : 30,
-      abortSignal,
-    });
-
-    // Command doesn't use stdin - abort to close immediately without waiting
-    await checkStream.stdin.abort();
-    return interpretDeletableCheck(await checkStream.exitCode, () =>
-      streamToString(checkStream.stderr)
-    );
-  }
-
   async deleteWorkspace(
     projectPath: string,
     workspaceName: string,
@@ -3396,13 +3250,137 @@ export class SSHRuntime extends RemoteRuntime {
     const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
 
     try {
-      const check = await this.checkWorkspaceDeletable(deletedPath, force, trusted, abortSignal);
-      if (check === "missing") {
+      // quoteForRemote expands a leading ~ remotely: a deferred-access runtime (Coder, Daytona)
+      // keeps the unresolved `~/...` path, and a quoted `~` would make a dirty checkout look missing.
+      const deletedPathArg = this.quoteForRemote(deletedPath);
+      // Combine all pre-deletion checks into a single bash script to minimize round trips
+      // Exit codes: 0=ok to delete, 1=uncommitted changes, 2=unpushed commits, 3=doesn't exist
+      const checkScript = force
+        ? // When force=true, only check existence
+          `test -d ${deletedPathArg} || exit 3`
+        : // When force=false, perform all safety checks
+          `
+            test -d ${deletedPathArg} || exit 3
+            cd ${deletedPathArg} || exit 1
+            git diff --quiet --exit-code && git diff --quiet --cached --exit-code || exit 1
+            if git remote | grep -q .; then
+              # First, check the original condition: any commits not in any remote
+              unpushed=$(git log --branches --not --remotes --oneline)
+              if [ -n "$unpushed" ]; then
+                # Get current branch for better error messaging
+                BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+                # Get default branch (prefer main/master over origin/HEAD since origin/HEAD
+                # might point to a feature branch in some setups)
+                if git rev-parse --verify origin/main >/dev/null 2>&1; then
+                  DEFAULT="main"
+                elif git rev-parse --verify origin/master >/dev/null 2>&1; then
+                  DEFAULT="master"
+                else
+                  # Fallback to origin/HEAD if main/master don't exist
+                  DEFAULT=$(git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@')
+                fi
+
+                # Check for squash-merge: if all changed files match origin/$DEFAULT, content is merged
+                if [ -n "$DEFAULT" ]; then
+                  # Fetch latest to ensure we have current remote state
+                  # nhp disables git hooks for untrusted projects (reference-transaction, etc.)
+                  ${nhp}git fetch origin "$DEFAULT" --quiet 2>/dev/null || true
+
+                  # Get merge-base between current branch and default
+                  MERGE_BASE=$(git merge-base "origin/$DEFAULT" HEAD 2>/dev/null)
+                  if [ -n "$MERGE_BASE" ]; then
+                    # Get files changed on this branch since fork point
+                    CHANGED_FILES=$(git diff --name-only "$MERGE_BASE" HEAD 2>/dev/null)
+
+                    if [ -n "$CHANGED_FILES" ]; then
+                      # Check if all changed files match what's in origin/$DEFAULT
+                      ALL_MERGED=true
+                      while IFS= read -r f; do
+                        # Compare file content between HEAD and origin/$DEFAULT
+                        # If file doesn't exist in one but exists in other, they differ
+                        if ! git diff --quiet "HEAD:$f" "origin/$DEFAULT:$f" 2>/dev/null; then
+                          ALL_MERGED=false
+                          break
+                        fi
+                      done <<< "$CHANGED_FILES"
+
+                      if $ALL_MERGED; then
+                        # All changes are in default branch - safe to delete (squash-merge case)
+                        exit 0
+                      fi
+                    else
+                      # No changed files means nothing to merge - safe to delete
+                      exit 0
+                    fi
+                  fi
+                fi
+
+                # If we get here, there are real unpushed changes
+                # Show helpful output for debugging
+                if [ -n "$BRANCH" ] && [ -n "$DEFAULT" ] && git show-branch "$BRANCH" "origin/$DEFAULT" >/dev/null 2>&1; then
+                  echo "Branch status compared to origin/$DEFAULT:" >&2
+                  echo "" >&2
+                  git show-branch "$BRANCH" "origin/$DEFAULT" 2>&1 | head -20 >&2
+                  echo "" >&2
+                  echo "Note: Branch has changes not yet in origin/$DEFAULT." >&2
+                else
+                  # Fallback to just showing the commit list
+                  echo "$unpushed" | head -10 >&2
+                fi
+                exit 2
+              fi
+            fi
+            exit 0
+          `;
+
+      const checkStream = await this.exec(checkScript, {
+        cwd: this.config.srcBaseDir,
+        // Non-force path includes `git fetch origin` (network op) that can
+        // easily exceed 10s on slow SSH connections. Force path only checks
+        // existence, so a short timeout is fine.
+        timeout: force ? 10 : 30,
+        abortSignal,
+      });
+
+      // Command doesn't use stdin - abort to close immediately without waiting
+      await checkStream.stdin.abort();
+      const checkExitCode = await checkStream.exitCode;
+
+      // Handle check results
+      if (checkExitCode === 3) {
         // Directory doesn't exist - deletion is idempotent (success).
         return { success: true, deletedPath };
       }
-      if (check !== "ok") {
-        return { success: false, error: check.error };
+
+      if (checkExitCode === 1) {
+        return {
+          success: false,
+          error: "Workspace contains uncommitted changes. Use force flag to delete anyway.",
+        };
+      }
+
+      if (checkExitCode === 2) {
+        // Read stderr which contains the unpushed commits output
+        const stderr = await streamToString(checkStream.stderr);
+        const commitList = stderr.trim();
+        const errorMsg = commitList
+          ? `Workspace contains unpushed commits:\n\n${commitList}`
+          : "Workspace contains unpushed commits. Use force flag to delete anyway.";
+
+        return {
+          success: false,
+          error: errorMsg,
+        };
+      }
+
+      if (checkExitCode !== 0) {
+        // Unexpected error
+        const stderr = await streamToString(checkStream.stderr);
+        return {
+          success: false,
+          error: `Failed to check workspace state: ${stderr.trim() || `exit code ${checkExitCode}`}`,
+        };
       }
 
       const branchToDelete = await this.resolveCheckedOutBranch(deletedPath, abortSignal, 10);

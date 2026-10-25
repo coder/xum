@@ -117,7 +117,7 @@ describe("DaytonaSandboxes", () => {
 });
 
 describe("DaytonaSandboxes.deleteSandbox", () => {
-  it("deletes only a sandbox with this install's label, keeping any other and its ssh access", async () => {
+  it("deletes only a sandbox with this install's label, and drops Xum's access to any", async () => {
     const rig = await createDaytonaTestRig();
     try {
       rig.plane.addSandbox({
@@ -128,14 +128,15 @@ describe("DaytonaSandboxes.deleteSandbox", () => {
       rig.plane.addSandbox({ id: "sb-own" });
       await rig.service.ssh.ensureSshAccess("sb-foreign");
 
-      expect(await rig.service.sandboxes.deleteSandbox("sb-foreign")).toBe("notOwned");
-      expect(await rig.service.sandboxes.deleteSandbox("sb-unlabeled")).toBe("notOwned");
+      await rig.service.sandboxes.deleteSandbox("sb-foreign");
+      await rig.service.sandboxes.deleteSandbox("sb-unlabeled");
       expect(rig.plane.find("sb-foreign")).toBeDefined();
       expect(rig.plane.find("sb-unlabeled")).toBeDefined();
-      expect(rig.plane.calls.filter((call) => call.startsWith("DELETE /sandbox/"))).toEqual([]);
-      expect(rig.writer.tokens.has("sb-foreign")).toBe(true);
+      expect(rig.plane.countCalls("DELETE /sandbox/sb-foreign")).toBe(0);
+      expect(rig.plane.countCalls("DELETE /sandbox/sb-unlabeled")).toBe(0);
+      expect(rig.writer.tokens.has("sb-foreign")).toBe(false);
 
-      expect(await rig.service.sandboxes.deleteSandbox("sb-own")).toBe("deleted");
+      await rig.service.sandboxes.deleteSandbox("sb-own");
       expect(rig.plane.find("sb-own")).toBeUndefined();
     } finally {
       await rig.cleanup();

@@ -9,7 +9,6 @@
  * host alias (`<sandboxId>.xum--daytona`) is then known before persist, like Coder's.
  */
 
-import * as path from "path";
 import { randomBytes } from "crypto";
 import type {
   EnsureReadyOptions,
@@ -42,21 +41,14 @@ import { isSSHRuntime } from "@/common/types/runtime";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import { getErrorMessage } from "@/common/utils/errors";
-import {
-  DaytonaApiError,
-  isDaytonaNotFound,
-  type DaytonaSandbox,
-} from "@/node/services/daytona/daytonaClient";
+import { DaytonaApiError, type DaytonaSandbox } from "@/node/services/daytona/daytonaClient";
 import type {
   DaytonaAccount,
   UnsupportedDaytonaSandboxKind,
 } from "@/node/services/daytona/daytonaAccount";
 import type { DaytonaReadiness } from "@/node/services/daytona/daytonaReadiness";
 import {
-  DAYTONA_LABEL_INSTANCE,
-  DAYTONA_LABEL_WORKSPACE_ID,
   DAYTONA_START_TIMEOUT_MS,
-  notOwnedSandboxNotice,
   type DaytonaSandboxes,
 } from "@/node/services/daytona/daytonaSandboxes";
 import type { DaytonaSsh } from "@/node/services/daytona/daytonaSsh";
@@ -99,11 +91,6 @@ export interface DaytonaRuntimeService {
     | "startAndWait"
     | "deleteSandbox"
     | "ensureSandboxReady"
-    | "sandboxOwnership"
-    | "waitUntilDestroyed"
-    | "recordSetupFailure"
-    | "getSetupFailure"
-    | "clearSetupFailure"
   >;
 }
 
@@ -170,20 +157,6 @@ function isBadRequest(error: unknown): boolean {
 }
 
 /**
- * What a failed setup may delete: "none" before any create, "created" after a create that
- * succeeded, "unknown" after a failed one. A failed create may still have created the sandbox
- * (a timeout, a 5xx), or the name may belong to another install's sandbox (a 409 when it was
- * taken after validateBeforePersist): only the labels tell, so they are checked first.
- */
-type CreateOutcome = "none" | "created" | "unknown";
-
-interface CreateAttempt {
-  outcome: CreateOutcome;
-  /** The labels the last create request carried. */
-  labels?: Record<string, string>;
-}
-
-/**
  * Captured before an ssh command: a recovery acts only on what changed since. A refusal
  * replaces only the token this command used; a gateway another failure already followed is
  * not refetched again.
@@ -194,7 +167,7 @@ interface SshAttempt {
 }
 
 type DeleteResult =
-  | { success: true; deletedPath: string; notice?: string }
+  | { success: true; deletedPath: string }
   | { success: false; error: string; leftoverPaths?: string[] };
 
 type StatusEmitter = (phase: RuntimeStatusEvent["phase"], detail?: string) => void;
@@ -350,13 +323,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         };
       }
       const emitStatus = makeStatusEmitter(options?.statusSink);
-      // Before the ready cache too: a fork on the same sandbox may have made it ready.
-      const refusal =
-        this.setupFailureResult() ??
-        (await this.refuseUnownedSandbox(sandboxId, emitStatus, options?.signal));
-      if (refusal) return refusal;
-      if (this.daytonaService.readiness.isSandboxReady(sandboxId)) {
-        return this.ensureReadyFromCache(sandboxId, options, emitStatus);
+      // An external client reads the user's ssh config, which the cache does not cover: another
+      // tool may have removed the managed block since. Only a full check writes it again.
+      if (!options?.externalSshClient && this.daytonaService.readiness.isSandboxReady(sandboxId)) {
+        return this.ensureReadyFromCache(options, emitStatus);
       }
       return this.ensureReadyUncached(sandboxId, options, emitStatus);
     });
@@ -375,37 +345,14 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     return result;
   }
 
-  private recordSetupFailure(reason: string): void {
-    if (this.workspaceId)
-      this.daytonaService.sandboxes.recordSetupFailure(this.workspaceId, reason);
-  }
-
-  private setupFailureResult(): EnsureReadyResult | undefined {
-    if (!this.workspaceId) return undefined;
-    const setupFailure = this.daytonaService.sandboxes.getSetupFailure(this.workspaceId);
-    if (!setupFailure) return undefined;
-    return {
-      ready: false,
-      error:
-        `Daytona sandbox setup failed: ${setupFailure}. Delete this workspace (which deletes ` +
-        `any sandbox its setup left) and create a new one.`,
-      errorType: "runtime_not_ready",
-    };
-  }
-
   /** The cache covers the sandbox, not this workspace's checkout: a fork shares the sandbox. */
   private async ensureReadyFromCache(
-    sandboxId: string,
     options: EnsureReadyOptions | undefined,
     emitStatus: StatusEmitter
   ): Promise<EnsureReadyResult> {
     // Set before the probe: ensureReady is an explicit action, so a sandbox that stopped
     // within the cache is started again (recoverForRetry) instead of failing until it expires.
     this.restartsStoppedSandbox = true;
-    const accessFailure = options?.externalSshClient
-      ? await this.restoreExternalSshAccess(sandboxId, emitStatus, options.signal)
-      : undefined;
-    if (accessFailure) return accessFailure;
     const repoFailure = await this.checkRepo(options, emitStatus);
     if (repoFailure) return repoFailure;
     return { ready: true };
@@ -555,10 +502,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     log.info("Daytona sandbox is not running; starting it and retrying the command once", {
       sandboxId,
     });
-    // The proof ensureReady took may have expired since; a lapsed one is read again.
-    const failure =
-      (await this.refuseUnownedSandbox(sandboxId, () => undefined, abortSignal)) ??
-      (await this.bringSandboxUp(sandboxId, () => undefined, abortSignal));
+    const failure = await this.bringSandboxUp(sandboxId, () => undefined, abortSignal);
     if (failure && !failure.ready) {
       log.warn("Could not restart the Daytona sandbox", { sandboxId, error: failure.error });
       return false;
@@ -603,25 +547,6 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     }
   }
 
-  /**
-   * The ready cache proves Xum's own ssh (`-F daytona.conf`) works, not the user's ssh config
-   * an external client reads: another tool may have removed the managed block since. Only
-   * external clients ask for this, so cached checks on the exec path never touch that file.
-   */
-  private async restoreExternalSshAccess(
-    sandboxId: string,
-    emitStatus: StatusEmitter,
-    signal: AbortSignal | undefined
-  ): Promise<EnsureReadyResult | undefined> {
-    try {
-      await this.daytonaService.ssh.ensureSshAccess(sandboxId);
-      return undefined;
-    } catch (error) {
-      emitStatus("error");
-      return this.ensureReadyFailure(sandboxId, error, signal);
-    }
-  }
-
   /** Start the sandbox if needed and refresh ssh access; a failure result, or undefined. */
   private async bringSandboxUp(
     sandboxId: string,
@@ -638,36 +563,6 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       emitStatus("error");
       return this.ensureReadyFailure(sandboxId, error, signal);
     }
-  }
-
-  /**
-   * A sandbox this workspace says Xum created must carry this install's label before Xum starts
-   * it, mints for it or runs anything in it: a create of unknown outcome may have left the
-   * workspace naming someone else's sandbox (after a restart, no setup failure says so). A
-   * missing sandbox goes on, so the start reports it.
-   */
-  private async refuseUnownedSandbox(
-    sandboxId: string,
-    emitStatus: StatusEmitter,
-    signal: AbortSignal | undefined
-  ): Promise<EnsureReadyResult | undefined> {
-    let ownership: Awaited<ReturnType<DaytonaSandboxes["sandboxOwnership"]>>;
-    try {
-      ownership = await this.daytonaService.sandboxes.sandboxOwnership(sandboxId, {
-        reuseProof: true,
-        signal,
-      });
-    } catch (error) {
-      emitStatus("error");
-      return this.ensureReadyFailure(sandboxId, error, signal);
-    }
-    if (ownership !== "notOwned") return undefined;
-    const error =
-      `Daytona sandbox "${sandboxId}" does not carry this Xum install's ` +
-      `"${DAYTONA_LABEL_INSTANCE}" label, so Xum does not use it for this workspace. Delete ` +
-      "this workspace (the sandbox is kept).";
-    emitStatus("error", error);
-    return { ready: false, error, errorType: "runtime_not_ready" };
   }
 
   private async markReadyIfRepoPresent(
@@ -866,11 +761,10 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     // A fork reuses its source's sandbox: create nothing (and so never delete it on failure).
     const creates = this.daytonaConfig.forked !== true;
 
-    const create: CreateAttempt = { outcome: "none" };
     try {
       if (creates) {
         params.initLogger.logStep(`Creating Daytona sandbox "${sandboxId}"...`);
-        await this.createSandbox(sandboxId, params, create);
+        await this.createSandbox(sandboxId, params);
         params.initLogger.logStep("Daytona sandbox created");
       }
       await this.connect(sandboxId, params);
@@ -879,12 +773,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       const errorMsg = redactDaytonaTokens(getErrorMessage(error));
       log.error("Daytona sandbox setup failed", { sandboxId, error: errorMsg });
       params.initLogger.logStderr(`Daytona sandbox setup failed: ${errorMsg}`);
-      // This workspace's later turns report this reason instead of "deleted outside Xum", and
-      // never use a sandbox of that name that Xum did not create.
-      if (creates) this.recordSetupFailure(errorMsg);
-      if (create.outcome !== "none") {
-        await this.deleteCreatedSandbox(sandboxId, create, params.initLogger);
-      }
+      // A failed create may still have made the sandbox (a timeout, a 5xx); deleteSandbox keeps
+      // one without this install's label.
+      if (creates) await this.deleteCreatedSandbox(sandboxId, params.initLogger);
       throw new Error(`Daytona sandbox setup failed: ${errorMsg}`);
     }
   }
@@ -901,22 +792,13 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   private async deleteCreatedSandbox(
     sandboxId: string,
-    create: CreateAttempt,
     initLogger: WorkspaceInitParams["initLogger"]
   ): Promise<void> {
     try {
-      if (create.outcome === "unknown" && !(await this.carriesLabels(sandboxId, create))) {
-        log.warn("Not deleting a Daytona sandbox this setup may not have created", { sandboxId });
-        return;
-      }
       initLogger.logStep(`Deleting the sandbox "${sandboxId}" this setup created...`);
-      if ((await this.daytonaService.sandboxes.deleteSandbox(sandboxId)) === "notOwned") {
-        log.warn("Not deleting a Daytona sandbox without this install's label", { sandboxId });
-        initLogger.logStderr(notOwnedSandboxNotice(sandboxId));
-      }
+      await this.daytonaService.sandboxes.deleteSandbox(sandboxId);
     } catch (error) {
-      // The persisted workspace still names the sandbox, so the reconciler leaves it alone;
-      // removing the workspace deletes it.
+      // The persisted workspace still names the sandbox; removing the workspace deletes it.
       const message = getErrorMessage(error);
       log.error("Failed to delete a Daytona sandbox after setup failed", {
         sandboxId,
@@ -929,36 +811,11 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     }
   }
 
-  /** After a create of unknown outcome: the sandbox has this install's and workspace's labels. */
-  private async carriesLabels(sandboxId: string, create: CreateAttempt): Promise<boolean> {
-    const { labels } = create;
-    const { sandbox } = await this.daytonaService.sandboxes.getSandboxState(sandboxId);
-    if (!sandbox || !labels) return false;
-    return [DAYTONA_LABEL_INSTANCE, DAYTONA_LABEL_WORKSPACE_ID].every(
-      (key) => labels[key] !== undefined && sandbox.labels?.[key] === labels[key]
-    );
-  }
-
-  /** One create request; `create.outcome` tells postCreateSetup what a failure may delete. */
-  private async requestCreate(
-    request: Parameters<DaytonaSandboxes["createSandbox"]>[0],
-    create: CreateAttempt
-  ): Promise<void> {
-    create.outcome = "unknown";
-    create.labels = request.labels;
-    await this.daytonaService.sandboxes.createSandbox(request);
-    create.outcome = "created";
-  }
-
   /**
    * Create with the preset resources. Daytona rejects resources (HTTP 400) for snapshots with
    * fixed resources: then create with the snapshot's own size and resize to the preset.
    */
-  private async createSandbox(
-    sandboxId: string,
-    params: WorkspaceInitParams,
-    create: CreateAttempt
-  ): Promise<void> {
+  private async createSandbox(sandboxId: string, params: WorkspaceInitParams): Promise<void> {
     const preset = resolveSizePreset(this.daytonaConfig);
     if (!preset) throw new Error(invalidSizeError());
     const base = {
@@ -974,10 +831,12 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       autoDeleteInterval: DAYTONA_AUTO_DELETE_DISABLED,
     };
     try {
-      await this.requestCreate(
-        { ...base, cpu: preset.cpu, memory: preset.memoryGiB, disk: preset.diskGiB },
-        create
-      );
+      await this.daytonaService.sandboxes.createSandbox({
+        ...base,
+        cpu: preset.cpu,
+        memory: preset.memoryGiB,
+        disk: preset.diskGiB,
+      });
       return;
     } catch (error) {
       if (!isBadRequest(error)) throw error;
@@ -986,7 +845,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
           `creating with the snapshot's size and resizing to ${preset.label}...`
       );
     }
-    await this.requestCreate(base, create);
+    await this.daytonaService.sandboxes.createSandbox(base);
     await this.resizeToPreset(sandboxId, preset);
   }
 
@@ -1042,9 +901,9 @@ export class DaytonaSSHRuntime extends SSHRuntime {
 
   /**
    * Delete the workspace, and the sandbox too when this workspace created it (a fork only
-   * deletes its checkout). The SSH dirty and unpushed checks run first, so a stopped or
-   * archived sandbox is started for them: unlike Coder, never delete unchecked work to avoid a
-   * start. Force skips the checks, and deletes the sandbox without SSH.
+   * deletes its checkout). The SSH dirty and unpushed checks run first on a running sandbox. As
+   * for Coder, a stopped or archived one is never started for them, so its work goes unchecked.
+   * Force skips the checks, and deletes the sandbox without SSH.
    */
   override deleteWorkspace(
     projectPath: string,
@@ -1057,23 +916,17 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     return this.daytonaService.account.withAccountLease(async () => {
       const sshDelete = () =>
         super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted, options);
-      const result = await this.deleteWorkspaceAndSandbox(
+      return this.deleteWorkspaceAndSandbox(
         this.getWorkspacePath(projectPath, workspaceName),
         force,
-        abortSignal,
         sshDelete
       );
-      if (result.success && this.workspaceId) {
-        this.daytonaService.sandboxes.clearSetupFailure(this.workspaceId);
-      }
-      return result;
     });
   }
 
   private async deleteWorkspaceAndSandbox(
     deletedPath: string,
     force: boolean,
-    abortSignal: AbortSignal | undefined,
     sshDelete: () => Promise<DeleteResult>
   ): Promise<DeleteResult> {
     const sandboxId = this.daytonaConfig.sandboxId;
@@ -1081,16 +934,15 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       log.warn("Daytona sandbox id not set, falling back to SSH-only deletion");
       return sshDelete();
     }
-    const unowned = await this.removalOfUnownedSandbox(sandboxId, deletedPath, force);
-    if (unowned) return unowned;
+    const state = await this.readSandboxState(sandboxId);
+    // As for Coder: a stopped sandbox is never started for SSH cleanup, so its checks are skipped.
+    const reachable = state !== "missing" && state !== "stopped" && state !== "archived";
     if (this.daytonaConfig.forked === true) {
-      return this.deleteForkCheckout(sandboxId, deletedPath, force, abortSignal, sshDelete);
+      return reachable
+        ? this.deleteForkCheckout(sandboxId, deletedPath, force, sshDelete)
+        : { success: true, deletedPath };
     }
-    if (force) return this.deleteOwnedSandbox(sandboxId, deletedPath);
-
-    const prepared = await this.startForDeleteChecks(sandboxId, abortSignal);
-    if (prepared === "missing") return this.deleteOwnedSandbox(sandboxId, deletedPath);
-    if (prepared !== "ready") return { success: false, error: prepared.error };
+    if (force || !reachable) return this.deleteOwnedSandbox(sandboxId, deletedPath);
     const sshResult = await sshDelete();
     return sshResult.success
       ? this.deleteOwnedSandbox(sandboxId, deletedPath, "SSH delete succeeded, but ")
@@ -1098,77 +950,29 @@ export class DaytonaSSHRuntime extends SSHRuntime {
   }
 
   /**
-   * A sandbox this workspace says Xum created, but without this install's label: a create of
-   * unknown outcome left the workspace naming someone else's sandbox, which may hold a
-   * checkout at this workspace's path. So the removal changes nothing on it (no start, no
-   * checks, no checkout or sandbox delete) and only drops Xum's access. Undefined for a sandbox
-   * that is Xum's or gone: the removal goes on as usual.
-   */
-  private async removalOfUnownedSandbox(
-    sandboxId: string,
-    deletedPath: string,
-    force: boolean
-  ): Promise<DeleteResult | undefined> {
-    let ownership: Awaited<ReturnType<DaytonaSandboxes["sandboxOwnership"]>>;
-    try {
-      ownership = await this.daytonaService.sandboxes.sandboxOwnership(sandboxId);
-    } catch (error) {
-      const message = getErrorMessage(error);
-      log.error("Could not read a Daytona sandbox's labels before removal", {
-        sandboxId,
-        error: message,
-      });
-      return {
-        success: false,
-        error: `Could not check that Daytona sandbox "${sandboxId}" is Xum's: ${message}`,
-        // A forced removal goes on without it: remove shows this as a warning to act on.
-        ...(force ? { leftoverPaths: [`Daytona sandbox "${sandboxId}"`] } : {}),
-      };
-    }
-    if (ownership !== "notOwned") return undefined;
-    await this.releaseAccess(sandboxId);
-    return { success: true, deletedPath, notice: notOwnedSandboxNotice(sandboxId) };
-  }
-
-  /**
    * A fork's removal deletes only its checkout: the sandbox belongs to the workspace that
-   * created it. A forced removal never starts a stopped (billed) sandbox for it, and goes on
-   * when the checkout cannot be deleted.
+   * created it. A forced removal goes on when the checkout cannot be deleted.
    */
   private async deleteForkCheckout(
     sandboxId: string,
     deletedPath: string,
     force: boolean,
-    abortSignal: AbortSignal | undefined,
     sshDelete: () => Promise<DeleteResult>
   ): Promise<DeleteResult> {
-    const leftOn = (why: string): DeleteResult => ({
-      success: true,
-      deletedPath,
-      notice: `The checkout ${deletedPath} was left on Daytona sandbox "${sandboxId}" (${why}); delete it there if you no longer need it.`,
-    });
-    const state = force
-      ? await this.readSandboxState(sandboxId)
-      : await this.startForDeleteChecks(sandboxId, abortSignal);
-    if (state === "missing") return { success: true, deletedPath };
-    if (force && state !== "started") return leftOn("the sandbox was not running");
-    if (typeof state === "object") return { success: false, error: state.error };
     const result = await sshDelete();
-    return result.success || !force ? result : leftOn(result.error);
+    if (result.success || !force) return result;
+    log.warn("Left a fork's checkout on its Daytona sandbox", { sandboxId, deletedPath });
+    return { success: true, deletedPath };
   }
 
-  /** A sandbox without this install's label stays: only Xum's access to it goes. */
   private async deleteOwnedSandbox(
     sandboxId: string,
     deletedPath: string,
     errorPrefix?: string
   ): Promise<DeleteResult> {
     try {
-      if ((await this.daytonaService.sandboxes.deleteSandbox(sandboxId)) === "deleted") {
-        return { success: true, deletedPath };
-      }
-      await this.releaseAccess(sandboxId);
-      return { success: true, deletedPath, notice: notOwnedSandboxNotice(sandboxId) };
+      await this.daytonaService.sandboxes.deleteSandbox(sandboxId);
+      return { success: true, deletedPath };
     } catch (error) {
       const message = getErrorMessage(error);
       log.error("Failed to delete Daytona sandbox", { sandboxId, error: message });
@@ -1180,69 +984,6 @@ export class DaytonaSSHRuntime extends SSHRuntime {
         // A forced removal goes on without it: remove shows this as a warning to act on.
         leftoverPaths: [`Daytona sandbox "${sandboxId}"`],
       };
-    }
-  }
-
-  private async releaseAccess(sandboxId: string): Promise<void> {
-    try {
-      await this.daytonaService.ssh.releaseSshAccess(sandboxId);
-    } catch (error) {
-      // The token expires within the hour; the workspace is gone either way.
-      log.warn("Failed to release Daytona ssh access after deleting a workspace", {
-        sandboxId,
-        error: getErrorMessage(error),
-      });
-    }
-  }
-
-  /**
-   * Fail closed: the workspace path is still the unresolved `~/...` default (deferred access
-   * skips resolution at creation), and a "missing" checkout deletes the whole sandbox. So
-   * resolve it on the sandbox first; a path that does not resolve to an absolute one throws,
-   * which keeps the workspace and its sandbox.
-   */
-  protected override async checkWorkspaceDeletable(
-    deletedPath: string,
-    force: boolean,
-    trusted: boolean | undefined,
-    abortSignal?: AbortSignal
-  ): Promise<"ok" | "missing" | { error: string }> {
-    const resolvedPath = await this.resolvePath(deletedPath);
-    if (!path.posix.isAbsolute(resolvedPath)) {
-      throw new Error(`Could not resolve the workspace path ${deletedPath} on the sandbox`);
-    }
-    return super.checkWorkspaceDeletable(resolvedPath, force, trusted, abortSignal);
-  }
-
-  /** Start the sandbox (if stopped or archived) so the dirty and unpushed checks can run. */
-  private async startForDeleteChecks(
-    sandboxId: string,
-    abortSignal: AbortSignal | undefined
-  ): Promise<"ready" | "missing" | { error: string }> {
-    try {
-      await this.daytonaService.sandboxes.ensureSandboxReady(sandboxId, { signal: abortSignal });
-      return "ready";
-    } catch (error) {
-      if (isDaytonaNotFound(error)) return "missing";
-      // A sandbox on its way out (a failed setup deleting it) has no work left to check.
-      if (await this.isBeingDestroyed(sandboxId)) return "missing";
-      return {
-        error:
-          `Could not start Daytona sandbox "${sandboxId}" to check for uncommitted work: ` +
-          `${getErrorMessage(error)}`,
-      };
-    }
-  }
-
-  private async isBeingDestroyed(sandboxId: string): Promise<boolean> {
-    try {
-      return await this.daytonaService.sandboxes.waitUntilDestroyed(sandboxId);
-    } catch (error) {
-      log.warn("Could not read Daytona sandbox state before a delete", {
-        sandboxId,
-        error: getErrorMessage(error),
-      });
-      return false;
     }
   }
 }

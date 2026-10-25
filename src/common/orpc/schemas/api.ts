@@ -1500,11 +1500,7 @@ const ArchivePreflightResultSchema = z.discriminatedUnion("kind", [
 ]);
 
 const ArchiveWorkspaceResultSchema = z.discriminatedUnion("kind", [
-  z.object({
-    kind: z.literal("archived"),
-    /** Outcomes that did not fail the archive, e.g. a Daytona sandbox kept instead of deleted. */
-    warnings: z.array(z.string()).optional(),
-  }),
+  z.object({ kind: z.literal("archived") }),
   ArchiveLossyUntrackedFilesConfirmationSchema,
 ]);
 
@@ -2142,12 +2138,6 @@ export const workspace = {
           z.object({
             workspaceId: z.string(),
             error: z.string(),
-          })
-        ),
-        warnings: z.array(
-          z.object({
-            workspaceId: z.string(),
-            warning: z.string(),
           })
         ),
       }),

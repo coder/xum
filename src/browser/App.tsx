@@ -110,7 +110,6 @@ import { SettingsProvider, useSettings } from "./contexts/SettingsContext";
 import { AboutDialogProvider, useAboutDialog } from "./contexts/AboutDialogContext";
 import { ConfirmDialogProvider, useConfirmDialog } from "./contexts/ConfirmDialogContext";
 import { confirmAndRemoveSubagent } from "@/browser/utils/subagentRemoval";
-import { showWorkspaceRemoveWarnings } from "@/browser/utils/workspace";
 import { AboutDialog } from "./features/About/AboutDialog";
 import { LazySettingsPage } from "@/browser/features/Settings/LazySettingsPage";
 import { LazyAnalyticsDashboard } from "@/browser/features/Analytics/LazyAnalyticsDashboard";
@@ -151,7 +150,6 @@ import { PopoverError } from "@/browser/components/PopoverError/PopoverError";
 import { usePopoverError } from "@/browser/hooks/usePopoverError";
 import { markAppShellReady } from "@/browser/utils/perf/appShellReady";
 import { serverPathLabel } from "@/common/utils/paths";
-import { describeArchiveMergedIssues } from "@/browser/utils/archiveMergedIssues";
 
 // T3 #5971 (route split): each page is its own chunk. The workspace page's ErrorBoundary sits inside
 // its chunk, so a failed chunk load reaches PageArea's LazyFeature (Reload, which can recover).
@@ -884,9 +882,24 @@ function AppInner() {
           return;
         }
 
-        const summary = describeArchiveMergedIssues(result.data);
-        if (summary && typeof window !== "undefined") {
-          window.alert(summary);
+        const errorCount = result.data.errors.length;
+        if (errorCount > 0) {
+          const archivedCount = result.data.archivedWorkspaceIds.length;
+          const skippedCount = result.data.skippedWorkspaceIds.length;
+
+          const MAX_ERRORS_TO_SHOW = 5;
+          const shownErrors = result.data.errors
+            .slice(0, MAX_ERRORS_TO_SHOW)
+            .map((e) => `- ${e.workspaceId}: ${e.error}`)
+            .join("\n");
+          const remainingCount = Math.max(0, errorCount - MAX_ERRORS_TO_SHOW);
+          const remainingSuffix = remainingCount > 0 ? `\n… and ${remainingCount} more.` : "";
+
+          if (typeof window !== "undefined") {
+            window.alert(
+              `Archived merged workspaces with some errors.\n\nArchived: ${archivedCount}\nSkipped: ${skippedCount}\nErrors: ${errorCount}\n\nErrors:\n${shownErrors}${remainingSuffix}`
+            );
+          }
         }
       } catch (error) {
         const message = getErrorMessage(error);
@@ -939,12 +952,10 @@ function AppInner() {
       const result = await removeWorkspace(workspaceId);
       if (!result.success) {
         paletteRemoveError.showError(workspaceId, result.error ?? "Failed to remove workspace");
-      } else {
-        showWorkspaceRemoveWarnings(paletteRemoveWarning, workspaceId, result.warnings);
       }
       return result;
     },
-    [removeWorkspace, paletteRemoveError, paletteRemoveWarning]
+    [removeWorkspace, paletteRemoveError]
   );
   const removeSubagentFromPalette = async (workspaceId: string, title: string) => {
     const notice = await confirmAndRemoveSubagent({
