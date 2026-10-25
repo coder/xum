@@ -152,7 +152,8 @@ export async function setupWorkspaceView(
     () => {
       const el = view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
       if (!el) throw new Error("Workspace not found in sidebar");
-      // Wait until the workspace is selectable (not still creating) before clicking.
+      // Wait until the workspace is selectable before clicking. aria-disabled covers only
+      // removing and archiving: this does not wait for workspace setup (isInitializing).
       if (el.getAttribute("aria-disabled") === "true") {
         throw new Error("Workspace still disabled");
       }
