@@ -11,6 +11,7 @@ import {
   prepareAgentInterfaceStatusPage,
 } from "./agentInterfaceStatusPage";
 import type { ArtifactsLocation } from "./artifactsOperations";
+import { transformMCPResult } from "./mcpResultTransform";
 
 const ALL_ON = {
   scratchDirSet: true,
@@ -119,6 +120,7 @@ describe("needsStatusPageTurnEndNudge", () => {
     },
   ];
   const failedTools: CompletedMessagePart[] = [toolCall({ success: false, error: "exit 2" })];
+  const screenshot = { type: "image", data: "aGVsbG8=", mimeType: "image/png" };
   const textOnly: CompletedMessagePart[] = [{ type: "text", text: "Hello." }];
 
   beforeEach(async () => {
@@ -156,6 +158,25 @@ describe("needsStatusPageTurnEndNudge", () => {
       nudge: true,
     },
     {
+      name: "an MCP call with an image result left the page unchanged",
+      agentPage: true,
+      parts: [toolCall(transformMCPResult({ content: [screenshot] }))],
+      nudge: true,
+    },
+    {
+      name: "a failed MCP call with an image result left the page unchanged",
+      agentPage: true,
+      parts: [
+        toolCall(
+          transformMCPResult({
+            content: [{ type: "text", text: "capture failed" }, screenshot],
+            isError: true,
+          })
+        ),
+      ],
+      nudge: false,
+    },
+    {
       name: "a tool-free turn left the agent's page unchanged",
       agentPage: true,
       parts: textOnly,
@@ -189,6 +210,61 @@ describe("needsStatusPageTurnEndNudge", () => {
         parts: ranTools,
       })
     ).toBe(false);
+  });
+
+  test.each([
+    {
+      name: "the placeholder an earlier release seeded with another comment",
+      page: AGENT_INTERFACE_STATUS_TEMPLATE.replace(/<!--[\s\S]*?-->/, "<!-- Older guidance -->"),
+      nudge: true,
+    },
+    { name: "a blank page", page: " \n\t\n", nudge: true },
+    { name: "a page with only a comment", page: "<!-- status -->\n", nudge: true },
+    {
+      name: "the placeholder plus a card the agent added",
+      page: AGENT_INTERFACE_STATUS_TEMPLATE.replace(
+        "</main>",
+        '  <p class="card">Fixing the build</p>\n</main>'
+      ),
+      nudge: false,
+    },
+    { name: "an oversize page", page: `<p>${"x".repeat(1024 * 1024 + 1)}</p>`, nudge: false },
+  ])("a tool-free turn that left $name: nudge $nudge", async (row) => {
+    await writePage(row.page);
+    const turn = await startTurn();
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: textOnly,
+      })
+    ).toBe(row.nudge);
+  });
+
+  test("a page that is one unclosed comment at the size limit gets the nudge without a stall", async () => {
+    // A lazy comment regex takes minutes on this page instead of milliseconds.
+    await writePage("<!--".repeat(256 * 1024));
+    const turn = await startTurn();
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: textOnly,
+      })
+    ).toBe(true);
+  }, 5_000);
+
+  test("a page emptied during the turn gets the nudge", async () => {
+    await writePage("<p>Fixing the build</p>");
+    const turn = await startTurn();
+    await writePage("");
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: textOnly,
+      })
+    ).toBe(true);
   });
 
   test.each([

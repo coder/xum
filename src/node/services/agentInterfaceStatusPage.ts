@@ -7,6 +7,7 @@ import type { CompletedMessagePart } from "@/common/types/stream";
 import type { ArtifactsLocation, AvailableArtifactsLocation } from "./artifactsOperations";
 import { readArtifactBytesAtLocation, writeArtifactAtLocation } from "./artifactsOperations";
 import { log } from "./log";
+import { isMCPErrorContentOutput } from "./mcpResultTransform";
 import { isSuccessfulToolOutput } from "./streamManager";
 
 const THEME_VARIABLE_NAMES = Object.keys(ARTIFACT_THEME_VARIABLES)
@@ -145,7 +146,7 @@ export async function prepareAgentInterfaceStatusPage(args: {
 
 /**
  * At turn end: whether the status page the user sees needs the turn-end nudge. True when the page
- * is missing (it is seeded again) or still the seeded placeholder, or when the turn made a
+ * is missing (it is seeded again), still the seeded placeholder or blank, or when the turn made a
  * successful tool call (it did work) and left the page as it was at turn start. False when the
  * view was inactive this turn or was switched off since (`viewEnabled` reads the flags at turn end:
  * the user then sees the transcript, so the page is neither seeded again nor nudged), and when the
@@ -170,14 +171,19 @@ export async function needsStatusPageTurnEndNudge(input: {
   }
   if (page.kind !== "page") return false;
   return (
-    page.placeholder ||
+    page.unpublished ||
     (page.fingerprint === input.turn.startFingerprint && madeSuccessfulToolCall(input.parts))
   );
 }
 
 function isSuccessfulToolCall(call: { state: string; output?: unknown }): boolean {
-  // Not isSuccessfulToolResult: MCP results carry no success marker, and MCP work counts too.
-  return call.state === "output-available" && isSuccessfulToolOutput(call.output);
+  // Not isSuccessfulToolResult: MCP results carry no success marker, and MCP work counts too. An
+  // MCP error with binary parts loses its isError flag on the way, so its marker text decides.
+  return (
+    call.state === "output-available" &&
+    isSuccessfulToolOutput(call.output) &&
+    !isMCPErrorContentOutput(call.output)
+  );
 }
 
 function madeSuccessfulToolCall(parts: readonly CompletedMessagePart[]): boolean {
@@ -224,11 +230,42 @@ async function seedStatusPage(
 }
 
 type StatusPageRead =
-  | { kind: "page"; fingerprint: string; placeholder: boolean }
+  | { kind: "page"; fingerprint: string; unpublished: boolean }
   | { kind: "missing" }
   | { kind: "unreadable" };
 
-const TEMPLATE_BYTES = Buffer.from(AGENT_INTERFACE_STATUS_TEMPLATE, "utf8");
+/**
+ * The HTML without its comments; an unclosed comment runs to the end, as browsers parse it. A
+ * linear scan, because a lazy regex takes quadratic time on a page of unclosed comments.
+ */
+function withoutHtmlComments(html: string): string {
+  let content = "";
+  let from = 0;
+  for (;;) {
+    const start = html.indexOf("<!--", from);
+    if (start === -1) return content + html.slice(from);
+    content += html.slice(from, start);
+    // From start + 2, so the empty comments "<!-->" and "<!--->" close here, as in HTML.
+    // mutation-equivalent: "-->" cannot begin at start - 2 through start + 1 (html[start] is "<"
+    // and html[start + 1] is "!"), so a search from start - 2 finds the same end.
+    const end = html.indexOf("-->", start + 2);
+    if (end === -1) return content;
+    from = end + 3;
+  }
+}
+
+const TEMPLATE_CONTENT = withoutHtmlComments(AGENT_INTERFACE_STATUS_TEMPLATE);
+
+/**
+ * Whether a page shows nothing the agent wrote: the seeded placeholder, or nothing at all (a
+ * failed redirect leaves an empty file), for which the main pane shows the transcript instead.
+ * Comments are left out, so a placeholder that an earlier release seeded with other guidance in
+ * its comment still matches.
+ */
+function isUnpublishedStatusPage(bytes: Buffer): boolean {
+  const content = withoutHtmlComments(bytes.toString("utf8"));
+  return content === TEMPLATE_CONTENT || content.trim() === "";
+}
 
 async function readStatusPage(
   location: AvailableArtifactsLocation,
@@ -246,7 +283,7 @@ async function readStatusPage(
         return {
           kind: "page",
           fingerprint: createHash("sha256").update(outcome.bytes).digest("hex"),
-          placeholder: outcome.bytes.equals(TEMPLATE_BYTES),
+          unpublished: isUnpublishedStatusPage(outcome.bytes),
         };
       case "too_large":
         // Size only, not mtime: a touch must not count as an update at any size, as for hashed
@@ -254,7 +291,7 @@ async function readStatusPage(
         return {
           kind: "page",
           fingerprint: `too-large:${outcome.size}`,
-          placeholder: false,
+          unpublished: false,
         };
       case "missing":
         return { kind: "missing" };

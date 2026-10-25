@@ -59,11 +59,11 @@ export function classifyTodoTurnEndNudgePrompt(text: string): "current" | "legac
  * The turn-end status page nudge of the Agent interface view. The user sees the agent's
  * status.html instead of the transcript, but agents often end whole turns without replacing the
  * seeded placeholder or updating the page, so AgentSession sends this prompt as a turn.stop
- * continuation, at most once per user turn, when the page still shows the placeholder or a turn
- * that ran tools left it unchanged. Constant, like the TODO nudge: no model-written text.
+ * continuation, at most once per user turn, when the page is blank or still shows the placeholder,
+ * or a turn that ran tools left it unchanged. Constant, like the TODO nudge: no model-written text.
  */
 export const STATUS_PAGE_TURN_END_NUDGE = `<notification>
-You ended your turn, but the status page the user sees instead of this chat still shows Xum's placeholder or did not change this turn. Update $XUM_SCRATCH_DIR/artifacts/status.html in place now so it shows the current status, progress and results, and anything that waits on the user. Do not redo work you already did.
+You ended your turn, but the status page the user sees instead of this chat is blank, still shows Xum's placeholder, or did not change this turn. Update $XUM_SCRATCH_DIR/artifacts/status.html in place now so it shows the current status, progress and results, and anything that waits on the user. Do not redo work you already did.
 </notification>`;
 
 /** Joins Xum's turn-end nudges (TODO first, then the status page) into one continuation. */
