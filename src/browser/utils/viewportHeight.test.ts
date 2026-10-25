@@ -1,6 +1,6 @@
 import "../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { installDom } from "../../../tests/ui/dom";
@@ -26,6 +26,19 @@ function setInnerHeight(value: number) {
 
 function appViewportHeight(): string {
   return document.documentElement.style.getPropertyValue(APP_VIEWPORT_HEIGHT_PROPERTY);
+}
+
+function withResizeObserver(value: unknown, run: () => void) {
+  const originalResizeObserver = window.ResizeObserver;
+  Object.defineProperty(window, "ResizeObserver", { configurable: true, value });
+  try {
+    run();
+  } finally {
+    Object.defineProperty(window, "ResizeObserver", {
+      configurable: true,
+      value: originalResizeObserver,
+    });
+  }
 }
 
 describe("iOS standalone viewport", () => {
@@ -101,6 +114,62 @@ describe("iOS standalone viewport", () => {
     setInnerHeight(852);
     window.dispatchEvent(new window.Event("resize"));
     expect(appViewportHeight()).toBe("");
+  });
+
+  test("syncs again when the rotated layout resizes the viewport after a stale resize event", () => {
+    const callbacks: Array<() => void> = [];
+    class RecordingResizeObserver {
+      constructor(callback: () => void) {
+        callbacks.push(callback);
+      }
+      observe() {
+        return undefined;
+      }
+      disconnect() {
+        return undefined;
+      }
+    }
+    withResizeObserver(RecordingResizeObserver, () => {
+      setStandalone(true);
+      setInnerHeight(820);
+      cleanupSync = installViewportHeightSync();
+
+      // iPad landscape to portrait: the resize event still sees the landscape height.
+      window.dispatchEvent(new window.Event("resize"));
+      setInnerHeight(1180);
+      for (const callback of callbacks) callback();
+
+      expect(appViewportHeight()).toBe("1180px");
+    });
+  });
+
+  test("keeps the resize sync and removes the probe when the viewport cannot be observed", () => {
+    class FailingResizeObserver {
+      observe() {
+        throw new Error("observe failed");
+      }
+      disconnect() {
+        return undefined;
+      }
+    }
+    const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      withResizeObserver(FailingResizeObserver, () => {
+        setStandalone(true);
+        setInnerHeight(852);
+        const bodyChildren = document.body.childElementCount;
+
+        cleanupSync = installViewportHeightSync();
+
+        expect(document.body.childElementCount).toBe(bodyChildren);
+        expect(consoleError).toHaveBeenCalledTimes(1);
+        setInnerHeight(500);
+        window.dispatchEvent(new window.Event("resize"));
+        expect(appViewportHeight()).toBe("500px");
+      });
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });
 

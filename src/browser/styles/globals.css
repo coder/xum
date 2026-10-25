@@ -911,6 +911,13 @@ body,
 /* iPadOS reports pointer: coarse even with a trackpad attached, so selection suppression
    must not be limited to phone widths. */
 @media (pointer: coarse) {
+  /* iOS ignores the viewport's zoom limits for gestures, so without this its double-tap-to-zoom
+     recognizer stays armed on tablets and holds or drops taps on the blank part of a control
+     (Settings nav rows on an iPad needed several taps right of the label). Pinch zoom stays. */
+  html {
+    touch-action: manipulation;
+  }
+
   body {
     -webkit-user-select: none;
     user-select: none;
@@ -929,7 +936,6 @@ body,
 @media (max-width: 768px) and (pointer: coarse) {
   html {
     -webkit-text-size-adjust: 100%;
-    touch-action: manipulation;
   }
 
   body {
