@@ -197,9 +197,11 @@ describe("needsStatusPageTurnEndNudge", () => {
         parts: textOnly,
       })
     ).toBe(row.viewEnabled);
-    const page = fs.readFile(statusPath(), "utf8");
-    if (row.viewEnabled) expect(await page).toBe(AGENT_INTERFACE_STATUS_TEMPLATE);
-    else await expect(page).rejects.toMatchObject({ code: "ENOENT" });
+    if (row.viewEnabled) {
+      expect(await fs.readFile(statusPath(), "utf8")).toBe(AGENT_INTERFACE_STATUS_TEMPLATE);
+    } else {
+      expect(existsSync(statusPath())).toBe(false);
+    }
   });
 
   test("a folder at the page's path gets no nudge", async () => {
