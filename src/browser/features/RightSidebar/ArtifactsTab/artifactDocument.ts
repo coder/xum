@@ -9,6 +9,7 @@ import { toImageDataUrl, type createArtifactAssetLoader } from "./artifactAssets
  * <meta> as the FIRST child of <head>, followed by the bridge <script>. A meta CSP only
  * governs content after it, and because the HTML parser places every artifact node after
  * <head>'s first child, nothing the artifact wrote can run or load before the policy applies.
+ * A host <style> (TEXT_SIZE_ADJUST_STYLE) follows the bridge scripts.
  * Never build these documents by string concatenation.
  */
 
@@ -42,6 +43,9 @@ function insertSecurityPreamble(doc: Document, options: SandboxedDocumentOptions
     previous.after(script);
     previous = script;
   }
+  const style = doc.createElement("style");
+  style.textContent = TEXT_SIZE_ADJUST_STYLE;
+  previous.after(style);
 }
 
 function serialize(doc: Document): string {
@@ -92,6 +96,14 @@ export function buildSandboxedHtmlDocument(
 ): string {
   return finalizeSandboxedDocument(parseArtifactHtml(html), options);
 }
+
+/**
+ * iOS WebKit autosizes (inflates) long text blocks inside iframes, and the host's own
+ * text-size-adjust in globals.css does not reach the srcdoc document, so status pages became
+ * unreadable on phones. `:where` keeps zero specificity and the rule comes before any artifact
+ * markup, so every artifact rule still overrides it.
+ */
+const TEXT_SIZE_ADJUST_STYLE = ":where(html){-webkit-text-size-adjust:100%;text-size-adjust:100%}";
 
 const SVG_FRAME_STYLE =
   "html,body{margin:0;height:100%}" +
