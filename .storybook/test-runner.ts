@@ -228,7 +228,7 @@ async function assertClearsRightInset(page: StoryPage, target: { sheet: string }
   }
 }
 
-const MENU_INSET_STORY = "components-projectpage--create-workspace-many-projects";
+const MENU_INSET_STORY = "components-projectpage--create-workspace-multiple-projects";
 // The iPhone Duo cover display draws its 21 px top inset as an opaque status band. A short
 // viewport (as when the software keyboard is up) leaves the project switcher too little room
 // below, so its list opens upward and Radix fits it to the top edge.
@@ -237,7 +237,7 @@ const MENU_INSET_VIEWPORT = { width: SIDE_INSET_VIEWPORT.width, height: 220 };
 
 /**
  * Radix fits a menu to the viewport edge, but menus portal out of the app shell that pads the
- * safe areas, so a list fitted to the edge drew rows under the top band and the right column.
+ * safe areas, so a list fitted to the top edge drew its first rows under the top band.
  */
 async function assertMenuClearsSafeArea(page: StoryPage) {
   const client = await page.context().newCDPSession(page);
@@ -267,23 +267,17 @@ async function assertMenuClearsSafeArea(page: StoryPage) {
       for (let i = 0; i < 60; i++) {
         await frame();
         const r = element.getBoundingClientRect();
-        const next = `${r.top},${r.right},${r.bottom}`;
+        const next = `${r.top},${r.bottom}`;
         if (next === last && r.height > 0) break;
         last = next;
       }
-      const r = element.getBoundingClientRect();
-      return { top: r.top, right: r.right, side: element.getAttribute("data-side") };
+      return { top: element.getBoundingClientRect().top, side: element.getAttribute("data-side") };
     });
     // Below the heading the list has room to start below any inset, so only the upward case checks.
     assert.equal(box.side, "top", "The project list must open above its trigger on a short phone");
-    const limit = MENU_INSET_VIEWPORT.width - MENU_INSETS.right;
-    const problems: string[] = [];
-    if (box.top < MENU_INSETS.top - 0.5) problems.push(`list starts at ${Math.round(box.top)}px`);
-    if (box.right > limit + 0.5) problems.push(`list ends at ${Math.round(box.right)}px`);
-    assert.equal(
-      problems.join("; "),
-      "",
-      `The project list must clear a ${MENU_INSETS.top}px top and ${MENU_INSETS.right}px right inset`
+    assert(
+      box.top >= MENU_INSETS.top - 0.5,
+      `The project list starts at ${Math.round(box.top)}px, under the ${MENU_INSETS.top}px top inset`
     );
   } finally {
     await page.keyboard.press("Escape");

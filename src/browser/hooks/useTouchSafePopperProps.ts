@@ -11,22 +11,34 @@ let lastInsets = NO_INSETS;
 // Every Popover and Select content renders this hook, open or not, and reading the probe's
 // padding forces layout, so measure only on first use and after the window resizes.
 let insetsStale = true;
-let coarsePointerQuery: MediaQueryList | null = null;
+
+function markInsetsStale() {
+  insetsStale = true;
+}
 
 // env() only resolves inside CSS, so a hidden fixed element padded by the insets exposes them.
+function createProbe(): HTMLElement {
+  const element = document.createElement("div");
+  element.setAttribute("aria-hidden", "true");
+  element.style.cssText =
+    "position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;" +
+    "padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) 0 env(safe-area-inset-left,0px)";
+  document.body.appendChild(element);
+  // Mounted menus hear resizes through subscribe; this also covers a resize (a fold) while no
+  // menu is mounted. addEventListener ignores a second registration of the same listener.
+  window.addEventListener("resize", markInsetsStale);
+  return element;
+}
+
 function readInsets(): Insets {
-  if (!insetsStale) return lastInsets;
   if (typeof document === "undefined" || document.body == null) return NO_INSETS;
-  insetsStale = false;
-  if (probe?.isConnected !== true) {
-    probe = document.createElement("div");
-    probe.setAttribute("aria-hidden", "true");
-    probe.style.cssText =
-      "position:fixed;top:0;left:0;width:0;height:0;visibility:hidden;pointer-events:none;" +
-      "padding:env(safe-area-inset-top,0px) env(safe-area-inset-right,0px) 0 env(safe-area-inset-left,0px)";
-    document.body.appendChild(probe);
+  if (probe == null || !document.body.contains(probe)) {
+    probe = createProbe();
+    insetsStale = true;
   }
-  const style = getComputedStyle(probe);
+  if (!insetsStale) return lastInsets;
+  insetsStale = false;
+  const style = window.getComputedStyle(probe);
   const top = parseFloat(style.paddingTop) || 0;
   const right = parseFloat(style.paddingRight) || 0;
   const left = parseFloat(style.paddingLeft) || 0;
@@ -39,13 +51,11 @@ function readInsets(): Insets {
 
 function subscribe(onChange: () => void): () => void {
   if (typeof window === "undefined") return () => undefined;
-  // Insets change with rotation and when a folding phone switches displays; both resize the window.
-  const handleResize = () => {
-    insetsStale = true;
-    onChange();
-  };
-  window.addEventListener("resize", handleResize);
-  return () => window.removeEventListener("resize", handleResize);
+  // Insets change with rotation and when a folding phone switches displays; both resize the
+  // window. React reads the snapshot inside onChange; the probe's resize listener runs first
+  // because the first snapshot read, before any subscribe, registered it.
+  window.addEventListener("resize", onChange);
+  return () => window.removeEventListener("resize", onChange);
 }
 
 function getServerSnapshot(): Insets {
@@ -53,9 +63,11 @@ function getServerSnapshot(): Insets {
 }
 
 function isCoarsePointer(): boolean {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return false;
-  coarsePointerQuery ??= window.matchMedia("(pointer: coarse)");
-  return coarsePointerQuery.matches;
+  return (
+    typeof window !== "undefined" &&
+    typeof window.matchMedia === "function" &&
+    window.matchMedia("(pointer: coarse)").matches
+  );
 }
 
 /**
