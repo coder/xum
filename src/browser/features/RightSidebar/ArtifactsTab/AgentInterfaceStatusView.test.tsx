@@ -364,8 +364,8 @@ describe("Agent interface status view", () => {
       expect(strip.textContent).toContain("Run the tests");
       expect(sends).toEqual([]);
 
-      const sendButton = within(strip).getByRole("button", { name: "Send" }) as HTMLButtonElement;
-      await waitFor(() => expect(sendButton.disabled).toBe(false), {
+      const sendButton = within(strip).getByRole("button", { name: "Send" });
+      await waitFor(() => expect(sendButton.hasAttribute("disabled")).toBe(false), {
         timeout: CONFIRM_ARM_DELAY_MS + 1000,
       });
       fireEvent.click(sendButton);
