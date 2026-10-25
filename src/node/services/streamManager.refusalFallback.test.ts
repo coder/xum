@@ -527,6 +527,33 @@ describe("StreamManager - fallback swap edges", () => {
     });
   });
 
+  test("a swap after a refusal without output clears the refused attempt's partial", async () => {
+    // A crash while the fallback starts must not recover the refused model's row.
+    const { chain, prepare } = preparedFallback();
+    const workspaceId = "fallback-edges-partial-reset";
+    let partialAtFallbackStart: Awaited<ReturnType<typeof historyService.readPartial>> | undefined;
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
+        refused,
+        {
+          chunks: [
+            async () => {
+              partialAtFallbackStart = await historyService.readPartial(workspaceId);
+            },
+            ...answered.chunks,
+          ],
+          usage: NO_USAGE,
+        },
+      ]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId,
+      modelFallback: { chain, prepare },
+    });
+    expect(completion.status).toBe("completed");
+    expect(partialAtFallbackStart).toBeNull();
+  });
+
   test("an interrupt while prepare() runs ends the turn as aborted, not as a refusal", async () => {
     const workspaceId = "fallback-edges-abort-in-prepare";
     let stopping: Promise<unknown> | undefined;
