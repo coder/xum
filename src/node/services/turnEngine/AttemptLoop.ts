@@ -19,7 +19,7 @@ import { eventSpine } from "@/node/services/events/eventSpine";
 import { log, type Logger } from "@/node/services/log";
 import { createErrorEvent, type StreamErrorPayload } from "@/node/services/utils/sendMessageError";
 import { nodeClock } from "@/node/utils/hostClock";
-import { partFold, type FoldablePart, type FoldStep, type FoldView } from "./partFold";
+import { partFold, type FoldablePart, type FoldStep } from "./partFold";
 import type { PartialJournal } from "./PartialJournal";
 import type { ProviderRequest, StreamRequestConfig } from "./ProviderRequest";
 import {
@@ -29,6 +29,7 @@ import {
   type AttemptOutcome,
 } from "./recoveryPolicy";
 import type { RefusalFallback } from "./RefusalFallback";
+import { foldView, type PartLoopState } from "./StepApply";
 import type { StepMessageTracker } from "./StepPreparation";
 import {
   getOpenAIPreviousResponseId,
@@ -52,25 +53,6 @@ import {
   markProviderMetadataCostsIncluded,
   type UsageLedger,
 } from "./UsageLedger";
-
-// Tool-call tracking + branded types
-export interface ToolCallState {
-  toolCallId: string;
-  toolName: string;
-  input: unknown;
-  output?: unknown;
-}
-
-export type ToolCallMap = Map<string, ToolCallState>;
-
-/** Stream-loop state of one processStreamWithCleanup turn that applyStep reads and updates. */
-export interface PartLoopState {
-  readonly workspaceLog: Logger;
-  /** Per attempt: processStreamWithCleanup replaces it before each attempt. */
-  toolCalls: ToolCallMap;
-  /** Per turn: counts orphan tool results for log suppression. */
-  orphanToolResultCount: number;
-}
 
 function isKnownProviderName(provider: string): provider is keyof typeof PROVIDER_DEFINITIONS {
   return Object.hasOwn(PROVIDER_DEFINITIONS, provider);
@@ -238,12 +220,7 @@ export interface AttemptLoopDeps {
     streamInfo: WorkspaceStreamInfo,
     terminalPartial?: MuxMessage
   ) => Promise<void>;
-  /** StreamManager's part fold view and step application (applyStep). */
-  readonly foldView: (
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    loop: PartLoopState
-  ) => FoldView;
+  /** StepApply.applyStep: runs the fold's intents against the stream state. */
   readonly applyStep: (
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo,
@@ -548,7 +525,7 @@ export class AttemptLoop {
       // });
 
       const step = partFold(
-        this.deps.foldView(workspaceId, streamInfo, loop),
+        foldView(workspaceId, streamInfo, loop),
         part as FoldablePart,
         nodeClock.nowMs()
       );
