@@ -1203,9 +1203,6 @@ export class WorkspaceStore {
   private fileModifyingToolMs = new Map<string, number>();
   private fileModifyingToolSubs = new MapStore<string, void>();
 
-  // RuntimeStatusStore listens: a turn starting a stopped runtime changes its badge.
-  private runtimeStatusEventListeners = new Set<(event: RuntimeStatusEvent) => void>();
-
   // Idle callbacks keep high-frequency init logs from blocking the renderer.
   private deltaIdleHandles = new Map<string, number>();
   private idleBumpPreludes = new Map<string, () => void>();
@@ -1441,8 +1438,6 @@ export class WorkspaceStore {
     "runtime-status": (workspaceId, aggregator, data) => {
       applyWorkspaceChatEventToAggregator(aggregator, data);
       this.states.bump(workspaceId);
-      const event = data as RuntimeStatusEvent;
-      for (const listener of this.runtimeStatusEventListeners) listener(event);
     },
     "auto-compaction-triggered": (workspaceId) => {
       // Informational event from backend auto-compaction monitor.
@@ -5065,11 +5060,6 @@ export class WorkspaceStore {
         listener(wsId);
       }
     });
-  }
-
-  subscribeRuntimeStatusEvents(listener: (event: RuntimeStatusEvent) => void): () => void {
-    this.runtimeStatusEventListeners.add(listener);
-    return () => this.runtimeStatusEventListeners.delete(listener);
   }
 
   /**
