@@ -5,9 +5,9 @@ import type { AutoModelRoutingEscalation } from "@/common/types/autoModelRouting
 import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
 import { log } from "@/node/services/log";
 
-import { createAutoThinkingEscalationState } from "./autoThinkingEscalation";
-import type { ContinuousPrefixSwap } from "./continuousCompactionJournal";
-import type { ActiveTurnThinkingOverride } from "./thinkingOverride";
+import { createAutoThinkingEscalationState } from "@/node/services/autoThinkingEscalation";
+import type { ContinuousPrefixSwap } from "@/node/services/continuousCompactionJournal";
+import type { ActiveTurnThinkingOverride } from "@/node/services/thinkingOverride";
 import {
   advanceReasoningReplayBoundary,
   buildContextBudgetRequest,
@@ -22,7 +22,7 @@ import {
   startFirstStepRebuild,
   stripReasoningBeforeReplayBoundary,
   thinkingChangeVoidsPrefixSwap,
-} from "./streamManager";
+} from "./StepPreparation";
 
 /** A staged swap whose prefix was prepared at this thinking level. */
 function swapPreparedAt(level: string): ContinuousPrefixSwap {
