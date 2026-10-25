@@ -43,10 +43,10 @@ import type {
   TurnEngineEvent,
   TurnEngineEventSink,
   WorkspaceId,
-  WorkspaceStreamInfo,
   DynamicToolCompletedMessagePart,
   WorkflowRunToolAttachment,
 } from "@/node/services/turnEngine/types";
+import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import type {
   ExecutionScope,
   ToolCallDisplayRegistry,

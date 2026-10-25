@@ -72,12 +72,12 @@ import type {
   TurnStreamHandle,
   SettledStepOutcome,
   OnStepSettled,
-  WorkspaceStreamInfo,
   StopStreamOptions,
   ActiveStreamInfo,
   MockStreamLifecycle,
   StreamManagerTokenTracker,
 } from "@/node/services/turnEngine/types";
+import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 export type {
   StreamTextOnChunk,
   WorkspaceId,
@@ -91,12 +91,12 @@ export type {
   OnStepSettled,
   ModelFallbackPrepareOptions,
   ModelFallbackOptions,
-  WorkspaceStreamInfo,
   StopStreamOptions,
   ActiveStreamInfo,
   MockStreamLifecycle,
   StreamManagerTokenTracker,
 } from "@/node/services/turnEngine/types";
+export type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import {
   StreamState,
   TurnRegistry,

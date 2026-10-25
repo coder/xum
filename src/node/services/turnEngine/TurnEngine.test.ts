@@ -10,8 +10,8 @@ import {
   type StepMessageTracker,
   type StreamRequestConfig,
   type StreamToken,
-  type WorkspaceStreamInfo,
 } from "@/node/services/turnEngine/types";
+import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 
 import {
   createStreamInfo,

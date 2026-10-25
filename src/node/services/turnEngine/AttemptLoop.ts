@@ -48,7 +48,8 @@ import {
 import { metadataModelIdentity, type TurnEvents } from "./TurnEvents";
 import { StreamState } from "./TurnRegistry";
 import type { TurnResources } from "./TurnResources";
-import type { StreamManagerTokenTracker, WorkspaceId, WorkspaceStreamInfo } from "./types";
+import type { StreamManagerTokenTracker, WorkspaceId } from "./types";
+import type { WorkspaceStreamInfo } from "./turnState";
 import {
   clonePersistedToolModelUsage,
   cloneUsage,

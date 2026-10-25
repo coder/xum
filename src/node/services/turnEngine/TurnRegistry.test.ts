@@ -11,8 +11,8 @@ import type {
   TurnCompletionController,
   TurnEngineEvent,
   WorkspaceId,
-  WorkspaceStreamInfo,
 } from "@/node/services/turnEngine/types";
+import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 
 import { TurnEvents } from "./TurnEvents";
 import { StreamState, TurnRegistry } from "./TurnRegistry";

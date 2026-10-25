@@ -26,7 +26,7 @@ import {
   extractStatusCode,
 } from "@/node/services/turnEngine/providerWire";
 import { isAnthropicMessagesModel } from "@/node/services/turnEngine/StepPreparation";
-import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/types";
+import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import { getOpenAIResponsesBaseUrlHint } from "@/node/services/utils/openAIResponsesBaseUrlHint";
 import {
   coerceStreamErrorTypeForMessage,

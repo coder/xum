@@ -44,8 +44,8 @@ import {
   type TurnCompletionController,
   type TurnStreamHandle,
   type WorkspaceId,
-  type WorkspaceStreamInfo,
 } from "@/node/services/turnEngine/types";
+import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import { UsageLedger } from "@/node/services/turnEngine/UsageLedger";
 import { nodeClock } from "@/node/utils/hostClock";
 
@@ -156,6 +156,8 @@ interface StreamRegistration {
   runtimeTempDir: string;
   resourceScope: Scope.Closeable;
   abortController: AbortController;
+  /** Unlinks the caller's abort signal; closeStreamResources calls it. */
+  unlinkAbortSignal?: () => void;
   completionController: TurnCompletionController;
 }
 
@@ -209,6 +211,7 @@ export function createStreamInfo(
     streamResult,
     workspaceName,
     abortController: ctx.abortController,
+    unlinkAbortSignal: ctx.unlinkAbortSignal,
     messageId,
     token: ctx.streamToken,
     executionScope,
@@ -508,10 +511,10 @@ export class TurnEngine {
         runtimeTempDir: prepared.runtimeTempDir,
         resourceScope: startup.resourceScope,
         abortController: streamAbortController,
+        unlinkAbortSignal: startup.unlinkAbortSignal,
         completionController: start.completionController,
       });
       start.registeredStream = registeredStream;
-      registeredStream.unlinkAbortSignal = startup.unlinkAbortSignal;
       // Scope close must own STARTING streams before the fence's release can await.
       this.deps.turnRegistry.superviseEngine(start.workspaceId, registeredStream);
     };

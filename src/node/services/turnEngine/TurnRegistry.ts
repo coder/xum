@@ -20,10 +20,10 @@ import {
   type MockStreamLifecycle,
   type StopStreamOptions,
   type WorkspaceId,
-  type WorkspaceStreamInfo,
   type StreamToken,
   StreamState,
 } from "@/node/services/turnEngine/types";
+import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import type { TurnEvents } from "@/node/services/turnEngine/TurnEvents";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
