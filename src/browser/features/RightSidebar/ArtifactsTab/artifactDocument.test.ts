@@ -33,6 +33,8 @@ function expectTextSizeAdjustBeforeArtifactStyles(srcdoc: string) {
   expect(host?.tagName).toBe("STYLE");
   expect(host?.parentElement).toBe(doc.head);
   expect(host?.previousElementSibling).not.toBeNull();
+  // iOS WebKit, where the autosizing happens, needs the -webkit- prefixed property.
+  expect(host?.textContent).toMatch(/:where\(html\)\s*\{[^}]*-webkit-text-size-adjust:\s*100%/);
   expect(host?.textContent).toMatch(
     /:where\(html\)\s*\{[^}]*(?<!-webkit-)text-size-adjust:\s*100%/
   );
