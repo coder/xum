@@ -351,6 +351,7 @@ describe("getToolsForModel - model-only notifications", () => {
           workspaceId: "ws-1",
           workspaceSessionDir: "/sessions/ws-1",
           sessionFiles: buildSessionFiles(SessionFilesMemory),
+          sessionLocks: nodeSessionLocks,
           clock: clock.hostClock,
         },
         "ws-1",
