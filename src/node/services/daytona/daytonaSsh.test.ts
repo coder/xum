@@ -7,7 +7,6 @@ import { XUM_DAYTONA_SSH_BLOCK_START } from "@/common/constants/daytona";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { log } from "@/node/services/log";
 import { ScriptedSandboxControlPlane } from "./daytona.testHarness";
-import { DAYTONA_BUSY_MESSAGE } from "./daytonaAccount";
 import { DaytonaService } from "./daytonaService";
 
 describe("DaytonaSsh", () => {
@@ -94,64 +93,6 @@ describe("DaytonaSsh", () => {
     }
   });
 
-  /** A service whose first token mint waits until `releaseMint`. */
-  function serviceWithHeldMint() {
-    let mintStarted!: () => void;
-    const started = new Promise<void>((resolve) => (mintStarted = resolve));
-    let releaseMint!: () => void;
-    const released = new Promise<void>((resolve) => (releaseMint = resolve));
-    let held = false;
-    const fetchHoldingFirstMint = (async (input: string | URL | Request, init?: RequestInit) => {
-      const url = input instanceof Request ? input.url : input.toString();
-      if (!held && init?.method === "POST" && url.includes("/ssh-access")) {
-        held = true;
-        mintStarted();
-        await released;
-      }
-      return plane.fetch(input, init);
-    }) as typeof fetch;
-    const written: string[] = [];
-    const store = (input: { token: string }) => {
-      written.push(input.token);
-      return Promise.resolve();
-    };
-    const heldService = new DaytonaService({
-      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
-      rootDir,
-      fetch: fetchHoldingFirstMint,
-      now: () => clock,
-      sshConfigWriter: {
-        writeSandbox: store,
-        ensureManagedBlock: () => Promise.resolve(),
-        restoreGatewayPins: () => Promise.resolve(false),
-        updateToken: store,
-        repointGateway: () => Promise.resolve(),
-        removeSandbox: () => Promise.resolve(),
-        readTokens: () => Promise.resolve([]),
-      },
-    });
-    return { service: heldService, started, releaseMint, written };
-  }
-
-  it("refuses a settings change while a token is minted, and takes it afterwards", async () => {
-    const held = serviceWithHeldMint();
-
-    const access = held.service.ssh.ensureSshAccess("sb-1");
-    await held.started;
-    const refusal = await held.service.account.setConfig({ apiKey: "k" }).then(
-      () => undefined,
-      (error: unknown) => error
-    );
-    expect(String(refusal)).toContain(DAYTONA_BUSY_MESSAGE);
-    held.releaseMint();
-    await access;
-
-    expect(held.written).toEqual(["tok1"]);
-    expect((await held.service.account.setConfig({ apiKey: "k" })).apiKeySource).toBe("settings");
-    // The change revokes the old settings' token.
-    expect(plane.revoked).toEqual(["tok1"]);
-  });
-
   /** A service whose ssh setup writes are recorded as `token@host keys`. */
   function serviceRecordingWrites(fetchImpl: typeof fetch = plane.fetch) {
     const writes: string[] = [];
@@ -188,38 +129,6 @@ describe("DaytonaSsh", () => {
     });
     return { service: recording, writes };
   }
-
-  it("refuses a settings change while it looks up the gateway for a token", async () => {
-    let gatewayFetched!: () => void;
-    const fetched = new Promise<void>((resolve) => (gatewayFetched = resolve));
-    let releaseGateway!: () => void;
-    const released = new Promise<void>((resolve) => (releaseGateway = resolve));
-    let held = false;
-    // The first /config answer is delivered late, while the user saves new settings.
-    const fetchHoldingFirstConfig = (async (input: string | URL | Request, init?: RequestInit) => {
-      const response = await plane.fetch(input, init);
-      const url = input instanceof Request ? input.url : input.toString();
-      if (!held && url.endsWith("/config")) {
-        held = true;
-        gatewayFetched();
-        await released;
-      }
-      return response;
-    }) as typeof fetch;
-    const { service: racing, writes } = serviceRecordingWrites(fetchHoldingFirstConfig);
-
-    const access = racing.ssh.ensureSshAccess("sb-1");
-    await fetched;
-    const refusal = await racing.account.setConfig({ apiKey: "k" }).then(
-      () => undefined,
-      (error: unknown) => error
-    );
-    expect(String(refusal)).toContain(DAYTONA_BUSY_MESSAGE);
-    releaseGateway();
-    await access;
-
-    expect(writes).toEqual(["tok1@ssh.test ssh-ed25519 AAAA"]);
-  });
 
   it("rewrites a sandbox's ssh setup once Daytona moves its gateway keys", async () => {
     const { service: watching, writes } = serviceRecordingWrites();

@@ -62,10 +62,7 @@ import {
 
 /** The DaytonaService parts this runtime uses (tests pass an in-memory fake). */
 export interface DaytonaRuntimeService {
-  account: Pick<
-    DaytonaAccount,
-    "checkAvailability" | "withAccountLease" | "getDefaultTarget" | "findSnapshot"
-  >;
+  account: Pick<DaytonaAccount, "checkAvailability" | "getDefaultTarget" | "findSnapshot">;
   readiness: Pick<
     DaytonaReadiness,
     "isSandboxReady" | "markSandboxReady" | "invalidateSandboxReady"
@@ -320,24 +317,22 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * checks share one control-plane request. A sandbox removed outside Xum is reported, never
    * silently recreated.
    */
-  override ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult> {
-    return this.daytonaService.account.withAccountLease(async () => {
-      const sandboxId = this.daytonaConfig.sandboxId;
-      if (!sandboxId) {
-        return {
-          ready: false,
-          error: "Daytona sandbox id not set",
-          errorType: "runtime_not_ready",
-        };
-      }
-      const emitStatus = makeStatusEmitter(options?.statusSink);
-      // An external client reads the user's ssh config, which the cache does not cover: another
-      // tool may have removed the managed block since. Only a full check writes it again.
-      if (!options?.externalSshClient && this.daytonaService.readiness.isSandboxReady(sandboxId)) {
-        return this.ensureReadyFromCache(options, emitStatus);
-      }
-      return this.ensureReadyUncached(sandboxId, options, emitStatus);
-    });
+  override async ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult> {
+    const sandboxId = this.daytonaConfig.sandboxId;
+    if (!sandboxId) {
+      return {
+        ready: false,
+        error: "Daytona sandbox id not set",
+        errorType: "runtime_not_ready",
+      };
+    }
+    const emitStatus = makeStatusEmitter(options?.statusSink);
+    // An external client reads the user's ssh config, which the cache does not cover: another
+    // tool may have removed the managed block since. Only a full check writes it again.
+    if (!options?.externalSshClient && this.daytonaService.readiness.isSandboxReady(sandboxId)) {
+      return this.ensureReadyFromCache(options, emitStatus);
+    }
+    return this.ensureReadyUncached(sandboxId, options, emitStatus);
   }
 
   private async ensureReadyUncached(
@@ -424,21 +419,19 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * "Permission denied", so only a started sandbox gets a new token. Throws a clear error for
    * a sandbox deleted outside Xum.
    */
-  private recoverForRetry(
+  private async recoverForRetry(
     error: unknown,
     attempt: SshAttempt,
     abortSignal: AbortSignal | undefined
   ): Promise<boolean> {
-    return this.daytonaService.account.withAccountLease(async () => {
-      const sandboxId = this.daytonaConfig.sandboxId;
-      if (!sandboxId || !isRuntimeTransportError(error) || abortSignal?.aborted) return false;
-      const tokenRejected = isTokenRejected(error);
-      // A UI or background runtime never starts the sandbox, so only a refused token is worth a look.
-      if (!tokenRejected && !this.restartsStoppedSandbox) return false;
-      this.daytonaService.readiness.invalidateSandboxReady(sandboxId);
-      const state = await this.readStateAfterFailure(sandboxId);
-      return this.recoverInState(sandboxId, state, { error, tokenRejected, attempt }, abortSignal);
-    });
+    const sandboxId = this.daytonaConfig.sandboxId;
+    if (!sandboxId || !isRuntimeTransportError(error) || abortSignal?.aborted) return false;
+    const tokenRejected = isTokenRejected(error);
+    // A UI or background runtime never starts the sandbox, so only a refused token is worth a look.
+    if (!tokenRejected && !this.restartsStoppedSandbox) return false;
+    this.daytonaService.readiness.invalidateSandboxReady(sandboxId);
+    const state = await this.readStateAfterFailure(sandboxId);
+    return this.recoverInState(sandboxId, state, { error, tokenRejected, attempt }, abortSignal);
   }
 
   private recoverInState(
@@ -757,11 +750,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * sync, worktree creation and init hook. If anything fails after the create request was
    * sent, the sandbox this call created is deleted again so it cannot linger and bill.
    */
-  postCreateSetup(params: WorkspaceInitParams): Promise<void> {
-    return this.daytonaService.account.withAccountLease(() => this.provisionSandbox(params));
-  }
-
-  private async provisionSandbox(params: WorkspaceInitParams): Promise<void> {
+  async postCreateSetup(params: WorkspaceInitParams): Promise<void> {
     const sandboxId = this.daytonaConfig.sandboxId;
     if (!sandboxId) {
       throw new Error("Daytona sandbox id is required (should be set by finalizeConfig)");
@@ -913,7 +902,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
    * for Coder, a stopped or archived one is never started for them, so its work goes unchecked.
    * Force skips the checks, and deletes the sandbox without SSH.
    */
-  override deleteWorkspace(
+  override async deleteWorkspace(
     projectPath: string,
     workspaceName: string,
     force: boolean,
@@ -921,15 +910,13 @@ export class DaytonaSSHRuntime extends SSHRuntime {
     trusted?: boolean,
     options?: { keepBranch?: boolean }
   ): Promise<DeleteResult> {
-    return this.daytonaService.account.withAccountLease(async () => {
-      const sshDelete = () =>
-        super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted, options);
-      return this.deleteWorkspaceAndSandbox(
-        this.getWorkspacePath(projectPath, workspaceName),
-        force,
-        sshDelete
-      );
-    });
+    const sshDelete = () =>
+      super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted, options);
+    return this.deleteWorkspaceAndSandbox(
+      this.getWorkspacePath(projectPath, workspaceName),
+      force,
+      sshDelete
+    );
   }
 
   private async deleteWorkspaceAndSandbox(

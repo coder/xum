@@ -37,15 +37,6 @@ export function unsupportedDaytonaSandboxKind(item: {
   return undefined;
 }
 
-export const DAYTONA_BUSY_MESSAGE =
-  "Daytona is busy creating, starting, deleting or checking sandboxes. Save these settings " +
-  "again when it is done.";
-
-/** Wait until `promise` settles; its outcome belongs to whoever started it. */
-async function settled(promise: Promise<unknown>): Promise<void> {
-  await Promise.allSettled([promise]);
-}
-
 export type DaytonaAvailability = { available: true } | { available: false; reason: string };
 
 export interface DaytonaAccountOptions {
@@ -74,10 +65,6 @@ export class DaytonaAccount {
   private readonly credentialsStore: DaytonaCredentialsStore;
   private readonly fetchImpl?: typeof fetch;
   private readonly onSettingsChange: DaytonaAccountOptions["onSettingsChange"];
-  /** Operations running under withAccountLease; setConfig refuses while any runs. */
-  private accountLeases = 0;
-  /** The settings change being saved; new leases wait for it. */
-  private settingsChange?: Promise<DaytonaPublicConfig>;
 
   constructor(options: DaytonaAccountOptions) {
     this.credentialsStore = options.credentialsStore;
@@ -89,38 +76,7 @@ export class DaytonaAccount {
     return this.credentialsStore.getPublicConfig();
   }
 
-  /**
-   * Run a Daytona operation that makes more than one control-plane call, or acts on what an
-   * earlier one returned (create and set up, delete after its checks, start and mint, archive,
-   * a reconcile sweep), against one account. setConfig refuses while any runs, so none spans a
-   * settings change; one that starts while a change is saved waits for it. Leases nest.
-   */
-  async withAccountLease<T>(fn: () => Promise<T>): Promise<T> {
-    // No await between this check and the claim (as in setConfig).
-    while (this.settingsChange) await settled(this.settingsChange);
-    this.accountLeases++;
-    try {
-      return await fn();
-    } finally {
-      this.accountLeases--;
-    }
-  }
-
-  /** Refused at once (DaytonaConfigError, shown in Settings) while a lease is held. */
   async setConfig(patch: DaytonaCredentialsPatch): Promise<DaytonaPublicConfig> {
-    while (this.settingsChange) await settled(this.settingsChange);
-    // No await between this check and the assignment: a lease cannot start in between.
-    if (this.accountLeases > 0) throw new DaytonaConfigError(DAYTONA_BUSY_MESSAGE);
-    const change = this.applyConfig(patch);
-    this.settingsChange = change;
-    try {
-      return await change;
-    } finally {
-      if (this.settingsChange === change) this.settingsChange = undefined;
-    }
-  }
-
-  private async applyConfig(patch: DaytonaCredentialsPatch): Promise<DaytonaPublicConfig> {
     const previousClient = await this.getClientIfConfigured();
     await this.credentialsStore.update(patch);
     await this.onSettingsChange(previousClient);

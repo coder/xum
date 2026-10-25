@@ -94,7 +94,7 @@ function nextStartStep(
 }
 
 export interface DaytonaSandboxesOptions {
-  account: Pick<DaytonaAccount, "getClient" | "withAccountLease">;
+  account: Pick<DaytonaAccount, "getClient">;
   ssh: Pick<DaytonaSsh, "ensureSshAccess" | "releaseSshAccess">;
   readiness: DaytonaReadiness;
   /** Xum data root; holds the installation identity used for the `xum.instance` label. */
@@ -290,11 +290,9 @@ export class DaytonaSandboxes {
    * `onStarting`. Throws a DaytonaApiError (`not_found` when the sandbox is gone).
    */
   ensureSandboxReady(sandboxId: string, options: DaytonaEnsureReadyOptions = {}): Promise<void> {
-    return this.readiness.join(sandboxId, options, (onStarting) =>
-      this.account.withAccountLease(async () => {
-        await this.startAndWait(sandboxId, this.now() + DAYTONA_START_TIMEOUT_MS, { onStarting });
-        await this.ssh.ensureSshAccess(sandboxId);
-      })
-    );
+    return this.readiness.join(sandboxId, options, async (onStarting) => {
+      await this.startAndWait(sandboxId, this.now() + DAYTONA_START_TIMEOUT_MS, { onStarting });
+      await this.ssh.ensureSshAccess(sandboxId);
+    });
   }
 }

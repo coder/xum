@@ -19,7 +19,6 @@ import { EXPERIMENT_IDS } from "@/common/constants/experiments";
  * providerService.ts and startDesktopFlowEffect in muxGatewayOauthService.ts).
  */
 import { ORPCError, os, type ProcedureConfig } from "@orpc/server";
-import { DaytonaConfigError } from "@/node/config/daytonaCredentialsStore";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import { PerfCaptureRefusedError } from "@/node/services/perf/perfCaptureService";
 import { PerfReportRefusedError } from "@/node/services/perf/perfReportService";
@@ -209,14 +208,6 @@ import { readWorkspaceViewTail } from "@/node/services/workspaceViewTail";
 function rethrowDraftTooLarge(error: unknown): never {
   if (isDraftTooLargeError(error)) {
     throw new ORPCError("BAD_REQUEST", { message: (error as Error).message });
-  }
-  throw error;
-}
-
-/** Transports mask plain errors as "Internal Server Error"; invalid settings need the reason. */
-function rethrowDaytonaConfigError(error: unknown): never {
-  if (error instanceof DaytonaConfigError) {
-    throw new ORPCError("BAD_REQUEST", { message: error.message });
   }
   throw error;
 }
@@ -1813,9 +1804,7 @@ export const router = (authToken?: string) => {
       setConfig: t
         .input(schemas.daytona.setConfig.input)
         .output(schemas.daytona.setConfig.output)
-        .handler(async ({ context, input }) =>
-          context.daytonaService.account.setConfig(input).catch(rethrowDaytonaConfigError)
-        ),
+        .handler(async ({ context, input }) => context.daytonaService.account.setConfig(input)),
       testConnection: t
         .input(schemas.daytona.testConnection.input)
         .output(schemas.daytona.testConnection.output)

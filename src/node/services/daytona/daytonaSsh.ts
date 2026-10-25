@@ -29,7 +29,7 @@ export type DaytonaSshWriter = Pick<
 >;
 
 export interface DaytonaSshOptions {
-  account: Pick<DaytonaAccount, "getClient" | "withAccountLease">;
+  account: Pick<DaytonaAccount, "getClient">;
   readiness: DaytonaReadiness;
   sshConfigWriter: DaytonaSshWriter;
   now: () => number;
@@ -272,24 +272,22 @@ export class DaytonaSsh {
    * The `~/.ssh/config` block is checked every time: another tool may have removed it while a
    * cached token stays fresh, and an external editor needs it to resolve the alias.
    */
-  ensureSshAccess(sandboxId: string): Promise<void> {
-    return this.account.withAccountLease(async () => {
-      // Fails before a mint when the control plane cannot say where the gateway is.
-      await this.getGatewayConfig();
-      // A cached token was written by the mint that produced it, so only a mint writes files.
-      await this.getSshToken(sandboxId, {
-        onNewToken: async ({ token }) => {
-          const gateway = toSshGateway(await this.getGatewayConfig());
-          if (this.sshConfigured.has(sandboxId)) {
-            await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
-            return;
-          }
-          await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
-        },
-      });
-      await this.sshConfigWriter.ensureManagedBlock();
-      this.sshConfigured.add(sandboxId);
+  async ensureSshAccess(sandboxId: string): Promise<void> {
+    // Fails before a mint when the control plane cannot say where the gateway is.
+    await this.getGatewayConfig();
+    // A cached token was written by the mint that produced it, so only a mint writes files.
+    await this.getSshToken(sandboxId, {
+      onNewToken: async ({ token }) => {
+        const gateway = toSshGateway(await this.getGatewayConfig());
+        if (this.sshConfigured.has(sandboxId)) {
+          await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
+          return;
+        }
+        await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
+      },
     });
+    await this.sshConfigWriter.ensureManagedBlock();
+    this.sshConfigured.add(sandboxId);
   }
 
   /**
@@ -358,11 +356,9 @@ export class DaytonaSsh {
     const inFlight = this.tokenRequests.get(sandboxId);
     if (inFlight) return inFlight;
 
-    const request = this.account
-      .withAccountLease(() => this.mintSshToken(sandboxId, cached, options))
-      .finally(() => {
-        this.tokenRequests.delete(sandboxId);
-      });
+    const request = this.mintSshToken(sandboxId, cached, options).finally(() => {
+      this.tokenRequests.delete(sandboxId);
+    });
     this.tokenRequests.set(sandboxId, request);
     return request;
   }

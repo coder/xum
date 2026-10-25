@@ -368,10 +368,7 @@ export class FakeDaytonaSshConfigWriter implements Pick<
 
 export interface DaytonaTestRig {
   rootDir: string;
-  /** The account of the default API key. */
   plane: FakeDaytonaControlPlane;
-  /** Another account: requests with this API key reach its own control plane. */
-  addAccount: (apiKey: string) => FakeDaytonaControlPlane;
   writer: FakeDaytonaSshConfigWriter;
   service: DaytonaService;
   clock: { now: number };
@@ -388,11 +385,6 @@ export async function createDaytonaTestRig(
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), "xum-daytona-test-"));
   const clock = { now: Date.parse("2026-01-01T00:00:00Z") };
   const plane = new FakeDaytonaControlPlane(() => clock.now);
-  const accounts = new Map<string, FakeDaytonaControlPlane>();
-  const planeFor = (init: RequestInit | undefined) => {
-    const auth = (init?.headers as Record<string, string> | undefined)?.Authorization;
-    return accounts.get(auth?.replace(/^Bearer /, "") ?? "") ?? plane;
-  };
   const writer = new FakeDaytonaSshConfigWriter();
   const env: NodeJS.ProcessEnv =
     options.apiKey === null ? {} : { DAYTONA_API_KEY: options.apiKey ?? "test-key" };
@@ -400,8 +392,7 @@ export async function createDaytonaTestRig(
     credentialsStore: new DaytonaCredentialsStore(rootDir, env),
     rootDir,
     sshConfigWriter: writer,
-    fetch: ((input: string | URL | Request, init?: RequestInit) =>
-      planeFor(init).fetch(input, init)) as typeof fetch,
+    fetch: plane.fetch,
     now: () => clock.now,
     sleep: (ms) => {
       clock.now += ms;
@@ -410,17 +401,10 @@ export async function createDaytonaTestRig(
   });
   // Sandboxes a test adds count as ones Xum created, as most tests need; a foreign one sets
   // its own labels.
-  const ownLabels = { [DAYTONA_LABEL_INSTANCE]: await service.sandboxes.getInstanceId() };
-  plane.defaultLabels = ownLabels;
+  plane.defaultLabels = { [DAYTONA_LABEL_INSTANCE]: await service.sandboxes.getInstanceId() };
   return {
     rootDir,
     plane,
-    addAccount: (apiKey) => {
-      const account = new FakeDaytonaControlPlane(() => clock.now);
-      account.defaultLabels = ownLabels;
-      accounts.set(apiKey, account);
-      return account;
-    },
     writer,
     service,
     clock,

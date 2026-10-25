@@ -18,7 +18,7 @@ export interface DaytonaWorkspaceRef {
 
 export interface DaytonaReconcilerOptions {
   daytonaService: {
-    account: Pick<DaytonaAccount, "checkAvailability" | "withAccountLease">;
+    account: Pick<DaytonaAccount, "checkAvailability">;
     sandboxes: Pick<DaytonaSandboxes, "listInstanceSandboxes" | "refreshActivity">;
     ssh: Pick<DaytonaSsh, "hasExpiringSshToken" | "ensureSshAccess">;
   };
@@ -107,12 +107,7 @@ export class DaytonaReconciler {
     this.timer = undefined;
   }
 
-  /** One account for the whole sweep: it refreshes sandboxes from what it listed. */
-  sweep(): Promise<void> {
-    return this.options.daytonaService.account.withAccountLease(() => this.sweepOnce());
-  }
-
-  private async sweepOnce(): Promise<void> {
+  async sweep(): Promise<void> {
     const service = this.options.daytonaService;
     // No credentials: no Daytona workspaces can be reached, and nothing to reconcile.
     if (!(await service.account.checkAvailability()).available) return;
