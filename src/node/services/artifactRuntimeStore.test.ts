@@ -229,6 +229,7 @@ describe("artifactRuntimeStore", () => {
         expect(await readArtifactOnRuntime(runtime, artifactsDir, relPath, CAP)).toEqual({
           success: false,
           error: `Artifact not found: ${relPath}`,
+          missing: true,
         });
       }
       for (const relPath of ["../outside/secret.md", "/etc/passwd", ".hidden", "a//b"]) {
@@ -244,6 +245,7 @@ describe("artifactRuntimeStore", () => {
       expect(await readArtifactOnRuntime(runtime, linked, "a.md", CAP)).toEqual({
         success: false,
         error: "Artifact not found: a.md",
+        missing: true,
       });
     });
 
@@ -264,6 +266,7 @@ describe("artifactRuntimeStore", () => {
       expect(await readArtifactOnRuntime(swapping, artifactsDir, "secret.md", CAP)).toEqual({
         success: false,
         error: "Artifact not found: secret.md",
+        missing: true,
       });
     });
 
@@ -312,6 +315,7 @@ describe("artifactRuntimeStore", () => {
       expect(await readArtifactOnRuntime(runtime, artifactsDir, "pipe.txt", CAP)).toEqual({
         success: false,
         error: "Artifact not found: pipe.txt",
+        missing: true,
       });
     });
   });

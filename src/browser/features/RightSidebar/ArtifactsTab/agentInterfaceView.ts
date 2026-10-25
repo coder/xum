@@ -249,27 +249,30 @@ export function subscribeStatusListings(
   return () => listingListeners.delete(onListing);
 }
 
-/** Reads the status page; neither callback runs once `signal` aborts. Failures are logged. */
+/**
+ * Reads the status page; neither callback runs once `signal` aborts. Failures are logged.
+ * `missing` tells a folder without the page apart from a read that failed (a reconnect).
+ */
 export function readStatusPage(
   api: APIClient,
   workspaceId: string,
   signal: AbortSignal,
-  callbacks: { onRead: (read: ArtifactReadResult) => void; onFailure: () => void }
+  callbacks: { onRead: (read: ArtifactReadResult) => void; onFailure: (missing: boolean) => void }
 ): void {
-  const failed = (error: string) => {
+  const failed = (error: string, missing: boolean) => {
     console.debug("[Agent interface] status page read failed:", error);
-    callbacks.onFailure();
+    callbacks.onFailure(missing);
   };
   api.artifacts
     .read({ workspaceId, path: AGENT_INTERFACE_STATUS_ARTIFACT }, { signal })
     .then((result) => {
       if (signal.aborted) return;
       if (result.success) callbacks.onRead(result.data);
-      else failed(result.error);
+      else failed(result.error, result.missing === true);
     })
     .catch((error: unknown) => {
       if (isAbortError(error) || signal.aborted) return;
-      failed(getErrorMessage(error));
+      failed(getErrorMessage(error), false);
     });
 }
 
@@ -323,7 +326,8 @@ function useUnshowableStatusRecheck(workspaceId: string, enabled: boolean) {
  * the status page's entry, and tells the listing listeners whether a file-modifying tool call
  * ended since the last listing. A truncated listing that leaves the page out says nothing about
  * it, so the page is read to learn its version; else a crowded folder would hide it for good. A
- * failed read keeps the last entry.
+ * read that finds no page clears the entry (else a deleted page would stay on screen), and a
+ * failed read keeps it.
  */
 function useStatusListings(workspaceId: string, enabled: boolean) {
   const { api } = useAPI();
@@ -350,8 +354,9 @@ function useStatusListings(workspaceId: string, enabled: boolean) {
             recordStatusPageRead(workspaceId, read);
             publishStatusEntry(workspaceId, entryFromRead(read));
           },
-          onFailure: () => {
+          onFailure: (missing) => {
             reading = false;
+            if (missing) publishStatusEntry(workspaceId, null);
           },
         });
       }

@@ -3,7 +3,11 @@ import * as fs from "fs/promises";
 import { constants as fsConstants, type Dirent, type Stats } from "fs";
 import * as path from "path";
 import { assert } from "@/common/utils/assert";
-import type { ArtifactEntry, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import type {
+  ArtifactEntry,
+  ArtifactReadOutcome,
+  ArtifactReadResult,
+} from "@/common/orpc/schemas/artifacts";
 import {
   getArtifactKind,
   isBinaryArtifactKind,
@@ -264,9 +268,7 @@ export function parseArtifactRelativePath(
   return segments;
 }
 
-export type ArtifactReadOutcome =
-  | { success: true; data: ArtifactReadResult }
-  | { success: false; error: string };
+export type { ArtifactReadOutcome };
 
 /**
  * Raw bytes of one artifact, before they are shaped into the wire result. Version snapshots and
@@ -308,7 +310,7 @@ export function toArtifactReadOutcome(
     case "invalid":
       return { success: false, error: outcome.error };
     case "missing":
-      return { success: false, error: `Artifact not found: ${relPath}` };
+      return { success: false, error: `Artifact not found: ${relPath}`, missing: true };
     case "too_large":
       return {
         success: true,

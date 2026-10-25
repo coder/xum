@@ -63,6 +63,17 @@ export const ArtifactReadResultSchema = z.discriminatedUnion("status", [
 ]);
 export type ArtifactReadResult = z.infer<typeof ArtifactReadResultSchema>;
 
+/**
+ * What a read returns. `missing` marks a file the folder does not have as a regular file (a
+ * listing leaves it out too), as against a read that failed, such as one that could not reach
+ * the runtime.
+ */
+export const ArtifactReadOutcomeSchema = z.discriminatedUnion("success", [
+  z.object({ success: z.literal(true), data: ArtifactReadResultSchema }),
+  z.object({ success: z.literal(false), error: z.string(), missing: z.literal(true).optional() }),
+]);
+export type ArtifactReadOutcome = z.infer<typeof ArtifactReadOutcomeSchema>;
+
 export const ArtifactCapabilitiesSchema = z.object({
   /**
    * Whether `agent-browser` is on the runtime's PATH, so the agent can look at its own HTML

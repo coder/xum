@@ -39,6 +39,8 @@ let current = page("<p>AAAA</p>");
 /** What the listing shows: the page, a truncated listing without it, or a complete one without it. */
 let listed: "page" | "truncated" | "absent" = "page";
 let failingReads = 0;
+/** The page is gone: reads find no file. */
+let deleted = false;
 let reads = 0;
 let lists = 0;
 
@@ -64,6 +66,13 @@ function Wrapper(props: { children: ReactNode }) {
         if (failingReads > 0) {
           failingReads -= 1;
           return Promise.resolve({ success: false as const, error: "runtime unreachable" });
+        }
+        if (deleted) {
+          return Promise.resolve({
+            success: false as const,
+            error: `Artifact not found: ${AGENT_INTERFACE_STATUS_ARTIFACT}`,
+            missing: true as const,
+          });
         }
         return Promise.resolve({ success: true as const, data: current });
       },
@@ -179,6 +188,7 @@ describe("Agent interface status view", () => {
     current = page("<p>AAAA</p>");
     listed = "page";
     failingReads = 0;
+    deleted = false;
     reads = 0;
     lists = 0;
   });
@@ -315,13 +325,20 @@ describe("Agent interface status view", () => {
     }
   });
 
-  test("a page that truncated listings leave out still shows, and so do its later versions", async () => {
+  test("a page that truncated listings leave out still shows, follows its later versions, and goes once deleted", async () => {
     // bun-types lacks advanceTimersByTime; bun implements it.
     const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
     const flush = () =>
       act(async () => {
         for (let i = 0; i < 20; i++) await Promise.resolve();
       });
+    const nextPoll = async () => {
+      await act(async () => {
+        fakeTimers.advanceTimersByTime(3_000);
+        await Promise.resolve();
+      });
+      await flush();
+    };
     // A crowded folder: past the listing caps, the page is in no listing at all.
     listed = "truncated";
     jest.useFakeTimers();
@@ -332,31 +349,24 @@ describe("Agent interface status view", () => {
 
       // A rewrite no tool call reported, found by the next poll alone.
       current = { ...page("<p>BBBBBB</p>"), modifiedMs: 2_000 };
-      await act(async () => {
-        fakeTimers.advanceTimersByTime(3_000);
-        await Promise.resolve();
-      });
-      await flush();
+      await nextPoll();
       expect(shownPage(view)).toContain("<p>BBBBBB</p>");
 
       // A read that fails (a reconnect) says nothing about the page: it stays ...
       failingReads = 1;
       const readsBefore = reads;
-      await act(async () => {
-        fakeTimers.advanceTimersByTime(3_000);
-        await Promise.resolve();
-      });
-      await flush();
+      await nextPoll();
       expect(reads).toBe(readsBefore + 1);
       expect(shownPage(view)).toContain("<p>BBBBBB</p>");
       // ... and the next poll reads it again.
       current = { ...page("<p>CCCCCCCC</p>"), modifiedMs: 3_000 };
-      await act(async () => {
-        fakeTimers.advanceTimersByTime(3_000);
-        await Promise.resolve();
-      });
-      await flush();
+      await nextPoll();
       expect(shownPage(view)).toContain("<p>CCCCCCCC</p>");
+
+      // A read that finds no page does say something: the pane goes back to the chat.
+      deleted = true;
+      await nextPoll();
+      expect(view.queryByTestId("agent-interface-status-view") == null).toBe(true);
     } finally {
       jest.useRealTimers();
     }
