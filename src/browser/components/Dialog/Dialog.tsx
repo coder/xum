@@ -67,6 +67,10 @@ const DialogOverlay = React.forwardRef<
 DialogOverlay.displayName = DialogPrimitive.Overlay.displayName;
 
 const NO_ANIMATION: React.CSSProperties = { animation: "none" };
+// A caller's width class replaces the safe-area width in `cn` while `left` stays at the safe area's
+// center, and those callers pass `maxWidth`: capping it keeps such a dialog between the safe areas.
+const SAFE_AREA_WIDTH =
+  "calc(100% - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px))";
 
 const DialogContent = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Content>,
@@ -159,7 +163,7 @@ const DialogContent = React.forwardRef<
             className
           )}
           style={{
-            ...(maxWidth && { maxWidth }),
+            ...(maxWidth && { maxWidth: `min(${maxWidth}, ${SAFE_AREA_WIDTH})` }),
             ...(maxHeight && { maxHeight }),
             ...(skipEntryAnimation && NO_ANIMATION),
             ...style,
