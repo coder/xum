@@ -228,6 +228,116 @@ async function assertClearsRightInset(page: StoryPage, target: { sheet: string }
   }
 }
 
+const MENU_INSET_STORY = "components-projectpage--create-workspace-multiple-projects";
+// The iPhone Duo cover display draws its 21 px top inset as an opaque status band. A short
+// viewport (as when the software keyboard is up) leaves the project switcher too little room
+// below, so its list opens upward and Radix fits it to the top edge.
+const MENU_INSETS = { top: 21, right: SIDE_INSET_PX, bottom: 0, left: 0 };
+// A taller top band that appears while the list is open.
+const RAISED_MENU_INSETS = { ...MENU_INSETS, top: 40 };
+const MENU_INSET_VIEWPORT = { width: SIDE_INSET_VIEWPORT.width, height: 220 };
+
+/** Waits until a Radix menu stops moving, then returns its top edge and side. */
+async function settledMenuBox(menu: ReturnType<StoryPage["getByRole"]>) {
+  return menu.evaluate(async (element) => {
+    const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+    let last = "";
+    for (let i = 0; i < 60; i++) {
+      await frame();
+      const r = element.getBoundingClientRect();
+      const next = `${r.top},${r.bottom}`;
+      if (next === last && r.height > 0) break;
+      last = next;
+    }
+    return { top: element.getBoundingClientRect().top, side: element.getAttribute("data-side") };
+  });
+}
+
+/**
+ * Counts the browser's "ResizeObserver loop" errors until the returned function runs. A menu that
+ * re-renders inside the safe-area probes' observer callback resizes during the observer loop.
+ */
+async function countResizeObserverLoopErrors(page: StoryPage): Promise<() => Promise<number>> {
+  const stop = await page.evaluateHandle(() => {
+    let count = 0;
+    const onError = (event: ErrorEvent) => {
+      if (event.message.includes("ResizeObserver loop")) count += 1;
+    };
+    window.addEventListener("error", onError);
+    return () => {
+      window.removeEventListener("error", onError);
+      return count;
+    };
+  });
+  return async () => {
+    const count = await stop.evaluate((stopCounting) => stopCounting());
+    await stop.dispose();
+    return count;
+  };
+}
+
+/**
+ * Radix fits a menu to the viewport edge, but menus portal out of the app shell that pads the
+ * safe areas, so a list fitted to the top edge drew its first rows under the top band.
+ */
+async function assertMenuClearsSafeArea(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  const loopErrors = await countResizeObserverLoopErrors(page);
+  // The probes' ResizeObserver reports new insets in the next frame; menus hear of them in the one
+  // after.
+  const setInsets = async (insets: typeof MENU_INSETS) => {
+    await client.send("Emulation.setSafeAreaInsetsOverride", { insets });
+    await page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    );
+  };
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await page.setViewportSize(MENU_INSET_VIEWPORT);
+    await page.waitForFunction(
+      (size) =>
+        matchMedia("(pointer: coarse)").matches &&
+        innerWidth === size.width &&
+        innerHeight === size.height,
+      MENU_INSET_VIEWPORT,
+      { timeout: 5000 }
+    );
+    // The insets come after the resize, with no resize of their own, as they can when a folding
+    // phone switches displays.
+    await setInsets(MENU_INSETS);
+    // A touch tap opens Radix Select on click; a hidden copy of the trigger can exist.
+    await page.locator("[data-testid=project-selector]:visible").evaluate((el) => {
+      (el as HTMLElement).click();
+    });
+    const listbox = page.getByRole("listbox");
+    await listbox.waitFor({ timeout: 5000 });
+    // Radix positions the list a frame after it mounts.
+    const box = await settledMenuBox(listbox);
+    // Below the heading the list has room to start below any inset, so only the upward case checks.
+    assert.equal(box.side, "top", "The project list must open above its trigger on a short phone");
+    assert(
+      box.top >= MENU_INSETS.top - 0.5,
+      `The project list starts at ${Math.round(box.top)}px, under the ${MENU_INSETS.top}px top inset`
+    );
+    await setInsets(RAISED_MENU_INSETS);
+    const raised = await settledMenuBox(listbox);
+    assert(
+      raised.top >= RAISED_MENU_INSETS.top - 0.5,
+      `The open list stays at ${Math.round(raised.top)}px, under a ${RAISED_MENU_INSETS.top}px top inset`
+    );
+    assert.equal(await loopErrors(), 0, "Menus must not resize inside a ResizeObserver callback");
+  } finally {
+    await page.keyboard.press("Escape");
+    await client.send("Emulation.setSafeAreaInsetsOverride", {
+      insets: { top: 0, right: 0, bottom: 0, left: 0 },
+    });
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
     // exposeFunction throws on a second registration, so register once per Playwright page.
@@ -241,6 +351,12 @@ const config: TestRunnerConfig = {
     if (insetTarget) {
       if (page.context().browser()?.browserType().name() === "chromium") {
         await assertClearsRightInset(page, insetTarget);
+      }
+      return;
+    }
+    if (context.id === MENU_INSET_STORY) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertMenuClearsSafeArea(page);
       }
       return;
     }
