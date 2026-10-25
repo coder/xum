@@ -129,6 +129,8 @@ function runBridgeScript(options: { querySelectorAll?: (selector: string) => unk
       pageHandler?: () => void;
       /** Runs unless the key was prevented, like Escape's close request. */
       defaultAction?: () => void;
+      /** Leaves the press's timers queued, so the next press arrives before they run. */
+      holdTimers?: boolean;
     } = {}
   ) => {
     const event = {
@@ -156,7 +158,7 @@ function runBridgeScript(options: { querySelectorAll?: (selector: string) => unk
     dispatch(false);
     event.defaultPrevented = extra.defaultPrevented ?? false;
     if (!event.defaultPrevented) extra.defaultAction?.();
-    for (const timer of timers.splice(0)) timer();
+    if (extra.holdTimers !== true) for (const timer of timers.splice(0)) timer();
   };
   return { keydown, posted, xum: fakeWindow.xum, prevented: () => prevented };
 }
@@ -347,8 +349,9 @@ describe("bridge script interrupt keys", () => {
     const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
     const vimKey = KEYBINDS.INTERRUPT_STREAM_VIM.key;
     for (const kind of ["dialog", "popover"] as const) {
+      // Escape closes the top one; the one it was opened from stays open.
       const layer = pageLayer(kind);
-      const bridge = runBridgeScript({ querySelectorAll: findLayers(layer) });
+      const bridge = runBridgeScript({ querySelectorAll: findLayers(pageLayer(kind), layer) });
       // The browser's close request closes it ...
       bridge.keydown(escape, div, false, {
         defaultAction: () => {
@@ -390,6 +393,23 @@ describe("bridge script interrupt keys", () => {
         { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
       ]);
     }
+  });
+
+  test("a second press before the first one's check keeps each press's own layers", () => {
+    const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
+    const dialog = pageLayer("dialog");
+    const bridge = runBridgeScript({ querySelectorAll: findLayers(dialog) });
+    // The first Escape closes the dialog; the second, with nothing open, interrupts.
+    bridge.keydown(escape, div, false, {
+      holdTimers: true,
+      defaultAction: () => {
+        dialog.open = false;
+      },
+    });
+    bridge.keydown(escape, div);
+    expect(interrupts(bridge.posted)).toEqual([
+      { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
+    ]);
   });
 
   test("Escape that leaves the page's dialogs and popovers open interrupts", () => {
