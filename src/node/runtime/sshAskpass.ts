@@ -52,6 +52,23 @@ async function writeResponseFile(responseFile: string, text: string): Promise<vo
   await fs.promises.rename(tempFile, responseFile);
 }
 
+/**
+ * File names a watcher event can point at. The script renames each prompt into
+ * place. Linux reports the rename under the final name. If a platform reports
+ * only the temp name (or no name), rescan the directory so the prompt is not
+ * missed. Returns [] when the directory is gone.
+ */
+async function promptCandidates(dir: string, filename: string | null): Promise<string[]> {
+  if (typeof filename === "string" && extractRequestId(filename) !== undefined) {
+    return [filename];
+  }
+  try {
+    return await fs.promises.readdir(dir);
+  } catch {
+    return [];
+  }
+}
+
 async function ensureAskpassScript(): Promise<string> {
   if (askpassPath) {
     try {
@@ -147,19 +164,7 @@ export async function createAskpassSession(
       if (closed) return;
 
       void (async () => {
-        let candidateFilenames: string[];
-        // The script renames each prompt into place. Linux reports the rename
-        // under the final name. If a platform reports only the temp name (or no
-        // name), rescan the directory so the prompt is not missed.
-        if (typeof filename === "string" && extractRequestId(filename) !== undefined) {
-          candidateFilenames = [filename];
-        } else {
-          try {
-            candidateFilenames = await fs.promises.readdir(dir);
-          } catch {
-            return;
-          }
-        }
+        const candidateFilenames = await promptCandidates(dir, filename);
 
         for (const candidate of candidateFilenames) {
           const requestId = extractRequestId(candidate);
