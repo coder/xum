@@ -6,9 +6,9 @@
 import type { ModelMessage } from "ai";
 import type { Logger } from "@/node/services/log";
 import type { PartialJournal } from "@/node/services/turnEngine/PartialJournal";
-import type {
+import {
   ProviderRequest,
-  StreamRequestConfig,
+  type StreamRequestConfig,
 } from "@/node/services/turnEngine/ProviderRequest";
 import {
   extractErrorCode,
@@ -285,7 +285,7 @@ export class StreamRetries {
     // Step-boundary retries restart the SDK stream, so totalUsage only reflects
     // the retried step. Track this to prefer cumulativeUsage at stream end.
     if (hasParts) {
-      streamInfo.didRetryPreviousResponseIdAtStep = true;
+      ProviderRequest.markRetry(streamInfo, "previousResponseIdAtStep");
     }
 
     workspaceLog.info("Retrying stream without invalid previousResponseId", {
@@ -303,15 +303,15 @@ export class StreamRetries {
       workspaceLog,
     });
 
-    streamInfo.request = {
-      ...streamInfo.request,
-      ...(stepMessages ? { messages: stepMessages } : {}),
-      providerOptions,
-    };
-    streamInfo.streamResult = this.deps.createStreamResult(
-      streamInfo.request,
-      streamInfo.abortController,
-      streamInfo.stepTracker
+    ProviderRequest.beginAttempt(
+      streamInfo,
+      {
+        ...streamInfo.request,
+        ...(stepMessages ? { messages: stepMessages } : {}),
+        providerOptions,
+      },
+      (request) =>
+        this.deps.createStreamResult(request, streamInfo.abortController, streamInfo.stepTracker)
     );
   }
 
@@ -330,7 +330,7 @@ export class StreamRetries {
     // Step-boundary retries restart the SDK stream, so totalUsage only reflects
     // the retried step. Track this to prefer cumulativeUsage at stream end.
     if (hasParts) {
-      streamInfo.didRetryReasoningReplayAtStep = true;
+      ProviderRequest.markRetry(streamInfo, "reasoningReplayAtStep");
     }
 
     workspaceLog.info("Retrying stream without rejected reasoning replay", {
@@ -363,11 +363,8 @@ export class StreamRetries {
       await this.deps.flushPartialWrite(workspaceId, streamInfo);
     }
 
-    streamInfo.request = { ...streamInfo.request, messages };
-    streamInfo.streamResult = this.deps.createStreamResult(
-      streamInfo.request,
-      streamInfo.abortController,
-      streamInfo.stepTracker
+    ProviderRequest.beginAttempt(streamInfo, { ...streamInfo.request, messages }, (request) =>
+      this.deps.createStreamResult(request, streamInfo.abortController, streamInfo.stepTracker)
     );
   }
 }

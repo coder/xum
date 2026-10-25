@@ -44,6 +44,7 @@ import type {
   StreamTextOnChunk,
   StreamRequestConfig,
 } from "@/node/services/turnEngine/types";
+import type { AttemptRequest, WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import type {
   ActiveTurnThinkingOverride,
   RebuildFirstStepForThinkingLevel,
@@ -129,6 +130,60 @@ export class ProviderRequest {
   private lostResponseIds = new Set<string>();
 
   constructor(private readonly deps: ProviderRequestDeps) {}
+
+  /**
+   * Starts the turn's next provider attempt: sets the request it sends, then the
+   * stream result built from that request.
+   */
+  static beginAttempt(
+    streamInfo: WorkspaceStreamInfo & AttemptRequest,
+    request: StreamRequestConfig,
+    createStreamResult: (request: StreamRequestConfig) => AttemptRequest["streamResult"]
+  ): void {
+    streamInfo.request = request;
+    streamInfo.streamResult = createStreamResult(request);
+  }
+
+  /** Marks a retry after which stream-end prefers the turn's cumulative usage. */
+  static markRetry(
+    streamInfo: WorkspaceStreamInfo & AttemptRequest,
+    retry: "previousResponseIdAtStep" | "reasoningReplayAtStep" | "afterEmptyOutput"
+  ): void {
+    switch (retry) {
+      case "previousResponseIdAtStep":
+        streamInfo.didRetryPreviousResponseIdAtStep = true;
+        return;
+      case "reasoningReplayAtStep":
+        streamInfo.didRetryReasoningReplayAtStep = true;
+        return;
+      case "afterEmptyOutput":
+        streamInfo.didRetryAfterEmptyOutput = true;
+        return;
+    }
+  }
+
+  /**
+   * Moves the attempt onto a fallback model. The thinking level changes only when
+   * the fallback's preparation chose one.
+   */
+  static adoptModel(
+    streamInfo: WorkspaceStreamInfo & AttemptRequest,
+    model: { modelString: string; metadataModel: string; thinkingLevel: string | undefined }
+  ): void {
+    streamInfo.model = model.modelString;
+    streamInfo.metadataModel = model.metadataModel;
+    if (model.thinkingLevel !== undefined) {
+      streamInfo.thinkingLevel = model.thinkingLevel;
+    }
+  }
+
+  /** Records the thinking level a mid-turn override applied. */
+  static setThinkingLevel(
+    streamInfo: WorkspaceStreamInfo & AttemptRequest,
+    thinkingLevel: string
+  ): void {
+    streamInfo.thinkingLevel = thinkingLevel;
+  }
 
   /**
    * Record a previousResponseId as lost if the error indicates OpenAI no longer has it.
