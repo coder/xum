@@ -13,7 +13,12 @@ import {
   testStartOptions,
   appendPartialAssistantForTests,
   createStreamResultForTests,
+  runTurnForTests,
+  scriptedStreamText,
+  STOP_FINISH,
+  type ScriptedAttempt,
 } from "./streamManager.suite.testHarness";
+import type { TurnEngineEvent } from "./streamManager";
 
 installStreamManagerTestHistory();
 
@@ -594,5 +599,72 @@ describe("StreamManager - tool execution start timing", () => {
     expect(events[0].toolCallId).toBe("tool-call-race");
     expect(liveParts(harness, workspaceId)[0].executionStartedAt).toBe(events[0].timestamp);
     await live.finish();
+  });
+});
+
+describe("StreamManager - step effects", () => {
+  function recordingManager(attempt: ScriptedAttempt, countTokens = () => Promise.resolve(0)) {
+    const events: TurnEngineEvent[] = [];
+    const streamManager = createStreamManagerForTests(historyService, {
+      eventSink: (event) => {
+        events.push(event);
+      },
+      tokenTracker: { setModel: () => Promise.resolve(), countTokens },
+      streamText: scriptedStreamText([attempt]),
+    });
+    return { events, streamManager };
+  }
+
+  test("a reasoning block ends with a reasoning-end event", async () => {
+    const workspaceId = "step-effects-reasoning-end";
+    const { events, streamManager } = recordingManager({
+      chunks: [
+        { type: "reasoning-start", id: "r1" },
+        { type: "reasoning-delta", id: "r1", text: "thinking" },
+        { type: "reasoning-end", id: "r1" },
+        { type: "text-delta", text: "answer" },
+        STOP_FINISH,
+      ],
+    });
+    const { completion } = await runTurnForTests(streamManager, { workspaceId });
+    expect(completion.status).toBe("completed");
+    expect(eventsOfType(events, "reasoning-end")).toHaveLength(1);
+  });
+
+  test("an ask_user_question call is on disk before the stream continues", async () => {
+    // The tool blocks on the user, so a restart during the wait must find the call.
+    const workspaceId = "step-effects-ask-user-flush";
+    let partialAfterCall: Awaited<ReturnType<typeof historyService.readPartial>> | undefined;
+    const { streamManager } = recordingManager({
+      chunks: [
+        dynamicToolCall("ask-1", "ask_user_question", { question: "Which?" }),
+        async () => {
+          partialAfterCall = await historyService.readPartial(workspaceId);
+        },
+        STOP_FINISH,
+      ],
+    });
+    await runTurnForTests(streamManager, { workspaceId });
+    expect(partialAfterCall?.parts).toMatchObject([
+      { type: "dynamic-tool", toolCallId: "ask-1", toolName: "ask_user_question" },
+    ]);
+  });
+
+  test("a tool-call delta part emits tool-call-delta with its token count", async () => {
+    const workspaceId = "step-effects-tool-call-delta";
+    const { events, streamManager } = recordingManager(
+      {
+        chunks: [
+          { type: "tool-call-delta", toolCallId: "t1", toolName: "bash", argsTextDelta: '{"a":1}' },
+          { type: "text-delta", text: "done" },
+          STOP_FINISH,
+        ],
+      },
+      () => Promise.resolve(7)
+    );
+    await runTurnForTests(streamManager, { workspaceId });
+    expect(eventsOfType(events, "tool-call-delta")).toMatchObject([
+      { toolCallId: "t1", toolName: "bash", delta: '{"a":1}', tokens: 7 },
+    ]);
   });
 });
