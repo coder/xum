@@ -8,6 +8,7 @@ import { formatSubagentReportEnvelope } from "@/common/utils/subagentReportEnvel
 import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import {
   BACKGROUND_WORK_WAKE_OPENINGS,
+  STATUS_PAGE_TURN_END_NUDGE,
   TODO_TURN_END_NUDGE,
 } from "@/common/utils/machineTurnPrompts";
 import { buildWorkflowResultContextMessage } from "@/common/utils/workflowRunMessages";
@@ -753,6 +754,18 @@ describe("MessageRenderer TODO nudge rows", () => {
     const joined = renderNudge(`Run the failing tests again.\n\n${TODO_TURN_END_NUDGE}`, true);
     expect(joined.container.querySelector("[data-todo-turn-end-nudge]")).toBeNull();
     expect(joined.getByText(/Run the failing tests again/)).toBeDefined();
+  });
+
+  test("collapses the status page nudge, alone or after the TODO nudge, but not a typed copy", () => {
+    const alone = renderNudge(STATUS_PAGE_TURN_END_NUDGE, true);
+    expect(alone.container.querySelector("[data-status-page-turn-end-nudge]")).not.toBeNull();
+    cleanup();
+    const both = renderNudge(`${TODO_TURN_END_NUDGE}\n\n${STATUS_PAGE_TURN_END_NUDGE}`, true);
+    expect(both.container.querySelector("[data-status-page-turn-end-nudge]")).not.toBeNull();
+    expect(both.queryByText(/status\.html/)).toBeNull();
+    cleanup();
+    const typed = renderNudge(STATUS_PAGE_TURN_END_NUDGE, false);
+    expect(typed.container.querySelector("[data-status-page-turn-end-nudge]")).toBeNull();
   });
 });
 

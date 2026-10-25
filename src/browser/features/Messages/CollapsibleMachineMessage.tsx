@@ -12,6 +12,7 @@ interface CollapsibleMachineMessageProps {
     | "bash-monitor-wake"
     | "agent-peer-message-trigger"
     | "context-budget-warning"
+    | "status-page-turn-end-nudge"
     | "todo-turn-end-nudge";
   className?: string;
 }
