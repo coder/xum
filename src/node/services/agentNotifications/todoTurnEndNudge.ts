@@ -48,9 +48,9 @@ export async function needsTodoTurnEndNudge(input: {
  * about 90% of nudges. Their open items almost always wait on purpose, so the nudged turn only
  * repeated the wait. Each wake counts as its own user turn, so a coordinator got one nudge per wake.
  *
- * A compaction request and the follow-up it dispatches continue the turn that asked for them,
- * so they keep `previous`: a user message compacted on send stays a user turn, and a heartbeat
- * that compacts stays a machine turn.
+ * An auto-compaction request (on-send or mid-stream) and a compaction follow-up continue the
+ * turn that asked for them, so they keep `previous`: a user message compacted on send stays a user
+ * turn. An idle or heartbeat compaction is a fresh synthetic send, so it starts a machine turn.
  */
 export function streamStartedByUserMessage(input: {
   previous: boolean;

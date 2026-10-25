@@ -6588,7 +6588,7 @@ export class AgentSession {
         return Ok(undefined);
       }
 
-      this.noteStreamStartOrigin(internal, isCompactionRequest);
+      this.noteStreamStartOrigin(internal, typedMuxMetadata);
       // Raw terminals reserve COMPLETING; delivered completion runs terminal policy.
       const streamResult = await this.streamWithHistory(
         preparedTurn,
@@ -10932,15 +10932,21 @@ export class AgentSession {
     return nudges;
   }
 
-  /** Records whether the sent message whose stream starts now began a user turn. */
+  /**
+   * Records whether the sent message whose stream starts now began a user turn. Only an
+   * auto-compaction request (on-send or mid-stream) continues the current turn: an idle or
+   * heartbeat compaction (`idle-compaction`) is a fresh machine turn.
+   */
   private noteStreamStartOrigin(
     internal: SendMessageInternalOptions | undefined,
-    isCompactionRequest: boolean
+    muxMetadata: MuxMessageMetadata | undefined
   ): void {
+    const autoCompaction =
+      muxMetadata?.type === "compaction-request" && muxMetadata.source === "auto-compaction";
     this.turnStartedByUserMessage = streamStartedByUserMessage({
       previous: this.turnStartedByUserMessage,
       synthetic: internal?.synthetic === true,
-      continuesCompaction: isCompactionRequest || internal?.compactionFollowUpSummary != null,
+      continuesCompaction: autoCompaction || internal?.compactionFollowUpSummary != null,
     });
   }
 

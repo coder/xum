@@ -880,6 +880,62 @@ describe("todo turn-end nudge", () => {
     expect((await userTexts(h)).slice(1)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
   });
 
+  // After a user turn, a heartbeat's compaction (idle-compaction) starts a machine turn, while an
+  // auto-compaction (on-send or mid-stream) continues the user's turn into its follow-up.
+  test.each([
+    { source: "idle-compaction", nudged: false },
+    { source: "auto-compaction", nudged: true },
+  ] as const)(
+    "after a user turn, a compaction request with source $source sets its follow-up's origin",
+    async (row) => {
+      // Only the follow-up (turn 3) writes todos.
+      const { h, streams } = await setup({
+        parts: (turn) => (turn === 3 ? todoWriteThenReply() : [{ type: "text", text: "ok" }]),
+      });
+      await writeTodos(h, openTodos);
+      await h.session.sendMessage("first", options);
+      await settle(h);
+      // The compaction stream runs; its summary is seeded below instead of written by the handler.
+      const session = h.session as unknown as {
+        contextController: {
+          compaction: { handleCompletion(...args: unknown[]): Promise<boolean> };
+        };
+      };
+      spyOn(session.contextController.compaction, "handleCompletion").mockResolvedValue(false);
+      await h.session.sendMessage(
+        "Please compact",
+        {
+          ...options,
+          agentId: "compact",
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: {},
+            source: row.source,
+          },
+        },
+        { acceptanceOrigin: "automatic", synthetic: true }
+      );
+      await settle(h);
+      const summary = createMuxMessage("summary", "assistant", "compacted summary", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: { text: "check the workspace", model, agentId: "exec" },
+        },
+      });
+      assert((await h.historyService.appendToHistory(workspaceId, summary)).success);
+
+      expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+      await settle(h);
+
+      expect(streams()).toBe(row.nudged ? 4 : 3);
+      expect((await userTexts(h)).includes(TODO_TURN_END_NUDGE)).toBe(row.nudged);
+    }
+  );
+
   // A resume starts a stream without a new message: an automatic one (the prompt-free resume after
   // a sub-agent report) is a machine wake, and a manual one continues the user's turn.
   test.each([
