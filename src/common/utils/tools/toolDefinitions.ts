@@ -3411,6 +3411,11 @@ export function getToolSchemas(): Record<string, ToolSchema> {
   );
 }
 
+/** Opt-in tool groups: absent flags mean off. */
+function whenEnabled(enabled: boolean | undefined, toolNames: string[]): string[] {
+  return enabled === true ? toolNames : [];
+}
+
 /**
  * Get which tools are available for a given model
  * @param modelString The model string (e.g., "anthropic:claude-opus-4-1")
@@ -3454,15 +3459,7 @@ export function getAvailableTools(
 ): string[] {
   const [provider] = modelString.split(":");
   const enableAgentReport = options.enableAgentReport ?? true;
-  const enableFamilyMessaging = options.enableFamilyMessaging ?? false;
   const enableAnalyticsQuery = options.enableAnalyticsQuery ?? true;
-  const enableDynamicWorkflows = options.enableDynamicWorkflows ?? false;
-  const enableMemory = options.enableMemory ?? false;
-  const enableTimelineEvent = options.enableTimelineEvent ?? false;
-  const enableArtifacts = options.enableArtifacts ?? false;
-  const enableStatusUpdate = options.enableStatusUpdate ?? false;
-  const enableToolSearch = options.enableToolSearch ?? false;
-  const enableMcpPromptGet = options.enableMcpPromptGet ?? false;
   const enableReviewPane = options.enableReviewPane ?? true;
   const enableGitPatches = options.enableGitPatches ?? true;
 
@@ -3495,13 +3492,13 @@ export function getAvailableTools(
     "file_edit_replace_string",
     // "file_edit_replace_lines", // DISABLED: causes models to break repo state
     "file_edit_insert",
-    ...(options.enableSessionHistory ? ["session_history", "new_context"] : []),
-    ...(enableMemory ? ["memory"] : []),
-    ...(enableTimelineEvent ? ["timeline_event"] : []),
-    ...(enableArtifacts ? ["artifact_list", "artifact", "artifact_read"] : []),
-    ...(enableStatusUpdate ? ["status_update"] : []),
-    ...(enableToolSearch ? ["tool_catalog_search"] : []),
-    ...(enableMcpPromptGet ? ["mcp_prompt_get"] : []),
+    ...whenEnabled(options.enableSessionHistory, ["session_history", "new_context"]),
+    ...whenEnabled(options.enableMemory, ["memory"]),
+    ...whenEnabled(options.enableTimelineEvent, ["timeline_event"]),
+    ...whenEnabled(options.enableArtifacts, ["artifact_list", "artifact", "artifact_read"]),
+    ...whenEnabled(options.enableStatusUpdate, ["status_update"]),
+    ...whenEnabled(options.enableToolSearch, ["tool_catalog_search"]),
+    ...whenEnabled(options.enableMcpPromptGet, ["mcp_prompt_get"]),
     "ask_user_question",
     "propose_plan",
     "bash",
@@ -3514,9 +3511,9 @@ export function getAvailableTools(
     "task_remove",
     "task_workspace_lifecycle",
     "task_list",
-    ...(enableDynamicWorkflows ? ["workflow_run", "workflow_resume"] : []),
+    ...whenEnabled(options.enableDynamicWorkflows, ["workflow_run", "workflow_resume"]),
     ...(enableAgentReport ? ["agent_report"] : []),
-    ...(enableFamilyMessaging ? ["task_message_parent", "task_message_sibling"] : []),
+    ...whenEnabled(options.enableFamilyMessaging, ["task_message_parent", "task_message_sibling"]),
     "set_goal",
     "get_goal",
     "complete_goal",

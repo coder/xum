@@ -138,3 +138,17 @@ async function seedStatusPage(
     log.debug("Seeding the agent interface status page failed", { error });
   }
 }
+
+/**
+ * Status page agent mode (artifacts-status-page-agent) for a turn: the Agent interface view is
+ * active (which already excludes side chats, compactions and turns without a scratch dir), the
+ * sub-experiment is on, and the host has the status page agent queue. In this mode the main agent
+ * gets status_update and the prompt tells it to send updates instead of editing the page.
+ */
+export function isStatusPageAgentMode(args: {
+  agentInterfaceView: boolean;
+  statusPageAgentEnabled: boolean;
+  queueAvailable: boolean;
+}): boolean {
+  return args.agentInterfaceView && args.statusPageAgentEnabled && args.queueAvailable;
+}

@@ -13,6 +13,7 @@
  * error, which the next enqueue() returns once so the main agent can take over the page.
  */
 import type { LanguageModel } from "ai";
+import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { assert } from "@/common/utils/assert";
 import {
   AGENT_INTERFACE_STATUS_ARTIFACT,
@@ -29,6 +30,7 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import type { Config } from "@/node/config";
 import { AGENT_INTERFACE_STATUS_TEMPLATE } from "./agentInterfaceStatusPage";
 import {
+  type AvailableArtifactsLocation,
   readArtifactBytesAtLocation,
   resolveArtifactsLocation,
   writeArtifactAtLocation,
@@ -91,8 +93,6 @@ interface PendingBatch {
   fallbackModel: string;
 }
 
-type PassOutcome = { kind: "skipped" } | { kind: "done" } | { kind: "failed"; error: string };
-
 function isGone(metadata: StatusPageWorkspaceMetadata | null): boolean {
   // Archived workspaces stay listed; a write must not restart a stopped dedicated workspace.
   return metadata == null || isWorkspaceArchived(metadata.archivedAt, metadata.unarchivedAt);
@@ -154,19 +154,16 @@ export class StatusPageAgentService {
       const batch = this.pending.get(workspaceId);
       if (batch === undefined) return;
       this.pending.delete(workspaceId);
-      let outcome: PassOutcome;
       try {
-        outcome = await this.runPass(workspaceId, batch);
+        await this.runPass(workspaceId, batch);
       } catch (error) {
-        outcome = { kind: "failed", error: getErrorMessage(error) };
-      }
-      if (outcome.kind === "failed") {
+        const message = getErrorMessage(error);
         log.warn("Status page agent pass failed", {
           workspaceId,
           updates: batch.updates.length,
-          error: outcome.error,
+          error: message,
         });
-        this.lastError.set(workspaceId, outcome.error);
+        this.lastError.set(workspaceId, message);
       }
     }
   }
@@ -186,9 +183,10 @@ export class StatusPageAgentService {
     return isGone(metadata) ? null : metadata;
   }
 
-  private async runPass(workspaceId: string, batch: PendingBatch): Promise<PassOutcome> {
+  /** One pass over a batch. Throws on failure; drain() keeps the error for the next enqueue. */
+  private async runPass(workspaceId: string, batch: PendingBatch): Promise<void> {
     const metadata = await this.writableMetadata(workspaceId);
-    if (metadata == null) return { kind: "skipped" };
+    if (metadata == null) return;
 
     const abortSignal = AbortSignal.timeout(STATUS_PAGE_AGENT_RUN_TIMEOUT_MS);
     const location = await resolveArtifactsLocation(
@@ -198,97 +196,98 @@ export class StatusPageAgentService {
       { abortSignal }
     );
     if (location.kind === "unavailable") {
-      return { kind: "failed", error: `artifacts are unavailable: ${location.reason}` };
+      throw new Error(`artifacts are unavailable: ${location.reason}`);
     }
-
-    const read = await readArtifactBytesAtLocation(
-      location,
-      AGENT_INTERFACE_STATUS_ARTIFACT,
-      STATUS_PAGE_AGENT_MAX_PAGE_BYTES,
-      abortSignal
-    );
-    let currentPage: string;
-    switch (read.status) {
-      case "ok":
-        currentPage = read.bytes.toString("utf8");
-        break;
-      case "missing":
-        currentPage = AGENT_INTERFACE_STATUS_TEMPLATE;
-        break;
-      case "too_large":
-        return {
-          kind: "failed",
-          error: `${AGENT_INTERFACE_STATUS_ARTIFACT} is ${read.size} bytes, over the ${STATUS_PAGE_AGENT_MAX_PAGE_BYTES}-byte limit`,
-        };
-      case "invalid":
-        return {
-          kind: "failed",
-          error: `could not read ${AGENT_INTERFACE_STATUS_ARTIFACT}: ${read.error}`,
-        };
-    }
-
-    const agentBody = await resolveHeadlessAgentBody(
-      this.deps.config.rootDir,
-      STATUS_PAGE_AGENT_ID
-    );
-    if (agentBody === null)
-      return { kind: "failed", error: "status_page agent definition is missing" };
-    const modelString = resolveHeadlessAgentSettings(
-      this.deps.config,
-      workspaceId,
-      STATUS_PAGE_AGENT_ID,
-      batch.fallbackModel
-    ).model;
-    const modelResult = await this.deps.modelFactory.createModelWithPinnedMetadata(modelString, {
-      agentInitiated: true,
-      workspaceId,
-    });
-    if (!modelResult.success) {
-      return {
-        kind: "failed",
-        error: `could not create model ${modelString}: ${modelResult.error.type}`,
-      };
-    }
+    const currentPage = await readCurrentPage(location, abortSignal);
+    const agent = await this.resolveAgent(workspaceId, batch.fallbackModel);
 
     const result = await runStatusPageAgent({
-      model: modelResult.data.model,
-      pricingModel: modelResult.data.metadataModel,
-      agentBody,
+      model: agent.model,
+      pricingModel: agent.metadataModel,
+      agentBody: agent.body,
       currentPage,
       updates: batch.updates,
       abortSignal,
-      recordUsage: async (usage, providerMetadata) => {
-        const recorded = await this.deps.sessionUsageService?.recordHeadlessUsage(
-          workspaceId,
-          modelString,
-          usage,
-          providerMetadata,
-          {
-            analyticsSource: STATUS_PAGE_AGENT_ANALYTICS_SOURCE,
-            // Creation-time identity: a catalog refresh mid-run must not re-attribute this spend.
-            metadataModel: modelResult.data.metadataModel,
-          }
-        );
-        if (recorded) this.deps.requestAnalyticsIngest?.(workspaceId);
-      },
+      recordUsage: this.usageRecorder(workspaceId, agent.modelString, agent.metadataModel),
     });
     if (result.streamError !== undefined) {
-      return { kind: "failed", error: `${modelString}: ${result.streamError}` };
+      throw new Error(`${agent.modelString}: ${result.streamError}`);
     }
-    if (result.page === null) return { kind: "done" };
+    if (result.page === null) return;
     // The run took a while: the user may have switched the experiments off or archived or
     // removed the workspace meanwhile. The writers also refuse to recreate a deleted scratch or
     // session dir, which covers a removal that finishes between this check and the write.
-    if ((await this.writableMetadata(workspaceId)) == null) return { kind: "skipped" };
+    if ((await this.writableMetadata(workspaceId)) == null) return;
     await writeArtifactAtLocation(location, AGENT_INTERFACE_STATUS_ARTIFACT, result.page, {
       abortSignal,
     });
     log.debug("Status page agent updated the page", {
       workspaceId,
-      model: modelString,
+      model: agent.modelString,
       updates: batch.updates.length,
       summary: result.summary,
     });
-    return { kind: "done" };
+  }
+
+  /**
+   * The status_page body and model: the Settings > Agents > Status Page choice (or a workspace
+   * override), else the main agent's model this turn.
+   */
+  private async resolveAgent(workspaceId: string, fallbackModel: string) {
+    const body = await resolveHeadlessAgentBody(this.deps.config.rootDir, STATUS_PAGE_AGENT_ID);
+    if (body === null) throw new Error("status_page agent definition is missing");
+    const modelString = resolveHeadlessAgentSettings(
+      this.deps.config,
+      workspaceId,
+      STATUS_PAGE_AGENT_ID,
+      fallbackModel
+    ).model;
+    const created = await this.deps.modelFactory.createModelWithPinnedMetadata(modelString, {
+      agentInitiated: true,
+      workspaceId,
+    });
+    if (!created.success) {
+      throw new Error(`could not create model ${modelString}: ${created.error.type}`);
+    }
+    return { body, modelString, ...created.data };
+  }
+
+  private usageRecorder(workspaceId: string, modelString: string, metadataModel: string) {
+    return async (usage: LanguageModelV2Usage, providerMetadata?: Record<string, unknown>) => {
+      const recorded = await this.deps.sessionUsageService?.recordHeadlessUsage(
+        workspaceId,
+        modelString,
+        usage,
+        providerMetadata,
+        // Creation-time identity: a catalog refresh mid-run must not re-attribute this spend.
+        { analyticsSource: STATUS_PAGE_AGENT_ANALYTICS_SOURCE, metadataModel }
+      );
+      if (recorded) this.deps.requestAnalyticsIngest?.(workspaceId);
+    };
+  }
+}
+
+async function readCurrentPage(
+  location: AvailableArtifactsLocation,
+  abortSignal: AbortSignal
+): Promise<string> {
+  const read = await readArtifactBytesAtLocation(
+    location,
+    AGENT_INTERFACE_STATUS_ARTIFACT,
+    STATUS_PAGE_AGENT_MAX_PAGE_BYTES,
+    abortSignal
+  );
+  switch (read.status) {
+    case "ok":
+      return read.bytes.toString("utf8");
+    case "missing":
+      // The turn seeds the page, but it may have been deleted since; start from the template.
+      return AGENT_INTERFACE_STATUS_TEMPLATE;
+    case "too_large":
+      throw new Error(
+        `${AGENT_INTERFACE_STATUS_ARTIFACT} is ${read.size} bytes, over the ${STATUS_PAGE_AGENT_MAX_PAGE_BYTES}-byte limit`
+      );
+    case "invalid":
+      throw new Error(`could not read ${AGENT_INTERFACE_STATUS_ARTIFACT}: ${read.error}`);
   }
 }

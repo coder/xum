@@ -37,7 +37,10 @@ import { createArtifactListTool } from "@/node/services/tools/artifact_list";
 import { createArtifactTool } from "@/node/services/tools/artifact";
 import { createArtifactReadTool } from "@/node/services/tools/artifact_read";
 import { createTimelineEventTool } from "@/node/services/tools/timeline_event";
-import { createStatusUpdateTool } from "@/node/services/tools/status_update";
+import {
+  createStatusUpdateTools,
+  isStatusUpdateEnabled,
+} from "@/node/services/tools/status_update";
 import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createMcpPromptGetTool } from "@/node/services/tools/mcp_prompt_get";
 import { createAnalyticsQueryTool } from "@/node/services/tools/analyticsQuery";
@@ -936,10 +939,6 @@ export function getForcedXaiSearchToolNames(
   return toolNames.length > 0 ? toolNames : undefined;
 }
 
-function statusUpdateEnabled(config: ToolConfiguration): boolean {
-  return config.statusPageAgent != null && config.statusPageAgentActive === true;
-}
-
 function toolAllowlistOptions(
   config: ToolConfiguration
 ): NonNullable<Parameters<typeof getAvailableTools>[1]> {
@@ -953,7 +952,7 @@ function toolAllowlistOptions(
     enableTimelineEvent: Boolean(config.timelineService),
     enableArtifacts:
       config.experiments?.artifacts === true && config.xumEnv?.XUM_SCRATCH_DIR != null,
-    enableStatusUpdate: statusUpdateEnabled(config),
+    enableStatusUpdate: isStatusUpdateEnabled(config),
     enableToolSearch: Boolean(config.toolSearchRuntime),
     enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
     // Sub-agents (enableAgentReport is set iff the workspace has a parentWorkspaceId) do not get
@@ -1062,9 +1061,7 @@ export async function getToolsForModel(
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
     ...(config.timelineService ? { timeline_event: createTimelineEventTool(config) } : {}),
-    ...(statusUpdateEnabled(config)
-      ? { status_update: createStatusUpdateTool(config, modelString) }
-      : {}),
+    ...createStatusUpdateTools(config, modelString),
     // Only where $XUM_SCRATCH_DIR exists: without it the description's
     // "$XUM_SCRATCH_DIR/artifacts/" would expand to "/artifacts/".
     ...(config.experiments?.artifacts && config.xumEnv?.XUM_SCRATCH_DIR != null

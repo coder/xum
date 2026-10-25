@@ -65,6 +65,17 @@ const OFFLINE_SAVE_MESSAGE =
 // the send path, which threads reasoningMode.
 const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace", "status_page"]);
 
+/**
+ * The status page agent only runs when Artifacts, Agent interface view and Status page agent are
+ * all on (see statusPageAgentService); its Settings card mirrors that gate.
+ */
+function useStatusPageAgentEnabled(): boolean {
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const agentInterfaceEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE);
+  const statusPageAgentFlag = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT);
+  return artifactsEnabled && agentInterfaceEnabled && statusPageAgentFlag;
+}
+
 function getAgentDefinitionPath(agent: AgentDefinitionDescriptor): string | null {
   switch (agent.scope) {
     case "project":
@@ -438,12 +449,7 @@ export function TasksSection() {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationFlag = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const memoryConsolidationEnabled = memoryEnabled && memoryConsolidationFlag;
-  // The status page agent only runs when Artifacts, Agent interface view and Status page agent
-  // are all on (see statusPageAgentService); mirror that gate for its Settings card.
-  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
-  const agentInterfaceEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE);
-  const statusPageAgentFlag = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT);
-  const statusPageAgentEnabled = artifactsEnabled && agentInterfaceEnabled && statusPageAgentFlag;
+  const statusPageAgentEnabled = useStatusPageAgentEnabled();
 
   // Resolve the workspace's active model so that when a sub-agent's model is
   // "Inherit", we show thinking levels for the workspace model (falling back to

@@ -77,7 +77,7 @@ import { formatMcpAppModelContextSection } from "@/node/services/mcpAppResultSto
 import type { InitStateManager } from "./initStateManager";
 import { runLanguageModelCleanup } from "./languageModelCleanup";
 import { log } from "./log";
-import { prepareAgentInterfaceStatusPage } from "./agentInterfaceStatusPage";
+import { isStatusPageAgentMode, prepareAgentInterfaceStatusPage } from "./agentInterfaceStatusPage";
 import { resolveArtifactsLocation } from "./artifactsOperations";
 import { NOOP_TIMELINE_RECORDER } from "./timelineRecorder";
 import type { StreamManager } from "./streamManager";
@@ -903,6 +903,30 @@ export interface PreparedTurnRequest extends AsyncDisposable {
 type PreparedTurnRequestOutcome =
   | Extract<TurnRequestBuildOutcome, { type: "finished" }>
   | { type: "prepared"; request: PreparedTurnRequest };
+
+/**
+ * Toolset facts the system prompt describes (hot memories, the status page guidance). Tool
+ * policy may strip a tool after the provisional prompt was built; a different toolset forces a
+ * rebuild so the prompt never advertises an absent tool.
+ */
+interface SystemPromptToolset {
+  memoryToolAvailable: boolean;
+  statusUpdateToolAvailable: boolean;
+}
+
+function systemPromptToolsetOf(tools: Record<string, Tool>): SystemPromptToolset {
+  return {
+    memoryToolAvailable: tools.memory !== undefined,
+    statusUpdateToolAvailable: tools.status_update !== undefined,
+  };
+}
+
+function sameSystemPromptToolset(a: SystemPromptToolset, b: SystemPromptToolset): boolean {
+  return (
+    a.memoryToolAvailable === b.memoryToolAvailable &&
+    a.statusUpdateToolAvailable === b.statusUpdateToolAvailable
+  );
+}
 
 export interface TurnRequestBuilderBindings extends OauthServiceBindings {
   mcpServerManager?: MCPServerManager;
@@ -2398,18 +2422,16 @@ export class TurnRequestBuilder {
     // Status page agent mode: the main agent sends status_update calls and a host-run agent
     // edits the page. Eligibility mirrors status_update registration; tool policy may still
     // strip the tool, which forces a rebuild below so the prompt keeps the classic guidance.
-    const statusPageAgentActive =
-      agentInterfaceViewActive && isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT);
-    const statusUpdateToolEligible =
-      statusPageAgentActive && this.dependencies.bindings.statusPageAgent !== undefined;
+    const statusPageAgentActive = isStatusPageAgentMode({
+      agentInterfaceView: agentInterfaceViewActive,
+      statusPageAgentEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT),
+      queueAvailable: this.dependencies.bindings.statusPageAgent !== undefined,
+    });
     // Filled by the first build: later rebuilds in this turn (tool policy,
     // model fallback) reuse the same instruction snapshot instead of re-reading.
     const turnInstructionSources: { current?: InstructionSources } = {};
     const buildStreamSystemContextForToolset = (
-      toolset: {
-        memoryToolAvailable: boolean;
-        statusUpdateToolAvailable: boolean;
-      },
+      toolset: SystemPromptToolset,
       modelStringForSystem: string = modelString
     ) =>
       buildStreamSystemContext({
@@ -2450,10 +2472,11 @@ export class TurnRequestBuilder {
     // Build provisional agent context before tool policy finalizes the toolset.
     // Rebuild after policy application so guidance only describes available tools.
     const buildStreamSystemContextStartedAt = this.hostClock.nowMs();
-    const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset({
+    const prePolicyToolset: SystemPromptToolset = {
       memoryToolAvailable: memoryToolEligible,
-      statusUpdateToolAvailable: statusUpdateToolEligible,
-    });
+      statusUpdateToolAvailable: statusPageAgentActive,
+    };
+    const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset(prePolicyToolset);
     // The MCP inventory the pre-policy context was built with; a later
     // rebuild from the validated serve makes that context stale.
     const mcpServersAtPrePolicy = mcpServers;
@@ -3169,20 +3192,15 @@ export class TurnRequestBuilder {
           }
         }
 
-        const memoryToolAvailable = attemptTools.memory !== undefined;
-        const statusUpdateToolAvailable = attemptTools.status_update !== undefined;
+        const attemptToolset = systemPromptToolsetOf(attemptTools);
         const canReuseSystemContext =
           options.reusePrePolicySystemContext &&
           mcpServers === mcpServersAtPrePolicy &&
-          memoryToolAvailable === memoryToolEligible &&
-          statusUpdateToolAvailable === statusUpdateToolEligible;
+          sameSystemPromptToolset(attemptToolset, prePolicyToolset);
         const rebuildSystemStartedAt = this.hostClock.nowMs();
         const systemContext = canReuseSystemContext
           ? prePolicyStreamSystemContext
-          : await buildStreamSystemContextForToolset(
-              { memoryToolAvailable, statusUpdateToolAvailable },
-              seed.rawModelString
-            );
+          : await buildStreamSystemContextForToolset(attemptToolset, seed.rawModelString);
         if (options.recordTimings && !canReuseSystemContext) {
           recordStartupPhaseTiming("rebuildStreamSystemContextMs", rebuildSystemStartedAt);
         }

@@ -4,12 +4,27 @@ import type { StatusUpdateToolResult } from "@/common/types/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
 
+/** status_update needs the status page agent queue and an active status page agent mode. */
+export function isStatusUpdateEnabled(config: ToolConfiguration): boolean {
+  return config.statusPageAgent != null && config.statusPageAgentActive === true;
+}
+
+/** `{ status_update }` while the tool is enabled for this turn, else no tools. */
+export function createStatusUpdateTools(
+  config: ToolConfiguration,
+  fallbackModel: string
+): Record<string, Tool> {
+  return isStatusUpdateEnabled(config)
+    ? { status_update: createStatusUpdateTool(config, fallbackModel) }
+    : {};
+}
+
 /**
  * status_update (status page agent mode): queues the update for the host-run status page agent
  * and returns at once, so the main loop never waits for the page edit. `fallbackModel` is this
  * turn's model, used when no Status Page model is configured in Settings > Agents.
  */
-export function createStatusUpdateTool(config: ToolConfiguration, fallbackModel: string): Tool {
+function createStatusUpdateTool(config: ToolConfiguration, fallbackModel: string): Tool {
   return tool({
     description: TOOL_DEFINITIONS.status_update.description,
     inputSchema: TOOL_DEFINITIONS.status_update.schema,
