@@ -13,6 +13,7 @@ import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
 import { TODO_TURN_END_NUDGE } from "@/node/services/agentNotifications/todoTurnEndNudge";
+import { STATUS_PAGE_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 import { Ok } from "@/common/types/result";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
@@ -81,6 +82,8 @@ async function setup(
     fallbackModel?: (turn: number) => string | undefined;
     /** Runs while turn N streams, before it ends. */
     whileStreaming?: (turn: number, h: AgentSessionHarness) => void;
+    /** Every turn's status page earns the Agent interface view's turn-end nudge. */
+    statusPageNeedsNudge?: boolean;
     session?: Omit<AgentSessionHarnessOptions, "workspaceId" | "aiEmitter" | "aiServiceOverrides">;
   } = {}
 ) {
@@ -93,6 +96,9 @@ async function setup(
     workspaceId,
     aiEmitter: emitter,
     aiServiceOverrides: {
+      ...(input.statusPageNeedsNudge === true
+        ? { needsStatusPageTurnEndNudge: () => Promise.resolve(true) }
+        : {}),
       streamMessage: mock<AgentSessionAIService["streamMessage"]>((request) => {
         requests.push(request);
         const messageId = `a${++turns}`;
@@ -839,6 +845,75 @@ describe("todo turn-end nudge", () => {
             : todoWriteThenReply,
     });
     await writeTodos(h, row.todos ?? openTodos);
+
+    await h.session.sendMessage("fix the bug", { ...options, agentId: row.agentId ?? "exec" });
+    await settle(h);
+
+    expect(streams()).toBe(1);
+  });
+});
+
+describe("status page turn-end nudge", () => {
+  test("a turn whose status page needs it gets exactly one nudge per user turn", async () => {
+    // The nudge's own turn would earn it too: only the first stream of a user turn is nudged.
+    const { h, streams } = await setup({ statusPageNeedsNudge: true });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+    expect(await userTexts(h)).toEqual(["fix the bug", STATUS_PAGE_TURN_END_NUDGE]);
+
+    await h.session.sendMessage("now lint", options);
+    await settle(h);
+    expect(streams()).toBe(4);
+  });
+
+  test("a plugin continuation carries the nudge once, and its own turns get none", async () => {
+    addConsumer(keepGoing);
+    const { h } = await setup({ statusPageNeedsNudge: true });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual([
+      "fix the bug",
+      `Run the failing tests again.\n\n${STATUS_PAGE_TURN_END_NUDGE}`,
+      "Run the failing tests again.",
+      "Run the failing tests again.",
+    ]);
+  });
+
+  test("with the TODO nudge and a capped plugin prompt, both nudges arrive whole, TODO first", async () => {
+    const todoWrite: CompletedMessagePart = {
+      type: "dynamic-tool",
+      toolCallId: "todo-1",
+      toolName: "todo_write",
+      input: { todos: [] },
+      state: "output-available",
+      output: { success: true },
+    };
+    addConsumer((ctx) => void ctx.continueReasons.push("x".repeat(TURN_STOP_PROMPT_MAX_CHARS)));
+    const { h } = await setup({ statusPageNeedsNudge: true, parts: () => [todoWrite] });
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    const openTodos: TodoItem[] = [{ content: "Verify the fix", status: "in_progress" }];
+    await fs.writeFile(getTodoFilePath(sessionDir), JSON.stringify(openTodos));
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    const [, continuation] = await userTexts(h);
+    expect(continuation.length).toBe(TURN_STOP_PROMPT_MAX_CHARS);
+    expect(
+      continuation.endsWith(`x\n\n${TODO_TURN_END_NUDGE}\n\n${STATUS_PAGE_TURN_END_NUDGE}`)
+    ).toBe(true);
+  });
+
+  test.each([
+    { name: "a Plan mode turn", agentId: "plan" },
+    { name: "a turn a plugin halted", halt: true },
+  ])("$name gets no nudge", async (row) => {
+    if (row.halt === true) addConsumer((ctx) => (ctx.halted = { pluginName: "guard" }));
+    const { h, streams } = await setup({ statusPageNeedsNudge: true });
 
     await h.session.sendMessage("fix the bug", { ...options, agentId: row.agentId ?? "exec" });
     await settle(h);

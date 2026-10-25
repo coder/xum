@@ -105,6 +105,8 @@ import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset"
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
+import type { CompletedMessagePart } from "@/common/types/stream";
+import { needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
 import { isMockAiMode } from "./mock/mockAiMode";
 import { ProviderModelFactory } from "./providerModelFactory";
 
@@ -606,6 +608,20 @@ export class AIService extends EventEmitter {
       ? await this.resolvePromptHookCwd(workspaceId)
       : undefined;
     return runTurnStopHooks(eventSpine, workspaceId, { ...input, cwd });
+  }
+
+  /**
+   * Whether the turn that streamed `messageId` earns the Agent interface view's turn-end status
+   * page nudge (needsStatusPageTurnEndNudge). Consumes the turn's state, so a second call is false.
+   */
+  needsStatusPageTurnEndNudge(
+    workspaceId: string,
+    input: { messageId: string; parts: readonly CompletedMessagePart[] }
+  ): Promise<boolean> {
+    return needsStatusPageTurnEndNudge({
+      turn: this.turnRequestBuilder.takeAgentInterfaceStatusPageTurn(workspaceId, input.messageId),
+      parts: input.parts,
+    });
   }
 
   /** The lazy hook setup of request building, fail-soft: the hooks already loaded still run. */

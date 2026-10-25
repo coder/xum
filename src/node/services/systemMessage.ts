@@ -251,7 +251,11 @@ function buildAgentInterfaceContext(options: { agentInterfaceView?: boolean } | 
   return `
 
 <agent-interface>
-The user sees $XUM_SCRATCH_DIR/artifacts/${AGENT_INTERFACE_STATUS_ARTIFACT} in the main pane instead of this chat transcript by default, and can switch to the transcript at any time. When the page is missing, Xum seeds it with a themed template that uses the --xum-* CSS variables listed in its HTML comment; keep using them (with fallbacks) so the page follows the user's theme. Keep the page current with your status, progress and results by editing it in place, and still answer in chat as usual.
+The user watches $XUM_SCRATCH_DIR/artifacts/${AGENT_INTERFACE_STATUS_ARTIFACT} in the main pane instead of this chat transcript, so the page is how they follow your work. Xum seeds it with a themed placeholder; keep the --xum-* CSS variables listed in its HTML comment (with fallbacks) so the page follows the user's theme.
+- In any turn that does work, replace the placeholder early, before long-running steps.
+- Edit the page in place at each milestone: plan, progress, blockers, results.
+- Before you end the turn, make the page show the final state and anything that needs the user.
+Still answer in chat as usual.
 </agent-interface>`;
 }
 

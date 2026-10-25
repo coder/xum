@@ -124,8 +124,10 @@ import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import {
   mergeTurnStopContinuation,
   needsTodoTurnEndNudge,
+  TODO_TURN_END_NUDGE,
   type TurnStopContinuation,
 } from "@/node/services/agentNotifications/todoTurnEndNudge";
+import { STATUS_PAGE_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 import { resolveLegacyTodoNudgeToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { readAssistedReviewForSessionDir } from "@/node/services/reviewPane/assistedReviewStorage";
 import { PLAN_REVIEW_SNAPSHOT_CAPTURE_TIMEOUT_MS } from "@/constants/planReview";
@@ -244,6 +246,7 @@ interface HeldInputEntry {
 }
 import {
   copyStreamLifecycleSnapshot,
+  type CompletedMessagePart,
   type RuntimeStatusEvent,
   type StreamAbortReason,
   type StreamEndEvent,
@@ -1098,6 +1101,11 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
     workspaceId: string,
     input: Pick<TurnStopContext, "messageId" | "lastAssistantMessage" | "stopHookActive" | "model">
   ): Promise<TurnStopHookOutcome>;
+  /** Whether the turn earns the Agent interface view's status page nudge. Absent: never. */
+  needsStatusPageTurnEndNudge?(
+    workspaceId: string,
+    input: { messageId: string; parts: readonly CompletedMessagePart[] }
+  ): Promise<boolean>;
   resolveXumToolScopeForWorkspace?(
     metadata: WorkspaceMetadata,
     runtime: Runtime,
@@ -10740,12 +10748,13 @@ export class AgentSession {
   /**
    * Run the turn.stop prompt hooks (Codex Stop) for a turn that ended normally. A continuation
    * (Codex `decision: "block"`) queues its prompt as a new synthetic user row, at most
-   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Xum's own todo nudge (needsTodoTurnEndNudge)
-   * rides the same continuation and gates. Sub-agent turns skip the hooks: TaskService
-   * owns their stream end (Codex has SubagentStop for them). A delegated workspace turn
-   * (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager settles its
-   * handle from this stream end, and can remove a disposable workspace, while a slow hook still
-   * runs, so a continuation would arrive after the caller already got the turn as finished.
+   * MAX_STOP_HOOK_CONTINUATIONS times per user turn. Xum's own nudges (needsTodoTurnEndNudge,
+   * needsStatusPageTurnEndNudge) ride the same continuation and gates. Sub-agent turns skip the
+   * hooks: TaskService owns their stream end (Codex has SubagentStop for them). A delegated
+   * workspace turn (`workspace-turn-task`) skips them for the same reason: WorkspaceTurnManager
+   * settles its handle from this stream end, and can remove a disposable workspace, while a slow
+   * hook still runs, so a continuation would arrive after the caller already got the turn as
+   * finished.
    */
   private async runTurnStopHooks(
     payload: StreamEndEvent,
@@ -10835,10 +10844,11 @@ export class AgentSession {
   }
 
   /**
-   * The turn.stop continuation: the plugin hooks' reasons plus Xum's todo nudge, or null when
-   * nothing continues. One todo nudge per user turn: only before any continuation (so never after
-   * the nudge itself), never against a plugin's halt, and never in Plan mode, where the list is
-   * the plan. The nudged turn keeps the turn's tools, so it can also finish open items.
+   * The turn.stop continuation: the plugin hooks' reasons plus Xum's nudges, or null when nothing
+   * continues. Each nudge fires at most once per user turn: only before any continuation (so
+   * never after a nudge itself), never against a plugin's halt, and never in Plan mode (where the
+   * todo list is the plan). The nudged turn keeps the turn's tools, so it can also finish open
+   * items.
    */
   private async readTurnStopContinuation(
     payload: StreamEndEvent,
@@ -10854,28 +10864,35 @@ export class AgentSession {
         model: stopHookModel(payload, provenance),
       }
     )) ?? { kind: "none" };
-    return mergeTurnStopContinuation({
-      hookPrompt: hookOutcome.kind === "continue" ? hookOutcome.prompt : null,
-      todoNudge: await this.needsTodoNudge(hookOutcome, options, payload),
-    });
-  }
-
-  private async needsTodoNudge(
-    hookOutcome: TurnStopHookOutcome,
-    options: SendMessageOptions | undefined,
-    payload: StreamEndEvent
-  ): Promise<boolean> {
-    return (
+    const nudges: string[] = [];
+    const nudgeable =
       hookOutcome.kind !== "halted" &&
       this.stopHookContinuations === 0 &&
       options != null &&
-      options.agentId !== "plan" &&
+      options.agentId !== "plan";
+    if (
+      nudgeable &&
       (await needsTodoTurnEndNudge({
         sessionDir: path.join(this.config.sessionsDir, this.workspaceId),
         parts: payload.parts,
         files: this.historyService.files,
       }))
-    );
+    ) {
+      nudges.push(TODO_TURN_END_NUDGE);
+    }
+    if (
+      nudgeable &&
+      (await this.aiService.needsStatusPageTurnEndNudge?.(this.workspaceId, {
+        messageId: payload.messageId,
+        parts: payload.parts,
+      })) === true
+    ) {
+      nudges.push(STATUS_PAGE_TURN_END_NUDGE);
+    }
+    return mergeTurnStopContinuation({
+      hookPrompt: hookOutcome.kind === "continue" ? hookOutcome.prompt : null,
+      nudges,
+    });
   }
 
   /** The ending stream's provenance for a turn.stop continuation (read before its reset). */
