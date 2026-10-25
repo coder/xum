@@ -8,6 +8,7 @@ import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { log } from "@/node/services/log";
 import { ScriptedSandboxControlPlane } from "./daytona.testHarness";
 import { DaytonaService } from "./daytonaService";
+import type { DaytonaSshWriter } from "./daytonaSsh";
 
 describe("DaytonaSsh", () => {
   let rootDir: string;
@@ -16,10 +17,14 @@ describe("DaytonaSsh", () => {
   let service: DaytonaService;
   const sleeps: number[] = [];
 
-  function makeService(env: NodeJS.ProcessEnv = { DAYTONA_API_KEY: "k" }): DaytonaService {
+  function makeService(
+    env: NodeJS.ProcessEnv = { DAYTONA_API_KEY: "k" },
+    sshConfigWriter?: DaytonaSshWriter
+  ): DaytonaService {
     return new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(rootDir, env),
       rootDir,
+      sshConfigWriter,
       fetch: plane.fetch,
       now: () => clock,
       sleep: (ms) => {
@@ -28,6 +33,26 @@ describe("DaytonaSsh", () => {
         return Promise.resolve();
       },
     });
+  }
+
+  /** An include file kept as a map from sandbox id to token. */
+  function mapWriter(includeFile: Map<string, string>): DaytonaSshWriter {
+    const store = (input: { sandboxId: string; token: string }) => {
+      includeFile.set(input.sandboxId, input.token);
+      return Promise.resolve();
+    };
+    return {
+      writeSandbox: store,
+      ensureManagedBlock: () => Promise.resolve(),
+      updateToken: store,
+      removeSandbox: (sandboxId) => {
+        includeFile.delete(sandboxId);
+        return Promise.resolve();
+      },
+      readTokens: () =>
+        Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
+      repointGateway: () => Promise.resolve(),
+    };
   }
 
   beforeEach(async () => {
@@ -95,27 +120,7 @@ describe("DaytonaSsh", () => {
 
   it("removes the old account's aliases from the include file when the settings change", async () => {
     const includeFile = new Map<string, string>();
-    const store = (input: { sandboxId: string; token: string }) => {
-      includeFile.set(input.sandboxId, input.token);
-      return Promise.resolve();
-    };
-    const changing = new DaytonaService({
-      credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
-      rootDir,
-      fetch: plane.fetch,
-      now: () => clock,
-      sshConfigWriter: {
-        writeSandbox: store,
-        ensureManagedBlock: () => Promise.resolve(),
-        updateToken: store,
-        removeSandbox: (sandboxId) => {
-          includeFile.delete(sandboxId);
-          return Promise.resolve();
-        },
-        readTokens: () => Promise.resolve([]),
-        repointGateway: () => Promise.resolve(),
-      },
-    });
+    const changing = makeService(undefined, mapWriter(includeFile));
     await changing.ssh.ensureSshAccess("sb-1");
     expect(includeFile.has("sb-1")).toBe(true);
 
@@ -124,23 +129,38 @@ describe("DaytonaSsh", () => {
     expect(includeFile.has("sb-1")).toBe(false);
   });
 
+  it("drops a token whose mint was still running when the settings changed", async () => {
+    const includeFile = new Map<string, string>();
+    const changing = makeService(undefined, mapWriter(includeFile));
+    const mintRoute = "POST /sandbox/sb-1/ssh-access";
+    let mintStarted!: () => void;
+    const started = new Promise<void>((resolve) => (mintStarted = resolve));
+    let finishMint!: () => void;
+    plane.onRequest.set(mintRoute, () => {
+      mintStarted();
+      return new Promise<void>((resolve) => (finishMint = resolve));
+    });
+    const access = changing.ssh.ensureSshAccess("sb-1");
+    await started;
+
+    await changing.account.setConfig({ apiKey: "k2" });
+    plane.onRequest.delete(mintRoute);
+    finishMint();
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(access).rejects.toThrow("settings changed");
+    // The token the old key minted is revoked with that key, and no alias holds it.
+    expect(includeFile.has("sb-1")).toBe(false);
+    expect(plane.revoked).toEqual(["tok1"]);
+    expect(plane.authorizedCalls).toContain("DELETE /sandbox/sb-1/ssh-access Bearer k");
+    await changing.ssh.ensureSshAccess("sb-1");
+    expect(includeFile.get("sb-1")).toBe("tok2");
+  });
+
   it("revokes the tokens an earlier process left in the include file once it replaces them", async () => {
     // The include file, shared by every Xum process (a restart is a new service).
     const includeFile = new Map([["sb-1", "earlier-process-token"]]);
-    const store = (input: { sandboxId: string; token: string }) => {
-      includeFile.set(input.sandboxId, input.token);
-      return Promise.resolve();
-    };
-    const writer = {
-      writeSandbox: store,
-      ensureManagedBlock: () => Promise.resolve(),
-      updateToken: store,
-      removeSandbox: () => Promise.resolve(),
-
-      readTokens: () =>
-        Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
-      repointGateway: () => Promise.resolve(),
-    };
+    const writer = mapWriter(includeFile);
     const startProcess = async () => {
       const started = new DaytonaService({
         credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),

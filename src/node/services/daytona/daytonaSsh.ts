@@ -63,6 +63,8 @@ export class DaytonaSsh {
   private readonly sshConfigured = new Set<string>();
   /** Whether the include file was read once, seeding the tokens an earlier process left. */
   private persistedTokensLoaded = false;
+  /** Counts forgetAccount calls: a mint that spans one holds a token the call never saw. */
+  private accountChanges = 0;
 
   constructor(options: DaytonaSshOptions) {
     this.account = options.account;
@@ -105,20 +107,12 @@ export class DaytonaSsh {
    * the caches. Connections already open may reach the old account until they end.
    */
   async forgetAccount(previousClient: DaytonaClient | undefined): Promise<void> {
+    this.accountChanges++;
     const tokens = [...this.tokens];
     this.tokens.clear();
     this.sshConfigured.clear();
     this.gatewayCache = undefined;
-    for (const [sandboxId] of tokens) {
-      try {
-        await this.sshConfigWriter.removeSandbox(sandboxId);
-      } catch (error) {
-        log.warn("Failed to remove an old-account Daytona alias from the include file", {
-          sandboxId,
-          error: getErrorMessage(error),
-        });
-      }
-    }
+    for (const [sandboxId] of tokens) await this.removeOldAccountAlias(sandboxId);
     if (previousClient) {
       await Promise.all(
         tokens.map(([sandboxId, access]) =>
@@ -229,10 +223,15 @@ export class DaytonaSsh {
     previous: DaytonaSshAccess | undefined,
     options: DaytonaSshTokenOptions
   ): Promise<DaytonaSshAccess> {
+    const accountChanges = this.accountChanges;
     const { client } = await this.account.getClient();
     const access = await client.createSshAccess(sandboxId, DAYTONA_SSH_TOKEN_TTL_MINUTES);
     rememberDaytonaToken(access.token);
     await this.announceNewToken(client, sandboxId, access, options);
+    // No await between this check and the set: forgetAccount sees the token, or this sees it.
+    if (this.accountChanges !== accountChanges) {
+      await this.dropOldAccountToken(client, sandboxId, access.token);
+    }
     this.tokens.set(sandboxId, access);
     if (previous && previous.token !== access.token) {
       await this.revokeQuietly(client, sandboxId, previous.token);
@@ -252,6 +251,32 @@ export class DaytonaSsh {
       // Nothing holds the new token any more: revoke it rather than leave it live.
       await this.revokeQuietly(client, sandboxId, access.token);
       throw error;
+    }
+  }
+
+  /**
+   * A settings save ran forgetAccount during this mint: the token belongs to the account the
+   * save left, so remove its alias and revoke it as forgetAccount would have, and fail the
+   * caller.
+   */
+  private async dropOldAccountToken(
+    client: DaytonaClient,
+    sandboxId: string,
+    token: string
+  ): Promise<never> {
+    await this.removeOldAccountAlias(sandboxId);
+    await this.revokeQuietly(client, sandboxId, token);
+    throw new Error(`The Daytona settings changed while Xum got ssh access to ${sandboxId}`);
+  }
+
+  private async removeOldAccountAlias(sandboxId: string): Promise<void> {
+    try {
+      await this.sshConfigWriter.removeSandbox(sandboxId);
+    } catch (error) {
+      log.warn("Failed to remove an old-account Daytona alias from the include file", {
+        sandboxId,
+        error: getErrorMessage(error),
+      });
     }
   }
 
