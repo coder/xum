@@ -114,6 +114,32 @@ test("passes a local named global or globalThis", () => {
   expect(patch(`function fake(global: G) {\n  global.Date.now = () => 1;\n}`)).toEqual([]);
 });
 
+test("passes locals named Date or AbortSignal", () => {
+  expect(rawClock(`function render(Date: () => string) {\n  return Date();\n}`)).toEqual([]);
+  expect(rawClock(`function f(Date: D) {\n  return Date.now() + new Date().getTime();\n}`)).toEqual(
+    []
+  );
+  expect(rawClock(`function f(AbortSignal: S) {\n  return AbortSignal.timeout(10);\n}`)).toEqual(
+    []
+  );
+  const patch = (code: string) => ids("no-global-clock-patch", code);
+  expect(patch(`function fake(Date: D) {\n  Date.now = () => 1;\n}`)).toEqual([]);
+});
+
+test("reports timers loaded by await import() and static computed members", () => {
+  expect(
+    rawClock(`const timers = await import("node:timers");\ntimers.setTimeout(fire, 10);`)
+  ).toEqual(["raw"]);
+  expect(
+    rawClock(`const { setTimeout: delay } = await import("timers/promises");\nawait delay(10);`)
+  ).toEqual(["raw"]);
+  expect(
+    rawClock(`import * as timers from "node:timers";\ntimers["setTimeout"](fire, 10);`)
+  ).toEqual(["raw"]);
+  expect(rawClock(`globalThis["setTimeout"](fire, 10);`)).toEqual(["raw"]);
+  expect(rawClock(`const t = global["Date"].now();`)).toEqual(["raw"]);
+});
+
 test("reports timers from a named default import of a timers module", () => {
   expect(
     rawClock(`import { default as timers } from "node:timers";\ntimers.setTimeout(fire, 10);`)

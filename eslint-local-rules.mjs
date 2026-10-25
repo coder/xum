@@ -86,6 +86,29 @@ function isDeclaredLocally(sourceCode, identifier) {
   return (resolveVariable(sourceCode, identifier)?.defs.length ?? 0) > 0;
 }
 
+/** The property name of `a.b` or of the static `a["b"]`; null for any other member. */
+function memberName(node) {
+  if (node.type !== "MemberExpression") return null;
+  if (!node.computed) return node.property.name ?? null;
+  return node.property.type === "Literal" && typeof node.property.value === "string"
+    ? node.property.value
+    : null;
+}
+
+/**
+ * The built-in global `name`: the bare name when no parameter, import or local declares it, or
+ * a member of the global object (`globalThis.name`, Node's `global.name`, or `global["name"]`).
+ */
+function isHostGlobal(sourceCode, node, name) {
+  if (node.type === "Identifier") return node.name === name && !isDeclaredLocally(sourceCode, node);
+  return (
+    memberName(node) === name &&
+    node.object.type === "Identifier" &&
+    (node.object.name === "globalThis" || node.object.name === "global") &&
+    !isDeclaredLocally(sourceCode, node.object)
+  );
+}
+
 function variableDeclarator(variable) {
   if (variable.defs.length !== 1) {
     return null;
@@ -806,25 +829,16 @@ const localPlugin = {
           source?.type === "Literal" &&
           typeof source.value === "string" &&
           TIMER_MODULES.has(source.value.replace(/^node:/, ""));
-        const isRequireOfTimers = (node) =>
-          node?.type === "CallExpression" &&
-          node.callee.type === "Identifier" &&
-          node.callee.name === "require" &&
-          isTimerModule(node.arguments[0]);
-        // `globalThis` or Node's `global`: both name the global object, unless a parameter or
-        // local declares that name.
-        const isGlobalObject = (node) =>
-          node.type === "Identifier" &&
-          (node.name === "globalThis" || node.name === "global") &&
-          !isDeclaredLocally(context.sourceCode, node);
-        const globalMember = (node, name) =>
-          node.type === "MemberExpression" &&
-          !node.computed &&
-          isGlobalObject(node.object) &&
-          node.property.name === name;
-        // `Date`, `globalThis.Date` or `global.Date`: each names the host clock.
-        const isDate = (node) =>
-          (node.type === "Identifier" && node.name === "Date") || globalMember(node, "Date");
+        // `require("node:timers")` or `await import("node:timers")`.
+        const loadsTimers = (node) =>
+          (node?.type === "CallExpression" &&
+            node.callee.type === "Identifier" &&
+            node.callee.name === "require" &&
+            isTimerModule(node.arguments[0])) ||
+          (node?.type === "AwaitExpression" &&
+            node.argument.type === "ImportExpression" &&
+            isTimerModule(node.argument.source));
+        const hostGlobal = (node, name) => isHostGlobal(context.sourceCode, node, name);
         // A call whose callee needs its binding checked at the end: `id` must resolve to one of
         // `bindings`, so a parameter or local that shadows the import is not a timer.
         const viaBinding = (node, what, id, bindings) =>
@@ -859,7 +873,7 @@ const localPlugin = {
             }
           },
           VariableDeclarator(node) {
-            if (!isRequireOfTimers(node.init)) return;
+            if (!loadsTimers(node.init)) return;
             if (node.id.type === "Identifier") {
               moduleBindings.add(node.id);
               return;
@@ -878,52 +892,26 @@ const localPlugin = {
           },
           CallExpression(node) {
             const callee = node.callee;
-            if (
-              callee.type === "MemberExpression" &&
-              !callee.computed &&
-              isDate(callee.object) &&
-              callee.property.name === "now"
-            ) {
+            const member = memberName(callee);
+            const hostTimer = [...TIMERS].find((timer) => hostGlobal(callee, timer));
+            if (member === "now" && hostGlobal(callee.object, "Date")) {
               found.push({ node, what: "Date.now()" });
-            } else if (isDate(callee)) {
+            } else if (hostGlobal(callee, "Date")) {
               // `Date()` without `new` returns the current time as a string.
               found.push({ node, what: "Date()" });
-            } else if (callee.type === "Identifier" && TIMERS.has(callee.name)) {
-              found.push({ node, what: `${callee.name}()` });
+            } else if (hostTimer !== undefined) {
+              found.push({ node, what: `${hostTimer}()` });
             } else if (callee.type === "Identifier") {
               viaBinding(node, `${callee.name}()`, callee, timerBindings);
-            } else if (
-              callee.type === "MemberExpression" &&
-              !callee.computed &&
-              TIMERS.has(callee.property.name) &&
-              isGlobalObject(callee.object)
-            ) {
-              found.push({ node, what: `${callee.object.name}.${callee.property.name}()` });
-            } else if (
-              callee.type === "MemberExpression" &&
-              !callee.computed &&
-              TIMERS.has(callee.property.name) &&
-              callee.object.type === "Identifier"
-            ) {
-              viaBinding(
-                node,
-                `${callee.object.name}.${callee.property.name}()`,
-                callee.object,
-                moduleBindings
-              );
-            } else if (
-              callee.type === "MemberExpression" &&
-              !callee.computed &&
-              callee.property.name === "timeout" &&
-              ((callee.object.type === "Identifier" && callee.object.name === "AbortSignal") ||
-                globalMember(callee.object, "AbortSignal"))
-            ) {
+            } else if (TIMERS.has(member) && callee.object.type === "Identifier") {
+              viaBinding(node, `${callee.object.name}.${member}()`, callee.object, moduleBindings);
+            } else if (member === "timeout" && hostGlobal(callee.object, "AbortSignal")) {
               // A host timer that aborts the signal: the TestClock cannot reach it.
               found.push({ node, what: "AbortSignal.timeout()" });
             }
           },
           NewExpression(node) {
-            if (isDate(node.callee) && node.arguments.length === 0) {
+            if (hostGlobal(node.callee, "Date") && node.arguments.length === 0) {
               found.push({ node, what: "new Date()" });
             }
           },
@@ -991,20 +979,9 @@ const localPlugin = {
           AssignmentExpression(node) {
             const left = node.left;
             // `Date`, `globalThis.Date` or Node's `global.Date`: one process-wide clock.
-            const isDateObject = (object) =>
-              (object.type === "Identifier" && object.name === "Date") ||
-              (object.type === "MemberExpression" &&
-                !object.computed &&
-                object.object.type === "Identifier" &&
-                (object.object.name === "globalThis" || object.object.name === "global") &&
-                !isDeclaredLocally(context.sourceCode, object.object) &&
-                object.property.name === "Date");
             if (
-              left.type === "MemberExpression" &&
-              isDateObject(left.object) &&
-              (left.computed
-                ? left.property.type === "Literal" && left.property.value === "now"
-                : left.property.name === "now")
+              memberName(left) === "now" &&
+              isHostGlobal(context.sourceCode, left.object, "Date")
             ) {
               context.report({ node, messageId: "patch", data: { what: "Date.now = ..." } });
             }
