@@ -42,6 +42,9 @@ import {
   type BlobQuotaEntry,
 } from "@/node/utils/journal/blobReclamation";
 import { log } from "@/node/services/log";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import { toolSessionFiles } from "@/node/services/tools/todo";
 
 /** Prior-content capture with inline content; the emitter offloads large contents to blobs. */
 export interface RefinementFileCapture {
@@ -83,6 +86,12 @@ export interface RefinementEmitArgs {
    * appendRefinementEventFromTool).
    */
   createSessionDir?: boolean;
+  /**
+   * The session's file and lock layers, so the row goes to the journal that the turn writes
+   * (aiService.durableEventJournalFor). The tool path passes its config's layers. Absent: the
+   * Node layers (memoryService and refinementRollback have no session layers in scope, #7326).
+   */
+  layers?: { files: SessionFiles; locks: SessionLocks };
 }
 
 /** Shared by the rollback engine to compare current files against `postState`. */
@@ -239,7 +248,7 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
   try {
     assert(args.sessionDir.length > 0, "refinement journal requires a session dir");
     assert(args.workspaceId.length > 0, "refinement journal requires a workspace id");
-    const journal = sharedDurableEventJournal(args.sessionDir);
+    const journal = sharedDurableEventJournal(args.sessionDir, args.layers);
     const writeOptions: DurableEventWriteOptions = { createSessionDir: args.createSessionDir };
     // Inverse blob puts and the append referencing them run under the journal
     // blob lock: a concurrent reclamation pass must never observe the
@@ -307,8 +316,13 @@ export async function appendRefinementEvent(args: RefinementEmitArgs): Promise<v
  * session — there is no journal to attribute the edit to.
  */
 export async function appendRefinementEventFromTool(
-  config: { workspaceSessionDir?: string; workspaceId?: string },
-  args: Omit<RefinementEmitArgs, "sessionDir" | "workspaceId">
+  config: {
+    workspaceSessionDir?: string;
+    workspaceId?: string;
+    sessionLocks: SessionLocks;
+    sessionFiles?: SessionFiles;
+  },
+  args: Omit<RefinementEmitArgs, "sessionDir" | "workspaceId" | "layers">
 ): Promise<void> {
   if (!config.workspaceSessionDir || !config.workspaceId) {
     log.debug("[refinement] skipping refinement journal: no workspace session", {
@@ -320,6 +334,7 @@ export async function appendRefinementEventFromTool(
     ...args,
     sessionDir: config.workspaceSessionDir,
     workspaceId: config.workspaceId,
+    layers: { files: toolSessionFiles(config), locks: config.sessionLocks },
     // A tool call can outlive its turn: an aborted turn leaves a slow
     // agent_skill_write/agent_skill_delete running, and workspace removal can
     // delete the session dir before the tool journals here (#7474). A live

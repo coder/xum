@@ -44,6 +44,7 @@ import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
 import type { ProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { sharedDurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import type { BlobQuotaEntry } from "@/node/utils/journal/blobReclamation";
 import { log } from "@/node/services/log";
@@ -59,10 +60,16 @@ import { SESSION_MEMORY_DIR_NAME } from "@/common/constants/memory";
 
 export type RefinementEvent = Extract<DurableEvent, { kind: "refinement" }>;
 
-/** All refinement rows in the session journal (byId-deduped, seq order). */
-export async function listRefinements(sessionDir: string): Promise<RefinementEvent[]> {
+/**
+ * All refinement rows in the session journal (byId-deduped, seq order). `layers`: the session's
+ * file and lock layers (RefineService passes its history's). Absent: the Node layers.
+ */
+export async function listRefinements(
+  sessionDir: string,
+  layers?: { files: SessionFiles; locks: SessionLocks }
+): Promise<RefinementEvent[]> {
   assert(sessionDir.length > 0, "listRefinements requires a session dir");
-  const events = await sharedDurableEventJournal(sessionDir).read();
+  const events = await sharedDurableEventJournal(sessionDir, layers).read();
   return events.filter((event): event is RefinementEvent => event.kind === "refinement");
 }
 
