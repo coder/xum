@@ -188,8 +188,10 @@ def codex_comment_is_informational($bot; $head; $resolved; $cleared):
         or ($body | test("Didn.t find any major issues|create a Codex account"))
         # codex_without_help removed at most one known heading; a second or
         # unknown heading must not hide finding-bearing text.
+        # Codex sometimes omits the Reviewed commit line (coder/xum#7302). The
+        # rest of the receipt is fixed text that reports no finding.
         or ($body | test("^Security review completed\\. No security issues were found in this pull request\\."
-          + "\n+\\*\\*Reviewed commit:\\*\\* `[0-9a-f]{7,40}`"
+          + "(\n+\\*\\*Reviewed commit:\\*\\* `[0-9a-f]{7,40}`)?"
           + "\n+\\[View security finding report\\]\\(https://chatgpt\\.com/codex/cloud/tasks/[A-Za-z0-9_-]+\\)"
           + "\n+_Only the user who started this review can view the report in Codex\\._$"))
       end
