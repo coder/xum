@@ -516,6 +516,65 @@ describe("BackgroundProcessManager", () => {
       }
     });
 
+    it("gives two backends distinct directories when the runtime's mkdir exits 0 for an existing directory", async () => {
+      // uutils coreutils mkdir before 0.11.0 (Ubuntu 25.10, 26.04) can exit 0 for both of two
+      // concurrent creates of one directory (uutils/coreutils#13970, #7256). This fake mkdir
+      // always behaves that way: it waits until both claims reached it, then runs `mkdir -p`.
+      // So mkdir cannot pick the winner, and only the exclusive marker create can.
+      const realMkdir = Bun.which("mkdir");
+      if (realMkdir == null) throw new Error("the test needs a mkdir on PATH");
+      const fakeBin = await fs.mkdtemp(path.join(os.tmpdir(), "bgpm-fake-mkdir-"));
+      const arrivals = path.join(fakeBin, "arrivals");
+      await fs.mkdir(arrivals);
+      await fs.writeFile(
+        path.join(fakeBin, "mkdir"),
+        [
+          "#!/bin/sh",
+          `case "$1" in -*) exec ${realMkdir} "$@" ;; esac`,
+          `: > ${arrivals}/$$`,
+          "i=0",
+          `while [ "$(ls ${arrivals} | wc -l)" -lt 2 ] && [ "$i" -lt 100 ]; do sleep 0.05; i=$((i + 1)); done`,
+          `exec ${realMkdir} -p "$@"`,
+        ].join("\n"),
+        { mode: 0o755 }
+      );
+      const base = new LocalRuntime(process.cwd());
+      const remote = new Proxy({} as Runtime, {
+        get(_target, prop) {
+          if (prop === "exec") {
+            return (command: string, opts: never) =>
+              base.exec(
+                command.includes("__MUX_SPAWN_NAME_CLAIMED__")
+                  ? `PATH=${fakeBin}:$PATH\n${command}`
+                  : command,
+                opts
+              );
+          }
+          const value = (base as unknown as Record<PropertyKey, unknown>)[prop];
+          return typeof value === "function"
+            ? (value as (...args: unknown[]) => unknown).bind(base)
+            : value;
+        },
+      });
+      const other = new BackgroundProcessManager(bgOutputDir);
+      try {
+        const results = await Promise.all(
+          [manager, other].map((m) =>
+            m.spawn(remote, testWorkspaceId, "sleep 5", {
+              cwd: process.cwd(),
+              displayName: "uutils-race-job",
+            })
+          )
+        );
+        const dirs = results.map((r) => (r.success ? r.outputDir : r.error));
+        expect(results.every((r) => r.success)).toBe(true);
+        expect(new Set(dirs).size).toBe(2);
+      } finally {
+        await other.cleanup(testWorkspaceId);
+        await fs.rm(fakeBin, { recursive: true, force: true });
+      }
+    });
+
     it("removes the claimed record directory when a seal refuses a non-host spawn", async () => {
       // A cleanup, archive or removal that seals the workspace while the remote claim runs
       // refuses the spawn after its mkdir; the empty claimed directory must not stay behind.
