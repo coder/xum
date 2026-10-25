@@ -25,17 +25,17 @@ function firstHeadChildren(srcdoc: string) {
 
 /** The host's text-size-adjust style precedes every artifact style, so artifact rules win. */
 function expectTextSizeAdjustBeforeArtifactStyles(srcdoc: string) {
-  const children = firstHeadChildren(srcdoc);
-  const hostIndex = children.findIndex(
-    (el) =>
-      el.tagName === "STYLE" &&
-      /:where\(html\)\s*\{[^}]*(?<!-webkit-)text-size-adjust:\s*100%/.test(el.textContent ?? "")
-  );
-  expect(hostIndex).toBeGreaterThan(0);
   const doc = new window.DOMParser().parseFromString(srcdoc, "text/html");
-  const styles = Array.from(doc.querySelectorAll('style, link[rel~="stylesheet"]'));
-  expect(styles.length).toBeGreaterThan(1);
-  expect(styles[0]).toBe(doc.head.children[hostIndex]);
+  const [host, ...artifactStyles] = Array.from(
+    doc.querySelectorAll('style, link[rel~="stylesheet"]')
+  );
+  expect(artifactStyles.length).toBeGreaterThan(0);
+  expect(host?.tagName).toBe("STYLE");
+  expect(host?.parentElement).toBe(doc.head);
+  expect(host?.previousElementSibling).not.toBeNull();
+  expect(host?.textContent).toMatch(
+    /:where\(html\)\s*\{[^}]*(?<!-webkit-)text-size-adjust:\s*100%/
+  );
 }
 
 function expectCspFirst(srcdoc: string) {

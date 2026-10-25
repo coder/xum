@@ -55,7 +55,8 @@ import {
  * - Host -> frame: `{ type: "theme", theme: "dark" | "light", themeName?, variables? }`, sent
  *   after load and on theme change; the artifact may read it. The only host style sheet is the
  *   zero-specificity text-size-adjust rule (artifactDocument.ts); `variables` are only `--xum-*`
- *   custom-property values, inert until the artifact's own CSS uses them. Only a page without any styles of its own also gets the theme's `color-scheme`.
+ *   custom-property values, inert until the artifact's own CSS uses them. Only a page without
+ *   any styles of its own also gets the theme's `color-scheme`.
  *   `{ type: "annotate", enabled }` switches the shim's click-to-pin capture on or off (clicks
  *   are swallowed while it is on).
  * - The persisted `window.xum.state` is never posted: it is baked into the shim when the srcdoc
