@@ -39,6 +39,18 @@ describeIntegration("ReviewPanel focus (UI + ORPC)", () => {
         await view.selectTab("costs");
         await view.selectTab("review");
 
+        // While the workspace is still in setup, the Review tab shows a placeholder without the
+        // panel, and Ctrl+2 then has nothing to focus (#7436). Wait for the real panel, which
+        // mounts when setup ends: setupWorkspaceView does not wait for setup.
+        await waitFor(
+          () => {
+            if (!view.container.querySelector('[data-testid="review-panel"]')) {
+              throw new Error("Review panel not mounted (workspace setup not finished)");
+            }
+          },
+          { timeout: 30_000 }
+        );
+
         // Ensure focus starts outside the review panel.
         await view.selectTab("costs");
         const costsTab = view.container.querySelector<HTMLElement>(
