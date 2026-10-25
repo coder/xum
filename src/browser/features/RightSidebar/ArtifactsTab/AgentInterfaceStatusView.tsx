@@ -5,9 +5,11 @@ import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { ChatInputAPI } from "@/browser/features/ChatInput/types";
+import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import {
   type AgentInterfaceView,
   recordStatusPageRead,
+  subscribeStatusListings,
   useStatusArtifactEntry,
 } from "./agentInterfaceView";
 import { ArtifactViewer } from "./ArtifactViewer";
@@ -34,33 +36,63 @@ function useElementHeight(ref: React.RefObject<HTMLElement | null>): number {
   return height;
 }
 
-/** The status page's content, re-read when the file changes; null until the first read. */
+/**
+ * The status page's content; null until the first read. Re-read when the listing shows a new
+ * version of the file, and on the next successful listing after a failed read or a tool call
+ * that may have written files: remote runtimes list whole-second mtimes, so a same-size rewrite
+ * can keep the listed version.
+ */
 function useStatusArtifactRead(workspaceId: string): ArtifactReadResult | null {
   const { api } = useAPI();
   const entry = useStatusArtifactEntry(workspaceId);
   const [read, setRead] = useState<ArtifactReadResult | null>(null);
-  // Size too, since a same-mtime rewrite still changes it.
+  const staleRef = useRef(false);
+  const [retryTick, setRetryTick] = useState(0);
+  // Size too, since a same-mtime rewrite usually changes it.
   const readKey = entry == null ? null : `${entry.modifiedMs}\u0000${entry.size}`;
+
+  useEffect(
+    () =>
+      workspaceStore.subscribeFileModifyingTool(() => {
+        staleRef.current = true;
+      }, workspaceId),
+    [workspaceId]
+  );
+  useEffect(
+    () =>
+      subscribeStatusListings(workspaceId, () => {
+        if (!staleRef.current) return;
+        staleRef.current = false;
+        setRetryTick((tick) => tick + 1);
+      }),
+    [workspaceId]
+  );
 
   useEffect(() => {
     if (!api || readKey == null) return;
     const controller = new AbortController();
+    // A failed read keeps the last good page on screen until the retry.
+    const failed = (error: string) => {
+      staleRef.current = true;
+      console.debug("[Agent interface] status page read failed:", error);
+    };
     api.artifacts
       .read({ workspaceId, path: AGENT_INTERFACE_STATUS_ARTIFACT }, { signal: controller.signal })
       .then((result) => {
         if (controller.signal.aborted) return;
-        // A failed re-read keeps the last good page on screen; the next change retries.
-        if (result.success) {
-          setRead(result.data);
-          recordStatusPageRead(workspaceId, result.data);
-        } else console.debug("[Agent interface] status page read failed:", result.error);
+        if (!result.success) {
+          failed(result.error);
+          return;
+        }
+        setRead(result.data);
+        recordStatusPageRead(workspaceId, result.data);
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;
-        console.debug("[Agent interface] status page read failed:", getErrorMessage(error));
+        failed(getErrorMessage(error));
       });
     return () => controller.abort();
-  }, [api, workspaceId, readKey]);
+  }, [api, workspaceId, readKey, retryTick]);
 
   return read;
 }

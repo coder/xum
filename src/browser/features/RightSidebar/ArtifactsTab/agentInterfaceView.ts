@@ -189,16 +189,33 @@ function useStatusArtifactExists(workspaceId: string): boolean {
   );
 }
 
-/** The status page's entry in a listing; null when the folder has none or is unavailable. */
-function findStatusEntry(listing: ArtifactListing): ArtifactEntry | null {
+/**
+ * The status page's entry in a listing: null when the folder has none or is unavailable, and
+ * undefined when a truncated listing leaves it out. Only a complete listing proves the page is
+ * gone: past the listing cap it may still exist.
+ */
+function findStatusEntry(listing: ArtifactListing): ArtifactEntry | null | undefined {
   if (!listing.available) return null;
-  return listing.entries.find((e) => e.path === AGENT_INTERFACE_STATUS_ARTIFACT) ?? null;
+  const entry = listing.entries.find((e) => e.path === AGENT_INTERFACE_STATUS_ARTIFACT);
+  return entry ?? (listing.truncated ? undefined : null);
+}
+
+// Called after each successful listing, so a status page read that failed or may be stale
+// retries on the next one.
+const listingListeners = new Set<(workspaceId: string) => void>();
+
+export function subscribeStatusListings(workspaceId: string, listener: () => void): () => void {
+  const onListing = (listedId: string) => {
+    if (listedId === workspaceId) listener();
+  };
+  listingListeners.add(onListing);
+  return () => listingListeners.delete(onListing);
 }
 
 /**
  * Lists the artifacts folder for the status page while the view is enabled, on the same signals
- * as the Artifacts panel. Mount once per main pane. A failed listing keeps the last entry, so a
- * reconnect does not flip the pane back to the transcript.
+ * as the Artifacts panel. Mount once per main pane. A failed or truncated listing keeps the last
+ * entry, so a reconnect or a crowded folder does not flip the pane back to the transcript.
  */
 function useStatusArtifactPoll(workspaceId: string, enabled: boolean) {
   const { api } = useAPI();
@@ -219,8 +236,13 @@ function useStatusArtifactPoll(workspaceId: string, enabled: boolean) {
       })
       .then((result) => {
         if (controller.signal.aborted) return;
-        if (result.success) publishStatusEntry(workspaceId, findStatusEntry(result.data));
-        else console.debug("[Agent interface] status page listing failed:", result.error);
+        if (!result.success) {
+          console.debug("[Agent interface] status page listing failed:", result.error);
+          return;
+        }
+        const entry = findStatusEntry(result.data);
+        if (entry !== undefined) publishStatusEntry(workspaceId, entry);
+        for (const listener of listingListeners) listener(workspaceId);
       })
       .catch((error: unknown) => {
         if (isAbortError(error) || controller.signal.aborted) return;

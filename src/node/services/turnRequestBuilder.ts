@@ -2358,6 +2358,7 @@ export class TurnRequestBuilder {
       scratchDirSet: scratchDir !== undefined,
       artifactsEnabled: artifactsExperimentEnabled,
       agentInterfaceEnabled: isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
+      sideChat: isSideChat,
       resolveLocation: () =>
         resolveArtifactsLocation(
           this.dependencies.config.sessionsDir,

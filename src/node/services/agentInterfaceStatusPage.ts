@@ -2,8 +2,8 @@ import {
   AGENT_INTERFACE_STATUS_ARTIFACT,
   ARTIFACT_THEME_VARIABLES,
 } from "@/common/constants/artifacts";
-import type { ArtifactsLocation, AvailableArtifactsLocation } from "./artifactsOperations";
-import { readArtifactBytesAtLocation, writeArtifactAtLocation } from "./artifactsOperations";
+import type { ArtifactsLocation } from "./artifactsOperations";
+import { writeArtifactAtLocation } from "./artifactsOperations";
 import { log } from "./log";
 
 const THEME_VARIABLE_NAMES = Object.keys(ARTIFACT_THEME_VARIABLES)
@@ -93,19 +93,23 @@ export const AGENT_INTERFACE_STATUS_TEMPLATE = `<!doctype html>
 `;
 
 /**
- * At turn start: whether the Agent interface view is active this turn (both flags on and
- * XUM_SCRATCH_DIR set, so the agent can edit what was seeded), seeding the status page first
- * when it is active and the page does not exist yet. Never overwrites (the agent owns the page
- * once it exists) and never throws: a failed seed is logged and the turn goes on.
+ * At turn start: whether the Agent interface view is active this turn (both flags on, not a side
+ * chat, and XUM_SCRATCH_DIR set, so the agent can edit what was seeded), seeding the status page
+ * first when it is active and the page does not exist yet. Side chats keep their transcript:
+ * they cannot write files, and on narrow layouts they fill the main pane. Never overwrites (the
+ * agent owns the page once it exists) and never throws: a failed seed is logged and the turn
+ * goes on.
  */
 export async function prepareAgentInterfaceStatusPage(args: {
   scratchDirSet: boolean;
   artifactsEnabled: boolean;
   agentInterfaceEnabled: boolean;
+  sideChat: boolean;
   resolveLocation: () => Promise<ArtifactsLocation>;
   abortSignal?: AbortSignal;
 }): Promise<boolean> {
-  const active = args.scratchDirSet && args.artifactsEnabled && args.agentInterfaceEnabled;
+  const active =
+    args.scratchDirSet && args.artifactsEnabled && args.agentInterfaceEnabled && !args.sideChat;
   if (active) await seedStatusPage(args.resolveLocation, args.abortSignal);
   return active;
 }
@@ -117,28 +121,14 @@ async function seedStatusPage(
   try {
     const location = await resolveLocation();
     if (location.kind === "unavailable") return;
-    if (await statusPageExists(location, abortSignal)) return;
+    // createOnly: a page that exists, or that the agent writes meanwhile, is left as it is.
     await writeArtifactAtLocation(
       location,
       AGENT_INTERFACE_STATUS_ARTIFACT,
-      AGENT_INTERFACE_STATUS_TEMPLATE
+      AGENT_INTERFACE_STATUS_TEMPLATE,
+      { createOnly: true, abortSignal }
     );
   } catch (error) {
     log.debug("Seeding the agent interface status page failed", { error });
   }
-}
-
-async function statusPageExists(
-  location: AvailableArtifactsLocation,
-  abortSignal: AbortSignal | undefined
-): Promise<boolean> {
-  // A 1-byte cap: only whether the file is there matters, not its content.
-  const outcome = await readArtifactBytesAtLocation(
-    location,
-    AGENT_INTERFACE_STATUS_ARTIFACT,
-    1,
-    abortSignal
-  );
-  // "invalid" (e.g. a directory or a symlink out of the folder) is not ours to replace either.
-  return outcome.status !== "missing";
 }

@@ -10,7 +10,12 @@ import {
 } from "./agentInterfaceStatusPage";
 import type { ArtifactsLocation } from "./artifactsOperations";
 
-const ALL_ON = { scratchDirSet: true, artifactsEnabled: true, agentInterfaceEnabled: true };
+const ALL_ON = {
+  scratchDirSet: true,
+  artifactsEnabled: true,
+  agentInterfaceEnabled: true,
+  sideChat: false,
+};
 
 describe("prepareAgentInterfaceStatusPage", () => {
   let scratchDir: string;
@@ -46,8 +51,9 @@ describe("prepareAgentInterfaceStatusPage", () => {
     { ...ALL_ON, artifactsEnabled: false },
     { ...ALL_ON, agentInterfaceEnabled: false },
     { ...ALL_ON, scratchDirSet: false },
+    { ...ALL_ON, sideChat: true },
   ])(
-    "is inactive and writes nothing unless both flags are on and the scratch dir is set (%o)",
+    "is inactive and writes nothing unless both flags are on in a main chat with a scratch dir (%o)",
     async (flags) => {
       expect(await prepare(flags)).toBe(false);
       expect(existsSync(statusPath())).toBe(false);

@@ -41,6 +41,7 @@ import {
   type ArtifactBytesOutcome,
   type ArtifactReadOptions,
   type ArtifactReadOutcome,
+  type ArtifactWriteOptions,
 } from "./artifactStore";
 
 export type ArtifactsContext = Pick<
@@ -267,18 +268,25 @@ export async function readArtifact(
 /**
  * Write one host-maintained artifact (e.g. the goal status board) wherever the location lives,
  * with the same containment rules as reads. Throws on failure; callers decide whether to care.
+ * `createOnly` writes only a missing file, atomically: a file that exists, or appears while
+ * the write runs, is left as it is.
  */
 export async function writeArtifactAtLocation(
   location: Exclude<ArtifactsLocation, { kind: "unavailable" }>,
   relPath: string,
-  content: string
+  content: string,
+  options?: ArtifactWriteOptions & { abortSignal?: AbortSignal }
 ): Promise<void> {
   if (location.kind === "runtime") {
-    await writeArtifactOnRuntime(location.runtime, location.dir, relPath, content);
+    await writeArtifactOnRuntime(location.runtime, location.dir, relPath, content, {
+      abortSignal: options?.abortSignal,
+      createOnly: options?.createOnly,
+    });
     return;
   }
   await writeArtifactToDir(location.dir, relPath, content, {
     requireDescriptorPaths: location.containerWritable,
+    createOnly: options?.createOnly,
   });
 }
 

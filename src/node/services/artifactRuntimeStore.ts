@@ -15,6 +15,7 @@ import {
   type ArtifactBytesOutcome,
   type ArtifactReadOptions,
   type ArtifactReadOutcome,
+  type ArtifactWriteOptions,
 } from "./artifactStore";
 
 /**
@@ -340,6 +341,20 @@ export async function readArtifactBytesOnRuntime(
   return parseArtifactReadBytes(stdout, maxBytes);
 }
 
+const REPLACE_LEAF_SCRIPT = String.raw`xum_tmp=".$xum_leaf.$$.tmp"
+rm -f -- "$xum_tmp"
+set -C
+(umask 022; cat > "$xum_tmp") || { rm -f -- "$xum_tmp"; exit 1; }
+mv -f -- "$xum_tmp" "$xum_leaf" || { rm -f -- "$xum_tmp"; exit 1; }`;
+
+// A leaf that exists by the time noclobber opens it is left alone; stdin is drained so the
+// writer does not see a broken pipe.
+const CREATE_LEAF_SCRIPT = String.raw`set -C
+if ! (umask 022; cat > "$xum_leaf") 2>/dev/null; then
+  if [ ! -e "$xum_leaf" ] && [ ! -L "$xum_leaf" ]; then exit 1; fi
+  cat >/dev/null
+fi`;
+
 /**
  * Writes one host-maintained artifact (the goal status board) through the Runtime. Only the
  * artifacts folder itself is created (no `mkdir -p`): the scratch dir above it is deleted when
@@ -347,11 +362,16 @@ export async function readArtifactBytesOnRuntime(
  * reads: cd one folder at a time (creating missing ones), refusing symlinked
  * folders, the final cwd must stay under the root's real path, and an existing leaf must be a
  * regular file. Content arrives on stdin into a hidden temp file (noclobber) that is renamed
- * over the leaf, so readers never see a partial board. Runtime.writeFile is not used: on SSH it
- * deliberately writes through symlinks, which would let the agent redirect a host write.
+ * over the leaf, so readers never see a partial board. `createOnly` (see ArtifactWriteOptions)
+ * creates the leaf itself under noclobber instead, which is atomic (O_EXCL), and leaves an
+ * existing leaf as it is. Runtime.writeFile is not used: on SSH it deliberately writes through
+ * symlinks, which would let the agent redirect a host write.
  * Prints `MAGIC ok` or `MAGIC refused reason`.
  */
-export function buildArtifactWriteScript(segments: string[]): string {
+export function buildArtifactWriteScript(
+  segments: string[],
+  options?: ArtifactWriteOptions
+): string {
   assert(segments.length > 0, "segments must not be empty");
   const dirSegments = segments.slice(0, -1).map((segment) => shescape.quote(segment));
   const leaf = shescape.quote(segments[segments.length - 1]);
@@ -370,11 +390,7 @@ case $(pwd -P) in "$xum_root"/*|"$xum_root") ;; *) xum_refuse folder ;; esac
 xum_leaf=${leaf}
 if [ -L "$xum_leaf" ]; then xum_refuse leaf; fi
 if [ -e "$xum_leaf" ] && [ ! -f "$xum_leaf" ]; then xum_refuse leaf; fi
-xum_tmp=".$xum_leaf.$$.tmp"
-rm -f -- "$xum_tmp"
-set -C
-(umask 022; cat > "$xum_tmp") || { rm -f -- "$xum_tmp"; exit 1; }
-mv -f -- "$xum_tmp" "$xum_leaf" || { rm -f -- "$xum_tmp"; exit 1; }
+${options?.createOnly === true ? CREATE_LEAF_SCRIPT : REPLACE_LEAF_SCRIPT}
 printf '${WRITE_MAGIC}\0ok\0'
 `;
 }
@@ -384,15 +400,15 @@ export async function writeArtifactOnRuntime(
   artifactsDir: string,
   relPath: string,
   content: string,
-  abortSignal?: AbortSignal
+  options?: ArtifactWriteOptions & { abortSignal?: AbortSignal }
 ): Promise<void> {
   const segments = parseArtifactRelativePath(relPath);
   if (typeof segments === "string") throw new Error(segments);
-  const result = await execBuffered(runtime, buildArtifactWriteScript(segments), {
+  const result = await execBuffered(runtime, buildArtifactWriteScript(segments, options), {
     cwd: "/",
     pathEnv: { XUM_ARTIFACTS_DIR: artifactsDir },
     timeout: EXEC_TIMEOUT_SECONDS,
-    abortSignal,
+    abortSignal: options?.abortSignal,
     stdin: content,
     maxOutputBytes: READ_OUTPUT_SLACK_BYTES,
   });

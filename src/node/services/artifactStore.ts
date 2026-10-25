@@ -279,6 +279,15 @@ export type ArtifactBytesOutcome =
   | { status: "missing" }
   | { status: "invalid"; error: string };
 
+export interface ArtifactWriteOptions {
+  /**
+   * Write only a missing file, created exclusively, so a file that exists or appears during
+   * the write is never replaced (the agent's own page, for one). Readers may see it partly
+   * written for a moment: only replacing writes go through a temp file.
+   */
+  createOnly?: boolean;
+}
+
 export interface ArtifactReadOptions extends ArtifactDirAccessOptions {
   /** Allow hidden path segments (pinned workspace files). */
   allowHidden?: boolean;
@@ -422,13 +431,14 @@ export async function readArtifactBytesFromDir(
  * can swap it (or a folder in it) for a symlink between the checks and open(); O_NOFOLLOW only
  * guards the leaf. The opened temp file is therefore verified to be inside the pinned real dir
  * before any byte is written, and the rename result is verified through the still-open
- * descriptor. Throws on any refusal.
+ * descriptor. Throws on any refusal. `createOnly` (see ArtifactWriteOptions) creates the file
+ * itself the same exclusive way instead, with no temp file or rename.
  */
 export async function writeArtifactToDir(
   artifactsDir: string,
   relPath: string,
   content: string,
-  options?: { requireDescriptorPaths?: boolean }
+  options?: ArtifactWriteOptions & { requireDescriptorPaths?: boolean }
 ): Promise<void> {
   // A container-written dir refuses the swap-raceable inode fallback, as reads do.
   const requireDescriptorPath = options?.requireDescriptorPaths === true;
@@ -483,7 +493,10 @@ export async function writeArtifactToDir(
       throw new Error("Artifacts folder changed during the write");
     }
     const base = dirHandle ? descriptorPath(dirHandle) : parent;
-    await writeArtifactFileInDir(base, parent, realDir, segments, content, requireDescriptorPath);
+    await writeArtifactFileInDir(base, parent, realDir, segments, content, {
+      requireDescriptorPath,
+      createOnly: options?.createOnly === true,
+    });
   } finally {
     await dirHandle?.close();
   }
@@ -496,8 +509,9 @@ async function writeArtifactFileInDir(
   realDir: string,
   segments: string[],
   content: string,
-  requireDescriptorPath: boolean
+  options: { requireDescriptorPath: boolean; createOnly: boolean }
 ): Promise<void> {
+  const { requireDescriptorPath, createOnly } = options;
   const leaf = segments[segments.length - 1];
   const target = path.join(base, leaf);
   try {
@@ -505,13 +519,20 @@ async function writeArtifactFileInDir(
   } catch (error) {
     if (!isMissing(error)) throw error;
   }
-  const tempName = `.${leaf}.${randomUUID()}.tmp`;
+  // createOnly opens the target itself: O_EXCL fails on a file that appeared since the check.
+  const tempName = createOnly ? leaf : `.${leaf}.${randomUUID()}.tmp`;
   const tempPath = path.join(base, tempName);
-  const handle = await fs.open(
-    tempPath,
-    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-    0o644
-  );
+  let handle: fs.FileHandle;
+  try {
+    handle = await fs.open(
+      tempPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o644
+    );
+  } catch (error) {
+    if (createOnly && (error as NodeJS.ErrnoException | undefined)?.code === "EEXIST") return;
+    throw error;
+  }
   let renamed = false;
   try {
     const openedStat = await handle.stat();
@@ -528,6 +549,7 @@ async function writeArtifactFileInDir(
       throw new Error("Artifacts folder changed during the write");
     }
     await handle.writeFile(content, "utf8");
+    if (createOnly) return;
     await fs.rename(tempPath, target);
     renamed = true;
     // The descriptor follows the file: it must now be the target inside the pinned dir.
@@ -545,8 +567,9 @@ async function writeArtifactFileInDir(
     }
   } finally {
     await handle.close();
-    // The random temp name is ours wherever a swapped folder put it; removing it is safe.
-    if (!renamed) await fs.rm(tempPath, { force: true });
+    // The random temp name is ours wherever a swapped folder put it; removing it is safe. A
+    // created target is not: by then its name may hold another writer's file.
+    if (!renamed && !createOnly) await fs.rm(tempPath, { force: true });
   }
 }
 

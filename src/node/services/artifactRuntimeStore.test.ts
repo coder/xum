@@ -19,6 +19,7 @@ import {
   listArtifactsInDir,
   readArtifactFromDir,
   writeArtifactToDir,
+  type ArtifactWriteOptions,
 } from "./artifactStore";
 
 // A LocalRuntime over a temp dir stands in for SSH/Docker: the same scripts run through
@@ -335,10 +336,10 @@ describe("artifactRuntimeStore", () => {
 
   // Host and runtime writers share one contract, so every case runs against both.
   const writers = {
-    host: (dir: string, relPath: string, content: string) =>
-      writeArtifactToDir(dir, relPath, content),
-    runtime: (dir: string, relPath: string, content: string) =>
-      writeArtifactOnRuntime(runtime, dir, relPath, content),
+    host: (dir: string, relPath: string, content: string, options?: ArtifactWriteOptions) =>
+      writeArtifactToDir(dir, relPath, content, options),
+    runtime: (dir: string, relPath: string, content: string, options?: ArtifactWriteOptions) =>
+      writeArtifactOnRuntime(runtime, dir, relPath, content, options),
   };
 
   const outcome = (write: Promise<void>) =>
@@ -372,6 +373,30 @@ describe("artifactRuntimeStore", () => {
           () => false
         )
       ).toBe(false);
+    });
+
+    test("createOnly writes a missing file and leaves an existing one as it is", async () => {
+      await writeArtifact(artifactsDir, "status.html", "seed", { createOnly: true });
+      expect(await fs.readFile(path.join(artifactsDir, "status.html"), "utf8")).toBe("seed");
+      await fs.writeFile(path.join(artifactsDir, "status.html"), "agent page");
+      // The exclusive create, not a separate check, keeps the existing file.
+      expect(
+        await outcome(writeArtifact(artifactsDir, "status.html", "seed", { createOnly: true }))
+      ).toBe("written");
+      expect(await fs.readFile(path.join(artifactsDir, "status.html"), "utf8")).toBe("agent page");
+      expect(await fs.readdir(artifactsDir)).toEqual(["status.html"]);
+
+      const outside = path.join(tempDir, "outside.txt");
+      await fs.writeFile(outside, "keep");
+      await fs.symlink(outside, path.join(artifactsDir, "leaf.html"));
+      await fs.symlink(path.join(tempDir, "missing.txt"), path.join(artifactsDir, "dangling.html"));
+      for (const leaf of ["leaf.html", "dangling.html"]) {
+        expect(await outcome(writeArtifact(artifactsDir, leaf, "x", { createOnly: true }))).toBe(
+          "refused"
+        );
+      }
+      expect(await fs.readFile(outside, "utf8")).toBe("keep");
+      expect(await fs.readdir(tempDir)).not.toContain("missing.txt");
     });
 
     test("never writes through symlinks or outside the dir", async () => {
