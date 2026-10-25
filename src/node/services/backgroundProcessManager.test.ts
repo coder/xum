@@ -1684,13 +1684,17 @@ describe("BackgroundProcessManager", () => {
       }
       expect(proc?.monitor?.pendingLines ?? []).toEqual(["ERR boom"]);
 
-      // Agent reads with a filter that excludes the error line: it sees only "DONE".
-      const filtered = await manager.getOutput(result.processId, "DONE", false, 1);
-      expect(filtered.success).toBe(true);
-      if (filtered.success) {
-        expect(filtered.output).toContain("DONE");
-        expect(filtered.output).not.toContain("ERR boom");
+      // Agent reads with a filter that excludes the error line: it sees only "DONE". printf writes
+      // the two lines separately (bash line-buffers stdout), and a filtered read that consumed only
+      // "ERR boom" returns an empty page, so read again until "DONE" arrives (#7256).
+      let filteredOutput = "";
+      while (!filteredOutput.includes("DONE")) {
+        const filtered = await manager.getOutput(result.processId, "DONE", false, 1);
+        expect(filtered.success).toBe(true);
+        if (!filtered.success) return;
+        filteredOutput += filtered.output;
       }
+      expect(filteredOutput).not.toContain("ERR boom");
       // The filtered read must not have advanced the shown mark.
       proc = await manager.getProcess(result.processId);
       expect(proc?.shownThroughOffset ?? -1).toBe(0);
