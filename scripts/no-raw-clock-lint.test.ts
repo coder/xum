@@ -107,6 +107,19 @@ test("passes a local name that shadows an imported timer", () => {
   );
 });
 
+test("passes a local named global or globalThis", () => {
+  expect(rawClock(`function read(global: G) {\n  return global.Date.now();\n}`)).toEqual([]);
+  expect(rawClock(`function arm(globalThis: G) {\n  globalThis.setTimeout(f, 1);\n}`)).toEqual([]);
+  const patch = (code: string) => ids("no-global-clock-patch", code);
+  expect(patch(`function fake(global: G) {\n  global.Date.now = () => 1;\n}`)).toEqual([]);
+});
+
+test("reports timers from a named default import of a timers module", () => {
+  expect(
+    rawClock(`import { default as timers } from "node:timers";\ntimers.setTimeout(fire, 10);`)
+  ).toEqual(["raw"]);
+});
+
 test("reports Node's global object like globalThis", () => {
   expect(rawClock(`const t = global.Date.now();`)).toEqual(["raw"]);
   expect(rawClock(`global.setTimeout(() => undefined, 10);`)).toEqual(["raw"]);

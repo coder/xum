@@ -81,6 +81,11 @@ function resolveVariable(sourceCode, identifier) {
   return null;
 }
 
+/** True when a parameter, import or local declares the identifier's name in its scope chain. */
+function isDeclaredLocally(sourceCode, identifier) {
+  return (resolveVariable(sourceCode, identifier)?.defs.length ?? 0) > 0;
+}
+
 function variableDeclarator(variable) {
   if (variable.defs.length !== 1) {
     return null;
@@ -806,9 +811,12 @@ const localPlugin = {
           node.callee.type === "Identifier" &&
           node.callee.name === "require" &&
           isTimerModule(node.arguments[0]);
-        // `globalThis` or Node's `global`: both name the global object.
+        // `globalThis` or Node's `global`: both name the global object, unless a parameter or
+        // local declares that name.
         const isGlobalObject = (node) =>
-          node.type === "Identifier" && (node.name === "globalThis" || node.name === "global");
+          node.type === "Identifier" &&
+          (node.name === "globalThis" || node.name === "global") &&
+          !isDeclaredLocally(context.sourceCode, node);
         const globalMember = (node, name) =>
           node.type === "MemberExpression" &&
           !node.computed &&
@@ -828,12 +836,14 @@ const localPlugin = {
           ImportDeclaration(node) {
             if (node.importKind === "type" || !isTimerModule(node.source)) return;
             for (const specifier of node.specifiers) {
-              if (specifier.type !== "ImportSpecifier") {
-                moduleBindings.add(specifier.local);
-              } else if (
-                specifier.importKind !== "type" &&
-                TIMERS.has(specifier.imported.name ?? specifier.imported.value)
-              ) {
+              const imported =
+                specifier.type === "ImportSpecifier"
+                  ? (specifier.imported.name ?? specifier.imported.value)
+                  : null;
+              // A namespace or default import, or `import { default as timers }`.
+              if (imported === null || imported === "default") {
+                if (specifier.importKind !== "type") moduleBindings.add(specifier.local);
+              } else if (specifier.importKind !== "type" && TIMERS.has(imported)) {
                 timerBindings.add(specifier.local);
               }
             }
@@ -987,6 +997,7 @@ const localPlugin = {
                 !object.computed &&
                 object.object.type === "Identifier" &&
                 (object.object.name === "globalThis" || object.object.name === "global") &&
+                !isDeclaredLocally(context.sourceCode, object.object) &&
                 object.property.name === "Date");
             if (
               left.type === "MemberExpression" &&
