@@ -51,7 +51,7 @@ describe("openInEditor", () => {
   // navigations and close() calls, mirroring a real popup.
   function createBrowserModeWindow(
     calls: OpenCall[],
-    opts?: { popupBlocked?: boolean; denyEditorPlaceholders?: boolean; hostname?: string }
+    opts?: { popupBlocked?: boolean; denyEditorPlaceholders?: boolean }
   ) {
     const placeholder = {
       closed: false,
@@ -68,7 +68,7 @@ describe("openInEditor", () => {
     });
     const windowValue = {
       localStorage: { getItem: () => null },
-      location: { hostname: opts?.hostname ?? "localhost" },
+      location: { hostname: "localhost" },
       open: (url: string, target?: string) => {
         calls.push([url, target]);
         const wrapperBlocked =
@@ -126,43 +126,6 @@ describe("openInEditor", () => {
       srcBaseDir: "/home/daytona/xum",
       daytona: { sandboxId: "sb-1" },
     };
-
-    test("remote browser: refuses before recording or launching", async () => {
-      const calls: OpenCall[] = [];
-      const { windowValue, placeholder } = createBrowserModeWindow(calls, {
-        hostname: "xum.example.com",
-      });
-      const recordEditorOpen = mock(() =>
-        Promise.resolve({ success: true as const, data: undefined })
-      );
-      const api = createTestApiClient({ general: { recordEditorOpen } });
-
-      const result = await withWindow(windowValue, () =>
-        openInEditor({ api, workspaceId, targetPath: parentDir, runtimeConfig: daytonaConfig })
-      );
-
-      expect(result.success).toBe(false);
-      expect(recordEditorOpen).not.toHaveBeenCalled();
-      expect(placeholder.navigations).toEqual([]);
-      expect(placeholder.closed).toBe(true);
-    });
-
-    test("a browser on the server's machine opens the sandbox", async () => {
-      const calls: OpenCall[] = [];
-      const { windowValue, placeholder } = createBrowserModeWindow(calls);
-
-      const result = await withWindow(windowValue, () =>
-        openInEditor({
-          api: createApiStub(),
-          workspaceId,
-          targetPath: parentDir,
-          runtimeConfig: daytonaConfig,
-        })
-      );
-
-      expect(result).toEqual({ success: true });
-      expect(placeholder.navigations[0]).toContain("ssh-remote+xum-daytona-sb-1");
-    });
 
     // The default srcBaseDir (~/mux) is persisted unresolved: the sandbox may not exist yet when
     // the workspace is created, so only the backend can resolve it once the sandbox is up.

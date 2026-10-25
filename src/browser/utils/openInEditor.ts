@@ -176,7 +176,7 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
       if (!recorded.success) {
         return { error: recorded.error };
       }
-      return { launchToken, remotePath: resolvedRemotePath(recorded.data) };
+      return { launchToken, remotePath: recorded.data?.remotePath };
     } catch (error) {
       // Ambiguous outcome: the backend may have committed the reservation even though the
       // response was lost, and this open will not launch. Best-effort reconciliation with
@@ -211,7 +211,7 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
     if (isPlaceholderClosed()) {
       return { success: false, error: placeholderClosedError };
     }
-    const admission = await recordOpenBeforeLaunch(pathToResolve(remote));
+    const admission = await recordOpenBeforeLaunch(remote?.path);
     if ("error" in admission) {
       return { success: false, error: admission.error };
     }
@@ -259,14 +259,6 @@ interface RemoteEditorPath {
   deepLinkFor: (resolvedPath: string) => string | null;
 }
 
-function pathToResolve(remote: RemoteEditorPath | undefined): string | undefined {
-  return remote?.path;
-}
-
-function resolvedRemotePath(data: { remotePath: string } | null | undefined): string | undefined {
-  return data?.remotePath;
-}
-
 function remoteDeepLink(
   deepLink: string,
   remote: RemoteEditorPath | undefined,
@@ -274,28 +266,6 @@ function remoteDeepLink(
 ): string {
   if (remote == null || resolvedPath == null) return deepLink;
   return remote.deepLinkFor(resolvedPath) ?? deepLink;
-}
-
-/**
- * A browser on another machine cannot open a Daytona sandbox: the deep link launches the editor
- * there, but the alias, token and pinned host keys exist only in the Xum server's
- * ~/.ssh/config. Refused before recording, so no editor-open marker is left for an editor that
- * cannot connect. Recording the open (recordEditorOpen) starts the sandbox and refreshes its
- * token.
- */
-function launchDaytonaFromThisMachine(
-  args: OpenInEditorArgs,
-  launch: () => Promise<OpenInEditorResult>
-): Promise<OpenInEditorResult> {
-  const isDaytona = isSSHRuntime(args.runtimeConfig) && args.runtimeConfig.daytona != null;
-  if (isDaytona && isBrowserModeNow() && !isLocalhost(window.location.hostname)) {
-    return Promise.resolve({
-      success: false,
-      error:
-        "Daytona sandboxes open in an editor only from the Xum desktop app or a browser on the Xum server's machine.",
-    });
-  }
-  return launch();
 }
 
 async function openInEditorWithLaunch(
@@ -445,9 +415,7 @@ async function openInEditorWithLaunch(
     }
 
     // The backend resolves only an SSH workspace's path under ~ (see RemoteEditorPath).
-    return launchDaytonaFromThisMachine(args, () =>
-      launch(deepLink, { path: args.targetPath, deepLinkFor })
-    );
+    return launch(deepLink, { path: args.targetPath, deepLinkFor });
   }
 
   // Custom editor:
