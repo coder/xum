@@ -31,6 +31,7 @@ import type {
   ProviderRequest,
   StreamRequestOptions,
 } from "@/node/services/turnEngine/ProviderRequest";
+import { convertToSendMessageError } from "@/node/services/turnEngine/streamErrors";
 import type { TurnRegistry } from "@/node/services/turnEngine/TurnRegistry";
 import type { TurnResources, TurnStartup } from "@/node/services/turnEngine/TurnResources";
 import {
@@ -352,7 +353,6 @@ export interface TurnEngineDeps {
     streamInfo: WorkspaceStreamInfo,
     historySequence: number
   ) => Promise<void>;
-  readonly convertToSendMessageError: (error: unknown) => SendMessageError;
 }
 
 export class TurnEngine {
@@ -600,7 +600,7 @@ export class TurnEngine {
       abortReason: this.deps.turnRegistry.getStartupAbortReason(start.options.abortSignal),
     });
     // Convert to strongly-typed error
-    return Err(this.deps.convertToSendMessageError(error));
+    return Err(convertToSendMessageError(error));
   }
 
   /**
