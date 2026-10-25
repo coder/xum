@@ -336,6 +336,48 @@ interface AiDefaultsControlsProps {
   onReasoningModeChange: (mode: OpenAIReasoningMode) => void;
 }
 
+/** The Reasoning half of AiDefaultsControls. */
+function ReasoningDefaultsControl(props: AiDefaultsControlsProps & { inheritLabel: string }) {
+  return (
+    <div className="space-y-1">
+      <div className="text-muted text-xs">Reasoning</div>
+      <div className="flex items-center gap-2">
+        {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
+        <ThinkingSelectorControl
+          modelString={props.effectiveModel}
+          modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
+          thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
+          onThinkingLevelChange={(level) => props.onThinkingChange(level)}
+          reasoningMode={props.reasoningModeValue}
+          reasoningModeInherited={props.reasoningModeInherited}
+          onReasoningModeChange={props.onReasoningModeChange}
+          allowReasoningModes={props.allowReasoningModes}
+          allowFastMode={false}
+          variant="box"
+          inheritOption={{
+            label: props.inheritLabel,
+            // Inherit remains the fallback, but only Auto reads as selected.
+            selected: props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
+            onSelect: () => props.onThinkingChange(INHERIT),
+          }}
+          autoRouting={props.thinkingAutoRouting}
+        />
+        {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-9 px-2"
+            onClick={() => props.onThinkingChange(INHERIT)}
+          >
+            Reset
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function AiDefaultsControls(props: AiDefaultsControlsProps) {
   const inheritLabel = props.inheritLabel ?? "Inherit";
 
@@ -370,43 +412,7 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
       </div>
 
       {props.showReasoning === false ? null : (
-        <div className="space-y-1">
-          <div className="text-muted text-xs">Reasoning</div>
-          <div className="flex items-center gap-2">
-            {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
-            <ThinkingSelectorControl
-              modelString={props.effectiveModel}
-              modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
-              thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
-              onThinkingLevelChange={(level) => props.onThinkingChange(level)}
-              reasoningMode={props.reasoningModeValue}
-              reasoningModeInherited={props.reasoningModeInherited}
-              onReasoningModeChange={props.onReasoningModeChange}
-              allowReasoningModes={props.allowReasoningModes}
-              allowFastMode={false}
-              variant="box"
-              inheritOption={{
-                label: inheritLabel,
-                // Inherit remains the fallback, but only Auto reads as selected.
-                selected:
-                  props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
-                onSelect: () => props.onThinkingChange(INHERIT),
-              }}
-              autoRouting={props.thinkingAutoRouting}
-            />
-            {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
-              <Button
-                type="button"
-                variant="ghost"
-                size="sm"
-                className="h-9 px-2"
-                onClick={() => props.onThinkingChange(INHERIT)}
-              >
-                Reset
-              </Button>
-            ) : null}
-          </div>
-        </div>
+        <ReasoningDefaultsControl {...props} inheritLabel={inheritLabel} />
       )}
     </div>
   );

@@ -705,6 +705,15 @@ function ExperimentSettingsPanel(props: ExperimentSettingsPanelProps) {
   return <div className="bg-background-secondary px-4 py-3">{props.children}</div>;
 }
 
+/** Status page agent does nothing without Agent interface view, so it shows only under it. */
+function visibleArtifactsSubExperimentIds(agentInterfaceEnabled: boolean): readonly ExperimentId[] {
+  return agentInterfaceEnabled
+    ? ARTIFACTS_SUB_EXPERIMENT_IDS
+    : ARTIFACTS_SUB_EXPERIMENT_IDS.filter(
+        (id) => id !== EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT
+      );
+}
+
 // Renders a parent experiment's sub-experiment toggles as a nested list.
 // Extracted so the nested-config call sites mirror their siblings
 // (AutoModelRoutingExperimentConfig) instead of inlining the map in the
@@ -734,10 +743,8 @@ export function ExperimentsSection() {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const ptcEnabled = useExperimentValue(EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
-  const agentInterfaceEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE);
-  // Status page agent does nothing without Agent interface view, so it shows only under it.
-  const artifactsSubExperimentIds = ARTIFACTS_SUB_EXPERIMENT_IDS.filter(
-    (id) => id !== EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT || agentInterfaceEnabled
+  const artifactsSubExperimentIds = visibleArtifactsSubExperimentIds(
+    useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE)
   );
   // Only show user-overridable experiments (non-overridable ones are hidden since users can't
   // change them). Sub-experiments render nested under their parent row instead.
