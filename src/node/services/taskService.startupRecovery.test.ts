@@ -36,6 +36,7 @@ import {
   removeTaskServiceTestRoot,
   removeWorkspaceFromTestConfig,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -1521,6 +1522,7 @@ describe("TaskService", () => {
     );
     for (const child of children.filter((child) => child.id !== "missing-patch")) {
       await upsertSubagentGitPatchArtifact({
+        locks: nodeSessionLocks,
         workspaceId: parentId,
         workspaceSessionDir: path.join(config.sessionsDir, parentId),
         childTaskId: child.id!,

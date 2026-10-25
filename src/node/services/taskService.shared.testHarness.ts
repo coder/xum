@@ -40,6 +40,7 @@ import {
   workspaceTurnManagerInternals,
   workspaceTurnRecord,
 } from "@/node/services/taskService.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 /**
  * Per-test temp root. Each split file owns its `rootDir` and installs it with
@@ -399,6 +400,7 @@ export async function upsertTestSubagentReports(params: {
   const parentSessionDir = path.join(params.config.sessionsDir, params.parentId);
   for (const report of params.reports) {
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: params.parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: report.childTaskId,

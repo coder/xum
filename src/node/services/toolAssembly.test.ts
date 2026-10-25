@@ -20,6 +20,7 @@ import { createFileEditReplaceStringTool } from "./tools/file_edit_replace_strin
 import { getTestDeps } from "./tools/testHelpers";
 // The Node layer: these tests read through host runtimes.
 import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function executableTool(description: string): Tool {
   return {
@@ -33,6 +34,7 @@ describe("applyToolPolicyAndExperiments", () => {
   test("PTC keeps literal file edits direct without duplicating them in the sandbox", async () => {
     using tmp = new DisposableTempDir("ptc-direct-file-edits");
     const deps = {
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: tmp.path,
       runtime: new LocalRuntime(tmp.path),

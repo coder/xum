@@ -58,6 +58,7 @@ import {
   upsertTestSubagentReports,
   writePendingBestOfParentPartial,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -450,6 +451,7 @@ describe("TaskService", () => {
 
     const planFilePath = path.join(rootDir, "plans", "repo", "child-222.md");
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
@@ -506,6 +508,7 @@ describe("TaskService", () => {
     ).mockResolvedValue(undefined);
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
@@ -556,6 +559,7 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config);
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
@@ -601,6 +605,7 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config);
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
@@ -642,6 +647,7 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config);
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,
@@ -678,6 +684,7 @@ describe("TaskService", () => {
     // Both children failed terminally (e.g. model_refusal) and were cleaned up:
     // no config entry, no report artifact — only the failure artifact remains.
     await upsertSubagentFailureArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: failedChildId,
@@ -687,6 +694,7 @@ describe("TaskService", () => {
       errorMessage: "Model refused (finishReason: refusal): anthropic:claude-fable-5",
     });
     await upsertSubagentFailureArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: workflowChildId,
@@ -757,6 +765,7 @@ describe("TaskService", () => {
     const { taskService } = createTaskServiceHarness(config);
 
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: path.join(config.sessionsDir, parentId),
       childTaskId: childId,

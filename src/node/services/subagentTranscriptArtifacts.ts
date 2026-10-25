@@ -3,7 +3,6 @@ import * as path from "node:path";
 import type { ThinkingLevel } from "@/common/types/thinking";
 
 import { log } from "@/node/services/log";
-import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
@@ -114,13 +113,12 @@ export async function updateSubagentTranscriptArtifactsFile(params: {
   workspaceId: string;
   workspaceSessionDir: string;
   update: (file: SubagentTranscriptArtifactsFile) => void;
-  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
-  locks?: SessionLocks;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
   /** The session files of the workspace (phase 5). Absent: the Node layer. */
   files?: SessionFiles;
 }): Promise<SubagentTranscriptArtifactsFile> {
-  // mutation-equivalent: locks is a SessionLocks object or undefined, so ?? and || agree
-  const fileLocks = (params.locks ?? nodeSessionLocks).workspaceFiles;
+  const fileLocks = params.locks.workspaceFiles;
   return fileLocks.withLock(params.workspaceId, async () => {
     // mutation-equivalent: files is a SessionFiles object or undefined, so ?? and || agree
     const files = params.files ?? nodeSessionFiles;
@@ -147,8 +145,8 @@ export async function upsertSubagentTranscriptArtifactIndexEntry(params: {
   updater: (
     existing: SubagentTranscriptArtifactIndexEntry | null
   ) => SubagentTranscriptArtifactIndexEntry;
-  /** The workspace FIFO (phase 4: SessionLocks). Absent: the Node layer. */
-  locks?: SessionLocks;
+  /** The workspace FIFO (phase 4: SessionLocks). */
+  locks: SessionLocks;
   /** The session files of the workspace (phase 5). Absent: the Node layer. */
   files?: SessionFiles;
 }): Promise<SubagentTranscriptArtifactIndexEntry> {

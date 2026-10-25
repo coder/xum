@@ -84,6 +84,7 @@ describe("GitPatchArtifactService coordination", () => {
       });
       const parentSessionDir = path.join(config.sessionsDir, "parent");
       const artifact = await upsertSubagentGitPatchArtifact({
+        locks: nodeSessionLocks,
         workspaceId: "parent",
         workspaceSessionDir: parentSessionDir,
         childTaskId: "child",
@@ -265,6 +266,7 @@ describe("GitPatchArtifactService coordination", () => {
     // must be left untouched and no generation job should start.
     const parentSessionDir = path.join(config.sessionsDir, parentId);
     const readyArtifact = await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childId,
@@ -352,6 +354,7 @@ describe("GitPatchArtifactService coordination", () => {
     // Same for a crash-left pending artifact, the case startup exists to resume: the reactivated
     // checkout is not snapshotted and the marker is left for the continuation refresh.
     const crashLeftPending = await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: pendingReactivatedChildId,

@@ -696,6 +696,10 @@ describe("MessageRenderer background work wake rows", () => {
   });
 });
 
+/** The TODO nudge text that #7027 shipped; histories still hold it. */
+const NUDGE_TEXT_7027 =
+  "<notification>\nYou ended your turn, but your TODO list still has pending or in-progress items. First finish the open items that are still in scope and that you can do now. Then update the list with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item stays open on purpose, for example because it waits for the user, keep it and say why in one sentence.\n</notification>";
+
 describe("MessageRenderer TODO nudge rows", () => {
   beforeEach(() => {
     saveDomGlobals();
@@ -748,6 +752,14 @@ describe("MessageRenderer TODO nudge rows", () => {
     ).toBeDefined();
   });
 
+  test("collapses a nudge stored with the text that #7027 shipped as a current nudge", () => {
+    const view = renderNudge(NUDGE_TEXT_7027, true);
+    expect(view.container.querySelector("[data-todo-turn-end-nudge]")).not.toBeNull();
+    expect(
+      view.getByText("Asked the agent to update its TODO list and finish open items")
+    ).toBeDefined();
+  });
+
   test("keeps a full bubble for typed lookalikes and plugin-joined prompts", () => {
     const typed = renderNudge(TODO_TURN_END_NUDGE, false);
     expect(typed.container.querySelector("[data-todo-turn-end-nudge]")).toBeNull();
@@ -755,6 +767,12 @@ describe("MessageRenderer TODO nudge rows", () => {
     const joined = renderNudge(`Run the failing tests again.\n\n${TODO_TURN_END_NUDGE}`, true);
     expect(joined.container.querySelector("[data-todo-turn-end-nudge]")).toBeNull();
     expect(joined.getByText(/Run the failing tests again/)).toBeDefined();
+  });
+
+  test("collapses a TODO and status page nudge stored with the #7027 TODO text", () => {
+    const both = renderNudge(`${NUDGE_TEXT_7027}\n\n${STATUS_PAGE_TURN_END_NUDGE}`, true);
+    expect(both.container.querySelector("[data-status-page-turn-end-nudge]")).not.toBeNull();
+    expect(both.getByText("Asked the agent to update its TODO list and status page")).toBeDefined();
   });
 
   test.each([STATUS_PAGE_TURN_END_NUDGE, STATUS_PAGE_AGENT_TURN_END_NUDGE])(

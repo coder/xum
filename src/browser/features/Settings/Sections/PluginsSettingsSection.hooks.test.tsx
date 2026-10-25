@@ -83,8 +83,12 @@ test("an update reloads an open hook review", async () => {
   await view.findByText(/old_tool/);
   fireEvent.click(await view.findByRole("button", { name: /^Update/ }));
 
-  await waitFor(() => expect(view.queryByText(/old_tool/)).toBeNull());
+  // Wait for the new hook, then check the old one is gone. Do not poll
+  // `expect(queryByText(/old_tool/)).toBeNull()`: each failing check makes Bun
+  // format the happy-dom element (~200 MB of text, ~2 s of CPU), which hit the
+  // 5 s test timeout on a loaded host (#7494).
   await view.findByText(/new_tool/);
+  expect(view.queryByText(/old_tool/)).toBeNull();
 });
 
 test("Trust waits until the user expands a cut input; the expanded text is the full input", async () => {
@@ -198,5 +202,6 @@ test("a successful reload after a reconnect clears the old load error", async ()
   view.rerender(tree(createMockORPCClient(options)));
 
   await view.findByText(/new_tool/);
-  await waitFor(() => expect(view.queryByText("connection lost")).toBeNull());
+  // A plain check, not a waitFor poll: see the first test (#7494).
+  expect(view.queryByText("connection lost")).toBeNull();
 });

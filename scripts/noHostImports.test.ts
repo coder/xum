@@ -149,3 +149,23 @@ test("each allow key is an agent-loop file", () => {
     });
   }
 });
+
+// #7282: host timers count as host access, so loop code arms timers through the HostClock.
+test("the configured module list covers the timers modules", () => {
+  const [, options] = ruleEntry().rules?.["local/no-host-imports"] as [string, unknown];
+  const lintConfig = [
+    {
+      files: ["**/*.ts"],
+      languageOptions: { parser: tseslint.parser },
+      plugins: { local: { rules: { "no-host-imports": findRule() } } },
+      rules: { "local/no-host-imports": ["error", options] as ["error", unknown] },
+    },
+  ];
+  const report = (code: string) =>
+    linter
+      .verify(code, lintConfig, "src/node/services/tools/x.ts")
+      .map((message) => message.messageId ?? message.message);
+  expect(report(`import { setTimeout as delay } from "node:timers/promises";`)).toEqual(["host"]);
+  expect(report(`import { setInterval } from "timers";`)).toEqual(["host"]);
+  expect(report(`import type { TimerOptions } from "node:timers";`)).toEqual([]);
+});

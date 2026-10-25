@@ -41,6 +41,38 @@ export async function needsTodoTurnEndNudge(input: {
   return todos.some((todo) => todo.status !== "completed");
 }
 
+/**
+ * Whether a message the user sent starts the stream that is about to run: a manual send that is
+ * not synthetic. Only those turns earn the nudge. A transcript audit (2026-10-25, 571 nudges) found
+ * that machine wakes (monitor matches, sub-agent reports, heartbeats, peer messages, goal
+ * continuations) caused about 90% of nudges. Their open items almost always wait on purpose, so the
+ * nudged turn only repeated the wait. Each wake counts as its own user turn, so a coordinator got
+ * one nudge per wake.
+ *
+ * Compaction requests and their follow-ups are automatic, so they start machine turns too: a user
+ * turn that compacts loses its one nudge. Inheriting the earlier origin instead mislabeled wakes
+ * that compacted before their send, and skipping one nudge is cheaper than nudging a machine turn.
+ */
+export function streamStartedByUserMessage(input: {
+  automatic: boolean;
+  synthetic: boolean;
+}): boolean {
+  return !input.automatic && !input.synthetic;
+}
+
+/**
+ * streamStartedByUserMessage for a resumed stream (no new message). An automatic resume that is
+ * not a retry is a machine wake, such as the prompt-free resume after a sub-agent report. An
+ * automatic retry and a manual resume (Retry, an answered question) continue the current turn.
+ */
+export function resumedStreamStartedByUserMessage(input: {
+  previous: boolean;
+  automatic: boolean;
+  retry: boolean;
+}): boolean {
+  return input.automatic && !input.retry ? false : input.previous;
+}
+
 export interface TurnStopContinuation {
   prompt: string;
 }

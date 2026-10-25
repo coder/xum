@@ -9,6 +9,7 @@ import type { ToolExecutionOptions } from "ai";
 import { TestTempDir, createTestToolConfig, getTestDeps } from "./testHelpers";
 import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
 import { writeFileString } from "@/node/utils/runtime/helpers";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 // Mock ToolCallOptions for testing
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -375,6 +376,7 @@ describe("file_read tool", () => {
     expectedContent: string
   ): Promise<void> {
     const tool = createFileReadTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: new LocalRuntime(testDir),
@@ -430,6 +432,7 @@ describe("file_read tool", () => {
       await fs.writeFile(planPath, planContent);
 
       const tool = createFileReadTool({
+        sessionLocks: nodeSessionLocks,
         ...getTestDeps(),
         cwd: testDir,
         runtime: new LocalRuntime(testDir),
@@ -459,6 +462,7 @@ describe("file_read tool", () => {
       await fs.writeFile(ancestorPlanPath, "# Ancestor Plan\n\n- Context");
 
       const tool = createFileReadTool({
+        sessionLocks: nodeSessionLocks,
         ...getTestDeps(),
         cwd: testDir,
         runtime: new LocalRuntime(testDir),
@@ -489,6 +493,7 @@ describe("file_read tool", () => {
       await fs.writeFile(otherPath, "# Other\n");
 
       const tool = createFileReadTool({
+        sessionLocks: nodeSessionLocks,
         ...getTestDeps(),
         cwd: testDir,
         runtime: new LocalRuntime(testDir),
@@ -520,6 +525,7 @@ describe("file_read tool", () => {
       await fs.writeFile(otherPath, "# Other\n");
 
       const tool = createFileReadTool({
+        sessionLocks: nodeSessionLocks,
         ...getTestDeps(),
         cwd: testDir,
         runtime: new LocalRuntime(testDir),

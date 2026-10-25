@@ -70,6 +70,7 @@ describe("getToolsForModel - model-only notifications", () => {
       const tools = await getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime,
           runtimeTempDir: "/tmp",
@@ -121,6 +122,7 @@ describe("getToolsForModel - model-only notifications", () => {
       const tools1 = await getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime,
           runtimeTempDir: "/tmp",
@@ -141,6 +143,7 @@ describe("getToolsForModel - model-only notifications", () => {
       const tools2 = await getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime,
           runtimeTempDir: "/tmp",
@@ -178,11 +181,7 @@ describe("getToolsForModel - model-only notifications", () => {
 
     const tools = await getToolsForModel(
       "noop:model",
-      {
-        cwd: process.cwd(),
-        runtime,
-        runtimeTempDir: "/tmp",
-      },
+      { sessionLocks: nodeSessionLocks, cwd: process.cwd(), runtime, runtimeTempDir: "/tmp" },
       "ws-1",
       initStateManager,
       undefined,
@@ -222,6 +221,7 @@ describe("getToolsForModel - model-only notifications", () => {
       const tools = await getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime,
           runtimeTempDir: "/tmp",
@@ -258,6 +258,7 @@ describe("getToolsForModel - model-only notifications", () => {
       const tools = await getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime: new LocalRuntime(process.cwd()),
           runtimeTempDir: "/tmp",
@@ -299,6 +300,7 @@ describe("getToolsForModel - model-only notifications", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime: new LocalRuntime(process.cwd()),
         runtimeTempDir: "/tmp",
@@ -349,6 +351,7 @@ describe("getToolsForModel - model-only notifications", () => {
           workspaceId: "ws-1",
           workspaceSessionDir: "/sessions/ws-1",
           sessionFiles: buildSessionFiles(SessionFilesMemory),
+          sessionLocks: nodeSessionLocks,
           clock: clock.hostClock,
         },
         "ws-1",

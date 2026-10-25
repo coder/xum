@@ -28,13 +28,27 @@ export const BACKGROUND_WORK_WAKE_OPENINGS = {
  * most once per user turn, so the model can bring the list up to date and finish open items it
  * can still do. The nudged turn keeps the turn's tools, so it can continue normally.
  *
+ * The "Do not start" sentence exists because a transcript audit (2026-10-25) found nudged turns
+ * that started a step their own previous message said waits on a review or a merge.
+ *
  * The prompt is constant on purpose: the todo text is model-written (a prompt injection can put
  * instructions there), so it must not come back as a user row. The model already sees its own
  * todo_write calls in context.
  */
 export const TODO_TURN_END_NUDGE = `<notification>
-You ended your turn, but your TODO list still has pending or in-progress items. First finish the open items that are still in scope and that you can do now. Then update the list with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item stays open on purpose, for example because it waits for the user, keep it and say why in one sentence.
+You ended your turn, but your TODO list still has pending or in-progress items. First finish the open items that are still in scope and that you can do now. Do not start an item that you said waits on something. Then update the list with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item stays open on purpose, for example because it waits for the user, keep it and say why in one sentence.
 </notification>`;
+
+/**
+ * Earlier texts of the current nudge (the nudged turn kept its tools). Histories still hold them,
+ * so the transcript keeps rendering those rows as the compact "current" nudge row.
+ */
+const EARLIER_TODO_TURN_END_NUDGES: readonly string[] = [
+  // #7027
+  `<notification>
+You ended your turn, but your TODO list still has pending or in-progress items. First finish the open items that are still in scope and that you can do now. Then update the list with todo_write so it matches what you actually did: mark finished items completed and remove items you dropped. If an item stays open on purpose, for example because it waits for the user, keep it and say why in one sentence.
+</notification>`,
+];
 
 /**
  * The nudge text that #6720 shipped (todo_write-only turns). Histories still hold it, so the
@@ -51,7 +65,7 @@ You ended your turn, but your TODO list still has pending or in-progress items. 
  * finishes open items), "legacy" (a todo_write-only list update), or null for any other text.
  */
 export function classifyTodoTurnEndNudgePrompt(text: string): "current" | "legacy" | null {
-  if (text === TODO_TURN_END_NUDGE) return "current";
+  if (text === TODO_TURN_END_NUDGE || EARLIER_TODO_TURN_END_NUDGES.includes(text)) return "current";
   return LEGACY_TODO_TURN_END_NUDGES.includes(text) ? "legacy" : null;
 }
 
@@ -90,9 +104,13 @@ export function classifyStatusPageTurnEndNudgePrompt(
   text: string
 ): "status-page" | "todo-and-status-page" | null {
   if (STATUS_PAGE_TURN_END_NUDGES.includes(text)) return "status-page";
-  const todoPrefix = `${TODO_TURN_END_NUDGE}${TURN_END_NUDGE_SEPARATOR}`;
-  return text.startsWith(todoPrefix) &&
-    STATUS_PAGE_TURN_END_NUDGES.includes(text.slice(todoPrefix.length))
+  // Any current TODO nudge text, earlier ones included: joined rows stored before the TODO
+  // prompt's last change must keep their compact row.
+  const statusSuffix = STATUS_PAGE_TURN_END_NUDGES.map(
+    (nudge) => `${TURN_END_NUDGE_SEPARATOR}${nudge}`
+  ).find((suffix) => text.endsWith(suffix));
+  return statusSuffix != null &&
+    classifyTodoTurnEndNudgePrompt(text.slice(0, -statusSuffix.length)) === "current"
     ? "todo-and-status-page"
     : null;
 }
