@@ -87,6 +87,12 @@ describe("status page fallback to the transcript", () => {
 
   test.each<[string, ArtifactReadResult, boolean]>([
     ["an HTML page shows", { ...meta, status: "ok", encoding: "utf8", content: "<p>hi</p>" }, true],
+    ["a page of bare text shows", { ...html, content: "Working on it" }, true],
+    [
+      "a page with only a text-free control shows",
+      { ...html, content: '<!doctype html><body><progress value="1" max="2"></progress></body>' },
+      true,
+    ],
     ["a blank page does not", { ...meta, status: "ok", encoding: "utf8", content: " \n\t" }, false],
     [
       "an empty HTML skeleton does not",
