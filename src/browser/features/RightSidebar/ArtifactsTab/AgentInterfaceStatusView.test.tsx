@@ -48,6 +48,9 @@ let reads = 0;
 let lists = 0;
 /** Messages the page's `window.xum.send` delivered. */
 let sends: Array<{ path: string; text: string }> = [];
+/** The page's persisted `window.xum.state`, and what its `setState` calls saved. */
+let persistedState: unknown = null;
+let savedStates: unknown[] = [];
 
 function listing(): ArtifactListing {
   const entry = { path: current.path, kind: current.kind, size: current.size, modifiedMs: 1_000 };
@@ -85,7 +88,11 @@ function Wrapper(props: { children: ReactNode }) {
         }
         return Promise.resolve({ success: true as const, data: current });
       },
-      getState: () => Promise.resolve({ success: true as const, data: { state: null } }),
+      getState: () => Promise.resolve({ success: true as const, data: { state: persistedState } }),
+      setState: (input: { state: unknown }) => {
+        savedStates.push(input.state);
+        return Promise.resolve({ success: true as const, data: undefined });
+      },
       sendInteraction: (input: { path: string; text: string }) => {
         sends.push({ path: input.path, text: input.text });
         return Promise.resolve({ success: true as const, data: { id: "i1" } });
@@ -133,6 +140,16 @@ function MainPane(props: { workspaceId: string }) {
 }
 
 /** The page the main pane's status view shows (the Artifacts panel may show it too). */
+/** Delivers `data` to the host as a message from the page in `frame`. */
+function postFromFrame(frame: HTMLIFrameElement, data: unknown) {
+  act(() => {
+    const event = new window.Event("message");
+    Object.defineProperty(event, "data", { value: data });
+    Object.defineProperty(event, "source", { value: frame.contentWindow });
+    window.dispatchEvent(event);
+  });
+}
+
 function shownPage(view: ReturnType<typeof render>): string {
   const statusView = view.queryByTestId("agent-interface-status-view");
   if (statusView == null) return "";
@@ -206,6 +223,8 @@ describe("Agent interface status view", () => {
     reads = 0;
     lists = 0;
     sends = [];
+    persistedState = null;
+    savedStates = [];
   });
 
   afterEach(() => {
@@ -351,14 +370,7 @@ describe("Agent interface status view", () => {
       await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
       const frame = view.getByTestId("artifact-frame") as HTMLIFrameElement;
       act(() => frame.focus());
-      act(() => {
-        const event = new window.Event("message");
-        Object.defineProperty(event, "data", {
-          value: { xumArtifact: 1, type: "send", text: "Run the tests" },
-        });
-        Object.defineProperty(event, "source", { value: frame.contentWindow });
-        window.dispatchEvent(event);
-      });
+      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Run the tests" });
 
       const strip = await view.findByTestId("artifact-send-strip");
       expect(strip.textContent).toContain("Run the tests");
@@ -375,6 +387,18 @@ describe("Agent interface status view", () => {
     } finally {
       Reflect.deleteProperty(window.navigator, "userActivation");
     }
+  });
+
+  test("the page's window.xum.state loads the saved state and setState saves it", async () => {
+    persistedState = { step: 1 };
+    const view = render(<MainPane workspaceId="ws-state" />, { wrapper: Wrapper });
+    await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+    const embedded = /var state = JSON\.parse\((.*)\);/.exec(shownPage(view))?.[1];
+    expect(JSON.parse(JSON.parse(embedded ?? '"null"') as string)).toEqual({ step: 1 });
+
+    const frame = view.getByTestId("artifact-frame") as HTMLIFrameElement;
+    postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
+    await waitFor(() => expect(savedStates).toEqual([{ step: 2 }]));
   });
 
   test("a page that truncated listings leave out still shows, follows its later versions, and goes once deleted", async () => {
