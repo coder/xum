@@ -71,6 +71,100 @@ async function assertPhoneFooterTouchTargets(page: StoryPage) {
   }
 }
 
+const AGENT_INTERFACE_TOUCH_STORY = "app-agentinterface--touch-toggle";
+// The gap the header's own side padding (px-2) gives while the left sidebar is open. The story
+// collapses the sidebar, which drops that padding, so the toggle must keep the gap itself.
+const PHONE_EDGE_GAP_PX = 8;
+
+/**
+ * On a touch phone the Status / Chat toggle starts the header's actions row. globals.css raises
+ * its buttons to touch targets, so the group (which clips its overflow) must grow to show them
+ * whole, and it must not sit flush against the screen edge. Plays cannot emulate the pointer.
+ */
+async function assertAgentInterfaceToggleTouchTargets(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    const toggle = page.locator('[data-testid="agent-interface-view-toggle"]');
+    // The phone header moves the actions to their own sideways-scrolling row.
+    await page.waitForFunction(
+      () => {
+        const row = document.querySelector(
+          '[data-testid="agent-interface-view-toggle"]'
+        )?.parentElement;
+        return row != null && getComputedStyle(row).overflowX === "auto";
+      },
+      undefined,
+      { timeout: 5000 }
+    );
+    // The resize to phone width slides the left sidebar drawer out over the header; let it and
+    // the other layout transitions finish before hit-testing.
+    await page.evaluate(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const transitions = document.getAnimations().filter((a) => a instanceof CSSTransition);
+      // allSettled: a transition the resize cancels rejects `finished` with an AbortError.
+      await Promise.allSettled(transitions.map((transition) => transition.finished));
+    });
+    const geometry = await toggle.evaluate((group) => {
+      const groupBox = group.getBoundingClientRect();
+      const buttons = Array.from(group.querySelectorAll("button"), (button) => {
+        const box = button.getBoundingClientRect();
+        let { left, right, top, bottom } = box;
+        // Clip by every ancestor that clips its overflow, then by the screen.
+        for (let el = button.parentElement; el; el = el.parentElement) {
+          const style = getComputedStyle(el);
+          const clip = el.getBoundingClientRect();
+          if (style.overflowX !== "visible") {
+            left = Math.max(left, clip.left);
+            right = Math.min(right, clip.right);
+          }
+          if (style.overflowY !== "visible") {
+            top = Math.max(top, clip.top);
+            bottom = Math.min(bottom, clip.bottom);
+          }
+        }
+        left = Math.max(left, 0);
+        top = Math.max(top, 0);
+        right = Math.min(right, window.innerWidth);
+        bottom = Math.min(bottom, window.innerHeight);
+        // A tap at the center must reach the button, not a header control drawn over it.
+        const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+        return {
+          name: button.textContent ?? "",
+          tappable: hit != null && button.contains(hit),
+          width: box.width,
+          height: box.height,
+          visibleWidth: Math.max(0, right - left),
+          visibleHeight: Math.max(0, bottom - top),
+        };
+      });
+      return { left: groupBox.left, buttons };
+    });
+    const problems: string[] = [];
+    if (geometry.left < PHONE_EDGE_GAP_PX) {
+      problems.push(`toggle starts ${Math.round(geometry.left)}px from the screen edge`);
+    }
+    for (const button of geometry.buttons) {
+      if (button.height < MOBILE_TOUCH_TARGET_PX) {
+        problems.push(`${button.name} is ${Math.round(button.height)}px tall`);
+      }
+      if (button.visibleWidth < button.width - 0.5 || button.visibleHeight < button.height - 0.5) {
+        problems.push(
+          `${button.name} shows ${Math.round(button.visibleWidth)}x${Math.round(button.visibleHeight)} of ${Math.round(button.width)}x${Math.round(button.height)}px`
+        );
+      }
+      if (!button.tappable) problems.push(`${button.name} is covered at its center`);
+    }
+    assert.equal(problems.join("; "), "", "Status / Chat touch targets must stay whole on a phone");
+  } finally {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
 const TOUCH_RESIZE_STORY = "app-seededworkspacea11y--narrow-sidebar-dark";
 
 /**
@@ -363,6 +457,12 @@ const config: TestRunnerConfig = {
     if (context.id === PHONE_FOOTER_TOUCH_STORY) {
       if (page.context().browser()?.browserType().name() === "chromium") {
         await assertPhoneFooterTouchTargets(page);
+      }
+      return;
+    }
+    if (context.id === AGENT_INTERFACE_TOUCH_STORY) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertAgentInterfaceToggleTouchTargets(page);
       }
       return;
     }

@@ -33,6 +33,7 @@ import { nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import type { ProjectConfig } from "@/common/types/project";
 import { getAvailableTools } from "@/common/utils/tools/toolDefinitions";
+import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailability";
 import { assertNever } from "@/common/utils/assertNever";
 import assert from "@/common/utils/assert";
@@ -240,6 +241,19 @@ Manage servers in Settings → MCP.
 `;
 }
 // #endregion SYSTEM_PROMPT_DOCS
+
+/**
+ * The Agent interface view's guidance. Static text (it names $XUM_SCRATCH_DIR, not the path), so
+ * the cached prompt stays the same across turns and sibling workspaces.
+ */
+function buildAgentInterfaceContext(options: { agentInterfaceView?: boolean } | undefined): string {
+  if (options?.agentInterfaceView !== true) return "";
+  return `
+
+<agent-interface>
+The user sees $XUM_SCRATCH_DIR/artifacts/${AGENT_INTERFACE_STATUS_ARTIFACT} in the main pane instead of this chat transcript by default, and can switch to the transcript at any time. When the page is missing, Xum seeds it with a themed template that uses the --xum-* CSS variables listed in its HTML comment; keep using them (with fallbacks) so the page follows the user's theme. Keep the page current with your status, progress and results by editing it in place, and still answer in chat as usual.
+</agent-interface>`;
+}
 
 /**
  * Extract tool-specific instructions from instruction sources.
@@ -645,6 +659,11 @@ export interface BuildSystemMessageFromSourcesOptions {
   modes?: readonly string[];
   /** XUM_SCRATCH_DIR is exported this turn; gates the scratch line on remote runtimes. */
   scratchDirSet?: boolean;
+  /**
+   * Agent interface view (artifacts-agent-interface) is on and XUM_SCRATCH_DIR is set: the user
+   * sees the status page instead of the transcript, so the agent is told to keep it current.
+   */
+  agentInterfaceView?: boolean;
 }
 
 /**
@@ -734,6 +753,8 @@ export function buildSystemMessageFromSources(
     systemMessage +=
       "\n\n<scratch-workspace>\nThis is a project-less scratch chat. The workspace directory is app-managed and is not a Git repository unless the user initializes one.\n</scratch-workspace>";
   }
+
+  systemMessage += buildAgentInterfaceContext(options);
 
   // Add MCP context if servers are configured
   if (mcpServers && Object.keys(mcpServers).length > 0) {

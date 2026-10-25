@@ -3,7 +3,11 @@ import * as fs from "fs/promises";
 import { constants as fsConstants, type Dirent, type Stats } from "fs";
 import * as path from "path";
 import { assert } from "@/common/utils/assert";
-import type { ArtifactEntry, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import type {
+  ArtifactEntry,
+  ArtifactReadOutcome,
+  ArtifactReadResult,
+} from "@/common/orpc/schemas/artifacts";
 import {
   getArtifactKind,
   isBinaryArtifactKind,
@@ -264,9 +268,7 @@ export function parseArtifactRelativePath(
   return segments;
 }
 
-export type ArtifactReadOutcome =
-  | { success: true; data: ArtifactReadResult }
-  | { success: false; error: string };
+export type { ArtifactReadOutcome };
 
 /**
  * Raw bytes of one artifact, before they are shaped into the wire result. Version snapshots and
@@ -278,6 +280,15 @@ export type ArtifactBytesOutcome =
   | { status: "too_large"; size: number; modifiedMs: number }
   | { status: "missing" }
   | { status: "invalid"; error: string };
+
+export interface ArtifactWriteOptions {
+  /**
+   * Write only a missing file: a file that exists, or appears during the write, is never
+   * replaced (the agent's own page, for one). The finished temp file is hard-linked to the name,
+   * which fails when the name is taken, so the file is never seen or left partly written.
+   */
+  createOnly?: boolean;
+}
 
 export interface ArtifactReadOptions extends ArtifactDirAccessOptions {
   /** Allow hidden path segments (pinned workspace files). */
@@ -299,7 +310,7 @@ export function toArtifactReadOutcome(
     case "invalid":
       return { success: false, error: outcome.error };
     case "missing":
-      return { success: false, error: `Artifact not found: ${relPath}` };
+      return { success: false, error: `Artifact not found: ${relPath}`, missing: true };
     case "too_large":
       return {
         success: true,
@@ -422,13 +433,15 @@ export async function readArtifactBytesFromDir(
  * can swap it (or a folder in it) for a symlink between the checks and open(); O_NOFOLLOW only
  * guards the leaf. The opened temp file is therefore verified to be inside the pinned real dir
  * before any byte is written, and the rename result is verified through the still-open
- * descriptor. Throws on any refusal.
+ * descriptor. Throws on any refusal. `createOnly` (see ArtifactWriteOptions) skips an existing
+ * file and hard-links the temp file to the target instead of renaming it. link() never replaces
+ * or follows the target name, so a folder swap could at worst add a file, never overwrite one.
  */
 export async function writeArtifactToDir(
   artifactsDir: string,
   relPath: string,
   content: string,
-  options?: { requireDescriptorPaths?: boolean }
+  options?: ArtifactWriteOptions & { requireDescriptorPaths?: boolean }
 ): Promise<void> {
   // A container-written dir refuses the swap-raceable inode fallback, as reads do.
   const requireDescriptorPath = options?.requireDescriptorPaths === true;
@@ -483,7 +496,10 @@ export async function writeArtifactToDir(
       throw new Error("Artifacts folder changed during the write");
     }
     const base = dirHandle ? descriptorPath(dirHandle) : parent;
-    await writeArtifactFileInDir(base, parent, realDir, segments, content, requireDescriptorPath);
+    await writeArtifactFileInDir(base, parent, realDir, segments, content, {
+      requireDescriptorPath,
+      createOnly: options?.createOnly === true,
+    });
   } finally {
     await dirHandle?.close();
   }
@@ -496,12 +512,14 @@ async function writeArtifactFileInDir(
   realDir: string,
   segments: string[],
   content: string,
-  requireDescriptorPath: boolean
+  options: { requireDescriptorPath: boolean; createOnly: boolean }
 ): Promise<void> {
+  const { requireDescriptorPath, createOnly } = options;
   const leaf = segments[segments.length - 1];
   const target = path.join(base, leaf);
   try {
     if (!(await fs.lstat(target)).isFile()) throw new Error("Artifact path is not a regular file");
+    if (createOnly) return;
   } catch (error) {
     if (!isMissing(error)) throw error;
   }
@@ -528,6 +546,10 @@ async function writeArtifactFileInDir(
       throw new Error("Artifacts folder changed during the write");
     }
     await handle.writeFile(content, "utf8");
+    if (createOnly) {
+      await linkUnlessTaken(tempPath, target);
+      return;
+    }
     await fs.rename(tempPath, target);
     renamed = true;
     // The descriptor follows the file: it must now be the target inside the pinned dir.
@@ -547,6 +569,19 @@ async function writeArtifactFileInDir(
     await handle.close();
     // The random temp name is ours wherever a swapped folder put it; removing it is safe.
     if (!renamed) await fs.rm(tempPath, { force: true });
+  }
+}
+
+/**
+ * createOnly's publish step: link() gives the finished file the target name only while that
+ * name is free (EEXIST on any entry there, a symlink included, which it never follows), so a
+ * page that appeared meanwhile is kept, and a failed write never leaves a partial one behind.
+ */
+async function linkUnlessTaken(file: string, target: string): Promise<void> {
+  try {
+    await fs.link(file, target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code !== "EEXIST") throw error;
   }
 }
 

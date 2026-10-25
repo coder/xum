@@ -69,6 +69,11 @@ import {
   useWorkspaceStoreRaw,
 } from "@/browser/stores/WorkspaceStore";
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
+import {
+  type AgentInterfaceView,
+  useMainPaneAgentInterfaceView,
+} from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
+import { AgentInterfaceStatusView } from "@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceStatusView";
 import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
 import type { DisplayedMessage, QueuedMessage as QueuedMessageData } from "@/common/types/message";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
@@ -181,6 +186,11 @@ export type ChatPaneContentProps = Omit<
   embedded?: boolean;
   /** Let an explicitly opened embedded chat claim focus when its composer mounts. */
   onChatInputReady?: (api: ChatInputAPI) => void;
+  /**
+   * Agent interface view: which view the main pane shows, or null/absent when the workspace has
+   * no status page to show (or the experiment is off), which leaves the transcript as is.
+   */
+  agentInterfaceView?: AgentInterfaceView | null;
 };
 
 type ReviewsState = ReturnType<typeof useReviews>;
@@ -210,7 +220,11 @@ function mountedSlice<Row>(rows: readonly Row[], from: number, to: number): read
 const isInSlice = (index: number, from: number, to: number) => index >= from && index < to;
 
 /** Off the bottom, or detached: the bottom of the slice is not the live tail. */
-const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean) => !autoScroll || isDetached;
+const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean, statusShown: boolean) =>
+  !statusShown && (!autoScroll || isDetached);
+
+/** Tab skips the transcript under the status page; the composer dock it holds stays reachable. */
+const transcriptTabIndex = (statusShown: boolean) => (statusShown ? -1 : 0);
 
 /** The last mounted transcript row and where it is now, for loadOlderAnchorRef. */
 function lastRowAnchor(scrollport: HTMLDivElement | null) {
@@ -348,6 +362,8 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   const meta = workspaceMetadata.get(workspaceId);
   const workspaceTitle = meta?.title ?? meta?.name ?? props.workspaceName;
 
+  const agentInterfaceView = useMainPaneAgentInterfaceView(workspaceId);
+
   return (
     <PerfRenderMarker id="chat-pane">
       <div
@@ -399,6 +415,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
             namedWorkspacePath={props.namedWorkspacePath}
             runtimeConfig={props.runtimeConfig}
             onOpenTerminal={props.onOpenTerminal}
+            agentInterfaceView={agentInterfaceView}
           />
         </main>
 
@@ -450,6 +467,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const workspaceUsage = useWorkspaceUsage(workspaceId);
   const reviews = useReviews(workspaceId);
   const { clearError: clearBackgroundBashError } = useBackgroundBashError();
+
+  // Agent interface view: the transcript stays mounted (hidden) under the status page, so its
+  // scroll position survives a round trip; the status page unmounts while the transcript shows.
+  const showStatusView = props.agentInterfaceView === "status";
 
   // Transcript-only workspaces preserve historical chat and usage after the worktree is deleted,
   // so the transcript stays readable while new sends remain disabled.
@@ -1636,6 +1657,15 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             props.embedded !== true && "mobile-header-spacer"
           )}
         >
+          {/* Before the scrollport, which holds the composer dock, so Tab reaches the page
+              before the composer below it. */}
+          <AgentInterfaceStatusView
+            key={workspaceId}
+            workspaceId={workspaceId}
+            view={props.agentInterfaceView}
+            dockRef={composerDockRef}
+            composerApiRef={chatInputAPI}
+          />
           <div
             ref={contentRef}
             onWheel={handleTranscriptWheel}
@@ -1646,7 +1676,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             onKeyDown={handleTranscriptKeyDown}
             onScroll={handleTranscriptScroll}
             onContextMenu={transcriptContextMenu.onContextMenu}
-            tabIndex={0}
+            tabIndex={transcriptTabIndex(showStatusView)}
             data-testid="message-window"
             // Settled marker for perf tests and story play helpers: includes
             // decoration data readiness AND the tail-first reveal having settled
@@ -1700,7 +1730,9 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // so the placeholder's flex-1 centering works). The hydration
                 // skeleton renders in normal top-aligned transcript flow so it sits
                 // where real messages will, avoiding a jump when hydration completes.
-                showEmptyTranscriptPlaceholder && "flex flex-col"
+                showEmptyTranscriptPlaceholder && "flex flex-col",
+                // Under the status page: hidden but laid out, so its scroll position survives.
+                { invisible: showStatusView }
               )}
             >
               {showTranscriptHydrationPlaceholder ? (
@@ -1815,7 +1847,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       <span className="sr-only">Loading messages...</span>
                     </div>
                   )}
-                  {offersJumpToBottom(autoScroll, isTranscriptDetached) && (
+                  {offersJumpToBottom(autoScroll, isTranscriptDetached, showStatusView) && (
                     <button
                       onClick={handleJumpToBottom}
                       type="button"

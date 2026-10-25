@@ -20,6 +20,7 @@ export const EXPERIMENT_IDS = {
   CLAUDE_DESIGN_MCP: "claude-design-mcp",
   SKILL_DYNAMIC_CONTEXT: "skill-dynamic-context",
   ARTIFACTS: "artifacts",
+  ARTIFACTS_AGENT_INTERFACE: "artifacts-agent-interface",
   MCP_APPS: "mcp-apps",
   CONTINUOUS_COMPACTION: "continuous-compaction",
   TOKEN_BUDGET: "tokenBudget",
@@ -183,6 +184,16 @@ export const EXPERIMENTS: Record<ExperimentId, ExperimentDefinition> = {
     name: "Artifacts",
     description:
       "Show files the agent writes to $XUM_SCRATCH_DIR/artifacts in an Artifacts tab, with previews for Markdown, JSON, CSV, images, diffs, Mermaid and sandboxed HTML/SVG. Works on every runtime with a scratch dir (devcontainers need a local Docker daemon).",
+    enabledByDefault: false,
+    showInSettings: true,
+  },
+  // Sub-experiment of Artifacts (flat flag, gated on the parent at call sites; Settings nests it
+  // under the Artifacts toggle): the main pane shows the agent's status page by default.
+  [EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE]: {
+    id: EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE,
+    name: "Agent interface view",
+    description:
+      "Show the agent's status page (status.html) instead of the chat transcript by default. Switch back to the chat at any time; the message box stays at the bottom.",
     enabledByDefault: false,
     showInSettings: true,
   },

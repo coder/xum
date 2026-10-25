@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { Window as HappyWindow } from "happy-dom";
 import * as vm from "node:vm";
 import {
@@ -14,6 +14,10 @@ import {
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
 } from "./artifactBridge";
+import {
+  ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS,
+  ARTIFACT_THEME_VARIABLES_MAX_COUNT,
+} from "./appStyleVariables";
 import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { mcpAppPreambleScript } from "./mcpAppCsp";
 
@@ -69,10 +73,17 @@ describe("acceptArtifactFrameMessage", () => {
   });
 });
 
-/** Run the bridge script against a minimal window; returns its keydown handler and posts. */
-function runBridgeScript() {
-  // Every listener, in registration order: keys use a capture listener and a bubble one.
-  const listeners: Array<{ type: string; listener: (event: unknown) => void }> = [];
+/**
+ * Run the bridge script against a minimal window; returns its keydown handler and posts.
+ * `querySelectorAll`: the page's document.querySelectorAll (default: finds nothing).
+ * `forwardsViewSwitch`: the frame is the main pane's status page.
+ */
+function runBridgeScript(
+  options: { querySelectorAll?: (selector: string) => unknown[]; forwardsViewSwitch?: boolean } = {}
+) {
+  // Every listener, in registration order: keys use capture listeners and bubble ones.
+  const listeners: Array<{ type: string; capture: boolean; listener: (event: unknown) => void }> =
+    [];
   const posted: unknown[] = [];
   // window.setTimeout callbacks, run once a key press has gone through every listener.
   const timers: Array<() => void> = [];
@@ -80,8 +91,8 @@ function runBridgeScript() {
   let prevented = 0;
   const fakeWindow: { xum?: { openWorkspace: (id: unknown) => void } } & Record<string, unknown> = {
     parent: { postMessage: (message: unknown) => posted.push(message) },
-    addEventListener: (type: string, listener: (event: unknown) => void) => {
-      listeners.push({ type, listener });
+    addEventListener: (type: string, listener: (event: unknown) => void, capture?: unknown) => {
+      listeners.push({ type, capture: capture === true, listener });
     },
     setTimeout: (callback: () => void) => timers.push(callback),
   };
@@ -89,18 +100,20 @@ function runBridgeScript() {
   const fakeDocument = {
     documentElement: { setAttribute: () => undefined },
     addEventListener: () => undefined,
+    querySelectorAll: options.querySelectorAll ?? (() => []),
   };
   // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs our own generated script
   const run = new Function(
     "window",
     "document",
     "CustomEvent",
-    buildArtifactBridgeScript("dark")
+    buildArtifactBridgeScript("dark", null, null, false, options.forwardsViewSwitch)
   ) as (window: unknown, document: unknown, customEvent: unknown) => void;
   run(fakeWindow, fakeDocument, class {});
   /**
-   * One key press through every keydown listener, then the timers. `defaultPrevented`: a
-   * handler the artifact registered after the bridge's listeners kept the key.
+   * One key press as the browser dispatches it to the window: the capture listeners, the page's
+   * own handlers, the bubble listeners, the key's default action, then the timers.
+   * `defaultPrevented`: a handler the artifact registered after the bridge's listeners kept the key.
    */
   const keydown = (
     key: string,
@@ -113,12 +126,21 @@ function runBridgeScript() {
       repeat?: boolean;
       defaultPrevented?: boolean;
       composedPath?: unknown[];
+      /** False for a key the page's own script dispatched. */
+      isTrusted?: boolean;
+      /** The page's keydown handlers on the target or the document. */
+      pageHandler?: () => void;
+      /** Runs unless the key was prevented, like Escape's close request. */
+      defaultAction?: () => void;
+      /** Leaves the press's timers queued, so the next press arrives before they run. */
+      holdTimers?: boolean;
     } = {}
   ) => {
     const event = {
       key,
       target,
       shiftKey,
+      isTrusted: extra.isTrusted ?? true,
       ctrlKey: extra.ctrlKey ?? false,
       repeat: extra.repeat ?? false,
       metaKey: extra.metaKey ?? false,
@@ -129,11 +151,28 @@ function runBridgeScript() {
       },
       ...(extra.composedPath ? { composedPath: () => extra.composedPath } : {}),
     };
-    for (const entry of listeners) if (entry.type === "keydown") entry.listener(event);
+    const dispatch = (capture: boolean) => {
+      for (const entry of listeners) {
+        if (entry.type === "keydown" && entry.capture === capture) entry.listener(event);
+      }
+    };
+    dispatch(true);
+    extra.pageHandler?.();
+    dispatch(false);
     event.defaultPrevented = extra.defaultPrevented ?? false;
-    for (const timer of timers.splice(0)) timer();
+    if (!event.defaultPrevented) extra.defaultAction?.();
+    if (extra.holdTimers !== true) for (const timer of timers.splice(0)) timer();
   };
-  return { keydown, posted, xum: fakeWindow.xum, prevented: () => prevented };
+  /**
+   * A non-bubbling event at an element in the page, such as a dialog's cancel event: window sees
+   * it only in the capture phase.
+   */
+  const fire = (type: string) => {
+    for (const entry of listeners) {
+      if (entry.type === type && entry.capture) entry.listener({ type });
+    }
+  };
+  return { keydown, fire, posted, xum: fakeWindow.xum, prevented: () => prevented };
 }
 
 describe("bridge script keys", () => {
@@ -160,6 +199,9 @@ describe("bridge script keys", () => {
     // The keybind's own key: a keybind the shim cannot forward fails here, not at startup.
     const key = KEYBINDS.TOGGLE_ARTIFACT_ANNOTATE.key.toLowerCase();
     const bridge = runBridgeScript();
+    // Ctrl+C below is also the Vim interrupt key, posted as its own message.
+    const keys = () =>
+      bridge.posted.filter((message) => (message as { type?: unknown }).type === "key");
     bridge.keydown(key, input);
     bridge.keydown(key.toUpperCase(), div, true);
     bridge.keydown(key, div, false, { ctrlKey: true });
@@ -167,12 +209,12 @@ describe("bridge script keys", () => {
     bridge.keydown(key, div, false, { defaultPrevented: true });
     // Typed in an input inside a web component: window sees the (non-editable) shadow host.
     bridge.keydown(key, div, false, { composedPath: [input, div] });
-    expect(bridge.posted).toEqual([]);
+    expect(keys()).toEqual([]);
     bridge.keydown(key, div);
     // Caps Lock gives the upper case without Shift.
     bridge.keydown(key.toUpperCase(), div);
     const c = { xumArtifact: 1, type: "key", key: "C", shiftKey: false };
-    expect(bridge.posted).toEqual([c, c]);
+    expect(keys()).toEqual([c, c]);
   });
 
   test("the right-sidebar chord is posted with Ctrl, even from an input, and claimed", () => {
@@ -203,7 +245,7 @@ describe("bridge script keys", () => {
   });
 
   test("the Artifacts tab chord is posted by name, and other Ctrl+Shift keys stay the artifact's", () => {
-    // The keybind's own key, so a keybind the shim cannot forward fails here.
+    // The keybinds' own keys, so a keybind the shim cannot forward fails here.
     const key = KEYBINDS.OPEN_ARTIFACTS_TAB.key;
     const bridge = runBridgeScript();
     // Keys of no forwarded chord, including names every object inherits.
@@ -217,6 +259,29 @@ describe("bridge script keys", () => {
       { xumArtifact: 1, type: "sidebarKey", chord: "artifacts", ctrlKey: true, metaKey: false },
     ]);
     expect(bridge.prevented()).toBe(1);
+  });
+
+  test("only the main pane's status page claims the view switch chord", () => {
+    const key = KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW.key;
+    // Any other frame may show while no switch exists: the chord stays the artifact's.
+    const elsewhere = runBridgeScript();
+    elsewhere.keydown(key, div, true, { ctrlKey: true });
+    expect(elsewhere.posted).toEqual([]);
+    expect(elsewhere.prevented()).toBe(0);
+
+    // The status page shows only while the switch exists: it must work after a click in it.
+    const statusPage = runBridgeScript({ forwardsViewSwitch: true });
+    statusPage.keydown(key, div, true, { ctrlKey: true });
+    expect(statusPage.posted).toEqual([
+      {
+        xumArtifact: 1,
+        type: "sidebarKey",
+        chord: "agentInterface",
+        ctrlKey: true,
+        metaKey: false,
+      },
+    ]);
+    expect(statusPage.prevented()).toBe(1);
   });
 
   test("on macOS the right-sidebar chord is Cmd, and Ctrl stays the artifact's", () => {
@@ -246,6 +311,213 @@ describe("bridge script keys", () => {
   });
 });
 
+describe("bridge script interrupt keys", () => {
+  const input = { nodeType: 1, tagName: "INPUT", isContentEditable: false };
+  const div = { nodeType: 1, tagName: "DIV", isContentEditable: false };
+  const interrupts = (posted: unknown[]) =>
+    posted.filter((message) => (message as { type?: unknown }).type === "interruptKey");
+
+  test("the chat's interrupt keys are posted by name: Escape outside text fields, Ctrl+C anywhere", () => {
+    // The keybinds' own keys: a keybind the shim cannot forward fails here.
+    const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
+    const vimKey = KEYBINDS.INTERRUPT_STREAM_VIM.key;
+    const bridge = runBridgeScript();
+    bridge.keydown(escape, input);
+    expect(interrupts(bridge.posted)).toEqual([]);
+    bridge.keydown(escape, div);
+    bridge.keydown(vimKey, input, false, { ctrlKey: true });
+    // Caps Lock gives the upper case without Shift.
+    bridge.keydown(vimKey.toUpperCase(), div, false, { ctrlKey: true });
+    expect(interrupts(bridge.posted)).toEqual([
+      { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
+      { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
+      { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
+    ]);
+  });
+
+  test("a key the artifact kept, dispatched itself, repeated or chorded is not posted", () => {
+    const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
+    const vimKey = KEYBINDS.INTERRUPT_STREAM_VIM.key;
+    const bridge = runBridgeScript();
+    bridge.keydown(escape, div, false, { defaultPrevented: true });
+    bridge.keydown(escape, div, false, { isTrusted: false });
+    bridge.keydown(escape, div, false, { repeat: true });
+    bridge.keydown(escape, div, true);
+    bridge.keydown(escape, div, false, { ctrlKey: true });
+    bridge.keydown(vimKey, div);
+    bridge.keydown(vimKey, div, false, { ctrlKey: true, metaKey: true });
+    bridge.keydown(vimKey, div, false, { ctrlKey: true, altKey: true });
+    // Typed in an input inside a web component: window sees the (non-editable) shadow host.
+    bridge.keydown(escape, div, false, { composedPath: [input, div] });
+    expect(interrupts(bridge.posted)).toEqual([]);
+  });
+
+  /**
+   * One of the page's dialogs or popovers. The page's querySelectorAll finds it while it is open
+   * and in the document, by its kind, as the browser's selectors would (happy-dom matches no
+   * :popover-open).
+   */
+  const pageLayer = (kind: "dialog" | "popover") => {
+    const layer = {
+      open: true,
+      isConnected: true,
+      matches: (selector: string): boolean =>
+        layer.open && selector.includes(kind === "dialog" ? "dialog" : "popover-open"),
+    };
+    return layer;
+  };
+  const findLayers =
+    (...layers: Array<ReturnType<typeof pageLayer>>) =>
+    (selector: string) =>
+      layers.filter((layer) => layer.isConnected && layer.matches(selector));
+
+  test("Escape that closes one of the page's dialogs or popovers stays the page's", () => {
+    const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
+    const vimKey = KEYBINDS.INTERRUPT_STREAM_VIM.key;
+    for (const kind of ["dialog", "popover"] as const) {
+      // Escape closes the top one; the one it was opened from stays open.
+      const layer = pageLayer(kind);
+      const bridge = runBridgeScript({ querySelectorAll: findLayers(pageLayer(kind), layer) });
+      // The browser's close request closes it ...
+      bridge.keydown(escape, div, false, {
+        defaultAction: () => {
+          layer.open = false;
+        },
+      });
+      // ... or the page's own handler does, before the bridge's bubble listener runs ...
+      layer.open = true;
+      bridge.keydown(escape, div, false, {
+        pageHandler: () => {
+          layer.open = false;
+        },
+      });
+      // ... or the page's handler removes it ...
+      layer.open = true;
+      bridge.keydown(escape, div, false, {
+        pageHandler: () => {
+          layer.isConnected = false;
+        },
+      });
+      // ... or closes it and dispatches a key of its own, which leaves the press's layers alone.
+      layer.isConnected = true;
+      bridge.keydown(escape, div, false, {
+        pageHandler: () => {
+          layer.open = false;
+          bridge.keydown(escape, div, false, { isTrusted: false });
+        },
+      });
+      expect(interrupts(bridge.posted)).toEqual([]);
+      // Only Escape closes layers: Ctrl+C interrupts whatever the page does with it.
+      layer.open = true;
+      bridge.keydown(vimKey, div, false, {
+        ctrlKey: true,
+        pageHandler: () => {
+          layer.open = false;
+        },
+      });
+      expect(interrupts(bridge.posted)).toEqual([
+        { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
+      ]);
+    }
+  });
+
+  test("a second press before the first one's check keeps each press's own layers", () => {
+    const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
+    const dialog = pageLayer("dialog");
+    const bridge = runBridgeScript({ querySelectorAll: findLayers(dialog) });
+    // The first Escape closes the dialog; the second, with nothing open, interrupts.
+    bridge.keydown(escape, div, false, {
+      holdTimers: true,
+      defaultAction: () => {
+        dialog.open = false;
+      },
+    });
+    bridge.keydown(escape, div);
+    expect(interrupts(bridge.posted)).toEqual([
+      { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
+    ]);
+  });
+
+  test("Escape whose close request a dialog's page cancels stays the page's", () => {
+    // The page cancels the cancel event and closes the dialog itself after an animation, so the
+    // dialog is still open when the bridge checks.
+    const bridge = runBridgeScript({ querySelectorAll: findLayers(pageLayer("dialog")) });
+    bridge.keydown(KEYBINDS.INTERRUPT_STREAM_NORMAL.key, div, false, {
+      defaultAction: () => bridge.fire("cancel"),
+    });
+    expect(interrupts(bridge.posted)).toEqual([]);
+    // The next Escape gets no cancel event: the dialog ignored it, so it interrupts.
+    bridge.keydown(KEYBINDS.INTERRUPT_STREAM_NORMAL.key, div);
+    // Ctrl+C sends no close request: a cancel event during it does not keep it.
+    bridge.keydown(KEYBINDS.INTERRUPT_STREAM_VIM.key, div, false, {
+      ctrlKey: true,
+      pageHandler: () => bridge.fire("cancel"),
+    });
+    expect(interrupts(bridge.posted)).toEqual([
+      { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
+      { xumArtifact: 1, type: "interruptKey", keybind: "vim" },
+    ]);
+  });
+
+  test("Escape that leaves the page's dialogs and popovers open interrupts", () => {
+    // A manual popover, or a dialog that Escape does not close (closedby="none" gives it no
+    // close request): the press did nothing in the page.
+    const bridge = runBridgeScript({
+      querySelectorAll: findLayers(pageLayer("dialog"), pageLayer("popover")),
+    });
+    bridge.keydown(KEYBINDS.INTERRUPT_STREAM_NORMAL.key, div);
+    expect(interrupts(bridge.posted)).toEqual([
+      { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
+    ]);
+  });
+
+  test("a browser without popovers still sees the dialog that Escape closes", () => {
+    const escape = KEYBINDS.INTERRUPT_STREAM_NORMAL.key;
+    const debug = spyOn(console, "debug").mockImplementation(() => undefined);
+    try {
+      const dialog = pageLayer("dialog");
+      const find = findLayers(dialog);
+      const bridge = runBridgeScript({
+        querySelectorAll: (selector) => {
+          if (selector.includes("popover")) throw new SyntaxError("unsupported selector");
+          return find(selector);
+        },
+      });
+      bridge.keydown(escape, div, false, {
+        defaultAction: () => {
+          dialog.open = false;
+        },
+      });
+      expect(interrupts(bridge.posted)).toEqual([]);
+      dialog.open = true;
+      bridge.keydown(escape, div);
+      expect(interrupts(bridge.posted)).toEqual([
+        { xumArtifact: 1, type: "interruptKey", keybind: "normal" },
+      ]);
+    } finally {
+      debug.mockRestore();
+    }
+  });
+});
+
+describe("interruptKey messages", () => {
+  test("accepts a known keybind name only", () => {
+    const accept = (data: unknown) =>
+      acceptArtifactFrameMessage({ source: frame, data }, frame, () => true);
+    for (const keybind of ["normal", "vim"] as const) {
+      const message = { xumArtifact: 1, type: "interruptKey", keybind } as const;
+      expect(accept(message)).toEqual(message);
+    }
+    for (const data of [
+      { xumArtifact: 1, type: "interruptKey" },
+      { xumArtifact: 1, type: "interruptKey", keybind: "stop" },
+      { xumArtifact: 1, type: "interruptKey", keybind: "normal", ctrlKey: true },
+    ]) {
+      expect(accept(data)).toBeNull();
+    }
+  });
+});
+
 describe("sidebarKey messages", () => {
   test("accepts a known chord name and the two modifier flags only", () => {
     const accept = (data: unknown) =>
@@ -258,10 +530,9 @@ describe("sidebarKey messages", () => {
       metaKey: false,
     } as const;
     expect(accept(sidebarKey)).toEqual(sidebarKey);
-    expect(accept({ ...sidebarKey, chord: "artifacts" })).toEqual({
-      ...sidebarKey,
-      chord: "artifacts",
-    });
+    for (const chord of ["artifacts", "agentInterface"] as const) {
+      expect(accept({ ...sidebarKey, chord })).toEqual({ ...sidebarKey, chord });
+    }
     for (const data of [
       { xumArtifact: 1, type: "sidebarKey", chord: "sidebar", ctrlKey: true },
       { xumArtifact: 1, type: "sidebarKey", ctrlKey: true, metaKey: false },
@@ -443,6 +714,119 @@ describe("buildArtifactBridgeScript", () => {
     expect(attributes.get("data-xum-theme")).toBe("light");
     send({ xumArtifact: 1, type: "theme", theme: "dark" });
     expect(attributes.get("data-xum-theme")).toBe("dark");
+  });
+
+  test("applies the app palette as --xum-* properties, at load and on theme messages", () => {
+    const attributes = new Map<string, string>();
+    const properties = new Map<string, string>();
+    type FakeMessageListener = (event: { source: unknown; data: unknown }) => void;
+    const listeners: FakeMessageListener[] = [];
+    const parent = {};
+    const fakeWindow = {
+      parent,
+      addEventListener: (type: string, listener: FakeMessageListener) => {
+        if (type === "message") listeners.push(listener);
+      },
+      dispatchEvent: () => true,
+    };
+    const fakeDocument = {
+      documentElement: {
+        setAttribute: (name: string, value: string) => attributes.set(name, value),
+        style: { setProperty: (name: string, value: string) => properties.set(name, value) },
+      },
+    };
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+    const run = new Function(
+      "window",
+      "document",
+      "CustomEvent",
+      buildArtifactBridgeScript("light", null, {
+        themeName: "flexoki-light",
+        variables: { "--xum-bg": "#fffcf0" },
+      })
+    ) as (window: unknown, document: unknown, customEvent: unknown) => void;
+    run(fakeWindow, fakeDocument, class {});
+    expect(attributes.get("data-xum-theme-name")).toBe("flexoki-light");
+    expect(properties.get("--xum-bg")).toBe("#fffcf0");
+
+    listeners.forEach((listener) =>
+      listener({
+        source: parent,
+        data: {
+          xumArtifact: 1,
+          type: "theme",
+          theme: "dark",
+          themeName: "flexoki-dark",
+          variables: {
+            "--xum-bg": "#100f0f",
+            // Not --xum-*: an artifact's own properties (or anything else) stay untouched.
+            "--color-background": "red",
+            background: "red",
+            "--xum-fg": 7,
+          },
+        },
+      })
+    );
+    expect(attributes.get("data-xum-theme-name")).toBe("flexoki-dark");
+    expect(Object.fromEntries(properties)).toEqual({ "--xum-bg": "#100f0f" });
+
+    // The frame bounds what a theme message may set: too many names set none, and an over-long
+    // value is skipped.
+    const sendVariables = (variables: Record<string, string>) =>
+      listeners.forEach((listener) =>
+        listener({
+          source: parent,
+          data: { xumArtifact: 1, type: "theme", theme: "dark", variables },
+        })
+      );
+    sendVariables(
+      Object.fromEntries(
+        Array.from({ length: ARTIFACT_THEME_VARIABLES_MAX_COUNT + 1 }, (_, i) => [
+          `--xum-v${i}`,
+          "#000",
+        ])
+      )
+    );
+    sendVariables({
+      "--xum-fg": "x".repeat(ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS + 1),
+      "--xum-muted": "#888",
+    });
+    expect(Object.fromEntries(properties)).toEqual({
+      "--xum-bg": "#100f0f",
+      "--xum-muted": "#888",
+    });
+  });
+
+  test("gives only a page without styles of its own the theme's color scheme, kept live", () => {
+    const runWith = (followColorScheme: boolean) => {
+      type FakeMessageListener = (event: { source: unknown; data: unknown }) => void;
+      const listeners: FakeMessageListener[] = [];
+      const parent = {};
+      const style: { colorScheme?: string } = {};
+      const fakeWindow = {
+        parent,
+        addEventListener: (type: string, listener: FakeMessageListener) => {
+          if (type === "message") listeners.push(listener);
+        },
+        dispatchEvent: () => true,
+      };
+      const fakeDocument = { documentElement: { setAttribute: () => undefined, style } };
+      // eslint-disable-next-line @typescript-eslint/no-implied-eval -- runs the generated frame script
+      const run = new Function(
+        "window",
+        "document",
+        "CustomEvent",
+        buildArtifactBridgeScript("dark", null, null, followColorScheme)
+      ) as (window: unknown, document: unknown, customEvent: unknown) => void;
+      run(fakeWindow, fakeDocument, class {});
+      const atLoad = style.colorScheme;
+      listeners.forEach((listener) =>
+        listener({ source: parent, data: { xumArtifact: 1, type: "theme", theme: "light" } })
+      );
+      return [atLoad, style.colorScheme];
+    };
+    expect(runWith(true)).toEqual(["dark", "light"]);
+    expect(runWith(false)).toEqual([undefined, undefined]);
   });
 });
 

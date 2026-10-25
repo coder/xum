@@ -10,6 +10,12 @@ import {
   isJsonValue,
   jsonByteLength,
 } from "@/common/constants/artifactInteractions";
+import { ThemePreferenceSchema } from "@/common/config/schemas/userPreferences";
+import {
+  ARTIFACT_THEME_VARIABLE_NAME_PATTERN,
+  ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS,
+  ARTIFACT_THEME_VARIABLES_MAX_COUNT,
+} from "./appStyleVariables";
 
 /**
  * postMessage bridge between the app and a sandboxed HTML/SVG artifact frame
@@ -24,9 +30,14 @@ import {
  *   on, so the host honours it only during a live user gesture in this frame
  *   (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
  * - Frame -> host: `{ type: "sidebarKey", chord, ctrlKey, metaKey }`, a right-sidebar chord
- *   (ARTIFACT_FRAME_CHORDS: KEYBINDS.TOGGLE_RIGHT_SIDEBAR or KEYBINDS.OPEN_ARTIFACTS_TAB), which a
- *   click into the frame also made unreachable: keys in the frame never reach the app's window
- *   listener. The host honours it only while the frame holds focus (SandboxedArtifactFrame.tsx).
+ *   (ARTIFACT_FRAME_CHORDS: KEYBINDS.TOGGLE_RIGHT_SIDEBAR or KEYBINDS.OPEN_ARTIFACTS_TAB, and from
+ *   the main pane's status page only, KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW), which a click into
+ *   the frame also made unreachable: keys in the frame never reach the app's window listener.
+ *   The host honours it only while the frame holds focus (SandboxedArtifactFrame.tsx).
+ * - Frame -> host: `{ type: "interruptKey", keybind }`, a stream-interrupt key pressed in the
+ *   frame (ARTIFACT_FRAME_INTERRUPT_KEYS: Escape outside a text field, or Ctrl+C). Only the main
+ *   pane's status page replays it, and only during a live user gesture in the frame, since a
+ *   script that posted it at will could stop every turn (SandboxedArtifactFrame.tsx).
  * - Frame -> host (M5b): `{ type: "send", text, data? }` (window.xum.send) sends at once only
  *   during a live user click or key in this frame, one message per click; any other send fills
  *   the host-owned confirm strip (SandboxedArtifactFrame.tsx); `{ type: "setState", state }`
@@ -41,8 +52,10 @@ import {
  *   the user clicked or typed inside this frame, and only for an active workspace
  *   (SandboxedArtifactFrame.tsx). The frame never gets a reply, so no workspace list or title
  *   reaches it.
- * - Host -> frame: `{ type: "theme", theme: "dark" | "light" }`, sent after load and on theme
- *   change; the artifact may read it, and the host never injects its own CSS.
+ * - Host -> frame: `{ type: "theme", theme: "dark" | "light", themeName?, variables? }`, sent
+ *   after load and on theme change; the artifact may read it. The host injects no style sheets:
+ *   `variables` are only `--xum-*` custom-property values, inert until the artifact's own CSS
+ *   uses them. Only a page without any styles of its own also gets the theme's `color-scheme`.
  *   `{ type: "annotate", enabled }` switches the shim's click-to-pin capture on or off (clicks
  *   are swallowed while it is on).
  * - The persisted `window.xum.state` is never posted: it is baked into the shim when the srcdoc
@@ -124,14 +137,19 @@ const ArtifactAnnotateMessageSchema = z
   .strict();
 
 /**
- * The app chords the frame forwards, by name. Both act on the right sidebar that holds the frame:
+ * The app chords the frame forwards, by name. Two act on the right sidebar that holds the frame:
  * TOGGLE_RIGHT_SIDEBAR collapses it, and OPEN_ARTIFACTS_TAB collapses it too, since the frame
  * only holds focus while the Artifacts tab shows (user request: that key toggles the tab, from
- * anywhere in it).
+ * anywhere in it). TOGGLE_AGENT_INTERFACE_VIEW switches the main pane between the status page
+ * (a frame too) and the chat, so the advertised chord also leaves the page after a click in it;
+ * from a frame it only ever switches to the chat (useMainPaneAgentInterfaceView). Only the status
+ * page claims it (`forwardsViewSwitch`): it shows only while the switch exists, and in any other
+ * frame a claimed chord could do nothing yet still keep the key from the page.
  */
 export const ARTIFACT_FRAME_CHORDS = {
   sidebar: KEYBINDS.TOGGLE_RIGHT_SIDEBAR,
   artifacts: KEYBINDS.OPEN_ARTIFACTS_TAB,
+  agentInterface: KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW,
 } as const satisfies Record<string, Keybind>;
 export type ArtifactFrameChord = keyof typeof ARTIFACT_FRAME_CHORDS;
 
@@ -145,9 +163,28 @@ const ArtifactSidebarKeyMessageSchema = z
     ...bridgeEnvelope,
     type: z.literal("sidebarKey"),
     // The host indexes ARTIFACT_FRAME_CHORDS with it, so a name without a keybind fails typecheck.
-    chord: z.enum(["sidebar", "artifacts"]),
+    chord: z.enum(["sidebar", "artifacts", "agentInterface"]),
     ctrlKey: z.boolean(),
     metaKey: z.boolean(),
+  })
+  .strict();
+
+/**
+ * The chat's stream-interrupt keybinds, by the name the frame forwards them with. The main pane's
+ * status page takes the chat's place, so with focus in it these keys should still stop the stream.
+ */
+export const ARTIFACT_FRAME_INTERRUPT_KEYS = {
+  normal: KEYBINDS.INTERRUPT_STREAM_NORMAL,
+  vim: KEYBINDS.INTERRUPT_STREAM_VIM,
+} as const satisfies Record<string, Keybind>;
+export type ArtifactFrameInterruptKey = keyof typeof ARTIFACT_FRAME_INTERRUPT_KEYS;
+
+const ArtifactInterruptKeyMessageSchema = z
+  .object({
+    ...bridgeEnvelope,
+    type: z.literal("interruptKey"),
+    // The host indexes ARTIFACT_FRAME_INTERRUPT_KEYS with it, so a name without a keybind fails typecheck.
+    keybind: z.enum(["normal", "vim"]),
   })
   .strict();
 
@@ -162,6 +199,7 @@ const ArtifactOpenWorkspaceMessageSchema = z
 export const ArtifactFrameToHostMessageSchema = z.discriminatedUnion("type", [
   ArtifactKeyMessageSchema,
   ArtifactSidebarKeyMessageSchema,
+  ArtifactInterruptKeyMessageSchema,
   ArtifactOpenWorkspaceMessageSchema,
   ArtifactSendMessageSchema,
   ArtifactSetStateMessageSchema,
@@ -171,11 +209,30 @@ export type ArtifactFrameToHostMessage = z.infer<typeof ArtifactFrameToHostMessa
 
 export type ArtifactTheme = "dark" | "light";
 
+/** The full theme mode (`data-xum-theme-name`), beyond the light/dark `theme`. */
+const ArtifactThemeNameSchema = ThemePreferenceSchema.exclude(["auto"]);
+
+/** `--xum-*` custom properties the frame sets on its root element (appStyleVariables.ts). */
+export const ArtifactThemeVariablesSchema = z
+  .record(
+    z.string().regex(ARTIFACT_THEME_VARIABLE_NAME_PATTERN),
+    z.string().max(ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS)
+  )
+  .refine((variables) => Object.keys(variables).length <= ARTIFACT_THEME_VARIABLES_MAX_COUNT);
+
+/** What a theme message carries besides light/dark: the theme mode and its palette. */
+export interface ArtifactAppearance {
+  themeName: z.infer<typeof ArtifactThemeNameSchema>;
+  variables: z.infer<typeof ArtifactThemeVariablesSchema>;
+}
+
 const ArtifactThemeMessageSchema = z
   .object({
     ...bridgeEnvelope,
     type: z.literal("theme"),
     theme: z.enum(["dark", "light"]),
+    themeName: ArtifactThemeNameSchema.optional(),
+    variables: ArtifactThemeVariablesSchema.optional(),
   })
   .strict();
 
@@ -241,12 +298,19 @@ export function acceptArtifactFrameMessage(
   return parsed.success ? parsed.data : null;
 }
 
-export function postArtifactTheme(frameWindow: Window | null | undefined, theme: ArtifactTheme) {
+export function postArtifactTheme(
+  frameWindow: Window | null | undefined,
+  theme: ArtifactTheme,
+  appearance?: ArtifactAppearance
+) {
   if (frameWindow == null) return;
   const message: ArtifactHostToFrameMessage = {
     xumArtifact: ARTIFACT_BRIDGE_VERSION,
     type: "theme",
     theme,
+    ...(appearance != null
+      ? { themeName: appearance.themeName, variables: appearance.variables }
+      : {}),
   };
   // The sandboxed frame has an opaque origin ("null"), which cannot be named as a target
   // origin, so "*" is required. The payload carries nothing sensitive by contract.
@@ -268,12 +332,15 @@ export function postArtifactAnnotateMode(frameWindow: Window | null | undefined,
  * Source of the inline <script> injected as the frame's first script (inline, so the CSP's
  * 'unsafe-inline' allows it). It forwards Escape and Shift+F to the host and exposes a
  * read-only `window.xum.theme`, updated from theme messages, plus a `xumthemechange` event;
+ * theme messages may also carry the full theme mode, mirrored into `data-xum-theme-name`, and
+ * the app palette, set as `--xum-*` custom properties on the root element so plain CSS can use
+ * `var(--xum-bg)` and friends (appStyleVariables.ts);
  * `window.xum.send` / `window.xum.setState` / `window.xum.openWorkspace`, and a read-only
  * `window.xum.state` with a `xumstatechange` event. It also mirrors the theme into `data-xum-theme` on the root element,
  * so plain CSS (the goal status board, which has no scripts) can follow the app theme instead
  * of the OS preference. While the host has annotate mode on, a capture-phase click listener
  * swallows clicks and reports the point (plus any selected text) instead.
- * Only the initial theme and the persisted state are interpolated. The state goes in as a JSON
+ * Only the initial theme and appearance and the persisted state are interpolated. The state goes in as a JSON
  * string passed to JSON.parse, never as an object literal (a literal `"__proto__"` key would set
  * the prototype instead of an own property), with `<` escaped so a `</script>` or `<!--` inside
  * it cannot leave the inline script. A restored state also gets one `xumstatechange` just after
@@ -484,6 +551,69 @@ const ANNOTATE_KEY_LISTENER =
   });`;
 
 /**
+ * The stream-interrupt keys (ARTIFACT_FRAME_INTERRUPT_KEYS), forwarded by name like the annotate
+ * key: once every handler in the artifact has run, so a page whose script uses the key
+ * (preventDefault) keeps it. Escape typed in a text field stays the field's, as in the chat, and
+ * so does an Escape that closes one of the page's dialogs or popovers, as the app's Escape closes
+ * its own dialog before it stops the stream. Whether Escape closes a layer depends on the browser
+ * (closedby, popover types) and on the page (its own key handler), so the bridge watches the press
+ * instead of guessing: the open layers are read before the page's handlers run and again once the
+ * press and its default action are done, and a layer that closed in between was the page's use of
+ * the key. So is a dialog's cancel event, Escape's close request reaching the dialog, which a page
+ * may cancel to close the dialog itself after an animation. Layers inside shadow roots and
+ * overlays the page builds from other elements are not seen. Ctrl+C (Vim mode) interrupts from
+ * anywhere, as in the chat. Keys the page's script dispatched itself are not forwarded.
+ */
+const INTERRUPT_KEY_LISTENER = `
+  var LAYER_SELECTORS = ["dialog[open]", ":popover-open"];
+  // The current trusted Escape press (null for other keys): the page's open layers then, each
+  // with the selector that found it, and whether a dialog got a cancel event since.
+  var press = null;
+  function openLayers() {
+    var layers = [];
+    for (var i = 0; i < LAYER_SELECTORS.length; i++) {
+      try {
+        var found = document.querySelectorAll(LAYER_SELECTORS[i]);
+        for (var j = 0; j < found.length; j++) layers.push({ element: found[j], selector: LAYER_SELECTORS[i] });
+      } catch (error) {
+        // A browser without popovers cannot have one open.
+        console.debug("[xum] artifact bridge: unsupported selector", LAYER_SELECTORS[i], error);
+      }
+    }
+    return layers;
+  }
+  function closedLayer(layers) {
+    for (var i = 0; i < layers.length; i++) {
+      if (!layers[i].element.isConnected || !layers[i].element.matches(layers[i].selector)) return true;
+    }
+    return false;
+  }
+  // Capture: these listeners run before any of the page's own handlers.
+  window.addEventListener("keydown", function (event) {
+    if (event.isTrusted) press = event.key === ${JSON.stringify(KEYBINDS.INTERRUPT_STREAM_NORMAL.key)} ? { layers: openLayers(), cancelled: false } : null;
+  }, true);
+  window.addEventListener("cancel", function () {
+    if (press !== null) press.cancelled = true;
+  }, true);
+  window.addEventListener("keydown", function (event) {
+    if (!event.isTrusted || event.repeat || event.metaKey || event.altKey || event.shiftKey) return;
+    if (typeof event.key !== "string") return;
+    var keybind = null;
+    if (!event.ctrlKey && event.key === ${JSON.stringify(KEYBINDS.INTERRUPT_STREAM_NORMAL.key)}) {
+      if (!isEditable(keyTarget(event))) keybind = "normal";
+    } else if (event.ctrlKey && event.key.toLowerCase() === ${JSON.stringify(KEYBINDS.INTERRUPT_STREAM_VIM.key)}) {
+      keybind = "vim";
+    }
+    if (keybind === null) return;
+    var current = press;
+    window.setTimeout(function () {
+      if (event.defaultPrevented) return;
+      if (current !== null && (current.cancelled || closedLayer(current.layers))) return;
+      host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "interruptKey", keybind: keybind }, "*");
+    }, 0);
+  });`;
+
+/**
  * A forwarded chord's key, lowercased. The shim checks only a Ctrl (Cmd on macOS) plus Shift chord
  * of one key, so another keybind shape turns forwarding off (null), like plainSingleKey. The shim
  * tests send the keybind's key.
@@ -500,16 +630,16 @@ function ctrlShiftKey(keybind: Keybind): string | null {
   return chord ? keybind.key.toLowerCase() : null;
 }
 
-/** Lowercased key -> chord name, for the chords the shim can forward. */
-function frameChordKeys(): Record<string, ArtifactFrameChord> {
+/** Lowercased key -> chord name, for the chords this frame forwards. */
+function frameChordKeys(forwardsViewSwitch: boolean): Record<string, ArtifactFrameChord> {
   const keys: Record<string, ArtifactFrameChord> = {};
   for (const chord of Object.keys(ARTIFACT_FRAME_CHORDS) as ArtifactFrameChord[]) {
+    if (chord === "agentInterface" && !forwardsViewSwitch) continue;
     const key = ctrlShiftKey(ARTIFACT_FRAME_CHORDS[chord]);
     if (key != null) keys[key] = chord;
   }
   return keys;
 }
-const FRAME_CHORD_KEYS = frameChordKeys();
 
 /**
  * The right-sidebar chords, with this platform's modifier as matchesKeybind reads the keybind: on
@@ -519,11 +649,12 @@ const FRAME_CHORD_KEYS = frameChordKeys();
  * decides). No editable exclusion: the chords type nothing, and the host's own handlers work from
  * the chat input too. Built per frame: isMac() needs the window.
  */
-function sidebarKeyListener(): string {
-  if (Object.keys(FRAME_CHORD_KEYS).length === 0) return "";
+function sidebarKeyListener(forwardsViewSwitch: boolean): string {
+  const chordKeys = frameChordKeys(forwardsViewSwitch);
+  if (Object.keys(chordKeys).length === 0) return "";
   const modifier = isMac() ? "event.metaKey" : "event.ctrlKey && !event.metaKey";
   return `
-  var chordKeys = ${JSON.stringify(FRAME_CHORD_KEYS)};
+  var chordKeys = ${JSON.stringify(chordKeys)};
   window.addEventListener("keydown", function (event) {
     // A held key would flip the sidebar on every repeat and spend the frame's message budget.
     if (event.repeat || event.altKey || !event.shiftKey || !(${modifier})) return;
@@ -539,7 +670,12 @@ function sidebarKeyListener(): string {
 
 export function buildArtifactBridgeScript(
   initialTheme: ArtifactTheme,
-  initialState: unknown = null
+  initialState: unknown = null,
+  initialAppearance: ArtifactAppearance | null = null,
+  /** The page has no styles of its own (isUnstyledHtmlDocument): it takes the theme's scheme. */
+  followColorScheme = false,
+  /** The main pane's status page: it also forwards the view switch (ARTIFACT_FRAME_CHORDS). */
+  forwardsViewSwitch = false
 ): string {
   return `(function () {
   "use strict";
@@ -550,6 +686,9 @@ export function buildArtifactBridgeScript(
   });
   var host = window.parent;
   var theme = ${JSON.stringify(initialTheme)};
+  var followColorScheme = ${JSON.stringify(followColorScheme)};
+  var themeNames = ${JSON.stringify(ArtifactThemeNameSchema.options)};
+  var themeVariablePattern = ${ARTIFACT_THEME_VARIABLE_NAME_PATTERN.toString()};
   var state = JSON.parse(${inlineScriptJson(JSON.stringify(initialState ?? null))});
   var annotating = false;
   var api = {};
@@ -600,9 +739,33 @@ export function buildArtifactBridgeScript(
   }
   function applyThemeAttribute() {
     var root = document.documentElement;
-    if (root) root.setAttribute("data-xum-theme", theme);
+    if (!root) return;
+    root.setAttribute("data-xum-theme", theme);
+    // Else such a page keeps a white canvas in dark themes; its default text follows the scheme.
+    if (followColorScheme && root.style) root.style.colorScheme = theme;
   }
   applyThemeAttribute();
+  // Checked again here (the host validates too): own string keys matching --xum-*, string
+  // values, bounded count and length. Unknown entries are skipped, never applied.
+  function applyAppearance(themeName, variables) {
+    var root = document.documentElement;
+    if (!root) return;
+    if (typeof themeName === "string" && themeNames.indexOf(themeName) !== -1) {
+      root.setAttribute("data-xum-theme-name", themeName);
+    }
+    if (!variables || typeof variables !== "object" || Array.isArray(variables)) return;
+    if (!root.style || typeof root.style.setProperty !== "function") return;
+    var names = Object.keys(variables);
+    if (names.length > ${ARTIFACT_THEME_VARIABLES_MAX_COUNT}) return;
+    for (var i = 0; i < names.length; i++) {
+      var value = variables[names[i]];
+      if (!themeVariablePattern.test(names[i]) || typeof value !== "string") continue;
+      if (value.length > ${ARTIFACT_THEME_VARIABLE_VALUE_MAX_CHARS}) continue;
+      root.style.setProperty(names[i], value);
+    }
+  }
+  var initialAppearance = JSON.parse(${inlineScriptJson(JSON.stringify(initialAppearance))});
+  if (initialAppearance) applyAppearance(initialAppearance.themeName, initialAppearance.variables);
   window.addEventListener("message", function (event) {
     if (event.source !== host) return;
     var data = event.data;
@@ -610,6 +773,7 @@ export function buildArtifactBridgeScript(
     if (data.type === "theme" && (data.theme === "dark" || data.theme === "light")) {
       theme = data.theme;
       applyThemeAttribute();
+      applyAppearance(data.themeName, data.variables);
       window.dispatchEvent(new CustomEvent("xumthemechange", { detail: { theme: theme } }));
     } else if (data.type === "annotate") {
       annotating = data.enabled === true;
@@ -685,7 +849,8 @@ export function buildArtifactBridgeScript(
     host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "key", key: key, shiftKey: event.shiftKey }, "*");
   }, true);
   ${ANNOTATE_KEY_LISTENER}
-  ${sidebarKeyListener()}
+  ${INTERRUPT_KEY_LISTENER}
+  ${sidebarKeyListener(forwardsViewSwitch)}
   ${ARTIFACT_IN_PAGE_LINK_SCRIPT}
 })();`;
 }

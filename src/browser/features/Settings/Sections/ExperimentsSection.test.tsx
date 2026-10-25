@@ -240,6 +240,17 @@ describe("PortableDesktopExperimentWarning", () => {
     expect(view.getByLabelText("Toggle RLM Mode")).toBeTruthy();
   });
 
+  test("shows Agent interface view nested under Artifacts only when Artifacts is enabled", () => {
+    experimentEnabled = false;
+    experimentValues = { [EXPERIMENT_IDS.ARTIFACTS]: false };
+    const view = render(<ExperimentsSection />, { wrapper: ApiWrapper });
+    expect(view.queryByLabelText("Toggle Agent interface view")).toBeNull();
+
+    experimentValues = { [EXPERIMENT_IDS.ARTIFACTS]: true };
+    view.rerender(<ExperimentsSection />);
+    expect(view.getByLabelText("Toggle Agent interface view")).toBeTruthy();
+  });
+
   // A reconnect checks the prerequisite again through the new client. The warning stays on
   // screen while offline and until that check answers.
   describe.each([...GAP_MODES])("across a reconnect (%s)", (mode) => {

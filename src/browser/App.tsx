@@ -123,6 +123,7 @@ import { WindowsToolchainBanner } from "./components/WindowsToolchainBanner/Wind
 import { RosettaBanner } from "./components/RosettaBanner/RosettaBanner";
 
 import { useExperimentValue } from "@/browser/hooks/useExperiments";
+import { useAgentInterfaceEnabled } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
 import { setAutoRoutingChoice } from "@/browser/utils/modelChange";
 import { useProvidersConfig } from "@/browser/hooks/useProvidersConfig";
 import { useRouting } from "@/browser/hooks/useRouting";
@@ -329,6 +330,7 @@ function AppInner() {
   const [isMultiProjectWorkspaceModalOpen, setMultiProjectWorkspaceModalOpen] = useState(false);
   const multiProjectWorkspacesEnabled = useExperimentValue(EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES);
   const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const agentInterfaceViewEnabled = useAgentInterfaceEnabled();
   const mcpAppsEnabled = useExperimentValue(EXPERIMENT_IDS.MCP_APPS);
   // MCP App entry points open as app tabs, so the mcp-apps experiment gates them too.
   useLoadMcpAppEntrypoints(selectedWorkspace?.workspaceId ?? null, mcpAppsEnabled);
@@ -1041,6 +1043,7 @@ function AppInner() {
     onStartMultiProjectWorkspaceCreation: openNewMultiProjectWorkspaceFromPalette,
     multiProjectWorkspacesEnabled,
     artifactsEnabled,
+    agentInterfaceViewEnabled,
     mcpAppsEnabled,
     mcpAppEntrypoints,
     perfFlightRecorderEnabled,

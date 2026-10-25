@@ -58,23 +58,7 @@ import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigation
 import { escapeControls, NAME_CONTROLS } from "./mcpAppText";
 import { ARTIFACT_IFRAME_SANDBOX } from "./SandboxedArtifactFrame";
 import { Notice, NoteBar } from "./SourceText";
-
-// Spec style variable -> the app's CSS variable it is read from (globals.css). Values are
-// sent to the view as data; the host never injects CSS into the frame.
-const STYLE_VARIABLES: Record<string, string> = {
-  "--color-background-primary": "--color-background",
-  "--color-background-secondary": "--color-background-secondary",
-  "--color-text-primary": "--color-foreground",
-  "--color-text-secondary": "--color-muted",
-  "--color-border-primary": "--color-border",
-  "--color-border-secondary": "--color-border-light",
-  "--color-text-info": "--color-accent",
-  "--color-text-danger": "--color-danger",
-  "--color-text-success": "--color-success-text",
-  "--font-sans": "--font-primary",
-  "--font-mono": "--font-monospace",
-  "--border-radius-md": "--radius",
-};
+import { readAppStyleVariables } from "./appStyleVariables";
 
 /**
  * The spec's responsive hint: the desktop app, a phone (the same narrow touch query the
@@ -83,16 +67,6 @@ const STYLE_VARIABLES: Record<string, string> = {
 function hostPlatform(): McpAppHostContext["platform"] {
   if (isDesktopMode()) return "desktop";
   return window.matchMedia("(max-width: 768px) and (pointer: coarse)").matches ? "mobile" : "web";
-}
-
-function readStyleVariables(): Record<string, string> {
-  const computed = window.getComputedStyle(document.documentElement);
-  const variables: Record<string, string> = {};
-  for (const [specName, appName] of Object.entries(STYLE_VARIABLES)) {
-    const value = computed.getPropertyValue(appName).trim();
-    if (value) variables[specName] = value;
-  }
-  return variables;
 }
 
 /**
@@ -721,7 +695,7 @@ export function McpAppFrame(props: {
     const { channel } = viewDocument;
     const getHostContext = (): McpAppHostContext => ({
       theme: latest.current.theme,
-      styles: { variables: readStyleVariables() },
+      styles: { variables: readAppStyleVariables("mcp") },
       // The mode follows where this instance lives: its app tab (full-screen sidebar on phones)
       // is the view's fullscreen, its tool card the inline mode. A move mounts a new instance.
       displayMode: inline ? "inline" : "fullscreen",
@@ -885,7 +859,10 @@ export function McpAppFrame(props: {
 
   // Keep the view's theme current without reloading it.
   useEffect(() => {
-    hostRef.current?.sendHostContextChanged({ theme, styles: { variables: readStyleVariables() } });
+    hostRef.current?.sendHostContextChanged({
+      theme,
+      styles: { variables: readAppStyleVariables("mcp") },
+    });
   }, [theme]);
 
   const settleConsent = (pending: PendingConsent, allowed: boolean) => {
