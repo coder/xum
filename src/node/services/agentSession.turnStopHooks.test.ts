@@ -908,6 +908,53 @@ describe("status page turn-end nudge", () => {
     ).toBe(true);
   });
 
+  test("a Stop that finished while the turn's last event arrived ends the turn without a nudge", async () => {
+    // The stream still ends normally, and the Stop is over before the stream-end work reaches
+    // the nudge: only the epoch the turn was admitted under shows the turn was stopped.
+    let stopEpoch = 0;
+    const { h, streams } = await setup({
+      statusPageNeedsNudge: true,
+      whileStreaming: () => void stopEpoch++,
+      session: { getStopEpoch: () => stopEpoch },
+    });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual(["fix the bug"]);
+    expect(streams()).toBe(1);
+  });
+
+  test("a Stop while the nudge row is written rolls the row back", async () => {
+    // Past dequeue, queue clearing no longer sees the continuation: its admission must.
+    let stopEpoch = 0;
+    const { h, streams } = await setup({
+      statusPageNeedsNudge: true,
+      session: { getStopEpoch: () => stopEpoch },
+    });
+    const accept = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(
+      async (id, capture, operation, observer) => {
+        const result = await accept(id, capture, operation, observer);
+        const nudgeRow =
+          operation.kind === "append" &&
+          operation.messages.some((row) =>
+            row.parts.some(
+              (part) => part.type === "text" && part.text === STATUS_PAGE_TURN_END_NUDGE
+            )
+          );
+        if (nudgeRow) stopEpoch++;
+        return result;
+      }
+    );
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual(["fix the bug"]);
+    expect(streams()).toBe(1);
+  });
+
   test.each([
     { name: "a Plan mode turn", agentId: "plan" },
     { name: "a turn a plugin halted", halt: true },

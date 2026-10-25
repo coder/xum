@@ -163,35 +163,56 @@ describe("needsStatusPageTurnEndNudge", () => {
   ])("$name: nudge $nudge", async (row) => {
     if (row.agentPage) await writePage("<p>Fixing the build</p>");
     const turn = await startTurn();
-    expect(await needsStatusPageTurnEndNudge({ turn: turn ?? undefined, parts: row.parts })).toBe(
-      row.nudge
-    );
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: row.parts,
+      })
+    ).toBe(row.nudge);
   });
 
   test("a turn that updated the page gets no nudge", async () => {
     const turn = await startTurn();
     await writePage("<p>Build fixed</p>");
-    expect(await needsStatusPageTurnEndNudge({ turn: turn ?? undefined, parts: ranTools })).toBe(
-      false
-    );
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: ranTools,
+      })
+    ).toBe(false);
   });
 
-  test("a page the agent deleted is seeded again and gets the nudge", async () => {
+  test.each([
+    { name: "is seeded again and gets the nudge", viewEnabled: true },
+    { name: "after the view was switched off gets neither", viewEnabled: false },
+  ])("a page the agent deleted $name", async (row) => {
     const turn = await startTurn();
     await fs.rm(statusPath());
-    expect(await needsStatusPageTurnEndNudge({ turn: turn ?? undefined, parts: textOnly })).toBe(
-      true
-    );
-    expect(await fs.readFile(statusPath(), "utf8")).toBe(AGENT_INTERFACE_STATUS_TEMPLATE);
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: row.viewEnabled,
+        turn: turn ?? undefined,
+        parts: textOnly,
+      })
+    ).toBe(row.viewEnabled);
+    const page = fs.readFile(statusPath(), "utf8");
+    if (row.viewEnabled) expect(await page).toBe(AGENT_INTERFACE_STATUS_TEMPLATE);
+    else await expect(page).rejects.toMatchObject({ code: "ENOENT" });
   });
 
   test("a folder at the page's path gets no nudge", async () => {
     const turn = await startTurn();
     await fs.rm(statusPath());
     await fs.mkdir(statusPath());
-    expect(await needsStatusPageTurnEndNudge({ turn: turn ?? undefined, parts: ranTools })).toBe(
-      false
-    );
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: ranTools,
+      })
+    ).toBe(false);
   });
 
   test.each([
@@ -202,13 +223,19 @@ describe("needsStatusPageTurnEndNudge", () => {
     const turn = await startTurn();
     const later = new Date(Date.now() + 60_000);
     await fs.utimes(statusPath(), later, later);
-    expect(await needsStatusPageTurnEndNudge({ turn: turn ?? undefined, parts: ranTools })).toBe(
-      true
-    );
+    expect(
+      await needsStatusPageTurnEndNudge({
+        viewEnabled: true,
+        turn: turn ?? undefined,
+        parts: ranTools,
+      })
+    ).toBe(true);
   });
 
   test("an inactive view gets no nudge", async () => {
-    expect(await needsStatusPageTurnEndNudge({ turn: undefined, parts: ranTools })).toBe(false);
+    expect(
+      await needsStatusPageTurnEndNudge({ viewEnabled: true, turn: undefined, parts: ranTools })
+    ).toBe(false);
   });
 
   test("a location that fails at turn end gets no nudge and does not throw", async () => {
@@ -218,6 +245,8 @@ describe("needsStatusPageTurnEndNudge", () => {
       startFingerprint: turn?.startFingerprint ?? null,
       resolveLocation: () => Promise.reject(new Error("runtime unreachable")),
     };
-    expect(await needsStatusPageTurnEndNudge({ turn: failing, parts: ranTools })).toBe(false);
+    expect(
+      await needsStatusPageTurnEndNudge({ viewEnabled: true, turn: failing, parts: ranTools })
+    ).toBe(false);
   });
 });

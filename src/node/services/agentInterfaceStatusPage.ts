@@ -147,14 +147,16 @@ export async function prepareAgentInterfaceStatusPage(args: {
  * At turn end: whether the status page the user sees needs the turn-end nudge. True when the page
  * is missing (it is seeded again) or still the seeded placeholder, or when the turn made a
  * successful tool call (it did work) and left the page as it was at turn start. False when the
- * view was inactive this turn, and when the page cannot be read or is not a regular file: a nudge
- * must never rest on a guess.
+ * view was inactive this turn or was switched off since (`viewEnabled` reads the flags at turn end:
+ * the user then sees the transcript, so the page is neither seeded again nor nudged), and when the
+ * page cannot be read or is not a regular file: a nudge must never rest on a guess.
  */
 export async function needsStatusPageTurnEndNudge(input: {
   turn: AgentInterfaceStatusPageTurn | undefined;
+  viewEnabled: boolean;
   parts: readonly CompletedMessagePart[];
 }): Promise<boolean> {
-  if (input.turn == null) return false;
+  if (input.turn == null || !input.viewEnabled) return false;
   const abortSignal = AbortSignal.timeout(STATUS_PAGE_TURN_END_READ_TIMEOUT_MS);
   const location = await resolveStatusPageLocation(input.turn.resolveLocation, abortSignal);
   if (location == null) return false;

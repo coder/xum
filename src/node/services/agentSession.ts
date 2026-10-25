@@ -723,6 +723,8 @@ interface StopContinuationProvenance {
    * exit). A continuation queued after stream-end would run after that owner saw the turn end.
    */
   externallyOwnedTurn: boolean;
+  /** See activeStreamContext.admissionStopEpoch; undefined when the stream had no context. */
+  admissionStopEpoch?: number;
 }
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
@@ -1925,6 +1927,8 @@ export class AgentSession {
     /** Automatic sub-agent turn provenance, so retries and follow-ups keep it. */
     taskTurnKind?: TaskTurnKind;
     workspaceTurnMetadata?: Extract<MuxMessageMetadata, { type: "workspace-turn-task" }>;
+    /** The Stop epoch at this turn's admission: a Stop since then fences its turn.stop continuation. */
+    admissionStopEpoch: number;
   };
 
   private activeCompactionRequest?: {
@@ -8879,6 +8883,7 @@ export class AgentSession {
         ...(goalId != null ? { goalId } : {}),
         ...(taskTurnKind != null ? { taskTurnKind } : {}),
         providersConfig,
+        admissionStopEpoch: preparation?.admissionStopEpoch ?? this.getStopEpoch(),
       };
       this.activeStreamContext = streamContext;
       if (activeTurnThinkingOverride != null) {
@@ -10776,8 +10781,13 @@ export class AgentSession {
     }
     // A hard Stop can land while a slow hook runs, after the stream ended: it then finds no live
     // stream to supersede and clears the queue before the hook returns. Its epoch fences the
-    // continuation instead (rechecked below, after the last await).
-    const stopEpochAtHook = this.getStopEpoch();
+    // continuation instead (rechecked below, after the last await, and at the continuation's
+    // admission). The baseline is the turn's admission, not the hook's start: a Stop pressed as
+    // the final text arrives can finish before the stream-end work reaches the hooks, and must
+    // still end the turn rather than let a nudge start a turn the user then sees interrupted.
+    const stopEpochAtTurn = provenance.admissionStopEpoch ?? this.getStopEpoch();
+    const stoppedSinceTurn = () =>
+      this.isStopInProgress() || this.getStopEpoch() !== stopEpochAtTurn;
     const continuation = await this.readTurnStopContinuation(payload, options, provenance);
     if (continuation == null || options == null) {
       this.stopHookContinuations = 0;
@@ -10816,8 +10826,8 @@ export class AgentSession {
       this.stopHookContinuations = 0;
       return;
     }
-    // A Stop since the hook started ends the turn: no continuation runs after it.
-    if (this.isStopInProgress() || this.getStopEpoch() !== stopEpochAtHook) {
+    // A Stop since the turn started ends it: no continuation runs after it.
+    if (stoppedSinceTurn()) {
       this.stopHookContinuations = 0;
       return;
     }
@@ -10836,7 +10846,9 @@ export class AgentSession {
       ...(provenance.goalKind != null
         ? { goalKind: GOAL_CONTINUATION_KIND, goalId: provenance.goalId }
         : {}),
-      ...(goalAdmissionStale != null ? { admissionStale: goalAdmissionStale } : {}),
+      // A Stop after dequeue, where queue clearing no longer sees the entry, still refuses the
+      // continuation at admission, rolling back its row instead of leaving it without a reply.
+      admissionStale: () => stoppedSinceTurn() || goalAdmissionStale?.() === true,
       dedupeKey: STOP_HOOK_CONTINUATION_DEDUPE_KEY,
       // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
       skipPromptHooks: true,
@@ -10913,6 +10925,7 @@ export class AgentSession {
       autoModelRouting: context.autoModelRouting,
       delegatedWorkspaceTurn: context.workspaceTurnMetadata != null,
       externallyOwnedTurn: this.isExternallyOwnedTurn(payload, context.options),
+      admissionStopEpoch: context.admissionStopEpoch,
     };
   }
 

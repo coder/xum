@@ -620,6 +620,9 @@ export class AIService extends EventEmitter {
   ): Promise<boolean> {
     return needsStatusPageTurnEndNudge({
       turn: this.turnRequestBuilder.takeAgentInterfaceStatusPageTurn(workspaceId, input.messageId),
+      viewEnabled:
+        this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) &&
+        this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
       parts: input.parts,
     });
   }
