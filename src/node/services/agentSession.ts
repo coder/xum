@@ -723,8 +723,8 @@ interface StopContinuationProvenance {
    * exit). A continuation queued after stream-end would run after that owner saw the turn end.
    */
   externallyOwnedTurn: boolean;
-  /** See activeStreamContext.admissionStopEpoch; undefined when the stream had no context. */
-  admissionStopEpoch?: number;
+  /** See activeStreamContext.admissionStopEpoch (the current epoch when it had no context). */
+  admissionStopEpoch: number;
 }
 
 function extractAgentSkillRefs(metadata: MuxMessageMetadata | undefined): AgentSkillReference[] {
@@ -8865,6 +8865,9 @@ export class AgentSession {
       this.activeStreamHadAnyDelta = false;
       this.activeStreamHadPostCompactionInjection = false;
       const providersConfig = this.getProvidersConfigSafe();
+      // Provider-start fence closes over the epoch captured at this turn's admission (never
+      // refreshed here, so a prepared candidate cannot launder a stop that happened meanwhile).
+      const admissionStopEpoch = preparation?.admissionStopEpoch ?? this.getStopEpoch();
       const streamContext: NonNullable<typeof this.activeStreamContext> = {
         admissionCapture,
         modelString,
@@ -8883,7 +8886,7 @@ export class AgentSession {
         ...(goalId != null ? { goalId } : {}),
         ...(taskTurnKind != null ? { taskTurnKind } : {}),
         providersConfig,
-        admissionStopEpoch: preparation?.admissionStopEpoch ?? this.getStopEpoch(),
+        admissionStopEpoch,
       };
       this.activeStreamContext = streamContext;
       if (activeTurnThinkingOverride != null) {
@@ -9220,9 +9223,6 @@ export class AgentSession {
         return await fail(createUnknownSendMessageError(getErrorMessage(error)));
       }
       if (isStreamStartAborted()) return Ok(undefined);
-      // Provider-start fence closes over the epoch captured at this turn's admission (never
-      // refreshed here, so a prepared candidate cannot launder a stop that happened meanwhile).
-      const admissionStopEpoch = preparation?.admissionStopEpoch ?? this.getStopEpoch();
       const stopFence = () =>
         !this.isStopInProgress() && this.getStopEpoch() === admissionStopEpoch;
       const streamResult = await startRequest({
@@ -10785,9 +10785,7 @@ export class AgentSession {
     // admission). The baseline is the turn's admission, not the hook's start: a Stop pressed as
     // the final text arrives can finish before the stream-end work reaches the hooks, and must
     // still end the turn rather than let a nudge start a turn the user then sees interrupted.
-    const stopEpochAtTurn = provenance.admissionStopEpoch ?? this.getStopEpoch();
-    const stoppedSinceTurn = () =>
-      this.isStopInProgress() || this.getStopEpoch() !== stopEpochAtTurn;
+    const stopEpochAtTurn = provenance.admissionStopEpoch;
     const continuation = await this.readTurnStopContinuation(payload, options, provenance);
     if (continuation == null || options == null) {
       this.stopHookContinuations = 0;
@@ -10806,7 +10804,7 @@ export class AgentSession {
     // its caps. Like a redispatched goal follow-up, it runs only while the goal still admits a
     // continuation (still active, same goal, no Pause or Stop since): a goal that just reached
     // its turn or cost limit, or a budget wrap-up, ends here.
-    let goalAdmissionStale: (() => boolean) | undefined;
+    let goalAdmissionStale = () => false;
     if (provenance.goalKind != null && this.workspaceGoalService != null) {
       const admission = await this.readStopContinuationGoalAdmission(provenance.goalId);
       if (!admission.admissible) {
@@ -10827,7 +10825,7 @@ export class AgentSession {
       return;
     }
     // A Stop since the turn started ends it: no continuation runs after it.
-    if (stoppedSinceTurn()) {
+    if (this.stoppedSince(stopEpochAtTurn)) {
       this.stopHookContinuations = 0;
       return;
     }
@@ -10848,11 +10846,16 @@ export class AgentSession {
         : {}),
       // A Stop after dequeue, where queue clearing no longer sees the entry, still refuses the
       // continuation at admission, rolling back its row instead of leaving it without a reply.
-      admissionStale: () => stoppedSinceTurn() || goalAdmissionStale?.() === true,
+      admissionStale: () => this.stoppedSince(stopEpochAtTurn) || goalAdmissionStale(),
       dedupeKey: STOP_HOOK_CONTINUATION_DEDUPE_KEY,
       // Codex runs no UserPromptSubmit hook for a Stop continuation (see skipPromptHooks).
       skipPromptHooks: true,
     });
+  }
+
+  /** Whether a hard Stop is in progress or ran since `stopEpoch` was read. */
+  private stoppedSince(stopEpoch: number): boolean {
+    return this.isStopInProgress() || this.getStopEpoch() !== stopEpoch;
   }
 
   /**
@@ -10925,7 +10928,7 @@ export class AgentSession {
       autoModelRouting: context.autoModelRouting,
       delegatedWorkspaceTurn: context.workspaceTurnMetadata != null,
       externallyOwnedTurn: this.isExternallyOwnedTurn(payload, context.options),
-      admissionStopEpoch: context.admissionStopEpoch,
+      admissionStopEpoch: context.admissionStopEpoch ?? this.getStopEpoch(),
     };
   }
 
