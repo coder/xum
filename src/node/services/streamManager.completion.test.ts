@@ -28,6 +28,8 @@ import {
   createStreamResultForTests,
   createStreamInfoForTests,
   runTurnForTests,
+  scriptedStreamText,
+  STOP_FINISH,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
@@ -1644,5 +1646,40 @@ describe("StreamManager - empty stream completions", () => {
 
     const partial = await historyService.readPartial(workspaceId);
     expect(partial?.metadata?.errorType).toBe("model_refusal");
+  });
+});
+
+describe("StreamManager - stream start", () => {
+  const answered = {
+    chunks: [{ type: "text-delta", text: "answer" }, STOP_FINISH],
+    usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+  };
+
+  test("stream-start carries the turn's history sequence", async () => {
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([answered]),
+    });
+    const starts: Array<{ historySequence?: number }> = [];
+    onTurnEngineEvent(streamManager, "stream-start", (data) => starts.push(data));
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "stream-start-history-sequence",
+      historySequence: 7,
+    });
+    expect(completion.status).toBe("completed");
+    expect(starts.map((start) => start.historySequence)).toEqual([7]);
+  });
+
+  test("the live token tracker counts the turn's model from stream start", async () => {
+    const setModel = mock((_model: string, _metadataModel?: string) => Promise.resolve());
+    const streamManager = createStreamManagerForTests(historyService, {
+      tokenTracker: { setModel, countTokens: () => Promise.resolve(0) },
+      streamText: scriptedStreamText([answered]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "stream-start-token-tracker",
+      modelString: KNOWN_MODELS.SONNET.id,
+    });
+    expect(completion.status).toBe("completed");
+    expect(setModel.mock.calls[0]?.[0]).toBe(KNOWN_MODELS.SONNET.id);
   });
 });
