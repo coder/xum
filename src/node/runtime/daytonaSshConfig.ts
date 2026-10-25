@@ -123,12 +123,16 @@ function quoteConfigPath(filePath: string): string {
  * option, so the alias's hardening beats any user entry such as a `Host *` that turns off host
  * key checking or forwards the agent. The Include is scoped to `Host *.xum--daytona` so it
  * reaches no other host, and the closing `Host *` puts the user's top-level lines that follow
- * back in scope for every host, as they were before the block.
+ * back in scope for every host, as they were before the block. `LogLevel QUIET` is here, not in
+ * the include file: ssh's fatal `user@host: Permission denied` names the token, and an editor's
+ * or a native terminal's ssh output passes no Xum redactor, while Xum's own ssh keeps its
+ * messages (its stderr is redacted).
  */
 export function renderDaytonaManagedBlock(includePath: string): string {
   return [
     XUM_DAYTONA_SSH_BLOCK_START,
     `Host *.${XUM_DAYTONA_HOST_SUFFIX}`,
+    "  LogLevel QUIET",
     `  Include ${quoteConfigPath(includePath)}`,
     "Host *",
     XUM_DAYTONA_SSH_BLOCK_END,

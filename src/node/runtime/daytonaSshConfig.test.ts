@@ -47,6 +47,7 @@ describe("DaytonaSshConfigWriter", () => {
       [
         XUM_DAYTONA_SSH_BLOCK_START,
         "Host *.xum--daytona",
+        "  LogLevel QUIET",
         `  Include ${writer.paths.includePath}`,
         "Host *",
         XUM_DAYTONA_SSH_BLOCK_END,
@@ -310,6 +311,20 @@ describe("DaytonaSshConfigWriter", () => {
     // The included Host block must not leak to unrelated hosts.
     const other = spawnSync("ssh", ["-G", "-F", sshConfigPath, "unrelated.example.com"]);
     expect(other.stdout.toString()).not.toContain("user tokenA");
+  });
+
+  // OpenSSH names the user (the token) in its fatal `user@host: Permission denied` line, and
+  // an editor's or a native terminal's ssh output reaches no Xum redactor.
+  it.skipIf(!hasOpenSsh)("keeps your own ssh clients quiet for a Daytona alias", async () => {
+    await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
+    await fs.writeFile(sshConfigPath, "Host *\n  LogLevel VERBOSE\n", "utf8");
+    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+
+    const resolve = (host: string) =>
+      spawnSync("ssh", ["-G", "-F", sshConfigPath, host]).stdout.toString();
+    // `ssh -G` prints QUIET as SILENT.
+    expect(resolve(toXumDaytonaHost("sb-1"))).toMatch(/^loglevel (QUIET|SILENT)$/m);
+    expect(resolve("unrelated.example.com")).toMatch(/^loglevel VERBOSE$/m);
   });
 
   // Any user directive with %r would get the token (the ssh user name), and `-o` cannot
