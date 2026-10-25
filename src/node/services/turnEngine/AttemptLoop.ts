@@ -8,16 +8,16 @@
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { PROVIDER_DEFINITIONS } from "@/common/constants/providers";
 import type { StreamErrorType } from "@/common/types/errors";
-import type { MuxMessage } from "@/common/types/message";
+import { hasTokenUsage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
 import type { StreamEndEvent } from "@/common/types/stream";
 import type { ThinkingLevel } from "@/common/types/thinking";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import assert from "@/common/utils/assert";
-import { getErrorMessage } from "@/common/utils/errors";
+import { clampErrorMessage, getErrorMessage } from "@/common/utils/errors";
 import { isRefusalFinishReason } from "@/common/utils/messages/refusalFinishReason";
 import { eventSpine } from "@/node/services/events/eventSpine";
-import type { Logger } from "@/node/services/log";
-import type { StreamErrorPayload } from "@/node/services/utils/sendMessageError";
+import { log, type Logger } from "@/node/services/log";
+import { createErrorEvent, type StreamErrorPayload } from "@/node/services/utils/sendMessageError";
 import { nodeClock } from "@/node/utils/hostClock";
 import { partFold, type FoldablePart, type FoldStep, type FoldView } from "./partFold";
 import type { PartialJournal } from "./PartialJournal";
@@ -48,6 +48,7 @@ import type { TurnResources } from "./TurnResources";
 import type { StreamManagerTokenTracker, WorkspaceId, WorkspaceStreamInfo } from "./types";
 import {
   clonePersistedToolModelUsage,
+  cloneUsage,
   markProviderMetadataCostsIncluded,
   type UsageLedger,
 } from "./UsageLedger";
@@ -185,7 +186,10 @@ export interface AttemptLoopDeps {
     "acquireMcpLease" | "releaseMcpLease" | "closeStreamResources"
   >;
   readonly partialJournal: Pick<PartialJournal, "commitFinal">;
-  readonly usageLedger: Pick<UsageLedger, "settle">;
+  readonly usageLedger: Pick<
+    UsageLedger,
+    "settle" | "discardInFlight" | "recordDroppedPartialUsage"
+  >;
   readonly providerRequest: Pick<ProviderRequest, "recordLostResponseIdIfApplicable">;
   readonly turnEvents: Pick<TurnEvents<WorkspaceStreamInfo>, "emitTurnEvent">;
   readonly refusalFallback: Pick<RefusalFallback, "tryModelFallbackAfterRefusal">;
@@ -231,7 +235,8 @@ export interface AttemptLoopDeps {
   ) => void;
   readonly flushPartialWrite: (
     workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo
+    streamInfo: WorkspaceStreamInfo,
+    terminalPartial?: MuxMessage
   ) => Promise<void>;
   /** StreamManager's part fold view and step application (applyStep). */
   readonly foldView: (
@@ -245,12 +250,11 @@ export interface AttemptLoopDeps {
     step: FoldStep,
     loop: PartLoopState
   ) => Promise<void>;
-  /** StreamManager's error persistence (the error partial and event). */
-  readonly persistStreamError: (
-    workspaceId: WorkspaceId,
+  /** StreamManager's partial snapshot, which the error partial extends. */
+  readonly buildPartialAssistantMessage: (
     streamInfo: WorkspaceStreamInfo,
-    payload: StreamErrorPayload & { errorType: StreamErrorType }
-  ) => Promise<StreamErrorPayload & { errorType: StreamErrorType }>;
+    options?: { metadata?: Partial<MuxMetadata>; parts?: MuxMessage["parts"] }
+  ) => MuxMessage;
   readonly discardUnsettledSessionUsage: (
     workspaceId: WorkspaceId,
     streamInfo: WorkspaceStreamInfo
@@ -796,11 +800,113 @@ export class AttemptLoop {
     );
 
     const errorPayload = buildStreamErrorPayload(streamInfo, error);
-    const persistedPayload = await this.deps.persistStreamError(
-      workspaceId,
-      streamInfo,
-      errorPayload
-    );
+    const persistedPayload = await this.persistStreamError(workspaceId, streamInfo, errorPayload);
     streamInfo.terminalCompletion = { status: "failed", streamError: persistedPayload };
+  }
+
+  /**
+   * Write error metadata to partial.json and emit the corresponding error event.
+   */
+  private async persistStreamError(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    payload: StreamErrorPayload & { errorType: StreamErrorType }
+  ): Promise<StreamErrorPayload & { errorType: StreamErrorType }> {
+    // Clamp at the single choke point every stream error payload passes
+    // through before persist/emit, including buildStreamErrorPayload's
+    // early-return branches (e.g. ModelRefusalError, whose fallbackNote can
+    // embed another error's message). Some SDK errors embed the entire
+    // serialized prompt in their message (AI_TypeValidationError via the
+    // cause walk); unbounded, that would be persisted to history metadata,
+    // shipped over IPC, and rendered in the chat.
+    payload = { ...payload, error: clampErrorMessage(payload.error), model: streamInfo.model };
+    const refusalFinishReason =
+      payload.errorType === "model_refusal"
+        ? ([streamInfo.terminalFinishReason, streamInfo.terminalRawFinishReason].find(
+            isRefusalFinishReason
+          ) ?? streamInfo.terminalFinishReason)
+        : undefined;
+    const terminalRefusalUsage = streamInfo.terminalRefusalUsage;
+    const terminalRefusalProviderMetadata = streamInfo.terminalRefusalProviderMetadata;
+
+    // Errored turns still billed every completed step. Capture the
+    // live-tracked cumulative usage for the sidecar below and mirror it into
+    // session-usage.json — the error path previously skipped both, ingesting
+    // failed turns as $0. Refusal errors are excluded entirely: the refusal
+    // paths already attributed the refusing attempt's tokens (terminal
+    // refusals via terminalRefusalUsage, fallback hops — including the FINAL
+    // hop on chain exhaustion — via recordRefusedAttemptUsage into
+    // toolModelUsages + the ledger), so re-recording the cumulative counters
+    // here would double-count the last refusing attempt.
+    let cumulativeErrorUsage: LanguageModelV2Usage | undefined;
+    let cumulativeErrorProviderMetadata: Record<string, unknown> | undefined;
+    if (payload.errorType !== "model_refusal" && hasTokenUsage(streamInfo.cumulativeUsage)) {
+      cumulativeErrorUsage = cloneUsage(streamInfo.cumulativeUsage);
+      await this.deps.backfillReasoningTokensFromParts(streamInfo, cumulativeErrorUsage);
+      cumulativeErrorProviderMetadata = markProviderMetadataCostsIncluded(
+        streamInfo.cumulativeProviderMetadata
+          ? { ...streamInfo.cumulativeProviderMetadata }
+          : undefined,
+        streamInfo.initialMetadata?.costsIncluded
+      );
+      await this.deps.usageLedger.settle(
+        workspaceId,
+        streamInfo,
+        cumulativeErrorUsage,
+        cumulativeErrorProviderMetadata,
+        "Failed to record session usage for errored stream",
+        "warn"
+      );
+    } else {
+      // Refusals recorded their own usage above: drop any in-flight copy.
+      await this.deps.usageLedger.discardInFlight(workspaceId, streamInfo);
+    }
+    const errorUsage = terminalRefusalUsage ?? cumulativeErrorUsage;
+    const errorProviderMetadata =
+      terminalRefusalProviderMetadata ?? cumulativeErrorProviderMetadata;
+
+    const errorPartialMessage = this.deps.buildPartialAssistantMessage(streamInfo, {
+      metadata: {
+        error: payload.error,
+        errorType: payload.errorType,
+        ...(refusalFinishReason !== undefined ? { finishReason: refusalFinishReason } : {}),
+        ...(errorProviderMetadata !== undefined ? { providerMetadata: errorProviderMetadata } : {}),
+        // INVARIANT: usage / toolModelUsages are deliberately NOT stamped on
+        // the error partial. Errored turns are sidecar-canonical: unlike
+        // aborts, nothing commits the partial at error time (AIService
+        // forwards "error" without commitPartial), so usage stamped here
+        // would strand in partial.json until an unrelated send — or die
+        // entirely when a retry overwrites the partial. The sidecar rows
+        // below are ingested immediately by the error listener, and the
+        // eventually committed row carries no usage, so exactly one source
+        // ever reaches the events table.
+      },
+    });
+
+    // Write error state to disk through the tracked partial write: it waits for any in-flight
+    // flush, cancels a scheduled one, and retires later flushes, so a concurrent cancel cannot
+    // land a pre-error snapshot after it (#5344). Awaited so the state is on disk before any
+    // resume.
+    await this.deps.flushPartialWrite(workspaceId, streamInfo, errorPartialMessage);
+
+    try {
+      await this.deps.usageLedger.recordDroppedPartialUsage(
+        workspaceId,
+        streamInfo,
+        errorUsage,
+        errorProviderMetadata,
+        "errored_stream",
+        // A model_refusal error's stream usage row is terminalRefusalUsage
+        // (only set for terminal no-fallback refusals); label it as a refusal
+        // so analytics can distinguish refusals from generic stream errors.
+        payload.errorType === "model_refusal" ? "refused_stream" : "errored_stream"
+      );
+    } catch (error) {
+      log.error("Failed to record errored-stream usage in headless sidecar", { error });
+    }
+
+    // Emit error event before completion settles so recovery bookkeeping is ready for waiters.
+    this.deps.turnEvents.emitTurnEvent(createErrorEvent(workspaceId as string, payload));
+    return payload;
   }
 }
