@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import {
   toWorkspaceSelection,
@@ -250,6 +250,14 @@ async function buildFrameDocument(input: {
   }
 }
 
+/** The frame's window while it still shows our srcdoc; null after it navigated away. */
+function liveFrameWindow(
+  navigatedRef: RefObject<boolean>,
+  frameRef: RefObject<HTMLIFrameElement | null>
+): Window | null | undefined {
+  return navigatedRef.current ? null : frameRef.current?.contentWindow;
+}
+
 /**
  * A page with the theme's scheme paints no canvas of its own, so the backdrop shows: the pane
  * surface (main pane and right sidebar alike), so the page sits seamlessly in the pane. Any other
@@ -377,8 +385,7 @@ export function SandboxedArtifactFrame(props: {
   // reports its own (the bridge always reports after load), so a dark page is not followed by
   // a flash of frameClassName's white.
   const [backdropColor, setBackdropColor] = useState<string | null>(null);
-  // The frame's window while it still shows our srcdoc; null after it navigated away.
-  const liveWindow = () => (navigatedRef.current ? null : frameRef.current?.contentWindow);
+  const liveWindow = () => liveFrameWindow(navigatedRef, frameRef);
 
   useEffect(() => {
     if (waitingForState) return;
@@ -428,7 +435,7 @@ export function SandboxedArtifactFrame(props: {
     const handler = (event: MessageEvent) => {
       const message = acceptArtifactFrameMessage(
         event,
-        navigatedRef.current ? null : frameRef.current?.contentWindow,
+        liveFrameWindow(navigatedRef, frameRef),
         allowMessage
       );
       if (message == null) return;
@@ -485,15 +492,12 @@ export function SandboxedArtifactFrame(props: {
 
   const annotating = onAnnotate != null;
   useEffect(() => {
-    postArtifactAnnotateMode(
-      navigatedRef.current ? null : frameRef.current?.contentWindow,
-      annotating
-    );
+    postArtifactAnnotateMode(liveFrameWindow(navigatedRef, frameRef), annotating);
   }, [annotating, navigatedRef]);
 
   // Keep the artifact's view of the theme current without reloading it.
   useEffect(() => {
-    postArtifactTheme(navigatedRef.current ? null : frameRef.current?.contentWindow, theme, {
+    postArtifactTheme(liveFrameWindow(navigatedRef, frameRef), theme, {
       themeName: themeMode,
       variables: readAppStyleVariables("xum"),
     });
