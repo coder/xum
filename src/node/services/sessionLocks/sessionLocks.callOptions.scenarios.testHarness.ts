@@ -240,51 +240,53 @@ export async function oneRefineApply(names: LockNames): Promise<void> {
     // The shared HistoryService seam (AGENTS.md): its temp root is the Xum home here.
     const { historyService, config, tempDir: muxHome, cleanup } = await createTestHistoryService();
     names.root(muxHome, "refine");
-    await fs.mkdir(path.join(muxHome, "memory"), { recursive: true });
-    await config.editConfig((cfg) => {
-      cfg.projects.set("/projects/demo", {
-        workspaces: [{ id: workspaceId, name: workspaceId, path: workspacePath }],
-      });
-      return cfg;
-    });
-    const metaService = new MemoryMetaService(muxHome);
-    const model = new MockLanguageModelV3({
-      doStream: () =>
-        Promise.resolve({
-          stream: simulateReadableStream({
-            chunks: [
-              { type: "text-start", id: "t1" },
-              { type: "text-delta", id: "t1", delta: "Nothing worth distilling." },
-              { type: "text-end", id: "t1" },
-              finishChunk(),
-            ] satisfies LanguageModelV3StreamPart[],
-          }),
-        }),
-    });
-    const enabled = new Set<ExperimentId>([
-      EXPERIMENT_IDS.RLM,
-      EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
-    ]);
-    const service = new RefineService(
-      config,
-      new MemoryService(config, metaService),
-      metaService,
-      historyService,
-      {
-        createModelWithPinnedMetadata: (modelString: string) =>
-          Promise.resolve(Ok({ model, metadataModel: modelString })),
-        getWorkspaceMetadata: () => Promise.resolve(Err("no metadata in this scenario")),
-      },
-      { isExperimentEnabled: (id) => enabled.has(id) },
-      { emitChatMessage: () => undefined }
-    );
-    for (const [index, text] of ["Run the tests.", "Lesson: run bun install first."].entries()) {
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage(`user-${index}`, "user", text, { timestamp: 1_000 + index })
-      );
-    }
+    // The seeding runs inside the try, so a failed append or config edit
+    // still removes the temp root of createTestHistoryService() (#7326 Finding 3).
     try {
+      await fs.mkdir(path.join(muxHome, "memory"), { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/projects/demo", {
+          workspaces: [{ id: workspaceId, name: workspaceId, path: workspacePath }],
+        });
+        return cfg;
+      });
+      const metaService = new MemoryMetaService(muxHome);
+      const model = new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "text-start", id: "t1" },
+                { type: "text-delta", id: "t1", delta: "Nothing worth distilling." },
+                { type: "text-end", id: "t1" },
+                finishChunk(),
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          }),
+      });
+      const enabled = new Set<ExperimentId>([
+        EXPERIMENT_IDS.RLM,
+        EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+      ]);
+      const service = new RefineService(
+        config,
+        new MemoryService(config, metaService),
+        metaService,
+        historyService,
+        {
+          createModelWithPinnedMetadata: (modelString: string) =>
+            Promise.resolve(Ok({ model, metadataModel: modelString })),
+          getWorkspaceMetadata: () => Promise.resolve(Err("no metadata in this scenario")),
+        },
+        { isExperimentEnabled: (id) => enabled.has(id) },
+        { emitChatMessage: () => undefined }
+      );
+      for (const [index, text] of ["Run the tests.", "Lesson: run bun install first."].entries()) {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(`user-${index}`, "user", text, { timestamp: 1_000 + index })
+        );
+      }
       await service.run(workspaceId);
       await service.apply(workspaceId, "no-proposal-rendered");
     } finally {
