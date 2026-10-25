@@ -1941,6 +1941,15 @@ export class SSHRuntime extends RemoteRuntime {
     }
 
     initLogger.logStep("Creating git bundle...");
+    // Start the remote writer before git: when git exits before anything reads its stdout,
+    // Node discards the unread output, and a slow ssh start (a Daytona gateway) uploaded an
+    // empty bundle.
+    const remoteAbortController = createAbortController(300_000, abortSignal);
+    const remoteStream = await this.exec(`cat > ${this.quoteForRemote(remoteBundlePath)}`, {
+      cwd: "~",
+      abortSignal: remoteAbortController.signal,
+    });
+
     // Use --branches --tags instead of --all to exclude refs/remotes/origin/*
     // from the bundle. Those tracking refs are from the local machine's last
     // fetch and can be arbitrarily stale — importing them into the shared bare
@@ -1964,12 +1973,6 @@ export class SSHRuntime extends RemoteRuntime {
       for (const line of chunk.split("\n").filter(Boolean)) {
         initLogger.logStderr(line);
       }
-    });
-
-    const remoteAbortController = createAbortController(300_000, abortSignal);
-    const remoteStream = await this.exec(`cat > ${this.quoteForRemote(remoteBundlePath)}`, {
-      cwd: "~",
-      abortSignal: remoteAbortController.signal,
     });
 
     try {
