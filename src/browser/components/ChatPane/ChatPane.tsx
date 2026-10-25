@@ -223,6 +223,9 @@ const isInSlice = (index: number, from: number, to: number) => index >= from && 
 const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean, statusShown: boolean) =>
   !statusShown && (!autoScroll || isDetached);
 
+/** Tab skips the transcript under the status page; the composer dock it holds stays reachable. */
+const transcriptTabIndex = (statusShown: boolean) => (statusShown ? -1 : 0);
+
 /** The last mounted transcript row and where it is now, for loadOlderAnchorRef. */
 function lastRowAnchor(scrollport: HTMLDivElement | null) {
   const rows = scrollport?.querySelectorAll<HTMLElement>("[data-message-id]") ?? [];
@@ -1673,8 +1676,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             onKeyDown={handleTranscriptKeyDown}
             onScroll={handleTranscriptScroll}
             onContextMenu={transcriptContextMenu.onContextMenu}
-            // The status page covers the transcript: Tab skips it (the composer stays reachable).
-            tabIndex={showStatusView ? -1 : 0}
+            tabIndex={transcriptTabIndex(showStatusView)}
             data-testid="message-window"
             // Settled marker for perf tests and story play helpers: includes
             // decoration data readiness AND the tail-first reveal having settled
