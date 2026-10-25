@@ -3,7 +3,8 @@
  * pre-registration (pending) start, the start lock, the stream token, the
  * engine supervisor that fences shutdown on a turn's completion, and hard and
  * soft stop. StreamManager keeps its public methods as delegates and supplies
- * the partial flush and the abort cleanup, which still live there.
+ * the partial flush, which still lives there, and the abort cleanup
+ * (AttemptLoop.cleanupAbortedStream).
  */
 import type { Scope } from "effect";
 import { Effect } from "effect";
