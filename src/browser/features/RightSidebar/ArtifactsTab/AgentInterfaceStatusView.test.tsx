@@ -39,6 +39,8 @@ let current = page("<p>AAAA</p>");
 /** What the listing shows: the page, a truncated listing without it, or a complete one without it. */
 let listed: "page" | "truncated" | "absent" = "page";
 let failingReads = 0;
+/** Reads that reject, as a call does when the connection drops. */
+let rejectingReads = 0;
 /** The page is gone: reads find no file. */
 let deleted = false;
 let reads = 0;
@@ -66,6 +68,10 @@ function Wrapper(props: { children: ReactNode }) {
         if (failingReads > 0) {
           failingReads -= 1;
           return Promise.resolve({ success: false as const, error: "runtime unreachable" });
+        }
+        if (rejectingReads > 0) {
+          rejectingReads -= 1;
+          return Promise.reject(new Error("connection lost"));
         }
         if (deleted) {
           return Promise.resolve({
@@ -188,6 +194,7 @@ describe("Agent interface status view", () => {
     current = page("<p>AAAA</p>");
     listed = "page";
     failingReads = 0;
+    rejectingReads = 0;
     deleted = false;
     reads = 0;
     lists = 0;
@@ -352,9 +359,15 @@ describe("Agent interface status view", () => {
       await nextPoll();
       expect(shownPage(view)).toContain("<p>BBBBBB</p>");
 
-      // A read that fails (a reconnect) says nothing about the page: it stays ...
+      // A read that fails (a reconnect) says nothing about the page: it stays, whether the
+      // route answers with an error or the call itself rejects ...
       failingReads = 1;
-      const readsBefore = reads;
+      let readsBefore = reads;
+      await nextPoll();
+      expect(reads).toBe(readsBefore + 1);
+      expect(shownPage(view)).toContain("<p>BBBBBB</p>");
+      rejectingReads = 1;
+      readsBefore = reads;
       await nextPoll();
       expect(reads).toBe(readsBefore + 1);
       expect(shownPage(view)).toContain("<p>BBBBBB</p>");
