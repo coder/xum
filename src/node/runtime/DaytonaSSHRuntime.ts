@@ -212,6 +212,14 @@ function makeStatusEmitter(statusSink: EnsureReadyOptions["statusSink"]): Status
   return (phase, detail) => statusSink?.({ phase, runtimeType: "ssh", detail });
 }
 
+/**
+ * As for Coder: a stopped or archived sandbox is never started for SSH cleanup, so its checks
+ * are skipped. An unreadable state tries SSH, which fails rather than deleting unchecked work.
+ */
+function reachableForCleanup(state: string | undefined): boolean {
+  return state !== "missing" && state !== "stopped" && state !== "archived";
+}
+
 function growsDisk(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {
   return sandbox.disk !== undefined && sandbox.disk < preset.diskGiB;
 }
@@ -934,9 +942,7 @@ export class DaytonaSSHRuntime extends SSHRuntime {
       log.warn("Daytona sandbox id not set, falling back to SSH-only deletion");
       return sshDelete();
     }
-    const state = await this.readSandboxState(sandboxId);
-    // As for Coder: a stopped sandbox is never started for SSH cleanup, so its checks are skipped.
-    const reachable = state !== "missing" && state !== "stopped" && state !== "archived";
+    const reachable = reachableForCleanup(await this.readSandboxState(sandboxId));
     if (this.daytonaConfig.forked === true) {
       return reachable
         ? this.deleteForkCheckout(sandboxId, deletedPath, force, sshDelete)
