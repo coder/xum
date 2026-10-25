@@ -17,7 +17,8 @@ import {
 } from "@/node/services/turnEngine/providerWire";
 import type { StepMessageTracker } from "@/node/services/turnEngine/StepPreparation";
 import { getReasoningReplayRejection } from "@/node/services/turnEngine/streamErrors";
-import type { WorkspaceId, WorkspaceStreamInfo } from "@/node/services/turnEngine/types";
+import type { WorkspaceId } from "@/node/services/turnEngine/types";
+import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import type { UsageLedger } from "@/node/services/turnEngine/UsageLedger";
 import type { AnthropicThinkingReplayPoint } from "@/node/utils/messages/anthropicThinkingReplay";
 import { stripReasoningReplay } from "@/node/utils/messages/reasoningProviderOptions";

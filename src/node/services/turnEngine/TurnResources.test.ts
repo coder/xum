@@ -6,11 +6,8 @@ import type { Runtime } from "@/node/runtime/Runtime";
 import { defaultEffectRunner } from "@/node/services/di/effectRunner";
 import { attachLanguageModelCleanup } from "@/node/services/languageModelCleanup";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
-import type {
-  StreamToken,
-  WorkspaceId,
-  WorkspaceStreamInfo,
-} from "@/node/services/turnEngine/types";
+import type { StreamToken, WorkspaceId } from "@/node/services/turnEngine/types";
+import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import type { ExecutionScope } from "@/node/services/toolCallDisplayRegistry";
 
 import { TurnResources } from "./TurnResources";

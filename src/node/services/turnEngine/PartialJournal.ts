@@ -25,8 +25,8 @@ import type { EffectRunner } from "@/node/services/di/effectRunner";
 import type { HistoryService } from "@/node/services/historyService";
 import { log, type Logger } from "@/node/services/log";
 import type { HostClock } from "@/node/utils/hostClock";
-import type { PartialJournalState } from "@/node/services/turnEngine/types";
-export type { PartialJournalState } from "@/node/services/turnEngine/types";
+import type { PartialJournalState } from "@/node/services/turnEngine/turnState";
+export type { PartialJournalState } from "@/node/services/turnEngine/turnState";
 
 /** One turn's partial: its workspace, its journal state and its current snapshot. */
 export interface PartialTarget {

@@ -38,8 +38,8 @@ import type {
   PreparedModelFallback,
   StreamManagerTokenTracker,
   WorkspaceId,
-  WorkspaceStreamInfo,
 } from "./types";
+import type { WorkspaceStreamInfo } from "./turnState";
 import { cloneUsage, markProviderMetadataCostsIncluded, type UsageLedger } from "./UsageLedger";
 
 function hasIncompleteToolCallPart(parts: CompletedMessagePart[]): boolean {
