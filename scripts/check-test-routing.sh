@@ -16,6 +16,8 @@
 #   3. Playwright lane: files under tests/e2e/ (playwright.config.ts testDir; CI
 #      "Test / E2E").
 #   4. The explicit list below: files run some other way, or deliberately not in CI.
+#
+# Python tests (*_test.py) have no discovery lane: each must appear in a Makefile recipe.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -76,7 +78,17 @@ report "test files claimed by more than one lane:" "$tmp/duplicated"
 LC_ALL=C comm -13 "$tmp/all" "$tmp/other" >"$tmp/stale"
 report "other_routes entries that are not tracked test files:" "$tmp/stale"
 
+# Python tests (*_test.py) run only through Makefile recipes that CI calls (test-bench-scripts,
+# test-crap-scripts, test-codex-comments, ...), so each one must appear in a recipe line.
+git ls-files --cached --others --exclude-standard -- '*_test.py' \
+  | while IFS= read -r file; do [[ ! -e "$file" ]] || printf '%s\n' "$file"; done \
+  | LC_ALL=C sort -u >"$tmp/python"
+{ grep -E $'^\t' Makefile | grep -oE '[A-Za-z0-9_./-]+_test\.py' || true; } \
+  | LC_ALL=C sort -u >"$tmp/python.routed"
+LC_ALL=C comm -23 "$tmp/python" "$tmp/python.routed" >"$tmp/python.unrouted"
+report "Python test files no Makefile recipe runs (add each to a make target CI calls):" "$tmp/python.unrouted"
+
 if ((status == 0)); then
-  echo "check-test-routing: $(wc -l <"$tmp/all") test files routed ($(wc -l <"$tmp/unit") bun unit, $(wc -l <"$tmp/jest") jest, $(wc -l <"$tmp/e2e") playwright, $(wc -l <"$tmp/other") other)"
+  echo "check-test-routing: $(wc -l <"$tmp/all") test files routed ($(wc -l <"$tmp/unit") bun unit, $(wc -l <"$tmp/jest") jest, $(wc -l <"$tmp/e2e") playwright, $(wc -l <"$tmp/other") other), plus $(wc -l <"$tmp/python") Python tests in Makefile recipes"
 fi
 exit "$status"
