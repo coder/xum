@@ -1283,6 +1283,84 @@ describe("assemblePromptPayload", () => {
       expect(unchanged.customInstructions).toBeUndefined();
     });
 
+    test("an assistant-last request after an agent switch re-freezes every section", async () => {
+      // Codex PRRT_kwDOPxxmWM6wf11x: a partial turn resumed under another agent must send that
+      // agent's live Tool: instructions, skill index and tail, not the old agent's frozen ones
+      // until a later user turn. A same-agent retry still keeps the frozen sections (F36).
+      const index = (skills: string) => `\n\nAvailable skills:\n${skills}`;
+      const send = (
+        live: { bash: string; skills: string; tail: string },
+        history: MuxMessage[],
+        extra: object = {}
+      ) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable + live.tail,
+          volatileSystemSuffixLength: live.tail.length,
+          tools: {
+            bash: tool({
+              description: `Run bash.\n\n${live.bash}`,
+              inputSchema: jsonSchema({ type: "object" }),
+            }),
+            agent_skill_read: tool({
+              description: `Read a skill.${index(live.skills)}`,
+              inputSchema: jsonSchema({ type: "object" }),
+            }),
+          },
+          toolInstructions: { bash: live.bash },
+          skillIndexSection: { prefix: "Read a skill.", block: index(live.skills) },
+          ...extra,
+        });
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        createMuxMessage("a1", "assistant", "answer", {
+          agentId: "exec",
+          toolInstructions: { text: JSON.stringify({ bash: "Use rg." }), placement: "system" },
+          skillIndex: { text: index("- a"), placement: "system" },
+          volatileSystemTail: { text: warning("A"), placement: "system" },
+        }),
+        createMuxMessage("u2", "user", "second"),
+        createMuxMessage("a2", "assistant", "partial", { agentId: "exec", partial: true }),
+      ];
+      const live = { bash: "Use fd.", skills: "- a\n- b", tail: warning("B") };
+
+      const switched = await send(live, history, { effectiveAgentId: "plan" });
+      expect(switched.tools?.bash?.description).toBe("Run bash.\n\nUse fd.");
+      expect(switched.tools?.agent_skill_read?.description).toBe(
+        `Read a skill.${index("- a\n- b")}`
+      );
+      expect(switched.messages[1]).toMatchObject({ role: "system", content: warning("B") });
+      expect(switched.toolInstructions).toEqual({
+        text: JSON.stringify({ bash: "Use fd." }),
+        placement: "system",
+      });
+      expect(switched.skillIndex).toEqual({ text: index("- a\n- b"), placement: "system" });
+      expect(switched.volatileSystemTail).toEqual({ text: warning("B"), placement: "system" });
+      // The replay verifier rebuilds the same request from the turn's records.
+      const replayed = await assemble({
+        ...opus,
+        history,
+        systemMessage: stable + live.tail,
+        volatileSystemSuffixLength: live.tail.length,
+        effectiveAgentId: "plan",
+        replayedTurn: {
+          record: switched.volatileSystemTail,
+          skillIndex: switched.skillIndex,
+          toolInstructions: switched.toolInstructions,
+        },
+      });
+      expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(switched.messages));
+
+      const retry = await send(live, history, { effectiveAgentId: "exec" });
+      expect(retry.tools?.bash?.description).toBe("Run bash.\n\nUse rg.");
+      expect(retry.tools?.agent_skill_read?.description).toBe(`Read a skill.${index("- a")}`);
+      expect(retry.messages[1]).toMatchObject({ role: "system", content: warning("A") });
+      expect(retry.toolInstructions).toBeUndefined();
+      expect(retry.skillIndex).toBeUndefined();
+      expect(retry.volatileSystemTail).toBeUndefined();
+    });
+
     test("Tool: instructions it cannot place or a corrupt record keep the live descriptions", async () => {
       const send = (description: string, instructions: string, history: MuxMessage[]) =>
         assemble({

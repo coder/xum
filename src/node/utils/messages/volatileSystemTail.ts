@@ -329,9 +329,18 @@ export function planVolatileSystemTail(
   requestTail: string,
   rowsSupported: boolean,
   /** Replay only: `requestTail` is the tail the turn sent, and this is the turn's record. */
-  replayedTurn?: { record?: VolatileSystemTailRecord }
+  replayedTurn?: { record?: VolatileSystemTailRecord },
+  /** A model or agent switch, as in planCustomInstructions. */
+  refreeze = false
 ): VolatileSystemTailPlan {
-  return planSystemSection(VOLATILE_TAIL, messages, requestTail, rowsSupported, replayedTurn);
+  return planSystemSection(
+    VOLATILE_TAIL,
+    messages,
+    requestTail,
+    rowsSupported,
+    replayedTurn,
+    refreeze
+  );
 }
 
 /**
@@ -407,14 +416,17 @@ export function planSkillIndex(
   messages: MuxMessage[],
   requestIndex: string,
   rowsSupported: boolean,
-  replayedTurn?: { record?: VolatileSystemTailRecord }
+  replayedTurn?: { record?: VolatileSystemTailRecord },
+  /** A model or agent switch, as in planCustomInstructions. */
+  refreeze = false
 ): VolatileSystemTailPlan {
   return planRemovableSection(
     { ...SKILL_INDEX, removed: SKILL_INDEX_REMOVED },
     messages,
     requestIndex,
     rowsSupported,
-    replayedTurn
+    replayedTurn,
+    refreeze
   );
 }
 
@@ -427,14 +439,17 @@ export function planToolInstructions(
   messages: MuxMessage[],
   requestInstructions: Record<string, string>,
   rowsSupported: boolean,
-  replayedTurn?: { record?: VolatileSystemTailRecord }
+  replayedTurn?: { record?: VolatileSystemTailRecord },
+  /** A model or agent switch, as in planCustomInstructions. */
+  refreeze = false
 ): VolatileSystemTailPlan {
   return planRemovableSection(
     { ...TOOL_INSTRUCTIONS, removed: TOOL_INSTRUCTIONS_REMOVED },
     messages,
     serializeToolInstructions(requestInstructions),
     rowsSupported,
-    replayedTurn
+    replayedTurn,
+    refreeze
   );
 }
 

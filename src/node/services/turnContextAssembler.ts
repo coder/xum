@@ -480,7 +480,8 @@ function planStableSystem(
   options: AssemblePromptPayloadOptions,
   liveStable: string,
   history: MuxMessage[],
-  rowsSupported: boolean
+  rowsSupported: boolean,
+  switched: boolean
 ) {
   if (options.replayedTurn) {
     const record = options.replayedTurn.customInstructions;
@@ -494,7 +495,7 @@ function planStableSystem(
     section?.block ?? "",
     valid && rowsSupported,
     undefined,
-    switchesModelOrAgent(options, history)
+    switched
   );
   const stableSystem = valid
     ? section.prefix +
@@ -505,11 +506,13 @@ function planStableSystem(
 }
 
 /**
- * Whether this request's model, route or agent differs from the segment's previous turn. The
- * instruction blocks then re-freeze instead of sending the new model's or agent's
- * `<model-...>`/`<mode-...>` sections in a row under the old ones: that costs no cache, since
- * each model has its own prompt cache and an agent switch already changes the
- * `<agent-instructions>` before the blocks (buildSystemMessageFromSources).
+ * Whether this request's model, route or agent differs from the segment's previous turn. Every
+ * system section then re-freezes instead of sending the new model's or agent's sections in a
+ * row under the old ones: that costs no cache, since each model has its own prompt cache and an
+ * agent switch already changes the `<agent-instructions>` before the instruction blocks
+ * (buildSystemMessageFromSources). This holds on an assistant-last request too (Codex
+ * PRRT_kwDOPxxmWM6wf11x): a partial turn resumed under another agent must not keep the old
+ * agent's frozen Tool: instructions, skill index or tail until the next user turn.
  */
 function switchesModelOrAgent(options: AssemblePromptPayloadOptions, history: MuxMessage[]) {
   const previous = history
@@ -541,14 +544,21 @@ function differs(before: string | undefined, now: string | undefined): boolean {
 function planSkillIndexTool(
   options: AssemblePromptPayloadOptions,
   history: MuxMessage[],
-  rowsSupported: boolean
+  rowsSupported: boolean,
+  switched: boolean
 ) {
   if (options.replayedTurn) {
     const record = options.replayedTurn.skillIndex;
     return { tools: options.tools, plan: planSkillIndex(history, "", rowsSupported, { record }) };
   }
   const live = locateSkillIndex(options);
-  const plan = planSkillIndex(history, live?.block ?? "", live != null && rowsSupported);
+  const plan = planSkillIndex(
+    history,
+    live?.block ?? "",
+    live != null && rowsSupported,
+    undefined,
+    switched
+  );
   if (live == null || plan.systemTail === live.block) return { tools: options.tools, plan };
   const frozen = withDescription(live.tool, live.prefix + plan.systemTail + live.rest);
   return { tools: { ...options.tools, agent_skill_read: frozen }, plan };
@@ -578,14 +588,21 @@ function planToolInstructionsTools(
   options: AssemblePromptPayloadOptions,
   tools: Record<string, Tool> | undefined,
   history: MuxMessage[],
-  rowsSupported: boolean
+  rowsSupported: boolean,
+  switched: boolean
 ) {
   if (options.replayedTurn) {
     const record = options.replayedTurn.toolInstructions;
     return { tools, plan: planToolInstructions(history, {}, rowsSupported, { record }) };
   }
   const live = locateToolInstructions(options);
-  const plan = planToolInstructions(history, live ?? {}, live != null && rowsSupported);
+  const plan = planToolInstructions(
+    history,
+    live ?? {},
+    live != null && rowsSupported,
+    undefined,
+    switched
+  );
   // A corrupt frozen record keeps the live descriptions (its rows still name the change).
   const frozen = parseToolInstructions(plan.systemTail);
   if (live == null || frozen == null || tools == null) return { tools, plan };
@@ -676,11 +693,13 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
   );
   const liveStable = options.systemMessage.slice(0, options.systemMessage.length - volatileLength);
   const rowsSupported = acceptsSystemSectionRows(options, liveStable);
+  const switched = switchesModelOrAgent(options, history);
   const { stableSystem, plan: instructionsPlan } = planStableSystem(
     options,
     liveStable,
     history,
-    rowsSupported
+    rowsSupported,
+    switched
   );
   const cachedSystemMessage = createCachedSystemMessage(
     stableSystem,
@@ -688,12 +707,13 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
     options.anthropicCacheTtl,
     options.providersConfig
   );
-  const skills = planSkillIndexTool(options, instructionsPlan.messages, rowsSupported);
+  const skills = planSkillIndexTool(options, instructionsPlan.messages, rowsSupported, switched);
   const { tools, plan: toolInstructionsPlan } = planToolInstructionsTools(
     options,
     skills.tools,
     skills.plan.messages,
-    rowsSupported
+    rowsSupported,
+    switched
   );
   // Length 0 means no volatile sections, or a tail the caller could not split off (middleware
   // edited it; turnRequestBuilder passes 0 then). Either way this request sends as before and
@@ -702,7 +722,8 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
     toolInstructionsPlan.messages,
     options.systemMessage.slice(liveStable.length),
     volatileLength > 0 && rowsSupported,
-    options.replayedTurn
+    options.replayedTurn,
+    switched
   );
   return {
     stableSystem,
