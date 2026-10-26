@@ -1,7 +1,7 @@
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
   ARTIFACT_JSON_MAX_BYTES,
   ARTIFACT_STATE_SUMMARY_MAX_CHARS,
@@ -248,50 +248,36 @@ describe("artifact interactions", () => {
     expect(await pendingIds()).toEqual([]);
   });
 
-  test("an accepted send whose record removal fails is sent, and the next startup drops the record", async () => {
-    // AgentSession keeps an accepted row even when onAccepted throws; it returns Err for the turn.
+  test("known limit (#7643): an acceptance whose record removal fails is reported as failed", async () => {
+    // AgentSession keeps the accepted row when onAccepted throws and returns Err. The send is
+    // reported as failed, and the record is removed so no startup re-sends it.
+    const rm = spyOn(fs, "rm").mockRejectedValueOnce(new Error("EIO"));
+    let callbackFailed = false;
     const failingRemoval: ArtifactInteractionDeps = {
       ...deps(),
-      sendMessage: async (_workspaceId, message, options, internal) => {
-        sent.push({ message, options: options as Record<string, unknown>, internal: internal! });
-        await fs.chmod(sessionDir, 0o500);
+      sendMessage: async (_workspaceId, _message, _options, internal) => {
         try {
           await internal?.onAccepted?.();
           return Ok(undefined);
         } catch {
+          callbackFailed = true;
           return Err("accept callback failed");
-        } finally {
-          await fs.chmod(sessionDir, 0o700);
         }
       },
     };
-    const result = await sendArtifactInteraction(failingRemoval, {
-      workspaceId: WS,
-      path: "a.html",
-      version: 0,
-      text: "x",
-    });
-    expect(result).toEqual(Ok({ id: "id-1" }));
-    expect(await pendingIds()).toEqual(["id-1"]);
-
-    // The row is in history, so replay drops the leftover record instead of re-sending it.
-    history = [
-      createMuxMessage("m1", "user", "x", {
-        muxMetadata: {
-          type: "normal",
-          artifactInteraction: {
-            id: "id-1",
-            artifactPath: "a.html",
-            title: "a.html",
-            version: 0,
-            action: "send",
-            text: "x",
-          },
-        },
-      }),
-    ];
-    expect(await replayPendingArtifactInteractions(deps(), WS)).toBe(0);
-    expect(sent).toHaveLength(1);
+    let result: Awaited<ReturnType<typeof sendArtifactInteraction>>;
+    try {
+      result = await sendArtifactInteraction(failingRemoval, {
+        workspaceId: WS,
+        path: "a.html",
+        version: 0,
+        text: "x",
+      });
+    } finally {
+      rm.mockRestore();
+    }
+    expect(callbackFailed).toBe(true);
+    expect(result).toEqual(Err("accept callback failed"));
     expect(await pendingIds()).toEqual([]);
   });
 

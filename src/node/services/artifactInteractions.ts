@@ -228,7 +228,7 @@ async function dispatchPending(
 ): Promise<Result<void, string>> {
   const sessionDir = sessionDirOf(deps, record.workspaceId);
   const sendOptions = await deps.getDefaultSendOptions(record.workspaceId);
-  // Set once the user row is durable. A turn that then fails to start
+  // Set once the user row is durable and the record is gone. A turn that then fails to start
   // (e.g. no API key) still returns Err, but the message was delivered: its error shows in the
   // chat as a stream error. Reporting it as "not sent" offered a Send that duplicated it (#7342).
   let accepted = false;
@@ -249,11 +249,11 @@ async function dispatchPending(
       // Fires once the user row is durable (immediately when idle, at dispatch when queued), so a
       // restart before then still finds the record and re-sends it.
       onAccepted: async () => {
-        // First: the row is durable even if the removal below throws (AgentSession keeps an
-        // accepted row). A record left behind is dropped on the next startup, whose replay finds
-        // its id in history.
-        accepted = true;
         await removePending(sessionDir, record.id);
+        // Only after the removal: a record left behind could be re-sent by a later startup.
+        // Known limit (#7643): if the removal throws, AgentSession still keeps the row, and the
+        // send is reported as failed although it was delivered.
+        accepted = true;
       },
       // A queued send the user withdrew (Stop, queue clear) or one that failed before its stream
       // started is settled: replaying it on the next startup would resurrect it.
