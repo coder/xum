@@ -494,6 +494,45 @@ export const PauseAtBudgetPhone: AppStory = {
 const CAPPED_ROWS = 2 * (TRANSCRIPT_MAX_MOUNTED_ROWS + TRANSCRIPT_REVEAL_AUTO_MAX_ROWS);
 const setupCapped = () => setup(CAPPED_ROWS);
 
+/**
+ * Waits for `find` to return an element, throwing a plain `Error` on each miss. A failed Testing
+ * Library query (findBy*) builds its error with prettyDOM of the WHOLE DOM, so with ~1,000 rows
+ * mounted each poll cost 250-350 ms, about 17 times per Load-older press, and the play took 21 s
+ * instead of 8 s (#7548). A timeout still prints the DOM once (waitFor's onTimeout).
+ */
+async function waitForElement<T extends HTMLElement>(
+  find: () => T | undefined,
+  what: string,
+  timeout: number
+): Promise<T> {
+  return waitFor(
+    () => {
+      const element = find();
+      if (!element) throw new Error(`Not found: ${what}`);
+      return element;
+    },
+    { timeout }
+  );
+}
+
+/** The button whose text is `name` (its accessible name: these buttons have no aria-label). */
+function buttonNamed(root: HTMLElement, name: string): HTMLButtonElement | undefined {
+  return Array.from(root.querySelectorAll("button")).find(
+    (button) => button.textContent?.trim() === name
+  );
+}
+
+/** The innermost element of a transcript row whose whole text is `text`. */
+function rowTextElement(scrollport: HTMLElement, text: string): HTMLElement | undefined {
+  for (const row of scrollport.querySelectorAll<HTMLElement>("[data-message-id]")) {
+    if (!row.textContent?.includes(text)) continue;
+    return Array.from(row.querySelectorAll<HTMLElement>("*"))
+      .reverse()
+      .find((element) => element.textContent?.trim() === text);
+  }
+  return undefined;
+}
+
 // F20 PR3a-3: reading back past the cap detaches the transcript from the live tail.
 // `releaseLock: false` walks back with the bottom lock still on (Load older never scrolls up).
 async function detachedPastCap(
@@ -506,21 +545,37 @@ async function detachedPastCap(
   const scrollport = () =>
     canvasElement.querySelector<HTMLElement>('[data-testid="message-window"]')!;
   const rows = () => scrollport().querySelectorAll<HTMLElement>('[data-testid="chat-message"]');
+  // The DOM-only waits below avoid a whole-DOM dump per failed poll (see waitForElement).
+  const findVisibleRowText = async (text: string) => {
+    const element = await waitForElement(
+      () => rowTextElement(scrollport(), text),
+      `row "${text}"`,
+      15_000
+    );
+    await waitFor(() => expect(element).toBeVisible());
+  };
   await step("Load older past the cap unmounts the newest rows", async () => {
     await switchToLargeWorkspace(canvasElement);
-    await findVisibleText(canvasElement, newest);
+    await findVisibleRowText(newest);
     if (releaseLock) {
       scrollport().dispatchEvent(new WheelEvent("wheel", { deltaY: -100, bubbles: true }));
     }
     for (let press = 0; press < 3; press += 1) {
-      const loadOlder = { name: "Load older messages" };
-      const button = await canvas.findByRole("button", loadOlder, { timeout: 15_000 });
+      const button = await waitForElement(
+        () => buttonNamed(canvasElement, "Load older messages"),
+        "Load older messages button",
+        15_000
+      );
       if (releaseLock) scrollport().scrollTop = 0;
       await userEvent.click(button);
     }
     // The last walk ends at the oldest row; Show newer appears as soon as the slice detaches.
-    await canvas.findByText(rowText(0), {}, { timeout: 15_000 });
-    await canvas.findByRole("button", { name: "Show newer messages" }, { timeout: 15_000 });
+    await waitForElement(() => rowTextElement(scrollport(), rowText(0)), "row 0", 15_000);
+    await waitForElement(
+      () => buttonNamed(canvasElement, "Show newer messages"),
+      "Show newer messages button",
+      15_000
+    );
     await expect(canvas.queryByText(newest)).toBeNull();
     await expect(rows().length).toBeLessThanOrEqual(TRANSCRIPT_MAX_MOUNTED_ROWS);
   });
@@ -541,9 +596,9 @@ async function detachedPastCap(
   });
   await step("Jump to bottom returns to the live tail", async () => {
     await userEvent.click(canvas.getByRole("button", { name: /Jump to bottom/ }));
-    await findVisibleText(canvasElement, newest);
+    await findVisibleRowText(newest);
     await waitFor(() =>
-      expect(canvas.queryByRole("button", { name: "Show newer messages" })).toBeNull()
+      expect(buttonNamed(canvasElement, "Show newer messages") ?? null).toBeNull()
     );
   });
 }
