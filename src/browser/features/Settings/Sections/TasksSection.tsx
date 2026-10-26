@@ -665,13 +665,15 @@ export function TasksSection() {
     };
   }, [liveApi, agentAiDefaults, loaded, loadFailed, taskSettings]);
 
-  // Flush any pending debounced save on unmount so changes aren't lost.
+  // Flush any pending debounced save on unmount and on pagehide so changes aren't lost: a
+  // reload does not unmount React, so a change made in the last 400 ms was lost (#7157).
+  // Best effort: the page can go away before the request leaves.
   useEffect(() => {
     if (!api) return;
     if (!loaded) return;
     if (loadFailed) return;
 
-    return () => {
+    const flushPendingSave = () => {
       clearSaveTimer(saveTimerRef);
 
       if (savingRef.current) return;
@@ -686,6 +688,12 @@ export function TasksSection() {
         .finally(() => {
           savingRef.current = false;
         });
+    };
+    window.addEventListener("pagehide", flushPendingSave);
+
+    return () => {
+      window.removeEventListener("pagehide", flushPendingSave);
+      flushPendingSave();
     };
   }, [api, loaded, loadFailed]);
 

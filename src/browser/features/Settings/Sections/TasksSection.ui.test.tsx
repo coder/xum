@@ -1,5 +1,6 @@
 // Real Radix exports must initialize after the DOM, even when this suite runs first.
 import { installDom } from "../../../../../tests/ui/dom";
+import assert from "@/common/utils/assert";
 import type React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -295,6 +296,53 @@ describe("TasksSection Exec subagent defaults", () => {
       modelString: "openai:subagent-model",
     });
     expect("subagentAiDefaults" in payload).toBe(false);
+  });
+
+  test("pagehide saves a change made inside the autosave delay, once (#7157)", async () => {
+    // Record which pagehide listeners come and go; the real methods still run. Wrapped by hand
+    // and restored from their descriptors: bun's spyOn on the happy-dom window broke later
+    // test files.
+    const addDescriptor = Object.getOwnPropertyDescriptor(window, "addEventListener");
+    const removeDescriptor = Object.getOwnPropertyDescriptor(window, "removeEventListener");
+    assert(addDescriptor && removeDescriptor, "happy-dom defines the listener methods on window");
+    const added: unknown[] = [];
+    const removed: unknown[] = [];
+    const realAdd = window.addEventListener.bind(window);
+    const realRemove = window.removeEventListener.bind(window);
+    window.addEventListener = ((type: string, listener: EventListener, options?: boolean) => {
+      if (type === "pagehide") added.push(listener);
+      realAdd(type, listener, options);
+    }) as typeof window.addEventListener;
+    window.removeEventListener = ((type: string, listener: EventListener, options?: boolean) => {
+      if (type === "pagehide") removed.push(listener);
+      realRemove(type, listener, options);
+    }) as typeof window.removeEventListener;
+    try {
+      const view = renderTasksSection();
+      await view.findByText("Explore");
+      fireEvent.click(
+        within(getAgentCardByName(view, "Explore")).getByRole("switch", {
+          name: "Toggle explore enabled",
+        })
+      );
+
+      // A reload right after the change: pagehide fires before the debounced save.
+      fireEvent(window, new window.Event("pagehide"));
+      expect(view.saveConfig).toHaveBeenCalledTimes(1);
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.explore).toEqual({
+        enabled: false,
+      });
+
+      // The unmount after pagehide does not save the same change again.
+      view.unmount();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(view.saveConfig).toHaveBeenCalledTimes(1);
+      expect(added.length).toBeGreaterThan(0);
+      expect(removed).toEqual(added);
+    } finally {
+      Object.defineProperty(window, "addEventListener", addDescriptor);
+      Object.defineProperty(window, "removeEventListener", removeDescriptor);
+    }
   });
 
   test("includes nested subagent defaults when saving a delegated default change", async () => {
