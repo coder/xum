@@ -461,6 +461,56 @@ function isAnthropicOverloadError(error: unknown): boolean {
   return false;
 }
 
+/**
+ * True when the error's response body or message matches pattern. Gateways can drop the
+ * structured code and forward only the message.
+ */
+function errorMentions(error: unknown, pattern: RegExp): boolean {
+  const texts = [
+    APICallError.isInstance(error) ? error.responseBody : undefined,
+    error instanceof Error ? error.message : undefined,
+  ];
+  return texts.some((text) => typeof text === "string" && pattern.test(text));
+}
+
+/** The data of an SSE response whose stream failed: an `error` or `response.failed` frame. */
+function isFailedStreamFrame(data: unknown): boolean {
+  return (
+    typeof data === "object" &&
+    data !== null &&
+    "type" in data &&
+    (data.type === "error" || data.type === "response.failed")
+  );
+}
+
+/** A WebSocket/SSE validation error: a stream error frame, or an SSE response that failed. */
+function isStreamValidationError(error: unknown): boolean {
+  if (StreamProviderError.isInstance(error)) return true;
+  return (
+    APICallError.isInstance(error) &&
+    error.responseHeaders?.["content-type"]?.startsWith("text/event-stream") === true &&
+    isFailedStreamFrame(error.data)
+  );
+}
+
+/**
+ * The statuses an OpenAI reasoning-replay rejection arrives with. WebSocket/SSE validation
+ * errors have no HTTP failure status: the SDK assigns 500 to code-less frames, including
+ * missing reasoning references.
+ */
+function hasOpenAIReplayRejectionStatus(error: unknown, statusCode: number | undefined): boolean {
+  if (statusCode === 400 || statusCode === 404) return true;
+  return statusCode === 500 && isStreamValidationError(error);
+}
+
+function isOpenAIReplayRejection(error: unknown): boolean {
+  return (
+    extractErrorCode(error) === "invalid_encrypted_content" ||
+    errorMentions(error, OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN) ||
+    errorMentions(error, OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN)
+  );
+}
+
 // These deterministic rejections survive encrypted-only replay: cross-org
 // blobs and same-turn reasoning references from a flapping route. Keep the
 // match narrow so unrelated provider errors retain their normal retry policy.
@@ -471,43 +521,17 @@ export function getReasoningReplayRejection(
 ): "openai" | "anthropic" | null {
   // The SDK can exhaust its own retries on a synthetic stream-error 500.
   // Classify only the final cause; earlier failures must not taint a later one.
-  if (RetryError.isInstance(error)) {
-    error = error.lastError;
-  }
-  const statusCode = extractStatusCode(error);
-  // Gateways can drop the structured code and forward only the message.
-  const texts = [
-    APICallError.isInstance(error) ? error.responseBody : undefined,
-    error instanceof Error ? error.message : undefined,
-  ];
-  const mentions = (pattern: RegExp) =>
-    texts.some((text) => typeof text === "string" && pattern.test(text));
+  const cause: unknown = RetryError.isInstance(error) ? error.lastError : error;
+  const statusCode = extractStatusCode(cause);
   if (isAnthropicMessagesModel(model)) {
-    return statusCode === 400 && mentions(ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN)
+    return statusCode === 400 && errorMentions(cause, ANTHROPIC_THINKING_SIGNATURE_INVALID_PATTERN)
       ? "anthropic"
       : null;
   }
-  // WebSocket/SSE validation errors have no HTTP failure status. The SDK
-  // assigns 500 to code-less frames, including missing reasoning references.
-  const isStreamError =
-    StreamProviderError.isInstance(error) ||
-    (APICallError.isInstance(error) &&
-      error.responseHeaders?.["content-type"]?.startsWith("text/event-stream") &&
-      typeof error.data === "object" &&
-      error.data !== null &&
-      "type" in error.data &&
-      (error.data.type === "error" || error.data.type === "response.failed"));
-  if (statusCode !== 400 && statusCode !== 404 && !(statusCode === 500 && isStreamError)) {
+  if (!hasOpenAIReplayRejectionStatus(cause, statusCode) || !isOpenAIResponsesModel(model)) {
     return null;
   }
-  if (!isOpenAIResponsesModel(model)) {
-    return null;
-  }
-  return extractErrorCode(error) === "invalid_encrypted_content" ||
-    mentions(OPENAI_REASONING_ITEM_NOT_FOUND_PATTERN) ||
-    mentions(OPENAI_ENCRYPTED_CONTENT_UNVERIFIED_PATTERN)
-    ? "openai"
-    : null;
+  return isOpenAIReplayRejection(cause) ? "openai" : null;
 }
 
 export function buildStreamErrorPayload(
