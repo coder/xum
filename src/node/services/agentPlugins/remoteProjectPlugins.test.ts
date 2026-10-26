@@ -193,6 +193,31 @@ describe("buildRemotePluginListingScript", () => {
     expect(Object.fromEntries(links.map(([, target, link]) => [link, target]))).toEqual(expected);
   });
 
+  test("one readlink resolves every link of a walk", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-batch");
+    const { root, container, kit } = await checkoutWithKit(checkout.path);
+    const links = path.join(kit, "links");
+    await fs.mkdir(links);
+    for (let i = 0; i < 8; i++) {
+      await fs.symlink(path.join(kit, "skills"), path.join(links, `l${i}`));
+    }
+    const bin = path.join(root, "bin");
+    const calls = path.join(root, "readlink-calls");
+    await writeFile(
+      path.join(bin, "readlink"),
+      `#!/bin/sh\necho >> ${calls}\nexec ${Bun.which("readlink") ?? "readlink"} "$@"\n`
+    );
+    await fs.chmod(path.join(bin, "readlink"), 0o755);
+    const snapshot = await createRemoteProjectPluginSnapshot({
+      runtime: new CountingRemoteRuntime(root, "test", `PATH=${bin}:$PATH\n`),
+      checkoutRoot: root,
+      containers: [container],
+    });
+    expect(snapshot?.plugins.map((plugin) => plugin.name)).toEqual(["kit"]);
+    // The checkout root, the container and one batch; per link it was 8 more.
+    expect((await fs.readFile(calls, "utf8")).length).toBe(3);
+  });
+
   test("a plugin link to a folder inside its container is walked once", async () => {
     using checkout = new DisposableTempDir("remote-plugins-alias");
     const { root, container, kit } = await checkoutWithKit(checkout.path);
