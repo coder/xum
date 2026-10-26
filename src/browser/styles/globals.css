@@ -57,6 +57,14 @@
   font-weight: 100 900;
   font-style: normal;
   font-display: swap;
+  /* The vertical metrics of geist 1.5.1's Geist Mono. geist 1.8.1 raised them from 955/245 to
+     1005/295 units (a 1.3 em text box, was 1.2 em; the baseline stays where it was). The phone
+     static workspace view paints code before this font loads (no preload, see staticAssets.ts), so
+     the live code line's taller box was a new, later LCP entry: seeded phone Lighthouse 93 -> 70
+     (#7637). Keep the live box no larger than the static copy's. */
+  ascent-override: 95.5%;
+  descent-override: 24.5%;
+  line-gap-override: 0%;
 }
 
 @import "./theme-dark.css";
