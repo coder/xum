@@ -30,6 +30,10 @@ test(
     // exact step: an agent step that types here stops replaying when the placeholder tip rotates.
     await sendMessage(screen, MESSAGE);
     await expect(transcript).toContainText(REPLY, { timeout: 30_000 });
+    // The reply text shows before stream-end persists it: a restart in that gap can lose it.
+    await expect(screen.getByRole("button", "Stop streaming")).not.toBeVisible({
+      timeout: 30_000,
+    });
 
     await xum.restartServer();
     await app.open();
