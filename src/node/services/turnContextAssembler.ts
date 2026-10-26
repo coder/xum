@@ -1479,8 +1479,6 @@ export async function buildStreamSystemContext(
     discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
       roots: skillCtx.roots,
       containment: skillCtx.containment,
-      // Used only for the project-runtime default-roots fallback (skillCtx.roots undefined).
-      includeClaudeSkills: opts.claudeSkillsCompatEnabled,
       runtimeFactory: opts.runtimeFactory,
     })
       .then((discovery) => {

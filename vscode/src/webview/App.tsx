@@ -243,13 +243,13 @@ function createChatReplayState(workspaceId: string): ChatReplayState {
 
 function shouldBufferUntilCaughtUp(event: WorkspaceChatMessage): boolean {
   switch (event.type) {
+    // The backend replays a turn's terminal error before caught-up; applied early, it would be
+    // dropped when history loads (as WorkspaceStore buffers it too).
+    case "stream-error":
     case "stream-start":
     case "stream-delta":
     case "stream-end":
     case "stream-abort":
-    // The backend replays a turn's terminal error before caught-up; applied early, it would be
-    // dropped when history loads (as WorkspaceStore buffers it too).
-    case "stream-error":
     case "tool-call-start":
     case "tool-call-delta":
     case "tool-call-end":

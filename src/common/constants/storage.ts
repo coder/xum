@@ -784,7 +784,7 @@ export interface WorkspaceKeyRegistration {
   scope: "workspaceId";
   getKey: (scopeId: string) => string;
   kind: PersistedKeyKind;
-  /** Copied to the new workspace on fork (and to the new scope on migrateWorkspaceStorage). */
+  /** Copied to the new workspace on fork. */
   copyOnFork: boolean;
   /** Longest accepted serialized value (UTF-16 code units); 0 refuses every write. */
   maxValueChars: number;

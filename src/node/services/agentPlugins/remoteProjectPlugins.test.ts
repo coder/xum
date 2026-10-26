@@ -1,6 +1,9 @@
+import * as childProcess from "child_process";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { CONTAINER_CLI_ENV } from "@/node/runtime/containerCli";
 import { DockerRuntime, getContainerName } from "@/node/runtime/DockerRuntime";
 import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
@@ -446,14 +449,50 @@ describe("getRemoteProjectPluginSnapshot", () => {
     expect(new Set(keys).size).toBe(keys.length);
     expect(sshKey({ host: "alice@build" })).toBe(keys[0]);
 
-    const docker = new DockerRuntime({
-      image: "node:22",
-      containerName: getContainerName("/p6426", "w"),
-    });
-    const before = docker.getAgentHostKey();
-    // Deleting (or creating) the container under this name gives it a new key.
-    await docker.deleteWorkspace("/p6426", "w", true).catch(() => undefined);
-    expect(docker.getAgentHostKey()).not.toBe(before);
+    // #7612: a unit test must not need a Docker daemon. The CLI override skips the `docker info`
+    // probe, and the stubbed spawn answers each docker command: `inspect` finds the container while
+    // `present` is true, and every other command (`rm -f`) succeeds.
+    const containerName = getContainerName("/p6426", "w");
+    let present = true;
+    const commands: string[] = [];
+    const originalCli = process.env[CONTAINER_CLI_ENV];
+    process.env[CONTAINER_CLI_ENV] = "docker";
+    const spawnSpy = spyOn(childProcess, "spawn").mockImplementation(((command: string) => {
+      commands.push(command);
+      const missing = !present && command.startsWith("docker inspect ");
+      const child = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        kill: () => true,
+      });
+      process.nextTick(() => {
+        if (missing)
+          child.stderr.emit("data", Buffer.from(`Error: No such object: ${containerName}`));
+        child.emit("close", missing ? 1 : 0);
+      });
+      return child;
+    }) as unknown as typeof childProcess.spawn);
+    try {
+      const docker = new DockerRuntime({ image: "node:22", containerName });
+      const keysSeen = [docker.getAgentHostKey()];
+      // Deleting (or creating) the container under this name gives it a new key, whether Xum
+      // removes the container or finds it already gone.
+      expect(await docker.deleteWorkspace("/p6426", "w", true)).toMatchObject({ success: true });
+      keysSeen.push(docker.getAgentHostKey());
+      present = false;
+      expect(await docker.deleteWorkspace("/p6426", "w", true)).toMatchObject({ success: true });
+      keysSeen.push(docker.getAgentHostKey());
+      expect(new Set(keysSeen).size).toBe(3);
+      expect(commands).toEqual([
+        `docker inspect ${containerName}`,
+        `docker rm -f ${containerName}`,
+        `docker inspect ${containerName}`,
+      ]);
+    } finally {
+      spawnSpy.mockRestore();
+      if (originalCli === undefined) delete process.env[CONTAINER_CLI_ENV];
+      else process.env[CONTAINER_CLI_ENV] = originalCli;
+    }
     expect(new DockerRuntime({ image: "node:22" }).getAgentHostKey()).toBeUndefined();
   });
 });

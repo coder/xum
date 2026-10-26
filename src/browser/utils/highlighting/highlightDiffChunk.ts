@@ -52,19 +52,6 @@ export interface HighlightedChunk {
   usedFallback: boolean; // True if highlighting failed
 }
 
-/**
- * Highlight a chunk of code using Shiki.
- * Falls back to plain text on error, except a worker start timeout, which rejects.
- */
-export async function highlightDiffChunk(
-  chunk: DiffChunk,
-  language: string,
-  themeMode: ThemeMode = "dark"
-): Promise<HighlightedChunk> {
-  const [highlighted] = await highlightDiffChunks([chunk], language, themeMode);
-  return highlighted ?? createFallbackChunk(chunk);
-}
-
 interface DiffLineRef {
   chunkIndex: number;
   lineIndex: number;

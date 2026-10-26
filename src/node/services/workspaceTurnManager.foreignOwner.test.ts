@@ -22,7 +22,7 @@ import {
   type ForeignHolders,
 } from "@/node/services/sessionLocks/foreignHolders.testHarness";
 import { SessionLocksNode } from "@/node/services/sessionLocks/nodeSessionLocks";
-import { registerLiveWorkspaceTurnHandle } from "@/node/services/taskService.shared.testHarness";
+import { startLiveWorkspaceTurn } from "@/node/services/taskService.shared.testHarness";
 import {
   createAIServiceMocks,
   createTaskServiceStack,
@@ -167,22 +167,19 @@ describe("workspace-turn handles owned by another live backend (#4446)", () => {
         projectWorkspace(projectPath, "child", "task-child", {
           parentWorkspaceId: "tree-root",
           taskStatus: "reported",
-          taskExecutionId: "wst_live_elsewhere",
-          taskExecutionStatus: "running",
         }),
       ],
       testTaskSettings()
     );
-    // Backend A runs the handle (live registration), then its startup adoption takes the lock.
+    // Backend A runs the handle (its reawakening holds the live registration and the lock), then
+    // its own startup adoption pass runs over it.
     const stackA = createTaskServiceStack(configA);
-    await registerLiveWorkspaceTurnHandle(stackA.taskService, "task-child", "wst_live_elsewhere");
-    await registerLiveWorkspaceTurnHandle(
-      stackA.taskService,
-      "task-child",
-      "wst_live_elsewhere",
-      "tree-root",
-      "recovered"
-    );
+    await startLiveWorkspaceTurn(stackA.taskService, configA, {
+      ownerWorkspaceId: "tree-root",
+      workspaceId: "task-child",
+      handleId: "wst_live_elsewhere",
+    });
+    await workspaceTurnManagerFor(stackA.taskService).reconcileAgentTaskExecutionIds();
 
     // Backend B starts on the same root while A is alive.
     const managerB = workspaceTurnManagerFor(

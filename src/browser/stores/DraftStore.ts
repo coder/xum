@@ -226,7 +226,7 @@ const SEND_RETRY_MAX_MS = 16_000;
 const PENDING_SCOPE_PREFIX = "__pending__";
 const DRAFT_SCOPE_PREFIX = "__draft__/";
 
-function retryDelayMs(attempt: number): number {
+export function retryDelayMs(attempt: number): number {
   return Math.min(RETRY_BASE_MS * 2 ** attempt, RETRY_MAX_MS);
 }
 

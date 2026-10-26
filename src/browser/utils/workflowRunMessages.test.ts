@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
-import { buildWorkflowResultContextMessage } from "@/common/utils/workflowRunMessages";
+import {
+  buildWorkflowResultContextMessage,
+  filterWorkflowDisplayOnlyMessages,
+} from "@/common/utils/workflowRunMessages";
 import {
   buildWorkflowRunCardMessage,
-  filterWorkflowDisplayOnlyMessages,
   getWorkflowRunCardProjection,
   hasWorkflowRunToolCallMessage,
 } from "./workflowRunMessages";

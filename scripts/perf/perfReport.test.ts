@@ -560,11 +560,9 @@ describe("workspace-open milestones", () => {
 
   test.each(
     MILESTONES.flatMap((milestone, index) =>
-      [null, undefined, "12", -1, 1e999, Number.NaN].map((value): [string, unknown, number] => [
-        milestone.id,
-        value,
-        index,
-      ])
+      [null, undefined, "12", -1, Number.POSITIVE_INFINITY, Number.NaN].map(
+        (value): [string, unknown, number] => [milestone.id, value, index]
+      )
     )
   )("milestone %s = %p is a problem; the other values stay", (id, value, index) => {
     const milestones: Record<string, unknown> = {
@@ -626,6 +624,7 @@ describe("sink safety", () => {
   ];
   const HOSTILE = `${CRAFTED.join(" ")} </details><img src=x onerror=alert(1)>|\`@org/team\``;
   const LONG_TITLE = `${HOSTILE} ${"x".repeat(5000)}`;
+  // eslint-disable-next-line no-control-regex -- the test asserts that no control characters reach the output
   const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
   function hostileReport(): Report {
@@ -718,6 +717,7 @@ describe("sink safety", () => {
 
   test("the summary has no escapes, HTML or broken tables, and long titles are truncated in their cell", () => {
     const markdown = render(hostileReport());
+    // eslint-disable-next-line no-control-regex -- the test asserts that no control characters reach the output
     expect(markdown).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u2028\u2029]/);
     expect(markdown).not.toMatch(/[<>]/);
     for (const line of markdown.split("\n").filter((l) => l.startsWith("- "))) {

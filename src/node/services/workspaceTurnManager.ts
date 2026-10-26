@@ -1292,14 +1292,19 @@ export class WorkspaceTurnManager {
         `Task.createWorkspaceTurn: target checkout is not reachable yet (provisioning or stopped runtime), so project-local agentId (${params.agentId}) cannot be verified there`
       );
     }
+    // #7216: the owner's checkout, but the target's trust (the target streams the agent).
+    const ownerCheckoutContext = {
+      ...params.owner,
+      projectPluginsTrusted: params.target.projectPluginsTrusted,
+    };
     const validation = await this.validateWorkspaceTurnAgentId({
       cfg: params.cfg,
       agentId: params.agentId,
       workspaceId: params.workspaceId,
-      ...params.owner,
+      ...ownerCheckoutContext,
     });
     return validation.success
-      ? Ok({ validatedContext: params.owner, ...validation.data })
+      ? Ok({ validatedContext: ownerCheckoutContext, ...validation.data })
       : validation;
   }
 
