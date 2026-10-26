@@ -315,6 +315,22 @@ async function signOutFailure(
 }
 
 /**
+ * Workspace IDs an install-time MCP override error lists. Large configs fail
+ * the sweep for hundreds of workspaces at once, and a wall of IDs hid the
+ * actual advice; the log keeps one warning per workspace.
+ */
+const MAX_LISTED_FAILED_WORKSPACES = 5;
+
+/** "812 workspaces (a, b, c, d, e, and 807 more)" for an install error. */
+function describeFailedWorkspaces(ids: readonly string[]): string {
+  assert(ids.length > 0, "describeFailedWorkspaces: ids must be non-empty");
+  const shown = ids.slice(0, MAX_LISTED_FAILED_WORKSPACES);
+  const rest = ids.length - shown.length;
+  const noun = ids.length === 1 ? "workspace" : "workspaces";
+  return `${ids.length} ${noun} (${shown.join(", ")}${rest > 0 ? `, and ${rest} more` : ""})`;
+}
+
+/**
  * The Settings text for a sign-out record Xum cannot use (#6627). The parser's own errors
  * already name the recovery step. A read error gets one here.
  */
@@ -5885,6 +5901,8 @@ export class AgentPluginInstallService {
                         : mcpServerManager.forgetWorkspaceOverrides(target)
                     )
                   : mcpServerManager.applyWorkspaceOverrides(target, persisted),
+              hasSnapshot: (workspaceId) =>
+                mcpServerManager.hasWorkspaceOverridesSnapshot(workspaceId),
             }
           : undefined
       );
@@ -6134,7 +6152,7 @@ export class AgentPluginInstallService {
     await this.writePendingOverridePrunes(envelope, rawEntries, remaining);
     if (failed.length > 0) {
       throw new Error(
-        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (workspaces: ${failed.join(", ")}). Retry once those workspaces are accessible.`
+        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (${describeFailedWorkspaces(failed)}). The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
       );
     }
   }
@@ -6166,7 +6184,7 @@ export class AgentPluginInstallService {
     }
     if (failed.length > 0) {
       throw new Error(
-        `Stale workspace MCP overrides for '${name}' could not be cleaned up (workspaces: ${failed.join(", ")}). Retry once those workspaces are accessible.`
+        `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'. The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
       );
     }
   }

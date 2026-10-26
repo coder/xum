@@ -132,6 +132,75 @@ const RAW_CLOCK_ALLOW = {
   // deadline on. It bounds a network request, not loop time.
   "src/node/services/tools/skillsCatalogFetch.ts": 1,
 };
+
+// local/no-fixed-sleep: browser test file -> the exact number of fixed real-time waits it still
+// has. Shrink-only: lower or delete an entry when a PR removes waits (#7608). .oxlintrc.json
+// repeats this map.
+const FIXED_SLEEP_ALLOW = {
+  "src/browser/components/AppLoader/AppLoader.auth.test.tsx": 2,
+  "src/browser/components/LeftSidebar/LeftSidebar.stories.tsx": 1,
+  "src/browser/components/ProjectSidebar/ProjectSidebar.test.tsx": 3,
+  "src/browser/components/TerminalView/TerminalView.test.tsx": 1,
+  "src/browser/components/WorkspaceMenuBar/LazySettingsModal.test.tsx": 4,
+  "src/browser/contexts/API.switch.test.tsx": 4,
+  "src/browser/contexts/API.test.tsx": 2,
+  "src/browser/contexts/AgentContext.test.tsx": 2,
+  "src/browser/contexts/WorkspaceContext.test.tsx": 4,
+  "src/browser/features/ChatInput/useComposerSuggestionsReconnect.test.tsx": 5,
+  "src/browser/features/ChatInput/useCreationWorkspace.test.tsx": 1,
+  "src/browser/features/Messages/ChatBarrier/StreamingBarrier.test.tsx": 1,
+  "src/browser/features/Messages/ChunkedStreamingMarkdown.test.tsx": 6,
+  "src/browser/features/Messages/TypewriterMarkdown.backfill.test.tsx": 1,
+  "src/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/ArtifactInteractions.test.tsx": 2,
+  "src/browser/features/RightSidebar/ArtifactsTab/ArtifactViewer.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/ArtifactsPanel.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/McpAppFrame.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/artifactBridge.test.ts": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/mcpAppOpenAiShim.test.ts": 2,
+  "src/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore.test.tsx": 1,
+  "src/browser/features/RightSidebar/BrowserTab/BrowserToolbar.test.tsx": 1,
+  "src/browser/features/RightSidebar/CodeReview/ImmersiveReviewView.test.tsx": 1,
+  "src/browser/features/RightSidebar/RightSidebar.stories.tsx": 6,
+  "src/browser/features/Settings/Sections/BackupSectionReconnect.test.tsx": 2,
+  "src/browser/features/Settings/Sections/ExperimentsSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/GeneralSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/HeartbeatSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/SecretsSection.test.tsx": 9,
+  "src/browser/features/Settings/Sections/ServerAccessSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/TasksSection.ui.test.tsx": 7,
+  "src/browser/features/SplashScreens/SplashScreenProviderReconnect.test.tsx": 3,
+  "src/browser/features/Tools/AskUserQuestion/AskUserQuestionToolCall.stories.tsx": 1,
+  "src/browser/features/desktop/useDesktopConnection.test.tsx": 4,
+  "src/browser/hooks/useAnalyticsReconnect.test.tsx": 1,
+  "src/browser/hooks/useCoderWorkspaceReconnect.test.tsx": 4,
+  "src/browser/hooks/useEscapeToDismiss.test.tsx": 1,
+  "src/browser/hooks/useWorkflowRunByIdReconnect.test.tsx": 1,
+  "src/browser/hooks/useWorkspaceHeartbeat.test.tsx": 1,
+  "src/browser/stores/CreationDraftStore.test.ts": 3,
+  "src/browser/stores/DraftStore.sendIds.test.ts": 3,
+  "src/browser/stores/DraftStore.test.ts": 4,
+  "src/browser/stores/WorkspaceStore.test.ts": 14,
+  "src/browser/stores/subscriptionTransport.test.ts": 2,
+  "src/browser/stories/App.phoneSidebarFullscreen.stories.tsx": 2,
+  "src/browser/utils/messages/StreamingMessageAggregator.init.test.ts": 2,
+  "src/browser/utils/messages/StreamingMessageAggregator.test.ts": 4,
+  "tests/ui/agents/creationWaitsForBranches.test.ts": 2,
+  "tests/ui/chat/composerSendIds.test.ts": 1,
+  "tests/ui/chat/composerStaysOnDuringSend.test.ts": 1,
+  "tests/ui/chat/editKeepsUnsentDraft.test.ts": 4,
+  "tests/ui/chat/heldQueuedMessage.test.ts": 1,
+  "tests/ui/chat/readMore.test.ts": 10,
+  "tests/ui/chat/stopRestoreQueuedDraft.test.ts": 1,
+  "tests/ui/chat/streamInterrupt.test.ts": 1,
+  "tests/ui/chat/unreadIndicator.test.ts": 2,
+  "tests/ui/helpers.ts": 1,
+  "tests/ui/layout/rightSidebar.test.ts": 1,
+  "tests/ui/review/refresh.test.ts": 2,
+  "tests/ui/review/sendAfterFailedSubscription.test.ts": 1,
+  "tests/ui/workspaces/creationDraftProjectChange.test.ts": 1,
+  "tests/ui/workspaces/lifecycle.test.ts": 1,
+};
 // The rule strips "node:" and resolves relative specifiers to "@/..." forms.
 const HOST_MODULES = [
   "fs",
@@ -923,6 +992,66 @@ export default defineConfig([
     },
   },
   {
+    // Tooling tests (scripts/**/*.test.ts) and the VS Code extension (vscode/src) are type-checked
+    // by tsconfig.tooling.json (make typecheck), not by the tsconfig.json the project service
+    // would pick, so lint them against that program with the same base rules as tests/.
+    files: ["scripts/**/*.test.ts", "vscode/src/**/*.{ts,tsx}"],
+    plugins: {
+      local: localPlugin,
+      "react-hooks": reactHooks,
+    },
+    languageOptions: {
+      parserOptions: {
+        project: "./tsconfig.tooling.json",
+        tsconfigRootDir: import.meta.dirname,
+      },
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        require: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        window: "readonly",
+        document: "readonly",
+      },
+    },
+    rules: {
+      // Same options as src/ and tests/: a leading underscore marks an intentionally unused binding.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          vars: "all",
+          args: "after-used",
+          ignoreRestSiblings: true,
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrors: "all",
+        },
+      ],
+    },
+  },
+  {
+    // The webview is React: run the two hook rules src/ runs (src/ also runs the compiler rules).
+    files: ["vscode/src/**/*.tsx"],
+    rules: {
+      "react-hooks/rules-of-hooks": "error",
+      "react-hooks/exhaustive-deps": "warn",
+    },
+  },
+  {
+    // Like tests/: test doubles implement async interfaces with synchronous or empty bodies.
+    files: ["scripts/**/*.test.ts", "vscode/src/**/*.test.{ts,tsx}"],
+    rules: {
+      "@typescript-eslint/require-await": "off",
+      "@typescript-eslint/no-empty-function": "off",
+    },
+  },
+  {
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
@@ -953,6 +1082,18 @@ export default defineConfig([
         beforeAll: "readonly",
         afterAll: "readonly",
       },
+    },
+  },
+  {
+    // Browser tests wait on signals or fake timers, not on a fixed real time (#7608).
+    // Stories count too: `make test-storybook` runs their play functions as interaction tests.
+    files: [
+      "src/browser/**/*.test.{ts,tsx}",
+      "src/browser/**/*.stories.tsx",
+      "tests/ui/**/*.{ts,tsx}",
+    ],
+    rules: {
+      "local/no-fixed-sleep": ["error", { allow: FIXED_SLEEP_ALLOW }],
     },
   },
   {

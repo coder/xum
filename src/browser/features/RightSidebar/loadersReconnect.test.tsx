@@ -13,6 +13,7 @@ import {
   createConnectionHarness,
   GAP_MODES,
   type ConnectionHarness,
+  settle,
 } from "@/browser/contexts/connection.testHarness";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
@@ -129,20 +130,14 @@ function Wrapper(props: { children: ReactNode }) {
   );
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  });
-}
-
 async function drop() {
   await harness.drop();
-  await flush();
+  await settle();
 }
 
 async function reconnect() {
   harness.reconnect();
-  await flush();
+  await settle();
 }
 
 /** Never answers: the read stays in flight until a drop cuts it off. */
@@ -258,7 +253,7 @@ describe.each([...GAP_MODES])("loaded panes across a dropped connection (%s)", (
     fireEvent.blur(turnCap());
     await waitFor(() => expect(savedOverrides).toHaveLength(1));
     next.resolve(turnCapOverride(7));
-    await flush();
+    await settle();
     expect(turnCap().value).toBe("9");
   });
 });
@@ -348,7 +343,7 @@ describe.each([...GAP_MODES])("edits and navigation while reconnecting (%s)", (m
     // Project B's first list is still loading when the connection drops and cuts it off.
     answerServers = pending;
     view.rerender(<ProjectMCPOverview projectPath="/projects/b" />);
-    await flush();
+    await settle();
     expect(view.queryByText("alpha")).toBeNull();
     await drop();
     expect(view.queryByText("alpha")).toBeNull();

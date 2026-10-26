@@ -8,10 +8,10 @@ import * as RoutingModule from "@/browser/hooks/useRouting";
 import {
   filterHiddenModels,
   getDefaultModel,
-  getSuggestedModels,
   useModelsFromSettings,
 } from "./useModelsFromSettings";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
+import { getSuggestedModels } from "@/common/utils/ai/selectableModels";
 import type {
   ProviderConfigInfo,
   ProviderModelEntry,

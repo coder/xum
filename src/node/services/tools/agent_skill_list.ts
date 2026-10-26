@@ -37,7 +37,6 @@ import {
 import {
   discoverAgentSkills,
   requireReachableSkills,
-  getDefaultAgentSkillsRoots,
   getProjectSkillRoots,
 } from "@/node/services/agentSkills/agentSkillsService";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
@@ -298,15 +297,9 @@ export const createAgentSkillListTool: ToolFactory = (config: ToolConfiguration)
         if (skillCtx.kind === "project-runtime") {
           // Runtime discovery mirrors the shared default roots contract so project-runtime
           // listings include .xum/skills and .agents/skills plus ~/.xum/skills and ~/.agents/skills.
-          const roots =
-            skillCtx.roots ??
-            getDefaultAgentSkillsRoots(skillCtx.runtime, skillCtx.workspacePath, {
-              includeClaudeSkills,
-            });
-
           const discovered = requireReachableSkills(
             await discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
-              roots,
+              roots: skillCtx.roots,
               containment: skillCtx.containment,
               runtimeFactory: toolRuntimeFactory(config),
               dedupeByName: false,

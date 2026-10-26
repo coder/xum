@@ -1,5 +1,5 @@
 diff --git a/dist/index.js b/dist/index.js
-index 476387edaa6d28a0d1bc6ce519fad894b0bbf154..d2d6c60209a1cef0b4b6ff93301b4c0fccea0938 100644
+index 476387edaa6d28a0d1bc6ce519fad894b0bbf154..ba5edc6be918c5b3bda6c238997280c4f0cac8c0 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -64,7 +64,21 @@ const parseTrpcRouter = ({ router, ...params }) => {
@@ -34,7 +34,48 @@ index 476387edaa6d28a0d1bc6ce519fad894b0bbf154..d2d6c60209a1cef0b4b6ff93301b4c0f
              '@valibot/to-json-schema': params['@valibot/to-json-schema'],
              effect: params.effect,
          });
-@@ -532,6 +546,10 @@ const getOptionValueParser = (schema) => {
+@@ -279,7 +293,9 @@ export function createCli({ router, ...params }) {
+                     if (itemEnumTypes?.type === 'string_enum') {
+                         option.choices(itemEnumTypes.choices);
+                     }
+-                    const itemParser = getOptionValueParser(itemsSchema);
++                    // xum patch (#7156): an item lands inside an array, never as the option
++                    // value commander checks for null, so items keep plain null.
++                    const itemParser = getOptionValueParserWithNull(itemsSchema);
+                     if (itemParser) {
+                         option.argParser((value, previous) => {
+                             const parsed = itemParser(value);
+@@ -331,6 +347,10 @@ export function createCli({ router, ...params }) {
+                 }
+                 // the last arg is the Command instance itself, the second last is the options object, and the other args are positional
+                 const positionalValues = args.slice(0, -2);
++                for (const [key, value] of Object.entries(options)) {
++                    if (value === NULL_OPTION_VALUE)
++                        options[key] = null;
++                }
+                 const input = parsedProcedure.getPojoInput({ positionalValues, options });
+                 let caller;
+                 const deprecatedCreateCaller = Reflect.get(params, 'createCallerFactory');
+@@ -517,7 +537,18 @@ const booleanParser = (val, { fallback = val } = {}) => {
+         return false;
+     return fallback;
+ };
++// xum patch (#7156): commander stores `true` when the parser of an optional-value option
++// (`--flag [value]`) returns null, so `--interval-ms null` sent `true`. The value parser returns
++// this sentinel for JSON null instead, and the command action turns it back into null.
++const NULL_OPTION_VALUE = Symbol('trpc-cli null option value');
+ const getOptionValueParser = (schema) => {
++    const parse = getOptionValueParserWithNull(schema);
++    return (value) => {
++        const parsed = parse(value);
++        return parsed === null ? NULL_OPTION_VALUE : parsed;
++    };
++};
++const getOptionValueParserWithNull = (schema) => {
+     const allowedSchemas = getAllowedSchemas(schema)
+         .slice()
+         .sort((a, b) => String(getSchemaTypes(a)[0]).localeCompare(String(getSchemaTypes(b)[0])));
+@@ -532,6 +563,10 @@ const getOptionValueParser = (schema) => {
              if (!types.size)
                  return parsed; // if types is empty, it means any type is allowed - e.g. for json input
              const jsonSchemaType = Array.isArray(parsed) ? 'array' : parsed === null ? 'null' : typeof parsed;

@@ -2,7 +2,7 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { BackgroundBashOutputDialog } from "@/browser/components/BackgroundBashOutputDialog/BackgroundBashOutputDialog";
@@ -12,6 +12,7 @@ import {
   createConnectionHarness,
   GAP_MODES,
   type ConnectionHarness,
+  settle,
 } from "@/browser/contexts/connection.testHarness";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
@@ -177,20 +178,14 @@ function Wrapper(props: { children: ReactNode }) {
   );
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  });
-}
-
 async function drop() {
   await harness.drop();
-  await flush();
+  await settle();
 }
 
 async function reconnect() {
   harness.reconnect();
-  await flush();
+  await settle();
 }
 
 function noop() {
@@ -218,7 +213,7 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
     const view = render(<ProjectMCPOverview projectPath="/projects/cancel" />, {
       wrapper: Wrapper,
     });
-    await flush();
+    await settle();
 
     expect(view.queryByText("cancelled by the server")).not.toBeNull();
     expect(view.container.querySelector(".animate-spin")).toBeNull();
@@ -230,7 +225,7 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
       <BackgroundBashOutputDialog open onOpenChange={noop} workspaceId="ws-1" processId="p1" />,
       { wrapper: Wrapper }
     );
-    await flush();
+    await settle();
 
     expect(view.queryByText("cancelled by the server")).not.toBeNull();
     expect(view.queryByText("Loading…")).toBeNull();
@@ -257,7 +252,7 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
       <GoalBoardSections workspaceId="ws-1" board={goalBoard()} onMutated={noop} />,
       { wrapper: Wrapper }
     );
-    await flush();
+    await settle();
     await drop();
 
     fireEvent.click(view.getByRole("button", { name: "Promote Ship it" }));
@@ -267,7 +262,7 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
     // A real change: an unchanged editor closes without saving.
     fireEvent.change(view.getByLabelText("Goal objective"), { target: { value: "Ship it now" } });
     fireEvent.click(view.getByRole("button", { name: "Save" }));
-    await flush();
+    await settle();
     // The editor stays open: nothing was saved.
     expect(view.queryByLabelText("Goal objective")).not.toBeNull();
 
@@ -284,7 +279,7 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
       <BackgroundBashOutputDialog open onOpenChange={noop} workspaceId="ws-1" processId="p1" />,
       { wrapper: Wrapper }
     );
-    await flush();
+    await settle();
     expect(view.queryByText("Loading…")).toBeNull();
 
     const next = Promise.withResolvers<ReturnType<typeof outputResult>>();
@@ -301,7 +296,7 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
       wrapper: Wrapper,
     });
     fireEvent.click(view.getByRole("button", { name: /hello/ }));
-    await flush();
+    await settle();
 
     await drop();
     expect(view.queryByText(/Not connected/)).toBeNull();
@@ -365,7 +360,7 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
     // In the kept gap the kept client's read fails at once with a lost connection.
     answerRunDetail = pending;
     fireEvent.click(view.getByRole("button", { name: /hello/ }));
-    await flush();
+    await settle();
     expect(view.queryByText("No steps recorded")).toBeNull();
     expect(view.container.querySelector(".animate-spin")).not.toBeNull();
 

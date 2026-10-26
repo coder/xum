@@ -18,6 +18,7 @@ import type { Result } from "@/common/types/result";
 import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
+import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -157,6 +158,38 @@ async function runProjectMutation(
   }
 }
 
+/** A project's effective trust: its parent project's when it has one (isProjectTrustedIn). */
+function effectiveProjectTrust(
+  projects: ReadonlyMap<string, ProjectConfig>,
+  projectPath: string
+): boolean {
+  const trustOwnerPath = projects.get(projectPath)?.parentProjectPath ?? projectPath;
+  return projects.get(trustOwnerPath)?.trusted === true;
+}
+
+/**
+ * #7216: trust changed by the `xum trust` CLI or another client reaches this renderer only as a
+ * config change and the re-list after it, so publish a trust change (it refreshes the
+ * trust-gated lists: project plugin skills, MCP servers) when a project listed in both snapshots
+ * changed its effective trust (a new untrusted parent project changes its child's too). The
+ * first list has nothing to compare with.
+ */
+function publishRelistedTrustChanges(
+  previous: ReadonlyMap<string, ProjectConfig> | null,
+  next: ReadonlyMap<string, ProjectConfig>
+): void {
+  if (previous == null) return;
+  for (const projectPath of next.keys()) {
+    if (
+      previous.has(projectPath) &&
+      effectiveProjectTrust(previous, projectPath) !== effectiveProjectTrust(next, projectPath)
+    ) {
+      publishProjectTrustChanged();
+      return;
+    }
+  }
+}
+
 export function ProjectProvider(props: { children: ReactNode }) {
   const { api } = useAPI();
   // Handlers use only the live client: offline they keep returning their result (for example
@@ -194,6 +227,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
     pending: boolean;
     promise: Promise<void> | null;
   }>({ api, pending: false, promise: null });
+  // Last list from the backend, to notice trust changes that arrive with a re-list.
+  const listedProjectsRef = useRef<Map<string, ProjectConfig> | null>(null);
 
   const refreshProjects = useCallback((): Promise<void> => {
     const refresh = projectsRefreshRef.current;
@@ -214,9 +249,13 @@ export function ProjectProvider(props: { children: ReactNode }) {
           try {
             const projectsList = await requestApi.projects.list();
             if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
-            setAllProjectsInternal(new Map(projectsList));
+            const listedProjects = new Map(projectsList);
+            const previousListedProjects = listedProjectsRef.current;
+            listedProjectsRef.current = listedProjects;
+            setAllProjectsInternal(listedProjects);
             setLoaded(true);
             setLoadError(null);
+            publishRelistedTrustChanges(previousListedProjects, listedProjects);
           } catch (error) {
             if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
             // A lost connection is no load error: the reconnect reloads.

@@ -21,7 +21,7 @@ import {
   TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   WORKSPACE_NAME_GENERATION_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
-import { isWorkspaceProjectTrusted } from "@/node/utils/projectTrust";
+import { isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 import { SERVER_UPDATE_MONITOR_VERIFY_TIMEOUT_MS } from "@/constants/serverUpdate";
 import { EventEmitter } from "events";
@@ -21754,7 +21754,9 @@ export class WorkspaceService
    * resolved; the unified resolver then uses its implicit fallback ancestor.
    */
   private async getAgentDefinitionContext(
-    workspaceId: string
+    workspaceId: string,
+    /** #7216: the caller's config snapshot, so trust comes from the config it resolves with. */
+    config: ProjectsConfig
   ): Promise<NodeAgentDefinitionContext | undefined> {
     try {
       const metadata = await this.getInfo(workspaceId);
@@ -21766,7 +21768,7 @@ export class WorkspaceService
         runtime,
         workspacePath: resolveWorkspaceRootPath(metadata, runtime),
         workspaceId,
-        projectPluginsTrusted: isWorkspaceProjectTrusted(this.config, metadata),
+        projectPluginsTrusted: isWorkspaceProjectTrustedIn(config.projects, metadata),
         runtimeFactory: nodeRuntimeFactory,
       };
     } catch {
@@ -21838,7 +21840,7 @@ export class WorkspaceService
       // kickoff must then use the user's configured default model, as the composer does, not
       // the built-in one (bug bash: the kickoff ran on a model the user had not picked).
       defaultModel: config.defaultModel,
-      definitionContext: await this.getAgentDefinitionContext(workspaceId),
+      definitionContext: await this.getAgentDefinitionContext(workspaceId, config),
     });
 
     // Selected values: the send path persists them and re-clamps at request time.
@@ -22111,7 +22113,7 @@ export class WorkspaceService
         },
       ],
       defaultModel: WORKSPACE_DEFAULTS.model,
-      definitionContext: await this.getAgentDefinitionContext(workspaceId),
+      definitionContext: await this.getAgentDefinitionContext(workspaceId, config),
     });
 
     return {
@@ -22629,7 +22631,7 @@ export class WorkspaceService
         },
       ],
       defaultModel: WORKSPACE_DEFAULTS.model,
-      definitionContext: await this.getAgentDefinitionContext(workspaceId),
+      definitionContext: await this.getAgentDefinitionContext(workspaceId, config),
     });
 
     return {
