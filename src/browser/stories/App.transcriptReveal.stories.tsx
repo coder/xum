@@ -451,11 +451,12 @@ export const PauseAtBudget: AppStory = {
 
 /**
  * The phone width in a frame no taller than the window (#7517). The test-runner window is 720 px
- * tall, so a full 844 px frame overflows it and the page's outer containers scroll. On a slow
- * runner they are still scrolled when the read row is measured, and the click's focus scrolls
- * them back mid-reveal: the read row moves on screen without any transcript change, and the
- * load-older pin, which compares screen positions, cannot undo it (#7549). The app fills the
- * window on a real phone, so this frame drops only the harness scroll.
+ * tall, so a full 844 px frame overflows it and the page's outer containers can scroll. A trace
+ * of a throttled failing run (in #7517) showed them still scrolled when the read row was
+ * measured, and scrolled back mid-reveal after the click: the read row moved on screen without
+ * any transcript change, and the load-older pin, which compares screen positions, cannot undo
+ * that (#7549). The frame is shorter in that window (720 px instead of 844 px), which the
+ * assertions do not depend on; only the width must be a phone's.
  */
 function IPhone16eWindowDecorator(Story: ComponentType) {
   return (
