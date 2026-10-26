@@ -10,6 +10,8 @@ import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager
 import type { MuxMessage } from "@/common/types/message";
 import { HistoryService } from "./historyService";
 import { log } from "./log";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { historyWriteLockPath } from "./workspaceRemoval";
 import type { SessionUsageService } from "./sessionUsageService";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -152,6 +154,42 @@ describe("StreamManager - retry reset clears only this stream's partial (#7499)"
     // state must survive this stream's retry.
     await historyService.writePartial(workspaceId, partialOf("other-message"));
     await resetWithoutParts(streamManager, "this-message");
+    expect((await historyService.readPartial(workspaceId))?.id).toBe("other-message");
+  });
+
+  test("a foreign backend's replacement between the check and the unlink survives", async () => {
+    await historyService.writePartial(workspaceId, partialOf("this-message"));
+    // This test plays the foreign backend: it holds the cross-process history write lock that
+    // partial writes take, and replaces partial.json while the delete (deleteForRetry's
+    // conditional delete) waits.
+    const lockPath = historyWriteLockPath(historyConfig.rootDir, workspaceId);
+    const foreignLock = await acquireProcessFileLock({
+      lockPath,
+      timeoutMs: 5_000,
+      label: "foreign history write lock",
+    });
+    const locks = historyService.locks;
+    const acquire = locks.acquireProcessFileLock.bind(locks);
+    let markWaiting = () => undefined as void;
+    const waiting = new Promise<void>((resolve) => (markWaiting = resolve));
+    const lockSpy = spyOn(locks, "acquireProcessFileLock").mockImplementation((options) => {
+      if (options.lockPath === lockPath) markWaiting();
+      return acquire(options);
+    });
+    try {
+      const deleted = historyService.deletePartialIfMessageIdMatches(workspaceId, "this-message");
+      // Without the lock the delete never waits: it finishes first and deletes this partial,
+      // before the replacement below.
+      await Promise.race([waiting, deleted]);
+      nodeFs.writeFileSync(
+        path.join(historyConfig.sessionsDir, workspaceId, "partial.json"),
+        JSON.stringify(partialOf("other-message"))
+      );
+      await foreignLock[Symbol.asyncDispose]();
+      expect(await deleted).toEqual(Ok(false));
+    } finally {
+      lockSpy.mockRestore();
+    }
     expect((await historyService.readPartial(workspaceId))?.id).toBe("other-message");
   });
 
