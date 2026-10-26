@@ -153,6 +153,9 @@ describeIntegration("Workspace Archive (UI)", () => {
     });
     if (!secondResult.success) throw new Error(secondResult.error);
     const secondWorkspace = secondResult.metadata;
+    // The quick archive button is hidden while the row shows setup activity, and
+    // setupWorkspaceView does not wait for setup (#7534).
+    await waitForInitComplete(env, firstWorkspace.id, 30_000);
     const firstDisplayTitle = firstWorkspace.title ?? firstWorkspace.name;
 
     const cleanupDom = setupTestDom();
@@ -225,6 +228,9 @@ describeIntegration("Workspace Archive (UI)", () => {
     await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
       const projectPath = metadata.projectPath;
       const displayTitle = metadata.title ?? metadata.name;
+      // withSharedWorkspace waits for setup only 1.5 s, and the actions menu appears after setup
+      // ends (#7534).
+      await waitForInitComplete(env, workspaceId, 30_000);
 
       const cleanupDom = setupTestDom();
       const view = renderApp({
