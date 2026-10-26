@@ -1876,16 +1876,10 @@ const localPlugin = {
           }
           return null;
         };
-        // The exported name behind a type identifier: the imported name of an aliased import
-        // (`import type { APIClient as Client }`), else the identifier's own name.
-        const importedName = (identifier) => {
-          const def = definitionOf(identifier);
-          return def?.type === "ImportBinding" && def.node.type === "ImportSpecifier"
-            ? (def.node.imported.name ?? def.node.imported.value)
-            : identifier.name;
-        };
         // The module that exports each name the rule follows, from the repo root.
         const MODULE_OF = {
+          APIClient: "src/browser/contexts/API",
+          TestApiOverrides: "src/browser/testUtils",
           createClient: "src/common/orpc/client",
           AppRouter: "src/node/orpc/router",
           useAPI: "src/browser/contexts/API",
@@ -1905,6 +1899,26 @@ const localPlugin = {
             .join("/")
             .replace(/\.tsx?$/, "");
           return normalized === MODULE_OF[name] || normalized.endsWith(`/${MODULE_OF[name]}`);
+        };
+        // The exported name behind a type identifier: the imported name of an aliased import
+        // (`import type { APIClient as Client }`), else the identifier's own name. Null for an
+        // import of a name the rule follows from another module (an SDK's own `APIClient`).
+        const importedName = (identifier) => {
+          const def = definitionOf(identifier);
+          if (def?.type !== "ImportBinding" || def.node.type !== "ImportSpecifier") {
+            return identifier.name;
+          }
+          const name = def.node.imported.name ?? def.node.imported.value;
+          return !Object.hasOwn(MODULE_OF, name) || importsModuleOf(def.parent, name) ? name : null;
+        };
+        // Whether `identifier` is a namespace import of the module that exports `name`.
+        const isNamespaceImportOf = (identifier, name) => {
+          const def = definitionOf(identifier);
+          return (
+            def?.type === "ImportBinding" &&
+            def.node.type === "ImportNamespaceSpecifier" &&
+            importsModuleOf(def.parent, name)
+          );
         };
         // Whether `identifier` is bound to an import of `name` from its module, aliased or not.
         // A local helper that only shares the name (`function createClient()` in a router test)
@@ -1935,12 +1949,7 @@ const localPlugin = {
           ) {
             return false;
           }
-          const def = definitionOf(expression.left);
-          return (
-            def?.type === "ImportBinding" &&
-            def.node.type === "ImportNamespaceSpecifier" &&
-            importsModuleOf(def.parent, name)
-          );
+          return isNamespaceImportOf(expression.left, name);
         };
         // Whether a type spells APIClient, a part of it, or its test overrides type.
         const isApiClientType = (type, depth = 0) => {
@@ -1965,9 +1974,14 @@ const localPlugin = {
             return false;
           }
           const [firstArgument] = typeArgumentsOf(type);
-          // `APIModule.APIClient` through a namespace import: the right-hand name.
+          // `APIModule.APIClient` through a namespace import of the API context module.
           if (type.typeName.type === "TSQualifiedName") {
-            return type.typeName.right.name === "APIClient";
+            const { left, right } = type.typeName;
+            return (
+              right.name === "APIClient" &&
+              left.type === "Identifier" &&
+              isNamespaceImportOf(left, "APIClient")
+            );
           }
           if (type.typeName.type !== "Identifier") {
             return false;
