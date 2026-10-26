@@ -9,7 +9,6 @@ import type { ExecOptions } from "@/node/runtime/Runtime";
 import {
   listArtifactsOnRuntime,
   parseArtifactListOutput,
-  parseArtifactReadOutput,
   readArtifactBytesOnRuntime,
   readArtifactOnRuntime,
   writeArtifactOnRuntime,
@@ -310,6 +309,29 @@ describe("artifactRuntimeStore", () => {
       ).toEqual({ status: "missing" });
     });
 
+    test("skips a login banner before the header and throws on cut-off output", async () => {
+      await write("pic.png", Buffer.from([0x89, 0x50, 0x4e]));
+      // An SSH login banner (motd) reaches stdout before the script's own output.
+      class BannerRuntime extends LocalRuntime {
+        override exec(command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
+          return super.exec(`printf 'motd\\n'\n${command}`, options);
+        }
+      }
+      expect(
+        await readArtifactBytesOnRuntime(new BannerRuntime(tempDir), artifactsDir, "pic.png", CAP)
+      ).toMatchObject({ status: "ok", bytes: Buffer.from([0x89, 0x50, 0x4e]) });
+
+      // A connection that drops mid-header leaves the size field unterminated.
+      class CutOffRuntime extends LocalRuntime {
+        override exec(_command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
+          return super.exec(String.raw`printf 'XUMREAD1\000ok\000'; printf 3`, options);
+        }
+      }
+      await expect(
+        readArtifactBytesOnRuntime(new CutOffRuntime(tempDir), artifactsDir, "pic.png", CAP)
+      ).rejects.toThrow("Artifact read output is cut off");
+    });
+
     test("refuses a FIFO without blocking", async () => {
       execFileSync("mkfifo", [path.join(artifactsDir, "pipe.txt")]);
       expect(await readArtifactOnRuntime(runtime, artifactsDir, "pipe.txt", CAP)).toEqual({
@@ -318,26 +340,6 @@ describe("artifactRuntimeStore", () => {
         missing: true,
       });
     });
-  });
-
-  test("parseArtifactReadOutput skips a banner and keeps raw bytes", () => {
-    const output = Buffer.concat([
-      Buffer.from("motd\nXUMREAD1\0ok\0" + "3\0" + "9\0"),
-      Buffer.from([0x89, 0x50, 0x4e]),
-    ]);
-    expect(parseArtifactReadOutput(output, "a.png", 10)).toEqual({
-      success: true,
-      data: {
-        status: "ok",
-        path: "a.png",
-        kind: "image",
-        size: 3,
-        modifiedMs: 9000,
-        encoding: "base64",
-        content: Buffer.from([0x89, 0x50, 0x4e]).toString("base64"),
-      },
-    });
-    expect(() => parseArtifactReadOutput(Buffer.from("XUMREAD1\0ok\0" + "3"), "a", 10)).toThrow();
   });
 
   // Host and runtime writers share one contract, so every case runs against both.

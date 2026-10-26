@@ -293,10 +293,6 @@ export function recordedStepsFromLog(log: DevtoolsLogSnapshot): RecordedStepRequ
   });
 }
 
-export async function readRecordedSteps(sessionDir: string): Promise<RecordedStepRequest[]> {
-  return recordedStepsFromLog(await readDevtoolsLog(sessionDir));
-}
-
 /** First structural difference between two JSON values (depth-first). */
 export interface JsonDivergence {
   path: string;
