@@ -2,6 +2,7 @@ import { createRequire } from "node:module";
 import type { APIClient } from "@/browser/contexts/API";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
 import type { ExperimentId } from "@/common/constants/experiments";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AgentAiDefaults } from "@/common/types/agentAiDefaults";
 import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
 import type { UserPreferences } from "@/common/config/schemas/userPreferences";
@@ -154,6 +155,25 @@ export type TestApiOverrides<T> = {
 export function createTestApiClient(overrides: TestApiOverrides<APIClient> = {}): APIClient {
   // The single cast: tests supply only the procedures they exercise.
   return overrides as unknown as APIClient;
+}
+
+/** A custom OpenAI model alias that maps to a model with xhigh and max thinking. */
+export const MAPPED_ALIAS_MODEL = "openai:team-sol";
+
+/**
+ * Providers config that maps MAPPED_ALIAS_MODEL to its target. The resolution itself is tested at
+ * its owner (resolveModelForMetadata in modelEntries.test.ts); component tests use this fixture to
+ * check that they read thinking levels from the target model, not from the alias.
+ */
+export function createMappedAliasProvidersConfig(): ProvidersConfigMap {
+  return {
+    openai: {
+      apiKeySet: true,
+      isEnabled: true,
+      isConfigured: true,
+      models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
+    },
+  };
 }
 
 /** What an APIClient procedure resolves to: `TestApiOutput<APIClient["mcp"]["list"]>`. */
