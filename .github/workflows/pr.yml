@@ -892,6 +892,9 @@ jobs:
         shell: pwsh
         run: |
           bun test src/node/utils/paths.test.ts src/node/utils/findExecutableOnPath.test.ts src/node/utils/gitNoHooksEnv.discovery.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts src/node/runtime/SSH2ConnectionPool.test.ts src/node/services/historyService.statusLock.test.ts
+      - name: Verify Report slowness script-path placeholders on Windows paths
+        shell: pwsh
+        run: bun test src/node/services/perf/perfReportService.test.ts -t "script paths"
       - name: Verify Windows plugin path aliases
         shell: pwsh
         run: bun test src/node/services/agentPlugins/discovery.test.ts -t "coalesces Windows case aliases"
