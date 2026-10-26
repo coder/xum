@@ -122,9 +122,7 @@ function createHttpClient(
     url: "/orpc",
     headers,
   });
-
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- test helper
-  return createORPCClient(link) as RouterClient<AppRouter>;
+  return createORPCClient<RouterClient<AppRouter>>(link);
 }
 
 async function withProxyUriTemplateEnv<T>(

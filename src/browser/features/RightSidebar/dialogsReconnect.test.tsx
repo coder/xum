@@ -13,7 +13,7 @@ import {
   type ConnectionHarness,
 } from "@/browser/contexts/connection.testHarness";
 import { SubagentTranscriptDialog } from "@/browser/features/Tools/SubagentTranscriptDialog";
-import type { TestApiOverrides } from "@/browser/testUtils";
+import type { TestApiOutput, TestApiOverrides } from "@/browser/testUtils";
 import { PlanFileDialog } from "./PlanFileDialog";
 
 /*
@@ -34,9 +34,13 @@ function deferred<T>(): Deferred<T> {
 }
 
 /** What each server procedure answers; a test swaps them before a reconnect. */
-let answerPlan: () => Promise<unknown>;
-let answerTranscript: () => Promise<unknown>;
-let answerOutput: () => Promise<unknown>;
+type Workspace = APIClient["workspace"];
+type PlanAnswer = TestApiOutput<Workspace["getPlanContent"]>;
+type TranscriptAnswer = TestApiOutput<Workspace["getSubagentTranscript"]>;
+type OutputAnswer = TestApiOutput<Workspace["backgroundBashes"]["getOutput"]>;
+let answerPlan: () => Promise<PlanAnswer>;
+let answerTranscript: () => Promise<TranscriptAnswer>;
+let answerOutput: () => Promise<OutputAnswer>;
 
 function planResult(content: string) {
   return { success: true as const, data: { content, path: "/plans/plan.md" } };
@@ -60,7 +64,7 @@ function serverOverrides(): TestApiOverrides<APIClient> {
       getSubagentTranscript: () => answerTranscript(),
       backgroundBashes: { getOutput: () => answerOutput() },
     },
-  } as unknown as TestApiOverrides<APIClient>;
+  };
 }
 
 let harness: ConnectionHarness;
@@ -117,7 +121,7 @@ describe.each([...GAP_MODES])("dialogs across a dropped connection (%s)", (mode)
     expect(view.queryByText("API unavailable")).toBeNull();
 
     // The new client's read is still in flight, and is then cut off by a second drop.
-    const pending = deferred<unknown>();
+    const pending = deferred<PlanAnswer>();
     answerPlan = () => pending.promise;
     await reconnect();
     expect(view.queryByText("Plan A")).not.toBeNull();
@@ -126,7 +130,7 @@ describe.each([...GAP_MODES])("dialogs across a dropped connection (%s)", (mode)
     expect(view.queryByText("Plan A")).not.toBeNull();
     expect(view.queryByTestId("plan-file-dialog-error")).toBeNull();
 
-    const next = deferred<unknown>();
+    const next = deferred<PlanAnswer>();
     answerPlan = () => next.promise;
     await reconnect();
     expect(view.queryByText("Plan A")).not.toBeNull();
@@ -148,7 +152,7 @@ describe.each([...GAP_MODES])("dialogs across a dropped connection (%s)", (mode)
     expect(view.queryByText("thinking: high")).not.toBeNull();
     expect(view.queryByText("Transcript is empty")).not.toBeNull();
 
-    const pending = deferred<unknown>();
+    const pending = deferred<TranscriptAnswer>();
     answerTranscript = () => pending.promise;
     await reconnect();
     expect(view.queryByText("thinking: high")).not.toBeNull();
@@ -157,7 +161,7 @@ describe.each([...GAP_MODES])("dialogs across a dropped connection (%s)", (mode)
     expect(view.queryByText("Transcript is empty")).not.toBeNull();
     expect(view.queryByText(/WebSocket|connection/i)).toBeNull();
 
-    const next = deferred<unknown>();
+    const next = deferred<TranscriptAnswer>();
     answerTranscript = () => next.promise;
     await reconnect();
     next.resolve(transcriptResult("low"));
@@ -175,7 +179,7 @@ describe.each([...GAP_MODES])("dialogs across a dropped connection (%s)", (mode)
     await drop();
     expect(view.queryByText("line A")).not.toBeNull();
 
-    const pending = deferred<unknown>();
+    const pending = deferred<OutputAnswer>();
     answerOutput = () => pending.promise;
     await reconnect();
     expect(view.queryByText("line A")).not.toBeNull();
@@ -185,7 +189,7 @@ describe.each([...GAP_MODES])("dialogs across a dropped connection (%s)", (mode)
     expect(view.queryByText(/WebSocket|connection/i)).toBeNull();
 
     // The new read is a fresh tail: it replaces the kept output instead of appending to it.
-    const next = deferred<unknown>();
+    const next = deferred<OutputAnswer>();
     answerOutput = () => next.promise;
     await reconnect();
     next.resolve(outputResult("line B"));
@@ -217,7 +221,7 @@ describe.each([...GAP_MODES])("dialogs opened while reconnecting (%s)", (mode) =
     });
     await flush();
 
-    const next = deferred<unknown>();
+    const next = deferred<PlanAnswer>();
     answerPlan = () => next.promise;
     await reconnect();
     expect(view.queryByText("Loading plan…")).not.toBeNull();
@@ -234,7 +238,7 @@ describe.each([...GAP_MODES])("dialogs opened while reconnecting (%s)", (mode) =
     });
     await flush();
 
-    const next = deferred<unknown>();
+    const next = deferred<TranscriptAnswer>();
     answerTranscript = () => next.promise;
     await reconnect();
     expect(view.queryByText(/Loading transcript/)).not.toBeNull();
@@ -266,7 +270,7 @@ describe("dialogs opened on other data", () => {
     });
     await view.findByText("Plan A");
 
-    const pending = deferred<unknown>();
+    const pending = deferred<PlanAnswer>();
     answerPlan = () => pending.promise;
     view.rerender(<PlanFileDialog open onOpenChange={noop} workspaceId="ws-2" />);
     await waitFor(() => expect(view.queryByText("Loading plan…")).not.toBeNull());
@@ -281,7 +285,7 @@ describe("dialogs opened on other data", () => {
     );
     await view.findByText("line A");
 
-    const pending = deferred<unknown>();
+    const pending = deferred<OutputAnswer>();
     answerOutput = () => pending.promise;
     view.rerender(
       <BackgroundBashOutputDialog open onOpenChange={noop} workspaceId="ws-1" processId="p2" />

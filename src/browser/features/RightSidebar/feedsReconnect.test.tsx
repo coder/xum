@@ -11,7 +11,7 @@ import {
   GAP_MODES,
   type ConnectionHarness,
 } from "@/browser/contexts/connection.testHarness";
-import type { TestApiOverrides } from "@/browser/testUtils";
+import { snapshotStream, type TestApiOverrides } from "@/browser/testUtils";
 import type { DevToolsRunSummary } from "@/common/types/devtools";
 import type { AvailableWorkflow, WorkflowRunRecord } from "@/common/types/workflow";
 import { useDevToolsSubscription } from "./DevToolsTab/useDevToolsSubscription";
@@ -38,16 +38,6 @@ function deferred<T>(): Deferred<T> {
 let devToolsSnapshot: () => Promise<string[]>;
 let workflowSnapshot: () => Promise<string[]>;
 let scriptNames: () => Promise<string[]>;
-
-/** A stream that sends one snapshot, then stays open until the connection drops. */
-function snapshotStream<T>(snapshot: Promise<T>) {
-  return Promise.resolve(
-    (async function* () {
-      yield await snapshot;
-      await new Promise(() => undefined);
-    })()
-  );
-}
 
 function devToolsRun(id: string): DevToolsRunSummary {
   return { id } as unknown as DevToolsRunSummary;
@@ -81,7 +71,7 @@ function serverOverrides(): TestApiOverrides<APIClient> {
         ),
       listScripts: () => scriptNames().then((names) => names.map(script)),
     },
-  } as unknown as TestApiOverrides<APIClient>;
+  };
 }
 
 let harness: ConnectionHarness;

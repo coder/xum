@@ -156,6 +156,23 @@ export function createTestApiClient(overrides: TestApiOverrides<APIClient> = {})
   return overrides as unknown as APIClient;
 }
 
+/** What an APIClient procedure resolves to: `TestApiOutput<APIClient["mcp"]["list"]>`. */
+export type TestApiOutput<F extends (...args: never) => unknown> = Awaited<ReturnType<F>>;
+
+/**
+ * A streaming procedure double that sends one snapshot, then stays open until the connection
+ * drops it, as a live feed does. Pass the item type when the snapshot is built from literals
+ * (`snapshotStream<WorkflowRunsEvent>(...)`), so it is checked against the procedure's items.
+ */
+export function snapshotStream<T>(snapshot: T | Promise<T>): Promise<AsyncIterable<T>> {
+  return Promise.resolve(
+    (async function* () {
+      yield await snapshot;
+      await new Promise<never>(() => undefined);
+    })()
+  );
+}
+
 export type TestClientConfig = Awaited<ReturnType<APIClient["config"]["getConfig"]>>;
 
 /**
