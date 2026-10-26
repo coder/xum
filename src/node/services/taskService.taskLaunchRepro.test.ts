@@ -4,15 +4,17 @@
  * correct contract and failed at its target assertion before its fix. Each control runs the same
  * steps on the path the code already handled.
  *
- * The launch runs for real; only the checkout materialization (a fake runtime, or a fake fork),
- * the init hook (runBackgroundInit) and the WorkspaceHost (createWorkspaceServiceMocks) are
- * stand-ins. The removal is its first step, the task workspace's mutation gate (what
+ * The launch runs for real, and so does its checkout: the parent's worktree runtime forks a git
+ * worktree of a real repository under the test root. Only the init hook (runBackgroundInit) and the
+ * WorkspaceHost (createWorkspaceServiceMocks) are stand-ins. The removal is its first step, the task workspace's mutation gate (what
  * WorkspaceService.remove takes before it marks the row); the second backend is a second
  * TaskService on its own Config over the same root.
  *
  * Run: bun test ./src/node/services/taskService.taskLaunchRepro.test.ts
  */
+import assert from "node:assert/strict";
 import { EventEmitter } from "events";
+import * as fs from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -72,16 +74,14 @@ describe("task launch races", () => {
   });
 
   /**
-   * ROOT spawns CHILD. `materialize` runs where materializeReservedTaskWorkspace forks (with
-   * `realMaterialize`, the real method runs and `forks` counts its orchestrateFork calls instead),
-   * `beforeLaunch` before startReservedAgentTask, and `sanitize` where
+   * ROOT spawns CHILD. `materialize` runs once the launch's real fork returned (inside
+   * materializeReservedTaskWorkspace), `beforeLaunch` before startReservedAgentTask, and `sanitize` where
    * sanitizeMaterializedTaskWorkspace runs (the sanitize/secrets window before the init starts).
    * `launched` resolves when startReservedAgentTask returns.
    */
   async function setUp(
     hooks: {
       materialize?: (config: Config) => Promise<void>;
-      realMaterialize?: boolean;
       beforeLaunch?: (config: Config) => Promise<void>;
       sanitize?: (config: Config) => Promise<void> | void;
       /** The WorkspaceHost send, in place of an accepting mock. */
@@ -99,7 +99,13 @@ describe("task launch races", () => {
     await saveWorkspaces(
       config,
       projectPath,
-      [projectWorkspace(projectPath, "root", ROOT)],
+      // The task inherits this runtime: its checkout is a git worktree under the test root (the
+      // default srcBaseDir is the real ~/.xum/src).
+      [
+        projectWorkspace(projectPath, "root", ROOT, {
+          runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+        }),
+      ],
       testTaskSettings(4, 3)
     );
     stubStableIds(config, [CHILD]);
@@ -109,31 +115,33 @@ describe("task launch races", () => {
     const { taskService, historyService } = createTaskServiceHarness(config, { workspaceService });
     const internals = taskService as unknown as Internals;
 
-    // The checkout the launch "forks": deleteWorkspace records each deletion.
+    // The launch forks a real checkout (the parent's worktree runtime adds a git worktree of the
+    // project under config.srcDir). Pass-through: `forks` counts this backend's forks, `materialize`
+    // runs once the fork returned, and `deleted` records each deletion of the forked checkout.
     const deleted: string[] = [];
-    const deleteWorkspace = mock((_projectPath: string, name: string) => {
-      deleted.push(name);
-      return Promise.resolve(Ok(undefined));
-    });
+    const checkouts: string[] = [];
     let forks = 0;
-    if (hooks.realMaterialize === true) {
-      spyOn(forkOrchestrator, "orchestrateFork").mockImplementation(() => {
-        forks++;
-        return Promise.resolve(Err("the fork is not under test"));
-      });
-    } else {
-      spyOn(internals, "materializeReservedTaskWorkspace").mockImplementation(async () => {
-        await hooks.materialize?.(config);
-        return {
-          workspacePath: projectPath,
-          trunkBranch: "main",
-          forkedRuntimeConfig: { type: "local" },
-          runtimeForTaskWorkspace: { deleteWorkspace, getWorkspacePath: () => projectPath },
-          inheritedProjects: undefined,
-          reusedExistingCheckout: false,
-        };
-      });
-    }
+    const realFork = forkOrchestrator.orchestrateFork;
+    spyOn(forkOrchestrator, "orchestrateFork").mockImplementation(async (params) => {
+      if (params.config !== config) return realFork(params);
+      forks++;
+      const forked = await realFork(params);
+      if (forked.success) {
+        assert(
+          forked.data.workspacePath.startsWith(config.srcDir),
+          "the forked checkout stays under the test root"
+        );
+        checkouts.push(forked.data.workspacePath);
+        const runtime = forked.data.targetRuntime;
+        const realDelete = runtime.deleteWorkspace.bind(runtime);
+        spyOn(runtime, "deleteWorkspace").mockImplementation((...args) => {
+          deleted.push(args[1]);
+          return realDelete(...args);
+        });
+      }
+      await hooks.materialize?.(config);
+      return forked;
+    });
     spyOn(workspaceService, "sanitizeMaterializedTaskWorkspace").mockImplementation(async () => {
       await hooks.sanitize?.(config);
       return undefined;
@@ -182,6 +190,14 @@ describe("task launch races", () => {
       inits,
       launched,
       forks: () => forks,
+      /** Whether the checkout the launch forked is on disk. */
+      checkoutExists: async () => {
+        assert(checkouts.length === 1, "the launch forked exactly one checkout");
+        return fs.access(checkouts[0]).then(
+          () => true,
+          () => false
+        );
+      },
       /** Copies of the initial brief in the child's history. */
       briefsInHistory: async () => {
         const history = await historyService.getHistoryFromLatestBoundary(CHILD);
@@ -304,7 +320,6 @@ describe("task launch races", () => {
     type Setup = Awaited<ReturnType<typeof setUp>>;
     const sites: Array<{
       name: string;
-      realMaterialize?: boolean;
       /** Arms the unreadable spell right before the read under test (or a setUp hook does). */
       arm?: (s: Setup, unreadable: () => void) => void;
       armInHook?: "beforeLaunch" | "materialize";
@@ -314,12 +329,10 @@ describe("task launch races", () => {
       { name: "the start check", armInHook: "beforeLaunch" },
       {
         name: "the reuse probe before the fork",
-        realMaterialize: true,
         arm: (s, unreadable) => armAfter(s.taskService, "admitTaskDesktopRecovery", unreadable),
       },
       {
         name: "the gate right before the fork",
-        realMaterialize: true,
         arm: (s, unreadable) =>
           armAfter(s.taskService, "getExistingMaterializedTaskLaunch", unreadable),
       },
@@ -353,7 +366,6 @@ describe("task launch races", () => {
           corrupt = true;
         };
         const s = await setUp({
-          realMaterialize: site.realMaterialize,
           ...(site.armInHook != null
             ? { [site.armInHook]: () => Promise.resolve(unreadable()) }
             : {}),
@@ -426,25 +438,15 @@ describe("task launch races", () => {
 
       expect(findWorkspaceInConfig(s.config, CHILD)).toBeUndefined();
       expect(s.deleted.length).toBe(1);
+      expect(await s.checkoutExists()).toBe(false);
     });
 
     test("a removal that would mark the row (and delete the checkout the fork recreates) is refused while the launch prepares", async () => {
       let removal: "refused" | "admitted" | undefined;
       const s = await setUp({
+        // The removal would delete the checkout this fork just made.
         materialize: async (config) => {
-          // WorkspaceService.remove takes the task's mutation gate, then claims its marker and
-          // deletes the checkout this fork is about to recreate.
-          try {
-            const release = await workspaceUseLeasesFor(config).acquireMutationGate([CHILD], {
-              hasRunningBackgroundProcesses: () => Promise.resolve(false),
-            });
-            removal = "admitted";
-            await editChild(config, { pendingRemoval: removalMarker() });
-            await release();
-          } catch (error) {
-            if (!(error instanceof WorkspaceBusyError)) throw error;
-            removal = "refused";
-          }
+          removal = await markForRemoval(config);
         },
       });
 
@@ -457,11 +459,11 @@ describe("task launch races", () => {
       // The launch went on: its checkout belongs to the published row.
       expect(s.inits.length).toBe(1);
       expect(s.deleted.length).toBe(0);
+      expect(await s.checkoutExists()).toBe(true);
     });
 
     test("a marker a failed removal left behind refuses the fork", async () => {
       const s = await setUp({
-        realMaterialize: true,
         // No live removal (no gate): the marker of a removal that crashed or could not clear it.
         beforeLaunch: (config) => editChild(config, { pendingRemoval: removalMarker() }),
       });
@@ -483,11 +485,12 @@ describe("task launch races", () => {
 
       await spawn(s.taskService);
       await s.launched;
+      // The launch ran to its end, so it no longer holds its lease.
+      expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("running");
+      expect(s.inits.length).toBe(1);
 
-      const release = await workspaceUseLeasesFor(s.config).acquireMutationGate([CHILD], {
-        hasRunningBackgroundProcesses: () => Promise.resolve(false),
-      });
-      await release();
+      expect(await markForRemoval(s.config)).toBe("admitted");
+      expect(findWorkspaceInConfig(s.config, CHILD)?.pendingRemoval).toBeDefined();
     });
 
     test("a row the normalized registry drops but the raw config still lists keeps the checkout", async () => {
@@ -510,6 +513,7 @@ describe("task launch races", () => {
       await s.launched;
 
       expect(s.deleted.length).toBe(0);
+      expect(await s.checkoutExists()).toBe(true);
     });
 
     test("an unreadable registry at the cleanup keeps the checkout", async () => {
@@ -539,6 +543,7 @@ describe("task launch races", () => {
 
       expect(findWorkspaceInConfig(s.config, CHILD)).toBeDefined();
       expect(s.deleted.length).toBe(0);
+      expect(await s.checkoutExists()).toBe(true);
     });
 
     test("control: a launch cancelled after the fork keeps the checkout of its published row", async () => {
@@ -556,6 +561,7 @@ describe("task launch races", () => {
       // The row stays (interrupted, resumable), so its checkout must stay too.
       expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("interrupted");
       expect(s.deleted.length).toBe(0);
+      expect(await s.checkoutExists()).toBe(true);
     });
   });
 
@@ -600,17 +606,17 @@ describe("task launch races", () => {
   describe("a second backend's startup leaves a launch being prepared alone", () => {
     async function backendB() {
       const configB = await createTestConfig(rootDir);
-      const { workspaceService } = createWorkspaceServiceMocks();
+      const { workspaceService, resumeStream } = createWorkspaceServiceMocks();
       const { taskService } = createTaskServiceHarness(configB, { workspaceService });
+      // Pass-through: backend B's launch prepares the checkout for real; this counts its tries.
+      const internals = taskService as unknown as Internals;
+      const realMaterialize = internals.materializeReservedTaskWorkspace.bind(taskService);
       let materialized = 0;
-      spyOn(
-        taskService as unknown as Internals,
-        "materializeReservedTaskWorkspace"
-      ).mockImplementation(() => {
+      spyOn(internals, "materializeReservedTaskWorkspace").mockImplementation((...args) => {
         materialized++;
-        return Promise.resolve(null);
+        return realMaterialize(...args);
       });
-      return { taskService, materialized: () => materialized };
+      return { taskService, resumeStream, materialized: () => materialized };
     }
 
     test("startup recovery during the fork", async () => {
@@ -649,6 +655,11 @@ describe("task launch races", () => {
       await b.taskService.queueDrainSettled();
 
       expect(b.materialized()).toBe(1);
+      // Backend B relaunched the task (a resume: the brief was sent) in the checkout the dead
+      // launch left.
+      expect(findWorkspaceInConfig(s.config, CHILD)?.taskStatus).toBe("running");
+      expect(b.resumeStream).toHaveBeenCalledTimes(1);
+      expect(s.forks()).toBe(1);
     });
   });
 
@@ -1092,6 +1103,28 @@ async function editChild(config: Config, patch: Partial<ChildRow>): Promise<void
     }
     return cfg;
   });
+}
+
+/**
+ * The first steps of WorkspaceService.remove: it takes the task's mutation gate, then claims its
+ * marker (and goes on to delete the checkout). A live use lease makes the gate refuse.
+ */
+async function markForRemoval(config: Config): Promise<"refused" | "admitted"> {
+  let release: () => Promise<void>;
+  try {
+    release = await workspaceUseLeasesFor(config).acquireMutationGate([CHILD], {
+      hasRunningBackgroundProcesses: () => Promise.resolve(false),
+    });
+  } catch (error) {
+    if (!(error instanceof WorkspaceBusyError)) throw error;
+    return "refused";
+  }
+  try {
+    await editChild(config, { pendingRemoval: removalMarker() });
+  } finally {
+    await release();
+  }
+  return "admitted";
 }
 
 /** Another live process's marker (pid 1), so no self-heal takes it over. */
