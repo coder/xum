@@ -149,9 +149,11 @@ export async function canBindMountHostPathsIntoContainers(
  * Create the workspace's scratch dir where its commands run and return the absolute path to
  * export as XUM_SCRATCH_DIR, or undefined when this runtime has none (the variable stays unset).
  *
- * Host dirs are returned even when mkdir fails (see ensureWorkspaceScratchDir). Remote dirs are
- * returned only once the runtime confirmed them: an exported path the agent cannot write to is
- * worse than none.
+ * Host dirs are returned even when mkdir fails (logged), because the environment prompt always
+ * tells local/worktree agents to use $XUM_SCRATCH_DIR: an unset variable would turn
+ * `mkdir -p "$XUM_SCRATCH_DIR/logs"` into `/logs`, and a set-but-missing dir just makes the
+ * agent's own `mkdir -p` create it. Remote dirs are returned only once the runtime confirmed
+ * them: an exported path the agent cannot write to is worse than none.
  */
 export async function ensureScratchDirForSpec(
   runtime: Runtime,
