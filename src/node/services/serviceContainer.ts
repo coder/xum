@@ -463,6 +463,13 @@ export class ServiceContainer {
     // Bash commands that outlived a restart still hold the proxy URL and key: bind the saved
     // port again before clients connect. Best-effort: a proxy problem never blocks startup.
     { name: "bashAiProxy.restore", run: () => this.bashAiProxy.restore(), bestEffort: true },
+    // #7621: a trust change from `xum trust` or another config.json writer drops the remote
+    // plugin snapshots. Never throws (best-effort anyway).
+    {
+      name: "projectService.watchProjectTrust",
+      run: () => Promise.resolve(this.projectService.watchProjectTrust()),
+      bestEffort: true,
+    },
     // Before task recovery, so commands of recovered tasks start under the agent resource limit.
     // Best-effort: a limit that cannot apply is reported in Settings and never blocks startup.
     {
