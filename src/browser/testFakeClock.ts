@@ -6,10 +6,9 @@ import assert from "node:assert/strict";
 import { vi } from "bun:test";
 
 /** `vi` with the fake-timer methods bun implements but bun-types does not declare. */
-export const fakeTimers = vi as typeof vi & {
+const fakeTimers = vi as typeof vi & {
   advanceTimersByTime(ms: number): void;
   isFakeTimers(): boolean;
-  getTimerCount(): number;
 };
 
 /**

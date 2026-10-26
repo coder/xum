@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it, expect, mock, vi } from "bun:test";
 
-import { advanceClock, fakeTimers } from "@/browser/testFakeClock";
+import { advanceClock } from "@/browser/testFakeClock";
 import { RefreshController } from "./RefreshController";
 
 function deferred<T>() {
@@ -16,7 +16,8 @@ function deferred<T>() {
 }
 
 // The controller runs on timers (debounce, cooldown) and a promise pipeline: a fake clock makes
-// every wait exact.
+// every wait exact. Assert on onRefresh calls, not on the fake clock's timer count: that count is
+// global, so a timer leaked by an earlier file in the same process breaks it.
 describe("RefreshController", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -42,7 +43,6 @@ describe("RefreshController", () => {
     // Ensure the second call didn't schedule another refresh.
     await advanceClock(250);
     expect(onRefresh).toHaveBeenCalledTimes(1);
-    expect(fakeTimers.getTimerCount()).toBe(0);
 
     controller.dispose();
   });
@@ -75,8 +75,7 @@ describe("RefreshController", () => {
     await advanceClock(10);
     expect(onRefresh).toHaveBeenCalledTimes(1);
 
-    // Original timer should be cleared.
-    expect(fakeTimers.getTimerCount()).toBe(0);
+    // The original debounce timer is cleared: no second refresh follows.
     await advanceClock(120);
     expect(onRefresh).toHaveBeenCalledTimes(1);
 
@@ -146,9 +145,7 @@ describe("RefreshController", () => {
     const controller = new RefreshController({ onRefresh, debounceMs: 20 });
 
     controller.schedule();
-    expect(fakeTimers.getTimerCount()).toBe(1);
     controller.dispose();
-    expect(fakeTimers.getTimerCount()).toBe(0);
 
     await advanceClock(80);
 
@@ -162,7 +159,6 @@ describe("RefreshController", () => {
     controller.dispose();
     controller.schedule();
     controller.requestImmediate();
-    expect(fakeTimers.getTimerCount()).toBe(0);
 
     await advanceClock(80);
 
