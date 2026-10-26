@@ -471,6 +471,7 @@ import {
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
 import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
 import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
+import { WorkspaceNaming } from "@/node/services/workspaceNaming";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
@@ -1150,12 +1151,6 @@ interface CreationNaming {
   /** Called once the branch is final: renamed, kept, or never to be renamed. Idempotent. */
   settleBranch(): void;
 }
-
-/**
- * How many creation-form naming requests stay available for a creation to take over. Most never
- * are (the form shows the name, or the message changes); one per open creation form is enough.
- */
-const MAX_RETAINED_DRAFT_NAMINGS = 16;
 
 /** Why a backend-generated branch name cannot replace the provisional one, if it cannot. */
 function refuseGeneratedBranchName(generated: string, provisional: string): string | undefined {
@@ -3151,25 +3146,6 @@ export class WorkspaceService
    */
   private readonly refineExclusionCounts = new Map<string, number>();
 
-  // Tracks in-flight fork auto-title generations so only the first accepted continue
-  // message can claim the workspace title.
-  private readonly autoTitlingWorkspaces = new Set<string>();
-  /**
-   * Workspaces create() opened before their generated name existed, until their title and
-   * branch are final (startCreationNaming). A fork of one waits for them.
-   */
-  private readonly pendingCreationNamings = new Map<string, Promise<void>>();
-  /**
-   * The creation form's naming requests by draftNamingId, oldest first, running or finished. The
-   * creation that hands one off takes it over instead of asking the model again. Kept after they
-   * finish: the form drops a result that arrives after its hand-off, and the creation request
-   * can reach the backend after that result.
-   */
-  private readonly draftNamings = new Map<
-    string,
-    Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>>
-  >();
-
   // Monotonic per-workspace stream generations prevent delayed stop-side metadata writes
   // from older streams from clobbering a newer streaming=true snapshot after async awaits.
   private readonly streamingGenerations = new Map<string, number>();
@@ -3292,7 +3268,9 @@ export class WorkspaceService
       files: nodeHostFiles,
       leases: workspaceUseLeasesFor(config),
       gates: lifecycleGates,
-    })
+    }),
+    // WorkspaceLive passes the WorkspaceNamingTag service.
+    private readonly naming: WorkspaceNaming = new WorkspaceNaming()
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -8948,7 +8926,7 @@ export class WorkspaceService
         throw error;
       }
       removedFromConfig = true;
-      this.autoTitlingWorkspaces.delete(workspaceId);
+      this.naming.releaseAutoTitle(workspaceId);
       this.agentTaskIntegration?.noteWorkspaceRemoved(workspaceId);
       // Only once the workspace is deregistered (and its session, with the
       // transcript, gone) are the retryable harvest records truly
@@ -11064,7 +11042,7 @@ export class WorkspaceService
     initAbortSignal: AbortSignal
   ): CreationNaming | undefined {
     if (request === undefined) return undefined;
-    this.autoTitlingWorkspaces.add(workspaceId);
+    this.naming.claimAutoTitle(workspaceId);
     const namingAbort = new AbortController();
     let settleCreation!: (created: boolean) => void;
     const created = new Promise<boolean>((resolve) => {
@@ -11107,13 +11085,10 @@ export class WorkspaceService
         });
       })
       .finally(() => {
-        this.autoTitlingWorkspaces.delete(workspaceId);
+        this.naming.releaseAutoTitle(workspaceId);
       });
     // Neither part rejects: the title chain catches, and the branch only ever resolves.
-    const namingFinal = Promise.all([titleFinal, branchFinal]).then(() => {
-      this.pendingCreationNamings.delete(workspaceId);
-    });
-    this.pendingCreationNamings.set(workspaceId, namingFinal);
+    this.naming.trackCreationNaming(workspaceId, Promise.all([titleFinal, branchFinal]));
     return {
       outcome,
       settleCreation: (wasCreated) => {
@@ -11137,16 +11112,8 @@ export class WorkspaceService
   private async readNamedForkSource(
     sourceWorkspaceId: string
   ): Promise<Result<WorkspaceMetadata, string>> {
-    const pending = this.pendingCreationNamings.get(sourceWorkspaceId);
-    if (pending !== undefined) {
-      const waited = await raceWithAbortAndTimeout(pending, {
-        timeoutMs: WORKSPACE_NAME_GENERATION_TIMEOUT_MS,
-      });
-      if (waited.kind !== "ok") {
-        return Err(
-          "The workspace is still being set up. Fork it again once its checkout finishes."
-        );
-      }
+    if (!(await this.naming.waitForCreationNaming(sourceWorkspaceId))) {
+      return Err("The workspace is still being set up. Fork it again once its checkout finishes.");
     }
     const result = await this.aiService.getWorkspaceMetadata(sourceWorkspaceId);
     if (!result.success) {
@@ -11165,23 +11132,9 @@ export class WorkspaceService
   ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
     const generation = this.generatePreCreationIdentity(request.message, request.candidates);
     if (request.draftNamingId !== undefined) {
-      this.draftNamings.set(request.draftNamingId, generation);
-      if (this.draftNamings.size > MAX_RETAINED_DRAFT_NAMINGS) {
-        const [oldest] = this.draftNamings.keys();
-        this.draftNamings.delete(oldest);
-      }
+      this.naming.retainDraftNaming(request.draftNamingId, generation);
     }
     return generation;
-  }
-
-  /** The creation form's naming request a creation hands off, once: see draftNamings. */
-  private takeDraftNaming(
-    draftNamingId: string | undefined
-  ): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> | undefined {
-    if (draftNamingId === undefined) return undefined;
-    const draftNaming = this.draftNamings.get(draftNamingId);
-    this.draftNamings.delete(draftNamingId);
-    return draftNaming;
   }
 
   private async generatePreCreationIdentity(
@@ -11211,7 +11164,7 @@ export class WorkspaceService
       // The form's request this creation hands off, running or finished, answers sooner and
       // spares a second model call. One creation takes it: two workspaces given one generated
       // name would collide on the branch.
-      const draftNaming = this.takeDraftNaming(request.draftNamingId);
+      const draftNaming = this.naming.takeDraftNaming(request.draftNamingId);
       const generated = await raceWithAbortAndTimeout(
         draftNaming ??
           this.generatePreCreationIdentity(request.message.trim(), request.candidates, signal),
@@ -17014,11 +16967,9 @@ export class WorkspaceService
         internal?.synthetic !== true &&
         internal?.planReviewFeedback !== true &&
         normalizedOptions.editMessageId == null &&
-        workspaceConfig.pendingAutoTitle === true &&
-        !this.autoTitlingWorkspaces.has(workspaceId);
+        workspaceConfig.pendingAutoTitle === true;
       if (shouldRunPendingAutoTitle) {
-        this.autoTitlingWorkspaces.add(workspaceId);
-        claimedAutoTitle = true;
+        claimedAutoTitle = this.naming.claimAutoTitle(workspaceId);
       }
 
       // Handoff: the session releases the probe reservation the moment the
@@ -17077,7 +17028,7 @@ export class WorkspaceService
         });
 
         if (claimedAutoTitle) {
-          this.autoTitlingWorkspaces.delete(workspaceId);
+          this.naming.releaseAutoTitle(workspaceId);
           claimedAutoTitle = false;
         }
 
@@ -17109,14 +17060,14 @@ export class WorkspaceService
             });
           })
           .finally(() => {
-            this.autoTitlingWorkspaces.delete(workspaceId);
+            this.naming.releaseAutoTitle(workspaceId);
           });
       }
 
       return result;
     } catch (error) {
       if (claimedAutoTitle) {
-        this.autoTitlingWorkspaces.delete(workspaceId);
+        this.naming.releaseAutoTitle(workspaceId);
         claimedAutoTitle = false;
       }
 
