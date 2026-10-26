@@ -221,7 +221,10 @@ describe("buildWorkspaceComposition", () => {
       using checkoutDir = new DisposableTempDir("composition-remote-checkout");
       const checkout = await fs.realpath(checkoutDir.path);
       await writeFixturePlugin(checkout);
-      const runtime = new HostKeyShellRemoteRuntime(checkout, `composition-remote-${projectTrusted}`);
+      const runtime = new HostKeyShellRemoteRuntime(
+        checkout,
+        `composition-remote-${projectTrusted}`
+      );
       const composed = () =>
         buildWorkspaceComposition({
           runtime,
