@@ -882,7 +882,7 @@ describe("SandboxHostService", () => {
 
     // Workspace removal: dropScope waits for the running call. A second call
     // of the aborted turn reaches the scope lock only after removal began.
-    const drop = host.dropScope("ws-removed");
+    const drop = host.dropScopeForRemoval("ws-removed");
     let queuedRan = false;
     const queued = host.withPersistentMount(options, async (mount) => {
       queuedRan = true;
@@ -900,6 +900,64 @@ describe("SandboxHostService", () => {
     expect(existsSync(sessionDir)).toBe(false);
     expect(host.hasScope("ws-removed")).toBe(false);
     expect(queuedRan).toBe(false);
+  });
+
+  test("an aborted removal reinstates the scope, so code_execution mounts again", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const host = new SandboxHostService();
+    const options = {
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-kept",
+      sessionDir: tmp.path,
+    } as const;
+    await host.dropScopeForRemoval("ws-kept");
+    let error: unknown;
+    try {
+      await host.acquireMount(options);
+    } catch (caught) {
+      error = caught;
+    }
+    expect(error).toBeInstanceOf(Error);
+
+    host.reinstateScope("ws-kept");
+    const mount = await host.acquireMount(options);
+    expect(host.hasScope("ws-kept")).toBe(true);
+    mount.release();
+    await host.dropScope("ws-kept");
+  });
+
+  test("a mount's journal writes never recreate a deleted session dir (#7484)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const sessionDir = join(tmp.path, "session");
+    mkdirSync(sessionDir);
+    const host = new SandboxHostService();
+    const mount = await host.acquireMount({
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-deleted",
+      sessionDir,
+    });
+    const stored = await mount.runtime.eval("vars.x = 1; return vars.x;");
+    expect(stored.success).toBe(true);
+    rmSync(sessionDir, { recursive: true, force: true });
+
+    let snapshotError: unknown;
+    try {
+      await mount.persistVars();
+    } catch (caught) {
+      snapshotError = caught;
+    }
+    expect(snapshotError).toBeInstanceOf(Error);
+    let handleError: unknown;
+    try {
+      await mount.persistResultHandle({ handle: "vars.__h1", preview: "p", serialized: '"value"' });
+    } catch (caught) {
+      handleError = caught;
+    }
+    expect(handleError).toBeInstanceOf(Error);
+    expect(existsSync(sessionDir)).toBe(false);
+    await host.dropScope("ws-deleted");
   });
 
   test("discardScope: context reset discards vars instead of restoring the last snapshot", async () => {

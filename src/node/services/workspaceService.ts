@@ -8726,8 +8726,10 @@ export class WorkspaceService
       // directory: dropScope disposes the runtime without disk writes and
       // waits for in-flight evaluation, so a late vars snapshot cannot
       // recreate the directory (and the QuickJS runtime is not leaked in the
-      // process-wide singleton).
-      await sandboxHostService.dropScope(workspaceId);
+      // process-wide singleton). The removal variant also refuses a later
+      // mount: a code_execution of the aborted turn can reach the scope lock
+      // after this drop (#7484).
+      await sandboxHostService.dropScopeForRemoval(workspaceId);
       // Plugin hook mounts live under their own scope keys; unregister their
       // spine middleware and drop their runtimes too. Never throws.
       await agentPluginHookService.disposeWorkspace(workspaceId);
@@ -9001,6 +9003,7 @@ export class WorkspaceService
           }
         }
         this.memoryConsolidationService?.releaseRemovalCancellation(workspaceId);
+        sandboxHostService.reinstateScope(workspaceId);
         if (pendingRemovalId != null) {
           await this.releasePendingRemoval(workspaceId, pendingRemovalId);
         }
