@@ -54,8 +54,6 @@ export async function resolveScratchDirSpec(params: {
   runtime: Pick<Runtime, "getXumHome">;
   /** Multi-project workspaces on remote runtimes span several hosts/containers: none. */
   multiProject?: boolean;
-  /** Override for tests; production reads the Docker client config. */
-  canBindMountHostPaths?: () => Promise<boolean>;
 }): Promise<ScratchDirSpec> {
   const runtimeType = getRuntimeType(params.runtimeConfig);
   if (runtimeType === "local" || runtimeType === "worktree") {
@@ -71,9 +69,7 @@ export async function resolveScratchDirSpec(params: {
     case "docker":
       return { kind: "runtime", path: DOCKER_SCRATCH_DIR };
     case "devcontainer": {
-      const canMount =
-        params.canBindMountHostPaths ?? (() => canBindMountHostPathsIntoContainers());
-      return (await canMount())
+      return (await canBindMountHostPathsIntoContainers())
         ? {
             kind: "devcontainer-mount",
             dir: getWorkspaceScratchDir(params.sessionsDir, params.workspaceId),
