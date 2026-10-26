@@ -62,6 +62,7 @@ import {
   TurnRequestBuilderBindingsTag,
   Workspace,
   WorkspaceGoal,
+  WorkspaceLifecycleGatesTag,
   WorkspaceMcpOverrides,
   WorkspaceTurnManagerTag,
   type CoreRootTags,
@@ -88,6 +89,7 @@ import { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { TaskService } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -258,6 +260,12 @@ export const TerminalAttentionStoreLive = Layer.effect(
 // also exposed so ServiceContainer can share it with HeartbeatService. Its
 // consumer is registered by `CoreWiringLive` once Task/Workspace exist.
 export const IdleDispatcherLive = Layer.sync(IdleDispatcherTag, () => new IdleDispatcher());
+
+/** One shared instance per graph: WorkspaceService and the services split out of it read it. */
+export const WorkspaceLifecycleGatesLive = Layer.sync(
+  WorkspaceLifecycleGatesTag,
+  () => new WorkspaceLifecycleGates()
+);
 
 /** One mutable record per graph build (`sync`, not `succeed`); filled by `CoreWiringLive`. */
 export const TurnRequestBuilderBindingsLive = Layer.sync(
@@ -507,7 +515,8 @@ export const WorkspaceLive = Layer.effect(
       yield* EffectRunnerTag,
       yield* AppFiberScopeTag,
       yield* AutoModelRouterTag,
-      yield* HostClockTag
+      yield* HostClockTag,
+      yield* WorkspaceLifecycleGatesTag
     );
   })
 );
@@ -754,6 +763,7 @@ const S1 = Layer.mergeAll(
   TerminalAttentionStoreLive,
   DesktopInputCoordinatorLive,
   IdleDispatcherLive,
+  WorkspaceLifecycleGatesLive,
   TurnRequestBuilderBindingsLive
 );
 const S2a = Layer.mergeAll(SessionUsageLive, WorkspaceGoalLive).pipe(Layer.provideMerge(S1));

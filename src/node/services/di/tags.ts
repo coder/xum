@@ -81,6 +81,7 @@ import type { StreamManager } from "@/node/services/streamManager";
 import type { TaskService } from "@/node/services/taskService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import type { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { TokenizerService } from "@/node/services/tokenizerService";
@@ -207,6 +208,14 @@ export class TerminalAttentionStoreTag extends Context.Service<
   TerminalAttentionStoreTag,
   TerminalAttentionStore
 >()("xum/TerminalAttentionStore") {}
+/**
+ * Which workspaces this backend is renaming, removing or archiving; shared by WorkspaceService and
+ * the services split out of it (not a `CoreServices` field).
+ */
+export class WorkspaceLifecycleGatesTag extends Context.Service<
+  WorkspaceLifecycleGatesTag,
+  WorkspaceLifecycleGates
+>()("xum/WorkspaceLifecycleGates") {}
 /** Late-bound collaborators of the turn request builder (a mutable record, filled by wiring). */
 export class TurnRequestBuilderBindingsTag extends Context.Service<
   TurnRequestBuilderBindingsTag,
@@ -367,7 +376,7 @@ export type RuntimeSeamTags = EffectRunnerTag | HostClockTag | AppFiberScopeTag;
 
 /**
  * Everything `CoreLive` (./layers/core.ts) provides: every `CoreServices`
- * field plus the graph-internal `TerminalAttentionStore`.
+ * field plus the graph-internal `TerminalAttentionStore` and `WorkspaceLifecycleGates`.
  */
 export type CoreTags =
   | ContextManagement
@@ -393,6 +402,7 @@ export type CoreTags =
   | MemoryConsolidation
   | DesktopInputCoordinatorTag
   | TerminalAttentionStoreTag
+  | WorkspaceLifecycleGatesTag
   | TurnRequestBuilderBindingsTag;
 
 /**
