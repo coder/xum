@@ -110,7 +110,8 @@ describe("artifact interactions", () => {
       version: null,
       text: "hi",
     });
-    expect(result.success).toBe(false);
+    // The error text reaches the Artifacts tab as is (not JSON-quoted).
+    expect(result).toEqual(Err("busy"));
     expect(await pendingIds()).toEqual([]);
   });
 
@@ -247,17 +248,18 @@ describe("artifact interactions", () => {
     expect(await pendingIds()).toEqual([]);
   });
 
-  test("an acceptance whose record removal fails still reports the send as failed", async () => {
-    // The session withdraws a send whose onAccepted throws, so it must not count as delivered.
+  test("an accepted send whose record removal fails is sent, and the next startup drops the record", async () => {
+    // AgentSession keeps an accepted row even when onAccepted throws; it returns Err for the turn.
     const failingRemoval: ArtifactInteractionDeps = {
       ...deps(),
-      sendMessage: async (_workspaceId, _message, _options, internal) => {
+      sendMessage: async (_workspaceId, message, options, internal) => {
+        sent.push({ message, options: options as Record<string, unknown>, internal: internal! });
         await fs.chmod(sessionDir, 0o500);
         try {
           await internal?.onAccepted?.();
           return Ok(undefined);
         } catch {
-          return Err("withdrawn");
+          return Err("accept callback failed");
         } finally {
           await fs.chmod(sessionDir, 0o700);
         }
@@ -269,7 +271,27 @@ describe("artifact interactions", () => {
       version: 0,
       text: "x",
     });
-    expect(result).toEqual(Err("withdrawn"));
+    expect(result).toEqual(Ok({ id: "id-1" }));
+    expect(await pendingIds()).toEqual(["id-1"]);
+
+    // The row is in history, so replay drops the leftover record instead of re-sending it.
+    history = [
+      createMuxMessage("m1", "user", "x", {
+        muxMetadata: {
+          type: "normal",
+          artifactInteraction: {
+            id: "id-1",
+            artifactPath: "a.html",
+            title: "a.html",
+            version: 0,
+            action: "send",
+            text: "x",
+          },
+        },
+      }),
+    ];
+    expect(await replayPendingArtifactInteractions(deps(), WS)).toBe(0);
+    expect(sent).toHaveLength(1);
     expect(await pendingIds()).toEqual([]);
   });
 
