@@ -471,6 +471,7 @@ import { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
 import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
 import { SendPreflight } from "@/node/services/sendPreflight";
 import { ContextMutationGate } from "@/node/services/contextMutationGate";
+import { BashMonitorActivity } from "@/node/services/bashMonitorActivity";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
@@ -2695,54 +2696,17 @@ export class WorkspaceService
   ): void => {
     this.bashMonitorPersistence.onMonitorStopped(workspaceId, payload);
   };
-  // Last armed-monitor count successfully broadcast per workspace, so background process
-  // churn that doesn't change the count (e.g. a monitorless bash exiting) skips the
-  // activity re-emit. A missing entry means "unknown" (never successfully emitted), which
-  // must never dedupe: renderers may have bootstrapped a non-zero count from
-  // getActivityList(), so suppressing an unknown->0 transition would strand the sidebar.
-  private readonly lastEmittedBashMonitorCounts = new Map<string, number>();
-  // Workspaces where an armed monitor has ever been observed (by the change listener or
-  // a getActivityList read). Deliberately never pruned and kept separate from the dedupe
-  // map above: the dedupe entry is dropped while emits are in flight or failed, but the
-  // tombstone decision in getActivityList must survive those windows, otherwise a
-  // renderer that bootstrapped a non-zero count can never see the zero-count clear.
-  private readonly bashMonitorSeenWorkspaces = new Set<string>();
+  // Activity emits for bash monitor counts (the dedupe map and the seen set behind the
+  // zero-count tombstone). Lives in BashMonitorActivity; the closures read this service's live
+  // count, the extension metadata and the activity emitter at call time.
+  private readonly bashMonitorActivity = new BashMonitorActivity({
+    getActiveBashMonitorCount: (workspaceId) => this.getActiveBashMonitorCount(workspaceId),
+    getSnapshot: (workspaceId, options) => this.extensionMetadata.getSnapshot(workspaceId, options),
+    emitWorkspaceActivity: (workspaceId, snapshot) =>
+      this.emitWorkspaceActivity(workspaceId, snapshot),
+  });
   private readonly bashProcessChangeListener = (workspaceId: string): void => {
-    const count = this.getActiveBashMonitorCount(workspaceId);
-    if (count > 0) {
-      this.bashMonitorSeenWorkspaces.add(workspaceId);
-    }
-    if (this.lastEmittedBashMonitorCounts.get(workspaceId) === count) {
-      return;
-    }
-    // Clear the entry synchronously BEFORE the async emit: while an emit is in flight
-    // the last delivered count is unknown (the snapshot read may fail, and renderers
-    // may observe transient counts via workspace.activity.list()). Deleting up front
-    // means a concurrent change event — e.g. a stop racing a slow armed emit in a fast
-    // 0 -> 1 -> 0 sequence — can never dedupe against a stale pre-emit value and drop
-    // the clear. Cost: an occasional duplicate emit, which renderers apply idempotently.
-    this.lastEmittedBashMonitorCounts.delete(workspaceId);
-    void this.extensionMetadata
-      // Strict: emitting a suspect (partial-main) snapshot after a failed
-      // sidecar reconcile would clear goal/status in the renderer; the
-      // catch below already retains "unknown" and re-emits on next change.
-      .getSnapshot(workspaceId, { throwOnError: true })
-      .then((snapshot) => {
-        this.emitWorkspaceActivity(workspaceId, snapshot);
-        // Record only after a successful emit. Re-read the count because the emit merges
-        // the live value, which may have moved past the one that triggered this listener.
-        this.lastEmittedBashMonitorCounts.set(
-          workspaceId,
-          this.getActiveBashMonitorCount(workspaceId)
-        );
-      })
-      .catch((error: unknown) => {
-        // Leave the entry absent ("unknown") so the next change event always re-emits.
-        log.debug("Failed to emit activity after background bash monitor change", {
-          workspaceId,
-          error,
-        });
-      });
+    this.bashMonitorActivity.onProcessChange(workspaceId);
   };
 
   // Debounce post-compaction metadata refreshes (file_edit_* can fire rapidly)
@@ -18776,7 +18740,7 @@ export class WorkspaceService
    */
   private evictWorkspaceActivityCaches(workspaceId: string): void {
     this.workflowRuns.evictWorkflowRunCaches(workspaceId);
-    this.bashMonitorSeenWorkspaces.delete(workspaceId);
+    this.bashMonitorActivity.evictSeenWorkspace(workspaceId);
   }
 
   /**
@@ -18962,7 +18926,7 @@ export class WorkspaceService
           for (const workspaceId of this.workflowRuns.cachedWorkspaceIds()) {
             workspaceIds.add(workspaceId);
           }
-          for (const workspaceId of this.bashMonitorSeenWorkspaces) {
+          for (const workspaceId of this.bashMonitorActivity.seenWorkspaceIds()) {
             workspaceIds.add(workspaceId);
           }
           for (const workspaceId of this.workflowRuns.seenWorkspaceIds()) {
@@ -19013,7 +18977,7 @@ export class WorkspaceService
             // surface a zero-count entry here, otherwise the renderer's last-known
             // "watching" state survives reconnect. The seen-set is used instead of the
             // dedupe map because dedupe entries are dropped around in-flight/failed emits.
-            const hadBashMonitorActivityCache = this.bashMonitorSeenWorkspaces.has(workspaceId);
+            const hadBashMonitorActivityCache = this.bashMonitorActivity.hasSeen(workspaceId);
             const activeWorkflowRunIds =
               await this.workflowRuns.getActiveWorkflowRunIds(workspaceId);
             const activeWorkflowRunCount = activeWorkflowRunIds.size;
@@ -19021,7 +18985,7 @@ export class WorkspaceService
             if (activeBashMonitorCount > 0) {
               // A list-delivered non-zero count is a renderer-visible observation too:
               // remember it so the eventual stop always yields a tombstone entry.
-              this.bashMonitorSeenWorkspaces.add(workspaceId);
+              this.bashMonitorActivity.markSeen(workspaceId);
             }
             // Keep a zero-count tombstone for workspaces whose workflow- or monitor-only
             // activity was cleared while a frontend activity subscription was disconnected.
