@@ -366,3 +366,73 @@ describe("AgentSession queue-cut receipts", () => {
     }
   });
 });
+
+// F182 (unverified suspicion): the cut skips an entry whose own admissionStale probe is true and
+// names the next live tool-end entry X. The drain's dequeue gate refuses only turnAdmission
+// staleness, so the stale head W claims a turn and X's receipt waits for a later drain.
+describe("AgentSession queue-cut receipts with a stale head", () => {
+  test("a stale head claims no turn and the cut entry dispatches in the same drain", async () => {
+    const h = await setup();
+    try {
+      let staleHeadFailures = 0;
+      h.session.queueMessage(
+        "stale head",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          acceptanceOrigin: "automatic",
+          synthetic: true,
+          admissionStale: () => true,
+          onAcceptedPreStreamFailure: () => {
+            staleHeadFailures += 1;
+          },
+        }
+      );
+      h.session.queueMessage("continue", { model: TEST_MODEL, agentId: "exec" });
+      const cut = h.session.getQueuedInputStopCause();
+      expect(cut).toBeDefined();
+      const entryId = cut!.entryId;
+      const phases: string[] = [];
+      h.session.onChatEvent(({ message }) => {
+        if (message.type === "stream-lifecycle") phases.push(message.phase);
+      });
+      const sends: string[] = [];
+      const send = h.session.sendMessage.bind(h.session);
+      const spy = spyOn(h.session, "sendMessage").mockImplementation((message, ...rest) => {
+        sends.push(message);
+        return send(message, ...rest);
+      });
+
+      h.session.sendQueuedMessages();
+      // One drain: no idle re-drain is allowed to rescue the cut entry.
+      const successorAfterDrain = h.session.getQueueCutReceipt(entryId)?.successor;
+      const dispatched = await Promise.race([
+        h.firstRequest.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5_000)),
+      ]);
+      spy.mockRestore();
+
+      const successorKind = (successor: unknown) =>
+        typeof successor === "object" && successor !== null
+          ? (successor as { kind: string }).kind
+          : successor;
+      expect({
+        sends,
+        phases,
+        successorAfterDrain: successorKind(successorAfterDrain),
+        dispatched,
+        finalSuccessor: successorKind(h.session.getQueueCutReceipt(entryId)?.successor),
+      }).toEqual({
+        // W is withdrawn: only X is sent, and only X's turn reaches the lifecycle.
+        sends: ["continue"],
+        phases: ["preparing", "streaming"],
+        successorAfterDrain: "admitted",
+        dispatched: true,
+        finalSuccessor: "streaming",
+      });
+      // W's enqueuer still hears its refusal exactly once (existing stale-entry contract).
+      expect(staleHeadFailures).toBe(1);
+    } finally {
+      await teardown(h);
+    }
+  });
+});
