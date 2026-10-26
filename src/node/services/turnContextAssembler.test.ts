@@ -28,6 +28,7 @@ import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
+import { createFileChangeNotificationMessage } from "./utils/fileChangeTracker";
 import { createContextBudgetWarning } from "./contextWindowRollover";
 import { extractToolInstructionsFromSources } from "./systemMessage";
 
@@ -1506,6 +1507,81 @@ describe("assemblePromptPayload", () => {
     expect(attached.messages).toHaveLength(plain.messages.length);
     const request = JSON.stringify(attached.messages.at(-1));
     expect(request.indexOf("ATTACHED PLAN")).toBeLessThan(request.indexOf("second"));
+  });
+
+  test("post-compaction attachments keep their place when a file-change row is the newest", async () => {
+    // F37: AgentSession appends the durable <system-file-update> row before it reads the
+    // history, so it is the newest user row. Every rebuild of the turn (a retry after the
+    // committed assistant row, a budget warning appended mid-turn) and the plain request
+    // keep the rows before the turn's request, and the retry extends the first request.
+    const opus = {
+      modelString: "anthropic:claude-opus-5-5",
+      providerForMessages: "anthropic",
+      routeProvider: "anthropic",
+    };
+    const summary = createMuxMessage("summary", "assistant", "Compacted summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const notification = createFileChangeNotificationMessage([
+      { type: "edited_text_file", filename: "src/a.ts", snippet: "@@ -1 +1 @@" },
+    ]);
+    const turn = [
+      summary,
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer 1"),
+      createMuxMessage("u2", "user", "second"),
+      notification,
+    ];
+    const attachments = [
+      { type: "plan_file_reference" as const, planFilePath: "/p.md", planContent: "ATTACHED PLAN" },
+    ];
+    const send = (history: MuxMessage[], withAttachments = true) =>
+      assemble({
+        ...opus,
+        history,
+        systemMessage: "stable instructions",
+        postCompactionAttachments: withAttachments ? attachments : null,
+      });
+    const rows = (payload: Awaited<ReturnType<typeof send>>, count: number) =>
+      JSON.stringify(payload.messages.slice(0, count), (key, value: unknown) =>
+        key === "providerOptions" ? undefined : value
+      );
+
+    const first = await send(turn);
+    const before = first.messages.length - 1;
+    const request = JSON.stringify(first.messages.at(-1));
+    expect(request.indexOf("second")).toBeLessThan(request.indexOf("ATTACHED PLAN"));
+    expect(request.indexOf("ATTACHED PLAN")).toBeLessThan(request.indexOf("system-file-update"));
+
+    const retry = await send([...turn, createMuxMessage("a2", "assistant", "partial answer")]);
+    expect(rows(retry, first.messages.length)).toBe(rows(first, first.messages.length));
+    const warned = await send([
+      ...turn,
+      createContextBudgetWarning({
+        contextTokens: 80_000,
+        maxTokens: 128_000,
+        budgetTokens: 96_000,
+        sessionHistoryAvailable: true,
+        handoff: true,
+      }),
+    ]);
+    expect(rows(warned, before)).toBe(rows(first, before));
+    expect(JSON.stringify(warned.messages.at(-1))).toContain("ATTACHED PLAN");
+    for (const plain of [
+      await send(turn, false),
+      await send(
+        [
+          ...turn,
+          createMuxMessage("a2", "assistant", "answer 2"),
+          createMuxMessage("u3", "user", "third"),
+        ],
+        false
+      ),
+    ]) {
+      expect(rows(plain, before)).toBe(rows(first, before));
+    }
   });
 
   test("token budget tags persisted user rows with their session_history item ID", async () => {
