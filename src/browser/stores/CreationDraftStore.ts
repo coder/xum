@@ -277,19 +277,17 @@ export class CreationDraftStore {
   private listedClient: APIClient | null = null;
   private readonly blankIds = new Map<string, string>();
   /**
-   * Deletes the backend has not confirmed (#7551): retried on failure and on each new client,
-   * and their listed records stay hidden. In memory only, as DraftStore's were before #6620.
+   * Deletes the backend has not confirmed (#7551): retried on failure and on each new client.
+   * In memory only, as DraftStore's were before #6620.
    */
   private readonly pendingDeletes = new Set<string>();
   /**
-   * Ids deleted in this session, confirmed or not: a list never shows them, even one read before
-   * the delete that lands after it. An edit (save) brings the draft back.
+   * Ids deleted in this session, confirmed or not. A delete is final: a list never shows them (even
+   * one read before the delete), and opening one again gives a blank draft.
    */
   private readonly deletedIds = new Set<string>();
   /** Backoff timers of failed deletes. A new client (or none) clears them: it retries at once. */
   private readonly deleteTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Delete requests still running (settles, never rejects): a save of the same id waits. */
-  private readonly deletesInFlight = new Map<string, Promise<void>>();
 
   constructor() {
     // The save debounce is the only unload risk (main wrote localStorage at once): save as soon
@@ -378,6 +376,7 @@ export class CreationDraftStore {
       // A local copy is newer than the backend's row, and a first save still running (the list
       // can land after its timeout) has no row yet.
       for (const [id, entry] of this.entries) {
+        if (this.deletedIds.has(id)) continue;
         if (entry.draft && (entry.persisted || entry.view.unsaved))
           this.summaries.set(id, summarizeCreationDraft(entry.draft));
       }
@@ -447,6 +446,13 @@ export class CreationDraftStore {
    */
   open(id: string, projectPath: string, subProjectPath: string | null = null): void {
     if (this.entries.has(id)) return;
+    if (this.deletedIds.has(id)) {
+      // Not read back: a pending delete still holds the sent record (#7551).
+      const blank = createBlankCreationDraft(id, projectPath, subProjectPath);
+      this.entries.set(id, this.newEntry(blank, { status: "ready" }, false));
+      this.notify(id);
+      return;
+    }
     const entry = this.newEntry(null, { status: "loading" }, true);
     entry.blank = { projectPath, subProjectPath };
     this.entries.set(id, entry);
@@ -570,22 +576,13 @@ export class CreationDraftStore {
     const draft = entry.draft;
     if (!draft) return;
     const { id: _id, ...all } = draft;
-    // A delete still running can remove the record first: save it whole, after that delete.
-    const deleting = this.deletesInFlight.get(id);
-    const patch = entry.persisted && !deleting ? entry.pending : all;
-    // Editing a draft whose delete is unconfirmed cancels that delete: a later retry would
-    // remove the new edits.
-    this.pendingDeletes.delete(id);
-    this.deletedIds.delete(id);
-    this.clearDeleteTimer(id);
+    const patch = entry.persisted ? entry.pending : all;
     entry.pending = {};
     entry.saving = true;
     this.recompute(id, entry);
     const client = this.client;
     try {
       if (!client) throw new Error("Not connected.");
-      // Only when one runs: the page-hide flush must send its request before the page goes.
-      if (deleting) await deleting;
       await client.drafts.updateCreation({
         scope: { kind: "creation", draftId: id },
         ...patch,
@@ -594,8 +591,10 @@ export class CreationDraftStore {
       entry.persisted = true;
       entry.saveError = null;
       if (this.entries.get(id) !== entry) return;
-      this.summaries.set(id, summarizeCreationDraft(entry.draft ?? draft));
-      this.recomputeList();
+      if (!this.deletedIds.has(id)) {
+        this.summaries.set(id, summarizeCreationDraft(entry.draft ?? draft));
+        this.recomputeList();
+      }
     } catch (error) {
       entry.saving = false;
       if (this.entries.get(id) !== entry) return;
@@ -638,8 +637,6 @@ export class CreationDraftStore {
     // Let a save in flight land first, so it cannot recreate the file after the delete. Pending
     // (resent by a new client) only after it: a resend must not overtake that save either.
     await entry?.inFlight;
-    // An edit during the wait cancelled the delete.
-    if (!this.deletedIds.has(id)) return;
     this.pendingDeletes.add(id);
     await this.sendDelete(id, 0);
   }
@@ -648,35 +645,20 @@ export class CreationDraftStore {
     const client = this.client;
     // Without a client the next one retries it (setClient).
     if (!client || !this.pendingDeletes.has(id)) return;
-    const request = client.drafts.deleteCreation({ scope: { kind: "creation", draftId: id } });
-    const running: Promise<void> = Promise.allSettled([this.deletesInFlight.get(id), request]).then(
-      () => {
-        if (this.deletesInFlight.get(id) === running) this.deletesInFlight.delete(id);
-      }
-    );
-    this.deletesInFlight.set(id, running);
     try {
-      await request;
+      await client.drafts.deleteCreation({ scope: { kind: "creation", draftId: id } });
       this.pendingDeletes.delete(id);
-      // A list that was read before the delete must not show the record again.
-      if (this.summaries.delete(id)) this.recomputeList();
     } catch (error) {
       console.warn("Failed to delete a creation draft; retrying:", error);
       // A client change while the request ran already resent it (setClient).
       if (this.client !== client || !this.pendingDeletes.has(id)) return;
-      this.clearDeleteTimer(id);
+      clearTimeout(this.deleteTimers.get(id));
       const timer = setTimeout(() => {
         this.deleteTimers.delete(id);
         this.sendDelete(id, attempt + 1).catch(() => undefined);
       }, retryDelayMs(attempt));
       this.deleteTimers.set(id, timer);
     }
-  }
-
-  private clearDeleteTimer(id: string): void {
-    const timer = this.deleteTimers.get(id);
-    if (timer) clearTimeout(timer);
-    this.deleteTimers.delete(id);
   }
 
   /** Drop local state of a removed project's drafts (the backend deletes their records). */
