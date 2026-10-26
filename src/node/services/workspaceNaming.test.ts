@@ -48,7 +48,8 @@ describe("WorkspaceNaming", () => {
     const wait = naming.waitForCreationNaming("ws-a").then((result) => {
       waited = result;
     });
-    await Promise.resolve();
+    // A full timer tick: every microtask chain of an already settled wait has run by then.
+    await new Promise((resolve) => setTimeout(resolve, 0));
     expect(waited).toBeUndefined();
 
     settle();
