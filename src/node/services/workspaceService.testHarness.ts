@@ -6,8 +6,12 @@ import { WorkspaceService } from "./workspaceService";
 import {
   createAgentSessionAIServiceFake,
   createStreamLifecycleMocks,
+  createTestStreamManager,
+  type AgentSessionAIServiceFake,
+  type StreamLifecycle,
 } from "./agentSession.testHarness";
-import type { AgentSession, AgentSessionAIService } from "./agentSession";
+import type { StreamManager } from "./streamManager";
+import type { AgentSession } from "./agentSession";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { defaultEffectRunner } from "./di/effectRunner";
 import { Exit, Scope } from "effect";
@@ -148,6 +152,15 @@ export function createWorkspaceServiceForTest(
   const config = options.config;
   const historyService = options.historyService ?? new HistoryService(config);
   const aiService = options.aiService ?? createMockAIService();
+  // The sessions' stream lifecycle answers from the AI fake (createMockAIService implements it),
+  // so tests drive streaming state through the fake they already hold.
+  const streamManager =
+    options.streamManager ??
+    (createTestStreamManager(
+      aiService as unknown as StreamLifecycle,
+      options.effectRunner,
+      options.hostClock
+    ) as unknown as StreamManager);
   return new WorkspaceService(
     config,
     historyService,
@@ -167,7 +180,7 @@ export function createWorkspaceServiceForTest(
     options.telemetryService,
     options.experimentsService,
     options.sessionTimingService,
-    options.streamManager,
+    streamManager,
     options.secretsStore,
     undefined,
     undefined,
@@ -278,7 +291,7 @@ export type RealHostWorkspaceServiceOptions = Omit<
 };
 
 /** The AIService members a real-host WorkspaceService and its sessions call. */
-export type RealHostAIService = AgentSessionAIService &
+export type RealHostAIService = AgentSessionAIServiceFake &
   Pick<AIService, "getAutomaticGoalTurnAgentRefusal">;
 
 export interface RealHostWorkspaceService extends AsyncDisposable {

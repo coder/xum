@@ -3,7 +3,7 @@ import { expect, spyOn, test } from "bun:test";
 import { createMuxMessage } from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
-import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createTestStreamManager } from "./agentSession.testHarness";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 
 const options = { model: "openai:gpt-4o", agentId: "exec" };
@@ -14,7 +14,7 @@ const options = { model: "openai:gpt-4o", agentId: "exec" };
 test("cleanup() stops a pending auto-retry: no retry and no use lease after cleanup", async () => {
   const workspaceId = "harness-cleanup-retry";
   const clock = makeTestEffectRunner();
-  const streamManager = { ...createStreamLifecycleMocks(), effectRunner: clock.runner };
+  const streamManager = createTestStreamManager(undefined, clock.runner);
   const h = await createAgentSessionHarness({ workspaceId, streamManager });
   try {
     await h.historyService.appendToHistory(
