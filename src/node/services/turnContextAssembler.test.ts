@@ -1431,6 +1431,60 @@ describe("assemblePromptPayload", () => {
     expect(JSON.stringify(payload.messages[1])).toContain("approved plan body");
   });
 
+  test("post-compaction attachments leave every row before the newest request unchanged", async () => {
+    // F34: the attachments are request-only and come back every few turns for the segment.
+    // After the compaction summary they rewrote the cached history on the turn they appeared
+    // and again on the next turn, when they were gone.
+    const opus = {
+      modelString: "anthropic:claude-opus-5-5",
+      providerForMessages: "anthropic",
+      routeProvider: "anthropic",
+    };
+    const summary = createMuxMessage("summary", "assistant", "Compacted summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const [u1, a1, u2, a2, u3] = [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer 1"),
+      createMuxMessage("u2", "user", "second"),
+      createMuxMessage("a2", "assistant", "answer 2"),
+      createMuxMessage("u3", "user", "third"),
+    ];
+    const attachments = [
+      {
+        type: "plan_file_reference" as const,
+        planFilePath: "/tmp/plan.md",
+        planContent: "ATTACHED PLAN",
+      },
+    ];
+    const send = (history: MuxMessage[], withAttachments: boolean) =>
+      assemble({
+        ...opus,
+        history,
+        systemMessage: "stable instructions",
+        postCompactionAttachments: withAttachments ? attachments : null,
+      });
+    const rows = (payload: Awaited<ReturnType<typeof send>>, count: number) =>
+      JSON.stringify(payload.messages.slice(0, count), (key, value: unknown) =>
+        key === "providerOptions" ? undefined : value
+      );
+
+    const plain = await send([summary, u1, a1, u2], false);
+    const attached = await send([summary, u1, a1, u2], true);
+    const next = await send([summary, u1, a1, u2, a2, u3], false);
+    // The cached system row, the summary, u1 and a1 come before the newest request (u2).
+    const before = plain.messages.length - 1;
+    expect(JSON.stringify(plain.messages.at(-1))).toContain("second");
+    expect(rows(attached, before)).toBe(rows(plain, before));
+    expect(rows(next, before)).toBe(rows(attached, before));
+    // The newest request carries the attachments, first.
+    expect(attached.messages).toHaveLength(plain.messages.length);
+    const request = JSON.stringify(attached.messages.at(-1));
+    expect(request.indexOf("ATTACHED PLAN")).toBeLessThan(request.indexOf("second"));
+  });
+
   test("token budget tags persisted user rows with their session_history item ID", async () => {
     const request = createMuxMessage("request", "user", "fix the bug", { historySequence: 7 });
     const reply = createMuxMessage("reply", "assistant", "on it", { historySequence: 8 });
