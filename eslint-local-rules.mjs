@@ -1853,11 +1853,13 @@ const localPlugin = {
     // passes; any other delay (a constant, `DELAY_MS + 50`) counts as a fixed wait.
     //
     // The rule sees `setTimeout(resolve, delay)` inside a Promise executor and `Bun.sleep(delay)`.
-    // A wait inside a same-file helper (a function declaration or a const, also through an
+    // Each wait inside a same-file helper (a function declaration or a const, also through an
     // `act()` callback) counts once per call of the helper. When the helper passes one of its
-    // parameters as the delay, the argument (or the parameter's default) decides. Limits: it
-    // does not follow imported helpers, a helper that only another helper calls (that call
-    // counts once), or other timer APIs.
+    // parameters as the delay, the argument (or the parameter's default) decides. A wait with an
+    // `eslint-disable-next-line` or `eslint-disable-line` comment for this rule does not use up
+    // the file's allow count, wherever it sits. Limits: it does not follow imported helpers, a
+    // helper that only another helper calls (that call counts once), block disable comments, or
+    // other timer APIs.
     "no-fixed-sleep": {
       meta: {
         type: "problem",
@@ -1887,8 +1889,8 @@ const localPlugin = {
         const relFile = path.relative(context.cwd, context.filename).split(path.sep).join("/");
         const allowed = context.options[0]?.allow?.[relFile] ?? 0;
         const found = [];
-        // Helper function -> how its calls wait: `{ paramIndex }` (the call's argument decides)
-        // or `{ delay }` (every call waits that long).
+        // Helper function -> the waits each call runs: `{ paramIndex }` (the call's argument
+        // decides) or `{ delay }` (every call waits that long).
         const helpers = new Map();
         // The delay as shown in the message, or null for a yield: no delay, or a literal under
         // MIN_MS. Any other expression is a fixed wait as far as the rule can tell.
@@ -1908,21 +1910,21 @@ const localPlugin = {
           while (current && !isFunction(current)) current = current.parent;
           return current ?? null;
         };
-        // `resolve` itself, `() => resolve()` or `() => { resolve(); }`.
+        // `resolve` itself, `() => resolve()`, or a block that calls `resolve()` among other
+        // statements (`() => { cleanup(); resolve(); }`).
         const callsResolve = (callback, resolveName) => {
           if (callback?.type === "Identifier") return callback.name === resolveName;
           if (!isFunction(callback)) return false;
-          const body =
-            callback.body.type === "BlockStatement" &&
-            callback.body.body.length === 1 &&
-            callback.body.body[0].type === "ExpressionStatement"
-              ? callback.body.body[0].expression
-              : callback.body;
-          return (
-            body.type === "CallExpression" &&
-            body.callee.type === "Identifier" &&
-            body.callee.name === resolveName
-          );
+          const isResolveCall = (node) =>
+            node?.type === "CallExpression" &&
+            node.callee.type === "Identifier" &&
+            node.callee.name === resolveName;
+          return callback.body.type === "BlockStatement"
+            ? callback.body.body.some(
+                (statement) =>
+                  statement.type === "ExpressionStatement" && isResolveCall(statement.expression)
+              )
+            : isResolveCall(callback.body);
         };
         // The executor of `new Promise(executor)` that `node` (a setTimeout call) runs in.
         const promiseExecutor = (node) => {
@@ -1943,11 +1945,11 @@ const localPlugin = {
                 fn.parent.id.type === "Identifier"
               ? fn.parent
               : null;
-        // The named helper whose calls run the wait in `promise`: the function around it, or the
+        // The named helper whose calls run the wait at `node`: the function around it, or the
         // function around the `act()` call whose callback holds it. Null for a wait written in
         // a test body.
-        const helperOf = (promise) => {
-          let fn = enclosingFunction(promise);
+        const helperOf = (node) => {
+          let fn = enclosingFunction(node);
           const call = fn?.parent;
           if (
             call?.type === "CallExpression" &&
@@ -1962,12 +1964,42 @@ const localPlugin = {
         const paramName = (param) =>
           param.type === "AssignmentPattern" ? param.left.name : param.name;
         const report = (node, delay) => found.push({ node, delay });
+        // A wait at `anchor` (the Promise of a timer wait, or the Bun.sleep call) with
+        // `delayNode`: a helper's waits count at its calls, any other at `reportNode`.
+        const recordWait = (anchor, delayNode, reportNode) => {
+          const helper = helperOf(anchor);
+          const paramIndex =
+            delayNode?.type === "Identifier"
+              ? (helper?.params.findIndex((param) => paramName(param) === delayNode.name) ?? -1)
+              : -1;
+          const delay = paramIndex >= 0 ? null : fixedDelay(delayNode);
+          if (paramIndex < 0 && delay === null) return;
+          if (!helper) {
+            report(reportNode, delay);
+            return;
+          }
+          if (!helpers.has(helper)) helpers.set(helper, []);
+          helpers.get(helper).push(paramIndex >= 0 ? { paramIndex } : { delay, node: reportNode });
+        };
+        // Lines whose waits carry a reasoned disable comment for this rule.
+        const disabledLines = new Set();
+        for (const comment of sourceCode.getAllComments()) {
+          const match = /^\s*eslint-disable-(next-)?line\s+([^]*?)(?:\s--[^]*)?$/.exec(
+            comment.value
+          );
+          if (
+            !match ||
+            !match[2].split(",").some((rule) => rule.trim() === "local/no-fixed-sleep")
+          ) {
+            continue;
+          }
+          disabledLines.add(match[1] ? comment.loc.end.line + 1 : comment.loc.start.line);
+        }
         return {
           CallExpression(node) {
             const callee = node.callee;
             if (memberName(callee) === "sleep" && isHostGlobal(sourceCode, callee.object, "Bun")) {
-              const delay = fixedDelay(node.arguments[0]);
-              if (delay !== null) report(node, delay);
+              recordWait(node, node.arguments[0], node);
               return;
             }
             const isTimer =
@@ -1979,52 +2011,53 @@ const localPlugin = {
             if (executor === null || !callsResolve(node.arguments[0], executor.params[0].name)) {
               return;
             }
-            const delayNode = node.arguments[1];
-            const helper = helperOf(executor.parent);
-            const paramIndex =
-              delayNode?.type === "Identifier"
-                ? (helper?.params.findIndex((param) => paramName(param) === delayNode.name) ?? -1)
-                : -1;
-            if (paramIndex >= 0) {
-              helpers.set(helper, { paramIndex });
-              return;
-            }
-            const delay = fixedDelay(delayNode);
-            if (delay === null) return;
-            if (helper) helpers.set(helper, { delay });
-            else report(node, delay);
+            recordWait(executor.parent, node.arguments[1], node);
           },
           "Program:exit"(program) {
-            for (const [helper, wait] of helpers) {
+            for (const [helper, waits] of helpers) {
               const declaration = namingDeclaration(helper);
               const variable = sourceCode
                 .getDeclaredVariables(declaration)
                 .find((candidate) => candidate.name === declaration.id.name);
-              const param = wait.paramIndex === undefined ? null : helper.params[wait.paramIndex];
-              for (const reference of variable?.references ?? []) {
-                const call = reference.identifier.parent;
-                if (call?.type !== "CallExpression" || call.callee !== reference.identifier)
-                  continue;
-                let delay = wait.delay;
-                if (param) {
-                  const argument = call.arguments[wait.paramIndex];
-                  delay = fixedDelay(
-                    argument ?? (param.type === "AssignmentPattern" ? param.right : null)
-                  );
+              const calls = (variable?.references ?? [])
+                .map((reference) => reference.identifier)
+                .filter((id) => id.parent?.type === "CallExpression" && id.parent.callee === id)
+                .map((id) => id.parent);
+              // A helper that nothing in the file calls (an exported function, one passed by
+              // reference) still waits when it runs: count each fixed wait in it once.
+              if (calls.length === 0) {
+                for (const wait of waits) {
+                  if (wait.delay != null) report(wait.node, wait.delay);
                 }
-                if (delay != null) report(call, delay);
+              }
+              for (const call of calls) {
+                for (const wait of waits) {
+                  let delay = wait.delay;
+                  if (wait.paramIndex !== undefined) {
+                    const param = helper.params[wait.paramIndex];
+                    delay = fixedDelay(
+                      call.arguments[wait.paramIndex] ??
+                        (param.type === "AssignmentPattern" ? param.right : null)
+                    );
+                  }
+                  if (delay != null) report(call, delay);
+                }
               }
             }
+            // A disabled wait is still reported, so ESLint drops it and its directive counts as
+            // used, but it does not use up the allow entry.
+            const disabled = found.filter(({ node }) => disabledLines.has(node.loc.start.line));
+            const counted = found.filter(({ node }) => !disabledLines.has(node.loc.start.line));
             // The allow entry is an exact count, so it can only go down (as in no-raw-clock).
-            found.sort((a, b) => a.node.range[0] - b.node.range[0]);
-            for (const { node, delay } of found.slice(allowed)) {
+            counted.sort((a, b) => a.node.range[0] - b.node.range[0]);
+            for (const { node, delay } of [...disabled, ...counted.slice(allowed)]) {
               context.report({ node, messageId: "sleep", data: { delay } });
             }
-            if (found.length < allowed) {
+            if (counted.length < allowed) {
               context.report({
                 node: program,
                 messageId: "lowerAllow",
-                data: { found: String(found.length), allowed: String(allowed) },
+                data: { found: String(counted.length), allowed: String(allowed) },
               });
             }
           },

@@ -1539,6 +1539,7 @@
               "tests/ui/chat/stopRestoreQueuedDraft.test.ts": 1,
               "tests/ui/chat/streamInterrupt.test.ts": 1,
               "tests/ui/chat/unreadIndicator.test.ts": 2,
+              "tests/ui/helpers.ts": 1,
               "tests/ui/layout/rightSidebar.test.ts": 1,
               "tests/ui/review/refresh.test.ts": 2,
               "tests/ui/review/sendAfterFailedSubscription.test.ts": 1,

@@ -41,6 +41,7 @@ test("reports a fixed wait of 20 ms or more in each spelling", () => {
     `await new Promise((resolve) => setTimeout(resolve, 20));`,
     `await new Promise<void>((r) => { setTimeout(r, 1_000); });`,
     `await new Promise((resolve) => setTimeout(() => resolve(undefined), 50));`,
+    `await new Promise((resolve) => setTimeout(() => { cleanup(); resolve(); }, 100));`,
     `await new Promise((resolve) => window.setTimeout(resolve, 50));`,
     `await act(() => new Promise((resolve) => setTimeout(resolve, 50)));`,
     `await Bun.sleep(20);`,
@@ -68,9 +69,17 @@ test("a delay the rule cannot prove short counts as a fixed wait", () => {
 test("a helper with a fixed delay counts once per call", () => {
   const helper = `const waitForThrottle = () => new Promise((resolve) => setTimeout(resolve, 120));`;
   expect(reportCount(`${helper}\nawait waitForThrottle();\nawait waitForThrottle();`)).toBe(2);
+  // A helper that nothing here calls (exported, or passed by reference) counts its wait once.
+  expect(reportCount(helper)).toBe(1);
+  expect(reportCount(`export async function run() {\n  await Bun.sleep(30);\n}`)).toBe(1);
   // Also through an act() callback, the shape of the reconnect suites' old flush().
   const flush = `async function flush() {\n  await act(async () => {\n    await new Promise((resolve) => setTimeout(resolve, 20));\n  });\n}`;
   expect(reportCount(`${flush}\nawait flush();\nawait flush();\nawait flush();`)).toBe(3);
+  // Bun.sleep in a helper, and a helper with two waits.
+  const pause = `async function pause() { await Bun.sleep(30); }`;
+  expect(reportCount(`${pause}\nawait pause();\nawait pause();`)).toBe(2);
+  const twoWaits = `async function both() {\n  await new Promise((r) => setTimeout(r, 30));\n  await Bun.sleep(40);\n}`;
+  expect(reportCount(`${twoWaits}\nawait both();\nawait both();`)).toBe(4);
 });
 
 test("allows yields under 20 ms, timers that do not resolve a wait, and signals", () => {
@@ -83,7 +92,6 @@ test("allows yields under 20 ms, timers that do not resolve a wait, and signals"
     `await waitFor(() => expect(calls).toBe(1), { timeout: 2000 });`,
     `function setTimeout(fn: () => void, ms: number) {}\nawait new Promise((resolve) => setTimeout(resolve, 50));`,
     `const Bun = { sleep: (_ms: number) => Promise.resolve() };\nawait Bun.sleep(20);`,
-    `const settle = () => new Promise((resolve) => setTimeout(resolve, 50));`,
   ];
   for (const code of allowed) {
     expect({ code, count: reportCount(code) }).toEqual({ code, count: 0 });
@@ -97,6 +105,17 @@ test("the allow entry is an exact count that can only go down", () => {
   expect(messages(twoWaits, { [FILE]: 1 }).map((m) => m.message)).toEqual([
     expect.stringContaining("fixed 30 ms"),
   ]);
+  // A reasoned disable keeps a new wait out of the count, wherever it sits.
+  const disable = `// eslint-disable-next-line local/no-fixed-sleep -- real disk write`;
+  expect(messages(`${disable}\nawait Bun.sleep(50);\n${twoWaits}`, { [FILE]: 2 })).toHaveLength(0);
+  expect(messages(`${twoWaits}\n${disable}\nawait Bun.sleep(50);`, { [FILE]: 2 })).toHaveLength(0);
+  expect(
+    messages(`await Bun.sleep(50); // eslint-disable-line local/no-fixed-sleep\n${twoWaits}`, {
+      [FILE]: 2,
+    })
+  ).toHaveLength(0);
+  // Without the comment, the same new wait fails.
+  expect(messages(`await Bun.sleep(50);\n${twoWaits}`, { [FILE]: 2 })).toHaveLength(1);
   // A removed wait must lower the entry.
   expect(messages(twoWaits, { [FILE]: 3 }).map((m) => m.message)).toEqual([
     expect.stringContaining("Lower the entry"),
