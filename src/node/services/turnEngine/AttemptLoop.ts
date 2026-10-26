@@ -79,7 +79,7 @@ interface StopCauseHolder {
 }
 
 /** The stream-end event of a completed stream, with its final metadata and parts. */
-export function buildStreamEndEvent(
+function buildStreamEndEvent(
   workspaceId: WorkspaceId,
   streamInfo: Pick<
     WorkspaceStreamInfo,
@@ -156,7 +156,7 @@ export function buildStreamEndEvent(
  * successful after downgrade or crash recovery: keep the internal stop cause, but persist
  * the legacy-compatible terminal signal.
  */
-export function resolveStreamEndFinishReason(
+function resolveStreamEndFinishReason(
   streamInfo: Pick<WorkspaceStreamInfo, "terminalFinishReason"> & StopCauseHolder,
   providerFinishReason: StreamEndEvent["metadata"]["finishReason"]
 ): StreamEndEvent["metadata"]["finishReason"] {

@@ -12,7 +12,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Err } from "@/common/types/result";
-import type { CompactionMonitor } from "./compactionMonitor";
+import { CompactionMonitor } from "./compactionMonitor";
 import { HistoryService } from "./historyService";
 import { log } from "./log";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
@@ -31,24 +31,21 @@ afterEach(async () => {
   }
 });
 
-/** Keep the dispatched send from being turned into another compaction by the budget monitor. */
-function quietMonitor(h: AgentSessionHarness): void {
-  (
-    h.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
-  ).contextController.compactionMonitor = {
-    checkBeforeSend: mock(() => ({
-      shouldShowWarning: false,
-      shouldForceCompact: false,
-      usagePercentage: 10,
-      thresholdPercentage: 85,
-    })),
-    checkMidStream: mock(() => false),
-    resetForNewStream: mock(() => undefined),
-    noteUserTurn: mock(() => undefined),
-    noteAutoCompactionRequested: mock(() => undefined),
-    noteAutoCompactionCompleted: mock(() => undefined),
-    suppressRepeatedAutoCompaction: mock(() => false),
-  } as unknown as CompactionMonitor;
+/**
+ * Keep the dispatched send from being turned into another compaction by the budget monitor.
+ * The spies sit on the prototype because each session builds its monitor internally (#4666);
+ * afterEach's mock.restore() removes them.
+ */
+function quietMonitor(): void {
+  spyOn(CompactionMonitor.prototype, "checkBeforeSend").mockReturnValue({
+    shouldShowWarning: false,
+    shouldForceCompact: false,
+    usagePercentage: 10,
+    thresholdPercentage: 85,
+    contextTokens: 0,
+    maxTokens: undefined,
+  });
+  spyOn(CompactionMonitor.prototype, "checkMidStream").mockReturnValue(false);
 }
 
 async function backend(from?: AgentSessionHarness): Promise<AgentSessionHarness> {
@@ -60,7 +57,7 @@ async function backend(from?: AgentSessionHarness): Promise<AgentSessionHarness>
       })
     : await createAgentSessionHarness({ workspaceId });
   harnesses.push(h);
-  quietMonitor(h);
+  quietMonitor();
   return h;
 }
 

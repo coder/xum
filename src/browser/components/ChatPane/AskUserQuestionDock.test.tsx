@@ -194,7 +194,9 @@ describe("AskUserQuestionDock", () => {
     // Both rows closed, so the dock drops the form once the send settled.
     expect(findOpenAskUserQuestions(workspaceId, messages)).toEqual([]);
     await waitFor(() =>
-      expect(view.container.querySelector('[data-component="AskUserQuestionDock"]')).toBeNull()
+      expect(view.container.querySelector('[data-component="AskUserQuestionDock"]') === null).toBe(
+        true
+      )
     );
   });
 

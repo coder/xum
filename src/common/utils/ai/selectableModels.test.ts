@@ -20,28 +20,24 @@ import {
   type SkippedModelReason,
 } from "./selectableModels";
 
-// Explicit per-provider built-in lists in KNOWN_MODELS (= picker) order. The
-// sanity test below fails loudly when the catalog changes so every expected
-// list in this file stays explicit instead of being derived from the pipeline.
+// Per-provider built-in lists, derived from KNOWN_MODELS in its (= picker) order, so a model
+// added to or renamed in the catalog needs no change here. The provider order below is
+// what the sanity test pins against BUILT_IN_MODELS.
 const ids = (...keys: KnownModelKey[]): string[] => keys.map((key) => KNOWN_MODELS[key].id);
-const ANTHROPIC = ids("FABLE", "MYTHOS", "OPUS", "SONNET", "HAIKU");
-const OPENAI = ids("GPT", "GPT_6_LUNA", "GPT_6_ASTRA");
-const GOOGLE = ids("GEMINI_31_PRO", "GEMINI_FLASH", "GEMINI_4_ARGON");
-const XAI = ids("GROK_47");
-const DEEPSEEK = ids("DEEPSEEK_V4_PRO", "DEEPSEEK_V4_FLASH");
-const MOONSHOT = ids("KIMI_K3");
-const META = ids("MUSE_WONDER");
-const ZAI = ids("GLM_53_FLASH");
-const ALL_BUILT_INS = [
-  ...ANTHROPIC,
-  ...OPENAI,
-  ...GOOGLE,
-  ...XAI,
-  ...DEEPSEEK,
-  ...MOONSHOT,
-  ...META,
-  ...ZAI,
-];
+const builtIns = (provider: (typeof KNOWN_MODELS)[KnownModelKey]["provider"]): string[] =>
+  Object.values(KNOWN_MODELS)
+    .filter((model) => model.provider === provider)
+    .map((model) => model.id);
+const ANTHROPIC = builtIns("anthropic");
+const OPENAI = builtIns("openai");
+const GOOGLE = builtIns("google");
+const XAI = builtIns("xai");
+const DEEPSEEK = builtIns("deepseek");
+const MOONSHOT = builtIns("moonshotai");
+const META = builtIns("meta");
+const ZAI = builtIns("zai");
+const PROVIDER_LISTS = [ANTHROPIC, OPENAI, GOOGLE, XAI, DEEPSEEK, MOONSHOT, META, ZAI];
+const ALL_BUILT_INS = PROVIDER_LISTS.flat();
 const OPENROUTER_ROUTABLE_BUILT_INS = [
   ...ANTHROPIC,
   ...OPENAI,
@@ -84,7 +80,10 @@ describe("computeSelectableModels", () => {
   });
 
   test("fixture lists cover the built-in catalog in picker order", () => {
+    // Fails when the catalog gains a provider or stops grouping models by provider.
     expect(ALL_BUILT_INS).toEqual(BUILT_IN_MODELS);
+    // An empty list would let that provider's expectations below pass vacuously.
+    for (const list of PROVIDER_LISTS) expect(list.length).toBeGreaterThan(0);
   });
 
   describe("custom models", () => {

@@ -27,7 +27,6 @@ export const ThemePreferenceSchema = z.enum([
   "flexoki-light",
   "flexoki-dark",
 ]);
-export type ThemePreferenceConfig = z.infer<typeof ThemePreferenceSchema>;
 
 export const LaunchBehaviorSchema = z.enum(["dashboard", "new-chat", "last-workspace"]);
 

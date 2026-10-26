@@ -20,8 +20,9 @@ import {
   createAgentSessionHarness,
   createFailedTurnHandle,
   createStartedTurnHandle,
-  createStreamLifecycleMocks,
+  createTestStreamManager,
   seedAutoCompactionThreshold,
+  type AgentSessionAIServiceFake,
 } from "./agentSession.testHarness";
 import { makeTestEffectRunner, type TestEffectRunner } from "./di/testEffectRunner";
 import { Duration } from "effect";
@@ -71,7 +72,7 @@ interface SessionBundle {
 
 async function createSessionBundle(
   workspaceId: string,
-  aiServiceOverrides?: Partial<AgentSessionAIService>,
+  aiServiceOverrides?: Partial<AgentSessionAIServiceFake>,
   options?: {
     /**
      * Runs the retry backoff on virtual time: the session schedules its RetryManager on the
@@ -105,7 +106,7 @@ async function createSessionBundle(
       replayInit: mock(() => Promise.resolve()),
     },
     ...(options?.clock
-      ? { streamManager: { ...createStreamLifecycleMocks(), effectRunner: options.clock.runner } }
+      ? { streamManager: createTestStreamManager(undefined, options.clock.runner) }
       : {}),
     captureEvents: true,
     workspaceGoalService: options?.workspaceGoalService,

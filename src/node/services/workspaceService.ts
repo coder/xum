@@ -3252,11 +3252,12 @@ export class WorkspaceService
     private readonly initStateManager: InitStateManager,
     private readonly extensionMetadata: ExtensionMetadataService,
     private readonly backgroundProcessManager: BackgroundProcessManager,
-    private readonly sessionUsageService?: SessionUsageService,
-    telemetryService?: TelemetryService,
-    experimentsService?: ExperimentsService,
-    sessionTimingService?: SessionTimingService,
-    private readonly streamManager?: StreamManager,
+    private readonly sessionUsageService: SessionUsageService | undefined,
+    telemetryService: TelemetryService | undefined,
+    experimentsService: ExperimentsService | undefined,
+    sessionTimingService: SessionTimingService | undefined,
+    // Every session's stream lifecycle (and its clock-driven retries) runs on this manager.
+    private readonly streamManager: StreamManager,
     private readonly secretsStore: Pick<SecretsStore, "getEffectiveSecrets"> = new SecretsStore(
       config.rootDir
     ),
@@ -12439,7 +12440,7 @@ export class WorkspaceService
     // different turn) is treated as user work and refuses.
     if (this.aiService.isStreaming(workspaceId)) {
       const streamCorrelation = parseWorkspaceTurnTaskCorrelation(
-        this.streamManager?.getStreamInfo(workspaceId)?.muxMetadata
+        this.streamManager.getStreamInfo(workspaceId)?.muxMetadata
       );
       const streamIsExpectedDelegatedTurn =
         streamCorrelation != null &&

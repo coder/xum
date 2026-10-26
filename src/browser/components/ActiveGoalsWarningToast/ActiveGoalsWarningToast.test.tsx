@@ -35,7 +35,7 @@ describe("ActiveGoalsWarningToast", () => {
     await waitFor(() => expect(queryByRole("status")?.textContent).toContain("4 active goals"));
 
     rerender(<ActiveGoalsWarningToast activeGoalCount={3} />);
-    await waitFor(() => expect(queryByRole("status")).toBeNull());
+    await waitFor(() => expect(queryByRole("status") === null).toBe(true));
 
     rerender(<ActiveGoalsWarningToast activeGoalCount={4} />);
     await waitFor(() => expect(queryByRole("status")?.textContent).toContain("4 active goals"));

@@ -9,11 +9,7 @@ import {
   DEFAULT_MODEL_FALLBACKS,
   resolveModelFallbackChain,
 } from "@/common/utils/ai/modelFallbacks";
-import type {
-  ModelFallbackOptions,
-  ModelFallbackPrepareOptions,
-  StreamManager,
-} from "./streamManager";
+import type { ModelFallbackOptions, StreamManager } from "./streamManager";
 import { attachLanguageModelCleanup } from "./languageModelCleanup";
 import type { SessionUsageService } from "./sessionUsageService";
 import {
@@ -28,6 +24,7 @@ import {
   REFUSAL_FINISH,
   STOP_FINISH,
   runTurnForTests,
+  preparedFallback,
   scriptedStreamText,
   type ScriptedAttempt,
 } from "./streamManager.suite.testHarness";
@@ -43,28 +40,6 @@ function unstartableFallback(): ModelFallbackOptions {
     chain: ["openai:gpt-5.6-luna"],
     prepare: () => Promise.reject(new Error("fallback unavailable")),
   };
-}
-
-function preparedFallback(
-  overrides: {
-    onStreamConstructed?: () => Promise<void>;
-    initialMetadataPatch?: { systemMessageTokens: number };
-  } = {}
-): ModelFallbackOptions & { prepare: ReturnType<typeof mock> } {
-  const prepare = mock((nextModelString: string, _options?: ModelFallbackPrepareOptions) =>
-    Promise.resolve(
-      Ok({
-        model: createTestLanguageModel("fallback-model"),
-        modelString: nextModelString,
-        messages: [],
-        system: "You are a helpful assistant",
-        tools: undefined,
-        thinkingLevel: "off" as const,
-        ...overrides,
-      })
-    )
-  );
-  return { chain: ["openai:gpt-5.6-luna"], prepare };
 }
 
 function createUsageRecorder() {

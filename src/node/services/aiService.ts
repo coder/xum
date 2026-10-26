@@ -1177,7 +1177,7 @@ export class AIService extends EventEmitter {
       recordStartupPhaseTiming("commitPartialMs", commitPartialStartedAt);
 
       const buildOutcome = prepared
-        ? await prepared.request.start(opts.activeTurnThinkingOverride)
+        ? await prepared.request.start(opts.activeTurnThinkingOverride, opts.onTurnStartStage)
         : await this.turnRequestBuilder.build(opts, {
             abortSignal: combinedAbortSignal,
             syntheticMessageId,

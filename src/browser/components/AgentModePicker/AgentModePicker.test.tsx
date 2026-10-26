@@ -221,8 +221,8 @@ describe("AgentModePicker", () => {
     fireEvent.click(getByLabelText("Select agent"));
 
     await waitFor(() => {
-      expect(queryByLabelText(autoSelectLabel)).toBeNull();
-      expect(queryByText("Xum chooses the best agent")).toBeNull();
+      expect(queryByLabelText(autoSelectLabel) === null).toBe(true);
+      expect(queryByText("Xum chooses the best agent") === null).toBe(true);
     });
   });
 

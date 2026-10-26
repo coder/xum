@@ -8,7 +8,6 @@ import { ProviderModelEntrySchema } from "./providerModelEntry";
 export const CacheTtlSchema = z.enum(["5m", "1h"]);
 /** Anthropic request speed; "fast" opts into Fast mode (see anthropicFastMode.ts). */
 export const AnthropicSpeedSchema = z.enum(["standard", "fast"]);
-export type AnthropicSpeed = z.infer<typeof AnthropicSpeedSchema>;
 // "ultrafast" is OpenAI's model-gated premium tier (DevDay 2026-09-29); requests for
 // models without it drop the tier (see openaiModelSupportsServiceTier).
 export const ServiceTierSchema = z.enum(["auto", "default", "flex", "priority", "ultrafast"]);
@@ -21,7 +20,6 @@ export const FastModePreviousServiceTierSchema = z.enum([
   "ultrafast",
   "unset",
 ]);
-export type FastModePreviousServiceTier = z.infer<typeof FastModePreviousServiceTierSchema>;
 export const XAIServiceTierSchema = z.enum(["default", "priority"]);
 export type XAIServiceTier = z.infer<typeof XAIServiceTierSchema>;
 export const XAIFastModePreviousServiceTierSchema = z.enum(["default", "unset"]);
