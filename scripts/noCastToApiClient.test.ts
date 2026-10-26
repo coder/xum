@@ -115,3 +115,24 @@ test("the factory and router names count only when they are imported", () => {
     )
   ).toBe(1);
 });
+
+test("the factory and router names count only when imported from their own module", () => {
+  // Database, HTTP and other clients export a `createClient` too.
+  const otherModules = [
+    `import { createClient } from "redis";\nconst a = fake as ReturnType<typeof createClient>;`,
+    `import { createClient } from "@/node/services/other";\nconst a = fake as ReturnType<typeof createClient>;`,
+    `import type { AppRouter } from "./otherRouter";\nconst a = fake as RouterClient<AppRouter>;`,
+    `import * as Other from "@/browser/contexts/Other";\nconst a = fake as ReturnType<typeof Other.useAPI>["api"];`,
+  ];
+  const imports = `import type { RouterClient } from "@orpc/server";`;
+  for (const code of otherModules) {
+    expect({ code, count: reportCount(code, imports) }).toEqual({ code, count: 0 });
+  }
+  // A relative import of the real module from a file next to it.
+  const relative = linter.verify(
+    `${imports}\nimport type { AppRouter } from "./router";\nconst a = fake as RouterClient<AppRouter>;`,
+    lintConfig,
+    "src/node/orpc/case.test.ts"
+  );
+  expect(relative.length).toBe(1);
+});
