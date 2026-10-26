@@ -396,6 +396,7 @@ export class StreamManager {
       cleanupStreamTempDir: (runtime, dir) => this.cleanupStreamTempDir(runtime, dir),
     });
     this.turnEngine = new TurnEngine({
+      effectRunner: this.effectRunner,
       turnRegistry: this.turnRegistry,
       turnResources: this.turnResources,
       providerRequest: this.providerRequest,
