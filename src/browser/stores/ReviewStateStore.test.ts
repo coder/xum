@@ -10,7 +10,7 @@ import type {
 } from "@/common/orpc/schemas/reviewState";
 import { REVIEW_STATE_SECTIONS } from "@/common/orpc/schemas/reviewState";
 import type { Review } from "@/common/types/review";
-import { applyReviewStateDelta, withReviewStateSection } from "@/common/utils/reviewState";
+import { applyReviewStateDelta, assignSection } from "@/common/utils/reviewState";
 import { installDom } from "../../../tests/ui/dom";
 import { ReviewStateStore } from "./ReviewStateStore";
 
@@ -139,7 +139,8 @@ function createBackend(initial: ReviewStateSections = {}) {
         if (sections[section] !== undefined) {
           results[section] = "present";
         } else {
-          sections = withReviewStateSection(sections, section, incoming);
+          sections = { ...sections };
+          assignSection(sections, section, incoming);
           results[section] = "applied";
         }
       }

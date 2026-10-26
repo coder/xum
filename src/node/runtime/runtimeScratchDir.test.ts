@@ -229,6 +229,18 @@ describe("runtimeScratchDir", () => {
       expect(await fs.readdir(tempDir)).toEqual([]);
     });
 
+    test("still returns a host dir when creation fails, so the prompt never names an unset variable", async () => {
+      // A regular file where the session dir should be makes mkdir fail.
+      const sessionsRoot = path.join(tempDir, "sessions");
+      await fs.mkdir(sessionsRoot);
+      await fs.writeFile(path.join(sessionsRoot, "ws1"), "not a dir");
+      const dir = getWorkspaceScratchDir(sessionsRoot, "ws1");
+
+      expect(await ensureScratchDirForSpec(new LocalRuntime(tempDir), { kind: "host", dir })).toBe(
+        dir
+      );
+    });
+
     test("creates a runtime-side dir and returns the path the runtime expanded", async () => {
       const runtime = new LocalRuntime(tempDir);
       const scratch = path.join(tempDir, "remote-home", RUNTIME_SCRATCH_DIR_NAME, "ws1");
