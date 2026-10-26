@@ -1359,17 +1359,11 @@ describe("AgentSession token-budget lifecycle", () => {
     "valid in-memory usage takes precedence over persisted usage (%d tokens)",
     async (inputTokens) => {
       const h = await setup();
+      // A completed stream records its context usage in memory; no restart follows.
+      expect((await h.session.sendMessage("Record counters", options)).success).toBe(true);
+      h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens } });
+      await h.session.waitForIdle();
       await seedHistory(h, inputTokens === 120_000 ? 20_000 : 120_000);
-      const session = h.session as unknown as {
-        updateUsageStateFromModelUsage(
-          input: Pick<SettledStepBudget, "model" | "usage"> & { live: boolean }
-        ): void;
-      };
-      session.updateUsageStateFromModelUsage({
-        model,
-        usage: { inputTokens, outputTokens: 0, totalTokens: inputTokens },
-        live: false,
-      });
       expect((await h.session.sendMessage("Use current counters", options)).success).toBe(true);
       expect(rolloverRows(await allRows(h))).toHaveLength(inputTokens === 120_000 ? 1 : 0);
     }
