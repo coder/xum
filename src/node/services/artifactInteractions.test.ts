@@ -247,6 +247,57 @@ describe("artifact interactions", () => {
     expect(await pendingIds()).toEqual([]);
   });
 
+  test("an acceptance whose record removal fails still reports the send as failed", async () => {
+    // The session withdraws a send whose onAccepted throws, so it must not count as delivered.
+    const failingRemoval: ArtifactInteractionDeps = {
+      ...deps(),
+      sendMessage: async (_workspaceId, _message, _options, internal) => {
+        await fs.chmod(sessionDir, 0o500);
+        try {
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        } catch {
+          return Err("withdrawn");
+        } finally {
+          await fs.chmod(sessionDir, 0o700);
+        }
+      },
+    };
+    const result = await sendArtifactInteraction(failingRemoval, {
+      workspaceId: WS,
+      path: "a.html",
+      version: 0,
+      text: "x",
+    });
+    expect(result).toEqual(Err("withdrawn"));
+    expect(await pendingIds()).toEqual([]);
+  });
+
+  test("startup replay of a send that is accepted but cannot start its turn is not re-sent again", async () => {
+    // #7342: no API key at startup. The row lands, then the turn start fails with Err.
+    await sendArtifactInteraction(deps(), {
+      workspaceId: WS,
+      path: "a.html",
+      version: 0,
+      text: "x",
+    });
+    expect(await pendingIds()).toEqual(["id-1"]);
+    sent = [];
+    const acceptThenFail: ArtifactInteractionDeps = {
+      ...deps(),
+      sendMessage: async (_workspaceId, message, options, internal) => {
+        sent.push({ message, options: options as Record<string, unknown>, internal: internal! });
+        await internal?.onAccepted?.();
+        return Err("api_key_not_found");
+      },
+    };
+
+    expect(await replayPendingArtifactInteractions(acceptThenFail, WS)).toBe(1);
+    expect(await pendingIds()).toEqual([]);
+    expect(await replayPendingArtifactInteractions(acceptThenFail, WS)).toBe(0);
+    expect(sent).toHaveLength(1);
+  });
+
   test("one malformed record does not discard the valid ones", async () => {
     const valid = {
       id: "id-1",

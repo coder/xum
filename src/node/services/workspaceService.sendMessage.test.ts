@@ -372,6 +372,45 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(pending.map((record) => record.id)).toEqual([id]);
   });
 
+  // #7342: a turn-start failure (no API key) comes back as Err after the user row is durable.
+  // Reporting it as "not sent" made the Artifacts tab offer Send, which delivered a duplicate.
+  test.each([
+    { accepted: true, expectSent: true },
+    { accepted: false, expectSent: false },
+  ])(
+    "an idle artifact interaction whose turn fails to start: accepted=$accepted -> sent=$expectSent",
+    async ({ accepted, expectSent }) => {
+      fakeSession.isBusy.mockReturnValue(false);
+      const turnError: SendMessageError = { type: "api_key_not_found", provider: "anthropic" };
+      fakeSession.sendMessage.mockImplementationOnce(
+        async (_message: string, _options: unknown, internal?: { onAccepted?: () => unknown }) => {
+          if (accepted) await internal?.onAccepted?.();
+          return Err(turnError);
+        }
+      );
+      const deps = createArtifactInteractionDeps({
+        config: harness.config,
+        workspaceService,
+        historyService: harness.historyService,
+      });
+      const sent = await sendArtifactInteraction(
+        {
+          ...deps,
+          getDefaultSendOptions: () =>
+            Promise.resolve({ model: "anthropic:claude-sonnet-4-5", agentId: "exec" }),
+        },
+        { workspaceId: "test-workspace", path: "form.html", version: null, text: "Ship it" }
+      );
+      expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+      expect(sent.success).toBe(expectSent);
+      // Either way the record is settled: an accepted row is delivered, a refused send is reported.
+      const pending = await readPendingArtifactInteractions(
+        path.join(harness.config.sessionsDir, "test-workspace")
+      );
+      expect(pending).toEqual([]);
+    }
+  );
+
   test("a send arriving during an earlier send's preflight queues instead of starting a second turn", async () => {
     // The session only reports busy once AgentSession.sendMessage claims PREPARING. A
     // later send admitted against the idle snapshot would start a competing stream that
