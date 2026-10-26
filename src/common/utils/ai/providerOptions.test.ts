@@ -4243,7 +4243,14 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
       undefined,
       undefined,
       undefined,
-      { bedrock: { region: "us-east-1", models: [{ id: ARN, mappedToModel }] } },
+      {
+        bedrock: {
+          apiKeySet: false,
+          isEnabled: true,
+          isConfigured: true,
+          models: [{ id: ARN, mappedToModel }],
+        },
+      },
       "bedrock"
     );
 
@@ -4251,8 +4258,8 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
     const named = bedrockOptions("bedrock:anthropic.claude-sonnet-5", "high");
     const mapped = arnOptions("anthropic:claude-sonnet-5");
     // A named id keeps the typed reasoningConfig; the ARN sends only the raw fields.
-    expect((named.bedrock as Record<string, unknown>).reasoningConfig).toBeDefined();
-    expect((mapped.bedrock as Record<string, unknown>).reasoningConfig).toBeUndefined();
+    expect(named).toHaveProperty("bedrock.reasoningConfig");
+    expect(mapped).not.toHaveProperty("bedrock.reasoningConfig");
 
     const namedSent = await sentBedrockBody("anthropic.claude-sonnet-5", named);
     const mappedSent = await sentBedrockBody(ARN, mapped);
