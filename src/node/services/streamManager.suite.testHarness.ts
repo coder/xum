@@ -125,6 +125,8 @@ export function createStreamInfoForTests(overrides: StreamInfoFixture = {}): Str
     messageId: "test-message",
     token: "test-token" as WorkspaceStreamInfo["token"],
     startTime: now,
+    // The default runner's HostClock is the wall clock; a TestClock test overrides this.
+    durationStartMs: now,
     lastPartTimestamp: now,
     toolCompletionTimestamps: new Map<string, number>(),
     pendingWorkflowRunAttachments: new Map(),
