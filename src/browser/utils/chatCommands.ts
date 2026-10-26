@@ -18,11 +18,15 @@ import type {
 } from "@/common/orpc/types";
 import { formatSendMessageError } from "@/common/utils/errors/formatSendError";
 import {
+  type AgentSkillReference,
+  type MCPPromptReference,
   type MuxMessageMetadata,
   type CompactionRequestData,
   type CompactionFollowUpRequest,
   type CompactionFollowUpInput,
   pickPreservedSendOptions,
+  withAgentSkillRefs,
+  withMcpPromptRefs,
 } from "@/common/types/message";
 import type { GoalRecordV1, GoalSetError, GoalStatus } from "@/common/types/goal";
 import type { ReviewNoteData } from "@/common/types/review";
@@ -243,8 +247,22 @@ export type CommandResult =
       backgroundTask?: () => Promise<CommandAction[]>;
     };
 
+/** `$skill` and MCP prompt references the composer resolved from the typed input. */
+export interface SlashCommandInlineRefs {
+  agentSkillRefs: AgentSkillReference[];
+  mcpPromptRefs: MCPPromptReference[];
+}
+
+/** For command runs without typed text to reference (/clear confirmation, creation /goal). */
+export const NO_INLINE_REFS: SlashCommandInlineRefs = { agentSkillRefs: [], mcpPromptRefs: [] };
+
 export interface SlashCommandEnv {
   api: RouterClient<AppRouter> | null;
+  /**
+   * Required so that every command that sends the typed text later or elsewhere (/compact
+   * follow-up, /new, /fork) gets the references; without them the model sees a bare `$skill`.
+   */
+  inlineRefs: SlashCommandInlineRefs;
   /** Composer's AI scope, which may be the owning project rather than a sub-project path. */
   aiScopeId?: string;
   workspaceId?: string;
@@ -271,6 +289,16 @@ export interface SlashCommandEnv {
 interface WorkspaceCommandEnv extends SlashCommandEnv {
   api: RouterClient<AppRouter>;
   workspaceId: string;
+}
+
+function inlineRefsMetadata(refs: SlashCommandInlineRefs): MuxMessageMetadata | undefined {
+  return withMcpPromptRefs(withAgentSkillRefs(undefined, refs.agentSkillRefs), refs.mcpPromptRefs);
+}
+
+/** Send options for a command's start message, carrying the references typed with it. */
+function startMessageSendOptions(env: SlashCommandEnv): SendMessageOptions {
+  const muxMetadata = inlineRefsMetadata(env.inlineRefs);
+  return muxMetadata ? { ...env.sendMessageOptions, muxMetadata } : env.sendMessageOptions;
 }
 
 function complete(
@@ -1441,7 +1469,7 @@ function handleForkCommand(
         client: env.api,
         sourceWorkspaceId: env.workspaceId,
         startMessage: parsed.startMessage,
-        sendMessageOptions: env.sendMessageOptions,
+        sendMessageOptions: startMessageSendOptions(env),
       });
       if (!result.success) {
         const message = result.error ?? "Failed to fork workspace";
@@ -1849,7 +1877,7 @@ function handleNewCommand(
         client: env.api,
         projectPath: workspaceInfo.projectPath,
         startMessage,
-        sendMessageOptions: env.sendMessageOptions,
+        sendMessageOptions: startMessageSendOptions(env),
         pendingAutoTitle: Boolean(startMessage),
       });
       if (!result.success) {
@@ -1918,6 +1946,10 @@ function handleCompactCommand(
             text: appendStagedAttachmentNotice(parsed.continueMessage ?? "", stagedAttachments),
             fileParts: env.fileParts,
             reviews: env.reviews,
+            // The references ride the follow-up, not the compaction request: a /compact turn
+            // persists its own skill snapshots, which would land before the boundary and be
+            // summarized away.
+            muxMetadata: inlineRefsMetadata(env.inlineRefs),
           }
         : undefined;
       const result = await executeCompaction({

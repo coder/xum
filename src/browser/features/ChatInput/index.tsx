@@ -54,10 +54,11 @@ import {
   getWorkspaceLastReadKey,
 } from "@/common/constants/storage";
 import {
-  prepareCompactionMessage,
+  NO_INLINE_REFS,
   processSlashCommand,
   type CommandAction,
   type SlashCommandEnv,
+  type SlashCommandInlineRefs,
 } from "@/browser/utils/chatCommands";
 import {
   addWorkflowRunCardMessageForRun,
@@ -145,7 +146,6 @@ import {
   type MuxMessageMetadata,
   type ReviewNoteDataForDisplay,
   withAgentSkillRefs,
-  withMcpPromptRefs,
 } from "@/common/types/message";
 import {
   getModelCapabilities,
@@ -1990,7 +1990,8 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
   const executeParsedCommand = async (
     parsed: ParsedCommand | null,
     restoreInput: string,
-    options?: {
+    options: {
+      inlineRefs: SlashCommandInlineRefs;
       skipConfirmation?: boolean;
       queueDispatchMode?: QueueDispatchMode;
       goalInterventionPolicy?: GoalInterventionPolicy;
@@ -2017,7 +2018,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     }
 
     const isDestructive = parsed.type === "clear" && parsed.mode === "hard";
-    if (isDestructive && variant === "workspace" && !options?.skipConfirmation) {
+    if (isDestructive && variant === "workspace" && !options.skipConfirmation) {
       setPendingDestructiveCommand(true);
       return true;
     }
@@ -2036,12 +2037,12 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       return true;
     }
 
-    const reviewsData = options?.reviews ? options.reviews.data : reviewData;
-    const dispatchMode = options?.queueDispatchMode ?? "tool-end";
+    const reviewsData = options.reviews ? options.reviews.data : reviewData;
+    const dispatchMode = options.queueDispatchMode ?? "tool-end";
     // Thread dispatch mode into send options so queued command sends stay in sync with normal sends.
     const commandSendMessageOptions: SendMessageOptions = {
       ...sendMessageOptions,
-      ...(options?.goalInterventionPolicy
+      ...(options.goalInterventionPolicy
         ? { goalInterventionPolicy: options.goalInterventionPolicy }
         : {}),
       ...(dispatchMode === "tool-end" ? {} : { queueDispatchMode: dispatchMode }),
@@ -2052,6 +2053,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const commandEnv: SlashCommandEnv = {
       // Commands report "Not connected to server" themselves when there is no live client.
       api: liveApi,
+      inlineRefs: options.inlineRefs,
       aiScopeId: sendOptionsScopeId,
       variant,
       workspaceId: commandWorkspaceId,
@@ -2068,7 +2070,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       reviews: reviewsData,
       attachments,
       fileParts: commandFileParts.length > 0 ? commandFileParts : undefined,
-      attachedReviewIds: options?.reviews ? options.reviews.ids : reviewIdsForCheck,
+      attachedReviewIds: options.reviews ? options.reviews.ids : reviewIdsForCheck,
       isSideChat:
         commandWorkspaceId != null &&
         workspaceMetadata.get(commandWorkspaceId)?.sideChatParentWorkspaceId != null,
@@ -2128,7 +2130,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
               props.onCheckReviews?.(action.reviewIds);
             }
             // Emitted once the command's message was accepted (/compact).
-            if (options?.reviews) warnIfReviewsUnavailable(options.reviews);
+            if (options.reviews) warnIfReviewsUnavailable(options.reviews);
             break;
           case "message-sent":
             if (variant === "workspace") props.onMessageSent?.(action.dispatchMode);
@@ -2186,7 +2188,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
     const parsedCommand: ParsedCommand = { type: "clear", mode: "hard" };
 
     setPendingDestructiveCommand(false);
-    await executeParsedCommand(parsedCommand, input, { skipConfirmation: true });
+    await executeParsedCommand(parsedCommand, input, {
+      inlineRefs: NO_INLINE_REFS,
+      skipConfirmation: true,
+    });
   };
 
   const handleDestructiveCommandCancel = useCallback(() => {
@@ -2442,6 +2447,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       combinedSkillRefs,
       combinedMcpPromptRefs,
     } = resolved;
+    const inlineRefs: SlashCommandInlineRefs = {
+      agentSkillRefs: combinedSkillRefs,
+      mcpPromptRefs: combinedMcpPromptRefs,
+    };
 
     // The barrier is re-checked here, after the resolution awaits and before any command runs:
     // a reconnect can close it meanwhile, and handled commands (/compact, /fork, workflow
@@ -2477,7 +2486,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         !goalCommandBypassedForAttachments &&
         parsed?.type !== "workflow-run"
       ) {
-        const commandHandled = await executeParsedCommand(parsed, input);
+        const commandHandled = await executeParsedCommand(parsed, input, { inlineRefs });
         if (commandHandled) {
           return;
         }
@@ -2584,6 +2593,7 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
         modelOneShot || goalCommandBypassedForAttachments
           ? false
           : await executeParsedCommand(parsed, input, {
+              inlineRefs,
               goalInterventionPolicy: overrides?.goalInterventionPolicy,
               queueDispatchMode: overrides?.queueDispatchMode,
               reviews: reviewsForSend,
@@ -2742,67 +2752,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
       const sendPreparedMessage = async () => {
         // Prepare file parts if any
         const fileParts = chatAttachmentsToFileParts(sendAttachments, { validate: true });
-        const sendFileParts = editMessageForSend
-          ? fileParts
-          : fileParts.length > 0
-            ? fileParts
-            : undefined;
 
-        // Prepare reviews data (used for both compaction continueMessage and normal send),
-        // read after hydration by readReviewsForSend.
+        // Review notes as hydrated by readReviewsForSend.
         const reviewsData = reviewsForSend.data;
         const reviewIdsToCheck = reviewsForSend.ids;
-
-        // When editing a /compact command, regenerate the actual summarization request
-        let actualMessageText = messageTextForSend;
-        let muxMetadata: MuxMessageMetadata | undefined = skillMuxMetadata ?? promptMuxMetadata;
-        let compactionOptions: Partial<SendMessageOptions> = {};
-
-        let appendStagedNoticeToUserMessage = true;
-        if (editMessageForSend && actualMessageText.startsWith("/")) {
-          const parsed = parseCommand(messageText);
-          if (parsed?.type === "compact") {
-            // Inline refs ride the follow-up message so their snapshots
-            // materialize after compaction, not on the summarization turn.
-            const followUpMuxMetadata = withMcpPromptRefs(
-              withAgentSkillRefs(undefined, combinedSkillRefs),
-              combinedMcpPromptRefs
-            );
-            const {
-              messageText: regeneratedText,
-              metadata,
-              sendOptions,
-            } = prepareCompactionMessage({
-              api: liveApi,
-              workspaceId: props.workspaceId,
-              maxOutputTokens: parsed.maxOutputTokens,
-              // Include current attachments + reviews in followUpContent so they're queued
-              // after compaction completes, not just attached to the compaction request.
-              followUpContent:
-                parsed.continueMessage ||
-                sendFileParts?.length ||
-                reviewsData?.length ||
-                getStagedAttachments(sendAttachments).length ||
-                followUpMuxMetadata
-                  ? {
-                      text: appendStagedAttachmentNotice(
-                        parsed.continueMessage ?? "",
-                        sendAttachments
-                      ),
-                      fileParts: sendFileParts,
-                      reviews: reviewsData,
-                      ...(followUpMuxMetadata ? { muxMetadata: followUpMuxMetadata } : {}),
-                    }
-                  : undefined,
-              model: parsed.model,
-              sendMessageOptions,
-            });
-            appendStagedNoticeToUserMessage = false;
-            actualMessageText = regeneratedText;
-            muxMetadata = metadata;
-            compactionOptions = sendOptions;
-          }
-        }
 
         const preparedMessage = prepareMessagePayload({
           messageText,
@@ -2816,13 +2769,10 @@ const ChatInputInner: React.FC<ChatInputProps> = (props) => {
           historyEditPrecondition: editMessageForSend
             ? getEditSendPrecondition(editMessageForSend)
             : undefined,
-          baseMetadata: muxMetadata,
+          baseMetadata: skillMuxMetadata ?? promptMuxMetadata,
           agentSkillRefs: combinedSkillRefs,
           mcpPromptRefs: combinedMcpPromptRefs,
           sendMessageOptions,
-          compactionOptions,
-          compactionMessageText: actualMessageText,
-          appendStagedNotice: appendStagedNoticeToUserMessage,
           modelOneShot,
           policyModel,
           transferredDraftProjectDiscovery,
