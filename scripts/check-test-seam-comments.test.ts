@@ -137,6 +137,10 @@ test("flags declarations named ...ForTests or ...ForTesting, not their uses", ()
     "pool?.clearForTests();",
     "const { boundForTests } = api;",
     "export const testsForUsers = 1;",
+    "export const first = 1, laterForTests = 2;",
+    "export class Harness { constructor(public injectedForTests: () => void, plain: number) {} }",
+    "function f() { const innerForTests = 1; }",
+    "export { resetForTests as aliasForTests };",
   ].join("\n");
   expect(
     findTestHookNames("src/x.ts", text).map((hit) => `${hit.line}:${hit.symbol}:${hit.phrase}`)
@@ -146,6 +150,10 @@ test("flags declarations named ...ForTests or ...ForTesting, not their uses", ()
     "5:visibleForTesting:visibleForTesting",
     "6:api.quotedForTests:quotedForTests",
     "6:api.computedForTests:computedForTests",
+    "13:laterForTests:laterForTests",
+    "14:Harness.injectedForTests:injectedForTests",
+    "15:f.innerForTests:innerForTests",
+    "16:aliasForTests:aliasForTests",
   ]);
 });
 

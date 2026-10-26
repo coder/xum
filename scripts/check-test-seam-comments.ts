@@ -283,8 +283,24 @@ function isSurfaceDeclaration(node: ts.Node): node is ts.NamedDeclaration {
     ts.isInterfaceDeclaration(node) ||
     ts.isTypeAliasDeclaration(node) ||
     ts.isEnumMember(node) ||
-    ts.isExportSpecifier(node)
+    ts.isExportSpecifier(node) ||
+    // `constructor(public resetForTests: () => void)` declares a class property.
+    (ts.isParameter(node) && ts.isParameterPropertyDeclaration(node, node.parent))
   );
+}
+
+/** The nearest ancestor of a declaration that is not its own variable list or statement. */
+function enclosingDeclaration(node: ts.Node): ts.Node {
+  let parent = node.parent;
+  while (
+    ts.isVariableDeclarationList(parent) ||
+    ts.isVariableStatement(parent) ||
+    ts.isNamedExports(parent) ||
+    ts.isExportDeclaration(parent)
+  ) {
+    parent = parent.parent;
+  }
+  return parent;
 }
 
 /** The static text of a declaration name: `a`, `#a`, `"a"` or `["a"]`. */
@@ -311,13 +327,14 @@ export function findTestHookNames(file: string, text: string): SeamComment[] {
   const visit = (node: ts.Node) => {
     const name = isSurfaceDeclaration(node) ? staticName(node.name) : undefined;
     if (name !== undefined && TEST_HOOK_NAME.test(name)) {
-      // A computed name (`["aForTests"]()`) is not part of the owner chain; append it.
-      const owner = symbolChain(node);
-      const named = owner === name || owner.endsWith(`.${name}`);
+      // Key by the enclosing declarations plus this name: symbolChain would name a variable by
+      // its list's first declarator (`const first = 1, aForTests = ...`) and drops computed
+      // names (`["aForTests"]()`).
+      const owner = symbolChain(enclosingDeclaration(node));
       found.push({
         file,
         line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
-        symbol: named ? owner : owner === "(file)" ? name : `${owner}.${name}`,
+        symbol: owner === "(file)" ? name : `${owner}.${name}`,
         phrase: name,
       });
     }
