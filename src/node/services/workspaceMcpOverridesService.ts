@@ -2569,10 +2569,12 @@ export class WorkspaceMcpOverridesService {
           const child = next.metadata;
           try {
             // A host-local workspace the receiver holds nothing for reads disk
-            // on its first serve: skip its probe and publication (thousands of
-            // cold task descendants exhausted a plugin sweep's budget), but
+            // on its first serve: skip its probe and resolution (thousands of
+            // cold task descendants exhausted a plugin sweep's budget), evict
+            // it (an I/O-free fence for a first serve already in flight), and
             // keep walking — a cached descendant can inherit the change.
             if (isColdRefresh(next, hasSnapshot)) {
+              await publish(null, child.id);
               return childrenOf(child.id).map(
                 (metadata): Step => ({ metadata, shares: false, action: "refresh" })
               );
@@ -4682,10 +4684,13 @@ export class WorkspaceMcpOverridesService {
     // otherwise reset its own 30 s while the locks stay held.
     for (const [workspaceId, { metadata, filePaths, ownFileRewritten }] of swept) {
       // This workspace's own files did not change and the receiver holds
-      // nothing to repair for it: its first serve reads disk. (A stale
-      // snapshot of an off-host descendant can survive the skip, but
-      // off-host runtimes never start plugin servers.)
+      // nothing to repair for it: skip the (disk-reading) resolution. Still
+      // evict: the I/O-free marker fences a cold first serve already in
+      // flight, which may have read pre-prune state, so it fails closed and
+      // re-reads. (A stale snapshot of an off-host descendant can survive
+      // the skip, but off-host runtimes never start plugin servers.)
       if (!ownFileRewritten && hasSnapshot?.(workspaceId) === false) {
+        await publish(null, workspaceId);
         continue;
       }
       try {

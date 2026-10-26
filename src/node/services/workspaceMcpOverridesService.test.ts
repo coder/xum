@@ -3906,10 +3906,13 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(failures).toEqual([]);
     // The rewritten workspace publishes although the receiver holds nothing
     // for it (its descendants and sharers may); the cached clean one
-    // publishes so a stale cached enable is replaced by disk truth.
+    // publishes so a stale cached enable is replaced by disk truth. The cold
+    // clean one is only evicted (null): no disk resolution, but a fence for
+    // a first serve that may be in flight.
     expect(published).toEqual([
       [rewrittenCold.workspaceId, { enabledServers: ["other"] }],
       [cleanCached.workspaceId, {}],
+      [cleanCold.workspaceId, null],
     ]);
   });
 
@@ -3942,13 +3945,14 @@ describe("WorkspaceMcpOverridesService", () => {
     );
 
     const publishedIds: string[] = [];
+    const evictedIds: string[] = [];
     // The grandchild is NOT swept directly: only the fan-out can reach it.
     const failures = await service.prunePluginOverrideKeysForWorkspaces(
       [parent.workspaceId, coldChild.workspaceId],
       "plugin:0123456789abcdef:",
       {
-        publish: (_persisted, workspaceId) => {
-          publishedIds.push(workspaceId);
+        publish: (persisted, workspaceId) => {
+          (persisted === null ? evictedIds : publishedIds).push(workspaceId);
           return Promise.resolve();
         },
         hasSnapshot: (workspaceId) => workspaceId === cachedGrandchild.workspaceId,
@@ -3958,7 +3962,9 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(failures).toEqual([]);
     expect(publishedIds).toContain(parent.workspaceId);
     expect(publishedIds).toContain(cachedGrandchild.workspaceId);
+    // The cold child gets no authoritative publication, only the fence.
     expect(publishedIds).not.toContain(coldChild.workspaceId);
+    expect(evictedIds).toContain(coldChild.workspaceId);
   });
 
   it("prunePluginOverrideKeysForWorkspaces prunes every checkout sharing a duplicated ID", async () => {
