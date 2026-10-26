@@ -449,11 +449,34 @@ export const PauseAtBudget: AppStory = {
   play: pauseAtBudget,
 };
 
+/**
+ * The phone width in a frame no taller than the window (#7517). The test-runner window is 720 px
+ * tall, so a full 844 px frame overflows it and the page's outer containers can scroll. A trace
+ * of a throttled failing run (in #7517) showed them still scrolled when the read row was
+ * measured, and scrolled back mid-reveal after the click: the read row moved on screen without
+ * any transcript change, and the load-older pin, which compares screen positions, cannot undo
+ * that (#7549). The frame is shorter in that window (720 px instead of 844 px), which the
+ * assertions do not depend on; only the width must be a phone's.
+ */
+function IPhone16eWindowDecorator(Story: ComponentType) {
+  return (
+    <div
+      style={{
+        width: IPHONE_16E.width,
+        height: `min(${IPHONE_16E.height}px, 100vh)`,
+        overflow: "hidden",
+      }}
+    >
+      <Story />
+    </div>
+  );
+}
+
 export const PauseAtBudgetPhone: AppStory = {
   globals: { viewport: { value: "mobile1", isRotated: false } },
   render: () => <AppWithMocks setup={setupOverBudget} />,
   // The decorator forces the phone width for the test-runner, which applies no viewport.
-  decorators: [IPhone16eDecorator],
+  decorators: [IPhone16eWindowDecorator],
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async (context) => {
     await waitFor(() =>
