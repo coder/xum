@@ -14,9 +14,9 @@ export function isHistoryIdentifierRepresentable(id: string): boolean {
 }
 
 const offset = z.number().int().nonnegative().safe();
-export const HistoryArtifactSchema = z.enum(["chat", "archive"]);
+const HistoryArtifactSchema = z.enum(["chat", "archive"]);
 export type HistoryArtifact = z.infer<typeof HistoryArtifactSchema>;
-export const HistorySnapshotSchema = z
+const HistorySnapshotSchema = z
   .object({
     endOffsetSnapshot: offset,
     inode: z.string(),
@@ -38,7 +38,7 @@ const positionFields = {
 const windowIdField = z.string().refine(isHistoryIdentifierRepresentable).nullable();
 const windowBoundaryKindField = z.nativeEnum(CONTEXT_BOUNDARY_KINDS).nullable();
 const rowLocation = z.object({ artifact: HistoryArtifactSchema, byteOffset: offset }).strict();
-export const HistoryScanStateSchema = z
+const HistoryScanStateSchema = z
   .object({
     provenanceEpoch: z.string().uuid(),
     snapshots: z.object({ chat: HistorySnapshotSchema, archive: HistorySnapshotSchema }).strict(),
