@@ -504,8 +504,9 @@ describe("ServiceContainer", () => {
     const project = services.projectService as unknown as { activeGitInits: Set<string> };
     let releaseWorkflow: (() => void) | undefined;
     let executingAdmission: Disposable | undefined;
+    let sendingAdmission: Disposable | undefined;
     const workspace = services.workspaceService as unknown as {
-      preflightSendCounts: Map<string, number>;
+      sendPreflight: { sends: PreflightCounter };
       operationAdmission: { exec: PreflightCounter };
       initSettlementPromises: Map<string, Promise<void>>;
       initAbortControllers: Map<string, AbortController>;
@@ -533,7 +534,7 @@ describe("ServiceContainer", () => {
       processes.processes.set("running", { status: "running", isForeground: false });
       processes.processes.set("foreground", { status: "running", isForeground: true });
       processes.processes.set("finished", { status: "exited", isForeground: false });
-      workspace.preflightSendCounts.set("preflight", 1);
+      sendingAdmission = workspace.sendPreflight.sends.acquire("preflight");
       executingAdmission = workspace.operationAdmission.exec.acquire("executing");
       expect(services.collectRestartBlockers()).toEqual([
         { kind: "pending-turns", count: 1 },
@@ -550,7 +551,7 @@ describe("ServiceContainer", () => {
       streams.workspaceStreams.clear();
       terminals.pendingSessionCreations.clear();
       processes.processes.clear();
-      workspace.preflightSendCounts.clear();
+      sendingAdmission?.[Symbol.dispose]();
       executingAdmission?.[Symbol.dispose]();
       workspace.initSettlementPromises.clear();
       workspace.initAbortControllers.clear();

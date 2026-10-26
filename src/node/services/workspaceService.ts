@@ -469,6 +469,7 @@ import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEdito
 import { WorkspaceNaming } from "@/node/services/workspaceNaming";
 import { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
 import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
+import { SendPreflight } from "@/node/services/sendPreflight";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
@@ -2800,154 +2801,13 @@ export class WorkspaceService
   // pre-admission awaits (e.g. branch-summary generation).
   private readonly contextMutationEpochs = new Map<string, number>();
 
-  // r41: sends currently between the entry check and their settled outcome
-  // (queued, refused, or admitted — PREPARING is set before any early
-  // background-start return). Refine publication must not interleave with a
-  // send's pre-admission window: a proposal row published and RELEASED while
-  // a send with an already-persisted user row awaits admission would land
-  // after that user row and enter the send's request as a trailing foreign
-  // assistant row (see acquireIdleTurnExclusion).
-  private readonly preflightSendCounts = new Map<string, number>();
-  /**
-   * Idempotent sends: this process's identity as a send receiver (getSendStatus). A process
-   * restart is a new receiver: requests it had died with it.
-   */
-  private readonly sendReceiverId = crypto.randomUUID();
-  /** Send ids of sendMessage calls still running, per workspace (a count per id). */
-  private readonly inFlightSendIds = new Map<string, Map<string, number>>();
-  /**
-   * Send ids this receiver answered "not accepted" (getSendStatus), per workspace: a later arrival
-   * of one is refused, so a send the client already made visible again is never also appended.
-   * Never evicted for this process's life (a restart is a new receiver: its requests died with
-   * the old one), nor when the workspace is removed. Memory grows by one short string per id a
-   * client looked up that this process held nowhere (at most 100 per call). An id this process
-   * never saw must be remembered too: it may be a request still in transit. Clients look up only
-   * their own unresolved sends, so this stays about one entry per such send.
-   */
-  private readonly refusedSendIds = new Map<string, Set<string>>();
-  /**
-   * Codex P1 (PRRT_kwDOPxxmWM6cRi_J): sends the SESSION cannot observe yet —
-   * counted from service entry until the queue/session handoff, then released.
-   * Unlike preflightSendCounts (held for the whole service call for archive
-   * and refine interlocks), this feeds the session's follow-up idle probes:
-   * a follow-up redispatched from within the originating send's own turn
-   * (e.g. its on-send compaction completing) must not veto itself, and once
-   * handed off the session's own queue/turn-phase state governs visibility.
-   * Tickets are kept in arrival order so a send can tell whether an EARLIER send is
-   * still in preflight (sendMessage queues behind it) without two simultaneous
-   * arrivals each deferring to the other, and so sends reach their queue-or-direct
-   * decision in arrival order (a later arrival must not enqueue first because its
-   * preflight awaits finished sooner). Supersedable tickets are maintenance sends that
-   * yield to user input (requireIdle skips and queue-mode heartbeats): they never count
-   * as "earlier" for anyone, nobody waits on them, and they yield to a manual send in
-   * preflight through preflightSendCounts.
-   */
-  private readonly sessionInvisiblePreflights = new Map<
-    string,
-    Map<
-      number,
-      { supersedable: boolean; manual: boolean; decided: Promise<void>; markDecided: () => void }
-    >
-  >();
-  private nextSessionInvisiblePreflightTicket = 0;
-
-  private hasSessionInvisiblePreflight(workspaceId: string): boolean {
-    return (this.sessionInvisiblePreflights.get(workspaceId)?.size ?? 0) > 0;
-  }
-
-  /**
-   * A user send in service preflight (a `manual` ticket): auto-retry defers to it, since its
-   * acceptance cancels the retry. Resumes, automatic and yielding sends do not hold a retry back.
-   */
-  private hasManualSessionInvisiblePreflight(workspaceId: string): boolean {
-    for (const entry of this.sessionInvisiblePreflights.get(workspaceId)?.values() ?? []) {
-      if (entry.manual) return true;
-    }
-    return false;
-  }
-
-  /**
-   * See sessionInvisiblePreflights. Release is idempotent. Disposal (scope exit of the
-   * service call) also drains messages queued behind this preflight when it is a
-   * blocking ticket with no blocking ticket before it (the head of the line that others
-   * queue behind): those entries have no stream end to drain them if this send settled
-   * without a turn (refused, rejected, startup failed). A younger send that settles
-   * first must not drain, or it would dispatch entries ahead of the older still-live
-   * preflight; the older send drains when it settles. Supersedable tickets never drain
-   * because nothing queues behind them, and the drain is a no-op when a turn was handed
-   * off (the session is busy).
-   */
-  private armSessionInvisiblePreflight(
-    workspaceId: string,
-    options?: { supersedable?: boolean; manual?: boolean }
-  ): {
-    release: () => void;
-    hasEarlierPreflight: () => boolean;
-    /** Resolve once every earlier blocking ticket has reached its queue-or-direct decision. */
-    awaitEarlierDecisions: () => Promise<void>;
-    markDecided: () => void;
-  } & Disposable {
-    const ticket = this.nextSessionInvisiblePreflightTicket++;
-    const supersedable = options?.supersedable === true;
-    const manual = options?.manual === true && !supersedable;
-    let tickets = this.sessionInvisiblePreflights.get(workspaceId);
-    if (tickets == null) {
-      tickets = new Map();
-      this.sessionInvisiblePreflights.set(workspaceId, tickets);
-    }
-    let markDecided!: () => void;
-    const decided = new Promise<void>((resolve) => {
-      markDecided = resolve;
-    });
-    tickets.set(ticket, { supersedable, manual, decided, markDecided });
-    let released = false;
-    let releasedAsHead = false;
-    // Map iteration follows insertion order, so tickets before this one arrived earlier.
-    const earlierBlockingTickets = () => {
-      const earlier: Array<{ decided: Promise<void> }> = [];
-      if (released) {
-        return earlier;
-      }
-      for (const [liveTicket, entry] of this.sessionInvisiblePreflights.get(workspaceId) ?? []) {
-        if (liveTicket === ticket) {
-          break;
-        }
-        if (!entry.supersedable) {
-          earlier.push(entry);
-        }
-      }
-      return earlier;
-    };
-    const hasEarlierPreflight = () => earlierBlockingTickets().length > 0;
-    const release = () => {
-      if (released) {
-        return;
-      }
-      releasedAsHead = !supersedable && !hasEarlierPreflight();
-      released = true;
-      // A send that leaves before deciding must not keep later arrivals waiting.
-      markDecided();
-      const live = this.sessionInvisiblePreflights.get(workspaceId);
-      live?.delete(ticket);
-      if (live?.size === 0) {
-        this.sessionInvisiblePreflights.delete(workspaceId);
-      }
-    };
-    return {
-      release,
-      hasEarlierPreflight,
-      awaitEarlierDecisions: async () => {
-        await Promise.all(earlierBlockingTickets().map((entry) => entry.decided));
-      },
-      markDecided,
-      [Symbol.dispose]: () => {
-        release();
-        if (releasedAsHead) {
-          this.sessions.get(workspaceId)?.drainQueuedMessagesIfIdle();
-        }
-      },
-    };
-  }
+  // Sends between their entry check and their settled outcome, the session-invisible send
+  // tickets and the idempotent send ids. Lives in SendPreflight; a disposed head-of-line ticket
+  // drains the session queue through the closure.
+  private readonly sendPreflight = new SendPreflight({
+    drainQueuedMessagesIfIdle: (workspaceId) =>
+      this.sessions.get(workspaceId)?.drainQueuedMessagesIfIdle(),
+  });
 
   // Monotonic per-workspace stream generations prevent delayed stop-side metadata writes
   // from older streams from clobbering a newer streaming=true snapshot after async awaits.
@@ -4388,7 +4248,7 @@ export class WorkspaceService
     // blocks the send's stream but cannot un-append. Refuse instead; sends
     // settle in bounded time and the user retries. Counted synchronously at
     // the send's entry, so one side always observes the other.
-    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+    if (this.sendPreflight.hasSendInPreflight(workspaceId)) {
       guard[Symbol.dispose]();
       return Err(`Cannot ${operation} while a message is being sent. Try again in a moment.`);
     }
@@ -4428,7 +4288,7 @@ export class WorkspaceService
     // trailing foreign assistant row. Refuse instead; the caller reports a
     // retryable failure. Counted synchronously at the send's entry, so on a
     // single thread one side always observes the other.
-    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+    if (this.sendPreflight.hasSendInPreflight(workspaceId)) {
       hold[Symbol.dispose]();
       return Err("a send is being admitted");
     }
@@ -5237,7 +5097,7 @@ export class WorkspaceService
   collectRestartBlockers(): RestartBlocker[] {
     const sessions = new Map([...this.sessions, ...this.transientStartupRecoverySessions]);
     const config = this.config.loadConfigOrDefault();
-    const pendingTurns = new Set(this.preflightSendCounts.keys());
+    const pendingTurns = new Set(this.sendPreflight.sends.workspaceIds());
     let queuedMessages = 0;
     const heldInputWorkspaces: Array<{ id: string; title?: unknown; name?: unknown }> = [];
     let autoRetries = 0;
@@ -5553,11 +5413,12 @@ export class WorkspaceService
       // preflights (manual sends counted but not yet queued or busy) to the
       // session's follow-up idle probes so redispatched synthetic turns yield
       // to them. Codex P1 (PRRT_kwDOPxxmWM6cRi_J): reads the session-invisible
-      // counter, not preflightSendCounts — the originating send's reservation
+      // counter, not sendPreflight.sends — the originating send's reservation
       // is released at its queue/session handoff so a follow-up dispatched
       // from within that turn does not veto itself.
-      hasExternalSendPreflight: () => this.hasSessionInvisiblePreflight(workspaceId),
-      hasExternalManualSendPreflight: () => this.hasManualSessionInvisiblePreflight(workspaceId),
+      hasExternalSendPreflight: () => this.sendPreflight.hasSessionInvisiblePreflight(workspaceId),
+      hasExternalManualSendPreflight: () =>
+        this.sendPreflight.hasManualSessionInvisiblePreflight(workspaceId),
       isStopInProgress: () =>
         this.agentTaskIntegration?.isWorkspaceStopInProgress(workspaceId) === true,
       getStopEpoch: () => this.agentTaskIntegration?.getWorkspaceStopEpoch(workspaceId) ?? 0,
@@ -11647,7 +11508,7 @@ export class WorkspaceService
       },
     };
     const activityLabels: string[] = [];
-    if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+    if (this.sendPreflight.hasSendInPreflight(workspaceId)) {
       activityLabels.push("a message send in progress");
     }
     // A user stream admitted after the caller's activity snapshot has already released its
@@ -12101,13 +11962,13 @@ export class WorkspaceService
       // Fail-closed live-activity gate for model-facing callers. This check and the
       // archivingWorkspaces.add above run in one synchronous block, pairing with the
       // synchronous entry guards in sendMessage: a send whose entry block ran first is
-      // visible here (preflightSendCounts or a registered stream) and refuses the archive;
+      // visible here (sendPreflight.sends or a registered stream) and refuses the archive;
       // a send entering later observes archivingWorkspaces and is refused instead.
       if (options?.refuseLiveUserActivity === true) {
         const liveActivity = this.listLiveWorkspaceActivity(workspaceId);
         const activityLabels: string[] = [];
         if (liveActivity.streaming) activityLabels.push("an active stream");
-        if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
+        if (this.sendPreflight.hasSendInPreflight(workspaceId)) {
           activityLabels.push("a message send in progress");
         }
         activityLabels.push(...this.operationAdmission.inFlightOperationLabels(workspaceId));
@@ -15624,30 +15485,18 @@ export class WorkspaceService
     // A late arrival of an id this receiver answered "not accepted": the
     // client shows its content again, so appending it now would duplicate it. Checked and the
     // ids registered as running in one synchronous block, so getSendStatus sees one or the other.
-    const refused = this.refusedSendIds.get(key);
-    if (sendIdentities.some((identity) => refused?.has(identity.id) === true)) {
+    const sendIds = sendIdentities.map((identity) => identity.id);
+    if (this.sendPreflight.isSendIdRefused(key, sendIds)) {
       log.info("sendMessage refused: the send id was already answered not accepted", {
         workspaceId: key,
       });
       return Err({ type: "unknown", raw: SEND_ID_REFUSED_MESSAGE });
     }
-    const inFlight = this.inFlightSendIds.get(key) ?? new Map<string, number>();
-    this.inFlightSendIds.set(key, inFlight);
-    for (const { id } of sendIdentities) inFlight.set(id, (inFlight.get(id) ?? 0) + 1);
-    try {
-      return await this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, {
-        ...internal,
-        sendIdentities,
-      });
-    } finally {
-      for (const { id } of sendIdentities) {
-        const count = inFlight.get(id) ?? 0;
-        if (count > 1) inFlight.set(id, count - 1);
-        else inFlight.delete(id);
-      }
-      if (inFlight.size === 0 && this.inFlightSendIds.get(key) === inFlight)
-        this.inFlightSendIds.delete(key);
-    }
+    using _inFlightSendIds = this.sendPreflight.trackInFlightSendIds(key, sendIds);
+    return await this.sendMessageWithIds(workspaceId, message, optionsWithoutSendId, {
+      ...internal,
+      sendIdentities,
+    });
   }
 
   /**
@@ -15671,21 +15520,19 @@ export class WorkspaceService
     if (findWorkspaceEntry(this.config.loadConfigOrDefault(), key) == null) {
       return Err(`Workspace ${key} not found`);
     }
-    const isReceiver = receiverId == null || receiverId === this.sendReceiverId;
+    const isReceiver = receiverId == null || receiverId === this.sendPreflight.sendReceiverId;
     return this.historyService.resolveSendIds(key, sendIds, (evidenceOf) => {
       const pending = this.sessions.get(key)?.getPendingSendIds() ?? new Set<string>();
-      for (const id of this.inFlightSendIds.get(key)?.keys() ?? []) pending.add(id);
+      for (const id of this.sendPreflight.inFlightSendIdsOf(key)) pending.add(id);
       const status = (id: string): SendStatus => {
         if (provesAccepted(evidenceOf(id))) return "accepted";
         if (pending.has(id)) return "pending";
         if (!isReceiver) return "unknown";
-        const refused = this.refusedSendIds.get(key) ?? new Set<string>();
-        this.refusedSendIds.set(key, refused);
-        refused.add(id);
+        this.sendPreflight.refuseSendId(key, id);
         return "not-accepted";
       };
       return {
-        receiverId: this.sendReceiverId,
+        receiverId: this.sendPreflight.sendReceiverId,
         statuses: sendIds.map((sendId) => ({ sendId, status: status(sendId) })),
       };
     });
@@ -15835,7 +15682,7 @@ export class WorkspaceService
       }
 
       // Archive admission pairing (see archiveUnlocked's refuseLiveUserActivity gate): these
-      // checks run in the same synchronous block as the preflightSendCounts increment below,
+      // checks run in the same synchronous block as the sendPreflight.sends increment below,
       // so a send and an archive always observe each other — whichever entry block runs first
       // refuses the other side. Also refuses sends to already-archived workspaces so no stream
       // can run hidden in a workspace the UI no longer surfaces.
@@ -15909,20 +15756,7 @@ export class WorkspaceService
       // (context mutations instead refuse the send itself via the epoch
       // probe above). Released on every exit path; admitted sends have set
       // PREPARING (busy) by the time sendMessage returns.
-      this.preflightSendCounts.set(
-        workspaceId,
-        (this.preflightSendCounts.get(workspaceId) ?? 0) + 1
-      );
-      using _preflightSend = {
-        [Symbol.dispose]: () => {
-          const remaining = (this.preflightSendCounts.get(workspaceId) ?? 1) - 1;
-          if (remaining <= 0) {
-            this.preflightSendCounts.delete(workspaceId);
-          } else {
-            this.preflightSendCounts.set(workspaceId, remaining);
-          }
-        },
-      };
+      using _preflightSend = this.sendPreflight.sends.acquire(workspaceId);
       // Maintenance sends that yield to user input: requireIdle skips and queue-mode
       // heartbeats. Both must yield to a manual send in preflight rather than race it.
       const yieldsToPreflightSends =
@@ -15937,11 +15771,14 @@ export class WorkspaceService
         });
         return Ok(undefined);
       };
-      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId, {
-        supersedable: yieldsToPreflightSends,
-        manual:
-          (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.synthetic !== true,
-      });
+      using sessionInvisiblePreflight = this.sendPreflight.armSessionInvisiblePreflight(
+        workspaceId,
+        {
+          supersedable: yieldsToPreflightSends,
+          manual:
+            (internal?.acceptanceOrigin ?? "manual") === "manual" && internal?.synthetic !== true,
+        }
+      );
 
       // Guard: avoid creating sessions for workspaces that don't exist anymore.
       const workspaceConfig = this.config.findWorkspace(workspaceId);
@@ -16161,7 +15998,7 @@ export class WorkspaceService
       // while the earlier turn is streaming, and ensureStreamSafety aborts the earlier turn
       // to start the later one. Queue behind the earlier in-preflight send instead.
       // requireIdle callers keep their skip semantics below (and are never waited on, see
-      // sessionInvisiblePreflights); edits bypass the queue by design.
+      // SendPreflight.sessionInvisiblePreflights); edits bypass the queue by design.
       // An idle session can still hold queued work: a report-decision hold (see
       // TurnAdmissionToken.resolveDispatch) leaves its entry queued with no turn running. A send
       // started directly here would run before that entry, so queue behind it; the queue then
@@ -16178,11 +16015,11 @@ export class WorkspaceService
       // captured before a manual send entered preflight would otherwise win
       // idle admission here — the session only reports busy late in
       // AgentSession.sendMessage, so `isBusy()` alone cannot see the user's
-      // in-flight turn. `preflightSendCounts` includes THIS send (incremented
+      // in-flight turn. `sendPreflight.sends` includes THIS send (incremented
       // synchronously at entry above), so any other in-preflight send makes
       // the count exceed 1; refusing is safe because idle-only callers
       // (continuations, heartbeats) treat this as a transient skip and retry.
-      const hasOtherSendInPreflight = (this.preflightSendCounts.get(workspaceId) ?? 0) > 1;
+      const hasOtherSendInPreflight = this.sendPreflight.sends.count(workspaceId) > 1;
       if (!shouldQueue && internal?.requireIdle && hasOtherSendInPreflight) {
         return Err({
           type: "unknown",
@@ -16213,8 +16050,7 @@ export class WorkspaceService
         internal = {
           ...internal,
           admissionStale: () =>
-            callerAdmissionStale?.() === true ||
-            (this.preflightSendCounts.get(workspaceId) ?? 0) > 1,
+            callerAdmissionStale?.() === true || this.sendPreflight.sends.count(workspaceId) > 1,
         };
       }
 
@@ -16744,21 +16580,9 @@ export class WorkspaceService
       // (mirrors sendMessage): the archive gate refuses while a resume that already passed
       // these guards is still doing pre-admission work, so neither side can slip past the
       // other's snapshot.
-      this.preflightSendCounts.set(
-        workspaceId,
-        (this.preflightSendCounts.get(workspaceId) ?? 0) + 1
-      );
-      using _preflightResume = {
-        [Symbol.dispose]: () => {
-          const remaining = (this.preflightSendCounts.get(workspaceId) ?? 1) - 1;
-          if (remaining <= 0) {
-            this.preflightSendCounts.delete(workspaceId);
-          } else {
-            this.preflightSendCounts.set(workspaceId, remaining);
-          }
-        },
-      };
-      using sessionInvisiblePreflight = this.armSessionInvisiblePreflight(workspaceId);
+      using _preflightResume = this.sendPreflight.sends.acquire(workspaceId);
+      using sessionInvisiblePreflight =
+        this.sendPreflight.armSessionInvisiblePreflight(workspaceId);
       // A resume never queues, so later sends must not wait on its decision.
       sessionInvisiblePreflight.markDecided();
 
@@ -20381,7 +20205,7 @@ export class WorkspaceService
       return Err(`Workspace ${workspaceId} is being archived; cannot execute bash`);
     }
     // Archive admission pairing (same synchronous block as the guard above, mirroring
-    // sendMessage's preflightSendCounts): the metadata/init awaits below would otherwise
+    // sendMessage's sendPreflight.sends): the metadata/init awaits below would otherwise
     // hide this in-flight exec from the archive gate, letting an archive capture/remove the
     // checkout (or stop a dedicated Coder workspace) while the admitted command resumes
     // against it — on Coder even waking the workspace the archive hook just stopped. Held
@@ -20782,11 +20606,11 @@ export class WorkspaceService
       // kickoff candidate restored while a pre-goal manual send is mid-flight
       // (row already durable, session still phase-idle) can be consumed and
       // dispatched concurrently with — or ahead of — the user's turn.
-      // `preflightSendCounts` is incremented synchronously at sendMessage
+      // `sendPreflight.sends` is incremented synchronously at sendMessage
       // entry and held until the send settles; admitted sends have set
       // PREPARING (busy) by the time it releases. Queue-dispatched sends set
       // PREPARING synchronously before dispatch and are covered by isBusy().
-      isBusy: session?.isBusy() === true || (this.preflightSendCounts.get(workspaceId) ?? 0) > 0,
+      isBusy: session?.isBusy() === true || this.sendPreflight.hasSendInPreflight(workspaceId),
       // Held user input (a manual send refused at dispatch or restored after an interrupt) counts
       // as queued user input: an automatic goal turn never runs over input the user must resend
       // or discard, whichever candidate (kickoff, stream end, error resume) is pending (G4).

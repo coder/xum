@@ -28,7 +28,7 @@ export interface WorkspaceOperationAdmissionDeps {
 export class WorkspaceOperationAdmission {
   // In-flight renderer executeBash requests per workspace. Incremented in the same
   // synchronous block as executeBash's archivingWorkspaces check (mirroring
-  // preflightSendCounts) so archive admission and bash execution always observe each other:
+  // SendPreflight.sends) so archive admission and bash execution always observe each other:
   // an exec admitted first holds the archive gate open for its full duration, and an exec
   // entering after the gate armed is refused at entry.
   readonly exec = new PreflightCounter();
