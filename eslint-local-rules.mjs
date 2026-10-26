@@ -1849,13 +1849,15 @@ const localPlugin = {
     // `await sleep(50)`) is slow, and a check after it is racy: "nothing happened" also passes
     // when the unwanted call only comes after the wait. Wait on a signal instead (waitFor, a
     // deferred the fake resolves, settle() in connection.testHarness), or drive time with fake
-    // timers (src/browser/testFakeClock.ts). Waits under 20 ms are macrotask yields and pass.
+    // timers (src/browser/testFakeClock.ts). A literal delay under 20 ms is a macrotask yield and
+    // passes; any other delay (a constant, `DELAY_MS + 50`) counts as a fixed wait.
     //
-    // Limits: the rule sees a numeric literal delay in `setTimeout(resolve, N)` inside a Promise
-    // executor, in `Bun.sleep(N)`, and in a call of a same-file helper that passes one of its
-    // parameters as that delay (`const sleep = (ms) => new Promise((r) => setTimeout(r, ms))`,
-    // including a default value). It does not follow computed delays (`DEBOUNCE_MS + 50`),
-    // imported helpers or other timer APIs.
+    // The rule sees `setTimeout(resolve, delay)` inside a Promise executor and `Bun.sleep(delay)`.
+    // A wait inside a same-file helper (a function declaration or a const, also through an
+    // `act()` callback) counts once per call of the helper. When the helper passes one of its
+    // parameters as the delay, the argument (or the parameter's default) decides. Limits: it
+    // does not follow imported helpers, a helper that only another helper calls (that call
+    // counts once), or other timer APIs.
     "no-fixed-sleep": {
       meta: {
         type: "problem",
@@ -1872,7 +1874,7 @@ const localPlugin = {
         ],
         messages: {
           sleep:
-            "This waits a fixed {{ms}} ms of real time. Wait on a signal (waitFor, a deferred, " +
+            "This waits a fixed {{delay}} of real time. Wait on a signal (waitFor, a deferred, " +
             "settle()) or drive time with fake timers (src/browser/testFakeClock.ts).",
           lowerAllow:
             "This file has {{found}} fixed waits, but its local/no-fixed-sleep allow entry says " +
@@ -1881,13 +1883,22 @@ const localPlugin = {
       },
       create(context) {
         const MIN_MS = 20;
+        const sourceCode = context.sourceCode;
         const relFile = path.relative(context.cwd, context.filename).split(path.sep).join("/");
         const allowed = context.options[0]?.allow?.[relFile] ?? 0;
         const found = [];
-        // Helper function node -> the index of the parameter it passes as the delay.
+        // Helper function -> how its calls wait: `{ paramIndex }` (the call's argument decides)
+        // or `{ delay }` (every call waits that long).
         const helpers = new Map();
-        const literalMs = (node) =>
-          node?.type === "Literal" && typeof node.value === "number" ? node.value : null;
+        // The delay as shown in the message, or null for a yield: no delay, or a literal under
+        // MIN_MS. Any other expression is a fixed wait as far as the rule can tell.
+        const fixedDelay = (node) => {
+          if (node == null) return null;
+          if (node.type === "Literal" && typeof node.value === "number") {
+            return node.value >= MIN_MS ? `${node.value} ms` : null;
+          }
+          return `\`${sourceCode.getText(node)}\` ms`;
+        };
         const isFunction = (node) =>
           node?.type === "ArrowFunctionExpression" ||
           node?.type === "FunctionExpression" ||
@@ -1918,78 +1929,96 @@ const localPlugin = {
           const executor = enclosingFunction(node);
           return executor?.parent?.type === "NewExpression" &&
             executor.parent.arguments[0] === executor &&
-            isHostGlobal(context.sourceCode, executor.parent.callee, "Promise") &&
+            isHostGlobal(sourceCode, executor.parent.callee, "Promise") &&
             executor.params[0]?.type === "Identifier"
             ? executor
             : null;
         };
-        // The parameter name behind `ms` or `ms = 0`.
+        // The declaration that names a function: `function sleep() {}` or `const sleep = ...`.
+        const namingDeclaration = (fn) =>
+          fn?.type === "FunctionDeclaration" && fn.id
+            ? fn
+            : fn?.parent?.type === "VariableDeclarator" &&
+                fn.parent.init === fn &&
+                fn.parent.id.type === "Identifier"
+              ? fn.parent
+              : null;
+        // The named helper whose calls run the wait in `promise`: the function around it, or the
+        // function around the `act()` call whose callback holds it. Null for a wait written in
+        // a test body.
+        const helperOf = (promise) => {
+          let fn = enclosingFunction(promise);
+          const call = fn?.parent;
+          if (
+            call?.type === "CallExpression" &&
+            call.arguments.includes(fn) &&
+            (call.callee.type === "Identifier" ? call.callee.name : memberName(call.callee)) ===
+              "act"
+          ) {
+            fn = enclosingFunction(call);
+          }
+          return namingDeclaration(fn) ? fn : null;
+        };
         const paramName = (param) =>
           param.type === "AssignmentPattern" ? param.left.name : param.name;
-        const report = (node, ms) => found.push({ node, ms });
+        const report = (node, delay) => found.push({ node, delay });
         return {
           CallExpression(node) {
             const callee = node.callee;
-            if (
-              memberName(callee) === "sleep" &&
-              callee.object.type === "Identifier" &&
-              callee.object.name === "Bun"
-            ) {
-              const ms = literalMs(node.arguments[0]);
-              if (ms !== null && ms >= MIN_MS) report(node, ms);
+            if (memberName(callee) === "sleep" && isHostGlobal(sourceCode, callee.object, "Bun")) {
+              const delay = fixedDelay(node.arguments[0]);
+              if (delay !== null) report(node, delay);
               return;
             }
             const isTimer =
-              isHostGlobal(context.sourceCode, callee, "setTimeout") ||
+              isHostGlobal(sourceCode, callee, "setTimeout") ||
               (memberName(callee) === "setTimeout" &&
-                callee.object.type === "Identifier" &&
-                callee.object.name === "window");
+                isHostGlobal(sourceCode, callee.object, "window"));
             if (!isTimer) return;
             const executor = promiseExecutor(node);
             if (executor === null || !callsResolve(node.arguments[0], executor.params[0].name)) {
               return;
             }
-            const delay = node.arguments[1];
-            const ms = literalMs(delay);
-            if (ms !== null) {
-              if (ms >= MIN_MS) report(node, ms);
+            const delayNode = node.arguments[1];
+            const helper = helperOf(executor.parent);
+            const paramIndex =
+              delayNode?.type === "Identifier"
+                ? (helper?.params.findIndex((param) => paramName(param) === delayNode.name) ?? -1)
+                : -1;
+            if (paramIndex >= 0) {
+              helpers.set(helper, { paramIndex });
               return;
             }
-            // A helper that passes its parameter as the delay: its calls are the waits.
-            if (delay?.type !== "Identifier") return;
-            const helper = enclosingFunction(executor.parent);
-            const index = helper?.params.findIndex((param) => paramName(param) === delay.name);
-            if (helper && index >= 0) helpers.set(helper, index);
+            const delay = fixedDelay(delayNode);
+            if (delay === null) return;
+            if (helper) helpers.set(helper, { delay });
+            else report(node, delay);
           },
           "Program:exit"(program) {
-            // Calls of the helpers, by the binding they resolve to.
-            for (const [helper, index] of helpers) {
-              const declaration =
-                helper.type === "FunctionDeclaration"
-                  ? helper
-                  : helper.parent?.type === "VariableDeclarator"
-                    ? helper.parent
-                    : null;
-              const id = declaration?.id;
-              if (id?.type !== "Identifier") continue;
-              const variable = context.sourceCode
+            for (const [helper, wait] of helpers) {
+              const declaration = namingDeclaration(helper);
+              const variable = sourceCode
                 .getDeclaredVariables(declaration)
-                .find((candidate) => candidate.name === id.name);
-              const param = helper.params[index];
-              const defaultMs = param.type === "AssignmentPattern" ? literalMs(param.right) : null;
+                .find((candidate) => candidate.name === declaration.id.name);
+              const param = wait.paramIndex === undefined ? null : helper.params[wait.paramIndex];
               for (const reference of variable?.references ?? []) {
                 const call = reference.identifier.parent;
                 if (call?.type !== "CallExpression" || call.callee !== reference.identifier)
                   continue;
-                const argument = call.arguments[index];
-                const ms = argument === undefined ? defaultMs : literalMs(argument);
-                if (ms !== null && ms >= MIN_MS) report(call, ms);
+                let delay = wait.delay;
+                if (param) {
+                  const argument = call.arguments[wait.paramIndex];
+                  delay = fixedDelay(
+                    argument ?? (param.type === "AssignmentPattern" ? param.right : null)
+                  );
+                }
+                if (delay != null) report(call, delay);
               }
             }
             // The allow entry is an exact count, so it can only go down (as in no-raw-clock).
             found.sort((a, b) => a.node.range[0] - b.node.range[0]);
-            for (const { node, ms } of found.slice(allowed)) {
-              context.report({ node, messageId: "sleep", data: { ms: String(ms) } });
+            for (const { node, delay } of found.slice(allowed)) {
+              context.report({ node, messageId: "sleep", data: { delay } });
             }
             if (found.length < allowed) {
               context.report({
