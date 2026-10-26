@@ -228,6 +228,10 @@ async function dispatchPending(
 ): Promise<Result<void, string>> {
   const sessionDir = sessionDirOf(deps, record.workspaceId);
   const sendOptions = await deps.getDefaultSendOptions(record.workspaceId);
+  // Set once the user row is durable and the record is gone. A turn that then fails to start
+  // (e.g. no API key) still returns Err, but the message was delivered: its error shows in the
+  // chat as a stream error. Reporting it as "not sent" offered a Send that duplicated it (#7342).
+  let accepted = false;
   const result = await deps.sendMessage(
     record.workspaceId,
     buildArtifactInteractionText(record),
@@ -244,14 +248,20 @@ async function dispatchPending(
       queueDedupeKey: `${ARTIFACT_INTERACTION_DEDUPE_PREFIX}${record.id}`,
       // Fires once the user row is durable (immediately when idle, at dispatch when queued), so a
       // restart before then still finds the record and re-sends it.
-      onAccepted: () => removePending(sessionDir, record.id),
+      onAccepted: async () => {
+        await removePending(sessionDir, record.id);
+        // Only after the removal: a record left behind could be re-sent by a later startup.
+        // Known limit (#7643): if the removal throws, AgentSession still keeps the row, and the
+        // send is reported as failed although it was delivered.
+        accepted = true;
+      },
       // A queued send the user withdrew (Stop, queue clear) or one that failed before its stream
       // started is settled: replaying it on the next startup would resurrect it.
       onCanceled: () => removePending(sessionDir, record.id),
       onAcceptedPreStreamFailure: () => removePending(sessionDir, record.id),
     }
   );
-  if (!result.success) {
+  if (!result.success && !accepted) {
     // Startup replay keeps the record for the next startup; a live send removes it (its caller
     // reports the error).
     return Err(typeof result.error === "string" ? result.error : JSON.stringify(result.error));
