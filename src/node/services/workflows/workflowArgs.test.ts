@@ -35,6 +35,9 @@ const sourceWithOptionalObjectSchema = `export const meta = {
 export default function workflow() { return { reportMarkdown: "done" }; }
 `;
 
+const sourceWithoutMeta = `export default function workflow(args) { return { reportMarkdown: String(args) }; }
+`;
+
 describe("normalizeWorkflowArgsForSource", () => {
   test("treats input as structured data instead of tokenized command text", () => {
     const result = normalizeWorkflowArgsForSource(sourceWithInputSchema, {
@@ -66,5 +69,28 @@ describe("normalizeWorkflowArgsForSource", () => {
     expect(() => normalizeWorkflowArgsForSource(sourceWithInputSchema, {})).toThrow(
       "Workflow argument input is required"
     );
+  });
+
+  // F51: models sometimes send args as a JSON-encoded string. The run stores the normalized value,
+  // and the script reads it from there, so a string here reached the script as `args.prompt ===
+  // undefined`.
+  describe("JSON-encoded object args", () => {
+    const encoded = '  {"prompt": "review the diff", "roles": ["a", "b"]}\n';
+
+    test("decode to an object for a workflow without argsSchema", () => {
+      const result = normalizeWorkflowArgsForSource(sourceWithoutMeta, encoded);
+      expect(result.args).toEqual({ prompt: "review the diff", roles: ["a", "b"] });
+    });
+
+    test("decode to an object for an object argsSchema", () => {
+      const result = normalizeWorkflowArgsForSource(sourceWithInputSchema, '{"input":"mux"}');
+      expect(result.args).toEqual({ input: "mux" });
+    });
+
+    test("leave other strings unchanged", () => {
+      for (const raw of ["review mux --quick", "{not json}", '["a"]', '"quoted"', "42", "null"]) {
+        expect(normalizeWorkflowArgsForSource(sourceWithoutMeta, raw).args).toBe(raw);
+      }
+    });
   });
 });
