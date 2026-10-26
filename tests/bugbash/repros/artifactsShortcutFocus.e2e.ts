@@ -42,8 +42,14 @@ test(
     await expect(panel).toBeFocused();
     await expect(screen.getByRole("button", "Collapse right sidebar")).toBeVisible();
 
-    // Focus is in the tab: the key hides the sidebar.
+    // Focus is in the tab: the key hides the sidebar, and focus moves to the header toggle. The
+    // check reads DOM focus: in CI, toBeFocused on the accessibility tree sometimes missed the
+    // focus that moved onto the toggle while its label changed.
     await browser.keyboard.press("Control+Shift+K");
-    await expect(screen.getByRole("button", "Expand right sidebar")).toBeFocused();
+    await expect
+      .poll(() =>
+        browser.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? null)
+      )
+      .toBe("Expand right sidebar");
   }
 );
