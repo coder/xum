@@ -767,13 +767,6 @@ export const MAX_PERSISTED_KEY_CHARS = 8192;
 export type PersistedKeyKind = "ui" | "cache" | "workspace-scoped" | "draft";
 
 /**
- * `workspaceId` keys append a scope id to a fixed prefix. The scope id is usually a workspace id,
- * but creation drafts reuse the same keys with getDraftScopeId()/getPendingScopeId() scope ids and
- * some keys also accept project/global scope ids.
- */
-export type PersistedKeyScope = "global" | "workspaceId";
-
-/**
  * Which scope ids a workspace key is written under, for the budget model: "workspace" keys are
  * counted for every workspace and creation draft, "draft" keys only for creation drafts.
  * "webview" keys are written only by the VS Code webview, whose origin has its own quota, so they

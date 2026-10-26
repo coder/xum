@@ -122,5 +122,4 @@ export const AgentPluginInstallEntrySchema = z.object({
 });
 
 export type AgentPluginGitSource = z.infer<typeof AgentPluginGitSourceSchema>;
-export type AgentPluginInstallSource = z.infer<typeof AgentPluginInstallSourceSchema>;
 export type AgentPluginInstallEntry = z.infer<typeof AgentPluginInstallEntrySchema>;
