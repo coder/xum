@@ -3,8 +3,8 @@
  * lock, opens and acquires the turn's resources, constructs and registers the
  * stream, records the turn envelope, and launches processing. start() returns
  * once the stream registers; it does not wait for the turn to end.
- * StreamManager.startStream delegates here, and the attempt loop
- * (processStreamWithCleanup) still runs in StreamManager.
+ * StreamManager.startStream delegates here. Processing runs the attempt loop
+ * (AttemptLoop.processStreamWithCleanup) through a StreamManager delegate.
  */
 import { Effect, type Scope } from "effect";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
@@ -644,9 +644,10 @@ export class TurnEngine {
     ) {
       this.deps.turnRegistry.workspaceStreams.delete(start.workspaceId);
     }
-    // No handle is handed out on this path, so the completion is observed only
-    // by a supervisor forked at registration: settle it so that fiber exits
-    // instead of cancelling this never-started stream at shutdown.
+    // No handle is handed out on this path, so only the turn scope that
+    // superviseEngine forked at registration observes the completion: settle it
+    // so that scope closes instead of cancelling this never-started stream at
+    // shutdown.
     start.completionController.settle({
       status: "aborted",
       abortReason: this.deps.turnRegistry.getStartupAbortReason(start.options.abortSignal),

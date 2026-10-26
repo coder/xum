@@ -106,7 +106,8 @@ export interface TurnSlot {
   processingPromise: Promise<void>;
   // Latched by the first cancelStreamSafely call (synchronously, before its
   // first await) so concurrent cancellers — a user stop racing shutdown's
-  // engine supervisor — join one cleanup: exactly one stream-abort, one settle.
+  // "system" cancel (TurnRegistry.stopForShutdown) — join one cleanup: exactly
+  // one stream-abort, one settle.
   cancelPromise?: Promise<void>;
   // The turn's child scope of the app's AppFiberScope (superviseEngine); set only
   // when the manager was constructed with an engine scope.

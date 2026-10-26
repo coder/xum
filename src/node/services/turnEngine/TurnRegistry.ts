@@ -1,10 +1,10 @@
 /**
  * TurnRegistry owns each workspace's turn slot: the registered stream, the
  * pre-registration (pending) start, the start lock, the stream token, the
- * engine supervisor that fences shutdown on a turn's completion, and hard and
- * soft stop. StreamManager keeps its public methods as delegates and supplies
- * the partial flush, which still lives there, and the abort cleanup
- * (AttemptLoop.cleanupAbortedStream).
+ * per-turn scope (a child of the engine scope) that fences shutdown on a
+ * turn's completion, and hard and soft stop. StreamManager keeps its public
+ * methods as delegates and supplies the partial flush (PartialJournal.flush)
+ * and the abort cleanup (AttemptLoop.cleanupAbortedStream).
  */
 import { Effect, Exit, Fiber, Scope } from "effect";
 import assert from "@/common/utils/assert";
@@ -173,8 +173,8 @@ export class TurnRegistry {
       return;
     }
 
-    // Idempotent for concurrent cancellers (a user stop racing the shutdown
-    // supervisor's "system" cancel): the latch is checked and assigned here,
+    // Idempotent for concurrent cancellers (a user stop racing shutdown's
+    // "system" cancel in stopForShutdown): the latch is checked and assigned here,
     // synchronously, with no suspension before it — an await ahead of this
     // point would let both callers reach cleanupAbortedStream and emit two
     // stream-aborts. Later callers join the first cancel; its abortReason and
