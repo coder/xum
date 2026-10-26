@@ -4,6 +4,7 @@ import { Scope } from "effect";
 import type { StreamAbortReason } from "@/common/types/stream";
 import { closeScopeBounded } from "@/node/services/di/appRuntime";
 import { log } from "@/node/services/log";
+import { nodeClock } from "@/node/utils/hostClock";
 import { defaultEffectRunner } from "@/node/services/di/effectRunner";
 import type {
   ActiveStreamInfo,
@@ -44,6 +45,7 @@ function createRegistry(options: { engineScope?: Scope.Closeable } = {}) {
   let mock: MockStreamLifecycle | undefined;
   const registry: TurnRegistry = new TurnRegistry({
     effectRunner: defaultEffectRunner,
+    hostClock: nodeClock,
     engineScope: options.engineScope,
     turnEvents: new TurnEvents((event) => void events.push(event), {
       flushPartialWrite: () => Promise.resolve(),
