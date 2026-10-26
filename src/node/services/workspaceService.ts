@@ -470,6 +470,7 @@ import { WorkspaceNaming } from "@/node/services/workspaceNaming";
 import { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
 import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
 import { SendPreflight } from "@/node/services/sendPreflight";
+import { ContextMutationGate } from "@/node/services/contextMutationGate";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
@@ -2788,18 +2789,13 @@ export class WorkspaceService
     | ((workspaceId: string, outcome: IdleCompactionOutcome) => void)
     | undefined;
 
-  // Blocks new sends while a context-discarding history mutation (reset, full
-  // clear, destructive replace) is in flight, and enforces one such mutation
-  // at a time (r40). Sends already past this entry check are refused by the
-  // session-level turn-admission block (AgentSession.holdTurnAdmission).
-  private readonly contextMutationWorkspaces = new Set<string>();
-
-  // r41: monotonic count of COMPLETED context-discarding mutations per
-  // workspace. Sends capture it synchronously with the entry check above and
-  // re-verify at their admission gates: the level-triggered admission block
-  // cannot catch a mutation that started and finished while a send sat in
-  // pre-admission awaits (e.g. branch-summary generation).
-  private readonly contextMutationEpochs = new Map<string, number>();
+  // Context-discarding history mutations in flight and their completed count (the epoch).
+  // Lives in ContextMutationGate; the guard reaches the sessions through these closures.
+  private readonly contextMutationGate = new ContextMutationGate({
+    getOrCreateSession: (workspaceId) => this.getOrCreateSession(workspaceId),
+    isStreaming: (workspaceId) => this.aiService.isStreaming(workspaceId),
+    hasSendInPreflight: (workspaceId) => this.sendPreflight.hasSendInPreflight(workspaceId),
+  });
 
   // Sends between their entry check and their settled outcome, the session-invisible send
   // tickets and the idempotent send ids. Lives in SendPreflight; a disposed head-of-line ticket
@@ -4189,72 +4185,6 @@ export class WorkspaceService
     }
   }
 
-  /** r41: mark a context-discarding mutation as durably committed (see contextMutationEpochs). */
-  private advanceContextMutationEpoch(workspaceId: string): void {
-    this.contextMutationEpochs.set(
-      workspaceId,
-      (this.contextMutationEpochs.get(workspaceId) ?? 0) + 1
-    );
-  }
-
-  /**
-   * Admission guard for context-discarding history mutations (r40): reject
-   * new sends at the door (contextMutationWorkspaces), block turn admission
-   * inside the session, and only then verify idleness — all in one
-   * synchronous block, so no turn can slip between the check and the guard
-   * (see AgentSession.holdTurnAdmission for the pairing argument). Callers
-   * hold the guard across the whole mutation — including the refine
-   * drain/lock awaits — and must recheck busy-ness after those awaits for
-   * the turn starts that bypass admission gating (in-turn compaction
-   * retries observing a transient idle gap).
-   *
-   * Scope: process-local, like every send/rename/remove/busy guard in this
-   * service. Under XUM_ALLOW_MULTIPLE_INSTANCES=1 a second backend sharing
-   * the workspace can admit a send this guard never sees; sends do not
-   * participate in a cross-process admission protocol (only refine's
-   * durable staging/apply state does, via refine-apply.lock). Multi-instance
-   * mode is a development escape hatch — concurrent turn traffic against one
-   * workspace from two backends is unsupported beyond those durable-state
-   * locks. See CONCURRENT BACKENDS in processLiveness.ts.
-   */
-  private acquireContextMutationAdmissionGuard(
-    workspaceId: string,
-    operation: "truncate history" | "reset context" | "replace history"
-  ): Result<Disposable> {
-    if (this.contextMutationWorkspaces.has(workspaceId)) {
-      return Err("A context reset or clear is already in progress for this workspace.");
-    }
-    const session = this.getOrCreateSession(workspaceId);
-    this.contextMutationWorkspaces.add(workspaceId);
-    const admissionHold = session.holdTurnAdmission();
-    const guard: Disposable = {
-      [Symbol.dispose]: () => {
-        this.contextMutationWorkspaces.delete(workspaceId);
-        admissionHold[Symbol.dispose]();
-      },
-    };
-    // Busy check AFTER arming the block: a turn admitted first is observed
-    // here; a turn admitted later observes the block and refuses. Pending
-    // mid-stream compaction counts as turn work (r43): its direct session
-    // send bypasses this service's entry accounting.
-    if (session.hasActiveOrPendingTurnWork() || this.aiService.isStreaming(workspaceId)) {
-      guard[Symbol.dispose]();
-      return Err(`Cannot ${operation} while a turn is active. Press Esc to stop the stream first.`);
-    }
-    // r42: a send between its entry check and admission may have passed its
-    // pre-persist gate but not yet appended its rows. If this mutation
-    // committed first, those rows — including attacker-influenced family
-    // payload rows — would land durably in the fresh context: the epoch gate
-    // blocks the send's stream but cannot un-append. Refuse instead; sends
-    // settle in bounded time and the user retries. Counted synchronously at
-    // the send's entry, so one side always observes the other.
-    if (this.sendPreflight.hasSendInPreflight(workspaceId)) {
-      guard[Symbol.dispose]();
-      return Err(`Cannot ${operation} while a message is being sent. Try again in a moment.`);
-    }
-    return Ok(guard);
-  }
-
   /**
    * Block turn admission while a background service (/refine) publishes rows
    * into an idle workspace's history or applies refinements (r40). Fails
@@ -5132,7 +5062,7 @@ export class WorkspaceService
           ...this.renamingWorkspaces,
           ...this.removingWorkspaces,
           ...this.archivingWorkspaces,
-          ...this.contextMutationWorkspaces,
+          ...this.contextMutationGate.mutatingWorkspaceIds(),
           ...this.operationAdmission.fork.workspaceIds(),
           ...this.operationAdmission.staging.workspaceIds(),
         ]).size,
@@ -5389,7 +5319,8 @@ export class WorkspaceService
           args.workspacePath,
           args.runtimeConfig
         ),
-      onContextWindowRollover: () => this.advanceContextMutationEpoch(workspaceId),
+      onContextWindowRollover: () =>
+        this.contextMutationGate.advanceContextMutationEpoch(workspaceId),
       onCompactionComplete: (metadata) => {
         this.schedulePostCompactionMetadataRefresh(workspaceId);
         // Compaction marks a long session with accumulated learnings: harvest
@@ -14825,7 +14756,7 @@ export class WorkspaceService
     // decided: under the history write lock at the row's actual append (sendMessage's
     // publication, see createPlanReviewFeedbackPrecondition), which also covers partial
     // truncations, sibling backends and feedback deferred behind on-send compaction.
-    const epochAtPrepare = this.contextMutationEpochs.get(workspaceId) ?? 0;
+    const epochAtPrepare = this.contextMutationGate.epoch(workspaceId);
     const prepared = await preparePlanReviewFeedback(
       this.historyService,
       workspaceId,
@@ -14833,7 +14764,7 @@ export class WorkspaceService
       input.options
     );
     if (!prepared.success) return prepared;
-    if ((this.contextMutationEpochs.get(workspaceId) ?? 0) !== epochAtPrepare) {
+    if (this.contextMutationGate.epoch(workspaceId) !== epochAtPrepare) {
       return Err({
         type: "send_failed",
         error: {
@@ -15710,7 +15641,7 @@ export class WorkspaceService
         }
       }
 
-      if (this.contextMutationWorkspaces.has(workspaceId)) {
+      if (this.contextMutationGate.isMutating(workspaceId)) {
         log.debug("sendMessage blocked: a context-discarding history mutation is in progress", {
           workspaceId,
         });
@@ -15746,11 +15677,11 @@ export class WorkspaceService
       // reset/clear/replace that completes while this send is still doing
       // pre-admission work refuses the send instead of letting it append and
       // stream stale content into the fresh context.
-      let admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+      let admissionEpoch = this.contextMutationGate.epoch(workspaceId);
       let compactionAdmissionStale = () => false;
       const admissionEpochStale = () =>
         compactionAdmissionStale() ||
-        (this.contextMutationEpochs.get(workspaceId) ?? 0) !== admissionEpoch;
+        this.contextMutationGate.epoch(workspaceId) !== admissionEpoch;
       // r41: count this send as in-preflight until it settles so refine
       // publication refuses to interleave with its pre-admission window
       // (context mutations instead refuse the send itself via the epoch
@@ -16369,8 +16300,8 @@ export class WorkspaceService
         readCompactionAdmission,
         onTurnAdmissionCommitted: () => sessionInvisiblePreflight.release(),
         onContextWindowRollover: () => {
-          this.advanceContextMutationEpoch(workspaceId);
-          admissionEpoch = this.contextMutationEpochs.get(workspaceId) ?? 0;
+          this.contextMutationGate.advanceContextMutationEpoch(workspaceId);
+          admissionEpoch = this.contextMutationGate.epoch(workspaceId);
         },
         synthetic: internal?.synthetic,
         agentInitiated: internal?.agentInitiated,
@@ -17964,7 +17895,10 @@ export class WorkspaceService
     // may remove rows (percentage > 0) pays the guard; percentage <= 0 is a deterministic
     // no-op that retires nothing and keeps the plain busy pre-check.
     if (effectivePercentage > 0) {
-      return this.acquireContextMutationAdmissionGuard(workspaceId, "truncate history");
+      return this.contextMutationGate.acquireContextMutationAdmissionGuard(
+        workspaceId,
+        "truncate history"
+      );
     }
     if (this.sessions.get(workspaceId)?.isBusy() || this.aiService.isStreaming(workspaceId)) {
       return Err(
@@ -18205,7 +18139,7 @@ export class WorkspaceService
     // r41: the discard is durable — sends that entered before it must not be
     // admitted afterwards (their content references the discarded context).
     if (isFullClear) {
-      this.advanceContextMutationEpoch(workspaceId);
+      this.contextMutationGate.advanceContextMutationEpoch(workspaceId);
     }
     // r43: a fork's settled branch-summary registration stays consumable
     // until the first send; its row was just deleted, so drop the
@@ -18253,7 +18187,10 @@ export class WorkspaceService
     // held across the refine drain/lock awaits below so a send admitted
     // mid-reset cannot snapshot the pre-reset transcript and stream across
     // the boundary.
-    const guardResult = this.acquireContextMutationAdmissionGuard(workspaceId, "reset context");
+    const guardResult = this.contextMutationGate.acquireContextMutationAdmissionGuard(
+      workspaceId,
+      "reset context"
+    );
     if (!guardResult.success) {
       return Err(guardResult.error);
     }
@@ -18360,7 +18297,7 @@ export class WorkspaceService
       // r41: the boundary is durable — sends that entered before it must not
       // be admitted afterwards (their content references the discarded
       // context).
-      this.advanceContextMutationEpoch(workspaceId);
+      this.contextMutationGate.advanceContextMutationEpoch(workspaceId);
       // r43: drop any settled-but-unconsumed branch-summary registration —
       // its row now sits behind the new boundary, and the next send would
       // otherwise re-emit that pre-reset summary into the live transcript.
@@ -18461,7 +18398,10 @@ export class WorkspaceService
     // inside an active turn, so they stay unguarded.
     let admissionGuard: Disposable | null = null;
     if (!isCompaction) {
-      const guardResult = this.acquireContextMutationAdmissionGuard(workspaceId, "replace history");
+      const guardResult = this.contextMutationGate.acquireContextMutationAdmissionGuard(
+        workspaceId,
+        "replace history"
+      );
       if (!guardResult.success) {
         return Err(guardResult.error);
       }
@@ -18621,8 +18561,8 @@ export class WorkspaceService
         }
         if (!isCompaction) {
           // r41: the destructive replacement is durable — refuse sends that
-          // entered before it (see contextMutationEpochs).
-          this.advanceContextMutationEpoch(workspaceId);
+          // entered before it (see ContextMutationGate.contextMutationEpochs).
+          this.contextMutationGate.advanceContextMutationEpoch(workspaceId);
           // r43: same branch-summary hygiene as full clear, and same r44
           // ordering — drop the registration only after the clear commits
           // (see truncateHistory).
