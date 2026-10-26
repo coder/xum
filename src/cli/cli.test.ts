@@ -122,7 +122,13 @@ describe("CLI nullable options (#7156)", () => {
   // Echoes the parsed input, so the test sees exactly what the CLI sends.
   const echoRouter = {
     set: orpcBase
-      .input(z.object({ name: z.string(), intervalMs: z.number().int().nullish() }))
+      .input(
+        z.object({
+          name: z.string(),
+          intervalMs: z.number().int().nullish(),
+          ids: z.array(z.number().nullable()).optional(),
+        })
+      )
       .handler(({ input }) => input),
   };
   const runEcho = createCliRunnerForRouter(echoRouter);
@@ -137,6 +143,13 @@ describe("CLI nullable options (#7156)", () => {
       intervalMs: 1800000,
     });
     expect(await runEcho(["set", "--name", "a"])).toEqual({ name: "a" });
+  });
+
+  test("a null array item stays null", async () => {
+    expect(await runEcho(["set", "--name", "a", "--ids", "1", "--ids", "null"])).toEqual({
+      name: "a",
+      ids: [1, null],
+    });
   });
 });
 
