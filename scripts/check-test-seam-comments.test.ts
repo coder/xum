@@ -118,6 +118,14 @@ test("matches test-double seam claims, not prose about doubles", () => {
   expect(
     seams("// Manager without an inventory (test doubles): list from disk.\nexport const d = 1;")
   ).toEqual([]);
+  // Singular forms make the same claim.
+  expect(seams("// Absent from a test double.\nexport const f = 1;")).toEqual(["1:f"]);
+  expect(seams("// A test double of AIService passes one too.\nexport const g = 1;")).toEqual([
+    "1:g",
+  ]);
+  // A negated absence and the noun "pass" claim no seam.
+  expect(seams("// Not absent from test doubles.\nexport const h = 1;")).toEqual([]);
+  expect(seams("// Test doubles record each render pass.\nexport const i = 1;")).toEqual([]);
   // "pass" in a later sentence is not part of the claim.
   expect(seams("// Uses test doubles. Callers pass a factory.\nexport const e = 1;")).toEqual([]);
 });
