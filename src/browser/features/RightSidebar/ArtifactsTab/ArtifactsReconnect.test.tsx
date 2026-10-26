@@ -18,6 +18,7 @@ import {
   createConnectionHarness,
   GAP_MODES,
   type ConnectionHarness,
+  settle,
 } from "@/browser/contexts/connection.testHarness";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import type { TestApiOverrides } from "@/browser/testUtils";
@@ -191,16 +192,9 @@ function ConnectionWrapper(props: { children: ReactNode }) {
   );
 }
 
-/** Let pending requests and the renders they cause settle. */
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 30));
-  });
-}
-
 async function dropConnection() {
   await harness.drop();
-  await flush();
+  await settle();
 }
 
 /** Reconnects and waits until the panel re-listed through the new client. */
@@ -208,7 +202,7 @@ async function reconnect() {
   const before = listCalls;
   harness.reconnect();
   await waitFor(() => expect(listCalls).toBeGreaterThan(before));
-  await flush();
+  await settle();
 }
 
 /** Identity check without printing the whole DOM node on failure. */
@@ -267,7 +261,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     persistedState = { step: 1 };
     const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    await flush();
+    await settle();
     const srcdoc = frame.getAttribute("srcdoc");
     const statesRead = getStateCalls;
     postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { step: 2 } });
@@ -313,7 +307,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
       persistedState = { step: 1 };
       const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
       const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-      await flush();
+      await settle();
       const srcdoc = frame.getAttribute("srcdoc");
       const statesRead = getStateCalls;
 
@@ -334,7 +328,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
       act(() => poll());
       await waitFor(() => expect(listCalls).toBeGreaterThan(listsBefore));
       await waitFor(() => expect(view.queryByText("Backend is starting")).toBeNull());
-      await flush();
+      await settle();
       expectSameFrame(view.queryByTestId("artifact-frame"), frame);
       expect(frame.getAttribute("srcdoc")).toBe(srcdoc);
       expect(getStateCalls).toBe(statesRead);
@@ -355,7 +349,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
 
     await dropConnection();
     harness.reconnect();
-    await flush();
+    await settle();
     expectSameFrame(view.queryByTestId("mcp-app-frame"), frame);
     // A torn-down host would have told the view to tear down.
     expect(posted.map((message) => message.method)).not.toContain("ui/resource-teardown");
@@ -386,11 +380,11 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
     failGetState = true;
     const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    await flush();
+    await settle();
     expect(frame.getAttribute("srcdoc")).not.toContain("zq-persisted");
     const statesRead = getStateCalls;
     // A lasting failure is not retried against the same client.
-    await flush();
+    await settle();
     expect(getStateCalls).toBe(statesRead);
 
     failGetState = false;
@@ -406,7 +400,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
   test("a state set while offline is saved even if the panel unmounts first", async () => {
     const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    await flush();
+    await settle();
     await dropConnection();
     postFromFrame(frame, { xumArtifact: 1, type: "setState", state: { marker: "zq-offline" } });
     // A tab switch unmounts the panel before the connection is back.
@@ -428,7 +422,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
   test("Send does not record a version from a version list whose refresh failed", async () => {
     const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    await flush();
+    await settle();
     failVersions = true;
     await dropConnection();
     await reconnect();
@@ -448,7 +442,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
   test("Send while offline shows the reconnecting message and sends nothing", async () => {
     const view = render(<ArtifactsPanel workspaceId="ws-r" />, { wrapper: ConnectionWrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    await flush();
+    await settle();
     postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Ship" });
     const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
     await waitFor(() => expect(sendButton.disabled).toBe(false), {
@@ -482,7 +476,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
 
     await dropConnection();
     view.rerender(element(1));
-    await flush();
+    await settle();
     // The re-read waits for the connection instead of reporting the file as missing.
     expect(view.queryByText(/Could not read/)).toBeNull();
     expect(view.getByText("Q")).toBeTruthy();
@@ -490,7 +484,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
 
     harness.reconnect();
     await waitFor(() => expect(assetReads.length).toBe(reads + 1));
-    await flush();
+    await settle();
     expect(view.queryByText(/Could not read/)).toBeNull();
   });
 
@@ -519,7 +513,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
       <CanvasArtifact content={content} path="board.canvas.json" workspaceId="ws-r" />,
       { wrapper: ConnectionWrapper }
     );
-    await flush();
+    await settle();
     // The abort lands before the API turns null: the read waits instead of failing.
     expect(assetReads).toEqual(["data/s.json"]);
     expect(view.queryByText(/Could not read/)).toBeNull();

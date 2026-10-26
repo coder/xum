@@ -2,7 +2,7 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { act, cleanup, render, waitFor } from "@testing-library/react";
+import { cleanup, render, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { BackgroundBashOutputDialog } from "@/browser/components/BackgroundBashOutputDialog/BackgroundBashOutputDialog";
@@ -11,6 +11,7 @@ import {
   createConnectionHarness,
   GAP_MODES,
   type ConnectionHarness,
+  settle,
 } from "@/browser/contexts/connection.testHarness";
 import { SubagentTranscriptDialog } from "@/browser/features/Tools/SubagentTranscriptDialog";
 import type { TestApiOutput, TestApiOverrides } from "@/browser/testUtils";
@@ -74,21 +75,15 @@ function Wrapper(props: { children: ReactNode }) {
   return <Connection>{props.children}</Connection>;
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  });
-}
-
 /** Drop the connection and wait until the dialog settled on it. */
 async function drop() {
   await harness.drop();
-  await flush();
+  await settle();
 }
 
 async function reconnect() {
   harness.reconnect();
-  await flush();
+  await settle();
 }
 
 function noop() {
@@ -219,7 +214,7 @@ describe.each([...GAP_MODES])("dialogs opened while reconnecting (%s)", (mode) =
     const view = render(<PlanFileDialog open onOpenChange={noop} workspaceId="ws-1" />, {
       wrapper: Wrapper,
     });
-    await flush();
+    await settle();
 
     const next = deferred<PlanAnswer>();
     answerPlan = () => next.promise;
@@ -236,7 +231,7 @@ describe.each([...GAP_MODES])("dialogs opened while reconnecting (%s)", (mode) =
     const view = render(<SubagentTranscriptDialog open onOpenChange={noop} taskId="task-1" />, {
       wrapper: Wrapper,
     });
-    await flush();
+    await settle();
 
     const next = deferred<TranscriptAnswer>();
     answerTranscript = () => next.promise;

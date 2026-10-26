@@ -2,7 +2,7 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { act, cleanup, renderHook } from "@testing-library/react";
+import { cleanup, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
@@ -10,6 +10,7 @@ import {
   createConnectionHarness,
   GAP_MODES,
   type ConnectionHarness,
+  settle,
 } from "@/browser/contexts/connection.testHarness";
 import {
   createTestConfig,
@@ -51,20 +52,14 @@ function Wrapper(props: { children: ReactNode }) {
   return <Connection>{props.children}</Connection>;
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  });
-}
-
 async function drop() {
   await harness.drop();
-  await flush();
+  await settle();
 }
 
 async function reconnect() {
   harness.reconnect();
-  await flush();
+  await settle();
 }
 
 /** Never answers: the read stays in flight until a drop cuts it off. */
@@ -89,7 +84,7 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
   test("the debug-logs setting keeps its value through a read the drop cut off", async () => {
     answerConfig = () => Promise.resolve(createTestConfig({ llmDebugLogs: true }));
     const view = renderHook(() => useLlmDebugLogsEnabled(useAPI().api), { wrapper: Wrapper });
-    await flush();
+    await settle();
     expect(view.result.current).toBe(true);
 
     await drop();
@@ -116,9 +111,9 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
       renderHook(() => useTerminalSessionSync(useAPI().api, "ws-1", layout, () => undefined), {
         wrapper: Wrapper,
       });
-      await flush();
+      await settle();
       await drop();
-      await flush();
+      await settle();
       expect(unhandled).toEqual([]);
     } finally {
       process.off("unhandledRejection", onUnhandled);
@@ -131,7 +126,7 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
     const view = renderHook(() => useDesktopAvailable(useAPI().api, true, "ws-1"), {
       wrapper: Wrapper,
     });
-    await flush();
+    await settle();
     expect(view.result.current).toBe(true);
 
     await drop();
