@@ -153,7 +153,7 @@ export async function setupWorkspaceView(
       const el = view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
       if (!el) throw new Error("Workspace not found in sidebar");
       // Wait until the workspace is selectable before clicking. aria-disabled covers only
-      // removing and archiving: this does not wait for workspace setup (isInitializing).
+      // removing and archiving; the setup wait comes after the click.
       if (el.getAttribute("aria-disabled") === "true") {
         throw new Error("Workspace still disabled");
       }
@@ -163,6 +163,22 @@ export async function setupWorkspaceView(
   );
   fireEvent.click(workspaceElement);
   await waitForPageSettled(view.container);
+
+  // Wait until the row has left workspace setup: while setup runs, it shows a cancel button in
+  // place of its actions menu, hides quick archive, and the Review tab shows a placeholder. Tests
+  // that used those controls right away raced setup on slow runners (#7450, #7541, #7543).
+  // Positive signal, not copy: the row's actions-menu trigger (the only popover trigger carrying
+  // the row's data-workspace-id) renders only once setup has ended. If it is ever removed, this
+  // wait fails loudly instead of passing at once.
+  await waitFor(
+    () => {
+      const menuTrigger = view.container.querySelector(
+        `button[data-workspace-id="${workspaceId}"][aria-haspopup]`
+      );
+      if (!menuTrigger) throw new Error("Workspace still in setup (no actions menu yet)");
+    },
+    { timeout: 30_000 }
+  );
 
   // Ensure the workspace is registered and activated in the store so that
   // runOnChatSubscription starts. In the real app, WorkspaceContext handles
