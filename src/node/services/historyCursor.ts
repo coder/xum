@@ -38,7 +38,7 @@ const positionFields = {
 const windowIdField = z.string().refine(isHistoryIdentifierRepresentable).nullable();
 const windowBoundaryKindField = z.nativeEnum(CONTEXT_BOUNDARY_KINDS).nullable();
 const rowLocation = z.object({ artifact: HistoryArtifactSchema, byteOffset: offset }).strict();
-const HistoryScanStateSchema = z
+export const HistoryScanStateSchema = z
   .object({
     provenanceEpoch: z.string().uuid(),
     snapshots: z.object({ chat: HistorySnapshotSchema, archive: HistorySnapshotSchema }).strict(),
