@@ -576,6 +576,51 @@ export const AddPluginConsentPreviewPhoneViewport: Story = {
   },
 };
 
+/**
+ * A long unbroken Preview error (#7623), such as one that names a 300-character source. The
+ * error must wrap inside the Add plugin panel at phone width instead of running past its right
+ * edge. Each `break-words` span in a flex row needs `min-w-0`: a flex item defaults to
+ * `min-width: auto`, so it cannot shrink below its longest unbroken token.
+ */
+export const AddPluginPreviewLongErrorPhoneViewport: Story = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  parameters: {
+    layout: "fullscreen",
+    pixel: {
+      matrix: { themes: ["dark"], viewports: ["phone"] },
+    },
+  },
+  render: () => (
+    <PluginsSectionStoryShell
+      options={{
+        agentPlugins: { items: [], previewError: `Unsupported plugin source: ${"a".repeat(300)}` },
+      }}
+    >
+      {/* Fixed phone width so the play's overflow assertion holds in the CI
+          test-runner too, which ignores viewport globals (AGENTS.md). */}
+      <div style={{ width: 390 }}>
+        <PluginsSettingsSection />
+      </div>
+    </PluginsSectionStoryShell>
+  ),
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+
+    await userEvent.click(await canvas.findByRole("button", { name: /Add plugin/ }));
+    await userEvent.type(await canvas.findByLabelText(/Git URL or owner\/repo/), "a".repeat(30));
+    await userEvent.click(await canvas.findByRole("button", { name: /Preview/ }));
+
+    const alert = await canvas.findByRole("alert");
+    if (alert.scrollWidth > alert.clientWidth + 1) {
+      throw new Error(
+        `Preview error overflows its alert at phone width (${alert.scrollWidth} > ${alert.clientWidth})`
+      );
+    }
+  },
+};
+
 const UPDATE_REVIEW_OPTIONS: MockORPCClientOptions = {
   agentPlugins: {
     items: [MANAGED_ITEM],
