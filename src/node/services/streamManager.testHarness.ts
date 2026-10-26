@@ -2,7 +2,6 @@ import type { ToolCallDisplayRegistry } from "./toolCallDisplayRegistry";
 import type { streamText } from "ai";
 import type { Scope } from "effect";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
-import type { MuxMessage } from "@/common/types/message";
 import type { EffectRunner } from "./di/effectRunner";
 import type { HistoryService } from "./historyService";
 import type { SessionUsageService } from "./sessionUsageService";
@@ -101,8 +100,6 @@ export function createStreamManagerForTests(
  *   rejecting one (startStream always attaches a catch).
  * - flushPartialWrite: forcing the pre-cancel flush to reject (it swallows its
  *   own writePartial errors).
- * - resetStreamStateForRetry / buildPartialAssistantMessage: the parts-preserving
- *   reset, reachable publicly only through the previousResponseId retry.
  * - processStreamWithCleanup: asserting the refusal-fallback swap clears the
  *   private stepTracker.latestMessages.
  * Types mirror what these tests pass, not the real signatures. Do not add members
@@ -111,15 +108,6 @@ export function createStreamManagerForTests(
 export interface StreamManagerEngineInternals {
   readonly workspaceStreams: Map<string, unknown>;
   flushPartialWrite: (workspaceId: string, streamInfo: unknown) => Promise<void>;
-  resetStreamStateForRetry: (
-    workspaceId: string,
-    streamInfo: unknown,
-    options: { preserveParts: boolean }
-  ) => Promise<void>;
-  buildPartialAssistantMessage: (
-    streamInfo: unknown,
-    options?: Record<string, unknown>
-  ) => MuxMessage;
   processStreamWithCleanup: (
     workspaceId: string,
     streamInfo: unknown,

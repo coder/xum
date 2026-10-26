@@ -448,7 +448,7 @@ export class StreamManager {
       createStreamResult: (request, abortController, stepTracker) =>
         this.createStreamResult(request, abortController, stepTracker),
       resetStreamStateForRetry: (workspaceId, streamInfo, options) =>
-        this.resetStreamStateForRetry(workspaceId, streamInfo, options),
+        this.streamRetries.resetStreamStateForRetry(workspaceId, streamInfo, options),
       moveAnthropicThinkingReplayPoint,
       getStreamMetadata: (streamInfo) => this.getStreamMetadata(streamInfo),
       backfillReasoningTokensFromParts: (streamInfo, usage) =>
@@ -1100,15 +1100,6 @@ export class StreamManager {
     historySequence: number
   ): Promise<void> {
     return this.attemptLoop.processStreamWithCleanup(workspaceId, streamInfo, historySequence);
-  }
-
-  /** StreamRetries.resetStreamStateForRetry; whitebox tests (engineInternals) call it here. */
-  private resetStreamStateForRetry(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    options?: { preserveParts?: boolean; preserveUsage?: boolean; workspaceLog?: Logger }
-  ): Promise<void> {
-    return this.streamRetries.resetStreamStateForRetry(workspaceId, streamInfo, options);
   }
 
   /**
