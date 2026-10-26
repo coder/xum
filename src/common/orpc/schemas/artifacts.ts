@@ -93,7 +93,6 @@ export type ArtifactCapabilities = z.infer<typeof ArtifactCapabilitiesSchema>;
  * indexes as corrupt and move their history aside.
  */
 export const ArtifactVersionSourceSchema = z.enum(["publish", "turn-end", "attach_file"]);
-export type ArtifactVersionSource = z.infer<typeof ArtifactVersionSourceSchema>;
 
 /** Shelf pin requested by the agent's `artifact` tool; M5 copies pinned versions to the shelf. */
 export const ArtifactPinSchema = z.enum(["project", "global"]);

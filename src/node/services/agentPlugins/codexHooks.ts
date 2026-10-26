@@ -48,7 +48,6 @@ export const MAPPED_CODEX_HOOK_EVENTS = {
   UserPromptSubmit: "message.send",
   Stop: "turn.stop",
 } as const;
-export type MappedCodexHookEvent = keyof typeof MAPPED_CODEX_HOOK_EVENTS;
 
 /** Other Codex events: parsed and listed, never run. */
 const IGNORED_CODEX_HOOK_EVENTS = new Set([
