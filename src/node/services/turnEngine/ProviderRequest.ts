@@ -1,13 +1,12 @@
 /**
- * ProviderRequest: the one owner of opening a StreamManager turn's provider stream
+ * ProviderRequest: the one owner of a StreamManager turn's provider request
  * (turn-engine layer 4a). It holds the cross-turn provider state that request building
  * reads (the OpenAI previousResponseIds the provider lost, and the continuous-compaction
  * prefix swap that the next step's request applies), builds the per-attempt request
  * config, and applies a pending mid-turn thinking override to it.
  *
- * StreamManager still opens the stream (createStreamResult) and builds its stop
- * conditions (createStopWhenCondition): both are complexity hotspots that a later layer
- * shrinks in place before they move here.
+ * StepPreparation opens the stream from that config (createStreamResult). StreamManager
+ * still builds the stop conditions (createStopWhenCondition).
  *
  * Shape: like PartialJournal and UsageLedger, a plain class that StreamManager
  * constructs. The swap staging fields stay on each stream's step tracker
