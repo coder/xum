@@ -597,7 +597,7 @@ describe("Unread indicator (mock AI router)", () => {
 
       await openWorkspaceActionsMenu(otherWorkspace.displayTitle);
       await waitFor(() => {
-        expect(queryMenuItem("Mark unread")).toBeNull();
+        expect(queryMenuItem("Mark unread") === null).toBe(true);
       });
     });
 
@@ -616,7 +616,7 @@ describe("Unread indicator (mock AI router)", () => {
 
       await openWorkspaceActionsMenu(selectedDisplayTitle);
       await waitFor(() => {
-        expect(queryMenuItem("Mark unread")).toBeNull();
+        expect(queryMenuItem("Mark unread") === null).toBe(true);
       });
     });
   });

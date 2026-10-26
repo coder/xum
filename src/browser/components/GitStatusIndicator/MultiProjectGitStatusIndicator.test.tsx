@@ -203,7 +203,7 @@ describe("MultiProjectGitStatusIndicator", () => {
     fireEvent.click(body.getByRole("button", { name: "Close" }));
 
     await waitFor(() => {
-      expect(body.queryByRole("dialog")).toBeNull();
+      expect(body.queryByRole("dialog") === null).toBe(true);
     });
   });
 

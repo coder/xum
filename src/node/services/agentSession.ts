@@ -280,8 +280,7 @@ import {
   type RetryFailureError,
   type RetryStatusEvent,
 } from "./retryManager";
-import { defaultEffectRunner, type EffectRunner } from "./di/effectRunner";
-import { hostClockFor } from "./di/hostClockLive";
+import type { EffectRunner } from "./di/effectRunner";
 import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import type { Scope } from "effect";
 import type { TelemetryService } from "./telemetryService";
@@ -1031,28 +1030,11 @@ export interface AgentSessionStreamManager {
   replayStream(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
   /**
    * The runner the stream manager's clock-driven fibers use; the session's
-   * `RetryManager` schedules its backoff on the same clock. Absent on test
-   * doubles and the AIService fallback, which leaves RetryManager on the
-   * global runtime.
+   * `RetryManager` schedules its backoff on the same clock.
    */
-  readonly effectRunner?: EffectRunner;
-  /** The stream's HostClock (StreamManager.hostClock). Absent on test doubles. */
-  readonly hostClock?: HostClock;
-}
-
-/**
- * One clock with the runner that supervises a session and runs RetryManager's sleeps: the
- * explicit clock first, then the stream's, else the clock of the runner that supervise() uses.
- */
-function resolveSessionHostClock(
-  options: Pick<AgentSessionOptions, "hostClock" | "effectRunner">,
-  streamManager: AgentSessionStreamManager
-): HostClock {
-  return (
-    options.hostClock ??
-    streamManager.hostClock ??
-    hostClockFor(options.effectRunner ?? streamManager.effectRunner ?? defaultEffectRunner)
-  );
+  readonly effectRunner: EffectRunner;
+  /** The stream's HostClock (StreamManager.hostClock). */
+  readonly hostClock: HostClock;
 }
 
 /** Keeps AgentSession coupled only to the AI operations and events it consumes. */
@@ -1066,18 +1048,6 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
   prepareStreamMessage?(
     options: StreamMessageOptions
   ): Promise<Result<PreparedStreamMessage, SendMessageError>>;
-  stopStream?(
-    workspaceId: string,
-    options?: {
-      soft?: boolean;
-      abandonPartial?: boolean;
-      abortReason?: StreamAbortReason;
-      emitIfMissing?: boolean;
-    }
-  ): Promise<Result<void>>;
-  isStreaming?(workspaceId: string): boolean;
-  getStreamInfo?(workspaceId: string): AgentSessionActiveStreamInfo | undefined;
-  replayStream?(workspaceId: string, options?: { afterTimestamp?: number }): Promise<void>;
   getProvidersConfig(): ProvidersConfigMap | null;
   isExperimentEnabled(experimentId: ExperimentId): boolean;
   buildMemorySessionContext?(
@@ -1121,14 +1091,14 @@ export interface AgentSessionAIService extends BranchSummaryAiService {
 interface AgentSessionOptions {
   contextManagement: ContextManagementService;
   effectRunner?: EffectRunner;
-  /** WorkspaceService passes the HostClock service. Default: see the constructor. */
+  /** WorkspaceService passes the HostClock service. Default: the stream manager's clock. */
   hostClock?: HostClock;
   appFiberScope?: Scope.Scope;
   workspaceId: string;
   config: Config;
   historyService: HistoryService;
   aiService: AgentSessionAIService;
-  streamManager?: AgentSessionStreamManager;
+  streamManager: AgentSessionStreamManager;
   mcpServerManager?: MCPServerManager;
   initStateManager: InitStateManager;
   telemetryService?: TelemetryService;
@@ -2010,16 +1980,10 @@ export class AgentSession {
       historyService.getCompactionCancellationStorage(trimmedWorkspaceId)
     );
     this.aiService = aiService;
-    const streamManagerCandidate = streamManager ?? aiService;
-    assert(
-      typeof streamManagerCandidate.stopStream === "function" &&
-        typeof streamManagerCandidate.isStreaming === "function" &&
-        typeof streamManagerCandidate.getStreamInfo === "function" &&
-        typeof streamManagerCandidate.replayStream === "function",
-      "AgentSession requires stream lifecycle access"
-    );
-    this.streamManager = streamManagerCandidate as AgentSessionStreamManager;
-    this.hostClock = resolveSessionHostClock(options, this.streamManager);
+    this.streamManager = streamManager;
+    // One clock with the runner that supervises the session and runs RetryManager's sleeps:
+    // the explicit clock (WorkspaceService passes the HostClock service), else the stream's.
+    this.hostClock = options.hostClock ?? streamManager.hostClock;
     this.mcpServerManager = mcpServerManager;
     this.initStateManager = initStateManager;
     this.backgroundProcessManager = backgroundProcessManager;
@@ -2135,7 +2099,7 @@ export class AgentSession {
     // App close can interrupt the guardian synchronously. Attach only after retry/compaction
     // collaborators exist, so a session created during shutdown can safely latch admission.
     this.coordinator.supervise(
-      options.effectRunner ?? this.streamManager.effectRunner ?? defaultEffectRunner,
+      options.effectRunner ?? this.streamManager.effectRunner,
       options.appFiberScope,
       () => this.beginShutdown()
     );
@@ -3706,7 +3670,7 @@ export class AgentSession {
   ): Promise<void> {
     const delayMs = Math.max(0, Math.trunc(retryDelayMs));
     if (delayMs > 0) {
-      const runner = this.streamManager.effectRunner ?? defaultEffectRunner;
+      const runner = this.streamManager.effectRunner;
       const sleeper = runner.runFork(Effect.sleep(delayMs));
       try {
         await raceWithAbortAndTimeout(runner.runPromise(Fiber.await(sleeper)), { signal });
@@ -11433,6 +11397,12 @@ export class AgentSession {
     }
     holder.pending = level;
     holder.manual = true;
+    // A Continue built from the captured options must run at the picked level, as for a speed
+    // pick below, even when the turn stops before its next model step (#7237).
+    const context = this.activeStreamContext;
+    if (context?.options) {
+      context.options = { ...context.options, thinkingLevel: level };
+    }
     return { accepted: true };
   }
 

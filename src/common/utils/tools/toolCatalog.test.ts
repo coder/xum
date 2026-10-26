@@ -5,7 +5,6 @@ import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import {
   applyNativeToolSearchReplay,
   buildToolCatalog,
-  buildToolCatalogOverview,
   buildToolSearchModelOutput,
   collectDeferLoadingToolNames,
   dedupeNativeToolReferences,
@@ -62,6 +61,36 @@ function baseTools(): Record<string, Tool> {
       title: { description: "Issue title" },
     }),
   };
+}
+
+/**
+ * The overview prepareToolSearch appends to tool_catalog_search's description when `catalog` is
+ * the deferred MCP surface. The search tool's own description is empty, so the result is the
+ * overview alone, and "" when nothing is deferred (prepareToolSearch then drops the tool).
+ */
+function advertisedOverview(catalog: readonly ToolCatalogEntry[]): string {
+  const prepared = prepareToolSearch({
+    tools: {
+      tool_catalog_search: fakeTool(""),
+      ...Object.fromEntries(
+        catalog.map((entry) => [
+          entry.name,
+          mcpTool(
+            entry.description,
+            entry.paramText ? { p: { description: entry.paramText } } : {}
+          ),
+        ])
+      ),
+    },
+    mcpToolNames: catalog.map((entry) => entry.name),
+    mcpToolServers: Object.fromEntries(
+      catalog.flatMap((entry) =>
+        entry.serverName === undefined ? [] : [[entry.name, entry.serverName]]
+      )
+    ),
+  });
+  const description = prepared.tools[TOOL_SEARCH_TOOL_NAME]?.description;
+  return typeof description === "string" ? description : "";
 }
 
 /**
@@ -150,13 +179,13 @@ describe("catalog advertising (overview + server names)", () => {
     expect(byName.get("github_create_issue")).toBe("github");
   });
 
-  test("buildToolCatalogOverview groups deferred tool names by server, deterministically", () => {
+  test("the overview groups deferred tool names by server, deterministically", () => {
     const { catalog } = buildToolCatalog({
       tools: baseTools(),
       mcpToolNames: MCP_NAMES,
       mcpToolServers: MCP_TOOL_SERVERS,
     });
-    const overview = buildToolCatalogOverview(catalog);
+    const overview = advertisedOverview(catalog);
     expect(overview).toBe(
       "Deferred tool catalog overview (search to activate):\n" +
         "- github: github_create_issue\n" +
@@ -172,7 +201,7 @@ describe("catalog advertising (overview + server names)", () => {
       paramText: `SECRET_PARAM_${i}`,
       serverName: "srv",
     }));
-    const overview = buildToolCatalogOverview(catalog);
+    const overview = advertisedOverview(catalog);
     expect(overview).toContain(
       "- srv: srv_tool_0, srv_tool_1, srv_tool_2, srv_tool_3, srv_tool_4, srv_tool_5, srv_tool_6, srv_tool_7, and more\n"
     );
@@ -181,10 +210,8 @@ describe("catalog advertising (overview + server names)", () => {
   });
 
   test("overview is empty for an empty catalog and groups unknown servers as 'other tools'", () => {
-    expect(buildToolCatalogOverview([])).toBe("");
-    const overview = buildToolCatalogOverview([
-      { name: "mystery_tool", description: "", paramText: "" },
-    ]);
+    expect(advertisedOverview([])).toBe("");
+    const overview = advertisedOverview([{ name: "mystery_tool", description: "", paramText: "" }]);
     expect(overview).toContain("- other tools: mystery_tool");
   });
 
@@ -301,7 +328,7 @@ describe("catalog advertising (overview + server names)", () => {
     const clampedCatalog: ToolCatalogEntry[] = [
       { name: "long_tool", description: "", paramText: "", serverName: longServer },
     ];
-    const clamped = buildToolCatalogOverview(clampedCatalog);
+    const clamped = advertisedOverview(clampedCatalog);
     expect(clamped).not.toContain(longServer);
     expect(clamped).toContain(`${"s".repeat(63)}…`);
 
@@ -312,7 +339,7 @@ describe("catalog advertising (overview + server names)", () => {
       paramText: "",
       serverName: `server-${String(i).padStart(3, "0")}`,
     }));
-    const bounded = buildToolCatalogOverview(bigCatalog);
+    const bounded = advertisedOverview(bigCatalog);
     expect(bounded.length).toBeLessThan(2200);
     expect(bounded).toMatch(/…and \d+ more servers \(use this tool to discover their tools\)/);
   });
@@ -404,7 +431,7 @@ describe("catalog advertising (overview + server names)", () => {
       paramText: "",
       serverName: evilServer,
     }));
-    const overview = buildToolCatalogOverview(catalog);
+    const overview = advertisedOverview(catalog);
     const matches = searchToolCatalog(catalog, "evil");
     const elapsedMs = performance.now() - startedAt;
     // Bounded work: must not stall stream startup (generous CI headroom).
@@ -421,7 +448,7 @@ describe("catalog advertising (overview + server names)", () => {
     const catalog: ToolCatalogEntry[] = [
       { name: "t1_do_thing", description: "unrelated words", paramText: "", serverName: longToken },
     ];
-    const overview = buildToolCatalogOverview(catalog);
+    const overview = advertisedOverview(catalog);
     const advertisedLabel = `${"a".repeat(63)}…`;
     expect(overview).toContain(advertisedLabel);
     // Querying with the visible label (as a model would copy it) must match.

@@ -19,6 +19,7 @@ import {
   installStreamManagerTestHistory,
   historyService,
   createTestLanguageModel,
+  finishStep,
   testStartOptions,
   REFUSAL_FINISH,
   STOP_FINISH,
@@ -28,13 +29,6 @@ import {
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
-
-function finishStep(
-  usage: Record<string, number>,
-  providerMetadata?: Record<string, unknown>
-): Record<string, unknown> {
-  return { type: "finish-step", usage, ...(providerMetadata ? { providerMetadata } : {}) };
-}
 
 /** Starts a public turn; callers await `completion` (or stop the stream first). */
 async function startTurnForTests(
@@ -308,6 +302,23 @@ describe("StreamManager - TTFT metadata persistence", () => {
       metadata: { routeProvider: "openrouter" },
     });
     expect(updatedMessage.metadata?.routeProvider).toBe("openrouter");
+  });
+
+  // ACP routes a completed turn back to its prompt by this id; the abort event's twin
+  // is checked in "aborted stream usage persistence".
+  test("the stream-end event carries the ACP prompt id from the initial metadata", async () => {
+    const events: TurnEngineEvent[] = [];
+    await completeTurnAndReadMessage({
+      workspaceId: "acp-prompt-end-workspace",
+      messageId: "acp-prompt-end-message",
+      events,
+      chunks: [text("hello"), STOP_FINISH],
+      options: { initialMetadata: { acpPromptId: "acp-prompt-1" } },
+    });
+
+    expect(events.find((event) => event.type === "stream-end")).toMatchObject({
+      acpPromptId: "acp-prompt-1",
+    });
   });
 
   test("persists per-invocation tool model usages on the final assistant message", async () => {

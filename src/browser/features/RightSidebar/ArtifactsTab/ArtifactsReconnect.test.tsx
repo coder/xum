@@ -327,7 +327,7 @@ describe.each([...GAP_MODES])("Artifacts tab across a dropped connection (%s)", 
       const listsBefore = listCalls;
       act(() => poll());
       await waitFor(() => expect(listCalls).toBeGreaterThan(listsBefore));
-      await waitFor(() => expect(view.queryByText("Backend is starting")).toBeNull());
+      await waitFor(() => expect(view.queryByText("Backend is starting") === null).toBe(true));
       await settle();
       expectSameFrame(view.queryByTestId("artifact-frame"), frame);
       expect(frame.getAttribute("srcdoc")).toBe(srcdoc);

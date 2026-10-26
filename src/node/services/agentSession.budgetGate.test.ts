@@ -6,7 +6,7 @@ import type { HistoryService } from "./historyService";
 import type { InitStateManager } from "./initStateManager";
 import type { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
-import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createTestStreamManager } from "./agentSession.testHarness";
 import type { EffectRunner } from "./di/effectRunner";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -93,7 +93,7 @@ async function createSessionHarness(
     initStateManager,
     backgroundProcessManager,
     workspaceGoalService: goalService,
-    ...(runner ? { streamManager: { ...createStreamLifecycleMocks(), effectRunner: runner } } : {}),
+    ...(runner ? { streamManager: createTestStreamManager(undefined, runner) } : {}),
   });
 
   return { historyService, session, goalService, cleanup };
