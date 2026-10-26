@@ -8,8 +8,10 @@ import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { createSSHTransport } from "@/node/runtime/transports";
 import { log } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { execBuffered } from "@/node/utils/runtime/helpers";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import {
+  buildRemotePluginListingScript,
   clearRemoteProjectPluginSnapshots,
   createRemoteProjectPluginSnapshot,
   getRemoteProjectPluginSnapshot,
@@ -161,6 +163,34 @@ describe("buildRemotePluginListingScript", () => {
     expect((await snapshot())?.plugins.map((plugin) => plugin.name)).toEqual(["kit"]);
     await fake("realpath", "exit 1");
     expect(await snapshot()).toBeNull();
+  });
+
+  test("each link line keeps its own target, and an empty one when readlink fails", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-links");
+    const { root, container, kit } = await checkoutWithKit(checkout.path);
+    // GNU `readlink -f a b c` prints no line for a link that fails (uutils stops there), so a
+    // plain batch would shift every target after it. Five of each, so in almost any directory
+    // order (find's order) a good link comes after a failing one.
+    const dir = path.join(kit, "links");
+    await fs.mkdir(dir);
+    const expected: Record<string, string> = {};
+    for (let i = 0; i < 5; i++) {
+      await fs.symlink(path.join(kit, "skills"), path.join(dir, `good${i}`));
+      expected[path.join(dir, `good${i}`)] = path.join(kit, "skills");
+      await fs.symlink(path.join(root, "missing", "x"), path.join(dir, `bad${i}`));
+      expected[path.join(dir, `bad${i}`)] = "";
+    }
+    const result = await execBuffered(
+      new CountingRemoteRuntime(root, "test"),
+      buildRemotePluginListingScript(root, [container]),
+      { cwd: "/", timeout: 10 }
+    );
+    expect(result.exitCode).toBe(0);
+    const links = result.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("L\t"))
+      .map((line) => line.split("\t"));
+    expect(Object.fromEntries(links.map(([, target, link]) => [link, target]))).toEqual(expected);
   });
 
   test("a plugin link to a folder inside its container is walked once", async () => {
