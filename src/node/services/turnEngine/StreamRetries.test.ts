@@ -56,10 +56,10 @@ describe("StreamRetries.resetStreamStateForRetry", () => {
     await cleanup();
   });
 
-  const resetWithoutParts = (messageId: string) =>
-    retries.resetStreamStateForRetry(WORKSPACE_ID, createWorkspaceStreamInfoForTests({ messageId }), {
-      preserveParts: false,
-    });
+  const resetWithoutParts = (messageId: string) => {
+    const streamInfo = createWorkspaceStreamInfoForTests({ messageId });
+    return retries.resetStreamStateForRetry(WORKSPACE_ID, streamInfo, { preserveParts: false });
+  };
 
   // The preserve-parts reset is proven publicly by errorRecovery's step-boundary
   // previousResponseId retry, which commits stepStartPartIndices [0, 1].
