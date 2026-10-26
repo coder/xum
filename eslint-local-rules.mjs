@@ -1900,7 +1900,10 @@ const localPlugin = {
             : source.startsWith(".")
               ? path.resolve(path.dirname(context.filename), source)
               : source;
-          const normalized = resolved.split(path.sep).join("/").replace(/\.tsx?$/, "");
+          const normalized = resolved
+            .split(path.sep)
+            .join("/")
+            .replace(/\.tsx?$/, "");
           return normalized === MODULE_OF[name] || normalized.endsWith(`/${MODULE_OF[name]}`);
         };
         // Whether `identifier` is bound to an import of `name` from its module, aliased or not.
