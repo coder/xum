@@ -110,7 +110,7 @@
     "crc-32": "^1.2.2",
     "diff": "^8.0.2",
     "disposablestack": "^1.1.7",
-    "effect": "4.0.0-rc.112",
+    "effect": "4.0.4",
     "electron-updater": "^6.6.2",
     "electron-window-state": "^5.0.3",
     "express": "^5.1.0",
