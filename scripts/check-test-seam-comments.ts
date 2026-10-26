@@ -60,13 +60,15 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "Useful in tests for checking ...", "needed only in tests".
   // "This callback must never be called in tests" is negated, so it stays quiet.
   /(?<!\b(?:not|never)\s+(?:be\s+|been\s+)?)\b(?:useful|needed|called|invoked)\s+(?:only\s+)?in\s+(?:unit\s+|integration\s+)?tests\b(?![/-])/i,
-  // "Absent on test doubles", "absent from a test double": the member is optional only so doubles
-  // can leave it out. "not absent from test doubles" says the opposite.
-  /(?<!\b(?:not|never)\s+)\babsent\s+(?:on|from|in)\s+(?:a\s+)?test\s+doubles?\b/i,
-  // "Test doubles of AIService pass one too": the member exists so doubles can supply it. `pass`
-  // must be a verb with an object in the same sentence, so "test doubles replace the modal" and
-  // "test doubles record each render pass" stay quiet.
-  /\btest\s+doubles?\b[^.!?]{0,60}?\bpass(?:es)?\s+(?:one|it|them|a|an|the|their|its|this|that|in)\b/i,
+  // The test-double claims must open a sentence: the double is the subject of the claim, so prose
+  // such as "defaults for fields absent from test doubles", "not absent from test doubles",
+  // "test doubles never pass it" or "test doubles record each render pass" stays quiet.
+  // "Absent on test doubles", "Absent from a test double": the member is optional only so doubles
+  // can leave it out.
+  /(?:^|[.!?]\s)\s*absent\s+(?:on|from|in)\s+(?:a\s+)?test\s+doubles?\b/i,
+  // "Test doubles of AIService pass one too", "A test double passes runtimeFactory": the member
+  // exists so doubles can supply it. "Test doubles pass the contract tests" is about tests.
+  /(?:^|[.!?]\s)\s*(?:a\s+)?test\s+doubles?(?:\s+of\s+[\w.]+)?\s+(?:also\s+)?pass(?:es)?\s+(?!(?:the\s+|their\s+|all\s+)?[\w-]*\s*tests?\b)[\w.]+/i,
 ];
 
 /**
@@ -76,6 +78,7 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
 const ANCHORED_PATTERN_PREFILTERS: readonly RegExp[] = [
   /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)\b/i,
   /\bin\s+(?:unit\s+|integration\s+)?tests\b/i,
+  /\btest\s+doubles?\b/i,
 ];
 
 /**

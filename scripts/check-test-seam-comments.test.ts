@@ -126,6 +126,15 @@ test("matches test-double seam claims, not prose about doubles", () => {
   // A negated absence and the noun "pass" claim no seam.
   expect(seams("// Not absent from test doubles.\nexport const h = 1;")).toEqual([]);
   expect(seams("// Test doubles record each render pass.\nexport const i = 1;")).toEqual([]);
+  expect(seams("// Test doubles pass runtimeFactory too.\nexport const j = 1;")).toEqual(["1:j"]);
+  // The double must be the subject: no test outcome, negation, or other subject.
+  expect(seams("// Test doubles pass the contract tests.\nexport const k = 1;")).toEqual([]);
+  expect(seams("// Test doubles pass their tests.\nexport const l = 1;")).toEqual([]);
+  expect(seams("// Test doubles never pass it.\nexport const m = 1;")).toEqual([]);
+  expect(seams("// Test doubles do not pass it.\nexport const n = 1;")).toEqual([]);
+  expect(
+    seams("// Supplies defaults for fields absent from test doubles.\nexport const o = 1;")
+  ).toEqual([]);
   // "pass" in a later sentence is not part of the claim.
   expect(seams("// Uses test doubles. Callers pass a factory.\nexport const e = 1;")).toEqual([]);
 });
