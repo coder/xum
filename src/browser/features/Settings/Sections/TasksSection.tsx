@@ -153,6 +153,60 @@ interface TasksSectionSavePayload {
   agentAiDefaults: AgentAiDefaults;
 }
 
+interface PendingSaveFlushProps {
+  /** Null until the config loaded: a flush before that would save defaults over the config. */
+  api: ReturnType<typeof useAPI>["api"];
+  saveTimerRef: { current: ReturnType<typeof setTimeout> | null };
+  savingRef: { current: boolean };
+  pendingSaveRef: { current: TasksSectionSavePayload | null };
+}
+
+function usePendingSaveFlush(props: PendingSaveFlushProps): void {
+  // Flush any pending debounced save on unmount and on pagehide so changes aren't lost: a
+  // reload does not unmount React, so a change made in the last 400 ms was lost (#7157).
+  // Best effort: the page can go away before the request leaves.
+  const { api, saveTimerRef, savingRef, pendingSaveRef } = props;
+  useEffect(() => {
+    if (!api) return;
+
+    const flushPendingSave = () => {
+      clearSaveTimer(saveTimerRef);
+
+      if (savingRef.current) return;
+      const payload = pendingSaveRef.current;
+      if (!payload) return;
+
+      pendingSaveRef.current = null;
+      savingRef.current = true;
+      void api.config
+        .saveConfig(payload)
+        .catch(() => undefined)
+        .finally(() => {
+          savingRef.current = false;
+        });
+    };
+    const onPageHide = () => {
+      if (!savingRef.current) {
+        flushPendingSave();
+        return;
+      }
+      // An autosave is in flight: its completion would send the newer change, but the page can
+      // be gone by then. Send it now too (best effort, after the in-flight save on the channel).
+      clearSaveTimer(saveTimerRef);
+      const payload = pendingSaveRef.current;
+      if (!payload) return;
+      pendingSaveRef.current = null;
+      void api.config.saveConfig(payload).catch(() => undefined);
+    };
+    window.addEventListener("pagehide", onPageHide);
+
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      flushPendingSave();
+    };
+  }, [api, saveTimerRef, savingRef, pendingSaveRef]);
+}
+
 function renderPolicySummary(agent: AgentDefinitionDescriptor): React.ReactNode {
   const isCompact = agent.id === "compact";
 
@@ -665,50 +719,12 @@ export function TasksSection() {
     };
   }, [liveApi, agentAiDefaults, loaded, loadFailed, taskSettings]);
 
-  // Flush any pending debounced save on unmount and on pagehide so changes aren't lost: a
-  // reload does not unmount React, so a change made in the last 400 ms was lost (#7157).
-  // Best effort: the page can go away before the request leaves.
-  useEffect(() => {
-    if (!api) return;
-    if (!loaded) return;
-    if (loadFailed) return;
-
-    const flushPendingSave = () => {
-      clearSaveTimer(saveTimerRef);
-
-      if (savingRef.current) return;
-      const payload = pendingSaveRef.current;
-      if (!payload) return;
-
-      pendingSaveRef.current = null;
-      savingRef.current = true;
-      void api.config
-        .saveConfig(payload)
-        .catch(() => undefined)
-        .finally(() => {
-          savingRef.current = false;
-        });
-    };
-    const onPageHide = () => {
-      if (!savingRef.current) {
-        flushPendingSave();
-        return;
-      }
-      // An autosave is in flight: its completion would send the newer change, but the page can
-      // be gone by then. Send it now too (best effort, after the in-flight save on the channel).
-      clearSaveTimer(saveTimerRef);
-      const payload = pendingSaveRef.current;
-      if (!payload) return;
-      pendingSaveRef.current = null;
-      void api.config.saveConfig(payload).catch(() => undefined);
-    };
-    window.addEventListener("pagehide", onPageHide);
-
-    return () => {
-      window.removeEventListener("pagehide", onPageHide);
-      flushPendingSave();
-    };
-  }, [api, loaded, loadFailed]);
+  usePendingSaveFlush({
+    api: loaded && !loadFailed ? api : null,
+    saveTimerRef,
+    savingRef,
+    pendingSaveRef,
+  });
 
   // TaskLimitInput decides when a typed value is ready (#6384); this clamps and saves it.
   const setMaxParallelAgentTasks = (value: number) => {
