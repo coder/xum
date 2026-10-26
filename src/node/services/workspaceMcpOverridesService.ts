@@ -99,6 +99,36 @@ export interface PluginSweepOptions {
   hasSnapshot?: (workspaceId: string) => boolean;
 }
 
+/** Direct children of each workspace, keyed by parentWorkspaceId. */
+function indexChildrenByParent(
+  all: readonly FrontendWorkspaceMetadata[]
+): Map<string, FrontendWorkspaceMetadata[]> {
+  const childrenByParent = new Map<string, FrontendWorkspaceMetadata[]>();
+  for (const m of all) {
+    if (m.parentWorkspaceId == null) continue;
+    const siblings = childrenByParent.get(m.parentWorkspaceId);
+    if (siblings) siblings.push(m);
+    else childrenByParent.set(m.parentWorkspaceId, [m]);
+  }
+  return childrenByParent;
+}
+
+/**
+ * True for a fan-out "refresh" step on a host-local workspace that the
+ * sweep's receiver holds no state for. Off-host steps keep their (I/O-free)
+ * eviction, and "evict" steps stay evictions.
+ */
+function isColdRefresh(
+  step: { metadata: FrontendWorkspaceMetadata; action: "refresh" | "evict" },
+  hasSnapshot: PluginSweepOptions["hasSnapshot"]
+): boolean {
+  return (
+    step.action === "refresh" &&
+    isHostLocalRuntimeConfig(step.metadata.runtimeConfig) &&
+    hasSnapshot?.(step.metadata.id) === false
+  );
+}
+
 /** One workspace a plugin-key sweep pruned, as its publication phase needs it. */
 interface SweptWorkspace {
   metadata: FrontendWorkspaceMetadata;
@@ -2271,7 +2301,9 @@ export class WorkspaceMcpOverridesService {
      */
     published = new Set<string>(),
     /** Shared by a batch sweep; a single save gets its own (see PublicationBudget). */
-    budget: PublicationBudget = createPublicationBudget()
+    budget: PublicationBudget = createPublicationBudget(),
+    /** A plugin-key sweep's hint (PluginSweepOptions.hasSnapshot); saves pass none. */
+    hasSnapshot?: PluginSweepOptions["hasSnapshot"]
   ): Promise<void> {
     try {
       await this.publishEffectiveOverridesInner(
@@ -2281,7 +2313,8 @@ export class WorkspaceMcpOverridesService {
         writtenPath,
         snapshot,
         published,
-        budget
+        budget,
+        hasSnapshot
       );
     } finally {
       // Steps that timed out may still have a migration write in flight; the
@@ -2391,7 +2424,8 @@ export class WorkspaceMcpOverridesService {
     // timeout. When the budget runs out nothing below
     // can be published authoritatively: evict every cache instead, and let
     // the abandoned work's cancellation flags keep it from publishing later.
-    budget: PublicationBudget
+    budget: PublicationBudget,
+    hasSnapshot: PluginSweepOptions["hasSnapshot"]
   ): Promise<void> {
     // The publisher callback itself (MCPServerManager.applyWorkspaceOverrides)
     // repairs cached enablement through listServers, which reads the
@@ -2459,13 +2493,7 @@ export class WorkspaceMcpOverridesService {
     };
     // Index once: scanning `all` per visited node made publication
     // O(total × affected) under the exclusive lock.
-    const childrenByParent = new Map<string, FrontendWorkspaceMetadata[]>();
-    for (const m of all) {
-      if (m.parentWorkspaceId == null) continue;
-      const siblings = childrenByParent.get(m.parentWorkspaceId);
-      if (siblings) siblings.push(m);
-      else childrenByParent.set(m.parentWorkspaceId, [m]);
-    }
+    const childrenByParent = indexChildrenByParent(all);
     const childrenOf = (id: string) =>
       (childrenByParent.get(id) ?? []).filter((m) => !published.has(m.id));
     let sharers: FrontendWorkspaceMetadata[] = [];
@@ -2540,6 +2568,15 @@ export class WorkspaceMcpOverridesService {
         async (next): Promise<Step[]> => {
           const child = next.metadata;
           try {
+            // A host-local workspace the receiver holds nothing for reads disk
+            // on its first serve: skip its probe and publication (thousands of
+            // cold task descendants exhausted a plugin sweep's budget), but
+            // keep walking — a cached descendant can inherit the change.
+            if (isColdRefresh(next, hasSnapshot)) {
+              return childrenOf(child.id).map(
+                (metadata): Step => ({ metadata, shares: false, action: "refresh" })
+              );
+            }
             let action = next.action;
             // Off-host workspaces would need remote `stat`s (10 s timeout each
             // level) while the write lock is held; a slow chain could exceed
@@ -4666,7 +4703,8 @@ export class WorkspaceMcpOverridesService {
           filePaths[0],
           after,
           published,
-          budget
+          budget,
+          hasSnapshot
         );
       } catch (error) {
         failures.push({ workspaceId, error });

@@ -4723,17 +4723,16 @@ export class MCPServerManager {
   }
 
   /**
-   * True when this manager holds state that an override publication repairs:
-   * a latest snapshot, recorded request options, or an invalidation marker.
-   * False means the next serve of any kind reads overrides from disk, so a
-   * plugin-key sweep that did not rewrite the workspace's files can skip its
-   * publication (see PluginSweepOptions.hasSnapshot).
+   * True when this manager holds an override snapshot it could serve: a
+   * latest snapshot or recorded request options. False means the next serve
+   * of any kind reads overrides from disk — an invalidation marker alone
+   * forces that re-read too — so a plugin-key sweep can skip the
+   * workspace's publication (see PluginSweepOptions.hasSnapshot).
    */
   hasWorkspaceOverridesSnapshot(workspaceId: string): boolean {
     return (
       this.latestWorkspaceOverrides.has(workspaceId) ||
-      this.lastWorkspaceRequestOptions.has(workspaceId) ||
-      this.overridesInvalidationGenerations.has(workspaceId)
+      this.lastWorkspaceRequestOptions.has(workspaceId)
     );
   }
 
