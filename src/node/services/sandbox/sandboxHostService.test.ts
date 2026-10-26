@@ -3,7 +3,7 @@
  * see .github/workflows: isolated_unit_tests).
  */
 import { describe, expect, spyOn, test } from "bun:test";
-import { readdirSync, statSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
 import { tool } from "ai";
 import { z } from "zod";
@@ -856,6 +856,50 @@ describe("SandboxHostService", () => {
     expect(host.hasScope("ws-drop")).toBe(false);
     const after = readdirSync(tmp.path, { recursive: true }).length;
     expect(after).toBe(before);
+  });
+
+  test("a call that reaches the scope lock after removal neither mounts nor recreates the session dir (#7484)", async () => {
+    using tmp = new DisposableTempDir("sandbox-host-test");
+    const sessionDir = join(tmp.path, "session");
+    mkdirSync(sessionDir);
+    const host = new SandboxHostService();
+    const options = {
+      lifetime: "persistent",
+      runtimeFactory,
+      scopeKey: "ws-removed",
+      sessionDir,
+    } as const;
+
+    // A running code_execution holds the scope lock.
+    let releaseRunning!: () => void;
+    let runningStarted!: () => void;
+    const started = new Promise<void>((resolve) => (runningStarted = resolve));
+    const running = host.withPersistentMount(options, async () => {
+      runningStarted();
+      await new Promise<void>((resolve) => (releaseRunning = resolve));
+    });
+    await started;
+
+    // Workspace removal: dropScope waits for the running call. A second call
+    // of the aborted turn reaches the scope lock only after removal began.
+    const drop = host.dropScope("ws-removed");
+    let queuedRan = false;
+    const queued = host.withPersistentMount(options, async (mount) => {
+      queuedRan = true;
+      await mount.runtime.eval("vars.late = 1; return vars.late;");
+      await mount.persistVars();
+    });
+
+    releaseRunning();
+    await running;
+    await drop;
+    // Removal deletes the session dir right after dropScope returns.
+    rmSync(sessionDir, { recursive: true, force: true });
+
+    await queued.catch(() => undefined);
+    expect(existsSync(sessionDir)).toBe(false);
+    expect(host.hasScope("ws-removed")).toBe(false);
+    expect(queuedRan).toBe(false);
   });
 
   test("discardScope: context reset discards vars instead of restoring the last snapshot", async () => {
