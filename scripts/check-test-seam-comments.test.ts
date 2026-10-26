@@ -121,6 +121,10 @@ test("matches in-tests seam claims, not prose about tests", () => {
     )
   ).toEqual([]);
   expect(seams("// Force telemetry off in tests/CI and E2E.\nexport const d = 1;")).toEqual([]);
+  // Negated claims say the symbol is not for tests.
+  expect(seams("// This callback must never be called in tests.\nexport const f = 1;")).toEqual([]);
+  expect(seams("// Not used in tests; production only.\nexport const g = 1;")).toEqual([]);
+  expect(seams("// This is not needed in tests.\nexport const h = 1;")).toEqual([]);
 });
 
 test("flags declarations named ...ForTests or ...ForTesting, not their uses", () => {
@@ -141,6 +145,9 @@ test("flags declarations named ...ForTests or ...ForTesting, not their uses", ()
     "export class Harness { constructor(public injectedForTests: () => void, plain: number) {} }",
     "function f() { const innerForTests = 1; }",
     "export { resetForTests as aliasForTests };",
+    "export enum ModeForTests { A }",
+    "export namespace HooksForTests {}",
+    "export const { exportedBoundForTests, nested: [deepForTests] } = api;",
   ].join("\n");
   expect(
     findTestHookNames("src/x.ts", text).map((hit) => `${hit.line}:${hit.symbol}:${hit.phrase}`)
@@ -154,6 +161,10 @@ test("flags declarations named ...ForTests or ...ForTesting, not their uses", ()
     "14:Harness.injectedForTests:injectedForTests",
     "15:f.innerForTests:innerForTests",
     "16:aliasForTests:aliasForTests",
+    "17:ModeForTests:ModeForTests",
+    "18:HooksForTests:HooksForTests",
+    "19:exportedBoundForTests:exportedBoundForTests",
+    "19:deepForTests:deepForTests",
   ]);
 });
 

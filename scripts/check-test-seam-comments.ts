@@ -34,7 +34,8 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "Exported for tests only", "visible for testing".
   /\b(?:exported|exposed|visible)\s+(?:only\s+)?for\s+(?:unit\s+|integration\s+)?(?:tests?|testing)\b/i,
   // "Used for testing.", "(used by tests)", "Used in tests to reset ...", "used only by unit tests".
-  /\bused\s+(?:only\s+)?(?:in|by|for)\s+(?:unit\s+|integration\s+)?(?:tests?|testing)\b/i,
+  // A negated claim ("must never be used in tests") says the opposite, so it stays quiet.
+  /(?<!\b(?:not|never)\s+(?:be\s+|been\s+)?)\bused\s+(?:only\s+)?(?:in|by|for)\s+(?:unit\s+|integration\s+)?(?:tests?|testing)\b/i,
   // "Test seam", "test seams", "@VisibleForTesting".
   /\btest[- ]?seams?\b/i,
   /\bvisibleForTesting\b/i,
@@ -57,7 +58,8 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // a seam verb, and "tests/" or "tests-" (a list or a compound) does not count.
   /(?:^|[.!?]\s)\s*(?:shorten|lengthen|override|replace|stub|inject|reset|force)s?\b[^.!?]{0,80}?\bin\s+(?:unit\s+|integration\s+)?tests\b(?![/-])/i,
   // "Useful in tests for checking ...", "needed only in tests".
-  /\b(?:useful|needed|called|invoked)\s+(?:only\s+)?in\s+(?:unit\s+|integration\s+)?tests\b(?![/-])/i,
+  // "This callback must never be called in tests" is negated, so it stays quiet.
+  /(?<!\b(?:not|never)\s+(?:be\s+|been\s+)?)\b(?:useful|needed|called|invoked)\s+(?:only\s+)?in\s+(?:unit\s+|integration\s+)?tests\b(?![/-])/i,
 ];
 
 /**
@@ -282,11 +284,36 @@ function isSurfaceDeclaration(node: ts.Node): node is ts.NamedDeclaration {
     ts.isClassDeclaration(node) ||
     ts.isInterfaceDeclaration(node) ||
     ts.isTypeAliasDeclaration(node) ||
+    ts.isEnumDeclaration(node) ||
     ts.isEnumMember(node) ||
+    ts.isModuleDeclaration(node) ||
     ts.isExportSpecifier(node) ||
     // `constructor(public resetForTests: () => void)` declares a class property.
     (ts.isParameter(node) && ts.isParameterPropertyDeclaration(node, node.parent))
   );
+}
+
+/**
+ * For a name bound by `export const { aForTests } = api`, the variable declaration that binds
+ * it. Exporting puts the name on the module surface, so it is a declaration, while the same
+ * destructuring without `export` only uses `api.aForTests`.
+ */
+function exportedBindingDeclaration(node: ts.Node): ts.VariableDeclaration | undefined {
+  if (!ts.isBindingElement(node)) return undefined;
+  let parent: ts.Node = node.parent;
+  while (
+    ts.isBindingElement(parent) ||
+    ts.isObjectBindingPattern(parent) ||
+    ts.isArrayBindingPattern(parent)
+  ) {
+    parent = parent.parent;
+  }
+  if (!ts.isVariableDeclaration(parent)) return undefined;
+  const statement = parent.parent.parent;
+  const exported =
+    ts.isVariableStatement(statement) &&
+    (ts.getModifiers(statement) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword);
+  return exported ? parent : undefined;
 }
 
 /** The nearest ancestor of a declaration that is not its own variable list or statement. */
@@ -325,12 +352,16 @@ export function findTestHookNames(file: string, text: string): SeamComment[] {
   const sourceFile = parseSource(file, text);
   const found: SeamComment[] = [];
   const visit = (node: ts.Node) => {
-    const name = isSurfaceDeclaration(node) ? staticName(node.name) : undefined;
+    const binding = exportedBindingDeclaration(node);
+    const name =
+      isSurfaceDeclaration(node) || binding !== undefined
+        ? staticName((node as ts.NamedDeclaration).name)
+        : undefined;
     if (name !== undefined && TEST_HOOK_NAME.test(name)) {
       // Key by the enclosing declarations plus this name: symbolChain would name a variable by
       // its list's first declarator (`const first = 1, aForTests = ...`) and drops computed
       // names (`["aForTests"]()`).
-      const owner = symbolChain(enclosingDeclaration(node));
+      const owner = symbolChain(enclosingDeclaration(binding ?? node));
       found.push({
         file,
         line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
