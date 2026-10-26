@@ -485,4 +485,42 @@ describe("AgentSession queue-cut receipts with a skipped head", () => {
       }
     }
   );
+
+  // Codex PRRT_kwDOPxxmWM6wQZq3: the refused send's settlement (one retry) used to finish before
+  // the idle re-drain started the successor; it must still finish before the successor's send.
+  test("the cut entry's send waits for the skipped head's settlement, retried once", async () => {
+    const h = await setup();
+    const release = Promise.withResolvers<void>();
+    try {
+      let calls = 0;
+      h.session.queueMessage(
+        "skipped head",
+        { model: TEST_MODEL, agentId: "exec" },
+        {
+          acceptanceOrigin: "automatic",
+          synthetic: true,
+          admissionStale: () => true,
+          onAcceptedPreStreamFailure: async () => {
+            if (++calls === 1) throw new Error("transient");
+            await release.promise;
+          },
+        }
+      );
+      h.session.queueMessage("continue", { model: TEST_MODEL, agentId: "exec" });
+      const entryId = h.session.getQueuedInputStopCause()!.entryId;
+      const sends = spyOn(h.session, "sendMessage");
+      h.session.sendQueuedMessages();
+      // The retry ran and the second call now waits on `release`; nothing else can advance.
+      for (let tick = 0; calls < 2 && tick < 200; tick++) await Promise.resolve();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect({ calls, sends: sends.mock.calls.length }).toEqual({ calls: 2, sends: 0 });
+      release.resolve();
+      await h.firstRequest;
+      sends.mockRestore();
+      expect(h.session.getQueueCutReceipt(entryId)?.successor).toBe("streaming");
+    } finally {
+      release.resolve();
+      await teardown(h);
+    }
+  });
 });

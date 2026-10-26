@@ -12470,24 +12470,42 @@ export class AgentSession {
    * reports the blocked send, and nothing is held (Stop's restore skips such input too). A manual
    * head whose input is still restorable keeps the full path: its failed preparation restores it
    * with the rest of the queue, and the turn it claims keeps the queue from dispatching until that
-   * restore ran. Returns true when the head was settled here.
+   * restore ran. Returns the head's settlement when it was settled here: the drain's successor
+   * awaits it before its send, as the refused send's own settlement completed before the idle
+   * re-drain did (Codex PRRT_kwDOPxxmWM6wQZq3).
    */
-  private settleWithdrawnQueueHead(candidate: QueueHead): boolean {
+  private settleWithdrawnQueueHead(candidate: QueueHead): Promise<void> | undefined {
     const withdrawal = candidate.withdrawal;
-    if (withdrawal == null || candidate.inputForRestore() != null) return false;
+    if (withdrawal == null || candidate.inputForRestore() != null) return undefined;
     const removed = this.messageQueue.removeEntry(candidate.identity);
-    if (removed == null) return true;
+    if (removed == null) return Promise.resolve();
     this.emitQueuedMessageChanged();
     if (withdrawal.kind === "canceled") {
       if (withdrawal.cancelState) withdrawal.cancelState.canceledBeforeAcceptance = true;
-      this.notifyQueuedMessageCleared({ onCanceled: removed.onCanceled }, withdrawal.reason);
-    } else {
-      this.notifyQueuedMessageCleared(
-        { onAcceptedPreStreamFailure: removed.onAcceptedPreStreamFailure },
-        CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
-      );
+      return this.runWithdrawnHeadCallback(() => removed.onCanceled?.(withdrawal.reason));
     }
-    return true;
+    return this.runWithdrawnHeadCallback(() =>
+      removed.onAcceptedPreStreamFailure?.(
+        createUnknownSendMessageError(CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE)
+      )
+    );
+  }
+
+  /** One retry, as settlePreparationFailure gives a refused send's callback; never rejects. */
+  private async runWithdrawnHeadCallback(callback: () => Promise<void> | void): Promise<void> {
+    using _execution = this.coordinator.enterExecution();
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await callback();
+        return;
+      } catch (error) {
+        if (attempt === 2)
+          log.error("Withdrawn queued message callback failed", {
+            workspaceId: this.workspaceId,
+            error: getErrorMessage(error),
+          });
+      }
+    }
   }
 
   /**
@@ -12496,7 +12514,9 @@ export class AgentSession {
    */
   sendQueuedMessages(
     trigger: QueueDrainTrigger = "terminal",
-    stopAdmission?: CompactionStopAdmission
+    stopAdmission?: CompactionStopAdmission,
+    /** Settlements of the withdrawn heads this drain removed (see settleWithdrawnQueueHead). */
+    withdrawnSettlements: ReadonlyArray<Promise<void>> = []
   ): void {
     // Stop-cascade barrier: hold queued entries (do not dequeue or consume them) while the
     // workspace's stop latch is held; the cascade's single clearQueue owns their removal.
@@ -12531,11 +12551,12 @@ export class AgentSession {
           : undefined;
     if (refusal != null) {
       this.refuseQueueHead(candidate, refusal);
-      this.sendQueuedMessages(trigger, stopAdmission);
+      this.sendQueuedMessages(trigger, stopAdmission, withdrawnSettlements);
       return;
     }
-    if (this.settleWithdrawnQueueHead(candidate)) {
-      this.sendQueuedMessages(trigger, stopAdmission);
+    const withdrawn = this.settleWithdrawnQueueHead(candidate);
+    if (withdrawn != null) {
+      this.sendQueuedMessages(trigger, stopAdmission, [...withdrawnSettlements, withdrawn]);
       return;
     }
     const expectedTurnId = this.coordinator.turnId;
@@ -12590,6 +12611,8 @@ export class AgentSession {
       this.preparingWorkspaceTurnMetadata = getWorkspaceTurnMuxMetadata(options?.muxMetadata);
       this.queuedProviderToolEndAbortInFlight = false;
       this.emitQueuedMessageChanged();
+      // Only when this drain removed a withdrawn head: an ordinary dispatch stays synchronous.
+      if (withdrawnSettlements.length > 0) await Promise.all(withdrawnSettlements);
       if (!this.coordinator.isCurrentTurn(preparedTurn) || this.coordinator.closing) {
         return Err(
           createUnknownSendMessageError("Queued preparation was retired before dispatch.")
