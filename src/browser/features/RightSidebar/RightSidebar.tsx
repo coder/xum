@@ -258,7 +258,7 @@ function settleAfterWidthTransition(container: HTMLElement | null, settle: () =>
  * The pane whose Artifacts panel takes focus, or null while the sidebar is collapsed (full-screen
  * shows it anyway). A collapse can land before the panel's low-priority "focus consumed" update:
  * React renders the keydown's collapse first, the panel's effect then ran again and took focus back
- * from the header toggle, and the collapse dropped it on <body> (a fast second Ctrl+Shift+K).
+ * from the header toggle, and the collapse dropped it on <body> (a fast second OPEN_ARTIFACTS_TAB press).
  */
 function shownArtifactsFocusTabsetId(
   tabsetId: string | null,

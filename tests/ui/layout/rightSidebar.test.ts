@@ -721,7 +721,7 @@ describeIntegration("RightSidebar (UI)", () => {
         outside.remove();
       }
 
-      // Focus is in the tab: the key collapses the whole sidebar, like Ctrl+Shift+B.
+      // Focus is in the tab: the key collapses the whole sidebar, like TOGGLE_RIGHT_SIDEBAR.
       const focusedPanel = panel();
       if (!focusedPanel) throw new Error("the Artifacts panel should be mounted");
       fireEvent.keyDown(focusedPanel, chord);

@@ -22,8 +22,9 @@ test(
   }
 );
 
-// User request (2026-10-26): while the Artifacts tab shows and focus is elsewhere, Ctrl+Shift+K
-// moves focus into the tab instead of hiding the sidebar. Only a press from inside the tab hides it.
+// User request (2026-10-26): while the Artifacts tab shows and focus is elsewhere,
+// OPEN_ARTIFACTS_TAB moves focus into the tab instead of hiding the sidebar. Only a press from
+// inside the tab hides it.
 test(
   "Ctrl+Shift+K focuses the showing Artifacts tab first, and hides the sidebar from inside it",
   { tags: ["bugbash", "artifacts-key-focus-first"] },
