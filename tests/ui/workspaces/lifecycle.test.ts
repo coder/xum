@@ -21,7 +21,7 @@ import {
   getSharedRepoPath,
   withSharedWorkspace,
 } from "../../ipc/sendMessageTestHelpers";
-import { generateBranchName } from "../../ipc/helpers";
+import { generateBranchName, waitForInitComplete } from "../../ipc/helpers";
 import { detectDefaultTrunkBranch } from "../../../src/node/git";
 
 import { renderApp } from "../renderReviewPanel";
@@ -345,6 +345,9 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
     });
     if (!secondResult.success) throw new Error(secondResult.error);
     const secondWorkspace = secondResult.metadata;
+    // The row shows its actions menu only after workspace setup ends (a cancel button replaces
+    // it while isInitializing), and setupWorkspaceView does not wait for setup (#7534).
+    await waitForInitComplete(env, secondWorkspace.id, 30_000);
     const secondDisplayTitle = secondWorkspace.title ?? secondWorkspace.name;
 
     // Archive the first workspace so the archive section will be visible
