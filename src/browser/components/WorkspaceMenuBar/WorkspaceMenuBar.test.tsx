@@ -13,7 +13,6 @@ import userEvent from "@testing-library/user-event";
 import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as RealDialogModule from "@/browser/components/Dialog/Dialog";
-import * as RealHeartbeatModalModule from "@/browser/components/WorkspaceHeartbeatModal/WorkspaceHeartbeatModal";
 import * as APIModule from "@/browser/contexts/API";
 import * as WorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
@@ -86,18 +85,6 @@ const RealWorkspaceUnrelatedMessagingModal =
 // the "another modal is open" test needs the actual overlay the MCP/heartbeat dialogs render.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const RealDialog = require("../Dialog/Dialog?real=1") as typeof RealDialogModule;
-
-// Counts imports of the heartbeat modal's index, which only the lazy loader in WorkspaceMenuBar
-// does. The factory runs on the first import of the mocked specifier.
-let heartbeatModalImports = 0;
-const realHeartbeatModalIndex = { ...RealHeartbeatModalModule };
-restoreModulesAfterSuite([
-  ["@/browser/components/WorkspaceHeartbeatModal", realHeartbeatModalIndex],
-]);
-void mock.module("@/browser/components/WorkspaceHeartbeatModal", () => {
-  heartbeatModalImports++;
-  return realHeartbeatModalIndex;
-});
 
 let WorkspaceMenuBar!: typeof WorkspaceMenuBarComponent;
 
@@ -1242,30 +1229,9 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(getLastUnrelatedMessagingModalProps()?.open).toBe(false);
   });
 
-  it("starts the settings modal imports when the Workspace actions menu opens", async () => {
-    // Runs before any test here opens the heartbeat modal, so its module is not imported yet.
-    // The Workspace actions popover is the one around the WorkspaceActionsMenuContent double.
-    let moreMenuOnOpenChange: ((open: boolean) => void) | undefined;
-    spyOn(PopoverModule, "Popover").mockImplementation(((
-      props: PropsWithChildren<{ onOpenChange?: (open: boolean) => void }>
-    ) => (
-      <div
-        ref={(el) => {
-          if (el?.querySelector('[aria-label="Workspace actions"]'))
-            moreMenuOnOpenChange = props.onOpenChange;
-        }}
-      >
-        {props.children}
-      </div>
-    )) as unknown as typeof PopoverModule.Popover);
-    render(<WorkspaceMenuBar {...defaultProps} />);
-    expect(moreMenuOnOpenChange).toBeDefined();
-    expect(heartbeatModalImports).toBe(0);
-    act(() => {
-      moreMenuOnOpenChange?.(true);
-    });
-    await waitFor(() => expect(heartbeatModalImports).toBe(1));
-  });
+  // That a page load never imports these modals is a static import-graph contract, owned by
+  // "the workspace page's static imports do not reach the workspace-menu modals"
+  // (src/browser/rendererFirstLoad.test.ts).
 
   it("shows a loading dialog that blocks a second modal while a settings modal loads", async () => {
     const view = render(<WorkspaceMenuBar {...defaultProps} />);

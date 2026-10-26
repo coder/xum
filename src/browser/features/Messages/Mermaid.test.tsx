@@ -1,6 +1,9 @@
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
+import { lazy } from "react";
+import { LazyFeature } from "@/browser/components/LazyFeature/LazyFeature";
+import { MermaidPendingFrame } from "./MermaidPendingFrame";
 import { StreamingContext } from "./StreamingContext";
 import { Mermaid, sanitizeMermaidSvg } from "./Mermaid";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
@@ -67,12 +70,29 @@ describe("Mermaid layout stability", () => {
     mermaidRender.mockClear();
   });
 
-  // React.lazy caches the resolved module for the whole process, so this must stay the first
-  // markdown mermaid render: later renders mount Mermaid synchronously (e.g. under `--rerun-each`).
-  test("markdown shows the pending diagram frame until the Mermaid chunk loads", async () => {
+  test("markdown reserves the diagram box on its first render", () => {
+    // In a fresh process the Mermaid chunk is still loading and the fallback holds the box. Once
+    // any earlier render loaded it (React.lazy caches it process-wide), Mermaid mounts at once in
+    // its own pending state. Either way the first frame already has the diagram's height.
     const view = render(
       <ThemeProvider forcedTheme="dark">
         <MarkdownRenderer content={"```mermaid\ngraph TD\nA-->B\n```"} />
+      </ThemeProvider>
+    );
+    const container = view.container.querySelector<HTMLElement>(".mermaid-container");
+    expect(container?.style.minHeight).toBe("300px");
+  });
+
+  test("the pending diagram frame keeps the loaded diagram's outer frame", async () => {
+    // Its own pending loader with the fallback MarkdownComponents uses, so the pending state does
+    // not depend on whether an earlier test file already loaded the Mermaid chunk.
+    const chunk = Promise.withResolvers<{ default: typeof Mermaid }>();
+    const PendingMermaid = lazy(() => chunk.promise);
+    const view = render(
+      <ThemeProvider forcedTheme="dark">
+        <LazyFeature name="Diagram" fallback={<MermaidPendingFrame />}>
+          <PendingMermaid chart={"graph TD\nA-->B"} />
+        </LazyFeature>
       </ThemeProvider>
     );
 
@@ -83,6 +103,10 @@ describe("Mermaid layout stability", () => {
     expect(pending?.textContent).toBe("Rendering diagram...");
     const pendingFrameStyle = pending?.parentElement?.style.cssText;
 
+    await act(async () => {
+      chunk.resolve({ default: Mermaid });
+      await chunk.promise;
+    });
     expect(await view.findByRole("button", { name: "⤢" })).toBeTruthy();
     await waitFor(() =>
       expect(view.container.querySelector(".mermaid-container svg")).not.toBeNull()
