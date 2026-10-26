@@ -8,10 +8,7 @@ import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import { prepareMessagesForProvider } from "./messagePipeline";
 import { assemblePromptPayload } from "./turnContextAssembler";
-import {
-  createStreamManagerForTests,
-  fakeStreamText,
-} from "./streamManager.testHarness";
+import { createStreamManagerForTests, fakeStreamText } from "./streamManager.testHarness";
 import {
   appendPartialAssistantForTests,
   createTestLanguageModel,
