@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { INSTANCE_DISCOVERY_MAX_LIMIT } from "@/constants/agentMessaging";
+import { BASH_DEFAULT_TIMEOUT_SECS } from "@/common/constants/toolLimits";
 import {
   buildTaskToolAgentArgsSchema,
   getAvailableTools,
@@ -347,6 +348,49 @@ describe("TOOL_DEFINITIONS", () => {
     if (parsed.success) {
       expect(parsed.data.display_name).toBe("Real Name");
     }
+  });
+
+  it("derives display_name from the script when a bash call omits it", () => {
+    // Haiku 5.5 often omits display_name; a rejection wastes one model step.
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({
+      script: "\n  git status --short  \necho done",
+      timeout_secs: 60,
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.display_name).toBe("git status --short");
+    }
+  });
+
+  it("falls back to the default display_name for a whitespace-only script", () => {
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({
+      script: "  \n\t\n",
+      timeout_secs: 60,
+      display_name: null,
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.display_name).toBe("bash");
+    }
+  });
+
+  it("defaults timeout_secs only for foreground bash calls", () => {
+    const foreground = TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls" });
+    expect(foreground.success).toBe(true);
+    if (foreground.success) {
+      expect(foreground.data.timeout_secs).toBe(BASH_DEFAULT_TIMEOUT_SECS);
+    }
+
+    // A background process has no safe default lifetime: a short one would kill
+    // a dev server, and none would let it run forever. Keep rejecting it.
+    const background = TOOL_DEFINITIONS.bash.schema.safeParse({
+      script: "bun run dev",
+      run_in_background: true,
+      display_name: "Dev Server",
+    });
+    expect(background.success).toBe(false);
   });
 
   it("validates heartbeat tool configuration bounds", () => {

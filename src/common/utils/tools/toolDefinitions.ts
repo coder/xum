@@ -64,6 +64,7 @@ import {
   type RuntimeMode,
 } from "@/common/types/runtime";
 import {
+  BASH_DEFAULT_TIMEOUT_SECS,
   BASH_HARD_MAX_LINES,
   BASH_MAX_LINE_BYTES,
   BASH_MAX_TOTAL_BYTES,
@@ -71,6 +72,7 @@ import {
   WEB_FETCH_MAX_OUTPUT_BYTES,
 } from "@/common/constants/toolLimits";
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
+import { getDefaultBashDisplayName } from "@/common/utils/tools/bashDisplayName";
 import { STATUS_PAGE_AGENT_MAX_UPDATE_CHARS } from "@/common/constants/artifacts";
 import {
   ConfigMutationPathSchema,
@@ -2329,6 +2331,19 @@ export const TOOL_DEFINITIONS = {
         let obj = value as Record<string, unknown>;
         obj = renameAliasField(obj, "command", "script");
         obj = renameAliasField(obj, "description", "display_name");
+        // Some models (mostly Haiku 5.5) omit the required display_name or
+        // timeout_secs. Rejecting the call costs a model step and a retry, so
+        // fill both here while the model-visible schema keeps them required.
+        // The script-derived name is the same one bash.ts already falls back to.
+        if (typeof obj.display_name !== "string" && typeof obj.script === "string") {
+          obj = { ...obj, display_name: getDefaultBashDisplayName(obj.script) };
+        }
+        // Foreground only: bash.ts already falls back to BASH_DEFAULT_TIMEOUT_SECS,
+        // and its timeout error tells the model how to raise it. A background
+        // process has no safe default lifetime, so that call is still rejected.
+        if (obj.timeout_secs == null && obj.run_in_background !== true) {
+          obj = { ...obj, timeout_secs: BASH_DEFAULT_TIMEOUT_SECS };
+        }
         return obj;
       },
       z
