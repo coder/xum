@@ -5,7 +5,7 @@ import type {
   WorkspaceCompositionPlugin,
 } from "@/common/orpc/schemas/agentPlugins";
 import type { MCPServerInfo } from "@/common/types/mcp";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { isRemoteRuntime, type Runtime } from "@/node/runtime/Runtime";
 import { discoverAgentDefinitions } from "@/node/services/agentDefinitions/agentDefinitionsService";
 import {
   discoverAgentSkills,
@@ -44,6 +44,11 @@ export interface BuildWorkspaceCompositionArgs {
    * off-host, and the runtime-based skill/agent loaders below report them.
    */
   hostCheckoutRoot: string | null;
+  /**
+   * Checkout root of a single-project workspace (remote path for SSH/Docker), like the turn's
+   * xumScope.checkoutRoot. Defaults to workspacePath.
+   */
+  projectCheckoutRoot?: string | null;
   xumHome: string;
   projectTrusted: boolean;
   /** MCP servers split by config layer (see MCPConfigService.listServerLayers). */
@@ -163,8 +168,7 @@ export async function buildWorkspaceComposition(
   // below intentionally keep execution-path defaults — production derives
   // their plugin containers from the discovery path, so checkout-anchoring
   // them here would report artifacts production never loads. Like production,
-  // these runtime-based loaders give RemoteRuntime only the global host plugin
-  // roots (no project plugin roots).
+  // RemoteRuntime gets its checkout's plugin skills only through remoteSkillRoots below.
   const defaultSkillRoots =
     args.hostCheckoutRoot != null
       ? getDefaultAgentSkillsRoots(args.runtime, args.workspacePath, {
@@ -190,6 +194,19 @@ export async function buildWorkspaceComposition(
           containment: { kind: "local" as const, root: args.hostCheckoutRoot },
         }
       : undefined;
+  // #7284: a remote checkout's plugin skills, read like a turn reads them (skillStorageContext's
+  // project-runtime branch): trust-gated roots and runtime containment. They come from the cached
+  // remote snapshot (getRemoteProjectPluginSnapshot), so a warm cache adds no remote listing.
+  const remoteProjectSearchRoot = args.projectCheckoutRoot ?? args.workspacePath;
+  const remoteSkillRoots = isRemoteRuntime(args.runtime)
+    ? {
+        roots: getDefaultAgentSkillsRoots(args.runtime, args.workspacePath, {
+          projectSearchRoot: remoteProjectSearchRoot,
+          projectPluginsTrusted: args.projectTrusted,
+        }),
+        containment: { kind: "runtime" as const, root: remoteProjectSearchRoot },
+      }
+    : undefined;
 
   // Outside the agent loop: the plugin composition inspector reads through the host's runtimes.
   const runtimeFactory = nodeRuntimeFactory;
@@ -198,7 +215,7 @@ export async function buildWorkspaceComposition(
   const skillDescriptors = requireReachableSkills(
     await discoverAgentSkills(args.runtime, args.workspacePath, {
       dedupeByName: false,
-      ...(checkoutSkillRoots ?? {}),
+      ...(checkoutSkillRoots ?? remoteSkillRoots ?? {}),
       runtimeFactory,
     })
   );

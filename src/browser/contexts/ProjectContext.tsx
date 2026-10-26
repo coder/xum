@@ -18,6 +18,7 @@ import type { Result } from "@/common/types/result";
 import { getCreationDraftStore } from "@/browser/stores/CreationDraftStore";
 import { getErrorMessage } from "@/common/utils/errors";
 import { isConnectionLostError } from "@/browser/contexts/connectionLink";
+import { publishProjectTrustChanged } from "@/browser/utils/workspaceMcpMutations";
 import type { ProjectWorkspaceCounts } from "@/common/utils/projectRemoval";
 import { getProjectRouteId } from "@/common/utils/projectRouteId";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
@@ -157,6 +158,20 @@ async function runProjectMutation(
   }
 }
 
+/** Whether a project listed in both snapshots changed its trust. */
+function projectTrustChanged(
+  previous: ReadonlyMap<string, ProjectConfig>,
+  next: ReadonlyMap<string, ProjectConfig>
+): boolean {
+  for (const [projectPath, projectConfig] of next) {
+    const before = previous.get(projectPath);
+    if (before != null && (before.trusted === true) !== (projectConfig.trusted === true)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function ProjectProvider(props: { children: ReactNode }) {
   const { api } = useAPI();
   // Handlers use only the live client: offline they keep returning their result (for example
@@ -194,6 +209,8 @@ export function ProjectProvider(props: { children: ReactNode }) {
     pending: boolean;
     promise: Promise<void> | null;
   }>({ api, pending: false, promise: null });
+  // Last list from the backend, to notice trust changes that arrive with a re-list.
+  const listedProjectsRef = useRef<Map<string, ProjectConfig> | null>(null);
 
   const refreshProjects = useCallback((): Promise<void> => {
     const refresh = projectsRefreshRef.current;
@@ -214,9 +231,21 @@ export function ProjectProvider(props: { children: ReactNode }) {
           try {
             const projectsList = await requestApi.projects.list();
             if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
-            setAllProjectsInternal(new Map(projectsList));
+            const listedProjects = new Map(projectsList);
+            const previousListedProjects = listedProjectsRef.current;
+            listedProjectsRef.current = listedProjects;
+            setAllProjectsInternal(listedProjects);
             setLoaded(true);
             setLoadError(null);
+            // #7216: trust changed by the `xum trust` CLI or another client reaches this
+            // renderer only as a config change (onConfigChanged below), so refresh the
+            // trust-gated lists (project plugin skills, MCP servers) here too.
+            if (
+              previousListedProjects != null &&
+              projectTrustChanged(previousListedProjects, listedProjects)
+            ) {
+              publishProjectTrustChanged();
+            }
           } catch (error) {
             if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
             // A lost connection is no load error: the reconnect reloads.

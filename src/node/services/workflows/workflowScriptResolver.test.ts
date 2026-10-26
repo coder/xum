@@ -24,6 +24,7 @@ import {
 } from "@/node/services/tools/testHelpers";
 import { discoverWorkflowScripts } from "./workflowScriptDiscovery";
 import { RuntimeError } from "@/node/runtime/Runtime";
+import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import {
   assertStoredPluginWorkflowReviewed,
   resolveWorkflowScript,
@@ -179,6 +180,37 @@ describe("resolveWorkflowScript", () => {
     expect(resolved.resolvedPath).toBe(path.join(skillDir, "workflow.js"));
     // Untrusted: the project's plugins are not even listed, so the skill does not exist.
     await expect(resolve(false)).rejects.toThrow("not found");
+  });
+
+  // #7216: the project-automation kill switch wins over trust for a project plugin's workflow.
+  test("a trusted project's plugin skill workflow is not found under the kill switch", async () => {
+    using tempDir = new TestTempDir("workflow-script-plugin-kill-switch");
+    const skillDir = path.join(tempDir.path, ".xum", "plugins", "kit", "skills", "flow");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(
+      path.join(tempDir.path, ".xum", "plugins", "kit", "plugin.json"),
+      JSON.stringify({ $schema: AGENT_PLUGIN_SCHEMA_ID_1_0_0, name: "kit" })
+    );
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: flow\ndescription: d\n---\n");
+    await fs.writeFile(path.join(skillDir, "workflow.js"), "export default function Flow() {}\n");
+    const resolve = () =>
+      resolveWorkflowScript({
+        scriptPath: "skill://flow/workflow.js",
+        runtime: new LocalRuntime(tempDir.path),
+        workspacePath: tempDir.path,
+        projectTrusted: true,
+        runtimeFactory,
+      });
+
+    expect((await resolve()).source).toContain("Flow");
+    const previous = process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+    process.env[DISABLE_PROJECT_AUTOMATION_ENV] = "1";
+    try {
+      await expect(resolve()).rejects.toThrow("not found");
+    } finally {
+      if (previous === undefined) delete process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+      else process.env[DISABLE_PROJECT_AUTOMATION_ENV] = previous;
+    }
   });
 
   test("blocks project skill workflow scripts when the project is untrusted", async () => {
