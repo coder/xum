@@ -1302,8 +1302,8 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     const settlement = new Promise<void>((resolve) => {
       releaseInit = resolve;
     });
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call
-    (workspaceService as any).initSettlementPromises.set(workspaceId, settlement);
+    // The public seam task orchestration registers its background inits through.
+    workspaceService.registerExternalBackgroundInit(workspaceId, new AbortController(), settlement);
 
     let archiveSettled = false;
     const archivePromise = workspaceService.archive(workspaceId).then((result) => {

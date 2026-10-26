@@ -48,7 +48,7 @@ import {
   createNullInitLogger,
   createTaskServiceHarness,
   createTaskServiceTestRoot,
-  registerLiveWorkspaceTurnHandle,
+  startLiveWorkspaceTurn,
   removeTaskServiceTestRoot,
   waitForWorkspaceTaskStatus,
 } from "@/node/services/taskService.shared.testHarness";
@@ -3131,7 +3131,12 @@ describe("TaskService", () => {
     });
     const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
     const { taskService } = createTaskServiceHarness(config, { workspaceService });
-    await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_live", parentId);
+    await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: parentId,
+      workspaceId: "target",
+      handleId: "wst_live",
+      ownerCreatedWorkspace: true,
+    });
 
     const created = await createAgentTask(taskService, parentId, "Inspect", { isolation: "none" });
     assert(created.success);

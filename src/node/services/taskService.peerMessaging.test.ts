@@ -39,7 +39,7 @@ import {
 import {
   collectFullHistory,
   createTaskServiceHarness,
-  registerLiveWorkspaceTurnHandle,
+  startLiveWorkspaceTurn,
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
@@ -1147,6 +1147,7 @@ describe("TaskService", () => {
         projectPath,
         [
           projectWorkspace(projectPath, "sender", "sender"),
+          projectWorkspace(projectPath, "owner", "owner"),
           projectWorkspace(projectPath, "target", "target", {
             agentId: "exec",
             unrelatedWorkspaceConsent: "consent",
@@ -1158,20 +1159,23 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       const sendCall = (index: number) =>
         sendMessage.mock.calls[index] as Parameters<WorkspaceHost["sendMessage"]>;
-      return { taskService, sendMessage, sendCall };
+      // `owner` delegates a turn to the target workspace it created earlier.
+      const delegate = (owner: string, handleId: string, accept = true) =>
+        startLiveWorkspaceTurn(taskService, config, {
+          ownerWorkspaceId: owner,
+          workspaceId: "target",
+          handleId,
+          ownerCreatedWorkspace: true,
+          accept,
+        });
+      return { taskService, sendMessage, sendCall, delegate };
     }
 
     // The owner already steers its delegated turn through follow-ups, so its peer message
     // continues that turn (correlated like same-tree sends).
     test("continues an accepted delegated turn owned by the sender", async () => {
-      const { taskService, sendCall } = await setUpDelegatedTarget();
-      await registerLiveWorkspaceTurnHandle(
-        taskService,
-        "target",
-        "wst_delegated",
-        "sender",
-        "accepted"
-      );
+      const { taskService, sendCall, delegate } = await setUpDelegatedTarget();
+      await delegate("sender", "wst_delegated");
       expect(
         await taskService.sendAgentTreeMessage("sender", "target", "Tokens for the composer")
       ).toEqual(
@@ -1200,14 +1204,8 @@ describe("TaskService", () => {
     test.each(["reserved", "accepted"] as const)(
       "holds a message from a sender that does not own the %s delegated turn until it ends",
       async (source) => {
-        const { taskService, sendMessage, sendCall } = await setUpDelegatedTarget();
-        await registerLiveWorkspaceTurnHandle(
-          taskService,
-          "target",
-          "wst_foreign",
-          "owner",
-          source
-        );
+        const { taskService, sendMessage, sendCall, delegate } = await setUpDelegatedTarget();
+        await delegate("owner", "wst_foreign", source === "accepted");
         expect(
           await taskService.sendAgentTreeMessage("sender", "target", "Do not resume delegated work")
         ).toEqual(
@@ -1232,18 +1230,15 @@ describe("TaskService", () => {
     );
 
     test("refuses the owner while its delegated turn is still reserved", async () => {
-      const { taskService, sendMessage, sendCall } = await setUpDelegatedTarget();
-      await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_own", "sender", "reserved");
+      const { taskService, sendMessage, sendCall, delegate } = await setUpDelegatedTarget();
+      const ownTurn = await delegate("sender", "wst_own", false);
       const result = await taskService.sendAgentTreeMessage("sender", "target", "Too early");
       expect(result).toMatchObject(Err({ code: "refused" }));
       assert(!result.success && "reason" in result.error);
       expect(result.error.reason).toMatch(/retry shortly/i);
       expect(sendMessage).not.toHaveBeenCalled();
       // Once the owner's send passes admission, the same message continues the turn.
-      workspaceTurnManagerInternals(taskService).activeWorkspaceTurnHandleByWorkspaceId.set(
-        "target",
-        { handleId: "wst_own", ownerWorkspaceId: "sender", accepted: true }
-      );
+      await ownTurn.accept();
       expect((await taskService.sendAgentTreeMessage("sender", "target", "Now")).success).toBe(
         true
       );
@@ -1254,26 +1249,14 @@ describe("TaskService", () => {
     // A queued continuation must not dispatch into a different delegated turn: its stale
     // correlation would end as an uncorrelated stream-end and supersede the new turn.
     test("withdraws a queued continuation when another delegated turn replaces it", async () => {
-      const { taskService, sendCall } = await setUpDelegatedTarget();
-      await registerLiveWorkspaceTurnHandle(
-        taskService,
-        "target",
-        "wst_first",
-        "sender",
-        "accepted"
-      );
+      const { taskService, sendCall, delegate } = await setUpDelegatedTarget();
+      await delegate("sender", "wst_first");
       expect((await taskService.sendAgentTreeMessage("sender", "target", "Queued")).success).toBe(
         true
       );
       const [, , , internal] = sendCall(0);
       expect(internal?.admissionStale?.()).toBe(false);
-      await registerLiveWorkspaceTurnHandle(
-        taskService,
-        "target",
-        "wst_second",
-        "sender",
-        "accepted"
-      );
+      await delegate("sender", "wst_second");
       expect(internal?.admissionStale?.()).toBe(true);
     });
 
@@ -1287,6 +1270,7 @@ describe("TaskService", () => {
           projectPath,
           [
             projectWorkspace(projectPath, "sender", "sender"),
+            projectWorkspace(projectPath, "owner", "owner"),
             projectWorkspace(projectPath, "target", "target", {
               agentId: "plan",
               unrelatedWorkspaceConsent: "consent",
@@ -1302,16 +1286,19 @@ describe("TaskService", () => {
           resolveParentAutoResumeOptions: () => Promise<{ model: string; agentId: string }>;
         };
         const resolve = spyOn(internals, "resolveParentAutoResumeOptions");
+        // `owner` starts a delegated turn on the target it created earlier; it stays reserved.
+        const delegate = () =>
+          startLiveWorkspaceTurn(taskService, config, {
+            ownerWorkspaceId: "owner",
+            workspaceId: "target",
+            handleId: "wst_race",
+            ownerCreatedWorkspace: true,
+            accept: false,
+          });
         try {
           if (phase === "pre-admission") {
             resolve.mockImplementationOnce(async () => {
-              await registerLiveWorkspaceTurnHandle(
-                taskService,
-                "target",
-                "wst_race",
-                "owner",
-                "reserved"
-              );
+              await delegate();
               return { model: defaultModel, agentId: "plan" };
             });
           }
@@ -1328,13 +1315,7 @@ describe("TaskService", () => {
                 queueDispatchMode: "tool-end",
               })
             );
-            await registerLiveWorkspaceTurnHandle(
-              taskService,
-              "target",
-              "wst_race",
-              "owner",
-              "reserved"
-            );
+            await delegate();
             const [, , , internal] = sendMessage.mock.calls[0] as Parameters<
               WorkspaceHost["sendMessage"]
             >;
@@ -1659,8 +1640,6 @@ describe("TaskService", () => {
           projectWorkspace(projectPath, "target", "target", {
             parentWorkspaceId: "foreign-root",
             taskStatus: "reported",
-            taskExecutionStatus: "running",
-            taskExecutionId: "wst_live",
             agentId: "explore",
             taskModelString: "openai:gpt-5.2",
             taskThinkingLevel: "medium",
@@ -1670,7 +1649,11 @@ describe("TaskService", () => {
       );
       const { workspaceService, sendMessage } = createWorkspaceServiceMocks();
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
-      await registerLiveWorkspaceTurnHandle(taskService, "target", "wst_live", "foreign-root");
+      await startLiveWorkspaceTurn(taskService, config, {
+        ownerWorkspaceId: "foreign-root",
+        workspaceId: "target",
+        handleId: "wst_live",
+      });
       // A parent's opt-in cannot grant access to its child, even during a live execution.
       expect(
         await taskService.sendAgentTreeMessage("sender", "target", "Parent consent only")
