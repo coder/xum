@@ -12,12 +12,8 @@ import {
   TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE,
   TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE,
 } from "@/constants/agentMessaging";
-import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
-import type { AIService } from "@/node/services/aiService";
 import { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
 import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
-import { InitStateManager } from "@/node/services/initStateManager";
 import type { TurnCompletion } from "@/node/services/streamManager";
 import {
   readSubagentReportArtifact,
@@ -36,7 +32,8 @@ import {
 import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
-import { WorkspaceService } from "@/node/services/workspaceService";
+import type { WorkspaceService } from "@/node/services/workspaceService";
+import { createRealHostWorkspaceService } from "@/node/services/workspaceService.testHarness";
 import { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
@@ -181,25 +178,17 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       owner: string | undefined;
     }> = [];
     let streaming = false;
-    const ledger: { svc?: Internals; host?: EventEmitter } = {};
-    const sessionHarness = await createAgentSessionHarness({
-      workspaceId: childId,
+    const ledger: { svc?: Internals } = {};
+    const host = createRealHostWorkspaceService({
       config,
       historyService,
       aiEmitter,
-      captureEvents: true,
-      // Turn settlement reaches TaskService the way WorkspaceService's own sessions report it.
-      onTurnSettled: (turnGeneration) =>
-        ledger.host?.emit("workspace-turn-settled", { workspaceId: childId, turnGeneration }),
-      onTurnSuperseded: (previous, next) =>
-        ledger.host?.emit("workspace-turn-superseded", { workspaceId: childId, previous, next }),
+      backgroundProcessManager: new BackgroundProcessManager(
+        path.join(config.rootDir, "hold-background-processes")
+      ),
+      workspaceGoalService: options?.workspaceGoalService,
       aiServiceOverrides: {
         isStreaming: () => streaming,
-        getWorkspaceMetadata: mock(async (workspaceId: string) => {
-          const all = await config.getAllWorkspaceMetadata();
-          const found = all.find((m) => m.id === workspaceId);
-          return found ? Ok(found) : Err("not found");
-        }),
         streamMessage: mock((opts: { workspaceId: string }) => {
           // Only the child's streams are under test. The root shares this mocked AIService, and
           // its terminal-attention wake (the `<mux_subagent_report>` delivery) would otherwise be
@@ -242,26 +231,17 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         }),
       },
     });
-    const backgroundProcessManager = new BackgroundProcessManager(
-      path.join(config.rootDir, "hold-background-processes")
-    );
-    const initStateManager = new InitStateManager(config);
-    const aiService = sessionHarness.aiService as unknown as AIService;
-    const workspaceService = new WorkspaceService(
-      config,
-      historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      initStateManager,
-      new ExtensionMetadataService(path.join(config.rootDir, "hold-extension-metadata.json")),
-      backgroundProcessManager
-    );
-    (workspaceService as unknown as { sessions: Map<string, unknown> }).sessions.set(
-      childId,
-      sessionHarness.session
-    );
+    const workspaceService = host.service;
+    const aiService = host.aiService;
     hosts.push(workspaceService);
-    ledger.host = workspaceService as unknown as EventEmitter;
+    // The child's real session (WorkspaceService.createSession wires its turn callbacks).
+    const child = {
+      session: host.session(childId),
+      aiService,
+      get events() {
+        return host.chatEvents(childId);
+      },
+    };
     const { taskService } = createTaskServiceStack(config, {
       historyService,
       aiService,
@@ -297,33 +277,26 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     };
     /** Stop restores only: a refused follow-up is held by the session, never restored. */
     const restoreEvents = () =>
-      sessionHarness.events.filter(
+      child.events.filter(
         (event): event is Extract<typeof event, { type: "restore-to-input" }> =>
           event.type === "restore-to-input"
       );
-    const heldInputs = () => sessionHarness.session.getHeldInputs();
+    const heldInputs = () => child.session.getHeldInputs();
     const heldTexts = () => heldInputs().map((held) => held.send.displayText);
     const cleanup = async () => {
       for (const completion of completions) {
         completion.resolve({ status: "aborted", abortReason: "user" });
       }
       // The host also runs sessions of its own: the root's, created to deliver the child's
-      // report. Latch it so nothing starts another session, then dispose every session it holds
-      // before the fixture deletes the temp root; otherwise the root's history I/O outlives the
-      // test and lands in later files (#5010).
-      workspaceService.beginShutdown();
-      await sessionHarness.session.dispose();
+      // report. Shut it down the way the app does (the app scope's join: every session's
+      // shutdown and the tracked cleanup, including the stream listeners' streaming-status
+      // writes, #5058) before the fixture deletes the temp root; otherwise the root's history
+      // I/O outlives the test and lands in later files (#5010).
+      await host.dispose();
+      // Deregister the disposed sessions so the leftover check above sees only live ones.
       const hostSessions = (workspaceService as unknown as { sessions: Map<string, unknown> })
         .sessions;
       await Promise.all([...hostSessions.keys()].map((id) => workspaceService.disposeSession(id)));
-      // Join the host's tracked cleanup as the app-scope finalizer does. Since #5058 that
-      // includes the stream listeners' streaming-status writes, which would otherwise land in
-      // hold-extension-metadata.json after the fixture deleted the root.
-      const pending = (
-        workspaceService as unknown as { pendingWorkspaceCleanup: Set<Promise<void>> }
-      ).pendingWorkspaceCleanup;
-      while (pending.size > 0) await Promise.all([...pending]);
-      await sessionHarness.cleanup();
     };
     return {
       aiEmitter,
@@ -331,7 +304,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       taskService,
       svc,
       workspaceService,
-      sessionHarness,
+      child,
       completions,
       streamStarts,
       sendOptions,
@@ -396,7 +369,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         // because the task reported — and published with that reason.
         expect(stack.heldTexts()).toEqual(["follow-up text"]);
         expect(stack.heldInputs().map((held) => held.reason)).toEqual(["reported"]);
-        const lastHeldEvent = stack.sessionHarness.events.findLast(
+        const lastHeldEvent = stack.child.events.findLast(
           (event) => event.type === "held-inputs-changed"
         );
         expect(lastHeldEvent).toMatchObject({
@@ -514,7 +487,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       );
       expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
       stack.completeStream(0, event);
-      await until(() => !stack.sessionHarness.session.isBusy(), "reporting turn settled");
+      await until(() => !stack.child.session.isBusy(), "reporting turn settled");
       await yieldMacrotasks(5);
       // No second stream: nothing ran under the completed attempt.
       expect(completions).toHaveLength(1);
@@ -542,9 +515,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
   test("refused manual follow-ups are held with their full sends, in order: never dispatched automatically (drains, force-send, a later manual turn), untouched by Stop and clearQueue, replayed on subscription; Send re-sends one under a fresh attempt and removes it only once accepted; Discard removes", async () => {
     const childId = "holdinput001";
     const stack = await createStack(childId);
-    const { config, taskService, workspaceService, sessionHarness, completions } = stack;
+    const { config, taskService, workspaceService, child, completions } = stack;
     const { streamStarts, sendOptions } = stack;
-    const session = sessionHarness.session;
+    const session = child.session;
     const review = {
       filePath: "src/a.ts",
       lineRange: "1-2",
@@ -664,9 +637,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(workspaceService.discardHeldInput(childId, first.id)).toEqual(Ok(undefined));
       expect(stack.heldInputs()).toHaveLength(0);
       expect(await replayedHeldLists()).toEqual([]);
-      const heldEvents = sessionHarness.events.filter(
-        (event) => event.type === "held-inputs-changed"
-      );
+      const heldEvents = child.events.filter((event) => event.type === "held-inputs-changed");
       expect(heldEvents.at(-1)).toMatchObject({ heldInputs: [] });
     } finally {
       await stack.cleanup();
@@ -762,7 +733,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       stack.endStream(0, { report: "done" }, true);
       await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
       await until(() => stack.heldInputs().length === 1, "follow-up held");
-      await until(() => !stack.sessionHarness.session.isBusy(), "turn settled");
+      await until(() => !stack.child.session.isBusy(), "turn settled");
       // Not queued work, yet a restart would lose it.
       expect(workspaceService.hasQueuedMessages(childId)).toBe(false);
       expect(heldBlockers()).toEqual([
@@ -947,6 +918,21 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       spyOn(goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
         realWait(workspaceId, messageId, 20)
       );
+      // The child's session opens its stream's accounting receipt at stream start (the session
+      // gets this goal service from WorkspaceService). Hold its settlement, as a slow accounting
+      // write would, until the test ends.
+      const isHeldReceipt = (workspaceId: string, messageId: string) =>
+        workspaceId === childId && messageId === "assistant-1";
+      const realSettle = goals.settleStreamAccountingReceipt.bind(goals);
+      const realRelease = goals.releaseUnaccountedStreamAccountingReceipt.bind(goals);
+      spyOn(goals, "settleStreamAccountingReceipt").mockImplementation((workspaceId, messageId) => {
+        if (!isHeldReceipt(workspaceId, messageId)) realSettle(workspaceId, messageId);
+      });
+      spyOn(goals, "releaseUnaccountedStreamAccountingReceipt").mockImplementation(
+        (workspaceId, messageId) => {
+          if (!isHeldReceipt(workspaceId, messageId)) realRelease(workspaceId, messageId);
+        }
+      );
       const stack = await createStack(childId, undefined, { workspaceGoalService: goals });
       const { taskService, svc, workspaceService, completions, sendOptions } = stack;
       try {
@@ -959,8 +945,6 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         expect(
           await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
         ).toEqual(Ok(undefined));
-        // The session opened this stream's accounting receipt; it never settles in this test.
-        goals.beginStreamAccountingReceipt(childId, "assistant-1");
         stack.endStream(0, {}, true);
         await until(
           () => svc.streamEndDecisionsByTaskId.get(childId)?.[0]?.outcome === "pending",
@@ -1014,6 +998,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
         expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
       } finally {
+        realSettle(childId, "assistant-1");
         await stack.cleanup();
       }
     },
@@ -1023,8 +1008,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
   test("while the decision is pending no drain trigger dispatches the held entry and a direct send in preflight is refused; the hold never blocks the session", async () => {
     const childId = "holdtriggers001";
     const stack = await createStack(childId);
-    const { config, taskService, svc, workspaceService, sessionHarness, completions, sendOptions } =
-      stack;
+    const { config, taskService, svc, workspaceService, child, completions, sendOptions } = stack;
     // Block TaskService's handler inside its first awaited write so the decision stays pending.
     const gate = Promise.withResolvers<void>();
     let blocked = false;
@@ -1047,11 +1031,11 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       stack.endStream(0, { report: "done" }, true);
       await until(() => blocked, "handler blocked");
       // The session finished its turn (idle) with the entry still queued: every trigger holds.
-      await until(() => !sessionHarness.session.isBusy(), "session idle");
-      sessionHarness.session.drainQueuedMessagesIfIdle();
-      expect(sessionHarness.session.sendNextUserQueuedMessage()).toBe(true);
-      sessionHarness.session.sendQueuedMessages("terminal");
-      sessionHarness.session.sendQueuedMessages("provider-tool");
+      await until(() => !child.session.isBusy(), "session idle");
+      child.session.drainQueuedMessagesIfIdle();
+      expect(child.session.sendNextUserQueuedMessage()).toBe(true);
+      child.session.sendQueuedMessages("terminal");
+      child.session.sendQueuedMessages("provider-tool");
       await yieldMacrotasks(3);
       expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
       expect(completions).toHaveLength(1);
@@ -1162,7 +1146,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     stack: Awaited<ReturnType<typeof createStack>>,
     childId: string
   ) {
-    const { config, taskService, svc, workspaceService, sessionHarness, sendOptions } = stack;
+    const { config, taskService, svc, workspaceService, child, sendOptions } = stack;
     const gate = Promise.withResolvers<void>();
     let blocked = false;
     const emitOriginal = svc.emitWorkspaceMetadata.bind(taskService);
@@ -1182,7 +1166,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     ).toEqual(Ok(undefined));
     stack.endStream(0, { report: "done" }, true);
     await until(() => blocked, "handler blocked");
-    await until(() => !sessionHarness.session.isBusy(), "session idle");
+    await until(() => !child.session.isBusy(), "session idle");
     await yieldMacrotasks(3);
     // Held: still queued, obligation still enqueued, decision pending.
     expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
@@ -1746,7 +1730,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       } else {
         // Idle session (the stopped stream already wound down): only TaskService's user-abort
         // handler is left to run, and later sends take the ordinary idle path.
-        expect(stack.sessionHarness.session.isBusy()).toBe(false);
+        expect(stack.child.session.isBusy()).toBe(false);
       }
       const queueAtClear: boolean[] = [];
       const realClear = workspaceService.clearQueue.bind(workspaceService);
@@ -1959,7 +1943,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
             await until(() => rotation !== undefined, "B's admission after the budget write");
             await rotation;
             await until(
-              () => !stack.sessionHarness.session.isBusy(),
+              () => !stack.child.session.isBusy(),
               "A's turn wound down without a successor turn"
             );
             await yieldMacrotasks(20);
@@ -2065,7 +2049,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       };
       // endStream() clears the harness's streaming flag, but builds a report-less text event;
       // this one is hand-built, so report the ended stream as no longer streaming here.
-      const ai = stack.sessionHarness.aiService as unknown as { isStreaming: () => boolean };
+      const ai = stack.child.aiService as unknown as { isStreaming: () => boolean };
       const realIsStreaming = ai.isStreaming.bind(ai);
       spyOn(ai, "isStreaming").mockImplementation(() =>
         completions.length === 1 ? false : realIsStreaming()
@@ -2178,7 +2162,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         taskAttemptId: undefined,
         taskModelString: undefined,
       });
-      const { svc, workspaceService, sessionHarness, completions } = stack;
+      const { svc, workspaceService, child, completions } = stack;
       let lock: ReturnType<typeof holdEventLock> | undefined;
       try {
         await seedUserRow(childId);
@@ -2189,7 +2173,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         );
         // The resume ends while its TaskService handler waits behind the lock holder.
         stack.endStream(0, { agentId: "compact" }, true);
-        await until(() => !sessionHarness.session.isBusy(), "resume turn settled");
+        await until(() => !child.session.isBusy(), "resume turn settled");
         // Not a task: nothing fences this send, so a real compaction starts and streams.
         expect(
           await workspaceService.sendMessage(childId, "/compact", {
@@ -2205,7 +2189,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         // The handler must finish; a wait on a decision nothing resolves would hold the lock (and
         // every later stream-end handler of this workspace) until the session is disposed.
         await until(released, "the resume's stream-end handler released the event lock");
-        expect(sessionHarness.session.isBusy()).toBe(true);
+        expect(child.session.isBusy()).toBe(true);
       } finally {
         await lock?.release();
         await stack.cleanup();
@@ -2230,7 +2214,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           await workspaceService.sendMessage(childId, "follow-up text", stack.sendOptions)
         ).toEqual(Ok(undefined));
         stack.endStream(0, { agentId: "compact" }, true);
-        await until(() => !stack.sessionHarness.session.isBusy(), "resume turn settled");
+        await until(() => !stack.child.session.isBusy(), "resume turn settled");
         // The follow-up is held behind the pending stream-end decision, and the attempt fence
         // refuses every turn start, a compaction send and a resume alike: no compaction can become
         // active before TaskService reads the resume's decision.
