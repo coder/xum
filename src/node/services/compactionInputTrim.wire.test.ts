@@ -98,25 +98,33 @@ async function wireBody(
   return body;
 }
 
-/** Tool call IDs, and the IDs that have a result, in the provider's own wire format. */
+/**
+ * Tool call IDs, the IDs that have a result, and each result's serialized output, in the
+ * provider's own wire format.
+ */
 function toolPairs(provider: "anthropic" | "openai", body: Record<string, unknown>) {
   const calls: string[] = [];
   const results: string[] = [];
+  const outputs = new Map<string, string>();
+  const addResult = (id: unknown, output: unknown) => {
+    results.push(String(id));
+    outputs.set(String(id), JSON.stringify(output));
+  };
   if (provider === "anthropic") {
     for (const message of body.messages as Array<{ content: unknown }>) {
       if (!Array.isArray(message.content)) continue;
       for (const block of message.content as Array<Record<string, unknown>>) {
         if (block.type === "tool_use") calls.push(String(block.id));
-        if (block.type === "tool_result") results.push(String(block.tool_use_id));
+        if (block.type === "tool_result") addResult(block.tool_use_id, block.content);
       }
     }
   } else {
     for (const item of body.input as Array<Record<string, unknown>>) {
       if (item.type === "function_call") calls.push(String(item.call_id));
-      if (item.type === "function_call_output") results.push(String(item.call_id));
+      if (item.type === "function_call_output") addResult(item.call_id, item.output);
     }
   }
-  return { calls, results };
+  return { calls, results, outputs };
 }
 
 describe("compaction input trim on the wire", () => {
@@ -139,15 +147,14 @@ describe("compaction input trim on the wire", () => {
       // Room for one full result: "a" and "b" become placeholders, "c" stays whole.
       const payload = await assemble(provider, 14_000);
       const body = await wireBody(provider, payload);
-      const text = JSON.stringify(body);
-      const { calls, results } = toolPairs(provider, body);
+      const { calls, results, outputs } = toolPairs(provider, body);
 
       expect(calls).toEqual(["call_a", "call_b", "call_c"]);
       expect(results).toEqual(calls);
-      expect(text).not.toContain(`a:${"x".repeat(100)}`);
-      expect(text).toContain(`c:${"x".repeat(100)}`);
-      expect(text).toContain("Tool result omitted to fit the compaction request");
-      expect(text).toContain("2 tool results were replaced by size placeholders");
+      // Two results ship as size placeholders (trimCompactionInput.test owns their wording).
+      const shipsWhole = (id: string) =>
+        outputs.get(`call_${id}`)?.includes(`${id}:${"x".repeat(100)}`);
+      expect(["a", "b", "c"].map(shipsWhole)).toEqual([false, false, true]);
       // Thinking signatures are bound to the prefix the trim changed. (The SDK body here has
       // no thinking config, so check the provider messages Xum hands it.)
       expect(JSON.stringify(payload.messages)).not.toContain("sig-");
@@ -229,8 +236,10 @@ describe("compaction input trim on the wire", () => {
 
     const text = JSON.stringify((await assemble("openai", budget, history)).messages);
 
-    // The hooked turn is the oldest one, so the trim leaves it out; its hook text never ships.
-    expect(text).toContain("Compaction input trimmed to fit the context window: 1 oldest turns");
+    // The hooked turn is the oldest one, so the trim leaves out that turn only; its hook text
+    // never ships.
+    expect(text).not.toContain("check the policy");
+    expect(text).toContain("read a");
     expect(text).not.toContain(hookText);
   });
 
