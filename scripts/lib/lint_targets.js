@@ -23,6 +23,8 @@ const LINT_FILE_PATTERNS = [
   /^src\/node\/builtinSkills\/.+\.js$/,
   /^src\/node\/workflowRuntime\/[^/]+\.js$/,
   /^scripts\/lib\/[^/]+\.js$/,
+  /^scripts\/.+\.test\.ts$/,
+  /^vscode\/src\/.+\.tsx?$/,
 ];
 
 // Changes that can alter findings in files the branch did not edit, so only a full run is
@@ -109,7 +111,7 @@ function listChangedFiles(cwd, base) {
  * oxlint walks these directories itself: a list of every file would exceed the Windows
  * command-line limit (~32K characters). Every file that LINT_FILE_PATTERNS matches is inside one.
  */
-const OXLINT_ROOTS = ["src", "tests", "scripts/lib"];
+const OXLINT_ROOTS = ["src", "tests", "scripts", "vscode/src"];
 // The extensions oxlint lints when it walks a directory.
 const OXLINT_FILE_EXTENSIONS = /\.(?:[cm]?[jt]sx?|vue|svelte|astro)$/;
 

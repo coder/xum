@@ -104,7 +104,7 @@ export function WorkspacePicker(props: {
     : props.workspaces;
 
   const projectGroups = (() => {
-    const groups: Array<{ projectName: string; projectPath: string; workspaces: UiWorkspace[] }> =
+    const groups: { projectName: string; projectPath: string; workspaces: UiWorkspace[] }[] =
       [];
     const byProjectPath = new Map<string, (typeof groups)[number]>();
 
