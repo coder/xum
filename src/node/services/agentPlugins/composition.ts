@@ -147,6 +147,24 @@ function workflowSourceLabel(scope: string, canonicalScriptPath?: string): strin
   return scope;
 }
 
+/**
+ * #7284: the skill roots of a remote (SSH/Docker) checkout, built like a turn's
+ * (skillStorageContext's project-runtime branch): trust-gated plugin containers at the checkout
+ * root and runtime containment. Those plugin skills come from the cached remote snapshot
+ * (getRemoteProjectPluginSnapshot), so a warm cache adds no remote listing. Other runtimes: none.
+ */
+function remoteCheckoutSkillRoots(args: BuildWorkspaceCompositionArgs) {
+  if (!isRemoteRuntime(args.runtime)) return {};
+  const projectSearchRoot = args.projectCheckoutRoot ?? args.workspacePath;
+  return {
+    roots: getDefaultAgentSkillsRoots(args.runtime, args.workspacePath, {
+      projectSearchRoot,
+      projectPluginsTrusted: args.projectTrusted,
+    }),
+    containment: { kind: "runtime" as const, root: projectSearchRoot },
+  };
+}
+
 export async function buildWorkspaceComposition(
   args: BuildWorkspaceCompositionArgs
 ): Promise<WorkspaceComposition> {
@@ -194,19 +212,6 @@ export async function buildWorkspaceComposition(
           containment: { kind: "local" as const, root: args.hostCheckoutRoot },
         }
       : undefined;
-  // #7284: a remote checkout's plugin skills, read like a turn reads them (skillStorageContext's
-  // project-runtime branch): trust-gated roots and runtime containment. They come from the cached
-  // remote snapshot (getRemoteProjectPluginSnapshot), so a warm cache adds no remote listing.
-  const remoteProjectSearchRoot = args.projectCheckoutRoot ?? args.workspacePath;
-  const remoteSkillRoots = isRemoteRuntime(args.runtime)
-    ? {
-        roots: getDefaultAgentSkillsRoots(args.runtime, args.workspacePath, {
-          projectSearchRoot: remoteProjectSearchRoot,
-          projectPluginsTrusted: args.projectTrusted,
-        }),
-        containment: { kind: "runtime" as const, root: remoteProjectSearchRoot },
-      }
-    : undefined;
 
   // Outside the agent loop: the plugin composition inspector reads through the host's runtimes.
   const runtimeFactory = nodeRuntimeFactory;
@@ -215,7 +220,7 @@ export async function buildWorkspaceComposition(
   const skillDescriptors = requireReachableSkills(
     await discoverAgentSkills(args.runtime, args.workspacePath, {
       dedupeByName: false,
-      ...(checkoutSkillRoots ?? remoteSkillRoots ?? {}),
+      ...(checkoutSkillRoots ?? remoteCheckoutSkillRoots(args)),
       runtimeFactory,
     })
   );

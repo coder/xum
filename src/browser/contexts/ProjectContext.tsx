@@ -158,18 +158,24 @@ async function runProjectMutation(
   }
 }
 
-/** Whether a project listed in both snapshots changed its trust. */
-function projectTrustChanged(
-  previous: ReadonlyMap<string, ProjectConfig>,
+/**
+ * #7216: trust changed by the `xum trust` CLI or another client reaches this renderer only as a
+ * config change and the re-list after it, so publish a trust change (it refreshes the
+ * trust-gated lists: project plugin skills, MCP servers) when a project listed in both snapshots
+ * changed its trust. The first list has nothing to compare with.
+ */
+function publishRelistedTrustChanges(
+  previous: ReadonlyMap<string, ProjectConfig> | null,
   next: ReadonlyMap<string, ProjectConfig>
-): boolean {
+): void {
+  if (previous == null) return;
   for (const [projectPath, projectConfig] of next) {
     const before = previous.get(projectPath);
     if (before != null && (before.trusted === true) !== (projectConfig.trusted === true)) {
-      return true;
+      publishProjectTrustChanged();
+      return;
     }
   }
-  return false;
 }
 
 export function ProjectProvider(props: { children: ReactNode }) {
@@ -237,15 +243,7 @@ export function ProjectProvider(props: { children: ReactNode }) {
             setAllProjectsInternal(listedProjects);
             setLoaded(true);
             setLoadError(null);
-            // #7216: trust changed by the `xum trust` CLI or another client reaches this
-            // renderer only as a config change (onConfigChanged below), so refresh the
-            // trust-gated lists (project plugin skills, MCP servers) here too.
-            if (
-              previousListedProjects != null &&
-              projectTrustChanged(previousListedProjects, listedProjects)
-            ) {
-              publishProjectTrustChanged();
-            }
+            publishRelistedTrustChanges(previousListedProjects, listedProjects);
           } catch (error) {
             if (refresh !== projectsRefreshRef.current || !refresh.api) continue;
             // A lost connection is no load error: the reconnect reloads.
