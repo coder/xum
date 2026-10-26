@@ -65,7 +65,7 @@ import {
   TurnEvents,
   type NestedToolEvent,
 } from "@/node/services/turnEngine/TurnEvents";
-import { nodeClock, type HostClock } from "@/node/utils/hostClock";
+import type { HostClock } from "@/node/utils/hostClock";
 import type {
   WorkspaceId,
   TurnEngineEventSink,
@@ -376,6 +376,7 @@ export class StreamManager {
     });
     this.turnRegistry = new TurnRegistry({
       effectRunner: runner,
+      hostClock: this.hostClock,
       engineScope,
       turnEvents: this.turnEvents,
       mockStreamLifecycle: () => this.mockStreamLifecycle,
@@ -397,6 +398,7 @@ export class StreamManager {
     });
     this.turnEngine = new TurnEngine({
       effectRunner: this.effectRunner,
+      hostClock: this.hostClock,
       turnRegistry: this.turnRegistry,
       turnResources: this.turnResources,
       providerRequest: this.providerRequest,
@@ -456,6 +458,7 @@ export class StreamManager {
         this.buildPartialAssistantMessage(streamInfo, options),
     });
     this.attemptLoop = new AttemptLoop({
+      hostClock: this.hostClock,
       turnResources: this.turnResources,
       toolCallDisplayRegistry: this.toolCallDisplayRegistry,
       partialJournal: this.partialJournal,
@@ -754,8 +757,7 @@ export class StreamManager {
         finalStep?.usage
       ),
       finishReason,
-      // Duration from the wall-clock streamInfo.startTime.
-      duration: nodeClock.nowMs() - streamInfo.startTime,
+      duration: this.hostClock.nowMs() - streamInfo.durationStartMs,
     };
   }
 

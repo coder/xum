@@ -95,6 +95,12 @@ export interface TurnSlot {
   token: StreamToken;
   executionScope?: ExecutionScope;
   startTime: number;
+  /**
+   * HostClock start of the stream-end and abort durations. Two start fields exist because
+   * `startTime` is a record time: the assistant row stamp and the `starting-<startTime>` id
+   * stay on the wall clock until the row consumers move to the HostClock (#7282).
+   */
+  durationStartMs: number;
   historySequence: number;
   // Track background processing promise for guaranteed cleanup
   processingPromise: Promise<void>;

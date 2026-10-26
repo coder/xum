@@ -49,7 +49,7 @@ import {
 } from "@/node/services/turnEngine/types";
 import type { WorkspaceStreamInfo } from "@/node/services/turnEngine/turnState";
 import { UsageLedger } from "@/node/services/turnEngine/UsageLedger";
-import { nodeClock } from "@/node/utils/hostClock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 
 export function createTurnCompletionController(): TurnCompletionController {
   let settled = false;
@@ -192,6 +192,7 @@ export function createStreamInfo(
     request: StreamRequestConfig;
     stepTracker: StepMessageTracker;
     metadataModel: string;
+    durationStartMs: number;
   }
 ): WorkspaceStreamInfo {
   const {
@@ -218,6 +219,7 @@ export function createStreamInfo(
     token: ctx.streamToken,
     executionScope,
     startTime,
+    durationStartMs: ctx.durationStartMs,
     lastPartTimestamp: startTime,
     toolCompletionTimestamps: new Map(),
     pendingWorkflowRunAttachments: new Map(),
@@ -338,6 +340,8 @@ function wireAutoThinkingEscalation(
 export interface TurnEngineDeps {
   /** Runs start's Effect (StreamManager's runner). */
   readonly effectRunner: EffectRunner;
+  /** Starts the stream's durations (StreamManager's HostClock). */
+  readonly hostClock: HostClock;
   readonly turnRegistry: TurnRegistry;
   readonly turnResources: TurnResources;
   readonly providerRequest: Pick<ProviderRequest, "buildStreamRequestConfig">;
@@ -697,6 +701,7 @@ export class TurnEngine {
       request,
       stepTracker,
       metadataModel,
+      durationStartMs: this.deps.hostClock.nowMs(),
     });
     wireStepTrackerHooks(streamInfo);
     wireThinkingOverride(streamInfo, options.initialMetadata);

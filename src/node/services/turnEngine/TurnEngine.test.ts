@@ -65,6 +65,7 @@ function streamFor(
     request: request as StreamRequestConfig,
     stepTracker,
     metadataModel: "anthropic:claude-sonnet-5-5",
+    durationStartMs: 0,
   });
 }
 

@@ -20,7 +20,7 @@ import { hasCommitWorthyParts } from "@/node/services/historyService";
 import { log, type Logger } from "@/node/services/log";
 import type { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry";
 import { createErrorEvent, type StreamErrorPayload } from "@/node/services/utils/sendMessageError";
-import { nodeClock } from "@/node/utils/hostClock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { partFold, type FoldablePart, type FoldStep } from "./partFold";
 import type { PartialJournal } from "./PartialJournal";
 import { ProviderRequest, type StreamRequestConfig } from "./ProviderRequest";
@@ -229,6 +229,8 @@ function abortedPartialMetadata(
 }
 
 export interface AttemptLoopDeps {
+  /** Measures the abort duration (StreamManager's HostClock). */
+  readonly hostClock: HostClock;
   readonly turnResources: Pick<
     TurnResources,
     "acquireMcpLease" | "releaseMcpLease" | "closeStreamResources"
@@ -1008,8 +1010,7 @@ export class AttemptLoop {
     // cumulativeUsage is updated on each finish-step event (before tool execution),
     // so it has accurate data even when the stream is interrupted mid-tool-call.
     // AI SDK's totalUsage may return zeros or stale data when aborted.
-    // Duration from the wall-clock streamInfo.startTime.
-    const duration = nodeClock.nowMs() - streamInfo.startTime;
+    const duration = this.deps.hostClock.nowMs() - streamInfo.durationStartMs;
     const usage = hasTokenUsage(streamInfo.cumulativeUsage)
       ? streamInfo.cumulativeUsage
       : undefined;

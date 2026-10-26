@@ -27,7 +27,7 @@ import type { TurnSlot, WorkspaceStreamInfo } from "@/node/services/turnEngine/t
 import type { TurnEvents } from "@/node/services/turnEngine/TurnEvents";
 import { linkAbortSignal } from "@/node/utils/abort";
 import { AsyncMutex } from "@/node/utils/concurrency/asyncMutex";
-import { nodeClock } from "@/node/utils/hostClock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 export { StreamState, type StreamToken } from "@/node/services/turnEngine/types";
 
 export interface PendingStreamStartHandle {
@@ -41,6 +41,8 @@ export interface PendingStreamStartHandle {
 interface PendingStreamStart {
   abortController: AbortController;
   startTime: number;
+  /** HostClock start of the startup-abort duration; see TurnSlot.durationStartMs. */
+  durationStartMs: number;
   syntheticMessageId: string;
   abortDelivery?: Promise<void>;
   acpPromptId?: string;
@@ -48,6 +50,8 @@ interface PendingStreamStart {
 
 export interface TurnRegistryDeps {
   readonly effectRunner: EffectRunner;
+  /** Measures the startup-abort duration (StreamManager's HostClock). */
+  readonly hostClock: HostClock;
   /**
    * Supervised scope for the stream engine (the app runtime's `AppFiberScope`,
    * di/appFiberScope.ts). When set, every started stream gets a child scope
@@ -102,6 +106,7 @@ export class TurnRegistry {
     this.pendingStreamStarts.set(input.workspaceId, {
       abortController,
       startTime,
+      durationStartMs: this.deps.hostClock.nowMs(),
       syntheticMessageId,
       acpPromptId: input.acpPromptId,
     });
@@ -500,8 +505,7 @@ export class TurnRegistry {
         .emitStreamAbort(
           workspaceId,
           pending.syntheticMessageId,
-          // Duration from the wall-clock pending.startTime.
-          { duration: nodeClock.nowMs() - pending.startTime },
+          { duration: this.deps.hostClock.nowMs() - pending.durationStartMs },
           this.getStartupAbortReason(pending.abortController.signal),
           options?.abandonPartial,
           pending.acpPromptId
