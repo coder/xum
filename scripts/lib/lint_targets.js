@@ -34,6 +34,10 @@ const FULL_LINT_TRIGGERS = [
   /^eslint-local-rules\.mjs$/,
   /^package\.json$/,
   /^bun\.lock$/,
+  // vscode/src is linted with the extension's own types (@types/vscode), so an update to its
+  // dependencies can surface findings in unchanged files.
+  /^vscode\/package\.json$/,
+  /^vscode\/bun\.lock$/,
   /^tsconfig[^/]*\.json$/,
   /^scripts\/lint\.sh$/,
   /^scripts\/lib\/lint_targets\.js$/,

@@ -48,6 +48,8 @@ describe("lint target selection", () => {
     "eslint-local-rules.mjs",
     "package.json",
     "bun.lock",
+    "vscode/package.json",
+    "vscode/bun.lock",
     "tsconfig.json",
     "tsconfig.main.json",
     "scripts/lint.sh",
@@ -60,7 +62,7 @@ describe("lint target selection", () => {
   });
 
   it("does not treat nested lookalikes as config changes", () => {
-    expect(lintTargets.selectLintTargets(["vscode/package.json", "src/tsconfig.json"])).toEqual({
+    expect(lintTargets.selectLintTargets(["src/package.json", "src/tsconfig.json"])).toEqual({
       mode: "files",
       files: [],
     });
