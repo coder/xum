@@ -28,6 +28,8 @@ function messages(code: string, allow: Record<string, number> = {}) {
         languageOptions: { parser: tseslint.parser },
         plugins: { local: { rules: { "no-fixed-sleep": findRule() } } },
         rules: { "local/no-fixed-sleep": ["error", { allow }] },
+        // As in eslint.config.mjs: a directive the rule never hits is an error.
+        linterOptions: { reportUnusedDisableDirectives: "error" },
       },
     ],
     FILE
@@ -113,6 +115,15 @@ test("the allow entry is an exact count that can only go down", () => {
     messages(`await Bun.sleep(50); // eslint-disable-line local/no-fixed-sleep\n${twoWaits}`, {
       [FILE]: 2,
     })
+  ).toHaveLength(0);
+  // A wait over several lines, and a wait inside a helper that runs twice.
+  expect(
+    messages(`${disable}\nawait new Promise((resolve) =>\n  setTimeout(resolve, 50)\n);`)
+  ).toHaveLength(0);
+  expect(
+    messages(
+      `async function pause() {\n  ${disable}\n  await Bun.sleep(50);\n}\nawait pause();\nawait pause();`
+    )
   ).toHaveLength(0);
   // Without the comment, the same new wait fails.
   expect(messages(`await Bun.sleep(50);\n${twoWaits}`, { [FILE]: 2 })).toHaveLength(1);
