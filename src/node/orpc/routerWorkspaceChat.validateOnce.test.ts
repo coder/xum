@@ -21,7 +21,7 @@ import {
   createAgentSessionHarness,
   type AgentSessionHarness,
 } from "@/node/services/agentSession.testHarness";
-import type { ORPCContext } from "./context";
+import { orpcContextFromDoubles } from "./orpcContextDoubles.testHarness";
 import { router } from "./router";
 
 const workspaceId = "ws-validate-once";
@@ -154,7 +154,7 @@ async function createHarness(): Promise<AgentSessionHarness> {
 
 function createClient(harness: AgentSessionHarness) {
   const getOrCreateSession = () => harness.session;
-  const context = {
+  const context = orpcContextFromDoubles({
     workspaceService: {
       getOrCreateSession,
       getFullReplay: (id: string) =>
@@ -163,7 +163,7 @@ function createClient(harness: AgentSessionHarness) {
           id
         ),
     },
-  } as unknown as ORPCContext;
+  });
   return createRouterClient(router(), { context });
 }
 

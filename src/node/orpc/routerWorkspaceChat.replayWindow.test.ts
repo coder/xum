@@ -28,7 +28,7 @@ import {
 } from "@/node/services/agentSession.testHarness";
 import { getAssistedReviewFilePath } from "@/node/services/reviewPane/assistedReviewStorage";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
-import type { ORPCContext } from "./context";
+import { orpcContextFromDoubles } from "./orpcContextDoubles.testHarness";
 import { router } from "./router";
 
 const workspaceId = "ws-replay-window";
@@ -67,9 +67,9 @@ async function writeRawChat(harness: AgentSessionHarness, rows: string[]): Promi
 }
 
 function createClient(harness: AgentSessionHarness) {
-  const context = {
+  const context = orpcContextFromDoubles({
     workspaceService: { getOrCreateSession: () => harness.session },
-  } as unknown as ORPCContext;
+  });
   return createRouterClient(router(), { context });
 }
 
