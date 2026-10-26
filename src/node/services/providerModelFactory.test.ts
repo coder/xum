@@ -6358,3 +6358,51 @@ describe("ProviderModelFactory prompt-cache prefix observation", () => {
     );
   });
 });
+
+describe("ProviderModelFactory Bedrock application inference profiles (#7181)", () => {
+  const ARN = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4";
+  const sendAdaptive = async (mappedToModel: string): Promise<Record<string, unknown>> => {
+    let body: Record<string, unknown> | undefined;
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({
+        bedrock: { region: "us-east-1", bearerToken: "test", models: [{ id: ARN, mappedToModel }] },
+      });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel(`bedrock:${ARN}`);
+        if (!result.success) throw new Error(result.error.type);
+        // The fake reply is not a Converse response: only the request matters.
+        await generateText({
+          model: result.data,
+          prompt: "hello",
+          maxRetries: 0,
+          providerOptions: {
+            bedrock: { reasoningConfig: { type: "adaptive", maxReasoningEffort: "high" } },
+          },
+        }).catch(() => undefined);
+        expect(calls).toHaveLength(1);
+        body = parseSentBody(calls[0]);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+    if (!body) throw new Error("the request was not captured");
+    return body;
+  };
+
+  it("sends adaptive Claude thinking for an ARN mapped to Claude", async () => {
+    const body = await sendAdaptive("anthropic:claude-sonnet-5");
+    expect(body.additionalModelRequestFields).toMatchObject({
+      thinking: { type: "adaptive" },
+      output_config: { effort: "high" },
+    });
+  });
+
+  it("sends no Claude fields for an ARN mapped to another model", async () => {
+    const body = await sendAdaptive("bedrock:amazon.nova-pro-v1:0");
+    const fields = (body.additionalModelRequestFields ?? {}) as Record<string, unknown>;
+    expect(fields.thinking).toBeUndefined();
+    expect(fields.output_config).toBeUndefined();
+  });
+});

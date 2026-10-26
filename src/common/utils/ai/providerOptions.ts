@@ -334,7 +334,7 @@ function adaptiveModelOffThinking(capabilityModel: string): AnthropicThinkingSha
  * `bedrock:` origin, and Bedrock ids end in -vN[:M]; both defeat the anchored
  * capability matchers (a missed "rejects disabled" match would send a 400).
  */
-function bedrockClaudeCapabilityModel(
+export function bedrockClaudeCapabilityModel(
   formatProvider: string | undefined,
   capabilityModel: string
 ): string | null {
