@@ -345,6 +345,25 @@ describe("TasksSection Exec subagent defaults", () => {
     }
   });
 
+  test("pagehide during an in-flight autosave still sends the newer change", async () => {
+    const view = renderTasksSection();
+    // The first autosave never settles, as over a slow channel.
+    view.saveConfig.mockImplementationOnce(() => new Promise<undefined>(() => undefined));
+    await view.findByText("Explore");
+    const toggle = (agentId: string) =>
+      fireEvent.click(view.getByRole("switch", { name: `Toggle ${agentId} enabled` }));
+
+    toggle("explore");
+    await waitFor(() => expect(view.saveConfig).toHaveBeenCalledTimes(1));
+    toggle("name_workspace");
+    fireEvent(window, new window.Event("pagehide"));
+
+    expect(view.saveConfig).toHaveBeenCalledTimes(2);
+    expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.name_workspace).toEqual({
+      enabled: false,
+    });
+  });
+
   test("includes nested subagent defaults when saving a delegated default change", async () => {
     const view = renderTasksSection();
     const row = await view.findByRole("group", { name: "Exec defaults" });

@@ -689,10 +689,23 @@ export function TasksSection() {
           savingRef.current = false;
         });
     };
-    window.addEventListener("pagehide", flushPendingSave);
+    const onPageHide = () => {
+      if (!savingRef.current) {
+        flushPendingSave();
+        return;
+      }
+      // An autosave is in flight: its completion would send the newer change, but the page can
+      // be gone by then. Send it now too (best effort, after the in-flight save on the channel).
+      clearSaveTimer(saveTimerRef);
+      const payload = pendingSaveRef.current;
+      if (!payload) return;
+      pendingSaveRef.current = null;
+      void api.config.saveConfig(payload).catch(() => undefined);
+    };
+    window.addEventListener("pagehide", onPageHide);
 
     return () => {
-      window.removeEventListener("pagehide", flushPendingSave);
+      window.removeEventListener("pagehide", onPageHide);
       flushPendingSave();
     };
   }, [api, loaded, loadFailed]);
