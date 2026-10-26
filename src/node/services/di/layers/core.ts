@@ -61,6 +61,7 @@ import {
   TerminalAttentionStoreTag,
   TurnRequestBuilderBindingsTag,
   Workspace,
+  WorkspaceExternalEditorsTag,
   WorkspaceGoal,
   WorkspaceLifecycleGatesTag,
   WorkspaceMcpOverrides,
@@ -90,6 +91,8 @@ import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoo
 import { TaskService } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
+import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -265,6 +268,20 @@ export const IdleDispatcherLive = Layer.sync(IdleDispatcherTag, () => new IdleDi
 export const WorkspaceLifecycleGatesLive = Layer.sync(
   WorkspaceLifecycleGatesTag,
   () => new WorkspaceLifecycleGates()
+);
+
+/** Built on the shared lifecycle gates, so an open sees WorkspaceService's archive state. */
+export const WorkspaceExternalEditorsLive = Layer.effect(
+  WorkspaceExternalEditorsTag,
+  Effect.gen(function* () {
+    const config = yield* ConfigTag;
+    return new WorkspaceExternalEditors({
+      config,
+      files: yield* HostFilesTag,
+      leases: workspaceUseLeasesFor(config),
+      gates: yield* WorkspaceLifecycleGatesTag,
+    });
+  })
 );
 
 /** One mutable record per graph build (`sync`, not `succeed`); filled by `CoreWiringLive`. */
@@ -516,7 +533,8 @@ export const WorkspaceLive = Layer.effect(
       yield* AppFiberScopeTag,
       yield* AutoModelRouterTag,
       yield* HostClockTag,
-      yield* WorkspaceLifecycleGatesTag
+      yield* WorkspaceLifecycleGatesTag,
+      yield* WorkspaceExternalEditorsTag
     );
   })
 );
@@ -766,7 +784,10 @@ const S1 = Layer.mergeAll(
   WorkspaceLifecycleGatesLive,
   TurnRequestBuilderBindingsLive
 );
-const S2a = Layer.mergeAll(SessionUsageLive, WorkspaceGoalLive).pipe(Layer.provideMerge(S1));
+// WorkspaceExternalEditorsLive reads S1's WorkspaceLifecycleGatesTag.
+const S2a = Layer.mergeAll(SessionUsageLive, WorkspaceGoalLive, WorkspaceExternalEditorsLive).pipe(
+  Layer.provideMerge(S1)
+);
 const S2b = StreamManagerLive.pipe(Layer.provideMerge(S2a));
 const S3 = AILive.pipe(Layer.provideMerge(S2b));
 const S4 = Layer.mergeAll(MemoryConsolidationLive, MCPConfigLive, ContextManagementLive).pipe(

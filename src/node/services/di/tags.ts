@@ -82,6 +82,7 @@ import type { TaskService } from "@/node/services/taskService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import type { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
+import type { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { TokenizerService } from "@/node/services/tokenizerService";
@@ -216,6 +217,11 @@ export class WorkspaceLifecycleGatesTag extends Context.Service<
   WorkspaceLifecycleGatesTag,
   WorkspaceLifecycleGates
 >()("xum/WorkspaceLifecycleGates") {}
+/** External editor opens of each workspace, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceExternalEditorsTag extends Context.Service<
+  WorkspaceExternalEditorsTag,
+  WorkspaceExternalEditors
+>()("xum/WorkspaceExternalEditors") {}
 /** Late-bound collaborators of the turn request builder (a mutable record, filled by wiring). */
 export class TurnRequestBuilderBindingsTag extends Context.Service<
   TurnRequestBuilderBindingsTag,
@@ -376,7 +382,8 @@ export type RuntimeSeamTags = EffectRunnerTag | HostClockTag | AppFiberScopeTag;
 
 /**
  * Everything `CoreLive` (./layers/core.ts) provides: every `CoreServices`
- * field plus the graph-internal `TerminalAttentionStore` and `WorkspaceLifecycleGates`.
+ * field plus the graph-internal `TerminalAttentionStore`, `WorkspaceLifecycleGates` and
+ * `WorkspaceExternalEditors`.
  */
 export type CoreTags =
   | ContextManagement
@@ -403,6 +410,7 @@ export type CoreTags =
   | DesktopInputCoordinatorTag
   | TerminalAttentionStoreTag
   | WorkspaceLifecycleGatesTag
+  | WorkspaceExternalEditorsTag
   | TurnRequestBuilderBindingsTag;
 
 /**
