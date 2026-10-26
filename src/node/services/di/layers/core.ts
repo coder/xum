@@ -65,6 +65,7 @@ import {
   WorkspaceGoal,
   WorkspaceLifecycleGatesTag,
   WorkspaceMcpOverrides,
+  WorkspaceNamingTag,
   WorkspaceTurnManagerTag,
   type CoreRootTags,
   type CoreTags,
@@ -92,6 +93,7 @@ import { TaskService } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
 import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
+import { WorkspaceNaming } from "@/node/services/workspaceNaming";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
@@ -283,6 +285,9 @@ export const WorkspaceExternalEditorsLive = Layer.effect(
     });
   })
 );
+
+/** WorkspaceService's naming claims; no dependencies, one instance per graph. */
+export const WorkspaceNamingLive = Layer.sync(WorkspaceNamingTag, () => new WorkspaceNaming());
 
 /** One mutable record per graph build (`sync`, not `succeed`); filled by `CoreWiringLive`. */
 export const TurnRequestBuilderBindingsLive = Layer.sync(
@@ -534,7 +539,8 @@ export const WorkspaceLive = Layer.effect(
       yield* AutoModelRouterTag,
       yield* HostClockTag,
       yield* WorkspaceLifecycleGatesTag,
-      yield* WorkspaceExternalEditorsTag
+      yield* WorkspaceExternalEditorsTag,
+      yield* WorkspaceNamingTag
     );
   })
 );
@@ -782,6 +788,7 @@ const S1 = Layer.mergeAll(
   DesktopInputCoordinatorLive,
   IdleDispatcherLive,
   WorkspaceLifecycleGatesLive,
+  WorkspaceNamingLive,
   TurnRequestBuilderBindingsLive
 );
 // WorkspaceExternalEditorsLive reads S1's WorkspaceLifecycleGatesTag.
