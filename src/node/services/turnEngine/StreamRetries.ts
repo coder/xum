@@ -237,13 +237,32 @@ export class StreamRetries {
     }
 
     if (!preserveParts) {
-      try {
-        await this.deps.partialJournal.deleteForRetry(workspaceId as string);
-      } catch (deleteError) {
-        const logger =
-          options?.workspaceLog ?? this.deps.getWorkspaceLogger(workspaceId, streamInfo);
-        logger.warn("Failed to clear partial state before retry", { error: deleteError });
-      }
+      await this.clearPartialForRetry(workspaceId, streamInfo, options?.workspaceLog);
+    }
+  }
+
+  /** Clears this stream's partial before the retry. A failed delete returns Err (#7499). */
+  private async clearPartialForRetry(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo,
+    workspaceLog: Logger | undefined
+  ): Promise<void> {
+    let deleteError: unknown;
+    try {
+      const deleted = await this.deps.partialJournal.deleteForRetry(
+        workspaceId as string,
+        streamInfo.messageId
+      );
+      if (!deleted.success) deleteError = deleted.error;
+    } catch (error) {
+      deleteError = error;
+    }
+    if (deleteError !== undefined) {
+      // Log and continue the retry: its first writePartial overwrites the stale file, so only a
+      // crash before that write restores the old attempt. Failing the retry would turn a
+      // transient unlink error into a failed turn.
+      const logger = workspaceLog ?? this.deps.getWorkspaceLogger(workspaceId, streamInfo);
+      logger.warn("Failed to clear partial state before retry", { error: deleteError });
     }
   }
 

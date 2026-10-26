@@ -177,9 +177,13 @@ export class PartialJournal {
     state.lastPartialWriteTime = 0;
   }
 
-  /** Clears partial.json before a retried attempt that does not keep its parts. */
-  async deleteForRetry(workspaceId: string): Promise<Result<void>> {
-    return this.deps.historyService.deletePartial(workspaceId);
+  /**
+   * Clears partial.json before a retried attempt that does not keep its parts, only while it is
+   * still this message's: another backend (XUM_ALLOW_MULTIPLE_INSTANCES) can replace the file
+   * first, and its crash-recovery state must survive this retry (#7499).
+   */
+  async deleteForRetry(workspaceId: string, messageId: string): Promise<Result<boolean>> {
+    return this.deps.historyService.deletePartialIfMessageIdMatches(workspaceId, messageId);
   }
 
   /**

@@ -3574,7 +3574,10 @@ export class HistoryService {
   /**
    * Delete the partial message file only when it still belongs to the expected message.
    * Returns true when a matching partial was deleted, false when the partial was missing
-   * or belonged to a different message.
+   * or belonged to a different message. The read and the unlink run under the workspace mutex
+   * AND the cross-process history write lock, which partial writes also take: a foreign backend
+   * (XUM_ALLOW_MULTIPLE_INSTANCES) cannot replace the partial between the check and the unlink
+   * and lose its crash-recovery state (#7499).
    */
   async deletePartialIfMessageIdMatches(
     workspaceId: string,
@@ -3582,14 +3585,17 @@ export class HistoryService {
   ): Promise<Result<boolean>> {
     return this.fileLocks.withLock(workspaceId, async () => {
       try {
-        const partialPath = this.getPartialPath(workspaceId);
-        const data = await this.files.promises.readFile(partialPath, "utf-8");
-        const partialMessage = normalizePersistedMessage(JSON.parse(data) as MuxMessage);
-        if (partialMessage.id !== messageId) {
-          return Ok(false);
-        }
-        await this.files.promises.unlink(partialPath);
-        return Ok(true);
+        return await this.withHistoryWriteFileLock(workspaceId, async (assertStillOwned) => {
+          const partialPath = this.getPartialPath(workspaceId);
+          const data = await this.files.promises.readFile(partialPath, "utf-8");
+          const partialMessage = normalizePersistedMessage(JSON.parse(data) as MuxMessage);
+          if (partialMessage.id !== messageId) {
+            return Ok(false);
+          }
+          await assertStillOwned();
+          await this.files.promises.unlink(partialPath);
+          return Ok(true);
+        });
       } catch (error) {
         if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
           return Ok(false);

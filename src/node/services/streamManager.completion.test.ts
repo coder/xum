@@ -9,6 +9,9 @@ import { Ok, Err } from "@/common/types/result";
 import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager";
 import type { MuxMessage } from "@/common/types/message";
 import { HistoryService } from "./historyService";
+import { log } from "./log";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { historyWriteLockPath } from "./workspaceRemoval";
 import type { SessionUsageService } from "./sessionUsageService";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -120,6 +123,97 @@ describe("StreamManager - exact step indices", () => {
     expect(
       (await historyService.readPartial("step-reset-workspace"))?.metadata?.stepStartPartIndices
     ).toEqual([]);
+  });
+});
+
+describe("StreamManager - retry reset clears only this stream's partial (#7499)", () => {
+  const workspaceId = "retry-partial-workspace";
+  const partialOf = (id: string): MuxMessage => ({
+    id,
+    role: "assistant",
+    parts: [{ type: "text", text: `partial of ${id}` }],
+    metadata: { historySequence: 1 },
+  });
+  const resetWithoutParts = async (streamManager: StreamManager, messageId: string) => {
+    const streamInfo = createStreamInfoForTests({ messageId });
+    await engineInternals(streamManager).resetStreamStateForRetry.call(
+      streamManager,
+      workspaceId,
+      streamInfo,
+      { preserveParts: false, workspaceLog: log }
+    );
+  };
+
+  test("deletes this stream's partial and keeps another stream's partial", async () => {
+    const streamManager = new StreamManager(historyService);
+    await historyService.writePartial(workspaceId, partialOf("this-message"));
+    await resetWithoutParts(streamManager, "this-message");
+    expect(await historyService.readPartial(workspaceId)).toBeNull();
+
+    // Another backend (XUM_ALLOW_MULTIPLE_INSTANCES) replaced partial.json: its crash-recovery
+    // state must survive this stream's retry.
+    await historyService.writePartial(workspaceId, partialOf("other-message"));
+    await resetWithoutParts(streamManager, "this-message");
+    expect((await historyService.readPartial(workspaceId))?.id).toBe("other-message");
+  });
+
+  test("a foreign backend's replacement between the check and the unlink survives", async () => {
+    await historyService.writePartial(workspaceId, partialOf("this-message"));
+    // This test plays the foreign backend: it holds the cross-process history write lock that
+    // partial writes take, and replaces partial.json while the delete (deleteForRetry's
+    // conditional delete) waits.
+    const lockPath = historyWriteLockPath(historyConfig.rootDir, workspaceId);
+    const foreignLock = await acquireProcessFileLock({
+      lockPath,
+      timeoutMs: 5_000,
+      label: "foreign history write lock",
+    });
+    const locks = historyService.locks;
+    const acquire = locks.acquireProcessFileLock.bind(locks);
+    let markWaiting = () => undefined as void;
+    const waiting = new Promise<void>((resolve) => (markWaiting = resolve));
+    const lockSpy = spyOn(locks, "acquireProcessFileLock").mockImplementation((options) => {
+      if (options.lockPath === lockPath) markWaiting();
+      return acquire(options);
+    });
+    try {
+      const deleted = historyService.deletePartialIfMessageIdMatches(workspaceId, "this-message");
+      // Without the lock the delete never waits: it finishes first and deletes this partial,
+      // before the replacement below.
+      await Promise.race([waiting, deleted]);
+      nodeFs.writeFileSync(
+        path.join(historyConfig.sessionsDir, workspaceId, "partial.json"),
+        JSON.stringify(partialOf("other-message"))
+      );
+      await foreignLock[Symbol.asyncDispose]();
+      expect(await deleted).toEqual(Ok(false));
+    } finally {
+      lockSpy.mockRestore();
+    }
+    expect((await historyService.readPartial(workspaceId))?.id).toBe("other-message");
+  });
+
+  test("logs a failed delete and continues the retry", async () => {
+    const streamManager = new StreamManager(historyService);
+    await historyService.writePartial(workspaceId, partialOf("this-message"));
+    spyOn(historyService, "deletePartialIfMessageIdMatches").mockResolvedValueOnce(
+      Err("Failed to delete matching partial: EACCES")
+    );
+    // Main's unconditional delete, so this test fails on main for the same reason: an Err
+    // result that nobody logs.
+    spyOn(historyService, "deletePartial").mockResolvedValueOnce(
+      Err("Failed to delete partial: EACCES")
+    );
+    const warn = spyOn(log, "warn");
+    try {
+      await resetWithoutParts(streamManager, "this-message");
+      const call = warn.mock.calls.find(
+        (args) => args[0] === "Failed to clear partial state before retry"
+      );
+      expect(call?.[1]).toEqual({ error: "Failed to delete matching partial: EACCES" });
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
