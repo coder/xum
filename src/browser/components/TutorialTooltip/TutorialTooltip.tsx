@@ -88,10 +88,17 @@ function handOffTabToBubble(textField: HTMLElement | null, bubble: HTMLElement):
   return () => window.removeEventListener("keydown", onKeyDown);
 }
 
+/** A focus move to `target` outside the bubble, once nothing covers the bubble. */
+function isUncoveredFocusOutside(target: EventTarget | null, bubble: HTMLElement): boolean {
+  return target instanceof Element && !bubble.contains(target) && !isBubbleCovered(bubble);
+}
+
 /**
  * A covered bubble checks again on the next focus move outside it (#7198): both full-screen panels
  * move focus back to their own panel when they unpin. Once uncovered, the bubble takes focus under
- * the usual rules, and `onUncovered` gets the element it found focused. Returns the cleanup.
+ * the usual rules, and `onUncovered` gets the element it found focused. The bubble acts in a
+ * microtask, after the code that moved focus is done: the Artifacts panel checks that its own
+ * focus call took and focuses the panel when it did not. Returns the cleanup.
  */
 function takeFocusWhenUncovered(
   covered: boolean,
@@ -99,15 +106,23 @@ function takeFocusWhenUncovered(
   onUncovered: (focused: Element) => void
 ): () => void {
   if (!covered) return () => undefined;
+  let closed = false;
+  const takeFocus = () => {
+    const active = document.activeElement;
+    if (closed || !active || bubble.contains(active)) return;
+    onUncovered(active);
+    if (mayTakeFocusFrom(active)) bubble.focus();
+  };
   const onFocusIn = (event: FocusEvent) => {
-    const target = event.target;
-    if (!(target instanceof Element) || bubble.contains(target) || isBubbleCovered(bubble)) return;
+    if (!isUncoveredFocusOutside(event.target, bubble)) return;
     document.removeEventListener("focusin", onFocusIn);
-    onUncovered(target);
-    if (mayTakeFocusFrom(target)) bubble.focus();
+    queueMicrotask(takeFocus);
   };
   document.addEventListener("focusin", onFocusIn);
-  return () => document.removeEventListener("focusin", onFocusIn);
+  return () => {
+    closed = true;
+    document.removeEventListener("focusin", onFocusIn);
+  };
 }
 
 /** Shift+Tab from the bubble or its first button goes back to the text field (#7198). */

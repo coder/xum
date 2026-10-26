@@ -96,15 +96,17 @@ describeIntegration("ReviewPanel focus during workspace setup (UI + ORPC)", () =
     }
   }, 120_000);
 
-  test("a focus move after the Ctrl+2 keeps focus where the user moved it", async () => {
+  test("a focus move after the Ctrl+2 cancels it, also when focus then drops to the body", async () => {
     const workspace = await openWorkspaceInSetup();
     try {
       fireEvent.keyDown(window, { key: "2", ctrlKey: true });
       const chatInput = await workspace.view.findByRole("textbox", { name: "Message" });
       chatInput.focus();
+      // As when the focused control unmounts: focus is back on the body, where it was at Ctrl+2.
+      chatInput.blur();
       await workspace.release();
       await waitFor(() => reviewPanel(workspace.view), { timeout: 30_000 });
-      expect(document.activeElement).toBe(chatInput);
+      expect(reviewPanel(workspace.view).contains(document.activeElement)).toBe(false);
     } finally {
       await workspace.dispose();
     }

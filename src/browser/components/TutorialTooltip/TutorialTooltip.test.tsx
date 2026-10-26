@@ -183,18 +183,24 @@ describe("TutorialTooltip", () => {
     };
   }
 
-  test("a covered bubble takes focus when the panel moves focus back after it unpins (#7198)", () => {
+  test("a covered bubble takes focus when the panel moves focus back after it unpins (#7198)", async () => {
     const cover = coverBubble();
     try {
       const { view, close } = renderTooltip();
       const bubble = view.getByRole("group", { name: "Step title" });
       // A focus move while the panel still covers the bubble leaves focus alone.
       cover.panel.focus();
+      await Promise.resolve();
       expect(document.activeElement).toBe(cover.panel);
 
-      view.getByRole("button", { name: "Header button" }).focus();
+      const headerButton = view.getByRole("button", { name: "Header button" });
+      headerButton.focus();
       cover.uncover();
+      // The Artifacts panel's unpin: focus one element, and another when that focus did not take.
+      // The bubble must wait for both steps, or the second one takes focus back from it.
       cover.panel.focus();
+      if (document.activeElement !== cover.panel) headerButton.focus();
+      await Promise.resolve();
       expect(document.activeElement).toBe(bubble);
 
       close();
@@ -204,13 +210,14 @@ describe("TutorialTooltip", () => {
     }
   });
 
-  test("an uncovered bubble still leaves focus in the composer (#7198, #7120)", () => {
+  test("an uncovered bubble still leaves focus in the composer (#7198, #7120)", async () => {
     const cover = coverBubble();
     try {
       const { view } = renderTooltip();
       const composer = view.getByRole("textbox", { name: "Composer" });
       cover.uncover();
       composer.focus();
+      await Promise.resolve();
       expect(document.activeElement).toBe(composer);
     } finally {
       cover.restore();
