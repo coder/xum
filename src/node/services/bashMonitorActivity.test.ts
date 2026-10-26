@@ -68,7 +68,7 @@ describe("BashMonitorActivity", () => {
     ]);
   });
 
-  test("a failed emit forgets the count delivered before it", async () => {
+  test("a failed snapshot read forgets the count delivered before it", async () => {
     const { activity, state, emits } = createActivity();
     state.count = 1;
     activity.onProcessChange("ws");
