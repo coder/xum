@@ -72,9 +72,10 @@ describe("highlightWorker", () => {
       expect(warn).toHaveBeenCalledTimes(1);
       // A language with no Shiki grammar keeps the Highlights error.
       expect(canHighlight("c3")).toBe(true);
-      await expect(worker().highlight("fn void main() {}", "c3", "dark")).rejects.toThrow(
-        "lexer failed"
-      );
+      const failure = await worker()
+        .highlight("fn void main() {}", "c3", "dark")
+        .catch((error: unknown) => error);
+      expect(failure).toEqual(new Error("lexer failed"));
     } finally {
       highlightsThrows = false;
       warn.mockRestore();
