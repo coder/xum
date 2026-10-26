@@ -73,10 +73,11 @@ describe("highlightWorker", () => {
         shikiPre(SHIKI_DARK_THEME)
       );
       expect(warn).toHaveBeenCalledTimes(1);
-      // A language with no Shiki grammar keeps the Highlights error.
-      expect(canHighlight("c3")).toBe(true);
+      // A language with no Shiki grammar keeps the Highlights error. Shiki 3.23 added c3, so this
+      // uses a language that only Highlights knows; pick another one if Shiki gains it too.
+      expect(canHighlight("godot-resource")).toBe(true);
       const failure = await worker()
-        .highlight("fn void main() {}", "c3", "dark")
+        .highlight("[gd_resource]", "godot-resource", "dark")
         .catch((error: unknown) => error);
       expect(failure).toEqual(new Error("lexer failed"));
     } finally {
