@@ -16,10 +16,28 @@ const ALLOWED = new Set([
   "src/browser/features/RightSidebar/ArtifactsTab/ArtifactInteractions.test.tsx",
 ]);
 
-// `[^;]` spans line breaks, so the multi-line form `waitFor(() =>\n  expect(...).toBeNull()\n)` matches
-// too. It cannot run past the end of the statement.
-const SLOW_ABSENCE_POLL =
-  /waitFor\(\s*\(\)\s*=>\s*expect\([^;]*?query[A-Za-z]*\([^;]*?\)\)\.(?:toBeNull|toBeFalsy)\(\)/g;
+// Matches one absence check. `[^;]` spans line breaks but cannot run past the end of a statement.
+const SLOW_ABSENCE_CHECK =
+  /expect\([^;]*?query[A-Za-z]*\([^;]*?\)\s*\)\s*\.(?:toBeNull|toBeFalsy)\(\)/g;
+
+// Returns each `waitFor(...)` call: the callback in any form (expression body, block body, async)
+// plus its options. Counts parentheses only, so an unbalanced parenthesis inside a string or regex
+// literal can cut a call short. No test source has one today.
+function waitForCalls(source: string): Array<{ start: number; text: string }> {
+  const calls: Array<{ start: number; text: string }> = [];
+  for (const match of source.matchAll(/\bwaitFor\(/g)) {
+    let depth = 0;
+    for (let i = match.index + "waitFor".length; i < source.length; i++) {
+      if (source[i] === "(") {
+        depth++;
+      } else if (source[i] === ")" && --depth === 0) {
+        calls.push({ start: match.index, text: source.slice(match.index, i + 1) });
+        break;
+      }
+    }
+  }
+  return calls;
+}
 
 test("no waitFor polls an element query with toBeNull or toBeFalsy (#7505)", () => {
   const offenders: string[] = [];
@@ -30,9 +48,11 @@ test("no waitFor polls an element query with toBeNull or toBeFalsy (#7505)", () 
       continue;
     }
     const source = fs.readFileSync(path.join(repoRoot, file), "utf8");
-    for (const match of source.matchAll(SLOW_ABSENCE_POLL)) {
-      const line = source.slice(0, match.index).split("\n").length;
-      offenders.push(`${relative}:${line}`);
+    for (const call of waitForCalls(source)) {
+      for (const match of call.text.matchAll(SLOW_ABSENCE_CHECK)) {
+        const line = source.slice(0, call.start + match.index).split("\n").length;
+        offenders.push(`${relative}:${line}`);
+      }
     }
   }
   expect(offenders).toEqual([]);

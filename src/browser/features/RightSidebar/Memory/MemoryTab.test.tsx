@@ -669,7 +669,7 @@ describe("MemoryTab", () => {
     fireEvent.click(await findByRole("button", { name: "Cancel" }));
 
     await waitFor(() => {
-      expect(queryByRole("button", { name: "Cancel" })).toBeNull();
+      expect(queryByRole("button", { name: "Cancel" }) === null).toBe(true);
     });
     expect(fake.state.deleteCalls).toEqual([]);
     await findByText("prefs.md");
@@ -779,7 +779,7 @@ describe("MemoryTab", () => {
     // Opening the file acknowledges the badge.
     fireEvent.click(await findByText("prefs.md"));
     await waitFor(() => {
-      expect(queryByText("agent edited")).toBeNull();
+      expect(queryByText("agent edited") === null).toBe(true);
     });
   });
 
@@ -796,7 +796,7 @@ describe("MemoryTab", () => {
       projectPath: "/project/one",
     });
     await waitFor(() => {
-      expect(queryByText("agent edited")).toBeNull();
+      expect(queryByText("agent edited") === null).toBe(true);
     });
   });
 });
