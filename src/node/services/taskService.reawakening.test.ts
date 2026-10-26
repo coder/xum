@@ -1008,6 +1008,71 @@ describe("TaskService", () => {
     expect(sendMessage).toHaveBeenCalled();
   });
 
+  // F54: a parent message to a reported child whose last stream is still ending (its continuation
+  // already settled) was queued as a plain synthetic turn. That turn ran with no task execution, so
+  // the child could not report, message or spawn. The message must reawaken the child once the
+  // stream ends.
+  test("a parent message to a reported child that is still streaming reawakens it after the stream ends", async () => {
+    const config = await createTestConfig(rootDir);
+    const projectPath = path.join(rootDir, "repo");
+    const parentWorkspaceId = "parent-streaming-reported";
+    const childTaskId = "child-streaming-reported";
+    await saveWorkspaces(
+      config,
+      projectPath,
+      [
+        projectWorkspace(projectPath, "parent", parentWorkspaceId),
+        projectWorkspace(projectPath, "child", childTaskId, {
+          runtimeConfig: { type: "local" },
+          parentWorkspaceId,
+          taskStatus: "reported",
+        }),
+      ],
+      testTaskSettings()
+    );
+    let streaming = true;
+    let releaseIdle: () => void = () => undefined;
+    const idle = new Promise<void>((resolve) => {
+      releaseIdle = resolve;
+    });
+    const waitForIdleAndNoQueuedMessages = mock(() => idle);
+    const { workspaceService, sendMessage } = createWorkspaceServiceMocks({
+      waitForIdleAndNoQueuedMessages,
+    });
+    const { aiService } = createAIServiceMocks(config, {
+      isStreaming: mock((workspaceId: string) => streaming && workspaceId === childTaskId),
+    });
+    const { taskService } = createTaskServiceHarness(config, { workspaceService, aiService });
+
+    // Two sends while the tail streams: both must arrive as task-owned turns, in send order.
+    for (const message of ["First decision", "Second decision"]) {
+      const sent = await taskService.sendMessageToDescendantAgentTask(
+        parentWorkspaceId,
+        childTaskId,
+        message,
+        "tool-end"
+      );
+      expect(sent.success ? null : sent.error).toBeNull();
+    }
+
+    streaming = false;
+    releaseIdle();
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(findWorkspaceInConfig(config, childTaskId)?.taskExecutionId).toMatch(/^wst_/);
+    const deliveries = sendMessage.mock.calls.map((call) => ({
+      text: String(call[1]),
+      type: (call[2] as { muxMetadata?: MuxMessageMetadata }).muxMetadata?.type,
+    }));
+    expect(deliveries).toHaveLength(2);
+    expect(deliveries[0].text).toContain("First decision");
+    expect(deliveries[1].text).toContain("Second decision");
+    expect(deliveries.map((delivery) => delivery.type)).toEqual([
+      "workspace-turn-task",
+      "workspace-turn-task",
+    ]);
+  });
+
   test("sendMessageToDescendantAgentTask reawakens an inactive child of a scratch parent", async () => {
     // Scratch (project-less) chats spawn scratch children in the SCRATCH config bucket; a
     // message to an inactive one reawakens it through a mode="existing" workspace turn.
