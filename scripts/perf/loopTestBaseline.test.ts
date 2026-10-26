@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -355,8 +356,10 @@ describe("the script on a fixture repo", () => {
         ),
         "utf8"
       )
-    ) as { files: Array<{ file: string; failedRuns: number }> };
-    expect(record.files).toEqual([expect.objectContaining({ file: loopTest, failedRuns: 0 })]);
+    ) as { files: { file: string; failedRuns: number }[] };
+    expect(record.files).toEqual([
+      expect.objectContaining({ file: loopTest, failedRuns: 0 }) as (typeof record.files)[number],
+    ]);
   });
 
   test("without src/version.ts it exits 2 and asks for make version", async () => {

@@ -3875,6 +3875,98 @@ describe("WorkspaceMcpOverridesService", () => {
     expect(configSpy).toHaveBeenCalledTimes(5);
   });
 
+  it("prunePluginOverrideKeysForWorkspaces skips publication only for unchanged, uncached workspaces", async () => {
+    // On a 6,302-workspace config, publishing every swept workspace exhausted
+    // the sweep budget and failed plugin installs. A workspace whose files the
+    // sweep did not rewrite and that the receiver holds no state for reads
+    // disk on its first serve, so it needs no publication.
+    const service = new WorkspaceMcpOverridesService(config);
+    const rewrittenCold = await registerWorkspace("rewritten-cold");
+    const cleanCached = await registerWorkspace("clean-cached");
+    const cleanCold = await registerWorkspace("clean-cold");
+    await fs.mkdir(path.join(rewrittenCold.workspacePath, ".xum"), { recursive: true });
+    await fs.writeFile(
+      path.join(rewrittenCold.workspacePath, ".xum", "mcp.local.jsonc"),
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+    );
+
+    const published: Array<[string, unknown]> = [];
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [rewrittenCold.workspaceId, cleanCached.workspaceId, cleanCold.workspaceId],
+      "plugin:0123456789abcdef:",
+      {
+        publish: (persisted, workspaceId) => {
+          published.push([workspaceId, persisted]);
+          return Promise.resolve();
+        },
+        hasSnapshot: (workspaceId) => workspaceId === cleanCached.workspaceId,
+      }
+    );
+
+    expect(failures).toEqual([]);
+    // The rewritten workspace publishes although the receiver holds nothing
+    // for it (its descendants and sharers may); the cached clean one
+    // publishes so a stale cached enable is replaced by disk truth. The cold
+    // clean one is only evicted (null): no disk resolution, but a fence for
+    // a first serve that may be in flight.
+    expect(published).toEqual([
+      [rewrittenCold.workspaceId, { enabledServers: ["other"] }],
+      [cleanCached.workspaceId, {}],
+      [cleanCold.workspaceId, null],
+    ]);
+  });
+
+  it("prunePluginOverrideKeysForWorkspaces fan-out skips cold descendants but reaches cached ones", async () => {
+    // A rewritten parent fans out to inheriting descendants. Publishing every
+    // cold (archived) task descendant there would cost the same budget the
+    // outer skip saves; a cached grandchild below a cold child must still be
+    // reached, because it inherits the change.
+    const service = new WorkspaceMcpOverridesService(config);
+    const parent = await registerWorkspace("fanout-parent");
+    const coldChild = await registerWorkspace("fanout-cold-child");
+    const cachedGrandchild = await registerWorkspace("fanout-cached-grandchild");
+    await config.editConfig((cfg) => {
+      for (const project of cfg.projects.values()) {
+        for (const workspace of project.workspaces) {
+          if (workspace.id === coldChild.workspaceId) {
+            workspace.parentWorkspaceId = parent.workspaceId;
+          }
+          if (workspace.id === cachedGrandchild.workspaceId) {
+            workspace.parentWorkspaceId = coldChild.workspaceId;
+          }
+        }
+      }
+      return cfg;
+    });
+    await fs.mkdir(path.join(parent.workspacePath, ".xum"), { recursive: true });
+    await fs.writeFile(
+      path.join(parent.workspacePath, ".xum", "mcp.local.jsonc"),
+      JSON.stringify({ enabledServers: ["plugin:0123456789abcdef:echo", "other"] })
+    );
+
+    const publishedIds: string[] = [];
+    const evictedIds: string[] = [];
+    // The grandchild is NOT swept directly: only the fan-out can reach it.
+    const failures = await service.prunePluginOverrideKeysForWorkspaces(
+      [parent.workspaceId, coldChild.workspaceId],
+      "plugin:0123456789abcdef:",
+      {
+        publish: (persisted, workspaceId) => {
+          (persisted === null ? evictedIds : publishedIds).push(workspaceId);
+          return Promise.resolve();
+        },
+        hasSnapshot: (workspaceId) => workspaceId === cachedGrandchild.workspaceId,
+      }
+    );
+
+    expect(failures).toEqual([]);
+    expect(publishedIds).toContain(parent.workspaceId);
+    expect(publishedIds).toContain(cachedGrandchild.workspaceId);
+    // The cold child gets no authoritative publication, only the fence.
+    expect(publishedIds).not.toContain(coldChild.workspaceId);
+    expect(evictedIds).toContain(coldChild.workspaceId);
+  });
+
   it("prunePluginOverrideKeysForWorkspaces prunes every checkout sharing a duplicated ID", async () => {
     const service = new WorkspaceMcpOverridesService(config);
     const first = await registerWorkspace("dup-a");

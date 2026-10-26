@@ -255,6 +255,20 @@ function settleAfterWidthTransition(container: HTMLElement | null, settle: () =>
 }
 
 /**
+ * The pane whose Artifacts panel takes focus, or null while the sidebar is collapsed (full-screen
+ * shows it anyway). A collapse can land before the panel's low-priority "focus consumed" update:
+ * React renders the keydown's collapse first, the panel's effect then ran again and took focus back
+ * from the header toggle, and the collapse dropped it on <body> (a fast second OPEN_ARTIFACTS_TAB press).
+ */
+function shownArtifactsFocusTabsetId(
+  tabsetId: string | null,
+  collapsed: boolean,
+  fullscreen: boolean
+): string | null {
+  return fullscreen || !collapsed ? tabsetId : null;
+}
+
+/**
  * The slide phase, adjusted during render when `collapsed` flips (react-effects: state derived
  * from a prop change), so the first frame of a slide already renders both the panel and the
  * card. Settles once the container's width transition ends; where none runs (drag resizes,
@@ -1902,6 +1916,12 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
     };
   }, [artifactsExperimentEnabled, mcpAppsExperimentEnabled, setCollapsed, setLayout, workspaceId]);
 
+  const artifactsAutoFocusTabsetId = shownArtifactsFocusTabsetId(
+    artifactsFocusTabsetId,
+    collapsed,
+    fullscreen
+  );
+
   useArtifactsTabKey({
     workspaceId,
     enabled: artifactsExperimentEnabled,
@@ -2858,7 +2878,7 @@ const RightSidebarComponent: React.FC<RightSidebarProps> = ({
         autoFocusTerminalSession={autoFocusTerminalSession}
         goal={goal ?? null}
         goalCompleteInputRequest={goalCompleteInputRequest}
-        autoFocusArtifacts={artifactsFocusTabsetId === node.id}
+        autoFocusArtifacts={artifactsAutoFocusTabsetId === node.id}
         onArtifactsAutoFocusConsumed={() => setArtifactsFocusTabsetId(null)}
         onGoalSetStatus={handleGoalSetStatus}
         onGoalUpdateObjective={handleGoalUpdateObjective}

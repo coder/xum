@@ -54,9 +54,7 @@ interface PendingAutoSelectState {
 let xumLogChannel: vscode.LogOutputChannel | undefined;
 
 function getXumLogChannel(): vscode.LogOutputChannel {
-  if (!xumLogChannel) {
-    xumLogChannel = vscode.window.createOutputChannel("Xum", { log: true });
-  }
+  xumLogChannel ??= vscode.window.createOutputChannel("Xum", { log: true });
 
   return xumLogChannel;
 }
@@ -69,6 +67,7 @@ function formatLogData(data: unknown): string {
   try {
     return JSON.stringify(data);
   } catch {
+    // eslint-disable-next-line @typescript-eslint/no-base-to-string -- last-resort fallback for values JSON.stringify rejects (cycles, BigInt)
     return String(data);
   }
 }
@@ -952,12 +951,12 @@ function renderChatViewHtml(
     <meta charset="UTF-8" />
     <meta http-equiv="Content-Security-Policy" content="${csp}" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="stylesheet" href="${katexStyleUri}" />
-    <link rel="stylesheet" href="${styleUri}" />
+    <link rel="stylesheet" href="${katexStyleUri.toString()}" />
+    <link rel="stylesheet" href="${styleUri.toString()}" />
   </head>
   <body data-mux-trace-id="${traceId}">
     <div id="root"></div>
-    <script nonce="${nonce}" type="module" src="${scriptUri}"></script>
+    <script nonce="${nonce}" type="module" src="${scriptUri.toString()}"></script>
   </body>
 </html>`;
 
@@ -986,7 +985,7 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
   private traceId: string | null = null;
 
   private readyProbeInterval: ReturnType<typeof setInterval> | null = null;
-  private readyProbeTimeouts: Array<ReturnType<typeof setTimeout>> = [];
+  private readyProbeTimeouts: ReturnType<typeof setTimeout>[] = [];
   private isWebviewReady = false;
 
   private connectionStatus: UiConnectionStatus = { mode: "file" };
@@ -1094,7 +1093,8 @@ class XumChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposab
     this.selectedWorkspaceId = workspaceId;
     await this.context.workspaceState.update(
       SELECTED_WORKSPACE_STATE_KEY,
-      workspaceId ? workspaceId : undefined
+      // An empty id clears the stored selection too, like null.
+      workspaceId !== null && workspaceId !== "" ? workspaceId : undefined
     );
 
     this.postMessage({ type: "setSelectedWorkspace", workspaceId });
@@ -2070,4 +2070,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 /**
  * Deactivate the extension
  */
-export function deactivate() {}
+export function deactivate() {
+  // Intentionally empty: VS Code disposes everything activate() put on context.subscriptions.
+}

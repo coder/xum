@@ -88,7 +88,7 @@ class TestBridge implements VscodeBridge {
     await this.emit({ type: "orpcStreamData", streamId, value });
   }
 
-  orpcCalls(path: string): Array<Extract<WebviewToExtensionMessage, { type: "orpcCall" }>> {
+  orpcCalls(path: string): Extract<WebviewToExtensionMessage, { type: "orpcCall" }>[] {
     return this.sent.filter(
       (message): message is Extract<WebviewToExtensionMessage, { type: "orpcCall" }> =>
         message.type === "orpcCall" && message.path.join(".") === path
@@ -676,7 +676,7 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
     });
 
   // Stop and Esc share one interrupt path; both must reach the host and mark the stream.
-  const interruptTriggers: Array<[string, (view: ReturnType<typeof render>) => void]> = [
+  const interruptTriggers: [string, (view: ReturnType<typeof render>) => void][] = [
     ["Stop", (view) => fireEvent.click(view.getByRole("button", { name: "Stop streaming" }))],
     ["Esc", () => fireEvent.keyDown(window, { key: "Escape" })],
     [
@@ -800,7 +800,7 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
     await selectWorkspace(bridge);
 
     const sentinel = view.getByTestId("transcript-bottom-sentinel");
-    const scrollport = sentinel.parentElement as HTMLElement;
+    const scrollport = sentinel.parentElement!;
     const content = scrollport.firstElementChild as HTMLElement;
     const scrollUp = () =>
       act(async () => {
@@ -2213,6 +2213,7 @@ describe("vscode webview message rows", () => {
   // ChatPane-level derivations the webview shares with desktop (#5002).
   test("prompt arrows skip machine wakes and scroll the neighboring prompt into view", async () => {
     const scrolled: Element[] = [];
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- saved only to restore the prototype method afterwards
     const originalScrollIntoView = Element.prototype.scrollIntoView;
     Element.prototype.scrollIntoView = function (this: Element) {
       scrolled.push(this);
@@ -3172,7 +3173,7 @@ describe("vscode webview background processes strip (#5092)", () => {
     };
     const bridge = new TestBridge();
     // Snapshot the document after every commit, before passive effects run.
-    const commits: Array<{ rows: boolean; error: boolean }> = [];
+    const commits: { rows: boolean; error: boolean }[] = [];
     const onRender = () => {
       const text = document.body.textContent ?? "";
       commits.push({
@@ -3296,12 +3297,12 @@ describe("vscode webview first reveal (#5202)", () => {
         workspaceName: `reveal-${label}`,
       };
       const bridge = new TestBridge();
-      const commits: Array<{
+      const commits: {
         transcript: boolean;
         held: boolean;
         strip: boolean;
         status: boolean;
-      }> = [];
+      }[] = [];
       const onRender = () => {
         const text = document.body.textContent ?? "";
         commits.push({

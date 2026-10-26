@@ -7311,6 +7311,37 @@ describe("AgentPluginInstallService", () => {
     expect(await registry()).toEqual([]);
   });
 
+  test("a failed install hygiene sweep reports a count and at most 5 workspace IDs", async () => {
+    // A 6,302-workspace config failed this sweep for 800-plus workspaces, and
+    // the error listed every ID. The log keeps one warning per workspace.
+    const ids = ["ws-1", "ws-2", "ws-3", "ws-4", "ws-5", "ws-6", "ws-7"];
+    const serviceWithOverrides = new AgentPluginInstallService(config, {
+      workspaceMcpOverridesService: overridesServiceStub(() =>
+        Promise.reject(new Error("pruning exceeded the plugin-prune budget"))
+      ),
+    });
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
+      () =>
+        Promise.resolve(
+          ids.map((id) => ({ id, runtimeConfig: { type: "local" } }))
+        ) as unknown as ReturnType<Config["getAllWorkspaceMetadata"]>
+    );
+    try {
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      const install = serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      await expect(install).rejects.toThrow(
+        "7 workspaces (ws-1, ws-2, ws-3, ws-4, ws-5, and 2 more)"
+      );
+      await expect(install).rejects.not.toThrow(/ws-6/);
+      expect(await registry()).toEqual([]);
+    } finally {
+      metadataSpy.mockRestore();
+    }
+  });
+
   test("failed per-workspace prunes persist a tombstone that gates reinstall and self-heals", async () => {
     const instanceId = computePluginInstanceId(path.join(pluginsDir(), "demo-plugin"));
     const serverKey = `plugin:${instanceId}:echo`;

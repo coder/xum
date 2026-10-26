@@ -27,7 +27,8 @@ export interface SkillStorageContext {
   kind: SkillStorageKind;
   runtime: Runtime;
   workspacePath: string;
-  roots?: AgentSkillsRoots;
+  /** #7216: every kind sets roots, so no caller falls back to untrusted default roots. */
+  roots: AgentSkillsRoots;
   containment: ProjectSkillContainment;
 }
 

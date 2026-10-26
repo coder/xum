@@ -59,23 +59,23 @@ export interface UiConnectionStatus {
   error?: string;
 }
 
-export type OrpcCall = {
+export interface OrpcCall {
   type: "orpcCall";
   requestId: string;
   path: string[];
   input: unknown;
   lastEventId?: string | undefined;
-};
+}
 
-export type OrpcCancel = {
+export interface OrpcCancel {
   type: "orpcCancel";
   requestId: string;
-};
+}
 
-export type OrpcStreamCancel = {
+export interface OrpcStreamCancel {
   type: "orpcStreamCancel";
   streamId: string;
-};
+}
 
 export type OrpcResponse =
   | {
@@ -99,22 +99,22 @@ export type OrpcResponse =
       error: string;
     };
 
-export type OrpcStreamData = {
+export interface OrpcStreamData {
   type: "orpcStreamData";
   streamId: string;
   value: unknown;
-};
+}
 
-export type OrpcStreamEnd = {
+export interface OrpcStreamEnd {
   type: "orpcStreamEnd";
   streamId: string;
-};
+}
 
-export type OrpcStreamError = {
+export interface OrpcStreamError {
   type: "orpcStreamError";
   streamId: string;
   error: string;
-};
+}
 
 export type WebviewToExtensionMessage =
   | { type: "ready" }

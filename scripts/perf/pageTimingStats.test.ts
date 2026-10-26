@@ -85,7 +85,7 @@ describe("gate", () => {
 // The 14 A/A pairs per page and signal from two blocks on the dev host (main built twice), in ms. Expected
 // rates and MDIs come from the prototype bootstrap (scratch an/qualsim3.py, 200,000 blocks).
 const ms = (s: string) => s.split(" ").map((x) => Number(x) / 1000);
-const fixture: Array<[string, stats.Signal, number[], number, number, number]> = [
+const fixture: [string, stats.Signal, number[], number, number, number][] = [
   // name, signal, pairs, MDI (s), qualification false-fail (%), no-regression false-fail (%)
   ["P1 UCS", "ucs", ms("68 12 -56 -28 -204 92 -16 680 -52 128 -44 -152 -204 -124"), 1.36, 8.1, 0.1],
   [

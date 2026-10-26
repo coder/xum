@@ -32,6 +32,7 @@ import {
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
   registerLiveWorkspaceTurnHandle,
+  startLiveWorkspaceTurn,
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
   removeWorkspaceFromTestConfig,
@@ -1109,13 +1110,12 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       const manager = workspaceTurnManagerFor(taskService);
       if (later) {
-        await registerLiveWorkspaceTurnHandle(
-          taskService,
-          childId,
-          "wst_canceled_guidance",
-          parentId,
-          "reserved"
-        );
+        await startLiveWorkspaceTurn(taskService, config, {
+          ownerWorkspaceId: parentId,
+          workspaceId: childId,
+          handleId: "wst_canceled_guidance",
+          accept: false,
+        });
         const interrupt = manager.interruptWorkspaceTurn.bind(manager);
         spyOn(manager, "interruptWorkspaceTurn").mockImplementationOnce(async (...args) => {
           // A concurrent writer after stop's capture horizon must not lose its fresh GUID.

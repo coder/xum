@@ -626,17 +626,21 @@ check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENER
 	@./scripts/check-bench-agent.sh
 
 LINT_PREREQS := node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+# Type-aware ESLint lints vscode/src, whose types (@types/vscode) come from the extension's own
+# install. Without it, `make -j static-check-full` races typecheck's install and every vscode
+# type reads as `error`.
+ESLINT_PREREQS := $(LINT_PREREQS) vscode/node_modules/.installed
 
 lint: $(LINT_PREREQS) ## Run oxlint on all files (the eslint.config.mjs rules it supports; no type-aware rules)
 	@./scripts/lint.sh
 
-lint-eslint: $(LINT_PREREQS) ## Run oxlint, then type-aware ESLint on files changed since the merge base with origin/main [XUM_LINT_BASE=<ref>]
+lint-eslint: $(ESLINT_PREREQS) ## Run oxlint, then type-aware ESLint on files changed since the merge base with origin/main [XUM_LINT_BASE=<ref>]
 	@./scripts/lint.sh --eslint
 
-lint-full: $(LINT_PREREQS) ## Run oxlint, then ESLint on all files, one ESLint run per machine at a time (as CI does)
+lint-full: $(ESLINT_PREREQS) ## Run oxlint, then ESLint on all files, one ESLint run per machine at a time (as CI does)
 	@./scripts/lint.sh --full
 
-lint-fix: $(LINT_PREREQS) ## Run oxlint --fix, then ESLint --fix on changed files (scripts/lint.sh --full --fix for all files)
+lint-fix: $(ESLINT_PREREQS) ## Run oxlint --fix, then ESLint --fix on changed files (scripts/lint.sh --full --fix for all files)
 	@./scripts/lint.sh --eslint --fix
 
 lint-actions: lint-actionlint lint-zizmor ## Lint GitHub Actions workflows

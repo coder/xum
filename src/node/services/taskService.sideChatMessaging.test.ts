@@ -9,6 +9,7 @@ import type { WorkspaceHost } from "@/node/services/taskWorkspaceSeam";
 import {
   createTestConfig,
   createWorkspaceServiceMocks,
+  findWorkspaceInConfig,
   projectWorkspace,
   saveWorkspacesWithCheckouts as saveWorkspaces,
   testTaskSettings,
@@ -17,7 +18,7 @@ import {
   createTaskServiceHarness,
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
-  registerLiveWorkspaceTurnHandle,
+  startLiveWorkspaceTurn,
 } from "@/node/services/taskService.shared.testHarness";
 
 const runtimes: RuntimeConfig[] = [
@@ -244,26 +245,19 @@ describe("TaskService side-chat messaging", () => {
     await updateWorkspace(config, "main", {
       parentWorkspaceId: "unrelated",
       taskStatus: "reported",
-      taskExecutionId: "wst_continuation",
-      taskExecutionStatus: "running",
     });
     const { taskService } = createTaskServiceHarness(config);
     expect(taskService.listTaskTreeAgents("side").relatedChats).toBeUndefined();
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "main",
-      "wst_continuation",
-      "unrelated",
-      "reserved"
-    );
+    // The owner's reawakening writes the running mirror at reservation, before admission.
+    const continuation = await startLiveWorkspaceTurn(taskService, config, {
+      ownerWorkspaceId: "unrelated",
+      workspaceId: "main",
+      handleId: "wst_continuation",
+      accept: false,
+    });
+    expect(findWorkspaceInConfig(config, "main")?.taskExecutionStatus).toBe("running");
     expect(taskService.listTaskTreeAgents("side").relatedChats).toBeUndefined();
-    await registerLiveWorkspaceTurnHandle(
-      taskService,
-      "main",
-      "wst_continuation",
-      "unrelated",
-      "accepted"
-    );
+    await continuation.accept();
     expect(taskService.listTaskTreeAgents("side").relatedChats).toEqual([
       { workspaceId: "main", title: "main", relationship: "main_chat" },
     ]);

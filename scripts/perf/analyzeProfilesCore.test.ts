@@ -119,7 +119,7 @@ describe("leaderboard", () => {
     });
     // A and B run in an unmapped .js bundle; a leaderboard warns too, not only a diff.
     expect(report.warnings).toEqual([
-      expect.stringContaining("1.1 ms of self time in unmapped bundle frames"),
+      expect.stringContaining("1.1 ms of self time in unmapped bundle frames") as string,
     ]);
   });
 
@@ -157,7 +157,11 @@ describe("readCpuProfile", () => {
       )
     );
     expect(result.profile.stacks).toEqual([
-      { frames: [expect.objectContaining({ functionName: "A" })], weightUs: 500, count: 3 },
+      {
+        frames: [expect.objectContaining({ functionName: "A" }) as Frame],
+        weightUs: 500,
+        count: 3,
+      },
     ]);
     expect(result.warnings).toEqual(["1 negative timeDeltas clamped to 0 (sample reordering)"]);
   });
@@ -171,7 +175,7 @@ describe("readCpuProfile", () => {
       [2],
       [10]
     );
-    (json.nodes as Array<Record<string, unknown>>)[1].parent = 1;
+    (json.nodes as Record<string, unknown>[])[1].parent = 1;
     expect(read(json).profile.stacks[0].frames.map((f) => f.functionName)).toEqual(["A"]);
   });
 
@@ -243,7 +247,7 @@ describe("frame category", () => {
 
 describe("diff", () => {
   /** One profile with a flat list of functions and one sample each; wall time in µs. */
-  function flat(wallUs: number, functions: Array<[string, number]>): Record<string, unknown> {
+  function flat(wallUs: number, functions: [string, number][]): Record<string, unknown> {
     return cpuProfile(
       [
         { id: 1, name: "(root)", children: functions.map((_, i) => i + 2) },
@@ -784,7 +788,7 @@ test("CLI maps each diff side with its own maps when bundle names are stable", (
       ["cand.ts"],
     ]);
     expect((JSON.parse(unmatched.stdout) as Report).warnings).toContainEqual(
-      expect.stringContaining("--baseline-map-dir matched no profiled script")
+      expect.stringContaining("--baseline-map-dir matched no profiled script") as string
     );
     // Without --baseline there is no baseline side for the option to map.
     const noBaseline = runCli([
@@ -813,7 +817,9 @@ test("folded stacks keep scripts that share a file name apart", () => {
     .trimEnd()
     .split("\n");
   expect(lines).toHaveLength(2);
-  expect(lines.map((l) => Number(l.split(" ").pop()))).toEqual(expect.arrayContaining([1, 2]));
+  expect(lines.map((l) => Number(l.split(" ").pop()))).toEqual(
+    expect.arrayContaining([1, 2]) as number[]
+  );
 });
 
 test("mapped frames with one name on one original line stay apart by original column", () => {

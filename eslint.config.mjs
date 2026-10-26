@@ -991,6 +991,66 @@ export default defineConfig([
     },
   },
   {
+    // Tooling tests (scripts/**/*.test.ts) and the VS Code extension (vscode/src) are type-checked
+    // by tsconfig.tooling.json (make typecheck), not by the tsconfig.json the project service
+    // would pick, so lint them against that program with the same base rules as tests/.
+    files: ["scripts/**/*.test.ts", "vscode/src/**/*.{ts,tsx}"],
+    plugins: {
+      local: localPlugin,
+      "react-hooks": reactHooks,
+    },
+    languageOptions: {
+      parserOptions: {
+        project: "./tsconfig.tooling.json",
+        tsconfigRootDir: import.meta.dirname,
+      },
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        require: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        window: "readonly",
+        document: "readonly",
+      },
+    },
+    rules: {
+      // Same options as src/ and tests/: a leading underscore marks an intentionally unused binding.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          vars: "all",
+          args: "after-used",
+          ignoreRestSiblings: true,
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrors: "all",
+        },
+      ],
+    },
+  },
+  {
+    // The webview is React: run the two hook rules src/ runs (src/ also runs the compiler rules).
+    files: ["vscode/src/**/*.tsx"],
+    rules: {
+      "react-hooks/rules-of-hooks": "error",
+      "react-hooks/exhaustive-deps": "warn",
+    },
+  },
+  {
+    // Like tests/: test doubles implement async interfaces with synchronous or empty bodies.
+    files: ["scripts/**/*.test.ts", "vscode/src/**/*.test.{ts,tsx}"],
+    rules: {
+      "@typescript-eslint/require-await": "off",
+      "@typescript-eslint/no-empty-function": "off",
+    },
+  },
+  {
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
