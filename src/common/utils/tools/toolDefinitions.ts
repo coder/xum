@@ -71,6 +71,7 @@ import {
   WEB_FETCH_MAX_OUTPUT_BYTES,
 } from "@/common/constants/toolLimits";
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
+import { getDefaultBashDisplayName } from "@/common/utils/tools/bashDisplayName";
 import { STATUS_PAGE_AGENT_MAX_UPDATE_CHARS } from "@/common/constants/artifacts";
 import {
   ConfigMutationPathSchema,
@@ -2329,6 +2330,16 @@ export const TOOL_DEFINITIONS = {
         let obj = value as Record<string, unknown>;
         obj = renameAliasField(obj, "command", "script");
         obj = renameAliasField(obj, "description", "display_name");
+        // Some models (mostly Haiku 5.5) omit the required display_name.
+        // Rejecting the call costs a model step and a retry, so fill it here
+        // while the model-visible schema keeps it required. The script-derived
+        // name is the same one bash.ts already falls back to.
+        // timeout_secs gets no default on purpose: a short default would start a
+        // long install or build and kill it partway, while a rejection runs
+        // nothing and the model retries with a timeout.
+        if (typeof obj.display_name !== "string" && typeof obj.script === "string") {
+          obj = { ...obj, display_name: getDefaultBashDisplayName(obj.script) };
+        }
         return obj;
       },
       z
