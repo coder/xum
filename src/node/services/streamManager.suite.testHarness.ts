@@ -156,6 +156,17 @@ export function createStreamInfoForTests(overrides: StreamInfoFixture = {}): Str
   return { ...defaults, ...overrides };
 }
 
+/**
+ * createStreamInfoForTests typed as the engine record, for turn-engine unit tests that
+ * call an owner directly. The SDK result and request stay loose fakes: pass only the
+ * fields the owner under test reads.
+ */
+export function createWorkspaceStreamInfoForTests(
+  overrides: StreamInfoFixture = {}
+): WorkspaceStreamInfo {
+  return createStreamInfoForTests(overrides) as unknown as WorkspaceStreamInfo;
+}
+
 /** A fullStream chunk, or a callback awaited at that point of the stream (mid-turn side effects). */
 export type ScriptedChunk = Record<string, unknown> | (() => unknown);
 
