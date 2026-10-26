@@ -15,9 +15,14 @@ import {
 } from "@/browser/contexts/connection.testHarness";
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
-import type { TestApiOverrides } from "@/browser/testUtils";
+import {
+  createTestConfig,
+  snapshotStream,
+  type TestApiOutput,
+  type TestApiOverrides,
+} from "@/browser/testUtils";
 import type { DevToolsRunSummary } from "@/common/types/devtools";
-import type { GoalBoardSnapshot } from "@/common/types/goal";
+import type { GoalBoardSnapshot, GoalRecordV1 } from "@/common/types/goal";
 import type { AvailableWorkflow, WorkflowRunRecord } from "@/common/types/workflow";
 import { DevToolsRunCard } from "./DevToolsTab/DevToolsRunCard";
 import { DevToolsTab } from "./DevToolsTab/DevToolsTab";
@@ -34,9 +39,11 @@ import { WorkflowsTab } from "./Workflows/WorkflowsTab";
  * - work cut off by the lost connection runs again on the next client.
  */
 
-let answerServers: () => Promise<unknown>;
-let answerOutput: () => Promise<unknown>;
-let answerRunDetail: () => Promise<unknown>;
+let answerServers: () => Promise<TestApiOutput<APIClient["mcp"]["list"]>>;
+let answerOutput: () => Promise<
+  TestApiOutput<APIClient["workspace"]["backgroundBashes"]["getOutput"]>
+>;
+let answerRunDetail: () => Promise<TestApiOutput<APIClient["devtools"]["getRunDetail"]>>;
 let mutations: string[] = [];
 
 /** A server cancel on a live socket: an abort that is not a lost connection. */
@@ -45,7 +52,7 @@ function serverCancel(): Promise<never> {
 }
 
 /** Never answers: the read stays in flight until a drop cuts it off. */
-function pending(): Promise<unknown> {
+function pending<T>(): Promise<T> {
   return new Promise(() => undefined);
 }
 
@@ -56,10 +63,11 @@ function outputResult(output: string) {
   };
 }
 
-function mutation(name: string) {
+/** A mutation that records its name and answers `result`. */
+function mutation<R>(name: string, result: R) {
   return () => {
     mutations.push(name);
-    return Promise.resolve();
+    return Promise.resolve(result);
   };
 }
 
@@ -68,36 +76,24 @@ function serverOverrides(): TestApiOverrides<APIClient> {
     mcp: { list: () => answerServers() },
     workspace: {
       backgroundBashes: { getOutput: () => answerOutput() },
-      promoteUpcomingGoal: mutation("promote"),
-      archiveGoal: mutation("archive"),
-      reviveArchivedGoal: mutation("revive"),
-      updateUpcomingGoal: mutation("update"),
+      promoteUpcomingGoal: mutation("promote", null),
+      archiveGoal: mutation("archive", undefined),
+      reviveArchivedGoal: mutation("revive", undefined),
+      updateUpcomingGoal: mutation("update", null),
       goalDefaults: { get: () => Promise.resolve(null) },
     },
     workflows: {
-      subscribe: () =>
-        Promise.resolve(
-          (async function* () {
-            yield { type: "snapshot", runs: [] };
-            await new Promise(() => undefined);
-          })()
-        ),
+      subscribe: () => snapshotStream({ type: "snapshot" as const, runs: [] }),
       listScripts: () => Promise.resolve([workflowScript()]),
-      start: mutation("start"),
+      start: mutation("start", { runId: "wfr_test", status: "running" as const, result: null }),
     },
     devtools: {
       getRunDetail: () => answerRunDetail(),
-      subscribe: () =>
-        Promise.resolve(
-          (async function* () {
-            yield { type: "snapshot", runs: [devToolsRun()] };
-            await new Promise(() => undefined);
-          })()
-        ),
-      clear: mutation("clear"),
+      subscribe: () => snapshotStream({ type: "snapshot" as const, runs: [devToolsRun()] }),
+      clear: mutation("clear", { success: true }),
     },
-    config: { getConfig: () => Promise.resolve({}) },
-  } as unknown as TestApiOverrides<APIClient>;
+    config: { getConfig: () => Promise.resolve(createTestConfig()) },
+  };
 }
 
 function workflowScript(): AvailableWorkflow {
@@ -115,14 +111,21 @@ function workflowScript(): AvailableWorkflow {
 }
 
 function goalBoard(): GoalBoardSnapshot {
-  const goal = (goalId: string, objective: string) =>
-    ({
-      goalId,
-      objective,
-      status: "active",
-      budgetCents: null,
-      costCents: 0,
-    }) as unknown as GoalBoardSnapshot["entries"][number]["goal"];
+  const goal = (goalId: string, objective: string): GoalRecordV1 => ({
+    version: 1,
+    goalId,
+    objective,
+    status: "active",
+    budgetCents: null,
+    turnCap: null,
+    costCents: 0,
+    turnsUsed: 0,
+    attributedChildren: [],
+    budgetLimitInjectedForGoalId: null,
+    requireUserAcknowledgmentSinceMs: null,
+    createdAtMs: 1,
+    updatedAtMs: 1,
+  });
   return {
     entries: [
       { section: "upcoming", goal: goal("11111111-1111-4111-8111-111111111111", "Ship it") },
@@ -140,7 +143,9 @@ function devToolsRun(): DevToolsRunSummary {
     modelId: null,
     isInProgress: false,
     hasError: false,
-  } as unknown as DevToolsRunSummary;
+    workspaceId: "ws-1",
+    startedAt: "2026-05-29T00:00:00.000Z",
+  };
 }
 
 function workflowRun(status: WorkflowRunRecord["status"]): WorkflowRunRecord {
@@ -259,6 +264,8 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
     await view.findByText(/Not connected/);
 
     fireEvent.click(view.getByRole("button", { name: "Edit Ship it" }));
+    // A real change: an unchanged editor closes without saving.
+    fireEvent.change(view.getByLabelText("Goal objective"), { target: { value: "Ship it now" } });
     fireEvent.click(view.getByRole("button", { name: "Save" }));
     await flush();
     // The editor stays open: nothing was saved.
@@ -280,7 +287,7 @@ describe.each([...GAP_MODES])("panes kept across a dropped connection (%s)", (mo
     await flush();
     expect(view.queryByText("Loading…")).toBeNull();
 
-    const next = Promise.withResolvers<unknown>();
+    const next = Promise.withResolvers<ReturnType<typeof outputResult>>();
     answerOutput = () => next.promise;
     await reconnect();
     expect(view.queryByText("Loading…")).not.toBeNull();

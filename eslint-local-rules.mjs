@@ -1849,52 +1849,170 @@ const localPlugin = {
     // `as unknown as APIClient` detour accepts anything, and a single `as APIClient` still
     // accepts any comparable subset. createTestApiClient (src/browser/testUtils.ts)
     // type-checks the partial double instead.
+    //
+    // The same bypass works through every other spelling of the client type, so the rule
+    // also matches the overrides type itself (`as unknown as TestApiOverrides<APIClient>`
+    // hands an unchecked fake to createTestApiClient), structural aliases
+    // (`NonNullable<ReturnType<typeof useAPI>["api"]>`, `RouterClient<AppRouter>`,
+    // `ReturnType<typeof createClient>`), parts of the client (`APIClient["workspace"]`) and
+    // transparent wrappers (`Partial<APIClient>`).
     "no-cast-to-api-client": {
       meta: {
         type: "problem",
         docs: { description: "Disallow casting to APIClient (`as APIClient`) in tests" },
         messages: {
-          cast: "Use createTestApiClient() from @/browser/testUtils instead of casting to APIClient: it type-checks the double against the real procedure types.",
+          cast: "Use createTestApiClient() from @/browser/testUtils instead of casting to APIClient (or TestApiOverrides, or another spelling of the client type): it type-checks the double against the real procedure types. Annotate the double, or use `satisfies TestApiOverrides<APIClient>`.",
         },
       },
       create(context) {
-        // Whether a type name refers to APIClient, including an aliased import
-        // (`import type { APIClient as Client }`) or a local alias (`type Client = APIClient`).
-        const isApiClientName = (identifier, depth = 0) => {
-          if (identifier.name === "APIClient") {
-            return true;
-          }
-          if (depth > 5) {
-            return false;
-          }
+        const WRAPPERS = new Set(["NonNullable", "Readonly", "Partial", "Required"]);
+        // The first definition of the binding a type name refers to, or null for a global.
+        const definitionOf = (identifier) => {
           for (let scope = context.sourceCode.getScope(identifier); scope; scope = scope.upper) {
             const variable = scope.set.get(identifier.name);
-            if (!variable) {
-              continue;
+            if (variable) {
+              return variable.defs[0] ?? null;
             }
-            const def = variable.defs[0];
-            if (def?.type === "ImportBinding") {
-              return (
-                def.node.type === "ImportSpecifier" &&
-                (def.node.imported.name ?? def.node.imported.value) === "APIClient"
-              );
+          }
+          return null;
+        };
+        // The module that exports each name the rule follows, from the repo root.
+        const MODULE_OF = {
+          APIClient: "src/browser/contexts/API",
+          TestApiOverrides: "src/browser/testUtils",
+          createClient: "src/common/orpc/client",
+          AppRouter: "src/node/orpc/router",
+          useAPI: "src/browser/contexts/API",
+        };
+        // Whether an import declaration loads the module that exports `name`: through the `@/`
+        // alias or a relative path. Another module's `createClient` (a database or HTTP client)
+        // only shares the name.
+        const importsModuleOf = (declaration, name) => {
+          const source = declaration.source.value;
+          const resolved = source.startsWith("@/")
+            ? `src/${source.slice(2)}`
+            : source.startsWith(".")
+              ? path.resolve(path.dirname(context.filename), source)
+              : source;
+          const normalized = resolved
+            .split(path.sep)
+            .join("/")
+            .replace(/\.tsx?$/, "");
+          return normalized === MODULE_OF[name] || normalized.endsWith(`/${MODULE_OF[name]}`);
+        };
+        // The exported name behind a type identifier: the imported name of an aliased import
+        // (`import type { APIClient as Client }`), else the identifier's own name. Null for an
+        // import of a name the rule follows from another module (an SDK's own `APIClient`).
+        const importedName = (identifier) => {
+          const def = definitionOf(identifier);
+          if (def?.type !== "ImportBinding" || def.node.type !== "ImportSpecifier") {
+            return identifier.name;
+          }
+          const name = def.node.imported.name ?? def.node.imported.value;
+          return !Object.hasOwn(MODULE_OF, name) || importsModuleOf(def.parent, name) ? name : null;
+        };
+        // Whether `identifier` is a namespace import of the module that exports `name`.
+        const isNamespaceImportOf = (identifier, name) => {
+          const def = definitionOf(identifier);
+          return (
+            def?.type === "ImportBinding" &&
+            def.node.type === "ImportNamespaceSpecifier" &&
+            importsModuleOf(def.parent, name)
+          );
+        };
+        // Whether `identifier` is bound to an import of `name` from its module, aliased or not.
+        // A local helper that only shares the name (`function createClient()` in a router test)
+        // is not the API client's factory.
+        const isImportOf = (identifier, name) => {
+          const def = definitionOf(identifier);
+          return (
+            def?.type === "ImportBinding" &&
+            def.node.type === "ImportSpecifier" &&
+            (def.node.imported.name ?? def.node.imported.value) === name &&
+            importsModuleOf(def.parent, name)
+          );
+        };
+        // `typeof useAPI` (an import of it) or `typeof APIModule.useAPI` (through a namespace
+        // import).
+        const isTypeofImport = (type, name) => {
+          if (type?.type !== "TSTypeQuery") {
+            return false;
+          }
+          const expression = type.exprName;
+          if (expression.type === "Identifier") {
+            return isImportOf(expression, name);
+          }
+          if (
+            expression.type !== "TSQualifiedName" ||
+            expression.left.type !== "Identifier" ||
+            expression.right.name !== name
+          ) {
+            return false;
+          }
+          return isNamespaceImportOf(expression.left, name);
+        };
+        // Whether a type spells APIClient, a part of it, or its test overrides type.
+        const isApiClientType = (type, depth = 0) => {
+          if (type == null || depth > 8) {
+            return false;
+          }
+          if (type.type === "TSIndexedAccessType") {
+            const object = type.objectType;
+            // `ReturnType<typeof useAPI>["api"]` (the client the API context hands out).
+            if (
+              typeReferenceName(object) === "ReturnType" &&
+              type.indexType.type === "TSLiteralType" &&
+              type.indexType.literal.value === "api" &&
+              isTypeofImport(typeArgumentsOf(object)[0], "useAPI")
+            ) {
+              return true;
             }
-            const aliased = def?.type === "Type" ? def.node.typeAnnotation : null;
+            // `APIClient["workspace"]`, `APIClient["workspace"]["getInfo"]`.
+            return isApiClientType(object, depth + 1);
+          }
+          if (type.type !== "TSTypeReference") {
+            return false;
+          }
+          const [firstArgument] = typeArgumentsOf(type);
+          // `APIModule.APIClient` through a namespace import of the API context module.
+          if (type.typeName.type === "TSQualifiedName") {
+            const { left, right } = type.typeName;
             return (
-              aliased?.type === "TSTypeReference" &&
-              aliased.typeName.type === "Identifier" &&
-              isApiClientName(aliased.typeName, depth + 1)
+              right.name === "APIClient" &&
+              left.type === "Identifier" &&
+              isNamespaceImportOf(left, "APIClient")
             );
           }
-          return false;
+          if (type.typeName.type !== "Identifier") {
+            return false;
+          }
+          const name = importedName(type.typeName);
+          if (name === "APIClient" || name === "TestApiOverrides") {
+            return true;
+          }
+          if (WRAPPERS.has(name)) {
+            return isApiClientType(firstArgument, depth + 1);
+          }
+          if (name === "RouterClient") {
+            return (
+              firstArgument?.type === "TSTypeReference" &&
+              firstArgument.typeName.type === "Identifier" &&
+              isImportOf(firstArgument.typeName, "AppRouter")
+            );
+          }
+          if (name === "ReturnType") {
+            // APIClient is declared as `ReturnType<typeof createClient>`.
+            return isTypeofImport(firstArgument, "createClient");
+          }
+          // A local alias: `type Client = APIClient`, `type Api = NonNullable<...>`.
+          const def = definitionOf(type.typeName);
+          return def?.type === "Type" && isApiClientType(def.node.typeAnnotation, depth + 1);
         };
         return {
           // Matches `x as APIClient` and the outer assertion of `x as unknown as APIClient`
           // (one report per chain, since the inner `as unknown` does not target APIClient).
-          "TSAsExpression[typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.type='Identifier']"(
-            node
-          ) {
-            if (isApiClientName(node.typeAnnotation.typeName)) {
+          TSAsExpression(node) {
+            if (isApiClientType(node.typeAnnotation)) {
               context.report({ node, messageId: "cast" });
             }
           },

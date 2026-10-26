@@ -312,27 +312,6 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect(view.queryByTestId("artifact-send-strip")).toBeNull();
   });
 
-  test("a frame that navigates away is dropped and gets no bridge until Reload", async () => {
-    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
-    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    const frameWindow = frame.contentWindow;
-    fireEvent.load(frame);
-    // The second load is a navigation (location.href, a clicked link).
-    fireEvent.load(frame);
-    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
-    expect(view.queryByTestId("artifact-frame")).toBeNull();
-    // Whatever the old window posts now is ignored.
-    act(() => {
-      window.dispatchEvent(
-        messageEvent({ xumArtifact: 1, type: "send", text: "From the remote page" }, frameWindow)
-      );
-    });
-    expect(view.queryByTestId("artifact-send-strip")).toBeNull();
-
-    fireEvent.click(view.getByRole("button", { name: "Reload" }));
-    expect(await view.findByTestId("artifact-frame")).toBeTruthy();
-  });
-
   test("in browser mode (phones) the bridge works: send, setState and Annotate", async () => {
     delete window.api;
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });

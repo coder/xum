@@ -729,7 +729,24 @@ async function setup() {
   return () => contextRef.current!;
 }
 
-function createMockAPI(overrides: TestApiOverrides<APIClient["projects"]>) {
+// ProjectContext reads secrets from the top-level `secrets` router, so `overrides.secrets` is
+// typed as that router (not as `projects.secrets`).
+function createMockAPI(
+  overrides: Omit<TestApiOverrides<APIClient["projects"]>, "secrets"> & {
+    secrets?: TestApiOverrides<APIClient["secrets"]>;
+  }
+) {
+  const secrets = {
+    get: mock(overrides.secrets?.get ?? (() => Promise.resolve([]))),
+    update: mock(
+      overrides.secrets?.update ??
+        (() =>
+          Promise.resolve({
+            success: true as const,
+            data: undefined,
+          }))
+    ),
+  };
   const projects = {
     create: mock(
       overrides.create ??
@@ -753,23 +770,12 @@ function createMockAPI(overrides: TestApiOverrides<APIClient["projects"]>) {
     ),
     setDisplayName: mock(overrides.setDisplayName ?? (() => Promise.resolve())),
     pickDirectory: mock(overrides.pickDirectory ?? (() => Promise.resolve(null))),
-    secrets: {
-      get: mock(overrides.secrets?.get ?? (() => Promise.resolve([]))),
-      update: mock(
-        overrides.secrets?.update ??
-          (() =>
-            Promise.resolve({
-              success: true as const,
-              data: undefined,
-            }))
-      ),
-    },
   };
 
   // Update the global mock
   currentClientMock = {
-    projects: projects as unknown as TestApiOverrides<APIClient["projects"]>,
-    secrets: projects.secrets as unknown as TestApiOverrides<APIClient["secrets"]>,
+    projects,
+    secrets,
   };
 
   globalThis.window = new GlobalWindow() as unknown as Window & typeof globalThis;
@@ -777,5 +783,5 @@ function createMockAPI(overrides: TestApiOverrides<APIClient["projects"]>) {
   globalThis.localStorage = globalThis.window.localStorage;
   globalThis.localStorage = globalThis.window.localStorage;
 
-  return projects;
+  return { ...projects, secrets };
 }
