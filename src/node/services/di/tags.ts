@@ -85,6 +85,7 @@ import type { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycle
 import type { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
 import type { WorkspaceNaming } from "@/node/services/workspaceNaming";
 import type { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
+import type { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { TokenizerService } from "@/node/services/tokenizerService";
@@ -233,6 +234,11 @@ export class WorkspaceWorkflowRunsTag extends Context.Service<
   WorkspaceWorkflowRunsTag,
   WorkspaceWorkflowRuns
 >()("xum/WorkspaceWorkflowRuns") {}
+/** Archive admission of non-send operations, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceOperationAdmissionTag extends Context.Service<
+  WorkspaceOperationAdmissionTag,
+  WorkspaceOperationAdmission
+>()("xum/WorkspaceOperationAdmission") {}
 /** Late-bound collaborators of the turn request builder (a mutable record, filled by wiring). */
 export class TurnRequestBuilderBindingsTag extends Context.Service<
   TurnRequestBuilderBindingsTag,
@@ -424,6 +430,7 @@ export type CoreTags =
   | WorkspaceExternalEditorsTag
   | WorkspaceNamingTag
   | WorkspaceWorkflowRunsTag
+  | WorkspaceOperationAdmissionTag
   | TurnRequestBuilderBindingsTag;
 
 /**

@@ -100,6 +100,7 @@ import type {
 import type { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
 import type { TurnCoordinator } from "@/node/services/turnCoordinator";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
+import type { PreflightCounter } from "@/node/services/preflightCounter";
 
 /**
  * Independent field → tag listing for every DI-built ORPC context field (the
@@ -502,9 +503,10 @@ describe("ServiceContainer", () => {
     };
     const project = services.projectService as unknown as { activeGitInits: Set<string> };
     let releaseWorkflow: (() => void) | undefined;
+    let executingAdmission: Disposable | undefined;
     const workspace = services.workspaceService as unknown as {
       preflightSendCounts: Map<string, number>;
-      preflightExecCounts: Map<string, number>;
+      operationAdmission: { exec: PreflightCounter };
       initSettlementPromises: Map<string, Promise<void>>;
       initAbortControllers: Map<string, AbortController>;
       removingWorkspaces: Set<string>;
@@ -532,7 +534,7 @@ describe("ServiceContainer", () => {
       processes.processes.set("foreground", { status: "running", isForeground: true });
       processes.processes.set("finished", { status: "exited", isForeground: false });
       workspace.preflightSendCounts.set("preflight", 1);
-      workspace.preflightExecCounts.set("executing", 1);
+      executingAdmission = workspace.operationAdmission.exec.acquire("executing");
       expect(services.collectRestartBlockers()).toEqual([
         { kind: "pending-turns", count: 1 },
         { kind: "workspace-inits", count: 3 },
@@ -549,7 +551,7 @@ describe("ServiceContainer", () => {
       terminals.pendingSessionCreations.clear();
       processes.processes.clear();
       workspace.preflightSendCounts.clear();
-      workspace.preflightExecCounts.clear();
+      executingAdmission?.[Symbol.dispose]();
       workspace.initSettlementPromises.clear();
       workspace.initAbortControllers.clear();
       services.initStateManager.clearInMemoryState("finishing");
