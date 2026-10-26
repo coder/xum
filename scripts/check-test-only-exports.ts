@@ -33,15 +33,12 @@ export const ALLOWLIST_PATH = "scripts/check-test-only-exports.allowlist.json";
  * and in the JSON file when its export is gone. Never add a key here.
  */
 export const FROZEN_PENDING_DELETION: readonly string[] = [
-  "src/browser/features/RightSidebar/ArtifactsTab/artifactDocument.ts#buildSandboxedHtmlDocument",
   "src/browser/features/Settings/Sections/GoalsSection.tsx#GoalsSection",
   "src/browser/hooks/useModelsFromSettings.ts#getSuggestedModels",
-  "src/browser/stores/DraftStore.ts#DraftAttachmentMatchesChatAttachment",
   "src/browser/utils/highlighting/highlightDiffChunk.ts#highlightDiffChunk",
   "src/browser/utils/messages/StreamingTPSCalculator.ts#calculateTPS",
   "src/browser/utils/messages/StreamingTPSCalculator.ts#calculateTokenCount",
   "src/browser/utils/messages/StreamingTPSCalculator.ts#DeltaRecord",
-  "src/browser/utils/rightSidebarLayout.ts#addToolToFocusedTabset",
   "src/browser/utils/workflowRunMessages.ts#filterWorkflowDisplayOnlyMessages",
   "src/browser/utils/workspaceStorage.ts#migrateWorkspaceStorage",
 ];
