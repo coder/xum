@@ -63,11 +63,15 @@ test("reports a cast to any spelling of the client type, once per chain", () => 
 
 test("follows aliased imports and local type aliases", () => {
   expect(
-    reportCount(`import type { APIClient as Client } from "./api";\nconst a = fake as Client;`)
+    reportCount(
+      `import type { APIClient as Client } from "@/browser/contexts/API";\nconst a = fake as Client;`,
+      ""
+    )
   ).toBe(1);
   expect(
     reportCount(
-      `import type { TestApiOverrides as Overrides } from "./t";\nconst a = fake as unknown as Overrides<X>;`
+      `import type { TestApiOverrides as Overrides } from "@/browser/testUtils";\nconst a = fake as unknown as Overrides<X>;`,
+      ""
     )
   ).toBe(1);
   expect(
@@ -116,13 +120,16 @@ test("the factory and router names count only when they are imported", () => {
   ).toBe(1);
 });
 
-test("the factory and router names count only when imported from their own module", () => {
+test("the client, factory and router names count only when imported from their own module", () => {
   // Database, HTTP and other clients export a `createClient` too.
   const otherModules = [
     `import { createClient } from "redis";\nconst a = fake as ReturnType<typeof createClient>;`,
     `import { createClient } from "@/node/services/other";\nconst a = fake as ReturnType<typeof createClient>;`,
     `import type { AppRouter } from "./otherRouter";\nconst a = fake as RouterClient<AppRouter>;`,
     `import * as Other from "@/browser/contexts/Other";\nconst a = fake as ReturnType<typeof Other.useAPI>["api"];`,
+    `import * as SDK from "some-sdk";\nconst a = fake as SDK.APIClient;`,
+    `import type { APIClient } from "some-sdk";\nconst a = fake as APIClient;`,
+    `import type { TestApiOverrides } from "./otherUtils";\nconst a = fake as TestApiOverrides<X>;`,
   ];
   const imports = `import type { RouterClient } from "@orpc/server";`;
   for (const code of otherModules) {
