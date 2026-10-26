@@ -1433,10 +1433,30 @@ describe("vscode webview workspace AI settings", () => {
 
     expect(agentPicker(view).textContent).toBe("Exec");
     expect(agentPicker(view).disabled).toBe(true);
-    // Agent cycling is locked too, so the composer does not advertise it.
-    expect(view.queryByText("- change agent")).toBeNull();
     const options = await send(bridge, view);
     expect(options.agentId).toBe("exec");
+  });
+
+  test("the empty composer shows no shortcut hints but Ctrl+/ still changes the model (#7540)", async () => {
+    const { view } = await selectWorkspaceWith({
+      ...WORKSPACE,
+      ai: {
+        agentId: "exec",
+        aiSettingsByAgent: {
+          exec: { model: "anthropic:claude-opus-5-5", thinkingLevel: "medium" },
+        },
+      },
+    });
+    // Like the desktop workspace composer (#7476), the one-line empty box has no hint row.
+    expect(view.queryByText("- change model")).toBeNull();
+
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    const modelBefore = view.getByRole("combobox").textContent;
+    await pressKey(textarea, { key: "/", ctrlKey: true });
+    // Read the selector rather than sending: a send with a pick leaves module-level persistence
+    // state in flight for later suites.
+    expect(view.getByRole("combobox").textContent).not.toBe(modelBefore);
   });
 
   test("switching the agent restores that agent's own settings", async () => {
@@ -1600,12 +1620,10 @@ describe("vscode webview agent lookup", () => {
     await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
     await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
     expect(toggle().disabled).toBe(true);
-    expect(view.queryByText("- change agent")).toBeNull();
 
     // With a server connection, the scope follows the listed selection.
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     expect(toggle().disabled).toBe(false);
-    expect(view.queryByText("- change agent")).not.toBeNull();
   });
 
   test("keeps the agent toggle disabled for a restored selection until the workspace list arrives (#4820)", async () => {
