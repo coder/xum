@@ -469,6 +469,7 @@ import {
   type DeliveredWakeRecord,
 } from "@/node/services/bashMonitorWakeReconciler";
 import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycleHooks";
+import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
 import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
   areArchiveUntrackedPathListsEqual,
@@ -2913,8 +2914,12 @@ export class WorkspaceService
 
   // Debounce post-compaction metadata refreshes (file_edit_* can fire rapidly)
   private readonly postCompactionRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
-  // Tracks workspaces currently being renamed to prevent streaming during rename
-  private readonly renamingWorkspaces = new Set<string>();
+  // Tracks workspaces currently being renamed to prevent streaming during rename. The Set lives in
+  // the shared WorkspaceLifecycleGates so services split out of this class can read it; the getter
+  // keeps the old name for this file and for tests that reach it through casts.
+  private get renamingWorkspaces(): Set<string> {
+    return this.lifecycleGates.renaming;
+  }
   // Plan deletions of a full clear in flight, per workspace (a count: two clears may overlap).
   // rename() refuses while one runs (#5479, see deletePlanFilesForWorkspace).
   private readonly planDeletionsInFlight = new Map<string, number>();
@@ -2922,12 +2927,18 @@ export class WorkspaceService
   // Cache for @file mention autocomplete (git ls-files output).
   private readonly fileCompletionsCache = new Map<string, FileCompletionsCacheEntry>();
   // Tracks workspaces currently being removed to prevent new sessions/streams during deletion.
-  private readonly removingWorkspaces = new Set<string>();
+  // Lives in WorkspaceLifecycleGates (see renamingWorkspaces).
+  private get removingWorkspaces(): Set<string> {
+    return this.lifecycleGates.removing;
+  }
   private onTodosChanged: ((workspaceId: string) => void) | null = null;
 
   // Tracks workspaces currently being archived to prevent runtime-affecting operations (e.g. SSH)
-  // from waking a dedicated workspace during archive().
-  private readonly archivingWorkspaces = new Set<string>();
+  // from waking a dedicated workspace during archive(). Lives in WorkspaceLifecycleGates (see
+  // renamingWorkspaces).
+  private get archivingWorkspaces(): Set<string> {
+    return this.lifecycleGates.archiving;
+  }
 
   // Tracks stream generations that are compaction turns so background stop snapshots
   // can carry authoritative notification policy instead of forcing the frontend to
@@ -3272,7 +3283,10 @@ export class WorkspaceService
     }),
     // The turn path stamps the user message, its recency and the stream end on the sessions'
     // clock. WorkspaceLive passes the HostClock service; by default the clock of the runner.
-    private readonly hostClock: HostClock = hostClockFor(effectRunner)
+    private readonly hostClock: HostClock = hostClockFor(effectRunner),
+    // WorkspaceLive passes the shared WorkspaceLifecycleGatesTag service; a standalone
+    // construction (tests, the bench) gets its own.
+    private readonly lifecycleGates: WorkspaceLifecycleGates = new WorkspaceLifecycleGates()
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
