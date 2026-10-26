@@ -888,7 +888,7 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
         <TasksSection />
       </harness.Wrapper>
     );
-    await waitFor(() => expect(view.queryByText("Loading agents…")).toBeNull());
+    await waitFor(() => expect(view.queryByText("Loading agents…") === null).toBe(true));
 
     connect(3, new Promise(() => undefined));
     await harness.drop();

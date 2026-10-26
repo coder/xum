@@ -4,7 +4,7 @@ import { createMuxMessage } from "@/common/types/message";
 import { Err } from "@/common/types/result";
 import assert from "@/common/utils/assert";
 import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
-import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createTestStreamManager } from "./agentSession.testHarness";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 
 // Deterministic code repros of a stream auto-retry racing a manual send's preflight.
@@ -19,7 +19,7 @@ async function retryPending(
   extra?: { hasExternalManualSendPreflight?: () => boolean }
 ) {
   const clock = makeTestEffectRunner();
-  const streamManager = { ...createStreamLifecycleMocks(), effectRunner: clock.runner };
+  const streamManager = createTestStreamManager(undefined, clock.runner);
   const h = await createAgentSessionHarness({
     workspaceId,
     captureEvents: true,

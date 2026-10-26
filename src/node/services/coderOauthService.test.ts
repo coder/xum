@@ -6,7 +6,7 @@ import { Err, Ok } from "@/common/types/result";
 import type { FileLeaseManager, ProvidersConfig, ProvidersConfigStore } from "@/node/config";
 import type { ProviderService } from "@/node/services/providerService";
 import type { WindowService } from "@/node/services/windowService";
-import type { ProviderModelEntry } from "@/common/config/schemas/providerModelEntry";
+import type { ProviderModelEntry } from "@/common/orpc/types";
 import type { CoderOauthAuth } from "@/node/utils/coderOauthAuth";
 import { CODER_GATEWAY_DEFAULT_PROVIDER_NAMES } from "@/common/constants/coderOAuth";
 import { CoderOauthService } from "./coderOauthService";

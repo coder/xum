@@ -7,10 +7,9 @@
  * It spawns two real `xum server` processes with the mock model, because only
  * a real process death runs this path. It runs in bun test (~26 s locally).
  *
- * The fixture pins two open bugs as today's behavior: the mock reuses the
- * message id after a restart, so the retry text lands in row 1 and row 2 stays
- * empty (#7204), and a kill before partial.json exists is not retried (#7205,
- * not covered here). A PR that changes either one records the fixture again:
+ * The fixture pins one open bug as today's behavior: a kill before
+ * partial.json exists is not retried (#7205, not covered here). A PR that
+ * changes it records the fixture again:
  * UPDATE_FIXTURE=1 bun test ./src/node/services/sessionLocks/backendKill.test.ts
  * and then `make fmt` (prettier reflows the JSON; the test compares parsed values).
  */
@@ -66,12 +65,11 @@ test("a SIGKILL in a turn recovers as today", async () => {
   expect(atKill.partialText.length).toBeGreaterThan(0);
   expect(recovered.rowTexts[1].startsWith(atKill.partialText)).toBe(true);
 
-  // The retry must persist its own output too, not only keep A's prefix. Today
-  // it streams the whole mock reply again into row 1 (#7204), so the length of
-  // the text after the prefix is the same in every run.
+  // The retry persists its own output in its own row (#7204: the mock gives a
+  // new backend's reply a new id), so the whole mock reply lands in row 2.
   const actual: Record<string, unknown> = {
     ...normalize(ws, { atKill, recovered }),
-    retryTextLength: recovered.rowTexts[1].length - atKill.partialText.length,
+    retryTextLength: recovered.rowTexts[2].length,
   };
   if (process.env.UPDATE_FIXTURE === "1") {
     await fs.mkdir(path.dirname(FIXTURE), { recursive: true });

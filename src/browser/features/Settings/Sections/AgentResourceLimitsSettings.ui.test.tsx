@@ -493,7 +493,7 @@ describe("AgentResourceLimitsSettings", () => {
     // Wait for the save first: a waitFor whose first check runs before the render polls again
     // only after about 5 s under happy-dom, which made this test time out on a busy host.
     await waitFor(() => expect(view.set).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(view.queryByText(/Not applied/)).toBeNull());
+    await waitFor(() => expect(view.queryByText(/Not applied/) === null).toBe(true));
     expect(view.set.mock.calls).toEqual([[{ cpuCores: 2 }]]);
   });
 });

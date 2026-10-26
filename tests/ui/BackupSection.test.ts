@@ -156,7 +156,7 @@ describe("BackupSection", () => {
         includeMcpHeaders: false,
       })
     );
-    await waitFor(() => expect(canvas.queryByText("Unsaved changes")).toBeNull());
+    await waitFor(() => expect(canvas.queryByText("Unsaved changes") === null).toBe(true));
   });
 
   test("toggles the content selection from the keyboard under the parent gate", async () => {

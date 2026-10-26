@@ -103,7 +103,6 @@ import {
   INSTANCE_DISCOVERY_MAX_LIMIT,
 } from "@/constants/agentMessaging";
 import {
-  AskUserQuestionOptionSchema,
   AskUserQuestionQuestionSchema,
   AskUserQuestionToolArgsSchema,
 } from "./askUserQuestionSchemas";
@@ -112,11 +111,7 @@ import {
 // ask_user_question (interactive questions for top-level agents)
 // -----------------------------------------------------------------------------
 
-export {
-  AskUserQuestionOptionSchema,
-  AskUserQuestionQuestionSchema,
-  AskUserQuestionToolArgsSchema,
-};
+export { AskUserQuestionQuestionSchema, AskUserQuestionToolArgsSchema };
 
 const AskUserQuestionUiOnlySchema = z.object({
   questions: z.array(AskUserQuestionQuestionSchema),
