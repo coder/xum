@@ -7,6 +7,7 @@ import {
   updatePersistedState,
 } from "@/browser/hooks/usePersistedState";
 import { getUserPreferences } from "@/browser/stores/AppConfigStore";
+import { retryDelayMs } from "@/browser/stores/DraftStore";
 import { deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import {
   getDraftScopeId,
@@ -275,6 +276,13 @@ export class CreationDraftStore {
   private listState: CreationDraftListState = { status: "loading" };
   private listedClient: APIClient | null = null;
   private readonly blankIds = new Map<string, string>();
+  /**
+   * Deletes the backend has not confirmed (#7551): retried on failure and on each new client,
+   * and their listed records stay hidden. In memory only, as DraftStore's were before #6620.
+   */
+  private readonly pendingDeletes = new Set<string>();
+  /** Backoff timers of failed deletes. A new client (or none) clears them: it retries at once. */
+  private readonly deleteTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   constructor() {
     // The save debounce is the only unload risk (main wrote localStorage at once): save as soon
@@ -292,8 +300,11 @@ export class CreationDraftStore {
   setClient(client: APIClient | null): void {
     if (client === this.client) return;
     this.client = client;
+    for (const timer of this.deleteTimers.values()) clearTimeout(timer);
+    this.deleteTimers.clear();
     if (!client) return;
     this.loadList(client);
+    for (const id of this.pendingDeletes) this.sendDelete(id, 0).catch(() => undefined);
     for (const [id, entry] of this.entries) {
       if (entry.load.status === "loadFailed") this.retryLoad(id);
       else if (entry.saveError !== null) this.flushInBackground(id);
@@ -352,7 +363,11 @@ export class CreationDraftStore {
       await this.importLegacyDrafts(client);
       const list = await client.drafts.listCreation();
       if (this.listedClient !== client) return;
-      this.summaries = new Map(list.drafts.map((summary) => [summary.draftId, summary]));
+      this.summaries = new Map(
+        list.drafts
+          .filter((summary) => !this.pendingDeletes.has(summary.draftId))
+          .map((summary) => [summary.draftId, summary])
+      );
       // A local copy is newer than the backend's row, and a first save still running (the list
       // can land after its timeout) has no row yet.
       for (const [id, entry] of this.entries) {
@@ -549,6 +564,10 @@ export class CreationDraftStore {
     if (!draft) return;
     const { id: _id, ...all } = draft;
     const patch = entry.persisted ? entry.pending : all;
+    // Editing a draft whose delete is unconfirmed cancels that delete: a later retry would
+    // remove the new edits.
+    this.pendingDeletes.delete(id);
+    this.clearDeleteTimer(id);
     entry.pending = {};
     entry.saving = true;
     this.recompute(id, entry);
@@ -589,7 +608,10 @@ export class CreationDraftStore {
     entry.saveError = this.client && this.client !== client ? null : getErrorMessage(error);
   }
 
-  /** Delete a draft (Send success, sidebar Delete). Another window's unsent edits go too. */
+  /**
+   * Delete a draft (Send success, sidebar Delete). Another window's unsent edits go too. Never
+   * rejects: a failed delete is retried, or the record would be listed again with sent text.
+   */
   async delete(id: string): Promise<void> {
     const entry = this.entries.get(id);
     if (entry?.timer) clearTimeout(entry.timer);
@@ -601,8 +623,36 @@ export class CreationDraftStore {
     this.recomputeList();
     // Let a save in flight land first, so it cannot recreate the file after the delete.
     await entry?.inFlight;
-    if (!this.client) throw new Error("Not connected.");
-    await this.client.drafts.deleteCreation({ scope: { kind: "creation", draftId: id } });
+    this.pendingDeletes.add(id);
+    await this.sendDelete(id, 0);
+  }
+
+  private async sendDelete(id: string, attempt: number): Promise<void> {
+    const client = this.client;
+    // Without a client the next one retries it (setClient).
+    if (!client || !this.pendingDeletes.has(id)) return;
+    try {
+      await client.drafts.deleteCreation({ scope: { kind: "creation", draftId: id } });
+      this.pendingDeletes.delete(id);
+      // A list that was read before the delete must not show the record again.
+      if (this.summaries.delete(id)) this.recomputeList();
+    } catch (error) {
+      console.warn("Failed to delete a creation draft; retrying:", error);
+      // A client change while the request ran already resent it (setClient).
+      if (this.client !== client || !this.pendingDeletes.has(id)) return;
+      this.clearDeleteTimer(id);
+      const timer = setTimeout(() => {
+        this.deleteTimers.delete(id);
+        this.sendDelete(id, attempt + 1).catch(() => undefined);
+      }, retryDelayMs(attempt));
+      this.deleteTimers.set(id, timer);
+    }
+  }
+
+  private clearDeleteTimer(id: string): void {
+    const timer = this.deleteTimers.get(id);
+    if (timer) clearTimeout(timer);
+    this.deleteTimers.delete(id);
   }
 
   /** Drop local state of a removed project's drafts (the backend deletes their records). */
