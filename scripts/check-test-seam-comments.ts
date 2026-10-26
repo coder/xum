@@ -60,6 +60,12 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "Useful in tests for checking ...", "needed only in tests".
   // "This callback must never be called in tests" is negated, so it stays quiet.
   /(?<!\b(?:not|never)\s+(?:be\s+|been\s+)?)\b(?:useful|needed|called|invoked)\s+(?:only\s+)?in\s+(?:unit\s+|integration\s+)?tests\b(?![/-])/i,
+  // "Absent on test doubles", "absent from test doubles": the member is optional only so doubles
+  // can leave it out.
+  /\babsent\s+(?:on|from|in)\s+test\s+doubles\b/i,
+  // "Test doubles of AIService pass one too": the member exists so doubles can supply it. The
+  // verb must follow in the same sentence, so "test doubles replace the modal" stays quiet.
+  /\btest\s+doubles\b[^.!?]{0,60}?\bpass(?:es)?\b/i,
 ];
 
 /**

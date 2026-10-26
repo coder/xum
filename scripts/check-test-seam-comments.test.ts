@@ -101,6 +101,27 @@ test("matches override-for-tests claims", () => {
   expect(seams("// Override for the request timeout.\nexport const b = 1;")).toEqual([]);
 });
 
+test("matches test-double seam claims, not prose about doubles", () => {
+  expect(
+    seams(
+      "interface S {\n  /** Absent on test doubles; production always sets it. */\n  clock?: number;\n}"
+    )
+  ).toEqual(["2:S.clock"]);
+  expect(seams("// Absent from test doubles.\nexport const a = 1;")).toEqual(["1:a"]);
+  expect(
+    seams("// Builds runtimes. Test doubles of AIService pass one too.\nexport const b = 1;")
+  ).toEqual(["1:b"]);
+  // Prose about doubles that claims no seam.
+  expect(
+    seams("// Test doubles replace the modal on the index module.\nexport const c = 1;")
+  ).toEqual([]);
+  expect(
+    seams("// Manager without an inventory (test doubles): list from disk.\nexport const d = 1;")
+  ).toEqual([]);
+  // "pass" in a later sentence is not part of the claim.
+  expect(seams("// Uses test doubles. Callers pass a factory.\nexport const e = 1;")).toEqual([]);
+});
+
 test("matches in-tests seam claims, not prose about tests", () => {
   expect(
     seams("class Pool {\n  /** Shorten the idle window in tests. */\n  setIdle(ms: number) {}\n}")
