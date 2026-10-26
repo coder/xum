@@ -11433,6 +11433,12 @@ export class AgentSession {
     }
     holder.pending = level;
     holder.manual = true;
+    // A Continue built from the captured options must run at the picked level, as for a speed
+    // pick below, even when the turn stops before its next model step (#7237).
+    const context = this.activeStreamContext;
+    if (context?.options) {
+      context.options = { ...context.options, thinkingLevel: level };
+    }
     return { accepted: true };
   }
 

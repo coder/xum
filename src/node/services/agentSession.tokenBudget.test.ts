@@ -2765,6 +2765,19 @@ describe("AgentSession token-budget lifecycle", () => {
     });
   });
 
+  test("a stage Continue runs at the thinking level the user picked during the stopped turn", async () => {
+    const h = await setup();
+    expect(
+      (await h.session.sendMessage("Work", { ...options, thinkingLevel: "low" })).success
+    ).toBe(true);
+    expect(h.requests[0].thinkingLevel).toBe("low");
+    // The pick lands before the turn's next model step, and the stage stops the turn first.
+    expect(h.session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: true });
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    expect((await h.waitForRequest(2)).thinkingLevel).toBe("high");
+  });
+
   const exceeded: SendMessageError = {
     type: "context_budget_exceeded",
     model,
