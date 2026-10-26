@@ -153,20 +153,71 @@ function bindingNames(name: ts.BindingName): ts.Identifier[] {
   );
 }
 
-/** The name of a top-level-style declaration (`const x`, `function x`, `class x`, ...). */
-function isDeclarationName(node: ts.Identifier): boolean {
-  const parent = node.parent;
-  return (
-    (ts.isVariableDeclaration(parent) ||
-      ts.isBindingElement(parent) ||
-      ts.isFunctionDeclaration(parent) ||
-      ts.isClassDeclaration(parent) ||
-      ts.isInterfaceDeclaration(parent) ||
-      ts.isTypeAliasDeclaration(parent) ||
-      ts.isEnumDeclaration(parent) ||
-      ts.isModuleDeclaration(parent)) &&
-    parent.name === node
-  );
+/** Names a block-like statement list declares for its own scope. */
+function statementBindings(statements: readonly ts.Statement[]): string[] {
+  return statements.flatMap((statement) => {
+    if (ts.isVariableStatement(statement)) {
+      return statement.declarationList.declarations.flatMap((declaration) =>
+        bindingNames(declaration.name).map((id) => id.text)
+      );
+    }
+    const name = (statement as { name?: ts.Node }).name;
+    return name !== undefined && ts.isIdentifier(name) ? [name.text] : [];
+  });
+}
+
+/**
+ * Names `node` binds for its own subtree (parameters, type parameters, catch variables, block
+ * declarations, a named function or class expression's own name). Inside that subtree they
+ * shadow a module-level export of the same name, so they are not uses of it.
+ */
+function scopeBindings(node: ts.Node): string[] {
+  if (ts.isSourceFile(node)) return [];
+  const names: string[] = [];
+  if (ts.isFunctionLike(node)) {
+    for (const parameter of node.parameters) {
+      names.push(...bindingNames(parameter.name).map((id) => id.text));
+    }
+    if (ts.isFunctionExpression(node) && node.name) names.push(node.name.text);
+  }
+  if (ts.isClassExpression(node) && node.name) names.push(node.name.text);
+  const typeParameters = (node as { typeParameters?: ts.NodeArray<ts.TypeParameterDeclaration> })
+    .typeParameters;
+  for (const typeParameter of typeParameters ?? []) names.push(typeParameter.name.text);
+  if (ts.isCatchClause(node) && node.variableDeclaration) {
+    names.push(...bindingNames(node.variableDeclaration.name).map((id) => id.text));
+  }
+  if (ts.isBlock(node) || ts.isModuleBlock(node)) names.push(...statementBindings(node.statements));
+  if (ts.isCaseBlock(node)) {
+    names.push(...statementBindings(node.clauses.flatMap((clause) => [...clause.statements])));
+  }
+  if (
+    (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) &&
+    node.initializer &&
+    ts.isVariableDeclarationList(node.initializer)
+  ) {
+    for (const declaration of node.initializer.declarations) {
+      names.push(...bindingNames(declaration.name).map((id) => id.text));
+    }
+  }
+  return names;
+}
+
+/**
+ * The module-level names a top-level declaration declares. Uses inside the declaration itself
+ * (a recursive call, a class naming itself) are not uses from elsewhere in the file.
+ */
+function ownDeclarationNames(node: ts.Node, sourceFile: ts.SourceFile): string[] {
+  if (
+    ts.isVariableDeclaration(node) &&
+    ts.isVariableDeclarationList(node.parent) &&
+    node.parent.parent.parent === sourceFile
+  ) {
+    return bindingNames(node.name).map((id) => id.text);
+  }
+  if (node.parent !== sourceFile || ts.isVariableStatement(node)) return [];
+  const name = (node as { name?: ts.Node }).name;
+  return name !== undefined && ts.isIdentifier(name) ? [name.text] : [];
 }
 
 /** An identifier that names a property or member, not a binding in scope. */
@@ -192,6 +243,43 @@ function isPropertyName(node: ts.Identifier): boolean {
     return parent.name === node;
   }
   return false;
+}
+
+const isModuleExports = (node: ts.Expression) =>
+  ts.isPropertyAccessExpression(node) &&
+  ts.isIdentifier(node.expression) &&
+  node.expression.text === "module" &&
+  node.name.text === "exports";
+
+/**
+ * CommonJS exports a statement declares: `exports.a = ...` / `module.exports.a = ...` declare
+ * `a`; `module.exports = { a, b }` declares `a` and `b`; any other `module.exports = x` declares
+ * `default`. Undefined for statements that are not such an assignment.
+ */
+function commonJsExportNames(statement: ts.Statement): string[] | undefined {
+  if (!ts.isExpressionStatement(statement)) return undefined;
+  const expression = statement.expression;
+  if (!ts.isBinaryExpression(expression)) return undefined;
+  if (expression.operatorToken.kind !== ts.SyntaxKind.EqualsToken) return undefined;
+  const target = expression.left;
+  if (isModuleExports(target)) {
+    const value = expression.right;
+    if (!ts.isObjectLiteralExpression(value)) return ["default"];
+    return value.properties.flatMap((property) => {
+      const name = property.name;
+      return name !== undefined && (ts.isIdentifier(name) || ts.isStringLiteral(name))
+        ? [name.text]
+        : [];
+    });
+  }
+  if (
+    ts.isPropertyAccessExpression(target) &&
+    ((ts.isIdentifier(target.expression) && target.expression.text === "exports") ||
+      isModuleExports(target.expression))
+  ) {
+    return [target.name.text];
+  }
+  return undefined;
 }
 
 function stringArgument(node: ts.CallExpression): string | undefined {
@@ -275,6 +363,11 @@ export function collectModuleFacts(file: string, text: string): ModuleFacts {
       addExport("default", undefined, statement);
       continue;
     }
+    const commonJs = commonJsExportNames(statement);
+    if (commonJs !== undefined) {
+      for (const name of commonJs) addExport(name, undefined, statement);
+      continue;
+    }
     if (!hasExportModifier(statement)) continue;
     if (ts.isVariableStatement(statement)) {
       for (const declaration of statement.declarationList.declarations) {
@@ -299,10 +392,14 @@ export function collectModuleFacts(file: string, text: string): ModuleFacts {
   }
 
   const usedLocally = new Set<string>();
-  const visit = (node: ts.Node) => {
+  const visit = (node: ts.Node, hidden: ReadonlySet<string>) => {
+    const hiding = [...scopeBindings(node), ...ownDeclarationNames(node, sourceFile)].filter(
+      (name) => exportedLocals.has(name) && !hidden.has(name)
+    );
+    const inner = hiding.length > 0 ? new Set([...hidden, ...hiding]) : hidden;
     if (ts.isIdentifier(node)) {
-      const exported = exportedLocals.get(node.text);
-      if (exported && !isDeclarationName(node) && !isPropertyName(node)) {
+      const exported = inner.has(node.text) ? undefined : exportedLocals.get(node.text);
+      if (exported && !isPropertyName(node)) {
         for (const name of exported) usedLocally.add(name);
       }
     } else if (ts.isCallExpression(node)) {
@@ -327,9 +424,9 @@ export function collectModuleFacts(file: string, text: string): ModuleFacts {
         imports.push({ specifier: argument.literal.text, names: [first?.text ?? "*"] });
       }
     }
-    ts.forEachChild(node, visit);
+    ts.forEachChild(node, (child) => visit(child, inner));
   };
-  visit(sourceFile);
+  visit(sourceFile, new Set());
   return { exports, usedLocally, imports, reExports };
 }
 
@@ -337,19 +434,32 @@ function leftmost(name: ts.QualifiedName): ts.Identifier {
   return ts.isIdentifier(name.left) ? name.left : leftmost(name.left);
 }
 
+/** Suffixes an extensionless specifier can stand for. */
 const RESOLVE_SUFFIXES = [
   "",
   ".ts",
   ".tsx",
   ".d.ts",
+  ".mts",
+  ".cts",
   ".js",
   ".jsx",
   ".mjs",
   ".cjs",
   "/index.ts",
   "/index.tsx",
+  "/index.mts",
+  "/index.cts",
   "/index.js",
 ];
+
+/** Sources an emitted-extension specifier (`./a.js`, NodeNext `./a.mjs`) can stand for. */
+const EMITTED_SOURCES: Readonly<Record<string, readonly string[]>> = {
+  ".js": [".ts", ".tsx", ".d.ts"],
+  ".jsx": [".tsx"],
+  ".mjs": [".mts", ".d.mts"],
+  ".cjs": [".cts", ".d.cts"],
+};
 
 /** Resolves a specifier to a known repo-relative file, or undefined for packages and assets. */
 export function resolveSpecifier(
@@ -360,26 +470,39 @@ export function resolveSpecifier(
   let base: string;
   const alias = /^(?:@|@shared)\//.exec(specifier);
   if (alias) base = `src/${specifier.slice(alias[0].length)}`;
-  else if (specifier.startsWith("."))
+  else if (specifier.startsWith(".")) {
     base = path.posix.join(path.posix.dirname(fromFile), specifier);
-  else return undefined;
-  const candidates = [base];
-  // ESM-style `./a.js` for `./a.ts`.
-  if (/\.[cm]?js$/.test(base)) candidates.push(base.replace(/\.[cm]?js$/, ""));
-  for (const candidate of candidates) {
-    for (const suffix of RESOLVE_SUFFIXES) {
-      if (knownFiles.has(candidate + suffix)) return candidate + suffix;
-    }
+  } else return undefined;
+  for (const suffix of RESOLVE_SUFFIXES) {
+    if (knownFiles.has(base + suffix)) return base + suffix;
+  }
+  const extension = /\.[cm]?jsx?$/.exec(base)?.[0];
+  if (extension === undefined) return undefined;
+  for (const source of EMITTED_SOURCES[extension]) {
+    const candidate = base.slice(0, -extension.length) + source;
+    if (knownFiles.has(candidate)) return candidate;
   }
   return undefined;
 }
 
 /**
- * Built-in workflow scripts (the .js files under src/node/builtinSkills/) are run by the workflow runtime,
- * which reads their `meta` and `default` exports by contract; no module imports them.
+ * Built-in workflow scripts (the .js files under src/node/builtinSkills/) are run by the workflow
+ * runtime, which reads their `meta` and `default` exports by contract; no module imports them.
+ * Their other exports are checked like any other.
  */
-export function hasImportedExports(file: string): boolean {
-  return !(file.startsWith("src/node/builtinSkills/") && file.endsWith(".js"));
+export function isRuntimeContractExport(file: string, symbol: string): boolean {
+  return (
+    file.startsWith("src/node/builtinSkills/") &&
+    file.endsWith(".js") &&
+    (symbol === "meta" || symbol === "default")
+  );
+}
+
+function explicitlyExports(module: ModuleFacts, name: string): boolean {
+  return (
+    module.exports.some((fact) => fact.name === name) ||
+    module.reExports.some((reExport) => reExport.names.some((n) => n.exported === name))
+  );
 }
 
 export interface UnreferencedExport {
@@ -415,8 +538,8 @@ export function findUnreferencedExports(
       const target = resolveSpecifier(reExport.specifier, file, knownFiles);
       if (target === undefined) continue;
       if (reExport.star) {
-        // `export * from` never forwards `default`.
-        if (name !== "default") markUse(target, name);
+        // `export * from` never forwards `default`, nor a name the barrel exports explicitly.
+        if (name !== "default" && !explicitlyExports(module, name)) markUse(target, name);
         continue;
       }
       for (const forwarded of reExport.names) {
@@ -532,7 +655,9 @@ function main(): number {
   for (const file of files) {
     facts.set(file, collectModuleFacts(file, readFileSync(path.join(root, file), "utf8")));
   }
-  const findings = findUnreferencedExports(facts, files, files.filter(hasImportedExports));
+  const findings = findUnreferencedExports(facts, files, files).filter(
+    (finding) => !isRuntimeContractExport(finding.file, finding.symbol)
+  );
   const allowlist = parseAllowlist(
     JSON.parse(readFileSync(path.join(root, ALLOWLIST_PATH), "utf8")) as unknown
   );

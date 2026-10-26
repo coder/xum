@@ -5,7 +5,7 @@ import {
   checkExports,
   collectModuleFacts,
   findUnreferencedExports,
-  hasImportedExports,
+  isRuntimeContractExport,
   resolveSpecifier,
   type ModuleFacts,
 } from "./check-test-only-exports";
@@ -125,12 +125,67 @@ test("resolves the @/ alias, relative paths, ESM .js suffixes and index files", 
   expect(resolveSpecifier("../a", "src/z/x.ts", known)).toBe("src/a/index.tsx");
   expect(resolveSpecifier("./c.js", "src/x.ts", known)).toBe("src/c.js");
   expect(resolveSpecifier("zod", "src/x.ts", known)).toBeUndefined();
+  // NodeNext sources are imported by their emitted extensions.
+  const nodeNext = new Set(["src/m.mts", "src/c.cts"]);
+  expect(resolveSpecifier("./m.mjs", "src/x.ts", nodeNext)).toBe("src/m.mts");
+  expect(resolveSpecifier("./c.cjs", "src/x.ts", nodeNext)).toBe("src/c.cts");
 });
 
-test("skips workflow scripts, whose exports the workflow runtime reads", () => {
-  expect(hasImportedExports("src/node/builtinSkills/deep-research/workflow.js")).toBe(false);
-  expect(hasImportedExports("src/node/builtinSkills/index.ts")).toBe(true);
-  expect(hasImportedExports("src/node/services/x.js")).toBe(true);
+test("exempts only the meta and default exports of workflow scripts", () => {
+  const workflow = "src/node/builtinSkills/deep-research/workflow.js";
+  expect(isRuntimeContractExport(workflow, "meta")).toBe(true);
+  expect(isRuntimeContractExport(workflow, "default")).toBe(true);
+  expect(isRuntimeContractExport(workflow, "helper")).toBe(false);
+  expect(isRuntimeContractExport("src/node/services/x.js", "default")).toBe(false);
+});
+
+test("does not count shadowing bindings or a declaration's own body as uses", () => {
+  expect(
+    unreferenced({
+      "src/a.ts": [
+        "export const param = 1;",
+        "export const caught = 2;",
+        "export const blockLocal = 3;",
+        "export type Generic = 4;",
+        "export function recursive(n: number): number { return n && recursive(n - 1); }",
+        "export class Self { static make() { return new Self(); } }",
+        "function f(param: number) { return param; }",
+        "try {} catch (caught) { void caught; }",
+        "function g() { const blockLocal = 0; return blockLocal; }",
+        "function h<Generic>(x: Generic) { return x; }",
+        "export const used = 5;",
+        "function k(other: number) { return other + used; }",
+      ].join("\n"),
+    })
+  ).toEqual([
+    "src/a.ts#param",
+    "src/a.ts#caught",
+    "src/a.ts#blockLocal",
+    "src/a.ts#Generic",
+    "src/a.ts#recursive",
+    "src/a.ts#Self",
+  ]);
+});
+
+test("reads CommonJS exports", () => {
+  expect(
+    unreferenced({
+      "src/a.cjs": "exports.one = 1;\nmodule.exports.two = 2;",
+      "src/b.cjs": "module.exports = { three: 3, four: 4 };",
+      "src/c.cjs": "module.exports = function () {};",
+      "src/d.ts": 'import { one, three } from "./a.cjs";\nimport { three as t } from "./b.cjs";',
+    })
+  ).toEqual(["src/a.cjs#two", "src/b.cjs#four", "src/c.cjs#default"]);
+});
+
+test("an explicit barrel export shadows the same name from export *", () => {
+  expect(
+    unreferenced({
+      "src/a.ts": "export const value = 1;",
+      "src/index.ts": 'export * from "./a";\nexport const value = 2;',
+      "src/b.ts": 'import { value } from "./index";\nvalue;',
+    })
+  ).toEqual(["src/a.ts#value"]);
 });
 
 test("reports unlisted findings, stale and duplicate entries, and pendingDeletion growth", () => {
