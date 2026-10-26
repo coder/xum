@@ -680,7 +680,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
   });
 
   test("the follow-up idle probe excludes the originating send after its session handoff", async () => {
-    // Codex P1 (PRRT_kwDOPxxmWM6cRi_J): preflightSendCounts stays positive
+    // Codex P1 (PRRT_kwDOPxxmWM6cRi_J): SendPreflight.sends stays positive
     // until the outer service call returns, so a probe reading it would let a
     // continuation's on-send compaction completion veto the continuation's
     // OWN saved follow-up. The probe must see unrelated preflights (round-37

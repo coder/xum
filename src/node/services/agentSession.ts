@@ -1131,7 +1131,7 @@ interface AgentSessionOptions {
   onPostCompactionStateChange?: () => void;
   /**
    * Codex P1 (PRRT_kwDOPxxmWM6cRJD-): true while a service-level send is in
-   * its preflight (counted in WorkspaceService.preflightSendCounts but not
+   * its preflight (counted in SendPreflight.sends but not
    * yet queued or holding the turn phase). Session queue/phase state cannot
    * see that window, so redispatched idle-rule follow-ups consult this probe
    * to yield to a manual send that is still awaiting pricing/settings.
