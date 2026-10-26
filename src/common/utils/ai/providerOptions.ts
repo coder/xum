@@ -334,7 +334,7 @@ function adaptiveModelOffThinking(capabilityModel: string): AnthropicThinkingSha
  * `bedrock:` origin, and Bedrock ids end in -vN[:M]; both defeat the anchored
  * capability matchers (a missed "rejects disabled" match would send a 400).
  */
-export function bedrockClaudeCapabilityModel(
+function bedrockClaudeCapabilityModel(
   formatProvider: string | undefined,
   capabilityModel: string
 ): string | null {
@@ -353,12 +353,24 @@ export function bedrockClaudeCapabilityModel(
  * Bedrock default, which is no thinking, at every level (#7180). A budget there
  * must fit the request's max_tokens, which the SDK's reasoningConfig budget
  * overshoots, and Bedrock reasoning signatures are not yet kept for replay.
+ *
+ * An id that does not name Claude (an application inference profile ARN mapped with
+ * mappedToModel) gets the raw Claude fields instead: the SDK treats such an id as Claude
+ * only for a thinking budget, so it would drop an adaptive reasoningConfig (#7181).
+ * Telling the SDK the family instead would make it check its per-model structured-output
+ * limits against the ARN, which names no model.
  */
-function buildBedrockClaudeOptions(shape: AnthropicThinkingShape): ProviderOptions {
-  return shape.usesAdaptiveThinking ? bedrockAdaptiveClaudeOptions(shape) : {};
+function buildBedrockClaudeOptions(
+  shape: AnthropicThinkingShape,
+  idNamesClaude: boolean
+): ProviderOptions {
+  return shape.usesAdaptiveThinking ? bedrockAdaptiveClaudeOptions(shape, idNamesClaude) : {};
 }
 
-function bedrockAdaptiveClaudeOptions(shape: AnthropicThinkingShape): ProviderOptions {
+function bedrockAdaptiveClaudeOptions(
+  shape: AnthropicThinkingShape,
+  idNamesClaude: boolean
+): ProviderOptions {
   const effort = shape.effort;
   assert(effort != null, "adaptive Claude thinking always carries an effort");
   if (shape.thinking?.type === "disabled") {
@@ -374,6 +386,21 @@ function bedrockAdaptiveClaudeOptions(shape: AnthropicThinkingShape): ProviderOp
   // between_tools needs the Anthropic payload (resolveBetweenToolsThinkingLevel
   // never yields it here); like an omitted `thinking`, send the effort alone.
   const adaptive = shape.thinking?.type === "adaptive" ? shape.thinking : undefined;
+  if (!idNamesClaude) {
+    return {
+      bedrock: {
+        additionalModelRequestFields: {
+          ...(adaptive && {
+            thinking: {
+              type: "adaptive",
+              ...(adaptive.summarized && { display: "summarized" }),
+            },
+          }),
+          output_config: { effort },
+        },
+      },
+    };
+  }
   return {
     bedrock: {
       reasoningConfig: {
@@ -1158,7 +1185,9 @@ export function buildProviderOptions(
         bedrockClaudeModel,
         bedrockClaudeModel.slice("anthropic:".length),
         effectiveThinking
-      )
+      ),
+      // The SDK's own Claude test (isAnthropicModel) looks for this in the model id.
+      modelString.includes("anthropic")
     );
     log.debug("buildProviderOptions: Returning Bedrock options", options);
     return options;

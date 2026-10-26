@@ -126,10 +126,7 @@ import {
   SESSION_TAPE_REPLAY_READ_ONLY_MESSAGE,
 } from "@/node/services/sessionTapes/sessionTapeReplaySource";
 import { isMockAiMode, MOCK_AI_MODEL_REFUSED_MESSAGE } from "@/node/services/mock/mockAiMode";
-import {
-  bedrockClaudeCapabilityModel,
-  resolveProviderOptionsNamespaceKey,
-} from "@/common/utils/ai/providerOptions";
+import { resolveProviderOptionsNamespaceKey } from "@/common/utils/ai/providerOptions";
 import { resolveRoute, type RouteContext } from "@/common/routing";
 import {
   getExplicitGatewayPrefix as getExplicitGatewayProvider,
@@ -1166,21 +1163,6 @@ export function requestEndpoint(requestUrl: string): string {
 }
 
 /** Google Vertex AI: ADC by default, express mode when an API key resolves. */
-/**
- * An application inference profile ARN does not name its model, and the SDK guesses Anthropic
- * only from a thinking budget: without the family, adaptive Claude thinking goes out as a
- * generic reasoningConfig (#7181). The mapped capability model names it.
- */
-function bedrockChatModelSettings(
-  modelString: string,
-  providersConfig: ProvidersConfig
-): { modelFamily: "anthropic" } | undefined {
-  const capabilityModel = resolveModelForMetadata(modelString, providersConfig);
-  return bedrockClaudeCapabilityModel("bedrock", capabilityModel)
-    ? { modelFamily: "anthropic" }
-    : undefined;
-}
-
 function createGoogleVertexModelEffect(
   providerConfig: ProviderConfig,
   modelId: string
@@ -2789,10 +2771,6 @@ export class ProviderModelFactory {
             PROVIDER_REGISTRY.bedrock()
           );
 
-          const chatSettings = bedrockChatModelSettings(modelString, providersConfig);
-          const createChatModel = (provider: ReturnType<typeof createAmazonBedrock>) =>
-            provider(modelId, chatSettings);
-
           // Check if explicit credentials are provided in config
           const hasExplicitCredentials =
             providerConfig.accessKeyId && providerConfig.secretAccessKey;
@@ -2804,7 +2782,7 @@ export class ProviderModelFactory {
               region,
               fetch: providerFetch,
             });
-            return Ok(createChatModel(provider));
+            return Ok(provider(modelId));
           }
 
           // Check for Bedrock bearer token (simplest auth) - from config or environment
@@ -2818,7 +2796,7 @@ export class ProviderModelFactory {
               apiKey: bearerToken,
               fetch: providerFetch,
             });
-            return Ok(createChatModel(provider));
+            return Ok(provider(modelId));
           }
 
           // Check if AWS_BEARER_TOKEN_BEDROCK env var is set
@@ -2828,7 +2806,7 @@ export class ProviderModelFactory {
               region,
               fetch: providerFetch,
             });
-            return Ok(createChatModel(provider));
+            return Ok(provider(modelId));
           }
 
           // Use AWS credential provider chain for flexible authentication:
@@ -2844,7 +2822,7 @@ export class ProviderModelFactory {
             credentialProvider: fromNodeProviderChain(profile ? { profile } : {}),
             fetch: providerFetch,
           });
-          return Ok(createChatModel(provider));
+          return Ok(provider(modelId));
         }
 
         if (providerName === "google-vertex") {

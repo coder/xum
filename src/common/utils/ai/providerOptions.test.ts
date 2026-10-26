@@ -6,7 +6,8 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createAmazonBedrock } from "@ai-sdk/amazon-bedrock";
 import { createOpenAI, type OpenAIResponsesProviderOptions } from "@ai-sdk/openai";
-import { generateText, streamText } from "ai";
+import { generateText, Output, streamText } from "ai";
+import { z } from "zod";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { createMuxMessage } from "@/common/types/message";
 import { createOpenAICachedSystemMessage } from "./cacheStrategy";
@@ -4067,7 +4068,11 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
   async function sentBedrockBody(
     bedrockModelId: string,
     options: ReturnType<typeof buildProviderOptions>,
-    callSettings: { maxOutputTokens?: number; temperature?: number } = {}
+    callSettings: {
+      maxOutputTokens?: number;
+      temperature?: number;
+      output?: ReturnType<typeof Output.object>;
+    } = {}
   ): Promise<{ path: string; body: Record<string, unknown> }> {
     const captured: Array<{ path: string; body: Record<string, unknown> }> = [];
     const captureFetch = Object.assign(
@@ -4087,7 +4092,8 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
         return Promise.resolve(
           new Response(
             JSON.stringify({
-              output: { message: { role: "assistant", content: [{ text: "ok" }] } },
+              // JSON, so a structured-output call parses it too.
+              output: { message: { role: "assistant", content: [{ text: '{"answer":"ok"}' }] } },
               stopReason: "end_turn",
               usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
             }),
@@ -4224,6 +4230,52 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
 
   test("non-Claude Bedrock models get no Claude thinking fields", () => {
     expect(bedrockOptions("bedrock:amazon.nova-pro-v1:0", "high")).toEqual({});
+  });
+
+  // An application inference profile ARN names no model: mappedToModel says what it runs.
+  const ARN = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4";
+  const arnOptions = (mappedToModel: string) =>
+    buildProviderOptions(
+      `bedrock:${ARN}`,
+      "high",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { bedrock: { region: "us-east-1", models: [{ id: ARN, mappedToModel }] } },
+      "bedrock"
+    );
+
+  test("an ARN mapped to Claude sends the same Claude fields as a named id (#7181)", async () => {
+    const named = bedrockOptions("bedrock:anthropic.claude-sonnet-5", "high");
+    const mapped = arnOptions("anthropic:claude-sonnet-5");
+    // A named id keeps the typed reasoningConfig; the ARN sends only the raw fields.
+    expect((named.bedrock as Record<string, unknown>).reasoningConfig).toBeDefined();
+    expect((mapped.bedrock as Record<string, unknown>).reasoningConfig).toBeUndefined();
+
+    const namedSent = await sentBedrockBody("anthropic.claude-sonnet-5", named);
+    const mappedSent = await sentBedrockBody(ARN, mapped);
+    expect(namedSent.body.additionalModelRequestFields).toMatchObject({
+      thinking: { type: "adaptive" },
+      output_config: { effort: "high" },
+    });
+    expect(mappedSent.body.additionalModelRequestFields).toEqual(
+      namedSent.body.additionalModelRequestFields
+    );
+  });
+
+  test("an ARN mapped to another model gets no Claude fields (#7181)", () => {
+    expect(arnOptions("bedrock:amazon.nova-pro-v1:0")).toEqual({});
+  });
+
+  test("an ARN mapped to Claude keeps structured output off output_config.format (#7181)", async () => {
+    // Bedrock rejects the native format field for Sonnet 5; the SDK cannot tell from the ARN.
+    const sent = await sentBedrockBody(ARN, arnOptions("anthropic:claude-sonnet-5"), {
+      output: Output.object({ schema: z.object({ answer: z.string() }) }),
+    });
+    const fields = sent.body.additionalModelRequestFields as Record<string, unknown>;
+    expect(fields.output_config).toEqual({ effort: "high" });
   });
 
   // Budget-thinking models keep main's Bedrock request exactly, at every level
