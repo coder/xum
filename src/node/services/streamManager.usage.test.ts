@@ -19,6 +19,7 @@ import {
   installStreamManagerTestHistory,
   historyService,
   createTestLanguageModel,
+  finishStep,
   testStartOptions,
   REFUSAL_FINISH,
   STOP_FINISH,
@@ -28,13 +29,6 @@ import {
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
-
-function finishStep(
-  usage: Record<string, number>,
-  providerMetadata?: Record<string, unknown>
-): Record<string, unknown> {
-  return { type: "finish-step", usage, ...(providerMetadata ? { providerMetadata } : {}) };
-}
 
 /** Starts a public turn; callers await `completion` (or stop the stream first). */
 async function startTurnForTests(
