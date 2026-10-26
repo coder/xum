@@ -1,6 +1,5 @@
 import { z } from "zod";
 import { INSTANCE_DISCOVERY_MAX_LIMIT } from "@/constants/agentMessaging";
-import { BASH_DEFAULT_TIMEOUT_SECS } from "@/common/constants/toolLimits";
 import {
   buildTaskToolAgentArgsSchema,
   getAvailableTools,
@@ -376,21 +375,16 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
-  it("defaults timeout_secs only for foreground bash calls", () => {
-    const foreground = TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls" });
-    expect(foreground.success).toBe(true);
-    if (foreground.success) {
-      expect(foreground.data.timeout_secs).toBe(BASH_DEFAULT_TIMEOUT_SECS);
+  it("still rejects bash calls without timeout_secs, foreground or background", () => {
+    // Only display_name is filled: a default timeout could kill a long command
+    // partway, while a rejection runs nothing and the model retries.
+    for (const run_in_background of [false, true]) {
+      const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls", run_in_background });
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) {
+        expect(parsed.error.issues.map((issue) => issue.path.join("."))).toEqual(["timeout_secs"]);
+      }
     }
-
-    // A background process has no safe default lifetime: a short one would kill
-    // a dev server, and none would let it run forever. Keep rejecting it.
-    const background = TOOL_DEFINITIONS.bash.schema.safeParse({
-      script: "bun run dev",
-      run_in_background: true,
-      display_name: "Dev Server",
-    });
-    expect(background.success).toBe(false);
   });
 
   it("validates heartbeat tool configuration bounds", () => {
