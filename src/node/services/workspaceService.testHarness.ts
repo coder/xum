@@ -3,7 +3,15 @@ import { expect, mock } from "bun:test";
 import { Err, Ok } from "@/common/types/result";
 import { ContextManagementService } from "./contextManagement/contextManagementService";
 import { WorkspaceService } from "./workspaceService";
-import { createStreamLifecycleMocks } from "./agentSession.testHarness";
+import {
+  createAgentSessionAIServiceFake,
+  createStreamLifecycleMocks,
+} from "./agentSession.testHarness";
+import type { AgentSession, AgentSessionAIService } from "./agentSession";
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
+import { defaultEffectRunner } from "./di/effectRunner";
+import { Exit, Scope } from "effect";
+import type { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import { tmpdir } from "os";
 import path from "path";
@@ -252,6 +260,86 @@ export async function createWorkspaceServiceHarness(
     rootDir: tempDir,
     cleanup: disposeHarness,
     [Symbol.asyncDispose]: disposeHarness,
+  };
+}
+
+export type RealHostWorkspaceServiceOptions = Omit<
+  WorkspaceServiceForTestOptions,
+  "aiService" | "historyService" | "appFiberScope"
+> & {
+  /** The suite's real store: TaskService stacks built on the same root share it. */
+  historyService: HistoryService;
+  /** Event source of the AI fake; tests emit stream events on it. */
+  aiEmitter?: EventEmitter;
+  /** Members layered over the AI fake (getWorkspaceMetadata defaults to the real Config). */
+  aiServiceOverrides?: Partial<AgentSessionAIService>;
+};
+
+export interface RealHostWorkspaceService extends AsyncDisposable {
+  service: WorkspaceService;
+  /** One AI fake for the service and every session, as the shared AIService is in production. */
+  aiService: AIService;
+  aiEmitter: EventEmitter;
+  /**
+   * The workspace's real session, created by `getOrCreateSession`: it carries the callbacks
+   * `createSession` installs (turn settlement events, stop latch, report acknowledgement).
+   */
+  session: (workspaceId: string) => AgentSession;
+  /** Chat events the service relayed from the workspace's session, in order. */
+  chatEvents: (workspaceId: string) => WorkspaceChatMessage[];
+  /**
+   * Closes the app fiber scope, which runs the service's production shutdown join: every
+   * session's shutdown and the tracked workspace cleanup. Idempotent.
+   */
+  dispose: () => Promise<void>;
+}
+
+/**
+ * Real-host WorkspaceService for tests that drive turns through a real AgentSession: only the
+ * AI stream is a fake. Sessions come from the service itself (never a write to its private
+ * session map), so they are wired exactly as in production.
+ */
+export function createRealHostWorkspaceService(
+  options: RealHostWorkspaceServiceOptions
+): RealHostWorkspaceService {
+  const { aiEmitter: emitter, aiServiceOverrides, ...serviceOptions } = options;
+  const config = options.config;
+  const aiFake = createAgentSessionAIServiceFake({
+    emitter,
+    overrides: {
+      getWorkspaceMetadata: mock(async (workspaceId: string) => {
+        const metadata = await config.getWorkspaceMetadataById(workspaceId);
+        return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${workspaceId}`);
+      }),
+      ...aiServiceOverrides,
+    },
+  });
+  // WorkspaceService reads members of the full AIService the session-facing fake also
+  // implements (events, stream lifecycle, metadata, providers, experiments).
+  const aiService = aiFake as unknown as AIService;
+  const appFiberScope = Scope.makeUnsafe("parallel");
+  const service = createWorkspaceServiceForTest({ ...serviceOptions, aiService, appFiberScope });
+  const events = new Map<string, WorkspaceChatMessage[]>();
+  service.on("chat", (event: { workspaceId: string; message: WorkspaceChatMessage }) => {
+    const list = events.get(event.workspaceId) ?? [];
+    list.push(event.message);
+    events.set(event.workspaceId, list);
+  });
+  let closing: Promise<void> | undefined;
+  const dispose = () => {
+    closing ??= (options.effectRunner ?? defaultEffectRunner).runPromise(
+      Scope.close(appFiberScope, Exit.void)
+    );
+    return closing;
+  };
+  return {
+    service,
+    aiService,
+    aiEmitter: aiFake,
+    session: (workspaceId) => service.getOrCreateSession(workspaceId),
+    chatEvents: (workspaceId) => events.get(workspaceId) ?? [],
+    dispose,
+    [Symbol.asyncDispose]: dispose,
   };
 }
 

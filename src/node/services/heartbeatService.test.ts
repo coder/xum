@@ -23,16 +23,11 @@ import { askUserQuestionManager } from "./askUserQuestionManager";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
 import { advanceAnchoredDeadline, HeartbeatService } from "./heartbeatService";
 import { IdleDispatcher } from "./idleDispatcher";
-import { InitStateManager } from "./initStateManager";
 import type { TaskService } from "./taskService";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { WorkspaceService } from "./workspaceService";
+import type { WorkspaceService } from "./workspaceService";
 import { createTestHistoryService } from "./testHistoryService";
-import {
-  createMockAIService,
-  createTestBackgroundProcessManager,
-} from "./workspaceService.testHarness";
+import { createWorkspaceServiceForTest } from "./workspaceService.testHarness";
 
 async function waitForCondition(
   condition: () => boolean,
@@ -233,16 +228,11 @@ describe("HeartbeatService", () => {
   ): WorkspaceService {
     // Shares the suite's real Config/HistoryService; chat history still flows through the
     // getChatHistory override where a test drives it.
-    const aiService = createMockAIService();
-    const realWorkspaceService = new WorkspaceService(
+    const realWorkspaceService = createWorkspaceServiceForTest({
       config,
       historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      new InitStateManager(config),
       extensionMetadata,
-      createTestBackgroundProcessManager()
-    );
+    });
     Object.assign(realWorkspaceService, overrides);
     return realWorkspaceService;
   }
