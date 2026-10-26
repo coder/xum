@@ -84,6 +84,29 @@ export type OverridesPublisher = (
  * must drop all cached snapshots rather than keep serving revoked enablement.
  */
 export const ALL_WORKSPACES_TARGET = "*";
+
+/** Options of the batch plugin-key sweep (prunePluginOverrideKeysForWorkspaces). */
+export interface PluginSweepOptions {
+  /** Same contract as prunePluginOverrideKeys's publish. */
+  publish?: OverridesPublisher;
+  /**
+   * False when the receiver holds no cached state for the workspace (its next
+   * serve reads disk). The sweep then skips publication for a workspace whose
+   * own override files it did not rewrite: thousands of such publications
+   * made installs on large configs (6,302 workspaces) exhaust the sweep's
+   * budget and fail. Omitted (or true) keeps the full publication.
+   */
+  hasSnapshot?: (workspaceId: string) => boolean;
+}
+
+/** One workspace a plugin-key sweep pruned, as its publication phase needs it. */
+interface SweptWorkspace {
+  metadata: FrontendWorkspaceMetadata;
+  /** Candidate override paths of the first entry (canonical first). */
+  filePaths: readonly string[];
+  /** True if this sweep rewrote a file of ANY entry carrying the ID. */
+  ownFileRewritten: boolean;
+}
 /**
  * Revision reported to the settings UI when the current state could not be
  * established (see getWorkspaceMcpOverrides). A save carrying it back is the
@@ -4401,10 +4424,7 @@ export class WorkspaceMcpOverridesService {
   async prunePluginOverrideKeysForWorkspaces(
     workspaceIds: readonly string[],
     keyPrefix: string,
-    options?: {
-      /** Same contract as prunePluginOverrideKeys's publish. */
-      publish?: OverridesPublisher;
-    }
+    options?: PluginSweepOptions
   ): Promise<Array<{ workspaceId: string; error: unknown }>> {
     assert(keyPrefix.length > 0, "prunePluginOverrideKeys: keyPrefix must be non-empty");
 
@@ -4455,7 +4475,7 @@ export class WorkspaceMcpOverridesService {
   private async sweepPluginOverrideKeys(
     workspaceIds: readonly string[],
     keyPrefix: string,
-    options: { publish?: OverridesPublisher } | undefined,
+    options: PluginSweepOptions | undefined,
     budget: PublicationBudget,
     snapshot: ConfigSnapshot
   ): Promise<Array<{ workspaceId: string; error: unknown }>> {
@@ -4483,10 +4503,7 @@ export class WorkspaceMcpOverridesService {
       /* hostLocalOnly */ true
     );
     const failures: Array<{ workspaceId: string; error: unknown }> = [];
-    const swept = new Map<
-      string,
-      { metadata: FrontendWorkspaceMetadata; filePaths: readonly string[] }
-    >();
+    const swept = new Map<string, SweptWorkspace>();
     let anyOwesEpoch = false;
     for (const workspaceId of workspaceIds) {
       try {
@@ -4495,6 +4512,7 @@ export class WorkspaceMcpOverridesService {
           throw new Error(`Host-local workspace metadata not found for ${workspaceId.trim()}`);
         }
         const pruned: Array<readonly string[]> = [];
+        let ownFileRewritten = false;
         for (const metadata of entries) {
           // Bounded by the remaining sweep budget: local stat/read/write
           // on a disconnected mount can block indefinitely. A timeout is
@@ -4513,9 +4531,10 @@ export class WorkspaceMcpOverridesService {
           );
           pruned.push(result.filePaths);
           anyOwesEpoch ||= result.owesEpoch;
+          ownFileRewritten ||= result.rewrote;
         }
         // Publication reads the first entry, matching getWorkspaceMetadata's lookup.
-        swept.set(workspaceId, { metadata: entries[0], filePaths: pruned[0] });
+        swept.set(workspaceId, { metadata: entries[0], filePaths: pruned[0], ownFileRewritten });
       } catch (error) {
         failures.push({ workspaceId, error });
       }
@@ -4586,38 +4605,71 @@ export class WorkspaceMcpOverridesService {
     }
 
     if (options?.publish) {
-      // Publish AFTER every prune landed: an inheriting descendant swept
-      // before its parent would otherwise publish the parent's pre-prune
-      // state. Strict re-read: the prune above already threw on anything
-      // unreadable, so a failure here is a real regression and must keep the
-      // caller's retry tombstone rather than publish a guess. One `published`
-      // set for the whole batch: a swept descendant already re-published by
-      // its ancestor's fan-out still gets its own strict verification and
-      // authoritative publication here, but its subtree is not walked again.
-      const published = new Set<string>();
-      // The sweep's single budget continues here: each fan-out would
-      // otherwise reset its own 30 s while the locks stay held.
-      for (const [workspaceId, { metadata, filePaths }] of swept) {
-        try {
-          await this.publishEffectiveOverrides(
-            workspaceId,
-            (
-              await withDeadline(
-                this.resolveOverridesFor(metadata, "strict", after),
-                budget.remaining(),
-                "override resolution exceeded the plugin-prune budget",
-                () => after.cancel()
-              )
-            ).overrides,
-            options.publish,
-            filePaths[0],
-            after,
-            published,
-            budget
-          );
-        } catch (error) {
-          failures.push({ workspaceId, error });
-        }
+      failures.push(
+        ...(await this.publishSweptWorkspaces(
+          swept,
+          options.publish,
+          options.hasSnapshot,
+          after,
+          budget
+        ))
+      );
+    }
+    return failures;
+  }
+
+  /**
+   * Publication phase of sweepPluginOverrideKeys: re-publish each swept
+   * workspace's effective overrides, in sweep order, under the sweep's budget.
+   * Returns the workspaces whose publication failed (the caller keeps their
+   * tombstones).
+   */
+  private async publishSweptWorkspaces(
+    swept: ReadonlyMap<string, SweptWorkspace>,
+    publish: OverridesPublisher,
+    hasSnapshot: PluginSweepOptions["hasSnapshot"],
+    after: ConfigSnapshot,
+    budget: PublicationBudget
+  ): Promise<Array<{ workspaceId: string; error: unknown }>> {
+    const failures: Array<{ workspaceId: string; error: unknown }> = [];
+    // Publish AFTER every prune landed: an inheriting descendant swept
+    // before its parent would otherwise publish the parent's pre-prune
+    // state. Strict re-read: the prune above already threw on anything
+    // unreadable, so a failure here is a real regression and must keep the
+    // caller's retry tombstone rather than publish a guess. One `published`
+    // set for the whole batch: a swept descendant already re-published by
+    // its ancestor's fan-out still gets its own strict verification and
+    // authoritative publication here, but its subtree is not walked again.
+    const published = new Set<string>();
+    // The sweep's single budget continues here: each fan-out would
+    // otherwise reset its own 30 s while the locks stay held.
+    for (const [workspaceId, { metadata, filePaths, ownFileRewritten }] of swept) {
+      // This workspace's own files did not change and the receiver holds
+      // nothing to repair for it: its first serve reads disk. (A stale
+      // snapshot of an off-host descendant can survive the skip, but
+      // off-host runtimes never start plugin servers.)
+      if (!ownFileRewritten && hasSnapshot?.(workspaceId) === false) {
+        continue;
+      }
+      try {
+        await this.publishEffectiveOverrides(
+          workspaceId,
+          (
+            await withDeadline(
+              this.resolveOverridesFor(metadata, "strict", after),
+              budget.remaining(),
+              "override resolution exceeded the plugin-prune budget",
+              () => after.cancel()
+            )
+          ).overrides,
+          publish,
+          filePaths[0],
+          after,
+          published,
+          budget
+        );
+      } catch (error) {
+        failures.push({ workspaceId, error });
       }
     }
     return failures;
