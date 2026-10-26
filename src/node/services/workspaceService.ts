@@ -468,6 +468,7 @@ import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates
 import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
 import { WorkspaceNaming } from "@/node/services/workspaceNaming";
 import { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
+import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
@@ -571,8 +572,6 @@ const ORPHAN_SESSION_DIR_GRACE_MS = 24 * 60 * 60 * 1000;
 // Upper bound on startup .code-workspace reconciliation (see initialize()).
 const STARTUP_CODE_WORKSPACE_SYNC_TIMEOUT_MS = 10_000;
 const STARTUP_STAGED_ATTACHMENT_RECOVERY_TIMEOUT_MS = 10_000;
-// Removal's join of MCP prompt discoveries it aborted (#4805); see abortAndJoinMcpPromptDiscoveries.
-const MCP_PROMPT_DISCOVERY_JOIN_TIMEOUT_MS = 10_000;
 
 /**
  * Cap on transient startup-recovery AgentSessions alive at once (see initialize()). Each
@@ -2949,39 +2948,6 @@ export class WorkspaceService
       },
     };
   }
-  // In-flight renderer executeBash requests per workspace. Incremented in the same
-  // synchronous block as executeBash's archivingWorkspaces check (mirroring
-  // preflightSendCounts) so archive admission and bash execution always observe each other:
-  // an exec admitted first holds the archive gate open for its full duration, and an exec
-  // entering after the gate armed is refused at entry.
-  private readonly preflightExecCounts = new Map<string, number>();
-  // Same pairing for renderer attachment staging (writes into the checkout an archive may
-  // capture/remove) and file-completion refreshes (run git through a runtime that could
-  // re-wake a stopped Coder workspace). See acquirePreflightAdmission.
-  private readonly preflightStagingCounts = new Map<string, number>();
-  private readonly preflightFileCompletionCounts = new Map<string, number>();
-  // Same pairing for renderer MCP prompt discovery (workspace.mcp.prompts.list): it readies the
-  // runtime (which can re-wake a stopped Coder workspace) and starts cached stdio servers inside
-  // the checkout. See acquireMcpPromptDiscoveryAdmission. Each admitted discovery carries an
-  // abort controller and a settlement so a removal can stop and join it (#4805).
-  private readonly mcpPromptDiscoveries = new Map<
-    string,
-    Set<{ controller: AbortController; settled: Promise<void>; settle: () => void }>
-  >();
-  /**
-   * In-flight forks counted per SOURCE workspace. A fork clones the source checkout and (for
-   * SSH/Coder runtimes) shares its remote workspace, so a model-driven archive admitted
-   * mid-fork could stop or snapshot the environment under the clone. Pairs with the archive
-   * gates like the other preflight counters: a fork admitted first is visible to the sink
-   * and the pre-interruption hold; one entering later observes archivingWorkspaces.
-   */
-  private readonly preflightForkCounts = new Map<string, number>();
-  /**
-   * Held refine turn exclusions (acquireIdleTurnExclusion), per workspace. A /refine apply
-   * writes approved skills into the checkout under it (#4965), so the archive gates count it
-   * like the other preflight counters.
-   */
-  private readonly refineExclusionCounts = new Map<string, number>();
 
   // Monotonic per-workspace stream generations prevent delayed stop-side metadata writes
   // from older streams from clobbering a newer streaming=true snapshot after async awaits.
@@ -3110,7 +3076,11 @@ export class WorkspaceService
     // WorkspaceLive passes the WorkspaceNamingTag service.
     private readonly naming: WorkspaceNaming = new WorkspaceNaming(),
     // WorkspaceLive passes the WorkspaceWorkflowRunsTag service.
-    private readonly workflowRuns: WorkspaceWorkflowRuns = new WorkspaceWorkflowRuns({ config })
+    private readonly workflowRuns: WorkspaceWorkflowRuns = new WorkspaceWorkflowRuns({ config }),
+    // WorkspaceLive passes the WorkspaceOperationAdmissionTag service, built on the same gates.
+    private readonly operationAdmission: WorkspaceOperationAdmission = new WorkspaceOperationAdmission(
+      { config, gates: lifecycleGates }
+    )
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -4462,7 +4432,7 @@ export class WorkspaceService
       hold[Symbol.dispose]();
       return Err("a send is being admitted");
     }
-    const counted = this.acquirePreflightAdmission(this.refineExclusionCounts, workspaceId);
+    const counted = this.operationAdmission.refine.acquire(workspaceId);
     return Ok({
       [Symbol.dispose]: () => {
         counted[Symbol.dispose]();
@@ -5303,8 +5273,8 @@ export class WorkspaceService
           ...this.removingWorkspaces,
           ...this.archivingWorkspaces,
           ...this.contextMutationWorkspaces,
-          ...this.preflightForkCounts.keys(),
-          ...this.preflightStagingCounts.keys(),
+          ...this.operationAdmission.fork.workspaceIds(),
+          ...this.operationAdmission.staging.workspaceIds(),
         ]).size,
       },
       { kind: "queued-messages", count: queuedMessages },
@@ -5316,7 +5286,7 @@ export class WorkspaceService
       { kind: "auto-retries", count: autoRetries },
       {
         kind: "background-processes",
-        count: Array.from(this.preflightExecCounts.values()).reduce((sum, count) => sum + count, 0),
+        count: this.operationAdmission.exec.total(),
       },
     ];
     return blockers.filter((blocker) => blocker.count > 0);
@@ -7787,7 +7757,7 @@ export class WorkspaceService
       // Same point for MCP prompt discoveries: new ones are refused since removingWorkspaces
       // was set, so joining the admitted ones leaves none that could publish servers after
       // the stopServers calls below (#4805).
-      await this.abortAndJoinMcpPromptDiscoveries(workspaceId);
+      await this.operationAdmission.abortAndJoinMcpPromptDiscoveries(workspaceId);
       // r65: keep renewing the removal tombstone's mtime until this removal
       // settles so a foreign backend's startup self-heal cannot mistake a
       // merely SLOW removal (a hung runtime deletion or MCP server close) for
@@ -11614,32 +11584,6 @@ export class WorkspaceService
   }
 
   /**
-   * Labels for the counted in-flight operations (bash exec, attachment staging, file
-   * completion, fork, MCP prompt discovery, refine) that archive and interrupt gates
-   * refuse on, in a fixed order so both gates report them alike.
-   */
-  private inFlightOperationLabels(workspaceId: string): string[] {
-    const counts: Array<[count: number, label: string]> = [
-      [this.preflightExecCounts.get(workspaceId) ?? 0, "a bash command executing"],
-      [this.preflightStagingCounts.get(workspaceId) ?? 0, "an attachment transfer in progress"],
-      [
-        this.preflightFileCompletionCounts.get(workspaceId) ?? 0,
-        "a file completion refresh in progress",
-      ],
-      [this.preflightForkCounts.get(workspaceId) ?? 0, "a fork of this workspace in progress"],
-      [
-        this.mcpPromptDiscoveries.get(workspaceId)?.size ?? 0,
-        "an MCP prompt discovery in progress",
-      ],
-      [
-        this.refineExclusionCounts.get(workspaceId) ?? 0,
-        "a refine apply or publication in progress",
-      ],
-    ];
-    return counts.filter(([count]) => count > 0).map(([, label]) => label);
-  }
-
-  /**
    * Arm the archive admission gate BEFORE a destructive pre-archive step (interrupt_active
    * turn interruption) and validate that no live user activity is already in flight. The
    * sink's refuseLiveUserActivity gate runs only inside archiveUnlocked — after the caller
@@ -11725,7 +11669,7 @@ export class WorkspaceService
         activityLabels.push("an active stream not attributable to the delegated turns");
       }
     }
-    activityLabels.push(...this.inFlightOperationLabels(workspaceId));
+    activityLabels.push(...this.operationAdmission.inFlightOperationLabels(workspaceId));
     // In-flight native-terminal/editor opens passed their own archive guards before this
     // hold armed and surface only through the pending-open counters until their durable
     // markers persist; the sink's untrackable-app check would refuse on them after the
@@ -12166,7 +12110,7 @@ export class WorkspaceService
         if ((this.preflightSendCounts.get(workspaceId) ?? 0) > 0) {
           activityLabels.push("a message send in progress");
         }
-        activityLabels.push(...this.inFlightOperationLabels(workspaceId));
+        activityLabels.push(...this.operationAdmission.inFlightOperationLabels(workspaceId));
         if (liveActivity.queuedMessages) activityLabels.push("queued messages");
         if (liveActivity.backgroundBashProcesses) {
           activityLabels.push("running background bash processes");
@@ -13784,17 +13728,14 @@ export class WorkspaceService
   ): Promise<Result<{ metadata: FrontendWorkspaceMetadata; projectPath: string }>> {
     // Source-fork admission pairs with the model-facing archive gates (same synchronous
     // block as the entry guards in sendMessage/executeBash): a fork admitted first is
-    // visible to the sink and the pre-interruption hold via preflightForkCounts and refuses
+    // visible to the sink and the pre-interruption hold via operationAdmission.fork and refuses
     // the archive; a fork entering later observes archivingWorkspaces and refuses here.
     // Without this pairing, a Coder-stop archive could stop the dedicated remote workspace
     // mid-clone while the fork shares it, and the child's init could restart it afterwards.
     if (this.archivingWorkspaces.has(sourceWorkspaceId)) {
       return Err(`Workspace is being archived: ${sourceWorkspaceId}. Unarchive it before forking.`);
     }
-    using _preflightFork = this.acquirePreflightAdmission(
-      this.preflightForkCounts,
-      sourceWorkspaceId
-    );
+    using _preflightFork = this.operationAdmission.fork.acquire(sourceWorkspaceId);
     // Set once the fork's ID exists; the finally below finalizes its pending default (#4455).
     let forkWorkspaceId: string | undefined;
     // Set while a failure must undo this fork's registration (#4818).
@@ -15252,27 +15193,6 @@ export class WorkspaceService
   }
 
   /**
-   * Increment a preflight admission counter in the caller's synchronous entry block and
-   * return a disposable releasing it. Pairs renderer-initiated workspace activity with the
-   * archive gate (see archiveUnlocked's refuseLiveUserActivity): an activity admitted first
-   * holds the gate open until it settles, and one entering after the gate armed observes
-   * archivingWorkspaces and refuses at entry.
-   */
-  private acquirePreflightAdmission(counts: Map<string, number>, workspaceId: string): Disposable {
-    counts.set(workspaceId, (counts.get(workspaceId) ?? 0) + 1);
-    return {
-      [Symbol.dispose]: () => {
-        const remaining = (counts.get(workspaceId) ?? 1) - 1;
-        if (remaining <= 0) {
-          counts.delete(workspaceId);
-        } else {
-          counts.set(workspaceId, remaining);
-        }
-      },
-    };
-  }
-
-  /**
    * Archive admission pairing for MCP prompt discovery (workspace.mcp.prompts.list), which
    * readies the runtime and starts cached stdio servers outside any stream. The guard check and
    * the counter increment run in one synchronous block, mirroring executeBash: a discovery
@@ -15285,58 +15205,7 @@ export class WorkspaceService
   acquireMcpPromptDiscoveryAdmission(
     workspaceId: string
   ): (Disposable & { signal: AbortSignal }) | undefined {
-    if (this.archivingWorkspaces.has(workspaceId) || this.removingWorkspaces.has(workspaceId)) {
-      return undefined;
-    }
-    const workspaceEntry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-    if (
-      workspaceEntry != null &&
-      isWorkspaceArchived(
-        workspaceEntry.workspace.archivedAt,
-        workspaceEntry.workspace.unarchivedAt
-      )
-    ) {
-      return undefined;
-    }
-    const { promise: settled, resolve: settle } = Promise.withResolvers<void>();
-    const discovery = { controller: new AbortController(), settled, settle };
-    let admitted = this.mcpPromptDiscoveries.get(workspaceId);
-    if (admitted === undefined) {
-      admitted = new Set();
-      this.mcpPromptDiscoveries.set(workspaceId, admitted);
-    }
-    admitted.add(discovery);
-    return {
-      signal: discovery.controller.signal,
-      [Symbol.dispose]: () => {
-        const current = this.mcpPromptDiscoveries.get(workspaceId);
-        current?.delete(discovery);
-        if (current?.size === 0) this.mcpPromptDiscoveries.delete(workspaceId);
-        discovery.settle();
-      },
-    };
-  }
-
-  /**
-   * #4805: a discovery admitted before a removal started can still publish stdio servers into
-   * the checkout. Abort each one and wait for it to settle, so anything it published exists
-   * before removal's stopServers runs. Bounded like the stream stop: a discovery that ignores
-   * its abort must not pin the removal, so the removal logs and proceeds.
-   */
-  private async abortAndJoinMcpPromptDiscoveries(workspaceId: string): Promise<void> {
-    const admitted = [...(this.mcpPromptDiscoveries.get(workspaceId) ?? [])];
-    if (admitted.length === 0) return;
-    for (const discovery of admitted) discovery.controller.abort();
-    const joined = await raceWithAbortAndTimeout(
-      Promise.all(admitted.map((discovery) => discovery.settled)),
-      { timeoutMs: MCP_PROMPT_DISCOVERY_JOIN_TIMEOUT_MS }
-    );
-    if (joined.kind !== "ok") {
-      log.warn("Workspace removal: an admitted MCP prompt discovery did not settle after abort", {
-        workspaceId,
-        pending: admitted.length,
-      });
-    }
+    return this.operationAdmission.acquireMcpPromptDiscoveryAdmission(workspaceId);
   }
 
   /**
@@ -15624,10 +15493,7 @@ export class WorkspaceService
     if (this.removingWorkspaces.has(input.workspaceId)) {
       return Err("Workspace is being removed.");
     }
-    using _preflightStaging = this.acquirePreflightAdmission(
-      this.preflightStagingCounts,
-      input.workspaceId
-    );
+    using _preflightStaging = this.operationAdmission.staging.acquire(input.workspaceId);
 
     const metadata = await this.getInfo(input.workspaceId);
     if (metadata == null) {
@@ -15672,10 +15538,7 @@ export class WorkspaceService
     if (this.archivingWorkspaces.has(input.workspaceId)) {
       return Err("Workspace is being archived. Unarchive it before downloading attachments.");
     }
-    using _preflightDownload = this.acquirePreflightAdmission(
-      this.preflightStagingCounts,
-      input.workspaceId
-    );
+    using _preflightDownload = this.operationAdmission.staging.acquire(input.workspaceId);
 
     const metadata = await this.getInfo(input.workspaceId);
     if (metadata == null) {
@@ -20421,10 +20284,7 @@ export class WorkspaceService
     if (this.archivingWorkspaces.has(workspaceId)) {
       return { paths: [] };
     }
-    using _preflightCompletions = this.acquirePreflightAdmission(
-      this.preflightFileCompletionCounts,
-      workspaceId
-    );
+    using _preflightCompletions = this.operationAdmission.fileCompletion.acquire(workspaceId);
 
     const metadata = await this.getInfo(workspaceId);
     if (!metadata) {
@@ -20450,10 +20310,7 @@ export class WorkspaceService
       // The refresh can outlive this call, so it holds its own admission: acquired here
       // while the outer admission is still held (no unguarded gap) and released when the
       // refresh settles, keeping the archive gate closed for the runtime work's duration.
-      const refreshAdmission = this.acquirePreflightAdmission(
-        this.preflightFileCompletionCounts,
-        workspaceId
-      );
+      const refreshAdmission = this.operationAdmission.fileCompletion.acquire(workspaceId);
       cacheEntry.refreshing = (async () => {
         const previousIndex = cacheEntry.index;
 
@@ -20530,17 +20387,7 @@ export class WorkspaceService
     // against it — on Coder even waking the workspace the archive hook just stopped. Held
     // until the command settles; an archive arming later observes the count, and an exec
     // entering after the gate armed is refused above.
-    this.preflightExecCounts.set(workspaceId, (this.preflightExecCounts.get(workspaceId) ?? 0) + 1);
-    using _preflightExec = {
-      [Symbol.dispose]: () => {
-        const remaining = (this.preflightExecCounts.get(workspaceId) ?? 1) - 1;
-        if (remaining <= 0) {
-          this.preflightExecCounts.delete(workspaceId);
-        } else {
-          this.preflightExecCounts.set(workspaceId, remaining);
-        }
-      },
-    };
+    using _preflightExec = this.operationAdmission.exec.acquire(workspaceId);
     // #4857: one "exec" use lease per call, until the command settles, so another backend
     // sharing this Xum root refuses to rename or remove the checkout under it. Taken before the
     // metadata read, so a mutation that finished first is seen by the reads below. While another
