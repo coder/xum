@@ -48,15 +48,15 @@
       },
       {
         "role": "assistant",
-        "id": "id1",
+        "id": "id2",
         "historySequence": 2,
         "partial": false,
         "error": false,
-        "parts": []
+        "parts": ["text"]
       }
     ],
     "partial": null,
     "locks": ["workspace-use/<h64>/<lease0>.turn.lock"]
   },
-  "retryTextLength": 17376
+  "retryTextLength": 17618
 }
