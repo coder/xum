@@ -3942,8 +3942,9 @@ describe("WorkspaceMcpOverridesService", () => {
     );
 
     const publishedIds: string[] = [];
+    // The grandchild is NOT swept directly: only the fan-out can reach it.
     const failures = await service.prunePluginOverrideKeysForWorkspaces(
-      [parent.workspaceId, coldChild.workspaceId, cachedGrandchild.workspaceId],
+      [parent.workspaceId, coldChild.workspaceId],
       "plugin:0123456789abcdef:",
       {
         publish: (_persisted, workspaceId) => {
