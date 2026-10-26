@@ -223,22 +223,26 @@ ${lines.join("\n")}
  * Build MCP servers context XML block.
  * Only included when at least one MCP server is configured.
  * Note: We only expose server names, not commands, to avoid leaking secrets.
+ *
+ * A volatile system section (turnRequestBuilder appends it before the MCP warning): turning
+ * one server off rewrote the cached stable prompt and the whole history after it, in every
+ * busy workspace at once. Its "\n\n" separator goes first, like the other volatile sections.
  */
-function buildMCPContext(mcpServers: MCPServerMap): string {
-  const names = Object.keys(mcpServers);
-  if (names.length === 0) return "";
+export function formatMcpContextSection(mcpServers: MCPServerMap | undefined): string | undefined {
+  const names = Object.keys(mcpServers ?? {});
+  if (names.length === 0) return undefined;
 
   const serverList = names.map((name) => `- ${name}`).join("\n");
 
   return `
+
 <mcp>
 MCP (Model Context Protocol) servers provide additional tools. Configured globally in ~/.xum/mcp.jsonc, with optional repo overrides in ./.xum/mcp.jsonc:
 
 ${serverList}
 
 Manage servers in Settings → MCP.
-</mcp>
-`;
+</mcp>`;
 }
 // #endregion SYSTEM_PROMPT_DOCS
 
@@ -755,7 +759,6 @@ function buildInstructionBlocks(
  * @param workspacePath - Workspace directory path
  * @param additionalSystemInstructions - Optional instructions appended last
  * @param modelString - Active model identifier used for Model-specific sections
- * @param mcpServers - Optional MCP server configuration (name -> command)
  * @returns The system message and its instruction-file span (BuiltSystemMessage)
  * @throws Error if metadata or workspacePath invalid
  */
@@ -765,7 +768,6 @@ export function buildSystemMessageFromSources(
   workspacePath: string,
   additionalSystemInstructions?: string,
   modelString?: string,
-  mcpServers?: MCPServerMap,
   options?: BuildSystemMessageFromSourcesOptions
 ): BuiltSystemMessage {
   if (!metadata) throw new Error("Invalid workspace metadata: metadata is required");
@@ -788,11 +790,6 @@ export function buildSystemMessageFromSources(
   }
 
   systemMessage += buildAgentInterfaceContext(options);
-
-  // Add MCP context if servers are configured
-  if (mcpServers && Object.keys(mcpServers).length > 0) {
-    systemMessage += buildMCPContext(mcpServers);
-  }
 
   // NOTE: Agent skills and available sub-agents are now injected into their respective
   // tool descriptions (agent_skill_read, task) for better model attention per Anthropic

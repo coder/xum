@@ -1059,7 +1059,6 @@ export interface BuildStreamSystemContextOptions {
   modelString: string;
   cfg: ProjectsConfig;
   providersConfig?: ProvidersConfigMap | null;
-  mcpServers: Parameters<typeof buildSystemMessageFromSources>[5];
   /** XUM_SCRATCH_DIR is exported for this turn (remote runtimes only promise it then). */
   scratchDirSet?: boolean;
   /** Agent interface view is on and XUM_SCRATCH_DIR is set: the prompt describes the page. */
@@ -1399,7 +1398,6 @@ export async function buildStreamSystemContext(
     modelString,
     cfg,
     providersConfig,
-    mcpServers,
     xumScope,
     loadDesktopCapability,
   } = opts;
@@ -1542,7 +1540,6 @@ export async function buildStreamSystemContext(
     workspacePath,
     mergedAdditionalInstructions,
     modelString,
-    mcpServers,
     // "Mode: <mode>" sections in Xum-dedicated instruction sources match the
     // effective mode (so "Mode: plan" also covers custom plan-like agents)
     // and the agent id (so per-agent sections work). The effective mode names
