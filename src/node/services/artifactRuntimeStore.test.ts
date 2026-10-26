@@ -327,9 +327,16 @@ describe("artifactRuntimeStore", () => {
           return super.exec(String.raw`printf 'XUMREAD1\000ok\000'; printf 3`, options);
         }
       }
-      await expect(
-        readArtifactBytesOnRuntime(new CutOffRuntime(tempDir), artifactsDir, "pic.png", CAP)
-      ).rejects.toThrow("Artifact read output is cut off");
+      const cutOff = await readArtifactBytesOnRuntime(
+        new CutOffRuntime(tempDir),
+        artifactsDir,
+        "pic.png",
+        CAP
+      ).then(
+        () => null,
+        (error: unknown) => error
+      );
+      expect(cutOff).toMatchObject({ message: "Artifact read output is cut off" });
     });
 
     test("refuses a FIFO without blocking", async () => {
