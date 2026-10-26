@@ -21,7 +21,7 @@ import {
   getSharedRepoPath,
   withSharedWorkspace,
 } from "../../ipc/sendMessageTestHelpers";
-import { generateBranchName, waitForInitComplete } from "../../ipc/helpers";
+import { generateBranchName } from "../../ipc/helpers";
 import { detectDefaultTrunkBranch } from "../../../src/node/git";
 
 import { renderApp } from "../renderReviewPanel";
@@ -162,11 +162,6 @@ describeIntegration("Workspace Archive (UI)", () => {
     });
 
     try {
-      // The quick archive button is hidden while the row shows setup activity, and
-      // setupWorkspaceView does not wait for setup (#7534). Inside the try, so a failed wait
-      // still removes both workspaces.
-      await waitForInitComplete(env, firstWorkspace.id, 30_000);
-
       // Navigate to the first workspace (make it active)
       await setupWorkspaceView(view, firstWorkspace, firstWorkspace.id);
 
@@ -230,10 +225,6 @@ describeIntegration("Workspace Archive (UI)", () => {
     await withSharedWorkspace("anthropic", async ({ env, workspaceId, metadata }) => {
       const projectPath = metadata.projectPath;
       const displayTitle = metadata.title ?? metadata.name;
-      // withSharedWorkspace waits for setup only 1.5 s, and the actions menu appears after setup
-      // ends (#7534).
-      await waitForInitComplete(env, workspaceId, 30_000);
-
       const cleanupDom = setupTestDom();
       const view = renderApp({
         apiClient: env.orpc,
@@ -365,11 +356,6 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
     });
 
     try {
-      // The row shows its actions menu only after workspace setup ends (a cancel button replaces
-      // it while isInitializing), and setupWorkspaceView does not wait for setup (#7534).
-      // Inside the try, so a failed wait still removes both workspaces.
-      await waitForInitComplete(env, secondWorkspace.id, 30_000);
-
       // Select the second workspace so its archive button is visible
       await setupWorkspaceView(view, secondWorkspace, secondWorkspace.id);
 
