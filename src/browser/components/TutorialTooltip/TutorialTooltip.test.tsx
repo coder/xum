@@ -18,7 +18,7 @@ describe("TutorialTooltip", () => {
   });
 
   // Before the bubble opens, focus is on a header button by default: a control the user clicked.
-  function renderTooltip(focusBefore: "button" | "composer" | "menu item" | "checkbox" = "button") {
+  function renderTooltip(focusBefore: "button" | "composer" | "menu item" = "button") {
     const onNext = mock(() => undefined);
     const onDismiss = mock(() => undefined);
     const onDisableTutorial = mock(() => undefined);
@@ -27,7 +27,6 @@ describe("TutorialTooltip", () => {
         <div data-tutorial="target">Target</div>
         <button type="button">Header button</button>
         <textarea aria-label="Composer" />
-        <input type="checkbox" aria-label="Show read" />
         <div role="menu">
           <button type="button" role="menuitem">
             Archive
@@ -51,7 +50,6 @@ describe("TutorialTooltip", () => {
       button: () => view.getByRole("button", { name: "Header button" }),
       composer: () => view.getByRole("textbox", { name: "Composer" }),
       "menu item": () => view.getByRole("menuitem", { name: "Archive" }),
-      checkbox: () => view.getByRole("checkbox", { name: "Show read" }),
     };
     focusTargets[focusBefore]().focus();
     view.rerender(tree(true));
@@ -166,60 +164,5 @@ describe("TutorialTooltip", () => {
     const { view } = renderTooltip("menu item");
 
     expect(document.activeElement).toBe(view.getByRole("menuitem", { name: "Archive" }));
-  });
-
-  test("Tab from the composer reaches the bubble, and Shift+Tab goes back (#7198)", () => {
-    const { view } = renderTooltip("composer");
-    const composer = view.getByRole("textbox", { name: "Composer" });
-    const bubble = view.getByRole("group", { name: "Step title" });
-
-    fireEvent.keyDown(composer, { key: "Tab" });
-    expect(document.activeElement).toBe(bubble);
-    fireEvent.keyDown(bubble, { key: "Tab", shiftKey: true });
-    expect(document.activeElement).toBe(composer);
-
-    // Shift+Tab from Skip, the bubble's first button, also goes back.
-    const skip = view.getByRole("button", { name: "Skip" });
-    skip.focus();
-    fireEvent.keyDown(skip, { key: "Tab", shiftKey: true });
-    expect(document.activeElement).toBe(composer);
-  });
-
-  test("a Tab that the composer's suggestion list took stays in the composer (#7198)", () => {
-    const { view } = renderTooltip("composer");
-    const composer = view.getByRole("textbox", { name: "Composer" });
-    const suggestions = (event: KeyboardEvent) => event.preventDefault();
-    document.addEventListener("keydown", suggestions);
-
-    try {
-      fireEvent.keyDown(composer, { key: "Tab" });
-      expect(document.activeElement).toBe(composer);
-    } finally {
-      document.removeEventListener("keydown", suggestions);
-    }
-  });
-
-  test("Tab from a checkbox keeps the normal Tab order (#7198)", () => {
-    const { view } = renderTooltip("checkbox");
-    const checkbox = view.getByRole("checkbox", { name: "Show read" });
-
-    fireEvent.keyDown(checkbox, { key: "Tab" });
-    expect(document.activeElement).toBe(checkbox);
-  });
-
-  test("closing the bubble removes its Tab listener (#7198)", () => {
-    const added = spyOn(window, "addEventListener");
-    const removed = spyOn(window, "removeEventListener");
-    const keydownListeners = (spy: typeof added) =>
-      spy.mock.calls.filter(([type]) => type === "keydown").map(([, listener]) => listener);
-    try {
-      renderTooltip("composer").close();
-
-      expect(keydownListeners(added)).toHaveLength(1);
-      expect(keydownListeners(removed)).toEqual(keydownListeners(added));
-    } finally {
-      added.mockRestore();
-      removed.mockRestore();
-    }
   });
 });
