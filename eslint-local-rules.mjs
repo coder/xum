@@ -1884,15 +1884,38 @@ const localPlugin = {
             ? (def.node.imported.name ?? def.node.imported.value)
             : identifier.name;
         };
-        // Whether `identifier` is bound to an import of `name`, aliased or not. A local helper
-        // that only shares the name (`function createClient()` in a router test) is not the
-        // API client's factory.
+        // The module that exports each name the rule follows, from the repo root.
+        const MODULE_OF = {
+          createClient: "src/common/orpc/client",
+          AppRouter: "src/node/orpc/router",
+          useAPI: "src/browser/contexts/API",
+        };
+        // Whether an import declaration loads the module that exports `name`: through the `@/`
+        // alias or a relative path. Another module's `createClient` (a database or HTTP client)
+        // only shares the name.
+        const importsModuleOf = (declaration, name) => {
+          const source = declaration.source.value;
+          const resolved = source.startsWith("@/")
+            ? `src/${source.slice(2)}`
+            : source.startsWith(".")
+              ? path.resolve(path.dirname(context.filename), source)
+              : source;
+          const normalized = resolved
+            .split(path.sep)
+            .join("/")
+            .replace(/\.tsx?$/, "");
+          return normalized === MODULE_OF[name] || normalized.endsWith(`/${MODULE_OF[name]}`);
+        };
+        // Whether `identifier` is bound to an import of `name` from its module, aliased or not.
+        // A local helper that only shares the name (`function createClient()` in a router test)
+        // is not the API client's factory.
         const isImportOf = (identifier, name) => {
           const def = definitionOf(identifier);
           return (
             def?.type === "ImportBinding" &&
             def.node.type === "ImportSpecifier" &&
-            (def.node.imported.name ?? def.node.imported.value) === name
+            (def.node.imported.name ?? def.node.imported.value) === name &&
+            importsModuleOf(def.parent, name)
           );
         };
         // `typeof useAPI` (an import of it) or `typeof APIModule.useAPI` (through a namespace
@@ -1913,7 +1936,11 @@ const localPlugin = {
             return false;
           }
           const def = definitionOf(expression.left);
-          return def?.type === "ImportBinding" && def.node.type === "ImportNamespaceSpecifier";
+          return (
+            def?.type === "ImportBinding" &&
+            def.node.type === "ImportNamespaceSpecifier" &&
+            importsModuleOf(def.parent, name)
+          );
         };
         // Whether a type spells APIClient, a part of it, or its test overrides type.
         const isApiClientType = (type, depth = 0) => {
