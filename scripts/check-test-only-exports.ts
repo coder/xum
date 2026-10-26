@@ -32,16 +32,7 @@ export const ALLOWLIST_PATH = "scripts/check-test-only-exports.allowlist.json";
  * The `pendingDeletion` keys (file#symbol). Another workstream owns each one; remove a key here
  * and in the JSON file when its export is gone. Never add a key here.
  */
-export const FROZEN_PENDING_DELETION: readonly string[] = [
-  "src/browser/features/Settings/Sections/GoalsSection.tsx#GoalsSection",
-  "src/browser/hooks/useModelsFromSettings.ts#getSuggestedModels",
-  "src/browser/utils/highlighting/highlightDiffChunk.ts#highlightDiffChunk",
-  "src/browser/utils/messages/StreamingTPSCalculator.ts#calculateTPS",
-  "src/browser/utils/messages/StreamingTPSCalculator.ts#calculateTokenCount",
-  "src/browser/utils/messages/StreamingTPSCalculator.ts#DeltaRecord",
-  "src/browser/utils/workflowRunMessages.ts#filterWorkflowDisplayOnlyMessages",
-  "src/browser/utils/workspaceStorage.ts#migrateWorkspaceStorage",
-];
+export const FROZEN_PENDING_DELETION: readonly string[] = [];
 
 /** What one file imports from one module specifier. `"*"` means every export (namespace use). */
 export interface ImportFact {
