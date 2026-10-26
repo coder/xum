@@ -1,6 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import type { HistoryEditPrecondition, SendMessageOptions } from "@/common/orpc/types";
-import type { MuxMessageMetadata } from "@/common/types/message";
 import { prepareMessagePayload } from "./prepareMessagePayload";
 
 const model = "anthropic:claude-sonnet-4";
@@ -96,54 +95,27 @@ describe("prepareMessagePayload", () => {
     expect(result.options.autoThinkingLevel).toBe(expected);
   });
 
-  it.each([
-    ["normal", undefined, ["demo"]],
-    [
-      "compaction-request",
-      {
-        type: "compaction-request",
-        rawCommand: "/compact",
-        parsed: {},
-      } satisfies MuxMessageMetadata,
-      undefined,
-    ],
-  ])("attaches skill refs to %s metadata only", (_name, baseMetadata, expectedSkills) => {
+  it("attaches skill refs to the message metadata", () => {
     const result = prepare({
-      baseMetadata,
       agentSkillRefs: [{ skillName: "demo", scope: "project", source: "inline" }],
     });
-    expect(result.options.muxMetadata?.agentSkillRefs?.map((ref) => ref.skillName)).toEqual(
-      expectedSkills
-    );
+    expect(result.options.muxMetadata?.agentSkillRefs?.map((ref) => ref.skillName)).toEqual([
+      "demo",
+    ]);
   });
 
-  it("applies compaction, context, and dispatch overrides", () => {
+  it("applies context and dispatch overrides", () => {
     const result = prepare({
-      compactionMessageText: "compact request",
-      appendStagedNotice: false,
-      compactionOptions: { model: "openai:gpt-5", additionalSystemInstructions: "compact" },
       additionalSystemContextHydrated: true,
       additionalSystemContext: { enabled: false, content: "ignored" },
       queueDispatchMode: "turn-end",
       goalInterventionPolicy: "pause",
     });
     expect([
-      result.message,
-      result.effectiveModel,
-      result.options.model,
-      result.options.additionalSystemInstructions,
       result.options.additionalSystemContext,
       result.options.queueDispatchMode,
       result.options.goalInterventionPolicy,
-    ]).toEqual([
-      "compact request",
-      "openai:gpt-5",
-      "openai:gpt-5",
-      "compact",
-      "",
-      "turn-end",
-      "pause",
-    ]);
+    ]).toEqual(["", "turn-end", "pause"]);
   });
 
   it("fences an edit with its precondition and never attaches one to a plain send", () => {

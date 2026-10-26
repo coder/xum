@@ -59,6 +59,7 @@ import type { MuxMessageMetadata } from "@/common/types/message";
 import type { PendingInitialUserMessage } from "@/browser/utils/messages/pendingInitialUserMessage";
 import type { ParsedCommand } from "@/browser/utils/slashCommands/types";
 import {
+  NO_INLINE_REFS,
   processSlashCommand,
   type CommandAction,
   type CommandResult,
@@ -794,6 +795,7 @@ export function useCreationWorkspace({
           await initialAiSettingsPersisted;
           const commandEnv: SlashCommandEnv = {
             api: liveApi,
+            inlineRefs: NO_INLINE_REFS,
             workspaceId: metadata.id,
             variant: "workspace",
             projectPath: metadata.projectPath,
