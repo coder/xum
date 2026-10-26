@@ -51,13 +51,13 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // notes such as "runs in tests only when isolation is enabled" stay quiet.
   /\b(?:overridable|overridden|settable|set|passed|injected|kept)\s+(?:for|by|in)\s+tests\s+only\b/i,
   // "Override for tests; production reads ...", "Overrides for tests only".
-  /\boverrides?\s+(?:only\s+)?for\s+tests\b/i,
+  /\boverrides?\s+(?:only\s+)?for\s+(?:unit\s+|integration\s+)?tests\b/i,
   // "Shorten the idle window in tests". Bare "in tests" is common prose ("a TestClock in tests",
   // "spied/overridden in tests", "a no-op in tests/CI"), so the claim must open its sentence with
   // a seam verb, and "tests/" or "tests-" (a list or a compound) does not count.
-  /(?:^|[.!?]\s)\s*(?:shorten|lengthen|override|replace|stub|inject|reset|force)s?\b[^.!?]{0,80}?\bin\s+tests\b(?![/-])/i,
+  /(?:^|[.!?]\s)\s*(?:shorten|lengthen|override|replace|stub|inject|reset|force)s?\b[^.!?]{0,80}?\bin\s+(?:unit\s+|integration\s+)?tests\b(?![/-])/i,
   // "Useful in tests for checking ...", "needed only in tests".
-  /\b(?:useful|needed|called|invoked)\s+(?:only\s+)?in\s+tests\b(?![/-])/i,
+  /\b(?:useful|needed|called|invoked)\s+(?:only\s+)?in\s+(?:unit\s+|integration\s+)?tests\b(?![/-])/i,
 ];
 
 /**
@@ -66,7 +66,7 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
  */
 const ANCHORED_PATTERN_PREFILTERS: readonly RegExp[] = [
   /\bno\s+(?:production|non-test)\s+(?:callers?|consumers?)\b/i,
-  /\bin\s+tests\b/i,
+  /\bin\s+(?:unit\s+|integration\s+)?tests\b/i,
 ];
 
 /**
@@ -266,27 +266,60 @@ export function typescriptProblem(tsModule: unknown): string | undefined {
   return "the typescript package is not installed (Bun loaded a stub without its parser); run `bun install --frozen-lockfile` first";
 }
 
+/** Declarations that put a name on a module, class, object or type surface. */
+function isSurfaceDeclaration(node: ts.Node): node is ts.NamedDeclaration {
+  return (
+    ts.isFunctionDeclaration(node) ||
+    ts.isMethodDeclaration(node) ||
+    ts.isMethodSignature(node) ||
+    ts.isPropertyDeclaration(node) ||
+    ts.isPropertySignature(node) ||
+    ts.isPropertyAssignment(node) ||
+    ts.isShorthandPropertyAssignment(node) ||
+    ts.isGetAccessorDeclaration(node) ||
+    ts.isSetAccessorDeclaration(node) ||
+    ts.isVariableDeclaration(node) ||
+    ts.isClassDeclaration(node) ||
+    ts.isInterfaceDeclaration(node) ||
+    ts.isTypeAliasDeclaration(node) ||
+    ts.isEnumMember(node) ||
+    ts.isExportSpecifier(node)
+  );
+}
+
+/** The static text of a declaration name: `a`, `#a`, `"a"` or `["a"]`. */
+function staticName(name: ts.Node | undefined): string | undefined {
+  if (name === undefined) return undefined;
+  if (ts.isIdentifier(name) || ts.isPrivateIdentifier(name) || ts.isStringLiteralLike(name)) {
+    return name.text;
+  }
+  if (ts.isComputedPropertyName(name) && ts.isStringLiteralLike(name.expression)) {
+    return name.expression.text;
+  }
+  return undefined;
+}
+
 /**
  * Finds declarations whose name ends in ForTests/ForTesting. The phrase is the name, so the
- * report says why the symbol matched.
+ * report says why the symbol matched. Call sites (`pool.resetForTests()`), imports and
+ * destructured bindings are uses, not declarations, so they do not count.
  */
 export function findTestHookNames(file: string, text: string): SeamComment[] {
   if (!/For(?:Tests|Testing)\b/.test(text)) return [];
   const sourceFile = parseSource(file, text);
   const found: SeamComment[] = [];
   const visit = (node: ts.Node) => {
-    if (ts.isIdentifier(node) && TEST_HOOK_NAME.test(node.text)) {
-      // Only the declaring identifier counts (`function aForTests`, `aForTests()` method,
-      // `const aForTests =`, `export { aForTests }`), not every call site.
-      const parent = node.parent as { name?: ts.Node } | undefined;
-      if (parent?.name === node) {
-        found.push({
-          file,
-          line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
-          symbol: symbolChain(node.parent),
-          phrase: node.text,
-        });
-      }
+    const name = isSurfaceDeclaration(node) ? staticName(node.name) : undefined;
+    if (name !== undefined && TEST_HOOK_NAME.test(name)) {
+      // A computed name (`["aForTests"]()`) is not part of the owner chain; append it.
+      const owner = symbolChain(node);
+      const named = owner === name || owner.endsWith(`.${name}`);
+      found.push({
+        file,
+        line: sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1,
+        symbol: named ? owner : owner === "(file)" ? name : `${owner}.${name}`,
+        phrase: name,
+      });
     }
     ts.forEachChild(node, visit);
   };

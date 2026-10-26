@@ -97,11 +97,18 @@ describe("runtimeScratchDir", () => {
         kind: "runtime",
         path: DOCKER_SCRATCH_DIR,
       });
-      expect(await spec({ type: "devcontainer", configPath: ".devcontainer.json" })).toEqual({
-        kind: "devcontainer-mount",
-        dir: hostDir,
-      });
     });
+
+    // Windows hosts never bind-mount the scratch dir (canBindMountHostPathsIntoContainers).
+    test.skipIf(process.platform === "win32")(
+      "bind-mounts the host scratch dir into devcontainers on a local daemon",
+      async () => {
+        expect(await spec({ type: "devcontainer", configPath: ".devcontainer.json" })).toEqual({
+          kind: "devcontainer-mount",
+          dir: getWorkspaceScratchDir(sessionsDir, "ws1"),
+        });
+      }
+    );
 
     test("has none for devcontainers without a local daemon and for remote multi-project", async () => {
       expect(
