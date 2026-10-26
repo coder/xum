@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import assert from "@/common/utils/assert";
 import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
@@ -224,9 +224,10 @@ export class MockAiStreamPlayer {
   /**
    * Each player (each backend) counts from 0, so its first reply would reuse the id of a row an
    * earlier backend wrote to the same history (#7204). The random tag keeps ids unique across
-   * restarts; fixtures that record ids normalize them, so replays stay deterministic.
+   * restarts (a full UUID: histories outlive many restarts); fixtures that record ids normalize
+   * them, so replays stay deterministic.
    */
-  private readonly mockMessageIdTag = randomBytes(4).toString("hex");
+  private readonly mockMessageIdTag = randomUUID();
 
   constructor(private readonly deps: MockPlayerDeps) {}
 
