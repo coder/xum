@@ -104,9 +104,9 @@ test("the allow entry is an exact count that can only go down", () => {
   const twoWaits = `await Bun.sleep(20);\nawait Bun.sleep(30);`;
   expect(messages(twoWaits, { [FILE]: 2 })).toHaveLength(0);
   // A new wait past the entry fails.
-  expect(messages(twoWaits, { [FILE]: 1 }).map((m) => m.message)).toEqual([
-    expect.stringContaining("fixed 30 ms"),
-  ]);
+  const overEntry = messages(twoWaits, { [FILE]: 1 });
+  expect(overEntry).toHaveLength(1);
+  expect(overEntry[0].message).toContain("fixed 30 ms");
   // A reasoned disable keeps a new wait out of the count, wherever it sits.
   const disable = `// eslint-disable-next-line local/no-fixed-sleep -- real disk write`;
   expect(messages(`${disable}\nawait Bun.sleep(50);\n${twoWaits}`, { [FILE]: 2 })).toHaveLength(0);
@@ -128,7 +128,7 @@ test("the allow entry is an exact count that can only go down", () => {
   // Without the comment, the same new wait fails.
   expect(messages(`await Bun.sleep(50);\n${twoWaits}`, { [FILE]: 2 })).toHaveLength(1);
   // A removed wait must lower the entry.
-  expect(messages(twoWaits, { [FILE]: 3 }).map((m) => m.message)).toEqual([
-    expect.stringContaining("Lower the entry"),
-  ]);
+  const underEntry = messages(twoWaits, { [FILE]: 3 });
+  expect(underEntry).toHaveLength(1);
+  expect(underEntry[0].message).toContain("Lower the entry");
 });
