@@ -46,32 +46,133 @@ function isBubbleCovered(bubble: HTMLElement): boolean {
 }
 
 /**
+ * Layers the user opened on purpose: a Radix popover, select or tooltip wrapper, a menu, a listbox
+ * or a dialog. Focus inside one of them stays there, because Radix closes a popover or menu when
+ * focus leaves it (#7452: the bubble closed the "Workspace actions" menu the user had just opened).
+ */
+const OPEN_LAYER_SELECTOR = [
+  "[data-radix-popper-content-wrapper]",
+  '[role="menu"]',
+  '[role="listbox"]',
+  '[role="dialog"]',
+].join(",");
+
+/** Whether the bubble may move focus from `active` without being asked (see useBubbleFocus). */
+function mayTakeFocusFrom(active: Element | null): boolean {
+  return !isEditableElement(active) && active?.closest(OPEN_LAYER_SELECTOR) == null;
+}
+
+function editableElement(element: Element | null): HTMLElement | null {
+  return element instanceof HTMLElement && isEditableElement(element) ? element : null;
+}
+
+/** Tab or Shift+Tab with no other modifier, not yet handled by another listener. */
+function isPlainTab(event: KeyboardEvent | React.KeyboardEvent, shift: boolean): boolean {
+  const modified = event.altKey || event.ctrlKey || event.metaKey || event.defaultPrevented;
+  return event.key === "Tab" && event.shiftKey === shift && !modified;
+}
+
+/**
+ * Tab from the text field the bubble left focus in moves focus to the bubble (#7198). The listener
+ * runs on window, after the document keydown listeners, so a composer suggestion list that takes
+ * Tab (it calls preventDefault) keeps it. Returns the cleanup.
+ */
+function handOffTabToBubble(textField: HTMLElement | null, bubble: HTMLElement): () => void {
+  if (!textField) return () => undefined;
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (event.target !== textField || !isPlainTab(event, false)) return;
+    event.preventDefault();
+    bubble.focus();
+  };
+  window.addEventListener("keydown", onKeyDown);
+  return () => window.removeEventListener("keydown", onKeyDown);
+}
+
+/**
+ * A covered bubble checks again on the next focus move outside it (#7198): both full-screen panels
+ * move focus back to their own panel when they unpin. Once uncovered, the bubble takes focus under
+ * the usual rules, and `onUncovered` gets the element it found focused. Returns the cleanup.
+ */
+function takeFocusWhenUncovered(
+  covered: boolean,
+  bubble: HTMLElement,
+  onUncovered: (focused: Element) => void
+): () => void {
+  if (!covered) return () => undefined;
+  const onFocusIn = (event: FocusEvent) => {
+    const target = event.target;
+    if (!(target instanceof Element) || bubble.contains(target) || isBubbleCovered(bubble)) return;
+    document.removeEventListener("focusin", onFocusIn);
+    onUncovered(target);
+    if (mayTakeFocusFrom(target)) bubble.focus();
+  };
+  document.addEventListener("focusin", onFocusIn);
+  return () => document.removeEventListener("focusin", onFocusIn);
+}
+
+/** Shift+Tab from the bubble or its first button goes back to the text field (#7198). */
+function handOffShiftTabBack(
+  event: React.KeyboardEvent,
+  bubble: HTMLElement | null,
+  textField: HTMLElement | null
+): void {
+  const fromStart =
+    bubble != null && (event.target === bubble || event.target === bubble.querySelector("button"));
+  if (!fromStart || !textField?.isConnected || !isPlainTab(event, true)) return;
+  event.preventDefault();
+  textField.focus();
+}
+
+/** On close, focus left on the body or in the bubble goes back to where it was. */
+function restoreFocus(bubble: HTMLElement, previous: Element | null): void {
+  const active = document.activeElement;
+  const focusLost = active === document.body || bubble.contains(active);
+  if (focusLost && previous instanceof HTMLElement && previous.isConnected) previous.focus();
+}
+
+/**
  * Moves focus into the bubble once it is on screen (a hidden element cannot take focus), so
  * Escape, Skip and Next work from the keyboard (#5701). Later steps keep focus on the control that
  * advanced them. When the bubble closes and leaves focus on the body, focus goes back to where it
  * was. An open modal dialog traps focus, so the bubble cannot take it from one.
  *
  * It leaves focus alone in a text field, where the user may be typing (keys such as Escape would
- * otherwise skip a tutorial they never chose to act on), and under a layer that covers the bubble,
- * where Escape would skip a tutorial the user cannot see (#7114). The bubble stays clickable.
+ * otherwise skip a tutorial they never chose to act on), inside an open layer (OPEN_LAYER_SELECTOR),
+ * and under a layer that covers the bubble, where Escape would skip a tutorial the user cannot see
+ * (#7114). The bubble stays clickable. A covered bubble takes focus once it is uncovered
+ * (takeFocusWhenUncovered). From the text field it left focus in, Tab reaches the bubble and
+ * Shift+Tab from the bubble goes back: the bubble never takes a text field's focus on its own
+ * (#7120). Every listener goes away when the bubble closes.
+ *
+ * Returns the bubble's keydown handler for that Shift+Tab.
  */
 function useBubbleFocus(
   tooltipRef: React.RefObject<HTMLDivElement | null>,
   isPositioned: boolean
-): void {
+): (event: React.KeyboardEvent) => void {
+  const textFieldRef = useRef<HTMLElement | null>(null);
   useEffect(() => {
     const bubble = tooltipRef.current;
     if (!isPositioned || !bubble) return;
-    const previous = document.activeElement;
-    if (!isEditableElement(previous) && !isBubbleCovered(bubble)) bubble.focus();
-    // Registered even when the bubble left focus alone: a click on Skip or Next still moves focus
-    // into the bubble, and it must go back to the composer when the bubble closes.
+    let previous = document.activeElement;
+    const covered = isBubbleCovered(bubble);
+    if (!covered && mayTakeFocusFrom(previous)) bubble.focus();
+    // The text field the bubble left focus in, for the Tab hand-over.
+    const textField = covered ? null : editableElement(previous);
+    textFieldRef.current = textField;
+    const stopTab = handOffTabToBubble(textField, bubble);
+    const stopWaiting = takeFocusWhenUncovered(covered, bubble, (focused) => (previous = focused));
+    // The restore runs even when the bubble left focus alone: a click on Skip or Next still moves
+    // focus into the bubble, and it must go back to the composer when the bubble closes.
     return () => {
-      const active = document.activeElement;
-      const focusLost = active === document.body || bubble.contains(active);
-      if (focusLost && previous instanceof HTMLElement && previous.isConnected) previous.focus();
+      stopTab();
+      stopWaiting();
+      textFieldRef.current = null;
+      restoreFocus(bubble, previous);
     };
   }, [tooltipRef, isPositioned]);
+
+  return (event) => handOffShiftTabBack(event, tooltipRef.current, textFieldRef.current);
 }
 
 /**
@@ -210,7 +311,7 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
     };
   }, [step.target]);
 
-  useBubbleFocus(tooltipRef, isPositioned);
+  const handOffShiftTab = useBubbleFocus(tooltipRef, isPositioned);
 
   const isLastStep = currentStep === totalSteps;
 
@@ -236,7 +337,10 @@ export const TutorialTooltip: React.FC<TutorialTooltipProps> = ({
         role="group"
         aria-labelledby={titleId}
         tabIndex={-1}
-        onKeyDown={(e) => dismissOnEscape(e, onDismiss)}
+        onKeyDown={(e) => {
+          handOffShiftTab(e);
+          dismissOnEscape(e, onDismiss);
+        }}
         style={{
           position: "fixed",
           top: position?.top ?? -9999,

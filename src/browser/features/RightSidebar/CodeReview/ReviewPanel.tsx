@@ -723,6 +723,41 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
   return null;
 };
 
+/**
+ * Focuses the panel when focusTrigger changes (preserves current hunk selection). During workspace
+ * setup only the placeholder renders, so the request waits for the real panel (#7449), together
+ * with the element that had focus when it came: a later focus move (the chat input) cancels it.
+ */
+function useFocusRequest(
+  panelRef: React.RefObject<HTMLDivElement | null>,
+  focusTrigger: number | undefined,
+  isCreating: boolean
+): void {
+  const pendingFromRef = useRef<Element | null | undefined>(undefined);
+  useEffect(() => {
+    if (!focusTrigger) return;
+    if (isCreating) {
+      pendingFromRef.current = document.activeElement;
+      return;
+    }
+    panelRef.current?.focus();
+    // isCreating is read, not a trigger: the effect below handles the end of setup.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelRef, focusTrigger]);
+  useEffect(() => {
+    const from = pendingFromRef.current;
+    if (isCreating || from === undefined) return;
+    pendingFromRef.current = undefined;
+    focusUnlessMoved(panelRef.current, from);
+  }, [panelRef, isCreating]);
+}
+
+/** Focuses `panel` unless focus moved away from `from` (the body counts as not moved). */
+function focusUnlessMoved(panel: HTMLElement | null, from: Element | null): void {
+  const active = document.activeElement;
+  if (active === from || active === document.body) panel?.focus();
+}
+
 export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   workspaceId,
   workspacePath,
@@ -1296,12 +1331,7 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     controllerRef.current?.requestImmediate();
   };
 
-  // Focus panel when focusTrigger changes (preserves current hunk selection)
-  useEffect(() => {
-    if (focusTrigger && focusTrigger > 0) {
-      panelRef.current?.focus();
-    }
-  }, [focusTrigger]);
+  useFocusRequest(panelRef, focusTrigger, isCreating);
 
   // Debounce search input
   useEffect(() => {
