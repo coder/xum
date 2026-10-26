@@ -117,7 +117,12 @@ const OXLINT_FILE_EXTENSIONS = /\.(?:[cm]?[jt]sx?|vue|svelte|astro)$/;
 
 function listFiles(cwd, args) {
   return (
-    git(["ls-files", "-z", ...args, "--", ...OXLINT_ROOTS], cwd)
+    // Exclude node_modules in the query itself: an installed scripts/mintlify/node_modules
+    // lists megabytes of ignored paths, more than execFileSync's output buffer holds.
+    git(
+      ["ls-files", "-z", ...args, "--", ...OXLINT_ROOTS, ":(exclude,glob)**/node_modules/**"],
+      cwd
+    )
       .split("\0")
       .filter((file) => file !== "")
       // ESLint never lints node_modules.
