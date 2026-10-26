@@ -294,7 +294,7 @@ export async function getWorkspacePluginComposition(
   const metadata = metadataResult.data;
   const runtimeResult = context.aiService.createWorkspaceRuntimeContext(workspaceId, metadata);
   if (!runtimeResult.success) throw new Error(formatSendMessageError(runtimeResult.error).message);
-  const { runtime, workspacePath, hostCheckoutRoot } = runtimeResult.data;
+  const { runtime, workspacePath, hostCheckoutRoot, projectCheckoutRoot } = runtimeResult.data;
   const projectTrusted = isWorkspaceProjectTrusted(context.config, metadata);
   const agentPlugins = hostCheckoutRoot
     ? resolveAgentPluginsMcpContext(metadata, hostCheckoutRoot)
@@ -303,6 +303,7 @@ export async function getWorkspacePluginComposition(
     runtime,
     workspacePath,
     hostCheckoutRoot,
+    projectCheckoutRoot,
     xumHome: context.config.rootDir,
     projectTrusted,
     listMcpServerLayers: () =>

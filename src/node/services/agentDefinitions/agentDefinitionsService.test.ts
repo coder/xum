@@ -12,6 +12,7 @@ import { RuntimeError, type Runtime } from "@/node/runtime/Runtime";
 import { HostKeyShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
 import { log } from "@/node/services/log";
+import { DISABLE_PROJECT_AUTOMATION_ENV } from "@/node/utils/projectAutomation";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import {
   AgentDefinitionRequestCache,
@@ -1107,6 +1108,32 @@ base: a
         }
       }
     );
+
+    // #7216: the project-automation kill switch wins over trust, in the listing and in a read.
+    test("project plugin agents stay hidden in a trusted project under the kill switch", async () => {
+      using project = new DisposableTempDir("agent-defs-plugin-kill-switch");
+      await writePluginWithAgent(
+        path.join(project.path, ".xum", "plugins"),
+        "repo-plugin",
+        "repo-agent",
+        "Repo (plugin)"
+      );
+      const runtime = new LocalRuntime(project.path);
+      const trusted = { projectPluginsTrusted: true, runtimeFactory } as const;
+      const previous = process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+      process.env[DISABLE_PROJECT_AUTOMATION_ENV] = "1";
+      try {
+        const agents = await discoverAgentDefinitions(runtime, project.path, trusted);
+        expect(agents.some((agent) => agent.id === "repo-agent")).toBe(false);
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun:test types `rejects` as void
+        await expect(
+          readAgentDefinition(runtime, project.path, AgentIdSchema.parse("repo-agent"), trusted)
+        ).rejects.toThrow("Agent definition not found");
+      } finally {
+        if (previous === undefined) delete process.env[DISABLE_PROJECT_AUTOMATION_ENV];
+        else process.env[DISABLE_PROJECT_AUTOMATION_ENV] = previous;
+      }
+    });
 
     test("dedupeById: false returns shadowed plugin agents in precedence order", async () => {
       using project = new DisposableTempDir("agent-defs-plugin-project");
