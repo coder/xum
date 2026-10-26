@@ -88,43 +88,6 @@ function handOffTabToBubble(textField: HTMLElement | null, bubble: HTMLElement):
   return () => window.removeEventListener("keydown", onKeyDown);
 }
 
-/** A focus move to `target` outside the bubble, once nothing covers the bubble. */
-function isUncoveredFocusOutside(target: EventTarget | null, bubble: HTMLElement): boolean {
-  return target instanceof Element && !bubble.contains(target) && !isBubbleCovered(bubble);
-}
-
-/**
- * A covered bubble checks again on the next focus move outside it (#7198): both full-screen panels
- * move focus back to their own panel when they unpin. Once uncovered, the bubble takes focus under
- * the usual rules, and `onUncovered` gets the element it found focused. The bubble acts in a
- * microtask, after the code that moved focus is done: the Artifacts panel checks that its own
- * focus call took and focuses the panel when it did not. Returns the cleanup.
- */
-function takeFocusWhenUncovered(
-  covered: boolean,
-  bubble: HTMLElement,
-  onUncovered: (focused: Element) => void
-): () => void {
-  if (!covered) return () => undefined;
-  let closed = false;
-  const takeFocus = () => {
-    const active = document.activeElement;
-    if (closed || !active || bubble.contains(active)) return;
-    onUncovered(active);
-    if (mayTakeFocusFrom(active)) bubble.focus();
-  };
-  const onFocusIn = (event: FocusEvent) => {
-    if (!isUncoveredFocusOutside(event.target, bubble)) return;
-    document.removeEventListener("focusin", onFocusIn);
-    queueMicrotask(takeFocus);
-  };
-  document.addEventListener("focusin", onFocusIn);
-  return () => {
-    closed = true;
-    document.removeEventListener("focusin", onFocusIn);
-  };
-}
-
 /** Shift+Tab from the bubble or its first button goes back to the text field (#7198). */
 function handOffShiftTabBack(
   event: React.KeyboardEvent,
@@ -154,10 +117,9 @@ function restoreFocus(bubble: HTMLElement, previous: Element | null): void {
  * It leaves focus alone in a text field, where the user may be typing (keys such as Escape would
  * otherwise skip a tutorial they never chose to act on), inside an open layer (OPEN_LAYER_SELECTOR),
  * and under a layer that covers the bubble, where Escape would skip a tutorial the user cannot see
- * (#7114). The bubble stays clickable. A covered bubble takes focus once it is uncovered
- * (takeFocusWhenUncovered). From the text field it left focus in, Tab reaches the bubble and
- * Shift+Tab from the bubble goes back: the bubble never takes a text field's focus on its own
- * (#7120). Every listener goes away when the bubble closes.
+ * (#7114). The bubble stays clickable. From the text field it left focus in, Tab reaches the
+ * bubble and Shift+Tab from the bubble goes back: the bubble never takes a text field's focus on
+ * its own (#7120). The Tab listener goes away when the bubble closes.
  *
  * Returns the bubble's keydown handler for that Shift+Tab.
  */
@@ -169,19 +131,17 @@ function useBubbleFocus(
   useEffect(() => {
     const bubble = tooltipRef.current;
     if (!isPositioned || !bubble) return;
-    let previous = document.activeElement;
+    const previous = document.activeElement;
     const covered = isBubbleCovered(bubble);
     if (!covered && mayTakeFocusFrom(previous)) bubble.focus();
     // The text field the bubble left focus in, for the Tab hand-over.
     const textField = covered ? null : editableElement(previous);
     textFieldRef.current = textField;
     const stopTab = handOffTabToBubble(textField, bubble);
-    const stopWaiting = takeFocusWhenUncovered(covered, bubble, (focused) => (previous = focused));
     // The restore runs even when the bubble left focus alone: a click on Skip or Next still moves
     // focus into the bubble, and it must go back to the composer when the bubble closes.
     return () => {
       stopTab();
-      stopWaiting();
       textFieldRef.current = null;
       restoreFocus(bubble, previous);
     };

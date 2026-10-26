@@ -723,37 +723,6 @@ export const ReviewAssistedStatsReporter: React.FC<ReviewAssistedStatsReporterPr
   return null;
 };
 
-/**
- * Focuses the panel when focusTrigger changes (preserves current hunk selection). During workspace
- * setup only the placeholder renders, so the request waits for the real panel (#7449). Any focus
- * move while it waits (the user clicks the chat input) cancels it.
- */
-function useFocusRequest(
-  panelRef: React.RefObject<HTMLDivElement | null>,
-  focusTrigger: number | undefined,
-  isCreating: boolean
-): void {
-  const pendingRef = useRef(false);
-  useEffect(() => {
-    if (!focusTrigger) return;
-    if (!isCreating) {
-      panelRef.current?.focus();
-      return;
-    }
-    pendingRef.current = true;
-    const cancel = () => (pendingRef.current = false);
-    document.addEventListener("focusin", cancel, { once: true });
-    return () => document.removeEventListener("focusin", cancel);
-    // isCreating is read, not a trigger: the effect below handles the end of setup.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [panelRef, focusTrigger]);
-  useEffect(() => {
-    if (isCreating || !pendingRef.current) return;
-    pendingRef.current = false;
-    panelRef.current?.focus();
-  }, [panelRef, isCreating]);
-}
-
 export const ReviewPanel: React.FC<ReviewPanelProps> = ({
   workspaceId,
   workspacePath,
@@ -1327,7 +1296,12 @@ export const ReviewPanel: React.FC<ReviewPanelProps> = ({
     controllerRef.current?.requestImmediate();
   };
 
-  useFocusRequest(panelRef, focusTrigger, isCreating);
+  // Focus panel when focusTrigger changes (preserves current hunk selection)
+  useEffect(() => {
+    if (focusTrigger && focusTrigger > 0) {
+      panelRef.current?.focus();
+    }
+  }, [focusTrigger]);
 
   // Debounce search input
   useEffect(() => {

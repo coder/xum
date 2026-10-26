@@ -126,9 +126,7 @@ async function waitForPageSettled(container: HTMLElement): Promise<void> {
 export async function setupWorkspaceView(
   view: RenderedApp,
   metadata: FrontendWorkspaceMetadata,
-  workspaceId: string,
-  /** False for a test that acts during workspace setup (#7449). */
-  options: { waitForSetup?: boolean } = {}
+  workspaceId: string
 ): Promise<void> {
   await view.waitForReady();
 
@@ -172,17 +170,15 @@ export async function setupWorkspaceView(
   // Positive signal, not copy: the row's actions-menu trigger (the only popover trigger carrying
   // the row's data-workspace-id) renders only once setup has ended. If it is ever removed, this
   // wait fails loudly instead of passing at once.
-  if (options.waitForSetup !== false) {
-    await waitFor(
-      () => {
-        const menuTrigger = view.container.querySelector(
-          `button[data-workspace-id="${workspaceId}"][aria-haspopup]`
-        );
-        if (!menuTrigger) throw new Error("Workspace still in setup (no actions menu yet)");
-      },
-      { timeout: 30_000 }
-    );
-  }
+  await waitFor(
+    () => {
+      const menuTrigger = view.container.querySelector(
+        `button[data-workspace-id="${workspaceId}"][aria-haspopup]`
+      );
+      if (!menuTrigger) throw new Error("Workspace still in setup (no actions menu yet)");
+    },
+    { timeout: 30_000 }
+  );
 
   // Ensure the workspace is registered and activated in the store so that
   // runOnChatSubscription starts. In the real app, WorkspaceContext handles

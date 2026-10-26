@@ -166,64 +166,6 @@ describe("TutorialTooltip", () => {
     expect(document.activeElement).toBe(view.getByRole("menuitem", { name: "Archive" }));
   });
 
-  /** Stubs the hit test: a full-screen panel covers the bubble until `uncover()` (#7114). */
-  function coverBubble() {
-    const panel = document.createElement("button");
-    panel.textContent = "Full-screen panel";
-    document.body.appendChild(panel);
-    const hitTest = spyOn(document, "elementFromPoint").mockReturnValue(panel);
-    return {
-      panel,
-      // No layout here: a null hit counts as uncovered.
-      uncover: () => hitTest.mockReturnValue(null),
-      restore: () => {
-        hitTest.mockRestore();
-        panel.remove();
-      },
-    };
-  }
-
-  test("a covered bubble takes focus when the panel moves focus back after it unpins (#7198)", async () => {
-    const cover = coverBubble();
-    try {
-      const { view, close } = renderTooltip();
-      const bubble = view.getByRole("group", { name: "Step title" });
-      // A focus move while the panel still covers the bubble leaves focus alone.
-      cover.panel.focus();
-      await Promise.resolve();
-      expect(document.activeElement).toBe(cover.panel);
-
-      const headerButton = view.getByRole("button", { name: "Header button" });
-      headerButton.focus();
-      cover.uncover();
-      // The Artifacts panel's unpin: focus one element, and another when that focus did not take.
-      // The bubble must wait for both steps, or the second one takes focus back from it.
-      cover.panel.focus();
-      if (document.activeElement !== cover.panel) headerButton.focus();
-      await Promise.resolve();
-      expect(document.activeElement).toBe(bubble);
-
-      close();
-      expect(document.activeElement).toBe(cover.panel);
-    } finally {
-      cover.restore();
-    }
-  });
-
-  test("an uncovered bubble still leaves focus in the composer (#7198, #7120)", async () => {
-    const cover = coverBubble();
-    try {
-      const { view } = renderTooltip();
-      const composer = view.getByRole("textbox", { name: "Composer" });
-      cover.uncover();
-      composer.focus();
-      await Promise.resolve();
-      expect(document.activeElement).toBe(composer);
-    } finally {
-      cover.restore();
-    }
-  });
-
   test("Tab from the composer reaches the bubble, and Shift+Tab goes back (#7198)", () => {
     const { view } = renderTooltip("composer");
     const composer = view.getByRole("textbox", { name: "Composer" });
@@ -255,29 +197,19 @@ describe("TutorialTooltip", () => {
     }
   });
 
-  test("closing the bubble removes its focus and Tab listeners (#7198)", () => {
-    const spies = [window, document].flatMap((target) => [
-      spyOn(target, "addEventListener"),
-      spyOn(target, "removeEventListener"),
-    ]);
-    const listeners = (index: number) =>
-      [spies[index], spies[index + 2]]
-        .flatMap((spy) => spy.mock.calls)
-        .filter(([type]) => type === "keydown" || type === "focusin")
-        .map(([, listener]) => listener);
-    const cover = coverBubble();
+  test("closing the bubble removes its Tab listener (#7198)", () => {
+    const added = spyOn(window, "addEventListener");
+    const removed = spyOn(window, "removeEventListener");
+    const keydownListeners = (spy: typeof added) =>
+      spy.mock.calls.filter(([type]) => type === "keydown").map(([, listener]) => listener);
     try {
-      // A covered bubble adds the focusin listener, a bubble beside the composer the Tab one.
-      renderTooltip().close();
-      cleanup();
-      cover.uncover();
       renderTooltip("composer").close();
 
-      expect(listeners(0)).toHaveLength(2);
-      expect(listeners(0).filter((listener) => !listeners(1).includes(listener))).toEqual([]);
+      expect(keydownListeners(added)).toHaveLength(1);
+      expect(keydownListeners(removed)).toEqual(keydownListeners(added));
     } finally {
-      cover.restore();
-      for (const spy of spies) spy.mockRestore();
+      added.mockRestore();
+      removed.mockRestore();
     }
   });
 });
