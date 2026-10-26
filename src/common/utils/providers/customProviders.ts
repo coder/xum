@@ -68,10 +68,6 @@ export function validateCustomProviderId(id: string): CustomProviderIdValidation
   return { ok: true };
 }
 
-export function isValidCustomProviderId(id: string): boolean {
-  return validateCustomProviderId(id).ok;
-}
-
 /**
  * Every supported SDK adapter builds request URLs by appending the endpoint
  * path directly onto the configured base URL string (e.g.

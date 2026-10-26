@@ -7,7 +7,11 @@ import type {
   ReviewStateUpdateOutput,
 } from "@/common/orpc/schemas/reviewState";
 import { REVIEW_STATE_SECTIONS } from "@/common/orpc/schemas/reviewState";
-import { applyReviewStateDelta, withReviewStateSection } from "@/common/utils/reviewState";
+import {
+  applyReviewStateDelta,
+  assignSection,
+  capReviewStateSections,
+} from "@/common/utils/reviewState";
 
 /**
  * Seeds consumed by the next mock client, so story setup can stage review state before
@@ -93,7 +97,10 @@ export function createMockReviewStateApi() {
           results[section] = "present";
           continue;
         }
-        next = withReviewStateSection(next, section, incoming);
+        next = { ...next };
+        assignSection(next, section, incoming);
+        // ReviewStateService.importLegacy caps what it imports; keep the mock in step.
+        next = capReviewStateSections(next);
         results[section] = "applied";
       }
       const snapshot = next === current ? { sections: current } : commit(input.workspaceId, next);

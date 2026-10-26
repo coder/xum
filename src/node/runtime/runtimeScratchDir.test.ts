@@ -52,18 +52,27 @@ describe("runtimeScratchDir", () => {
 
   describe("resolveScratchDirSpec", () => {
     const remoteHome = { getXumHome: () => "~/.mux" };
+    const originalDockerHost = process.env.DOCKER_HOST;
+    afterEach(() => {
+      if (originalDockerHost === undefined) delete process.env.DOCKER_HOST;
+      else process.env.DOCKER_HOST = originalDockerHost;
+    });
     const spec = (
       runtimeConfig: RuntimeConfig,
       extra?: { multiProject?: boolean; canMount?: boolean }
-    ) =>
-      resolveScratchDirSpec({
+    ) => {
+      // DOCKER_HOST decides the bind-mount probe before any Docker client config is read, so
+      // the developer's own Docker setup cannot change the result.
+      process.env.DOCKER_HOST =
+        (extra?.canMount ?? true) ? "unix:///var/run/docker.sock" : "tcp://10.0.0.1:2375";
+      return resolveScratchDirSpec({
         runtimeConfig,
         workspaceId: "ws1",
         sessionsDir,
         runtime: remoteHome,
         multiProject: extra?.multiProject,
-        canBindMountHostPaths: () => Promise.resolve(extra?.canMount ?? true),
       });
+    };
 
     test("puts the scratch dir where each runtime's commands run", async () => {
       const hostDir = getWorkspaceScratchDir(sessionsDir, "ws1");
@@ -88,11 +97,18 @@ describe("runtimeScratchDir", () => {
         kind: "runtime",
         path: DOCKER_SCRATCH_DIR,
       });
-      expect(await spec({ type: "devcontainer", configPath: ".devcontainer.json" })).toEqual({
-        kind: "devcontainer-mount",
-        dir: hostDir,
-      });
     });
+
+    // Windows hosts never bind-mount the scratch dir (canBindMountHostPathsIntoContainers).
+    test.skipIf(process.platform === "win32")(
+      "bind-mounts the host scratch dir into devcontainers on a local daemon",
+      async () => {
+        expect(await spec({ type: "devcontainer", configPath: ".devcontainer.json" })).toEqual({
+          kind: "devcontainer-mount",
+          dir: getWorkspaceScratchDir(sessionsDir, "ws1"),
+        });
+      }
+    );
 
     test("has none for devcontainers without a local daemon and for remote multi-project", async () => {
       expect(
@@ -211,6 +227,18 @@ describe("runtimeScratchDir", () => {
       ).toBe(dir);
       expect((await files.promises.stat(dir)).isDirectory()).toBe(true);
       expect(await fs.readdir(tempDir)).toEqual([]);
+    });
+
+    test("still returns a host dir when creation fails, so the prompt never names an unset variable", async () => {
+      // A regular file where the session dir should be makes mkdir fail.
+      const sessionsRoot = path.join(tempDir, "sessions");
+      await fs.mkdir(sessionsRoot);
+      await fs.writeFile(path.join(sessionsRoot, "ws1"), "not a dir");
+      const dir = getWorkspaceScratchDir(sessionsRoot, "ws1");
+
+      expect(await ensureScratchDirForSpec(new LocalRuntime(tempDir), { kind: "host", dir })).toBe(
+        dir
+      );
     });
 
     test("creates a runtime-side dir and returns the path the runtime expanded", async () => {

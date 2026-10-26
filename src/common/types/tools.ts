@@ -187,7 +187,6 @@ export type TimelineEventToolArgs = z.infer<typeof TOOL_DEFINITIONS.timeline_eve
 export type TimelineEventToolResult = z.infer<typeof TimelineEventToolResultSchema>;
 
 // Status-update tool types (status page agent mode)
-export type StatusUpdateToolArgs = z.infer<typeof TOOL_DEFINITIONS.status_update.schema>;
 export type StatusUpdateToolResult =
   | { success: true; queued: true; note?: string }
   | { success: false; error: string };

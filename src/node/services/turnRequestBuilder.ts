@@ -905,7 +905,15 @@ export interface PreparedStreamMessage extends AsyncDisposable {
 }
 
 export interface PreparedTurnRequest extends AsyncDisposable {
-  start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
+  /**
+   * `turnStartStage` is the starting send's stage callback. It is passed at start, not prepare:
+   * a request prepared before its rows were published (a rollover's first request) gets it from
+   * the send that starts it, so the new window's first request decides its stage too (#7215).
+   */
+  start(
+    thinkingOverride?: ActiveTurnThinkingOverride,
+    turnStartStage?: OnTurnStartStage
+  ): Promise<TurnRequestBuildOutcome>;
 }
 
 type PreparedTurnRequestOutcome =
@@ -1471,7 +1479,7 @@ export class TurnRequestBuilder {
     const prepared = await this.prepare(opts, context);
     if (prepared.type === "finished") return prepared;
     await using request = prepared.request;
-    return await request.start(opts.activeTurnThinkingOverride);
+    return await request.start(opts.activeTurnThinkingOverride, opts.onTurnStartStage);
   }
 
   async prepare(
@@ -1632,7 +1640,6 @@ export class TurnRequestBuilder {
       hasQueuedMessages,
       getQueuedInputStopCause,
       onStepSettled,
-      onTurnStartStage,
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
@@ -3697,7 +3704,8 @@ export class TurnRequestBuilder {
 
     let started = false;
     const start = async (
-      thinkingOverride?: ActiveTurnThinkingOverride
+      thinkingOverride?: ActiveTurnThinkingOverride,
+      turnStartStage?: OnTurnStartStage
     ): Promise<TurnRequestBuildOutcome> => {
       assert(!started && !transferred, "Prepared request must be started once before disposal");
       started = true;
@@ -3769,7 +3777,7 @@ export class TurnRequestBuilder {
         requestHistorySequence,
       };
       const staged = await applyTurnStartStage({
-        onTurnStartStage,
+        onTurnStartStage: turnStartStage,
         estimate: streamState.contextBudgetEstimate,
         limit: primaryRequest.contextBudgetLimit,
         model: modelString,

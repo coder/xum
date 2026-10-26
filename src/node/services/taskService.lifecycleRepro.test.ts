@@ -6,7 +6,6 @@
  * Run: bun test ./src/node/services/taskService.lifecycleRepro.test.ts
  */
 import * as path from "path";
-import { EventEmitter } from "events";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { Workspace as WorkspaceConfigEntry } from "@/node/config";
@@ -29,18 +28,13 @@ import {
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
-import type { AIService } from "./aiService";
-import type { AgentSession } from "./agentSession";
-import { createAgentSessionHarness } from "./agentSession.testHarness";
-import type { BackgroundProcessManager } from "./backgroundProcessManager";
-import { ContextManagementService } from "./contextManagement/contextManagementService";
-import { ExtensionMetadataService } from "./ExtensionMetadataService";
-import type { InitStateManager } from "./initStateManager";
 import type { TurnCompletion } from "./streamManager";
 import { makeAgentTaskIntegrationFake } from "./taskWorkspaceSeam.testUtils";
 import { createTestHistoryService } from "./testHistoryService";
-import { WorkspaceService } from "./workspaceService";
-import { createMockAIService } from "./workspaceService.testHarness";
+import {
+  createRealHostWorkspaceService,
+  type RealHostWorkspaceService,
+} from "./workspaceService.testHarness";
 
 type SendArgs = Parameters<WorkspaceHost["sendMessage"]>;
 type Lineage = (...args: unknown[]) => Promise<unknown>;
@@ -307,7 +301,7 @@ describe("task lifecycle races (WorkspaceService resume)", () => {
   const model = "anthropic:claude-sonnet-4-5";
   const attemptId = "att_00000000000000f1";
   let cleanup: (() => Promise<void>) | undefined;
-  let session: AgentSession | undefined;
+  let host: RealHostWorkspaceService | undefined;
   const completions: Array<ReturnType<typeof Promise.withResolvers<TurnCompletion>>> = [];
 
   afterEach(async () => {
@@ -315,8 +309,8 @@ describe("task lifecycle races (WorkspaceService resume)", () => {
       completion.resolve({ status: "aborted", abortReason: "user" });
     }
     completions.length = 0;
-    await session?.dispose();
-    session = undefined;
+    await host?.dispose();
+    host = undefined;
     await cleanup?.();
     cleanup = undefined;
   });
@@ -334,6 +328,8 @@ describe("task lifecycle races (WorkspaceService resume)", () => {
         name: id,
         projectName: "lifecycle-project",
         projectPath: "/tmp/lifecycle-project",
+        // A project-dir local workspace runs in its project directory.
+        namedWorkspacePath: "/tmp/lifecycle-project",
         runtimeConfig: { type: "local" },
       });
     }
@@ -348,21 +344,10 @@ describe("task lifecycle races (WorkspaceService resume)", () => {
         return cfg;
       });
     }
-    const backgroundProcessManager = Object.assign(new EventEmitter(), {
-      cleanup: mock(() => Promise.resolve()),
-      hasRunningBackgroundProcesses: mock(() => false),
-      hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
-      getForegroundToolCallIds: mock(() => []),
-      getActiveMonitorCount: mock(() => 0),
-    }) as unknown as BackgroundProcessManager;
-    const aiEmitter = new EventEmitter();
     let streaming = false;
-    const harness = await createAgentSessionHarness({
-      workspaceId,
+    host = createRealHostWorkspaceService({
       config,
       historyService,
-      backgroundProcessManager,
-      aiEmitter,
       aiServiceOverrides: {
         isStreaming: () => streaming,
         streamMessage: mock(() => {
@@ -370,7 +355,7 @@ describe("task lifecycle races (WorkspaceService resume)", () => {
           completions.push(completion);
           streaming = true;
           const messageId = `assistant-${completions.length}`;
-          aiEmitter.emit("stream-start", {
+          host?.aiEmitter.emit("stream-start", {
             type: "stream-start",
             workspaceId,
             messageId,
@@ -381,34 +366,7 @@ describe("task lifecycle races (WorkspaceService resume)", () => {
         }),
       },
     });
-    session = harness.session;
-    const initStateManager = {
-      on: mock(() => undefined),
-      off: mock(() => undefined),
-      getInitState: mock(() => undefined),
-      waitForInit: mock(() => Promise.resolve()),
-      clearInMemoryState: mock(() => undefined),
-      getUnsanitizedCheckoutError: mock(() => undefined),
-    } as unknown as InitStateManager;
-    const aiService = createMockAIService({
-      on: aiEmitter.on.bind(aiEmitter) as AIService["on"],
-      off: aiEmitter.off.bind(aiEmitter) as AIService["off"],
-      isStreaming: () => streaming,
-    });
-    const service = new WorkspaceService(
-      config,
-      historyService,
-      aiService,
-      new ContextManagementService({ config, historyService, aiService }),
-      initStateManager,
-      new ExtensionMetadataService(path.join(config.rootDir, "lifecycle-extension-metadata.json")),
-      backgroundProcessManager
-    );
-    (service as unknown as { sessions: Map<string, AgentSession> }).sessions.set(
-      workspaceId,
-      harness.session
-    );
-    return { service, session: harness.session, config };
+    return { service: host.service, session: host.session(workspaceId), config };
   }
 
   function resumedIntegration(admission: { kind: "refused"; message: string } | undefined) {

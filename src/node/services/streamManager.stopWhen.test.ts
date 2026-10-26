@@ -307,6 +307,20 @@ describe("StreamManager - stopWhen configuration", () => {
     }
   );
 
+  test("a budget stop keeps the stop cause an earlier condition recorded for the step", async () => {
+    const turn = await startStopWhenTurnForTests({
+      hasQueuedMessages: () => false,
+      onStepSettled: () => Promise.resolve({ decision: "rollover", continuationEntryId: "next" }),
+      modelString: "anthropic:claude-sonnet-4-5",
+    });
+    const [stepCap, budgetStop] = turn.stopWhen;
+    const steps = Array.from({ length: 100000 }, () => ({ usage: undefined, toolResults: [] }));
+    // The SDK runs every condition for a step: the step cap records its cause first.
+    expect(await stepCap({ steps })).toBe(true);
+    expect(await budgetStop({ steps })).toBe(true);
+    expect((await turn.finish("tool-calls")).stopCause).toEqual({ kind: "step-limit" });
+  });
+
   test("a settled successful new_context result is reported alongside its siblings", async () => {
     const onStepSettled = mock<NonNullable<TurnExecutionOptions["onStepSettled"]>>(() =>
       Promise.resolve({ decision: "rollover" })
@@ -379,6 +393,16 @@ describe("StreamManager - stopWhen configuration", () => {
     expect(onStepSettled).not.toHaveBeenCalled();
     expect(await stop(stepsWithToolResult("agent_report", { success: false }))).toBe(true);
     expect(onStepSettled).toHaveBeenCalledTimes(1);
+  });
+
+  test("only the last step's required-tool result stops the stream", async () => {
+    const required = await requiredToolConditionForTests([
+      { regex_match: "agent_report", action: "require" },
+    ]);
+    const report = { toolName: "agent_report", output: { success: true } };
+    // The SDK passes every step so far: an earlier step's completion must not stop a later one.
+    expect(required({ steps: [{ toolResults: [report] }, { toolResults: [] }] })).toBe(false);
+    expect(required({ steps: [{ toolResults: [] }, { toolResults: [report] }] })).toBe(true);
   });
 
   const requiredToolCases: Array<{

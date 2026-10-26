@@ -649,6 +649,36 @@ describe("MockAiStreamPlayer", () => {
     expect(extractText(assistantMessage)).toContain("Here are three programming languages");
   });
 
+  // #7204: each backend gets a new player; its first reply must not reuse an earlier backend's id.
+  test("a new player (a restarted backend) gives its reply a new message id", async () => {
+    const workspaceId = "workspace-restart-ids";
+    const replyWithNewPlayer = async (text: string) => {
+      const player = new MockAiStreamPlayer({
+        historyService,
+        aiService: new EventEmitter() as unknown as AIService,
+      });
+      const user = createMuxMessage(`user-${text}`, "user", `[mock:list-languages] ${text}`, {
+        timestamp: Date.now(),
+      });
+      const appended = await historyService.appendToHistory(workspaceId, user);
+      expect(appended.success).toBe(true);
+      const history = await historyService.getLastMessages(workspaceId, 10);
+      const played = await player.play(history.success ? history.data : [user], workspaceId);
+      if (!played.success || !played.data) throw new Error("expected a stream handle");
+      expect(await played.data.completion).toMatchObject({ status: "completed" });
+    };
+
+    await replyWithNewPlayer("first backend");
+    await replyWithNewPlayer("second backend");
+
+    const history = await historyService.getLastMessages(workspaceId, 10);
+    const assistantIds = (history.success ? history.data : [])
+      .filter((message) => message.role === "assistant")
+      .map((message) => message.id);
+    expect(assistantIds).toHaveLength(2);
+    expect(new Set(assistantIds).size).toBe(2);
+  });
+
   test("keeps the streamed partial with its error details on stream error, like StreamManager", async () => {
     const aiServiceStub = new EventEmitter();
     aiServiceStub.on("error", () => undefined);

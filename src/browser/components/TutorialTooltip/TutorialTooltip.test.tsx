@@ -18,7 +18,7 @@ describe("TutorialTooltip", () => {
   });
 
   // Before the bubble opens, focus is on a header button by default: a control the user clicked.
-  function renderTooltip(focusBefore: "button" | "composer" = "button") {
+  function renderTooltip(focusBefore: "button" | "composer" | "menu item" = "button") {
     const onNext = mock(() => undefined);
     const onDismiss = mock(() => undefined);
     const onDisableTutorial = mock(() => undefined);
@@ -27,6 +27,11 @@ describe("TutorialTooltip", () => {
         <div data-tutorial="target">Target</div>
         <button type="button">Header button</button>
         <textarea aria-label="Composer" />
+        <div role="menu">
+          <button type="button" role="menuitem">
+            Archive
+          </button>
+        </div>
         {showTooltip && (
           <TutorialTooltip
             step={{ target: "target", title: "Step title", content: "Step content" }}
@@ -41,10 +46,12 @@ describe("TutorialTooltip", () => {
     );
     // The tooltip portals into document.body, which is render()'s default query root.
     const view = render(tree(false));
-    (focusBefore === "composer"
-      ? view.getByRole("textbox", { name: "Composer" })
-      : view.getByRole("button", { name: "Header button" })
-    ).focus();
+    const focusTargets = {
+      button: () => view.getByRole("button", { name: "Header button" }),
+      composer: () => view.getByRole("textbox", { name: "Composer" }),
+      "menu item": () => view.getByRole("menuitem", { name: "Archive" }),
+    };
+    focusTargets[focusBefore]().focus();
     view.rerender(tree(true));
     const close = () => view.rerender(tree(false));
     return { view, close, onNext, onDismiss, onDisableTutorial };
@@ -151,5 +158,11 @@ describe("TutorialTooltip", () => {
       hitTest.mockRestore();
       panel.remove();
     }
+  });
+
+  test("the bubble leaves focus in an open menu, so the menu stays open (#7452)", () => {
+    const { view } = renderTooltip("menu item");
+
+    expect(document.activeElement).toBe(view.getByRole("menuitem", { name: "Archive" }));
   });
 });
