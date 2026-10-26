@@ -9,6 +9,7 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
+import * as artifactStoreModule from "./artifactStore";
 import { recordArtifactVersion } from "./artifactVersionStore";
 import {
   ARTIFACTS_UNAVAILABLE_REASON,
@@ -153,6 +154,18 @@ describe("artifacts operations", () => {
 
   describe("resolveArtifactsLocation", () => {
     const fakeRuntime = { getXumHome: () => "~/.mux" } as unknown as Runtime;
+    const originalDockerHost = process.env.DOCKER_HOST;
+    let descriptors: ReturnType<
+      typeof spyOn<typeof artifactStoreModule, "hostSupportsDescriptorPaths">
+    >;
+    beforeEach(() => {
+      descriptors = spyOn(artifactStoreModule, "hostSupportsDescriptorPaths");
+    });
+    afterEach(() => {
+      descriptors.mockRestore();
+      if (originalDockerHost === undefined) delete process.env.DOCKER_HOST;
+      else process.env.DOCKER_HOST = originalDockerHost;
+    });
     const resolve = (
       runtimeConfig: RuntimeConfig,
       extra?: {
@@ -161,8 +174,13 @@ describe("artifacts operations", () => {
         projects?: Array<{ projectPath: string; projectName: string }>;
         runtime?: Runtime;
       }
-    ) =>
-      resolveArtifactsLocation(
+    ) => {
+      // DOCKER_HOST decides the bind-mount probe before any Docker client config is read, and
+      // the spy stands in for the host's /proc/self/fd check, so the host cannot change results.
+      process.env.DOCKER_HOST =
+        (extra?.canMount ?? true) ? "unix:///var/run/docker.sock" : "tcp://10.0.0.1:2375";
+      descriptors.mockResolvedValue(extra?.pinnable ?? true);
+      return resolveArtifactsLocation(
         config.sessionsDir,
         "ws-art",
         {
@@ -172,12 +190,9 @@ describe("artifacts operations", () => {
           namedWorkspacePath: tempDir,
           projects: extra?.projects,
         },
-        {
-          createRuntime: () => extra?.runtime ?? fakeRuntime,
-          canBindMountHostPaths: () => Promise.resolve(extra?.canMount ?? true),
-          hostSupportsDescriptorPaths: () => Promise.resolve(extra?.pinnable ?? true),
-        }
+        { createRuntime: () => extra?.runtime ?? fakeRuntime }
       );
+    };
     const hostArtifacts = () =>
       path.join(getWorkspaceScratchDir(config.sessionsDir, "ws-art"), "artifacts");
 

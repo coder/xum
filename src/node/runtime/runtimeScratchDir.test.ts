@@ -52,18 +52,27 @@ describe("runtimeScratchDir", () => {
 
   describe("resolveScratchDirSpec", () => {
     const remoteHome = { getXumHome: () => "~/.mux" };
+    const originalDockerHost = process.env.DOCKER_HOST;
+    afterEach(() => {
+      if (originalDockerHost === undefined) delete process.env.DOCKER_HOST;
+      else process.env.DOCKER_HOST = originalDockerHost;
+    });
     const spec = (
       runtimeConfig: RuntimeConfig,
       extra?: { multiProject?: boolean; canMount?: boolean }
-    ) =>
-      resolveScratchDirSpec({
+    ) => {
+      // DOCKER_HOST decides the bind-mount probe before any Docker client config is read, so
+      // the developer's own Docker setup cannot change the result.
+      process.env.DOCKER_HOST =
+        (extra?.canMount ?? true) ? "unix:///var/run/docker.sock" : "tcp://10.0.0.1:2375";
+      return resolveScratchDirSpec({
         runtimeConfig,
         workspaceId: "ws1",
         sessionsDir,
         runtime: remoteHome,
         multiProject: extra?.multiProject,
-        canBindMountHostPaths: () => Promise.resolve(extra?.canMount ?? true),
       });
+    };
 
     test("puts the scratch dir where each runtime's commands run", async () => {
       const hostDir = getWorkspaceScratchDir(sessionsDir, "ws1");
