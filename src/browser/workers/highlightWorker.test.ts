@@ -69,6 +69,9 @@ describe("highlightWorker", () => {
           shikiPre(SHIKI_DARK_THEME)
         );
       }
+      expect(await worker().highlight("plain words", "text", "dark")).toStartWith(
+        shikiPre(SHIKI_DARK_THEME)
+      );
       expect(warn).toHaveBeenCalledTimes(1);
       // A language with no Shiki grammar keeps the Highlights error.
       expect(canHighlight("c3")).toBe(true);

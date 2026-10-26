@@ -5,7 +5,7 @@
  */
 
 import * as Comlink from "comlink";
-import { bundledLanguages, createHighlighter, type Highlighter } from "shiki";
+import { bundledLanguages, createHighlighter, isPlainLang, type Highlighter } from "shiki";
 // No Wasm SIMD guard (#7184): @pierre/highlights compiles its SIMD module while this import is
 // evaluated, so a runtime without SIMD fails the worker before any code here runs, and a guard
 // would need a dynamic import. Every runtime Xum supports has SIMD: Electron and the VS Code
@@ -69,8 +69,9 @@ const api = {
         return highlightToShikiHtml(code, shikiLang, theme);
       } catch (error) {
         // Shiki highlights this call, so the caller does not fall back to plain text (#7184). A
-        // language that only Highlights knows (c3, the `patch` alias) has no Shiki grammar.
-        if (!Object.hasOwn(bundledLanguages, shikiLang)) throw error;
+        // language that only Highlights knows (c3, the `patch` alias) has no Shiki grammar. Shiki's
+        // plaintext IDs have none either, but Shiki always handles them.
+        if (!isPlainLang(shikiLang) && !Object.hasOwn(bundledLanguages, shikiLang)) throw error;
         if (!warnedHighlightsFailure) {
           warnedHighlightsFailure = true;
           console.warn("[highlightWorker] Highlights failed; using Shiki:", error);
