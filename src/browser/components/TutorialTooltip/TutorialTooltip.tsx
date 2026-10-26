@@ -62,8 +62,15 @@ function mayTakeFocusFrom(active: Element | null): boolean {
   return !isEditableElement(active) && active?.closest(OPEN_LAYER_SELECTOR) == null;
 }
 
-function editableElement(element: Element | null): HTMLElement | null {
-  return element instanceof HTMLElement && isEditableElement(element) ? element : null;
+/**
+ * Text-entry controls, where Tab would otherwise move on to the next control. Checkboxes and
+ * selects keep the normal Tab order (the Review controls sit right next to a tutorial step).
+ */
+const TEXT_ENTRY_SELECTOR =
+  'textarea, input:not([type]), input[type="text"], input[type="search"], [contenteditable="true"]';
+
+function textEntryElement(element: Element | null): HTMLElement | null {
+  return element instanceof HTMLElement && element.matches(TEXT_ENTRY_SELECTOR) ? element : null;
 }
 
 /** Tab or Shift+Tab with no other modifier, not yet handled by another listener. */
@@ -135,7 +142,7 @@ function useBubbleFocus(
     const covered = isBubbleCovered(bubble);
     if (!covered && mayTakeFocusFrom(previous)) bubble.focus();
     // The text field the bubble left focus in, for the Tab hand-over.
-    const textField = covered ? null : editableElement(previous);
+    const textField = covered ? null : textEntryElement(previous);
     textFieldRef.current = textField;
     const stopTab = handOffTabToBubble(textField, bubble);
     // The restore runs even when the bubble left focus alone: a click on Skip or Next still moves

@@ -18,7 +18,7 @@ describe("TutorialTooltip", () => {
   });
 
   // Before the bubble opens, focus is on a header button by default: a control the user clicked.
-  function renderTooltip(focusBefore: "button" | "composer" | "menu item" = "button") {
+  function renderTooltip(focusBefore: "button" | "composer" | "menu item" | "checkbox" = "button") {
     const onNext = mock(() => undefined);
     const onDismiss = mock(() => undefined);
     const onDisableTutorial = mock(() => undefined);
@@ -27,6 +27,7 @@ describe("TutorialTooltip", () => {
         <div data-tutorial="target">Target</div>
         <button type="button">Header button</button>
         <textarea aria-label="Composer" />
+        <input type="checkbox" aria-label="Show read" />
         <div role="menu">
           <button type="button" role="menuitem">
             Archive
@@ -50,6 +51,7 @@ describe("TutorialTooltip", () => {
       button: () => view.getByRole("button", { name: "Header button" }),
       composer: () => view.getByRole("textbox", { name: "Composer" }),
       "menu item": () => view.getByRole("menuitem", { name: "Archive" }),
+      checkbox: () => view.getByRole("checkbox", { name: "Show read" }),
     };
     focusTargets[focusBefore]().focus();
     view.rerender(tree(true));
@@ -195,6 +197,14 @@ describe("TutorialTooltip", () => {
     } finally {
       document.removeEventListener("keydown", suggestions);
     }
+  });
+
+  test("Tab from a checkbox keeps the normal Tab order (#7198)", () => {
+    const { view } = renderTooltip("checkbox");
+    const checkbox = view.getByRole("checkbox", { name: "Show read" });
+
+    fireEvent.keyDown(checkbox, { key: "Tab" });
+    expect(document.activeElement).toBe(checkbox);
   });
 
   test("closing the bubble removes its Tab listener (#7198)", () => {
