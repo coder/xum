@@ -3,7 +3,7 @@ import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { act, cleanup, renderHook } from "@testing-library/react";
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import {
@@ -12,7 +12,13 @@ import {
   type ConnectionHarness,
 } from "@/browser/contexts/connection.testHarness";
 import type { TestApiOverrides } from "@/browser/testUtils";
-import { getDefaultRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
+import { registerTerminalView } from "@/browser/terminal/terminalViews";
+import { makeTerminalTabType } from "@/browser/types/rightSidebar";
+import {
+  addTabToFocusedTabset,
+  collectAllTabs,
+  getDefaultRightSidebarLayoutState,
+} from "@/browser/utils/rightSidebarLayout";
 import {
   useDesktopAvailable,
   useLlmDebugLogsEnabled,
@@ -117,6 +123,33 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
     } finally {
       process.off("unhandledRejection", onUnhandled);
     }
+  });
+
+  // Tabs left over from an app reload still go. A tab a mounted view shows stays: that view
+  // writes the exit line and closes the tab once the server reports the exit.
+  test("the terminal session sync removes only the gone sessions no view shows", async () => {
+    answerSessions = () => Promise.resolve(["shown", "gone"]);
+    const initial = ["shown", "gone"].reduce(
+      (layout, sessionId) => addTabToFocusedTabset(layout, makeTerminalTabType(sessionId)),
+      getDefaultRightSidebarLayoutState()
+    );
+    const view = renderHook(
+      () => {
+        useEffect(() => registerTerminalView("shown"), []);
+        const [layout, setLayout] = useState(initial);
+        useTerminalSessionSync(useAPI().api, "ws-1", layout, setLayout);
+        return collectAllTabs(layout.root);
+      },
+      { wrapper: Wrapper }
+    );
+    await flush();
+    expect(view.result.current).toContain("terminal:gone");
+
+    await drop();
+    answerSessions = () => Promise.resolve([]);
+    await reconnect();
+    expect(view.result.current).toContain("terminal:shown");
+    expect(view.result.current).not.toContain("terminal:gone");
   });
 
   test("the desktop capability keeps its value through a read the drop cut off", async () => {
