@@ -283,6 +283,8 @@ export class CreationDraftStore {
   private readonly pendingDeletes = new Set<string>();
   /** Backoff timers of failed deletes. A new client (or none) clears them: it retries at once. */
   private readonly deleteTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Delete requests still running (settles, never rejects): a save of the same id waits. */
+  private readonly deletesInFlight = new Map<string, Promise<void>>();
 
   constructor() {
     // The save debounce is the only unload risk (main wrote localStorage at once): save as soon
@@ -563,7 +565,9 @@ export class CreationDraftStore {
     const draft = entry.draft;
     if (!draft) return;
     const { id: _id, ...all } = draft;
-    const patch = entry.persisted ? entry.pending : all;
+    // A delete still running can remove the record first: save it whole, after that delete.
+    const deleting = this.deletesInFlight.get(id);
+    const patch = entry.persisted && !deleting ? entry.pending : all;
     // Editing a draft whose delete is unconfirmed cancels that delete: a later retry would
     // remove the new edits.
     this.pendingDeletes.delete(id);
@@ -574,6 +578,8 @@ export class CreationDraftStore {
     const client = this.client;
     try {
       if (!client) throw new Error("Not connected.");
+      // Only when one runs: the page-hide flush must send its request before the page goes.
+      if (deleting) await deleting;
       await client.drafts.updateCreation({
         scope: { kind: "creation", draftId: id },
         ...patch,
@@ -621,9 +627,10 @@ export class CreationDraftStore {
     this.notify(id);
     this.summaries.delete(id);
     this.recomputeList();
+    // Pending before the wait, so a list that lands meanwhile cannot show the record again.
+    this.pendingDeletes.add(id);
     // Let a save in flight land first, so it cannot recreate the file after the delete.
     await entry?.inFlight;
-    this.pendingDeletes.add(id);
     await this.sendDelete(id, 0);
   }
 
@@ -631,8 +638,15 @@ export class CreationDraftStore {
     const client = this.client;
     // Without a client the next one retries it (setClient).
     if (!client || !this.pendingDeletes.has(id)) return;
+    const request = client.drafts.deleteCreation({ scope: { kind: "creation", draftId: id } });
+    const running: Promise<void> = Promise.allSettled([this.deletesInFlight.get(id), request]).then(
+      () => {
+        if (this.deletesInFlight.get(id) === running) this.deletesInFlight.delete(id);
+      }
+    );
+    this.deletesInFlight.set(id, running);
     try {
-      await client.drafts.deleteCreation({ scope: { kind: "creation", draftId: id } });
+      await request;
       this.pendingDeletes.delete(id);
       // A list that was read before the delete must not show the record again.
       if (this.summaries.delete(id)) this.recomputeList();
