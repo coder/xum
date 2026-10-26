@@ -6,7 +6,7 @@
  * the partial flush, which still lives there, and the abort cleanup
  * (AttemptLoop.cleanupAbortedStream).
  */
-import { Effect, Exit, Scope } from "effect";
+import { Effect, Exit, Fiber, Scope } from "effect";
 import assert from "@/common/utils/assert";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
@@ -289,10 +289,17 @@ export class TurnRegistry {
       )
     );
     // A turn that settles on its own leaves the engine scope (no per-stream residue).
-    // The completion promise never rejects.
+    // The completion promise never rejects. The loop settles the completion before its
+    // promise returns, so the loop fiber is still running here: closing the scope now
+    // would interrupt it and run stopForShutdown on a settled turn. Close only after the
+    // fiber exits. A turn whose processing never launched has no fiber.
     void streamInfo.completionController.promise.then(() => {
       settled = true;
-      this.deps.effectRunner.runFork(Scope.close(turnScope, Exit.void));
+      const close = Scope.close(turnScope, Exit.void);
+      const loopFiber = streamInfo.engineFiber;
+      this.deps.effectRunner.runFork(
+        loopFiber === undefined ? close : Effect.andThen(Fiber.await(loopFiber), close)
+      );
     });
   }
 

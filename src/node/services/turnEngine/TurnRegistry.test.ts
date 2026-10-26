@@ -306,6 +306,29 @@ describe("TurnRegistry", () => {
     expect(finalizerCount(engineScope)).toBe(0);
   });
 
+  test("a turn whose loop settles on its own is not stopped when it leaves the engine scope", async () => {
+    // The loop settles the completion before its promise returns. Closing the turn
+    // scope at that point would interrupt the loop fiber, whose interrupt handler
+    // stops the already-settled turn as "system" (Codex review on #7500).
+    const engineScope = Scope.makeUnsafe();
+    const { registry, cleanups } = createRegistry({ engineScope });
+    const info = streamFixture();
+    registry.superviseEngine(WS, info);
+
+    registry.launchProcessing(WS, info, async () => {
+      await Promise.resolve();
+      info.completionController.settle({ status: "completed" } as TurnCompletion);
+      await Promise.resolve();
+    });
+    for (let tick = 0; tick < 50 && finalizerCount(engineScope) > 0; tick++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    expect(finalizerCount(engineScope)).toBe(0);
+    expect(cleanups).toEqual([]);
+    expect(info.abortController.signal.aborted).toBe(false);
+  });
+
   test("launchProcessing runs the loop's synchronous start before it returns", async () => {
     for (const engineScope of [Scope.makeUnsafe(), undefined]) {
       const { registry } = createRegistry({ engineScope });
