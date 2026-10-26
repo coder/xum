@@ -729,7 +729,7 @@ function withToolTypeArraysAsAnyOf(model: Parameters<typeof wrapLanguageModel>[0
  * createOpenAIModelWithPreservedOptions: the injected "none" must be visible
  * to that wrapper's body patch, or the SDK strips it.
  */
-export function clampGpt6ChatCompletionsToolReasoning(
+function clampGpt6ChatCompletionsToolReasoning(
   model: LanguageModelV4,
   capabilityModel: string
 ): LanguageModelV4 {

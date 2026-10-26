@@ -251,17 +251,8 @@ async function collectBytesWithCeiling(
   return Buffer.concat(chunks, total);
 }
 
-/** Parse buildArtifactReadScript output into the shared wire result. */
-export function parseArtifactReadOutput(
-  stdout: Buffer,
-  relPath: string,
-  maxBytes: number
-): ArtifactReadOutcome {
-  return toArtifactReadOutcome(relPath, parseArtifactReadBytes(stdout, maxBytes), maxBytes);
-}
-
 /** Parse buildArtifactReadScript output into raw bytes. Throws on malformed output. */
-export function parseArtifactReadBytes(stdout: Buffer, maxBytes: number): ArtifactBytesOutcome {
+function parseArtifactReadBytes(stdout: Buffer, maxBytes: number): ArtifactBytesOutcome {
   const start = stdout.indexOf(`${READ_MAGIC}\0`);
   if (start === -1) throw new Error("Artifact read output has no header");
   let offset = start + READ_MAGIC.length + 1;

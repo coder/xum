@@ -87,7 +87,7 @@ describe("HeldInput transcript-only Discard shortcut", () => {
   test("an auto-repeated chord discards only the oldest held input", async () => {
     const { view, discarded } = renderTranscriptOnlyBanners(["held-1", "held-2", "held-3"]);
     pressDiscard();
-    await waitFor(() => expect(view.queryByText("held-1")).toBeNull());
+    await waitFor(() => expect(view.queryByText("held-1") === null).toBe(true));
     // The key stays down: the next banner is now the target and must ignore the repeats.
     pressDiscard({ repeat: true });
     pressDiscard({ repeat: true });

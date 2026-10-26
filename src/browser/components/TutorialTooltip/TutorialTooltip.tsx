@@ -46,14 +46,32 @@ function isBubbleCovered(bubble: HTMLElement): boolean {
 }
 
 /**
+ * Layers the user opened on purpose: a Radix popover, select or tooltip wrapper, a menu, a listbox
+ * or a dialog. Focus inside one of them stays there, because Radix closes a popover or menu when
+ * focus leaves it (#7452: the bubble closed the "Workspace actions" menu the user had just opened).
+ */
+const OPEN_LAYER_SELECTOR = [
+  "[data-radix-popper-content-wrapper]",
+  '[role="menu"]',
+  '[role="listbox"]',
+  '[role="dialog"]',
+].join(",");
+
+/** Whether the bubble may move focus from `active` without being asked (see useBubbleFocus). */
+function mayTakeFocusFrom(active: Element | null): boolean {
+  return !isEditableElement(active) && active?.closest(OPEN_LAYER_SELECTOR) == null;
+}
+
+/**
  * Moves focus into the bubble once it is on screen (a hidden element cannot take focus), so
  * Escape, Skip and Next work from the keyboard (#5701). Later steps keep focus on the control that
  * advanced them. When the bubble closes and leaves focus on the body, focus goes back to where it
  * was. An open modal dialog traps focus, so the bubble cannot take it from one.
  *
  * It leaves focus alone in a text field, where the user may be typing (keys such as Escape would
- * otherwise skip a tutorial they never chose to act on), and under a layer that covers the bubble,
- * where Escape would skip a tutorial the user cannot see (#7114). The bubble stays clickable.
+ * otherwise skip a tutorial they never chose to act on), inside an open layer (OPEN_LAYER_SELECTOR),
+ * and under a layer that covers the bubble, where Escape would skip a tutorial the user cannot see
+ * (#7114). The bubble stays clickable.
  */
 function useBubbleFocus(
   tooltipRef: React.RefObject<HTMLDivElement | null>,
@@ -63,7 +81,7 @@ function useBubbleFocus(
     const bubble = tooltipRef.current;
     if (!isPositioned || !bubble) return;
     const previous = document.activeElement;
-    if (!isEditableElement(previous) && !isBubbleCovered(bubble)) bubble.focus();
+    if (mayTakeFocusFrom(previous) && !isBubbleCovered(bubble)) bubble.focus();
     // Registered even when the bubble left focus alone: a click on Skip or Next still moves focus
     // into the bubble, and it must go back to the composer when the bubble closes.
     return () => {

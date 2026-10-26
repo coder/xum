@@ -1,6 +1,12 @@
 import { describe, expect, test } from "bun:test";
 
-import { summarizeToolResultForLog } from "./StepApply";
+import {
+  createTestLanguageModel,
+  createWorkspaceStreamInfoForTests,
+} from "@/node/services/streamManager.suite.testHarness";
+
+import { summarizeToolResultForLog, turnReplayOffAfterServerTool } from "./StepApply";
+import type { WorkspaceStreamInfo } from "./turnState";
 
 describe("summarizeToolResultForLog", () => {
   test("strings log their length and a preview cut at 160 characters", () => {
@@ -65,5 +71,44 @@ describe("summarizeToolResultForLog", () => {
       outputType: "undefined",
       outputPreview: undefined,
     });
+  });
+});
+
+describe("turnReplayOffAfterServerTool", () => {
+  const serverToolPart = {
+    type: "dynamic-tool" as const,
+    toolCallId: "srvtoolu_1",
+    toolName: "web_search",
+    state: "output-available" as const,
+    input: { query: "xum" },
+    output: [],
+  };
+  const anthropicStream = (parts: WorkspaceStreamInfo["parts"]) =>
+    createWorkspaceStreamInfoForTests({
+      parts,
+      anthropicServerToolCallIds: new Set(["srvtoolu_1"]),
+      request: {
+        model: createTestLanguageModel("claude-opus-5-5", "anthropic.messages"),
+        messages: [],
+      },
+    });
+
+  test("reasoning after a server tool in the row turns thinking replay off up to the row end", () => {
+    const streamInfo = anthropicStream([serverToolPart]);
+    turnReplayOffAfterServerTool(streamInfo);
+    expect(streamInfo.initialMetadata).toMatchObject({
+      anthropicThinkingReplay: "off",
+      anthropicThinkingReplayFromStep: "end",
+    });
+  });
+
+  // A retry that discards the parts drops the server-tool part but not its recorded ID.
+  // Dropping the stale IDs is the perf contract: later reasoning deltas return early
+  // instead of scanning every part again.
+  test("after a retry dropped the server-tool part, replay stays on and the stale IDs go", () => {
+    const streamInfo = anthropicStream([]);
+    turnReplayOffAfterServerTool(streamInfo);
+    expect(streamInfo.initialMetadata?.anthropicThinkingReplay).toBeUndefined();
+    expect(streamInfo.anthropicServerToolCallIds).toBeUndefined();
   });
 });

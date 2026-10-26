@@ -447,7 +447,7 @@ describeIntegration("RightSidebar (UI)", () => {
         )
       );
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
       expect(isCollapsed()).toBe(false);
 
@@ -554,7 +554,7 @@ describeIntegration("RightSidebar (UI)", () => {
         )
       );
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
       await waitFor(() => expect(activeTabDescription()).toMatch(/^tab .*-panel-costs$/));
     } finally {
@@ -583,7 +583,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Outside the viewport the same chord still closes the active tab.
       fireEvent.keyDown(window, closeTab);
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
     } finally {
       viewport.remove();
@@ -800,7 +800,7 @@ describeIntegration("RightSidebar (UI)", () => {
       toggle.focus();
       fireEvent.mouseUp(toggle);
       fireEvent.click(toggle);
-      await waitFor(() => expect(sidebar.querySelector('[role="tablist"]')).toBeNull());
+      await waitFor(() => expect(sidebar.querySelector('[role="tablist"]') === null).toBe(true));
       fireEvent.click(toggle);
 
       await findSidebarTab(sidebar, "costs");
@@ -849,7 +849,7 @@ describeIntegration("RightSidebar (UI)", () => {
       expect(panel()).not.toBeNull();
       running = null;
       closing.finish();
-      await waitFor(() => expect(panel()).toBeNull());
+      await waitFor(() => expect(panel() === null).toBe(true));
       expect(card()).not.toBeNull();
 
       const opening = new FakeCSSTransition();
@@ -1308,7 +1308,7 @@ describeIntegration("RightSidebar (UI)", () => {
       fireEvent.keyDown(reviewPanel, { key: "w", ctrlKey: true });
 
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
       expect(sidebar.querySelector('[role="tab"][aria-controls*="costs"]')).not.toBeNull();
     } finally {

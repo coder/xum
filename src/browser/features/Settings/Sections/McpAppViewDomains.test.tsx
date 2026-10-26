@@ -205,7 +205,7 @@ describe("MCP Apps allowed view domains", () => {
         await revokeMcpAppViewDomains(client, { projectPath: "/repo", serverName: "charts" })
       ).toBeNull();
     });
-    await waitFor(() => expect(view.queryByText(/api\.example\.com/)).toBeNull());
+    await waitFor(() => expect(view.queryByText(/api\.example\.com/) === null).toBe(true));
   });
 
   test("a malformed stored origin renders as text instead of crashing Settings", async () => {

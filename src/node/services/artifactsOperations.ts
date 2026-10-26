@@ -97,8 +97,6 @@ export async function resolveArtifactsLocation(
   metadata: ArtifactsWorkspaceMetadata,
   options?: {
     createRuntime?: (metadata: ArtifactsWorkspaceMetadata) => Runtime;
-    canBindMountHostPaths?: () => Promise<boolean>;
-    hostSupportsDescriptorPaths?: () => Promise<boolean>;
     abortSignal?: AbortSignal;
   }
 ): Promise<ArtifactsLocation> {
@@ -113,7 +111,6 @@ export async function resolveArtifactsLocation(
     sessionsDir,
     runtime: { getXumHome: () => getRuntime().getXumHome() },
     multiProject: (metadata.projects?.length ?? 0) > 1, // isMultiProject, on a narrower type
-    canBindMountHostPaths: options?.canBindMountHostPaths,
   });
   switch (spec.kind) {
     case "host":
@@ -135,10 +132,7 @@ export async function resolveArtifactsLocation(
       // can be raced from there. Hosts with descriptor paths (Linux) pin every folder; elsewhere
       // the dir is read inside the container, where a swap reaches nothing the container could
       // not already read.
-      const pinnable = await (
-        options?.hostSupportsDescriptorPaths ?? hostSupportsDescriptorPaths
-      )();
-      if (!pinnable) {
+      if (!(await hostSupportsDescriptorPaths())) {
         return { kind: "runtime", runtime: getRuntime(), dir: getArtifactsDir(spec.dir) };
       }
       return { kind: "host", dir: getArtifactsDir(spec.dir), containerWritable: true };

@@ -8,7 +8,7 @@ import type { SendMessageInternalOptions } from "./taskWorkspaceSeam";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
-  createStreamLifecycleMocks,
+  createTestStreamManager,
 } from "./agentSession.testHarness";
 import { makeTestEffectRunner, TEST_CLOCK_START_MS } from "./di/testEffectRunner";
 import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
@@ -2253,12 +2253,12 @@ describe("WorkspaceService interruptStream", () => {
       workspaceId,
       captureEvents: true,
       backgroundProcessManager: createTestBackgroundProcessManager(),
-      streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+      streamManager: createTestStreamManager(undefined, clock.runner),
     });
     const service = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
-      aiService: h.aiService as AIService,
+      aiService: h.aiService as unknown as AIService,
       initStateManager: h.initStateManager,
       extensionMetadata: new ExtensionMetadataService(
         path.join(h.config.rootDir, "extensionMetadata.json")
@@ -2304,7 +2304,7 @@ describe("WorkspaceService interruptStream", () => {
     const service = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
-      aiService: h.aiService as AIService,
+      aiService: h.aiService as unknown as AIService,
       initStateManager: h.initStateManager,
       extensionMetadata: new ExtensionMetadataService(
         path.join(h.config.rootDir, "extensionMetadata.json")
@@ -2394,7 +2394,7 @@ describe("WorkspaceService interruptStream", () => {
     const workspaceService = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
-      aiService: h.aiService as AIService,
+      aiService: h.aiService as unknown as AIService,
       initStateManager: h.initStateManager,
       extensionMetadata,
       backgroundProcessManager: h.backgroundProcessManager,

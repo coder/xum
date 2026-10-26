@@ -1,9 +1,16 @@
 /**
  * Shared fixtures for the StreamManager test files (streamManager*.test.ts).
  */
-import { expect, afterEach, beforeEach } from "bun:test";
+import { expect, afterEach, beforeEach, mock } from "bun:test";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import type { StreamManager, TurnExecutionOptions, WorkspaceStreamInfo } from "./streamManager";
+import { Ok } from "@/common/types/result";
+import type {
+  ModelFallbackOptions,
+  ModelFallbackPrepareOptions,
+  StreamManager,
+  TurnExecutionOptions,
+  WorkspaceStreamInfo,
+} from "./streamManager";
 import { fakeStreamText } from "./streamManager.testHarness";
 import type { ExecOptions, ExecStream, Runtime } from "@/node/runtime/Runtime";
 import type { LanguageModel, ModelMessage, streamText } from "ai";
@@ -156,6 +163,17 @@ export function createStreamInfoForTests(overrides: StreamInfoFixture = {}): Str
   return { ...defaults, ...overrides };
 }
 
+/**
+ * createStreamInfoForTests typed as the engine record, for turn-engine unit tests that
+ * call an owner directly. The SDK result and request stay loose fakes: pass only the
+ * fields the owner under test reads.
+ */
+export function createWorkspaceStreamInfoForTests(
+  overrides: StreamInfoFixture = {}
+): WorkspaceStreamInfo {
+  return createStreamInfoForTests(overrides) as unknown as WorkspaceStreamInfo;
+}
+
 /** A fullStream chunk, or a callback awaited at that point of the stream (mid-turn side effects). */
 export type ScriptedChunk = Record<string, unknown> | (() => unknown);
 
@@ -169,6 +187,13 @@ export interface ScriptedAttempt {
   steps?: Array<{ usage: Record<string, number>; providerMetadata?: Record<string, unknown> }>;
   /** Keep the stream open after the chunks until the turn's abort signal fires. */
   holdUntilAbort?: boolean;
+}
+
+export function finishStep(
+  usage: Record<string, number>,
+  providerMetadata?: Record<string, unknown>
+): Record<string, unknown> {
+  return { type: "finish-step", usage, ...(providerMetadata ? { providerMetadata } : {}) };
 }
 
 export const STOP_FINISH = { type: "finish", finishReason: "stop" };
@@ -310,4 +335,30 @@ export async function prepareStepForTests(
     toolsContext: {},
     runtimeContext: {},
   });
+}
+
+/** The fallback model of preparedFallback's one-hop chain. */
+export const PREPARED_FALLBACK_MODEL = "openai:gpt-5.6-luna";
+
+/** A one-hop chain whose fallback prepares a plain request; `prepare` records its calls. */
+export function preparedFallback(
+  overrides: {
+    onStreamConstructed?: () => Promise<void>;
+    initialMetadataPatch?: { systemMessageTokens: number };
+  } = {}
+): ModelFallbackOptions & { prepare: ReturnType<typeof mock> } {
+  const prepare = mock((nextModelString: string, _options?: ModelFallbackPrepareOptions) =>
+    Promise.resolve(
+      Ok({
+        model: createTestLanguageModel("fallback-model"),
+        modelString: nextModelString,
+        messages: [],
+        system: "You are a helpful assistant",
+        tools: undefined,
+        thinkingLevel: "off" as const,
+        ...overrides,
+      })
+    )
+  );
+  return { chain: [PREPARED_FALLBACK_MODEL], prepare };
 }

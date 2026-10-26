@@ -265,23 +265,28 @@ function addEntryLine(context: ListingContext, line: string): boolean {
 const FRAME_END = "\n.\nEND\n";
 const ROOT_PREFIX = "ROOT\t\t";
 
-/** The listing's entry lines, root and base64 lines; null when its frame is wrong or cut. */
+/** The listing's entry lines, root and base64 section; null when its frame is wrong or cut. */
 function splitListing(
   stdout: string
-): { entryLines: string[]; root: string; base64Lines: string[] } | null {
+): { entryLines: string[]; root: string; base64: string } | null {
   if (stdout.length > MAX_LISTING_OUTPUT_BYTES || !stdout.endsWith(FRAME_END)) return null;
-  const lines = stdout.slice(0, -FRAME_END.length).split("\n");
-  const tarLine = lines.indexOf("T");
-  const rootLine = tarLine < 1 ? "" : lines[tarLine - 1];
+  // Only the lines before the first `T` line are split. The base64 lines (most of the output near
+  // the cap) stay one slice of stdout: split and joined, they held ~45 MiB at once (#7249).
+  const tarLine = stdout.indexOf("\nT\n");
+  const lines = tarLine === -1 ? [] : stdout.slice(0, tarLine).split("\n");
+  const rootLine = lines.at(-1) ?? "";
   const root = rootLine.slice(ROOT_PREFIX.length);
   if (!rootLine.startsWith(ROOT_PREFIX) || !isCanonicalRemotePath(root)) return null;
-  return { entryLines: lines.slice(0, tarLine - 1), root, base64Lines: lines.slice(tarLine + 1) };
+  const base64 = stdout.slice(tarLine + 3, -FRAME_END.length);
+  return { entryLines: lines.slice(0, -1), root, base64 };
 }
 
 /** The tar and its files, decoded once; null when the base64 or the tar is malformed. */
-function decodeTar(base64Lines: string[]): { tar: Buffer; files: Map<string, Buffer> } | null {
-  if (!base64Lines.every((line) => /^[A-Za-z0-9+/=]*$/.test(line))) return null;
-  const tar = Buffer.from(base64Lines.join(""), "base64");
+function decodeTar(base64: string): { tar: Buffer; files: Map<string, Buffer> } | null {
+  // The base64 alphabet plus the line breaks, which Buffer.from skips: the same bytes as the
+  // joined lines, decoded without a joined copy.
+  if (!/^[A-Za-z0-9+/=\n]*$/.test(base64)) return null;
+  const tar = Buffer.from(base64, "base64");
   const files = tar.length === 0 ? new Map<string, Buffer>() : parseTarFiles(tar);
   return files === null ? null : { tar, files };
 }
@@ -310,7 +315,7 @@ function retainedBytes(tar: Buffer, nodes: Map<string, MemoryNode>): number {
 export function parseRemotePluginListing(stdout: string): RemotePluginListing | null {
   const parts = splitListing(stdout);
   if (parts === null) return null;
-  const decoded = decodeTar(parts.base64Lines);
+  const decoded = decodeTar(parts.base64);
   // The script counts every D, L and F line against the same cap (K lines name the containers).
   const counted = parts.entryLines.filter((line) => !line.startsWith("K\t")).length;
   if (decoded === null || counted > MAX_REMOTE_PLUGIN_ENTRIES) return null;

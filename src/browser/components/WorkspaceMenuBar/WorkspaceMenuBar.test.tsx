@@ -551,7 +551,7 @@ describe("WorkspaceMenuBar archive confirmations", () => {
     expect(document.activeElement).toBe(input);
     await typeTitle(input, "  Renamed  {Enter}");
 
-    await waitFor(() => expect(view.queryByTestId("workspace-title-input")).toBeNull());
+    await waitFor(() => expect(view.queryByTestId("workspace-title-input") === null).toBe(true));
     expect(updateWorkspaceTitleMock).toHaveBeenCalledTimes(1);
     expect(updateWorkspaceTitleMock).toHaveBeenCalledWith(workspaceId, "Renamed");
     expect(document.activeElement).toBe(view.getByTestId("workspace-more-actions"));
@@ -1280,7 +1280,9 @@ describe("WorkspaceMenuBar archive confirmations", () => {
       fireEvent.keyDown(window, { key: "U", ctrlKey: true, shiftKey: true });
     });
     // The first import of the real heartbeat modal can take over a second here.
-    await waitFor(() => expect(view.queryByText("Loading…")).toBeNull(), { timeout: 10_000 });
+    await waitFor(() => expect(view.queryByText("Loading…") === null).toBe(true), {
+      timeout: 10_000,
+    });
     expect(view.getByText("Configure heartbeat")).not.toBeNull();
     expect(messagingDialogOpen()).toBe(false);
   }, 20_000);

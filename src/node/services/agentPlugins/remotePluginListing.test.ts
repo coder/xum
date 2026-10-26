@@ -104,6 +104,22 @@ describe("parseRemotePluginListing", () => {
     expect(parseRemotePluginListing(listing([`F\t\t${a}`], [path.join(root, "p")]))).toBeNull();
   });
 
+  test("base64 that a lenient decoder would skip through, or a cut tar, refuses the listing", async () => {
+    const [a] = await writeFiles({ "p/a.md": "a" });
+    const good = listing([`F\t\t${a}`], [a]);
+    expect(parseRemotePluginListing(good)).not.toBeNull();
+    // Buffer.from(_, "base64") skips "!" and "\r", so these decode to the same tar: only the
+    // alphabet check refuses them.
+    const [head, base64] = good.split("\nT\n");
+    for (const bad of [base64.replace("\n", "\n!!!!\n"), base64.replaceAll("\n", "\r\n")]) {
+      expect(parseRemotePluginListing(`${head}\nT\n${bad}`)).toBeNull();
+    }
+    // Base64 lines missing at the end: the tar has no end-of-archive block.
+    const lines = base64.split("\n");
+    const cut = [...lines.slice(0, 4), ...lines.slice(-3)].join("\n");
+    expect(parseRemotePluginListing(`${head}\nT\n${cut}`)).toBeNull();
+  });
+
   test("pax headers name the next member; a malformed, oversized or escaping one refuses", async () => {
     const [a] = await writeFiles({ "p/a.md": "a" });
     // pax extended headers (bsdtar's default format) carry a long name and other records.
