@@ -972,7 +972,6 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
       modelString: "openai:gpt-5.2",
       cfg: params.cfg,
       providersConfig: null,
-      mcpServers: {},
       agentDefinitionCache: params.cache,
       runtimeFactory: nodeRuntimeFactory,
     });

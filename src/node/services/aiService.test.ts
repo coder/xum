@@ -4143,6 +4143,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       rolloverAvailable?: boolean;
       toolSearch?: boolean;
       failedMcpServers?: string[];
+      // The enabled MCP servers this request lists (default: all).
+      mcpServerNames?: string[];
       agentId?: string;
       // Earlier turns, sent before the latest user message (or built from the earlier requests).
       history?: MuxMessage[] | ((requests: TurnExecutionOptions[]) => MuxMessage[]);
@@ -4220,7 +4222,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
             // Like the real manager: the prompt inventory is the enabled
             // (configured, trusted, allowed) servers, not the running ones.
             overridesUsed: {},
-            serversUsed: mcpServers,
+            serversUsed:
+              state.mcpServerNames == null
+                ? mcpServers
+                : Object.fromEntries(
+                    Object.entries(mcpServers).filter(([name]) =>
+                      state.mcpServerNames?.includes(name)
+                    )
+                  ),
             stats: {
               totalTools: 1,
               activeServerCount: 2 - failedServerNames.length,
@@ -4346,6 +4355,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         states: [{}, { failedMcpServers: ["beta"] }],
         observe: (request) => systemTail(request),
       },
+      {
+        // F35: the <mcp> server list is volatile too, so turning one server off keeps the cache.
+        label: "MCP server list change",
+        states: [{}, { mcpServerNames: ["alpha"] }],
+        observe: (request) => systemTail(request),
+      },
     ])(
       "keeps the tool block and the cached system row across $label",
       async ({ states, observe }) => {
@@ -4441,6 +4456,26 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         }),
       ]);
     const lastRow = (request: TurnExecutionOptions) => JSON.stringify(request.messages.at(-1));
+
+    it("sends an MCP server list change mid-segment as a tail row", async () => {
+      // F35: turning one MCP server off rewrote the cached stable prompt in every busy
+      // workspace at once. The list now rides the volatile tail, and a change is a row.
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const {
+        requests: [first, changed],
+      } = await streamPair(
+        xumHome.path,
+        [{}, { mcpServerNames: ["alpha"], history: instructionLedger }],
+        undefined,
+        "anthropic"
+      );
+      expect(stableSystemRow(first)).not.toContain("<mcp>");
+      expect(stableSystemRow(changed)).toBe(stableSystemRow(first));
+      expect(changed.initialMetadata?.volatileSystemTail?.placement).toBe("row");
+      expect(lastRow(changed)).toContain("<mcp>");
+      expect(lastRow(changed)).toContain("- alpha");
+      expect(lastRow(changed)).not.toContain("- beta");
+    });
 
     it("keeps the cached system row across an AGENTS.md Mode: section change", async () => {
       // Codex P2 PRRT_kwDOPxxmWM6vffUy: a scoped section leaves <custom-instructions> for its

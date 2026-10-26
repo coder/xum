@@ -128,7 +128,6 @@ async function buildSystemContextForTest(args: {
     modelString: "openai:gpt-5.2",
     cfg: args.cfg,
     providersConfig: null,
-    mcpServers: {},
     memoryToolAvailable: args.memoryToolAvailable,
     tokenBudgetEnabled: args.tokenBudgetEnabled,
     workspaceMemoryWritable: args.workspaceMemoryWritable,
@@ -2092,7 +2091,6 @@ describe("buildStreamSystemContext", () => {
       modelString: "openai:gpt-5.2",
       cfg,
       providersConfig: null,
-      mcpServers: {},
       runtimeFactory,
     });
 
@@ -2298,7 +2296,6 @@ describe("buildStreamSystemContext", () => {
       modelString: "openai:gpt-5.2",
       cfg,
       providersConfig: null,
-      mcpServers: {},
       runtimeFactory,
     });
 

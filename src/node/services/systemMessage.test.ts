@@ -11,7 +11,6 @@ import {
 } from "./systemMessage";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ProjectConfig } from "@/common/types/project";
-import type { MCPServerMap } from "@/common/types/mcp";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
 
@@ -40,7 +39,6 @@ async function buildSystemMessage(
   workspacePath: string,
   additionalSystemInstructions?: string,
   modelString?: string,
-  mcpServers?: MCPServerMap,
   options?: BuildSystemMessageFromSourcesOptions & {
     projectConfigs?: Map<string, ProjectConfig>;
     claudeSkillsCompatEnabled?: boolean;
@@ -59,7 +57,6 @@ async function buildSystemMessage(
     workspacePath,
     additionalSystemInstructions,
     modelString,
-    mcpServers,
     options
   ).systemMessage;
 }
@@ -341,7 +338,6 @@ Use clear examples.
           workspaceDir,
           undefined,
           undefined,
-          undefined,
           { scratchDirSet }
         ),
         "environment"
@@ -372,7 +368,7 @@ Use clear examples.
     };
     const agentInterfaceFor = async (agentInterfaceView: boolean | undefined) =>
       extractTagContent(
-        await buildSystemMessage(metadata, runtime, workspaceDir, undefined, undefined, undefined, {
+        await buildSystemMessage(metadata, runtime, workspaceDir, undefined, undefined, {
           scratchDirSet: true,
           agentInterfaceView,
         }),
@@ -394,7 +390,7 @@ Use clear examples.
     };
     const agentInterfaceFor = async (agentInterfaceView: boolean, statusPageAgent: boolean) =>
       extractTagContent(
-        await buildSystemMessage(metadata, runtime, workspaceDir, undefined, undefined, undefined, {
+        await buildSystemMessage(metadata, runtime, workspaceDir, undefined, undefined, {
           scratchDirSet: true,
           agentInterfaceView,
           statusPageAgent,
@@ -417,7 +413,7 @@ Use clear examples.
       runtimeConfig: DEFAULT_RUNTIME_CONFIG,
     };
     const build = (statusPageAgent: boolean) =>
-      buildSystemMessage(metadata, runtime, workspaceDir, undefined, undefined, undefined, {
+      buildSystemMessage(metadata, runtime, workspaceDir, undefined, undefined, {
         scratchDirSet: true,
         agentInterfaceView: true,
         statusPageAgent,
@@ -440,7 +436,7 @@ Use clear examples.
     });
 
     const buildWithCompat = (modelString?: string, modes?: readonly string[]): Promise<string> =>
-      buildSystemMessage(metadata(), runtime, workspaceDir, undefined, modelString, undefined, {
+      buildSystemMessage(metadata(), runtime, workspaceDir, undefined, modelString, {
         claudeSkillsCompatEnabled: true,
         modes,
       });
@@ -741,7 +737,6 @@ Include the secondary project context too.
         workspaceDir,
         undefined,
         undefined,
-        undefined,
         { projectConfigs }
       );
 
@@ -759,7 +754,6 @@ Include the secondary project context too.
         singleProjectMetadata(projectDir),
         runtime,
         workspaceDir,
-        undefined,
         undefined,
         undefined,
         { projectConfigs }
@@ -781,7 +775,6 @@ Include the secondary project context too.
         workspaceDir,
         undefined,
         undefined,
-        undefined,
         { projectConfigs }
       );
 
@@ -801,7 +794,6 @@ Include the secondary project context too.
         metadata,
         runtime,
         workspaceDir,
-        undefined,
         undefined,
         undefined,
         { projectConfigs }
@@ -832,7 +824,6 @@ Scoped project model guidance.
         workspaceDir,
         undefined,
         "anthropic:claude-3.5-sonnet",
-        undefined,
         { projectConfigs }
       );
 
@@ -981,7 +972,6 @@ Plan thoroughly before proposing.
       workspaceDir,
       undefined,
       undefined,
-      undefined,
       { modes: ["plan"] }
     );
 
@@ -1022,7 +1012,6 @@ Planner-specific guidance.
       workspaceDir,
       undefined,
       undefined,
-      undefined,
       { modes: ["plan", "my-planner"] }
     );
 
@@ -1059,7 +1048,6 @@ Exec-only guidance.
       metadata,
       runtime,
       workspaceDir,
-      undefined,
       undefined,
       undefined,
       { modes: ["plan"] }
@@ -1105,7 +1093,6 @@ Plan-only guidance.
       metadata,
       runtime,
       workspaceDir,
-      undefined,
       undefined,
       undefined,
       { modes: ["plan"] }
@@ -1185,7 +1172,6 @@ Be extra concise when using Sonnet.
         workspaceDir,
         undefined,
         "anthropic:claude-3.5-sonnet",
-        undefined,
         { agentSystemPromptSections: [agentSystemPrompt] }
       );
 
@@ -1226,7 +1212,6 @@ From agent: Be terse.
         workspaceDir,
         undefined,
         "anthropic:claude-3.5-sonnet",
-        undefined,
         { agentSystemPromptSections: [agentSystemPrompt] }
       );
 
@@ -1264,7 +1249,6 @@ From agent: Opus instructions.
         workspaceDir,
         undefined,
         "anthropic:claude-3.5-sonnet",
-        undefined,
         { agentSystemPromptSections: [agentSystemPrompt] }
       );
 
