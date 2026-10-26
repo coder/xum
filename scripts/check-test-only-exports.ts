@@ -591,6 +591,8 @@ export function findUnreferencedExports(
     seen.add(file);
     const names = module.exports.map((fact) => fact.name);
     for (const reExport of module.reExports) {
+      // `export { a } from "./b"` puts `a` in this namespace too.
+      names.push(...reExport.names.map((forwarded) => forwarded.exported));
       const target = reExport.star
         ? resolveSpecifier(reExport.specifier, file, knownFiles)
         : undefined;

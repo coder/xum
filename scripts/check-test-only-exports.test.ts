@@ -213,6 +213,15 @@ test("an explicit barrel export shadows the same name from export *", () => {
       "src/b.ts": 'import * as lib from "./index";\nlib;',
     })
   ).toEqual(["src/a.ts#value"]);
+  // A namespace use reaches names a star target forwards by name.
+  expect(
+    unreferenced({
+      "src/source.ts": "export const value = 1;",
+      "src/middle.ts": 'export { value } from "./source";',
+      "src/outer.ts": 'export * from "./middle";',
+      "src/b.ts": 'import * as lib from "./outer";\nlib;',
+    })
+  ).toEqual([]);
 });
 
 test("reports unlisted findings, stale and duplicate entries, and pendingDeletion growth", () => {
