@@ -11,7 +11,11 @@ import {
   GAP_MODES,
   type ConnectionHarness,
 } from "@/browser/contexts/connection.testHarness";
-import { createTestConfig, type TestApiOverrides, type TestClientConfig } from "@/browser/testUtils";
+import {
+  createTestConfig,
+  type TestApiOverrides,
+  type TestClientConfig,
+} from "@/browser/testUtils";
 import { getDefaultRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import {
   useDesktopAvailable,
@@ -28,8 +32,9 @@ import {
 /** What the server answers; a test swaps it (or holds it) before a connect. */
 let answerConfig: () => Promise<TestClientConfig>;
 let answerCapability: () => Promise<Awaited<ReturnType<APIClient["desktop"]["getCapability"]>>>;
-let answerSessions: () => Promise<Awaited<ReturnType<APIClient["terminal"]["listSessions"]>>> =
-  () => Promise.resolve([]);
+let answerSessions: () => Promise<
+  Awaited<ReturnType<APIClient["terminal"]["listSessions"]>>
+> = () => Promise.resolve([]);
 
 function serverOverrides(): TestApiOverrides<APIClient> {
   return {
@@ -121,7 +126,8 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
   });
 
   test("the desktop capability keeps its value through a read the drop cut off", async () => {
-    answerCapability = () => Promise.resolve({ available: true, width: 1280, height: 800, sessionId: "desktop-1" });
+    answerCapability = () =>
+      Promise.resolve({ available: true, width: 1280, height: 800, sessionId: "desktop-1" });
     const view = renderHook(() => useDesktopAvailable(useAPI().api, true, "ws-1"), {
       wrapper: Wrapper,
     });

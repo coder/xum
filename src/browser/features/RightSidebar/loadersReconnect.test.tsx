@@ -17,11 +17,7 @@ import {
 import { RouterProvider } from "@/browser/contexts/RouterContext";
 import { SettingsProvider } from "@/browser/contexts/SettingsContext";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import {
-  createTestConfig,
-  type TestApiOutput,
-  type TestApiOverrides,
-} from "@/browser/testUtils";
+import { createTestConfig, type TestApiOutput, type TestApiOverrides } from "@/browser/testUtils";
 import type { GoalBoardSnapshot, GoalRecordV1 } from "@/common/types/goal";
 import type { WorkspaceInstructions } from "@/common/types/instructions";
 import { GoalDefaultsSection } from "./GoalDefaultsSection";
