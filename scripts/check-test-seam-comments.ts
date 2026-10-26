@@ -65,7 +65,8 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "test doubles never pass it" or "test doubles record each render pass" stays quiet.
   // "Absent on test doubles", "Absent from a test double": the member is optional only so doubles
   // can leave it out.
-  /(?:^|[.!?]\s)\s*absent\s+(?:on|from|in)\s+(?:a\s+)?test\s+doubles?\b/i,
+  // An explicit subject and copula may come first: "This member is absent from test doubles".
+  /(?:^|[.!?]\s)\s*(?:(?:this\s+|the\s+)?[\w.]+\s+(?:is|are)\s+)?absent\s+(?:on|from|in)\s+(?:a\s+)?test\s+doubles?\b/i,
   // "Test doubles of AIService pass one too", "A test double passes runtimeFactory": the member
   // exists so doubles can supply it. "Test doubles pass the contract tests" is about tests.
   /(?:^|[.!?]\s)\s*(?:a\s+)?test\s+doubles?(?:\s+of\s+[\w.]+)?\s+(?:also\s+)?pass(?:es)?\s+(?!(?:the\s+|their\s+|all\s+)?[\w-]*\s*tests?\b)[\w.]+/i,
