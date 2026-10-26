@@ -995,6 +995,9 @@ describe("BackgroundProcessManager", () => {
     });
 
     it("retires the monitor when the output file disappears mid-run", async () => {
+      // Budget (#7531): the monitor's first remote poll can run before the file changes. Then
+      // it needs three more failed polls, 1 s apart, and terminate() adds its 2 s SIGTERM
+      // grace, so the test runs past the 5 s default. The same holds for the two tests below.
       const stoppedEvents: MonitorStoppedPayload[] = [];
       manager.on("monitor:stopped", (_workspaceId, payload) => stoppedEvents.push(payload));
 
@@ -1025,7 +1028,7 @@ describe("BackgroundProcessManager", () => {
       } finally {
         await manager.terminate(result.processId, { monitorDisposition: "discard" });
       }
-    });
+    }, 15_000);
 
     it("retires the monitor when the exit marker is corrupted", async () => {
       const stoppedEvents: MonitorStoppedPayload[] = [];
@@ -1058,7 +1061,7 @@ describe("BackgroundProcessManager", () => {
       } finally {
         await manager.terminate(result.processId, { monitorDisposition: "discard" });
       }
-    });
+    }, 15_000);
 
     it("retires the monitor when the exit marker becomes unreadable", async () => {
       const stoppedEvents: MonitorStoppedPayload[] = [];
@@ -1093,7 +1096,7 @@ describe("BackgroundProcessManager", () => {
       } finally {
         await manager.terminate(result.processId, { monitorDisposition: "discard" });
       }
-    });
+    }, 15_000);
 
     it("resets consecutive output failures after an output probe succeeds", async () => {
       const stoppedEvents: MonitorStoppedPayload[] = [];
