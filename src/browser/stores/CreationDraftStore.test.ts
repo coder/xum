@@ -79,6 +79,8 @@ async function createHarness(
     failReads: 0,
     readGate: Promise.resolve(),
     listGate: Promise.resolve(),
+    /** Holds a list reply that was read already (a snapshot older than what follows). */
+    listReplyGate: Promise.resolve(),
     listCalls: 0,
     failDeletes: 0,
     deleteCalls: 0,
@@ -89,7 +91,9 @@ async function createHarness(
     listCreation: async () => {
       control.listCalls++;
       await control.listGate;
-      return service.list();
+      const list = await service.list();
+      await control.listReplyGate;
+      return list;
     },
     getCreation: async ({ scope }: { scope: CreationDraftScope }) => {
       await control.readGate;
@@ -611,6 +615,50 @@ describe("CreationDraftStore", () => {
     releaseSave();
     await Promise.all([saving, deleting]);
     store.setClient(null);
+  });
+
+  test("a reconnect does not delete before the save the delete waits for (#7551)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-reconnect-save");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    let releaseSave: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    const saving = store.flush(id);
+    await waitFor(() => control.updates.length === 1);
+
+    const deleting = store.delete(id);
+    store.setClient(harness.newClient());
+    await waitFor(() => control.listCalls === 2 && store.getListState().status === "ready");
+    releaseSave();
+    await Promise.all([saving, deleting]);
+
+    expect(await service.get(id)).toBeNull();
+  });
+
+  test("a list read before a delete succeeds does not show the draft (#7551)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-stale-list");
+    const harness = await createHarness(tempDir);
+    const { store, control } = harness;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+    control.failDeletes = 1;
+    await store.delete(id);
+
+    let releaseList: () => void = () => undefined;
+    control.listReplyGate = new Promise<void>((resolve) => {
+      releaseList = resolve;
+    });
+    store.setClient(harness.newClient());
+    // The new list read the record, then the resent delete removed it.
+    await waitFor(() => control.listCalls === 2 && control.deletesDone === 1);
+    releaseList();
+    await waitFor(() => store.getListState().status === "ready");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
   });
 
   test("editing a draft whose delete failed keeps the new edits (#7551)", async () => {

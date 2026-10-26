@@ -281,6 +281,11 @@ export class CreationDraftStore {
    * and their listed records stay hidden. In memory only, as DraftStore's were before #6620.
    */
   private readonly pendingDeletes = new Set<string>();
+  /**
+   * Ids deleted in this session, confirmed or not: a list never shows them, even one read before
+   * the delete that lands after it. An edit (save) brings the draft back.
+   */
+  private readonly deletedIds = new Set<string>();
   /** Backoff timers of failed deletes. A new client (or none) clears them: it retries at once. */
   private readonly deleteTimers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Delete requests still running (settles, never rejects): a save of the same id waits. */
@@ -367,7 +372,7 @@ export class CreationDraftStore {
       if (this.listedClient !== client) return;
       this.summaries = new Map(
         list.drafts
-          .filter((summary) => !this.pendingDeletes.has(summary.draftId))
+          .filter((summary) => !this.deletedIds.has(summary.draftId))
           .map((summary) => [summary.draftId, summary])
       );
       // A local copy is newer than the backend's row, and a first save still running (the list
@@ -571,6 +576,7 @@ export class CreationDraftStore {
     // Editing a draft whose delete is unconfirmed cancels that delete: a later retry would
     // remove the new edits.
     this.pendingDeletes.delete(id);
+    this.deletedIds.delete(id);
     this.clearDeleteTimer(id);
     entry.pending = {};
     entry.saving = true;
@@ -627,10 +633,14 @@ export class CreationDraftStore {
     this.notify(id);
     this.summaries.delete(id);
     this.recomputeList();
-    // Pending before the wait, so a list that lands meanwhile cannot show the record again.
-    this.pendingDeletes.add(id);
-    // Let a save in flight land first, so it cannot recreate the file after the delete.
+    // Before the wait, so a list that lands meanwhile cannot show the record again.
+    this.deletedIds.add(id);
+    // Let a save in flight land first, so it cannot recreate the file after the delete. Pending
+    // (resent by a new client) only after it: a resend must not overtake that save either.
     await entry?.inFlight;
+    // An edit during the wait cancelled the delete.
+    if (!this.deletedIds.has(id)) return;
+    this.pendingDeletes.add(id);
     await this.sendDelete(id, 0);
   }
 
