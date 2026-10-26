@@ -13,7 +13,7 @@ import {
   selectWorkspace,
 } from "@/browser/stories/helpers/uiState";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
-import { openLeftSidebar } from "@/browser/stories/storyPlayHelpers";
+import { openLeftSidebar, waitForModalLayer } from "@/browser/stories/storyPlayHelpers";
 import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import type { AppStory } from "@/browser/stories/meta.js";
 import { PIXEL_DUAL_THEME, appMeta, AppWithMocks } from "@/browser/stories/meta.js";
@@ -53,8 +53,8 @@ async function openNewProjectModal(canvasElement: HTMLElement): Promise<void> {
   const addButton = await canvas.findByLabelText("Add project", {}, { timeout: 10000 });
   await userEvent.click(addButton);
 
-  // Wait for the dialog portal to render
-  await body.findByRole("dialog");
+  // Wait for the dialog portal to render and take clicks
+  await waitForModalLayer(await body.findByRole("dialog"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
