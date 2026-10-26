@@ -124,6 +124,8 @@ export interface ModuleFacts {
   usedLocally: Set<string>;
   imports: ImportFact[];
   reExports: ReExportFact[];
+  /** `module.exports = { a, b }`: a default import is the whole object, so it uses a and b. */
+  defaultIsWholeModule: boolean;
 }
 
 function scriptKind(file: string): ts.ScriptKind {
@@ -167,6 +169,28 @@ function statementBindings(statements: readonly ts.Statement[]): string[] {
 }
 
 /**
+ * `var` names declared anywhere in a function body outside nested functions. JavaScript hoists
+ * them to the whole function, so they shadow a module export of the same name there.
+ */
+function hoistedVarNames(body: ts.Node): string[] {
+  const names: string[] = [];
+  const walk = (node: ts.Node) => {
+    if (ts.isFunctionLike(node)) return;
+    if (
+      ts.isVariableDeclarationList(node) &&
+      (node.flags & ts.NodeFlags.BlockScoped) === ts.NodeFlags.None
+    ) {
+      for (const declaration of node.declarations) {
+        names.push(...bindingNames(declaration.name).map((id) => id.text));
+      }
+    }
+    ts.forEachChild(node, walk);
+  };
+  ts.forEachChild(body, walk);
+  return names;
+}
+
+/**
  * Names `node` binds for its own subtree (parameters, type parameters, catch variables, block
  * declarations, a named function or class expression's own name). Inside that subtree they
  * shadow a module-level export of the same name, so they are not uses of it.
@@ -179,6 +203,8 @@ function scopeBindings(node: ts.Node): string[] {
       names.push(...bindingNames(parameter.name).map((id) => id.text));
     }
     if (ts.isFunctionExpression(node) && node.name) names.push(node.name.text);
+    const body = (node as { body?: ts.Node }).body;
+    if (body !== undefined) names.push(...hoistedVarNames(body));
   }
   if (ts.isClassExpression(node) && node.name) names.push(node.name.text);
   const typeParameters = (node as { typeParameters?: ts.NodeArray<ts.TypeParameterDeclaration> })
@@ -245,6 +271,23 @@ function isPropertyName(node: ts.Identifier): boolean {
   return false;
 }
 
+/** `exports.a` / `module.exports.a` / `exports["a"]`: the exported name, else undefined. */
+function commonJsMemberName(target: ts.Expression): string | undefined {
+  const isExportsObject = (object: ts.Expression) =>
+    (ts.isIdentifier(object) && object.text === "exports") || isModuleExports(object);
+  if (ts.isPropertyAccessExpression(target) && isExportsObject(target.expression)) {
+    return target.name.text;
+  }
+  if (
+    ts.isElementAccessExpression(target) &&
+    isExportsObject(target.expression) &&
+    ts.isStringLiteralLike(target.argumentExpression)
+  ) {
+    return target.argumentExpression.text;
+  }
+  return undefined;
+}
+
 const isModuleExports = (node: ts.Expression) =>
   ts.isPropertyAccessExpression(node) &&
   ts.isIdentifier(node.expression) &&
@@ -252,8 +295,9 @@ const isModuleExports = (node: ts.Expression) =>
   node.name.text === "exports";
 
 /**
- * CommonJS exports a statement declares: `exports.a = ...` / `module.exports.a = ...` declare
- * `a`; `module.exports = { a, b }` declares `a` and `b`; any other `module.exports = x` declares
+ * CommonJS exports a statement declares: `exports.a = ...` / `module.exports.a = ...` /
+ * `exports["a"] = ...` declare `a`; `module.exports = { a, b }` declares `a` and `b` (and its
+ * default import is the whole object, see `ModuleFacts.defaultIsWholeModule`); any other `module.exports = x` declares
  * `default`. Undefined for statements that are not such an assignment.
  */
 function commonJsExportNames(statement: ts.Statement): string[] | undefined {
@@ -272,14 +316,19 @@ function commonJsExportNames(statement: ts.Statement): string[] | undefined {
         : [];
     });
   }
-  if (
-    ts.isPropertyAccessExpression(target) &&
-    ((ts.isIdentifier(target.expression) && target.expression.text === "exports") ||
-      isModuleExports(target.expression))
-  ) {
-    return [target.name.text];
-  }
-  return undefined;
+  const member = commonJsMemberName(target);
+  return member === undefined ? undefined : [member];
+}
+
+/** `module.exports = { ... }`. */
+function assignsModuleExportsObject(statement: ts.Statement): boolean {
+  return (
+    ts.isExpressionStatement(statement) &&
+    ts.isBinaryExpression(statement.expression) &&
+    statement.expression.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+    isModuleExports(statement.expression.left) &&
+    ts.isObjectLiteralExpression(statement.expression.right)
+  );
 }
 
 function stringArgument(node: ts.CallExpression): string | undefined {
@@ -299,6 +348,7 @@ export function collectModuleFacts(file: string, text: string): ModuleFacts {
   const exports: ExportFact[] = [];
   const imports: ImportFact[] = [];
   const reExports: ReExportFact[] = [];
+  let defaultIsWholeModule = false;
   /** Local name -> exported names, and the identifier nodes that declare it. */
   const exportedLocals = new Map<string, string[]>();
   const lineOf = (node: ts.Node) =>
@@ -364,6 +414,7 @@ export function collectModuleFacts(file: string, text: string): ModuleFacts {
       continue;
     }
     const commonJs = commonJsExportNames(statement);
+    if (assignsModuleExportsObject(statement)) defaultIsWholeModule = true;
     if (commonJs !== undefined) {
       for (const name of commonJs) addExport(name, undefined, statement);
       continue;
@@ -423,11 +474,14 @@ export function collectModuleFacts(file: string, text: string): ModuleFacts {
               : leftmost(qualifier);
         imports.push({ specifier: argument.literal.text, names: [first?.text ?? "*"] });
       }
+      // The qualifier names the other module's exports, not this file's.
+      for (const typeArgument of node.typeArguments ?? []) visit(typeArgument, inner);
+      return;
     }
     ts.forEachChild(node, (child) => visit(child, inner));
   };
   visit(sourceFile, new Set());
-  return { exports, usedLocally, imports, reExports };
+  return { exports, usedLocally, imports, reExports, defaultIsWholeModule };
 }
 
 function leftmost(name: ts.QualifiedName): ts.Identifier {
@@ -450,7 +504,11 @@ const RESOLVE_SUFFIXES = [
   "/index.tsx",
   "/index.mts",
   "/index.cts",
+  "/index.d.ts",
   "/index.js",
+  "/index.jsx",
+  "/index.mjs",
+  "/index.cjs",
 ];
 
 /** Sources an emitted-extension specifier (`./a.js`, NodeNext `./a.mjs`) can stand for. */
@@ -523,12 +581,37 @@ export function findUnreferencedExports(
   const knownFiles = new Set(facts.keys());
   const used = new Set<string>();
   const visited = new Set<string>();
+  /**
+   * The names `file`'s namespace holds: its own exports (named re-exports included) plus, through
+   * each `export *`, the target's names except `default` and the names `file` shadows.
+   */
+  const namespaceNames = (file: string, seen: Set<string> = new Set()): string[] => {
+    const module = facts.get(file);
+    if (module === undefined || seen.has(file)) return [];
+    seen.add(file);
+    const names = module.exports.map((fact) => fact.name);
+    for (const reExport of module.reExports) {
+      const target = reExport.star
+        ? resolveSpecifier(reExport.specifier, file, knownFiles)
+        : undefined;
+      if (target === undefined) continue;
+      for (const name of namespaceNames(target, seen)) {
+        if (name !== "default" && !explicitlyExports(module, name)) names.push(name);
+      }
+    }
+    return names;
+  };
   const markUse = (file: string, name: string) => {
     const key = `${file}#${name}`;
     if (visited.has(key)) return;
     visited.add(key);
     const module = facts.get(file);
     if (module === undefined) return;
+    // The default import of `module.exports = { a, b }` is the whole object.
+    if (name === "default" && module.defaultIsWholeModule) {
+      markUse(file, "*");
+      return;
+    }
     if (name === "*") {
       for (const fact of module.exports) used.add(`${file}#${fact.name}`);
     } else {
@@ -538,8 +621,14 @@ export function findUnreferencedExports(
       const target = resolveSpecifier(reExport.specifier, file, knownFiles);
       if (target === undefined) continue;
       if (reExport.star) {
-        // `export * from` never forwards `default`, nor a name the barrel exports explicitly.
-        if (name !== "default" && !explicitlyExports(module, name)) markUse(target, name);
+        // `export * from` never forwards `default`, nor a name the barrel exports explicitly, so
+        // a namespace use of the barrel reaches only the target's other names.
+        const names = name === "*" ? namespaceNames(target) : [name];
+        for (const forwarded of names) {
+          if (forwarded !== "default" && !explicitlyExports(module, forwarded)) {
+            markUse(target, forwarded);
+          }
+        }
         continue;
       }
       for (const forwarded of reExport.names) {

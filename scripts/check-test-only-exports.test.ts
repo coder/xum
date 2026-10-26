@@ -78,6 +78,14 @@ test("treats namespace, dynamic, require and import-type uses as references", ()
   expect(
     unreferenced({ "src/t.ts": target, "src/u.ts": 'type A = typeof import("./t").a;' })
   ).toEqual(["src/t.ts#b"]);
+  // An import-type qualifier names the other module's export, not a same-named local one.
+  expect(
+    unreferenced({
+      "src/t.ts": target,
+      "src/u.ts":
+        'export interface a {}\nexport interface c {}\nexport type R = import("./t").a<c>;',
+    })
+  ).toEqual(["src/t.ts#b", "src/u.ts#a", "src/u.ts#R"]);
   expect(
     unreferenced({ "src/t.ts": "export default 1;", "src/u.ts": 'import d from "./t";\nd;' })
   ).toEqual([]);
@@ -124,6 +132,7 @@ test("resolves the @/ alias, relative paths, ESM .js suffixes and index files", 
   expect(resolveSpecifier("./b.js", "src/a/x.ts", known)).toBe("src/a/b.ts");
   expect(resolveSpecifier("../a", "src/z/x.ts", known)).toBe("src/a/index.tsx");
   expect(resolveSpecifier("./c.js", "src/x.ts", known)).toBe("src/c.js");
+  expect(resolveSpecifier("./j", "src/x.ts", new Set(["src/j/index.jsx"]))).toBe("src/j/index.jsx");
   expect(resolveSpecifier("zod", "src/x.ts", known)).toBeUndefined();
   // NodeNext sources are imported by their emitted extensions.
   const nodeNext = new Set(["src/m.mts", "src/c.cts"]);
@@ -155,6 +164,8 @@ test("does not count shadowing bindings or a declaration's own body as uses", ()
         "function h<Generic>(x: Generic) { return x; }",
         "export const used = 5;",
         "function k(other: number) { return other + used; }",
+        "export const hoisted = 6;",
+        "function m() { if (true) { var hoisted = 0; } return hoisted; }",
       ].join("\n"),
     })
   ).toEqual([
@@ -164,18 +175,26 @@ test("does not count shadowing bindings or a declaration's own body as uses", ()
     "src/a.ts#Generic",
     "src/a.ts#recursive",
     "src/a.ts#Self",
+    "src/a.ts#hoisted",
   ]);
 });
 
 test("reads CommonJS exports", () => {
   expect(
     unreferenced({
-      "src/a.cjs": "exports.one = 1;\nmodule.exports.two = 2;",
+      "src/a.cjs": 'exports.one = 1;\nmodule.exports.two = 2;\nexports["five"] = 5;',
       "src/b.cjs": "module.exports = { three: 3, four: 4 };",
       "src/c.cjs": "module.exports = function () {};",
       "src/d.ts": 'import { one, three } from "./a.cjs";\nimport { three as t } from "./b.cjs";',
     })
-  ).toEqual(["src/a.cjs#two", "src/b.cjs#four", "src/c.cjs#default"]);
+  ).toEqual(["src/a.cjs#two", "src/a.cjs#five", "src/b.cjs#four", "src/c.cjs#default"]);
+  // The default import of `module.exports = { ... }` is the whole object.
+  expect(
+    unreferenced({
+      "src/b.cjs": "module.exports = { three: 3, four: 4 };",
+      "src/d.ts": 'import b from "./b.cjs";\nb.three;',
+    })
+  ).toEqual([]);
 });
 
 test("an explicit barrel export shadows the same name from export *", () => {
@@ -184,6 +203,14 @@ test("an explicit barrel export shadows the same name from export *", () => {
       "src/a.ts": "export const value = 1;",
       "src/index.ts": 'export * from "./a";\nexport const value = 2;',
       "src/b.ts": 'import { value } from "./index";\nvalue;',
+    })
+  ).toEqual(["src/a.ts#value"]);
+  // A namespace use of the barrel holds the barrel's own `value`, not a's.
+  expect(
+    unreferenced({
+      "src/a.ts": "export const value = 1;\nexport const other = 3;",
+      "src/index.ts": 'export * from "./a";\nexport const value = 2;',
+      "src/b.ts": 'import * as lib from "./index";\nlib;',
     })
   ).toEqual(["src/a.ts#value"]);
 });
