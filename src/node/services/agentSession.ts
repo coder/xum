@@ -239,6 +239,9 @@ import {
 } from "@/constants/acpMetadata";
 import { sendIdRefusalMessage, type SendIdDecision, type SendIdentity } from "./sendIds";
 
+/** The queue head as the drain's dequeue gates see it. */
+type QueueHead = NonNullable<ReturnType<MessageQueue["peekNext"]>>;
+
 /** A held input (see AgentSession.heldInputs): the refused send and why it was refused. */
 interface HeldInputEntry {
   id: string;
@@ -12447,6 +12450,46 @@ export class AgentSession {
     this.sendQueuedMessages("idle");
   }
 
+  /** Remove a head the dequeue gate refused; the user's manual input stays as held input. */
+  private refuseQueueHead(candidate: QueueHead, refusal: string): void {
+    const refusedSend = candidate.refusedManualSend();
+    const removed = this.messageQueue.removeEntry(candidate.identity);
+    if (removed == null) return;
+    if (refusedSend != null) {
+      // Held before the queue change is published, so no observer sees the input in neither.
+      this.holdRefusedSend(refusedSend, refusal);
+    }
+    this.emitQueuedMessageChanged();
+    this.notifyQueuedMessageCleared(removed, refusal);
+  }
+
+  /**
+   * Withdrawal gate (#7553): the tool-end cut skips a head that is not dispatchable and names the
+   * next entry as its successor, so that head must not claim a turn ahead of it. Settle it here as
+   * sendMessage's own refusal would: a fired cancel signal reports cancellation, a stale probe
+   * reports the blocked send, and nothing is held (Stop's restore skips such input too). A manual
+   * head whose input is still restorable keeps the full path: its failed preparation restores it
+   * with the rest of the queue, and the turn it claims keeps the queue from dispatching until that
+   * restore ran. Returns true when the head was settled here.
+   */
+  private settleWithdrawnQueueHead(candidate: QueueHead): boolean {
+    const withdrawal = candidate.withdrawal;
+    if (withdrawal == null || candidate.inputForRestore() != null) return false;
+    const removed = this.messageQueue.removeEntry(candidate.identity);
+    if (removed == null) return true;
+    this.emitQueuedMessageChanged();
+    if (withdrawal.kind === "canceled") {
+      if (withdrawal.cancelState) withdrawal.cancelState.canceledBeforeAcceptance = true;
+      this.notifyQueuedMessageCleared({ onCanceled: removed.onCanceled }, withdrawal.reason);
+    } else {
+      this.notifyQueuedMessageCleared(
+        { onAcceptedPreStreamFailure: removed.onAcceptedPreStreamFailure },
+        CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
+      );
+    }
+    return true;
+  }
+
   /**
    * Send queued messages if any exist.
    * Called when the current turn ends or the user chooses to send immediately.
@@ -12487,41 +12530,11 @@ export class AgentSession {
           ? SEND_ADMISSION_STALE_MESSAGE
           : undefined;
     if (refusal != null) {
-      const refusedSend = candidate.refusedManualSend();
-      const removed = this.messageQueue.removeEntry(candidate.identity);
-      if (removed != null) {
-        if (refusedSend != null) {
-          // Held before the queue change is published, so no observer sees the input in neither.
-          this.holdRefusedSend(refusedSend, refusal);
-        }
-        this.emitQueuedMessageChanged();
-        this.notifyQueuedMessageCleared(removed, refusal);
-      }
+      this.refuseQueueHead(candidate, refusal);
       this.sendQueuedMessages(trigger, stopAdmission);
       return;
     }
-    // Withdrawal gate (#7553): the tool-end cut skips a head that is not dispatchable and names
-    // the next entry as its successor, so that head must not claim a turn ahead of it. Settle it
-    // here as sendMessage's own refusal would: a fired cancel signal reports cancellation, a stale
-    // probe reports the blocked send, and nothing is held (Stop's restore skips such input too).
-    // A manual head whose input is still restorable keeps the full path: its failed preparation
-    // restores it with the rest of the queue, and the turn it claims keeps the queue from
-    // dispatching until that restore ran.
-    const withdrawal = candidate.withdrawal;
-    if (withdrawal != null && candidate.inputForRestore() == null) {
-      const removed = this.messageQueue.removeEntry(candidate.identity);
-      if (removed != null) {
-        this.emitQueuedMessageChanged();
-        if (withdrawal.kind === "canceled") {
-          if (withdrawal.cancelState) withdrawal.cancelState.canceledBeforeAcceptance = true;
-          this.notifyQueuedMessageCleared({ onCanceled: removed.onCanceled }, withdrawal.reason);
-        } else {
-          this.notifyQueuedMessageCleared(
-            { onAcceptedPreStreamFailure: removed.onAcceptedPreStreamFailure },
-            CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
-          );
-        }
-      }
+    if (this.settleWithdrawnQueueHead(candidate)) {
       this.sendQueuedMessages(trigger, stopAdmission);
       return;
     }
