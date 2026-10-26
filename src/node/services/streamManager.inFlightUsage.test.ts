@@ -7,10 +7,8 @@ import { describe, test, expect, spyOn, afterEach } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
-import { Ok } from "@/common/types/result";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { getTotalCost, sumUsageHistory } from "@/common/utils/tokens/usageAggregator";
-import type { ModelFallbackOptions } from "./streamManager";
 import { SessionUsageService, type SessionUsageFile } from "./sessionUsageService";
 import { createStreamManagerForTests } from "./streamManager.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
@@ -19,7 +17,9 @@ import {
   installStreamManagerTestHistory,
   historyService,
   historyConfig,
-  createTestLanguageModel,
+  finishStep,
+  PREPARED_FALLBACK_MODEL,
+  preparedFallback,
   REFUSAL_FINISH,
   STOP_FINISH,
   runTurnForTests,
@@ -29,10 +29,8 @@ import {
 installStreamManagerTestHistory();
 
 const MODEL = KNOWN_MODELS.SONNET.id;
-const FALLBACK_MODEL = "openai:gpt-5.6-luna";
 const STEP = { inputTokens: 1_000, outputTokens: 100, totalTokens: 1_100 };
 
-const finishStep = (usage: Record<string, number>) => ({ type: "finish-step", usage });
 const text = (value: string) => ({ type: "text-delta", text: value });
 
 function totals(ledger: SessionUsageFile | undefined) {
@@ -85,23 +83,6 @@ async function restartFromSnapshot(workspaceId: string): Promise<() => SessionUs
     { recursive: true }
   );
   return () => new SessionUsageService(restarted.config, restarted.historyService);
-}
-
-function preparedFallback(): ModelFallbackOptions {
-  return {
-    chain: [FALLBACK_MODEL],
-    prepare: (nextModelString: string) =>
-      Promise.resolve(
-        Ok({
-          model: createTestLanguageModel("fallback-model"),
-          modelString: nextModelString,
-          messages: [],
-          system: "You are a helpful assistant",
-          tools: undefined,
-          thinkingLevel: "off" as const,
-        })
-      ),
-  };
 }
 
 describe("StreamManager - in-flight session usage", () => {
@@ -309,11 +290,11 @@ describe("StreamManager - in-flight session usage", () => {
     // the fallback's finished step comes back from its in-flight file.
     expect(tokensByModel(await restarted!().getSessionUsage(workspaceId))).toEqual({
       [MODEL]: 500,
-      [FALLBACK_MODEL]: 320,
+      [PREPARED_FALLBACK_MODEL]: 320,
     });
     expect(tokensByModel(await sessionUsageService.getSessionUsage(workspaceId))).toEqual({
       [MODEL]: 500,
-      [FALLBACK_MODEL]: 430,
+      [PREPARED_FALLBACK_MODEL]: 430,
     });
     expect(await inFlightFiles(historyConfig.sessionsDir, workspaceId)).toEqual([]);
   });
