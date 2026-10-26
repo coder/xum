@@ -666,7 +666,7 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  test("Ctrl+Shift+K opens the Artifacts tab, and collapses the sidebar while it shows", async () => {
+  test("Ctrl+Shift+K opens and focuses the Artifacts tab, and collapses the sidebar from it", async () => {
     await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: true });
     const { sidebar, cleanup } = await setupRightSidebarView();
     const chord = { key: "K", code: "KeyK", ctrlKey: true, shiftKey: true };
@@ -708,8 +708,23 @@ describeIntegration("RightSidebar (UI)", () => {
         }
       }
 
-      // Artifacts shows: the key collapses the whole sidebar, like Ctrl+Shift+B.
-      fireEvent.keyDown(window, chord);
+      // Artifacts shows but focus is elsewhere: the key moves focus into the tab and keeps the
+      // sidebar open.
+      const panel = () => sidebar.querySelector<HTMLElement>('[data-testid="artifacts-panel"]');
+      const outside = document.body.appendChild(document.createElement("button"));
+      try {
+        outside.focus();
+        fireEvent.keyDown(outside, chord);
+        await waitFor(() => expect(document.activeElement).toBe(panel()));
+        expect(collapsed()).toBe(false);
+      } finally {
+        outside.remove();
+      }
+
+      // Focus is in the tab: the key collapses the whole sidebar, like Ctrl+Shift+B.
+      const focusedPanel = panel();
+      if (!focusedPanel) throw new Error("the Artifacts panel should be mounted");
+      fireEvent.keyDown(focusedPanel, chord);
       await waitFor(() => expect(collapsed()).toBe(true));
 
       // Collapsed: the key opens the sidebar on Artifacts again.
