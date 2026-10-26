@@ -882,9 +882,7 @@ export class SandboxHostService {
     const sessionDir = options.sessionDir;
     assert(scopeKey, "persistent mounts require a scopeKey");
     assert(sessionDir, "persistent mounts require a sessionDir");
-    if (this.removedScopes.has(scopeKey)) {
-      throw new Error(`sandbox scope '${scopeKey}' belongs to a removed workspace`);
-    }
+    this.assertScopeNotRemoved(scopeKey);
     const journal = this.journalFor(sessionDir);
 
     const existing = this.persistentMounts.get(scopeKey);
@@ -1301,6 +1299,13 @@ export class SandboxHostService {
   async dropScopeForRemoval(scopeKey: string): Promise<void> {
     this.removedScopes.add(scopeKey);
     await this.dropScope(scopeKey);
+  }
+
+  /** Refuse a mount for a removed workspace (see removedScopes). Caller holds the scope lock. */
+  private assertScopeNotRemoved(scopeKey: string): void {
+    if (this.removedScopes.has(scopeKey)) {
+      throw new Error(`sandbox scope '${scopeKey}' belongs to a removed workspace`);
+    }
   }
 
   /** Undo dropScopeForRemoval after an aborted removal: the workspace stays usable. */
