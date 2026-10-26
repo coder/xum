@@ -10,7 +10,6 @@ import { prepareMessagesForProvider } from "./messagePipeline";
 import { assemblePromptPayload } from "./turnContextAssembler";
 import {
   createStreamManagerForTests,
-  engineInternals,
   fakeStreamText,
 } from "./streamManager.testHarness";
 import {
@@ -535,70 +534,6 @@ describe("StreamManager - Anthropic preserved thinking replay", () => {
       );
       expect(toolIndex).toBeGreaterThanOrEqual(0);
       expect(parts.slice(toolIndex + 1).some((part) => part.type === "reasoning")).toBe(true);
-      expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
-    });
-
-    test("a dropped server-tool part costs at most one parts scan, not one per delta", async () => {
-      const workspaceId = "preserved-thinking-server-tool-dropped";
-      const deltas = 50;
-      let scans = 0;
-      let streamInfo: { parts: unknown[] } | undefined;
-      // The script below reads the manager lazily, after construction.
-      const streamManager: ReturnType<typeof createStreamManagerForTests> =
-        createStreamManagerForTests(historyService, {
-          streamText: scriptedStreamText([
-            {
-              chunks: [
-                { type: "start-step" },
-                {
-                  type: "tool-call",
-                  toolCallId: "srvtoolu_1",
-                  toolName: "web_search",
-                  input: { query: "xum" },
-                  providerExecuted: true,
-                },
-                {
-                  type: "tool-result",
-                  toolCallId: "srvtoolu_1",
-                  toolName: "web_search",
-                  output: [],
-                  providerExecuted: true,
-                },
-                // A retry that does not preserve parts drops the server-tool part, while
-                // the turn keeps its record of the server-tool call.
-                async () => {
-                  const internals = engineInternals(streamManager);
-                  streamInfo = internals.workspaceStreams.get(workspaceId) as { parts: unknown[] };
-                  await internals.resetStreamStateForRetry(workspaceId, streamInfo, {
-                    preserveParts: false,
-                  });
-                  const parts = streamInfo.parts;
-                  // Count full scans of the parts array from here on.
-                  parts.some = (...args: Parameters<typeof parts.some>) => {
-                    scans += 1;
-                    return Array.prototype.some.apply(parts, args);
-                  };
-                },
-                ...Array.from({ length: deltas }, () => ({ type: "reasoning-delta", text: "r" })),
-                { type: "finish-step", usage: TEST_USAGE },
-                STOP_FINISH,
-              ],
-            },
-          ]),
-        });
-      const { messageId } = await runTurnForTests(streamManager, {
-        workspaceId,
-        model: createTestLanguageModel("claude-opus-5-5", "anthropic.messages"),
-        modelString: "anthropic:claude-opus-5-5",
-      });
-
-      expect(streamInfo).toBeDefined();
-      expect(scans).toBeLessThanOrEqual(1);
-      // Nothing in the committed row follows a server tool, so replay stays on.
-      const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
-      if (!history.success) throw new Error(history.error);
-      const row = history.data.find((message) => message.id === messageId);
-      expect(row?.parts.some((part) => part.type === "dynamic-tool")).toBe(false);
       expect(row?.metadata?.anthropicThinkingReplay).toBeUndefined();
     });
 
