@@ -1884,13 +1884,36 @@ const localPlugin = {
             ? (def.node.imported.name ?? def.node.imported.value)
             : identifier.name;
         };
-        // `typeof useAPI` or `typeof APIModule.useAPI` (for a name in `names`).
-        const isTypeofOneOf = (type, names) => {
+        // Whether `identifier` is bound to an import of `name`, aliased or not. A local helper
+        // that only shares the name (`function createClient()` in a router test) is not the
+        // API client's factory.
+        const isImportOf = (identifier, name) => {
+          const def = definitionOf(identifier);
+          return (
+            def?.type === "ImportBinding" &&
+            def.node.type === "ImportSpecifier" &&
+            (def.node.imported.name ?? def.node.imported.value) === name
+          );
+        };
+        // `typeof useAPI` (an import of it) or `typeof APIModule.useAPI` (through a namespace
+        // import).
+        const isTypeofImport = (type, name) => {
           if (type?.type !== "TSTypeQuery") {
             return false;
           }
-          const last = type.exprName.type === "TSQualifiedName" ? type.exprName.right : type.exprName;
-          return last.type === "Identifier" && names.has(importedName(last));
+          const expression = type.exprName;
+          if (expression.type === "Identifier") {
+            return isImportOf(expression, name);
+          }
+          if (
+            expression.type !== "TSQualifiedName" ||
+            expression.left.type !== "Identifier" ||
+            expression.right.name !== name
+          ) {
+            return false;
+          }
+          const def = definitionOf(expression.left);
+          return def?.type === "ImportBinding" && def.node.type === "ImportNamespaceSpecifier";
         };
         // Whether a type spells APIClient, a part of it, or its test overrides type.
         const isApiClientType = (type, depth = 0) => {
@@ -1904,7 +1927,7 @@ const localPlugin = {
               typeReferenceName(object) === "ReturnType" &&
               type.indexType.type === "TSLiteralType" &&
               type.indexType.literal.value === "api" &&
-              isTypeofOneOf(typeArgumentsOf(object)[0], new Set(["useAPI"]))
+              isTypeofImport(typeArgumentsOf(object)[0], "useAPI")
             ) {
               return true;
             }
@@ -1933,12 +1956,12 @@ const localPlugin = {
             return (
               firstArgument?.type === "TSTypeReference" &&
               firstArgument.typeName.type === "Identifier" &&
-              importedName(firstArgument.typeName) === "AppRouter"
+              isImportOf(firstArgument.typeName, "AppRouter")
             );
           }
           if (name === "ReturnType") {
             // APIClient is declared as `ReturnType<typeof createClient>`.
-            return isTypeofOneOf(firstArgument, new Set(["createClient"]));
+            return isTypeofImport(firstArgument, "createClient");
           }
           // A local alias: `type Client = APIClient`, `type Api = NonNullable<...>`.
           const def = definitionOf(type.typeName);

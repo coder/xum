@@ -36,8 +36,8 @@ const IMPORTS = [
   `import { createClient } from "@/common/orpc/client";`,
 ].join("\n");
 
-function reportCount(code: string): number {
-  return linter.verify(`${IMPORTS}\n${code}`, lintConfig, "case.test.ts").length;
+function reportCount(code: string, imports = IMPORTS): number {
+  return linter.verify(`${imports}\n${code}`, lintConfig, "case.test.ts").length;
 }
 
 test("reports a cast to any spelling of the client type, once per chain", () => {
@@ -94,4 +94,24 @@ test("allows typed doubles and casts to unrelated types", () => {
   for (const code of allowed) {
     expect({ code, count: reportCount(code) }).toEqual({ code, count: 0 });
   }
+});
+
+test("the factory and router names count only when they are imported", () => {
+  // Router and node tests define their own helpers with these names.
+  const localHelpers = [
+    `function createClient() { return {}; }\nconst a = fake as ReturnType<typeof createClient>;`,
+    `const api = { useAPI: () => ({ api: 1 }) };\nconst a = fake as ReturnType<typeof api.useAPI>["api"];`,
+    `function useAPI() { return { api: 1 }; }\nconst a = fake as ReturnType<typeof useAPI>["api"];`,
+    `type AppRouter = { ping: () => void };\nconst a = fake as RouterClient<AppRouter>;`,
+  ];
+  const imports = `import type { RouterClient } from "@orpc/server";`;
+  for (const code of localHelpers) {
+    expect({ code, count: reportCount(code, imports) }).toEqual({ code, count: 0 });
+  }
+  expect(
+    reportCount(
+      `import { createClient as make } from "@/common/orpc/client";\nconst a = fake as ReturnType<typeof make>;`,
+      ""
+    )
+  ).toBe(1);
 });
