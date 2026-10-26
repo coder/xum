@@ -6,8 +6,7 @@
  * the partial flush, which still lives there, and the abort cleanup
  * (AttemptLoop.cleanupAbortedStream).
  */
-import type { Scope } from "effect";
-import { Effect } from "effect";
+import { Effect, Exit, Fiber, Scope } from "effect";
 import assert from "@/common/utils/assert";
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
@@ -51,8 +50,8 @@ export interface TurnRegistryDeps {
   readonly effectRunner: EffectRunner;
   /**
    * Supervised scope for the stream engine (the app runtime's `AppFiberScope`,
-   * di/appFiberScope.ts). When set, every started stream is wrapped in a
-   * supervisor fiber forked here (`superviseEngine`), so
+   * di/appFiberScope.ts). When set, every started stream gets a child scope
+   * forked here (`superviseEngine`), so
    * `ServiceContainer.dispose()`/the CLI cleanup lists interrupt **and await**
    * in-flight streams — aborted as `"system"`, partial flushed and committed —
    * before the bridges and sessions are torn down. `undefined` (direct
@@ -194,14 +193,6 @@ export class TurnRegistry {
     return streamInfo.cancelPromise;
   }
 
-  /** Records the promise of the turn's attempt loop; the abort settle waits for it. */
-  static trackProcessing(
-    streamInfo: WorkspaceStreamInfo & TurnSlot,
-    processing: Promise<void>
-  ): void {
-    streamInfo.processingPromise = processing;
-  }
-
   /** Moves the turn to a state its attempt loop reached (STOPPING is the stop's own). */
   static setState(
     streamInfo: WorkspaceStreamInfo & TurnSlot,
@@ -252,70 +243,130 @@ export class TurnRegistry {
   }
 
   /**
-   * Make the engine scope (`AppFiberScope`) supervise this stream: one fiber
-   * per stream that lives exactly as long as the turn is unsettled (it waits on
-   * `completionController.promise`) and, when interrupted by the scope closing
-   * during shutdown, cancels the stream through the user-stop path
-   * (`cancelStreamSafely`, abort reason `"system"`) and waits for the turn to
+   * Make the engine scope (`AppFiberScope`) supervise this stream: the turn gets
+   * its own child scope (`turnScope`) that lives exactly as long as the turn is
+   * unsettled. When the engine scope closes during shutdown, the turn scope
+   * closes too and stops the turn through the user-stop path
+   * (`cancelStreamSafely`, abort reason `"system"`), then waits for the turn to
    * settle — i.e. for the partial to be flushed with usage, `stream-abort`
    * delivered after attempt-owned partial persistence, and `completion` resolved.
-   * `closeScopeBounded` awaits that
-   * finalizer, so dispose() proceeds to tear down bridges and sessions only once
-   * every in-flight stream is durably settled. Supervision starts at
-   * registration (before the awaited turn-envelope write), so a STARTING stream
-   * is covered too: cancelling it takes the same hard-interrupt path a user stop
-   * takes during that write.
+   * Before processing launches the scope's own finalizer does this; afterwards
+   * the attempt loop's fiber does, from its interrupt handler (launchProcessing).
+   * `closeScopeBounded` awaits both, so dispose() proceeds to tear down bridges
+   * and sessions only once every in-flight stream is durably settled.
+   * Supervision starts at registration (before the awaited turn-envelope write),
+   * so a STARTING stream is covered too: cancelling it takes the same
+   * hard-interrupt path a user stop takes during that write.
    *
-   * The fiber is the ownership unit only; the stream's AbortSignal stays the
+   * The scope is the ownership unit only; the stream's AbortSignal stays the
    * sole cancellation transport (the loop, the AI SDK, soft interrupts and
    * `stopStream` all key off it), so interruption meets the stream at exactly
-   * one point — this finalizer. A turn that settles on its own resolves the
-   * promise and the fiber exits, which removes its finalizer from the scope
-   * (no per-stream residue). A stream started after the scope closed is
-   * interrupted synchronously by `forkIn` and thus aborted right away (pinned in
-   * appFiberScope.test.ts); the pre-registration window (`pendingStreamStarts`)
-   * is not supervised — nothing durable exists for it yet and `stopStream`
-   * already aborts pending controllers.
+   * one point — stopForShutdown. A turn that settles on its own closes its
+   * scope, which removes it from the engine scope (no per-stream residue). A
+   * stream started after the engine scope closed gets a closed turn scope, whose
+   * finalizer runs right away and aborts it; the pre-registration window
+   * (`pendingStreamStarts`) is not supervised — nothing durable exists for it
+   * yet and `stopStream` already aborts pending controllers.
    */
   superviseEngine(workspaceId: WorkspaceId, streamInfo: WorkspaceStreamInfo & TurnSlot): void {
     if (this.deps.engineScope === undefined) {
       return;
     }
-    assert(streamInfo.engineFiber === undefined, "stream engine already supervised");
-    // Zero-arity thunk on purpose: Effect.promise allocates an internal
-    // AbortController only when the thunk declares a `signal` parameter; the
-    // stream's own controller must stay the only signal in play.
-    const supervisor = Effect.promise(() => streamInfo.completionController.promise).pipe(
-      Effect.onInterrupt(() =>
-        // Finalizers already run uninterruptibly; explicit per house doctrine so
-        // the cancel → settle sequence is visibly atomic under a second interrupt.
-        Effect.uninterruptible(
-          Effect.promise(async () => {
-            const startedAt = performance.now();
-            await this.cancelStreamSafely(workspaceId, streamInfo, "system");
-            // The engine fence includes persistence and raw delivery, never session policy.
-            await streamInfo.completionController.promise;
-            // Per-stream cost inside the AppFiberScope close (shutdownStep style).
-            log.debug("[shutdown] streamManager.abortStream", {
-              workspaceId,
-              messageId: streamInfo.messageId,
-              ms: Math.round(performance.now() - startedAt),
-            });
-          })
+    assert(streamInfo.turnScope === undefined, "stream engine already supervised");
+    const turnScope = Scope.forkUnsafe(this.deps.engineScope);
+    streamInfo.turnScope = turnScope;
+    let settled = false;
+    // Stops a turn that has not settled. Once processing launched, the attempt loop's
+    // fiber (launchProcessing) stops it first; cancelStreamSafely's latch makes this a
+    // join. A scope that is already closed runs it right here, so a STARTING stream is
+    // aborted at once.
+    this.deps.effectRunner.runFork(
+      Scope.addFinalizer(
+        turnScope,
+        Effect.suspend(() =>
+          settled ? Effect.void : this.stopForShutdown(workspaceId, streamInfo)
         )
-      ),
+      )
+    );
+    // A turn that settles on its own leaves the engine scope (no per-stream residue).
+    // The completion promise never rejects. The loop settles the completion before its
+    // promise returns, so the loop fiber is still running here: closing the scope now
+    // would interrupt it and run stopForShutdown on a settled turn. Close only after the
+    // fiber exits. A turn whose processing never launched has no fiber.
+    void streamInfo.completionController.promise.then(() => {
+      settled = true;
+      const close = Scope.close(turnScope, Exit.void);
+      const loopFiber = streamInfo.engineFiber;
+      this.deps.effectRunner.runFork(
+        loopFiber === undefined ? close : Effect.andThen(Fiber.await(loopFiber), close)
+      );
+    });
+  }
+
+  /**
+   * Runs the turn's attempt loop on a fiber, in the turn scope when there is one.
+   * startImmediately: the loop's synchronous start (MCP lease, STREAMING, stream-start)
+   * runs before this returns. The AbortSignal stays the only cancellation transport:
+   * interrupting the fiber (engine scope close) stops the turn as "system" and waits for
+   * the settle; it does not interrupt the loop's Promise.
+   */
+  launchProcessing(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo & TurnSlot,
+    processStream: () => Promise<void>
+  ): void {
+    assert(streamInfo.engineFiber === undefined, "stream processing already launched");
+    // Zero-arity thunk on purpose: Effect.promise allocates an internal
+    // AbortController only when the thunk declares a `signal` parameter.
+    const loop = Effect.promise(async () => {
+      const processing = processStream();
+      // cancelStreamSafely and the abort cleanup wait for this; it never rejects.
+      streamInfo.processingPromise = processing.then(
+        () => undefined,
+        () => undefined
+      );
+      return processing;
+    }).pipe(
+      Effect.onInterrupt(() => this.stopForShutdown(workspaceId, streamInfo)),
+      Effect.catchDefect((error) =>
+        Effect.sync(() => {
+          log.error("Unexpected error in stream processing:", error);
+        })
+      )
+    );
+    streamInfo.engineFiber = streamInfo.turnScope
+      ? this.deps.effectRunner.runSync(
+          Effect.forkIn(loop, streamInfo.turnScope, { startImmediately: true })
+        )
+      : this.deps.effectRunner.runFork(loop);
+  }
+
+  /** Shutdown's stop of one turn: cancel it as "system", then wait for its settle. */
+  private stopForShutdown(
+    workspaceId: WorkspaceId,
+    streamInfo: WorkspaceStreamInfo & TurnSlot
+  ): Effect.Effect<void> {
+    // Finalizers already run uninterruptibly; explicit per house doctrine so
+    // the cancel → settle sequence is visibly atomic under a second interrupt.
+    return Effect.uninterruptible(
+      Effect.promise(async () => {
+        const startedAt = performance.now();
+        await this.cancelStreamSafely(workspaceId, streamInfo, "system");
+        // The engine fence includes persistence and raw delivery, never session policy.
+        await streamInfo.completionController.promise;
+        // Per-stream cost inside the AppFiberScope close (shutdownStep style).
+        log.debug("[shutdown] streamManager.abortStream", {
+          workspaceId,
+          messageId: streamInfo.messageId,
+          ms: Math.round(performance.now() - startedAt),
+        });
+      })
+    ).pipe(
       Effect.catchDefect((defect) =>
         Effect.sync(() => {
           log.warn("[stream] engine supervisor defect", { workspaceId, error: defect });
         })
-      ),
-      Effect.asVoid
-    );
-    // startImmediately: the fiber reaches its (only) suspension point — the
-    // promise wait — before forkIn registers it with the scope, so a scope that
-    // is already closed interrupts it right here, synchronously.
-    streamInfo.engineFiber = this.deps.effectRunner.runSync(
-      Effect.forkIn(supervisor, this.deps.engineScope, { startImmediately: true })
+      )
     );
   }
 

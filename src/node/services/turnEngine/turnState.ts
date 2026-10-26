@@ -102,8 +102,10 @@ export interface TurnSlot {
   // first await) so concurrent cancellers — a user stop racing shutdown's
   // engine supervisor — join one cleanup: exactly one stream-abort, one settle.
   cancelPromise?: Promise<void>;
-  // Supervisor fiber in the app's AppFiberScope (superviseEngine); set only when
-  // the manager was constructed with an engine scope.
+  // The turn's child scope of the app's AppFiberScope (superviseEngine); set only
+  // when the manager was constructed with an engine scope.
+  turnScope?: Scope.Closeable;
+  // The attempt loop's fiber (launchProcessing), in turnScope when there is one.
   engineFiber?: Fiber.Fiber<void>;
   // Soft-interrupt state: when pending, stream will end at next block boundary
   softInterrupt:

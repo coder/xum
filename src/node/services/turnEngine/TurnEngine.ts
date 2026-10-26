@@ -34,7 +34,7 @@ import {
 } from "@/node/services/turnEngine/ProviderRequest";
 import { StepApply } from "@/node/services/turnEngine/StepApply";
 import { convertToSendMessageError } from "@/node/services/turnEngine/streamErrors";
-import { TurnRegistry } from "@/node/services/turnEngine/TurnRegistry";
+import type { TurnRegistry } from "@/node/services/turnEngine/TurnRegistry";
 import type { TurnResources, TurnStartup } from "@/node/services/turnEngine/TurnResources";
 import {
   StreamState,
@@ -467,13 +467,12 @@ export class TurnEngine {
       // Step 5: Track the processing promise for guaranteed cleanup
       // This allows cancelStreamSafely to wait for full exit
       start.processingStarted = true;
-      TurnRegistry.trackProcessing(
-        streamInfo,
-        this.deps
-          .processStreamWithCleanup(start.workspaceId, streamInfo, start.options.historySequence)
-          .catch((error) => {
-            log.error("Unexpected error in stream processing:", error);
-          })
+      this.deps.turnRegistry.launchProcessing(start.workspaceId, streamInfo, () =>
+        this.deps.processStreamWithCleanup(
+          start.workspaceId,
+          streamInfo,
+          start.options.historySequence
+        )
       );
 
       return Ok(start.handle);

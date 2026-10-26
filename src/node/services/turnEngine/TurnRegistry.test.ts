@@ -1,8 +1,9 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { Scope } from "effect";
 
 import type { StreamAbortReason } from "@/common/types/stream";
 import { closeScopeBounded } from "@/node/services/di/appRuntime";
+import { log } from "@/node/services/log";
 import { defaultEffectRunner } from "@/node/services/di/effectRunner";
 import type {
   ActiveStreamInfo,
@@ -29,6 +30,13 @@ interface Cleanup {
  * A TurnRegistry whose abort cleanup does what StreamManager's does to the slot:
  * it settles the turn's completion and frees the slot if the turn still owns it.
  */
+/** Finalizers registered on an open scope (its supervised occupants). */
+function finalizerCount(scope: Scope.Closeable): number {
+  const state = scope.state;
+  if (state._tag !== "Open") return 0;
+  return (state.finalizer === undefined ? 0 : 1) + (state.finalizers?.size ?? 0);
+}
+
 function createRegistry(options: { engineScope?: Scope.Closeable } = {}) {
   const events: TurnEngineEvent[] = [];
   const flushes: string[] = [];
@@ -281,6 +289,90 @@ describe("TurnRegistry", () => {
       status: "aborted",
       abortReason: "system",
     });
+  });
+
+  test("a turn that settles on its own leaves nothing in the engine scope", async () => {
+    // One supervised turn per stream: a long-running app must not keep a finalizer
+    // for every finished turn until shutdown.
+    const engineScope = Scope.makeUnsafe();
+    const { registry } = createRegistry({ engineScope });
+    const info = streamFixture();
+    registry.superviseEngine(WS, info);
+    expect(finalizerCount(engineScope)).toBe(1);
+
+    info.completionController.settle({ status: "aborted", abortReason: "user" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(finalizerCount(engineScope)).toBe(0);
+  });
+
+  test("a turn whose loop settles on its own is not stopped when it leaves the engine scope", async () => {
+    // The loop settles the completion before its promise returns. Closing the turn
+    // scope at that point would interrupt the loop fiber, whose interrupt handler
+    // stops the already-settled turn as "system" (Codex review on #7500).
+    const engineScope = Scope.makeUnsafe();
+    const { registry, cleanups } = createRegistry({ engineScope });
+    const info = streamFixture();
+    registry.superviseEngine(WS, info);
+
+    registry.launchProcessing(WS, info, async () => {
+      await Promise.resolve();
+      info.completionController.settle({ status: "completed" } as TurnCompletion);
+      await Promise.resolve();
+    });
+    for (let tick = 0; tick < 50 && finalizerCount(engineScope) > 0; tick++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
+    expect(finalizerCount(engineScope)).toBe(0);
+    expect(cleanups).toEqual([]);
+    expect(info.abortController.signal.aborted).toBe(false);
+  });
+
+  test("launchProcessing runs the loop's synchronous start before it returns", async () => {
+    for (const engineScope of [Scope.makeUnsafe(), undefined]) {
+      const { registry } = createRegistry({ engineScope });
+      const info = streamFixture();
+      registry.superviseEngine(WS, info);
+      const finished = Promise.withResolvers<void>();
+      let started = false;
+
+      registry.launchProcessing(WS, info, () => {
+        started = true;
+        return finished.promise;
+      });
+
+      // stream-start and the STREAMING state come from this synchronous start, and a
+      // stop right after startStream waits for this promise.
+      expect(started).toBe(true);
+      let processed = false;
+      const processing = info.processingPromise.then(() => {
+        processed = true;
+      });
+      await Promise.resolve();
+      expect(processed).toBe(false);
+      finished.resolve();
+      await processing;
+    }
+  });
+
+  test("a rejected attempt loop is logged and its processing promise still resolves", async () => {
+    const { registry } = createRegistry({ engineScope: Scope.makeUnsafe() });
+    const info = streamFixture();
+    registry.superviseEngine(WS, info);
+    const logged = spyOn(log, "error").mockImplementation(() => undefined);
+    try {
+      registry.launchProcessing(WS, info, () => Promise.reject(new Error("loop bug")));
+      await info.processingPromise;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(logged).toHaveBeenCalledWith(
+        "Unexpected error in stream processing:",
+        expect.anything()
+      );
+    } finally {
+      logged.mockRestore();
+    }
   });
 
   test("without an engine scope a turn is not supervised", () => {

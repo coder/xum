@@ -12,8 +12,8 @@
  *
  * This is the seam for I/O-suspended, long-lived work that shutdown must wait
  * for. Its occupants include the stream engine: `TurnRegistry.superviseEngine`
- * forks one supervisor fiber per stream into it, whose interruption cancels the
- * stream (`"system"` abort) and awaits the turn's settlement, so dispose()
+ * forks one child scope per stream into it (holding the attempt loop's fiber),
+ * whose close cancels the stream (`"system"` abort) and awaits the turn's settlement, so dispose()
  * commits the partial into chat.jsonl before the bridges stop. Each AgentSession also
  * registers a guardian after initialization. The guardian closes admission, joins registered
  * preparation and physical policy work, then closes its detached resource scope. Engine
