@@ -32,6 +32,43 @@ test(
     await openPlayground(app, screen, browser);
     const input = screen.getByRole("textbox", "Message");
     const panel = screen.getByTestId("artifacts-panel");
+    // TEMP diagnostics (remove before merge).
+    await browser.evaluate(() => {
+      const w = window as unknown as { __log: string[] };
+      w.__log = [];
+      const d = (el: Element | null) =>
+        el
+          ? `${el.tagName}[${el.getAttribute("data-testid") ?? el.getAttribute("aria-label") ?? el.getAttribute("role")}]`
+          : "null";
+      const t0 = performance.now();
+      const ts = () => (performance.now() - t0).toFixed(0);
+      document.addEventListener(
+        "focusin",
+        (e) => w.__log.push(`${ts()} focusin ${d(e.target as Element)}`),
+        true
+      );
+      window.addEventListener(
+        "keydown",
+        (e) => {
+          if (e.key === "K")
+            w.__log.push(
+              `${ts()} keydown K target=${d(e.target as Element)} trusted=${e.isTrusted}`
+            );
+        },
+        true
+      );
+      const orig = HTMLElement.prototype.focus;
+      HTMLElement.prototype.focus = function (this: HTMLElement, ...args: [FocusOptions?]) {
+        w.__log.push(
+          `${ts()} .focus() ${d(this)} ${(new Error().stack ?? "")
+            .split("\n")
+            .slice(2, 7)
+            .map((l) => l.trim().replace(/https?:\/\/[^/]+\//, ""))
+            .join(" | ")}`
+        );
+        return orig.apply(this, args);
+      };
+    });
     await input.tap();
     await browser.keyboard.press("Control+Shift+K");
     await expect(panel).toBeFocused();
@@ -42,14 +79,21 @@ test(
     await expect(panel).toBeFocused();
     await expect(screen.getByRole("button", "Collapse right sidebar")).toBeVisible();
 
-    // Focus is in the tab: the key hides the sidebar, and focus moves to the header toggle. The
-    // check reads DOM focus: in CI, toBeFocused on the accessibility tree sometimes missed the
-    // focus that moved onto the toggle while its label changed.
+    // Focus is in the tab: the key hides the sidebar, and focus moves to the header toggle.
     await browser.keyboard.press("Control+Shift+K");
-    await expect
-      .poll(() =>
-        browser.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? null)
-      )
-      .toBe("Expand right sidebar");
+    try {
+      await expect
+        .poll(() =>
+          browser.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? null)
+        )
+        .toBe("Expand right sidebar");
+    } finally {
+      const log = await browser.evaluate(() => {
+        const a = document.activeElement;
+        const toggle = document.querySelector('[data-testid="right-sidebar-toggle-bar"] button');
+        return `${(window as unknown as { __log: string[] }).__log.join("\n")}\nFINAL active=${a?.tagName}[${a?.getAttribute("data-testid") ?? a?.getAttribute("aria-label")}] toggle=${toggle?.getAttribute("aria-label")} hasFocus=${document.hasFocus()}`;
+      });
+      console.log(`DIAGLOG\n${log}\nENDDIAG`);
+    }
   }
 );
