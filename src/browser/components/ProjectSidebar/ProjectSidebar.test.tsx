@@ -50,6 +50,7 @@ import type * as WorkspaceStatusIndicatorModuleExports from "../WorkspaceStatusI
 import * as RealPositionedMenuModule from "@/browser/components/PositionedMenu/PositionedMenu";
 import * as RealContextMenuPositionModule from "@/browser/hooks/useContextMenuPosition";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
+import { createTestApiClient } from "@/browser/testUtils";
 
 const agentItemTestId = (workspaceId: string) => `agent-item-${workspaceId}`;
 const toggleButtonLabel = (workspaceId: string) => `toggle-completed-${workspaceId}`;
@@ -973,9 +974,7 @@ describe("ProjectSidebar title keys", () => {
     const regenerateTitle = mock((_input: { workspaceId: string }) =>
       Promise.resolve({ success: true as const, data: { title: "Generated" } })
     );
-    const api = { workspace: { regenerateTitle } } as unknown as NonNullable<
-      ReturnType<typeof APIModule.useAPI>["api"]
-    >;
+    const api = createTestApiClient({ workspace: { regenerateTitle } });
     spyOn(APIModule, "useAPI").mockImplementation(() => ({
       api,
       status: "connected",
@@ -3208,12 +3207,12 @@ describe("ProjectSidebar archive errors", () => {
       ): Promise<ArchiveWorkspaceActionResult> =>
         Promise.resolve({ success: false as const, error: "snapshot failed" })
     );
-    const apiWithArchivePreflight = {
+    const apiWithArchivePreflight = createTestApiClient({
       workspace: {
         preflightArchive: () =>
-          Promise.resolve({ success: true, data: { kind: "ready" as const } }),
+          Promise.resolve({ success: true as const, data: { kind: "ready" as const } }),
       },
-    } as unknown as NonNullable<ReturnType<typeof APIModule.useAPI>["api"]>;
+    });
     spyOn(APIModule, "useAPI").mockImplementation(() => ({
       api: apiWithArchivePreflight,
       status: "connected",
