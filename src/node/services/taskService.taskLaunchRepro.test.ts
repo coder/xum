@@ -102,9 +102,13 @@ describe("task launch races", () => {
       // The task inherits this runtime: its checkout is a git worktree under the test root (the
       // default srcBaseDir is the real ~/.xum/src).
       [
-        projectWorkspace(projectPath, "root", ROOT, {
-          runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
-        }),
+        {
+          ...projectWorkspace(projectPath, "root", ROOT, {
+            runtimeConfig: { type: "worktree", srcBaseDir: config.srcDir },
+          }),
+          // The parent's checkout is the initialized repository, so the fork runs git there.
+          path: projectPath,
+        },
       ],
       testTaskSettings(4, 3)
     );
@@ -131,6 +135,8 @@ describe("task launch races", () => {
           forked.data.workspacePath.startsWith(config.srcDir),
           "the forked checkout stays under the test root"
         );
+        // A real fork of the parent's checkout, not the create-from-trunk fallback.
+        assert(forked.data.forkedFromSource, "the launch forks the parent's checkout");
         checkouts.push(forked.data.workspacePath);
         const runtime = forked.data.targetRuntime;
         const realDelete = runtime.deleteWorkspace.bind(runtime);
