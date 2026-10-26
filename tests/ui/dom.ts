@@ -59,6 +59,9 @@ export function installDom(): () => void {
     domWindow.DocumentFragment;
   (globalThis as unknown as { HTMLInputElement: unknown }).HTMLInputElement =
     domWindow.HTMLInputElement;
+  // Radix Select (2.4+) checks `instanceof HTMLFormElement` when it mounts.
+  (globalThis as unknown as { HTMLFormElement: unknown }).HTMLFormElement =
+    domWindow.HTMLFormElement;
   (globalThis as unknown as { HTMLElement: unknown }).HTMLElement = domWindow.HTMLElement;
   (globalThis as unknown as { MutationObserver: unknown }).MutationObserver =
     domWindow.MutationObserver;

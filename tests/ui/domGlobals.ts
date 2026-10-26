@@ -22,6 +22,7 @@ const DOM_GLOBAL_KEYS = [
   "DocumentFragment",
   "Element",
   "HTMLInputElement",
+  "HTMLFormElement",
   "HTMLElement",
   "NodeFilter",
   "Node",

@@ -1,0 +1,64 @@
+diff --git a/dist/index.js b/dist/index.js
+index 88d4f0a1fc0a27daea52c682bb390bfc87b601db..e5b58728d2273f6387f33b87085eb54f8868e118 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -478,6 +478,10 @@ const getOptionValueParser = (schema) => {
+             if (!types.size)
+                 return parsed; // if types is empty, it means any type is allowed - e.g. for json input
+             const jsonSchemaType = Array.isArray(parsed) ? 'array' : parsed === null ? 'null' : typeof parsed;
++            // xum patch (#6329): `typeof` never gives "integer", so a nullable integer option
++            // ({integer, null}) rejected every number. Accept a whole number for "integer".
++            if (jsonSchemaType === 'number' && types.has('integer') && Number.isInteger(parsed))
++                return parsed;
+             if (!types.has(jsonSchemaType)) {
+                 throw new InvalidOptionArgumentError(`Got ${jsonSchemaType} but expected ${[...types].join(' or ')}`);
+             }
+diff --git a/dist/parse-router.d.ts b/dist/parse-router.d.ts
+index 6064922407f32fb92b3fa494e92baf89e87e3469..496346ef02af9452c9ede689bdf74df1bbca5c21 100644
+--- a/dist/parse-router.d.ts
++++ b/dist/parse-router.d.ts
+@@ -59,6 +59,9 @@ export type OrpcProcedureLike<Ctx> = {
+     '~orpc': {
+         __initialContext?: (context: Ctx) => unknown;
+         inputSchema?: StandardSchemaV1;
++        /** xum patch: oRPC >=1.14 renamed the context brand and pluralized schemas. */
++        __TInitialContext?: (type: Ctx) => unknown;
++        inputSchemas?: StandardSchemaV1<any, any>[];
+     };
+ };
+ export type OrpcRouterLike<Ctx> = {
+diff --git a/dist/parse-router.js b/dist/parse-router.js
+index ff404e3682ec52f55b6469213f80429424e1df1b..16c6c38f2337739e73f5c0d1f3e7a491e44f07fc 100644
+--- a/dist/parse-router.js
++++ b/dist/parse-router.js
+@@ -85,14 +85,28 @@ const parseTrpcRouter = ({ router, ...dependencies }) => {
+ };
+ const parseOrpcRouter = ({ router, ...dependencies }) => {
+     const entries = [];
+-    const { traverseContractProcedures, isProcedure } = getOrpcServerModule();
++    // xum patch: oRPC >=1.14 removed `traverseContractProcedures` and `isProcedure`
++    // from @orpc/server. Duck-type procedures by their '~orpc' definition and walk
++    // the router locally. Lazy routers are not used by xum, so lazyRoutes stays [].
++    const isProcedure = (value) => Boolean(value) && typeof value === 'object' && typeof value['~orpc'] === 'object' && typeof value['~orpc'].handler === 'function';
++    const traverseContractProcedures = ({ path, router }, visit) => {
++        for (const [key, value] of Object.entries(router)) {
++            if (!value || typeof value !== 'object')
++                continue;
++            if (isProcedure(value))
++                visit({ contract: value, path: [...path, key] });
++            else
++                traverseContractProcedures({ path: [...path, key], router: value }, visit);
++        }
++        return [];
++    };
+     const lazyRoutes = traverseContractProcedures({ path: [], router: router }, ({ contract, path }) => {
+         let procedure = router;
+         for (const p of path)
+             procedure = procedure[p];
+         if (!isProcedure(procedure))
+             return; // if it's contract-only, we can't run it via CLI (user may have passed an implemented contract router? should we tell them? it's undefined behaviour so kinda on them)
+-        const inputSchemas = getProcedureInputJsonSchemas([contract['~orpc'].inputSchema], dependencies);
++        const inputSchemas = getProcedureInputJsonSchemas([contract['~orpc'].inputSchema ?? contract['~orpc'].inputSchemas?.[0]], dependencies);
+         if (path.some(p => p.includes('.'))) {
+             throw new Error(`ORPC procedure path segments cannot contain \`.'. Got: ${JSON.stringify(path)}`);
+         }

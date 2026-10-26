@@ -72,6 +72,7 @@ let originalSetTimeout: typeof globalThis.setTimeout;
 let originalClearTimeout: typeof globalThis.clearTimeout;
 let originalSetInterval: typeof globalThis.setInterval;
 let originalClearInterval: typeof globalThis.clearInterval;
+let originalHTMLFormElement: typeof globalThis.HTMLFormElement;
 
 function renderWarning() {
   return render(<PortableDesktopExperimentWarning />, { wrapper: ApiWrapper });
@@ -89,6 +90,7 @@ describe("PortableDesktopExperimentWarning", () => {
     originalClearTimeout = globalThis.clearTimeout;
     originalSetInterval = globalThis.setInterval;
     originalClearInterval = globalThis.clearInterval;
+    originalHTMLFormElement = globalThis.HTMLFormElement;
 
     const dom = new GlobalWindow({ url: "https://example.com/settings/experiments" });
     globalThis.window = dom as unknown as Window & typeof globalThis;
@@ -105,6 +107,8 @@ describe("PortableDesktopExperimentWarning", () => {
     globalThis.clearInterval = dom.clearInterval.bind(
       dom
     ) as unknown as typeof globalThis.clearInterval;
+    // Radix Select (2.4+) checks `instanceof HTMLFormElement` when it mounts.
+    globalThis.HTMLFormElement = dom.HTMLFormElement as unknown as typeof HTMLFormElement;
 
     globalThis.window.api = { platform: "linux", versions: {} };
     experimentEnabled = true;
@@ -153,6 +157,7 @@ describe("PortableDesktopExperimentWarning", () => {
     globalThis.clearTimeout = originalClearTimeout;
     globalThis.setInterval = originalSetInterval;
     globalThis.clearInterval = originalClearInterval;
+    globalThis.HTMLFormElement = originalHTMLFormElement;
   });
 
   test.each([false, true])(
