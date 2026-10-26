@@ -1,7 +1,7 @@
 import {
-  highlightDiffChunk,
   highlightDiffChunks,
   isWithinDiffHighlightSyncBudget,
+  type HighlightedChunk,
 } from "./highlightDiffChunk";
 import type { DiffChunk } from "./diffChunking";
 
@@ -11,7 +11,14 @@ import type { DiffChunk } from "./diffChunking";
  * WASM loads on first test (~100ms), then cached for subsequent tests
  */
 
-describe("highlightDiffChunk", () => {
+// One chunk through the batch API that DiffRenderer calls.
+async function highlightDiffChunk(chunk: DiffChunk, language: string): Promise<HighlightedChunk> {
+  const highlighted = await highlightDiffChunks([chunk], language);
+  expect(highlighted).toHaveLength(1);
+  return highlighted[0];
+}
+
+describe("highlightDiffChunks", () => {
   const mockChunk: DiffChunk = {
     type: "add",
     lines: ["const x = 1;", "const y = 2;"],

@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test";
-import { calculateTPS, calculateTokenCount, type DeltaRecord } from "./StreamingTPSCalculator";
+import { calculateTPS, calculateTokenCount, type DeltaRecord } from "@/common/utils/tokens/tps";
 
 describe("StreamingTPSCalculator", () => {
   describe("calculateTokenCount", () => {

@@ -26,15 +26,14 @@ import {
   dedupeKeepFirst,
   filterHiddenModels,
   getCustomModels,
-  getSuggestedModels,
   isAuthoritativeProviderModelAccessible as isAuthoritativeProviderModelAccessibleIn,
   isProviderConfigured,
 } from "@/common/utils/ai/selectableModels";
 import { getProviderModelEntryId } from "@/common/utils/providers/modelEntries";
 
 // The selector pipeline lives in @/common (shared with the backend models_list
-// tool); these two stay exported for existing importers/tests.
-export { filterHiddenModels, getSuggestedModels };
+// tool); this one stays exported for existing importers.
+export { filterHiddenModels };
 
 const BUILT_IN_MODEL_SET = new Set<string>(BUILT_IN_MODELS);
 // Module-level so the default keeps a stable identity across renders.
