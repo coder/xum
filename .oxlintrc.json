@@ -1109,6 +1109,50 @@
       }
     },
     {
+      "files": ["scripts/**/*.test.ts", "vscode/src/**/*.{ts,tsx}"],
+      "rules": {
+        "no-unused-vars": [
+          "error",
+          {
+            "vars": "all",
+            "args": "after-used",
+            "ignoreRestSiblings": true,
+            "argsIgnorePattern": "^_",
+            "varsIgnorePattern": "^_",
+            "caughtErrors": "all"
+          }
+        ]
+      },
+      "globals": {
+        "console": "readonly",
+        "process": "readonly",
+        "Buffer": "readonly",
+        "__dirname": "readonly",
+        "__filename": "readonly",
+        "require": "readonly",
+        "setTimeout": "readonly",
+        "clearTimeout": "readonly",
+        "setInterval": "readonly",
+        "clearInterval": "readonly",
+        "window": "readonly",
+        "document": "readonly"
+      }
+    },
+    {
+      "files": ["vscode/src/**/*.tsx"],
+      "plugins": ["react"],
+      "rules": {
+        "react/rules-of-hooks": "error",
+        "react/exhaustive-deps": "warn"
+      }
+    },
+    {
+      "files": ["scripts/**/*.test.ts", "vscode/src/**/*.test.{ts,tsx}"],
+      "rules": {
+        "no-empty-function": "off"
+      }
+    },
+    {
       "files": ["**/*.test.ts", "**/*.test.tsx"],
       "globals": {
         "describe": "readonly",

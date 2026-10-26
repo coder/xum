@@ -35,6 +35,7 @@ let registeredProvider: unknown = null;
 const fakeUri = (value: string) => ({ toString: () => value });
 
 // The real "vscode" module exists only inside the extension host, so there is nothing to restore.
+// eslint-disable-next-line local/require-module-mock-restore -- no real "vscode" exports exist under bun to restore (see above)
 void mock.module("vscode", () => ({
   Uri: {
     joinPath: (base: { toString(): string }, ...parts: string[]) =>
@@ -254,7 +255,7 @@ afterAll(async () => {
 
 afterEach(() => {
   for (const subscription of subscriptions.splice(0)) subscription.dispose();
-  for (const server of servers.splice(0)) server.stop();
+  for (const server of servers.splice(0)) void server.stop();
   settings.clear();
 });
 
@@ -505,7 +506,7 @@ describe("chat view live workspace list and dock activity (#5109)", () => {
     parentWorkspaceId: WORKSPACE.id,
     ...extra,
   });
-  type Posted = PostedMessage & { workspaces?: Array<{ id: string }>; activity?: object };
+  type Posted = PostedMessage & { workspaces?: { id: string }[]; activity?: object };
   const lists = (posted: Posted[]) => posted.filter((message) => message.type === "workspaces");
 
   test("a burst of metadata events re-posts the list only when the projection changes", async () => {
