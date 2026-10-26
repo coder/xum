@@ -6,7 +6,7 @@
  * only reloaded the page, so the server kept its in-memory state there.
  */
 import { expect } from "e2e";
-import { disableTutorials } from "../bugbash/repros/helpers";
+import { disableTutorials, sendMessage } from "../bugbash/repros/helpers";
 import { test } from "./fixtures";
 import { openPlayground } from "./helpers";
 
@@ -27,8 +27,13 @@ test(
     // replay, so the agent had to conclude it with a model call on every warm run.
     // exact step: Haiku 5.5 missed this step in 10 of 14 cold failures (Phase 5)
     await openPlayground(screen);
-    await agent.act(`send the chat message '${MESSAGE}' and wait for the reply`);
+    // exact step: an agent step that types here stops replaying when the placeholder tip rotates.
+    await sendMessage(screen, MESSAGE);
     await expect(transcript).toContainText(REPLY, { timeout: 30_000 });
+    // The reply text shows before stream-end persists it: a restart in that gap can lose it.
+    await expect(screen.getByRole("button", "Stop streaming")).not.toBeVisible({
+      timeout: 30_000,
+    });
 
     await xum.restartServer();
     await app.open();

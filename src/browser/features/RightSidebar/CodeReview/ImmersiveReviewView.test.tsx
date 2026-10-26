@@ -506,7 +506,9 @@ describe("ImmersiveReviewView", () => {
 
     // Full-file context hydrates and the loading cover clears (file is on screen).
     await waitFor(() => expect(view.container.textContent ?? "").toContain("file line 12"));
-    await waitFor(() => expect(view.queryByTestId("immersive-diff-reveal-overlay")).toBeNull());
+    await waitFor(() =>
+      expect(view.queryByTestId("immersive-diff-reveal-overlay") === null).toBe(true)
+    );
     const readsAfterHydration = readCount;
     expect(readsAfterHydration).toBeGreaterThanOrEqual(1);
 

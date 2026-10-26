@@ -283,8 +283,8 @@ describe("Send dispatch modes (mock AI router)", () => {
         expect(textContent).toContain("Queued");
         expect(textContent).toContain("Sends after this turn");
         expect(
-          app.view.container.querySelector('[data-component="QueuedMessageDispatchMenu"]')
-        ).toBeNull();
+          app.view.container.querySelector('[data-component="QueuedMessageDispatchMenu"]') === null
+        ).toBe(true);
       });
 
       const queuedDispatchButton = app.view.container.querySelector<HTMLButtonElement>(

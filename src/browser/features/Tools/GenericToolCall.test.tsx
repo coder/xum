@@ -180,7 +180,7 @@ describe("GenericToolCall MCP Apps view", () => {
     act(() => {
       updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1"));
     });
-    await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
+    await waitFor(() => expect(view.queryByTestId("mcp-app-frame") === null).toBe(true));
     const goTo = view.getByRole("button", { name: "Go to tab" });
     const opened: string[] = [];
     const onOpen = (e: Event) =>
@@ -208,7 +208,7 @@ describe("GenericToolCall MCP Apps view", () => {
       setMcpAppViewFullscreenOnly(workspaceId, "call-1", true);
       updateRightSidebarLayout(workspaceId, (s) => withAppViewTab(s, "call-1"));
     });
-    await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
+    await waitFor(() => expect(view.queryByTestId("mcp-app-frame") === null).toBe(true));
     act(() => {
       updateRightSidebarLayout(workspaceId, (s) => removeTabEverywhere(s, appViewTabFor("call-1")));
     });
@@ -226,7 +226,7 @@ describe("GenericToolCall MCP Apps view", () => {
     act(() => {
       updateRightSidebarLayout("ws-app-card", (s) => withAppViewTab(s, "call-1"));
     });
-    await waitFor(() => expect(view.queryByTestId("mcp-app-frame")).toBeNull());
+    await waitFor(() => expect(view.queryByTestId("mcp-app-frame") === null).toBe(true));
     expect(isCard()).toBe(true);
     // Collapsed, the card mounts no view: inline from the tab must not close it.
     fireEvent.click(view.getByText("dice_show_dice_board"));

@@ -628,7 +628,7 @@ describe("AskUserQuestionToolCall", () => {
       };
 
       await waitFor(() =>
-        expect(view.queryByRole("button", { name: "Submit answers" })).toBeNull()
+        expect(view.queryByRole("button", { name: "Submit answers" }) === null).toBe(true)
       );
       expect(sendMessage).not.toHaveBeenCalled();
     });
