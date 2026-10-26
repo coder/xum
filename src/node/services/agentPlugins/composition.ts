@@ -147,6 +147,13 @@ function workflowSourceLabel(scope: string, canonicalScriptPath?: string): strin
   return scope;
 }
 
+/** #7284: a remote (SSH/Docker) checkout's root, the turn's projectSearchRoot there. */
+function remoteCheckoutSearchRoot(args: BuildWorkspaceCompositionArgs): string | undefined {
+  return isRemoteRuntime(args.runtime)
+    ? (args.projectCheckoutRoot ?? args.workspacePath)
+    : undefined;
+}
+
 /**
  * #7284: the skill roots of a remote (SSH/Docker) checkout, built like a turn's
  * (skillStorageContext's project-runtime branch): trust-gated plugin containers at the checkout
@@ -154,8 +161,8 @@ function workflowSourceLabel(scope: string, canonicalScriptPath?: string): strin
  * (getRemoteProjectPluginSnapshot), so a warm cache adds no remote listing. Other runtimes: none.
  */
 function remoteCheckoutSkillRoots(args: BuildWorkspaceCompositionArgs) {
-  if (!isRemoteRuntime(args.runtime)) return {};
-  const projectSearchRoot = args.projectCheckoutRoot ?? args.workspacePath;
+  const projectSearchRoot = remoteCheckoutSearchRoot(args);
+  if (projectSearchRoot == null) return {};
   return {
     roots: getDefaultAgentSkillsRoots(args.runtime, args.workspacePath, {
       projectSearchRoot,
@@ -252,6 +259,8 @@ export async function buildWorkspaceComposition(
     const availableWorkflows = await discoverWorkflowScripts({
       runtime: args.runtime,
       workspacePath: args.workspacePath,
+      // Remote: the checkout root, like the skills above and a turn's workflow resolution.
+      projectSearchRoot: remoteCheckoutSearchRoot(args),
       projectTrusted: args.projectTrusted,
       runtimeFactory,
     });

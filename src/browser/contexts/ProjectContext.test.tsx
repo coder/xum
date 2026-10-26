@@ -156,6 +156,17 @@ describe("ProjectContext", () => {
       await waitFor(() => expect(triggers.length).toBeGreaterThan(0));
       changeConfig([["/alpha", { workspaces: [], displayName: "Alpha", trusted: true }]]);
       await waitFor(() => expect(trustChanges).toBe(1));
+
+      // A new untrusted parent project changes its trusted child's effective trust.
+      await waitFor(() => expect(triggers.length).toBeGreaterThan(0));
+      changeConfig([
+        ["/root", { workspaces: [] }],
+        [
+          "/alpha",
+          { workspaces: [], displayName: "Alpha", trusted: true, parentProjectPath: "/root" },
+        ],
+      ]);
+      await waitFor(() => expect(trustChanges).toBe(2));
     } finally {
       unsubscribe();
     }

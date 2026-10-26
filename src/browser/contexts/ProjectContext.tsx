@@ -158,20 +158,32 @@ async function runProjectMutation(
   }
 }
 
+/** A project's effective trust: its parent project's when it has one (isProjectTrustedIn). */
+function effectiveProjectTrust(
+  projects: ReadonlyMap<string, ProjectConfig>,
+  projectPath: string
+): boolean {
+  const trustOwnerPath = projects.get(projectPath)?.parentProjectPath ?? projectPath;
+  return projects.get(trustOwnerPath)?.trusted === true;
+}
+
 /**
  * #7216: trust changed by the `xum trust` CLI or another client reaches this renderer only as a
  * config change and the re-list after it, so publish a trust change (it refreshes the
  * trust-gated lists: project plugin skills, MCP servers) when a project listed in both snapshots
- * changed its trust. The first list has nothing to compare with.
+ * changed its effective trust (a new untrusted parent project changes its child's too). The
+ * first list has nothing to compare with.
  */
 function publishRelistedTrustChanges(
   previous: ReadonlyMap<string, ProjectConfig> | null,
   next: ReadonlyMap<string, ProjectConfig>
 ): void {
   if (previous == null) return;
-  for (const [projectPath, projectConfig] of next) {
-    const before = previous.get(projectPath);
-    if (before != null && (before.trusted === true) !== (projectConfig.trusted === true)) {
+  for (const projectPath of next.keys()) {
+    if (
+      previous.has(projectPath) &&
+      effectiveProjectTrust(previous, projectPath) !== effectiveProjectTrust(next, projectPath)
+    ) {
       publishProjectTrustChanged();
       return;
     }

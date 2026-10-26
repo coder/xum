@@ -214,21 +214,36 @@ describe("buildWorkspaceComposition", () => {
 
   // #7284: a turn in a trusted SSH/Docker checkout loads the checkout's plugin skills and agents
   // from the cached remote snapshot, so the inspector must list them too (and never for an
-  // untrusted checkout). A warm snapshot costs no further remote listing.
+  // untrusted checkout). Skills, agents and workflows share one remote listing (the snapshot).
   test.each([true, false])(
     "a remote checkout's plugin skills and agents are listed only when trusted (trusted: %s)",
     async (projectTrusted) => {
       using checkoutDir = new DisposableTempDir("composition-remote-checkout");
       const checkout = await fs.realpath(checkoutDir.path);
       await writeFixturePlugin(checkout);
+      await fs.writeFile(
+        path.join(
+          checkout,
+          ".mux",
+          "plugins",
+          PLUGIN_NAME,
+          "skills",
+          "fixture-skill",
+          "workflow.js"
+        ),
+        "export const meta = { name: 'fixture-skill-flow', description: 'Skill workflow' };",
+        "utf-8"
+      );
+      const subProjectPath = path.join(checkout, "packages", "app");
+      await fs.mkdir(subProjectPath, { recursive: true });
       const runtime = new HostKeyShellRemoteRuntime(
         checkout,
         `composition-remote-${projectTrusted}`
       );
-      const composed = () =>
+      const composed = (workspacePath = checkout) =>
         buildWorkspaceComposition({
           runtime,
-          workspacePath: checkout,
+          workspacePath,
           hostCheckoutRoot: null,
           projectCheckoutRoot: checkout,
           xumHome: path.join(checkout, ".fixture-mux-home"),
@@ -243,12 +258,19 @@ describe("buildWorkspaceComposition", () => {
       expect(pluginEntries.map((entry) => entry.name).sort()).toEqual(
         projectTrusted ? ["fixture-agent", "fixture-skill", "shared-fixture-skill"] : []
       );
-      const listings = runtime.pluginListings;
-      expect(listings).toBe(projectTrusted ? 1 : 0);
-      await composed();
-      expect(runtime.pluginListings).toBe(listings);
+      expect(runtime.pluginListings).toBe(projectTrusted ? 1 : 0);
+
+      // A subProjectPath workspace reads the checkout-level plugin's skill and its workflow too.
+      const subProject = await composed(subProjectPath);
+      expect(subProject.skills.some((skill) => skill.name === "fixture-skill")).toBe(
+        projectTrusted
+      );
+      expect(subProject.workflows.some((flow) => flow.name === "fixture-skill-flow")).toBe(
+        projectTrusted
+      );
     },
-    120_000
+    // Two compositions through a shell-backed remote runtime (hundreds of shell commands).
+    240_000
   );
 
   test("lists a managed plugin's slash command only while it matches its review (#6629)", async () => {
