@@ -446,6 +446,7 @@ import {
   BashMonitorRegistryStore,
   type BashMonitorRegistryRecord,
 } from "@/node/services/bashMonitorRegistryStore";
+import { BashMonitorPersistence } from "@/node/services/bashMonitorPersistence";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { getSelfIdentity } from "@/node/utils/concurrency/processLiveness";
@@ -1203,7 +1204,6 @@ const WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE =
 // workspace became active. This is an expected race, not a compaction failure, so the
 // idle-compaction loop must not count it toward suppression.
 const IDLE_ONLY_BUSY_SKIP_MESSAGE = "Workspace is busy; idle-only send was skipped.";
-const BASH_MONITOR_PERSIST_RETRY_DELAYS_MS = [50, 200] as const;
 
 async function waitForAgentSessionIdle(session: AgentSession, signal?: AbortSignal): Promise<void> {
   assert(session instanceof AgentSession, "waitForAgentSessionIdle requires an AgentSession");
@@ -2663,33 +2663,13 @@ export class WorkspaceService
    */
   private readonly bashMonitorHistoryLocks = new MutexMap<string>();
   private readonly bashMonitorRecoveryPromise: Promise<void>;
-  private readonly pendingBashMonitorPersistenceByWorkspace = new Map<string, Set<Promise<void>>>();
-  // Failed-persistence chains active per process, so a later cancellation (task_stop after a
-  // runtime failure) can invalidate in-flight persists and scheduled retries by generation.
-  // "failed" can never follow "canceled" for one generation (stopMonitor guards on
-  // monitor.stopped), so tracking only live failed chains suffices; the owning chain removes
-  // its entry on termination, keeping the map bounded by in-flight failure persists.
-  private readonly activeBashMonitorFailurePersists = new Map<
-    string,
-    { createdAt: string; canceled: boolean }
-  >();
-
-  private trackBashMonitorPersistence(workspaceId: string, promise: Promise<void>): Promise<void> {
-    const pending =
-      this.pendingBashMonitorPersistenceByWorkspace.get(workspaceId) ?? new Set<Promise<void>>();
-    this.pendingBashMonitorPersistenceByWorkspace.set(workspaceId, pending);
-    const tracked = promise.finally(() => {
-      pending.delete(tracked);
-      if (pending.size === 0) this.pendingBashMonitorPersistenceByWorkspace.delete(workspaceId);
-    });
-    pending.add(tracked);
-    return tracked;
-  }
-
-  private async drainBashMonitorPersistence(workspaceId: string): Promise<void> {
-    const pending = this.pendingBashMonitorPersistenceByWorkspace.get(workspaceId);
-    if (pending != null) await Promise.allSettled([...pending]);
-  }
+  private readonly bashMonitorPersistence = new BashMonitorPersistence({
+    registry: () => this.bashMonitorRegistryStore,
+    discardProcess: (workspaceId, processId, createdAt) =>
+      this.bashMonitorWakeReconciler.discardProcess(workspaceId, processId, createdAt),
+    isRemoving: (workspaceId) => this.removingWorkspaces.has(workspaceId),
+    onPersisted: (workspaceId) => this.scheduleBashMonitorWakeReconcile(workspaceId),
+  });
   private readonly bashOutputShownListener = (
     workspaceId: string,
     _payload: OutputShownPayload
@@ -2706,128 +2686,13 @@ export class WorkspaceService
     _workspaceId: string,
     payload: MonitorArmedPayload
   ): void => {
-    if (this.removingWorkspaces.has(payload.workspaceId)) return;
-    const persistence = this.bashMonitorRegistryStore
-      .upsert(payload)
-      .then(() => this.scheduleBashMonitorWakeReconcile(payload.workspaceId));
-    void this.trackBashMonitorPersistence(payload.workspaceId, persistence).catch(
-      (error: unknown) => {
-        log.error("Failed to persist armed bash monitor", {
-          workspaceId: payload.workspaceId,
-          error,
-        });
-      }
-    );
+    this.bashMonitorPersistence.onMonitorArmed(payload);
   };
   private readonly bashMonitorStoppedListener = (
     workspaceId: string,
     payload: MonitorStoppedPayload
   ): void => {
-    const processKey = workspaceId + "\u0000" + payload.processId;
-    const createdAt = payload.armMetadata?.createdAt;
-    if (payload.reason === "canceled" && createdAt != null) {
-      const active = this.activeBashMonitorFailurePersists.get(processKey);
-      if (active?.createdAt === createdAt) active.canceled = true;
-    }
-    const failurePersist =
-      payload.reason === "failed" && createdAt != null ? { createdAt, canceled: false } : undefined;
-    if (failurePersist != null) {
-      this.activeBashMonitorFailurePersists.set(processKey, failurePersist);
-    }
-    const wasCanceled = (): boolean => failurePersist?.canceled === true;
-    const settleFailurePersist = (): void => {
-      if (
-        failurePersist != null &&
-        this.activeBashMonitorFailurePersists.get(processKey) === failurePersist
-      ) {
-        this.activeBashMonitorFailurePersists.delete(processKey);
-      }
-    };
-    const persist = async (): Promise<boolean> => {
-      if (payload.reason === "canceled") {
-        if (createdAt == null) return false;
-        await this.bashMonitorWakeReconciler.discardProcess(
-          workspaceId,
-          payload.processId,
-          createdAt
-        );
-        await this.bashMonitorRegistryStore.remove(workspaceId, payload.processId, createdAt);
-        return true;
-      }
-      if (payload.reason === "failed") {
-        if (wasCanceled()) return false;
-        if (payload.armMetadata != null) {
-          await this.bashMonitorRegistryStore.upsert(payload.armMetadata);
-        }
-        if (wasCanceled()) return false;
-        if (payload.terminal != null) {
-          if (createdAt == null) return false;
-          await this.bashMonitorRegistryStore.recordTerminal(
-            workspaceId,
-            payload.processId,
-            createdAt,
-            payload.terminal
-          );
-        }
-        if (wasCanceled()) return false;
-        if (createdAt == null) return false;
-        await this.bashMonitorRegistryStore.recordLost(workspaceId, payload.processId, createdAt, {
-          reason: "runtime-failure",
-          ...(payload.failureMessage != null ? { failureMessage: payload.failureMessage } : {}),
-          ...(payload.failedOperations != null
-            ? { failedOperations: payload.failedOperations }
-            : {}),
-          ...(payload.failedMatch != null ? { failedMatch: payload.failedMatch } : {}),
-          failedAt: new Date().toISOString(),
-        });
-        return !wasCanceled();
-      }
-      if (payload.terminal != null && createdAt != null) {
-        await this.bashMonitorRegistryStore.recordTerminal(
-          workspaceId,
-          payload.processId,
-          createdAt,
-          payload.terminal
-        );
-      }
-      return true;
-    };
-    const persistence = new Promise<void>((resolve) => {
-      let retryIndex = 0;
-      const finish = (): void => {
-        settleFailurePersist();
-        resolve();
-      };
-      const run = (): void => {
-        if (this.removingWorkspaces.has(workspaceId) || wasCanceled()) {
-          finish();
-          return;
-        }
-        void persist()
-          .then((persisted) => {
-            if (persisted && !wasCanceled()) {
-              this.scheduleBashMonitorWakeReconcile(workspaceId);
-            }
-            finish();
-          })
-          .catch((error: unknown) => {
-            if (wasCanceled()) {
-              finish();
-              return;
-            }
-            const delay = BASH_MONITOR_PERSIST_RETRY_DELAYS_MS[retryIndex++];
-            if (delay == null) {
-              log.error("Failed to retire bash monitor state", { workspaceId, error });
-              finish();
-              return;
-            }
-            const timer = setTimeout(run, delay);
-            timer.unref();
-          });
-      };
-      run();
-    });
-    void this.trackBashMonitorPersistence(workspaceId, persistence);
+    this.bashMonitorPersistence.onMonitorStopped(workspaceId, payload);
   };
   // Last armed-monitor count successfully broadcast per workspace, so background process
   // churn that doesn't change the count (e.g. a monitorless bash exiting) skips the
@@ -8562,7 +8427,7 @@ export class WorkspaceService
         });
       }
 
-      await this.drainBashMonitorPersistence(workspaceId);
+      await this.bashMonitorPersistence.drainBashMonitorPersistence(workspaceId);
       await this.bashMonitorHistoryLocks.withLock(workspaceId, () =>
         this.bashMonitorWakeReconciler.dispose(workspaceId)
       );

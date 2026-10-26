@@ -27,7 +27,7 @@ function monitorInternals(service: WorkspaceService) {
   return service as unknown as {
     bashMonitorRegistryStore: BashMonitorRegistryStore;
     bashMonitorRecoveryPromise: Promise<void>;
-    drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+    bashMonitorPersistence: { drainBashMonitorPersistence(workspaceId: string): Promise<void> };
     scheduleBashMonitorWakeReconcile(workspaceId: string): void;
   };
 }
@@ -145,7 +145,9 @@ describeIntegration("Server update restart blockers", () => {
     }
     const live = await runningMonitor(result.backgroundProcessId);
     processes.push({ id: live.id, pid: live.pid });
-    await monitorInternals(env.services.workspaceService).drainBashMonitorPersistence(workspaceId);
+    await monitorInternals(
+      env.services.workspaceService
+    ).bashMonitorPersistence.drainBashMonitorPersistence(workspaceId);
     return live.id;
   }
 

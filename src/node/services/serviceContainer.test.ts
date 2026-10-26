@@ -216,7 +216,7 @@ describe("ServiceContainer", () => {
       dispatchBashMonitorWake(
         dispatch: BashMonitorWakeDispatch
       ): Promise<BashMonitorWakeDispatchOutcome>;
-      drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+      bashMonitorPersistence: { drainBashMonitorPersistence(workspaceId: string): Promise<void> };
       scheduleBashMonitorWakeReconcile(workspaceId: string): void;
     };
     await internal.bashMonitorRecoveryPromise;
@@ -291,7 +291,7 @@ describe("ServiceContainer", () => {
       expect(container.collectRestartBlockers()).toEqual(blocked);
 
       container.backgroundProcessManager.emit("monitor:armed", armed.workspaceId, armed);
-      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence(armed.workspaceId);
       await container.refreshRestartBlockers();
       expect(container.collectRestartBlockers()).toEqual([]);
 
@@ -402,7 +402,7 @@ describe("ServiceContainer", () => {
     try {
       upsert.mockRejectedValueOnce(new Error("registry write failed"));
       container.backgroundProcessManager.emit("monitor:armed", armed.workspaceId, armed);
-      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence(armed.workspaceId);
       await container.refreshRestartBlockers();
       expect(container.collectRestartBlockers()).toEqual([
         { kind: "background-processes", count: 1 },
@@ -419,7 +419,7 @@ describe("ServiceContainer", () => {
       ]);
     } finally {
       releaseWrite?.();
-      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence(armed.workspaceId);
       upsert.mockRestore();
       processes.clear();
     }
