@@ -5,7 +5,9 @@ import { WorkspaceNaming } from "@/node/services/workspaceNaming";
 import type { GenerateWorkspaceIdentityResult } from "@/node/services/workspaceTitleGenerator";
 
 function draft(): Promise<Result<GenerateWorkspaceIdentityResult, NameGenerationError>> {
-  return Promise.resolve(Ok({ name: "fix-login", title: "Fix login", modelUsed: "anthropic:claude-haiku-4-5" }));
+  return Promise.resolve(
+    Ok({ name: "fix-login", title: "Fix login", modelUsed: "anthropic:claude-haiku-4-5" })
+  );
 }
 
 describe("WorkspaceNaming", () => {
