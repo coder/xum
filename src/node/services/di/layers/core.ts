@@ -67,6 +67,7 @@ import {
   WorkspaceMcpOverrides,
   WorkspaceNamingTag,
   WorkspaceTurnManagerTag,
+  WorkspaceWorkflowRunsTag,
   type CoreRootTags,
   type CoreTags,
   type StoreTags,
@@ -94,6 +95,7 @@ import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
 import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
 import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
 import { WorkspaceNaming } from "@/node/services/workspaceNaming";
+import { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
@@ -288,6 +290,12 @@ export const WorkspaceExternalEditorsLive = Layer.effect(
 
 /** WorkspaceService's naming claims; no dependencies, one instance per graph. */
 export const WorkspaceNamingLive = Layer.sync(WorkspaceNamingTag, () => new WorkspaceNaming());
+
+/** WorkspaceService's workflow-run activity cache; reads only the config. */
+export const WorkspaceWorkflowRunsLive = Layer.effect(
+  WorkspaceWorkflowRunsTag,
+  Effect.map(ConfigTag, (config) => new WorkspaceWorkflowRuns({ config }))
+);
 
 /** One mutable record per graph build (`sync`, not `succeed`); filled by `CoreWiringLive`. */
 export const TurnRequestBuilderBindingsLive = Layer.sync(
@@ -540,7 +548,8 @@ export const WorkspaceLive = Layer.effect(
       yield* HostClockTag,
       yield* WorkspaceLifecycleGatesTag,
       yield* WorkspaceExternalEditorsTag,
-      yield* WorkspaceNamingTag
+      yield* WorkspaceNamingTag,
+      yield* WorkspaceWorkflowRunsTag
     );
   })
 );
@@ -789,6 +798,7 @@ const S1 = Layer.mergeAll(
   IdleDispatcherLive,
   WorkspaceLifecycleGatesLive,
   WorkspaceNamingLive,
+  WorkspaceWorkflowRunsLive,
   TurnRequestBuilderBindingsLive
 );
 // WorkspaceExternalEditorsLive reads S1's WorkspaceLifecycleGatesTag.

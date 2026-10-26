@@ -328,13 +328,7 @@ import {
   STAGED_ATTACHMENT_MIRROR_DIR_NAME,
   STAGED_ATTACHMENT_REHYDRATE_PENDING_FILE_NAME,
 } from "@/common/constants/stagedAttachments";
-import {
-  isActiveWorkflowRunStatus,
-  isNestedWorkflowRun,
-  type WorkflowRunRecord,
-  type WorkflowRunStatus,
-} from "@/common/types/workflow";
-import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import { type WorkflowRunRecord, type WorkflowRunStatus } from "@/common/types/workflow";
 import {
   hasInProcessWorkflowWork,
   type WorkflowArchiveAdmissionGuard,
@@ -472,6 +466,7 @@ import type { WorkspaceLifecycleHooks } from "@/node/services/workspaceLifecycle
 import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
 import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
 import { WorkspaceNaming } from "@/node/services/workspaceNaming";
+import { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
 import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { runProjectLifecycleHook } from "@/node/services/projectLifecycleHooks";
 import {
@@ -660,15 +655,6 @@ function findWorkspaceSharingPlanPath(
 type PlanFileDeletionError =
   | { type: "runtime_unreachable"; message: string }
   | { type: "delete_failed"; message: string };
-
-interface ActiveWorkflowRunIdsOptions {
-  /**
-   * Install the shared Set for an ARCHIVED workspace too. Only workflow status events need
-   * that (so later events accumulate without a disk scan); read paths leave dormant
-   * workspaces out of the cache. See resolveActiveWorkflowRunIds.
-   */
-  installDormant?: boolean;
-}
 
 /**
  * Random draws before an auto-generated name falls back to a numbered suffix. The pool holds
@@ -2893,20 +2879,6 @@ export class WorkspaceService
       });
   };
 
-  // Lazily bootstrapped workflow activity cache so sidebar refreshes don't rescan run history.
-  private readonly activeWorkflowRunIdBootstrapsByWorkspace = new Map<
-    string,
-    Promise<Set<string>>
-  >();
-  private readonly activeWorkflowRunIdsByWorkspace = new Map<string, Set<string>>();
-  // Workspaces where NONZERO workflow-run activity was actually observed
-  // (bootstrap probe, run-status event, or list read). This — not cache
-  // presence — is the zero-count tombstone signal: the activity list's own
-  // probe installs an (empty) cache for every scoped id, so cache existence
-  // would fabricate recency:0 entries for every idle config-known workspace
-  // from the second list on, re-bloating the payload this scoping trims.
-  private readonly workflowRunSeenWorkspaces = new Set<string>();
-
   // Debounce post-compaction metadata refreshes (file_edit_* can fire rapidly)
   private readonly postCompactionRefreshTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // Tracks workspaces currently being renamed to prevent streaming during rename. The Set lives in
@@ -3270,7 +3242,9 @@ export class WorkspaceService
       gates: lifecycleGates,
     }),
     // WorkspaceLive passes the WorkspaceNamingTag service.
-    private readonly naming: WorkspaceNaming = new WorkspaceNaming()
+    private readonly naming: WorkspaceNaming = new WorkspaceNaming(),
+    // WorkspaceLive passes the WorkspaceWorkflowRunsTag service.
+    private readonly workflowRuns: WorkspaceWorkflowRuns = new WorkspaceWorkflowRuns({ config })
   ) {
     super();
     this.bashMonitorRegistryStore = new BashMonitorRegistryStore(config);
@@ -4939,170 +4913,11 @@ export class WorkspaceService
     });
   }
 
-  private async populateActiveWorkflowRunIds(
-    workspaceId: string,
-    activeRunIds: Set<string>
-  ): Promise<Set<string>> {
-    try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, workspaceId),
-      });
-      const runs = await runStore.listRunStatusSnapshots();
-      for (const run of runs) {
-        if (
-          run.workspaceId === workspaceId &&
-          !isNestedWorkflowRun(run) &&
-          isActiveWorkflowRunStatus(run.status)
-        ) {
-          activeRunIds.add(run.id);
-        }
-      }
-    } catch (error) {
-      log.debug("Failed to inspect active workflow runs for workspace activity", {
-        workspaceId,
-        error,
-      });
-    }
-    return activeRunIds;
-  }
-
-  private async getActiveWorkflowRunIds(
-    workspaceId: string,
-    options?: ActiveWorkflowRunIdsOptions
-  ): Promise<Set<string>> {
-    let activeRunIds = await this.resolveActiveWorkflowRunIds(workspaceId, options);
-    // Converge on the installed cache: a dormant (archived) read resolves a DETACHED empty
-    // Set, and a workflow event can install and populate the shared one in the microtask
-    // gap above. Returning the detached copy would let an authoritative list response that
-    // lands after the event clear the activity the event just delivered to the renderer.
-    // (Same applies to the pathological detached disk probe in resolve's fallback.)
-    const installed = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
-    if (installed != null && installed !== activeRunIds) {
-      activeRunIds = installed;
-    }
-    if (
-      activeRunIds.size > 0 &&
-      // Installation re-check in THIS continuation: an eviction (removal, or
-      // a tombstone lifted for revival) can land in the microtask gap after
-      // resolve's own final check. A detached set must not repopulate the
-      // seen marker — the evicted id's caches are empty, so a stale marker
-      // would fabricate zero-count entries for the idle revived workspace.
-      this.activeWorkflowRunIdsByWorkspace.get(workspaceId) === activeRunIds
-    ) {
-      // A list- or event-delivered nonzero count is what makes a later zero
-      // meaningful as a tombstone (see workflowRunSeenWorkspaces).
-      this.workflowRunSeenWorkspaces.add(workspaceId);
-    }
-    return activeRunIds;
-  }
-
-  private async resolveActiveWorkflowRunIds(
-    workspaceId: string,
-    options?: ActiveWorkflowRunIdsOptions
-  ): Promise<Set<string>> {
-    assert(workspaceId.length > 0, "getActiveWorkflowRunIds requires workspaceId");
-    // Bounded retry: evictWorkspaceActivityCaches (removal, or a tombstone
-    // lifted for re-registration) can race an in-flight bootstrap. A waiter
-    // that captured the pre-eviction Set would otherwise return the removed
-    // incarnation's runs — ghost counts with no future terminal event to
-    // clear them — so after every await the Set is re-verified as still the
-    // installed cache and the read restarts when it was evicted.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const cached = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
-      if (cached != null) {
-        const bootstrap = this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId);
-        if (bootstrap != null) {
-          await bootstrap;
-        }
-        if (this.activeWorkflowRunIdsByWorkspace.get(workspaceId) !== cached) {
-          continue;
-        }
-        return cached;
-      }
-
-      const workspace = findWorkspaceEntry(
-        this.config.loadConfigOrDefault(),
-        workspaceId
-      )?.workspace;
-      // Archived stores are dormant until unarchive invalidates this cache. Live workflow
-      // events still update the shared Set without scanning archived session directories,
-      // so only the event path installs one: read paths (the activity list walks every
-      // config-known id) would otherwise fill this map with an empty Set per archived
-      // workspace, thousands on long-lived deployments, that nothing ever reads back.
-      // The detached result is provisional: getActiveWorkflowRunIds swaps in the shared
-      // Set if an event installed one before the caller's continuation ran.
-      if (workspace && isWorkspaceArchived(workspace.archivedAt, workspace.unarchivedAt)) {
-        const activeRunIds = new Set<string>();
-        if (options?.installDormant === true) {
-          this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
-        }
-        return activeRunIds;
-      }
-
-      // Install the shared Set before awaiting disk so parallel workflow status events
-      // mutate the same cache instead of racing to replace each other after bootstrap.
-      const activeRunIds = new Set<string>();
-      this.activeWorkflowRunIdsByWorkspace.set(workspaceId, activeRunIds);
-      const bootstrap = this.populateActiveWorkflowRunIds(workspaceId, activeRunIds);
-      this.activeWorkflowRunIdBootstrapsByWorkspace.set(workspaceId, bootstrap);
-      try {
-        await bootstrap;
-      } finally {
-        if (this.activeWorkflowRunIdBootstrapsByWorkspace.get(workspaceId) === bootstrap) {
-          this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
-        }
-      }
-      if (this.activeWorkflowRunIdsByWorkspace.get(workspaceId) !== activeRunIds) {
-        continue;
-      }
-      return activeRunIds;
-    }
-    // Eviction churn exhausted the retries (pathological): probe disk once
-    // more DETACHED so the caller still gets current durable state without
-    // installing a cache that may itself be mid-eviction.
-    return this.populateActiveWorkflowRunIds(workspaceId, new Set<string>());
-  }
-
-  private async updateActiveWorkflowRunCount(event: {
-    workspaceId: string;
-    runId: string;
-    status: WorkflowRunStatus;
-  }): Promise<number> {
-    // Bounded retry (same reason as resolveActiveWorkflowRunIds): an
-    // eviction can land in the microtask gap after the cache read resolves,
-    // so the mutation below would hit a detached incarnation — and must not
-    // mark the seen set for an id whose caches were just evicted, or the
-    // idle revived workspace emits fabricated zero-count entries forever.
-    let detachedSize = 0;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const activeRunIds = await this.getActiveWorkflowRunIds(event.workspaceId, {
-        installDormant: true,
-      });
-      if (isActiveWorkflowRunStatus(event.status)) {
-        activeRunIds.add(event.runId);
-      } else {
-        activeRunIds.delete(event.runId);
-      }
-      detachedSize = activeRunIds.size;
-      if (this.activeWorkflowRunIdsByWorkspace.get(event.workspaceId) !== activeRunIds) {
-        continue;
-      }
-      if (isActiveWorkflowRunStatus(event.status)) {
-        this.workflowRunSeenWorkspaces.add(event.workspaceId);
-      }
-      return activeRunIds.size;
-    }
-    // Eviction churn exhausted the retries (pathological): report the last
-    // detached mutation's size without seen-marking, mirroring the detached
-    // disk-probe fallback in resolveActiveWorkflowRunIds.
-    return detachedSize;
-  }
-
   private mergeCachedActiveWorkflowRuns(
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot | null
   ): WorkspaceActivitySnapshot | null {
-    const activeRunIds = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+    const activeRunIds = this.workflowRuns.installedActiveWorkflowRunIds(workspaceId);
     if (activeRunIds == null) {
       return snapshot;
     }
@@ -5162,7 +4977,10 @@ export class WorkspaceService
     workspaceId: string,
     snapshot: WorkspaceActivitySnapshot
   ): Promise<WorkspaceActivitySnapshot> {
-    return mergeActiveWorkflowRuns(snapshot, await this.getActiveWorkflowRunIds(workspaceId));
+    return mergeActiveWorkflowRuns(
+      snapshot,
+      await this.workflowRuns.getActiveWorkflowRunIds(workspaceId)
+    );
   }
 
   public async emitWorkflowRunActivity(event: {
@@ -5172,7 +4990,7 @@ export class WorkspaceService
   }): Promise<void> {
     assert(event.workspaceId.length > 0, "emitWorkflowRunActivity requires workspaceId");
     assert(event.runId.length > 0, "emitWorkflowRunActivity requires runId");
-    await this.updateActiveWorkflowRunCount(event);
+    await this.workflowRuns.updateActiveWorkflowRunCount(event);
     let snapshot: WorkspaceActivitySnapshot | null;
     try {
       snapshot = await this.extensionMetadata.getSnapshot(event.workspaceId, {
@@ -13211,8 +13029,7 @@ export class WorkspaceService
         return Ok(undefined);
       }
 
-      this.activeWorkflowRunIdsByWorkspace.delete(workspaceId);
-      this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+      this.workflowRuns.invalidateActiveWorkflowRunIds(workspaceId);
 
       // Emit updated metadata
       const allMetadata = await this.config.getAllWorkspaceMetadata();
@@ -19465,10 +19282,8 @@ export class WorkspaceService
    * an in-flight bootstrap keeps populating its orphaned Set harmlessly.
    */
   private evictWorkspaceActivityCaches(workspaceId: string): void {
-    this.activeWorkflowRunIdsByWorkspace.delete(workspaceId);
-    this.activeWorkflowRunIdBootstrapsByWorkspace.delete(workspaceId);
+    this.workflowRuns.evictWorkflowRunCaches(workspaceId);
     this.bashMonitorSeenWorkspaces.delete(workspaceId);
-    this.workflowRunSeenWorkspaces.delete(workspaceId);
   }
 
   /**
@@ -19651,13 +19466,13 @@ export class WorkspaceService
           log.debug("Failed to scope activity list to known workspaces", { error });
           scopedFailOpen = true;
           workspaceIds = new Set(snapshots.keys());
-          for (const workspaceId of this.activeWorkflowRunIdsByWorkspace.keys()) {
+          for (const workspaceId of this.workflowRuns.cachedWorkspaceIds()) {
             workspaceIds.add(workspaceId);
           }
           for (const workspaceId of this.bashMonitorSeenWorkspaces) {
             workspaceIds.add(workspaceId);
           }
-          for (const workspaceId of this.workflowRunSeenWorkspaces) {
+          for (const workspaceId of this.workflowRuns.seenWorkspaceIds()) {
             workspaceIds.add(workspaceId);
           }
         }
@@ -19699,14 +19514,15 @@ export class WorkspaceService
             // installs an empty cache for every scoped id, which would turn
             // every idle config-known workspace into a fabricated recency:0
             // entry on the next list.
-            const hadWorkflowActivity = this.workflowRunSeenWorkspaces.has(workspaceId);
+            const hadWorkflowActivity = this.workflowRuns.hasSeenWorkflowRuns(workspaceId);
             // Bash-monitor counterpart of the workflow tombstone: a monitor that stopped
             // while the renderer was disconnected (or whose stop emit failed) must still
             // surface a zero-count entry here, otherwise the renderer's last-known
             // "watching" state survives reconnect. The seen-set is used instead of the
             // dedupe map because dedupe entries are dropped around in-flight/failed emits.
             const hadBashMonitorActivityCache = this.bashMonitorSeenWorkspaces.has(workspaceId);
-            const activeWorkflowRunIds = await this.getActiveWorkflowRunIds(workspaceId);
+            const activeWorkflowRunIds =
+              await this.workflowRuns.getActiveWorkflowRunIds(workspaceId);
             const activeWorkflowRunCount = activeWorkflowRunIds.size;
             const activeBashMonitorCount = this.getActiveBashMonitorCount(workspaceId);
             if (activeBashMonitorCount > 0) {
@@ -20088,7 +19904,10 @@ export class WorkspaceService
           ) {
             continue;
           }
-          probedWorkflowRunIds.set(workspaceId, await this.getActiveWorkflowRunIds(workspaceId));
+          probedWorkflowRunIds.set(
+            workspaceId,
+            await this.workflowRuns.getActiveWorkflowRunIds(workspaceId)
+          );
         }
         const isRawInvisible = (workspaceId: string): boolean =>
           !(initialConfigIds?.has(workspaceId) ?? false) &&
@@ -20391,7 +20210,7 @@ export class WorkspaceService
       // delivered to the renderer. Removed ids cannot re-enter: eviction deletes their
       // cache entry and the local tombstone is re-checked.
       for (const workspaceId of new Set([...workspaceIds, ...Object.keys(activityById)])) {
-        const installed = this.activeWorkflowRunIdsByWorkspace.get(workspaceId);
+        const installed = this.workflowRuns.installedActiveWorkflowRunIds(workspaceId);
         if (installed == null) continue;
         const row = activityById[workspaceId];
         if (row != null) {

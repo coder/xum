@@ -84,6 +84,7 @@ import type { TerminalAttentionStore } from "@/node/services/terminalAttentionSt
 import type { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
 import type { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
 import type { WorkspaceNaming } from "@/node/services/workspaceNaming";
+import type { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { TokenizerService } from "@/node/services/tokenizerService";
@@ -227,6 +228,11 @@ export class WorkspaceExternalEditorsTag extends Context.Service<
 export class WorkspaceNamingTag extends Context.Service<WorkspaceNamingTag, WorkspaceNaming>()(
   "xum/WorkspaceNaming"
 ) {}
+/** Active workflow runs of each workspace, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceWorkflowRunsTag extends Context.Service<
+  WorkspaceWorkflowRunsTag,
+  WorkspaceWorkflowRuns
+>()("xum/WorkspaceWorkflowRuns") {}
 /** Late-bound collaborators of the turn request builder (a mutable record, filled by wiring). */
 export class TurnRequestBuilderBindingsTag extends Context.Service<
   TurnRequestBuilderBindingsTag,
@@ -417,6 +423,7 @@ export type CoreTags =
   | WorkspaceLifecycleGatesTag
   | WorkspaceExternalEditorsTag
   | WorkspaceNamingTag
+  | WorkspaceWorkflowRunsTag
   | TurnRequestBuilderBindingsTag;
 
 /**
