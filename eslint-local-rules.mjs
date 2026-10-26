@@ -1963,7 +1963,18 @@ const localPlugin = {
         };
         const paramName = (param) =>
           param.type === "AssignmentPattern" ? param.left.name : param.name;
-        const report = (node, delay) => found.push({ node, delay });
+        // The statement a node starts in (`await new Promise(...)` over several lines).
+        const statementOf = (node) => {
+          let current = node;
+          while (current.parent && !/Statement$|Declaration$/.test(current.type)) {
+            current = current.parent;
+          }
+          return current;
+        };
+        // `places`: the nodes a disable comment can sit on for this wait (the timer, the first
+        // line of its statement and, for a helper call, the wait inside the helper).
+        const report = (node, delay, places = []) =>
+          found.push({ node, delay, places: [node, statementOf(node), ...places] });
         // A wait at `anchor` (the Promise of a timer wait, or the Bun.sleep call) with
         // `delayNode`: a helper's waits count at its calls, any other at `reportNode`.
         const recordWait = (anchor, delayNode, reportNode) => {
@@ -1975,11 +1986,12 @@ const localPlugin = {
           const delay = paramIndex >= 0 ? null : fixedDelay(delayNode);
           if (paramIndex < 0 && delay === null) return;
           if (!helper) {
-            report(reportNode, delay);
+            report(reportNode, delay, [statementOf(anchor)]);
             return;
           }
           if (!helpers.has(helper)) helpers.set(helper, []);
-          helpers.get(helper).push(paramIndex >= 0 ? { paramIndex } : { delay, node: reportNode });
+          const places = [reportNode, statementOf(anchor)];
+          helpers.get(helper).push(paramIndex >= 0 ? { paramIndex, places } : { delay, places });
         };
         // Lines whose waits carry a reasoned disable comment for this rule.
         const disabledLines = new Set();
@@ -2027,7 +2039,7 @@ const localPlugin = {
               // reference) still waits when it runs: count each fixed wait in it once.
               if (calls.length === 0) {
                 for (const wait of waits) {
-                  if (wait.delay != null) report(wait.node, wait.delay);
+                  if (wait.delay != null) report(wait.places[0], wait.delay, wait.places);
                 }
               }
               for (const call of calls) {
@@ -2040,14 +2052,18 @@ const localPlugin = {
                         (param.type === "AssignmentPattern" ? param.right : null)
                     );
                   }
-                  if (delay != null) report(call, delay);
+                  if (delay != null) report(call, delay, wait.places);
                 }
               }
             }
-            // A disabled wait is still reported, so ESLint drops it and its directive counts as
-            // used, but it does not use up the allow entry.
-            const disabled = found.filter(({ node }) => disabledLines.has(node.loc.start.line));
-            const counted = found.filter(({ node }) => !disabledLines.has(node.loc.start.line));
+            // A disabled wait is still reported, on its disabled line, so ESLint drops it and its
+            // directive counts as used. It does not use up the allow entry.
+            const disabledPlace = (wait) =>
+              wait.places.find((place) => disabledLines.has(place.loc.start.line));
+            const disabled = found
+              .filter((wait) => disabledPlace(wait))
+              .map((wait) => ({ ...wait, node: disabledPlace(wait) }));
+            const counted = found.filter((wait) => !disabledPlace(wait));
             // The allow entry is an exact count, so it can only go down (as in no-raw-clock).
             counted.sort((a, b) => a.node.range[0] - b.node.range[0]);
             for (const { node, delay } of [...disabled, ...counted.slice(allowed)]) {
