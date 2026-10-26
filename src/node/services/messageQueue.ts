@@ -408,6 +408,15 @@ interface QueueEntry {
   turnAdmission?: TurnAdmissionToken;
 }
 
+/** Why a queue head is not dispatchable (see MessageQueue.peekNext). */
+type QueueHeadWithdrawal =
+  | {
+      kind: "canceled";
+      reason: string;
+      cancelState: { canceledBeforeAcceptance: boolean } | undefined;
+    }
+  | { kind: "stale" };
+
 /** Stale/withdrawn entries drain as no-ops or held input; they must not cut tools or background Bash. */
 function isEntryDispatchable(entry: QueueEntry): boolean {
   return (
@@ -1360,11 +1369,25 @@ export class MessageQueue {
         refusedManualSend: () => RefusedManualSend | undefined;
         /** The entry's task-attempt obligation, checked by the dequeue gate before admission. */
         turnAdmission: TurnAdmissionToken | undefined;
+        /**
+         * Set when the entry is not dispatchable, the rule the tool-end cut uses too (#7553): how
+         * sendMessage would refuse it (a fired cancel signal wins over staleness there as well).
+         */
+        withdrawal: QueueHeadWithdrawal | undefined;
       }
     | undefined {
     const entry = this.entries[0];
     return entry
       ? {
+          withdrawal: isEntryDispatchable(entry)
+            ? undefined
+            : entry.cancelSignal?.aborted === true
+              ? {
+                  kind: "canceled",
+                  reason: cancelReasonBeforeAcceptance(entry.cancelSignal),
+                  cancelState: entry.cancelState,
+                }
+              : { kind: "stale" },
           identity: entry,
           muxMetadata: entry.muxMetadata,
           acceptanceOrigin: this.getAcceptanceOrigin(entry),

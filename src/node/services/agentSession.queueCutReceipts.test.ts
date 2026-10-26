@@ -10,7 +10,7 @@ import {
   CONTEXT_CONTINUE_DEDUPE_KEY,
   CONTEXT_WARNING_DEDUPE_KEY,
 } from "@/common/constants/contextBudget";
-import type { AgentSessionAIService } from "./agentSession";
+import { CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE, type AgentSessionAIService } from "./agentSession";
 import {
   createAgentSessionHarness,
   seedAutoCompactionThreshold,
@@ -367,72 +367,122 @@ describe("AgentSession queue-cut receipts", () => {
   });
 });
 
-// F182 (unverified suspicion): the cut skips an entry whose own admissionStale probe is true and
-// names the next live tool-end entry X. The drain's dequeue gate refuses only turnAdmission
-// staleness, so the stale head W claims a turn and X's receipt waits for a later drain.
-describe("AgentSession queue-cut receipts with a stale head", () => {
-  test("a stale head claims no turn and the cut entry dispatches in the same drain", async () => {
-    const h = await setup();
-    try {
-      let staleHeadFailures = 0;
-      h.session.queueMessage(
-        "stale head",
-        { model: TEST_MODEL, agentId: "exec" },
-        {
-          acceptanceOrigin: "automatic",
-          synthetic: true,
-          admissionStale: () => true,
-          onAcceptedPreStreamFailure: () => {
-            staleHeadFailures += 1;
-          },
-        }
-      );
-      h.session.queueMessage("continue", { model: TEST_MODEL, agentId: "exec" });
-      const cut = h.session.getQueuedInputStopCause();
-      expect(cut).toBeDefined();
-      const entryId = cut!.entryId;
-      const phases: string[] = [];
-      h.session.onChatEvent(({ message }) => {
-        if (message.type === "stream-lifecycle") phases.push(message.phase);
-      });
-      const sends: string[] = [];
-      const send = h.session.sendMessage.bind(h.session);
-      const spy = spyOn(h.session, "sendMessage").mockImplementation((message, ...rest) => {
-        sends.push(message);
-        return send(message, ...rest);
-      });
+type SkipReason = "entry-stale" | "compaction-stale" | "canceled";
+type HeadKind = "automatic" | "manual";
 
-      h.session.sendQueuedMessages();
-      // One drain: no idle re-drain is allowed to rescue the cut entry.
-      const successorAfterDrain = h.session.getQueueCutReceipt(entryId)?.successor;
-      const dispatched = await Promise.race([
-        h.firstRequest.then(() => true),
-        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 5_000)),
-      ]);
-      spy.mockRestore();
+interface HeadOutcome {
+  canceled: string[];
+  failures: string[];
+  canceledBeforeAcceptance: boolean;
+}
 
-      const successorKind = (successor: unknown) =>
-        typeof successor === "object" && successor !== null
-          ? (successor as { kind: string }).kind
-          : successor;
-      expect({
-        sends,
-        phases,
-        successorAfterDrain: successorKind(successorAfterDrain),
-        dispatched,
-        finalSuccessor: successorKind(h.session.getQueueCutReceipt(entryId)?.successor),
-      }).toEqual({
-        // W is withdrawn: only X is sent, and only X's turn reaches the lifecycle.
-        sends: ["continue"],
-        phases: ["preparing", "streaming"],
-        successorAfterDrain: "admitted",
-        dispatched: true,
-        finalSuccessor: "streaming",
-      });
-      // W's enqueuer still hears its refusal exactly once (existing stale-entry contract).
-      expect(staleHeadFailures).toBe(1);
-    } finally {
-      await teardown(h);
+/** Queue a head the tool-end cut skips (isEntryDispatchable false); returns its outcome so far. */
+function queueSkippedHead(h: AgentSessionHarness, reason: SkipReason, kind: HeadKind) {
+  const canceled: string[] = [];
+  const failures: string[] = [];
+  const cancelState = { canceledBeforeAcceptance: false };
+  const controller = new AbortController();
+  if (reason === "canceled") controller.abort();
+  h.session.queueMessage(
+    "skipped head",
+    { model: TEST_MODEL, agentId: "exec" },
+    {
+      ...(kind === "automatic" ? { acceptanceOrigin: "automatic" as const, synthetic: true } : {}),
+      ...(reason === "entry-stale" ? { admissionStale: () => true } : {}),
+      ...(reason === "compaction-stale" ? { compactionAdmissionStale: () => true } : {}),
+      cancelSignal: controller.signal,
+      cancelState,
+      onCanceled: (why) => {
+        canceled.push(why);
+      },
+      onAcceptedPreStreamFailure: (error) => {
+        failures.push(error.type === "unknown" ? error.raw : error.type);
+      },
     }
-  });
+  );
+  return (): HeadOutcome => ({ canceled, failures, ...cancelState });
+}
+
+interface SuccessorOutcome {
+  phases: string[];
+  afterDrain: unknown;
+  final: unknown;
+  restored: string[];
+  held: string[];
+}
+const STALE: HeadOutcome = {
+  canceled: [],
+  failures: [CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE],
+  canceledBeforeAcceptance: false,
+};
+const CANCELED: HeadOutcome = {
+  canceled: ["Queued message canceled before acceptance."],
+  failures: [],
+  canceledBeforeAcceptance: true,
+};
+/** The cut's successor dispatches in the drain that settles the skipped head (#7553). */
+const SAME_DRAIN: SuccessorOutcome = {
+  phases: ["preparing", "streaming"],
+  afterDrain: "admitted",
+  final: "streaming",
+  restored: [],
+  held: [],
+};
+
+describe("AgentSession queue-cut receipts with a skipped head", () => {
+  test.each<[SkipReason, HeadKind, HeadOutcome, SuccessorOutcome]>([
+    ["entry-stale", "automatic", STALE, SAME_DRAIN],
+    ["entry-stale", "manual", STALE, SAME_DRAIN],
+    ["compaction-stale", "automatic", STALE, SAME_DRAIN],
+    // Restorable manual input keeps the full path: its failed dispatch restores it with the
+    // queue, so the successor is restored too, never dispatched.
+    [
+      "compaction-stale",
+      "manual",
+      STALE,
+      {
+        phases: ["preparing", "idle"],
+        afterDrain: "pending",
+        final: "canceled",
+        restored: ["skipped head\ncontinue"],
+        held: ["skipped head", "continue"],
+      },
+    ],
+    ["canceled", "automatic", CANCELED, SAME_DRAIN],
+    ["canceled", "manual", CANCELED, SAME_DRAIN],
+  ])(
+    "a %s %s head the cut skips keeps its outcome and does not delay the cut entry",
+    async (reason, kind, head, successor) => {
+      const h = await setup();
+      try {
+        const headOutcome = queueSkippedHead(h, reason, kind);
+        h.session.queueMessage("continue", { model: TEST_MODEL, agentId: "exec" });
+        const entryId = h.session.getQueuedInputStopCause()!.entryId;
+        const phases: string[] = [];
+        const restored: string[] = [];
+        h.session.onChatEvent(({ message }) => {
+          if (message.type === "stream-lifecycle") phases.push(message.phase);
+          if (message.type === "restore-to-input") restored.push(message.text);
+        });
+        const kindOf = (value: unknown) =>
+          typeof value === "object" && value !== null ? (value as { kind: string }).kind : value;
+
+        h.session.sendQueuedMessages();
+        const afterDrain = kindOf(h.session.getQueueCutReceipt(entryId)?.successor);
+        if (successor.final === "streaming") await h.firstRequest;
+        else await h.session.waitForIdle();
+
+        expect(headOutcome()).toEqual(head);
+        expect({
+          phases,
+          afterDrain,
+          final: kindOf(h.session.getQueueCutReceipt(entryId)?.successor),
+          restored,
+          held: h.session.getHeldInputs().map((input) => input.send.displayText),
+        }).toEqual(successor);
+      } finally {
+        await teardown(h);
+      }
+    }
+  );
 });

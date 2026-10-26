@@ -12500,6 +12500,31 @@ export class AgentSession {
       this.sendQueuedMessages(trigger, stopAdmission);
       return;
     }
+    // Withdrawal gate (#7553): the tool-end cut skips a head that is not dispatchable and names
+    // the next entry as its successor, so that head must not claim a turn ahead of it. Settle it
+    // here as sendMessage's own refusal would: a fired cancel signal reports cancellation, a stale
+    // probe reports the blocked send, and nothing is held (Stop's restore skips such input too).
+    // A manual head whose input is still restorable keeps the full path: its failed preparation
+    // restores it with the rest of the queue, and the turn it claims keeps the queue from
+    // dispatching until that restore ran.
+    const withdrawal = candidate.withdrawal;
+    if (withdrawal != null && candidate.inputForRestore() == null) {
+      const removed = this.messageQueue.removeEntry(candidate.identity);
+      if (removed != null) {
+        this.emitQueuedMessageChanged();
+        if (withdrawal.kind === "canceled") {
+          if (withdrawal.cancelState) withdrawal.cancelState.canceledBeforeAcceptance = true;
+          this.notifyQueuedMessageCleared({ onCanceled: removed.onCanceled }, withdrawal.reason);
+        } else {
+          this.notifyQueuedMessageCleared(
+            { onAcceptedPreStreamFailure: removed.onAcceptedPreStreamFailure },
+            CONTEXT_MUTATION_SEND_BLOCKED_MESSAGE
+          );
+        }
+      }
+      this.sendQueuedMessages(trigger, stopAdmission);
+      return;
+    }
     const expectedTurnId = this.coordinator.turnId;
     const attempt: PreparationAttempt = {
       intent: "send",
