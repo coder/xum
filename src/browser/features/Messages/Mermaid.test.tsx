@@ -1,6 +1,7 @@
-import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
+import * as LazyFeatureModule from "@/browser/components/LazyFeature/LazyFeature";
 import { StreamingContext } from "./StreamingContext";
 import { Mermaid, sanitizeMermaidSvg } from "./Mermaid";
 import { getTranscriptContextMenuMarkdown } from "@/browser/utils/messages/transcriptContextMenu";
@@ -67,21 +68,32 @@ describe("Mermaid layout stability", () => {
     mermaidRender.mockClear();
   });
 
-  // React.lazy caches the resolved module for the whole process, so this must stay the first
-  // markdown mermaid render: later renders mount Mermaid synchronously (e.g. under `--rerun-each`).
-  test("markdown shows the pending diagram frame until the Mermaid chunk loads", async () => {
+  test("markdown's diagram fallback keeps the loaded diagram's frame", async () => {
+    // React.lazy caches the Mermaid chunk for the whole process, so whether this render shows the
+    // fallback depends on which test files ran first. The spy captures the fallback that
+    // MarkdownComponents hands its LazyFeature boundary, and the test renders it on its own.
+    const lazyFeature = spyOn(LazyFeatureModule, "LazyFeature");
     const view = render(
       <ThemeProvider forcedTheme="dark">
         <MarkdownRenderer content={"```mermaid\ngraph TD\nA-->B\n```"} />
       </ThemeProvider>
     );
+    // Fallback or Mermaid's own pending state: the first frame has the diagram's height.
+    expect(view.container.querySelector<HTMLElement>(".mermaid-container")?.style.minHeight).toBe(
+      "300px"
+    );
+    const boundary = lazyFeature.mock.calls.find(([props]) => props.name === "Diagram");
+    lazyFeature.mockRestore();
+    expect(boundary).toBeDefined();
+    const fallbackView = render(
+      <ThemeProvider forcedTheme="dark">{boundary?.[0].fallback}</ThemeProvider>
+    );
 
     // The chunk has not loaded yet: no zoom controls, but the same box Mermaid reserves.
-    const pending = view.container.querySelector<HTMLElement>(".mermaid-container");
-    expect(view.queryAllByRole("button")).toHaveLength(0);
+    const pending = fallbackView.container.querySelector<HTMLElement>(".mermaid-container");
+    expect(within(fallbackView.container).queryAllByRole("button")).toHaveLength(0);
     expect(pending?.style.minHeight).toBe("300px");
     expect(pending?.textContent).toBe("Rendering diagram...");
-    const pendingFrameStyle = pending?.parentElement?.style.cssText;
 
     expect(await view.findByRole("button", { name: "⤢" })).toBeTruthy();
     await waitFor(() =>
@@ -89,7 +101,7 @@ describe("Mermaid layout stability", () => {
     );
     // Same outer frame before and after the chunk loads, so nothing shifts.
     const loaded = view.container.querySelector<HTMLElement>(".mermaid-container");
-    expect(loaded?.parentElement?.style.cssText).toBe(pendingFrameStyle);
+    expect(loaded?.parentElement?.style.cssText).toBe(pending?.parentElement?.style.cssText);
     expect(loaded?.style.minHeight).toBe("300px");
   });
 
