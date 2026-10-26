@@ -151,8 +151,7 @@ export class BashMonitorPersistence {
         }
         void persist()
           .then((persisted) => {
-            // mutation-equivalent: persistFailed already returns false once canceled, and no
-            // cancellation can land between its return and this callback.
+            // A cancel can land after persistFailed's last check and before this callback.
             if (persisted && !wasCanceled()) {
               this.deps.onPersisted(workspaceId);
             }
@@ -211,7 +210,8 @@ export class BashMonitorPersistence {
     await this.deps
       .registry()
       .recordLost(workspaceId, payload.processId, createdAt, runtimeFailureLoss(payload));
-    // mutation-equivalent: persistWithRetries checks wasCanceled() again before it reconciles.
+    // mutation-equivalent: canceled never resets, and persistWithRetries checks wasCanceled()
+    // again later, before it reconciles; so returning true here reconciles the same set of chains.
     return !wasCanceled();
   }
 

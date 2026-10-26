@@ -132,4 +132,28 @@ describe("BashMonitorPersistence", () => {
     await persistence.drainBashMonitorPersistence("ws");
     expect(persisted).toEqual(["ws"]);
   });
+
+  test("a cancellation right after the lost write also keeps the chain from reconciling", async () => {
+    const { persistence, registry, persisted } = harness();
+    const cancel = (): void =>
+      persistence.onMonitorStopped("ws", {
+        processId: "proc-1",
+        reason: "canceled",
+        armMetadata: armed,
+      });
+    // The cancel runs after persistFailed's last check but before the chain reconciles: the
+    // write resolves at once, and the cancel is queued just behind persistFailed's await on it.
+    registry.recordLost.mockImplementationOnce(() => {
+      const written = Promise.resolve();
+      queueMicrotask(() => void written.then(cancel));
+      return written;
+    });
+    persistence.onMonitorStopped("ws", {
+      processId: "proc-1",
+      reason: "failed",
+      armMetadata: armed,
+    });
+    await persistence.drainBashMonitorPersistence("ws");
+    expect(persisted).toEqual(["ws"]);
+  });
 });
