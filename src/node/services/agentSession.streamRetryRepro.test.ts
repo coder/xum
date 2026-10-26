@@ -211,14 +211,14 @@ test("scope: only the auto-retry defers; other automatic resumes still start", a
     hasExternalManualSendPreflight: () => true,
   });
   try {
-    const providerStarted = Promise.withResolvers<void>();
-    spyOn(h.aiService, "streamMessage").mockImplementationOnce(() => {
-      providerStarted.resolve();
-      return Promise.resolve(Err({ type: "unknown" as const, raw: "test stream" }));
-    });
-    const resuming = h.session.resumeStream(options, { acceptanceOrigin: "automatic" });
-    await providerStarted.promise;
-    await resuming;
+    const streamSpy = spyOn(h.aiService, "streamMessage").mockImplementationOnce(() =>
+      Promise.resolve(Err({ type: "unknown" as const, raw: "test stream" }))
+    );
+    const resumed = await h.session.resumeStream(options, { acceptanceOrigin: "automatic" });
+    // Not deferred (that returns Ok({ started: false }) without the provider): the resume reached
+    // the provider and returns the provider's error.
+    expect(streamSpy).toHaveBeenCalledTimes(1);
+    expect(resumed).toMatchObject({ success: false, error: { raw: "test stream" } });
   } finally {
     await h.cleanup();
   }
