@@ -479,9 +479,12 @@ function planSystemSection(
     return asBefore;
   }
   if (liveTail === appliedTail) return withRows;
-  // A row must follow a user message. Otherwise (a resume after an assistant row) send the new
-  // tail as before, which re-freezes the segment at it.
-  if (messages.at(-1)?.role !== "user") return asBefore;
+  // A row must follow a user message. Otherwise (a retry after a stream failure, or a resume
+  // after an assistant row) keep the frozen section and record nothing: the next request
+  // after a user message sends the change as a row. A re-freeze here rewrote the warm cache
+  // seconds after the failed attempt (F36: 3 prefix breaks on retries in one day), and the
+  // turn's earlier steps read the frozen section anyway.
+  if (messages.at(-1)?.role !== "user") return withRows;
   const appendedRow = systemRow(`${channel.rowId}-pending`, channel, liveTail);
   return {
     ...withRows,

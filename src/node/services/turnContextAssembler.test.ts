@@ -788,46 +788,38 @@ describe("assemblePromptPayload", () => {
       const gemini = await withTail(warning("B"), history, {});
       expect(gemini.system).toBe(stable + warning("B"));
       expect(gemini.volatileSystemTail).toBeUndefined();
-
-      // Anthropic rejects a system row after an assistant row: send B as before and refreeze.
-      const resumed = await withTail(warning("B"), [
-        ...history,
-        createMuxMessage("a2", "assistant", "partial", { partial: true }),
-      ]);
-      expect(roles(resumed).slice(0, 2)).toEqual(["system:stable", `system:${warning("B")}`]);
-      expect(roles(resumed).filter((role) => role.startsWith("system")).length).toBe(2);
-      expect(resumed.volatileSystemTail).toEqual({ text: warning("B"), placement: "system" });
     });
 
-    test("a re-freeze after an assistant-last resume drops the rows before it", async () => {
-      // Codex P1 (PRRT_kwDOPxxmWM6sqho9): row B says it replaces the earlier sections, so if
-      // it stayed after a re-freeze at C, the model would read B as the newer tail.
+    test("an assistant-last request keeps the frozen tail and the next user turn sends the row", async () => {
+      // F36: a retry after a stream failure (or a resume) ends with an assistant row, where
+      // Anthropic rejects a system row. It re-froze at the live tail and rewrote the warm
+      // cache seconds after the failed attempt. Now it keeps A and row B, and records nothing.
       const history = [
         createMuxMessage("u1", "user", "first"),
         answer("a1", "system", warning("A")),
         createMuxMessage("u2", "user", "second"),
         answer("a2", "row", warning("B")),
         createMuxMessage("u3", "user", "third"),
-        createMuxMessage("a3", "assistant", "partial", { partial: true }),
       ];
-      const resumed = await withTail(warning("C"), history);
-      expect(resumed.volatileSystemTail).toEqual({ text: warning("C"), placement: "system" });
-      expect(roles(resumed).filter((role) => role.startsWith("system"))).toEqual([
-        "system:stable",
-        `system:${warning("C")}`,
+      const sent = await withTail(warning("B"), history);
+      const resumed = await withTail(warning("C"), [
+        ...history,
+        createMuxMessage("a3", "assistant", "partial", { partial: true }),
       ]);
+      expect(resumed.volatileSystemTail).toBeUndefined();
+      expect(withoutMarkers(resumed.messages.slice(0, sent.messages.length))).toBe(
+        withoutMarkers(sent.messages)
+      );
+      expect(JSON.stringify(resumed.messages)).not.toContain("[Warning: C]");
 
-      // The next turn keeps the re-freeze: C stays in the system prompt and B does not return.
+      // The next request after a user message sends C as a row.
       const next = await withTail(warning("C"), [
-        ...history.slice(0, -1),
-        answer("a3", "system", warning("C"), { partial: true }),
+        ...history,
+        createMuxMessage("a3", "assistant", "answer"),
         createMuxMessage("u4", "user", "fourth"),
       ]);
-      expect(next.volatileSystemTail).toBeUndefined();
-      expect(roles(next).filter((role) => role.startsWith("system"))).toEqual([
-        "system:stable",
-        `system:${warning("C")}`,
-      ]);
+      expect(next.volatileSystemTail).toEqual({ text: warning("C"), placement: "row" });
+      expect(roles(next).slice(0, 2)).toEqual(["system:stable", `system:${warning("A")}`]);
     });
 
     test("a row skipped on rebuild does not hide its tail from the model", async () => {
@@ -1055,6 +1047,38 @@ describe("assemblePromptPayload", () => {
       expect(withoutMarkers(next.messages.slice(0, removed.messages.length))).toBe(
         withoutMarkers(removed.messages)
       );
+    });
+
+    test("a retry after an assistant row keeps the frozen skill index in the tool block", async () => {
+      // F36 (live, 2026-10-26): a stream closed mid-turn, and the retry's history ended with
+      // the committed assistant row. The skill list had changed meanwhile, so the retry
+      // re-froze it and rewrote the cached tool block 2 s after the failed attempt.
+      const index = (skills: string) => `\n\nAvailable skills:\n${skills}`;
+      const send = (skills: string, history: MuxMessage[]) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable,
+          tools: {
+            agent_skill_read: tool({
+              description: `Read a skill.${index(skills)}`,
+              inputSchema: jsonSchema({ type: "object" }),
+            }),
+          },
+          skillIndexSection: { prefix: "Read a skill.", block: index(skills) },
+        });
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        createMuxMessage("a1", "assistant", "answer", {
+          skillIndex: { text: index("- a"), placement: "system" },
+        }),
+      ];
+      const retry = await send("- a\n- b", history);
+      expect(retry.tools?.agent_skill_read?.description).toBe(`Read a skill.${index("- a")}`);
+      expect(retry.skillIndex).toBeUndefined();
+      const next = await send("- a\n- b", [...history, createMuxMessage("u2", "user", "second")]);
+      expect(next.tools?.agent_skill_read?.description).toBe(`Read a skill.${index("- a")}`);
+      expect(next.skillIndex).toEqual({ text: index("- a\n- b"), placement: "row" });
     });
 
     test("a skill index change keeps the frozen tool description and replays from the records", async () => {
