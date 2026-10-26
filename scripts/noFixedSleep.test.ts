@@ -53,6 +53,26 @@ test("reports a fixed wait of 20 ms or more in each spelling", () => {
   }
 });
 
+test("a delay the rule cannot prove short counts as a fixed wait", () => {
+  const waits = [
+    `await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_MS));`,
+    `await Bun.sleep(STATUS_DELAY_MS + 50);`,
+    `const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));\nawait sleep(40 * RETRY_MS);`,
+  ];
+  for (const code of waits) {
+    expect({ code, count: reportCount(code) }).toEqual({ code, count: 1 });
+  }
+  expect(messages(`await Bun.sleep(DELAY_MS + 50);`)[0]?.message).toContain("`DELAY_MS + 50` ms");
+});
+
+test("a helper with a fixed delay counts once per call", () => {
+  const helper = `const waitForThrottle = () => new Promise((resolve) => setTimeout(resolve, 120));`;
+  expect(reportCount(`${helper}\nawait waitForThrottle();\nawait waitForThrottle();`)).toBe(2);
+  // Also through an act() callback, the shape of the reconnect suites' old flush().
+  const flush = `async function flush() {\n  await act(async () => {\n    await new Promise((resolve) => setTimeout(resolve, 20));\n  });\n}`;
+  expect(reportCount(`${flush}\nawait flush();\nawait flush();\nawait flush();`)).toBe(3);
+});
+
 test("allows yields under 20 ms, timers that do not resolve a wait, and signals", () => {
   const allowed = [
     `await new Promise((resolve) => setTimeout(resolve, 0));`,
@@ -60,9 +80,10 @@ test("allows yields under 20 ms, timers that do not resolve a wait, and signals"
     `function tick(ms = 0) { return new Promise((resolve) => setTimeout(resolve, ms)); }\nawait tick(); await tick(10);`,
     `setTimeout(() => emit("late"), 50);`,
     `await new Promise((resolve, reject) => setTimeout(() => reject(new Error("timeout")), 50));`,
-    `await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_MS));`,
     `await waitFor(() => expect(calls).toBe(1), { timeout: 2000 });`,
     `function setTimeout(fn: () => void, ms: number) {}\nawait new Promise((resolve) => setTimeout(resolve, 50));`,
+    `const Bun = { sleep: (_ms: number) => Promise.resolve() };\nawait Bun.sleep(20);`,
+    `const settle = () => new Promise((resolve) => setTimeout(resolve, 50));`,
   ];
   for (const code of allowed) {
     expect({ code, count: reportCount(code) }).toEqual({ code, count: 0 });
