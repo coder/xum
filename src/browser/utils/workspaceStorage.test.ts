@@ -2,10 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import { restoreDomGlobals, saveDomGlobals } from "../../../tests/ui/domGlobals";
 
-import {
-  copyWorkspaceStorage,
-  deleteWorkspaceStorage,
-} from "@/browser/utils/workspaceStorage";
+import { copyWorkspaceStorage, deleteWorkspaceStorage } from "@/browser/utils/workspaceStorage";
 import {
   getReviewsKey,
   getDesktopPopoutKey,
