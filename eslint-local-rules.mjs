@@ -1020,7 +1020,6 @@ const localPlugin = {
           "DocumentFragment",
           "Element",
           "HTMLInputElement",
-          "HTMLFormElement",
           "HTMLElement",
           "NodeFilter",
           "Node",
