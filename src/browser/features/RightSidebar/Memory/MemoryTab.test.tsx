@@ -615,7 +615,7 @@ describe("MemoryTab", () => {
     const reload = await findByLabelText("Reload memory file");
     reload.focus();
     fireEvent.click(reload);
-    await waitFor(() => expect(queryByRole("alert")).toBeNull());
+    await waitFor(() => expect(queryByRole("alert") === null).toBe(true));
 
     fireEvent.keyDown(document.activeElement!, { key: "e", ctrlKey: true });
     expect(document.activeElement).toBe(

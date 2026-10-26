@@ -174,7 +174,7 @@ describe("UpdateRestartOverlay", () => {
     await flushStream();
     expect(view.getByTestId(OVERLAY)).toBeTruthy();
     after.push({ type: "idle" });
-    await waitFor(() => expect(textOf(view.queryByTestId(OVERLAY))).toBeNull());
+    await waitFor(() => expect(textOf(view.queryByTestId(OVERLAY)) === null).toBe(true));
   });
 
   test("hides again when the install fails after restarting was announced", async () => {
@@ -186,7 +186,7 @@ describe("UpdateRestartOverlay", () => {
     await waitFor(() => expect(view.getByTestId(OVERLAY)).toBeTruthy());
 
     stream.push({ type: "error", phase: "install", message: "activation failed" });
-    await waitFor(() => expect(textOf(view.queryByTestId(OVERLAY))).toBeNull());
+    await waitFor(() => expect(textOf(view.queryByTestId(OVERLAY)) === null).toBe(true));
   });
 
   // The App keeps the last client while Xum reconnects (kept-gap), so a drop ends the stream

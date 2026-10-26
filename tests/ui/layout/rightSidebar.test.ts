@@ -800,7 +800,7 @@ describeIntegration("RightSidebar (UI)", () => {
       toggle.focus();
       fireEvent.mouseUp(toggle);
       fireEvent.click(toggle);
-      await waitFor(() => expect(sidebar.querySelector('[role="tablist"]')).toBeNull());
+      await waitFor(() => expect(sidebar.querySelector('[role="tablist"]') === null).toBe(true));
       fireEvent.click(toggle);
 
       await findSidebarTab(sidebar, "costs");
@@ -849,7 +849,7 @@ describeIntegration("RightSidebar (UI)", () => {
       expect(panel()).not.toBeNull();
       running = null;
       closing.finish();
-      await waitFor(() => expect(panel()).toBeNull());
+      await waitFor(() => expect(panel() === null).toBe(true));
       expect(card()).not.toBeNull();
 
       const opening = new FakeCSSTransition();

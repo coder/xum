@@ -63,7 +63,7 @@ describe.each([...GAP_MODES])("ServerAccessSection across a reconnect (%s)", (mo
 
     act(() => answer?.([session("s2", "Phone")]));
     await view.findByText("Phone");
-    await waitFor(() => expect(view.queryByText("Laptop")).toBeNull());
+    await waitFor(() => expect(view.queryByText("Laptop") === null).toBe(true));
   });
 
   // A revoke offline cannot reach the server: the kept rows must not offer it.

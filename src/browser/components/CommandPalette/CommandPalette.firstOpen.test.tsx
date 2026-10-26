@@ -79,7 +79,7 @@ describe("command palette first open", () => {
     const input = await view.findByRole("combobox");
     expect((input as HTMLInputElement).value).toBe(">Pick");
     fireEvent.keyDown(input, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("combobox")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("combobox") === null).toBe(true));
     expect(document.activeElement).toBe(second);
   });
 
@@ -108,7 +108,7 @@ describe("command palette first open", () => {
       if (actionsMode) expect(await view.findByRole("option", { name: "Pick me" })).toBeTruthy();
       // Escape returns focus to where it was before the open (not to the loading input).
       fireEvent.keyDown(input, { key: "Escape" });
-      await waitFor(() => expect(view.queryByRole("combobox")).toBeNull());
+      await waitFor(() => expect(view.queryByRole("combobox") === null).toBe(true));
       expect(document.activeElement).toBe(openerButton);
     });
   }
