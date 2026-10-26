@@ -29,6 +29,13 @@ import ts from "typescript";
  * testing recovery", or design notes like "pure for easy testing"), and "test-only"
  * used as an adjective about test code elsewhere ("builds a narrow test-only context").
  */
+/**
+ * A phrase that names the documented declaration: "this member" (or field, property, option,
+ * method, parameter, argument, hook, callback), a `backticked` name, or a camelCase identifier.
+ * Case-sensitive on purpose: camelCase is what tells `runtimeFactory` from a plain word.
+ */
+const DECLARATION_REFERENCE = String.raw`(?:(?:[Tt]his|[Tt]he)\s+(?:member|field|property|option|method|parameter|argument|hook|callback)|\`[^\`]+\`|[a-z]+[A-Z]\w*)`;
+
 export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "Exported for tests", "exported for unit testing", "exposed only for tests",
   // "Exported for tests only", "visible for testing".
@@ -60,16 +67,20 @@ export const SEAM_COMMENT_PATTERNS: readonly RegExp[] = [
   // "Useful in tests for checking ...", "needed only in tests".
   // "This callback must never be called in tests" is negated, so it stays quiet.
   /(?<!\b(?:not|never)\s+(?:be\s+|been\s+)?)\b(?:useful|needed|called|invoked)\s+(?:only\s+)?in\s+(?:unit\s+|integration\s+)?tests\b(?![/-])/i,
-  // The test-double claims must open a sentence: the double is the subject of the claim, so prose
-  // such as "defaults for fields absent from test doubles", "not absent from test doubles",
-  // "test doubles never pass it" or "test doubles record each render pass" stays quiet.
-  // "Absent on test doubles", "Absent from a test double": the member is optional only so doubles
-  // can leave it out.
-  // An explicit subject and copula may come first: "This member is absent from test doubles".
-  /(?:^|[.!?]\s)\s*(?:(?:this\s+|the\s+)?[\w.]+\s+(?:is|are)\s+)?absent\s+(?:on|from|in)\s+(?:a\s+)?test\s+doubles?\b/i,
+  // The test-double claims must open a sentence, and any subject or object must name the
+  // declaration, so prose such as "defaults for fields absent from test doubles", "The race is
+  // absent from test doubles", "test doubles never pass it", "test doubles pass the same contract
+  // tests" or "test doubles record each render pass" stays quiet.
+  // "Absent on test doubles", "This member is absent from a test double", "`clock` is absent
+  // from test doubles": the member is optional only so doubles can leave it out.
+  new RegExp(
+    String.raw`(?:^|[.!?]\s)\s*(?:${DECLARATION_REFERENCE}\s+(?:is|are)\s+)?[Aa]bsent\s+(?:on|from|in)\s+(?:a\s+)?test\s+doubles?\b`
+  ),
   // "Test doubles of AIService pass one too", "A test double passes runtimeFactory": the member
-  // exists so doubles can supply it. "Test doubles pass the contract tests" is about tests.
-  /(?:^|[.!?]\s)\s*(?:a\s+)?test\s+doubles?(?:\s+of\s+[\w.]+)?\s+(?:also\s+)?pass(?:es)?\s+(?!(?:the\s+|their\s+|all\s+)?[\w-]*\s*tests?\b)[\w.]+/i,
+  // exists so doubles can supply it.
+  new RegExp(
+    String.raw`(?:^|[.!?]\s)\s*(?:[Aa]\s+)?[Tt]est\s+doubles?(?:\s+of\s+[\w.]+)?\s+(?:also\s+)?pass(?:es)?\s+(?:one|it|them|${DECLARATION_REFERENCE})(?![\w-])`
+  ),
 ];
 
 /**

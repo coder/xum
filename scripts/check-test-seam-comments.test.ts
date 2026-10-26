@@ -134,6 +134,14 @@ test("matches test-double seam claims, not prose about doubles", () => {
     "1:q",
   ]);
   expect(seams("// This member is not absent from test doubles.\nexport const r = 1;")).toEqual([]);
+  expect(seams("// `clock` is absent from test doubles.\nexport const s = 1;")).toEqual(["1:s"]);
+  // A subject or object that does not name the declaration claims no seam.
+  expect(seams("// The race is absent from test doubles.\nexport const t = 1;")).toEqual([]);
+  expect(seams("// This behavior is absent from test doubles.\nexport const u = 1;")).toEqual([]);
+  expect(
+    seams("// Test doubles pass the same contract tests as production.\nexport const v = 1;")
+  ).toEqual([]);
+  expect(seams("// Test doubles pass every integration test.\nexport const w = 1;")).toEqual([]);
   // The double must be the subject: no test outcome, negation, or other subject.
   expect(seams("// Test doubles pass the contract tests.\nexport const k = 1;")).toEqual([]);
   expect(seams("// Test doubles pass their tests.\nexport const l = 1;")).toEqual([]);
