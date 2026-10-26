@@ -35,7 +35,7 @@ async function commit(remote: string) {
  * slow runner (#4394). Wait for the panel's own idle signal before interacting again.
  */
 async function waitForComponentsIdle(canvas: { queryByText: (text: string) => unknown }) {
-  await waitFor(() => expect(canvas.queryByText("Saving components…")).toBeNull());
+  await waitFor(() => expect(canvas.queryByText("Saving components…") === null).toBe(true));
 }
 
 async function openPreview(app: AppHarness, remote: string) {

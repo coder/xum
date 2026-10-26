@@ -69,7 +69,7 @@ describeIntegration("ReviewPanel FileTree view mode (UI + ORPC)", () => {
         await within(fileTree).findByText("a/b", {}, { timeout: 10_000 });
         await waitFor(
           () => {
-            expect(fileTree.querySelector("[data-toggle]")).toBeNull();
+            expect(fileTree.querySelector("[data-toggle]") === null).toBe(true);
           },
           { timeout: 5_000 }
         );
