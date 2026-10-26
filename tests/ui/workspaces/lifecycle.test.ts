@@ -153,9 +153,6 @@ describeIntegration("Workspace Archive (UI)", () => {
     });
     if (!secondResult.success) throw new Error(secondResult.error);
     const secondWorkspace = secondResult.metadata;
-    // The quick archive button is hidden while the row shows setup activity, and
-    // setupWorkspaceView does not wait for setup (#7534).
-    await waitForInitComplete(env, firstWorkspace.id, 30_000);
     const firstDisplayTitle = firstWorkspace.title ?? firstWorkspace.name;
 
     const cleanupDom = setupTestDom();
@@ -165,6 +162,11 @@ describeIntegration("Workspace Archive (UI)", () => {
     });
 
     try {
+      // The quick archive button is hidden while the row shows setup activity, and
+      // setupWorkspaceView does not wait for setup (#7534). Inside the try, so a failed wait
+      // still removes both workspaces.
+      await waitForInitComplete(env, firstWorkspace.id, 30_000);
+
       // Navigate to the first workspace (make it active)
       await setupWorkspaceView(view, firstWorkspace, firstWorkspace.id);
 
@@ -311,7 +313,7 @@ describeIntegration("Workspace Archive (UI)", () => {
         await cleanupView(view, cleanupDom);
       }
     });
-  }, 30_000);
+  }, 60_000);
 });
 
 describeIntegration("Workspace Archive List Reactivity (UI)", () => {
@@ -351,9 +353,6 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
     });
     if (!secondResult.success) throw new Error(secondResult.error);
     const secondWorkspace = secondResult.metadata;
-    // The row shows its actions menu only after workspace setup ends (a cancel button replaces
-    // it while isInitializing), and setupWorkspaceView does not wait for setup (#7534).
-    await waitForInitComplete(env, secondWorkspace.id, 30_000);
     const secondDisplayTitle = secondWorkspace.title ?? secondWorkspace.name;
 
     // Archive the first workspace so the archive section will be visible
@@ -366,6 +365,11 @@ describeIntegration("Workspace Archive List Reactivity (UI)", () => {
     });
 
     try {
+      // The row shows its actions menu only after workspace setup ends (a cancel button replaces
+      // it while isInitializing), and setupWorkspaceView does not wait for setup (#7534).
+      // Inside the try, so a failed wait still removes both workspaces.
+      await waitForInitComplete(env, secondWorkspace.id, 30_000);
+
       // Select the second workspace so its archive button is visible
       await setupWorkspaceView(view, secondWorkspace, secondWorkspace.id);
 
