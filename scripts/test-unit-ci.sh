@@ -258,9 +258,9 @@ done
 
 # Bun-run test trees outside src/ (Jest ignores them, see jest.config.js): Storybook
 # policy tests, the VS Code extension's pure helpers (incl. the webview oRPC allowlist
-# guard) and tooling tests under scripts/. check-startup-imports.test.ts and
-# check-test-seam-comments.test.ts are excluded because their static-check make
-# targets run them right before the guard itself; crap/check.test.ts and
+# guard) and tooling tests under scripts/. check-startup-imports.test.ts,
+# check-test-seam-comments.test.ts and check-test-only-exports.test.ts are excluded
+# because their static-check make targets run them right before the guard itself; crap/check.test.ts and
 # crap/agentGate.test.ts need uv (make test-crap-scripts runs them), as do
 # dry/check.test.ts and mutate/check.test.ts (make test-dry-scripts and
 # test-mutate-scripts); orpcConnection.integration.test.ts
@@ -281,6 +281,7 @@ done < <(
   find "${tooling_roots[@]}" -type f \( -name '*.test.ts' -o -name '*.test.tsx' \) \
     ! -path ./scripts/check-startup-imports.test.ts \
     ! -path ./scripts/check-test-seam-comments.test.ts \
+    ! -path ./scripts/check-test-only-exports.test.ts \
     ! -path ./scripts/crap/check.test.ts \
     ! -path ./scripts/crap/agentGate.test.ts \
     ! -path ./scripts/dry/check.test.ts \
