@@ -186,6 +186,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       backgroundProcessManager: new BackgroundProcessManager(
         path.join(config.rootDir, "hold-background-processes")
       ),
+      workspaceGoalService: options?.workspaceGoalService,
       aiServiceOverrides: {
         isStreaming: () => streaming,
         streamMessage: mock((opts: { workspaceId: string }) => {
@@ -249,9 +250,6 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     });
     const svc = internals(taskService);
     ledger.svc = svc;
-    if (options?.workspaceGoalService != null) {
-      workspaceService.setWorkspaceGoalService(options.workspaceGoalService);
-    }
     workspaceService.setAgentTaskIntegration(
       taskService as unknown as Parameters<WorkspaceService["setAgentTaskIntegration"]>[0]
     );
@@ -920,6 +918,21 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       spyOn(goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
         realWait(workspaceId, messageId, 20)
       );
+      // The child's session opens its stream's accounting receipt at stream start (the session
+      // gets this goal service from WorkspaceService). Hold its settlement, as a slow accounting
+      // write would, until the test ends.
+      const isHeldReceipt = (workspaceId: string, messageId: string) =>
+        workspaceId === childId && messageId === "assistant-1";
+      const realSettle = goals.settleStreamAccountingReceipt.bind(goals);
+      const realRelease = goals.releaseUnaccountedStreamAccountingReceipt.bind(goals);
+      spyOn(goals, "settleStreamAccountingReceipt").mockImplementation((workspaceId, messageId) => {
+        if (!isHeldReceipt(workspaceId, messageId)) realSettle(workspaceId, messageId);
+      });
+      spyOn(goals, "releaseUnaccountedStreamAccountingReceipt").mockImplementation(
+        (workspaceId, messageId) => {
+          if (!isHeldReceipt(workspaceId, messageId)) realRelease(workspaceId, messageId);
+        }
+      );
       const stack = await createStack(childId, undefined, { workspaceGoalService: goals });
       const { taskService, svc, workspaceService, completions, sendOptions } = stack;
       try {
@@ -932,8 +945,6 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         expect(
           await workspaceService.sendMessage(childId, "follow-up text", sendOptions, { onCanceled })
         ).toEqual(Ok(undefined));
-        // The session opened this stream's accounting receipt; it never settles in this test.
-        goals.beginStreamAccountingReceipt(childId, "assistant-1");
         stack.endStream(0, {}, true);
         await until(
           () => svc.streamEndDecisionsByTaskId.get(childId)?.[0]?.outcome === "pending",
@@ -987,6 +998,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
         expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
       } finally {
+        realSettle(childId, "assistant-1");
         await stack.cleanup();
       }
     },

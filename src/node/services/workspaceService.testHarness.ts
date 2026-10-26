@@ -272,8 +272,14 @@ export type RealHostWorkspaceServiceOptions = Omit<
   /** Event source of the AI fake; tests emit stream events on it. */
   aiEmitter?: EventEmitter;
   /** Members layered over the AI fake (getWorkspaceMetadata defaults to the real Config). */
-  aiServiceOverrides?: Partial<AgentSessionAIService>;
+  aiServiceOverrides?: Partial<RealHostAIService>;
+  /** Set before any session exists: AgentSession captures the goal service when created. */
+  workspaceGoalService?: WorkspaceGoalService;
 };
+
+/** The AIService members a real-host WorkspaceService and its sessions call. */
+export type RealHostAIService = AgentSessionAIService &
+  Pick<AIService, "getAutomaticGoalTurnAgentRefusal">;
 
 export interface RealHostWorkspaceService extends AsyncDisposable {
   service: WorkspaceService;
@@ -302,23 +308,37 @@ export interface RealHostWorkspaceService extends AsyncDisposable {
 export function createRealHostWorkspaceService(
   options: RealHostWorkspaceServiceOptions
 ): RealHostWorkspaceService {
-  const { aiEmitter: emitter, aiServiceOverrides, ...serviceOptions } = options;
+  const {
+    aiEmitter: emitter,
+    aiServiceOverrides,
+    workspaceGoalService,
+    ...serviceOptions
+  } = options;
   const config = options.config;
-  const aiFake = createAgentSessionAIServiceFake({
-    emitter,
-    overrides: {
-      getWorkspaceMetadata: mock(async (workspaceId: string) => {
-        const metadata = await config.getWorkspaceMetadataById(workspaceId);
-        return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${workspaceId}`);
-      }),
-      ...aiServiceOverrides,
-    },
-  });
-  // WorkspaceService reads members of the full AIService the session-facing fake also
-  // implements (events, stream lifecycle, metadata, providers, experiments).
+  const aiFake = Object.assign(
+    createAgentSessionAIServiceFake({
+      emitter,
+      overrides: {
+        getWorkspaceMetadata: mock(async (workspaceId: string) => {
+          const metadata = await config.getWorkspaceMetadataById(workspaceId);
+          return metadata ? Ok(metadata) : Err(`Workspace metadata not found for ${workspaceId}`);
+        }),
+        ...aiServiceOverrides,
+      },
+    }),
+    {
+      // AIService answers null when the workspace's agent resolves for an automatic goal turn.
+      getAutomaticGoalTurnAgentRefusal:
+        aiServiceOverrides?.getAutomaticGoalTurnAgentRefusal ??
+        mock((_workspaceId: string, _options: unknown) => Promise.resolve(null)),
+    }
+  ) satisfies RealHostAIService;
+  // The fake implements every member WorkspaceService and its sessions call (RealHostAIService);
+  // the full class also has members only other services use.
   const aiService = aiFake as unknown as AIService;
   const appFiberScope = Scope.makeUnsafe("parallel");
   const service = createWorkspaceServiceForTest({ ...serviceOptions, aiService, appFiberScope });
+  if (workspaceGoalService != null) service.setWorkspaceGoalService(workspaceGoalService);
   const events = new Map<string, WorkspaceChatMessage[]>();
   service.on("chat", (event: { workspaceId: string; message: WorkspaceChatMessage }) => {
     const list = events.get(event.workspaceId) ?? [];
