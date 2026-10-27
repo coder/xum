@@ -123,7 +123,9 @@ export function deriveStatusActivity(
   messages: readonly DisplayedMessage[],
   flags: StatusActivityFlags
 ): StatusActivity {
-  if (flags.isStreamStarting) return { kind: "starting", label: startingLabel(flags.runtimeStatus) };
+  if (flags.isStreamStarting) {
+    return { kind: "starting", label: startingLabel(flags.runtimeStatus) };
+  }
   if (flags.isCompacting) return { kind: "compacting", label: "Compacting context…" };
   if (flags.awaitingUserQuestion) return { kind: "question", label: "Waiting for your answer" };
   if (flags.canInterrupt) return streamingActivity(messages);

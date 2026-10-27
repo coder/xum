@@ -215,7 +215,10 @@ function AgentInterfaceStatusBar(props: { workspaceId: string }) {
 function usePeekShortcut(togglePeek: () => void) {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (!matchesKeybind(e, KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK) || isShortcutOwnedElsewhere(e)) {
+      if (
+        !matchesKeybind(e, KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK) ||
+        isShortcutOwnedElsewhere(e)
+      ) {
         return;
       }
       e.preventDefault();
