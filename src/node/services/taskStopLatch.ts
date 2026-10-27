@@ -23,8 +23,8 @@ import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
 /**
  * Everything the stop latch reads from TaskService. Each entry is a call-time closure over
  * TaskService, never a captured value or bound method: tests swap TaskService fields and patch
- * its methods after construction. Attempt, send and stream-end state stays on TaskService and is
- * reached only through these closures.
+ * its methods after construction. Attempt, send and stream-end state stays with its owners
+ * (AttemptLedger, StreamEndLedger) and is reached only through these closures.
  */
 export interface TaskStopLatchDeps {
   config: () => Pick<Config, "loadConfigOrDefault">;

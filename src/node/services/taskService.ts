@@ -105,6 +105,7 @@ import { log } from "@/node/services/log";
 import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS, AttemptLedger } from "@/node/services/attemptLedger";
 export { ATTEMPT_CLOSURE_SETTLE_WAIT_MS } from "@/node/services/attemptLedger";
 import { TaskStopLatch } from "@/node/services/taskStopLatch";
+import { StreamEndLedger } from "@/node/services/streamEndLedger";
 import { PeerSendParking } from "@/node/services/peerSendParking";
 import {
   TaskWaiters,
@@ -1368,7 +1369,7 @@ const QUEUED_LAUNCH_LEASE_RETRY_MS = 1_000;
 type ChildGoalTurnOutcome = "none" | "handled" | "failed" | "deferred";
 
 /** The ended stream's task origin, captured in the stream-end event's own tick. */
-interface StreamEndTaskOrigin {
+export interface StreamEndTaskOrigin {
   executionId: string | null;
   stopEpoch: number;
   ownedAttempt: OwnedTaskAttempt | undefined;
@@ -1479,7 +1480,7 @@ function markedTerminalFailure(
  * a CAS on it), or `null` when the caller has no proven attempt (a legacy/pre-identity row, a
  * parent- or timer-driven decision), which keeps today's unconditional writes.
  */
-type AttemptFence = string | null;
+export type AttemptFence = string | null;
 
 /**
  * Who a stream event belongs to, read in the event's own tick (resolveStreamAttemptAtEvent):
@@ -1899,30 +1900,7 @@ export class TaskService implements AgentTaskIntegration {
   private readonly peerSendParking: PeerSendParking;
   private readonly taskStopLatch: TaskStopLatch;
   private readonly attemptLedger: AttemptLedger;
-  /**
-   * Child stream ends cut by a host-selected continuation (queued input or context-budget
-   * hand-over) whose successor has not yet streamed or been withdrawn. Keyed by task; settled
-   * from the recorded successor outcome (QueueCutReceipt), never from an idle probe, and cleared
-   * on terminal transitions. In-memory only: after a restart a running task with no stream is
-   * handled by startup recovery.
-   */
-  private readonly deferredTaskStreamEnds = new Map<
-    string,
-    {
-      sourceMessageId: string;
-      sourceTurnGeneration: symbol;
-      continuationEntryId: string;
-      executionId: string | undefined;
-      stopEpoch: number;
-      /**
-       * The cut stream's attempt: a row another writer re-admitted since drops the deferral, and
-       * its recovery is CAS'd on this attempt (#4414).
-       */
-      attemptId: AttemptFence;
-    }
-  >();
-  /** Per task, the stream-end decisions of this process's owned attempts (see StreamEndDecision). */
-  private readonly streamEndDecisionsByTaskId = new Map<string, StreamEndDecision[]>();
+  private readonly streamEndLedger: StreamEndLedger;
   /** Tracks consecutive auto-resumes per workspace. Reset when a user message is sent. */
   private consecutiveAutoResumes = new Map<string, number>();
 
@@ -2287,13 +2265,7 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
     // A terminal decision held for this turn's late readers: only actual readers keep it now.
-    let decisionTurnSettled = false;
-    for (const decision of this.streamEndDecisionsByTaskId.get(workspaceId) ?? []) {
-      if (decision.turn !== turnGeneration) continue;
-      decision.turn = undefined;
-      decisionTurnSettled = true;
-    }
-    if (decisionTurnSettled) this.pruneStreamEndDecisions(workspaceId);
+    this.streamEndLedger.settleTurn(workspaceId, turnGeneration);
     this.attemptLedger.recheckResumeFailureSettlement(workspaceId);
     this.taskStopLatch.releaseCapturedTurn(workspaceId, turnGeneration);
   }
@@ -2312,9 +2284,7 @@ export class TaskService implements AgentTaskIntegration {
         send.inherited = true;
       }
     }
-    for (const decision of this.streamEndDecisionsByTaskId.get(workspaceId) ?? []) {
-      if (decision.turn === previous) decision.turn = next;
-    }
+    this.streamEndLedger.rebindTurn(workspaceId, previous, next);
     this.taskStopLatch.rebindCapturedTurn(workspaceId, previous, next);
   }
 
@@ -2362,210 +2332,6 @@ export class TaskService implements AgentTaskIntegration {
     source: SubagentAttemptSettlementSource
   ): Promise<boolean> {
     return this.attemptLedger.writeSettlementReceipt(taskId, target, source);
-  }
-
-  // ---------------------------------------------------------------------------------------------
-  // Stream-end decisions (see StreamEndDecision)
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * Run handleStreamEnd under the workspace event lock, owning the stream's decision: resolved
-   * `nonreport` on every return that neither published nor failed, `indeterminate` on a throw —
-   * unless the handler deferred the stream (child goal arbitration waiting on its accounting),
-   * which transfers the still-pending decision to deferChildStreamEnd.
-   */
-  private runStreamEndHandler(
-    event: StreamEndEvent,
-    queueCutSnapshot: QueueCutAttributionSnapshot,
-    taskOrigin: StreamEndTaskOrigin,
-    decision: StreamEndDecision | undefined
-  ): void {
-    void this.workspaceEventLocks
-      .withLock(event.workspaceId, async () => {
-        let deferred = false;
-        try {
-          deferred =
-            (await this.handleStreamEnd(event, queueCutSnapshot, taskOrigin)) === "deferred";
-        } catch (error: unknown) {
-          // Unknown outcome: never let held follow-ups run as if the attempt continued.
-          this.resolveStreamEndDecision(event.workspaceId, decision, "indeterminate");
-          throw error;
-        } finally {
-          // Every return path that neither published nor failed left the attempt continuing.
-          if (!deferred) this.resolveStreamEndDecision(event.workspaceId, decision, "nonreport");
-        }
-        if (deferred) this.deferChildStreamEnd(event, queueCutSnapshot, taskOrigin, decision);
-      })
-      .catch((error: unknown) => {
-        log.error("TaskService.handleStreamEnd failed", { error });
-      });
-  }
-
-  /**
-   * A child stream whose goal accounting had not settled when arbitration needed it (see
-   * arbitrateChildGoalAtStreamEnd): accounting completion is authoritative, so nothing is decided
-   * from unsettled state and the task is not finalized. The stream's pending decision (held
-   * follow-ups keep waiting) moves here; outside the event lock this waits — unbounded — for the
-   * retained receipt to settle, or for the attempt to close / be superseded / be stopped (or its
-   * row to stop reading running), then re-runs the original stream end (same event, attempt,
-   * turn and stop fences) under the lock.
-   */
-  private deferChildStreamEnd(
-    event: StreamEndEvent,
-    queueCutSnapshot: QueueCutAttributionSnapshot,
-    taskOrigin: StreamEndTaskOrigin,
-    decision: StreamEndDecision | undefined
-  ): void {
-    const goalService = this.workspaceGoalService;
-    assert(goalService != null, "deferChildStreamEnd requires the goal service");
-    const taskId = event.workspaceId;
-    const attemptId = taskOrigin.ownedAttempt?.attemptId ?? taskOrigin.unownedAttemptId;
-    const cancelled = Promise.withResolvers<void>();
-    const listener = () => {
-      if (
-        attemptId == null ||
-        !this.attemptLedger.attemptAdmissionOpen(taskId, attemptId) ||
-        taskOrigin.stopEpoch !== this.getWorkspaceStopEpoch(taskId) ||
-        taskOrigin.executionId !== this.getAgentTaskExecutionId(taskId) ||
-        // arbitrateChildGoalAtStreamEnd's status gate (its owed-pause gate needs no mirror: the
-        // pause marker is written only with a terminal status): a row that no longer reads
-        // running (a report adopted from disk, an archive) can never take a goal turn, so the
-        // accounting decides nothing and the re-run takes the same branch now as after it (#6994).
-        findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace.taskStatus !==
-          "running"
-      ) {
-        cancelled.resolve();
-      }
-    };
-    this.attemptLedger.addAttemptSettlementListener(taskId, listener);
-    listener();
-    log.info("[task-goal] stream accounting unsettled; deferring the child stream end", {
-      taskId,
-      messageId: event.messageId,
-    });
-    void Promise.race([
-      goalService.streamAccountingReceiptOutcome(taskId, event.messageId),
-      cancelled.promise,
-    ])
-      .finally(() => this.attemptLedger.removeAttemptSettlementListener(taskId, listener))
-      .then(() => {
-        // #7003: this stream deferred while its row read running, and nothing moves a running row
-        // to a completed report under the same attempt but a publication (ours resolved the
-        // decision already) or another backend's. So that attempt reported: the re-run's
-        // `reported` branch must not leave the decision `nonreport`, or a held follow-up would
-        // start a new turn of a reported attempt.
-        this.resolveDecisionOfReportedAttempt(taskId, attemptId, decision);
-        this.runStreamEndHandler(event, queueCutSnapshot, taskOrigin, decision);
-      })
-      .catch((error: unknown) => {
-        log.error("TaskService: deferred child stream end failed", { taskId, error });
-        this.resolveStreamEndDecision(taskId, decision, "indeterminate");
-      });
-  }
-
-  /**
-   * Register the pending decision for the ended stream of `attempt` (owned) or, when this process
-   * owns none, of the persisted `unownedAttemptId`. Synchronous, event tick only.
-   */
-  private registerStreamEndDecision(
-    taskId: string,
-    messageId: string,
-    attempt: OwnedTaskAttempt | undefined,
-    unownedAttemptId: string | undefined
-  ): StreamEndDecision | undefined {
-    const attemptId = attempt != null ? attempt.attemptId : unownedAttemptId;
-    if (attemptId == null) return undefined;
-    const decision: StreamEndDecision = {
-      attempt,
-      attemptId,
-      messageId,
-      outcome: "pending",
-      turn: this.workspaceService.getActiveTurnGeneration(taskId),
-    };
-    const decisions = this.streamEndDecisionsByTaskId.get(taskId) ?? [];
-    decisions.push(decision);
-    this.streamEndDecisionsByTaskId.set(taskId, decisions);
-    return decision;
-  }
-
-  /** The decision a send bound to `attemptId` must honor: the pending one, else the latest. */
-  private findStreamEndDecision(taskId: string, attemptId: string): StreamEndDecision | undefined {
-    let latest: StreamEndDecision | undefined;
-    for (const decision of this.streamEndDecisionsByTaskId.get(taskId) ?? []) {
-      if (decision.attemptId !== attemptId) continue;
-      if (decision.outcome === "pending") return decision;
-      latest = decision;
-    }
-    return latest;
-  }
-
-  /**
-   * The handler's own pending decision for exactly `attempt` — or, for an unowned stream
-   * (`attempt` undefined), the unowned decision for `unownedAttemptId` — none once resolved or
-   * replaced.
-   */
-  private findPendingStreamEndDecision(
-    taskId: string,
-    attempt: OwnedTaskAttempt | undefined,
-    unownedAttemptId?: string
-  ): StreamEndDecision | undefined {
-    const attemptId = attempt != null ? attempt.attemptId : unownedAttemptId;
-    if (attemptId == null) return undefined;
-    const decision = this.findStreamEndDecision(taskId, attemptId);
-    return decision?.outcome === "pending" && decision.attempt === attempt ? decision : undefined;
-  }
-
-  /**
-   * Resolve exactly once (later calls, including the handler's finally, are no-ops), drop the
-   * decision when nothing is left to read it, and wake the workspace's idle drain so a held entry
-   * either dispatches (nonreport) or is refused and handed back (published/indeterminate) now
-   * rather than at the next unrelated drain. Returns whether this call resolved it.
-   */
-  private resolveStreamEndDecision(
-    taskId: string,
-    decision: StreamEndDecision | undefined,
-    outcome: Exclude<StreamEndDecision["outcome"], "pending">
-  ): boolean {
-    if (decision?.outcome !== "pending") return false;
-    decision.outcome = outcome;
-    // A stream that published (or may have published) the report ends the attempt WITH a report:
-    // it can never produce a no-report receipt, even after this decision is pruned below.
-    if (outcome !== "nonreport" && decision.attempt != null) {
-      decision.attempt.receiptEligible = false;
-    }
-    log.debug("[task-attempt] stream-end decision resolved", {
-      taskId,
-      attemptId: decision.attemptId,
-      messageId: decision.messageId,
-      outcome,
-    });
-    this.pruneStreamEndDecisions(taskId);
-    // A stop record of this attempt waits for the decision (recheckWorkspaceStopRelease).
-    this.taskStopLatch.recheckWorkspaceStopRelease(taskId);
-    this.workspaceService.drainQueuedMessagesIfIdle(taskId);
-    return true;
-  }
-
-  /**
-   * Drop resolved decisions no pending/enqueued obligation of their attempt can still read — a
-   * terminal one only once its reporting turn settled too (a later reader can still arrive while
-   * that turn is live; see StreamEndDecision).
-   */
-  private pruneStreamEndDecisions(taskId: string): void {
-    const decisions = this.streamEndDecisionsByTaskId.get(taskId);
-    if (decisions == null) return;
-    const readers = new Set<string>();
-    for (const send of this.attemptLedger.sendsOf(taskId)) {
-      if (send.state === "pending" || send.state === "enqueued") readers.add(send.attemptId);
-    }
-    const kept = decisions.filter(
-      (decision) =>
-        decision.outcome === "pending" ||
-        readers.has(decision.attemptId) ||
-        (decision.outcome !== "nonreport" && decision.turn != null)
-    );
-    if (kept.length === 0) this.streamEndDecisionsByTaskId.delete(taskId);
-    else if (kept.length !== decisions.length) this.streamEndDecisionsByTaskId.set(taskId, kept);
   }
 
   /** Tests call this; AttemptLedger owns the listeners. */
@@ -3039,7 +2805,7 @@ export class TaskService implements AgentTaskIntegration {
    * Delayed source events are separately fenced by their execution identity and Stop epoch.
    */
   private clearTaskRecovery(taskId: string): void {
-    this.deferredTaskStreamEnds.delete(taskId);
+    this.streamEndLedger.forgetDeferral(taskId);
     this.workspaceService.clearQueueCutReceipts(taskId);
     const removal = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
       taskId,
@@ -3178,10 +2944,11 @@ export class TaskService implements AgentTaskIntegration {
       editWorkspaceEntry: (workspaceId, updater, options) =>
         this.editWorkspaceEntry(workspaceId, updater, options),
       settleChildGoalPause: (workspaceId) => this.settleChildGoalPause(workspaceId),
-      findStreamEndDecision: (taskId, attemptId) => this.findStreamEndDecision(taskId, attemptId),
-      pruneStreamEndDecisions: (taskId) => this.pruneStreamEndDecisions(taskId),
+      findStreamEndDecision: (taskId, attemptId) =>
+        this.streamEndLedger.findStreamEndDecision(taskId, attemptId),
+      pruneStreamEndDecisions: (taskId) => this.streamEndLedger.pruneStreamEndDecisions(taskId),
       discardStreamEndDecisions: (taskId) => {
-        this.streamEndDecisionsByTaskId.delete(taskId);
+        this.streamEndLedger.discardStreamEndDecisions(taskId);
       },
       // Through TaskService: tests spy on inspectAttemptOutcome on the instance.
       inspectAttemptOutcome: (taskId, options) => this.inspectAttemptOutcome(taskId, options),
@@ -3214,7 +2981,8 @@ export class TaskService implements AgentTaskIntegration {
       admittedSends: (taskId) => this.attemptLedger.sendsOf(taskId),
       ownsReceiptEligibleAttempt: (taskId, attempt) =>
         this.attemptLedger.ownsReceiptEligibleAttempt(taskId, attempt),
-      findStreamEndDecision: (taskId, attemptId) => this.findStreamEndDecision(taskId, attemptId),
+      findStreamEndDecision: (taskId, attemptId) =>
+        this.streamEndLedger.findStreamEndDecision(taskId, attemptId),
       decideSettlementReceipt: (taskId, attempt, settlementSource) =>
         this.decideSettlementReceipt(taskId, attempt, settlementSource),
       writeSettlementReceipt: (taskId, target, source) =>
@@ -3225,6 +2993,27 @@ export class TaskService implements AgentTaskIntegration {
         this.settleOwnedTaskAttempt(taskId, attempt, source),
       recheckResumeFailureSettlement: (taskId) =>
         this.attemptLedger.recheckResumeFailureSettlement(taskId),
+    });
+    this.streamEndLedger = new StreamEndLedger({
+      config: () => this.config,
+      workspaceService: () => this.workspaceService,
+      workspaceGoalService: () => this.workspaceGoalService,
+      workspaceEventLocks: () => this.workspaceEventLocks,
+      handleStreamEnd: (event, queueCutSnapshot, taskOrigin) =>
+        this.handleStreamEnd(event, queueCutSnapshot, taskOrigin),
+      recoverTaskFromIncompleteStreamEnd: (workspaceId, status, streamAttemptId) =>
+        this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId),
+      getWorkspaceStopEpoch: (workspaceId) => this.getWorkspaceStopEpoch(workspaceId),
+      getAgentTaskExecutionId: (taskId) => this.getAgentTaskExecutionId(taskId),
+      recheckWorkspaceStopRelease: (workspaceId) =>
+        this.taskStopLatch.recheckWorkspaceStopRelease(workspaceId),
+      attemptAdmissionOpen: (taskId, attemptId) =>
+        this.attemptLedger.attemptAdmissionOpen(taskId, attemptId),
+      addAttemptSettlementListener: (taskId, listener) =>
+        this.attemptLedger.addAttemptSettlementListener(taskId, listener),
+      removeAttemptSettlementListener: (taskId, listener) =>
+        this.attemptLedger.removeAttemptSettlementListener(taskId, listener),
+      sendsOf: (taskId) => this.attemptLedger.sendsOf(taskId),
     });
     this.peerSendParking = new PeerSendParking({
       flush: (targetId) => this.flushParkedPeerSends(targetId),
@@ -3282,13 +3071,13 @@ export class TaskService implements AgentTaskIntegration {
       };
       // The decision this handler owes for the attempt's ended stream, registered in the event's
       // own tick so the session's turn-completion drain (a later microtask) finds it.
-      const decision = this.registerStreamEndDecision(
+      const decision = this.streamEndLedger.registerStreamEndDecision(
         payload.workspaceId,
         payload.messageId,
         taskOrigin.ownedAttempt,
         taskOrigin.unownedAttemptId
       );
-      this.runStreamEndHandler(payload, queueCutSnapshot, taskOrigin, decision);
+      this.streamEndLedger.runStreamEndHandler(payload, queueCutSnapshot, taskOrigin, decision);
     });
 
     this.aiService.on("stream-abort", (payload: unknown) => {
@@ -3331,10 +3120,10 @@ export class TaskService implements AgentTaskIntegration {
 
     // Successor outcomes (withdrawn, admitted, streaming) are published as queue changes.
     this.workspaceService.onQueuedMessageChanged((workspaceId) => {
-      if (!this.deferredTaskStreamEnds.has(workspaceId)) return;
+      if (!this.streamEndLedger.hasDeferral(workspaceId)) return;
       this.workspaceEventLocks
         .withLock(workspaceId, async () => {
-          await this.reconcileDeferredTaskStreamEnd(workspaceId);
+          await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId);
         })
         .catch((error: unknown) => {
           log.error("TaskService.reconcileDeferredTaskStreamEnd failed", { error });
@@ -16316,9 +16105,9 @@ export class TaskService implements AgentTaskIntegration {
     // BEFORE the recovery/continuation sends below, so a user follow-up queued during the stream
     // still dispatches ahead of them, exactly as it did before the hold existed.
     if (reportArgs == null && !(isPlanLike && proposePlanResult) && status !== "interrupted") {
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         workspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           workspaceId,
           taskOrigin.ownedAttempt,
           taskOrigin.unownedAttemptId
@@ -16437,9 +16226,9 @@ export class TaskService implements AgentTaskIntegration {
         status,
         streamAttemptId,
         () =>
-          this.resolveStreamEndDecision(
+          this.streamEndLedger.resolveStreamEndDecision(
             workspaceId,
-            this.findPendingStreamEndDecision(
+            this.streamEndLedger.findPendingStreamEndDecision(
               workspaceId,
               taskOrigin.ownedAttempt,
               taskOrigin.unownedAttemptId
@@ -16485,9 +16274,9 @@ export class TaskService implements AgentTaskIntegration {
       // exec. Decide (and wake the held queue) before the handoff, as for any other non-report
       // end above: the kickoff's admission reads a still-pending decision for its attempt as
       // stale and would be refused, leaving the task running with no exec turn.
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         workspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           workspaceId,
           taskOrigin.ownedAttempt,
           taskOrigin.unownedAttemptId
@@ -16507,8 +16296,8 @@ export class TaskService implements AgentTaskIntegration {
       discardCutReceipt();
       return;
     }
-    if (await this.reconcileDeferredTaskStreamEnd(workspaceId)) return;
-    const pendingCut = this.deferredTaskStreamEnds.get(workspaceId);
+    if (await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId)) return;
+    const pendingCut = this.streamEndLedger.deferralOf(workspaceId);
     // A different turn can be admitted ahead of the designated continuation. Its incomplete
     // end does not withdraw that continuation or transfer the old cut's recovery obligation.
     if (pendingCut != null && pendingCut.sourceTurnGeneration !== queueCutSnapshot.turnGeneration) {
@@ -16536,7 +16325,7 @@ export class TaskService implements AgentTaskIntegration {
               expectedAttemptId: streamAttemptId,
             });
           }
-          this.deferredTaskStreamEnds.set(workspaceId, {
+          this.streamEndLedger.recordDeferral(workspaceId, {
             sourceMessageId: event.messageId,
             sourceTurnGeneration: receipt.sourceTurnGeneration,
             continuationEntryId,
@@ -16545,7 +16334,7 @@ export class TaskService implements AgentTaskIntegration {
             attemptId: streamAttemptId,
           });
           // The successor may have been withdrawn between the cut and this classification.
-          await this.reconcileDeferredTaskStreamEnd(workspaceId);
+          await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId);
           return;
         }
       }
@@ -17135,58 +16924,6 @@ export class TaskService implements AgentTaskIntegration {
     });
   }
 
-  /**
-   * Settle a deferred cut from the recorded successor outcome. Runs under the task's
-   * workspaceEventLock (from handleStreamEnd, the queue-change listener, stream-abort and error
-   * handlers). Only `canceled`/`prestream-failed` (recover once) and `streaming` (transfer) settle
-   * it; `pending`/`admitted` keep waiting. A task whose execution or stop epoch moved on, or that
-   * left `running`, drops the deferral without recovery.
-   */
-  private async reconcileDeferredTaskStreamEnd(workspaceId: string): Promise<boolean> {
-    const deferral = this.deferredTaskStreamEnds.get(workspaceId);
-    if (deferral == null) return false;
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-    if (
-      entry?.workspace.parentWorkspaceId == null ||
-      entry.workspace.taskStatus !== "running" ||
-      rowSupersedes(entry.workspace, deferral.attemptId) ||
-      entry.workspace.taskExecutionId !== deferral.executionId ||
-      this.getWorkspaceStopEpoch(workspaceId) !== deferral.stopEpoch
-    ) {
-      this.deferredTaskStreamEnds.delete(workspaceId);
-      this.workspaceService.disposeQueueCut(workspaceId, deferral.continuationEntryId);
-      return false;
-    }
-    const receipt = this.workspaceService.getQueueCutReceipt(
-      workspaceId,
-      deferral.continuationEntryId
-    );
-    if (receipt == null || receipt.successor === "streaming") {
-      this.deferredTaskStreamEnds.delete(workspaceId);
-      return false;
-    }
-    if (receipt.successor !== "canceled" && receipt.successor !== "prestream-failed") {
-      return false;
-    }
-    this.deferredTaskStreamEnds.delete(workspaceId);
-    if (!this.workspaceService.disposeQueueCut(workspaceId, deferral.continuationEntryId)) {
-      return true;
-    }
-    log.debug("Deferred task stream end recovering: continuation withdrawn", {
-      workspaceId,
-      sourceMessageId: deferral.sourceMessageId,
-      continuationEntryId: deferral.continuationEntryId,
-      successor: receipt.successor,
-    });
-    // Recovery acts for the cut stream's attempt only (its writes and prompt are CAS'd on it).
-    await this.recoverTaskFromIncompleteStreamEnd(
-      workspaceId,
-      entry.workspace.taskStatus,
-      deferral.attemptId
-    );
-    return true;
-  }
-
   private async handleStreamAbort(
     event: StreamAbortEvent,
     /** Captured by the stream-abort listener in the event's own tick, before the lock wait. */
@@ -17198,7 +16935,7 @@ export class TaskService implements AgentTaskIntegration {
       this.bumpWorkspaceStopEpoch(event.workspaceId);
       this.clearTaskRecovery(event.workspaceId);
     } else {
-      await this.reconcileDeferredTaskStreamEnd(event.workspaceId);
+      await this.streamEndLedger.reconcileDeferredTaskStreamEnd(event.workspaceId);
     }
     // Settles a continuation handle (execution mirror) first. A reawakened child is ALSO
     // `running` in its stable status (markInterruptedTaskRunning), and the desktop ledger treats
@@ -17429,7 +17166,7 @@ export class TaskService implements AgentTaskIntegration {
 
     // A startup error can wait behind the source handler until its continuation failure is
     // recorded. That disposition already requested recovery; do not spend the budget twice.
-    if (await this.reconcileDeferredTaskStreamEnd(workspaceId)) return;
+    if (await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId)) return;
 
     if (status !== "awaiting_report") {
       // Retryable errors during `running` are handled by the agent session's
@@ -17918,9 +17655,9 @@ export class TaskService implements AgentTaskIntegration {
       // continues. Decide (and wake the held queue) before the completion prompt, as for any
       // other non-report end: the prompt's admission reads a still-pending decision for its
       // attempt as stale and would be refused, leaving the task awaiting a report forever.
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         args.workspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           args.workspaceId,
           args.reportedAttempt,
           args.reportedAttempt == null ? (args.streamAttemptId ?? undefined) : undefined
@@ -18705,9 +18442,9 @@ export class TaskService implements AgentTaskIntegration {
       // stream's pending decision before the completion prompt, as handleStreamEnd does for any
       // other non-report end: the prompt's admission reads a still-pending decision for its
       // attempt as stale and is refused, leaving the workflow step awaiting a report forever.
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           childWorkspaceId,
           reportedAttempt,
           reportedAttempt == null ? (reportedAttemptId ?? undefined) : undefined
@@ -18974,9 +18711,9 @@ export class TaskService implements AgentTaskIntegration {
       );
       // Never a continuation of the reporting attempt; its held entries are refused (they also
       // read stale at their own gates, since the row names another attempt).
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           childWorkspaceId,
           reportedAttempt,
           unownedReportedAttemptId
@@ -19032,9 +18769,9 @@ export class TaskService implements AgentTaskIntegration {
       this.resolveWaiters(childWorkspaceId, reportArgs);
       this.scheduleMaybeStartQueuedTasks();
       // Reported row, no release, nobody to report to: not a continuation of the attempt.
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           childWorkspaceId,
           reportedAttempt,
           unownedReportedAttemptId
@@ -19113,9 +18850,9 @@ export class TaskService implements AgentTaskIntegration {
     // so held follow-ups are refused rather than run under an attempt of unknown standing.
     if (persistedInEveryAncestor) {
       this.attemptLedger.releaseReportedTaskAttempt(childWorkspaceId, reportedAttempt);
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           childWorkspaceId,
           reportedAttempt,
           unownedReportedAttemptId
@@ -19123,9 +18860,9 @@ export class TaskService implements AgentTaskIntegration {
         "published"
       );
     } else {
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           childWorkspaceId,
           reportedAttempt,
           unownedReportedAttemptId
@@ -19185,7 +18922,7 @@ export class TaskService implements AgentTaskIntegration {
     // After the committed `reported` (ours above, or the other backend's): a report bound to the
     // row's attempt settles that attempt's stream-end decision (#7003); the notification then
     // re-runs its deferral (the row no longer reads running).
-    if (this.resolveDecisionOfReportedAttempt(taskId, artifact.taskAttemptId)) {
+    if (this.streamEndLedger.resolveDecisionOfReportedAttempt(taskId, artifact.taskAttemptId)) {
       this.notifyAttemptSettlementListeners(taskId);
     }
     if (adopt) {
@@ -19210,27 +18947,6 @@ export class TaskService implements AgentTaskIntegration {
       model: artifact.model,
       thinkingLevel: artifact.thinkingLevel,
     };
-  }
-  /**
-   * The row reads a completed report for `attemptId` (#7003): that attempt reported, possibly on
-   * another backend. Its pending stream-end decision (`decision`, else the attempt's) resolves
-   * `indeterminate`, as publication's not-durable branch does: held follow-ups are refused and
-   * handed back, never run as a new turn of a reported attempt. Returns whether the row reads so.
-   */
-  private resolveDecisionOfReportedAttempt(
-    taskId: string,
-    attemptId: string | undefined,
-    decision?: StreamEndDecision
-  ): boolean {
-    if (attemptId == null) return false;
-    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
-    if (workspace?.taskAttemptId !== attemptId || !hasCompletedAgentReport(workspace)) return false;
-    this.resolveStreamEndDecision(
-      taskId,
-      decision ?? this.findStreamEndDecision(taskId, attemptId),
-      "indeterminate"
-    );
-    return true;
   }
 
   /**
