@@ -97,8 +97,7 @@ export async function runSelfCheck(
       BUGBASH_MODEL: "anthropic:claude-haiku-5-5",
       PATH: process.env.PATH,
       HOME: process.env.HOME,
-      // CI's opt-in to a local image on a stale key, and its warning annotation.
-      BUGBASH_SANDBOX_BUILD_STALE: process.env.BUGBASH_SANDBOX_BUILD_STALE,
+      // CI's warning annotation for a local image.
       GITHUB_ACTIONS: process.env.GITHUB_ACTIONS,
     };
     const stamp = `${Date.now()}-${process.pid}`;
