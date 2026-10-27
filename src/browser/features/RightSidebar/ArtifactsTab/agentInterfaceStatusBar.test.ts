@@ -118,7 +118,6 @@ describe("deriveStatusActivity", () => {
     ]) {
       expect(deriveStatusActivity(turn, flags).kind).toBe("interrupting");
     }
-    expect(isTurnActive(deriveStatusActivity(turn, stopping))).toBe(true);
     // A turn still starting shows its startup, and an ended stream leaves no stop to wait for.
     expect(deriveStatusActivity(turn, { ...stopping, isStreamStarting: true }).kind).toBe(
       "starting"
@@ -216,6 +215,7 @@ describe("deriveStatusActivity", () => {
       [{ ...streaming, awaitingUserQuestion: true }, [], true],
       [streaming, [user("go"), tool("bash", "executing")], true],
       [idle, [user("go"), assistant("done")], false],
+      [{ ...streaming, isInterrupting: true }, [user("go"), tool("bash", "executing")], true],
       [{ ...idle, activeBashMonitorCount: 1 }, [user("go"), assistant("watching")], false],
     ];
     for (const [flags, messages, active] of phases) {
