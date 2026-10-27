@@ -21,13 +21,13 @@ export const ChatDockInsetProvider = ChatDockInsetContext.Provider;
 /** Gutter plus column for docked surfaces that carry no padding of their own. */
 export function ChatDockSurface(props: { children: ReactNode }) {
   const columnWidthClass = useChatDockColumnWidthClass();
-  if (useContext(ChatDockInsetContext)) {
-    return <div data-component="ChatDockSurface">{props.children}</div>;
-  }
-
+  // Inset or not, the same two elements: only the classes change. A different tree would remount
+  // the content whenever the "Waiting on you" card forms or breaks up, losing a half-typed answer's
+  // textarea (and its focus) mid-word.
+  const inset = useContext(ChatDockInsetContext);
   return (
-    <div className={CHAT_DOCK_GUTTER_CLASS}>
-      <div className={columnWidthClass} data-component="ChatDockSurface">
+    <div className={inset ? undefined : CHAT_DOCK_GUTTER_CLASS}>
+      <div className={inset ? undefined : columnWidthClass} data-component="ChatDockSurface">
         {props.children}
       </div>
     </div>

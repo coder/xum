@@ -1,4 +1,5 @@
 import {
+  Component,
   createContext,
   useContext,
   useId,
@@ -62,6 +63,8 @@ interface WaitingOnYouValue {
   waits: (id: WaitingOnYouId) => boolean;
   /** Where a slot's content goes while consolidated; null keeps it in the slot. */
   hostFor: (id: WaitingOnYouId) => HTMLElement | null;
+  /** What had focus before the commit now running (FocusBeforeCommit). */
+  focusBeforeCommit: { readonly current: Element | null };
 }
 
 const WaitingOnYouContext = createContext<WaitingOnYouValue | null>(null);
@@ -181,6 +184,31 @@ export function waitingHost(
 }
 
 /**
+ * Records what has focus before each commit that can move items. getSnapshotBeforeUpdate runs
+ * before React changes the DOM, and a commit that removes the card removes the item in its body
+ * with it, focus included, before any effect could read the focus. Its props are the inputs of
+ * every slot's host, so it updates in each commit that moves one.
+ */
+class FocusBeforeCommit extends Component<{
+  arranged: WaitingArrangement;
+  hosts: object;
+  focusRef: { current: Element | null };
+}> {
+  getSnapshotBeforeUpdate(): null {
+    this.props.focusRef.current = document.activeElement;
+    return null;
+  }
+
+  componentDidUpdate(): void {
+    // React requires it next to getSnapshotBeforeUpdate; the snapshot above did the work.
+  }
+
+  render() {
+    return null;
+  }
+}
+
+/**
  * Owns the items waiting on the user; wraps the composer's decoration stack, whose items include
  * the slots and the card.
  */
@@ -192,6 +220,7 @@ export function WaitingOnYouProvider(props: { children: ReactNode }) {
   const [bodyHost, setBodyHost] = useState<HTMLElement | null>(null);
   const [afterHost, setAfterHost] = useState<HTMLElement | null>(null);
   const [sheetHost, setSheetHost] = useState<HTMLElement | null>(null);
+  const focusBeforeCommit = useRef<Element | null>(null);
   const phone = useSheetViewport();
 
   const arranged = arrangeWaiting(entries, chosen, phone);
@@ -207,7 +236,7 @@ export function WaitingOnYouProvider(props: { children: ReactNode }) {
 
   return (
     <WaitingOnYouRegisterContext.Provider value={setEntries}>
-      <WaitingOnYouContext.Provider value={{ consolidated, waits, hostFor }}>
+      <WaitingOnYouContext.Provider value={{ consolidated, waits, hostFor, focusBeforeCommit }}>
         <WaitingOnYouCardContext.Provider
           value={{
             entries: arranged.listed,
@@ -223,6 +252,7 @@ export function WaitingOnYouProvider(props: { children: ReactNode }) {
             setSheetHost,
           }}
         >
+          <FocusBeforeCommit arranged={arranged} hosts={hosts} focusRef={focusBeforeCommit} />
           {props.children}
         </WaitingOnYouCardContext.Provider>
       </WaitingOnYouContext.Provider>
@@ -253,10 +283,23 @@ export function WaitingOnYouSlot(props: {
   });
   const slotRef = useRef<HTMLDivElement>(null);
   const host = waiting?.hostFor(props.id) ?? null;
+  const focusBeforeCommit = waiting?.focusBeforeCommit;
   useLayoutEffect(() => {
     const target = host ?? slotRef.current;
-    if (target !== null && container.parentNode !== target) target.appendChild(container);
-  }, [host, container]);
+    if (target === null || container.parentNode === target) return;
+    target.appendChild(container);
+    // Taking a node out of the page drops the focus inside it: this move does, and so does a card
+    // that went away with the content in its body. Put it back, so the user typing an answer when
+    // another item arrives (or leaves) types on.
+    const focused = focusBeforeCommit?.current;
+    if (
+      focused instanceof HTMLElement &&
+      focused !== document.activeElement &&
+      container.contains(focused)
+    ) {
+      focused.focus({ preventScroll: true });
+    }
+  }, [host, container, focusBeforeCommit]);
   useLayoutEffect(() => () => container.remove(), [container]);
 
   if (waiting === null) {

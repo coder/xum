@@ -11,6 +11,7 @@
 
 import { expect, screen, userEvent, waitFor, within } from "storybook/test";
 
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
@@ -45,7 +46,35 @@ const QUESTIONS = [
 
 const QUEUED_TEXT = "Also restack the follow-up once the base lands, then ping the owner.";
 
-function setupWaitingStory(workspaceId: string) {
+function heldInputsChanged(workspaceId: string, held: boolean): WorkspaceChatMessage {
+  return {
+    type: "held-inputs-changed",
+    workspaceId,
+    heldInputs: held
+      ? [
+          {
+            id: "held-1",
+            reason: "interrupted",
+            displayText: "Rebase onto main before the next push.",
+            attachmentCount: 0,
+            reviewCount: 0,
+          },
+          {
+            id: "held-2",
+            reason: "interrupted",
+            displayText: "Then rerun the flaky shard.",
+            attachmentCount: 0,
+            reviewCount: 0,
+          },
+        ]
+      : [],
+  };
+}
+
+function setupWaitingStory(
+  workspaceId: string,
+  onEmit?: (emit: (message: WorkspaceChatMessage) => void) => void
+) {
   return setupSimpleChatStory({
     workspaceId,
     workspaceName: "provider-stack",
@@ -62,32 +91,14 @@ function setupWaitingStory(workspaceId: string) {
       }),
     ],
     onChat: (id, emit) => {
-      emit({
-        type: "held-inputs-changed",
-        workspaceId: id,
-        heldInputs: [
-          {
-            id: "held-1",
-            reason: "interrupted",
-            displayText: "Rebase onto main before the next push.",
-            attachmentCount: 0,
-            reviewCount: 0,
-          },
-          {
-            id: "held-2",
-            reason: "interrupted",
-            displayText: "Then rerun the flaky shard.",
-            attachmentCount: 0,
-            reviewCount: 0,
-          },
-        ],
-      });
+      emit(heldInputsChanged(id, true));
       emit({
         type: "queued-message-changed",
         workspaceId: id,
         queuedMessages: [QUEUED_TEXT],
         displayText: QUEUED_TEXT,
       });
+      onEmit?.(emit);
     },
   });
 }
@@ -152,6 +163,59 @@ export const Desktop: AppStory = {
     await expect(within(dock).getByText(QUESTIONS[1].question)).not.toBeVisible();
     await userEvent.click(within(card).getByRole("button", { name: "Show what is waiting" }));
     await expect(within(card).getByText(QUESTIONS[1].question)).toBeVisible();
+  },
+};
+
+// The count-change story's chat, to drop and restore the unsent messages mid-play.
+let emitCountChangeChat: ((message: WorkspaceChatMessage) => void) | null = null;
+const COUNT_CHANGE_WORKSPACE = "ws-waiting-count";
+
+/**
+ * Another item leaving or arriving while the user types an answer: the card breaks up or forms
+ * around the question, which keeps its textarea and its focus, so typing goes on (a remount would
+ * drop focus to the page and lose the next keystrokes).
+ */
+export const CountChangeKeepsTyping: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() =>
+        setupWaitingStory(COUNT_CHANGE_WORKSPACE, (emit) => {
+          emitCountChangeChat = emit;
+        })
+      }
+    />
+  ),
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const dock = await findDock(canvasElement);
+    const card = await within(dock).findByRole(
+      "region",
+      { name: "Waiting on you" },
+      { timeout: 10_000 }
+    );
+    await userEvent.click(
+      await within(card).findByRole("button", { name: /^Other/ }, { timeout: 10_000 })
+    );
+    const answer = await within(card).findByPlaceholderText("Type your answer");
+    await userEvent.click(answer);
+    await userEvent.keyboard("use");
+    const emit = emitCountChangeChat;
+    if (emit === null) throw new Error("The story's chat never subscribed");
+
+    emit(heldInputsChanged(COUNT_CHANGE_WORKSPACE, false));
+    await waitFor(() =>
+      expect(within(dock).queryByRole("region", { name: "Waiting on you" })).toBeNull()
+    );
+    await expect(within(dock).getByPlaceholderText("Type your answer")).toBe(answer);
+    await expect(answer).toHaveFocus();
+    await userEvent.keyboard(" redis");
+
+    emit(heldInputsChanged(COUNT_CHANGE_WORKSPACE, true));
+    const formed = await within(dock).findByRole("region", { name: "Waiting on you" });
+    await expect(formed.contains(answer)).toBe(true);
+    await expect(answer).toHaveFocus();
+    await userEvent.keyboard(" now");
+    await expect(answer).toHaveValue("use redis now");
   },
 };
 

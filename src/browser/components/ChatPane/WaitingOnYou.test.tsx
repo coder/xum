@@ -221,13 +221,27 @@ describe("Waiting on you", () => {
     expect(document.activeElement).toBe(unsentTab);
   });
 
-  it("puts an item back inline, state intact, when only one is left", () => {
+  it("puts an item back inline, same node and focus, when only one is left", () => {
     const view = render(<Stack question unsent />);
-    fireEvent.click(view.getByRole("button", { name: "question 0" }));
+    const question = view.getByRole("button", { name: "question 0" });
+    fireEvent.click(question);
+    question.focus();
     view.rerender(<Stack question />);
     expect(view.queryByRole("region", { name: "Waiting on you" })).toBeNull();
-    const question = view.getByRole("button", { name: "question 1" });
+    // The same element, not a remount below the item's own state (a textarea would lose focus).
+    expect(view.getByRole("button", { name: "question 1" }) === question).toBe(true);
     expect(isShown(question)).toBe(true);
+    expect(document.activeElement === question).toBe(true);
+  });
+
+  it("moves an item into the card, same node and focus, when a second one arrives", () => {
+    const view = render(<Stack question />);
+    const question = view.getByRole("button", { name: "question 0" });
+    question.focus();
+    view.rerender(<Stack question unsent />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    expect(within(card).getByRole("button", { name: "question 0" }) === question).toBe(true);
+    expect(document.activeElement === question).toBe(true);
   });
 
   it("forms the card when self-reporting content opens, and breaks it up when it closes", () => {
