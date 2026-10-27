@@ -186,6 +186,14 @@ function seedWorkspace(workspaceId: string, patch: Partial<WorkspaceState>) {
   });
 }
 
+/** Changes a seeded workspace's state and notifies its subscribers, as a stream event does. */
+function updateSeededWorkspace(workspaceId: string, patch: Partial<WorkspaceState>) {
+  const state = seededStates.get(workspaceId);
+  if (state == null) throw new Error(`${workspaceId} was not seeded`);
+  seededStates.set(workspaceId, { ...state, ...patch });
+  act(() => readRealWorkspaceStore().bumpState(workspaceId));
+}
+
 /** A turn mid-way: the user's prompt, the agent's reply so far, and a bash call still running. */
 const MID_TURN: DisplayedMessage[] = [
   {
@@ -614,15 +622,27 @@ describe("Agent interface status view", () => {
       messages: MID_TURN,
       canInterrupt: true,
       queuedMessage: { id: "q1", content: "Then roll to 50%" },
+      heldInputs: [
+        {
+          id: "h1",
+          reason: "reported",
+          displayText: "An older send that failed",
+          attachmentCount: 0,
+          reviewCount: 0,
+        },
+      ],
     });
     const view = render(<MainPane workspaceId="ws-bar-busy" />, { wrapper: Wrapper });
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
     const bar = view.getByTestId("agent-interface-status-bar");
     expect(within(bar).getByRole("status").textContent).toContain("Slow check");
-    // The send made during the turn is the user's last message, still waiting in the queue.
+    // The send made during the turn is the user's last message, still waiting in the queue; the
+    // held input is counted, not shown in its place.
     const receipt = within(bar).getByTestId("agent-interface-status-receipt");
     expect(receipt.textContent).toContain("Then roll to 50%");
     expect(receipt.textContent).toContain("Queued");
+    expect(receipt.textContent).toContain("+1 held");
+    expect(receipt.textContent).not.toContain("An older send that failed");
     expect(receipt.textContent).not.toMatch(/\d:\d\d/);
     // Start Here would rewrite the context under the running turn.
     expect(within(bar).getByRole("button", { name: "Start here" }).hasAttribute("disabled")).toBe(
@@ -641,7 +661,7 @@ describe("Agent interface status view", () => {
     expect(view.queryByTestId("agent-interface-transcript-peek")).toBeNull();
   });
 
-  test("Start here from the status bar opens the Start Here confirmation once the turn ends", async () => {
+  test("Start here from the status bar opens the confirmation once the turn ends, and a turn that starts under it turns OK off", async () => {
     seedWorkspace("ws-bar-idle", { messages: MID_TURN.slice(0, 2) });
     const view = render(<MainPane workspaceId="ws-bar-idle" />, { wrapper: Wrapper });
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
@@ -655,6 +675,29 @@ describe("Agent interface status view", () => {
     fireEvent.click(startHere);
     const dialog = await within(document.body).findByRole("dialog");
     expect(within(dialog).getByText("Start Here")).toBeTruthy();
+    const ok = within(dialog).getByRole("button", { name: "OK" });
+    expect(ok.hasAttribute("disabled")).toBe(false);
+
+    // A queued send starts the next turn while the dialog is open: the boundary must not land
+    // under it.
+    updateSeededWorkspace("ws-bar-idle", { messages: MID_TURN, canInterrupt: true });
+    expect(ok.hasAttribute("disabled")).toBe(true);
+  });
+
+  test("the transcript peek's shortcut opens and closes it, and a held chord does not flip it", async () => {
+    seedWorkspace("ws-bar-chord", { messages: MID_TURN.slice(0, 2) });
+    const view = render(<MainPane workspaceId="ws-bar-chord" />, { wrapper: Wrapper });
+    await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+    const peekShown = () => view.queryByTestId("agent-interface-transcript-peek") != null;
+    const { key, code } = KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK;
+    const chord = { key, code, ctrlKey: true, altKey: true, shiftKey: true };
+
+    fireEvent.keyDown(window, chord);
+    expect(peekShown()).toBe(true);
+    fireEvent.keyDown(window, { ...chord, repeat: true });
+    expect(peekShown()).toBe(true);
+    fireEvent.keyDown(window, chord);
+    expect(peekShown()).toBe(false);
   });
   test("before the first message the bar shows no receipt and Start here stays off", async () => {
     seedWorkspace("ws-bar-empty", {});
