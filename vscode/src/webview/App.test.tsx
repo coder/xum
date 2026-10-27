@@ -2800,11 +2800,9 @@ describe("vscode webview background processes strip (#5092)", () => {
     await emitBackgroundBashes(bridge, workspaceA.id, [runningProcess]);
 
     await click(view.getByRole("button", { name: /1 background bash/ }));
-    const script = view.container.querySelector('[title="sleep 600"]');
-    if (!script) throw new Error("the expanded strip does not list the process");
-    // Each row ends with its Terminate button.
-    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
-    await click(rowButtons[rowButtons.length - 1]);
+    // The row leads with its command.
+    expect(view.getByText("sleep 600")).toBeTruthy();
+    await click(view.getByRole("button", { name: "Terminate process" }));
     await settle();
 
     expect(
@@ -3137,10 +3135,8 @@ describe("vscode webview background processes strip (#5092)", () => {
     await settle();
     await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
     await click(view.getByRole("button", { name: /1 background bash/ }));
-    const script = view.container.querySelector('[title="sleep 600"]');
-    if (!script) throw new Error("the expanded strip does not list the process");
-    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
-    await click(rowButtons[rowButtons.length - 1]);
+    expect(view.getByText("sleep 600")).toBeTruthy();
+    await click(view.getByRole("button", { name: "Terminate process" }));
     await settle();
     expect(bridge.orpcCalls("workspace.backgroundBashes.terminate")).toHaveLength(1);
 
@@ -3190,11 +3186,9 @@ describe("vscode webview background processes strip (#5092)", () => {
     await settle();
     await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
     await click(view.getByRole("button", { name: /1 background bash/ }));
-    const script = view.container.querySelector('[title="sleep 600"]');
-    if (!script) throw new Error("the expanded strip does not list the process");
-    const rowButtons = script.parentElement?.parentElement?.querySelectorAll("button") ?? [];
+    expect(view.getByText("sleep 600")).toBeTruthy();
     // Terminate on server A.
-    await click(rowButtons[rowButtons.length - 1]);
+    await click(view.getByRole("button", { name: "Terminate process" }));
     await settle();
     const answerTerminate = () =>
       bridge.answer("workspace.backgroundBashes.terminate", {
@@ -3231,7 +3225,7 @@ describe("vscode webview background processes strip (#5092)", () => {
     // Server B runs a process too: its strip starts collapsed, never with server A's expanded list.
     await emitBackgroundBashes(bridge, workspace.id, [runningProcess]);
     expect(view.getByRole("button", { name: /1 background bash/ })).toBeTruthy();
-    expect(view.container.querySelectorAll('[title="sleep 600"]')).toHaveLength(0);
+    expect(view.queryByText("sleep 600")).toBeNull();
   });
 
   test("does not show another workspace's processes after a switch", async () => {
