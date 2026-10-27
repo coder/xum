@@ -43,7 +43,7 @@ export interface TaskStopLatchDeps {
   notifyAttemptSettlementListeners: (taskId: string) => void;
   addAttemptSettlementListener: (taskId: string, listener: () => void) => void;
   removeAttemptSettlementListener: (taskId: string, listener: () => void) => void;
-  /** This process's owned attempt for the task (TaskService.ownedAttemptByTaskId). */
+  /** This process's owned attempt for the task (AttemptLedger.ownedAttemptByTaskId). */
   ownedAttempt: (taskId: string) => OwnedTaskAttempt | undefined;
   currentTaskAttemptId: (taskId: string) => string | undefined;
   /** The task's live set of send obligations; its sends are captured by reference. */

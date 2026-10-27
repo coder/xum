@@ -49,8 +49,10 @@ const rootId = "root-hold";
 const model = "openai:gpt-5.2";
 
 interface Internals {
-  ownedAttemptByTaskId: Map<string, { attemptId?: string }>;
-  attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string }>;
+  attemptLedger: {
+    ownedAttemptByTaskId: Map<string, { attemptId?: string }>;
+    attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string }>;
+  };
   admittedSendsByTaskId: Map<string, Set<{ state: string; attemptId: string }>>;
   streamEndDecisionsByTaskId: Map<string, Array<{ attemptId: string; outcome: string }>>;
   taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
@@ -213,7 +215,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
             messageId,
             row: row?.taskAttemptId,
             status: row?.taskStatus,
-            owner: ledger.svc?.ownedAttemptByTaskId.get(childId)?.attemptId,
+            owner: ledger.svc?.attemptLedger.ownedAttemptByTaskId.get(childId)?.attemptId,
           });
           aiEmitter.emit("stream-start", {
             type: "stream-start",
@@ -349,7 +351,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
         if (!ordering.startsWith("drain before")) {
           // The decision landed before the session finished the turn: the drain reads it late.
-          await until(() => !svc.ownedAttemptByTaskId.has(childId), "release");
+          await until(() => !svc.attemptLedger.ownedAttemptByTaskId.has(childId), "release");
           stack.completeStream(0, event);
         }
         await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
@@ -361,7 +363,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           taskStatus: "reported",
           taskAttemptId: attemptA,
         });
-        expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+        expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
         // The follow-up's obligation was discharged exactly once and the decision pruned.
         expect(outstanding(svc, childId)).toHaveLength(0);
         expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
@@ -416,7 +418,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       // still live, so the queued follow-up has not drained.
       const event = stack.endStream(0, { report: "done" }, false);
       await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
-      await until(() => !svc.ownedAttemptByTaskId.has(childId), "attempt released");
+      await until(() => !svc.attemptLedger.ownedAttemptByTaskId.has(childId), "attempt released");
       expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
       expect(stack.heldInputs()).toHaveLength(0);
 
@@ -477,7 +479,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       // The report turn ends on a terminal agent_report; the session has not finished the turn.
       const event = stack.endStream(0, { report: "done" }, false);
       await until(() => entryOf(config, childId)?.taskStatus === "reported", "report");
-      await until(() => !svc.ownedAttemptByTaskId.has(childId), "release");
+      await until(() => !svc.attemptLedger.ownedAttemptByTaskId.has(childId), "release");
       // The decision resolved with no reader queued yet. The user's follow-up arrives now, while
       // the reporting turn is still live: it targets the completed attempt, so it is refused in
       // its preflight (fail closed, text stays with the caller) instead of queueing behind the
@@ -496,7 +498,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         taskStatus: "reported",
         taskAttemptId: attemptA,
       });
-      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
       // Nor was it accepted as a user turn of that attempt.
       const history = await fixture.historyService.getLastMessages(childId, 10);
       expect(history.success && history.data.map((message) => message.role)).toEqual(["user"]);
@@ -886,7 +888,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(completions).toHaveLength(1);
       // Not released (no durable report), not continued: fail closed, the follow-up held — as
       // indeterminate, never as if a report had been confirmed.
-      expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
       expect(stack.heldTexts()).toEqual(["follow-up text"]);
       expect(stack.heldInputs().map((held) => held.reason)).toEqual(["indeterminate"]);
       // Refused as indeterminate — not as a completed report and not as a plain stale attempt.
@@ -1208,7 +1210,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       // Handler resumes: publishes and releases A; no reader is left, so the decision is dropped.
       gate.resolve();
       await until(() => !svc.streamEndDecisionsByTaskId.has(childId), "decision pruned");
-      await until(() => !svc.ownedAttemptByTaskId.has(childId), "attempt released");
+      await until(() => !svc.attemptLedger.ownedAttemptByTaskId.has(childId), "attempt released");
       await yieldMacrotasks(5);
       expect(entryOf(config, childId)).toMatchObject({
         taskStatus: "reported",
@@ -1258,7 +1260,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(completions).toHaveLength(1);
       gate.resolve();
       await until(() => !svc.streamEndDecisionsByTaskId.has(childId), "decision pruned");
-      await until(() => !svc.ownedAttemptByTaskId.has(childId), "attempt released");
+      await until(() => !svc.attemptLedger.ownedAttemptByTaskId.has(childId), "attempt released");
       await yieldMacrotasks(5);
       expect(entryOf(config, childId)).toMatchObject({
         taskStatus: "reported",
@@ -1305,7 +1307,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       try {
         if (status === "reported") {
           // The released shape of an ordinary reported child (no owner, no settlement entry).
-          expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+          expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
         }
         const result = await workspaceService.sendMessage(childId, "manual follow-up", sendOptions);
         expect(result.success).toBe(false);
@@ -1313,7 +1315,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         await yieldMacrotasks(3);
         expect(completions).toHaveLength(0);
         expect(outstanding(svc, childId)).toHaveLength(0);
-        expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).not.toBe(winner);
+        expect(svc.attemptLedger.ownedAttemptByTaskId.get(childId)?.attemptId).not.toBe(winner);
         expect(entryOf(config, childId)?.taskAttemptId).toBe(winner);
       } finally {
         await stack.cleanup();
@@ -1332,7 +1334,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await until(() => completions.length === 1, "the re-drive's stream");
       const redriven = entryOf(config, childId)?.taskAttemptId;
       expect(redriven).not.toBe("att_00000000000000a4");
-      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
       // The user's follow-up arrives mid-stream: queued, bound to the re-driven attempt.
       expect(await workspaceService.sendMessage(childId, "follow-up text", sendOptions)).toEqual(
         Ok(undefined)
@@ -1349,7 +1351,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(outstanding(svc, childId)).toHaveLength(0);
       expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
       // The hold came from the decision alone: no ownership (settlement/receipt authority) granted.
-      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
       expect(entryOf(config, childId)?.taskAttemptId).toBe(redriven);
     } finally {
       await stack.cleanup();
@@ -1368,7 +1370,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await until(() => completions.length === 1, "the re-drive's stream");
       const redriven = entryOf(config, childId)?.taskAttemptId;
       expect(redriven).not.toBe("att_00000000000000a4");
-      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
       // Backend B admits the row under its own attempt while this backend's stream still runs.
       await otherBackend.editConfig((cfg) => {
         for (const project of cfg.projects.values()) {
@@ -1407,7 +1409,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(
         await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), childId)
       ).toBeNull();
-      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
     } finally {
       await stack.cleanup();
     }
@@ -1423,7 +1425,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await taskService.recoverInterruptedTasks();
       await until(() => completions.length === 1, "the re-drive's stream");
       const redriven = entryOf(config, childId)?.taskAttemptId;
-      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
       // Backend B re-admits the row right before the publication's status write, i.e. after
       // every earlier check of the stream-end handler read the re-driven attempt.
       let rotated = false;
@@ -1471,7 +1473,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         (svc.streamEndDecisionsByTaskId.get(childId) ?? []).map((decision) => decision.attemptId)
       ).not.toContain(foreign);
       expect(redriven).not.toBe(foreign);
-      expect(svc.ownedAttemptByTaskId.has(childId)).toBe(false);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
     } finally {
       await stack.cleanup();
     }
@@ -1499,7 +1501,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       try {
         expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
         const attemptA = entryOf(config, childId)!.taskAttemptId!;
-        expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
+        expect(svc.attemptLedger.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
         expect(await workspaceService.sendMessage(childId, "work", sendOptions)).toEqual(
           Ok(undefined)
         );
@@ -1559,7 +1561,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     try {
       expect(await taskService.markInterruptedTaskRunning(childId)).toBe(true);
       const attemptA = entryOf(config, childId)!.taskAttemptId!;
-      expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
       // Backend B re-admits the idle row under its own attempt; this process still owns A.
       await otherBackend.editConfig((cfg) => {
         for (const project of cfg.projects.values()) {
@@ -1577,7 +1579,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         Ok(undefined)
       );
       expect(completions).toHaveLength(1);
-      expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.get(childId)?.attemptId).toBe(attemptA);
       stack.endStream(0, { report: "done by B" }, true);
       await until(() => entryOf(config, childId)?.taskStatus === "reported", "B's report");
       expect(entryOf(config, childId)?.taskAttemptId).toBe(foreign);
@@ -1669,7 +1671,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(
         await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), childId)
       ).toBeNull();
-      expect(svc.ownedAttemptByTaskId.get(childId)?.attemptId).not.toBe(foreign);
+      expect(svc.attemptLedger.ownedAttemptByTaskId.get(childId)?.attemptId).not.toBe(foreign);
     } finally {
       await stack.cleanup();
     }
