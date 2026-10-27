@@ -75,10 +75,11 @@ describe("TaskService.reawakenInterruptedTask early exits", () => {
     // The barrier was the only reason: once the stop settles, the same row reawakens.
     release();
     const outcome = await taskService.reawakenInterruptedTask(taskId);
-    expect(outcome).toMatchObject({ kind: "reawakened", statusChanged: true });
     const row = findWorkspaceInConfig(config, taskId);
     expect(row?.taskStatus).toBe("running");
-    expect(outcome.kind === "reawakened" && outcome.attemptId).toBe(row?.taskAttemptId);
+    expect(row?.taskAttemptId).not.toBe(previousAttemptId);
+    expect(outcome).toMatchObject({ kind: "reawakened", statusChanged: true });
+    expect(outcome.kind === "reawakened" ? outcome.attemptId : undefined).toBe(row?.taskAttemptId);
   });
 
   test("a child being removed refuses the send instead of reading as not applicable", async () => {
