@@ -110,6 +110,7 @@ import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
 } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
+import { PeerSendParking } from "@/node/services/peerSendParking";
 import { isProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
@@ -1125,7 +1126,7 @@ function isInactiveAgentTaskStatus(
 /** After this many idle waits, a deferred message falls back to plain live delivery. */
 const MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS = 5;
 
-type TreeMessageSpec =
+export type TreeMessageSpec =
   | {
       relation: "descendant";
       senderWorkspaceId: string;
@@ -1169,7 +1170,7 @@ type TreeMessagePipelineError = SendAgentTreeMessageError | SendParentAgentMessa
  * What a peer message's first admission established, kept while it waits for the target's
  * delegated turn (#4997). Its retry re-runs the whole peer path against these baselines.
  */
-interface PeerDelegatedTurnWait {
+export interface PeerDelegatedTurnWait {
   /** Recipient consent at first admission: an off/on cycle must not revive the message. */
   unrelatedConsent: string | undefined;
   /** Both endpoints' tag generations at first admission: a clear/re-tag cycle is a new link. */
@@ -1186,10 +1187,6 @@ interface PeerDelegatedTurnWait {
    */
   stopEpochs: Map<string, number>;
 }
-
-type ParkedPeerSend = Extract<TreeMessageSpec, { relation: "peer" }> & {
-  awaitedDelegatedTurn: PeerDelegatedTurnWait;
-};
 
 /** The caller-relative relationship tag on task_list scope:"tree" rows. */
 export type TreeAgentRelationship = "self" | "ancestor" | "sibling" | "descendant";
@@ -2033,20 +2030,7 @@ export class TaskService implements AgentTaskIntegration {
    * flushParkedPeerSends), so parking needs this separate count to tell a user Stop apart.
    */
   private readonly workspaceUserStopEpochs = new Map<string, number>();
-  /**
-   * #4997: peer messages to a root whose running delegated workspace turn the sender does not
-   * own, in arrival order per target. The delegated turn stays owner-only, so they wait here and
-   * are delivered as ordinary new turns once its live registration is released (see
-   * flushParkedPeerSends). They wait outside the target's MessageQueue on purpose: a queued
-   * uncorrelated entry would supersede the delegated turn or strip the owner's continuations
-   * (MessageQueue.hasAllWorkspaceTurnContinuations), and a "hold" dispatch decision blocks every
-   * entry behind it, including the continuations that turn is waiting for. In-memory and
-   * process-local, like the queue.
-   */
-  private readonly parkedPeerSendsByTarget = new Map<string, ParkedPeerSend[]>();
-  private readonly parkedPeerSendFlushLocks = new MutexMap<string>();
-  /** #5271: new delegated-turn registrations per target (see onWorkspaceTurnRegistered). */
-  private readonly workspaceTurnRegistrationEpochs = new Map<string, number>();
+  private readonly peerSendParking: PeerSendParking;
   /**
    * Child stream ends cut by a host-selected continuation (queued input or context-budget
    * hand-over) whose successor has not yet streamed or been withdrawn. Keyed by task; settled
@@ -2452,106 +2436,17 @@ export class TaskService implements AgentTaskIntegration {
 
   /** WorkspaceTurnTaskHost: a delegated turn's registration release (#4997). */
   onWorkspaceTurnRegistrationReleased(workspaceId: string): void {
-    this.scheduleParkedPeerSendFlush(workspaceId);
+    this.peerSendParking.scheduleParkedPeerSendFlush(workspaceId);
   }
 
-  /**
-   * WorkspaceTurnTaskHost: a new delegated turn registered (#5271). A message waits once, for the
-   * turn it was parked behind. Counting registrations, like the stop epochs, lets the retry's
-   * admission gate see a replacement turn even after it settled, at any point before admission.
-   */
+  /** WorkspaceTurnTaskHost: a new delegated turn registered (#5271). */
   onWorkspaceTurnRegistered(workspaceId: string): void {
-    this.workspaceTurnRegistrationEpochs.set(
-      workspaceId,
-      (this.workspaceTurnRegistrationEpochs.get(workspaceId) ?? 0) + 1
-    );
+    this.peerSendParking.onWorkspaceTurnRegistered(workspaceId);
   }
 
-  /**
-   * Park a peer message behind the target's delegated turn, then schedule a flush. Park first,
-   * check second: the registration may have been released between the caller's synchronous
-   * check and this call, and that release found nothing to flush. Only first attempts park: a
-   * message that already waited is delivered once or dropped.
-   */
-  private parkPeerSend(send: ParkedPeerSend): void {
-    const parked = this.parkedPeerSendsByTarget.get(send.targetId) ?? [];
-    parked.push(send);
-    this.parkedPeerSendsByTarget.set(send.targetId, parked);
-    this.scheduleParkedPeerSendFlush(send.targetId);
-  }
-
-  /**
-   * Triggered by the delegated turn's registration release and by the stop-latch release (an
-   * explicit interrupt releases the registration while its latch is still held), never by a
-   * timer. Flushes of one target run one at a time, in park order.
-   */
-  private scheduleParkedPeerSendFlush(targetId: string): void {
-    if (!this.parkedPeerSendsByTarget.has(targetId)) return;
-    this.parkedPeerSendFlushLocks
-      .withLock(targetId, () => this.flushParkedPeerSends(targetId))
-      .catch((error: unknown) => {
-        log.error("Failed to deliver peer messages that waited for a delegated turn", {
-          targetId,
-          error: getErrorMessage(error),
-        });
-      });
-  }
-
-  private async flushParkedPeerSends(targetId: string): Promise<void> {
-    // While a registration or stop latch is held, stop: its release schedules the next flush.
-    // The list stays registered while it drains, so a fresh send parks behind it instead of
-    // overtaking the rest (see sendTreeMessage), and a user Stop that drops it ends the drain.
-    const parked = this.parkedPeerSendsByTarget.get(targetId);
-    let drainStarted = false;
-    while (parked != null && this.parkedPeerSendsByTarget.get(targetId) === parked) {
-      // Messages that waited for an earlier turn are dropped by their retry's admission gate.
-      if (
-        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null ||
-        this.isWorkspaceStopInProgress(targetId)
-      ) {
-        return;
-      }
-      if (!drainStarted) {
-        drainStarted = true;
-        // The owner's explicit interrupt of the delegated turn bumps the target's stop epoch (so
-        // sends admitted during its wind-down cannot outlive that stop), and these messages
-        // waited for the turn on purpose. Take a new target baseline once, here, not per retry:
-        // a user Stop after this point still refuses a retry that is already in flight, and one
-        // before it dropped the list (markParentWorkspaceInterrupted).
-        const epoch = this.getWorkspaceStopEpoch(targetId);
-        for (const waiting of parked) waiting.awaitedDelegatedTurn.stopEpochs.set(targetId, epoch);
-      }
-      // The retry removes itself from the list under the target's admission lock (see
-      // sendTreeMessage), so it stays counted against the queue cap until then.
-      const spec = parked[0];
-      if (spec == null) {
-        this.parkedPeerSendsByTarget.delete(targetId);
-        return;
-      }
-      // The retry re-runs the full peer path under the target's event lock. A withdrawn message
-      // (consent revoked, sender stopped, runtime change, target archived) is dropped and
-      // touches no turn state, and so is one that meets another delegated turn.
-      // Each message is handled on its own, so one failure cannot discard the rest.
-      try {
-        const result = await this.sendTreeMessage(spec);
-        if (!result.success) {
-          log.debug("Dropped a peer message that waited for a delegated turn", {
-            senderWorkspaceId: spec.senderWorkspaceId,
-            targetId,
-            code: result.error.code,
-          });
-        }
-      } catch (error) {
-        log.error("Failed to deliver a peer message that waited for a delegated turn", {
-          senderWorkspaceId: spec.senderWorkspaceId,
-          targetId,
-          error: getErrorMessage(error),
-        });
-      } finally {
-        // A retry that never reached the lock (it threw first) must not be retried forever.
-        if (parked[0] === spec) parked.shift();
-      }
-    }
+  /** Tests spy on this; PeerSendParking's scheduled flush calls back through it. */
+  private flushParkedPeerSends(targetId: string): Promise<void> {
+    return this.peerSendParking.flushParkedPeerSends(targetId);
   }
 
   /**
@@ -2573,7 +2468,7 @@ export class TaskService implements AgentTaskIntegration {
           }
           this.notifyAttemptSettlementListeners(id);
           // An interrupted delegated turn releases its registration while this latch is held.
-          this.scheduleParkedPeerSendFlush(id);
+          this.peerSendParking.scheduleParkedPeerSendFlush(id);
         } else {
           this.workspaceStopsInProgress.set(id, count - 1);
         }
@@ -4822,11 +4717,18 @@ export class TaskService implements AgentTaskIntegration {
     terminalAttentionStore?: TerminalAttentionStore,
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
+    this.peerSendParking = new PeerSendParking({
+      flush: (targetId) => this.flushParkedPeerSends(targetId),
+      getWorkspaceTurnManager: () => this.getWorkspaceTurnManager(),
+      isWorkspaceStopInProgress: (workspaceId) => this.isWorkspaceStopInProgress(workspaceId),
+      getWorkspaceStopEpoch: (workspaceId) => this.getWorkspaceStopEpoch(workspaceId),
+      sendTreeMessage: (spec) => this.sendTreeMessage(spec),
+    });
     this.agentPeerMessageBroker = new AgentPeerMessageBroker({
       // Parked sends count against the recipient's queue cap like queued ones.
       countQueuedAgentPeerMessages: (targetId) =>
         workspaceService.countQueuedAgentPeerMessages(targetId) +
-        (this.parkedPeerSendsByTarget.get(targetId)?.length ?? 0),
+        this.peerSendParking.countParked(targetId),
     });
     this.terminalAttentionStore = terminalAttentionStore ?? new TerminalAttentionStore(config);
     this.workflowRunAttention = new WorkflowRunAttention({
@@ -10398,8 +10300,7 @@ export class TaskService implements AgentTaskIntegration {
         // A retry leaves the parked list only here, under the target's admission lock: removed
         // earlier, it was counted nowhere while it waited for the lock, and a fresh send
         // admitted meanwhile could push the queue past its cap (see flushParkedPeerSends).
-        const parked = this.parkedPeerSendsByTarget.get(targetId);
-        if (parked?.[0] === spec) parked.shift();
+        this.peerSendParking.removeRetry(targetId, spec);
       }
       const cfg = this.config.loadConfigOrDefault();
       const targetEntry = findWorkspaceEntry(cfg, targetId);
@@ -10545,7 +10446,7 @@ export class TaskService implements AgentTaskIntegration {
         // settled again before this check (#5271).
         if (
           awaitedDelegatedTurn != null &&
-          (this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0) !==
+          this.peerSendParking.registrationEpoch(targetId) !==
             awaitedDelegatedTurn.registrationEpoch
         ) {
           return awaitDelegatedTurn;
@@ -10884,7 +10785,7 @@ export class TaskService implements AgentTaskIntegration {
         const delegatedRootRefusal = getDelegatedRootRefusal();
         if (delegatedRootRefusal != null) {
           if (delegatedRootRefusal === awaitDelegatedTurn) {
-            refusedAtRegistrationEpoch ??= this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0;
+            refusedAtRegistrationEpoch ??= this.peerSendParking.registrationEpoch(targetId);
           }
           admissionRefusal = delegatedRootRefusal;
           return true;
@@ -11009,13 +10910,13 @@ export class TaskService implements AgentTaskIntegration {
           return;
         }
         parkedThisAttempt = true;
-        this.parkPeerSend({
+        this.peerSendParking.parkPeerSend({
           ...spec,
           awaitedDelegatedTurn: {
             unrelatedConsent,
             tagGenerations,
             registrationEpoch:
-              refusedAtRegistrationEpoch ?? this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0,
+              refusedAtRegistrationEpoch ?? this.peerSendParking.registrationEpoch(targetId),
             stopEpochs: new Map(capturedStopEpochs),
           },
         });
@@ -11037,7 +10938,7 @@ export class TaskService implements AgentTaskIntegration {
       if (
         firstAttempt &&
         !targetIsAgentTask &&
-        this.parkedPeerSendsByTarget.has(targetId) &&
+        this.peerSendParking.hasParked(targetId) &&
         this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) == null
       ) {
         return waitForDelegatedTurn();
@@ -17141,7 +17042,7 @@ export class TaskService implements AgentTaskIntegration {
     // A user Stop refuses agent messages that were not admitted yet, including those waiting
     // for a delegated turn: their retry takes a new baseline for the target's stop epoch (see
     // sendTreeMessage), so drop them here rather than let them run after a resume.
-    if (this.parkedPeerSendsByTarget.delete(workspaceId)) {
+    if (this.peerSendParking.dropParked(workspaceId)) {
       log.debug("Dropped peer messages waiting for a delegated turn after a user stop", {
         workspaceId,
       });

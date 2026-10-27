@@ -310,8 +310,10 @@ describe("peer-message limits", () => {
     await fresh;
     // Let the drain deliver every waiting message (it unregisters the list once empty).
     const parkedByTarget = (
-      taskService as unknown as { parkedPeerSendsByTarget: Map<string, unknown> }
-    ).parkedPeerSendsByTarget;
+      taskService as unknown as {
+        peerSendParking: { parkedPeerSendsByTarget: Map<string, unknown> };
+      }
+    ).peerSendParking.parkedPeerSendsByTarget;
     for (let spin = 0; spin < 200 && parkedByTarget.has("target"); spin++) {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
