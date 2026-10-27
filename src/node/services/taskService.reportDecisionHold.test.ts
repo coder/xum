@@ -53,7 +53,7 @@ interface Internals {
   attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string }>;
   admittedSendsByTaskId: Map<string, Set<{ state: string; attemptId: string }>>;
   streamEndDecisionsByTaskId: Map<string, Array<{ attemptId: string; outcome: string }>>;
-  workspaceStopRecords: Map<string, unknown>;
+  taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
   workspaceEventLocks: { withLock<T>(key: string, operation: () => Promise<T>): Promise<T> };
 }
@@ -1250,7 +1250,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(onCanceled).toHaveBeenCalledTimes(1);
       expect(onCanceled).toHaveBeenCalledWith("Queued message cleared before dispatch.");
       expect(outstanding(svc, childId)).toHaveLength(0);
-      expect(svc.workspaceStopRecords.has(childId)).toBe(false);
+      expect(svc.taskStopLatch.workspaceStopRecords.has(childId)).toBe(false);
       expect(taskService.isWorkspaceStopInProgress(childId)).toBe(false);
       expect(svc.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
         "pending",
