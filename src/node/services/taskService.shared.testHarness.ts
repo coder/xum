@@ -422,8 +422,10 @@ export async function flushTerminalAttentionDrains(
   assert(passes > 0, "flushTerminalAttentionDrains needs at least one pass");
   for (let i = 0; i < passes; i++) {
     const drains = (
-      taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> }
-    ).pendingTerminalAttentionDrains;
+      taskService as unknown as {
+        terminalAttention: { pendingTerminalAttentionDrains: Set<Promise<void>> };
+      }
+    ).terminalAttention.pendingTerminalAttentionDrains;
     if (drains.size === 0) break;
     await Promise.all([...drains]);
   }
