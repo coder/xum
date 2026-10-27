@@ -491,6 +491,11 @@ import {
   type WorkspaceLiveActivity,
 } from "@/node/services/taskWorkspaceSeam";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
+import {
+  isManualUserSupersessionMessage,
+  isResetBoundaryMessage,
+  isTerminalWorkflowTaskAwaitRecord,
+} from "@/node/services/taskMessagePredicates";
 import { MINTED_SEND_ID_PREFIX } from "@/common/orpc/schemas/stream";
 import {
   computeSendDigest,
@@ -850,31 +855,6 @@ function isTerminalWorkflowToolResultMessage(message: MuxMessage, runId: string)
   );
 }
 
-function isInternalResumeAutoCompactionMessage(message: MuxMessage): boolean {
-  const muxMetadata = message.metadata?.muxMetadata;
-  if (muxMetadata?.type !== "compaction-request" || muxMetadata.source !== "auto-compaction") {
-    return false;
-  }
-  return muxMetadata.parsed.followUpContent?.dispatchOptions?.source === "internal-resume";
-}
-
-function isSyntheticManualSupersessionMessage(message: MuxMessage): boolean {
-  const muxMetadata = message.metadata?.muxMetadata;
-  return (
-    message.metadata?.synthetic === true &&
-    muxMetadata?.type === "compaction-request" &&
-    muxMetadata.source === "auto-compaction" &&
-    !isInternalResumeAutoCompactionMessage(message)
-  );
-}
-
-function isManualUserSupersessionMessage(message: MuxMessage): boolean {
-  return (
-    message.role === "user" &&
-    (message.metadata?.synthetic !== true || isSyntheticManualSupersessionMessage(message))
-  );
-}
-
 function isWorkflowResultContinuationMessage(message: MuxMessage, runId: string): boolean {
   return (
     message.metadata?.muxMetadata?.type === WORKFLOW_RESULT_METADATA_TYPE &&
@@ -897,34 +877,6 @@ function isCoalescedWorkflowResultMessage(message: MuxMessage, runId: string): b
   return message.parts.some(
     (part) => part.type === "text" && textContainsWorkflowResultPayload(part.text, runId)
   );
-}
-
-function isResetBoundaryMessage(message: MuxMessage): boolean {
-  return message.metadata?.contextBoundaryKind === CONTEXT_BOUNDARY_KINDS.RESET;
-}
-
-function isFailedWorkflowRunSnapshot(value: unknown, runId: string): boolean {
-  if (value == null || typeof value !== "object") {
-    return false;
-  }
-  const record = value as Record<string, unknown>;
-  return record.id === runId && record.status === "failed";
-}
-
-function isTerminalWorkflowTaskAwaitRecord(
-  record: Record<string, unknown>,
-  runId: string
-): boolean {
-  if (record.taskId !== runId) {
-    return false;
-  }
-  if (record.status === "completed" || record.status === "interrupted") {
-    return true;
-  }
-  if (record.status === "error") {
-    return isFailedWorkflowRunSnapshot(record.run, runId);
-  }
-  return false;
 }
 
 function isTerminalWorkflowTaskAwaitResultMessage(message: MuxMessage, runId: string): boolean {
