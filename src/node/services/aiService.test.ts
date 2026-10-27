@@ -2869,6 +2869,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         const reply = createMuxMessage("reply-0", "assistant", "done", {
           model: KNOWN_MODELS.SONNET.id,
           metadataModel: KNOWN_MODELS.SONNET.id,
+          agentId: "exec",
           thinkingLevel: replyLevel,
           systemMessageTokens: 0,
           contextUsage: { inputTokens: 500, outputTokens: 10, totalTokens: 510 },

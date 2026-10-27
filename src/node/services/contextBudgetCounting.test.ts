@@ -849,8 +849,8 @@ describe("turn-start anchor (#7662)", () => {
   const payload = { messages: [...history, reply, prompt] };
   const options = { model, modelContextLimit: 200_000 };
   const system = "Answer briefly and cite the files you read.";
-  const systemTokens = async (forModel: string) =>
-    (await tokenizerModule.getTokenizerForModel(forModel)).countTokens(system);
+  const systemTokens = async (forModel: string, text = system) =>
+    (await tokenizerModule.getTokenizerForModel(forModel)).countTokens(text);
   const request: {
     model: string;
     metadataModel?: string;
@@ -914,12 +914,15 @@ describe("turn-start anchor (#7662)", () => {
     };
     // Rows keep cache writes in provider metadata: 300 uncached + 600 read + 100 written.
     const contextProviderMetadata = { anthropic: { cacheCreationInputTokens: 100 } };
-    const sent = await systemTokens(model);
-    expect((await anchorFor({ contextUsage, contextProviderMetadata }))?.providerTokens).toBe(1050);
+    // Long enough that 30 fewer saved tokens is still a valid (non-negative) count.
+    const longSystem = { system: system.repeat(20) };
+    const sent = await systemTokens(model, longSystem.system);
+    const cached = { contextUsage, contextProviderMetadata, systemMessageTokens: sent };
+    expect((await anchorFor(cached, longSystem))?.providerTokens).toBe(1050);
     const grown = { contextUsage, systemMessageTokens: sent - 30 };
-    expect((await anchorFor(grown))?.providerTokens).toBe(1080);
+    expect((await anchorFor(grown, longSystem))?.providerTokens).toBe(1080);
     const shrunk = { contextUsage, systemMessageTokens: sent + 30 };
-    expect((await anchorFor(shrunk))?.providerTokens).toBe(1050);
+    expect((await anchorFor(shrunk, longSystem))?.providerTokens).toBe(1050);
     // Claude-encoded growth is scaled like every other claude count (#5219). Tests default to
     // the approximate tokenizer, which has no claude encoding.
     const original = process.env.XUM_FORCE_REAL_TOKENIZER;
@@ -930,9 +933,9 @@ describe("turn-start anchor (#7662)", () => {
         model: claude,
         metadataModel: claude,
         contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
-        systemMessageTokens: (await systemTokens(claude)) - 30,
+        systemMessageTokens: (await systemTokens(claude, longSystem.system)) - 30,
       };
-      const claudeRequest = { model: claude, metadataModel: claude };
+      const claudeRequest = { model: claude, metadataModel: claude, ...longSystem };
       expect((await anchorFor(claudeGrown, claudeRequest))?.providerTokens).toBe(
         1000 + Math.ceil(30 * CLAUDE_ENCODING_BUDGET_FACTOR)
       );
@@ -980,13 +983,18 @@ describe("turn-start anchor (#7662)", () => {
       {},
     ],
     ["a reply without its system count", { systemMessageTokens: undefined }, {}],
+    ["a negative system count", { systemMessageTokens: -100_000 }, {}],
+    ["a fractional system count", { systemMessageTokens: 1.5 }, {}],
     ["a reply without its model", { model: undefined }, {}],
     ["another model", {}, { model: "openai:gpt-4.1" }],
     // A providers.jsonc mapping changes the resolved model and keeps the model.
     ["another resolved model", { metadataModel: "openai:gpt-4.1" }, { metadataModel: model }],
     ["a reply without its resolved model", {}, { metadataModel: model }],
     ["another route", {}, { routeProvider: "openrouter" }],
+    ["a reply without its route", { routeProvider: undefined }, {}],
+    ["a direct-route request after a routed reply", {}, { routeProvider: undefined }],
     ["another agent", {}, { agentId: "plan" }],
+    ["a reply without its agent", { agentId: undefined }, {}],
     // Anthropic history keeps signed reasoning with thinking on and strips it at "off".
     ["another thinking level", {}, { thinkingLevel: "off" }],
     ["a reply without its thinking level", { thinkingLevel: undefined }, {}],
@@ -1042,8 +1050,10 @@ describe("turn-start anchor (#7662)", () => {
     expect((await anchorFor({ compacted: false }))?.providerTokens).toBe(1000);
   });
 
-  test("a row without a route or agent still anchors; history without a reply does not", async () => {
-    expect(await anchorFor({ agentId: undefined, routeProvider: undefined })).toBeDefined();
+  test("a direct route on both sides anchors; history without a reply does not", async () => {
+    expect(
+      (await anchorFor({ routeProvider: undefined }, { routeProvider: undefined }))?.providerTokens
+    ).toBe(1000);
     expect(
       await createTurnBudgetAnchor([createMuxMessage("u1", "user", "hi")], request)
     ).toBeUndefined();

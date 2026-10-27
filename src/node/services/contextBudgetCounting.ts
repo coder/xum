@@ -230,11 +230,6 @@ export function createContextBudgetAnchor(
   return providerTokens == null ? undefined : { ...request, providerTokens };
 }
 
-/** Both set and different: a row without the field does not count as a switch. */
-function differs(before: string | undefined, now: string | undefined): boolean {
-  return before != null && now != null && before !== now;
-}
-
 type ReplyMetadata = NonNullable<MuxMessage["metadata"]>;
 
 /** A completed reply: not partial, synthetic, failed, a compaction summary or a boundary. */
@@ -259,31 +254,37 @@ type AnchorRequest = BudgetModel & {
 };
 
 /**
- * The model the provider counted with, the route and agent switches that re-freeze the system
- * prompt, and the thinking level that decides which earlier reasoning replays.
+ * The saved request fields that decide what a reply's provider count holds (#7662). The
+ * resolved model picks the tokenizer and the request transforms (a providers.jsonc mapping
+ * changes it and keeps the model). The thinking level decides which earlier Anthropic reasoning
+ * message preparation replays. The route and the agent each re-freeze the system prompt and
+ * tools. A reply anchors only when every field equals the request's, unset included: a direct
+ * route saves no route, and a row from a build that did not save a field proves no match.
  */
-function sameRequestRoute(metadata: ReplyMetadata & { model: string }, request: AnchorRequest) {
-  // Rows record the canonical model (Coder ids raw), so compare both sides canonicalized. A
-  // providers.jsonc mapping keeps the model and changes the resolved model, which picks the
-  // tokenizer and the request transforms, so a row from another one (or from a build that did
-  // not record it) does not anchor.
+const ANCHOR_IDENTITY_KEYS = [
+  "metadataModel",
+  "thinkingLevel",
+  "routeProvider",
+  "agentId",
+] as const satisfies ReadonlyArray<keyof AnchorRequest & keyof ReplyMetadata>;
+
+function sameRequestIdentity(metadata: ReplyMetadata & { model: string }, request: AnchorRequest) {
+  // Rows record the canonical model (Coder ids raw), so compare both sides canonicalized.
   return (
     normalizeToCanonical(metadata.model) === normalizeToCanonical(request.model) &&
-    metadata.metadataModel === request.metadataModel &&
-    // Message preparation keeps or strips earlier Anthropic reasoning by the effective level,
-    // which the row records, so another level replays history the count does not hold.
-    metadata.thinkingLevel === request.thinkingLevel &&
-    !differs(metadata.routeProvider, request.routeProvider) &&
-    !differs(metadata.agentId, request.agentId)
+    ANCHOR_IDENTITY_KEYS.every((key) => metadata[key] === request[key])
   );
 }
 
 /** The newest reply's metadata when its saved usage can anchor this request, else undefined. */
 function anchoringReply(metadata: ReplyMetadata | undefined, request: AnchorRequest) {
   const { contextUsage, model, systemMessageTokens } = metadata ?? {};
-  if (contextUsage == null || model == null || systemMessageTokens == null) return undefined;
+  // A negative saved system count would read as system growth and inflate the anchor.
+  if (contextUsage == null || model == null || !isTokenCount(systemMessageTokens)) {
+    return undefined;
+  }
   const reply = { ...metadata, contextUsage, model, systemMessageTokens };
-  return isCompletedReply(reply) && sameRequestRoute(reply, request) ? reply : undefined;
+  return isCompletedReply(reply) && sameRequestIdentity(reply, request) ? reply : undefined;
 }
 
 /** The reply's last step: its parts from its last trusted step start. */
