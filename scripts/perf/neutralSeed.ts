@@ -58,6 +58,7 @@ export function writeNeutralSeed(outDir: string) {
       agentHeartbeatsSeeded: true,
       defaultModelFallbacksSeeded: true,
       defaultModelFallbacksSeededFable51: true,
+      defaultModelFallbacksSeededFable55: true,
       taskSettingsDefaultsRaised: true, // #6390
     },
     taskSettings: { preserveSubagentsUntilArchive: true },
