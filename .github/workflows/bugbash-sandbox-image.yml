@@ -121,6 +121,9 @@ jobs:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+          # Runners verify the attestation bundle in GHCR and read no artifact storage record.
+          # Creating one needs artifact-metadata: write, and without it the action warns.
+          create-storage-record: false
       # The stable tag marks the key as published, so it comes only after the attestation: a failed
       # Attest leaves no tag, and a re-run builds and attests again instead of skipping the key.
       - name: Tag inputs-<key>
