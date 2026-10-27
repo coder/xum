@@ -13,7 +13,9 @@ import { ChatDockSheet } from "./ChatDockSheet";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   isAltGraphPressed,
+  isBrowserViewportFocused,
   isCommandPaletteTarget,
+  isDesktopViewportFocused,
   isDialogOpen,
   isTerminalFocused,
   matchesKeybind,
@@ -148,8 +150,14 @@ export function acceptsActivityPanelChord(
   if (!matchesKeybind(event, keybind) || isAltGraphPressed(event) || isDialogOpen()) return false;
   if (!paneHandlesKeyEvent(paneScope, event.target)) return false;
   if (isCommandPaletteTarget(event.target)) return false;
-  // The terminal owns its keystrokes.
-  if (isTerminalFocused(event.target)) return false;
+  // The terminal and the browser and desktop viewports own their keystrokes.
+  if (
+    isTerminalFocused(event.target) ||
+    isBrowserViewportFocused(event.target) ||
+    isDesktopViewportFocused(event.target)
+  ) {
+    return false;
+  }
   return element?.closest("[inert]") == null;
 }
 

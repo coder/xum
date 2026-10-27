@@ -265,6 +265,37 @@ describe("Waiting on you", () => {
     const notice = view.getByRole("button", { name: "notice 1" });
     expect(card.contains(notice)).toBe(false);
     expect(isShown(notice)).toBe(true);
+    // Inline again, it lines up with the transcript column as before, not edge to edge.
+    const surface = notice.closest('[data-component="ChatDockSurface"]');
+    expect(surface?.className ?? "").not.toBe("");
+  });
+
+  it("moves focus to the next tab when the item on show leaves", () => {
+    const view = render(<Stack question unsent notice="waiting" />);
+    view.getByRole("button", { name: "question 0" }).focus();
+    view.rerender(<Stack unsent notice="waiting" />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    expect(document.activeElement === within(card).getByRole("tab", { name: "2 unsent" })).toBe(
+      true
+    );
+  });
+
+  it("leaves focus outside the card alone when the item on show leaves", () => {
+    const view = render(
+      <>
+        <button type="button">composer</button>
+        <Stack question unsent notice="waiting" />
+      </>
+    );
+    const composer = view.getByRole("button", { name: "composer" });
+    composer.focus();
+    view.rerender(
+      <>
+        <button type="button">composer</button>
+        <Stack unsent notice="waiting" />
+      </>
+    );
+    expect(document.activeElement === composer).toBe(true);
   });
 
   describe("on a phone", () => {
@@ -305,6 +336,18 @@ describe("Waiting on you", () => {
         fireEvent.keyDown(sheet, { key: "Escape" });
       });
       expect(view.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull();
+    });
+
+    it("keeps focus in the open sheet when the item on show leaves", () => {
+      const view = render(<Stack question unsent notice="waiting" />);
+      fireEvent.click(view.getByRole("button", { name: /Which reviewers\?/ }));
+      const sheet = view.getByRole("dialog", { name: /Waiting on you/ });
+      within(sheet).getByRole("button", { name: "question 0" }).focus();
+
+      view.rerender(<Stack unsent notice="waiting" />);
+      expect(view.getByRole("dialog", { name: /Waiting on you/ })).toBe(sheet);
+      expect(within(sheet).getByRole("button", { name: "unsent 0" })).not.toBeNull();
+      expect(sheet.contains(document.activeElement)).toBe(true);
     });
   });
 });

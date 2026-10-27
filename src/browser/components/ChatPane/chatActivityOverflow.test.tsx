@@ -274,6 +274,21 @@ describe("panel shortcuts", () => {
     expect(view.queryByRole("group", { name: "Agents" })).toBeNull();
   });
 
+  it("leave the chord to a browser or desktop viewport that has focus", () => {
+    stubLayout(400);
+    const view = render(<Line />);
+    for (const attr of ["data-browser-viewport", "data-desktop-viewport"]) {
+      const viewport = document.createElement("div");
+      viewport.setAttribute(attr, "");
+      viewport.tabIndex = 0;
+      document.body.append(viewport);
+      viewport.focus();
+      chord(viewport, KEYBINDS.OPEN_REVIEWS_PANEL);
+      expect(view.queryByRole("group", { name: "Reviews" })).toBeNull();
+      viewport.remove();
+    }
+  });
+
   it("leave AltGr typing alone, which some layouts report as Ctrl+Alt", () => {
     stubLayout(400);
     const view = render(<Line />);

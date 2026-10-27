@@ -463,14 +463,16 @@ function ChatActivitySheetTab(props: {
       aria-selected={props.open}
       aria-controls={props.open ? props.panelId : undefined}
       onClick={props.open ? undefined : props.onOpen}
-      style={
-        props.activityId === undefined
-          ? undefined
-          : { order: CHAT_ACTIVITY_ORDER[props.activityId] }
-      }
-      // No min-w-0: a tab never shrinks below its label and count, which would overlap the next
-      // tab's. When the tabs do not fit (four on a phone), the tab strip scrolls instead. 44px on
-      // touch, as the sheet's Close button (also in landscape, past globals.css's phone width).
+      // A tab never shrinks below its label and count, which would overlap the next tab's: when
+      // the tabs do not fit (four on a phone), the tab strip scrolls instead. Inline, because the
+      // touch rule in globals.css gives every button a 44px min-width, which beats a utility class
+      // and would let the tab shrink to it.
+      style={{
+        minWidth: "max-content",
+        order: props.activityId === undefined ? undefined : CHAT_ACTIVITY_ORDER[props.activityId],
+      }}
+      // 44px on touch, as the sheet's Close button (also in landscape, past globals.css's phone
+      // width).
       className={cn(
         "inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-sm whitespace-nowrap transition-colors pointer-coarse:h-11",
         props.open ? "bg-hover text-foreground" : "text-secondary hover:text-foreground"

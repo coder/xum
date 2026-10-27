@@ -314,10 +314,10 @@ export function WaitingOnYouSlot(props: {
         ref={slotRef}
         className={waiting.consolidated && waiting.waits(props.id) ? "hidden" : "contents"}
       >
+        {/* Inset only where the card or sheet hosts it: content left inline beside the card (it
+            stopped waiting) keeps its gutter and column. */}
         {createPortal(
-          <ChatDockInsetProvider value={waiting.consolidated}>
-            {props.children}
-          </ChatDockInsetProvider>,
+          <ChatDockInsetProvider value={host !== null}>{props.children}</ChatDockInsetProvider>,
           container
         )}
       </div>
@@ -340,6 +340,26 @@ function WaitingCountBadge(props: { count: number; label?: boolean; className?: 
       {props.label === true && " waiting on you"}
     </span>
   );
+}
+
+/**
+ * When the item on show leaves while others still wait (a question answered from the card or the
+ * sheet), focus inside it falls to the page: behind the sheet's inert page on phones. Move it to
+ * `target` (what now shows the next item) instead. Only when focus did fall: a click elsewhere
+ * keeps its own.
+ */
+function useFocusWhenShownItemLeaves(
+  card: WaitingOnYouCardState,
+  target: () => HTMLElement | null | undefined
+): void {
+  const shownRef = useRef(card.selected);
+  useLayoutEffect(() => {
+    const shown = shownRef.current;
+    shownRef.current = card.selected;
+    if (shown === null || card.entries.some(([id]) => id === shown)) return;
+    if (document.activeElement !== null && document.activeElement !== document.body) return;
+    target()?.focus({ preventScroll: true });
+  });
 }
 
 /** Left/Right move between the tabs (the tablist keyboard pattern). */
@@ -401,6 +421,10 @@ function WaitingTab(props: {
 function WaitingOnYouTabs(props: { card: WaitingOnYouCardState; panelId: string }) {
   const card = props.card;
   const count = card.entries.length;
+  const tablistRef = useRef<HTMLDivElement>(null);
+  useFocusWhenShownItemLeaves(card, () =>
+    tablistRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+  );
   return (
     <ChatDockSurface>
       <div className="py-1.5">
@@ -417,6 +441,7 @@ function WaitingOnYouTabs(props: { card: WaitingOnYouCardState; panelId: string 
           >
             <WaitingCountBadge count={count} label className="h-7 px-2 text-xs" />
             <div
+              ref={tablistRef}
               role="tablist"
               aria-label="Waiting on you"
               onKeyDown={moveTabFocus}
@@ -480,6 +505,7 @@ function WaitingOnYouSummary(props: { card: WaitingOnYouCardState }) {
   ].join(" · ");
   const others = card.entries.filter(([id]) => id !== card.selected);
   const sheetHostRef = useRef<HTMLDivElement | null>(null);
+  useFocusWhenShownItemLeaves(card, () => (card.sheetOpen ? sheetHostRef.current : null));
   return (
     <>
       <ChatDockSurface>

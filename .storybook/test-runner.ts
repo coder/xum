@@ -435,41 +435,51 @@ async function assertMenuClearsSafeArea(page: StoryPage) {
 const LANDSCAPE_SHEET_STORY = "app-composeractivityline--worst-case-phone";
 
 /**
- * A phone in landscape is wider than globals.css's touch-size rule (up to 768px) but short, so the
- * live line opens its panels in the activity sheet there too. The sheet's Close button and tabs
- * must still be 44px touch targets. Plays cannot emulate the pointer.
+ * The live line's activity sheet on a touch phone, upright and in landscape. Landscape is wider
+ * than globals.css's touch-size rule (up to 768px) but short, so the sheet opens there too, and its
+ * Close button and tabs must still be 44px touch targets. Upright, four tabs do not fit: each must
+ * keep its label and count (the strip scrolls), though that rule's 44px min-width would let a tab
+ * shrink below them. Plays cannot emulate the pointer.
  */
-async function assertLandscapeSheetTouchTargets(page: StoryPage) {
+async function assertSheetTouchTargets(page: StoryPage) {
   const client = await page.context().newCDPSession(page);
   const viewport = page.viewportSize();
+  const problems: string[] = [];
   try {
     await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
-    await page.setViewportSize({ width: 844, height: 390 });
-    await page.waitForFunction(
-      () => matchMedia("(pointer: coarse)").matches && innerWidth === 844,
-      undefined,
-      { timeout: 5000 }
-    );
-    await page
-      .locator('[data-component="ChatActivityLine"] [data-component="PinnedTodoList"] button')
-      .first()
-      .click();
-    const sheet = page.getByRole("dialog", { name: "Activity" });
-    await sheet.waitFor({ timeout: 5000 });
-    const targets = [
-      sheet.getByRole("button", { name: "Close" }),
-      ...(await sheet.getByRole("tab").all()),
-    ];
-    const problems: string[] = [];
-    for (const target of targets) {
-      const box = await target.boundingBox();
-      const name = (await target.textContent())?.trim() || "Close";
-      if (!box) problems.push(`${name}: missing`);
-      else if (box.height < 44) problems.push(`${name}: ${Math.round(box.height)}px tall`);
+    for (const size of [
+      { width: 844, height: 390 },
+      { width: 375, height: 667 },
+    ]) {
+      await page.setViewportSize(size);
+      await page.waitForFunction(
+        (width) => matchMedia("(pointer: coarse)").matches && innerWidth === width,
+        size.width,
+        { timeout: 5000 }
+      );
+      await page
+        .locator('[data-component="ChatActivityLine"] [data-component="PinnedTodoList"] button')
+        .first()
+        .click();
+      const sheet = page.getByRole("dialog", { name: "Activity" });
+      await sheet.waitFor({ timeout: 5000 });
+      const targets = [
+        sheet.getByRole("button", { name: "Close" }),
+        ...(await sheet.getByRole("tab").all()),
+      ];
+      for (const target of targets) {
+        const box = await target.boundingBox();
+        const name = `${size.width}px ${(await target.textContent())?.trim() || "Close"}`;
+        const clipped = await target.evaluate((element) => element.scrollWidth > element.clientWidth);
+        if (!box) problems.push(`${name}: missing`);
+        else if (box.height < 44) problems.push(`${name}: ${Math.round(box.height)}px tall`);
+        else if (clipped) problems.push(`${name}: label cut`);
+      }
+      await page.keyboard.press("Escape");
+      await sheet.waitFor({ state: "hidden", timeout: 5000 });
     }
-    assert.equal(problems.join("; "), "", "The landscape sheet's controls must be touch targets");
+    assert.equal(problems.join("; "), "", "The sheet's controls must be whole touch targets");
   } finally {
-    await page.keyboard.press("Escape");
     await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
     await client.detach();
     if (viewport) await page.setViewportSize(viewport);
@@ -509,7 +519,7 @@ const config: TestRunnerConfig = {
     }
     if (context.id === LANDSCAPE_SHEET_STORY) {
       if (page.context().browser()?.browserType().name() === "chromium") {
-        await assertLandscapeSheetTouchTargets(page);
+        await assertSheetTouchTargets(page);
       }
       return;
     }
