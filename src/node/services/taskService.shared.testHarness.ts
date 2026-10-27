@@ -460,8 +460,10 @@ export function queuedWorkflowRunAttention(
   ownerWorkspaceId: string
 ): ReadonlySet<string> {
   const queue = (
-    taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-  ).pendingWorkflowRunAttention;
+    taskService as unknown as {
+      workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+    }
+  ).workflowRunAttention.pendingWorkflowRunAttention;
   return new Set(queue.get(ownerWorkspaceId));
 }
 
