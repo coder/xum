@@ -1,11 +1,12 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState, useSyncExternalStore } from "react";
-import { CircleAlert, CircleDot, ListStart, Loader2 } from "lucide-react";
+import { CircleAlert, CircleDot, Hourglass, ListStart, Loader2 } from "lucide-react";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useStartHere } from "@/browser/hooks/useStartHere";
 import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { formatTimestamp } from "@/browser/utils/ui/dateTime";
+import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { AGENT_INTERFACE_TRANSCRIPT_PEEK_KEY } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
@@ -23,6 +24,7 @@ import {
   type StatusActivity,
 } from "./agentInterfaceStatusBar";
 import {
+  isShortcutOwnedElsewhere,
   readStatusPage,
   recordStatusPageRead,
   subscribeStatusListings,
@@ -187,6 +189,8 @@ function ActivityIcon(props: { activity: StatusActivity }) {
       return <CircleDot aria-hidden="true" className={cn(className, "text-muted")} />;
     case "error":
       return <CircleAlert aria-hidden="true" className={cn(className, "text-error")} />;
+    case "monitor":
+      return <Hourglass aria-hidden="true" className={cn(className, "text-muted")} />;
     default:
       return <Loader2 aria-hidden="true" className={cn(className, "text-muted animate-spin")} />;
   }
@@ -204,16 +208,39 @@ function AgentInterfaceStatusBar(props: { workspaceId: string }) {
   return <StatusBar workspaceId={props.workspaceId} state={state} />;
 }
 
+/**
+ * The peek's shortcut. The bar is mounted only while the status page shows, so the chord does
+ * nothing in the chat view. Keys typed in the page's frame stay in the frame.
+ */
+function usePeekShortcut(togglePeek: () => void) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!matchesKeybind(e, KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK) || isShortcutOwnedElsewhere(e)) {
+        return;
+      }
+      e.preventDefault();
+      // A held chord would flip the peek on every key repeat.
+      if (e.repeat) return;
+      togglePeek();
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [togglePeek]);
+}
+
 function StatusBar(props: { workspaceId: string; state: WorkspaceState }) {
   const { state } = props;
   const panelId = useId();
   const [peekOpen, setPeekOpen] = usePersistedState(AGENT_INTERFACE_TRANSCRIPT_PEEK_KEY, false);
+  const togglePeek = () => setPeekOpen((open) => !open);
+  usePeekShortcut(togglePeek);
   const activity = deriveStatusActivity(state.messages, {
     canInterrupt: state.canInterrupt,
     isStreamStarting: state.isStreamStarting,
     isCompacting: state.isCompacting,
     awaitingUserQuestion: state.awaitingUserQuestion,
-    runtimeDetail: state.runtimeStatus?.detail,
+    activeBashMonitorCount: state.activeBashMonitorCount,
+    runtimeStatus: state.runtimeStatus,
   });
   const receipt = deriveLastMessageReceipt(state.messages, state.queuedMessage, state.heldInputs);
 
@@ -226,16 +253,21 @@ function StatusBar(props: { workspaceId: string; state: WorkspaceState }) {
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-1">
           <ActivityLine activity={activity} />
           <div className="flex shrink-0 items-center gap-1">
-            <button
-              type="button"
-              aria-expanded={peekOpen}
-              // The peek is unmounted while closed, and aria-controls must name an element that exists.
-              aria-controls={peekOpen ? panelId : undefined}
-              onClick={() => setPeekOpen(!peekOpen)}
-              className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent h-6 rounded px-1.5 focus-visible:ring-1"
+            <TooltipIfPresent
+              tooltip={`${peekOpen ? "Hide" : "Show"} the newest transcript rows (${formatKeybind(KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK)})`}
+              side="bottom"
             >
-              {peekOpen ? "Hide transcript" : "Show transcript"}
-            </button>
+              <button
+                type="button"
+                aria-expanded={peekOpen}
+                // The peek is unmounted while closed, and aria-controls must name an element that exists.
+                aria-controls={peekOpen ? panelId : undefined}
+                onClick={togglePeek}
+                className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent h-6 rounded px-1.5 focus-visible:ring-1"
+              >
+                {peekOpen ? "Hide transcript" : "Show transcript"}
+              </button>
+            </TooltipIfPresent>
             <StartHereButton
               workspaceId={props.workspaceId}
               messages={state.messages}
@@ -285,6 +317,8 @@ function StartHereButton(props: {
     // Preserve legacy plan/exec markers so Start Here keeps plan→exec handoff for old history.
     // mutation-equivalent: agent ids are never empty strings, so ?? and || agree
     sourceAgentId: source?.agentId ?? source?.mode,
+    // Off while a turn runs, in the confirmation too: it may have opened before the turn started.
+    turnActive: props.turnActive,
   });
   return (
     <>
@@ -295,7 +329,7 @@ function StartHereButton(props: {
       >
         <button
           type="button"
-          disabled={startHere.disabled || props.turnActive}
+          disabled={startHere.disabled}
           onClick={startHere.openModal}
           className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-6 items-center gap-1 rounded px-1.5 focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-50"
         >
@@ -329,6 +363,9 @@ function ReceiptRow(props: { receipt: LastMessageReceipt }) {
           </span>
         )}
       </span>
+      {receipt.otherHeldCount > 0 && (
+        <span className="text-error shrink-0 font-medium">+{receipt.otherHeldCount} held</span>
+      )}
     </div>
   );
 }

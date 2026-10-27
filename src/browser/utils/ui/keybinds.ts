@@ -612,6 +612,9 @@ export const KEYBINDS = {
   /** Agent interface view: switch the main pane between the agent's status page and the chat */
   TOGGLE_AGENT_INTERFACE_VIEW: { key: "S", ctrl: true, shift: true },
 
+  /** Agent interface view: show or hide the transcript peek under the status page's bar */
+  TOGGLE_STATUS_TRANSCRIPT_PEEK: { key: "p", code: "KeyP", ctrl: true, alt: true, shift: true },
+
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.
   /** Toggle fullscreen for the selected artifact */

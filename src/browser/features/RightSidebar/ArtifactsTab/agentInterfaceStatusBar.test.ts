@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { HeldInput } from "@/common/orpc/types";
 import type { DisplayedMessage, DisplayedUserMessage } from "@/common/types/message";
+import { formatAgentMessageEnvelope } from "@/common/utils/agentMessageEnvelope";
 import {
   deriveLastMessageReceipt,
   deriveStatusActivity,
@@ -55,10 +56,13 @@ function reasoning(isStreaming: boolean): DisplayedMessage {
   };
 }
 
+type DisplayedTool = Extract<DisplayedMessage, { type: "tool" }>;
+
 function tool(
   toolName: string,
-  status: Extract<DisplayedMessage, { type: "tool" }>["status"],
-  args: unknown = {}
+  status: DisplayedTool["status"],
+  args: unknown = {},
+  extra: Partial<DisplayedTool> = {}
 ): DisplayedMessage {
   sequence += 1;
   return {
@@ -71,6 +75,7 @@ function tool(
     status,
     isPartial: false,
     historySequence: sequence,
+    ...extra,
   };
 }
 
@@ -79,6 +84,7 @@ const streaming: StatusActivityFlags = {
   isStreamStarting: false,
   isCompacting: false,
   awaitingUserQuestion: false,
+  activeBashMonitorCount: 0,
 };
 const idle: StatusActivityFlags = { ...streaming, canInterrupt: false };
 
@@ -86,9 +92,19 @@ describe("deriveStatusActivity", () => {
   test("a turn that is starting reports starting, with the runtime's breadcrumb when present", () => {
     const flags = { ...streaming, isStreamStarting: true };
     expect(deriveStatusActivity([tool("bash", "executing")], flags).kind).toBe("starting");
-    expect(
-      deriveStatusActivity([], { ...flags, runtimeDetail: "Waking the workspace" }).label
-    ).toBe("Waking the workspace");
+    const startingWith = (runtimeStatus: StatusActivityFlags["runtimeStatus"]) =>
+      deriveStatusActivity([], { ...flags, runtimeStatus }).label;
+    expect(startingWith({ phase: "starting", detail: "Waking the workspace" })).toBe(
+      "Waking the workspace"
+    );
+    expect(startingWith({ phase: "waiting", detail: "Waiting for the runtime" })).toBe(
+      "Waiting for the runtime"
+    );
+    // A blank breadcrumb, or one from a phase that is not starting up, names no step.
+    const fallback = startingWith(null);
+    expect(fallback).not.toBe("");
+    expect(startingWith({ phase: "starting", detail: "  " })).toBe(fallback);
+    expect(startingWith({ phase: "error", detail: "Runtime failed earlier" })).toBe(fallback);
   });
 
   test("compacting and a pending question name their phase over the turn's running tool", () => {
@@ -114,6 +130,18 @@ describe("deriveStatusActivity", () => {
 
     const writing = [user("go"), reasoning(false), assistant("so far", { isStreaming: true })];
     expect(deriveStatusActivity(writing, streaming).kind).toBe("writing");
+  });
+
+  test("of serialized calls, the one whose execution began is named, not a queued sibling", () => {
+    const turn = [
+      user("go"),
+      tool("bash", "executing", { display_name: "Build" }, { executionStartedAt: 10 }),
+      tool("bash", "executing", { display_name: "Test" }),
+    ];
+    expect(deriveStatusActivity(turn, streaming).detail).toBe("Build");
+    // Provider-executed calls never report a start, so the newest running call stands.
+    const provider = [user("go"), tool("web_search", "executing", { title: "Search" })];
+    expect(deriveStatusActivity(provider, streaming).detail).toBe("Search");
   });
 
   test("a parallel call still running counts after a newer call completed", () => {
@@ -147,13 +175,25 @@ describe("deriveStatusActivity", () => {
     expect(deriveStatusActivity([user("go"), errored, assistant("done")], idle).kind).toBe("idle");
   });
 
-  test("a turn counts as running in every phase but idle and a stopped stream", () => {
+  test("after the turn, an armed bash monitor is waited on, not idle", () => {
+    const settled = [user("go"), assistant("watching the logs")];
+    expect(deriveStatusActivity(settled, { ...idle, activeBashMonitorCount: 2 }).kind).toBe(
+      "monitor"
+    );
+    // A running turn still names its own phase.
+    expect(deriveStatusActivity(settled, { ...streaming, activeBashMonitorCount: 2 }).kind).toBe(
+      "working"
+    );
+  });
+
+  test("a turn counts as running in every phase but idle, a stopped stream and a monitor wait", () => {
     const phases: Array<[StatusActivityFlags, DisplayedMessage[], boolean]> = [
       [{ ...idle, isStreamStarting: true }, [], true],
       [{ ...streaming, isCompacting: true }, [], true],
       [{ ...streaming, awaitingUserQuestion: true }, [], true],
       [streaming, [user("go"), tool("bash", "executing")], true],
       [idle, [user("go"), assistant("done")], false],
+      [{ ...idle, activeBashMonitorCount: 1 }, [user("go"), assistant("watching")], false],
     ];
     for (const [flags, messages, active] of phases) {
       expect(isTurnActive(deriveStatusActivity(messages, flags))).toBe(active);
@@ -180,14 +220,23 @@ describe("deriveLastMessageReceipt", () => {
     expect(receipt).toMatchObject({ state: "queued", preview: "queued text" });
   });
 
-  test("held inputs win over the newest transcript row, the newest held input first", () => {
+  test("a held input does not stand in for a message that landed; it is counted", () => {
+    // Held inputs carry no time: one left from earlier must not hide a newer message's arrival.
+    expect(deriveLastMessageReceipt([user("in history")], null, [held])).toMatchObject({
+      state: "in-transcript",
+      preview: "in history",
+      otherHeldCount: 1,
+    });
+    expect(deriveLastMessageReceipt([user("in history")], null, [])?.otherHeldCount).toBe(0);
+  });
+
+  test("with nothing sent to show, the newest held input is the receipt and the rest count", () => {
     const middle: HeldInput = { ...held, id: "h2", displayText: "middle held text" };
     const newer: HeldInput = { ...held, id: "h3", displayText: "newer held text" };
-    expect(
-      deriveLastMessageReceipt([user("in history")], null, [held, middle, newer])
-    ).toMatchObject({
+    expect(deriveLastMessageReceipt([], null, [held, middle, newer])).toMatchObject({
       state: "held",
       preview: "newer held text",
+      otherHeldCount: 2,
     });
   });
 
@@ -242,6 +291,28 @@ describe("recentTranscriptRows", () => {
       "boundary",
       "tool",
     ]);
+  });
+
+  test("another agent's message names its sender and shows its text, not the envelope", () => {
+    const peerMessage = assistant(
+      formatAgentMessageEnvelope({
+        from: "ws-reviewer",
+        fromTitle: "Reviewer",
+        relationship: "sibling",
+        message: "Looks good to me",
+      }),
+      {
+        agentPeerMessage: {
+          fromWorkspaceId: "ws-reviewer",
+          fromTitle: "Reviewer",
+          relationship: "sibling",
+        },
+      }
+    );
+    const [row] = recentTranscriptRows([peerMessage], 1);
+    expect(row.label).toContain("Reviewer");
+    expect(row.label).not.toBe(recentTranscriptRows([assistant("mine")], 1)[0].label);
+    expect(row.preview).toBe("Looks good to me");
   });
 
   test("previews are one bounded line, and malformed tool arguments show none", () => {

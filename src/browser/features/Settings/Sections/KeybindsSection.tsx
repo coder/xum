@@ -69,6 +69,7 @@ const KEYBIND_LABELS: Record<keyof typeof KEYBINDS, string> = {
   OPEN_STATS_DIALOG: "Open Stats tab (small viewports)",
   OPEN_ARTIFACTS_TAB: "Focus Artifacts tab, or hide the sidebar when focused",
   TOGGLE_AGENT_INTERFACE_VIEW: "Switch between status page and chat (Agent interface view)",
+  TOGGLE_STATUS_TRANSCRIPT_PEEK: "Show or hide the transcript on the status page",
   TOGGLE_ARTIFACT_FULLSCREEN: "Toggle artifact fullscreen (Artifacts tab)",
   NEXT_ARTIFACT: "Next artifact (Artifacts tab)",
   PREV_ARTIFACT: "Previous artifact (Artifacts tab)",
@@ -267,6 +268,7 @@ const KEYBIND_GROUPS: Array<{
     keys: [
       "OPEN_ARTIFACTS_TAB",
       "TOGGLE_AGENT_INTERFACE_VIEW",
+      "TOGGLE_STATUS_TRANSCRIPT_PEEK",
       "TOGGLE_ARTIFACT_FULLSCREEN",
       "NEXT_ARTIFACT",
       "PREV_ARTIFACT",

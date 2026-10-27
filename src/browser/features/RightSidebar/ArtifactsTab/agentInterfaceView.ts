@@ -375,6 +375,6 @@ export function useMainPaneAgentInterfaceView(workspaceId: string): AgentInterfa
 }
 
 /** Dialogs, terminals and remote desktops keep their keystrokes, as for the Artifacts chord. */
-function isShortcutOwnedElsewhere(e: KeyboardEvent): boolean {
+export function isShortcutOwnedElsewhere(e: KeyboardEvent): boolean {
   return isDialogOpen() || isTerminalFocused(e.target) || isDesktopViewportFocused(e.target);
 }

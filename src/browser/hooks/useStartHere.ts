@@ -9,6 +9,8 @@ import {
 } from "@/browser/utils/transcriptBarrier";
 import { TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE } from "@/constants/transcriptBarrier";
 
+const START_HERE_TURN_ACTIVE_MESSAGE = "A turn is running. Start Here once it ends.";
+
 /**
  * Hook for managing Start Here button state and modal.
  * Returns a button config and modal state management.
@@ -22,7 +24,16 @@ export function useStartHere(
   workspaceId: string | undefined,
   content: string,
   isCompacted = false,
-  options?: { deletePlanFile?: boolean; sourceAgentId?: string }
+  options?: {
+    deletePlanFile?: boolean;
+    sourceAgentId?: string;
+    /**
+     * A turn is running. The backend does not refuse Start Here then (compaction replaces run
+     * inside turns), so a caller that knows the turn state passes it to keep the boundary from
+     * landing under the running turn, also from a confirmation opened before the turn started.
+     */
+    turnActive?: boolean;
+  }
 ) {
   const { api } = useAPI();
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -30,10 +41,11 @@ export function useStartHere(
   // Rendered disabled state follows the barrier, so the button never offers a click that
   // `openModal`/`executeStartHere` would refuse.
   const transcriptMutationAllowed = useTranscriptMutationAllowed(workspaceId);
+  const turnActive = options?.turnActive === true;
 
   // Opens the confirmation modal
   const openModal = () => {
-    if (!workspaceId || isCompacted) return;
+    if (!workspaceId || isCompacted || turnActive) return;
     // Start Here rewrites the request window around a row the user sees; refuse while the
     // transcript is not yet a verified copy of history (same barrier as sends and edits).
     if (!isTranscriptMutationAllowed(workspaceId)) return;
@@ -52,6 +64,9 @@ export function useStartHere(
     // the rendered OK button is already disabled through `confirmDisabled` by then.
     if (!isTranscriptMutationAllowed(workspaceId)) {
       throw new Error(TRANSCRIPT_NOT_CAUGHT_UP_MESSAGE);
+    }
+    if (turnActive) {
+      throw new Error(START_HERE_TURN_ACTIVE_MESSAGE);
     }
 
     setIsStartingHere(true);
@@ -93,14 +108,15 @@ export function useStartHere(
     onConfirm: executeStartHere,
     // The open dialog follows the barrier too: a replay that drops out after it opened
     // disables OK rather than letting a click resolve to nothing.
-    confirmDisabled: !transcriptMutationAllowed,
+    confirmDisabled: !transcriptMutationAllowed || turnActive,
   });
 
   return {
     openModal,
     isStartingHere,
     buttonLabel: `Start Here`,
-    disabled: !workspaceId || isStartingHere || isCompacted || !transcriptMutationAllowed,
+    disabled:
+      !workspaceId || isStartingHere || isCompacted || !transcriptMutationAllowed || turnActive,
     modal, // Pre-configured modal to render
   };
 }
