@@ -261,7 +261,7 @@
     "vite-plugin-top-level-await": "^1.6.0"
   },
   "optionalDependencies": {
-    "electron": "^44.9.0",
+    "electron": "^44.10.0",
     "robotjs": "^0.9.1"
   },
   "files": [
