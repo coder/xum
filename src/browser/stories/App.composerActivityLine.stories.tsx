@@ -231,7 +231,9 @@ async function assertPanels(line: HTMLElement, surface: "popover" | "sheet") {
     await openChatActivityPanel(line, "BackgroundProcessesBanner");
   }
   await waitFor(() => expect(document.querySelectorAll("[data-activity-panel]")).toHaveLength(1));
-  await expect(within(await findChatActivityPanel()).getByText("gh pr checks 30958 --watch")).toBeVisible();
+  await expect(
+    within(await findChatActivityPanel()).getByText("gh pr checks 30958 --watch")
+  ).toBeVisible();
 
   // Escape closes the panel and leaves the stream running.
   await userEvent.keyboard("{Escape}");
@@ -271,7 +273,9 @@ async function assertTodoChipFollowsRewrite(line: HTMLElement, workspaceId: stri
   await waitFor(() => expect(todoChips()).toHaveLength(0));
   writeTodos("call-todo-again", TODOS);
   await waitFor(() => expect(todoChips()).toHaveLength(1));
-  await expect(within(await findChatActivityPanel()).getByText("gh pr checks 30958 --watch")).toBeVisible();
+  await expect(
+    within(await findChatActivityPanel()).getByText("gh pr checks 30958 --watch")
+  ).toBeVisible();
   await expect(bashesChip).toBeInTheDocument();
   await expect(bashesChip).toHaveAttribute("aria-expanded", "true");
 }

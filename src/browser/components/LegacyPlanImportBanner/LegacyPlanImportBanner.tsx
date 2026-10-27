@@ -1,6 +1,10 @@
 import React, { useEffect, useRef, useState } from "react";
 import { FileInput, Loader2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
+import {
+  useWaitingOnYou,
+  type WaitingOnYouEntry,
+} from "@/browser/components/ChatPane/WaitingOnYou";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useOptionalCommandRegistry } from "@/browser/contexts/CommandRegistryContext";
 import { useOptionalWorkspaceMetadata } from "@/browser/contexts/WorkspaceContext";
@@ -25,7 +29,15 @@ export interface LegacyPlanImportNoticeProps {
  * it: Xum never imports it on its own, only when the user asks here or in the command palette.
  * The backend copies it (never replacing an existing plan) and leaves the legacy file in place.
  */
+const LEGACY_PLAN_ENTRY: WaitingOnYouEntry = {
+  icon: FileInput,
+  tab: "Old plan",
+  title: "Plan from an older Xum",
+  detail: "Check it is yours, then import it",
+};
+
 export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (props) => {
+  useWaitingOnYou(LEGACY_PLAN_ENTRY);
   const liveApi = useLiveAPI();
   const registerSource = useOptionalCommandRegistry()?.registerSource;
   const [importing, setImporting] = useState(false);

@@ -564,7 +564,9 @@ function ChatActivityMoreEntry(props: {
     <button
       type="button"
       style={
-        props.activityId === undefined ? undefined : { order: CHAT_ACTIVITY_ORDER[props.activityId] }
+        props.activityId === undefined
+          ? undefined
+          : { order: CHAT_ACTIVITY_ORDER[props.activityId] }
       }
       onClick={(event) => {
         // The entry leaves with the list, so focus goes to the "+N" chip first: the phone sheet

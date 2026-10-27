@@ -481,6 +481,7 @@ async function assertLandscapeSheetTouchTargets(page: StoryPage) {
 // its panels (the phone sheet or a popover), still sees the desktop window.
 const PHONE_VIEWPORT_STORIES = new Map([
   ["app-composeractivityline--worst-case-phone", { width: 375, height: 667 }],
+  ["app-waitingonyou--phone", { width: 390, height: 844 }],
 ]);
 const viewportsToRestore = new WeakMap<object, { width: number; height: number }>();
 
