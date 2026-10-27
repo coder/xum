@@ -130,14 +130,17 @@ function stubLayout(room: number): void {
   });
 }
 
-/** `streaming` adds Stop to the line, a change in the line that makes it measure its chips again. */
-function Line(props: { streaming?: boolean }) {
+/**
+ * `streaming` adds Stop to the line, a change in the line that makes it measure its chips again.
+ * `bashes={false}` drops the Bashes chip, as its last bash exiting does.
+ */
+function Line(props: { streaming?: boolean; bashes?: boolean }) {
   return (
     <div>
       <ChatActivityPanelsProvider>
         <div data-activity-strip="">
           <Chip id="sub-agents" label="Agents" panelKeybind={KEYBINDS.OPEN_SUB_AGENTS_PANEL} />
-          <Chip id="background-bashes" label="Bashes" />
+          {props.bashes !== false && <Chip id="background-bashes" label="Bashes" />}
           <Chip id="reviews" label="Reviews" panelKeybind={KEYBINDS.OPEN_REVIEWS_PANEL} />
           <ChatActivityOverflowChip />
         </div>
@@ -146,6 +149,15 @@ function Line(props: { streaming?: boolean }) {
       <button type="button">composer</button>
     </div>
   );
+}
+
+async function rerenderLine(view: ReturnType<typeof render>, room: number, streaming: boolean) {
+  stubLayout(room);
+  view.rerender(<Line streaming={streaming} />);
+  // The line measures its chips again from a MutationObserver callback.
+  await act(async () => {
+    await Promise.resolve();
+  });
 }
 
 describe("the +N chip", () => {
@@ -175,11 +187,32 @@ describe("the +N chip", () => {
     fireEvent.click(within(list).getByRole("button", { name: "Reviews tab" }));
     expect(view.queryByRole("group", { name: "More activity" })).toBeNull();
     const panel = view.getByRole("group", { name: "Reviews" });
+    // Focus moves into the panel: it comes before the +N chip, so Tab from there would skip it.
+    expect(document.activeElement).toBe(within(panel).getByRole("button", { name: "Reviews row" }));
     // The hidden chip's panel keeps the +N chip lit, and closing it returns focus there.
     expect(more.querySelector("span")?.className).toContain("color-exec-mode");
     fireEvent.keyDown(within(panel).getByText("Reviews row"), { key: "Escape" });
     expect(view.queryByRole("group", { name: "Reviews" })).toBeNull();
     expect(document.activeElement).toBe(more);
+  });
+
+  // A hidden chip cannot keep focus: the browser would drop it to the page.
+  it("takes focus from a chip that hides, and hands it to that chip once it shows again", async () => {
+    stubLayout(400);
+    const view = render(<Line />);
+    const bashes = view.getByRole("button", { name: "Bashes" });
+    bashes.focus();
+
+    // A turn starts: Stop takes room, and Bashes moves into the +N chip.
+    await rerenderLine(view, 110, true);
+    expect(bashes.className).toContain("invisible");
+    const more = view.getByRole("button", { name: "2 more" });
+    expect(document.activeElement).toBe(more);
+
+    // The turn ends: every chip fits again, and the +N chip hides.
+    await rerenderLine(view, 400, false);
+    expect(more.className).toContain("invisible");
+    expect(document.activeElement).toBe(bashes);
   });
 
   it("closes its list on Escape and keeps focus on itself", () => {
@@ -199,15 +232,6 @@ describe("the phone sheet", () => {
   beforeEach(() => {
     stubNarrowViewport(true);
   });
-
-  async function rerenderLine(view: ReturnType<typeof render>, room: number, streaming: boolean) {
-    stubLayout(room);
-    view.rerender(<Line streaming={streaming} />);
-    // The line measures its chips again from a MutationObserver callback.
-    await act(async () => {
-      await Promise.resolve();
-    });
-  }
 
   it("returns focus to the +N chip once the chip that opened it has moved there", async () => {
     stubLayout(400);
@@ -250,6 +274,20 @@ describe("the phone sheet", () => {
     fireEvent.click(within(list).getByRole("button", { name: "Bashes tab" }));
     fireEvent.keyDown(view.getByRole("dialog", { name: "Activity" }), { key: "Escape" });
     expect(document.activeElement).toBe(more);
+  });
+
+  it("returns focus to a chip the line shows once the chip that opened it has left", () => {
+    stubLayout(400);
+    const view = render(<Line />);
+    const bashes = view.getByRole("button", { name: "Bashes" });
+    bashes.focus();
+    fireEvent.click(bashes);
+    view.getByRole("dialog", { name: "Activity" });
+
+    // The last bash exits: its chip leaves, which closes the sheet.
+    view.rerender(<Line bashes={false} />);
+    expect(view.queryByRole("dialog", { name: "Activity" })).toBeNull();
+    expect(document.activeElement).toBe(view.getByRole("button", { name: "Agents" }));
   });
 
   it("returns focus to a chip that opened it and is still shown", () => {

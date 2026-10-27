@@ -175,6 +175,18 @@ function focusPanel(panelId: string): void {
 }
 
 /**
+ * Moves focus into the panel after the commit that renders it, for openers whose focus the panel
+ * does not follow in Tab order. On phones the sheet then keeps this focus.
+ */
+function usePanelFocusRequest(panelId: string): () => void {
+  const [request, setRequest] = useState(0);
+  useEffect(() => {
+    if (request > 0) focusPanel(panelId);
+  }, [request, panelId]);
+  return () => setRequest((current) => current + 1);
+}
+
+/**
  * The chip's `panelKeybind`. The chord opens the panel and moves focus into it, recording where
  * focus was (usually the composer) so closing returns there; with focus in the open panel, the
  * chord closes it. With the panel open and focus elsewhere (Tab back to the composer), it moves
@@ -189,10 +201,11 @@ function usePanelChord(options: {
   returnFocusRef: { current: HTMLElement | null };
   onOpen: () => void;
   onClose: () => void;
+  requestFocus: () => void;
 }): void {
-  const { keybind, open, panelId, chipRef, returnFocusRef, onOpen, onClose } = options;
+  const { keybind, open, panelId, chipRef, returnFocusRef, onOpen, onClose, requestFocus } =
+    options;
   const paneScope = useChatPaneScope();
-  const [focusRequest, setFocusRequest] = useState(0);
   useEffect(() => {
     if (keybind === undefined) return;
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -209,15 +222,11 @@ function usePanelChord(options: {
         returnFocusRef.current = active;
       }
       if (!open) onOpen();
-      setFocusRequest((request) => request + 1);
+      requestFocus();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [keybind, open, panelId, paneScope, chipRef, returnFocusRef, onOpen, onClose]);
-  // After the commit that renders the panel. On phones the sheet then keeps this focus.
-  useEffect(() => {
-    if (focusRequest > 0) focusPanel(panelId);
-  }, [focusRequest, panelId]);
+  }, [keybind, open, panelId, paneScope, chipRef, returnFocusRef, onOpen, onClose, requestFocus]);
 }
 
 /** The chip, its tab in the phone activity sheet, and its panel while open. */
@@ -248,6 +257,7 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
     }
   };
   useCloseChatActivityPanelOnBodyEscape(open, close);
+  const requestPanelFocus = usePanelFocusRequest(panelId);
   usePanelChord({
     keybind: props.renderExpanded === undefined ? undefined : props.panelKeybind,
     open,
@@ -256,6 +266,7 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
     returnFocusRef,
     onOpen: props.onToggle,
     onClose: close,
+    requestFocus: requestPanelFocus,
   });
   const shortcut = props.panelKeybind === undefined ? undefined : formatKeybind(props.panelKeybind);
   const tooltip =
@@ -292,7 +303,15 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
       {overflowed &&
         moreList !== null &&
         createPortal(
-          <ChatActivityMoreEntry activityId={props.activityId} onOpen={props.onToggle}>
+          <ChatActivityMoreEntry
+            activityId={props.activityId}
+            onOpen={() => {
+              props.onToggle();
+              // The entry leaves focus on the "+N" chip, which comes after the panel: Tab from
+              // there would skip the panel's rows.
+              requestPanelFocus();
+            }}
+          >
             {/* mutation-equivalent: tab is an element or absent, never another falsy node */}
             {props.tab ?? chipContent}
           </ChatActivityMoreEntry>,

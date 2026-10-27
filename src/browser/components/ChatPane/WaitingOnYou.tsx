@@ -65,6 +65,8 @@ interface WaitingOnYouValue {
   hostFor: (id: WaitingOnYouId) => HTMLElement | null;
   /** What had focus before the commit now running (FocusBeforeCommit). */
   focusBeforeCommit: { readonly current: Element | null };
+  /** Whether the open phone sheet shows slot `id`'s content. */
+  inSheet: (id: WaitingOnYouId) => boolean;
 }
 
 const WaitingOnYouContext = createContext<WaitingOnYouValue | null>(null);
@@ -72,6 +74,12 @@ const WaitingOnYouContext = createContext<WaitingOnYouValue | null>(null);
 // stable, so registering never re-renders the items that register.
 const WaitingOnYouRegisterContext = createContext<Dispatch<SetStateAction<Entries>> | null>(null);
 const WaitingOnYouSlotIdContext = createContext<WaitingOnYouId | null>(null);
+const WaitingOnYouInSheetContext = createContext(false);
+
+/** True for content the phone sheet shows, which scrolls with the sheet. */
+export function useInWaitingOnYouSheet(): boolean {
+  return useContext(WaitingOnYouInSheetContext);
+}
 interface WaitingOnYouCardState {
   entries: ReadonlyArray<[WaitingOnYouId, WaitingOnYouEntry]>;
   selected: WaitingOnYouId | null;
@@ -232,11 +240,14 @@ export function WaitingOnYouProvider(props: { children: ReactNode }) {
   const hosts = { body: bodyHost, after: afterHost, sheet: sheetShown ? sheetHost : null };
   const consolidated = arranged.consolidated;
   const hostFor = (id: WaitingOnYouId) => waitingHost(id, arranged, phone, hosts);
+  const inSheet = (id: WaitingOnYouId) => hosts.sheet !== null && hostFor(id) === hosts.sheet;
   const waits = (id: WaitingOnYouId) => entries.has(id);
 
   return (
     <WaitingOnYouRegisterContext.Provider value={setEntries}>
-      <WaitingOnYouContext.Provider value={{ consolidated, waits, hostFor, focusBeforeCommit }}>
+      <WaitingOnYouContext.Provider
+        value={{ consolidated, waits, hostFor, focusBeforeCommit, inSheet }}
+      >
         <WaitingOnYouCardContext.Provider
           value={{
             entries: arranged.listed,
@@ -317,7 +328,11 @@ export function WaitingOnYouSlot(props: {
         {/* Inset only where the card or sheet hosts it: content left inline beside the card (it
             stopped waiting) keeps its gutter and column. */}
         {createPortal(
-          <ChatDockInsetProvider value={host !== null}>{props.children}</ChatDockInsetProvider>,
+          <ChatDockInsetProvider value={host !== null}>
+            <WaitingOnYouInSheetContext.Provider value={waiting.inSheet(props.id)}>
+              {props.children}
+            </WaitingOnYouInSheetContext.Provider>
+          </ChatDockInsetProvider>,
           container
         )}
       </div>

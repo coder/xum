@@ -202,6 +202,7 @@ export function ChatActivityPanelsProvider(props: {
   const sheetViewport = useSheetViewport();
   const { sheet, setSheetTabs, setSheetBody } = useSheetSlots(sheetViewport);
   const overflow = useChipOverflow(rootRef, setOpenIdState);
+  useChipFocusWhenHidden(rootRef, overflow);
   // The panel the sheet showed last, whose chip the closing sheet may return focus to.
   const sheetPanelRef = useRef<ChatActivityPanelId | null>(null);
   useLayoutEffect(() => {
@@ -232,7 +233,9 @@ export function ChatActivityPanelsProvider(props: {
           // panel (Chat Instructions), which the sheet has no tab for.
           open={openId !== null && openId !== "more"}
           onClose={() => setOpenIdState(null)}
-          returnFocus={(opener) => sheetReturnFocus(opener, sheetPanelRef.current, overflow)}
+          returnFocus={(opener) =>
+            shownFocusTarget(opener, sheetPanelRef.current, overflow, rootRef.current)
+          }
           tabsRef={setSheetTabs}
           bodyRef={setSheetBody}
         />
@@ -246,6 +249,9 @@ export function ChatActivityPanelsProvider(props: {
  * step stays readable on a phone (the approved phone design shows its first words).
  */
 const PLAIN_CHIP_RESERVE_PX = 104;
+
+/** The line's chips, the "+N" chip included. */
+const LINE_CHIPS = "[data-activity-chip], [data-activity-overflow-chip]";
 
 /** A chip's width without truncation: its width plus what its truncating text cuts off. */
 function naturalChipWidth(chip: HTMLElement): number {
@@ -322,9 +328,7 @@ function useChipOverflow(
       strip = root.querySelector<HTMLElement>("[data-activity-strip]");
       if (strip === null) return;
       resizes.observe(strip);
-      for (const chip of strip.querySelectorAll(
-        "[data-activity-chip], [data-activity-overflow-chip]"
-      )) {
+      for (const chip of strip.querySelectorAll(LINE_CHIPS)) {
         resizes.observe(chip);
       }
     };
@@ -344,27 +348,54 @@ function useChipOverflow(
 }
 
 /**
- * Where the closing sheet returns focus: what had it when the sheet opened, unless the line hides
- * that chip now, which then cannot take focus. The line hides the chips it has no room for (a
- * status label or Stop can take room while the sheet is open), and the "+N" chip once every chip
- * fits again. The "+N" chip stands in for a hidden chip, and the chip whose panel the sheet
- * showed last for a hidden "+N" chip.
+ * A chip that hides while it has focus would drop focus to the page: it goes to what shows the
+ * chip now instead, the "+N" chip, or for the "+N" chip the first chip it stood in for. In the
+ * commit that hides the chip, while the browser still counts it as focused.
  */
-function sheetReturnFocus(
-  opener: Element | null,
-  panel: ChatActivityPanelId | null,
+function useChipFocusWhenHidden(
+  rootRef: RefObject<HTMLDivElement | null>,
   overflow: readonly ChatActivityId[]
-): Element | null {
-  const strip = opener?.closest("[data-activity-strip]");
-  // mutation-equivalent: only chips carry an activity id, and every chip sits in the strip
-  if (!(opener instanceof HTMLElement) || strip == null) return opener;
-  if (opener.hasAttribute("data-activity-overflow-chip")) {
-    // mutation-equivalent: the sheet opens on a panel, so one is set by the time it closes
-    if (overflow.length > 0 || panel === null) return opener;
-    return strip.querySelector(`[data-activity-chip][data-activity-id="${panel}"]`);
-  }
-  if (!overflow.includes(opener.dataset.activityId as ChatActivityId)) return opener;
-  return strip.querySelector("[data-activity-overflow-chip]");
+): void {
+  const previousRef = useRef(overflow);
+  useLayoutEffect(() => {
+    const previous = previousRef.current;
+    previousRef.current = overflow;
+    const line = rootRef.current;
+    const focused = document.activeElement;
+    if (!line?.contains(focused)) return;
+    // mutation-equivalent: without `?? null`, the heir lookup finds the "+N" chip, a candidate already
+    const target = shownFocusTarget(focused, previous.at(0) ?? null, overflow, line);
+    if (target !== focused) target?.focus();
+  }, [rootRef, overflow]);
+}
+
+/**
+ * Where focus on `element` goes: `element` itself, unless it is a chip the line no longer shows,
+ * which cannot take focus. The line hides the chips it has no room for (Stop or a status label
+ * can take room) and the "+N" chip once every chip fits again, and a chip leaves with its
+ * activity (the last bash exits). Then the first the line shows of: the "+N" chip, which stands
+ * in for a hidden chip; `heir`, the chip that takes over from a hidden "+N" chip; any chip.
+ */
+function shownFocusTarget(
+  element: Element | null,
+  heir: ChatActivityPanelId | null,
+  overflow: readonly ChatActivityId[],
+  line: HTMLElement | null
+): HTMLElement | null {
+  const shown = (candidate: Element | null | undefined): candidate is HTMLElement =>
+    candidate instanceof HTMLElement &&
+    candidate.isConnected &&
+    (candidate.hasAttribute("data-activity-overflow-chip")
+      ? overflow.length > 0
+      : !overflow.includes(candidate.dataset.activityId as ChatActivityId));
+  const chips = [...(line?.querySelectorAll<HTMLElement>(LINE_CHIPS) ?? [])];
+  const candidates = [
+    element,
+    chips.find((chip) => chip.hasAttribute("data-activity-overflow-chip")),
+    chips.find((chip) => chip.dataset.activityId === heir),
+    ...chips,
+  ];
+  return candidates.find(shown) ?? null;
 }
 
 /**

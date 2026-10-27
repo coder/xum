@@ -62,8 +62,9 @@ function useSheetFocus(
  * sheet from their chips, so their React events bubble to the chips and never reach a React
  * handler here. It runs after those handlers, so a panel that handles Escape itself (by
  * preventing default or stopping it) keeps it, and it stops Escape before the window's stream
- * interrupt sees it. Escape from <body> reaches the open panel's chip instead
- * (useCloseChatActivityPanelOnBodyEscape).
+ * interrupt sees it. Escape from <body> closes it too: focus lands there when it leaves the sheet
+ * (Tab past its last control, a focused row that leaves), and the page behind is inert. A layer
+ * opened over the sheet (bash output) keeps its own Escape.
  */
 function useSheetEscape(
   open: boolean,
@@ -79,8 +80,15 @@ function useSheetEscape(
       stopKeyboardPropagation(event);
       close();
     };
+    const onBodyKeyDown = (event: KeyboardEvent) => {
+      if (event.target === document.body) onKeyDown(event);
+    };
     root.addEventListener("keydown", onKeyDown);
-    return () => root.removeEventListener("keydown", onKeyDown);
+    document.body.addEventListener("keydown", onBodyKeyDown);
+    return () => {
+      root.removeEventListener("keydown", onKeyDown);
+      document.body.removeEventListener("keydown", onBodyKeyDown);
+    };
   }, [open, rootRef, close]);
 }
 

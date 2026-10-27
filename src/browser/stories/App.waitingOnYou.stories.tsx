@@ -238,6 +238,27 @@ async function findSummary(dock: HTMLElement): Promise<HTMLElement> {
   );
 }
 
+/**
+ * The queued message's dispatch menu opens in full view in the sheet. The sheet scrolls, and a
+ * menu above the row of a short message would run off the sheet's top, where no scroll reaches.
+ */
+async function assertDispatchMenuInReach(sheet: HTMLElement) {
+  const status = sheet.querySelector<HTMLElement>('[data-component="QueuedMessageStatus"]');
+  if (status === null) throw new Error("No queued message status in the sheet");
+  await userEvent.click(status);
+  const menu = await within(sheet).findByRole("menu");
+  for (const item of within(menu).getAllByRole("menuitem")) {
+    const box = item.getBoundingClientRect();
+    // Both edges: a menu cut off at the sheet's top can still show the middle of its first choice.
+    for (const y of [box.top + 1, box.bottom - 1]) {
+      const hit = document.elementFromPoint(box.left + box.width / 2, y);
+      await expect(hit?.closest('[role="menuitem"]')).toBe(item);
+    }
+  }
+  await userEvent.click(status);
+  await waitFor(() => expect(within(sheet).queryByRole("menu")).toBeNull());
+}
+
 // The sheet opens by matchMedia, so the test-runner needs a real phone viewport
 // (.storybook/test-runner.ts), like the live line's phone story.
 export const Phone: AppStory = {
@@ -263,6 +284,7 @@ export const Phone: AppStory = {
     await expect(within(sheet).getByText("Then rerun the flaky shard.")).toBeVisible();
     await userEvent.click(within(others).getByRole("button", { name: /Queued/ }));
     await expect(within(sheet).getByText(QUEUED_TEXT)).toBeVisible();
+    await assertDispatchMenuInReach(sheet);
 
     await userEvent.keyboard("{Escape}");
     await waitFor(() =>

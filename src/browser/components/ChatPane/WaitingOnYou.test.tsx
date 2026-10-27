@@ -7,6 +7,7 @@ import { installDom, stubNarrowViewport } from "../../../../tests/ui/dom";
 import { ChatDockSurface } from "./chatDockColumn";
 import {
   arrangeWaiting,
+  useInWaitingOnYouSheet,
   useWaitingOnYou,
   WaitingOnYouCard,
   WaitingOnYouProvider,
@@ -44,9 +45,10 @@ const QUEUED: WaitingOnYouEntry = {
 /** Content with state of its own, to tell a moved item from a remounted one. */
 function Counter(props: { label: string }) {
   const [count, setCount] = useState(0);
+  const inSheet = useInWaitingOnYouSheet();
   return (
     <ChatDockSurface>
-      <button type="button" onClick={() => setCount((value) => value + 1)}>
+      <button type="button" data-in-sheet={inSheet} onClick={() => setCount((value) => value + 1)}>
         {`${props.label} ${count}`}
       </button>
     </ChatDockSurface>
@@ -336,6 +338,34 @@ describe("Waiting on you", () => {
         fireEvent.keyDown(sheet, { key: "Escape" });
       });
       expect(view.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull();
+    });
+
+    // The queued message's menu opens downward there: the sheet scrolls, and clips upward.
+    it("tells the item the open sheet shows, and only it, that it is in the sheet", () => {
+      const view = render(<Stack question unsent />);
+      const question = view.getByRole("button", { name: "question 0", hidden: true });
+      const unsent = view.getByRole("button", { name: "unsent 0", hidden: true });
+      expect(question.dataset.inSheet).toBe("false");
+
+      fireEvent.click(view.getByRole("button", { name: /Which reviewers\?/ }));
+      expect(question.dataset.inSheet).toBe("true");
+      expect(unsent.dataset.inSheet).toBe("false");
+    });
+
+    it("closes on Escape from the page once focus left the sheet", () => {
+      const view = render(<Stack question unsent />);
+      const summary = view.getByRole("button", { name: /Which reviewers\?/ });
+      summary.focus();
+      fireEvent.click(summary);
+      view.getByRole("dialog", { name: /Waiting on you/ });
+      // Tab past the sheet's last control: the page behind is inert, so focus lands on <body>.
+      document.body.focus();
+
+      act(() => {
+        fireEvent.keyDown(document.body, { key: "Escape" });
+      });
+      expect(view.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull();
+      expect(document.activeElement).toBe(summary);
     });
 
     it("keeps focus in the open sheet when the item on show leaves", () => {
