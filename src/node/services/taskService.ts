@@ -344,6 +344,7 @@ import {
   type TerminalAttentionNotification,
   type TerminalAttentionOutcome,
 } from "@/node/services/terminalAttentionStore";
+import { WorkflowRunAttention } from "@/node/services/workflowRunAttention";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
 import type { AgentWorkflowRunStrictPin } from "@/node/services/agentWorkflowRunReferences";
 import { normalizeWorkflowAgentReportPayloadForHostSchema } from "@/common/utils/tools/workflowReportPayload";
@@ -1970,16 +1971,8 @@ export class TaskService implements AgentTaskIntegration {
   // the whole map, so each report can cut at most one busy turn, and only the turn that was live
   // at its delivery (see cutBusyOwnerTurnForSubagentAttention).
   private readonly freshSubagentAttentionTurnByOwner = new Map<string, Map<string, symbol>>();
-  // Terminal settlements of the same run must not overlap: settlement is multi-step (stable
-  // refresh, generation marker, post-write mismatch delete), so an older generation reaching
-  // its mismatch delete after a newer settlement's stable refresh would remove the newer
-  // generation's valid marker and let a downgraded build re-deliver a consumed result.
-  private readonly workflowRunSettlementByRun = new Map<string, Promise<void>>();
-  // Owed workflow terminal wakes (owner -> runIds believed terminal and not yet settled). An
-  // in-memory work queue over durable state, not a delivery record: entries are (re)derived
-  // from run records + settled markers at startup and on the periodic sweep and added by live
-  // terminal callbacks, so losing the map merely delays a wake until the next sweep.
-  private readonly pendingWorkflowRunAttention = new Map<string, Set<string>>();
+  // Owed workflow terminal wakes and the per-run settlement chain (see WorkflowRunAttention).
+  private readonly workflowRunAttention: WorkflowRunAttention;
   // Owner -> wake-group key -> epoch ms before which the drain skips selecting the group. A
   // group whose send was rejected for group-specific reasons (for example an unresolvable
   // strictly pinned agent) would otherwise be re-selected newest-first by every drain and
@@ -4836,6 +4829,10 @@ export class TaskService implements AgentTaskIntegration {
         (this.parkedPeerSendsByTarget.get(targetId)?.length ?? 0),
     });
     this.terminalAttentionStore = terminalAttentionStore ?? new TerminalAttentionStore(config);
+    this.workflowRunAttention = new WorkflowRunAttention({
+      sessionsDir: () => this.config.sessionsDir,
+      terminalAttentionStore: () => this.terminalAttentionStore,
+    });
     this.gitPatchArtifactService = new GitPatchArtifactService(config, historyService.locks);
 
     this.aiService.on("stream-end", (payload: unknown) => {
@@ -12264,7 +12261,7 @@ export class TaskService implements AgentTaskIntegration {
               continue;
             }
           }
-          if (this.queueWorkflowRunAttention(workspace.id, run.id)) {
+          if (this.workflowRunAttention.queueWorkflowRunAttention(workspace.id, run.id)) {
             queuedCount += 1;
           }
           queuedForWorkspace = true;
@@ -12303,7 +12300,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!isTerminalWorkflowRunStatus(params.status)) {
       return;
     }
-    this.queueWorkflowRunAttention(params.ownerWorkspaceId, params.runId);
+    this.workflowRunAttention.queueWorkflowRunAttention(params.ownerWorkspaceId, params.runId);
     this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
   }
 
@@ -12323,20 +12320,6 @@ export class TaskService implements AgentTaskIntegration {
     return ownerWorkspaceIds.length;
   }
 
-  /** Returns true when the run was newly queued for this owner. */
-  private queueWorkflowRunAttention(ownerWorkspaceId: string, runId: string): boolean {
-    let runIds = this.pendingWorkflowRunAttention.get(ownerWorkspaceId);
-    if (runIds == null) {
-      runIds = new Set();
-      this.pendingWorkflowRunAttention.set(ownerWorkspaceId, runIds);
-    }
-    if (runIds.has(runId)) {
-      return false;
-    }
-    runIds.add(runId);
-    return true;
-  }
-
   /**
    * Tool-path access to the invocation-boundary snapshot recorded into the
    * agent-workflow-runs sidecar (see recordBackgroundWorkflowRunReference).
@@ -12348,13 +12331,7 @@ export class TaskService implements AgentTaskIntegration {
     return this.workspaceService.getWorkflowInvocationBoundaryMessageId(workspaceId, runId);
   }
 
-  /**
-   * Durable "this terminal generation needs no further wake" marker, keyed by the run's
-   * terminal updatedAt: a later resume produces a new generation and thereby re-arms
-   * attention without any reset bookkeeping. Write-once and best-effort by design: if the
-   * write fails or never happens, the next drain evaluation re-derives the same answer from
-   * run + history evidence and merely re-attempts the marker.
-   */
+  /** See WorkflowRunAttention.markWorkflowRunTerminalAttentionSettled. */
   async markWorkflowRunTerminalAttentionSettled(params: {
     ownerWorkspaceId: string;
     runId: string;
@@ -12362,148 +12339,15 @@ export class TaskService implements AgentTaskIntegration {
     runUpdatedAt: string;
     settledAs: "delivered" | "superseded";
   }): Promise<void> {
-    assert(
-      params.ownerWorkspaceId.length > 0,
-      "markWorkflowRunTerminalAttentionSettled requires ownerWorkspaceId"
-    );
-    assert(params.runId.length > 0, "markWorkflowRunTerminalAttentionSettled requires runId");
-    if (!isTerminalWorkflowRunStatus(params.status)) {
-      return;
-    }
-    const key = `${params.ownerWorkspaceId}\u0000${params.runId}`;
-    const previous = this.workflowRunSettlementByRun.get(key) ?? Promise.resolve();
-    const run = previous
-      .catch(() => undefined)
-      .then(() => this.settleWorkflowRunTerminalAttention(params));
-    const tracked = run
-      .then(
-        () => undefined,
-        () => undefined
-      )
-      .finally(() => {
-        if (this.workflowRunSettlementByRun.get(key) === tracked) {
-          this.workflowRunSettlementByRun.delete(key);
-        }
-      });
-    this.workflowRunSettlementByRun.set(key, tracked);
-    return await run;
+    return await this.workflowRunAttention.markWorkflowRunTerminalAttentionSettled(params);
   }
 
-  private async settleWorkflowRunTerminalAttention(params: {
-    ownerWorkspaceId: string;
-    runId: string;
-    status: WorkflowRunStatus;
-    runUpdatedAt: string;
-    settledAs: "delivered" | "superseded";
-  }): Promise<void> {
-    try {
-      // Downgrade compatibility: the previous build dedupes its startup re-derivation on the
-      // stable un-suffixed workflow_run id, so settling only the generation marker would let
-      // a downgraded build re-create a pending wake for a result the user already consumed.
-      // Stable-first ordering keeps the generation marker (this build's authority) retryable:
-      // if either write fails, the queue entry survives and the next drain re-settles both.
-      // The refresh (not write-once) matters: a stale previous-generation stable marker can
-      // survive its best-effort restart-time clear, and a downgraded build would read it as
-      // consumption of THIS generation's result. The recorded generation also gives the
-      // sweep's upgrade fallback exact evidence immune to wall-clock corrections.
-      await this.terminalAttentionStore.recordSettled(
-        {
-          ownerWorkspaceId: params.ownerWorkspaceId,
-          sourceKind: "workflow_run",
-          sourceId: params.runId,
-          generationId: params.runUpdatedAt,
-          terminalOutcome: terminalAttentionOutcome(params.status),
-          status: params.settledAs,
-        },
-        { wholeSourceRefresh: true }
-      );
-      await this.terminalAttentionStore.recordSettled({
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        sourceKind: "workflow_run",
-        sourceId: params.runId,
-        generationId: params.runUpdatedAt,
-        terminalOutcome: terminalAttentionOutcome(params.status),
-        status: params.settledAs,
-      });
-    } catch (error: unknown) {
-      // Contain marker I/O here so no caller fails on bookkeeping: workflow_resume and
-      // task_await must still return the run's durable result, and the drain must move on to
-      // its other candidates. Keep the queue entry so the next drain re-evaluates from run +
-      // history evidence and re-attempts the marker; at worst a truthful wake re-delivers.
-      log.warn("Failed to record workflow terminal settlement marker", {
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        runId: params.runId,
-        settledAs: params.settledAs,
-        error,
-      });
-      return;
-    }
-    // Post-write revalidation: a wake-turn workflow_resume can restart the run while this
-    // settlement's snapshot was in flight, so the restart-time stable clear can land BEFORE
-    // the stable write above re-creates the marker. That marker postdates the newer
-    // generation's updatedAt, so the sweep's upgrade fallback (and a downgraded build's
-    // whole-run dedupe) would permanently suppress the newer result, and the by-run-id queue
-    // delete below would drop its owed wake. Reading the run AFTER the writes closes the
-    // write-side race: any restart after this read re-clears the stable marker itself and
-    // its terminal callback re-queues behind this deletion.
-    let currentRunUpdatedAt: string | null;
-    try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, params.ownerWorkspaceId),
-      });
-      currentRunUpdatedAt = (await runStore.getRun(params.runId)).updatedAt;
-    } catch {
-      currentRunUpdatedAt = null;
-    }
-    if (currentRunUpdatedAt !== params.runUpdatedAt) {
-      // The settled snapshot is no longer the run's newest generation (or the run is
-      // unreadable): the stable whole-run marker must not outlive the snapshot. The
-      // generation marker stays; it truthfully settles only this snapshot.
-      await this.clearWorkflowRunDowngradeSettlement({
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        runId: params.runId,
-      });
-      if (currentRunUpdatedAt != null) {
-        // The queue entry now represents the newer generation's owed wake: leave it for the
-        // drain the terminal callback scheduled (the sweep backstops a lost poke).
-        return;
-      }
-      // Unreadable run: fall through to the delete. With no stable marker surviving, the
-      // sweep re-derives any owed newer generation from durable state.
-    }
-    this.pendingWorkflowRunAttention.get(params.ownerWorkspaceId)?.delete(params.runId);
-  }
-
-  /**
-   * Downgrade-compat bookkeeping only: settlement dual-writes a stable un-suffixed marker for
-   * the previous build's whole-run dedupe (see markWorkflowRunTerminalAttentionSettled), and a
-   * restarted run invalidates it. Without this delete, downgrading after a resume would leave
-   * the old build refusing to enqueue the run's newer result behind the stale stable marker.
-   * This build reads the stable marker only as recency-gated upgrade evidence behind
-   * generation markers (see sweepWorkflowRunTerminalAttention), so the delete stays
-   * best-effort and must never fail the status transition.
-   */
+  /** See WorkflowRunAttention.clearWorkflowRunDowngradeSettlement. */
   async clearWorkflowRunDowngradeSettlement(params: {
     ownerWorkspaceId: string;
     runId: string;
   }): Promise<void> {
-    assert(
-      params.ownerWorkspaceId.length > 0,
-      "clearWorkflowRunDowngradeSettlement requires ownerWorkspaceId"
-    );
-    assert(params.runId.length > 0, "clearWorkflowRunDowngradeSettlement requires runId");
-    try {
-      await this.terminalAttentionStore.delete(
-        params.ownerWorkspaceId,
-        TerminalAttentionStore.notificationId("workflow_run", params.runId)
-      );
-    } catch (error: unknown) {
-      log.warn("Failed to clear stale workflow downgrade settlement marker", {
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        runId: params.runId,
-        error,
-      });
-    }
+    return await this.workflowRunAttention.clearWorkflowRunDowngradeSettlement(params);
   }
 
   private async suppressTerminalAttention(params: {
@@ -13352,9 +13196,7 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
     let pending = allPending.filter((notification) => notification.sourceKind !== "workflow_run");
-    const queuedWorkflowRunIds = Array.from(
-      this.pendingWorkflowRunAttention.get(ownerWorkspaceId) ?? []
-    );
+    const queuedWorkflowRunIds = this.workflowRunAttention.queuedRunIds(ownerWorkspaceId);
     if (pending.length === 0 && queuedWorkflowRunIds.length === 0) {
       return;
     }
@@ -13364,7 +13206,7 @@ export class TaskService implements AgentTaskIntegration {
     if (entry == null) {
       // Owner workspace no longer exists: the terminal artifacts remain retrievable elsewhere.
       // Queue only, no markers: a settled-marker write would recreate the deleted session dir.
-      this.pendingWorkflowRunAttention.delete(ownerWorkspaceId);
+      this.workflowRunAttention.dropOwner(ownerWorkspaceId);
       for (const notification of pending) {
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
       }
@@ -13374,7 +13216,7 @@ export class TaskService implements AgentTaskIntegration {
     if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
       // Workflow wakes stay unsettled while archived: the sweep skips archived workspaces, so
       // dropping the queue parks them until an unarchive-time sweep re-derives the entries.
-      this.pendingWorkflowRunAttention.delete(ownerWorkspaceId);
+      this.workflowRunAttention.dropOwner(ownerWorkspaceId);
       for (const notification of pending) {
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
       }
@@ -13483,7 +13325,7 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
       if (workflowPrompt.outcome === "drop") {
-        this.pendingWorkflowRunAttention.get(ownerWorkspaceId)?.delete(runId);
+        this.workflowRunAttention.dropRun(ownerWorkspaceId, runId);
         continue;
       }
       if (workflowPrompt.outcome === "settle") {
