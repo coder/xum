@@ -37,7 +37,6 @@
                 "pages": ["config/models", "config/providers"]
               },
               "getting-started/why-parallelize",
-              "getting-started/mux-gateway",
               "reference/cli"
             ]
           },
@@ -154,8 +153,6 @@
   },
   "redirects": [
     { "source": "/why-parallelize", "destination": "/getting-started/why-parallelize" },
-    { "source": "/mux-codes", "destination": "/getting-started/mux-gateway" },
-    { "source": "/getting-started/mux-codes", "destination": "/getting-started/mux-gateway" },
     { "source": "/workspaces/muxignore", "destination": "/workspaces/xumignore" },
     { "source": "/fork", "destination": "/workspaces/fork" },
     { "source": "/init-hooks", "destination": "/hooks/init" },

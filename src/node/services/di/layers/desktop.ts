@@ -107,7 +107,6 @@ import {
   MemoryConsolidation,
   MemoryMeta,
   MenuEvent,
-  MuxGatewayOauth,
   Project,
   Provider,
   ProvidersConfigStoreTag,
@@ -156,7 +155,6 @@ import { IdleCompactionService } from "@/node/services/idleCompactionService";
 import { InstructionsService } from "@/node/services/instructionsService";
 import { McpOauthService } from "@/node/services/mcpOauthService";
 import { MenuEventService } from "@/node/services/menuEventService";
-import { MuxGatewayOauthService } from "@/node/services/muxGatewayOauthService";
 import { ProjectService } from "@/node/services/projectService";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import { PTYService } from "@/node/services/ptyService";
@@ -168,6 +166,7 @@ import { SshPromptService } from "@/node/services/sshPromptService";
 import { TelemetryService } from "@/node/services/telemetryService";
 import { TerminalService } from "@/node/services/terminalService";
 import { TimelineService } from "@/node/services/timelineService";
+import { StatusPageAgentService } from "@/node/services/statusPageAgentService";
 import { TokenizerService } from "@/node/services/tokenizerService";
 import { UpdateService } from "@/node/services/updateService";
 import { VoiceService } from "@/node/services/voiceService";
@@ -385,14 +384,12 @@ export const MiscDesktopLive: Layer.Layer<
   | ConfigTag
   | SecretsStoreTag
   | ProvidersConfigStoreTag
-  | Provider
   | MCPConfig
   | MCPServerManagerTag
   | WorkspaceMcpOverrides
 > = Layer.effectContext(
   Effect.gen(function* () {
     const config = yield* ConfigTag;
-    const providerService = yield* Provider;
     const providersConfigStore = yield* ProvidersConfigStoreTag;
     const workflowRuntimeFactory = new QuickJSRuntimeFactory();
     const sshPromptService = new SshPromptService();
@@ -415,7 +412,7 @@ export const MiscDesktopLive: Layer.Layer<
     const updateService = new UpdateService(config);
     const serverService = new ServerService();
     const menuEventService = new MenuEventService();
-    const voiceService = new VoiceService(config, providerService, providersConfigStore);
+    const voiceService = new VoiceService(config, providersConfigStore);
     const serverAuthService = new ServerAuthService(config);
     const workspaceLifecycleHooks = new WorkspaceLifecycleHooks();
     const worktreeArchiveSnapshotService = new WorktreeArchiveSnapshotService(config);
@@ -461,11 +458,6 @@ export const OauthLive: Layer.Layer<
       windowService,
       yield* Telemetry
     );
-    const muxGatewayOauthService = new MuxGatewayOauthService(
-      providersConfigStore,
-      providerService,
-      windowService
-    );
     const codexOauthService = new CodexOauthService(
       providersConfigStore,
       providerService,
@@ -480,7 +472,6 @@ export const OauthLive: Layer.Layer<
     const copilotOauthService = new CopilotOauthService(providerService, windowService);
     return Context.empty().pipe(
       Context.add(McpOauth, mcpOauthService),
-      Context.add(MuxGatewayOauth, muxGatewayOauthService),
       Context.add(CodexOauth, codexOauthService),
       Context.add(CoderOauth, coderOauthService),
       Context.add(CopilotOauth, copilotOauthService)
@@ -740,6 +731,23 @@ export const DesktopWiringLive: Layer.Layer<
     workspaceService.setOnTodosChanged((workspaceId) =>
       goalStatusBoard.handleTodosChanged(workspaceId)
     );
+    // Status page agent (artifacts-status-page-agent): status_update queues the main agent's
+    // updates and a host-run headless agent applies them to status.html in the background.
+    const statusPageAgent = new StatusPageAgentService({
+      config,
+      isExperimentEnabled: (experimentId) => experimentsService.isExperimentEnabled(experimentId),
+      getWorkspaceMetadata: (workspaceId) => workspaceService.getInfo(workspaceId),
+      // Archiving stops a dedicated Coder workspace; a late page write would restart it.
+      isWorkspaceRemoving: (workspaceId) =>
+        workspaceService.isRemoving(workspaceId) || workspaceService.isArchiving(workspaceId),
+      modelFactory: aiService,
+      sessionUsageService: yield* SessionUsage,
+      requestAnalyticsIngest: (workspaceId) => {
+        workspaceService.emit("analyticsIngest", { workspaceId });
+      },
+    });
+    turnRequestBuilderBindings.statusPageAgent = statusPageAgent;
+    workspaceService.setStatusPageAgentCanceller(statusPageAgent);
     turnRequestBuilderBindings.timelineService = timelineService;
     timelineService.subscribeToWorkspace(workspaceService);
 

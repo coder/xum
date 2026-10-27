@@ -498,6 +498,11 @@ export const KEYBINDS = {
   // macOS: Cmd+P, Win/Linux: Ctrl+P
   TOGGLE_SIDEBAR: { key: "P", ctrl: true },
 
+  /** Collapse or expand the right sidebar */
+  // VS Code uses this letter for its sidebars. "command": on macOS only Cmd matches, so the
+  // Ctrl form of the chord stays free.
+  TOGGLE_RIGHT_SIDEBAR: { key: "B", ctrl: true, shift: true, macCtrlBehavior: "command" },
+
   /** Cycle through configured models */
   CYCLE_MODEL: { key: "/", ctrl: true },
 
@@ -601,8 +606,11 @@ export const KEYBINDS = {
   /** Show the Stats tab full-screen on small viewports, where the right sidebar is hidden */
   OPEN_STATS_DIALOG: { key: "s", shift: true },
 
-  /** Open (or focus) the Artifacts tab in the right sidebar */
+  /** Open or focus the Artifacts tab in the right sidebar, or collapse the sidebar when focus is in it */
   OPEN_ARTIFACTS_TAB: { key: "K", ctrl: true, shift: true },
+
+  /** Agent interface view: switch the main pane between the agent's status page and the chat */
+  TOGGLE_AGENT_INTERFACE_VIEW: { key: "S", ctrl: true, shift: true },
 
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.

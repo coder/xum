@@ -30,6 +30,7 @@ import type {
   WorkspaceForkResult,
   EnsureReadyResult,
   ReadFileOptions,
+  RuntimeLocation,
 } from "./Runtime";
 import { RuntimeError, isRuntimeTransportError } from "./Runtime";
 import { LEGACY_REMOTE_MUX_HOME } from "@/common/compat/legacyMux";
@@ -83,6 +84,12 @@ export interface SpawnResult {
  * Abstract base class for remote execution runtimes.
  */
 export abstract class RemoteRuntime implements Runtime {
+  /** Runtime.location. A prototype getter, so subclasses and Object.create doubles inherit it. */
+  // eslint-disable-next-line @typescript-eslint/class-literal-property-style -- a readonly field is set by the constructor, so Object.create(X.prototype) doubles (mcpServerManager.test.ts) would read undefined
+  get location(): RuntimeLocation {
+    return "remote";
+  }
+
   /** Remote stops started by aborts and not finished yet (#6923). */
   private readonly pendingStops = new PendingStops();
 
@@ -121,6 +128,15 @@ export abstract class RemoteRuntime implements Runtime {
    * Command prefix (e.g., "SSH" or "Docker") for logging.
    */
   protected abstract readonly commandPrefix: string;
+
+  /**
+   * #6426: a key for the host or container that holds this runtime's files, from its config only
+   * (no exec). Caches of remote checkout content key on it. Undefined: no stable identity, so such
+   * caches are not used.
+   */
+  getAgentHostKey(): string | undefined {
+    return undefined;
+  }
 
   /**
    * Execute command with streaming I/O.
@@ -369,33 +385,36 @@ export abstract class RemoteRuntime implements Runtime {
       },
       close: async () => {
         const nodeStdin = childProcess.stdin;
+        // A destroyed or ended stdin emits no further 'finish', so waiting would hang.
         if (!nodeStdin || nodeStdin.destroyed || nodeStdin.writableEnded) {
           return;
         }
 
         await new Promise<void>((resolve) => {
-          const onError = () => {
-            cleanup();
-            resolve();
-          };
-
-          const onFinish = () => {
+          const settle = () => {
             cleanup();
             resolve();
           };
 
           const cleanup = () => {
-            nodeStdin.removeListener("error", onError);
-            nodeStdin.removeListener("finish", onFinish);
+            nodeStdin.removeListener("error", settle);
+            nodeStdin.removeListener("finish", settle);
+            nodeStdin.removeListener("close", settle);
           };
 
-          nodeStdin.once("error", onError);
-          nodeStdin.once("finish", onFinish);
+          // Node destroys a child's stdin when the child exits. If end() is still
+          // flushing then, only 'close' fires: no 'finish' and no 'error'. Without
+          // the 'close' listener, close() never settled and execBuffered hung the
+          // caller, so a send on an SSH, Docker or devcontainer workspace could
+          // hang with no error (#7436).
+          nodeStdin.once("error", settle);
+          nodeStdin.once("finish", settle);
+          nodeStdin.once("close", settle);
 
           try {
             nodeStdin.end();
           } catch {
-            onError();
+            settle();
           }
         });
       },

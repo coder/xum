@@ -22,6 +22,8 @@ import { applyToolPolicyAndExperiments } from "./toolAssembly";
 import { applyToolPolicy, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { Tool } from "ai";
 import { z } from "zod";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 
 const PARENT_WORKSPACE_ID = "parent-workspace";
 const CHILD_WORKSPACE_ID = "child-workspace";
@@ -89,6 +91,7 @@ describe("resolveAgentForStream transport failures (#4438)", () => {
     );
     try {
       return await resolveAgentForStream({
+        runtimeFactory: nodeRuntimeFactory,
         workspaceId: CHILD_WORKSPACE_ID,
         metadata,
         runtime: new LocalRuntime(projectPath),
@@ -151,6 +154,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(projectPath),
@@ -217,6 +221,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(childPath),
@@ -234,6 +239,74 @@ describe("resolveAgentForStream agent identity", () => {
     expect(result.data.effectiveAgentId).toBe(customAgentId);
     expect(result.data.agentIsPlanLike).toBe(true);
     expect(result.data.effectiveMode).toBe("plan");
+  });
+
+  test("builds the parent's discovery runtime through the RuntimeFactory it was given", async () => {
+    using tempDir = new DisposableTempDir("agent-resolution-parent-factory");
+    const projectPath = path.join(tempDir.path, "project");
+    const parentPath = path.join(projectPath, "parent");
+    const childPath = path.join(projectPath, "child");
+    const customAgentId = "factory-reviewer";
+    await fs.mkdir(path.join(parentPath, ".mux", "agents"), { recursive: true });
+    await fs.mkdir(childPath, { recursive: true });
+    await fs.writeFile(
+      path.join(parentPath, ".mux", "agents", `${customAgentId}.md`),
+      ["---", "name: Factory Reviewer", "subagent:", "  runnable: true", "---", "Body.", ""].join(
+        "\n"
+      )
+    );
+    // The config points the parent at a folder that does not exist: only the factory's
+    // context reaches the parent checkout.
+    const cfg: ProjectsConfig = {
+      projects: new Map([
+        [
+          projectPath,
+          {
+            trusted: true,
+            workspaces: [
+              {
+                id: PARENT_WORKSPACE_ID,
+                name: PARENT_WORKSPACE_ID,
+                path: path.join(projectPath, "missing"),
+              },
+              {
+                id: CHILD_WORKSPACE_ID,
+                name: CHILD_WORKSPACE_ID,
+                path: childPath,
+                parentWorkspaceId: PARENT_WORKSPACE_ID,
+                agentId: "",
+                agentType: customAgentId,
+              },
+            ],
+          },
+        ],
+      ]),
+    };
+    const runtimeFactory: RuntimeFactory = {
+      ...nodeRuntimeFactory,
+      createRuntimeContextForWorkspace: () => ({
+        runtime: new LocalRuntime(parentPath),
+        workspacePath: parentPath,
+      }),
+    };
+
+    const result = await resolveAgentForStream({
+      runtimeFactory,
+      workspaceId: CHILD_WORKSPACE_ID,
+      metadata: createSubagentMetadata({ projectPath, agentId: "", agentType: customAgentId }),
+      runtime: new LocalRuntime(childPath),
+      workspacePath: childPath,
+      requestedAgentId: "exec",
+      disableWorkspaceAgents: false,
+      callerToolPolicy: undefined,
+      cfg,
+      emitError: () => undefined,
+    });
+
+    expect(result.success).toBe(true);
+    if (!result.success) return;
+    expect(result.data.agentDiscoveryPath).toBe(parentPath);
+    expect(result.data.effectiveAgentId).toBe(customAgentId);
   });
 
   test("tries legacy project agentType before stale built-in agentId fallback", async () => {
@@ -286,6 +359,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(childPath),
@@ -353,6 +427,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(childPath),
@@ -406,6 +481,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(childPath),
@@ -470,6 +546,7 @@ describe("resolveAgentForStream agent identity", () => {
     };
 
     const result = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: CHILD_WORKSPACE_ID,
       metadata,
       runtime: new LocalRuntime(childPath),
@@ -532,6 +609,7 @@ describe("resolveAgentForStream strict resolution", () => {
       ...(params.agentAiDefaults ? { agentAiDefaults: params.agentAiDefaults } : {}),
     };
     return await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: PARENT_WORKSPACE_ID,
       metadata: createTopLevelMetadata(params.projectPath),
       runtime: new LocalRuntime(params.projectPath),
@@ -866,6 +944,7 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
       runtimeConfig: DEFAULT_RUNTIME_CONFIG,
     };
     const resolved = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: metadata.id,
       metadata,
       runtime,
@@ -893,8 +972,8 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
       modelString: "openai:gpt-5.2",
       cfg: params.cfg,
       providersConfig: null,
-      mcpServers: {},
       agentDefinitionCache: params.cache,
+      runtimeFactory: nodeRuntimeFactory,
     });
     const totalReads = [...runtime.definitionReads.values()].reduce((sum, n) => sum + n, 0);
     return { agent, context, metadata, reads: runtime.definitionReads, totalReads };
@@ -978,8 +1057,12 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
       const again = await runTurn({ projectPath, cfg, cache });
       const repeatRuntime = again.agent.agentDiscoveryRuntime as CountingRuntime;
       const readsAfterTurn = new Map(repeatRuntime.definitionReads);
+      // The cache keys reads by trust (#6426), so repeat the turn's trust value.
+      const projectPluginsTrusted = again.agent.projectPluginsTrusted;
       const repeatedBody = await resolveAgentBody(repeatRuntime, projectPath, "reviewer", {
         cache,
+        projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       await resolveAgentInheritanceChain({
         runtime: repeatRuntime,
@@ -988,6 +1071,8 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
         agentDefinition: again.agent.agentDefinition,
         workspaceId: again.metadata.id,
         cache,
+        projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       expect(repeatedBody).toBe(again.context.agentSystemPromptSections[0]);
       expect(repeatRuntime.definitionReads).toEqual(readsAfterTurn);
@@ -1025,16 +1110,25 @@ describe("resolveAgentForStream per-request agent definition cache", () => {
     const runtime = new LocalRuntime(projectPath);
     const cache = new AgentDefinitionRequestCache();
 
-    const override = await readAgentDefinition(runtime, projectPath, "exec", { cache });
+    const override = await readAgentDefinition(runtime, projectPath, "exec", {
+      cache,
+      runtimeFactory: nodeRuntimeFactory,
+    });
     const base = await readAgentDefinition(runtime, projectPath, "exec", {
       cache,
       skipScopesAbove: "project",
+      runtimeFactory: nodeRuntimeFactory,
     });
 
     expect(override.scope).toBe("project");
     expect(base.scope).not.toBe("project");
     // Repeated lookups in the same request return the memoized winner.
-    expect(await readAgentDefinition(runtime, projectPath, "exec", { cache })).toBe(override);
+    expect(
+      await readAgentDefinition(runtime, projectPath, "exec", {
+        cache,
+        runtimeFactory: nodeRuntimeFactory,
+      })
+    ).toBe(override);
   });
 });
 
@@ -1096,6 +1190,7 @@ describe("resolveAgentForStream caller tool policy keeps the advertised tool set
           runtimeConfig: DEFAULT_RUNTIME_CONFIG,
         };
     const resolved = await resolveAgentForStream({
+      runtimeFactory: nodeRuntimeFactory,
       workspaceId: metadata.id,
       metadata,
       runtime: new LocalRuntime(params.projectPath),

@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { installDom } from "../../../../../tests/ui/dom";
+import { installDom, stubNarrowViewport } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getReviewStateStore } from "@/browser/stores/ReviewStateStore";
@@ -26,6 +26,12 @@ import {
   ARTIFACTS_SELECTION_KEY,
   ARTIFACTS_SELECTION_MAX_WORKSPACES,
 } from "@/common/constants/storage";
+import { PinnedViewToggleBarSpacer } from "@/browser/components/SidebarCollapseButton/SidebarCollapseButton";
+import {
+  NoToolbarSpacer,
+  PinnedViewToolbarSpacerContext,
+  RightSidebarOverlayContext,
+} from "@/browser/hooks/usePinnedViewCoversWindow";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { readArtifactSelection, writeArtifactSelection } from "./artifactSelection";
 import { openArtifact } from "./openArtifact";
@@ -230,6 +236,9 @@ describe("ArtifactsPanel", () => {
 
   beforeEach(() => {
     cleanupDom = installDom();
+    // Most tests cover the narrow-window fullscreen, a modal dialog over the whole window. The
+    // wide-window tests stub a wide viewport and wrap the panel in a workspace shell.
+    stubNarrowViewport(true);
     window.localStorage.clear();
     // Desktop mode (the preload bridge isDesktopMode checks).
     window.api = { getIsRosetta: () => Promise.resolve(false) } as unknown as typeof window.api;
@@ -306,7 +315,7 @@ describe("ArtifactsPanel", () => {
     const dialog = await first.findByRole("dialog", { name: "Artifact data.json" });
     expect(pressed(dialog, "raw")).toBe("true");
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(first.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(first.queryByRole("dialog") === null).toBe(true));
     expect(pressed(first.container, "raw")).toBe("true");
 
     // Switching sidebar tabs unmounts the panel.
@@ -361,7 +370,7 @@ describe("ArtifactsPanel", () => {
     const dialog = await first.findByRole("dialog", { name: "Artifact tree.json" });
     toggled(dialog);
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(first.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(first.queryByRole("dialog") === null).toBe(true));
     toggled(first.container);
 
     // Switching sidebar tabs unmounts the panel.
@@ -531,7 +540,7 @@ describe("ArtifactsPanel", () => {
     window.addEventListener("keydown", windowListener);
     fireEvent.keyDown(dialog, { key: "Escape" });
     window.removeEventListener("keydown", windowListener);
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(escapeReachedWindowUnhandled).toBe(false);
     expect(outside.inert).toBe(false);
     expect(view.getByText("alpha")).toBe(viewerNode);
@@ -539,6 +548,101 @@ describe("ArtifactsPanel", () => {
     // Focus returns to the panel, so J/K keep working without another click.
     await waitFor(() => expect(document.activeElement).toBe(panel));
     outside.remove();
+  });
+
+  // A wide window pins fullscreen over the workspace shell only, like immersive review: the left
+  // sidebar beside the shell stays visible and usable, so the panel is a region, not a modal.
+  for (const leftSidebarCollapsed of [false, true]) {
+    test(`wide: fullscreen covers the workspace shell and the left sidebar stays usable (collapsed: ${leftSidebarCollapsed})`, async () => {
+      stubNarrowViewport(false);
+      fake = createFakeArtifactsApi(
+        {
+          available: true,
+          dir: "/scratch/artifacts",
+          entries: [entry("a.txt", 1, "text")],
+          truncated: false,
+        },
+        { "a.txt": textFile("a.txt", "text", "alpha") }
+      );
+      const leftSidebar = document.body.appendChild(document.createElement("button"));
+      const shell = document.body.appendChild(document.createElement("div"));
+      shell.setAttribute("data-workspace-shell", "");
+      const chat = shell.appendChild(document.createElement("button"));
+      // RightSidebar provides the toolbar spacer while the left sidebar is collapsed (the webview
+      // bundles the panel without it).
+      const view = render(
+        <PinnedViewToolbarSpacerContext.Provider
+          value={leftSidebarCollapsed ? PinnedViewToggleBarSpacer : NoToolbarSpacer}
+        >
+          <ArtifactsPanel workspaceId="ws-artifacts" />
+        </PinnedViewToolbarSpacerContext.Provider>,
+        { wrapper: ApiWrapper, container: shell.appendChild(document.createElement("div")) }
+      );
+      const panel = view.getByTestId("artifacts-panel");
+      expect(await view.findByText("alpha")).toBeTruthy();
+
+      fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+      const region = await view.findByRole("region", { name: "Artifact a.txt" });
+      expect(region.getAttribute("aria-modal")).toBeNull();
+      expect([leftSidebar.inert, chat.inert]).toEqual([false, true]);
+      // The collapsed sidebar's toggle bar sits over the toolbar's start: a spacer keeps it clear.
+      expect(region.querySelector(".left-sidebar-toggle-host") != null).toBe(leftSidebarCollapsed);
+
+      fireEvent.keyDown(region, { key: "Escape" });
+      await waitFor(() => expect(view.queryByRole("region") === null).toBe(true));
+      expect(chat.inert).toBe(false);
+      await waitFor(() => expect(document.activeElement).toBe(panel));
+
+      // Escape from a control in the usable left sidebar ends fullscreen too, and is consumed, so
+      // it cannot also reach Escape-to-interrupt (a window listener) behind the panel.
+      fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+      await view.findByRole("region", { name: "Artifact a.txt" });
+      leftSidebar.focus();
+      expect(fireEvent.keyDown(leftSidebar, { key: "Escape" })).toBe(false);
+      await waitFor(() => expect(view.queryByRole("region") === null).toBe(true));
+      expect(chat.inert).toBe(false);
+      leftSidebar.remove();
+      shell.remove();
+    });
+  }
+
+  // A wide window whose workspace shell is too narrow for the docked right sidebar shows it only as
+  // the full-window overlay, which covers the left sidebar and makes it inert: fullscreen inside it
+  // must cover the window too (a workspace-scoped region would claim a usable left sidebar).
+  test("wide window inside the full-window right sidebar overlay: fullscreen covers the window", async () => {
+    stubNarrowViewport(false);
+    fake = createFakeArtifactsApi(
+      {
+        available: true,
+        dir: "/scratch/artifacts",
+        entries: [entry("a.txt", 1, "text")],
+        truncated: false,
+      },
+      { "a.txt": textFile("a.txt", "text", "alpha") }
+    );
+    const leftSidebar = document.body.appendChild(document.createElement("button"));
+    const shell = document.body.appendChild(document.createElement("div"));
+    shell.setAttribute("data-workspace-shell", "");
+    const view = render(
+      <RightSidebarOverlayContext.Provider value={true}>
+        <ArtifactsPanel workspaceId="ws-artifacts" />
+      </RightSidebarOverlayContext.Provider>,
+      { wrapper: ApiWrapper, container: shell.appendChild(document.createElement("div")) }
+    );
+    const panel = view.getByTestId("artifacts-panel");
+    expect(await view.findByText("alpha")).toBeTruthy();
+
+    fireEvent.keyDown(panel, { key: "F", shiftKey: true });
+    const dialog = await view.findByRole("dialog", { name: "Artifact a.txt" });
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(leftSidebar.inert).toBe(true);
+    expect(dialog.style.left).toBe("");
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
+    expect(leftSidebar.inert).toBe(false);
+    leftSidebar.remove();
+    shell.remove();
   });
 
   test("autoFocus takes focus from the chat input so J/K and Shift+F work at once", async () => {
@@ -579,7 +683,7 @@ describe("ArtifactsPanel", () => {
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "F", shiftKey: true });
     expect(await view.findByRole("dialog", { name: "Artifact b.txt" })).toBeTruthy();
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     // Leaving the panel drops the ring.
     act(() => chatInput.focus());
     expect(panel.getAttribute("data-shortcut-focus")).toBeNull();
@@ -704,7 +808,7 @@ describe("ArtifactsPanel", () => {
     // Opening the changed artifact clears its marker.
     fireEvent.keyDown(view.getByTestId("artifacts-panel"), { key: "j" });
     expect(await view.findByText("beta")).toBeTruthy();
-    await waitFor(() => expect(view.queryByLabelText("1 changed")).toBeNull());
+    await waitFor(() => expect(view.queryByLabelText("1 changed") === null).toBe(true));
   });
 
   test("retries a failed preview on the next refresh", async () => {
@@ -1718,7 +1822,7 @@ describe("ArtifactsPanel", () => {
     expect(await within(dialog).findByText("alpha")).toBeTruthy();
 
     fireEvent.keyDown(document.activeElement!, { key: "F", shiftKey: true });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     await waitFor(() => expect(document.activeElement).toBe(panel));
   });
 
@@ -1743,7 +1847,7 @@ describe("ArtifactsPanel", () => {
     await waitFor(() => expect(document.activeElement).toBe(dialog));
 
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(document.activeElement).toBe(button);
     // J/K still reach the panel from the button.
     fireEvent.keyDown(button, { key: "j" });
@@ -2011,14 +2115,16 @@ describe("ArtifactsPanel", () => {
 
     // Keys go to whatever has focus, as a real key press would.
     fireEvent.keyDown(textarea, { key: "Escape" });
-    await waitFor(() => expect(view.queryByTestId("artifact-annotation-popover")).toBeNull());
+    await waitFor(() =>
+      expect(view.queryByTestId("artifact-annotation-popover") === null).toBe(true)
+    );
     expect(document.activeElement).toBe(panel);
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
     expect(view.getByRole("button", { name: "Annotate" }).getAttribute("aria-pressed")).toBe(
       "false"
     );
     fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
   });
 
   // Review: leaving fullscreen from inside the viewer (Escape in an HTML frame arrives over the
@@ -2043,7 +2149,7 @@ describe("ArtifactsPanel", () => {
     act(() => toggle.focus());
 
     fireEvent.keyDown(toggle, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(toggle.isConnected).toBe(true);
     expect(document.activeElement).toBe(panel);
   });
@@ -2083,7 +2189,7 @@ describe("ArtifactsPanel", () => {
 
     await pick();
     fireEvent.click(view.getByRole("button", { name: "Exit fullscreen" }));
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
     expect(view.queryByTestId("artifact-annotation-popover")).toBeNull();
     // Annotate mode itself stays on: only the box, tied to the old layout, goes.
     expect(view.getByRole("button", { name: "Stop annotating" })).toBeTruthy();
@@ -2120,6 +2226,6 @@ describe("ArtifactsPanel", () => {
     expect(view.queryByRole("dialog")).not.toBeNull();
 
     fireEvent.keyDown(dialog, { key: "Escape" });
-    await waitFor(() => expect(view.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(view.queryByRole("dialog") === null).toBe(true));
   });
 });

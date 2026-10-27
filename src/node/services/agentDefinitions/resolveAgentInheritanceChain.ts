@@ -2,6 +2,7 @@ import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
 
 import type { AgentDefinitionPackage, AgentId } from "@/common/types/agentDefinition";
 import { log } from "@/node/services/log";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 
 import {
   agentVisitKey,
@@ -35,6 +36,10 @@ interface ResolveAgentInheritanceChainOptions {
   cache?: AgentDefinitionRequestCache;
   /** Cancels base-definition reads; traversal then rejects instead of issuing further reads. */
   abortSignal?: AbortSignal;
+  /** #6426: bases may come from project plugin agents only in a trusted project. */
+  projectPluginsTrusted?: boolean;
+  /** Builds the host-local runtimes of the base-definition reads (ReadAgentDefinitionOptions). */
+  runtimeFactory: RuntimeFactory;
 }
 
 /**
@@ -94,6 +99,8 @@ export async function resolveAgentInheritanceChain(
       currentDefinition = await readAgentDefinition(runtime, workspacePath, baseId, {
         skipScopesAbove,
         cache: options.cache,
+        projectPluginsTrusted: options.projectPluginsTrusted,
+        runtimeFactory: options.runtimeFactory,
         ...(options.abortSignal != null ? { abortSignal: options.abortSignal } : {}),
       });
     } catch (error) {

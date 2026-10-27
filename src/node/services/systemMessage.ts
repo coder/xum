@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import * as os from "node:os";
 import path from "node:path";
 
 import type { WorkspaceMetadata } from "@/common/types/workspace";
@@ -29,10 +28,12 @@ import {
 } from "@/node/utils/main/markdown";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
-import { getXumHome } from "@/common/constants/paths";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import type { ProjectConfig } from "@/common/types/project";
 import { getAvailableTools } from "@/common/utils/tools/toolDefinitions";
+import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import { getToolAvailabilityOptions } from "@/common/utils/tools/toolAvailability";
 import { assertNever } from "@/common/utils/assertNever";
 import assert from "@/common/utils/assert";
@@ -222,24 +223,69 @@ ${lines.join("\n")}
  * Build MCP servers context XML block.
  * Only included when at least one MCP server is configured.
  * Note: We only expose server names, not commands, to avoid leaking secrets.
+ *
+ * A volatile system section (turnRequestBuilder appends it before the MCP warning): turning
+ * one server off rewrote the cached stable prompt and the whole history after it, in every
+ * busy workspace at once. Its "\n\n" separator goes first, like the other volatile sections.
  */
-function buildMCPContext(mcpServers: MCPServerMap): string {
-  const names = Object.keys(mcpServers);
-  if (names.length === 0) return "";
+export function formatMcpContextSection(mcpServers: MCPServerMap | undefined): string | undefined {
+  const names = Object.keys(mcpServers ?? {});
+  if (names.length === 0) return undefined;
 
   const serverList = names.map((name) => `- ${name}`).join("\n");
 
   return `
+
 <mcp>
 MCP (Model Context Protocol) servers provide additional tools. Configured globally in ~/.xum/mcp.jsonc, with optional repo overrides in ./.xum/mcp.jsonc:
 
 ${serverList}
 
 Manage servers in Settings → MCP.
-</mcp>
-`;
+</mcp>`;
 }
 // #endregion SYSTEM_PROMPT_DOCS
+
+/**
+ * The Agent interface view's guidance. Static text (it names $XUM_SCRATCH_DIR, not the path), so
+ * the cached prompt stays the same across turns and sibling workspaces.
+ */
+function buildAgentInterfaceContext(
+  options: { agentInterfaceView?: boolean; statusPageAgent?: boolean } | undefined
+): string {
+  if (options?.agentInterfaceView !== true) return "";
+  if (options.statusPageAgent === true) {
+    return `
+
+<agent-interface>
+The user sees $XUM_SCRATCH_DIR/artifacts/${AGENT_INTERFACE_STATUS_ARTIFACT} in the main pane instead of this chat transcript by default, and can switch to the transcript at any time. A status page agent keeps the page current with its own model, so do not edit the page yourself. Call status_update with a short, self-contained update when you start, at each milestone, and before you finish; the call returns at once. If a status_update result reports that the status page agent failed, edit the page yourself. Still answer in chat as usual.
+</agent-interface>`;
+  }
+  return `
+
+<agent-interface>
+The user watches $XUM_SCRATCH_DIR/artifacts/${AGENT_INTERFACE_STATUS_ARTIFACT} in the main pane instead of this chat transcript, so the page is how they follow your work. Xum seeds it with a themed placeholder; keep the --xum-* CSS variables listed in its HTML comment (with fallbacks) so the page follows the user's theme.
+- In any turn that does work, replace the placeholder early, before long-running steps.
+- Edit the page in place at each milestone: plan, progress, blockers, results.
+- Before you end the turn, make the page show the final state and anything that needs the user.
+Still answer in chat as usual.
+</agent-interface>`;
+}
+
+/**
+ * request.assemble middleware may filter status_update after the prompt was built: swap the
+ * status page agent guidance for the classic edit-the-page guidance and keep everything else.
+ */
+export function removeStatusPageAgentGuidance(systemMessage: string): string {
+  const agentGuidance = buildAgentInterfaceContext({
+    agentInterfaceView: true,
+    statusPageAgent: true,
+  });
+  const classicGuidance = buildAgentInterfaceContext({ agentInterfaceView: true });
+  // A replacer function: the guidance names $XUM_SCRATCH_DIR, and `$` patterns in a replacement
+  // string are special.
+  return systemMessage.replace(agentGuidance, () => classicGuidance);
+}
 
 /**
  * Extract tool-specific instructions from instruction sources.
@@ -305,6 +351,8 @@ export function extractToolInstructionsFromSources(
   const contextContents = collectInstructionContents(sources.context);
 
   return extractToolInstructionsCached(globalContents, contextContents, modelString, {
+    // No scratchWorkspace: instructions reach only the tools getToolsForModel creates, and the
+    // parse cache does not key enableGitPatches.
     ...getToolAvailabilityOptions({
       workspaceId: metadata.id,
       parentWorkspaceId: metadata.parentWorkspaceId,
@@ -381,6 +429,15 @@ function subProjectAwareWorkspaceRoot(
 }
 
 /**
+ * The host layers of the global instruction reads (~/.xum, ~/.claude). The agent loop passes its
+ * own (phase 5). Absent members: the Node layers.
+ */
+export interface InstructionHost {
+  files?: HostFiles;
+  paths?: HostPaths;
+}
+
+/**
  * Load instruction sources for a workspace execution path. Sub-project
  * workspaces are anchored at the workspace root so the parent project's
  * AGENTS.md is still read (see `loadInstructionSources`).
@@ -390,21 +447,24 @@ export async function loadWorkspaceInstructionSources(
   runtime: Runtime,
   workspacePath: string,
   projectConfigs?: Map<string, ProjectConfig>,
-  claudeSkillsCompatEnabled = false
+  claudeSkillsCompatEnabled = false,
+  host: InstructionHost = {}
 ): Promise<InstructionSources> {
   return loadInstructionSources(
     metadata,
     runtime,
     subProjectAwareWorkspaceRoot(metadata, runtime, workspacePath),
     projectConfigs,
-    claudeSkillsCompatEnabled
+    claudeSkillsCompatEnabled,
+    host
   );
 }
 
 async function readMultiProjectContextInstructions(
   metadata: WorkspaceMetadata,
   runtime: Runtime,
-  workspaceRootPath: string
+  workspaceRootPath: string,
+  files: HostFiles | undefined
 ): Promise<InstructionSet[]> {
   const sets: InstructionSet[] = [];
   const workspaceInstructions = await readInstructionSetFromRuntime(
@@ -439,7 +499,8 @@ async function readMultiProjectContextInstructions(
       (await readInstructionSet(
         project.projectPath,
         INSTRUCTION_SCOPE.PROJECT,
-        project.projectName
+        project.projectName,
+        files
       ));
     if (projectInstructions) {
       sets.push(projectInstructions);
@@ -522,6 +583,7 @@ function deriveSubProjectRelativePath(projectPath: string, subProjectPath: strin
  * @param workspacePath - Workspace directory path
  * @param projectConfigs - Project configs from ~/.mux/config.json for per-project customInstructions
  * @param claudeSkillsCompatEnabled - Whether to include ~/.claude/CLAUDE.md before native globals
+ * @param host - The host files and paths of the global reads (see InstructionHost)
  * @returns Structured instruction sources (ordered global and context entries)
  */
 export async function loadInstructionSources(
@@ -529,8 +591,11 @@ export async function loadInstructionSources(
   runtime: Runtime,
   workspaceRootPath: string,
   projectConfigs?: Map<string, ProjectConfig>,
-  claudeSkillsCompatEnabled = false
+  claudeSkillsCompatEnabled = false,
+  host: InstructionHost = {}
 ): Promise<InstructionSources> {
+  // mutation-equivalent: paths is a HostPaths object or undefined, so ?? and || agree
+  const paths = host.paths ?? nodeHostPaths;
   // `workspaceRootPath` is the parent project's checkout root — *without* the
   // optional sub-project segment. Callers that hand us the execution path
   // (root + subProject) for a sub-project workspace would silently lose the
@@ -541,12 +606,13 @@ export async function loadInstructionSources(
   const [claudeCompatGlobal, nativeGlobal, context] = await Promise.all([
     claudeSkillsCompatEnabled
       ? readClaudeCompatGlobalInstructionSet(
-          path.join(os.homedir(), CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY)
+          path.join(paths.userHome(), CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY),
+          host.files
         )
       : Promise.resolve(null),
-    readInstructionSet(getXumHome(), INSTRUCTION_SCOPE.GLOBAL),
+    readInstructionSet(paths.xumHome(), INSTRUCTION_SCOPE.GLOBAL, undefined, host.files),
     isMultiProject(metadata)
-      ? readMultiProjectContextInstructions(metadata, runtime, workspaceRootPath)
+      ? readMultiProjectContextInstructions(metadata, runtime, workspaceRootPath, host.files)
       : readSingleProjectContextInstructions(metadata, runtime, workspaceRootPath),
   ]);
   const global = [claudeCompatGlobal, nativeGlobal].filter(
@@ -555,7 +621,7 @@ export async function loadInstructionSources(
 
   // Config-stored per-project instructions (Settings → Instructions) come after
   // the repo-file sets so user settings layer on top of committed guidance.
-  const settingsSets = buildProjectSettingsInstructionSets(metadata, projectConfigs);
+  const settingsSets = buildProjectSettingsInstructionSets(metadata, projectConfigs, paths);
 
   return { global, context: [...context, ...settingsSets] };
 }
@@ -570,10 +636,11 @@ export async function loadInstructionSources(
  */
 function buildProjectSettingsInstructionSets(
   metadata: WorkspaceMetadata,
-  projectConfigs: Map<string, ProjectConfig> | undefined
+  projectConfigs: Map<string, ProjectConfig> | undefined,
+  paths: HostPaths
 ): InstructionSet[] {
   if (!projectConfigs) return [];
-  const configPath = path.join(getXumHome(), "config.json");
+  const configPath = path.join(paths.xumHome(), "config.json");
   const sets: InstructionSet[] = [];
   for (const project of getProjects(metadata)) {
     const normalizedPath = stripTrailingSlashes(project.projectPath);
@@ -586,7 +653,7 @@ function buildProjectSettingsInstructionSets(
     sets.push({
       scope: INSTRUCTION_SCOPE.PROJECT,
       projectName: project.projectName,
-      directory: getXumHome(),
+      directory: paths.xumHome(),
       files: [
         {
           // Suffix with the project path so multi-project workspaces keep a
@@ -624,6 +691,44 @@ export interface BuildSystemMessageFromSourcesOptions {
   modes?: readonly string[];
   /** XUM_SCRATCH_DIR is exported this turn; gates the scratch line on remote runtimes. */
   scratchDirSet?: boolean;
+  /**
+   * Agent interface view (artifacts-agent-interface) is on and XUM_SCRATCH_DIR is set: the user
+   * sees the status page instead of the transcript, so the agent is told to keep it current.
+   */
+  agentInterfaceView?: boolean;
+  /**
+   * With agentInterfaceView: the status_update tool is in the final toolset (status page agent
+   * sub-experiment), so the agent sends updates instead of editing the page.
+   */
+  statusPageAgent?: boolean;
+}
+
+/**
+ * The system message, and where its instruction-file blocks are: `<custom-instructions>` and
+ * the `<model-...>`/`<mode-...>` sections scoped in those files, one contiguous span (empty
+ * when none apply). The request assembler keeps this span frozen inside a context segment
+ * (planCustomInstructions), so an AGENTS.md change does not rewrite the cached prompt. The
+ * builder reports it: parsing the final prompt cannot tell a tag in later text from the end.
+ */
+export interface BuiltSystemMessage {
+  systemMessage: string;
+  instructionsSection: { prefix: string; block: string };
+}
+
+/** The instruction-file blocks, in prompt order (see BuiltSystemMessage). */
+function buildInstructionBlocks(
+  customInstructions: string,
+  model: { content: string | null; tag: string },
+  mode: { content: string | null; tag: string }
+): string {
+  const custom = customInstructions
+    ? `\n<custom-instructions>\n${customInstructions}\n</custom-instructions>`
+    : "";
+  return (
+    custom +
+    buildTaggedSection(model.content, model.tag, "model") +
+    buildTaggedSection(mode.content, mode.tag, "mode")
+  );
 }
 
 /**
@@ -654,7 +759,7 @@ export interface BuildSystemMessageFromSourcesOptions {
  * @param workspacePath - Workspace directory path
  * @param additionalSystemInstructions - Optional instructions appended last
  * @param modelString - Active model identifier used for Model-specific sections
- * @param mcpServers - Optional MCP server configuration (name -> command)
+ * @returns The system message and its instruction-file span (BuiltSystemMessage)
  * @throws Error if metadata or workspacePath invalid
  */
 export function buildSystemMessageFromSources(
@@ -663,9 +768,8 @@ export function buildSystemMessageFromSources(
   workspacePath: string,
   additionalSystemInstructions?: string,
   modelString?: string,
-  mcpServers?: MCPServerMap,
   options?: BuildSystemMessageFromSourcesOptions
-): string {
+): BuiltSystemMessage {
   if (!metadata) throw new Error("Invalid workspace metadata: metadata is required");
   if (!workspacePath) throw new Error("Invalid workspace path: workspacePath is required");
 
@@ -685,10 +789,7 @@ export function buildSystemMessageFromSources(
       "\n\n<scratch-workspace>\nThis is a project-less scratch chat. The workspace directory is app-managed and is not a Git repository unless the user initializes one.\n</scratch-workspace>";
   }
 
-  // Add MCP context if servers are configured
-  if (mcpServers && Object.keys(mcpServers).length > 0) {
-    systemMessage += buildMCPContext(mcpServers);
-  }
+  systemMessage += buildAgentInterfaceContext(options);
 
   // NOTE: Agent skills and available sub-agents are now injected into their respective
   // tool descriptions (agent_skill_read, task) for better model attention per Anthropic
@@ -768,27 +869,21 @@ export function buildSystemMessageFromSources(
           .join("\n\n")
       : null;
 
-  if (customInstructions) {
-    systemMessage += `\n<custom-instructions>\n${customInstructions}\n</custom-instructions>`;
-  }
-
-  if (modelContent && modelString) {
-    const modelSection = buildTaggedSection(modelContent, `model-${modelString}`, "model");
-    if (modelSection) {
-      systemMessage += modelSection;
-    }
-  }
-
-  if (modeContent && modeCandidates.length > 0) {
-    const modeSection = buildTaggedSection(modeContent, `mode-${modeCandidates[0]}`, "mode");
-    if (modeSection) {
-      systemMessage += modeSection;
-    }
-  }
+  // modelContent is null without a model string, modeContent without mode candidates.
+  const instructionsSection = {
+    prefix: systemMessage,
+    block: buildInstructionBlocks(
+      customInstructions,
+      // The tags only matter when content is set, and content implies the value (see above).
+      { content: modelContent, tag: `model-${modelString ?? ""}` },
+      { content: modeContent, tag: `mode-${modeCandidates[0] ?? ""}` }
+    ),
+  };
+  systemMessage += instructionsSection.block;
 
   if (additionalSystemInstructions) {
     systemMessage += `\n\n<additional-instructions>\n${additionalSystemInstructions}\n</additional-instructions>`;
   }
 
-  return systemMessage;
+  return { systemMessage, instructionsSection };
 }

@@ -4,7 +4,6 @@ import * as path from "path";
 import { z } from "zod";
 import {
   ArtifactKindSchema,
-  ArtifactShelfScopeSchema,
   type ArtifactShelfEntry,
   type ArtifactShelfScope,
 } from "@/common/orpc/schemas/artifacts";
@@ -25,8 +24,8 @@ import { parseArtifactRelativePath } from "./artifactStore";
  *   <xumRoot>/artifacts/global/<entry>/{meta.json, <file>}
  *   <xumRoot>/artifacts/project/<projectMemoryDirName>/<entry>/{meta.json, <file>}
  *
- * Deliberately NOT under /memories: memory files feed the memory index, the hot set, intuition
- * recall and the consolidation agent, which may rewrite or delete them. An entry is a byte copy of
+ * Deliberately NOT under /memories: memory files feed the memory index and the
+ * consolidation agent, which may rewrite or delete them. An entry is a byte copy of
  * one published version, so the shelf never changes under a reader; pinning the same artifact
  * path from the same workspace again replaces its entry (see chooseShelfEntryName). Agents write the shelf only through the
  * `artifact` tool's pin; everything else is read-only for them.
@@ -265,14 +264,6 @@ async function chooseShelfEntryName(
   return { error: "Too many shelf entries share this name" };
 }
 
-/**
- * Replace one shelf entry with exactly `files` (plain names inside the entry). Shared by pins
- * and the settings-backup restore so both take the scope lock and swap atomically.
- */
-export async function replaceShelfEntry(params: ShelfEntryWrite): Promise<ShelfWriteResult> {
-  return withShelfScopeLock(params.scopeDir, () => replaceShelfEntryLocked(params));
-}
-
 interface ShelfEntryWrite {
   shelfRoot: string;
   scopeDir: string;
@@ -282,7 +273,11 @@ interface ShelfEntryWrite {
 
 type ShelfWriteResult = { success: true } | { success: false; error: string };
 
-/** replaceShelfEntry body; the caller holds the scope lock (withShelfScopeLock). */
+/**
+ * Replace one shelf entry with exactly `files` (plain names inside the entry). Shared by pins
+ * and the settings-backup restore, which both hold the scope lock (withShelfScopeLock), so the
+ * swap is atomic.
+ */
 export async function replaceShelfEntryLocked(params: ShelfEntryWrite): Promise<ShelfWriteResult> {
   assert(isValidShelfEntryName(params.name), `invalid shelf entry name: ${params.name}`);
   assert(
@@ -503,9 +498,4 @@ export async function unpinFromShelf(
     }
     return { success: true as const };
   });
-}
-
-export function parseShelfScope(value: unknown): ArtifactShelfScope | null {
-  const parsed = ArtifactShelfScopeSchema.safeParse(value);
-  return parsed.success ? parsed.data : null;
 }

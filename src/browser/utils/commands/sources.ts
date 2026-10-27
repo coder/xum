@@ -41,6 +41,10 @@ import {
   pinAndOpenArtifact,
 } from "@/browser/features/RightSidebar/ArtifactsTab/openArtifact";
 import {
+  hasAgentInterfaceStatusPage,
+  toggleAgentInterfaceView,
+} from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceViewState";
+import {
   appViewDetails,
   appViewServerNames,
   focusMcpAppViewTab,
@@ -190,19 +194,23 @@ import {
   getTabConfig,
   type BaseTabType,
 } from "@/browser/features/RightSidebar/Tabs/tabConfig";
-import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+import {
+  isRightSidebarToggleAvailable,
+  isWorkspaceRightSidebarHidden,
+  toggleRightSidebarFromPalette,
+} from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { formatProjectHierarchyLabel, getTopLevelProjectEntries } from "@/common/utils/subProjects";
 import { serverPathLabel } from "@/common/utils/paths";
 import {
   hasTab,
-  openToolFromNewTab,
-  splitFocusedTabset,
   toggleTab,
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import {
-  focusRightSidebarTab,
+  focusRightSidebarTabWithKeyboard,
+  openRightSidebarTool,
   readRightSidebarLayout,
+  splitRightSidebarPane,
   updateRightSidebarLayout,
 } from "@/browser/utils/rightSidebarTabFocus";
 
@@ -296,6 +304,8 @@ export interface BuildSourcesParams {
   multiProjectWorkspacesEnabled: boolean;
   /** artifacts experiment: gates "Open Artifacts" and "Open File as Artifact…". */
   artifactsEnabled?: boolean;
+  /** Artifacts plus its Agent interface view sub-experiment: gates the status/chat switch. */
+  agentInterfaceViewEnabled?: boolean;
   /** mcp-apps experiment: gates the MCP App view and entry-point commands. */
   mcpAppsEnabled?: boolean;
   /** The selected workspace's MCP App entry points; undefined until listed. */
@@ -434,7 +444,8 @@ const findFirstTerminalSessionTab = (
 
 function focusExistingTerminalTab(workspaceId: string): void {
   const found = findFirstTerminalSessionTab(readRightSidebarLayout(workspaceId).root);
-  if (found) focusRightSidebarTab(workspaceId, found.tab);
+  // "Focus Terminal" and Add Tool > Terminal: the terminal takes the keyboard, like other tools.
+  if (found) focusRightSidebarTabWithKeyboard(workspaceId, found.tab);
 }
 
 /**
@@ -546,6 +557,28 @@ function openGoalPanel(workspaceId: string, openCompleteInput = false): void {
 /** Subtitle for an On/Off toggle backed by config.json; `fallback` until the value is known. */
 function describeConfigToggle(value: boolean | undefined, fallback: string): string {
   return value === undefined ? fallback : `Current: ${value ? "On" : "Off"}`;
+}
+
+/** The Agent interface view's switch, while that experiment (and Artifacts) is on. */
+function agentInterfaceNavigationActions(
+  p: BuildSourcesParams,
+  wsId: string,
+  navigationSection: CommandAction["section"]
+): CommandAction[] {
+  if (p.agentInterfaceViewEnabled !== true) return [];
+  return [
+    {
+      // Not in CommandIds: a single static id, like "cycle-agent".
+      id: "nav:toggle-agent-interface-view",
+      title: "Switch Status Page / Chat",
+      section: navigationSection,
+      shortcutHint: formatKeybind(KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW),
+      keywords: ["status", "chat", "agent interface", "transcript", "view"],
+      // Listed only while there is a status page to switch to.
+      visible: () => hasAgentInterfaceStatusPage(wsId),
+      run: () => toggleAgentInterfaceView(wsId),
+    },
+  ];
 }
 
 /**
@@ -1032,7 +1065,7 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
       },
       {
         id: CommandIds.navToggleSidebar(),
-        title: "Toggle Sidebar",
+        title: "Toggle Left Sidebar",
         section: section.navigation,
         shortcutHint: formatKeybind(KEYBINDS.TOGGLE_SIDEBAR),
         run: () => p.onToggleSidebar(),
@@ -1144,7 +1177,18 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
               },
             ]
           : []),
+        ...agentInterfaceNavigationActions(p, wsId, section.navigation),
         ...mcpAppNavigationActions(p, wsId, section.navigation),
+        {
+          id: CommandIds.navRightSidebarToggle(),
+          title: "Right Sidebar: Toggle",
+          section: section.navigation,
+          shortcutHint: formatKeybind(KEYBINDS.TOGGLE_RIGHT_SIDEBAR),
+          // Listed only while the toggle can act: the layout can hide the sidebar, and the phone
+          // full-screen view, immersive review and a failed load refuse the toggle too.
+          visible: () => isRightSidebarToggleAvailable(wsId),
+          run: () => toggleRightSidebarFromPalette(wsId),
+        },
         {
           id: CommandIds.navRightSidebarFocusTerminal(),
           title: "Right Sidebar: Focus Terminal",
@@ -1155,19 +1199,13 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
           id: CommandIds.navRightSidebarSplitHorizontal(),
           title: "Right Sidebar: Split Horizontally",
           section: section.navigation,
-          run: () => {
-            updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
-            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "horizontal"));
-          },
+          run: () => splitRightSidebarPane(wsId, "horizontal"),
         },
         {
           id: CommandIds.navRightSidebarSplitVertical(),
           title: "Right Sidebar: Split Vertically",
           section: section.navigation,
-          run: () => {
-            updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
-            updateRightSidebarLayout(wsId, (s) => splitFocusedTabset(s, "vertical"));
-          },
+          run: () => splitRightSidebarPane(wsId, "vertical"),
         },
         {
           id: CommandIds.navRightSidebarNewTab(),
@@ -1230,10 +1268,8 @@ export function buildCoreSources(p: BuildSourcesParams): Array<() => CommandActi
                 return;
               }
 
-              // Same as picking the tool in the focused pane's New tab: it takes the New tab's
-              // place, or is selected where it is already open.
-              updatePersistedState(getRightSidebarCollapsedKey(wsId), false);
-              updateRightSidebarLayout(wsId, (s) => openToolFromNewTab(s, s.focusedTabsetId, tool));
+              // Same as picking the tool in the focused pane's New tab, focus included.
+              openRightSidebarTool(wsId, tool);
               // While the sidebar is hidden (phones) that tab cannot be seen, so WorkspaceMenuBar
               // shows it in the full-screen sidebar; with the sidebar visible it ignores the event.
               // "costs" is the Stats tab's id.

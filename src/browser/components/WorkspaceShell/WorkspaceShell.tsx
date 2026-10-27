@@ -16,7 +16,19 @@ import { useChatTranscriptFullWidth } from "@/browser/hooks/useChatTranscriptFul
 import { updatePersistedState, usePersistedState } from "@/browser/hooks/usePersistedState";
 import { guardSidebarKeys, holdSidebarInput, type HeldSidebarInput } from "./deferredSidebarInput";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
-import { isWorkspaceRightSidebarHidden } from "@/browser/features/RightSidebar/rightSidebarVisibility";
+import {
+  isBrowserViewportFocused,
+  isDesktopViewportFocused,
+  isTerminalFocused,
+  KEYBINDS,
+  matchesKeybind,
+} from "@/browser/utils/ui/keybinds";
+
+import {
+  isRightSidebarToggleBlocked,
+  isWorkspaceRightSidebarHidden,
+  toggleRightSidebarFromKey,
+} from "@/browser/features/RightSidebar/rightSidebarVisibility";
 import { useEscapeToDismiss } from "@/browser/hooks/useEscapeToDismiss";
 import { CUSTOM_EVENTS, type CustomEventType } from "@/common/constants/events";
 import { PopoverError } from "../PopoverError/PopoverError";
@@ -40,6 +52,7 @@ import {
 } from "@/constants/layout";
 import { ChatPane } from "../ChatPane/ChatPane";
 import {
+  PinnedViewToolbarSpacerProvider,
   RightSidebarToggle,
   RightSidebarToggleHole,
 } from "../SidebarCollapseButton/SidebarCollapseButton";
@@ -322,6 +335,44 @@ const WorkspacePlaceholder: React.FC<{
   </main>
 );
 
+/**
+ * True for the TOGGLE_RIGHT_SIDEBAR chord outside terminals, browser and desktop viewports, which
+ * own their keystrokes.
+ */
+function isRightSidebarToggleChord(e: KeyboardEvent): boolean {
+  return (
+    matchesKeybind(e, KEYBINDS.TOGGLE_RIGHT_SIDEBAR) &&
+    !isTerminalFocused(e.target) &&
+    !isBrowserViewportFocused(e.target) &&
+    !isDesktopViewportFocused(e.target)
+  );
+}
+
+/**
+ * The right sidebar had no hotkey (user request). It lives in WorkspaceShell, outside the lazy
+ * sidebar, so it works while the sidebar chunk loads, like the header toggle. It also works from
+ * the chat input, where the chord types nothing, like TOGGLE_SIDEBAR for the left sidebar.
+ */
+function useRightSidebarToggleKey(
+  workspaceId: string,
+  shellRef: React.RefObject<HTMLDivElement | null>
+) {
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!isRightSidebarToggleChord(e)) return;
+      // Claim the chord even when an overlay blocks the toggle: in a browser, Chrome binds it to
+      // its bookmarks bar.
+      e.preventDefault();
+      if (isRightSidebarToggleBlocked(e)) return;
+      toggleRightSidebarFromKey(workspaceId, shellRef.current);
+    };
+    // Capture phase: some modal controls stop keydown propagation (stopKeyboardPropagation),
+    // which would hide the chord from a bubble-phase listener before it is claimed.
+    window.addEventListener("keydown", handler, { capture: true });
+    return () => window.removeEventListener("keydown", handler, { capture: true });
+  }, [workspaceId, shellRef]);
+}
+
 export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   const shellRef = useRef<HTMLDivElement>(null);
   const shellSize = useResizeObserver(shellRef);
@@ -464,6 +515,7 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
   // Layer 1: the full-screen sidebar is drawn above the narrow-screen drawer (layer 0), so it
   // answers Escape first when both are open.
   useEscapeToDismiss(sidebarFullscreen, closeSidebarFullscreen, 1);
+  useRightSidebarToggleKey(props.workspaceId, shellRef);
   // The Timeline's "Reveal in transcript" scrolls to and highlights a message in the chat behind
   // the view, so close the view to show it (the phone Timeline dialog did the same).
   useEffect(() => {
@@ -561,24 +613,28 @@ export const WorkspaceShell: React.FC<WorkspaceShellProps> = (props) => {
         immersive={isReviewImmersive}
       />
 
-      <LazyRightSidebar
-        held={heldSidebarInput}
-        collapsed={rightSidebarCollapsed}
-        key={props.workspaceId}
-        workspaceId={props.workspaceId}
-        workspacePath={props.namedWorkspacePath}
-        projectPath={props.projectPath}
-        width={sidebarWidth}
-        onStartResize={startResize}
-        isResizing={isResizing}
-        onReviewNote={handleReviewNote}
-        isCreating={props.isInitializing === true}
-        immersiveHidden={isReviewImmersive}
-        addTerminalRef={addTerminalRef}
-        fullscreen={sidebarFullscreen}
-        onCloseFullscreen={closeSidebarFullscreen}
-        onRequestFullscreen={handleRequestSidebarFullscreen}
-      />
+      {/* App's resolved left sidebar state (not the persisted key, whose default App picks at
+          mount) decides whether pinned views in the sidebar reserve the toggle bar's width. */}
+      <PinnedViewToolbarSpacerProvider leftSidebarCollapsed={props.leftSidebarCollapsed}>
+        <LazyRightSidebar
+          held={heldSidebarInput}
+          collapsed={rightSidebarCollapsed}
+          key={props.workspaceId}
+          workspaceId={props.workspaceId}
+          workspacePath={props.namedWorkspacePath}
+          projectPath={props.projectPath}
+          width={sidebarWidth}
+          onStartResize={startResize}
+          isResizing={isResizing}
+          onReviewNote={handleReviewNote}
+          isCreating={props.isInitializing === true}
+          immersiveHidden={isReviewImmersive}
+          addTerminalRef={addTerminalRef}
+          fullscreen={sidebarFullscreen}
+          onCloseFullscreen={closeSidebarFullscreen}
+          onRequestFullscreen={handleRequestSidebarFullscreen}
+        />
+      </PinnedViewToolbarSpacerProvider>
 
       {/* After the sidebar in DOM order: see RightSidebarToggleHole. */}
       <RightSidebarToggleHole />

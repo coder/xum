@@ -1,8 +1,8 @@
 import { tool } from "ai";
+import { clockOf, type HostClock } from "@/node/utils/hostClock";
 import { Window } from "happy-dom";
 import { Readability } from "@mozilla/readability";
 import TurndownService from "turndown";
-import * as net from "node:net";
 import type { WebFetchToolResult } from "@/common/types/tools";
 import { shellQuote } from "@/common/utils/shell";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
@@ -19,6 +19,7 @@ import { getErrorMessage } from "@/common/utils/errors";
 import { assert } from "@/common/utils/assert";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { log } from "@/node/services/log";
+import { isIP } from "@/node/utils/ipAddress";
 import {
   isBlockedHostname,
   isBlockedIpAddress,
@@ -39,15 +40,49 @@ const CURL_ROUTE_MARKER = "XUM_CURL_ROUTE=";
 
 class WebFetchValidationError extends Error {}
 
+// parseHtmlDocument answers every request that happy-dom tries to send with this
+// status instead of sending it.
+const WEB_FETCH_REFUSED_STATUS = 403;
+const WEB_FETCH_REFUSED_STATUS_TEXT = "Forbidden";
+
+/**
+ * Remove every `<tagName ...>...</tagName>` block, with the same matches as
+ * /<tagName\b[^>]*>[\s\S]*?<\/tagName\s*>/gi. That regex restarts its scan at
+ * every opener that has no ">" or no closer after it, so it takes quadratic
+ * time on untrusted HTML full of unclosed openers. This scan runs in linear
+ * time: each search starts where the last match ended, and the first failed
+ * search ends the scan, because a later start cannot succeed where an earlier
+ * one failed.
+ */
+function stripElementBlocks(html: string, tagName: string): string {
+  assert(/^[a-z]+$/.test(tagName), `stripElementBlocks: unsupported tag name ${tagName}`);
+  const opener = new RegExp(`<${tagName}\\b`, "gi");
+  const closer = new RegExp(`<\\/${tagName}\\s*>`, "gi");
+  const kept: string[] = [];
+  let keptFrom = 0;
+  for (let open = opener.exec(html); open !== null; open = opener.exec(html)) {
+    const openerEnd = html.indexOf(">", opener.lastIndex);
+    if (openerEnd === -1) break;
+    // mutation-equivalent: a closer starts with "</", and html[openerEnd] is ">",
+    // so a search from openerEnd - 1 or openerEnd finds the same closer.
+    closer.lastIndex = openerEnd + 1;
+    if (closer.exec(html) === null) break;
+    kept.push(html.slice(keptFrom, open.index));
+    keptFrom = closer.lastIndex;
+    opener.lastIndex = keptFrom;
+  }
+  kept.push(html.slice(keptFrom));
+  return kept.join("");
+}
+
 /**
  * Strip <style> and <script> blocks before happy-dom parsing. Large minified
  * blocks add substantial parsing work, while Readability only needs DOM
  * structure and visible text.
  */
-function stripHeavyTags(html: string): string {
-  return html
-    .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, "")
-    .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, "");
+// Exported for web_fetch.test.ts, which checks the matches and the linear time.
+export function stripHeavyTags(html: string): string {
+  return stripElementBlocks(stripElementBlocks(html, "style"), "script");
 }
 
 // Exported for web_fetch.bundle.test.ts: the no-subresource-fetch guarantee
@@ -57,10 +92,18 @@ export function parseHtmlDocument(html: string, url: string): Document {
   // SECURITY: the HTML is untrusted. Parsing must never trigger network
   // fetches from the Mux backend (subresources like iframes or external
   // stylesheets would bypass the SSRF checks in assertWebFetchTargetAllowed).
-  // JavaScript evaluation is already disabled by default in happy-dom.
+  // The settings below turn off the loaders we know about, and the fetch
+  // interceptor refuses every HTTP request: happy-dom sends all of them
+  // (fetch, XMLHttpRequest, sendBeacon, <link> elements, stylesheets,
+  // scripts, frames) through Fetch/SyncFetch, which call the interceptor
+  // before they open a connection, so a refused request never reaches the
+  // network and never follows a redirect. WebSocket is the one happy-dom
+  // network path that skips the interceptor, and only script can open one:
+  // keep JavaScript evaluation off (happy-dom's default, also set here).
   const window = new Window({
     url,
     settings: {
+      enableJavaScriptEvaluation: false,
       disableJavaScriptFileLoading: true,
       disableCSSFileLoading: true,
       navigation: {
@@ -68,8 +111,32 @@ export function parseHtmlDocument(html: string, url: string): Document {
         disableChildFrameNavigation: true,
         disableChildPageNavigation: true,
       },
+      fetch: {
+        interceptor: {
+          beforeAsyncRequest: ({ window: requestWindow }) =>
+            Promise.resolve(
+              new requestWindow.Response(null, {
+                status: WEB_FETCH_REFUSED_STATUS,
+                statusText: WEB_FETCH_REFUSED_STATUS_TEXT,
+              })
+            ),
+          beforeSyncRequest: ({ window: requestWindow, request }) => ({
+            status: WEB_FETCH_REFUSED_STATUS,
+            statusText: WEB_FETCH_REFUSED_STATUS_TEXT,
+            ok: false,
+            url: request.url,
+            redirected: false,
+            headers: new requestWindow.Headers(),
+            body: null,
+          }),
+        },
+      },
     },
   });
+  // Do not strip preload links from the raw HTML before this write: a regex
+  // cannot tell a tag from text inside a quoted attribute, so it would cut
+  // into the containing tag and drop the page content after it. The
+  // interceptor above already refuses their requests.
   window.document.write(html);
   // happy-dom's Document is structurally DOM-compatible but uses its own type declarations.
   const document: unknown = window.document;
@@ -84,8 +151,12 @@ function assertSupportedWebFetchProtocol(url: URL): void {
   }
 }
 
-function getRemainingWebFetchTimeoutSecs(deadlineMs: number, maxTimeoutSecs?: number): number {
-  const remainingMs = deadlineMs - Date.now();
+function getRemainingWebFetchTimeoutSecs(
+  clock: HostClock,
+  deadlineMs: number,
+  maxTimeoutSecs?: number
+): number {
+  const remainingMs = deadlineMs - clock.nowMs();
   if (remainingMs <= 0) {
     throw new WebFetchValidationError(WEB_FETCH_TIMEOUT_ERROR);
   }
@@ -188,7 +259,7 @@ function parseResolvedAddresses(output: string): string[] {
     }
 
     const normalizedAddress = normalizeHostname(value);
-    if (net.isIP(normalizedAddress) === 0) {
+    if (isIP(normalizedAddress) === 0) {
       throw new WebFetchValidationError(WEB_FETCH_RESOLVE_ERROR);
     }
 
@@ -205,6 +276,7 @@ async function resolveHostnameInRuntime(
   abortSignal?: AbortSignal
 ): Promise<string[]> {
   const resolveTimeoutSecs = getRemainingWebFetchTimeoutSecs(
+    clockOf(config),
     deadlineMs,
     WEB_FETCH_RESOLVE_TIMEOUT_SECS
   );
@@ -292,7 +364,7 @@ function buildConnectToPin(url: URL, address: string): string {
   if (url.hostname.length === 0 || /[:[\]]/.test(url.hostname) || !/^\d+$/.test(port)) {
     throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
   }
-  const routedAddress = net.isIP(address) === 6 ? `[${address}]` : address;
+  const routedAddress = isIP(address) === 6 ? `[${address}]` : address;
   return `${url.hostname}:${port}:${routedAddress}:${port}`;
 }
 
@@ -316,7 +388,7 @@ async function assertWebFetchTargetAllowed(
     throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
   }
 
-  if (net.isIP(hostname) !== 0) {
+  if (isIP(hostname) !== 0) {
     if (isBlockedIpAddress(hostname)) {
       throw new WebFetchValidationError(WEB_FETCH_BLOCKED_TARGET_ERROR);
     }
@@ -512,7 +584,7 @@ async function fetchTargetFromValidatedAddresses(
 ): Promise<runtimeHelpers.ExecResult> {
   let result: runtimeHelpers.ExecResult | undefined;
   for (const address of target.addresses.slice(0, WEB_FETCH_MAX_ADDRESS_ATTEMPTS)) {
-    const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(deadlineMs);
+    const curlTimeoutSecs = getRemainingWebFetchTimeoutSecs(clockOf(config), deadlineMs);
     const connectTo = target.pinned ? buildConnectToPin(target.url, address) : null;
     const raw = await runtimeHelpers.execBuffered(
       config.runtime,
@@ -542,7 +614,7 @@ async function executeWebFetchRequest(
   rawUrl: string,
   abortSignal?: AbortSignal
 ): Promise<{ result: runtimeHelpers.ExecResult; finalUrl: string }> {
-  const deadlineMs = Date.now() + WEB_FETCH_TIMEOUT_SECS * 1000;
+  const deadlineMs = clockOf(config).nowMs() + WEB_FETCH_TIMEOUT_SECS * 1000;
   let target = await assertWebFetchTargetAllowed(config, rawUrl, deadlineMs, abortSignal);
   // A curl that cannot be classified refuses here, before any HTTP request.
   const reportsProxyUsed = await probeCurlReportsProxyUsed(config);

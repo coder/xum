@@ -68,7 +68,9 @@ Xum harness. Where the two differ, follow this skill.
 4. Dry run at $0 with no key: `make bug-bash-sandbox-check` (isolation, proxy and export
    refusals against a fake upstream, about 2 minutes) and `make test-bugbash-repros-sandbox` (the
    repros through the launcher on the mock app AI, about 4 minutes). CI's
-   `Test / Bug-bash sandbox` job runs both.
+   `Test / Bug-bash sandbox` job runs both, in the merge queue and on PRs that change
+   `tests/e2e`, `tests/bugbash`, `playwright.config.ts`, `pr.yml`, `Makefile`, `package.json`
+   or `bun.lock`.
 
 ## 2. Plan charters
 
@@ -144,7 +146,7 @@ launcher refuses an Electron job without `node_modules/electron/dist/electron`. 
 the mock AI, agent tools, terminals and project automation off, no HTTP API server, and never
 `XUM_ALLOW_MULTIPLE_INSTANCES`. It refuses to start Electron when a switch is missing. In Electron
 the seeded project starts collapsed, and every attempt shares the one seeded root, so a story
-sees the UI state that an earlier one left: use `tests/stories/electron/helpers.ts`
+sees the UI state that an earlier one left: use `tests/stories/helpers.ts`
 (`openPlayground`), which works from either state. `app.clearState()`,
 extra headers and locale overrides do not work on this target (one fresh app per attempt).
 The first run, with one smoke story and no agent repro, spent $0.09 at list price and took about
@@ -164,17 +166,29 @@ job (a story job only) and refuses any entry that is not a regular `<sha256>.jso
 or less, more than 1000 entries, or more than 128 MiB in all. Each run
 summary counts the outcomes (`Cache N replayed`). An empty or missing seed is a cold run.
 CI: the `Stories` workflow (`.github/workflows/stories.yml`) runs one `make test-stories` with
-`BUGBASH_BUDGET_USD=3` (the cap per job) once for each PR in the merge queue (pr.yml's
-`Test / Stories` job calls it), nightly on main and on demand (Actions > Stories > Run workflow,
-on any branch). `Required` waits for it in the queue but counts its result only when the repo
-variable `STORIES_MODE` is `block`. Unset is warn mode: a failure shows but blocks no merge. When
+Sonnet 5.5 and `BUGBASH_BUDGET_USD=3` (the cap per job) once for each PR in the merge queue
+(pr.yml's `Test / Stories` job calls it), nightly on main and on demand (Actions > Stories > Run
+workflow, on any branch). `Required` waits for it in the queue but counts its result only when the
+repo variable `STORIES_MODE` is `block`. Unset is warn mode: a failure shows but blocks no merge.
+On each push to a PR that is not a draft, pr.yml's `Test / Stories (Haiku)` job runs it with
+Haiku 5.5 and a $1 cap per job (its `model` and `budget_usd` inputs): Haiku on PRs, Sonnet in the
+queue. Sonnet 5.5 judges that lane's story asserts (`judge_model`, which sets
+`BUGBASH_JUDGE_MODEL`), because Haiku missed layout defects on screenshots. The agent repros keep
+Haiku as their judge. Fork and Dependabot PRs skip it. `Required` counts that result only when the repo variable
+`STORIES_PR_MODE` is `block`: warn until 50 PR runs with less than 5% failures. When
 every failed job's proxy record holds a provider 5xx (`bun tests/stories/summary.ts
 --upstream-fault`), the workflow runs `make test-stories` once more. It restores the seed with actions/cache
-(this ref's newest, else main's), writes a table of the tests, their cache outcomes and each
-job's spend to the job summary, and, except in the merge queue, saves the next seed: `bun
+(this ref's newest, else main's), writes e2e's page of each job with its spend to the job
+summary (`bun tests/stories/summary.ts`), uploads each job's `report.json` and `.spend.json` as the
+artifact `stories-reports-<attempt>` and, on a failure, the `results/` folders as
+`stories-evidence-<attempt>` (both kept 7 days), and, except in the merge queue, saves the next seed: `bun
 tests/stories/summary.ts --next-seed <dir>` (the caches of the newest web and Electron story
 jobs, less the seed entries either one deleted, at most 1000 entries and 128 MiB). GitHub scopes a saved cache to its ref, and a queue ref is temporary, so a
 merge-queue run saves none. Only the nightly and on-demand runs on main change what main replays. A PR that changes the sandbox image inputs fails there until main publishes the image.
+After the PR lane, pr.yml's `Test / Stories (Haiku) comment` job posts the same page as one PR
+comment, which each push edits (`tests/stories/prComment.ts`; `--dry-run` prints the body). It
+runs the base commit's copy with no install scripts, writes only while the run's commit is still
+the PR head, and is not in `Required`.
 To check state across a server restart, a story imports `test` from `tests/stories/fixtures.ts`
 and calls `xum.restartServer()` (same port and XUM_ROOT), then `app.open()`: e2e's
 `app.restart()` only opens a new page.

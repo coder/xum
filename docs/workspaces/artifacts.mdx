@@ -22,9 +22,9 @@ On SSH, Docker and dev container workspaces the scratch folder exists only while
 
 ## Open the tab
 
-- Press `Ctrl+Shift+K` (`Cmd+Shift+K` on macOS).
+- Press `Ctrl+Shift+K` (`Cmd+Shift+K` on macOS). If the tab already shows, the shortcut moves focus into it. On wide windows, press it again while focus is in the tab to hide the right sidebar.
 - Click an artifact card in the chat. The card shows the file name, its version and its title.
-- On narrow windows, where the right sidebar is hidden, the same shortcut shows the sidebar full-screen on the Artifacts tab.
+- On narrow windows, where the right sidebar is hidden, the same shortcut shows the sidebar full-screen on the Artifacts tab. Its **Close** button or `Esc` closes it.
 
 The toolbar has a picker for the file, a version menu, and buttons for fullscreen and reload. A dot in the picker marks files that changed since you last looked at them.
 
@@ -87,16 +87,35 @@ Shelf files are stored under `~/.xum/artifacts/`. The settings backup leaves the
 HTML artifacts can send messages to the agent with a small script API:
 
 ```js
-window.xum.send("Use strategy B", { ttl: 30 }); // asks you to send a message
+window.xum.send("Use strategy B", { ttl: 30 }); // call it from a click: sends at once
 window.xum.setState({ selected: ["lru", "ttl"] }); // saved with this artifact
 window.xum.theme; // "dark" or "light"
 window.xum.openWorkspace("a1b2c3d4e5"); // switches Xum to that workspace
 ```
 
-- `send` never sends on its own. Xum shows the text above the artifact with **Send** and **Dismiss**. Only your click or the Send shortcut sends it, and Send waits a moment after the message appears.
+- Call `send` from a click or key handler. Then Xum sends the message at once. If the send fails, Xum shows the text and the error above the artifact, with **Send** and **Dismiss**.
+- A `send` that comes within a few seconds of your click or key in the artifact, also from a timer, counts as a click. Only one such `send` goes out at once in 5 seconds.
+- A `send` with no recent click or key in the artifact, or the second `send` within those 5 seconds, does not send on its own. Xum shows the text above the artifact with **Send** and **Dismiss**. Only your click or the Send shortcut sends it, and Send waits a moment after the message appears.
 - A sent message arrives as your message, labeled "from artifact". If the agent is busy, it arrives at the next tool step. A message you sent survives an app restart, even if it was still waiting for the agent. A message you have not sent yet does not.
 - `setState` saves a small JSON value for the artifact. A new version keeps it. The agent sees it in `artifact_list`.
 - `openWorkspace` switches Xum to the workspace with that ID. A task ID from the `task` tool works too, for a sub-agent or a workspace task. Call it from a click or key handler: Xum ignores it unless you just clicked or typed inside the artifact. For an unknown or archived workspace, nothing switches and Xum shows a short notice above the artifact. The artifact never gets an answer, and no workspace list or title reaches it. Pinned files and shelf copies cannot switch workspaces.
+
+### Theme variables
+
+Xum sets the current theme's colors and fonts as CSS variables on the root element of HTML and SVG artifacts, and updates them when you change the theme, without a reload:
+
+```css
+body {
+  background: var(--xum-surface, #fff);
+  color: var(--xum-fg, #111);
+  border: 1px solid var(--xum-border, #ccc);
+}
+a {
+  color: var(--xum-accent, #06c);
+}
+```
+
+The variables are `--xum-surface` (the background of the pane that shows the artifact), `--xum-bg`, `--xum-bg-secondary`, `--xum-fg`, `--xum-muted`, `--xum-border`, `--xum-border-light`, `--xum-accent`, `--xum-danger`, `--xum-success`, `--xum-warning`, `--xum-font-sans`, `--xum-font-mono` and `--xum-radius`. Give each one a fallback, so the page also looks right outside Xum. The root element also has `data-xum-theme` (`light` or `dark`) and `data-xum-theme-name` (`light`, `dark`, `flexoki-light` or `flexoki-dark`).
 
 ## Canvases
 
@@ -114,7 +133,7 @@ A canvas is a JSON file that Xum draws with its own components, so it needs no H
 }
 ```
 
-Block types are `markdown`, `table`, `chart` (`bar` or `line`; inline rows or a file reference with a JSON pointer), `stat`, `diff`, `image` and `button`. A button works like `window.xum.send`.
+Block types are `markdown`, `table`, `chart` (`bar` or `line`; inline rows or a file reference with a JSON pointer), `stat`, `diff`, `image` and `button`. A button sends its message when you click it.
 
 ## Annotate
 
@@ -130,6 +149,34 @@ Comments attach to your next message, with the artifact, its version and the anc
 ## Goal status board
 
 When the workspace has an active goal, Xum keeps `goal.status.html` up to date in the artifacts folder. It shows the objective, status, cost against budget, turns against the cap, the todo list, and the pull request's checks and open review threads when there is one.
+
+## Agent interface view
+
+**Agent interface view** is a sub-experiment of Artifacts. Turn it on under the Artifacts row in **Settings > Experiments**. When it is on, the main pane shows the agent's status page, `status.html` in the artifacts folder, instead of the chat transcript. The message box stays at the bottom, so you can send messages from the status page.
+
+- At the start of each turn, if `status.html` does not exist, Xum writes a starter page that uses the [theme variables](#theme-variables). Xum never replaces a page that exists. The agent is told to keep the page current. Side chats get no starter page, so they show their chat.
+- Switch between the status page and the chat with the **Status** and **Chat** buttons in the workspace header, `Ctrl+Shift+S` (`Cmd+Shift+S` on macOS), or **Switch Status Page / Chat** in the command palette. With focus inside the status page, the shortcut only switches to the chat.
+- With focus inside the status page, `Esc` (`Ctrl+C` in Vim mode) stops the agent, as in the chat. It does not when you type `Esc` in a text field, when `Esc` closes a dialog or popover on the page, or when the page's script cancels the key (`preventDefault`). So that a page cannot stop the agent by itself, `Esc` works there only shortly after you click or press another key in the page.
+- Xum remembers your choice for each workspace. A workspace where you made no choice shows the status page.
+- When the workspace has no status page, or the page is empty or cannot be shown (for example a binary file), the main pane shows the chat transcript.
+- On the status page, every `window.xum.send` asks first, also from a click: Xum shows the text above the page with **Send** and **Dismiss**. The page shows without you opening it, so its script could otherwise take a click elsewhere in Xum for a click in the page.
+
+### Status page agent
+
+**Status page agent** is a sub-experiment of Artifacts that needs Agent interface view. Turn both on under the Artifacts row in **Settings > Experiments**: the **Status page agent** row shows there only while Agent interface view is on. When it is on, a separate status page agent keeps `status.html` current, so the main agent spends no time or tokens on the page.
+
+- The main agent sends short updates with the `status_update` tool. The call returns at once, and the status page agent edits the page in the background. Updates sent while it runs go into its next run together.
+- When the main agent ends a turn without a `status_update` call, and the page is missing, blank, still Xum's placeholder, or did not change in a turn that did work, Xum asks the agent once to call `status_update`. A turn that sent an update gets no reminder, because the status page agent can still be editing the page when the turn ends. When you turn the status page agent off before the turn ends, the reminder asks the agent to edit the page itself.
+- Pick the status page agent's model in **Settings > Agents > Status Page**. That card shows only while Artifacts, Agent interface view and Status page agent are all on. When the model is **Inherit**, it uses the workspace's model. A small, fast model is usually enough.
+- The status page agent can change only `status.html`. It does not write to an archived or removed workspace, or after you turn the experiment off. Removing a workspace stops its run in progress.
+- Its spend shows in the workspace's costs, like other background agents.
+- Waiting updates are capped at the newest 20, and at 20,000 characters in total. Older updates are dropped.
+- An update can have up to 4,000 characters. A run stops after 8 model steps and keeps the edits it made until then. A run fails when it takes more than 2 minutes, or when `status.html` is larger than 256 KiB. The status page agent cannot make the page larger than 256 KiB.
+- When a run fails (for example the model is unavailable, or the run ends without a change to the page), the main agent's turn goes on. The result of its next `status_update` call says that the last update failed, and the agent can then edit the page itself. The updates of the failed run are applied again with the next update.
+- When the page changes while a run is in progress (for example the main agent edits it), the run does not overwrite that change. Its updates count as failed and are applied again, on top of the changed page, with the next update.
+- Some updates are dropped without being applied: updates over the caps, and updates of a run cut short because you turned the status page agent off or archived the workspace. The result of the next `status_update` call says how many were dropped, so the main agent can send again what still matters.
+- To stop the status page agent without turning off the experiment, switch off **Enabled** on its card in **Settings > Agents**. The main agent then edits the page itself. When a turn starts while the status page agent is off (its **Enabled** switch, or one of the experiments it needs), waiting updates and a failure that was not reported yet are dropped, so they do not come back when you turn it on again. A run that is in progress at that time writes nothing, and its updates are dropped too. When you turn it off and on again before a turn starts, nothing is dropped.
+- An agent whose tool policy removes `status_update` (for example a custom agent with `tools.remove: [status_update]`), a turn that disables it, or a plugin hook that removes it from the request, gets the usual guidance and reminder to edit the page itself.
 
 ## Apps from MCP servers
 
@@ -150,7 +197,7 @@ MCP Apps are a separate experiment. Turn on **MCP Apps** in Settings → Experim
 
 HTML and SVG artifacts run in a sandboxed frame with no access to Xum, your files, cookies or storage. A strict content security policy blocks network requests.
 
-**Allow CDN scripts in artifacts** (Settings → Experiments → Artifacts, on by default) lets artifacts load scripts, styles and fonts from a few public CDNs: cdnjs, unpkg, jsDelivr, the Tailwind CDN, the jQuery CDN and Google Fonts. The URL of such a request can carry data out. Turn the setting off to block these hosts.
+**Allow CDN assets in artifacts** (Settings → Experiments → Artifacts, on by default) lets artifacts load scripts, styles and fonts from a few public CDNs: cdnjs, unpkg, jsDelivr, the Tailwind CDN, the jQuery CDN and Google Fonts. The URL of such a request can carry data out. Turn the setting off to block these hosts.
 
 The policy cannot block every channel (for example WebRTC). Treat artifact content as untrusted.
 

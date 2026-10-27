@@ -98,7 +98,7 @@ To give a plugin server another variable:
 
 Tool search is on by default. Xum keeps MCP tool definitions out of the model-visible tool list until the model finds them with the `tool_catalog_search` tool, which saves context when you have many MCP tools. Turn it off in **Settings → MCP** to advertise every MCP tool up front.
 
-Claude 4.5 and later models with Anthropic prompt caching, used directly or through Mux Gateway or a Coder instance, use Anthropic's native deferred loading: every MCP tool stays in the request, so the cached prefix is unchanged, and a search loads the matched definitions in place. Other models, including Claude through OpenRouter, GitHub Copilot, or Bedrock, get a tool list that grows as searches find tools. Each search costs an extra model round trip, so the native path defers only when the MCP tool definitions are large (roughly 8k tokens or more); smaller catalogs are sent in full, as with tool search off. On the other models, turning tool search off can be cheaper with only a few MCP tools.
+Claude 4.5 and later models with Anthropic prompt caching, used directly or through a Coder instance, use Anthropic's native deferred loading: every MCP tool stays in the request, so the cached prefix is unchanged, and a search loads the matched definitions in place. Other models, including Claude through OpenRouter, GitHub Copilot, or Bedrock, get a tool list that grows as searches find tools. Each search costs an extra model round trip, so the native path defers only when the MCP tool definitions are large (roughly 8k tokens or more); smaller catalogs are sent in full, as with tool search off. On the other models, turning tool search off can be cheaper with only a few MCP tools.
 
 ## Behavior
 
@@ -141,6 +141,7 @@ If a server fails to start:
 1. **Test the command manually** — Run the command in your terminal to verify it works
 2. **Check dependencies** — Ensure required packages are installed (`npx -y` downloads on first run)
 3. **Use the Test button** — Settings → MCP shows connection errors inline
+4. **Use the final URL of a remote server** — Xum follows a redirect of a remote MCP server only when it stays on the same origin (scheme, host and port) and keeps the request method (a 307 or 308, or any redirect of a GET). `http` to `https` on the same host also works when neither URL has a port. Any other redirect fails with `Redirect to <url> not followed`, so your headers never reach a host you did not configure. Put that URL in the server config.
 
 ## Claude Design experiment
 

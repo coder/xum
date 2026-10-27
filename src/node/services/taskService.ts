@@ -111,6 +111,7 @@ import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
 } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
+import { isProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
 import {
@@ -194,6 +195,8 @@ import type {
   WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
+// Outside the agent loop: TaskService passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentId } from "@/common/types/agentDefinition";
 import {
@@ -318,7 +321,7 @@ import { hasCompletedAgentReport } from "@/common/utils/agentTaskCompletion";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { StartupRecoveryState } from "@/node/services/startupRecovery";
 import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
-import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
+import { LegacyTodoNudgePolicyTrace, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import {
@@ -1071,7 +1074,47 @@ export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMes
 interface TrustedDescendantMessageOptions {
   messageLabel?: string;
   preTurnMessages?: MuxMessage[];
+  /** Internal (F54): set only by scheduleDeferredDescendantMessage's redelivery. */
+  redelivery?: DeferredDescendantRedelivery;
 }
+
+/** One deferred redelivery attempt of a trusted descendant message (F54). */
+interface DeferredDescendantRedelivery {
+  /** The Stop fence of the original send: a Stop during the wait still wins. */
+  stopFence: ReadonlyMap<string, number>;
+  /** Earlier waits for this message; at the bound, the message takes the live path. */
+  attempt: number;
+  /** Set by the dispatch when the target is still streaming without a task execution. */
+  deferAgain: boolean;
+}
+
+/** A trusted descendant message whose delivery waits for an idle target (F54). */
+interface DeferredDescendantMessage {
+  ancestorWorkspaceId: string;
+  taskId: string;
+  trimmedMessage: string;
+  queueDispatchMode: TaskMessageQueueDispatchMode;
+  sender: "ancestor" | "sibling";
+  options: TrustedDescendantMessageOptions | undefined;
+  stopFence: ReadonlyMap<string, number>;
+}
+
+function resolveDescendantMessageStopFence(
+  options: TrustedDescendantMessageOptions | undefined,
+  captured: ReadonlyMap<string, number>
+): ReadonlyMap<string, number> {
+  return options?.redelivery?.stopFence ?? captured;
+}
+
+function isInactiveAgentTaskStatus(
+  status: AgentTaskStatus | undefined,
+  legacyArchived: boolean
+): boolean {
+  return status === "reported" || status === "interrupted" || legacyArchived;
+}
+
+/** After this many idle waits, a deferred message falls back to plain live delivery. */
+const MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS = 5;
 
 type TreeMessageSpec =
   | {
@@ -2072,6 +2115,10 @@ function isManualUserSupersessionMessage(message: MuxMessage): boolean {
   );
 }
 
+function withToolPolicy(toolPolicy: ToolPolicy | undefined): { toolPolicy?: ToolPolicy } {
+  return toolPolicy != null ? { toolPolicy } : {};
+}
+
 function isResetBoundaryMessage(message: MuxMessage): boolean {
   return message.metadata?.contextBoundaryKind === CONTEXT_BOUNDARY_KINDS.RESET;
 }
@@ -2188,6 +2235,8 @@ async function readTaskBaseCommitShaByProjectPath(params: {
   runtime: Runtime;
 }): Promise<Record<string, string>> {
   const projectRepos = getWorkspaceProjectRepos({
+    // Outside the agent loop: the host's runtimes.
+    runtimeFactory: nodeRuntimeFactory,
     workspaceId: params.workspaceId,
     workspaceName: params.workspaceName,
     workspacePath: params.workspacePath,
@@ -2331,6 +2380,8 @@ export class TaskService implements AgentTaskIntegration {
   // tests and shutdown can await them; drains are idempotent and re-triggered on owner idle events.
   private readonly pendingTerminalAttentionDrainsByOwner = new Map<string, Promise<void>>();
   private readonly pendingTerminalAttentionDrains = new Set<Promise<void>>();
+  /** Tail of each task's chain of deferred trusted messages (F54), in send order. */
+  private readonly deferredDescendantMessagesByTask = new Map<string, Promise<void>>();
   private readonly pendingTerminalAttentionIdleWaitsByOwner = new Map<string, Promise<void>>();
   // Sub-agent terminal notifications this process just enqueued while their owner was streaming,
   // mapped to that owner turn's generation (owner -> notification ID -> turn). The next drain takes
@@ -5203,7 +5254,7 @@ export class TaskService implements AgentTaskIntegration {
         (this.parkedPeerSendsByTarget.get(targetId)?.length ?? 0),
     });
     this.terminalAttentionStore = terminalAttentionStore ?? new TerminalAttentionStore(config);
-    this.gitPatchArtifactService = new GitPatchArtifactService(config);
+    this.gitPatchArtifactService = new GitPatchArtifactService(config, historyService.locks);
 
     this.aiService.on("stream-end", (payload: unknown) => {
       if (!isStreamEndEvent(payload)) return;
@@ -5512,6 +5563,8 @@ export class TaskService implements AgentTaskIntegration {
     if (agentIdCandidates.length === 0) {
       return false;
     }
+    // #6426: one cached config load per call (not per candidate or per read).
+    const projectPluginsTrusted = isProjectTrusted(this.config, entry.projectPath);
 
     const workspacePath = coerceNonEmptyString(entry.workspace.path);
     const workspaceName = coerceNonEmptyString(entry.workspace.name) ?? entry.workspace.id;
@@ -5561,7 +5614,8 @@ export class TaskService implements AgentTaskIntegration {
           const agentDefinition = await readAgentDefinition(
             discovery.runtime,
             discovery.workspacePath,
-            agentId
+            agentId,
+            { projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
           );
           const chain = await resolveAgentInheritanceChain({
             runtime: discovery.runtime,
@@ -5569,6 +5623,8 @@ export class TaskService implements AgentTaskIntegration {
             agentId: agentDefinition.id,
             agentDefinition,
             workspaceId: entry.workspace.id ?? workspaceName,
+            projectPluginsTrusted,
+            runtimeFactory: nodeRuntimeFactory,
           });
 
           if (agentDefinition.scope === "project") {
@@ -6717,6 +6773,8 @@ export class TaskService implements AgentTaskIntegration {
       return Err(`Task.createMany: parent workspace not found (${parentMetaResult.error})`);
     }
     const parentMeta = parentMetaResult.data;
+    // #6426: once per reservation, from the loaded config.
+    const projectPluginsTrusted = isWorkspaceProjectTrustedIn(cfg.projects, parentMeta);
     const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
     if (
       parentEntry != null &&
@@ -6813,7 +6871,10 @@ export class TaskService implements AgentTaskIntegration {
 
     const getRunnableHint = async (): Promise<string> => {
       try {
-        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath);
+        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
+          projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
+        });
         const runnableIds = (
           await Promise.all(
             allAgents.map(async (agent) => {
@@ -6822,7 +6883,11 @@ export class TaskService implements AgentTaskIntegration {
                   runtime,
                   parentWorkspacePath,
                   agent.id,
-                  { skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope) }
+                  {
+                    skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
+                    projectPluginsTrusted,
+                    runtimeFactory: nodeRuntimeFactory,
+                  }
                 );
                 if (
                   !isAgentRunnableAsChild(frontmatter, {
@@ -6857,7 +6922,10 @@ export class TaskService implements AgentTaskIntegration {
     let frontmatterJson: string;
     try {
       const definitionRead = await this.readCancellable(
-        resolveAgentDefinition(runtime, parentWorkspacePath, agentId),
+        resolveAgentDefinition(runtime, parentWorkspacePath, agentId, {
+          projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
+        }),
         signal
       );
       if (definitionRead.kind !== "ok") return Err(progress.interruptedError());
@@ -6907,6 +6975,8 @@ export class TaskService implements AgentTaskIntegration {
             runtime,
             workspacePath: parentWorkspacePath,
             workspaceId: parentWorkspaceId,
+            projectPluginsTrusted,
+            runtimeFactory: nodeRuntimeFactory,
           },
         }),
         signal
@@ -7051,7 +7121,10 @@ export class TaskService implements AgentTaskIntegration {
       let definitionNow: { source?: string; frontmatter: unknown };
       try {
         const definitionNowRead = await this.readCancellable(
-          resolveAgentDefinition(plan.runtime, plan.parentWorkspacePath, plan.agentId),
+          resolveAgentDefinition(plan.runtime, plan.parentWorkspacePath, plan.agentId, {
+            projectPluginsTrusted: isWorkspaceProjectTrustedIn(cfg.projects, parentMetaNow.data),
+            runtimeFactory: nodeRuntimeFactory,
+          }),
           signal
         );
         if (definitionNowRead.kind !== "ok") return interrupted();
@@ -8655,6 +8728,8 @@ export class TaskService implements AgentTaskIntegration {
 
     // Enforce nesting depth.
     const cfg = this.config.loadConfigOrDefault();
+    // #6426: once per create, from the loaded config.
+    const projectPluginsTrusted = isWorkspaceProjectTrustedIn(cfg.projects, parentMeta);
     const taskSettings = cfg.taskSettings ?? DEFAULT_TASK_SETTINGS;
     const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
     const legacyParentRow = this.legacyParentRowOf(cfg, parentWorkspaceId);
@@ -8779,7 +8854,10 @@ export class TaskService implements AgentTaskIntegration {
     // with base: exec) still count as runnable.
     const getRunnableHint = async (): Promise<string> => {
       try {
-        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath);
+        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
+          projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
+        });
 
         const runnableIds = (
           await Promise.all(
@@ -8791,6 +8869,8 @@ export class TaskService implements AgentTaskIntegration {
                   agent.id,
                   {
                     skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
+                    projectPluginsTrusted,
+                    runtimeFactory: nodeRuntimeFactory,
                   }
                 );
                 if (
@@ -8824,7 +8904,10 @@ export class TaskService implements AgentTaskIntegration {
 
     let skipInitHook = false;
     try {
-      const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId);
+      const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId, {
+        projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
+      });
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
         const hint = await getRunnableHint();
         return Err(`Task.create: agentId is not runnable as a sub-agent (${agentId}). ${hint}`);
@@ -8875,6 +8958,8 @@ export class TaskService implements AgentTaskIntegration {
           runtime,
           workspacePath: parentWorkspacePath,
           workspaceId: parentWorkspaceId,
+          projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
         },
       }));
     } catch (error) {
@@ -9847,7 +9932,8 @@ export class TaskService implements AgentTaskIntegration {
    * falls back to resolving without layers. Never mutates.
    */
   private async prepareReawakenAi(taskId: string): Promise<PreparedReawakenAi | undefined> {
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    const cfg = this.config.loadConfigOrDefault();
+    const entry = findWorkspaceEntry(cfg, taskId);
     if (entry == null) return undefined;
     const workspace = entry.workspace;
     if (
@@ -9866,13 +9952,20 @@ export class TaskService implements AgentTaskIntegration {
     const contextKey = buildReawakenContextKey(entry);
     let context: ReturnType<typeof buildWorkspaceAgentContext>;
     try {
-      context = buildWorkspaceAgentContext({
-        runtimeConfig: workspace.runtimeConfig,
-        projectPath: entry.projectPath,
-        workspaceName,
-        persistedWorkspacePath: workspace.path,
-        subProjectPath: workspace.subProjectPath,
-      });
+      context = buildWorkspaceAgentContext(
+        {
+          runtimeConfig: workspace.runtimeConfig,
+          projectPath: entry.projectPath,
+          workspaceName,
+          persistedWorkspacePath: workspace.path,
+          subProjectPath: workspace.subProjectPath,
+        },
+        // #6426: from the snapshot loaded above (no second config read).
+        isWorkspaceProjectTrustedIn(cfg.projects, {
+          kind: workspace.kind,
+          projectPath: entry.projectPath,
+        })
+      );
     } catch (error) {
       log.debug("prepareReawakenAi: definition context unavailable", {
         taskId,
@@ -9886,6 +9979,8 @@ export class TaskService implements AgentTaskIntegration {
         runtime: context.runtime,
         workspacePath: context.workspacePath,
         workspaceId: taskId,
+        projectPluginsTrusted: context.projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       },
       { abortSignal: AbortSignal.timeout(REAWAKEN_DEFINITION_READ_TIMEOUT_MS) }
     );
@@ -9975,7 +10070,19 @@ export class TaskService implements AgentTaskIntegration {
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     // Before the first await: a Stop of the child or any ancestor (the sender's included) that
     // lands while this send is suspended overtakes a reawakening it decides on.
-    const stopFence = this.captureReawakeningStopFence(taskId);
+    const stopFence = resolveDescendantMessageStopFence(
+      options,
+      this.captureReawakeningStopFence(taskId)
+    );
+    const deferral = {
+      ancestorWorkspaceId,
+      taskId,
+      trimmedMessage,
+      queueDispatchMode,
+      sender,
+      options,
+      stopFence,
+    };
     const messageLabel = options?.messageLabel ?? "Updated guidance from parent";
     // Keep the labeled message explicit in the child transcript so it cannot be confused
     // with the original brief, whoever the sender is.
@@ -10092,13 +10199,13 @@ export class TaskService implements AgentTaskIntegration {
           entry.workspace.archivedAt,
           entry.workspace.unarchivedAt
         );
-        if (
+        const inactive =
           !continuationActive &&
-          (entry.workspace.taskStatus === "reported" ||
-            entry.workspace.taskStatus === "interrupted" ||
-            legacyArchived) &&
-          !this.aiService.isStreaming(taskId)
-        ) {
+          isInactiveAgentTaskStatus(entry.workspace.taskStatus, legacyArchived);
+        if (this.deferDescendantMessage(deferral, inactive)) {
+          return Ok({ delivery: "queued" as const, queueDispatchMode });
+        }
+        if (inactive && !this.aiService.isStreaming(taskId)) {
           return this.reactivateInactiveAgentTask({
             ancestorWorkspaceId,
             taskId,
@@ -10235,6 +10342,88 @@ export class TaskService implements AgentTaskIntegration {
         return Ok(accepted ? { delivery: "accepted" } : { delivery: "queued", queueDispatchMode });
       })
     );
+  }
+
+  /**
+   * Send order (F54): while an earlier message to this task waits for the target to go idle, a new
+   * message queues behind it instead of overtaking it. Redeliveries are the chain itself.
+   */
+  private deferDescendantMessage(params: DeferredDescendantMessage, inactive: boolean): boolean {
+    if (
+      params.options?.redelivery == null &&
+      this.deferredDescendantMessagesByTask.has(params.taskId)
+    ) {
+      this.scheduleDeferredDescendantMessage(params);
+      return true;
+    }
+    return inactive && this.deferWhileTargetStreamsWithoutExecution(params);
+  }
+
+  /**
+   * F54: an inactive task's stream belongs to no task execution (for example the tail of one that
+   * just settled). A message queued into it would run as a plain turn that cannot report, message
+   * or spawn, so it waits until the target is idle, where it reawakens the task. After
+   * MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS waits it falls back to the live path.
+   */
+  private deferWhileTargetStreamsWithoutExecution(params: DeferredDescendantMessage): boolean {
+    if (!this.aiService.isStreaming(params.taskId)) return false;
+    const redelivery = params.options?.redelivery;
+    if (redelivery == null) {
+      this.scheduleDeferredDescendantMessage(params);
+      return true;
+    }
+    if (redelivery.attempt >= MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS) return false;
+    redelivery.deferAgain = true;
+    return true;
+  }
+
+  /**
+   * Redeliver a trusted descendant message once the target is idle (see the F54 note in
+   * dispatchTrustedDescendantMessage). Messages to one task chain in send order. The chain is the
+   * owner: tracked with terminal attention drains (tests await them) and failures are logged.
+   * Like the session queue it replaces for this case, the wait is in memory only.
+   */
+  private scheduleDeferredDescendantMessage(params: DeferredDescendantMessage): void {
+    const previous = this.deferredDescendantMessagesByTask.get(params.taskId);
+    const deliver = async () => {
+      // A message behind an earlier one tries at once when that one is done: the earlier one may
+      // have reawakened the task, whose live execution then takes this message as guidance.
+      let waitForIdle = previous == null;
+      await previous;
+      for (let attempt = 0; ; attempt++) {
+        if (waitForIdle) await this.workspaceService.waitForIdleAndNoQueuedMessages(params.taskId);
+        waitForIdle = true;
+        const redelivery = { stopFence: params.stopFence, attempt, deferAgain: false };
+        const result = await this.dispatchTrustedDescendantMessage(
+          params.ancestorWorkspaceId,
+          params.taskId,
+          params.trimmedMessage,
+          params.queueDispatchMode,
+          params.sender,
+          { ...params.options, redelivery }
+        );
+        if (redelivery.deferAgain) continue;
+        if (!result.success) {
+          log.warn("Deferred descendant message was not delivered", {
+            taskId: params.taskId,
+            error: result.error,
+          });
+        }
+        return;
+      }
+    };
+    const promise = deliver()
+      .catch((error: unknown) => {
+        log.warn("Deferred descendant message failed", { taskId: params.taskId, error });
+      })
+      .finally(() => {
+        this.pendingTerminalAttentionDrains.delete(promise);
+        if (this.deferredDescendantMessagesByTask.get(params.taskId) === promise) {
+          this.deferredDescendantMessagesByTask.delete(params.taskId);
+        }
+      });
+    this.deferredDescendantMessagesByTask.set(params.taskId, promise);
+    this.pendingTerminalAttentionDrains.add(promise);
   }
 
   private taskGuidanceSendOptions(
@@ -12826,8 +13015,9 @@ export class TaskService implements AgentTaskIntegration {
     // Manual rows still define both wholesale (absence means lifted).
     const state: {
       pin: { strictAgentResolution?: SendMessageOptions["strictAgentResolution"] } | null;
-      restrictions: { toolPolicy?: ToolPolicy; disableWorkspaceAgents?: boolean } | null;
-    } = { pin: null, restrictions: null };
+      restrictions: { disableWorkspaceAgents?: boolean } | null;
+      trace: LegacyTodoNudgePolicyTrace;
+    } = { pin: null, restrictions: null, trace: new LegacyTodoNudgePolicyTrace(undefined) };
     const historyResult = await this.historyService.iterateFullHistory(
       ownerWorkspaceId,
       "backward",
@@ -12849,6 +13039,9 @@ export class TaskService implements AgentTaskIntegration {
           if (isCompactionRequestMessage(message)) {
             continue;
           }
+          // Rows older than the one that defined the restrictions only prove where its policy
+          // came from (see LegacyTodoNudgePolicyTrace).
+          state.trace.visit(message);
           const metadata = message.metadata;
           // The strict-agent pin lives in the row's retry snapshot: an explicit agent override
           // must stay loud on the wake too, or a vanished/corrupted definition would silently
@@ -12893,14 +13086,17 @@ export class TaskService implements AgentTaskIntegration {
                 messageId: message.id,
               });
             }
+            // The returned policy is the trace's: it drops a legacy TODO-nudge rule only when
+            // older rows prove that Xum added it.
+            state.trace = new LegacyTodoNudgePolicyTrace(parsedPolicy?.data);
+            state.trace.visit(message);
             state.restrictions = {
-              ...(parsedPolicy?.success ? { toolPolicy: parsedPolicy.data } : {}),
               ...(typeof metadata?.disableWorkspaceAgents === "boolean"
                 ? { disableWorkspaceAgents: metadata.disableWorkspaceAgents }
                 : {}),
             };
           }
-          if (state.pin != null && state.restrictions != null) {
+          if (state.pin != null && state.restrictions != null && state.trace.finished) {
             return false;
           }
         }
@@ -12910,7 +13106,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!historyResult.success) {
       throw new Error(`history unavailable: ${historyResult.error}`);
     }
-    return { ...(state.restrictions ?? {}), ...(state.pin ?? {}) };
+    return { ...state.restrictions, ...withToolPolicy(state.trace.policy), ...state.pin };
   }
 
   private scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId: string): void {
@@ -15522,6 +15718,8 @@ export class TaskService implements AgentTaskIntegration {
               namedWorkspacePath: workspacePath,
             }),
             projectRepos: getWorkspaceProjectRepos({
+              // Outside the agent loop: the host's runtimes.
+              runtimeFactory: nodeRuntimeFactory,
               workspaceId: taskId,
               workspaceName,
               workspacePath,
@@ -17249,7 +17447,14 @@ export class TaskService implements AgentTaskIntegration {
           const frontmatter = await resolveAgentFrontmatter(
             parentRuntime,
             parentWorkspacePath,
-            agentId
+            agentId,
+            {
+              projectPluginsTrusted: isWorkspaceProjectTrustedIn(config.projects, {
+                kind: parentEntry.workspace.kind,
+                projectPath: parentEntry.projectPath,
+              }),
+              runtimeFactory: nodeRuntimeFactory,
+            }
           );
           skipInitHook = frontmatter.subagent?.skip_init_hook === true;
         } catch (error: unknown) {
@@ -19848,6 +20053,7 @@ export class TaskService implements AgentTaskIntegration {
       for (const ancestorWorkspaceId of ancestorWorkspaceIds) {
         try {
           await upsertSubagentFailureArtifact({
+            locks: this.historyService.locks,
             workspaceId: ancestorWorkspaceId,
             workspaceSessionDir: path.join(this.config.sessionsDir, ancestorWorkspaceId),
             childTaskId: workspaceId,
@@ -20135,7 +20341,7 @@ export class TaskService implements AgentTaskIntegration {
         const runtime = createRuntimeForWorkspace(info);
         const planResult = await readPlanFile(
           runtime,
-          await resolvePlanFileLocation(this.config, runtime, info)
+          await resolvePlanFileLocation(this.config, runtime, info, this.historyService.locks)
         );
         if (planResult.exists && planResult.content.trim().length > 0) {
           if (planResult.path !== args.proposePlanResult.planPath) {
@@ -20248,7 +20454,7 @@ export class TaskService implements AgentTaskIntegration {
           const runtime = createRuntimeForWorkspace(info);
           const planResult = await readPlanFile(
             runtime,
-            await resolvePlanFileLocation(this.config, runtime, info)
+            await resolvePlanFileLocation(this.config, runtime, info, this.historyService.locks)
           );
           if (planResult.exists) {
             planSummary = { content: planResult.content, path: planResult.path };
@@ -21331,6 +21537,7 @@ export class TaskService implements AgentTaskIntegration {
       try {
         const ancestorSessionDir = path.join(this.config.sessionsDir, ancestorWorkspaceId);
         await upsertSubagentReportArtifact({
+          locks: this.historyService.locks,
           workspaceId: ancestorWorkspaceId,
           workspaceSessionDir: ancestorSessionDir,
           childTaskId: childWorkspaceId,

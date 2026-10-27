@@ -126,7 +126,9 @@ async function waitForPageSettled(container: HTMLElement): Promise<void> {
 export async function setupWorkspaceView(
   view: RenderedApp,
   metadata: FrontendWorkspaceMetadata,
-  workspaceId: string
+  workspaceId: string,
+  /** False for a test that acts during workspace setup (#7449). */
+  options: { waitForSetup?: boolean } = {}
 ): Promise<void> {
   await view.waitForReady();
 
@@ -152,7 +154,8 @@ export async function setupWorkspaceView(
     () => {
       const el = view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
       if (!el) throw new Error("Workspace not found in sidebar");
-      // Wait until the workspace is selectable (not still creating) before clicking.
+      // Wait until the workspace is selectable before clicking. aria-disabled covers only
+      // removing and archiving; the setup wait comes after the click.
       if (el.getAttribute("aria-disabled") === "true") {
         throw new Error("Workspace still disabled");
       }
@@ -162,6 +165,24 @@ export async function setupWorkspaceView(
   );
   fireEvent.click(workspaceElement);
   await waitForPageSettled(view.container);
+
+  // Wait until the row has left workspace setup: while setup runs, it shows a cancel button in
+  // place of its actions menu, hides quick archive, and the Review tab shows a placeholder. Tests
+  // that used those controls right away raced setup on slow runners (#7450, #7541, #7543).
+  // Positive signal, not copy: the row's actions-menu trigger (the only popover trigger carrying
+  // the row's data-workspace-id) renders only once setup has ended. If it is ever removed, this
+  // wait fails loudly instead of passing at once.
+  if (options.waitForSetup !== false) {
+    await waitFor(
+      () => {
+        const menuTrigger = view.container.querySelector(
+          `button[data-workspace-id="${workspaceId}"][aria-haspopup]`
+        );
+        if (!menuTrigger) throw new Error("Workspace still in setup (no actions menu yet)");
+      },
+      { timeout: 30_000 }
+    );
+  }
 
   // Ensure the workspace is registered and activated in the store so that
   // runOnChatSubscription starts. In the real app, WorkspaceContext handles
@@ -363,11 +384,18 @@ export function setupTestDom(options?: { enableTutorial?: boolean }): () => void
   const { installDom } = require("./dom") as typeof import("./dom");
   const cleanupDom = installDom();
 
-  if (!options?.enableTutorial) {
-    disableTutorial();
+  if (options?.enableTutorial) {
+    return cleanupDom;
   }
-
-  return cleanupDom;
+  // The workspace tutorial opens 300 ms after a workspace view mounts and moves focus into its
+  // bubble, so focus and blur assertions would race it (#7120). Cleanup restores the flag, so later
+  // renders in the same test file keep their own tutorial setting.
+  const previousTutorialOptIn = globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__;
+  disableTutorial();
+  return () => {
+    cleanupDom();
+    globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = previousTutorialOptIn;
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

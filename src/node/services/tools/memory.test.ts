@@ -16,6 +16,7 @@ import type { MemoryToolResult } from "@/common/types/tools";
 import { MEMORY_SCOPES, type MemoryScopeAccess, type MemoryScope } from "@/common/constants/memory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { getToolsForModel, type ToolConfiguration } from "@/common/utils/tools/tools";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function pathExists(target: string): Promise<boolean> {
   return fsPromises.access(target).then(
@@ -430,6 +431,7 @@ describe("memory tool", () => {
       const tools = await getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: tempDir.path,
           runtime: new LocalRuntime(tempDir.path),
           runtimeTempDir: tempDir.path,

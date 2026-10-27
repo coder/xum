@@ -13,9 +13,33 @@ export async function openSidebarNewTab(scope: HTMLElement): Promise<void> {
  * modal stays mounted, so plays should query within the dialog rather than the whole canvas.
  */
 export async function openSettingsDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
-  const canvas = within(canvasElement);
-  await userEvent.click(await canvas.findByTestId("settings-button", {}, { timeout: 10000 }));
+  await openLeftSidebar(canvasElement);
+  await userEvent.click(within(canvasElement).getByTestId("settings-button"));
   return findSettingsDialog(canvasElement.ownerDocument);
+}
+
+/**
+ * Open the left sidebar when it is collapsed, so plays can reach its controls (the titlebar's
+ * settings button, project rows). At phone widths (Pixel's phone and tablet variants) the sidebar
+ * is a drawer that starts closed each time a story mounts, whatever `expandLeftSidebar()` saved.
+ */
+export async function openLeftSidebar(canvasElement: HTMLElement): Promise<void> {
+  const canvas = within(canvasElement);
+  const openToggle = () => canvas.queryByRole("button", { name: "Open sidebar menu" });
+  await waitFor(
+    () => {
+      if (!canvas.queryByTestId("settings-button") && !openToggle()) {
+        throw new Error("Neither the sidebar nor its open toggle rendered yet");
+      }
+    },
+    { timeout: 10000 }
+  );
+  const toggle = canvas.queryByTestId("settings-button") ? null : openToggle();
+  if (toggle) {
+    // A native click: userEvent's synthetic hover could leave the toggle's tooltip in a snapshot.
+    toggle.click();
+    await canvas.findByTestId("settings-button", {}, { timeout: 10000 });
+  }
 }
 
 /**
@@ -30,13 +54,42 @@ export async function findSettingsDialog(doc: Document = document): Promise<HTML
     { name: "Settings" },
     { timeout: 10000 }
   );
-  // Inline `auto` is Radix's own signal that this modal layer is registered and on top.
-  await waitFor(() => {
-    if (dialog.style.pointerEvents !== "auto") {
-      throw new Error("Settings dialog does not take pointer events yet");
-    }
-  });
+  return waitForModalLayer(dialog);
+}
+
+/**
+ * Wait until a Radix modal layer (Dialog, AlertDialog) is registered and on top, then return it.
+ * A new layer renders with `pointer-events: none` and an unknown stack index. Its effect then
+ * registers it, and only the re-render after that sets inline `auto`, Radix's own signal. Before
+ * it, clicks fail with "pointer-events: none" and Escape is ignored (#7648).
+ */
+export async function waitForModalLayer(dialog: HTMLElement): Promise<HTMLElement> {
+  await waitFor(
+    () => {
+      if (dialog.style.pointerEvents !== "auto") {
+        throw new Error("Modal layer does not take pointer events yet");
+      }
+    },
+    { timeout: 5000 }
+  );
   return dialog;
+}
+
+/**
+ * Click `element` once it takes pointer events. Use it for a control in a modal layer that just
+ * opened or just came back on top (a nested confirm closed), when the play does not hold that
+ * layer's element; with the element, use waitForModalLayer.
+ */
+export async function clickWhenReady(element: HTMLElement): Promise<void> {
+  await waitFor(
+    () => {
+      if (getComputedStyle(element).pointerEvents === "none") {
+        throw new Error("Element does not take pointer events yet");
+      }
+    },
+    { timeout: 5000 }
+  );
+  await userEvent.click(element);
 }
 
 export function getSettingsDialog(): HTMLElement {

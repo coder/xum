@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/browser/components/Tooltip/Tooltip";
-import { Input } from "@/browser/components/Input/Input";
 import { Switch } from "@/browser/components/Switch/Switch";
 import { Button } from "@/browser/components/Button/Button";
 import { ModelSelector } from "@/browser/components/ModelSelector/ModelSelector";
@@ -52,6 +51,7 @@ import { normalizeAgentId } from "@/common/utils/agentIds";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { FALLBACK_AGENTS, deriveTasksSectionAgentGroups } from "./TasksSection.agents";
 import { AgentResourceLimitsSettings } from "./AgentResourceLimitsSettings";
+import { TaskLimitInput } from "./TaskLimitInput";
 
 const INHERIT = "__inherit__";
 /** Shown while an autosave waits for the connection. */
@@ -63,7 +63,20 @@ const OFFLINE_SAVE_MESSAGE =
 // apply reasoningMode. Never offer a Pro/Cyber toggle that cannot affect requests.
 // Compact stays eligible: compaction goes through the send path, which
 // threads reasoningMode.
-const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace", "intuition"]);
+const HEADLESS_REASONING_AGENT_IDS = new Set(["dream", "name_workspace"]);
+/** The status page agent runs with thinking off (raw streamText, no provider options). */
+const NO_REASONING_AGENT_IDS = new Set(["status_page"]);
+
+/**
+ * The status page agent only runs when Artifacts, Agent interface view and Status page agent are
+ * all on (see statusPageAgentService); its Settings card mirrors that gate.
+ */
+function useStatusPageAgentEnabled(): boolean {
+  const artifactsEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS);
+  const agentInterfaceEnabled = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE);
+  const statusPageAgentFlag = useExperimentValue(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT);
+  return artifactsEnabled && agentInterfaceEnabled && statusPageAgentFlag;
+}
 
 function getAgentDefinitionPath(agent: AgentDefinitionDescriptor): string | null {
   switch (agent.scope) {
@@ -138,6 +151,60 @@ function updateAgentSubagentProfile(
 interface TasksSectionSavePayload {
   taskSettings: TaskSettings;
   agentAiDefaults: AgentAiDefaults;
+}
+
+interface PendingSaveFlushProps {
+  /** Null until the config loaded: a flush before that would save defaults over the config. */
+  api: ReturnType<typeof useAPI>["api"];
+  saveTimerRef: { current: ReturnType<typeof setTimeout> | null };
+  savingRef: { current: boolean };
+  pendingSaveRef: { current: TasksSectionSavePayload | null };
+}
+
+function usePendingSaveFlush(props: PendingSaveFlushProps): void {
+  // Flush any pending debounced save on unmount and on pagehide so changes aren't lost: a
+  // reload does not unmount React, so a change made in the last 400 ms was lost (#7157).
+  // Best effort: the page can go away before the request leaves.
+  const { api, saveTimerRef, savingRef, pendingSaveRef } = props;
+  useEffect(() => {
+    if (!api) return;
+
+    const flushPendingSave = () => {
+      clearSaveTimer(saveTimerRef);
+
+      if (savingRef.current) return;
+      const payload = pendingSaveRef.current;
+      if (!payload) return;
+
+      pendingSaveRef.current = null;
+      savingRef.current = true;
+      void api.config
+        .saveConfig(payload)
+        .catch(() => undefined)
+        .finally(() => {
+          savingRef.current = false;
+        });
+    };
+    const onPageHide = () => {
+      if (!savingRef.current) {
+        flushPendingSave();
+        return;
+      }
+      // An autosave is in flight: its completion would send the newer change, but the page can
+      // be gone by then. Send it now too (best effort, after the in-flight save on the channel).
+      clearSaveTimer(saveTimerRef);
+      const payload = pendingSaveRef.current;
+      if (!payload) return;
+      pendingSaveRef.current = null;
+      void api.config.saveConfig(payload).catch(() => undefined);
+    };
+    window.addEventListener("pagehide", onPageHide);
+
+    return () => {
+      window.removeEventListener("pagehide", onPageHide);
+      flushPendingSave();
+    };
+  }, [api, saveTimerRef, savingRef, pendingSaveRef]);
 }
 
 function renderPolicySummary(agent: AgentDefinitionDescriptor): React.ReactNode {
@@ -307,9 +374,10 @@ interface AiDefaultsControlsProps {
   reasoningModeValue: OpenAIReasoningMode;
   reasoningModeInherited?: boolean;
   modelCapabilitiesDeferred?: boolean;
-  applyMinimumThinkingLevel?: boolean;
   /** Forwarded to the picker; false hides the Pro and Cyber toggles (e.g. Dream, whose requests never apply reasoningMode). */
   allowReasoningModes?: boolean;
+  /** False hides the Reasoning control for agents whose runs never apply a thinking level. */
+  showReasoning?: boolean;
   effectiveModel: string | undefined;
   models: string[];
   hiddenModelsForSelector: string[];
@@ -320,6 +388,48 @@ interface AiDefaultsControlsProps {
   onModelChange: (value: string) => void;
   onThinkingChange: (value: string) => void;
   onReasoningModeChange: (mode: OpenAIReasoningMode) => void;
+}
+
+/** The Reasoning half of AiDefaultsControls. */
+function ReasoningDefaultsControl(props: AiDefaultsControlsProps & { inheritLabel: string }) {
+  return (
+    <div className="space-y-1">
+      <div className="text-muted text-xs">Reasoning</div>
+      <div className="flex items-center gap-2">
+        {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
+        <ThinkingSelectorControl
+          modelString={props.effectiveModel}
+          modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
+          thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
+          onThinkingLevelChange={(level) => props.onThinkingChange(level)}
+          reasoningMode={props.reasoningModeValue}
+          reasoningModeInherited={props.reasoningModeInherited}
+          onReasoningModeChange={props.onReasoningModeChange}
+          allowReasoningModes={props.allowReasoningModes}
+          allowFastMode={false}
+          variant="box"
+          inheritOption={{
+            label: props.inheritLabel,
+            // Inherit remains the fallback, but only Auto reads as selected.
+            selected: props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
+            onSelect: () => props.onThinkingChange(INHERIT),
+          }}
+          autoRouting={props.thinkingAutoRouting}
+        />
+        {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-9 px-2"
+            onClick={() => props.onThinkingChange(INHERIT)}
+          >
+            Reset
+          </Button>
+        ) : null}
+      </div>
+    </div>
+  );
 }
 
 function AiDefaultsControls(props: AiDefaultsControlsProps) {
@@ -355,44 +465,9 @@ function AiDefaultsControls(props: AiDefaultsControlsProps) {
         </div>
       </div>
 
-      <div className="space-y-1">
-        <div className="text-muted text-xs">Reasoning</div>
-        <div className="flex items-center gap-2">
-          {/* Reasoning defaults share the composer picker; speed remains a per-chat choice. */}
-          <ThinkingSelectorControl
-            modelString={props.effectiveModel}
-            modelCapabilitiesDeferred={props.modelCapabilitiesDeferred}
-            applyMinimumThinkingLevel={props.applyMinimumThinkingLevel}
-            thinkingLevel={coerceThinkingLevel(props.thinkingValue) ?? THINKING_LEVEL_OFF}
-            onThinkingLevelChange={(level) => props.onThinkingChange(level)}
-            reasoningMode={props.reasoningModeValue}
-            reasoningModeInherited={props.reasoningModeInherited}
-            onReasoningModeChange={props.onReasoningModeChange}
-            allowReasoningModes={props.allowReasoningModes}
-            allowFastMode={false}
-            variant="box"
-            inheritOption={{
-              label: inheritLabel,
-              // Inherit remains the fallback, but only Auto reads as selected.
-              selected:
-                props.thinkingValue === INHERIT && props.thinkingAutoRouting?.active !== true,
-              onSelect: () => props.onThinkingChange(INHERIT),
-            }}
-            autoRouting={props.thinkingAutoRouting}
-          />
-          {props.showThinkingResetButton === true && props.thinkingValue !== INHERIT ? (
-            <Button
-              type="button"
-              variant="ghost"
-              size="sm"
-              className="h-9 px-2"
-              onClick={() => props.onThinkingChange(INHERIT)}
-            >
-              Reset
-            </Button>
-          ) : null}
-        </div>
-      </div>
+      {props.showReasoning === false ? null : (
+        <ReasoningDefaultsControl {...props} inheritLabel={inheritLabel} />
+      )}
     </div>
   );
 }
@@ -440,8 +515,7 @@ export function TasksSection() {
   const memoryEnabled = useExperimentValue(EXPERIMENT_IDS.MEMORY);
   const memoryConsolidationFlag = useExperimentValue(EXPERIMENT_IDS.MEMORY_CONSOLIDATION);
   const memoryConsolidationEnabled = memoryEnabled && memoryConsolidationFlag;
-  const memoryIntuitionFlag = useExperimentValue(EXPERIMENT_IDS.MEMORY_INTUITION);
-  const memoryIntuitionEnabled = memoryEnabled && memoryIntuitionFlag;
+  const statusPageAgentEnabled = useStatusPageAgentEnabled();
 
   // Resolve the workspace's active model so that when a sub-agent's model is
   // "Inherit", we show thinking levels for the workspace model (falling back to
@@ -645,38 +719,21 @@ export function TasksSection() {
     };
   }, [liveApi, agentAiDefaults, loaded, loadFailed, taskSettings]);
 
-  // Flush any pending debounced save on unmount so changes aren't lost.
-  useEffect(() => {
-    if (!api) return;
-    if (!loaded) return;
-    if (loadFailed) return;
+  usePendingSaveFlush({
+    api: loaded && !loadFailed ? api : null,
+    saveTimerRef,
+    savingRef,
+    pendingSaveRef,
+  });
 
-    return () => {
-      clearSaveTimer(saveTimerRef);
-
-      if (savingRef.current) return;
-      const payload = pendingSaveRef.current;
-      if (!payload) return;
-
-      pendingSaveRef.current = null;
-      savingRef.current = true;
-      void api.config
-        .saveConfig(payload)
-        .catch(() => undefined)
-        .finally(() => {
-          savingRef.current = false;
-        });
-    };
-  }, [api, loaded, loadFailed]);
-
-  const setMaxParallelAgentTasks = (rawValue: string) => {
-    const parsed = Number(rawValue);
-    setTaskSettings((prev) => normalizeTaskSettings({ ...prev, maxParallelAgentTasks: parsed }));
+  // TaskLimitInput decides when a typed value is ready (#6384); this clamps and saves it.
+  const setMaxParallelAgentTasks = (value: number) => {
+    setTaskSettings((prev) => normalizeTaskSettings({ ...prev, maxParallelAgentTasks: value }));
   };
 
-  const setMaxTaskNestingDepth = (rawValue: string) => {
-    const parsed = Number(rawValue);
-    setTaskSettings((prev) => normalizeTaskSettings({ ...prev, maxTaskNestingDepth: parsed }));
+  // TaskLimitInput decides when a typed value is ready (#6384); this clamps and saves it.
+  const setMaxTaskNestingDepth = (value: number) => {
+    setTaskSettings((prev) => normalizeTaskSettings({ ...prev, maxTaskNestingDepth: value }));
   };
 
   const setProposePlanImplementReplacesChatHistory = (value: boolean) => {
@@ -867,14 +924,14 @@ export function TasksSection() {
         agentAiDefaults,
         portableDesktopEnabled,
         memoryConsolidationEnabled,
-        memoryIntuitionEnabled,
+        statusPageAgentEnabled,
       }),
     [
       agentAiDefaults,
       listedAgents,
       portableDesktopEnabled,
       memoryConsolidationEnabled,
-      memoryIntuitionEnabled,
+      statusPageAgentEnabled,
     ]
   );
   const execSubagentAgent = listedAgents.find(
@@ -933,8 +990,7 @@ export function TasksSection() {
     // a base-chain model wins over the ambient default (otherwise an agent
     // inheriting GPT-5.6+pro from its base would hide the Pro toggle whenever
     // the ambient model isn't pro-capable).
-    // Intuition resolves without ancestors, falling back to the parent turn's model.
-    const inheritedDefaults = agent.id === "intuition" ? {} : resolveBaseChainDefaults(agent.id);
+    const inheritedDefaults = resolveBaseChainDefaults(agent.id);
     const effectiveModel =
       modelValue !== INHERIT
         ? modelValue
@@ -1039,8 +1095,7 @@ export function TasksSection() {
           thinkingValue={thinkingValue}
           reasoningModeValue={entry?.reasoningMode ?? inheritedDefaults.reasoningMode ?? "standard"}
           allowReasoningModes={!HEADLESS_REASONING_AGENT_IDS.has(agent.id)}
-          // Intuition clamps to model capabilities, not the chat's minimum effort.
-          applyMinimumThinkingLevel={agent.id !== "intuition"}
+          showReasoning={!NO_REASONING_AGENT_IDS.has(agent.id)}
           effectiveModel={effectiveModel}
           models={models}
           hiddenModelsForSelector={hiddenModelsForSelector}
@@ -1174,15 +1229,12 @@ export function TasksSection() {
                 {TASK_SETTINGS_LIMITS.maxParallelAgentTasks.max}
               </div>
             </div>
-            <Input
-              type="number"
+            <TaskLimitInput
+              label="Max Parallel Agent Tasks"
               value={taskSettings.maxParallelAgentTasks}
               min={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.min}
               max={TASK_SETTINGS_LIMITS.maxParallelAgentTasks.max}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                setMaxParallelAgentTasks(e.target.value)
-              }
-              className="border-border-medium bg-background-secondary h-9 w-28"
+              onCommit={setMaxParallelAgentTasks}
             />
           </div>
 
@@ -1195,15 +1247,12 @@ export function TasksSection() {
                 {TASK_SETTINGS_LIMITS.maxTaskNestingDepth.max}
               </div>
             </div>
-            <Input
-              type="number"
+            <TaskLimitInput
+              label="Max Task Nesting Depth"
               value={taskSettings.maxTaskNestingDepth}
               min={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.min}
               max={TASK_SETTINGS_LIMITS.maxTaskNestingDepth.max}
-              onChange={(e: React.ChangeEvent<HTMLInputElement>) =>
-                setMaxTaskNestingDepth(e.target.value)
-              }
-              className="border-border-medium bg-background-secondary h-9 w-28"
+              onCommit={setMaxTaskNestingDepth}
             />
           </div>
 

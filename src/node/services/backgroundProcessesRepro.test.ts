@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { Effect } from "effect";
+import { Effect, Layer } from "effect";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -10,10 +10,12 @@ import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeClock } from "@/node/utils/hostClock";
 import { expectReproFailure } from "@/node/utils/repro.testHarness";
 import * as backgroundProcessExecutor from "./backgroundProcessExecutor";
 import { localBgWorkspaceDir } from "./backgroundProcessExecutor";
 import { BackgroundProcessManager, SPAWN_NAME_LOCK_FILENAME } from "./backgroundProcessManager";
+import { HostClockTag } from "./di/hostClockLive";
 import { BackgroundProcessManagerLive } from "./di/layers/core";
 import { BackgroundProcessManagerTag } from "./di/tags";
 import { projectWorkspace, saveWorkspaces } from "./taskService.testHarness";
@@ -275,7 +277,12 @@ describe("another backend's evidence of a command sent to the background", () =>
     return Effect.runSync(
       Effect.gen(function* () {
         return yield* BackgroundProcessManagerTag;
-      }).pipe(Effect.provide(BackgroundProcessManagerLive))
+      }).pipe(
+        Effect.provide(
+          // nodeClock is what HostClockLive gives production (the default Effect Clock).
+          BackgroundProcessManagerLive.pipe(Layer.provide(Layer.succeed(HostClockTag)(nodeClock)))
+        )
+      )
     );
   }
 

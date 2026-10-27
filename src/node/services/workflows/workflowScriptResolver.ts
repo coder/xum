@@ -7,6 +7,7 @@ import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import { isRuntimeTransportError, type Runtime } from "@/node/runtime/Runtime";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
   discoverAgentPlugins,
   readPluginFileWithinRootCapped,
@@ -72,6 +73,8 @@ export interface ResolveWorkflowScriptInput {
   skillStorageContext?: SkillStorageContext;
   /** Shared by the resolutions of one listing: each install's approved copies are read once. */
   approvedCopiesReads?: ApprovedCopiesReads;
+  /** Builds the host-local runtimes of a `skill://` path's skill read. */
+  runtimeFactory: RuntimeFactory;
 }
 
 const SKILL_SCRIPT_PATH_PREFIX = "skill://";
@@ -157,8 +160,12 @@ function readWorkflowSkill(
   const roots = workflowSkillRoots(input);
   const projectSearchRoot = roots?.projectSearchRoot ?? input.projectSearchRoot ?? workspacePath;
   return readAgentSkill(workflowSkillRuntime(input), workspacePath, skillName, {
-    ...(roots != null ? { roots } : { projectSearchRoot }),
+    // #6426: default roots include project plugin skills only in a trusted project.
+    ...(roots != null
+      ? { roots }
+      : { projectSearchRoot, projectPluginsTrusted: input.projectTrusted }),
     containment: workflowSkillContainment(input, projectSearchRoot),
+    runtimeFactory: input.runtimeFactory,
   });
 }
 
@@ -185,6 +192,24 @@ async function resolveSkillWorkflowScript(
   assertJavaScriptWorkflowPath(parsed.relativePath);
 
   const resolvedSkill = await readWorkflowSkill(input, parsed.skillName);
+
+  // A Claude command's skill directory is its plugin's commands folder: a script there is not
+  // part of the command, and a Claude package runs no Xum workflow code.
+  if (resolvedSkill.commandSkill === true) {
+    throw new Error(`Skill '${parsed.skillName}' is a Claude command and has no workflow scripts`);
+  }
+  // A Skills install loads skills only (installMethods.ts): its skills run no workflow scripts.
+  if (resolvedSkill.skillsOnlyPlugin === true) {
+    throw new Error(
+      `Skill '${parsed.skillName}' comes from a skills-only plugin install and has no workflow scripts`
+    );
+  }
+  // A Claude Code package runs no Xum code (docs/agents/agent-skills.mdx): no workflow scripts.
+  if (resolvedSkill.claudePackagePlugin === true) {
+    throw new Error(
+      `Skill '${parsed.skillName}' comes from a Claude Code plugin and has no workflow scripts`
+    );
+  }
 
   if (resolvedSkill.package.scope === "project" && !input.projectTrusted) {
     throw new Error("Project trust is required to run project skill workflow scripts");
@@ -262,6 +287,7 @@ export async function discoverWorkflowPlugins(input: {
     input.skillStorageContext?.roots ??
     getDefaultAgentSkillsRoots(input.runtime, input.workspacePath, {
       projectSearchRoot: input.projectSearchRoot,
+      projectPluginsTrusted: input.projectTrusted,
     });
   const projectContainmentRoot =
     input.skillStorageContext?.containment.kind === "local"

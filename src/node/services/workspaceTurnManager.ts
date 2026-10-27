@@ -3,10 +3,9 @@ import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import {
-  acquireCrossProcessLock,
   CrossProcessLockTimeoutError,
-  inspectCrossProcessLock,
-} from "@/node/utils/main/crossProcessLock";
+  type SessionLocks,
+} from "@/node/services/sessionLocks/sessionLocks";
 import assert from "node:assert/strict";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
@@ -42,6 +41,8 @@ import {
   agentReportProgressDedupePrefix,
 } from "@/constants/agentMessaging";
 import { log } from "@/node/services/log";
+// Outside the agent loop: WorkspaceTurnManager passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import {
   readAgentDefinition,
   resolveAgentFrontmatter,
@@ -49,6 +50,7 @@ import {
 import { resolveAgentInheritanceChain } from "@/node/services/agentDefinitions/resolveAgentInheritanceChain";
 import { isAgentEffectivelyDisabled } from "@/node/services/agentDefinitions/agentEnablement";
 import { resolveAgentVisibility } from "@/node/services/agentDefinitions/agentVisibility";
+import { isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import { createRuntimeContextForWorkspace } from "@/node/runtime/runtimeHelpers";
 import {
   formatRuntimeUnreachableError,
@@ -258,6 +260,11 @@ interface WorkspaceTurnAgentContext {
   workspacePath: string;
   /** Source config, kept so owner/target contexts can be compared for host identity. */
   runtimeConfig: RuntimeConfig;
+  /**
+   * #6426: whether this workspace's project plugin agents may load. Required so a caller
+   * that builds a context cannot forget the trust gate.
+   */
+  projectPluginsTrusted: boolean;
 }
 
 export interface WorkspaceAgentContextParams {
@@ -276,7 +283,9 @@ export interface WorkspaceAgentContextParams {
  * Shared with TaskService, which reads a reawakened child's definition chain.
  */
 export function buildWorkspaceAgentContext(
-  params: WorkspaceAgentContextParams
+  params: WorkspaceAgentContextParams,
+  /** #6426: from the config the caller already loaded (no config read here). */
+  projectPluginsTrusted: boolean
 ): WorkspaceTurnAgentContext {
   const context = createRuntimeContextForWorkspace({
     runtimeConfig: params.runtimeConfig,
@@ -288,6 +297,7 @@ export function buildWorkspaceAgentContext(
   return {
     ...context,
     runtimeConfig: params.runtimeConfig,
+    projectPluginsTrusted,
   };
 }
 
@@ -441,9 +451,10 @@ const WORKSPACE_TURN_OWNER_LOCK_STALE_MS = 5 * 60 * 1000;
 class OwnedWorkspaceTurnHandleStore extends TaskHandleStore {
   constructor(
     config: Config,
-    private readonly afterUpsert: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>
+    private readonly afterUpsert: (record: WorkspaceTurnTaskHandleRecord) => Promise<void>,
+    locks: SessionLocks
   ) {
-    super(config);
+    super(config, locks);
   }
 
   override async upsertWorkspaceTurn(record: WorkspaceTurnTaskHandleRecord): Promise<void> {
@@ -724,8 +735,12 @@ export class WorkspaceTurnManager {
     private readonly streamManager?: StreamManager,
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
-    this.taskHandleStore = new OwnedWorkspaceTurnHandleStore(config, (record) =>
-      this.afterHandleWrite(record)
+    // Phase 4: every lock of this manager (publication, live owner, its probe) comes from the
+    // history service's SessionLocks, so a test layer can play another backend's owner.
+    this.taskHandleStore = new OwnedWorkspaceTurnHandleStore(
+      config,
+      (record) => this.afterHandleWrite(record),
+      historyService.locks
     );
   }
 
@@ -748,7 +763,7 @@ export class WorkspaceTurnManager {
   private async acquireTurnOwnerLock(handleId: string): Promise<"held" | "foreign-live"> {
     if (this.turnOwnerLocks.has(handleId)) return "held";
     try {
-      const release = await acquireCrossProcessLock({
+      const release = await this.historyService.locks.acquireCrossProcessLock({
         lockPath: workspaceTurnOwnerLockPath(this.config.rootDir, handleId),
         acquireTimeoutMs: 0,
         staleMs: WORKSPACE_TURN_OWNER_LOCK_STALE_MS,
@@ -1085,6 +1100,8 @@ export class WorkspaceTurnManager {
     /** Discovery context of the workspace whose turn will run (or the owner pre-create). */
     runtime: Runtime;
     workspacePath: string;
+    /** #6426: whether that workspace's project plugin agents may load. */
+    projectPluginsTrusted: boolean;
   }): Promise<
     Result<
       {
@@ -1112,7 +1129,8 @@ export class WorkspaceTurnManager {
       const definition = await readAgentDefinition(
         params.runtime,
         params.workspacePath,
-        parsedAgentId.data
+        parsedAgentId.data,
+        { projectPluginsTrusted: params.projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
       );
       scope = definition.scope;
       source = definition.source;
@@ -1122,6 +1140,8 @@ export class WorkspaceTurnManager {
         agentId: parsedAgentId.data,
         agentDefinition: definition,
         workspaceId: params.workspaceId,
+        projectPluginsTrusted: params.projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       chain = resolvedChain.map((entry) => ({
         id: entry.id,
@@ -1145,7 +1165,8 @@ export class WorkspaceTurnManager {
       frontmatter = await resolveAgentFrontmatter(
         params.runtime,
         params.workspacePath,
-        params.agentId
+        params.agentId,
+        { projectPluginsTrusted: params.projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
       );
     } catch (error) {
       if (isRuntimeTransportError(error)) {
@@ -1266,7 +1287,13 @@ export class WorkspaceTurnManager {
       const definition = await readAgentDefinition(
         params.owner.runtime,
         params.owner.workspacePath,
-        parsedAgentId.data
+        parsedAgentId.data,
+        // #6426: read in the owner, but the target streams it, so the target's trust decides
+        // which candidate wins (owner and target share the agent host here).
+        {
+          projectPluginsTrusted: params.target.projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
+        }
       );
       resolvedScope = definition.scope;
     } catch (error) {
@@ -1285,14 +1312,19 @@ export class WorkspaceTurnManager {
         `Task.createWorkspaceTurn: target checkout is not reachable yet (provisioning or stopped runtime), so project-local agentId (${params.agentId}) cannot be verified there`
       );
     }
+    // #7216: the owner's checkout, but the target's trust (the target streams the agent).
+    const ownerCheckoutContext = {
+      ...params.owner,
+      projectPluginsTrusted: params.target.projectPluginsTrusted,
+    };
     const validation = await this.validateWorkspaceTurnAgentId({
       cfg: params.cfg,
       agentId: params.agentId,
       workspaceId: params.workspaceId,
-      ...params.owner,
+      ...ownerCheckoutContext,
     });
     return validation.success
-      ? Ok({ validatedContext: params.owner, ...validation.data })
+      ? Ok({ validatedContext: ownerCheckoutContext, ...validation.data })
       : validation;
   }
 
@@ -1508,24 +1540,34 @@ export class WorkspaceTurnManager {
         // never mutates the target workspace's saved agent/settings (the dispatch below
         // skips AI-settings persistence). Validate against the TARGET workspace's checkout
         // (project-local agent definitions can diverge across branches).
-        const ownerContext = buildWorkspaceAgentContext({
-          runtimeConfig: parentMeta.runtimeConfig,
-          projectPath: parentMeta.projectPath,
-          workspaceName: parentMeta.name,
-          persistedWorkspacePath: parentEntry?.workspace.path,
-          subProjectPath: parentMeta.subProjectPath,
-        });
+        const ownerContext = buildWorkspaceAgentContext(
+          {
+            runtimeConfig: parentMeta.runtimeConfig,
+            projectPath: parentMeta.projectPath,
+            workspaceName: parentMeta.name,
+            persistedWorkspacePath: parentEntry?.workspace.path,
+            subProjectPath: parentMeta.subProjectPath,
+          },
+          isWorkspaceProjectTrustedIn(cfg.projects, parentMeta)
+        );
         const targetContext =
           targetEntry != null
-            ? buildWorkspaceAgentContext({
-                runtimeConfig: targetEntry.workspace.runtimeConfig ?? parentMeta.runtimeConfig,
-                projectPath: targetEntry.projectPath,
-                // Entries created by workspaceService.create always carry a name; the fallback
-                // only satisfies the optional persisted-config type.
-                workspaceName: coerceNonEmptyString(targetEntry.workspace.name) ?? parentMeta.name,
-                persistedWorkspacePath: targetEntry.workspace.path,
-                subProjectPath: targetEntry.workspace.subProjectPath,
-              })
+            ? buildWorkspaceAgentContext(
+                {
+                  runtimeConfig: targetEntry.workspace.runtimeConfig ?? parentMeta.runtimeConfig,
+                  projectPath: targetEntry.projectPath,
+                  // Entries created by workspaceService.create always carry a name; the fallback
+                  // only satisfies the optional persisted-config type.
+                  workspaceName:
+                    coerceNonEmptyString(targetEntry.workspace.name) ?? parentMeta.name,
+                  persistedWorkspacePath: targetEntry.workspace.path,
+                  subProjectPath: targetEntry.workspace.subProjectPath,
+                },
+                isWorkspaceProjectTrustedIn(cfg.projects, {
+                  kind: targetEntry.workspace.kind,
+                  projectPath: targetEntry.projectPath,
+                })
+              )
             : ownerContext;
         const validation = await this.validateWorkspaceTurnAgentIdForTarget({
           cfg,
@@ -1550,6 +1592,7 @@ export class WorkspaceTurnManager {
         agentDefinitionContext = {
           ...validation.data.validatedContext,
           workspaceId: targetWorkspaceId,
+          runtimeFactory: nodeRuntimeFactory,
         };
       }
       // Follow-up sends continue the target workspace's own last-used settings
@@ -1586,13 +1629,16 @@ export class WorkspaceTurnManager {
     } else {
       let ownerContext: WorkspaceTurnAgentContext | undefined;
       const buildOwnerContext = () =>
-        buildWorkspaceAgentContext({
-          runtimeConfig: parentMeta.runtimeConfig,
-          projectPath: parentMeta.projectPath,
-          workspaceName: parentMeta.name,
-          persistedWorkspacePath: parentEntry?.workspace.path,
-          subProjectPath: parentMeta.subProjectPath,
-        });
+        buildWorkspaceAgentContext(
+          {
+            runtimeConfig: parentMeta.runtimeConfig,
+            projectPath: parentMeta.projectPath,
+            workspaceName: parentMeta.name,
+            persistedWorkspacePath: parentEntry?.workspace.path,
+            subProjectPath: parentMeta.subProjectPath,
+          },
+          isWorkspaceProjectTrustedIn(cfg.projects, parentMeta)
+        );
       // An omitted trunkBranch is the owner's branch: for a worktree owner, the branch its
       // checkout is on, which an auto-named owner's workspace name does not name.
       const trunkBranch =
@@ -1676,7 +1722,11 @@ export class WorkspaceTurnManager {
             { agentId: requestedAgentId, error: validation.error }
           );
         } else {
-          agentDefinitionContext = { ...ownerContext, workspaceId: ownerWorkspaceId };
+          agentDefinitionContext = {
+            ...ownerContext,
+            workspaceId: ownerWorkspaceId,
+            runtimeFactory: nodeRuntimeFactory,
+          };
         }
       }
       const slot = await ensureParallelSlot();
@@ -1740,13 +1790,16 @@ export class WorkspaceTurnManager {
         // instead of hitting invalid_scope. The failure settles through the normal handle
         // machinery below.
         const createdMeta = createResult.data.metadata;
-        const targetContext = buildWorkspaceAgentContext({
-          runtimeConfig: createdMeta.runtimeConfig,
-          projectPath: createdMeta.projectPath,
-          workspaceName: createdMeta.name,
-          persistedWorkspacePath: createdMeta.namedWorkspacePath,
-          subProjectPath: createdMeta.subProjectPath,
-        });
+        const targetContext = buildWorkspaceAgentContext(
+          {
+            runtimeConfig: createdMeta.runtimeConfig,
+            projectPath: createdMeta.projectPath,
+            workspaceName: createdMeta.name,
+            persistedWorkspacePath: createdMeta.namedWorkspacePath,
+            subProjectPath: createdMeta.subProjectPath,
+          },
+          isWorkspaceProjectTrustedIn(cfg.projects, createdMeta)
+        );
         const validation = await this.validateWorkspaceTurnAgentIdForTarget({
           cfg,
           agentId: requestedAgentId,
@@ -1777,6 +1830,7 @@ export class WorkspaceTurnManager {
           agentDefinitionContext = {
             ...validation.data.validatedContext,
             workspaceId: targetWorkspaceId,
+            runtimeFactory: nodeRuntimeFactory,
           };
         }
       }
@@ -4842,7 +4896,7 @@ export class WorkspaceTurnManager {
    */
   private async keepIfOwnedElsewhere(handleId: string): Promise<"keep" | undefined> {
     if (this.turnOwnerLocks.has(handleId)) return undefined;
-    const lock = await inspectCrossProcessLock(
+    const lock = await this.historyService.locks.inspectCrossProcessLock(
       workspaceTurnOwnerLockPath(this.config.rootDir, handleId)
     );
     return lock.state === "held" ? "keep" : undefined;

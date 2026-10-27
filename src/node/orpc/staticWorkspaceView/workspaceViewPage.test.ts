@@ -157,10 +157,18 @@ describe("the workspace view's early script", () => {
     ["a narrow window", { width: 359 }],
     ["a wide window", { width: 481 }],
     ["a fine pointer", { coarse: false }],
-    ["a saved expanded sidebar", { sidebar: "false" }],
   ])("makes no request and loads the app at once on %s", (_name, options) => {
     const page = run(options);
     expect([page.calls.length, page.apps()]).toEqual([0, 1]);
+  });
+
+  // The saved flag drives only the wide sidebar: at phone widths the app always mounts with the
+  // drawer closed, which is the layout the view draws.
+  test("shows the view with a saved expanded sidebar", async () => {
+    const page = run({ sidebar: "false" });
+    expect(page.calls).toHaveLength(1);
+    await page.answer(200, TAIL);
+    expect(page.view()?.getAttribute("data-workspace-id")).toBe("ws1");
   });
 
   test("a slow tail loads the app at 1,000 ms, and still shows the view before the app starts", async () => {

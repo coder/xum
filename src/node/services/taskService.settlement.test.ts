@@ -68,6 +68,7 @@ import {
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -647,6 +648,7 @@ describe("TaskService", () => {
       const t = await setupChildTask();
       t.receiptFake.register("late-source-entry", "prestream-failed");
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: t.parentId,
         workspaceSessionDir: path.join(t.config.sessionsDir, t.parentId),
         childTaskId: t.childId,
@@ -1695,6 +1697,7 @@ describe("TaskService", () => {
       markdown: string
     ) {
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: ownerId,
         workspaceSessionDir: path.join(config.sessionsDir, ownerId),
         childTaskId: taskId,

@@ -1,5 +1,6 @@
 // Real Radix exports must initialize after the DOM, even when this suite runs first.
 import { installDom } from "../../../../../tests/ui/dom";
+import assert from "@/common/utils/assert";
 import type React from "react";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
@@ -14,6 +15,7 @@ import {
   type TestClientConfig,
 } from "@/browser/testUtils";
 import * as WorkspaceModule from "@/browser/contexts/WorkspaceContext";
+import * as ProjectContextModule from "@/browser/contexts/ProjectContext";
 import * as ExperimentsModule from "@/browser/hooks/useExperiments";
 import * as ModelsModule from "@/browser/hooks/useModelsFromSettings";
 import * as ModelSelectorModule from "@/browser/components/ModelSelector/ModelSelector";
@@ -48,6 +50,7 @@ let selectedWorkspaceMock: { projectPath: string; workspaceId: string } | null =
 // Snapshot real exports before Bun replaces their live bindings for this suite.
 restoreModulesAfterSuite([
   ["@/browser/contexts/WorkspaceContext", { ...WorkspaceModule }],
+  ["@/browser/contexts/ProjectContext", { ...ProjectContextModule }],
   ["@/browser/hooks/useExperiments", { ...ExperimentsModule }],
   ["@/browser/hooks/useModelsFromSettings", { ...ModelsModule }],
   ["@/browser/components/Tooltip/Tooltip", { ...tooltipModule }],
@@ -57,6 +60,12 @@ restoreModulesAfterSuite([
 
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   useWorkspaceContext: () => ({ selectedWorkspace: selectedWorkspaceMock }),
+}));
+
+// The resource limits section lists projects; these tests have none.
+void mock.module("@/browser/contexts/ProjectContext", () => ({
+  ...ProjectContextModule,
+  useProjectContext: () => ({ userProjects: new Map() }),
 }));
 
 void mock.module("@/browser/hooks/useExperiments", () => ({
@@ -255,174 +264,6 @@ describe("TasksSection Exec subagent defaults", () => {
     restoreDom = null;
   });
 
-  test.each([
-    [false, false],
-    [false, true],
-    [true, false],
-    [true, true],
-  ])("gates the Intuition card on parent=%s and intuition=%s", async (memory, intuition) => {
-    experimentsEnabledByDefault = true;
-    experimentValues = {
-      [EXPERIMENT_IDS.MEMORY]: memory,
-      [EXPERIMENT_IDS.MEMORY_INTUITION]: intuition,
-    };
-    const view = renderTasksSection({
-      agentAiDefaults: {
-        intuition: {
-          modelString: "openai:gpt-6-luna",
-          thinkingLevel: "high",
-        },
-      },
-    });
-    await view.findByText("Name Workspace");
-    if (!memory || !intuition) {
-      expect(view.queryByText("Intuition")).toBeNull();
-      return;
-    }
-    const card = getAgentCardByName(view, "Intuition");
-    expect(within(card).getByRole<HTMLSelectElement>("combobox", { name: "Model" }).value).toBe(
-      "openai:gpt-6-luna"
-    );
-    expect(within(card).getAllByRole("switch")).toHaveLength(1);
-    expect(within(card).getAllByRole("combobox")).toHaveLength(1);
-    expect(within(card).getByRole("button", { name: "Reasoning" }).textContent).toContain("High");
-    selectReasoningOption(card, "Medium");
-    await waitFor(() => {
-      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition).toMatchObject({
-        modelString: "openai:gpt-6-luna",
-        thinkingLevel: "medium",
-      });
-    });
-    expect(within(card).queryByRole("button", { name: /Pro mode/ })).toBeNull();
-    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
-    fireEvent.click(within(listbox).getByRole("option", { name: "Inherit" }));
-    await waitFor(() => {
-      const settings = getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition;
-      expect(settings?.thinkingLevel).toBeUndefined();
-      expect(settings?.modelString).toBe("openai:gpt-6-luna");
-    });
-    expect(
-      within(getAgentCardByName(view, "Name Workspace")).getByRole("button", { name: "Reasoning" })
-    ).toBeTruthy();
-  });
-
-  test("Intuition can display and save Off and Low below the chat minimum", async () => {
-    experimentsEnabledByDefault = true;
-    const view = renderTasksSection({
-      minThinkingLevelByModel: { "openai:gpt-6-luna": "high" },
-      agentAiDefaults: {
-        intuition: { modelString: "openai:gpt-6-luna", thinkingLevel: "low" },
-        explore: { modelString: "openai:gpt-6-luna", thinkingLevel: "low" },
-      },
-    });
-    await view.findByText("Intuition");
-    const card = getAgentCardByName(view, "Intuition");
-    const reasoning = within(card).getByRole("button", { name: "Reasoning" });
-    expect(reasoning.textContent).toContain("Low");
-    fireEvent.click(reasoning);
-    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
-    for (const [label, level] of [
-      ["Off", "off"],
-      ["Low", "low"],
-    ] as const) {
-      fireEvent.click(within(listbox).getByRole("option", { name: label }));
-      await waitFor(() => {
-        expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
-          level
-        );
-      });
-      expect(reasoning.textContent).toContain(label);
-    }
-
-    // Ordinary task agents still use the chat floor for the same model.
-    const explore = getAgentCardByName(view, "Explore");
-    const exploreReasoning = within(explore).getByRole("button", { name: "Reasoning" });
-    expect(exploreReasoning.textContent).toContain("High");
-    fireEvent.click(exploreReasoning);
-    expect(within(explore).queryByRole("option", { name: "Off" })).toBeNull();
-    expect(within(explore).queryByRole("option", { name: "Low" })).toBeNull();
-  });
-
-  test.each([undefined, "openai:gpt-6-luna"])(
-    "Intuition inherits workspace/default capabilities instead of global Exec (workspace=%s)",
-    async (workspaceModel) => {
-      experimentsEnabledByDefault = true;
-      const view = renderTasksSection({
-        workspaceModel,
-        agentAiDefaults: { exec: { modelString: "xai:grok-4-1-fast" } },
-      });
-      await view.findByText("Intuition");
-      const card = getAgentCardByName(view, "Intuition");
-      selectReasoningOption(card, "Low");
-      const max = within(card).queryByRole("option", { name: "Max" });
-      if (workspaceModel) expect(max).toBeTruthy();
-      else expect(max).toBeNull();
-      await waitFor(() => {
-        expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition).toEqual({
-          thinkingLevel: "low",
-        });
-      });
-    }
-  );
-
-  test.each([undefined, "xai:grok-4-1-fast"])(
-    "Intuition prefers its own model override to its definition, then the parent (override=%s)",
-    async (modelString) => {
-      experimentsEnabledByDefault = true;
-      const view = renderTasksSection({
-        agents: FALLBACK_AGENTS.map((agent) =>
-          agent.id === "intuition"
-            ? { ...agent, aiDefaults: { model: "openai:gpt-6-luna" } }
-            : agent
-        ),
-        agentAiDefaults: {
-          exec: { modelString: "anthropic:ui-exec" },
-          intuition: { modelString },
-        },
-      });
-      await view.findByText("Intuition");
-      const card = getAgentCardByName(view, "Intuition");
-      fireEvent.click(within(card).getByRole("button", { name: "Reasoning" }));
-      const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
-      expect(within(listbox).getByRole("option", { name: "High" })).toBeTruthy();
-      if (modelString) {
-        expect(within(listbox).queryByRole("option", { name: "Low" })).toBeNull();
-        expect(within(listbox).queryByRole("option", { name: "Max" })).toBeNull();
-      } else {
-        expect(within(listbox).getByRole("option", { name: "Low" })).toBeTruthy();
-        expect(within(listbox).getByRole("option", { name: "Max" })).toBeTruthy();
-      }
-    }
-  );
-
-  test("Intuition exposes only Off and High for the binary Grok Fast model", async () => {
-    experimentsEnabledByDefault = true;
-    const view = renderTasksSection({
-      agentAiDefaults: { intuition: { modelString: "xai:grok-4-1-fast", thinkingLevel: "low" } },
-    });
-    await view.findByText("Intuition");
-    const card = getAgentCardByName(view, "Intuition");
-    expect(within(card).getByRole("button", { name: "Reasoning" }).textContent).toContain("High");
-    selectReasoningOption(card, "Off");
-    const listbox = within(card).getByRole("listbox", { name: "Reasoning effort" });
-    expect(
-      within(listbox)
-        .getAllByRole("option")
-        .map((option) => option.getAttribute("aria-label"))
-    ).toEqual(["Inherit", "Off", "High"]);
-    await waitFor(() => {
-      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
-        "off"
-      );
-    });
-    fireEvent.click(within(listbox).getByRole("option", { name: "High" }));
-    await waitFor(() => {
-      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.intuition?.thinkingLevel).toBe(
-        "high"
-      );
-    });
-  });
-
   test("renders a distinct Exec subagent row", async () => {
     const view = renderTasksSection();
 
@@ -455,6 +296,72 @@ describe("TasksSection Exec subagent defaults", () => {
       modelString: "openai:subagent-model",
     });
     expect("subagentAiDefaults" in payload).toBe(false);
+  });
+
+  test("pagehide saves a change made inside the autosave delay, once (#7157)", async () => {
+    // Record which pagehide listeners come and go; the real methods still run. Wrapped by hand
+    // and restored from their descriptors: bun's spyOn on the happy-dom window broke later
+    // test files.
+    const addDescriptor = Object.getOwnPropertyDescriptor(window, "addEventListener");
+    const removeDescriptor = Object.getOwnPropertyDescriptor(window, "removeEventListener");
+    assert(addDescriptor && removeDescriptor, "happy-dom defines the listener methods on window");
+    const added: unknown[] = [];
+    const removed: unknown[] = [];
+    const realAdd = window.addEventListener.bind(window);
+    const realRemove = window.removeEventListener.bind(window);
+    window.addEventListener = ((type: string, listener: EventListener, options?: boolean) => {
+      if (type === "pagehide") added.push(listener);
+      realAdd(type, listener, options);
+    }) as typeof window.addEventListener;
+    window.removeEventListener = ((type: string, listener: EventListener, options?: boolean) => {
+      if (type === "pagehide") removed.push(listener);
+      realRemove(type, listener, options);
+    }) as typeof window.removeEventListener;
+    try {
+      const view = renderTasksSection();
+      await view.findByText("Explore");
+      fireEvent.click(
+        within(getAgentCardByName(view, "Explore")).getByRole("switch", {
+          name: "Toggle explore enabled",
+        })
+      );
+
+      // A reload right after the change: pagehide fires before the debounced save.
+      fireEvent(window, new window.Event("pagehide"));
+      expect(view.saveConfig).toHaveBeenCalledTimes(1);
+      expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.explore).toEqual({
+        enabled: false,
+      });
+
+      // The unmount after pagehide does not save the same change again.
+      view.unmount();
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(view.saveConfig).toHaveBeenCalledTimes(1);
+      expect(added.length).toBeGreaterThan(0);
+      expect(removed).toEqual(added);
+    } finally {
+      Object.defineProperty(window, "addEventListener", addDescriptor);
+      Object.defineProperty(window, "removeEventListener", removeDescriptor);
+    }
+  });
+
+  test("pagehide during an in-flight autosave still sends the newer change", async () => {
+    const view = renderTasksSection();
+    // The first autosave never settles, as over a slow channel.
+    view.saveConfig.mockImplementationOnce(() => new Promise<undefined>(() => undefined));
+    await view.findByText("Explore");
+    const toggle = (agentId: string) =>
+      fireEvent.click(view.getByRole("switch", { name: `Toggle ${agentId} enabled` }));
+
+    toggle("explore");
+    await waitFor(() => expect(view.saveConfig).toHaveBeenCalledTimes(1));
+    toggle("name_workspace");
+    fireEvent(window, new window.Event("pagehide"));
+
+    expect(view.saveConfig).toHaveBeenCalledTimes(2);
+    expect(getLatestSavePayload(view.saveConfig).agentAiDefaults.name_workspace).toEqual({
+      enabled: false,
+    });
   });
 
   test("includes nested subagent defaults when saving a delegated default change", async () => {
@@ -1048,7 +955,7 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
         <TasksSection />
       </harness.Wrapper>
     );
-    await waitFor(() => expect(view.queryByText("Loading agents…")).toBeNull());
+    await waitFor(() => expect(view.queryByText("Loading agents…") === null).toBe(true));
 
     connect(3, new Promise(() => undefined));
     await harness.drop();
@@ -1126,5 +1033,125 @@ describe.each([...GAP_MODES])("TasksSection across a reconnect (%s)", (mode) => 
     expect(isDisabled(maxParallelInput(view))).toBe(true);
     act(() => answer?.());
     await waitFor(() => expect(isDisabled(maxParallelInput(view))).toBe(false));
+  });
+});
+
+// #6384: the limit inputs used to clamp and autosave on every keystroke, so clearing a field saved
+// 1. The field must keep the typed text, save only a valid value, and settle the text on blur.
+describe("TasksSection limit inputs", () => {
+  let restoreDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    restoreDom = installDom();
+    experimentsEnabledByDefault = false;
+    experimentValues = {};
+    apiMock = null;
+    selectedWorkspaceMock = null;
+  });
+
+  afterEach(() => {
+    cleanup();
+    apiMock = null;
+    restoreDom?.();
+    restoreDom = null;
+  });
+
+  function limitInput(view: ReturnType<typeof render>, label: string): HTMLInputElement {
+    const row = view.getByText(label).closest(".justify-between");
+    const input = row?.querySelector("input");
+    if (!(input instanceof window.HTMLInputElement)) throw new Error(`No input for ${label}`);
+    return input;
+  }
+
+  // fireEvent does not reach this Input's React handlers in happy-dom (see the reconnect suite
+  // above), so call them through React's props, as a browser event would.
+  function reactHandlers(input: HTMLInputElement) {
+    const key = Object.keys(input).find((name) => name.startsWith("__reactProps"));
+    return (key ? (input as unknown as Record<string, unknown>)[key] : null) as {
+      onChange?: (event: { target: { value: string } }) => void;
+      onBlur?: (event: { target: { value: string } }) => void;
+      onKeyDown?: (event: { key: string }) => void;
+    } | null;
+  }
+
+  function type(view: ReturnType<typeof render>, label: string, value: string) {
+    const onChange = reactHandlers(limitInput(view, label))?.onChange;
+    if (!onChange) throw new Error("Expected an onChange handler");
+    act(() => onChange({ target: { value } }));
+  }
+
+  // Without an onBlur handler, a blur changes nothing.
+  function blur(view: ReturnType<typeof render>, label: string) {
+    const input = limitInput(view, label);
+    const onBlur = reactHandlers(input)?.onBlur;
+    if (onBlur) act(() => onBlur({ target: { value: input.value } }));
+  }
+
+  const savedValues = (saveConfig: ReturnType<typeof mock>, key: string): unknown[] =>
+    saveConfig.mock.calls.map(
+      (call) => (call[0] as { taskSettings: Record<string, unknown> }).taskSettings[key]
+    );
+
+  // Longer than the autosave debounce, so a save of the cleared field would have happened.
+  const waitPastAutosave = () =>
+    act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 600));
+    });
+
+  test("Max Parallel Agent Tasks keeps the typed text and never saves a cleared field as 1", async () => {
+    const view = renderTasksSection();
+    const label = "Max Parallel Agent Tasks";
+    await waitFor(() => expect(limitInput(view, label).value).toBe("32"));
+
+    type(view, label, "");
+    expect(limitInput(view, label).value).toBe("");
+    await waitPastAutosave();
+    expect(savedValues(view.saveConfig, "maxParallelAgentTasks")).not.toContain(1);
+
+    // A valid value saves while the user types.
+    type(view, label, "12");
+    expect(limitInput(view, label).value).toBe("12");
+    await waitFor(() =>
+      expect(savedValues(view.saveConfig, "maxParallelAgentTasks")).toContain(12)
+    );
+
+    // An out-of-range value stays as typed, then clamps on blur.
+    type(view, label, "999");
+    expect(limitInput(view, label).value).toBe("999");
+    blur(view, label);
+    expect(limitInput(view, label).value).toBe("256");
+    await waitFor(() =>
+      expect(savedValues(view.saveConfig, "maxParallelAgentTasks").at(-1)).toBe(256)
+    );
+
+    // A field left empty goes back to the saved value.
+    type(view, label, "");
+    blur(view, label);
+    expect(limitInput(view, label).value).toBe("256");
+    await waitPastAutosave();
+    expect(savedValues(view.saveConfig, "maxParallelAgentTasks")).not.toContain(1);
+  });
+
+  test("Max Task Nesting Depth keeps the typed text and reverts an empty field on blur", async () => {
+    const view = renderTasksSection();
+    const label = "Max Task Nesting Depth";
+    await waitFor(() => expect(limitInput(view, label).value).toBe("5"));
+
+    type(view, label, "");
+    expect(limitInput(view, label).value).toBe("");
+    blur(view, label);
+    expect(limitInput(view, label).value).toBe("5");
+
+    // Enter settles the text like blur: an out-of-range value clamps to the maximum.
+    type(view, label, "9");
+    const onKeyDown = reactHandlers(limitInput(view, label))?.onKeyDown;
+    if (!onKeyDown) throw new Error("Expected an onKeyDown handler");
+    act(() => onKeyDown({ key: "Enter" }));
+    expect(limitInput(view, label).value).toBe("5");
+
+    type(view, label, "2");
+    await waitFor(() => expect(savedValues(view.saveConfig, "maxTaskNestingDepth")).toContain(2));
+    await waitPastAutosave();
+    expect(savedValues(view.saveConfig, "maxTaskNestingDepth")).not.toContain(1);
   });
 });

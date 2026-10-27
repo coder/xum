@@ -5,13 +5,14 @@ import {
   listProjectMetadataRelativePaths,
 } from "@/common/compat/legacyMux";
 import type { XumToolScope } from "@/common/types/toolScope";
-import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
-import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import type { Runtime } from "@/node/runtime/Runtime";
+import { projectPluginsAllowed } from "@/node/utils/projectTrust";
 
 import {
   buildProjectSkillRoots,
   getDefaultAgentSkillsRoots,
+  getLegacyMuxGlobalSkillsRoot,
   type AgentSkillsRoots,
 } from "./agentSkillsService";
 
@@ -26,7 +27,8 @@ export interface SkillStorageContext {
   kind: SkillStorageKind;
   runtime: Runtime;
   workspacePath: string;
-  roots?: AgentSkillsRoots;
+  /** #7216: every kind sets roots, so no caller falls back to untrusted default roots. */
+  roots: AgentSkillsRoots;
   containment: ProjectSkillContainment;
 }
 
@@ -45,17 +47,23 @@ function buildProjectLocalRoots(
     }),
     globalRoot: path.join(xumScope.xumHome, "skills"),
     universalRoot: "~/.agents/skills",
+    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(runtime),
     ...(options?.includeClaudeSkills ? { globalClaudeRoot: "~/.claude/skills" } : {}),
     // Read-only Agent Plugins containers at lowest precedence within each scope.
     // Containers anchor at the CHECKOUT root: for subProjectPath workspaces
     // `projectRoot` is the execution subdirectory, but plugins live (and are
-    // listed by the UI) at the checkout level.
-    projectPluginRoots: [
-      ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
-        path.join(projectSearchRoot, relativePath)
-      ),
-      path.join(projectSearchRoot, ".agents", "plugins"),
-    ],
+    // listed by the UI) at the checkout level. #6426: project containers only in a
+    // trusted project, so an untrusted repo's plugin skills are neither listed nor read.
+    ...(projectPluginsAllowed(xumScope.projectPluginsTrusted)
+      ? {
+          projectPluginRoots: [
+            ...listProjectMetadataRelativePaths("plugins").map((relativePath) =>
+              path.join(projectSearchRoot, relativePath)
+            ),
+            path.join(projectSearchRoot, ".agents", "plugins"),
+          ],
+        }
+      : {}),
     globalPluginRoots: [path.join(xumScope.xumHome, "plugins"), "~/.agents/plugins"],
   };
 }
@@ -71,6 +79,7 @@ function buildGlobalLocalRoots(input: {
     projectRoot: "",
     globalRoot: path.join(xumHome, "skills"),
     universalRoot: "~/.agents/skills",
+    legacyMuxGlobalRoot: getLegacyMuxGlobalSkillsRoot(input.runtime),
     // claude-skills-compat experiment: read-only root at lowest global precedence.
     ...(input.includeClaudeSkills ? { globalClaudeRoot: "~/.claude/skills" } : {}),
     // Read-only Agent Plugins containers at lowest global precedence.
@@ -81,11 +90,12 @@ function buildGlobalLocalRoots(input: {
 function resolveProjectLocalRuntime(input: {
   runtime: Runtime;
   xumScope: Extract<XumToolScope, { type: "project" }>;
+  runtimeFactory: RuntimeFactory;
 }): Runtime {
-  if (input.runtime instanceof DevcontainerRuntime) {
+  if (input.runtime.location === "devcontainer") {
     // Devcontainer commands run in the container, but project-local skill roots point at
     // host paths. Use host-local I/O here so discovery can still reach host-global skills.
-    return new LocalRuntime(input.xumScope.projectRoot);
+    return input.runtimeFactory.createLocalRuntime(input.xumScope.projectRoot);
   }
 
   return input.runtime;
@@ -101,6 +111,8 @@ export function resolveSkillStorageContext(input: {
   xumScope?: XumToolScope | null;
   /** claude-skills-compat experiment: include read-only .claude/skills roots in discovery. */
   includeClaudeSkills?: boolean;
+  /** Builds the host-local runtime of a devcontainer's project-local skill roots. */
+  runtimeFactory: RuntimeFactory;
 }): SkillStorageContext {
   if (input.xumScope?.type !== "project") {
     return {
@@ -127,6 +139,7 @@ export function resolveSkillStorageContext(input: {
       roots: getDefaultAgentSkillsRoots(input.runtime, input.workspacePath, {
         includeClaudeSkills: input.includeClaudeSkills,
         projectSearchRoot,
+        projectPluginsTrusted: input.xumScope.projectPluginsTrusted,
       }),
       containment: {
         kind: "runtime",
@@ -138,6 +151,7 @@ export function resolveSkillStorageContext(input: {
   const projectRuntime = resolveProjectLocalRuntime({
     runtime: input.runtime,
     xumScope: input.xumScope,
+    runtimeFactory: input.runtimeFactory,
   });
   return {
     kind: "project-local",

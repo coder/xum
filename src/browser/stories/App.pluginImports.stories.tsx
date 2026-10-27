@@ -15,11 +15,19 @@ const preview: AgentPluginInstallPreview = {
     ref: "main",
     refType: "branch",
   },
+  method: { kind: "agent-plugin" },
+  methods: [{ kind: "agent-plugin" }],
+  skillsCliSkills: [],
   lockedSha: "a".repeat(40),
   manifest: { name: "review-tools", version: "1.0.0", description: "Review and research tools" },
   targetPath: "~/.xum/plugins/review-tools",
   skills: [
-    { name: "review", description: "Review a change" },
+    // Long prose description: at phone width it must wrap between words, not mid-word.
+    {
+      name: "review",
+      description:
+        "Picks the smallest change that fully solves the task, then reviews it for scope creep",
+    },
     { name: "research", description: "Research a topic" },
   ],
   mcpServers: [
@@ -67,7 +75,8 @@ function setupPluginSettings(installed = false, conflict = false) {
         }),
     },
   };
-  client.agentPlugins.preview = () => Promise.resolve({ success: true, data: preview });
+  client.agentPlugins.preview = () =>
+    Promise.resolve({ success: true, data: { kind: "plugin", preview } });
   client.agentPlugins.checkUpdates = () => Promise.resolve({ success: true, data: [] });
   client.agentPlugins.list = () =>
     Promise.resolve({

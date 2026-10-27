@@ -90,15 +90,6 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
     },
   },
   {
-    id: "intuition",
-    scope: "built-in",
-    name: "Intuition",
-    description: "Read-only memory recognition (internal)",
-    uiSelectable: false,
-    subagentRunnable: false,
-    tools: { require: ["memory_read", "intuition_report"] },
-  },
-  {
     id: "dream",
     scope: "built-in",
     name: "Dream",
@@ -107,6 +98,18 @@ export const FALLBACK_AGENTS: AgentDefinitionDescriptor[] = [
     subagentRunnable: false,
     tools: {
       require: ["memory"],
+    },
+  },
+  {
+    id: "status_page",
+    scope: "built-in",
+    name: "Status Page",
+    description:
+      "Keeps the Agent interface status page current from the main agent's updates (internal)",
+    uiSelectable: false,
+    subagentRunnable: false,
+    tools: {
+      add: ["edit_page", "write_page"],
     },
   },
 ];
@@ -123,12 +126,12 @@ function shouldShowAgentInTasksSettings(
   params: {
     portableDesktopEnabled: boolean;
     memoryConsolidationEnabled: boolean;
-    memoryIntuitionEnabled: boolean;
+    statusPageAgentEnabled: boolean;
   }
 ): boolean {
   if (agent.id === "desktop") return params.portableDesktopEnabled;
   if (agent.id === "dream") return params.memoryConsolidationEnabled;
-  if (agent.id === "intuition") return params.memoryIntuitionEnabled;
+  if (agent.id === "status_page") return params.statusPageAgentEnabled;
   return true;
 }
 
@@ -138,8 +141,8 @@ export function deriveTasksSectionAgentGroups(params: {
   portableDesktopEnabled: boolean;
   /** True only when both Agent Memory and Memory Consolidation experiments are on (mirrors the runtime gate in memoryConsolidationService). */
   memoryConsolidationEnabled: boolean;
-  /** True only when both Agent Memory and Memory Intuition are on. */
-  memoryIntuitionEnabled: boolean;
+  /** True only when Artifacts, Agent interface view and Status page agent are all on (the runtime gate in statusPageAgentService). */
+  statusPageAgentEnabled: boolean;
 }): {
   uiAgents: AgentDefinitionDescriptor[];
   subagents: AgentDefinitionDescriptor[];

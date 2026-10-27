@@ -132,6 +132,13 @@ function writeHooks(dir: string, hooks: unknown): void {
   fs.writeFileSync(path.join(dir, "hooks", "hooks.json"), text);
 }
 
+/** Makes `dir` a git repository with one commit ("v1") of everything in it. */
+export function commitFixture(dir: string, env: NodeJS.ProcessEnv): void {
+  git(dir, env, "init", "-q", "-b", "main");
+  git(dir, env, "add", ".");
+  git(dir, env, "commit", "-qm", "v1");
+}
+
 /** Writes each fixture as a one-commit git repository; returns name -> absolute path. */
 export function writePluginSources(root: string, env: NodeJS.ProcessEnv): Map<string, string> {
   const paths = new Map<string, string>();
@@ -152,9 +159,7 @@ export function writePluginSources(root: string, env: NodeJS.ProcessEnv): Map<st
       )
     );
     writeHooks(dir, fixture.hooks);
-    git(dir, env, "init", "-q", "-b", "main");
-    git(dir, env, "add", ".");
-    git(dir, env, "commit", "-qm", "v1");
+    commitFixture(dir, env);
     paths.set(fixture.name, dir);
   }
   return paths;
@@ -185,14 +190,20 @@ export async function seedPluginHooks(
   for (const name of PREINSTALLED_PLUGINS) {
     const source = sources.get(name);
     if (source == null) throw new Error(`plugin hook seed: no source for ${name}`);
-    const preview = ok<{ source: unknown; lockedSha: string; consentDigest: string }>(
-      `preview ${name}`,
-      await api("agentPlugins/preview", { input: source })
-    );
+    // A source previews as a plugin or as a Claude Code marketplace; these are plugins.
+    const found = ok<{
+      kind: string;
+      preview?: { source: unknown; method: unknown; lockedSha: string; consentDigest: string };
+    }>(`preview ${name}`, await api("agentPlugins/preview", { input: source }));
+    const preview = found.preview;
+    if (found.kind !== "plugin" || preview === undefined) {
+      throw new Error(`plugin hook seed: ${name} previewed as a ${found.kind}, not a plugin`);
+    }
     ok(
       `install ${name}`,
       await api("agentPlugins/install", {
         source: preview.source,
+        method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,
       })

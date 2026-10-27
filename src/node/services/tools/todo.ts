@@ -1,14 +1,15 @@
 import { tool } from "ai";
-import * as fs from "fs/promises";
 import * as path from "path";
-import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import assert from "@/common/utils/assert";
 import type { ToolFactory } from "@/common/utils/tools/tools";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { TodoItem } from "@/common/types/tools";
 import { MAX_TODOS } from "@/common/constants/toolLimits";
 import { getTodoFilePath, readTodosForSessionDir } from "@/node/services/todos/todoStorage";
-import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /**
  * Validate todo sequencing rules before persisting.
@@ -80,15 +81,23 @@ function validateTodos(todos: TodoItem[]): void {
 async function writeTodos(
   workspaceId: string,
   workspaceSessionDir: string,
-  todos: TodoItem[]
+  todos: TodoItem[],
+  locks: SessionLocks,
+  files: SessionFiles
 ): Promise<void> {
   validateTodos(todos);
 
-  await workspaceFileLocks.withLock(workspaceId, async () => {
+  await locks.workspaceFiles.withLock(workspaceId, async () => {
     const todoFile = getTodoFilePath(workspaceSessionDir);
-    await fs.mkdir(path.dirname(todoFile), { recursive: true });
-    await writeFileAtomic(todoFile, JSON.stringify(todos, null, 2));
+    await files.promises.mkdir(path.dirname(todoFile), { recursive: true });
+    await files.writeFileAtomic(todoFile, JSON.stringify(todos, null, 2));
   });
+}
+
+/** A tool config's session files: the session's, or the Node layer for configs that tests build by hand. */
+export function toolSessionFiles(config: { sessionFiles?: SessionFiles }): SessionFiles {
+  // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
+  return config.sessionFiles ?? nodeSessionFiles;
 }
 
 /**
@@ -102,7 +111,13 @@ export const createTodoWriteTool: ToolFactory = (config) => {
     execute: async ({ todos }) => {
       assert(config.workspaceId, "todo_write requires workspaceId");
       assert(config.workspaceSessionDir, "todo_write requires workspaceSessionDir");
-      await writeTodos(config.workspaceId, config.workspaceSessionDir, todos);
+      await writeTodos(
+        config.workspaceId,
+        config.workspaceSessionDir,
+        todos,
+        config.sessionLocks,
+        toolSessionFiles(config)
+      );
       return {
         success: true as const,
         count: todos.length,
@@ -121,7 +136,10 @@ export const createTodoReadTool: ToolFactory = (config) => {
     inputSchema: TOOL_DEFINITIONS.todo_read.schema,
     execute: async () => {
       assert(config.workspaceSessionDir, "todo_read requires workspaceSessionDir");
-      const todos = await readTodosForSessionDir(config.workspaceSessionDir);
+      const todos = await readTodosForSessionDir(
+        config.workspaceSessionDir,
+        toolSessionFiles(config)
+      );
       return {
         todos,
       };
@@ -131,11 +149,16 @@ export const createTodoReadTool: ToolFactory = (config) => {
 
 /**
  * Set todos for a workspace session directory (propose_plan uses this to mark todos completed).
+ * `locks` gives the workspace FIFO (phase 4: SessionLocks) and `files` the session files (phase 5:
+ * SessionFiles). `files` has no default, so each caller names its session files. Both app callers
+ * pass their session's locks, and tests keep the Node locks default.
  */
 export async function setTodosForSessionDir(
   workspaceId: string,
   workspaceSessionDir: string,
-  todos: TodoItem[]
+  todos: TodoItem[],
+  locks: SessionLocks = nodeSessionLocks,
+  files: SessionFiles
 ): Promise<void> {
-  await writeTodos(workspaceId, workspaceSessionDir, todos);
+  await writeTodos(workspaceId, workspaceSessionDir, todos, locks, files);
 }

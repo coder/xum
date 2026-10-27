@@ -240,8 +240,9 @@ describe("New chat streaming flash regression", () => {
           const text = app.view.container.textContent ?? "";
           expect(text.toLowerCase()).toContain("starting");
           expect(
-            app.view.container.querySelector('[data-testid="transcript-hydration-placeholder"]')
-          ).toBeNull();
+            app.view.container.querySelector('[data-testid="transcript-hydration-placeholder"]') ===
+              null
+          ).toBe(true);
           expect(text).not.toContain("No Messages Yet");
         },
         { timeout: 5_000 }

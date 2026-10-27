@@ -34,6 +34,7 @@ import {
 import type { BashMonitorProcessSnapshot, BashMonitorTailLine } from "./bashMonitorWakeReconciler";
 import { isErrnoWithCode } from "@/node/utils/fs";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 
 const DEFAULT_BACKGROUND_BASH_TAIL_BYTES = 64_000;
 const MAX_BACKGROUND_BASH_TAIL_BYTES = 1_000_000;
@@ -45,6 +46,9 @@ const SPAWN_NAME_LOCK_TIMEOUT_MS = 30_000;
 // Candidate names one non-host claim exec tries in order (#5485): a name used in k earlier
 // sessions costs ceil((k + 1) / batch) exec round-trips instead of k + 1.
 const RUNTIME_SPAWN_NAME_CLAIM_BATCH = 8;
+// Empty file whose exclusive create inside a non-host record directory decides the name claim
+// (claimRuntimeSpawnDir). Record readers only look for meta.json and exit_code, so it is inert.
+const RUNTIME_SPAWN_CLAIM_MARKER_FILENAME = ".spawn-claim";
 // Upper bound on a fail-closed cleanup() (archive, removal) waiting for pending spawns and
 // migrations, shared by both of its drains (#5477). Each wait is normally bounded by its own
 // steps (the 30 s name lock, 10 s claim execs), but a hung runtime probe or spawnProcess call
@@ -185,7 +189,8 @@ async function pruneOldSettledRecord(recordDir: string): Promise<boolean> {
     const marker = await fsPromises.lstat(nodePath.join(recordDir, BG_EXIT_CODE_FILENAME));
     if (!marker.isFile() || !metaStat.isFile()) return false;
     const settledAtMs = Math.max(marker.mtimeMs, metaStat.mtimeMs);
-    if (Date.now() - settledAtMs < SETTLED_RECORD_PRUNE_AGE_MS) return false;
+    // Wall clock: settledAtMs is a file mtime (#7282).
+    if (nodeClock.nowMs() - settledAtMs < SETTLED_RECORD_PRUNE_AGE_MS) return false;
     await fsPromises.rm(recordDir, { recursive: true });
     return true;
   } catch (error) {
@@ -365,7 +370,8 @@ export interface BackgroundProcessMonitorState extends BackgroundProcessMonitorC
   droppedLines: number;
   totalDroppedLines: number;
   lastLines: string[];
-  flushTimer?: ReturnType<typeof setTimeout>;
+  /** Cancels the pending cooldown flush (HostClock.setTimer). */
+  flushTimer?: () => void;
   lastReadOffset: number;
   /**
    * File byte offset at the end of the last complete line that produced a match. Unlike
@@ -701,8 +707,8 @@ const DECIDED_ON_HEAD_NOTE = `A line over ${MAX_RETAINED_UNREAD_BYTES} bytes was
 
 const OUTPUT_POLL_INTERVAL_MS = 100;
 
-function sleepMs(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleepMs(clock: HostClock, ms: number): Promise<void> {
+  return new Promise((resolve) => clock.setTimer(resolve, ms));
 }
 
 /** What getOutput's read collected: see readOutputWindow. */
@@ -993,13 +999,17 @@ function nextWaitStep(
  * Without a final drain, we can return "exited" with empty output even though output becomes
  * available moments later.
  */
-async function drainAfterExit(proc: BackgroundProcess, window: OutputWindow): Promise<void> {
+async function drainAfterExit(
+  proc: BackgroundProcess,
+  window: OutputWindow,
+  clock: HostClock
+): Promise<void> {
   if (window.status === "running") return;
   // A read made before the exit was seen can have held back a split character: this read
   // (bounded by the window's room) takes it, even when the window is not at the end.
   if ((await readIntoWindow(proc, window)) || !window.reachedEnd) return;
   // We didn't observe any new output: wait one poll interval and try once more.
-  await sleepMs(OUTPUT_POLL_INTERVAL_MS);
+  await sleepMs(clock, OUTPUT_POLL_INTERVAL_MS);
   await readIntoWindow(proc, window);
 }
 
@@ -1085,7 +1095,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   // were lost. Never reset: the manager does not outlive a shutdown.
   private shuttingDown = false;
 
-  constructor(bgOutputDir: string) {
+  // Agent-loop time (timestamps, polls, cooldowns, deadlines) reads this clock, so tests can
+  // drive it with a TestClock. The default is today's Date.now() and setTimeout().
+  constructor(
+    bgOutputDir: string,
+    private readonly hostClock: HostClock = nodeClock
+  ) {
     super();
     // Background bash status can have many concurrent subscribers (e.g. multiple workspaces).
     // Raise the default listener cap to avoid noisy MaxListenersExceededWarning.
@@ -1180,7 +1195,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     if (monitor.settled) return;
 
     if (monitor.flushTimer) {
-      clearTimeout(monitor.flushTimer);
+      monitor.flushTimer();
       monitor.flushTimer = undefined;
     }
 
@@ -1271,7 +1286,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       ...(update.tailLines !== undefined ? { tailLines: update.tailLines } : {}),
       totalMatches: monitor.matchesCount,
       ...(update.droppedLines > 0 ? { droppedLines: update.droppedLines } : {}),
-      timestamp: Date.now(),
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      timestamp: nodeClock.nowMs(),
       ...(update.matchedThroughOffset !== undefined
         ? { matchedThroughOffset: update.matchedThroughOffset }
         : {}),
@@ -1316,7 +1332,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         : undefined;
     monitor.stopped = true;
     if (monitor.flushTimer) {
-      clearTimeout(monitor.flushTimer);
+      monitor.flushTimer();
       monitor.flushTimer = undefined;
     }
     if (reason === "failed") {
@@ -1420,7 +1436,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     monitor.settled = true;
     // A stale cooldown timer must not fire while the settlement helper awaits its final reads.
     if (monitor.flushTimer) {
-      clearTimeout(monitor.flushTimer);
+      monitor.flushTimer();
       monitor.flushTimer = undefined;
     }
     return { proc, monitor };
@@ -1455,7 +1471,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // Emitting then would let WorkspaceService persist or queue a synthetic turn during
     // ServiceContainer.dispose; returning instead leaves the armed registry record for the
     // restart monitor-lost recovery (in-memory pending matches are lost, crash-equivalent).
-    await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
+    await sleepMs(this.hostClock, monitor.pollIntervalMs);
     if (monitor.stopped || this.shuttingDown) return;
 
     // Final monitor scan: matches printed after the last poll (or sitting in the chunk the tail
@@ -1513,7 +1529,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     monitor.settlementDisposition = {
       status: terminal.status,
       ...(terminal.exitCode !== undefined ? { exitCode: terminal.exitCode } : {}),
-      settledAt: new Date().toISOString(),
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      settledAt: new Date(nodeClock.nowMs()).toISOString(),
       wakeOnExit: monitor.wakeOnExit,
       terminalStatusShown: proc.terminalStatusShownToAgent,
       ...(retainedMatchedThroughOffset != null
@@ -1594,7 +1611,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       return;
     }
 
-    monitor.flushTimer ??= setTimeout(() => {
+    monitor.flushTimer ??= this.hostClock.setTimer(() => {
       monitor.flushTimer = undefined;
       if (!monitor.stopped && !monitor.settled) {
         this.emitMonitorMatch(proc, monitor);
@@ -1935,7 +1952,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         if (proc.status === "running") {
           proc.status = "exited";
           proc.exitCode = exitCode;
-          proc.exitTime = Date.now();
+          // Record time: wall clock until #7282 moves its consumers to HostClock.
+          proc.exitTime = nodeClock.nowMs();
           await this.updateMetaFile(proc).catch((err: unknown) => {
             log.debug(
               `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -1950,7 +1968,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
           monitor.lastReadOffset = read.newOffset;
           this.processMonitorContent(proc, read.content, { chunkStartOffset });
           // stdout/stderr redirection can lag exit-code observation by a tick.
-          await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
+          await sleepMs(this.hostClock, monitor.pollIntervalMs);
           const finalChunkStartOffset = monitor.lastReadOffset;
           const finalRead = await proc.handle.readOutput(finalChunkStartOffset);
           monitor.lastReadOffset = finalRead.newOffset;
@@ -1974,7 +1992,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       monitor.lastReadOffset = read.newOffset;
       this.processMonitorContent(proc, read.content, { chunkStartOffset });
 
-      await new Promise((resolve) => setTimeout(resolve, monitor.pollIntervalMs));
+      await sleepMs(this.hostClock, monitor.pollIntervalMs);
     }
   }
 
@@ -2087,9 +2105,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       }
       return;
     }
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelTimer: (() => void) | undefined;
     const timedOut = new Promise<"timed-out">((resolve) => {
-      timer = setTimeout(() => resolve("timed-out"), Math.max(0, deadline - Date.now()));
+      cancelTimer = this.hostClock.setTimer(
+        () => resolve("timed-out"),
+        Math.max(0, deadline - this.hostClock.nowMs())
+      );
     });
     try {
       for (
@@ -2107,7 +2128,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         }
       }
     } finally {
-      clearTimeout(timer);
+      cancelTimer?.();
     }
   }
 
@@ -2283,7 +2304,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // reusing a settled one may clobber a record the other backend still tracks (see
     // recordDirIsFree). Host-local records are probed on the local filesystem; all other
     // layouts (SSH/Coder, Docker, devcontainer) live in the runtime's exec namespace and are
-    // claimed through the runtime with an atomic mkdir instead (claimRuntimeSpawnDir).
+    // claimed through the runtime with an exclusive marker create instead (claimRuntimeSpawnDir).
     // Cross-process claim (#4873): two backends on one XUM_ROOT (desktop + `xum server`) have
     // separate in-memory reservations but share the host records root, so both could probe a
     // name as free and spawn into one directory. Host-local spawns therefore hold a
@@ -2406,7 +2427,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     }
 
     const { handle, pid, outputDir } = result;
-    const startTime = Date.now();
+    // Process start time: stored in meta.json, shown and compared with wake origins (#7282).
+    const startTime = nodeClock.nowMs();
 
     // Write meta.json with process info
     const meta: BackgroundProcessMeta = {
@@ -2474,7 +2496,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         filter: config.monitor.filter,
         filterExclude: config.monitor.exclude,
         script,
-        createdAt: new Date().toISOString(),
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        createdAt: new Date(nodeClock.nowMs()).toISOString(),
       };
       proc.monitor = this.createMonitorState(config.monitor, { pollIntervalMs, armMetadata });
       this.startMonitorTail(proc);
@@ -2490,7 +2513,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     // Schedule auto-termination for background processes with timeout
     const timeoutSecs = config.timeoutSecs;
     if (!config.isForeground && timeoutSecs !== undefined && timeoutSecs > 0) {
-      setTimeout(() => {
+      this.hostClock.setTimer(() => {
         void this.terminate(processId, { monitorDisposition: "flush" }).then((result) => {
           if (result.success) {
             log.debug(`Process ${processId} auto-terminated after ${timeoutSecs}s timeout`);
@@ -2571,7 +2594,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     outputDir: string,
     displayName?: string
   ): void {
-    const startTime = Date.now();
+    // Process start time: stored in meta.json, shown and compared with wake origins (#7282).
+    const startTime = nodeClock.nowMs();
 
     const proc: BackgroundProcess = {
       id: processId,
@@ -2689,7 +2713,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         log.debug(`Background process ${proc.id} has exited`);
         proc.status = "exited";
         proc.exitCode = exitCode;
-        proc.exitTime = Date.now();
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        proc.exitTime = nodeClock.nowMs();
         await this.updateMetaFile(proc).catch((err: unknown) => {
           log.debug(
             `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -2972,7 +2997,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     if (proc.unreadLineFilter !== lineFilter) proc.unreadLineDecision = undefined;
     proc.unreadLineFilter = lineFilter;
 
-    const startTime = Date.now();
+    const startTime = this.hostClock.nowMs();
     // File offset where this read's processable content begins (start cursor minus the buffered
     // output that cursor already advanced past). Used below to detect a gap left by a prior
     // filtered read so the shown-frontier never jumps over lines this read never showed.
@@ -2991,7 +3016,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         success: true,
         status: "interrupted",
         output: "(waiting interrupted)",
-        elapsed_ms: Date.now() - startTime,
+        elapsed_ms: this.hostClock.nowMs() - startTime,
       };
     }
     const currentStatus = window.status;
@@ -3090,7 +3115,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         currentStatus !== "running"
           ? ((await this.getProcess(processId))?.exitCode ?? undefined)
           : undefined,
-      elapsed_ms: Date.now() - startTime,
+      elapsed_ms: this.hostClock.nowMs() - startTime,
       note: appendDecidedOnHeadNote(note, filterRegex != null, [window, page]),
     };
   }
@@ -3105,7 +3130,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     proc: BackgroundProcess,
     options: OutputWaitOptions
   ): Promise<OutputWindow | null> {
-    const startTime = Date.now();
+    const startTime = this.hostClock.nowMs();
     const window: OutputWindow = {
       pending: proc.incompleteLineBuffer,
       decision: proc.unreadLineDecision,
@@ -3125,11 +3150,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       window.status = await this.refreshedStatus(proc);
       if (!options.filtered && lineRunsOnInWindow(window)) continue;
       if (windowHasOutputToReturn(window, options)) break;
-      if (nextWaitStep(window, Date.now() - startTime, options.timeoutMs) === "stop") break;
+      if (nextWaitStep(window, this.hostClock.nowMs() - startTime, options.timeoutMs) === "stop")
+        break;
       if (isInterrupted()) return keepInterruptedWindow(proc, window);
-      await sleepMs(OUTPUT_POLL_INTERVAL_MS);
+      await sleepMs(this.hostClock, OUTPUT_POLL_INTERVAL_MS);
     }
-    await drainAfterExit(proc, window);
+    await drainAfterExit(proc, window, this.hostClock);
     return window;
   }
 
@@ -3428,9 +3454,12 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * records are NOT host-local (SSH/Coder, Docker, devcontainer, multi-project — see
    * spawnRecordsAreHostLocal): the record layout lives in the runtime's exec namespace, so the
    * name is claimed through the runtime. No host file lock can serialise backends there, so
-   * the claim is a plain `mkdir` (no -p) of the record directory: it is atomic on the target
-   * filesystem, so of two backends spawning the same name (or one spawning after the other)
-   * exactly one creates the directory, and the other moves on to a suffixed name (#4889).
+   * the claim is an exclusive create of an empty marker file in the record directory: the
+   * shell's noclobber redirect (`set -C`) opens it with O_EXCL, so of two backends spawning
+   * the same name (or one spawning after the other) exactly one creates the marker, and the
+   * other moves on to a suffixed name (#4889). `mkdir` only makes the directory and never
+   * decides the claim: uutils coreutils mkdir before 0.11.0 (Ubuntu 25.10 and 26.04) can exit 0
+   * for both of two concurrent creates of one directory (uutils/coreutils#13970, #7256).
    *
    * An existing directory is never reused, not even a settled one with an exit marker: nothing
    * on the runtime says which backend spawned it, another backend on this Xum root may still
@@ -3457,13 +3486,20 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     try {
       const tempDir = await runtime.tempDir();
       const workspaceDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}`;
-      // `[ -L ]` too: a dangling symlink planted at the name makes mkdir fail but `[ -e ]` false.
-      // Any other mkdir failure exits 1, so the caller aborts instead of skipping the name.
+      // A name that exists before the claim is held, whatever made it: the check comes first
+      // because a buggy mkdir can exit 0 for a directory that exists. `[ -L ]` too: a dangling
+      // symlink planted at the name makes mkdir fail but `[ -e ]` false. A directory that
+      // appeared between the check and the mkdir is held by whoever created its marker.
+      // Any other mkdir or marker failure exits 1, so the caller aborts instead of skipping
+      // the name. A backend without the marker (older Xum) still claims with mkdir alone.
+      const marker = `"$1"/${RUNTIME_SPAWN_CLAIM_MARKER_FILENAME}`;
       const script = [
         `mkdir -p ${quotePathForShell(workspaceDir)} || exit 1`,
         `claim() {`,
-        `  if mkdir "$1" 2>/dev/null; then echo "__MUX_SPAWN_NAME_CLAIMED__:$2:"; exit 0; fi`,
-        `  [ -e "$1" ] || [ -L "$1" ] || exit 1`,
+        `  if [ -e "$1" ] || [ -L "$1" ]; then return 0; fi`,
+        `  if ! mkdir "$1" 2>/dev/null; then [ -e "$1" ] || [ -L "$1" ] || exit 1; return 0; fi`,
+        `  if (set -C; : > ${marker}) 2>/dev/null; then echo "__MUX_SPAWN_NAME_CLAIMED__:$2:"; exit 0; fi`,
+        `  [ -e ${marker} ] || [ -L ${marker} ] || exit 1`,
         `}`,
         ...candidates.map(
           (candidate, index) =>
@@ -3495,8 +3531,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
-   * Undo claimRuntimeSpawnDir for a spawn that is refused before anything ran. `rmdir` removes
-   * only an empty directory, so it cannot delete output another process wrote. Best-effort: a
+   * Undo claimRuntimeSpawnDir for a spawn that is refused before anything ran: remove the claim
+   * marker, then `rmdir`, which removes only an empty directory, so it cannot delete output
+   * another process wrote. Best-effort: a
    * leftover empty directory only costs a suffixed name and fails the remote orphan probe closed.
    */
   private async releaseRuntimeSpawnDir(
@@ -3507,7 +3544,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     try {
       const tempDir = await runtime.tempDir();
       const processDir = `${tempDir}/${BG_OUTPUT_SUBDIR}/${workspaceId}/${processId}`;
-      await execBuffered(runtime, `rmdir ${quotePathForShell(processDir)}`, {
+      const marker = `${processDir}/${RUNTIME_SPAWN_CLAIM_MARKER_FILENAME}`;
+      const script = `rm -f -- ${quotePathForShell(marker)}; rmdir -- ${quotePathForShell(processDir)}`;
+      await execBuffered(runtime, script, {
         cwd: "/tmp",
         timeout: 10,
       });
@@ -3622,7 +3661,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
         log.debug(`Background process ${proc.id} has exited`);
         proc.status = "exited";
         proc.exitCode = exitCode;
-        proc.exitTime = Date.now();
+        // Record time: wall clock until #7282 moves its consumers to HostClock.
+        proc.exitTime = nodeClock.nowMs();
         await this.updateMetaFile(proc).catch((err: unknown) => {
           log.debug(
             `BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`
@@ -3688,7 +3728,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       // Update process status and exit code
       proc.status = "killed";
       proc.exitCode = (await proc.handle.getExitCode()) ?? undefined;
-      proc.exitTime ??= Date.now();
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      proc.exitTime ??= nodeClock.nowMs();
 
       // Update meta.json
       await this.updateMetaFile(proc).catch((err: unknown) => {
@@ -3719,7 +3760,8 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
       log.debug(`Error terminating process ${processId}: ${errorMessage}`);
       // Mark as killed even if there was an error (process likely already dead)
       proc.status = "killed";
-      proc.exitTime ??= Date.now();
+      // Record time: wall clock until #7282 moves its consumers to HostClock.
+      proc.exitTime ??= nodeClock.nowMs();
       // Update meta.json
       await this.updateMetaFile(proc).catch((err: unknown) => {
         log.debug(`BackgroundProcessManager: Failed to update meta.json: ${getErrorMessage(err)}`);
@@ -3775,7 +3817,7 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
     log.debug(`BackgroundProcessManager.cleanup(${workspaceId}) called`);
     const drainDeadline =
       options?.failClosedAfterDrainTimeout === true
-        ? Date.now() + PENDING_ADMISSION_DRAIN_TIMEOUT_MS
+        ? this.hostClock.nowMs() + PENDING_ADMISSION_DRAIN_TIMEOUT_MS
         : null;
     // #4967, B2: no migration or spawn may begin while cleanup runs; a migration that tries is
     // refused and its command terminated, a spawn is refused. The seal lifts when cleanup

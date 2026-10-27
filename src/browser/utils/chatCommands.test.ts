@@ -17,6 +17,7 @@ import { setWorkspaceServiceTier } from "./fastModeServiceTier";
 import {
   createNewWorkspace,
   executeCompaction,
+  NO_INLINE_REFS,
   parseRuntimeString,
   prepareCompactionMessage,
   WORKFLOW_FREEFORM_ARGS_ERROR_MESSAGE,
@@ -25,6 +26,7 @@ import {
   type CommandInputDisposition,
   type CommandResult,
   type SlashCommandEnv,
+  type SlashCommandInlineRefs,
 } from "./chatCommands";
 import { parseCommand } from "./slashCommands/parser";
 import type { ReviewNoteData } from "@/common/types/review";
@@ -144,6 +146,7 @@ const sendMessageOptions: SendMessageOptions = {
 function createEnv(overrides: Partial<SlashCommandEnv> = {}): SlashCommandEnv {
   return {
     api: null,
+    inlineRefs: NO_INLINE_REFS,
     workspaceId: "test-ws",
     variant: "workspace",
     projectPath: "/tmp/project",
@@ -1385,6 +1388,65 @@ describe("detached command work", () => {
   });
 });
 
+const inlineRefs: SlashCommandInlineRefs = {
+  agentSkillRefs: [{ skillName: "orchestrate", scope: "built-in", source: "inline" }],
+  mcpPromptRefs: [
+    { serverName: "docs", promptName: "brief", commandKey: "docs:brief", source: "inline" },
+  ],
+};
+
+describe("start messages", () => {
+  test.each([
+    { type: "new", startMessage: "$orchestrate go" },
+    { type: "fork", startMessage: "$orchestrate go" },
+  ] as const)("/$type sends its start message with the references", async (parsed) => {
+    ensureWindowDispatchEvent();
+    const originalRequestAnimationFrame = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = (callback) => {
+      callback(0);
+      return 0;
+    };
+    const created: FrontendWorkspaceMetadata = {
+      id: "started-ws",
+      name: "started",
+      projectName: "Project",
+      projectPath: "/tmp/project",
+      namedWorkspacePath: "/tmp/project/started",
+      runtimeConfig: { type: "local" },
+      createdAt: "2026-10-23T00:00:00.000Z",
+    };
+    const sendMessage = mock((_input: { options: SendMessageOptions }) =>
+      Promise.resolve({ success: true })
+    );
+    try {
+      const settled = await finishCommand(
+        await processSlashCommand(
+          parsed,
+          createEnv({
+            api: {
+              projects: {
+                listBranches: () => Promise.resolve({ recommendedTrunk: "main" }),
+                list: () => Promise.resolve([]),
+              },
+              workspace: {
+                getInfo: () => Promise.resolve(created),
+                create: () => Promise.resolve({ success: true, metadata: created }),
+                fork: () => Promise.resolve({ success: true, metadata: created }),
+                sendMessage,
+              },
+            } as unknown as SlashCommandEnv["api"],
+            inlineRefs,
+          })
+        )
+      );
+      expectDisposition(settled.result, "consume");
+    } finally {
+      globalThis.requestAnimationFrame = originalRequestAnimationFrame;
+    }
+    expect(sendMessage.mock.calls[0]?.[0].options.muxMetadata).toMatchObject(inlineRefs);
+  });
+});
+
 describe("compact and plan command results", () => {
   test("compact returns phased composer actions and terminal review actions", async () => {
     const reviews: ReviewNoteData[] = [
@@ -1398,7 +1460,10 @@ describe("compact and plan command results", () => {
     const sentMessages: Array<{
       options?: {
         historyEditPrecondition?: HistoryEditPrecondition;
-        muxMetadata?: { parsed?: { followUpContent?: { reviews?: ReviewNoteData[] } } };
+        muxMetadata?: {
+          agentSkillRefs?: unknown;
+          parsed?: { followUpContent?: { reviews?: ReviewNoteData[]; muxMetadata?: unknown } };
+        };
       };
     }> = [];
     const sendMessage = mock((input: (typeof sentMessages)[number]) => {
@@ -1420,6 +1485,7 @@ describe("compact and plan command results", () => {
         { type: "compact" },
         createEnv({
           api: { workspace: { sendMessage } } as unknown as SlashCommandEnv["api"],
+          inlineRefs,
           reviews,
           editMessageId: "edit-id",
           historyEditPrecondition,
@@ -1446,6 +1512,11 @@ describe("compact and plan command results", () => {
     expect(sentMessages[0]?.options?.muxMetadata?.parsed?.followUpContent?.reviews).toEqual(
       reviews
     );
+    // Refs on the request itself would materialize before the boundary and be summarized away.
+    expect(
+      sentMessages[0]?.options?.muxMetadata?.parsed?.followUpContent?.muxMetadata
+    ).toMatchObject(inlineRefs);
+    expect(sentMessages[0]?.options?.muxMetadata?.agentSkillRefs).toBeUndefined();
     // The composer's edit fence rides the compaction send unchanged.
     expect(sentMessages[0]?.options?.historyEditPrecondition).toEqual(historyEditPrecondition);
   });

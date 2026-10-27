@@ -71,6 +71,100 @@ async function assertPhoneFooterTouchTargets(page: StoryPage) {
   }
 }
 
+const AGENT_INTERFACE_TOUCH_STORY = "app-agentinterface--touch-toggle";
+// The gap the header's own side padding (px-2) gives while the left sidebar is open. The story
+// collapses the sidebar, which drops that padding, so the toggle must keep the gap itself.
+const PHONE_EDGE_GAP_PX = 8;
+
+/**
+ * On a touch phone the Status / Chat toggle starts the header's actions row. globals.css raises
+ * its buttons to touch targets, so the group (which clips its overflow) must grow to show them
+ * whole, and it must not sit flush against the screen edge. Plays cannot emulate the pointer.
+ */
+async function assertAgentInterfaceToggleTouchTargets(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await page.setViewportSize({ width: 390, height: 844 });
+    const toggle = page.locator('[data-testid="agent-interface-view-toggle"]');
+    // The phone header moves the actions to their own sideways-scrolling row.
+    await page.waitForFunction(
+      () => {
+        const row = document.querySelector(
+          '[data-testid="agent-interface-view-toggle"]'
+        )?.parentElement;
+        return row != null && getComputedStyle(row).overflowX === "auto";
+      },
+      undefined,
+      { timeout: 5000 }
+    );
+    // The resize to phone width slides the left sidebar drawer out over the header; let it and
+    // the other layout transitions finish before hit-testing.
+    await page.evaluate(async () => {
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      const transitions = document.getAnimations().filter((a) => a instanceof CSSTransition);
+      // allSettled: a transition the resize cancels rejects `finished` with an AbortError.
+      await Promise.allSettled(transitions.map((transition) => transition.finished));
+    });
+    const geometry = await toggle.evaluate((group) => {
+      const groupBox = group.getBoundingClientRect();
+      const buttons = Array.from(group.querySelectorAll("button"), (button) => {
+        const box = button.getBoundingClientRect();
+        let { left, right, top, bottom } = box;
+        // Clip by every ancestor that clips its overflow, then by the screen.
+        for (let el = button.parentElement; el; el = el.parentElement) {
+          const style = getComputedStyle(el);
+          const clip = el.getBoundingClientRect();
+          if (style.overflowX !== "visible") {
+            left = Math.max(left, clip.left);
+            right = Math.min(right, clip.right);
+          }
+          if (style.overflowY !== "visible") {
+            top = Math.max(top, clip.top);
+            bottom = Math.min(bottom, clip.bottom);
+          }
+        }
+        left = Math.max(left, 0);
+        top = Math.max(top, 0);
+        right = Math.min(right, window.innerWidth);
+        bottom = Math.min(bottom, window.innerHeight);
+        // A tap at the center must reach the button, not a header control drawn over it.
+        const hit = document.elementFromPoint(box.left + box.width / 2, box.top + box.height / 2);
+        return {
+          name: button.textContent ?? "",
+          tappable: hit != null && button.contains(hit),
+          width: box.width,
+          height: box.height,
+          visibleWidth: Math.max(0, right - left),
+          visibleHeight: Math.max(0, bottom - top),
+        };
+      });
+      return { left: groupBox.left, buttons };
+    });
+    const problems: string[] = [];
+    if (geometry.left < PHONE_EDGE_GAP_PX) {
+      problems.push(`toggle starts ${Math.round(geometry.left)}px from the screen edge`);
+    }
+    for (const button of geometry.buttons) {
+      if (button.height < MOBILE_TOUCH_TARGET_PX) {
+        problems.push(`${button.name} is ${Math.round(button.height)}px tall`);
+      }
+      if (button.visibleWidth < button.width - 0.5 || button.visibleHeight < button.height - 0.5) {
+        problems.push(
+          `${button.name} shows ${Math.round(button.visibleWidth)}x${Math.round(button.visibleHeight)} of ${Math.round(button.width)}x${Math.round(button.height)}px`
+        );
+      }
+      if (!button.tappable) problems.push(`${button.name} is covered at its center`);
+    }
+    assert.equal(problems.join("; "), "", "Status / Chat touch targets must stay whole on a phone");
+  } finally {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
 const TOUCH_RESIZE_STORY = "app-seededworkspacea11y--narrow-sidebar-dark";
 
 /**
@@ -127,6 +221,217 @@ async function assertTouchResizesRightSidebar(page: StoryPage) {
   }
 }
 
+// The iPhone Duo cover display keeps a status and camera column on its right edge (an 84 px
+// right safe-area inset in Apple's simulator) at a width where xum shows its phone layout.
+const SIDE_INSET_PX = 84;
+const SIDE_INSET_VIEWPORT = { width: 466, height: 700 };
+const SIDE_INSET_TARGETS = new Map<string, { sheet: string } | "toast">([
+  ["settings-settingspage--phone-full-screen", { sheet: "Settings" }],
+  ["app-phoneviewports--i-phone-16-e-analytics-sheet", { sheet: "Analytics" }],
+  ["app-components-activegoalswarningtoast--above-threshold", "toast"],
+]);
+
+/**
+ * Phone sheets and toasts are portaled out of the app shell, which pads the side safe areas, so
+ * they must keep their controls clear of a right inset themselves, while a sheet's background
+ * still fills the width. Plays cannot set safe-area insets; CDP can (env() reads the override).
+ */
+async function assertClearsRightInset(page: StoryPage, target: { sheet: string } | "toast") {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await client.send("Emulation.setSafeAreaInsetsOverride", {
+      insets: { top: 0, right: SIDE_INSET_PX, bottom: 34, left: 0 },
+    });
+    await page.setViewportSize(SIDE_INSET_VIEWPORT);
+    await page.waitForFunction(
+      (width) => matchMedia("(pointer: coarse)").matches && innerWidth === width,
+      SIDE_INSET_VIEWPORT.width,
+      { timeout: 5000 }
+    );
+    const root =
+      target === "toast"
+        ? page.getByRole("status").locator("..")
+        : page.getByRole("dialog", { name: target.sheet });
+    if (target !== "toast") {
+      // The md+ dialog turns into the full-width phone sheet once the new width lays out.
+      await page.waitForFunction(
+        (dialog) => dialog?.getBoundingClientRect().left === 0,
+        await root.elementHandle({ timeout: 5000 }),
+        { timeout: 5000 }
+      );
+    }
+    const problems = await root.evaluate(
+      (element, args) => {
+        const found: string[] = [];
+        const limit = innerWidth - args.inset;
+        const box = element.getBoundingClientRect();
+        if (args.toast) {
+          // max(1rem, inset) on each side: the toast's left edge stays on screen as well.
+          if (box.right > limit + 0.5) found.push(`toast ends at ${Math.round(box.right)}px`);
+          if (box.left < 16 - 0.5) found.push(`toast starts at ${Math.round(box.left)}px`);
+          return found;
+        }
+        if (Math.round(box.right) !== innerWidth) {
+          found.push(`sheet background ends at ${Math.round(box.right)}px`);
+        }
+        const controls = element.querySelectorAll<HTMLElement>(
+          "button, a[href], input, select, textarea, [role=combobox], [role=switch], [role=tab]"
+        );
+        for (const control of controls) {
+          const rect = control.getBoundingClientRect();
+          if (rect.width === 0 || getComputedStyle(control).visibility === "hidden") continue;
+          let left = rect.left;
+          let right = rect.right;
+          for (let el = control.parentElement; el; el = el.parentElement) {
+            if (getComputedStyle(el).overflowX !== "visible") {
+              const clip = el.getBoundingClientRect();
+              left = Math.max(left, clip.left);
+              right = Math.min(right, clip.right);
+            }
+            if (el === element) break;
+          }
+          // Scrolled out of its container: not on screen.
+          if (right <= left) continue;
+          if (right > limit + 0.5) {
+            const name =
+              control.getAttribute("aria-label") ?? control.textContent ?? control.tagName;
+            found.push(`${name.trim().slice(0, 40)} ends at ${Math.round(right)}px`);
+          }
+        }
+        return found;
+      },
+      { inset: SIDE_INSET_PX, toast: target === "toast" }
+    );
+    // Compare a string: the page's array has another realm's prototype, so deepEqual always fails.
+    assert.equal(
+      problems.join("; "),
+      "",
+      `Nothing may sit under a ${SIDE_INSET_PX}px right safe-area inset (limit ${
+        SIDE_INSET_VIEWPORT.width - SIDE_INSET_PX
+      }px)`
+    );
+  } finally {
+    await client.send("Emulation.setSafeAreaInsetsOverride", {
+      insets: { top: 0, right: 0, bottom: 0, left: 0 },
+    });
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
+const MENU_INSET_STORY = "components-projectpage--create-workspace-multiple-projects";
+// The iPhone Duo cover display draws its 21 px top inset as an opaque status band. A short
+// viewport (as when the software keyboard is up) leaves the project switcher too little room
+// below, so its list opens upward and Radix fits it to the top edge.
+const MENU_INSETS = { top: 21, right: SIDE_INSET_PX, bottom: 0, left: 0 };
+// A taller top band that appears while the list is open.
+const RAISED_MENU_INSETS = { ...MENU_INSETS, top: 40 };
+const MENU_INSET_VIEWPORT = { width: SIDE_INSET_VIEWPORT.width, height: 220 };
+
+/** Waits until a Radix menu stops moving, then returns its top edge and side. */
+async function settledMenuBox(menu: ReturnType<StoryPage["getByRole"]>) {
+  return menu.evaluate(async (element) => {
+    const frame = () => new Promise((resolve) => requestAnimationFrame(resolve));
+    let last = "";
+    for (let i = 0; i < 60; i++) {
+      await frame();
+      const r = element.getBoundingClientRect();
+      const next = `${r.top},${r.bottom}`;
+      if (next === last && r.height > 0) break;
+      last = next;
+    }
+    return { top: element.getBoundingClientRect().top, side: element.getAttribute("data-side") };
+  });
+}
+
+/**
+ * Counts the browser's "ResizeObserver loop" errors until the returned function runs. A menu that
+ * re-renders inside the safe-area probes' observer callback resizes during the observer loop.
+ */
+async function countResizeObserverLoopErrors(page: StoryPage): Promise<() => Promise<number>> {
+  const stop = await page.evaluateHandle(() => {
+    let count = 0;
+    const onError = (event: ErrorEvent) => {
+      if (event.message.includes("ResizeObserver loop")) count += 1;
+    };
+    window.addEventListener("error", onError);
+    return () => {
+      window.removeEventListener("error", onError);
+      return count;
+    };
+  });
+  return async () => {
+    const count = await stop.evaluate((stopCounting) => stopCounting());
+    await stop.dispose();
+    return count;
+  };
+}
+
+/**
+ * Radix fits a menu to the viewport edge, but menus portal out of the app shell that pads the
+ * safe areas, so a list fitted to the top edge drew its first rows under the top band.
+ */
+async function assertMenuClearsSafeArea(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  const loopErrors = await countResizeObserverLoopErrors(page);
+  // The probes' ResizeObserver reports new insets in the next frame; menus hear of them in the one
+  // after.
+  const setInsets = async (insets: typeof MENU_INSETS) => {
+    await client.send("Emulation.setSafeAreaInsetsOverride", { insets });
+    await page.evaluate(
+      () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+    );
+  };
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await page.setViewportSize(MENU_INSET_VIEWPORT);
+    await page.waitForFunction(
+      (size) =>
+        matchMedia("(pointer: coarse)").matches &&
+        innerWidth === size.width &&
+        innerHeight === size.height,
+      MENU_INSET_VIEWPORT,
+      { timeout: 5000 }
+    );
+    // The insets come after the resize, with no resize of their own, as they can when a folding
+    // phone switches displays.
+    await setInsets(MENU_INSETS);
+    // A touch tap opens Radix Select on click; a hidden copy of the trigger can exist.
+    await page.locator("[data-testid=project-selector]:visible").evaluate((el) => {
+      (el as HTMLElement).click();
+    });
+    const listbox = page.getByRole("listbox");
+    await listbox.waitFor({ timeout: 5000 });
+    // Radix positions the list a frame after it mounts.
+    const box = await settledMenuBox(listbox);
+    // Below the heading the list has room to start below any inset, so only the upward case checks.
+    assert.equal(box.side, "top", "The project list must open above its trigger on a short phone");
+    assert(
+      box.top >= MENU_INSETS.top - 0.5,
+      `The project list starts at ${Math.round(box.top)}px, under the ${MENU_INSETS.top}px top inset`
+    );
+    await setInsets(RAISED_MENU_INSETS);
+    const raised = await settledMenuBox(listbox);
+    assert(
+      raised.top >= RAISED_MENU_INSETS.top - 0.5,
+      `The open list stays at ${Math.round(raised.top)}px, under a ${RAISED_MENU_INSETS.top}px top inset`
+    );
+    assert.equal(await loopErrors(), 0, "Menus must not resize inside a ResizeObserver callback");
+  } finally {
+    await page.keyboard.press("Escape");
+    await client.send("Emulation.setSafeAreaInsetsOverride", {
+      insets: { top: 0, right: 0, bottom: 0, left: 0 },
+    });
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
     // exposeFunction throws on a second registration, so register once per Playwright page.
@@ -136,9 +441,28 @@ const config: TestRunnerConfig = {
     await page.exposeFunction("__storybookUnhover", () => page.mouse.move(0, 0));
   },
   async postVisit(page, context) {
+    const insetTarget = SIDE_INSET_TARGETS.get(context.id);
+    if (insetTarget) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertClearsRightInset(page, insetTarget);
+      }
+      return;
+    }
+    if (context.id === MENU_INSET_STORY) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertMenuClearsSafeArea(page);
+      }
+      return;
+    }
     if (context.id === PHONE_FOOTER_TOUCH_STORY) {
       if (page.context().browser()?.browserType().name() === "chromium") {
         await assertPhoneFooterTouchTargets(page);
+      }
+      return;
+    }
+    if (context.id === AGENT_INTERFACE_TOUCH_STORY) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertAgentInterfaceToggleTouchTargets(page);
       }
       return;
     }

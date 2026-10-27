@@ -36,7 +36,7 @@ export interface AskUserQuestionTranscriptRow {
   id?: string;
   toolName?: string;
   toolCallId?: string;
-  askUserQuestionAnswer?: AskUserQuestionAnswerMetadata;
+  askUserQuestionAnswers?: AskUserQuestionAnswerMetadata[];
 }
 
 /** Where one ask_user_question row stands, from the transcript alone. */
@@ -59,6 +59,17 @@ function isAskUserQuestionRow(row: AskUserQuestionTranscriptRow): boolean {
   return row.type === "tool" && row.toolName === "ask_user_question";
 }
 
+/** Gives each answer of one answer row to its question row (the latest earlier one with its id). */
+function assignAnswerEntries<Row extends AskUserQuestionTranscriptRow>(
+  entries: readonly AskUserQuestionAnswerMetadata[],
+  latestByToolCallId: ReadonlyMap<string, AskUserQuestionOccurrence<Row>>
+): void {
+  for (const entry of entries) {
+    const owner = latestByToolCallId.get(entry.toolCallId);
+    if (owner) owner.state.answers = entry.answers;
+  }
+}
+
 /**
  * Every ask_user_question row with its state, in transcript order, in one pass.
  *
@@ -79,9 +90,8 @@ export function getAskUserQuestionOccurrences<Row extends AskUserQuestionTranscr
   transcript.forEach((row, index) => {
     if (row.type === "compaction-boundary") {
       lastBoundaryIndex = index;
-    } else if (row.askUserQuestionAnswer != null) {
-      const owner = latestByToolCallId.get(row.askUserQuestionAnswer.toolCallId);
-      if (owner) owner.state.answers = row.askUserQuestionAnswer.answers;
+    } else if (row.askUserQuestionAnswers != null) {
+      assignAnswerEntries(row.askUserQuestionAnswers, latestByToolCallId);
     } else if (isAskUserQuestionRow(row) && row.toolCallId != null) {
       const toolCallId = row.toolCallId;
       const previous = latestByToolCallId.get(toolCallId);
@@ -102,6 +112,24 @@ export function getAskUserQuestionOccurrences<Row extends AskUserQuestionTranscr
 }
 
 /**
+ * Whether an ask_user_question row still takes answers, from the transcript alone: a blocking
+ * question while its tool call executes, and a non-blocking one until an answer row for it lands,
+ * a later question reuses its tool call id, or a boundary drops it from the agent's context.
+ */
+export function isAskUserQuestionOccurrenceOpen(
+  row: { status?: string; result?: unknown },
+  state: AskUserQuestionOccurrenceState
+): boolean {
+  if (row.status === "executing") return true;
+  return (
+    isAsyncAskUserQuestionOutput(row.result) &&
+    state.answers === undefined &&
+    !state.superseded &&
+    !state.leftContext
+  );
+}
+
+/**
  * The state of one ask_user_question row: the row with `rowId` (a transcript row's display id),
  * or without one the latest row with `toolCallId`. A row missing from the transcript (a host that
  * feeds none, or history not loaded yet) is judged by its id alone, as before rows were told apart.
@@ -118,20 +146,33 @@ export function getAskUserQuestionOccurrenceState(
     )
     .at(-1);
   if (own) return own.state;
-  const answerRow = transcript.findLast(
-    (row) => row.askUserQuestionAnswer?.toolCallId === question.toolCallId
-  );
-  return {
-    answers: answerRow?.askUserQuestionAnswer?.answers,
-    superseded: false,
-    leftContext: false,
-  };
+  const answer = transcript
+    .flatMap((row) => row.askUserQuestionAnswers ?? [])
+    .findLast((entry) => entry.toolCallId === question.toolCallId);
+  return { answers: answer?.answers, superseded: false, leftContext: false };
 }
 
 /** One question's answer as picked on the card: 1-based option numbers plus the user's own text. */
 export interface AskUserQuestionSelection {
   optionNumbers: number[];
   otherText: string;
+}
+
+const ASK_USER_QUESTION_REVISIT_LINE = "Revisit any work that assumed differently.";
+
+function buildSelectionLines(selections: readonly AskUserQuestionSelection[]): string[] {
+  return selections.map((selection, index) => {
+    const parts: string[] = [];
+    const { optionNumbers } = selection;
+    if (optionNumbers.length > 0) {
+      parts.push(`${optionNumbers.length > 1 ? "options" : "option"} ${optionNumbers.join(", ")}`);
+    }
+    const otherText = selection.otherText.trim();
+    if (otherText.length > 0) {
+      parts.push(`other: ${JSON.stringify(otherText)}`);
+    }
+    return `- Question ${index + 1}: ${parts.length > 0 ? parts.join("; ") : "skipped"}`;
+  });
 }
 
 /**
@@ -148,23 +189,41 @@ export function buildAskUserQuestionAnswerMessage(
   toolCallId: string,
   selections: readonly AskUserQuestionSelection[]
 ): string {
-  const lines = selections.map((selection, index) => {
-    const parts: string[] = [];
-    const { optionNumbers } = selection;
-    if (optionNumbers.length > 0) {
-      parts.push(`${optionNumbers.length > 1 ? "options" : "option"} ${optionNumbers.join(", ")}`);
-    }
-    const otherText = selection.otherText.trim();
-    if (otherText.length > 0) {
-      parts.push(`other: ${JSON.stringify(otherText)}`);
-    }
-    return `- Question ${index + 1}: ${parts.length > 0 ? parts.join("; ") : "skipped"}`;
-  });
   return [
     `The user answered your ask_user_question (tool call ${toolCallId}). ` +
       "Questions and options are numbered as in that call:",
-    ...lines,
-    "Revisit any work that assumed differently.",
+    ...buildSelectionLines(selections),
+    ASK_USER_QUESTION_REVISIT_LINE,
+  ].join("\n");
+}
+
+/** The answers to one ask_user_question call, as picked on the form. */
+export interface AskUserQuestionCallSelections {
+  toolCallId: string;
+  selections: readonly AskUserQuestionSelection[];
+}
+
+/**
+ * One user message that answers several non-blocking ask_user_question calls at once (the dock
+ * chains every open question set into one form). One call gives exactly
+ * buildAskUserQuestionAnswerMessage's text; several get one numbered section per call. Same
+ * SECURITY rule: only tool call ids, numbers and the user's own Other text.
+ */
+export function buildAskUserQuestionAnswersMessage(
+  calls: readonly AskUserQuestionCallSelections[]
+): string {
+  if (calls.length === 1) {
+    return buildAskUserQuestionAnswerMessage(calls[0].toolCallId, calls[0].selections);
+  }
+  const ids = calls.map((call) => call.toolCallId).join(", ");
+  return [
+    `The user answered your ask_user_question calls (tool calls ${ids}). ` +
+      "Questions and options are numbered as in each call:",
+    ...calls.flatMap((call) => [
+      `Tool call ${call.toolCallId}:`,
+      ...buildSelectionLines(call.selections),
+    ]),
+    ASK_USER_QUESTION_REVISIT_LINE,
   ].join("\n");
 }
 
@@ -173,19 +232,33 @@ export function isAsyncAskUserQuestionOutput(output: unknown): boolean {
   return getToolOutputUiOnly(output)?.ask_user_question?.answerDelivery === "message";
 }
 
-const AskUserQuestionAnswerHolderSchema = z.object({
-  askUserQuestionAnswer: z.object({
-    toolCallId: z.string().min(1),
-    answers: z.record(z.string(), z.string()),
-  }),
+const AskUserQuestionAnswerEntrySchema = z.object({
+  toolCallId: z.string().min(1),
+  answers: z.record(z.string(), z.string()),
 });
 
-/** Reads `muxMetadata.askUserQuestionAnswer`, dropping missing or malformed values (self-healing). */
+const AskUserQuestionAnswerHolderSchema = z.object({ askUserQuestionAnswer: z.unknown() });
+
+/**
+ * Reads `muxMetadata.askUserQuestionAnswer` as a list: one answered call (an object) or several
+ * (an array, sent by the chained form). Self-healing: each entry is checked on its own, so one
+ * malformed entry does not reopen the other calls the message answered; no valid entry reads as
+ * undefined.
+ */
 export function parseAskUserQuestionAnswerMetadata(
   muxMetadata: unknown
-): AskUserQuestionAnswerMetadata | undefined {
-  const parsed = AskUserQuestionAnswerHolderSchema.safeParse(muxMetadata);
-  return parsed.success ? parsed.data.askUserQuestionAnswer : undefined;
+): AskUserQuestionAnswerMetadata[] | undefined {
+  const holder = AskUserQuestionAnswerHolderSchema.safeParse(muxMetadata);
+  if (!holder.success) {
+    return undefined;
+  }
+  const value = holder.data.askUserQuestionAnswer;
+  const items: unknown[] = Array.isArray(value) ? value : [value];
+  const entries = items.flatMap((entry) => {
+    const parsed = AskUserQuestionAnswerEntrySchema.safeParse(entry);
+    return parsed.success ? [parsed.data] : [];
+  });
+  return entries.length > 0 ? entries : undefined;
 }
 
 export function buildAskUserQuestionSummary(answers: Record<string, string>): string {

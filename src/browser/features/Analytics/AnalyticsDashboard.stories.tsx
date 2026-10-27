@@ -18,6 +18,7 @@ import { textsBelowAaInThemes } from "@/browser/stories/helpers/contrast";
 import { lightweightMeta } from "@/browser/stories/meta.js";
 import { NOW, createWorkspace, groupWorkspacesByProject } from "@/browser/stories/mocks/workspaces";
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
+import { waitForModalLayer } from "@/browser/stories/storyPlayHelpers";
 import assert from "@/common/utils/assert";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, userEvent, waitFor, within } from "storybook/test";
@@ -957,10 +958,12 @@ function AnalyticsDashboardStory() {
 
 /** The dialog portals to document.body, outside the story canvas. */
 async function findAnalyticsDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
-  return within(canvasElement.ownerDocument.body).findByRole(
-    "dialog",
-    { name: "Analytics" },
-    { timeout: 10000 }
+  return waitForModalLayer(
+    await within(canvasElement.ownerDocument.body).findByRole(
+      "dialog",
+      { name: "Analytics" },
+      { timeout: 10000 }
+    )
   );
 }
 

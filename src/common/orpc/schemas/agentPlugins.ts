@@ -73,9 +73,15 @@ export const PluginHookHandlerSchema = z.discriminatedUnion("type", [
 
 /**
  * `runnable`: an mcp_tool handler on a mapped event. `unsupported-handler`: a command, prompt or
- * agent handler. `ignored-event`: a Codex event Xum does not map.
+ * agent handler. `ignored-event`: a Codex event Xum does not map. `claude-plugin`: any hook of a
+ * Claude Code plugin (Xum lists them and never runs them).
  */
-export const PluginHookStatusSchema = z.enum(["runnable", "unsupported-handler", "ignored-event"]);
+export const PluginHookStatusSchema = z.enum([
+  "runnable",
+  "unsupported-handler",
+  "ignored-event",
+  "claude-plugin",
+]);
 
 /**
  * Trust review state, keyed by the hook's location and checked against its hash (Codex trust):
@@ -154,8 +160,43 @@ export const AgentPluginComponentKindSchema = z.enum([
   "slashCommands",
 ]);
 
+/**
+ * How Xum reads a repository as a managed plugin. Preview lists every method that fits, in this
+ * order, and install must use the method the user previewed. Each member is an object so a method
+ * can carry its own fields (a later Claude marketplace method names its entry).
+ */
+export const AgentPluginInstallMethodSchema = z.discriminatedUnion("kind", [
+  /** plugin.json, or .codex-plugin/plugin.json. */
+  z.object({ kind: z.literal("agent-plugin") }),
+  /** .claude-plugin/plugin.json. */
+  z.object({ kind: z.literal("claude-plugin") }),
+  /** SKILL.md folders only: Xum writes a plugin.json for them (installMethods.ts). */
+  z.object({ kind: z.literal("skills") }),
+  /**
+   * One entry of a Claude Code marketplace (`.claude-plugin/marketplace.json` at the repository
+   * root). A preview with it resolves the entry; install gets it back only when the entry has no
+   * plugin.json of its own and Xum writes one from the entry (claudeMarketplace.ts).
+   */
+  z.object({ kind: z.literal("claude-marketplace"), entry: z.string().min(1) }),
+]);
+export type AgentPluginInstallMethod = z.infer<typeof AgentPluginInstallMethodSchema>;
+
 export const AgentPluginInstallPreviewSchema = z.object({
   source: AgentPluginGitSourceSchema,
+  /** The method this preview used. Install gets it back. */
+  method: AgentPluginInstallMethodSchema,
+  /** Every method that fits the repository, in order: agent-plugin, claude-plugin, skills. */
+  methods: z.array(AgentPluginInstallMethodSchema),
+  /**
+   * Skill folder names found with the skills CLI rules, for the "Skills CLI" choice (empty when
+   * the repository has no SKILL.md files). Independent of `method`.
+   */
+  skillsCliSkills: z.array(z.string()),
+  /**
+   * Why Install refuses this method: a plugin or folder of the same name exists. The preview
+   * still lists every method and the Skills CLI choice (it creates no managed plugin).
+   */
+  installBlockedReason: z.string().optional(),
   /** Commit SHA the preview was computed from; install verifies it gets the same tree. */
   lockedSha: z.string(),
   manifest: AgentPluginManifestSummarySchema,
@@ -196,6 +237,56 @@ export const AgentPluginInstallPreviewSchema = z.object({
    */
   consentDigest: z.string(),
 });
+
+/** One plugin entry of a Claude Code marketplace listing. */
+export const AgentPluginMarketplaceEntrySchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  /** The entry `source` kind; "relative" is a folder of the marketplace repository. */
+  sourceKind: z.enum([
+    "relative",
+    "github",
+    "git-subdir",
+    "url",
+    "npm",
+    "archive",
+    "command",
+    "unknown",
+  ]),
+  /** Display form of the source: a folder ("./" for the root) or a repository URL. */
+  source: z.string(),
+  /**
+   * Absent when the entry lists no `skills` paths. For an entry in the marketplace repository,
+   * the skills its preview accepts; for an entry in another repository, the number of paths.
+   */
+  skillCount: z.number().int().nonnegative().optional(),
+  installable: z.boolean(),
+  /** Why the entry cannot install (present exactly when `installable` is false). */
+  reason: z.string().optional(),
+});
+
+/** A repository whose only package is a Claude Code marketplace: the user picks one entry. */
+export const AgentPluginMarketplaceListingSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  owner: z.string().optional(),
+  /** The marketplace repository, resolved like a plugin source. */
+  source: AgentPluginGitSourceSchema,
+  lockedSha: z.string(),
+  entries: z.array(AgentPluginMarketplaceEntrySchema),
+  /**
+   * Other methods that fit the repository root (Skills when it has SKILL.md files), so the user
+   * can install the whole repository instead of one entry.
+   */
+  methods: z.array(AgentPluginInstallMethodSchema),
+  warnings: z.array(z.string()),
+});
+
+/** What a preview found: a plugin to review, or a marketplace to pick an entry from. */
+export const AgentPluginSourcePreviewSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("plugin"), preview: AgentPluginInstallPreviewSchema }),
+  z.object({ kind: z.literal("marketplace"), marketplace: AgentPluginMarketplaceListingSchema }),
+]);
 
 export const AgentPluginListItemSchema = z.object({
   name: z.string(),
@@ -319,6 +410,9 @@ export type AgentPluginHook = z.infer<typeof AgentPluginHookSchema>;
 export type AgentPluginHooks = z.infer<typeof AgentPluginHooksSchema>;
 export type AgentPluginManifestSummary = z.infer<typeof AgentPluginManifestSummarySchema>;
 export type AgentPluginInstallPreview = z.infer<typeof AgentPluginInstallPreviewSchema>;
+export type AgentPluginMarketplaceEntry = z.infer<typeof AgentPluginMarketplaceEntrySchema>;
+export type AgentPluginMarketplaceListing = z.infer<typeof AgentPluginMarketplaceListingSchema>;
+export type AgentPluginSourcePreview = z.infer<typeof AgentPluginSourcePreviewSchema>;
 export type AgentPluginListItem = z.infer<typeof AgentPluginListItemSchema>;
 export type AgentPluginPendingSignOuts = z.infer<typeof AgentPluginPendingSignOutsSchema>;
 export type AgentPluginUpdateCheck = z.infer<typeof AgentPluginUpdateCheckSchema>;

@@ -14,6 +14,7 @@ import { getInterruptionContext } from "@/common/utils/messages/retryEligibility
 import { shouldNotifyOnResponseComplete } from "./responseCompletionMetadata";
 import { MAX_HISTORY_HIDDEN_SEGMENTS } from "./transcriptTruncationPlan";
 import { StreamingMessageAggregator } from "./StreamingMessageAggregator";
+import { setAcceptedAnswers } from "./openAskUserQuestions";
 import { canEditDisplayedUserMessage } from "@/browser/utils/chatEditing";
 import { buildHistoryEditPrecondition } from "@/common/utils/history/editTruncation";
 
@@ -2202,44 +2203,6 @@ describe("StreamingMessageAggregator", () => {
     const asChatMessage = (msg: ReturnType<typeof createMuxMessage>) => ({
       ...msg,
       type: "message" as const,
-    });
-
-    test("prunes older messages on first compaction and keeps the new boundary", () => {
-      const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
-
-      // Simulate messages accumulated during a live session (no prior compaction)
-      const msg1 = asChatMessage(
-        createMuxMessage("user-1", "user", "First message", {
-          historySequence: 0,
-          timestamp: 1,
-        })
-      );
-      const msg2 = asChatMessage(
-        createMuxMessage("assistant-1", "assistant", "Response", {
-          historySequence: 1,
-          timestamp: 2,
-        })
-      );
-
-      aggregator.handleMessage(msg1);
-      aggregator.handleMessage(msg2);
-
-      const summary = asChatMessage(
-        createMuxMessage("summary-1", "assistant", "Compacted summary", {
-          historySequence: 2,
-          compacted: "user",
-          compactionBoundary: true,
-          compactionEpoch: 1,
-          muxMetadata: { type: "compaction-summary" },
-        })
-      );
-      aggregator.handleMessage(summary);
-
-      // Existing messages with sequence < incoming boundary (2) are pruned.
-      // The incoming boundary itself is appended after pruning and remains visible.
-      const remaining = aggregator.getAllMessages();
-      expect(remaining).toHaveLength(1);
-      expect(remaining.map((m) => m.id)).toEqual(["summary-1"]);
     });
 
     test("keeps only the latest boundary epoch start on subsequent compactions", () => {
@@ -5474,5 +5437,106 @@ describe("StreamingMessageAggregator in-turn hidden notice rows", () => {
     });
     expect(aggregator.getPendingStreamStartTime()).not.toBeNull();
     expect(aggregator.getPendingStreamModel()).toBe(model);
+  });
+});
+
+describe("transcript truncation keeps open questions", () => {
+  const questionInput = {
+    questions: [
+      {
+        question: "Which option?",
+        header: "Option",
+        options: [
+          { label: "First", description: "The first option." },
+          { label: "Second", description: "The second option." },
+        ],
+        multiSelect: false,
+      },
+    ],
+  };
+  const asyncOutput = {
+    summary: "Questions shown to the user.",
+    ui_only: {
+      ask_user_question: {
+        questions: questionInput.questions,
+        answers: {},
+        answerDelivery: "message",
+      },
+    },
+  };
+
+  function loadQuestionThenOutput(
+    answered: boolean,
+    workspaceId?: string,
+    input: Record<string, unknown> = questionInput
+  ) {
+    const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT, workspaceId);
+    const answerRows = answered
+      ? [
+          createMuxMessage("answer-1", "user", "option 1", {
+            historySequence: 2,
+            timestamp: 2,
+            muxMetadata: {
+              type: "normal",
+              askUserQuestionAnswer: { toolCallId: "ask-1", answers: { "Which option?": "First" } },
+            },
+          }),
+        ]
+      : [];
+    aggregator.loadHistoricalMessages(
+      [
+        historicalToolMessage("question-1", "ask_user_question", input, {
+          toolCallId: "ask-1",
+          output: asyncOutput,
+          historySequence: 1,
+        }),
+        ...answerRows,
+        // Enough later agent output to push the question past the recent-row window.
+        ...Array.from({ length: 70 }, (_, index) =>
+          createMuxMessage(`later-${index}`, "assistant", `later response ${index}`, {
+            historySequence: index + 3,
+            timestamp: index + 3,
+          })
+        ),
+      ],
+      false
+    );
+    const rows = aggregator.getDisplayedMessages();
+    const question = rows.find((row) => row.type === "tool" && row.toolCallId === "ask-1");
+    return {
+      truncated: rows.some((row) => row.type === "history-hidden"),
+      questionShown: question !== undefined,
+      questionRowId: question?.id,
+    };
+  }
+
+  test("an unanswered question stays in the displayed rows", () => {
+    expect(loadQuestionThenOutput(false)).toMatchObject({ truncated: true, questionShown: true });
+  });
+
+  test("an answered question may be hidden like any older tool row", () => {
+    expect(loadQuestionThenOutput(true)).toMatchObject({ truncated: true, questionShown: false });
+  });
+
+  test("a question with malformed args (a generic card, never docked) is not kept", () => {
+    expect(loadQuestionThenOutput(false, undefined, { questions: "not a list" })).toMatchObject({
+      truncated: true,
+      questionShown: false,
+    });
+  });
+
+  test("an answer the app accepted without an answer row releases the question", () => {
+    // A batched answer rides an earlier queued message, so no answer row ever lands for it.
+    const workspaceId = "ws-truncation-accepted";
+    const before = loadQuestionThenOutput(false, workspaceId);
+    expect(before).toMatchObject({ truncated: true, questionShown: true });
+    setAcceptedAnswers(
+      { workspaceId, toolCallId: "ask-1", rowId: before.questionRowId },
+      { "Which option?": "First" }
+    );
+    expect(loadQuestionThenOutput(false, workspaceId)).toMatchObject({
+      truncated: true,
+      questionShown: false,
+    });
   });
 });

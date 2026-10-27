@@ -58,7 +58,9 @@ import type { NameGenerationError } from "@/common/types/errors";
 import type { Secret } from "@/common/types/secrets";
 import type { MCPHttpServerInfo, MCPServerIdentity, MCPServerInfo } from "@/common/types/mcp";
 import type {
+  AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceListing,
   AgentPluginListItem,
   AgentPluginUpdateCheck,
   AgentPluginUpdateReview,
@@ -165,6 +167,14 @@ export interface MockORPCClientOptions {
     updateChecks?: AgentPluginUpdateCheck[];
     /** Returned by agentPlugins.preview; omit to make preview fail. */
     preview?: AgentPluginInstallPreview;
+    /** The error agentPlugins.preview returns when it fails. */
+    previewError?: string;
+    /** Returned by agentPlugins.preview for an "Install as" method; others get `preview`. */
+    previewsByMethod?: Partial<Record<AgentPluginInstallMethod["kind"], AgentPluginInstallPreview>>;
+    /** Returned by agentPlugins.preview without a method: a Claude Code marketplace listing. */
+    marketplace?: AgentPluginMarketplaceListing;
+    /** Returned by agentPlugins.preview for a marketplace entry, by entry name. */
+    previewsByEntry?: Record<string, AgentPluginInstallPreview>;
     /** Returned by agentPlugins.previewUpdate for the named plugin; omit to make it fail. */
     updateReview?: AgentPluginUpdateReview;
     /** agentPlugins.getHooks data by plugin name; setHookTrust updates it in memory. */
@@ -252,6 +262,8 @@ export interface MockORPCClientOptions {
     shelfFiles?: Record<string, ArtifactReadResult>;
     /** Persisted window.xum.state per artifact path (artifacts.getState); default null. */
     states?: Record<string, unknown>;
+    /** When set, artifacts.sendInteraction fails with this error (the strip's error state). */
+    sendInteractionError?: string;
   };
   /** MCP Apps views: mcpApps.getView by tool call ID, mcpApps.callTool per request. */
   /** When set, mcpApps.listViewDomains fails with this error (Settings' load error). */
@@ -726,8 +738,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
   let agentAiDefaults = normalizeAgentAiDefaults(initialAgentAiDefaults ?? {});
 
-  let muxGatewayEnabled: boolean | undefined = undefined;
-  let muxGatewayModels: string[] | undefined = undefined;
   let coderWorkspaceArchiveBehavior = initialCoderWorkspaceArchiveBehavior;
   let worktreeArchiveBehavior = initialWorktreeArchiveBehavior;
   let chatTranscriptFullWidth = initialChatTranscriptFullWidth;
@@ -967,8 +977,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         Promise.resolve({
           userPreferences,
           taskSettings,
-          muxGatewayEnabled,
-          muxGatewayModels,
           routePriority,
           routeOverrides,
           coderWorkspaceArchiveBehavior,
@@ -1066,15 +1074,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
             ...(chosen.thinkingLevel != null ? { thinkingLevel: chosen.thinkingLevel } : {}),
           },
         });
-      },
-      updateMuxGatewayPrefs: (input: {
-        muxGatewayEnabled: boolean;
-        muxGatewayModels: string[];
-      }) => {
-        muxGatewayEnabled = input.muxGatewayEnabled ? undefined : false;
-        muxGatewayModels = input.muxGatewayModels.length > 0 ? input.muxGatewayModels : undefined;
-        notifyConfigChanged();
-        return Promise.resolve(undefined);
       },
       updateRoutePreferences: (input: {
         routePriority: string[];
@@ -1281,16 +1280,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       setProviderConfig: () => Promise.resolve({ success: true, data: undefined }),
       setModels: () => Promise.resolve({ success: true, data: undefined }),
     },
-    muxGateway: {
-      getAccountStatus: () =>
-        Promise.resolve({
-          success: true,
-          data: {
-            remaining_microdollars: 134_598_127,
-            ai_gateway_concurrent_requests_per_user: 20,
-          },
-        }),
-    },
     analytics: {
       getDelegationSummary: (_input: {
         projectPath?: string | null;
@@ -1438,10 +1427,39 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       },
       checkUpdates: () =>
         Promise.resolve({ success: true, data: agentPluginsMock?.updateChecks ?? [] }),
-      preview: () =>
-        agentPluginsMock?.preview
-          ? Promise.resolve({ success: true, data: agentPluginsMock.preview })
-          : Promise.resolve({ success: false, error: "No preview configured in this story" }),
+      preview: (input: { method?: AgentPluginInstallMethod | null }) => {
+        const method = input.method;
+        if (method == null && agentPluginsMock?.marketplace !== undefined) {
+          return Promise.resolve({
+            success: true as const,
+            data: { kind: "marketplace" as const, marketplace: agentPluginsMock.marketplace },
+          });
+        }
+        const preview =
+          method?.kind === "claude-marketplace"
+            ? agentPluginsMock?.previewsByEntry?.[method.entry]
+            : ((method != null ? agentPluginsMock?.previewsByMethod?.[method.kind] : null) ??
+              agentPluginsMock?.preview);
+        return preview
+          ? Promise.resolve({ success: true as const, data: { kind: "plugin" as const, preview } })
+          : Promise.resolve({
+              success: false as const,
+              error: agentPluginsMock?.previewError ?? "No preview configured in this story",
+            });
+      },
+      // Like the backend's command, from the typed source (the backend normalizes it first).
+      skillsCliCommand: (input: { source: string; skills: string[] }) =>
+        Promise.resolve({
+          success: true as const,
+          data: {
+            command: [
+              "cd ~ && npx --yes skills@1.7.4 add",
+              input.source,
+              ...input.skills.map((skill) => `--skill ${skill}`),
+              "--global --agent codex --copy",
+            ].join(" "),
+          },
+        }),
       install: (input: { source: AgentPluginInstallPreview["source"]; expectedSha: string }) =>
         Promise.resolve({
           success: true,
@@ -2636,7 +2654,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         }),
       setState: () => Promise.resolve({ success: true as const, data: undefined }),
       sendInteraction: () =>
-        Promise.resolve({ success: true as const, data: { id: "story-interaction" } }),
+        Promise.resolve(
+          artifacts.sendInteractionError != null
+            ? { success: false as const, error: artifacts.sendInteractionError }
+            : { success: true as const, data: { id: "story-interaction" } }
+        ),
     },
     mcpApps: {
       getView: (input: { toolCallId: string }) => {
@@ -2718,14 +2740,36 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
       set: (limits: AgentResourceLimits) => {
         agentResourceLimitsState = mockAgentResourceLimitsState(
           agentResourceLimitsState.enabled,
-          limits
+          limits,
+          agentResourceLimitsState.projects
         );
         return Promise.resolve(agentResourceLimitsState);
       },
       setEnabled: ({ enabled }: { enabled: boolean }) => {
         agentResourceLimitsState = mockAgentResourceLimitsState(
           enabled,
-          agentResourceLimitsState.limits
+          agentResourceLimitsState.limits,
+          agentResourceLimitsState.projects
+        );
+        return Promise.resolve(agentResourceLimitsState);
+      },
+      setProject: ({
+        projectPath,
+        limits,
+      }: {
+        projectPath: string;
+        limits: AgentResourceLimits;
+      }) => {
+        const projects = { ...agentResourceLimitsState.projects };
+        if (limits.cpuCores === undefined && limits.memoryGiB === undefined) {
+          delete projects[projectPath];
+        } else {
+          projects[projectPath] = { limits };
+        }
+        agentResourceLimitsState = mockAgentResourceLimitsState(
+          agentResourceLimitsState.enabled,
+          agentResourceLimitsState.limits,
+          projects
         );
         return Promise.resolve(agentResourceLimitsState);
       },
@@ -2798,12 +2842,25 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
 
 function mockAgentResourceLimitsState(
   enabled: boolean,
-  limits: AgentResourceLimits
+  limits: AgentResourceLimits,
+  savedProjects: AgentResourceLimitsState["projects"] = {}
 ): AgentResourceLimitsState {
-  const limited = enabled && (limits.cpuCores !== undefined || limits.memoryGiB !== undefined);
+  const limited =
+    enabled &&
+    (limits.cpuCores !== undefined ||
+      limits.memoryGiB !== undefined ||
+      Object.keys(savedProjects).length > 0);
+  // Like the backend: a project's cgroup shows only while the limits are active.
+  const projects: AgentResourceLimitsState["projects"] = {};
+  for (const [projectPath, project] of Object.entries(savedProjects)) {
+    projects[projectPath] = limited
+      ? { limits: project.limits, cgroup: `/xum/xum-agents/p-${projectPath.length}` }
+      : { limits: project.limits };
+  }
   return {
     enabled,
     limits,
+    projects,
     status: limited ? { state: "active", cgroup: "/xum/xum-agents" } : { state: "off" },
     support: { state: "ready", cgroup: "/xum" },
   };

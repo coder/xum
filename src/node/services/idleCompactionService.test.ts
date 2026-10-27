@@ -11,6 +11,7 @@ import {
   formatPlanReviewEnvelope,
 } from "@/common/utils/planReview/planReviewEnvelope";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import { waitForCondition } from "./testDispatchHelpers";
 
 /** Hidden plan-review record row (resolve/reopen appended while idle): user role, never a prompt. */
@@ -62,7 +63,7 @@ describe("IdleCompactionService", () => {
     mockConfig = { loadConfigOrDefault: loadConfigMock } as unknown as Config;
 
     // Create real history service and seed default idle messages (25 hours ago)
-    ({ historyService, cleanup } = await createTestHistoryService());
+    ({ historyService, cleanup } = await createTestHistoryService({ files: SessionFilesMemory }));
     const idleTimestamp = now - 25 * oneHourMs;
     await historyService.appendToHistory(
       testWorkspaceId,

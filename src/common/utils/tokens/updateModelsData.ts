@@ -8,7 +8,12 @@
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { normalizeToCanonical } from "../ai/models";
 import { modelsExtra } from "./models-extra";
-import { generateModelLookupKeys, hasUsableTokenLimits, parseNum } from "./modelStats";
+import {
+  generateModelLookupKeys,
+  hasUsableTokenLimits,
+  LONG_CONTEXT_RATE_FIELD,
+  parseNum,
+} from "./modelStats";
 
 const RETAINED_FIELDS = [
   "max_input_tokens",
@@ -16,13 +21,8 @@ const RETAINED_FIELDS = [
   "input_cost_per_token",
   "output_cost_per_token",
   "output_cost_per_image_token",
-  "input_cost_per_token_above_200k_tokens",
-  "output_cost_per_token_above_200k_tokens",
   "cache_creation_input_token_cost",
-  "cache_creation_input_token_cost_above_200k_tokens",
   "cache_read_input_token_cost",
-  "cache_read_input_token_cost_above_200k_tokens",
-  "tiered_pricing_threshold_tokens",
   "mode",
   "litellm_provider",
   "supports_pdf_input",
@@ -36,13 +36,21 @@ const COST_FIELDS = [
   "input_cost_per_token",
   "output_cost_per_token",
   "output_cost_per_image_token",
-  "input_cost_per_token_above_200k_tokens",
-  "output_cost_per_token_above_200k_tokens",
   "cache_creation_input_token_cost",
-  "cache_creation_input_token_cost_above_200k_tokens",
   "cache_read_input_token_cost",
-  "cache_read_input_token_cost_above_200k_tokens",
 ] as const;
+
+/** An entry's long-context rates, at whatever threshold LiteLLM names, in sorted order. */
+function longContextRateFields(metadata: Record<string, unknown>): string[] {
+  return Object.keys(metadata)
+    .filter((field) => LONG_CONTEXT_RATE_FIELD.test(field))
+    .sort();
+}
+
+/** The retained fields an entry carries, in a key order upstream reordering cannot change. */
+function retainedFields(metadata: Record<string, unknown>): string[] {
+  return [...RETAINED_FIELDS, ...longContextRateFields(metadata)];
+}
 
 // Abort thresholds guarding against truncated or structurally reshaped upstream data.
 // The absolute floor catches degenerate payloads; the relative bounds catch partial
@@ -105,7 +113,7 @@ export function pruneModelData(data: unknown): ModelCatalogData {
     const retained: Record<string, unknown> = {};
     // Keep models.json small: Xum only reads pricing, token limits, provider, mode, and media
     // capability fields, while upstream LiteLLM ships many provider-specific fields we never use.
-    for (const field of RETAINED_FIELDS) {
+    for (const field of retainedFields(metadata)) {
       if (metadata[field] !== undefined) {
         retained[field] = metadata[field];
       }
@@ -117,7 +125,7 @@ export function pruneModelData(data: unknown): ModelCatalogData {
 }
 
 function hasValidPricing(metadata: Record<string, unknown>): boolean {
-  return COST_FIELDS.every((field) => {
+  return [...COST_FIELDS, ...longContextRateFields(metadata)].every((field) => {
     const value = metadata[field];
     // Absent costs are fine (e.g. subscription providers); present costs must be
     // usable numbers, otherwise cost tracking would silently misprice the model.
@@ -235,7 +243,7 @@ export function summarizeCatalog(catalog: ModelCatalogData): CatalogSummary {
     if (hasUsableTokenLimits(metadata)) {
       coverage.usable++;
     }
-    for (const field of RETAINED_FIELDS) {
+    for (const field of retainedFields(metadata)) {
       if (field === "mode") {
         continue; // the bucket key itself; `entries` already counts it
       }
@@ -390,7 +398,7 @@ export function validateModelData(
     if (entry === undefined) {
       continue; // fully removed identities are governed by the coverage baselines
     }
-    for (const field of RETAINED_FIELDS) {
+    for (const field of retainedFields(baselineEntry)) {
       const baselineValue = baselineEntry[field];
       if (baselineValue === true) {
         if (entry[field] !== true) {

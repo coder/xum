@@ -128,8 +128,8 @@ describe("resolveProviderOptionsNamespaceKey", () => {
     expect(resolveProviderOptionsNamespaceKey("openai", "openai")).toBe("openai");
   });
 
-  test("returns the canonical provider for passthrough gateways", () => {
-    expect(resolveProviderOptionsNamespaceKey("openai", "mux-gateway")).toBe("openai");
+  test("returns the canonical provider for the passthrough Coder gateway", () => {
+    expect(resolveProviderOptionsNamespaceKey("openai", "coder")).toBe("openai");
   });
 
   test("returns the route provider for non-passthrough OpenRouter routing", () => {
@@ -369,7 +369,6 @@ describe("buildProviderOptions - Anthropic", () => {
       const ineligible: Array<
         [string, string, ProvidersConfigMap | null | undefined, Parameters<typeof optionsFor>[3]]
       > = [
-        ["Xum gateway", "mux-gateway:anthropic/claude-sonnet-5-5", directConfig(), "mux-gateway"],
         ["no resolved route", sonnet55, directConfig(), undefined],
         ["no providers config", sonnet55, null, "anthropic"],
         [
@@ -655,7 +654,6 @@ describe("buildProviderOptions - Anthropic", () => {
     test("fails closed on routes that may not forward the beta header", () => {
       const cases: Array<[string, Parameters<typeof thinkingFor>[1]]> = [
         ["no resolved route", { route: undefined }],
-        ["gateway route", { route: "mux-gateway" }],
         ["no providers config", { config: null }],
         ["config base URL", { config: directConfig({ baseUrl: "https://llm.example.com/v1" }) }],
         [
@@ -677,9 +675,6 @@ describe("buildProviderOptions - Anthropic", () => {
           thinking: { type: "adaptive", display: "summarized" },
         });
       }
-      expect(
-        thinkingFor("mux-gateway:anthropic/claude-opus-5-5", { route: "mux-gateway" })
-      ).not.toHaveProperty("blockBinding");
     });
 
     test("the SDK sends block_binding with its beta header only when eligible", async () => {
@@ -712,7 +707,7 @@ describe("buildProviderOptions - Anthropic", () => {
         { preconnect: fetch.preconnect.bind(fetch) }
       );
       const model = createAnthropic({ apiKey: "test", fetch: captureFetch })("claude-opus-5-5");
-      for (const route of ["anthropic", "mux-gateway"] as const) {
+      for (const route of ["anthropic", undefined] as const) {
         await generateText({
           model,
           prompt: "Return ok.",
@@ -1401,7 +1396,6 @@ describe("anthropicNativeWebFetchRouteAvailable", () => {
         anthropic({ baseUrl: "https://api.anthropic.com/v1" })
       )
     ).toBe(true);
-    expect(anthropicNativeWebFetchRouteAvailable(opus, "mux-gateway", anthropic())).toBe(true);
     expect(
       anthropicNativeWebFetchRouteAvailable(
         "coder:anthropic/claude-opus-4-6",
@@ -1750,9 +1744,9 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(openai).toBeDefined();
       expect(openai!.truncation).toBe("auto");
     });
-    test("should derive promptCacheKey for gateway OpenAI model with promptCacheScope", () => {
+    test("should derive promptCacheKey for Coder-routed OpenAI model with promptCacheScope", () => {
       const result = buildProviderOptions(
-        "mux-gateway:openai/gpt-5.2",
+        "coder:openai/gpt-5.2",
         "off",
         undefined,
         undefined,
@@ -1846,7 +1840,7 @@ describe("buildProviderOptions - OpenAI", () => {
       expect(buildChatOptions("openai:gpt-6-luna")?.promptCacheKey).toBeUndefined();
       // Passthrough gateway route fails closed.
       expect(
-        buildChatOptions("openai:gpt-6-luna", { routeProvider: "mux-gateway" })?.promptCacheKey
+        buildChatOptions("openai:gpt-6-luna", { routeProvider: "coder" })?.promptCacheKey
       ).toBeUndefined();
       // Codex OAuth wins the auth path.
       expect(
@@ -1894,7 +1888,7 @@ describe("buildProviderOptions - OpenAI", () => {
       // Passthrough gateway Responses request: legacy behavior still applies.
       const passthrough = getOpenAIOptions(
         buildProviderOptions(
-          "mux-gateway:openai/gpt-6-luna",
+          "coder:openai/gpt-6-luna",
           "medium",
           undefined,
           undefined,
@@ -1902,7 +1896,7 @@ describe("buildProviderOptions - OpenAI", () => {
           "workspace-1",
           undefined,
           undefined,
-          "mux-gateway",
+          "coder",
           "project-scope"
         )
       );
@@ -1913,7 +1907,7 @@ describe("buildProviderOptions - OpenAI", () => {
   describe("route provider format selection", () => {
     test("uses the transforming route provider format for gateway-routed OpenAI models", () => {
       const result = buildProviderOptions(
-        "mux-gateway:openai/gpt-5.2",
+        "openrouter:openai/gpt-5.2",
         "medium",
         undefined,
         undefined,
@@ -1936,7 +1930,7 @@ describe("buildProviderOptions - OpenAI", () => {
     });
 
     test("falls back to the canonical origin provider format when routeProvider is absent", () => {
-      const result = buildProviderOptions("mux-gateway:openai/gpt-5.2", "medium");
+      const result = buildProviderOptions("openrouter:openai/gpt-5.2", "medium");
       const openai = getOpenAIOptions(result);
 
       expect(openai).toBeDefined();
@@ -2328,7 +2322,7 @@ describe("buildProviderOptions - OpenAI", () => {
         expect(
           openaiProModeAvailable(model, {
             providersConfig: config,
-            resolvedRouteProvider: "mux-gateway",
+            resolvedRouteProvider: "openrouter",
           })
         ).toBe(false);
         expect(
@@ -2460,17 +2454,22 @@ describe("buildProviderOptions - OpenAI", () => {
       }
     });
 
-    test("omits pro mode for standard mode, unsupported models, gateways, and Chat Completions", () => {
+    test("sends native max, explicit none, and pro mode for catalogue GPT-5.6 Sol", () => {
+      const max = buildWithMode("openai:gpt-5.6-sol", "pro", { thinkingLevel: "max" });
+      expect(max?.reasoningEffort).toBe("max");
+      expect(max?.reasoningMode).toBe("pro");
+      expect(buildWithMode("openai:gpt-5.6-sol", "standard")?.reasoningEffort).toBe("none");
+    });
+
+    test("omits pro mode for standard mode, unsupported models, and Chat Completions", () => {
       const cases = [
         buildWithMode("openai:gpt-6.1-sol", "standard"),
         buildWithMode("openai:gpt-6-astra", "standard"),
         buildWithMode("openai:gpt-6-astra", undefined),
-        buildWithMode("openai:gpt-6-astra", "pro", { routeProvider: "mux-gateway" }),
         buildWithMode("openai:gpt-6-astra", "pro", {
           muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
         }),
         buildWithMode("openai:gpt-5.5-pro", "pro"),
-        buildWithMode("openai:gpt-6.1-sol", "pro", { routeProvider: "mux-gateway" }),
         buildWithMode("openai:gpt-6.1-sol", "pro", {
           muxProviderOptions: { openai: { wireFormat: "chatCompletions" } },
         }),
@@ -2495,6 +2494,9 @@ describe("buildProviderOptions - OpenAI", () => {
       ["gpt-6.1-sol", "openai"],
       ["gpt-6-astra", "openai"],
       ["gpt-6-astra", "coder"],
+      // The SDK's effort allowlist covers only GPT-6+ ids, so catalogue GPT-5.6
+      // relies on the SDK passing "max" through unchanged.
+      ["gpt-5.6-sol", "openai"],
     ] as const)(
       "serializes native max and pro for %s via %s through the OpenAI SDK",
       async (model, routeProvider) => {
@@ -2634,7 +2636,7 @@ describe("buildProviderOptions - OpenAI", () => {
       ["the setting off", { openai: { cyberModelEnabled: false } }],
       ["an unmapped model", { model: "openai:gpt-6-luna" }],
       ["Chat Completions", { wireFormat: "chatCompletions" as const }],
-      ["a gateway route", { routeProvider: "mux-gateway" as const }],
+      ["a gateway route", { routeProvider: "coder" as const }],
       ["Codex OAuth", { openai: { apiKeySet: false, codexOauthSet: true } }],
     ])("omits the program for %s", (_name, options) => {
       expect(buildCyber(options)).not.toHaveProperty("cyberAccessProgram");
@@ -2920,11 +2922,11 @@ describe("buildProviderOptions - OpenAI", () => {
     test("does not reuse previousResponseId when Xum already sends explicit GPT-5.5 history", () => {
       const messages = [
         createMuxMessage("assistant-1", "assistant", "", {
-          model: "mux-gateway:openai/gpt-5.5",
+          model: "coder:openai/gpt-5.5",
           providerMetadata: { openai: { responseId: "resp_123" } },
         }),
       ];
-      const result = buildProviderOptions("mux-gateway:openai/gpt-5.5", "medium", messages);
+      const result = buildProviderOptions("coder:openai/gpt-5.5", "medium", messages);
       const openai = getOpenAIOptions(result);
 
       expect(openai).toBeDefined();
@@ -3025,16 +3027,6 @@ describe("buildProviderOptions - Google", () => {
     });
   });
 
-  test("maps gateway Gemini 3.5 Flash off to minimal thinking without thoughts", () => {
-    expect(buildProviderOptions("mux-gateway:google/gemini-3.5-flash", "off")).toEqual({
-      google: {
-        thinkingConfig: {
-          thinkingLevel: "minimal",
-        },
-      },
-    });
-  });
-
   test("maps namespaced Gemini 3.5 Flash off to minimal thinking without thoughts", () => {
     expect(buildProviderOptions("google:models/gemini-3.5-flash", "off")).toEqual({
       google: {
@@ -3126,8 +3118,8 @@ describe("buildProviderOptions - Google", () => {
     }
   });
 
-  test("maps gateway-routed Gemini 3.8 Flash to thinkingLevel config", () => {
-    expect(buildProviderOptions("mux-gateway:google/gemini-3.8-flash", "high")).toEqual({
+  test("maps gateway-prefixed Gemini 3.8 Flash to thinkingLevel config", () => {
+    expect(buildProviderOptions("openrouter:google/gemini-3.8-flash", "high")).toEqual({
       google: {
         thinkingConfig: {
           includeThoughts: true,
@@ -3138,7 +3130,7 @@ describe("buildProviderOptions - Google", () => {
   });
 
   test("maps Gemini 3.5 Flash medium to thinkingLevel medium with thoughts", () => {
-    expect(buildProviderOptions("mux-gateway:google/gemini-3.5-flash", "medium")).toEqual({
+    expect(buildProviderOptions("google:gemini-3.5-flash", "medium")).toEqual({
       google: {
         thinkingConfig: {
           includeThoughts: true,
@@ -3581,8 +3573,8 @@ describe("buildRequestHeaders", () => {
       expected: { "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER },
     },
     {
-      name: "should return anthropic-beta header for gateway-routed beta Anthropic model",
-      model: "mux-gateway:anthropic/claude-sonnet-4-5",
+      name: "should return anthropic-beta header for Coder-routed beta Anthropic model",
+      model: "coder:anthropic/claude-sonnet-4-5",
       options: { anthropic: { use1MContext: true } },
       expected: { "anthropic-beta": ANTHROPIC_1M_CONTEXT_HEADER },
     },
@@ -3697,10 +3689,8 @@ describe("buildRequestHeaders", () => {
       ["openai:gpt-6-luna", true],
       ["openai:gpt-6-astra", true],
       ["openai:gpt-6-astra-2026-09-03", true],
-      ["mux-gateway:openai/gpt-6-astra", false],
       ["openai:gpt-6-astra-mini", false],
-      // Other gateways fail closed — mux-gateway drops the field server-side.
-      ["mux-gateway:openai/gpt-6.1-sol", false],
+      // Non-passthrough gateways fail closed.
       ["openrouter:openai/gpt-6.1-sol", false],
       ["github-copilot:gpt-6.1-sol", false],
       // Non-pro-capable models.
@@ -3768,7 +3758,7 @@ describe("buildRequestHeaders", () => {
         expect(
           openaiProModeAvailable("openrouter:openai/gpt-6.1-sol", {
             providersConfig,
-            resolvedRouteProvider: "mux-gateway",
+            resolvedRouteProvider: "github-copilot",
           })
         ).toBe(false);
       });
@@ -3808,8 +3798,6 @@ describe("buildRequestHeaders", () => {
       const route = (r: string) =>
         openaiProModeAvailable("openai:gpt-6.1-sol", { resolvedRouteProvider: r });
       expect(route("direct")).toBe(true);
-      // mux-gateway drops the field server-side today — fail closed.
-      expect(route("mux-gateway")).toBe(false);
       expect(route("openrouter")).toBe(false);
       expect(route("github-copilot")).toBe(false);
       // Unknown route names fail closed.
@@ -3844,13 +3832,6 @@ describe("buildRequestHeaders", () => {
     {
       name: "should include X-Mux-Workspace-Id for non-Anthropic provider when workspaceId provided",
       model: "openai:gpt-5.2",
-      options: undefined,
-      workspaceId: "a1b2c3d4e5",
-      expected: { [MUX_WORKSPACE_ID_HEADER]: "a1b2c3d4e5" },
-    },
-    {
-      name: "should include X-Mux-Workspace-Id for mux-gateway routes",
-      model: "mux-gateway:openai/gpt-5.2",
       options: undefined,
       workspaceId: "a1b2c3d4e5",
       expected: { [MUX_WORKSPACE_ID_HEADER]: "a1b2c3d4e5" },
@@ -4078,15 +4059,16 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
       "bedrock"
     );
 
-  // Haiku 5.5 thinks adaptively when `thinking` is omitted, so "off" (the `haiku`
-  // alias default and the workspace-naming fallback level) must be explicit. The real
-  // Bedrock provider drops `reasoningConfig: { type: "disabled" }` for Claude, so this
-  // checks the bytes it actually sends.
-  test.each([
-    ["the canonical alias routed to Bedrock", "anthropic:claude-haiku-5-5"],
-    ["an explicit Bedrock model", "bedrock:anthropic.claude-haiku-5-5"],
-  ])("Haiku 5.5 off disables thinking for %s", async (_label, model) => {
-    const options = bedrockOptions(model, "off");
+  /**
+   * Sends one request through the real Bedrock Converse provider and returns the
+   * JSON body it put on the wire, so these tests check the bytes Bedrock gets,
+   * not Xum's option object (the SDK rewrites reasoningConfig into raw fields).
+   */
+  async function sentBedrockBody(
+    bedrockModelId: string,
+    options: ReturnType<typeof buildProviderOptions>,
+    callSettings: { maxOutputTokens?: number; temperature?: number } = {}
+  ): Promise<{ path: string; body: Record<string, unknown> }> {
     const captured: Array<{ path: string; body: Record<string, unknown> }> = [];
     const captureFetch = Object.assign(
       (
@@ -4123,25 +4105,150 @@ describe("buildProviderOptions - Claude on Bedrock", () => {
     });
 
     await generateText({
-      model: bedrock("anthropic.claude-haiku-5-5"),
+      model: bedrock(bedrockModelId),
       prompt: "Return ok.",
       providerOptions: options as Parameters<typeof generateText>[0]["providerOptions"],
       maxRetries: 0,
+      ...callSettings,
     });
 
     expect(captured).toHaveLength(1);
-    expect(captured[0].path).toBe("/model/anthropic.claude-haiku-5-5/converse");
-    expect(captured[0].body.additionalModelRequestFields).toEqual({
+    return captured[0];
+  }
+
+  // Haiku 5.5 thinks adaptively when `thinking` is omitted, so "off" (the `haiku`
+  // alias default and the workspace-naming fallback level) must be explicit. The real
+  // Bedrock provider drops `reasoningConfig: { type: "disabled" }` for Claude, so this
+  // checks the bytes it actually sends.
+  test.each([
+    ["the canonical alias routed to Bedrock", "anthropic:claude-haiku-5-5"],
+    ["an explicit Bedrock model", "bedrock:anthropic.claude-haiku-5-5"],
+  ])("Haiku 5.5 off disables thinking for %s", async (_label, model) => {
+    const sent = await sentBedrockBody("anthropic.claude-haiku-5-5", bedrockOptions(model, "off"));
+    expect(sent.path).toBe("/model/anthropic.claude-haiku-5-5/converse");
+    expect(sent.body.additionalModelRequestFields).toEqual({
       thinking: { type: "disabled" },
       output_config: { effort: "low" },
     });
   });
 
-  test("leaves other levels and older Claude models on the Bedrock defaults", () => {
-    // The Bedrock route sends no thinking options for these yet (#5839). Haiku 4.5
-    // does not think unless asked, so omitting `thinking` already means "off".
-    expect(bedrockOptions("anthropic:claude-haiku-5-5", "low")).toEqual({});
-    expect(bedrockOptions("anthropic:claude-haiku-4-5", "off")).toEqual({});
-    expect(bedrockOptions("anthropic:claude-sonnet-5-5", "off")).toEqual({});
+  // #5839: the selected level must reach Bedrock adaptive models with the same
+  // per-model shape as the direct Anthropic route: adaptive thinking plus effort
+  // (native-xhigh models also ask for summarized thinking).
+  test.each([
+    [
+      "anthropic:claude-sonnet-5-5",
+      "low",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
+    ],
+    [
+      "bedrock:anthropic.claude-sonnet-5-5",
+      "medium",
+      {
+        thinking: { type: "adaptive", display: "summarized" },
+        output_config: { effort: "medium" },
+      },
+    ],
+    [
+      "bedrock:anthropic.claude-sonnet-5-5",
+      "high",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "high" } },
+    ],
+    [
+      "bedrock:anthropic.claude-opus-5-5",
+      "xhigh",
+      {
+        thinking: { type: "adaptive", display: "summarized" },
+        output_config: { effort: "xhigh" },
+      },
+    ],
+    // Opus 4.6 has no native xhigh (it maps to "max") and must not get `display`.
+    [
+      "bedrock:anthropic.claude-opus-4-6",
+      "xhigh",
+      { thinking: { type: "adaptive" }, output_config: { effort: "max" } },
+    ],
+    [
+      "bedrock:anthropic.claude-sonnet-5",
+      "off",
+      { thinking: { type: "disabled" }, output_config: { effort: "low" } },
+    ],
+    // Sonnet 5.5 rejects disabled thinking and its `between_tools` needs the
+    // Anthropic payload, so "off" runs as low adaptive on Bedrock.
+    [
+      "bedrock:anthropic.claude-sonnet-5-5",
+      "off",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
+    ],
+  ] as const)("%s at %s sends the matching reasoning fields", async (model, level, expected) => {
+    const bedrockModelId = `anthropic.${model.slice(model.indexOf("claude-"))}`;
+    const sent = await sentBedrockBody(bedrockModelId, bedrockOptions(model, level));
+    expect(sent.body.additionalModelRequestFields).toEqual(expected);
+  });
+
+  // Cross-region inference profiles keep the `bedrock:` origin, and Bedrock ids
+  // carry a -vN[:M] suffix that the capability matchers do not expect. A missed
+  // match must not send `disabled` to a model that rejects it (a 400).
+  test.each([
+    [
+      "bedrock:us.anthropic.claude-sonnet-5-5",
+      "high",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "high" } },
+    ],
+    [
+      "bedrock:global.anthropic.claude-opus-4-6-v1",
+      "xhigh",
+      { thinking: { type: "adaptive" }, output_config: { effort: "max" } },
+    ],
+    // Like the unversioned id: Sonnet 5.5 "off" runs as low adaptive on Bedrock.
+    [
+      "bedrock:us.anthropic.claude-sonnet-5-5-v1:0",
+      "off",
+      { thinking: { type: "adaptive", display: "summarized" }, output_config: { effort: "low" } },
+    ],
+    [
+      "bedrock:eu.anthropic.claude-haiku-5-5-v1:0",
+      "off",
+      { thinking: { type: "disabled" }, output_config: { effort: "low" } },
+    ],
+  ] as const)(
+    "Bedrock profile id %s at %s sends the matching fields",
+    async (model, level, expected) => {
+      const sent = await sentBedrockBody(
+        model.slice("bedrock:".length),
+        bedrockOptions(model, level)
+      );
+      expect(sent.body.additionalModelRequestFields).toEqual(expected);
+    }
+  );
+
+  test("non-Claude Bedrock models get no Claude thinking fields", () => {
+    expect(bedrockOptions("bedrock:amazon.nova-pro-v1:0", "high")).toEqual({});
+  });
+
+  // Budget-thinking models keep main's Bedrock request exactly, at every level
+  // (#7180): no thinking or effort field, and the caller's output ceiling and
+  // sampling settings untouched.
+  test.each([
+    "bedrock:anthropic.claude-opus-4-5",
+    "anthropic:claude-sonnet-4-5",
+    "bedrock:us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+    "bedrock:anthropic.claude-haiku-4-5",
+    "bedrock:anthropic.claude-opus-4-1",
+    "bedrock:anthropic.claude-3-5-sonnet-20240620-v1:0",
+  ])("budget-thinking model %s keeps the Bedrock default at every level", async (model) => {
+    const bedrockModelId = model.startsWith("bedrock:")
+      ? model.slice("bedrock:".length)
+      : `anthropic.${model.slice(model.indexOf("claude-"))}`;
+    for (const level of ["off", "low", "medium", "high", "xhigh", "max"] as const) {
+      const options = bedrockOptions(model, level);
+      expect(options).toEqual({});
+      const sent = await sentBedrockBody(bedrockModelId, options, {
+        maxOutputTokens: 64000,
+        temperature: 0.5,
+      });
+      expect(sent.body.additionalModelRequestFields).toBeUndefined();
+      expect(sent.body.inferenceConfig).toEqual({ maxTokens: 64000, temperature: 0.5 });
+    }
   });
 });

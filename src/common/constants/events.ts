@@ -79,12 +79,6 @@ export const CUSTOM_EVENTS = {
   SKILLS_REFRESH_REQUESTED: "mux:skillsRefreshRequested",
 
   /**
-   * Event emitted when the mux gateway session expires.
-   * No detail
-   */
-  MUX_GATEWAY_SESSION_EXPIRED: "mux:muxGatewaySessionExpired",
-
-  /**
    * Event to switch to a different workspace after fork
    * Detail: { workspaceId: string, projectPath: string, projectName: string, workspacePath: string, branch: string }
    */
@@ -148,6 +142,13 @@ export const CUSTOM_EVENTS = {
    * keyboard shortcut. Detail: { workspaceId: string }
    */
   OPEN_NEW_SIDEBAR_TAB: "mux:openNewSidebarTab",
+
+  /**
+   * Move keyboard focus to a right-sidebar tab that the command palette just showed (its
+   * "Split Horizontally/Vertically" and "Add Tool…" change the stored layout, then send this).
+   * Detail: { workspaceId: string, tabsetId: string, tab: string }
+   */
+  FOCUS_SIDEBAR_TAB: "mux:focusSidebarTab",
 
   /**
    * Start a new chat the way the left sidebar's "New chat" button does. Sent by the app shell's
@@ -241,7 +242,6 @@ export interface CustomEventPayloads {
   [CUSTOM_EVENTS.AGENTS_REFRESH_REQUESTED]: never; // No payload
   [CUSTOM_EVENTS.SKILLS_REFRESH_REQUESTED]: never; // No payload
   [CUSTOM_EVENTS.OPEN_MODEL_SELECTOR]: never; // No payload
-  [CUSTOM_EVENTS.MUX_GATEWAY_SESSION_EXPIRED]: never; // No payload
   [CUSTOM_EVENTS.WORKSPACE_FORK_SWITCH]: {
     workspaceId: string;
     projectPath: string;
@@ -285,6 +285,13 @@ export interface CustomEventPayloads {
   };
   [CUSTOM_EVENTS.OPEN_NEW_SIDEBAR_TAB]: {
     workspaceId: string;
+  };
+  [CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB]: {
+    workspaceId: string;
+    /** The pane that shows the tab. */
+    tabsetId: string;
+    /** A TabType (a browser type); the sidebar ignores anything else. */
+    tab: string;
   };
   [CUSTOM_EVENTS.OPEN_SIDE_CHAT_TAB]: {
     /** The main chat whose right sidebar shows the tab. */

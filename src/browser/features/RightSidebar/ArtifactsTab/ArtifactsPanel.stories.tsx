@@ -48,7 +48,11 @@ const meta: Meta<typeof ArtifactsPanel> = {
   decorators: [
     (Story, context) => (
       <WindowApiStub browserMode={context.parameters.browserMode === true}>
-        <Story />
+        {/* The workspace shell a wide-window fullscreen panel pins over (pinOverWorkspace). It
+            fills the canvas here: no left sidebar in these stories. */}
+        <div data-workspace-shell="">
+          <Story />
+        </div>
       </WindowApiStub>
     ),
   ],
@@ -203,14 +207,18 @@ function listingFor(files: Record<string, ArtifactReadResult>): ArtifactListing 
 function renderPanel(
   selectedPath: string,
   files: Record<string, ArtifactReadResult> = FILES,
-  options: { allowCdn?: boolean; workspaceId?: string } = {}
+  options: { allowCdn?: boolean; workspaceId?: string; sendInteractionError?: string } = {}
 ) {
   const workspaceId = options.workspaceId ?? WORKSPACE_ID;
   writeArtifactSelection(workspaceId, { scope: "artifact", path: selectedPath, version: null });
   return (
     <APIProvider
       client={createMockORPCClient({
-        artifacts: { listing: listingFor(files), files },
+        artifacts: {
+          listing: listingFor(files),
+          files,
+          sendInteractionError: options.sendInteractionError,
+        },
         userPreferences: { ui: { artifactsAllowCdnScripts: options.allowCdn ?? true } },
       })}
     >
@@ -517,23 +525,26 @@ const INTERACTIVE_CANVAS = JSON.stringify({
 });
 
 /**
- * Host-owned controls around an artifact (M5b): the confirm strip after the canvas button asked
- * to send (nothing is sent without the user's click), and annotate mode with a text selection's
- * comment box open.
+ * Host-owned controls around an artifact (M5b): the confirm strip with its error after a clicked
+ * canvas send failed (a clicked send that works shows no strip), and annotate mode with a text
+ * selection's comment box open.
  */
 export const SendStripAndAnnotate: Story = {
   parameters: {
     pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone", "laptop"] } },
   },
   render: () =>
-    renderPanel("rollout.canvas.json", {
-      "rollout.canvas.json": ok("rollout.canvas.json", INTERACTIVE_CANVAS),
-    }),
+    renderPanel(
+      "rollout.canvas.json",
+      { "rollout.canvas.json": ok("rollout.canvas.json", INTERACTIVE_CANVAS) },
+      { sendInteractionError: "Workspace not found: story" }
+    ),
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await userEvent.click(await canvas.findByRole("button", { name: "Approve plan B" }));
     const strip = await canvas.findByTestId("artifact-send-strip");
     await within(strip).findByText("Approve plan B.");
+    await within(strip).findByText("Workspace not found: story");
     // Send arms shortly after the strip appears; wait so the snapshot is stable.
     const send = within(strip).getByRole("button", { name: "Send" });
     await waitFor(() => expect(send).toBeEnabled(), { timeout: 5000 });
@@ -928,7 +939,10 @@ export const BridgeEscapeExitsFullscreen: Story = {
     await waitFor(() => expect(bridgeMessages).toContain("ready"));
     await userEvent.click(canvas.getByRole("button", { name: "Fullscreen" }));
     await waitFor(() =>
-      expect(canvasElement.ownerDocument.querySelector('[role="dialog"]')).not.toBeNull()
+      // A modal dialog in a narrow window, a region in a wide one: only fullscreen labels it.
+      expect(
+        canvasElement.ownerDocument.querySelector('[data-testid="artifacts-panel"][aria-label]')
+      ).not.toBeNull()
     );
     // Fullscreen keeps the same frame: entering it must not reload the artifact.
     await expect(canvas.getByTestId("artifact-frame")).toBe(frame);
@@ -938,7 +952,9 @@ export const BridgeEscapeExitsFullscreen: Story = {
     await waitFor(() => expect(bridgeMessages).toContain("sent-escape"), { timeout: 10000 });
     // The host must leave fullscreen.
     await waitFor(() =>
-      expect(canvasElement.ownerDocument.querySelector('[role="dialog"]')).toBeNull()
+      expect(
+        canvasElement.ownerDocument.querySelector('[data-testid="artifacts-panel"][aria-label]')
+      ).toBeNull()
     );
   },
 };
@@ -963,7 +979,8 @@ export const FullscreenKeepsFocusWhenViewerSwaps: Story = {
     const canvas = within(canvasElement);
     await canvas.findByRole("button", { name: /^runs:/ });
     await userEvent.click(canvas.getByRole("button", { name: "Fullscreen" }));
-    const dialog = await canvas.findByRole("dialog", { name: "Artifact tree.json" });
+    // A modal dialog in a narrow window, a region in a wide one: both carry the label.
+    const dialog = await canvas.findByLabelText("Artifact tree.json");
     const toggle = within(dialog).getByRole("button", { name: /^runs:/ });
     toggle.focus();
     await expect(toggle).toHaveFocus();
@@ -972,7 +989,7 @@ export const FullscreenKeepsFocusWhenViewerSwaps: Story = {
     await waitFor(() => expect(toggle.isConnected).toBe(false));
     await waitFor(() => expect(dialog).toHaveFocus());
     await userEvent.keyboard("{Escape}");
-    await waitFor(() => expect(canvas.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(canvas.queryByLabelText("Artifact tree.json")).toBeNull());
   },
 };
 

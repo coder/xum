@@ -26,12 +26,17 @@ import { BackgroundProcessManager } from "@/node/services/backgroundProcessManag
 import type { CoreOptions, CoreServices, CoreServicesOptions } from "@/node/services/coreServices";
 import { AppFiberScopeLive, AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { EffectRunnerLive, EffectRunnerTag } from "@/node/services/di/effectRunner";
+import { HostClockLive, HostClockTag } from "@/node/services/di/hostClockLive";
 import {
   AI,
   AutoModelRouterTag,
   BackgroundProcessManagerTag,
   ConfigTag,
   ContextManagement,
+  DesktopNotificationsTag,
+  RuntimeFactoryTag,
+  HostFilesTag,
+  HostPathsTag,
   Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
@@ -46,7 +51,9 @@ import {
   Provider,
   ProvidersConfigStoreTag,
   SecretsStoreTag,
+  SessionFilesTag,
   SessionLocatorTag,
+  SessionLocksTag,
   SessionUsage,
   StreamManagerTag,
   Task,
@@ -54,9 +61,14 @@ import {
   TerminalAttentionStoreTag,
   TurnRequestBuilderBindingsTag,
   Workspace,
+  WorkspaceExternalEditorsTag,
   WorkspaceGoal,
+  WorkspaceLifecycleGatesTag,
   WorkspaceMcpOverrides,
+  WorkspaceNamingTag,
   WorkspaceTurnManagerTag,
+  WorkspaceWorkflowRunsTag,
+  WorkspaceOperationAdmissionTag,
   type CoreRootTags,
   type CoreTags,
   type StoreTags,
@@ -81,6 +93,12 @@ import { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { TaskService } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
+import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
+import { WorkspaceNaming } from "@/node/services/workspaceNaming";
+import { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
+import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -131,6 +149,7 @@ export type CoreInputTags =
   | StoreTags
   | CoreOptionsTag
   | EffectRunnerTag
+  | HostClockTag
   | AppFiberScopeTag
   | MemoryMeta
   | WorkspaceMcpOverrides;
@@ -171,7 +190,13 @@ export const WorkspaceMcpOverridesDefaultLive: Layer.Layer<
 
 export const HistoryLive = Layer.effect(
   History,
-  Effect.map(SessionLocatorTag, (sessionLocator) => new HistoryService(sessionLocator))
+  Effect.gen(function* () {
+    return new HistoryService(
+      yield* SessionLocatorTag,
+      yield* SessionFilesTag,
+      yield* SessionLocksTag
+    );
+  })
 );
 
 export const InitStateManagerLive = Layer.effect(
@@ -200,11 +225,13 @@ export const AutoModelRouterLive = Layer.effect(
   })
 );
 
-export const BackgroundProcessManagerLive = Layer.sync(
+export const BackgroundProcessManagerLive = Layer.effect(
   BackgroundProcessManagerTag,
-  // Same root as local spawns, their name lock, and every gate (localBgRecordsRoot), not
-  // os.tmpdir(): on macOS that is /var/folders/..., where other backends never looked.
-  () => new BackgroundProcessManager(localBgRecordsRoot())
+  Effect.gen(function* () {
+    // Same root as local spawns, their name lock, and every gate (localBgRecordsRoot), not
+    // os.tmpdir(): on macOS that is /var/folders/..., where other backends never looked.
+    return new BackgroundProcessManager(localBgRecordsRoot(), yield* HostClockTag);
+  })
 );
 
 // Headless evaluation (workflow `evaluate()`): no dependencies — the caller
@@ -242,6 +269,46 @@ export const TerminalAttentionStoreLive = Layer.effect(
 // also exposed so ServiceContainer can share it with HeartbeatService. Its
 // consumer is registered by `CoreWiringLive` once Task/Workspace exist.
 export const IdleDispatcherLive = Layer.sync(IdleDispatcherTag, () => new IdleDispatcher());
+
+/** One shared instance per graph: WorkspaceService and the services split out of it read it. */
+export const WorkspaceLifecycleGatesLive = Layer.sync(
+  WorkspaceLifecycleGatesTag,
+  () => new WorkspaceLifecycleGates()
+);
+
+/** Built on the shared lifecycle gates, so an open sees WorkspaceService's archive state. */
+export const WorkspaceExternalEditorsLive = Layer.effect(
+  WorkspaceExternalEditorsTag,
+  Effect.gen(function* () {
+    const config = yield* ConfigTag;
+    return new WorkspaceExternalEditors({
+      config,
+      files: yield* HostFilesTag,
+      leases: workspaceUseLeasesFor(config),
+      gates: yield* WorkspaceLifecycleGatesTag,
+    });
+  })
+);
+
+/** WorkspaceService's naming claims; no dependencies, one instance per graph. */
+export const WorkspaceNamingLive = Layer.sync(WorkspaceNamingTag, () => new WorkspaceNaming());
+
+/** WorkspaceService's workflow-run activity cache; reads only the config. */
+export const WorkspaceWorkflowRunsLive = Layer.effect(
+  WorkspaceWorkflowRunsTag,
+  Effect.map(ConfigTag, (config) => new WorkspaceWorkflowRuns({ config }))
+);
+
+/** Archive admission of non-send operations; built on the shared lifecycle gates. */
+export const WorkspaceOperationAdmissionLive = Layer.effect(
+  WorkspaceOperationAdmissionTag,
+  Effect.gen(function* () {
+    return new WorkspaceOperationAdmission({
+      config: yield* ConfigTag,
+      gates: yield* WorkspaceLifecycleGatesTag,
+    });
+  })
+);
 
 /** One mutable record per graph build (`sync`, not `succeed`); filled by `CoreWiringLive`. */
 export const TurnRequestBuilderBindingsLive = Layer.sync(
@@ -297,9 +364,10 @@ export const StreamManagerLive = Layer.effect(
       yield* EffectRunnerTag,
       // The stream engine is the AppFiberScope's occupant: dispose() closes the
       // scope before the explicit teardown steps, which aborts and awaits every
-      // in-flight stream (StreamManager.superviseEngine).
+      // in-flight stream (TurnRegistry.superviseEngine).
       yield* AppFiberScopeTag,
-      yield* ToolCallDisplayRegistryTag
+      yield* ToolCallDisplayRegistryTag,
+      { hostClock: yield* HostClockTag }
     );
   })
 );
@@ -328,7 +396,13 @@ export const AILive = Layer.effect(
       yield* StreamManagerTag,
       yield* TurnRequestBuilderBindingsTag,
       yield* ProvidersConfigStoreTag,
-      yield* SecretsStoreTag
+      yield* SecretsStoreTag,
+      {
+        desktopNotifications: yield* DesktopNotificationsTag,
+        runtimeFactory: yield* RuntimeFactoryTag,
+        hostFiles: yield* HostFilesTag,
+        hostPaths: yield* HostPathsTag,
+      }
     );
   })
 );
@@ -483,7 +557,13 @@ export const WorkspaceLive = Layer.effect(
       yield* DesktopInputCoordinatorTag,
       yield* EffectRunnerTag,
       yield* AppFiberScopeTag,
-      yield* AutoModelRouterTag
+      yield* AutoModelRouterTag,
+      yield* HostClockTag,
+      yield* WorkspaceLifecycleGatesTag,
+      yield* WorkspaceExternalEditorsTag,
+      yield* WorkspaceNamingTag,
+      yield* WorkspaceWorkflowRunsTag,
+      yield* WorkspaceOperationAdmissionTag
     );
   })
 );
@@ -730,9 +810,18 @@ const S1 = Layer.mergeAll(
   TerminalAttentionStoreLive,
   DesktopInputCoordinatorLive,
   IdleDispatcherLive,
+  WorkspaceLifecycleGatesLive,
+  WorkspaceNamingLive,
+  WorkspaceWorkflowRunsLive,
   TurnRequestBuilderBindingsLive
 );
-const S2a = Layer.mergeAll(SessionUsageLive, WorkspaceGoalLive).pipe(Layer.provideMerge(S1));
+// WorkspaceExternalEditorsLive and WorkspaceOperationAdmissionLive read S1's WorkspaceLifecycleGatesTag.
+const S2a = Layer.mergeAll(
+  SessionUsageLive,
+  WorkspaceGoalLive,
+  WorkspaceExternalEditorsLive,
+  WorkspaceOperationAdmissionLive
+).pipe(Layer.provideMerge(S1));
 const S2b = StreamManagerLive.pipe(Layer.provideMerge(S2a));
 const S3 = AILive.pipe(Layer.provideMerge(S2b));
 const S4 = Layer.mergeAll(MemoryConsolidationLive, MCPConfigLive, ContextManagementLive).pipe(
@@ -799,8 +888,10 @@ export function CoreRootLive(opts: CoreServicesOptions): Layer.Layer<CoreRootTag
     fileLeaseManager,
     ...coreOptions
   } = opts;
+  const runner = EffectRunnerLive.pipe(Layer.provideMerge(StoresFromCoreOptionsLive(opts)));
+  // HostClockLive reads the Clock that the runner captured: one clock for both.
   const runtimeSeams = AppFiberScopeLive.pipe(
-    Layer.provideMerge(EffectRunnerLive.pipe(Layer.provideMerge(StoresFromCoreOptionsLive(opts))))
+    Layer.provideMerge(HostClockLive.pipe(Layer.provideMerge(runner)))
   );
   return CoreLive.pipe(
     // True siblings: both derive from the config alone.

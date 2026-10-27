@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { nodeClock } from "@/node/utils/hostClock";
 import { tool } from "ai";
 
 import type { SkillsCatalogReadToolResult } from "@/common/types/tools";
@@ -100,7 +101,8 @@ async function loadSkillForPage(
   const { owner, repo, skillId } = args;
   const laterPage = (args.offset_chars ?? 0) > 0;
   const requested = args.snapshot ?? undefined;
-  const now = Date.now();
+  // Wall clock: the pins live in a process-wide cache shared by every session (#7282).
+  const now = nodeClock.nowMs();
   const pinned = findPinnedSkillForPage(args, now);
   if (pinned != null) return pinned;
   const loaded = await fetchAndParseSkill(owner, repo, skillId, now);

@@ -1,12 +1,14 @@
 import { createHash } from "crypto";
-import * as fsPromises from "fs/promises";
-import * as os from "os";
 import * as path from "path";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { withLegacyMuxEnvironmentAliases } from "@/common/compat/legacyMux";
 import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 import { log } from "@/node/services/log";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { getRuntimeType } from "./initHook";
 import type { Runtime } from "./Runtime";
@@ -52,8 +54,6 @@ export async function resolveScratchDirSpec(params: {
   runtime: Pick<Runtime, "getXumHome">;
   /** Multi-project workspaces on remote runtimes span several hosts/containers: none. */
   multiProject?: boolean;
-  /** Override for tests; production reads the Docker client config. */
-  canBindMountHostPaths?: () => Promise<boolean>;
 }): Promise<ScratchDirSpec> {
   const runtimeType = getRuntimeType(params.runtimeConfig);
   if (runtimeType === "local" || runtimeType === "worktree") {
@@ -69,9 +69,7 @@ export async function resolveScratchDirSpec(params: {
     case "docker":
       return { kind: "runtime", path: DOCKER_SCRATCH_DIR };
     case "devcontainer": {
-      const canMount =
-        params.canBindMountHostPaths ?? (() => canBindMountHostPathsIntoContainers());
-      return (await canMount())
+      return (await canBindMountHostPathsIntoContainers())
         ? {
             kind: "devcontainer-mount",
             dir: getWorkspaceScratchDir(params.sessionsDir, params.workspaceId),
@@ -103,7 +101,9 @@ function isLocalDockerEndpoint(host: string): boolean {
 export async function canBindMountHostPathsIntoContainers(
   env: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
-  homeDir: string = os.homedir()
+  homeDir: string = nodeHostPaths.userHome(),
+  // The Docker client config is a host file outside the session dir, so HostFiles (phase 5).
+  files: HostFiles = nodeHostFiles
 ): Promise<boolean> {
   if (platform === "win32") return false;
   const dockerHost = env.DOCKER_HOST?.trim();
@@ -115,7 +115,7 @@ export async function canBindMountHostPathsIntoContainers(
     if (!contextName) {
       let configText: string;
       try {
-        configText = await fsPromises.readFile(path.join(configDir, "config.json"), "utf8");
+        configText = await files.promises.readFile(path.join(configDir, "config.json"), "utf8");
       } catch (error) {
         // No client config: the CLI uses its default local socket.
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
@@ -132,7 +132,7 @@ export async function canBindMountHostPathsIntoContainers(
       createHash("sha256").update(contextName).digest("hex"),
       "meta.json"
     );
-    const meta = JSON.parse(await fsPromises.readFile(metaPath, "utf8")) as {
+    const meta = JSON.parse(await files.promises.readFile(metaPath, "utf8")) as {
       Endpoints?: { docker?: { Host?: unknown } };
     };
     const host = meta.Endpoints?.docker?.Host;
@@ -149,23 +149,27 @@ export async function canBindMountHostPathsIntoContainers(
  * Create the workspace's scratch dir where its commands run and return the absolute path to
  * export as XUM_SCRATCH_DIR, or undefined when this runtime has none (the variable stays unset).
  *
- * Host dirs are returned even when mkdir fails (see ensureWorkspaceScratchDir). Remote dirs are
- * returned only once the runtime confirmed them: an exported path the agent cannot write to is
- * worse than none.
+ * Host dirs are returned even when mkdir fails (logged), because the environment prompt always
+ * tells local/worktree agents to use $XUM_SCRATCH_DIR: an unset variable would turn
+ * `mkdir -p "$XUM_SCRATCH_DIR/logs"` into `/logs`, and a set-but-missing dir just makes the
+ * agent's own `mkdir -p` create it. Remote dirs are returned only once the runtime confirmed
+ * them: an exported path the agent cannot write to is worse than none.
  */
 export async function ensureScratchDirForSpec(
   runtime: Runtime,
   spec: ScratchDirSpec,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  /** The host dirs are in the session dir, so the workspace's session files (phase 5). */
+  files: SessionFiles = nodeSessionFiles
 ): Promise<string | undefined> {
   switch (spec.kind) {
     case "none":
       return undefined;
     case "host":
-      await mkdirHostBestEffort(spec.dir);
+      await mkdirHostBestEffort(spec.dir, files);
       return spec.dir;
     case "devcontainer-mount": {
-      await mkdirHostBestEffort(spec.dir);
+      await mkdirHostBestEffort(spec.dir, files);
       // The mount exists only in containers created after this feature (and only when Xum knew
       // the workspace id at `devcontainer up`); an existing container keeps its mounts. Export
       // only when the container really sees the host dir.
@@ -242,6 +246,8 @@ export class RemoteScratchDirCache {
     runtime: Runtime;
     spec: ScratchDirSpec;
     abortSignal?: AbortSignal;
+    /** For the devcontainer mount dir in the session dir. Absent: the Node layer. */
+    files?: SessionFiles;
   }): Promise<string | undefined> {
     assert(params.spec.kind !== "host", "host scratch dirs are not cached");
     const key = JSON.stringify([params.runtimeConfig ?? null, params.spec]);
@@ -250,16 +256,21 @@ export class RemoteScratchDirCache {
     if (cached?.key === key && nowMs - cached.confirmedAtMs < REMOTE_SCRATCH_DIR_TTL_MS) {
       return cached.dir;
     }
-    const dir = await ensureScratchDirForSpec(params.runtime, params.spec, params.abortSignal);
+    const dir = await ensureScratchDirForSpec(
+      params.runtime,
+      params.spec,
+      params.abortSignal,
+      params.files
+    );
     if (dir === undefined) this.entries.delete(params.workspaceId);
     else this.entries.set(params.workspaceId, { key, dir, confirmedAtMs: nowMs });
     return dir;
   }
 }
 
-async function mkdirHostBestEffort(dir: string): Promise<void> {
+async function mkdirHostBestEffort(dir: string, files: SessionFiles): Promise<void> {
   try {
-    await fsPromises.mkdir(dir, { recursive: true });
+    await files.promises.mkdir(dir, { recursive: true });
   } catch (error) {
     log.warn(`Could not create workspace scratch dir ${dir}: ${getErrorMessage(error)}`);
   }

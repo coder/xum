@@ -23,8 +23,7 @@
  * real key and base URL, makes the app model the default, and starts the server with
  * XUM_DISABLE_AGENT_TOOLS=1: no agent turn sends a tool to the model, whatever agent, project
  * file or plugin defines it, so chat replies cannot read files or run commands. Callers with
- * their own tools (refinement, memory harvest and intuition, continuous compaction) do not check
- * the flag, and none of them runs shell commands here (src/node/utils/agentToolsDisabled.ts). Agent
+ * their own tools (refinement, memory harvest, continuous compaction) do not check the flag, and none of them runs shell commands here (src/node/utils/agentToolsDisabled.ts). Agent
  * overrides also tell the built-in agents they have no tools, so replies say so. Real mode also
  * sets XUM_DISABLE_TERMINALS and XUM_DISABLE_PROJECT_AUTOMATION: AI replies are untrusted input
  * for the explorer, so the terminal and project init hooks are closed.
@@ -60,6 +59,7 @@ import { startScriptedModel } from "./scriptedModel";
 import { scriptedModelLogPath } from "./appControl";
 import { seedMcpChat, writeMcpConfig } from "./mcpapps/seed";
 import { seedPluginHooks, writePluginSources } from "./pluginHookFixtures";
+import { writeInstallSources } from "./pluginInstallFixtures";
 
 const REPO_ROOT = path.resolve(import.meta.dir, "../..");
 const SERVER_ENTRY = path.join(REPO_ROOT, "dist/cli/index.js");
@@ -440,9 +440,45 @@ async function seed(
   fs.writeFileSync(guide, GUIDE_ARTIFACT_HTML);
   const anHourAgo = new Date(Date.now() - 60 * 60 * 1000);
   fs.utimesSync(guide, anHourAgo, anHourAgo);
+  // Artifacts that send a message to the agent: an HTML page that sends on a click (at once) and
+  // from a timer after a click (the confirm strip asks), and a canvas whose button sends at once.
+  // Dated back like the guide, so the default artifact stays the same.
+  for (const [name, body] of [
+    ["feedback.html", FEEDBACK_ARTIFACT_HTML],
+    ["decision.canvas.json", DECISION_ARTIFACT_CANVAS],
+  ] as const) {
+    const file = path.join(artifactsDir, name);
+    fs.writeFileSync(file, body);
+    fs.utimesSync(file, anHourAgo, anHourAgo);
+  }
   await seedVersionedArtifact(base, xumRoot, workspaceId, artifactsDir);
   return workspaceId;
 }
+
+/** A form that sends its answer with window.xum.send: on a click, and from a timer 7 s after one. */
+const FEEDBACK_ARTIFACT_HTML = `<!doctype html>
+<html>
+  <body>
+    <h1>Feedback</h1>
+    <label>Answer <input id="answer" value="Ship plan B" /></label>
+    <button id="send" onclick="window.xum.send(document.getElementById('answer').value)">
+      Send to agent
+    </button>
+    <button id="later" onclick="setTimeout(() => window.xum.send('Sent by a timer'), 7000)">
+      Send in 7 seconds
+    </button>
+  </body>
+</html>
+`;
+
+/** A canvas with one button that sends a message. */
+const DECISION_ARTIFACT_CANVAS = JSON.stringify({
+  $xum: "canvas",
+  blocks: [
+    { type: "markdown", text: "Plan **B** keeps the old path for a week." },
+    { type: "button", label: "Approve plan B", send: "Approve plan B.", data: { plan: "B" } },
+  ],
+});
 
 /** Contents, two tall sections with a link back to the top, and a status line its own script updates on scroll. */
 const GUIDE_ARTIFACT_HTML = `<!doctype html>
@@ -750,7 +786,13 @@ async function main(): Promise<void> {
     fs.mkdirSync(home, { recursive: true });
     if (ai.mode === "real") writeNoToolAgents(xumRoot);
     createDemoRepo(projectPath, env);
-    const pluginSources = writePluginSources(path.join(tempRoot, "plugin-sources"), env);
+    const sourcesRoot = path.join(tempRoot, "plugin-sources");
+    // Hook fixtures, then the install-method fixtures (Claude plugin, marketplace, skills repo):
+    // plugin-sources.md lists both.
+    const pluginSources = new Map([
+      ...writePluginSources(sourcesRoot, env),
+      ...writeInstallSources(sourcesRoot, env),
+    ]);
     if (mcpApps) writeMcpConfig(xumRoot);
 
     const seedPort = await getFreePort();

@@ -67,7 +67,7 @@ import {
 import {
   ArtifactCapabilitiesSchema,
   ArtifactListingSchema,
-  ArtifactReadResultSchema,
+  ArtifactReadOutcomeSchema,
   ArtifactShelfListingSchema,
   ArtifactShelfScopeSchema,
   ArtifactVersionListSchema,
@@ -185,6 +185,7 @@ import {
   AgentIdSchema,
 } from "./agentDefinition";
 import { PluginSlashCommandDescriptorSchema, WorkspaceCompositionSchema } from "./agentPlugins";
+import { SkillsCliCommandInputSchema, SkillsCliCommandSchema } from "./skillsCli";
 import {
   MCPAddGlobalParamsSchema,
   MCPAddParamsSchema,
@@ -213,7 +214,8 @@ import {
 import {
   AgentPluginGitSourceSchema,
   AgentPluginInstallEntrySchema,
-  AgentPluginInstallPreviewSchema,
+  AgentPluginInstallMethodSchema,
+  AgentPluginSourcePreviewSchema,
   AgentPluginComponentsSchema,
   AgentPluginComponentRefSchema,
   AgentPluginHooksSchema,
@@ -450,10 +452,6 @@ export const ProviderConfigInfoSchema = z.object({
   aws: AWSCredentialStatusSchema.optional(),
   /** Google Vertex AI-specific fields (only present for google-vertex provider) */
   googleVertex: GoogleVertexCredentialStatusSchema.optional(),
-  /** Xum Gateway-specific fields */
-  couponCodeSet: z.boolean().optional(),
-  /** Xum Gateway-specific: which models are enabled for gateway routing */
-  gatewayModels: z.array(z.string()).optional(),
   /** Coder-only: deployment access URL (e.g. https://coder.example.com) */
   deploymentUrl: z.string().optional(),
   /** Coder-only: whether Coder OAuth tokens are present in providers.jsonc */
@@ -637,34 +635,6 @@ export const providers = {
   },
 };
 
-// Xum Gateway OAuth (desktop login flow)
-export const muxGatewayOauth = {
-  startDesktopFlow: {
-    input: z.void(),
-    output: ResultSchema(
-      z.object({
-        flowId: z.string(),
-        authorizeUrl: z.string(),
-        redirectUri: z.string(),
-      }),
-      z.string()
-    ),
-  },
-  waitForDesktopFlow: {
-    input: z
-      .object({
-        flowId: z.string(),
-        timeoutMs: z.number().int().positive().optional(),
-      })
-      .strict(),
-    output: ResultSchema(z.void(), z.string()),
-  },
-  cancelDesktopFlow: {
-    input: z.object({ flowId: z.string() }).strict(),
-    output: z.void(),
-  },
-};
-
 // GitHub Copilot OAuth (Device Code Flow)
 export const copilotOauth = {
   startDeviceFlow: {
@@ -780,20 +750,6 @@ export const coderOauth = {
   refreshProviders: {
     input: z.void(),
     output: ResultSchema(z.void(), z.string()),
-  },
-};
-
-// Xum Gateway
-export const muxGateway = {
-  getAccountStatus: {
-    input: z.void(),
-    output: ResultSchema(
-      z.object({
-        remaining_microdollars: z.number().int().nonnegative(),
-        ai_gateway_concurrent_requests_per_user: z.number().int().nonnegative(),
-      }),
-      z.string()
-    ),
   },
 };
 
@@ -1295,13 +1251,26 @@ export const agentPlugins = {
       input: z.string(),
       ref: z.string().nullish(),
       subpath: z.string().nullish(),
+      /** Absent: the first method that fits (see AgentPluginInstallMethodSchema). */
+      method: AgentPluginInstallMethodSchema.nullish(),
     }),
-    output: ResultSchema(AgentPluginInstallPreviewSchema, z.string()),
+    /** A plugin preview, or the entries of a Claude Code marketplace repository. */
+    output: ResultSchema(AgentPluginSourcePreviewSchema, z.string()),
+  },
+  /**
+   * The pinned skills CLI command for the "Skills CLI" method, for the user to run in a terminal
+   * (Xum does not run it). The error branch is invalid input.
+   */
+  skillsCliCommand: {
+    input: SkillsCliCommandInputSchema,
+    output: ResultSchema(SkillsCliCommandSchema, z.string()),
   },
   /** Fetch the consented SHA, promote into ~/.mux/plugins, write the registry entry. */
   install: {
     input: z.object({
       source: AgentPluginGitSourceSchema,
+      /** The preview's `method`: install refuses a clone that this method does not fit. */
+      method: AgentPluginInstallMethodSchema,
       /** SHA from the preview the user consented to. */
       expectedSha: z.string(),
       /** `consentDigest` of that preview: install refuses other components (#6777). */
@@ -1520,7 +1489,7 @@ export const artifacts = {
       /** Lower read cap (clamped to the server's): larger files return too_large, no bytes. */
       maxBytes: z.number().int().positive().nullish(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Runtime tooling probes (cached per workspace); never fails, null means unknown. */
   capabilities: {
@@ -1539,7 +1508,7 @@ export const artifacts = {
       artifactId: z.string(),
       version: z.number().int().positive(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Pinned workspace files with their current size/mtime (live, no snapshots). */
   listPinned: {
@@ -1566,7 +1535,7 @@ export const artifacts = {
   /** Read a pinned file (same shape and cap as `read`; path relative to the checkout). */
   readPinned: {
     input: z.object({ workspaceId: z.string(), path: z.string() }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Shelf entries visible from this workspace: its project shelf, then the global shelf. */
   listShelf: {
@@ -1580,7 +1549,7 @@ export const artifacts = {
       scope: ArtifactShelfScopeSchema,
       name: z.string(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** User pin: copy one stored version to the project or global shelf. */
   pinToShelf: {
@@ -1603,7 +1572,7 @@ export const artifacts = {
     output: ResultSchema(z.void(), z.string()),
   },
   /**
-   * A send the user confirmed in the Artifacts tab (window.xum.send or a canvas button). The
+   * A send the user clicked or confirmed in the Artifacts tab (window.xum.send or a canvas button). The
    * backend persists it, then delivers it as a user message at the next tool boundary (M5b).
    * `version: null` targets the live file (latest stored version).
    */
@@ -3407,8 +3376,6 @@ export const config = {
     output: z.object({
       userPreferences: UserPreferencesSchema.optional(),
       taskSettings: ResolvedTaskSettingsSchema,
-      muxGatewayEnabled: z.boolean().optional(),
-      muxGatewayModels: z.array(z.string()).optional(),
       routePriority: z.array(z.string()).optional(),
       routeOverrides: z.record(z.string(), z.string()).optional(),
       minThinkingLevelByModel: z.record(z.string(), ThinkingLevelSchema).optional(),
@@ -3456,13 +3423,6 @@ export const config = {
   updateAgentAiDefaults: {
     input: z.object({
       agentAiDefaults: AgentAiDefaultsSchema,
-    }),
-    output: z.void(),
-  },
-  updateMuxGatewayPrefs: {
-    input: z.object({
-      muxGatewayEnabled: z.boolean(),
-      muxGatewayModels: z.array(z.string()),
     }),
     output: z.void(),
   },

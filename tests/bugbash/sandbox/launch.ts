@@ -24,6 +24,8 @@
  * that this process runs for the job, on a unix socket that the container gets read-only. The
  * provider key stays here, and BUGBASH_BUDGET_USD caps the spend at list price (not a billing
  * cap: the upstream key's own limit is the backstop); run.ts shares one budget across its jobs.
+ * A story job may also name a judge model (BUGBASH_JUDGE_MODEL) for its asserts: the launcher
+ * validates and probes it, and that job's proxy allows it too.
  * The proxy writes one record per call to `<output>.proxy.jsonl` on the host only, and a job with
  * its own budget writes its spend (settled costs plus kept reservations) to `<output>.spend.json`
  * at the end. In an explore job with the real app AI (run.ts resolves it with probeApp()), the
@@ -115,19 +117,24 @@ export interface ModelJob {
   upstream: { baseUrl: string; apiKey: string };
 }
 
+/** An `anthropic:<model>` spec the proxy can price, or a Refusal that names `named`. */
+function pricedAnthropic(spec: string, named: string): string {
+  const [provider, model] = spec.split(/:(.*)/s, 2);
+  if (provider !== "anthropic" || !model)
+    throw new Refusal(`${named}: only anthropic:<model> runs here`);
+  // The proxy refuses every call of a model it cannot price, so the job could only fail.
+  if (!priced(model)) throw new Refusal(`${named}: the proxy has no price for it`);
+  return model;
+}
+
 /**
  * Reads a model-driven job from the host env, before any docker command. Refusal texts never
  * hold the key or the base URL.
  */
 export function modelJob(env: NodeJS.ProcessEnv, modelVar = "BUGBASH_MODEL"): ModelJob {
   const spec = env.BUGBASH_MODEL ?? MCP_APPS_MODEL;
-  const [provider, model] = spec.split(/:(.*)/s, 2);
   // `modelVar` names the variable the user set (run.ts: a BUGBASH_MODELS entry).
-  const named = `${modelVar} ${JSON.stringify(spec)}`;
-  if (provider !== "anthropic" || !model)
-    throw new Refusal(`${named}: only anthropic:<model> runs here`);
-  // The proxy refuses every call of a model it cannot price, so the job could only fail.
-  if (!priced(model)) throw new Refusal(`${named}: the proxy has no price for it`);
+  const model = pricedAnthropic(spec, `${modelVar} ${JSON.stringify(spec)}`);
   const budget = env.BUGBASH_BUDGET_USD ?? "";
   if (!/^\d+(\.\d+)?$/.test(budget) || !(Number(budget) > 0))
     throw new Refusal("set BUGBASH_BUDGET_USD: the most this run may spend at list price, in $");
@@ -502,7 +509,15 @@ function checkJob(args: string[], o: LaunchOptions) {
   // The job's folder: its cwd in the container, and where its output comes back.
   const storyJob = stories || electron;
   const dir = storyJob ? storiesDir : bugbash;
-  return { dir, drivenRun, selfCheck, ai, driven, localBuild, storyJob, electron };
+  // BUGBASH_JUDGE_MODEL: the story configs' judge (storyConfig.ts), a second model their proxy
+  // allows. Only story jobs read it, so the others neither check nor get it: `make test-stories`
+  // sets it for all three of its jobs, and a stray value cannot refuse `make bug-bash`.
+  const judgeSpec = o.env.BUGBASH_JUDGE_MODEL ?? "";
+  const judgeModel =
+    storyJob && judgeSpec !== ""
+      ? pricedAnthropic(judgeSpec, `BUGBASH_JUDGE_MODEL ${JSON.stringify(judgeSpec)}`)
+      : undefined;
+  return { dir, drivenRun, selfCheck, ai, driven, judgeModel, localBuild, storyJob, electron };
 }
 
 /** A job's checks and the Docker check, with no job: `--preflight` (Makefile, before the build). */
@@ -514,10 +529,8 @@ export async function preflight(args: string[], o: LaunchOptions): Promise<Clean
 /** Runs one job. A refusal before any docker command is thrown; anything later is returned. */
 export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOutcome> {
   const log = o.log ?? logLine;
-  const { dir, drivenRun, selfCheck, ai, driven, localBuild, storyJob, electron } = checkJob(
-    args,
-    o
-  );
+  const { dir, drivenRun, selfCheck, ai, driven, judgeModel, localBuild, storyJob, electron } =
+    checkJob(args, o);
   const output = outputDir(args);
   const dest = path.join(dir, output);
   const records = `${dest}.proxy.jsonl`;
@@ -621,6 +634,7 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
     };
     const drivenEnv = driven && {
       BUGBASH_MODEL: `anthropic:${driven.model}`,
+      ...(judgeModel != null && { BUGBASH_JUDGE_MODEL: `anthropic:${judgeModel}` }),
       BUGBASH_MODEL_DRIVEN: "1",
     };
     // entry.ts starts Xvfb for this job only.
@@ -650,30 +664,34 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
           probeRefusedBy[category] = (probeRefusedBy[category] ?? 0) + 1;
         }
       };
-      const probe = await probeApp(
-        driven,
-        driven.model,
-        ledger,
-        o.stop,
-        undefined,
-        onProbeRecord
-      ).catch((error: Error) => {
-        probeFault = error.message;
-        fault(probeFault);
-        throw error;
-      });
-      if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
-      if (probe.status !== 200)
-        throw new Refusal(
-          probeUnreachable(probe.records)
-            ? `${cannotReach(driven)}: check the URL and the network`
-            : (keyRejected(driven, probe.status, probe.records, {
-                model: driven.model,
-                variable: "BUGBASH_MODEL",
-              }) ??
-                `the ${driven.model} probe failed (HTTP ${probe.status}): check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and BUGBASH_BUDGET_USD`)
-        );
-      log(`${name} probe: ${driven.model} answered`);
+      // The judge too (story jobs): a key that cannot use it would fail each judgment late,
+      // and each such call keeps its reservation.
+      const probed = [{ model: driven.model, variable: "BUGBASH_MODEL" }];
+      if (judgeModel != null && judgeModel !== driven.model)
+        probed.push({ model: judgeModel, variable: "BUGBASH_JUDGE_MODEL" });
+      for (const target of probed) {
+        const probe = await probeApp(
+          driven,
+          target.model,
+          ledger,
+          o.stop,
+          undefined,
+          onProbeRecord
+        ).catch((error: Error) => {
+          probeFault = error.message;
+          fault(probeFault);
+          throw error;
+        });
+        if (o.stop.aborted) throw new Stopped(String(o.stop.reason));
+        if (probe.status !== 200)
+          throw new Refusal(
+            probeUnreachable(probe.records)
+              ? `${cannotReach(driven)}: check the URL and the network`
+              : (keyRejected(driven, probe.status, probe.records, target) ??
+                  `the ${target.model} probe failed (HTTP ${probe.status}): check ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL and BUGBASH_BUDGET_USD`)
+          );
+        log(`${name} probe: ${target.model} answered`);
+      }
     }
     const proxyMount: string[] = [];
     if (driven) {
@@ -688,8 +706,16 @@ export async function launchJob(args: string[], o: LaunchOptions): Promise<JobOu
         // The job folder: not mounted (only stage/ and proxy/ are), and one place to clean up.
         privateParent: jobDir,
         upstream: driven.upstream,
-        // The explorer, and in real mode the app too: nothing else.
-        job: { models: [...new Set([driven.model, ...(ai.mode === "real" ? [ai.model] : [])])] },
+        // The explorer, its judge if set, and in real mode the app too: nothing else.
+        job: {
+          models: [
+            ...new Set([
+              driven.model,
+              ...(judgeModel != null ? [judgeModel] : []),
+              ...(ai.mode === "real" ? [ai.model] : []),
+            ]),
+          ],
+        },
         ledger,
         log: record,
         onFault: fault,

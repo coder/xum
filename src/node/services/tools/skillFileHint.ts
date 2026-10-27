@@ -4,8 +4,8 @@ import type { InvocableSkill, SkillLookupName } from "@/common/types/agentSkill"
 import assert from "@/common/utils/assert";
 import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
-import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import { isRemoteRuntime, type Runtime } from "@/node/runtime/Runtime";
 import { readAgentSkill } from "@/node/services/agentSkills/agentSkillsService";
 import { resolveSkillDirectory } from "@/node/services/agentSkills/skillDirectory";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
@@ -101,7 +101,7 @@ async function findSkillFileForPath(
   filePath: string
 ): Promise<SkillFileLocation | null> {
   if (!config.cwd) return null;
-  const pathApi = config.runtime instanceof RemoteRuntime ? path.posix : path;
+  const pathApi = isRemoteRuntime(config.runtime) ? path.posix : path;
   // Lexical: `..` segments are resolved first, so `<skill>/../x` is outside.
   // Symlinks are checked by agent_skill_read_file's containment in skillOwnsFile.
   // pathApi.normalize: remote normalizePath keeps `..` segments.
@@ -160,6 +160,7 @@ async function skillOwnsFile(
   const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
   const skillCtx = resolveSkillStorageContext({
     runtime: config.runtime,
+    runtimeFactory: toolRuntimeFactory(config),
     workspacePath: config.cwd,
     xumScope: config.xumScope ?? null,
     includeClaudeSkills,
@@ -169,6 +170,7 @@ async function skillOwnsFile(
     resolved = await readAgentSkill(skillCtx.runtime, skillCtx.workspacePath, name, {
       roots: skillCtx.roots,
       containment: skillCtx.containment,
+      runtimeFactory: toolRuntimeFactory(config),
       includeClaudeSkills,
     });
   } catch (error) {

@@ -10,6 +10,7 @@ import * as path from "node:path";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { filterEmptyAssistantMessages } from "@/browser/utils/messages/modelMessageTransform";
 import type { SendMessageError } from "@/common/types/errors";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { Err, Ok, type Result } from "@/common/types/result";
@@ -158,6 +159,64 @@ async function seedHistory(h: AgentSessionHarness, inputTokens: number, toolResu
   expect(result.success).toBe(true);
 }
 
+/** E′ − E: what the warning row adds to a counted request (the harness has no tokenizer). */
+const TURN_START_ROW_TOKENS = 300;
+
+interface TurnStartControl {
+  /**
+   * E (full estimate of the built request) for one provider attempt. Unset, E is the saved usage
+   * of the turn's last assistant row, so a scenario's seeded usage drives the stage.
+   */
+  estimate?: (attempt: number, usage: number) => number;
+  /** Runs after the stage fit, right before the session's publish (a Stop can land here). */
+  beforePublish?: () => void | Promise<void>;
+}
+
+/**
+ * Provider usage as the on-send rollover check reads it: the session's last stream usage, else the
+ * saved usage of the newest assistant row in the request's messages (after a restart).
+ */
+function lastUsage(h: AgentSessionHarness, messages: readonly MuxMessage[]): number {
+  const state = (
+    Reflect.get(h.session, "getUsageState") as (
+      this: AgentSessionHarness["session"]
+    ) =>
+      | { lastContextUsage?: { input: { tokens: number }; cached: { tokens: number } } }
+      | undefined
+  ).call(h.session);
+  const live = state?.lastContextUsage;
+  if (live) return live.input.tokens + live.cached.tokens;
+  const usage = messages.findLast((row) => row.metadata?.contextUsage)?.metadata?.contextUsage;
+  return (usage?.inputTokens ?? 0) + (usage?.cachedInputTokens ?? 0);
+}
+
+/**
+ * The controlled provider replaces TurnRequestBuilder.start(), so it replays the turn-start stage
+ * step (#5286): decide from E, count E′ with the row appended, publish only if E′ fits, and
+ * dispatch that payload (the row joins `messages`, as in the builder).
+ */
+async function emulateTurnStartStage(
+  h: AgentSessionHarness,
+  request: Request,
+  attempt: number,
+  control: TurnStartControl
+): Promise<void> {
+  const decide = request.onTurnStartStage;
+  const limit = contextLimits.getEffectiveContextLimit(request.modelString, false);
+  if (!decide || limit == null) return;
+  const usage = lastUsage(h, request.messages);
+  const estimate = control.estimate?.(attempt, usage) ?? usage;
+  const stage = await decide({
+    estimate,
+    limit,
+    model: request.modelString,
+    messages: request.messages,
+  });
+  if (!stage?.fits(estimate + TURN_START_ROW_TOKENS)) return;
+  await control.beforePublish?.();
+  if (await stage.publish()) request.messages.push(stage.row);
+}
+
 describe("AgentSession token-budget lifecycle", () => {
   const harnesses: AgentSessionHarness[] = [];
   const storageCleanups: Array<() => Promise<void>> = [];
@@ -215,10 +274,14 @@ describe("AgentSession token-budget lifecycle", () => {
       return waiter.promise;
     };
     const completions: Array<ReturnType<typeof createTurnCompletionController>> = [];
+    const turnStart: TurnStartControl = {};
     const streamMessage = mock<AgentSessionAIService["streamMessage"]>(async (request) => {
       requests.push(request);
-      if (requests.length === 2) secondRequest.resolve(request);
-      const error = await args?.failure?.(requests.length);
+      const attempt = requests.length;
+      // A refused request (the failure hook models the turn-start check) never reaches the stage.
+      const error = await args?.failure?.(attempt);
+      if (!error) await emulateTurnStartStage(h, request, attempt, turnStart);
+      if (attempt === 2) secondRequest.resolve(request);
       if (error) return Err(error);
       h.aiEmitter.emit("stream-start", {
         type: "stream-start",
@@ -307,6 +370,7 @@ describe("AgentSession token-budget lifecycle", () => {
       completions,
       streamMessage,
       secondRequest,
+      turnStart,
       finishAndDispatch,
       settleStream,
       waitForRequest,
@@ -1295,17 +1359,11 @@ describe("AgentSession token-budget lifecycle", () => {
     "valid in-memory usage takes precedence over persisted usage (%d tokens)",
     async (inputTokens) => {
       const h = await setup();
+      // A completed stream records its context usage in memory; no restart follows.
+      expect((await h.session.sendMessage("Record counters", options)).success).toBe(true);
+      h.settleStream(0, { finishReason: "stop", contextUsage: { inputTokens } });
+      await h.session.waitForIdle();
       await seedHistory(h, inputTokens === 120_000 ? 20_000 : 120_000);
-      const session = h.session as unknown as {
-        updateUsageStateFromModelUsage(
-          input: Pick<SettledStepBudget, "model" | "usage"> & { live: boolean }
-        ): void;
-      };
-      session.updateUsageStateFromModelUsage({
-        model,
-        usage: { inputTokens, outputTokens: 0, totalTokens: inputTokens },
-        live: false,
-      });
       expect((await h.session.sendMessage("Use current counters", options)).success).toBe(true);
       expect(rolloverRows(await allRows(h))).toHaveLength(inputTokens === 120_000 ? 1 : 0);
     }
@@ -1389,7 +1447,9 @@ describe("AgentSession token-budget lifecycle", () => {
     const rows = await allRows(h);
     expect(warningRows(rows).map(isFinalFlushRow)).toEqual([false, true]);
     expect(rolloverRows(rows)).toHaveLength(0);
-    expect(text(rows.at(-1)!)).toBe("And another");
+    // The send that delivers the prompt carries it after its own user row (#5286).
+    expect(text(rows.at(-2)!)).toBe("And another");
+    expect(isFinalFlushRow(rows.at(-1)!)).toBe(true);
   });
 
   test("without new_context no final prompt is offered", async () => {
@@ -1402,6 +1462,19 @@ describe("AgentSession token-budget lifecycle", () => {
       (await second.onStepSettled?.(step(111_000, { newContextAvailable: false })))?.decision
     ).toBe("continue");
     expect(h.session.hasQueuedMessages()).toBe(false);
+    // The turn start offers the final prompt only when the dispatching send has new_context.
+    h.settleStream(1, { finishReason: "stop", contextUsage: { inputTokens: 111_000 } });
+    await h.session.waitForIdle();
+    const noNewContext: SendMessageOptions = {
+      ...options,
+      toolPolicy: [{ regex_match: "new_context", action: "disable" }],
+    };
+    expect((await h.session.sendMessage("Without new_context", noNewContext)).success).toBe(true);
+    expect((await allRows(h)).some(isFinalFlushRow)).toBe(false);
+    h.settleStream(2, { finishReason: "stop", contextUsage: { inputTokens: 111_000 } });
+    await h.session.waitForIdle();
+    expect((await h.session.sendMessage("With new_context", options)).success).toBe(true);
+    expect(isFinalFlushRow((await allRows(h)).at(-1)!)).toBe(true);
   });
 
   test("a settled step whose next request would cross the ceiling seals the window instead of blocking", async () => {
@@ -1990,7 +2063,8 @@ describe("AgentSession token-budget lifecycle", () => {
         handoffTokens: 89_600,
       });
       expect(isHandoffRow(warnings[0])).toBe(true);
-      const continuation = rows.at(-1)!;
+      expect(rows.at(-1)).toBe(warnings[0]);
+      const continuation = rows.at(-2)!;
       expect(continuation.metadata).toMatchObject({
         synthetic: true,
         uiVisible: false,
@@ -1999,7 +2073,7 @@ describe("AgentSession token-budget lifecycle", () => {
         goalId: "goal-budget",
         muxMetadata: correlation,
       });
-      expect(warnings[0].metadata!.historySequence!).toBeLessThan(
+      expect(warnings[0].metadata!.historySequence!).toBeGreaterThan(
         continuation.metadata!.historySequence!
       );
       expect((await h.requests[1].onStepSettled?.(step(usage)))?.decision).toBe("continue");
@@ -2179,7 +2253,7 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(rolloverRows(rows)).toHaveLength(0);
   });
 
-  test("a pending handoff is published ahead of the queued user input that dispatches it", async () => {
+  test("a pending handoff is published after the queued user input that dispatches it", async () => {
     const h = await setup();
     expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
     expect(h.session.queueMessage("Later question", options)).not.toBeNull();
@@ -2192,11 +2266,10 @@ describe("AgentSession token-budget lifecycle", () => {
     await h.waitForRequest(2);
     const rows = await allRows(h);
     expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
-    expect(text(rows.at(-1)!)).toBe("Later question");
+    const later = rows.find((row) => text(row) === "Later question")!;
     expect(rows.filter((row) => text(row) === "Continue")).toHaveLength(0);
-    expect(warningRows(rows)[0].metadata!.historySequence!).toBeLessThan(
-      rows.at(-1)!.metadata!.historySequence!
-    );
+    // [..., user, warning]: the queued input's own build carries the row (#5286).
+    expect(rows.slice(-2)).toEqual([later, warningRows(rows)[0]]);
     expect(handoffClaimed(h)).toBe(true);
   });
 
@@ -2287,7 +2360,8 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
       expect(rolloverRows(rows)).toHaveLength(0);
       expect(handoffClaimed(h)).toBe(true);
-      expect(text(rows.at(-1)!)).toBe("Next request");
+      expect(text(rows.at(-2)!)).toBe("Next request");
+      expect(isHandoffRow(rows.at(-1)!)).toBe(true);
     }
   );
 
@@ -2306,9 +2380,12 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(handoffClaimed(h)).toBe(false);
     expect(text(h.requests[1].messages.at(-1)!)).toBe("Continue");
 
-    expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
-    h.settleStream(1, { contextUsage: { inputTokens: 90_000 } });
-    await h.waitForRequest(3);
+    // The Continue's own turn start declined the stage, so its settlement does not stop again.
+    expect((await h.requests[1].onStepSettled?.(step(90_000)))?.decision).toBe("continue");
+    h.settleStream(1, { finishReason: "stop", contextUsage: { inputTokens: 90_000 } });
+    await h.session.waitForIdle();
+    // Nothing was claimed: the next turn's start publishes the handoff.
+    expect((await h.session.sendMessage("Next request", options)).success).toBe(true);
     const rows = await allRows(h);
     expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
     expect(handoffClaimed(h)).toBe(true);
@@ -2341,24 +2418,37 @@ describe("AgentSession token-budget lifecycle", () => {
     }
   );
 
-  test("removing the queued advisory Continue does not lose the advisory itself", async () => {
-    const h = await setup();
-    expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
-    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
-    expect(
-      h.session.removeQueuedMessagesByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY, "removed")
-    ).toBe(1);
-    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
-    await h.session.waitForIdle();
-    expect(h.requests).toHaveLength(1);
-    expect(warningRows(await allRows(h))).toHaveLength(0);
-    // The next real send derives the advisory from usage, not from the dropped intent.
-    expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
-    const rows = await allRows(h);
-    expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
-    expect(text(rows.at(-1)!)).toBe("Follow-up");
-    expect(handoffClaimed(h)).toBe(true);
-  });
+  // "queue": the user's queued send replaces the removed Continue and dispatches at stream end.
+  test.each(["send", "queue"] as const)(
+    "removing the queued advisory Continue does not lose the advisory itself (%s)",
+    async (dispatch) => {
+      const h = await setup();
+      expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
+      expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+      expect(
+        h.session.removeQueuedMessagesByDedupeKeyPrefix(CONTEXT_WARNING_DEDUPE_KEY, "removed")
+      ).toBe(1);
+      if (dispatch === "queue") {
+        expect(h.session.queueMessage("Follow-up", options)).not.toBeNull();
+        h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+        await h.waitForRequest(2);
+      } else {
+        h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+        await h.session.waitForIdle();
+        expect(h.requests).toHaveLength(1);
+        expect(warningRows(await allRows(h))).toHaveLength(0);
+        // The next real send derives the advisory from usage, not from the dropped intent.
+        expect((await h.session.sendMessage("Follow-up", options)).success).toBe(true);
+      }
+      const rows = await allRows(h);
+      expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+      // The replacing send's own turn start carries the row, after its user row (#5286).
+      expect(text(rows.at(-2)!)).toBe("Follow-up");
+      expect(isHandoffRow(rows.at(-1)!)).toBe(true);
+      expect(rows.filter((row) => text(row) === "Continue")).toHaveLength(0);
+      expect(handoffClaimed(h)).toBe(true);
+    }
+  );
 
   test.each(["stop", "failed-publication", "restart-before", "restart-after"] as const)(
     "the handoff is published exactly once across a %s",
@@ -2402,18 +2492,27 @@ describe("AgentSession token-budget lifecycle", () => {
           break;
         }
         case "failed-publication": {
-          spyOn(h.historyService, "acceptCompactionReplacement").mockImplementationOnce(
-            (...args) => {
-              const operation = args[2];
-              expect(operation.kind === "append" && warningRows(operation.messages)).toHaveLength(
-                1
-              );
-              return Promise.resolve(Err("disk full"));
-            }
-          );
+          // The turn start publishes the row (#5286): a failed publication dispatches the
+          // Continue without it and claims nothing.
+          // The Continue row is published first; the next fenced append is the warning's.
+          const accept = spyOn(h.historyService, "acceptCompactionReplacement");
+          let rejectedCall: number | undefined;
+          const unsubscribe = h.session.onChatEvent(({ message }) => {
+            if (message.type !== "message" || rejectedCall != null) return;
+            if (message.role !== "user" || text(message) !== "Continue") return;
+            rejectedCall = accept.mock.calls.length;
+            accept.mockRejectedValueOnce(new Error("disk full"));
+          });
           h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+          const continued = await h.waitForRequest(2);
+          unsubscribe();
+          // Non-vacuous: the rejected call was the warning's publication.
+          const rejected = accept.mock.calls[rejectedCall!]?.[2];
+          expect(rejected?.kind === "append" && warningRows(rejected.messages).length).toBe(1);
+          expect(text(continued.messages.at(-1)!)).toBe("Continue");
+          expect(handoffClaimed(h)).toBe(false);
+          h.settleStream(1, { finishReason: "stop", contextUsage: { inputTokens: 90_000 } });
           await h.session.waitForIdle();
-          expect(h.requests).toHaveLength(1);
           break;
         }
         case "restart-before": {
@@ -2451,9 +2550,12 @@ describe("AgentSession token-budget lifecycle", () => {
     { toolResultTokens: 18_500, advisory: false },
     { toolResultTokens: 1_000, advisory: true },
   ])(
-    "dispatch screens the pending handoff against the encoded last-step outputs (advisory=$advisory)",
+    "the pending handoff fits against the built request that carries the encoded last-step outputs (advisory=$advisory)",
     async ({ toolResultTokens, advisory }) => {
       const h = await setup();
+      // #5286: the stage fits on E, the count of the built request. That request carries the last
+      // step's outputs, which provider usage has not counted yet.
+      h.turnStart.estimate = (_attempt, projected) => (projected ?? 0) + toolResultTokens;
       const stale = "s".repeat(400_000);
       const settled = "d".repeat(4_000);
       const toolPart = (toolCallId: string, output: string): MuxMessage["parts"][number] => ({
@@ -2491,13 +2593,12 @@ describe("AgentSession token-budget lifecycle", () => {
       let rows = await allRows(h);
       expect(warningRows(rows)).toHaveLength(advisory ? 1 : 0);
       if (!advisory) {
-        // Settlement sees no persisted outputs and asks for the handoff; dispatch screens again.
-        expect((await h.requests[0].onStepSettled?.(step(100_000)))?.decision).toBe("warn");
-        h.settleStream(0, { contextUsage: { inputTokens: 100_000 } });
-        await h.waitForRequest(2);
+        // This turn's start found the handoff due without room for its row, and the request only
+        // grows within the turn: settlement does not stop for a Continue that would decline it.
+        expect((await h.requests[0].onStepSettled?.(step(100_000)))?.decision).toBe("continue");
+        expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(false);
         rows = await allRows(h);
         expect(warningRows(rows)).toHaveLength(0);
-        expect(text(rows.at(-1)!)).toBe("Continue");
       }
       expect(rolloverRows(rows)).toHaveLength(0);
       expect(handoffClaimed(h)).toBe(advisory);
@@ -2527,7 +2628,9 @@ describe("AgentSession token-budget lifecycle", () => {
     expect(h.requests).toHaveLength(3);
   });
 
-  test("an advisory that overflows at assembly takes the emergency path without a stale claim", async () => {
+  // #5286: the stage is decided only after the turn-start check admitted the request, so a send
+  // refused there publishes no warning that the emergency reset would then seal.
+  test("a handoff send refused at the turn-start check takes the emergency path without a warning or stale claim", async () => {
     const h = await setup({ failure: (attempt) => (attempt === 2 ? exceeded : undefined) });
     expect((await h.session.sendMessage("Start work", options)).success).toBe(true);
     expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
@@ -2536,13 +2639,10 @@ describe("AgentSession token-budget lifecycle", () => {
     const rows = await allRows(h);
     const [reset] = rolloverRows(rows);
     expect(reset.metadata?.muxMetadata).toMatchObject({ reason: "context-exceeded" });
-    const handoff = warningRows(rows);
-    expect(handoff.map(isHandoffRow)).toEqual([true]);
-    expect(handoff[0].metadata!.historySequence!).toBeLessThan(reset.metadata!.historySequence!);
-    // The sealed advisory neither travels into the fresh window nor claims it.
+    expect(warningRows(rows)).toHaveLength(0);
     const fresh = sliceMessagesForProviderFromLatestContextBoundary(h.requests[2].messages);
-    expect(warningRows(fresh)).toHaveLength(0);
     expect(text(fresh.findLast((row) => row.role === "user")!)).toBe("Continue");
+    // The fresh window still owes its handoff.
     expect(handoffClaimed(h)).toBe(false);
     expect((await h.requests[2].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
     expect(h.requests).toHaveLength(3);
@@ -2569,8 +2669,8 @@ describe("AgentSession token-budget lifecycle", () => {
     await h.waitForRequest(2);
     expect(recordStreamAccounting).toHaveBeenCalledTimes(1);
     const rows = await allRows(h);
-    expect(isHandoffRow(rows.at(-2)!)).toBe(true);
-    expect(rows.at(-1)?.metadata).toMatchObject({
+    expect(isHandoffRow(rows.at(-1)!)).toBe(true);
+    expect(rows.at(-2)?.metadata).toMatchObject({
       kind: GOAL_CONTINUATION_KIND,
       goalId: "goal-budget",
     });
@@ -2603,8 +2703,8 @@ describe("AgentSession token-budget lifecycle", () => {
     h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
     await h.waitForRequest(2);
     const rows = await allRows(h);
-    expect(isHandoffRow(rows.at(-2)!)).toBe(true);
-    expect(rows.at(-1)?.metadata?.taskTurnKind).toBe("required_report");
+    expect(isHandoffRow(rows.at(-1)!)).toBe(true);
+    expect(rows.at(-2)?.metadata?.taskTurnKind).toBe("required_report");
     expect(h.requests[1].taskTurnKind).toBe("required_report");
   });
 
@@ -2635,8 +2735,8 @@ describe("AgentSession token-budget lifecycle", () => {
     h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
     const continuation = await h.waitForRequest(2);
     const rows = await allRows(h);
-    expect(isHandoffRow(rows.at(-2)!)).toBe(true);
-    expect(text(rows.at(-1)!)).toBe("Continue");
+    expect(isHandoffRow(rows.at(-1)!)).toBe(true);
+    expect(text(rows.at(-2)!)).toBe("Continue");
     expect(continuation.messages.map(text)).toContain("Edited request");
     expect(continuation.messages.map(text)).not.toContain("Original request");
   });
@@ -2663,6 +2763,19 @@ describe("AgentSession token-budget lifecycle", () => {
       autoModelRouting: record,
       additionalSystemContext: "",
     });
+  });
+
+  test("a stage Continue runs at the thinking level the user picked during the stopped turn", async () => {
+    const h = await setup();
+    expect(
+      (await h.session.sendMessage("Work", { ...options, thinkingLevel: "low" })).success
+    ).toBe(true);
+    expect(h.requests[0].thinkingLevel).toBe("low");
+    // The pick lands before the turn's next model step, and the stage stops the turn first.
+    expect(h.session.setActiveTurnThinkingLevel("high")).toEqual({ accepted: true });
+    expect((await h.requests[0].onStepSettled?.(step(90_000)))?.decision).toBe("warn");
+    h.settleStream(0, { contextUsage: { inputTokens: 90_000 } });
+    expect((await h.waitForRequest(2)).thinkingLevel).toBe("high");
   });
 
   const exceeded: SendMessageError = {
@@ -3346,8 +3459,11 @@ describe("AgentSession token-budget lifecycle", () => {
 
   test("memory tool writes keep the window's cached notes until the next window", async () => {
     const h = await setup();
-    const oldContext = { indexEntries: [], hotMemoriesBlock: "Old task notes" };
-    const newContext = { indexEntries: [], hotMemoriesBlock: "Updated task notes" };
+    const notes = (description: string) => ({
+      indexEntries: [{ path: "/memories/workspace/context-notes.md", description }],
+    });
+    const oldContext = notes("Old task notes");
+    const newContext = notes("Updated task notes");
     const buildMemory = spyOn(h.aiService, "buildMemorySessionContext")
       .mockResolvedValueOnce(oldContext)
       .mockResolvedValue(newContext);
@@ -4118,4 +4234,288 @@ describe("AgentSession token-budget lifecycle", () => {
       expect(rolloverRows(await allRows(h))).toHaveLength(0);
     }
   );
+
+  describe("turn-start stages (#5286)", () => {
+    // gpt-4o: limit 128,000, slider 70%. C = 119,808, H = 89,600, F = 109,616.
+    const ceiling = 119_808;
+    const handoffReserve = 2_048;
+
+    async function stopStream(h: Awaited<ReturnType<typeof setup>>, index: number, usage: number) {
+      h.settleStream(index, { finishReason: "stop", contextUsage: { inputTokens: usage } });
+      await h.session.waitForIdle();
+    }
+
+    test.each([
+      // E′ + reserve = C − 1.
+      { estimate: ceiling - handoffReserve - TURN_START_ROW_TOKENS - 1, published: true },
+      // #5409 F1: E + reserve fits, E′ + reserve does not.
+      { estimate: ceiling - handoffReserve - TURN_START_ROW_TOKENS, published: false },
+      // Usage alone (95,000) leaves room; the built request does not.
+      { estimate: 118_000, published: false },
+    ])(
+      "a due handoff is published only when the built request has room for its row (E=$estimate)",
+      async ({ estimate, published }) => {
+        const h = await setup();
+        await seedHistory(h, 95_000);
+        h.turnStart.estimate = () => estimate;
+        expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+        expect(h.requests).toHaveLength(1);
+        const rows = await allRows(h);
+        // The on-send projection publishes no prefix: any warning follows this send's user row.
+        expect(rows.slice(-2).map((row) => (isHandoffRow(row) ? "handoff" : text(row)))).toEqual(
+          published ? ["Keep working", "handoff"] : ["Completed old work", "Keep working"]
+        );
+        expect(handoffClaimed(h)).toBe(published);
+        // Live subscribers receive the published row as a chat message, like the turn's other rows.
+        const warningIds = warningRows(rows).map((row) => row.id);
+        expect(
+          h.events.filter(
+            (event) => event.type === "message" && "id" in event && warningIds.includes(event.id)
+          )
+        ).toHaveLength(published ? 1 : 0);
+        if (published) return;
+        // The row that did not fit claimed nothing: the next send with room still gets it.
+        await stopStream(h, 0, 95_000);
+        h.turnStart.estimate = () => 100_000;
+        expect((await h.session.sendMessage("Next request", options)).success).toBe(true);
+        expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+      }
+    );
+
+    /** E below H (not due) or past it without room for the row (a fit decline). */
+    const NOT_DUE = 80_000;
+    const NO_ROOM = 118_000;
+
+    test.each([
+      // A due stage without room: the queued Continue would decline it again, so no stop.
+      { estimate: NO_ROOM, decision: "continue" },
+      // Nothing was due at turn start: a stage that comes due mid-turn still stops the turn.
+      { estimate: NOT_DUE, decision: "warn" },
+    ] as const)(
+      "settlement after a turn start that opened no stage (E=$estimate) stops with $decision",
+      async ({ estimate, decision }) => {
+        const h = await setup();
+        await seedHistory(h, 90_000);
+        h.turnStart.estimate = () => estimate;
+        expect((await h.session.sendMessage("Work", options)).success).toBe(true);
+        expect(warningRows(await allRows(h))).toHaveLength(0);
+        expect((await h.requests[0].onStepSettled?.(step(95_000)))?.decision).toBe(decision);
+        expect(h.session.hasQueuedDedupeKey(CONTEXT_WARNING_DEDUPE_KEY)).toBe(decision === "warn");
+      }
+    );
+
+    test.each(["user", "edit", "resume"] as const)(
+      "a decline holds only for its own stream: a later %s turn decides again",
+      async (kind) => {
+        const h = await setup();
+        await seedHistory(h, 90_000);
+        h.turnStart.estimate = () => NO_ROOM;
+        expect((await h.session.sendMessage("First try", options)).success).toBe(true);
+        await stopStream(h, 0, 90_000);
+        // The later turn has no room either, so a decline it inherited would show here.
+        const first = (await allRows(h)).find((row) => text(row) === "First try")!;
+        if (kind === "edit") {
+          const historyEditPrecondition = buildHistoryEditPrecondition(
+            (await allRows(h)).map((row) => MuxMessageSchema.parse(row) as MuxMessage),
+            first.id
+          );
+          expect(
+            (
+              await h.session.sendMessage("Second try", {
+                ...options,
+                editMessageId: first.id,
+                historyEditPrecondition,
+              })
+            ).success
+          ).toBe(true);
+        } else if (kind === "resume") {
+          h.turnStart.estimate = () => NOT_DUE;
+          expect((await h.session.resumeStream(options)).success).toBe(true);
+        } else {
+          h.turnStart.estimate = () => NOT_DUE;
+          expect((await h.session.sendMessage("Second try", options)).success).toBe(true);
+        }
+        const second = await h.waitForRequest(2);
+        expect(warningRows(await allRows(h))).toHaveLength(0);
+        // An edit declines on its own turn start (E=NO_ROOM); the others found nothing due.
+        expect((await second.onStepSettled?.(step(95_000)))?.decision).toBe(
+          kind === "edit" ? "continue" : "warn"
+        );
+      }
+    );
+
+    test("when both stages are due, the published handoff does not delay the final stop", async () => {
+      const h = await setup();
+      await seedHistory(h, 111_000);
+      // E is past the final point, but the unclaimed handoff takes precedence.
+      expect((await h.session.sendMessage("Work near the ceiling", options)).success).toBe(true);
+      expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+      // Growth below the reserve: the final stage was never assessed against this send.
+      expect((await h.requests[0].onStepSettled?.(step(111_100)))?.decision).toBe("warn");
+      h.settleStream(0, { contextUsage: { inputTokens: 111_100 } });
+      await h.waitForRequest(2);
+      const rows = await allRows(h);
+      expect(warningRows(rows).map(isFinalFlushRow)).toEqual([false, true]);
+      expect(text(rows.at(-2)!)).toBe("Continue");
+    });
+
+    test.each([
+      { estimate: 100_000, final: false },
+      { estimate: 111_000, final: true },
+    ])(
+      "after a restart the next send decides from its own E with claims from history (E=$estimate)",
+      async ({ estimate, final }) => {
+        const first = await setup();
+        await seedHistory(first, 90_000);
+        expect((await first.session.sendMessage("Before restart", options)).success).toBe(true);
+        expect(warningRows(await allRows(first)).map(isHandoffRow)).toEqual([true]);
+        await stopStream(first, 0, 90_000);
+        await first.session.dispose();
+        const h = await setup({ previous: first });
+        h.turnStart.estimate = () => estimate;
+        expect((await h.session.sendMessage("After restart", options)).success).toBe(true);
+        const rows = await allRows(h);
+        // The handoff claimed before the restart is never repeated; only the final stage remains.
+        expect(warningRows(rows).map(isFinalFlushRow)).toEqual(final ? [false, true] : [false]);
+        expect(text(rows.at(final ? -2 : -1)!)).toBe("After restart");
+        if (!final) return;
+        // The claimed final prompt closes the window's stages: a later send past F gets none.
+        await stopStream(h, 0, estimate);
+        expect((await h.session.sendMessage("Still working", options)).success).toBe(true);
+        expect(warningRows(await allRows(h)).map(isFinalFlushRow)).toEqual([false, true]);
+      }
+    );
+
+    // Claims come from history: a claimed final prompt closes the window's stages even when no
+    // handoff row precedes it, so a later send past H gets no handoff.
+    test("a claimed final prompt without a handoff row suppresses a due handoff", async () => {
+      const h = await setup();
+      expect(
+        (
+          await h.historyService.appendManyToHistory(workspaceId, [
+            rolloverMessages.createContextBudgetWarning({
+              contextTokens: 110_000,
+              maxTokens: 128_000,
+              budgetTokens: ceiling,
+              sessionHistoryAvailable: true,
+              final: true,
+              newContextAvailable: true,
+            }),
+          ])
+        ).success
+      ).toBe(true);
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      expect(warningRows(await allRows(h)).map(isFinalFlushRow)).toEqual([true]);
+      expect(handoffClaimed(h)).toBe(false);
+    });
+
+    // The row is published under the send's admission, like its user row: a second backend that
+    // advanced the history generation (a reset, a rollover) leaves no warning in the new state.
+    test("a turn-start warning is not published after another backend advanced the generation", async () => {
+      const h = await setup();
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      let advanced = false;
+      h.turnStart.beforePublish = async () => {
+        await h.historyService.getContinuousCompactionJournal(workspaceId).advanceGeneration();
+        advanced = true;
+      };
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      expect(advanced).toBe(true);
+      expect(warningRows(await allRows(h))).toHaveLength(0);
+      expect(handoffClaimed(h)).toBe(false);
+      expect(text(h.requests[0].messages.at(-1)!)).toBe("Keep working");
+    });
+
+    // A row appended after the request's history read (here a sub-agent report) is not in the
+    // request. The warning's later sequence would stamp it as seen, so the warning is refused.
+    test("a turn-start warning is not published after a row the request did not read", async () => {
+      const h = await setup();
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      h.turnStart.beforePublish = async () => {
+        const late = createMuxMessage(
+          "late-report",
+          "user",
+          "<mux_subagent_report>done</mux_subagent_report>",
+          {
+            synthetic: true,
+          }
+        );
+        expect((await h.historyService.appendToHistory(workspaceId, late)).success).toBe(true);
+      };
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      const rows = await allRows(h);
+      expect(rows.map((row) => row.id)).toContain("late-report");
+      expect(warningRows(rows)).toHaveLength(0);
+      expect(handoffClaimed(h)).toBe(false);
+      expect(text(h.requests[0].messages.at(-1)!)).toBe("Keep working");
+    });
+
+    // The fence compares with the newest row the turn's history READ saw, not with the rows the
+    // provider request keeps. A crash can leave an empty partial assistant row as the newest row:
+    // the resume reads it, and the builder's provider filter drops it, yet it is no unread row.
+    test("an empty newest row the request drops does not refuse the turn-start warning", async () => {
+      let h = await setup();
+      await seedHistory(h, 90_000);
+      h.turnStart.estimate = () => NOT_DUE;
+      expect((await h.session.sendMessage("First try", options)).success).toBe(true);
+      await stopStream(h, 0, 90_000);
+      const crashLeft = createMuxMessage("crash-left", "assistant", "", { model, partial: true });
+      expect((await h.historyService.appendToHistory(workspaceId, crashLeft)).success).toBe(true);
+      // A restart, as after the crash: the new session reads history fresh.
+      await h.session.dispose();
+      h = await setup({ previous: h });
+      const accept = spyOn(h.historyService, "acceptCompactionReplacement");
+      h.turnStart.estimate = () => 100_000;
+      expect((await h.session.resumeStream(options)).success).toBe(true);
+      await h.waitForRequest(1);
+      const rows = await allRows(h);
+      const newest = rows.find((row) => row.id === crashLeft.id)?.metadata?.historySequence;
+      assert(newest != null);
+      // Non-vacuous: the provider request drops the row, and it was the newest before the warning.
+      expect(filterEmptyAssistantMessages(rows).map((row) => row.id)).not.toContain(crashLeft.id);
+      const fenced = accept.mock.calls.map(([, , , observer]) => observer.maxHistorySequence);
+      expect(fenced.filter((sequence) => sequence != null)).toEqual([newest]);
+      expect(warningRows(rows).map(isHandoffRow)).toEqual([true]);
+      expect(handoffClaimed(h)).toBe(true);
+    });
+
+    // The builder drops a stage once its abort signal fires. The session's publish fence covers a
+    // Stop that is already in progress when the warning would be published.
+    test("a Stop that lands before the turn-start warning is published writes no warning", async () => {
+      const h = await setup();
+      await seedHistory(h, 95_000);
+      h.turnStart.estimate = () => 100_000;
+      let stop: Promise<unknown> | undefined;
+      h.turnStart.beforePublish = () => {
+        stop ??= h.session.interruptStream();
+      };
+      expect((await h.session.sendMessage("Keep working", options)).success).toBe(true);
+      expect(stop).toBeDefined();
+      await stop;
+      // The controlled provider still started its stream; the Stop ends it.
+      h.aiEmitter.emit("stream-abort", {
+        type: "stream-abort",
+        workspaceId,
+        messageId: "assistant-1",
+        abortReason: "user",
+        metadata: { duration: 1 },
+      });
+      h.completions[0].settle({
+        status: "aborted",
+        abortReason: "user",
+        streamAbort: { type: "stream-abort", workspaceId, metadata: { duration: 1 } },
+      });
+      await h.session.waitForIdle();
+      expect(warningRows(await allRows(h))).toHaveLength(0);
+      expect(handoffClaimed(h)).toBe(false);
+      // Nothing was claimed, so the next send still delivers the handoff.
+      h.turnStart.beforePublish = undefined;
+      expect((await h.session.sendMessage("Resume the work", options)).success).toBe(true);
+      expect(warningRows(await allRows(h)).map(isHandoffRow)).toEqual([true]);
+    });
+  });
 });

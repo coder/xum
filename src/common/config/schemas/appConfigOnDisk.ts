@@ -14,7 +14,6 @@ import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constant
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 
 export { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
-export type { RuntimeEnablementOverrides } from "../../schemas/runtimeEnablement";
 export { UserPreferencesSchema } from "./userPreferences";
 export type { UserPreferences } from "./userPreferences";
 export { TaskSettingsSchema } from "./taskSettings";
@@ -26,11 +25,7 @@ export {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallSourceSchema,
 } from "./agentPluginInstalls";
-export type {
-  AgentPluginGitSource,
-  AgentPluginInstallEntry,
-  AgentPluginInstallSource,
-} from "./agentPluginInstalls";
+export type { AgentPluginGitSource, AgentPluginInstallEntry } from "./agentPluginInstalls";
 
 /**
  * Sparse delegated-run (sub-agent) override profile nested under an agent's
@@ -179,7 +174,6 @@ export const AppConfigOnDiskSchema = z
     /** Apply agentResourceLimits. Absent = off; the limits stay saved while off. */
     agentResourceLimitsEnabled: z.boolean().optional(),
     chatTranscriptFullWidth: z.boolean().optional(),
-    muxGatewayEnabled: z.boolean().optional(),
     llmDebugLogs: z.boolean().optional(),
     /** Desktop only: hold a display-sleep blocker while any local agent is working. */
     keepScreenAwake: z.boolean().optional(),
@@ -198,7 +192,6 @@ export const AppConfigOnDiskSchema = z
       .optional(),
     goalDefaults: GoalDefaultsSchema.optional(),
     evaluationDefaults: EvaluationDefaultsSchema.optional(),
-    muxGatewayModels: z.array(z.string()).optional(),
     routePriority: z.array(z.string()).optional(),
     routeOverrides: z.record(z.string(), z.string()).optional(),
     /**

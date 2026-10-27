@@ -9,6 +9,7 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import { LocalRuntime } from "@/node/runtime/LocalRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
+import * as artifactStoreModule from "./artifactStore";
 import { recordArtifactVersion } from "./artifactVersionStore";
 import {
   ARTIFACTS_UNAVAILABLE_REASON,
@@ -153,6 +154,18 @@ describe("artifacts operations", () => {
 
   describe("resolveArtifactsLocation", () => {
     const fakeRuntime = { getXumHome: () => "~/.mux" } as unknown as Runtime;
+    const originalDockerHost = process.env.DOCKER_HOST;
+    let descriptors: ReturnType<
+      typeof spyOn<typeof artifactStoreModule, "hostSupportsDescriptorPaths">
+    >;
+    beforeEach(() => {
+      descriptors = spyOn(artifactStoreModule, "hostSupportsDescriptorPaths");
+    });
+    afterEach(() => {
+      descriptors.mockRestore();
+      if (originalDockerHost === undefined) delete process.env.DOCKER_HOST;
+      else process.env.DOCKER_HOST = originalDockerHost;
+    });
     const resolve = (
       runtimeConfig: RuntimeConfig,
       extra?: {
@@ -161,8 +174,13 @@ describe("artifacts operations", () => {
         projects?: Array<{ projectPath: string; projectName: string }>;
         runtime?: Runtime;
       }
-    ) =>
-      resolveArtifactsLocation(
+    ) => {
+      // DOCKER_HOST decides the bind-mount probe before any Docker client config is read, and
+      // the spy stands in for the host's /proc/self/fd check, so the host cannot change results.
+      process.env.DOCKER_HOST =
+        (extra?.canMount ?? true) ? "unix:///var/run/docker.sock" : "tcp://10.0.0.1:2375";
+      descriptors.mockResolvedValue(extra?.pinnable ?? true);
+      return resolveArtifactsLocation(
         config.sessionsDir,
         "ws-art",
         {
@@ -172,12 +190,9 @@ describe("artifacts operations", () => {
           namedWorkspacePath: tempDir,
           projects: extra?.projects,
         },
-        {
-          createRuntime: () => extra?.runtime ?? fakeRuntime,
-          canBindMountHostPaths: () => Promise.resolve(extra?.canMount ?? true),
-          hostSupportsDescriptorPaths: () => Promise.resolve(extra?.pinnable ?? true),
-        }
+        { createRuntime: () => extra?.runtime ?? fakeRuntime }
       );
+    };
     const hostArtifacts = () =>
       path.join(getWorkspaceScratchDir(config.sessionsDir, "ws-art"), "artifacts");
 
@@ -187,6 +202,13 @@ describe("artifacts operations", () => {
         kind: "host",
         dir: hostArtifacts(),
       });
+    });
+
+    // Windows hosts never bind-mount the scratch dir (canBindMountHostPathsIntoContainers), so
+    // the devcontainer mount cases below cannot happen there.
+    const onMountingHost = test.skipIf(process.platform === "win32");
+
+    onMountingHost("reads a pinnable devcontainer mount from this host", async () => {
       // The devcontainer scratch dir is the host dir, bind-mounted at the same path. A
       // LocalRuntime "container" sees every host path, so the mount probe passes.
       expect(
@@ -197,46 +219,52 @@ describe("artifacts operations", () => {
       ).toEqual({ kind: "host", dir: hostArtifacts(), containerWritable: true });
     });
 
-    test("reads a devcontainer mount inside the container where folders cannot be pinned", async () => {
-      // Without descriptor paths the host's pathname checks can be raced by the container writer.
-      const container = new LocalRuntime(tempDir);
-      expect(
-        await resolve(
-          { type: "devcontainer", configPath: "dc.json" },
-          { runtime: container, pinnable: false }
-        )
-      ).toEqual({ kind: "runtime", runtime: container, dir: hostArtifacts() });
-    });
-
-    test("is unavailable in a devcontainer that does not see the scratch mount", async () => {
-      let probes = 0;
-      class NoMountRuntime extends LocalRuntime {
-        override exec(_command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
-          probes++;
-          return super.exec("exit 1", options);
-        }
+    onMountingHost(
+      "reads a devcontainer mount inside the container where folders cannot be pinned",
+      async () => {
+        // Without descriptor paths the host's pathname checks can be raced by the container writer.
+        const container = new LocalRuntime(tempDir);
+        expect(
+          await resolve(
+            { type: "devcontainer", configPath: "dc.json" },
+            { runtime: container, pinnable: false }
+          )
+        ).toEqual({ kind: "runtime", runtime: container, dir: hostArtifacts() });
       }
-      const devcontainer = { type: "devcontainer", configPath: "dc.json" } as const;
-      expect(await resolve(devcontainer, { runtime: new NoMountRuntime(tempDir) })).toEqual({
-        kind: "unavailable",
-        reason: DEVCONTAINER_SCRATCH_MOUNT_MISSING_REASON,
-      });
-      expect(probes).toBe(1);
+    );
 
-      // Once the container sees the mount, the positive result is kept: no probe per poll.
-      const seesHost = new LocalRuntime(tempDir);
-      expect(await resolve(devcontainer, { runtime: seesHost })).toEqual({
-        kind: "host",
-        dir: hostArtifacts(),
-        containerWritable: true,
-      });
-      expect(await resolve(devcontainer, { runtime: new NoMountRuntime(tempDir) })).toEqual({
-        kind: "host",
-        dir: hostArtifacts(),
-        containerWritable: true,
-      });
-      expect(probes).toBe(1);
-    });
+    onMountingHost(
+      "is unavailable in a devcontainer that does not see the scratch mount",
+      async () => {
+        let probes = 0;
+        class NoMountRuntime extends LocalRuntime {
+          override exec(_command: string, options: Parameters<LocalRuntime["exec"]>[1]) {
+            probes++;
+            return super.exec("exit 1", options);
+          }
+        }
+        const devcontainer = { type: "devcontainer", configPath: "dc.json" } as const;
+        expect(await resolve(devcontainer, { runtime: new NoMountRuntime(tempDir) })).toEqual({
+          kind: "unavailable",
+          reason: DEVCONTAINER_SCRATCH_MOUNT_MISSING_REASON,
+        });
+        expect(probes).toBe(1);
+
+        // Once the container sees the mount, the positive result is kept: no probe per poll.
+        const seesHost = new LocalRuntime(tempDir);
+        expect(await resolve(devcontainer, { runtime: seesHost })).toEqual({
+          kind: "host",
+          dir: hostArtifacts(),
+          containerWritable: true,
+        });
+        expect(await resolve(devcontainer, { runtime: new NoMountRuntime(tempDir) })).toEqual({
+          kind: "host",
+          dir: hostArtifacts(),
+          containerWritable: true,
+        });
+        expect(probes).toBe(1);
+      }
+    );
 
     test("reads SSH and Docker scratch dirs through the runtime, never the host", async () => {
       const remote = new FakeRemoteRuntime(tempDir, { mkdirSucceeds: true });

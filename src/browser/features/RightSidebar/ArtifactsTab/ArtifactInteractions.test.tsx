@@ -1,7 +1,7 @@
 // Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
 import "../../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
@@ -22,6 +22,7 @@ import type { ArtifactInteractionHandlers } from "./artifactInteractions";
 import { useArtifactInteractions, type ArtifactInteractionTarget } from "./useArtifactInteractions";
 import { CONFIRM_ARM_DELAY_MS } from "./confirmArming";
 import { ARTIFACT_BRIDGE_MAX_MESSAGES_PER_SECOND } from "./artifactBridge";
+import { ARTIFACT_CLICK_SEND_WINDOW_MS } from "@/common/constants/artifactInteractions";
 
 const HTML: ArtifactReadResult = {
   status: "ok",
@@ -52,6 +53,8 @@ let persistedState: unknown = { step: 1 };
 let stateGate: Promise<void> | null = null;
 /** When set, sendInteraction resolves only after this promise (send in flight). */
 let sendGate: Promise<void> | null = null;
+/** When set, sendInteraction fails with this error (after recording the attempt). */
+let sendFailure: string | null = null;
 
 function Wrapper(props: { children: ReactNode }) {
   const api: TestApiOverrides<APIClient> = {
@@ -101,10 +104,11 @@ function Wrapper(props: { children: ReactNode }) {
         version: number | null;
       }) => {
         sends.push(input);
-        return (sendGate ?? Promise.resolve()).then(() => ({
-          success: true as const,
-          data: { id: "i1" },
-        }));
+        return (sendGate ?? Promise.resolve()).then(() =>
+          sendFailure != null
+            ? { success: false as const, error: sendFailure }
+            : { success: true as const, data: { id: "i1" } }
+        );
       },
     },
   };
@@ -162,6 +166,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     persistedState = { step: 1 };
     stateGate = null;
     sendGate = null;
+    sendFailure = null;
   });
 
   afterEach(() => {
@@ -170,7 +175,7 @@ describe("artifact interactions in the Artifacts panel", () => {
     cleanupDom = null;
   });
 
-  test("xum.send only fills the confirm strip; the host Send click delivers it", async () => {
+  test("a send with no click only fills the confirm strip; the host Send click delivers it", async () => {
     const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
     const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
 
@@ -207,25 +212,104 @@ describe("artifact interactions in the Artifacts panel", () => {
     expect((await view.findByTestId("artifact-send-strip")).textContent).toContain("Third");
   });
 
-  test("a frame that navigates away is dropped and gets no bridge until Reload", async () => {
-    const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
-    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
-    const frameWindow = frame.contentWindow;
-    fireEvent.load(frame);
-    // The second load is a navigation (location.href, a clicked link).
-    fireEvent.load(frame);
-    expect(await view.findByText(/This artifact navigated away/)).toBeTruthy();
-    expect(view.queryByTestId("artifact-frame")).toBeNull();
-    // Whatever the old window posts now is ignored.
-    act(() => {
-      window.dispatchEvent(
-        messageEvent({ xumArtifact: 1, type: "send", text: "From the remote page" }, frameWindow)
-      );
+  /** The user's click in the frame: focus on the iframe and live activation, until restored. */
+  function stubUserActivation(isActive: () => boolean): () => void {
+    Object.defineProperty(window.navigator, "userActivation", {
+      configurable: true,
+      get: () => ({ isActive: isActive() }),
     });
-    expect(view.queryByTestId("artifact-send-strip")).toBeNull();
+    return () => Reflect.deleteProperty(window.navigator, "userActivation");
+  }
 
-    fireEvent.click(view.getByRole("button", { name: "Reload" }));
-    expect(await view.findByTestId("artifact-frame")).toBeTruthy();
+  test("a send during the user's click in the frame goes out at once, one per click", async () => {
+    let active = false;
+    const restore = stubUserActivation(() => active);
+    const nowSpy = spyOn(Date, "now");
+    try {
+      let now = 1_000_000;
+      nowSpy.mockImplementation(() => now);
+      const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+      const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+
+      // Neither half of the gesture alone sends: activation with focus elsewhere, then focus
+      // with no activation (focus stays in the frame long after the click).
+      active = true;
+      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "No focus" });
+      fireEvent.click(await view.findByRole("button", { name: "Dismiss" }));
+      active = false;
+      act(() => frame.focus());
+      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "No activation" });
+      fireEvent.click(await view.findByRole("button", { name: "Dismiss" }));
+      expect(sends).toEqual([]);
+
+      // The user's click: sent at once, with no strip.
+      active = true;
+      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Clicked", data: { n: 1 } });
+      await waitFor(() => expect(sends).toHaveLength(1));
+      expect(sends[0]).toMatchObject({ path: "form.html", text: "Clicked", data: { n: 1 } });
+      expect(view.queryByTestId("artifact-send-strip")).toBeNull();
+
+      // A second send in the same click's window (a script riding the activation) asks first.
+      now += ARTIFACT_CLICK_SEND_WINDOW_MS - 1;
+      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Riding" });
+      expect((await view.findByTestId("artifact-send-strip")).textContent).toContain("Riding");
+      expect(sends).toHaveLength(1);
+      fireEvent.click(view.getByRole("button", { name: "Dismiss" }));
+
+      // A later click sends at once again.
+      now += 1;
+      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Next click" });
+      await waitFor(() => expect(sends).toHaveLength(2));
+      expect(sends[1]).toMatchObject({ text: "Next click" });
+      expect(view.queryByTestId("artifact-send-strip")).toBeNull();
+    } finally {
+      nowSpy.mockRestore();
+      restore();
+    }
+  });
+
+  test("a failed clicked send shows the strip with its text and error, and Send retries", async () => {
+    const restore = stubUserActivation(() => true);
+    try {
+      sendFailure = "Workspace not found: ws-i";
+      const view = render(<ArtifactsPanel workspaceId="ws-i" />, { wrapper: Wrapper });
+      const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+      act(() => frame.focus());
+      postFromFrame(frame, { xumArtifact: 1, type: "send", text: "Answers" });
+      const strip = await view.findByTestId("artifact-send-strip");
+      await waitFor(() => expect(strip.textContent).toContain("Workspace not found: ws-i"));
+      expect(strip.textContent).toContain("Answers");
+      expect(sends).toHaveLength(1);
+
+      sendFailure = null;
+      const sendButton = view.getByRole("button", { name: "Send" }) as HTMLButtonElement;
+      await waitFor(() => expect(sendButton.disabled).toBe(false), {
+        timeout: CONFIRM_ARM_DELAY_MS + 1000,
+      });
+      fireEvent.pointerDown(sendButton);
+      fireEvent.click(sendButton);
+      await waitFor(() => expect(sends).toHaveLength(2));
+      expect(sends[1]).toMatchObject({ text: "Answers" });
+      await waitFor(() => expect(view.queryByTestId("artifact-send-strip")).toBeNull());
+    } finally {
+      restore();
+    }
+  });
+
+  test("clicked sends from the host (canvas buttons) each go out at once", async () => {
+    const view = render(
+      <InteractionsHarness target={{ path: HTML.path, version: 1, latestVersion: 1 }} />,
+      { wrapper: Wrapper }
+    );
+    act(() => hookHandlers?.requestSend("Ship A", undefined, "click"));
+    await waitFor(() => expect(sends).toHaveLength(1));
+    // Once the first one is delivered, the next click sends too: no per-click window here.
+    await waitFor(() => {
+      act(() => hookHandlers?.requestSend("Ship B", undefined, "click"));
+      expect(sends).toHaveLength(2);
+    });
+    expect(sends.map((send) => send.text)).toEqual(["Ship A", "Ship B"]);
+    expect(view.queryByTestId("artifact-send-strip")).toBeNull();
   });
 
   test("in browser mode (phones) the bridge works: send, setState and Annotate", async () => {
@@ -355,7 +439,7 @@ describe("artifact interactions in the Artifacts panel", () => {
   test("Send delivers the version shown when the artifact asked, not the one selected later", async () => {
     const target = (version: number) => ({ path: HTML.path, version, latestVersion: 2 });
     const view = render(<InteractionsHarness target={target(1)} />, { wrapper: Wrapper });
-    act(() => hookHandlers?.requestSend("Ship v1", undefined));
+    act(() => hookHandlers?.requestSend("Ship v1", undefined, "ask"));
     await view.findByTestId("artifact-send-strip");
     view.rerender(<InteractionsHarness target={target(2)} />);
     // Send arms after a short delay (confirmArming.ts).
@@ -371,7 +455,7 @@ describe("artifact interactions in the Artifacts panel", () => {
   test("a live view's send keeps the newest version from when the artifact asked", async () => {
     const live = (latestVersion: number) => ({ path: HTML.path, version: null, latestVersion });
     const view = render(<InteractionsHarness target={live(2)} />, { wrapper: Wrapper });
-    act(() => hookHandlers?.requestSend("Ship it", undefined));
+    act(() => hookHandlers?.requestSend("Ship it", undefined, "ask"));
     await view.findByTestId("artifact-send-strip");
     // A snapshot lands while the strip is open.
     view.rerender(<InteractionsHarness target={live(3)} />);
@@ -389,7 +473,7 @@ describe("artifact interactions in the Artifacts panel", () => {
       <InteractionsHarness target={{ path: HTML.path, version: 1, latestVersion: 1 }} />,
       { wrapper: Wrapper }
     );
-    act(() => hookHandlers?.requestSend("Held", undefined));
+    act(() => hookHandlers?.requestSend("Held", undefined, "ask"));
     const sendButton = (await view.findByRole("button", { name: "Send" })) as HTMLButtonElement;
     // A press held from before the strip armed does not confirm it on release.
     fireEvent.pointerDown(sendButton);

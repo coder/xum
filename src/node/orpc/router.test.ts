@@ -18,10 +18,14 @@ import type { AutoModelRoutingDecision } from "@/common/types/autoModelRouting";
 import { AutoModelRouterTag } from "@/node/services/di/tags";
 import type { AutoModelRouter, AutoModelRouterFailure } from "@/node/services/autoModelRouter";
 
+import type { WorkspaceMetadata } from "@/common/types/workspace";
 import type { ORPCContext } from "./context";
+import { orpcContextFromDoubles } from "./orpcContextDoubles.testHarness";
 import { inFlightProcedureCount } from "./inFlightProcedures";
 import { WorkspaceMutationInProgressError } from "@/node/services/workspaceUseLeases";
 import { router } from "./router";
+// The Node layer: the skill routes read through host runtimes.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 describe("config.previewAutoModelRouting", () => {
   const PREVIEW_TIERS = {
@@ -35,9 +39,9 @@ describe("config.previewAutoModelRouting", () => {
   function createPreviewClient(outcome: Result<AutoModelRoutingDecision, AutoModelRouterFailure>) {
     const classifyEffect = mock((_input: unknown) => Effect.succeed(outcome));
     const recordHeadlessUsage = mock((..._args: unknown[]) => Promise.resolve(undefined));
-    const context = {
+    const context = orpcContextFromDoubles({
       config: {
-        loadConfigOrDefault: () => ({}),
+        loadConfigOrDefault: () => ({ projects: new Map() }),
         // Only ws-live is registered; a stale persisted selection resolves to nothing.
         findWorkspace: (workspaceId: string) =>
           workspaceId === "ws-live" ? { workspacePath: "/repo/ws", projectPath: "/repo" } : null,
@@ -47,7 +51,7 @@ describe("config.previewAutoModelRouting", () => {
       "effect/context": Context.make(AutoModelRouterTag, {
         classifyEffect,
       } as unknown as AutoModelRouter),
-    } as unknown as ORPCContext;
+    });
     return {
       client: createRouterClient(router(), { context }),
       classifyEffect,
@@ -149,9 +153,9 @@ describe("config.previewAutoModelRouting", () => {
 describe("router drafts.update", () => {
   test("the size refusal reaches the client with its message, so it is not retried", async () => {
     const message = draftTooLargeMessage(41 * 1024 * 1024);
-    const context = {
+    const context = orpcContextFromDoubles({
       draftService: { update: mock(() => Promise.reject(new Error(message))) },
-    } as unknown as ORPCContext;
+    });
     const client = createRouterClient(router(), { context });
 
     let refused: unknown;
@@ -167,11 +171,11 @@ describe("router drafts.update", () => {
 describe("router terminal.create", () => {
   test("a structural mutation's refusal reaches the client with its message (#4476)", async () => {
     const message = "Workspace ws-1 is being renamed, removed or archived by pid 42";
-    const context = {
+    const context = orpcContextFromDoubles({
       terminalService: {
         create: mock(() => Promise.reject(new WorkspaceMutationInProgressError(message))),
       },
-    } as unknown as ORPCContext;
+    });
     const client = createRouterClient(router(), { context });
 
     let refused: unknown;
@@ -228,33 +232,34 @@ describe("router agent skill routes", () => {
         "dir"
       );
 
-      const context = {
+      const context = orpcContextFromDoubles({
         config: new Config(tempDir),
         initStateManager: { waitForInit: mock(async () => undefined) },
         aiService: {
+          runtimeFactory: nodeRuntimeFactory,
           resolveXumToolScopeForWorkspace: mock(() => ({
-            type: "project",
+            type: "project" as const,
             xumHome: tempDir,
             projectRoot: subProjectPath,
-            projectStorageAuthority: "host-local",
+            projectStorageAuthority: "host-local" as const,
             checkoutRoot,
           })),
           getWorkspaceMetadata: mock(async () => ({
-            success: true,
+            success: true as const,
             data: {
               id: "workspace-1",
               name: "workspace-1",
+              projectName: "repo",
               projectPath: checkoutRoot,
-              namedWorkspacePath: checkoutRoot,
               subProjectPath,
               runtimeConfig: { type: "local", srcBaseDir: tempDir },
-            },
+            } satisfies WorkspaceMetadata,
           })),
         },
         experimentsService: {
           isExperimentEnabled: mock(() => false),
         },
-      } as unknown as ORPCContext;
+      });
       const client = createRouterClient(router(), { context });
 
       const { skills } = await client.agentSkills.list({ workspaceId: "workspace-1" });
@@ -296,36 +301,37 @@ describe("router agent skill routes", () => {
         "---\nname: parent-only\ndescription: Parent skill\n---\nHost parent body\n"
       );
 
-      const context = {
+      const context = orpcContextFromDoubles({
         config: new Config(tempDir),
         initStateManager: { waitForInit: mock(async () => undefined) },
         aiService: {
+          runtimeFactory: nodeRuntimeFactory,
           resolveXumToolScopeForWorkspace: mock(() => ({
-            type: "project",
+            type: "project" as const,
             xumHome: tempDir,
             projectRoot: subProjectPath,
-            projectStorageAuthority: "host-local",
+            projectStorageAuthority: "host-local" as const,
             checkoutRoot,
           })),
           getWorkspaceMetadata: mock(async () => ({
-            success: true,
+            success: true as const,
             data: {
               id: "workspace-1",
               name: "workspace-1",
+              projectName: "repo",
               projectPath: checkoutRoot,
-              namedWorkspacePath: checkoutRoot,
               subProjectPath,
               runtimeConfig: {
                 type: "devcontainer",
                 configPath: ".devcontainer/devcontainer.json",
               },
-            },
+            } satisfies WorkspaceMetadata,
           })),
         },
         experimentsService: {
           isExperimentEnabled: mock(() => false),
         },
-      } as unknown as ORPCContext;
+      });
       const client = createRouterClient(router(), { context });
 
       await expect(
@@ -367,12 +373,13 @@ describe("router agent skill routes", () => {
         });
         return current;
       });
-      const context = {
+      const context = orpcContextFromDoubles({
         config,
+        aiService: { runtimeFactory: nodeRuntimeFactory },
         experimentsService: {
           isExperimentEnabled: mock(() => false),
         },
-      } as unknown as ORPCContext;
+      });
       const client = createRouterClient(router(), { context });
 
       await expect(
@@ -407,7 +414,7 @@ describe("router config transcript mutation", () => {
     const telemetryService = {
       setFeatureFlagVariant: () => undefined,
     } as unknown as TelemetryService;
-    return {
+    return orpcContextFromDoubles({
       config,
       experimentsService: new ExperimentsService({ telemetryService, xumHome: tempDir }),
       taskService: { maybeStartQueuedTasks: () => Promise.resolve() },
@@ -417,7 +424,7 @@ describe("router config transcript mutation", () => {
         setEnabled: () => undefined,
       },
       perfCaptures: { setEnabled: () => undefined },
-    } as unknown as ORPCContext;
+    });
   }
 
   test("experiments.set signals onConfigChanged and the next getConfig carries the value", async () => {
@@ -599,10 +606,10 @@ describe("router config transcript mutation", () => {
 
   test("refuses procedure calls once the server has begun shutting down", async () => {
     let shuttingDown = false;
-    const context = {
+    const context = orpcContextFromDoubles({
       config,
       serverService: { isShuttingDown: () => shuttingDown },
-    } as unknown as ORPCContext;
+    });
     const client = createRouterClient(router(), { context });
     expect(await client.general.ping("alive")).toBe("Pong: alive");
 
@@ -622,14 +629,14 @@ describe("router config transcript mutation", () => {
     const writeStarted = new Promise<void>((resolve) => (started = resolve));
     let finish!: () => void;
     const write = new Promise<void>((resolve) => (finish = resolve));
-    const context = {
+    const context = orpcContextFromDoubles({
       config: {
         markSplashScreenViewed: () => {
           started();
           return write;
         },
       },
-    } as unknown as ORPCContext;
+    });
     const client = createRouterClient(router(), { context });
     const controller = new AbortController();
     const call = client.splashScreens

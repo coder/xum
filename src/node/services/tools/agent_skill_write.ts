@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import * as fsPromises from "fs/promises";
 import * as path from "path";
 import { tool } from "ai";
 
@@ -11,6 +10,7 @@ import { FILE_EDIT_DIFF_OMITTED_MESSAGE } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import { appendRefinementEventFromTool } from "@/node/services/refinement/refinementJournal";
@@ -33,6 +33,7 @@ import {
   migrateLegacyProjectSkill,
   resolveSkillFilePathForRuntime,
 } from "./runtimeSkillPathUtils";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 interface AgentSkillWriteToolArgs {
   name: string;
@@ -254,6 +255,7 @@ function makeAgentSkillWriteTool(
         const relativeFilePath = filePath ?? SKILL_FILENAME;
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
+          runtimeFactory: toolRuntimeFactory(config),
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
         });
@@ -274,7 +276,8 @@ function makeAgentSkillWriteTool(
             await withTargetMutationLock(
               config.xumScope.xumHome,
               path.resolve(projectSkillDirs[0], ".."),
-              () => migrateLegacyProjectSkill(skillCtx, parsedName.data)
+              () => migrateLegacyProjectSkill(skillCtx, parsedName.data),
+              config.sessionLocks
             );
           }
         }
@@ -459,7 +462,7 @@ function makeAgentSkillWriteTool(
         try {
           if (xumScope.type !== "project") {
             // Self-heal a deleted mux home before realpath-based containment validation runs.
-            await fsPromises.mkdir(containmentRoot, { recursive: true });
+            await nodeHostFiles.promises.mkdir(containmentRoot, { recursive: true });
           }
 
           await validateLocalSkillDirectory(containmentRoot, skillDir);
@@ -513,7 +516,7 @@ function makeAgentSkillWriteTool(
             let originalContent = "";
             let fileExisted = false;
             try {
-              const existingStat = await fsPromises.lstat(resolvedTarget.resolvedPath);
+              const existingStat = await nodeHostFiles.promises.lstat(resolvedTarget.resolvedPath);
               if (existingStat.isSymbolicLink()) {
                 return {
                   success: false,
@@ -528,7 +531,10 @@ function makeAgentSkillWriteTool(
                 };
               }
 
-              originalContent = await fsPromises.readFile(resolvedTarget.resolvedPath, "utf-8");
+              originalContent = await nodeHostFiles.promises.readFile(
+                resolvedTarget.resolvedPath,
+                "utf-8"
+              );
               fileExisted = true;
             } catch (error) {
               if (!hasErrorCode(error, "ENOENT")) {
@@ -553,8 +559,14 @@ function makeAgentSkillWriteTool(
               }
             }
 
-            await fsPromises.mkdir(path.dirname(resolvedTarget.resolvedPath), { recursive: true });
-            await fsPromises.writeFile(resolvedTarget.resolvedPath, contentToWrite, "utf-8");
+            await nodeHostFiles.promises.mkdir(path.dirname(resolvedTarget.resolvedPath), {
+              recursive: true,
+            });
+            await nodeHostFiles.promises.writeFile(
+              resolvedTarget.resolvedPath,
+              contentToWrite,
+              "utf-8"
+            );
 
             // Refinement journal (RLM r2): row is appended before the write is
             // acknowledged; failures never fail the tool (self-healing). An
@@ -582,7 +594,8 @@ function makeAgentSkillWriteTool(
               });
             }
             return { ok: true, originalContent };
-          }
+          },
+          config.sessionLocks
         );
         if ("success" in outcome) {
           return outcome;

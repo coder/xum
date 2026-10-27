@@ -30,10 +30,7 @@ import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { SUMMARIZER_INPUT_FRACTION } from "@/constants/continuousCompaction";
 import type { Config } from "@/node/config";
-import {
-  createRuntimeContextForWorkspace,
-  resolveWorkspaceRootPath,
-} from "@/node/runtime/runtimeHelpers";
+import { resolveWorkspaceRootPath } from "@/node/runtime/runtimeHelpers";
 import type { AgentSessionAIService } from "./agentSession";
 import { resolveAgentForStream } from "./agentResolution";
 import {
@@ -88,7 +85,8 @@ export async function summarizeContinuousCompaction(args: {
   const metadata = await args.aiService.getWorkspaceMetadata(args.workspaceId);
   if (!metadata.success) throw new Error(metadata.error);
   args.signal.throwIfAborted();
-  const { runtime, workspacePath } = createRuntimeContextForWorkspace(metadata.data);
+  const runtimeFactory = args.aiService.runtimeFactory;
+  const { runtime, workspacePath } = runtimeFactory.createRuntimeContextForWorkspace(metadata.data);
   const pluginContext = resolveAgentPluginsMcpContext(
     metadata.data,
     resolveWorkspaceRootPath(metadata.data, runtime)
@@ -109,6 +107,7 @@ export async function summarizeContinuousCompaction(args: {
     metadata: metadata.data,
     runtime,
     workspacePath,
+    runtimeFactory,
     requestedAgentId: "compact",
     disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
     callerToolPolicy: [{ regex_match: ".*", action: "disable" }],
@@ -122,6 +121,8 @@ export async function summarizeContinuousCompaction(args: {
     agent.data.agentDefinition.id,
     {
       skipScopesAbove: getSkipScopesAboveForKnownScope(agent.data.agentDefinition.scope),
+      projectPluginsTrusted: agent.data.projectPluginsTrusted,
+      runtimeFactory,
     }
   );
   args.signal.throwIfAborted();

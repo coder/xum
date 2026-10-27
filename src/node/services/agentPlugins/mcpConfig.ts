@@ -32,6 +32,7 @@ import {
 import { serverConsentFingerprint } from "./componentConsent";
 import { expandPluginPlaceholders, type PluginPlaceholderValues } from "./expansion";
 import {
+  envNameKey,
   isReservedPluginEnvName,
   PLUGIN_MCP_CONFIG_PARSE_ERROR,
   readOpenAIMcpAuth,
@@ -292,10 +293,24 @@ interface NormalizeContext {
   vars: PluginPlaceholderValues;
 }
 
+/**
+ * The variables Xum supplies to a plugin server's environment: the placeholder names of its
+ * dialect (PLUGIN_ROOT and PLUGIN_DATA, plus the two Claude names for a Claude `.mcp.json`,
+ * because Claude Code exports them and Claude servers read them).
+ */
+function suppliedPluginEnv(vars: PluginPlaceholderValues): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(vars).filter((entry): entry is [string, string] => entry[1] !== undefined)
+  );
+}
+
 /** The first problem of a stdio entry's `env` object, or undefined when it is valid. */
-function stdioEnvError(env: Record<string, unknown>): string | undefined {
+function stdioEnvError(
+  env: Record<string, unknown>,
+  supplied: Record<string, string>
+): string | undefined {
   for (const [key, value] of Object.entries(env)) {
-    if (isReservedPluginEnvName(key)) {
+    if (isReservedPluginEnvName(key) || Object.hasOwn(supplied, envNameKey(key))) {
       // §9.2: reserved names in `env` make the entry invalid; the client
       // supplies these variables itself.
       return `'env' must not contain reserved variable '${key}'`;
@@ -315,6 +330,47 @@ function stdioEnvError(env: Record<string, unknown>): string | undefined {
     }
   }
   return undefined;
+}
+
+const CLAUDE_ROOT_COMMAND_PREFIX = "${CLAUDE_PLUGIN_ROOT}/";
+
+/**
+ * A Claude-dialect stdio entry in Xum's spelling:
+ * - A command of exactly `${CLAUDE_PLUGIN_ROOT}/<path>` becomes `./<path>`, so it goes through
+ *   the same `./` checks (containment, a file, executable). Every other form, including a quoted
+ *   or absolute one, stays unchanged and classifyCommandToken refuses it.
+ * - A cwd anchored at `${CLAUDE_PLUGIN_ROOT}` or `${CLAUDE_PLUGIN_DATA}` is anchored at the
+ *   matching Xum name, so the cwd form and containment checks apply unchanged.
+ * Args and env values expand the Claude names through the placeholder values instead.
+ */
+function claudeStdioEntry(entry: Record<string, unknown>): Record<string, unknown> {
+  const { command, cwd } = entry;
+  const rewritten = { ...entry };
+  if (
+    typeof command === "string" &&
+    command.startsWith(CLAUDE_ROOT_COMMAND_PREFIX) &&
+    command.length > CLAUDE_ROOT_COMMAND_PREFIX.length
+  ) {
+    rewritten.command = `./${command.slice(CLAUDE_ROOT_COMMAND_PREFIX.length)}`;
+  }
+  if (typeof cwd === "string") {
+    rewritten.cwd = cwd.replace(
+      /^\$\{CLAUDE_(PLUGIN_(?:ROOT|DATA))\}(?=\/|$)/,
+      (_match, name: string) => `\${${name}}`
+    );
+  }
+  return rewritten;
+}
+
+/** Placeholder values for a plugin's MCP file: the Claude names expand only in its dialect. */
+function pluginPlaceholderValues(
+  plugin: AgentPluginInfo,
+  dataPath: string
+): PluginPlaceholderValues {
+  const vars = { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath };
+  return plugin.mcpConfigDialect === "claude"
+    ? { ...vars, CLAUDE_PLUGIN_ROOT: plugin.rootPath, CLAUDE_PLUGIN_DATA: dataPath }
+    : vars;
 }
 
 /** Validate + normalize one stdio entry; returns null (with error) when invalid. */
@@ -354,7 +410,8 @@ async function normalizeStdioEntry(
     return { error: "'env' must be an object of strings" };
   }
   const env = entry.env ?? {};
-  const envError = stdioEnvError(env);
+  const supplied = suppliedPluginEnv(ctx.vars);
+  const envError = stdioEnvError(env, supplied);
   if (envError !== undefined) return { error: envError };
 
   if (entry.cwd !== undefined && typeof entry.cwd !== "string") {
@@ -472,11 +529,7 @@ async function normalizeStdioEntry(
       args: expandedArgs,
       // §9.1 overlay order: configured env first, reserved variables last so
       // they can never be shadowed.
-      env: {
-        ...expandedEnv,
-        PLUGIN_ROOT: rootPath,
-        PLUGIN_DATA: ctx.dataPath,
-      },
+      env: { ...expandedEnv, ...supplied },
       cwd: resolvedCwd,
       disabled: true,
       plugin: {
@@ -589,7 +642,10 @@ async function normalizeServerEntry(
     return normalizeRemoteEntry(entry, ctx);
   if (entry.type !== "stdio")
     return { error: `unknown server 'type' ${JSON.stringify(entry.type)}` };
-  const result = await normalizeStdioEntry(entry, ctx);
+  const result = await normalizeStdioEntry(
+    ctx.plugin.mcpConfigDialect === "claude" ? claudeStdioEntry(entry) : entry,
+    ctx
+  );
   if ("info" in result && translated.forwardEnv !== undefined)
     result.info.forwardEnv = translated.forwardEnv;
   return result;
@@ -680,8 +736,10 @@ export async function loadPluginMcpServers(
   // Codex packages ship `.mcp.json` in their own dialect (no `$schema`,
   // `type: "http"`, `oauth`/`scopes`/`oauth_resource`). Discovery marks it
   // from the lexical selection (a contained symlink keeps the dialect); a
-  // root mcp.json stays strict.
-  const codexDialect = plugin.mcpConfigDialect === "codex";
+  // root mcp.json stays strict. A Claude `.mcp.json` has the Codex shape, plus
+  // the Claude names for the two plugin variables (normalizeStdioEntry).
+  // Both dialects ("codex" and "claude") have the Codex shape.
+  const codexDialect = plugin.mcpConfigDialect !== undefined;
   // Codex also accepts a flat `{ "<server>": {...} }` map without `mcpServers`.
   const doc: Record<string, unknown> =
     codexDialect && !("mcpServers" in raw)
@@ -717,7 +775,7 @@ export async function loadPluginMcpServers(
   const normalizeCtx: NormalizeContext = {
     plugin,
     dataPath,
-    vars: { PLUGIN_ROOT: plugin.rootPath, PLUGIN_DATA: dataPath },
+    vars: pluginPlaceholderValues(plugin, dataPath),
   };
 
   for (const [serverName, rawEntryValue] of Object.entries(doc.mcpServers)) {
@@ -745,6 +803,19 @@ export async function loadPluginMcpServers(
       continue;
     }
     const { rawEntry } = shape;
+    // Claude Code skips a remote entry without `type` as a configuration error, so Xum does not
+    // infer a transport for it as the Codex dialect does.
+    if (
+      plugin.mcpConfigDialect === "claude" &&
+      rawEntry.type === undefined &&
+      rawEntry.url !== undefined
+    ) {
+      reportEntry(
+        "warning",
+        "a 'url' entry needs a 'type' ('http' or 'sse') in a Claude .mcp.json"
+      );
+      continue;
+    }
     const codex = codexDialect
       ? translateCodexMcpEntry(rawEntry)
       : { entry: rawEntry, ignored: [], warnings: [], hasClientSecret: false };

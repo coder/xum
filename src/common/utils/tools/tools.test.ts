@@ -23,6 +23,7 @@ import {
   type ToolConfiguration,
   type WorkspaceHeartbeatToolService,
 } from "./tools";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 const DESKTOP_TOOL_NAMES = [
   "desktop_screenshot",
   "desktop_move_mouse",
@@ -141,6 +142,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime: new LocalRuntime(process.cwd()),
         runtimeTempDir: "/tmp",
@@ -162,6 +164,7 @@ describe("getToolsForModel", () => {
     const toolsWithoutReport = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -175,6 +178,7 @@ describe("getToolsForModel", () => {
     const toolsWithReport = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -195,6 +199,7 @@ describe("getToolsForModel", () => {
     const toolsWithout = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -209,6 +214,7 @@ describe("getToolsForModel", () => {
     const toolsWith = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -229,6 +235,7 @@ describe("getToolsForModel", () => {
     const toolsWithoutHeartbeat = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -251,6 +258,7 @@ describe("getToolsForModel", () => {
     const toolsWithHeartbeat = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -263,6 +271,7 @@ describe("getToolsForModel", () => {
     const childToolsWithHeartbeat = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -297,6 +306,7 @@ describe("getToolsForModel", () => {
       const tools = await getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime,
           runtimeTempDir: "/tmp",
@@ -322,7 +332,13 @@ describe("getToolsForModel", () => {
 
     const withoutGoalService = await getToolsForModel(
       "noop:model",
-      { cwd: process.cwd(), runtime, runtimeTempDir: "/tmp", workspaceId: "ws-1" },
+      {
+        sessionLocks: nodeSessionLocks,
+        cwd: process.cwd(),
+        runtime,
+        runtimeTempDir: "/tmp",
+        workspaceId: "ws-1",
+      },
       "ws-1",
       initStateManager
     );
@@ -338,6 +354,7 @@ describe("getToolsForModel", () => {
       getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime,
           runtimeTempDir: "/tmp",
@@ -384,6 +401,7 @@ describe("getToolsForModel", () => {
     const topLevelTools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -399,6 +417,7 @@ describe("getToolsForModel", () => {
     const subAgentTools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -411,6 +430,31 @@ describe("getToolsForModel", () => {
     expect(subAgentTools.review_pane_get).toBeUndefined();
   });
 
+  test("withholds repository tools from scratch chats", async () => {
+    const runtime = new LocalRuntime(process.cwd());
+    const build = (scratchWorkspace: boolean) =>
+      getToolsForModel(
+        "noop:model",
+        {
+          sessionLocks: nodeSessionLocks,
+          cwd: process.cwd(),
+          runtime,
+          runtimeTempDir: "/tmp",
+          scratchWorkspace,
+        },
+        "ws-1",
+        createInitStateManager()
+      );
+    const repositoryTools = ["review_pane_update", "review_pane_get", "task_apply_git_patch"];
+
+    const project = Object.keys(await build(false));
+    const scratch = Object.keys(await build(true));
+
+    expect(repositoryTools.filter((name) => !project.includes(name))).toEqual([]);
+    expect(scratch.filter((name) => repositoryTools.includes(name))).toEqual([]);
+    expect(scratch).toContain("task");
+  });
+
   test("only includes workflow tools when the workflow service is available", async () => {
     const runtime = new LocalRuntime(process.cwd());
     const initStateManager = createInitStateManager();
@@ -418,6 +462,7 @@ describe("getToolsForModel", () => {
     const withoutService = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -432,6 +477,7 @@ describe("getToolsForModel", () => {
     const withService = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -463,6 +509,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -489,6 +536,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -510,6 +558,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -532,6 +581,7 @@ describe("getToolsForModel", () => {
       getToolsForModel(
         "noop:model",
         {
+          sessionLocks: nodeSessionLocks,
           cwd: process.cwd(),
           runtime,
           runtimeTempDir: "/tmp",
@@ -577,6 +627,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       `${provider}:${modelId}`,
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime: new LocalRuntime(process.cwd()),
         runtimeTempDir: "/tmp",
@@ -640,6 +691,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -678,6 +730,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -705,6 +758,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -728,6 +782,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5-latest",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -748,6 +803,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:team-grok",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -769,6 +825,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -813,6 +870,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -846,6 +904,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -893,6 +952,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "xai:grok-4.5",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -914,6 +974,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime,
         runtimeTempDir: "/tmp",
@@ -944,6 +1005,7 @@ describe("getToolsForModel", () => {
     const tools = await getToolsForModel(
       "noop:model",
       {
+        sessionLocks: nodeSessionLocks,
         cwd: process.cwd(),
         runtime: new LocalRuntime(process.cwd()),
         runtimeTempDir: "/tmp",
@@ -985,6 +1047,7 @@ describe("getToolsForModel", () => {
       getToolsForModel(
         model,
         {
+          sessionLocks: nodeSessionLocks,
           cwd: dir,
           runtime: new LocalRuntime(dir),
           runtimeTempDir: dir,
@@ -1040,6 +1103,7 @@ describe("getToolsForModel", () => {
         const tools = await getToolsForModel(
           "anthropic:claude-opus-4-6",
           {
+            sessionLocks: nodeSessionLocks,
             cwd: dir,
             runtime: new LocalRuntime(dir),
             runtimeTempDir: dir,

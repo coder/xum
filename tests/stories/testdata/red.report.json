@@ -1,0 +1,964 @@
+{
+ "schemaVersion": "report-1",
+ "run": {
+  "id": "01a15fcd-1081-779a-9cad-8e1666c23eb9",
+  "specVersion": "0.1",
+  "runner": {
+   "name": "e2e",
+   "version": "0.20.0"
+  },
+  "status": "failed",
+  "exitCode": 1,
+  "startedAt": "2026-10-21T18:50:37.580Z",
+  "finishedAt": "2026-10-21T18:53:38.170Z",
+  "project": {
+   "id": "xum-bugbash",
+   "configDigest": "b36226003a436a66c9eadab030ce89a22df8e141cb5b5f010c7bba31024435ef"
+  },
+  "environment": {
+   "ci": false,
+   "trustNoticeShown": false,
+   "os": "linux 6.8.0-139-generic",
+   "arch": "x64",
+   "runtime": "node v22.23.3"
+  },
+  "targets": [
+   {
+    "id": "web",
+    "index": 0,
+    "platform": "web",
+    "baseOrigin": "http://127.0.0.1:46841",
+    "environment": "test",
+    "engine": {
+     "name": "web",
+     "version": "0.14.0",
+     "spiVersion": 1
+    },
+    "capabilities": [
+     "actions",
+     "artifacts",
+     "browser",
+     "keyboard",
+     "location",
+     "observation",
+     "pointer",
+     "state"
+    ],
+    "artifactCapabilities": [
+     "screenshot",
+     "video"
+    ],
+    "stateCapability": true
+   }
+  ],
+  "serialGroups": [],
+  "results": [
+   {
+    "id": "9b1a040b91add8e73e8c1b51942b939b34daeec3591fbc2ef5366934f11030f2",
+    "testId": "chatRestart.e2e.ts::a%20chat%20survives%20a%20restart%20of%20the%20server",
+    "kind": "test",
+    "declarationIndex": 0,
+    "titlePath": [
+     "a chat survives a restart of the server"
+    ],
+    "file": "chatRestart.e2e.ts",
+    "source": {
+     "file": "chatRestart.e2e.ts",
+     "line": 17,
+     "column": 1
+    },
+    "targetId": "web",
+    "platform": "web",
+    "agent": "default",
+    "repeat": 0,
+    "tags": [
+     "story"
+    ],
+    "selected": true,
+    "status": "passed",
+    "attempts": [
+     {
+      "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a",
+      "index": 0,
+      "status": "passed",
+      "startedAt": "2026-10-21T18:50:43.123Z",
+      "durationMs": 11702,
+      "artifacts": [
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:artifact:0",
+        "kind": "screenshot",
+        "mediaType": "image/png",
+        "redaction": "complete",
+        "producer": {
+         "kind": "step",
+         "stepId": "01a15fcd-2832-7f15-ab1b-324f74fd503a:13"
+        },
+        "path": "chatrestart-a-chat-survives-a-restart-of-the-9b1a040b91add8e7/attempt-1/screenshots/001-assert.png",
+        "size": 60485,
+        "sha256": "d966ee972a8fad1f377768f4627fb91609d6626fc9f7a3f26c2ff16d04bda2e6"
+       }
+      ],
+      "secondaryErrors": [],
+      "cleanup": "complete",
+      "environment": {
+       "browser": "chromium 153.0.8010.12",
+       "user agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.8010.12 Safari/537.36"
+      },
+      "steps": [
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:0",
+        "index": 0,
+        "kind": "app",
+        "api": "app.open",
+        "label": "/",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:43.393Z",
+        "durationMs": 88,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:46841/",
+         "nodes": 4,
+         "changes": []
+        },
+        "source": {
+         "file": "chatRestart.e2e.ts",
+         "line": 25,
+         "column": 15
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:1",
+        "index": 1,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByRole(\"navigation\", name: \"Projects\") >> getByText(\"demo-app\").first()",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:43.482Z",
+        "durationMs": 212,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "helpers.ts",
+         "line": 15,
+         "column": 5
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:2",
+        "index": 2,
+        "kind": "locator",
+        "api": "locator.tap",
+        "label": "getByRole(\"button\", name: \"Expand project demo-app\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:43.760Z",
+        "durationMs": 172,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:46841/project?project=demo-app-596d07fd",
+         "nodes": 73,
+         "since": 0,
+         "changes": [
+          "changed document \"xum\" (was: document \"xum - coding agent multiplexer\")",
+          "added testid=\"left-sidebar-toggle-bar\"",
+          "added button \"Collapse sidebar\"",
+          "added testid=\"left-sidebar\"",
+          "added button \"Open about dialog\"",
+          "added text=\"v0.31.1-nightly.762-18-g17e1de98e1-dirty\"",
+          "added button \"Open analytics\" testid=\"analytics-button\"",
+          "added button \"Open settings\" testid=\"settings-button\"",
+          "added navigation \"Projects\"",
+          "added button \"Home\"",
+          "added button \"Add project\"",
+          "added text=\"+\""
+         ],
+         "more": 62
+        },
+        "source": {
+         "file": "helpers.ts",
+         "line": 23,
+         "column": 46
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:3",
+        "index": 3,
+        "kind": "locator",
+        "api": "locator.tap",
+        "label": "getByRole(\"navigation\", name: \"Projects\") >> getByText(\"Bug bash playground\").first()",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:43.933Z",
+        "durationMs": 112,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:46841/workspace/66d778ac39",
+         "nodes": 32,
+         "since": 2,
+         "changes": [
+          "changed document \"Bug bash playground - demo-app - xum\" (was: document \"xum\")",
+          "added status \"Opening page...\"",
+          "added text=\"Opening page...\"",
+          "removed box",
+          "removed combobox \"Select project\" testid=\"project-selector\"",
+          "removed text=\"demo-app\"",
+          "removed text=\"/\"",
+          "removed textbox \"Workspace name\"",
+          "removed button \"Disable auto-naming\"",
+          "removed text=\"This workspace will use\"",
+          "removed text=\"Workspace Type\"",
+          "removed group \"Runtime type\""
+         ],
+         "more": 34
+        },
+        "source": {
+         "file": "helpers.ts",
+         "line": 24,
+         "column": 87
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:4",
+        "index": 4,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByRole(\"button\", name: \"Notifications\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:44.047Z",
+        "durationMs": 133,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "helpers.ts",
+         "line": 26,
+         "column": 61
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:5",
+        "index": 5,
+        "kind": "agent",
+        "api": "agent.act",
+        "label": "send the chat message 'remember this' and wait for the reply",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:44.180Z",
+        "durationMs": 5899,
+        "events": [],
+        "agent": "default",
+        "artifacts": [],
+        "metrics": {
+         "modelCalls": 3,
+         "actionSteps": 2,
+         "observationBytes": 3945,
+         "contextBytes": 572,
+         "ledgerBytes": 394
+        },
+        "model": {
+         "provider": "anthropic.messages",
+         "model": "claude-haiku-5-5",
+         "endpoint": "provider-default",
+         "adapterVersion": "executor/e2e-default-agent@2",
+         "policyVersion": "e2e-default-agent/2",
+         "calls": 3,
+         "tokenAccounting": "provider",
+         "inputTokens": 29577,
+         "outputTokens": 225,
+         "peakTokensPerCall": 10514,
+         "cacheReadTokens": 26573,
+         "cacheWriteTokens": 2966
+        },
+        "cache": {
+         "mode": "missed",
+         "reason": "no-entry",
+         "replayedActions": 0,
+         "totalActions": 0,
+         "entry": "0394a00e27e0c46c881e89e2e96e7a762ced1dc669352eac8c69cd292cf36df0",
+         "write": "saved"
+        },
+        "observationRevision": "b14",
+        "explanation": "Typed 'remember this' into the chat composer and sent it. The transcript now shows my message 'remember this' and the reply 'Mock response: remember this'. The composer is cleared and Send is disabled again.",
+        "turns": [],
+        "screen": {
+         "location": "http://127.0.0.1:46841/workspace/66d778ac39",
+         "nodes": 112,
+         "since": 3,
+         "changes": [
+          "added testid=\"workspace-menu-bar\"",
+          "added text=\"Bug bash playground\" testid=\"workspace-title\"",
+          "added button \"Workspace details\"",
+          "added button \"Notifications\" testid=\"notify-on-response-button\"",
+          "added button \"0 of 9 skills loaded\"",
+          "added text=\"0\"",
+          "added button \"Open in editor\"",
+          "added button \"New terminal\"",
+          "added button \"Workspace actions\" testid=\"workspace-more-actions\"",
+          "added testid=\"message-window\"",
+          "added log \"Conversation transcript\"",
+          "added testid=\"chat-message\""
+         ],
+         "more": 72
+        },
+        "source": {
+         "file": "chatRestart.e2e.ts",
+         "line": 30,
+         "column": 17
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:6",
+        "index": 6,
+        "kind": "assertion",
+        "api": "expect.toContainText",
+        "label": "locator(\"[role=\\\"log\\\"][aria-label=\\\"Conversation transcript\\\"]\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:50.080Z",
+        "durationMs": 12,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "chatRestart.e2e.ts",
+         "line": 31,
+         "column": 30
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:7",
+        "index": 7,
+        "kind": "app",
+        "api": "app.open",
+        "label": "/",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:52.354Z",
+        "durationMs": 158,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:46841/",
+         "nodes": 4,
+         "since": 5,
+         "changes": [
+          "changed document \"xum - coding agent multiplexer\" (was: document \"Bug bash playground - demo-app - xum\")",
+          "added status \"Loading preferences\"",
+          "added text=\"Loading preferences\"",
+          "removed testid=\"left-sidebar-toggle-bar\"",
+          "removed button \"Collapse sidebar\"",
+          "removed testid=\"left-sidebar\"",
+          "removed button \"Open about dialog\"",
+          "removed text=\"v0.31.1-nightly.762-18-g17e1de98e1-dirty\"",
+          "removed button \"Open analytics\" testid=\"analytics-button\"",
+          "removed button \"Open settings\" testid=\"settings-button\"",
+          "removed navigation \"Projects\"",
+          "removed button \"Home\""
+         ],
+         "more": 101
+        },
+        "source": {
+         "file": "chatRestart.e2e.ts",
+         "line": 34,
+         "column": 15
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:8",
+        "index": 8,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByRole(\"navigation\", name: \"Projects\") >> getByText(\"demo-app\").first()",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:52.512Z",
+        "durationMs": 146,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "helpers.ts",
+         "line": 15,
+         "column": 5
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:9",
+        "index": 9,
+        "kind": "locator",
+        "api": "locator.tap",
+        "label": "getByRole(\"navigation\", name: \"Projects\") >> getByText(\"Bug bash playground\").first()",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:52.665Z",
+        "durationMs": 191,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:46841/workspace/66d778ac39",
+         "nodes": 32,
+         "since": 7,
+         "changes": [
+          "changed document \"Bug bash playground - demo-app - xum\" (was: document \"xum - coding agent multiplexer\")",
+          "added testid=\"left-sidebar-toggle-bar\"",
+          "added button \"Collapse sidebar\"",
+          "added testid=\"left-sidebar\"",
+          "added button \"Open about dialog\"",
+          "added text=\"v0.31.1-nightly.762-18-g17e1de98e1-dirty\"",
+          "added button \"Open analytics\" testid=\"analytics-button\"",
+          "added button \"Open settings\" testid=\"settings-button\"",
+          "added navigation \"Projects\"",
+          "added button \"Home\"",
+          "added button \"Add project\"",
+          "added text=\"+\""
+         ],
+         "more": 21
+        },
+        "source": {
+         "file": "helpers.ts",
+         "line": 24,
+         "column": 87
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:10",
+        "index": 10,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByRole(\"button\", name: \"Notifications\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:52.857Z",
+        "durationMs": 11,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "helpers.ts",
+         "line": 26,
+         "column": 61
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:11",
+        "index": 11,
+        "kind": "assertion",
+        "api": "expect.toContainText",
+        "label": "locator(\"[role=\\\"log\\\"][aria-label=\\\"Conversation transcript\\\"]\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:52.868Z",
+        "durationMs": 3,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "chatRestart.e2e.ts",
+         "line": 36,
+         "column": 30
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:12",
+        "index": 12,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "locator(\"[role=\\\"log\\\"][aria-label=\\\"Conversation transcript\\\"]\") >> getByText(\"remember this\")",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:52.871Z",
+        "durationMs": 3,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "chatRestart.e2e.ts",
+         "line": 38,
+         "column": 49
+        }
+       },
+       {
+        "id": "01a15fcd-2832-7f15-ab1b-324f74fd503a:13",
+        "index": 13,
+        "kind": "agent",
+        "api": "agent.assert",
+        "label": "the chat shows the user's message 'remember this' and the reply 'Mock response: remember this'",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:50:52.874Z",
+        "durationMs": 1932,
+        "events": [],
+        "agent": "default",
+        "artifacts": [
+         "01a15fcd-2832-7f15-ab1b-324f74fd503a:artifact:0"
+        ],
+        "metrics": {
+         "modelCalls": 1,
+         "actionSteps": 0,
+         "observationBytes": 3608,
+         "contextBytes": 572,
+         "ledgerBytes": 0
+        },
+        "model": {
+         "provider": "anthropic.messages",
+         "model": "claude-haiku-5-5",
+         "endpoint": "provider-default",
+         "adapterVersion": "ai-sdk/0.20.0",
+         "policyVersion": "policy-0.3",
+         "calls": 1,
+         "tokenAccounting": "provider",
+         "inputTokens": 2987,
+         "outputTokens": 108,
+         "peakTokensPerCall": 3095,
+         "cacheReadTokens": 844,
+         "cacheWriteTokens": 0
+        },
+        "observationRevision": "b15",
+        "explanation": "The chat transcript shows a user message with text 'remember this' (#n63023) and an assistant reply with text 'Mock response: remember this' (#n63032). Both match the instruction's quoted words, so the assertion holds.",
+        "screen": {
+         "location": "http://127.0.0.1:46841/workspace/66d778ac39",
+         "nodes": 98,
+         "since": 9,
+         "changes": [
+          "added testid=\"workspace-menu-bar\"",
+          "added text=\"Bug bash playground\" testid=\"workspace-title\"",
+          "added button \"Workspace details\"",
+          "added button \"Notifications\" testid=\"notify-on-response-button\"",
+          "added button \"Open in editor\"",
+          "added button \"New terminal\"",
+          "added button \"Workspace actions\" testid=\"workspace-more-actions\"",
+          "added testid=\"message-window\"",
+          "added log \"Conversation transcript\"",
+          "added testid=\"chat-message\"",
+          "added text=\"remember this\"",
+          "added button \"Edit\""
+         ],
+         "more": 58
+        },
+        "source": {
+         "file": "chatRestart.e2e.ts",
+         "line": 40,
+         "column": 17
+        }
+       }
+      ],
+      "appLog": [
+       {
+        "source": "console",
+        "level": "info",
+        "text": "Service Worker registered: ServiceWorkerRegistration (at http://127.0.0.1:46841/main-DWnXPNPq.js:2)",
+        "at": "2026-10-21T18:50:43.572Z",
+        "step": 1
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.125Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.125Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.125Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket is already in CLOSING or CLOSED state. (at http://127.0.0.1:46841/API-BuW8GvF_.js:94)",
+        "at": "2026-10-21T18:50:50.126Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket connection to 'ws://127.0.0.1:46841/orpc/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED (at http://127.0.0.1:46841/API-BuW8GvF_.js:138)",
+        "at": "2026-10-21T18:50:50.232Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket connection to 'ws://127.0.0.1:46841/orpc/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED (at http://127.0.0.1:46841/API-BuW8GvF_.js:138)",
+        "at": "2026-10-21T18:50:50.440Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket connection to 'ws://127.0.0.1:46841/orpc/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED (at http://127.0.0.1:46841/API-BuW8GvF_.js:138)",
+        "at": "2026-10-21T18:50:50.845Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "error",
+        "text": "WebSocket connection to 'ws://127.0.0.1:46841/orpc/ws' failed: Error in connection establishment: net::ERR_CONNECTION_REFUSED (at http://127.0.0.1:46841/API-BuW8GvF_.js:138)",
+        "at": "2026-10-21T18:50:51.650Z",
+        "step": 6
+       },
+       {
+        "source": "console",
+        "level": "info",
+        "text": "Service Worker registered: ServiceWorkerRegistration (at http://127.0.0.1:46841/main-DWnXPNPq.js:2)",
+        "at": "2026-10-21T18:50:52.492Z",
+        "step": 7
+       }
+      ]
+     }
+    ]
+   },
+   {
+    "id": "8975ddbd94e6d97d2709758b67b909d5f533f7d16ba041fe5fe04bb94a351885",
+    "testId": "smoke.e2e.ts::the%20agent%20opens%20the%20playground%20workspace",
+    "kind": "test",
+    "declarationIndex": 0,
+    "titlePath": [
+     "the agent opens the playground workspace"
+    ],
+    "file": "smoke.e2e.ts",
+    "source": {
+     "file": "smoke.e2e.ts",
+     "line": 11,
+     "column": 1
+    },
+    "targetId": "web",
+    "platform": "web",
+    "agent": "default",
+    "repeat": 0,
+    "tags": [
+     "story"
+    ],
+    "selected": true,
+    "status": "failed",
+    "attempts": [
+     {
+      "id": "01a15fcf-27c8-75cf-ba59-ca9365162052",
+      "index": 0,
+      "status": "failed",
+      "startedAt": "2026-10-21T18:52:54.088Z",
+      "durationMs": 14501,
+      "artifacts": [
+       {
+        "id": "01a15fcf-27c8-75cf-ba59-ca9365162052:artifact:0",
+        "kind": "log",
+        "mediaType": "text/plain",
+        "redaction": "complete",
+        "producer": {
+         "kind": "attempt"
+        },
+        "path": "smoke-the-agent-opens-the-playground-8975ddbd94e6d97d/attempt-1/screen-at-failure.txt",
+        "size": 4659,
+        "sha256": "824a5f846448b135080b6cf6876fbd2352af92b37173978e433ce436d8d58c7a"
+       },
+       {
+        "id": "01a15fcf-27c8-75cf-ba59-ca9365162052:artifact:1",
+        "kind": "screenshot",
+        "mediaType": "image/png",
+        "redaction": "complete",
+        "producer": {
+         "kind": "attempt"
+        },
+        "path": "smoke-the-agent-opens-the-playground-8975ddbd94e6d97d/attempt-1/screenshots/001-failure.png",
+        "size": 70733,
+        "sha256": "72b9c77db9b79b1d691653cc3c9d643fe245c23cb46fbb646fd3728c79de224e"
+       }
+      ],
+      "error": {
+       "category": "test",
+       "code": "ASSERTION_FAILED",
+       "message": "expect.toBeVisible failed\nlocator: getByRole(\"button\", name: \"Planted failure\")\nexpected: visible\nobserved: no node (match count 0)",
+       "retryable": false,
+       "phase": "body",
+       "details": {
+        "locator": "getByRole(\"button\", name: \"Planted failure\")",
+        "expected": "visible",
+        "observed": "no node",
+        "matches": 0
+       }
+      },
+      "secondaryErrors": [],
+      "cleanup": "complete",
+      "environment": {
+       "browser": "chromium 153.0.8010.12",
+       "user agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/153.0.8010.12 Safari/537.36"
+      },
+      "failure": {
+       "url": "http://127.0.0.1:46841/workspace/66d778ac39",
+       "viewport": {
+        "width": 1440,
+        "height": 900
+       },
+       "nodes": 129,
+       "screen": "01a15fcf-27c8-75cf-ba59-ca9365162052:artifact:0",
+       "screenshot": "01a15fcf-27c8-75cf-ba59-ca9365162052:artifact:1"
+      },
+      "steps": [
+       {
+        "id": "01a15fcf-27c8-75cf-ba59-ca9365162052:0",
+        "index": 0,
+        "kind": "app",
+        "api": "app.open",
+        "label": "/",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:52:54.096Z",
+        "durationMs": 69,
+        "events": [],
+        "artifacts": [],
+        "screen": {
+         "location": "http://127.0.0.1:46841/",
+         "nodes": 4,
+         "changes": []
+        },
+        "source": {
+         "file": "smoke.e2e.ts",
+         "line": 16,
+         "column": 15
+        }
+       },
+       {
+        "id": "01a15fcf-27c8-75cf-ba59-ca9365162052:1",
+        "index": 1,
+        "kind": "agent",
+        "api": "agent.act",
+        "label": "open the 'Bug bash playground' workspace in the left sidebar",
+        "status": "passed",
+        "startedAt": "2026-10-21T18:52:54.167Z",
+        "durationMs": 9295,
+        "events": [],
+        "agent": "default",
+        "artifacts": [],
+        "metrics": {
+         "modelCalls": 3,
+         "actionSteps": 2,
+         "observationBytes": 4658,
+         "contextBytes": 572,
+         "ledgerBytes": 23
+        },
+        "model": {
+         "provider": "anthropic.messages",
+         "model": "claude-haiku-5-5",
+         "endpoint": "provider-default",
+         "adapterVersion": "executor/e2e-default-agent@2",
+         "policyVersion": "e2e-default-agent/2",
+         "calls": 3,
+         "tokenAccounting": "provider",
+         "inputTokens": 29619,
+         "outputTokens": 245,
+         "peakTokensPerCall": 11707,
+         "cacheReadTokens": 25442,
+         "cacheWriteTokens": 4139
+        },
+        "cache": {
+         "mode": "missed",
+         "reason": "no-entry",
+         "replayedActions": 0,
+         "totalActions": 0,
+         "entry": "123c61e31b1760dd2574979ebbff9fdf3c247e43002cd4a4b34f7fb333cd426b",
+         "write": "unconfirmed"
+        },
+        "observationRevision": "b16",
+        "explanation": "Expanded the demo-app project in the left sidebar and clicked the 'Bug bash playground' workspace. The app opened /workspace/66d778ac39, the title reads 'Bug bash playground - demo-app - xum', and the workspace's chat history is shown.",
+        "turns": [],
+        "screen": {
+         "location": "http://127.0.0.1:46841/workspace/66d778ac39",
+         "nodes": 129,
+         "since": 0,
+         "changes": [
+          "changed document \"Bug bash playground - demo-app - xum\" (was: document \"xum - coding agent multiplexer\")",
+          "added testid=\"left-sidebar-toggle-bar\"",
+          "added button \"Collapse sidebar\"",
+          "added testid=\"left-sidebar\"",
+          "added button \"Open about dialog\"",
+          "added text=\"v0.31.1-nightly.762-18-g17e1de98e1-dirty\"",
+          "added button \"Open analytics\" testid=\"analytics-button\"",
+          "added button \"Open settings\" testid=\"settings-button\"",
+          "added navigation \"Projects\"",
+          "added button \"Home\"",
+          "added button \"Add project\"",
+          "added text=\"+\""
+         ],
+         "more": 118
+        },
+        "source": {
+         "file": "smoke.e2e.ts",
+         "line": 17,
+         "column": 17
+        }
+       },
+       {
+        "id": "01a15fcf-27c8-75cf-ba59-ca9365162052:2",
+        "index": 2,
+        "kind": "assertion",
+        "api": "expect.toBeVisible",
+        "label": "getByRole(\"button\", name: \"Planted failure\")",
+        "status": "failed",
+        "startedAt": "2026-10-21T18:53:03.463Z",
+        "durationMs": 5002,
+        "events": [],
+        "artifacts": [],
+        "source": {
+         "file": "smoke.e2e.ts",
+         "line": 19,
+         "column": 65
+        },
+        "error": {
+         "category": "test",
+         "code": "ASSERTION_FAILED",
+         "message": "expect.toBeVisible failed\nlocator: getByRole(\"button\", name: \"Planted failure\")\nexpected: visible\nobserved: no node (match count 0)",
+         "retryable": false,
+         "details": {
+          "locator": "getByRole(\"button\", name: \"Planted failure\")",
+          "expected": "visible",
+          "observed": "no node",
+          "matches": 0
+         }
+        }
+       }
+      ],
+      "appLog": [
+       {
+        "source": "console",
+        "level": "info",
+        "text": "Service Worker registered: ServiceWorkerRegistration (at http://127.0.0.1:46841/main-DWnXPNPq.js:2)",
+        "at": "2026-10-21T18:52:54.271Z",
+        "step": 1
+       }
+      ]
+     }
+    ]
+   }
+  ],
+  "errors": [],
+  "summary": {
+   "discovered": 2,
+   "selected": 2,
+   "executed": 2,
+   "passed": 1,
+   "failed": 1,
+   "interrupted": 0,
+   "flaky": 0,
+   "skipped": 0
+  },
+  "limits": {
+   "maxAgentContextBytes": 16384,
+   "maxLedgerBytes": 8192,
+   "maxObservationBytes": 262144,
+   "maxEventsPerStep": 1000,
+   "maxModelTokensPerCall": 64000
+  },
+  "usage": {
+   "discoveredResults": 8,
+   "maxAgentContextBytes": 572,
+   "maxLedgerBytes": 2502,
+   "maxObservationBytes": 18220,
+   "artifactBytes": 620262,
+   "downloads": 0,
+   "events": 349,
+   "modelTokens": 684782,
+   "maxModelCallsInStep": 7,
+   "maxActionStepsInStep": 6,
+   "modelCachedTokens": 550353
+  }
+ }
+}

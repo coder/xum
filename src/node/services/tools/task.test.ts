@@ -1,4 +1,6 @@
 import { describe, it, expect, mock } from "bun:test";
+import { nodeClock } from "@/node/utils/hostClock";
+import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
 import type { TaskCreatedEvent } from "@/common/types/stream";
 
 import { tool } from "ai";
@@ -78,6 +80,34 @@ describe("task tool", () => {
     });
 
     expect(tool.description).toContain(guidance);
+  });
+
+  it("adds the desktop delegation hint only when the built-in desktop agent is listed", () => {
+    using tempDir = new TestTempDir("test-task-tool-desktop-hint");
+    const agent = (
+      id: string,
+      scope: AgentDefinitionDescriptor["scope"] = "built-in"
+    ): AgentDefinitionDescriptor => ({
+      id,
+      scope,
+      name: id,
+      description: `${id} agent`,
+      uiSelectable: false,
+      subagentRunnable: true,
+    });
+    const paragraphCount = (agents: AgentDefinitionDescriptor[]) => {
+      const { description } = createTaskTool({
+        ...createTestToolConfig(tempDir.path),
+        availableSubagents: agents,
+      });
+      if (typeof description !== "string") throw new Error("expected a static description");
+      return description.split("\n\n").length;
+    };
+    const base = paragraphCount([agent("explore")]);
+
+    expect(paragraphCount([agent("explore"), agent("exec")])).toBe(base);
+    expect(paragraphCount([agent("explore"), agent("desktop")])).toBe(base + 1);
+    expect(paragraphCount([agent("explore"), agent("desktop", "project")])).toBe(base);
   });
 
   // The advertised inputSchema is the raw (strict) Zod schema. A `.strict()` schema that omits
@@ -1371,6 +1401,36 @@ describe("task tool", () => {
       })
     );
     expectQueuedOrRunningTaskToolResult(result, { status: "queued", taskId: "grandchild-task" });
+  });
+
+  it("stamps task-created on the wall clock when the session clock trails it", async () => {
+    // Chat events are record times: the renderer and history compare them with Date.now()
+    // times, so they read the wall clock until #7282, whatever clock the session runs on.
+    using tempDir = new TestTempDir("test-task-tool-wall-clock");
+    const baseConfig = createTestToolConfig(tempDir.path, { workspaceId: "parent-workspace" });
+    const events: TaskCreatedEvent[] = [];
+    const create = mock(() =>
+      Ok({ taskId: "child-task", kind: "agent" as const, status: "running" as const })
+    );
+    const tool = createTaskTool({
+      ...baseConfig,
+      clock: { ...nodeClock, nowMs: () => 0 },
+      emitChatEvent: (event) => {
+        if (event.type === "task-created") events.push(event);
+      },
+      taskService: { create } as unknown as TaskService,
+    });
+
+    const before = Date.now();
+    await Promise.resolve(
+      tool.execute!(
+        { subagent_type: "explore", prompt: "do it", title: "Child", run_in_background: true },
+        mockToolCallOptions
+      )
+    );
+
+    expect(events[0]?.timestamp).toBeGreaterThanOrEqual(before);
+    expect(events[0]?.timestamp).toBeLessThanOrEqual(Date.now());
   });
 
   it("should block and return report when run_in_background is false", async () => {

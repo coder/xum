@@ -68,7 +68,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       namedWorkspacePath: args.workspacePath,
       runtimeConfig: args.runtimeConfig ?? { type: "local" },
     } as unknown as FrontendWorkspaceMetadata;
-    const { session, historyService, cleanup } = await createAgentSessionHarness({
+    const { session, historyService, cleanup, config } = await createAgentSessionHarness({
       workspaceId,
       aiServiceOverrides: {
         getWorkspaceMetadata: mock((_workspaceId: string) => Promise.resolve(Ok(workspaceMeta))),
@@ -76,6 +76,11 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
       },
     });
     historyCleanup = cleanup;
+    // #6426: these tests use project plugin skills, which load only in a trusted project.
+    await config.editConfig((cfg) => {
+      cfg.projects.set(workspaceMeta.projectPath, { workspaces: [], trusted: true });
+      return cfg;
+    });
 
     const messages: MuxMessage[] = [];
     const send = session.sendMessage.bind(session);
@@ -350,6 +355,7 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
           projectRoot: subprojectPath,
           projectStorageAuthority: "host-local",
           checkoutRoot: checkout,
+          projectPluginsTrusted: true,
         }),
       },
     });
@@ -669,6 +675,49 @@ describe("AgentSession.sendMessage (agent skill snapshots)", () => {
 
     expect(userMessage.role).toBe("user");
     expect(getMessageText(userMessage)).toBe("do X");
+  });
+
+  it("materializes a /compact follow-up's skill refs after the boundary", async () => {
+    const workspaceId = "ws-test";
+    const { workspacePath } = await createTestWorkspaceWithSkill({
+      skillName: "test-skill",
+      skillBody: "Follow this skill.",
+    });
+    const { session, historyService } = await createSessionHarness({ workspaceId, workspacePath });
+    const followUpText = "$test-skill go";
+    for (const message of [
+      createMuxMessage("u0", "user", "original question"),
+      createMuxMessage("summary", "assistant", "compacted summary", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: {
+            text: followUpText,
+            model: "anthropic:claude-3-5-sonnet-latest",
+            agentId: "exec",
+            muxMetadata: {
+              type: "normal",
+              agentSkillRefs: [{ skillName: "test-skill", scope: "project", source: "inline" }],
+            },
+          },
+        },
+      }),
+    ]) {
+      expect((await historyService.appendToHistory(workspaceId, message)).success).toBe(true);
+    }
+
+    expect(await session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+    await session.waitForIdle();
+
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const [summary, snapshot, followUp] = history.data;
+    expect(summary.id).toBe("summary");
+    expect(snapshot.metadata?.agentSkillSnapshot?.skillName).toBe("test-skill");
+    expect(getMessageText(snapshot)).toContain("Follow this skill.");
+    expect(getMessageText(followUp)).toBe(followUpText);
   });
 
   it("dedupes slash + inline refs for the same skill, slash wins", async () => {

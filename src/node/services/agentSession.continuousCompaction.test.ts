@@ -21,8 +21,11 @@ import type { AgentSession, AgentSessionStreamManager } from "./agentSession";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
+  createStreamLifecycleMocks,
+  createTestStreamManager,
   seedAutoCompactionThreshold,
   type AgentSessionHarness,
+  type StreamLifecycle,
 } from "./agentSession.testHarness";
 import type { ContinuousCompactor } from "./continuousCompactor";
 import type { CompactionToken, TurnCoordinator } from "./turnCoordinator";
@@ -112,8 +115,16 @@ describe("AgentSession continuous compaction wiring", () => {
   });
 
   const enabledExperiments = new Set<ExperimentId>();
-  async function setup(usagePercent = 0, streamManager?: AgentSessionStreamManager) {
-    harness = await createAgentSessionHarness({ workspaceId, captureEvents: true, streamManager });
+  async function setup(
+    usagePercent = 0,
+    streamManager?: Omit<AgentSessionStreamManager, "effectRunner" | "hostClock">
+  ) {
+    harness = await createAgentSessionHarness({
+      workspaceId,
+      captureEvents: true,
+      // The default runner and its clock, as a real StreamManager without injection has.
+      streamManager: streamManager && { ...createTestStreamManager(), ...streamManager },
+    });
     enabledExperiments.clear();
     enabledExperiments.add(EXPERIMENT_IDS.CONTINUOUS_COMPACTION);
     spyOn(harness.aiService, "isExperimentEnabled").mockImplementation((id) =>
@@ -918,7 +929,22 @@ describe("AgentSession continuous compaction wiring", () => {
   });
 
   test("invalidation contains an initial wait rejection and safely stops the blocked stream", async () => {
-    const h = await setup();
+    // The session's stream manager answers the lifecycle from the AI fake (spied below) and
+    // reports the swap invalidated once the live turn runs.
+    // The session reads the lifecycle while it is constructed, before the fake exists.
+    let invalidated = false;
+    let ai: StreamLifecycle = createStreamLifecycleMocks();
+    const fromAi: StreamLifecycle = {
+      stopStream: (id, options) => ai.stopStream(id, options),
+      isStreaming: (id) => ai.isStreaming(id),
+      getStreamInfo: (id, includeFinalizing) => ai.getStreamInfo(id, includeFinalizing),
+      replayStream: (id, options) => ai.replayStream(id, options),
+    };
+    const h = await setup(0, {
+      ...createTestStreamManager(fromAi),
+      getPrefixSwapState: () => (invalidated ? "invalidated" : "none"),
+    });
+    ai = h.aiService;
     const compactor = continuous(h.session).continuousCompactor;
     const unhandled: unknown[] = [];
     const onUnhandled = (error: unknown) => {
@@ -933,8 +959,7 @@ describe("AgentSession continuous compaction wiring", () => {
       parts: [],
       toolCompletionTimestamps: new Map(),
     });
-    // The harness injects aiService as the session's stream manager; give it the swap probe.
-    Object.assign(h.aiService, { getPrefixSwapState: () => "invalidated" as const });
+    invalidated = true;
     spyOn(compactor, "waitForIdle").mockImplementationOnce(() =>
       Promise.reject(new Error("apply wait failed"))
     );
@@ -1714,7 +1739,7 @@ describe("AgentSession continuous compaction wiring", () => {
 
   test.each([
     { route: "coder", alias: true, wire: "responses", pro: true },
-    { route: "mux-gateway", alias: false, wire: "responses", pro: false },
+    { route: "openrouter", alias: false, wire: "responses", pro: false },
     { route: "openai", alias: false, wire: "responses", pro: true },
     { route: "openai", alias: false, wire: "chatCompletions", pro: false },
   ] as const)(

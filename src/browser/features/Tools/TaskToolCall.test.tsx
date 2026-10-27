@@ -13,12 +13,17 @@ import { pageToolText, type ToolTextPage } from "@/common/utils/tools/pageToolTe
 import * as RealWorkspaceContextModule from "@/browser/contexts/WorkspaceContext";
 import * as RealSubagentTranscriptDialogModule from "@/browser/features/Tools/SubagentTranscriptDialog";
 import * as RealElapsedTimeDisplayModule from "@/browser/features/Tools/Shared/ElapsedTimeDisplay";
+import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import { createMappedAliasProvidersConfig, MAPPED_ALIAS_MODEL } from "@/browser/testUtils";
+import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
 let workspaceContextMock: {
   workspaceMetadata: Map<string, FrontendWorkspaceMetadata>;
   setSelectedWorkspace?: (selection: unknown) => void;
 } | null = null;
+let providersConfigMock: ProvidersConfigMap | null = null;
+const realProvidersConfigModule = { ...RealProvidersConfigModule };
 
 // Restore the real modules after this suite so the partial stubs cannot leak into later
 // suites that render the real components (e.g. AgentContext.test uses the real provider).
@@ -26,6 +31,7 @@ restoreModulesAfterSuite([
   ["@/browser/contexts/WorkspaceContext", { ...RealWorkspaceContextModule }],
   ["@/browser/features/Tools/SubagentTranscriptDialog", { ...RealSubagentTranscriptDialogModule }],
   ["@/browser/features/Tools/Shared/ElapsedTimeDisplay", { ...RealElapsedTimeDisplayModule }],
+  ["@/browser/hooks/useProvidersConfig", realProvidersConfigModule],
 ]);
 void mock.module("@/browser/contexts/WorkspaceContext", () => ({
   useOptionalWorkspaceContext: () => workspaceContextMock,
@@ -34,6 +40,14 @@ void mock.module("@/browser/contexts/WorkspaceContext", () => ({
 
 void mock.module("@/browser/features/Tools/SubagentTranscriptDialog", () => ({
   SubagentTranscriptDialog: () => null,
+}));
+
+void mock.module("@/browser/hooks/useProvidersConfig", () => ({
+  ...realProvidersConfigModule,
+  useProvidersConfig: () => ({
+    ...realProvidersConfigModule.useProvidersConfig(),
+    config: providersConfigMock,
+  }),
 }));
 
 void mock.module("@/browser/features/Tools/Shared/ElapsedTimeDisplay", () => ({
@@ -130,6 +144,7 @@ describe("TaskToolCall", () => {
 
   afterEach(() => {
     workspaceContextMock = null;
+    providersConfigMock = null;
     cleanup();
     mock.restore();
     globalThis.window = originalWindow;
@@ -686,6 +701,39 @@ describe("TaskToolCall", () => {
 
     const settings = view.container.querySelector("[data-task-ai-settings]");
     expect(settings?.textContent).toContain("thinking: low");
+  });
+
+  test("labels a mapped alias's thinking from its target model", () => {
+    workspaceContextMock = { workspaceMetadata: new Map() };
+    providersConfigMock = createMappedAliasProvidersConfig();
+
+    const agentTaskArgs = {
+      subagent_type: "explore",
+      prompt: "Look around.",
+      title: "Explore task",
+      run_in_background: true,
+    };
+    const AgentTaskToolCall = getToolComponent("task", agentTaskArgs, undefined);
+    const view = render(
+      <TooltipProvider>
+        <AgentTaskToolCall
+          args={agentTaskArgs}
+          result={{
+            status: "running",
+            taskId: "task-child-3",
+            modelString: MAPPED_ALIAS_MODEL,
+            thinkingLevel: "max",
+            note: "Task started in background.",
+          }}
+          status="completed"
+        />
+      </TooltipProvider>
+    );
+
+    fireEvent.click(view.getByText("task"));
+
+    const settings = view.container.querySelector("[data-task-ai-settings]");
+    expect(settings?.textContent).toContain("thinking: max");
   });
 });
 

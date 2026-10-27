@@ -16,6 +16,8 @@ import * as fs from "fs/promises";
 import type { BrowserWindow, WebContents } from "electron";
 
 import { createCli, FailedToExitError } from "trpc-cli";
+import { os as orpcBase } from "@orpc/server";
+import { z } from "zod";
 import { router } from "@/node/orpc/router";
 import { proxifyOrpc } from "./proxifyOrpc";
 import type { ORPCContext } from "@/node/orpc/context";
@@ -87,8 +89,11 @@ async function createTestServer(authToken?: string): Promise<TestServerHandle> {
  * Uses trpc-cli's programmatic API to avoid subprocess overhead.
  */
 function createCliRunner(baseUrl: string, authToken?: string) {
-  const proxiedRouter = proxifyOrpc(router(), { baseUrl, authToken });
-  const cli = createCli({ router: proxiedRouter });
+  return createCliRunnerForRouter(proxifyOrpc(router(), { baseUrl, authToken }));
+}
+
+function createCliRunnerForRouter(cliRouter: Parameters<typeof createCli>[0]["router"]) {
+  const cli = createCli({ router: cliRouter });
 
   return async (args: string[]): Promise<unknown> => {
     return cli
@@ -112,6 +117,41 @@ function createCliRunner(baseUrl: string, authToken?: string) {
 }
 
 // --- Tests ---
+
+describe("CLI nullable options (#7156)", () => {
+  // Echoes the parsed input, so the test sees exactly what the CLI sends.
+  const echoRouter = {
+    set: orpcBase
+      .input(
+        z.object({
+          name: z.string(),
+          intervalMs: z.number().int().nullish(),
+          ids: z.array(z.number().nullable()).optional(),
+        })
+      )
+      .handler(({ input }) => input),
+  };
+  const runEcho = createCliRunnerForRouter(echoRouter);
+
+  test("--interval-ms null sends null; a number and an omitted option work as before", async () => {
+    expect(await runEcho(["set", "--name", "a", "--interval-ms", "null"])).toEqual({
+      name: "a",
+      intervalMs: null,
+    });
+    expect(await runEcho(["set", "--name", "a", "--interval-ms", "1800000"])).toEqual({
+      name: "a",
+      intervalMs: 1800000,
+    });
+    expect(await runEcho(["set", "--name", "a"])).toEqual({ name: "a" });
+  });
+
+  test("a null array item stays null", async () => {
+    expect(await runEcho(["set", "--name", "a", "--ids", "1", "--ids", "null"])).toEqual({
+      name: "a",
+      ids: [1, null],
+    });
+  });
+});
 
 describe("CLI via HTTP", () => {
   let serverHandle: TestServerHandle;
@@ -196,6 +236,30 @@ describe("CLI via HTTP", () => {
       for (const value of ["500", "abc"]) {
         expect(await captureNow(value)).toMatchObject({ code: "BAD_REQUEST" });
       }
+    });
+
+    test("workspace heartbeat set accepts a nullable integer --interval-ms (#6329)", async () => {
+      const setInterval = (intervalMs: string) =>
+        runCli([
+          "workspace",
+          "heartbeat",
+          "set",
+          "--workspace-id",
+          "nonexistent",
+          "--enabled",
+          "true",
+          "--interval-ms",
+          intervalMs,
+        ]).then(
+          (result: unknown) => ({ result }),
+          (rejection: unknown) => ({ rejection: String(rejection) })
+        );
+      // An integer passes CLI parsing and reaches the server, which reports the unknown
+      // workspace in its result.
+      expect(await setInterval("1800000")).toMatchObject({ result: { success: false } });
+      // A fraction is still not an integer.
+      const fraction = await setInterval("1800000.5");
+      expect("rejection" in fraction && fraction.rejection).toContain("expected integer or null");
     });
 
     test("workspace get-info with workspace-id option", async () => {

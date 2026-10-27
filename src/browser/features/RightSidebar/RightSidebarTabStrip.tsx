@@ -88,7 +88,11 @@ const SortableTab: React.FC<{
   const sortableOnKeyDown = listeners?.onKeyDown;
 
   return (
-    <div className="relative shrink-0" style={style}>
+    // The selected tab is capped at the row's width, so it never shows cut off at the row's end
+    // when the row is narrower than the tab (a 300 px sidebar under the window-controls inset,
+    // #7103): its label truncates and its X stays in view. Only the selected one: a capped terminal
+    // tab is mostly its pop-out and close buttons, so a click on an unselected one would hit them.
+    <div className={cn("relative shrink-0", { "max-w-full": item.selected })} style={style}>
       <Tooltip>
         <TooltipTrigger asChild>
           <div
@@ -99,6 +103,9 @@ const SortableTab: React.FC<{
               "group relative flex min-w-0 max-w-[240px] items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1 text-xs font-medium transition-colors duration-150",
               // Let touch users pan the overflowing strip; mouse pointers still drag/reorder.
               "cursor-grab touch-pan-x active:cursor-grabbing",
+              // Arrow keys move focus without selecting (#7102), so the focused tab needs a mark of
+              // its own, like the strip's icon buttons. Inset: the scrolling row clips an outer ring.
+              "focus-visible:ring-accent outline-none focus-visible:ring-1 focus-visible:ring-inset",
               // Reserve the X's space even while hidden: hovering/focusing/selecting a tab must
               // neither cover its text nor change its label width (especially for long titles).
               // Phones reserve row height/padding for the 44px touch X. Tablets keep the desktop
@@ -351,6 +358,42 @@ const StripEndControls: React.FC<{
   </div>
 );
 
+/** Where each tab-moving key sends focus, from the focused tab's index among `count` tabs. */
+const TAB_STRIP_FOCUS_MOVES: Record<string, (index: number, count: number) => number> = {
+  ArrowLeft: (index, count) => (index - 1 + count) % count,
+  ArrowRight: (index, count) => (index + 1) % count,
+  Home: () => 0,
+  End: (_index, count) => count - 1,
+};
+
+function hasModifierKey(event: React.KeyboardEvent): boolean {
+  return event.altKey || event.ctrlKey || event.metaKey || event.shiftKey;
+}
+
+/**
+ * ArrowLeft/ArrowRight (wrapping), Home and End move focus between the tabs, per the WAI-ARIA
+ * tabs pattern (#7102). They do not select the tab: Enter or Space does (manual activation), so
+ * passing over a tab does not mount its panel (a terminal, the review diff).
+ */
+function handleTabStripKeyDown(event: React.KeyboardEvent<HTMLElement>): void {
+  const move = TAB_STRIP_FOCUS_MOVES[event.key];
+  // Keys from controls inside a tab (close, pop-out) and modified keys keep their own meaning.
+  if (move == null || hasModifierKey(event)) return;
+  const target = event.target;
+  if (!(target instanceof HTMLElement) || target.getAttribute("role") !== "tab") return;
+  const row = event.currentTarget;
+  const tabs = Array.from(
+    row.querySelectorAll<HTMLElement>('[role="tab"]:not([aria-disabled="true"])')
+  );
+  const index = tabs.indexOf(target);
+  if (index < 0) return;
+  event.preventDefault();
+  const next = tabs[move(index, tabs.length)];
+  // Like the All tabs menu: focus() would also scroll the sidebar's overflow-hidden ancestors.
+  next.focus({ preventScroll: true });
+  revealTab(row, next);
+}
+
 /**
  * One row that never wraps: extra tabs scroll sideways (hidden scrollbar, faded edges) while the
  * controls after it stay in view. Its wrapper holds the desktop no-drag box over the row's
@@ -374,7 +417,8 @@ const TabScrollRow: React.FC<{
       data-tab-scroll-row
       role="tablist"
       aria-label={props.ariaLabel}
-      className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
+      className="scroll-fade-x flex min-w-0 flex-initial scrollbar-none flex-nowrap items-center gap-1 overflow-x-auto"
+      onKeyDown={handleTabStripKeyDown}
     >
       {props.items.map((item, index) => (
         <SortableTab key={item.id} item={item} index={index} tabsetId={props.tabsetId} />
@@ -387,13 +431,55 @@ const TabScrollRow: React.FC<{
 const SCROLL_FADE_PX = 24;
 
 /**
- * Scroll the row (only as far as needed) so its selected tab is fully visible and clear of the
- * edge fades. Computed against the row instead of `scrollIntoView`, which also scrolls
- * overflow-hidden ancestors and ignores the fades.
+ * After a size change in the row (a badge loads, a font swaps), keep the selected tab in view. If
+ * the arrow keys hold focus on another tab (#7102), keep that one in view instead: scrolling back
+ * to the selected tab would hide where the user is.
  */
+function revealSelectedTabOnResize(row: HTMLElement): void {
+  // Focus on a control inside a tab (its close button) counts as focus on that tab.
+  const active = row.ownerDocument.activeElement?.closest<HTMLElement>('[role="tab"]');
+  if (active != null && row.contains(active) && active.getAttribute("aria-selected") !== "true") {
+    revealTab(row, active);
+  } else {
+    revealSelectedTab(row);
+  }
+}
+
+/** Re-reveal a tab whenever the row or one of its tabs changes size. Returns the cleanup. */
+function observeRowSizes(row: HTMLElement): () => void {
+  // A new observer reports every observed element once at the start. That report is no size
+  // change, so it reveals the selected tab, as the caller just did: preferring the focused tab
+  // there would scroll a tab that a shortcut just selected back out of view. The report comes a
+  // frame later, though, and a key can move focus to another tab before it (#7288). Then the
+  // user's latest move wins, as on a real size change.
+  const focusAtStart = row.ownerDocument.activeElement;
+  let initialReport = true;
+  const observer = new ResizeObserver(() => {
+    const focusUnchanged = initialReport && row.ownerDocument.activeElement === focusAtStart;
+    initialReport = false;
+    if (focusUnchanged) {
+      revealSelectedTab(row);
+    } else {
+      revealSelectedTabOnResize(row);
+    }
+  });
+  observer.observe(row);
+  for (const child of Array.from(row.children)) observer.observe(child);
+  return () => observer.disconnect();
+}
+
+/** Keep the row's selected tab fully visible, clear of the edge fades (see `revealTab`). */
 function revealSelectedTab(row: HTMLElement): void {
   const tab = row.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]');
-  if (tab == null) return;
+  if (tab != null) revealTab(row, tab);
+}
+
+/**
+ * Scroll the row (only as far as needed) so `tab` is fully visible and clear of the edge fades.
+ * Computed against the row instead of `scrollIntoView`, which also scrolls overflow-hidden
+ * ancestors and ignores the fades.
+ */
+function revealTab(row: HTMLElement, tab: HTMLElement): void {
   const rowRect = row.getBoundingClientRect();
   const tabRect = tab.getBoundingClientRect();
   const tabStart = tabRect.left - rowRect.left + row.scrollLeft;
@@ -452,13 +538,9 @@ export const RightSidebarTabStrip: React.FC<RightSidebarTabStripProps> = ({
   React.useEffect(() => {
     const row = scrollRowRef.current;
     if (row == null || selectedItemId == null) return;
-    const reveal = () => revealSelectedTab(row);
-    reveal();
+    revealSelectedTab(row);
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(reveal);
-    observer.observe(row);
-    for (const child of Array.from(row.children)) observer.observe(child);
-    return () => observer.disconnect();
+    return observeRowSizes(row);
   }, [selectedItemId, itemIdsKey]);
 
   return (

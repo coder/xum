@@ -1,4 +1,3 @@
-import * as fs from "fs/promises";
 import * as path from "path";
 import {
   INSTRUCTION_SCOPE,
@@ -8,6 +7,8 @@ import {
 } from "@/common/types/instructions";
 import { listProjectMetadataRelativePaths } from "@/common/compat/legacyMux";
 import { isRuntimeReadFailure, type Runtime } from "@/node/runtime/Runtime";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import { readFileString } from "@/node/utils/runtime/helpers";
 
 export const CLAUDE_COMPAT_INSTRUCTIONS_DIRECTORY = ".claude";
@@ -47,11 +48,11 @@ interface FileReader {
 }
 
 /**
- * Create a FileReader for local filesystem access.
+ * Create a FileReader for host filesystem access.
  */
-function createLocalFileReader(): FileReader {
+function createLocalFileReader(files: HostFiles): FileReader {
   return {
-    readFile: (filePath: string) => fs.readFile(filePath, "utf-8"),
+    readFile: (filePath: string) => files.promises.readFile(filePath, "utf-8"),
   };
 }
 
@@ -251,11 +252,13 @@ async function readInstructionSetWith(
 export async function readInstructionSet(
   directory: string | null | undefined,
   scope: InstructionScope,
-  projectName?: string
+  projectName?: string,
+  /** The host files of the read (phase 5: the agent loop passes its own). Absent: the Node layer. */
+  files: HostFiles = nodeHostFiles
 ): Promise<InstructionSet | null> {
   if (!directory) return null;
   return readInstructionSetWith(
-    createLocalFileReader(),
+    createLocalFileReader(files),
     path.resolve(directory),
     scope,
     projectName
@@ -268,11 +271,13 @@ export async function readInstructionSet(
  * Xum candidate and local-file semantics never leak into ~/.claude.
  */
 export async function readClaudeCompatGlobalInstructionSet(
-  directory: string
+  directory: string,
+  /** As in readInstructionSet. */
+  files: HostFiles = nodeHostFiles
 ): Promise<InstructionSet | null> {
   const resolvedDirectory = path.resolve(directory);
   const result = await readSingleFile(
-    createLocalFileReader(),
+    createLocalFileReader(files),
     resolvedDirectory,
     CLAUDE_COMPAT_GLOBAL_INSTRUCTION_FILENAME,
     INSTRUCTION_SCOPE.GLOBAL,

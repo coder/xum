@@ -23,7 +23,7 @@ function run(slot: number, overrides: Partial<RunInfo> = {}): RunInfo {
 }
 
 /** One night per slot (0 = current); `series[metric][slot]` is scenario `label`'s value. */
-function nights(series: Partial<Record<TrendMetricId, Array<number | undefined>>>, label = "s") {
+function nights(series: Partial<Record<TrendMetricId, (number | undefined)[]>>, label = "s") {
   const length = Math.max(...Object.values(series).map((values) => values?.length ?? 0));
   return Array.from({ length }, (_, slot): Night => {
     const values: Values = {};
@@ -290,6 +290,7 @@ describe("renderTrendSummary", () => {
     );
     for (const historyError of [undefined, evil]) {
       const lines = render(all, historyError).split("\n");
+      // eslint-disable-next-line no-control-regex -- the test asserts that no control characters reach the output
       expect(lines.join("")).not.toMatch(/[\u0000-\u001f\u007f-\u009f\u2028\u2029<>]/);
       const table = lines.filter((line) => line.startsWith("|"));
       expect(table.length).toBe(historyError === undefined ? 3 : 0);

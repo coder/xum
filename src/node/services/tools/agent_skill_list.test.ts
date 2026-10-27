@@ -1,5 +1,5 @@
 import * as fs from "node:fs/promises";
-import os from "node:os";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { describe, expect, it, spyOn } from "bun:test";
@@ -327,6 +327,59 @@ describe("agent_skill_list", () => {
     });
   });
 
+  it("lists ~/.mux/skills after ~/.agents/skills, and not again when it is the Xum home's", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-legacy-mux-home");
+    using project = new TestTempDir("test-agent-skill-list-legacy-mux-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-legacy-mux-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await writeSkill(path.join(homeDir.path, ".agents", "skills"), "shared", {
+        description: "from agents",
+      });
+      for (const name of ["shared", "cli-only"]) {
+        await writeSkill(path.join(homeDir.path, ".mux", "skills"), name, {
+          description: "from legacy mux",
+        });
+      }
+      // The skills CLI links a skill to its store copy elsewhere in the user home.
+      await writeSkill(path.join(homeDir.path, "store"), "linked", { description: "from store" });
+      await fs.symlink(
+        path.join(homeDir.path, "store", "linked"),
+        path.join(homeDir.path, ".mux", "skills", "linked")
+      );
+      const list = async (xumHome: string) => {
+        const tool = createAgentSkillListTool(
+          createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          })
+        );
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+        if (!result.success) throw new Error(result.error);
+        return result.skills.map((skill) => [skill.name, skill.description]);
+      };
+
+      // A read-only root contained at the user home, like ~/.agents/skills.
+      expect(await list(xumHomeDir.path)).toEqual([
+        ["cli-only", "from legacy mux"],
+        ["linked", "from store"],
+        ["shared", "from agents"],
+      ]);
+      // With ~/.mux as the Xum home, it is only the Xum home's root: a link out of the Xum home
+      // stays refused instead of listing through the wider user-home containment.
+      await withMuxRoot(path.join(homeDir.path, ".mux"), async () => {
+        expect(await list(path.join(homeDir.path, ".mux"))).toEqual([
+          ["cli-only", "from legacy mux"],
+          ["shared", "from legacy mux"],
+        ]);
+      });
+    });
+  });
+
   it("lists Agent Plugins skills", async () => {
     using homeDir = new TestTempDir("test-agent-skill-list-plugins-on-home");
     using project = new TestTempDir("test-agent-skill-list-plugins-on-project");
@@ -375,6 +428,133 @@ describe("agent_skill_list", () => {
           description: "from global plugin",
           scope: "global",
         });
+      });
+    });
+  });
+
+  it("lists a plugin skill in a snake_case folder under its kebab-case name", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-snake-home");
+    using project = new TestTempDir("test-agent-skill-list-snake-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-snake-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        // google/elephant-goldfish-model: skills/egm_bootstrap/SKILL.md has `name: egm-bootstrap`.
+        const pluginDir = await writePlugin(path.join(xumHomeDir.path, "plugins"), "egm", []);
+        const skillDir = path.join(pluginDir, "skills", "egm_bootstrap");
+        await fs.mkdir(skillDir, { recursive: true });
+        await fs.writeFile(
+          path.join(skillDir, "SKILL.md"),
+          "---\nname: egm-bootstrap\ndescription: Bootstrap\n---\nBody\n"
+        );
+
+        const tool = createAgentSkillListTool({
+          ...createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          }),
+        });
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(getSkill(result.skills, "egm-bootstrap").description).toBe("Bootstrap");
+      });
+    });
+  });
+
+  it("lists a plugin skills path that holds SKILL.md as one skill", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-single-home");
+    using project = new TestTempDir("test-agent-skill-list-single-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-single-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        const pluginDir = path.join(xumHomeDir.path, "plugins", "solo");
+        await fs.mkdir(pluginDir, { recursive: true });
+        await fs.writeFile(
+          path.join(pluginDir, "plugin.json"),
+          JSON.stringify({
+            $schema: "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+            name: "solo",
+            contributes: { skills: ["lone", ".", "leaky"] },
+          })
+        );
+        await writeSkill(pluginDir, "lone", { description: "single folder" });
+        // The plugin root is a skill folder too: it lists under the plugin name.
+        await writeSkill(path.dirname(pluginDir), "solo", { description: "plugin root" });
+        // A single skill folder whose SKILL.md links outside the plugin is refused.
+        await writeSkill(homeDir.path, "leaky", { description: "outside" });
+        await fs.mkdir(path.join(pluginDir, "leaky"));
+        await fs.symlink(
+          path.join(homeDir.path, "leaky", "SKILL.md"),
+          path.join(pluginDir, "leaky", "SKILL.md")
+        );
+
+        const tool = createAgentSkillListTool(
+          createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          })
+        );
+        const result = (await tool.execute!({}, mockToolCallOptions)) as AgentSkillListToolResult;
+
+        expect(result.success).toBe(true);
+        if (!result.success) return;
+        expect(result.skills.map((skill) => [skill.name, skill.description])).toEqual([
+          ["lone", "single folder"],
+          ["solo", "plugin root"],
+        ]);
+      });
+    });
+  });
+
+  it("hides a Claude command from the model and lists it only with includeUnadvertised", async () => {
+    using homeDir = new TestTempDir("test-agent-skill-list-command-home");
+    using project = new TestTempDir("test-agent-skill-list-command-project");
+    using xumHomeDir = new TestTempDir("test-agent-skill-list-command-xum-home");
+
+    await withHomeDir(homeDir.path, async () => {
+      await withMuxRoot(xumHomeDir.path, async () => {
+        const pluginDir = path.join(xumHomeDir.path, "plugins", "kit");
+        await fs.mkdir(path.join(pluginDir, ".claude-plugin"), { recursive: true });
+        await fs.writeFile(
+          path.join(pluginDir, ".claude-plugin", "plugin.json"),
+          JSON.stringify({ name: "kit" })
+        );
+        await fs.mkdir(path.join(pluginDir, "commands"));
+        await fs.writeFile(path.join(pluginDir, "commands", "review.md"), "Review $ARGUMENTS\n");
+        await writeSkill(path.join(pluginDir, "skills"), "greet", { description: "Greets" });
+
+        const tool = createAgentSkillListTool(
+          createTestToolConfig(project.path, {
+            xumScope: {
+              type: "project",
+              xumHome: xumHomeDir.path,
+              projectRoot: project.path,
+              projectStorageAuthority: "host-local",
+            },
+          })
+        );
+        const list = async (includeUnadvertised: boolean) => {
+          const result = (await tool.execute!(
+            { includeUnadvertised },
+            mockToolCallOptions
+          )) as AgentSkillListToolResult;
+          expect(result.success).toBe(true);
+          return result.success ? result.skills.map((skill) => skill.name) : [];
+        };
+
+        expect(await list(false)).toEqual(["greet"]);
+        expect(await list(true)).toEqual(["greet", "review"]);
       });
     });
   });

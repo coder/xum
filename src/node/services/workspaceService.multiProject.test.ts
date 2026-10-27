@@ -14,17 +14,15 @@ import * as runtimeFactory from "@/node/runtime/runtimeFactory";
 import * as gitModule from "@/node/git";
 import type { AIService } from "@/node/services/aiService";
 import * as bashToolModule from "@/node/services/tools/bash";
-import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
 import type { HistoryService } from "@/node/services/historyService";
 import { InitStateManager } from "@/node/services/initStateManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { ExperimentsService } from "@/node/services/experimentsService";
-import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
-import { WorkspaceService } from "@/node/services/workspaceService";
+import type { WorkspaceService } from "@/node/services/workspaceService";
 import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import {
   createMockAIService,
-  createTestBackgroundProcessManager,
+  createWorkspaceServiceForTest as createSharedWorkspaceServiceForTest,
   createWorkspaceServiceHarness,
 } from "@/node/services/workspaceService.testHarness";
 import { Ok } from "@/common/types/result";
@@ -60,23 +58,6 @@ async function pathExists(targetPath: string): Promise<boolean> {
     return false;
   }
 }
-// Real ExtensionMetadataService per service; its file lives in a per-test temp dir removed below.
-const extensionMetadataDirs: string[] = [];
-function createTestExtensionMetadataService(): ExtensionMetadataService {
-  const dir = path.join(
-    tmpdir(),
-    `xum-test-ext-metadata-${Date.now()}-${Math.random().toString(36).slice(2)}`
-  );
-  extensionMetadataDirs.push(dir);
-  return new ExtensionMetadataService(path.join(dir, "extensionMetadata.json"));
-}
-afterEach(async () => {
-  await Promise.all(
-    extensionMetadataDirs
-      .splice(0)
-      .map((dir) => fsPromises.rm(dir, { recursive: true, force: true }))
-  );
-});
 function createMockExperimentsService(enabled: boolean): ExperimentsService {
   return {
     isExperimentEnabled: mock(() => enabled),
@@ -92,23 +73,11 @@ interface WorkspaceServiceTestOptions {
   secretsStore?: Pick<SecretsStore, "getEffectiveSecrets">;
 }
 function createWorkspaceServiceForTest(options: WorkspaceServiceTestOptions): WorkspaceService {
-  const config = options.config;
-  const aiService = options.aiService ?? createMockAIService();
-  return new WorkspaceService(
-    config,
-    options.historyService,
-    aiService,
-    new ContextManagementService({ config, historyService: options.historyService, aiService }),
-    options.initStateManager ?? new InitStateManager(config),
-    createTestExtensionMetadataService(),
-    createTestBackgroundProcessManager(),
-    undefined,
-    undefined,
-    createMockExperimentsService(options.experimentsEnabled ?? true),
-    undefined,
-    undefined,
-    options.secretsStore
-  );
+  const { experimentsEnabled, ...serviceOptions } = options;
+  return createSharedWorkspaceServiceForTest({
+    ...serviceOptions,
+    experimentsService: createMockExperimentsService(experimentsEnabled ?? true),
+  });
 }
 interface ExecuteBashHarnessOptions {
   workspaceId: string;

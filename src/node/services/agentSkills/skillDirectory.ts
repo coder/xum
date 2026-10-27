@@ -1,8 +1,5 @@
 import assert from "@/common/utils/assert";
-import { DevcontainerRuntime } from "@/node/runtime/DevcontainerRuntime";
-import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
-import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
-import type { Runtime } from "@/node/runtime/Runtime";
+import { isRemoteRuntime, type Runtime } from "@/node/runtime/Runtime";
 import { toPosixPath } from "@/node/utils/paths";
 
 import type { ResolvedAgentSkill } from "./agentSkillsService";
@@ -35,7 +32,8 @@ const OTHER_CHECKOUT_REASON =
  * filesystem.
  */
 function execsOnHost(runtime: Runtime): boolean {
-  return runtime instanceof LocalBaseRuntime && !(runtime instanceof DevcontainerRuntime);
+  // "local" is a LocalBaseRuntime that is not a DevcontainerRuntime (see Runtime.location).
+  return runtime.location === "local";
 }
 
 /**
@@ -74,7 +72,7 @@ export function resolveSkillDirectory(
   // Host paths are native on Windows (drive letter, backslashes), but bash runs
   // in Git Bash there: give it the POSIX form. toPosixPath is a no-op off Windows; remote paths
   // are already POSIX.
-  const forBash = resolved.sourceRuntime instanceof RemoteRuntime ? (p: string) => p : toPosixPath;
+  const forBash = resolved.sourceRuntime?.location === "remote" ? (p: string) => p : toPosixPath;
   return {
     available: true,
     skillDir: forBash(resolved.skillDir),
@@ -141,7 +139,7 @@ function getSkillDirectoryUnavailableReason(
   // read and execute on the same machine. A DevcontainerRuntime (or a wrapper
   // around one) reads the host but executes in the container.
   const sameRemote =
-    resolved.sourceRuntime === workspaceRuntime && workspaceRuntime instanceof RemoteRuntime;
+    resolved.sourceRuntime === workspaceRuntime && isRemoteRuntime(workspaceRuntime);
   const bothOnHost = execsOnHost(resolved.sourceRuntime) && execsOnHost(workspaceRuntime);
   return sameRemote || bothOnHost ? null : OFF_HOST_REASON;
 }

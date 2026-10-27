@@ -19,6 +19,7 @@
  */
 
 import assert from "node:assert";
+import { clockOf, type HostClock } from "@/node/utils/hostClock";
 import { randomUUID } from "node:crypto";
 import { asSchema, type FlexibleSchema, type Tool } from "ai";
 import type { ToolConfiguration } from "@/common/utils/tools/tools";
@@ -58,11 +59,13 @@ export interface HookConfig {
   env?: Record<string, string>;
   /** See ToolExecutionHost.turn. */
   turn?: HookTurn;
+  /** See ToolExecutionHost.clock. */
+  clock?: HostClock;
 }
 
 /**
  * Derive the hook config every hook-wrapped tool runs with, or null when
- * hooks must not run. Host-side reads (mux.load and intuition) share this
+ * hooks must not run. Host-side reads (mux.load) share this
  * trust gate with public tools: repo-controlled hooks run only for trusted projects.
  */
 export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | null {
@@ -87,6 +90,7 @@ export function deriveToolHookConfig(config: ToolConfiguration): HookConfig | nu
       ...(config.secrets ?? {}),
     },
     turn: config.hookTurn,
+    clock: config.clock,
   };
 }
 
@@ -205,7 +209,7 @@ function readToolOption(options: unknown, key: "abortSignal" | "toolCallId"): un
     : undefined;
 }
 
-/** A host-side call (mux.load, intuition) has no SDK call ID: its Pre and Post hooks share one. */
+/** A host-side call (mux.load) has no SDK call ID: its Pre and Post hooks share one. */
 function hookCallId(toolCallId: string | undefined): string {
   return toolCallId ?? `xum-hook-call-${randomUUID()}`;
 }
@@ -305,6 +309,7 @@ async function shellToolHookMiddleware(
   next: WaterfallNext
 ): Promise<void> {
   const { runtime, cwd } = ctx.host;
+  const clock = clockOf(ctx.host);
 
   // Find hooks (checked per call - hooks can be added/removed dynamically)
   const [preHookPath, postHookPath, legacyHookPath] = await Promise.all([
@@ -338,7 +343,7 @@ async function shellToolHookMiddleware(
       postHookPath,
     });
 
-    const hookStart = Date.now();
+    const hookStart = clock.nowMs();
     const preResult = await runPreHook(runtime, preHookPath, hookContext);
 
     // Pre-hook blocked tool
@@ -357,7 +362,7 @@ async function shellToolHookMiddleware(
     // Run post-hook if exists
     if (postHookPath) {
       const postResult = await runPostHook(runtime, postHookPath, hookContext, ctx.result);
-      const hookDurationMs = Date.now() - hookStart;
+      const hookDurationMs = clock.nowMs() - hookStart;
       let hookOutput = postResult.output;
 
       if (!postResult.success && !hookOutput) {
@@ -381,7 +386,7 @@ async function shellToolHookMiddleware(
   if (legacyHookPath) {
     log.debug("[withHooks] Running tool with legacy hook", { toolName, hookPath: legacyHookPath });
 
-    const hookStart = Date.now();
+    const hookStart = clock.nowMs();
     const { result, hook } = await runWithHook<unknown>(
       runtime,
       legacyHookPath,
@@ -399,7 +404,7 @@ async function shellToolHookMiddleware(
         },
       }
     );
-    const hookDurationMs = Date.now() - hookStart;
+    const hookDurationMs = clock.nowMs() - hookStart;
 
     // Hook blocked tool execution (exited before $MUX_EXEC)
     if (!hook.toolExecuted) {
@@ -439,9 +444,9 @@ async function shellToolHookMiddleware(
   // Only post hook exists (no pre) - execute tool then run post
   assert(postHookPath, "shellToolHookMiddleware: expected tool_post path in post-only branch");
   await next();
-  const postStart = Date.now();
+  const postStart = clock.nowMs();
   const postResult = await runPostHook(runtime, postHookPath, hookContext, ctx.result);
-  const hookDurationMs = Date.now() - postStart;
+  const hookDurationMs = clock.nowMs() - postStart;
   if (postResult.output) {
     ctx.result = appendHookOutput(
       ctx.result,

@@ -1,12 +1,13 @@
 /**
  * The story lane's CI helper (.github/workflows/stories.yml), after one `make test-stories`.
  *
- * - `bun tests/stories/summary.ts` prints one Markdown table for the job summary: a row per
- *   selected test of every story job (`tests/stories/.e2e/stories-*`), Electron story job
- *   (`tests/stories/.e2e/stories-electron-*`) and agent-repros job
- *   (`tests/bugbash/.e2e/agent-repros-*`), then one line per job with its spend from
- *   `<job>.spend.json` (launch.ts). A missing or broken report gives a row that says so: the
- *   summary runs after a failed run too, and must show what is there.
+ * - `bun tests/stories/summary.ts` prints the page for the job summary: e2e's own page
+ *   (renderMarkdownReport) of every story job (`tests/stories/.e2e/stories-*`), Electron story
+ *   job (`tests/stories/.e2e/stories-electron-*`) and agent-repros job
+ *   (`tests/bugbash/.e2e/agent-repros-*`), each with its spend from `<job>.spend.json`
+ *   (launch.ts) under its headline. The PR comment (prComment.ts) is this same page, so the job
+ *   summary looks like it (the user's pick). A missing or broken report gives a headline that
+ *   says so: the summary runs after a failed run too, and must show what is there.
  * - `--next-seed <dir>` replaces `<dir>` with the replay caches (`<job>/cache/*.json`) of the
  *   newest web story job and the newest Electron story job that recorded one, so the next run
  *   replays them. Both jobs start from the one seed (seedCacheDir copies it into each cache), so
@@ -18,11 +19,13 @@
  *   failed job's proxy record (`<job>.proxy.jsonl`, launch.ts) holds a provider 5xx, else exit 1.
  *   It prints one line that says why.
  *
- * No import beyond node and the repo: CI runs it with plain bun.
+ * No import beyond node, the repo and e2e: CI runs it with plain bun, and the PR comment job
+ * installs with no lifecycle scripts (pr.yml stories-pr-comment).
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { renderMarkdownReport } from "e2e";
 import {
   checkSeed,
   isSeedEntry,
@@ -31,18 +34,39 @@ import {
 } from "../bugbash/sandbox/cacheSeed";
 import { UNREACHABLE } from "../bugbash/sandbox/proxy";
 
-/** Where make test-stories puts each job's output folder; the story kinds record a cache. */
+/**
+ * Where make test-stories puts each job's output folder; the story kinds record a cache. The
+ * `project` is the job's e2e project (its config's folder), which the report's paths start at.
+ */
 const JOB_KINDS = [
-  { dir: "tests/stories/.e2e", prefix: "stories-", not: "stories-electron-", cache: true },
-  { dir: "tests/stories/.e2e", prefix: "stories-electron-", cache: true },
-  { dir: "tests/bugbash/.e2e", prefix: "agent-repros-", cache: false },
+  {
+    dir: "tests/stories/.e2e",
+    prefix: "stories-",
+    not: "stories-electron-",
+    cache: true,
+    label: "stories",
+    project: "tests/stories",
+  },
+  {
+    dir: "tests/stories/.e2e",
+    prefix: "stories-electron-",
+    cache: true,
+    label: "Electron stories",
+    project: "tests/stories",
+  },
+  {
+    dir: "tests/bugbash/.e2e",
+    prefix: "agent-repros-",
+    cache: false,
+    label: "agent repros",
+    project: "tests/bugbash",
+  },
 ] as const;
 type JobKind = (typeof JOB_KINDS)[number];
 
 type Json = Record<string, unknown>;
 const obj = (v: unknown): Json | undefined =>
   v != null && typeof v === "object" && !Array.isArray(v) ? (v as Json) : undefined;
-const list = (v: unknown): unknown[] => (Array.isArray(v) ? v : []);
 const num = (v: unknown): number | undefined =>
   typeof v === "number" && Number.isFinite(v) ? v : undefined;
 
@@ -87,85 +111,152 @@ function readJson(file: string): { value: unknown } | { problem: string } {
   }
 }
 
-/** A table cell: one line, with no `|` that would split it. */
-const cell = (text: string) => text.replace(/\r?\n/g, " ").replace(/\|/g, "\\|");
-
-const CACHE_MODES = ["self-finalized", "agent-concluded", "missed"] as const;
-
-/** One table row (without the job cell) for a result of report-1 (e2e report/build.d.ts). */
-function resultRow(result: Json): string[] {
-  const title = list(result.titlePath).filter((t) => typeof t === "string");
-  const attempts = list(result.attempts)
-    .map(obj)
-    .filter((a) => a != null);
-  const durationMs = attempts.reduce((sum, a) => sum + (num(a.durationMs) ?? 0), 0);
-  // Model calls are per step (`step.model.calls`, e2e run/steps.d.ts StepModelInfo).
-  const calls: number[] = [];
-  const cache: Record<string, number> = { "self-finalized": 0, "agent-concluded": 0, missed: 0 };
-  for (const attempt of attempts)
-    for (const step of list(attempt.steps)) {
-      const mode = obj(obj(step)?.cache)?.mode;
-      if (typeof mode === "string" && mode in cache) cache[mode] += 1;
-      const stepCalls = num(obj(obj(step)?.model)?.calls);
-      if (stepCalls != null) calls.push(stepCalls);
-    }
-  const status = typeof result.status === "string" ? result.status : "unknown";
-  return [
-    title.length > 0 ? title.join(" › ") : "(no title)",
-    attempts.length > 1 ? `${status} (${attempts.length} attempts)` : status,
-    `${(durationMs / 1000).toFixed(1)} s`,
-    CACHE_MODES.map((m) => cache[m]).join(" / "),
-    calls.length > 0 ? String(calls.reduce((a, b) => a + b, 0)) : "-",
-  ];
+/** What a job's page links to and names. prComment.ts passes the links, the job summary none. */
+export interface PageOptions {
+  /** The lane's model (BUGBASH_MODEL), named in each page's title: "stories (Haiku)". */
+  model?: string;
+  /** Where the run's artifacts are (the run page's #artifacts): each evidence link goes there. */
+  artifactsUrl?: string;
+  /** A link to a line of a file at the tested commit, the path from the checkout root. */
+  sourceUrl?: (file: string, line: number) => string;
 }
 
-/** The rows of one job's report.json: one per selected test, or one that says what is wrong. */
-function jobRows(folder: string): string[][] {
-  const read = readJson(path.join(folder, "report.json"));
-  if ("problem" in read) return [[`(report.json ${read.problem})`, "-", "-", "-", "-"]];
-  const results = obj(obj(read.value)?.run)?.results;
-  if (!Array.isArray(results)) return [["(report.json has no run.results)", "-", "-", "-", "-"]];
-  // A test the selection left out (a tag filter) is in the report as skipped, for the record.
-  const selected = results.map(obj).filter((r) => r != null && r.selected !== false) as Json[];
-  if (selected.length === 0) return [["(no test selected)", "-", "-", "-", "-"]];
-  return selected.map(resultRow);
+/** One job's part of the page: the e2e page with our spend line under its headline. */
+export interface JobSection {
+  passed: boolean;
+  /** The headline, e2e's spend line and ours: what a passing job folds to. */
+  head: string;
+  /** The rest of the e2e page: the failures, the folds and the footer. */
+  rest: string;
 }
 
-/** The job's line under the table: the e2e run status and the spend from `<job>.spend.json`. */
-function jobLine(folder: string): string {
-  const report = readJson(path.join(folder, "report.json"));
-  const run = "value" in report ? obj(obj(report.value)?.run) : undefined;
-  const status = typeof run?.status === "string" ? `e2e ${run.status}` : "no e2e status";
+/** "Haiku" for anthropic:claude-haiku-5-5; the model name for a model of another family. */
+function modelLabel(model: string): string {
+  const family = /haiku|sonnet|opus/i.exec(model)?.[0];
+  if (family != null) return family[0].toUpperCase() + family.slice(1).toLowerCase();
+  return model.replace(/^[^:]*:/, "");
+}
+
+/**
+ * The job's spend from `<job>.spend.json` (launch.ts): the proxy ledger, at list price. e2e's
+ * own spend line shows no cost for these jobs (their reports carry no estimatedCostUsd).
+ */
+/**
+ * Untrusted text as one inline code span: GitHub renders no link, mention or markup inside it.
+ * The fence is one backtick longer than the longest run in the text, so the text cannot close it.
+ */
+function codeSpan(text: string): string {
+  const flat = text.replace(/[\r\n]+/g, " ");
+  const longest = Math.max(0, ...(flat.match(/`+/g) ?? []).map((run) => run.length));
+  const fence = "`".repeat(longest + 1);
+  const pad = flat.startsWith("`") || flat.endsWith("`") ? " " : "";
+  return `${fence}${pad}${flat}${pad}${fence}`;
+}
+
+function spendLine(folder: string): string {
   const read = readJson(`${folder}.spend.json`);
   const spend = "value" in read ? obj(read.value) : undefined;
-  let money = `spend.json ${"problem" in read ? read.problem : "is not an object"}`;
-  if (spend != null) {
-    const usd = (v: unknown) => `$${(num(v) ?? 0).toFixed(2)}`;
-    money =
-      `${usd(spend.spentUsd)} spent of the ${usd(spend.capUsd)} cap, ` +
-      `${num(spend.settled) ?? 0} calls settled, ${num(spend.refused) ?? 0} refused`;
-    if ((num(spend.refused) ?? 0) > 0) money += ` ${JSON.stringify(spend.refusedBy ?? {})}`;
-  }
-  return `- \`${path.basename(folder)}\`: ${status}. ${money}.`;
+  // spend.json comes back from the sandbox, so a PR run controls its text: only numbers and
+  // code spans reach the comment (Phase 4 advisor review of #7140).
+  if (spend == null)
+    return `Spend: no record (spend.json ${"problem" in read ? codeSpan(read.problem) : "is not an object"})`;
+  const usd = (v: unknown) => `$${(num(v) ?? 0).toFixed(2)}`;
+  let line = `Spend: ${usd(spend.spentUsd)} of the ${usd(spend.capUsd)} cap (proxy ledger)`;
+  const refused = num(spend.refused) ?? 0;
+  if (refused > 0)
+    line += `, ${refused} calls refused ${codeSpan(JSON.stringify(spend.refusedBy ?? {}))}`;
+  return line;
 }
 
-/** The Markdown summary of every job output under `root` (a checkout). */
-export function summarize(root: string): string {
-  const folders = JOB_KINDS.flatMap((kind) => jobFolders(root, kind));
-  const lines = ["### Story tests", ""];
-  if (folders.length === 0) {
-    lines.push("No job left output: `make test-stories` stopped before its first job.");
-    return `${lines.join("\n")}\n`;
+type Report = Parameters<typeof renderMarkdownReport>[0];
+
+/** One job's section: the e2e page of its report.json, or a headline that says what is wrong. */
+function jobSection(folder: string, kind: JobKind, options: PageOptions): JobSection {
+  const title = options.model ? `${kind.label} (${modelLabel(options.model)})` : kind.label;
+  const spend = spendLine(folder);
+  const broken = (problem: string): JobSection => ({
+    passed: false,
+    head: `### 🔴 e2e ${title}: report.json ${problem}\n${spend}`,
+    rest: "",
+  });
+  const read = readJson(path.join(folder, "report.json"));
+  if ("problem" in read) return broken(read.problem);
+  const report = obj(read.value);
+  const run = obj(report?.run);
+  if (report?.schemaVersion !== "report-1" || !Array.isArray(run?.results))
+    return broken("is not an e2e report-1 document");
+  const sourceUrl = options.sourceUrl;
+  let page: string;
+  try {
+    page = renderMarkdownReport(report as unknown as Report, {
+      title,
+      artifactsUrl: options.artifactsUrl,
+      // The report's files are relative to the e2e project (the config's folder).
+      sourceUrl:
+        sourceUrl && ((file, line) => sourceUrl(path.posix.join(kind.project, file), line)),
+    });
+  } catch {
+    // The file is the job's output, made in the sandbox: a shape e2e cannot read is a broken job.
+    return broken("could not be rendered");
   }
-  lines.push(
-    "| Job | Test | Status | Duration | Cache: self-finalized / agent-concluded / missed | Model calls |",
-    "| --- | --- | --- | --- | --- | --- |"
+  // e2e's page opens with its head (the headline, then its spend line) and a blank line.
+  const cut = page.indexOf("\n\n");
+  const head = cut === -1 ? page.trimEnd() : page.slice(0, cut);
+  const rest = cut === -1 ? "" : page.slice(cut + 2);
+  return { passed: run?.status === "passed", head: `${head}\n${spend}`, rest };
+}
+
+/** Each job's section, in JOB_KINDS order (the order make test-stories runs them), oldest first. */
+export function jobSections(root: string, options: PageOptions = {}): JobSection[] {
+  return JOB_KINDS.flatMap((kind) =>
+    jobFolders(root, kind).map((folder) => jobSection(folder, kind, options))
   );
-  for (const folder of folders)
-    for (const row of jobRows(folder))
-      lines.push(`| ${[`\`${path.basename(folder)}\``, ...row].map(cell).join(" | ")} |`);
-  lines.push("", ...folders.map(jobLine));
-  return `${lines.join("\n")}\n`;
+}
+
+export const NO_OUTPUT_NOTE =
+  "No job left output: `make test-stories` stopped before its first job. See the run log.";
+export const CLIPPED_NOTE =
+  "_Clipped to fit a pull request comment: the full reports are in the run artifacts._";
+
+/** The first lines of `text` that fit in `max` characters with the note, its open folds closed. */
+function clip(text: string, max: number): string {
+  const lines = text.split("\n");
+  const render = (count: number) => {
+    const kept = lines.slice(0, count);
+    const tags = (tag: string) => kept.filter((line) => line.includes(tag)).length;
+    const unclosed = Math.max(0, tags("<details") - tags("</details>"));
+    return [...kept, ...Array<string>(unclosed).fill("</details>"), "", CLIPPED_NOTE].join("\n");
+  };
+  let count = 0;
+  let size = CLIPPED_NOTE.length + 2;
+  while (count < lines.length && size + lines[count].length + 1 <= max)
+    size += lines[count++].length + 1;
+  while (count > 0 && render(count).length > max) count--; // room for the closing tags
+  return render(count);
+}
+
+/**
+ * The page of the jobs (jobSections), one section per job, at most `maxChars` long. The PR
+ * comment (prComment.ts) and the job summary show this same page (the user's pick: one format
+ * everywhere). Over the limit, passing jobs fold to their head first; then each other job's rest
+ * gets an equal share and is clipped to it.
+ */
+export function storyPage(
+  sections: readonly JobSection[],
+  maxChars = Number.POSITIVE_INFINITY
+): string {
+  if (sections.length === 0) return `${NO_OUTPUT_NOTE}\n`;
+  const render = (parts: readonly JobSection[]) =>
+    parts.map((p) => (p.rest === "" ? `${p.head}\n` : `${p.head}\n\n${p.rest}`)).join("\n");
+  let parts = [...sections];
+  if (render(parts).length <= maxChars) return render(parts);
+  parts = parts.map((p) => (p.passed ? { ...p, rest: "" } : p));
+  if (render(parts).length <= maxChars) return render(parts);
+  const heads = render(parts.map((p) => ({ ...p, rest: "" }))).length;
+  const open = parts.filter((p) => p.rest !== "").length;
+  // Each rest adds a blank line before it and a newline after it.
+  const share = Math.floor((maxChars - heads) / open) - 2;
+  return render(parts.map((p) => (p.rest === "" ? p : { ...p, rest: `${clip(p.rest, share)}\n` })));
 }
 
 /**
@@ -316,7 +407,7 @@ if (import.meta.main) {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const args = process.argv.slice(2);
   if (args.length === 0) {
-    process.stdout.write(summarize(root));
+    process.stdout.write(storyPage(jobSections(root, { model: process.env.BUGBASH_MODEL })));
   } else if (args.length === 2 && args[0] === "--next-seed") {
     const count = nextSeed(root, path.resolve(args[1]));
     console.error(

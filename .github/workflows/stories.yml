@@ -2,19 +2,43 @@ name: Stories
 
 # The agentic story lane (`make test-stories`): the story tests, the Electron stories and the
 # agent-tagged repros, each as a model-driven job in the bug-bash sandbox. pr.yml calls it in the
-# merge queue (its `stories` job), and Required counts its result only when the repo variable
-# STORIES_MODE is "block". Unset is warn mode: a failure shows in the queue but blocks no merge.
+# merge queue (its `stories` job, Sonnet 5.5), and Required counts its result only when the repo
+# variable STORIES_MODE is "block". Unset is warn mode: a failure shows in the queue but blocks no
+# merge. pr.yml also calls it on each push to a PR that is not a draft (its `stories-pr` job):
+# Haiku on PRs, Sonnet in the queue. Required counts that result only when STORIES_PR_MODE is
+# "block".
 #
 # Triggers: change only this block to pick when it runs. The job below works unchanged under
 # pull_request, merge_group (called from pr.yml), schedule and workflow_dispatch.
 on:
-  # From pr.yml's merge_group run, once for each PR in the merge queue: the user's pick over every
-  # PR push (about $500 against $1,700 a month at Phase 2 prices). No merge_group trigger of its
-  # own, else each queue entry runs it twice. The caller passes the key by name.
+  # From pr.yml's merge_group run, once for each PR in the merge queue (Sonnet 5.5, $3 a job), and
+  # from its pull_request run on each push to a PR that is not a draft (Haiku 5.5, $1 a job). No
+  # trigger of its own for either, else each runs it twice. The caller passes the key by name.
   workflow_call:
+    inputs:
+      # The explorer and judge model of every job (launch.ts reads BUGBASH_MODEL). Unset: Sonnet.
+      model:
+        type: string
+        required: false
+      # The model that judges the story suites' asserts instead (BUGBASH_JUDGE_MODEL,
+      # storyConfig.ts). Unset: `model` judges. The agent repros always judge with `model`.
+      judge_model:
+        type: string
+        required: false
+      # The cap per job at list price, in $. Unset: 3.
+      budget_usd:
+        type: string
+        required: false
     secrets:
       ANTHROPIC_API_KEY:
         required: true
+    # The model the jobs ran, for the titles of pr.yml's PR comment (stories-pr-comment).
+    outputs:
+      model:
+        value: ${{ jobs.stories.outputs.model }}
+      # The reports artifact of the attempt that ran the lane (pr.yml's comment job downloads it).
+      reports_artifact:
+        value: ${{ jobs.stories.outputs.reports_artifact }}
   # One run a night on main: it keeps main's replay cache warm (GitHub evicts a cache that no
   # run reads for 7 days). A merge-queue run saves under its own queue ref, which no run
   # restores, so this run is the one that every other run restores first.
@@ -24,7 +48,8 @@ on:
   workflow_dispatch: {}
 
 # One run per PR (or per ref for the other events: a merge-queue entry has its own ref), and a
-# new push cancels the old run, so its model calls stop too. A fixed prefix, not
+# new push cancels the old run, so its model calls stop too. A ref starts with refs/, so a PR
+# run's group never equals a queue, nightly or dispatched run's group. A fixed prefix, not
 # github.workflow: a called workflow sees the caller's name ("PR"), and a group equal to
 # pr.yml's would cancel the caller's run or be cancelled with it.
 concurrency:
@@ -36,9 +61,11 @@ permissions:
 
 jobs:
   stories:
-    # pr.yml's caller job is "Test / Stories", so the queue shows "Test / Stories / make test-stories".
+    # pr.yml's caller jobs are "Test / Stories" (queue) and "Test / Stories (Haiku)" (PR), so the
+    # checks read "Test / Stories / make test-stories" and "Test / Stories (Haiku) / make test-stories".
     name: make test-stories
-    # Only for pull_request (off now, see on:): fork and Dependabot PRs get no Actions secrets.
+    # For pull_request (pr.yml's stories-pr, which has the same guard): fork and Dependabot PRs
+    # get no Actions secrets.
     if: github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
     runs-on: ${{ github.repository_owner == 'coder' && 'depot-ubuntu-22.04-16' || 'ubuntu-latest' }}
     # In the merge queue: under the ruleset's 60 minutes for checks, so a hung run fails here
@@ -51,6 +78,13 @@ jobs:
       # The cache key's ref: the PR branch on pull_request, else the ref name (a branch, or
       # gh-readonly-queue/main/pr-<n>-<sha> in the merge queue). In env, not inline in run:.
       CACHE_REF: ${{ github.head_ref || github.ref_name }}
+      # The model of every job, and the pages' titles (summary.ts). schedule and
+      # workflow_dispatch have no inputs: Sonnet 5.5.
+      BUGBASH_MODEL: ${{ inputs.model || 'anthropic:claude-sonnet-5-5' }}
+      BUGBASH_JUDGE_MODEL: ${{ inputs.judge_model || '' }}
+    outputs:
+      model: ${{ env.BUGBASH_MODEL }}
+      reports_artifact: stories-reports-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -98,11 +132,65 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ANTHROPIC_BASE_URL: https://api.anthropic.com
           BUGBASH_AI: mock
-          # The cap per job, so one run spends at most three times this, six with the retry.
-          BUGBASH_BUDGET_USD: "3"
+          # The cap per job, so one run spends at most three times this, six with the retry. $3
+          # unless the caller passes budget_usd ($1 for the PR lane).
+          BUGBASH_BUDGET_USD: ${{ inputs.budget_usd || '3' }}
+      # The e2e page of each job, as in the PR comment (summary.ts).
       - name: Summary
         if: always()
         run: bun tests/stories/summary.ts >> "$GITHUB_STEP_SUMMARY"
+      # Each job's report.json and spend.json, for pr.yml's PR comment (stories-pr-comment), and
+      # the first run's under first-try/ after the 5xx retry. The proxy records too: a job that
+      # its probe's 5xx refused has no report, only its record (summary.ts --upstream-fault).
+      # Copied into one folder first: the first run's outputs are outside the checkout, and
+      # upload-artifact would root the artifact at the folder above both. The attempt in the
+      # name: a re-run uploads its own.
+      - name: Collect the reports
+        if: ${{ !cancelled() }}
+        run: |
+          shopt -s nullglob
+          collect() (
+            cd "$1" || exit 0
+            files=(tests/stories/.e2e/stories-*/report.json tests/stories/.e2e/stories-*.{spend.json,proxy.jsonl}
+              tests/bugbash/.e2e/agent-repros-*/report.json tests/bugbash/.e2e/agent-repros-*.{spend.json,proxy.jsonl})
+            mkdir -p "$2"
+            if ((${#files[@]})); then cp --parents "${files[@]}" "$2"; fi
+            # Every job folder, also one without report.json (a job that stopped before it wrote
+            # one): the page then says the report is missing, not that no job ran (Codex review).
+            for dir in tests/stories/.e2e/stories-*/ tests/bugbash/.e2e/agent-repros-*/; do
+              mkdir -p "$2/$dir"
+            done
+          )
+          collect . "$RUNNER_TEMP/stories-reports"
+          # Always one file, so the artifact exists even when no job left output: the comment job
+          # then says so, and treats a failed download as a download error (pr.yml).
+          echo "${{ github.run_id }}-${{ github.run_attempt }}" > "$RUNNER_TEMP/stories-reports/collected"
+          if [[ -d "$RUNNER_TEMP/first-try" ]]; then
+            collect "$RUNNER_TEMP/first-try" "$RUNNER_TEMP/stories-reports/first-try"
+          fi
+      - name: Upload the reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: stories-reports-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/stories-reports
+          # The job folders sit under .e2e/, and upload-artifact skips hidden paths by default:
+          # without this the artifact is empty (seen on #7140's own run).
+          include-hidden-files: true
+          if-no-files-found: ignore
+          retention-days: 7
+      # The screenshots, logs and traces the failure blocks link to (the run's #artifacts).
+      - name: Upload the evidence
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: stories-evidence-${{ github.run_attempt }}
+          path: |
+            tests/stories/.e2e/stories-*/results
+            tests/bugbash/.e2e/agent-repros-*/results
+          include-hidden-files: true # the results sit under .e2e/ (see the reports upload)
+          if-no-files-found: ignore
+          retention-days: 7
       # Every run saves its seed, a failed one too: e2e (read-write mode) saves a recording only
       # once a check after it passed, and deletes an entry that replayed into a failure. When no
       # job recorded an entry, the restored seed is saved again as it is. Not in the merge queue:

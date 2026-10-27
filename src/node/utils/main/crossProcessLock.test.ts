@@ -1,4 +1,4 @@
-import { describe, expect, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { constants as fsConstants } from "node:fs";
 import * as fsPromises from "node:fs/promises";
@@ -17,8 +17,18 @@ import {
   inspectCrossProcessLock,
 } from "./crossProcessLock";
 
+/** The folders that tempLockPath() made in the current test; afterEach removes them (#7326). */
+const tempLockDirs: string[] = [];
+
+afterEach(async () => {
+  for (const dir of tempLockDirs.splice(0)) {
+    await fsPromises.rm(dir, { recursive: true, force: true });
+  }
+});
+
 async function tempLockPath(): Promise<string> {
   const dir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "cross-process-lock-"));
+  tempLockDirs.push(dir);
   return path.join(dir, "test.lock");
 }
 
@@ -636,6 +646,247 @@ describe("supersede guards", () => {
       token: "r",
     });
     await writeRecord(lockPath, { ...identity, pid: deadReclaimer, token: "r" });
+    await expectAcquired(lockPath);
+  });
+});
+
+/**
+ * Plant a dead lock record and `guards` dead takeover guards nested over it: each guard is the
+ * one a reclaimer of the target below takes (see supersede()). Returns the innermost level.
+ */
+async function plantDeadChain(
+  lockPath: string,
+  guards: number,
+  identity: Record<string, unknown>
+): Promise<{ target: string; key: string }> {
+  const dead = deadPid();
+  let level = { target: lockPath, key: "dead-holder" };
+  await writeRecord(lockPath, { ...identity, pid: dead, token: level.key });
+  for (let depth = 1; depth <= guards; depth++) {
+    const guard = guardPath(lockPath, level.target, level.key);
+    level = { target: guard, key: `dead-guard-${depth}` };
+    await writeRecord(guard, { ...identity, pid: dead, token: level.key });
+  }
+  return level;
+}
+
+/** Run `hook` right after the next `name` call that targets `lockPath`, whatever its outcome. */
+function afterNext(name: "link" | "rename", lockPath: string, hook: () => Promise<void>) {
+  const real = fsPromises[name];
+  let fired = false;
+  return spyOn(fsPromises, name).mockImplementation(async (from, to) => {
+    if (fired || String(to) !== lockPath) return real(from, to);
+    fired = true;
+    try {
+      return await real(from, to);
+    } finally {
+      await hook();
+    }
+  });
+}
+
+// Each test below kills mutants that the phase 4 whole-file mutation run left alive (#7255).
+describe("takeover and ownership edges", () => {
+  test.skipIf(linuxOnly)("a live guard nested under a dead guard blocks the takeover", async () => {
+    const lockPath = await tempLockPath();
+    const identity = await ownIdentity();
+    const inner = await plantDeadChain(lockPath, 1, identity);
+    const reclaimer = liveProcess();
+    try {
+      await writeRecord(guardPath(lockPath, inner.target, inner.key), {
+        ...identity,
+        pid: reclaimer.pid,
+        birth: probeProcessBirth(reclaimer.pid),
+        token: "stalled",
+      });
+      await expectRefused(lockPath, 0);
+      expect(await readToken(lockPath)).toBe("dead-holder");
+    } finally {
+      reclaimer.stop();
+    }
+  });
+
+  test("takes over dead guards nested up to the bound and refuses one level deeper", async () => {
+    const identity = await ownIdentity();
+    const atBound = await tempLockPath();
+    await plantDeadChain(atBound, 8, identity);
+    await expectAcquired(atBound);
+    expect(await fsPromises.readdir(path.dirname(atBound))).toEqual([]);
+    const tooDeep = await tempLockPath();
+    await plantDeadChain(tooDeep, 9, identity);
+    await expectRefused(tooDeep, 0);
+    expect(await readToken(tooDeep)).toBe("dead-holder");
+  });
+
+  test("never reports ownership while another record, or none, is in the lock", async () => {
+    const foreign = { pid: deadPid(), token: "foreign" };
+    // A record replaces ours between the takeover's rename and its confirmation.
+    const takenOver = await tempLockPath();
+    await writeRecord(takenOver, { pid: foreign.pid, token: "dead-holder" });
+    // A record replaces ours between the create's link and its confirmation.
+    const created = await tempLockPath();
+    // The lock vanishes between a failed create and the next observation.
+    const vanished = await tempLockPath();
+    await writeRecord(vanished, foreign);
+    for (const [lockPath, name, hook] of [
+      [takenOver, "rename", () => writeRecord(takenOver, foreign)],
+      [created, "link", () => writeRecord(created, foreign)],
+      [vanished, "link", () => fsPromises.rm(vanished)],
+    ] as const) {
+      const spy = afterNext(name, lockPath, hook);
+      try {
+        await expectRefused(lockPath, 0);
+      } finally {
+        spy.mockRestore();
+      }
+    }
+  });
+
+  test.skipIf(unixOnly)("an unreadable takeover guard refuses the takeover", async () => {
+    if (process.getuid?.() === 0) return; // root ignores modes
+    const lockPath = await tempLockPath();
+    await writeRecord(lockPath, { pid: deadPid(), token: "dead-holder" });
+    const guard = guardPath(lockPath, lockPath, "dead-holder");
+    await writeRecord(guard, { pid: deadPid(), token: "dead-guard" });
+    await fsPromises.chmod(guard, 0o000);
+    try {
+      expect((await expectRefused(lockPath, 0)).message).toContain("cannot be read");
+      expect(await readToken(lockPath)).toBe("dead-holder");
+    } finally {
+      await fsPromises.chmod(guard, 0o600);
+    }
+  });
+
+  test("renewal never rewrites another holder's record", async () => {
+    const lockPath = await tempLockPath();
+    const release = await acquireCrossProcessLock({ ...baseOptions, lockPath, staleMs: 1_000 });
+    await writeRecord(lockPath, { pid: process.pid, token: "successor" });
+    await sleep(600); // Two renewal ticks (staleMs / 4).
+    expect(await readToken(lockPath)).toBe("successor");
+    await release();
+  });
+
+  test("renewal ticks never overlap, and one in flight at release never renames back", async () => {
+    const lockPath = await tempLockPath();
+    const release = await acquireCrossProcessLock({ ...baseOptions, lockPath, staleMs: 1_000 });
+    const { writeFile, rename } = fsPromises;
+    const unblock = Promise.withResolvers<void>();
+    const renewing = Promise.withResolvers<void>();
+    let releasing = false;
+    let renewals = 0;
+    let renamesAfterRelease = 0;
+    const writeSpy = spyOn(fsPromises, "writeFile").mockImplementation(async (file, data) => {
+      if (typeof file === "string" && file.startsWith(`${lockPath}.tmp-`)) {
+        renewals += 1;
+        renewing.resolve();
+        await unblock.promise;
+      }
+      return writeFile(file, data);
+    });
+    const renameSpy = spyOn(fsPromises, "rename").mockImplementation((from, to) => {
+      if (releasing && String(to) === lockPath) renamesAfterRelease += 1;
+      return rename(from, to);
+    });
+    try {
+      await renewing.promise;
+      await sleep(600); // Two more ticks pass while the first one is blocked.
+      expect(renewals).toBe(1);
+      releasing = true;
+      const released = release();
+      unblock.resolve();
+      await released;
+    } finally {
+      writeSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+    expect(renamesAfterRelease).toBe(0);
+    expect(await pathExists(lockPath)).toBe(false);
+  });
+
+  test("a try-lock makes one attempt, even within the deadline's millisecond", async () => {
+    const lockPath = await tempLockPath();
+    const release = await acquireCrossProcessLock({ lockPath, ...baseOptions });
+    const frozen = Date.now();
+    const now = spyOn(Date, "now").mockReturnValue(frozen);
+    // Count the attempts (each one links a record onto lockPath) instead of
+    // racing a timer, so host load cannot change the result (#7326). A retry
+    // moves the clock past the deadline, so a retrying build still ends.
+    const realLink = fsPromises.link;
+    let attempts = 0;
+    const linkSpy = spyOn(fsPromises, "link").mockImplementation((from, to) => {
+      if (String(to) === lockPath) {
+        attempts += 1;
+        if (attempts > 1) now.mockReturnValue(frozen + 1);
+      }
+      return realLink(from, to);
+    });
+    try {
+      await expectRefused(lockPath, 0);
+    } finally {
+      linkSpy.mockRestore();
+      now.mockRestore();
+      await release();
+    }
+    expect(attempts).toBe(1);
+  });
+
+  test("malformed records read as corrupt; valid edge records read as holders", async () => {
+    // Each record must probe like plain corrupt bytes; a holder record names its pid instead.
+    const lockPath = await tempLockPath();
+    await fsPromises.writeFile(lockPath, "not json");
+    const corrupt = await inspectCrossProcessLock(lockPath);
+    expect(corrupt).toMatchObject({ state: "held", holder: "an unknown holder" });
+    for (const text of [
+      "null",
+      '{"pid":1.5,"token":"t","acquiredAt":1}',
+      '{"pid":0,"token":"t","acquiredAt":1}',
+      '{"pid":"7","token":"t","acquiredAt":1}',
+      '{"pid":2,"token":"","acquiredAt":1}',
+      '{"pid":2,"token":"t"}',
+      '{"pid":2,"token":"t","acquiredAt":1e999}',
+    ]) {
+      await fsPromises.writeFile(lockPath, text);
+      expect({ text, probe: await inspectCrossProcessLock(lockPath) }).toEqual({
+        text,
+        probe: corrupt,
+      });
+    }
+    // pid 1 always runs, and a one-character token is valid.
+    await fsPromises.writeFile(lockPath, '{"pid":1,"token":"x","acquiredAt":1}');
+    const probe = await inspectCrossProcessLock(lockPath);
+    expect(probe.state === "held" && probe.holder).toContain("pid 1 ");
+  });
+
+  test("release gives up after 40 failed unlinks and retires the token", async () => {
+    const lockPath = await tempLockPath();
+    const release = await acquireCrossProcessLock({ lockPath, ...baseOptions });
+    const realRm = fsPromises.rm;
+    let attempts = 0;
+    const rmSpy = spyOn(fsPromises, "rm").mockImplementation((target, options) => {
+      if (String(target) !== lockPath) return realRm(target, options);
+      attempts += 1;
+      return Promise.reject(new Error("EBUSY: resource busy"));
+    });
+    try {
+      await release();
+    } finally {
+      rmSpy.mockRestore();
+    }
+    expect(attempts).toBe(40);
+    await expectAcquired(lockPath);
+  }, 10_000);
+
+  test("the record of an attempt that threw is reclaimed by the next acquire", async () => {
+    const lockPath = await tempLockPath();
+    const failure = new Error("EIO after the link");
+    const spy = afterNext("link", lockPath, () => Promise.reject(failure));
+    try {
+      const attempt = acquireCrossProcessLock({ lockPath, ...baseOptions });
+      expect(await attempt.catch((error: unknown) => error)).toBe(failure);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(await pathExists(lockPath)).toBe(true);
     await expectAcquired(lockPath);
   });
 });

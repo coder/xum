@@ -63,13 +63,9 @@ import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 import type { AIService } from "@/node/services/aiService";
 import type { StreamEndEvent } from "@/common/types/stream";
 import { EventEmitter } from "events";
-import { createAgentSessionHarness } from "@/node/services/agentSession.testHarness";
-import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
-import { ContextManagementService } from "@/node/services/contextManagement/contextManagementService";
-import { ExtensionMetadataService } from "@/node/services/ExtensionMetadataService";
-import type { InitStateManager } from "@/node/services/initStateManager";
 import type { TurnCompletion } from "@/node/services/streamManager";
-import { WorkspaceService } from "@/node/services/workspaceService";
+import type { WorkspaceService } from "@/node/services/workspaceService";
+import { createRealHostWorkspaceService } from "@/node/services/workspaceService.testHarness";
 
 /**
  * G1 — attempt identity, lineage and the send-admission lifecycle (Changes 1, 2, 3a). Receipt
@@ -3653,18 +3649,12 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         const streamStarts: Array<Array<{ attemptId: string; state: string; owned: boolean }>> = [];
         // Filled once the TaskService exists; the stream mock below reads it at stream start.
         const ledger: { svc?: Internals } = {};
-        const sessionHarness = await createAgentSessionHarness({
-          workspaceId: taskId,
+        const host = createRealHostWorkspaceService({
           config,
           historyService,
           aiEmitter,
           aiServiceOverrides: {
             isStreaming: () => completions.length > 0,
-            getWorkspaceMetadata: mock(async (workspaceId: string) => {
-              const all = await config.getAllWorkspaceMetadata();
-              const found = all.find((m) => m.id === workspaceId);
-              return found ? Ok(found) : Err("not found");
-            }),
             streamMessage: mock(() => {
               const completion = Promise.withResolvers<TurnCompletion>();
               completions.push(completion);
@@ -3692,34 +3682,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             }),
           },
         });
-        const backgroundProcessManager = Object.assign(new EventEmitter(), {
-          cleanup: mock(() => Promise.resolve()),
-          hasRunningBackgroundProcesses: mock(() => false),
-          hasOrphanedRunningBackgroundProcesses: mock(() => Promise.resolve(false)),
-          getForegroundToolCallIds: mock(() => []),
-        }) as unknown as BackgroundProcessManager;
-        const initStateManager = {
-          on: mock(() => undefined),
-          off: mock(() => undefined),
-          getInitState: mock(() => undefined),
-          waitForInit: mock(() => Promise.resolve()),
-          clearInMemoryState: mock(() => undefined),
-          getUnsanitizedCheckoutError: mock(() => undefined),
-        } as unknown as InitStateManager;
-        const aiService = sessionHarness.aiService as unknown as AIService;
-        const workspaceService = new WorkspaceService(
-          config,
-          historyService,
-          aiService,
-          new ContextManagementService({ config, historyService, aiService }),
-          initStateManager,
-          new ExtensionMetadataService(path.join(config.rootDir, "fence-extension-metadata.json")),
-          backgroundProcessManager
-        );
-        (workspaceService as unknown as { sessions: Map<string, unknown> }).sessions.set(
-          taskId,
-          sessionHarness.session
-        );
+        const { service: workspaceService, aiService } = host;
         const { taskService } = createHarness(config, {
           aiService,
           workspaceService: workspaceService as unknown as WorkspaceHost,
@@ -3794,8 +3757,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           for (const completion of completions) {
             completion.resolve({ status: "aborted", abortReason: "user" });
           }
-          await sessionHarness.session.dispose();
-          await sessionHarness.cleanup();
+          await host.dispose();
         }
       },
       20_000

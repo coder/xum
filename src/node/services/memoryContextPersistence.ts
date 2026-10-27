@@ -1,19 +1,19 @@
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { z } from "zod";
 import type { Config } from "@/node/config";
 import { log } from "@/node/services/log";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { MemorySessionContext } from "@/node/services/memoryService";
 import { isErrnoWithCode } from "@/node/utils/fs";
-import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 /**
  * Session file that holds the memory context of the current context window.
  *
  * Why it exists: AgentSession freezes the memory context (memory index in the memory tool
- * description, hot-memories block in the system prompt) per context window. The cache lived
+ * description) per context window. The cache lived
  * only in RAM, so a server restart rebuilt it from memory files that other agents had changed
  * meanwhile. The next request then had a different system prompt or tool list. Anthropic
  * rejected every replayed thinking block with a 400 ("The `system` prompt differs from the one
@@ -25,21 +25,22 @@ export const MEMORY_CONTEXT_FILE_NAME = "memory-context.json";
 /** One model's cached memory context and the gates it was built under. */
 export interface CachedMemoryContext {
   context: MemorySessionContext | null;
-  includesHotMemories: boolean;
   memoryEnabled: boolean;
-  hotSetEnabled: boolean;
 }
 
+// The removed Memory Hot Set experiment left three fields in the file. They are read and
+// ignored (files written by older builds hold them) and always written as constants (see
+// toFile()).
 const CachedMemoryContextSchema = z.object({
   context: z
     .object({
       indexEntries: z.array(z.object({ path: z.string(), description: z.string() })),
-      hotMemoriesBlock: z.string().nullable(),
+      hotMemoriesBlock: z.string().nullable().optional(),
     })
     .nullable(),
-  includesHotMemories: z.boolean(),
+  includesHotMemories: z.boolean().optional(),
   memoryEnabled: z.boolean(),
-  hotSetEnabled: z.boolean(),
+  hotSetEnabled: z.boolean().optional(),
 });
 
 const MemoryContextFileSchema = z.object({
@@ -59,9 +60,15 @@ function toFile(
   const data: MemoryContextFile = { version: 1, windowKey, contexts: {} };
   for (const [modelString, cached] of entries) {
     data.contexts[modelString] = {
-      includesHotMemories: cached.includesHotMemories,
+      // Downgrade compatibility: an older build reuses a saved context only when it holds the
+      // hot set (includesHotMemories) and was built under its Hot Set gate (hotSetEnabled).
+      // These constants say "complete, hot set off, no block", so an older build with Hot Set
+      // off reuses the context instead of rebuilding it. A rebuild can change the memory
+      // index, and Anthropic then rejects the replayed thinking blocks with a 400 (see the
+      // header comment).
+      includesHotMemories: true,
       memoryEnabled: cached.memoryEnabled,
-      hotSetEnabled: cached.hotSetEnabled,
+      hotSetEnabled: false,
       context:
         cached.context == null
           ? null
@@ -70,7 +77,7 @@ function toFile(
                 path: entry.path,
                 description: entry.description,
               })),
-              hotMemoriesBlock: cached.context.hotMemoriesBlock,
+              hotMemoriesBlock: null,
             },
     };
   }
@@ -94,7 +101,9 @@ export class MemoryContextStore {
 
   constructor(
     config: Config,
-    private readonly workspaceId: string
+    private readonly workspaceId: string,
+    /** The session files of the workspace (phase 5). Absent: the Node layer. */
+    private readonly files: SessionFiles = nodeSessionFiles
   ) {
     assert(workspaceId.length > 0, "MemoryContextStore requires a workspace id");
     this.filePath = path.join(config.sessionsDir, workspaceId, MEMORY_CONTEXT_FILE_NAME);
@@ -111,7 +120,7 @@ export class MemoryContextStore {
     const generation = this.generation;
     const raw = await this.enqueue("read", async () => {
       try {
-        return await fs.readFile(this.filePath, "utf-8");
+        return await this.files.promises.readFile(this.filePath, "utf-8");
       } catch (error) {
         if (isErrnoWithCode(error, "ENOENT")) return null;
         throw error;
@@ -130,10 +139,15 @@ export class MemoryContextStore {
       this.warn("Ignoring malformed", parsed.error);
       return null;
     }
-    return {
-      windowKey: parsed.data.windowKey,
-      contexts: new Map(Object.entries(parsed.data.contexts)),
-    };
+    const contexts = new Map<string, CachedMemoryContext>();
+    for (const [modelString, saved] of Object.entries(parsed.data.contexts)) {
+      // Drop the retired Hot Set fields: the runtime entry holds only what the prompt uses.
+      contexts.set(modelString, {
+        context: saved.context == null ? null : { indexEntries: saved.context.indexEntries },
+        memoryEnabled: saved.memoryEnabled,
+      });
+    }
+    return { windowKey: parsed.data.windowKey, contexts };
   }
 
   /** Returns true only when the file now holds these contexts. */
@@ -148,8 +162,8 @@ export class MemoryContextStore {
     const written = await this.enqueue("write", async () => {
       // A window boundary that ran while this write waited owns the file now.
       if (generation !== this.generation) return false;
-      await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-      await writeFileAtomic(this.filePath, JSON.stringify(toFile(windowKey, entries)));
+      await this.files.promises.mkdir(path.dirname(this.filePath), { recursive: true });
+      await this.files.writeFileAtomic(this.filePath, JSON.stringify(toFile(windowKey, entries)));
       return true;
     });
     return written === true;
@@ -158,7 +172,7 @@ export class MemoryContextStore {
   /** A window boundary: the saved context must not reach the next window. */
   async discard(): Promise<void> {
     this.generation++;
-    await this.enqueue("delete", () => fs.rm(this.filePath, { force: true }));
+    await this.enqueue("delete", () => this.files.promises.rm(this.filePath, { force: true }));
   }
 
   /** Run one file operation after the earlier ones; a failure logs and resolves undefined. */

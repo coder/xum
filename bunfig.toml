@@ -1,3 +1,13 @@
 [test]
 root = "src"
 preload = ["./tests/setup.ts"]
+
+[install]
+# Resolve only releases at least a week old (in seconds) when bun.lock changes (bun add, bun
+# update, a non-frozen install): a compromised release is usually caught and pulled within days
+# (#7227). Installs from bun.lock (--frozen-lockfile) are unaffected. To take a newer release on
+# purpose (an urgent fix), list the package in minimumReleaseAgeExcludes.
+minimumReleaseAge = 604800
+# happy-dom 21.0.4 (2026-10-20) fixes 3 high alerts (#7384). Remove the entry after 2026-10-27, when
+# it is a week old.
+minimumReleaseAgeExcludes = ["happy-dom"]

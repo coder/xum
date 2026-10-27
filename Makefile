@@ -91,14 +91,14 @@ include fmt.mk
 .PHONY: all build dev start clean help
 .PHONY: build-renderer version build-icons build-static build-docker-runtime verify-docker-runtime-artifacts
 .PHONY: lint lint-eslint lint-full lint-fix check-oxlint-config typecheck static-check static-check-full
-.PHONY: crap crap-check test-crap-scripts
+.PHONY: crap crap-check test-crap-scripts tree-sitter-grammars dry-check test-dry-scripts mutate-check test-mutate-scripts
 .PHONY: test-bugbash-repros test-bugbash-known-failures bugbash-sandbox-key bugbash-sandbox-image bugbash-sandbox-publish bug-bash-sandbox-recover bug-bash-sandbox-check test-bugbash-repros-sandbox
-.PHONY: test test-unit test-unit-ci test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
+.PHONY: test test-unit test-unit-ci test-host-proof test-integration test-watch test-coverage test-e2e test-e2e-perf perf-tape-replay smoke-test
 .PHONY: dist dist-mac dist-win dist-linux install-mac-arm64 ensure-mac-sharp-runtime-deps check-appimage-icons check-mac-attach-file-runtime
 .PHONY: vscode-ext vscode-ext-install
 .PHONY: docs-server check-docs-links
 .PHONY: storybook storybook-run storybook-build storybook-flake-check test-storybook storybook-budget
-.PHONY: benchmark-terminal bench bench-compare first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
+.PHONY: benchmark-terminal bench bench-compare test-loop-baseline first-load-js page-timing first-run-view-parity bug-bash mcp-apps-e2e test-stories generate-phone-chrome check-phone-chrome
 .PHONY: ensure-deps mux
 .PHONY: check-startup-imports check-startup-imports-runtime check-react-compiler check-test-routing check-test-seam-comments test-bench-scripts
 
@@ -543,21 +543,17 @@ STATIC_CHECKS := typecheck fmt-check check-startup-imports check-react-compiler 
 
 static-check: lint $(STATIC_CHECKS) ## Run fast local static checks
 
-static-check-full: lint-full $(STATIC_CHECKS) check-bench-agent test-bench-scripts test-crap-scripts check-docs-links ## Run the full CI static check suite
+static-check-full: lint-full $(STATIC_CHECKS) check-bench-agent test-bench-scripts test-crap-scripts test-dry-scripts test-mutate-scripts check-docs-links ## Run the full CI static check suite
 
-# Harbor version for benchmark-terminal and the adapter tests below, so CI tests the
-# adapter against the same Harbor API the scheduled benchmark runs.
-TB_HARBOR_VERSION := 0.6.4
-
-# pytest is not a repo dependency; uv (installed in CI's static-check job) supplies it.
+# The Python tools (pytest, Harbor, Crapper, ...) come from pyproject.toml's dependency groups.
+# `uv run --locked --only-group <group>` installs a group exactly as uv.lock pins it, and fails
+# when uv.lock is out of date. uv fetches a managed Python 3.12 if the system has none.
 test-bench-scripts: ## Test the Terminal-Bench result checker and agent adapter with offline fixtures
-	@uv run --no-project --with pytest python -m pytest -q scripts/check_tbench_results_test.py
-	@# Harbor requires Python >=3.12 and CI's system python is older; uv fetches a managed 3.12 if needed.
-	@uv run --no-project --python 3.12 --with 'harbor==$(TB_HARBOR_VERSION)' --with pytest python -m pytest -q benchmarks/terminal_bench/mux_agent_test.py
+	@uv run --locked --only-group test python -m pytest -q scripts/check_tbench_results_test.py
+	@uv run --locked --only-group test --only-group harbor python -m pytest -q benchmarks/terminal_bench/mux_agent_test.py
 
-# CRAP scores (scripts/crap/). uv reads the Crapper and grammar pins from the
-# adapter's inline script header, so no virtualenv is committed or reused.
-CRAP_REPORT := uv run --quiet --script scripts/crap/crapper_report.py
+# CRAP scores (scripts/crap/), with Crapper and the grammars from the crap group.
+CRAP_REPORT := uv run --locked --quiet --only-group crap python scripts/crap/crapper_report.py
 
 crap: ## Score every production src/ function with Crapper into .metrics/crap.json [COVERAGE="<lcov>..."]
 	@mkdir -p .metrics
@@ -572,18 +568,48 @@ crap-check: ## CRAP gate on files changed since BASE (default: merge-base with o
 	@bun scripts/crap/check.ts --base "$(or $(BASE),$$(git merge-base origin/main HEAD))" \
 		$(foreach lcov,$(COVERAGE),--coverage $(lcov)) $(CRAP_CHECK_ARGS)
 
-CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --quiet --no-project --with pytest --with-requirements scripts/crap/crapper_report.py python
+CRAP_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --locked --quiet --only-group crap --only-group test python
 
-test-crap-scripts: ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
-	@# tree-sitter-language-pack downloads its grammars from GitHub releases on
-	@# first use. This target is in static-check-full (Required), so retry a
-	@# transient failure there (seen: HTTP 504) before the tests use them.
+# tree-sitter-language-pack downloads its grammars from GitHub releases on
+# first use. The script tests are in static-check-full (Required), so retry a
+# transient failure there (seen: HTTP 504) once, before any test uses them.
+tree-sitter-grammars:
 	@for attempt in 1 2 3; do \
 		$(CRAP_PYTHON) -c 'from tree_sitter_language_pack import download; download(["typescript", "tsx", "javascript"])' && break; \
 		[ $$attempt -lt 3 ] || exit 1; echo "grammar download failed, retrying ($$attempt/3)" >&2; sleep 10; \
 	done
+
+test-crap-scripts: tree-sitter-grammars ## Test the Crapper adapter (hand-counted fixtures) and crap-check end to end (needs uv)
 	@$(CRAP_PYTHON) -m pytest -q -p no:cacheprovider scripts/crap/crapper_report_test.py
 	@bun test ./scripts/crap/check.test.ts ./scripts/crap/agentGate.test.ts
+
+# DRY gate (scripts/dry/): near-duplicate functions that the changes since
+# BASE make (CI's mode: DRY_MODE; see .xum/skills/gauntlet). The script exits
+# 0 no findings, 1 findings that no marker accepts, 2 tool error; CI calls
+# it through scripts/dry/ci.ts.
+dry-check: ## DRY gate on functions changed since BASE (default: merge-base with origin/main) [DRY_CHECK_ARGS=--json]
+	@bun scripts/dry/check.ts --base "$(or $(BASE),$$(git merge-base origin/main HEAD))" $(DRY_CHECK_ARGS)
+
+DRY_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --locked --quiet --only-group dry --only-group test python
+
+test-dry-scripts: tree-sitter-grammars ## Test the dryer adapter and dry-check end to end (needs uv)
+	@$(DRY_PYTHON) -m pytest -q -p no:cacheprovider scripts/dry/dryer_report_test.py
+	@bun test ./scripts/dry/check.test.ts
+
+# Mutation gate (scripts/mutate/): mutants in the functions changed since BASE
+# that the unit tests do not kill (CI's mode: MUTATION_MODE; see
+# .xum/skills/gauntlet). The script exits 0 no survivors, 1 survivors that no
+# marker accepts, 2 tool error, 3 a test failed
+# without a mutant; CI calls it through scripts/mutate/ci.ts.
+mutate-check: ## Mutation gate on functions changed since BASE (default: merge-base with origin/main) [COVERAGE="<lcov>..."] [MUTATE_CHECK_ARGS=--json]
+	@bun scripts/mutate/check.ts --base "$(or $(BASE),$$(git merge-base origin/main HEAD))" \
+		$(foreach lcov,$(COVERAGE),--coverage $(lcov)) $(MUTATE_CHECK_ARGS)
+
+MUTATE_PYTHON := PYTHONDONTWRITEBYTECODE=1 uv run --locked --quiet --only-group mutate --only-group test python
+
+test-mutate-scripts: tree-sitter-grammars ## Test the mutation runner and mutate-check end to end (needs uv)
+	@$(MUTATE_PYTHON) -m pytest -q -p no:cacheprovider scripts/mutate/mutate_report_test.py
+	@bun test ./scripts/mutate/check.test.ts
 
 check-test-routing: node_modules/.installed ## Fail when a *.test.ts(x) file is run by no CI lane (or by two)
 	@./scripts/check-test-routing.sh
@@ -600,17 +626,21 @@ check-bench-agent: node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENER
 	@./scripts/check-bench-agent.sh
 
 LINT_PREREQS := node_modules/.installed src/version.ts $(BUILTIN_SKILLS_GENERATED) $(BUILTIN_WORKFLOWS_GENERATED) $(WORKFLOW_RUNTIME_SOURCES_GENERATED)
+# Type-aware ESLint lints vscode/src, whose types (@types/vscode) come from the extension's own
+# install. Without it, `make -j static-check-full` races typecheck's install and every vscode
+# type reads as `error`.
+ESLINT_PREREQS := $(LINT_PREREQS) vscode/node_modules/.installed
 
 lint: $(LINT_PREREQS) ## Run oxlint on all files (the eslint.config.mjs rules it supports; no type-aware rules)
 	@./scripts/lint.sh
 
-lint-eslint: $(LINT_PREREQS) ## Run oxlint, then type-aware ESLint on files changed since the merge base with origin/main [XUM_LINT_BASE=<ref>]
+lint-eslint: $(ESLINT_PREREQS) ## Run oxlint, then type-aware ESLint on files changed since the merge base with origin/main [XUM_LINT_BASE=<ref>]
 	@./scripts/lint.sh --eslint
 
-lint-full: $(LINT_PREREQS) ## Run oxlint, then ESLint on all files, one ESLint run per machine at a time (as CI does)
+lint-full: $(ESLINT_PREREQS) ## Run oxlint, then ESLint on all files, one ESLint run per machine at a time (as CI does)
 	@./scripts/lint.sh --full
 
-lint-fix: $(LINT_PREREQS) ## Run oxlint --fix, then ESLint --fix on changed files (scripts/lint.sh --full --fix for all files)
+lint-fix: $(ESLINT_PREREQS) ## Run oxlint --fix, then ESLint --fix on changed files (scripts/lint.sh --full --fix for all files)
 	@./scripts/lint.sh --eslint --fix
 
 lint-actions: lint-actionlint lint-zizmor ## Lint GitHub Actions workflows
@@ -625,14 +655,16 @@ lint-zizmor: ## Run zizmor security analysis on GitHub Actions workflows
 # Prune any node_modules tree (not just ./node_modules) plus the removed mobile/
 # prototype: upgraded checkouts may keep stale untracked leftovers there (e.g.
 # CocoaPods .sh scripts under mobile/ios) that would otherwise be scanned.
-SHELL_SRC_FILES := $(shell find . -not \( -path '*/.git/*' -o -path '*/node_modules/*' -o -path './mobile/*' -o -path './build/*' -o -path './dist/*' -o -path './release/*' -o -path './benchmarks/terminal_bench/.leaderboard_cache/*' \) -type f -name '*.sh' 2>/dev/null)
+# Also prune ./.venv: uv installs the pyproject.toml tools there, and their
+# packages ship shell scripts and Dockerfiles.
+SHELL_SRC_FILES := $(shell find . -not \( -path '*/.git/*' -o -path '*/node_modules/*' -o -path './mobile/*' -o -path './build/*' -o -path './dist/*' -o -path './release/*' -o -path './benchmarks/terminal_bench/.leaderboard_cache/*' -o -path './.venv/*' \) -type f -name '*.sh' 2>/dev/null)
 
 lint-shellcheck: ## Run shellcheck on shell scripts
 	@echo "Running shellcheck on $(words $(SHELL_SRC_FILES)) shell scripts..."
 	@shellcheck --external-sources $(SHELL_SRC_FILES)
 
 # Dockerfiles to lint (excludes node_modules, build artifacts, .git)
-DOCKERFILES := $(shell find . -not \( -path '*/.git/*' -o -path '*/node_modules/*' -o -path './mobile/*' -o -path './build/*' -o -path './dist/*' -o -path './release/*' -o -path './benchmarks/terminal_bench/.leaderboard_cache/*' \) -type f -name 'Dockerfile' 2>/dev/null)
+DOCKERFILES := $(shell find . -not \( -path '*/.git/*' -o -path '*/node_modules/*' -o -path './mobile/*' -o -path './build/*' -o -path './dist/*' -o -path './release/*' -o -path './benchmarks/terminal_bench/.leaderboard_cache/*' -o -path './.venv/*' \) -type f -name 'Dockerfile' 2>/dev/null)
 
 lint-hadolint: ## Run hadolint on Dockerfiles
 	@echo "Running hadolint on $(words $(DOCKERFILES)) Dockerfiles..."
@@ -707,9 +739,28 @@ test-integration: node_modules/.installed build-main ## Run all tests (unit + in
 	@bun test src
 	@TEST_INTEGRATION=1 bun x jest tests
 
+# The files in test-unit-ci.sh's isolated list fail when another test file shares their process
+# (#7297), so they run one per process here too, as in CI. The two shared runs skip them.
 test-unit: node_modules/.installed build-main ## Run unit tests
-	@bun test src
-	@bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts ./vscode/src/ ./scripts/
+	@set -e; isolated="$$(./scripts/test-unit-ci.sh --list-isolated)"; ignores=(); \
+	for f in $$isolated; do ignores+=("--path-ignore-patterns=$${f#./}"); done; \
+	bun test src "$${ignores[@]}"; \
+	bun test ./tests/ui/storybook/ ./tests/ui/domIsolation.test.ts ./vscode/src/ ./scripts/ "$${ignores[@]}"; \
+	for f in $$isolated; do bun test "./$${f#./}"; done
+
+# The host trap self-tests and the in-memory agent-loop proof, in their own bun process.
+# tests/hostProof.bunfig.toml loads the trap before tests/setup.ts. *.hostProof.ts files are
+# not *.test.ts, so `bun test src`, test-unit-ci.sh and Jest never run them. The ./ prefix
+# matters: without it bun reads each path as a name filter and exits 1. HOME and XUM_ROOT
+# are set before bun starts, because Bun caches homedir and the log sink opens at the first
+# log call. The temp dir keeps the proof's writes out of the real home (#7209). The real bun
+# binary is resolved first: a version-manager shim (mise) finds its tools under HOME.
+test-host-proof: node_modules/.installed src/version.ts ## Host trap self-tests and the in-memory loop proof (own process)
+	@T="$$(mktemp -d)" && mkdir -p "$$T/home" "$$T/root" && \
+	  bun_bin="$$(bun -e 'process.stdout.write(process.execPath)')" && \
+	  files="$$(find src -name '*.hostProof.ts' | LC_ALL=C sort | sed 's|^|./|')" && \
+	  HOME="$$T/home" XUM_ROOT="$$T/root" "$$bun_bin" --config=./tests/hostProof.bunfig.toml test $$files; \
+	  status=$$?; rm -rf "$$T"; exit $$status
 
 # CI runs this once per shard; SHARD_INDEX/SHARD_TOTAL (env) pick the slice. See the script header.
 test-unit-ci: node_modules/.installed build-main ## Run the CI unit suite with coverage (sharded via SHARD_INDEX/SHARD_TOTAL)
@@ -838,16 +889,21 @@ vscode-ext-install: ## Build and install VS Code extension locally
 	@$(MAKE) -C vscode install
 
 ## Documentation
-docs-server: node_modules/.installed ## Serve documentation locally (Mintlify dev server)
-	@cd docs && npx mintlify dev
+# The Mintlify CLI and its dependencies, as scripts/mintlify/bun.lock pins them. Bump mintlify
+# there (`bun add mintlify@<version>` in that directory) and check the docs targets still run:
+# 4.2.681 pulls @mintlify/auth-edge@0.0.36, which was unpublished from npm (404).
+MINTLIFY := $(CURDIR)/scripts/mintlify/node_modules/.bin/mintlify
 
-check-docs-links: ## Check documentation for broken links
+scripts/mintlify/node_modules/.installed: scripts/mintlify/package.json scripts/mintlify/bun.lock
+	@cd scripts/mintlify && bun install --frozen-lockfile --ignore-scripts
+	@touch $@
+
+docs-server: scripts/mintlify/node_modules/.installed ## Serve documentation locally (Mintlify dev server)
+	@cd docs && $(MINTLIFY) dev
+
+check-docs-links: scripts/mintlify/node_modules/.installed ## Check documentation for broken links
 	@echo "🔗 Checking documentation links..."
-	# Workaround: katex@0.16.34 ships broken ESM with unreplaced __VERSION__ placeholder.
-	# Remove this NODE_OPTIONS prefix once katex publishes a fixed build.
-	# Pin mintlify: 4.2.681 pulls @mintlify/auth-edge@0.0.36, which was unpublished
-	# from npm (404) and breaks resolution. Bump once a fixed release ships.
-	@cd docs && NODE_OPTIONS="$${NODE_OPTIONS:+$$NODE_OPTIONS }--import data:text/javascript,globalThis.__VERSION__=%220.16.34%22" bun x mintlify@4.2.680 broken-links
+	@cd docs && $(MINTLIFY) broken-links
 
 check-code-docs-links: ## Validate code references to docs paths
 	@./scripts/check-code-docs-links.sh
@@ -893,6 +949,10 @@ bench: node_modules/.installed src/version.ts ## Run *.bench.ts microbenchmarks 
 bench-compare: node_modules/.installed src/version.ts ## Compare *.bench.ts results, base vs working tree (BENCH=<filter>, BASE=<ref>, ROUNDS=10, RUNTIME=node|bun)
 	@bun scripts/perf/benchCompare.ts --bench '$(BENCH)' --runtime $(or $(RUNTIME),node) --rounds $(or $(ROUNDS),10) $(if $(BASE),--base '$(BASE)')
 
+# Agent loop refactor tripwire data. Gates call the script directly: make reports any failure as 2.
+test-loop-baseline: node_modules/.installed src/version.ts ## Time the loop test files (RUNS=10, FILTER=<substring>, JOBS=6, BASE=<ref> compares)
+	@bun scripts/perf/loopTestBaseline.ts --runs $(or $(RUNS),10) --jobs $(or $(JOBS),6) $(if $(FILTER),--filter '$(FILTER)') $(if $(BASE),--base '$(BASE)')
+
 first-load-js: ## Report first-load JS bytes of dist/ (run make build-renderer first)
 	@bun scripts/perf/firstLoadJs.ts dist
 
@@ -908,13 +968,10 @@ generate-phone-chrome: build-main build-renderer build-static ## Capture the pho
 check-phone-chrome: node_modules/.installed ## Fail when the built live phone workspace page (run `make build` first) drifted from the checked-in skeleton
 	@bun scripts/perf/generatePhoneChrome.ts --check $(PHONE_CHROME_ARGS)
 
-benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE/TB_HARBOR_DAYTONA_PACKAGE/TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
-	@# Pin Harbor with the Daytona extra so scheduled ingestion does not break on future CLI or adapter API drift.
-	@# Force the Daytona SDK to the cursor-pagination API while keeping Harbor stable.
+benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_DATASET/TB_CONCURRENCY/TB_TIMEOUT/TB_ENV/TB_MODEL/TB_ARGS to customize)
+	@# Harbor and its Daytona SDK come from the harbor group in pyproject.toml; bump them there.
 	@# Harbor removed --task-name, so keep smoke-test task filtering on the current dataset filter flag.
-	@HARBOR_PACKAGE=$${TB_HARBOR_PACKAGE:-harbor[daytona]==$(TB_HARBOR_VERSION)}; \
-	HARBOR_DAYTONA_PACKAGE=$${TB_HARBOR_DAYTONA_PACKAGE:-daytona>=0.180.0,<2}; \
-	TB_DATASET=$${TB_DATASET:-terminal-bench@2.0}; \
+	@TB_DATASET=$${TB_DATASET:-terminal-bench@2.0}; \
 	TB_TIMEOUT=$${TB_TIMEOUT:-1800}; \
 	TB_CONCURRENCY=$${TB_CONCURRENCY:-4}; \
 	ENV_FLAG=$${TB_ENV:+--env $$TB_ENV}; \
@@ -925,13 +982,11 @@ benchmark-terminal: ## Run Terminal-Bench 2.0 with Harbor (use TB_HARBOR_PACKAGE
 			TASK_NAME_FLAGS="$$TASK_NAME_FLAGS --include-task-name $$task_name"; \
 		done; \
 	fi; \
-	echo "Using Harbor package: $$HARBOR_PACKAGE"; \
-	echo "Using Daytona package constraint: $$HARBOR_DAYTONA_PACKAGE"; \
 	echo "Using timeout: $$TB_TIMEOUT seconds"; \
 	echo "Running Terminal-Bench with dataset $$TB_DATASET (concurrency: $$TB_CONCURRENCY)"; \
 	export MUX_TIMEOUT_MS=$$((TB_TIMEOUT * 1000)); \
-	uvx --from "$$HARBOR_PACKAGE" --with "$$HARBOR_DAYTONA_PACKAGE" python -c 'import importlib.metadata as m; print("Resolved Harbor package:", m.version("harbor")); print("Resolved Daytona package:", m.version("daytona"))'; \
-	uvx --from "$$HARBOR_PACKAGE" --with "$$HARBOR_DAYTONA_PACKAGE" harbor run \
+	uv run --locked --only-group harbor python -c 'import importlib.metadata as m; print("Resolved Harbor package:", m.version("harbor")); print("Resolved Daytona package:", m.version("daytona"))'; \
+	uv run --locked --only-group harbor harbor run \
 		--dataset "$$TB_DATASET" \
 		--agent-import-path benchmarks.terminal_bench.mux_agent:MuxAgent \
 		--agent-kwarg timeout=$$TB_TIMEOUT \

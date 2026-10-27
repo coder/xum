@@ -63,6 +63,8 @@ export interface PerfReportServiceOptions {
   /** Perf epoch ms. */
   now?: () => number;
   createId?: () => string;
+  /** The folder holding the running app's `dist/`; null for none. Default: found from __dirname. */
+  appRoot?: string | null;
 }
 
 export interface PerfReportResult {
@@ -92,7 +94,8 @@ type CaptureSkipReason =
   | "not-a-regular-file"
   | "missing"
   | "unreadable"
-  | "unscrubbable";
+  | "unscrubbable"
+  | "size-mismatch";
 
 interface IncludedCapture {
   metadata: PerfCaptureMetadata;
@@ -147,6 +150,48 @@ function scrubHome(text: string, spellings: readonly string[], atEnd = true): st
   return out;
 }
 
+/** Home spellings for text; lower-case `/`-separated home and app-root prefixes for paths. */
+interface PathScrub {
+  spellings: readonly string[];
+  home: readonly string[];
+  app: readonly string[];
+}
+
+function pathPrefixes(dir: string): string[] {
+  return [...new Set([dir.split(path.sep).join("/"), pathToFileURL(dir).pathname])].map((p) =>
+    p.toLowerCase()
+  );
+}
+
+/** The folder holding the running app's `dist/`: a checkout, an npm package or app.asar. */
+function findAppRoot(dir: string): string | null {
+  for (let at = dir; path.dirname(at) !== at; at = path.dirname(at)) {
+    if (path.basename(at) === "dist") return path.dirname(at);
+  }
+  return null;
+}
+
+/** A script path below home without the user's folder names (#7125). The analyzer needs the
+ * app path and package names: `<xum>/...`, `~/<dir>/node_modules/...` or `~/<dir>/<name>`. */
+function placeholderPath(value: string, scrub: PathScrub): string {
+  const scheme = value.startsWith("file://") ? "file://" : "";
+  // Keeps a UNC home's host (`file://server/...`); URL parsing already dropped `localhost`.
+  const rest =
+    scheme === "" ? value.replaceAll("\\", "/") : value.slice(5).replace(/^\/\/(?=\/)/, "");
+  const below = (prefixes: readonly string[]) => {
+    const lower = rest.toLowerCase();
+    const prefix = prefixes.find((p) => lower.startsWith(p) && rest[p.length] === "/");
+    return prefix === undefined ? undefined : rest.slice(prefix.length + 1);
+  };
+  const inHome = below(scrub.home);
+  if (inHome === undefined) return value;
+  const inApp = below(scrub.app);
+  if (inApp !== undefined) return `${scheme}<xum>/${inApp}`;
+  const segments = inHome.split("/");
+  const anchor = segments.indexOf("node_modules");
+  return `${scheme}~/<dir>/${segments.slice(anchor >= 0 ? anchor : -1).join("/")}`;
+}
+
 const REPORT_ID_PATTERN = /^[A-Za-z0-9-]{1,64}$/;
 const PARTIAL_DIR_PATTERN = /^\.[A-Za-z0-9-]{1,64}\.partial$/;
 const COPY_CHUNK_BYTES = 1024 * 1024;
@@ -176,7 +221,7 @@ const LINE_COL_SUFFIX = /(?::\d+){1,2}$/;
  * The text with every URL sanitized and the home directory written as "~", or null when
  * a URL cannot be parsed.
  */
-function sanitizeUrlsIn(text: string, homeSpellings: readonly string[]): string | null {
+function sanitizeUrlsIn(text: string, scrub: PathScrub): string | null {
   let failed = false;
   const sanitized = text.replace(STACK_URL_PATTERN, (token) => {
     const suffix = LINE_COL_SUFFIX.exec(token)?.[0] ?? "";
@@ -185,9 +230,9 @@ function sanitizeUrlsIn(text: string, homeSpellings: readonly string[]): string 
       failed = true;
       return "";
     }
-    return url + suffix;
+    return placeholderPath(url, scrub) + suffix;
   });
-  return failed ? null : scrubHome(sanitized, homeSpellings);
+  return failed ? null : scrubHome(sanitized, scrub.spellings);
 }
 
 /**
@@ -216,6 +261,10 @@ function sanitizeScriptUrl(raw: string): string {
   return url.protocol;
 }
 
+function scrubScriptUrl(raw: string, scrub: PathScrub): string {
+  return scrubHome(placeholderPath(sanitizeScriptUrl(raw), scrub), scrub.spellings);
+}
+
 /** LoAF invokers name the script URL only for script invoker types; others are labels. */
 const SCRIPT_INVOKER_TYPES = new Set(["classic-script", "module-script"]);
 
@@ -226,13 +275,13 @@ const SCRIPT_INVOKER_TYPES = new Set(["classic-script", "module-script"]);
  */
 function sanitizeSnapshot(
   snapshot: FlightRecorderSnapshot,
-  homeSpellings: readonly string[]
+  scrub: PathScrub
 ): FlightRecorderSnapshot {
-  const clean = (text: string) => sanitizeUrlsIn(text, homeSpellings) ?? "";
+  const clean = (text: string) => sanitizeUrlsIn(text, scrub) ?? "";
   return {
     ...snapshot,
     ...(snapshot.failure !== undefined
-      ? { failure: scrubHome(snapshot.failure, homeSpellings) }
+      ? { failure: scrubHome(snapshot.failure, scrub.spellings) }
       : {}),
     renderer: {
       ...snapshot.renderer,
@@ -240,9 +289,9 @@ function sanitizeSnapshot(
         ...entry,
         scripts: entry.scripts.map((script) => ({
           ...script,
-          sourceURL: scrubHome(sanitizeScriptUrl(script.sourceURL), homeSpellings),
+          sourceURL: scrubScriptUrl(script.sourceURL, scrub),
           invoker: SCRIPT_INVOKER_TYPES.has(script.invokerType)
-            ? scrubHome(sanitizeScriptUrl(script.invoker), homeSpellings)
+            ? scrubScriptUrl(script.invoker, scrub)
             : clean(script.invoker),
         })),
       })),
@@ -256,6 +305,25 @@ const STACK_FRAME_PREFIX = /^\s*at\s+/;
 // Identifiers, member chains, `new X`, `async X`, `X [as y]`, `Object.<anonymous>`. Anything
 // else (a computed name holding a URL, a path) is replaced by ANONYMOUS_FRAME.
 const PLAIN_FUNCTION_NAME = /^[\w$.<>[\] -]{1,200}$/;
+
+/**
+ * Why an opened capture profile must not be copied, or undefined when it may be. `checked` is
+ * the lstat taken before opening.
+ */
+function openedProfileProblem(
+  stat: { dev: number; ino: number; size: number; nlink: number; isFile(): boolean },
+  checked: { dev: number; ino: number },
+  recordedBytes: number | undefined
+): CaptureSkipReason | undefined {
+  // The opened file must be the one checked above, not one swapped in since.
+  const sameFile = stat.dev === checked.dev && stat.ino === checked.ino;
+  if (!sameFile || !stat.isFile() || stat.nlink > 1) return "not-a-regular-file";
+  // A profile whose size differs from the one recorded at capture time was changed since (or
+  // its metadata was): it is not the capture the metadata describes (#5561). Metadata without
+  // profileBytes is not checked.
+  if (recordedBytes !== undefined && stat.size !== recordedBytes) return "size-mismatch";
+  return undefined;
+}
 
 /**
  * The function names of a JS stack, one per line. Every URL, file path, `:line:col` and
@@ -304,8 +372,10 @@ recorder). It stays on this computer: Xum uploads nothing. Share it with a
 developer if you choose to.
 
 It contains no chat content, prompts, tool payloads, session tapes or
-environment variables. In the CPU profiles, your home folder is written as "~"
-and script URLs keep only scheme, host and path (other URLs only their scheme).
+environment variables. Script URLs keep only scheme, host and path (other URLs
+only their scheme). Script paths below your home folder name no folders: Xum's
+files read "<xum>/...", dependencies "~/<dir>/node_modules/...", other files
+"~/<dir>/<name>". Other text writes your home folder as "~".
 
 Files
 -----
@@ -326,7 +396,8 @@ captures/          The newest CPU profile captures (*.cpuprofile, open them in t
                    at most ${PERF_REPORT_MAX_CAPTURES}, and the whole folder stays under ${PERF_REPORT_MAX_TOTAL_BYTES / (1024 * 1024)} MiB.
                    manifest.json lists the captures included and the ones left out
                    and why ("count-cap": over the ${PERF_REPORT_MAX_CAPTURES}-capture limit; "size-cap": over
-                   the size limit). A capture triggered by a trip shows the activity AFTER
+                   the size limit; "size-mismatch": the profile file no longer has
+                   the size its metadata records). A capture triggered by a trip shows the activity AFTER
                    its trigger, not the stall itself.
 environment.json   Xum version, platform, runtime versions, enabled experiments
                    and the recorder status.
@@ -353,7 +424,7 @@ export class PerfReportService {
   private readonly createId: () => string;
   private desktopHooks: PerfReportDesktopHooks | null = null;
   private inFlight = false;
-  private readonly homeSpellings: string[];
+  private readonly scrub: PathScrub;
 
   constructor(options: PerfReportServiceOptions) {
     this.options = options;
@@ -363,7 +434,13 @@ export class PerfReportService {
     } catch {
       // No home directory: nothing to scrub.
     }
-    this.homeSpellings = homePathSpellings(home);
+    const spellings = homePathSpellings(home);
+    const appRoot = options.appRoot === undefined ? findAppRoot(__dirname) : options.appRoot;
+    this.scrub = {
+      spellings,
+      home: spellings.length > 0 ? pathPrefixes(home) : [],
+      app: appRoot === null ? [] : pathPrefixes(appRoot),
+    };
     this.now = options.now ?? perfEpochNowMs;
     this.createId = options.createId ?? defaultCreateId;
   }
@@ -421,7 +498,7 @@ export class PerfReportService {
   }
 
   private async writeBundle(dir: string): Promise<Omit<PerfReportResult, "dir" | "revealed">> {
-    const snapshot = sanitizeSnapshot(this.options.recorder.getSnapshot(), this.homeSpellings);
+    const snapshot = sanitizeSnapshot(this.options.recorder.getSnapshot(), this.scrub);
     const status = this.options.recorder.getStatus();
     const hooks = this.desktopHooks;
     // Re-parsed here so a metadata object can never carry fields beyond the schema.
@@ -434,9 +511,11 @@ export class PerfReportService {
       .slice(PERF_REPORT_MAX_CAPTURES)
       .map((metadata) => ({ metadata, reason: "count-cap" }));
 
+    const trace = buildPerfTrace({ snapshot, captures: candidates });
     const fixedFiles = new Map<string, string>([
       ["snapshot.json", JSON.stringify(snapshot, null, 2)],
-      ["trace.json", JSON.stringify(buildPerfTrace({ snapshot, captures: candidates }))],
+      // skippedReason ("failed: <error>") can quote a path; copyCapture scrubs its copy too.
+      ["trace.json", scrubHome(JSON.stringify(trace), this.scrub.spellings)],
       ["environment.json", JSON.stringify(this.environment(status, hooks !== null), null, 2)],
       ["README.txt", README],
     ]);
@@ -522,7 +601,7 @@ export class PerfReportService {
     budget: number
   ): Promise<IncludedCapture | { reason: CaptureSkipReason }> {
     assert(PERF_CAPTURE_ID_PATTERN.test(metadata.id), "perf capture id must be validated");
-    const metadataText = JSON.stringify(metadata, null, 2);
+    const metadataText = scrubHome(JSON.stringify(metadata, null, 2), this.scrub.spellings);
     const metadataBytes = Buffer.byteLength(metadataText);
     const metadataPath = path.join(outDir, `${metadata.id}.json`);
     const profileName = `${metadata.id}.cpuprofile`;
@@ -561,12 +640,11 @@ export class PerfReportService {
     let wrote = false;
     try {
       const stat = await source.stat();
-      // The opened file must be the one checked above, not one swapped in since.
-      const sameFile = stat.dev === checked.dev && stat.ino === checked.ino;
-      if (!sameFile || !stat.isFile() || stat.nlink > 1) return { reason: "not-a-regular-file" };
+      const problem = openedProfileProblem(stat, checked, metadata.profileBytes);
+      if (problem !== undefined) return { reason: problem };
       if (metadataBytes + stat.size > budget) return { reason: "size-cap" };
       wrote = true;
-      const copied = await copyScrubbed(source, profilePath, stat.size, this.homeSpellings);
+      const copied = await copyScrubbed(source, profilePath, stat.size, this.scrub);
       await writeFileAtomic(metadataPath, metadataText, { mode: 0o600 });
       return { metadata, bytes: metadataBytes + copied, files: [metadataPath, profilePath] };
     } catch (error) {
@@ -659,17 +737,17 @@ function renderManifest(included: IncludedCapture[], skipped: SkippedCapture[]):
  * the home directory written as "~". The renderer's page URL can carry the `xum server`
  * auth token as `?token=`. V8 profiles hold URLs only in "url" fields.
  */
-function scrubProfileText(text: string, spellings: readonly string[], atEnd: boolean): string {
+function scrubProfileText(text: string, scrub: PathScrub, atEnd: boolean): string {
   const urlsClean = text.replace(PROFILE_URL_FIELD, (_match, raw: string) => {
     let value = "";
     try {
-      value = sanitizeScriptUrl(JSON.parse(`"${raw}"`) as string);
+      value = scrubScriptUrl(JSON.parse(`"${raw}"`) as string, scrub);
     } catch {
       // Not a valid JSON string: drop it.
     }
     return `"url":${JSON.stringify(value)}`;
   });
-  return scrubHome(urlsClean, spellings, atEnd);
+  return scrubHome(urlsClean, scrub.spellings, atEnd);
 }
 
 const PROFILE_URL_FIELD = /"url"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
@@ -709,7 +787,7 @@ async function copyScrubbed(
   source: fs.FileHandle,
   destPath: string,
   maxBytes: number,
-  spellings: readonly string[]
+  scrub: PathScrub
 ): Promise<number> {
   const dest = await fs.open(destPath, "wx", 0o600);
   try {
@@ -741,10 +819,10 @@ async function copyScrubbed(
       // A cut right after a quote never splits a surrogate pair either.
       const cut = lastSafeCut(pending);
       if (pending.length - cut > MAX_HELD_PROFILE_CHARS) throw new UnscrubbableProfileError();
-      await write(scrubProfileText(pending.slice(0, cut), spellings, false));
+      await write(scrubProfileText(pending.slice(0, cut), scrub, false));
       pending = pending.slice(cut);
     }
-    await write(scrubProfileText(pending + decoder.end(), spellings, true));
+    await write(scrubProfileText(pending + decoder.end(), scrub, true));
     await dest.sync();
     return written;
   } finally {

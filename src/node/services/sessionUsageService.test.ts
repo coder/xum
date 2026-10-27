@@ -12,6 +12,8 @@ import {
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { createTestHistoryService } from "./testHistoryService";
+import { SessionFilesMemory } from "@/node/services/sessionFiles/memorySessionFiles.testHarness";
+import { HEADLESS_USAGE_FILE_NAME } from "@/common/constants/paths";
 import { workspaceRemovalTombstonePath } from "./workspaceRemoval";
 import { existsSync } from "fs";
 import * as fs from "fs/promises";
@@ -404,19 +406,19 @@ describe("SessionUsageService", () => {
     it("keeps mixed-model session totals separate while lastRequest follows the latest write", async () => {
       const workspaceId = "test-workspace";
       const parentModel = "openai:gpt-5.2";
-      const intuitionModel = "anthropic:claude-sonnet-4-20250514";
+      const nestedToolModel = "anthropic:claude-sonnet-4-20250514";
       const parentUsage = createUsage(100, 50);
-      const intuitionUsage = createUsage(40, 10);
+      const nestedToolUsage = createUsage(40, 10);
 
       await service.recordUsage(workspaceId, parentModel, parentUsage);
-      await service.recordUsage(workspaceId, intuitionModel, intuitionUsage);
+      await service.recordUsage(workspaceId, nestedToolModel, nestedToolUsage);
 
       const result = await service.getSessionUsage(workspaceId);
       expect(result).toBeDefined();
       expect(result?.byModel[parentModel]).toEqual(parentUsage);
-      expect(result?.byModel[intuitionModel]).toEqual(intuitionUsage);
-      expect(result?.lastRequest?.model).toBe(intuitionModel);
-      expect(result?.lastRequest?.usage).toEqual(intuitionUsage);
+      expect(result?.byModel[nestedToolModel]).toEqual(nestedToolUsage);
+      expect(result?.lastRequest?.model).toBe(nestedToolModel);
+      expect(result?.lastRequest?.usage).toEqual(nestedToolUsage);
     });
 
     it("should update lastRequest with each recordUsage call", async () => {
@@ -863,7 +865,7 @@ describe("SessionUsageService", () => {
         anthropic: { cacheCreationInputTokens: 10 },
       };
       const toolUsage = {
-        toolName: "intuition",
+        toolName: "nested_tool",
         toolCallId: "tool-call-1",
         timestamp: Date.now(),
         model,
@@ -953,7 +955,7 @@ describe("SessionUsageService", () => {
       const rawModel = "coder:prod-anthropic/claude-opus-4-5";
       const metadataModel = "anthropic:claude-opus-4-5";
       const toolUsage = {
-        toolName: "intuition",
+        toolName: "nested_tool",
         toolCallId: "tool-call-coder-1",
         timestamp: Date.now(),
         model: rawModel,
@@ -1042,7 +1044,7 @@ describe("SessionUsageService", () => {
         },
       };
       const validOtherModelToolUsage = {
-        toolName: "intuition",
+        toolName: "nested_tool",
         toolCallId: "tool-call-valid-2",
         timestamp: 1_700_000_000_050,
         model: otherModel,
@@ -1150,5 +1152,91 @@ describe("SessionUsageService", () => {
       expect(result!.byModel["anthropic:claude-sonnet-4-5"]).toBeDefined();
       expect(result!.byModel["anthropic:claude-sonnet-4-5"].input.tokens).toBe(300); // 100 + 200
     });
+  });
+});
+
+describe("SessionUsageService on the HistoryService's SessionFiles", () => {
+  it("refuses a headless write when the tombstone exists only in its memory volume", async () => {
+    const memory = await createTestHistoryService({ files: SessionFilesMemory });
+    try {
+      const service = new SessionUsageService(memory.config, memory.historyService);
+      const workspaceId = "removed-in-memory";
+      const tombstonePath = workspaceRemovalTombstonePath(memory.config.rootDir, workspaceId);
+      await memory.files.promises.mkdir(path.dirname(tombstonePath), { recursive: true });
+      await memory.files.promises.writeFile(
+        tombstonePath,
+        JSON.stringify({ workspaceId, removedAt: Date.now() })
+      );
+
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        "anthropic:claude-haiku-4-5",
+        { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+        undefined,
+        { analyticsSource: "memory_consolidation" }
+      );
+      expect(recorded).toBeUndefined();
+      expect(
+        await memory.files.promises.access(path.join(memory.config.sessionsDir, workspaceId)).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    } finally {
+      await memory.cleanup();
+    }
+  });
+
+  it("keeps the ledger, the in-flight files and the headless sidecar in its memory volume", async () => {
+    // The session-usage files are session files: with memory SessionFiles they live in the
+    // memory volume, and the session dir on disk is never created.
+    const memory = await createTestHistoryService({ files: SessionFilesMemory });
+    try {
+      const service = new SessionUsageService(memory.config, memory.historyService);
+      const workspaceId = "usage-in-memory";
+      const model = "anthropic:claude-sonnet-4-5";
+      const sessionDir = path.join(memory.config.sessionsDir, workspaceId);
+
+      await service.recordUsage(workspaceId, model, createUsage(100, 10));
+      await service.recordInFlightUsage(workspaceId, "key-a", "msg-a", model, createUsage(20, 2));
+      const recorded = await service.recordHeadlessUsage(
+        workspaceId,
+        "anthropic:claude-haiku-4-5",
+        { inputTokens: 40, outputTokens: 4, totalTokens: 44 },
+        undefined,
+        { analyticsSource: "memory_consolidation" }
+      );
+      expect(recorded).toBeDefined();
+
+      const names = await memory.files.promises.readdir(sessionDir);
+      for (const name of [
+        "session-usage.json",
+        "session-usage.in-flight",
+        HEADLESS_USAGE_FILE_NAME,
+      ]) {
+        expect(names).toContain(name);
+      }
+      expect(
+        await memory.files.promises.readdir(path.join(sessionDir, "session-usage.in-flight"))
+      ).toEqual(["key-a.json"]);
+
+      // A restarted service folds the killed stream's in-flight file into the ledger: the
+      // readdir, the read and the delete all go to the memory volume.
+      const restarted = new SessionUsageService(memory.config, memory.historyService);
+      const result = await restarted.getSessionUsage(workspaceId);
+      expect(result?.byModel[model]?.input.tokens).toBe(120);
+      expect(result?.byModel["anthropic:claude-haiku-4-5"]?.input.tokens).toBe(40);
+      expect(
+        await memory.files.promises.readdir(path.join(sessionDir, "session-usage.in-flight"))
+      ).toEqual([]);
+      expect(
+        await fs.access(sessionDir).then(
+          () => true,
+          () => false
+        )
+      ).toBe(false);
+    } finally {
+      await memory.cleanup();
+    }
   });
 });

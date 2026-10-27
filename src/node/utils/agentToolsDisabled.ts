@@ -9,8 +9,7 @@
  * boundary every agent turn passes.
  *
  * Scope: callers that call streamText themselves with their own tools do not check this flag:
- * refinement/refineRunner.ts, memoryHarvest.ts, memoryIntuition.ts and
- * continuousCompactionSummary.ts (plugin `request.assemble` tools). None of them runs shell
+ * refinement/refineRunner.ts, memoryHarvest.ts and continuousCompactionSummary.ts (plugin `request.assemble` tools). None of them runs shell
  * commands in the seeded bug-bash app.
  */
 export function isAgentToolsDisabled(): boolean {

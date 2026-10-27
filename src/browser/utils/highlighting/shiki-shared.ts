@@ -26,6 +26,9 @@ export const SHIKI_COLOR_REPLACEMENTS: Record<string, Record<string, string>> = 
     "#cd3131": "#b52b2b", // error token
     "#316bcd": "#2b5eb4", // info token
     "#cd9731": "#7b5b1d", // warning token
+    // Two more colors that @pierre/highlights' min-light uses (for its hint and diff.plus scopes).
+    "#757575": "#5e6064", // hint
+    "#77cc00": "#3d6b00", // diff.plus
   },
   /**
    * Lighter replacements for min-dark colors that miss WCAG AA on the dark code backgrounds:
@@ -36,6 +39,8 @@ export const SHIKI_COLOR_REPLACEMENTS: Record<string, Record<string, string>> = 
    */
   [SHIKI_DARK_THEME]: {
     "#6b737c": "#90979f", // comment
+    // @pierre/highlights' min-dark comment color: 4.3:1 on the diff tints (dark), 3.9:1 (flexoki-dark).
+    "#888888": "#90979f", // comment (Highlights)
     "#1976d2": "#4b9bea", // markdown inline link
     "#316bcd": "#6e97dc", // info token
     "#cd3131": "#df7a7a", // error token
@@ -109,4 +114,16 @@ export function extractShikiLines(html: string): string[] {
   }
 
   return lines;
+}
+
+/**
+ * Escape HTML entities for plain text fallback
+ */
+export function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
 }

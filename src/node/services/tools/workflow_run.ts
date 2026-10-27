@@ -1,6 +1,8 @@
 import { tool } from "ai";
+import { nodeClock } from "@/node/utils/hostClock";
 
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import {
   COMPLETED_REPORT_REFETCH_NOTE,
   WorkflowRunToolResultSchema,
@@ -227,6 +229,7 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         config.xumScope?.type === "project"
           ? resolveSkillStorageContext({
               runtime: config.runtime,
+              runtimeFactory: toolRuntimeFactory(config),
               workspacePath: config.cwd,
               xumScope: config.xumScope,
             })
@@ -238,6 +241,7 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         workspacePath: config.cwd,
         projectTrusted: config.trusted === true,
         ...(skillCtx != null ? { skillStorageContext: skillCtx } : {}),
+        runtimeFactory: toolRuntimeFactory(config),
       });
       // Duplicate guard: a retried or replayed turn must not mint a second active run of the
       // same script. The admission gate serializes check + creation for one script identity.
@@ -260,7 +264,8 @@ export const createWorkflowRunTool: ToolFactory = (config: ToolConfiguration) =>
         }
       }
       const createdRun: { id: string | null } = { id: null };
-      const invocationStartedAtMs = Date.now();
+      // Wall clock: the sidecar stores it as createdAtMs beside WorkflowService times (#7282).
+      const invocationStartedAtMs = nodeClock.nowMs();
       const startInput = {
         script,
         workspaceId,

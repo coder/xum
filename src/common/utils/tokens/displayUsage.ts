@@ -38,8 +38,10 @@ export const PRICING_LOGIC_VERSION = 2;
 
 /**
  * Anthropic bills 1-hour-TTL cache writes at 2x base input (5-minute writes use the
- * model's `cache_creation_input_token_cost`, 1.25x). The catalog has no 1h field, so
- * the rate derives from the input rate of the same context tier and service tier.
+ * model's `cache_creation_input_token_cost`, 1.25x), stacked on the context tier and
+ * service tier, so the rate derives from the input rate of the same tiers. LiteLLM's
+ * `cache_creation_input_token_cost_above_1hr` rates all follow this rule (checked
+ * 2026-10-21), so models.json does not keep them.
  * https://platform.claude.com/docs/en/build-with-claude/prompt-caching#pricing
  */
 const CACHE_WRITE_1H_INPUT_MULTIPLIER = 2;
@@ -68,29 +70,24 @@ function tierRates(modelStats: ModelStats, longContext: boolean): TierRates {
   const rate = (baseRate: number, longRate: number | undefined) =>
     longContext ? (longRate ?? baseRate) : baseRate;
   return {
-    input: rate(modelStats.input_cost_per_token, modelStats.input_cost_per_token_above_200k_tokens),
+    input: rate(modelStats.input_cost_per_token, modelStats.input_cost_per_token_above_threshold),
     cached: rate(
       modelStats.cache_read_input_token_cost ?? 0,
-      modelStats.cache_read_input_token_cost_above_200k_tokens
+      modelStats.cache_read_input_token_cost_above_threshold
     ),
     cacheCreate: rate(
       modelStats.cache_creation_input_token_cost ?? 0,
-      modelStats.cache_creation_input_token_cost_above_200k_tokens
+      modelStats.cache_creation_input_token_cost_above_threshold
     ),
     output: rate(
       modelStats.output_cost_per_token,
-      modelStats.output_cost_per_token_above_200k_tokens
+      modelStats.output_cost_per_token_above_threshold
     ),
   };
 }
 
 function hasTieredPricing(modelStats: ModelStats): boolean {
-  return (
-    modelStats.input_cost_per_token_above_200k_tokens != null ||
-    modelStats.output_cost_per_token_above_200k_tokens != null ||
-    modelStats.cache_creation_input_token_cost_above_200k_tokens != null ||
-    modelStats.cache_read_input_token_cost_above_200k_tokens != null
-  );
+  return modelStats.tiered_pricing_threshold_tokens !== undefined;
 }
 
 /**

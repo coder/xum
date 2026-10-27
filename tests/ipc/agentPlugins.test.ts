@@ -60,12 +60,15 @@ function unwrap<T>(result: Result<T, string>): T {
   });
 
   it("imports a subset, replaces offline, and requires new consent after an update", async () => {
-    const preview = unwrap(
+    const result = unwrap(
       await env.orpc.agentPlugins.preview({ input: pathToFileURL(remote).href })
     );
+    if (result.kind !== "plugin") throw new Error("expected a plugin preview");
+    const preview = result.preview;
     const selection = { skills: ["selective-first"], mcpServers: ["selective-first"] };
     const invalid = await env.orpc.agentPlugins.install({
       source: preview.source,
+      method: preview.method,
       expectedSha: preview.lockedSha,
       expectedConsentDigest: preview.consentDigest,
       importedComponents: { ...selection, skills: ["unknown"] },
@@ -78,6 +81,7 @@ function unwrap<T>(result: Result<T, string>): T {
     const installed = unwrap(
       await env.orpc.agentPlugins.install({
         source: preview.source,
+        method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,
         importedComponents: selection,

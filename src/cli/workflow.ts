@@ -39,6 +39,7 @@ import { closeScopeBounded, disposeAppRuntime } from "@/node/services/di/appRunt
 import { log, type LogLevel } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import {
   assertStoredPluginWorkflowReviewed,
   resolveWorkflowScript,
@@ -475,6 +476,7 @@ function createWorkflowService(input: {
           runtimeTempDir: runtime.normalizePath(".xum/tmp", input.ctx.workspacePath),
           workspaceSessionDir,
           trusted: input.ctx.projectTrusted,
+          sessionLocks: input.ctx.services.historyService.locks,
         },
       }),
     resolveWorkflowScript: (scriptPath) =>
@@ -483,6 +485,8 @@ function createWorkflowService(input: {
         runtime,
         workspacePath: input.ctx.workspacePath,
         projectTrusted: input.ctx.projectTrusted,
+        // Outside the agent loop: the headless CLI builds host runtimes.
+        runtimeFactory: nodeRuntimeFactory,
       }),
     assertStoredPluginWorkflowReviewed: (stored) =>
       assertStoredPluginWorkflowReviewed({
@@ -490,6 +494,8 @@ function createWorkflowService(input: {
         runtime,
         workspacePath: input.ctx.workspacePath,
         projectTrusted: input.ctx.projectTrusted,
+        // Outside the agent loop: the headless CLI builds host runtimes.
+        runtimeFactory: nodeRuntimeFactory,
       }),
     getCurrentProjectTrusted: () => input.ctx.projectTrusted,
     runnerId: input.ctx.workspaceId,
@@ -546,6 +552,8 @@ async function runWorkflow(scriptPath: string, options: WorkflowCLIOptions): Pro
       runtime,
       workspacePath: ctx.workspacePath,
       projectTrusted: ctx.projectTrusted,
+      // Outside the agent loop: the headless CLI builds host runtimes.
+      runtimeFactory: nodeRuntimeFactory,
     });
     const result = await workflowService.startWorkflow({
       script,

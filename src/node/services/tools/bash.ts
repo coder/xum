@@ -1,7 +1,8 @@
 import { tool } from "ai";
+import { clockOf, nodeClock } from "@/node/utils/hostClock";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 import assert from "node:assert/strict";
 // NOTE: We avoid readline; consume Web Streams directly to prevent race conditions
-import * as fs from "fs";
 import * as path from "path";
 import {
   BASH_DEFAULT_TIMEOUT_SECS,
@@ -24,8 +25,8 @@ import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { toBashTaskId } from "./taskId";
 import { migrateToBackground } from "@/node/services/backgroundProcessExecutor";
 import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
-import { LocalBaseRuntime } from "@/node/runtime/LocalBaseRuntime";
 import { getToolEnvPath } from "@/node/services/hooks";
+import { isLocalBaseRuntime } from "@/node/runtime/Runtime";
 import {
   combineGitNoRepoAutomationEnvs,
   gitHooksAllowed,
@@ -965,7 +966,7 @@ export function buildBashToolDescription(cwd: string, projects: ProjectRef[]): s
  * instead; remote discovery already fails on a missing cwd.
  */
 async function assertLocalRepoDirectoryExists(repoPath: string): Promise<void> {
-  const stats = await fs.promises.stat(repoPath).catch(() => null);
+  const stats = await nodeHostFiles.promises.stat(repoPath).catch(() => null);
   if (!stats?.isDirectory()) {
     throw new Error(LOCAL_DISCOVERY_AUTOMATION_ERROR, {
       cause: new Error(`Repository directory does not exist: ${repoPath}`),
@@ -1037,7 +1038,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
             : [config.cwd];
         const repoEnvs: Array<Record<string, string>> = [];
         for (const repoPath of repoPaths) {
-          if (config.runtime instanceof LocalBaseRuntime) {
+          if (isLocalBaseRuntime(config.runtime)) {
             await assertLocalRepoDirectoryExists(repoPath);
             repoEnvs.push(await gitNoRepoAutomationEnvForLocalRepo(repoPath, abortSignal, true));
           } else {
@@ -1060,7 +1061,7 @@ export const createBashTool: ToolFactory = (config: ToolConfiguration) => {
       // Since the bash tool runs via bash, `nul` becomes a real file in the workspace.
       // Only rewrite for local Windows runtimes so non-Windows scripts keep their semantics.
       const shouldRewriteNullRedirects =
-        process.platform === "win32" && config.runtime instanceof LocalBaseRuntime;
+        process.platform === "win32" && isLocalBaseRuntime(config.runtime);
       const nulRedirectRewrite = shouldRewriteNullRedirects
         ? rewriteWindowsNullRedirects(script)
         : { script, didRewrite: false };
@@ -1342,7 +1343,8 @@ ${scriptWithEnv}`;
             toolCallId,
             text,
             isError,
-            timestamp: Date.now(),
+            // Record time: wall clock until #7282 moves its consumers to HostClock.
+            timestamp: nodeClock.nowMs(),
           } satisfies BashOutputEvent,
           "bash"
         );
@@ -1575,7 +1577,7 @@ ${scriptWithEnv}`;
             (await Promise.race([
               execStream.exitCode.then(() => true).catch(() => true),
               new Promise<boolean>((resolve) =>
-                setTimeout(() => resolve(false), BACKGROUND_EXIT_GRACE_MS)
+                clockOf(config).setTimer(() => resolve(false), BACKGROUND_EXIT_GRACE_MS)
               ),
             ]));
 
@@ -1707,6 +1709,7 @@ ${scriptWithEnv}`;
             );
             await raceWithAbortAndTimeout(execStream.exitCode, {
               timeoutMs: FAILED_MIGRATION_EXIT_JOIN_MS,
+              clock: config.clock,
             }).catch(() => undefined);
             return withNotice({
               success: false,

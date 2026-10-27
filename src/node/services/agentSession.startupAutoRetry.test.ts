@@ -4,8 +4,11 @@ import type { TurnCoordinator } from "./turnCoordinator";
 import { runSessionTerminalPolicy } from "./agentSession.testHarness";
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
+import { LEGACY_TODO_TURN_END_NUDGES } from "@/common/utils/machineTurnPrompts";
 import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
+import { buildSessionFiles } from "./sessionFiles/buildSessionFiles.testHarness";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import path from "path";
 import {
   type AgentSession,
@@ -17,8 +20,9 @@ import {
   createAgentSessionHarness,
   createFailedTurnHandle,
   createStartedTurnHandle,
-  createStreamLifecycleMocks,
+  createTestStreamManager,
   seedAutoCompactionThreshold,
+  type AgentSessionAIServiceFake,
 } from "./agentSession.testHarness";
 import { makeTestEffectRunner, type TestEffectRunner } from "./di/testEffectRunner";
 import { Duration } from "effect";
@@ -68,7 +72,7 @@ interface SessionBundle {
 
 async function createSessionBundle(
   workspaceId: string,
-  aiServiceOverrides?: Partial<AgentSessionAIService>,
+  aiServiceOverrides?: Partial<AgentSessionAIServiceFake>,
   options?: {
     /**
      * Runs the retry backoff on virtual time: the session schedules its RetryManager on the
@@ -102,7 +106,7 @@ async function createSessionBundle(
       replayInit: mock(() => Promise.resolve()),
     },
     ...(options?.clock
-      ? { streamManager: { ...createStreamLifecycleMocks(), effectRunner: options.clock.runner } }
+      ? { streamManager: createTestStreamManager(undefined, options.clock.runner) }
       : {}),
     captureEvents: true,
     workspaceGoalService: options?.workspaceGoalService,
@@ -355,6 +359,58 @@ describe("AgentSession startup auto-retry recovery", () => {
     expect(retryOptions.options.agentId).toBe(WORKSPACE_DEFAULTS.agentId);
     expect(retryOptions.options.toolPolicy).toEqual([{ regex_match: ".*", action: "disable" }]);
     expect(retryOptions.options.disableWorkspaceAgents).toBe(true);
+
+    await session.dispose();
+  });
+
+  // F49: rows saved before #7027 carry the turn-end TODO nudge's todo-only rule. Reused as-is, it
+  // disabled session_history and task_await, so every resumed turn hit context_budget_blocked. The
+  // rule goes only when the row proves a nudge added it: a caller's identical policy stays.
+  const legacyRule = { regex_match: "(?!todo_write$).*", action: "disable" } as const;
+  const bashRule = { regex_match: "bash", action: "disable" } as const;
+  test.each([
+    ["heals the legacy nudge rule", LEGACY_TODO_TURN_END_NUDGES[0], true, [], undefined],
+    [
+      "heals the legacy nudge rule and keeps the caller rule",
+      LEGACY_TODO_TURN_END_NUDGES[0],
+      true,
+      [bashRule],
+      [bashRule],
+    ],
+    ["keeps the same rule a manual turn set", "Only todos", false, [], [legacyRule]],
+  ] as const)("startup auto-retry %s", async (_name, text, synthetic, callerRules, expected) => {
+    const workspaceId = "startup-retry-legacy-todo-policy";
+    const clock = makeTestEffectRunner();
+    const { session, historyService, events, cleanup } = await createSessionBundle(
+      workspaceId,
+      undefined,
+      { clock }
+    );
+    cleanups.push(() => clock.dispose(), cleanup);
+    const savedPolicy = [...callerRules, legacyRule];
+    const appendResult = await historyService.appendToHistory(
+      workspaceId,
+      createMuxMessage("retried-row", "user", text, {
+        timestamp: Date.now(),
+        ...(synthetic ? { synthetic: true, uiVisible: true } : {}),
+        toolPolicy: savedPolicy,
+        retrySendOptions: {
+          model: "anthropic:claude-sonnet-4-5",
+          agentId: "exec",
+          toolPolicy: savedPolicy,
+          ...(synthetic ? { agentInitiated: true } : {}),
+        },
+      })
+    );
+    expect(appendResult.success).toBe(true);
+
+    await session.ensureStartupAutoRetryCheck();
+    expect(events.some((event) => event.type === "auto-retry-scheduled")).toBe(true);
+    const resumeStream = spyOn(session, "resumeStream").mockResolvedValue(Ok({ started: true }));
+    await fireScheduledRetry(clock, events);
+    expect(resumeStream).toHaveBeenCalledTimes(1);
+    const retryPolicy: unknown = resumeStream.mock.calls[0][0].toolPolicy;
+    expect(retryPolicy).toEqual(expected);
 
     await session.dispose();
   });
@@ -2439,6 +2495,32 @@ describe("AgentSession startup auto-retry recovery", () => {
     await clearProviderConfigFixableAbandonMarkers(config.sessionsDir, new Set());
 
     expect(await Bun.file(preferencePath).exists()).toBe(false);
+  });
+
+  // The sweep runs on the session files it gets (the memory layer here), so no host file is read.
+  test("provider config sweep reads and rewrites the session files it gets", async () => {
+    const files = buildSessionFiles(SessionFilesMemory);
+    const sessionsDir = "/sessions";
+    const preference = (workspaceId: string) =>
+      path.join(sessionsDir, workspaceId, "auto-retry-preference.json");
+    const marker = { startupAutoRetryAbandon: { reason: "authentication" } };
+    for (const [workspaceId, document] of [
+      ["opted-out", { enabled: false, ...marker }],
+      ["marker-only", marker],
+    ] as const) {
+      await files.promises.mkdir(path.join(sessionsDir, workspaceId), { recursive: true });
+      await files.promises.writeFile(preference(workspaceId), JSON.stringify(document), "utf-8");
+    }
+
+    await clearProviderConfigFixableAbandonMarkers(sessionsDir, new Set(), files);
+
+    expect(await files.promises.readFile(preference("opted-out"), "utf-8")).toBe(
+      '{"enabled":false}\n'
+    );
+    const removed = await files.promises
+      .readFile(preference("marker-only"), "utf-8")
+      .catch((error: NodeJS.ErrnoException) => error.code);
+    expect(removed).toBe("ENOENT");
   });
 
   test("provider config sweep preserves non-fixable markers and skips live sessions", async () => {

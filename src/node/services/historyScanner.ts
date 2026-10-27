@@ -1,7 +1,9 @@
 import { createScanner, SyntaxKind } from "jsonc-parser";
-import * as fs from "node:fs/promises";
+import type * as fs from "node:fs/promises";
 import { StringDecoder } from "node:string_decoder";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import { isPlainObject } from "@/common/utils/isPlainObject";
 import { isNonNegativeInteger } from "@/common/utils/numbers";
 import { createHash } from "node:crypto";
@@ -871,7 +873,8 @@ export interface OpenHistorySnapshot {
 }
 
 export async function openHistorySnapshot(
-  paths: Record<HistoryArtifact, string>
+  paths: Record<HistoryArtifact, string>,
+  sessionFiles: SessionFiles
 ): Promise<OpenHistorySnapshot> {
   const files = new Map<HistoryArtifact, HistorySnapshotFile>();
   const close = async () => {
@@ -881,7 +884,7 @@ export async function openHistorySnapshot(
     for (const artifact of ["chat", "archive"] as const) {
       let handle: fs.FileHandle;
       try {
-        handle = await fs.open(paths[artifact], "r");
+        handle = await sessionFiles.promises.open(paths[artifact], "r");
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
         throw error;
@@ -901,10 +904,12 @@ export async function openHistorySnapshot(
       // Foreign writers can replace either pathname while these descriptors stay
       // open. Never release provider rows assembled from an obsolete raw offset.
       for (const artifact of ["chat", "archive"] as const) {
-        const stat = await fs.stat(paths[artifact]).catch((error: NodeJS.ErrnoException) => {
-          if (error.code !== "ENOENT") throw error;
-          return undefined;
-        });
+        const stat = await sessionFiles.promises
+          .stat(paths[artifact])
+          .catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT") throw error;
+            return undefined;
+          });
         if (historyFileStamp(stat) !== (files.get(artifact)?.stamp ?? "missing")) {
           throw new Error("History changed during provider read");
         }
@@ -917,9 +922,10 @@ export async function openHistorySnapshot(
 /** Run `read` on open descriptors of both history files and fail closed if either was replaced. */
 async function withVerifiedHistorySnapshot<T>(
   paths: Record<HistoryArtifact, string>,
+  sessionFiles: SessionFiles,
   read: (files: ReadonlyMap<HistoryArtifact, HistorySnapshotFile>) => Promise<T>
 ): Promise<T> {
-  const snapshot = await openHistorySnapshot(paths);
+  const snapshot = await openHistorySnapshot(paths, sessionFiles);
   try {
     const result = await read(snapshot.files);
     await snapshot.verify();
@@ -932,6 +938,7 @@ async function withVerifiedHistorySnapshot<T>(
 /** Keep raw location and projected tail reads on one verified snapshot, without write-lock re-entry. */
 async function readHistoryProjectionFromLatestBoundary<Row>(
   paths: Record<HistoryArtifact, string>,
+  sessionFiles: SessionFiles,
   skip: number,
   project?: (value: unknown) => Row | null,
   includeReadableResetFloor = false,
@@ -939,7 +946,7 @@ async function readHistoryProjectionFromLatestBoundary<Row>(
   onBytesRead?: (bytes: number) => void
 ): Promise<{ messages: Row[]; boundary: PendingBoundary; boundaryPublicationId?: string }> {
   assert(Number.isSafeInteger(skip) && skip >= 0, "provider boundary skip must be non-negative");
-  return withVerifiedHistorySnapshot(paths, async (files) => {
+  return withVerifiedHistorySnapshot(paths, sessionFiles, async (files) => {
     const locate = async (
       artifact: HistoryArtifact,
       skipCount: number
@@ -1023,10 +1030,12 @@ export function readProviderHistoryFromLatestBoundary(
     includeReadableResetFloor?: boolean;
     /** Replay timing (#4504): raw tail bytes read from disk, reported per file read. */
     onBytesRead?: (bytes: number) => void;
-  }
+  },
+  sessionFiles: SessionFiles = nodeSessionFiles
 ): Promise<MuxMessage[]> {
   return readHistoryProjectionFromLatestBoundary(
     paths,
+    sessionFiles,
     skip,
     (value) => (isReadableHistoryMessage(value) ? normalizePersistedMessage(value) : null),
     options?.includeReadableResetFloor,
@@ -1080,9 +1089,10 @@ export async function readStatusHistorySuffix(
  */
 export function readProviderHistory(
   paths: Record<HistoryArtifact, string>,
-  options?: { onBytesRead?: (bytes: number) => void }
+  options?: { onBytesRead?: (bytes: number) => void },
+  sessionFiles: SessionFiles = nodeSessionFiles
 ): Promise<MuxMessage[]> {
-  return withVerifiedHistorySnapshot(paths, (files) =>
+  return withVerifiedHistorySnapshot(paths, sessionFiles, (files) =>
     scanHistorySnapshot(files, undefined, options?.onBytesRead, false)
   );
 }
@@ -1240,9 +1250,10 @@ export type HistoryPage =
 
 export async function readProviderHistoryWindow(
   paths: Record<HistoryArtifact, string>,
-  caps: HistoryWindowCaps
+  caps: HistoryWindowCaps,
+  sessionFiles: SessionFiles = nodeSessionFiles
 ): Promise<HistoryWindow> {
-  const tail = await readActiveEpochTail(paths, caps, undefined);
+  const tail = await readActiveEpochTail(paths, sessionFiles, caps, undefined);
   assert(tail.kind !== "before-epoch", "a window has no cursor");
   return tail.kind === "page" ? { ...tail, kind: "window" } : { kind: "not-windowable" };
 }
@@ -1250,10 +1261,11 @@ export async function readProviderHistoryWindow(
 export function readProviderHistoryPage(
   paths: Record<HistoryArtifact, string>,
   caps: HistoryWindowCaps,
-  beforeHistorySequence: number
+  beforeHistorySequence: number,
+  sessionFiles: SessionFiles = nodeSessionFiles
 ): Promise<HistoryPage> {
   assert(isNonNegativeInteger(beforeHistorySequence), "page cursor must be a sequence");
-  return readActiveEpochTail(paths, caps, beforeHistorySequence);
+  return readActiveEpochTail(paths, sessionFiles, caps, beforeHistorySequence);
 }
 
 export type HistorySinceRange =
@@ -1263,11 +1275,12 @@ export type HistorySinceRange =
 export async function readProviderHistorySince(
   paths: Record<HistoryArtifact, string>,
   caps: HistoryWindowCaps,
-  since: { floor: number; anchor: number }
+  since: { floor: number; anchor: number },
+  sessionFiles: SessionFiles = nodeSessionFiles
 ): Promise<HistorySinceRange> {
   assert(isNonNegativeInteger(since.floor), "since floor must be a sequence");
   assert(isNonNegativeInteger(since.anchor), "since anchor must be a sequence");
-  const tail = await readActiveEpochTail(paths, caps, undefined, since);
+  const tail = await readActiveEpochTail(paths, sessionFiles, caps, undefined, since);
   return tail.kind === "page"
     ? { kind: "range", messages: tail.messages }
     : { kind: "not-in-range" };
@@ -1279,13 +1292,14 @@ export async function readProviderHistorySince(
  */
 function readActiveEpochTail(
   paths: Record<HistoryArtifact, string>,
+  sessionFiles: SessionFiles,
   caps: HistoryWindowCaps,
   before: number | undefined,
   since?: { floor: number; anchor: number }
 ): Promise<HistoryPage> {
   assert(Number.isSafeInteger(caps.maxRows) && caps.maxRows > 0, "window maxRows must be > 0");
   assert(Number.isSafeInteger(caps.maxBytes) && caps.maxBytes > 0, "window maxBytes must be > 0");
-  return withVerifiedHistorySnapshot(paths, async (files) => {
+  return withVerifiedHistorySnapshot(paths, sessionFiles, async (files) => {
     // Newest first, like scanHistorySnapshot: rows starting before a file's located start are
     // not part of full replay, and the archive is read only after chat.jsonl is exhausted.
     const kept: Array<{ file: HistorySnapshotFile; row: ScannedHistoryRow }> = [];
@@ -1377,10 +1391,12 @@ function readActiveEpochTail(
 /** Exact occurrence evidence shares the verified boundary scan; never persist it in legacy fallback tags. */
 export async function readCompactionPendingHistoryObservation(
   paths: Record<HistoryArtifact, string>,
-  skip = 0
+  skip = 0,
+  sessionFiles: SessionFiles = nodeSessionFiles
 ) {
   const { boundary, boundaryPublicationId } = await readHistoryProjectionFromLatestBoundary(
     paths,
+    sessionFiles,
     skip,
     undefined,
     false,
@@ -1392,13 +1408,22 @@ export async function readCompactionPendingHistoryObservation(
 /** Inactive pending-state evidence from the same raw locator and snapshot verification as reads. */
 export async function readCompactionPendingHistoryBoundary(
   paths: Record<HistoryArtifact, string>,
-  skip = 0
+  skip = 0,
+  sessionFiles: SessionFiles = nodeSessionFiles
 ): Promise<PendingBoundary> {
   // Known absence requires exhausting BOTH files; an unreadable reset never becomes absence.
   // No row projection is needed, so the verified location does not re-read the active tail.
   // Retention needs the actual exposed base; provider reads may clamp excessive skips to the oldest window.
-  return (await readHistoryProjectionFromLatestBoundary(paths, skip, undefined, false, false))
-    .boundary;
+  return (
+    await readHistoryProjectionFromLatestBoundary(
+      paths,
+      sessionFiles,
+      skip,
+      undefined,
+      false,
+      false
+    )
+  ).boundary;
 }
 
 /** Ordered lifecycle evidence, not a provider message or a source of repaired IDs. */
@@ -1410,9 +1435,10 @@ export interface HistoryControlRow {
 
 export function readHistoryControlEvidenceFromLatestBoundary(
   paths: Record<HistoryArtifact, string>,
-  skip: number
+  skip: number,
+  sessionFiles: SessionFiles
 ): Promise<HistoryControlRow[]> {
-  return readHistoryProjectionFromLatestBoundary(paths, skip, (row) => {
+  return readHistoryProjectionFromLatestBoundary(paths, sessionFiles, skip, (row) => {
     if (!isPlainObject(row)) return null;
     if (row.role !== "user" && row.role !== "assistant" && row.role !== "system") return null;
     // Damaged metadata cannot hide recognized control input or establish synthetic status.
@@ -1462,6 +1488,7 @@ export async function scanHistoryFilesBounded(
   paths: Record<HistoryArtifact, string>,
   options: BoundedHistoryScanOptions,
   provenanceEpoch: string,
+  sessionFiles: SessionFiles,
   maxBytes = SESSION_HISTORY_MAX_SCAN_BYTES,
   maxRows = SESSION_HISTORY_MAX_SCAN_ROWS
 ): Promise<BoundedHistoryScanResult> {
@@ -1489,7 +1516,7 @@ export async function scanHistoryFilesBounded(
     for (const artifact of ["chat", "archive"] as const) {
       try {
         options.abortSignal?.throwIfAborted();
-        handles.set(artifact, await fs.open(paths[artifact], "r"));
+        handles.set(artifact, await sessionFiles.promises.open(paths[artifact], "r"));
         options.abortSignal?.throwIfAborted();
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
@@ -1503,10 +1530,12 @@ export async function scanHistoryFilesBounded(
       // The mutex excludes local writers, not foreign backends. Never release
       // rows read through a handle that was rotated/reset while this page ran.
       for (const artifact of ["chat", "archive"] as const) {
-        const current = await fs.stat(paths[artifact]).catch((error: NodeJS.ErrnoException) => {
-          if (error.code !== "ENOENT") throw error;
-          return undefined;
-        });
+        const current = await sessionFiles.promises
+          .stat(paths[artifact])
+          .catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "ENOENT") throw error;
+            return undefined;
+          });
         if (historyFileStamp(current) !== initialStamps.get(artifact))
           throw new Error("stale_cursor");
       }

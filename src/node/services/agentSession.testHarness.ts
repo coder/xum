@@ -23,6 +23,10 @@ import { InitStateManager } from "@/node/services/initStateManager";
 import type { MCPServerManager } from "@/node/services/mcpServerManager";
 import { createTestHistoryService } from "@/node/services/testHistoryService";
 import type { StreamErrorType } from "@/common/types/errors";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import { defaultEffectRunner, type EffectRunner } from "@/node/services/di/effectRunner";
+import { hostClockFor } from "@/node/services/di/hostClockLive";
+import type { HostClock } from "@/node/utils/hostClock";
 
 export function createStartedTurnHandle(
   signal: AbortSignal,
@@ -106,10 +110,52 @@ export function createStreamLifecycleMocks() {
   };
 }
 
+/** The stream lifecycle a test drives; the AI fakes implement it (createStreamLifecycleMocks). */
+export type StreamLifecycle = Pick<
+  AgentSessionStreamManager,
+  "stopStream" | "isStreaming" | "getStreamInfo" | "replayStream"
+>;
+
+/**
+ * Stream-manager double. It answers from `lifecycle` at call time, so a spy installed on the
+ * lifecycle object later still applies, and it hands out one runner and its clock, as
+ * StreamManager does.
+ */
+export function createTestStreamManager(
+  lifecycle: StreamLifecycle = createStreamLifecycleMocks(),
+  effectRunner: EffectRunner = defaultEffectRunner,
+  hostClock: HostClock = hostClockFor(effectRunner)
+): AgentSessionStreamManager {
+  return {
+    stopStream: (workspaceId, options) => lifecycle.stopStream(workspaceId, options),
+    isStreaming: (workspaceId) => lifecycle.isStreaming(workspaceId),
+    getStreamInfo: (workspaceId, includeFinalizing) =>
+      lifecycle.getStreamInfo(workspaceId, includeFinalizing),
+    replayStream: (workspaceId, options) => lifecycle.replayStream(workspaceId, options),
+    effectRunner,
+    hostClock,
+  };
+}
+
+export type AgentSessionAIServiceFake = AgentSessionAIService & StreamLifecycle;
+
+/** A caller-supplied AI double stands in for the stream manager only if it has the lifecycle. */
+function streamLifecycleOf(aiService: AgentSessionAIService): StreamLifecycle {
+  const candidate = aiService as Partial<StreamLifecycle>;
+  assert(
+    typeof candidate.stopStream === "function" &&
+      typeof candidate.isStreaming === "function" &&
+      typeof candidate.getStreamInfo === "function" &&
+      typeof candidate.replayStream === "function",
+    "createAgentSessionHarness: pass streamManager, or an aiService with the stream lifecycle"
+  );
+  return candidate as StreamLifecycle;
+}
+
 export interface AgentSessionAIServiceFakeOptions {
   /** Event source the session subscribes to; tests emit stream events on it. */
   emitter?: EventEmitter;
-  overrides?: Partial<AgentSessionAIService>;
+  overrides?: Partial<AgentSessionAIServiceFake>;
   /**
    * Signal that ends the default stream's started-turn handle (usually the session's
    * closingSignal). Without it the default stream reports a startup failure instead.
@@ -124,10 +170,11 @@ export interface AgentSessionAIServiceFakeOptions {
  */
 export function createAgentSessionAIServiceFake(
   options: AgentSessionAIServiceFakeOptions = {}
-): AgentSessionAIService & EventEmitter {
+): AgentSessionAIServiceFake & EventEmitter {
   const aiEmitter = options.emitter ?? new EventEmitter();
   const getClosingSignal = options.getClosingSignal;
-  const aiService: AgentSessionAIService & EventEmitter = Object.assign(aiEmitter, {
+  const aiService: AgentSessionAIServiceFake & EventEmitter = Object.assign(aiEmitter, {
+    runtimeFactory: nodeRuntimeFactory,
     // Real implementations report failures as Err results, never rejections.
     createModelWithPinnedOptions: mock(() =>
       Promise.resolve(
@@ -204,10 +251,12 @@ export interface AgentSessionHarnessOptions extends Pick<
   contextManagement?: ContextManagementService;
   config?: Config;
   historyService?: HistoryService;
+  /** Without `streamManager`, it must also implement the stream lifecycle (StreamLifecycle). */
   aiService?: AgentSessionAIService;
+  /** Default: createTestStreamManager over the AI fake, on the session's runner. */
   streamManager?: AgentSessionStreamManager;
   aiEmitter?: EventEmitter;
-  aiServiceOverrides?: Partial<AgentSessionAIService>;
+  aiServiceOverrides?: Partial<AgentSessionAIServiceFake>;
   initStateManager?: InitStateManager;
   initStateManagerOverrides?: Partial<InitStateManager>;
   backgroundProcessManager?: BackgroundProcessManager;
@@ -226,7 +275,8 @@ export interface AgentSessionHarness {
   historyService: HistoryService;
   cleanup: () => Promise<void>;
   aiEmitter: EventEmitter;
-  aiService: AgentSessionAIService;
+  /** The fake, or the caller's double (which then answers the lifecycle calls tests spy on). */
+  aiService: AgentSessionAIServiceFake;
   initStateManager: InitStateManager;
   backgroundProcessManager: BackgroundProcessManager;
   events: WorkspaceChatMessage[];
@@ -259,7 +309,18 @@ export async function createAgentSessionHarness(
   const testHistory = options.historyService ? undefined : await createTestHistoryService();
   const historyService = options.historyService ?? testHistory!.historyService;
   const config = options.config ?? testHistory!.config;
-  const cleanup = testHistory?.cleanup ?? (() => Promise.resolve());
+  const removeTempDir = testHistory?.cleanup ?? (() => Promise.resolve());
+  // Dispose before removing the folder: a session left alive keeps its RetryManager retrying
+  // (up to every 60 s) after its file ends, and each retry takes workspace use leases while
+  // later files in the same bun process run (#7526, #7518). dispose() is idempotent, so tests
+  // that already dispose their session can keep doing so.
+  const cleanup = async () => {
+    try {
+      await session.dispose();
+    } finally {
+      await removeTempDir();
+    }
+  };
   const fake = options.aiService
     ? undefined
     : createAgentSessionAIServiceFake({
@@ -292,7 +353,12 @@ export async function createAgentSessionHarness(
     config,
     historyService,
     aiService,
-    streamManager: options.streamManager,
+    streamManager:
+      options.streamManager ??
+      createTestStreamManager(
+        fake ?? streamLifecycleOf(aiService),
+        options.effectRunner ?? defaultEffectRunner
+      ),
     mcpServerManager: options.mcpServerManager,
     initStateManager,
     workspaceGoalService: options.workspaceGoalService,
@@ -327,7 +393,8 @@ export async function createAgentSessionHarness(
     historyService,
     cleanup,
     aiEmitter,
-    aiService,
+    // A caller double is returned as given; see AgentSessionHarness.aiService.
+    aiService: aiService as AgentSessionAIServiceFake,
     initStateManager,
     backgroundProcessManager,
     events,

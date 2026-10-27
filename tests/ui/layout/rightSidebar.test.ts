@@ -28,9 +28,10 @@ import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 
 import { installDom } from "../dom";
 import { renderApp } from "../renderReviewPanel";
-import { cleanupView, openSidebarNewTab, setupWorkspaceView } from "../helpers";
+import { cleanupView, disableTutorial, openSidebarNewTab, setupWorkspaceView } from "../helpers";
 import {
   getRightSidebarCollapsedKey,
+  getReviewImmersiveKey,
   RIGHT_SIDEBAR_TAB_KEY,
   RIGHT_SIDEBAR_WIDTH_KEY,
   getPersistedKeyRegistration,
@@ -46,7 +47,8 @@ import {
   type RightSidebarLayoutState,
 } from "@/browser/utils/rightSidebarLayout";
 import type { TabType } from "@/browser/types/rightSidebar";
-import { BROWSER_VIEWPORT_ATTR } from "@/browser/utils/ui/keybinds";
+import { openRightSidebarTool, splitRightSidebarPane } from "@/browser/utils/rightSidebarTabFocus";
+import { BROWSER_VIEWPORT_ATTR, TERMINAL_CONTAINER_ATTR } from "@/browser/utils/ui/keybinds";
 
 const RIGHT_SIDEBAR_SELECTOR = '[role="complementary"][aria-label="Workspace insights"]';
 
@@ -140,6 +142,7 @@ describeIntegration("RightSidebar (UI)", () => {
     // Reset all right-sidebar persisted state so each test starts clean.
     updatePersistedState(RIGHT_SIDEBAR_TAB_KEY, null);
     updatePersistedState(getRightSidebarCollapsedKey(workspaceId), null);
+    updatePersistedState(getReviewImmersiveKey(workspaceId), null);
     await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.AGENT_BROWSER, enabled: null });
     await env.orpc.experiments.set({
       experimentId: EXPERIMENT_IDS.PORTABLE_DESKTOP,
@@ -164,6 +167,14 @@ describeIntegration("RightSidebar (UI)", () => {
 
   async function setupRightSidebarView(beforeRender?: () => void) {
     const cleanupDom = installDom();
+    // Tutorial popovers take focus when their targets appear (the launcher's Terminal row, the
+    // immersive review button), so they made this file's focus checks flaky. Cleanup puts back the
+    // value from before, so later tests keep whatever default the suite set.
+    const tutorialsBefore = globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__;
+    const restoreTutorials = () => {
+      globalThis.__MUX_ENABLE_TUTORIALS_IN_SANDBOX__ = tutorialsBefore;
+    };
+    disableTutorial();
     // Most tests exercise open tools; individual tests can clear this to cover the default.
     updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
     beforeRender?.();
@@ -177,9 +188,17 @@ describeIntegration("RightSidebar (UI)", () => {
         "RightSidebar not found",
         10_000
       );
-      return { view, sidebar, cleanup: () => cleanupView(view, cleanupDom) };
+      return {
+        view,
+        sidebar,
+        cleanup: async () => {
+          await cleanupView(view, cleanupDom);
+          restoreTutorials();
+        },
+      };
     } catch (error) {
       await cleanupView(view, cleanupDom);
+      restoreTutorials();
       throw error;
     }
   }
@@ -277,8 +296,6 @@ describeIntegration("RightSidebar (UI)", () => {
       for (const name of ["Stats", "Review", "Instructions", "Goal", "Terminal"]) {
         expect(within(launcher).getByRole("button", { name })).toBeTruthy();
       }
-      // The only tab is already the New tab, so it offers no close button.
-      expect(sidebar.querySelector('button[aria-label^="Close"]')).toBeNull();
     } finally {
       await cleanup();
     }
@@ -409,8 +426,17 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
-  test("closing tabs: a static tab closes, and closing the last tab leaves the New tab", async () => {
-    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs", "review"]));
+  const isCollapsed = () => readPersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+  const waitForCollapse = (sidebar: HTMLElement) =>
+    waitFor(() => {
+      if (sidebar.querySelector('[role="tablist"]')) throw new Error("sidebar did not collapse");
+      expect(isCollapsed()).toBe(true);
+    });
+
+  test("closing tabs: a static tab closes, and closing the last tab closes the sidebar", async () => {
+    const { view, sidebar, cleanup } = await setupRightSidebarView(() =>
+      seedLayout(["costs", "review"])
+    );
 
     try {
       fireEvent.click(
@@ -421,9 +447,11 @@ describeIntegration("RightSidebar (UI)", () => {
         )
       );
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
+      expect(isCollapsed()).toBe(false);
 
+      // User request: the sidebar closes instead of showing the New tab in the last tab's place.
       fireEvent.click(
         await findRequiredElement(
           sidebar,
@@ -431,18 +459,41 @@ describeIntegration("RightSidebar (UI)", () => {
           "Close Stats not found"
         )
       );
+      await waitForCollapse(sidebar);
+
+      // The next expand shows the New tab alone, and closing it closes the sidebar too.
+      fireEvent.click(within(view.container).getByRole("button", { name: "Expand right sidebar" }));
       await findSidebarPanel(sidebar, "-panel-new");
-      await waitFor(() => {
-        expect(getTabs(sidebar)).toHaveLength(1);
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="costs"]')).toBeNull();
-      });
+      expect(getTabs(sidebar)).toHaveLength(1);
+      fireEvent.click(
+        await findRequiredElement(
+          sidebar,
+          'button[aria-label="Close New tab"]',
+          "Close New tab not found"
+        )
+      );
+      await waitForCollapse(sidebar);
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("closing the last tab when it is a terminal closes the sidebar", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView();
+
+    try {
+      const terminalTab = await createTerminalTab(sidebar);
+      expect(getTabs(sidebar)).toHaveLength(1);
+      fireEvent.click(within(terminalTab).getByRole("button", { name: "Close terminal" }));
+      await waitForCollapse(sidebar);
     } finally {
       await cleanup();
     }
   }, 60_000);
 
   // #6117 covered a close that leaves tabs in the pane. These cover the close of a pane's last
-  // tab: the pane empties (or collapses), and focus must still land on a tab, not <body>.
+  // tab: the pane collapses into its sibling, or the sidebar closes, and focus must still land
+  // on a control, not <body>.
   const closeByKeyboard = (close: HTMLElement) => {
     close.focus();
     // A focused button turns Enter into a click on itself.
@@ -455,7 +506,7 @@ describeIntegration("RightSidebar (UI)", () => {
       : (active?.tagName ?? "none");
   };
 
-  test("closing the only pane's last tab by keyboard focuses the New tab", async () => {
+  test("closing the only pane's last tab by keyboard focuses the sidebar toggle", async () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs"]));
     try {
       closeByKeyboard(
@@ -465,8 +516,10 @@ describeIntegration("RightSidebar (UI)", () => {
           "Close Stats not found"
         )
       );
-      await findSidebarPanel(sidebar, "-panel-new");
-      await waitFor(() => expect(activeTabDescription()).toMatch(/^tab .*-panel-new$/));
+      await waitForCollapse(sidebar);
+      await waitFor(() =>
+        expect(document.activeElement?.getAttribute("aria-label")).toBe("Expand right sidebar")
+      );
     } finally {
       await cleanup();
     }
@@ -501,7 +554,7 @@ describeIntegration("RightSidebar (UI)", () => {
         )
       );
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
       await waitFor(() => expect(activeTabDescription()).toMatch(/^tab .*-panel-costs$/));
     } finally {
@@ -530,7 +583,7 @@ describeIntegration("RightSidebar (UI)", () => {
       // Outside the viewport the same chord still closes the active tab.
       fireEvent.keyDown(window, closeTab);
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
     } finally {
       viewport.remove();
@@ -576,6 +629,158 @@ describeIntegration("RightSidebar (UI)", () => {
     }
   }, 60_000);
 
+  test("Ctrl+Shift+B collapses and expands the sidebar, but not from a terminal", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+    });
+    const tablist = () => sidebar.querySelector('[role="tablist"]');
+
+    try {
+      await waitFor(() => {
+        if (!tablist()) throw new Error("Tablist should be visible when expanded");
+      });
+
+      const chord = { key: "B", code: "KeyB", ctrlKey: true, shiftKey: true };
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => {
+        if (tablist()) throw new Error("Ctrl+Shift+B should collapse the sidebar");
+      });
+
+      // A focused terminal keeps the key: the sidebar stays collapsed.
+      const terminal = document.createElement("div");
+      terminal.setAttribute(TERMINAL_CONTAINER_ATTR, "");
+      document.body.append(terminal);
+      try {
+        fireEvent.keyDown(terminal, chord);
+      } finally {
+        terminal.remove();
+      }
+      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), false)).toBe(true);
+
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => {
+        if (!tablist()) throw new Error("Ctrl+Shift+B should expand the sidebar again");
+      });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("Ctrl+Shift+K opens and focuses the Artifacts tab, and collapses the sidebar from it", async () => {
+    await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: true });
+    const { sidebar, cleanup } = await setupRightSidebarView();
+    const chord = { key: "K", code: "KeyK", ctrlKey: true, shiftKey: true };
+    const collapsed = () => readPersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+    const artifactsSelected = () =>
+      sidebar
+        .querySelector('[role="tab"][aria-controls*="artifacts"]')
+        ?.getAttribute("aria-selected") === "true";
+
+    try {
+      // The shortcut listens once the experiment reads on: the launcher then offers the tool.
+      const launcher = await openLauncher(sidebar);
+      await waitFor(
+        () => expect(within(launcher).getByRole("button", { name: /^Artifacts\b/ })).toBeTruthy(),
+        { timeout: 10_000 }
+      );
+
+      // Another tab shows: the key switches to Artifacts and keeps the sidebar open.
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => expect(artifactsSelected()).toBe(true));
+      expect(collapsed()).toBe(false);
+
+      // A held key does not collapse it.
+      fireEvent.keyDown(window, { ...chord, repeat: true });
+      expect(collapsed()).toBe(false);
+
+      // Nor does a press in an overlay that blocks Ctrl+Shift+B (stand-ins, as in the Ctrl+Shift+B
+      // overlay test, but letting the key bubble to the window listener).
+      for (const attribute of ["cmdk-root", "data-radix-popper-content-wrapper"]) {
+        const root = document.createElement("div");
+        root.setAttribute(attribute, "");
+        const control = root.appendChild(document.createElement("button"));
+        document.body.append(root);
+        try {
+          fireEvent.keyDown(control, chord);
+          expect({ attribute, collapsed: collapsed() }).toEqual({ attribute, collapsed: false });
+        } finally {
+          root.remove();
+        }
+      }
+
+      // Artifacts shows but focus is elsewhere: the key moves focus into the tab and keeps the
+      // sidebar open.
+      const panel = () => sidebar.querySelector<HTMLElement>('[data-testid="artifacts-panel"]');
+      const outside = document.body.appendChild(document.createElement("button"));
+      try {
+        outside.focus();
+        fireEvent.keyDown(outside, chord);
+        await waitFor(() => expect(document.activeElement).toBe(panel()));
+        expect(collapsed()).toBe(false);
+      } finally {
+        outside.remove();
+      }
+
+      // Focus is in the tab: the key collapses the whole sidebar, like TOGGLE_RIGHT_SIDEBAR.
+      const focusedPanel = panel();
+      if (!focusedPanel) throw new Error("the Artifacts panel should be mounted");
+      fireEvent.keyDown(focusedPanel, chord);
+      await waitFor(() => expect(collapsed()).toBe(true));
+
+      // Collapsed: the key opens the sidebar on Artifacts again.
+      fireEvent.keyDown(window, chord);
+      await waitFor(() => expect(collapsed()).toBe(false));
+      await waitFor(() => expect(artifactsSelected()).toBe(true));
+    } finally {
+      await cleanup();
+      await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: null });
+    }
+  }, 60_000);
+
+  test("Ctrl+Shift+B over an overlay is claimed but does not toggle", async () => {
+    const { cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), false);
+    });
+    // Stand-ins for the overlays that block the toggle. The modal's control stops keydown
+    // propagation, as ConfirmationModal's controls do.
+    const overlays: [string, (root: HTMLElement) => void][] = [
+      ["command palette", (root) => root.setAttribute("cmdk-root", "")],
+      ["popover", (root) => root.setAttribute("data-radix-popper-content-wrapper", "")],
+      [
+        "modal that stops propagation",
+        (root) => {
+          root.setAttribute("role", "dialog");
+          root.setAttribute("aria-modal", "true");
+        },
+      ],
+    ];
+
+    try {
+      for (const [name, mark] of overlays) {
+        const root = document.createElement("div");
+        mark(root);
+        const control = document.createElement("button");
+        control.addEventListener("keydown", (e) => e.stopPropagation());
+        root.append(control);
+        document.body.append(root);
+        try {
+          const chord = { key: "B", code: "KeyB", ctrlKey: true, shiftKey: true };
+          // fireEvent returns false when a handler called preventDefault: in a browser, the
+          // chord must not fall through to Chrome's bookmarks bar.
+          expect({ name, notPrevented: fireEvent.keyDown(control, chord) }).toEqual({
+            name,
+            notPrevented: false,
+          });
+          expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
+        } finally {
+          root.remove();
+        }
+      }
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
   // The toggle sits over the top pane's strip but acts on the whole sidebar, so expanding
   // returns to the pane the user was in.
   test("collapsing over the top pane keeps the focused pane for Expand", async () => {
@@ -610,7 +815,7 @@ describeIntegration("RightSidebar (UI)", () => {
       toggle.focus();
       fireEvent.mouseUp(toggle);
       fireEvent.click(toggle);
-      await waitFor(() => expect(sidebar.querySelector('[role="tablist"]')).toBeNull());
+      await waitFor(() => expect(sidebar.querySelector('[role="tablist"]') === null).toBe(true));
       fireEvent.click(toggle);
 
       await findSidebarTab(sidebar, "costs");
@@ -659,7 +864,7 @@ describeIntegration("RightSidebar (UI)", () => {
       expect(panel()).not.toBeNull();
       running = null;
       closing.finish();
-      await waitFor(() => expect(panel()).toBeNull());
+      await waitFor(() => expect(panel() === null).toBe(true));
       expect(card()).not.toBeNull();
 
       const opening = new FakeCSSTransition();
@@ -944,7 +1149,7 @@ describeIntegration("RightSidebar (UI)", () => {
     const { sidebar, cleanup } = await setupRightSidebarView(() => {
       // Force a narrow viewport so the right sidebar max clamp is exercised.
       Object.defineProperty(window, "innerWidth", { value: 900, configurable: true });
-      window.dispatchEvent(new Event("resize"));
+      window.dispatchEvent(new window.Event("resize"));
     });
 
     try {
@@ -1118,7 +1323,7 @@ describeIntegration("RightSidebar (UI)", () => {
       fireEvent.keyDown(reviewPanel, { key: "w", ctrlKey: true });
 
       await waitFor(() => {
-        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]')).toBeNull();
+        expect(sidebar.querySelector('[role="tab"][aria-controls*="review"]') === null).toBe(true);
       });
       expect(sidebar.querySelector('[role="tab"][aria-controls*="costs"]')).not.toBeNull();
     } finally {
@@ -1205,6 +1410,214 @@ describeIntegration("RightSidebar (UI)", () => {
       await cleanup();
     }
   }, 60_000);
+
+  test("the palette's splits reveal the sidebar and move focus into the new pane", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      seedLayout(["costs", "goal"]);
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), true);
+    });
+    // What the palette's "Right Sidebar: Split Horizontally/Vertically" runs.
+    const split = (direction: "horizontal" | "vertical") =>
+      splitRightSidebarPane(workspaceId, direction);
+
+    try {
+      // From two tabs, the split moves the shown one (Stats) to the new pane: focus follows it.
+      split("vertical");
+      await waitFor(() => {
+        const active = document.activeElement;
+        expect(active?.getAttribute("role")).toBe("tab");
+        expect(active?.getAttribute("aria-controls")).toContain("-panel-costs");
+      });
+      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
+
+      // Stats is now alone in the focused pane, so the next split gives the new pane a New tab:
+      // focus lands on its launcher's first row.
+      split("horizontal");
+      const launcher = await findSidebarPanel(sidebar, "-panel-new");
+      await waitFor(() => {
+        expect(document.activeElement).toBe(launcher.querySelector("button"));
+      });
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("the palette's Add Tool reveals the sidebar with focus on the tool's tab", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarCollapsedKey(workspaceId), true);
+    });
+
+    try {
+      // What the palette's "Right Sidebar: Add Tool…" runs for Stats.
+      openRightSidebarTool(workspaceId, "costs");
+      const statsTab = await findSidebarTab(sidebar, "costs");
+      await waitFor(() => expect(document.activeElement).toBe(statsTab));
+      expect(readPersistedState(getRightSidebarCollapsedKey(workspaceId), true)).toBe(false);
+    } finally {
+      await cleanup();
+    }
+  }, 60_000);
+
+  // The palette's split and Add Tool must not move focus into a sidebar that cannot be seen. In
+  // a real browser focus() on a hidden element does nothing, but happy-dom moves focus anyway,
+  // so these fail if the sidebar stops checking (usePaletteTabFocus's isSidebarShown).
+  // Boolean checks: a failed toBe() on two DOM elements makes this jest setup fail while it prints
+  // them ("Cannot assign to read only property 'versions'"), which hides the real failure.
+  const expectPaletteKeepsFocusOutOf = async (sidebar: HTMLElement, outside: HTMLElement) => {
+    const container = sidebar.closest<HTMLElement>("[data-right-sidebar-phase]")!;
+    outside.focus();
+    splitRightSidebarPane(workspaceId, "vertical");
+    // The layout still changes: the new pane shows its launcher.
+    await waitFor(() => expect(sidebar.querySelectorAll('[id$="-panel-new"]')).toHaveLength(1));
+    expect(container.contains(document.activeElement)).toBe(false);
+
+    openRightSidebarTool(workspaceId, "instructions");
+    await findSidebarTab(sidebar, "instructions");
+    expect(container.contains(document.activeElement)).toBe(false);
+  };
+
+  test("the palette keeps focus out of the sidebar while the narrow layout hides it", async () => {
+    const { sidebar, cleanup } = await setupRightSidebarView(() => seedLayout(["costs"]));
+    const outside = document.body.appendChild(document.createElement("button"));
+    try {
+      await findSidebarTab(sidebar, "costs");
+      // What the narrow layout's CSS does (isRightSidebarResponsivelyHidden reads display).
+      const container = sidebar.closest<HTMLElement>("[data-right-sidebar-phase]")!;
+      container.style.display = "none";
+      await expectPaletteKeepsFocusOutOf(sidebar, outside);
+    } finally {
+      outside.remove();
+      await cleanup();
+    }
+  }, 60_000);
+
+  test("the palette keeps focus out of the sidebar while immersive review covers it", async () => {
+    // Immersive review needs a mounted Review panel. It sits in its own pane, so the split of the
+    // focused (Stats) pane does not remount it: a remount focuses the immersive view by design.
+    const layout: RightSidebarLayoutState = {
+      version: 1,
+      openTabsOnly: true,
+      nextId: 10,
+      root: {
+        type: "split",
+        id: "split-1",
+        direction: "horizontal",
+        sizes: [50, 50],
+        children: [
+          { type: "tabset", id: "tabset-review", tabs: ["review"], activeTab: "review" },
+          { type: "tabset", id: "tabset-stats", tabs: ["costs"], activeTab: "costs" },
+        ],
+      },
+      focusedTabsetId: "tabset-stats",
+    };
+    const { sidebar, cleanup } = await setupRightSidebarView(() => {
+      updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
+      updatePersistedState(getReviewImmersiveKey(workspaceId), true);
+    });
+    const outside = document.body.appendChild(document.createElement("button"));
+    try {
+      await findSidebarTab(sidebar, "review");
+      await waitFor(() =>
+        expect(sidebar.closest("[data-right-sidebar-phase]")?.getAttribute("aria-hidden")).toBe(
+          "true"
+        )
+      );
+
+      await expectPaletteKeepsFocusOutOf(sidebar, outside);
+    } finally {
+      outside.remove();
+      await cleanup();
+    }
+  }, 60_000);
+
+  test.each([
+    ["review", "Review"],
+    ["artifacts", "Artifacts"],
+  ] as const)(
+    "%s takes focus in the pane that opened it, not in another pane that shows it",
+    async (tool, name) => {
+      // The tool is open in both panes (a drag can do that). Every path that focuses its panel
+      // must focus the copy in the pane it targets: here the first pane.
+      if (tool === "artifacts") {
+        await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: true });
+      }
+      const layout: RightSidebarLayoutState = {
+        version: 1,
+        openTabsOnly: true,
+        nextId: 10,
+        root: {
+          type: "split",
+          id: "split-1",
+          direction: "horizontal",
+          sizes: [50, 50],
+          children: [
+            { type: "tabset", id: "tabset-a", tabs: [tool, "new"], activeTab: tool },
+            { type: "tabset", id: "tabset-b", tabs: [tool], activeTab: tool },
+          ],
+        },
+        focusedTabsetId: "tabset-a",
+      };
+      const { sidebar, cleanup } = await setupRightSidebarView();
+      const outside = document.body.appendChild(document.createElement("button"));
+      const panelOf = (tabsetId: string) =>
+        sidebar.querySelector<HTMLElement>(`[id$="-${tabsetId}-panel-${tool}"]`);
+      const expectFocusInFirstPane = () =>
+        waitFor(() => {
+          const active = document.activeElement;
+          expect(active !== outside && panelOf("tabset-a")?.contains(active) === true).toBe(true);
+          expect(panelOf("tabset-b")?.contains(active)).toBe(false);
+        });
+
+      try {
+        // The layout goes in once the fresh workspace's launcher offers the tool: an Artifacts
+        // tab stored while its experiment still reads off is pruned (useExperimentGatedTab).
+        const launcher0 = await findSidebarPanel(sidebar, "-panel-new");
+        await waitFor(
+          () =>
+            expect(
+              within(launcher0).getByRole("button", { name: new RegExp(`^${name}\\b`) })
+            ).toBeTruthy(),
+          { timeout: 10_000 }
+        );
+        updatePersistedState(getRightSidebarLayoutKey(workspaceId), layout);
+        // Both panels load lazily, and a panel takes focus only once loaded.
+        await waitFor(
+          () => {
+            for (const tabsetId of ["tabset-a", "tabset-b"]) {
+              const loaded = panelOf(tabsetId)?.querySelector(`[data-testid="${tool}-panel"]`);
+              expect(loaded != null).toBe(true);
+            }
+          },
+          { timeout: 10_000 }
+        );
+
+        // The palette's "Add Tool…" (the focused pane already shows the tool).
+        outside.focus();
+        openRightSidebarTool(workspaceId, tool);
+        await expectFocusInFirstPane();
+
+        // Ctrl+1: the first tab of the layout is the first pane's copy.
+        outside.focus();
+        fireEvent.keyDown(window, { key: "1", ctrlKey: true });
+        await expectFocusInFirstPane();
+
+        // The first pane's New tab launcher: picking the tool selects the copy in that pane.
+        // Its "+" button: opening the tool from the palette closed that pane's New tab.
+        fireEvent.click(within(sidebar).getAllByRole("button", { name: "New tab" })[0]);
+        const launcher = await findSidebarPanel(sidebar, "tabset-a-panel-new");
+        outside.focus();
+        fireEvent.click(within(launcher).getByRole("button", { name: new RegExp(`^${name}\\b`) }));
+        await expectFocusInFirstPane();
+      } finally {
+        outside.remove();
+        await cleanup();
+        if (tool === "artifacts") {
+          await env.orpc.experiments.set({ experimentId: EXPERIMENT_IDS.ARTIFACTS, enabled: null });
+        }
+      }
+    },
+    60_000
+  );
 
   test("a new terminal gets its tab even when the layout no longer fits its budget", async () => {
     // Pad the tabset id so the layout sits just under its budget: with a terminal tab (~45 chars)

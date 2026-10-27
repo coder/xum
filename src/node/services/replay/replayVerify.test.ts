@@ -28,7 +28,6 @@ import {
 } from "./replayFixture";
 import {
   collectFullHistory,
-  readRecordedSteps,
   replayVerifySession,
   type ReplayVerifySessionResult,
 } from "./replayVerify";
@@ -150,7 +149,7 @@ describe("replayVerifySession pairing", () => {
     ]);
   });
 
-  test("the step audit keeps the log order of overlapping runs", async () => {
+  test("the step audit orders overlapping runs by log order, or by observation when recorded", async () => {
     using tmp = new DisposableTempDir("replay-verify-step-order");
     const ctx = createReplayFixtureSessionContext(tmp.path);
     for (const userText of ["First.", "Second."]) {
@@ -167,14 +166,39 @@ describe("replayVerifySession pairing", () => {
     ctx.devtoolsLines.push(
       JSON.stringify({ type: "step", step: { ...firstStep, id: "step-1b", stepNumber: 1 } })
     );
-    await flushReplayFixtureDevtools(ctx);
+    // Without observation records the audit compares in log order, so A1 breaks against B0.
+    expect((await verify(ctx)).stepPrefix).toMatchObject({
+      comparedPairs: 2,
+      breaks: [{ runId: "run-1", stepNumber: 1, boundary: "turn" }],
+    });
 
-    const steps = await readRecordedSteps(ctx.sessionDir);
-    expect(steps.map((step) => `${step.runId}:${step.stepNumber}`)).toEqual([
-      "run-1:0",
-      "run-2:0",
-      "run-1:1",
-    ]);
+    // The monitor observed A0, A1, B0 in one millisecond. Only the observation counter orders
+    // them, so the log read must keep it: A1 then repeats A0 and B0 extends it.
+    const loggedStepIds = ctx.devtoolsLines.flatMap((line) => {
+      const entry = JSON.parse(line) as { type: string; step?: DevToolsStep };
+      return entry.type === "step" && entry.step != null ? [entry.step.id] : [];
+    });
+    expect(loggedStepIds).toHaveLength(3);
+    const observedSeqInLogOrder = [1, 3, 2];
+    loggedStepIds.forEach((stepId, index) => {
+      ctx.devtoolsLines.push(
+        JSON.stringify({
+          type: "step-update",
+          stepId,
+          update: {
+            promptCacheWire: {
+              route: "anthropic",
+              modelString: REPLAY_FIXTURE_MODEL,
+              cacheMarkersInjected: true,
+              dispatched: true,
+              observedAt: firstStep.startedAt,
+              observedSeq: observedSeqInLogOrder[index],
+            },
+          },
+        })
+      );
+    });
+    expect((await verify(ctx)).stepPrefix).toMatchObject({ comparedPairs: 2, breaks: [] });
   });
 
   test("a compact-agent turn without a compaction request row is skipped", async () => {
@@ -417,11 +441,6 @@ describe("replayVerifySession pairing", () => {
       comparedPairs: 2,
       breaks: [{ runId: "run-2", boundary: "turn" }],
     });
-    // The observation counter survives the read: it orders same-millisecond responses.
-    const cut = (await readRecordedSteps(ctx.sessionDir)).find(
-      (step) => step.stepId === "step-cut"
-    );
-    expect(cut?.promptCacheWire?.observedSeq).toBe(7);
     // A damaged wire record falls back to the old rule, which drops a failed step without usage.
     ctx.devtoolsLines[3] = JSON.stringify({
       type: "step-update",
@@ -794,10 +813,105 @@ describe("replayVerifySession pairing", () => {
     );
   });
 
+  test("a Tool: section change replays from the toolInstructions record", async () => {
+    // F31: inside a segment the tool descriptions keep the frozen Tool: text and a row sends
+    // the change. Replay has no tools, so it must rebuild that row from the record alone.
+    using tmp = new DisposableTempDir("replay-verify-tool-instructions");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    const bashTools = (rule: string): Record<string, Tool> => ({
+      bash: tool({
+        description: `Run a command\n\n${rule}`,
+        inputSchema: z.object({ script: z.string() }),
+      }),
+    });
+    for (const [index, rule] of ["Use rg.", "Use fd.", "Use fd."].entries()) {
+      await appendReplayFixtureTurn(ctx, {
+        userText: `Turn ${index + 1}.`,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: bashTools(rule),
+        liveToolInstructions: { bash: rule },
+      });
+    }
+
+    const result = await verify(ctx);
+    expect(
+      result.turns.map((turn) => ({ status: turn.status, messagesMatch: turn.messagesMatch }))
+    ).toEqual([
+      { status: "PASS", messagesMatch: true },
+      { status: "PASS", messagesMatch: true },
+      { status: "PASS", messagesMatch: true },
+    ]);
+
+    // Guard against a vacuous pass: turn 2 recorded a row with the new text, and its wire
+    // tool description kept the frozen one.
+    const history = await collectFullHistory(ctx.historyService, ctx.workspaceId);
+    if (!history.success) throw new Error(history.error);
+    expect(
+      history.data.find((row) => row.id === "assistant-2")?.metadata?.toolInstructions
+    ).toMatchObject({ placement: "row" });
+    const devtoolsRaw = await fs.readFile(`${tmp.path}/devtools.jsonl`, "utf-8");
+    const second = devtoolsRaw
+      .split("\n")
+      .filter((line) => line.length > 0)
+      .map((line) => JSON.parse(line) as { type?: string; step?: DevToolsStep })
+      .find((entry) => entry.type === "step" && entry.step?.runId === "run-2")?.step;
+    expect(JSON.stringify(second?.input?.prompt)).toContain(
+      '<tool-instructions tool=\\"bash\\">\\nUse fd.'
+    );
+    expect(JSON.stringify(second?.input?.tools)).toContain("Run a command\\n\\nUse rg.");
+    expect(JSON.stringify(second?.input?.tools)).not.toContain("Use fd.");
+  });
+
+  test("a Tool: change on an unrecorded turn and a split tail still replay", async () => {
+    // Codex PRRT_kwDOPxxmWM6vksx- and PRRT_kwDOPxxmWM6vksyK: the live fixture request honors
+    // the volatile tail split, and a turn without DevTools still records on its row.
+    using tmp = new DisposableTempDir("replay-verify-tool-instructions-unrecorded");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    const tail = (note: string) => `\n\n[Warning: ${note}]`;
+    const turns = [
+      { rule: "Use rg.", note: "A", recordDevtools: true },
+      { rule: "Use fd.", note: "A", recordDevtools: false },
+      { rule: "Use fd.", note: "B", recordDevtools: true },
+    ];
+    for (const [index, turn] of turns.entries()) {
+      await appendReplayFixtureTurn(ctx, {
+        userText: `Turn ${index + 1}.`,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT + tail(turn.note),
+        systemVolatileSuffixLength: tail(turn.note).length,
+        tools: {
+          bash: tool({
+            description: `Run a command\n\n${turn.rule}`,
+            inputSchema: z.object({ script: z.string() }),
+          }),
+        },
+        liveToolInstructions: { bash: turn.rule },
+        recordDevtools: turn.recordDevtools,
+      });
+    }
+
+    const result = await verify(ctx);
+    expect(
+      result.turns.map((turn) => ({ status: turn.status, messagesMatch: turn.messagesMatch }))
+    ).toEqual([
+      { status: "PASS", messagesMatch: true },
+      { status: "SKIPPED", messagesMatch: undefined },
+      { status: "PASS", messagesMatch: true },
+    ]);
+    const history = await collectFullHistory(ctx.historyService, ctx.workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const record = (id: string) => history.data.find((row) => row.id === id)?.metadata;
+    expect(record("assistant-2")?.toolInstructions).toMatchObject({ placement: "row" });
+    // Turn 3 puts turn 2's row back and adds none; only its tail changed.
+    expect(record("assistant-3")?.toolInstructions).toBeUndefined();
+    expect(record("assistant-3")?.volatileSystemTail).toMatchObject({ placement: "row" });
+  });
+
   test("a split volatile system tail is log-derivable", async () => {
     using tmp = new DisposableTempDir("replay-verify-volatile-system");
     const ctx = createReplayFixtureSessionContext(tmp.path);
-    const volatileTail = "\n\n<hot_memories>note</hot_memories>";
+    const volatileTail = "\n\n[Warning: note]";
 
     await appendReplayFixtureTurn(ctx, {
       userText: "Use the notes.",

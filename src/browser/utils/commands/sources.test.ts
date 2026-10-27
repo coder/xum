@@ -28,6 +28,7 @@ import {
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { MCP_APP_ENTRYPOINT_NOT_CONNECTED } from "@/browser/features/RightSidebar/AppViewTab/openMcpAppEntrypoint";
 import { CommandIds } from "@/browser/utils/commandIds";
+import { QuotaLimitedStorage } from "../../../../tests/ui/quotaLimitedStorage";
 import { updateRightSidebarLayout } from "@/browser/utils/rightSidebarTabFocus";
 import { withAppViewTab } from "@/browser/features/RightSidebar/AppViewTab/appViewTabs";
 import type { OpenLocalServerResult, RemoteConnectionApi } from "@/common/types/remoteConnection";
@@ -1903,7 +1904,7 @@ test("toggle hide sub-agents command flips the persisted sidebar setting", () =>
   }
 });
 
-test.each(["coder", "mux-gateway", "direct"])(
+test.each(["coder", "openrouter", "direct"])(
   "Pro palette uses the effective %s route instead of stale settings routing",
   async (route) =>
     withTestWindow(() => {
@@ -1927,7 +1928,7 @@ test.each(["coder", "mux-gateway", "direct"])(
         getEffectiveRouteForModel: resolveEffectiveRoute,
       });
       expect(actions.some((action) => action.id === "thinking:toggle-pro-reasoning")).toBe(
-        route !== "mux-gateway"
+        route !== "openrouter"
       );
       expect(resolveEffectiveRoute).toHaveBeenCalled();
     })
@@ -2185,6 +2186,16 @@ describe("Focus Background Processes palette action (#5197)", () => {
       }
     });
   });
+});
+
+test("the status page / chat switch needs the Agent interface view and hides without a status page", () => {
+  const find = (agentInterfaceViewEnabled: boolean) =>
+    getActions({ agentInterfaceViewEnabled }).find(
+      (action) => action.id === "nav:toggle-agent-interface-view"
+    );
+  expect(find(false)).toBeUndefined();
+  // No status page has been listed for the workspace, so there is nothing to switch to.
+  expect(find(true)?.visible?.()).toBe(false);
 });
 
 test("artifact palette commands follow the experiment and pin the typed path", async () => {
@@ -2466,6 +2477,80 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
     });
   });
 
+  // The sidebar moves focus there (tests/ui/layout/rightSidebar.test.ts).
+  test("Add Tool and the splits ask the sidebar to focus the tab they showed", async () => {
+    await withTestWindow(async () => {
+      const requests: unknown[] = [];
+      const record = (event: Event) => requests.push((event as CustomEvent).detail);
+      window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      try {
+        const actions = getActions();
+        const find = (id: string) => actions.find((entry) => entry.id === id)!;
+        await find(CommandIds.navRightSidebarSplitVertical()).run();
+        // The split's new pane holds a New tab, which Add Tool then replaces with the tool.
+        const newPane = readRightSidebarLayout("w1").focusedTabsetId;
+        await find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool: "review" });
+        expect(requests).toEqual([
+          { workspaceId: "w1", tabsetId: newPane, tab: "new" },
+          { workspaceId: "w1", tabsetId: newPane, tab: "review" },
+        ]);
+      } finally {
+        window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      }
+    });
+  });
+
+  // A refused layout write (localStorage full, or setItem throwing) changes nothing on screen, so
+  // a focus request would move focus to the tab the focused pane showed before. A request that
+  // the old layout already shows still gets focus.
+  test("a refused layout write sends a focus request only when the screen already shows it", async () => {
+    await withTestWindow(async () => {
+      const layoutKey = getRightSidebarLayoutKey("w1");
+      // Every layout write throws, like setItem when storage is blocked (SecurityError).
+      class LayoutRefusingStorage extends QuotaLimitedStorage {
+        override setItem(key: string, value: string): void {
+          if (key === layoutKey)
+            throw new DOMException("The operation is insecure.", "SecurityError");
+          super.setItem(key, value);
+        }
+      }
+      const storage = new LayoutRefusingStorage(Number.POSITIVE_INFINITY);
+      // A terminal session to focus, behind the Stats tab.
+      const before = selectOrAddTab(
+        getDefaultRightSidebarLayoutState("terminal:session-1"),
+        "costs"
+      );
+      storage.seed(layoutKey, JSON.stringify(before));
+      Object.defineProperty(window, "localStorage", { configurable: true, value: storage });
+
+      const requests: unknown[] = [];
+      const record = (event: Event) => requests.push((event as CustomEvent).detail);
+      window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      const consoleError = spyOn(console, "error").mockImplementation(() => undefined);
+      try {
+        const actions = getActions();
+        const find = (id: string) => actions.find((entry) => entry.id === id)!;
+        const addTool = (tool: string) =>
+          find(CommandIds.navRightSidebarAddTool()).prompt!.onSubmit({ tool });
+        await find(CommandIds.navRightSidebarSplitVertical()).run();
+        await addTool("review");
+        await find(CommandIds.navRightSidebarFocusTerminal()).run();
+        // Nothing was stored, and none of these three would have shown its target.
+        expect(readRightSidebarLayout("w1")).toEqual(before);
+        expect(requests).toEqual([]);
+
+        // Stats is already the focused pane's tab: the request still gets focus there.
+        await addTool("costs");
+        expect(requests).toEqual([
+          { workspaceId: "w1", tabsetId: before.focusedTabsetId, tab: "costs" },
+        ]);
+      } finally {
+        consoleError.mockRestore();
+        window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+      }
+    });
+  });
+
   test.each([null, true])("Add Tool opens with collapse preference %s", async (collapsed) => {
     await withTestWindow(async () => {
       updatePersistedState(getRightSidebarCollapsedKey("w1"), collapsed);
@@ -2510,17 +2595,31 @@ describe("explicit sidebar navigation from a collapsed chat", () => {
               .prompt!.onSubmit({ tool: "terminal" });
           }
         };
-        await run();
-        // With no session there is nothing to focus: leave the new chat collapsed.
-        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(true);
-        const layout = selectOrAddTab(
-          getDefaultRightSidebarLayoutState("terminal:session-1"),
-          "costs"
-        );
-        updatePersistedState(getRightSidebarLayoutKey("w1"), layout);
-        await run();
-        expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
-        expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe("terminal:session-1");
+        const focusRequests: unknown[] = [];
+        const record = (event: Event) => focusRequests.push((event as CustomEvent).detail);
+        window.addEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+        try {
+          await run();
+          // With no session there is nothing to focus: leave the new chat collapsed.
+          expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(true);
+          expect(focusRequests).toEqual([]);
+          const layout = selectOrAddTab(
+            getDefaultRightSidebarLayoutState("terminal:session-1"),
+            "costs"
+          );
+          updatePersistedState(getRightSidebarLayoutKey("w1"), layout);
+          await run();
+          expect(readPersistedState(getRightSidebarCollapsedKey("w1"), true)).toBe(false);
+          expect(getFocusedActiveTab(readRightSidebarLayout("w1"), "new")).toBe(
+            "terminal:session-1"
+          );
+          // The sidebar hands the terminal the keyboard.
+          expect(focusRequests).toEqual([
+            { workspaceId: "w1", tabsetId: layout.focusedTabsetId, tab: "terminal:session-1" },
+          ]);
+        } finally {
+          window.removeEventListener(CUSTOM_EVENTS.FOCUS_SIDEBAR_TAB, record);
+        }
       });
     }
   );
@@ -2584,6 +2683,9 @@ test("an app view with an open tab gets a Reload command that focuses its tab", 
   const originalDocument = globalThis.document;
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
   globalThis.document = testWindow.document as unknown as Document;
+  const originalCustomEvent = globalThis.CustomEvent;
+  // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+  globalThis.CustomEvent = testWindow.CustomEvent as unknown as typeof CustomEvent;
   try {
     const call = (toolCallId: string) => ({
       type: "tool",
@@ -2614,6 +2716,7 @@ test("an app view with an open tab gets a Reload command that focuses its tab", 
     void reload?.run();
     expect(focused).toEqual([{ workspaceId: "w1", toolCallId: "open" }]);
   } finally {
+    globalThis.CustomEvent = originalCustomEvent;
     globalThis.window = originalWindow;
     globalThis.document = originalDocument;
   }
@@ -2712,7 +2815,10 @@ test("an MCP App entry point's palette entry shows its server label and opens it
   // Opening dispatches OPEN_MCP_APP_VIEW on window (the "Open in tab" path).
   const testWindow = new GlobalWindow();
   const originalWindow = globalThis.window;
+  const originalCustomEvent = globalThis.CustomEvent;
   globalThis.window = testWindow as unknown as Window & typeof globalThis;
+  // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+  globalThis.CustomEvent = testWindow.CustomEvent as unknown as typeof CustomEvent;
   const shown: unknown[] = [];
   testWindow.addEventListener(CUSTOM_EVENTS.OPEN_MCP_APP_VIEW, (event) =>
     shown.push((event as unknown as CustomEvent<{ toolCallId: string }>).detail.toolCallId)
@@ -2720,6 +2826,7 @@ test("an MCP App entry point's palette entry shows its server label and opens it
   try {
     await entry?.run();
   } finally {
+    globalThis.CustomEvent = originalCustomEvent;
     globalThis.window = originalWindow;
     testWindow.close();
   }

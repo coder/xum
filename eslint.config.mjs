@@ -70,6 +70,196 @@ const BACKEND_ONLY_COMMON_RESTRICTION = backendOnlyCommonRestriction(
 );
 // Every no-restricted-imports block for browser or common files replaces the options of the
 // earlier blocks that match the same file, so each one starts from these lists.
+// local/no-host-imports (agent loop refactor, phase 1). .oxlintrc.json repeats these lists.
+// The loop core, its context code and its tools. Not tests or test helpers.
+const AGENT_LOOP_FILES = [
+  "src/node/services/agentSession.ts",
+  "src/node/services/aiService.ts",
+  "src/node/services/aiServiceEventGuards.ts",
+  "src/node/services/messagePipeline.ts",
+  "src/node/services/retryManager.ts",
+  "src/node/services/streamManager.ts",
+  "src/node/services/turn*.ts",
+  "src/node/services/contextManagement/**/*.ts",
+  "src/node/services/tools/**/*.ts",
+  // Phase 2: the history layer, whose fs calls move behind SessionFiles.
+  "src/node/services/compactionCancellation.ts",
+  "src/node/services/compactionPendingState.ts",
+  "src/node/services/continuousCompactionJournal.ts",
+  "src/node/services/historyAppendProvenance.ts",
+  "src/node/services/historyReplacementRows.ts",
+  "src/node/services/historyRowScanner.ts",
+  "src/node/services/historyScanner.ts",
+  "src/node/services/historyService.ts",
+  "src/node/services/sendIds.ts",
+];
+const AGENT_LOOP_IGNORES = [
+  "**/*.test.ts",
+  "**/*.testHarness.ts",
+  "**/*.bench.ts",
+  "src/node/services/tools/testHelpers.ts",
+];
+// local/no-raw-clock (agent loop refactor, phase 3). Its own literal list, not
+// ...AGENT_LOOP_FILES: phase 2 adds history modules there, and their clock reads are not phase 3
+// work. .oxlintrc.json repeats these lists.
+const RAW_CLOCK_FILES = [
+  "src/node/services/agentSession.ts",
+  "src/node/services/aiService.ts",
+  "src/node/services/aiServiceEventGuards.ts",
+  "src/node/services/messagePipeline.ts",
+  "src/node/services/retryManager.ts",
+  "src/node/services/streamManager.ts",
+  "src/node/services/turn*.ts",
+  "src/node/services/contextManagement/**/*.ts",
+  "src/node/services/tools/**/*.ts",
+  // Not in AGENT_LOOP_FILES: phase 3 moves its timers too.
+  "src/node/services/backgroundProcessManager.ts",
+];
+// Loop test files that moved from global fake timers and Date patches to the TestClock
+// (makeTestEffectRunner). Each phase 3 PR adds the test files it moves.
+const CLOCK_PATCH_FREE_TESTS = [
+  "src/node/services/backgroundProcessManager.test.ts",
+  "src/node/services/retryManager.test.ts",
+  "src/node/services/streamManager.toolEvents.test.ts",
+  "src/node/services/tools/web_fetch.test.ts",
+];
+// File -> the exact number of raw clock reads it still has. Phase 3 lowers each entry as it
+// moves the file onto the HostClock service, and the rule fails an entry that is too high.
+const RAW_CLOCK_ALLOW = {
+  "src/node/services/tools/bash.ts": 1,
+  // AbortSignal.timeout() on the skills.sh search request (#7282). The file calls the
+  // module-level node host services, not injected ones, so it has no HostClock to arm the
+  // deadline on. It bounds a network request, not loop time.
+  "src/node/services/tools/skillsCatalogFetch.ts": 1,
+};
+
+// local/no-fixed-sleep: browser test file -> the exact number of fixed real-time waits it still
+// has. Shrink-only: lower or delete an entry when a PR removes waits (#7608). .oxlintrc.json
+// repeats this map.
+const FIXED_SLEEP_ALLOW = {
+  "src/browser/components/AppLoader/AppLoader.auth.test.tsx": 2,
+  "src/browser/components/LeftSidebar/LeftSidebar.stories.tsx": 1,
+  "src/browser/components/ProjectSidebar/ProjectSidebar.test.tsx": 3,
+  "src/browser/components/TerminalView/TerminalView.test.tsx": 1,
+  "src/browser/components/WorkspaceMenuBar/LazySettingsModal.test.tsx": 4,
+  "src/browser/contexts/API.switch.test.tsx": 4,
+  "src/browser/contexts/API.test.tsx": 2,
+  "src/browser/contexts/AgentContext.test.tsx": 2,
+  "src/browser/contexts/WorkspaceContext.test.tsx": 4,
+  "src/browser/features/ChatInput/useComposerSuggestionsReconnect.test.tsx": 5,
+  "src/browser/features/ChatInput/useCreationWorkspace.test.tsx": 1,
+  "src/browser/features/Messages/ChatBarrier/StreamingBarrier.test.tsx": 1,
+  "src/browser/features/Messages/ChunkedStreamingMarkdown.test.tsx": 6,
+  "src/browser/features/Messages/TypewriterMarkdown.backfill.test.tsx": 1,
+  "src/browser/features/RightSidebar/AppViewTab/mcpAppEntrypoints.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/ArtifactInteractions.test.tsx": 2,
+  "src/browser/features/RightSidebar/ArtifactsTab/ArtifactViewer.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/ArtifactsPanel.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/McpAppFrame.test.tsx": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/artifactBridge.test.ts": 1,
+  "src/browser/features/RightSidebar/ArtifactsTab/mcpAppOpenAiShim.test.ts": 2,
+  "src/browser/features/RightSidebar/ArtifactsTab/mcpAppViewDomainsStore.test.tsx": 1,
+  "src/browser/features/RightSidebar/BrowserTab/BrowserToolbar.test.tsx": 1,
+  "src/browser/features/RightSidebar/CodeReview/ImmersiveReviewView.test.tsx": 1,
+  "src/browser/features/RightSidebar/RightSidebar.stories.tsx": 6,
+  "src/browser/features/Settings/Sections/BackupSectionReconnect.test.tsx": 2,
+  "src/browser/features/Settings/Sections/ExperimentsSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/GeneralSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/HeartbeatSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/SecretsSection.test.tsx": 9,
+  "src/browser/features/Settings/Sections/ServerAccessSection.test.tsx": 1,
+  "src/browser/features/Settings/Sections/TasksSection.ui.test.tsx": 7,
+  "src/browser/features/SplashScreens/SplashScreenProviderReconnect.test.tsx": 3,
+  "src/browser/features/Tools/AskUserQuestion/AskUserQuestionToolCall.stories.tsx": 1,
+  "src/browser/features/desktop/useDesktopConnection.test.tsx": 4,
+  "src/browser/hooks/useAnalyticsReconnect.test.tsx": 1,
+  "src/browser/hooks/useCoderWorkspaceReconnect.test.tsx": 4,
+  "src/browser/hooks/useEscapeToDismiss.test.tsx": 1,
+  "src/browser/hooks/useWorkflowRunByIdReconnect.test.tsx": 1,
+  "src/browser/hooks/useWorkspaceHeartbeat.test.tsx": 1,
+  "src/browser/stores/CreationDraftStore.test.ts": 3,
+  "src/browser/stores/DraftStore.sendIds.test.ts": 3,
+  "src/browser/stores/DraftStore.test.ts": 4,
+  "src/browser/stores/WorkspaceStore.test.ts": 14,
+  "src/browser/stores/subscriptionTransport.test.ts": 2,
+  "src/browser/stories/App.phoneSidebarFullscreen.stories.tsx": 2,
+  "src/browser/utils/messages/StreamingMessageAggregator.init.test.ts": 2,
+  "src/browser/utils/messages/StreamingMessageAggregator.test.ts": 4,
+  "tests/ui/agents/creationWaitsForBranches.test.ts": 2,
+  "tests/ui/chat/composerSendIds.test.ts": 1,
+  "tests/ui/chat/composerStaysOnDuringSend.test.ts": 1,
+  "tests/ui/chat/editKeepsUnsentDraft.test.ts": 4,
+  "tests/ui/chat/heldQueuedMessage.test.ts": 1,
+  "tests/ui/chat/readMore.test.ts": 10,
+  "tests/ui/chat/stopRestoreQueuedDraft.test.ts": 1,
+  "tests/ui/chat/streamInterrupt.test.ts": 1,
+  "tests/ui/chat/unreadIndicator.test.ts": 2,
+  "tests/ui/helpers.ts": 1,
+  "tests/ui/layout/rightSidebar.test.ts": 1,
+  "tests/ui/review/refresh.test.ts": 2,
+  "tests/ui/review/sendAfterFailedSubscription.test.ts": 1,
+  "tests/ui/workspaces/creationDraftProjectChange.test.ts": 1,
+  "tests/ui/workspaces/lifecycle.test.ts": 1,
+};
+// The rule strips "node:" and resolves relative specifiers to "@/..." forms.
+const HOST_MODULES = [
+  "fs",
+  "fs/promises",
+  "os",
+  "net",
+  "child_process",
+  "electron",
+  // Host timers. Loop code arms timers through the HostClock service (phase 3).
+  "timers",
+  "timers/promises",
+  "@/node/utils/writeFileAtomic",
+  { module: "@/node/utils/fs", names: ["ensurePrivateDir", "ensurePrivateDirSync"] },
+  // Concrete runtimes. The Runtime interface (runtime/Runtime.ts) stays allowed.
+  ...[
+    "CoderSSHRuntime",
+    "DevcontainerRuntime",
+    "DockerRuntime",
+    "LocalBaseRuntime",
+    "LocalRuntime",
+    "RemoteRuntime",
+    "SSHRuntime",
+    "WorktreeRuntime",
+    "multiProjectRuntime",
+    "runtimeFactory",
+  ].map((name) => `@/node/runtime/${name}`),
+  // The two builders make concrete runtimes. Its path helpers and types stay allowed.
+  {
+    module: "@/node/runtime/runtimeHelpers",
+    names: ["createRuntimeForWorkspace", "createRuntimeContextForWorkspace"],
+  },
+  // getXumHome() reads XUM_ROOT and stats ~/.xum (paths.ts). Phase 5 gives loop code the
+  // Xum home through HostPaths instead. The other names here call getXumHome() when no rootDir
+  // is passed. The file-name constants of paths.ts stay allowed.
+  {
+    module: "@/common/constants/paths",
+    names: [
+      "cleanupObsoleteXumBinArtifacts",
+      "getXumExtensionMetadataPath",
+      "getXumHome",
+      "getXumLogsDir",
+      "getXumPerfCapturesDir",
+      "getXumPerfReportsDir",
+      "getXumPerfTapesDir",
+      "getXumProjectsDir",
+      "getXumSessionsDir",
+    ],
+  },
+  // The session lock modules (phase 4): loop code takes its locks through SessionLocks. Not
+  // mutexMap: tools/file_edit_operation.ts keeps a pure in-memory map.
+  "@/node/utils/concurrency/workspaceFileLocks",
+  "@/node/utils/concurrency/fileLock",
+  "@/node/utils/concurrency/processLiveness",
+  "@/node/utils/main/crossProcessLock",
+  "@/node/services/workspaceUseLeases",
+];
+// File -> the host modules it still imports. Phase plans list the pairs they add or remove.
+const HOST_IMPORT_ALLOW = {};
+
 const SHARED_RESTRICTED_PATHS = [AI_TOKENIZER_ENCODING_RESTRICTION];
 const SHARED_RESTRICTED_PATTERNS = [SHIKI_RESTRICTION, ORPC_SCHEMAS_BARREL_RESTRICTION];
 const BROWSER_COMMON_RESTRICTED_PATTERNS = [
@@ -392,6 +582,7 @@ export default defineConfig([
       "src/browser/stories/**",
       "src/**/*StoryUtils.tsx",
       "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
       "src/**/test[A-Z]*.ts",
     ],
     rules: {
@@ -399,10 +590,42 @@ export default defineConfig([
     },
   },
   {
+    // Agent-loop files get host access from Effect services, not by an import (agent loop
+    // refactor, phase 1). The allow map is today's debt: later phases only remove entries, and
+    // scripts/noHostImports.test.ts freezes it.
+    files: AGENT_LOOP_FILES,
+    ignores: AGENT_LOOP_IGNORES,
+    rules: {
+      "local/no-host-imports": ["error", { modules: HOST_MODULES, allow: HOST_IMPORT_ALLOW }],
+    },
+  },
+  {
+    // Agent-loop files read time and arm timers through the HostClock service, so tests can
+    // drive loop time with the TestClock (agent loop refactor, phase 3).
+    files: RAW_CLOCK_FILES,
+    ignores: AGENT_LOOP_IGNORES,
+    rules: {
+      "local/no-raw-clock": ["error", { allow: RAW_CLOCK_ALLOW }],
+    },
+  },
+  {
+    // These loop tests drive time with the TestClock; a global patch would come back silently.
+    files: CLOCK_PATCH_FREE_TESTS,
+    rules: {
+      "local/no-global-clock-patch": "error",
+    },
+  },
+  {
     // Backend production code: required-member typeof guards only exist to tolerate partial
     // test doubles; tests must complete the doubles instead (see the rule's docs).
     files: ["src/node/services/**/*.ts"],
-    ignores: ["**/*.test.ts", "**/*.testHarness.ts", "**/*.testUtils.ts", "**/test*/**"],
+    ignores: [
+      "**/*.test.ts",
+      "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
+      "**/*.testUtils.ts",
+      "**/test*/**",
+    ],
     rules: {
       "local/no-required-member-typeof-guard": "error",
     },
@@ -709,6 +932,7 @@ export default defineConfig([
       "**/*.stories.tsx",
       "src/browser/stories/**",
       "**/*.testHarness.ts",
+      "**/*.hostProof.ts",
       "src/**/test[A-Z]*.ts",
     ],
     rules: {
@@ -768,6 +992,66 @@ export default defineConfig([
     },
   },
   {
+    // Tooling tests (scripts/**/*.test.ts) and the VS Code extension (vscode/src) are type-checked
+    // by tsconfig.tooling.json (make typecheck), not by the tsconfig.json the project service
+    // would pick, so lint them against that program with the same base rules as tests/.
+    files: ["scripts/**/*.test.ts", "vscode/src/**/*.{ts,tsx}"],
+    plugins: {
+      local: localPlugin,
+      "react-hooks": reactHooks,
+    },
+    languageOptions: {
+      parserOptions: {
+        project: "./tsconfig.tooling.json",
+        tsconfigRootDir: import.meta.dirname,
+      },
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+        __dirname: "readonly",
+        __filename: "readonly",
+        require: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        window: "readonly",
+        document: "readonly",
+      },
+    },
+    rules: {
+      // Same options as src/ and tests/: a leading underscore marks an intentionally unused binding.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          vars: "all",
+          args: "after-used",
+          ignoreRestSiblings: true,
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrors: "all",
+        },
+      ],
+    },
+  },
+  {
+    // The webview is React: run the two hook rules src/ runs (src/ also runs the compiler rules).
+    files: ["vscode/src/**/*.tsx"],
+    rules: {
+      "react-hooks/rules-of-hooks": "error",
+      "react-hooks/exhaustive-deps": "warn",
+    },
+  },
+  {
+    // Like tests/: test doubles implement async interfaces with synchronous or empty bodies.
+    files: ["scripts/**/*.test.ts", "vscode/src/**/*.test.{ts,tsx}"],
+    rules: {
+      "@typescript-eslint/require-await": "off",
+      "@typescript-eslint/no-empty-function": "off",
+    },
+  },
+  {
     // Test file configuration
     files: ["**/*.test.ts", "**/*.test.tsx"],
     rules: {
@@ -801,12 +1085,25 @@ export default defineConfig([
     },
   },
   {
+    // Browser tests wait on signals or fake timers, not on a fixed real time (#7608).
+    // Stories count too: `make test-storybook` runs their play functions as interaction tests.
+    files: [
+      "src/browser/**/*.test.{ts,tsx}",
+      "src/browser/**/*.stories.tsx",
+      "tests/ui/**/*.{ts,tsx}",
+    ],
+    rules: {
+      "local/no-fixed-sleep": ["error", { allow: FIXED_SLEEP_ALLOW }],
+    },
+  },
+  {
     // Test files and the support code they load run in the same covered bun process.
     files: [
       "**/*.test.ts",
       "**/*.test.tsx",
       "tests/**/*.{ts,tsx}",
       "src/**/*.testHarness.{ts,tsx}",
+      "src/**/*.hostProof.ts",
       "src/**/*.testUtils.{ts,tsx}",
       "src/**/test[A-Z]*.{ts,tsx}",
     ],
@@ -852,7 +1149,7 @@ export default defineConfig([
             "src/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection.test.tsx": [
               "./useBrowserBridgeConnection.ts?test-isolation=static",
             ],
-            "src/browser/utils/feedbackToast.test.tsx": ["../components/Dialog/Dialog?real=1"],
+            "src/browser/utils/feedbackToastView.test.tsx": ["../components/Dialog/Dialog?real=1"],
             "src/browser/utils/perf/appShellReady.test.ts": ["./appShellReady?fresh=1"],
           },
         },

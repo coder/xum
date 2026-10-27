@@ -567,6 +567,9 @@ const setupWindow = ({
 
   const windowInstance = new GlobalWindow();
   globalThis.window = windowInstance as unknown as WindowWithApi;
+  // happy-dom 21 dispatches only its own Event instances; createCustomEvent uses the global.
+  // saveDomGlobals() in beforeEach puts the previous CustomEvent back.
+  globalThis.CustomEvent = windowInstance.CustomEvent as unknown as typeof CustomEvent;
   const windowWithApi = globalThis.window as WindowWithApi;
 
   const apiMock: WindowApi = {

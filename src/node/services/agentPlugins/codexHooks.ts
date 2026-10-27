@@ -9,6 +9,9 @@
  * - Only `mcp_tool` handlers on the four mapped events can run (in a later change). `command`,
  *   `prompt` and `agent` handlers are parsed and never run; other Codex events are parsed and
  *   ignored. Both are listed so the user sees what the plugin declares.
+ * - Claude Code plugins use the same file shape (`hooks/hooks.json`, plus the manifest's `hooks`
+ *   files). Xum lists their hooks on every Claude event and never runs any of them, `mcp_tool`
+ *   included: Claude matchers name Claude tools, and Xum maps only Codex tool names.
  * - Trust: Codex trusts each hook by the hash of its exact definition, so a new or changed hook
  *   is skipped until the user trusts it. `hash` is that key (see pluginHookTrust.ts).
  *
@@ -36,7 +39,7 @@ import {
   type AgentPluginInfo,
 } from "./discovery";
 import { isPlainObject } from "./manifest";
-import { MAX_HOOK_POINTER_ENTRIES } from "./openaiExtension";
+import { MAX_HOOK_POINTER_ENTRIES, type OpenAIPluginHooksEntry } from "./openaiExtension";
 
 /** Codex events Xum maps to its own hook points. */
 export const MAPPED_CODEX_HOOK_EVENTS = {
@@ -45,7 +48,6 @@ export const MAPPED_CODEX_HOOK_EVENTS = {
   UserPromptSubmit: "message.send",
   Stop: "turn.stop",
 } as const;
-export type MappedCodexHookEvent = keyof typeof MAPPED_CODEX_HOOK_EVENTS;
 
 /** Other Codex events: parsed and listed, never run. */
 const IGNORED_CODEX_HOOK_EVENTS = new Set([
@@ -59,8 +61,56 @@ const IGNORED_CODEX_HOOK_EVENTS = new Set([
   "Interrupt",
 ]);
 
+/**
+ * Claude Code hook events (https://code.claude.com/docs/en/hooks.md). A Claude package's hooks on
+ * these events are listed and never run.
+ */
+const CLAUDE_HOOK_EVENTS = new Set([
+  ...Object.keys(MAPPED_CODEX_HOOK_EVENTS),
+  ...IGNORED_CODEX_HOOK_EVENTS,
+  "PostToolUseFailure",
+  "PostToolBatch",
+  "PermissionDenied",
+  "Notification",
+  "UserPromptExpansion",
+  "MessageDisplay",
+  "TaskCreated",
+  "TaskCompleted",
+  "StopFailure",
+  "TeammateIdle",
+  "ConfigChange",
+  "CwdChanged",
+  "DirectoryAdded",
+  "FileChanged",
+  "WorktreeCreate",
+  "WorktreeRemove",
+  "PreModelSwitch",
+  "PostModelSwitch",
+  "Setup",
+  "InstructionsLoaded",
+  "Elicitation",
+  "ElicitationResult",
+]);
+
 /** Codex ignores the matcher on these events (codex-rs/hooks/src/events/common.rs). */
 const MATCHERLESS_CODEX_HOOK_EVENTS = new Set(["UserPromptSubmit", "Stop", "Interrupt"]);
+
+/**
+ * Claude Code has no matcher support on these events and silently ignores a matcher there
+ * (hooks.md "Matcher patterns"), so Xum does not check it: the never-run hook stays listed.
+ */
+const MATCHERLESS_CLAUDE_HOOK_EVENTS = new Set([
+  "UserPromptSubmit",
+  "PostToolBatch",
+  "Stop",
+  "TeammateIdle",
+  "TaskCreated",
+  "TaskCompleted",
+  "WorktreeCreate",
+  "WorktreeRemove",
+  "MessageDisplay",
+  "CwdChanged",
+]);
 
 const DEFAULT_HOOKS_FILE = "hooks/hooks.json";
 const MAX_HOOKS_FILE_BYTES = 256 * 1024;
@@ -109,7 +159,8 @@ export interface PluginHooksLoadResult {
 
 /**
  * Read and parse a plugin's Codex hooks. An explicit `com.openai` pointer replaces the default
- * `hooks/hooks.json`; it never adds to it.
+ * `hooks/hooks.json`; it never adds to it. A Claude package's manifest `hooks` files add to the
+ * default (the Claude rule), and every one of its hooks gets the `claude-plugin` status.
  *
  * The pointer is the `com.openai` extension discovery selected (root `plugin.json`, a Codex-only
  * `.codex-plugin/plugin.json`, or the overlay next to a root manifest without one), already
@@ -118,24 +169,28 @@ export interface PluginHooksLoadResult {
  * (PRRT_kwDOPxxmWM6r2kUY).
  */
 export async function loadPluginCodexHooks(
-  plugin: Pick<AgentPluginInfo, "rootPath" | "openai" | "openaiManifestPath">
+  plugin: Pick<
+    AgentPluginInfo,
+    "rootPath" | "openai" | "openaiManifestPath" | "claudeFallback" | "claude" | "skillsOnly"
+  >
 ): Promise<PluginHooksLoadResult> {
+  // A skills-only package has no hooks, not even the default hooks/hooks.json.
+  if (plugin.skillsOnly === true) return { hooks: [], warnings: [] };
   const warnings = new HookWarnings();
   const hooks: PluginHookDefinition[] = [];
-  const pointer = plugin.openai?.hooks;
-  // Discovery already caps the entries; this guards any other caller of the loader.
-  if (pointer !== undefined && pointer.length > MAX_HOOK_POINTER_ENTRIES) {
-    warnings.push(
-      `'extensions["com.openai"].hooks' has ${pointer.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
-    );
-  }
-  const entries = pointer?.slice(0, MAX_HOOK_POINTER_ENTRIES) ?? [DEFAULT_HOOKS_FILE];
+  const { entries, defaultFileListed } = listHookEntries(plugin, warnings);
+  const claude = plugin.claudeFallback === true;
   const seenFiles = new Set<string>();
   const inlineSource = path.normalize(plugin.openaiManifestPath ?? PLUGIN_MANIFEST_RELATIVE_PATH);
-  for (const entry of entries) {
+  for (const [index, entry] of entries.entries()) {
     if (hooks.length > MAX_PLUGIN_HOOKS) break;
     if (typeof entry !== "string") {
-      parseHooksDocument(entry.inline, `${inlineSource}#hooks[${entry.index}]`, hooks, warnings);
+      parseHooksDocument(
+        entry.inline,
+        { source: `${inlineSource}#hooks[${entry.index}]`, claude },
+        hooks,
+        warnings
+      );
       continue;
     }
     // A hook key is `<source>#<event>[group][handler]`, and an inline source is
@@ -150,7 +205,9 @@ export async function loadPluginCodexHooks(
       continue;
     }
     seenFiles.add(path.normalize(entry));
-    const content = await readHooksFile(plugin.rootPath, entry, pointer == null, warnings);
+    // Only the default file is optional: a listed file that is missing is a plugin bug.
+    const isDefault = defaultFileListed && index === 0;
+    const content = await readHooksFile(plugin.rootPath, entry, isDefault, warnings);
     if (content === undefined) continue;
     let document: unknown;
     try {
@@ -159,7 +216,7 @@ export async function loadPluginCodexHooks(
       warnings.push(`${entry} is not valid JSON; ignoring it: ${getErrorMessage(error)}`);
       continue;
     }
-    parseHooksDocument(document, path.normalize(entry), hooks, warnings);
+    parseHooksDocument(document, { source: path.normalize(entry), claude }, hooks, warnings);
   }
   const list = warnings.list();
   if (hooks.length > MAX_PLUGIN_HOOKS) {
@@ -167,6 +224,29 @@ export async function loadPluginCodexHooks(
     hooks.length = MAX_PLUGIN_HOOKS;
   }
   return { hooks, warnings: list };
+}
+
+/**
+ * The hook sources to read, in order: the com.openai pointer, or the default file followed by a
+ * Claude package's manifest `hooks` files. A Claude package has no com.openai pointer (discovery
+ * drops its extensions). `defaultFileListed`: the first entry is the optional default file.
+ */
+function listHookEntries(
+  plugin: Pick<AgentPluginInfo, "openai" | "claudeFallback" | "claude">,
+  warnings: HookWarnings
+): { entries: OpenAIPluginHooksEntry[]; defaultFileListed: boolean } {
+  const pointer = plugin.openai?.hooks;
+  if (pointer == null) {
+    const claudeFiles = plugin.claudeFallback === true ? (plugin.claude?.hooks ?? []) : [];
+    return { entries: [DEFAULT_HOOKS_FILE, ...claudeFiles], defaultFileListed: true };
+  }
+  // Discovery already caps the entries; this guards any other caller of the loader.
+  if (pointer.length > MAX_HOOK_POINTER_ENTRIES) {
+    warnings.push(
+      `'extensions["com.openai"].hooks' has ${pointer.length} entries; reading only the first ${MAX_HOOK_POINTER_ENTRIES}`
+    );
+  }
+  return { entries: pointer.slice(0, MAX_HOOK_POINTER_ENTRIES), defaultFileListed: false };
 }
 
 async function readHooksFile(
@@ -204,23 +284,28 @@ function getErrorCode(error: unknown): unknown {
 
 function parseHooksDocument(
   document: unknown,
-  source: string,
+  where: { source: string; claude: boolean },
   out: PluginHookDefinition[],
   warnings: HookWarnings
 ): void {
+  const { source, claude } = where;
   if (!isPlainObject(document) || !isPlainObject(document.hooks)) {
     warnings.push(`${source}: expected { "hooks": { <Event>: [...] } }; ignoring it`);
     return;
   }
   for (const [event, value] of Object.entries(document.hooks)) {
-    const groups = readEventGroups(event, value, source, warnings);
+    const groups = readEventGroups(event, value, where, warnings);
     if (groups === undefined) continue;
-    const mapped = Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event);
+    const status: PluginHookStatus | undefined = claude
+      ? "claude-plugin"
+      : Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event)
+        ? undefined
+        : "ignored-event";
     for (const [groupIndex, group] of groups.entries()) {
       // The plugin's hook budget is checked inside each document too (PRRT_kwDOPxxmWM6rRIkV).
       if (out.length > MAX_PLUGIN_HOOKS) return;
       const groupKey = `${source}#${event}[${groupIndex}]`;
-      parseMatcherGroup(group, { source, groupKey, event, mapped }, out, warnings);
+      parseMatcherGroup(group, { source, groupKey, event, status }, out, warnings);
     }
   }
 }
@@ -229,10 +314,14 @@ function parseHooksDocument(
 function readEventGroups(
   event: string,
   groups: unknown,
-  source: string,
+  where: { source: string; claude: boolean },
   warnings: HookWarnings
 ): unknown[] | undefined {
-  if (!Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event) && !IGNORED_CODEX_HOOK_EVENTS.has(event)) {
+  const { source } = where;
+  const known = where.claude
+    ? CLAUDE_HOOK_EVENTS.has(event)
+    : Object.hasOwn(MAPPED_CODEX_HOOK_EVENTS, event) || IGNORED_CODEX_HOOK_EVENTS.has(event);
+  if (!known) {
     warnings.push(`${source}: unknown hook event '${event}'; ignoring it`);
     return undefined;
   }
@@ -246,20 +335,27 @@ function readEventGroups(
 
 function parseMatcherGroup(
   group: unknown,
-  where: { source: string; groupKey: string; event: string; mapped: boolean },
+  where: {
+    source: string;
+    groupKey: string;
+    event: string;
+    /** Fixed status of every hook in the group; undefined: decided by the handler type. */
+    status: PluginHookStatus | undefined;
+  },
   out: PluginHookDefinition[],
   warnings: HookWarnings
 ): void {
-  const { source, groupKey, event, mapped } = where;
+  const { source, groupKey, event } = where;
   if (!isPlainObject(group) || !Array.isArray(group.hooks)) {
     warnings.push(`${source}: a '${event}' matcher group needs a "hooks" array; ignoring it`);
     return;
   }
-  const matcher = readGroupMatcher(group.matcher, source, event, warnings);
+  const claude = where.status === "claude-plugin";
+  const matcher = readGroupMatcher(group.matcher, source, event, warnings, claude);
   if (matcher === null) return;
   for (const [handlerIndex, raw] of group.hooks.entries()) {
     if (out.length > MAX_PLUGIN_HOOKS) return;
-    const handler = parseHandler(raw, `${source}: '${event}'`, warnings);
+    const handler = parseHandler(raw, `${source}: '${event}'`, warnings, { claude });
     if (handler === undefined) continue;
     let hash: string;
     try {
@@ -269,11 +365,8 @@ function parseMatcherGroup(
       warnings.push(`${source}: '${event}': ${getErrorMessage(error)}; ignoring a handler`);
       continue;
     }
-    const status: PluginHookStatus = !mapped
-      ? "ignored-event"
-      : handler.type === "mcp_tool"
-        ? "runnable"
-        : "unsupported-handler";
+    const status: PluginHookStatus =
+      where.status ?? (handler.type === "mcp_tool" ? "runnable" : "unsupported-handler");
     out.push({
       key: `${groupKey}[${handlerIndex}]`,
       hash,
@@ -298,14 +391,11 @@ function readGroupMatcher(
   matcher: unknown,
   source: string,
   event: string,
-  warnings: HookWarnings
+  warnings: HookWarnings,
+  claude: boolean
 ): string | undefined | null {
-  if (
-    matcher == null ||
-    matcher === "*" ||
-    matcher === "" ||
-    MATCHERLESS_CODEX_HOOK_EVENTS.has(event)
-  ) {
+  const matcherless = claude ? MATCHERLESS_CLAUDE_HOOK_EVENTS : MATCHERLESS_CODEX_HOOK_EVENTS;
+  if (matcher == null || matcher === "*" || matcher === "" || matcherless.has(event)) {
     return undefined;
   }
   const error = typeof matcher === "string" ? hookMatcherError(matcher) : "not a string";
@@ -330,7 +420,8 @@ function isU64(value: unknown): boolean {
 function parseHandler(
   raw: unknown,
   where: string,
-  warnings: HookWarnings
+  warnings: HookWarnings,
+  dialect: { claude: boolean }
 ): PluginHookHandler | undefined {
   if (!isPlainObject(raw)) {
     warnings.push(`${where}: a hook handler must be an object; ignoring it`);
@@ -376,7 +467,12 @@ function parseHandler(
         invalid = "command";
         break;
       }
-      return { type: "command", summary: raw.command };
+      {
+        const summary = commandSummary(raw.command, dialect.claude ? raw.args : undefined);
+        if (summary !== undefined) return { type: "command", summary };
+        invalid = "args";
+        break;
+      }
     case "prompt":
     case "agent":
       return { type: raw.type, summary: `${raw.type} handler` };
@@ -391,6 +487,20 @@ function parseHandler(
     `${where}: a '${String(raw.type)}' handler has missing or invalid fields ('${invalid}'${tool}); ignoring it`
   );
   return undefined;
+}
+
+/**
+ * A command hook's summary. Claude's exec form adds `args`, the argument vector, so the
+ * disclosure shows it too: each argument is quoted when it is empty or has a space or quote.
+ * Undefined when `args` is not a list of strings.
+ */
+function commandSummary(command: string, args: unknown): string | undefined {
+  if (args === undefined) return command;
+  if (!Array.isArray(args) || !args.every((arg) => typeof arg === "string")) return undefined;
+  const argv: string[] = [command, ...args];
+  return argv
+    .map((arg) => (arg === "" || /[\s"'\\]/.test(arg) ? JSON.stringify(arg) : arg))
+    .join(" ");
 }
 
 /**

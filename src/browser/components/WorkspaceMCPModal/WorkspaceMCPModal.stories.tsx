@@ -14,6 +14,7 @@ import { createWorkspace, groupWorkspacesByProject } from "@/browser/stories/moc
 import { createMockORPCClient } from "@/browser/stories/mocks/orpc";
 import { PIXEL_DISABLED } from "@/browser/stories/meta.js";
 import { textContrast } from "@/browser/stories/helpers/contrast";
+import { clickWhenReady } from "@/browser/stories/storyPlayHelpers";
 import { getMCPTestResultsKey } from "@/common/constants/storage";
 import type { MCPServerInfo } from "@/common/types/mcp";
 import type { MCPSettingsSnapshot } from "@/common/utils/mcpSettings";
@@ -779,11 +780,12 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
     await expect(toolActionRuns).toEqual([{ toolName: "cad.library", confirmed: false }]);
 
     await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
-    await userEvent.click(await page.findByRole("button", { name: "Cancel" }));
+    await clickWhenReady(await page.findByRole("button", { name: "Cancel" }));
     await waitFor(() => expect(page.queryByText("Run Reset parts?")).not.toBeInTheDocument());
     await expect(toolActionRuns).toHaveLength(1);
-    await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
-    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    // The settings dialog takes clicks again only once it is back on top of the closed confirm.
+    await clickWhenReady(section.getByRole("button", { name: "Run Reset parts" }));
+    await clickWhenReady(await page.findByRole("button", { name: "Run" }));
     // A tool that can write: the dialog reads the settings again, which remounts the section.
     await expect(within(dialog).findByText("cad.reset finished")).resolves.toBeInTheDocument();
     section = within(within(dialog).getByTestId("mcp-server-settings"));
@@ -807,7 +809,7 @@ export const WorkspaceMCPServerSettingsToolActions: Story = {
 
     // The MCP App tool can write too: it opens only after the confirmation, in a modal.
     await userEvent.click(section.getByRole("button", { name: "Open Payment method" }));
-    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    await clickWhenReady(await page.findByRole("button", { name: "Run" }));
     const appDialog = await page.findByRole("dialog", { name: "Payment method" });
     await expect(toolActionRuns[2]).toEqual({ toolName: "cad.payment", confirmed: true });
     await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
@@ -866,7 +868,7 @@ export const WorkspaceMCPServerSettingsStaleReadOnlyFlag: Story = {
 
     await userEvent.click(run);
     await expect(page.findByText("Run Part library?")).resolves.toBeInTheDocument();
-    await userEvent.click(page.getByRole("button", { name: "Run" }));
+    await clickWhenReady(page.getByRole("button", { name: "Run" }));
     // The confirmed run can write, so the dialog reads the settings again (a new section).
     await expect(within(dialog).findByText("cad.library finished")).resolves.toBeInTheDocument();
     await expect(staleFlagRuns).toEqual([{ toolName: "cad.library", confirmed: true }]);
@@ -956,7 +958,7 @@ export const WorkspaceMCPServerSettingsAppViewRetry: Story = {
     const section = within(await within(dialog).findByTestId("mcp-server-settings"));
     const page = within(canvasElement.ownerDocument.body);
     await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
-    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    await clickWhenReady(await page.findByRole("button", { name: "Run" }));
     const appDialog = await page.findByRole("dialog", { name: "Payment method" });
     const reload = await within(appDialog).findByRole("button", { name: "Reload" });
     retryViews["settings:cad:cad.payment"] = {
@@ -967,7 +969,7 @@ export const WorkspaceMCPServerSettingsAppViewRetry: Story = {
       result: { content: [] },
       invocation: null,
     };
-    await userEvent.click(reload);
+    await clickWhenReady(reload);
     await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
     await expect(retryViewRuns).toHaveLength(1);
   },
@@ -984,7 +986,7 @@ async function exerciseRereadAfterWrite(canvasElement: HTMLElement, resetText: s
   await expect(section.findByText("cad.library finished")).resolves.toBeInTheDocument();
   await expect(rereadReads).toHaveLength(1);
   await userEvent.click(section.getByRole("button", { name: "Run Reset parts" }));
-  await userEvent.click(await page.findByRole("button", { name: "Run" }));
+  await clickWhenReady(await page.findByRole("button", { name: "Run" }));
   // The re-read remounts the section: query it again.
   await waitFor(() => expect(modal.getByLabelText("Default zoom setting")).toHaveValue(1));
   await expect(rereadReads).toEqual([["cad"], ["cad"]]);
@@ -1056,7 +1058,7 @@ export const WorkspaceMCPServerSettingsRereadAfterApp: Story = {
     const section = within(await modal.findByTestId("mcp-server-settings"));
     const page = within(canvasElement.ownerDocument.body);
     await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
-    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    await clickWhenReady(await page.findByRole("button", { name: "Run" }));
     const appDialog = await page.findByRole("dialog", { name: "Payment method" });
     await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
     await expect(appWriteReads).toHaveLength(1);
@@ -1121,7 +1123,7 @@ export const WorkspaceMCPServerSettingsRereadAfterAppUnmount: Story = {
     const section = within(await modal.findByTestId("mcp-server-settings"));
     const page = within(canvasElement.ownerDocument.body);
     await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
-    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    await clickWhenReady(await page.findByRole("button", { name: "Run" }));
     const appDialog = await page.findByRole("dialog", { name: "Payment method" });
     await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
     await expect(appUnmountReads).toHaveLength(1);
@@ -1187,7 +1189,7 @@ export const WorkspaceMCPServerSettingsRereadAfterAppWorkspaceSwitch: Story = {
     const section = within(await modal.findByTestId("mcp-server-settings"));
     const page = within(canvasElement.ownerDocument.body);
     await userEvent.click(await section.findByRole("button", { name: "Open Payment method" }));
-    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    await clickWhenReady(await page.findByRole("button", { name: "Run" }));
     const appDialog = await page.findByRole("dialog", { name: "Payment method" });
     await waitFor(() => expect(appDialog.querySelector("iframe")).not.toBeNull());
     await expect(appSwitchReadWorkspaces).toEqual([WORKSPACE_ID]);
@@ -1303,7 +1305,7 @@ export const WorkspaceMCPServerSettingsRereadAfterRemount: Story = {
     const section = within(await modal.findByTestId("mcp-server-settings"));
     const page = within(canvasElement.ownerDocument.body);
     await userEvent.click(await section.findByRole("button", { name: "Run Reset parts" }));
-    await userEvent.click(await page.findByRole("button", { name: "Run" }));
+    await clickWhenReady(await page.findByRole("button", { name: "Run" }));
     await waitFor(() =>
       expect(section.getByRole("button", { name: "Run Part library" })).toBeDisabled()
     );

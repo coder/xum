@@ -11,6 +11,7 @@ import {
 import type { RuntimeStatus, RuntimeStatusStore } from "./RuntimeStatusStore";
 import type { FrontendWorkspaceMetadata, GitStatus } from "@/common/types/workspace";
 import { DEFAULT_RUNTIME_CONFIG } from "@/common/constants/workspace";
+import { advanceClock, advanceClockUntil, drainMicrotasks } from "@/browser/testFakeClock";
 
 /**
  * Unit tests for GitStatusStore.
@@ -42,16 +43,22 @@ const DAYTONA_RUNTIME = {
   daytona: { sandboxId: "sb-1" },
 };
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+// The store refreshes on RefreshController timers (debounce, cooldown), fetch intervals and a
+// promise pipeline, so every test runs on a fake clock: waits take no real time, and a negative
+// check advances past the whole window it claims nothing happens in.
+beforeEach(() => {
+  jest.useFakeTimers();
+});
 
-async function waitUntil(condition: () => boolean, timeoutMs = 1000): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!condition()) {
-    if (Date.now() >= deadline) {
-      throw new Error("Timed out waiting for passive git fetch");
-    }
-    await sleep(10);
-  }
+afterEach(() => {
+  jest.useRealTimers();
+});
+
+/** Past the 3 s refresh debounce and the 3 s base fetch interval. */
+const REFRESH_WINDOW_MS = 3500;
+
+function waitUntil(condition: () => boolean, timeoutMs = 1000): Promise<void> {
+  return advanceClockUntil(condition, timeoutMs, "passive git fetch");
 }
 
 function createWorkspaceMetadata(
@@ -1044,9 +1051,13 @@ describe("GitStatusStore", () => {
           metadata = next(metadata, i);
           emitMetadata(metadata);
         }
-        await sleep(50);
-
+        // Past the 3 s refresh debounce: a refresh these events scheduled has run by now.
+        await advanceClock(REFRESH_WINDOW_MS);
         expect(mockExecuteBash).not.toHaveBeenCalled();
+
+        // Positive control: the store is live, so a change to a status input refreshes.
+        emitMetadata(withEntry(metadata, openId, { projectPath: "/home/user/moved-project" }));
+        await waitUntil(() => getStatusCallCount(openId) === 1, REFRESH_WINDOW_MS);
       });
 
       it.each<[string, Partial<FrontendWorkspaceMetadata>]>([
@@ -1151,7 +1162,8 @@ describe("GitStatusStore", () => {
         const metadata = await openWorkspace();
         unsubscribe();
         emitMetadata(withEntry(metadata, openId, { projectPath: "/home/user/moved-project" }));
-        await sleep(50);
+        // syncWorkspaces decides synchronously, and no clock time passes before the resubscribe.
+        await drainMicrotasks();
         expect(mockExecuteBash).not.toHaveBeenCalled();
 
         unsubscribe = store.subscribeKey(openId, jest.fn());
@@ -1186,7 +1198,7 @@ describe("GitStatusStore", () => {
 
         // The held forced fetch covers the first move only.
         emitMetadata(withEntry(moved, openId, { name: "renamed" }));
-        await sleep(50);
+        await advanceClock(50);
         release();
 
         // Inside the 3 s fetch backoff, so only the pending rename can start this fetch.
@@ -1205,7 +1217,7 @@ describe("GitStatusStore", () => {
         const unsubscribeSecond = store.subscribeKey(second, jest.fn());
         try {
           await waitUntil(() => getFetchCallCount() >= 1);
-          await sleep(100);
+          await advanceClock(100);
           mockExecuteBash.mockClear();
 
           metadata = withEntry(metadata, openId, { projectPath: "/home/user/moved-a" });
@@ -1237,7 +1249,7 @@ describe("GitStatusStore", () => {
         store.syncWorkspaces(metadata);
         unsubscribe = store.subscribeProjectStatusesKey(openId, jest.fn());
         await waitUntil(() => fetchRoots().includes("/home/user/project-b"));
-        await sleep(100);
+        await advanceClock(100);
         const heldSecondary = createDeferred<void>();
         mockExecuteBash.mockImplementation(async (...args: unknown[]) => {
           const input = args[0] as { options?: { repoRootProjectPath?: string } };
@@ -1253,7 +1265,7 @@ describe("GitStatusStore", () => {
         emitMetadata(withEntry(metadata, openId, { projects }));
         await waitUntil(() => fetchRoots().includes(addedProject.projectPath), 1000);
         // Past the 3 s debounce a racing follow-up read would use.
-        await sleep(3500);
+        await advanceClock(3500);
         expect(mockGetProjectGitStatuses).toHaveBeenCalledTimes(1);
 
         heldSecondary.resolve();
@@ -1294,7 +1306,7 @@ describe("GitStatusStore", () => {
         const unsubscribeStopped = store.subscribeProjectStatusesKey(stoppedId, jest.fn());
         try {
           await waitUntil(() => getFetchCallCount() >= 1);
-          await sleep(100);
+          await advanceClock(100);
           mockExecuteBash.mockClear();
 
           metadata = withEntry(metadata, runnableId, { name: "runnable-renamed" });
@@ -1302,7 +1314,7 @@ describe("GitStatusStore", () => {
           emitMetadata(metadata);
           await waitUntil(() => getFetchCallCount() >= 1, 1000);
           // Let the runnable workspace's fetch and its follow-up refresh settle.
-          await sleep(500);
+          await advanceClock(500);
           const fetchedWorkspaceIds = () =>
             mockExecuteBash.mock.calls
               .map((call) => (call as unknown[])[0] as { script?: string; workspaceId?: string })
@@ -1318,7 +1330,7 @@ describe("GitStatusStore", () => {
           // Starting the runtime fetches its own repos without another trigger.
           await waitUntil(() => fetchRoots().includes(stoppedOnlyRepo), 4500);
           const settledFetches = getFetchCallCount();
-          await sleep(1000);
+          await advanceClock(REFRESH_WINDOW_MS);
           expect(getFetchCallCount()).toBe(settledFetches);
         } finally {
           unsubscribeStopped();
@@ -1336,7 +1348,7 @@ describe("GitStatusStore", () => {
         // The settled fetch requests one more status run (after the 3 s debounce when it
         // settles during the status checks), then nothing else runs.
         await waitUntil(() => getStatusCallCount(openId) === 2, 4500);
-        await sleep(1000);
+        await advanceClock(REFRESH_WINDOW_MS);
 
         expect(getFetchCallCount()).toBe(1);
         expect(getStatusCallCount(openId)).toBe(2);
@@ -1356,7 +1368,7 @@ describe("GitStatusStore", () => {
       async function churnOnce(): Promise<void> {
         metadata = withEntry(metadata, otherId, { title: `Other ${i++}` });
         emitMetadata(metadata);
-        await sleep(100);
+        await advanceClock(100);
       }
 
       const scheduledAt = Date.now();
@@ -1418,7 +1430,7 @@ describe("GitStatusStore", () => {
       mockGetProjectGitStatuses.mockResolvedValue(projectResults);
 
       store.syncWorkspaces(new Map([[workspaceId, metadata]]));
-      await sleep(0);
+      await advanceClock(0);
       mockGetProjectGitStatuses.mockClear();
       mockExecuteBash.mockClear();
       // @ts-expect-error - Accessing private field for targeted subscription control
@@ -1520,7 +1532,7 @@ describe("GitStatusStore", () => {
       mockGetProjectGitStatuses.mockResolvedValue(initialResults);
 
       store.syncWorkspaces(new Map([[workspaceId, metadata]]));
-      await sleep(0);
+      await advanceClock(0);
       mockGetProjectGitStatuses.mockClear();
       mockExecuteBash.mockClear();
       // @ts-expect-error - Accessing private field for targeted subscription control
@@ -1573,7 +1585,7 @@ describe("GitStatusStore", () => {
       mockGetProjectGitStatuses.mockResolvedValue(projectResults);
 
       store.syncWorkspaces(new Map([[workspaceId, metadata]]));
-      await sleep(0);
+      await advanceClock(0);
       mockGetProjectGitStatuses.mockClear();
       mockExecuteBash.mockClear();
       // @ts-expect-error - Accessing private field for targeted subscription control
@@ -1641,7 +1653,7 @@ describe("GitStatusStore", () => {
         .mockResolvedValueOnce(secondResults);
 
       store.syncWorkspaces(new Map([[workspaceId, metadata]]));
-      await sleep(0);
+      await advanceClock(0);
       mockGetProjectGitStatuses.mockClear();
       mockExecuteBash.mockClear();
       // @ts-expect-error - Accessing private field for targeted subscription control
@@ -1677,7 +1689,7 @@ describe("GitStatusStore", () => {
       mockGetProjectGitStatuses.mockImplementation(() => refresh.promise);
 
       store.syncWorkspaces(new Map([[workspaceId, metadata]]));
-      await sleep(0);
+      await advanceClock(0);
       mockGetProjectGitStatuses.mockClear();
       mockExecuteBash.mockClear();
       // @ts-expect-error - Accessing private field for targeted subscription control
@@ -1733,7 +1745,7 @@ describe("GitStatusStore", () => {
       store.syncWorkspaces(
         new Map([[workspaceId, createWorkspaceMetadata(workspaceId, DEVCONTAINER_RUNTIME)]])
       );
-      await sleep(0);
+      await advanceClock(0);
       mockGetProjectGitStatuses.mockClear();
       mockExecuteBash.mockClear();
       // @ts-expect-error - Accessing private field for targeted subscription control

@@ -8,7 +8,6 @@ import { ProviderModelEntrySchema } from "./providerModelEntry";
 export const CacheTtlSchema = z.enum(["5m", "1h"]);
 /** Anthropic request speed; "fast" opts into Fast mode (see anthropicFastMode.ts). */
 export const AnthropicSpeedSchema = z.enum(["standard", "fast"]);
-export type AnthropicSpeed = z.infer<typeof AnthropicSpeedSchema>;
 // "ultrafast" is OpenAI's model-gated premium tier (DevDay 2026-09-29); requests for
 // models without it drop the tier (see openaiModelSupportsServiceTier).
 export const ServiceTierSchema = z.enum(["auto", "default", "flex", "priority", "ultrafast"]);
@@ -21,7 +20,6 @@ export const FastModePreviousServiceTierSchema = z.enum([
   "ultrafast",
   "unset",
 ]);
-export type FastModePreviousServiceTier = z.infer<typeof FastModePreviousServiceTierSchema>;
 export const XAIServiceTierSchema = z.enum(["default", "priority"]);
 export type XAIServiceTier = z.infer<typeof XAIServiceTierSchema>;
 export const XAIFastModePreviousServiceTierSchema = z.enum(["default", "unset"]);
@@ -92,11 +90,6 @@ export const XAIProviderConfigSchema = BaseProviderConfigSchema.extend({
   searchParameters: z.record(z.string(), z.unknown()).optional(),
   serviceTier: XAIServiceTierSchema.optional(),
   fastModePreviousServiceTier: XAIFastModePreviousServiceTierSchema.optional(),
-});
-
-export const MuxGatewayProviderConfigSchema = BaseProviderConfigSchema.extend({
-  couponCode: z.string().optional(),
-  voucher: z.string().optional(),
 });
 
 export const CoderProviderConfigSchema = BaseProviderConfigSchema.extend({
@@ -199,7 +192,6 @@ export const ProvidersConfigSchema = z
     openrouter: OpenRouterProviderConfigSchema.optional(),
     xai: XAIProviderConfigSchema.optional(),
     meta: MetaProviderConfigSchema.optional(),
-    "mux-gateway": MuxGatewayProviderConfigSchema.optional(),
     google: GoogleProviderConfigSchema.optional(),
     "google-vertex": GoogleVertexProviderConfigSchema.optional(),
     deepseek: DeepSeekProviderConfigSchema.optional(),
@@ -215,7 +207,6 @@ export type BaseProviderConfig = z.infer<typeof BaseProviderConfigSchema>;
 export type OpenAIProviderConfig = z.infer<typeof OpenAIProviderConfigSchema>;
 export type BedrockProviderConfig = z.infer<typeof BedrockProviderConfigSchema>;
 export type GoogleVertexProviderConfig = z.infer<typeof GoogleVertexProviderConfigSchema>;
-export type MuxGatewayProviderConfig = z.infer<typeof MuxGatewayProviderConfigSchema>;
 export type CoderProviderConfig = z.infer<typeof CoderProviderConfigSchema>;
 
 export type ProvidersConfig = z.infer<typeof ProvidersConfigSchema>;

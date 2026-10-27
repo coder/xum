@@ -48,7 +48,6 @@ import {
   markCodexOauthRoutedResponse,
   normalizeOpenAICompatibleBaseURL,
   resolveAIProviderHeaderSource,
-  muxGatewayPromptCacheRoute,
   requestEndpoint,
   resolveOpenAIWebSocketResponsesUrl,
   wrapFetchWithAnthropicCacheControl,
@@ -109,7 +108,6 @@ function expectSuccessfulRouteResult(
   expected: {
     effectiveModelString: string;
     routeProvider: SuccessfulResolvedModel["routeProvider"];
-    routedThroughGateway?: boolean;
   }
 ): void {
   expect(result.success).toBe(true);
@@ -118,9 +116,6 @@ function expectSuccessfulRouteResult(
   }
   expect(result.data.effectiveModelString).toBe(expected.effectiveModelString);
   expect(result.data.routeProvider).toBe(expected.routeProvider);
-  if (expected.routedThroughGateway !== undefined) {
-    expect(result.data.routedThroughGateway).toBe(expected.routedThroughGateway);
-  }
 }
 
 async function withTempConfig(
@@ -373,12 +368,12 @@ describe("ProviderModelFactory.createModel", () => {
           apiKey: "sk-test",
           enabled: false,
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
+        openrouter: {
+          apiKey: "or-test",
         },
       });
 
-      await saveRoutePriority(config, ["mux-gateway", "direct"], { muxGatewayEnabled: true });
+      await saveRoutePriority(config, ["openrouter", "direct"]);
 
       const result = await factory.createModel("openai:gpt-5");
       if (!result.success) {
@@ -505,27 +500,6 @@ describe("ProviderModelFactory.createModel", () => {
         }
       });
     }
-  });
-
-  it("keeps a custom provider shadowing mux-gateway off gateway attribution", async () => {
-    await withTempConfig(async (config, factory) => {
-      // The request goes directly to the custom endpoint, so gateway
-      // attribution and quota handling must not engage.
-      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        "mux-gateway": {
-          providerType: "openai-compatible",
-          baseUrl: "http://localhost:8000/v1",
-          models: ["qwen3-coder"],
-        },
-      });
-
-      const result = await factory.resolveAndCreateModel("mux-gateway:qwen3-coder", "off");
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.data.routedThroughGateway).toBe(false);
-        expect(result.data.routeProvider).toBeUndefined();
-      }
-    });
   });
 
   it("merges backend OpenAI store policy for custom openai-responses providers", async () => {
@@ -2448,133 +2422,28 @@ describe("ProviderModelFactory Codex authentication", () => {
     });
   });
 });
-describe("ProviderModelFactory.resolveGatewayModelString (mux gateway)", () => {
-  // Raw file writes (not editConfig/saveProvidersConfig) keep the legacy
-  // muxGateway* config keys exactly as older configs persist them.
-  async function writeMainConfig(config: Config, mainConfig: object): Promise<void> {
-    await writeFile(
-      path.join(config.rootDir, "config.json"),
-      JSON.stringify({ projects: [], ...mainConfig }, null, 2),
-      "utf-8"
-    );
-  }
-
-  async function writeProvidersConfig(config: Config, providersConfig: object): Promise<void> {
-    await writeFile(
-      path.join(config.rootDir, "providers.jsonc"),
-      JSON.stringify(providersConfig, null, 2),
-      "utf-8"
-    );
-  }
-
-  function toGatewayModelString(modelString: string): string {
-    const colonIndex = modelString.indexOf(":");
-    const provider = colonIndex === -1 ? modelString : modelString.slice(0, colonIndex);
-    const modelId = colonIndex === -1 ? "" : modelString.slice(colonIndex + 1);
-    return `mux-gateway:${provider}/${modelId}`;
-  }
-
-  it("routes allowlisted models when gateway is enabled + configured", async () => {
+describe("ProviderModelFactory.resolveGatewayModelString modelKey", () => {
+  it("routes model variants when the base model has a route override", async () => {
     await withTempConfig(async (config, factory) => {
-      await writeMainConfig(config, {
-        muxGatewayEnabled: true,
-        muxGatewayModels: [KNOWN_MODELS.SONNET.id],
+      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
+        openrouter: { apiKey: "or-test" },
       });
-      await writeProvidersConfig(config, {
-        "mux-gateway": { couponCode: "test-coupon" },
-      });
-
-      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
-
-      expect(resolved).toBe(toGatewayModelString(KNOWN_MODELS.SONNET.id));
-    });
-  });
-
-  it("does not route when the mux-gateway provider is disabled", async () => {
-    await withTempConfig(async (config, factory) => {
-      await writeMainConfig(config, {
-        routePriority: ["mux-gateway", "direct"],
-      });
-      await writeProvidersConfig(config, {
-        anthropic: { apiKey: "sk-ant-test" },
-        "mux-gateway": {
-          couponCode: "test-coupon",
-          enabled: false,
-        },
+      await saveRoutePriority(config, ["direct"], {
+        routeOverrides: { "xai:grok-4-1-fast": "openrouter" },
       });
 
-      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
+      const resolved = factory.resolveGatewayModelString(
+        "xai:grok-4-1-fast-reasoning",
+        "xai:grok-4-1-fast"
+      );
 
-      expect(resolved).toBe(KNOWN_MODELS.SONNET.id);
-    });
-  });
-
-  it("does not route when gateway is not configured", async () => {
-    await withTempConfig(async (config, factory) => {
-      await writeMainConfig(config, {
-        muxGatewayEnabled: true,
-        muxGatewayModels: [KNOWN_MODELS.SONNET.id],
-      });
-
-      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.SONNET.id);
-
-      expect(resolved).toBe(KNOWN_MODELS.SONNET.id);
-    });
-  });
-
-  it("does not route unsupported providers even when allowlisted", async () => {
-    await withTempConfig(async (config, factory) => {
-      const modelString = "openrouter:some-model";
-      await writeMainConfig(config, {
-        muxGatewayEnabled: true,
-        muxGatewayModels: [modelString],
-      });
-      await writeProvidersConfig(config, {
-        "mux-gateway": { couponCode: "test-coupon" },
-      });
-
-      const resolved = factory.resolveGatewayModelString(modelString);
-
-      expect(resolved).toBe(modelString);
-    });
-  });
-
-  it("routes model variants when the base model is allowlisted via modelKey", async () => {
-    await withTempConfig(async (config, factory) => {
-      const variant = "xai:grok-4-1-fast-reasoning";
-      await writeMainConfig(config, {
-        muxGatewayEnabled: true,
-        muxGatewayModels: ["xai:grok-4-1-fast"],
-      });
-      await writeProvidersConfig(config, {
-        "mux-gateway": { couponCode: "test-coupon" },
-      });
-
-      const resolved = factory.resolveGatewayModelString(variant, "xai:grok-4-1-fast");
-
-      expect(resolved).toBe(toGatewayModelString(variant));
-    });
-  });
-
-  it("honors explicit mux-gateway prefixes from legacy clients", async () => {
-    await withTempConfig(async (config, factory) => {
-      await writeMainConfig(config, {
-        muxGatewayEnabled: true,
-        muxGatewayModels: [],
-      });
-      await writeProvidersConfig(config, {
-        "mux-gateway": { couponCode: "test-coupon" },
-      });
-
-      const resolved = factory.resolveGatewayModelString(KNOWN_MODELS.GPT.id, undefined, true);
-
-      expect(resolved).toBe(toGatewayModelString(KNOWN_MODELS.GPT.id));
+      expect(resolved).toBe("openrouter:xai/grok-4-1-fast-reasoning");
     });
   });
 });
 
 describe("ProviderModelFactory routing", () => {
-  it("honors non-mux gateway routes end-to-end", async () => {
+  it("honors gateway routes end-to-end", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
         openai: {
@@ -2598,7 +2467,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openrouter:openai/gpt-5",
         routeProvider: "openrouter",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2621,7 +2489,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openai:gpt-5.5",
         routeProvider: "openai",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2641,7 +2508,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openrouter:openai/gpt-5",
         routeProvider: "openrouter",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2705,25 +2571,24 @@ describe("ProviderModelFactory routing", () => {
   it("skips disabled gateway providers even when credentials exist", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        openai: {
-          apiKey: "sk-test",
+        anthropic: {
+          apiKey: "sk-ant-test",
           enabled: false,
         },
         openrouter: {
           apiKey: "or-test",
           enabled: false,
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
-        },
+        bedrock: { region: "us-east-1" },
       });
 
-      await saveRoutePriority(config, ["openrouter", "mux-gateway", "direct"], {
-        muxGatewayEnabled: true,
-      });
+      await saveRoutePriority(config, ["openrouter", "bedrock", "direct"]);
 
-      const resolved = factory.resolveGatewayModelString("openai:gpt-5", "openai:gpt-5");
-      expect(resolved).toBe("mux-gateway:openai/gpt-5");
+      const resolved = factory.resolveGatewayModelString(
+        "anthropic:claude-sonnet-4-5",
+        "anthropic:claude-sonnet-4-5"
+      );
+      expect(resolved).toBe("bedrock:anthropic.claude-sonnet-4-5");
     });
   });
 
@@ -2734,12 +2599,12 @@ describe("ProviderModelFactory routing", () => {
           providerType: "openai-compatible",
           baseUrl: "http://localhost:8000/v1",
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
+        openrouter: {
+          apiKey: "or-test",
         },
       });
 
-      await saveRoutePriority(config, ["mux-gateway", "direct"], { muxGatewayEnabled: true });
+      await saveRoutePriority(config, ["openrouter", "direct"]);
 
       const resolved = factory.resolveGatewayModelString("openai:gpt-5", "openai:gpt-5");
       expect(resolved).toBe("openai:gpt-5");
@@ -2805,7 +2670,6 @@ describe("ProviderModelFactory routing", () => {
       if (result.success) {
         expect(result.data.effectiveModelString).toBe("coder:google/gemini-2.5-pro");
         expect(result.data.canonicalModelString).toBe("coder:google/gemini-2.5-pro");
-        expect(result.data.routedThroughGateway).toBe(false);
         expect((result.data.model as { modelId?: unknown }).modelId).toBe("google/gemini-2.5-pro");
       }
     });
@@ -2823,7 +2687,7 @@ describe("ProviderModelFactory routing", () => {
         },
       });
 
-      await saveRoutePriority(config, ["mux-gateway", "openrouter", "direct"]);
+      await saveRoutePriority(config, ["github-copilot", "openrouter", "direct"]);
 
       const resolved = factory.resolveGatewayModelString("openai:gpt-5", "openai:gpt-5");
       expect(resolved).toBe("openrouter:openai/gpt-5");
@@ -2843,12 +2707,13 @@ describe("ProviderModelFactory routing", () => {
         openrouter: {
           apiKey: "or-test",
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
+        "github-copilot": {
+          apiKey: "copilot-token",
+          models: ["gpt-5"],
         },
       });
 
-      await saveRoutePriority(config, ["mux-gateway", "direct"], { muxGatewayEnabled: true });
+      await saveRoutePriority(config, ["github-copilot", "direct"]);
 
       const resolved = factory.resolveGatewayModelString(
         "openrouter:openai/gpt-5",
@@ -2861,7 +2726,6 @@ describe("ProviderModelFactory routing", () => {
       expectSuccessfulRouteResult(result, {
         effectiveModelString: "openrouter:openai/gpt-5",
         routeProvider: "openrouter",
-        routedThroughGateway: false,
       });
     });
   });
@@ -2869,64 +2733,33 @@ describe("ProviderModelFactory routing", () => {
   it("falls back from explicit OpenRouter model strings when OpenRouter is unavailable", async () => {
     await withTempConfig(async (config, factory) => {
       new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        openai: {
-          apiKey: "sk-test",
+        anthropic: {
+          apiKey: "sk-ant-test",
           enabled: false,
         },
         openrouter: {
           apiKey: "or-test",
           enabled: false,
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
-        },
+        bedrock: { region: "us-east-1" },
       });
 
-      await saveRoutePriority(config, ["openrouter", "mux-gateway", "direct"], {
-        muxGatewayEnabled: true,
-      });
+      await saveRoutePriority(config, ["openrouter", "bedrock", "direct"]);
 
       const resolved = factory.resolveGatewayModelString(
-        "openrouter:openai/gpt-5",
-        "openai:gpt-5",
+        "openrouter:anthropic/claude-sonnet-4-5",
+        "anthropic:claude-sonnet-4-5",
         "openrouter"
       );
-      expect(resolved).toBe("mux-gateway:openai/gpt-5");
-
-      const result = await factory.resolveAndCreateModel("openrouter:openai/gpt-5", "off");
-      expectSuccessfulRouteResult(result, {
-        effectiveModelString: "mux-gateway:openai/gpt-5",
-        routeProvider: "mux-gateway",
-        routedThroughGateway: true,
-      });
-    });
-  });
-
-  it("honors explicit mux-gateway prefixes for compatibility", async () => {
-    await withTempConfig(async (config, factory) => {
-      new ProvidersConfigStore(config.rootDir).saveProvidersConfig({
-        "mux-gateway": {
-          couponCode: "test-coupon",
-        },
-      });
-
-      await saveRoutePriority(config, ["direct"], { muxGatewayEnabled: true });
-
-      const resolved = factory.resolveGatewayModelString(
-        "mux-gateway:anthropic/claude-sonnet-4-6",
-        KNOWN_MODELS.SONNET.id,
-        "mux-gateway"
-      );
-      expect(resolved).toBe("mux-gateway:anthropic/claude-sonnet-4-6");
+      expect(resolved).toBe("bedrock:anthropic.claude-sonnet-4-5");
 
       const result = await factory.resolveAndCreateModel(
-        "mux-gateway:anthropic/claude-sonnet-4-6",
+        "openrouter:anthropic/claude-sonnet-4-5",
         "off"
       );
       expectSuccessfulRouteResult(result, {
-        effectiveModelString: "mux-gateway:anthropic/claude-sonnet-4-6",
-        routeProvider: "mux-gateway",
-        routedThroughGateway: true,
+        effectiveModelString: "bedrock:anthropic.claude-sonnet-4-5",
+        routeProvider: "bedrock",
       });
     });
   });
@@ -2961,7 +2794,6 @@ describe("ProviderModelFactory routing", () => {
         expectSuccessfulRouteResult(result, {
           effectiveModelString: "openai:gpt-6-luna",
           routeProvider: "openai",
-          routedThroughGateway: false,
         });
       });
     } finally {
@@ -2980,14 +2812,9 @@ describe("ProviderModelFactory routing", () => {
         openrouter: {
           apiKey: "or-test",
         },
-        "mux-gateway": {
-          couponCode: "test-coupon",
-        },
       });
 
-      await saveRoutePriority(config, ["direct", "mux-gateway", "openrouter"], {
-        muxGatewayEnabled: true,
-      });
+      await saveRoutePriority(config, ["direct", "openrouter"]);
 
       const result = await factory.resolveAndCreateModel("openai:gpt-5", "off");
       expect(result.success).toBe(true);
@@ -2998,7 +2825,6 @@ describe("ProviderModelFactory routing", () => {
       expect(result.data.effectiveModelString).toBe("openai:gpt-5");
       expect(result.data.canonicalModelString).toBe("openai:gpt-5");
       expect(result.data.routeProvider).toBe("openai");
-      expect(result.data.routedThroughGateway).toBe(false);
     });
   });
 });
@@ -3600,7 +3426,6 @@ describe("ProviderModelFactory Coder", () => {
     "coder:chat-proxy/team-astra",
     "coder:chat-proxy/gpt-6-astra",
     "openrouter:openai/gpt-6-astra",
-    "mux-gateway:openai/gpt-6-astra",
     "github-copilot:gpt-6-astra",
     "github-copilot:gpt-5.4",
     "openai:gpt-6-astra",
@@ -3609,7 +3434,6 @@ describe("ProviderModelFactory Coder", () => {
     "openai:team-astra",
     "responses-proxy:team-astra",
     "openrouter:openai/team-astra",
-    "mux-gateway:openai/team-astra",
     "responses-proxy:gpt-6-astra",
   ])("pins Fast tiers and isolates live per-chat speed changes through %s", async (modelString) => {
     await withTempConfig(async (config, factory, oauth, store) => {
@@ -3631,7 +3455,6 @@ describe("ProviderModelFactory Coder", () => {
           models: [{ id: "team-astra", mappedToModel: "openai:gpt-6-astra" }],
         },
         openrouter: { apiKey: "test-key" },
-        "mux-gateway": { couponCode: "test-token" },
         "github-copilot": { apiKey: COPILOT_TOKEN, baseUrl: "https://copilot.example.com/v1" },
         "responses-proxy": {
           providerType: "openai-responses",
@@ -3747,13 +3570,7 @@ describe("ProviderModelFactory Coder", () => {
                 expect(new Headers(calls[before].init.headers).get("authorization")).toBeNull();
                 expect(calls[before].url).toBe("https://proxy.example.com/v1/responses");
               }
-              if (modelString.startsWith("mux-gateway:")) {
-                expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
-                  expected
-                );
-              } else {
-                expect(body.service_tier).toBe(expected);
-              }
+              expect(body.service_tier).toBe(expected);
             }
           }
         }
@@ -3845,13 +3662,7 @@ describe("ProviderModelFactory Coder", () => {
                 expect(new Headers(call.init.headers).get("authorization")).toBe(
                   new Headers(originalCall.init.headers).get("authorization")
                 );
-                if (modelString.startsWith("mux-gateway:")) {
-                  expect((body.providerOptions as MuxProviderOptions)?.openai?.serviceTier).toBe(
-                    expected
-                  );
-                } else {
-                  expect(body.service_tier).toBe(expected);
-                }
+                expect(body.service_tier).toBe(expected);
               }
             }
           }
@@ -4254,7 +4065,7 @@ describe("ProviderModelFactory Coder", () => {
     {
       available: true,
       excluded: false,
-      fallback: "mux-gateway",
+      fallback: "openrouter",
       wire: "chatCompletions",
       alias: true,
       pro: true,
@@ -4262,7 +4073,7 @@ describe("ProviderModelFactory Coder", () => {
     {
       available: false,
       excluded: false,
-      fallback: "mux-gateway",
+      fallback: "openrouter",
       wire: "responses",
       alias: false,
       pro: false,
@@ -4270,7 +4081,7 @@ describe("ProviderModelFactory Coder", () => {
     {
       available: true,
       excluded: true,
-      fallback: "mux-gateway",
+      fallback: "openrouter",
       wire: "responses",
       alias: false,
       pro: false,
@@ -4314,10 +4125,10 @@ describe("ProviderModelFactory Coder", () => {
       store.saveProvidersConfig({
         ...store.loadProvidersConfig(),
         openai: { apiKey: "test-key", wireFormat: testCase.wire },
-        "mux-gateway": { couponCode: "test" },
+        openrouter: { apiKey: "test-key" },
       });
       oauth.coderOauthService = stubCoderOauthService();
-      await saveRoutePriority(config, [testCase.fallback], { muxGatewayEnabled: true });
+      await saveRoutePriority(config, [testCase.fallback]);
       const result = await factory.createModelWithPinnedOptions(`coder:prod-openai/${modelId}`, {
         thinkingLevel: "high",
         agentInitiated: true,
@@ -4330,7 +4141,7 @@ describe("ProviderModelFactory Coder", () => {
           ? "coder"
           : testCase.fallback === "direct"
             ? "openai"
-            : "mux-gateway"
+            : "openrouter"
       );
       expect(result.data.metadataModel).toBe("openai:gpt-6-astra");
       const options = buildProviderOptions(
@@ -4346,8 +4157,9 @@ describe("ProviderModelFactory Coder", () => {
         undefined,
         "pro"
       );
-      if (!("openai" in options)) throw new Error("Expected OpenAI request options");
-      expect(options.openai.reasoningMode).toBe(testCase.pro ? "pro" : undefined);
+      // A non-passthrough fallback (OpenRouter) builds its own options namespace.
+      const reasoningMode = "openai" in options ? options.openai.reasoningMode : undefined;
+      expect(reasoningMode).toBe(testCase.pro ? "pro" : undefined);
     });
   });
 
@@ -4393,22 +4205,21 @@ describe("ProviderModelFactory Coder", () => {
         store.saveProvidersConfig({
           ...store.loadProvidersConfig(),
           openai: { apiKey: "test-key" },
-          "mux-gateway": { couponCode: "test" },
         });
-        await saveRoutePriority(config, ["direct"], { muxGatewayEnabled: true });
+        await saveRoutePriority(config, ["direct"]);
         oauth.coderOauthService = stubCoderOauthService();
         const resolve = factory.resolveAndCreateModel.bind(factory);
         spyOn(factory, "resolveAndCreateModel").mockImplementation(async (...args) => {
           const created = await resolve(...args);
           store.saveProvidersConfig({
             openai: { apiKey: "test-key" },
-            "mux-gateway": { couponCode: "test" },
+            openrouter: { apiKey: "or-test" },
             coder: {
               discoveredProviders: [{ name: "prod-openai", type: "anthropic" }],
               models: [],
             },
           });
-          await saveRoutePriority(config, ["mux-gateway"]);
+          await saveRoutePriority(config, ["openrouter"]);
           return created;
         });
         const result = await factory.createModelWithPinnedOptions(modelString, {
@@ -5985,8 +5796,8 @@ describe("ProviderModelFactory.createEvaluationModel", () => {
   it("rejects explicit gateway prefixes instead of rewriting them to a direct route", async () => {
     await withEvaluationFixture({ openai: { apiKey: "sk-test" } }, async (_c, factory) => {
       expect(
-        expectRejected(await factory.createEvaluationModel("mux-gateway:openai/gpt-5"))
-      ).toEqual({ reason: "unsupported-route", routeKind: "gateway", providerName: "mux-gateway" });
+        expectRejected(await factory.createEvaluationModel("openrouter:openai/gpt-5"))
+      ).toEqual({ reason: "unsupported-route", routeKind: "gateway", providerName: "openrouter" });
       expect(
         expectRejected(await factory.createEvaluationModel("coder:anthropic/claude-haiku-4-5"))
       ).toMatchObject({ reason: "unsupported-route", providerName: "coder" });
@@ -6413,6 +6224,38 @@ describe("ProviderModelFactory Ollama tool schemas", () => {
   });
 });
 
+describe("ProviderModelFactory tool schema compaction", () => {
+  unsetEnvForEachTest("ANTHROPIC_BASE_URL");
+
+  it("sends Anthropic built-in tool schemas without $schema or optional nulls", async () => {
+    let sent: Array<{ name: string; input_schema: Record<string, unknown> }> = [];
+    await withTempConfig(async (_config, factory, _oauth, store) => {
+      store.saveProvidersConfig({ anthropic: { apiKey: "test-key" } });
+      const { calls, fakeFetch } = createCapturingFetch();
+      const fetchSpy = spyOn(globalThis, "fetch").mockImplementation(fakeFetch);
+      try {
+        const result = await factory.createModel("anthropic:claude-opus-5-5");
+        if (!result.success) throw new Error(result.error.type);
+        const tools = { task_await: tool({ inputSchema: TOOL_DEFINITIONS.task_await.schema }) };
+        // The fake response is not a valid message, so only the request matters.
+        // eslint-disable-next-line @typescript-eslint/await-thenable -- bun-types mistype .rejects.toThrow as void
+        await expect(
+          generateText({ model: result.data, prompt: "hello", tools, maxRetries: 0 })
+        ).rejects.toThrow();
+        expect(calls).toHaveLength(1);
+        sent = parseSentBody(calls[0]).tools as typeof sent;
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+
+    expect(sent.map((entry) => entry.name)).toEqual(["task_await"]);
+    const schema = sent[0].input_schema;
+    expect(schema).not.toHaveProperty("$schema");
+    expect(JSON.stringify(schema)).not.toContain('"null"');
+  });
+});
+
 describe("ProviderModelFactory prompt-cache prefix observation", () => {
   const recorded: TimelineEventDraft[] = [];
   const recorder = {
@@ -6438,56 +6281,6 @@ describe("ProviderModelFactory prompt-cache prefix observation", () => {
   async function send(model: LanguageModel, messages: ModelMessage[]) {
     await generateText({ model, messages, maxRetries: 0 }).catch(() => undefined);
   }
-
-  it("observes mux-gateway requests after file-part normalization", async () => {
-    await withTempConfig(async (_config, factory) => {
-      const sent: Array<Record<string, unknown>> = [];
-      const providersConfig = {
-        "mux-gateway": { couponCode: "test-coupon", fetch: capturingFetch(sent) },
-      } as unknown as ProvidersConfig;
-      const messages = (image: string) => [
-        {
-          role: "user" as const,
-          content: [
-            { type: "text" as const, text: "What is in this image?" },
-            { type: "file" as const, mediaType: "image/png", data: image },
-          ],
-        },
-      ];
-      for (const image of ["AAAA", "BBBB"]) {
-        const scope = factory.createPromptCacheTurnScope("ws-gateway", recorder);
-        const result = await factory.createModel(
-          "mux-gateway:anthropic/claude-sonnet-4-5",
-          {},
-          {
-            promptCacheScope: scope,
-            providersConfig,
-          }
-        );
-        if (!result.success) throw new Error("expected a gateway model");
-        await send(result.data, messages(image));
-      }
-
-      // The changed image breaks the prefix, and the event describes the part as the gateway
-      // received it (the v3 data-URL string), not the SDK's v4 tagged object.
-      const sentFile = (sent[1].prompt as Array<{ content: Array<Record<string, unknown>> }>)
-        .flatMap((message) => message.content)
-        .find((part) => part.type === "file");
-      expect(sentFile?.data).toBe("data:image/png;base64,BBBB");
-      const { cache_control: _marker, ...unmarkedFile } = sentFile ?? {};
-      expect(recorded).toMatchObject([
-        {
-          kind: "cache.prefix_break",
-          data: {
-            promptCacheBreak: {
-              section: "messages",
-              next: { type: "file", length: JSON.stringify(unmarkedFile).length },
-            },
-          },
-        },
-      ]);
-    });
-  });
 
   it("does not compare requests sent to another Anthropic base URL", async () => {
     await withTempConfig(async (_config, factory) => {
@@ -6546,44 +6339,6 @@ describe("ProviderModelFactory prompt-cache prefix observation", () => {
       expect(recorded).toHaveLength(1);
       expect(JSON.stringify(recorded)).not.toContain("secret");
     });
-  });
-
-  it("keys mux-gateway baselines by account: another sign-in is another baseline", async () => {
-    await withTempConfig(async (_config, factory) => {
-      const sent: Array<Record<string, unknown>> = [];
-      const sendAs = async (couponCode: string, text: string) => {
-        const scope = factory.createPromptCacheTurnScope("ws-gateway-account", recorder);
-        const result = await factory.createModel(
-          "mux-gateway:anthropic/claude-sonnet-4-5",
-          {},
-          {
-            promptCacheScope: scope,
-            providersConfig: {
-              "mux-gateway": { couponCode, fetch: capturingFetch(sent) },
-            } as unknown as ProvidersConfig,
-          }
-        );
-        if (!result.success) throw new Error("expected a gateway model");
-        await send(result.data, [{ role: "user", content: text }]);
-      };
-      // Same base URL, another account: its first request is a new baseline.
-      await sendAs("account-a-secret", "first");
-      await sendAs("account-b-secret", "second");
-      expect(sent).toHaveLength(2);
-      expect(recorded).toEqual([]);
-      // The same account is the same cache, so a rewritten prompt is reported.
-      await sendAs("account-b-secret", "third");
-      expect(recorded).toHaveLength(1);
-      expect(JSON.stringify(recorded)).not.toContain("secret");
-    });
-  });
-
-  it("the mux-gateway route holds a stable hash of the account, not its credential", () => {
-    const accountA = muxGatewayPromptCacheRoute("account-a-secret");
-    expect(accountA).toMatch(/^mux-gateway:[0-9a-f]{16}$/);
-    expect(accountA).toBe(muxGatewayPromptCacheRoute("account-a-secret"));
-    expect(accountA).not.toBe(muxGatewayPromptCacheRoute("account-b-secret"));
-    expect(accountA).not.toContain("secret");
   });
 
   it("requestEndpoint keeps no query text, only a stable hash of it", () => {

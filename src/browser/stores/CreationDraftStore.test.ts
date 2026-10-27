@@ -28,6 +28,7 @@ import {
 import { TestTempDir } from "@/node/services/tools/testHelpers";
 import { installDom } from "../../../tests/ui/dom";
 import { CreationDraftStore } from "./CreationDraftStore";
+import { retryDelayMs } from "./DraftStore";
 
 const PROJECT_A = "/projects/a";
 const PROJECT_B = "/projects/b";
@@ -78,11 +79,20 @@ async function createHarness(
     failReads: 0,
     readGate: Promise.resolve(),
     listGate: Promise.resolve(),
+    /** Holds a list reply that was read already (a snapshot older than what follows). */
+    listReplyGate: Promise.resolve(),
+    listCalls: 0,
+    failDeletes: 0,
+    deleteCalls: 0,
+    deletesDone: 0,
   };
   const drafts = {
     listCreation: async () => {
+      control.listCalls++;
       await control.listGate;
-      return service.list();
+      const list = await service.list();
+      await control.listReplyGate;
+      return list;
     },
     getCreation: async ({ scope }: { scope: CreationDraftScope }) => {
       await control.readGate;
@@ -107,7 +117,15 @@ async function createHarness(
       }
       return reply;
     },
-    deleteCreation: ({ scope }: { scope: CreationDraftScope }) => service.delete(scope.draftId),
+    deleteCreation: async ({ scope }: { scope: CreationDraftScope }) => {
+      control.deleteCalls++;
+      if (control.failDeletes > 0) {
+        control.failDeletes--;
+        throw new Error("connection lost");
+      }
+      await service.delete(scope.draftId);
+      control.deletesDone++;
+    },
     importLegacyCreation: async (input: CreationDraftImportLegacyInput) => {
       if (input.legacyDraftId === options?.failLegacyImport) throw new Error("connection lost");
       return service.importLegacy(input);
@@ -354,7 +372,7 @@ describe("CreationDraftStore", () => {
     await store.flush(id);
     store.update(id, { text: "typed just before reload" });
     const saves = control.updates.length;
-    window.dispatchEvent(new Event("beforeunload"));
+    window.dispatchEvent(new window.Event("beforeunload"));
     // Sent at once, not after the debounce.
     expect(control.updates.length).toBe(saves + 1);
     await waitFor(() => !store.getView(id).unsaved);
@@ -471,6 +489,189 @@ describe("CreationDraftStore", () => {
     expect(store.getView(id).draft).toBeNull();
   });
 
+  test("a failed delete of a sent draft is retried on reconnect (#7551)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-retry");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+    control.failDeletes = 1;
+
+    // The connection drops right after the workspace was created.
+    await store.delete(id).catch(() => undefined);
+    store.setClient(null);
+    expect(await service.get(id)).not.toBeNull();
+
+    store.setClient(harness.newClient());
+    await waitFor(() => control.listCalls === 2 && store.getListState().status === "ready");
+    await waitFor(() => store.getDraftsByProject()[PROJECT_A] === undefined);
+    // The new connection deleted the record, so a reloaded window does not list it either.
+    expect(await service.get(id)).toBeNull();
+  });
+
+  test("a listed draft whose delete keeps failing stays hidden (#7551)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-hidden");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+    control.failDeletes = Number.MAX_SAFE_INTEGER;
+
+    await store.delete(id).catch(() => undefined);
+    let relisted = false;
+    const unsubscribe = store.subscribeList(() => {
+      if (control.listCalls === 2) relisted = true;
+    });
+    store.setClient(harness.newClient());
+    // The reconnect's list landed: it still holds the record.
+    await waitFor(() => relisted);
+    unsubscribe();
+    expect(await service.get(id)).not.toBeNull();
+    expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
+    expect(store.draftIdForProject(PROJECT_A)).not.toBe(id);
+    store.setClient(null);
+  });
+
+  test("a new client replaces the backoff retry of a failed delete (#7551)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-timer");
+    const harness = await createHarness(tempDir);
+    const { store, control } = harness;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+    control.failDeletes = Number.MAX_SAFE_INTEGER;
+    const settle = async () => {
+      for (let i = 0; i < 10; i++) await Promise.resolve();
+    };
+    // bun-types lacks advanceTimersByTime; bun implements it.
+    const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
+    jest.useFakeTimers();
+
+    await store.delete(id);
+    store.setClient(harness.newClient());
+    await settle();
+    expect(control.deleteCalls).toBe(2);
+    // Only the new client's retry runs: the old client's timer was cleared.
+    fakeTimers.advanceTimersByTime(retryDelayMs(0));
+    await settle();
+    expect(control.deleteCalls).toBe(3);
+
+    // Disconnecting stops the retries.
+    store.setClient(null);
+    fakeTimers.advanceTimersByTime(retryDelayMs(10));
+    await settle();
+    expect(control.deleteCalls).toBe(3);
+  });
+
+  test("a list that lands while a deleted draft's save runs does not show it (#7551)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-during-save");
+    const harness = await createHarness(tempDir);
+    const { store, control } = harness;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+    control.failDeletes = Number.MAX_SAFE_INTEGER;
+    let releaseSave: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    store.update(id, { text: "sent!" });
+    const saving = store.flush(id).catch(() => undefined);
+    await waitFor(() => control.updates.length === 2);
+
+    const deleting = store.delete(id);
+    store.setClient(harness.newClient());
+    await waitFor(() => control.listCalls === 2 && store.getListState().status === "ready");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
+    releaseSave();
+    await Promise.all([saving, deleting]);
+    store.setClient(null);
+  });
+
+  test("a reconnect does not delete before the save the delete waits for (#7551)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-reconnect-save");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    let releaseSave: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    const saving = store.flush(id);
+    await waitFor(() => control.updates.length === 1);
+
+    const deleting = store.delete(id);
+    store.setClient(harness.newClient());
+    await waitFor(() => control.listCalls === 2 && store.getListState().status === "ready");
+    releaseSave();
+    await Promise.all([saving, deleting]);
+
+    expect(await service.get(id)).toBeNull();
+  });
+
+  test("a list read before a delete succeeds does not show the draft (#7551)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-stale-list");
+    const harness = await createHarness(tempDir);
+    const { store, control } = harness;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+    control.failDeletes = 1;
+    await store.delete(id);
+
+    let releaseList: () => void = () => undefined;
+    control.listReplyGate = new Promise<void>((resolve) => {
+      releaseList = resolve;
+    });
+    store.setClient(harness.newClient());
+    // The new list read the record, then the resent delete removed it.
+    await waitFor(() => control.listCalls === 2 && control.deletesDone === 1);
+    releaseList();
+    await waitFor(() => store.getListState().status === "ready");
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
+  });
+
+  test("reopening a draft whose delete failed gives a blank draft (#7551)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-reopen");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+    control.failDeletes = 1;
+    await store.delete(id);
+
+    store.open(id, PROJECT_A);
+    expect(store.getView(id).load.status).toBe("ready");
+    expect(store.getView(id).draft?.text).toBe("");
+    store.setClient(harness.newClient());
+    await waitFor(() => control.deletesDone === 1 && store.getListState().status === "ready");
+    expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
+    expect(await service.get(id)).toBeNull();
+  });
+
+  test("an edit to a reopened deleted draft saves whole and stays out of the list (#7551)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-reopen-edit");
+    const harness = await createHarness(tempDir);
+    const { store, control } = harness;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+    control.failDeletes = 1;
+    await store.delete(id);
+    store.open(id, PROJECT_A);
+    await waitFor(() => store.getView(id).load.status === "ready");
+    store.update(id, { text: "typed after" });
+    store.setClient(harness.newClient());
+    await waitFor(() => control.deletesDone === 1);
+
+    // The retry removed the record before this save: a patch of changed fields would be refused.
+    await store.flush(id);
+    expect(store.getView(id).saveError).toBeNull();
+    expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
+    store.setClient(harness.newClient());
+    await waitFor(() => control.listCalls === 3);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(store.getDraftsByProject()[PROJECT_A]).toBeUndefined();
+  });
   test("after a bare project page's draft is sent, the page opens a new blank draft", async () => {
     using tempDir = new TestTempDir("creation-store-sent-blank");
     const harness = await createHarness(tempDir);

@@ -691,6 +691,21 @@ export function getControlPath(config: SSHConnectionConfig): string {
  * Identical configs produce identical keys.
  * Includes local username to prevent cross-user socket collisions.
  */
+/**
+ * #6426: a key for caches of remote checkout content, from the same fields as the pool's
+ * connection key. An unset port is kept apart from 22, because the SSH config can give the host
+ * another port. The pool's own key is unchanged.
+ */
+export function makeAgentHostKey(config: SSHConnectionConfig): string {
+  return JSON.stringify([
+    "ssh",
+    os.userInfo().username,
+    config.host,
+    config.port ?? "unset",
+    config.identityFile ?? "default",
+  ]);
+}
+
 function makeConnectionKey(config: SSHConnectionConfig): string {
   // Note: srcBaseDir is intentionally excluded - connection identity is determined
   // by user + host + port + key. This allows health tracking and multiplexing

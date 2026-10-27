@@ -27,22 +27,6 @@ describe("createDisplayUsage", () => {
       expect(result!.input.tokens).toBe(36600);
     });
 
-    test("subtracts cached tokens for gateway OpenAI model", () => {
-      const openAIUsage: LanguageModelV2Usage = {
-        inputTokens: 108200,
-        outputTokens: 227,
-        totalTokens: 108427,
-        cachedInputTokens: 71600,
-      };
-
-      const result = createDisplayUsage(openAIUsage, "mux-gateway:openai/gpt-5.2");
-
-      expect(result).toBeDefined();
-      expect(result!.cached.tokens).toBe(71600);
-      // Input = raw minus cached: 108200 - 71600 = 36600
-      expect(result!.input.tokens).toBe(36600);
-    });
-
     test("subtracts cached tokens for Anthropic model (v6 semantics)", () => {
       // In v6, Anthropic now reports inputTokens INCLUSIVE of cached tokens
       // (matching OpenAI/Google behavior). inputTokens = input + cache_read + cache_write.
@@ -58,22 +42,6 @@ describe("createDisplayUsage", () => {
       expect(result).toBeDefined();
       expect(result!.cached.tokens).toBe(71600);
       // Input = raw minus cached: 108200 - 71600 = 36600 (non-cached only)
-      expect(result!.input.tokens).toBe(36600);
-    });
-
-    test("subtracts cached tokens for gateway Anthropic model", () => {
-      const anthropicUsage: LanguageModelV2Usage = {
-        inputTokens: 108200,
-        outputTokens: 227,
-        totalTokens: 108427,
-        cachedInputTokens: 71600,
-      };
-
-      const result = createDisplayUsage(anthropicUsage, "mux-gateway:anthropic/claude-opus-4-6");
-
-      expect(result).toBeDefined();
-      expect(result!.cached.tokens).toBe(71600);
-      // Input = raw minus cached: 108200 - 71600 = 36600
       expect(result!.input.tokens).toBe(36600);
     });
 
@@ -121,22 +89,6 @@ describe("createDisplayUsage", () => {
       // Input = raw minus cached: 74300 - 42600 = 31700
       expect(result!.input.tokens).toBe(31700);
     });
-
-    test("subtracts cached tokens for gateway Google model", () => {
-      const googleUsage: LanguageModelV2Usage = {
-        inputTokens: 74300,
-        outputTokens: 1600,
-        totalTokens: 75900,
-        cachedInputTokens: 42600,
-      };
-
-      const result = createDisplayUsage(googleUsage, "mux-gateway:google/gemini-3-pro-preview");
-
-      expect(result).toBeDefined();
-      expect(result!.cached.tokens).toBe(42600);
-      // Input = raw minus cached: 74300 - 42600 = 31700
-      expect(result!.input.tokens).toBe(31700);
-    });
   });
 
   describe("backward compatibility with pre-v6 data", () => {
@@ -160,7 +112,7 @@ describe("createDisplayUsage", () => {
     });
 
     test("uses outputTokens directly when smaller than reasoningTokens (reasoning-exclusive rows)", () => {
-      // Historical Gemini-via-gateway rows persisted outputTokens exclusive of
+      // Some historical Gemini rows persisted outputTokens exclusive of
       // reasoning (candidatesTokenCount), so output < reasoning. The display must
       // show the text tokens, not clamp to 0.
       const usage: LanguageModelV2Usage = {
@@ -325,21 +277,22 @@ describe("createDisplayUsage", () => {
       }
     });
 
-    test("keeps GPT-5.5 on base rates at the published 272K boundary", () => {
-      const usage: LanguageModelV2Usage = {
-        inputTokens: 272000,
-        outputTokens: 1000,
-        totalTokens: 273000,
-      };
-
-      const result = createDisplayUsage(usage, "openai:gpt-5.5");
-
-      expect(result).toBeDefined();
-      expect(result!.input.cost_usd).toBeCloseTo(1.36);
-      expect(result!.output.cost_usd).toBeCloseTo(0.03);
+    test("applies GPT-5.5's long-context tier only above its published 272K boundary", () => {
+      for (const tokens of [272000, 272001]) {
+        const longContext = tokens > 272000;
+        const result = createDisplayUsage(
+          { inputTokens: tokens, outputTokens: 1000, totalTokens: tokens + 1000 },
+          "openai:gpt-5.5"
+        );
+        expect(result?.input.cost_usd).toBeCloseTo(
+          ((tokens * 5) / 1e6) * (longContext ? 2 : 1),
+          12
+        );
+        expect(result?.output.cost_usd).toBeCloseTo(0.001 * 30 * (longContext ? 1.5 : 1), 12);
+      }
     });
 
-    test("falls back to LiteLLM's default 200K threshold for existing tiered models", () => {
+    test("prices Gemini 3.1 Pro above its 200K threshold at the long-context rates", () => {
       const usage: LanguageModelV2Usage = {
         inputTokens: 250000,
         outputTokens: 1000,
@@ -558,21 +511,6 @@ describe("createDisplayUsage", () => {
 
       expect(result).toBeDefined();
       expect(result!.cacheCreate.tokens).toBe(0);
-    });
-
-    test("handles gateway Anthropic model with cache creation", () => {
-      const usage: LanguageModelV2Usage = {
-        inputTokens: 2000,
-        outputTokens: 100,
-        totalTokens: 2100,
-      };
-
-      const result = createDisplayUsage(usage, "mux-gateway:anthropic/claude-sonnet-4-5", {
-        anthropic: { cacheCreationInputTokens: 1500 },
-      });
-
-      expect(result).toBeDefined();
-      expect(result!.cacheCreate.tokens).toBe(1500);
     });
   });
 });
@@ -1100,7 +1038,7 @@ describe("OpenAI service-tier pricing (#4352)", () => {
     }
   });
 
-  test("keeps gateway-included costs at zero whatever tier was reported", () => {
+  test("keeps included costs at zero whatever tier was reported", () => {
     const usage = createDisplayUsage(
       { inputTokens: 100_000, outputTokens: 1_000 },
       "openai:gpt-6.1-sol",

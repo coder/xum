@@ -48,17 +48,17 @@ describe("isProviderAutoRouteEligible", () => {
   });
 
   it("returns false for disabled non-bedrock providers even when configured", () => {
-    expect(
-      isProviderAutoRouteEligible("mux-gateway", { couponCode: "x", enabled: false }, {})
-    ).toBe(false);
+    expect(isProviderAutoRouteEligible("openrouter", { apiKey: "x", enabled: false }, {})).toBe(
+      false
+    );
   });
 
   it("returns true for non-bedrock providers when enabled is omitted", () => {
-    expect(isProviderAutoRouteEligible("mux-gateway", { couponCode: "x" }, {})).toBe(true);
+    expect(isProviderAutoRouteEligible("openrouter", { apiKey: "x" }, {})).toBe(true);
   });
 
   it("returns true for non-bedrock providers when explicitly enabled", () => {
-    expect(isProviderAutoRouteEligible("mux-gateway", { couponCode: "x", enabled: true }, {})).toBe(
+    expect(isProviderAutoRouteEligible("openrouter", { apiKey: "x", enabled: true }, {})).toBe(
       true
     );
   });

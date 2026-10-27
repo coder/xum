@@ -8,9 +8,9 @@ import type { SendMessageInternalOptions } from "./taskWorkspaceSeam";
 import {
   createAgentSessionHarness,
   createStartedTurnHandle,
-  createStreamLifecycleMocks,
+  createTestStreamManager,
 } from "./agentSession.testHarness";
-import { makeTestEffectRunner } from "./di/testEffectRunner";
+import { makeTestEffectRunner, TEST_CLOCK_START_MS } from "./di/testEffectRunner";
 import { calculateBackoffDelay } from "@/common/utils/messages/retryState";
 import { askUserQuestionManager } from "./askUserQuestionManager";
 import { EventEmitter } from "events";
@@ -187,6 +187,47 @@ describe("WorkspaceService sendMessage status clearing", () => {
     expect(remembered?.plan).toBeUndefined();
   });
 
+  test("stamps the turn's recency and authoring time on the wall clock, not on the runner's TestClock", async () => {
+    // Recency must match the user message timestamp, which AgentSession stamps on the wall
+    // clock, and the renderer compares it with lastRead (Date.now()). authoredAtMs reaches
+    // messageQueue and the goal acknowledgment gate, which compare it with Date.now() times.
+    // Both stay on the wall clock until #7282.
+    const clock = makeTestEffectRunner();
+    const wallNowMs = TEST_CLOCK_START_MS + 1_234_567;
+    const service = createWorkspaceServiceForTest({
+      config: harness.config,
+      historyService: harness.historyService,
+      aiService: harness.aiService,
+      initStateManager: harness.initStateManager,
+      extensionMetadata: harness.extensionMetadata,
+      backgroundProcessManager: harness.backgroundProcessManager,
+      effectRunner: clock.runner,
+      hostClock: clock.hostClock,
+    });
+    service.registerSession("test-workspace", fakeSession as unknown as AgentSession);
+    // beforeEach already spies on updateRecency; spyOn returns that same spy.
+    const updateRecency = spyOn(harness.extensionMetadata, "updateRecency");
+    const dateNow = spyOn(Date, "now").mockReturnValue(wallNowMs);
+    try {
+      await clock.adjust(7_000);
+      const result = await service.sendMessage("test-workspace", "hello", {
+        model: "openai:gpt-4o",
+        agentId: "exec",
+      });
+
+      expect(result.success).toBe(true);
+      expect(updateRecency).toHaveBeenCalledWith("test-workspace", wallNowMs);
+      expect(fakeSession.queueMessage).toHaveBeenCalledWith(
+        "hello",
+        expect.anything(),
+        expect.objectContaining({ authoredAtMs: wallNowMs })
+      );
+    } finally {
+      dateNow.mockRestore();
+      await clock.dispose();
+    }
+  });
+
   test("leaves budgeted-goal pricing rejections to AgentSession instead of rejecting early", async () => {
     // The session is a fake, so this only proves the forward. Input preservation is owned by
     // agentSession.budgetGate.test.ts "manual rejected send preserves the user message + emits a stream-error event".
@@ -330,6 +371,45 @@ describe("WorkspaceService sendMessage status clearing", () => {
     const pending = await readPendingArtifactInteractions(path.join(sessionsDir, "test-workspace"));
     expect(pending.map((record) => record.id)).toEqual([id]);
   });
+
+  // #7342: a turn-start failure (no API key) comes back as Err after the user row is durable.
+  // Reporting it as "not sent" made the Artifacts tab offer Send, which delivered a duplicate.
+  test.each([
+    { accepted: true, expectSent: true },
+    { accepted: false, expectSent: false },
+  ])(
+    "an idle artifact interaction whose turn fails to start: accepted=$accepted -> sent=$expectSent",
+    async ({ accepted, expectSent }) => {
+      fakeSession.isBusy.mockReturnValue(false);
+      const turnError: SendMessageError = { type: "api_key_not_found", provider: "anthropic" };
+      fakeSession.sendMessage.mockImplementationOnce(
+        async (_message: string, _options: unknown, internal?: { onAccepted?: () => unknown }) => {
+          if (accepted) await internal?.onAccepted?.();
+          return Err(turnError);
+        }
+      );
+      const deps = createArtifactInteractionDeps({
+        config: harness.config,
+        workspaceService,
+        historyService: harness.historyService,
+      });
+      const sent = await sendArtifactInteraction(
+        {
+          ...deps,
+          getDefaultSendOptions: () =>
+            Promise.resolve({ model: "anthropic:claude-sonnet-4-5", agentId: "exec" }),
+        },
+        { workspaceId: "test-workspace", path: "form.html", version: null, text: "Ship it" }
+      );
+      expect(fakeSession.sendMessage).toHaveBeenCalledTimes(1);
+      expect(sent.success).toBe(expectSent);
+      // Either way the record is settled: an accepted row is delivered, a refused send is reported.
+      const pending = await readPendingArtifactInteractions(
+        path.join(harness.config.sessionsDir, "test-workspace")
+      );
+      expect(pending).toEqual([]);
+    }
+  );
 
   test("a send arriving during an earlier send's preflight queues instead of starting a second turn", async () => {
     // The session only reports busy once AgentSession.sendMessage claims PREPARING. A
@@ -639,7 +719,7 @@ describe("WorkspaceService sendMessage status clearing", () => {
   });
 
   test("the follow-up idle probe excludes the originating send after its session handoff", async () => {
-    // Codex P1 (PRRT_kwDOPxxmWM6cRi_J): preflightSendCounts stays positive
+    // Codex P1 (PRRT_kwDOPxxmWM6cRi_J): SendPreflight.sends stays positive
     // until the outer service call returns, so a probe reading it would let a
     // continuation's on-send compaction completion veto the continuation's
     // OWN saved follow-up. The probe must see unrelated preflights (round-37
@@ -2212,12 +2292,12 @@ describe("WorkspaceService interruptStream", () => {
       workspaceId,
       captureEvents: true,
       backgroundProcessManager: createTestBackgroundProcessManager(),
-      streamManager: { ...createStreamLifecycleMocks(), effectRunner: clock.runner },
+      streamManager: createTestStreamManager(undefined, clock.runner),
     });
     const service = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
-      aiService: h.aiService as AIService,
+      aiService: h.aiService as unknown as AIService,
       initStateManager: h.initStateManager,
       extensionMetadata: new ExtensionMetadataService(
         path.join(h.config.rootDir, "extensionMetadata.json")
@@ -2263,7 +2343,7 @@ describe("WorkspaceService interruptStream", () => {
     const service = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
-      aiService: h.aiService as AIService,
+      aiService: h.aiService as unknown as AIService,
       initStateManager: h.initStateManager,
       extensionMetadata: new ExtensionMetadataService(
         path.join(h.config.rootDir, "extensionMetadata.json")
@@ -2353,7 +2433,7 @@ describe("WorkspaceService interruptStream", () => {
     const workspaceService = createWorkspaceServiceForTest({
       config: h.config,
       historyService: h.historyService,
-      aiService: h.aiService as AIService,
+      aiService: h.aiService as unknown as AIService,
       initStateManager: h.initStateManager,
       extensionMetadata,
       backgroundProcessManager: h.backgroundProcessManager,

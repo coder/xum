@@ -16,12 +16,15 @@ import { useAPI, useLiveAPI } from "@/browser/contexts/API";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { Button } from "@/browser/components/Button/Button";
+import { KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { Checkbox } from "@/browser/components/Checkbox/Checkbox";
 import { cn } from "@/common/lib/utils";
 import type {
   AgentPluginComponentRef,
   AgentPluginComponents,
+  AgentPluginInstallMethod,
   AgentPluginInstallPreview,
+  AgentPluginMarketplaceListing,
   AgentPluginInterfaceSummary,
   AgentPluginListItem,
   AgentPluginPendingSignOuts,
@@ -31,6 +34,7 @@ import type {
 } from "@/common/orpc/schemas/agentPlugins";
 import type { AgentPluginImportedComponents } from "@/common/config/schemas/agentPluginInstalls";
 import { getErrorMessage } from "@/common/utils/errors";
+import { displayRepoUrl } from "@/common/utils/agentPluginSource";
 import { publishAgentPluginsMutated } from "@/browser/utils/agentPluginMutations";
 import {
   consumePendingPluginsSectionIntent,
@@ -44,6 +48,13 @@ import {
   cutReviewText,
   kilobytes,
 } from "./PluginHooksPanel";
+import {
+  InstallMethodPicker,
+  SkillsCliInstall,
+  installMethodLabel,
+  offersSkillsCli,
+} from "./PluginInstallMethods";
+import { MarketplaceListing } from "./PluginMarketplaceListing";
 
 /**
  * Settings → Plugins (global scope only).
@@ -61,17 +72,6 @@ function formatSource(item: AgentPluginListItem): string | null {
   }
   const ref = item.source.refType === "commit" ? item.source.ref.slice(0, 12) : item.source.ref;
   return `${displayRepoUrl(item.source.url)}${subpathSuffix(item.source.subpath)} @ ${ref}`;
-}
-
-/**
- * Clone URL without scheme and `.git` ("github.com/foo/grill"), so a monorepo
- * folder appended to it reads as a path, not as an invalid `….git/pstack` URL.
- */
-function displayRepoUrl(url: string): string {
-  return url
-    .replace(/^https:\/\//, "")
-    .replace(/^git@([^:]+):/, "$1/")
-    .replace(/\.git$/, "");
 }
 
 /** Trimmed optional text-field value, or null when empty. */
@@ -272,8 +272,10 @@ const ComponentChooser: React.FC<{
               <span className="min-w-0 break-words">
                 <span className="text-foreground font-mono break-all">{name}</span>
                 {imported.includes(name) && <span className="text-muted"> — imported</span>}
+                {/* Prose wraps between words. break-words still splits an unbroken URL or path
+                    that cannot fit, so nothing scrolls sideways at phone width. */}
                 {detail && (
-                  <span className="text-muted block break-all whitespace-pre-wrap">{detail}</span>
+                  <span className="text-muted block break-words whitespace-pre-wrap">{detail}</span>
                 )}
                 <SkillDirectives directives={directives} />
               </span>
@@ -323,6 +325,47 @@ function sameImports(
   );
 }
 
+/**
+ * Escape from inside a panel acts like its Cancel button (#7122): it closes only the panel and
+ * drops the unsaved selection. Settings is a Radix dialog that closes on Escape in the document
+ * capture phase, so this listens one step earlier, on the window, and only for keys sent to the
+ * panel. An Escape from anywhere else in Settings still closes Settings.
+ */
+function useEscapeCancelsPanel(
+  rootRef: React.RefObject<HTMLElement | null>,
+  busy: boolean,
+  onCancel: () => void
+) {
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!matchesKeybind(event, KEYBINDS.CANCEL) || event.defaultPrevented || event.isComposing) {
+        return;
+      }
+      if (!(event.target instanceof Node) || rootRef.current?.contains(event.target) !== true) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      // Cancel is disabled while a load or save runs: Escape then only keeps Settings open.
+      if (!busy) onCancel();
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [rootRef, busy, onCancel]);
+}
+
+/** Buttons by plugin name, so closing a row's panel can give focus back to the button that opened it. */
+function useButtonsByName() {
+  const buttonsRef = useRef(new Map<string, HTMLButtonElement>());
+  return {
+    refFor: (name: string) => (button: HTMLButtonElement | null) => {
+      if (button) buttonsRef.current.set(name, button);
+      else buttonsRef.current.delete(name);
+    },
+    focus: (name: string) => buttonsRef.current.get(name)?.focus(),
+  };
+}
+
 const ManageComponentsPanel: React.FC<{
   name: string;
   onSaved: () => Promise<void>;
@@ -340,6 +383,8 @@ const ManageComponentsPanel: React.FC<{
   const [loadAttempt, setLoadAttempt] = useState(0);
   const [saved, setSaved] = useState(false);
   const name = props.name;
+  const rootRef = useRef<HTMLDivElement>(null);
+  useEscapeCancelsPanel(rootRef, busy, props.onClose);
 
   useEffect(() => {
     let ignore = false;
@@ -454,7 +499,10 @@ const ManageComponentsPanel: React.FC<{
     }
   };
   return (
-    <div className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3">
+    <div
+      ref={rootRef}
+      className="border-border-medium bg-background-secondary mt-2 space-y-3 rounded-md border p-3"
+    >
       <p className="text-foreground text-xs">
         Manage components from the installed version
         {inventory ? ` · ${inventory.lockedSha.slice(0, 12)}` : ""}. No remote fetch.
@@ -530,6 +578,53 @@ const ManageComponentsPanel: React.FC<{
   );
 };
 
+/**
+ * Whether keyboard focus fell out of an unmounted control: to the page body, or to the Settings
+ * dialog itself (Radix moves it there). A control the user focused, anywhere, is not lost focus.
+ * A slow preview or install must not take the focus from a control the user moved to meanwhile.
+ */
+function focusFellOut(near: HTMLElement): boolean {
+  const active = document.activeElement;
+  return active === null || active === document.body || active === near.closest('[role="dialog"]');
+}
+
+/**
+ * Focus an element when it next mounts, once, if focus fell out meanwhile: `arm()` before the
+ * state change that mounts it. A later rerender or remount does not move focus.
+ */
+function useFocusOnNextMount() {
+  const armedRef = useRef(false);
+  return {
+    arm: () => {
+      armedRef.current = true;
+    },
+    ref: (element: HTMLElement | null) => {
+      if (element === null || !armedRef.current) return;
+      armedRef.current = false;
+      if (focusFellOut(element)) element.focus();
+    },
+  };
+}
+
+/**
+ * Callback ref of the preview view (#7121). Opening the preview unmounts the focused source field
+ * or Preview button, and focus then fell to the Settings dialog. So the view focuses its first
+ * control when it mounts, if focus fell out. It does not when a control inside already took focus
+ * (the Back button after a marketplace entry, #7134) or the user focused another control while
+ * the preview loaded. The function is module-level, so React calls it only on mount and unmount:
+ * a changed Install as method or the Skills CLI choice rerenders the view without moving focus.
+ */
+function focusFirstControlOnMount(view: HTMLDivElement | null): void {
+  if (view === null || !focusFellOut(view)) return;
+  const controls = view.querySelectorAll<HTMLElement>(
+    "button, input, select, textarea, [tabindex]"
+  );
+  const first = Array.from(controls).find(
+    (control) => control.tabIndex >= 0 && !control.matches(":disabled")
+  );
+  first?.focus();
+}
+
 /** Two-phase add flow: source input → consent preview → install. */
 const AddPluginPanel: React.FC<{
   onInstalled: () => void;
@@ -542,12 +637,23 @@ const AddPluginPanel: React.FC<{
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<AgentPluginInstallPreview | null>(null);
+  /** A Claude Code marketplace repository: the user picks an entry, then previews it. */
+  const [marketplace, setMarketplace] = useState<AgentPluginMarketplaceListing | null>(null);
   const [selected, setSelected] = useState<AgentPluginImportedComponents>({
     skills: [],
     mcpServers: [],
   });
+  /** The "Skills CLI" choice of the Install as picker: not a managed install. */
+  const [cliChosen, setCliChosen] = useState(false);
+  /**
+   * The marketplace entry of the current preview, if any. Its plugin can live in another
+   * repository or folder than the typed source, which the Skills CLI would install from, so an
+   * entry preview offers no Skills CLI choice. Back to the list picks this entry again.
+   */
+  const [previewedEntry, setPreviewedEntry] = useState<string | null>(null);
 
-  const handlePreview = async () => {
+  /** `method`: the Install as choice; null takes the first method that fits. */
+  const handlePreview = async (method: AgentPluginInstallMethod | null) => {
     if (!api || input.trim().length === 0 || busy) return;
     setBusy(true);
     setError(null);
@@ -556,16 +662,21 @@ const AddPluginPanel: React.FC<{
         input: input.trim(),
         ref: optionalField(ref),
         subpath: optionalField(subpath),
+        method,
       });
-      if (result.success) {
-        setPreview(result.data);
+      if (!result.success) {
+        setError(result.error);
+      } else if (result.data.kind === "marketplace") {
+        setMarketplace(result.data.marketplace);
+      } else {
+        const next = result.data.preview;
+        setPreview(next);
+        setPreviewedEntry(method?.kind === "claude-marketplace" ? method.entry : null);
         // An accepted preview starts a new consent decision; failed attempts retain choices.
         setSelected({
-          skills: result.data.skills.map((skill) => skill.name),
-          mcpServers: result.data.mcpServers.map((server) => server.serverName),
+          skills: next.skills.map((skill) => skill.name),
+          mcpServers: next.mcpServers.map((server) => server.serverName),
         });
-      } else {
-        setError(result.error);
       }
     } catch (err) {
       setError(getErrorMessage(err));
@@ -575,7 +686,14 @@ const AddPluginPanel: React.FC<{
   };
 
   const previewOnEnter = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === "Enter") void handlePreview();
+    if (e.key === "Enter") void handlePreview(null);
+  };
+
+  /** Back from a preview: to the marketplace entries when they led here, else to the source. */
+  const backToSource = () => {
+    setPreview(null);
+    setError(null);
+    setCliChosen(false);
   };
 
   const handleInstall = async () => {
@@ -585,6 +703,7 @@ const AddPluginPanel: React.FC<{
     try {
       const result = await api.agentPlugins.install({
         source: preview.source,
+        method: preview.method,
         expectedSha: preview.lockedSha,
         expectedConsentDigest: preview.consentDigest,
         importedComponents: selected,
@@ -606,7 +725,22 @@ const AddPluginPanel: React.FC<{
 
   return (
     <div className="border-border-medium bg-background-secondary space-y-3 rounded-md border p-3">
-      {preview === null ? (
+      {preview === null && marketplace !== null ? (
+        <MarketplaceListing
+          listing={marketplace}
+          busy={busy}
+          error={error}
+          initialEntry={previewedEntry}
+          onBack={() => {
+            setMarketplace(null);
+            setPreviewedEntry(null);
+            setError(null);
+          }}
+          onPickEntry={() => setError(null)}
+          onPreviewEntry={(entry) => void handlePreview({ kind: "claude-marketplace", entry })}
+          onPickMethod={(method) => void handlePreview(method)}
+        />
+      ) : preview === null ? (
         <>
           <div>
             <label htmlFor="plugin-source" className="text-muted mb-1 block text-xs">
@@ -662,13 +796,13 @@ const AddPluginPanel: React.FC<{
               className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
             >
               <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span className="break-words">{error}</span>
+              <span className="min-w-0 break-words">{error}</span>
             </div>
           )}
           <div className="flex gap-2">
             <Button
               size="sm"
-              onClick={() => void handlePreview()}
+              onClick={() => void handlePreview(null)}
               disabled={busy || input.trim().length === 0}
             >
               {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
@@ -680,203 +814,303 @@ const AddPluginPanel: React.FC<{
           </div>
         </>
       ) : (
-        <>
-          {/* Consent preview: everything the plugin will contribute, before anything is written. */}
-          <div className="space-y-1">
-            <div className="flex flex-wrap items-baseline gap-2">
-              {/* break-all: a valid 64-char separator-free name has no natural
-                  break points and would overflow the card on phone widths. */}
-              <span className="text-foreground text-sm font-medium break-all">
-                {preview.manifest.name}
-              </span>
-              {preview.manifest.version && (
-                <span className="text-muted text-xs">v{preview.manifest.version}</span>
-              )}
-              <Badge tone="muted">
-                {preview.source.refType} · {preview.lockedSha.slice(0, 12)}
-              </Badge>
-            </div>
-            {preview.manifest.description && (
-              <p className="text-muted text-xs">{preview.manifest.description}</p>
-            )}
-            {preview.manifest.interface && (
-              <PluginInterfaceDetails info={preview.manifest.interface} />
-            )}
-            {/* break-all: URLs and a 64-char separator-free plugin dir name
-                have no natural break points and would overflow the card on
-                phone widths. */}
-            <p className="text-muted text-[11px] break-all">
-              {displayRepoUrl(preview.source.url)}
-              {subpathSuffix(preview.source.subpath)} @ {preview.source.ref} →{" "}
-              <code className="text-accent-text">{preview.targetPath}</code>
-              {preview.manifest.authorName ? ` · by ${preview.manifest.authorName}` : ""}
-              {preview.manifest.license ? ` · ${preview.manifest.license}` : ""}
-            </p>
-          </div>
-
-          {preview.warnings.length > 0 && (
-            <div className="bg-warning/10 space-y-1 rounded-md px-3 py-2">
-              {preview.warnings.map((warning) => (
-                <div key={warning} className="text-warning flex items-start gap-2 text-xs">
-                  <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                  <span className="break-words">{warning}</span>
-                </div>
-              ))}
-            </div>
-          )}
-
-          <ComponentChooser
-            inventory={preview}
-            selected={selected}
+        <div ref={focusFirstControlOnMount} className="space-y-3">
+          <InstallMethodPicker
+            preview={preview}
+            cliOffered={
+              previewedEntry === null &&
+              offersSkillsCli({ input, ref, subpath, skills: preview.skillsCliSkills })
+            }
+            cliChosen={cliChosen}
             disabled={busy}
-            onChange={setSelected}
+            onPickCurrent={() => {
+              // A changed method clears the error of the previous one.
+              setError(null);
+              setCliChosen(false);
+            }}
+            onPickMethod={(method) => {
+              setCliChosen(false);
+              void handlePreview(method);
+            }}
+            onPickCli={() => {
+              setError(null);
+              setCliChosen(true);
+            }}
           />
-          <p className="text-warning text-xs">
-            {selected.skills.length + selected.mcpServers.length === 0
-              ? "No skills or MCP servers selected. "
-              : ""}
-            Selection does not affect agents, workflows, slash commands, or hooks below: these
-            remain part of the install, even when neither group is selected. Skipped files stay on
-            disk; this is not a filesystem sandbox.
-          </p>
-
-          {preview.agents.length > 0 && (
-            <div>
-              <h4 className="text-foreground mb-1 text-xs font-medium">
-                Agents ({preview.agents.length})
-              </h4>
-              {/* Activatable components: consent must name everything that
-                  becomes available after install, not just skills/MCP. */}
-              <p className="text-xs">
-                <span className="text-foreground font-mono break-all">
-                  {preview.agents.join(", ")}
-                </span>{" "}
-                <span className="text-muted">
-                  — become agent definitions. An agent in Claude Code or Cursor format (no Xum-only
-                  field such as base) becomes a hidden sub-agent with Exec&apos;s tools, narrowed
-                  only by its Claude Code tools or disallowedTools list. Unless that list removes
-                  Bash, it can run shell commands, which can change any file. readonly: true removes
-                  only the file edit and task tools.
-                </span>
-              </p>
-            </div>
+          {cliChosen ? (
+            <SkillsCliInstall
+              source={input.trim()}
+              skills={preview.skillsCliSkills}
+              onBack={backToSource}
+            />
+          ) : (
+            <PreviewConsent
+              preview={preview}
+              selected={selected}
+              onSelect={setSelected}
+              busy={busy}
+              error={error}
+              onBack={backToSource}
+              onInstall={() => void handleInstall()}
+              focusBack={previewedEntry !== null}
+            />
           )}
-
-          {preview.workflows.length > 0 && (
-            <div>
-              <h4 className="text-foreground mb-1 text-xs font-medium">
-                Workflows ({preview.workflows.length})
-              </h4>
-              <p className="text-xs">
-                <span className="text-foreground font-mono break-all">
-                  {preview.workflows.join(", ")}
-                </span>{" "}
-                <span className="text-muted">
-                  — executable workflow scripts, invokable after install.
-                </span>
-              </p>
-            </div>
-          )}
-
-          {preview.slashCommands.length > 0 && (
-            <div>
-              <h4 className="text-foreground mb-1 text-xs font-medium">
-                Slash commands ({preview.slashCommands.length})
-              </h4>
-              <ul className="space-y-1">
-                {preview.slashCommands.map((command) => (
-                  <li key={command.name} className="text-xs">
-                    <span className="text-foreground font-mono">/{command.name}</span>
-                    {command.description && (
-                      <span className="text-muted"> — {command.description}</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          <ReviewedDefinitions items={preview.reviewedComponents} />
-
-          {preview.codexHooks.length > 0 && (
-            <div>
-              <h4 className="text-foreground mb-1 text-xs font-medium">
-                hooks.json hooks ({preview.codexHooks.length})
-              </h4>
-              {/* Install trusts none of them (Codex trust per hash): consent must say so. */}
-              <p className="text-muted mb-1 text-xs">
-                None of these run until you trust each one in Settings → Plugins.
-              </p>
-              <ul className="space-y-1">
-                {preview.codexHooks.map((hook) => (
-                  <li key={hook.key} className="text-xs break-all">
-                    <span className="text-foreground font-mono">{hook.event}</span>
-                    {hook.matcher !== undefined && (
-                      <span className="text-muted font-mono"> ({hook.matcher})</span>
-                    )}
-                    <span className="text-muted">
-                      {" "}
-                      — {describePluginHookHandler(hook.handler)}
-                      {PLUGIN_HOOK_STATUS_NOTE[hook.status] != null &&
-                        `. ${PLUGIN_HOOK_STATUS_NOTE[hook.status] ?? ""}`}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {preview.hook && (
-            <div>
-              <h4 className="text-foreground mb-1 text-xs font-medium">Hooks</h4>
-              {/* Executable code that loads automatically: consent must say so. */}
-              <p className="text-xs">
-                <span className="text-foreground font-mono break-all">{preview.hook.path}</span>{" "}
-                <span className="text-muted">
-                  — runs sandboxed on every agent request and can observe, rewrite, or block tool
-                  calls
-                  {preview.hook.toolGrants.length > 0
-                    ? ` for: ${preview.hook.toolGrants.join(", ")}`
-                    : " (no tool visibility granted)"}
-                  .
-                </span>
-              </p>
-            </div>
-          )}
-
-          {error && (
-            <div
-              role="alert"
-              className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
-            >
-              <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span className="break-words">{error}</span>
-            </div>
-          )}
-
-          <div className="flex gap-2">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => {
-                setPreview(null);
-                setError(null);
-              }}
-              disabled={busy}
-            >
-              <ArrowLeft className="h-3.5 w-3.5" />
-              Back
-            </Button>
-            <Button size="sm" onClick={() => void handleInstall()} disabled={busy}>
-              {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
-              {busy ? "Installing…" : "Install"}
-            </Button>
-          </div>
-        </>
+        </div>
       )}
     </div>
   );
 };
+
+/** Name, method, version, description and source of a consent preview. */
+const PreviewHeader: React.FC<{ preview: AgentPluginInstallPreview }> = (props) => (
+  <div className="space-y-1">
+    <div className="flex flex-wrap items-baseline gap-2">
+      {/* break-all: a valid 64-char separator-free name has no natural
+          break points and would overflow the card on phone widths. */}
+      <span className="text-foreground text-sm font-medium break-all">
+        {props.preview.manifest.name}
+      </span>
+      {props.preview.manifest.version && (
+        <span className="text-muted text-xs">v{props.preview.manifest.version}</span>
+      )}
+      <Badge tone="accent">{installMethodLabel(props.preview.method)}</Badge>
+      <Badge tone="muted">
+        {props.preview.source.refType} · {props.preview.lockedSha.slice(0, 12)}
+      </Badge>
+    </div>
+    {props.preview.manifest.description && (
+      <p className="text-muted text-xs">{props.preview.manifest.description}</p>
+    )}
+    {props.preview.manifest.interface && (
+      <PluginInterfaceDetails info={props.preview.manifest.interface} />
+    )}
+    {/* break-words: wrap at spaces ("@ main" stays whole), and still break URLs and a 64-char
+        separator-free plugin dir name, which have no natural break points and would overflow
+        the card on phone widths. break-all split words mid-way. */}
+    <p className="text-muted text-[11px] break-words">
+      {displayRepoUrl(props.preview.source.url)}
+      {subpathSuffix(props.preview.source.subpath)} @ {props.preview.source.ref} →{" "}
+      <code className="text-accent-text">{props.preview.targetPath}</code>
+      {props.preview.manifest.authorName ? ` · by ${props.preview.manifest.authorName}` : ""}
+      {props.preview.manifest.license ? ` · ${props.preview.manifest.license}` : ""}
+    </p>
+  </div>
+);
+
+/** hooks.json hooks of a consent preview: install trusts none of them. */
+/**
+ * Install trusts none of the hooks (Codex trust per hash), and some can never run (a Claude
+ * plugin hook, a command handler): the note must be true for every hook listed.
+ */
+function hooksRunNote(hooks: AgentPluginInstallPreview["codexHooks"]): string {
+  const neverRun = hooks.filter((hook) => hook.status !== "runnable").length;
+  if (neverRun === hooks.length) return "Xum never runs these hooks.";
+  const untilTrusted = "None of these run until you trust each one in Settings → Plugins.";
+  return neverRun === 0
+    ? untilTrusted
+    : `${untilTrusted} Hooks marked "Never runs" do not run at all.`;
+}
+
+const CodexHooksDisclosure: React.FC<{ hooks: AgentPluginInstallPreview["codexHooks"] }> = (
+  props
+) => (
+  <>
+    {props.hooks.length > 0 && (
+      <div>
+        <h4 className="text-foreground mb-1 text-xs font-medium">
+          hooks.json hooks ({props.hooks.length})
+        </h4>
+        <p className="text-muted mb-1 text-xs">{hooksRunNote(props.hooks)}</p>
+        <ul className="space-y-1">
+          {props.hooks.map((hook) => (
+            <li key={hook.key} className="text-xs break-all">
+              <span className="text-foreground font-mono">{hook.event}</span>
+              {hook.matcher !== undefined && (
+                <span className="text-muted font-mono"> ({hook.matcher})</span>
+              )}
+              <span className="text-muted">
+                {" "}
+                — {describePluginHookHandler(hook.handler)}
+                {PLUGIN_HOOK_STATUS_NOTE[hook.status] != null &&
+                  `. ${PLUGIN_HOOK_STATUS_NOTE[hook.status] ?? ""}`}
+              </span>
+            </li>
+          ))}
+        </ul>
+      </div>
+    )}
+  </>
+);
+
+/** The consent preview of a managed install: everything the plugin will contribute, before anything is written. */
+const PreviewConsent: React.FC<{
+  preview: AgentPluginInstallPreview;
+  selected: AgentPluginImportedComponents;
+  onSelect: (selection: AgentPluginImportedComponents) => void;
+  busy: boolean;
+  error: string | null;
+  onBack: () => void;
+  onInstall: () => void;
+  /**
+   * An entry preview replaces the marketplace list and unmounts the focused Preview button, so
+   * Back takes the focus (as the list's picked radio does on the way back).
+   */
+  focusBack: boolean;
+}> = (props) => (
+  <>
+    <PreviewHeader preview={props.preview} />
+
+    {props.preview.warnings.length > 0 && (
+      <div className="bg-warning/10 space-y-1 rounded-md px-3 py-2">
+        {props.preview.warnings.map((warning) => (
+          <div key={warning} className="text-warning flex items-start gap-2 text-xs">
+            <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span className="min-w-0 break-words">{warning}</span>
+          </div>
+        ))}
+      </div>
+    )}
+
+    <ComponentChooser
+      inventory={props.preview}
+      selected={props.selected}
+      disabled={props.busy}
+      onChange={props.onSelect}
+    />
+    <p className="text-warning text-xs">
+      {props.selected.skills.length + props.selected.mcpServers.length === 0
+        ? "No skills or MCP servers selected. "
+        : ""}
+      Selection does not affect agents, workflows, slash commands, or hooks below: these remain part
+      of the install, even when neither group is selected. Skipped files stay on disk; this is not a
+      filesystem sandbox.
+    </p>
+
+    <PreviewDisclosures preview={props.preview} />
+
+    {props.error && (
+      <div
+        role="alert"
+        className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
+      >
+        <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+        <span className="min-w-0 break-words">{props.error}</span>
+      </div>
+    )}
+
+    {/* A name collision blocks only this method; the Install as choice above stays usable. */}
+    {props.preview.installBlockedReason !== undefined && (
+      <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
+        <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+        <span className="min-w-0 break-words">
+          Xum cannot install this as {installMethodLabel(props.preview.method)}.{" "}
+          {props.preview.installBlockedReason}
+        </span>
+      </div>
+    )}
+
+    <div className="flex gap-2">
+      <Button
+        variant="ghost"
+        size="sm"
+        onClick={props.onBack}
+        disabled={props.busy}
+        autoFocus={props.focusBack}
+      >
+        <ArrowLeft className="h-3.5 w-3.5" />
+        Back
+      </Button>
+      <Button
+        size="sm"
+        onClick={props.onInstall}
+        disabled={props.busy || props.preview.installBlockedReason !== undefined}
+      >
+        {props.busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+        {props.busy ? "Installing…" : "Install"}
+      </Button>
+    </div>
+  </>
+);
+
+/** Agents, workflows, slash commands and hooks of a consent preview: the import choice does not cover them. */
+const PreviewDisclosures: React.FC<{ preview: AgentPluginInstallPreview }> = (props) => (
+  <>
+    {props.preview.agents.length > 0 && (
+      <div>
+        <h4 className="text-foreground mb-1 text-xs font-medium">
+          Agents ({props.preview.agents.length})
+        </h4>
+        {/* Activatable components: consent must name everything that
+            becomes available after install, not just skills/MCP. */}
+        <p className="text-xs">
+          <span className="text-foreground font-mono break-all">
+            {props.preview.agents.join(", ")}
+          </span>{" "}
+          <span className="text-muted">
+            — become agent definitions. An agent in Claude Code or Cursor format (no Xum-only field
+            such as base) becomes a hidden sub-agent with Exec&apos;s tools, narrowed only by its
+            Claude Code tools or disallowedTools list. Unless that list removes Bash, it can run
+            shell commands, which can change any file. readonly: true removes only the file edit and
+            task tools.
+          </span>
+        </p>
+      </div>
+    )}
+
+    {props.preview.workflows.length > 0 && (
+      <div>
+        <h4 className="text-foreground mb-1 text-xs font-medium">
+          Workflows ({props.preview.workflows.length})
+        </h4>
+        <p className="text-xs">
+          <span className="text-foreground font-mono break-all">
+            {props.preview.workflows.join(", ")}
+          </span>{" "}
+          <span className="text-muted">
+            — executable workflow scripts, invokable after install.
+          </span>
+        </p>
+      </div>
+    )}
+
+    {props.preview.slashCommands.length > 0 && (
+      <div>
+        <h4 className="text-foreground mb-1 text-xs font-medium">
+          Slash commands ({props.preview.slashCommands.length})
+        </h4>
+        <ul className="space-y-1">
+          {props.preview.slashCommands.map((command) => (
+            <li key={command.name} className="text-xs">
+              <span className="text-foreground font-mono">/{command.name}</span>
+              {command.description && <span className="text-muted"> — {command.description}</span>}
+            </li>
+          ))}
+        </ul>
+      </div>
+    )}
+
+    <ReviewedDefinitions items={props.preview.reviewedComponents} />
+
+    <CodexHooksDisclosure hooks={props.preview.codexHooks} />
+
+    {props.preview.hook && (
+      <div>
+        <h4 className="text-foreground mb-1 text-xs font-medium">Hooks</h4>
+        {/* Executable code that loads automatically: consent must say so. */}
+        <p className="text-xs">
+          <span className="text-foreground font-mono break-all">{props.preview.hook.path}</span>{" "}
+          <span className="text-muted">
+            — runs sandboxed on every agent request and can observe, rewrite, or block tool calls
+            {props.preview.hook.toolGrants.length > 0
+              ? ` for: ${props.preview.hook.toolGrants.join(", ")}`
+              : " (no tool visibility granted)"}
+            .
+          </span>
+        </p>
+      </div>
+    )}
+  </>
+);
 
 /** Inline uninstall confirmation (conditional rendering keeps this testable without portals). */
 const UninstallConfirm: React.FC<{
@@ -1134,7 +1368,7 @@ const UpdateReviewPanel: React.FC<{
           {props.review.warnings.map((warning) => (
             <div key={warning} className="text-warning flex items-start gap-2 text-xs">
               <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span className="break-words">{warning}</span>
+              <span className="min-w-0 break-words">{warning}</span>
             </div>
           ))}
         </div>
@@ -1244,7 +1478,7 @@ const PendingSignOutNotice: React.FC<{
       {status.kind === "broken" ? (
         <BrokenSignOutRecord reason={status.reason} onCleared={props.onCleared} />
       ) : (
-        <span className="space-y-1 break-words">
+        <span className="min-w-0 space-y-1 break-words">
           <span className="block">
             Managed plugins are unavailable to agents until Xum finishes signing out of a plugin MCP
             server whose sign-in changed in an update
@@ -1269,7 +1503,7 @@ const ComponentReviewNotice: React.FC<{ items: AgentPluginListItem[] | null }> =
       className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm"
     >
       <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-      <span className="break-words">
+      <span className="min-w-0 break-words">
         Some plugins have components (such as skills, MCP servers or workflow scripts) that you have
         not reviewed on this install. Xum loads a plugin component only after you approve its
         current version. A skill or workflow script that changed after you approved it keeps working
@@ -1451,6 +1685,13 @@ export const PluginsSettingsSection: React.FC = () => {
   const [componentsTarget, setComponentsTarget] = useState<string | null>(
     initialIntent?.type === "manage-components" ? initialIntent.name : null
   );
+  // Managed rows' "Manage components" buttons by plugin name: closing the panel (Escape, Cancel,
+  // Done) gives focus back to the button that opens it, not to the Settings dialog (#7122).
+  const manageButtons = useButtonsByName();
+  const closeComponents = (pluginName: string) => {
+    setComponentsTarget(null);
+    manageButtons.focus(pluginName);
+  };
   const [hooksTarget, setHooksTarget] = useState<string | null>(
     initialIntent?.type === "review-hooks" ? initialIntent.name : null
   );
@@ -1474,6 +1715,14 @@ export const PluginsSettingsSection: React.FC = () => {
     refresh: () => refresh(),
   });
 
+  // Install and Cancel unmount the Add plugin panel with the focused control in it. The Add plugin
+  // button comes back in its place and takes the focus, so it does not fall to the Settings
+  // dialog (#7121).
+  const addButtonFocus = useFocusOnNextMount();
+  const closeAddPanel = () => {
+    addButtonFocus.arm();
+    setAddOpen(false);
+  };
   const openAddPanel = () => {
     // Feedback belongs to the completed install, not the next attempt from any entry point.
     setInstallSucceeded(false);
@@ -1719,7 +1968,7 @@ export const PluginsSettingsSection: React.FC = () => {
               Check for updates
             </Button>
             {!addOpen && (
-              <Button size="sm" onClick={openAddPanel}>
+              <Button size="sm" onClick={openAddPanel} ref={addButtonFocus.ref}>
                 <Plus className="h-3.5 w-3.5" />
                 Add plugin
               </Button>
@@ -1731,12 +1980,12 @@ export const PluginsSettingsSection: React.FC = () => {
           <div className="mb-4">
             <AddPluginPanel
               onInstalled={() => {
-                setAddOpen(false);
+                closeAddPanel();
                 setInstallSucceeded(true);
                 void refresh();
                 void checkForUpdates();
               }}
-              onClose={() => setAddOpen(false)}
+              onClose={closeAddPanel}
             />
           </div>
         )}
@@ -1749,13 +1998,13 @@ export const PluginsSettingsSection: React.FC = () => {
         {error && (
           <div className="bg-destructive/10 text-destructive mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm">
             <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            <span className="break-words">{error}</span>
+            <span className="min-w-0 break-words">{error}</span>
           </div>
         )}
         {updateCheckError && (
           <div className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm">
             <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-            <span className="break-words">Update check failed: {updateCheckError}</span>
+            <span className="min-w-0 break-words">Update check failed: {updateCheckError}</span>
           </div>
         )}
 
@@ -1829,7 +2078,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       {check?.status === "error" && check.message && (
                         <p className="text-warning mt-0.5 flex items-start gap-1 text-[11px]">
                           <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />
-                          <span className="break-words">{check.message}</span>
+                          <span className="min-w-0 break-words">{check.message}</span>
                         </p>
                       )}
                     </div>
@@ -1848,6 +2097,7 @@ export const PluginsSettingsSection: React.FC = () => {
                             className="h-7 px-2 text-xs"
                             disabled={busyPlugin !== null}
                             onClick={() => setComponentsTarget(item.name)}
+                            ref={manageButtons.refFor(item.name)}
                             aria-label={`Manage components for ${item.name}`}
                           >
                             Manage components
@@ -1912,7 +2162,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       key={item.name}
                       name={item.name}
                       onSaved={refresh}
-                      onClose={() => setComponentsTarget(null)}
+                      onClose={() => closeComponents(item.name)}
                     />
                   )}
                   {item.managed && item.present && hooksTarget === item.name && (

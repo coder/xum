@@ -30,6 +30,7 @@ import type {
 import type { QuickJSRuntimeFactory } from "@/node/services/ptc/quickjsRuntime";
 import type { ToolBridge } from "@/node/services/ptc/toolBridge";
 import type { PTCExecutionResult } from "@/node/services/ptc/types";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import { sandboxHostService, type SandboxMount } from "@/node/services/sandbox/sandboxHostService";
 import { createRefinementRollbackTool } from "@/node/services/tools/refinement_rollback";
 import type { KernelFileLoader } from "@/node/services/tools/kernelFileLoad";
@@ -125,8 +126,14 @@ export interface ApplyToolPolicyAndExperimentsOptions {
    * kernelFileLoader backs mux.load (r12 bulk ingestion) — built by the
    * caller from the workspace cwd/runtime pair the file tools use; only
    * honored in kernel mode with file_read bridged.
+   * locks take refinement_rollback's rollback and target locks (phase 4: SessionLocks).
    */
-  sandbox?: { workspaceId: string; sessionDir: string; kernelFileLoader?: KernelFileLoader };
+  sandbox?: {
+    workspaceId: string;
+    sessionDir: string;
+    kernelFileLoader?: KernelFileLoader;
+    locks?: SessionLocks;
+  };
   /**
    * Capability grants for this assembly (registry-with-filters posture).
    * Omitted = session-scope full grants (identical to pre-grants behavior).
@@ -166,7 +173,7 @@ function refuseToolForAgent(
  * - Provider-executed tools (native web_search) and tools without a local
  *   execute never run the refusal.
  * - Memory's description carries the memory index, so an agent denied memory
- *   must not see it (intuition, which reads memory directly, follows memory).
+ *   must not see it.
  * - A refused tool_catalog_search would still make tool search defer the MCP
  *   tools (prepareToolSearch reads presence), and every search would then be
  *   refused, leaving those allowed tools unreachable.
@@ -223,6 +230,31 @@ function policyLeavesNoTools(tools: Record<string, Tool>, policy: ToolPolicy | u
   return (
     Object.keys(applyToolPolicy(tools, policy)).length === 0 &&
     applyToolPolicyToNames(["code_execution"], policy).length === 0
+  );
+}
+
+/**
+ * Whether policy lets the PTC branch run (#7028): the active policy must allow
+ * the code_execution name, so a deny stops PTC, allowlists that do not list it
+ * included ("allowlist" means [disable .*, enable ...]). A policy that leaves no
+ * tools at all (a no-tools contract such as compaction's `.*` disable) stops it
+ * too. Otherwise the model gets the policy-filtered flat tools.
+ *
+ * Even when another switchable agent allows code_execution, a refusing stub is
+ * no option: exclusive PTC moves every bridgeable tool behind code_execution, so
+ * the refusal would also hide the allowed ones. A switch between such agents
+ * changes the tool block (one cache miss), as an absent tool does (#5253).
+ *
+ * Only policy decides, never capability grants: a least-privilege grants ceiling
+ * stubs bridged tools but keeps code_execution as the entry point.
+ */
+function policyAllowsPtc(
+  tools: Record<string, Tool>,
+  activePolicy: ToolPolicy | undefined
+): boolean {
+  return (
+    !policyLeavesNoTools(tools, activePolicy) &&
+    applyToolPolicyToNames(["code_execution"], activePolicy).length > 0
   );
 }
 
@@ -302,19 +334,16 @@ export async function applyToolPolicyAndExperiments(
   // RLM rides the PTC parent flag: this flag is only read inside the PTC
   // branch below, so RLM alone (PTC off) is inert by construction.
   const rlmActive = experiments?.rlm === true;
-  // A policy that disables EVERY tool (e.g. auto-compaction's `.*` disable
-  // rule, inherited alongside the original send's experiment flags) is a
-  // no-tools contract: synthesizing code_execution anyway would hand that
-  // flow a tool it explicitly forbade. Checked on the PRE-grant policy
-  // result so a least-privilege grants ceiling (which stubs, not disables)
-  // keeps code_execution as the mandatory bridge entry point. The synthesized
-  // name is probed explicitly: an allowlist like [disable .*, enable
-  // code_execution] empties the base record yet clearly intends the exclusive
-  // entry point to exist, so the base-tool record alone cannot decide.
-  // The ACTIVE policy decides: the advertised union may hold refused tools.
+  // Policy decides whether PTC runs (see policyAllowsPtc): a policy that
+  // disables every tool (e.g. auto-compaction's `.*` disable rule, inherited
+  // alongside the original send's experiment flags) or denies the
+  // code_execution name gets the flat tools. Decided on policy, not on the
+  // grant-filtered tools, so a least-privilege grants ceiling (which stubs, not
+  // disables) keeps code_execution as the bridge entry point. The ACTIVE policy
+  // decides: the advertised union may hold refused tools.
   if (
     experiments?.programmaticToolCalling &&
-    !policyLeavesNoTools(allToolsWithExtra, effectiveToolPolicy)
+    policyAllowsPtc(allToolsWithExtra, effectiveToolPolicy)
   ) {
     try {
       // Lazy-load PTC modules only when experiments are enabled
@@ -406,9 +435,9 @@ export async function applyToolPolicyAndExperiments(
         }
       );
 
-      // code_execution is mandatory — it's the only way to use bridged
-      // tools. The experiment flag is the opt-in; policy cannot disable it here since
-      // that would leave no way to access tools. nonBridgeable is policy-filtered but
+      // code_execution is the only way to use bridged tools, so it exists
+      // whenever PTC runs; policy decides whether PTC runs (policyAllowsPtc,
+      // #7028). nonBridgeable is policy-filtered but
       // comes from the PRE-grant bridge input, so re-apply the grants ceiling here to
       // keep grant-denied non-bridgeable tools out of the model-visible set.
       const nonBridgeable = opts.capabilityGrants

@@ -1998,7 +1998,7 @@ describe("filterEmptyAssistantMessages", () => {
 });
 
 describe("injectPostCompactionAttachments", () => {
-  it("inserts after the compaction summary and enforces a size budget", () => {
+  it("inserts before the request after a compaction summary and enforces a size budget", () => {
     const messages: MuxMessage[] = [
       {
         id: "compaction-summary",
@@ -2047,98 +2047,34 @@ describe("injectPostCompactionAttachments", () => {
     expect(text).toContain("post-compaction context truncated");
   });
 
-  it("falls back to a legacy compacted summary when durable boundary metadata is missing", () => {
-    const messages: MuxMessage[] = [
-      {
-        id: "legacy-summary",
-        role: "assistant",
-        parts: [{ type: "text", text: "Legacy compacted summary" }],
-        metadata: {
-          timestamp: 1000,
-          compacted: true,
-        },
-      },
-      {
-        id: "assistant-1",
-        role: "assistant",
-        parts: [{ type: "text", text: "Assistant context after summary" }],
-        metadata: { timestamp: 1050 },
-      },
-      {
-        id: "user-1",
-        role: "user",
-        parts: [{ type: "text", text: "Continue" }],
-        metadata: { timestamp: 1100 },
-      },
-    ];
-
+  it("goes before the newest user message, past Token Budget warnings, or last without one", () => {
+    const row = (id: string, role: "user" | "assistant", extra = {}): MuxMessage => ({
+      id,
+      role,
+      parts: [{ type: "text", text: id }],
+      metadata: { timestamp: 1000, ...extra },
+    });
+    const warning = row("warning", "user", { muxMetadata: { type: "context-budget-warning" } });
     const attachments = [
       {
         type: "plan_file_reference" as const,
         planFilePath: "PLAN.md",
-        planContent: "Legacy plan",
+        planContent: "Plan",
       },
     ];
+    const ids = (messages: MuxMessage[]) =>
+      injectPostCompactionAttachments(messages, attachments).map((message) =>
+        message.metadata?.synthetic === true ? "attachments" : message.id
+      );
 
-    const result = injectPostCompactionAttachments(messages, attachments);
-
-    expect(result).toHaveLength(4);
-    expect(result[0].id).toBe("legacy-summary");
-
-    const injected = result[1];
-    expect(injected.metadata?.synthetic).toBe(true);
-    expect(injected.metadata?.timestamp).toBe(1000);
-    const text = (injected.parts[0] as { type: "text"; text: string }).text;
-    expect(text).toContain("<system-update>");
-
-    expect(result[2].id).toBe("assistant-1");
-    expect(result[3].id).toBe("user-1");
+    // Request-only and re-injected every few turns: the rows before the current request stay.
+    expect(
+      ids([row("user-1", "user"), row("assistant-1", "assistant"), row("user-2", "user"), warning])
+    ).toEqual(["user-1", "assistant-1", "attachments", "user-2", "warning"]);
+    expect(ids([row("assistant-1", "assistant")])).toEqual(["assistant-1", "attachments"]);
   });
 
-  it("appends at the end when no compaction indicators are present", () => {
-    const messages: MuxMessage[] = [
-      {
-        id: "user-1",
-        role: "user",
-        parts: [{ type: "text", text: "Initial question" }],
-        metadata: { timestamp: 1000 },
-      },
-      {
-        id: "assistant-1",
-        role: "assistant",
-        parts: [{ type: "text", text: "Initial response" }],
-        metadata: { timestamp: 1010 },
-      },
-      {
-        id: "user-2",
-        role: "user",
-        parts: [{ type: "text", text: "Follow-up" }],
-        metadata: { timestamp: 1020 },
-      },
-    ];
-
-    const attachments = [
-      {
-        type: "plan_file_reference" as const,
-        planFilePath: "PLAN.md",
-        planContent: "Fallback plan",
-      },
-    ];
-
-    const result = injectPostCompactionAttachments(messages, attachments);
-
-    expect(result).toHaveLength(4);
-    expect(result[0].id).toBe("user-1");
-    expect(result[1].id).toBe("assistant-1");
-    expect(result[2].id).toBe("user-2");
-
-    const appended = result[3];
-    expect(appended.metadata?.synthetic).toBe(true);
-    const text = (appended.parts[0] as { type: "text"; text: string }).text;
-    expect(text).toContain("<system-update>");
-  });
-
-  it("inserts after the latest compaction boundary when multiple summaries exist", () => {
+  it("inserts before the newest request when multiple summaries exist", () => {
     const messages: MuxMessage[] = [
       {
         id: "summary-1",

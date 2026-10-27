@@ -1,6 +1,8 @@
 // #5701: Escape did not close the tutorial bubble, and the bubble (with its spotlighted model
 // chip) drew on top of a Settings dialog opened while it showed. The bubble now sits under every
-// layer the user opens, owns focus while nothing covers it, and closes on its own Escape.
+// layer the user opens and closes on its own Escape. It takes focus only while nothing covers it
+// and no text field has it (#7114): the app opens on the creation form with the composer focused,
+// so each test clicks the bubble first, as a keyboard user would Tab to it.
 import type { Browser } from "@e2e-dev/web";
 import { test } from "@e2e-dev/web";
 import { expect } from "e2e";
@@ -46,6 +48,7 @@ test(
       await app.open();
       const title = screen.getByText(FIRST_STEP_TITLE, { exact: true });
       await expect(title).toBeVisible({ timeout: 15_000 });
+      await title.tap();
 
       await browser.keyboard.press("Escape");
       await expect(title).toBeHidden();
@@ -66,6 +69,8 @@ test(
       await app.open();
       const title = screen.getByText(FIRST_STEP_TITLE, { exact: true });
       await expect(title).toBeVisible({ timeout: 15_000 });
+      // Settings gives focus back to the bubble when it closes.
+      await title.tap();
 
       // The bug bash opened Settings with its shortcut and went to Agents (/settings/tasks).
       await browser.keyboard.press("Control+,");

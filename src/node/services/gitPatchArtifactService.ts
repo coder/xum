@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { isProjectTrustedIn } from "@/node/utils/projectTrust";
 import assert from "node:assert/strict";
 
 import type { Config, ProjectsConfig } from "@/node/config";
@@ -36,12 +37,15 @@ import { shellQuote } from "@/common/utils/shell";
 import { getErrorMessage } from "@/common/utils/errors";
 import { PlatformPaths } from "@/common/utils/paths";
 import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import {
   getWorkspaceProjectRepos,
   getWorkspaceProjectStorageKeys,
 } from "@/node/services/workspaceProjectRepos";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { taskGitPatchEngine } from "@/node/services/taskGitPatchEngine";
+// Outside the agent loop: GitPatchArtifactService passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /** Callback invoked after patch generation completes (success or failure). */
 export type OnPatchGenerationComplete = (childWorkspaceId: string) => Promise<void>;
@@ -100,6 +104,7 @@ async function resolveAgentEditingCapability(args: {
   discoveryContexts: readonly WorkspaceRuntimeContext[];
   agentId: string;
   workspaceId: string;
+  projectPluginsTrusted: boolean;
 }): Promise<{ editingCapable: boolean; projectScoped: boolean } | undefined> {
   const parsedAgentId = AgentIdSchema.safeParse(args.agentId);
   if (!parsedAgentId.success) {
@@ -113,7 +118,8 @@ async function resolveAgentEditingCapability(args: {
       const agentDefinition = await readAgentDefinition(
         discovery.runtime,
         discovery.workspacePath,
-        parsedAgentId.data
+        parsedAgentId.data,
+        { projectPluginsTrusted: args.projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
       );
       const chain = await resolveAgentInheritanceChain({
         runtime: discovery.runtime,
@@ -121,6 +127,8 @@ async function resolveAgentEditingCapability(args: {
         agentId: agentDefinition.id,
         agentDefinition,
         workspaceId: args.workspaceId,
+        projectPluginsTrusted: args.projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
 
       if (agentDefinition.scope === "project") {
@@ -314,7 +322,11 @@ export class GitPatchArtifactService {
   private readonly operationLocks = new MutexMap<string>();
   private readonly pendingJobsByTaskId = new Map<string, Promise<void>>();
 
-  constructor(private readonly config: Config) {}
+  constructor(
+    private readonly config: Config,
+    /** The workspace FIFO of the parent's patch artifact index writes (phase 4: SessionLocks). */
+    private readonly locks: SessionLocks
+  ) {}
 
   withOperationLock<T>(childWorkspaceId: string, operation: () => Promise<T>): Promise<T> {
     assert(childWorkspaceId.length > 0, "withOperationLock: childWorkspaceId must be non-empty");
@@ -387,14 +399,15 @@ export class GitPatchArtifactService {
     const cfg = options?.config ?? this.config.loadConfigOrDefault();
     const childEntry = findWorkspaceEntry(cfg, childWorkspaceId);
 
-    if (childEntry?.workspace.kind === "scratch") {
+    // No entry: no persisted agent id, so no patch (#6426 narrows it once for the trust read).
+    if (childEntry == null || childEntry.workspace.kind === "scratch") {
       return;
     }
 
     // Only exec-like subagents are expected to make commits that should be handed back to the parent.
     // NOTE: Custom agents can inherit from exec (base: exec). Those should also generate patches,
     // but read-only subagents (e.g. explore) should not.
-    const childAgentIds = resolvePersistedAgentIdCandidates(childEntry?.workspace);
+    const childAgentIds = resolvePersistedAgentIdCandidates(childEntry.workspace);
     if (childAgentIds.length === 0) {
       return;
     }
@@ -410,6 +423,8 @@ export class GitPatchArtifactService {
         discoveryContexts,
         agentId: childAgentId,
         workspaceId: childWorkspaceId,
+        // #6426: from the config loaded above (no extra read).
+        projectPluginsTrusted: isProjectTrustedIn(cfg.projects, childEntry.projectPath),
       });
       if (editingCapability == null) {
         continue;
@@ -418,7 +433,7 @@ export class GitPatchArtifactService {
       break;
     }
 
-    if (!shouldGeneratePatch || !childEntry) {
+    if (!shouldGeneratePatch) {
       return;
     }
 
@@ -445,6 +460,7 @@ export class GitPatchArtifactService {
 
     const artifact = await upsertSubagentGitPatchArtifact({
       workspaceId: parentWorkspaceId,
+      locks: this.locks,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childWorkspaceId,
       updater: (existing) => {
@@ -494,6 +510,7 @@ export class GitPatchArtifactService {
           try {
             await upsertSubagentGitPatchArtifact({
               workspaceId: parentWorkspaceId,
+              locks: this.locks,
               workspaceSessionDir: parentSessionDir,
               childTaskId: childWorkspaceId,
               updater: (existing) => {
@@ -528,6 +545,7 @@ export class GitPatchArtifactService {
     } catch (error: unknown) {
       await upsertSubagentGitPatchArtifact({
         workspaceId: parentWorkspaceId,
+        locks: this.locks,
         workspaceSessionDir: parentSessionDir,
         childTaskId: childWorkspaceId,
         updater: (existing) => {
@@ -580,6 +598,7 @@ export class GitPatchArtifactService {
     ): Promise<SubagentGitPatchArtifact> => {
       return await upsertSubagentGitPatchArtifact({
         workspaceId: parentWorkspaceId,
+        locks: this.locks,
         workspaceSessionDir: parentSessionDir,
         childTaskId: childWorkspaceId,
         updater,
@@ -696,6 +715,8 @@ export class GitPatchArtifactService {
       });
 
       const projectRepos = getWorkspaceProjectRepos({
+        // Outside the agent loop: the host's runtimes.
+        runtimeFactory: nodeRuntimeFactory,
         workspaceId: childWorkspaceId,
         workspaceName,
         workspacePath,

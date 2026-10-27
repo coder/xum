@@ -32,10 +32,12 @@ import {
   createTaskServiceHarness,
   flushTerminalAttentionDrains,
   registerLiveWorkspaceTurnHandle,
+  startLiveWorkspaceTurn,
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
   removeWorkspaceFromTestConfig,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -1108,13 +1110,12 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
       const manager = workspaceTurnManagerFor(taskService);
       if (later) {
-        await registerLiveWorkspaceTurnHandle(
-          taskService,
-          childId,
-          "wst_canceled_guidance",
-          parentId,
-          "reserved"
-        );
+        await startLiveWorkspaceTurn(taskService, config, {
+          ownerWorkspaceId: parentId,
+          workspaceId: childId,
+          handleId: "wst_canceled_guidance",
+          accept: false,
+        });
         const interrupt = manager.interruptWorkspaceTurn.bind(manager);
         spyOn(manager, "interruptWorkspaceTurn").mockImplementationOnce(async (...args) => {
           // A concurrent writer after stop's capture horizon must not lose its fresh GUID.
@@ -1521,6 +1522,7 @@ describe("TaskService", () => {
     );
     for (const child of children.filter((child) => child.id !== "missing-patch")) {
       await upsertSubagentGitPatchArtifact({
+        locks: nodeSessionLocks,
         workspaceId: parentId,
         workspaceSessionDir: path.join(config.sessionsDir, parentId),
         childTaskId: child.id!,
