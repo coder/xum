@@ -29,9 +29,10 @@ import {
  *   frame (focus then sits in it) made unreachable from the keyboard. It can turn annotate mode
  *   on, so the host honours it only during a live user gesture in this frame
  *   (hasLiveUserGesture, SandboxedArtifactFrame.tsx).
- * - Frame -> host: `{ type: "sidebarKey", chord, ctrlKey, metaKey }`, a right-sidebar chord
+ * - Frame -> host: `{ type: "sidebarKey", chord, ctrlKey, metaKey }`, an app chord
  *   (ARTIFACT_FRAME_CHORDS: KEYBINDS.TOGGLE_RIGHT_SIDEBAR or KEYBINDS.OPEN_ARTIFACTS_TAB, and from
- *   the main pane's status page only, KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW), which a click into
+ *   the main pane's status page only, KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW and
+ *   KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK), which a click into
  *   the frame also made unreachable: keys in the frame never reach the app's window listener.
  *   The host honours it only while the frame holds focus (SandboxedArtifactFrame.tsx).
  * - Frame -> host: `{ type: "interruptKey", keybind }`, a stream-interrupt key pressed in the
@@ -152,16 +153,25 @@ const ArtifactAnnotateMessageSchema = z
  * only holds focus while the Artifacts tab shows (user request: that key toggles the tab, from
  * anywhere in it). TOGGLE_AGENT_INTERFACE_VIEW switches the main pane between the status page
  * (a frame too) and the chat, so the advertised chord also leaves the page after a click in it;
- * from a frame it only ever switches to the chat (useMainPaneAgentInterfaceView). Only the status
- * page claims it (`forwardsViewSwitch`): it shows only while the switch exists, and in any other
- * frame a claimed chord could do nothing yet still keep the key from the page.
+ * from a frame it only ever switches to the chat (useMainPaneAgentInterfaceView).
+ * TOGGLE_STATUS_TRANSCRIPT_PEEK shows or hides the transcript rows under the status page's bar,
+ * which the page cannot read. Only the status page claims those two (STATUS_PAGE_FRAME_CHORDS,
+ * `forwardsViewSwitch`): it shows only while they work, and in any other frame a claimed chord
+ * could do nothing yet still keep the key from the page.
  */
 export const ARTIFACT_FRAME_CHORDS = {
   sidebar: KEYBINDS.TOGGLE_RIGHT_SIDEBAR,
   artifacts: KEYBINDS.OPEN_ARTIFACTS_TAB,
   agentInterface: KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW,
+  peek: KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK,
 } as const satisfies Record<string, Keybind>;
 export type ArtifactFrameChord = keyof typeof ARTIFACT_FRAME_CHORDS;
+
+/** The chords only the main pane's status page forwards, and the host takes from it only. */
+export const STATUS_PAGE_FRAME_CHORDS: ReadonlySet<ArtifactFrameChord> = new Set([
+  "agentInterface",
+  "peek",
+]);
 
 /**
  * A right-sidebar chord (ARTIFACT_FRAME_CHORDS) pressed inside the frame, with the modifiers the
@@ -173,7 +183,7 @@ const ArtifactSidebarKeyMessageSchema = z
     ...bridgeEnvelope,
     type: z.literal("sidebarKey"),
     // The host indexes ARTIFACT_FRAME_CHORDS with it, so a name without a keybind fails typecheck.
-    chord: z.enum(["sidebar", "artifacts", "agentInterface"]),
+    chord: z.enum(["sidebar", "artifacts", "agentInterface", "peek"]),
     ctrlKey: z.boolean(),
     metaKey: z.boolean(),
   })
@@ -672,41 +682,47 @@ const INTERRUPT_KEY_LISTENER = `
     }, 0);
   });`;
 
-/**
- * A forwarded chord's key, lowercased. The shim checks only a Ctrl (Cmd on macOS) plus Shift chord
- * of one key, so another keybind shape turns forwarding off (null), like plainSingleKey. The shim
- * tests send the keybind's key.
- */
-function ctrlShiftKey(keybind: Keybind): string | null {
-  const chord =
-    keybind.key.length === 1 &&
-    keybind.code == null &&
+/** The modifiers the shim checks: Ctrl (Cmd on macOS) plus Shift, with or without Alt. */
+function hasFrameChordModifiers(keybind: Keybind): boolean {
+  return (
     keybind.ctrl === true &&
     keybind.shift === true &&
-    keybind.macCtrlBehavior !== "control" &&
-    !keybind.alt &&
-    !keybind.meta;
-  return chord ? keybind.key.toLowerCase() : null;
+    keybind.meta !== true &&
+    keybind.macCtrlBehavior !== "control"
+  );
 }
 
-/** Lowercased key -> chord name, for the chords this frame forwards. */
+/**
+ * A forwarded chord's id in the shim: its one key, lowercased, or with Alt its physical key
+ * ("Alt+KeyP"), since Option changes the key on macOS (Option+Shift+P types ∏). Another keybind
+ * shape turns forwarding off (null), like plainSingleKey. The shim tests send the keybind's key
+ * and code.
+ */
+function frameChordId(keybind: Keybind): string | null {
+  if (!hasFrameChordModifiers(keybind)) return null;
+  if (keybind.alt === true) return keybind.code == null ? null : `Alt+${keybind.code}`;
+  return keybind.key.length === 1 && keybind.code == null ? keybind.key.toLowerCase() : null;
+}
+
+/** Chord id (frameChordId) -> chord name, for the chords this frame forwards. */
 function frameChordKeys(forwardsViewSwitch: boolean): Record<string, ArtifactFrameChord> {
   const keys: Record<string, ArtifactFrameChord> = {};
   for (const chord of Object.keys(ARTIFACT_FRAME_CHORDS) as ArtifactFrameChord[]) {
-    if (chord === "agentInterface" && !forwardsViewSwitch) continue;
-    const key = ctrlShiftKey(ARTIFACT_FRAME_CHORDS[chord]);
-    if (key != null) keys[key] = chord;
+    if (STATUS_PAGE_FRAME_CHORDS.has(chord) && !forwardsViewSwitch) continue;
+    const id = frameChordId(ARTIFACT_FRAME_CHORDS[chord]);
+    if (id != null) keys[id] = chord;
   }
   return keys;
 }
 
 /**
- * The right-sidebar chords, with this platform's modifier as matchesKeybind reads the keybind: on
+ * The forwarded chords, with this platform's modifier as matchesKeybind reads the keybind: on
  * macOS only Cmd (Ctrl may be held too), elsewhere only Ctrl. A keybind that also takes Ctrl on
  * macOS (OPEN_ARTIFACTS_TAB) is forwarded in its Cmd form only. The shim claims nothing else, so
  * the other form of each chord stays the artifact's. The host matches the keybind again (it
  * decides). No editable exclusion: the chords type nothing, and the host's own handlers work from
- * the chat input too. Built per frame: isMac() needs the window.
+ * the chat input too. AltGr reads as Ctrl+Alt and types text, so it stays the page's (as
+ * isAltGraphPressed keeps it out of the host's chords). Built per frame: isMac() needs the window.
  */
 function sidebarKeyListener(forwardsViewSwitch: boolean): string {
   const chordKeys = frameChordKeys(forwardsViewSwitch);
@@ -714,16 +730,20 @@ function sidebarKeyListener(forwardsViewSwitch: boolean): string {
   const modifier = isMac() ? "event.metaKey" : "event.ctrlKey && !event.metaKey";
   return `
   var chordKeys = ${JSON.stringify(chordKeys)};
+  function chordId(event) {
+    if (!event.altKey) return typeof event.key === "string" ? event.key.toLowerCase() : null;
+    if (typeof event.getModifierState === "function" && event.getModifierState("AltGraph")) return null;
+    return typeof event.code === "string" ? "Alt+" + event.code : null;
+  }
   window.addEventListener("keydown", function (event) {
     // A held key would flip the sidebar on every repeat and spend the frame's message budget.
-    if (event.repeat || event.altKey || !event.shiftKey || !(${modifier})) return;
-    if (typeof event.key !== "string") return;
-    var key = event.key.toLowerCase();
+    if (event.repeat || !event.shiftKey || !(${modifier})) return;
+    var id = chordId(event);
     // Own keys only: "constructor" and the like are on every object's prototype.
-    if (!Object.prototype.hasOwnProperty.call(chordKeys, key)) return;
+    if (id === null || !Object.prototype.hasOwnProperty.call(chordKeys, id)) return;
     // Claimed like the host claims it: in a browser, Chrome binds Ctrl+Shift+B to its bookmarks bar.
     event.preventDefault();
-    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "sidebarKey", chord: chordKeys[key], ctrlKey: event.ctrlKey, metaKey: event.metaKey }, "*");
+    host.postMessage({ xumArtifact: ${ARTIFACT_BRIDGE_VERSION}, type: "sidebarKey", chord: chordKeys[id], ctrlKey: event.ctrlKey, metaKey: event.metaKey }, "*");
   }, true);`;
 }
 
@@ -733,7 +753,7 @@ export function buildArtifactBridgeScript(
   initialAppearance: ArtifactAppearance | null = null,
   /** The page has no styles of its own (isUnstyledHtmlDocument): it takes the theme's scheme. */
   followColorScheme = false,
-  /** The main pane's status page: it also forwards the view switch (ARTIFACT_FRAME_CHORDS). */
+  /** The main pane's status page: it also forwards its own chords (STATUS_PAGE_FRAME_CHORDS). */
   forwardsViewSwitch = false
 ): string {
   return `(function () {

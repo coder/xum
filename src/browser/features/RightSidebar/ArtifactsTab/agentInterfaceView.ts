@@ -4,6 +4,7 @@ import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { isAbortError } from "@/browser/utils/isAbortError";
 import {
+  isCommandPaletteTarget,
   isDesktopViewportFocused,
   isDialogOpen,
   isTerminalFocused,
@@ -374,7 +375,15 @@ export function useMainPaneAgentInterfaceView(workspaceId: string): AgentInterfa
   return available ? view : null;
 }
 
-/** Dialogs, terminals and remote desktops keep their keystrokes, as for the Artifacts chord. */
-function isShortcutOwnedElsewhere(e: KeyboardEvent): boolean {
-  return isDialogOpen() || isTerminalFocused(e.target) || isDesktopViewportFocused(e.target);
+/**
+ * Dialogs, the command palette, terminals and remote desktops keep their keystrokes, as for the
+ * Artifacts chord. isDialogOpen() does not see the palette: cmdk renders no modal overlay.
+ */
+export function isShortcutOwnedElsewhere(e: KeyboardEvent): boolean {
+  return (
+    isDialogOpen() ||
+    isCommandPaletteTarget(e.target) ||
+    isTerminalFocused(e.target) ||
+    isDesktopViewportFocused(e.target)
+  );
 }

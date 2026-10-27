@@ -124,6 +124,10 @@ function runBridgeScript(
       ctrlKey?: boolean;
       metaKey?: boolean;
       altKey?: boolean;
+      /** The physical key, KeyboardEvent.code. */
+      code?: string;
+      /** AltGr is down: getModifierState("AltGraph"). */
+      altGraph?: boolean;
       repeat?: boolean;
       defaultPrevented?: boolean;
       composedPath?: unknown[];
@@ -146,6 +150,8 @@ function runBridgeScript(
       repeat: extra.repeat ?? false,
       metaKey: extra.metaKey ?? false,
       altKey: extra.altKey ?? false,
+      code: extra.code ?? "",
+      getModifierState: (modifier: string) => modifier === "AltGraph" && extra.altGraph === true,
       defaultPrevented: false,
       preventDefault: () => {
         prevented += 1;
@@ -262,27 +268,48 @@ describe("bridge script keys", () => {
     expect(bridge.prevented()).toBe(1);
   });
 
-  test("only the main pane's status page claims the view switch chord", () => {
+  test("only the main pane's status page claims the view switch and transcript peek chords", () => {
     const key = KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW.key;
-    // Any other frame may show while no switch exists: the chord stays the artifact's.
+    const peek = KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK;
+    const pressPeek = (bridge: ReturnType<typeof runBridgeScript>) =>
+      bridge.keydown(peek.key, div, true, { ctrlKey: true, altKey: true, code: peek.code });
+    // Any other frame may show while no switch exists: the chords stay the artifact's.
     const elsewhere = runBridgeScript();
     elsewhere.keydown(key, div, true, { ctrlKey: true });
+    pressPeek(elsewhere);
     expect(elsewhere.posted).toEqual([]);
     expect(elsewhere.prevented()).toBe(0);
 
     // The status page shows only while the switch exists: it must work after a click in it.
     const statusPage = runBridgeScript({ forwardsViewSwitch: true });
     statusPage.keydown(key, div, true, { ctrlKey: true });
+    pressPeek(statusPage);
+    const posted = { xumArtifact: 1, type: "sidebarKey", ctrlKey: true, metaKey: false };
     expect(statusPage.posted).toEqual([
-      {
-        xumArtifact: 1,
-        type: "sidebarKey",
-        chord: "agentInterface",
-        ctrlKey: true,
-        metaKey: false,
-      },
+      { ...posted, chord: "agentInterface" },
+      { ...posted, chord: "peek" },
     ]);
-    expect(statusPage.prevented()).toBe(1);
+    expect(statusPage.prevented()).toBe(2);
+  });
+
+  test("the peek chord matches the physical key, and AltGr and Start here stay the page's", () => {
+    const peek = KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK;
+    const statusPage = runBridgeScript({ forwardsViewSwitch: true });
+    const chord = { ctrlKey: true, altKey: true, code: peek.code };
+    // Shift+AltGr+P types Ö on US-International: AltGr reads as Ctrl+Alt.
+    statusPage.keydown("Ö", input, true, { ...chord, altGraph: true });
+    // Without Alt it is the command palette's chord, which no frame forwards.
+    statusPage.keydown(peek.key, div, true, { ctrlKey: true, code: peek.code });
+    // Start here would open its confirmation under the user's typing in the page.
+    const startHere = KEYBINDS.STATUS_START_HERE;
+    statusPage.keydown(startHere.key, div, true, { ...chord, code: startHere.code });
+    expect(statusPage.posted).toEqual([]);
+    expect(statusPage.prevented()).toBe(0);
+    // Whatever character the layout gives the key.
+    statusPage.keydown("π", div, true, chord);
+    expect(statusPage.posted).toEqual([
+      { xumArtifact: 1, type: "sidebarKey", chord: "peek", ctrlKey: true, metaKey: false },
+    ]);
   });
 
   test("on macOS the right-sidebar chord is Cmd, and Ctrl stays the artifact's", () => {
@@ -306,6 +333,13 @@ describe("bridge script keys", () => {
         { xumArtifact: 1, type: "sidebarKey", chord: "artifacts", ctrlKey: false, metaKey: true },
       ]);
       expect(bridge.prevented()).toBe(2);
+      // Option changes the key (Option+Shift+P types ∏): the peek chord matches the physical key.
+      const statusPage = runBridgeScript({ forwardsViewSwitch: true });
+      const peekCode = KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK.code;
+      statusPage.keydown("∏", div, true, { metaKey: true, altKey: true, code: peekCode });
+      expect(statusPage.posted).toEqual([
+        { xumArtifact: 1, type: "sidebarKey", chord: "peek", ctrlKey: false, metaKey: true },
+      ]);
     } finally {
       global.window = saved;
     }
@@ -531,7 +565,7 @@ describe("sidebarKey messages", () => {
       metaKey: false,
     } as const;
     expect(accept(sidebarKey)).toEqual(sidebarKey);
-    for (const chord of ["artifacts", "agentInterface"] as const) {
+    for (const chord of ["artifacts", "agentInterface", "peek"] as const) {
       expect(accept({ ...sidebarKey, chord })).toEqual({ ...sidebarKey, chord });
     }
     for (const data of [

@@ -25,6 +25,7 @@ import {
   createBridgeRateLimiter,
   postArtifactAnnotateMode,
   postArtifactTheme,
+  STATUS_PAGE_FRAME_CHORDS,
   type ArtifactAppearance,
   type ArtifactFrameChord,
   type ArtifactFrameInterruptKey,
@@ -99,10 +100,11 @@ function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
 /**
  * Replays a chord pressed inside `frame` as a keydown on the frame element, so the app's one
  * handler for it applies its own rules: WorkspaceShell's useRightSidebarToggleKey for
- * TOGGLE_RIGHT_SIDEBAR, useArtifactsTabKey for OPEN_ARTIFACTS_TAB, the main pane's Agent interface
- * view handler for TOGGLE_AGENT_INTERFACE_VIEW (from the main pane's status page only, the one
- * frame that forwards it). All keep the dialog block (Artifacts fullscreen is a modal dialog); the
- * sidebar ones also move focus to the toggle after a collapse.
+ * TOGGLE_RIGHT_SIDEBAR, useArtifactsTabKey for OPEN_ARTIFACTS_TAB, and from the main pane's status
+ * page only (the one frame that forwards them), the main pane's Agent interface view handler for
+ * TOGGLE_AGENT_INTERFACE_VIEW and the status bar's for TOGGLE_STATUS_TRANSCRIPT_PEEK. All keep the
+ * dialog block (Artifacts fullscreen is a modal dialog); the sidebar ones also move focus to the
+ * toggle after a collapse.
  *
  * SECURITY AUDIT: the artifact's script can post the message without a key press, and can move
  * focus into its own frame with window.focus(). The host honours it only during the user's own
@@ -154,6 +156,9 @@ function replayKeybindOnFrame(
   if (!hasLiveUserGesture(frame) || frame == null) return;
   const event = new KeyboardEvent("keydown", {
     key: keybind.key,
+    // matchesKeybind compares the physical key when the keybind names one.
+    code: keybind.code,
+    altKey: keybind.alt === true,
     ...modifiers,
     bubbles: true,
     cancelable: true,
@@ -196,8 +201,13 @@ function handleFrameKeyMessage(
   }
 ): void {
   if (message.type === "sidebarKey") {
-    // Any other frame's shim never forwards the view switch: its page's own script posted it.
-    if (message.chord === "agentInterface" && handlers.mainPaneInterruptKey === undefined) return;
+    // Any other frame's shim never forwards these: its page's own script posted it.
+    if (
+      STATUS_PAGE_FRAME_CHORDS.has(message.chord) &&
+      handlers.mainPaneInterruptKey === undefined
+    ) {
+      return;
+    }
     replayFrameSidebarKey(frame, message);
     return;
   }
