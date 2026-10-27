@@ -16,7 +16,9 @@ import {
   deriveLastMessageReceipt,
   deriveStatusActivity,
   findStartHereSource,
+  isTurnActive,
   recentTranscriptRows,
+  type LastMessageReceipt,
   type LastMessageReceiptState,
   type StatusActivity,
 } from "./agentInterfaceStatusBar";
@@ -206,7 +208,6 @@ function StatusBar(props: { workspaceId: string; state: WorkspaceState }) {
   const { state } = props;
   const panelId = useId();
   const [peekOpen, setPeekOpen] = usePersistedState(AGENT_INTERFACE_TRANSCRIPT_PEEK_KEY, false);
-
   const activity = deriveStatusActivity(state.messages, {
     canInterrupt: state.canInterrupt,
     isStreamStarting: state.isStreamStarting,
@@ -215,15 +216,6 @@ function StatusBar(props: { workspaceId: string; state: WorkspaceState }) {
     runtimeDetail: state.runtimeStatus?.detail,
   });
   const receipt = deriveLastMessageReceipt(state.messages, state.queuedMessage, state.heldInputs);
-  const source = findStartHereSource(state.messages);
-  const turnActive = state.canInterrupt || state.isStreamStarting || state.isCompacting;
-
-  // No eligible reply counts as compacted, which keeps the hook's modal from opening.
-  const startHere = useStartHere(props.workspaceId, source?.content ?? "", source == null, {
-    // Preserve legacy plan/exec markers so Start Here keeps plan→exec handoff for old history.
-    sourceAgentId: source?.agentId ?? source?.mode,
-  });
-  const startHereDisabled = startHere.disabled || turnActive;
 
   return (
     <>
@@ -232,23 +224,7 @@ function StatusBar(props: { workspaceId: string; state: WorkspaceState }) {
         className="border-border-light bg-surface-secondary shrink-0 border-b text-[11px]"
       >
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-3 py-1">
-          <div
-            role="status"
-            aria-live="polite"
-            data-testid="agent-interface-status-activity"
-            className="flex min-w-0 flex-[1_1_12rem] items-center gap-1.5"
-          >
-            <ActivityIcon activity={activity} />
-            <span className="min-w-0 truncate">
-              <span className="text-foreground font-medium">{activity.label}</span>
-              {activity.detail != null && (
-                <span className="text-muted">
-                  {" · "}
-                  {activity.detail}
-                </span>
-              )}
-            </span>
-          </div>
+          <ActivityLine activity={activity} />
           <div className="flex shrink-0 items-center gap-1">
             <button
               type="button"
@@ -259,45 +235,96 @@ function StatusBar(props: { workspaceId: string; state: WorkspaceState }) {
             >
               {peekOpen ? "Hide transcript" : "Show transcript"}
             </button>
-            <TooltipIfPresent
-              tooltip="Start a new context from the agent's last reply and keep earlier history"
-              side="bottom"
-              align="end"
-            >
-              <button
-                type="button"
-                disabled={startHereDisabled}
-                onClick={startHere.openModal}
-                className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-6 items-center gap-1 rounded px-1.5 focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-50"
-              >
-                <ListStart aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
-                Start here
-              </button>
-            </TooltipIfPresent>
+            <StartHereButton
+              workspaceId={props.workspaceId}
+              messages={state.messages}
+              turnActive={isTurnActive(activity)}
+            />
           </div>
         </div>
-        {receipt != null && (
-          <div
-            data-testid="agent-interface-status-receipt"
-            className="flex min-w-0 items-center gap-2 px-3 pb-1"
-          >
-            <span className="text-muted shrink-0">Last message</span>
-            <span className="min-w-0 flex-1 truncate">{receipt.preview}</span>
-            <span className={cn("shrink-0 font-medium", RECEIPT_CHIPS[receipt.state].className)}>
-              {RECEIPT_CHIPS[receipt.state].label}
-              {receipt.state === "in-transcript" && receipt.timestamp != null && (
-                <span className="text-muted counter-nums font-normal">
-                  {" · "}
-                  {formatRelativeTime(receipt.timestamp)}
-                </span>
-              )}
-            </span>
-          </div>
-        )}
+        {receipt != null && <ReceiptRow receipt={receipt} />}
       </div>
       {peekOpen && <TranscriptPeek id={panelId} messages={state.messages} />}
+    </>
+  );
+}
+
+function ActivityLine(props: { activity: StatusActivity }) {
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      data-testid="agent-interface-status-activity"
+      className="flex min-w-0 flex-[1_1_12rem] items-center gap-1.5"
+    >
+      <ActivityIcon activity={props.activity} />
+      <span className="min-w-0 truncate">
+        <span className="text-foreground font-medium">{props.activity.label}</span>
+        {props.activity.detail != null && (
+          <span className="text-muted">
+            {" · "}
+            {props.activity.detail}
+          </span>
+        )}
+      </span>
+    </div>
+  );
+}
+
+/** Start Here from the agent's last reply, as on the reply in the chat; off while a turn runs. */
+function StartHereButton(props: {
+  workspaceId: string;
+  messages: WorkspaceState["messages"];
+  turnActive: boolean;
+}) {
+  const source = findStartHereSource(props.messages);
+  // No eligible reply counts as compacted, which keeps the hook's modal from opening.
+  const startHere = useStartHere(props.workspaceId, source?.content ?? "", source == null, {
+    // Preserve legacy plan/exec markers so Start Here keeps plan→exec handoff for old history.
+    sourceAgentId: source?.agentId ?? source?.mode,
+  });
+  return (
+    <>
+      <TooltipIfPresent
+        tooltip="Start a new context from the agent's last reply and keep earlier history"
+        side="bottom"
+        align="end"
+      >
+        <button
+          type="button"
+          disabled={startHere.disabled || props.turnActive}
+          onClick={startHere.openModal}
+          className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent flex h-6 items-center gap-1 rounded px-1.5 focus-visible:ring-1 disabled:pointer-events-none disabled:opacity-50"
+        >
+          <ListStart aria-hidden="true" className="h-3.5 w-3.5 shrink-0" />
+          Start here
+        </button>
+      </TooltipIfPresent>
       {startHere.modal}
     </>
+  );
+}
+
+function ReceiptRow(props: { receipt: LastMessageReceipt }) {
+  const { receipt } = props;
+  const chip = RECEIPT_CHIPS[receipt.state];
+  return (
+    <div
+      data-testid="agent-interface-status-receipt"
+      className="flex min-w-0 items-center gap-2 px-3 pb-1"
+    >
+      <span className="text-muted shrink-0">Last message</span>
+      <span className="min-w-0 flex-1 truncate">{receipt.preview}</span>
+      <span className={cn("shrink-0 font-medium", chip.className)}>
+        {chip.label}
+        {receipt.state === "in-transcript" && receipt.timestamp != null && (
+          <span className="text-muted counter-nums font-normal">
+            {" · "}
+            {formatRelativeTime(receipt.timestamp)}
+          </span>
+        )}
+      </span>
+    </div>
   );
 }
 

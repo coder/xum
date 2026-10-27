@@ -49,11 +49,39 @@ export interface StatusActivityFlags {
   runtimeDetail?: string | null;
 }
 
+type DisplayedTool = Extract<DisplayedMessage, { type: "tool" }>;
+
+function isRunningTool(message: DisplayedMessage): message is DisplayedTool {
+  return (
+    message.type === "tool" && (message.status === "pending" || message.status === "executing")
+  );
+}
+
+function isStreamingRow(message: DisplayedMessage, type: "reasoning" | "assistant"): boolean {
+  return message.type === type && message.isStreaming;
+}
+
 /**
- * What the agent is doing right now. While a turn streams, the current turn's rows (after the
- * last user row) decide: a running tool call beats streaming reasoning, which beats reply text,
- * so a turn that runs parallel tools keeps naming a tool while one still runs.
+ * The streaming turn's rows (after the last user row) decide: a running tool call beats
+ * streaming reasoning, which beats reply text, so a turn that runs parallel tools keeps naming a
+ * tool while one still runs.
  */
+function streamingActivity(messages: readonly DisplayedMessage[]): StatusActivity {
+  const turn = messages.slice(messages.findLastIndex((message) => message.type === "user") + 1);
+  const tool = turn.findLast(isRunningTool);
+  if (tool != null) {
+    return { kind: "tool", label: `Running ${tool.toolName}`, detail: toolCallDetail(tool.args) };
+  }
+  if (turn.some((message) => isStreamingRow(message, "reasoning"))) {
+    return { kind: "thinking", label: "Thinking…" };
+  }
+  if (turn.some((message) => isStreamingRow(message, "assistant"))) {
+    return { kind: "writing", label: "Writing a reply…" };
+  }
+  return { kind: "working", label: "Working…" };
+}
+
+/** What the agent is doing right now. */
 export function deriveStatusActivity(
   messages: readonly DisplayedMessage[],
   flags: StatusActivityFlags
@@ -63,33 +91,15 @@ export function deriveStatusActivity(
   }
   if (flags.isCompacting) return { kind: "compacting", label: "Compacting context…" };
   if (flags.awaitingUserQuestion) return { kind: "question", label: "Waiting for your answer" };
-  if (!flags.canInterrupt) {
-    return messages.at(-1)?.type === "stream-error"
-      ? { kind: "error", label: "Stopped with an error" }
-      : { kind: "idle", label: "Idle" };
-  }
+  if (flags.canInterrupt) return streamingActivity(messages);
+  return messages.at(-1)?.type === "stream-error"
+    ? { kind: "error", label: "Stopped with an error" }
+    : { kind: "idle", label: "Idle" };
+}
 
-  let thinking = false;
-  let writing = false;
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index];
-    if (message.type === "user") break;
-    if (
-      message.type === "tool" &&
-      (message.status === "pending" || message.status === "executing")
-    ) {
-      return {
-        kind: "tool",
-        label: `Running ${message.toolName}`,
-        detail: toolCallDetail(message.args),
-      };
-    }
-    if (message.type === "reasoning" && message.isStreaming) thinking = true;
-    if (message.type === "assistant" && message.isStreaming) writing = true;
-  }
-  if (thinking) return { kind: "thinking", label: "Thinking…" };
-  if (writing) return { kind: "writing", label: "Writing a reply…" };
-  return { kind: "working", label: "Working…" };
+/** Whether a turn is still running: every activity but idle and a stopped stream. */
+export function isTurnActive(activity: StatusActivity): boolean {
+  return activity.kind !== "idle" && activity.kind !== "error";
 }
 
 /** A user row the human typed, not a machine turn (wakes, continuations, peer triggers, warnings). */
@@ -160,47 +170,65 @@ export interface RecentTranscriptRow {
   preview: string;
 }
 
+type RowBuilders = {
+  [Type in DisplayedMessage["type"]]: (
+    message: Extract<DisplayedMessage, { type: Type }>
+  ) => RecentTranscriptRow | null;
+};
+
+/** One line per row type; rows with nothing to read (hidden counts, init logs) get none. */
+const ROW_BUILDERS: RowBuilders = {
+  user: (message) => ({
+    id: message.id,
+    kind: "user",
+    // Machine-authored user rows (wakes, continuations) are Xum's, not the user's.
+    label: isHumanUserMessage(message) ? "You" : "Xum",
+    preview: oneLine(message.content),
+  }),
+  assistant: (message) => ({
+    id: message.id,
+    kind: "assistant",
+    label: "Agent",
+    preview: oneLine(message.content),
+  }),
+  tool: (message) => ({
+    id: message.id,
+    kind: "tool",
+    label: `${message.toolName} (${message.status})`,
+    preview: toolCallDetail(message.args) ?? "",
+  }),
+  reasoning: (message) => ({
+    id: message.id,
+    kind: "reasoning",
+    label: "Thinking",
+    preview: oneLine(message.content),
+  }),
+  "stream-error": (message) => ({
+    id: message.id,
+    kind: "error",
+    label: "Error",
+    preview: oneLine(message.error),
+  }),
+  "plan-display": (message) => ({
+    id: message.id,
+    kind: "plan",
+    label: "Plan",
+    preview: oneLine(message.content),
+  }),
+  "compaction-boundary": (message) => ({
+    id: message.id,
+    kind: "boundary",
+    label: "Context reset",
+    preview: "",
+  }),
+  "history-hidden": () => null,
+  "workspace-init": () => null,
+};
+
 function transcriptRow(message: DisplayedMessage): RecentTranscriptRow | null {
-  switch (message.type) {
-    case "user":
-      return {
-        id: message.id,
-        kind: "user",
-        // Machine-authored user rows (wakes, continuations) are Xum's, not the user's.
-        label: isHumanUserMessage(message) ? "You" : "Xum",
-        preview: oneLine(message.content),
-      };
-    case "assistant":
-      return {
-        id: message.id,
-        kind: "assistant",
-        label: "Agent",
-        preview: oneLine(message.content),
-      };
-    case "tool":
-      return {
-        id: message.id,
-        kind: "tool",
-        label: `${message.toolName} (${message.status})`,
-        preview: toolCallDetail(message.args) ?? "",
-      };
-    case "reasoning":
-      return {
-        id: message.id,
-        kind: "reasoning",
-        label: "Thinking",
-        preview: oneLine(message.content),
-      };
-    case "stream-error":
-      return { id: message.id, kind: "error", label: "Error", preview: oneLine(message.error) };
-    case "plan-display":
-      return { id: message.id, kind: "plan", label: "Plan", preview: oneLine(message.content) };
-    case "compaction-boundary":
-      return { id: message.id, kind: "boundary", label: "Context reset", preview: "" };
-    case "history-hidden":
-    case "workspace-init":
-      return null;
-  }
+  // TypeScript cannot pair a union-keyed builder with its own variant; the mapped type does.
+  const build = ROW_BUILDERS[message.type] as (row: DisplayedMessage) => RecentTranscriptRow | null;
+  return build(message);
 }
 
 /** The newest `limit` transcript rows worth a line in the peek, oldest first. */
