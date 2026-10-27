@@ -470,7 +470,9 @@ async function assertSheetTouchTargets(page: StoryPage) {
       for (const target of targets) {
         const box = await target.boundingBox();
         const name = `${size.width}px ${(await target.textContent())?.trim() || "Close"}`;
-        const clipped = await target.evaluate((element) => element.scrollWidth > element.clientWidth);
+        const clipped = await target.evaluate(
+          (element) => element.scrollWidth > element.clientWidth
+        );
         if (!box) problems.push(`${name}: missing`);
         else if (box.height < 44) problems.push(`${name}: ${Math.round(box.height)}px tall`);
         else if (clipped) problems.push(`${name}: label cut`);
@@ -492,6 +494,7 @@ async function assertSheetTouchTargets(page: StoryPage) {
 const PHONE_VIEWPORT_STORIES = new Map([
   ["app-composeractivityline--worst-case-phone", { width: 375, height: 667 }],
   ["app-waitingonyou--phone", { width: 390, height: 844 }],
+  ["app-waitingonyou--phone-count-change-keeps-typing", { width: 390, height: 844 }],
 ]);
 const viewportsToRestore = new WeakMap<object, { width: number; height: number }>();
 

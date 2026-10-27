@@ -349,5 +349,23 @@ describe("Waiting on you", () => {
       expect(within(sheet).getByRole("button", { name: "unsent 0" })).not.toBeNull();
       expect(sheet.contains(document.activeElement)).toBe(true);
     });
+
+    it("puts the item on show back inline, same node and focus, when only one is left", () => {
+      const view = render(<Stack question unsent />);
+      const summary = view.getByRole("button", { name: /Which reviewers\?/ });
+      // As a click does; happy-dom moves focus to <body> on body.focus(), which browsers ignore.
+      summary.focus();
+      fireEvent.click(summary);
+      const sheet = view.getByRole("dialog", { name: /Waiting on you/ });
+      const question = within(sheet).getByRole("button", { name: "question 0" });
+      question.focus();
+
+      view.rerender(<Stack question />);
+      expect(view.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull();
+      expect(view.getByRole("button", { name: "question 0" }) === question).toBe(true);
+      expect(isShown(question)).toBe(true);
+      // The sheet kept the page inert up to that commit: an inert element cannot take focus.
+      expect(document.activeElement === question).toBe(true);
+    });
   });
 });

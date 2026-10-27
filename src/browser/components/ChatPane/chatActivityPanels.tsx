@@ -9,7 +9,7 @@ import {
   type RefObject,
 } from "react";
 import { useNarrowViewport, useShortViewport } from "@/browser/hooks/useNarrowViewport";
-import { ChatDockSheet } from "./ChatDockSheet";
+import { ChatDockSheet, type ChatDockSheetReturnFocus } from "./ChatDockSheet";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import {
   isAltGraphPressed,
@@ -202,6 +202,11 @@ export function ChatActivityPanelsProvider(props: {
   const sheetViewport = useSheetViewport();
   const { sheet, setSheetTabs, setSheetBody } = useSheetSlots(sheetViewport);
   const overflow = useChipOverflow(rootRef, setOpenIdState);
+  // The panel the sheet showed last, whose chip the closing sheet may return focus to.
+  const sheetPanelRef = useRef<ChatActivityPanelId | null>(null);
+  useLayoutEffect(() => {
+    if (openId !== null) sheetPanelRef.current = openId;
+  }, [openId]);
 
   useEffect(() => {
     if (openId === null) return;
@@ -227,6 +232,7 @@ export function ChatActivityPanelsProvider(props: {
           // panel (Chat Instructions), which the sheet has no tab for.
           open={openId !== null && openId !== "more"}
           onClose={() => setOpenIdState(null)}
+          returnFocus={(opener) => sheetReturnFocus(opener, sheetPanelRef.current, overflow)}
           tabsRef={setSheetTabs}
           bodyRef={setSheetBody}
         />
@@ -338,6 +344,30 @@ function useChipOverflow(
 }
 
 /**
+ * Where the closing sheet returns focus: what had it when the sheet opened, unless the line hides
+ * that chip now, which then cannot take focus. The line hides the chips it has no room for (a
+ * status label or Stop can take room while the sheet is open), and the "+N" chip once every chip
+ * fits again. The "+N" chip stands in for a hidden chip, and the chip whose panel the sheet
+ * showed last for a hidden "+N" chip.
+ */
+function sheetReturnFocus(
+  opener: Element | null,
+  panel: ChatActivityPanelId | null,
+  overflow: readonly ChatActivityId[]
+): Element | null {
+  const strip = opener?.closest("[data-activity-strip]");
+  // mutation-equivalent: only chips carry an activity id, and every chip sits in the strip
+  if (!(opener instanceof HTMLElement) || strip == null) return opener;
+  if (opener.hasAttribute("data-activity-overflow-chip")) {
+    // mutation-equivalent: the sheet opens on a panel, so one is set by the time it closes
+    if (overflow.length > 0 || panel === null) return opener;
+    return strip.querySelector(`[data-activity-chip][data-activity-id="${panel}"]`);
+  }
+  if (!overflow.includes(opener.dataset.activityId as ChatActivityId)) return opener;
+  return strip.querySelector("[data-activity-overflow-chip]");
+}
+
+/**
  * True where the panels open in the sheet: phone widths, and viewports too short for a popover
  * above the line (a phone in landscape), which would run off the top of the screen.
  */
@@ -367,6 +397,7 @@ function useSheetSlots(sheetViewport: boolean) {
 function ChatActivitySheet(props: {
   open: boolean;
   onClose: () => void;
+  returnFocus: ChatDockSheetReturnFocus;
   tabsRef: (element: HTMLElement | null) => void;
   bodyRef: (element: HTMLElement | null) => void;
 }) {
@@ -374,6 +405,7 @@ function ChatActivitySheet(props: {
     <ChatDockSheet
       open={props.open}
       onClose={props.onClose}
+      returnFocus={props.returnFocus}
       title="Activity"
       dataComponent="ChatActivitySheet"
     >

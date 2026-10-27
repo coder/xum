@@ -5,39 +5,56 @@ import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { cn } from "@/common/lib/utils";
 
+/** Maps what had focus when the sheet opened to what takes it back on close. */
+export type ChatDockSheetReturnFocus = (opener: Element | null) => Element | null;
+
 /**
  * Modal focus for the sheet. While it is open the covered page is inert, so Tab cannot leave the
  * sheet for the composer behind it, and focus moves in unless a panel already placed it there
  * (the background-bash chord focuses its first row; the content's effects run before the sheet's).
- * Closing hands focus back to where it was before once the page is interactive again (an inert
- * element cannot take focus). In a passive effect's cleanup: a layout effect's cleanup runs amid
- * the commit's DOM changes, and React then puts focus back on the element that had it before.
+ *
+ * The page is interactive again before the layout effects of the commit that closes the sheet:
+ * content that leaves the sheet in that commit puts its focus back in a layout effect
+ * (WaitingOnYouSlot), and an inert element cannot take focus. Then focus goes back to where it was
+ * when the sheet opened, or where `returnFocusRef` maps that. In a passive effect's cleanup: a
+ * layout effect's cleanup runs amid the commit's DOM changes, and React then puts focus back on
+ * the element that had it before.
  */
 function useSheetFocus(
   open: boolean,
   rootRef: RefObject<HTMLDivElement | null>,
-  dialogRef: RefObject<HTMLDivElement | null>
+  dialogRef: RefObject<HTMLDivElement | null>,
+  returnFocus: ChatDockSheetReturnFocus | undefined
 ): void {
   // Read in the commit that opens the sheet, before the chord's effect moves focus to its row.
   // Closing reads it too, unused.
-  const returnFocusRef = useRef<Element | null>(null);
+  const openerRef = useRef<Element | null>(null);
   useLayoutEffect(() => {
-    returnFocusRef.current = document.activeElement;
+    openerRef.current = document.activeElement;
   }, [open]);
-  useEffect(() => {
+  // The latest one, read as the sheet closes: it maps by what the page shows at that point.
+  const returnFocusRef = useRef(returnFocus);
+  useLayoutEffect(() => {
+    returnFocusRef.current = returnFocus;
+  });
+  useLayoutEffect(() => {
     const root = rootRef.current;
+    // mutation-equivalent: the sheet always renders its root, so the ref is set before its effects
+    if (!open || root === null) return;
+    return makeOthersInert(root);
+  }, [open, rootRef]);
+  useEffect(() => {
     const dialog = dialogRef.current;
-    // mutation-equivalent: both refs attach in the sheet's one commit, so they are null together
-    if (!open || root === null || dialog === null) return;
-    const returnFocus = returnFocusRef.current;
-    const restoreOthers = makeOthersInert(root);
+    // mutation-equivalent: the sheet always renders its dialog, so the ref is set before its effects
+    if (!open || dialog === null) return;
+    const opener = openerRef.current;
     if (!dialog.contains(document.activeElement)) dialog.focus();
     return () => {
-      restoreOthers();
+      const target = returnFocusRef.current?.(opener) ?? opener;
       // No isConnected check: focus() does nothing on an element that left the page meanwhile.
-      if (returnFocus instanceof HTMLElement) returnFocus.focus();
+      if (target instanceof HTMLElement) target.focus();
     };
-  }, [open, rootRef, dialogRef]);
+  }, [open, dialogRef]);
 }
 
 /**
@@ -78,6 +95,11 @@ export function ChatDockSheet(props: {
   /** The heading, also the sheet's accessible name. */
   title: ReactNode;
   dataComponent: string;
+  /**
+   * What takes focus back on close, given what had it when the sheet opened (by default, that
+   * element). For openers that can hide while the sheet is open, as the live line's chips do.
+   */
+  returnFocus?: ChatDockSheetReturnFocus;
   children: ReactNode;
 }) {
   const titleId = useId();
@@ -85,7 +107,7 @@ export function ChatDockSheet(props: {
   const dialogRef = useRef<HTMLDivElement>(null);
   const open = props.open;
   const close = props.onClose;
-  useSheetFocus(open, rootRef, dialogRef);
+  useSheetFocus(open, rootRef, dialogRef, props.returnFocus);
   useSheetEscape(open, rootRef, close);
 
   return createPortal(

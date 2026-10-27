@@ -280,10 +280,7 @@ async function assertTodoChipFollowsRewrite(line: HTMLElement, workspaceId: stri
   await expect(bashesChip).toHaveAttribute("aria-expanded", "true");
 }
 
-// A turn ending must not remount the chips: that would close the open panel (and a bash output
-// dialog opened from it) and drop the chips' state.
-async function assertPanelSurvivesTurnEnd(line: HTMLElement, workspaceId: string) {
-  await openChatActivityPanel(line, "PinnedTodoList");
+async function endTurn(line: HTMLElement, workspaceId: string) {
   emitChat({
     type: "stream-end",
     workspaceId,
@@ -295,6 +292,13 @@ async function assertPanelSurvivesTurnEnd(line: HTMLElement, workspaceId: string
   await waitFor(() =>
     expect(within(line).queryByRole("button", { name: "Stop streaming" })).toBeNull()
   );
+}
+
+// A turn ending must not remount the chips: that would close the open panel (and a bash output
+// dialog opened from it) and drop the chips' state.
+async function assertPanelSurvivesTurnEnd(line: HTMLElement, workspaceId: string) {
+  await openChatActivityPanel(line, "PinnedTodoList");
+  await endTurn(line, workspaceId);
   await expect(
     within(await findChatActivityPanel()).getByText("Report the stack as merged")
   ).toBeVisible();
@@ -378,6 +382,37 @@ async function assertSheetTabs(line: HTMLElement) {
   await waitFor(() => expect(more).toHaveFocus());
 }
 
+// The chip that opened the sheet can move into the "+N" chip while the sheet is open: a turn
+// that starts takes room for Stop. Closing the sheet returns focus to the "+N" chip then, not to
+// the page: the hidden chip cannot take it.
+async function assertSheetFocusWhenChipHides(line: HTMLElement, workspaceId: string) {
+  const bashes = line.querySelector<HTMLElement>(
+    '[data-component="BackgroundProcessesBanner"] [data-activity-chip]'
+  );
+  if (bashes === null) throw new Error("No background bashes chip");
+  const shown = () => getComputedStyle(bashes).visibility !== "hidden";
+  // Between turns the line has room for the bashes chip.
+  await endTurn(line, workspaceId);
+  await waitFor(() => expect(shown()).toBe(true));
+  await userEvent.click(bashes);
+  await screen.findByRole("dialog", { name: "Activity" });
+
+  emitChat({
+    type: "stream-start",
+    workspaceId,
+    messageId: "msg-4",
+    model: DEFAULT_MODEL,
+    historySequence: 4,
+    startTime: STABLE_TIMESTAMP,
+  });
+  await waitFor(() => expect(shown()).toBe(false));
+  await userEvent.keyboard("{Escape}");
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "Activity" })).toBeNull());
+  await waitFor(() =>
+    expect(within(line).getByRole("button", { name: /^\d+ more$/ })).toHaveFocus()
+  );
+}
+
 // The line opens its panels in the phone sheet by matchMedia, so a phone-sized frame inside a
 // desktop window would test the popover. The Storybook test-runner applies no globals.viewport:
 // .storybook/test-runner.ts gives this story a real phone viewport instead.
@@ -395,5 +430,6 @@ export const WorstCasePhone: AppStory = {
     await assertOneLine(line);
     await assertPanels(line, "sheet");
     await assertSheetTabs(line);
+    await assertSheetFocusWhenChipHides(line, "ws-activity-line-phone");
   },
 };

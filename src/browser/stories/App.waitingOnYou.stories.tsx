@@ -166,9 +166,27 @@ export const Desktop: AppStory = {
   },
 };
 
-// The count-change story's chat, to drop and restore the unsent messages mid-play.
+// The count-change stories' chat, to drop and restore the unsent messages mid-play.
 let emitCountChangeChat: ((message: WorkspaceChatMessage) => void) | null = null;
 const COUNT_CHANGE_WORKSPACE = "ws-waiting-count";
+
+function renderCountChangeStory(workspaceId: string) {
+  return (
+    <AppWithMocks
+      setup={() =>
+        setupWaitingStory(workspaceId, (emit) => {
+          emitCountChangeChat = emit;
+        })
+      }
+    />
+  );
+}
+
+function emitHeldInputs(workspaceId: string, held: boolean): void {
+  const emit = emitCountChangeChat;
+  if (emit === null) throw new Error("The story's chat never subscribed");
+  emit(heldInputsChanged(workspaceId, held));
+}
 
 /**
  * Another item leaving or arriving while the user types an answer: the card breaks up or forms
@@ -176,15 +194,7 @@ const COUNT_CHANGE_WORKSPACE = "ws-waiting-count";
  * drop focus to the page and lose the next keystrokes).
  */
 export const CountChangeKeepsTyping: AppStory = {
-  render: () => (
-    <AppWithMocks
-      setup={() =>
-        setupWaitingStory(COUNT_CHANGE_WORKSPACE, (emit) => {
-          emitCountChangeChat = emit;
-        })
-      }
-    />
-  ),
+  render: () => renderCountChangeStory(COUNT_CHANGE_WORKSPACE),
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const dock = await findDock(canvasElement);
@@ -199,10 +209,8 @@ export const CountChangeKeepsTyping: AppStory = {
     const answer = await within(card).findByPlaceholderText("Type your answer");
     await userEvent.click(answer);
     await userEvent.keyboard("use");
-    const emit = emitCountChangeChat;
-    if (emit === null) throw new Error("The story's chat never subscribed");
 
-    emit(heldInputsChanged(COUNT_CHANGE_WORKSPACE, false));
+    emitHeldInputs(COUNT_CHANGE_WORKSPACE, false);
     await waitFor(() =>
       expect(within(dock).queryByRole("region", { name: "Waiting on you" })).toBeNull()
     );
@@ -210,7 +218,7 @@ export const CountChangeKeepsTyping: AppStory = {
     await expect(answer).toHaveFocus();
     await userEvent.keyboard(" redis");
 
-    emit(heldInputsChanged(COUNT_CHANGE_WORKSPACE, true));
+    emitHeldInputs(COUNT_CHANGE_WORKSPACE, true);
     const formed = await within(dock).findByRole("region", { name: "Waiting on you" });
     await expect(formed.contains(answer)).toBe(true);
     await expect(answer).toHaveFocus();
@@ -218,6 +226,17 @@ export const CountChangeKeepsTyping: AppStory = {
     await expect(answer).toHaveValue("use redis now");
   },
 };
+
+async function findSummary(dock: HTMLElement): Promise<HTMLElement> {
+  return waitFor(
+    () => {
+      const button = dock.querySelector<HTMLElement>('[data-component="WaitingOnYouSummary"]');
+      if (button === null) throw new Error("No Waiting on you summary");
+      return button;
+    },
+    { timeout: 10_000 }
+  );
+}
 
 // The sheet opens by matchMedia, so the test-runner needs a real phone viewport
 // (.storybook/test-runner.ts), like the live line's phone story.
@@ -227,14 +246,7 @@ export const Phone: AppStory = {
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const dock = await findDock(canvasElement);
-    const summary = await waitFor(
-      () => {
-        const button = dock.querySelector<HTMLElement>('[data-component="WaitingOnYouSummary"]');
-        if (button === null) throw new Error("No Waiting on you summary");
-        return button;
-      },
-      { timeout: 10_000 }
-    );
+    const summary = await findSummary(dock);
     await expect(summary).toHaveTextContent("Which reviewers should get the ready PRs?");
     await expect(summary).toHaveTextContent("1 more waiting · 1 queued");
     // Folded into the summary: neither the form nor the queued row takes the phone's height.
@@ -257,5 +269,39 @@ export const Phone: AppStory = {
       expect(screen.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull()
     );
     await waitFor(() => expect(summary).toHaveFocus());
+  },
+};
+
+const PHONE_COUNT_CHANGE_WORKSPACE = "ws-waiting-count-phone";
+
+/**
+ * The count change on a phone, typing in the sheet: once only the question is left, the sheet
+ * closes and the question goes back inline, still focused, so typing goes on. The sheet keeps the
+ * page behind it inert until it closes, and an inert textarea cannot take the focus back.
+ */
+export const PhoneCountChangeKeepsTyping: AppStory = {
+  globals: { viewport: { value: "mobile1", isRotated: false } },
+  render: () => renderCountChangeStory(PHONE_COUNT_CHANGE_WORKSPACE),
+  parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
+  play: async ({ canvasElement }) => {
+    const dock = await findDock(canvasElement);
+    await userEvent.click(await findSummary(dock));
+    const sheet = await screen.findByRole("dialog", { name: /Waiting on you/ });
+    await userEvent.click(
+      await within(sheet).findByRole("button", { name: /^Other/ }, { timeout: 10_000 })
+    );
+    const answer = await within(sheet).findByPlaceholderText("Type your answer");
+    await userEvent.click(answer);
+    await userEvent.keyboard("use");
+
+    emitHeldInputs(PHONE_COUNT_CHANGE_WORKSPACE, false);
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: /Waiting on you/ })).toBeNull()
+    );
+    await expect(within(dock).getByPlaceholderText("Type your answer")).toBe(answer);
+    await expect(answer).toBeVisible();
+    await expect(answer).toHaveFocus();
+    await userEvent.keyboard(" redis");
+    await expect(answer).toHaveValue("use redis");
   },
 };
