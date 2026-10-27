@@ -220,8 +220,11 @@ const logged = () => {
 const WORKFLOW = "coder/xum/.github/workflows/bugbash-sandbox-image.yml";
 
 test("a verified image of the stable tag is pulled by digest, with a private client config", async () => {
-  const s = session();
+  const { s, lines: log } = logged();
   expect(await s.ensureImage()).toEqual({ ref: REF, local: null });
+  // One log line, and it names the image that runs.
+  expect(log).toHaveLength(1);
+  expect(log[0]).toContain(REF);
   const lines = calls().trim().split("\n");
   const kinds = lines.map((l) => l.split(" ")[0]);
   expect(kinds).toEqual(["context", "info", "buildx", "gh", "images", "pull", "image"]);

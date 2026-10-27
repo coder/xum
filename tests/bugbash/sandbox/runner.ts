@@ -138,6 +138,8 @@ export class Session {
       // An empty list with exit 0 means absent. Any failure refuses: it is not "absent".
       const listed = await this.#must(["images", "--no-trunc", "--quiet", ref], 15_000);
       if (listed.stdout === "") await this.#must(["pull", "--quiet", ref], 10 * 60_000);
+      // Names the image in the job log, as the fallback below names its reason.
+      this.#log(`verified image for inputs key ${key.slice(0, 16)}: ${ref}`);
     } else {
       this.#log(`no verified image for inputs key ${key.slice(0, 16)}: ${published.why}`);
       ref = await this.#localImage(key);
