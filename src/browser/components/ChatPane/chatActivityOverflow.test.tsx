@@ -23,9 +23,23 @@ afterEach(() => {
   cleanupDom = null;
 });
 
+function rect(width: number): DOMRect {
+  return {
+    width,
+    height: 0,
+    x: 0,
+    y: 0,
+    top: 0,
+    left: 0,
+    right: width,
+    bottom: 0,
+    toJSON: () => ({}),
+  };
+}
+
 /** happy-dom has no layout: give each element the width the test needs. */
 function setWidth(element: HTMLElement, width: number): void {
-  element.getBoundingClientRect = () => ({ width }) as DOMRect;
+  element.getBoundingClientRect = () => rect(width);
 }
 
 describe("measureChipOverflow", () => {
@@ -105,8 +119,8 @@ function Chip(props: { id: ChatActivityId; label: string; panelKeybind?: Keybind
 function stubLayout(room: number): void {
   const realRect = HTMLElement.prototype.getBoundingClientRect;
   HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
-    if (this.hasAttribute("data-activity-chip")) return { width: 60 } as DOMRect;
-    if (this.hasAttribute("data-activity-overflow-chip")) return { width: 40 } as DOMRect;
+    if (this.hasAttribute("data-activity-chip")) return rect(60);
+    if (this.hasAttribute("data-activity-overflow-chip")) return rect(40);
     return realRect.call(this);
   };
   Object.defineProperty(HTMLElement.prototype, "clientWidth", {
