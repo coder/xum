@@ -17371,7 +17371,12 @@ export class WorkspaceService
     await session?.waitForIdle();
   }
 
-  async waitForIdleAndNoQueuedMessages(workspaceId: string): Promise<void> {
+  /**
+   * `signal` lets an observer that stops waiting (task_await timeout or detach) release its
+   * listeners instead of staying subscribed until the workspace idles. Aborting rejects. The
+   * mid-stream compaction wait has no cancel hook; it is bounded by that compaction.
+   */
+  async waitForIdleAndNoQueuedMessages(workspaceId: string, signal?: AbortSignal): Promise<void> {
     const session = this.sessions.get(workspaceId.trim());
     if (!session) {
       return;
@@ -17385,9 +17390,10 @@ export class WorkspaceService
       session.hasQueuedMessages() ||
       session.hasPendingAutoRetry();
     while (hasTurnWork()) {
-      if (session.closingSignal.aborted) throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
+      if (session.closingSignal.aborted || signal?.aborted)
+        throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
       if (session.isBusy()) {
-        await session.waitForIdle();
+        await session.waitForIdle(signal);
         continue;
       }
       if (session.hasActiveOrPendingTurnWork()) {
@@ -17404,6 +17410,7 @@ export class WorkspaceService
           settled = true;
           unsubscribe();
           session.closingSignal.removeEventListener("abort", finish);
+          signal?.removeEventListener("abort", finish);
           resolve();
         };
         const unsubscribe = session.onChatEvent((event) => {
@@ -17420,12 +17427,14 @@ export class WorkspaceService
           }
         });
         session.closingSignal.addEventListener("abort", finish, { once: true });
-        if (session.closingSignal.aborted || !hasTurnWork()) {
+        signal?.addEventListener("abort", finish, { once: true });
+        if (session.closingSignal.aborted || signal?.aborted || !hasTurnWork()) {
           finish();
         }
       });
     }
-    if (session.closingSignal.aborted) throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
+    if (session.closingSignal.aborted || signal?.aborted)
+      throw new Error(WORKSPACE_IDLE_WAIT_CANCELED_MESSAGE);
   }
 
   /** See WorkspaceHost.drainQueuedMessagesIfIdle. */

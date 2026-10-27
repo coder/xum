@@ -294,8 +294,14 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // (Zod .default() only replaces undefined, not null).
       const timeoutSecsForBash = args.timeout_secs ?? 600;
 
+      const requestedWorkspaceIds = dedupeStrings(args.workspace_ids ?? []);
+      // Explicit workspace_ids alone must not also auto-discover every in-scope task.
       const requestedIds: string[] | null =
-        args.task_ids && args.task_ids.length > 0 ? args.task_ids : null;
+        args.task_ids && args.task_ids.length > 0
+          ? args.task_ids
+          : requestedWorkspaceIds.length > 0
+            ? []
+            : null;
 
       const activeDescendantAgentTaskIds = taskService.listActiveDescendantAgentTaskIds(
         workspaceId,
@@ -387,6 +393,13 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       const uniqueTaskIds = requestedIds
         ? dedupeStrings(requestedIds)
         : await listInScopeAwaitableTaskIds();
+
+      // Workspace observations ride the same result/min_completed machinery. An ID passed in
+      // both lists keeps its task_ids meaning.
+      const workspaceAwaitIds = new Set(
+        requestedWorkspaceIds.filter((id) => !uniqueTaskIds.includes(id))
+      );
+      const awaitedIds = [...uniqueTaskIds, ...workspaceAwaitIds];
 
       const agentTaskIds = uniqueTaskIds.filter(
         (taskId) =>
@@ -509,7 +522,50 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // completions, we can detach the still-pending waiters/reads without terminating those
       // children — they keep running and remain re-awaitable later (reports stay cached in
       // TaskService and the child's bash poll is merely interrupted, not killed).
+      const awaitWorkspace = async (targetId: string, taskSignal: AbortSignal) => {
+        const observed = await taskService.observeWorkspaceUntilIdle(workspaceId, targetId, {
+          // Same documented 600s default as the other waits when timeout_secs is null.
+          timeoutMs: timeoutMs ?? timeoutSecsForBash * 1000,
+          abortSignal: taskSignal,
+        });
+        if (observed.status === "not_found") {
+          return { status: "not_found" as const, taskId: targetId };
+        }
+        if (observed.status === "read_failed") {
+          return {
+            status: "error" as const,
+            taskId: targetId,
+            error: "Could not read the workspace's history; retry task_await.",
+          };
+        }
+        if (observed.status !== "idle") {
+          return {
+            status: "running" as const,
+            taskId: targetId,
+            workspaceId: targetId,
+            ...(observed.status === "backgrounded"
+              ? {
+                  note: "Wait sent to background because a new message was queued. Use task_await to monitor progress.",
+                }
+              : {}),
+          };
+        }
+        return {
+          status: "completed" as const,
+          taskId: targetId,
+          workspaceId: targetId,
+          reportMarkdown:
+            observed.reply?.text ?? "Workspace is idle and has no assistant reply yet.",
+          ...(observed.reply != null ? { messageId: observed.reply.messageId } : {}),
+          ...(observed.title != null ? { title: observed.title } : {}),
+          note: "Latest reply of an idle workspace. Await workspace_ids again to wait for its next turn, or read more with session_history task_id.",
+        };
+      };
+
       const awaitOne = async (taskId: string, taskSignal: AbortSignal) => {
+        if (workspaceAwaitIds.has(taskId)) {
+          return await awaitWorkspace(taskId, taskSignal);
+        }
         const maybeProcessId = fromBashTaskId(taskId);
         if (taskId.startsWith("bash:") && !maybeProcessId) {
           return { status: "error" as const, taskId, error: "Invalid bash taskId." };
@@ -952,11 +1008,11 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // there — wait for all per-task results (which all resolve immediately) instead.
       const wantCount =
         timeoutMs === 0
-          ? Math.max(uniqueTaskIds.length, 1)
-          : Math.min(Math.max(requestedMinCompleted, 1), Math.max(uniqueTaskIds.length, 1));
+          ? Math.max(awaitedIds.length, 1)
+          : Math.min(Math.max(requestedMinCompleted, 1), Math.max(awaitedIds.length, 1));
 
       const taskControllers = new Map<string, AbortController>();
-      for (const taskId of uniqueTaskIds) {
+      for (const taskId of awaitedIds) {
         const controller = new AbortController();
         // Propagate a real tool-call interrupt to every per-task wait.
         if (abortSignal) {
@@ -971,7 +1027,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
 
       const resultsByTaskId = new Map<string, Awaited<ReturnType<typeof awaitOne>>>();
       let completedCount = 0;
-      const taskPromises = uniqueTaskIds.map((taskId) => {
+      const taskPromises = awaitedIds.map((taskId) => {
         // awaitOne resolves to a result object for every documented path, but a few calls (e.g. the
         // bash getProcess/getOutput reads) run outside its internal try/catch and could reject.
         // Convert any stray rejection into an `error` result so the task still counts as settled —
@@ -999,14 +1055,14 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // Resolve once `wantCount` tasks have completed, or every awaited task has otherwise settled
       // (failed/interrupted/timed out) — so an unreachable threshold still returns promptly.
       await new Promise<void>((resolveGate) => {
-        if (uniqueTaskIds.length === 0) {
+        if (awaitedIds.length === 0) {
           resolveGate();
           return;
         }
         let gateResolved = false;
         const checkGate = () => {
           if (gateResolved) return;
-          if (completedCount >= wantCount || resultsByTaskId.size >= uniqueTaskIds.length) {
+          if (completedCount >= wantCount || resultsByTaskId.size >= awaitedIds.length) {
             gateResolved = true;
             resolveGate();
           }
@@ -1029,7 +1085,7 @@ export const createTaskAwaitTool: ToolFactory = (config: ToolConfiguration) => {
       // those to land so every awaited task has a result before assembling the ordered array.
       await Promise.all(taskPromises);
 
-      const results = uniqueTaskIds.map((taskId) => {
+      const results = awaitedIds.map((taskId) => {
         const result = resultsByTaskId.get(taskId);
         assert(result != null, "every awaited task has a result once all promises settled");
         return pageCompletedReport(result, args.offset_chars);
