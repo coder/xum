@@ -1,0 +1,263 @@
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { cleanup, fireEvent, render, within } from "@testing-library/react";
+import { installDom } from "../../../../tests/ui/dom";
+import { KEYBINDS, type Keybind } from "@/browser/utils/ui/keybinds";
+
+import { ChatActivityOverflowChip, ChatInputDecoration } from "./ChatInputDecoration";
+import {
+  ChatActivityPanelsProvider,
+  measureChipOverflow,
+  useChatActivityPanel,
+  type ChatActivityId,
+} from "./chatActivityPanels";
+
+let cleanupDom: (() => void) | null = null;
+
+beforeEach(() => {
+  cleanupDom = installDom();
+});
+
+afterEach(() => {
+  cleanup();
+  cleanupDom?.();
+  cleanupDom = null;
+});
+
+/** happy-dom has no layout: give each element the width the test needs. */
+function setWidth(element: HTMLElement, width: number): void {
+  element.getBoundingClientRect = () => ({ width }) as DOMRect;
+}
+
+describe("measureChipOverflow", () => {
+  function strip(width: number, chips: Array<{ id: ChatActivityId; width: number; plain?: true }>) {
+    const element = document.createElement("div");
+    Object.defineProperty(element, "clientWidth", { value: width });
+    for (const chip of chips) {
+      const button = document.createElement("button");
+      button.dataset.activityChip = "";
+      button.dataset.activityId = chip.id;
+      if (chip.plain) button.dataset.chipVariant = "plain";
+      setWidth(button, chip.width);
+      element.append(button);
+    }
+    const more = document.createElement("button");
+    more.dataset.activityOverflowChip = "";
+    setWidth(more, 40);
+    element.append(more);
+    return element;
+  }
+
+  it("hides nothing while every chip fits", () => {
+    const element = strip(300, [
+      { id: "todo", width: 100, plain: true },
+      { id: "sub-agents", width: 60 },
+      { id: "reviews", width: 60 },
+    ]);
+    expect(measureChipOverflow(element)).toEqual([]);
+  });
+
+  it("hides chips from the end of the line, leaving room for the +N chip", () => {
+    // 100 (TODO) + 3 × 60 = 280 does not fit 270; without Reviews, 100 + 2 × 60 + 40 (+N) does.
+    const element = strip(270, [
+      { id: "reviews", width: 60 },
+      { id: "todo", width: 100, plain: true },
+      { id: "sub-agents", width: 60 },
+      { id: "background-bashes", width: 60 },
+    ]);
+    expect(measureChipOverflow(element)).toEqual(["reviews"]);
+  });
+
+  it("lets the TODO chip shrink to its reserve before a chip hides", () => {
+    // The plain chip's step text is cut off (natural width 380), so it can yield down to its reserve.
+    const element = strip(250, [
+      { id: "todo", width: 200, plain: true },
+      { id: "sub-agents", width: 60 },
+      { id: "background-bashes", width: 60 },
+    ]);
+    const text = document.createElement("span");
+    text.dataset.chipTruncates = "";
+    Object.defineProperty(text, "scrollWidth", { value: 200 });
+    Object.defineProperty(text, "clientWidth", { value: 20 });
+    element.querySelector("[data-chip-variant]")?.append(text);
+    // The reserve (104) and the two chips (120) fit 250; at its current width (200) they would not.
+    expect(measureChipOverflow(element)).toEqual([]);
+  });
+});
+
+function Chip(props: { id: ChatActivityId; label: string; panelKeybind?: Keybind }) {
+  const [expanded, setExpanded] = useChatActivityPanel(props.id);
+  return (
+    <ChatInputDecoration
+      activityId={props.id}
+      expanded={expanded}
+      onToggle={() => setExpanded((open) => !open)}
+      chipLabel={props.label}
+      summary={props.label}
+      panelTitle={props.label}
+      panelKeybind={props.panelKeybind}
+      tab={<span>{`${props.label} tab`}</span>}
+      renderExpanded={() => <button type="button">{`${props.label} row`}</button>}
+    />
+  );
+}
+
+/** A line whose strip has room for `room` px of bordered chips (60 px each, +N 40 px). */
+function stubLayout(room: number): void {
+  const realRect = HTMLElement.prototype.getBoundingClientRect;
+  HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+    if (this.hasAttribute("data-activity-chip")) return { width: 60 } as DOMRect;
+    if (this.hasAttribute("data-activity-overflow-chip")) return { width: 40 } as DOMRect;
+    return realRect.call(this);
+  };
+  Object.defineProperty(HTMLElement.prototype, "clientWidth", {
+    configurable: true,
+    get(this: HTMLElement) {
+      return this.hasAttribute("data-activity-strip") ? room : 0;
+    },
+  });
+}
+
+function Line() {
+  return (
+    <div>
+      <ChatActivityPanelsProvider>
+        <div data-activity-strip="">
+          <Chip id="sub-agents" label="Agents" panelKeybind={KEYBINDS.OPEN_SUB_AGENTS_PANEL} />
+          <Chip id="background-bashes" label="Bashes" />
+          <Chip id="reviews" label="Reviews" panelKeybind={KEYBINDS.OPEN_REVIEWS_PANEL} />
+          <ChatActivityOverflowChip />
+        </div>
+      </ChatActivityPanelsProvider>
+      <button type="button">composer</button>
+    </div>
+  );
+}
+
+describe("the +N chip", () => {
+  it("stays out of sight while every chip fits", () => {
+    stubLayout(400);
+    const view = render(<Line />);
+    const more = view.getByRole("button", { name: "0 more" });
+    expect(more.className).toContain("invisible");
+    expect(view.getByRole("button", { name: "Reviews" }).className).not.toContain("invisible");
+  });
+
+  it("lists the chips the line has no room for and opens their panels", () => {
+    // Two chips and the +N chip (2 × 60 + 40 + gaps) fit 170; three chips do not.
+    stubLayout(170);
+    const view = render(<Line />);
+    const more = view.getByRole("button", { name: "1 more" });
+    expect(view.getByRole("button", { name: "Reviews" }).className).toContain("invisible");
+
+    fireEvent.click(more);
+    const list = view.getByRole("group", { name: "More activity" });
+    expect(
+      within(list)
+        .getAllByRole("button")
+        .map((entry) => entry.textContent)
+    ).toEqual(["Reviews tab"]);
+
+    fireEvent.click(within(list).getByRole("button", { name: "Reviews tab" }));
+    expect(view.queryByRole("group", { name: "More activity" })).toBeNull();
+    const panel = view.getByRole("group", { name: "Reviews" });
+    // The hidden chip's panel keeps the +N chip lit, and closing it returns focus there.
+    expect(more.querySelector("span")?.className).toContain("color-exec-mode");
+    fireEvent.keyDown(within(panel).getByText("Reviews row"), { key: "Escape" });
+    expect(view.queryByRole("group", { name: "Reviews" })).toBeNull();
+    expect(document.activeElement).toBe(more);
+  });
+
+  it("closes its list on Escape and keeps focus on itself", () => {
+    stubLayout(170);
+    const view = render(<Line />);
+    const more = view.getByRole("button", { name: "1 more" });
+    fireEvent.click(more);
+    fireEvent.keyDown(view.getByRole("group", { name: "More activity" }), { key: "Escape" });
+    expect(view.queryByRole("group", { name: "More activity" })).toBeNull();
+    expect(document.activeElement).toBe(more);
+  });
+});
+
+describe("panel shortcuts", () => {
+  let altGraph = false;
+  beforeEach(() => {
+    // happy-dom reports AltGraph for every Ctrl+Alt event; a real keyboard does only for AltGr.
+    altGraph = false;
+    const real = window.KeyboardEvent.prototype.getModifierState;
+    window.KeyboardEvent.prototype.getModifierState = function (this: KeyboardEvent, key) {
+      return key === "AltGraph" ? altGraph : real.call(this, key);
+    };
+  });
+
+  const chord = (target: Element, keybind: Keybind) =>
+    fireEvent.keyDown(target, {
+      key: keybind.key,
+      code: keybind.code,
+      ctrlKey: true,
+      altKey: true,
+    });
+
+  it("open the panel from the composer, focus it, and close it again", () => {
+    stubLayout(400);
+    const view = render(<Line />);
+    const composer = view.getByRole("button", { name: "composer" });
+    composer.focus();
+
+    chord(composer, KEYBINDS.OPEN_REVIEWS_PANEL);
+    const row = view.getByRole("button", { name: "Reviews row" });
+    expect(document.activeElement).toBe(row);
+    expect(view.getByRole("button", { name: "Reviews" }).getAttribute("aria-keyshortcuts")).toBe(
+      "Control+Alt+R"
+    );
+
+    chord(row, KEYBINDS.OPEN_REVIEWS_PANEL);
+    expect(view.queryByRole("group", { name: "Reviews" })).toBeNull();
+    expect(document.activeElement).toBe(composer);
+  });
+
+  it("return focus to where it was when Escape closes the panel", () => {
+    stubLayout(400);
+    const view = render(<Line />);
+    const composer = view.getByRole("button", { name: "composer" });
+    composer.focus();
+    chord(composer, KEYBINDS.OPEN_SUB_AGENTS_PANEL);
+    fireEvent.keyDown(view.getByRole("button", { name: "Agents row" }), { key: "Escape" });
+    expect(view.queryByRole("group", { name: "Agents" })).toBeNull();
+    expect(document.activeElement).toBe(composer);
+  });
+
+  it("swap panels, and stay quiet while a dialog is open", () => {
+    stubLayout(400);
+    const view = render(<Line />);
+    const composer = view.getByRole("button", { name: "composer" });
+    composer.focus();
+    chord(composer, KEYBINDS.OPEN_SUB_AGENTS_PANEL);
+    chord(document.activeElement ?? composer, KEYBINDS.OPEN_REVIEWS_PANEL);
+    expect(view.queryByRole("group", { name: "Agents" })).toBeNull();
+    expect(view.queryByRole("group", { name: "Reviews" })).not.toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "Reviews" }));
+
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    document.body.append(dialog);
+    chord(composer, KEYBINDS.OPEN_SUB_AGENTS_PANEL);
+    expect(view.queryByRole("group", { name: "Agents" })).toBeNull();
+  });
+
+  it("leave AltGr typing alone, which some layouts report as Ctrl+Alt", () => {
+    stubLayout(400);
+    const view = render(<Line />);
+    altGraph = true;
+    chord(view.getByRole("button", { name: "composer" }), KEYBINDS.OPEN_REVIEWS_PANEL);
+    expect(view.queryByRole("group", { name: "Reviews" })).toBeNull();
+  });
+
+  it("ignore a chip without a shortcut", () => {
+    stubLayout(400);
+    const view = render(<Line />);
+    const composer = view.getByRole("button", { name: "composer" });
+    chord(composer, KEYBINDS.OPEN_TODO_PANEL);
+    expect(view.queryByRole("group")).toBeNull();
+  });
+});

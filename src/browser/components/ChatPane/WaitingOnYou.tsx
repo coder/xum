@@ -83,8 +83,11 @@ interface WaitingOnYouCardState {
 
 const WaitingOnYouCardContext = createContext<WaitingOnYouCardState | null>(null);
 
-function sameEntry(a: WaitingOnYouEntry | undefined, b: WaitingOnYouEntry | null): boolean {
-  if (a === undefined || b === null) return a === undefined && b === null;
+function sameEntry(
+  a: WaitingOnYouEntry | null | undefined,
+  b: WaitingOnYouEntry | null | undefined
+): boolean {
+  if (a == null || b == null) return a === b;
   return (
     a.icon === b.icon &&
     a.tab === b.tab &&
@@ -94,41 +97,40 @@ function sameEntry(a: WaitingOnYouEntry | undefined, b: WaitingOnYouEntry | null
   );
 }
 
+function registerEntry(
+  setEntries: Dispatch<SetStateAction<Entries>>,
+  id: WaitingOnYouId,
+  entry: WaitingOnYouEntry | null
+): void {
+  setEntries((current) => {
+    if (sameEntry(current.get(id), entry)) return current;
+    const copy = new Map(current);
+    if (entry === null) {
+      copy.delete(id);
+    } else {
+      copy.set(id, entry);
+    }
+    return copy;
+  });
+}
+
 /** Registers `entry` for slot `id` while mounted; `undefined` leaves it to the slot's content. */
 function useEntryRegistration(
   id: WaitingOnYouId | null,
   entry: WaitingOnYouEntry | null | undefined
 ): void {
   const setEntries = useContext(WaitingOnYouRegisterContext);
-  const icon = entry?.icon;
-  const tab = entry?.tab;
-  const title = entry?.title;
-  const detail = entry?.detail;
-  const urgent = entry?.urgent;
-  const reports = entry !== undefined;
-  const present = entry != null;
+  // Callers build the entry on every render: keep one object while its content stays the same,
+  // so the effect below runs only when the entry really changes.
+  const [stable, setStable] = useState(entry);
+  if (!sameEntry(stable, entry)) setStable(entry);
   // A layout effect: the card takes the items in before the first paint, so they never flash
   // inline first.
   useLayoutEffect(() => {
-    if (setEntries === null || id === null || !reports) return;
-    const next: WaitingOnYouEntry | null =
-      present && icon !== undefined
-        ? { icon, tab: tab ?? "", title: title ?? "", detail: detail ?? "", urgent }
-        : null;
-    const update = (value: WaitingOnYouEntry | null) =>
-      setEntries((current) => {
-        if (sameEntry(current.get(id), value)) return current;
-        const copy = new Map(current);
-        if (value === null) {
-          copy.delete(id);
-        } else {
-          copy.set(id, value);
-        }
-        return copy;
-      });
-    update(next);
-    return () => update(null);
-  }, [setEntries, id, reports, present, icon, tab, title, detail, urgent]);
+    if (setEntries === null || id === null || stable === undefined) return;
+    registerEntry(setEntries, id, stable);
+    return () => registerEntry(setEntries, id, null);
+  }, [setEntries, id, stable]);
 }
 
 /**
@@ -137,6 +139,43 @@ function useEntryRegistration(
  */
 export function useWaitingOnYou(entry: WaitingOnYouEntry | null): void {
   useEntryRegistration(useContext(WaitingOnYouSlotIdContext), entry);
+}
+
+interface WaitingArrangement {
+  /** The card's tabs (desktop) or the sheet's items (phones), in WAITING_ORDER. */
+  listed: ReadonlyArray<[WaitingOnYouId, WaitingOnYouEntry]>;
+  selected: WaitingOnYouId | null;
+  consolidated: boolean;
+}
+
+/** Which items the card lists, which one it shows, and whether there is a card at all. */
+export function arrangeWaiting(
+  entries: Entries,
+  chosen: WaitingOnYouId | null,
+  phone: boolean
+): WaitingArrangement {
+  const ordered = [...entries].sort(([a], [b]) => WAITING_ORDER[a] - WAITING_ORDER[b]);
+  const waiting = ordered.filter(([id]) => id !== "queued");
+  // Phones list the queued message in the sheet; desktop keeps it under the card.
+  const listed = phone ? ordered : waiting;
+  const selected = (listed.find(([id]) => id === chosen) ?? listed.at(0))?.[0] ?? null;
+  return { listed, selected, consolidated: waiting.length >= 2 };
+}
+
+/**
+ * Where a slot's content goes: the card's body (desktop, the chosen tab), under the card (desktop,
+ * the queued message), the open sheet (phones, the chosen item), or null to stay in its slot.
+ */
+export function waitingHost(
+  id: WaitingOnYouId,
+  arranged: WaitingArrangement,
+  phone: boolean,
+  hosts: { body: HTMLElement | null; after: HTMLElement | null; sheet: HTMLElement | null }
+): HTMLElement | null {
+  if (!arranged.consolidated) return null;
+  if (!phone && id === "queued") return hosts.after;
+  if (id !== arranged.selected) return null;
+  return phone ? hosts.sheet : hosts.body;
 }
 
 /**
@@ -153,33 +192,23 @@ export function WaitingOnYouProvider(props: { children: ReactNode }) {
   const [sheetHost, setSheetHost] = useState<HTMLElement | null>(null);
   const phone = useSheetViewport();
 
-  const ordered = [...entries].sort(([a], [b]) => WAITING_ORDER[a] - WAITING_ORDER[b]);
-  const waiting = ordered.filter(([id]) => id !== "queued");
-  const consolidated = waiting.length >= 2;
-  // Phones list the queued message in the sheet; desktop keeps it under the card.
-  const listed = phone ? ordered : waiting;
-  const selected =
-    listed.find(([id]) => id === chosen)?.[0] ?? (listed.length > 0 ? listed[0][0] : null);
-  const sheetShown = sheetOpen && consolidated && phone;
+  const arranged = arrangeWaiting(entries, chosen, phone);
+  const sheetShown = sheetOpen && arranged.consolidated && phone;
   if (sheetOpen && !sheetShown) {
     // Adjust during render: down to one item (or onto a wide screen), nothing is left to list.
     setSheetOpen(false);
   }
-
-  const hostFor = (id: WaitingOnYouId): HTMLElement | null => {
-    if (!consolidated) return null;
-    if (phone) return sheetShown && id === selected ? sheetHost : null;
-    if (id === "queued") return afterHost;
-    return id === selected ? bodyHost : null;
-  };
+  const hosts = { body: bodyHost, after: afterHost, sheet: sheetShown ? sheetHost : null };
+  const consolidated = arranged.consolidated;
+  const hostFor = (id: WaitingOnYouId) => waitingHost(id, arranged, phone, hosts);
 
   return (
     <WaitingOnYouRegisterContext.Provider value={setEntries}>
       <WaitingOnYouContext.Provider value={{ consolidated, hostFor }}>
         <WaitingOnYouCardContext.Provider
           value={{
-            entries: listed,
-            selected,
+            entries: arranged.listed,
+            selected: arranged.selected,
             select: setChosen,
             collapsed,
             setCollapsed,
@@ -291,6 +320,33 @@ export function WaitingOnYouCard() {
   );
 }
 
+function WaitingTab(props: {
+  label: string;
+  selected: boolean;
+  collapsed: boolean;
+  panelId: string;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="tab"
+      aria-selected={props.selected}
+      aria-controls={props.selected ? props.panelId : undefined}
+      tabIndex={props.selected ? 0 : -1}
+      onClick={props.onSelect}
+      className={cn(
+        "h-7 shrink-0 rounded-md px-2 text-xs whitespace-nowrap transition-colors",
+        props.selected && !props.collapsed
+          ? "bg-hover text-foreground font-medium"
+          : "text-secondary hover:text-foreground"
+      )}
+    >
+      {props.label}
+    </button>
+  );
+}
+
 function WaitingOnYouTabs(props: { card: WaitingOnYouCardState; panelId: string }) {
   const card = props.card;
   const count = card.entries.length;
@@ -315,31 +371,19 @@ function WaitingOnYouTabs(props: { card: WaitingOnYouCardState; panelId: string 
               onKeyDown={moveTabFocus}
               className="flex min-w-0 scrollbar-none gap-0.5 overflow-x-auto"
             >
-              {card.entries.map(([id, entry]) => {
-                const selected = id === card.selected;
-                return (
-                  <button
-                    key={id}
-                    type="button"
-                    role="tab"
-                    aria-selected={selected}
-                    aria-controls={selected ? props.panelId : undefined}
-                    tabIndex={selected ? 0 : -1}
-                    onClick={() => {
-                      card.select(id);
-                      card.setCollapsed(false);
-                    }}
-                    className={cn(
-                      "h-7 shrink-0 rounded-md px-2 text-xs whitespace-nowrap transition-colors",
-                      selected && !card.collapsed
-                        ? "bg-hover text-foreground font-medium"
-                        : "text-secondary hover:text-foreground"
-                    )}
-                  >
-                    {entry.tab}
-                  </button>
-                );
-              })}
+              {card.entries.map(([id, entry]) => (
+                <WaitingTab
+                  key={id}
+                  label={entry.tab}
+                  selected={id === card.selected}
+                  collapsed={card.collapsed}
+                  panelId={props.panelId}
+                  onSelect={() => {
+                    card.select(id);
+                    card.setCollapsed(false);
+                  }}
+                />
+              ))}
             </div>
             <button
               type="button"
