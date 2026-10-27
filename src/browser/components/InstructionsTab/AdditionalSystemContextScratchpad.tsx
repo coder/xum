@@ -353,6 +353,14 @@ export function ChatInstructionsChatDecoration(props: { workspaceId: string }) {
           <ArrowUpRight aria-hidden="true" className="size-3 shrink-0" />
         </>
       }
+      // Its entry in the "+N" chip's list, when the line has no room for the chip.
+      tab={
+        <>
+          <BookOpen className="size-4 shrink-0" />
+          <span>{CHAT_INSTRUCTIONS_LABEL}</span>
+          <ArrowUpRight aria-hidden="true" className="text-muted size-3.5 shrink-0" />
+        </>
+      }
       trailingIcon={
         <ArrowUpRight
           aria-hidden="true"

@@ -91,7 +91,7 @@ import { MapStore } from "./MapStore";
 import { createDisplayUsage, recomputeUsageCosts } from "@/common/utils/tokens/displayUsage";
 import { getCacheHealth, type TurnCacheHealth } from "@/common/utils/tokens/cacheHealth";
 import { getAssistantMessageModelUsages } from "@/common/utils/tokens/messageModelUsages";
-import { deriveTodoStatus } from "@/common/utils/todoList";
+import { deriveTodoStatus, isTodoListFinished } from "@/common/utils/todoList";
 import { getModelStats } from "@/common/utils/tokens/modelStats";
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { computeProvidersConfigFingerprint } from "@/common/utils/providers/configFingerprint";
@@ -127,6 +127,7 @@ import {
 
 /** Stable empty reference returned when a workspace has no assisted hunks; keeps useSyncExternalStore snapshot identity stable. */
 const EMPTY_ASSISTED_REVIEW: AssistedReviewHunk[] = [];
+const EMPTY_TODOS: TodoItem[] = [];
 
 export function mergeTimelineEvents(
   preferred: TimelineEvent[],
@@ -2746,7 +2747,10 @@ export class WorkspaceStore {
       const agentStatus = resolveSidebarAgentStatus({
         useAggregatorState,
         activity,
-        todos: aggregatorTodos,
+        // A finished plan stays in the TODO chip until the next turn starts. Between turns the
+        // sidebar keeps the agent's own status (its status_set, or the AI summary) instead of
+        // the plan's last step, as when the plan cleared at the turn's end.
+        todos: canInterrupt || !isTodoListFinished(aggregatorTodos) ? aggregatorTodos : EMPTY_TODOS,
         // A plain getter: reading it for inactive workspaces too has no side effect.
         aggregatorAgentStatus: aggregator.getAgentStatus(),
       });

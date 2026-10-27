@@ -189,9 +189,16 @@ async function findLine(canvasElement: HTMLElement): Promise<HTMLElement> {
   );
 }
 
+/** The chips the line shows: the ones it has room for, and the "+N" chip once any do not fit. */
+function shownChips(line: HTMLElement): HTMLElement[] {
+  return [
+    ...line.querySelectorAll<HTMLElement>("[data-activity-chip], [data-activity-overflow-chip]"),
+  ].filter((chip) => getComputedStyle(chip).visibility !== "hidden");
+}
+
 async function assertOneLine(line: HTMLElement) {
   const stop = within(line).getByRole("button", { name: "Stop streaming" });
-  const chips = [...line.querySelectorAll<HTMLElement>("[data-activity-chip]")];
+  const chips = shownChips(line);
   const centers = new Set(
     [stop, ...chips].map((element) => {
       const rect = element.getBoundingClientRect();
@@ -224,7 +231,7 @@ async function assertPanels(line: HTMLElement, surface: "popover" | "sheet") {
     await openChatActivityPanel(line, "BackgroundProcessesBanner");
   }
   await waitFor(() => expect(document.querySelectorAll("[data-activity-panel]")).toHaveLength(1));
-  await expect(within(await findChatActivityPanel()).getByText("CI watch")).toBeVisible();
+  await expect(within(await findChatActivityPanel()).getByText("gh pr checks 30958 --watch")).toBeVisible();
 
   // Escape closes the panel and leaves the stream running.
   await userEvent.keyboard("{Escape}");
@@ -264,7 +271,7 @@ async function assertTodoChipFollowsRewrite(line: HTMLElement, workspaceId: stri
   await waitFor(() => expect(todoChips()).toHaveLength(0));
   writeTodos("call-todo-again", TODOS);
   await waitFor(() => expect(todoChips()).toHaveLength(1));
-  await expect(within(await findChatActivityPanel()).getByText("CI watch")).toBeVisible();
+  await expect(within(await findChatActivityPanel()).getByText("gh pr checks 30958 --watch")).toBeVisible();
   await expect(bashesChip).toBeInTheDocument();
   await expect(bashesChip).toHaveAttribute("aria-expanded", "true");
 }
@@ -298,16 +305,34 @@ export const WorstCaseDesktop: AppStory = {
   play: async ({ canvasElement }) => {
     const line = await findLine(canvasElement);
     await assertOneLine(line);
+    // Every chip fits a desktop line: no "+N" chip.
+    await expect(within(line).queryByRole("button", { name: /\d+ more$/ })).toBeNull();
     await assertPanels(line, "popover");
     await assertTodoChipFollowsRewrite(line, "ws-activity-line-desktop");
     await assertPanelSurvivesTurnEnd(line, "ws-activity-line-desktop");
   },
 };
 
+// A phone line has no room for all five chips: the last ones move into a "+N" chip, which lists
+// them. Its Reviews entry opens the reviews panel in the sheet, and closing it returns focus to
+// the "+N" chip (the reviews chip is not shown).
+async function openReviewsFromOverflow(line: HTMLElement) {
+  const more = within(line).getByRole("button", { name: /^\d+ more$/ });
+  const hidden = line.querySelectorAll('[data-activity-chip][class~="invisible"]');
+  await expect(more).toHaveAccessibleName(`${hidden.length} more`);
+  await expect(hidden.length).toBeGreaterThan(0);
+  await expect(within(line).queryByRole("button", { name: /pending review/ })).toBeNull();
+  await userEvent.click(more);
+  const list = await within(line).findByRole("group", { name: "More activity" });
+  await expect(more).toHaveAttribute("aria-expanded", "true");
+  await userEvent.click(within(list).getByRole("button", { name: /Reviews/ }));
+  return more;
+}
+
 // Four tabs do not fit a phone's sheet: the strip scrolls instead of squeezing a tab below its
 // label and count (which then overlap the next tab's), and the sheet opens with its tab in view.
 async function assertSheetTabs(line: HTMLElement) {
-  await userEvent.click(within(line).getByRole("button", { name: /pending review/ }));
+  const more = await openReviewsFromOverflow(line);
   const sheet = await screen.findByRole("dialog", { name: "Activity" });
   const strip = within(sheet).getByRole("tablist");
   for (const tab of within(strip).getAllByRole("tab")) {
@@ -320,6 +345,7 @@ async function assertSheetTabs(line: HTMLElement) {
   await expect(tabRect.right).toBeLessThanOrEqual(stripRect.right);
   await userEvent.keyboard("{Escape}");
   await waitFor(() => expect(document.querySelector("[data-activity-panel]")).toBeNull());
+  await waitFor(() => expect(more).toHaveFocus());
 }
 
 // The line opens its panels in the phone sheet by matchMedia, so a phone-sized frame inside a

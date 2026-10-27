@@ -81,12 +81,30 @@ function BashesKeyHints(props: { canViewOutput: boolean }) {
   return <>{hints.filter((hint) => hint !== false).join(" · ")}</>;
 }
 
+type ProcessRowFields = Pick<BackgroundProcessInfo, "id" | "script" | "displayName">;
+
 /**
- * A row's muted line, e.g. "watching /READY|FAILED/ · 0 matches · pid 48211". Rows synthesized
- * from a durable pending wake (process gone after restart) carry no real pid, but always a monitor.
+ * What a row leads with: its command, the script's first non-blank line (the row truncates it to
+ * fit), else the agent's name for the process.
  */
-export function formatProcessDetail(proc: Pick<BackgroundProcessInfo, "monitor" | "pid">): string {
+function processRowTitle(proc: ProcessRowFields): string {
+  const command = proc.script.split("\n").find((line) => line.trim() !== "");
+  return command?.trim() ?? proc.displayName ?? proc.id;
+}
+
+/**
+ * A row's muted line, e.g. "CI watch · watching /READY|FAILED/ · 0 matches · pid 48211": the
+ * agent's name for the process (the row leads with its command), then its monitor and pid. Rows
+ * synthesized from a durable pending wake (process gone after restart) carry no real pid, but
+ * always a monitor.
+ */
+export function formatProcessDetail(
+  proc: ProcessRowFields & Pick<BackgroundProcessInfo, "monitor" | "pid">
+): string {
   const parts: string[] = [];
+  if (proc.displayName && proc.displayName !== processRowTitle(proc)) {
+    parts.push(proc.displayName);
+  }
   if (proc.monitor) {
     const matches = proc.monitor.totalMatches;
     parts.push(`watching /${proc.monitor.filter}/`, `${matches} match${matches === 1 ? "" : "es"}`);
@@ -103,18 +121,6 @@ function ProcessRowDot(props: { running: boolean }) {
   ) : (
     <span aria-hidden className="size-1.5 shrink-0" />
   );
-}
-
-/**
- * Truncate script to reasonable display length.
- */
-function truncateScript(script: string, maxLength = 60): string {
-  // First line only, truncated
-  const firstLine = script.split("\n")[0] ?? script;
-  if (firstLine.length <= maxLength) {
-    return firstLine;
-  }
-  return firstLine.slice(0, maxLength - 3) + "...";
 }
 
 interface BackgroundProcessesBannerProps {
@@ -141,8 +147,10 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   const [focusRequest, setFocusRequest] = useState(0);
   // The focused row; if its process leaves the list, a neighbor takes focus instead of the body.
   const focusedRowRef = useRef<{ processId: string; index: number } | null>(null);
-  // The output dialog has no trigger to return focus to, so a keyboard open records its row.
-  const refocusAfterOutputRef = useRef<{ row: HTMLElement; index: number } | null>(null);
+  // The output dialog has no trigger to return focus to, so opening it records what opened it:
+  // the row (keyboard) or its View output button (mouse). Radix would otherwise leave focus on
+  // the body, where the next Escape closed the panel instead of reaching the row.
+  const refocusAfterOutputRef = useRef<{ target: HTMLElement; index: number } | null>(null);
   // Under immersive review desktop keeps the chat pane mounted but inert: ignore requests then.
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -239,8 +247,8 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     refocusAfterOutputRef.current = null;
     if (target == null) return;
     // The row's process may have left the list while the dialog was open.
-    if (target.row.isConnected) {
-      target.row.focus();
+    if (target.target.isConnected) {
+      target.target.focus();
     } else if (listRef.current) {
       focusProcessRow(listRef.current, target.index);
     } else {
@@ -272,7 +280,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       canViewOutput &&
       !terminatingIds.has(proc.id)
     ) {
-      refocusAfterOutputRef.current = { row, index };
+      refocusAfterOutputRef.current = { target: row, index };
       setViewingProcessId(proc.id);
     } else if (
       matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_TERMINATE) &&
@@ -288,10 +296,15 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     stopKeyboardPropagation(event);
   };
 
-  const handleViewOutput = useCallback((processId: string, event: React.MouseEvent) => {
+  const handleViewOutput = (
+    processId: string,
+    index: number,
+    event: React.MouseEvent<HTMLButtonElement>
+  ) => {
     event.stopPropagation();
+    refocusAfterOutputRef.current = { target: event.currentTarget, index };
     setViewingProcessId(processId);
-  }, []);
+  };
 
   const handleTerminate = useCallback(
     (processId: string, event: React.MouseEvent) => {
@@ -382,9 +395,19 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                 >
                   <ProcessRowDot running={proc.status === "running"} />
                   <div className="min-w-0 flex-1">
-                    <div className="text-foreground truncate font-mono text-xs" title={proc.script}>
-                      {proc.displayName ?? truncateScript(proc.script)}
-                    </div>
+                    {/* The command, as in the approved design; the detail line names the
+                        process. The tooltip carries the whole script, which the row cuts at
+                        its first line and the row's width. */}
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <div className="text-foreground truncate font-mono text-xs">
+                          {processRowTitle(proc)}
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-md font-mono break-all whitespace-pre-wrap">
+                        {proc.script}
+                      </TooltipContent>
+                    </Tooltip>
                     <div className="text-muted truncate text-[10px]">
                       {formatProcessDetail(proc)}
                     </div>
@@ -421,7 +444,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                             type="button"
                             aria-label="View output"
                             disabled={isTerminating}
-                            onClick={(e) => handleViewOutput(proc.id, e)}
+                            onClick={(e) => handleViewOutput(proc.id, index, e)}
                             className={cn(
                               "text-muted hover:text-secondary rounded p-1 transition-colors",
                               isTerminating && "cursor-not-allowed"
@@ -444,6 +467,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         <TooltipTrigger asChild>
                           <button
                             type="button"
+                            aria-label="Terminate process"
                             disabled={isTerminating}
                             onClick={(e) => handleTerminate(proc.id, e)}
                             className={cn(

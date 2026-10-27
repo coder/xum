@@ -4,6 +4,7 @@ import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/Backgrou
 import { PinnedTodoList } from "../PinnedTodoList/PinnedTodoList";
 import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
 import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
+import { ChatActivityOverflowChip } from "./ChatInputDecoration";
 import { ChatDockSurface } from "./chatDockColumn";
 import { ChatActivityPanelsProvider } from "./chatActivityPanels";
 
@@ -39,6 +40,7 @@ export function ChatActivityLine(props: ChatActivityLineProps) {
       {props.showReviews && <ReviewsBanner workspaceId={props.workspaceId} />}
       {/* Self-gating: renders nothing when the scratchpad is empty or disabled. */}
       <ChatInstructionsChatDecoration workspaceId={props.workspaceId} />
+      <ChatActivityOverflowChip />
     </>
   ) : null;
 

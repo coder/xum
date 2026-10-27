@@ -295,6 +295,9 @@ export const OutputDialogHeading: AppStory = {
     });
     await userEvent.keyboard("{Escape}");
     await waitFor(() => expect(body.queryByRole("dialog")).toBeNull());
+    // The dialog has no trigger of its own: focus goes back to the button that opened it, not
+    // the page body, so the next Escape reaches the panel.
+    await waitFor(() => expect(viewButtons[0]).toHaveFocus());
 
     await userEvent.click(viewButtons[1]);
     const second = await body.findByRole("dialog");

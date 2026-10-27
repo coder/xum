@@ -40,7 +40,10 @@ export const CHAT_ACTIVITY_ORDER: Record<ChatActivityId, number> = {
   "chat-instructions": 4,
 };
 
-type OpenIdUpdate = (current: ChatActivityId | null) => ChatActivityId | null;
+/** What the line's one panel slot can hold: a chip's panel, or the "+N" chip's list of hidden chips. */
+export type ChatActivityPanelId = ChatActivityId | "more";
+
+type OpenIdUpdate = (current: ChatActivityPanelId | null) => ChatActivityPanelId | null;
 
 /** Where chips render their tab and open panel on phones: the activity sheet. */
 export interface ChatActivitySheetSlots {
@@ -49,10 +52,15 @@ export interface ChatActivitySheetSlots {
 }
 
 interface ChatActivityPanelsValue {
-  openId: ChatActivityId | null;
+  openId: ChatActivityPanelId | null;
   setOpenId: (update: OpenIdUpdate) => void;
   /** Set on phones, where every panel opens in one bottom sheet with a tab per chip. */
   sheet: ChatActivitySheetSlots | null;
+  /** The chips the line has no room for, in line order; the "+N" chip stands in for them. */
+  overflow: readonly ChatActivityId[];
+  /** Where hidden chips render their entry while the "+N" chip's list is open, else null. */
+  moreList: HTMLElement | null;
+  setMoreList: (element: HTMLElement | null) => void;
 }
 
 const ChatActivityPanelsContext = createContext<ChatActivityPanelsValue | null>(null);
@@ -65,6 +73,20 @@ export function useInChatActivityLine(): boolean {
 /** The activity sheet's slots while the line opens its panels in the sheet, else null. */
 export function useChatActivitySheet(): ChatActivitySheetSlots | null {
   return useContext(ChatActivityPanelsContext)?.sheet ?? null;
+}
+
+const NO_OVERFLOW: readonly ChatActivityId[] = [];
+
+/** The line's overflow state, for the "+N" chip and the chips it stands in for. */
+export function useChatActivityOverflow() {
+  const panels = useContext(ChatActivityPanelsContext);
+  return {
+    overflow: panels?.overflow ?? NO_OVERFLOW,
+    moreList: panels?.moreList ?? null,
+    setMoreList: panels?.setMoreList,
+    openId: panels?.openId ?? null,
+    setOpenId: panels?.setOpenId,
+  };
 }
 
 type SetExpanded = (next: boolean | ((current: boolean) => boolean)) => void;
@@ -141,10 +163,12 @@ export function ChatActivityPanelsProvider(props: {
   className?: string;
   dataComponent?: string;
 }) {
-  const [openId, setOpenIdState] = useState<ChatActivityId | null>(null);
+  const [openId, setOpenIdState] = useState<ChatActivityPanelId | null>(null);
+  const [moreList, setMoreList] = useState<HTMLElement | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const sheetViewport = useSheetViewport();
   const { sheet, setSheetTabs, setSheetBody } = useSheetSlots(sheetViewport);
+  const overflow = useChipOverflow(rootRef, setOpenIdState);
 
   useEffect(() => {
     if (openId === null) return;
@@ -158,13 +182,17 @@ export function ChatActivityPanelsProvider(props: {
   }, [openId]);
 
   return (
-    <ChatActivityPanelsContext.Provider value={{ openId, setOpenId: setOpenIdState, sheet }}>
+    <ChatActivityPanelsContext.Provider
+      value={{ openId, setOpenId: setOpenIdState, sheet, overflow, moreList, setMoreList }}
+    >
       <div ref={rootRef} className={props.className} data-component={props.dataComponent}>
         {props.children}
       </div>
       {sheetViewport && (
         <ChatActivitySheet
-          open={openId !== null}
+          // The "+N" chip's list opens above the line on phones too: it holds chips without a
+          // panel (Chat Instructions), which the sheet has no tab for.
+          open={openId !== null && openId !== "more"}
           onClose={() => setOpenIdState(null)}
           tabsRef={setSheetTabs}
           bodyRef={setSheetBody}
@@ -172,6 +200,106 @@ export function ChatActivityPanelsProvider(props: {
       )}
     </ChatActivityPanelsContext.Provider>
   );
+}
+
+/**
+ * The width the TODO chip keeps before a chip after it moves into the "+N" chip, so the current
+ * step stays readable on a phone (the approved phone design shows its first words).
+ */
+const PLAIN_CHIP_RESERVE_PX = 104;
+
+/** A chip's width without truncation: its width plus what its truncating text cuts off. */
+function naturalChipWidth(chip: HTMLElement): number {
+  const text = chip.querySelector<HTMLElement>("[data-chip-truncates]");
+  const cut = text === null ? 0 : text.scrollWidth - text.clientWidth;
+  return chip.getBoundingClientRect().width + cut;
+}
+
+/**
+ * The bordered chips that do not fit the strip, from the end of the line. The TODO chip
+ * (plain) never hides: it yields width down to its reserve first. A hidden chip stays laid out
+ * out of the flow (ChatActivityChipButton), so its width is known when room comes back.
+ */
+export function measureChipOverflow(strip: HTMLElement): ChatActivityId[] {
+  const chips = [...strip.querySelectorAll<HTMLElement>("[data-activity-chip][data-activity-id]")];
+  const plain = chips.filter((chip) => chip.dataset.chipVariant === "plain");
+  const bordered = chips
+    .filter((chip) => chip.dataset.chipVariant !== "plain")
+    .sort(
+      (a, b) =>
+        CHAT_ACTIVITY_ORDER[a.dataset.activityId as ChatActivityId] -
+        CHAT_ACTIVITY_ORDER[b.dataset.activityId as ChatActivityId]
+    );
+  const more = strip.querySelector<HTMLElement>("[data-activity-overflow-chip]");
+  const gap = Number.parseFloat(getComputedStyle(strip).columnGap) || 0;
+  const plainWidth = plain.reduce(
+    (sum, chip) => sum + Math.min(naturalChipWidth(chip), PLAIN_CHIP_RESERVE_PX),
+    0
+  );
+  const widths = bordered.map((chip) => chip.getBoundingClientRect().width);
+  const moreWidth = more?.getBoundingClientRect().width ?? 0;
+  // Flex items: the plain chips, the spacer between them and the rest, the chips shown, and the
+  // "+N" chip once any hides. One gap between each pair.
+  const needed = (shown: number) => {
+    const hides = shown < bordered.length;
+    const items = plain.length + 1 + shown + (hides ? 1 : 0);
+    const chipsWidth = widths.slice(0, shown).reduce((sum, width) => sum + width, 0);
+    return plainWidth + chipsWidth + (hides ? moreWidth : 0) + gap * (items - 1);
+  };
+  let shown = bordered.length;
+  // Sub-pixel layout: a chip that fits to within half a pixel stays.
+  while (shown > 0 && needed(shown) > strip.clientWidth + 0.5) shown--;
+  return bordered.slice(shown).map((chip) => chip.dataset.activityId as ChatActivityId);
+}
+
+function sameIds(a: readonly ChatActivityId[], b: readonly ChatActivityId[]): boolean {
+  return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+/**
+ * Which chips the line has no room for. Measured from the DOM, not computed in render: the chips
+ * render themselves (each decides whether it has anything to show), and only layout knows their
+ * widths. Re-measured when the strip or a chip resizes, and when chips mount or unmount.
+ */
+function useChipOverflow(
+  rootRef: RefObject<HTMLDivElement | null>,
+  setOpenId: (update: OpenIdUpdate) => void
+): readonly ChatActivityId[] {
+  const [overflow, setOverflow] = useState<readonly ChatActivityId[]>(NO_OVERFLOW);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    // mutation-equivalent: the ref attaches in the provider's commit, before its layout effects
+    if (root === null) return;
+    let strip: HTMLElement | null = null;
+    const update = () => {
+      const next = strip === null ? NO_OVERFLOW : measureChipOverflow(strip);
+      setOverflow((current) => (sameIds(current, next) ? current : next));
+      // Nothing left to list: the "+N" chip went away with its list open.
+      if (next.length === 0) setOpenId((current) => (current === "more" ? null : current));
+    };
+    const resizes = new ResizeObserver(update);
+    const observe = () => {
+      resizes.disconnect();
+      strip = root.querySelector<HTMLElement>("[data-activity-strip]");
+      if (strip === null) return;
+      resizes.observe(strip);
+      for (const chip of strip.querySelectorAll("[data-activity-chip], [data-activity-overflow-chip]")) {
+        resizes.observe(chip);
+      }
+    };
+    const mutations = new MutationObserver(() => {
+      observe();
+      update();
+    });
+    mutations.observe(root, { childList: true, subtree: true });
+    observe();
+    update();
+    return () => {
+      resizes.disconnect();
+      mutations.disconnect();
+    };
+  }, [rootRef, setOpenId]);
+  return overflow;
 }
 
 /**
@@ -302,7 +430,9 @@ function ChatActivitySheet(props: {
             type="button"
             aria-label="Close"
             onClick={close}
-            className="text-muted hover:text-foreground ml-auto inline-flex size-8 items-center justify-center rounded-md transition-colors"
+            // 44px on touch: globals.css sizes touch targets only up to the phone width, and the
+            // sheet also opens on a phone in landscape, which is wider (a short viewport).
+            className="text-muted hover:text-foreground ml-auto inline-flex size-8 items-center justify-center rounded-md transition-colors pointer-coarse:size-11"
           >
             <X className="size-4" />
           </button>

@@ -9,6 +9,7 @@ import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { useChatDockColumnWidthClass } from "./chatDockColumn";
 import {
   CHAT_ACTIVITY_ORDER,
+  useChatActivityOverflow,
   useChatActivitySheet,
   useCloseChatActivityPanelOnBodyEscape,
   useInChatActivityLine,
@@ -56,7 +57,10 @@ interface ChatInputDecorationProps {
   panelShortcut?: string;
   /** Key hints under the list (desktop only: phones have no keyboard to hint at). */
   panelFooter?: ReactNode;
-  /** The panel's tab in the phone activity sheet: icon, name and count. */
+  /**
+   * The chip by name (icon, name and count): its panel's tab in the phone activity sheet, and its
+   * entry in the "+N" chip's list when the line has no room for the chip.
+   */
   tab?: ReactNode;
 }
 
@@ -136,18 +140,32 @@ export function ActivityChipLiveDot() {
   return <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-[var(--color-success)]" />;
 }
 
+/** Focus for a closing panel: its chip, or the "+N" chip while the line has no room for it. */
+function focusChip(chip: HTMLButtonElement | null, overflowed: boolean): void {
+  if (overflowed) {
+    chip
+      ?.closest("[data-activity-strip]")
+      ?.querySelector<HTMLElement>("[data-activity-overflow-chip]")
+      ?.focus();
+  } else {
+    chip?.focus();
+  }
+}
+
 /** The chip, its tab in the phone activity sheet, and its panel while open. */
 function ChatActivityChip(props: ChatInputDecorationProps) {
   const chipRef = useRef<HTMLButtonElement>(null);
   const panelId = useId();
   useReleaseChatActivityPanelOnUnmount(props.activityId);
+  const { overflow, moreList } = useChatActivityOverflow();
+  const overflowed = props.activityId !== undefined && overflow.includes(props.activityId);
   const renderPanel = props.expanded ? props.renderExpanded : undefined;
   // mutation-equivalent: chip is an element or absent, never another falsy node
   const chipContent = props.chip ?? props.summary;
   const close = () => {
     props.onToggle();
     // mutation-equivalent: close runs only from the chip's own handlers and listener, so the chip is mounted
-    chipRef.current?.focus();
+    focusChip(chipRef.current, overflowed);
   };
   useCloseChatActivityPanelOnBodyEscape(renderPanel !== undefined, close);
 
@@ -161,12 +179,23 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
         label={props.chipLabel}
         tooltip={props.chipTooltip}
         variant={props.chipVariant}
+        activityId={props.activityId}
+        overflowed={overflowed}
         className={props.chipClassName}
         onToggle={props.onToggle}
         onClose={close}
       >
         {chipContent}
       </ChatActivityChipButton>
+      {overflowed &&
+        moreList !== null &&
+        createPortal(
+          <ChatActivityMoreEntry activityId={props.activityId} onOpen={props.onToggle}>
+            {/* mutation-equivalent: tab is an element or absent, never another falsy node */}
+            {props.tab ?? chipContent}
+          </ChatActivityMoreEntry>,
+          moreList
+        )}
       {props.renderExpanded !== undefined && (
         <ChatActivitySheetTab
           activityId={props.activityId}
@@ -332,9 +361,10 @@ function ChatActivitySheetTab(props: {
           : { order: CHAT_ACTIVITY_ORDER[props.activityId] }
       }
       // No min-w-0: a tab never shrinks below its label and count, which would overlap the next
-      // tab's. When the tabs do not fit (four on a phone), the tab strip scrolls instead.
+      // tab's. When the tabs do not fit (four on a phone), the tab strip scrolls instead. 44px on
+      // touch, as the sheet's Close button (also in landscape, past globals.css's phone width).
       className={cn(
-        "inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-sm whitespace-nowrap transition-colors",
+        "inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-sm whitespace-nowrap transition-colors pointer-coarse:h-11",
         props.open ? "bg-hover text-foreground" : "text-secondary hover:text-foreground"
       )}
     >
@@ -345,7 +375,7 @@ function ChatActivitySheetTab(props: {
 }
 
 function ChatActivityChipButton(props: {
-  chipRef: Ref<HTMLButtonElement>;
+  chipRef?: Ref<HTMLButtonElement>;
   /** False for link-style chips (Chat Instructions) that navigate instead of opening a panel. */
   hasPanel: boolean;
   open: boolean;
@@ -353,6 +383,16 @@ function ChatActivityChipButton(props: {
   label?: string;
   tooltip?: ReactNode;
   variant?: "plain";
+  activityId?: ChatActivityId;
+  /**
+   * The line has no room for the chip: the "+N" chip lists it instead. It stays laid out, out of
+   * the flow and invisible, so the line can measure it when room comes back.
+   */
+  overflowed?: boolean;
+  /** The "+N" chip itself, marked apart: `data-activity-chip` tells the line a real chip exists. */
+  more?: boolean;
+  /** Drawn as open while not expanded itself: the "+N" chip while a hidden chip's panel is open. */
+  lit?: boolean;
   className?: string;
   onToggle: () => void;
   onClose: () => void;
@@ -364,7 +404,10 @@ function ChatActivityChipButton(props: {
       <button
         ref={props.chipRef}
         type="button"
-        data-activity-chip=""
+        data-activity-chip={props.more === true ? undefined : ""}
+        data-activity-overflow-chip={props.more === true ? "" : undefined}
+        data-activity-id={props.activityId}
+        data-chip-variant={props.variant}
         aria-expanded={props.hasPanel ? props.open : undefined}
         aria-controls={props.open ? props.panelId : undefined}
         aria-label={props.label}
@@ -377,7 +420,8 @@ function ChatActivityChipButton(props: {
         // the line's start and the bordered chips, which end the line next to Stop.
         className={cn(
           "group/chip inline-flex min-w-0 items-center justify-center",
-          plain ? "order-0" : "order-2 shrink-0",
+          plain ? "order-0" : props.more === true ? "order-3 shrink-0" : "order-2 shrink-0",
+          props.overflowed === true && "invisible absolute top-0 left-0",
           props.className
         )}
       >
@@ -387,7 +431,7 @@ function ChatActivityChipButton(props: {
             // The live line is the nearest @container.
             "@max-md:h-11 @max-md:rounded-[10px] @max-md:text-sm @max-md:[&_svg]:size-4",
             !plain && "@max-md:px-2.5",
-            props.open
+            props.open || props.lit === true
               ? "text-foreground border-[var(--color-exec-mode)] bg-[color-mix(in_srgb,var(--color-exec-mode)_16%,transparent)]"
               : plain
                 ? "text-foreground group-hover/chip:bg-hover border-transparent"
@@ -398,5 +442,86 @@ function ChatActivityChipButton(props: {
         </span>
       </button>
     </TooltipIfPresent>
+  );
+}
+
+/** A hidden chip's entry in the "+N" chip's list: its sheet-tab content, which names it. */
+function ChatActivityMoreEntry(props: {
+  activityId?: ChatActivityId;
+  onOpen: () => void;
+  children: ReactNode;
+}) {
+  const { setOpenId } = useChatActivityOverflow();
+  return (
+    <button
+      type="button"
+      style={
+        props.activityId === undefined ? undefined : { order: CHAT_ACTIVITY_ORDER[props.activityId] }
+      }
+      onClick={(event) => {
+        // The entry leaves with the list, so focus goes to the "+N" chip first: the phone sheet
+        // returns focus to what had it when it opened.
+        event.currentTarget
+          .closest("[data-activity-strip]")
+          ?.querySelector<HTMLElement>("[data-activity-overflow-chip]")
+          ?.focus();
+        props.onOpen();
+        // A chip without a panel (Chat Instructions) navigates instead, so the list closes.
+        setOpenId?.((current) => (current === "more" ? null : current));
+      }}
+      className="text-secondary hover:bg-hover hover:text-foreground inline-flex h-9 w-full items-center gap-2 rounded-md px-2.5 text-sm whitespace-nowrap transition-colors"
+    >
+      {props.children}
+    </button>
+  );
+}
+
+/**
+ * The "+N" chip: it stands in for the chips the line has no room for (a phone with every kind of
+ * activity), and lists them above the line. It is always laid out, invisible while every chip
+ * fits, so the line can measure it before deciding whether it needs it.
+ */
+export function ChatActivityOverflowChip() {
+  const chipRef = useRef<HTMLButtonElement>(null);
+  const listId = useId();
+  const { overflow, openId, setOpenId, setMoreList } = useChatActivityOverflow();
+  const open = openId === "more" && overflow.length > 0;
+  // A hidden chip's panel open from the list keeps the "+N" chip lit, as an open chip is.
+  const lit = openId !== null && openId !== "more" && overflow.includes(openId);
+  const toggle = () => setOpenId?.((current) => (current === "more" ? null : "more"));
+  const close = () => {
+    setOpenId?.((current) => (current === "more" ? null : current));
+    chipRef.current?.focus();
+  };
+  useCloseChatActivityPanelOnBodyEscape(open, close);
+
+  return (
+    <>
+      <ChatActivityChipButton
+        chipRef={chipRef}
+        more
+        hasPanel
+        open={open}
+        lit={lit}
+        panelId={listId}
+        label={`${overflow.length} more`}
+        overflowed={overflow.length === 0}
+        onToggle={toggle}
+        onClose={close}
+      >
+        <span className="counter-nums">+{Math.max(overflow.length, 1)}</span>
+      </ChatActivityChipButton>
+      {open && (
+        <div
+          id={listId}
+          ref={setMoreList}
+          role="group"
+          aria-label="More activity"
+          data-activity-panel=""
+          onKeyDown={(event) => closeOnEscape(event, close)}
+          className="bg-surface-primary border-border-medium absolute right-0 bottom-full z-30 mb-1 flex w-max max-w-full min-w-44 flex-col gap-0.5 rounded-lg border p-1 shadow-lg"
+        />
+      )}
+    </>
   );
 }

@@ -1959,7 +1959,7 @@ describe("StreamingMessageAggregator", () => {
       ]);
     });
 
-    test("should clear fully completed todos when the final stream ends", () => {
+    test("keeps a finished plan after its turn and clears it when the next turn starts", () => {
       const aggregator = createTestAggregator();
       startTestStream(aggregator);
       writeTodos(aggregator, [
@@ -1967,9 +1967,37 @@ describe("StreamingMessageAggregator", () => {
         { content: "Do task 2", status: "completed" },
       ]);
 
-      expect(aggregator.getCurrentTodos()).toHaveLength(2);
       endTestStream(aggregator);
+      // The TODO chip reads 2/2 between turns.
+      expect(aggregator.getCurrentTodos()).toHaveLength(2);
+
+      aggregator.handleMessage({
+        type: "message",
+        id: "msg2",
+        role: "user",
+        parts: [{ type: "text", text: "Next task" }],
+        metadata: { historySequence: 2, timestamp: Date.now() },
+      });
       expect(aggregator.getCurrentTodos()).toHaveLength(0);
+    });
+
+    test("keeps an unfinished plan when the next turn starts", () => {
+      const aggregator = createTestAggregator();
+      startTestStream(aggregator);
+      writeTodos(aggregator, [
+        { content: "Do task 1", status: "completed" },
+        { content: "Do task 2", status: "pending" },
+      ]);
+      endTestStream(aggregator);
+
+      aggregator.handleMessage({
+        type: "message",
+        id: "msg2",
+        role: "user",
+        parts: [{ type: "text", text: "Continue" }],
+        metadata: { historySequence: 2, timestamp: Date.now() },
+      });
+      expect(aggregator.getCurrentTodos()).toHaveLength(2);
     });
 
     test("should preserve todos when stream aborts", () => {
@@ -1987,20 +2015,50 @@ describe("StreamingMessageAggregator", () => {
       expect(aggregator.getCurrentTodos()).toHaveLength(1);
     });
 
-    test("should keep completed todos on reload only while reconnecting to an active stream", () => {
-      const historicalMessage = historicalTodoMessage("msg1", [
-        { content: "Historical task 1", status: "completed" },
-        { content: "Historical task 2", status: "completed" },
-      ]);
+    test("a reload keeps a finished plan until a later user turn, as live", () => {
+      const historicalMessage = historicalTodoMessage(
+        "msg1",
+        [
+          { content: "Historical task 1", status: "completed" },
+          { content: "Historical task 2", status: "completed" },
+        ],
+        { historySequence: 2 }
+      );
+      const turn = (id: string, historySequence: number) =>
+        createMuxMessage(id, "user", "Next task", { historySequence, timestamp: historySequence });
 
-      const aggregator = createTestAggregator();
-      aggregator.loadHistoricalMessages([historicalMessage], true);
-      expect(aggregator.getCurrentTodos()).toHaveLength(2);
-      expect(aggregator.getCurrentTodos()[0].content).toBe("Historical task 1");
+      for (const hasActiveStream of [true, false]) {
+        const aggregator = createTestAggregator();
+        aggregator.loadHistoricalMessages([turn("u1", 1), historicalMessage], hasActiveStream);
+        expect(aggregator.getCurrentTodos()).toHaveLength(2);
+        expect(aggregator.getCurrentTodos()[0].content).toBe("Historical task 1");
+      }
 
-      const aggregator2 = createTestAggregator();
-      aggregator2.loadHistoricalMessages([historicalMessage], false);
-      expect(aggregator2.getCurrentTodos()).toHaveLength(0);
+      const idle = createTestAggregator();
+      idle.loadHistoricalMessages([turn("u1", 1), historicalMessage, turn("u3", 3)], false);
+      expect(idle.getCurrentTodos()).toHaveLength(0);
+
+      // A Token Budget warning is a user row that starts no turn.
+      const warned = createTestAggregator();
+      warned.loadHistoricalMessages(
+        [
+          historicalMessage,
+          createMuxMessage("warn", "user", "Write the next steps to workspace notes.", {
+            historySequence: 3,
+            timestamp: 3,
+            synthetic: true,
+            uiVisible: true,
+            muxMetadata: {
+              type: "context-budget-warning",
+              contextTokens: 800,
+              maxTokens: 1000,
+              budgetTokens: 991,
+            },
+          }),
+        ],
+        false
+      );
+      expect(warned.getCurrentTodos()).toHaveLength(2);
     });
 
     test("preserves completed todos on idle reload when they came from a partial assistant message", () => {

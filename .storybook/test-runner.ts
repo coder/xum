@@ -432,6 +432,50 @@ async function assertMenuClearsSafeArea(page: StoryPage) {
   }
 }
 
+const LANDSCAPE_SHEET_STORY = "app-composeractivityline--worst-case-phone";
+
+/**
+ * A phone in landscape is wider than globals.css's touch-size rule (up to 768px) but short, so the
+ * live line opens its panels in the activity sheet there too. The sheet's Close button and tabs
+ * must still be 44px touch targets. Plays cannot emulate the pointer.
+ */
+async function assertLandscapeSheetTouchTargets(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    await page.setViewportSize({ width: 844, height: 390 });
+    await page.waitForFunction(
+      () => matchMedia("(pointer: coarse)").matches && innerWidth === 844,
+      undefined,
+      { timeout: 5000 }
+    );
+    await page
+      .locator('[data-component="ChatActivityLine"] [data-component="PinnedTodoList"] button')
+      .first()
+      .click();
+    const sheet = page.getByRole("dialog", { name: "Activity" });
+    await sheet.waitFor({ timeout: 5000 });
+    const targets = [
+      sheet.getByRole("button", { name: "Close" }),
+      ...(await sheet.getByRole("tab").all()),
+    ];
+    const problems: string[] = [];
+    for (const target of targets) {
+      const box = await target.boundingBox();
+      const name = (await target.textContent())?.trim() || "Close";
+      if (!box) problems.push(`${name}: missing`);
+      else if (box.height < 44) problems.push(`${name}: ${Math.round(box.height)}px tall`);
+    }
+    assert.equal(problems.join("; "), "", "The landscape sheet's controls must be touch targets");
+  } finally {
+    await page.keyboard.press("Escape");
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
 // Stories that need a phone viewport for their play, as their globals.viewport gives them in
 // Storybook. A fixed-size frame would not do: matchMedia, which decides where the live line opens
 // its panels (the phone sheet or a popover), still sees the desktop window.
@@ -461,6 +505,12 @@ const config: TestRunnerConfig = {
     if (restoreViewport) {
       viewportsToRestore.delete(page);
       await page.setViewportSize(restoreViewport);
+    }
+    if (context.id === LANDSCAPE_SHEET_STORY) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertLandscapeSheetTouchTargets(page);
+      }
+      return;
     }
     const insetTarget = SIDE_INSET_TARGETS.get(context.id);
     if (insetTarget) {

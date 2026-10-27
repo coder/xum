@@ -21,6 +21,11 @@ export function renderTodoItemsAsMarkdownList(todos: TodoItem[]): string {
     .join("\n");
 }
 
+/** A plan with every step done: the TODO chip reads 5/5 until the next turn starts. */
+export function isTodoListFinished(todos: readonly TodoLikeItem[]): boolean {
+  return todos.length > 0 && todos.every((todo) => todo.status === "completed");
+}
+
 /**
  * Sidebar and landing-card status should reflect the most actionable todo item,
  * so we surface in-progress work first, then the next pending task, and finally
