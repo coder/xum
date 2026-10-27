@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test async matchers return thenables the rule cannot see */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "node:os";
@@ -256,14 +257,14 @@ describe("WorkflowRunAttention", () => {
           ownerWorkspaceId: "",
           runId: "r",
         })
-      ).rejects.toThrow();
+      ).rejects.toThrow(/requires/);
       await expect(
         attention.markWorkflowRunTerminalAttentionSettled({
           ...base,
           ownerWorkspaceId: "o",
           runId: "",
         })
-      ).rejects.toThrow();
+      ).rejects.toThrow(/requires/);
       expect(store.recordSettled).not.toHaveBeenCalled();
 
       await attention.markWorkflowRunTerminalAttentionSettled({
@@ -315,10 +316,10 @@ describe("WorkflowRunAttention", () => {
     test("rejects an empty owner or run id", async () => {
       await expect(
         attention.clearWorkflowRunDowngradeSettlement({ ownerWorkspaceId: "", runId: "r" })
-      ).rejects.toThrow();
+      ).rejects.toThrow(/requires/);
       await expect(
         attention.clearWorkflowRunDowngradeSettlement({ ownerWorkspaceId: OWNER, runId: "" })
-      ).rejects.toThrow();
+      ).rejects.toThrow(/requires/);
       expect(store.delete).not.toHaveBeenCalled();
     });
   });
