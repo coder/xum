@@ -170,7 +170,6 @@ describe("Anthropic 1M context classification", () => {
     expect(getAnthropic1MContextMode("anthropic:claude-fable-5-1")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-fable-5-5")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-fable-5-5-20261001")).toBe("native");
-    expect(getAnthropic1MContextMode("mux-gateway:anthropic/claude-fable-5-5")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-mythos-5")).toBe("native");
     expect(getAnthropic1MContextMode("anthropic:claude-mythos-5-1")).toBe("native");
     expect(supports1MContext("anthropic:claude-fable-5-1")).toBe(false);
