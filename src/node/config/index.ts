@@ -36,6 +36,7 @@ import {
   FABLE_5_DEFAULT_MODEL_FALLBACKS,
   LEGACY_DEFAULT_MODEL_FALLBACKS,
   SEEDED_MODEL_FALLBACKS,
+  sanitizeFallbackModelString,
   sanitizeModelFallbacks,
 } from "@/common/utils/ai/modelFallbacks";
 import { DEFAULT_TASK_SETTINGS, normalizeTaskSettings } from "@/common/types/tasks";
@@ -675,8 +676,12 @@ function seedDefaultModelFallbacks(
     !Array.isArray(parsed.modelFallbacks)
       ? (parsed.modelFallbacks as Record<string, unknown>)
       : {};
+  // Same key form as persistence (sanitizeFallbackModelString): a `coder:` key
+  // stays gateway-scoped. Runtime lookup is raw-first, so a Coder-scoped chain
+  // serves only its own selection and must not stand in for the direct default
+  // (a cross-typed or shadowed Coder instance never shares the direct chain).
   const existingCanonicalKeys = new Set(
-    Object.keys(rawFallbacks).map((key) => normalizeToCanonical(key).trim())
+    Object.keys(rawFallbacks).map((key) => sanitizeFallbackModelString(key))
   );
   const missingDefaults = Object.fromEntries(
     pendingPasses

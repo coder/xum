@@ -119,8 +119,12 @@ New installs start with these chains:
 Claude Sonnet 5.5 can refuse some higher-risk cybersecurity requests, and
 Anthropic's own fallback for those requests is Claude Sonnet 5.
 
-Updates never change an existing config's chains. If your config predates the
-Sonnet 5.5 chain, add it by hand:
+Updates change an existing config's chains in one case only. When the `fable`
+alias moves to a new Fable model, Xum adds that model's default chain to your
+config once. It never replaces a chain you already have for that model, and it
+does not add the chain again after you delete it. Other new chains, such as the
+Sonnet 5.5 chain, reach new installs only. If your config predates the Sonnet
+5.5 chain, add it by hand:
 
 1. Under **Settings → Models**, add the custom model `claude-sonnet-5` for
    Anthropic.
