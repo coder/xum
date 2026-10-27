@@ -358,14 +358,14 @@ async function assertChipsLeftWithoutDividers(line: HTMLElement) {
   );
   await expect(chips).toHaveLength(1);
   await expect(line.querySelectorAll("[data-activity-chip]")).toHaveLength(1);
-  const chip = chips[0];
   const lineRect = line.getBoundingClientRect();
-  await expect(chip.getBoundingClientRect().right).toBeLessThan(lineRect.left + lineRect.width / 2);
-  const stop = within(line).getByRole("button", { name: "Stop streaming" });
-  await expect(stop.getBoundingClientRect().right).toBeGreaterThan(
-    lineRect.left + lineRect.width / 2
-  );
-  await expect(stop.getBoundingClientRect().right).toBeLessThanOrEqual(lineRect.right);
+  const lineMiddle = lineRect.left + lineRect.width / 2;
+  await expect(chips[0].getBoundingClientRect().right).toBeLessThan(lineMiddle);
+  const stopRight = within(line)
+    .getByRole("button", { name: "Stop streaming" })
+    .getBoundingClientRect().right;
+  await expect(stopRight).toBeGreaterThan(lineMiddle);
+  await expect(stopRight).toBeLessThanOrEqual(lineRect.right);
   const dividers = [...line.querySelectorAll<HTMLElement>("[aria-hidden]")].filter((element) => {
     const rect = element.getBoundingClientRect();
     return rect.width > 0 && rect.width <= 1 && rect.height > 0;
