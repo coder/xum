@@ -436,6 +436,18 @@ export function buildContextBudgetRequest(
 }
 
 /**
+ * The turn anchor counts the request at the level the turn started at. A thinking override the
+ * step applied (the step-0 rebuild, or options only when it failed) changes which reasoning is
+ * sent, so the step uses the full estimate then (#7662).
+ */
+function turnAnchorAfterOverride(
+  request: Pick<StreamRequestConfig, "contextBudgetTurnAnchor">,
+  thinkingOverride: Record<string, unknown> | undefined
+): TurnBudgetAnchor | undefined {
+  return thinkingOverride === undefined ? request.contextBudgetTurnAnchor : undefined;
+}
+
+/**
  * Hard-stop the step when its assembled request exceeds the safe context budget. Step zero has
  * no settled step, so it counts against the turn anchor, as the turn-start check did (#7662).
  */
@@ -722,7 +734,7 @@ export class StepPreparation {
         previousRequest,
         steps.at(-1),
         stepNumber,
-        request.contextBudgetTurnAnchor
+        turnAnchorAfterOverride(request, thinkingOverride)
       );
     }
     return buildPrepareStepResult({

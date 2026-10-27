@@ -9,7 +9,7 @@ import { createTestToolConfig } from "./tools/testHelpers";
 import { describe, expect, spyOn, test } from "bun:test";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3StreamPart } from "@ai-sdk/provider";
-import { tool } from "ai";
+import { tool, type ModelMessage } from "ai";
 import { z } from "zod";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -228,10 +228,13 @@ describe("settled context hard ceiling", () => {
   );
 
   // #7662: step zero has no settled step, so it counts against the turn anchor, as the
-  // turn-start check did; a full estimate here could refuse what turn start accepted.
-  test.each([false, true])(
-    "step zero counts against the turn anchor (anchored=%p)",
-    async (anchored) => {
+  // turn-start check did; a full estimate here could refuse what turn start accepted. A
+  // thinking change that races stream setup rebuilds step zero at a level the anchor's
+  // provider count does not hold, so that step uses the full estimate.
+  test.each(["none", "anchored", "rethought"] as const)(
+    "step zero counts against the turn anchor (%s)",
+    async (mode) => {
+      const anchored = mode === "anchored";
       const h = await createTestHistoryService();
       const workspaceId = "turn-anchor-budget";
       const messageId = "turn-anchor-assistant";
@@ -270,29 +273,40 @@ describe("settled context hard ceiling", () => {
             ])
           ).success
         ).toBe(true);
+        const messages: ModelMessage[] = [
+          { role: "user", content: "Hello" },
+          { role: "assistant", content: "Hi" },
+          { role: "user", content: "Again" },
+        ];
         const started = await manager.startStream({
           workspaceId,
           messageId,
           historySequence: 1,
           model,
           modelString: "openai:gpt-4o",
-          messages: [
-            { role: "user", content: "Hello" },
-            { role: "assistant", content: "Hi" },
-            { role: "user", content: "Again" },
-          ],
+          messages,
           system: "Answer briefly",
           runtime: new LocalRuntime(h.tempDir),
           providedRuntimeTempDir: runtimeDir,
           contextBudgetLimit: 10000,
           // The previous reply's provider count alone is at the ceiling.
-          ...(anchored
-            ? {
+          ...(mode === "none"
+            ? {}
+            : {
                 contextBudgetTurnAnchor: {
                   model: "openai:gpt-4o",
                   metadataModel: "openai:gpt-4o",
                   providerTokens: getContextBudgetHardCeiling(10000),
                 },
+              }),
+          ...(mode === "rethought"
+            ? {
+                thinkingOverrideState: { pending: "off" as const },
+                rebuildProviderOptionsForThinkingLevel: () => ({
+                  providerOptions: {},
+                  effectiveLevel: "off" as const,
+                }),
+                rebuildFirstStepForThinkingLevel: () => Promise.resolve({ messages }),
               }
             : {}),
         });

@@ -594,6 +594,8 @@ interface FoldedStreamState<TMessages, TTail> {
   systemMessageTokens: number;
   /** The count of `messages` the budget check enforced, the stage decision's E (#5286). */
   contextBudgetEstimate?: number;
+  /** The turn anchor that count used; a rebuild at another level carries its own (#7662). */
+  contextBudgetTurnAnchor?: TurnBudgetAnchor;
 }
 
 /**
@@ -620,6 +622,7 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
       systemRecords: TTail;
       systemMessageTokens: number;
       contextBudgetEstimate?: number;
+      contextBudgetTurnAnchor?: TurnBudgetAnchor;
     }>;
     currentEffectiveLevelRef: { current: ThinkingLevel };
     /** Leave pending changes for StreamManager's step 0 (after a published stage, #5286). */
@@ -650,6 +653,7 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
         systemRecords: rebuilt.systemRecords,
         systemMessageTokens: rebuilt.systemMessageTokens,
         contextBudgetEstimate: rebuilt.contextBudgetEstimate,
+        contextBudgetTurnAnchor: rebuilt.contextBudgetTurnAnchor,
       };
     } catch (error) {
       if (error instanceof ContextBudgetExceededError) return { exceeded: error.details };
@@ -3639,6 +3643,7 @@ export class TurnRequestBuilder {
           return {
             messages: rebuiltPayload.messages,
             contextBudgetEstimate: rebuiltPayload.contextBudgetEstimate,
+            contextBudgetTurnAnchor: rebuiltPayload.contextBudgetTurnAnchor,
             systemMessageTokens: sent.tokens,
             systemRecords: rowSystemRecords(rebuiltPayload, options.partialContinuationMessage),
           };
@@ -3812,6 +3817,7 @@ export class TurnRequestBuilder {
         systemRecords: primaryRequest.systemRecords,
         systemMessageTokens,
         contextBudgetEstimate: primaryRequest.contextBudgetEstimate,
+        contextBudgetTurnAnchor: primaryRequest.contextBudgetTurnAnchor,
       });
       if ("exceeded" in streamState) {
         runLanguageModelCleanup(modelResult.data.model);
@@ -3898,6 +3904,7 @@ export class TurnRequestBuilder {
         providerOptions: streamProviderOptions,
         messages: streamFinalMessages,
         systemRecords: streamSystemRecords,
+        contextBudgetTurnAnchor: streamTurnAnchor,
       } = streamState;
       ({ systemMessageTokens } = streamState);
       // Debug sinks pair systemMessage with the message list, so when the
@@ -4219,7 +4226,7 @@ export class TurnRequestBuilder {
         abortSignal: combinedAbortSignal,
         tools: toolsForStream,
         contextBudgetLimit: primaryRequest.contextBudgetLimit,
-        contextBudgetTurnAnchor: primaryRequest.contextBudgetTurnAnchor,
+        contextBudgetTurnAnchor: streamTurnAnchor,
         initialMetadata: {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
           systemMessageTokens,
