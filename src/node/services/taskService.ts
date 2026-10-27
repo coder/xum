@@ -72,6 +72,7 @@ import {
 import {
   readSubagentAttemptSettlementReceiptStrict,
   writeSubagentAttemptSettlementReceipt,
+  type SubagentAttemptSettlementReceiptReadResult,
   type SubagentAttemptSettlementSource,
 } from "@/node/services/subagentAttemptSettlements";
 import { assertTaskAttemptId, isTaskAttemptId, newTaskAttemptId } from "@/node/utils/taskAttemptId";
@@ -1440,6 +1441,82 @@ interface WorkspaceStopRecord {
   receipt?: "writing" | "written" | "failed";
 }
 /**
+ * The stop record's release conditions hold: no cleanup owed, a durable stop marker, no captured
+ * turn or pending admission left, and the captured execution settled.
+ */
+function isWorkspaceStopRecordSettled(record: WorkspaceStopRecord): boolean {
+  if (record.cleanupInFlight > 0) return false;
+  return (
+    record.stopPersisted &&
+    record.capturedTurns.size === 0 &&
+    record.pendingAdmissions.size === 0 &&
+    record.executionSettled
+  );
+}
+
+/** Lineage proof (evaluateAttemptLineage) from the predecessor's receipt in the parent's dir. */
+function lineageProofFromReceipt(
+  receipt: SubagentAttemptSettlementReceiptReadResult,
+  parentWorkspaceId: string
+): { proven: boolean; reason: string } {
+  if (receipt.kind === "found") {
+    // The strict reader binds task and attempt id to the path; the parent is bound here, to
+    // the entry: a receipt naming another parent at this path was copied or misplaced, never
+    // written by this task's owner (the same fail-closed outcome as an unreadable receipt).
+    if (receipt.receipt.parentWorkspaceId !== parentWorkspaceId) {
+      return {
+        proven: false,
+        reason: `settlement receipt names parent ${receipt.receipt.parentWorkspaceId}, expected ${parentWorkspaceId}`,
+      };
+    }
+    return { proven: true, reason: "settlement receipt found" };
+  }
+  return {
+    proven: false,
+    reason:
+      receipt.kind === "unreadable"
+        ? `settlement receipt unreadable: ${receipt.error}`
+        : "no settlement receipt for the predecessor attempt",
+  };
+}
+
+/**
+ * Row step of readUnownedSettlementProof: the row names an interrupted, proven attempt with a
+ * parent, so the parent's receipt copy can prove it; else why it cannot.
+ */
+function unownedSettlementCandidate(
+  row: WorkspaceConfigEntry | undefined
+):
+  | { kind: "candidate"; attemptId: string; parentWorkspaceId: string }
+  | { kind: "unproven"; reason: string } {
+  const unproven = (reason: string) => ({ kind: "unproven" as const, reason });
+  if (row == null) return unproven("no task record");
+  const attemptId = row.taskAttemptId;
+  if (!isTaskAttemptId(attemptId)) return unproven("no attempt id (pre-identity entry)");
+  if (row.taskStatus !== "interrupted") return unproven(`status ${row.taskStatus ?? "missing"}`);
+  if (row.taskAttemptUnproven === true) return unproven("lineage marked unproven");
+  const parentWorkspaceId = coerceNonEmptyString(row.parentWorkspaceId);
+  if (parentWorkspaceId == null) return unproven("no parent");
+  return { kind: "candidate", attemptId, parentWorkspaceId };
+}
+
+/** Receipt step of readUnownedSettlementProof: why the read receipt proves nothing, if it does not. */
+function unownedSettlementReceiptGap(
+  receipt: SubagentAttemptSettlementReceiptReadResult,
+  attemptId: string,
+  parentWorkspaceId: string
+): string | undefined {
+  if (receipt.kind === "not_found") return `no settlement receipt for ${attemptId}`;
+  if (receipt.kind === "unreadable") {
+    return `settlement receipt unreadable: ${receipt.error}`;
+  }
+  if (receipt.receipt.parentWorkspaceId !== parentWorkspaceId) {
+    return `settlement receipt names parent ${receipt.receipt.parentWorkspaceId}`;
+  }
+  return undefined;
+}
+
+/**
  * Attempt compare-and-swap for a task-row write made on behalf of one attempt (stream end, report
  * publication, recovery, terminal failure, resume rollback). Evaluated inside the write's own
  * editWorkspaceEntry transform: true when the caller captured an attempt and the row now names
@@ -2615,16 +2692,7 @@ export class TaskService implements AgentTaskIntegration {
   private recheckWorkspaceStopRelease(workspaceId: string): void {
     const record = this.workspaceStopRecords.get(workspaceId);
     if (record == null) return;
-    if (record.cleanupInFlight > 0) return;
-    if (
-      !(
-        record.stopPersisted &&
-        record.capturedTurns.size === 0 &&
-        record.pendingAdmissions.size === 0 &&
-        record.executionSettled
-      )
-    )
-      return;
+    if (!isWorkspaceStopRecordSettled(record)) return;
     // Execution-settlement producer: the receipt is durable before the latch releases, so nothing
     // the latch holds back (a reawaken, a peer send, a queued launch) observes the stopped attempt
     // as released while its receipt could still be missing. The record stays registered (latched)
@@ -2632,40 +2700,51 @@ export class TaskService implements AgentTaskIntegration {
     // one step as before. A failed write (or an unreadable config) still releases, with the
     // attempt left `closing` (fail closed) instead of pinning the latch until restart.
     if (record.receipt === "writing") return;
-    // A receipt can be at stake: wait for the attempt's pending stream-end decision (its report
-    // may still publish); resolveStreamEndDecision rechecks. Without a receipt at stake the
-    // release keeps its previous timing.
-    if (
+    if (this.isStopReceiptDecisionPending(workspaceId, record)) return;
+    if (record.receipt == null && this.startStopSettlementReceipt(workspaceId, record)) return;
+    this.releaseWorkspaceStopRecord(workspaceId, record);
+  }
+
+  /**
+   * A receipt can be at stake: wait for the attempt's pending stream-end decision (its report
+   * may still publish); resolveStreamEndDecision rechecks. Without a receipt at stake the
+   * release keeps its previous timing.
+   */
+  private isStopReceiptDecisionPending(workspaceId: string, record: WorkspaceStopRecord): boolean {
+    return (
       record.receipt == null &&
       record.attemptId != null &&
       this.ownsReceiptEligibleAttempt(workspaceId, record.ownedAttempt) &&
       this.findStreamEndDecision(workspaceId, record.attemptId)?.outcome === "pending"
-    ) {
-      return;
-    }
-    if (record.receipt == null) {
-      const decision = this.decideSettlementReceipt(
-        workspaceId,
-        record.ownedAttempt,
-        "stop-settled"
-      );
-      if (decision.kind === "unreadable") record.receipt = "failed";
-      if (decision.kind === "write") {
-        record.receipt = "writing";
-        void this.writeSettlementReceipt(workspaceId, decision, "execution-settled")
-          .then(
-            (written) => {
-              record.receipt = written ? "written" : "failed";
-            },
-            (error: unknown) => {
-              log.error("Stop release: settlement receipt write threw", { workspaceId, error });
-              record.receipt = "failed";
-            }
-          )
-          .finally(() => this.recheckWorkspaceStopRelease(workspaceId));
-        return;
-      }
-    }
+    );
+  }
+
+  /**
+   * Decide the stopped attempt's settlement receipt and start its write. Returns true while the
+   * write is in flight (the release waits for its completion recheck). An unreadable config marks
+   * the receipt failed and lets the release go ahead.
+   */
+  private startStopSettlementReceipt(workspaceId: string, record: WorkspaceStopRecord): boolean {
+    const decision = this.decideSettlementReceipt(workspaceId, record.ownedAttempt, "stop-settled");
+    if (decision.kind === "unreadable") record.receipt = "failed";
+    if (decision.kind !== "write") return false;
+    record.receipt = "writing";
+    void this.writeSettlementReceipt(workspaceId, decision, "execution-settled")
+      .then(
+        (written) => {
+          record.receipt = written ? "written" : "failed";
+        },
+        (error: unknown) => {
+          log.error("Stop release: settlement receipt write threw", { workspaceId, error });
+          record.receipt = "failed";
+        }
+      )
+      .finally(() => this.recheckWorkspaceStopRelease(workspaceId));
+    return true;
+  }
+
+  /** Release step of recheckWorkspaceStopRelease: drop the latch and settle the stopped attempt. */
+  private releaseWorkspaceStopRecord(workspaceId: string, record: WorkspaceStopRecord): void {
     this.workspaceStopRecords.delete(workspaceId);
     for (const release of record.releases) {
       release();
@@ -3555,91 +3634,108 @@ export class TaskService implements AgentTaskIntegration {
       capturedBy: new Set(),
       token: {
         resolveDispatch: () => this.resolveEnqueuedSendDispatch(send),
-        admissionStale: () => {
-          // Admitted obligations belong to their turn: rotation, closure and stops no longer
-          // concern the send itself (the turn is captured by the stop record instead).
-          if (send.state === "admitted") return false;
-          if (send.state === "discharged") return true;
-          if (!this.attemptAdmissionOpen(taskId, attemptId)) return true;
-          if (send.attempt != null && this.ownedAttemptByTaskId.get(taskId) !== send.attempt) {
-            return true;
-          }
-          // A send still in its preflight while the attempt's last stream is undecided, or was
-          // decided a report (or unknowable): it must not start a turn under that attempt. The
-          // queue's own gate handles enqueued entries (hold/refuse) before reaching here.
-          if (send.state === "pending") {
-            const decision = this.findStreamEndDecision(taskId, attemptId);
-            return decision != null && decision.outcome !== "nonreport";
-          }
-          return false;
-        },
+        admissionStale: () => this.isAdmittedSendStale(send),
         onEnqueued: () => {
           if (send.state === "pending") send.state = "enqueued";
         },
-        onAdmitted: (turnId) => {
-          if (send.state === "admitted") {
-            // The dequeued entry is adopted by a second sendMessage naming the same turn.
-            if (send.turnId !== turnId) {
-              log.warn(
-                "[task-attempt] admitted send re-admitted under another turn; keeping first",
-                {
-                  taskId,
-                  attemptId,
-                }
-              );
-            }
-            return;
-          }
-          if (send.state === "discharged") {
-            log.warn("[task-attempt] disposed send reported admitted; ignoring", {
-              taskId,
-              attemptId,
-            });
-            return;
-          }
-          send.state = "admitted";
-          send.turnId = turnId;
-          // A record that captured this obligation while pending now waits on the turn instead,
-          // and owes one more stopStream so the late turn is actually stopped: Phase B's single
-          // stopStream targeted the execution captured at Phase A, not this one.
-          for (const record of send.capturedBy) {
-            record.pendingAdmissions.delete(send);
-            record.capturedTurns.add(turnId);
-            record.cleanupInFlight += 1;
-            void this.aiService
-              .stopStream(taskId, { abandonPartial: false })
-              .catch((error: unknown) => {
-                log.debug("[task-attempt] late-turn stopStream threw", { taskId, error });
-              })
-              .finally(() => {
-                record.cleanupInFlight -= 1;
-                this.recheckWorkspaceStopRelease(taskId);
-              });
-          }
-          send.capturedBy.clear();
-        },
-        onDisposed: (kind) => {
-          if (send.state === "admitted" || send.state === "discharged") return;
-          log.debug("[task-attempt] send obligation disposed before admission", {
-            taskId,
-            attemptId,
-            kind,
-          });
-          const records = [...send.capturedBy];
-          this.dischargeAdmittedSend(send);
-          for (const record of records) {
-            if (this.workspaceStopRecords.get(taskId) === record) {
-              this.recheckWorkspaceStopRelease(taskId);
-            }
-          }
-          this.recheckResumeFailureSettlement(taskId);
-        },
+        onAdmitted: (turnId) => this.recordAdmittedSendTurn(send, turnId),
+        onDisposed: (kind) => this.disposeSendBeforeAdmission(send, kind),
       },
     };
     const sends = this.admittedSendsByTaskId.get(taskId) ?? new Set<AdmittedSend>();
     sends.add(send);
     this.admittedSendsByTaskId.set(taskId, sends);
     return send;
+  }
+
+  /** TurnAdmissionToken.admissionStale for `send` (see createAdmittedSend). */
+  private isAdmittedSendStale(send: AdmittedSend): boolean {
+    const { taskId, attemptId } = send;
+    // Admitted obligations belong to their turn: rotation, closure and stops no longer
+    // concern the send itself (the turn is captured by the stop record instead).
+    if (send.state === "admitted") return false;
+    if (send.state === "discharged") return true;
+    if (!this.attemptAdmissionOpen(taskId, attemptId)) return true;
+    if (send.attempt != null && this.ownedAttemptByTaskId.get(taskId) !== send.attempt) {
+      return true;
+    }
+    // A send still in its preflight while the attempt's last stream is undecided, or was
+    // decided a report (or unknowable): it must not start a turn under that attempt. The
+    // queue's own gate handles enqueued entries (hold/refuse) before reaching here.
+    if (send.state === "pending") {
+      return this.streamEndBlocksNewTurn(taskId, attemptId);
+    }
+    return false;
+  }
+
+  /** The attempt's last stream is undecided, or was decided a report (or unknowable). */
+  private streamEndBlocksNewTurn(taskId: string, attemptId: string): boolean {
+    const decision = this.findStreamEndDecision(taskId, attemptId);
+    return decision != null && decision.outcome !== "nonreport";
+  }
+
+  /** TurnAdmissionToken.onAdmitted for `send`: bind it to `turnId` (see createAdmittedSend). */
+  private recordAdmittedSendTurn(send: AdmittedSend, turnId: symbol): void {
+    const { taskId, attemptId } = send;
+    if (send.state === "admitted") {
+      // The dequeued entry is adopted by a second sendMessage naming the same turn.
+      if (send.turnId !== turnId) {
+        log.warn("[task-attempt] admitted send re-admitted under another turn; keeping first", {
+          taskId,
+          attemptId,
+        });
+      }
+      return;
+    }
+    if (send.state === "discharged") {
+      log.warn("[task-attempt] disposed send reported admitted; ignoring", {
+        taskId,
+        attemptId,
+      });
+      return;
+    }
+    send.state = "admitted";
+    send.turnId = turnId;
+    // A record that captured this obligation while pending now waits on the turn instead,
+    // and owes one more stopStream so the late turn is actually stopped: Phase B's single
+    // stopStream targeted the execution captured at Phase A, not this one.
+    for (const record of send.capturedBy) {
+      record.pendingAdmissions.delete(send);
+      record.capturedTurns.add(turnId);
+      record.cleanupInFlight += 1;
+      void this.aiService
+        .stopStream(taskId, { abandonPartial: false })
+        .catch((error: unknown) => {
+          log.debug("[task-attempt] late-turn stopStream threw", { taskId, error });
+        })
+        .finally(() => {
+          record.cleanupInFlight -= 1;
+          this.recheckWorkspaceStopRelease(taskId);
+        });
+    }
+    send.capturedBy.clear();
+  }
+
+  /** TurnAdmissionToken.onDisposed for `send`: no turn will exist (see createAdmittedSend). */
+  private disposeSendBeforeAdmission(
+    send: AdmittedSend,
+    kind: Parameters<TurnAdmissionToken["onDisposed"]>[0]
+  ): void {
+    const { taskId, attemptId } = send;
+    if (send.state === "admitted" || send.state === "discharged") return;
+    log.debug("[task-attempt] send obligation disposed before admission", {
+      taskId,
+      attemptId,
+      kind,
+    });
+    const records = [...send.capturedBy];
+    this.dischargeAdmittedSend(send);
+    for (const record of records) {
+      if (this.workspaceStopRecords.get(taskId) === record) {
+        this.recheckWorkspaceStopRelease(taskId);
+      }
+    }
+    this.recheckResumeFailureSettlement(taskId);
   }
 
   /**
@@ -3691,6 +3787,18 @@ export class TaskService implements AgentTaskIntegration {
     if (entry.taskAttemptRetiredBy != null) {
       return { kind: "refused", message: retiredAttemptMessage(entry.taskAttemptRetiredBy) };
     }
+    return this.admitSendToCurrentAttempt(workspaceId, entry, options);
+  }
+
+  /**
+   * Attempt step of admitTaskWorkspaceTurn for a task entry that is not retired: refuse a send
+   * the current attempt cannot take, else bind it to that attempt.
+   */
+  private admitSendToCurrentAttempt(
+    workspaceId: string,
+    entry: WorkspaceConfigEntry,
+    options: { acceptanceOrigin: TurnAcceptanceOrigin; expectedAttemptId?: string }
+  ): TaskTurnAdmission {
     const attemptId = this.currentTaskAttemptId(workspaceId, entry);
     if (attemptId == null) {
       log.debug("[task-attempt] send into a pre-identity task entry carries no obligation", {
@@ -3751,13 +3859,11 @@ export class TaskService implements AgentTaskIntegration {
       if (!owned.receiptEligible) {
         return { proven: false, reason: "predecessor owned but not receipt-eligible" };
       }
-      let settlement = this.attemptSettlementByTaskId.get(taskId);
-      if (settlement?.attempt === owned && settlement.phase === "closing") {
+      if (this.ownedAttemptSettlementPhase(taskId, owned) === "closing") {
         // The producer's awaited write is in flight; wait for its outcome (bounded, no lock).
         await this.waitForAttemptClosureToSettle(taskId, ATTEMPT_CLOSURE_SETTLE_WAIT_MS);
-        settlement = this.attemptSettlementByTaskId.get(taskId);
       }
-      if (settlement?.attempt === owned && settlement.phase === "settled") {
+      if (this.ownedAttemptSettlementPhase(taskId, owned) === "settled") {
         return { proven: true, reason: "predecessor settled by this process" };
       }
     }
@@ -3768,25 +3874,16 @@ export class TaskService implements AgentTaskIntegration {
       taskId,
       attemptId
     );
-    if (receipt.kind === "found") {
-      // The strict reader binds task and attempt id to the path; the parent is bound here, to
-      // the entry: a receipt naming another parent at this path was copied or misplaced, never
-      // written by this task's owner (the same fail-closed outcome as an unreadable receipt).
-      if (receipt.receipt.parentWorkspaceId !== parentWorkspaceId) {
-        return {
-          proven: false,
-          reason: `settlement receipt names parent ${receipt.receipt.parentWorkspaceId}, expected ${parentWorkspaceId}`,
-        };
-      }
-      return { proven: true, reason: "settlement receipt found" };
-    }
-    return {
-      proven: false,
-      reason:
-        receipt.kind === "unreadable"
-          ? `settlement receipt unreadable: ${receipt.error}`
-          : "no settlement receipt for the predecessor attempt",
-    };
+    return lineageProofFromReceipt(receipt, parentWorkspaceId);
+  }
+
+  /** Phase of this process's settlement entry for `owned`; undefined when it records another. */
+  private ownedAttemptSettlementPhase(
+    taskId: string,
+    owned: OwnedTaskAttempt
+  ): AttemptSettlementEntry["phase"] | undefined {
+    const settlement = this.attemptSettlementByTaskId.get(taskId);
+    return settlement?.attempt === owned ? settlement.phase : undefined;
   }
 
   /**
@@ -3988,25 +4085,16 @@ export class TaskService implements AgentTaskIntegration {
     } catch (error: unknown) {
       return unproven(`config unreadable: ${getErrorMessage(error)}`);
     }
-    if (row == null) return unproven("no task record");
-    const attemptId = row.taskAttemptId;
-    if (!isTaskAttemptId(attemptId)) return unproven("no attempt id (pre-identity entry)");
-    if (row.taskStatus !== "interrupted") return unproven(`status ${row.taskStatus ?? "missing"}`);
-    if (row.taskAttemptUnproven === true) return unproven("lineage marked unproven");
-    const parentWorkspaceId = coerceNonEmptyString(row.parentWorkspaceId);
-    if (parentWorkspaceId == null) return unproven("no parent");
+    const candidate = unownedSettlementCandidate(row);
+    if (candidate.kind === "unproven") return candidate;
+    const { attemptId, parentWorkspaceId } = candidate;
     const receipt = await readSubagentAttemptSettlementReceiptStrict(
       path.join(this.config.sessionsDir, parentWorkspaceId),
       taskId,
       attemptId
     );
-    if (receipt.kind === "not_found") return unproven(`no settlement receipt for ${attemptId}`);
-    if (receipt.kind === "unreadable") {
-      return unproven(`settlement receipt unreadable: ${receipt.error}`);
-    }
-    if (receipt.receipt.parentWorkspaceId !== parentWorkspaceId) {
-      return unproven(`settlement receipt names parent ${receipt.receipt.parentWorkspaceId}`);
-    }
+    const receiptGap = unownedSettlementReceiptGap(receipt, attemptId, parentWorkspaceId);
+    if (receiptGap != null) return unproven(receiptGap);
     let latest: WorkspaceConfigEntry | undefined;
     try {
       latest = readRow();
