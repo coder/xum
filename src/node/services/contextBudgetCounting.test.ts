@@ -194,41 +194,62 @@ describe("real-encoding budget guards", () => {
     ).toBeUndefined();
   });
 
-  test("encrypted OpenAI reasoning does not inflate either count or mutate the request", async () => {
-    const payload = (encrypted: string) => ({
+  test.each([
+    {
+      name: "OpenAI encrypted reasoning",
+      type: "reasoning",
+      options: (v: string) => ({ openai: { reasoningEncryptedContent: v } }),
+    },
+    {
+      name: "an Anthropic thinking signature",
+      type: "reasoning",
+      options: (v: string) => ({ anthropic: { signature: v } }),
+    },
+    {
+      name: "Anthropic redacted thinking",
+      type: "reasoning",
+      options: (v: string) => ({ anthropic: { redactedData: v } }),
+    },
+    {
+      name: "a Google thought signature",
+      type: "text",
+      options: (v: string) => ({ google: { thoughtSignature: v } }),
+    },
+    {
+      name: "OpenRouter reasoning details",
+      type: "tool-call",
+      options: (v: string) => ({
+        openrouter: { reasoning_details: [{ type: "reasoning.encrypted", data: v }] },
+      }),
+    },
+  ])("$name does not inflate either count or mutate the request", async ({ type, options }) => {
+    const payload = (secret: string) => ({
       messages: [
         {
           role: "assistant",
           content: [
             {
-              type: "reasoning",
-              text: "Check the result.",
-              providerOptions: { openai: { reasoningEncryptedContent: encrypted } },
+              ...(type === "tool-call"
+                ? { type, toolCallId: "call", toolName: "read", input: {} }
+                : { type, text: "Check the result." }),
+              providerOptions: options(secret),
             },
           ],
         },
       ],
     });
-    const encrypted = "a0b1c2d3e4f5".repeat(4000);
-    const request = payload(encrypted);
+    const secret = "a0b1c2d3e4f5".repeat(4000);
+    const request = payload(secret);
     expect(estimateAssembledRequestTokens(request)).toBe(
       estimateAssembledRequestTokens(payload("short"))
     );
     expect(
       await checkAssembledRequestBudgetForModel(request, { model, modelContextLimit: 10000 })
     ).toBeUndefined();
-    expect(request.messages[0].content[0].providerOptions.openai.reasoningEncryptedContent).toBe(
-      encrypted
-    );
+    expect(request.messages[0].content[0].providerOptions).toEqual(options(secret));
   });
 
-  test.each([
-    "text",
-    "other-openai-field",
-    "other-provider",
-    "nested-field",
-    "non-string",
-  ] as const)("reasoning still counts %s beside encrypted OpenAI metadata", async (kind) => {
+  test("reasoning text still counts beside replay metadata", async () => {
     const large = "a0b1c2d3e4f5".repeat(4000);
     const request = {
       messages: [
@@ -237,17 +258,8 @@ describe("real-encoding budget guards", () => {
           content: [
             {
               type: "reasoning",
-              text: kind === "text" ? large : "Check the result.",
-              providerOptions: {
-                openai: {
-                  reasoningEncryptedContent: kind === "non-string" ? { text: large } : large,
-                  ...(kind === "other-openai-field" ? { extra: large } : {}),
-                  ...(kind === "nested-field"
-                    ? { extra: { reasoningEncryptedContent: large } }
-                    : {}),
-                },
-                ...(kind === "other-provider" ? { xai: { reasoningEncryptedContent: large } } : {}),
-              },
+              text: large,
+              providerOptions: { openai: { reasoningEncryptedContent: large } },
             },
           ],
         },
