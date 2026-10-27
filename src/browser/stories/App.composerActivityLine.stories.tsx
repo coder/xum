@@ -296,6 +296,31 @@ async function assertPanelSurvivesTurnEnd(line: HTMLElement, workspaceId: string
   ).toBeVisible();
 }
 
+// The chips' shortcuts open their panel from the composer and focus it; the chord again, or
+// Escape, closes it and puts focus back in the composer, with the stream still running.
+async function assertPanelChords(line: HTMLElement, canvasElement: HTMLElement) {
+  const composer = canvasElement.querySelector<HTMLTextAreaElement>("textarea");
+  if (composer === null) throw new Error("No composer textarea");
+  composer.focus();
+  await userEvent.keyboard("{Control>}{Alt>}r{/Alt}{/Control}");
+  const reviews = await findChatActivityPanel();
+  await expect(reviews).toHaveAccessibleName("Reviews");
+  await waitFor(() => expect(reviews.contains(document.activeElement)).toBe(true));
+  await userEvent.keyboard("{Control>}{Alt>}r{/Alt}{/Control}");
+  await waitFor(() => expect(document.querySelector("[data-activity-panel]")).toBeNull());
+  await expect(composer).toHaveFocus();
+
+  await userEvent.keyboard("{Control>}{Alt>}o{/Alt}{/Control}");
+  const todo = await findChatActivityPanel();
+  await expect(todo).toHaveAccessibleName("TODO");
+  // A TODO list has no controls: the panel itself takes focus.
+  await waitFor(() => expect(todo).toHaveFocus());
+  await userEvent.keyboard("{Escape}");
+  await waitFor(() => expect(document.querySelector("[data-activity-panel]")).toBeNull());
+  await expect(composer).toHaveFocus();
+  await expect(within(line).getByRole("button", { name: "Stop streaming" })).toBeVisible();
+}
+
 export const WorstCaseDesktop: AppStory = {
   render: () => <AppWithMocks setup={() => setupActivityLineStory("ws-activity-line-desktop")} />,
   parameters: {
@@ -308,6 +333,7 @@ export const WorstCaseDesktop: AppStory = {
     // Every chip fits a desktop line: no "+N" chip.
     await expect(within(line).queryByRole("button", { name: /\d+ more$/ })).toBeNull();
     await assertPanels(line, "popover");
+    await assertPanelChords(line, canvasElement);
     await assertTodoChipFollowsRewrite(line, "ws-activity-line-desktop");
     await assertPanelSurvivesTurnEnd(line, "ws-activity-line-desktop");
   },

@@ -3,8 +3,12 @@ import { Terminal, X, Loader2, FileText } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { BackgroundBashOutputDialog } from "../BackgroundBashOutputDialog/BackgroundBashOutputDialog";
-import { ActivityChipLiveDot, ChatInputDecoration } from "../ChatPane/ChatInputDecoration";
-import { useChatActivityPanel } from "../ChatPane/chatActivityPanels";
+import {
+  ACTIVITY_SHORTCUT_HINT_CLASS,
+  ActivityChipLiveDot,
+  ChatInputDecoration,
+} from "../ChatPane/ChatInputDecoration";
+import { acceptsActivityPanelChord, useChatActivityPanel } from "../ChatPane/chatActivityPanels";
 import { formatKeyLabel } from "../Keycap/Keycap";
 import { formatElapsed } from "@/common/utils/formatDuration";
 import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
@@ -15,20 +19,9 @@ import {
 import { useBackgroundBashActions } from "@/browser/contexts/BackgroundBashContext";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import {
-  KEYBINDS,
-  formatKeybind,
-  isCommandPaletteTarget,
-  isDialogOpen,
-  isTerminalFocused,
-  matchesKeybind,
-  paneHandlesKeyEvent,
-} from "@/browser/utils/ui/keybinds";
+import { KEYBINDS, formatKeybind, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
-
-const SHORTCUT_HINT_CLASS =
-  "ml-1.5 font-mono text-[10px] opacity-70 [@media(max-width:768px)]:hidden";
 
 /** Focuses the expanded strip's row at `index`, clamped to the rows that exist. */
 function focusProcessRow(list: HTMLElement | null, index: number): void {
@@ -192,11 +185,10 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       setFocusRequest((request) => request + 1);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!matchesKeybind(event, KEYBINDS.FOCUS_BACKGROUND_PROCESSES) || isDialogOpen()) return;
-      if (!paneHandlesKeyEvent(paneScope, event.target)) return;
-      if (isCommandPaletteTarget(event.target)) return;
-      if (isTerminalFocused(event.target)) return; // the terminal owns its keystrokes
-      if (rootRef.current?.closest("[inert]")) return;
+      const root = rootRef.current;
+      if (!acceptsActivityPanelChord(event, KEYBINDS.FOCUS_BACKGROUND_PROCESSES, paneScope, root)) {
+        return;
+      }
       event.preventDefault();
       if (event.repeat) return;
       if (listRef.current?.contains(document.activeElement)) {
@@ -336,7 +328,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
           chipTooltip={
             <>
               Background bashes
-              <kbd className={SHORTCUT_HINT_CLASS}>
+              <kbd className={ACTIVITY_SHORTCUT_HINT_CLASS}>
                 {formatKeybind(KEYBINDS.FOCUS_BACKGROUND_PROCESSES)}
               </kbd>
             </>
@@ -455,7 +447,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         </TooltipTrigger>
                         <TooltipContent>
                           View output
-                          <kbd className={SHORTCUT_HINT_CLASS}>
+                          <kbd className={ACTIVITY_SHORTCUT_HINT_CLASS}>
                             {formatKeybind(KEYBINDS.BACKGROUND_PROCESS_VIEW_OUTPUT)}
                           </kbd>
                         </TooltipContent>
@@ -484,7 +476,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         </TooltipTrigger>
                         <TooltipContent>
                           Terminate process
-                          <kbd className={SHORTCUT_HINT_CLASS}>
+                          <kbd className={ACTIVITY_SHORTCUT_HINT_CLASS}>
                             {formatKeybind(KEYBINDS.BACKGROUND_PROCESS_TERMINATE)}
                           </kbd>
                         </TooltipContent>

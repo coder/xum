@@ -25,6 +25,7 @@ import {
 import { useChatActivityPanel } from "@/browser/components/ChatPane/chatActivityPanels";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   isWorkspaceDelegatedActivityActive,
   isWorkspaceSidebarStateWorking,
@@ -813,6 +814,7 @@ export function SubAgentTasksContent(props: {
       chipLabel={chip.label}
       chip={<SubAgentsChip icon={SummaryIcon} count={chip.count} active={chip.active} />}
       panelTitle={names.panelTitle}
+      panelKeybind={KEYBINDS.OPEN_SUB_AGENTS_PANEL}
       panelMeta={formatSubAgentsPanelMeta(props.subAgents.length, activeCount, workflowSummary)}
       tab={
         <>

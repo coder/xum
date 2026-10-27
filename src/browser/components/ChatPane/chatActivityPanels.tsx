@@ -13,7 +13,16 @@ import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { useNarrowViewport, useShortViewport } from "@/browser/hooks/useNarrowViewport";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { isDialogOpen } from "@/browser/utils/ui/keybinds";
+import {
+  isAltGraphPressed,
+  isCommandPaletteTarget,
+  isDialogOpen,
+  isTerminalFocused,
+  matchesKeybind,
+  paneHandlesKeyEvent,
+  type ChatPaneScope,
+  type Keybind,
+} from "@/browser/utils/ui/keybinds";
 import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { cn } from "@/common/lib/utils";
 
@@ -126,6 +135,26 @@ export function useReleaseChatActivityPanelOnUnmount(id: ChatActivityId | undefi
     if (setOpenId === undefined || id === undefined) return;
     return () => setOpenId((current) => (current === id ? null : current));
   }, [setOpenId, id]);
+}
+
+/**
+ * Whether a window keydown is the chord that opens a live-line panel in this pane. The main chat
+ * and each /side chat mount their own line, so only the pane owning the focused element reacts.
+ * `element` is in the line: under immersive review desktop keeps the chat pane mounted but inert.
+ */
+export function acceptsActivityPanelChord(
+  event: KeyboardEvent,
+  keybind: Keybind,
+  paneScope: ChatPaneScope,
+  element: Element | null
+): boolean {
+  // Ctrl+Alt chords must not claim AltGr input, which types characters.
+  if (!matchesKeybind(event, keybind) || isAltGraphPressed(event) || isDialogOpen()) return false;
+  if (!paneHandlesKeyEvent(paneScope, event.target)) return false;
+  if (isCommandPaletteTarget(event.target)) return false;
+  // The terminal owns its keystrokes.
+  if (isTerminalFocused(event.target)) return false;
+  return element?.closest("[inert]") == null;
 }
 
 /**

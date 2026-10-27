@@ -1,13 +1,16 @@
-import { useId, useRef } from "react";
-import type { KeyboardEvent, KeyboardEventHandler, ReactNode, Ref } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import type { KeyboardEvent, KeyboardEventHandler, ReactNode, Ref, RefObject } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, ChevronRight, X } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
+import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
+import { formatKeybind, formatKeybindForAria, type Keybind } from "@/browser/utils/ui/keybinds";
 import { useChatDockColumnWidthClass } from "./chatDockColumn";
 import {
+  acceptsActivityPanelChord,
   CHAT_ACTIVITY_ORDER,
   useChatActivityOverflow,
   useChatActivitySheet,
@@ -55,6 +58,11 @@ interface ChatInputDecorationProps {
   panelMeta?: ReactNode;
   /** Formatted shortcut that toggles this panel, shown in its heading (desktop only). */
   panelShortcut?: string;
+  /**
+   * Chord that opens this panel from anywhere in the chat pane and focuses it; again, or Esc,
+   * closes it and returns focus to where it was. The chip's tooltip and the panel heading show it.
+   */
+  panelKeybind?: Keybind;
   /** Key hints under the list (desktop only: phones have no keyboard to hint at). */
   panelFooter?: ReactNode;
   /**
@@ -135,6 +143,10 @@ function closeOnEscape(event: KeyboardEvent<HTMLElement>, close: () => void): vo
   close();
 }
 
+/** A shortcut in a chip's tooltip; hidden on phones, which have no keyboard to hint at. */
+export const ACTIVITY_SHORTCUT_HINT_CLASS =
+  "ml-1.5 font-mono text-[10px] opacity-70 [@media(max-width:768px)]:hidden";
+
 /** A running indicator inside a chip (bashes running, sub-agents working). */
 export function ActivityChipLiveDot() {
   return <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-[var(--color-success)]" />;
@@ -152,6 +164,60 @@ function focusChip(chip: HTMLButtonElement | null, overflowed: boolean): void {
   }
 }
 
+const PANEL_FOCUSABLE =
+  'button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])';
+
+/** The open panel's first control, else the panel itself (a TODO list has no controls). */
+function focusPanel(panelId: string): void {
+  const panel = document.getElementById(panelId);
+  const content = panel?.querySelector("[data-activity-panel-content]");
+  (content?.querySelector<HTMLElement>(PANEL_FOCUSABLE) ?? panel)?.focus();
+}
+
+/**
+ * The chip's `panelKeybind`. The chord opens the panel and moves focus into it, recording where
+ * focus was (usually the composer) so closing returns there; with focus in the open panel, the
+ * chord closes it.
+ */
+function usePanelChord(options: {
+  keybind: Keybind | undefined;
+  open: boolean;
+  panelId: string;
+  chipRef: RefObject<HTMLButtonElement | null>;
+  returnFocusRef: { current: HTMLElement | null };
+  onOpen: () => void;
+  onClose: () => void;
+}): void {
+  const { keybind, open, panelId, chipRef, returnFocusRef, onOpen, onClose } = options;
+  const paneScope = useChatPaneScope();
+  const [focusRequest, setFocusRequest] = useState(0);
+  useEffect(() => {
+    if (keybind === undefined) return;
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (!acceptsActivityPanelChord(event, keybind, paneScope, chipRef.current)) return;
+      event.preventDefault();
+      if (event.repeat) return;
+      const panel = document.getElementById(panelId);
+      const active = document.activeElement;
+      if (open && panel?.contains(active)) {
+        onClose();
+        return;
+      }
+      if (active instanceof HTMLElement && active !== document.body) {
+        returnFocusRef.current = active;
+      }
+      if (!open) onOpen();
+      setFocusRequest((request) => request + 1);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [keybind, open, panelId, paneScope, chipRef, returnFocusRef, onOpen, onClose]);
+  // After the commit that renders the panel. On phones the sheet then keeps this focus.
+  useEffect(() => {
+    if (focusRequest > 0) focusPanel(panelId);
+  }, [focusRequest, panelId]);
+}
+
 /** The chip, its tab in the phone activity sheet, and its panel while open. */
 function ChatActivityChip(props: ChatInputDecorationProps) {
   const chipRef = useRef<HTMLButtonElement>(null);
@@ -160,24 +226,58 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
   const { overflow, moreList } = useChatActivityOverflow();
   const overflowed = props.activityId !== undefined && overflow.includes(props.activityId);
   const renderPanel = props.expanded ? props.renderExpanded : undefined;
+  const open = renderPanel !== undefined;
   // mutation-equivalent: chip is an element or absent, never another falsy node
   const chipContent = props.chip ?? props.summary;
+  // Where focus was when the chord opened the panel; closing returns there instead of the chip.
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    // Closed another way (the chip, a press outside): the next close starts from the chip again.
+    if (!open) returnFocusRef.current = null;
+  }, [open]);
   const close = () => {
+    const origin = returnFocusRef.current;
     props.onToggle();
-    // mutation-equivalent: close runs only from the chip's own handlers and listener, so the chip is mounted
-    focusChip(chipRef.current, overflowed);
+    if (origin?.isConnected === true) {
+      origin.focus();
+    } else {
+      // mutation-equivalent: close runs only from the chip's own handlers and listener, so the chip is mounted
+      focusChip(chipRef.current, overflowed);
+    }
   };
-  useCloseChatActivityPanelOnBodyEscape(renderPanel !== undefined, close);
+  useCloseChatActivityPanelOnBodyEscape(open, close);
+  usePanelChord({
+    keybind: props.renderExpanded === undefined ? undefined : props.panelKeybind,
+    open,
+    panelId,
+    chipRef,
+    returnFocusRef,
+    onOpen: props.onToggle,
+    onClose: close,
+  });
+  const shortcut = props.panelKeybind === undefined ? undefined : formatKeybind(props.panelKeybind);
+  const tooltip =
+    shortcut === undefined ? (
+      props.chipTooltip
+    ) : (
+      <>
+        {props.chipTooltip ?? props.panelTitle}
+        <kbd className={ACTIVITY_SHORTCUT_HINT_CLASS}>{shortcut}</kbd>
+      </>
+    );
 
   return (
     <div className="contents" data-component={props.dataComponent}>
       <ChatActivityChipButton
         chipRef={chipRef}
         hasPanel={props.renderExpanded !== undefined}
-        open={renderPanel !== undefined}
+        open={open}
         panelId={panelId}
         label={props.chipLabel}
-        tooltip={props.chipTooltip}
+        tooltip={tooltip}
+        keyShortcuts={
+          props.panelKeybind === undefined ? undefined : formatKeybindForAria(props.panelKeybind)
+        }
         variant={props.chipVariant}
         activityId={props.activityId}
         overflowed={overflowed}
@@ -199,7 +299,7 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
       {props.renderExpanded !== undefined && (
         <ChatActivitySheetTab
           activityId={props.activityId}
-          open={renderPanel !== undefined}
+          open={open}
           panelId={panelId}
           onOpen={props.onToggle}
         >
@@ -210,6 +310,7 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
       {renderPanel && (
         <ChatActivityChipPanel
           {...props}
+          panelShortcut={props.panelShortcut ?? shortcut}
           panelId={panelId}
           onClose={close}
           renderPanel={renderPanel}
@@ -251,9 +352,11 @@ function ChatActivityPopover(props: ChatActivityPanelProps) {
       role="group"
       aria-label={props.panelTitle ?? props.chipLabel}
       data-activity-panel=""
+      // Its shortcut focuses the panel itself when the list has no controls.
+      tabIndex={-1}
       onKeyDown={(event) => closeOnEscape(event, props.onClose)}
       className={cn(
-        "bg-surface-primary border-border-medium absolute bottom-full z-30 mb-1 flex max-h-[min(55vh,26rem)] w-[min(30rem,100%)] flex-col overflow-hidden rounded-lg border shadow-lg",
+        "bg-surface-primary border-border-medium absolute outline-none bottom-full z-30 mb-1 flex max-h-[min(55vh,26rem)] w-[min(30rem,100%)] flex-col overflow-hidden rounded-lg border shadow-lg",
         props.chipVariant === "plain" ? "left-0" : "right-0"
       )}
     >
@@ -276,6 +379,7 @@ function ChatActivityPopover(props: ChatActivityPanelProps) {
       {/* The content's own key handler runs before the panel's (events bubble from it). */}
       <div
         ref={props.contentRef}
+        data-activity-panel-content=""
         onKeyDown={props.onContentKeyDown}
         className={cn("min-h-0 overflow-y-auto px-1", props.contentClassName)}
       >
@@ -297,14 +401,16 @@ function ChatActivitySheetPanel(props: ChatActivityPanelProps) {
       role="tabpanel"
       aria-label={props.panelTitle ?? props.chipLabel}
       data-activity-panel=""
+      tabIndex={-1}
       onKeyDown={(event) => closeOnEscape(event, props.onClose)}
-      className="flex min-h-0 flex-1 flex-col"
+      className="flex min-h-0 flex-1 flex-col outline-none"
     >
       <div className="text-muted shrink-0 px-4 pt-3 pb-1 text-xs">
         {props.panelMeta ?? props.summary}
       </div>
       <div
         ref={props.contentRef}
+        data-activity-panel-content=""
         onKeyDown={props.onContentKeyDown}
         // The sheet sets the height; the inline row's max height would waste the room.
         className={cn("min-h-0 overflow-y-auto px-2", props.contentClassName, "max-h-none")}
@@ -382,6 +488,7 @@ function ChatActivityChipButton(props: {
   panelId: string;
   label?: string;
   tooltip?: ReactNode;
+  keyShortcuts?: string;
   variant?: "plain";
   activityId?: ChatActivityId;
   /**
@@ -411,6 +518,7 @@ function ChatActivityChipButton(props: {
         aria-expanded={props.hasPanel ? props.open : undefined}
         aria-controls={props.open ? props.panelId : undefined}
         aria-label={props.label}
+        aria-keyshortcuts={props.keyShortcuts}
         onClick={props.onToggle}
         onKeyDown={props.open ? (event) => closeOnEscape(event, props.onClose) : undefined}
         // The button is the touch target (globals.css grows buttons to 44px on touch phones) and

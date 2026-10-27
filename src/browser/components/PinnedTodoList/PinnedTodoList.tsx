@@ -5,6 +5,7 @@ import { TodoList } from "../TodoList/TodoList";
 import { ChatInputDecoration } from "../ChatPane/ChatInputDecoration";
 import { useChatActivityPanel } from "../ChatPane/chatActivityPanels";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { TodoItem } from "@/common/types/tools";
 
 interface PinnedTodoListProps {
@@ -136,6 +137,7 @@ export const PinnedTodoList: React.FC<PinnedTodoListProps> = ({ workspaceId }) =
       chipVariant="plain"
       chipClassName="min-w-14"
       panelTitle="TODO"
+      panelKeybind={KEYBINDS.OPEN_TODO_PANEL}
       panelMeta={[`${progress} done`, ...(currentTodo ? summaryParts : [])].join(" · ")}
       tab={
         <>

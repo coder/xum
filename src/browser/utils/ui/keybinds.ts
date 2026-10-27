@@ -574,6 +574,13 @@ export const KEYBINDS = {
   // Expand the background processes strip and focus its first row; again (or Esc) collapses it.
   // The VS Code webview forwards every keydown to the workbench: avoid VS Code's global chords.
   FOCUS_BACKGROUND_PROCESSES: { key: "J", ctrl: true, shift: true },
+  // Open the live line's TODO, sub-agents or reviews panel and focus it; again (or Esc) closes it.
+  // Ctrl/Cmd+Alt, like NEW_SIDEBAR_TAB: Ctrl/Cmd+Shift has no free letters left for them, and
+  // Ctrl+Alt+T is GNOME's terminal. Matched by `code`: Option+letter is a dead key on macOS.
+  // The settings backup chords reuse these keys only inside the Settings dialog.
+  OPEN_TODO_PANEL: { key: "o", code: "KeyO", ctrl: true, alt: true },
+  OPEN_SUB_AGENTS_PANEL: { key: "a", code: "KeyA", ctrl: true, alt: true },
+  OPEN_REVIEWS_PANEL: { key: "r", code: "KeyR", ctrl: true, alt: true },
   // Scoped to a focused row of the background processes strip.
   BACKGROUND_PROCESS_NEXT: { key: "ArrowDown" },
   BACKGROUND_PROCESS_PREV: { key: "ArrowUp" },

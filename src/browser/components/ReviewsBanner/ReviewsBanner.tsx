@@ -438,6 +438,7 @@ const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) 
         />
       }
       panelTitle="Reviews"
+      panelKeybind={KEYBINDS.OPEN_REVIEWS_PANEL}
       panelMeta={formatReviewsPanelMeta(reviewsHook.pendingCount, reviewsHook.checkedCount)}
       tab={
         <ReviewsTab
