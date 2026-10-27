@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { GlobalWindow } from "happy-dom";
 import {
@@ -60,7 +61,8 @@ test("each run records the host's 1-minute load and PSI cpu some avg10, or null 
 });
 
 test("processes of a run that outlive the server by 10 s are killed before it returns, and the run is invalid", async () => {
-  let [alive, killed, sleeps] = [[41, 42], [] as number[], 0];
+  let [alive, sleeps] = [[41, 42], 0];
+  const killed: number[] = [];
   // A real macrotask per poll: a reaper that never ends fails on the test timeout instead of hanging.
   const sleep = () => new Promise<void>((resolve) => setImmediate(() => resolve(void sleeps++)));
   const kill = (pid: number) => {
@@ -192,7 +194,10 @@ describe("the probe's IR check", () => {
     }
     for (const name of names) {
       const value = (dom as unknown as Record<string, unknown>)[name];
-      const bound = typeof value === "function" && /^[a-z]/.test(name) ? value.bind(dom) : value;
+      const bound =
+        typeof value === "function" && /^[a-z]/.test(name)
+          ? (value as (...args: unknown[]) => unknown).bind(dom)
+          : value;
       Object.defineProperty(globalThis, name, { value: bound, configurable: true, writable: true });
     }
     // Element Timing is UCS, not IR: a no-op observer keeps this test on the IR path.

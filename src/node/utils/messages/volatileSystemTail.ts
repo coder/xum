@@ -329,9 +329,18 @@ export function planVolatileSystemTail(
   requestTail: string,
   rowsSupported: boolean,
   /** Replay only: `requestTail` is the tail the turn sent, and this is the turn's record. */
-  replayedTurn?: { record?: VolatileSystemTailRecord }
+  replayedTurn?: { record?: VolatileSystemTailRecord },
+  /** A model or agent switch, as in planCustomInstructions. */
+  refreeze = false
 ): VolatileSystemTailPlan {
-  return planSystemSection(VOLATILE_TAIL, messages, requestTail, rowsSupported, replayedTurn);
+  return planSystemSection(
+    VOLATILE_TAIL,
+    messages,
+    requestTail,
+    rowsSupported,
+    replayedTurn,
+    refreeze
+  );
 }
 
 /**
@@ -407,14 +416,17 @@ export function planSkillIndex(
   messages: MuxMessage[],
   requestIndex: string,
   rowsSupported: boolean,
-  replayedTurn?: { record?: VolatileSystemTailRecord }
+  replayedTurn?: { record?: VolatileSystemTailRecord },
+  /** A model or agent switch, as in planCustomInstructions. */
+  refreeze = false
 ): VolatileSystemTailPlan {
   return planRemovableSection(
     { ...SKILL_INDEX, removed: SKILL_INDEX_REMOVED },
     messages,
     requestIndex,
     rowsSupported,
-    replayedTurn
+    replayedTurn,
+    refreeze
   );
 }
 
@@ -427,14 +439,17 @@ export function planToolInstructions(
   messages: MuxMessage[],
   requestInstructions: Record<string, string>,
   rowsSupported: boolean,
-  replayedTurn?: { record?: VolatileSystemTailRecord }
+  replayedTurn?: { record?: VolatileSystemTailRecord },
+  /** A model or agent switch, as in planCustomInstructions. */
+  refreeze = false
 ): VolatileSystemTailPlan {
   return planRemovableSection(
     { ...TOOL_INSTRUCTIONS, removed: TOOL_INSTRUCTIONS_REMOVED },
     messages,
     serializeToolInstructions(requestInstructions),
     rowsSupported,
-    replayedTurn
+    replayedTurn,
+    refreeze
   );
 }
 
@@ -479,9 +494,12 @@ function planSystemSection(
     return asBefore;
   }
   if (liveTail === appliedTail) return withRows;
-  // A row must follow a user message. Otherwise (a resume after an assistant row) send the new
-  // tail as before, which re-freezes the segment at it.
-  if (messages.at(-1)?.role !== "user") return asBefore;
+  // A row must follow a user message. Otherwise (a retry after a stream failure, or a resume
+  // after an assistant row) keep the frozen section and record nothing: the next request
+  // after a user message sends the change as a row. A re-freeze here rewrote the warm cache
+  // seconds after the failed attempt (F36: 3 prefix breaks on retries in one day), and the
+  // turn's earlier steps read the frozen section anyway.
+  if (messages.at(-1)?.role !== "user") return withRows;
   const appendedRow = systemRow(`${channel.rowId}-pending`, channel, liveTail);
   return {
     ...withRows,

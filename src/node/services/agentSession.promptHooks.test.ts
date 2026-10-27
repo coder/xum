@@ -5,7 +5,7 @@
  * runMessageSendHooks (the same runner AIService uses).
  */
 import { stripClientPluginSendHookFields } from "@/common/utils/messages/pluginSendHookFields";
-import { afterEach, describe, expect, mock, test } from "bun:test";
+import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import assert from "node:assert";
 import {
   createMuxMessage,
@@ -19,7 +19,7 @@ import { GOAL_CONTINUATION_KIND } from "@/constants/goals";
 import { computeSendDigest } from "./sendIds";
 import { waitForCondition } from "./testDispatchHelpers";
 import { eventSpine, type MessageSendContext } from "./events/eventSpine";
-import type { CompactionMonitor } from "./compactionMonitor";
+import { CompactionMonitor } from "./compactionMonitor";
 import { createAgentSessionHarness, type AgentSessionHarness } from "./agentSession.testHarness";
 import type { AgentSessionAIService } from "./agentSession";
 import type { StreamMessageOptions } from "./turnRequestBuilder";
@@ -30,6 +30,7 @@ const harnesses: AgentSessionHarness[] = [];
 const unregisters: Array<() => void> = [];
 
 afterEach(async () => {
+  mock.restore();
   for (const unregister of unregisters.splice(0)) unregister();
   for (const h of harnesses.splice(0).reverse()) {
     await h.session.dispose();
@@ -72,24 +73,21 @@ async function userRows(h: AgentSessionHarness): Promise<MuxMessage[]> {
 const textOf = (row: MuxMessage | undefined) =>
   (row?.parts ?? []).map((part) => (part.type === "text" ? part.text : "")).join("");
 
-/** Force (or suppress) on-send compaction regardless of usage. */
-function setOnSendCompaction(h: AgentSessionHarness, force: boolean): void {
-  (
-    h.session as unknown as { contextController: { compactionMonitor: CompactionMonitor } }
-  ).contextController.compactionMonitor = {
-    checkBeforeSend: mock(() => ({
-      shouldShowWarning: false,
-      shouldForceCompact: force,
-      usagePercentage: force ? 99 : 10,
-      thresholdPercentage: 85,
-    })),
-    checkMidStream: mock(() => false),
-    resetForNewStream: mock(() => undefined),
-    noteUserTurn: mock(() => undefined),
-    noteAutoCompactionRequested: mock(() => undefined),
-    noteAutoCompactionCompleted: mock(() => undefined),
-    suppressRepeatedAutoCompaction: mock(() => false),
-  } as unknown as CompactionMonitor;
+/**
+ * Force (or suppress) on-send compaction regardless of usage. The spies sit on the prototype
+ * because each session builds its monitor internally (#4666); afterEach's mock.restore()
+ * removes them.
+ */
+function setOnSendCompaction(force: boolean): void {
+  spyOn(CompactionMonitor.prototype, "checkBeforeSend").mockReturnValue({
+    shouldShowWarning: false,
+    shouldForceCompact: force,
+    usagePercentage: force ? 99 : 10,
+    thresholdPercentage: 85,
+    contextTokens: 0,
+    maxTokens: undefined,
+  });
+  spyOn(CompactionMonitor.prototype, "checkMidStream").mockReturnValue(false);
 }
 
 const blockAll: Decide = (ctx) => {
@@ -166,7 +164,7 @@ describe("message.send outcomes", () => {
     const { h, calls, streamed } = await setup((ctx) => {
       if (addHookContext) addContext(ctx);
     });
-    setOnSendCompaction(h, false);
+    setOnSendCompaction(false);
     const send = (text: string) =>
       h.session.sendMessage(text, { ...options, additionalSystemInstructions: "Scratchpad." });
 
@@ -263,7 +261,7 @@ describe("message.send outcomes", () => {
 
   test("an automatic send ignores a block, so its sender cannot loop on it", async () => {
     const { h } = await setup(blockAll);
-    setOnSendCompaction(h, false);
+    setOnSendCompaction(false);
 
     const result = await h.session.sendMessage("wake up", options, {
       acceptanceOrigin: "automatic",
@@ -485,7 +483,7 @@ describe("message.send outcomes", () => {
 describe("on-send compaction follow-up", () => {
   test("the diverted send runs the hooks once and carries their context", async () => {
     const { h, calls } = await setup(addContext);
-    setOnSendCompaction(h, true);
+    setOnSendCompaction(true);
 
     const result = await h.session.sendMessage("my token is abc", options);
     expect(result.success).toBe(true);
@@ -524,7 +522,7 @@ describe("on-send compaction follow-up", () => {
 
   test("dispatching a follow-up whose hooks already ran does not run them again", async () => {
     const { h, calls } = await setup(addContext);
-    setOnSendCompaction(h, false);
+    setOnSendCompaction(false);
     await seedHandoff(h, {
       text: "my token is abc",
       model: options.model,
@@ -546,7 +544,7 @@ describe("on-send compaction follow-up", () => {
   test("a redispatched follow-up keeps only the context under the persisted cap", async () => {
     // Codex PRRT_kwDOPxxmWM6rPrJe: the handoff row is read from disk like any other row.
     const { h } = await setup(addContext);
-    setOnSendCompaction(h, false);
+    setOnSendCompaction(false);
     const kept = { pluginId: "fake", text: "Ask for a reproduction first." };
     await seedHandoff(h, {
       text: "fix it",
@@ -565,7 +563,7 @@ describe("on-send compaction follow-up", () => {
     // Codex P1 (PRRT_kwDOPxxmWM6rZbml): WorkspaceService.replaceHistory sanitizes a client's
     // summary row this way before persisting it.
     const { h, calls } = await setup(addContext);
-    setOnSendCompaction(h, false);
+    setOnSendCompaction(false);
     const forged = {
       type: "compaction-summary" as const,
       pendingFollowUp: {
@@ -594,7 +592,7 @@ describe("on-send compaction follow-up", () => {
       // N7of follow-up: the admission run is the follow-up's one hook run, and its context
       // moves to the follow-up row instead of the summarization request.
       const { h, calls } = await setup(addContext);
-      setOnSendCompaction(h, false);
+      setOnSendCompaction(false);
       const followUp = { text: "then fix the bug", model: options.model, agentId: "exec" };
 
       const result = await h.session.sendMessage("Summarize this conversation.", {
@@ -661,7 +659,7 @@ describe("on-send compaction follow-up", () => {
 
   test("a follow-up the hooks never saw (manual /compact) runs them as a system send", async () => {
     const { h, calls } = await setup(() => undefined);
-    setOnSendCompaction(h, false);
+    setOnSendCompaction(false);
     await seedHandoff(h, { text: "then fix the bug", model: options.model, agentId: "exec" });
 
     expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);

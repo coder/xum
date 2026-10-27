@@ -48,6 +48,8 @@ describe("lint target selection", () => {
     "eslint-local-rules.mjs",
     "package.json",
     "bun.lock",
+    "vscode/package.json",
+    "vscode/bun.lock",
     "tsconfig.json",
     "tsconfig.main.json",
     "scripts/lint.sh",
@@ -60,7 +62,7 @@ describe("lint target selection", () => {
   });
 
   it("does not treat nested lookalikes as config changes", () => {
-    expect(lintTargets.selectLintTargets(["vscode/package.json", "src/tsconfig.json"])).toEqual({
+    expect(lintTargets.selectLintTargets(["src/package.json", "src/tsconfig.json"])).toEqual({
       mode: "files",
       files: [],
     });
@@ -193,22 +195,32 @@ describe("lint target git discovery", () => {
     git("add", "-f", "src/committed.generated.ts");
     write("src/untracked.generated.ts");
     write("docs/page.md", "# page\n");
+    // Only tests are linted under scripts/; vscode/src is linted whole.
+    write("scripts/tool.ts");
+    write("scripts/tool.test.ts");
+    write("vscode/src/extension.ts");
+    write("scripts/mintlify/node_modules/pkg/index.ts");
 
     expect(lintTargets.listLintFiles(repo)).toEqual([
+      "scripts/tool.test.ts",
       "src/committed.generated.ts",
       "src/edited.ts",
       "src/kept.ts",
       "src/node/workflowRuntime/runtime.js",
       "src/renamed.ts",
       "src/untracked.generated.ts",
+      "vscode/src/extension.ts",
     ]);
     // oxlint walks the directories: skip what ESLint does not lint, add the gitignored lint files.
     expect(lintTargets.oxlintArgs(repo)).toEqual([
       "--ignore-pattern",
+      "scripts/tool.ts",
+      "--ignore-pattern",
       "tests/__mocks__/styleMock.js",
       "src",
       "tests",
-      "scripts/lib",
+      "scripts",
+      "vscode/src",
       "src/committed.generated.ts",
       "src/untracked.generated.ts",
     ]);

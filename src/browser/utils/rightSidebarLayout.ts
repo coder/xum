@@ -434,25 +434,6 @@ export function reorderTabInTabset(
   };
 }
 
-export function selectTabInFocusedTabset(
-  state: RightSidebarLayoutState,
-  tab: TabType
-): RightSidebarLayoutState {
-  const focused = findTabset(state.root, state.focusedTabsetId);
-  if (focused?.type !== "tabset") {
-    return state;
-  }
-
-  if (focused.activeTab === tab && focused.tabs.includes(tab)) {
-    return state;
-  }
-
-  return {
-    ...state,
-    root: updateNode(state.root, focused.id, (ts) => insertTab(ts, tab, true)),
-  };
-}
-
 export function splitFocusedTabset(
   state: RightSidebarLayoutState,
   direction: "horizontal" | "vertical"
@@ -606,13 +587,6 @@ export function getFocusedActiveTab(state: RightSidebarLayoutState, fallback: Ta
   if (focused?.type === "tabset") return focused.activeTab;
   return fallback;
 }
-export function addToolToFocusedTabset(
-  state: RightSidebarLayoutState,
-  tab: TabType
-): RightSidebarLayoutState {
-  return selectTabInFocusedTabset(state, tab);
-}
-
 /**
  * Add a tab to the focused tabset without changing the active tab.
  * Used for feature-flagged tabs that should be available but not auto-selected.

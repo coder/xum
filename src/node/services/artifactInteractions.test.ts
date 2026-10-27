@@ -1,7 +1,7 @@
 import * as fs from "fs/promises";
 import * as os from "os";
 import * as path from "path";
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import {
   ARTIFACT_JSON_MAX_BYTES,
   ARTIFACT_STATE_SUMMARY_MAX_CHARS,
@@ -110,7 +110,8 @@ describe("artifact interactions", () => {
       version: null,
       text: "hi",
     });
-    expect(result.success).toBe(false);
+    // The error text reaches the Artifacts tab as is (not JSON-quoted).
+    expect(result).toEqual(Err("busy"));
     expect(await pendingIds()).toEqual([]);
   });
 
@@ -245,6 +246,64 @@ describe("artifact interactions", () => {
     expect(await pendingIds()).toEqual(["id-2"]);
     await sent[0].internal.onAccepted?.();
     expect(await pendingIds()).toEqual([]);
+  });
+
+  test("known limit (#7643): an acceptance whose record removal fails is reported as failed", async () => {
+    // AgentSession keeps the accepted row when onAccepted throws and returns Err. The send is
+    // reported as failed, and the record is removed so no startup re-sends it.
+    const rm = spyOn(fs, "rm").mockRejectedValueOnce(new Error("EIO"));
+    let callbackFailed = false;
+    const failingRemoval: ArtifactInteractionDeps = {
+      ...deps(),
+      sendMessage: async (_workspaceId, _message, _options, internal) => {
+        try {
+          await internal?.onAccepted?.();
+          return Ok(undefined);
+        } catch {
+          callbackFailed = true;
+          return Err("accept callback failed");
+        }
+      },
+    };
+    let result: Awaited<ReturnType<typeof sendArtifactInteraction>>;
+    try {
+      result = await sendArtifactInteraction(failingRemoval, {
+        workspaceId: WS,
+        path: "a.html",
+        version: 0,
+        text: "x",
+      });
+    } finally {
+      rm.mockRestore();
+    }
+    expect(callbackFailed).toBe(true);
+    expect(result).toEqual(Err("accept callback failed"));
+    expect(await pendingIds()).toEqual([]);
+  });
+
+  test("startup replay of a send that is accepted but cannot start its turn is not re-sent again", async () => {
+    // #7342: no API key at startup. The row lands, then the turn start fails with Err.
+    await sendArtifactInteraction(deps(), {
+      workspaceId: WS,
+      path: "a.html",
+      version: 0,
+      text: "x",
+    });
+    expect(await pendingIds()).toEqual(["id-1"]);
+    sent = [];
+    const acceptThenFail: ArtifactInteractionDeps = {
+      ...deps(),
+      sendMessage: async (_workspaceId, message, options, internal) => {
+        sent.push({ message, options: options as Record<string, unknown>, internal: internal! });
+        await internal?.onAccepted?.();
+        return Err("api_key_not_found");
+      },
+    };
+
+    expect(await replayPendingArtifactInteractions(acceptThenFail, WS)).toBe(1);
+    expect(await pendingIds()).toEqual([]);
+    expect(await replayPendingArtifactInteractions(acceptThenFail, WS)).toBe(0);
+    expect(sent).toHaveLength(1);
   });
 
   test("one malformed record does not discard the valid ones", async () => {

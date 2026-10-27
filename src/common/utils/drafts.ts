@@ -58,11 +58,6 @@ export function createEmptyDraft(): Draft {
   return { text: "", attachments: [] };
 }
 
-/** An empty draft has no file on the backend: writing one deletes it. */
-export function isDraftEmpty(draft: Draft): boolean {
-  return draft.text.length === 0 && draft.attachments.length === 0;
-}
-
 const UTF8_CHUNK_UNITS = 64 * 1024;
 const utf8Encoder = new TextEncoder();
 // Up to 3 bytes per UTF-16 code unit, so one chunk always fits.

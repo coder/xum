@@ -3,8 +3,6 @@
  * These keys are used for persisting state in localStorage
  */
 
-import { DEFAULT_CREATION_DRAFT_ID, DRAFT_ID_PATTERN } from "@/constants/drafts";
-
 /**
  * Scope ID Helpers
  * These create consistent scope identifiers for storage keys
@@ -733,13 +731,6 @@ export const TERMINAL_TITLES_MAX_CHARS = 768;
 export const SIDEBAR_EXPANSION_MAP_MAX_CHARS = 16 * 1024;
 /** archivedWorkspaces:{projectPath}: the cache keeps the first archived entries that fit. */
 export const ARCHIVED_WORKSPACES_CACHE_MAX_CHARS = 6 * 1024;
-/** workspaceNameState stores at most this much (serialized) of the message it was generated for. */
-export const WORKSPACE_NAME_STATE_MESSAGE_MAX_CHARS = 2000;
-/**
- * workspaceNameState stores at most this much (serialized) of a typed manual name. Valid names are
- * at most 64 chars (validateWorkspaceBranchName), so only invalid names are cut.
- */
-export const WORKSPACE_NAME_STATE_MANUAL_NAME_MAX_CHARS = 1024;
 /**
  * Model preferences hold a "provider:modelId" string. Custom model ids are checked against it
  * where they are entered (getModelIdLengthError); built-in ids are far shorter.
@@ -779,13 +770,6 @@ export const MAX_PERSISTED_KEY_CHARS = 8192;
 export type PersistedKeyKind = "ui" | "cache" | "workspace-scoped" | "draft";
 
 /**
- * `workspaceId` keys append a scope id to a fixed prefix. The scope id is usually a workspace id,
- * but creation drafts reuse the same keys with getDraftScopeId()/getPendingScopeId() scope ids and
- * some keys also accept project/global scope ids.
- */
-export type PersistedKeyScope = "global" | "workspaceId";
-
-/**
  * Which scope ids a workspace key is written under, for the budget model: "workspace" keys are
  * counted for every workspace and creation draft, "draft" keys only for creation drafts.
  * "webview" keys are written only by the VS Code webview, whose origin has its own quota, so they
@@ -803,7 +787,7 @@ export interface WorkspaceKeyRegistration {
   scope: "workspaceId";
   getKey: (scopeId: string) => string;
   kind: PersistedKeyKind;
-  /** Copied to the new workspace on fork (and to the new scope on migrateWorkspaceStorage). */
+  /** Copied to the new workspace on fork. */
   copyOnFork: boolean;
   /** Longest accepted serialized value (UTF-16 code units); 0 refuses every write. */
   maxValueChars: number;
@@ -1083,43 +1067,5 @@ export function findOrphanedWorkspaceStorageKeys(
   return candidateKeys.filter((key) => {
     const ownerId = getWorkspaceStorageGcOwnerId(key);
     return ownerId !== null && !knownWorkspaceIds.has(ownerId);
-  });
-}
-
-/**
- * The listed creation draft that owns a registered draft-scope settings key
- * (`<key>:__draft__/<project>/<id>`), or null for every other key: the default composer's fixed
- * draft id, ids the backend would never list, and "draft"-kind keys, which hold typed input (the
- * legacy draft text its migration still owns, a typed workspace name) and are never collected.
- */
-function getCreationDraftStorageOwner(
-  key: string
-): { projectPath: string; draftId: string } | null {
-  if (getPersistedKeyKind(key) === "draft") return null;
-  const scopeId = getWorkspaceScopeIdFromKey(key);
-  if (scopeId?.startsWith(DRAFT_SCOPE_ID_PREFIX) !== true) return null;
-  const rest = scopeId.slice(DRAFT_SCOPE_ID_PREFIX.length);
-  const separator = rest.lastIndexOf("/");
-  const projectPath = rest.slice(0, separator);
-  const draftId = rest.slice(separator + 1);
-  if (separator <= 0 || !DRAFT_ID_PATTERN.test(draftId) || draftId === DEFAULT_CREATION_DRAFT_ID) {
-    return null;
-  }
-  return { projectPath, draftId };
-}
-
-/** Whether the creation-draft storage GC could ever collect `key` (see creationDraftStorageGc.ts). */
-export function isCreationDraftStorageGcCandidateKey(key: string): boolean {
-  return getCreationDraftStorageOwner(key) !== null;
-}
-
-/** Pick the candidate keys whose creation draft `isKept` rejects. */
-export function findOrphanedCreationDraftStorageKeys(
-  candidateKeys: readonly string[],
-  isKept: (projectPath: string, draftId: string) => boolean
-): string[] {
-  return candidateKeys.filter((key) => {
-    const owner = getCreationDraftStorageOwner(key);
-    return owner !== null && !isKept(owner.projectPath, owner.draftId);
   });
 }

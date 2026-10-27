@@ -2379,7 +2379,7 @@ export const ImmersiveReviewView: React.FC<ImmersiveReviewViewProps> = (props) =
           <div className="relative min-h-0 min-w-0 flex-1">
             <div
               ref={scrollContainerRef}
-              className="scrollbar-none h-full min-h-0 min-w-0 overflow-y-auto pb-3 [overflow-anchor:none]"
+              className="h-full min-h-0 min-w-0 scrollbar-none overflow-y-auto pb-3 [overflow-anchor:none]"
             >
               {props.isLoading && currentFileHunks.length === 0 ? (
                 <div className="text-muted flex items-center justify-center py-12 text-sm">

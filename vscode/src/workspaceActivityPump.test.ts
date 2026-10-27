@@ -16,7 +16,7 @@ type ActivityEvent =
 /** A subscription the test drives: events are delivered in order, then end or fail. */
 function createFakeActivityClient(snapshot: Record<string, Activity> | null) {
   const calls: string[] = [];
-  const queue: Array<{ event: ActivityEvent } | { end: true } | { error: unknown }> = [];
+  const queue: ({ event: ActivityEvent } | { end: true } | { error: unknown })[] = [];
   let wake: (() => void) | null = null;
   const enqueue = (item: (typeof queue)[number]) => {
     queue.push(item);
@@ -77,7 +77,7 @@ function startPump(
 ) {
   // The selected workspace's monitor count per post, and every posted map.
   const posted: number[] = [];
-  const maps: Array<Record<string, UiWorkspaceActivity>> = [];
+  const maps: Record<string, UiWorkspaceActivity>[] = [];
   const errors: unknown[] = [];
   const controller = new AbortController();
   const done = pumpWorkspaceActivity({

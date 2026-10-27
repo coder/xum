@@ -4,6 +4,7 @@ import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import { createMappedAliasProvidersConfig, MAPPED_ALIAS_MODEL } from "@/browser/testUtils";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 
 // Snapshot the real exports before the mock below replaces the live namespace binding.
@@ -36,14 +37,7 @@ describe("SubagentReportMessageContent", () => {
   });
 
   test("labels a mapped alias's thinking from its target model", () => {
-    providersConfig = {
-      openai: {
-        apiKeySet: true,
-        isEnabled: true,
-        isConfigured: true,
-        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
-      },
-    };
+    providersConfig = createMappedAliasProvidersConfig();
 
     const view = render(
       <TooltipProvider>
@@ -54,7 +48,7 @@ describe("SubagentReportMessageContent", () => {
             status: "completed",
             title: "Explore task",
             reportMarkdown: "Done.",
-            model: "openai:team-sol",
+            model: MAPPED_ALIAS_MODEL,
             thinkingLevel: "max",
           }}
         />

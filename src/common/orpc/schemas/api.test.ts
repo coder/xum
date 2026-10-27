@@ -10,7 +10,7 @@ import {
 } from "./api";
 import { OnChatEventSchema } from "./stream";
 import { MCP_ICON_LIMITS } from "../../constants/mcpIcon";
-import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from "../types";
+import type { ProviderConfigInfo, ProvidersConfigMap } from "../types";
 
 /**
  * Schema conformance tests for provider types.
@@ -24,7 +24,7 @@ import type { AWSCredentialStatus, ProviderConfigInfo, ProvidersConfigMap } from
  */
 describe("ProviderConfigInfoSchema conformance", () => {
   it("preserves all AWSCredentialStatus fields", () => {
-    const full: AWSCredentialStatus = {
+    const full: ProviderConfigInfo["aws"] = {
       region: "us-east-1",
       profile: "my-sso-profile",
       bearerTokenSet: true,

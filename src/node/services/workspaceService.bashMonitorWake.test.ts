@@ -1716,7 +1716,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         recordTerminal(): Promise<void>;
         recordLost: typeof recordLost;
       };
-      drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+      bashMonitorPersistence: { drainBashMonitorPersistence(workspaceId: string): Promise<void> };
     };
     try {
       await internal.bashMonitorRecoveryPromise;
@@ -1737,9 +1737,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       };
       events.emit("monitor:armed", "owner", armed);
       let armedDrained = false;
-      const armedDrain = internal.drainBashMonitorPersistence("owner").then(() => {
-        armedDrained = true;
-      });
+      const armedDrain = internal.bashMonitorPersistence
+        .drainBashMonitorPersistence("owner")
+        .then(() => {
+          armedDrained = true;
+        });
       await Promise.resolve();
       expect(armedDrained).toBe(false);
       releaseArmed?.();
@@ -1756,9 +1758,11 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
         await new Promise((resolve) => setTimeout(resolve, 5));
       }
       let failureDrained = false;
-      const failureDrain = internal.drainBashMonitorPersistence("owner").then(() => {
-        failureDrained = true;
-      });
+      const failureDrain = internal.bashMonitorPersistence
+        .drainBashMonitorPersistence("owner")
+        .then(() => {
+          failureDrained = true;
+        });
       await Promise.resolve();
       expect(failureDrained).toBe(false);
       releaseLost?.();
@@ -1780,7 +1784,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       "scheduleReconcile"
     ).mockImplementation(() => undefined);
     const internal = service as unknown as {
-      drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+      bashMonitorPersistence: { drainBashMonitorPersistence(workspaceId: string): Promise<void> };
     };
     // Read the evidence back through a fresh store: it must be durable, not only in memory.
     const registry = new BashMonitorRegistryStore(config);
@@ -1812,7 +1816,7 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       // Wait for the whole failure persist (upsert, then recordLost, then the wake), not for the
       // first row to appear: polling for the row could observe the upserted row before recordLost
       // added its evidence, which failed under host load (#5401).
-      await internal.drainBashMonitorPersistence("owner");
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence("owner");
       const rows = await registry.listAll("owner");
       expect(rows).toHaveLength(1);
       expect(rows[0]).toMatchObject({
@@ -1930,8 +1934,10 @@ describe("WorkspaceService bash monitor wake reconciler wiring", () => {
       // The invalidated chain must also release its tracking entry so the
       // per-process failure-persist map stays bounded by in-flight chains.
       const tracking = (
-        service as unknown as { activeBashMonitorFailurePersists: Map<string, unknown> }
-      ).activeBashMonitorFailurePersists;
+        service as unknown as {
+          bashMonitorPersistence: { activeBashMonitorFailurePersists: Map<string, unknown> };
+        }
+      ).bashMonitorPersistence.activeBashMonitorFailurePersists;
       expect(tracking.size).toBe(0);
     } finally {
       mock.restore();

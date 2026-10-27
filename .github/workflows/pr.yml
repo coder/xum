@@ -751,8 +751,10 @@ jobs:
       - run: make test-storybook
 
   test-e2e:
-    # Renders "linux 1/4" for shards and plain "macos" for the unsharded entry.
-    name: Test / E2E (${{ matrix.os }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
+    # No matrix expression in the name: GitHub then appends the matrix values ("linux, 1/4",
+    # "macos") to expanded jobs, and a job skipped before matrix expansion shows plain
+    # "Test / E2E" instead of the unexpanded expression (#7340).
+    name: Test / E2E
     needs: [changes]
     # Queue only on PR pushes: in 330 sampled PR runs (2026-10-16..23) the jobs moved here (E2E,
     # bug-bash sandbox, Smoke / Server, Build / Linux, Build / VS Code) failed 8 times but were

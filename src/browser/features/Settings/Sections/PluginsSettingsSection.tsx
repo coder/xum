@@ -796,7 +796,7 @@ const AddPluginPanel: React.FC<{
               className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
             >
               <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-              <span className="break-words">{error}</span>
+              <span className="min-w-0 break-words">{error}</span>
             </div>
           )}
           <div className="flex gap-2">
@@ -965,7 +965,7 @@ const PreviewConsent: React.FC<{
         {props.preview.warnings.map((warning) => (
           <div key={warning} className="text-warning flex items-start gap-2 text-xs">
             <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-            <span className="break-words">{warning}</span>
+            <span className="min-w-0 break-words">{warning}</span>
           </div>
         ))}
       </div>
@@ -994,7 +994,7 @@ const PreviewConsent: React.FC<{
         className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm"
       >
         <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-        <span className="break-words">{props.error}</span>
+        <span className="min-w-0 break-words">{props.error}</span>
       </div>
     )}
 
@@ -1002,7 +1002,7 @@ const PreviewConsent: React.FC<{
     {props.preview.installBlockedReason !== undefined && (
       <div className="bg-destructive/10 text-destructive flex items-start gap-2 rounded-md px-3 py-2 text-sm">
         <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-        <span className="break-words">
+        <span className="min-w-0 break-words">
           Xum cannot install this as {installMethodLabel(props.preview.method)}.{" "}
           {props.preview.installBlockedReason}
         </span>
@@ -1368,7 +1368,7 @@ const UpdateReviewPanel: React.FC<{
           {props.review.warnings.map((warning) => (
             <div key={warning} className="text-warning flex items-start gap-2 text-xs">
               <TriangleAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-              <span className="break-words">{warning}</span>
+              <span className="min-w-0 break-words">{warning}</span>
             </div>
           ))}
         </div>
@@ -1478,7 +1478,7 @@ const PendingSignOutNotice: React.FC<{
       {status.kind === "broken" ? (
         <BrokenSignOutRecord reason={status.reason} onCleared={props.onCleared} />
       ) : (
-        <span className="space-y-1 break-words">
+        <span className="min-w-0 space-y-1 break-words">
           <span className="block">
             Managed plugins are unavailable to agents until Xum finishes signing out of a plugin MCP
             server whose sign-in changed in an update
@@ -1503,7 +1503,7 @@ const ComponentReviewNotice: React.FC<{ items: AgentPluginListItem[] | null }> =
       className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm"
     >
       <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-      <span className="break-words">
+      <span className="min-w-0 break-words">
         Some plugins have components (such as skills, MCP servers or workflow scripts) that you have
         not reviewed on this install. Xum loads a plugin component only after you approve its
         current version. A skill or workflow script that changed after you approved it keeps working
@@ -1998,13 +1998,13 @@ export const PluginsSettingsSection: React.FC = () => {
         {error && (
           <div className="bg-destructive/10 text-destructive mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm">
             <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
-            <span className="break-words">{error}</span>
+            <span className="min-w-0 break-words">{error}</span>
           </div>
         )}
         {updateCheckError && (
           <div className="bg-warning/10 text-warning mb-3 flex items-start gap-2 rounded-md px-3 py-2 text-sm">
             <TriangleAlert className="mt-0.5 h-4 w-4 shrink-0" />
-            <span className="break-words">Update check failed: {updateCheckError}</span>
+            <span className="min-w-0 break-words">Update check failed: {updateCheckError}</span>
           </div>
         )}
 
@@ -2078,7 +2078,7 @@ export const PluginsSettingsSection: React.FC = () => {
                       {check?.status === "error" && check.message && (
                         <p className="text-warning mt-0.5 flex items-start gap-1 text-[11px]">
                           <CircleAlert className="mt-0.5 h-3 w-3 shrink-0" />
-                          <span className="break-words">{check.message}</span>
+                          <span className="min-w-0 break-words">{check.message}</span>
                         </p>
                       )}
                     </div>

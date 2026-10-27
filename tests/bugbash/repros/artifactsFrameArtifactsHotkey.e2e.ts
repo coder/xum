@@ -1,8 +1,8 @@
 // artifact-frame-artifacts-hotkey (PR #7194 review, 2026-10-22): OPEN_ARTIFACTS_TAB did nothing once
 // focus was inside an HTML artifact's sandboxed frame (any click in its content). The key went to
 // the frame's document, which never reaches the app's window listener, and the frame's key bridge
-// forwarded only TOGGLE_RIGHT_SIDEBAR. Since the key toggles the Artifacts tab, a press there must
-// hide the sidebar, like a press with focus anywhere else in the tab.
+// forwarded only TOGGLE_RIGHT_SIDEBAR. Focus in the frame is focus in the Artifacts tab, so a press
+// there must hide the sidebar, like a press with focus anywhere else in the tab.
 import { test } from "@e2e-dev/web";
 import type { Browser } from "@e2e-dev/web";
 import { expect } from "e2e";

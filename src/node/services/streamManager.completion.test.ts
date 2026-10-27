@@ -6,10 +6,9 @@ import { z } from "zod";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
 import { Ok, Err } from "@/common/types/result";
-import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager";
+import type { ModelFallbackPrepareOptions } from "./streamManager";
 import type { MuxMessage } from "@/common/types/message";
 import { HistoryService } from "./historyService";
-import { log } from "./log";
 import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { historyWriteLockPath } from "./workspaceRemoval";
 import type { SessionUsageService } from "./sessionUsageService";
@@ -92,69 +91,16 @@ describe("StreamManager - exact step indices", () => {
     // The trailing empty step start is not persisted.
     expect(committed?.metadata?.stepStartPartIndices).toEqual([0, 1]);
   });
-
-  // The preserve-parts reset is proven publicly by errorRecovery's step-boundary
-  // previousResponseId retry, which commits stepStartPartIndices [0, 1].
-  test("retry reset discards step indices together with discarded parts", async () => {
-    const streamManager = new StreamManager(historyService);
-    const streamInfo = createStreamInfoForTests({
-      parts: [{ type: "text", text: "discarded", timestamp: 1 }],
-      stepStartIndices: [0, 1, 3],
-      currentStepStartIndex: 1,
-      streamStepOrdinals: [0, 1],
-      reasoningBackfillStartIndex: 1,
-      currentReasoningBlock: {},
-      receivedTerminalEvent: true,
-      terminalFinishReason: "stop",
-    });
-    const reset = engineInternals(streamManager).resetStreamStateForRetry;
-    await reset.call(streamManager, "step-reset-workspace", streamInfo, { preserveParts: false });
-    expect(streamInfo.stepStartIndices).toEqual([0]);
-    expect(streamInfo.currentStepStartIndex).toBe(0);
-    // The retried streamText numbers its steps from 0 and has no reasoning or finish yet.
-    expect(streamInfo.streamStepOrdinals).toEqual([]);
-    expect(streamInfo.reasoningBackfillStartIndex).toBeUndefined();
-    expect(streamInfo.currentReasoningBlock).toBeUndefined();
-    expect(streamInfo.terminalFinishReason).toBeUndefined();
-    const buildPartial = engineInternals(streamManager).buildPartialAssistantMessage;
-    const partial = buildPartial.call(streamManager, streamInfo);
-    expect(partial.metadata?.stepStartPartIndices).toEqual([]);
-    await historyService.writePartial("step-reset-workspace", partial);
-    expect(
-      (await historyService.readPartial("step-reset-workspace"))?.metadata?.stepStartPartIndices
-    ).toEqual([]);
-  });
 });
 
-describe("StreamManager - retry reset clears only this stream's partial (#7499)", () => {
+// #7499: StreamRetries.test.ts owns the retry reset; this checks the conditional delete it uses.
+describe("StreamManager - the retry's partial delete holds the history write lock (#7499)", () => {
   const workspaceId = "retry-partial-workspace";
   const partialOf = (id: string): MuxMessage => ({
     id,
     role: "assistant",
     parts: [{ type: "text", text: `partial of ${id}` }],
     metadata: { historySequence: 1 },
-  });
-  const resetWithoutParts = async (streamManager: StreamManager, messageId: string) => {
-    const streamInfo = createStreamInfoForTests({ messageId });
-    await engineInternals(streamManager).resetStreamStateForRetry.call(
-      streamManager,
-      workspaceId,
-      streamInfo,
-      { preserveParts: false, workspaceLog: log }
-    );
-  };
-
-  test("deletes this stream's partial and keeps another stream's partial", async () => {
-    const streamManager = new StreamManager(historyService);
-    await historyService.writePartial(workspaceId, partialOf("this-message"));
-    await resetWithoutParts(streamManager, "this-message");
-    expect(await historyService.readPartial(workspaceId)).toBeNull();
-
-    // Another backend (XUM_ALLOW_MULTIPLE_INSTANCES) replaced partial.json: its crash-recovery
-    // state must survive this stream's retry.
-    await historyService.writePartial(workspaceId, partialOf("other-message"));
-    await resetWithoutParts(streamManager, "this-message");
-    expect((await historyService.readPartial(workspaceId))?.id).toBe("other-message");
   });
 
   test("a foreign backend's replacement between the check and the unlink survives", async () => {
@@ -191,29 +137,6 @@ describe("StreamManager - retry reset clears only this stream's partial (#7499)"
       lockSpy.mockRestore();
     }
     expect((await historyService.readPartial(workspaceId))?.id).toBe("other-message");
-  });
-
-  test("logs a failed delete and continues the retry", async () => {
-    const streamManager = new StreamManager(historyService);
-    await historyService.writePartial(workspaceId, partialOf("this-message"));
-    spyOn(historyService, "deletePartialIfMessageIdMatches").mockResolvedValueOnce(
-      Err("Failed to delete matching partial: EACCES")
-    );
-    // Main's unconditional delete, so this test fails on main for the same reason: an Err
-    // result that nobody logs.
-    spyOn(historyService, "deletePartial").mockResolvedValueOnce(
-      Err("Failed to delete partial: EACCES")
-    );
-    const warn = spyOn(log, "warn");
-    try {
-      await resetWithoutParts(streamManager, "this-message");
-      const call = warn.mock.calls.find(
-        (args) => args[0] === "Failed to clear partial state before retry"
-      );
-      expect(call?.[1]).toEqual({ error: "Failed to delete matching partial: EACCES" });
-    } finally {
-      warn.mockRestore();
-    }
   });
 });
 

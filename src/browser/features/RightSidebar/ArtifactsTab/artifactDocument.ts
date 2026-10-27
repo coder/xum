@@ -90,13 +90,6 @@ export function finalizeSandboxedDocument(
   return serialize(doc);
 }
 
-export function buildSandboxedHtmlDocument(
-  html: string,
-  options: SandboxedDocumentOptions
-): string {
-  return finalizeSandboxedDocument(parseArtifactHtml(html), options);
-}
-
 /**
  * iOS WebKit autosizes (inflates) long text blocks inside iframes, and the host's own
  * text-size-adjust in globals.css does not reach the srcdoc document, so status pages became

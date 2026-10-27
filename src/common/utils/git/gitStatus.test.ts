@@ -36,4 +36,28 @@ describe("generateGitStatusScript", () => {
     const result = await Bun.$`bash -c ${generateGitStatusScript()}`.cwd(repo).quiet();
     expect(result.stdout.toString()).toContain("---AHEAD_BEHIND---\n1\t1");
   });
+
+  // #7626: a poll that rewrites the index holds .git/index.lock, and a commit at that moment fails.
+  test("does not rewrite the index when a tracked file's stat info is stale", async () => {
+    using tmp = new DisposableTempDir("git-status-no-index-lock");
+    const repo = path.join(tmp.path, "repo");
+    await fs.mkdir(repo, { recursive: true });
+    await Bun.$`git init -b main`.cwd(repo).quiet();
+    await Bun.$`git config user.email test@example.com`.cwd(repo).quiet();
+    await Bun.$`git config user.name Test`.cwd(repo).quiet();
+    await fs.writeFile(path.join(repo, "tracked.txt"), "same\n", "utf-8");
+    await Bun.$`git add tracked.txt`.cwd(repo).quiet();
+    await Bun.$`git commit -m base`.cwd(repo).quiet();
+    // Same content, new mtime: a locking "git status" re-hashes it and writes the refreshed index.
+    const stale = new Date("2001-01-01T00:00:00Z");
+    await fs.utimes(path.join(repo, "tracked.txt"), stale, stale);
+    const indexPath = path.join(repo, ".git", "index");
+    const before = await fs.stat(indexPath);
+
+    const result = await Bun.$`bash -c ${generateGitStatusScript()}`.cwd(repo).quiet();
+
+    expect(result.stdout.toString()).toContain("---DIRTY---\n0");
+    // Git writes a new index by renaming index.lock over it, so a write changes the inode.
+    expect((await fs.stat(indexPath)).ino).toBe(before.ino);
+  });
 });

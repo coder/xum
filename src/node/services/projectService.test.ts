@@ -2455,6 +2455,60 @@ exit 1
       expect(execs).toBe(2);
     });
 
+    it("drops remote plugin snapshots when another config writer changes trust (#7621)", async () => {
+      let execs = 0;
+      class CountingRuntime extends ShellRemoteRuntime {
+        override getAgentHostKey(): string {
+          return "external-trust-test";
+        }
+        override exec(command: string, options: ExecOptions): Promise<ExecStream> {
+          execs++;
+          return super.exec(command, options);
+        }
+      }
+      const runtime = new CountingRuntime(tempDir);
+      const containers = [path.join(tempDir, ".xum", "plugins")];
+      const read = () => getRemoteProjectPluginSnapshot(runtime, tempDir, containers);
+      const projectPath = path.join(tempDir, "project");
+      await config.editConfig((current) => {
+        current.projects.set(projectPath, { workspaces: [], trusted: true });
+        return current;
+      });
+      service.watchProjectTrust();
+      // A second instance writes config.json like the `xum trust` CLI. Registered after the
+      // service's listener, this one resolves once the service has seen the change.
+      const otherWriter = new Config(tempDir);
+      const writeProject = async (fields: { trusted: boolean; displayName?: string }) => {
+        const seen = new Promise<void>((resolve) => {
+          const unsubscribe = config.onConfigChanged(() => {
+            unsubscribe();
+            resolve();
+          });
+        });
+        await otherWriter.editConfig((current) => {
+          current.projects.set(projectPath, { workspaces: [], ...fields });
+          return current;
+        });
+        await seen;
+      };
+
+      try {
+        await read();
+        expect(execs).toBe(1);
+        // A change that leaves trust alone keeps the snapshot.
+        await writeProject({ trusted: true, displayName: "Project" });
+        await read();
+        expect(execs).toBe(1);
+        // A revoke and a re-grant outside setTrust: the next read lists again.
+        await writeProject({ trusted: false });
+        await writeProject({ trusted: true });
+        await read();
+        expect(execs).toBe(2);
+      } finally {
+        service.beginShutdown();
+      }
+    });
+
     it("setIcon stores an icon name and null clears it", async () => {
       const projectPath = path.join(tempDir, "project");
       await config.editConfig((current) => {

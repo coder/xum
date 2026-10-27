@@ -178,7 +178,7 @@ export function isSuccessfulToolOutput(output: unknown): boolean {
 }
 
 /** The last step returned a successful result from a tool the policy requires. */
-export function hasSuccessfulRequiredToolResult(
+function hasSuccessfulRequiredToolResult(
   { steps }: StopConditionOptions,
   requiredPatterns: readonly RegExp[]
 ): boolean {
@@ -203,7 +203,7 @@ export function hasSuccessfulRequiredToolResult(
  * Record a settled step's budget decision as the stop cause and say whether to stop.
  * A blocked decision throws: the settled results do not fit the context budget.
  */
-export function applyContextBudgetDecision(
+function applyContextBudgetDecision(
   request: Pick<StreamRequestConfig, "stopCause">,
   { decision, continuationEntryId }: SettledStepOutcome
 ): boolean {
@@ -448,7 +448,7 @@ export class StreamManager {
       createStreamResult: (request, abortController, stepTracker) =>
         this.createStreamResult(request, abortController, stepTracker),
       resetStreamStateForRetry: (workspaceId, streamInfo, options) =>
-        this.resetStreamStateForRetry(workspaceId, streamInfo, options),
+        this.streamRetries.resetStreamStateForRetry(workspaceId, streamInfo, options),
       moveAnthropicThinkingReplayPoint,
       getStreamMetadata: (streamInfo) => this.getStreamMetadata(streamInfo),
       backfillReasoningTokensFromParts: (streamInfo, usage) =>
@@ -1100,15 +1100,6 @@ export class StreamManager {
     historySequence: number
   ): Promise<void> {
     return this.attemptLoop.processStreamWithCleanup(workspaceId, streamInfo, historySequence);
-  }
-
-  /** StreamRetries.resetStreamStateForRetry; whitebox tests (engineInternals) call it here. */
-  private resetStreamStateForRetry(
-    workspaceId: WorkspaceId,
-    streamInfo: WorkspaceStreamInfo,
-    options?: { preserveParts?: boolean; preserveUsage?: boolean; workspaceLog?: Logger }
-  ): Promise<void> {
-    return this.streamRetries.resetStreamStateForRetry(workspaceId, streamInfo, options);
   }
 
   /**

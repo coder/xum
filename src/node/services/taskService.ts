@@ -1074,7 +1074,47 @@ export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMes
 interface TrustedDescendantMessageOptions {
   messageLabel?: string;
   preTurnMessages?: MuxMessage[];
+  /** Internal (F54): set only by scheduleDeferredDescendantMessage's redelivery. */
+  redelivery?: DeferredDescendantRedelivery;
 }
+
+/** One deferred redelivery attempt of a trusted descendant message (F54). */
+interface DeferredDescendantRedelivery {
+  /** The Stop fence of the original send: a Stop during the wait still wins. */
+  stopFence: ReadonlyMap<string, number>;
+  /** Earlier waits for this message; at the bound, the message takes the live path. */
+  attempt: number;
+  /** Set by the dispatch when the target is still streaming without a task execution. */
+  deferAgain: boolean;
+}
+
+/** A trusted descendant message whose delivery waits for an idle target (F54). */
+interface DeferredDescendantMessage {
+  ancestorWorkspaceId: string;
+  taskId: string;
+  trimmedMessage: string;
+  queueDispatchMode: TaskMessageQueueDispatchMode;
+  sender: "ancestor" | "sibling";
+  options: TrustedDescendantMessageOptions | undefined;
+  stopFence: ReadonlyMap<string, number>;
+}
+
+function resolveDescendantMessageStopFence(
+  options: TrustedDescendantMessageOptions | undefined,
+  captured: ReadonlyMap<string, number>
+): ReadonlyMap<string, number> {
+  return options?.redelivery?.stopFence ?? captured;
+}
+
+function isInactiveAgentTaskStatus(
+  status: AgentTaskStatus | undefined,
+  legacyArchived: boolean
+): boolean {
+  return status === "reported" || status === "interrupted" || legacyArchived;
+}
+
+/** After this many idle waits, a deferred message falls back to plain live delivery. */
+const MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS = 5;
 
 type TreeMessageSpec =
   | {
@@ -2340,6 +2380,8 @@ export class TaskService implements AgentTaskIntegration {
   // tests and shutdown can await them; drains are idempotent and re-triggered on owner idle events.
   private readonly pendingTerminalAttentionDrainsByOwner = new Map<string, Promise<void>>();
   private readonly pendingTerminalAttentionDrains = new Set<Promise<void>>();
+  /** Tail of each task's chain of deferred trusted messages (F54), in send order. */
+  private readonly deferredDescendantMessagesByTask = new Map<string, Promise<void>>();
   private readonly pendingTerminalAttentionIdleWaitsByOwner = new Map<string, Promise<void>>();
   // Sub-agent terminal notifications this process just enqueued while their owner was streaming,
   // mapped to that owner turn's generation (owner -> notification ID -> turn). The next drain takes
@@ -10028,7 +10070,19 @@ export class TaskService implements AgentTaskIntegration {
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     // Before the first await: a Stop of the child or any ancestor (the sender's included) that
     // lands while this send is suspended overtakes a reawakening it decides on.
-    const stopFence = this.captureReawakeningStopFence(taskId);
+    const stopFence = resolveDescendantMessageStopFence(
+      options,
+      this.captureReawakeningStopFence(taskId)
+    );
+    const deferral = {
+      ancestorWorkspaceId,
+      taskId,
+      trimmedMessage,
+      queueDispatchMode,
+      sender,
+      options,
+      stopFence,
+    };
     const messageLabel = options?.messageLabel ?? "Updated guidance from parent";
     // Keep the labeled message explicit in the child transcript so it cannot be confused
     // with the original brief, whoever the sender is.
@@ -10145,13 +10199,13 @@ export class TaskService implements AgentTaskIntegration {
           entry.workspace.archivedAt,
           entry.workspace.unarchivedAt
         );
-        if (
+        const inactive =
           !continuationActive &&
-          (entry.workspace.taskStatus === "reported" ||
-            entry.workspace.taskStatus === "interrupted" ||
-            legacyArchived) &&
-          !this.aiService.isStreaming(taskId)
-        ) {
+          isInactiveAgentTaskStatus(entry.workspace.taskStatus, legacyArchived);
+        if (this.deferDescendantMessage(deferral, inactive)) {
+          return Ok({ delivery: "queued" as const, queueDispatchMode });
+        }
+        if (inactive && !this.aiService.isStreaming(taskId)) {
           return this.reactivateInactiveAgentTask({
             ancestorWorkspaceId,
             taskId,
@@ -10288,6 +10342,88 @@ export class TaskService implements AgentTaskIntegration {
         return Ok(accepted ? { delivery: "accepted" } : { delivery: "queued", queueDispatchMode });
       })
     );
+  }
+
+  /**
+   * Send order (F54): while an earlier message to this task waits for the target to go idle, a new
+   * message queues behind it instead of overtaking it. Redeliveries are the chain itself.
+   */
+  private deferDescendantMessage(params: DeferredDescendantMessage, inactive: boolean): boolean {
+    if (
+      params.options?.redelivery == null &&
+      this.deferredDescendantMessagesByTask.has(params.taskId)
+    ) {
+      this.scheduleDeferredDescendantMessage(params);
+      return true;
+    }
+    return inactive && this.deferWhileTargetStreamsWithoutExecution(params);
+  }
+
+  /**
+   * F54: an inactive task's stream belongs to no task execution (for example the tail of one that
+   * just settled). A message queued into it would run as a plain turn that cannot report, message
+   * or spawn, so it waits until the target is idle, where it reawakens the task. After
+   * MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS waits it falls back to the live path.
+   */
+  private deferWhileTargetStreamsWithoutExecution(params: DeferredDescendantMessage): boolean {
+    if (!this.aiService.isStreaming(params.taskId)) return false;
+    const redelivery = params.options?.redelivery;
+    if (redelivery == null) {
+      this.scheduleDeferredDescendantMessage(params);
+      return true;
+    }
+    if (redelivery.attempt >= MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS) return false;
+    redelivery.deferAgain = true;
+    return true;
+  }
+
+  /**
+   * Redeliver a trusted descendant message once the target is idle (see the F54 note in
+   * dispatchTrustedDescendantMessage). Messages to one task chain in send order. The chain is the
+   * owner: tracked with terminal attention drains (tests await them) and failures are logged.
+   * Like the session queue it replaces for this case, the wait is in memory only.
+   */
+  private scheduleDeferredDescendantMessage(params: DeferredDescendantMessage): void {
+    const previous = this.deferredDescendantMessagesByTask.get(params.taskId);
+    const deliver = async () => {
+      // A message behind an earlier one tries at once when that one is done: the earlier one may
+      // have reawakened the task, whose live execution then takes this message as guidance.
+      let waitForIdle = previous == null;
+      await previous;
+      for (let attempt = 0; ; attempt++) {
+        if (waitForIdle) await this.workspaceService.waitForIdleAndNoQueuedMessages(params.taskId);
+        waitForIdle = true;
+        const redelivery = { stopFence: params.stopFence, attempt, deferAgain: false };
+        const result = await this.dispatchTrustedDescendantMessage(
+          params.ancestorWorkspaceId,
+          params.taskId,
+          params.trimmedMessage,
+          params.queueDispatchMode,
+          params.sender,
+          { ...params.options, redelivery }
+        );
+        if (redelivery.deferAgain) continue;
+        if (!result.success) {
+          log.warn("Deferred descendant message was not delivered", {
+            taskId: params.taskId,
+            error: result.error,
+          });
+        }
+        return;
+      }
+    };
+    const promise = deliver()
+      .catch((error: unknown) => {
+        log.warn("Deferred descendant message failed", { taskId: params.taskId, error });
+      })
+      .finally(() => {
+        this.pendingTerminalAttentionDrains.delete(promise);
+        if (this.deferredDescendantMessagesByTask.get(params.taskId) === promise) {
+          this.deferredDescendantMessagesByTask.delete(params.taskId);
+        }
+      });
+    this.deferredDescendantMessagesByTask.set(params.taskId, promise);
+    this.pendingTerminalAttentionDrains.add(promise);
   }
 
   private taskGuidanceSendOptions(

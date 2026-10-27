@@ -589,4 +589,37 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
     },
     TEST_TIMEOUT_MS
   );
+
+  test(
+    "a rollover whose first request is past the handoff point publishes the warning in the new window",
+    async () => {
+      const scenario = await startScenario({ slider: 70, usageFor: LOW_USAGE });
+      try {
+        await scenario.send("Turn 0: read 4 files.");
+        await scenario.send("Turn 1: read 4 files.");
+        // The paste takes the old window past C, so the send rolls it over. The fresh window's
+        // own first request (system prompt, lead-in, paste) is past H (70k) and still has room
+        // for the row and its reserve below C (#7215).
+        await scenario.send(`Turn 2: read 0 files. Pasted deploy log:\n${filler("Paste", 30_000)}`);
+        const history = await scenario.history();
+        const reset = history.findLastIndex(isReset);
+        expect(reset).toBeGreaterThanOrEqual(0);
+        const window = history.slice(reset);
+        const user = window.findIndex((row) => textOf(row.parts as Block[]).includes("Pasted"));
+        expect(user).toBeGreaterThan(0);
+        // The warning follows the copied user row, and the request that was sent carries it.
+        const warning = window[user + 1];
+        expect(warning && isWarning(warning)).toBe(true);
+        expect(warning?.metadata?.muxMetadata?.handoff).toBe(true);
+        const stage = scenario.stageRequests();
+        expect(stage).toHaveLength(1);
+        expect(stage[0]?.messages.some((m) => textOf(m.blocks).includes("Pasted"))).toBe(true);
+        // The new window's request is the one with the warning: nothing sealed sits before it.
+        expect(stage[0]?.messages.some((m) => textOf(m.blocks).includes("Turn 0"))).toBe(false);
+      } finally {
+        await scenario.close();
+      }
+    },
+    TEST_TIMEOUT_MS
+  );
 });

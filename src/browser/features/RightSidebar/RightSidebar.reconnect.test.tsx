@@ -2,7 +2,7 @@
 import "../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { act, cleanup, renderHook } from "@testing-library/react";
+import { cleanup, renderHook } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../tests/ui/dom";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
@@ -10,8 +10,13 @@ import {
   createConnectionHarness,
   GAP_MODES,
   type ConnectionHarness,
+  settle,
 } from "@/browser/contexts/connection.testHarness";
-import type { TestApiOverrides } from "@/browser/testUtils";
+import {
+  createTestConfig,
+  type TestApiOverrides,
+  type TestClientConfig,
+} from "@/browser/testUtils";
 import { getDefaultRightSidebarLayoutState } from "@/browser/utils/rightSidebarLayout";
 import {
   useDesktopAvailable,
@@ -26,16 +31,18 @@ import {
  */
 
 /** What the server answers; a test swaps it (or holds it) before a connect. */
-let answerConfig: () => Promise<unknown>;
-let answerCapability: () => Promise<unknown>;
-let answerSessions: () => Promise<unknown> = () => Promise.resolve([]);
+let answerConfig: () => Promise<TestClientConfig>;
+let answerCapability: () => Promise<Awaited<ReturnType<APIClient["desktop"]["getCapability"]>>>;
+let answerSessions: () => Promise<
+  Awaited<ReturnType<APIClient["terminal"]["listSessions"]>>
+> = () => Promise.resolve([]);
 
 function serverOverrides(): TestApiOverrides<APIClient> {
   return {
     config: { getConfig: () => answerConfig() },
     desktop: { getCapability: () => answerCapability() },
     terminal: { listSessions: () => answerSessions() },
-  } as unknown as TestApiOverrides<APIClient>;
+  };
 }
 
 let harness: ConnectionHarness;
@@ -45,24 +52,18 @@ function Wrapper(props: { children: ReactNode }) {
   return <Connection>{props.children}</Connection>;
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  });
-}
-
 async function drop() {
   await harness.drop();
-  await flush();
+  await settle();
 }
 
 async function reconnect() {
   harness.reconnect();
-  await flush();
+  await settle();
 }
 
 /** Never answers: the read stays in flight until a drop cuts it off. */
-function pending(): Promise<unknown> {
+function pending<T>(): Promise<T> {
   return new Promise(() => undefined);
 }
 
@@ -81,9 +82,9 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
   });
 
   test("the debug-logs setting keeps its value through a read the drop cut off", async () => {
-    answerConfig = () => Promise.resolve({ llmDebugLogs: true });
+    answerConfig = () => Promise.resolve(createTestConfig({ llmDebugLogs: true }));
     const view = renderHook(() => useLlmDebugLogsEnabled(useAPI().api), { wrapper: Wrapper });
-    await flush();
+    await settle();
     expect(view.result.current).toBe(true);
 
     await drop();
@@ -94,7 +95,7 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
     await drop();
     expect(view.result.current).toBe(true);
 
-    answerConfig = () => Promise.resolve({ llmDebugLogs: false });
+    answerConfig = () => Promise.resolve(createTestConfig({ llmDebugLogs: false }));
     await reconnect();
     expect(view.result.current).toBe(false);
   });
@@ -110,9 +111,9 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
       renderHook(() => useTerminalSessionSync(useAPI().api, "ws-1", layout, () => undefined), {
         wrapper: Wrapper,
       });
-      await flush();
+      await settle();
       await drop();
-      await flush();
+      await settle();
       expect(unhandled).toEqual([]);
     } finally {
       process.off("unhandledRejection", onUnhandled);
@@ -120,11 +121,12 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
   });
 
   test("the desktop capability keeps its value through a read the drop cut off", async () => {
-    answerCapability = () => Promise.resolve({ available: true });
+    answerCapability = () =>
+      Promise.resolve({ available: true, width: 1280, height: 800, sessionId: "desktop-1" });
     const view = renderHook(() => useDesktopAvailable(useAPI().api, true, "ws-1"), {
       wrapper: Wrapper,
     });
-    await flush();
+    await settle();
     expect(view.result.current).toBe(true);
 
     await drop();
@@ -135,7 +137,7 @@ describe.each([...GAP_MODES])("sidebar tab gates across a dropped connection (%s
     await drop();
     expect(view.result.current).toBe(true);
 
-    answerCapability = () => Promise.resolve({ available: false });
+    answerCapability = () => Promise.resolve({ available: false, reason: "disabled" });
     await reconnect();
     expect(view.result.current).toBe(false);
   });

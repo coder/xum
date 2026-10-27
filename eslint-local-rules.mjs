@@ -1845,56 +1845,409 @@ const localPlugin = {
         };
       },
     },
+    // A fixed real-time wait in a browser test (`await new Promise((r) => setTimeout(r, 50))`,
+    // `await sleep(50)`) is slow, and a check after it is racy: "nothing happened" also passes
+    // when the unwanted call only comes after the wait. Wait on a signal instead (waitFor, a
+    // deferred the fake resolves, settle() in connection.testHarness), or drive time with fake
+    // timers (src/browser/testFakeClock.ts). A literal delay under 20 ms is a macrotask yield and
+    // passes; any other delay (a constant, `DELAY_MS + 50`) counts as a fixed wait.
+    //
+    // The rule sees `setTimeout(resolve, delay)` inside a Promise executor and `Bun.sleep(delay)`.
+    // Each wait inside a same-file helper (a function declaration or a const, also through an
+    // `act()` callback) counts once per call of the helper. When the helper passes one of its
+    // parameters as the delay, the argument (or the parameter's default) decides. A wait with an
+    // `eslint-disable-next-line` or `eslint-disable-line` comment for this rule does not use up
+    // the file's allow count, wherever it sits. Limits: it does not follow imported helpers, a
+    // helper that only another helper calls (that call counts once), block disable comments, or
+    // other timer APIs.
+    "no-fixed-sleep": {
+      meta: {
+        type: "problem",
+        docs: { description: "Disallow fixed real-time waits of 20 ms or more in browser tests" },
+        schema: [
+          {
+            type: "object",
+            properties: {
+              // Repo-relative file -> the exact number of fixed waits it still has.
+              allow: { type: "object", additionalProperties: { type: "integer", minimum: 1 } },
+            },
+            additionalProperties: false,
+          },
+        ],
+        messages: {
+          sleep:
+            "This waits a fixed {{delay}} of real time. Wait on a signal (waitFor, a deferred, " +
+            "settle()) or drive time with fake timers (src/browser/testFakeClock.ts).",
+          lowerAllow:
+            "This file has {{found}} fixed waits, but its local/no-fixed-sleep allow entry says " +
+            "{{allowed}}. Lower the entry, or remove it at 0.",
+        },
+      },
+      create(context) {
+        const MIN_MS = 20;
+        const sourceCode = context.sourceCode;
+        const relFile = path.relative(context.cwd, context.filename).split(path.sep).join("/");
+        const allowed = context.options[0]?.allow?.[relFile] ?? 0;
+        const found = [];
+        // Helper function -> the waits each call runs: `{ paramIndex }` (the call's argument
+        // decides) or `{ delay }` (every call waits that long).
+        const helpers = new Map();
+        // The delay as shown in the message, or null for a yield: no delay, or a literal under
+        // MIN_MS. Any other expression is a fixed wait as far as the rule can tell.
+        const fixedDelay = (node) => {
+          if (node == null) return null;
+          if (node.type === "Literal" && typeof node.value === "number") {
+            return node.value >= MIN_MS ? `${node.value} ms` : null;
+          }
+          return `\`${sourceCode.getText(node)}\` ms`;
+        };
+        const isFunction = (node) =>
+          node?.type === "ArrowFunctionExpression" ||
+          node?.type === "FunctionExpression" ||
+          node?.type === "FunctionDeclaration";
+        const enclosingFunction = (node) => {
+          let current = node.parent;
+          while (current && !isFunction(current)) current = current.parent;
+          return current ?? null;
+        };
+        // `resolve` itself, `() => resolve()`, or a block that calls `resolve()` among other
+        // statements (`() => { cleanup(); resolve(); }`).
+        const callsResolve = (callback, resolveName) => {
+          if (callback?.type === "Identifier") return callback.name === resolveName;
+          if (!isFunction(callback)) return false;
+          const isResolveCall = (node) =>
+            node?.type === "CallExpression" &&
+            node.callee.type === "Identifier" &&
+            node.callee.name === resolveName;
+          return callback.body.type === "BlockStatement"
+            ? callback.body.body.some(
+                (statement) =>
+                  statement.type === "ExpressionStatement" && isResolveCall(statement.expression)
+              )
+            : isResolveCall(callback.body);
+        };
+        // The executor of `new Promise(executor)` that `node` (a setTimeout call) runs in.
+        const promiseExecutor = (node) => {
+          const executor = enclosingFunction(node);
+          return executor?.parent?.type === "NewExpression" &&
+            executor.parent.arguments[0] === executor &&
+            isHostGlobal(sourceCode, executor.parent.callee, "Promise") &&
+            executor.params[0]?.type === "Identifier"
+            ? executor
+            : null;
+        };
+        // The declaration that names a function: `function sleep() {}` or `const sleep = ...`.
+        const namingDeclaration = (fn) =>
+          fn?.type === "FunctionDeclaration" && fn.id
+            ? fn
+            : fn?.parent?.type === "VariableDeclarator" &&
+                fn.parent.init === fn &&
+                fn.parent.id.type === "Identifier"
+              ? fn.parent
+              : null;
+        // The named helper whose calls run the wait at `node`: the function around it, or the
+        // function around the `act()` call whose callback holds it. Null for a wait written in
+        // a test body.
+        const helperOf = (node) => {
+          let fn = enclosingFunction(node);
+          const call = fn?.parent;
+          if (
+            call?.type === "CallExpression" &&
+            call.arguments.includes(fn) &&
+            (call.callee.type === "Identifier" ? call.callee.name : memberName(call.callee)) ===
+              "act"
+          ) {
+            fn = enclosingFunction(call);
+          }
+          return namingDeclaration(fn) ? fn : null;
+        };
+        const paramName = (param) =>
+          param.type === "AssignmentPattern" ? param.left.name : param.name;
+        // The statement a node starts in (`await new Promise(...)` over several lines).
+        const statementOf = (node) => {
+          let current = node;
+          while (current.parent && !/Statement$|Declaration$/.test(current.type)) {
+            current = current.parent;
+          }
+          return current;
+        };
+        // `places`: the nodes a disable comment can sit on for this wait (the timer, the first
+        // line of its statement and, for a helper call, the wait inside the helper).
+        const report = (node, delay, places = []) =>
+          found.push({ node, delay, places: [node, statementOf(node), ...places] });
+        // A wait at `anchor` (the Promise of a timer wait, or the Bun.sleep call) with
+        // `delayNode`: a helper's waits count at its calls, any other at `reportNode`.
+        const recordWait = (anchor, delayNode, reportNode) => {
+          const helper = helperOf(anchor);
+          const paramIndex =
+            delayNode?.type === "Identifier"
+              ? (helper?.params.findIndex((param) => paramName(param) === delayNode.name) ?? -1)
+              : -1;
+          const delay = paramIndex >= 0 ? null : fixedDelay(delayNode);
+          if (paramIndex < 0 && delay === null) return;
+          if (!helper) {
+            report(reportNode, delay, [statementOf(anchor)]);
+            return;
+          }
+          if (!helpers.has(helper)) helpers.set(helper, []);
+          const places = [reportNode, statementOf(anchor)];
+          helpers.get(helper).push(paramIndex >= 0 ? { paramIndex, places } : { delay, places });
+        };
+        // Lines whose waits carry a reasoned disable comment for this rule.
+        const disabledLines = new Set();
+        for (const comment of sourceCode.getAllComments()) {
+          const match = /^\s*eslint-disable-(next-)?line\s+([^]*?)(?:\s--[^]*)?$/.exec(
+            comment.value
+          );
+          if (
+            !match ||
+            !match[2].split(",").some((rule) => rule.trim() === "local/no-fixed-sleep")
+          ) {
+            continue;
+          }
+          disabledLines.add(match[1] ? comment.loc.end.line + 1 : comment.loc.start.line);
+        }
+        return {
+          CallExpression(node) {
+            const callee = node.callee;
+            if (memberName(callee) === "sleep" && isHostGlobal(sourceCode, callee.object, "Bun")) {
+              recordWait(node, node.arguments[0], node);
+              return;
+            }
+            const isTimer =
+              isHostGlobal(sourceCode, callee, "setTimeout") ||
+              (memberName(callee) === "setTimeout" &&
+                isHostGlobal(sourceCode, callee.object, "window"));
+            if (!isTimer) return;
+            const executor = promiseExecutor(node);
+            if (executor === null || !callsResolve(node.arguments[0], executor.params[0].name)) {
+              return;
+            }
+            recordWait(executor.parent, node.arguments[1], node);
+          },
+          "Program:exit"(program) {
+            for (const [helper, waits] of helpers) {
+              const declaration = namingDeclaration(helper);
+              const variable = sourceCode
+                .getDeclaredVariables(declaration)
+                .find((candidate) => candidate.name === declaration.id.name);
+              const calls = (variable?.references ?? [])
+                .map((reference) => reference.identifier)
+                .filter((id) => id.parent?.type === "CallExpression" && id.parent.callee === id)
+                .map((id) => id.parent);
+              // A helper that nothing in the file calls (an exported function, one passed by
+              // reference) still waits when it runs: count each fixed wait in it once.
+              if (calls.length === 0) {
+                for (const wait of waits) {
+                  if (wait.delay != null) report(wait.places[0], wait.delay, wait.places);
+                }
+              }
+              for (const call of calls) {
+                for (const wait of waits) {
+                  let delay = wait.delay;
+                  if (wait.paramIndex !== undefined) {
+                    const param = helper.params[wait.paramIndex];
+                    delay = fixedDelay(
+                      call.arguments[wait.paramIndex] ??
+                        (param.type === "AssignmentPattern" ? param.right : null)
+                    );
+                  }
+                  if (delay != null) report(call, delay, wait.places);
+                }
+              }
+            }
+            // A disabled wait is still reported, on its disabled line, so ESLint drops it and its
+            // directive counts as used. It does not use up the allow entry.
+            const disabledPlace = (wait) =>
+              wait.places.find((place) => disabledLines.has(place.loc.start.line));
+            const disabled = found
+              .filter((wait) => disabledPlace(wait))
+              .map((wait) => ({ ...wait, node: disabledPlace(wait) }));
+            const counted = found.filter((wait) => !disabledPlace(wait));
+            // The allow entry is an exact count, so it can only go down (as in no-raw-clock).
+            counted.sort((a, b) => a.node.range[0] - b.node.range[0]);
+            for (const { node, delay } of [...disabled, ...counted.slice(allowed)]) {
+              context.report({ node, messageId: "sleep", data: { delay } });
+            }
+            if (counted.length < allowed) {
+              context.report({
+                node: program,
+                messageId: "lowerAllow",
+                data: { found: String(counted.length), allowed: String(allowed) },
+              });
+            }
+          },
+        };
+      },
+    },
     // Casting an API double to APIClient in tests hides typos and wrong return types: the
     // `as unknown as APIClient` detour accepts anything, and a single `as APIClient` still
     // accepts any comparable subset. createTestApiClient (src/browser/testUtils.ts)
     // type-checks the partial double instead.
+    //
+    // The same bypass works through every other spelling of the client type, so the rule
+    // also matches the overrides type itself (`as unknown as TestApiOverrides<APIClient>`
+    // hands an unchecked fake to createTestApiClient), structural aliases
+    // (`NonNullable<ReturnType<typeof useAPI>["api"]>`, `RouterClient<AppRouter>`,
+    // `ReturnType<typeof createClient>`), parts of the client (`APIClient["workspace"]`) and
+    // transparent wrappers (`Partial<APIClient>`).
     "no-cast-to-api-client": {
       meta: {
         type: "problem",
         docs: { description: "Disallow casting to APIClient (`as APIClient`) in tests" },
         messages: {
-          cast: "Use createTestApiClient() from @/browser/testUtils instead of casting to APIClient: it type-checks the double against the real procedure types.",
+          cast: "Use createTestApiClient() from @/browser/testUtils instead of casting to APIClient (or TestApiOverrides, or another spelling of the client type): it type-checks the double against the real procedure types. Annotate the double, or use `satisfies TestApiOverrides<APIClient>`.",
         },
       },
       create(context) {
-        // Whether a type name refers to APIClient, including an aliased import
-        // (`import type { APIClient as Client }`) or a local alias (`type Client = APIClient`).
-        const isApiClientName = (identifier, depth = 0) => {
-          if (identifier.name === "APIClient") {
-            return true;
-          }
-          if (depth > 5) {
-            return false;
-          }
+        const WRAPPERS = new Set(["NonNullable", "Readonly", "Partial", "Required"]);
+        // The first definition of the binding a type name refers to, or null for a global.
+        const definitionOf = (identifier) => {
           for (let scope = context.sourceCode.getScope(identifier); scope; scope = scope.upper) {
             const variable = scope.set.get(identifier.name);
-            if (!variable) {
-              continue;
+            if (variable) {
+              return variable.defs[0] ?? null;
             }
-            const def = variable.defs[0];
-            if (def?.type === "ImportBinding") {
-              return (
-                def.node.type === "ImportSpecifier" &&
-                (def.node.imported.name ?? def.node.imported.value) === "APIClient"
-              );
+          }
+          return null;
+        };
+        // The module that exports each name the rule follows, from the repo root.
+        const MODULE_OF = {
+          APIClient: "src/browser/contexts/API",
+          TestApiOverrides: "src/browser/testUtils",
+          createClient: "src/common/orpc/client",
+          AppRouter: "src/node/orpc/router",
+          useAPI: "src/browser/contexts/API",
+        };
+        // Whether an import declaration loads the module that exports `name`: through the `@/`
+        // alias or a relative path. Another module's `createClient` (a database or HTTP client)
+        // only shares the name.
+        const importsModuleOf = (declaration, name) => {
+          const source = declaration.source.value;
+          const resolved = source.startsWith("@/")
+            ? `src/${source.slice(2)}`
+            : source.startsWith(".")
+              ? path.resolve(path.dirname(context.filename), source)
+              : source;
+          const normalized = resolved
+            .split(path.sep)
+            .join("/")
+            .replace(/\.tsx?$/, "");
+          return normalized === MODULE_OF[name] || normalized.endsWith(`/${MODULE_OF[name]}`);
+        };
+        // The exported name behind a type identifier: the imported name of an aliased import
+        // (`import type { APIClient as Client }`), else the identifier's own name. Null for an
+        // import of a name the rule follows from another module (an SDK's own `APIClient`).
+        const importedName = (identifier) => {
+          const def = definitionOf(identifier);
+          if (def?.type !== "ImportBinding" || def.node.type !== "ImportSpecifier") {
+            return identifier.name;
+          }
+          const name = def.node.imported.name ?? def.node.imported.value;
+          return !Object.hasOwn(MODULE_OF, name) || importsModuleOf(def.parent, name) ? name : null;
+        };
+        // Whether `identifier` is a namespace import of the module that exports `name`.
+        const isNamespaceImportOf = (identifier, name) => {
+          const def = definitionOf(identifier);
+          return (
+            def?.type === "ImportBinding" &&
+            def.node.type === "ImportNamespaceSpecifier" &&
+            importsModuleOf(def.parent, name)
+          );
+        };
+        // Whether `identifier` is bound to an import of `name` from its module, aliased or not.
+        // A local helper that only shares the name (`function createClient()` in a router test)
+        // is not the API client's factory.
+        const isImportOf = (identifier, name) => {
+          const def = definitionOf(identifier);
+          return (
+            def?.type === "ImportBinding" &&
+            def.node.type === "ImportSpecifier" &&
+            (def.node.imported.name ?? def.node.imported.value) === name &&
+            importsModuleOf(def.parent, name)
+          );
+        };
+        // `typeof useAPI` (an import of it) or `typeof APIModule.useAPI` (through a namespace
+        // import).
+        const isTypeofImport = (type, name) => {
+          if (type?.type !== "TSTypeQuery") {
+            return false;
+          }
+          const expression = type.exprName;
+          if (expression.type === "Identifier") {
+            return isImportOf(expression, name);
+          }
+          if (
+            expression.type !== "TSQualifiedName" ||
+            expression.left.type !== "Identifier" ||
+            expression.right.name !== name
+          ) {
+            return false;
+          }
+          return isNamespaceImportOf(expression.left, name);
+        };
+        // Whether a type spells APIClient, a part of it, or its test overrides type.
+        const isApiClientType = (type, depth = 0) => {
+          if (type == null || depth > 8) {
+            return false;
+          }
+          if (type.type === "TSIndexedAccessType") {
+            const object = type.objectType;
+            // `ReturnType<typeof useAPI>["api"]` (the client the API context hands out).
+            if (
+              typeReferenceName(object) === "ReturnType" &&
+              type.indexType.type === "TSLiteralType" &&
+              type.indexType.literal.value === "api" &&
+              isTypeofImport(typeArgumentsOf(object)[0], "useAPI")
+            ) {
+              return true;
             }
-            const aliased = def?.type === "Type" ? def.node.typeAnnotation : null;
+            // `APIClient["workspace"]`, `APIClient["workspace"]["getInfo"]`.
+            return isApiClientType(object, depth + 1);
+          }
+          if (type.type !== "TSTypeReference") {
+            return false;
+          }
+          const [firstArgument] = typeArgumentsOf(type);
+          // `APIModule.APIClient` through a namespace import of the API context module.
+          if (type.typeName.type === "TSQualifiedName") {
+            const { left, right } = type.typeName;
             return (
-              aliased?.type === "TSTypeReference" &&
-              aliased.typeName.type === "Identifier" &&
-              isApiClientName(aliased.typeName, depth + 1)
+              right.name === "APIClient" &&
+              left.type === "Identifier" &&
+              isNamespaceImportOf(left, "APIClient")
             );
           }
-          return false;
+          if (type.typeName.type !== "Identifier") {
+            return false;
+          }
+          const name = importedName(type.typeName);
+          if (name === "APIClient" || name === "TestApiOverrides") {
+            return true;
+          }
+          if (WRAPPERS.has(name)) {
+            return isApiClientType(firstArgument, depth + 1);
+          }
+          if (name === "RouterClient") {
+            return (
+              firstArgument?.type === "TSTypeReference" &&
+              firstArgument.typeName.type === "Identifier" &&
+              isImportOf(firstArgument.typeName, "AppRouter")
+            );
+          }
+          if (name === "ReturnType") {
+            // APIClient is declared as `ReturnType<typeof createClient>`.
+            return isTypeofImport(firstArgument, "createClient");
+          }
+          // A local alias: `type Client = APIClient`, `type Api = NonNullable<...>`.
+          const def = definitionOf(type.typeName);
+          return def?.type === "Type" && isApiClientType(def.node.typeAnnotation, depth + 1);
         };
         return {
           // Matches `x as APIClient` and the outer assertion of `x as unknown as APIClient`
           // (one report per chain, since the inner `as unknown` does not target APIClient).
-          "TSAsExpression[typeAnnotation.type='TSTypeReference'][typeAnnotation.typeName.type='Identifier']"(
-            node
-          ) {
-            if (isApiClientName(node.typeAnnotation.typeName)) {
+          TSAsExpression(node) {
+            if (isApiClientType(node.typeAnnotation)) {
               context.report({ node, messageId: "cast" });
             }
           },

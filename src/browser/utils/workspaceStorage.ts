@@ -59,14 +59,3 @@ export function deleteWorkspaceStorage(workspaceId: string): void {
 export function listWorkspaceStorageGcCandidateKeys(): string[] {
   return listPersistedStateKeys([""]).filter(isWorkspaceStorageGcCandidateKey);
 }
-
-/**
- * Migrate all workspace-specific localStorage keys from old to new workspace ID
- * Should be called when a workspace is renamed to preserve settings.
- * If any copy fails (e.g. the quota is full), the old keys are kept: the write helpers report
- * failure instead of throwing, and deleting anyway would erase the only persisted copy.
- */
-export function migrateWorkspaceStorage(oldWorkspaceId: string, newWorkspaceId: string): void {
-  if (!copyWorkspaceStorage(oldWorkspaceId, newWorkspaceId)) return;
-  deleteWorkspaceStorage(oldWorkspaceId);
-}

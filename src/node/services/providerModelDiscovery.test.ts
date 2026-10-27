@@ -8,6 +8,14 @@ import { CUSTOM_PROVIDER_TYPES } from "@/common/utils/providers/customProviders"
 import type { BaseProviderConfig } from "@/common/config/schemas/providersConfig";
 import { ProviderService } from "./providerService";
 
+// undici lists destroy()'s promise overload last, so `.call` on the bare method picks it. The
+// promise form re-enters the mocked destroy, so these mocks call the callback overload.
+type DestroyWithCallback = (
+  this: EnvHttpProxyAgent,
+  err: Error | null,
+  callback: () => void
+) => void;
+
 let root: string, config: Config, service: ProviderService;
 let cleanups: Array<() => void>;
 let server: ReturnType<typeof Bun.serve>;
@@ -289,7 +297,7 @@ it.each(["unchanged", "key", "abort"])(
     const release = Promise.withResolvers<void>();
     // Capture before spying; the callback overload is invoked below with its original receiver.
     // eslint-disable-next-line @typescript-eslint/unbound-method
-    const destroy = EnvHttpProxyAgent.prototype.destroy;
+    const destroy = EnvHttpProxyAgent.prototype.destroy as DestroyWithCallback;
     const spy = spyOn(EnvHttpProxyAgent.prototype, "destroy").mockImplementation(async function (
       this: EnvHttpProxyAgent
     ) {
@@ -836,7 +844,7 @@ it.each(specializedRaceCases)(
     };
     if (cut === "teardown") {
       // eslint-disable-next-line @typescript-eslint/unbound-method
-      const destroy = EnvHttpProxyAgent.prototype.destroy;
+      const destroy = EnvHttpProxyAgent.prototype.destroy as DestroyWithCallback;
       const spy = spyOn(EnvHttpProxyAgent.prototype, "destroy").mockImplementation(async function (
         this: EnvHttpProxyAgent
       ) {

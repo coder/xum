@@ -4143,6 +4143,10 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       rolloverAvailable?: boolean;
       toolSearch?: boolean;
       failedMcpServers?: string[];
+      // The enabled MCP servers this request lists (default: all).
+      mcpServerNames?: string[];
+      // The requested model (default: Sonnet).
+      modelString?: string;
       agentId?: string;
       // Earlier turns, sent before the latest user message (or built from the earlier requests).
       history?: MuxMessage[] | ((requests: TurnExecutionOptions[]) => MuxMessage[]);
@@ -4220,7 +4224,14 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
             // Like the real manager: the prompt inventory is the enabled
             // (configured, trusted, allowed) servers, not the running ones.
             overridesUsed: {},
-            serversUsed: mcpServers,
+            serversUsed:
+              state.mcpServerNames == null
+                ? mcpServers
+                : Object.fromEntries(
+                    Object.entries(mcpServers).filter(([name]) =>
+                      state.mcpServerNames?.includes(name)
+                    )
+                  ),
             stats: {
               totalTools: 1,
               activeServerCount: 2 - failedServerNames.length,
@@ -4268,7 +4279,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         const result = await harness.service.streamMessage({
           messages: [...history, createMuxMessage("latest-user", "user", "hello")],
           workspaceId,
-          modelString: KNOWN_MODELS.SONNET.id,
+          modelString: state.modelString ?? KNOWN_MODELS.SONNET.id,
           thinkingLevel: "off",
           agentId: state.agentId ?? "exec",
           contextBudgetRolloverAvailable: state.rolloverAvailable === true,
@@ -4344,6 +4355,12 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         // The <mcp> inventory lists configured servers; the failure goes to the uncached tail.
         label: "MCP server failure",
         states: [{}, { failedMcpServers: ["beta"] }],
+        observe: (request) => systemTail(request),
+      },
+      {
+        // F35: the <mcp> server list is volatile too, so turning one server off keeps the cache.
+        label: "MCP server list change",
+        states: [{}, { mcpServerNames: ["alpha"] }],
         observe: (request) => systemTail(request),
       },
     ])(
@@ -4441,6 +4458,55 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         }),
       ]);
     const lastRow = (request: TurnExecutionOptions) => JSON.stringify(request.messages.at(-1));
+
+    it("sends the MCP server list in the system prompt on a route without tail rows", async () => {
+      // F37: the <mcp> list moved to the volatile tail (#7653). OpenAI routes never send
+      // system rows, so the list must still reach the model in the system prompt, live.
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const {
+        requests: [first, changed],
+      } = await streamPair(
+        xumHome.path,
+        [
+          { modelString: KNOWN_MODELS.GPT.id },
+          {
+            modelString: KNOWN_MODELS.GPT.id,
+            mcpServerNames: ["alpha"],
+            history: instructionLedger,
+          },
+        ],
+        undefined,
+        "openai"
+      );
+      const systemText = (request: TurnExecutionOptions) =>
+        JSON.stringify([request.system, request.messages.filter((m) => m.role === "system")]);
+      expect(systemText(first)).toContain("<mcp>");
+      expect(systemText(first)).toContain("- beta");
+      expect(systemText(changed)).toContain("- alpha");
+      expect(systemText(changed)).not.toContain("- beta");
+      expect(changed.initialMetadata?.volatileSystemTail).toBeUndefined();
+      expect(JSON.stringify(changed.messages.at(-1))).not.toContain("<mcp>");
+    });
+
+    it("sends an MCP server list change mid-segment as a tail row", async () => {
+      // F35: turning one MCP server off rewrote the cached stable prompt in every busy
+      // workspace at once. The list now rides the volatile tail, and a change is a row.
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const {
+        requests: [first, changed],
+      } = await streamPair(
+        xumHome.path,
+        [{}, { mcpServerNames: ["alpha"], history: instructionLedger }],
+        undefined,
+        "anthropic"
+      );
+      expect(stableSystemRow(first)).not.toContain("<mcp>");
+      expect(stableSystemRow(changed)).toBe(stableSystemRow(first));
+      expect(changed.initialMetadata?.volatileSystemTail?.placement).toBe("row");
+      expect(lastRow(changed)).toContain("<mcp>");
+      expect(lastRow(changed)).toContain("- alpha");
+      expect(lastRow(changed)).not.toContain("- beta");
+    });
 
     it("keeps the cached system row across an AGENTS.md Mode: section change", async () => {
       // Codex P2 PRRT_kwDOPxxmWM6vffUy: a scoped section leaves <custom-instructions> for its

@@ -106,6 +106,11 @@ export async function resetTutorials(app: { baseUrl: string | undefined }): Prom
 /**
  * Sends a chat message with the Send button and waits until the composer has taken it. Pressing
  * Enter right after `fill` can arrive before the composer is ready (seen on the phone target).
+ *
+ * Stories send setup messages with this, not `agent.act`: e2e records the composer's placeholder
+ * as part of the target, and the placeholder tip rotates on a wall-clock timer (placeholderTips.ts).
+ * So an agent step that typed here replayed only until the next tip, and missed
+ * (`target-not-found`) in almost every CI run.
  */
 export async function sendMessage(screen: Screen, text: string): Promise<void> {
   const composer = screen.getByRole("textbox", "Message");

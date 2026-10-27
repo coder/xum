@@ -606,7 +606,7 @@ export const KEYBINDS = {
   /** Show the Stats tab full-screen on small viewports, where the right sidebar is hidden */
   OPEN_STATS_DIALOG: { key: "s", shift: true },
 
-  /** Open (or focus) the Artifacts tab in the right sidebar, or collapse the sidebar when it shows it */
+  /** Open or focus the Artifacts tab in the right sidebar, or collapse the sidebar when focus is in it */
   OPEN_ARTIFACTS_TAB: { key: "K", ctrl: true, shift: true },
 
   /** Agent interface view: switch the main pane between the agent's status page and the chat */

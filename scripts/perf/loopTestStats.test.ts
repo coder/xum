@@ -44,7 +44,7 @@ describe("summarizeFile", () => {
 });
 
 describe("trips", () => {
-  const record = (files: Array<[string, number[], number]>): LoopTestRecord => ({
+  const record = (files: [string, number[], number][]): LoopTestRecord => ({
     commit: "c",
     dirty: false,
     bun: "1.4.3",

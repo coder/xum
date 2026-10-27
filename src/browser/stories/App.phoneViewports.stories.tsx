@@ -28,6 +28,7 @@ import {
   openChatActivityPanel,
   openLeftSidebar,
   waitForChatInputAutofocusDone,
+  waitForModalLayer,
   waitForScrollStabilization,
 } from "./storyPlayHelpers.js";
 
@@ -758,7 +759,7 @@ export const IPhone16eHomeScreenTerminal: AppStory = {
 
     // The fixed-width decorator hides the right sidebar, so New terminal takes the pop-out path.
     await userEvent.click(await canvas.findByRole("button", { name: "New terminal" }));
-    const dialog = await body.findByTestId("terminal-dialog");
+    const dialog = await waitForModalLayer(await body.findByTestId("terminal-dialog"));
     await expect(homeScreenTerminal.windowOpen).not.toHaveBeenCalled();
 
     await userEvent.click(within(dialog).getByRole("button", { name: "Close terminal" }));

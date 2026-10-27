@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { armPairMedians, launchPlan, pairedRelativeDelta } from "./desktopColdStartStats";
 
-const near = (value: number) => expect.closeTo(value, 12);
+const near = (value: number) => expect.closeTo(value, 12) as number;
 
 describe("launchPlan", () => {
   test("alternates warm-ups, runs pairs ABBA, and measures every pair once per arm", () => {
@@ -53,19 +53,21 @@ describe("pairedRelativeDelta", () => {
   test("20% trim: drops 4 of 20 pairs per side, winsorized sd, t(0.95, df 11) = 1.796", () => {
     // d = -10%, then 18 pairs alternating -1% / +1%, then +60%: the two strays are trimmed away.
     const head = [90, ...[...Array(18).keys()].map((i) => (i % 2 ? 101 : 99)), 160];
-    const stats = pairedRelativeDelta(Array(20).fill(100), head, 0.2);
+    const stats = pairedRelativeDelta(Array<number>(20).fill(100), head, 0.2);
     // Winsorized at the 5th and 16th sorted d: 10 values of -1% and 10 of +1%, sd = 0.01 * sqrt(20 / 19).
     const halfWidth = 1.796 * Math.sqrt((19 * (0.01 ** 2 * 20)) / 19 / (12 * 11));
     expect([stats.n, stats.trim, stats.meanDelta]).toEqual([20, 0.2, near(0)]);
     expect([stats.halfWidth95, stats.upperBound95]).toEqual([near(halfWidth), near(halfWidth)]);
     // Untrimmed, the two strays decide the result.
-    expect(pairedRelativeDelta(Array(20).fill(100), head).upperBound95).toBeGreaterThan(0.05);
+    expect(pairedRelativeDelta(Array<number>(20).fill(100), head).upperBound95).toBeGreaterThan(
+      0.05
+    );
   });
 
   test("uses t = 1.729 at 20 pairs (df 19) and keeps 1.697 above df 30", () => {
     const alternating = (n: number) =>
       pairedRelativeDelta(
-        Array(n).fill(100),
+        Array<number>(n).fill(100),
         [...Array(n).keys()].map((i) => (i % 2 ? 99 : 101))
       );
     // d alternates +1% / -1%, so halfWidth = t * sd / sqrt(n) = t * 0.01 / sqrt(n - 1).

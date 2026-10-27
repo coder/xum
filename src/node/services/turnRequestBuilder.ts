@@ -121,7 +121,11 @@ import type { SessionUsageService } from "./sessionUsageService";
 import { sideChatCapabilityGrants, withSideChatInstructions } from "./sideChat";
 import type { EvaluationService } from "./evaluation/evaluationService";
 import type { InstructionSources } from "@/common/types/instructions";
-import { extractToolInstructionsFromSources, removeStatusPageAgentGuidance } from "./systemMessage";
+import {
+  extractToolInstructionsFromSources,
+  formatMcpContextSection,
+  removeStatusPageAgentGuidance,
+} from "./systemMessage";
 import { createAssistantMessageId } from "./utils/messageIds";
 import { createErrorEvent, formatSendMessageError } from "./utils/sendMessageError";
 
@@ -905,7 +909,15 @@ export interface PreparedStreamMessage extends AsyncDisposable {
 }
 
 export interface PreparedTurnRequest extends AsyncDisposable {
-  start(thinkingOverride?: ActiveTurnThinkingOverride): Promise<TurnRequestBuildOutcome>;
+  /**
+   * `turnStartStage` is the starting send's stage callback. It is passed at start, not prepare:
+   * a request prepared before its rows were published (a rollover's first request) gets it from
+   * the send that starts it, so the new window's first request decides its stage too (#7215).
+   */
+  start(
+    thinkingOverride?: ActiveTurnThinkingOverride,
+    turnStartStage?: OnTurnStartStage
+  ): Promise<TurnRequestBuildOutcome>;
 }
 
 type PreparedTurnRequestOutcome =
@@ -1471,7 +1483,7 @@ export class TurnRequestBuilder {
     const prepared = await this.prepare(opts, context);
     if (prepared.type === "finished") return prepared;
     await using request = prepared.request;
-    return await request.start(opts.activeTurnThinkingOverride);
+    return await request.start(opts.activeTurnThinkingOverride, opts.onTurnStartStage);
   }
 
   async prepare(
@@ -1632,7 +1644,6 @@ export class TurnRequestBuilder {
       hasQueuedMessages,
       getQueuedInputStopCause,
       onStepSettled,
-      onTurnStartStage,
       contextBudgetRolloverAvailable,
       requestAssemblySnapshot,
       openaiTruncationModeOverride,
@@ -2570,7 +2581,6 @@ export class TurnRequestBuilder {
         modelString: modelStringForSystem,
         cfg,
         providersConfig: this.dependencies.providerService.getConfig(),
-        mcpServers,
         xumScope,
         loadDesktopCapability,
         memoryToolAvailable: toolset.memoryToolAvailable,
@@ -2592,9 +2602,6 @@ export class TurnRequestBuilder {
       statusUpdateToolAvailable: statusPageAgentActive,
     };
     const prePolicyStreamSystemContext = await buildStreamSystemContextForToolset(prePolicyToolset);
-    // The MCP inventory the pre-policy context was built with; a later
-    // rebuild from the validated serve makes that context stale.
-    const mcpServersAtPrePolicy = mcpServers;
     recordStartupPhaseTiming("buildStreamSystemContextMs", buildStreamSystemContextStartedAt);
     const {
       agentSystemPromptSections,
@@ -3127,6 +3134,11 @@ export class TurnRequestBuilder {
     const mcpWarningSection = mcpStats
       ? formatMcpWarningSection(mcpStats.failedServerCount, mcpStats.failedServerNames)
       : undefined;
+    // The MCP server list is volatile too (the final inventory, after validation): its
+    // change goes through the volatile-tail rows instead of rewriting the cached prompt.
+    const mcpContextSection = formatMcpContextSection(mcpServers);
+    // join() reads an absent section as "".
+    const mcpSections = [mcpContextSection, mcpWarningSection].join("");
     if (mcpWarningSection != null) {
       workspaceLog.warn("MCP servers failed to start", {
         failedNames: mcpStats?.failedServerNames.join(", "),
@@ -3318,7 +3330,6 @@ export class TurnRequestBuilder {
         const attemptToolset = systemPromptToolsetOf(attemptTools, effectiveToolPolicy);
         const canReuseSystemContext =
           options.reusePrePolicySystemContext &&
-          mcpServers === mcpServersAtPrePolicy &&
           sameSystemPromptToolset(attemptToolset, prePolicyToolset);
         const rebuildSystemStartedAt = this.hostClock.nowMs();
         const systemContext = canReuseSystemContext
@@ -3329,10 +3340,10 @@ export class TurnRequestBuilder {
         }
         let attemptSystem = systemContext.systemMessage;
         let attemptSystemTokens = systemContext.systemMessageTokens;
-        // Volatile sections (this warning, the context-window ids) go last so
+        // Volatile sections (the MCP list and warning, the context-window ids) go last so
         // the stable prefix stays cacheable (#5251).
-        if (mcpWarningSection != null) {
-          attemptSystem = attemptSystem + mcpWarningSection;
+        if (mcpSections !== "") {
+          attemptSystem = attemptSystem + mcpSections;
           const tokenizer = await getTokenizerForModel(
             seed.rawModelString,
             seed.capabilityModelString
@@ -3419,6 +3430,7 @@ export class TurnRequestBuilder {
           // Re-measured on every render: the window section can change length. A tail that
           // middleware edited is not split at all (no rows either, see planSystemPrompt).
           attemptVolatileSystemSuffixLength = measureWholeVolatileSystemSuffix(attemptSystem, [
+            mcpContextSection,
             mcpWarningSection,
             section,
           ]);
@@ -3697,7 +3709,8 @@ export class TurnRequestBuilder {
 
     let started = false;
     const start = async (
-      thinkingOverride?: ActiveTurnThinkingOverride
+      thinkingOverride?: ActiveTurnThinkingOverride,
+      turnStartStage?: OnTurnStartStage
     ): Promise<TurnRequestBuildOutcome> => {
       assert(!started && !transferred, "Prepared request must be started once before disposal");
       started = true;
@@ -3769,7 +3782,7 @@ export class TurnRequestBuilder {
         requestHistorySequence,
       };
       const staged = await applyTurnStartStage({
-        onTurnStartStage,
+        onTurnStartStage: turnStartStage,
         estimate: streamState.contextBudgetEstimate,
         limit: primaryRequest.contextBudgetLimit,
         model: modelString,

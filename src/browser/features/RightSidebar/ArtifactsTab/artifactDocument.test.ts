@@ -7,7 +7,6 @@ import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { ARTIFACT_ASSET_LIMITS, createArtifactAssetLoader } from "./artifactAssets";
 import { buildArtifactCsp, isArtifactCdnUrl } from "./artifactCsp";
 import {
-  buildSandboxedHtmlDocument,
   buildSandboxedSvgDocument,
   finalizeSandboxedDocument,
   inlineArtifactHtmlAssets,
@@ -78,7 +77,13 @@ describe("isArtifactCdnUrl", () => {
   });
 });
 
-describe("buildSandboxedHtmlDocument", () => {
+// Production parses the artifact HTML, inlines its assets, then finalizes it
+// (SandboxedArtifactFrame, McpAppFrame): the CSP contract belongs to the finalize step.
+function finalizeHtml(html: string): string {
+  return finalizeSandboxedDocument(parseArtifactHtml(html), OPTIONS);
+}
+
+describe("finalizeSandboxedDocument", () => {
   let cleanupDom: (() => void) | null = null;
   beforeEach(() => {
     cleanupDom = installDom();
@@ -98,7 +103,7 @@ describe("buildSandboxedHtmlDocument", () => {
       "",
       "<!-- comment --><html lang=en>text",
     ]) {
-      const srcdoc = buildSandboxedHtmlDocument(html, OPTIONS);
+      const srcdoc = finalizeHtml(html);
       expect(srcdoc.startsWith("<!DOCTYPE html>\n<html")).toBe(true);
       expectCspFirst(srcdoc);
     }
@@ -110,14 +115,14 @@ describe("buildSandboxedHtmlDocument", () => {
       "<style>p{color:red}</style><link rel=stylesheet href='https://unpkg.com/x.css'>",
       "<p>x</p><style>body{font-size:13px}</style>",
     ]) {
-      const srcdoc = buildSandboxedHtmlDocument(html, OPTIONS);
+      const srcdoc = finalizeHtml(html);
       expectCspFirst(srcdoc);
       expectTextSizeAdjustBeforeArtifactStyles(srcdoc);
     }
   });
 
   test("keeps the artifact's own markup", () => {
-    const srcdoc = buildSandboxedHtmlDocument("<h1 id=t>Hello</h1>", OPTIONS);
+    const srcdoc = finalizeHtml("<h1 id=t>Hello</h1>");
     const doc = new window.DOMParser().parseFromString(srcdoc, "text/html");
     expect(doc.getElementById("t")?.textContent).toBe("Hello");
   });

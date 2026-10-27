@@ -417,7 +417,7 @@ const TabScrollRow: React.FC<{
       data-tab-scroll-row
       role="tablist"
       aria-label={props.ariaLabel}
-      className="scrollbar-none scroll-fade-x flex min-w-0 flex-initial flex-nowrap items-center gap-1 overflow-x-auto"
+      className="scroll-fade-x flex min-w-0 flex-initial scrollbar-none flex-nowrap items-center gap-1 overflow-x-auto"
       onKeyDown={handleTabStripKeyDown}
     >
       {props.items.map((item, index) => (

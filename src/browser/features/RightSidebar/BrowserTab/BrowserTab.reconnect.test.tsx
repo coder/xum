@@ -2,7 +2,7 @@
 import "../../../../../tests/ui/dom";
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { act, cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
@@ -11,9 +11,10 @@ import {
   createConnectionHarness,
   GAP_MODES,
   type ConnectionHarness,
+  settle,
 } from "@/browser/contexts/connection.testHarness";
 import * as RealBrowserBridgeConnectionModule from "@/browser/features/RightSidebar/BrowserTab/useBrowserBridgeConnection";
-import type { TestApiOverrides } from "@/browser/testUtils";
+import type { TestApiOutput, TestApiOverrides } from "@/browser/testUtils";
 import type { BrowserPageTab } from "./browserBridgeTypes";
 
 // The live bridge opens its own socket; this suite is about the API client, so stub the bridge
@@ -43,8 +44,8 @@ import { BrowserTab } from "./BrowserTab";
  */
 
 /** What the server's listings answer; a test swaps them (or holds them) before a connect. */
-let answerSessions: () => Promise<unknown>;
-let answerTabs: () => Promise<unknown>;
+let answerSessions: () => Promise<TestApiOutput<APIClient["browser"]["listSessions"]>>;
+let answerTabs: () => Promise<TestApiOutput<APIClient["browser"]["listTabs"]>>;
 
 function pageTab(tabId: string, title: string, active: boolean): BrowserPageTab {
   return { tabId, label: null, title, url: `https://${tabId}.example.com/`, active, type: "page" };
@@ -56,7 +57,7 @@ function serverOverrides(): TestApiOverrides<APIClient> {
       listSessions: () => answerSessions(),
       listTabs: () => answerTabs(),
     },
-  } as unknown as TestApiOverrides<APIClient>;
+  };
 }
 
 let harness: ConnectionHarness;
@@ -66,24 +67,18 @@ function Wrapper(props: { children: ReactNode }) {
   return <Connection>{props.children}</Connection>;
 }
 
-async function flush() {
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 20));
-  });
-}
-
 async function drop() {
   await harness.drop();
-  await flush();
+  await settle();
 }
 
 async function reconnect() {
   harness.reconnect();
-  await flush();
+  await settle();
 }
 
 /** Never answers: the listing stays in flight until a drop cuts it off. */
-function pending(): Promise<unknown> {
+function pending<T>(): Promise<T> {
   return new Promise(() => undefined);
 }
 
@@ -161,7 +156,7 @@ describe.each([...GAP_MODES])("BrowserTab across a dropped connection (%s)", (mo
     await drop();
     fireEvent.click(view.getByText("alpha"));
     fireEvent.click(view.getByTestId("browser-session-beta"));
-    await flush();
+    await settle();
     expect(view.queryByTestId("browser-page-tab-t2")).toBeNull();
 
     answerTabs = () =>

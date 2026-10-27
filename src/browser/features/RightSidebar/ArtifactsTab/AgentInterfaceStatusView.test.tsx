@@ -275,7 +275,9 @@ describe("Agent interface status view", () => {
     current = page("<!-- xx -->");
     const view = render(<MainPane workspaceId="ws-unshowable" />, { wrapper: Wrapper });
     await waitFor(() => expect(reads).toBe(1));
-    await waitFor(() => expect(view.queryByTestId("agent-interface-status-view")).toBeNull());
+    await waitFor(() =>
+      expect(view.queryByTestId("agent-interface-status-view") === null).toBe(true)
+    );
 
     // Same size and listed mtime: only the tool call tells the pane to look again.
     current = page("<p>AAAA</p>");
@@ -352,7 +354,9 @@ describe("Agent interface status view", () => {
       act(() =>
         pressInFrame(KEYBINDS.TOGGLE_AGENT_INTERFACE_VIEW.key, { ctrlKey: true, shiftKey: true })
       );
-      await waitFor(() => expect(view.queryByTestId("agent-interface-status-view")).toBeNull());
+      await waitFor(() =>
+        expect(view.queryByTestId("agent-interface-status-view") === null).toBe(true)
+      );
     } finally {
       globalThis.KeyboardEvent = globalKeyboardEvent;
       Reflect.deleteProperty(window.navigator, "userActivation");
@@ -500,6 +504,8 @@ describe("Agent interface status view", () => {
 
     listed = "absent";
     act(() => workspaceStore.simulateFileModifyingToolEnd("ws-truncated"));
-    await waitFor(() => expect(view.queryByTestId("agent-interface-status-view")).toBeNull());
+    await waitFor(() =>
+      expect(view.queryByTestId("agent-interface-status-view") === null).toBe(true)
+    );
   });
 });
