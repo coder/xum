@@ -7,13 +7,11 @@
  * Play-only: the Pixel snapshot budget is full, and the plays (not a snapshot) carry the behavior.
  */
 
-import type { ComponentType } from "react";
-import { expect, userEvent, waitFor, within } from "storybook/test";
+import { expect, screen, userEvent, waitFor, within } from "storybook/test";
 
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { TodoItem } from "@/common/types/tools";
-import { NARROW_VIEWPORT_MAX_WIDTH_PX, SHORT_VIEWPORT_MAX_HEIGHT_PX } from "@/constants/layout";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createOnChatAdapter } from "./helpers/chatSetup";
@@ -206,7 +204,7 @@ async function assertOneLine(line: HTMLElement) {
   await expect(stop.getBoundingClientRect().right).toBeLessThanOrEqual(lineRect.right);
 }
 
-async function assertPanels(line: HTMLElement) {
+async function assertPanels(line: HTMLElement, surface: "popover" | "sheet") {
   const chip = await openChatActivityPanel(line, "PinnedTodoList");
   const panel = await findChatActivityPanel();
   await expect(within(panel).getByText("Report the stack as merged")).toBeVisible();
@@ -215,17 +213,13 @@ async function assertPanels(line: HTMLElement) {
   await expect(panelRect.right).toBeLessThanOrEqual(window.innerWidth);
 
   // Switching lists swaps the panel instead of stacking a second one.
-  if (
-    window.innerWidth <= NARROW_VIEWPORT_MAX_WIDTH_PX ||
-    window.innerHeight <= SHORT_VIEWPORT_MAX_HEIGHT_PX
-  ) {
-    // Phone viewports (local Storybook's mobile1): the panels share the activity sheet, whose
-    // tabs switch between them.
+  if (surface === "sheet") {
+    // Phones: the panels share the activity sheet, whose tabs switch between them.
     const sheet = panel.closest<HTMLElement>('[role="dialog"]');
     if (sheet === null) throw new Error("The TODO panel opened outside the activity sheet");
     await userEvent.click(within(sheet).getByRole("tab", { name: /Bashes/ }));
   } else {
-    // The test-runner's wide window: a popover above the line.
+    // Wide viewports: a popover above the line.
     await expect(panelRect.bottom).toBeLessThanOrEqual(line.getBoundingClientRect().top);
     await openChatActivityPanel(line, "BackgroundProcessesBanner");
   }
@@ -240,7 +234,8 @@ async function assertPanels(line: HTMLElement) {
 }
 
 // Clearing the plan and writing it again must leave one TODO chip: a stale chip from the cleared
-// plan once stayed behind (sibling chips shared a React key) next to the new one.
+// plan once stayed behind (sibling chips shared a React key) next to the new one. The TODO chip
+// coming and going must not remount the chips after it either, which would close their panel.
 async function assertTodoChipFollowsRewrite(line: HTMLElement, workspaceId: string) {
   const writeTodos = (toolCallId: string, todos: TodoItem[]) => {
     emitChat({
@@ -264,10 +259,14 @@ async function assertTodoChipFollowsRewrite(line: HTMLElement, workspaceId: stri
     });
   };
   const todoChips = () => line.querySelectorAll('[data-component="PinnedTodoList"]');
+  const bashesChip = await openChatActivityPanel(line, "BackgroundProcessesBanner");
   writeTodos("call-todo-clear", []);
   await waitFor(() => expect(todoChips()).toHaveLength(0));
   writeTodos("call-todo-again", TODOS);
   await waitFor(() => expect(todoChips()).toHaveLength(1));
+  await expect(within(await findChatActivityPanel()).getByText("CI watch")).toBeVisible();
+  await expect(bashesChip).toBeInTheDocument();
+  await expect(bashesChip).toHaveAttribute("aria-expanded", "true");
 }
 
 // A turn ending must not remount the chips: that would close the open panel (and a bash output
@@ -299,27 +298,38 @@ export const WorstCaseDesktop: AppStory = {
   play: async ({ canvasElement }) => {
     const line = await findLine(canvasElement);
     await assertOneLine(line);
-    await assertPanels(line);
+    await assertPanels(line, "popover");
     await assertTodoChipFollowsRewrite(line, "ws-activity-line-desktop");
     await assertPanelSurvivesTurnEnd(line, "ws-activity-line-desktop");
   },
 };
 
-function PhoneWidthDecorator(Story: ComponentType) {
-  // The Storybook test-runner ignores Pixel viewports, so the phone width comes from this frame.
-  return (
-    <div style={{ width: 390, height: 844, overflow: "hidden" }}>
-      <Story />
-    </div>
-  );
+// Four tabs do not fit a phone's sheet: the strip scrolls instead of squeezing a tab below its
+// label and count (which then overlap the next tab's), and the sheet opens with its tab in view.
+async function assertSheetTabs(line: HTMLElement) {
+  await userEvent.click(within(line).getByRole("button", { name: /pending review/ }));
+  const sheet = await screen.findByRole("dialog", { name: "Activity" });
+  const strip = within(sheet).getByRole("tablist");
+  for (const tab of within(strip).getAllByRole("tab")) {
+    await expect(tab.scrollWidth).toBeLessThanOrEqual(tab.clientWidth);
+  }
+  await expect(strip.scrollWidth).toBeGreaterThan(strip.clientWidth);
+  const stripRect = strip.getBoundingClientRect();
+  const tabRect = within(strip).getByRole("tab", { selected: true }).getBoundingClientRect();
+  await expect(tabRect.left).toBeGreaterThanOrEqual(stripRect.left);
+  await expect(tabRect.right).toBeLessThanOrEqual(stripRect.right);
+  await userEvent.keyboard("{Escape}");
+  await waitFor(() => expect(document.querySelector("[data-activity-panel]")).toBeNull());
 }
 
+// The line opens its panels in the phone sheet by matchMedia, so a phone-sized frame inside a
+// desktop window would test the popover. The Storybook test-runner applies no globals.viewport:
+// .storybook/test-runner.ts gives this story a real phone viewport instead.
 export const WorstCasePhone: AppStory = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
   render: () => <AppWithMocks setup={() => setupActivityLineStory("ws-activity-line-phone")} />,
-  decorators: [PhoneWidthDecorator],
   parameters: {
     ...appMeta.parameters,
     pixel: PIXEL_DISABLED,
@@ -327,6 +337,7 @@ export const WorstCasePhone: AppStory = {
   play: async ({ canvasElement }) => {
     const line = await findLine(canvasElement);
     await assertOneLine(line);
-    await assertPanels(line);
+    await assertPanels(line, "sheet");
+    await assertSheetTabs(line);
   },
 };

@@ -432,8 +432,23 @@ async function assertMenuClearsSafeArea(page: StoryPage) {
   }
 }
 
+// Stories that need a phone viewport for their play, as their globals.viewport gives them in
+// Storybook. A fixed-size frame would not do: matchMedia, which decides where the live line opens
+// its panels (the phone sheet or a popover), still sees the desktop window.
+const PHONE_VIEWPORT_STORIES = new Map([
+  ["app-composeractivityline--worst-case-phone", { width: 375, height: 667 }],
+]);
+const viewportsToRestore = new WeakMap<object, { width: number; height: number }>();
+
 const config: TestRunnerConfig = {
   async preVisit(page, context) {
+    const phoneViewport = PHONE_VIEWPORT_STORIES.get(context.id);
+    if (phoneViewport) {
+      const viewport = page.viewportSize();
+      if (viewport) viewportsToRestore.set(page, viewport);
+      await page.setViewportSize(phoneViewport);
+      return;
+    }
     // exposeFunction throws on a second registration, so register once per Playwright page.
     if (!context.id.startsWith(HOVER_STORY_PREFIX) || hoverReady.has(page)) return;
     hoverReady.add(page);
@@ -441,6 +456,12 @@ const config: TestRunnerConfig = {
     await page.exposeFunction("__storybookUnhover", () => page.mouse.move(0, 0));
   },
   async postVisit(page, context) {
+    // Runs after a failed play too, so a phone viewport never leaks into the next story.
+    const restoreViewport = viewportsToRestore.get(page);
+    if (restoreViewport) {
+      viewportsToRestore.delete(page);
+      await page.setViewportSize(restoreViewport);
+    }
     const insetTarget = SIDE_INSET_TARGETS.get(context.id);
     if (insetTarget) {
       if (page.context().browser()?.browserType().name() === "chromium") {

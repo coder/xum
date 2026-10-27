@@ -311,7 +311,7 @@ function ChatActivitySheet(props: {
           ref={props.tabsRef}
           role="tablist"
           aria-label="Activity"
-          className="bg-surface-secondary mx-4 mt-2 flex shrink-0 gap-1 rounded-lg p-1"
+          className="bg-surface-secondary mx-4 mt-2 flex shrink-0 scroll-px-1 scrollbar-none gap-1 overflow-x-auto rounded-lg p-1"
         />
         <div ref={props.bodyRef} className="flex min-h-0 flex-1 flex-col" />
       </div>

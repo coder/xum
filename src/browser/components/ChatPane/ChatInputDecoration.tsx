@@ -300,6 +300,10 @@ function PanelHeading(props: ChatInputDecorationProps) {
   );
 }
 
+function revealSheetTab(tab: HTMLButtonElement | null): void {
+  tab?.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
 /** The chip's tab in the activity sheet, while the line opens its panels in one (phones). */
 function ChatActivitySheetTab(props: {
   activityId?: ChatActivityId;
@@ -314,6 +318,9 @@ function ChatActivitySheetTab(props: {
   }
   return createPortal(
     <button
+      // The tab strip scrolls when the tabs do not fit, so a chip late in the line (Reviews)
+      // would otherwise open the sheet on a tab cut off at the strip's edge.
+      ref={props.open ? revealSheetTab : undefined}
       type="button"
       role="tab"
       aria-selected={props.open}
@@ -324,8 +331,10 @@ function ChatActivitySheetTab(props: {
           ? undefined
           : { order: CHAT_ACTIVITY_ORDER[props.activityId] }
       }
+      // No min-w-0: a tab never shrinks below its label and count, which would overlap the next
+      // tab's. When the tabs do not fit (four on a phone), the tab strip scrolls instead.
       className={cn(
-        "inline-flex h-9 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-sm whitespace-nowrap transition-colors",
+        "inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-sm whitespace-nowrap transition-colors",
         props.open ? "bg-hover text-foreground" : "text-secondary hover:text-foreground"
       )}
     >
