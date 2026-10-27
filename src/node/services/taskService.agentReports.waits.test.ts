@@ -112,11 +112,15 @@ describe("TaskService", () => {
       const hasQueuedMessages = mock(() => true);
       const { workspaceService } = createWorkspaceServiceMocks({ hasQueuedMessages });
       const { taskService } = createTaskServiceHarness(config, { workspaceService });
-      const internal = taskService as unknown as {
-        backgroundableForegroundWaitersByWorkspaceId: Map<string, Set<unknown>>;
-        pendingStartWaitersByTaskId: Map<string, unknown[]>;
-        pendingWaitersByTaskId: Map<string, unknown[]>;
-      };
+      const internal = (
+        taskService as unknown as {
+          waiters: {
+            backgroundableForegroundWaitersByWorkspaceId: Map<string, Set<unknown>>;
+            pendingStartWaitersByTaskId: Map<string, unknown[]>;
+            pendingWaitersByTaskId: Map<string, unknown[]>;
+          };
+        }
+      ).waiters;
 
       const waitError = await taskService
         .waitForAgentReport(childId, {
@@ -754,8 +758,8 @@ describe("TaskService", () => {
 
     // Simulate process restart / eviction.
     (
-      taskService as unknown as { completedReportsByTaskId: Map<string, unknown> }
-    ).completedReportsByTaskId.clear();
+      taskService as unknown as { waiters: { completedReportsByTaskId: Map<string, unknown> } }
+    ).waiters.completedReportsByTaskId.clear();
 
     const report = await taskService.waitForAgentReport(childId, {
       timeoutMs: 10,

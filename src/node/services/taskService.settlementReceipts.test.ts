@@ -865,8 +865,8 @@ describe("TaskService settlement receipt producers (G2)", () => {
     await ownEligibleAttempt(config, taskService, taskId);
     const pendingWaiters = () =>
       (
-        svc as unknown as { pendingWaitersByTaskId: Map<string, unknown[]> }
-      ).pendingWaitersByTaskId.get(taskId)?.length ?? 0;
+        svc as unknown as { waiters: { pendingWaitersByTaskId: Map<string, unknown[]> } }
+      ).waiters.pendingWaitersByTaskId.get(taskId)?.length ?? 0;
     const settledOf = (promise: Promise<unknown>) => {
       const state: { settled?: "resolved" | "rejected"; error?: unknown } = {};
       promise.then(

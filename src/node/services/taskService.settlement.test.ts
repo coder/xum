@@ -2220,7 +2220,7 @@ describe("TaskService", () => {
     interface AttemptLedgerInternals {
       ownedAttemptByTaskId: Map<string, { generation: number }>;
       attemptSettlementByTaskId: Map<string, { attempt: { generation: number } }>;
-      completedReportsByTaskId: Map<string, unknown>;
+      waiters: { completedReportsByTaskId: Map<string, unknown> };
       shouldAllowLegacyInvalidWorkflowOutputSchema: (...args: unknown[]) => Promise<boolean>;
     }
     const ledgerInternals = (taskService: TaskService) =>
@@ -2276,7 +2276,7 @@ describe("TaskService", () => {
         const reported = { kind: "reported", report: { reportMarkdown: "final answer" } };
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
         // Not just the in-memory cache: the persisted artifact answers, here and in a fresh process.
-        internals.completedReportsByTaskId.clear();
+        internals.waiters.completedReportsByTaskId.clear();
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
         const { taskService: freshService } = createTaskServiceHarness(config);
         expect(await freshService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
