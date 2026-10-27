@@ -107,6 +107,28 @@ export function useReleaseChatActivityPanelOnUnmount(id: ChatActivityId | undefi
 }
 
 /**
+ * Escape from <body> closes the open panel, popover or sheet. Focus lands there when a focused row
+ * leaves (a stopped bash) or a dialog opened from a row closes (bash output), where the panel's
+ * own Escape handling never sees the key, and the window's stream interrupt would take it while
+ * the panel stays open. On <body>, so it runs before that interrupt.
+ */
+export function useCloseChatActivityPanelOnBodyEscape(open: boolean, close: () => void): void {
+  useEffect(() => {
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || event.target !== document.body) {
+        return;
+      }
+      event.preventDefault();
+      stopKeyboardPropagation(event);
+      close();
+    };
+    document.body.addEventListener("keydown", onKeyDown);
+    return () => document.body.removeEventListener("keydown", onKeyDown);
+  }, [open, close]);
+}
+
+/**
  * Owns the live line's single open panel. A press outside the line closes it, except inside a
  * modal opened from a panel (the background bash output dialog portals outside the line).
  *
@@ -196,6 +218,7 @@ function useSheetFocus(
   useEffect(() => {
     const root = rootRef.current;
     const dialog = dialogRef.current;
+    // mutation-equivalent: both refs attach in the sheet's one commit, so they are null together
     if (!open || root === null || dialog === null) return;
     const returnFocus = returnFocusRef.current;
     const restoreOthers = makeOthersInert(root);
@@ -213,9 +236,8 @@ function useSheetFocus(
  * sheet from their chips, so their React events bubble to the chips and never reach a React
  * handler here. It runs after those handlers, so a panel that handles Escape itself (by
  * preventing default or stopping it) keeps it, and it stops Escape before the window's stream
- * interrupt sees it. It listens on <body>, not the sheet: a row removed while focused (a stopped
- * bash) drops focus there, and the page behind the sheet is inert, so a key from <body> is the
- * sheet's too.
+ * interrupt sees it. Escape from <body> reaches the open panel's chip instead
+ * (useCloseChatActivityPanelOnBodyEscape).
  */
 function useSheetEscape(
   open: boolean,
@@ -227,14 +249,12 @@ function useSheetEscape(
     if (!open || root === null) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
-      const target = event.target;
-      if (target !== document.body && !(target instanceof Node && root.contains(target))) return;
       event.preventDefault();
       stopKeyboardPropagation(event);
       close();
     };
-    document.body.addEventListener("keydown", onKeyDown);
-    return () => document.body.removeEventListener("keydown", onKeyDown);
+    root.addEventListener("keydown", onKeyDown);
+    return () => root.removeEventListener("keydown", onKeyDown);
   }, [open, rootRef, close]);
 }
 

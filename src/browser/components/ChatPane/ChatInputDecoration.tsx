@@ -10,6 +10,7 @@ import { useChatDockColumnWidthClass } from "./chatDockColumn";
 import {
   CHAT_ACTIVITY_ORDER,
   useChatActivitySheet,
+  useCloseChatActivityPanelOnBodyEscape,
   useInChatActivityLine,
   useReleaseChatActivityPanelOnUnmount,
   type ChatActivityId,
@@ -145,9 +146,10 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
   const chipContent = props.chip ?? props.summary;
   const close = () => {
     props.onToggle();
-    // mutation-equivalent: close only runs from the chip's or its panel's handlers, so the chip is mounted
+    // mutation-equivalent: close runs only from the chip's own handlers and listener, so the chip is mounted
     chipRef.current?.focus();
   };
+  useCloseChatActivityPanelOnBodyEscape(renderPanel !== undefined, close);
 
   return (
     <div className="contents" data-component={props.dataComponent}>

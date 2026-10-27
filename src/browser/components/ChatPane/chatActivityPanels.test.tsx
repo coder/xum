@@ -98,6 +98,39 @@ describe("chat activity panels", () => {
     expect(document.activeElement).toBe(chip);
   });
 
+  it("closes on Escape from <body> without reaching window handlers", () => {
+    // A row's bash output dialog has no trigger to return focus to, so closing it leaves focus on
+    // <body>: the next Escape must close the panel, not interrupt the stream behind it.
+    const view = render(renderLine());
+    const chip = view.getByRole("button", { name: "TODO" });
+    let windowSawEscape = false;
+    const onWindowKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") windowSawEscape = true;
+    };
+    window.addEventListener("keydown", onWindowKeyDown);
+
+    fireEvent.click(chip);
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    window.removeEventListener("keydown", onWindowKeyDown);
+
+    expect(view.queryByText("TODO list")).toBeNull();
+    expect(windowSawEscape).toBe(false);
+    expect(document.activeElement === chip).toBe(true);
+  });
+
+  it("leaves an Escape from <body> that a dialog above the panel handled", () => {
+    // Radix dialogs (bash output) take Escape in the document's capture phase.
+    const view = render(renderLine());
+    fireEvent.click(view.getByRole("button", { name: "TODO" }));
+    const onCapture = (event: KeyboardEvent) => event.preventDefault();
+    document.addEventListener("keydown", onCapture, { capture: true });
+
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    document.removeEventListener("keydown", onCapture, { capture: true });
+
+    expect(view.queryByText("TODO list")).not.toBeNull();
+  });
+
   it("ignores keys other than Escape", () => {
     const view = render(renderLine());
 
@@ -154,16 +187,17 @@ describe("chat activity panels", () => {
   it("leaves Escape to the window while every panel is closed", () => {
     // The global Escape handler interrupts the stream; a closed chip must not swallow it.
     const view = render(renderLine());
-    let windowSawEscape = false;
+    let windowSawEscapes = 0;
     const onWindowKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") windowSawEscape = true;
+      if (event.key === "Escape") windowSawEscapes++;
     };
     window.addEventListener("keydown", onWindowKeyDown);
 
     fireEvent.keyDown(view.getByRole("button", { name: "TODO" }), { key: "Escape" });
+    fireEvent.keyDown(document.body, { key: "Escape" });
     window.removeEventListener("keydown", onWindowKeyDown);
 
-    expect(windowSawEscape).toBe(true);
+    expect(windowSawEscapes).toBe(2);
   });
 
   it("closes when the user presses outside the line, not inside it", () => {
