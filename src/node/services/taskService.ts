@@ -42,6 +42,7 @@ import {
   type AgentTaskStatus,
   type BackgroundableForegroundWaiter,
   type QueueCutAttributionSnapshot,
+  type QueueCutReceipt,
   type ResolvedWorkspaceAiSettings,
   type TaskCreateArgs,
   type TaskKind,
@@ -1459,6 +1460,31 @@ interface ParentStreamEndState extends ParentStreamEndContext {
 }
 
 type ParentAutoResumeOptions = Awaited<ReturnType<TaskService["resolveParentAutoResumeOptions"]>>;
+
+/** A child (task) stream end's inputs, all snapshots taken before the child branch's awaits. */
+interface ChildStreamEndContext extends StreamEndAdmission {
+  readonly event: StreamEndEvent;
+  readonly queueCutSnapshot: QueueCutAttributionSnapshot;
+  readonly taskOrigin: StreamEndTaskOrigin;
+  readonly isCompaction: boolean;
+}
+
+/** A child stream end's context plus what it read once its workspace turn was finalized. */
+interface ChildStreamEndState extends ChildStreamEndContext {
+  readonly status: WorkspaceConfigEntry["taskStatus"];
+  /** The stream's final report; always null for a plan-like task. */
+  readonly reportArgs: Awaited<ReturnType<TaskService["resolveFinalAgentReportArgs"]>>;
+  readonly isPlanLike: boolean;
+  readonly proposePlanResult: ReturnType<TaskService["findProposePlanSuccessInParts"]>;
+}
+
+/** A child's non-blocking background work, which still holds its final report back. */
+interface ChildBackgroundWork {
+  /** Captured before the workflow and workspace-turn awaits (see holdChildForBlockingDescendants). */
+  readonly activeDescendantTaskIds: readonly string[];
+  readonly activeTaskWorkflowRunIds: readonly string[];
+  readonly activeWorkspaceTurnIds: readonly string[];
+}
 
 /** Active task ids that block the parent: neither queue-backgrounded nor notify_on_terminal. */
 function filterParentBlockingTaskIds(
@@ -16057,298 +16083,20 @@ export class TaskService implements AgentTaskIntegration {
 
     const admission = this.admitStreamEnd(event, taskOrigin);
     if (admission == null) return;
-    const { workspaceId, cfg, entry, streamAttemptId, taskIndex } = admission;
 
     // Parent workspaces must not end while they have active background tasks/workflows.
     // Enforce by auto-resuming the stream with a directive to await outstanding work.
-    if (!entry.workspace.parentWorkspaceId) {
+    if (!admission.entry.workspace.parentWorkspaceId) {
       await this.resumeParentStreamEnd(event, queueCutSnapshot, admission);
       return;
     }
-
-    if (
-      await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamEnd(
-        event,
-        queueCutSnapshot
-      )
-    ) {
-      return;
-    }
-
-    // Stop and reactivation can pass this handler while it waits for the event lock. Its
-    // original execution, not the task's current status, owns this stream-end disposition.
-    if (this.cutSourceIsObsolete(event, taskOrigin)) {
-      this.discardCutReceipt(event);
-      return;
-    }
-
-    const status = entry.workspace.taskStatus;
-    const workflowOutputSchema = entry.workspace.workflowTask?.outputSchema;
-    const acceptsSchemaShapedWorkflowReport =
-      workflowOutputSchema !== undefined &&
-      validateJsonSchemaSubsetSchema(workflowOutputSchema, { requireObjectSchema: true }).success;
-    // Missing finish reasons are not proof of a clean stop: providers may omit them and metadata
-    // collection may time out. Only explicit `stop` can promote the final assistant response to the
-    // terminal report; otherwise recovery asks the child to finish instead of finalizing an update.
-    const finalAgentReportArgs =
-      !isCompaction && event.metadata.finishReason === "stop"
-        ? await this.resolveFinalAgentReportArgs(workspaceId, event.parts, {
-            acceptSchemaShapedWorkflowReport: acceptsSchemaShapedWorkflowReport,
-          })
-        : null;
-    const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
-    const reportArgs = isPlanLike ? null : finalAgentReportArgs;
-    const proposePlanResult = this.findProposePlanSuccessInParts(event.parts);
-    // No terminal report in this stream: the attempt continues. Decide (and wake the held queue)
-    // BEFORE the recovery/continuation sends below, so a user follow-up queued during the stream
-    // still dispatches ahead of them, exactly as it did before the hold existed.
-    if (reportArgs == null && !(isPlanLike && proposePlanResult) && status !== "interrupted") {
-      this.streamEndLedger.resolveStreamEndDecision(
-        workspaceId,
-        this.streamEndLedger.findPendingStreamEndDecision(
-          workspaceId,
-          taskOrigin.ownedAttempt,
-          taskOrigin.unownedAttemptId
-        ),
-        "nonreport"
-      );
-    }
-
-    // Stream-end settlement: interrupted tasks must settle all pending waiters.
-    // A workflow-owned plan step that successfully called propose_plan is already complete,
-    // even if the interruption status landed before the provider emitted stream-end.
-    if (status === "interrupted") {
-      if (isPlanLike && proposePlanResult && entry.workspace.workflowTask != null) {
-        await this.handleSuccessfulWorkflowProposePlan({
-          workspaceId,
-          entry,
-          proposePlanResult,
-          reportedAttempt: taskOrigin.ownedAttempt,
-          streamAttemptId,
-        });
-        return;
-      }
-      await this.settleInterruptedTaskAtStreamEnd(workspaceId, entry, reportArgs, streamAttemptId, {
-        reportedAttempt: taskOrigin.ownedAttempt,
-      });
-      return;
-    }
-    if (status === "reported") {
-      await this.finalizeTerminationPhaseForReportedTask(workspaceId);
-      return;
-    }
-
-    if (
-      reportArgs == null &&
-      !(isPlanLike && proposePlanResult && entry.workspace.workflowTask != null) &&
-      (await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-        workspaceId,
-        cfg,
-        "stream-end",
-        taskIndex
-      ))
-    ) {
-      return;
-    }
-
-    const activeDescendantTaskIds = this.listActiveDescendantAgentTaskIds(workspaceId);
-    const blockingDescendantTaskIds = this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(
-      taskIndex,
-      workspaceId
-    );
-    if (blockingDescendantTaskIds.length > 0) {
-      if (status === "awaiting_report") {
-        await this.setTaskStatus(workspaceId, "running", { expectedAttemptId: streamAttemptId });
-      }
-      return;
-    }
-
-    const taskReferencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
-      workspaceId,
-      event.parts,
-      event.messageId
-    );
-    const activeTaskWorkflowRunIds = await this.listActiveBackgroundWorkflowRunIds(
-      workspaceId,
-      taskReferencedWorkflowRunIds
-    );
-    const blockingTaskWorkflowRunIds = await this.listBlockingBackgroundWorkflowRunIds(
-      workspaceId,
-      taskReferencedWorkflowRunIds,
-      event.parts
-    );
-    const activeWorkspaceTurnIds =
-      await this.getWorkspaceTurnManager().listActiveWorkspaceTurnTaskIdsForOwner(workspaceId);
-    const blockingWorkspaceTurnIds =
-      await this.getWorkspaceTurnManager().listBlockingWorkspaceTurnTaskIds(
-        workspaceId,
-        activeWorkspaceTurnIds
-      );
-    if (blockingTaskWorkflowRunIds.length > 0 || blockingWorkspaceTurnIds.length > 0) {
-      if (status === "awaiting_report") {
-        await this.setTaskStatus(workspaceId, "running", { expectedAttemptId: streamAttemptId });
-      }
-      await this.promptTaskForBackgroundAwait(workspaceId, {
-        taskIds: blockingWorkspaceTurnIds,
-        workflowRunIds: blockingTaskWorkflowRunIds,
-      });
-      return;
-    }
-
-    // Non-blocking background children should not force task_await, but a child task's final
-    // agent_report must wait for them so the original parent does not receive an incomplete report.
-    if (
-      activeDescendantTaskIds.length > 0 ||
-      activeTaskWorkflowRunIds.length > 0 ||
-      activeWorkspaceTurnIds.length > 0
-    ) {
-      if (status === "awaiting_report") {
-        await this.setTaskStatus(workspaceId, "running", { expectedAttemptId: streamAttemptId });
-      }
-      return;
-    }
-
-    // Parent corrections queued for the next task turn supersede any report emitted by the old
-    // turn. Keep the task active until AgentSession accepts the reserved guidance and clears this
-    // durable flag; otherwise turn-end dispatch could deliver a stale report before the correction.
-    if ((entry.workspace.taskPendingGuidance?.length ?? 0) > 0) {
-      return;
-    }
-
-    if (reportArgs) {
-      // A child pursuing a live goal decides report vs. goal turn BEFORE publishing: its final prose
-      // stays in history, and only publication to the parent waits for the goal to finish.
-      const goalOutcome = await this.arbitrateChildGoalAtStreamEnd(
-        workspaceId,
-        event,
-        status,
-        streamAttemptId,
-        () =>
-          this.streamEndLedger.resolveStreamEndDecision(
-            workspaceId,
-            this.streamEndLedger.findPendingStreamEndDecision(
-              workspaceId,
-              taskOrigin.ownedAttempt,
-              taskOrigin.unownedAttemptId
-            ),
-            "nonreport"
-          )
-      );
-      if (goalOutcome === "handled") return;
-      if (goalOutcome === "deferred") return "deferred";
-      if (goalOutcome === "failed") {
-        // Decided nonreport, then the goal turn was refused: ask for the report rather than
-        // leave the task idle with an unpublished report.
-        await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId);
-        return;
-      }
-      const finalization = await this.finalizeAgentTaskReport(
-        workspaceId,
-        entry,
-        reportArgs,
-        taskOrigin.ownedAttempt,
-        streamAttemptId
-      );
-      if (finalization.finalized) {
-        await this.finalizeTerminationPhaseForReportedTask(workspaceId);
-      } else if (finalization.reason === "retired_attempt") {
-        this.rejectWaiters(workspaceId, new Error(finalization.message));
-      }
-      return;
-    }
-
-    if (isPlanLike && proposePlanResult) {
-      if (entry.workspace.workflowTask != null) {
-        await this.handleSuccessfulWorkflowProposePlan({
-          workspaceId,
-          entry,
-          proposePlanResult,
-          reportedAttempt: taskOrigin.ownedAttempt,
-          streamAttemptId,
-        });
-        return;
-      }
-      // A non-workflow plan task's propose_plan is no terminal report: the attempt continues in
-      // exec. Decide (and wake the held queue) before the handoff, as for any other non-report
-      // end above: the kickoff's admission reads a still-pending decision for its attempt as
-      // stale and would be refused, leaving the task running with no exec turn.
-      this.streamEndLedger.resolveStreamEndDecision(
-        workspaceId,
-        this.streamEndLedger.findPendingStreamEndDecision(
-          workspaceId,
-          taskOrigin.ownedAttempt,
-          taskOrigin.unownedAttemptId
-        ),
-        "nonreport"
-      );
-      await this.handleSuccessfulProposePlanAutoHandoff({
-        workspaceId,
-        entry,
-        proposePlanResult,
-        streamAttemptId,
-      });
-      return;
-    }
-
-    if (this.cutSourceIsObsolete(event, taskOrigin)) {
-      this.discardCutReceipt(event);
-      return;
-    }
-    if (await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId)) return;
-    const pendingCut = this.streamEndLedger.deferralOf(workspaceId);
-    // A different turn can be admitted ahead of the designated continuation. Its incomplete
-    // end does not withdraw that continuation or transfer the old cut's recovery obligation.
-    if (pendingCut != null && pendingCut.sourceTurnGeneration !== queueCutSnapshot.turnGeneration) {
-      return;
-    }
-
-    // Host-initiated cuts (queued input, context-budget hand-over) are not incomplete responses:
-    // the selected continuation owns the turn unless it is withdrawn or fails before streaming.
-    const continuationEntryId = continuationEntryIdOfStopCause(event.metadata.stopCause);
-    if (continuationEntryId != null) {
-      const receipt = this.workspaceService.getQueueCutReceipt(workspaceId, continuationEntryId);
-      if (receipt != null) {
-        this.workspaceService.markQueueCutSourceHandled(workspaceId, continuationEntryId);
-        if (receipt.successor === "streaming") {
-          return;
-        }
-        if (receipt.successor === "canceled" || receipt.successor === "prestream-failed") {
-          // Consume-once: the failure notification may already have recovered.
-          if (!this.workspaceService.disposeQueueCut(workspaceId, continuationEntryId)) {
-            return;
-          }
-        } else {
-          if (status === "awaiting_report") {
-            await this.setTaskStatus(workspaceId, "running", {
-              expectedAttemptId: streamAttemptId,
-            });
-          }
-          this.streamEndLedger.recordDeferral(workspaceId, {
-            sourceMessageId: event.messageId,
-            sourceTurnGeneration: receipt.sourceTurnGeneration,
-            continuationEntryId,
-            executionId: taskOrigin.executionId ?? undefined,
-            stopEpoch: taskOrigin.stopEpoch,
-            attemptId: streamAttemptId,
-          });
-          // The successor may have been withdrawn between the cut and this classification.
-          await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId);
-          return;
-        }
-      }
-    }
-
-    // The decision already resolved nonreport above (no final report in this stream).
-    const goalOutcome = await this.arbitrateChildGoalAtStreamEnd(
-      workspaceId,
+    return this.finalizeChildStreamEndTurn({
+      ...admission,
       event,
-      status,
-      streamAttemptId,
-      () => undefined
-    );
-    if (goalOutcome === "handled") return;
-    if (goalOutcome === "deferred") return "deferred";
-    await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId);
+      queueCutSnapshot,
+      taskOrigin,
+      isCompaction,
+    });
   }
 
   /** True when the stream end's task execution or stop epoch moved on since the event. */
@@ -16783,6 +16531,449 @@ export class TaskService implements AgentTaskIntegration {
         error: sendResult.error,
       });
     }
+  }
+
+  /**
+   * A child (task) stream end, first step: finalizes the workspace turn from the stream end, and
+   * drops the cut of a stream whose execution moved on.
+   *
+   * The child steps run as a chain: finalizeChildStreamEndTurn → readChildStreamEndReport →
+   * settleInterruptedOrReportedChild → holdChildForBlockingDescendants →
+   * holdChildForBlockingWorkflowsAndTurns → holdChildForNonblockingWork → publishOrHandOffChild →
+   * publishChildFinalReport, or handoffPlanLikeChild → reconcileCutBeforeContinuation →
+   * handleQueueCutContinuation → deferChildStreamEndToContinuation, or
+   * recoverIncompleteChildStreamEnd. Each step starts the next one in the same tick as its own
+   * last await, so no collaborator call, status write or decision runs a microtask later than it
+   * did in the inline code; only the handler's own resolution comes later. Every step returns the
+   * next one's result unchanged: a "deferred" from a child goal arbitration must reach
+   * StreamEndLedger.runStreamEndHandler.
+   */
+  private async finalizeChildStreamEndTurn(
+    ctx: ChildStreamEndContext
+  ): Promise<"deferred" | undefined> {
+    const { event, taskOrigin } = ctx;
+    if (
+      await this.getWorkspaceTurnManager().finalizeWorkspaceTurnFromStreamEnd(
+        event,
+        ctx.queueCutSnapshot
+      )
+    ) {
+      return;
+    }
+
+    // Stop and reactivation can pass this handler while it waits for the event lock. Its
+    // original execution, not the task's current status, owns this stream-end disposition.
+    if (this.cutSourceIsObsolete(event, taskOrigin)) {
+      this.discardCutReceipt(event);
+      return;
+    }
+    return this.readChildStreamEndReport(ctx);
+  }
+
+  /** Reads the task status and the stream's final report, then decides a stream without one. */
+  private async readChildStreamEndReport(
+    ctx: ChildStreamEndContext
+  ): Promise<"deferred" | undefined> {
+    const { event, workspaceId, entry } = ctx;
+    const status = entry.workspace.taskStatus;
+    const workflowOutputSchema = entry.workspace.workflowTask?.outputSchema;
+    const acceptsSchemaShapedWorkflowReport =
+      workflowOutputSchema !== undefined &&
+      validateJsonSchemaSubsetSchema(workflowOutputSchema, { requireObjectSchema: true }).success;
+    // Missing finish reasons are not proof of a clean stop: providers may omit them and metadata
+    // collection may time out. Only explicit `stop` can promote the final assistant response to the
+    // terminal report; otherwise recovery asks the child to finish instead of finalizing an update.
+    const finalAgentReportArgs =
+      !ctx.isCompaction && event.metadata.finishReason === "stop"
+        ? await this.resolveFinalAgentReportArgs(workspaceId, event.parts, {
+            acceptSchemaShapedWorkflowReport: acceptsSchemaShapedWorkflowReport,
+          })
+        : null;
+    const isPlanLike = await this.isPlanLikeTaskWorkspace(entry);
+    const state: ChildStreamEndState = {
+      ...ctx,
+      status,
+      reportArgs: isPlanLike ? null : finalAgentReportArgs,
+      isPlanLike,
+      proposePlanResult: this.findProposePlanSuccessInParts(event.parts),
+    };
+    this.decideNonreportBeforeContinuation(state);
+    return this.settleInterruptedOrReportedChild(state);
+  }
+
+  /** Resolves the stream's decision `nonreport` when the stream carried no terminal report. */
+  private decideNonreportBeforeContinuation(state: ChildStreamEndState): void {
+    const { workspaceId, taskOrigin } = state;
+    // No terminal report in this stream: the attempt continues. Decide (and wake the held queue)
+    // BEFORE the recovery/continuation sends below, so a user follow-up queued during the stream
+    // still dispatches ahead of them, exactly as it did before the hold existed.
+    if (
+      state.reportArgs == null &&
+      !(state.isPlanLike && state.proposePlanResult) &&
+      state.status !== "interrupted"
+    ) {
+      this.streamEndLedger.resolveStreamEndDecision(
+        workspaceId,
+        this.streamEndLedger.findPendingStreamEndDecision(
+          workspaceId,
+          taskOrigin.ownedAttempt,
+          taskOrigin.unownedAttemptId
+        ),
+        "nonreport"
+      );
+    }
+  }
+
+  /** Settles an interrupted task's waiters, and the termination phase of a reported task. */
+  private async settleInterruptedOrReportedChild(
+    state: ChildStreamEndState
+  ): Promise<"deferred" | undefined> {
+    const { workspaceId, entry, streamAttemptId, taskOrigin } = state;
+    // Stream-end settlement: interrupted tasks must settle all pending waiters.
+    // A workflow-owned plan step that successfully called propose_plan is already complete,
+    // even if the interruption status landed before the provider emitted stream-end.
+    if (state.status === "interrupted") {
+      if (state.isPlanLike && state.proposePlanResult && entry.workspace.workflowTask != null) {
+        await this.handleSuccessfulWorkflowProposePlan({
+          workspaceId,
+          entry,
+          proposePlanResult: state.proposePlanResult,
+          reportedAttempt: taskOrigin.ownedAttempt,
+          streamAttemptId,
+        });
+        return;
+      }
+      await this.settleInterruptedTaskAtStreamEnd(
+        workspaceId,
+        entry,
+        state.reportArgs,
+        streamAttemptId,
+        { reportedAttempt: taskOrigin.ownedAttempt }
+      );
+      return;
+    }
+    if (state.status === "reported") {
+      await this.finalizeTerminationPhaseForReportedTask(workspaceId);
+      return;
+    }
+    return this.holdChildForBlockingDescendants(state);
+  }
+
+  /**
+   * Interrupts the recovery of a task whose workflow owner is inactive, and holds the task while
+   * active sync descendants block it. The active descendants are captured here, before the
+   * workflow and workspace-turn awaits, and read again by holdChildForNonblockingWork.
+   */
+  private async holdChildForBlockingDescendants(
+    state: ChildStreamEndState
+  ): Promise<"deferred" | undefined> {
+    const { workspaceId, entry, taskIndex } = state;
+    if (
+      state.reportArgs == null &&
+      !(state.isPlanLike && state.proposePlanResult && entry.workspace.workflowTask != null) &&
+      (await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+        workspaceId,
+        state.cfg,
+        "stream-end",
+        taskIndex
+      ))
+    ) {
+      return;
+    }
+
+    const activeDescendantTaskIds = this.listActiveDescendantAgentTaskIds(workspaceId);
+    const blockingDescendantTaskIds = this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(
+      taskIndex,
+      workspaceId
+    );
+    if (blockingDescendantTaskIds.length > 0) {
+      if (state.status === "awaiting_report") {
+        await this.setTaskStatus(workspaceId, "running", {
+          expectedAttemptId: state.streamAttemptId,
+        });
+      }
+      return;
+    }
+    return this.holdChildForBlockingWorkflowsAndTurns(state, activeDescendantTaskIds);
+  }
+
+  /**
+   * Reads the task's active and blocking workflow runs and workspace turns, and prompts the task
+   * to await the blocking ones.
+   */
+  private async holdChildForBlockingWorkflowsAndTurns(
+    state: ChildStreamEndState,
+    activeDescendantTaskIds: readonly string[]
+  ): Promise<"deferred" | undefined> {
+    const { event, workspaceId } = state;
+    const taskReferencedWorkflowRunIds = await this.listAgentReferencedWorkflowRunIds(
+      workspaceId,
+      event.parts,
+      event.messageId
+    );
+    const activeTaskWorkflowRunIds = await this.listActiveBackgroundWorkflowRunIds(
+      workspaceId,
+      taskReferencedWorkflowRunIds
+    );
+    const blockingTaskWorkflowRunIds = await this.listBlockingBackgroundWorkflowRunIds(
+      workspaceId,
+      taskReferencedWorkflowRunIds,
+      event.parts
+    );
+    const activeWorkspaceTurnIds =
+      await this.getWorkspaceTurnManager().listActiveWorkspaceTurnTaskIdsForOwner(workspaceId);
+    const blockingWorkspaceTurnIds =
+      await this.getWorkspaceTurnManager().listBlockingWorkspaceTurnTaskIds(
+        workspaceId,
+        activeWorkspaceTurnIds
+      );
+    if (blockingTaskWorkflowRunIds.length > 0 || blockingWorkspaceTurnIds.length > 0) {
+      if (state.status === "awaiting_report") {
+        await this.setTaskStatus(workspaceId, "running", {
+          expectedAttemptId: state.streamAttemptId,
+        });
+      }
+      await this.promptTaskForBackgroundAwait(workspaceId, {
+        taskIds: blockingWorkspaceTurnIds,
+        workflowRunIds: blockingTaskWorkflowRunIds,
+      });
+      return;
+    }
+    return this.holdChildForNonblockingWork(state, {
+      activeDescendantTaskIds,
+      activeTaskWorkflowRunIds,
+      activeWorkspaceTurnIds,
+    });
+  }
+
+  /** Holds the task, without a prompt, while non-blocking background work is still active. */
+  private async holdChildForNonblockingWork(
+    state: ChildStreamEndState,
+    work: ChildBackgroundWork
+  ): Promise<"deferred" | undefined> {
+    // Non-blocking background children should not force task_await, but a child task's final
+    // agent_report must wait for them so the original parent does not receive an incomplete report.
+    if (
+      work.activeDescendantTaskIds.length > 0 ||
+      work.activeTaskWorkflowRunIds.length > 0 ||
+      work.activeWorkspaceTurnIds.length > 0
+    ) {
+      if (state.status === "awaiting_report") {
+        await this.setTaskStatus(state.workspaceId, "running", {
+          expectedAttemptId: state.streamAttemptId,
+        });
+      }
+      return;
+    }
+    return this.publishOrHandOffChild(state);
+  }
+
+  /**
+   * Holds the task while parent guidance is pending, else publishes its final report or hands off
+   * its proposed plan. No await, so it returns the next step's promise, or undefined for the hold.
+   */
+  private publishOrHandOffChild(
+    state: ChildStreamEndState
+  ): Promise<"deferred" | undefined> | undefined {
+    // Parent corrections queued for the next task turn supersede any report emitted by the old
+    // turn. Keep the task active until AgentSession accepts the reserved guidance and clears this
+    // durable flag; otherwise turn-end dispatch could deliver a stale report before the correction.
+    if ((state.entry.workspace.taskPendingGuidance?.length ?? 0) > 0) {
+      return;
+    }
+    if (state.reportArgs) return this.publishChildFinalReport(state, state.reportArgs);
+    return this.handoffPlanLikeChild(state);
+  }
+
+  /**
+   * Publishes the child's final report to its parent, unless a live child goal takes the turn
+   * first. Returns "deferred" while the goal's accounting for this stream has not settled.
+   */
+  private async publishChildFinalReport(
+    state: ChildStreamEndState,
+    reportArgs: NonNullable<ChildStreamEndState["reportArgs"]>
+  ): Promise<"deferred" | undefined> {
+    const { workspaceId, event, status, streamAttemptId, taskOrigin } = state;
+    // A child pursuing a live goal decides report vs. goal turn BEFORE publishing: its final prose
+    // stays in history, and only publication to the parent waits for the goal to finish.
+    const goalOutcome = await this.arbitrateChildGoalAtStreamEnd(
+      workspaceId,
+      event,
+      status,
+      streamAttemptId,
+      () =>
+        this.streamEndLedger.resolveStreamEndDecision(
+          workspaceId,
+          this.streamEndLedger.findPendingStreamEndDecision(
+            workspaceId,
+            taskOrigin.ownedAttempt,
+            taskOrigin.unownedAttemptId
+          ),
+          "nonreport"
+        )
+    );
+    if (goalOutcome === "handled") return;
+    if (goalOutcome === "deferred") return "deferred";
+    if (goalOutcome === "failed") {
+      // Decided nonreport, then the goal turn was refused: ask for the report rather than
+      // leave the task idle with an unpublished report.
+      await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId);
+      return;
+    }
+    const finalization = await this.finalizeAgentTaskReport(
+      workspaceId,
+      state.entry,
+      reportArgs,
+      taskOrigin.ownedAttempt,
+      streamAttemptId
+    );
+    if (finalization.finalized) {
+      await this.finalizeTerminationPhaseForReportedTask(workspaceId);
+    } else if (finalization.reason === "retired_attempt") {
+      this.rejectWaiters(workspaceId, new Error(finalization.message));
+    }
+  }
+
+  /** Completes a plan-like task's successful propose_plan: a workflow step, or an exec handoff. */
+  private async handoffPlanLikeChild(state: ChildStreamEndState): Promise<"deferred" | undefined> {
+    const { workspaceId, entry, streamAttemptId, taskOrigin } = state;
+    if (state.isPlanLike && state.proposePlanResult) {
+      if (entry.workspace.workflowTask != null) {
+        await this.handleSuccessfulWorkflowProposePlan({
+          workspaceId,
+          entry,
+          proposePlanResult: state.proposePlanResult,
+          reportedAttempt: taskOrigin.ownedAttempt,
+          streamAttemptId,
+        });
+        return;
+      }
+      // A non-workflow plan task's propose_plan is no terminal report: the attempt continues in
+      // exec. Decide (and wake the held queue) before the handoff, as for any other non-report
+      // end above: the kickoff's admission reads a still-pending decision for its attempt as
+      // stale and would be refused, leaving the task running with no exec turn.
+      this.streamEndLedger.resolveStreamEndDecision(
+        workspaceId,
+        this.streamEndLedger.findPendingStreamEndDecision(
+          workspaceId,
+          taskOrigin.ownedAttempt,
+          taskOrigin.unownedAttemptId
+        ),
+        "nonreport"
+      );
+      await this.handleSuccessfulProposePlanAutoHandoff({
+        workspaceId,
+        entry,
+        proposePlanResult: state.proposePlanResult,
+        streamAttemptId,
+      });
+      return;
+    }
+    return this.reconcileCutBeforeContinuation(state);
+  }
+
+  /**
+   * Re-checks the cut source after the awaits above, reconciles a deferred stream end, and leaves
+   * a pending cut that another turn's stream owns alone.
+   */
+  private async reconcileCutBeforeContinuation(
+    state: ChildStreamEndState
+  ): Promise<"deferred" | undefined> {
+    const { event, workspaceId } = state;
+    if (this.cutSourceIsObsolete(event, state.taskOrigin)) {
+      this.discardCutReceipt(event);
+      return;
+    }
+    if (await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId)) return;
+    const pendingCut = this.streamEndLedger.deferralOf(workspaceId);
+    // A different turn can be admitted ahead of the designated continuation. Its incomplete
+    // end does not withdraw that continuation or transfer the old cut's recovery obligation.
+    if (
+      pendingCut != null &&
+      pendingCut.sourceTurnGeneration !== state.queueCutSnapshot.turnGeneration
+    ) {
+      return;
+    }
+    return this.handleQueueCutContinuation(state);
+  }
+
+  /**
+   * Classifies a queue-cut continuation by its receipt: a streaming successor owns the turn, a
+   * canceled or prestream-failed one falls through to recovery once, any other one defers.
+   */
+  private async handleQueueCutContinuation(
+    state: ChildStreamEndState
+  ): Promise<"deferred" | undefined> {
+    const { event, workspaceId } = state;
+    // Host-initiated cuts (queued input, context-budget hand-over) are not incomplete responses:
+    // the selected continuation owns the turn unless it is withdrawn or fails before streaming.
+    const continuationEntryId = continuationEntryIdOfStopCause(event.metadata.stopCause);
+    if (continuationEntryId != null) {
+      const receipt = this.workspaceService.getQueueCutReceipt(workspaceId, continuationEntryId);
+      if (receipt != null) {
+        this.workspaceService.markQueueCutSourceHandled(workspaceId, continuationEntryId);
+        if (receipt.successor === "streaming") {
+          return;
+        }
+        if (receipt.successor === "canceled" || receipt.successor === "prestream-failed") {
+          // Consume-once: the failure notification may already have recovered.
+          if (!this.workspaceService.disposeQueueCut(workspaceId, continuationEntryId)) {
+            return;
+          }
+        } else {
+          return this.deferChildStreamEndToContinuation(state, continuationEntryId, receipt);
+        }
+      }
+    }
+    return this.recoverIncompleteChildStreamEnd(state);
+  }
+
+  /**
+   * Records the stream end as deferred to its still-unsettled continuation (the task runs again
+   * meanwhile), then reconciles it at once in case that continuation was already withdrawn.
+   */
+  private async deferChildStreamEndToContinuation(
+    state: ChildStreamEndState,
+    continuationEntryId: string,
+    receipt: QueueCutReceipt
+  ): Promise<undefined> {
+    const { event, workspaceId, taskOrigin } = state;
+    if (state.status === "awaiting_report") {
+      await this.setTaskStatus(workspaceId, "running", {
+        expectedAttemptId: state.streamAttemptId,
+      });
+    }
+    this.streamEndLedger.recordDeferral(workspaceId, {
+      sourceMessageId: event.messageId,
+      sourceTurnGeneration: receipt.sourceTurnGeneration,
+      continuationEntryId,
+      executionId: taskOrigin.executionId ?? undefined,
+      stopEpoch: taskOrigin.stopEpoch,
+      attemptId: state.streamAttemptId,
+    });
+    // The successor may have been withdrawn between the cut and this classification.
+    await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId);
+  }
+
+  /**
+   * An incomplete child stream end: a live child goal takes the turn, else the task is asked to
+   * finish. Returns "deferred" while the goal's accounting for this stream has not settled.
+   */
+  private async recoverIncompleteChildStreamEnd(
+    state: ChildStreamEndState
+  ): Promise<"deferred" | undefined> {
+    const { workspaceId, status, streamAttemptId } = state;
+    // The decision already resolved nonreport above (no final report in this stream).
+    const goalOutcome = await this.arbitrateChildGoalAtStreamEnd(
+      workspaceId,
+      state.event,
+      status,
+      streamAttemptId,
+      () => undefined
+    );
+    if (goalOutcome === "handled") return;
+    if (goalOutcome === "deferred") return "deferred";
+    await this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId);
   }
 
   /**

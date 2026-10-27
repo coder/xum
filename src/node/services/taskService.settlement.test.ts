@@ -257,6 +257,61 @@ describe("TaskService", () => {
       }
     );
 
+    test("an awaiting_report task whose cut successor is pending runs again and defers", async () => {
+      const t = await setupChildTask({ taskStatus: "awaiting_report" });
+      t.receiptFake.register("entry-1", "pending");
+
+      await streamEnd(
+        t.taskService,
+        cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+      );
+
+      // The pending continuation owns the turn: the task runs again and nothing is prompted.
+      expect(t.child()?.taskStatus).toBe("running");
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.child()?.taskRecoveryAttempts).toBeUndefined();
+      expect(t.receiptFake.receipts.get("entry-1")).toMatchObject({
+        sourceHandled: true,
+        disposed: false,
+      });
+    });
+
+    // A Stop or reactivation can land while the stream end awaits its report read: the second
+    // cut-source check, right before the continuation classification, discards the cut.
+    test("a stop epoch bump during the report read discards the cut instead of deferring it", async () => {
+      // awaiting_report: a deferral would also set the task running again.
+      const t = await setupChildTask({ taskStatus: "awaiting_report" });
+      t.receiptFake.register("entry-1", "pending");
+      const internal = t.taskService as unknown as {
+        isPlanLikeTaskWorkspace: (entry: unknown) => Promise<boolean>;
+      };
+      const realIsPlanLike = internal.isPlanLikeTaskWorkspace.bind(t.taskService);
+      let bumps = 0;
+      const isPlanLike = spyOn(internal, "isPlanLikeTaskWorkspace").mockImplementation(
+        async (entry) => {
+          bumps++;
+          t.taskService.bumpWorkspaceStopEpoch(t.childId);
+          return await realIsPlanLike(entry);
+        }
+      );
+
+      try {
+        await streamEnd(
+          t.taskService,
+          cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+        );
+      } finally {
+        isPlanLike.mockRestore();
+      }
+
+      expect(bumps).toBe(1);
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.child()?.taskStatus).toBe("awaiting_report");
+      // Disposed and handled, so released; a deferral would have kept it undisposed.
+      expect(t.receiptFake.overrides.disposeQueueCut).toHaveBeenCalledTimes(1);
+      expect(t.receiptFake.receipts.has("entry-1")).toBe(false);
+    });
+
     test.each<QueueCutSuccessorState>([
       "pending",
       { kind: "admitted", turnGeneration: Symbol("successor") },
