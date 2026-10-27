@@ -10525,6 +10525,8 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "- When the workspace has no status page, or the page is empty or cannot be shown (for example a binary file), the main pane shows the chat transcript.",
       "- On the status page, every `window.xum.send` asks first, also from a click: Xum shows the text above the page with **Send** and **Dismiss**. The page shows without you opening it, so its script could otherwise take a click elsewhere in Xum for a click in the page.",
       "",
+      "A bar above the status page, drawn by Xum and not by the page, shows what the agent is doing now (for example the tool it runs, or **Idle**) and where your last message is: **Queued**, **Held, not sent**, **Sending…**, or **In transcript**. **Show transcript** opens the newest transcript rows below the bar, and Xum remembers whether it is open. **Start here** starts a new context from the agent's last reply and keeps earlier history, like **Start Here** on a reply in the chat. It is off while a turn runs.",
+      "",
       "### Status page agent",
       "",
       "**Status page agent** is a sub-experiment of Artifacts that needs Agent interface view. Turn both on under the Artifacts row in **Settings > Experiments**: the **Status page agent** row shows there only while Agent interface view is on. When it is on, a separate status page agent keeps `status.html` current, so the main agent spends no time or tokens on the page.",

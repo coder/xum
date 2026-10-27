@@ -611,6 +611,9 @@ export const AGENT_INTERFACE_VIEW_KEY = "artifacts:agentInterfaceView";
 export const AGENT_INTERFACE_VIEW_MAX_WORKSPACES = 64;
 export const AGENT_INTERFACE_VIEW_MAX_CHARS = 4096;
 
+/** Whether the Agent interface status bar's transcript peek is open (boolean, all workspaces). */
+export const AGENT_INTERFACE_TRANSCRIPT_PEEK_KEY = "artifacts:agentInterfaceTranscriptPeek";
+
 /**
  * Get the localStorage key for terminal titles per workspace.
  * Maps sessionId -> title for persisting OSC-set terminal titles.
@@ -907,6 +910,7 @@ export const PERSISTED_KEY_REGISTRY: readonly PersistedKeyRegistration[] = [
   globalKey(ONBOARDING_VIEWED_KEY, "cache", 8),
   globalKey(ARTIFACTS_SELECTION_KEY, "ui", ARTIFACTS_SELECTION_MAX_CHARS),
   globalKey(AGENT_INTERFACE_VIEW_KEY, "ui", AGENT_INTERFACE_VIEW_MAX_CHARS),
+  globalKey(AGENT_INTERFACE_TRANSCRIPT_PEEK_KEY, "ui", 8),
   globalKey(LAST_CUSTOM_MODEL_PROVIDER_KEY, "ui", 128),
   // { workspaceId } (older builds also stored paths; readers use only the id).
   globalKey(SELECTED_WORKSPACE_KEY, "ui", 256),

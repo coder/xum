@@ -1,13 +1,15 @@
 // Bootstrap Happy DOM before react-dom evaluates (see MemoryTab.test.tsx).
 import "../../../../../tests/ui/dom";
 
-import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, jest, spyOn, test } from "bun:test";
 import { act, cleanup, fireEvent, render, waitFor, within } from "@testing-library/react";
 import { useRef, useState, type ReactNode } from "react";
 import { installDom } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
-import { workspaceStore } from "@/browser/stores/WorkspaceStore";
+import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
+import { workspaceStore, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
+import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
 import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import {
   createTestApiClient,
@@ -18,6 +20,7 @@ import {
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
 import { EXPERIMENT_IDS } from "@/common/constants/experiments";
 import type { ArtifactListing, ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
+import type { DisplayedMessage } from "@/common/types/message";
 import { AgentInterfaceStatusView } from "./AgentInterfaceStatusView";
 import { ArtifactsPanel } from "./ArtifactsPanel";
 import { useMainPaneAgentInterfaceView } from "./agentInterfaceView";
@@ -120,6 +123,99 @@ function Wrapper(props: { children: ReactNode }) {
     </ThemeProvider>
   );
 }
+
+/** Workspace states the status bar reads, for workspaces the real store never registered. */
+const seededStates = new Map<string, WorkspaceState>();
+const restoreSpies: Array<() => void> = [];
+
+function seedWorkspace(workspaceId: string, patch: Partial<WorkspaceState>) {
+  if (restoreSpies.length === 0) {
+    const realStore = WorkspaceStoreModule.useWorkspaceStoreRaw();
+    const store = overlayWorkspaceStoreRaw(realStore, {
+      hasRegisteredWorkspace: (id: string) =>
+        seededStates.has(id) || realStore.hasRegisteredWorkspace(id),
+      getWorkspaceState: (id: string) => seededStates.get(id) ?? realStore.getWorkspaceState(id),
+    });
+    const storeSpy = spyOn(WorkspaceStoreModule, "useWorkspaceStoreRaw").mockReturnValue(store);
+    // Start Here's transcript barrier: a seeded workspace has a complete replay.
+    const realCaughtUp = workspaceStore.isWorkspaceTranscriptCaughtUp;
+    const barrierSpy = spyOn(workspaceStore, "isWorkspaceTranscriptCaughtUp").mockImplementation(
+      (id: string) => seededStates.has(id) || realCaughtUp(id)
+    );
+    restoreSpies.push(
+      () => storeSpy.mockRestore(),
+      () => barrierSpy.mockRestore()
+    );
+  }
+  seededStates.set(workspaceId, {
+    name: workspaceId,
+    messages: [],
+    queuedMessage: null,
+    heldInputs: [],
+    canInterrupt: false,
+    isCompacting: false,
+    isStreamStarting: false,
+    awaitingUserQuestion: false,
+    loading: false,
+    isTranscriptCaughtUp: true,
+    transcriptReplayFailed: false,
+    isHydratingTranscript: false,
+    isTranscriptStale: false,
+    isIncrementalCatchUp: false,
+    hasOlderHistory: false,
+    loadingOlderHistory: false,
+    muxMessages: [],
+    currentModel: null,
+    currentThinkingLevel: null,
+    recencyTimestamp: null,
+    todos: [],
+    loadedSkills: [],
+    skillLoadErrors: [],
+    agentStatus: undefined,
+    activeWorkflowRunCount: 0,
+    activeBashMonitorCount: 0,
+    lastAbortReason: null,
+    pendingStreamStartTime: null,
+    pendingStreamModel: null,
+    runtimeStatus: null,
+    autoRetryStatus: null,
+    ...patch,
+  });
+}
+
+/** A turn mid-way: the user's prompt, the agent's reply so far, and a bash call still running. */
+const MID_TURN: DisplayedMessage[] = [
+  {
+    type: "user",
+    id: "u1",
+    historyId: "u1",
+    content: "Run the slow check",
+    historySequence: 1,
+    timestamp: Date.now(),
+  },
+  {
+    type: "assistant",
+    id: "a1",
+    historyId: "a1",
+    content: "Starting the check now.",
+    historySequence: 2,
+    isStreaming: false,
+    isPartial: false,
+    isCompacted: false,
+    isIdleCompacted: false,
+  },
+  {
+    type: "tool",
+    id: "t1",
+    historyId: "t1",
+    toolCallId: "call1",
+    toolName: "bash",
+    args: { script: "sleep 20", display_name: "Slow check" },
+    status: "executing",
+    isPartial: false,
+    historySequence: 3,
+  },
+];
 
 /** The main pane's wiring: the poll and shortcut hook, then the status view it selects. */
 function MainPane(props: { workspaceId: string }) {
@@ -229,6 +325,8 @@ describe("Agent interface status view", () => {
 
   afterEach(() => {
     cleanup();
+    for (const restore of restoreSpies.splice(0)) restore();
+    seededStates.clear();
     resetTestExperiments();
     cleanupDom?.();
     cleanupDom = null;
@@ -507,5 +605,39 @@ describe("Agent interface status view", () => {
     await waitFor(() =>
       expect(view.queryByTestId("agent-interface-status-view") === null).toBe(true)
     );
+  });
+  test("the status bar names the running tool and its transcript peek opens and closes", async () => {
+    seedWorkspace("ws-bar-busy", { messages: MID_TURN, canInterrupt: true });
+    const view = render(<MainPane workspaceId="ws-bar-busy" />, { wrapper: Wrapper });
+    await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+    const bar = view.getByTestId("agent-interface-status-bar");
+    expect(within(bar).getByRole("status").textContent).toContain("Slow check");
+    // Start Here would rewrite the context under the running turn.
+    expect(within(bar).getByRole("button", { name: "Start here" }).hasAttribute("disabled")).toBe(
+      true
+    );
+
+    const toggle = within(bar).getByRole("button", { name: "Show transcript" });
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    const peek = view.getByTestId("agent-interface-transcript-peek");
+    expect(toggle.getAttribute("aria-controls")).toBe(peek.id);
+    expect(peek.textContent).toContain("Run the slow check");
+    expect(peek.textContent).toContain("Starting the check now.");
+    fireEvent.click(within(bar).getByRole("button", { name: "Hide transcript" }));
+    expect(view.queryByTestId("agent-interface-transcript-peek")).toBeNull();
+  });
+
+  test("Start here from the status bar opens the Start Here confirmation once the turn ends", async () => {
+    seedWorkspace("ws-bar-idle", { messages: MID_TURN.slice(0, 2) });
+    const view = render(<MainPane workspaceId="ws-bar-idle" />, { wrapper: Wrapper });
+    await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+    const startHere = within(view.getByTestId("agent-interface-status-bar")).getByRole("button", {
+      name: "Start here",
+    });
+    expect(startHere.hasAttribute("disabled")).toBe(false);
+    fireEvent.click(startHere);
+    const dialog = await within(document.body).findByRole("dialog");
+    expect(within(dialog).getByText("Start Here")).toBeTruthy();
   });
 });
