@@ -18,6 +18,9 @@ const ROOT = fs.realpathSync(path.resolve(import.meta.dir, "../../.."));
 export const IMAGE = "ghcr.io/coder/xum-bugbash-sandbox";
 /** The only workflow whose attestation ensureImage() accepts, and only from main. */
 const PUBLISH_WORKFLOW = "coder/xum/.github/workflows/bugbash-sandbox-image.yml";
+/** The host env names, besides PATH and HOME, that gh needs to find the user's login. */
+const GH_LOGIN_ENV = ["GH_TOKEN", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "DBUS_SESSION_BUS_ADDRESS",
+  "XDG_RUNTIME_DIR"]; // prettier-ignore
 /** How long build.sh gets for a local image: a fresh build with no cache. */
 const BUILD_MS = 25 * 60_000;
 /** How long a child gets after SIGTERM before SIGKILL. */
@@ -176,15 +179,16 @@ export class Session {
     if (digest == null)
       return { ok: false, why: `the lookup of ${tag} gave ${JSON.stringify(look.stdout)}` };
     const ref = `${IMAGE}@${digest}`;
-    // gh gets the user's login (HOME, or GH_CONFIG_DIR for a custom config folder) or GH_TOKEN,
-    // and nothing else of this env. Neither reaches Docker or the container (containerEnv drops
-    // the token, and its allowlist has no GH_CONFIG_DIR).
+    // gh gets the user's login and nothing else of this env: GH_TOKEN, or its config folder
+    // (GH_CONFIG_DIR, else XDG_CONFIG_HOME/gh, else HOME/.config/gh) with the token in it or in
+    // the desktop keyring, which gh reaches over the session bus (DBUS_SESSION_BUS_ADDRESS, else
+    // XDG_RUNTIME_DIR/bus). None of them reaches Docker or the container (containerEnv drops
+    // the token, and its allowlist has none of the others).
     const env: Record<string, string> = {
       PATH: process.env.PATH ?? "",
       HOME: process.env.HOME ?? "",
     };
-    for (const name of ["GH_TOKEN", "GH_CONFIG_DIR"])
-      if (process.env[name] != null) env[name] = process.env[name];
+    for (const name of GH_LOGIN_ENV) if (process.env[name] != null) env[name] = process.env[name];
     // prettier-ignore
     const verify = await this.#job("gh", ["attestation", "verify", `oci://${ref}`, "--repo", "coder/xum",
       "--bundle-from-oci", "--source-ref", "refs/heads/main", "--signer-workflow", PUBLISH_WORKFLOW], env, 120_000);

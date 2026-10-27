@@ -32,8 +32,7 @@ const FAKE = `#!/bin/sh
 bin=$(dirname "$0"); . "$bin/fake.env"
 unregister() { awk -v id="$1" '$1!=id' "$bin/containers" > "$bin/c.tmp"; mv "$bin/c.tmp" "$bin/containers"; }
 echo "$* [home=\${HOME-} cfg=\${DOCKER_CONFIG-}]" >> "$bin/calls.log"
-[ -z "\${GH_TOKEN-}" ] || echo "docker got GH_TOKEN" >> "$bin/calls.log"
-[ -z "\${GH_CONFIG_DIR-}" ] || echo "docker got GH_CONFIG_DIR" >> "$bin/calls.log"
+env | grep -oE '^(GH|XDG|DBUS)_[A-Z_]*' | sed 's/^/docker got /' >> "$bin/calls.log"
 case "$1" in
   context) if [ "\${CONTEXT-}" = hang ]; then trap '' TERM; exec sleep 30; fi; echo "$HOST" ;;
   info) echo "$INFO" ;;
@@ -106,10 +105,11 @@ case "$1" in
 esac
 `;
 
-// gh attestation verify: exits GH_RC with GH_ERR on stderr, and logs its GH_TOKEN and GH_CONFIG_DIR.
+// gh attestation verify: exits GH_RC with GH_ERR on stderr, and logs the env names it reads for
+// the user's login.
 const FAKE_GH = `#!/bin/sh
 bin=$(dirname "$0"); . "$bin/fake.env"
-echo "gh $* [token=\${GH_TOKEN-} config=\${GH_CONFIG_DIR-}]" >> "$bin/calls.log"
+echo "gh $* [token=\${GH_TOKEN-} config=\${GH_CONFIG_DIR-} xdg=\${XDG_CONFIG_HOME-} bus=\${DBUS_SESSION_BUS_ADDRESS-} run=\${XDG_RUNTIME_DIR-}]" >> "$bin/calls.log"
 [ "$GH_RC" = 0 ] || { echo "$GH_ERR" >&2; exit "$GH_RC"; }
 `;
 
@@ -2123,20 +2123,30 @@ test.each(Object.entries(KINDS))(
   }
 );
 
-test("GH_TOKEN and GH_CONFIG_DIR reach gh on the host, and never docker or the job container", async () => {
-  const gh = { GH_TOKEN: "ghs_hosttoken", GH_CONFIG_DIR: "/home/u/.gh-custom" };
-  const saved = { GH_TOKEN: process.env.GH_TOKEN, GH_CONFIG_DIR: process.env.GH_CONFIG_DIR };
+test("the gh login env reaches gh on the host, and never docker or the job container", async () => {
+  // A token, a custom config folder, and the keyring's session bus.
+  const gh = {
+    GH_TOKEN: "ghs_hosttoken",
+    GH_CONFIG_DIR: "/home/u/.gh-custom",
+    XDG_CONFIG_HOME: "/home/u/.cfg",
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+    XDG_RUNTIME_DIR: "/run/user/1000",
+  };
+  const saved = Object.fromEntries(Object.keys(gh).map((name) => [name, process.env[name]]));
   Object.assign(process.env, gh);
   try {
     // The launcher's env is the host env (launch.ts's main passes process.env).
     const { run } = await jobRun("repro", gh);
     expect(run).toContain(` ${REF} `);
-    expect(calls()).toMatch(
-      /^gh attestation verify .* \[token=ghs_hosttoken config=\/home\/u\/\.gh-custom\]$/m
+    expect(calls()).toContain(
+      "[token=ghs_hosttoken config=/home/u/.gh-custom xdg=/home/u/.cfg " +
+        "bus=unix:path=/run/user/1000/bus run=/run/user/1000]"
     );
-    expect(calls()).not.toMatch(/docker got GH_/);
-    expect(run).not.toContain("ghs_hosttoken");
-    expect(run).not.toContain("GH_CONFIG_DIR");
+    expect(calls()).not.toMatch(/docker got/);
+    for (const [name, value] of Object.entries(gh)) {
+      expect(run).not.toContain(name);
+      expect(run).not.toContain(value);
+    }
   } finally {
     for (const [name, value] of Object.entries(saved))
       if (value === undefined) delete process.env[name];
