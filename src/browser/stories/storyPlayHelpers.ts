@@ -191,3 +191,39 @@ export async function waitForScrollStabilization(canvasElement: HTMLElement): Pr
   // Wait 2 RAFs: one for coalesced scroll to fire, one for layout to settle
   await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
 }
+
+/**
+ * Opens the panel of a chip in the composer's live line (TODO, sub-agents, background bashes,
+ * reviews), which starts closed. `dataComponent` names the decoration that renders the chip.
+ */
+export async function openChatActivityPanel(
+  root: HTMLElement,
+  dataComponent: string
+): Promise<HTMLElement> {
+  const chip = await waitFor(
+    () => {
+      const found = root.querySelector<HTMLElement>(
+        `[data-component="${dataComponent}"] [data-activity-chip]`
+      );
+      if (found === null) throw new Error(`${dataComponent} chip not found`);
+      return found;
+    },
+    { timeout: 10_000 }
+  );
+  if (chip.getAttribute("aria-expanded") !== "true") {
+    await userEvent.click(chip);
+  }
+  return chip;
+}
+
+/**
+ * The live line's open panel. Phone viewports open it in the activity sheet, which portals to the
+ * body, so this looks in the whole document rather than in the line.
+ */
+export async function findChatActivityPanel(): Promise<HTMLElement> {
+  return waitFor(() => {
+    const found = document.querySelector<HTMLElement>("[data-activity-panel]");
+    if (found === null) throw new Error("No live-line panel is open");
+    return found;
+  });
+}

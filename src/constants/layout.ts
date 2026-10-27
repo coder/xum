@@ -26,6 +26,10 @@ export const TABLET_TOUCH_TARGET_PX = 24;
 // constant, so `[@media(max-width:768px)]` class strings repeat this literal.
 export const NARROW_VIEWPORT_MAX_WIDTH_PX = 768;
 
+// Height at or below which a viewport is too short for a popover above the composer (a phone in
+// landscape): the composer's live line opens its lists in a bottom sheet there, as on phones.
+export const SHORT_VIEWPORT_MAX_HEIGHT_PX = 500;
+
 // Keep composer controls aligned without relying on individual component defaults. This is a floor,
 // not a fixed height: mobile raises touch targets to MOBILE_TOUCH_TARGET_PX, and a pill that caps
 // its height would clip the controls inside it instead of growing with them.

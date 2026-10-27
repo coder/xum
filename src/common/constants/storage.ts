@@ -206,6 +206,8 @@ export function getInputKey(workspaceId: string): string {
 /**
  * Get the localStorage key for the pinned TODO panel expansion state.
  * Format: "pinnedTodoExpanded:{workspaceId}"
+ * Legacy: no longer read, since the TODO chip's panel starts closed. Kept registered so
+ * deleteWorkspaceStorage still clears values that earlier versions wrote.
  */
 export function getPinnedTodoExpandedKey(workspaceId: string): string {
   return `pinnedTodoExpanded:${workspaceId}`;
@@ -214,6 +216,7 @@ export function getPinnedTodoExpandedKey(workspaceId: string): string {
 /**
  * Get the localStorage key for the sub-agent chat decoration expansion state.
  * Format: "subAgentTasksExpanded:{workspaceId}"
+ * Read by the VS Code webview's tray only; the desktop chip's panel starts closed.
  */
 export function getSubAgentTasksExpandedKey(workspaceId: string): string {
   return `subAgentTasksExpanded:${workspaceId}`;

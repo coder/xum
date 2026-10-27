@@ -12,7 +12,6 @@ import { SideChatBanner } from "@/browser/components/SideChatBanner/SideChatBann
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
-import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
 import { MessageRenderer } from "@/browser/features/Messages/MessageRenderer";
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { useTranscriptContextMenu } from "@/browser/features/Messages/useTranscriptContextMenu";
@@ -21,7 +20,6 @@ import { useResumeStream } from "@/browser/hooks/useResumeStream";
 import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditCutoffBarrier";
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
-import { PinnedTodoList } from "../PinnedTodoList/PinnedTodoList";
 import { AskUserQuestionDock } from "./AskUserQuestionDock";
 import { useAcceptedAnswersVersion } from "@/browser/utils/messages/openAskUserQuestions";
 import {
@@ -84,8 +82,6 @@ import { DelegatedCreationInterruptedBanner } from "@/browser/components/Delegat
 import { LegacyPlanImportBanner } from "@/browser/components/LegacyPlanImportBanner/LegacyPlanImportBanner";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
-import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
-import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
@@ -112,9 +108,9 @@ import {
   ChatDockSurface,
   useChatDockColumnWidthClass,
 } from "./chatDockColumn";
+import { ChatActivityLine } from "./ChatActivityLine";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useReviews } from "@/browser/hooks/useReviews";
-import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
@@ -1369,8 +1365,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     workspaceState.messages
   );
   const resumeInterruptedStream = () => void resumeInterruptedStreamAsync();
-  // Live status belongs beside the input, below async decorations: neither history
-  // reveal nor banners arriving should bump the label and Stop across the screen.
+  // Transcript-only workspaces have no composer, so their live status stands alone; the
+  // composer's live line (ChatActivityLine) renders its own.
   const turnStatus = shouldMountStreamingBarrier ? (
     <ChatDockSurface>
       <StreamingBarrier
@@ -1879,7 +1875,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                     </>
                   ) : (
                     <ChatInputPane
-                      turnStatus={turnStatus}
+                      vimEnabled={vimEnabled}
+                      onCancelCompaction={handleCancelCompactionFromBarrier}
                       kind={meta?.kind}
                       workspaceId={workspaceId}
                       projectName={projectName}
@@ -1973,7 +1970,8 @@ const TranscriptOnlyNoticePane: React.FC<{
 };
 
 interface ChatInputPaneProps {
-  turnStatus: React.ReactNode;
+  vimEnabled: boolean;
+  onCancelCompaction: () => void;
   kind?: "scratch";
   workspaceId: string;
   projectName: string;
@@ -2129,45 +2127,12 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   }
   // Match Codex’s behavior: shared local checkouts intentionally have no concurrency warning.
 
-  if (props.shouldShowPinnedTodoList) {
-    addDecorationEntry({
-      key: "pinned-todo-list",
-      // Keyed by workspace: ChatPane stays mounted across workspace switches, and the panel's
-      // scroll position (set to the current item on open) must not carry over to another chat.
-      node: <PinnedTodoList key={props.workspaceId} workspaceId={props.workspaceId} />,
-    });
-  }
-  addDecorationEntry({
-    key: "sub-agent-tasks",
-    // Durable sub-agents live with their parent chat instead of relying only on nested sidebar rows.
-    // The decoration is collapsed by default, so inactive task history is available without noise.
-    // Keyed by workspace: ChatPane stays mounted across workspace switches, and the decoration
-    // retains observed workflow-run refs that must never leak into another chat's tray.
-    node: <SubAgentTasksDecoration key={props.workspaceId} workspaceId={props.workspaceId} />,
-  });
-  addDecorationEntry({
-    key: "background-processes",
-    node: <BackgroundProcessesBanner workspaceId={props.workspaceId} />,
-  });
   // Self-gating: only an SSH workspace from before #5174 with a plan to import shows it. Keyed by
   // workspace so one workspace's offer, error or pending import never carries over to another.
   addDecorationEntry({
     key: "legacy-plan-import",
     node: <LegacyPlanImportBanner key={props.workspaceId} workspaceId={props.workspaceId} />,
   });
-  // The Chat Instructions decoration is intentionally self-gating: it renders
-  // nothing when the scratchpad is empty or disabled, so it can always be in
-  // the decoration lane without affecting layout for users who don't use it.
-  addDecorationEntry({
-    key: "chat-instructions",
-    node: <ChatInstructionsChatDecoration workspaceId={props.workspaceId} />,
-  });
-  if (props.shouldShowReviewsBanner) {
-    addDecorationEntry({
-      key: "reviews-banner",
-      node: <ReviewsBanner workspaceId={props.workspaceId} />,
-    });
-  }
   if (props.delegatedCreationInterrupted) {
     addDecorationEntry({
       key: "delegated-creation-interrupted",
@@ -2216,7 +2181,16 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       <ChatInputDecorationStackLane
         items={selectVisibleChatInputDecorations(decorationEntries, props.revealDecorations)}
       />
-      {props.turnStatus}
+      {/* Live status sits beside the input, below async decorations: neither history reveal nor
+          banners arriving should bump the label and Stop across the screen. */}
+      <ChatActivityLine
+        workspaceId={props.workspaceId}
+        vimEnabled={props.vimEnabled}
+        onCancelCompaction={props.onCancelCompaction}
+        revealChips={props.revealDecorations}
+        showTodo={props.shouldShowPinnedTodoList}
+        showReviews={props.shouldShowReviewsBanner}
+      />
       <ChatInput
         key={props.workspaceId}
         variant="workspace"

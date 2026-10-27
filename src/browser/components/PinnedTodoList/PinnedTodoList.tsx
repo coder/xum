@@ -1,10 +1,10 @@
 import React, { useLayoutEffect, useRef, useSyncExternalStore } from "react";
 import { List } from "lucide-react";
+import { cn } from "@/common/lib/utils";
 import { TodoList } from "../TodoList/TodoList";
 import { ChatInputDecoration } from "../ChatPane/ChatInputDecoration";
+import { useChatActivityPanel } from "../ChatPane/chatActivityPanels";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
-import { usePersistedState } from "@/browser/hooks/usePersistedState";
-import { getPinnedTodoExpandedKey } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
 
 interface PinnedTodoListProps {
@@ -39,11 +39,60 @@ function useScrollToCurrentTodo(expanded: boolean, todos: readonly TodoItem[]) {
 }
 
 /**
- * Pinned TODO list displayed in the composer-adjacent decoration stack beneath
- * the stream barrier. Incomplete plans persist across streams until the agent
- * updates them, while fully completed plans clear when the final stream ends
- * for this workspace. The pinned panel expansion state persists separately in
- * localStorage.
+ * The list's counts ("1 in progress · 2 pending", or "5 completed" once nothing is left) and the
+ * step the chip names: the one in progress, else the next pending one.
+ */
+function summarizeTodos(todos: readonly TodoItem[]) {
+  const inProgressCount = todos.filter((todo) => todo.status === "in_progress").length;
+  const pendingCount = todos.filter((todo) => todo.status === "pending").length;
+  const completedCount = todos.length - inProgressCount - pendingCount;
+  const summaryParts: string[] = [];
+  if (inProgressCount > 0) {
+    summaryParts.push(`${inProgressCount} in progress`);
+  }
+  if (pendingCount > 0) {
+    summaryParts.push(`${pendingCount} pending`);
+  }
+  if (summaryParts.length === 0) {
+    summaryParts.push(`${completedCount} completed`);
+  }
+  const currentTodo =
+    todos.find((todo) => todo.status === "in_progress") ??
+    todos.find((todo) => todo.status === "pending");
+  return { completedCount, summaryParts, currentTodo };
+}
+
+/** Progress ring for the chip: the completed share of the list, drawn as an arc. */
+function TodoProgressRing(props: { completed: number; total: number }) {
+  const radius = 5;
+  const circumference = 2 * Math.PI * radius;
+  return (
+    <svg aria-hidden="true" viewBox="0 0 14 14" className="size-3.5 shrink-0 -rotate-90">
+      <circle
+        cx="7"
+        cy="7"
+        r={radius}
+        fill="none"
+        strokeWidth="2"
+        stroke="var(--color-border-medium)"
+      />
+      <circle
+        cx="7"
+        cy="7"
+        r={radius}
+        fill="none"
+        strokeWidth="2"
+        stroke="var(--color-success)"
+        strokeDasharray={`${(circumference * props.completed) / props.total} ${circumference}`}
+      />
+    </svg>
+  );
+}
+
+/**
+ * Pinned TODO list: a chip in the composer's live line that names the current step, with the
+ * full list in its panel. Incomplete plans persist across streams until the agent updates them,
+ * while fully completed plans clear when the final stream ends for this workspace.
  *
  * Relies on natural reference stability from MapStore + Aggregator architecture:
  * - Aggregator.getCurrentTodos() returns direct reference (not a copy)
@@ -51,7 +100,9 @@ function useScrollToCurrentTodo(expanded: boolean, todos: readonly TodoItem[]) {
  * - MapStore caches WorkspaceState per version, avoiding unnecessary recomputation
  */
 export const PinnedTodoList: React.FC<PinnedTodoListProps> = ({ workspaceId }) => {
-  const [expanded, setExpanded] = usePersistedState(getPinnedTodoExpandedKey(workspaceId), true);
+  // Closed until asked for: the panel covers the transcript, unlike the old inline list that
+  // stayed open across turns.
+  const [expanded, setExpanded] = useChatActivityPanel("todo");
 
   const workspaceStore = useWorkspaceStoreRaw();
   const subscribeToWorkspace = (callback: () => void) =>
@@ -68,19 +119,8 @@ export const PinnedTodoList: React.FC<PinnedTodoListProps> = ({ workspaceId }) =
     return null;
   }
 
-  const inProgressCount = todos.filter((todo) => todo.status === "in_progress").length;
-  const pendingCount = todos.filter((todo) => todo.status === "pending").length;
-  const completedCount = todos.length - inProgressCount - pendingCount;
-  const summaryParts: string[] = [];
-  if (inProgressCount > 0) {
-    summaryParts.push(`${inProgressCount} in progress`);
-  }
-  if (pendingCount > 0) {
-    summaryParts.push(`${pendingCount} pending`);
-  }
-  if (summaryParts.length === 0) {
-    summaryParts.push(`${completedCount} completed`);
-  }
+  const { completedCount, summaryParts, currentTodo } = summarizeTodos(todos);
+  const progress = `${completedCount}/${todos.length}`;
 
   return (
     <ChatInputDecoration
@@ -89,6 +129,31 @@ export const PinnedTodoList: React.FC<PinnedTodoListProps> = ({ workspaceId }) =
       contentClassName="max-h-[300px] overflow-y-auto"
       contentRef={contentRef}
       dataComponent="PinnedTodoList"
+      activityId="todo"
+      chipLabel={`TODO, ${completedCount} of ${todos.length} done${currentTodo ? `: ${currentTodo.content}` : ""}`}
+      // The only chip with text worth reading: it takes the line's free width, and it is the one
+      // that yields width on phones, down to its ring and the start of the step.
+      chipVariant="plain"
+      chipClassName="min-w-14"
+      panelTitle="TODO"
+      panelMeta={[`${progress} done`, ...(currentTodo ? summaryParts : [])].join(" · ")}
+      tab={
+        <>
+          <TodoProgressRing completed={completedCount} total={todos.length} />
+          <span>TODO</span>
+          <span className="counter-nums text-muted">{progress}</span>
+        </>
+      }
+      chip={
+        <>
+          <TodoProgressRing completed={completedCount} total={todos.length} />
+          {/* The ring carries progress on phones, where the current step needs the width. */}
+          <span className={cn("counter-nums text-muted", currentTodo && "hidden @md:inline")}>
+            {progress}
+          </span>
+          {currentTodo && <span className="min-w-0 truncate">{currentTodo.content}</span>}
+        </>
+      }
       summary={
         <>
           <List className="text-muted group-hover:text-secondary size-3.5 transition-colors" />

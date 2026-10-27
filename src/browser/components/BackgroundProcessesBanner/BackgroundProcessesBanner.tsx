@@ -3,8 +3,11 @@ import { Terminal, X, Loader2, FileText } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { BackgroundBashOutputDialog } from "../BackgroundBashOutputDialog/BackgroundBashOutputDialog";
-import { ChatInputDecoration } from "../ChatPane/ChatInputDecoration";
-import { formatDuration } from "@/common/utils/formatDuration";
+import { ActivityChipLiveDot, ChatInputDecoration } from "../ChatPane/ChatInputDecoration";
+import { useChatActivityPanel } from "../ChatPane/chatActivityPanels";
+import { formatKeyLabel } from "../Keycap/Keycap";
+import { formatElapsed } from "@/common/utils/formatDuration";
+import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
 import {
   useBackgroundBashTerminatingIds,
   useBackgroundProcesses,
@@ -48,9 +51,58 @@ function restoreFocus(
   }
 }
 
-/** The strip's expand/collapse button, which ChatInputDecoration renders just before the list. */
-function stripToggle(list: HTMLElement | null): Element | null {
-  return list?.previousElementSibling ?? null;
+/**
+ * The strip's expand/collapse control: the live line's chip, or else the row button that
+ * ChatInputDecoration renders just before the list (the VS Code webview's tray).
+ */
+function stripToggle(root: HTMLElement | null, list: HTMLElement | null): Element | null {
+  return root?.querySelector("[data-activity-chip]") ?? list?.previousElementSibling ?? null;
+}
+
+function backgroundBashNoun(count: number): string {
+  return count === 1 ? "background bash" : "background bashes";
+}
+
+/** "2 running", plus the exited rows still waiting to wake the agent. */
+function formatBashesPanelMeta(count: number, runningCount: number): string {
+  const waking = count - runningCount;
+  return waking > 0 ? `${runningCount} running · ${waking} waking the agent` : `${count} running`;
+}
+
+/** The row keys, under the list: the strip is keyboard-driven but its keys are otherwise hidden. */
+function BashesKeyHints(props: { canViewOutput: boolean }) {
+  const hints = [
+    `${formatKeyLabel(KEYBINDS.BACKGROUND_PROCESS_PREV.key)}${formatKeyLabel(KEYBINDS.BACKGROUND_PROCESS_NEXT.key)} move`,
+    props.canViewOutput &&
+      `${formatKeyLabel(KEYBINDS.BACKGROUND_PROCESS_VIEW_OUTPUT.key)} view output`,
+    `${formatKeyLabel(KEYBINDS.BACKGROUND_PROCESS_TERMINATE.key)} terminate`,
+    `${formatKeyLabel(KEYBINDS.CANCEL.key)} close`,
+  ];
+  return <>{hints.filter((hint) => hint !== false).join(" · ")}</>;
+}
+
+/**
+ * A row's muted line, e.g. "watching /READY|FAILED/ · 0 matches · pid 48211". Rows synthesized
+ * from a durable pending wake (process gone after restart) carry no real pid, but always a monitor.
+ */
+export function formatProcessDetail(proc: Pick<BackgroundProcessInfo, "monitor" | "pid">): string {
+  const parts: string[] = [];
+  if (proc.monitor) {
+    const matches = proc.monitor.totalMatches;
+    parts.push(`watching /${proc.monitor.filter}/`, `${matches} match${matches === 1 ? "" : "es"}`);
+    if (proc.monitor.stopped) parts.push("stopped");
+  }
+  if (proc.pid > 0) parts.push(`pid ${proc.pid}`);
+  return parts.join(" · ");
+}
+
+/** The chip's live dot, per running row; a blank slot keeps exited rows aligned. */
+function ProcessRowDot(props: { running: boolean }) {
+  return props.running ? (
+    <ActivityChipLiveDot />
+  ) : (
+    <span aria-hidden className="size-1.5 shrink-0" />
+  );
 }
 
 /**
@@ -75,7 +127,7 @@ interface BackgroundProcessesBannerProps {
  */
 export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps> = (props) => {
   const [viewingProcessId, setViewingProcessId] = useState<string | null>(null);
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpanded, setIsExpanded] = useChatActivityPanel("background-bashes");
   const [, setTick] = useState(0);
   const processes = useBackgroundProcesses(props.workspaceId);
   const terminatingIds = useBackgroundBashTerminatingIds(props.workspaceId);
@@ -102,7 +154,8 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   );
   const viewingProcess = processes.find((p) => p.id === viewingProcessId) ?? null;
   const count = visibleProcesses.length;
-  const hasRunning = visibleProcesses.some((p) => p.status === "running");
+  const runningCount = visibleProcesses.filter((p) => p.status === "running").length;
+  const hasRunning = runningCount > 0;
 
   // Update duration display every second when expanded (exited processes show no duration)
   useEffect(() => {
@@ -139,7 +192,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       event.preventDefault();
       if (event.repeat) return;
       if (listRef.current?.contains(document.activeElement)) {
-        const toggle = stripToggle(listRef.current);
+        const toggle = stripToggle(rootRef.current, listRef.current);
         setIsExpanded(false);
         restoreFocus(returnFocusRef, toggle);
       } else {
@@ -160,7 +213,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, onFocusRequest);
     };
-  }, [count, props.workspaceId, paneScope]);
+  }, [count, props.workspaceId, paneScope, setIsExpanded]);
 
   useEffect(() => {
     if (focusRequest > 0) focusProcessRow(listRef.current, 0);
@@ -204,7 +257,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     const proc = visibleProcesses[index];
     if (!row || !proc) return;
     if (matchesKeybind(event, KEYBINDS.CANCEL)) {
-      const toggle = stripToggle(listRef.current);
+      const toggle = stripToggle(rootRef.current, listRef.current);
       setIsExpanded(false);
       restoreFocus(returnFocusRef, toggle);
     } else if (matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_NEXT)) {
@@ -248,9 +301,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     [terminate]
   );
 
-  const handleToggle = useCallback(() => {
-    setIsExpanded((prev) => !prev);
-  }, []);
+  const handleToggle = () => setIsExpanded((prev) => !prev);
 
   // Don't render if no running processes and no dialog open.
   if (count === 0 && !viewingProcessId) {
@@ -266,13 +317,40 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
           contentClassName="max-h-48 space-y-1.5 overflow-y-auto py-2"
           contentRef={listRef}
           onContentKeyDown={handleListKeyDown}
+          dataComponent="BackgroundProcessesBanner"
+          activityId="background-bashes"
+          chipLabel={`${count} ${backgroundBashNoun(count)}`}
+          chipTooltip={
+            <>
+              Background bashes
+              <kbd className={SHORTCUT_HINT_CLASS}>
+                {formatKeybind(KEYBINDS.FOCUS_BACKGROUND_PROCESSES)}
+              </kbd>
+            </>
+          }
+          chip={
+            <>
+              <Terminal className="size-3.5 shrink-0" />
+              <span className="counter-nums">{count}</span>
+              {hasRunning && <ActivityChipLiveDot />}
+            </>
+          }
+          panelTitle="Background bashes"
+          panelMeta={formatBashesPanelMeta(count, runningCount)}
+          panelShortcut={formatKeybind(KEYBINDS.FOCUS_BACKGROUND_PROCESSES)}
+          panelFooter={<BashesKeyHints canViewOutput={canViewOutput} />}
+          tab={
+            <>
+              <Terminal className="size-4 shrink-0" />
+              <span>Bashes</span>
+              <span className="counter-nums text-muted">{count}</span>
+            </>
+          }
           summary={
             <>
               <Terminal className="text-muted group-hover:text-secondary size-3.5 transition-colors" />
               <span className="text-muted group-hover:text-secondary transition-colors">
-                <span className="font-medium">{count}</span>
-                {" background bash"}
-                {count !== 1 && "es"}
+                <span className="font-medium">{count}</span> {backgroundBashNoun(count)}
               </span>
             </>
           }
@@ -297,49 +375,39 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                   }}
                   className={cn(
                     "hover:bg-hover flex items-center justify-between gap-3 rounded px-2 py-1.5",
-                    "focus-visible:ring-accent outline-none focus-visible:ring-1",
+                    "focus-visible:ring-accent focus-visible:bg-hover outline-none focus-visible:ring-1",
                     "transition-colors",
                     isTerminating && "pointer-events-none opacity-50"
                   )}
                 >
+                  <ProcessRowDot running={proc.status === "running"} />
                   <div className="min-w-0 flex-1">
                     <div className="text-foreground truncate font-mono text-xs" title={proc.script}>
                       {proc.displayName ?? truncateScript(proc.script)}
                     </div>
-                    {proc.monitor && (
-                      <>
-                        <div className="text-muted truncate text-[10px]">
-                          watching /{proc.monitor.filter}/ · {proc.monitor.totalMatches} match
-                          {proc.monitor.totalMatches === 1 ? "" : "es"}
-                          {proc.monitor.stopped ? " · stopped" : ""}
-                        </div>
-                        {/* Own non-truncating line: appended to the watching line above,
-                            a long filter would right-ellipsize this away on narrow
-                            widths — hiding the only explanation for an exited row. */}
-                        {proc.monitor.pendingWakeKind != null && (
-                          <div className="text-secondary text-[10px]">
-                            {/* settled wakes report a process exit without any filter match;
-                                monitor-lost wakes report a terminated watcher, not a match */}
-                            {proc.monitor.pendingWakeKind === "match"
-                              ? "match found — waking agent…"
-                              : proc.monitor.pendingWakeKind === "settled"
-                                ? "process settled — waking agent…"
-                                : "monitor lost — waking agent…"}
-                          </div>
-                        )}
-                      </>
-                    )}
-                    {/* Rows synthesized from a durable pending wake (process gone after
-                        restart) carry no real pid. */}
-                    {proc.pid > 0 && (
-                      <div className="text-muted font-mono text-[10px]">pid {proc.pid}</div>
+                    <div className="text-muted truncate text-[10px]">
+                      {formatProcessDetail(proc)}
+                    </div>
+                    {/* Own non-truncating line: appended to the detail line above, a long
+                        filter would right-ellipsize this away on narrow widths, hiding the
+                        only explanation for an exited row. */}
+                    {proc.monitor?.pendingWakeKind != null && (
+                      <div className="text-secondary text-[10px]">
+                        {/* settled wakes report a process exit without any filter match;
+                            monitor-lost wakes report a terminated watcher, not a match */}
+                        {proc.monitor.pendingWakeKind === "match"
+                          ? "match found — waking agent…"
+                          : proc.monitor.pendingWakeKind === "settled"
+                            ? "process settled — waking agent…"
+                            : "monitor lost — waking agent…"}
+                      </div>
                     )}
                   </div>
                   <div className="flex shrink-0 items-center gap-2">
                     {/* Exited-but-wake-pending rows have no live duration to increment */}
                     {proc.status === "running" && (
-                      <span className="text-muted text-[10px] tabular-nums">
-                        {formatDuration(Date.now() - proc.startTime)}
+                      <span className="text-muted counter-nums-mono text-[10px]">
+                        {formatElapsed(Date.now() - proc.startTime)}
                       </span>
                     )}
                     {/* Rows synthesized from a durable pending wake have no manager entry
