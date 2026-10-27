@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { cleanup, fireEvent, render } from "@testing-library/react";
+import type React from "react";
 import { installDom } from "../../../../tests/ui/dom";
 
 import { ChatInputDecoration } from "./ChatInputDecoration";
@@ -11,7 +12,11 @@ import {
 
 let cleanupDom: (() => void) | null = null;
 
-function Chip(props: { id: ChatActivityId; label: string }) {
+function Chip(props: {
+  id: ChatActivityId;
+  label: string;
+  onContentKeyDown?: (event: React.KeyboardEvent<HTMLDivElement>) => void;
+}) {
   const [expanded, setExpanded] = useChatActivityPanel(props.id);
   return (
     <ChatInputDecoration
@@ -20,7 +25,8 @@ function Chip(props: { id: ChatActivityId; label: string }) {
       onToggle={() => setExpanded((open) => !open)}
       chipLabel={props.label}
       summary={props.label}
-      renderExpanded={() => <p>{props.label} list</p>}
+      onContentKeyDown={props.onContentKeyDown}
+      renderExpanded={() => <button type="button">{props.label} list</button>}
     />
   );
 }
@@ -76,6 +82,59 @@ describe("chat activity panels", () => {
     expect(view.queryByText("TODO list")).toBeNull();
     expect(windowSawEscape).toBe(false);
     expect(document.activeElement).toBe(chip);
+  });
+
+  it("ignores keys other than Escape", () => {
+    const view = render(renderLine());
+
+    fireEvent.click(view.getByRole("button", { name: "TODO" }));
+    fireEvent.keyDown(view.getByText("TODO list"), { key: "Enter" });
+
+    expect(view.queryByText("TODO list")).not.toBeNull();
+  });
+
+  it("leaves Escape to a list that handles it itself", () => {
+    // The background bash list closes itself on Escape and moves focus; closing again would reopen.
+    let listSawEscape = false;
+    const view = render(
+      <ChatActivityPanelsProvider>
+        <Chip
+          id="background-bashes"
+          label="Bashes"
+          onContentKeyDown={(event) => {
+            if (event.key !== "Escape") return;
+            listSawEscape = true;
+            event.preventDefault();
+          }}
+        />
+      </ChatActivityPanelsProvider>
+    );
+
+    fireEvent.click(view.getByRole("button", { name: "Bashes" }));
+    fireEvent.keyDown(view.getByText("Bashes list"), { key: "Escape" });
+
+    expect(listSawEscape).toBe(true);
+    expect(view.queryByText("Bashes list")).not.toBeNull();
+  });
+
+  it("keeps the inline row outside the live line", () => {
+    // Hosts without the line (the VS Code webview's tray) show the list in the row, when expanded.
+    function Row(props: { expanded: boolean }) {
+      return (
+        <ChatInputDecoration
+          expanded={props.expanded}
+          onToggle={() => undefined}
+          summary="TODO"
+          renderExpanded={() => <p>TODO list</p>}
+        />
+      );
+    }
+    const view = render(<Row expanded={false} />);
+    expect(view.container.querySelector("[data-activity-chip]")).toBeNull();
+    expect(view.queryByText("TODO list")).toBeNull();
+
+    view.rerender(<Row expanded />);
+    expect(view.queryByText("TODO list")).not.toBeNull();
   });
 
   it("leaves Escape to the window while every panel is closed", () => {

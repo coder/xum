@@ -443,7 +443,7 @@ describe("describeSubAgentsChip", () => {
     depth: 1,
   });
   const describeChip = (input: {
-    subAgents?: ReturnType<typeof agent>[];
+    subAgents?: Array<ReturnType<typeof agent>>;
     workflowGroups?: WorkflowAgentGroup[];
     activeCount?: number;
   }) =>

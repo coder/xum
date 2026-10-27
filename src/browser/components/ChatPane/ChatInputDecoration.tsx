@@ -81,6 +81,7 @@ function ChatInputDecorationRow(props: ChatInputDecorationProps) {
       >
         {props.summary}
         <div className="ml-auto">
+          {/* mutation-equivalent: trailingIcon is an icon element or absent, never another falsy node */}
           {props.trailingIcon ??
             (props.expanded ? (
               <ChevronDown className="text-muted group-hover:text-secondary size-3.5 transition-colors" />
@@ -122,6 +123,7 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
   const renderPanel = props.expanded ? props.renderExpanded : undefined;
   const close = () => {
     props.onToggle();
+    // mutation-equivalent: close only runs from the chip's or its panel's handlers, so the chip is mounted
     chipRef.current?.focus();
   };
 
@@ -137,6 +139,7 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
         onToggle={props.onToggle}
         onClose={close}
       >
+        {/* mutation-equivalent: chip is an element or absent, never another falsy node */}
         {props.chip ?? props.summary}
       </ChatActivityChipButton>
       {renderPanel && (
