@@ -5,6 +5,7 @@ import {
   deriveLastMessageReceipt,
   deriveStatusActivity,
   findStartHereSource,
+  isTurnActive,
   recentTranscriptRows,
   type StatusActivityFlags,
 } from "./agentInterfaceStatusBar";
@@ -120,7 +121,7 @@ describe("deriveStatusActivity", () => {
   });
 
   test("not streaming is idle, or stopped when the newest row is a stream error", () => {
-    expect(deriveStatusActivity([user("go"), assistant("done")], idle).kind).toBe("idle");
+    expect(deriveStatusActivity([], idle).kind).toBe("idle");
     const errored: DisplayedMessage = {
       type: "stream-error",
       id: "e1",
@@ -129,7 +130,25 @@ describe("deriveStatusActivity", () => {
       errorType: "unknown",
       historySequence: 99,
     };
-    expect(deriveStatusActivity([user("go"), errored], idle).kind).toBe("error");
+    expect(deriveStatusActivity([user("go"), assistant("partial"), errored], idle).kind).toBe(
+      "error"
+    );
+    // A retry that answered after the error leaves the turn settled, not stopped.
+    expect(deriveStatusActivity([user("go"), errored, assistant("done")], idle).kind).toBe("idle");
+  });
+
+  test("a turn counts as running in every phase but idle and a stopped stream", () => {
+    const phases: Array<[StatusActivityFlags, DisplayedMessage[], boolean]> = [
+      [{ ...idle, isStreamStarting: true }, [], true],
+      [{ ...streaming, isCompacting: true }, [], true],
+      [{ ...streaming, awaitingUserQuestion: true }, [], true],
+      [streaming, [user("go"), tool("bash", "executing")], true],
+      [idle, [user("go"), assistant("done")], false],
+    ];
+    for (const [flags, messages, active] of phases) {
+      expect(isTurnActive(deriveStatusActivity(messages, flags))).toBe(active);
+    }
+    expect(isTurnActive({ kind: "error", label: "Stopped" })).toBe(false);
   });
 });
 
@@ -151,10 +170,11 @@ describe("deriveLastMessageReceipt", () => {
     expect(receipt).toMatchObject({ state: "queued", preview: "queued text" });
   });
 
-  test("held inputs win over the newest transcript row", () => {
-    expect(deriveLastMessageReceipt([user("in history")], null, [held])).toMatchObject({
+  test("held inputs win over the newest transcript row, the newest held input first", () => {
+    const newer: HeldInput = { ...held, id: "h2", displayText: "newer held text" };
+    expect(deriveLastMessageReceipt([user("in history")], null, [held, newer])).toMatchObject({
       state: "held",
-      preview: "held text",
+      preview: "newer held text",
     });
   });
 
@@ -172,7 +192,9 @@ describe("deriveLastMessageReceipt", () => {
   test("machine-authored user rows are not the user's last message", () => {
     const messages = [
       user("mine"),
-      user("continue the goal", { isSynthetic: true, isGoalContinuation: true }),
+      user("synthetic row", { isSynthetic: true }),
+      user("continue the goal", { isGoalContinuation: true }),
+      user("wrap up the goal", { isBudgetLimitWrapup: true }),
       user("monitor fired", { bashMonitorWake: { records: [] } }),
       user("peer says hi", { agentPeerMessageTrigger: true }),
       user("context is filling up", {
@@ -208,6 +230,18 @@ describe("recentTranscriptRows", () => {
       "tool",
     ]);
   });
+
+  test("previews are one bounded line, and malformed tool arguments show none", () => {
+    const long = `First line\n\n${"word ".repeat(100)}`;
+    const [row] = recentTranscriptRows([user(long)], 1);
+    expect(row.preview.startsWith("First line word")).toBe(true);
+    expect(row.preview).not.toContain("\n");
+    expect(row.preview.length).toBeLessThan(long.length);
+    expect(row.preview.length).toBeLessThanOrEqual(160);
+    expect(recentTranscriptRows([tool("bash", "executing", "not an object")], 1)[0].preview).toBe(
+      ""
+    );
+  });
 });
 
 describe("findStartHereSource", () => {
@@ -223,6 +257,7 @@ describe("findStartHereSource", () => {
       assistant("still typing", { isStreaming: true }),
     ];
     expect(findStartHereSource(messages)).toBe(settled);
+    expect(findStartHereSource([settled])).toBe(settled);
   });
 
   test("offers nothing once the newest reply is compacted or before the latest boundary", () => {

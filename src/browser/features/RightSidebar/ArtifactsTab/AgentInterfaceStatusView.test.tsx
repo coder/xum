@@ -610,11 +610,20 @@ describe("Agent interface status view", () => {
     );
   });
   test("the status bar names the running tool and its transcript peek opens and closes", async () => {
-    seedWorkspace("ws-bar-busy", { messages: MID_TURN, canInterrupt: true });
+    seedWorkspace("ws-bar-busy", {
+      messages: MID_TURN,
+      canInterrupt: true,
+      queuedMessage: { id: "q1", content: "Then roll to 50%" },
+    });
     const view = render(<MainPane workspaceId="ws-bar-busy" />, { wrapper: Wrapper });
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
     const bar = view.getByTestId("agent-interface-status-bar");
     expect(within(bar).getByRole("status").textContent).toContain("Slow check");
+    // The send made during the turn is the user's last message, still waiting in the queue.
+    const receipt = within(bar).getByTestId("agent-interface-status-receipt");
+    expect(receipt.textContent).toContain("Then roll to 50%");
+    expect(receipt.textContent).toContain("Queued");
+    expect(receipt.textContent).not.toMatch(/ago|just now/);
     // Start Here would rewrite the context under the running turn.
     expect(within(bar).getByRole("button", { name: "Start here" }).hasAttribute("disabled")).toBe(
       true
@@ -635,12 +644,24 @@ describe("Agent interface status view", () => {
     seedWorkspace("ws-bar-idle", { messages: MID_TURN.slice(0, 2) });
     const view = render(<MainPane workspaceId="ws-bar-idle" />, { wrapper: Wrapper });
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
-    const startHere = within(view.getByTestId("agent-interface-status-bar")).getByRole("button", {
-      name: "Start here",
-    });
+    const bar = view.getByTestId("agent-interface-status-bar");
+    expect(within(bar).getByTestId("agent-interface-status-receipt").textContent).toContain(
+      "In transcript · just now"
+    );
+    const startHere = within(bar).getByRole("button", { name: "Start here" });
     expect(startHere.hasAttribute("disabled")).toBe(false);
     fireEvent.click(startHere);
     const dialog = await within(document.body).findByRole("dialog");
     expect(within(dialog).getByText("Start Here")).toBeTruthy();
+  });
+  test("before the first message the bar shows no receipt and Start here stays off", async () => {
+    seedWorkspace("ws-bar-empty", {});
+    const view = render(<MainPane workspaceId="ws-bar-empty" />, { wrapper: Wrapper });
+    await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+    const bar = view.getByTestId("agent-interface-status-bar");
+    expect(within(bar).queryByTestId("agent-interface-status-receipt")).toBeNull();
+    expect(within(bar).getByRole("button", { name: "Start here" }).hasAttribute("disabled")).toBe(
+      true
+    );
   });
 });

@@ -67,6 +67,7 @@ function isStreamingRow(message: DisplayedMessage, type: "reasoning" | "assistan
  * tool while one still runs.
  */
 function streamingActivity(messages: readonly DisplayedMessage[]): StatusActivity {
+  // mutation-equivalent: the user row itself is neither a tool nor a streaming row
   const turn = messages.slice(messages.findLastIndex((message) => message.type === "user") + 1);
   const tool = turn.findLast(isRunningTool);
   if (tool != null) {
