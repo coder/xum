@@ -386,6 +386,15 @@ export const SubAgentsOnlyDesktop: AppStory = {
   play: async ({ canvasElement }) => {
     const line = await findLine(canvasElement, 1);
     await assertChipsLeftWithoutDividers(line);
+    // The popover opens over its left-aligned chip, not at the line's far end.
+    const chip = line.querySelector<HTMLElement>("[data-activity-chip]");
+    if (chip === null) throw new Error("The sub-agents chip is missing");
+    await userEvent.click(chip);
+    const panelRect = (await findChatActivityPanel()).getBoundingClientRect();
+    const chipRect = chip.getBoundingClientRect();
+    await expect(panelRect.left).toBeLessThanOrEqual(chipRect.left);
+    await expect(panelRect.right).toBeGreaterThanOrEqual(chipRect.right);
+    await userEvent.keyboard("{Escape}");
   },
 };
 

@@ -200,8 +200,8 @@ interface ChatActivityPanelProps extends ChatInputDecorationProps {
 /**
  * The open panel. On wide viewports it is a popover positioned against the live line (the nearest
  * positioned ancestor), just above it and over the transcript, so the composer does not move when
- * a list opens: anchored to the line's start for the TODO chip, which sits at the start, and to
- * its end for the chips beside Stop. On phones (narrow or short viewports) it opens in the line's
+ * a list opens: anchored to the line's start for the TODO chip and for bordered chips that follow
+ * the status, and to its end for bordered chips pushed beside Stop by a TODO chip. On phones (narrow or short viewports) it opens in the line's
  * activity sheet instead (see ChatActivityPanelsProvider).
  */
 function ChatActivityChipPanel(props: ChatActivityPanelProps) {
@@ -225,7 +225,11 @@ function ChatActivityPopover(props: ChatActivityPanelProps) {
       onKeyDown={(event) => closeOnEscape(event, props.onClose)}
       className={cn(
         "bg-surface-primary border-border-medium absolute bottom-full z-30 mb-1 flex max-h-[min(55vh,26rem)] w-[min(30rem,100%)] flex-col overflow-hidden rounded-lg border shadow-lg",
-        props.chipVariant === "plain" ? "left-0" : "right-0"
+        // Bordered chips end the line only beside a plain TODO chip (see StreamingBarrierView's
+        // spacer); otherwise they follow the status label, so their panel opens at the start too.
+        props.chipVariant === "plain"
+          ? "left-0"
+          : "left-0 group-has-[[data-activity-chip-plain]]/live:right-0 group-has-[[data-activity-chip-plain]]/live:left-auto"
       )}
     >
       {/* min-h, not h: touch phones grow the Close button to 44px (globals.css), and the panel
