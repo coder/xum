@@ -4,8 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
+import { TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE } from "@/constants/agentMessaging";
+import { Ok } from "@/common/types/result";
 import type { TaskAttemptOutcome } from "@/common/types/tasks";
-import type { ProjectsConfig } from "@/node/config";
+import type { ProjectsConfig, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { AgentTaskIndex } from "@/node/services/agentTaskIndex";
 import { AttemptLedger, type AttemptLedgerDeps } from "@/node/services/attemptLedger";
 import { readSubagentAttemptSettlementReceiptStrict } from "@/node/services/subagentAttemptSettlements";
@@ -15,8 +17,11 @@ import type {
   OwnedTaskAttempt,
   SettlementReceiptDecision,
   StreamEndDecision,
+  WorkspaceStopRecord,
 } from "@/node/services/taskService";
+import { findWorkspaceEntry } from "@/node/services/taskUtils";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { isTaskAttemptId } from "@/node/utils/taskAttemptId";
 
 const TASK = "task-a";
 const PARENT = "parent-a";
@@ -30,7 +35,10 @@ function send(attemptId: string): AdmittedSend {
 
 /** A config whose only workspace is TASK, with this row. */
 function configWithRow(row: Record<string, unknown> | undefined): ProjectsConfig {
-  const workspaces = row == null ? [] : [{ id: TASK, ...row }];
+  return configWithRows(row == null ? [] : [{ id: TASK, ...row }]);
+}
+
+function configWithRows(workspaces: Array<Record<string, unknown>>): ProjectsConfig {
   return { projects: new Map([["/project", { workspaces }]]) } as unknown as ProjectsConfig;
 }
 
@@ -39,13 +47,20 @@ interface HarnessState {
   sessionsDir: string;
   stopRecordAttemptId: string | undefined;
   hasStopRecord: boolean;
-  sends: Set<AdmittedSend>;
   activeTurn: symbol | undefined;
   liveRegistration: unknown;
   streaming: boolean;
   streamEnd: StreamEndDecision | undefined;
   owners: string[];
   outcomes: Array<TaskAttemptOutcome<AgentTaskReport>>;
+  stopInProgress: boolean;
+  currentStopRecord: WorkspaceStopRecord | undefined;
+  /** Config reads (lenient and strict) per call; the next one wins when set. */
+  nextConfigs: Array<ProjectsConfig | Error>;
+  /** Config edits throw this. */
+  editError: Error | undefined;
+  /** Config edits run on a copy that is never saved (a write that failed silently). */
+  dropEdits: boolean;
 }
 
 /**
@@ -59,13 +74,25 @@ function createHarness() {
     sessionsDir: "/unused",
     stopRecordAttemptId: undefined,
     hasStopRecord: false,
-    sends: new Set(),
     activeTurn: undefined,
     liveRegistration: undefined,
     streaming: false,
     streamEnd: undefined,
     owners: [PARENT, ROOT],
     outcomes: [],
+    stopInProgress: false,
+    currentStopRecord: undefined,
+    nextConfigs: [],
+    editError: undefined,
+    dropEdits: false,
+  };
+  /** Like Config.editConfig: the edit applies to the stored config, unless it fails. */
+  const editConfig = (fn: (config: ProjectsConfig) => ProjectsConfig): Promise<void> => {
+    if (state.editError != null) return Promise.reject(state.editError);
+    if (state.config instanceof Error) return Promise.reject(state.config);
+    const edited = fn(state.dropEdits ? structuredClone(state.config) : state.config);
+    if (!state.dropEdits) state.config = edited;
+    return Promise.resolve();
   };
   const eventLocks = new MutexMap<string>();
   const inspect = mock(
@@ -79,13 +106,22 @@ function createHarness() {
     config: () => ({
       // Like the real Config: an unreadable file throws only for a strict read.
       loadConfigOrDefault: (options?: { throwOnError?: boolean }) => {
+        const next = state.nextConfigs.shift();
+        if (next != null) state.config = next;
         if (!(state.config instanceof Error)) return state.config;
         if (options?.throwOnError === true) throw state.config;
         return configWithRow(undefined);
       },
       sessionsDir: state.sessionsDir,
+      editConfig,
     }),
-    aiService: () => ({ isStreaming: () => state.streaming }),
+    aiService: () => ({
+      isStreaming: () => state.streaming,
+      stopStream: (taskId, options) => {
+        events.push(`stopStream:${taskId}:abandonPartial=${String(options?.abandonPartial)}`);
+        return Promise.resolve(Ok(undefined));
+      },
+    }),
     workspaceService: () => ({ getActiveTurnGeneration: () => state.activeTurn }),
     turnManager: () =>
       ({
@@ -96,8 +132,35 @@ function createHarness() {
     listAncestorWorkspaceIdsUsingParentById: () => state.owners,
     stopRecordAttemptId: () => state.stopRecordAttemptId,
     hasStopRecord: () => state.hasStopRecord,
-    admittedSends: () => state.sends,
+    isWorkspaceStopInProgress: () => state.stopInProgress,
+    isCurrentStopRecord: (_workspaceId, record) => state.currentStopRecord === record,
+    recheckWorkspaceStopRelease: (workspaceId) => events.push(`recheckStop:${workspaceId}`),
+    // Like TaskService.currentTaskAttemptId: the entry, else a lenient read of the row.
+    currentTaskAttemptId: (taskId, entry) => {
+      const id =
+        entry?.taskAttemptId ??
+        findWorkspaceEntry(deps.config().loadConfigOrDefault(), taskId)?.workspace.taskAttemptId;
+      return isTaskAttemptId(id) ? id : undefined;
+    },
+    // Like TaskService.editWorkspaceEntry: the updater runs on the row inside one config edit.
+    editWorkspaceEntry: async (workspaceId, updater) => {
+      let found = false;
+      await editConfig((config) => {
+        const row = findWorkspaceEntry(config, workspaceId)?.workspace;
+        if (row != null) {
+          updater(row, config);
+          found = true;
+        }
+        return config;
+      });
+      return found;
+    },
+    settleChildGoalPause: (workspaceId) => {
+      events.push(`settleGoalPause:${workspaceId}`);
+      return Promise.resolve();
+    },
     findStreamEndDecision: () => state.streamEnd,
+    pruneStreamEndDecisions: (taskId) => events.push(`prune:${taskId}`),
     discardStreamEndDecisions: (taskId) => events.push(`discardStreamEnds:${taskId}`),
     inspectAttemptOutcome: (taskId, options) => {
       events.push("inspect");
@@ -303,10 +366,11 @@ describe("AttemptLedger", () => {
     });
 
     test("an obligation of this attempt blocks; a successor's does not", () => {
-      const { ledger, state, owned } = closedOwner();
-      state.sends.add(send(OTHER));
+      const { ledger, owned } = closedOwner();
+      const sends = new Set([send(OTHER)]);
+      ledger.admittedSendsByTaskId.set(TASK, sends);
       expect(ledger.attemptCannotStillReport(TASK, owned)).toBe(true);
-      state.sends.add(send(ATTEMPT));
+      sends.add(send(ATTEMPT));
       expect(ledger.attemptCannotStillReport(TASK, owned)).toBe(false);
     });
 
@@ -523,12 +587,12 @@ describe("AttemptLedger", () => {
       state.hasStopRecord = true;
       ledger.recheckResumeFailureSettlement(TASK);
       state.hasStopRecord = false;
-      state.sends.add(send(ATTEMPT));
+      ledger.admittedSendsByTaskId.set(TASK, new Set([send(ATTEMPT)]));
       ledger.recheckResumeFailureSettlement(TASK);
       expect(ledger.resumeFailureSettlementByTaskId.has(TASK)).toBe(true);
       expect(events).toEqual([]);
 
-      state.sends.clear();
+      ledger.admittedSendsByTaskId.delete(TASK);
       ledger.recheckResumeFailureSettlement(TASK);
       expect(ledger.resumeFailureSettlementByTaskId.has(TASK)).toBe(false);
       await Promise.resolve();
@@ -649,6 +713,610 @@ describe("AttemptLedger", () => {
         reason: "unknown owner",
       });
       expect(inspect).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  describe("send admission", () => {
+    function admit(ledger: AttemptLedger, expectedAttemptId?: string) {
+      const admission = ledger.admitTaskWorkspaceTurn(TASK, {
+        acceptanceOrigin: "automatic",
+        ...(expectedAttemptId != null ? { expectedAttemptId } : {}),
+      });
+      if (admission.kind !== "admitted") throw new Error(`not admitted: ${admission.kind}`);
+      return admission.token;
+    }
+
+    function onlySend(ledger: AttemptLedger): AdmittedSend {
+      const sends = [...ledger.sendsOf(TASK)];
+      expect(sends).toHaveLength(1);
+      return sends[0];
+    }
+
+    /** A stop record that captured `captured` while it was pending (by reference). */
+    function capture(captured: AdmittedSend): WorkspaceStopRecord {
+      const record = {
+        pendingAdmissions: new Set([captured]),
+        capturedTurns: new Set<symbol>(),
+        cleanupInFlight: 0,
+      } as unknown as WorkspaceStopRecord;
+      captured.capturedBy.add(record);
+      return record;
+    }
+
+    test("an admitted send is the object the task's set holds; it is owned only under the owner's id", () => {
+      const { ledger } = createHarness();
+      begin(ledger, OTHER);
+      const unownedToken = admit(ledger);
+      const unowned = onlySend(ledger);
+      expect(unowned.token).toBe(unownedToken);
+      expect(unowned.attemptId).toBe(ATTEMPT);
+      expect(unowned.attempt).toBeUndefined();
+      expect(ledger.sendsOf(TASK)).toBe(ledger.admittedSendsByTaskId.get(TASK)!);
+
+      const owner = begin(ledger, ATTEMPT);
+      admit(ledger, ATTEMPT);
+      const [, owned] = [...ledger.sendsOf(TASK)];
+      expect(owned.attempt).toBe(owner);
+    });
+
+    test("an empty workspace id is refused; any other id is classified", () => {
+      const { ledger } = createHarness();
+      expect(() => ledger.admitTaskWorkspaceTurn("", { acceptanceOrigin: "manual" })).toThrow();
+      expect(ledger.admitTaskWorkspaceTurn("t", { acceptanceOrigin: "manual" })).toEqual({
+        kind: "not-a-task",
+      });
+    });
+
+    test("refusals and non-task sends register no obligation", () => {
+      const cases: Array<{
+        name: string;
+        arrange: (h: ReturnType<typeof createHarness>) => void;
+        expectedAttemptId?: string;
+        kind: "refused" | "not-a-task";
+      }> = [
+        {
+          name: "unreadable",
+          arrange: (h) => (h.state.config = new Error("EIO")),
+          kind: "refused",
+        },
+        {
+          name: "row gone for a decided send",
+          arrange: (h) => (h.state.config = configWithRow(undefined)),
+          expectedAttemptId: ATTEMPT,
+          kind: "refused",
+        },
+        {
+          name: "no row for an ordinary send",
+          arrange: (h) => (h.state.config = configWithRow(undefined)),
+          kind: "not-a-task",
+        },
+        {
+          name: "no parent",
+          arrange: (h) => (h.state.config = configWithRow({ taskAttemptId: ATTEMPT })),
+          kind: "not-a-task",
+        },
+        {
+          name: "retired",
+          arrange: (h) =>
+            (h.state.config = configWithRow({
+              parentWorkspaceId: PARENT,
+              taskAttemptId: ATTEMPT,
+              taskAttemptRetiredBy: { runId: "run", stepId: "step" },
+            })),
+          kind: "refused",
+        },
+        {
+          name: "pre-identity",
+          arrange: (h) => (h.state.config = configWithRow({ parentWorkspaceId: PARENT })),
+          kind: "not-a-task",
+        },
+        { name: "superseded", arrange: () => undefined, expectedAttemptId: OTHER, kind: "refused" },
+        { name: "stopping", arrange: (h) => (h.state.stopInProgress = true), kind: "refused" },
+        {
+          name: "closed",
+          arrange: (h) => h.ledger.closeAttemptAdmission(TASK, ATTEMPT, undefined, "closed"),
+          kind: "refused",
+        },
+      ];
+      for (const c of cases) {
+        const harness = createHarness();
+        c.arrange(harness);
+        const admission = harness.ledger.admitTaskWorkspaceTurn(TASK, {
+          acceptanceOrigin: "manual",
+          ...(c.expectedAttemptId != null ? { expectedAttemptId: c.expectedAttemptId } : {}),
+        });
+        expect({ name: c.name, kind: admission.kind }).toEqual({ name: c.name, kind: c.kind });
+        expect(harness.ledger.sendsOf(TASK).size).toBe(0);
+      }
+    });
+
+    test("disposal before admission discharges the send, then prunes, then rechecks only the current stop", () => {
+      const { ledger, state, events } = createHarness();
+      const token = admit(ledger);
+      const pending = onlySend(ledger);
+      const current = capture(pending);
+      const replaced = capture(pending);
+      state.currentStopRecord = current;
+
+      token.onDisposed("refused");
+      expect(pending.state).toBe("discharged");
+      expect(ledger.admittedSendsByTaskId.has(TASK)).toBe(false);
+      expect(current.pendingAdmissions.size).toBe(0);
+      expect(replaced.pendingAdmissions.size).toBe(0);
+      expect(pending.capturedBy.size).toBe(0);
+      expect(events).toEqual([`prune:${TASK}`, `recheckStop:${TASK}`]);
+
+      token.onDisposed("refused");
+      ledger.dischargeAdmittedSend(pending);
+      expect(events).toEqual([`prune:${TASK}`, `recheckStop:${TASK}`]);
+    });
+
+    test("the first admission binds the turn and owes each capturing stop one more stopStream", async () => {
+      const { ledger, events } = createHarness();
+      const token = admit(ledger);
+      const pending = onlySend(ledger);
+      const record = capture(pending);
+      const turn = Symbol("turn");
+
+      token.onAdmitted(turn);
+      expect(pending.state).toBe("admitted");
+      expect(pending.turnId).toBe(turn);
+      expect(record.pendingAdmissions.has(pending)).toBe(false);
+      expect(record.capturedTurns.has(turn)).toBe(true);
+      expect(record.cleanupInFlight).toBe(1);
+      expect(pending.capturedBy.size).toBe(0);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(record.cleanupInFlight).toBe(0);
+      expect(events).toEqual([`stopStream:${TASK}:abandonPartial=false`, `recheckStop:${TASK}`]);
+
+      // First admission wins; an admitted send belongs to its turn, not to a disposal.
+      token.onAdmitted(Symbol("other"));
+      token.onDisposed("no-work");
+      expect(pending.turnId).toBe(turn);
+      expect(pending.state).toBe("admitted");
+      expect(token.admissionStale()).toBe(false);
+    });
+
+    test("a discharged send is never re-admitted", () => {
+      const { ledger } = createHarness();
+      const token = admit(ledger);
+      const pending = onlySend(ledger);
+      token.onDisposed("canceled-before-admission");
+      token.onAdmitted(Symbol("late"));
+      expect(pending.state).toBe("discharged");
+      expect(pending.turnId).toBeUndefined();
+      expect(token.admissionStale()).toBe(true);
+    });
+
+    test("staleness and the dequeue gate follow the attempt, its owner and its stream end", () => {
+      const { ledger, state } = createHarness();
+      begin(ledger, ATTEMPT);
+      const token = admit(ledger);
+      const decision = (outcome: StreamEndDecision["outcome"]): StreamEndDecision => ({
+        attempt: undefined,
+        attemptId: ATTEMPT,
+        messageId: "msg-1",
+        outcome,
+        turn: undefined,
+      });
+      expect(token.admissionStale()).toBe(false);
+      expect(token.resolveDispatch?.()).toBe("proceed");
+
+      state.streamEnd = decision("pending");
+      expect(token.admissionStale()).toBe(true);
+      token.onEnqueued();
+      // Enqueued: the queue's gate holds or refuses instead of the staleness probe.
+      expect(token.admissionStale()).toBe(false);
+      expect(token.resolveDispatch?.()).toBe("hold");
+      state.streamEnd = decision("published");
+      expect(token.resolveDispatch?.()).toEqual({
+        refuse: TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE,
+      });
+      state.streamEnd = decision("nonreport");
+      expect(token.resolveDispatch?.()).toBe("proceed");
+
+      begin(ledger, ATTEMPT);
+      expect(token.admissionStale()).toBe(true);
+    });
+
+    test("a pending send reads stale once its row rotates, a closure, a claim or a removal lands", () => {
+      const row = { parentWorkspaceId: PARENT, taskAttemptId: ATTEMPT };
+      const cases: Array<{ name: string; arrange: (h: ReturnType<typeof createHarness>) => void }> =
+        [
+          {
+            name: "rotated",
+            arrange: (h) => (h.state.config = configWithRow({ ...row, taskAttemptId: OTHER })),
+          },
+          {
+            name: "closed",
+            arrange: (h) => h.ledger.closeAttemptAdmission(TASK, ATTEMPT, undefined, "closed"),
+          },
+          {
+            name: "retired",
+            arrange: (h) =>
+              (h.state.config = configWithRow({ ...row, taskAttemptRetiredBy: { runId: "run" } })),
+          },
+          {
+            name: "removing",
+            arrange: (h) =>
+              (h.state.config = configWithRow({ ...row, pendingRemoval: { pid: 1 } })),
+          },
+        ];
+      for (const c of cases) {
+        const harness = createHarness();
+        const token = admit(harness.ledger);
+        expect({ name: c.name, stale: token.admissionStale() }).toEqual({
+          name: c.name,
+          stale: false,
+        });
+        c.arrange(harness);
+        expect({ name: c.name, stale: token.admissionStale() }).toEqual({
+          name: c.name,
+          stale: true,
+        });
+      }
+    });
+
+    test("an admitted send is neither a pending admission nor a live reawakening once its turn ends", () => {
+      const { ledger } = createHarness();
+      admit(ledger).onAdmitted(Symbol("turn"));
+      expect(ledger.hasPendingAdmissions(TASK)).toBe(false);
+      expect(ledger.hasLiveReawakening(TASK)).toBe(false);
+    });
+
+    test("pending admissions and live reawakenings", () => {
+      const { ledger, state } = createHarness();
+      expect(ledger.hasLiveReawakening(TASK)).toBe(false);
+      ledger.beginReawakening(TASK, ATTEMPT);
+      expect(ledger.hasLiveReawakening(TASK)).toBe(true);
+      ledger.endReawakening(TASK, OTHER);
+      expect(ledger.hasLiveReawakening(TASK)).toBe(true);
+      ledger.endReawakening(TASK, ATTEMPT);
+      expect(ledger.hasLiveReawakening(TASK)).toBe(false);
+
+      admit(ledger);
+      expect(ledger.hasPendingAdmissions(TASK)).toBe(true);
+      expect(ledger.hasLiveReawakening(TASK)).toBe(true);
+      // A send that reads stale is no continuation to protect.
+      state.stopInProgress = true;
+      expect(ledger.hasLiveReawakening(TASK)).toBe(false);
+      state.activeTurn = Symbol("turn");
+      expect(ledger.hasLiveReawakening(TASK)).toBe(true);
+      state.config = configWithRow({ parentWorkspaceId: PARENT, taskAttemptId: OTHER });
+      expect(ledger.hasPendingAdmissions(TASK)).toBe(false);
+    });
+
+    test("a stream event belongs to the turn's direct admission before an inherited or owned one", () => {
+      const { ledger, state } = createHarness();
+      const owner = begin(ledger, OTHER);
+      expect(ledger.resolveStreamAttemptAtEvent(TASK)).toEqual({
+        ownedAttempt: owner,
+        unownedAttemptId: undefined,
+      });
+      const turn = Symbol("turn");
+      state.activeTurn = turn;
+      const token = admit(ledger);
+      token.onAdmitted(turn);
+      expect(ledger.resolveStreamAttemptAtEvent(TASK)).toEqual({
+        ownedAttempt: undefined,
+        unownedAttemptId: ATTEMPT,
+      });
+    });
+
+    test("an inherited obligation counts only when the turn has no direct admission", () => {
+      const { ledger, state } = createHarness();
+      const turn = Symbol("turn");
+      state.activeTurn = turn;
+      // Rebound from a superseded predecessor (recordWorkspaceTurnSuperseded) under OTHER.
+      admit(ledger).onAdmitted(turn);
+      const inherited = onlySend(ledger) as AdmittedSend & { attemptId: string };
+      Object.assign(inherited, { attemptId: OTHER, inherited: true });
+      expect(ledger.resolveStreamAttemptAtEvent(TASK).unownedAttemptId).toBe(OTHER);
+
+      admit(ledger).onAdmitted(turn);
+      expect(ledger.resolveStreamAttemptAtEvent(TASK).unownedAttemptId).toBe(ATTEMPT);
+      // Another turn's admission says nothing about this one.
+      state.activeTurn = Symbol("next");
+      state.config = configWithRow({ parentWorkspaceId: PARENT, taskAttemptId: OTHER });
+      expect(ledger.resolveStreamAttemptAtEvent(TASK).unownedAttemptId).toBe(OTHER);
+    });
+  });
+
+  describe("lineage and unowned settlement proofs", () => {
+    let sessionsDir: string;
+    beforeEach(async () => {
+      sessionsDir = await fs.mkdtemp(path.join(os.tmpdir(), "attempt-ledger-proof-"));
+    });
+    afterEach(async () => {
+      await fs.rm(sessionsDir, { recursive: true, force: true });
+    });
+
+    const interruptedRow = (attemptId: string) =>
+      configWithRow({
+        parentWorkspaceId: PARENT,
+        taskAttemptId: attemptId,
+        taskStatus: "interrupted",
+      });
+
+    test("the owner's closing settlement is re-read after the closure wait", async () => {
+      const { ledger } = createHarness();
+      const owner = begin(ledger, ATTEMPT);
+      ledger.closeAttemptAdmission(TASK, ATTEMPT, owner, "stopping");
+      const entry: WorkspaceConfigEntry = {
+        path: "/project/task",
+        parentWorkspaceId: PARENT,
+        taskAttemptId: ATTEMPT,
+      };
+      const lineage = ledger.evaluateAttemptLineage(TASK, entry);
+      ledger.settleOwnedTaskAttempt(TASK, owner, "stopped");
+      expect(await lineage).toEqual({
+        proven: true,
+        reason: "predecessor settled by this process",
+      });
+    });
+
+    test("a receipt in the parent's dir proves the predecessor; one naming another parent does not", async () => {
+      const { ledger, state } = createHarness();
+      state.sessionsDir = sessionsDir;
+      const entry: WorkspaceConfigEntry = {
+        path: "/project/task",
+        parentWorkspaceId: PARENT,
+        taskAttemptId: ATTEMPT,
+      };
+      expect((await ledger.evaluateAttemptLineage(TASK, entry)).proven).toBe(false);
+      const target = { attemptId: ATTEMPT, parentWorkspaceId: PARENT, owners: [PARENT] };
+      expect(await ledger.writeSettlementReceipt(TASK, target, "idle-settled")).toBe(true);
+      expect((await ledger.evaluateAttemptLineage(TASK, entry)).proven).toBe(true);
+      expect(
+        (await ledger.evaluateAttemptLineage(TASK, { ...entry, parentWorkspaceId: ROOT })).proven
+      ).toBe(false);
+    });
+
+    test("a receipt copy that names another parent proves nothing", async () => {
+      const { ledger, state } = createHarness();
+      state.sessionsDir = sessionsDir;
+      // The parent's receipt fans out to ROOT's dir too, naming PARENT.
+      const target = { attemptId: ATTEMPT, parentWorkspaceId: PARENT, owners: [PARENT, ROOT] };
+      expect(await ledger.writeSettlementReceipt(TASK, target, "idle-settled")).toBe(true);
+      const entry: WorkspaceConfigEntry = {
+        path: "/project/task",
+        parentWorkspaceId: ROOT,
+        taskAttemptId: ATTEMPT,
+      };
+      expect(await ledger.evaluateAttemptLineage(TASK, entry)).toEqual({
+        proven: false,
+        reason: `settlement receipt names parent ${PARENT}, expected ${ROOT}`,
+      });
+      state.config = configWithRow({
+        parentWorkspaceId: ROOT,
+        taskAttemptId: ATTEMPT,
+        taskStatus: "interrupted",
+      });
+      expect(await ledger.readUnownedSettlementProof(TASK)).toEqual({
+        kind: "unproven",
+        reason: `settlement receipt names parent ${PARENT}`,
+      });
+    });
+
+    test("no id, marked lineage, an ineligible owner or no parent is unproven even with a receipt", async () => {
+      const { ledger, state } = createHarness();
+      state.sessionsDir = sessionsDir;
+      const target = { attemptId: ATTEMPT, parentWorkspaceId: PARENT, owners: [PARENT] };
+      expect(await ledger.writeSettlementReceipt(TASK, target, "idle-settled")).toBe(true);
+      const entry: WorkspaceConfigEntry = {
+        path: "/project/task",
+        parentWorkspaceId: PARENT,
+        taskAttemptId: ATTEMPT,
+      };
+      const unprovenEntries: WorkspaceConfigEntry[] = [
+        { ...entry, taskAttemptId: undefined },
+        { ...entry, taskAttemptUnproven: true },
+        { ...entry, parentWorkspaceId: undefined },
+      ];
+      for (const unproven of unprovenEntries) {
+        expect(await ledger.evaluateAttemptLineage(TASK, unproven)).toMatchObject({
+          proven: false,
+        });
+      }
+      begin(ledger, ATTEMPT, false);
+      expect(await ledger.evaluateAttemptLineage(TASK, entry)).toEqual({
+        proven: false,
+        reason: "predecessor owned but not receipt-eligible",
+      });
+    });
+
+    test("an unowned proof needs the receipt and the same row before and after reading it", async () => {
+      const { ledger, state } = createHarness();
+      state.sessionsDir = sessionsDir;
+      state.config = interruptedRow(ATTEMPT);
+      expect(await ledger.readUnownedSettlementProof(TASK)).toMatchObject({ kind: "unproven" });
+      const target = { attemptId: ATTEMPT, parentWorkspaceId: PARENT, owners: [PARENT] };
+      expect(await ledger.writeSettlementReceipt(TASK, target, "idle-settled")).toBe(true);
+      expect(await ledger.readUnownedSettlementProof(TASK)).toEqual({
+        kind: "proven",
+        attemptId: ATTEMPT,
+      });
+
+      // Another writer admitted, re-ran or marked the attempt while the receipt was read.
+      const changed = { parentWorkspaceId: PARENT, taskAttemptId: ATTEMPT };
+      for (const latest of [
+        interruptedRow(OTHER),
+        configWithRow({ ...changed, taskStatus: "running" }),
+        configWithRow({ ...changed, taskStatus: "interrupted", taskAttemptUnproven: true }),
+      ]) {
+        state.nextConfigs = [interruptedRow(ATTEMPT), latest];
+        expect(await ledger.readUnownedSettlementProof(TASK)).toEqual({
+          kind: "unproven",
+          reason: "the attempt changed while its receipt was read",
+        });
+      }
+      // A strict re-read that fails is no evidence (never the lenient empty view).
+      state.nextConfigs = [interruptedRow(ATTEMPT), new Error("EIO")];
+      expect(await ledger.readUnownedSettlementProof(TASK)).toEqual({
+        kind: "unproven",
+        reason: "config unreadable: EIO",
+      });
+    });
+  });
+
+  describe("workflow claims", () => {
+    const CLAIMANT = { runId: "run", stepId: "step", inputHash: "hash" };
+    const claimableRow = () => ({
+      parentWorkspaceId: PARENT,
+      taskAttemptId: ATTEMPT,
+      taskStatus: "interrupted",
+      workflowTask: { runId: CLAIMANT.runId, stepId: CLAIMANT.stepId },
+    });
+    const rowOf = (state: HarnessState, id = TASK) =>
+      findWorkspaceEntry(state.config as ProjectsConfig, id)?.workspace;
+
+    test("a granted claim retires the attempt, is confirmed, and then settles the goal pause", async () => {
+      const { ledger, state, events } = createHarness();
+      state.config = configWithRow(claimableRow());
+      const claim = await ledger.claimRetiredAttempt(TASK, ATTEMPT, CLAIMANT);
+      if (!claim.success) throw new Error(claim.error);
+      expect(rowOf(state)?.taskAttemptRetiredBy).toMatchObject({
+        runId: CLAIMANT.runId,
+        attemptId: ATTEMPT,
+        nonce: claim.data.nonce,
+      });
+      expect(events).toEqual([`settleGoalPause:${TASK}`]);
+
+      // The same step re-stamps with a fresh nonce.
+      const again = await ledger.claimRetiredAttempt(TASK, ATTEMPT, CLAIMANT);
+      if (!again.success) throw new Error(again.error);
+      expect(again.data.nonce).not.toBe(claim.data.nonce);
+    });
+
+    test("a live attempt, a refused row, a failed or lost write and an unconfirmed claim refuse", async () => {
+      const cases: Array<{ name: string; arrange: (h: ReturnType<typeof createHarness>) => void }> =
+        [
+          { name: "attempt is live", arrange: (h) => (h.state.activeTurn = Symbol("turn")) },
+          { name: "attempt is live", arrange: (h) => (h.state.streaming = true) },
+          { name: "attempt is live", arrange: (h) => (h.state.liveRegistration = {}) },
+          { name: "attempt is live", arrange: (h) => (h.state.stopInProgress = true) },
+          {
+            name: "attempt is running",
+            arrange: (h) =>
+              (h.state.config = configWithRow({ ...claimableRow(), taskStatus: "running" })),
+          },
+          {
+            name: "the task does not belong to this workflow step",
+            arrange: (h) =>
+              (h.state.config = configWithRow({
+                ...claimableRow(),
+                workflowTask: { runId: CLAIMANT.runId, stepId: "other-step" },
+              })),
+          },
+          {
+            name: "the retired attempt already has replacement",
+            arrange: (h) =>
+              (h.state.config = configWithRow({
+                ...claimableRow(),
+                taskAttemptRetiredBy: { ...CLAIMANT, attemptId: ATTEMPT, replacementTaskId: "r" },
+              })),
+          },
+          {
+            name: "the attempt was retired by another workflow step",
+            arrange: (h) =>
+              (h.state.config = configWithRow({
+                ...claimableRow(),
+                taskAttemptRetiredBy: { ...CLAIMANT, attemptId: ATTEMPT, stepId: "other-step" },
+              })),
+          },
+          {
+            name: "claim lost: the task now names attempt",
+            arrange: (h) =>
+              (h.state.config = configWithRow({ ...claimableRow(), taskAttemptId: OTHER })),
+          },
+          {
+            name: "task record not found",
+            arrange: (h) => (h.state.config = configWithRow(undefined)),
+          },
+          { name: "claim write failed", arrange: (h) => (h.state.editError = new Error("EIO")) },
+          { name: "claim lost", arrange: (h) => (h.state.dropEdits = true) },
+          {
+            // The edit lands, then the strict re-read fails.
+            name: "claim unconfirmed: config unreadable",
+            arrange: (h) => h.state.nextConfigs.push(new Error("EIO")),
+          },
+        ];
+      for (const c of cases) {
+        const harness = createHarness();
+        harness.state.config = configWithRow(claimableRow());
+        c.arrange(harness);
+        const claim = await harness.ledger.claimRetiredAttempt(TASK, ATTEMPT, CLAIMANT);
+        expect({ name: c.name, success: claim.success }).toEqual({ name: c.name, success: false });
+        if (!claim.success) expect(claim.error.startsWith(c.name)).toBe(true);
+        expect(harness.events).not.toContain(`settleGoalPause:${TASK}`);
+      }
+    });
+
+    test("empty ids are refused; one-character ids are not", async () => {
+      const { ledger } = createHarness();
+      const rejected = (promise: Promise<unknown>) =>
+        promise.then(
+          () => false,
+          () => true
+        );
+      const claimant = { runId: "r", stepId: "s", inputHash: "" };
+      expect(await rejected(ledger.claimRetiredAttempt("", ATTEMPT, claimant))).toBe(true);
+      expect(
+        await rejected(ledger.claimRetiredAttempt("t", ATTEMPT, { ...claimant, runId: "" }))
+      ).toBe(true);
+      expect(
+        await rejected(ledger.claimRetiredAttempt("t", ATTEMPT, { ...claimant, stepId: "" }))
+      ).toBe(true);
+      expect(await ledger.claimRetiredAttempt("t", ATTEMPT, claimant)).toEqual({
+        success: false,
+        error: "task record not found",
+      });
+      expect(await rejected(ledger.tombstoneUnpublishedReservation("", "t"))).toBe(true);
+      expect(await rejected(ledger.tombstoneUnpublishedReservation("p", ""))).toBe(true);
+      expect(await ledger.tombstoneUnpublishedReservation("p", "t")).toEqual({
+        success: false,
+        error: "parent record not found",
+      });
+    });
+
+    test("a tombstone is written on the parent once and confirmed by a strict re-read", async () => {
+      const { ledger, state } = createHarness();
+      state.config = configWithRows([{ id: PARENT }]);
+      expect(await ledger.tombstoneUnpublishedReservation(PARENT, TASK)).toEqual(Ok(undefined));
+      expect(await ledger.tombstoneUnpublishedReservation(PARENT, TASK)).toEqual(Ok(undefined));
+      expect(rowOf(state, PARENT)?.taskReservationTombstones).toEqual([TASK]);
+    });
+
+    test("an owned attempt, a published task, a missing parent and a failed or lost write refuse", async () => {
+      const cases: Array<{ name: string; arrange: (h: ReturnType<typeof createHarness>) => void }> =
+        [
+          { name: "this process owns an attempt for the task", arrange: (h) => begin(h.ledger) },
+          {
+            name: "the task was published",
+            arrange: (h) => (h.state.config = configWithRows([{ id: PARENT }, { id: TASK }])),
+          },
+          {
+            name: "parent record not found",
+            arrange: (h) => (h.state.config = configWithRows([])),
+          },
+          {
+            name: "tombstone write failed",
+            arrange: (h) => (h.state.editError = new Error("EIO")),
+          },
+          { name: "tombstone lost", arrange: (h) => (h.state.dropEdits = true) },
+          {
+            name: "tombstone unconfirmed: config unreadable",
+            arrange: (h) => h.state.nextConfigs.push(new Error("EIO")),
+          },
+        ];
+      for (const c of cases) {
+        const harness = createHarness();
+        harness.state.config = configWithRows([{ id: PARENT }]);
+        c.arrange(harness);
+        const result = await harness.ledger.tombstoneUnpublishedReservation(PARENT, TASK);
+        expect({ name: c.name, success: result.success }).toEqual({ name: c.name, success: false });
+        if (!result.success) expect(result.error.startsWith(c.name)).toBe(true);
+      }
     });
   });
 });
