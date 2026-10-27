@@ -194,9 +194,9 @@ export interface AttemptLedgerDeps {
   ) => Promise<boolean>;
   settleChildGoalPause: (workspaceId: string) => Promise<void>;
   findStreamEndDecision: (taskId: string, attemptId: string) => StreamEndDecision | undefined;
-  /** Drop the stream-end decisions no send obligation can still read (TaskService). */
+  /** Drop the stream-end decisions no send obligation can still read (StreamEndLedger). */
   pruneStreamEndDecisions: (taskId: string) => void;
-  /** Drop every stream-end decision of the task (TaskService.streamEndDecisionsByTaskId). */
+  /** Drop every stream-end decision of the task (StreamEndLedger). */
   discardStreamEndDecisions: (taskId: string) => void;
   inspectAttemptOutcome: (
     taskId: string,

@@ -54,7 +54,9 @@ interface Internals {
     attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string }>;
     admittedSendsByTaskId: Map<string, Set<{ state: string; attemptId: string }>>;
   };
-  streamEndDecisionsByTaskId: Map<string, Array<{ attemptId: string; outcome: string }>>;
+  streamEndLedger: {
+    streamEndDecisionsByTaskId: Map<string, Array<{ attemptId: string; outcome: string }>>;
+  };
   taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
   workspaceEventLocks: { withLock<T>(key: string, operation: () => Promise<T>): Promise<T> };
@@ -346,7 +348,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
           // The session's terminal drain runs while TaskService still decides: the entry is HELD
           // — still queued, no turn claimed, nothing dispatched.
           await yieldMacrotasks(3);
-          expect(svc.streamEndDecisionsByTaskId.get(childId)?.[0]).toMatchObject({
+          expect(svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.[0]).toMatchObject({
             attemptId: attemptA,
           });
         }
@@ -368,7 +370,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
         // The follow-up's obligation was discharged exactly once and the decision pruned.
         expect(outstanding(svc, childId)).toHaveLength(0);
-        expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+        expect(svc.streamEndLedger.streamEndDecisionsByTaskId.has(childId)).toBe(false);
         // The follow-up is held by the session (nothing is pushed into the composer), refused
         // because the task reported — and published with that reason.
         expect(stack.heldTexts()).toEqual(["follow-up text"]);
@@ -507,7 +509,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       // Its obligation was discharged, and the decision is gone once the reporting turn settled
       // (bounded: nothing retained past the turn it was decided for).
       expect(outstanding(svc, childId)).toHaveLength(0);
-      expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+      expect(svc.streamEndLedger.streamEndDecisionsByTaskId.has(childId)).toBe(false);
       // After the turn settled, a manual send is a new admission that mints a fresh attempt.
       expect(await taskService.markInterruptedTaskRunning(childId)).toBe(false);
       expect(entryOf(config, childId)?.taskAttemptId).not.toBe(attemptA);
@@ -855,7 +857,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       );
       // The decision reads `nonreport` for as long as a queued reader (the nudge) is bound to A.
       expect(
-        (svc.streamEndDecisionsByTaskId.get(childId) ?? []).every(
+        (svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId) ?? []).every(
           (decision) => decision.outcome === "nonreport"
         )
       ).toBe(true);
@@ -896,7 +898,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       // Refused as indeterminate — not as a completed report and not as a plain stale attempt.
       expect(onCanceled).toHaveBeenCalledWith(TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE);
       expect(outstanding(svc, childId)).toHaveLength(0);
-      expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+      expect(svc.streamEndLedger.streamEndDecisionsByTaskId.has(childId)).toBe(false);
     } finally {
       await stack.cleanup();
     }
@@ -951,13 +953,14 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         ).toEqual(Ok(undefined));
         stack.endStream(0, {}, true);
         await until(
-          () => svc.streamEndDecisionsByTaskId.get(childId)?.[0]?.outcome === "pending",
+          () =>
+            svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.[0]?.outcome === "pending",
           "deferred decision"
         );
         await yieldMacrotasks(30);
-        expect(svc.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
-          "pending",
-        ]);
+        expect(
+          svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)
+        ).toEqual(["pending"]);
         expect(completions).toHaveLength(1);
 
         if (rowStatus === "reported") {
@@ -989,7 +992,8 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         });
         expect(report.reportMarkdown).toBe("Report from another backend.");
         await until(
-          () => svc.streamEndDecisionsByTaskId.get(childId)?.[0]?.outcome !== "pending",
+          () =>
+            svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.[0]?.outcome !== "pending",
           "decision settled"
         );
         await until(() => !workspaceService.hasQueuedMessages(childId), "queue drained");
@@ -1055,7 +1059,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(completions).toHaveLength(1);
       expect(stack.heldTexts()).toEqual(["follow-up text"]);
       expect(outstanding(svc, childId)).toHaveLength(0);
-      expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+      expect(svc.streamEndLedger.streamEndDecisionsByTaskId.has(childId)).toBe(false);
     } finally {
       gate.resolve();
       await stack.cleanup();
@@ -1175,7 +1179,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
     // Held: still queued, obligation still enqueued, decision pending.
     expect(workspaceService.hasQueuedMessages(childId)).toBe(true);
     expect(outstanding(svc, childId).map((send) => send.state)).toEqual(["enqueued"]);
-    expect(svc.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual(["pending"]);
+    expect(
+      svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)
+    ).toEqual(["pending"]);
     return { gate, attemptA, onCanceled };
   }
 
@@ -1205,13 +1211,16 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(onCanceled).toHaveBeenCalledWith("Queued message cleared before dispatch.");
       // The obligation is discharged by the clear; the decision still belongs to the handler.
       expect(outstanding(svc, childId)).toHaveLength(0);
-      expect(svc.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
-        "pending",
-      ]);
+      expect(
+        svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)
+      ).toEqual(["pending"]);
       expect(completions).toHaveLength(1);
       // Handler resumes: publishes and releases A; no reader is left, so the decision is dropped.
       gate.resolve();
-      await until(() => !svc.streamEndDecisionsByTaskId.has(childId), "decision pruned");
+      await until(
+        () => !svc.streamEndLedger.streamEndDecisionsByTaskId.has(childId),
+        "decision pruned"
+      );
       await until(() => !svc.attemptLedger.ownedAttemptByTaskId.has(childId), "attempt released");
       await yieldMacrotasks(5);
       expect(entryOf(config, childId)).toMatchObject({
@@ -1256,12 +1265,15 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(outstanding(svc, childId)).toHaveLength(0);
       expect(svc.taskStopLatch.workspaceStopRecords.has(childId)).toBe(false);
       expect(taskService.isWorkspaceStopInProgress(childId)).toBe(false);
-      expect(svc.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)).toEqual([
-        "pending",
-      ]);
+      expect(
+        svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId)?.map((d) => d.outcome)
+      ).toEqual(["pending"]);
       expect(completions).toHaveLength(1);
       gate.resolve();
-      await until(() => !svc.streamEndDecisionsByTaskId.has(childId), "decision pruned");
+      await until(
+        () => !svc.streamEndLedger.streamEndDecisionsByTaskId.has(childId),
+        "decision pruned"
+      );
       await until(() => !svc.attemptLedger.ownedAttemptByTaskId.has(childId), "attempt released");
       await yieldMacrotasks(5);
       expect(entryOf(config, childId)).toMatchObject({
@@ -1351,7 +1363,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(completions).toHaveLength(1);
       expect(stack.heldTexts()).toEqual(["follow-up text"]);
       expect(outstanding(svc, childId)).toHaveLength(0);
-      expect(svc.streamEndDecisionsByTaskId.has(childId)).toBe(false);
+      expect(svc.streamEndLedger.streamEndDecisionsByTaskId.has(childId)).toBe(false);
       // The hold came from the decision alone: no ownership (settlement/receipt authority) granted.
       expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
       expect(entryOf(config, childId)?.taskAttemptId).toBe(redriven);
@@ -1394,7 +1406,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       stack.endStream(0, { report: "done by the re-drive" }, true);
       // No decision of the ended stream is ever keyed by B.
       expect(
-        (svc.streamEndDecisionsByTaskId.get(childId) ?? []).map((decision) => decision.attemptId)
+        (svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId) ?? []).map(
+          (decision) => decision.attemptId
+        )
       ).not.toContain(foreign);
       await until(() => completions.length === 2, "B's follow-up dispatched");
       await yieldMacrotasks(20);
@@ -1457,7 +1471,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await until(() => rotated, "the publication write");
       await until(
         () =>
-          !(svc.streamEndDecisionsByTaskId.get(childId) ?? []).some((d) => d.outcome === "pending"),
+          !(svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId) ?? []).some(
+            (d) => d.outcome === "pending"
+          ),
         "the decision resolved"
       );
       await yieldMacrotasks(20);
@@ -1472,7 +1488,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       ).toBeNull();
       // The re-drive's decision stayed keyed by its own attempt, and no ownership was granted.
       expect(
-        (svc.streamEndDecisionsByTaskId.get(childId) ?? []).map((decision) => decision.attemptId)
+        (svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId) ?? []).map(
+          (decision) => decision.attemptId
+        )
       ).not.toContain(foreign);
       expect(redriven).not.toBe(foreign);
       expect(svc.attemptLedger.ownedAttemptByTaskId.has(childId)).toBe(false);
@@ -1533,7 +1551,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
         await until(() => rotated, "the rotation");
         await until(
           () =>
-            !(svc.streamEndDecisionsByTaskId.get(childId) ?? []).some(
+            !(svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId) ?? []).some(
               (decision) => decision.outcome === "pending"
             ),
           "the decision resolved"
@@ -1658,7 +1676,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       await rotation;
       await until(
         () =>
-          !(svc.streamEndDecisionsByTaskId.get(childId) ?? []).some((d) => d.outcome === "pending"),
+          !(svc.streamEndLedger.streamEndDecisionsByTaskId.get(childId) ?? []).some(
+            (d) => d.outcome === "pending"
+          ),
         "the decision resolved"
       );
       await yieldMacrotasks(20);

@@ -83,7 +83,9 @@ interface Internals {
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
   writeSettlementReceipt: (...args: unknown[]) => Promise<boolean>;
   workspaceEventLocks: { withLock: <T>(key: string, fn: () => Promise<T>) => Promise<T> };
-  streamEndDecisionsByTaskId: Map<string, Array<{ attemptId: string; outcome: string }>>;
+  streamEndLedger: {
+    streamEndDecisionsByTaskId: Map<string, Array<{ attemptId: string; outcome: string }>>;
+  };
 }
 const internals = (service: TaskService) => service as unknown as Internals;
 
@@ -1202,9 +1204,9 @@ describe("TaskService settlement receipt producers (G2)", () => {
       const gate = Promise.withResolvers<void>();
       const held = svc.workspaceEventLocks.withLock(taskId, () => gate.promise);
       emitter.emit("stream-end", streamEnd(taskId, "assistant-1"));
-      expect(svc.streamEndDecisionsByTaskId.get(taskId)?.map((d) => d.outcome)).toEqual([
-        "pending",
-      ]);
+      expect(
+        svc.streamEndLedger.streamEndDecisionsByTaskId.get(taskId)?.map((d) => d.outcome)
+      ).toEqual(["pending"]);
       const { stopped } = await startStopAwaitingRelease(taskService, rootId, taskId);
       // Every other release condition holds once the cleanup paid back; the pending decision
       // alone keeps the latch, and no receipt write has even begun.
@@ -1249,16 +1251,16 @@ describe("TaskService settlement receipt producers (G2)", () => {
       });
       emitter.emit("stream-end", streamEnd(taskId, "assistant-1", "done"));
       await waitForCondition(() => blocked);
-      expect(svc.streamEndDecisionsByTaskId.get(taskId)?.map((d) => d.outcome)).toEqual([
-        "pending",
-      ]);
+      expect(
+        svc.streamEndLedger.streamEndDecisionsByTaskId.get(taskId)?.map((d) => d.outcome)
+      ).toEqual(["pending"]);
       const { stopped } = await startStopAwaitingRelease(taskService, rootId, taskId);
       await new Promise((resolve) => setImmediate(resolve));
       await expectNoReceipt(config, taskId, attemptId);
       gate.resolve();
       expect((await stopped).success).toBe(true);
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
-      await waitForCondition(() => !svc.streamEndDecisionsByTaskId.has(taskId));
+      await waitForCondition(() => !svc.streamEndLedger.streamEndDecisionsByTaskId.has(taskId));
       expect(entryOf(config, taskId)).toMatchObject({
         taskStatus: "reported",
         taskAttemptId: attemptId,
