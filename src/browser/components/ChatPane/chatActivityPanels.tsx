@@ -135,19 +135,31 @@ export function useReleaseChatActivityPanelOnUnmount(id: ChatActivityId | undefi
   }, [setOpenId, id]);
 }
 
+/** Whether `target` is in the open activity sheet whose slots are `sheet`. */
+function isInOpenSheet(target: EventTarget | null, sheet: ChatActivitySheetSlots | null): boolean {
+  // The dialog role is set only while the sheet is open.
+  const dialog = sheet?.body.closest('[role="dialog"]');
+  return target instanceof Node && dialog?.contains(target) === true;
+}
+
 /**
  * Whether a window keydown is the chord that opens a live-line panel in this pane. The main chat
  * and each /side chat mount their own line, so only the pane owning the focused element reacts.
  * `element` is in the line: under immersive review desktop keeps the chat pane mounted but inert.
+ * `sheet` is the line's activity sheet (phones and short windows): a modal over an inert page,
+ * chips included, whose panels the chords still switch and close while focus is in it.
  */
 export function acceptsActivityPanelChord(
   event: KeyboardEvent,
   keybind: Keybind,
   paneScope: ChatPaneScope,
-  element: Element | null
+  element: Element | null,
+  sheet: ChatActivitySheetSlots | null
 ): boolean {
   // Ctrl+Alt chords must not claim AltGr input, which types characters.
-  if (!matchesKeybind(event, keybind) || isAltGraphPressed(event) || isDialogOpen()) return false;
+  if (!matchesKeybind(event, keybind) || isAltGraphPressed(event)) return false;
+  if (isInOpenSheet(event.target, sheet)) return true;
+  if (isDialogOpen()) return false;
   if (!paneHandlesKeyEvent(paneScope, event.target)) return false;
   if (isCommandPaletteTarget(event.target)) return false;
   // The terminal and the browser and desktop viewports own their keystrokes.

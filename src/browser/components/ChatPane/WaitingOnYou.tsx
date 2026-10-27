@@ -358,20 +358,24 @@ function WaitingCountBadge(props: { count: number; label?: boolean; className?: 
 }
 
 /**
- * When the item on show leaves while others still wait (a question answered from the card or the
- * sheet), focus inside it falls to the page: behind the sheet's inert page on phones. Move it to
- * `target` (what now shows the next item) instead. Only when focus did fall: a click elsewhere
- * keeps its own.
+ * When an item that can hold focus (`focusable`) leaves while others still wait (a question
+ * answered from the card or the sheet, a focused sheet row whose queued message sent itself),
+ * focus inside it falls to the page: behind the sheet's inert page on phones. Move it to `target`
+ * (what now shows the next item) instead. Only when focus did fall: a click elsewhere keeps its
+ * own.
  */
-function useFocusWhenShownItemLeaves(
+function useFocusWhenItemLeaves(
   card: WaitingOnYouCardState,
+  focusable: ReadonlyArray<WaitingOnYouId | null>,
   target: () => HTMLElement | null | undefined
 ): void {
-  const shownRef = useRef(card.selected);
+  const focusableRef = useRef(focusable);
   useLayoutEffect(() => {
-    const shown = shownRef.current;
-    shownRef.current = card.selected;
-    if (shown === null || card.entries.some(([id]) => id === shown)) return;
+    const before = focusableRef.current;
+    focusableRef.current = focusable;
+    const listed = (id: WaitingOnYouId | null) =>
+      id === null || card.entries.some(([entry]) => entry === id);
+    if (before.every(listed)) return;
     if (document.activeElement !== null && document.activeElement !== document.body) return;
     target()?.focus({ preventScroll: true });
   });
@@ -437,7 +441,8 @@ function WaitingOnYouTabs(props: { card: WaitingOnYouCardState; panelId: string 
   const card = props.card;
   const count = card.entries.length;
   const tablistRef = useRef<HTMLDivElement>(null);
-  useFocusWhenShownItemLeaves(card, () =>
+  // The item on show: its tab and content. The other tabs leave the Tab order (a roving tabindex).
+  useFocusWhenItemLeaves(card, [card.selected], () =>
     tablistRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
   );
   return (
@@ -520,7 +525,12 @@ function WaitingOnYouSummary(props: { card: WaitingOnYouCardState }) {
   ].join(" · ");
   const others = card.entries.filter(([id]) => id !== card.selected);
   const sheetHostRef = useRef<HTMLDivElement | null>(null);
-  useFocusWhenShownItemLeaves(card, () => (card.sheetOpen ? sheetHostRef.current : null));
+  // Every item: the one on show in the sheet, and a row for each of the others.
+  useFocusWhenItemLeaves(
+    card,
+    card.entries.map(([id]) => id),
+    () => (card.sheetOpen ? sheetHostRef.current : null)
+  );
   return (
     <>
       <ChatDockSurface>

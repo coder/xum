@@ -380,6 +380,22 @@ describe("Waiting on you", () => {
       expect(sheet.contains(document.activeElement)).toBe(true);
     });
 
+    it("keeps focus in the open sheet when a focused row's item leaves", () => {
+      const view = render(<Stack question unsent queued />);
+      fireEvent.click(view.getByRole("button", { name: /Which reviewers\?/ }));
+      const sheet = view.getByRole("dialog", { name: /Waiting on you/ });
+      const others = within(sheet).getByRole("list", { name: "Also waiting" });
+      within(others)
+        .getByRole("button", { name: /Queued/ })
+        .focus();
+
+      // The queued message sends itself; two items still wait, the one on show included.
+      view.rerender(<Stack question unsent />);
+      expect(view.getByRole("dialog", { name: /Waiting on you/ })).toBe(sheet);
+      expect(within(sheet).queryByRole("button", { name: /Queued/ })).toBeNull();
+      expect(sheet.contains(document.activeElement)).toBe(true);
+    });
+
     it("puts the item on show back inline, same node and focus, when only one is left", () => {
       const view = render(<Stack question unsent />);
       const summary = view.getByRole("button", { name: /Which reviewers\?/ });

@@ -413,6 +413,28 @@ async function assertSheetFocusWhenChipHides(line: HTMLElement, workspaceId: str
   );
 }
 
+// The sheet is a modal over the page, its chips included: from inside it the chords still swap
+// its panels and close them, and closing puts focus back in the composer.
+async function assertSheetChords(canvasElement: HTMLElement) {
+  const composer = canvasElement.querySelector<HTMLTextAreaElement>("textarea");
+  if (composer === null) throw new Error("No composer textarea");
+  composer.focus();
+  await userEvent.keyboard("{Control>}{Alt>}r{/Alt}{/Control}");
+  const sheet = await screen.findByRole("dialog", { name: "Activity" });
+  const reviews = await findChatActivityPanel();
+  await expect(reviews).toHaveAccessibleName("Reviews");
+  await waitFor(() => expect(reviews.contains(document.activeElement)).toBe(true));
+
+  await userEvent.keyboard("{Control>}{Shift>}J{/Shift}{/Control}");
+  await waitFor(() =>
+    expect(within(sheet).getByRole("tabpanel")).toHaveAccessibleName("Background bashes")
+  );
+  await waitFor(() => expect(document.activeElement?.closest("[data-process-row]")).not.toBeNull());
+  await userEvent.keyboard("{Control>}{Shift>}J{/Shift}{/Control}");
+  await waitFor(() => expect(screen.queryByRole("dialog", { name: "Activity" })).toBeNull());
+  await waitFor(() => expect(composer).toHaveFocus());
+}
+
 // The line opens its panels in the phone sheet by matchMedia, so a phone-sized frame inside a
 // desktop window would test the popover. The Storybook test-runner applies no globals.viewport:
 // .storybook/test-runner.ts gives this story a real phone viewport instead.
@@ -431,5 +453,6 @@ export const WorstCasePhone: AppStory = {
     await assertPanels(line, "sheet");
     await assertSheetTabs(line);
     await assertSheetFocusWhenChipHides(line, "ws-activity-line-phone");
+    await assertSheetChords(canvasElement);
   },
 };

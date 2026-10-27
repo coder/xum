@@ -206,10 +206,11 @@ function usePanelChord(options: {
   const { keybind, open, panelId, chipRef, returnFocusRef, onOpen, onClose, requestFocus } =
     options;
   const paneScope = useChatPaneScope();
+  const sheet = useChatActivitySheet();
   useEffect(() => {
     if (keybind === undefined) return;
     const onKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (!acceptsActivityPanelChord(event, keybind, paneScope, chipRef.current)) return;
+      if (!acceptsActivityPanelChord(event, keybind, paneScope, chipRef.current, sheet)) return;
       event.preventDefault();
       if (event.repeat) return;
       const panel = document.getElementById(panelId);
@@ -226,7 +227,18 @@ function usePanelChord(options: {
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [keybind, open, panelId, paneScope, chipRef, returnFocusRef, onOpen, onClose, requestFocus]);
+  }, [
+    keybind,
+    open,
+    panelId,
+    paneScope,
+    sheet,
+    chipRef,
+    returnFocusRef,
+    onOpen,
+    onClose,
+    requestFocus,
+  ]);
 }
 
 /** The chip, its tab in the phone activity sheet, and its panel while open. */

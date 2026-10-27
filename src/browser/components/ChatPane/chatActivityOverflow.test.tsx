@@ -386,6 +386,27 @@ describe("panel shortcuts", () => {
     expect(view.queryByRole("group", { name: "Agents" })).toBeNull();
   });
 
+  // There the panels open in the sheet: a modal over the page, chips included.
+  it("swap and close the panels of the phone sheet from inside it", () => {
+    stubNarrowViewport(true);
+    stubLayout(400);
+    const view = render(<Line />);
+    const composer = view.getByRole("button", { name: "composer" });
+    composer.focus();
+    chord(composer, KEYBINDS.OPEN_REVIEWS_PANEL);
+    const sheet = view.getByRole("dialog", { name: "Activity" });
+    const reviewsRow = within(sheet).getByRole("button", { name: "Reviews row" });
+    expect(document.activeElement).toBe(reviewsRow);
+
+    chord(reviewsRow, KEYBINDS.OPEN_SUB_AGENTS_PANEL);
+    const agentsRow = within(sheet).getByRole("button", { name: "Agents row" });
+    expect(document.activeElement).toBe(agentsRow);
+
+    chord(agentsRow, KEYBINDS.OPEN_SUB_AGENTS_PANEL);
+    expect(view.queryByRole("dialog", { name: "Activity" })).toBeNull();
+    expect(document.activeElement).toBe(composer);
+  });
+
   it("leave the chord to a browser or desktop viewport that has focus", () => {
     stubLayout(400);
     const view = render(<Line />);

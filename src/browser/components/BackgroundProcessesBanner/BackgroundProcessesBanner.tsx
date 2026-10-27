@@ -8,7 +8,11 @@ import {
   ActivityChipLiveDot,
   ChatInputDecoration,
 } from "../ChatPane/ChatInputDecoration";
-import { acceptsActivityPanelChord, useChatActivityPanel } from "../ChatPane/chatActivityPanels";
+import {
+  acceptsActivityPanelChord,
+  useChatActivityPanel,
+  useChatActivitySheet,
+} from "../ChatPane/chatActivityPanels";
 import { formatKeyLabel } from "../Keycap/Keycap";
 import { formatElapsed } from "@/common/utils/formatDuration";
 import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
@@ -168,6 +172,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   // The main chat and the /side chat tab each mount a banner; the chord goes to the pane owning
   // the focused element so focus never jumps into the other chat's list.
   const paneScope = useChatPaneScope();
+  const sheet = useChatActivitySheet();
   // Listens only while there is something to focus, so the chord is not consumed otherwise.
   useEffect(() => {
     if (count === 0) return;
@@ -186,9 +191,8 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     };
     const onKeyDown = (event: KeyboardEvent) => {
       const root = rootRef.current;
-      if (!acceptsActivityPanelChord(event, KEYBINDS.FOCUS_BACKGROUND_PROCESSES, paneScope, root)) {
-        return;
-      }
+      const chord = KEYBINDS.FOCUS_BACKGROUND_PROCESSES;
+      if (!acceptsActivityPanelChord(event, chord, paneScope, root, sheet)) return;
       event.preventDefault();
       if (event.repeat) return;
       if (listRef.current?.contains(document.activeElement)) {
@@ -213,7 +217,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, onFocusRequest);
     };
-  }, [count, props.workspaceId, paneScope, setIsExpanded]);
+  }, [count, props.workspaceId, paneScope, sheet, setIsExpanded]);
 
   useEffect(() => {
     if (focusRequest > 0) focusProcessRow(listRef.current, 0);
