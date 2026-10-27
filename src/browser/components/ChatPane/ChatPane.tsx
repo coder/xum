@@ -1875,7 +1875,6 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                     </>
                   ) : (
                     <ChatInputPane
-                      showTurnStatus={shouldMountStreamingBarrier}
                       vimEnabled={vimEnabled}
                       onCancelCompaction={handleCancelCompactionFromBarrier}
                       kind={meta?.kind}
@@ -1971,8 +1970,6 @@ const TranscriptOnlyNoticePane: React.FC<{
 };
 
 interface ChatInputPaneProps {
-  /** See ChatActivityLine. */
-  showTurnStatus: boolean;
   vimEnabled: boolean;
   onCancelCompaction: () => void;
   kind?: "scratch";
@@ -2188,7 +2185,6 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
           banners arriving should bump the label and Stop across the screen. */}
       <ChatActivityLine
         workspaceId={props.workspaceId}
-        showTurnStatus={props.showTurnStatus}
         vimEnabled={props.vimEnabled}
         onCancelCompaction={props.onCancelCompaction}
         revealChips={props.revealDecorations}

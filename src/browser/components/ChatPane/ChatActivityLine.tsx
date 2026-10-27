@@ -1,6 +1,5 @@
 import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
-import { StreamingBarrierView } from "@/browser/features/Messages/ChatBarrier/StreamingBarrierView";
 import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { PinnedTodoList } from "../PinnedTodoList/PinnedTodoList";
 import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
@@ -10,8 +9,6 @@ import { ChatActivityPanelsProvider } from "./chatActivityPanels";
 
 interface ChatActivityLineProps {
   workspaceId: string;
-  /** A turn is live (or a bash monitor will wake the agent), so the line shows status and Stop. */
-  showTurnStatus: boolean;
   vimEnabled: boolean;
   onCancelCompaction: () => void;
   /**
@@ -58,22 +55,16 @@ export function ChatActivityLine(props: ChatActivityLineProps) {
         className="relative"
         dataComponent="ChatActivityLine"
       >
-        {props.showTurnStatus ? (
-          <StreamingBarrier
-            workspaceId={props.workspaceId}
-            vimEnabled={props.vimEnabled}
-            onCancelCompaction={props.onCancelCompaction}
-            showModelName={false}
-            activity={chips}
-          />
-        ) : (
-          <StreamingBarrierView
-            statusText={null}
-            cancelText=""
-            reserveStatsSlot={false}
-            activity={chips}
-          />
-        )}
+        {/* Always mounted, even between turns (it then shows only the chips): swapping it for
+            another component when a turn starts or ends would remount the chips, closing an open
+            panel and the bash output dialog and dropping their state. */}
+        <StreamingBarrier
+          workspaceId={props.workspaceId}
+          vimEnabled={props.vimEnabled}
+          onCancelCompaction={props.onCancelCompaction}
+          showModelName={false}
+          activity={chips}
+        />
       </ChatActivityPanelsProvider>
     </ChatDockSurface>
   );

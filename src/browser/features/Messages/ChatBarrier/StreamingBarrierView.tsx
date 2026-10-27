@@ -137,7 +137,7 @@ function ActivityChips(props: { showDivider: boolean; children: React.ReactNode 
       {/* Chips scroll sideways rather than wrap when a phone-width row runs out of room.
           No edge-fade mask here: a mask would also clip the chips' panels, which render
           inside this row but are positioned against the whole line. */}
-      <div className="scrollbar-none flex min-w-0 items-center gap-1.5 overflow-x-auto">
+      <div className="flex min-w-0 scrollbar-none items-center gap-1.5 overflow-x-auto">
         {props.children}
       </div>
     </>

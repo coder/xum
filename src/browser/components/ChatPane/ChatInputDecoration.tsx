@@ -148,7 +148,9 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
           onKeyDown={(event) => closeOnEscape(event, close)}
           className="bg-surface-primary border-border-medium absolute inset-x-0 bottom-full z-30 mb-1 flex max-h-[min(55vh,26rem)] flex-col overflow-hidden rounded-lg border shadow-lg"
         >
-          <div className="border-border-light flex h-8 shrink-0 items-center gap-2 border-b pr-1 pl-3 text-xs leading-none">
+          {/* min-h, not h: touch phones grow the Close button to 44px (globals.css), and the
+              panel clips overflow, so a fixed 32px header would cut its touch target. */}
+          <div className="border-border-light flex min-h-8 shrink-0 items-center gap-2 border-b pr-1 pl-3 text-xs leading-none">
             {props.summary}
             <button
               type="button"

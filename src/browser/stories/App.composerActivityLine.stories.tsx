@@ -11,6 +11,7 @@ import type { ComponentType } from "react";
 import { expect, userEvent, waitFor, within } from "storybook/test";
 
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
+import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { TodoItem } from "@/common/types/tools";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
@@ -40,6 +41,11 @@ const TODOS: TodoItem[] = [
   { content: "Merge the next PR in the stack", status: "pending" },
   { content: "Report the stack as merged", status: "pending" },
 ];
+
+// Set by the story setup so the play can end the streaming turn.
+let emitChat: (event: WorkspaceChatMessage) => void = () => {
+  throw new Error("ComposerActivityLine story setup has not run");
+};
 
 function setupActivityLineStory(workspaceId: string) {
   const parent = createWorkspace({
@@ -107,6 +113,14 @@ function setupActivityLineStory(workspaceId: string) {
     }),
   ];
 
+  const streaming = createStreamingChatHandler({
+    messages,
+    streamingMessageId: "msg-3",
+    model: DEFAULT_MODEL,
+    historySequence: 3,
+    streamText: "Checking CI on #30958.",
+  });
+
   return createMockORPCClient({
     projects: groupWorkspacesByProject(workspaces),
     workspaces,
@@ -114,13 +128,10 @@ function setupActivityLineStory(workspaceId: string) {
       new Map([
         [
           workspaceId,
-          createStreamingChatHandler({
-            messages,
-            streamingMessageId: "msg-3",
-            model: DEFAULT_MODEL,
-            historySequence: 3,
-            streamText: "Checking CI on #30958.",
-          }),
+          (callback) => {
+            emitChat = callback;
+            return streaming(callback);
+          },
         ],
       ])
     ),
@@ -215,6 +226,24 @@ async function assertPanels(line: HTMLElement) {
   await expect(chip).toHaveAttribute("aria-expanded", "false");
 }
 
+// A turn ending must not remount the chips: that would close the open panel (and a bash output
+// dialog opened from it) and drop the chips' state.
+async function assertPanelSurvivesTurnEnd(line: HTMLElement, workspaceId: string) {
+  await openChatActivityPanel(line, "PinnedTodoList");
+  emitChat({
+    type: "stream-end",
+    workspaceId,
+    messageId: "msg-3",
+    metadata: { model: DEFAULT_MODEL },
+    parts: [{ type: "text", text: "Checking CI on #30958." }],
+  });
+  emitChat({ type: "stream-lifecycle", workspaceId, phase: "idle", hadAnyOutput: true });
+  await waitFor(() =>
+    expect(within(line).queryByRole("button", { name: "Stop streaming" })).toBeNull()
+  );
+  await expect(within(line).getByText("Report the stack as merged")).toBeVisible();
+}
+
 export const WorstCaseDesktop: AppStory = {
   render: () => <AppWithMocks setup={() => setupActivityLineStory("ws-activity-line-desktop")} />,
   parameters: {
@@ -225,6 +254,7 @@ export const WorstCaseDesktop: AppStory = {
     const line = await findLine(canvasElement);
     await assertOneLine(line);
     await assertPanels(line);
+    await assertPanelSurvivesTurnEnd(line, "ws-activity-line-desktop");
   },
 };
 
