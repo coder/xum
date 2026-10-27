@@ -266,6 +266,35 @@ describe("TaskService claimed retirement (G2 PR B)", () => {
       }
     );
 
+    test("an unreadable failure artifact with an unreadable config proves no failure, even with a marker on disk", async () => {
+      const config = await setupChild("unreadconfig", {
+        taskLaunchError: "refused by the model",
+        taskTerminalFailure: { attemptId: ATTEMPT, errorType: "model_refusal" },
+      });
+      await writeReceipt(config, midId, "unreadconfig");
+      const failures = getSubagentFailureArtifactsFilePath(path.join(config.sessionsDir, midId));
+      await fsPromises.writeFile(failures, "{ not json", "utf-8");
+      const taskService = otherProcess(config);
+      // The marker is the only evidence left; a damaged config cannot show it (fail closed).
+      await fsPromises.writeFile(configFilePath(config.rootDir), "{ not json", "utf-8");
+      const outcome = await read(taskService, "unreadconfig");
+      expect(outcome.kind).toBe("indeterminate");
+      expect(outcome.kind === "indeterminate" && outcome.reason).toContain(
+        "failure artifact unreadable"
+      );
+    });
+
+    test("a row whose parent id is blank names no session dir: legacy indeterminate, never a receipt proof", async () => {
+      const config = await setupChild("blankparent", { parentWorkspaceId: "   " });
+      await writeReceipt(config, midId, "blankparent");
+      // No requester: the blank parent id cannot name where the report or receipt would be.
+      const outcome = await otherProcess(config).readAttemptOutcome("blankparent");
+      expect(outcome.kind).toBe("indeterminate");
+      expect(outcome.kind === "indeterminate" && outcome.reason).toContain(
+        "(legacy or prior-process attempt)"
+      );
+    });
+
     test.each([
       ["only an ancestor holds the receipt", {}, rootId, ATTEMPT],
       ["the receipt names an older attempt", {}, midId, "att_00000000000000c0"],

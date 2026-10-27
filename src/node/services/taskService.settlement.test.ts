@@ -61,6 +61,7 @@ import {
   streamEnd,
   stubStableIds,
   testTaskSettings,
+  workspaceTurnManagerFor,
 } from "@/node/services/taskService.testHarness";
 import {
   createTaskServiceHarness,
@@ -1761,6 +1762,68 @@ describe("TaskService", () => {
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
         kind: "live",
         executionId: taskId,
+      });
+    });
+
+    test("a workspace that is not an agent task is indeterminate, even with a report in the requester's session dir", async () => {
+      const { config } = await setupTree([]);
+      // A report keyed by the root's id: the agent-task check must decide before any artifact read.
+      await persistReport(config, unrelatedParentId, rootId, "not a task report");
+      const { taskService } = createTaskServiceHarness(config);
+      expect(
+        await taskService.readAttemptOutcome(rootId, { requestingWorkspaceId: unrelatedParentId })
+      ).toEqual({ kind: "indeterminate", reason: "workspace is not an agent task" });
+    });
+
+    test("a live workspace turn registration is live under its handle, ahead of interrupted config", async () => {
+      const taskId = "task-outcome-live-registration";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      const registration = spyOn(
+        workspaceTurnManagerFor(taskService),
+        "getLiveWorkspaceTurnRegistration"
+      ).mockImplementation((workspaceId) =>
+        workspaceId === taskId
+          ? { handleId: "wst_live_turn", ownerWorkspaceId: rootId, accepted: true }
+          : undefined
+      );
+      try {
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "live",
+          executionId: "wst_live_turn",
+        });
+      } finally {
+        registration.mockRestore();
+      }
+    });
+
+    test("paired: an owned settled attempt whose row is gone proves no report only through a session dir", async () => {
+      const taskId = "task-outcome-owned-rowless";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      await waitForOutcomeKind(taskService, taskId, "terminal-no-report");
+      // The row disappears outside this process (no TaskService path drops its ownership).
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          project.workspaces = project.workspaces.filter((entry) => entry.id !== taskId);
+        }
+        return cfg;
+      });
+      // No requester and no row: nothing names where a report would be, so nothing is proven.
+      expect(await taskService.readAttemptOutcome(taskId)).toEqual({
+        kind: "indeterminate",
+        reason: "attempt settled but no session directory names where its report would be",
+      });
+      // The requester's session dir positively holds no report: the owned settlement decides.
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+        code: "no-record",
       });
     });
 
