@@ -4145,6 +4145,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       failedMcpServers?: string[];
       // The enabled MCP servers this request lists (default: all).
       mcpServerNames?: string[];
+      // The requested model (default: Sonnet).
+      modelString?: string;
       agentId?: string;
       // Earlier turns, sent before the latest user message (or built from the earlier requests).
       history?: MuxMessage[] | ((requests: TurnExecutionOptions[]) => MuxMessage[]);
@@ -4277,7 +4279,7 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         const result = await harness.service.streamMessage({
           messages: [...history, createMuxMessage("latest-user", "user", "hello")],
           workspaceId,
-          modelString: KNOWN_MODELS.SONNET.id,
+          modelString: state.modelString ?? KNOWN_MODELS.SONNET.id,
           thinkingLevel: "off",
           agentId: state.agentId ?? "exec",
           contextBudgetRolloverAvailable: state.rolloverAvailable === true,
@@ -4456,6 +4458,35 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         }),
       ]);
     const lastRow = (request: TurnExecutionOptions) => JSON.stringify(request.messages.at(-1));
+
+    it("sends the MCP server list in the system prompt on a route without tail rows", async () => {
+      // F37: the <mcp> list moved to the volatile tail (#7653). OpenAI routes never send
+      // system rows, so the list must still reach the model in the system prompt, live.
+      using xumHome = new DisposableTempDir("ai-service-prefix-guard");
+      const {
+        requests: [first, changed],
+      } = await streamPair(
+        xumHome.path,
+        [
+          { modelString: KNOWN_MODELS.GPT.id },
+          {
+            modelString: KNOWN_MODELS.GPT.id,
+            mcpServerNames: ["alpha"],
+            history: instructionLedger,
+          },
+        ],
+        undefined,
+        "openai"
+      );
+      const systemText = (request: TurnExecutionOptions) =>
+        JSON.stringify([request.system, request.messages.filter((m) => m.role === "system")]);
+      expect(systemText(first)).toContain("<mcp>");
+      expect(systemText(first)).toContain("- beta");
+      expect(systemText(changed)).toContain("- alpha");
+      expect(systemText(changed)).not.toContain("- beta");
+      expect(changed.initialMetadata?.volatileSystemTail).toBeUndefined();
+      expect(JSON.stringify(changed.messages.at(-1))).not.toContain("<mcp>");
+    });
 
     it("sends an MCP server list change mid-segment as a tail row", async () => {
       // F35: turning one MCP server off rewrote the cached stable prompt in every busy
