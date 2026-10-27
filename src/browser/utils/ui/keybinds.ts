@@ -615,6 +615,9 @@ export const KEYBINDS = {
   /** Agent interface view: show or hide the transcript peek under the status page's bar */
   TOGGLE_STATUS_TRANSCRIPT_PEEK: { key: "p", code: "KeyP", ctrl: true, alt: true, shift: true },
 
+  /** Agent interface view: open Start Here from the agent's last reply, from the status page's bar */
+  STATUS_START_HERE: { key: "h", code: "KeyH", ctrl: true, alt: true, shift: true },
+
   // Artifacts tab shortcuts: only handled while focus is inside the Artifacts panel,
   // like the Review panel's single-key hunk navigation.
   /** Toggle fullscreen for the selected artifact */

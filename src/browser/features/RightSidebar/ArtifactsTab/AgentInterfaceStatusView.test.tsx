@@ -10,7 +10,7 @@ import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import * as WorkspaceStoreModule from "@/browser/stores/WorkspaceStore";
 import { workspaceStore, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
 import { overlayWorkspaceStoreRaw } from "@/browser/stores/workspaceStoreTestOverlay";
-import { KEYBINDS } from "@/browser/utils/ui/keybinds";
+import { KEYBINDS, type Keybind } from "@/browser/utils/ui/keybinds";
 import {
   createTestApiClient,
   resetTestExperiments,
@@ -129,6 +129,8 @@ const readRealWorkspaceStore = WorkspaceStoreModule.useWorkspaceStoreRaw;
 
 /** Workspace states the status bar reads, for workspaces the real store never registered. */
 const seededStates = new Map<string, WorkspaceState>();
+/** Seeded workspaces whose aggregator reports a stop in progress (WorkspaceStore.setInterrupting). */
+const interruptingWorkspaces = new Set<string>();
 const restoreSpies: Array<() => void> = [];
 
 function seedWorkspace(workspaceId: string, patch: Partial<WorkspaceState>) {
@@ -138,6 +140,10 @@ function seedWorkspace(workspaceId: string, patch: Partial<WorkspaceState>) {
       hasRegisteredWorkspace: (id: string) =>
         seededStates.has(id) || realStore.hasRegisteredWorkspace(id),
       getWorkspaceState: (id: string) => seededStates.get(id) ?? realStore.getWorkspaceState(id),
+      getAggregator: (id: string) =>
+        interruptingWorkspaces.has(id)
+          ? { hasInterruptingStream: (): boolean => true }
+          : realStore.getAggregator(id),
     });
     const storeSpy = spyOn(WorkspaceStoreModule, "useWorkspaceStoreRaw").mockReturnValue(store);
     // Start Here's transcript barrier: a seeded workspace has a complete replay.
@@ -264,6 +270,31 @@ function shownPage(view: ReturnType<typeof render>): string {
 }
 
 /**
+ * A press of `keybind`'s physical Ctrl+Alt+Shift chord at `target`, or AltGr's (`altGraph`):
+ * happy-dom infers AltGraph from any Ctrl+Alt event, so the event states which it is.
+ */
+function pressAltChord(
+  target: Element | Window,
+  keybind: Keybind,
+  extra: { repeat?: boolean; altGraph?: boolean } = {}
+) {
+  const event = new window.KeyboardEvent("keydown", {
+    key: keybind.key,
+    code: keybind.code,
+    ctrlKey: true,
+    altKey: true,
+    shiftKey: true,
+    repeat: extra.repeat ?? false,
+    bubbles: true,
+    cancelable: true,
+  });
+  Object.defineProperty(event, "getModifierState", {
+    value: (modifier: string) => modifier === "AltGraph" && extra.altGraph === true,
+  });
+  fireEvent(target, event);
+}
+
+/**
  * Runs the bridge shim from `frame`'s srcdoc against a stand-in window whose posts reach the host
  * as the frame's messages; returns a trusted key press inside the frame.
  */
@@ -297,16 +328,22 @@ function runFrameShim(frame: HTMLIFrameElement) {
     customEvent: unknown
   ) => void;
   run(frameWindow, frameDocument, class {});
-  return (key: string, modifiers: { ctrlKey?: boolean; shiftKey?: boolean }) => {
+  return (
+    key: string,
+    modifiers: { ctrlKey?: boolean; shiftKey?: boolean; altKey?: boolean; code?: string }
+  ) => {
     const event = {
       key,
+      code: modifiers.code ?? "",
       target: { nodeType: 1, tagName: "DIV", isContentEditable: false },
       isTrusted: true,
       repeat: false,
       ctrlKey: modifiers.ctrlKey ?? false,
       shiftKey: modifiers.shiftKey ?? false,
       metaKey: false,
-      altKey: false,
+      altKey: modifiers.altKey ?? false,
+      // Physical Ctrl+Alt, not AltGr.
+      getModifierState: () => false,
       defaultPrevented: false,
       preventDefault: () => undefined,
     };
@@ -338,6 +375,7 @@ describe("Agent interface status view", () => {
     cleanup();
     for (const restore of restoreSpies.splice(0)) restore();
     seededStates.clear();
+    interruptingWorkspaces.clear();
     resetTestExperiments();
     cleanupDom?.();
     cleanupDom = null;
@@ -466,6 +504,41 @@ describe("Agent interface status view", () => {
       await waitFor(() =>
         expect(view.queryByTestId("agent-interface-status-view") === null).toBe(true)
       );
+    } finally {
+      globalThis.KeyboardEvent = globalKeyboardEvent;
+      Reflect.deleteProperty(window.navigator, "userActivation");
+    }
+  });
+
+  test("the transcript peek's chord pressed in the page opens and closes it", async () => {
+    Object.defineProperty(window.navigator, "userActivation", {
+      configurable: true,
+      get: () => ({ isActive: true }),
+    });
+    // The host builds the replayed event with the global constructor, which the DOM harness
+    // lacks. Chrome's constructed events report no AltGraph unless built with it; happy-dom's
+    // infer it from Ctrl+Alt.
+    const globalKeyboardEvent = globalThis.KeyboardEvent;
+    globalThis.KeyboardEvent = class extends window.KeyboardEvent {
+      override getModifierState(modifier: string): boolean {
+        return modifier !== "AltGraph" && super.getModifierState(modifier);
+      }
+    };
+    try {
+      seedWorkspace("ws-peek-frame", { messages: MID_TURN.slice(0, 2) });
+      const view = render(<MainPane workspaceId="ws-peek-frame" />, { wrapper: Wrapper });
+      await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+      const frame = view.getByTestId("artifact-frame") as HTMLIFrameElement;
+      act(() => frame.focus());
+      // Through the shim this frame's srcdoc carries, as for the view switch chord.
+      const pressInFrame = runFrameShim(frame);
+      const peekShown = () => view.queryByTestId("agent-interface-transcript-peek") != null;
+      const { key, code } = KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK;
+      const chord = { ctrlKey: true, altKey: true, shiftKey: true, code };
+      act(() => pressInFrame(key, chord));
+      expect(peekShown()).toBe(true);
+      act(() => pressInFrame(key, chord));
+      expect(peekShown()).toBe(false);
     } finally {
       globalThis.KeyboardEvent = globalKeyboardEvent;
       Reflect.deleteProperty(window.navigator, "userActivation");
@@ -660,6 +733,19 @@ describe("Agent interface status view", () => {
     expect(view.queryByTestId("agent-interface-transcript-peek")).toBeNull();
   });
 
+  test("after Stop, the status bar shows the stop in progress, not the tool the turn ran", async () => {
+    seedWorkspace("ws-bar-stopping", { messages: MID_TURN, canInterrupt: true });
+    const view = render(<MainPane workspaceId="ws-bar-stopping" />, { wrapper: Wrapper });
+    await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+    const activity = within(view.getByTestId("agent-interface-status-bar")).getByRole("status");
+    expect(activity.textContent).toContain("Slow check");
+    // Stop marks the stream on the aggregator and bumps the state, as setInterrupting does.
+    interruptingWorkspaces.add("ws-bar-stopping");
+    updateSeededWorkspace("ws-bar-stopping", {});
+    expect(activity.textContent).toContain("Interrupting");
+    expect(activity.textContent).not.toContain("Slow check");
+  });
+
   test("Start here from the status bar opens the confirmation once the turn ends, and a turn that starts under it turns OK off", async () => {
     seedWorkspace("ws-bar-idle", { messages: MID_TURN.slice(0, 2) });
     const view = render(<MainPane workspaceId="ws-bar-idle" />, { wrapper: Wrapper });
@@ -683,27 +769,63 @@ describe("Agent interface status view", () => {
     expect(ok.hasAttribute("disabled")).toBe(true);
   });
 
-  test("the transcript peek's shortcut opens and closes it, but not on a held chord or under a dialog", async () => {
+  test("the transcript peek's shortcut opens and closes it, but not on a held chord, AltGr, from the command palette or under a dialog", async () => {
     seedWorkspace("ws-bar-chord", { messages: MID_TURN.slice(0, 2) });
     const view = render(<MainPane workspaceId="ws-bar-chord" />, { wrapper: Wrapper });
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
     const peekShown = () => view.queryByTestId("agent-interface-transcript-peek") != null;
-    const { key, code } = KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK;
-    const chord = { key, code, ctrlKey: true, altKey: true, shiftKey: true };
+    const peek = KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK;
 
-    fireEvent.keyDown(window, chord);
+    pressAltChord(window, peek);
     expect(peekShown()).toBe(true);
-    fireEvent.keyDown(window, { ...chord, repeat: true });
+    pressAltChord(window, peek, { repeat: true });
     expect(peekShown()).toBe(true);
-    fireEvent.keyDown(window, chord);
+    pressAltChord(window, peek);
     expect(peekShown()).toBe(false);
+    // AltGr reads as Ctrl+Alt but types text (Shift+AltGr+P types Ö on US-International).
+    pressAltChord(window, peek, { altGraph: true });
+    expect(peekShown()).toBe(false);
+
+    // The command palette keeps its keystrokes too, though it renders no modal dialog.
+    const palette = document.createElement("div");
+    palette.setAttribute("cmdk-root", "");
+    const paletteInput = document.createElement("input");
+    palette.append(paletteInput);
+    document.body.append(palette);
+    pressAltChord(paletteInput, peek);
+    expect(peekShown()).toBe(false);
+    palette.remove();
 
     // An open dialog keeps its keystrokes.
     fireEvent.click(view.getByRole("button", { name: "Start here" }));
     await within(document.body).findByRole("dialog");
-    fireEvent.keyDown(window, chord);
+    pressAltChord(window, peek);
     expect(peekShown()).toBe(false);
   });
+
+  test("Start here's shortcut opens the confirmation, but not on a held chord or mid-turn", async () => {
+    seedWorkspace("ws-bar-start-chord", { messages: MID_TURN.slice(0, 2) });
+    const view = render(<MainPane workspaceId="ws-bar-start-chord" />, { wrapper: Wrapper });
+    await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+    const dialogShown = () => within(document.body).queryByRole("dialog") != null;
+    const startHere = KEYBINDS.STATUS_START_HERE;
+
+    pressAltChord(window, startHere, { repeat: true });
+    expect(dialogShown()).toBe(false);
+    // Off while a turn runs, as the button is.
+    updateSeededWorkspace("ws-bar-start-chord", { messages: MID_TURN, canInterrupt: true });
+    pressAltChord(window, startHere);
+    expect(dialogShown()).toBe(false);
+
+    updateSeededWorkspace("ws-bar-start-chord", {
+      messages: MID_TURN.slice(0, 2),
+      canInterrupt: false,
+    });
+    pressAltChord(window, startHere);
+    const dialog = await within(document.body).findByRole("dialog");
+    expect(within(dialog).getByText("Start Here")).toBeTruthy();
+  });
+
   test("before the first message the bar shows no receipt and Start here stays off", async () => {
     seedWorkspace("ws-bar-empty", {});
     const view = render(<MainPane workspaceId="ws-bar-empty" />, { wrapper: Wrapper });

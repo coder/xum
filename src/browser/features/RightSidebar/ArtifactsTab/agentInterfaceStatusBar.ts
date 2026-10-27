@@ -27,6 +27,7 @@ export function toolCallDetail(args: unknown): string | undefined {
 
 export type StatusActivityKind =
   | "starting"
+  | "interrupting"
   | "compacting"
   | "question"
   | "tool"
@@ -45,6 +46,8 @@ export interface StatusActivity {
 
 export interface StatusActivityFlags {
   canInterrupt: boolean;
+  /** The user stopped the turn and the backend has not ended the stream yet. */
+  isInterrupting: boolean;
   isStreamStarting: boolean;
   isCompacting: boolean;
   awaitingUserQuestion: boolean;
@@ -125,6 +128,10 @@ export function deriveStatusActivity(
 ): StatusActivity {
   if (flags.isStreamStarting) {
     return { kind: "starting", label: startingLabel(flags.runtimeStatus) };
+  }
+  // As in StreamingBarrier: once the user stops the turn, the tool or phase it was in is stale.
+  if (flags.canInterrupt && flags.isInterrupting) {
+    return { kind: "interrupting", label: "Interrupting…" };
   }
   if (flags.isCompacting) return { kind: "compacting", label: "Compacting context…" };
   if (flags.awaitingUserQuestion) return { kind: "question", label: "Waiting for your answer" };

@@ -464,7 +464,7 @@ describe("ArtifactViewer renderers", () => {
     const globalKeyboardEvent = globalThis.KeyboardEvent;
     globalThis.KeyboardEvent = window.KeyboardEvent;
     try {
-      const postChord = (chord: "sidebar" | "agentInterface") =>
+      const postChord = (chord: "sidebar" | "agentInterface" | "peek") =>
         act(() => {
           const event = new window.Event("message");
           Object.defineProperty(event, "data", {
@@ -483,8 +483,9 @@ describe("ArtifactViewer renderers", () => {
       activation = { isActive: true };
       postChord("sidebar");
       expect(replayed).toEqual([sidebarKey]);
-      // Only the main pane's status page forwards the view switch: here the page's script posted it.
+      // Only the main pane's status page forwards its chords: here the page's script posted them.
       postChord("agentInterface");
+      postChord("peek");
       expect(replayed).toEqual([sidebarKey]);
 
       // A frame that stopped rendering keeps focus in the browser; that focus does not count.

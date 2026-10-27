@@ -4,9 +4,19 @@ import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useStartHere } from "@/browser/hooks/useStartHere";
-import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
+import {
+  useWorkspaceAggregator,
+  useWorkspaceStoreRaw,
+  type WorkspaceState,
+} from "@/browser/stores/WorkspaceStore";
 import { formatTimestamp } from "@/browser/utils/ui/dateTime";
-import { formatKeybind, KEYBINDS, matchesKeybind } from "@/browser/utils/ui/keybinds";
+import {
+  formatKeybind,
+  isAltGraphPressed,
+  KEYBINDS,
+  matchesKeybind,
+  type Keybind,
+} from "@/browser/utils/ui/keybinds";
 import { AGENT_INTERFACE_TRANSCRIPT_PEEK_KEY } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
@@ -209,26 +219,26 @@ function AgentInterfaceStatusBar(props: { workspaceId: string }) {
 }
 
 /**
- * The peek's shortcut. The bar is mounted only while the status page shows, so the chord does
- * nothing in the chat view. Keys typed in the page's frame stay in the frame.
+ * A chord of the bar, on the app's window. The bar is mounted only while the status page shows,
+ * so its chords do nothing in the chat view. `run` is null while the action is off: the chord is
+ * still claimed. Keys typed in the page's frame reach this listener only when its bridge
+ * forwards them (ARTIFACT_FRAME_CHORDS).
  */
-function usePeekShortcut(togglePeek: () => void) {
+function useBarShortcut(keybind: Keybind, run: (() => void) | null) {
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (
-        !matchesKeybind(e, KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK) ||
-        isShortcutOwnedElsewhere(e)
-      ) {
+      // AltGr reads as Ctrl+Alt and types text, which stays the focused field's.
+      if (!matchesKeybind(e, keybind) || isAltGraphPressed(e) || isShortcutOwnedElsewhere(e)) {
         return;
       }
       e.preventDefault();
-      // A held chord would flip the peek on every key repeat.
-      if (e.repeat) return;
-      togglePeek();
+      // A held chord would act on every key repeat.
+      if (e.repeat || run == null) return;
+      run();
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [togglePeek]);
+  }, [keybind, run]);
 }
 
 function StatusBar(props: { workspaceId: string; state: WorkspaceState }) {
@@ -236,9 +246,13 @@ function StatusBar(props: { workspaceId: string; state: WorkspaceState }) {
   const panelId = useId();
   const [peekOpen, setPeekOpen] = usePersistedState(AGENT_INTERFACE_TRANSCRIPT_PEEK_KEY, false);
   const togglePeek = () => setPeekOpen((open) => !open);
-  usePeekShortcut(togglePeek);
+  useBarShortcut(KEYBINDS.TOGGLE_STATUS_TRANSCRIPT_PEEK, togglePeek);
+  // Not in WorkspaceState, as for StreamingBarrier: setInterrupting bumps the state, and that
+  // re-renders the bar.
+  const aggregator = useWorkspaceAggregator(props.workspaceId);
   const activity = deriveStatusActivity(state.messages, {
     canInterrupt: state.canInterrupt,
+    isInterrupting: aggregator?.hasInterruptingStream() ?? false,
     isStreamStarting: state.isStreamStarting,
     isCompacting: state.isCompacting,
     awaitingUserQuestion: state.awaitingUserQuestion,
@@ -323,10 +337,15 @@ function StartHereButton(props: {
     // Off while a turn runs, in the confirmation too: it may have opened before the turn started.
     turnActive: props.turnActive,
   });
+  // SECURITY AUDIT: unlike the peek's chord, the status page's frame does not forward this one.
+  // The host honours a forwarded chord during any live gesture in the frame, so the page's
+  // script could open the confirmation while the user types in the page, and their next key
+  // would land in the dialog, where Y confirms.
+  useBarShortcut(KEYBINDS.STATUS_START_HERE, startHere.disabled ? null : startHere.openModal);
   return (
     <>
       <TooltipIfPresent
-        tooltip="Start a new context from the agent's last reply and keep earlier history"
+        tooltip={`Start a new context from the agent's last reply and keep earlier history (${formatKeybind(KEYBINDS.STATUS_START_HERE)})`}
         side="bottom"
         align="end"
       >

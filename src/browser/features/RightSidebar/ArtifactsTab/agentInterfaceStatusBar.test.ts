@@ -81,6 +81,7 @@ function tool(
 
 const streaming: StatusActivityFlags = {
   canInterrupt: true,
+  isInterrupting: false,
   isStreamStarting: false,
   isCompacting: false,
   awaitingUserQuestion: false,
@@ -105,6 +106,24 @@ describe("deriveStatusActivity", () => {
     expect(fallback).not.toBe("");
     expect(startingWith({ phase: "starting", detail: "  " })).toBe(fallback);
     expect(startingWith({ phase: "error", detail: "Runtime failed earlier" })).toBe(fallback);
+  });
+
+  test("a stop the backend has not finished shows over the turn's phase until the stream ends", () => {
+    const turn = [user("go"), tool("bash", "executing", { display_name: "Run tests" })];
+    const stopping = { ...streaming, isInterrupting: true };
+    for (const flags of [
+      stopping,
+      { ...stopping, isCompacting: true },
+      { ...stopping, awaitingUserQuestion: true },
+    ]) {
+      expect(deriveStatusActivity(turn, flags).kind).toBe("interrupting");
+    }
+    expect(isTurnActive(deriveStatusActivity(turn, stopping))).toBe(true);
+    // A turn still starting shows its startup, and an ended stream leaves no stop to wait for.
+    expect(deriveStatusActivity(turn, { ...stopping, isStreamStarting: true }).kind).toBe(
+      "starting"
+    );
+    expect(deriveStatusActivity(turn, { ...stopping, canInterrupt: false }).kind).toBe("idle");
   });
 
   test("compacting and a pending question name their phase over the turn's running tool", () => {
