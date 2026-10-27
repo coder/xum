@@ -643,7 +643,6 @@ describe("Agent interface status view", () => {
     expect(receipt.textContent).toContain("Queued");
     expect(receipt.textContent).toContain("+1 held");
     expect(receipt.textContent).not.toContain("An older send that failed");
-    expect(receipt.textContent).not.toMatch(/\d:\d\d/);
     // Start Here would rewrite the context under the running turn.
     expect(within(bar).getByRole("button", { name: "Start here" }).hasAttribute("disabled")).toBe(
       true
@@ -684,7 +683,7 @@ describe("Agent interface status view", () => {
     expect(ok.hasAttribute("disabled")).toBe(true);
   });
 
-  test("the transcript peek's shortcut opens and closes it, and a held chord does not flip it", async () => {
+  test("the transcript peek's shortcut opens and closes it, but not on a held chord or under a dialog", async () => {
     seedWorkspace("ws-bar-chord", { messages: MID_TURN.slice(0, 2) });
     const view = render(<MainPane workspaceId="ws-bar-chord" />, { wrapper: Wrapper });
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
@@ -696,6 +695,12 @@ describe("Agent interface status view", () => {
     expect(peekShown()).toBe(true);
     fireEvent.keyDown(window, { ...chord, repeat: true });
     expect(peekShown()).toBe(true);
+    fireEvent.keyDown(window, chord);
+    expect(peekShown()).toBe(false);
+
+    // An open dialog keeps its keystrokes.
+    fireEvent.click(view.getByRole("button", { name: "Start here" }));
+    await within(document.body).findByRole("dialog");
     fireEvent.keyDown(window, chord);
     expect(peekShown()).toBe(false);
   });

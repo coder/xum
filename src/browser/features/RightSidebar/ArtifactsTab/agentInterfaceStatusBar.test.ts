@@ -140,7 +140,11 @@ describe("deriveStatusActivity", () => {
     ];
     expect(deriveStatusActivity(turn, streaming).detail).toBe("Build");
     // Provider-executed calls never report a start, so the newest running call stands.
-    const provider = [user("go"), tool("web_search", "executing", { title: "Search" })];
+    const provider = [
+      user("go"),
+      tool("web_search", "executing", { title: "Older search" }),
+      tool("web_search", "executing", { title: "Search" }),
+    ];
     expect(deriveStatusActivity(provider, streaming).detail).toBe("Search");
   });
 
