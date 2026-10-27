@@ -349,9 +349,12 @@ import {
 import {
   TerminalAttentionStore,
   type TerminalAttentionNotification,
-  type TerminalAttentionOutcome,
 } from "@/node/services/terminalAttentionStore";
 import { WorkflowRunAttention } from "@/node/services/workflowRunAttention";
+import {
+  TerminalAttentionNotifier,
+  WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS,
+} from "@/node/services/terminalAttentionNotifier";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
 import type { AgentWorkflowRunStrictPin } from "@/node/services/agentWorkflowRunReferences";
 import { normalizeWorkflowAgentReportPayloadForHostSchema } from "@/common/utils/tools/workflowReportPayload";
@@ -1337,12 +1340,6 @@ function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
 
 const REMOVED_AGENT_TASKS_DIR = "removed-agent-tasks";
 
-// Level-triggered backstop for workflow terminal wakes: the sweep re-derives owed wakes from
-// durable state (run records + settled markers), so lost terminal callbacks, deferred
-// (transiently unreadable) evaluations, and crashes all recover here without any per-failure
-// retry bookkeeping.
-const WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS = 5 * 60_000;
-
 /** Maximum consecutive auto-resumes before stopping. Prevents infinite loops when descendants are stuck. */
 
 const MAX_CONSECUTIVE_PARENT_AUTO_RESUMES = 3;
@@ -1919,29 +1916,13 @@ export class TaskService implements AgentTaskIntegration {
   // Git worktree creation touches per-repository metadata; serialize that narrow phase per project
   // while allowing post-fork init/send startup work for sibling tasks to overlap.
   private readonly reservedTaskLaunchByProjectPath = new Map<string, Promise<void>>();
-  // In-flight durable persistence of notify_on_terminal policy for backgrounded foreground waits.
-  // Awaited at the start of handleStreamEnd so a just-detached wait is treated as non-blocking.
-  private readonly pendingNotifyOnTerminalPersists = new Set<Promise<void>>();
-  // In-flight terminal attention drains (workspace-turn / sub-agent terminal wake-ups). Tracked so
-  // tests and shutdown can await them; drains are idempotent and re-triggered on owner idle events.
-  private readonly pendingTerminalAttentionDrainsByOwner = new Map<string, Promise<void>>();
-  private readonly pendingTerminalAttentionDrains = new Set<Promise<void>>();
+  // Terminal attention scheduling and bookkeeping: notify_on_terminal persists, drain chains, idle
+  // waits, fresh sub-agent edges and wake-group send backoff. The drain itself stays here.
+  private readonly terminalAttention: TerminalAttentionNotifier;
   /** Tail of each task's chain of deferred trusted messages (F54), in send order. */
   private readonly deferredDescendantMessagesByTask = new Map<string, Promise<void>>();
-  private readonly pendingTerminalAttentionIdleWaitsByOwner = new Map<string, Promise<void>>();
-  // Sub-agent terminal notifications this process just enqueued while their owner was streaming,
-  // mapped to that owner turn's generation (owner -> notification ID -> turn). The next drain takes
-  // the whole map, so each report can cut at most one busy turn, and only the turn that was live
-  // at its delivery (see cutBusyOwnerTurnForSubagentAttention).
-  private readonly freshSubagentAttentionTurnByOwner = new Map<string, Map<string, symbol>>();
   // Owed workflow terminal wakes and the per-run settlement chain (see WorkflowRunAttention).
   private readonly workflowRunAttention: WorkflowRunAttention;
-  // Owner -> wake-group key -> epoch ms before which the drain skips selecting the group. A
-  // group whose send was rejected for group-specific reasons (for example an unresolvable
-  // strictly pinned agent) would otherwise be re-selected newest-first by every drain and
-  // sweep, starving older deliverable groups. In-memory only: a restart retries every group,
-  // and entries expire on read.
-  private readonly workflowWakeGroupSendBackoffUntilMs = new Map<string, Map<string, number>>();
   private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
   /** The pending drain retry after a refused launch lease (QUEUED_LAUNCH_LEASE_RETRY_MS). */
   private queuedLaunchLeaseRetryTimer: ReturnType<typeof setTimeout> | undefined;
@@ -2617,7 +2598,7 @@ export class TaskService implements AgentTaskIntegration {
       });
       return;
     }
-    await this.suppressTerminalAttention({
+    await this.terminalAttention.suppressTerminalAttention({
       ownerWorkspaceId: execution.ownerWorkspaceId,
       sourceKind: "workspace_turn",
       sourceId: execution.handleId,
@@ -4679,6 +4660,15 @@ export class TaskService implements AgentTaskIntegration {
     this.workflowRunAttention = new WorkflowRunAttention({
       sessionsDir: () => this.config.sessionsDir,
       terminalAttentionStore: () => this.terminalAttentionStore,
+    });
+    this.terminalAttention = new TerminalAttentionNotifier({
+      terminalAttentionStore: () => this.terminalAttentionStore,
+      config: () => this.config,
+      aiService: () => this.aiService,
+      workspaceService: () => this.workspaceService,
+      turnManager: () => this.getWorkspaceTurnManager(),
+      // Through TaskService: the test harness wraps drainTerminalAttention on the instance.
+      drain: (ownerWorkspaceId) => this.drainTerminalAttention(ownerWorkspaceId),
     });
     this.gitPatchArtifactService = new GitPatchArtifactService(config, historyService.locks);
 
@@ -9843,13 +9833,13 @@ export class TaskService implements AgentTaskIntegration {
         log.warn("Deferred descendant message failed", { taskId: params.taskId, error });
       })
       .finally(() => {
-        this.pendingTerminalAttentionDrains.delete(promise);
+        this.terminalAttention.untrackDrain(promise);
         if (this.deferredDescendantMessagesByTask.get(params.taskId) === promise) {
           this.deferredDescendantMessagesByTask.delete(params.taskId);
         }
       });
     this.deferredDescendantMessagesByTask.set(params.taskId, promise);
-    this.pendingTerminalAttentionDrains.add(promise);
+    this.terminalAttention.trackDrain(promise);
   }
 
   private taskGuidanceSendOptions(
@@ -11084,7 +11074,7 @@ export class TaskService implements AgentTaskIntegration {
         );
         this.markWorkspaceStopPersisted(id);
         if (parentWorkspaceId != null) {
-          await this.suppressTerminalAttention({
+          await this.terminalAttention.suppressTerminalAttention({
             ownerWorkspaceId: parentWorkspaceId,
             sourceKind: "agent_task",
             sourceId: id,
@@ -11137,7 +11127,7 @@ export class TaskService implements AgentTaskIntegration {
           });
           continue;
         }
-        await this.suppressTerminalAttention({
+        await this.terminalAttention.suppressTerminalAttention({
           ownerWorkspaceId: handle.ownerWorkspaceId,
           sourceKind: "workspace_turn",
           sourceId: handle.handleId,
@@ -11867,61 +11857,16 @@ export class TaskService implements AgentTaskIntegration {
     return this.waiters.backgroundForegroundWaitsForWorkspace(workspaceId);
   }
 
-  /**
-   * Persist `notify_on_terminal` on a backgrounded handle (agent task config or
-   * workspace-turn record). Tracked per workspace so `handleStreamEnd` can await
-   * any in-flight persistence before it reads config to decide blocking work.
-   */
-  /**
-   * Durably mark a still-active task/handle as `notify_on_terminal`. Used when a foreground wait
-   * detaches because it exceeded its foreground wait budget (timeout) and the work continues in the
-   * background: like queued-message detachment, the work must not re-force the owner to await it.
-   * Awaited so callers (e.g. the task tool) can rely on the policy before returning pending results.
-   */
-  async markBackgroundWorkNotifyOnTerminal(
-    taskId: string,
-    ownerWorkspaceId: string
-  ): Promise<void> {
-    await this.persistNotifyOnTerminalPolicy(taskId, ownerWorkspaceId);
+  /** See TerminalAttentionNotifier.markBackgroundWorkNotifyOnTerminal (task tool calls it). */
+  markBackgroundWorkNotifyOnTerminal(taskId: string, ownerWorkspaceId: string): Promise<void> {
+    return this.terminalAttention.markBackgroundWorkNotifyOnTerminal(taskId, ownerWorkspaceId);
   }
 
   private scheduleNotifyOnTerminalPersist(
     taskId: string,
     ownerWorkspaceId: string | undefined
   ): void {
-    const promise = this.persistNotifyOnTerminalPolicy(taskId, ownerWorkspaceId)
-      .catch((error: unknown) => {
-        log.error("Failed to persist notify_on_terminal policy for backgrounded wait", {
-          taskId,
-          error,
-        });
-      })
-      .finally(() => {
-        this.pendingNotifyOnTerminalPersists.delete(promise);
-      });
-    this.pendingNotifyOnTerminalPersists.add(promise);
-  }
-
-  private async persistNotifyOnTerminalPolicy(
-    taskId: string,
-    ownerWorkspaceId: string | undefined
-  ): Promise<void> {
-    if (isWorkspaceTurnTaskId(taskId)) {
-      if (ownerWorkspaceId != null) {
-        await this.getWorkspaceTurnManager().markWorkspaceTurnBackgroundWorkNotifyOnTerminal(
-          taskId,
-          ownerWorkspaceId
-        );
-      }
-      return;
-    }
-    await this.config.editConfig((config) => {
-      const found = findWorkspaceEntry(config, taskId);
-      if (found != null && found.workspace.taskAttentionPolicy !== "notify_on_terminal") {
-        found.workspace.taskAttentionPolicy = "notify_on_terminal";
-      }
-      return config;
-    });
+    this.terminalAttention.scheduleNotifyOnTerminalPersist(taskId, ownerWorkspaceId);
   }
 
   /**
@@ -12095,20 +12040,9 @@ export class TaskService implements AgentTaskIntegration {
     this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
   }
 
-  /**
-   * Level-triggered retry for outbox (sub-agent / workspace-turn) attention: pending records
-   * are the durable "wake owed" state, but unlike workflow runs they have no periodic
-   * re-derivation of their own, so a drain that failed transiently (for example an unreadable
-   * history for caller restrictions) would otherwise leave them stuck until restart. Startup
-   * and the sweep interval both re-poke their owners; drains are idempotent and no-op when
-   * nothing is deliverable.
-   */
-  private async schedulePendingTerminalAttentionOwnerDrains(): Promise<number> {
-    const ownerWorkspaceIds = await this.terminalAttentionStore.listPendingOwnerWorkspaceIds();
-    for (const ownerWorkspaceId of ownerWorkspaceIds) {
-      this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-    }
-    return ownerWorkspaceIds.length;
+  // Startup and the sweep call this; tests cast-call it. See the notifier for the why.
+  private schedulePendingTerminalAttentionOwnerDrains(): Promise<number> {
+    return this.terminalAttention.schedulePendingTerminalAttentionOwnerDrains();
   }
 
   /**
@@ -12141,21 +12075,6 @@ export class TaskService implements AgentTaskIntegration {
     return await this.workflowRunAttention.clearWorkflowRunDowngradeSettlement(params);
   }
 
-  private async suppressTerminalAttention(params: {
-    ownerWorkspaceId: string;
-    sourceKind: TerminalAttentionNotification["sourceKind"];
-    sourceId: string;
-  }): Promise<void> {
-    await this.terminalAttentionStore.enqueueIfAbsent({
-      ...params,
-      terminalOutcome: "interrupted",
-    });
-    await this.terminalAttentionStore.markSuperseded(
-      params.ownerWorkspaceId,
-      TerminalAttentionStore.notificationId(params.sourceKind, params.sourceId)
-    );
-  }
-
   private async getAgentTerminalAttentionGenerationId(
     ownerWorkspaceId: string,
     childTaskId: string
@@ -12167,47 +12086,15 @@ export class TaskService implements AgentTaskIntegration {
     return execution?.record.handleId;
   }
 
-  async enqueueTerminalAttention(params: {
-    ownerWorkspaceId: string;
-    sourceKind: TerminalAttentionNotification["sourceKind"];
-    terminalOutcome: TerminalAttentionOutcome;
-    sourceId: string;
-    generationId?: string;
-  }): Promise<void> {
-    const created = await this.terminalAttentionStore.enqueueIfAbsent(params);
-    if (created == null) {
-      return;
-    }
-    const liveTurn = this.aiService.isStreaming(created.ownerWorkspaceId)
-      ? this.workspaceService.getActiveTurnGeneration(created.ownerWorkspaceId)
-      : undefined;
-    if (created.sourceKind === "agent_task" && liveTurn != null) {
-      let fresh = this.freshSubagentAttentionTurnByOwner.get(created.ownerWorkspaceId);
-      if (fresh == null) {
-        fresh = new Map();
-        this.freshSubagentAttentionTurnByOwner.set(created.ownerWorkspaceId, fresh);
-      }
-      fresh.set(created.id, liveTurn);
-    }
-    this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
+  // Spied on in tests, and called through TaskHost (taskWorkspaceSeam): stays a facade.
+  enqueueTerminalAttention(
+    params: Parameters<TerminalAttentionNotifier["enqueueTerminalAttention"]>[0]
+  ): Promise<void> {
+    return this.terminalAttention.enqueueTerminalAttention(params);
   }
 
   scheduleTerminalAttentionDrain(ownerWorkspaceId: string): void {
-    const previous = this.pendingTerminalAttentionDrainsByOwner.get(ownerWorkspaceId);
-    const promise = (previous ?? Promise.resolve())
-      .catch(() => undefined)
-      .then(() => this.drainTerminalAttention(ownerWorkspaceId))
-      .catch((error: unknown) => {
-        log.error("Terminal attention drain failed", { ownerWorkspaceId, error });
-      })
-      .finally(() => {
-        this.pendingTerminalAttentionDrains.delete(promise);
-        if (this.pendingTerminalAttentionDrainsByOwner.get(ownerWorkspaceId) === promise) {
-          this.pendingTerminalAttentionDrainsByOwner.delete(ownerWorkspaceId);
-        }
-      });
-    this.pendingTerminalAttentionDrainsByOwner.set(ownerWorkspaceId, promise);
-    this.pendingTerminalAttentionDrains.add(promise);
+    this.terminalAttention.scheduleTerminalAttentionDrain(ownerWorkspaceId);
   }
 
   /**
@@ -12326,34 +12213,6 @@ export class TaskService implements AgentTaskIntegration {
     return { ...state.restrictions, ...withToolPolicy(state.trace.policy), ...state.pin };
   }
 
-  private scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId: string): void {
-    // One idle wait per owner: each wait subscribes to the owner session's chat-event, and every
-    // report deferred by a busy owner lands here. The drain it schedules reads every pending
-    // notification from the store, so one wait delivers all of them, in store order.
-    if (this.pendingTerminalAttentionIdleWaitsByOwner.has(ownerWorkspaceId)) return;
-    const promise = this.workspaceService
-      .waitForIdleAndNoQueuedMessages(ownerWorkspaceId)
-      .catch((error: unknown) => {
-        log.debug("Terminal attention idle wait failed; retrying drain anyway", {
-          ownerWorkspaceId,
-          error,
-        });
-      })
-      .then(() => {
-        // Release the slot before scheduling: that drain can find the owner busy again and must
-        // be able to install the next idle wait.
-        if (this.pendingTerminalAttentionIdleWaitsByOwner.get(ownerWorkspaceId) === promise) {
-          this.pendingTerminalAttentionIdleWaitsByOwner.delete(ownerWorkspaceId);
-        }
-        this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-      })
-      .finally(() => {
-        this.pendingTerminalAttentionDrains.delete(promise);
-      });
-    this.pendingTerminalAttentionIdleWaitsByOwner.set(ownerWorkspaceId, promise);
-    this.pendingTerminalAttentionDrains.add(promise);
-  }
-
   /**
    * A withdrawn correlated continuation settles nothing itself, but its turn's stream end may have
    * deferred to it (#5261). Once the target is idle the stale-turn sweep decides from live state;
@@ -12390,9 +12249,9 @@ export class TaskService implements AgentTaskIntegration {
         log.warn("Withdrawn workspace-turn continuation reconcile failed", { targetId, error });
       })
       .finally(() => {
-        this.pendingTerminalAttentionDrains.delete(promise);
+        this.terminalAttention.untrackDrain(promise);
       });
-    this.pendingTerminalAttentionDrains.add(promise);
+    this.terminalAttention.trackDrain(promise);
   }
 
   /**
@@ -12845,25 +12704,6 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Back the given terminal-wake send batches off until the sweep cadence retries them and
-   * re-poke the drain so the remaining batches get their send this cycle instead of starving
-   * behind the failed one.
-   */
-  private backOffTerminalWakeSends(ownerWorkspaceId: string, keys: readonly string[]): void {
-    assert(keys.length > 0, "backOffTerminalWakeSends requires keys");
-    let ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
-    if (ownerBackoff == null) {
-      ownerBackoff = new Map();
-      this.workflowWakeGroupSendBackoffUntilMs.set(ownerWorkspaceId, ownerBackoff);
-    }
-    const retryAt = Date.now() + WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS;
-    for (const key of keys) {
-      ownerBackoff.set(key, retryAt);
-    }
-    this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-  }
-
-  /**
    * A sub-agent report or failure that lands while its owner is mid-turn is already a durable row
    * in the owner's history, but the terminal drain defers until idle and the running turn's model
    * only sees its in-memory messages. A parent blocked in a long task_await on OTHER tasks (or any
@@ -12974,9 +12814,7 @@ export class TaskService implements AgentTaskIntegration {
   private async drainTerminalAttention(ownerWorkspaceId: string): Promise<void> {
     // Every drain consumes the fresh edges, whichever branch it takes: an idle drain delivers them
     // itself, and a busy drain may cut the live turn for them exactly once.
-    const freshSubagentAttentionTurns =
-      this.freshSubagentAttentionTurnByOwner.get(ownerWorkspaceId) ?? new Map<string, symbol>();
-    this.freshSubagentAttentionTurnByOwner.delete(ownerWorkspaceId);
+    const freshSubagentAttentionTurns = this.terminalAttention.takeFreshTurns(ownerWorkspaceId);
     const allPending = await this.terminalAttentionStore.listPending(ownerWorkspaceId);
     // Legacy pre-reconciler outbox records for workflow runs (no generation suffix) are dead
     // state now that workflow wakes are re-derived from run records + settled markers: delete
@@ -13033,7 +12871,7 @@ export class TaskService implements AgentTaskIntegration {
         freshSubagentAttentionTurns
       );
       if (ownerHasBusyQueuedOrRetry && !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId)) {
-        this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+        this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
       }
       return;
     }
@@ -13156,21 +12994,10 @@ export class TaskService implements AgentTaskIntegration {
     // A backed-off non-workflow batch (its conversation-identity send was rejected) sits out
     // the drain entirely, staying pending for the sweep-cadence retry, so agent-bound groups
     // are not starved behind a send that fails the same way on every drain.
-    const nonWorkflowSendBackoffUntil = this.workflowWakeGroupSendBackoffUntilMs
-      .get(ownerWorkspaceId)
-      ?.get(NON_WORKFLOW_WAKE_BACKOFF_KEY);
-    let nonWorkflowSendBackedOff = false;
-    if (nonWorkflowSendBackoffUntil != null) {
-      if (nonWorkflowSendBackoffUntil > Date.now()) {
-        nonWorkflowSendBackedOff = true;
-      } else {
-        const ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
-        ownerBackoff?.delete(NON_WORKFLOW_WAKE_BACKOFF_KEY);
-        if (ownerBackoff?.size === 0) {
-          this.workflowWakeGroupSendBackoffUntilMs.delete(ownerWorkspaceId);
-        }
-      }
-    }
+    const nonWorkflowSendBackedOff = this.terminalAttention.isWakeSendBackedOff(
+      ownerWorkspaceId,
+      NON_WORKFLOW_WAKE_BACKOFF_KEY
+    );
     const hasNonWorkflowDeliverables =
       !nonWorkflowSendBackedOff &&
       (deliverableAgentNotificationIds.size > 0 || workspaceTurnCandidates.length > 0);
@@ -13260,20 +13087,12 @@ export class TaskService implements AgentTaskIntegration {
       );
       // Group keys embed \u0000, so the empty string safely keys the unpinned group.
       const backoffKey = groupKey ?? "";
-      const ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
-      const backoffUntil = ownerBackoff?.get(backoffKey);
-      if (backoffUntil != null) {
-        if (backoffUntil > Date.now()) {
-          // Recently rejected send: leave the group queued and give the next group its turn.
-          remainingWorkflowPrompts = remainingWorkflowPrompts.filter(
-            (candidate) => !groupCandidates.includes(candidate)
-          );
-          continue;
-        }
-        ownerBackoff?.delete(backoffKey);
-        if (ownerBackoff?.size === 0) {
-          this.workflowWakeGroupSendBackoffUntilMs.delete(ownerWorkspaceId);
-        }
+      if (this.terminalAttention.isWakeSendBackedOff(ownerWorkspaceId, backoffKey)) {
+        // Recently rejected send: leave the group queued and give the next group its turn.
+        remainingWorkflowPrompts = remainingWorkflowPrompts.filter(
+          (candidate) => !groupCandidates.includes(candidate)
+        );
+        continue;
       }
       // Resolve the send identity before the revalidation reread so the reread stays the last
       // await before dispatch: a history clear that completes during this history and
@@ -13445,12 +13264,14 @@ export class TaskService implements AgentTaskIntegration {
         // Same starvation shape as the prompt path: agent-bound groups were excluded by this
         // batch, so back it off and re-poke to let them send under their own launch identity.
         if (deliverableWorkflowPrompts.some((candidate) => candidate.initiatingAgent != null)) {
-          this.backOffTerminalWakeSends(ownerWorkspaceId, [NON_WORKFLOW_WAKE_BACKOFF_KEY]);
+          this.terminalAttention.backOffTerminalWakeSends(ownerWorkspaceId, [
+            NON_WORKFLOW_WAKE_BACKOFF_KEY,
+          ]);
         }
         return;
       }
       if (!resumeResult.data.started) {
-        this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+        this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
         return;
       }
       await markPendingDelivered();
@@ -13526,11 +13347,11 @@ export class TaskService implements AgentTaskIntegration {
             // Same wake as the primary send above (#4721).
             skipOnSendCompaction: true,
             onCanceled: () => {
-              this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+              this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
             },
             onAcceptedPreStreamFailure: async () => {
               await markPendingForRetry();
-              this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+              this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
             },
             onAccepted: async () => {
               fallbackAccepted = true;
@@ -13563,7 +13384,7 @@ export class TaskService implements AgentTaskIntegration {
           backoffKeys.push(NON_WORKFLOW_WAKE_BACKOFF_KEY);
         }
         if (backoffKeys.length > 0) {
-          this.backOffTerminalWakeSends(ownerWorkspaceId, backoffKeys);
+          this.terminalAttention.backOffTerminalWakeSends(ownerWorkspaceId, backoffKeys);
         }
       }
       // Busy rejection: the owner started work between the idle check and the send; leave
@@ -17590,8 +17411,9 @@ export class TaskService implements AgentTaskIntegration {
 
     // Ensure any in-flight notify_on_terminal persistence (from a just-detached foreground wait)
     // has settled so the config we read below reflects the durable non-blocking policy.
-    if (this.pendingNotifyOnTerminalPersists.size > 0) {
-      await Promise.all([...this.pendingNotifyOnTerminalPersists]);
+    const notifyOnTerminalPersists = this.terminalAttention.inFlightNotifyOnTerminalPersists();
+    if (notifyOnTerminalPersists.length > 0) {
+      await Promise.all(notifyOnTerminalPersists);
     }
 
     // The owner's own stream ending is the signal to retry any terminal wake-ups that were deferred
