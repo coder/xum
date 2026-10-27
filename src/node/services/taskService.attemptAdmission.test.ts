@@ -90,18 +90,20 @@ interface Internals {
     string,
     Set<{ state: string; turnId?: symbol; attemptId: string; attempt?: unknown }>
   >;
-  workspaceStopRecords: Map<
-    string,
-    {
-      attemptId: string | undefined;
-      ownedAttempt: unknown;
-      capturedTurns: Set<symbol>;
-      pendingAdmissions: Set<unknown>;
-      cleanupInFlight: number;
-      capturedExecutionId: string | undefined;
-      executionSettled: boolean;
-    }
-  >;
+  taskStopLatch: {
+    workspaceStopRecords: Map<
+      string,
+      {
+        attemptId: string | undefined;
+        ownedAttempt: unknown;
+        capturedTurns: Set<symbol>;
+        pendingAdmissions: Set<unknown>;
+        cleanupInFlight: number;
+        capturedExecutionId: string | undefined;
+        executionSettled: boolean;
+      }
+    >;
+  };
   currentAttemptIdByTaskId: Map<string, string>;
   resumeFailureSettlementByTaskId: Map<string, unknown>;
   markTaskLaunchFailed: (taskId: string, message: string) => Promise<void>;
@@ -1316,8 +1318,10 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         if (race === "pending-before-decision") {
           // The pending obligation counted as live: a stop record captured it and cannot release
           // (nor settle) until it is dispositioned.
-          await waitForCondition(() => svc.workspaceStopRecords.has(taskId));
-          expect(svc.workspaceStopRecords.get(taskId)!.pendingAdmissions.size).toBe(1);
+          await waitForCondition(() => svc.taskStopLatch.workspaceStopRecords.has(taskId));
+          expect(svc.taskStopLatch.workspaceStopRecords.get(taskId)!.pendingAdmissions.size).toBe(
+            1
+          );
           expect(pending!.admissionStale()).toBe(true);
           pending!.onDisposed("refused");
         }
@@ -1474,7 +1478,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // ...so a Stop has nothing to wait for and releases its latch.
       await raceWithTimeout(taskService.terminateAllDescendantAgentTasks(rootId), 2_000);
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
-      expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+      expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
     });
 
     describe("a reawaken whose manual send/resume fails settles its owned attempt (#4310)", () => {
@@ -1893,7 +1897,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         const stop = taskService.terminateAllDescendantAgentTasks(rootId);
         await settle();
         await settle();
-        expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+        expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
         expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
         expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
         // "during-write": nothing is committed yet; "after-durable": the fresh id is already the
@@ -1909,8 +1913,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         expect(fresh).not.toBe(previous);
         // Ownership was installed before the mutex was released; only now can Phase A capture,
         // and it captures the fresh attempt OWNED.
-        await waitForCondition(() => svc.workspaceStopRecords.has(taskId));
-        expect(svc.workspaceStopRecords.get(taskId)).toMatchObject({
+        await waitForCondition(() => svc.taskStopLatch.workspaceStopRecords.has(taskId));
+        expect(svc.taskStopLatch.workspaceStopRecords.get(taskId)).toMatchObject({
           attemptId: fresh,
           ownedAttempt: svc.ownedAttemptByTaskId.get(taskId),
         });
@@ -1922,7 +1926,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         cleanupGate.resolve();
         await stop;
         await waitForStopRelease(taskService, taskId);
-        expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+        expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
         expect(entryOf(config, taskId)).toMatchObject({
           taskStatus: "interrupted",
           taskAttemptId: fresh,
@@ -1964,8 +1968,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(gapSend.admissionStale()).toBe(false);
       // The Stop captures the pending obligation and cannot release until it is dispositioned.
       const stop = taskService.terminateAllDescendantAgentTasks(rootId);
-      await waitForCondition(() => svc.workspaceStopRecords.has(taskId));
-      expect(svc.workspaceStopRecords.get(taskId)!.pendingAdmissions.size).toBe(1);
+      await waitForCondition(() => svc.taskStopLatch.workspaceStopRecords.has(taskId));
+      expect(svc.taskStopLatch.workspaceStopRecords.get(taskId)!.pendingAdmissions.size).toBe(1);
       expect(gapSend.admissionStale()).toBe(true);
       await settle();
       await settle();
@@ -2009,7 +2013,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       const reawaken = taskService.markInterruptedTaskRunning(taskId);
       // Outside the critical section: a real Stop runs fully to completion.
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+      expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
       gate.resolve();
       expect(await reawaken).toBe(false);
       expect(entryOf(config, taskId)).toMatchObject({
@@ -2342,7 +2346,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           if (racing === "pending-outlives") racingToken?.onDisposed("refused");
           else settleRacingTurn(spawnedId);
           await waitForStopRelease(taskService, spawnedId);
-          expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
+          expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
           expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
             phase: "settled",
             source: "stop-settled",
@@ -2424,7 +2428,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         });
         expect(entryOf(config, spawnedId)?.taskLaunchError).toBeUndefined();
         expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
-        expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
+        expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
         // This process still owns A; idle under it, the launch failure settles exactly A.
         expect(svc.ownedAttemptByTaskId.get(spawnedId)?.attemptId).toBe(mintedAttemptId);
         expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
@@ -2527,7 +2531,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           });
           expect(entryOf(config, spawnedId)?.taskLaunchError).toBeUndefined();
           expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
-          expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
+          expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
           expect(svc.ownedAttemptByTaskId.get(spawnedId)?.attemptId).toBe(mintedAttemptId);
           if (liveness === "idle") {
             expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
@@ -2570,7 +2574,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
             attemptId: mintedAttemptId,
             phase: "closing",
           });
-          expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
+          expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
           expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
           expect(entryOf(config, spawnedId)).toMatchObject({
             taskStatus: "running",
@@ -2640,7 +2644,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         // The captured owner outlived the bound: the latch holds for A's turn, and B's row —
         // written after our marker — is untouched (no deletion, no second marker).
         expect(rollbackSpy).not.toHaveBeenCalled();
-        expect(svc.workspaceStopRecords.get(spawnedId)).toMatchObject({
+        expect(svc.taskStopLatch.workspaceStopRecords.get(spawnedId)).toMatchObject({
           attemptId: mintedAttemptId,
         });
         expect(entryOf(config, spawnedId)).toMatchObject({
@@ -2656,14 +2660,14 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         // promise settles and hands its in-flight count back; the record cannot release while
         // that cleanup is still counted, so wait for it before checking that only A's turn holds.
         await waitForCondition(
-          () => svc.workspaceStopRecords.get(spawnedId)?.cleanupInFlight === 0
+          () => svc.taskStopLatch.workspaceStopRecords.get(spawnedId)?.cleanupInFlight === 0
         );
         expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(true);
         // Only A's turn settling releases the record and settles A; B's row stays as it was.
         liveTurn = undefined;
         host.settleTurn(spawnedId, racingTurn);
         expect(taskService.isWorkspaceStopInProgress(spawnedId)).toBe(false);
-        expect(svc.workspaceStopRecords.has(spawnedId)).toBe(false);
+        expect(svc.taskStopLatch.workspaceStopRecords.has(spawnedId)).toBe(false);
         expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
           attemptId: mintedAttemptId,
           phase: "settled",
@@ -2884,7 +2888,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       await taskService.terminateAllDescendantAgentTasks(rootId);
       // Phase B ran (one stopStream) but the record is retained by the pending obligation.
       expect(stopStream).toHaveBeenCalledTimes(1);
-      const record = svc.workspaceStopRecords.get(taskId)!;
+      const record = svc.taskStopLatch.workspaceStopRecords.get(taskId)!;
       expect(record.pendingAdmissions.size).toBe(1);
       expect(record.capturedTurns.size).toBe(0);
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
@@ -2942,7 +2946,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       token.onAdmitted(first);
       activeTurn = first;
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      const record = svc.workspaceStopRecords.get(taskId)!;
+      const record = svc.taskStopLatch.workspaceStopRecords.get(taskId)!;
       expect(record.capturedTurns.has(first)).toBe(true);
       // The coordinator replaced T1 with T2 without T1 ever going idle.
       host.supersedeTurn(taskId, first, second);
@@ -3222,7 +3226,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       expect(reactivatedEntry?.taskExecutionStatus).toBe("running");
 
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      const record = svc.workspaceStopRecords.get(taskId)!;
+      const record = svc.taskStopLatch.workspaceStopRecords.get(taskId)!;
       expect(record.capturedExecutionId).toBe(handleId);
       // The shortened deadlines let the cascade return while its cleanup (handle interrupt +
       // stream stop) is still in flight; ownership stays with that cleanup, so wait for it.
@@ -3312,7 +3316,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       await settle();
       await settle();
       // Phase A blocks on the mutex: nothing captured, nothing latched, no owner yet.
-      expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+      expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
       expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
       gate.resolve();
       // createWorkspaceTurn runs after the section, behind the cascade's Phase A in the mutex
@@ -3322,8 +3326,8 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         success: false,
         error: { code: "send_failed" },
       });
-      await waitForCondition(() => svc.workspaceStopRecords.has(taskId));
-      expect(svc.workspaceStopRecords.get(taskId)).toMatchObject({
+      await waitForCondition(() => svc.taskStopLatch.workspaceStopRecords.has(taskId));
+      expect(svc.taskStopLatch.workspaceStopRecords.get(taskId)).toMatchObject({
         attemptId: fresh,
         ownedAttempt: svc.ownedAttemptByTaskId.get(taskId),
       });
@@ -3354,7 +3358,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       const { taskService } = createHarness(config, { aiService });
       const svc = internals(taskService);
       const stop = taskService.terminateAllDescendantAgentTasks(rootId);
-      await waitForCondition(() => svc.workspaceStopRecords.has(taskId));
+      await waitForCondition(() => svc.taskStopLatch.workspaceStopRecords.has(taskId));
       expect(
         await taskService.sendMessageToDescendantAgentTask(rootId, taskId, "again", "tool-end")
       ).toEqual({
@@ -3364,7 +3368,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
       // Nothing published: the cascade's record still names the predecessor it captured.
       expect(entryOf(config, taskId)?.taskAttemptId).toBe(previous);
       expect(svc.ownedAttemptByTaskId.has(taskId)).toBe(false);
-      expect(svc.workspaceStopRecords.get(taskId)?.attemptId).toBe(previous);
+      expect(svc.taskStopLatch.workspaceStopRecords.get(taskId)?.attemptId).toBe(previous);
       cleanupGate.resolve();
       await stop;
       // Once settled, a reactivation proceeds under a fresh id.
@@ -3602,7 +3606,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
           expect(failure).toBeNull();
           expect(clearQueue).not.toHaveBeenCalled();
           expect(stopStream).not.toHaveBeenCalled();
-          expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+          expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
           expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
           expect(svc.attemptSettlementByTaskId.get(taskId)?.attemptId).not.toBe(foreignAttemptId);
           return;
@@ -3616,7 +3620,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
         expect(entryOf(config, taskId)?.taskLaunchError).toContain("recovery attempts");
         expect(failure?.errorType).toBe("task_recovery_limit");
         await waitForCondition(() => !taskService.isWorkspaceStopInProgress(taskId));
-        expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+        expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
       }
     );
   });
@@ -3816,7 +3820,7 @@ describe("TaskService attempt identity and send admission (G1)", () => {
     ).toBeNull();
     expect(clearQueue).not.toHaveBeenCalled();
     expect(stopStream).not.toHaveBeenCalled();
-    expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+    expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
     expect(svc.attemptSettlementByTaskId.get(taskId)?.attemptId).not.toBe(foreign);
   });
   test("a resume-failure rollback restores only the reawakened attempt: a row another backend re-admitted meanwhile keeps its running status", async () => {

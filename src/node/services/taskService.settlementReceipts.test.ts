@@ -60,7 +60,7 @@ const PREDECESSOR = "att_00000000000000f1";
 interface Internals {
   ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
   attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string; source: string }>;
-  workspaceStopRecords: Map<string, unknown>;
+  taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
   attemptSettlementListenersByTaskId: Map<string, Set<() => void>>;
   waitForWorkspaceStopsToRelease: (ids: readonly string[], deadlineMs: number) => Promise<void>;
   releaseSharedDesktopTaskOnUserStop: (taskId: string, abortOrigin: unknown) => Promise<void>;
@@ -617,7 +617,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
           expect((await taskService.stopDescendantAgentTask(rootId, taskId)).success).toBe(true);
           // A failed write still releases the latch (no latch pinned until restart).
           await waitForCondition(() => !taskService.isWorkspaceStopInProgress(taskId));
-          expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+          expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
         }
         expect(entryOf(config, taskId)?.taskStatus).toBe("interrupted");
         expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
@@ -955,7 +955,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
     });
     expect((await taskService.stopDescendantAgentTask(rootId, taskId)).success).toBe(true);
     await waitForCondition(() => !taskService.isWorkspaceStopInProgress(taskId));
-    expect(svc.workspaceStopRecords.has(taskId)).toBe(false);
+    expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
     expect(entryOf(config, taskId)?.taskAttemptId).toBe(successor);
     // Neither id gets a receipt: the predecessor's settlement vouches only while the row names it.
     await expectNoReceipt(config, taskId, successor);
@@ -1203,7 +1203,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       // Every other release condition holds once the cleanup paid back; the pending decision
       // alone keeps the latch, and no receipt write has even begun.
       const record = () =>
-        svc.workspaceStopRecords.get(taskId) as
+        svc.taskStopLatch.workspaceStopRecords.get(taskId) as
           | { cleanupInFlight: number; receipt?: string }
           | undefined;
       await waitForCondition(() => record()?.cleanupInFlight === 0);

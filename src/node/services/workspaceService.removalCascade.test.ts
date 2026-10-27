@@ -191,8 +191,9 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
     const userStopEpochs = (
       a.taskService as unknown as { workspaceUserStopEpochs: Map<string, number> }
     ).workspaceUserStopEpochs;
-    const stopEpochs = (a.taskService as unknown as { workspaceStopEpochs: Map<string, number> })
-      .workspaceStopEpochs;
+    const stopEpochs = (
+      a.taskService as unknown as { taskStopLatch: { workspaceStopEpochs: Map<string, number> } }
+    ).taskStopLatch.workspaceStopEpochs;
     expect([...userStopEpochs.keys()].sort()).toEqual([...allIds].sort());
     expect([...stopEpochs.keys()].sort()).toEqual([...allIds].sort());
 

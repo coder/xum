@@ -468,9 +468,9 @@ describe("TaskService", () => {
     // free it — otherwise the child stays barred from peer messaging until restart even after
     // every admission-visible marker refuses on its own.
     const internals = taskService as unknown as {
-      workspaceStopsInProgress: Map<string, number>;
+      taskStopLatch: { workspaceStopsInProgress: Map<string, number> };
     };
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
     // A STALE handle settling for the same workspace is NOT settlement for the live execution:
     // the mirror still points at wst_leaf, so releasing here would let the still-running child
@@ -487,14 +487,14 @@ describe("TaskService", () => {
       "wst_stale"
     );
     expect(staleInterrupt.success).toBe(true);
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
     const interrupted = await workspaceTurnManagerFor(taskService).interruptWorkspaceTurn(
       "tree-root",
       "wst_leaf"
     );
     expect(interrupted.success).toBe(true);
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
   test("successful no-op stream stop still retains the latch for an unsettled PREPARING execution the cascade could not settle", async () => {
@@ -546,8 +546,10 @@ describe("TaskService", () => {
     interruptSpy.mockRestore();
     expect(findWorkspaceInConfig(config, "leaf-a")?.taskStatus).toBe("reported");
 
-    const internals = taskService as unknown as { workspaceStopsInProgress: Map<string, number> };
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+    const internals = taskService as unknown as {
+      taskStopLatch: { workspaceStopsInProgress: Map<string, number> };
+    };
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
     // User resume clears the level-triggered suppression; only the retained latch refuses the
     // prepared turn's child until its execution settles.
@@ -568,7 +570,7 @@ describe("TaskService", () => {
       "wst_leaf"
     );
     expect(interrupted.success).toBe(true);
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
   test("settlement with a swallowed mirror write still refuses peer sends via registration removal", async () => {
@@ -615,9 +617,9 @@ describe("TaskService", () => {
     expect(interruptSpy).toHaveBeenCalledTimes(1);
     interruptSpy.mockRestore();
     const internals = taskService as unknown as {
-      workspaceStopsInProgress: Map<string, number>;
+      taskStopLatch: { workspaceStopsInProgress: Map<string, number> };
     };
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(true);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(true);
 
     // Settlement's terminal mirror write does not land (another writer replaced it), so the
     // on-disk mirror keeps claiming "running". Releasing the latch on the
@@ -641,7 +643,7 @@ describe("TaskService", () => {
     expect(
       workspaceTurnManagerFor(taskService).getLiveWorkspaceTurnRegistration("leaf-a")
     ).toBeUndefined();
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(false);
 
     taskService.resetAutoResumeCount("branch-a");
     expect(
@@ -702,7 +704,7 @@ describe("TaskService", () => {
       status: "interrupted",
     });
     const internals = taskService as unknown as {
-      workspaceStopsInProgress: Map<string, number>;
+      taskStopLatch: { workspaceStopsInProgress: Map<string, number> };
     };
     expect(
       workspaceTurnManagerFor(taskService).getLiveWorkspaceTurnRegistration("leaf-a")
@@ -712,7 +714,7 @@ describe("TaskService", () => {
       expect.objectContaining({ abandonPartial: false })
     );
     // No owner left to settle: the latch releases with the cascade instead of at restart.
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(false);
     // The owner's terminal wake for the handle its own Stop interrupted is suppressed (same as
     // task_stop), so a restart cannot resurrect it as a wake-up.
     const attention = await new TerminalAttentionStore(config).get(
@@ -760,8 +762,10 @@ describe("TaskService", () => {
     taskService.markParentWorkspaceInterrupted("branch-a");
     await taskService.terminateAllDescendantAgentTasks("branch-a");
 
-    const internals = taskService as unknown as { workspaceStopsInProgress: Map<string, number> };
-    expect(internals.workspaceStopsInProgress.has("leaf-a")).toBe(false);
+    const internals = taskService as unknown as {
+      taskStopLatch: { workspaceStopsInProgress: Map<string, number> };
+    };
+    expect(internals.taskStopLatch.workspaceStopsInProgress.has("leaf-a")).toBe(false);
   });
 
   test("sendAgentTreeMessage refuses root sends while an interrupted workspace turn winds down", async () => {
