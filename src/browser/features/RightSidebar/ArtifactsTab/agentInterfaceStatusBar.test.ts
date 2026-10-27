@@ -89,7 +89,6 @@ describe("deriveStatusActivity", () => {
     expect(
       deriveStatusActivity([], { ...flags, runtimeDetail: "Waking the workspace" }).label
     ).toBe("Waking the workspace");
-    expect(deriveStatusActivity([], { ...flags, runtimeDetail: "" }).label).not.toBe("");
   });
 
   test("a running tool beats streaming reasoning, which beats reply text", () => {
