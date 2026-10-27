@@ -405,8 +405,6 @@ function StatusPage(props: StatusViewProps) {
         interactions.handleKeyDown(e);
       }}
     >
-      {/* Host-rendered, outside the sandboxed page: live activity, the last send's state, a
-          transcript peek and Start Here, which the page covering the transcript would hide. */}
       <AgentInterfaceStatusBar workspaceId={workspaceId} />
       {interactions.strip}
       <div className="min-h-0 flex-1 overflow-auto">
