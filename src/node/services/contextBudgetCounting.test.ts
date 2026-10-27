@@ -274,6 +274,27 @@ describe("real-encoding budget guards", () => {
     ).toBe("context_budget_exceeded");
   });
 
+  test("request options on a user part still count", async () => {
+    // Anthropic sends a document part's context option to the model as text.
+    const attachment = {
+      type: "file",
+      mediaType: "application/pdf",
+      data: "JVBERi0xLjQ=",
+      providerOptions: { anthropic: { context: "a0b1c2d3e4f5".repeat(4000) } },
+    };
+    const request = { messages: [{ role: "user", content: [attachment] }] };
+    expect(
+      (await checkAssembledRequestBudgetForModel(request, { model, modelContextLimit: 10000 }))
+        ?.type
+    ).toBe("context_budget_exceeded");
+    expect(
+      await estimateFreshRequestTokensForModel(
+        { userText: "Summarize it.", attachments: [attachment], modelContextLimit: 10000 },
+        { model }
+      )
+    ).toBeGreaterThan(getContextBudgetHardCeiling(10000));
+  });
+
   test.each(["tool-json", "tool-content", "tool-input", "user-text"] as const)(
     "reasoning metadata lookalikes remain counted in %s",
     async (kind) => {

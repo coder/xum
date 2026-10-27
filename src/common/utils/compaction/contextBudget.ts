@@ -166,7 +166,8 @@ type BudgetContentKind =
   | "assistant-part"
   | "output"
   | "output-parts"
-  | "output-part";
+  | "output-part"
+  | "request-options";
 
 const BUDGET_ITEM_KIND: Partial<Record<BudgetContentKind, BudgetContentKind>> = {
   messages: "message",
@@ -258,10 +259,12 @@ function measureBudgetContent(
         (urlMedia && key === "url")
       )
         continue;
-      // providerOptions on a message or message part holds replay metadata, not input text:
-      // reasoning signatures and ciphertext, item IDs, cache hints, and Xum's own stash.
-      // Tool-output items keep it: some adapters send output.value as JSON text.
-      if (key === "providerOptions" && (messagePart || entry.kind === "message")) continue;
+      // On model output, providerOptions replays provider metadata (reasoning signatures and
+      // ciphertext, item IDs, cache hints), which providers do not bill as input text.
+      if (key === "providerOptions" && entry.kind === "assistant-part") continue;
+      // Options on user and tool content can reach the model as text (an Anthropic
+      // document's context and title), but adapters never send Xum's own namespace.
+      if (entry.kind === "request-options" && key === "mux") continue;
       toolResultChars += JSON.stringify(key).length + 2;
       textParts?.push(key);
       let childKind: typeof entry.kind = "json";
@@ -272,6 +275,8 @@ function measureBudgetContent(
         childKind = "output";
       } else if (entry.kind === "output" && record.type === "content" && key === "value") {
         childKind = "output-parts";
+      } else if (key === "providerOptions" && (messagePart || entry.kind === "message")) {
+        childKind = "request-options";
       }
       stack.push({ value: child, kind: childKind });
     }
