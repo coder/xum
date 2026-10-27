@@ -88,7 +88,8 @@ export function deriveStatusActivity(
   flags: StatusActivityFlags
 ): StatusActivity {
   if (flags.isStreamStarting) {
-    return { kind: "starting", label: flags.runtimeDetail ?? "Starting…" };
+    // || so an empty breadcrumb cannot blank the line.
+    return { kind: "starting", label: flags.runtimeDetail || "Starting…" };
   }
   if (flags.isCompacting) return { kind: "compacting", label: "Compacting context…" };
   if (flags.awaitingUserQuestion) return { kind: "question", label: "Waiting for your answer" };

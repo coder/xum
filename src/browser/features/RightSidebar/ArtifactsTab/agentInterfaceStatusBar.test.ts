@@ -89,6 +89,7 @@ describe("deriveStatusActivity", () => {
     expect(
       deriveStatusActivity([], { ...flags, runtimeDetail: "Waking the workspace" }).label
     ).toBe("Waking the workspace");
+    expect(deriveStatusActivity([], { ...flags, runtimeDetail: "" }).label).not.toBe("");
   });
 
   test("a running tool beats streaming reasoning, which beats reply text", () => {
@@ -171,8 +172,11 @@ describe("deriveLastMessageReceipt", () => {
   });
 
   test("held inputs win over the newest transcript row, the newest held input first", () => {
-    const newer: HeldInput = { ...held, id: "h2", displayText: "newer held text" };
-    expect(deriveLastMessageReceipt([user("in history")], null, [held, newer])).toMatchObject({
+    const middle: HeldInput = { ...held, id: "h2", displayText: "middle held text" };
+    const newer: HeldInput = { ...held, id: "h3", displayText: "newer held text" };
+    expect(
+      deriveLastMessageReceipt([user("in history")], null, [held, middle, newer])
+    ).toMatchObject({
       state: "held",
       preview: "newer held text",
     });

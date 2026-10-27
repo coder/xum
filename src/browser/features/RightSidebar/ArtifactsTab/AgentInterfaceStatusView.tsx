@@ -279,8 +279,10 @@ function StartHereButton(props: {
 }) {
   const source = findStartHereSource(props.messages);
   // No eligible reply counts as compacted, which keeps the hook's modal from opening.
+  // mutation-equivalent: an eligible reply always has text, so ?? and || agree
   const startHere = useStartHere(props.workspaceId, source?.content ?? "", source == null, {
     // Preserve legacy plan/exec markers so Start Here keeps plan→exec handoff for old history.
+    // mutation-equivalent: agent ids are never empty strings, so ?? and || agree
     sourceAgentId: source?.agentId ?? source?.mode,
   });
   return (

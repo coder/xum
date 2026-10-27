@@ -660,6 +660,10 @@ describe("Agent interface status view", () => {
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
     const bar = view.getByTestId("agent-interface-status-bar");
     expect(within(bar).queryByTestId("agent-interface-status-receipt")).toBeNull();
+    fireEvent.click(within(bar).getByRole("button", { name: "Show transcript" }));
+    expect(view.getByTestId("agent-interface-transcript-peek").textContent).toContain(
+      "No messages yet"
+    );
     expect(within(bar).getByRole("button", { name: "Start here" }).hasAttribute("disabled")).toBe(
       true
     );
