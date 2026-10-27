@@ -37,9 +37,9 @@ Xum harness. Where the two differ, follow this skill.
   suite, the story tests, the agent repros and the preflight of `make bug-bash`,
   `make mcp-apps-e2e` and `make test-stories` always refuse a stale key.
 - An image change lands in three steps: the PR that changes the Dockerfile, `build.sh` or
-  playwright-core passes CI on a local build. After it merges, a maintainer runs the manual
-  workflow "Bug-bash sandbox image" on main. Then a reviewed PR updates `image.json` to pin the
-  new digest. An e2e update that keeps playwright-core keeps the key, so the image stays valid.
+  playwright-core passes CI on a local build. Its merge push runs the workflow "Bug-bash sandbox
+  image" on main, which publishes the image once for each inputs key (a manual run on main
+  retries a failed publish). Then a reviewed PR updates `image.json` to pin the new digest. An e2e update that keeps playwright-core keeps the key, so the image stays valid.
 - The container gets `--network none`, `--read-only`, `--cap-drop ALL`, no-new-privileges, a
   non-root user, 4 GB memory and tmpfs scratch folders. It reads copies of the git-listed files,
   plus `dist/` and `node_modules/` read-only. An env allowlist passes no credential.
