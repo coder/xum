@@ -292,6 +292,7 @@ function pressAltChord(
     value: (modifier: string) => modifier === "AltGraph" && extra.altGraph === true,
   });
   fireEvent(target, event);
+  return event;
 }
 
 /**
@@ -810,11 +811,12 @@ describe("Agent interface status view", () => {
     const dialogShown = () => within(document.body).queryByRole("dialog") != null;
     const startHere = KEYBINDS.STATUS_START_HERE;
 
-    pressAltChord(window, startHere, { repeat: true });
+    // A held chord and the chord mid-turn open nothing, but the bar still claims them.
+    expect(pressAltChord(window, startHere, { repeat: true }).defaultPrevented).toBe(true);
     expect(dialogShown()).toBe(false);
     // Off while a turn runs, as the button is.
     updateSeededWorkspace("ws-bar-start-chord", { messages: MID_TURN, canInterrupt: true });
-    pressAltChord(window, startHere);
+    expect(pressAltChord(window, startHere).defaultPrevented).toBe(true);
     expect(dialogShown()).toBe(false);
 
     updateSeededWorkspace("ws-bar-start-chord", {
