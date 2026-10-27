@@ -952,6 +952,30 @@ describe("turn-start anchor (#7662)", () => {
       { contextUsage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 } },
       {},
     ],
+    [
+      "a negative reasoning count",
+      {
+        contextUsage: {
+          inputTokens: 1000,
+          outputTokens: 5,
+          totalTokens: 1005,
+          reasoningTokens: -900,
+        },
+      },
+      {},
+    ],
+    [
+      "a negative cache-read count",
+      {
+        contextUsage: {
+          inputTokens: 1000,
+          outputTokens: 5,
+          totalTokens: 1005,
+          cachedInputTokens: -900,
+        },
+      },
+      {},
+    ],
     ["a reply without its system count", { systemMessageTokens: undefined }, {}],
     ["a reply without its model", { model: undefined }, {}],
     ["another model", {}, { model: "openai:gpt-4.1" }],

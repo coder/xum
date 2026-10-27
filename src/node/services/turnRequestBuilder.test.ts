@@ -4,6 +4,7 @@ import { z } from "zod";
 import { getContextBudgetHardCeiling } from "@/common/utils/compaction/contextBudget";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import { estimateAssembledRequestTokensForModel } from "./contextBudgetCounting";
+import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
@@ -477,6 +478,48 @@ describe("TurnRequestBuilder assembled preflight", () => {
       { enabled: true }
     );
     expect(compaction.contextBudgetTurnAnchor).toBeUndefined();
+  });
+
+  // #7662: the reply's systemMessageTokens counted the system message and its rows, so a system
+  // message that grows by less than the retained rows still adds its growth.
+  it("adds system growth when the earlier request also sent system rows", async () => {
+    const opus = {
+      ...options(),
+      modelString: "anthropic:claude-opus-5-5",
+      providerForMessages: "anthropic",
+      routeProvider: "anthropic",
+    };
+    const stable = "stable instructions";
+    const tail = `\n\n[Warning: ${"retained row ".repeat(300)}]`;
+    const withSystem = (system: string, history: MuxMessage[]) =>
+      assembleBudgetCheckedPromptPayload(
+        { ...opus, history, systemMessage: system + tail, volatileSystemSuffixLength: tail.length },
+        { enabled: true }
+      );
+    const u1 = createMuxMessage("u1", "user", "first");
+    const a1 = createMuxMessage("a1", "assistant", "answer a1", {
+      volatileSystemTail: { text: "\n\n[Warning: A]", placement: "system" },
+    });
+    const u2 = createMuxMessage("u2", "user", "second");
+    const earlier = await withSystem(stable, [u1, a1, u2]);
+    expect(earlier.sentSystem.rowsText).not.toBe("");
+    const tokenizer = await getTokenizerForModel(opus.modelString);
+    const reply = createMuxMessage("a2", "assistant", "answer a2", {
+      model: opus.modelString,
+      metadataModel: opus.modelString,
+      agentId: "exec",
+      routeProvider: "anthropic",
+      volatileSystemTail: { text: tail, placement: "row" },
+      systemMessageTokens: await tokenizer.countTokens(
+        earlier.sentSystem.message + earlier.sentSystem.rowsText
+      ),
+      contextUsage: { inputTokens: 50_000, outputTokens: 10, totalTokens: 50_010 },
+    });
+    const history = [u1, a1, u2, reply, createMuxMessage("u3", "user", "third")];
+    const same = await withSystem(stable, history);
+    expect(same.contextBudgetTurnAnchor!.providerTokens).toBe(50_000);
+    const grown = await withSystem(`${stable} and more instructions`, history);
+    expect(grown.contextBudgetTurnAnchor!.providerTokens).toBeGreaterThan(50_000);
   });
 });
 

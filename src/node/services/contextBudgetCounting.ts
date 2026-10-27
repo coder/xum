@@ -177,6 +177,11 @@ export interface TurnBudgetAnchor extends BudgetModel {
   providerTokens: number;
 }
 
+/** Persisted usage is unchecked JSON: a negative count would shrink the anchor. */
+function isTokenCount(count: unknown): count is number {
+  return typeof count === "number" && Number.isSafeInteger(count) && count >= 0;
+}
+
 /**
  * The provider's count of a step's request (cache reads and writes included) plus the step's
  * reasoning output: the next request replays that reasoning, and the local estimator skips its
@@ -192,10 +197,12 @@ function replayedStepTokens(
 ): number | undefined {
   // Cache or reasoning details without an input total do not count the whole request.
   const input = usage.inputTokens;
-  if (input == null || !Number.isSafeInteger(input) || input <= 0) return undefined;
+  if (!isTokenCount(input) || input === 0) return undefined;
   // Provider-metadata-only reasoning counts are read too. Zero cannot tell "no reasoning" from
   // "not reported", so a step that emitted reasoning needs a count.
   const tokens = readUsageTokens(usage, providerMetadata);
+  const counts = [tokens.input, tokens.cached, tokens.cacheCreate, tokens.reasoning];
+  if (!counts.every(isTokenCount)) return undefined;
   if (emittedReasoning && tokens.reasoning === 0) return undefined;
   const total = getPromptTokens(tokens) + tokens.reasoning;
   return Number.isSafeInteger(total) ? total : undefined;
@@ -290,9 +297,10 @@ function lastStepEmittedReasoning(reply: Pick<MuxMessage, "parts" | "metadata">)
  * Opus 5.5 does) counts all of it, not the summary text the estimator sees. For a model that
  * drops it, this overcounts by that step's reasoning.
  *
- * Growth of `system`, the sent system text, since that request (a live system prompt changes
- * between turns when the provider takes no system rows) is added, because the provider count
- * holds the old prompt. New tail rows go after the newest reply, where the delta counts them.
+ * Growth of `system`, the sent system text with its system rows, since that request (a live
+ * system prompt changes between turns when the provider takes no system rows) is added, because
+ * the provider count holds the old prompt. A row this request appends after the newest reply is
+ * also in the delta, a small overcount.
  */
 export async function createTurnBudgetAnchor(
   rows: readonly MuxMessage[],
@@ -308,9 +316,8 @@ export async function createTurnBudgetAnchor(
     lastStepEmittedReasoning(row)
   );
   if (replayed == null) return undefined;
-  // The row counted its system text, tail rows included, with this tokenizer (measureSentSystem),
-  // so its rows only make the growth smaller. Claude-encoded growth is scaled like every other
-  // claude count (#5219).
+  // The row counted the same text (message and rows) with this tokenizer (measureSentSystem).
+  // Claude-encoded growth is scaled like every other claude count (#5219).
   const tokenizer = await getTokenizerForModel(request.model, request.metadataModel);
   const growth = (await tokenizer.countTokens(request.system)) - reply.systemMessageTokens;
   const factor = tokenizer.encoding === "claude" ? CLAUDE_ENCODING_BUDGET_FACTOR : 1;
