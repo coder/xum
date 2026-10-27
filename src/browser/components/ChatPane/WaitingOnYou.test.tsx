@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { act, cleanup, fireEvent, render, within } from "@testing-library/react";
 import { useState, type ReactNode } from "react";
-import { Ban, Clock3, MessageCircleQuestion } from "lucide-react";
+import { Ban, Clock3, FileInput, MessageCircleQuestion } from "lucide-react";
 import { installDom, stubNarrowViewport } from "../../../../tests/ui/dom";
 
 import { ChatDockSurface } from "./chatDockColumn";
@@ -28,6 +28,12 @@ const UNSENT: WaitingOnYouEntry = {
   title: "2 unsent messages",
   detail: "Not sent",
 };
+const OLD_PLAN: WaitingOnYouEntry = {
+  icon: FileInput,
+  tab: "Old plan",
+  title: "Plan from an older Xum",
+  detail: "Check it is yours, then import it",
+};
 const QUEUED: WaitingOnYouEntry = {
   icon: Clock3,
   tab: "Queued",
@@ -53,7 +59,18 @@ function SelfReporting(props: { open: boolean }) {
   return props.open ? <Counter label="question" /> : null;
 }
 
-function Stack(props: { question?: boolean; unsent?: boolean; queued?: boolean }) {
+/** A notice that stops waiting but keeps showing, like an old plan that was no longer there. */
+function Notice(props: { settled: boolean }) {
+  useWaitingOnYou(props.settled ? null : OLD_PLAN);
+  return <Counter label="notice" />;
+}
+
+function Stack(props: {
+  question?: boolean;
+  unsent?: boolean;
+  queued?: boolean;
+  notice?: "waiting" | "settled";
+}) {
   const slot = (id: WaitingOnYouId, entry: WaitingOnYouEntry | undefined, node: ReactNode) => (
     <WaitingOnYouSlot id={id} entry={entry}>
       {node}
@@ -65,6 +82,8 @@ function Stack(props: { question?: boolean; unsent?: boolean; queued?: boolean }
         {props.queued === true && slot("queued", QUEUED, <Counter label="queued" />)}
         {props.unsent === true && slot("held-inputs", UNSENT, <Counter label="unsent" />)}
         {slot("question", undefined, <SelfReporting open={props.question === true} />)}
+        {props.notice !== undefined &&
+          slot("legacy-plan", undefined, <Notice settled={props.notice === "settled"} />)}
         <WaitingOnYouCard />
       </div>
     </WaitingOnYouProvider>
@@ -218,6 +237,20 @@ describe("Waiting on you", () => {
     expect(view.queryByRole("region", { name: "Waiting on you" })).not.toBeNull();
     view.rerender(<Stack unsent />);
     expect(view.queryByRole("region", { name: "Waiting on you" })).toBeNull();
+  });
+
+  it("shows content that stopped waiting inline, next to the card, state intact", () => {
+    const view = render(<Stack question unsent notice="waiting" />);
+    const card = view.getByRole("region", { name: "Waiting on you" });
+    fireEvent.click(within(card).getByRole("tab", { name: "Old plan" }));
+    fireEvent.click(within(card).getByRole("button", { name: "notice 0" }));
+
+    view.rerender(<Stack question unsent notice="settled" />);
+    expect(within(card).getByText(/2 waiting on you/)).not.toBeNull();
+    expect(within(card).queryByRole("tab", { name: "Old plan" })).toBeNull();
+    const notice = view.getByRole("button", { name: "notice 1" });
+    expect(card.contains(notice)).toBe(false);
+    expect(isShown(notice)).toBe(true);
   });
 
   describe("on a phone", () => {

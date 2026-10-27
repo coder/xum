@@ -226,6 +226,24 @@ describe("panel shortcuts", () => {
     expect(document.activeElement).toBe(composer);
   });
 
+  it("bring focus back into a panel left open, then close it from there", () => {
+    stubLayout(400);
+    const view = render(<Line />);
+    const composer = view.getByRole("button", { name: "composer" });
+    composer.focus();
+    chord(composer, KEYBINDS.OPEN_REVIEWS_PANEL);
+    // Tab back to the composer: the non-modal panel stays open.
+    composer.focus();
+
+    chord(composer, KEYBINDS.OPEN_REVIEWS_PANEL);
+    const row = view.getByRole("button", { name: "Reviews row" });
+    expect(document.activeElement).toBe(row);
+
+    chord(row, KEYBINDS.OPEN_REVIEWS_PANEL);
+    expect(view.queryByRole("group", { name: "Reviews" })).toBeNull();
+    expect(document.activeElement).toBe(composer);
+  });
+
   it("return focus to where it was when Escape closes the panel", () => {
     stubLayout(400);
     const view = render(<Line />);

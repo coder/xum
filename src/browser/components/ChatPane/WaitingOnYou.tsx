@@ -58,7 +58,9 @@ type Entries = ReadonlyMap<WaitingOnYouId, WaitingOnYouEntry>;
 interface WaitingOnYouValue {
   /** True while two or more items wait: they render in the card (or sheet), not inline. */
   consolidated: boolean;
-  /** Where a slot's content goes while consolidated; null keeps it in the slot (hidden). */
+  /** Whether slot `id` waits on the user now (it has an entry). */
+  waits: (id: WaitingOnYouId) => boolean;
+  /** Where a slot's content goes while consolidated; null keeps it in the slot. */
   hostFor: (id: WaitingOnYouId) => HTMLElement | null;
 }
 
@@ -201,10 +203,11 @@ export function WaitingOnYouProvider(props: { children: ReactNode }) {
   const hosts = { body: bodyHost, after: afterHost, sheet: sheetShown ? sheetHost : null };
   const consolidated = arranged.consolidated;
   const hostFor = (id: WaitingOnYouId) => waitingHost(id, arranged, phone, hosts);
+  const waits = (id: WaitingOnYouId) => entries.has(id);
 
   return (
     <WaitingOnYouRegisterContext.Provider value={setEntries}>
-      <WaitingOnYouContext.Provider value={{ consolidated, hostFor }}>
+      <WaitingOnYouContext.Provider value={{ consolidated, waits, hostFor }}>
         <WaitingOnYouCardContext.Provider
           value={{
             entries: arranged.listed,
@@ -261,8 +264,13 @@ export function WaitingOnYouSlot(props: {
   }
   return (
     <WaitingOnYouSlotIdContext.Provider value={props.id}>
-      {/* While consolidated, items not shown in the card wait here, hidden. */}
-      <div ref={slotRef} className={waiting.consolidated ? "hidden" : "contents"}>
+      {/* While consolidated, waiting items not shown in the card wait here, hidden. Content
+          that no longer waits (an old-plan notice that found nothing to import) stays inline,
+          so its message stays visible next to the card. */}
+      <div
+        ref={slotRef}
+        className={waiting.consolidated && waiting.waits(props.id) ? "hidden" : "contents"}
+      >
         {createPortal(
           <ChatDockInsetProvider value={waiting.consolidated}>
             {props.children}

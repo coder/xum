@@ -37,7 +37,6 @@ const LEGACY_PLAN_ENTRY: WaitingOnYouEntry = {
 };
 
 export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (props) => {
-  useWaitingOnYou(LEGACY_PLAN_ENTRY);
   const liveApi = useLiveAPI();
   const registerSource = useOptionalCommandRegistry()?.registerSource;
   const [importing, setImporting] = useState(false);
@@ -46,6 +45,9 @@ export const LegacyPlanImportNotice: React.FC<LegacyPlanImportNoticeProps> = (pr
   // The notice keeps the reason but drops the button and the palette action, which could only
   // fail again. It goes away with the next mount, which asks the backend again.
   const [vanished, setVanished] = useState(false);
+  // Settled, the notice has nothing left for the user to do: it leaves the "Waiting on you" card
+  // and shows its reason inline.
+  useWaitingOnYou(vanished ? null : LEGACY_PLAN_ENTRY);
   // Synchronous guard: a click and the palette action can both land before the disabled state.
   const inFlightRef = useRef(false);
 

@@ -177,7 +177,9 @@ function focusPanel(panelId: string): void {
 /**
  * The chip's `panelKeybind`. The chord opens the panel and moves focus into it, recording where
  * focus was (usually the composer) so closing returns there; with focus in the open panel, the
- * chord closes it.
+ * chord closes it. With the panel open and focus elsewhere (Tab back to the composer), it moves
+ * focus back in rather than closing, as the background bashes shortcut does: the chord is how the
+ * keyboard reaches the list.
  */
 function usePanelChord(options: {
   keybind: Keybind | undefined;

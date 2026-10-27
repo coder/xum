@@ -4717,7 +4717,7 @@ export const BUILTIN_SKILL_FILES: Record<string, Record<string, string>> = {
       "",
       "## Composer Activity",
       "",
-      "In the desktop app, these shortcuts open a list from the line above the composer and move focus into it. Press the shortcut again, or `Esc`, to close the list and return focus to where it was.",
+      "In the desktop app, these shortcuts open a list from the line above the composer and move focus into it. If the list is already open but focus is elsewhere, the shortcut moves focus back into it. Press the shortcut again from inside the list, or `Esc`, to close the list and return focus to where it was.",
       "",
       "| Action          | Shortcut     |",
       "| --------------- | ------------ |",
