@@ -4,6 +4,7 @@ import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { BackgroundBashOutputDialog } from "../BackgroundBashOutputDialog/BackgroundBashOutputDialog";
 import { ChatInputDecoration } from "../ChatPane/ChatInputDecoration";
+import { useChatActivityPanel } from "../ChatPane/chatActivityPanels";
 import { formatDuration } from "@/common/utils/formatDuration";
 import {
   useBackgroundBashTerminatingIds,
@@ -48,9 +49,16 @@ function restoreFocus(
   }
 }
 
-/** The strip's expand/collapse button, which ChatInputDecoration renders just before the list. */
-function stripToggle(list: HTMLElement | null): Element | null {
-  return list?.previousElementSibling ?? null;
+/**
+ * The strip's expand/collapse control: the live line's chip, or else the row button that
+ * ChatInputDecoration renders just before the list (the VS Code webview's tray).
+ */
+function stripToggle(root: HTMLElement | null, list: HTMLElement | null): Element | null {
+  return root?.querySelector("[data-activity-chip]") ?? list?.previousElementSibling ?? null;
+}
+
+function backgroundBashNoun(count: number): string {
+  return count === 1 ? "background bash" : "background bashes";
 }
 
 /**
@@ -75,7 +83,7 @@ interface BackgroundProcessesBannerProps {
  */
 export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps> = (props) => {
   const [viewingProcessId, setViewingProcessId] = useState<string | null>(null);
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpanded, setIsExpanded] = useChatActivityPanel("background-bashes");
   const [, setTick] = useState(0);
   const processes = useBackgroundProcesses(props.workspaceId);
   const terminatingIds = useBackgroundBashTerminatingIds(props.workspaceId);
@@ -139,7 +147,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       event.preventDefault();
       if (event.repeat) return;
       if (listRef.current?.contains(document.activeElement)) {
-        const toggle = stripToggle(listRef.current);
+        const toggle = stripToggle(rootRef.current, listRef.current);
         setIsExpanded(false);
         restoreFocus(returnFocusRef, toggle);
       } else {
@@ -160,7 +168,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, onFocusRequest);
     };
-  }, [count, props.workspaceId, paneScope]);
+  }, [count, props.workspaceId, paneScope, setIsExpanded]);
 
   useEffect(() => {
     if (focusRequest > 0) focusProcessRow(listRef.current, 0);
@@ -204,7 +212,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     const proc = visibleProcesses[index];
     if (!row || !proc) return;
     if (matchesKeybind(event, KEYBINDS.CANCEL)) {
-      const toggle = stripToggle(listRef.current);
+      const toggle = stripToggle(rootRef.current, listRef.current);
       setIsExpanded(false);
       restoreFocus(returnFocusRef, toggle);
     } else if (matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_NEXT)) {
@@ -248,9 +256,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     [terminate]
   );
 
-  const handleToggle = useCallback(() => {
-    setIsExpanded((prev) => !prev);
-  }, []);
+  const handleToggle = () => setIsExpanded((prev) => !prev);
 
   // Don't render if no running processes and no dialog open.
   if (count === 0 && !viewingProcessId) {
@@ -266,13 +272,28 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
           contentClassName="max-h-48 space-y-1.5 overflow-y-auto py-2"
           contentRef={listRef}
           onContentKeyDown={handleListKeyDown}
+          dataComponent="BackgroundProcessesBanner"
+          activityId="background-bashes"
+          chipLabel={`${count} ${backgroundBashNoun(count)}`}
+          chipTooltip={
+            <>
+              Background bashes
+              <kbd className={SHORTCUT_HINT_CLASS}>
+                {formatKeybind(KEYBINDS.FOCUS_BACKGROUND_PROCESSES)}
+              </kbd>
+            </>
+          }
+          chip={
+            <>
+              <Terminal className="size-3.5 shrink-0" />
+              <span className="counter-nums">{count}</span>
+            </>
+          }
           summary={
             <>
               <Terminal className="text-muted group-hover:text-secondary size-3.5 transition-colors" />
               <span className="text-muted group-hover:text-secondary transition-colors">
-                <span className="font-medium">{count}</span>
-                {" background bash"}
-                {count !== 1 && "es"}
+                <span className="font-medium">{count}</span> {backgroundBashNoun(count)}
               </span>
             </>
           }

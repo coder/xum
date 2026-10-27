@@ -36,6 +36,10 @@ interface StreamingBarrierProps {
    * When provided, this path should preserve compaction edit state + follow-up content.
    */
   onCancelCompaction?: () => void;
+  /** Activity chips sharing the row; see StreamingBarrierView's `activity`. */
+  activity?: React.ReactNode;
+  /** Name the model in the status label (default true); the composer's live line drops it. */
+  showModelName?: boolean;
 }
 
 // Debounce delay for transient startup/streaming/compacting label churn.
@@ -164,6 +168,8 @@ interface StreamingBarrierContentProps {
    * compaction "configure" hint is not shown.
    */
   onConfigureCompaction?: () => void;
+  activity?: React.ReactNode;
+  showModelName?: boolean;
 }
 
 /**
@@ -176,6 +182,8 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
   className,
   vimEnabled,
   onCancelCompaction,
+  activity,
+  showModelName,
 }) => {
   const workspaceState = useWorkspaceState(workspaceId);
   const aggregator = useWorkspaceAggregator(workspaceId);
@@ -231,9 +239,33 @@ export const StreamingBarrier: React.FC<StreamingBarrierProps> = ({
       className={className}
       onCancel={handleCancel}
       onConfigureCompaction={() => openSettings("tasks")}
+      activity={activity}
+      showModelName={showModelName}
     />
   );
 };
+
+/**
+ * The model the status label names:
+ * - "starting" phase: prefer pendingStreamModel (from muxMetadata), then the composer model
+ * - Otherwise: use currentModel from active stream
+ * Null when the host leaves the name out: the composer's live line, where the model picker sits
+ * right below and the activity chips need the room.
+ */
+function getStatusModelName(input: {
+  phase: StreamingPhase | null;
+  showModelName: boolean;
+  workspaceId: string;
+  currentModel: string | null;
+  pendingStreamModel: string | null;
+}): string | null {
+  if (!input.showModelName) return null;
+  const model =
+    input.phase === "starting"
+      ? (input.pendingStreamModel ?? getWorkspaceAiSelection(input.workspaceId).model)
+      : input.currentModel;
+  return model ? getModelName(model) : null;
+}
 
 /**
  * Presentational barrier logic shared by desktop and the VS Code webview (#4971): phase,
@@ -248,6 +280,8 @@ export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = (
   className,
   onCancel,
   onConfigureCompaction,
+  activity,
+  showModelName = true,
 }) => {
   const {
     canInterrupt,
@@ -282,14 +316,13 @@ export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = (
   const tokenCount = showTokenCount ? streamingStats?.tokenCount : undefined;
   const tps = showTokenCount ? streamingStats?.tps : undefined;
 
-  // Model to display:
-  // - "starting" phase: prefer pendingStreamModel (from muxMetadata), then the composer model
-  // - Otherwise: use currentModel from active stream
-  const model =
-    phase === "starting"
-      ? (pendingStreamModel ?? getWorkspaceAiSelection(workspaceId).model)
-      : currentModel;
-  const modelName = model ? getModelName(model) : null;
+  const modelName = getStatusModelName({
+    phase,
+    showModelName,
+    workspaceId,
+    currentModel,
+    pendingStreamModel,
+  });
 
   // Prefer parent vim state (subscribed in ChatPane) so the hint updates immediately.
   const vimEnabled = vimEnabledFromParent ?? getUserPreferences().appearance?.vimEnabled === true;
@@ -329,7 +362,16 @@ export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = (
   const statusText = useStabilizedStreamingStatusText(workspaceId, phase, rawStatusText);
 
   if (!phase || statusText == null) {
-    return null;
+    // Between turns the row stays for its activity chips; it hides itself when none render.
+    return activity === undefined ? null : (
+      <StreamingBarrierView
+        statusText={null}
+        cancelText=""
+        reserveStatsSlot={false}
+        className={className}
+        activity={activity}
+      />
+    );
   }
 
   // Compute cancel hint based on phase
@@ -376,6 +418,7 @@ export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = (
       reserveStatsSlot={phase !== "waiting-on-monitor"}
       hideHintOnNarrow={phase === "waiting-on-monitor"}
       className={className}
+      activity={activity}
       hintElement={
         showCompactionHint ? (
           <button

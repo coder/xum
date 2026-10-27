@@ -2,8 +2,9 @@
  * Pinned TODO panel with a list as long as MAX_TODOS allows (a 9-step playbook plus task items).
  *
  * The panel has a fixed max height, and completed items come first, so a long list used to open
- * with the current item below the fold. Each play asserts that the in-progress row is inside the
- * panel's visible area and that the panel does not overflow horizontally.
+ * with the current item below the fold. Each play opens the TODO chip's panel and asserts that the
+ * in-progress row is inside the panel's visible area and that the panel does not overflow
+ * horizontally.
  *
  * Play-only: the Pixel snapshot budget is full, and the plays (not a snapshot) carry the
  * behavior. The PR that added them has desktop and 390px screenshots.
@@ -12,8 +13,6 @@
 import type { ComponentType } from "react";
 import { waitFor } from "storybook/test";
 
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import { getPinnedTodoExpandedKey } from "@/common/constants/storage";
 import type { TodoItem } from "@/common/types/tools";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
@@ -21,7 +20,11 @@ import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
 import { createTodoWriteTool } from "./mocks/tools";
 import { STABLE_TIMESTAMP } from "./mocks/workspaces";
-import { blurActiveElement, waitForScrollStabilization } from "./storyPlayHelpers.js";
+import {
+  blurActiveElement,
+  openChatActivityPanel,
+  waitForScrollStabilization,
+} from "./storyPlayHelpers.js";
 
 export default {
   ...appMeta,
@@ -47,7 +50,6 @@ const LONG_TODOS: TodoItem[] = [
 ];
 
 function setupLongTodoStory(workspaceId: string) {
-  updatePersistedState(getPinnedTodoExpandedKey(workspaceId), true);
   return setupSimpleChatStory({
     workspaceId,
     workspaceName: "todo-cap",
@@ -69,12 +71,15 @@ function setupLongTodoStory(workspaceId: string) {
 async function assertCurrentTodoVisible(canvasElement: HTMLElement) {
   const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
   await waitForScrollStabilization(storyRoot);
+  await openChatActivityPanel(storyRoot, "PinnedTodoList");
   blurActiveElement();
   await waitFor(() => checkCurrentTodoVisible(storyRoot), { timeout: 10_000 });
 }
 
 function checkCurrentTodoVisible(storyRoot: HTMLElement) {
-  const panel = storyRoot.querySelector<HTMLElement>('[data-component="PinnedTodoList"]');
+  const panel = storyRoot.querySelector<HTMLElement>(
+    '[data-component="PinnedTodoList"] [data-activity-panel]'
+  );
   if (panel === null) {
     throw new Error("Pinned TODO panel not found");
   }

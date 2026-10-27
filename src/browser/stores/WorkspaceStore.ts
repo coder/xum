@@ -111,7 +111,7 @@ import {
 } from "@/browser/utils/messages/liveBashOutputBuffer";
 import { readPersistedState, updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { isDesktopMode } from "@/browser/hooks/useDesktopTitlebar";
-import { getAutoRetryKey, getPinnedTodoExpandedKey } from "@/common/constants/storage";
+import { getAutoRetryKey } from "@/common/constants/storage";
 import { APPROX_CHARS_PER_TOKEN } from "@/constants/streaming";
 import { trackStreamCompleted } from "@/common/telemetry";
 import { isWorkflowRunEmittingToolName } from "@/common/utils/workflowRunMessages";
@@ -734,21 +734,6 @@ function isIteratorValidationFailed(error: unknown): error is Error {
   );
 }
 
-/**
- * Auto-collapse the pinned TODO panel when a workspace's stream stops.
- * Lives in the store (not the component) because PinnedTodoList is only
- * mounted for the active workspace — background workspaces would miss
- * the transition. Callers supply the authoritative hasTodos value: the
- * live aggregator for active workspaces, the backend snapshot for background ones.
- */
-function collapsePinnedTodoOnStreamStop(workspaceId: string, hasTodos: boolean): void {
-  if (!hasTodos) {
-    return;
-  }
-
-  updatePersistedState(getPinnedTodoExpandedKey(workspaceId), false);
-}
-
 const EMPTY_ACTIVE_WORKFLOW_RUN_IDS: string[] = [];
 
 function areStringArraysEqual(
@@ -1330,8 +1315,6 @@ export class WorkspaceStore {
         }
       }
 
-      collapsePinnedTodoOnStreamStop(workspaceId, aggregator.getCurrentTodos().length > 0);
-
       // Flush any pending debounced bump before final bump to avoid double-bump
       this.cancelPendingIdleBump(workspaceId);
       this.cancelPendingStreamingBump(workspaceId);
@@ -1359,8 +1342,6 @@ export class WorkspaceStore {
           true
         );
       }
-
-      collapsePinnedTodoOnStreamStop(workspaceId, aggregator.getCurrentTodos().length > 0);
 
       // Flush any pending debounced bump before final bump to avoid double-bump
       this.cancelPendingIdleBump(workspaceId);
@@ -4098,12 +4079,6 @@ export class WorkspaceStore {
 
     const stoppedStreamingSnapshot =
       previous?.streaming === true && snapshot?.streaming === false ? snapshot : null;
-    // Activity snapshots only collapse for background workspaces — active workspaces
-    // already collapse from onChat stream-end/stream-abort, which is faster and authoritative.
-    // Firing here too would let a late async snapshot override the user re-expanding the panel.
-    if (stoppedStreamingSnapshot && !this.isOnChatSubscriptionActive(workspaceId)) {
-      collapsePinnedTodoOnStreamStop(workspaceId, stoppedStreamingSnapshot.hasTodos === true);
-    }
     // The pinned side chat is on screen with a live onChat loop, so like the routed chat it
     // gets completion from onChat stream-end, never an activity-driven background notification.
     const isBackgroundStreamingStop =

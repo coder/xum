@@ -5,10 +5,9 @@ import { createMockORPCClient } from "./mocks/orpc";
 import { groupWorkspacesByProject } from "./mocks/workspaces";
 import { expandLeftSidebar, expandProjects, selectWorkspace } from "./helpers/uiState";
 
-import { getSubAgentTasksExpandedKey } from "@/common/constants/storage";
-import { updatePersistedState } from "@/browser/hooks/usePersistedState";
 import { workspaceStore } from "@/browser/stores/WorkspaceStore";
 import { appMeta, AppWithMocks, type AppStory } from "./meta.js";
+import { openChatActivityPanel } from "./storyPlayHelpers.js";
 import { setupSimpleChatStory } from "./helpers/chatSetup";
 import { collapseLeftSidebar, collapseRightSidebar } from "./helpers/uiState";
 import { createAssistantMessage, createUserMessage } from "./mocks/messages";
@@ -21,7 +20,6 @@ const PROJECT_PATH = "/home/user/projects/mux";
 function setupPersistentSubagentsStory() {
   collapseLeftSidebar();
   collapseRightSidebar();
-  updatePersistedState(getSubAgentTasksExpandedKey(PARENT_WORKSPACE_ID), true);
 
   return setupSimpleChatStory({
     workspaceId: PARENT_WORKSPACE_ID,
@@ -134,7 +132,6 @@ function setupMonitoredSubagentStory(sidebarExpanded = true) {
   collapseRightSidebar();
   expandProjects([PROJECT_PATH]);
   selectWorkspace(parent);
-  updatePersistedState(getSubAgentTasksExpandedKey(PARENT_WORKSPACE_ID), true);
   const client = createMockORPCClient({
     projects: groupWorkspacesByProject([parent, child]),
     workspaces: [parent, child],
@@ -203,6 +200,7 @@ export const BackgroundMonitor: AppStory = {
       });
 
     await step("A completed report fences off stale streaming without a monitor", async () => {
+      await openChatActivityPanel(canvasElement, "SubAgentTasksDecoration");
       await expectSettled();
       await expect(sidebar().classList.contains("mobile-sidebar-collapsed")).toBe(
         canvasElement.querySelector('[data-testid="subagent-phone-frame"]') !== null
@@ -212,13 +210,14 @@ export const BackgroundMonitor: AppStory = {
       emitMonitorCount(1);
       await expectMonitored();
     });
-    await step("Collapsing hides the rows; expanding brings them back", async () => {
-      await userEvent.click(within(tray()).getAllByRole("button")[0]);
+    await step("Closing the chip's panel hides the rows; reopening brings them back", async () => {
+      const chip = within(tray()).getByRole("button", { name: "1 sub-agent, 1 active" });
+      await userEvent.click(chip);
       await settle(async () => {
         await expect(trayRow()).toBeNull();
-        await expect(tray()).toHaveTextContent("1 sub-agent · 1 active");
+        await expect(chip).toHaveAttribute("aria-expanded", "false");
       });
-      await userEvent.click(within(tray()).getAllByRole("button")[0]);
+      await userEvent.click(chip);
       await expectMonitored();
     });
     await step("A second monitor counts the same child once", async () => {
@@ -251,12 +250,17 @@ export const BackgroundMonitorPhone: AppStory = {
   },
 };
 
+const openSubAgentsPanel: AppStory["play"] = async ({ canvasElement }) => {
+  await openChatActivityPanel(canvasElement, "SubAgentTasksDecoration");
+};
+
 export const Expanded: AppStory = {
   render: () => <AppWithMocks setup={setupPersistentSubagentsStory} />,
   parameters: {
     ...appMeta.parameters,
     pixel: { matrix: { themes: ["dark", "light"], viewports: ["laptop"] } },
   },
+  play: openSubAgentsPanel,
 };
 
 export const Phone: AppStory = {
@@ -270,4 +274,5 @@ export const Phone: AppStory = {
     ...appMeta.parameters,
     pixel: { matrix: { themes: ["dark", "light"], viewports: ["phone"] } },
   },
+  play: openSubAgentsPanel,
 };

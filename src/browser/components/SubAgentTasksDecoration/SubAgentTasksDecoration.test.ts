@@ -6,6 +6,7 @@ import type { WorkspaceSidebarState } from "@/browser/stores/WorkspaceStore";
 import {
   collectDescendantAgents,
   decodeDescendantActivity,
+  describeSubAgentsChip,
   encodeDescendantActivity,
   getSubAgentStatusPresentation,
   isSubAgentActive,
@@ -433,5 +434,52 @@ describe("reconcileNestedRunLiveness", () => {
     expect(dead).toEqual([]);
     expect(failureCounts.get("wfr_gone")).toBe(1);
     expect(failureCounts.get("wfr_ok")).toBeUndefined();
+  });
+});
+
+describe("describeSubAgentsChip", () => {
+  const agent = (id: string, options: Partial<FrontendWorkspaceMetadata> = {}) => ({
+    workspace: workspace(id, options),
+    depth: 1,
+  });
+  const describeChip = (input: {
+    subAgents?: ReturnType<typeof agent>[];
+    workflowGroups?: WorkflowAgentGroup[];
+    activeCount?: number;
+  }) =>
+    describeSubAgentsChip({
+      subAgents: input.subAgents ?? [],
+      workflowGroups: input.workflowGroups ?? [],
+      activity: new Map(),
+      activeCount: input.activeCount ?? 0,
+      workflowSummary: null,
+    });
+
+  test("counts sub-agents, or workflow runs when no sub-agent is user-owned", () => {
+    const groups = [
+      { runId: "run-1", workers: [agent("w1")] },
+      { runId: "run-2", workers: [] },
+    ];
+    expect(describeChip({ subAgents: [agent("a1")], workflowGroups: groups }).count).toBe(1);
+    expect(describeChip({ workflowGroups: groups }).count).toBe(2);
+  });
+
+  test("reads as active while a sub-agent, a workflow worker, or a run between workers is", () => {
+    const reported = agent("w-reported", { taskStatus: "reported" });
+    const queued = agent("w-queued", { taskStatus: "queued" });
+    expect(describeChip({ subAgents: [reported], activeCount: 1 }).active).toBe(true);
+    expect(describeChip({ workflowGroups: [{ runId: "r", workers: [queued] }] }).active).toBe(true);
+    // A retained run with no workers yet is between sequential steps, so it is still running.
+    expect(describeChip({ workflowGroups: [{ runId: "r", workers: [] }] }).active).toBe(true);
+  });
+
+  test("reads as idle when every sub-agent and workflow worker has reported", () => {
+    const reported = agent("w-reported", { taskStatus: "reported" });
+    expect(
+      describeChip({
+        subAgents: [reported],
+        workflowGroups: [{ runId: "r", workers: [reported] }],
+      }).active
+    ).toBe(false);
   });
 });
