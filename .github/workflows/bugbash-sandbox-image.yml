@@ -95,10 +95,13 @@ jobs:
             exit 1
           fi
           make -s bugbash-sandbox-publish > image.json
-          # The subject of the attestation is this build's own output (image.json).
+          # The subject of the attestation is this build's own output (image.json). Assignments, not
+          # $(...) inside echo: a failed jq must fail the step, or an empty digest would skip Attest.
+          image=$(jq -er .image image.json)
+          digest=$(jq -er .digest image.json)
           {
-            echo "image=$(jq -er .image image.json)"
-            echo "digest=$(jq -er .digest image.json)"
+            echo "image=$image"
+            echo "digest=$digest"
             echo "tag=$tag"
           } >> "$GITHUB_OUTPUT"
           {
