@@ -5,7 +5,7 @@ import { useAPI } from "@/browser/contexts/API";
 import { usePersistedState } from "@/browser/hooks/usePersistedState";
 import { useStartHere } from "@/browser/hooks/useStartHere";
 import { useWorkspaceStoreRaw, type WorkspaceState } from "@/browser/stores/WorkspaceStore";
-import { formatRelativeTime } from "@/browser/utils/ui/dateTime";
+import { formatTimestamp } from "@/browser/utils/ui/dateTime";
 import { AGENT_INTERFACE_TRANSCRIPT_PEEK_KEY } from "@/common/constants/storage";
 import { cn } from "@/common/lib/utils";
 import { AGENT_INTERFACE_STATUS_ARTIFACT } from "@/common/constants/artifacts";
@@ -229,7 +229,8 @@ function StatusBar(props: { workspaceId: string; state: WorkspaceState }) {
             <button
               type="button"
               aria-expanded={peekOpen}
-              aria-controls={panelId}
+              // The peek is unmounted while closed, and aria-controls must name an element that exists.
+              aria-controls={peekOpen ? panelId : undefined}
               onClick={() => setPeekOpen(!peekOpen)}
               className="text-muted hover:bg-hover hover:text-foreground focus-visible:ring-accent h-6 rounded px-1.5 focus-visible:ring-1"
             >
@@ -319,10 +320,12 @@ function ReceiptRow(props: { receipt: LastMessageReceipt }) {
       <span className="min-w-0 flex-1 truncate">{receipt.preview}</span>
       <span className={cn("shrink-0 font-medium", chip.className)}>
         {chip.label}
+        {/* The time the transcript shows on the row. A relative time would go stale: nothing
+            re-renders the bar while the workspace is idle, so it would read "just now" for good. */}
         {receipt.state === "in-transcript" && receipt.timestamp != null && (
-          <span className="text-muted counter-nums font-normal">
+          <span className="text-muted font-normal">
             {" · "}
-            {formatRelativeTime(receipt.timestamp)}
+            {formatTimestamp(receipt.timestamp)}
           </span>
         )}
       </span>

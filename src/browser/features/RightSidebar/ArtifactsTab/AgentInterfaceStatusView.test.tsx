@@ -623,7 +623,7 @@ describe("Agent interface status view", () => {
     const receipt = within(bar).getByTestId("agent-interface-status-receipt");
     expect(receipt.textContent).toContain("Then roll to 50%");
     expect(receipt.textContent).toContain("Queued");
-    expect(receipt.textContent).not.toMatch(/ago|just now/);
+    expect(receipt.textContent).not.toMatch(/\d:\d\d/);
     // Start Here would rewrite the context under the running turn.
     expect(within(bar).getByRole("button", { name: "Start here" }).hasAttribute("disabled")).toBe(
       true
@@ -631,6 +631,7 @@ describe("Agent interface status view", () => {
 
     const toggle = within(bar).getByRole("button", { name: "Show transcript" });
     expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(toggle.hasAttribute("aria-controls")).toBe(false);
     fireEvent.click(toggle);
     const peek = view.getByTestId("agent-interface-transcript-peek");
     expect(toggle.getAttribute("aria-controls")).toBe(peek.id);
@@ -645,8 +646,9 @@ describe("Agent interface status view", () => {
     const view = render(<MainPane workspaceId="ws-bar-idle" />, { wrapper: Wrapper });
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
     const bar = view.getByTestId("agent-interface-status-bar");
-    expect(within(bar).getByTestId("agent-interface-status-receipt").textContent).toContain(
-      "In transcript · just now"
+    // The row's clock time, as the transcript shows it, not a relative time that goes stale.
+    expect(within(bar).getByTestId("agent-interface-status-receipt").textContent).toMatch(
+      /In transcript · \d{1,2}:\d\d\s[AP]M$/
     );
     const startHere = within(bar).getByRole("button", { name: "Start here" });
     expect(startHere.hasAttribute("disabled")).toBe(false);
