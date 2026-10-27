@@ -31,7 +31,12 @@ test(
     const composer = screen.getByRole("textbox", "Message");
     const followUpAnswered = screen.getByText(`Mock response: ${followUp}`);
     const stopBusy = screen.getByText(WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE);
-    const sendFailed = screen.getByRole("alert", /^Message Send Failed/);
+    // Any error toast, whatever its title: an alert has no accessible name, and refusal titles
+    // vary, so match the toast by its Dismiss button.
+    const sendFailed = screen
+      .getByRole("alert")
+      .filter({ has: screen.getByRole("button", "Dismiss") })
+      .first();
     const outcome = async () =>
       (await followUpAnswered.isVisible())
         ? "answered"
@@ -55,7 +60,16 @@ test(
       await expect(stopBusy).not.toBeVisible();
       // The refused text comes back into the composer.
       await expect(composer).toHaveValue(followUp);
+      // A Stop that never settles must fail here, not resend until the runner's global timeout.
+      if (Date.now() >= deadline) {
+        throw new Error("the Stop did not settle within 20 s: every follow-up send was refused");
+      }
     }
+
+    // The reply text shows while it still streams. An edit tapped mid-stream was refused as
+    // "History changed" in 1 of 6 phone runs. This test covers an edit after the reply, so wait
+    // for the stream to end.
+    await expect(screen.getByRole("button", "Stop streaming")).not.toBeVisible({ timeout: 20_000 });
 
     await edit.tap();
     const editBox = screen.getByRole("textbox", "Edit message");
