@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { expect, fn, mocked, userEvent, waitFor, within } from "storybook/test";
 import { useState, type ComponentProps } from "react";
+import { waitForModalLayer } from "@/browser/stories/storyPlayHelpers";
 import { ForceDeleteModal } from "./ForceDeleteModal";
 
 const descendants = [
@@ -38,15 +39,9 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
-/**
- * The open dialog, once it takes pointer input. Radix locks `body` with `pointer-events: none`
- * in an effect and lifts it for the dialog content only on the next render, so a click right
- * after the dialog appears can land while the content still inherits `none` (#7646).
- */
+/** The open dialog, once it takes pointer input (#7646). */
 async function openDialog(canvasElement: HTMLElement): Promise<HTMLElement> {
-  const dialog = await within(canvasElement.ownerDocument.body).findByRole("dialog");
-  await waitFor(() => expect(getComputedStyle(dialog).pointerEvents).not.toBe("none"));
-  return dialog;
+  return waitForModalLayer(await within(canvasElement.ownerDocument.body).findByRole("dialog"));
 }
 
 export const ExplicitScope: Story = {
