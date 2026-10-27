@@ -2,11 +2,13 @@
  * The composer's live line in its busiest state: a turn is streaming while a TODO list, sub-agents,
  * background bashes, pending reviews and Chat Instructions are all active. Each kind used to take
  * its own full-width row above the composer; now each is a chip on the streaming status row, and
- * its list opens in a panel above the line.
+ * its list opens in a panel above the line. The SubAgentsOnly stories cover the line with one
+ * bordered chip and no TODO list.
  *
  * Play-only: the Pixel snapshot budget is full, and the plays (not a snapshot) carry the behavior.
  */
 
+import type { ComponentType } from "react";
 import { expect, screen, userEvent, waitFor, within } from "storybook/test";
 
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
@@ -45,12 +47,36 @@ const TODOS: TodoItem[] = [
   { content: "Report the stack as merged", status: "pending" },
 ];
 
+const BACKGROUND_BASHES = [
+  {
+    id: "bash-ci",
+    pid: 4242,
+    script: "gh pr checks 30958 --watch",
+    displayName: "CI watch",
+    startTime: STABLE_TIMESTAMP - 90_000,
+    status: "running" as const,
+  },
+  {
+    id: "bash-dev",
+    pid: 4343,
+    script: "bun run dev",
+    displayName: "dev server",
+    startTime: STABLE_TIMESTAMP - 60_000,
+    status: "running" as const,
+  },
+];
+
 // Set by the story setup so the play can end the streaming turn.
 let emitChat: (event: WorkspaceChatMessage) => void = () => {
   throw new Error("ComposerActivityLine story setup has not run");
 };
 
-function setupActivityLineStory(workspaceId: string) {
+// "sub-agents-only" drops the TODO list and every other chip, leaving one bordered chip.
+function setupActivityLineStory(
+  workspaceId: string,
+  activity: "worst-case" | "sub-agents-only" = "worst-case"
+) {
+  const worstCase = activity === "worst-case";
   const parent = createWorkspace({
     id: workspaceId,
     name: "provider-stack",
@@ -76,26 +102,28 @@ function setupActivityLineStory(workspaceId: string) {
   );
   const workspaces = [parent, ...subAgents];
 
-  seedMockReviewState(workspaceId, {
-    reviews: {
-      "review-1": createReview(
-        "review-1",
-        "src/node/provider.ts",
-        "42-48",
-        "Drop the retry",
-        "pending",
-        STABLE_TIMESTAMP
-      ),
-      "review-2": createReview(
-        "review-2",
-        "src/node/transport.ts",
-        "10",
-        "Rename",
-        "pending",
-        STABLE_TIMESTAMP
-      ),
-    },
-  });
+  if (worstCase) {
+    seedMockReviewState(workspaceId, {
+      reviews: {
+        "review-1": createReview(
+          "review-1",
+          "src/node/provider.ts",
+          "42-48",
+          "Drop the retry",
+          "pending",
+          STABLE_TIMESTAMP
+        ),
+        "review-2": createReview(
+          "review-2",
+          "src/node/transport.ts",
+          "10",
+          "Rename",
+          "pending",
+          STABLE_TIMESTAMP
+        ),
+      },
+    });
+  }
   selectWorkspace(parent);
   collapseLeftSidebar();
   collapseRightSidebar();
@@ -112,7 +140,7 @@ function setupActivityLineStory(workspaceId: string) {
     createAssistantMessage("msg-2", "#30928 and #30929 landed. Watching #30958 next.", {
       historySequence: 2,
       timestamp: STABLE_TIMESTAMP - 110_000,
-      toolCalls: [createTodoWriteTool("call-todo", TODOS)],
+      toolCalls: worstCase ? [createTodoWriteTool("call-todo", TODOS)] : [],
     }),
   ];
 
@@ -138,47 +166,27 @@ function setupActivityLineStory(workspaceId: string) {
         ],
       ])
     ),
-    backgroundProcesses: new Map([
-      [
-        workspaceId,
-        [
-          {
-            id: "bash-ci",
-            pid: 4242,
-            script: "gh pr checks 30958 --watch",
-            displayName: "CI watch",
-            startTime: STABLE_TIMESTAMP - 90_000,
-            status: "running" as const,
-          },
-          {
-            id: "bash-dev",
-            pid: 4343,
-            script: "bun run dev",
-            displayName: "dev server",
-            startTime: STABLE_TIMESTAMP - 60_000,
-            status: "running" as const,
-          },
-        ],
-      ],
-    ]),
-    additionalSystemContexts: new Map([
-      [workspaceId, { content: "Merge one PR at a time, bottom first.", enabled: true }],
-    ]),
+    backgroundProcesses: new Map(worstCase ? [[workspaceId, BACKGROUND_BASHES]] : []),
+    additionalSystemContexts: new Map(
+      worstCase
+        ? [[workspaceId, { content: "Merge one PR at a time, bottom first.", enabled: true }]]
+        : []
+    ),
   });
 }
 
 // TODO, sub-agents, background bashes, reviews and Chat Instructions.
 const CHIP_COUNT = 5;
 
-async function findLine(canvasElement: HTMLElement): Promise<HTMLElement> {
+async function findLine(canvasElement: HTMLElement, chipCount = CHIP_COUNT): Promise<HTMLElement> {
   const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
   await waitForChatMessagesLoaded(storyRoot);
   return waitFor(
     () => {
       const line = storyRoot.querySelector<HTMLElement>('[data-component="ChatActivityLine"]');
       const chips = line?.querySelectorAll("[data-activity-chip]") ?? [];
-      if (line == null || chips.length < CHIP_COUNT) {
-        throw new Error(`Expected five chips in the live line, found ${chips.length}`);
+      if (line == null || chips.length < chipCount) {
+        throw new Error(`Expected ${chipCount} chips in the live line, found ${chips.length}`);
       }
       if (within(line).queryByRole("button", { name: "Stop streaming" }) == null) {
         throw new Error("Live line is not streaming yet");
@@ -339,5 +347,75 @@ export const WorstCasePhone: AppStory = {
     await assertOneLine(line);
     await assertPanels(line, "sheet");
     await assertSheetTabs(line);
+  },
+};
+
+// Without a TODO chip the bordered chips follow the status label instead of sitting next to Stop
+// with a divider on each side of an empty gap.
+async function assertChipsLeftWithoutDividers(line: HTMLElement) {
+  const chips = line.querySelectorAll<HTMLElement>(
+    '[data-component="SubAgentTasksDecoration"] [data-activity-chip]'
+  );
+  await expect(chips).toHaveLength(1);
+  await expect(line.querySelectorAll("[data-activity-chip]")).toHaveLength(1);
+  const chip = chips[0];
+  const lineRect = line.getBoundingClientRect();
+  await expect(chip.getBoundingClientRect().right).toBeLessThan(lineRect.left + lineRect.width / 2);
+  const stop = within(line).getByRole("button", { name: "Stop streaming" });
+  await expect(stop.getBoundingClientRect().right).toBeGreaterThan(
+    lineRect.left + lineRect.width / 2
+  );
+  await expect(stop.getBoundingClientRect().right).toBeLessThanOrEqual(lineRect.right);
+  const dividers = [...line.querySelectorAll<HTMLElement>("[aria-hidden]")].filter((element) => {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.width <= 1 && rect.height > 0;
+  });
+  await expect(dividers).toHaveLength(0);
+}
+
+export const SubAgentsOnlyDesktop: AppStory = {
+  render: () => (
+    <AppWithMocks
+      setup={() => setupActivityLineStory("ws-activity-line-subagents-desktop", "sub-agents-only")}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    pixel: PIXEL_DISABLED,
+  },
+  play: async ({ canvasElement }) => {
+    const line = await findLine(canvasElement, 1);
+    await assertChipsLeftWithoutDividers(line);
+  },
+};
+
+// The line lays out by its own @container width, so a phone-width frame gives the test-runner
+// (which applies no globals.viewport) the phone line.
+function PhoneFrameDecorator(Story: ComponentType) {
+  return (
+    <div style={{ width: 390, maxWidth: "100%", height: 844, overflow: "hidden" }}>
+      <Story />
+    </div>
+  );
+}
+
+export const SubAgentsOnlyPhone: AppStory = {
+  globals: {
+    viewport: { value: "mobile1", isRotated: false },
+  },
+  decorators: [PhoneFrameDecorator],
+  render: () => (
+    <AppWithMocks
+      setup={() => setupActivityLineStory("ws-activity-line-subagents-phone", "sub-agents-only")}
+    />
+  ),
+  parameters: {
+    ...appMeta.parameters,
+    pixel: PIXEL_DISABLED,
+  },
+  play: async ({ canvasElement }) => {
+    const line = await findLine(canvasElement, 1);
+    await assertOneLine(line);
+    await assertChipsLeftWithoutDividers(line);
   },
 };

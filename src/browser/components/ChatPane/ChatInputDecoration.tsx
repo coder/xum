@@ -365,6 +365,7 @@ function ChatActivityChipButton(props: {
         ref={props.chipRef}
         type="button"
         data-activity-chip=""
+        data-activity-chip-plain={plain ? "" : undefined}
         aria-expanded={props.hasPanel ? props.open : undefined}
         aria-controls={props.open ? props.panelId : undefined}
         aria-label={props.label}
@@ -374,7 +375,8 @@ function ChatActivityChipButton(props: {
         // the inner span draws the chip: 28px in a wide line, and in a phone-width line the 44px
         // box of the approved phone design.
         // The order classes put a spacer (in StreamingBarrierView) between the plain TODO chip at
-        // the line's start and the bordered chips, which end the line next to Stop.
+        // the line's start and the bordered chips, which end the line next to Stop. The spacer
+        // shows only with a plain chip (data-activity-chip-plain), else bordered chips sit left.
         className={cn(
           "group/chip inline-flex min-w-0 items-center justify-center",
           plain ? "order-0" : "order-2 shrink-0",
