@@ -120,8 +120,8 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
 };
 
 /**
- * Stop, or the phase's hint. The approved desktop line divides the chips from Stop; the phone
- * line does not.
+ * Stop, or the phase's hint. With a TODO chip the approved desktop line divides the chips from
+ * Stop; the phone line does not. Without one the bordered chips sit left and need no divider.
  */
 function LineEnd(props: StreamingBarrierViewProps) {
   return (
@@ -129,7 +129,7 @@ function LineEnd(props: StreamingBarrierViewProps) {
       {props.activity !== undefined && props.cancelText.length > 0 && (
         <span
           aria-hidden
-          className="bg-border-light mr-3 hidden h-3 w-px shrink-0 @md:group-has-[[data-activity-chip]]/live:block"
+          className="bg-border-light mr-3 hidden h-3 w-px shrink-0 @md:group-has-[[data-activity-chip-plain]]/live:block"
         />
       )}
       <CancelControl {...props} />
@@ -184,26 +184,31 @@ function ActivityChips(props: {
 }) {
   return (
     <>
-      {/* Where the status label collapses to its dot (phones), the dot needs no divider. */}
+      {/* Only the plain TODO chip needs a divider after the status; a bordered chip separates
+          itself. Where the status label collapses to its dot (phones), the dot needs none. */}
       {props.showDivider && (
         <span
           aria-hidden
           className={cn(
             "bg-border-light hidden h-3 w-px shrink-0",
             props.compactOnNarrow
-              ? "@md:group-has-[[data-activity-chip]]/live:block"
-              : "group-has-[[data-activity-chip]]/live:block"
+              ? "@md:group-has-[[data-activity-chip-plain]]/live:block"
+              : "group-has-[[data-activity-chip-plain]]/live:block"
           )}
         />
       )}
       {/* Chips scroll sideways rather than wrap when a phone-width row runs out of room.
           No edge-fade mask here: a mask would also clip the chips' panels, which render
           inside this row but are positioned against the whole line. With chips the strip takes
-          the row's free width, and the spacer (between the plain TODO chip and the bordered
-          chips, by flex order) ends the line with the bordered chips next to Stop. */}
+          the row's free width. With a plain TODO chip the spacer (between it and the bordered
+          chips, by flex order) ends the line with the bordered chips next to Stop; without one
+          the spacer stays hidden so the bordered chips follow the status label. */}
       <div className="flex min-w-0 scrollbar-none items-center gap-1.5 overflow-x-auto has-[[data-activity-chip]]:flex-1">
         {props.children}
-        <span aria-hidden className="order-1 min-w-0 flex-1" />
+        <span
+          aria-hidden
+          className="order-1 hidden min-w-0 flex-1 group-has-[[data-activity-chip-plain]]/live:block"
+        />
       </div>
     </>
   );
