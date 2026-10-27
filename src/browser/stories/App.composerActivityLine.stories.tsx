@@ -13,6 +13,7 @@ import { expect, userEvent, waitFor, within } from "storybook/test";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { TodoItem } from "@/common/types/tools";
+import { NARROW_VIEWPORT_MAX_WIDTH_PX, SHORT_VIEWPORT_MAX_HEIGHT_PX } from "@/constants/layout";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
 import { createOnChatAdapter } from "./helpers/chatSetup";
@@ -24,7 +25,11 @@ import { createMockORPCClient } from "./mocks/orpc";
 import { seedMockReviewState } from "./mocks/reviewState";
 import { createTodoWriteTool } from "./mocks/tools";
 import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
-import { openChatActivityPanel, waitForChatMessagesLoaded } from "./storyPlayHelpers.js";
+import {
+  findChatActivityPanel,
+  openChatActivityPanel,
+  waitForChatMessagesLoaded,
+} from "./storyPlayHelpers.js";
 
 export default {
   ...appMeta,
@@ -203,27 +208,66 @@ async function assertOneLine(line: HTMLElement) {
 
 async function assertPanels(line: HTMLElement) {
   const chip = await openChatActivityPanel(line, "PinnedTodoList");
-  const panel = await waitFor(() => {
-    const found = line.querySelector<HTMLElement>("[data-activity-panel]");
-    if (found == null) throw new Error("TODO panel did not open");
-    return found;
-  });
+  const panel = await findChatActivityPanel();
   await expect(within(panel).getByText("Report the stack as merged")).toBeVisible();
   const panelRect = panel.getBoundingClientRect();
   await expect(panelRect.left).toBeGreaterThanOrEqual(0);
   await expect(panelRect.right).toBeLessThanOrEqual(window.innerWidth);
-  await expect(panelRect.bottom).toBeLessThanOrEqual(line.getBoundingClientRect().top);
 
-  // Opening another chip swaps the panel instead of stacking a second one.
-  await openChatActivityPanel(line, "BackgroundProcessesBanner");
-  await waitFor(() => expect(line.querySelectorAll("[data-activity-panel]")).toHaveLength(1));
-  await expect(within(line).getByText("CI watch")).toBeVisible();
+  // Switching lists swaps the panel instead of stacking a second one.
+  if (
+    window.innerWidth <= NARROW_VIEWPORT_MAX_WIDTH_PX ||
+    window.innerHeight <= SHORT_VIEWPORT_MAX_HEIGHT_PX
+  ) {
+    // Phone viewports (local Storybook's mobile1): the panels share the activity sheet, whose
+    // tabs switch between them.
+    const sheet = panel.closest<HTMLElement>('[role="dialog"]');
+    if (sheet === null) throw new Error("The TODO panel opened outside the activity sheet");
+    await userEvent.click(within(sheet).getByRole("tab", { name: /Bashes/ }));
+  } else {
+    // The test-runner's wide window: a popover above the line.
+    await expect(panelRect.bottom).toBeLessThanOrEqual(line.getBoundingClientRect().top);
+    await openChatActivityPanel(line, "BackgroundProcessesBanner");
+  }
+  await waitFor(() => expect(document.querySelectorAll("[data-activity-panel]")).toHaveLength(1));
+  await expect(within(await findChatActivityPanel()).getByText("CI watch")).toBeVisible();
 
   // Escape closes the panel and leaves the stream running.
   await userEvent.keyboard("{Escape}");
-  await waitFor(() => expect(line.querySelector("[data-activity-panel]")).toBeNull());
+  await waitFor(() => expect(document.querySelector("[data-activity-panel]")).toBeNull());
   await expect(within(line).getByRole("button", { name: "Stop streaming" })).toBeVisible();
   await expect(chip).toHaveAttribute("aria-expanded", "false");
+}
+
+// Clearing the plan and writing it again must leave one TODO chip: a stale chip from the cleared
+// plan once stayed behind (sibling chips shared a React key) next to the new one.
+async function assertTodoChipFollowsRewrite(line: HTMLElement, workspaceId: string) {
+  const writeTodos = (toolCallId: string, todos: TodoItem[]) => {
+    emitChat({
+      type: "tool-call-start",
+      workspaceId,
+      messageId: "msg-3",
+      toolCallId,
+      toolName: "todo_write",
+      args: { todos },
+      tokens: 5,
+      timestamp: STABLE_TIMESTAMP,
+    });
+    emitChat({
+      type: "tool-call-end",
+      workspaceId,
+      messageId: "msg-3",
+      toolCallId,
+      toolName: "todo_write",
+      result: { success: true, count: todos.length },
+      timestamp: STABLE_TIMESTAMP,
+    });
+  };
+  const todoChips = () => line.querySelectorAll('[data-component="PinnedTodoList"]');
+  writeTodos("call-todo-clear", []);
+  await waitFor(() => expect(todoChips()).toHaveLength(0));
+  writeTodos("call-todo-again", TODOS);
+  await waitFor(() => expect(todoChips()).toHaveLength(1));
 }
 
 // A turn ending must not remount the chips: that would close the open panel (and a bash output
@@ -241,7 +285,9 @@ async function assertPanelSurvivesTurnEnd(line: HTMLElement, workspaceId: string
   await waitFor(() =>
     expect(within(line).queryByRole("button", { name: "Stop streaming" })).toBeNull()
   );
-  await expect(within(line).getByText("Report the stack as merged")).toBeVisible();
+  await expect(
+    within(await findChatActivityPanel()).getByText("Report the stack as merged")
+  ).toBeVisible();
 }
 
 export const WorstCaseDesktop: AppStory = {
@@ -254,6 +300,7 @@ export const WorstCaseDesktop: AppStory = {
     const line = await findLine(canvasElement);
     await assertOneLine(line);
     await assertPanels(line);
+    await assertTodoChipFollowsRewrite(line, "ws-activity-line-desktop");
     await assertPanelSurvivesTurnEnd(line, "ws-activity-line-desktop");
   },
 };

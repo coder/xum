@@ -1,5 +1,19 @@
-import { createContext, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useId,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from "react";
+import { createPortal } from "react-dom";
+import { X } from "lucide-react";
+import { useNarrowViewport, useShortViewport } from "@/browser/hooks/useNarrowViewport";
+import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { isDialogOpen } from "@/browser/utils/ui/keybinds";
+import { cn } from "@/common/lib/utils";
 
 /**
  * The activity summaries that share the composer's live line as chips: the streaming status row
@@ -12,11 +26,31 @@ export type ChatActivityId =
   | "reviews"
   | "chat-instructions";
 
+/**
+ * The line's chip order, which the activity sheet's tabs follow too: a tab portals into the sheet
+ * when its chip mounts, so a chip that appears later would otherwise land at the end.
+ */
+export const CHAT_ACTIVITY_ORDER: Record<ChatActivityId, number> = {
+  todo: 0,
+  "sub-agents": 1,
+  "background-bashes": 2,
+  reviews: 3,
+  "chat-instructions": 4,
+};
+
 type OpenIdUpdate = (current: ChatActivityId | null) => ChatActivityId | null;
+
+/** Where chips render their tab and open panel on phones: the activity sheet. */
+export interface ChatActivitySheetSlots {
+  tabs: HTMLElement;
+  body: HTMLElement;
+}
 
 interface ChatActivityPanelsValue {
   openId: ChatActivityId | null;
   setOpenId: (update: OpenIdUpdate) => void;
+  /** Set on phones, where every panel opens in one bottom sheet with a tab per chip. */
+  sheet: ChatActivitySheetSlots | null;
 }
 
 const ChatActivityPanelsContext = createContext<ChatActivityPanelsValue | null>(null);
@@ -24,6 +58,11 @@ const ChatActivityPanelsContext = createContext<ChatActivityPanelsValue | null>(
 /** True inside the live line, where ChatInputDecoration renders a chip instead of a full row. */
 export function useInChatActivityLine(): boolean {
   return useContext(ChatActivityPanelsContext) !== null;
+}
+
+/** The activity sheet's slots while the line opens its panels in the sheet, else null. */
+export function useChatActivitySheet(): ChatActivitySheetSlots | null {
+  return useContext(ChatActivityPanelsContext)?.sheet ?? null;
 }
 
 type SetExpanded = (next: boolean | ((current: boolean) => boolean)) => void;
@@ -68,6 +107,10 @@ export function useReleaseChatActivityPanelOnUnmount(id: ChatActivityId | undefi
 /**
  * Owns the live line's single open panel. A press outside the line closes it, except inside a
  * modal opened from a panel (the background bash output dialog portals outside the line).
+ *
+ * On phones the panels open in one bottom sheet instead of a popover above the line, as in the
+ * approved phone design: the sheet carries a tab per chip, so every list is one tap away even when
+ * the chip strip has scrolled a chip out of view.
  */
 export function ChatActivityPanelsProvider(props: {
   children: ReactNode;
@@ -76,6 +119,8 @@ export function ChatActivityPanelsProvider(props: {
 }) {
   const [openId, setOpenIdState] = useState<ChatActivityId | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
+  const sheetViewport = useSheetViewport();
+  const { sheet, setSheetTabs, setSheetBody } = useSheetSlots(sheetViewport);
 
   useEffect(() => {
     if (openId === null) return;
@@ -89,10 +134,154 @@ export function ChatActivityPanelsProvider(props: {
   }, [openId]);
 
   return (
-    <ChatActivityPanelsContext.Provider value={{ openId, setOpenId: setOpenIdState }}>
+    <ChatActivityPanelsContext.Provider value={{ openId, setOpenId: setOpenIdState, sheet }}>
       <div ref={rootRef} className={props.className} data-component={props.dataComponent}>
         {props.children}
       </div>
+      {sheetViewport && (
+        <ChatActivitySheet
+          open={openId !== null}
+          onClose={() => setOpenIdState(null)}
+          tabsRef={setSheetTabs}
+          bodyRef={setSheetBody}
+        />
+      )}
     </ChatActivityPanelsContext.Provider>
+  );
+}
+
+/**
+ * True where the panels open in the sheet: phone widths, and viewports too short for a popover
+ * above the line (a phone in landscape), which would run off the top of the screen.
+ */
+function useSheetViewport(): boolean {
+  const narrow = useNarrowViewport();
+  const short = useShortViewport();
+  return narrow || short;
+}
+
+/**
+ * The activity sheet's slots, set only where the sheet renders. Callback refs into state, not
+ * refs: chips portal into the slots, and need them on the render after the sheet mounts.
+ */
+function useSheetSlots(sheetViewport: boolean) {
+  const [tabs, setSheetTabs] = useState<HTMLElement | null>(null);
+  const [body, setSheetBody] = useState<HTMLElement | null>(null);
+  const sheet: ChatActivitySheetSlots | null =
+    sheetViewport && tabs !== null && body !== null ? { tabs, body } : null;
+  return { sheet, setSheetTabs, setSheetBody };
+}
+
+/**
+ * Modal focus for the sheet: moves focus into it when it opens, unless a panel already placed it
+ * there (the background-bash chord focuses its first row; the line's effects run before the
+ * sheet's). Returns the sheet's close, which hands focus back to where it was before, if that
+ * element is still there.
+ */
+function useSheetFocus(
+  open: boolean,
+  dialogRef: RefObject<HTMLDivElement | null>,
+  onClose: () => void
+): () => void {
+  const returnFocusRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!open || dialog === null || dialog.contains(document.activeElement)) return;
+    returnFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    dialog.focus();
+  }, [open, dialogRef]);
+  return () => {
+    onClose();
+    const target = returnFocusRef.current;
+    returnFocusRef.current = null;
+    if (target?.isConnected) target.focus();
+  };
+}
+
+/**
+ * Escape closes the sheet. A DOM listener, not onKeyDown: the tabs and the panel portal into the
+ * sheet from their chips, so their React events bubble to the chips and never reach a React
+ * handler here. It runs after those handlers, so a panel that handles Escape itself (by
+ * preventing default or stopping it) keeps it, and it stops Escape before the window's stream
+ * interrupt sees it.
+ */
+function useSheetEscape(
+  open: boolean,
+  rootRef: RefObject<HTMLDivElement | null>,
+  close: () => void
+): void {
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!open || root === null) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented) return;
+      event.preventDefault();
+      stopKeyboardPropagation(event);
+      close();
+    };
+    root.addEventListener("keydown", onKeyDown);
+    return () => root.removeEventListener("keydown", onKeyDown);
+  }, [open, rootRef, close]);
+}
+
+/**
+ * The phone sheet. It stays mounted (hidden while closed) so its slots exist before a panel
+ * opens: the background-bash chord opens the panel and focuses its first row in one commit, which
+ * needs the row in the DOM on that commit.
+ */
+function ChatActivitySheet(props: {
+  open: boolean;
+  onClose: () => void;
+  tabsRef: (element: HTMLElement | null) => void;
+  bodyRef: (element: HTMLElement | null) => void;
+}) {
+  const titleId = useId();
+  const rootRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const open = props.open;
+  const close = useSheetFocus(open, dialogRef, props.onClose);
+  useSheetEscape(open, rootRef, close);
+
+  return createPortal(
+    <div
+      ref={rootRef}
+      className={cn("fixed inset-0 z-[1400]", !open && "hidden")}
+      data-component="ChatActivitySheet"
+    >
+      <div aria-hidden className="absolute inset-0 bg-black/50" onClick={close} />
+      <div
+        ref={dialogRef}
+        // Only while open: isDialogOpen() looks for an aria-modal dialog anywhere in the DOM.
+        role={open ? "dialog" : undefined}
+        aria-modal={open ? true : undefined}
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        className="bg-surface-primary border-border-medium absolute inset-x-0 bottom-0 flex max-h-[min(80vh,40rem)] flex-col rounded-t-2xl border-t pb-[env(safe-area-inset-bottom,0px)] shadow-lg outline-none"
+      >
+        <div aria-hidden className="bg-border-medium mx-auto mt-2 h-1 w-9 shrink-0 rounded-full" />
+        <div className="flex shrink-0 items-center gap-2 pt-2 pr-2 pl-4">
+          <h2 id={titleId} className="text-foreground text-base font-semibold">
+            Activity
+          </h2>
+          <button
+            type="button"
+            aria-label="Close"
+            onClick={close}
+            className="text-muted hover:text-foreground ml-auto inline-flex size-8 items-center justify-center rounded-md transition-colors"
+          >
+            <X className="size-4" />
+          </button>
+        </div>
+        <div
+          ref={props.tabsRef}
+          role="tablist"
+          aria-label="Activity"
+          className="bg-surface-secondary mx-4 mt-2 flex shrink-0 gap-1 rounded-lg p-1"
+        />
+        <div ref={props.bodyRef} className="flex min-h-0 flex-1 flex-col" />
+      </div>
+    </div>,
+    document.body
   );
 }

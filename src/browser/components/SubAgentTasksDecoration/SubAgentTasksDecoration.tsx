@@ -18,7 +18,10 @@ import { isActiveWorkflowRunStatus } from "@/common/types/workflow";
 import type { WorkflowRunLivenessEntry } from "@/common/orpc/schemas/api";
 import { shortenWorkflowRunId } from "@/browser/components/ProjectSidebar/sidebarTaskGroups";
 import { useRouter } from "@/browser/contexts/RouterContext";
-import { ChatInputDecoration } from "@/browser/components/ChatPane/ChatInputDecoration";
+import {
+  ActivityChipLiveDot,
+  ChatInputDecoration,
+} from "@/browser/components/ChatPane/ChatInputDecoration";
 import { useChatActivityPanel } from "@/browser/components/ChatPane/chatActivityPanels";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
@@ -739,14 +742,30 @@ export function describeSubAgentsChip(input: {
   };
 }
 
+/** The panel heading's detail: how many sub-agents work right now, then any workflow runs. */
+function formatSubAgentsPanelMeta(
+  subAgentCount: number,
+  activeCount: number,
+  workflowSummary: string | null
+): string {
+  const parts: string[] = [];
+  if (subAgentCount > 0) {
+    parts.push(activeCount > 0 ? `${activeCount} active` : "inactive");
+  }
+  if (workflowSummary !== null) parts.push(workflowSummary);
+  return parts.join(" · ");
+}
+
+/** The tray's icon, panel title and sheet tab name: it names sub-agents when it lists any. */
+const SUB_AGENTS_NAMES = { icon: Bot, panelTitle: "Sub-agents", tab: "Agents" };
+const WORKFLOWS_NAMES = { icon: Workflow, panelTitle: "Workflows", tab: "Workflows" };
+
 function SubAgentsChip(props: { icon: typeof Bot; count: number; active: boolean }) {
   return (
     <>
       <props.icon className="size-3.5 shrink-0" />
       <span className="counter-nums">{props.count}</span>
-      {props.active && (
-        <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-[var(--color-info)]" />
-      )}
+      {props.active && <ActivityChipLiveDot />}
     </>
   );
 }
@@ -770,7 +789,8 @@ export function SubAgentTasksContent(props: {
   const activeCount = props.subAgents.filter(({ workspace }) =>
     isSubAgentActive(workspace, props.descendantActivity.get(workspace.id))
   ).length;
-  const SummaryIcon = props.subAgents.length === 0 ? Workflow : Bot;
+  const names = props.subAgents.length > 0 ? SUB_AGENTS_NAMES : WORKFLOWS_NAMES;
+  const SummaryIcon = names.icon;
   const workflowSummary =
     props.workflowGroups.length > 0
       ? formatWorkflowSummary(props.workflowGroups, props.descendantActivity)
@@ -792,6 +812,15 @@ export function SubAgentTasksContent(props: {
       activityId="sub-agents"
       chipLabel={chip.label}
       chip={<SubAgentsChip icon={SummaryIcon} count={chip.count} active={chip.active} />}
+      panelTitle={names.panelTitle}
+      panelMeta={formatSubAgentsPanelMeta(props.subAgents.length, activeCount, workflowSummary)}
+      tab={
+        <>
+          <SummaryIcon className="size-4 shrink-0" />
+          <span>{names.tab}</span>
+          <span className="counter-nums text-muted">{chip.count}</span>
+        </>
+      }
       summary={
         <>
           <SummaryIcon className="text-muted group-hover:text-secondary size-3.5 shrink-0 transition-colors" />

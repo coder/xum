@@ -73,13 +73,13 @@ async function assertCurrentTodoVisible(canvasElement: HTMLElement) {
   await waitForScrollStabilization(storyRoot);
   await openChatActivityPanel(storyRoot, "PinnedTodoList");
   blurActiveElement();
-  await waitFor(() => checkCurrentTodoVisible(storyRoot), { timeout: 10_000 });
+  await waitFor(() => checkCurrentTodoVisible(), { timeout: 10_000 });
 }
 
-function checkCurrentTodoVisible(storyRoot: HTMLElement) {
-  const panel = storyRoot.querySelector<HTMLElement>(
-    '[data-component="PinnedTodoList"] [data-activity-panel]'
-  );
+function checkCurrentTodoVisible() {
+  // Anywhere in the document: phone viewports open the panel in the activity sheet, outside the
+  // line. Only one panel opens at a time.
+  const panel = document.querySelector<HTMLElement>("[data-activity-panel]");
   if (panel === null) {
     throw new Error("Pinned TODO panel not found");
   }
@@ -91,8 +91,11 @@ function checkCurrentTodoVisible(storyRoot: HTMLElement) {
   if (scroller === null) {
     throw new Error("Pinned TODO scroll container not found");
   }
-  // The list must actually overflow, or the visibility check below proves nothing.
-  if (scroller.scrollHeight <= scroller.clientHeight) {
+  // The list must actually overflow, or the visibility check below proves nothing. The phone
+  // sheet is exempt: it has room for the whole list on a phone screen, where the popover's
+  // height cap does not apply.
+  const inSheet = panel.closest('[role="dialog"]') !== null;
+  if (!inSheet && scroller.scrollHeight <= scroller.clientHeight) {
     throw new Error("Expected the long TODO list to overflow the pinned panel");
   }
 

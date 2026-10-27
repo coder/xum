@@ -419,6 +419,9 @@ export const StreamingBarrierContent: React.FC<StreamingBarrierContentProps> = (
       hideHintOnNarrow={phase === "waiting-on-monitor"}
       className={className}
       activity={activity}
+      compactStatusOnNarrow={
+        phase === "starting" || phase === "streaming" || phase === "awaiting-input"
+      }
       hintElement={
         showCompactionHint ? (
           <button

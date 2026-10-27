@@ -215,3 +215,15 @@ export async function openChatActivityPanel(
   }
   return chip;
 }
+
+/**
+ * The live line's open panel. Phone viewports open it in the activity sheet, which portals to the
+ * body, so this looks in the whole document rather than in the line.
+ */
+export async function findChatActivityPanel(): Promise<HTMLElement> {
+  return waitFor(() => {
+    const found = document.querySelector<HTMLElement>("[data-activity-panel]");
+    if (found === null) throw new Error("No live-line panel is open");
+    return found;
+  });
+}

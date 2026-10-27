@@ -1,5 +1,6 @@
-import { useRef } from "react";
+import { useId, useRef } from "react";
 import type { KeyboardEvent, KeyboardEventHandler, ReactNode, Ref } from "react";
+import { createPortal } from "react-dom";
 import { ChevronDown, ChevronRight, X } from "lucide-react";
 import { cn } from "@/common/lib/utils";
 import { CHAT_DOCK_GUTTER_CLASS } from "@/constants/layout";
@@ -7,6 +8,8 @@ import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { useChatDockColumnWidthClass } from "./chatDockColumn";
 import {
+  CHAT_ACTIVITY_ORDER,
+  useChatActivitySheet,
   useInChatActivityLine,
   useReleaseChatActivityPanelOnUnmount,
   type ChatActivityId,
@@ -39,6 +42,21 @@ interface ChatInputDecorationProps {
   chipLabel?: string;
   chipClassName?: string;
   chipTooltip?: ReactNode;
+  /**
+   * "plain" draws the chip without a border and lets it take the line's free width (the TODO
+   * chip, which names the current step); other chips sit at the line's end, next to Stop.
+   */
+  chipVariant?: "plain";
+  /** Panel heading, also the panel's accessible name; without it the `summary` heads the panel. */
+  panelTitle?: string;
+  /** Muted detail after the title, e.g. "2 running". */
+  panelMeta?: ReactNode;
+  /** Formatted shortcut that toggles this panel, shown in its heading (desktop only). */
+  panelShortcut?: string;
+  /** Key hints under the list (desktop only: phones have no keyboard to hint at). */
+  panelFooter?: ReactNode;
+  /** The panel's tab in the phone activity sheet: icon, name and count. */
+  tab?: ReactNode;
 }
 
 /**
@@ -112,15 +130,19 @@ function closeOnEscape(event: KeyboardEvent<HTMLElement>, close: () => void): vo
   close();
 }
 
-/**
- * The chip and its panel. The panel is positioned against the live line (the nearest positioned
- * ancestor), so every chip's list opens at the same place: full column width, just above the line,
- * over the transcript, which keeps the composer from moving when a list opens.
- */
+/** A running indicator inside a chip (bashes running, sub-agents working). */
+export function ActivityChipLiveDot() {
+  return <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-[var(--color-success)]" />;
+}
+
+/** The chip, its tab in the phone activity sheet, and its panel while open. */
 function ChatActivityChip(props: ChatInputDecorationProps) {
   const chipRef = useRef<HTMLButtonElement>(null);
+  const panelId = useId();
   useReleaseChatActivityPanelOnUnmount(props.activityId);
   const renderPanel = props.expanded ? props.renderExpanded : undefined;
+  // mutation-equivalent: chip is an element or absent, never another falsy node
+  const chipContent = props.chip ?? props.summary;
   const close = () => {
     props.onToggle();
     // mutation-equivalent: close only runs from the chip's or its panel's handlers, so the chip is mounted
@@ -133,45 +155,181 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
         chipRef={chipRef}
         hasPanel={props.renderExpanded !== undefined}
         open={renderPanel !== undefined}
+        panelId={panelId}
         label={props.chipLabel}
         tooltip={props.chipTooltip}
+        variant={props.chipVariant}
         className={props.chipClassName}
         onToggle={props.onToggle}
         onClose={close}
       >
-        {/* mutation-equivalent: chip is an element or absent, never another falsy node */}
-        {props.chip ?? props.summary}
+        {chipContent}
       </ChatActivityChipButton>
-      {renderPanel && (
-        <div
-          data-activity-panel=""
-          onKeyDown={(event) => closeOnEscape(event, close)}
-          className="bg-surface-primary border-border-medium absolute inset-x-0 bottom-full z-30 mb-1 flex max-h-[min(55vh,26rem)] flex-col overflow-hidden rounded-lg border shadow-lg"
+      {props.renderExpanded !== undefined && (
+        <ChatActivitySheetTab
+          activityId={props.activityId}
+          open={renderPanel !== undefined}
+          panelId={panelId}
+          onOpen={props.onToggle}
         >
-          {/* min-h, not h: touch phones grow the Close button to 44px (globals.css), and the
-              panel clips overflow, so a fixed 32px header would cut its touch target. */}
-          <div className="border-border-light flex min-h-8 shrink-0 items-center gap-2 border-b pr-1 pl-3 text-xs leading-none">
-            {props.summary}
-            <button
-              type="button"
-              aria-label="Close"
-              onClick={close}
-              className="text-muted hover:text-foreground ml-auto inline-flex size-6 items-center justify-center rounded-sm transition-colors"
-            >
-              <X className="size-3.5" />
-            </button>
-          </div>
-          {/* The content's own key handler runs before the panel's (events bubble from it). */}
-          <div
-            ref={props.contentRef}
-            onKeyDown={props.onContentKeyDown}
-            className={cn("min-h-0 overflow-y-auto px-1", props.contentClassName)}
-          >
-            {renderPanel()}
-          </div>
+          {/* mutation-equivalent: tab is an element or absent, never another falsy node */}
+          {props.tab ?? chipContent}
+        </ChatActivitySheetTab>
+      )}
+      {renderPanel && (
+        <ChatActivityChipPanel
+          {...props}
+          panelId={panelId}
+          onClose={close}
+          renderPanel={renderPanel}
+        />
+      )}
+    </div>
+  );
+}
+
+interface ChatActivityPanelProps extends ChatInputDecorationProps {
+  panelId: string;
+  /** Closes the panel and returns focus to its chip. */
+  onClose: () => void;
+  renderPanel: () => ReactNode;
+}
+
+/**
+ * The open panel. On wide viewports it is a popover positioned against the live line (the nearest
+ * positioned ancestor), just above it and over the transcript, so the composer does not move when
+ * a list opens: anchored to the line's start for the TODO chip, which sits at the start, and to
+ * its end for the chips beside Stop. On phones (narrow or short viewports) it opens in the line's
+ * activity sheet instead (see ChatActivityPanelsProvider).
+ */
+function ChatActivityChipPanel(props: ChatActivityPanelProps) {
+  const sheet = useChatActivitySheet();
+  return sheet === null ? (
+    <ChatActivityPopover {...props} />
+  ) : (
+    createPortal(<ChatActivitySheetPanel {...props} />, sheet.body)
+  );
+}
+
+function ChatActivityPopover(props: ChatActivityPanelProps) {
+  return (
+    <div
+      id={props.panelId}
+      // A group, not a dialog: the popover is a non-modal disclosure of its chip, and a dialog
+      // opened from one of its rows (bash output) stays the page's only dialog.
+      role="group"
+      aria-label={props.panelTitle ?? props.chipLabel}
+      data-activity-panel=""
+      onKeyDown={(event) => closeOnEscape(event, props.onClose)}
+      className={cn(
+        "bg-surface-primary border-border-medium absolute bottom-full z-30 mb-1 flex max-h-[min(55vh,26rem)] w-[min(30rem,100%)] flex-col overflow-hidden rounded-lg border shadow-lg",
+        props.chipVariant === "plain" ? "left-0" : "right-0"
+      )}
+    >
+      {/* min-h, not h: touch phones grow the Close button to 44px (globals.css), and the panel
+          clips overflow, so a fixed 32px header would cut its touch target. */}
+      <div className="border-border-light flex min-h-10 shrink-0 items-center gap-2 border-b pr-1.5 pl-3 text-xs leading-none">
+        <PanelHeading {...props} />
+        <kbd className="border-border-medium text-muted ml-auto rounded border px-1 py-[1px] font-sans text-[10px] leading-none">
+          {props.panelShortcut ?? "Esc"}
+        </kbd>
+        <button
+          type="button"
+          aria-label="Close"
+          onClick={props.onClose}
+          className="text-muted hover:text-foreground inline-flex size-6 items-center justify-center rounded-sm transition-colors"
+        >
+          <X className="size-3.5" />
+        </button>
+      </div>
+      {/* The content's own key handler runs before the panel's (events bubble from it). */}
+      <div
+        ref={props.contentRef}
+        onKeyDown={props.onContentKeyDown}
+        className={cn("min-h-0 overflow-y-auto px-1", props.contentClassName)}
+      >
+        {props.renderPanel()}
+      </div>
+      {props.panelFooter !== undefined && (
+        <div className="border-border-light text-muted shrink-0 border-t px-3 py-2 text-[11px] leading-none">
+          {props.panelFooter}
         </div>
       )}
     </div>
+  );
+}
+
+function ChatActivitySheetPanel(props: ChatActivityPanelProps) {
+  return (
+    <div
+      id={props.panelId}
+      role="tabpanel"
+      aria-label={props.panelTitle ?? props.chipLabel}
+      data-activity-panel=""
+      onKeyDown={(event) => closeOnEscape(event, props.onClose)}
+      className="flex min-h-0 flex-1 flex-col"
+    >
+      <div className="text-muted shrink-0 px-4 pt-3 pb-1 text-xs">
+        {props.panelMeta ?? props.summary}
+      </div>
+      <div
+        ref={props.contentRef}
+        onKeyDown={props.onContentKeyDown}
+        // The sheet sets the height; the inline row's max height would waste the room.
+        className={cn("min-h-0 overflow-y-auto px-2", props.contentClassName, "max-h-none")}
+      >
+        {props.renderPanel()}
+      </div>
+    </div>
+  );
+}
+
+function PanelHeading(props: ChatInputDecorationProps) {
+  if (props.panelTitle === undefined) {
+    return <>{props.summary}</>;
+  }
+  return (
+    <span className="flex min-w-0 items-baseline gap-2">
+      <span className="text-foreground shrink-0 text-[13px] font-semibold">{props.panelTitle}</span>
+      {props.panelMeta !== undefined && (
+        <span className="text-muted min-w-0 truncate">{props.panelMeta}</span>
+      )}
+    </span>
+  );
+}
+
+/** The chip's tab in the activity sheet, while the line opens its panels in one (phones). */
+function ChatActivitySheetTab(props: {
+  activityId?: ChatActivityId;
+  open: boolean;
+  panelId: string;
+  onOpen: () => void;
+  children: ReactNode;
+}) {
+  const sheet = useChatActivitySheet();
+  if (sheet === null) {
+    return null;
+  }
+  return createPortal(
+    <button
+      type="button"
+      role="tab"
+      aria-selected={props.open}
+      aria-controls={props.open ? props.panelId : undefined}
+      onClick={props.open ? undefined : props.onOpen}
+      style={
+        props.activityId === undefined
+          ? undefined
+          : { order: CHAT_ACTIVITY_ORDER[props.activityId] }
+      }
+      className={cn(
+        "inline-flex h-9 min-w-0 flex-1 items-center justify-center gap-1.5 rounded-md px-2 text-sm whitespace-nowrap transition-colors",
+        props.open ? "bg-hover text-foreground" : "text-secondary hover:text-foreground"
+      )}
+    >
+      {props.children}
+    </button>,
+    sheet.tabs
   );
 }
 
@@ -180,13 +338,16 @@ function ChatActivityChipButton(props: {
   /** False for link-style chips (Chat Instructions) that navigate instead of opening a panel. */
   hasPanel: boolean;
   open: boolean;
+  panelId: string;
   label?: string;
   tooltip?: ReactNode;
+  variant?: "plain";
   className?: string;
   onToggle: () => void;
   onClose: () => void;
   children: ReactNode;
 }) {
+  const plain = props.variant === "plain";
   return (
     <TooltipIfPresent tooltip={props.tooltip} side="top">
       <button
@@ -194,22 +355,32 @@ function ChatActivityChipButton(props: {
         type="button"
         data-activity-chip=""
         aria-expanded={props.hasPanel ? props.open : undefined}
+        aria-controls={props.open ? props.panelId : undefined}
         aria-label={props.label}
         onClick={props.onToggle}
         onKeyDown={props.open ? (event) => closeOnEscape(event, props.onClose) : undefined}
-        // The button is the touch target (globals.css grows buttons to 44px on touch phones);
-        // the inner span draws the 24px chip, so the line does not turn into 44px boxes.
+        // The button is the touch target (globals.css grows buttons to 44px on touch phones) and
+        // the inner span draws the chip: 28px in a wide line, and in a phone-width line the 44px
+        // box of the approved phone design.
+        // The order classes put a spacer (in StreamingBarrierView) between the plain TODO chip at
+        // the line's start and the bordered chips, which end the line next to Stop.
         className={cn(
-          "group/chip inline-flex min-w-0 shrink-0 items-center justify-center",
+          "group/chip inline-flex min-w-0 items-center justify-center",
+          plain ? "order-0" : "order-2 shrink-0",
           props.className
         )}
       >
         <span
           className={cn(
-            "inline-flex h-6 max-w-full min-w-0 items-center gap-1.5 rounded-md border px-2 text-xs leading-none whitespace-nowrap transition-colors",
+            "inline-flex h-7 max-w-full min-w-0 items-center gap-1.5 rounded-md border px-2 text-xs leading-none whitespace-nowrap transition-colors",
+            // The live line is the nearest @container.
+            "@max-md:h-11 @max-md:rounded-[10px] @max-md:text-sm @max-md:[&_svg]:size-4",
+            !plain && "@max-md:px-2.5",
             props.open
               ? "text-foreground border-[var(--color-exec-mode)] bg-[color-mix(in_srgb,var(--color-exec-mode)_16%,transparent)]"
-              : "border-border-light text-secondary group-hover/chip:bg-hover group-hover/chip:text-foreground"
+              : plain
+                ? "text-foreground group-hover/chip:bg-hover border-transparent"
+                : "border-border-light text-secondary group-hover/chip:bg-hover group-hover/chip:text-foreground"
           )}
         >
           {props.children}

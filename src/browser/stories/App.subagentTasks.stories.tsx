@@ -160,9 +160,16 @@ export const BackgroundMonitor: AppStory = {
       }
       return element;
     };
+    // The chip's open panel: a popover in the tray, or at phone viewports the activity sheet,
+    // which portals to the body.
+    const panel = () => document.querySelector<HTMLElement>("[data-activity-panel]");
     // The row's accessible name is "<title> <status label>", so match the title prefix.
-    const trayRow = () =>
-      within(tray()).queryByRole("button", { name: new RegExp(`^${MONITORED_CHILD_TITLE}`) });
+    const trayRow = () => {
+      const open = panel();
+      return open === null
+        ? null
+        : within(open).queryByRole("button", { name: new RegExp(`^${MONITORED_CHILD_TITLE}`) });
+    };
     // Store propagation through activity -> sidebar state -> both surfaces can exceed the
     // 1s default on loaded CI runners.
     const settle = (assertion: () => Promise<void>) => waitFor(assertion, { timeout: 5_000 });
@@ -182,7 +189,10 @@ export const BackgroundMonitor: AppStory = {
         } else {
           await expect(sidebarRow()).toBeVisible();
         }
-        await expect(tray()).toHaveTextContent("1 sub-agent · 1 active");
+        await expect(
+          within(tray()).getByRole("button", { name: "1 sub-agent, 1 active" })
+        ).toBeVisible();
+        await expect(panel()).toHaveTextContent("1 active");
         await expect(trayRow()).toHaveTextContent("Monitoring");
       });
     const expectSettled = () =>
@@ -195,7 +205,8 @@ export const BackgroundMonitor: AppStory = {
           activeBashMonitorCount: 0,
         });
         await expect(sidebarRow()).toBeNull();
-        await expect(tray()).toHaveTextContent("1 sub-agent · inactive");
+        await expect(within(tray()).getByRole("button", { name: "1 sub-agent" })).toBeVisible();
+        await expect(panel()).toHaveTextContent("inactive");
         await expect(trayRow()).toHaveTextContent("Completed");
       });
 

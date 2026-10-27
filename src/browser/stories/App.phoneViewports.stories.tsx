@@ -25,6 +25,7 @@ import { clearWorkspaceSelection, collapseRightSidebar, expandProjects } from ".
 import { createMockORPCClient } from "./mocks/orpc";
 import {
   blurActiveElement,
+  findChatActivityPanel,
   openChatActivityPanel,
   openLeftSidebar,
   waitForChatInputAutofocusDone,
@@ -397,15 +398,18 @@ export const IPhone16eComposerDecorations: AppStory = {
     }
 
     await openChatActivityPanel(storyRoot, "BackgroundProcessesBanner");
-    const panel = await waitFor(() => {
-      const found = line.querySelector<HTMLElement>("[data-activity-panel]");
-      if (found == null) throw new Error("Background bash panel did not open");
-      return found;
-    });
+    const panel = await findChatActivityPanel();
     const panelRect = panel.getBoundingClientRect();
     await expect(panelRect.left).toBeGreaterThanOrEqual(0);
     await expect(panelRect.right).toBeLessThanOrEqual(window.innerWidth);
-    await expect(panelRect.bottom).toBeLessThanOrEqual(line.getBoundingClientRect().top);
+    if (window.innerWidth <= NARROW_VIEWPORT_MAX_WIDTH_PX) {
+      // Pixel's phone viewport: the list opens in the activity sheet at the bottom of the screen.
+      await expect(panel.closest('[role="dialog"]')).not.toBeNull();
+      await expect(Math.round(panelRect.bottom)).toBeLessThanOrEqual(window.innerHeight);
+    } else {
+      // The test-runner's wide window around the phone frame: a popover above the line.
+      await expect(panelRect.bottom).toBeLessThanOrEqual(line.getBoundingClientRect().top);
+    }
     await expect(within(panel).getByText("dev server")).toBeVisible();
   },
 };

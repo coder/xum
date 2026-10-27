@@ -1,5 +1,5 @@
 import React from "react";
-import { CircleStopIcon } from "lucide-react";
+import { CircleStopIcon, Square } from "lucide-react";
 
 import { cn } from "@/common/lib/utils";
 import { TooltipIfPresent } from "@/browser/components/Tooltip/Tooltip";
@@ -36,6 +36,13 @@ export interface StreamingBarrierViewProps {
    * components decide on their own whether to render, so the row cannot know in JS.
    */
   activity?: React.ReactNode;
+  /**
+   * With chips in a phone-width row, let a dot stand in for the status label (default false).
+   * Only for phases the rest of the row still names: Stop marks a running turn (starting,
+   * streaming), and the awaiting-input hint asks for a reply. The other phases (compacting,
+   * waiting on a bash monitor, whose hint hides on phones) keep their label.
+   */
+  compactStatusOnNarrow?: boolean;
 }
 
 function hasLiveTps(tps: number | undefined): tps is number {
@@ -63,10 +70,22 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
       {/* A live status is left-anchored chrome, not a centered transcript divider.
           Let long labels truncate and secondary stats yield before Stop is squeezed. */}
       <div className="flex min-w-0 items-center gap-2">
-        {props.statusText !== null && <StatusLabel statusText={props.statusText} tps={props.tps} />}
+        {props.statusText !== null && (
+          <StatusLabel
+            statusText={props.statusText}
+            tps={props.tps}
+            inLiveLine={props.activity !== undefined}
+            compactOnNarrow={props.compactStatusOnNarrow === true}
+          />
+        )}
         {props.hintElement}
         {props.activity !== undefined && (
-          <ActivityChips showDivider={props.statusText !== null}>{props.activity}</ActivityChips>
+          <ActivityChips
+            showDivider={props.statusText !== null}
+            compactOnNarrow={props.compactStatusOnNarrow === true}
+          >
+            {props.activity}
+          </ActivityChips>
         )}
         {/* Render the stats slot for streaming-bound phases so the row geometry is
             identical across the starting -> streaming transition; only its visibility
@@ -79,8 +98,8 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
             aria-hidden={props.tokenCount === undefined}
             className={cn(
               "text-assistant-border counter-nums-mono hidden min-w-[14ch] shrink-0 @lg:inline-flex items-baseline justify-end text-[11px] whitespace-nowrap select-none",
-              // Chips need the room more than the stats until the row is wide.
-              "group-has-[[data-activity-chip]]/live:hidden @3xl:group-has-[[data-activity-chip]]/live:inline-flex",
+              // The chips take the row's free width beside Stop (approved line design).
+              "group-has-[[data-activity-chip]]/live:hidden",
               props.tokenCount === undefined && "invisible"
             )}
           >
@@ -94,22 +113,55 @@ export const StreamingBarrierView: React.FC<StreamingBarrierViewProps> = (props)
         )}
       </div>
       <div className="flex items-center whitespace-nowrap">
-        {props.statusText !== null && <CancelControl {...props} />}
+        {props.statusText !== null && <LineEnd {...props} />}
       </div>
     </div>
   );
 };
 
-function StatusLabel(props: { statusText: string; tps?: number }) {
+/**
+ * Stop, or the phase's hint. The approved desktop line divides the chips from Stop; the phone
+ * line does not.
+ */
+function LineEnd(props: StreamingBarrierViewProps) {
   return (
     <>
-      {/* With chips in a phone-width row, a pulsing dot stands in for the label (still read
-          out by screen readers) so the chips keep the room; wider rows keep the full label. */}
+      {props.activity !== undefined && props.cancelText.length > 0 && (
+        <span
+          aria-hidden
+          className="bg-border-light mr-3 hidden h-3 w-px shrink-0 @md:group-has-[[data-activity-chip]]/live:block"
+        />
+      )}
+      <CancelControl {...props} />
+    </>
+  );
+}
+
+function StatusLabel(props: {
+  statusText: string;
+  tps?: number;
+  inLiveLine: boolean;
+  compactOnNarrow: boolean;
+}) {
+  return (
+    <>
+      {/* The composer's live line leads with a status dot. With chips in a phone-width row it
+          stands in for the label (still read out by screen readers) so the chips keep the room. */}
+      {props.inLiveLine && (
+        <span
+          aria-hidden
+          className="bg-assistant-border ring-assistant-border/30 size-2 shrink-0 animate-pulse rounded-full ring-[3px]"
+        />
+      )}
       <span
-        aria-hidden
-        className="bg-assistant-border hidden size-1.5 shrink-0 animate-pulse rounded-full @max-md:group-has-[[data-activity-chip]]/live:block"
-      />
-      <span className="text-assistant-border min-w-0 animate-pulse truncate font-mono text-[10px] tracking-wide uppercase group-has-[[data-activity-chip]]/live:shrink-0 @max-md:group-has-[[data-activity-chip]]/live:sr-only">
+        className={cn(
+          "text-assistant-border min-w-0 animate-pulse truncate font-mono text-[10px] tracking-wide uppercase @md:group-has-[[data-activity-chip]]/live:shrink-0",
+          props.compactOnNarrow
+            ? "@max-md:group-has-[[data-activity-chip]]/live:sr-only"
+            : // A phase without Stop keeps its label on phones; it truncates before the chips do.
+              "@max-md:group-has-[[data-activity-chip]]/live:max-w-[45%]"
+        )}
+      >
         {props.statusText}
         {/* Narrow panes hide the stats slot, so they read t/s here. It follows the live prop
             rather than statusText, whose within-phase debounce would freeze the number, and
@@ -125,20 +177,33 @@ function StatusLabel(props: { statusText: string; tps?: number }) {
   );
 }
 
-function ActivityChips(props: { showDivider: boolean; children: React.ReactNode }) {
+function ActivityChips(props: {
+  showDivider: boolean;
+  compactOnNarrow: boolean;
+  children: React.ReactNode;
+}) {
   return (
     <>
+      {/* Where the status label collapses to its dot (phones), the dot needs no divider. */}
       {props.showDivider && (
         <span
           aria-hidden
-          className="bg-border-light hidden h-3 w-px shrink-0 group-has-[[data-activity-chip]]/live:block"
+          className={cn(
+            "bg-border-light hidden h-3 w-px shrink-0",
+            props.compactOnNarrow
+              ? "@md:group-has-[[data-activity-chip]]/live:block"
+              : "group-has-[[data-activity-chip]]/live:block"
+          )}
         />
       )}
       {/* Chips scroll sideways rather than wrap when a phone-width row runs out of room.
           No edge-fade mask here: a mask would also clip the chips' panels, which render
-          inside this row but are positioned against the whole line. */}
-      <div className="flex min-w-0 scrollbar-none items-center gap-1.5 overflow-x-auto">
+          inside this row but are positioned against the whole line. With chips the strip takes
+          the row's free width, and the spacer (between the plain TODO chip and the bordered
+          chips, by flex order) ends the line with the bordered chips next to Stop. */}
+      <div className="flex min-w-0 scrollbar-none items-center gap-1.5 overflow-x-auto has-[[data-activity-chip]]:flex-1">
         {props.children}
+        <span aria-hidden className="order-1 min-w-0 flex-1" />
       </div>
     </>
   );
@@ -150,10 +215,21 @@ function CancelControl(props: StreamingBarrierViewProps) {
       <button
         type="button"
         onClick={props.onCancel}
-        className="text-muted hover:text-foreground inline-flex h-6 cursor-pointer items-center rounded-sm px-1.5 py-0.5 text-[11px] leading-none font-medium transition-colors duration-200"
+        className={cn(
+          "text-muted hover:text-foreground inline-flex h-6 cursor-pointer items-center rounded-sm px-1.5 py-0.5 text-[11px] leading-none font-medium transition-colors duration-200",
+          // Beside chips in a phone-width row: a round icon button (approved phone design).
+          "@max-md:group-has-[[data-activity-chip]]/live:border-border-medium @max-md:group-has-[[data-activity-chip]]/live:text-foreground @max-md:group-has-[[data-activity-chip]]/live:size-8 @max-md:group-has-[[data-activity-chip]]/live:justify-center @max-md:group-has-[[data-activity-chip]]/live:rounded-full @max-md:group-has-[[data-activity-chip]]/live:border @max-md:group-has-[[data-activity-chip]]/live:p-0"
+        )}
         aria-label="Stop streaming"
       >
-        <CircleStopIcon className="h-3.5 w-3.5 shrink-0" strokeWidth={2.2} />
+        <CircleStopIcon
+          className="h-3.5 w-3.5 shrink-0 @max-md:group-has-[[data-activity-chip]]/live:hidden"
+          strokeWidth={2.2}
+        />
+        <Square
+          aria-hidden
+          className="hidden size-3 shrink-0 fill-current @max-md:group-has-[[data-activity-chip]]/live:block"
+        />
         {/* Icon-only beside chips in a phone-width row; the aria-label still names it. */}
         <span className="ml-1 leading-none @max-md:group-has-[[data-activity-chip]]/live:hidden">
           Stop

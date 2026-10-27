@@ -38,6 +38,30 @@ function useScrollToCurrentTodo(expanded: boolean, todos: readonly TodoItem[]) {
   return contentRef;
 }
 
+/**
+ * The list's counts ("1 in progress · 2 pending", or "5 completed" once nothing is left) and the
+ * step the chip names: the one in progress, else the next pending one.
+ */
+function summarizeTodos(todos: readonly TodoItem[]) {
+  const inProgressCount = todos.filter((todo) => todo.status === "in_progress").length;
+  const pendingCount = todos.filter((todo) => todo.status === "pending").length;
+  const completedCount = todos.length - inProgressCount - pendingCount;
+  const summaryParts: string[] = [];
+  if (inProgressCount > 0) {
+    summaryParts.push(`${inProgressCount} in progress`);
+  }
+  if (pendingCount > 0) {
+    summaryParts.push(`${pendingCount} pending`);
+  }
+  if (summaryParts.length === 0) {
+    summaryParts.push(`${completedCount} completed`);
+  }
+  const currentTodo =
+    todos.find((todo) => todo.status === "in_progress") ??
+    todos.find((todo) => todo.status === "pending");
+  return { completedCount, summaryParts, currentTodo };
+}
+
 /** Progress ring for the chip: the completed share of the list, drawn as an arc. */
 function TodoProgressRing(props: { completed: number; total: number }) {
   const radius = 5;
@@ -95,22 +119,7 @@ export const PinnedTodoList: React.FC<PinnedTodoListProps> = ({ workspaceId }) =
     return null;
   }
 
-  const inProgressCount = todos.filter((todo) => todo.status === "in_progress").length;
-  const pendingCount = todos.filter((todo) => todo.status === "pending").length;
-  const completedCount = todos.length - inProgressCount - pendingCount;
-  const summaryParts: string[] = [];
-  if (inProgressCount > 0) {
-    summaryParts.push(`${inProgressCount} in progress`);
-  }
-  if (pendingCount > 0) {
-    summaryParts.push(`${pendingCount} pending`);
-  }
-  if (summaryParts.length === 0) {
-    summaryParts.push(`${completedCount} completed`);
-  }
-  const currentTodo =
-    todos.find((todo) => todo.status === "in_progress") ??
-    todos.find((todo) => todo.status === "pending");
+  const { completedCount, summaryParts, currentTodo } = summarizeTodos(todos);
   const progress = `${completedCount}/${todos.length}`;
 
   return (
@@ -122,9 +131,19 @@ export const PinnedTodoList: React.FC<PinnedTodoListProps> = ({ workspaceId }) =
       dataComponent="PinnedTodoList"
       activityId="todo"
       chipLabel={`TODO, ${completedCount} of ${todos.length} done${currentTodo ? `: ${currentTodo.content}` : ""}`}
-      // The only chip with text worth reading, so it is the one that yields width on phones,
-      // down to its ring and the start of the step.
-      chipClassName="max-w-[22rem] min-w-14 shrink"
+      // The only chip with text worth reading: it takes the line's free width, and it is the one
+      // that yields width on phones, down to its ring and the start of the step.
+      chipVariant="plain"
+      chipClassName="min-w-14"
+      panelTitle="TODO"
+      panelMeta={[`${progress} done`, ...(currentTodo ? summaryParts : [])].join(" · ")}
+      tab={
+        <>
+          <TodoProgressRing completed={completedCount} total={todos.length} />
+          <span>TODO</span>
+          <span className="counter-nums text-muted">{progress}</span>
+        </>
+      }
       chip={
         <>
           <TodoProgressRing completed={completedCount} total={todos.length} />

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { cleanup, fireEvent, render, within } from "@testing-library/react";
 import type React from "react";
-import { installDom } from "../../../../tests/ui/dom";
+import { installDom, stubNarrowViewport, stubShortViewport } from "../../../../tests/ui/dom";
 
 import { ChatInputDecoration } from "./ChatInputDecoration";
 import {
@@ -171,5 +171,115 @@ describe("chat activity panels", () => {
     view.rerender(renderLine());
 
     expect(view.queryByText("Bashes list")).toBeNull();
+  });
+
+  it("opens the panels in the sheet on a short viewport, such as a phone in landscape", () => {
+    // A popover above the line would run off the top of a screen this short.
+    stubShortViewport(true);
+    const view = render(renderLine());
+
+    fireEvent.click(view.getByRole("button", { name: "TODO" }));
+    const sheet = view.getByRole("dialog", { name: "Activity" });
+    expect(within(sheet).queryByText("TODO list")).not.toBeNull();
+  });
+
+  describe("on a phone-width viewport", () => {
+    beforeEach(() => {
+      stubNarrowViewport(true);
+    });
+
+    it("opens every panel in one sheet, with a tab per chip", () => {
+      const view = render(renderLine());
+      expect(view.queryByRole("dialog")).toBeNull();
+
+      fireEvent.click(view.getByRole("button", { name: "TODO" }));
+      const sheet = view.getByRole("dialog", { name: "Activity" });
+      expect(within(sheet).queryByText("TODO list")).not.toBeNull();
+      const tabs = within(sheet).getAllByRole("tab");
+      expect(tabs.map((tab) => [tab.textContent, tab.getAttribute("aria-selected")])).toEqual([
+        ["TODO", "true"],
+        ["Bashes", "false"],
+      ]);
+
+      // A tab reaches a list whose chip the strip may have scrolled out of view.
+      fireEvent.click(within(sheet).getByRole("tab", { name: "Bashes" }));
+      expect(within(sheet).queryByText("Bashes list")).not.toBeNull();
+      expect(view.queryByText("TODO list")).toBeNull();
+      expect(view.getByRole("button", { name: "Bashes" }).getAttribute("aria-expanded")).toBe(
+        "true"
+      );
+    });
+
+    it("takes focus while open and returns it to the chip on Escape", () => {
+      const view = render(renderLine());
+      const chip = view.getByRole("button", { name: "TODO" });
+      chip.focus();
+
+      fireEvent.click(chip);
+      const sheet = view.getByRole("dialog", { name: "Activity" });
+      expect(sheet.contains(document.activeElement)).toBe(true);
+
+      fireEvent.keyDown(sheet, { key: "Escape" });
+      expect(view.queryByRole("dialog")).toBeNull();
+      expect(view.queryByText("TODO list")).toBeNull();
+      expect(document.activeElement).toBe(chip);
+    });
+
+    it("closes on Escape from a tab without reaching window handlers", () => {
+      // The tabs portal in from their chips, so their key events skip the sheet's React tree;
+      // the window's Escape handler interrupts the stream.
+      const view = render(renderLine());
+      let windowSawEscape = false;
+      const onWindowKeyDown = (event: KeyboardEvent) => {
+        if (event.key === "Escape") windowSawEscape = true;
+      };
+      window.addEventListener("keydown", onWindowKeyDown);
+
+      fireEvent.click(view.getByRole("button", { name: "TODO" }));
+      const sheet = view.getByRole("dialog", { name: "Activity" });
+      fireEvent.keyDown(within(sheet).getByRole("tab", { name: "Bashes" }), { key: "Escape" });
+      window.removeEventListener("keydown", onWindowKeyDown);
+
+      expect(view.queryByRole("dialog")).toBeNull();
+      expect(windowSawEscape).toBe(false);
+    });
+
+    it("leaves Escape to a list in the sheet that handles it itself", () => {
+      let listSawEscape = false;
+      const view = render(
+        <ChatActivityPanelsProvider>
+          <Chip
+            id="background-bashes"
+            label="Bashes"
+            onContentKeyDown={(event) => {
+              if (event.key !== "Escape") return;
+              listSawEscape = true;
+              event.preventDefault();
+            }}
+          />
+        </ChatActivityPanelsProvider>
+      );
+
+      fireEvent.click(view.getByRole("button", { name: "Bashes" }));
+      fireEvent.keyDown(view.getByText("Bashes list"), { key: "Escape" });
+
+      expect(listSawEscape).toBe(true);
+      expect(view.queryByRole("dialog", { name: "Activity" })).not.toBeNull();
+    });
+
+    it("stays open on a press inside it and closes from its Close button", () => {
+      const view = render(renderLine());
+
+      fireEvent.click(view.getByRole("button", { name: "TODO" }));
+      fireEvent.pointerDown(view.getByText("TODO list"));
+      const sheet = view.getByRole("dialog", { name: "Activity" });
+      expect(within(sheet).queryByText("TODO list")).not.toBeNull();
+
+      fireEvent.click(within(sheet).getByRole("button", { name: "Close" }));
+      expect(view.queryByRole("dialog")).toBeNull();
+      expect(view.getByRole("button", { name: "TODO" }).getAttribute("aria-expanded")).toBe(
+        "false"
+      );
+    });
   });
 });

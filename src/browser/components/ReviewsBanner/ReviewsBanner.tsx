@@ -59,7 +59,7 @@ class BannerErrorBoundary extends Component<
         // hides when no chip renders and would otherwise hide this way out too.
         <div
           data-activity-chip=""
-          className="border-border-light flex h-6 shrink-0 items-center gap-1.5 rounded-md border px-2 text-xs"
+          className="border-border-light order-2 flex h-6 shrink-0 items-center gap-1.5 rounded-md border px-2 text-xs"
         >
           <AlertTriangle className="text-warning size-3.5" />
           <span className="text-muted">Reviews data corrupted</span>
@@ -339,6 +339,14 @@ function formatReviewsChipLabel(pendingCount: number, checkedCount: number): str
   return checkedCount > 0 ? `${pending}, ${checkedCount} completed` : pending;
 }
 
+/** "2 pending · 3 done", the reviews panel heading's detail. */
+function formatReviewsPanelMeta(pendingCount: number, checkedCount: number): string {
+  const parts: string[] = [];
+  if (pendingCount > 0) parts.push(`${pendingCount} pending`);
+  if (checkedCount > 0) parts.push(`${checkedCount} done`);
+  return parts.length > 0 ? parts.join(" · ") : "No pending reviews";
+}
+
 /** The live line's reviews chip: pending reviews in the review accent, else the completed count. */
 function ReviewsChip(props: { pendingCount: number; checkedCount: number }) {
   return props.pendingCount > 0 ? (
@@ -351,6 +359,19 @@ function ReviewsChip(props: { pendingCount: number; checkedCount: number }) {
       <MessageSquare className="size-3.5 shrink-0" />
       <Check className="size-3 shrink-0" />
       <span className="counter-nums">{props.checkedCount}</span>
+    </>
+  );
+}
+
+/** The reviews tab in the phone activity sheet, counting what the chip counts. */
+function ReviewsTab(props: { pendingCount: number; checkedCount: number }) {
+  return (
+    <>
+      <MessageSquare className="size-4 shrink-0" />
+      <span>Reviews</span>
+      <span className="counter-nums text-muted">
+        {props.pendingCount > 0 ? props.pendingCount : props.checkedCount}
+      </span>
     </>
   );
 }
@@ -412,6 +433,14 @@ const ReviewsBannerInner: React.FC<ReviewsBannerInnerProps> = ({ workspaceId }) 
       chipLabel={formatReviewsChipLabel(reviewsHook.pendingCount, reviewsHook.checkedCount)}
       chip={
         <ReviewsChip
+          pendingCount={reviewsHook.pendingCount}
+          checkedCount={reviewsHook.checkedCount}
+        />
+      }
+      panelTitle="Reviews"
+      panelMeta={formatReviewsPanelMeta(reviewsHook.pendingCount, reviewsHook.checkedCount)}
+      tab={
+        <ReviewsTab
           pendingCount={reviewsHook.pendingCount}
           checkedCount={reviewsHook.checkedCount}
         />

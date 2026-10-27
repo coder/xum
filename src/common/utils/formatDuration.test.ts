@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { formatDuration } from "./formatDuration";
+import { formatDuration, formatElapsed } from "./formatDuration";
 
 describe("formatDuration", () => {
   test("coarse style keeps boundary outputs byte-identical", () => {
@@ -78,6 +78,26 @@ describe("formatDuration", () => {
 
     for (const ms of inputs) {
       expect(formatDuration(ms)).toBe(formatDuration(ms, "coarse"));
+    }
+  });
+});
+
+describe("formatElapsed", () => {
+  test("ticks through seconds, minutes and hours with the smaller unit padded", () => {
+    const cases: Array<[number, string]> = [
+      // A start time slightly ahead of this clock reads as just started.
+      [-1500, "0s"],
+      [999, "0s"],
+      [59_999, "59s"],
+      [60_000, "1m 00s"],
+      [724_000, "12m 04s"],
+      [3_599_999, "59m 59s"],
+      [3_600_000, "1h 00m"],
+      [3_720_000, "1h 02m"],
+    ];
+
+    for (const [ms, expected] of cases) {
+      expect(formatElapsed(ms)).toBe(expected);
     }
   });
 });

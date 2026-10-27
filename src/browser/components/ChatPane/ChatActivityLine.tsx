@@ -27,17 +27,14 @@ interface ChatActivityLineProps {
  * list in a panel above the line instead. Without a live turn and without chips it renders nothing.
  */
 export function ChatActivityLine(props: ChatActivityLineProps) {
+  // No keys on the chips: the provider's key below remounts them per workspace, and siblings that
+  // shared a key once left a cleared TODO list's chip behind next to the next list's.
   const chips = props.revealChips ? (
     <>
-      {props.showTodo && (
-        // Keyed by workspace: ChatPane stays mounted across workspace switches, and the panel's
-        // scroll position (set to the current item on open) must not carry over.
-        <PinnedTodoList key={props.workspaceId} workspaceId={props.workspaceId} />
-      )}
+      {props.showTodo && <PinnedTodoList workspaceId={props.workspaceId} />}
       {/* Durable sub-agents live with their parent chat instead of relying only on nested
-          sidebar rows. Keyed by workspace: the decoration retains observed workflow-run refs
-          that must never leak into another chat's panel. */}
-      <SubAgentTasksDecoration key={props.workspaceId} workspaceId={props.workspaceId} />
+          sidebar rows. */}
+      <SubAgentTasksDecoration workspaceId={props.workspaceId} />
       <BackgroundProcessesBanner workspaceId={props.workspaceId} />
       {props.showReviews && <ReviewsBanner workspaceId={props.workspaceId} />}
       {/* Self-gating: renders nothing when the scratchpad is empty or disabled. */}
@@ -47,9 +44,10 @@ export function ChatActivityLine(props: ChatActivityLineProps) {
 
   return (
     <ChatDockSurface>
-      {/* Positioned so every chip's panel opens at the line's full width, right above it. Keyed
-          by workspace: ChatPane stays mounted across switches, and a panel left open in one chat
-          must not open in the next. */}
+      {/* Positioned so every chip's panel opens against the line, right above it. Keyed by
+          workspace: ChatPane stays mounted across switches, and nothing in the line may carry
+          over to the next chat: an open panel, the TODO panel's scroll position (set to the
+          current item on open), or the workflow-run refs the sub-agents chip retains. */}
       <ChatActivityPanelsProvider
         key={props.workspaceId}
         className="relative"
