@@ -7,7 +7,11 @@ import type { QueuedInputStopCause } from "@/common/types/streamStopCause";
 import { execBuffered } from "@/node/utils/runtime/helpers";
 import { shellQuote } from "@/common/utils/shell";
 import type { OnStepSettled } from "./streamManager";
-import { measureAssembledRequestBudgetForModel } from "./contextBudgetCounting";
+import {
+  createTurnBudgetAnchor,
+  measureAssembledRequestBudgetForModel,
+  type TurnBudgetAnchor,
+} from "./contextBudgetCounting";
 import { ContextBudgetExceededError } from "./contextBudgetError";
 import type { ContextBudgetExceeded } from "@/common/utils/compaction/contextBudget";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
@@ -588,7 +592,7 @@ interface FoldedStreamState<TMessages, TTail> {
   messages: TMessages;
   systemRecords: TTail;
   systemMessageTokens: number;
-  /** The full estimate of `messages`, the stage decision's E (#5286). */
+  /** The count of `messages` the budget check enforced, the stage decision's E (#5286). */
   contextBudgetEstimate?: number;
 }
 
@@ -661,7 +665,7 @@ async function foldPendingThinkingOverrides<TMessages, TTail>(
   return state;
 }
 
-/** Called once per primary start() with E, the full estimate of the built request (#5286). */
+/** Called once per primary start() with E, the enforced count of the built request (#5286). */
 export type OnTurnStartStage = (budget: {
   estimate: number;
   limit: number;
@@ -756,9 +760,49 @@ async function countAndPublishStage<TCandidate extends { contextBudgetEstimate?:
 }
 
 /**
+ * The turn anchor for this assembled request (#7662). A compaction request has none: its trim
+ * can drop the rows the anchored provider count holds.
+ */
+async function turnBudgetAnchorFor(
+  options: Parameters<typeof assemblePromptPayload>[0],
+  payload: PromptPayload,
+  metadataModel: string | undefined
+): Promise<TurnBudgetAnchor | undefined> {
+  if (options.compactionInputBudgetTokens != null) return undefined;
+  return createTurnBudgetAnchor(payload.providerRequestMessages, {
+    model: options.modelString,
+    metadataModel,
+    routeProvider: options.routeProvider,
+    agentId: options.effectiveAgentId,
+    system: payload.sentSystem.message,
+  });
+}
+
+/** The model's effective context limit, or undefined (logged) when it is unknown. */
+function contextBudgetLimitFor(
+  options: Parameters<typeof assemblePromptPayload>[0],
+  providerOptions: MuxProviderOptions | undefined
+): number | undefined {
+  const limit = getEffectiveContextLimit(
+    options.modelString,
+    isAnthropic1MEffectivelyEnabled(options.modelString, providerOptions, options.providersConfig),
+    options.providersConfig,
+    { openaiWireFormat: providerOptions?.openai?.wireFormat }
+  );
+  if (limit == null) {
+    log.warn("Context budget preflight unavailable: model context limit is unknown", {
+      workspaceId: options.workspaceId,
+      model: options.modelString,
+    });
+  }
+  return limit ?? undefined;
+}
+
+/**
  * Shared assembly path for primary, fallback, and thinking-rebuild provider attempts.
- * `contextBudgetEstimate` is the full estimate the check enforced (undefined when the budget is
- * off or the limit is unknown).
+ * `contextBudgetEstimate` is the estimate the check enforced (undefined when the budget is off
+ * or the limit is unknown): the previous turn's provider count plus the messages after it when
+ * `contextBudgetTurnAnchor` applies, else the full estimate.
  */
 export async function assembleBudgetCheckedPromptPayload(
   options: Parameters<typeof assemblePromptPayload>[0],
@@ -771,43 +815,40 @@ export async function assembleBudgetCheckedPromptPayload(
   Awaited<ReturnType<typeof assemblePromptPayload>> & {
     contextBudgetLimit?: number;
     contextBudgetEstimate?: number;
+    contextBudgetTurnAnchor?: TurnBudgetAnchor;
   }
 > {
   const payload = await assemblePromptPayload(options);
   let contextBudgetLimit: number | undefined;
   let contextBudgetEstimate: number | undefined;
+  let contextBudgetTurnAnchor: TurnBudgetAnchor | undefined;
   // Check after provider transforms and system/schema assembly: history-only
   // estimates cannot prevent oversized requests from reaching the provider.
   if (budget.enabled) {
-    contextBudgetLimit =
-      getEffectiveContextLimit(
-        options.modelString,
-        isAnthropic1MEffectivelyEnabled(
-          options.modelString,
-          budget.providerOptions,
-          options.providersConfig
-        ),
-        options.providersConfig,
-        { openaiWireFormat: budget.providerOptions?.openai?.wireFormat }
-      ) ?? undefined;
-    if (contextBudgetLimit == null) {
-      log.warn("Context budget preflight unavailable: model context limit is unknown", {
-        workspaceId: options.workspaceId,
-        model: options.modelString,
-      });
+    contextBudgetLimit = contextBudgetLimitFor(options, budget.providerOptions);
+    const metadataModel = resolveModelForMetadata(
+      options.modelString,
+      options.providersConfig ?? null
+    );
+    if (contextBudgetLimit != null) {
+      contextBudgetTurnAnchor = await turnBudgetAnchorFor(options, payload, metadataModel);
     }
-    const measured = await measureAssembledRequestBudgetForModel(payload, {
-      model: options.modelString,
-      metadataModel: resolveModelForMetadata(options.modelString, options.providersConfig ?? null),
-      modelContextLimit: contextBudgetLimit,
-      activeTools: budget.activeTools,
-    });
+    const measured = await measureAssembledRequestBudgetForModel(
+      payload,
+      {
+        model: options.modelString,
+        metadataModel,
+        modelContextLimit: contextBudgetLimit,
+        activeTools: budget.activeTools,
+      },
+      contextBudgetTurnAnchor
+    );
     contextBudgetEstimate = measured?.estimate;
     if (measured?.exceeded) {
       throw new ContextBudgetExceededError(measured.exceeded);
     }
   }
-  return { ...payload, contextBudgetLimit, contextBudgetEstimate };
+  return { ...payload, contextBudgetLimit, contextBudgetEstimate, contextBudgetTurnAnchor };
 }
 
 /**
@@ -3617,6 +3658,7 @@ export class TurnRequestBuilder {
           engineSystem: attemptPayload.system,
           systemRecords: rowSystemRecords(attemptPayload, options.partialContinuationMessage),
           contextBudgetLimit: attemptPayload.contextBudgetLimit,
+          contextBudgetTurnAnchor: attemptPayload.contextBudgetTurnAnchor,
           contextBudgetEstimate: attemptPayload.contextBudgetEstimate,
           ...compactionInputBudget,
           systemMessageTokens: sent.tokens,
@@ -3646,6 +3688,7 @@ export class TurnRequestBuilder {
               systemRecords: rowSystemRecords(payload, options.partialContinuationMessage),
               messages: payload.messages,
               contextBudgetLimit: payload.contextBudgetLimit,
+              contextBudgetTurnAnchor: payload.contextBudgetTurnAnchor,
               contextBudgetEstimate: payload.contextBudgetEstimate,
             };
           },
@@ -4135,6 +4178,7 @@ export class TurnRequestBuilder {
                   system: nextRequest.engineSystem,
                   tools: nextRequest.engineTools,
                   contextBudgetLimit: nextRequest.contextBudgetLimit,
+                  contextBudgetTurnAnchor: nextRequest.contextBudgetTurnAnchor,
                   providerOptions: nextRequest.providerOptions,
                   headers: nextHeaders,
                   callSettingsOverrides: nextRequest.resolvedOverrides.standard,
@@ -4173,6 +4217,7 @@ export class TurnRequestBuilder {
         abortSignal: combinedAbortSignal,
         tools: toolsForStream,
         contextBudgetLimit: primaryRequest.contextBudgetLimit,
+        contextBudgetTurnAnchor: primaryRequest.contextBudgetTurnAnchor,
         initialMetadata: {
           ...(requestHistorySequence >= 0 ? { requestHistorySequence } : {}),
           systemMessageTokens,

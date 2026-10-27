@@ -13,7 +13,10 @@ import type { QueuedInputStopCause, StreamStopCause } from "@/common/types/strea
 import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 import type { AutoThinkingEscalationState } from "@/node/services/autoThinkingEscalation";
-import type { ContextBudgetAnchorRequest } from "@/node/services/contextBudgetCounting";
+import type {
+  ContextBudgetAnchorRequest,
+  TurnBudgetAnchor,
+} from "@/node/services/contextBudgetCounting";
 import type { ContinuousPrefixSwap } from "@/node/services/continuousCompactionJournal";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { SendMessageError, StreamErrorType } from "@/common/types/errors";
@@ -131,6 +134,8 @@ export type OnStepSettled = (step: SettledStepBudget) => Promise<SettledStepOutc
  */
 export interface PreparedModelFallback {
   contextBudgetLimit?: number;
+  /** Step 0's budget anchor: the previous turn's provider count (createTurnBudgetAnchor). */
+  contextBudgetTurnAnchor?: TurnBudgetAnchor;
   model: LanguageModel;
   /** Canonical model string of the fallback attempt (drives metadata + tokenizer). */
   modelString: string;
@@ -282,6 +287,8 @@ export interface StreamRequestConfig {
   onStepMessages?: (messages: ModelMessage[]) => void;
   onStepSettled?: OnStepSettled;
   contextBudgetLimit?: number;
+  /** Step 0's budget anchor: the previous turn's provider count (createTurnBudgetAnchor). */
+  contextBudgetTurnAnchor?: TurnBudgetAnchor;
   toolPolicy?: ToolPolicy;
   /**
    * Tool-search deferral state. Owned and mutated by

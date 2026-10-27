@@ -33,6 +33,7 @@ import { getModelStats, getModelStatsResolved } from "@/common/utils/tokens/mode
 import type { ToolSearchStreamState } from "@/common/utils/tools/toolCatalog";
 import type { ToolPolicy } from "@/common/utils/tools/toolPolicy";
 
+import type { TurnBudgetAnchor } from "@/node/services/contextBudgetCounting";
 import {
   stripMessageCacheControl,
   type ContinuousPrefixSwap,
@@ -76,6 +77,7 @@ export interface StreamRequestOptions {
   onStepMessages?: (messages: ModelMessage[]) => void;
   onStepSettled?: OnStepSettled;
   contextBudgetLimit?: number;
+  contextBudgetTurnAnchor?: TurnBudgetAnchor;
   toolSearchState?: ToolSearchStreamState;
   thinkingOverrideState?: ActiveTurnThinkingOverride;
   rebuildProviderOptionsForThinkingLevel?: RebuildProviderOptionsForThinkingLevel;
@@ -315,6 +317,7 @@ export class ProviderRequest {
       onStepMessages,
       onStepSettled,
       contextBudgetLimit,
+      contextBudgetTurnAnchor,
       toolSearchState,
       onToolExecutionStart,
       thinkingOverrideState,
@@ -370,6 +373,7 @@ export class ProviderRequest {
       onStepMessages,
       onStepSettled,
       contextBudgetLimit,
+      contextBudgetTurnAnchor,
       toolPolicy,
       toolSearchState,
       thinkingOverrideState,

@@ -8,10 +8,13 @@ import {
   type AssembledRequestBudgetInput,
 } from "@/common/utils/compaction/contextBudget";
 import type { JSONSchema7 } from "@ai-sdk/provider";
+import { createMuxMessage, type MuxMetadata } from "@/common/types/message";
+import { CLAUDE_ENCODING_BUDGET_FACTOR } from "@/constants/tokenizerCorrection";
 import calibration from "./__fixtures__/contextBudgetClaudeTokenizer.json";
 import {
   checkAssembledRequestBudgetForModel,
   createContextBudgetAnchor,
+  createTurnBudgetAnchor,
   estimateAnchoredRequestTokensForModel,
   estimateAssembledRequestTokensForModel,
   estimateFreshRequestTokensForModel,
@@ -838,6 +841,132 @@ describe("anchored request estimate (#4858)", () => {
   });
 });
 
+describe("turn-start anchor (#7662)", () => {
+  const history = [{ role: "user", content: "long history ".repeat(4000) }];
+  const reply = { role: "assistant", content: "answer ".repeat(2000) };
+  const prompt = { role: "user", content: "follow-up question ".repeat(20) };
+  const payload = { messages: [...history, reply, prompt] };
+  const options = { model, modelContextLimit: 200_000 };
+  const system = "Answer briefly and cite the files you read.";
+  const systemTokens = async (forModel: string) =>
+    (await tokenizerModule.getTokenizerForModel(forModel)).countTokens(system);
+  const request = { model, agentId: "exec", routeProvider: "openai", system };
+  const anchorFor = async (
+    metadata?: Partial<MuxMetadata>,
+    overrides?: Partial<typeof request>
+  ) => {
+    const reply = createMuxMessage("a1", "assistant", "answer", {
+      model,
+      agentId: "exec",
+      routeProvider: "openai",
+      systemMessageTokens: await systemTokens(overrides?.model ?? model),
+      contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
+      ...metadata,
+    });
+    return createTurnBudgetAnchor([createMuxMessage("u1", "user", "hi"), reply], {
+      ...request,
+      ...overrides,
+    });
+  };
+
+  test("costs the previous reply's input plus the messages from its last step on", async () => {
+    const anchored = await estimateAnchoredRequestTokensForModel(
+      payload,
+      options,
+      await anchorFor()
+    );
+    const delta = (await estimateAssembledRequestTokensForModel(
+      { messages: [reply, prompt] },
+      options
+    ))!.estimate;
+    expect(anchored).toEqual({
+      estimate: 1000 + delta,
+      hardCeiling: getContextBudgetHardCeiling(200_000),
+    });
+    expect(anchored!.estimate).toBeLessThan(
+      (await estimateAssembledRequestTokensForModel(payload, options))!.estimate
+    );
+  });
+
+  test("counts cache reads and writes once, adds system growth, and leaves out the reply's reasoning", async () => {
+    const contextUsage = {
+      inputTokens: 1000,
+      outputTokens: 80,
+      cachedInputTokens: 600,
+      reasoningTokens: 50,
+      totalTokens: 1080,
+    };
+    // Rows keep cache writes in provider metadata: 300 uncached + 600 read + 100 written.
+    const contextProviderMetadata = { anthropic: { cacheCreationInputTokens: 100 } };
+    const sent = await systemTokens(model);
+    expect((await anchorFor({ contextUsage, contextProviderMetadata }))?.providerTokens).toBe(1000);
+    const grown = { contextUsage, systemMessageTokens: sent - 30 };
+    expect((await anchorFor(grown))?.providerTokens).toBe(1030);
+    const shrunk = { contextUsage, systemMessageTokens: sent + 30 };
+    expect((await anchorFor(shrunk))?.providerTokens).toBe(1000);
+    // Claude-encoded growth is scaled like every other claude count (#5219). Tests default to
+    // the approximate tokenizer, which has no claude encoding.
+    const original = process.env.XUM_FORCE_REAL_TOKENIZER;
+    process.env.XUM_FORCE_REAL_TOKENIZER = "1";
+    try {
+      const claude = "anthropic:claude-opus-5-5";
+      const claudeGrown = {
+        model: claude,
+        contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
+        systemMessageTokens: (await systemTokens(claude)) - 30,
+      };
+      expect((await anchorFor(claudeGrown, { model: claude }))?.providerTokens).toBe(
+        1000 + Math.ceil(30 * CLAUDE_ENCODING_BUDGET_FACTOR)
+      );
+    } finally {
+      if (original == null) delete process.env.XUM_FORCE_REAL_TOKENIZER;
+      else process.env.XUM_FORCE_REAL_TOKENIZER = original;
+    }
+  });
+
+  test.each<[string, Partial<MuxMetadata>, Partial<typeof request>]>([
+    ["a partial reply", { partial: true }, {}],
+    ["a synthetic reply", { synthetic: true }, {}],
+    ["a failed reply", { error: "boom" }, {}],
+    ["a reply with an error type", { errorType: "unknown" }, {}],
+    ["a compaction summary", { compacted: "user" }, {}],
+    ["a context boundary", { compactionBoundary: true }, {}],
+    ["a reply without usage", { contextUsage: undefined }, {}],
+    [
+      "a reply without input",
+      { contextUsage: { inputTokens: 0, outputTokens: 5, totalTokens: 5 } },
+      {},
+    ],
+    ["a reply without its system count", { systemMessageTokens: undefined }, {}],
+    ["a reply without its model", { model: undefined }, {}],
+    ["another model", {}, { model: "openai:gpt-4.1" }],
+    ["another route", {}, { routeProvider: "openrouter" }],
+    ["another agent", {}, { agentId: "plan" }],
+  ])("%s yields no turn anchor", async (_name, metadata, overrides) => {
+    expect(await anchorFor(metadata, overrides)).toBeUndefined();
+  });
+
+  test("a reply marked as not compacted still anchors", async () => {
+    expect((await anchorFor({ compacted: false }))?.providerTokens).toBe(1000);
+  });
+
+  test("a row without a route or agent still anchors; history without a reply does not", async () => {
+    expect(await anchorFor({ agentId: undefined, routeProvider: undefined })).toBeDefined();
+    expect(
+      await createTurnBudgetAnchor([createMuxMessage("u1", "user", "hi")], request)
+    ).toBeUndefined();
+  });
+
+  test.each([
+    ["no assistant message", { messages: [...history, prompt] }, options],
+    ["another model", payload, { ...options, model: "openai:gpt-4.1" }],
+  ])("%s falls back to the full estimate", async (_name, input, opts) => {
+    expect(await estimateAnchoredRequestTokensForModel(input, opts, await anchorFor())).toEqual(
+      await estimateAssembledRequestTokensForModel(input, opts)
+    );
+  });
+});
+
 describe("repeated native tool references (#5413)", () => {
   // Anthropic expands every tool_reference into the full definition, repeats included.
   const claude = "anthropic:claude-opus-5-5";
@@ -909,6 +1038,14 @@ describe("repeated native tool references (#5413)", () => {
     expect(anchor).toBeDefined();
     const payload = { tools, messages: twice };
     expect(await estimateAnchoredRequestTokensForModel(payload, options, anchor)).toEqual(
+      await estimateAssembledRequestTokensForModel(payload, options)
+    );
+  });
+
+  test("a reference after the turn anchor's reply falls back to the full estimate", async () => {
+    const turnAnchor = { model: claude, providerTokens: 1000 };
+    const payload = { tools, messages: once };
+    expect(await estimateAnchoredRequestTokensForModel(payload, options, turnAnchor)).toEqual(
       await estimateAssembledRequestTokensForModel(payload, options)
     );
   });

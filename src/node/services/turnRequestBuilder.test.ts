@@ -446,6 +446,37 @@ describe("TurnRequestBuilder assembled preflight", () => {
     const off = await assembleBudgetCheckedPromptPayload(request, { enabled: false });
     expect(off.contextBudgetEstimate).toBeUndefined();
   });
+
+  // #7662: after a completed reply, E is that reply's provider input plus the messages after it.
+  it("anchors the enforced estimate to the newest reply's provider input", async () => {
+    const base = options("openai:large-context-model");
+    const reply = createMuxMessage("reply", "assistant", "done", {
+      model: base.modelString,
+      agentId: "exec",
+      systemMessageTokens: 0,
+      contextUsage: { inputTokens: 50_000, outputTokens: 10, totalTokens: 50_010 },
+    });
+    const request = {
+      ...base,
+      history: [createMuxMessage("earlier", "user", "earlier request"), reply, ...base.history],
+    };
+    const payload = await assembleBudgetCheckedPromptPayload(request, { enabled: true });
+    const full = (await estimateAssembledRequestTokensForModel(payload, {
+      model: request.modelString,
+      modelContextLimit: payload.contextBudgetLimit,
+    }))!.estimate;
+    expect(full).toBeLessThan(50_000);
+    expect(payload.contextBudgetTurnAnchor!.providerTokens).toBeGreaterThan(50_000);
+    expect(payload.contextBudgetEstimate).toBeGreaterThan(
+      payload.contextBudgetTurnAnchor!.providerTokens
+    );
+    // A compaction request's trim can drop rows the provider count holds.
+    const compaction = await assembleBudgetCheckedPromptPayload(
+      { ...request, compactionInputBudgetTokens: 90_000 },
+      { enabled: true }
+    );
+    expect(compaction.contextBudgetTurnAnchor).toBeUndefined();
+  });
 });
 
 describe("TurnRequestBuilder MCP overrides deadline", () => {

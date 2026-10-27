@@ -14,6 +14,8 @@ import {
   BUDGET_TOKEN_CHUNK_SLACK,
   REQUEST_FRAMING_TOKENS,
 } from "@/common/constants/contextBudget";
+import type { MuxMessage } from "@/common/types/message";
+import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
 import { normalizeUsage, type AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
 import { countToolReferences } from "@/common/utils/tools/toolCatalog";
@@ -163,6 +165,28 @@ export interface ContextBudgetAnchor extends ContextBudgetAnchorRequest {
 }
 
 /**
+ * A turn-start request's anchor (#7662): the provider-counted input of the previous turn's last
+ * step. That step's request is this request up to its last assistant message (the step's own
+ * output), so no request object is kept: the delta is found in the messages at count time.
+ */
+export interface TurnBudgetAnchor extends BudgetModel {
+  providerTokens: number;
+}
+
+/** A step's usage normalized for display, or undefined without a positive integer input total. */
+function reportedUsage(
+  usage: AiSdkUsageLike,
+  model: string,
+  providerMetadata: Record<string, unknown> | undefined
+) {
+  const normalized = normalizeUsage(usage);
+  // Cache or reasoning details without an input total do not count the whole request.
+  const input = normalized.inputTokens;
+  if (input == null || !Number.isSafeInteger(input) || input <= 0) return undefined;
+  return createDisplayUsage(normalized, model, providerMetadata);
+}
+
+/**
  * Pairs a step's request with the usage the provider reported for it. Reasoning output is
  * added because the next request replays it and the local estimator skips encrypted
  * reasoning. Undefined (so the caller uses the full estimate) when the provider reported no
@@ -179,11 +203,7 @@ export function createContextBudgetAnchor(
     | undefined
 ): ContextBudgetAnchor | undefined {
   if (request == null || step?.usage == null) return undefined;
-  const normalized = normalizeUsage(step.usage);
-  // Cache or reasoning details without an input total do not count the whole request.
-  const input = normalized.inputTokens;
-  if (input == null || !Number.isSafeInteger(input) || input <= 0) return undefined;
-  const usage = createDisplayUsage(normalized, request.model, step.providerMetadata);
+  const usage = reportedUsage(step.usage, request.model, step.providerMetadata);
   if (usage == null) return undefined;
   // Display recovery also reads provider-metadata-only reasoning counts. Zero cannot tell
   // "no reasoning" from "not reported", so a step that emitted reasoning needs a count.
@@ -193,6 +213,89 @@ export function createContextBudgetAnchor(
     usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens + reasoning;
   return Number.isSafeInteger(providerTokens) && providerTokens > 0
     ? { ...request, providerTokens }
+    : undefined;
+}
+
+/** Both set and different: a row without the field does not count as a switch. */
+function differs(before: string | undefined, now: string | undefined): boolean {
+  return before != null && now != null && before !== now;
+}
+
+type ReplyMetadata = NonNullable<MuxMessage["metadata"]>;
+
+/** A completed reply: not partial, synthetic, failed, a compaction summary or a boundary. */
+function isCompletedReply(metadata: ReplyMetadata): boolean {
+  // A compaction summary carries an estimated usage, and starts a new segment.
+  const compacted = metadata.compacted != null && metadata.compacted !== false;
+  return !(
+    metadata.partial === true ||
+    metadata.synthetic === true ||
+    metadata.error != null ||
+    metadata.errorType != null ||
+    compacted ||
+    metadata.compactionBoundary === true ||
+    metadata.contextBoundaryKind != null
+  );
+}
+
+/** The model, route and agent switches that re-freeze the system prompt. */
+function sameRequestRoute(
+  metadata: ReplyMetadata & { model: string },
+  request: BudgetModel & { routeProvider?: string; agentId?: string }
+): boolean {
+  // Rows record the canonical model (Coder ids raw), so compare both sides canonicalized.
+  return (
+    normalizeToCanonical(metadata.model) === normalizeToCanonical(request.model) &&
+    !differs(metadata.routeProvider, request.routeProvider) &&
+    !differs(metadata.agentId, request.agentId)
+  );
+}
+
+/** The newest reply's metadata when its saved usage can anchor this request, else undefined. */
+function anchoringReply(
+  rows: readonly MuxMessage[],
+  request: BudgetModel & { routeProvider?: string; agentId?: string }
+) {
+  const metadata = rows.findLast((row) => row.role === "assistant")?.metadata;
+  const { contextUsage, model, systemMessageTokens } = metadata ?? {};
+  if (contextUsage == null || model == null || systemMessageTokens == null) return undefined;
+  const reply = { ...metadata, contextUsage, model, systemMessageTokens };
+  return isCompletedReply(reply) && sameRequestRoute(reply, request) ? reply : undefined;
+}
+
+/**
+ * The anchor for a turn-start request built from `rows`, its provider request rows (#7662).
+ * The newest assistant row must be a completed reply from the same model, route and agent (the
+ * switches that re-freeze the system prompt), with the provider's input total for its last step
+ * and its sent system token count. Undefined (so the caller uses the full estimate) otherwise.
+ *
+ * Reasoning output is not added, unlike the in-turn anchor: the request carries that step's
+ * output, reasoning text included, after the anchored prefix, so the estimator counts it.
+ * Growth of `system`, the sent system text, since that request (a live system prompt changes
+ * between turns when the provider takes no system rows) is added, because the provider count
+ * holds the old prompt. New tail rows go after the newest reply, where the delta counts them.
+ */
+export async function createTurnBudgetAnchor(
+  rows: readonly MuxMessage[],
+  request: BudgetModel & { routeProvider?: string; agentId?: string; system: string }
+): Promise<TurnBudgetAnchor | undefined> {
+  const reply = anchoringReply(rows, request);
+  if (reply == null) return undefined;
+  const usage = reportedUsage(reply.contextUsage, request.model, reply.contextProviderMetadata);
+  if (usage == null) return undefined;
+  // The row counted its system text, tail rows included, with this tokenizer (measureSentSystem),
+  // so its rows only make the growth smaller. Claude-encoded growth is scaled like every other
+  // claude count (#5219).
+  const tokenizer = await getTokenizerForModel(request.model, request.metadataModel);
+  const growth = (await tokenizer.countTokens(request.system)) - reply.systemMessageTokens;
+  const factor = tokenizer.encoding === "claude" ? CLAUDE_ENCODING_BUDGET_FACTOR : 1;
+  const providerTokens =
+    usage.input.tokens +
+    usage.cached.tokens +
+    usage.cacheCreate.tokens +
+    Math.ceil(Math.max(0, growth) * factor);
+  return Number.isSafeInteger(providerTokens)
+    ? { model: request.model, metadataModel: request.metadataModel, providerTokens }
     : undefined;
 }
 
@@ -218,12 +321,41 @@ export function isExactAppend(
 }
 
 /**
- * Anchored estimate (#4858). Contract: the anchor is used ONLY when this request is an exact
- * append of the step whose usage it carries: same model, the same system prompt and tool set
- * objects, the same advertised tool names, a message list that starts with that step's sent
+ * The messages the anchor's provider count does not hold, or undefined when the anchor does
+ * not apply. A turn anchor's delta starts at the last assistant message: the previous turn's
+ * last step output, which Xum's history rebuild sends as its own message (stepStartPartIndices).
+ */
+function anchoredDelta(
+  payload: AssembledRequestBudgetInput,
+  options: BudgetModel & { activeTools?: readonly string[] },
+  anchor: ContextBudgetAnchor | TurnBudgetAnchor
+): readonly unknown[] | undefined {
+  if ("messages" in anchor) {
+    return isExactAppend(payload, options, anchor)
+      ? payload.messages.slice(anchor.messages.length)
+      : undefined;
+  }
+  if (anchor.model !== options.model || anchor.metadataModel !== options.metadataModel) {
+    return undefined;
+  }
+  const start = payload.messages.findLastIndex(
+    (message) => (message as { role?: unknown } | null)?.role === "assistant"
+  );
+  if (start < 0) return undefined;
+  const delta = payload.messages.slice(start);
+  // A tool_reference expands into a definition the delta never charges (#5413), as above.
+  return countToolReferences(delta).size === 0 ? delta : undefined;
+}
+
+/**
+ * Anchored estimate (#4858). Contract: an in-turn anchor is used ONLY when this request is an
+ * exact append of the step whose usage it carries: same model, the same system prompt and tool
+ * set objects, the same advertised tool names, a message list that starts with that step's sent
  * messages (element identity, so any rewrite of the prefix fails), and a positive integer
- * provider input total plus a reasoning count whenever the step emitted reasoning. The estimate is then the provider's count plus the existing estimator applied to the
- * appended messages only. ANY doubt means the full estimate; edge cases get a new full-estimate
+ * provider input total plus a reasoning count whenever the step emitted reasoning. A turn
+ * anchor (createTurnBudgetAnchor) needs the same model and a last assistant message. The
+ * estimate is then the provider's count plus the existing estimator applied to the appended
+ * messages only. ANY doubt means the full estimate; edge cases get a new full-estimate
  * condition here, never new mechanism.
  */
 export async function estimateAnchoredRequestTokensForModel(
@@ -232,15 +364,15 @@ export async function estimateAnchoredRequestTokensForModel(
     modelContextLimit: number | null | undefined;
     activeTools?: readonly string[];
   },
-  anchor: ContextBudgetAnchor | undefined
+  anchor: ContextBudgetAnchor | TurnBudgetAnchor | undefined
 ): Promise<{ estimate: number; hardCeiling: number } | undefined> {
-  if (anchor == null || !isExactAppend(payload, options, anchor)) {
+  const delta = anchor == null ? undefined : anchoredDelta(payload, options, anchor);
+  if (anchor == null || delta == null) {
     return estimateAssembledRequestTokensForModel(payload, options);
   }
   const limit = options.modelContextLimit;
   if (limit == null || !Number.isFinite(limit) || limit <= 0) return undefined;
   const hardCeiling = getContextBudgetHardCeiling(limit);
-  const delta = payload.messages.slice(anchor.messages.length);
   // Same early-exit lower bound as the full estimate: above the ceiling, not exact.
   const deltaEstimate = await countBudgetInput(
     prepareAssembledRequestTokenCount({ messages: delta }),
@@ -261,7 +393,7 @@ export async function measureAssembledRequestBudgetForModel(
     modelContextLimit: number | null | undefined;
     activeTools?: readonly string[];
   },
-  anchor?: ContextBudgetAnchor
+  anchor?: ContextBudgetAnchor | TurnBudgetAnchor
 ): Promise<
   { estimate: number; hardCeiling: number; exceeded?: ContextBudgetExceeded } | undefined
 > {
@@ -283,7 +415,7 @@ export async function checkAssembledRequestBudgetForModel(
     modelContextLimit: number | null | undefined;
     activeTools?: readonly string[];
   },
-  anchor?: ContextBudgetAnchor
+  anchor?: ContextBudgetAnchor | TurnBudgetAnchor
 ): Promise<ContextBudgetExceeded | undefined> {
   return (await measureAssembledRequestBudgetForModel(payload, options, anchor))?.exceeded;
 }

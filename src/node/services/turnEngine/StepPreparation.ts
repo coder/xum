@@ -36,6 +36,7 @@ import {
   checkAssembledRequestBudgetForModel,
   createContextBudgetAnchor,
   type ContextBudgetAnchorRequest,
+  type TurnBudgetAnchor,
 } from "@/node/services/contextBudgetCounting";
 import { ContextBudgetBlockedError } from "@/node/services/contextBudgetError";
 import type { HistoryService } from "@/node/services/historyService";
@@ -434,17 +435,22 @@ export function buildContextBudgetRequest(
   };
 }
 
-/** Hard-stop the step when its assembled request exceeds the safe context budget. */
+/**
+ * Hard-stop the step when its assembled request exceeds the safe context budget. Step zero has
+ * no settled step, so it counts against the turn anchor, as the turn-start check did (#7662).
+ */
 async function enforceContextBudgetPreflight(
   request: Pick<StreamRequestConfig, "onStepSettled">,
   modelContextLimit: number,
   budgetRequest: ContextBudgetAnchorRequest,
   previousRequest: ContextBudgetAnchorRequest | undefined,
   lastStep: Parameters<typeof createContextBudgetAnchor>[1],
-  stepNumber: number
+  stepNumber: number,
+  turnAnchor: TurnBudgetAnchor | undefined
 ): Promise<void> {
   const budgetOptions = { ...budgetRequest, modelContextLimit };
-  const anchor = createContextBudgetAnchor(previousRequest, lastStep);
+  const anchor =
+    stepNumber === 0 ? turnAnchor : createContextBudgetAnchor(previousRequest, lastStep);
   const exceeded = await checkAssembledRequestBudgetForModel(budgetRequest, budgetOptions, anchor);
   // Step zero can follow executed tools on a fallback. This late hard stop
   // preserves settled results; it must not reset/replay the activated catalog.
@@ -715,7 +721,8 @@ export class StepPreparation {
         budgetRequest,
         previousRequest,
         steps.at(-1),
-        stepNumber
+        stepNumber,
+        request.contextBudgetTurnAnchor
       );
     }
     return buildPrepareStepResult({
