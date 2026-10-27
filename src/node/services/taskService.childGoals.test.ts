@@ -1208,10 +1208,10 @@ describe("TaskService child goals", () => {
     expect(seeded.success).toBe(true);
     expect(await t.taskService.markInterruptedTaskRunning(childId)).toBe(true);
     const internal = t.taskService as unknown as {
-      ownedAttemptByTaskId: Map<string, { receiptEligible: boolean }>;
+      attemptLedger: { ownedAttemptByTaskId: Map<string, { receiptEligible: boolean }> };
       streamEndDecisionsByTaskId: Map<string, Array<{ outcome: string }>>;
     };
-    expect(internal.ownedAttemptByTaskId.get(childId)?.receiptEligible).toBe(true);
+    expect(internal.attemptLedger.ownedAttemptByTaskId.get(childId)?.receiptEligible).toBe(true);
     await t.setChildGoal();
     const realWait = t.goals.waitForStreamAccountingReceipt.bind(t.goals);
     spyOn(t.goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
@@ -1566,10 +1566,10 @@ describe("TaskService child goals", () => {
 
     const listeners = (
       t.taskService as unknown as {
-        attemptSettlementListenersByTaskId: Map<string, Set<() => void>>;
+        attemptLedger: { attemptSettlementListenersByTaskId: Map<string, Set<() => void>> };
         notifyAttemptSettlementListeners: (taskId: string) => void;
       }
-    ).attemptSettlementListenersByTaskId;
+    ).attemptLedger.attemptSettlementListenersByTaskId;
     expect(listeners.get(childId)?.size).toBe(1);
     (
       t.taskService as unknown as { notifyAttemptSettlementListeners: (taskId: string) => void }

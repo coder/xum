@@ -58,10 +58,12 @@ const OWNERS = [midId, rootId];
 const PREDECESSOR = "att_00000000000000f1";
 
 interface Internals {
-  ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
-  attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string; source: string }>;
+  attemptLedger: {
+    ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
+    attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string; source: string }>;
+    attemptSettlementListenersByTaskId: Map<string, Set<() => void>>;
+  };
   taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
-  attemptSettlementListenersByTaskId: Map<string, Set<() => void>>;
   waitForWorkspaceStopsToRelease: (ids: readonly string[], deadlineMs: number) => Promise<void>;
   releaseSharedDesktopTaskOnUserStop: (taskId: string, abortOrigin: unknown) => Promise<void>;
   resolveStreamAttemptAtEvent: (taskId: string) => unknown;
@@ -211,7 +213,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
     expect(seeded.success).toBe(true);
     expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
     const attemptId = entryOf(config, taskId)!.taskAttemptId!;
-    expect(internals(taskService).ownedAttemptByTaskId.get(taskId)).toMatchObject({
+    expect(internals(taskService).attemptLedger.ownedAttemptByTaskId.get(taskId)).toMatchObject({
       attemptId,
       receiptEligible: true,
     });
@@ -306,7 +308,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       const attemptId = await ownEligibleAttempt(config, taskService, taskId);
       await svc.releaseSharedDesktopTaskOnUserStop(taskId, svc.resolveStreamAttemptAtEvent(taskId));
       expect(entryOf(config, taskId)?.taskStatus).toBe("interrupted");
-      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(taskId)).toMatchObject({
         attemptId,
         phase: "settled",
         source: "user-stop-idle",
@@ -328,7 +330,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
         { expectedAttemptId: attemptId }
       );
       expect(entryOf(config, taskId)?.taskStatus).toBe("interrupted");
-      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(taskId)).toMatchObject({
         attemptId,
         phase: "settled",
         source: "terminal-failure",
@@ -385,7 +387,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
         return true;
       });
       expect(receiptAtRelease).toBe(true);
-      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(taskId)).toMatchObject({
         attemptId,
         phase: "settled",
         source: "stop-settled",
@@ -454,7 +456,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
         cleared.add(timer);
         realClearTimeout(timer);
       }) as typeof clearTimeout);
-      const listenerSets = spyOn(svc.attemptSettlementListenersByTaskId, "set");
+      const listenerSets = spyOn(svc.attemptLedger.attemptSettlementListenersByTaskId, "set");
       // This file restores its spies per test (no mock.restore in afterEach).
       const restoreSpies = () => {
         for (const spy of [writeSpy, waitSpy, setSpy, clearSpy, listenerSets]) spy.mockRestore();
@@ -495,7 +497,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       expect(launch).not.toHaveBeenCalled();
       const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
       expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
-      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
         attemptId,
         phase: "settled",
         source: "reservation-canceled",
@@ -520,7 +522,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       expect(created.success).toBe(false);
       const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
       expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
-      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
         attemptId,
         phase: "settled",
         source: "reservation-failed",
@@ -564,9 +566,9 @@ describe("TaskService settlement receipt producers (G2)", () => {
         await waitForCondition(() => entryOf(config, spawnedId)?.taskStatus === "interrupted");
         const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
         await waitForCondition(
-          () => svc.attemptSettlementByTaskId.get(spawnedId)?.phase === "settled"
+          () => svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)?.phase === "settled"
         );
-        expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+        expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
           attemptId,
           source: "launch-failed",
         });
@@ -620,7 +622,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
           expect(svc.taskStopLatch.workspaceStopRecords.has(taskId)).toBe(false);
         }
         expect(entryOf(config, taskId)?.taskStatus).toBe("interrupted");
-        expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+        expect(svc.attemptLedger.attemptSettlementByTaskId.get(taskId)).toMatchObject({
           attemptId,
           phase: "closing",
         });
@@ -650,7 +652,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
         // bound and then marks the successor unproven.
         shortenClosureSettleWait();
         expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-        expect(svc.ownedAttemptByTaskId.get(taskId)?.receiptEligible).toBe(false);
+        expect(svc.attemptLedger.ownedAttemptByTaskId.get(taskId)?.receiptEligible).toBe(false);
         expect(entryOf(config, taskId)?.taskAttemptUnproven).toBe(true);
       }
     );
@@ -703,7 +705,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       await fsPromises.writeFile(configPath, goodBytes);
 
       expect(entryOf(config, taskId)?.taskAttemptId).toBe(attemptId);
-      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(taskId)).toMatchObject({
         attemptId,
         phase: "closing",
       });
@@ -747,7 +749,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
     } finally {
       indexSpy.mockRestore();
     }
-    expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+    expect(svc.attemptLedger.attemptSettlementByTaskId.get(taskId)).toMatchObject({
       attemptId,
       phase: "closing",
     });
@@ -799,7 +801,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
 
     await svc.releaseSharedDesktopTaskOnUserStop(taskId, svc.resolveStreamAttemptAtEvent(taskId));
 
-    expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+    expect(svc.attemptLedger.attemptSettlementByTaskId.get(taskId)).toMatchObject({
       attemptId,
       phase: "settled",
     });
@@ -1015,7 +1017,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       // No receipt for the marked child's predecessor: its reawakened attempt is ineligible.
       expect(await first.taskService.markInterruptedTaskRunning(marked)).toBe(true);
       const markedAttempt = entryOf(config, marked)!.taskAttemptId!;
-      expect(first.svc.ownedAttemptByTaskId.get(marked)?.receiptEligible).toBe(false);
+      expect(first.svc.attemptLedger.ownedAttemptByTaskId.get(marked)?.receiptEligible).toBe(false);
       await first.taskService.terminateAllDescendantAgentTasks(midId);
       await waitForCondition(
         () =>
@@ -1031,7 +1033,9 @@ describe("TaskService settlement receipt producers (G2)", () => {
         await restarted.svc.evaluateAttemptLineage(eligible, entryOf(restartedConfig, eligible)!)
       ).toEqual({ proven: true, reason: "settlement receipt found" });
       expect(await restarted.taskService.markInterruptedTaskRunning(eligible)).toBe(true);
-      expect(restarted.svc.ownedAttemptByTaskId.get(eligible)?.receiptEligible).toBe(true);
+      expect(restarted.svc.attemptLedger.ownedAttemptByTaskId.get(eligible)?.receiptEligible).toBe(
+        true
+      );
       expect(entryOf(restartedConfig, eligible)?.taskAttemptUnproven).toBeUndefined();
       expect(entryOf(restartedConfig, eligible)?.taskAttemptId).not.toBe(eligibleAttempt);
 
@@ -1040,7 +1044,9 @@ describe("TaskService settlement receipt producers (G2)", () => {
           .proven
       ).toBe(false);
       expect(await restarted.taskService.markInterruptedTaskRunning(marked)).toBe(true);
-      expect(restarted.svc.ownedAttemptByTaskId.get(marked)?.receiptEligible).toBe(false);
+      expect(restarted.svc.attemptLedger.ownedAttemptByTaskId.get(marked)?.receiptEligible).toBe(
+        false
+      );
       expect(entryOf(restartedConfig, marked)?.taskAttemptUnproven).toBe(true);
     });
   });
@@ -1075,7 +1081,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
       expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
       // The obligation may still run toward a report: settled in memory only, no durable claim.
-      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
         attemptId,
         phase: "settled",
         source: "reservation-canceled",
@@ -1215,7 +1221,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       // The Stop resolves once its latch dropped (#6727).
       expect((await stopped).success).toBe(true);
       expect(taskService.isWorkspaceStopInProgress(taskId)).toBe(false);
-      expect(svc.attemptSettlementByTaskId.get(taskId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(taskId)).toMatchObject({
         attemptId,
         phase: "settled",
         source: "stop-settled",
@@ -1286,7 +1292,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       expect((await taskService.create(direct)).success).toBe(false);
       const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
       expect(entryOf(config, spawnedId)?.taskStatus).toBe("interrupted");
-      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
         attemptId,
         phase: "settled",
         source: "launch-failed",
@@ -1295,7 +1301,9 @@ describe("TaskService settlement receipt producers (G2)", () => {
       const restartedConfig = await createTestConfig(rootDir);
       const restarted = createHarness(restartedConfig);
       expect(await restarted.taskService.markInterruptedTaskRunning(spawnedId)).toBe(true);
-      expect(restarted.svc.ownedAttemptByTaskId.get(spawnedId)?.receiptEligible).toBe(true);
+      expect(restarted.svc.attemptLedger.ownedAttemptByTaskId.get(spawnedId)?.receiptEligible).toBe(
+        true
+      );
       expect(entryOf(restartedConfig, spawnedId)?.taskAttemptUnproven).toBeUndefined();
     });
 
@@ -1323,7 +1331,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       const { taskService, svc } = createHarness(config, { workspaceService });
       expect((await taskService.create(direct)).success).toBe(false);
       const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
-      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
         attemptId,
         phase: "settled",
         source: "launch-failed",
@@ -1342,7 +1350,7 @@ describe("TaskService settlement receipt producers (G2)", () => {
       const { taskService, svc } = failingSanitizeHarness(config);
       expect((await taskService.create(direct)).success).toBe(false);
       const attemptId = entryOf(config, spawnedId)!.taskAttemptId!;
-      expect(svc.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
+      expect(svc.attemptLedger.attemptSettlementByTaskId.get(spawnedId)).toMatchObject({
         attemptId,
         phase: "closing",
       });
