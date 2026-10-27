@@ -19,7 +19,7 @@ import {
 import {
   createAgentSessionAIServiceFake,
   createAgentSessionHarness,
-  createStreamLifecycleMocks,
+  createTestStreamManager,
 } from "./agentSession.testHarness";
 import type { TurnCompletion } from "./streamManager";
 import type { TurnCoordinator } from "./turnCoordinator";
@@ -614,7 +614,7 @@ describe("AgentSession awaitable disposal", () => {
       const background = Promise.withResolvers<void>();
       const workspaceId = "disposal-fence";
       const streamManager = {
-        ...createStreamLifecycleMocks(),
+        ...createTestStreamManager(),
         getStreamInfo: () => ({
           messageId: "old",
           model: "openai:gpt-4o",

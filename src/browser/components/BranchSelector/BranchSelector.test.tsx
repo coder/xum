@@ -273,7 +273,7 @@ describe("BranchSelector", () => {
       expect(executeBash.mock.calls).toHaveLength(1);
     });
     await waitFor(() => {
-      expect(view.queryByRole("button", { name: "plain-workspace" })).toBeNull();
+      expect(view.queryByRole("button", { name: "plain-workspace" }) === null).toBe(true);
     });
     expect(view.getByText("plain-workspace")).toBeDefined();
     expect(localStorage.getItem("branch:ws-2")).toBeNull();

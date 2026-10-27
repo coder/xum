@@ -315,6 +315,22 @@ async function signOutFailure(
 }
 
 /**
+ * Workspace IDs an install-time MCP override error lists. Large configs fail
+ * the sweep for hundreds of workspaces at once, and a wall of IDs hid the
+ * actual advice; the log keeps one warning per workspace.
+ */
+const MAX_LISTED_FAILED_WORKSPACES = 5;
+
+/** "812 workspaces (a, b, c, d, e, and 807 more)" for an install error. */
+function describeFailedWorkspaces(ids: readonly string[]): string {
+  assert(ids.length > 0, "describeFailedWorkspaces: ids must be non-empty");
+  const shown = ids.slice(0, MAX_LISTED_FAILED_WORKSPACES);
+  const rest = ids.length - shown.length;
+  const noun = ids.length === 1 ? "workspace" : "workspaces";
+  return `${ids.length} ${noun} (${shown.join(", ")}${rest > 0 ? `, and ${rest} more` : ""})`;
+}
+
+/**
  * The Settings text for a sign-out record Xum cannot use (#6627). The parser's own errors
  * already name the recovery step. A read error gets one here.
  */
@@ -1684,6 +1700,19 @@ function manifestSummary(manifest: AgentPluginManifest): AgentPluginManifestSumm
   };
 }
 
+/**
+ * The repository path of a staged plugin root, for manifest errors (discoverAgentPluginAt
+ * `shownRoot`). The staged tree is the "Plugin folder", so errors name e.g.
+ * `.codex-plugin/plugin.json`. A marketplace entry's folder sits below it, so its errors keep
+ * entry-relative paths.
+ */
+function shownStagedRoot(
+  source: Pick<AgentPluginGitSource, "subpath">,
+  marketplace: MarketplaceEntryContext | undefined
+): string | undefined {
+  return marketplace === undefined ? source.subpath : undefined;
+}
+
 export class AgentPluginInstallService {
   private mcpOauthService: Pick<McpOauthService, "logout" | "credentialKey"> | undefined;
   private readonly containerDir: string;
@@ -2720,6 +2749,7 @@ export class AgentPluginInstallService {
     const { plugin, diagnostics } = await discoverAgentPluginAt({
       pluginDir: stagedDir,
       scope: "global",
+      shownRoot: shownStagedRoot(source, marketplace),
     });
     if (!plugin) {
       const reasons = diagnostics.map((d) => d.message);
@@ -3133,12 +3163,16 @@ export class AgentPluginInstallService {
   ): Promise<CollectedPluginSkill[]> {
     const skills: CollectedPluginSkill[] = [];
     for (const skillsRoot of plugin.skillsDirs ?? []) {
-      for (const skill of await this.collectSkills(plugin.rootPath, skillsRoot, warnings)) {
+      for (const { skill, label } of await this.collectSkills(
+        plugin.rootPath,
+        skillsRoot,
+        warnings
+      )) {
         // Runtime discovery keeps the first skill of a name (roots in declared order), so the
         // preview must not promise the later one (#6121).
         if (skills.some((earlier) => earlier.name === skill.name)) {
           warnings.push(
-            `${skillReviewLabel(plugin.rootPath, skillsRoot, skill.name)}: an earlier skills root has a skill with this name; it will not load`
+            `${label}: an earlier skills root has a skill with this name; it will not load`
           );
           continue;
         }
@@ -3148,19 +3182,25 @@ export class AgentPluginInstallService {
     return skills;
   }
 
-  /** One skills root of collectSkillsFromRoots. Warnings name the root by its plugin-relative path. */
+  /**
+   * One skills root of collectSkillsFromRoots. Warnings name the root by its plugin-relative path;
+   * `label` names each skill's real folder (a snake_case folder has a kebab-case skill name).
+   */
   private async collectSkills(
     pluginRoot: string,
     skillsRoot: PluginSkillsRoot,
     warnings: string[]
-  ): Promise<CollectedPluginSkill[]> {
-    const skills: CollectedPluginSkill[] = [];
+  ): Promise<Array<{ skill: CollectedPluginSkill; label: string }>> {
+    const skills: Array<{ skill: CollectedPluginSkill; label: string }> = [];
     // Includes symlinked skill dirs, matching runtime discovery: a symlinked
     // skill activates after install, so it MUST appear in the consent preview.
-    for (const { name: dirName, dir: skillDir, file: skillPath } of await listPluginSkillFolders(
-      skillsRoot
-    )) {
-      const label = skillReviewLabel(pluginRoot, skillsRoot, dirName);
+    for (const {
+      name: skillName,
+      folder,
+      dir: skillDir,
+      file: skillPath,
+    } of await listPluginSkillFolders(skillsRoot)) {
+      const label = skillReviewLabel(pluginRoot, skillsRoot, folder);
       // Spec §4.1 containment anchored at the plugin root, mirroring runtime
       // component checks: a symlink escaping the plugin is surfaced as a
       // warning instead of silently ignored.
@@ -3194,8 +3234,8 @@ export class AgentPluginInstallService {
       // preview (and the update capability surface built from it) would
       // promise a skill that disappears after installation — or classify a
       // never-loading skill as a capability addition.
-      const dirNameParsed = SkillNameSchema.safeParse(dirName);
-      if (!dirNameParsed.success) {
+      const skillNameParsed = SkillNameSchema.safeParse(skillName);
+      if (!skillNameParsed.success) {
         warnings.push(`${label}: invalid skill directory name; it will not load`);
         continue;
       }
@@ -3212,41 +3252,44 @@ export class AgentPluginInstallService {
         // A Claude command becomes SKILL.md text first, so its review, fingerprint and approved
         // copy are a skill's (the copy is that text, which the runtime check parses as is).
         const content = pluginSkillMarkdown(
-          dirName,
+          skillName,
           await fsPromises.readFile(containedSkillPath, "utf8"),
           skillsRoot.command
         );
         const parsed = parseSkillMarkdown({
           content,
           byteSize: stat.size,
-          directoryName: dirNameParsed.data,
+          directoryName: skillNameParsed.data,
           // Mirror runtime discovery: a display name loads under the dir name.
           allowDisplayName: true,
         });
-        warnings.push(...displayNameWarnings(label, dirName, parsed.displayName));
+        warnings.push(...displayNameWarnings(label, skillName, parsed.displayName));
         const relativeDir = path.relative(pluginRoot, skillDir);
         skills.push({
-          name: parsed.frontmatter.name,
-          ...skillConsentFields({
-            relativeDir,
-            frontmatter: skillConsentFrontmatter(parsed),
-            body: parsed.body,
-          }),
-          approvedCopy: { relativeDir, content },
-          // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
-          ...directivesField(skillReviewDirectives(parsed.body)),
-          ...(parsed.frontmatter.description !== undefined
-            ? { description: parsed.frontmatter.description }
-            : {}),
-          // Model-visible beyond name/description: whenToUse interpolates
-          // into the agent_skill_read tool description, and advertise
-          // controls whether the skill appears there at all. Both feed the
-          // update capability fingerprint (capabilitySurface), resolved with
-          // the same helpers the runtime uses.
-          whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
-          advertise: resolveSkillAdvertise(parsed.frontmatter),
-          // paths moves the skill from the static index to file-tool pointers.
-          paths: resolveSkillPaths(parsed.frontmatter),
+          label,
+          skill: {
+            name: parsed.frontmatter.name,
+            ...skillConsentFields({
+              relativeDir,
+              frontmatter: skillConsentFrontmatter(parsed),
+              body: parsed.body,
+            }),
+            approvedCopy: { relativeDir, content },
+            // The commands the skill can run when invoked (#6617): shown, then fingerprinted.
+            ...directivesField(skillReviewDirectives(parsed.body)),
+            ...(parsed.frontmatter.description !== undefined
+              ? { description: parsed.frontmatter.description }
+              : {}),
+            // Model-visible beyond name/description: whenToUse interpolates
+            // into the agent_skill_read tool description, and advertise
+            // controls whether the skill appears there at all. Both feed the
+            // update capability fingerprint (capabilitySurface), resolved with
+            // the same helpers the runtime uses.
+            whenToUse: resolveSkillWhenToUse(parsed.frontmatter),
+            advertise: resolveSkillAdvertise(parsed.frontmatter),
+            // paths moves the skill from the static index to file-tool pointers.
+            paths: resolveSkillPaths(parsed.frontmatter),
+          },
         });
       } catch (error) {
         warnings.push(`${label}: ${getErrorMessage(error)}`);
@@ -5858,6 +5901,8 @@ export class AgentPluginInstallService {
                         : mcpServerManager.forgetWorkspaceOverrides(target)
                     )
                   : mcpServerManager.applyWorkspaceOverrides(target, persisted),
+              hasSnapshot: (workspaceId) =>
+                mcpServerManager.hasWorkspaceOverridesSnapshot(workspaceId),
             }
           : undefined
       );
@@ -6107,7 +6152,7 @@ export class AgentPluginInstallService {
     await this.writePendingOverridePrunes(envelope, rawEntries, remaining);
     if (failed.length > 0) {
       throw new Error(
-        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (workspaces: ${failed.join(", ")}). Retry once those workspaces are accessible.`
+        `A previous uninstall of '${name}' could not clean up its workspace MCP overrides yet (${describeFailedWorkspaces(failed)}). The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
       );
     }
   }
@@ -6139,7 +6184,7 @@ export class AgentPluginInstallService {
     }
     if (failed.length > 0) {
       throw new Error(
-        `Stale workspace MCP overrides for '${name}' could not be cleaned up (workspaces: ${failed.join(", ")}). Retry once those workspaces are accessible.`
+        `Xum could not check the MCP overrides of ${describeFailedWorkspaces(failed)} before installing '${name}'. The log has the error for each workspace. If the errors are time-outs (Xum was busy), retry in a moment.`
       );
     }
   }

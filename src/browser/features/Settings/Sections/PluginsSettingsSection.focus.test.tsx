@@ -109,7 +109,7 @@ test("Escape in Manage components closes only the panel and refocuses its button
   fireEvent.keyDown(alpha, { key: "Escape" });
   expect(onOpenChange).not.toHaveBeenCalledWith(false);
   await waitFor(() =>
-    expect(view.queryByText(/Manage components from the installed version/)).toBeNull()
+    expect(view.queryByText(/Manage components from the installed version/) === null).toBe(true)
   );
   expect(document.activeElement).toBe(manage);
 });

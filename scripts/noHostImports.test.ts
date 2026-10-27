@@ -119,26 +119,7 @@ test("allows listed modules and fails stale entries", () => {
 
 // The allow map is frozen: a PR adds a (file, module) pair only when its phase plan lists it.
 // Phases 2 to 5 remove pairs until the map is empty.
-const FROZEN_ALLOW_PAIRS = [
-  "src/node/services/agentSession.ts @/node/runtime/runtimeHelpers",
-  "src/node/services/agentSession.ts fs/promises",
-  "src/node/services/aiService.ts @/node/runtime/multiProjectRuntime",
-  "src/node/services/aiService.ts @/node/runtime/runtimeFactory",
-  "src/node/services/aiService.ts @/node/runtime/runtimeHelpers",
-  "src/node/services/aiService.ts @/node/utils/fs",
-  "src/node/services/aiService.ts fs/promises",
-  "src/node/services/contextManagement/strategies/tokenBudget.ts @/node/runtime/runtimeHelpers",
-  "src/node/services/tools/bash.ts fs",
-  "src/node/services/tools/review_pane.ts @/node/utils/writeFileAtomic",
-  "src/node/services/tools/review_pane.ts fs/promises",
-  "src/node/services/tools/shared/configReadWrite.ts @/node/utils/writeFileAtomic",
-  "src/node/services/tools/shared/configReadWrite.ts fs/promises",
-  "src/node/services/tools/todo.ts @/node/utils/writeFileAtomic",
-  "src/node/services/tools/todo.ts fs/promises",
-  "src/node/services/tools/xum_agents_path.ts fs/promises",
-  "src/node/services/tools/xum_agents_read.ts fs/promises",
-  "src/node/services/tools/xum_agents_write.ts fs/promises",
-];
+const FROZEN_ALLOW_PAIRS: string[] = [];
 
 function allowMap(): Record<string, string[]> {
   const setting = ruleEntry().rules?.["local/no-host-imports"] as [
@@ -167,4 +148,24 @@ test("each allow key is an agent-loop file", () => {
       loop: true,
     });
   }
+});
+
+// #7282: host timers count as host access, so loop code arms timers through the HostClock.
+test("the configured module list covers the timers modules", () => {
+  const [, options] = ruleEntry().rules?.["local/no-host-imports"] as [string, unknown];
+  const lintConfig = [
+    {
+      files: ["**/*.ts"],
+      languageOptions: { parser: tseslint.parser },
+      plugins: { local: { rules: { "no-host-imports": findRule() } } },
+      rules: { "local/no-host-imports": ["error", options] as ["error", unknown] },
+    },
+  ];
+  const report = (code: string) =>
+    linter
+      .verify(code, lintConfig, "src/node/services/tools/x.ts")
+      .map((message) => message.messageId ?? message.message);
+  expect(report(`import { setTimeout as delay } from "node:timers/promises";`)).toEqual(["host"]);
+  expect(report(`import { setInterval } from "timers";`)).toEqual(["host"]);
+  expect(report(`import type { TimerOptions } from "node:timers";`)).toEqual([]);
 });

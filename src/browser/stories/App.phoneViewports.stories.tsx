@@ -13,11 +13,7 @@ import { CUSTOM_EVENTS, createCustomEvent } from "@/common/constants/events";
 import type { TimelineEvent } from "@/common/orpc/schemas/timeline";
 
 import { updatePersistedState } from "@/browser/hooks/usePersistedState";
-import {
-  LEFT_SIDEBAR_COLLAPSED_KEY,
-  getPinnedTodoExpandedKey,
-  getSubAgentTasksExpandedKey,
-} from "@/common/constants/storage";
+import { LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
 import { MOBILE_TOUCH_TARGET_PX, NARROW_VIEWPORT_MAX_WIDTH_PX } from "@/constants/layout";
 
 import { appMeta, AppWithMocks, PIXEL_DISABLED, type AppStory } from "./meta.js";
@@ -29,7 +25,11 @@ import { clearWorkspaceSelection, collapseRightSidebar, expandProjects } from ".
 import { createMockORPCClient } from "./mocks/orpc";
 import {
   blurActiveElement,
+  findChatActivityPanel,
+  openChatActivityPanel,
+  openLeftSidebar,
   waitForChatInputAutofocusDone,
+  waitForModalLayer,
   waitForScrollStabilization,
 } from "./storyPlayHelpers.js";
 
@@ -259,6 +259,8 @@ export const IPhone16eAnalyticsSheet: AppStory = {
     const canvas = within(canvasElement);
     await stabilizePhoneViewportStory(canvasElement);
 
+    // The analytics button sits in the sidebar's title bar: on phones a drawer that starts closed.
+    await openLeftSidebar(canvasElement);
     await userEvent.click(await canvas.findByTestId("analytics-button"));
     const dialog = await within(canvasElement.ownerDocument.body).findByRole(
       "dialog",
@@ -309,37 +311,9 @@ export const IPhone17ProMax: AppStory = {
 const COMPOSER_DECORATIONS_WORKSPACE_ID = "ws-iphone-16e-composer-decorations";
 
 /**
- * Neither Pixel nor the test-runner matches `pointer: coarse`, so read the shipped rule instead
- * of the rendered height: the min-height `selector` receives inside a coarse-pointer media rule.
- */
-function coarsePointerMinHeight(selector: string): number | null {
-  const visit = (rules: CSSRuleList, inCoarse: boolean): number | null => {
-    for (const rule of rules) {
-      if (rule instanceof CSSStyleRule) {
-        if (inCoarse && rule.selectorText === selector && rule.style.minHeight) {
-          return Number.parseFloat(rule.style.minHeight);
-        }
-      } else if (rule instanceof CSSGroupingRule) {
-        const coarse =
-          inCoarse ||
-          (rule instanceof CSSMediaRule && rule.conditionText.includes("pointer: coarse"));
-        const found = visit(rule.cssRules, coarse);
-        if (found !== null) return found;
-      }
-    }
-    return null;
-  };
-  for (const sheet of document.styleSheets) {
-    const found = visit(sheet.cssRules, false);
-    if (found !== null) return found;
-  }
-  return null;
-}
-
-/**
- * Every collapsible decoration stacked above the composer at once (TODO, sub-agents, background
- * bash). Pixel captures the collapsed stack at phone width; the play assertion covers the touch
- * floor these rows opt into, which the snapshot cannot.
+ * TODO, sub-agents and a background bash at once: they share the composer's live line as chips
+ * instead of stacking one row each. Pixel captures the line at phone width; the play asserts the
+ * chips fit on one line and that a chip's panel opens above the line inside the screen.
  */
 export const IPhone16eComposerDecorations: AppStory = {
   globals: {
@@ -348,8 +322,6 @@ export const IPhone16eComposerDecorations: AppStory = {
   render: () => (
     <AppWithMocks
       setup={() => {
-        updatePersistedState(getPinnedTodoExpandedKey(COMPOSER_DECORATIONS_WORKSPACE_ID), false);
-        updatePersistedState(getSubAgentTasksExpandedKey(COMPOSER_DECORATIONS_WORKSPACE_ID), false);
         return setupSimpleChatStory({
           workspaceId: COMPOSER_DECORATIONS_WORKSPACE_ID,
           workspaceName: "mobile-decorations",
@@ -405,21 +377,40 @@ export const IPhone16eComposerDecorations: AppStory = {
     await stabilizePhoneViewportStory(canvasElement);
 
     const storyRoot = document.getElementById("storybook-root") ?? canvasElement;
-    await waitFor(() => {
-      const rows = storyRoot.querySelectorAll(
-        '[data-component="ChatInputDecorationStack"] .mobile-touch-row'
-      );
-      if (rows.length < 3) {
-        throw new Error(`Expected TODO, sub-agent, and background bash rows, found ${rows.length}`);
+    const line = await waitFor(() => {
+      const found = storyRoot.querySelector<HTMLElement>('[data-component="ChatActivityLine"]');
+      const chips = found?.querySelectorAll<HTMLElement>("[data-activity-chip]") ?? [];
+      if (found == null || chips.length < 3) {
+        throw new Error(
+          `Expected TODO, sub-agent and background bash chips, found ${chips.length}`
+        );
       }
+      return found;
     });
-
-    const rowFloor = coarsePointerMinHeight(".mobile-touch-row");
-    if (rowFloor === null || rowFloor >= MOBILE_TOUCH_TARGET_PX) {
-      throw new Error(
-        `Decoration rows should sit below the ${MOBILE_TOUCH_TARGET_PX}px touch floor on coarse pointers, got ${String(rowFloor)}`
-      );
+    const chips = [...line.querySelectorAll<HTMLElement>("[data-activity-chip]")];
+    const tops = new Set(chips.map((chip) => Math.round(chip.getBoundingClientRect().top)));
+    await expect(tops.size).toBe(1);
+    // Every chip fully visible: the chip strip scrolls sideways only when it runs out of room.
+    for (const chip of chips) {
+      const rect = chip.getBoundingClientRect();
+      await expect(rect.left).toBeGreaterThanOrEqual(line.getBoundingClientRect().left);
+      await expect(rect.right).toBeLessThanOrEqual(line.getBoundingClientRect().right);
     }
+
+    await openChatActivityPanel(storyRoot, "BackgroundProcessesBanner");
+    const panel = await findChatActivityPanel();
+    const panelRect = panel.getBoundingClientRect();
+    await expect(panelRect.left).toBeGreaterThanOrEqual(0);
+    await expect(panelRect.right).toBeLessThanOrEqual(window.innerWidth);
+    if (window.innerWidth <= NARROW_VIEWPORT_MAX_WIDTH_PX) {
+      // Pixel's phone viewport: the list opens in the activity sheet at the bottom of the screen.
+      await expect(panel.closest('[role="dialog"]')).not.toBeNull();
+      await expect(Math.round(panelRect.bottom)).toBeLessThanOrEqual(window.innerHeight);
+    } else {
+      // The test-runner's wide window around the phone frame: a popover above the line.
+      await expect(panelRect.bottom).toBeLessThanOrEqual(line.getBoundingClientRect().top);
+    }
+    await expect(within(panel).getByText("dev server")).toBeVisible();
   },
 };
 
@@ -772,7 +763,7 @@ export const IPhone16eHomeScreenTerminal: AppStory = {
 
     // The fixed-width decorator hides the right sidebar, so New terminal takes the pop-out path.
     await userEvent.click(await canvas.findByRole("button", { name: "New terminal" }));
-    const dialog = await body.findByTestId("terminal-dialog");
+    const dialog = await waitForModalLayer(await body.findByTestId("terminal-dialog"));
     await expect(homeScreenTerminal.windowOpen).not.toHaveBeenCalled();
 
     await userEvent.click(within(dialog).getByRole("button", { name: "Close terminal" }));
@@ -880,6 +871,8 @@ export const IPhone16eSidebarWithSections: AppStory = {
   },
   play: async ({ canvasElement }) => {
     const projectPath = "/home/user/projects/my-app";
+    // The capture shows the drawer, which starts closed on phones.
+    await openLeftSidebar(canvasElement);
     // No workspace is selected so there's no ChatInput to wait for;
     // skip stabilizePhoneViewportStory and wait for the section directly.
     await waitFor(

@@ -25,11 +25,13 @@ async function restrictedImports(filePath: string, code: string): Promise<string
   return messages.map((message) => message.message);
 }
 
-const barrelMessage = expect.stringContaining("not the @/common/orpc/schemas barrel");
-const nodeMessage = expect.stringContaining("must not value-import src/node");
-const backendOnlyMessage = expect.stringContaining("module is backend-only");
-const shikiMessage = expect.stringContaining("Shiki must only be imported in highlightWorker.ts");
-const tokenizerMessage = expect.stringContaining("ai-tokenizer/encoding barrel");
+const barrelMessage = expect.stringContaining("not the @/common/orpc/schemas barrel") as string;
+const nodeMessage = expect.stringContaining("must not value-import src/node") as string;
+const backendOnlyMessage = expect.stringContaining("module is backend-only") as string;
+const shikiMessage = expect.stringContaining(
+  "Shiki must only be imported in highlightWorker.ts"
+) as string;
+const tokenizerMessage = expect.stringContaining("ai-tokenizer/encoding barrel") as string;
 
 describe("orpc schemas barrel guard", () => {
   test.each([
@@ -166,7 +168,7 @@ describe("src/node guard for browser and common code", () => {
     [
       "src/common/config/schemas/example.test.ts",
       'import { X } from "@/common/orpc/schemas/runtime";',
-      expect.stringContaining("Config schemas must not import from ORPC"),
+      expect.stringContaining("Config schemas must not import from ORPC") as string,
     ],
   ])("keeps the folder rules for tests in %s: %s", async (filePath, code, message) => {
     expect(await restrictedImports(filePath, code)).toEqual([message]);

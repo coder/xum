@@ -8,6 +8,7 @@ import { installDom, stubNarrowViewport } from "../../../../../tests/ui/dom";
 import { APIProvider, type APIClient } from "@/browser/contexts/API";
 import { ThemeProvider } from "@/browser/contexts/ThemeContext";
 import { getAppConfigStore } from "@/browser/stores/AppConfigStore";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import { createTestApiClient, type TestApiOverrides } from "@/browser/testUtils";
 import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { getArtifactKind } from "@/common/utils/artifactKind";
@@ -272,6 +273,66 @@ describe("ArtifactViewer renderers", () => {
     expect(await view.findByTestId("artifact-frame")).toBeTruthy();
   });
 
+  test("a styled page's reported canvas color replaces the white backdrop", async () => {
+    const html = "<style>body { background: #100f0f }</style><p>hi</p>";
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", html) });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const postBackdrop = (target: HTMLIFrameElement, color: string | null) =>
+      act(() => {
+        const event = new window.Event("message");
+        Object.defineProperty(event, "data", {
+          value: { xumArtifact: 1, type: "backdrop", color },
+        });
+        Object.defineProperty(event, "source", { value: target.contentWindow });
+        window.dispatchEvent(event);
+      });
+    // Until the page reports, the pane shows through: no white flash while a dark page loads.
+    expect(frame.className).not.toContain("bg-white");
+    expect(frame.style.backgroundColor).toBe("");
+
+    postBackdrop(frame, "rgb(16, 15, 15)");
+    expect(frame.style.backgroundColor).toBe("rgb(16, 15, 15)");
+    // A canvas that is not opaque (legacy or modern alpha syntax), or none, falls back to white.
+    // The page paints a translucent canvas over that backing, so the same color there would
+    // double its alpha.
+    for (const notOpaque of [
+      "rgba(0, 0, 0, 0)",
+      "rgb(16 15 15 / 0)",
+      "rgba(255, 0, 0, 0.5)",
+      "color(srgb 1 0 0 / 0.5)",
+    ]) {
+      postBackdrop(frame, "rgb(16, 15, 15)");
+      postBackdrop(frame, notOpaque);
+      expect(frame.style.backgroundColor).toBe("");
+      expect(frame.className).toContain("bg-white");
+    }
+    postBackdrop(frame, "rgb(16, 15, 15)");
+    postBackdrop(frame, null);
+    expect(frame.style.backgroundColor).toBe("");
+    expect(frame.className).toContain("bg-white");
+
+    // Only a plain computed color passes: CSS.supports alone also takes these.
+    for (const color of [
+      "var(--color-danger)",
+      "inherit",
+      "currentcolor",
+      "light-dark(red, blue)",
+    ]) {
+      postBackdrop(frame, color);
+      expect(frame.style.backgroundColor).toBe("");
+    }
+
+    // A reloaded frame keeps the last color until its new document reports, so no white flash.
+    postBackdrop(frame, "rgb(16, 15, 15)");
+    fireEvent.load(frame);
+    fireEvent.load(frame);
+    fireEvent.click(await view.findByRole("button", { name: "Reload" }));
+    const reloaded = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    expect(reloaded.style.backgroundColor).toBe("rgb(16, 15, 15)");
+    postBackdrop(reloaded, null);
+    expect(reloaded.style.backgroundColor).toBe("");
+  });
+
   test("a frame's own messages can exit fullscreen but never enter it", async () => {
     const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
     const panel = view.getByTestId("artifacts-panel");
@@ -382,6 +443,59 @@ describe("ArtifactViewer renderers", () => {
       postC();
       expect(annotatePressed()).toBe("false");
     } finally {
+      Reflect.deleteProperty(window.navigator, "userActivation");
+    }
+  });
+
+  test("a chord posted by a frame is replayed only during the user's key press in the shown frame", async () => {
+    let activation = { isActive: false };
+    Object.defineProperty(window.navigator, "userActivation", {
+      configurable: true,
+      get: () => activation,
+    });
+    const view = renderArtifact("page.html", { "page.html": ok("page.html", "<p>hi</p>") });
+    const frame = (await view.findByTestId("artifact-frame")) as HTMLIFrameElement;
+    const replayed: string[] = [];
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.target === frame) replayed.push(event.key);
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    // The host builds the replayed event with the global constructor, which the DOM harness lacks.
+    const globalKeyboardEvent = globalThis.KeyboardEvent;
+    globalThis.KeyboardEvent = window.KeyboardEvent;
+    try {
+      const postChord = (chord: "sidebar" | "agentInterface" | "peek") =>
+        act(() => {
+          const event = new window.Event("message");
+          Object.defineProperty(event, "data", {
+            value: { xumArtifact: 1, type: "sidebarKey", chord, ctrlKey: true, metaKey: false },
+          });
+          Object.defineProperty(event, "source", { value: frame.contentWindow });
+          window.dispatchEvent(event);
+        });
+      const sidebarKey = KEYBINDS.TOGGLE_RIGHT_SIDEBAR.key;
+      // The page's script can move focus into its frame (window.focus()) and post the chord from
+      // a timer: without the user's activation that must not collapse the sidebar.
+      act(() => frame.focus());
+      postChord("sidebar");
+      expect(replayed).toEqual([]);
+
+      activation = { isActive: true };
+      postChord("sidebar");
+      expect(replayed).toEqual([sidebarKey]);
+      // Only the main pane's status page forwards its chords: here the page's script posted them.
+      postChord("agentInterface");
+      postChord("peek");
+      expect(replayed).toEqual([sidebarKey]);
+
+      // A frame that stopped rendering keeps focus in the browser; that focus does not count.
+      frame.parentElement!.style.display = "none";
+      expect(document.activeElement).toBe(frame);
+      postChord("sidebar");
+      expect(replayed).toEqual([sidebarKey]);
+    } finally {
+      globalThis.KeyboardEvent = globalKeyboardEvent;
+      window.removeEventListener("keydown", onKeyDown, true);
       Reflect.deleteProperty(window.navigator, "userActivation");
     }
   });

@@ -14,6 +14,7 @@ import * as RealWorkspaceContextModule from "@/browser/contexts/WorkspaceContext
 import * as RealSubagentTranscriptDialogModule from "@/browser/features/Tools/SubagentTranscriptDialog";
 import * as RealElapsedTimeDisplayModule from "@/browser/features/Tools/Shared/ElapsedTimeDisplay";
 import * as RealProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import { createMappedAliasProvidersConfig, MAPPED_ALIAS_MODEL } from "@/browser/testUtils";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 
@@ -704,14 +705,7 @@ describe("TaskToolCall", () => {
 
   test("labels a mapped alias's thinking from its target model", () => {
     workspaceContextMock = { workspaceMetadata: new Map() };
-    providersConfigMock = {
-      openai: {
-        apiKeySet: true,
-        isEnabled: true,
-        isConfigured: true,
-        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
-      },
-    };
+    providersConfigMock = createMappedAliasProvidersConfig();
 
     const agentTaskArgs = {
       subagent_type: "explore",
@@ -727,7 +721,7 @@ describe("TaskToolCall", () => {
           result={{
             status: "running",
             taskId: "task-child-3",
-            modelString: "openai:team-sol",
+            modelString: MAPPED_ALIAS_MODEL,
             thinkingLevel: "max",
             note: "Task started in background.",
           }}

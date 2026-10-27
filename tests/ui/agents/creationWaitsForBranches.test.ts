@@ -478,7 +478,10 @@ describeIntegration("creation composer while the branch list loads (#6033)", () 
       await waitFor(() => expect(sendButton(view.container).disabled).toBe(false), {
         timeout: 10_000,
       });
-      expect(runInitButtonNow(view.container)?.disabled).toBe(false);
+      // Run /init turns on one commit after Send: the composer reports it from an effect (#6458, #7519).
+      await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(false), {
+        timeout: 5_000,
+      });
       fireEvent.click(sendButton(view.container));
       await waitFor(() => expect(create).toHaveBeenCalledTimes(1), { timeout: 30_000 });
       await waitFor(() => expect(runInitButtonNow(view.container)?.disabled).toBe(true), {

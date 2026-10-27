@@ -67,7 +67,7 @@ import {
 import {
   ArtifactCapabilitiesSchema,
   ArtifactListingSchema,
-  ArtifactReadResultSchema,
+  ArtifactReadOutcomeSchema,
   ArtifactShelfListingSchema,
   ArtifactShelfScopeSchema,
   ArtifactVersionListSchema,
@@ -1487,7 +1487,7 @@ export const artifacts = {
       /** Lower read cap (clamped to the server's): larger files return too_large, no bytes. */
       maxBytes: z.number().int().positive().nullish(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Runtime tooling probes (cached per workspace); never fails, null means unknown. */
   capabilities: {
@@ -1506,7 +1506,7 @@ export const artifacts = {
       artifactId: z.string(),
       version: z.number().int().positive(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Pinned workspace files with their current size/mtime (live, no snapshots). */
   listPinned: {
@@ -1533,7 +1533,7 @@ export const artifacts = {
   /** Read a pinned file (same shape and cap as `read`; path relative to the checkout). */
   readPinned: {
     input: z.object({ workspaceId: z.string(), path: z.string() }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** Shelf entries visible from this workspace: its project shelf, then the global shelf. */
   listShelf: {
@@ -1547,7 +1547,7 @@ export const artifacts = {
       scope: ArtifactShelfScopeSchema,
       name: z.string(),
     }),
-    output: ResultSchema(ArtifactReadResultSchema, z.string()),
+    output: ArtifactReadOutcomeSchema,
   },
   /** User pin: copy one stored version to the project or global shelf. */
   pinToShelf: {

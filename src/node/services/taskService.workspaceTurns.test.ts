@@ -49,6 +49,7 @@ import {
   removeTaskServiceTestRoot,
   startWorkspaceTurnForTest,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -223,6 +224,7 @@ describe("TaskService", () => {
 
     const parentSessionDir = path.join(config.sessionsDir, parentId);
     await upsertSubagentGitPatchArtifact({
+      locks: nodeSessionLocks,
       workspaceId: parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childId,

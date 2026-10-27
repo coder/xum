@@ -27,14 +27,13 @@ import {
   anthropicThinksUnlessDisabled,
 } from "@/common/types/thinking";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import { buildProviderOptions } from "@/common/utils/ai/providerOptions";
 import { getErrorMessage } from "@/common/utils/errors";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { pluginHookContextTexts } from "@/common/utils/messages/pluginHookContext";
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import {
   BRANCH_SUMMARY_MAX_ACCUMULATED_CHARS,
   BRANCH_SUMMARY_MAX_OUTPUT_TOKENS,
@@ -942,6 +941,15 @@ export async function runInlineAbandonedBranchSummary(
 }
 
 /**
+ * The cross-process pending marker of a fork's session dir. The locks are part of it, with no
+ * Node default: a caller that names the marker also names its session's locks (#7326).
+ */
+export interface BranchSummaryMarker {
+  sessionDir: string;
+  locks: SessionLocks;
+}
+
+/**
  * Start abandoned-branch summarization without blocking the caller on
  * GENERATION. Used by fork: awaiting generation synchronously stalls the
  * user-facing fork for seconds even when it ultimately produces nothing.
@@ -953,7 +961,10 @@ export async function runInlineAbandonedBranchSummary(
  * observe the marker (r55).
  */
 export async function startAbandonedBranchSummaryInBackground(
-  input: AbandonedBranchSummaryInput & { guardTailMessageId: string; sessionDir?: string }
+  input: AbandonedBranchSummaryInput & {
+    guardTailMessageId: string;
+    marker?: BranchSummaryMarker;
+  }
 ): Promise<void> {
   const controller = new AbortController();
   // r55: the returned promise resolves only after the cross-process pending
@@ -978,10 +989,10 @@ export async function startAbandonedBranchSummaryInBackground(
     // awaitPendingBranchSummary). Best-effort like the summary itself —
     // acquisition failure degrades to process-local coordination.
     let lock: AsyncDisposable | null = null;
-    if (input.sessionDir !== undefined) {
+    if (input.marker !== undefined) {
       try {
-        lock = await acquireProcessFileLock({
-          lockPath: path.join(input.sessionDir, BRANCH_SUMMARY_LOCK_FILENAME),
+        lock = await input.marker.locks.acquireProcessFileLock({
+          lockPath: path.join(input.marker.sessionDir, BRANCH_SUMMARY_LOCK_FILENAME),
           timeoutMs: BRANCH_SUMMARY_LOCK_ACQUIRE_TIMEOUT_MS,
           label: "branch summary pending marker",
         });
@@ -1033,7 +1044,7 @@ export async function startAbandonedBranchSummaryInBackground(
  */
 export async function awaitPendingBranchSummary(
   workspaceId: string,
-  sessionDir?: string
+  marker?: BranchSummaryMarker
 ): Promise<MuxMessage | null> {
   const entry = pendingBranchSummaries.get(workspaceId);
   if (!entry) {
@@ -1047,16 +1058,13 @@ export async function awaitPendingBranchSummary(
     // produced — is durable before the marker releases, so this send's
     // request assembly reads it from history; only the foreign process can
     // emit it to its renderer. The ENOENT fast path keeps ordinary sends at
-    // one stat of a nonexistent file.
-    if (sessionDir !== undefined) {
-      const lockPath = path.join(sessionDir, BRANCH_SUMMARY_LOCK_FILENAME);
-      const markerExists = await fs.stat(lockPath).then(
-        () => true,
-        () => false
-      );
-      if (markerExists) {
+    // one stat of a nonexistent file. The probe comes from the same locks as
+    // the writer's acquire: a memory layer leaves no lock file to stat.
+    if (marker !== undefined) {
+      const lockPath = path.join(marker.sessionDir, BRANCH_SUMMARY_LOCK_FILENAME);
+      if (await marker.locks.processFileLockExists(lockPath)) {
         try {
-          const lock = await acquireProcessFileLock({
+          const lock = await marker.locks.acquireProcessFileLock({
             lockPath,
             timeoutMs: BRANCH_SUMMARY_LOCK_WAIT_TIMEOUT_MS,
             label: "branch summary pending marker",

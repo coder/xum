@@ -6,7 +6,6 @@ import {
   getValidMessagingTag,
   getValidUnrelatedWorkspaceConsent,
 } from "@/common/orpc/schemas/workspace";
-import { isPlainObject } from "@/common/utils/isPlainObject";
 import assert from "node:assert/strict";
 import * as path from "node:path";
 import * as fsPromises from "fs/promises";
@@ -14,7 +13,6 @@ import type { z } from "zod";
 import {
   TASK_CREATE_WAIT_WARNING_MS,
   TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS,
-  TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
   TASK_TERMINATION_WORKSPACE_REMOVE_TIMEOUT_MS,
 } from "@/constants/terminationTimeouts";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
@@ -44,7 +42,6 @@ import {
   type AgentTaskStatus,
   type BackgroundableForegroundWaiter,
   type QueueCutAttributionSnapshot,
-  type QueuedDispatchDecision,
   type ResolvedWorkspaceAiSettings,
   type TaskCreateArgs,
   type TaskKind,
@@ -57,6 +54,7 @@ import {
   type WorkspaceTurnHost,
 } from "@/node/services/taskWorkspaceSeam";
 export type { TaskKind } from "@/node/services/taskWorkspaceSeam";
+export { ForegroundWaitBackgroundedError } from "@/node/services/taskWaiters";
 import {
   ACTIVE_AGENT_TASK_STATUSES,
   buildAgentTaskIndex,
@@ -69,12 +67,8 @@ import {
   type AgentTaskIndex,
   type AgentTaskWorkspaceEntry,
 } from "@/node/services/agentTaskIndex";
-import {
-  readSubagentAttemptSettlementReceiptStrict,
-  writeSubagentAttemptSettlementReceipt,
-  type SubagentAttemptSettlementSource,
-} from "@/node/services/subagentAttemptSettlements";
-import { assertTaskAttemptId, isTaskAttemptId, newTaskAttemptId } from "@/node/utils/taskAttemptId";
+import type { SubagentAttemptSettlementSource } from "@/node/services/subagentAttemptSettlements";
+import { isTaskAttemptId, newTaskAttemptId } from "@/node/utils/taskAttemptId";
 import type { HistoryService } from "@/node/services/historyService";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import { STRUCTURED_WORKFLOW_REPORT_PLACEHOLDER_MARKDOWN } from "@/common/constants/workflowReports";
@@ -97,10 +91,7 @@ import {
   taskRecoveryPromptDedupePrefix,
   TASK_RECOVERY_DIAGNOSTIC_MAX_CHARS,
   SEND_ADMISSION_STALE_MESSAGE,
-  TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE,
-  TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE,
   TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
-  TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE,
   WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE,
   pendingRemovalAdmissionMessage,
   retiredAttemptMessage,
@@ -111,6 +102,16 @@ import {
   TASK_FAMILY_MESSAGE_MAX_CHARS,
 } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
+import { ATTEMPT_CLOSURE_SETTLE_WAIT_MS, AttemptLedger } from "@/node/services/attemptLedger";
+export { ATTEMPT_CLOSURE_SETTLE_WAIT_MS } from "@/node/services/attemptLedger";
+import { TaskStopLatch } from "@/node/services/taskStopLatch";
+import { StreamEndLedger } from "@/node/services/streamEndLedger";
+import { PeerSendParking } from "@/node/services/peerSendParking";
+import {
+  TaskWaiters,
+  type PendingTaskStartWaiter,
+  type PendingTaskWaiter,
+} from "@/node/services/taskWaiters";
 import { isProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
@@ -150,9 +151,9 @@ import {
   tryReadGitHeadCommitSha,
   findWorkspaceEntry,
   markChildGoalPauseOwed,
+  rowSupersedes,
 } from "@/node/services/taskUtils";
 import { validateWorkspaceName } from "@/common/utils/validation/workspaceValidation";
-import { getTaskGroupCount } from "@/common/utils/tools/taskGroups";
 import { stripTrailingSlashes } from "@/node/utils/pathUtils";
 import { isErrnoException } from "@/node/utils/fs";
 import { Ok, Err, type Result } from "@/common/types/result";
@@ -195,6 +196,8 @@ import type {
   WorkspaceRemoveWarning,
 } from "@/common/types/workspace";
 import { getRuntimeType } from "@/node/runtime/initHook";
+// Outside the agent loop: TaskService passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { AgentIdSchema } from "@/common/orpc/schemas";
 import type { AgentId } from "@/common/types/agentDefinition";
 import {
@@ -269,15 +272,12 @@ import {
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
 import {
   buildWorkflowResultContextMessage,
-  isTerminalWorkflowRunToolOutput,
   isWorkflowDisplayOnlyMessage,
-  isWorkflowRunEmittingToolName,
 } from "@/common/utils/workflowRunMessages";
 import {
   AgentReportInlineToolArgsSchema,
   AgentReportSubmittedReportSchema,
   TaskToolResultSchema,
-  TaskToolArgsSchema,
   type SubagentGitPatchArtifact,
 } from "@/common/utils/tools/toolDefinitions";
 import { isPlanLikeInResolvedChain } from "@/common/utils/agentTools";
@@ -320,8 +320,22 @@ import { isWorkspaceArchived } from "@/common/utils/archive";
 import type { StartupRecoveryState } from "@/node/services/startupRecovery";
 import { judgeLifecycleMarkerOwner } from "@/node/services/lifecycleMarkerOwners";
 import { LegacyTodoNudgePolicyTrace, type ToolPolicy } from "@/common/utils/tools/toolPolicy";
-import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
+import {
+  collectReferencedTaskIdsFromTaskToolOutput,
+  type CompletedTaskReportReceipt,
+  receiptMatchesReport,
+  collectCompletedTaskReportReceipts,
+  parseTaskToolInputForRecovery,
+  collectAgentReferencedWorkflowRunIdsFromParts,
+} from "@/node/services/taskToolOutputs";
+import {
+  isResetBoundaryMessage,
+  isCompactionRequestMessage,
+  isWorkflowSupersessionMessage,
+  hasTerminalWorkflowTaskAwaitInParts,
+  hasTerminalWorkflowToolOutputInParts,
+} from "@/node/services/taskMessagePredicates";
 import {
   isActiveWorkspaceTurnTaskStatus,
   isWorkspaceTurnTaskId,
@@ -331,11 +345,14 @@ import {
 import {
   TerminalAttentionStore,
   type TerminalAttentionNotification,
-  type TerminalAttentionOutcome,
 } from "@/node/services/terminalAttentionStore";
+import { WorkflowRunAttention } from "@/node/services/workflowRunAttention";
+import {
+  TerminalAttentionNotifier,
+  WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS,
+} from "@/node/services/terminalAttentionNotifier";
 import { readAgentWorkflowRunReferences } from "@/node/services/agentWorkflowRunReferences";
 import type { AgentWorkflowRunStrictPin } from "@/node/services/agentWorkflowRunReferences";
-import { isWorkflowRunTaskId } from "@/node/services/tools/taskId";
 import { normalizeWorkflowAgentReportPayloadForHostSchema } from "@/common/utils/tools/workflowReportPayload";
 import {
   formatJsonSchemaValidationErrors,
@@ -624,7 +641,7 @@ export interface AgentTaskReport {
  * can be matched exactly against the attempt it belongs to. Persisted status, a stop cascade or
  * startup reconciliation never mint one: a prior backend's attempt has no owner in this process.
  */
-interface OwnedTaskAttempt {
+export interface OwnedTaskAttempt {
   readonly generation: number;
   readonly source: string;
   /**
@@ -648,8 +665,8 @@ interface OwnedTaskAttempt {
   receiptEligible: boolean;
 }
 
-/** In-process settlement ledger entry; see TaskService.attemptSettlementByTaskId. */
-interface AttemptSettlementEntry {
+/** In-process settlement ledger entry; see AttemptLedger.attemptSettlementByTaskId. */
+export interface AttemptSettlementEntry {
   /** The attempt id the closure/settlement names; undefined only for pre-identity entries. */
   readonly attemptId: string | undefined;
   /** Present when the attempt is owned by this process (only owners can reach `settled`). */
@@ -668,7 +685,7 @@ interface AttemptSettlementEntry {
  * the seam). Identity is immutable: an obligation admitted under attempt X can never enter, or be
  * removed from, a successor attempt's stop record.
  */
-interface AdmittedSend {
+export interface AdmittedSend {
   readonly taskId: string;
   readonly attemptId: string;
   /** Set for sends admitted while this process owns the attempt (receipt authority, later change). */
@@ -714,7 +731,7 @@ interface AdmittedSend {
  * was decided for is live: input sent after it resolved but before that turn settles targets the
  * same attempt and must still find it (preflight refusal, or the dequeue gate's refusal).
  */
-interface StreamEndDecision {
+export interface StreamEndDecision {
   readonly attempt: OwnedTaskAttempt | undefined;
   readonly attemptId: string;
   readonly messageId: string;
@@ -1072,9 +1089,49 @@ export type SendAgentTreeMessageError = SendAgentTaskMessageError | AgentPeerMes
 interface TrustedDescendantMessageOptions {
   messageLabel?: string;
   preTurnMessages?: MuxMessage[];
+  /** Internal (F54): set only by scheduleDeferredDescendantMessage's redelivery. */
+  redelivery?: DeferredDescendantRedelivery;
 }
 
-type TreeMessageSpec =
+/** One deferred redelivery attempt of a trusted descendant message (F54). */
+interface DeferredDescendantRedelivery {
+  /** The Stop fence of the original send: a Stop during the wait still wins. */
+  stopFence: ReadonlyMap<string, number>;
+  /** Earlier waits for this message; at the bound, the message takes the live path. */
+  attempt: number;
+  /** Set by the dispatch when the target is still streaming without a task execution. */
+  deferAgain: boolean;
+}
+
+/** A trusted descendant message whose delivery waits for an idle target (F54). */
+interface DeferredDescendantMessage {
+  ancestorWorkspaceId: string;
+  taskId: string;
+  trimmedMessage: string;
+  queueDispatchMode: TaskMessageQueueDispatchMode;
+  sender: "ancestor" | "sibling";
+  options: TrustedDescendantMessageOptions | undefined;
+  stopFence: ReadonlyMap<string, number>;
+}
+
+function resolveDescendantMessageStopFence(
+  options: TrustedDescendantMessageOptions | undefined,
+  captured: ReadonlyMap<string, number>
+): ReadonlyMap<string, number> {
+  return options?.redelivery?.stopFence ?? captured;
+}
+
+function isInactiveAgentTaskStatus(
+  status: AgentTaskStatus | undefined,
+  legacyArchived: boolean
+): boolean {
+  return status === "reported" || status === "interrupted" || legacyArchived;
+}
+
+/** After this many idle waits, a deferred message falls back to plain live delivery. */
+const MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS = 5;
+
+export type TreeMessageSpec =
   | {
       relation: "descendant";
       senderWorkspaceId: string;
@@ -1118,7 +1175,7 @@ type TreeMessagePipelineError = SendAgentTreeMessageError | SendParentAgentMessa
  * What a peer message's first admission established, kept while it waits for the target's
  * delegated turn (#4997). Its retry re-runs the whole peer path against these baselines.
  */
-interface PeerDelegatedTurnWait {
+export interface PeerDelegatedTurnWait {
   /** Recipient consent at first admission: an off/on cycle must not revive the message. */
   unrelatedConsent: string | undefined;
   /** Both endpoints' tag generations at first admission: a clear/re-tag cycle is a new link. */
@@ -1135,10 +1192,6 @@ interface PeerDelegatedTurnWait {
    */
   stopEpochs: Map<string, number>;
 }
-
-type ParkedPeerSend = Extract<TreeMessageSpec, { relation: "peer" }> & {
-  awaitedDelegatedTurn: PeerDelegatedTurnWait;
-};
 
 /** The caller-relative relationship tag on task_list scope:"tree" rows. */
 export type TreeAgentRelationship = "self" | "ancestor" | "sibling" | "descendant";
@@ -1283,14 +1336,6 @@ function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
 
 const REMOVED_AGENT_TASKS_DIR = "removed-agent-tasks";
 
-const COMPLETED_REPORT_CACHE_MAX_ENTRIES = 128;
-
-// Level-triggered backstop for workflow terminal wakes: the sweep re-derives owed wakes from
-// durable state (run records + settled markers), so lost terminal callbacks, deferred
-// (transiently unreadable) evaluations, and crashes all recover here without any per-failure
-// retry bookkeeping.
-const WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS = 5 * 60_000;
-
 /** Maximum consecutive auto-resumes before stopping. Prevents infinite loops when descendants are stuck. */
 
 const MAX_CONSECUTIVE_PARENT_AUTO_RESUMES = 3;
@@ -1324,7 +1369,7 @@ const QUEUED_LAUNCH_LEASE_RETRY_MS = 1_000;
 type ChildGoalTurnOutcome = "none" | "handled" | "failed" | "deferred";
 
 /** The ended stream's task origin, captured in the stream-end event's own tick. */
-interface StreamEndTaskOrigin {
+export interface StreamEndTaskOrigin {
   executionId: string | null;
   stopEpoch: number;
   ownedAttempt: OwnedTaskAttempt | undefined;
@@ -1334,17 +1379,8 @@ interface StreamEndTaskOrigin {
 /** Ended streams per task the goal arbitration remembers, so a duplicate delivery is a no-op. */
 const CHILD_GOAL_ARBITRATED_STREAMS_MAX = 32;
 
-/**
- * Bound on waiting for an owned predecessor's in-flight settlement write before deciding a
- * successor's lineage (evaluateAttemptLineage), and on a failed direct launch's wait for the
- * owners its stop cascade captured before its rollback (TaskService.create). Elapsing the bound
- * is a decision — unproven lineage, deferred rollback — not an error; the write or the cascade
- * keeps its own ownership and completes on its own.
- */
-export const ATTEMPT_CLOSURE_SETTLE_WAIT_MS = 5_000;
-
-/** See TaskService.workspaceStopRecords. */
-interface WorkspaceStopRecord {
+/** See TaskStopLatch.workspaceStopRecords. */
+export interface WorkspaceStopRecord {
   /** Latch releases (one per overlapping cascade) run together once release conditions hold. */
   releases: Array<() => void>;
   /**
@@ -1390,20 +1426,12 @@ interface WorkspaceStopRecord {
    */
   receipt?: "writing" | "written" | "failed";
 }
-/**
- * Attempt compare-and-swap for a task-row write made on behalf of one attempt (stream end, report
- * publication, recovery, terminal failure, resume rollback). Evaluated inside the write's own
- * editWorkspaceEntry transform: true when the caller captured an attempt and the row now names
- * another one — another writer (e.g. a second backend) re-admitted it, so the row is theirs and
- * the write is abandoned. A write with no captured attempt (legacy/pre-identity) is never held
- * back, which keeps today's behavior for it.
- */
-function rowSupersedes(
-  row: Pick<WorkspaceConfigEntry, "taskAttemptId"> | undefined,
-  expectedAttemptId: string | null | undefined
-): boolean {
-  return expectedAttemptId != null && row?.taskAttemptId !== expectedAttemptId;
-}
+
+/** Result of TaskService.decideSettlementReceipt. */
+export type SettlementReceiptDecision =
+  | { kind: "memory-only" }
+  | { kind: "unreadable" }
+  | { kind: "write"; attemptId: string; parentWorkspaceId: string; owners: string[] };
 
 /**
  * Task-pinned send options for an automatic TaskService turn (required-report prompt today;
@@ -1446,52 +1474,20 @@ function markedTerminalFailure(
 }
 
 /**
- * Why a workflow claim on `attemptId` must be refused (see TaskService.claimRetiredAttempt), or
- * undefined when it may be granted (or re-stamped, for the same run/step before any replacement).
- */
-function retiredAttemptClaimRefusal(
-  row: WorkspaceConfigEntry,
-  attemptId: string,
-  claimant: { runId: string; stepId: string }
-): string | undefined {
-  if (row.taskAttemptId !== attemptId) {
-    return `claim lost: the task now names attempt ${row.taskAttemptId ?? "none"}`;
-  }
-  if (row.taskStatus !== "interrupted") return `attempt is ${row.taskStatus ?? "running"}`;
-  const task = row.workflowTask;
-  if (task?.runId !== claimant.runId || task.stepId !== claimant.stepId) {
-    return "the task does not belong to this workflow step";
-  }
-  const existing = row.taskAttemptRetiredBy;
-  if (existing == null) return undefined;
-  if (existing.replacementTaskId != null) {
-    return `the retired attempt already has replacement ${existing.replacementTaskId}`;
-  }
-  if (
-    existing.runId !== claimant.runId ||
-    existing.stepId !== claimant.stepId ||
-    existing.attemptId !== attemptId
-  ) {
-    return "the attempt was retired by another workflow step";
-  }
-  return undefined;
-}
-
-/**
  * The attempt a settlement/finalization write acts for (see rowSupersedes). A REQUIRED parameter
  * on every helper reachable from stream end, stream error, report publication and interrupted
  * settlement, so the compiler makes each caller state it: the captured attempt id (the writes are
  * a CAS on it), or `null` when the caller has no proven attempt (a legacy/pre-identity row, a
  * parent- or timer-driven decision), which keeps today's unconditional writes.
  */
-type AttemptFence = string | null;
+export type AttemptFence = string | null;
 
 /**
  * Who a stream event belongs to, read in the event's own tick (resolveStreamAttemptAtEvent):
  * this process's owned attempt, else the attempt the stream's turn was admitted under (or the
  * persisted id). Both undefined = captured without an identity (a pre-identity row).
  */
-interface StreamAttemptOrigin {
+export interface StreamAttemptOrigin {
   ownedAttempt: OwnedTaskAttempt | undefined;
   unownedAttemptId: string | undefined;
 }
@@ -1581,37 +1577,6 @@ interface InactiveWorkflowTaskOwner {
 }
 
 type InterruptedTaskStatusMutation = "interrupted" | "preserved-completed-report";
-
-interface PendingTaskWaiter extends BackgroundableForegroundWaiter {
-  resolve: (report: {
-    reportMarkdown: string;
-    title?: string;
-    structuredOutput?: unknown;
-    planFilePath?: string;
-    model?: string;
-    thinkingLevel?: ThinkingLevel;
-  }) => void;
-}
-
-interface PendingTaskStartWaiter {
-  start: () => void;
-  cleanup: () => void;
-}
-
-interface CompletedAgentReportCacheEntry {
-  reportMarkdown: string;
-  planFilePath?: string;
-  structuredOutput?: unknown;
-  title?: string;
-  // Final settings the child reported with (post plan-to-exec handoff), not the launch snapshot.
-  model?: string;
-  thinkingLevel?: ThinkingLevel;
-  // Ancestor workspace IDs captured when the report was cached.
-  // Used to keep descendant-scope checks working even if the task workspace is cleaned up.
-  ancestorWorkspaceIds: string[];
-  // Ancestors for which the task report must only be consumed through a workflow run.
-  workflowOwnedAncestorWorkspaceIds?: string[];
-}
 
 interface ParentAutoResumeHint {
   agentId?: string;
@@ -1717,434 +1682,8 @@ function buildBackgroundAwaitPrompt(params: {
   );
 }
 
-const isWorkflowRunId = isWorkflowRunTaskId;
-
-function collectWorkflowRunIdsFromToolOutput(output: unknown): string[] {
-  if (output == null || typeof output !== "object") {
-    return [];
-  }
-
-  const record = output as Record<string, unknown>;
-  if (isWorkflowRunId(record.runId)) {
-    return [record.runId];
-  }
-
-  const results = record.results;
-  if (!Array.isArray(results)) {
-    return [];
-  }
-
-  const runIds: string[] = [];
-  for (const result of results) {
-    if (result == null || typeof result !== "object") {
-      continue;
-    }
-    const taskId = (result as Record<string, unknown>).taskId;
-    if (isWorkflowRunId(taskId)) {
-      runIds.push(taskId);
-    }
-  }
-  return runIds;
-}
-
-/**
- * Tolerant extraction of the task IDs a persisted task tool output references. Recovery
- * bookkeeping must survive outputs written by newer releases (extra fields would fail the
- * strict result schema) so that a mid-stream downgrade cannot duplicate fallback reports.
- */
-function collectReferencedTaskIdsFromTaskToolOutput(output: unknown, into: Set<string>): void {
-  if (output == null || typeof output !== "object") {
-    return;
-  }
-  const addTaskId = (value: unknown): void => {
-    if (typeof value === "string" && value.length > 0) {
-      into.add(value);
-    }
-  };
-
-  const record = output as Record<string, unknown>;
-  addTaskId(record.taskId);
-  if (Array.isArray(record.taskIds)) {
-    for (const taskId of record.taskIds) {
-      addTaskId(taskId);
-    }
-  }
-  for (const key of ["tasks", "reports"] as const) {
-    const rows = record[key];
-    if (!Array.isArray(rows)) {
-      continue;
-    }
-    for (const row of rows) {
-      if (row != null && typeof row === "object") {
-        addTaskId((row as Record<string, unknown>).taskId);
-      }
-    }
-  }
-}
-
-type CompletedTaskReportReceipt = (
-  | { kind: "initial"; taskId: string }
-  | { kind: "continuation"; taskId: string; handleId?: string; messageId: string }
-) & {
-  reportMarkdown: string;
-  /** Where reportMarkdown starts in the full report, when the row is one paged page. */
-  pageOffset?: number;
-};
-
-/**
- * A paged row (task_await, or a foreground task since #6427) holds one page of a long report:
- * its pageOffset is its startCharOffset, 0 for a first page that only carries nextCharOffset.
- * Undefined for a whole report.
- */
-function readReportPageOffset(row: Record<string, unknown>): number | undefined {
-  if (typeof row.startCharOffset === "number") return row.startCharOffset;
-  return typeof row.nextCharOffset === "number" ? 0 : undefined;
-}
-
-/**
- * Whether a continuation receipt shows the owner this exact report: the whole text, or any
- * non-empty page of it at the page's own offset. Reading one page (with its continuation note)
- * delivers the result, so its terminal notification must not wake the owner again.
- */
-function receiptMatchesReport(
-  receipt: Extract<CompletedTaskReportReceipt, { kind: "continuation" }>,
-  reportMarkdown: string | undefined
-): boolean {
-  if (receipt.reportMarkdown === reportMarkdown) return true;
-  if (reportMarkdown == null || receipt.pageOffset == null) return false;
-  return (
-    receipt.reportMarkdown.length > 0 &&
-    reportMarkdown.startsWith(receipt.reportMarkdown, receipt.pageOffset)
-  );
-}
-
-/** Read only canonical task-result containers, never arbitrary JSON or prose. */
-function completedTaskReports(toolName: unknown, output: unknown): CompletedTaskReportReceipt[] {
-  if (!isPlainObject(output)) return [];
-  const rows: unknown[] = [];
-  if (toolName === "task") {
-    if (output.status === "completed") rows.push(output);
-    // A group can return completed members while other members are still running.
-    if (Array.isArray(output.reports)) output.reports.forEach((row: unknown) => rows.push(row));
-  } else if (toolName === "task_await" && Array.isArray(output.results)) {
-    output.results.forEach((row: unknown) => {
-      if (isPlainObject(row) && row.status === "completed") rows.push(row);
-    });
-  }
-  return rows.flatMap((row): CompletedTaskReportReceipt[] => {
-    if (
-      !isPlainObject(row) ||
-      typeof row.taskId !== "string" ||
-      typeof row.reportMarkdown !== "string"
-    )
-      return [];
-    const messageId =
-      row.messageId ??
-      (isPlainObject(row.finalMessageRef) ? row.finalMessageRef.messageId : undefined);
-    // Workspace-target tools expose a handle; stable-child awaits expose the child itself.
-    const handleId = isWorkspaceTurnTaskId(row.taskId) ? row.taskId : undefined;
-    const taskId = handleId != null ? coerceNonEmptyString(row.workspaceId) : row.taskId;
-    if (taskId == null) return [];
-    if (typeof messageId === "string") {
-      return [
-        {
-          kind: "continuation",
-          taskId,
-          handleId,
-          messageId,
-          reportMarkdown: row.reportMarkdown,
-          pageOffset: readReportPageOffset(row),
-        },
-      ];
-    }
-    return handleId == null
-      ? [
-          {
-            kind: "initial",
-            taskId,
-            reportMarkdown: row.reportMarkdown,
-            pageOffset: readReportPageOffset(row),
-          },
-        ]
-      : [];
-  });
-}
-
-/**
- * Same text and same page position. A visible projection that drops a page's offset fields
- * (nextCharOffset/startCharOffset) hides that more text exists and where to read it, so it does
- * not prove delivery of the genuine paged row.
- */
-function sameReportPage(a: CompletedTaskReportReceipt, b: CompletedTaskReportReceipt): boolean {
-  return a.reportMarkdown === b.reportMarkdown && a.pageOffset === b.pageOffset;
-}
-
-function sameTaskReportReceipt(
-  a: CompletedTaskReportReceipt,
-  b: CompletedTaskReportReceipt
-): boolean {
-  return (
-    a.kind === b.kind &&
-    a.taskId === b.taskId &&
-    sameReportPage(a, b) &&
-    (a.kind === "initial" ||
-      (b.kind === "continuation" && a.messageId === b.messageId && a.handleId === b.handleId))
-  );
-}
-
-/** Only model-visible successful tool results prove consumption. UI telemetry does not. */
-function collectCompletedTaskReportReceipts(message: MuxMessage): CompletedTaskReportReceipt[] {
-  const reports: CompletedTaskReportReceipt[] = [];
-  const succeeded = (call: unknown): call is Record<string, unknown> =>
-    isPlainObject(call) &&
-    call.failed !== true &&
-    call.error == null &&
-    call.ok !== false &&
-    (call.state == null || call.state === "output-available");
-  const visit = (call: unknown, depth: number): void => {
-    if (depth > 30 || !succeeded(call)) return;
-    const output = call.output ?? call.result;
-    if (!isPlainObject(output)) return;
-    reports.push(...completedTaskReports(call.toolName, output));
-    if (call.toolName !== "code_execution") return;
-
-    // Classic executions expose these result records to the model, even when a later
-    // call fails. Persistent kernels replace them with summaries that contain no report.
-    if (Array.isArray(output.toolCalls)) {
-      for (const nested of output.toolCalls) visit(nested, depth + 1);
-    }
-    // Persistent nestedCalls hold UI-only full values. Use them solely as provenance for
-    // a complete canonical report deliberately returned through output.result. Offload
-    // handles, previews, hidden values, and unrelated returns must retain their wake.
-    if (Array.isArray(call.nestedCalls)) {
-      for (const nested of call.nestedCalls) {
-        if (!succeeded(nested)) continue;
-        const genuine = completedTaskReports(nested.toolName, nested.output);
-        const visible = completedTaskReports(nested.toolName, output.result);
-        reports.push(
-          ...visible.filter((receipt) =>
-            genuine.some((source) => sameTaskReportReceipt(source, receipt))
-          )
-        );
-      }
-    }
-  };
-  for (const part of message.parts) {
-    if (isDynamicToolPart(part) && part.state === "output-available") visit(part, 0);
-  }
-  return reports;
-}
-
-interface RecoveredTaskToolInput {
-  data: z.infer<typeof TaskToolArgsSchema>;
-  groupCount: number;
-  legacyVariants: boolean;
-}
-
-/**
- * Persisted partials may contain the removed `variants` input. Keep that field out of the
- * model-facing schema while accepting it narrowly during crash recovery so completed legacy
- * siblings can still finalize their parent tool call.
- */
-function parseTaskToolInputForRecovery(input: unknown): RecoveredTaskToolInput | null {
-  const current = TaskToolArgsSchema.safeParse(input);
-  if (current.success) {
-    return {
-      data: current.data,
-      groupCount: getTaskGroupCount(current.data),
-      legacyVariants: false,
-    };
-  }
-
-  if (!input || typeof input !== "object" || Array.isArray(input)) {
-    return null;
-  }
-
-  const sanitized = { ...(input as Record<string, unknown>) };
-  const variants = sanitized.variants;
-  delete sanitized.variants;
-  const parsed = TaskToolArgsSchema.safeParse(sanitized);
-  if (!parsed.success) {
-    return null;
-  }
-
-  if (variants == null) {
-    return {
-      data: parsed.data,
-      groupCount: getTaskGroupCount(parsed.data),
-      legacyVariants: false,
-    };
-  }
-  if (!Array.isArray(variants) || variants.length < 1 || variants.length > 20) {
-    return null;
-  }
-
-  const labels = variants.map((variant) => (typeof variant === "string" ? variant.trim() : ""));
-  if (labels.some((label) => label.length === 0) || new Set(labels).size !== labels.length) {
-    return null;
-  }
-
-  return {
-    data: parsed.data,
-    groupCount: labels.length,
-    legacyVariants: true,
-  };
-}
-
-function collectWorkflowRunIdsFromTaskAwaitInput(input: unknown): string[] {
-  if (input == null || typeof input !== "object") {
-    return [];
-  }
-  const taskIds = (input as Record<string, unknown>).task_ids;
-  if (!Array.isArray(taskIds)) {
-    return [];
-  }
-  return taskIds.filter(isWorkflowRunId);
-}
-
-function collectAgentReferencedWorkflowRunIdsFromParts(
-  parts: readonly unknown[],
-  knownAgentRunIds: ReadonlySet<string>
-): string[] {
-  const runIds = new Set<string>();
-
-  for (const part of parts) {
-    if (!isDynamicToolPart(part) || part.state !== "output-available") {
-      continue;
-    }
-    // workflow_resume re-establishes agent provenance the same way workflow_run does: both
-    // outputs carry the runId of a run the agent explicitly owns.
-    if (!isWorkflowRunEmittingToolName(part.toolName)) {
-      continue;
-    }
-    for (const runId of collectWorkflowRunIdsFromToolOutput(part.output)) {
-      runIds.add(runId);
-    }
-  }
-
-  const allowedTaskAwaitRunIds = new Set([...knownAgentRunIds, ...runIds]);
-  for (const part of parts) {
-    if (!isDynamicToolPart(part) || part.state !== "output-available") {
-      continue;
-    }
-    if (part.toolName !== "task_await") {
-      continue;
-    }
-
-    // Omitted task_ids makes task_await discover every active run in the workspace, including
-    // slash-command runs. Only treat task_await output as agent provenance when the model either
-    // explicitly awaited that workflow ID in this turn or we already know the run was agent-started.
-    for (const runId of collectWorkflowRunIdsFromTaskAwaitInput(part.input)) {
-      runIds.add(runId);
-      allowedTaskAwaitRunIds.add(runId);
-    }
-    for (const runId of collectWorkflowRunIdsFromToolOutput(part.output)) {
-      if (allowedTaskAwaitRunIds.has(runId)) {
-        runIds.add(runId);
-      }
-    }
-  }
-
-  return Array.from(runIds);
-}
-
-function isInternalResumeAutoCompactionMessage(message: MuxMessage): boolean {
-  const muxMetadata = message.metadata?.muxMetadata;
-  if (muxMetadata?.type !== "compaction-request" || muxMetadata.source !== "auto-compaction") {
-    return false;
-  }
-  return muxMetadata.parsed.followUpContent?.dispatchOptions?.source === "internal-resume";
-}
-
-function isSyntheticManualSupersessionMessage(message: MuxMessage): boolean {
-  const muxMetadata = message.metadata?.muxMetadata;
-  return (
-    message.metadata?.synthetic === true &&
-    muxMetadata?.type === "compaction-request" &&
-    muxMetadata.source === "auto-compaction" &&
-    !isInternalResumeAutoCompactionMessage(message)
-  );
-}
-
-function isManualUserSupersessionMessage(message: MuxMessage): boolean {
-  return (
-    message.role === "user" &&
-    (message.metadata?.synthetic !== true || isSyntheticManualSupersessionMessage(message))
-  );
-}
-
 function withToolPolicy(toolPolicy: ToolPolicy | undefined): { toolPolicy?: ToolPolicy } {
   return toolPolicy != null ? { toolPolicy } : {};
-}
-
-function isResetBoundaryMessage(message: MuxMessage): boolean {
-  return message.metadata?.contextBoundaryKind === CONTEXT_BOUNDARY_KINDS.RESET;
-}
-
-function isCompactionRequestMessage(message: MuxMessage): boolean {
-  return message.metadata?.muxMetadata?.type === "compaction-request";
-}
-
-function isWorkflowSupersessionMessage(message: MuxMessage): boolean {
-  return isManualUserSupersessionMessage(message) || isResetBoundaryMessage(message);
-}
-
-function isFailedWorkflowRunSnapshot(value: unknown, runId: string): boolean {
-  if (value == null || typeof value !== "object") {
-    return false;
-  }
-  const record = value as Record<string, unknown>;
-  return record.id === runId && record.status === "failed";
-}
-
-function isTerminalWorkflowTaskAwaitRecord(
-  record: Record<string, unknown>,
-  runId: string
-): boolean {
-  if (record.taskId !== runId) {
-    return false;
-  }
-  if (record.status === "completed" || record.status === "interrupted") {
-    return true;
-  }
-  if (record.status === "error") {
-    return isFailedWorkflowRunSnapshot(record.run, runId);
-  }
-  return false;
-}
-
-function hasTerminalWorkflowTaskAwaitInParts(parts: readonly unknown[], runId: string): boolean {
-  return parts.some((part) => {
-    if (!isDynamicToolPart(part) || part.toolName !== "task_await") {
-      return false;
-    }
-    if (part.state !== "output-available") {
-      return false;
-    }
-    const output = part.output;
-    if (output == null || typeof output !== "object") {
-      return false;
-    }
-    const results = (output as Record<string, unknown>).results;
-    if (!Array.isArray(results)) {
-      return false;
-    }
-    return results.some((result) => {
-      if (result == null || typeof result !== "object") {
-        return false;
-      }
-      return isTerminalWorkflowTaskAwaitRecord(result as Record<string, unknown>, runId);
-    });
-  });
-}
-
-function hasTerminalWorkflowToolOutputInParts(parts: readonly unknown[], runId: string): boolean {
-  return parts.some(
-    (part) =>
-      isDynamicToolPart(part) &&
-      part.state === "output-available" &&
-      isTerminalWorkflowRunToolOutput(part.toolName, part.output, runId)
-  );
 }
 
 function sanitizeAgentTypeForName(agentType: string): string {
@@ -2193,6 +1732,8 @@ async function readTaskBaseCommitShaByProjectPath(params: {
   runtime: Runtime;
 }): Promise<Record<string, string>> {
   const projectRepos = getWorkspaceProjectRepos({
+    // Outside the agent loop: the host's runtimes.
+    runtimeFactory: nodeRuntimeFactory,
     workspaceId: params.workspaceId,
     workspaceName: params.workspaceName,
     workspacePath: params.workspacePath,
@@ -2211,13 +1752,6 @@ async function readTaskBaseCommitShaByProjectPath(params: {
   }
 
   return taskBaseCommitShaByProjectPath;
-}
-
-export class ForegroundWaitBackgroundedError extends Error {
-  constructor() {
-    super("Foreground wait sent to background due to queued message");
-    this.name = "ForegroundWaitBackgroundedError";
-  }
 }
 
 function buildWorkflowTimeoutFinalizationPrompt(
@@ -2329,60 +1863,20 @@ export class TaskService implements AgentTaskIntegration {
   // Git worktree creation touches per-repository metadata; serialize that narrow phase per project
   // while allowing post-fork init/send startup work for sibling tasks to overlap.
   private readonly reservedTaskLaunchByProjectPath = new Map<string, Promise<void>>();
-  // In-flight durable persistence of notify_on_terminal policy for backgrounded foreground waits.
-  // Awaited at the start of handleStreamEnd so a just-detached wait is treated as non-blocking.
-  private readonly pendingNotifyOnTerminalPersists = new Set<Promise<void>>();
-  // In-flight terminal attention drains (workspace-turn / sub-agent terminal wake-ups). Tracked so
-  // tests and shutdown can await them; drains are idempotent and re-triggered on owner idle events.
-  private readonly pendingTerminalAttentionDrainsByOwner = new Map<string, Promise<void>>();
-  private readonly pendingTerminalAttentionDrains = new Set<Promise<void>>();
-  private readonly pendingTerminalAttentionIdleWaitsByOwner = new Map<string, Promise<void>>();
-  // Sub-agent terminal notifications this process just enqueued while their owner was streaming,
-  // mapped to that owner turn's generation (owner -> notification ID -> turn). The next drain takes
-  // the whole map, so each report can cut at most one busy turn, and only the turn that was live
-  // at its delivery (see cutBusyOwnerTurnForSubagentAttention).
-  private readonly freshSubagentAttentionTurnByOwner = new Map<string, Map<string, symbol>>();
-  // Terminal settlements of the same run must not overlap: settlement is multi-step (stable
-  // refresh, generation marker, post-write mismatch delete), so an older generation reaching
-  // its mismatch delete after a newer settlement's stable refresh would remove the newer
-  // generation's valid marker and let a downgraded build re-deliver a consumed result.
-  private readonly workflowRunSettlementByRun = new Map<string, Promise<void>>();
-  // Owed workflow terminal wakes (owner -> runIds believed terminal and not yet settled). An
-  // in-memory work queue over durable state, not a delivery record: entries are (re)derived
-  // from run records + settled markers at startup and on the periodic sweep and added by live
-  // terminal callbacks, so losing the map merely delays a wake until the next sweep.
-  private readonly pendingWorkflowRunAttention = new Map<string, Set<string>>();
-  // Owner -> wake-group key -> epoch ms before which the drain skips selecting the group. A
-  // group whose send was rejected for group-specific reasons (for example an unresolvable
-  // strictly pinned agent) would otherwise be re-selected newest-first by every drain and
-  // sweep, starving older deliverable groups. In-memory only: a restart retries every group,
-  // and entries expire on read.
-  private readonly workflowWakeGroupSendBackoffUntilMs = new Map<string, Map<string, number>>();
+  // Terminal attention scheduling and bookkeeping: notify_on_terminal persists, drain chains, idle
+  // waits, fresh sub-agent edges and wake-group send backoff. The drain itself stays here.
+  private readonly terminalAttention: TerminalAttentionNotifier;
+  /** Tail of each task's chain of deferred trusted messages (F54), in send order. */
+  private readonly deferredDescendantMessagesByTask = new Map<string, Promise<void>>();
+  // Owed workflow terminal wakes and the per-run settlement chain (see WorkflowRunAttention).
+  private readonly workflowRunAttention: WorkflowRunAttention;
   private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
   /** The pending drain retry after a refused launch lease (QUEUED_LAUNCH_LEASE_RETRY_MS). */
   private queuedLaunchLeaseRetryTimer: ReturnType<typeof setTimeout> | undefined;
-  private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
-  private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
-  // Tasks whose launch failed, or whose reservation was canceled or failed, but whose write
-  // ending the row rejected (#4747, #5028): the row still says queued/starting and nothing will
-  // move it to running, so waiters arm their timeout at once. A later move to running, a
-  // recorded launch failure or the workspace's removal clears the mark.
-  private readonly unpersistedLaunchFailureTaskIds = new Set<string>();
-  // Tracks workspaces currently blocked in a foreground wait (e.g. a task tool call awaiting
-  // agent_report). Used to avoid scheduler deadlocks when maxParallelAgentTasks is low and tasks
-  // spawn nested tasks in the foreground.
-  private readonly foregroundAwaitCountByWorkspaceId = new Map<string, number>();
-  private readonly backgroundableForegroundWaitersByWorkspaceId = new Map<
-    string,
-    Set<BackgroundableForegroundWaiter>
-  >();
+  /** Report/start waiters, foreground-await state and the completed-report cache. */
+  private readonly waiters: TaskWaiters;
 
   private readonly terminalAttentionStore: TerminalAttentionStore;
-  private readonly userBackgroundedTaskIds = new Set<string>();
-
-  // Cache completed reports so callers can retrieve them without re-reading disk.
-  // Bounded by max entries; disk persistence is the source of truth for restart-safety.
-  private readonly completedReportsByTaskId = new Map<string, CompletedAgentReportCacheEntry>();
 
   // Task workspace removals that outlived their termination timeout. Retries must
   // await the ORIGINAL removal outcome: the host's remove() short-circuits Ok
@@ -2398,126 +1892,15 @@ export class TaskService implements AgentTaskIntegration {
    */
   private interruptedParentWorkspaceIds = new Set<string>();
   /**
-   * Monotonic per-workspace stop generation, bumped synchronously at every explicit stop
-   * boundary (user Stop suppression, task_stop interruption, workspace-turn interruption).
-   * Peer-send admission captures its endpoints' generations and refuses when any changed:
-   * unlike the level-triggered suppression set and persisted statuses — which a quick user
-   * resume clears between probe evaluations — a bump latches, so an intervening stop keeps
-   * the in-flight send stale forever.
-   */
-  private readonly workspaceStopEpochs = new Map<string, number>();
-  /**
-   * User Stops per workspace (markParentWorkspaceInterrupted). The stop epoch above also counts
+   * User Stops per workspace (markParentWorkspaceInterrupted). The stop epoch also counts
    * owner interrupts of a delegated turn, which a message waiting for that turn survives (see
    * flushParkedPeerSends), so parking needs this separate count to tell a user Stop apart.
    */
   private readonly workspaceUserStopEpochs = new Map<string, number>();
-  /**
-   * #4997: peer messages to a root whose running delegated workspace turn the sender does not
-   * own, in arrival order per target. The delegated turn stays owner-only, so they wait here and
-   * are delivered as ordinary new turns once its live registration is released (see
-   * flushParkedPeerSends). They wait outside the target's MessageQueue on purpose: a queued
-   * uncorrelated entry would supersede the delegated turn or strip the owner's continuations
-   * (MessageQueue.hasAllWorkspaceTurnContinuations), and a "hold" dispatch decision blocks every
-   * entry behind it, including the continuations that turn is waiting for. In-memory and
-   * process-local, like the queue.
-   */
-  private readonly parkedPeerSendsByTarget = new Map<string, ParkedPeerSend[]>();
-  private readonly parkedPeerSendFlushLocks = new MutexMap<string>();
-  /** #5271: new delegated-turn registrations per target (see onWorkspaceTurnRegistered). */
-  private readonly workspaceTurnRegistrationEpochs = new Map<string, number>();
-  /**
-   * Child stream ends cut by a host-selected continuation (queued input or context-budget
-   * hand-over) whose successor has not yet streamed or been withdrawn. Keyed by task; settled
-   * from the recorded successor outcome (QueueCutReceipt), never from an idle probe, and cleared
-   * on terminal transitions. In-memory only: after a restart a running task with no stream is
-   * handled by startup recovery.
-   */
-  private readonly deferredTaskStreamEnds = new Map<
-    string,
-    {
-      sourceMessageId: string;
-      sourceTurnGeneration: symbol;
-      continuationEntryId: string;
-      executionId: string | undefined;
-      stopEpoch: number;
-      /**
-       * The cut stream's attempt: a row another writer re-admitted since drops the deferral, and
-       * its recovery is CAS'd on this attempt (#4414).
-       */
-      attemptId: AttemptFence;
-    }
-  >();
-  /**
-   * Level-triggered stop latches: workspace IDs whose stop cascade is currently between its
-   * synchronous epoch bump and terminal status persistence. The epoch map alone cannot refuse
-   * a send that ENTERS during that window — the post-bump generation becomes the send's clean
-   * baseline while the endpoints' persisted statuses still read running — so peer-send
-   * admission also rejects any endpoint chain holding an in-progress stop latch. Refcounted:
-   * overlapping stops (a subtree stop racing a workspace-turn interrupt on the same workspace)
-   * must not clear each other's latch.
-   */
-  private readonly workspaceStopsInProgress = new Map<string, number>();
-  /**
-   * Latched workspace IDs whose held latch deferred a queued-task launch (own or parent latch;
-   * see startReservedAgentTask). The launch record was handed back to "queued", and the queue is
-   * rechecked exactly when that latch clears — not on every release (startup normalizes stopped
-   * trees before any drain) and not on an unrelated scheduler trigger.
-   */
-  private readonly queueRechecksOwedByStopLatch = new Set<string>();
-  /**
-   * Attempt ownership ledger (see OwnedTaskAttempt); replaced before any new admission, dropped
-   * once the attempt's report is durable (releaseReportedTaskAttempt).
-   */
-  private readonly ownedAttemptByTaskId = new Map<string, OwnedTaskAttempt>();
-  /**
-   * Closure/settlement of exactly the attempt it names (AttemptSettlementEntry). A `closing` entry
-   * is recorded synchronously by every producer before its first awaited write and refuses further
-   * sends under that id; only the owner's settleOwnedTaskAttempt upgrades it to `settled`. Never
-   * removed by a failed write — a new admission (fresh id) is the only way to reopen.
-   */
-  private readonly attemptSettlementByTaskId = new Map<string, AttemptSettlementEntry>();
-  private readonly attemptSettlementListenersByTaskId = new Map<string, Set<() => void>>();
-  /**
-   * Failed reawakens whose closed attempt still awaits settlement (#4310): the owner snapshot
-   * restoreInterruptedTaskAfterResumeFailure closed, settled by recheckResumeFailureSettlement.
-   */
-  private readonly resumeFailureSettlementByTaskId = new Map<
-    string,
-    OwnedTaskAttempt & { attemptId: string }
-  >();
-  /**
-   * The last attempt id THIS process published for each task (every local rotation, owned or
-   * not). Not an authority on the current id — currentTaskAttemptId reads the persisted row, so
-   * a rotation committed by another process is honored and a row that is missing or unreadable
-   * yields no id at all. Never read to classify or authorize: an unreadable registry refuses
-   * every send regardless of this map (see admitTaskWorkspaceTurn), since absence here is no
-   * proof that a workspace is not a task.
-   */
-  private readonly currentAttemptIdByTaskId = new Map<string, string>();
-  /** Outstanding send obligations per task (see AdmittedSend); discharged entries are removed. */
-  private readonly admittedSendsByTaskId = new Map<string, Set<AdmittedSend>>();
-  /**
-   * Reawakenings (parent reactivation or manual resume) that published a fresh attempt and have
-   * not yet handed it a send obligation (reactivation: until createWorkspaceTurn returns; manual
-   * resume: until reawakenInterruptedTask returns to the send that admits it; a reactivation in
-   * the remaining hand-off tick only makes that send, which names its attempt, read stale). With
-   * pending admissions and the live turn it is the "another reawakening is live" evidence each
-   * path rechecks under the mutex (see hasLiveReawakening): neither path holds the other's locks,
-   * and rotating an attempt a live continuation runs under drops that continuation's report.
-   */
-  private readonly reawakeningsInFlight = new Map<string, string>();
-  /** Per task, the stream-end decisions of this process's owned attempts (see StreamEndDecision). */
-  private readonly streamEndDecisionsByTaskId = new Map<string, StreamEndDecision[]>();
-  /** Stop latches retained past their cascade because the stop could not be confirmed; released on authoritative terminal settlement. */
-  /**
-   * Ownership of every in-progress stop, keyed by workspace (see beginWorkspaceStop). The latch
-   * a record guards drops only when BOTH hold: the captured owner settled authoritatively
-   * (admitted turn generation ended; matching execution mirror settled) AND no cleanup issued
-   * by the cascade is still in flight. Persisted statuses, stop results, and missing
-   * registrations are not evidence — an accepted-but-preparing turn can still start.
-   */
-  private readonly workspaceStopRecords = new Map<string, WorkspaceStopRecord>();
+  private readonly peerSendParking: PeerSendParking;
+  private readonly taskStopLatch: TaskStopLatch;
+  private readonly attemptLedger: AttemptLedger;
+  private readonly streamEndLedger: StreamEndLedger;
   /** Tracks consecutive auto-resumes per workspace. Reset when a user message is sent. */
   private consecutiveAutoResumes = new Map<string, number>();
 
@@ -2821,465 +2204,52 @@ export class TaskService implements AgentTaskIntegration {
     return null;
   }
 
+  /** WorkspaceTurnTaskHost (see TaskStopLatch.bumpWorkspaceStopEpoch). */
   bumpWorkspaceStopEpoch(workspaceId: string): void {
-    this.workspaceStopEpochs.set(workspaceId, (this.workspaceStopEpochs.get(workspaceId) ?? 0) + 1);
+    this.taskStopLatch.bumpWorkspaceStopEpoch(workspaceId);
   }
 
+  /** AgentTaskIntegration (see TaskStopLatch.getWorkspaceStopEpoch). */
   getWorkspaceStopEpoch(workspaceId: string): number {
-    return this.workspaceStopEpochs.get(workspaceId) ?? 0;
+    return this.taskStopLatch.getWorkspaceStopEpoch(workspaceId);
   }
 
   /** WorkspaceTurnTaskHost: a delegated turn's registration release (#4997). */
   onWorkspaceTurnRegistrationReleased(workspaceId: string): void {
-    this.scheduleParkedPeerSendFlush(workspaceId);
+    this.peerSendParking.scheduleParkedPeerSendFlush(workspaceId);
   }
 
-  /**
-   * WorkspaceTurnTaskHost: a new delegated turn registered (#5271). A message waits once, for the
-   * turn it was parked behind. Counting registrations, like the stop epochs, lets the retry's
-   * admission gate see a replacement turn even after it settled, at any point before admission.
-   */
+  /** WorkspaceTurnTaskHost: a new delegated turn registered (#5271). */
   onWorkspaceTurnRegistered(workspaceId: string): void {
-    this.workspaceTurnRegistrationEpochs.set(
-      workspaceId,
-      (this.workspaceTurnRegistrationEpochs.get(workspaceId) ?? 0) + 1
-    );
+    this.peerSendParking.onWorkspaceTurnRegistered(workspaceId);
   }
 
-  /**
-   * Park a peer message behind the target's delegated turn, then schedule a flush. Park first,
-   * check second: the registration may have been released between the caller's synchronous
-   * check and this call, and that release found nothing to flush. Only first attempts park: a
-   * message that already waited is delivered once or dropped.
-   */
-  private parkPeerSend(send: ParkedPeerSend): void {
-    const parked = this.parkedPeerSendsByTarget.get(send.targetId) ?? [];
-    parked.push(send);
-    this.parkedPeerSendsByTarget.set(send.targetId, parked);
-    this.scheduleParkedPeerSendFlush(send.targetId);
+  /** Tests spy on this; PeerSendParking's scheduled flush calls back through it. */
+  private flushParkedPeerSends(targetId: string): Promise<void> {
+    return this.peerSendParking.flushParkedPeerSends(targetId);
   }
 
-  /**
-   * Triggered by the delegated turn's registration release and by the stop-latch release (an
-   * explicit interrupt releases the registration while its latch is still held), never by a
-   * timer. Flushes of one target run one at a time, in park order.
-   */
-  private scheduleParkedPeerSendFlush(targetId: string): void {
-    if (!this.parkedPeerSendsByTarget.has(targetId)) return;
-    this.parkedPeerSendFlushLocks
-      .withLock(targetId, () => this.flushParkedPeerSends(targetId))
-      .catch((error: unknown) => {
-        log.error("Failed to deliver peer messages that waited for a delegated turn", {
-          targetId,
-          error: getErrorMessage(error),
-        });
-      });
-  }
-
-  private async flushParkedPeerSends(targetId: string): Promise<void> {
-    // While a registration or stop latch is held, stop: its release schedules the next flush.
-    // The list stays registered while it drains, so a fresh send parks behind it instead of
-    // overtaking the rest (see sendTreeMessage), and a user Stop that drops it ends the drain.
-    const parked = this.parkedPeerSendsByTarget.get(targetId);
-    let drainStarted = false;
-    while (parked != null && this.parkedPeerSendsByTarget.get(targetId) === parked) {
-      // Messages that waited for an earlier turn are dropped by their retry's admission gate.
-      if (
-        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) != null ||
-        this.isWorkspaceStopInProgress(targetId)
-      ) {
-        return;
-      }
-      if (!drainStarted) {
-        drainStarted = true;
-        // The owner's explicit interrupt of the delegated turn bumps the target's stop epoch (so
-        // sends admitted during its wind-down cannot outlive that stop), and these messages
-        // waited for the turn on purpose. Take a new target baseline once, here, not per retry:
-        // a user Stop after this point still refuses a retry that is already in flight, and one
-        // before it dropped the list (markParentWorkspaceInterrupted).
-        const epoch = this.getWorkspaceStopEpoch(targetId);
-        for (const waiting of parked) waiting.awaitedDelegatedTurn.stopEpochs.set(targetId, epoch);
-      }
-      // The retry removes itself from the list under the target's admission lock (see
-      // sendTreeMessage), so it stays counted against the queue cap until then.
-      const spec = parked[0];
-      if (spec == null) {
-        this.parkedPeerSendsByTarget.delete(targetId);
-        return;
-      }
-      // The retry re-runs the full peer path under the target's event lock. A withdrawn message
-      // (consent revoked, sender stopped, runtime change, target archived) is dropped and
-      // touches no turn state, and so is one that meets another delegated turn.
-      // Each message is handled on its own, so one failure cannot discard the rest.
-      try {
-        const result = await this.sendTreeMessage(spec);
-        if (!result.success) {
-          log.debug("Dropped a peer message that waited for a delegated turn", {
-            senderWorkspaceId: spec.senderWorkspaceId,
-            targetId,
-            code: result.error.code,
-          });
-        }
-      } catch (error) {
-        log.error("Failed to deliver a peer message that waited for a delegated turn", {
-          senderWorkspaceId: spec.senderWorkspaceId,
-          targetId,
-          error: getErrorMessage(error),
-        });
-      } finally {
-        // A retry that never reached the lock (it threw first) must not be retried forever.
-        if (parked[0] === spec) parked.shift();
-      }
-    }
-  }
-
-  /**
-   * Hold a stop-in-progress latch for the given workspaces until the returned release runs.
-   * Callers latch synchronously with the epoch bump and release only after the cascade has
-   * persisted terminal state, so sends entering mid-stop are refused at admission.
-   */
+  /** WorkspaceTurnTaskHost (see TaskStopLatch.latchWorkspaceStopsInProgress). */
   latchWorkspaceStopsInProgress(workspaceIds: readonly string[]): () => void {
-    for (const id of workspaceIds) {
-      this.workspaceStopsInProgress.set(id, (this.workspaceStopsInProgress.get(id) ?? 0) + 1);
-    }
-    return () => {
-      for (const id of workspaceIds) {
-        const count = this.workspaceStopsInProgress.get(id) ?? 0;
-        if (count <= 1) {
-          this.workspaceStopsInProgress.delete(id);
-          if (this.queueRechecksOwedByStopLatch.delete(id)) {
-            this.scheduleMaybeStartQueuedTasks();
-          }
-          this.notifyAttemptSettlementListeners(id);
-          // An interrupted delegated turn releases its registration while this latch is held.
-          this.scheduleParkedPeerSendFlush(id);
-        } else {
-          this.workspaceStopsInProgress.set(id, count - 1);
-        }
-      }
-    };
+    return this.taskStopLatch.latchWorkspaceStopsInProgress(workspaceIds);
   }
 
+  /** AgentTaskIntegration: a stop cascade holds the workspace's latch. */
   isWorkspaceStopInProgress(workspaceId: string): boolean {
-    return this.workspaceStopsInProgress.has(workspaceId);
+    return this.taskStopLatch.isWorkspaceStopInProgress(workspaceId);
   }
 
-  /**
-   * Stop-cascade launch barrier: true (and the queue recheck owed to the held latch recorded)
-   * while the task's own or its parent's stop latch is held. The record stays/returns to
-   * "queued"; the latch release rechecks the queue (see queueRechecksOwedByStopLatch).
-   */
-  private deferLaunchWhileStopInProgress(
-    taskId: string,
-    parentWorkspaceId: string | undefined
-  ): boolean {
-    let deferred = false;
-    for (const id of [taskId, parentWorkspaceId]) {
-      if (id != null && this.isWorkspaceStopInProgress(id)) {
-        this.queueRechecksOwedByStopLatch.add(id);
-        deferred = true;
-      }
-    }
-    return deferred;
-  }
-
-  /**
-   * Phase A of a stop cascade (synchronous, under the global mutex): bump the epoch, latch the
-   * workspace and record what must settle before the latch may drop — the admitted turn
-   * generation (owner of any preparing/streaming work) and the live execution mirror. Nothing
-   * admitted after this point exists (admission barrier), so these captures are complete.
-   * Overlapping cascades add their release to the same record instead of resetting ownership.
-   */
-  private beginWorkspaceStop(workspaceId: string): WorkspaceStopRecord {
-    this.bumpWorkspaceStopEpoch(workspaceId);
-    const release = this.latchWorkspaceStopsInProgress([workspaceId]);
-    const existing = this.workspaceStopRecords.get(workspaceId);
-    if (existing != null) {
-      // An overlapping cascade adds its release and plans its own cleanup; ownership of the
-      // earlier cascade's counts is untouched.
-      existing.releases.push(release);
-      existing.cleanupInFlight += 1;
-      return existing;
-    }
-    const capturedTurn = this.workspaceService.getActiveTurnGeneration(workspaceId);
-    const capturedExecutionId =
-      this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId)?.handleId;
-    const ownedAttempt = this.ownedAttemptByTaskId.get(workspaceId);
-    const attemptId = ownedAttempt?.attemptId ?? this.currentTaskAttemptId(workspaceId);
-    const record: WorkspaceStopRecord = {
-      releases: [release],
-      cleanupInFlight: 1,
-      attemptId,
-      capturedTurns: new Set(capturedTurn != null ? [capturedTurn] : []),
-      pendingAdmissions: new Set(),
-      capturedExecutionId,
-      // A registration whose mirror already persisted terminally is settled (its settlement
-      // callback ran before this capture and will not run again).
-      executionSettled:
-        capturedExecutionId == null ||
-        this.isExecutionMirrorSettled(workspaceId, capturedExecutionId),
-      stopPersisted: false,
-      ownedAttempt,
-      capturedStreamMessageId:
-        this.getWorkspaceTurnManager().captureQueueCutAttributionSnapshot(workspaceId).activeStream
-          ?.messageId,
-    };
-    // Sends admitted against this attempt that have not claimed a turn yet are part of what
-    // must settle: captured by reference so a later obligation of a successor attempt (or one
-    // already superseded) can never enter this record.
-    for (const send of this.admittedSendsByTaskId.get(workspaceId) ?? []) {
-      if (send.attemptId !== attemptId) continue;
-      if (send.state !== "pending" && send.state !== "enqueued") continue;
-      record.pendingAdmissions.add(send);
-      send.capturedBy.add(record);
-    }
-    this.workspaceStopRecords.set(workspaceId, record);
-    return record;
-  }
-
-  /**
-   * Phase B (outside the global mutex): every descendant's clearQueue + stopStream, issued
-   * exactly once while its latch is held and targeted at the execution captured in Phase A, raced
-   * concurrently under a per-child and one aggregate deadline. A timeout abandons the WAIT only:
-   * the original promise keeps its cleanup ownership and its later settlement rechecks release.
-   * Must run for EVERY id latched in Phase A (each planned one cleanup), so callers pass the
-   * full latched set even when Phase A failed midway.
-   */
-  private async runWorkspaceStopCleanup(
+  /** Tests spy on this; TaskStopLatch owns Phase B. */
+  private runWorkspaceStopCleanup(
     targets: readonly string[],
-    options: {
-      label: string;
-      abandonPartial: boolean;
-      clearQueue: boolean;
-      /**
-       * Live continuation handles captured in Phase A (see WorkspaceStopRecord.capturedExecutionId),
-       * interrupted here so their mirror settles: the stream stop below is a `system` abort, which
-       * never settles a workspace-turn handle (only a user abort does), so without this the record
-       * would wait for an execution settlement that never comes and hold the latch until restart.
-       */
-      capturedExecutionsById?: ReadonlyMap<string, { ownerWorkspaceId: string; handleId: string }>;
-      onTimeout?: (workspaceId: string) => void;
-    }
+    options: Parameters<TaskStopLatch["runWorkspaceStopCleanup"]>[1]
   ): Promise<void> {
-    const waits = targets.map(async (id) => {
-      // Consumes the unit planned by beginWorkspaceStop; the finally below pays it back.
-      const record = this.workspaceStopRecords.get(id);
-      const expectedMessageId = record?.capturedStreamMessageId;
-      const cleanup = (async () => {
-        if (options.clearQueue) {
-          // AgentSession stream-end cleanup auto-flushes queued messages, so a stopped
-          // descendant must not keep pending input; issued once, never re-issued later. The
-          // user's queued messages are handed back as held input, never silently dropped.
-          try {
-            const clearQueueResult = this.workspaceService.clearQueue(id, {
-              preserveUserInput: true,
-            });
-            if (!clearQueueResult.success) {
-              log.debug(`${options.label}: clearQueue failed`, {
-                taskId: id,
-                error: clearQueueResult.error,
-              });
-            }
-          } catch (error: unknown) {
-            log.debug(`${options.label}: clearQueue threw`, { taskId: id, error });
-          }
-        }
-        const execution = options.capturedExecutionsById?.get(id);
-        if (execution != null) {
-          await this.interruptCapturedExecution(id, execution, options.label);
-        }
-        // Success is NOT stop confirmation (an accepted-but-PREPARING turn has no registered
-        // stream yet); only the owner's settlement recorded on the stop record confirms.
-        const stopResult = await this.aiService.stopStream(id, {
-          abandonPartial: options.abandonPartial,
-          ...(expectedMessageId != null ? { expectedMessageId } : {}),
-        });
-        if (!stopResult.success) {
-          log.debug(`${options.label}: stopStream failed`, { taskId: id });
-        }
-      })();
-      // Ownership stays with the original promise: only ITS settlement (however late) counts
-      // the cleanup as finished, and even then it merely triggers a recheck.
-      void cleanup
-        .catch((error: unknown) => {
-          log.debug(`${options.label}: cleanup threw`, { taskId: id, error });
-        })
-        .finally(() => {
-          if (record != null) record.cleanupInFlight -= 1;
-          this.recheckWorkspaceStopRelease(id);
-        });
-      const outcome = await raceWithAbortAndTimeout(cleanup, {
-        timeoutMs: TASK_TERMINATION_STOP_STREAM_TIMEOUT_MS,
-      });
-      if (outcome.kind !== "ok") {
-        log.warn(`${options.label}: stopStream timed out; retaining stop latch`, { taskId: id });
-        options.onTimeout?.(id);
-      }
-    });
-    const aggregate = await raceWithAbortAndTimeout(Promise.allSettled(waits), {
-      timeoutMs: TASK_TERMINATION_STOP_STREAM_AGGREGATE_TIMEOUT_MS,
-    });
-    if (aggregate.kind !== "ok") {
-      log.warn(`${options.label}: cleanup exceeded the aggregate deadline`, {
-        taskIds: targets,
-      });
-    }
+    return this.taskStopLatch.runWorkspaceStopCleanup(targets, options);
   }
 
-  /**
-   * Settle the continuation handle a stop record captured (a reawakened child executes under a
-   * WorkspaceTurnManager handle): interruptWorkspaceTurn persists the handle and its execution
-   * mirror terminal within one settlement boundary and drops the live registration, which is the
-   * authoritative execution settlement the record waits on (releaseRetainedStopLatches). Same
-   * pairing as the task_stop subtree stop (finishSubtreeStopCleanup): the owner's terminal wake
-   * for a handle the stop itself interrupted is suppressed. A failure leaves the record waiting
-   * (fail closed), exactly as an unsettled execution does today.
-   */
-  private async interruptCapturedExecution(
-    taskId: string,
-    execution: { ownerWorkspaceId: string; handleId: string },
-    label: string
-  ): Promise<void> {
-    const interrupted = await this.getWorkspaceTurnManager().interruptWorkspaceTurn(
-      execution.ownerWorkspaceId,
-      execution.handleId,
-      { scheduleQueueDrain: false }
-    );
-    if (!interrupted.success) {
-      log.warn(`${label}: interruptWorkspaceTurn failed for the captured execution`, {
-        taskId,
-        handleId: execution.handleId,
-        error: interrupted.error,
-      });
-      return;
-    }
-    await this.suppressTerminalAttention({
-      ownerWorkspaceId: execution.ownerWorkspaceId,
-      sourceKind: "workspace_turn",
-      sourceId: execution.handleId,
-    });
-  }
-
-  /**
-   * Phase C: drop the latch iff the captured owner settled, a durable stop marker exists and no
-   * cleanup is owed. Called from every settlement path; a late cleanup completion or a
-   * persisted-status caller only triggers this recheck and never supplies evidence by itself.
-   * A missing config entry is NOT evidence: a still-preparing session settles through its own
-   * disposal (the coordinator publishes the captured generation's idle transition).
-   */
-  private recheckWorkspaceStopRelease(workspaceId: string): void {
-    const record = this.workspaceStopRecords.get(workspaceId);
-    if (record == null) return;
-    if (record.cleanupInFlight > 0) return;
-    if (
-      !(
-        record.stopPersisted &&
-        record.capturedTurns.size === 0 &&
-        record.pendingAdmissions.size === 0 &&
-        record.executionSettled
-      )
-    )
-      return;
-    // Execution-settlement producer: the receipt is durable before the latch releases, so nothing
-    // the latch holds back (a reawaken, a peer send, a queued launch) observes the stopped attempt
-    // as released while its receipt could still be missing. The record stays registered (latched)
-    // for the write; its completion rechecks, releasing the latch and recording the settlement in
-    // one step as before. A failed write (or an unreadable config) still releases, with the
-    // attempt left `closing` (fail closed) instead of pinning the latch until restart.
-    if (record.receipt === "writing") return;
-    // A receipt can be at stake: wait for the attempt's pending stream-end decision (its report
-    // may still publish); resolveStreamEndDecision rechecks. Without a receipt at stake the
-    // release keeps its previous timing.
-    if (
-      record.receipt == null &&
-      record.attemptId != null &&
-      this.ownsReceiptEligibleAttempt(workspaceId, record.ownedAttempt) &&
-      this.findStreamEndDecision(workspaceId, record.attemptId)?.outcome === "pending"
-    ) {
-      return;
-    }
-    if (record.receipt == null) {
-      const decision = this.decideSettlementReceipt(
-        workspaceId,
-        record.ownedAttempt,
-        "stop-settled"
-      );
-      if (decision.kind === "unreadable") record.receipt = "failed";
-      if (decision.kind === "write") {
-        record.receipt = "writing";
-        void this.writeSettlementReceipt(workspaceId, decision, "execution-settled")
-          .then(
-            (written) => {
-              record.receipt = written ? "written" : "failed";
-            },
-            (error: unknown) => {
-              log.error("Stop release: settlement receipt write threw", { workspaceId, error });
-              record.receipt = "failed";
-            }
-          )
-          .finally(() => this.recheckWorkspaceStopRelease(workspaceId));
-        return;
-      }
-    }
-    this.workspaceStopRecords.delete(workspaceId);
-    for (const release of record.releases) {
-      release();
-    }
-    // Owner settled + cleanup finished + marker persisted: authoritative for the attempt captured
-    // in Phase A. An unknown (legacy) attempt has none to settle — stopping it proves nothing,
-    // but its id is closed to further sends until a new admission rotates it.
-    if (record.ownedAttempt == null && record.attemptId != null) {
-      this.closeAttemptAdmission(workspaceId, record.attemptId, undefined, "stop-settled");
-    }
-    // A failed receipt write leaves the attempt `closing` (never settled without its receipt).
-    if (record.receipt !== "failed") {
-      this.settleOwnedTaskAttempt(workspaceId, record.ownedAttempt, "stop-settled");
-    }
-    // A failed reawaken's settlement deferred to this Stop (#4310): drop or finish it now; no
-    // later disposal or turn settlement is guaranteed to recheck it.
-    this.recheckResumeFailureSettlement(workspaceId);
-  }
-
-  /**
-   * Authoritative execution settlement (WorkspaceTurnManager settled the MATCHING execution
-   * mirror and removed its live registration). Records the evidence for the captured execution
-   * and rechecks; persisted interrupted statuses from other callers reach only the recheck.
-   */
+  /** WorkspaceTurnTaskHost (see TaskStopLatch.releaseRetainedStopLatches). */
   releaseRetainedStopLatches(workspaceId: string): void {
-    const record = this.workspaceStopRecords.get(workspaceId);
-    if (record == null) return;
-    const liveHandleId =
-      this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId)?.handleId;
-    if (
-      record.capturedExecutionId != null &&
-      (liveHandleId !== record.capturedExecutionId ||
-        this.isExecutionMirrorSettled(workspaceId, record.capturedExecutionId))
-    ) {
-      record.executionSettled = true;
-    }
-    this.recheckWorkspaceStopRelease(workspaceId);
-  }
-
-  /** The persisted execution mirror for this handle is terminal (settled by its owner). */
-  private isExecutionMirrorSettled(workspaceId: string, handleId: string): boolean {
-    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace;
-    return (
-      workspace?.taskExecutionId === handleId &&
-      !isActiveWorkspaceTurnTaskStatus(workspace.taskExecutionStatus)
-    );
-  }
-
-  /** Phase A recorded a durable stop marker for this workspace (see WorkspaceStopRecord). */
-  private markWorkspaceStopPersisted(workspaceId: string): void {
-    const record = this.workspaceStopRecords.get(workspaceId);
-    if (record == null) return;
-    record.stopPersisted = true;
-    // A deferred child stream end cancels on this notification (the stop is in progress), so its
-    // pending decision cannot hold the latch. Every caller runs after its durable status write, or
-    // where no status is left to write (a removed row, or an already-terminal status that is the
-    // marker), on every branch, including those that skip recordTaskInterrupted: a terminate whose
-    // removal keeps the workspace (#6920), or a status already interrupted by an archive (#6967).
-    this.notifyAttemptSettlementListeners(workspaceId);
+    this.taskStopLatch.releaseRetainedStopLatches(workspaceId);
   }
 
   /**
@@ -3289,24 +2259,15 @@ export class TaskService implements AgentTaskIntegration {
    * fail-closed shape (cleanup-pending), never a silent discharge.
    */
   private recordWorkspaceTurnSettled(workspaceId: string, turnGeneration: symbol): void {
-    for (const send of this.admittedSendsByTaskId.get(workspaceId) ?? []) {
+    for (const send of this.attemptLedger.sendsOf(workspaceId)) {
       if (send.state === "admitted" && send.turnId === turnGeneration) {
-        this.dischargeAdmittedSend(send);
+        this.attemptLedger.dischargeAdmittedSend(send);
       }
     }
     // A terminal decision held for this turn's late readers: only actual readers keep it now.
-    let decisionTurnSettled = false;
-    for (const decision of this.streamEndDecisionsByTaskId.get(workspaceId) ?? []) {
-      if (decision.turn !== turnGeneration) continue;
-      decision.turn = undefined;
-      decisionTurnSettled = true;
-    }
-    if (decisionTurnSettled) this.pruneStreamEndDecisions(workspaceId);
-    this.recheckResumeFailureSettlement(workspaceId);
-    const record = this.workspaceStopRecords.get(workspaceId);
-    if (!record?.capturedTurns.has(turnGeneration)) return;
-    record.capturedTurns.delete(turnGeneration);
-    this.recheckWorkspaceStopRelease(workspaceId);
+    this.streamEndLedger.settleTurn(workspaceId, turnGeneration);
+    this.attemptLedger.recheckResumeFailureSettlement(workspaceId);
+    this.taskStopLatch.releaseCapturedTurn(workspaceId, turnGeneration);
   }
 
   /**
@@ -3317,603 +2278,65 @@ export class TaskService implements AgentTaskIntegration {
    */
   private recordWorkspaceTurnSuperseded(workspaceId: string, previous: symbol, next: symbol): void {
     if (previous === next) return;
-    for (const send of this.admittedSendsByTaskId.get(workspaceId) ?? []) {
+    for (const send of this.attemptLedger.sendsOf(workspaceId)) {
       if (send.state === "admitted" && send.turnId === previous) {
         send.turnId = next;
         send.inherited = true;
       }
     }
-    for (const decision of this.streamEndDecisionsByTaskId.get(workspaceId) ?? []) {
-      if (decision.turn === previous) decision.turn = next;
-    }
-    const record = this.workspaceStopRecords.get(workspaceId);
-    if (!record?.capturedTurns.has(previous)) return;
-    record.capturedTurns.delete(previous);
-    record.capturedTurns.add(next);
+    this.streamEndLedger.rebindTurn(workspaceId, previous, next);
+    this.taskStopLatch.rebindCapturedTurn(workspaceId, previous, next);
   }
 
-  /**
-   * A new attempt begins in this process (reservation commit, launch, reawakening, reactivation).
-   * Replaces the owned identity and drops any settlement of the previous attempt SYNCHRONOUSLY,
-   * before the admission that follows — current ownership always wins over a stale settlement.
-   */
+  /** Tests call this; AttemptLedger owns the attempt identity. */
   private beginOwnedTaskAttempt(
     taskId: string,
     source: string,
     identity: { attemptId: string | undefined; receiptEligible: boolean; abortSignal?: AbortSignal }
   ): OwnedTaskAttempt {
-    assert(taskId.length > 0, "beginOwnedTaskAttempt: taskId must be non-empty");
-    if (identity.attemptId != null) {
-      assertTaskAttemptId(identity.attemptId, "beginOwnedTaskAttempt");
-    }
-    const attempt: OwnedTaskAttempt = {
-      generation: (this.ownedAttemptByTaskId.get(taskId)?.generation ?? 0) + 1,
-      source,
-      attemptId: identity.attemptId,
-      receiptEligible: identity.receiptEligible,
-      ...(identity.abortSignal != null ? { abortSignal: identity.abortSignal } : {}),
-    };
-    this.ownedAttemptByTaskId.set(taskId, attempt);
-    if (identity.attemptId != null) this.currentAttemptIdByTaskId.set(taskId, identity.attemptId);
-    // A closure recorded for THIS id (between the rotating CAS and this block) stays: the fresh
-    // admission that follows must observe it and refuse. Only another attempt's entry is stale.
-    if (this.attemptSettlementByTaskId.get(taskId)?.attemptId !== identity.attemptId) {
-      this.attemptSettlementByTaskId.delete(taskId);
-    }
-    // Predecessors' stream-end decisions have no reader left that they could authorize: a send
-    // bound to a predecessor reads stale from the row's new id at its next gate.
-    this.streamEndDecisionsByTaskId.delete(taskId);
-    return attempt;
+    return this.attemptLedger.beginOwnedTaskAttempt(taskId, source, identity);
   }
 
-  /**
-   * Linearization point of every settlement producer: close the attempt to further sends BEFORE
-   * the producer's first awaited write, so no send can be admitted for an id whose settlement is
-   * under way. Synchronous — the admission fence (admitTaskWorkspaceTurn) is synchronous too, so
-   * the two can never interleave and no lock is needed. Never downgrades a `settled` entry and
-   * never touches an entry naming another attempt. `ownedAttempt` (the producer's snapshot of
-   * this process's owner) is recorded only when it holds exactly `attemptId`.
-   */
+  /** Tests spy on this; AttemptLedger owns the closure. */
   private closeAttemptAdmission(
     taskId: string,
     attemptId: string | undefined,
     ownedAttempt: OwnedTaskAttempt | undefined,
     source: string
   ): void {
-    const existing = this.attemptSettlementByTaskId.get(taskId);
-    if (existing != null && existing.attemptId === attemptId) return;
-    const attempt = ownedAttempt?.attemptId === attemptId ? ownedAttempt : undefined;
-    this.attemptSettlementByTaskId.set(taskId, {
-      attemptId,
-      ...(attempt != null ? { attempt } : {}),
-      phase: "closing",
-      source,
-    });
-    this.notifyAttemptSettlementListeners(taskId);
+    this.attemptLedger.closeAttemptAdmission(taskId, attemptId, ownedAttempt, source);
   }
 
-  /**
-   * Authoritative settlement by the attempt's owner (stop record released, launch failed,
-   * terminal stream failure). `attempt` is the identity captured BEFORE the owner's awaited
-   * write; a settlement for an attempt that is no longer current, or for no owned attempt at
-   * all (legacy/prior-process execution), is never recorded — only announced.
-   */
+  /** Tests call this; AttemptLedger owns the settlement. */
   private settleOwnedTaskAttempt(
     taskId: string,
     attempt: OwnedTaskAttempt | undefined,
     source: string
   ): void {
-    if (attempt != null && this.ownedAttemptByTaskId.get(taskId) === attempt) {
-      this.attemptSettlementByTaskId.set(taskId, {
-        attemptId: attempt.attemptId,
-        attempt,
-        phase: "settled",
-        source,
-      });
-    } else {
-      log.debug("Task attempt settlement without a current owned attempt", {
-        taskId,
-        source,
-        owned: attempt?.generation,
-      });
-    }
-    this.notifyAttemptSettlementListeners(taskId);
+    this.attemptLedger.settleOwnedTaskAttempt(taskId, attempt, source);
   }
 
-  /**
-   * Only this process's CURRENT owned attempt, admitted with proven lineage under a persisted id,
-   * may produce a cross-process receipt. Anything else (unowned or prior-process attempt, marked
-   * lineage, pre-identity entry, an owner a reawakening or a durable report already replaced)
-   * settles in memory only, exactly as before receipts existed. In-memory checks only: whether
-   * the row still names the attempt is decided by one strict read (readSettlementReceiptRow).
-   */
-  private ownsReceiptEligibleAttempt(
-    taskId: string,
-    attempt: OwnedTaskAttempt | undefined
-  ): attempt is OwnedTaskAttempt & { attemptId: string } {
-    return (
-      attempt?.attemptId != null &&
-      attempt.receiptEligible &&
-      this.ownedAttemptByTaskId.get(taskId) === attempt
-    );
-  }
-
-  /**
-   * The one strict config read a receipt decision rests on. `ours`: the row names `attemptId`,
-   * with the owner dirs to write into (parent first). `elsewhere`: CONFIRMED gone, parentless or
-   * naming another attempt (rowSupersedes) — a successor another writer admitted must never be
-   * vouched for by its predecessor's settlement. `unreadable`: the config (or the parent chain)
-   * could not be read, which is no evidence either way and must never be taken for `elsewhere`.
-   */
-  private readSettlementReceiptRow(
-    taskId: string,
-    attemptId: string
-  ):
-    | { kind: "ours"; parentWorkspaceId: string; owners: string[] }
-    | { kind: "elsewhere" }
-    | { kind: "unreadable"; error: string } {
-    let parentWorkspaceId: string | undefined;
-    let owners: string[];
-    try {
-      const cfg = this.config.loadConfigOrDefault({ throwOnError: true });
-      const row = findWorkspaceEntry(cfg, taskId)?.workspace;
-      parentWorkspaceId = coerceNonEmptyString(row?.parentWorkspaceId);
-      if (row == null || parentWorkspaceId == null || rowSupersedes(row, attemptId)) {
-        log.info("[task-attempt] settlement receipt skipped: the row no longer names the attempt", {
-          taskId,
-          attemptId,
-          current: row?.taskAttemptId,
-        });
-        return { kind: "elsewhere" };
-      }
-      owners = this.listAncestorWorkspaceIdsUsingParentById(
-        this.buildAgentTaskIndex(cfg).parentById,
-        taskId
-      );
-    } catch (error: unknown) {
-      // An unreadable config, or a parent cycle in it.
-      return { kind: "unreadable", error: getErrorMessage(error) };
-    }
-    // Inconsistent ancestry is malformed config, not a programming error: fail closed like an
-    // unreadable read instead of throwing out of a settlement path. (Duplicate workspace ids no
-    // longer cause it: the row lookup and the task index both take the first row, #4550.)
-    if (owners[0] !== parentWorkspaceId) {
-      return {
-        kind: "unreadable",
-        error: `inconsistent ancestry for ${taskId}: parent ${parentWorkspaceId}, first owner ${owners[0] ?? "none"}`,
-      };
-    }
-    return { kind: "ours", parentWorkspaceId, owners };
-  }
-
-  /**
-   * Durable settlement for producers that established that no execution can still publish a
-   * report for `attempt` (idle stop, idle terminal failure, reservation canceled/failed, launch
-   * failed before its send): the receipt first, then the in-memory settlement.
-   */
-  private async persistOwnedAttemptSettlement(
-    taskId: string,
-    attempt: OwnedTaskAttempt | undefined,
-    receiptSource: SubagentAttemptSettlementSource,
-    settlementSource: string
-  ): Promise<void> {
-    const decision = this.decideSettlementReceipt(taskId, attempt, settlementSource);
-    if (decision.kind === "unreadable") return;
-    if (
-      decision.kind === "write" &&
-      !(await this.writeSettlementReceipt(taskId, decision, receiptSource))
-    ) {
-      return;
-    }
-    this.settleOwnedTaskAttempt(taskId, attempt, settlementSource);
-  }
-
-  /**
-   * THE no-report boundary every receipt producer must prove, evaluated synchronously in the tick
-   * that decides the write (see decideSettlementReceipt): a receipt may claim that `attempt` can no
-   * longer publish a report only when ALL of these hold at once —
-   *  1. it is closed to admissions: a closure names it (closeAttemptAdmission, recorded by the
-   *     producer before its first await), or a stop record latched for it since capture;
-   *  2. no send obligation of THIS attempt exists in any state (pending, enqueued, admitted) —
-   *     keyed by attempt id, so a successor's obligations neither block nor satisfy it;
-   *  3. nothing is live for the task: no turn generation, workspace-turn registration or stream
-   *     (task-level signals; any of them blocks, which is the safe direction);
-   *  4. no stream-end decision of the attempt is pending, and none resolved as a report
-   *     (published) or unknowable (indeterminate). Such a resolution also downgrades the
-   *     attempt's receiptEligible (resolveStreamEndDecision), so it still counts once the
-   *     decision itself was pruned.
-   * False means no durable claim: the producer settles in memory only, exactly as before receipts.
-   */
-  private attemptCannotStillReport(
-    taskId: string,
-    attempt: OwnedTaskAttempt & { attemptId: string }
-  ): boolean {
-    const attemptId = attempt.attemptId;
-    const closed =
-      this.isAttemptClosed(taskId, attemptId) ||
-      this.workspaceStopRecords.get(taskId)?.attemptId === attemptId;
-    if (!closed) return false;
-    for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
-      if (send.attemptId === attemptId) return false;
-    }
-    if (
-      this.workspaceService.getActiveTurnGeneration(taskId) != null ||
-      this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId) != null ||
-      this.aiService.isStreaming(taskId)
-    ) {
-      return false;
-    }
-    const decision = this.findStreamEndDecision(taskId, attemptId);
-    return decision == null || decision.outcome === "nonreport";
-  }
-
-  /**
-   * closeAttemptAdmission that never replaces a closure recorded for a DIFFERENT attempt: used
-   * where the row's current attempt is unknown or may differ (another writer re-admitted it), so
-   * replacing that closure could reopen the row's attempt to sends.
-   */
-  private closeAttemptAdmissionUnlessOtherClosed(
-    taskId: string,
-    attemptId: string,
-    attempt: OwnedTaskAttempt | undefined,
-    source: string
-  ): void {
-    const existing = this.attemptSettlementByTaskId.get(taskId);
-    if (existing != null && existing.attemptId !== attemptId) return;
-    this.closeAttemptAdmission(taskId, attemptId, attempt, source);
-  }
-
-  /**
-   * The synchronous half of a receipt-bearing settlement, from one strict read:
-   *  - `memory-only`: no receipt authority (ownsReceiptEligibleAttempt), the no-report boundary is
-   *    not proven (attemptCannotStillReport), or the read CONFIRMED the row gone or naming another
-   *    attempt — today's in-memory-only settlement follows;
-   *  - `write`: the row names the attempt, which is closed to sends here (before any await) and
-   *    must not be settled until writeSettlementReceipt succeeds;
-   *  - `unreadable`: no evidence either way, so fail closed — the attempt is closed but never
-   *    settled (cleanup-pending here, indeterminate after a restart) and gets no receipt; with the
-   *    row unknown, a closure recorded for a different attempt is kept (it may be the row's).
-   * A failed write, like `unreadable`, leaves the attempt `closing`: never settled without its
-   * receipt, so no successor reads it as settled when a restart would not.
-   */
+  /** Tests spy on this; AttemptLedger owns the decision. */
   private decideSettlementReceipt(
     taskId: string,
     attempt: OwnedTaskAttempt | undefined,
     settlementSource: string
-  ):
-    | { kind: "memory-only" }
-    | { kind: "unreadable" }
-    | { kind: "write"; attemptId: string; parentWorkspaceId: string; owners: string[] } {
-    if (!this.ownsReceiptEligibleAttempt(taskId, attempt)) return { kind: "memory-only" };
-    const attemptId = attempt.attemptId;
-    if (!this.attemptCannotStillReport(taskId, attempt)) return { kind: "memory-only" };
-    const row = this.readSettlementReceiptRow(taskId, attemptId);
-    if (row.kind === "elsewhere") return { kind: "memory-only" };
-    if (row.kind === "unreadable") {
-      log.warn("[task-attempt] settlement receipt not written: config unreadable", {
-        taskId,
-        attemptId,
-        error: row.error,
-      });
-      this.closeAttemptAdmissionUnlessOtherClosed(taskId, attemptId, attempt, settlementSource);
-      return { kind: "unreadable" };
-    }
-    // Synchronous with the read: the row names this attempt, so any closure replaced here names
-    // an attempt the row no longer does.
-    this.closeAttemptAdmission(taskId, attemptId, attempt, settlementSource);
-    return {
-      kind: "write",
-      attemptId,
-      parentWorkspaceId: row.parentWorkspaceId,
-      owners: row.owners,
-    };
+  ): SettlementReceiptDecision {
+    return this.attemptLedger.decideSettlementReceipt(taskId, attempt, settlementSource);
   }
 
-  /**
-   * Write the receipt into every owner dir: outermost ancestor first, the parent LAST, stopping
-   * at the first failure, so the parent's copy (the one lineage proof reads) exists only once
-   * every other owner holds one too. True when all writes succeeded. Never throws.
-   */
-  private async writeSettlementReceipt(
+  /** Tests spy on this; AttemptLedger owns the write. */
+  private writeSettlementReceipt(
     taskId: string,
     target: { attemptId: string; parentWorkspaceId: string; owners: string[] },
     source: SubagentAttemptSettlementSource
   ): Promise<boolean> {
-    const receipt = {
-      taskId,
-      attemptId: target.attemptId,
-      parentWorkspaceId: target.parentWorkspaceId,
-      source,
-      settledAt: new Date().toISOString(),
-    };
-    for (const ownerWorkspaceId of [...target.owners].reverse()) {
-      const result = await writeSubagentAttemptSettlementReceipt({
-        ownerWorkspaceSessionDirs: [path.join(this.config.sessionsDir, ownerWorkspaceId)],
-        receipt,
-      });
-      if (!result.success) {
-        log.warn("[task-attempt] settlement receipt write failed; attempt left closing", {
-          taskId,
-          attemptId: target.attemptId,
-          ownerWorkspaceId,
-          error: result.error,
-        });
-        return false;
-      }
-    }
-    return true;
+    return this.attemptLedger.writeSettlementReceipt(taskId, target, source);
   }
 
-  /**
-   * The ledger entries of an attempt whose report is durable are redundant: every reader
-   * (inspectAttemptOutcome, waitForAgentReport) classifies a persisted report first, so neither
-   * this attempt's ownership nor its settlement can decide an outcome again. Dropping them keeps
-   * the per-task ledgers bounded by the tasks still able to end without a report, instead of by
-   * every task ever attempted in this process.
-   *
-   * `attempt` is the identity captured at the stream-end event that carried the report (see the
-   * stream-end listener), so the drop names the attempt the report belongs to — a task reawakened
-   * (markInterruptedTaskRunning, not under the task's event lock) while that report waited for
-   * the lock or for its writes owns a different identity and stays owned; an older report never
-   * decides the new attempt's outcome. Called only after every ancestor artifact write succeeded:
-   * a report that is not durable everywhere leaves the entries in place.
-   *
-   * Interrupted-without-report receipts are deliberately NOT dropped here or on stop: an ancestor
-   * that has not yet read terminal-no-report still needs the receipt after config cleanup, and no
-   * consumer acknowledgement exists yet to bound that retention.
-   *
-   * The released shape (reported row, no owner, no settlement entry) is itself read by
-   * markInterruptedTaskRunning: a manual follow-up into such a child mints a fresh attempt rather
-   * than being admitted under the completed id.
-   */
-  private releaseReportedTaskAttempt(taskId: string, attempt: OwnedTaskAttempt | undefined): void {
-    if (attempt == null || this.ownedAttemptByTaskId.get(taskId) !== attempt) return;
-    this.ownedAttemptByTaskId.delete(taskId);
-    if (this.attemptSettlementByTaskId.get(taskId)?.attempt === attempt) {
-      this.attemptSettlementByTaskId.delete(taskId);
-    }
-  }
-
-  // ---------------------------------------------------------------------------------------------
-  // Stream-end decisions (see StreamEndDecision)
-  // ---------------------------------------------------------------------------------------------
-
-  /**
-   * Run handleStreamEnd under the workspace event lock, owning the stream's decision: resolved
-   * `nonreport` on every return that neither published nor failed, `indeterminate` on a throw —
-   * unless the handler deferred the stream (child goal arbitration waiting on its accounting),
-   * which transfers the still-pending decision to deferChildStreamEnd.
-   */
-  private runStreamEndHandler(
-    event: StreamEndEvent,
-    queueCutSnapshot: QueueCutAttributionSnapshot,
-    taskOrigin: StreamEndTaskOrigin,
-    decision: StreamEndDecision | undefined
-  ): void {
-    void this.workspaceEventLocks
-      .withLock(event.workspaceId, async () => {
-        let deferred = false;
-        try {
-          deferred =
-            (await this.handleStreamEnd(event, queueCutSnapshot, taskOrigin)) === "deferred";
-        } catch (error: unknown) {
-          // Unknown outcome: never let held follow-ups run as if the attempt continued.
-          this.resolveStreamEndDecision(event.workspaceId, decision, "indeterminate");
-          throw error;
-        } finally {
-          // Every return path that neither published nor failed left the attempt continuing.
-          if (!deferred) this.resolveStreamEndDecision(event.workspaceId, decision, "nonreport");
-        }
-        if (deferred) this.deferChildStreamEnd(event, queueCutSnapshot, taskOrigin, decision);
-      })
-      .catch((error: unknown) => {
-        log.error("TaskService.handleStreamEnd failed", { error });
-      });
-  }
-
-  /**
-   * A child stream whose goal accounting had not settled when arbitration needed it (see
-   * arbitrateChildGoalAtStreamEnd): accounting completion is authoritative, so nothing is decided
-   * from unsettled state and the task is not finalized. The stream's pending decision (held
-   * follow-ups keep waiting) moves here; outside the event lock this waits — unbounded — for the
-   * retained receipt to settle, or for the attempt to close / be superseded / be stopped (or its
-   * row to stop reading running), then re-runs the original stream end (same event, attempt,
-   * turn and stop fences) under the lock.
-   */
-  private deferChildStreamEnd(
-    event: StreamEndEvent,
-    queueCutSnapshot: QueueCutAttributionSnapshot,
-    taskOrigin: StreamEndTaskOrigin,
-    decision: StreamEndDecision | undefined
-  ): void {
-    const goalService = this.workspaceGoalService;
-    assert(goalService != null, "deferChildStreamEnd requires the goal service");
-    const taskId = event.workspaceId;
-    const attemptId = taskOrigin.ownedAttempt?.attemptId ?? taskOrigin.unownedAttemptId;
-    const cancelled = Promise.withResolvers<void>();
-    const listener = () => {
-      if (
-        attemptId == null ||
-        !this.attemptAdmissionOpen(taskId, attemptId) ||
-        taskOrigin.stopEpoch !== this.getWorkspaceStopEpoch(taskId) ||
-        taskOrigin.executionId !== this.getAgentTaskExecutionId(taskId) ||
-        // arbitrateChildGoalAtStreamEnd's status gate (its owed-pause gate needs no mirror: the
-        // pause marker is written only with a terminal status): a row that no longer reads
-        // running (a report adopted from disk, an archive) can never take a goal turn, so the
-        // accounting decides nothing and the re-run takes the same branch now as after it (#6994).
-        findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace.taskStatus !==
-          "running"
-      ) {
-        cancelled.resolve();
-      }
-    };
-    const listeners = this.attemptSettlementListenersByTaskId.get(taskId) ?? new Set();
-    listeners.add(listener);
-    this.attemptSettlementListenersByTaskId.set(taskId, listeners);
-    listener();
-    log.info("[task-goal] stream accounting unsettled; deferring the child stream end", {
-      taskId,
-      messageId: event.messageId,
-    });
-    void Promise.race([
-      goalService.streamAccountingReceiptOutcome(taskId, event.messageId),
-      cancelled.promise,
-    ])
-      .finally(() => this.removeAttemptSettlementListener(taskId, listener))
-      .then(() => {
-        // #7003: this stream deferred while its row read running, and nothing moves a running row
-        // to a completed report under the same attempt but a publication (ours resolved the
-        // decision already) or another backend's. So that attempt reported: the re-run's
-        // `reported` branch must not leave the decision `nonreport`, or a held follow-up would
-        // start a new turn of a reported attempt.
-        this.resolveDecisionOfReportedAttempt(taskId, attemptId, decision);
-        this.runStreamEndHandler(event, queueCutSnapshot, taskOrigin, decision);
-      })
-      .catch((error: unknown) => {
-        log.error("TaskService: deferred child stream end failed", { taskId, error });
-        this.resolveStreamEndDecision(taskId, decision, "indeterminate");
-      });
-  }
-
-  /**
-   * Register the pending decision for the ended stream of `attempt` (owned) or, when this process
-   * owns none, of the persisted `unownedAttemptId`. Synchronous, event tick only.
-   */
-  private registerStreamEndDecision(
-    taskId: string,
-    messageId: string,
-    attempt: OwnedTaskAttempt | undefined,
-    unownedAttemptId: string | undefined
-  ): StreamEndDecision | undefined {
-    const attemptId = attempt != null ? attempt.attemptId : unownedAttemptId;
-    if (attemptId == null) return undefined;
-    const decision: StreamEndDecision = {
-      attempt,
-      attemptId,
-      messageId,
-      outcome: "pending",
-      turn: this.workspaceService.getActiveTurnGeneration(taskId),
-    };
-    const decisions = this.streamEndDecisionsByTaskId.get(taskId) ?? [];
-    decisions.push(decision);
-    this.streamEndDecisionsByTaskId.set(taskId, decisions);
-    return decision;
-  }
-
-  /** The decision a send bound to `attemptId` must honor: the pending one, else the latest. */
-  private findStreamEndDecision(taskId: string, attemptId: string): StreamEndDecision | undefined {
-    let latest: StreamEndDecision | undefined;
-    for (const decision of this.streamEndDecisionsByTaskId.get(taskId) ?? []) {
-      if (decision.attemptId !== attemptId) continue;
-      if (decision.outcome === "pending") return decision;
-      latest = decision;
-    }
-    return latest;
-  }
-
-  /**
-   * The handler's own pending decision for exactly `attempt` — or, for an unowned stream
-   * (`attempt` undefined), the unowned decision for `unownedAttemptId` — none once resolved or
-   * replaced.
-   */
-  private findPendingStreamEndDecision(
-    taskId: string,
-    attempt: OwnedTaskAttempt | undefined,
-    unownedAttemptId?: string
-  ): StreamEndDecision | undefined {
-    const attemptId = attempt != null ? attempt.attemptId : unownedAttemptId;
-    if (attemptId == null) return undefined;
-    const decision = this.findStreamEndDecision(taskId, attemptId);
-    return decision?.outcome === "pending" && decision.attempt === attempt ? decision : undefined;
-  }
-
-  /**
-   * Resolve exactly once (later calls, including the handler's finally, are no-ops), drop the
-   * decision when nothing is left to read it, and wake the workspace's idle drain so a held entry
-   * either dispatches (nonreport) or is refused and handed back (published/indeterminate) now
-   * rather than at the next unrelated drain. Returns whether this call resolved it.
-   */
-  private resolveStreamEndDecision(
-    taskId: string,
-    decision: StreamEndDecision | undefined,
-    outcome: Exclude<StreamEndDecision["outcome"], "pending">
-  ): boolean {
-    if (decision?.outcome !== "pending") return false;
-    decision.outcome = outcome;
-    // A stream that published (or may have published) the report ends the attempt WITH a report:
-    // it can never produce a no-report receipt, even after this decision is pruned below.
-    if (outcome !== "nonreport" && decision.attempt != null) {
-      decision.attempt.receiptEligible = false;
-    }
-    log.debug("[task-attempt] stream-end decision resolved", {
-      taskId,
-      attemptId: decision.attemptId,
-      messageId: decision.messageId,
-      outcome,
-    });
-    this.pruneStreamEndDecisions(taskId);
-    // A stop record of this attempt waits for the decision (recheckWorkspaceStopRelease).
-    this.recheckWorkspaceStopRelease(taskId);
-    this.workspaceService.drainQueuedMessagesIfIdle(taskId);
-    return true;
-  }
-
-  /**
-   * Drop resolved decisions no pending/enqueued obligation of their attempt can still read — a
-   * terminal one only once its reporting turn settled too (a later reader can still arrive while
-   * that turn is live; see StreamEndDecision).
-   */
-  private pruneStreamEndDecisions(taskId: string): void {
-    const decisions = this.streamEndDecisionsByTaskId.get(taskId);
-    if (decisions == null) return;
-    const readers = new Set<string>();
-    for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
-      if (send.state === "pending" || send.state === "enqueued") readers.add(send.attemptId);
-    }
-    const kept = decisions.filter(
-      (decision) =>
-        decision.outcome === "pending" ||
-        readers.has(decision.attemptId) ||
-        (decision.outcome !== "nonreport" && decision.turn != null)
-    );
-    if (kept.length === 0) this.streamEndDecisionsByTaskId.delete(taskId);
-    else if (kept.length !== decisions.length) this.streamEndDecisionsByTaskId.set(taskId, kept);
-  }
-
-  /**
-   * Dequeue-gate consultation for an enqueued obligation (see TurnAdmissionToken.resolveDispatch):
-   * held while its attempt's stream-end is undecided, refused once that stream turned out to be
-   * the terminal report (or its outcome is unknowable), otherwise on to the ordinary gates.
-   */
-  private resolveEnqueuedSendDispatch(send: AdmittedSend): QueuedDispatchDecision {
-    if (send.state !== "enqueued") return "proceed";
-    const decision = this.findStreamEndDecision(send.taskId, send.attemptId);
-    switch (decision?.outcome) {
-      case "pending":
-        return "hold";
-      case "published":
-        return { refuse: TASK_REPORTED_QUEUED_SEND_UNSENT_MESSAGE };
-      case "indeterminate":
-        return { refuse: TASK_REPORT_OUTCOME_INDETERMINATE_UNSENT_MESSAGE };
-      case "nonreport":
-      case undefined:
-        return "proceed";
-    }
-  }
-
+  /** Tests call this; AttemptLedger owns the listeners. */
   private notifyAttemptSettlementListeners(taskId: string): void {
-    const listeners = this.attemptSettlementListenersByTaskId.get(taskId);
-    if (!listeners) return;
-    for (const listener of [...listeners]) {
-      listener();
-    }
-  }
-
-  private removeAttemptSettlementListener(taskId: string, listener: () => void): void {
-    const listeners = this.attemptSettlementListenersByTaskId.get(taskId);
-    if (!listeners) return;
-    listeners.delete(listener);
-    if (listeners.size === 0) this.attemptSettlementListenersByTaskId.delete(taskId);
+    this.attemptLedger.notifyAttemptSettlementListeners(taskId);
   }
 
   // ---------------------------------------------------------------------------------------------
@@ -3937,39 +2360,6 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Publish a committed identity rotation to in-memory state: record the id this process
-   * committed (currentAttemptIdByTaskId), and drop a closure recorded for a previous attempt (a
-   * closure for the NEW id, recorded between the CAS and this call, stays). Tokens minted for an
-   * older id are revoked by the persisted row itself at their next gate.
-   */
-  private publishAttemptRotation(taskId: string, attemptId: string): void {
-    assertTaskAttemptId(attemptId, "publishAttemptRotation");
-    this.currentAttemptIdByTaskId.set(taskId, attemptId);
-    if (this.attemptSettlementByTaskId.get(taskId)?.attemptId !== attemptId) {
-      this.attemptSettlementByTaskId.delete(taskId);
-    }
-  }
-
-  /** A closure or settlement is recorded for exactly this attempt id. */
-  private isAttemptClosed(taskId: string, attemptId: string): boolean {
-    const entry = this.attemptSettlementByTaskId.get(taskId);
-    return entry?.attemptId === attemptId;
-  }
-
-  /**
-   * Common send-authorization predicate (no ownership): the id is still the task's current
-   * attempt, nothing closed it, no stop cascade holds the workspace and no workflow claim retired
-   * it. Ownership is a separate question, checked only where it applies.
-   */
-  private attemptAdmissionOpen(taskId: string, attemptId: string): boolean {
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
-    if (this.currentTaskAttemptId(taskId, entry) !== attemptId) return false;
-    if (this.isAttemptClosed(taskId, attemptId)) return false;
-    if (this.isWorkspaceStopInProgress(taskId)) return false;
-    return entry?.taskAttemptRetiredBy == null && entry?.pendingRemoval == null;
-  }
-
-  /**
    * The attempt id a stream event belongs to, read in the event's own tick (see
    * resolveStreamAttemptAtEvent).
    */
@@ -3978,75 +2368,9 @@ export class TaskService implements AgentTaskIntegration {
     return origin.ownedAttempt != null ? origin.ownedAttempt.attemptId : origin.unownedAttemptId;
   }
 
-  /**
-   * Who a stream event belongs to, read in the event's own tick. The live turn's ADMITTED attempt
-   * decides first: local ownership counts only when it names that same attempt. A process can
-   * still hold a stale owned attempt A after another backend rotated the row to B and a local send
-   * was admitted for B (unowned) — preferring the owner would treat B's stream as A's and discard
-   * its report/recovery as superseded. Without an admitted obligation (legacy turns) the owner,
-   * else the persisted id, applies as before.
-   */
+  /** Tests and the stream listeners call this (see AttemptLedger.resolveStreamAttemptAtEvent). */
   private resolveStreamAttemptAtEvent(taskId: string): StreamAttemptOrigin {
-    const owned = this.ownedAttemptByTaskId.get(taskId);
-    const turn = this.workspaceService.getActiveTurnGeneration(taskId);
-    // The turn's DIRECT admission decides; an obligation rebound from a superseded predecessor
-    // (inherited) shares the turn id but not its attempt, and counts only when the turn has no
-    // direct admission (a successor started without its own obligation).
-    let admitted: string | undefined;
-    let inherited: string | undefined;
-    if (turn != null) {
-      for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
-        if (send.state !== "admitted" || send.turnId !== turn) continue;
-        if (send.inherited !== true) {
-          admitted = send.attemptId;
-          break;
-        }
-        inherited ??= send.attemptId;
-      }
-    }
-    admitted ??= inherited;
-    if (owned != null && (admitted == null || owned.attemptId === admitted)) {
-      return { ownedAttempt: owned, unownedAttemptId: undefined };
-    }
-    return {
-      ownedAttempt: undefined,
-      unownedAttemptId: admitted ?? this.currentTaskAttemptId(taskId),
-    };
-  }
-
-  /** Sends admitted against the task's current attempt that have not claimed a turn yet. */
-  private hasPendingAdmissions(taskId: string): boolean {
-    const current = this.currentTaskAttemptId(taskId);
-    for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
-      if (send.attemptId !== current) continue;
-      if (send.state === "pending" || send.state === "enqueued") return true;
-    }
-    return false;
-  }
-
-  /**
-   * Another reawakening's attempt is live in this process: published and still launching, or
-   * handed to work that has not ended (a pending/enqueued admission, the live turn, a stream).
-   * Synchronous; both reawakening paths evaluate it under the mutex BEFORE their own publish, so
-   * their own work is never counted. Evidence, not ownership: an owned attempt that nothing runs
-   * (a reactivation whose launch was refused, a follow-up turn that ended) stays reawakenable.
-   */
-  private hasLiveReawakening(taskId: string): boolean {
-    if (
-      this.reawakeningsInFlight.has(taskId) ||
-      this.workspaceService.getActiveTurnGeneration(taskId) != null ||
-      this.aiService.isStreaming(taskId)
-    ) {
-      return true;
-    }
-    // Only sends that can still start a turn: one bound to a closed, superseded or stopped
-    // attempt reads stale at every later gate and is no continuation to protect.
-    for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
-      if ((send.state === "pending" || send.state === "enqueued") && !send.token.admissionStale()) {
-        return true;
-      }
-    }
-    return false;
+    return this.attemptLedger.resolveStreamAttemptAtEvent(taskId);
   }
 
   /**
@@ -4078,323 +2402,28 @@ export class TaskService implements AgentTaskIntegration {
     return false;
   }
 
-  private dischargeAdmittedSend(send: AdmittedSend): void {
-    if (send.state === "discharged") return;
-    send.state = "discharged";
-    const sends = this.admittedSendsByTaskId.get(send.taskId);
-    sends?.delete(send);
-    if (sends?.size === 0) this.admittedSendsByTaskId.delete(send.taskId);
-    for (const record of send.capturedBy) {
-      record.pendingAdmissions.delete(send);
-    }
-    send.capturedBy.clear();
-    this.pruneStreamEndDecisions(send.taskId);
-  }
-
-  /**
-   * Register one send obligation against `attemptId` and return its token. Every lifecycle event
-   * updates the obligation object and the records that captured it by reference — never
-   * whichever record currently occupies the task's slot.
-   */
-  private createAdmittedSend(
-    taskId: string,
-    attemptId: string,
-    attempt: OwnedTaskAttempt | undefined
-  ): AdmittedSend {
-    assertTaskAttemptId(attemptId, "createAdmittedSend");
-    const send: AdmittedSend = {
-      taskId,
-      attemptId,
-      ...(attempt != null ? { attempt } : {}),
-      state: "pending",
-      capturedBy: new Set(),
-      token: {
-        resolveDispatch: () => this.resolveEnqueuedSendDispatch(send),
-        admissionStale: () => {
-          // Admitted obligations belong to their turn: rotation, closure and stops no longer
-          // concern the send itself (the turn is captured by the stop record instead).
-          if (send.state === "admitted") return false;
-          if (send.state === "discharged") return true;
-          if (!this.attemptAdmissionOpen(taskId, attemptId)) return true;
-          if (send.attempt != null && this.ownedAttemptByTaskId.get(taskId) !== send.attempt) {
-            return true;
-          }
-          // A send still in its preflight while the attempt's last stream is undecided, or was
-          // decided a report (or unknowable): it must not start a turn under that attempt. The
-          // queue's own gate handles enqueued entries (hold/refuse) before reaching here.
-          if (send.state === "pending") {
-            const decision = this.findStreamEndDecision(taskId, attemptId);
-            return decision != null && decision.outcome !== "nonreport";
-          }
-          return false;
-        },
-        onEnqueued: () => {
-          if (send.state === "pending") send.state = "enqueued";
-        },
-        onAdmitted: (turnId) => {
-          if (send.state === "admitted") {
-            // The dequeued entry is adopted by a second sendMessage naming the same turn.
-            if (send.turnId !== turnId) {
-              log.warn(
-                "[task-attempt] admitted send re-admitted under another turn; keeping first",
-                {
-                  taskId,
-                  attemptId,
-                }
-              );
-            }
-            return;
-          }
-          if (send.state === "discharged") {
-            log.warn("[task-attempt] disposed send reported admitted; ignoring", {
-              taskId,
-              attemptId,
-            });
-            return;
-          }
-          send.state = "admitted";
-          send.turnId = turnId;
-          // A record that captured this obligation while pending now waits on the turn instead,
-          // and owes one more stopStream so the late turn is actually stopped: Phase B's single
-          // stopStream targeted the execution captured at Phase A, not this one.
-          for (const record of send.capturedBy) {
-            record.pendingAdmissions.delete(send);
-            record.capturedTurns.add(turnId);
-            record.cleanupInFlight += 1;
-            void this.aiService
-              .stopStream(taskId, { abandonPartial: false })
-              .catch((error: unknown) => {
-                log.debug("[task-attempt] late-turn stopStream threw", { taskId, error });
-              })
-              .finally(() => {
-                record.cleanupInFlight -= 1;
-                this.recheckWorkspaceStopRelease(taskId);
-              });
-          }
-          send.capturedBy.clear();
-        },
-        onDisposed: (kind) => {
-          if (send.state === "admitted" || send.state === "discharged") return;
-          log.debug("[task-attempt] send obligation disposed before admission", {
-            taskId,
-            attemptId,
-            kind,
-          });
-          const records = [...send.capturedBy];
-          this.dischargeAdmittedSend(send);
-          for (const record of records) {
-            if (this.workspaceStopRecords.get(taskId) === record) {
-              this.recheckWorkspaceStopRelease(taskId);
-            }
-          }
-          this.recheckResumeFailureSettlement(taskId);
-        },
-      },
-    };
-    const sends = this.admittedSendsByTaskId.get(taskId) ?? new Set<AdmittedSend>();
-    sends.add(send);
-    this.admittedSendsByTaskId.set(taskId, sends);
-    return send;
-  }
-
-  /**
-   * Admission fence for a send into a workspace (AgentTaskIntegration.admitTaskWorkspaceTurn),
-   * evaluated synchronously at the session handoff. Not a task, or a pre-identity task entry →
-   * no obligation (the next admission stamps an id). A task whose current attempt is retired,
-   * stopping, or closed refuses; otherwise the send is bound to the current attempt — owned when
-   * this process owns exactly that id, unowned otherwise (startup re-drives, prior-process
-   * attempts). Ownership is never acquired here: a send authorizes work, not receipt authority.
-   */
+  /** AgentTaskIntegration (see AttemptLedger.admitTaskWorkspaceTurn). */
   admitTaskWorkspaceTurn(
     workspaceId: string,
     options: { acceptanceOrigin: TurnAcceptanceOrigin; expectedAttemptId?: string }
   ): TaskTurnAdmission {
-    assert(workspaceId.length > 0, "admitTaskWorkspaceTurn: workspaceId must be non-empty");
-    let entry: WorkspaceConfigEntry | undefined;
-    try {
-      entry = findWorkspaceEntry(
-        this.config.loadConfigOrDefault({ throwOnError: true }),
-        workspaceId
-      )?.workspace;
-    } catch (error: unknown) {
-      // Unreadable registry: the classification itself is indeterminate. Absence from this
-      // process's identity map (currentAttemptIdByTaskId) is no proof of "not a task" — a task
-      // loaded from disk and never rotated here has no entry — so EVERY send refuses here (fail
-      // closed) rather than bypassing the attempt fence. That deliberately includes root/non-task
-      // workspaces: without the registry nothing can tell them apart, and such a send could not
-      // run anyway (lenient readers then see no workspaces, so its metadata cannot be resolved);
-      // refusing here just fails it before anything is persisted. Sends resume once the registry
-      // reads again.
-      return {
-        kind: "refused",
-        message: `Workspace registry unreadable; send refused: ${getErrorMessage(error)}`,
-      };
-    }
-    // A send decided for a specific attempt whose row is gone (unpublished, removed) is stale,
-    // never an ordinary send into a workspace that is not a task.
-    if (entry == null && options.expectedAttemptId != null) {
-      return { kind: "refused", message: SEND_ADMISSION_STALE_MESSAGE };
-    }
-    // Checked before the task classification: another backend's removal of a root workspace
-    // deletes its checkout too (#4478).
-    if (entry?.pendingRemoval != null) {
-      return { kind: "refused", message: pendingRemovalAdmissionMessage(entry.pendingRemoval) };
-    }
-    if (!entry?.parentWorkspaceId) return { kind: "not-a-task" };
-    // The claim is monotonic and stronger than the id: a retired task refuses even when its id
-    // is missing or malformed (fail closed on partial state), so check it before the id.
-    if (entry.taskAttemptRetiredBy != null) {
-      return { kind: "refused", message: retiredAttemptMessage(entry.taskAttemptRetiredBy) };
-    }
-    const attemptId = this.currentTaskAttemptId(workspaceId, entry);
-    if (attemptId == null) {
-      log.debug("[task-attempt] send into a pre-identity task entry carries no obligation", {
-        workspaceId,
-      });
-      return { kind: "not-a-task" };
-    }
-    // A send decided for one attempt never binds to a successor another writer admitted since:
-    // the decision is stale, not the row (see TaskWorkspaceSeam.admitTaskWorkspaceTurn).
-    if (options.expectedAttemptId != null && attemptId !== options.expectedAttemptId) {
-      log.info("[task-attempt] send refused: decided for a superseded attempt", {
-        workspaceId,
-        expectedAttemptId: options.expectedAttemptId,
-        attemptId,
-        acceptanceOrigin: options.acceptanceOrigin,
-      });
-      return { kind: "refused", message: SEND_ADMISSION_STALE_MESSAGE };
-    }
-    if (this.isWorkspaceStopInProgress(workspaceId)) {
-      return { kind: "refused", message: WORKSPACE_STOP_IN_PROGRESS_SEND_BLOCKED_MESSAGE };
-    }
-    if (this.isAttemptClosed(workspaceId, attemptId)) {
-      log.info("[task-attempt] send refused: attempt settled", {
-        workspaceId,
-        attemptId,
-        acceptanceOrigin: options.acceptanceOrigin,
-      });
-      return { kind: "refused", message: TASK_ATTEMPT_SETTLED_SEND_BLOCKED_MESSAGE };
-    }
-    const owned = this.ownedAttemptByTaskId.get(workspaceId);
-    const send = this.createAdmittedSend(
-      workspaceId,
-      attemptId,
-      owned?.attemptId === attemptId ? owned : undefined
-    );
-    return { kind: "admitted", token: send.token };
+    return this.attemptLedger.admitTaskWorkspaceTurn(workspaceId, options);
   }
 
-  /**
-   * Lineage proof for a reawaken/reactivation of `entry`'s current attempt (P11): proven iff the
-   * predecessor is settled by this process's owner (recorded `settled`) or by a durable receipt.
-   * Anything else — no id, marked lineage, unsettled/closing owner, missing or unreadable receipt —
-   * is unproven and makes the successor ineligible for receipts. Never throws.
-   */
-  private async evaluateAttemptLineage(
+  /** Tests spy on this (see AttemptLedger.evaluateAttemptLineage). */
+  private evaluateAttemptLineage(
     taskId: string,
     entry: WorkspaceConfigEntry
   ): Promise<{ proven: boolean; reason: string }> {
-    const attemptId = entry.taskAttemptId;
-    if (!isTaskAttemptId(attemptId)) {
-      return { proven: false, reason: "predecessor has no attempt id (pre-upgrade entry)" };
-    }
-    if (entry.taskAttemptUnproven === true) {
-      return { proven: false, reason: "lineage marked unproven" };
-    }
-    const owned = this.ownedAttemptByTaskId.get(taskId);
-    if (owned?.attemptId === attemptId) {
-      if (!owned.receiptEligible) {
-        return { proven: false, reason: "predecessor owned but not receipt-eligible" };
-      }
-      let settlement = this.attemptSettlementByTaskId.get(taskId);
-      if (settlement?.attempt === owned && settlement.phase === "closing") {
-        // The producer's awaited write is in flight; wait for its outcome (bounded, no lock).
-        await this.waitForAttemptClosureToSettle(taskId, ATTEMPT_CLOSURE_SETTLE_WAIT_MS);
-        settlement = this.attemptSettlementByTaskId.get(taskId);
-      }
-      if (settlement?.attempt === owned && settlement.phase === "settled") {
-        return { proven: true, reason: "predecessor settled by this process" };
-      }
-    }
-    const parentWorkspaceId = coerceNonEmptyString(entry.parentWorkspaceId);
-    if (parentWorkspaceId == null) return { proven: false, reason: "entry has no parent" };
-    const receipt = await readSubagentAttemptSettlementReceiptStrict(
-      path.join(this.config.sessionsDir, parentWorkspaceId),
-      taskId,
-      attemptId
-    );
-    if (receipt.kind === "found") {
-      // The strict reader binds task and attempt id to the path; the parent is bound here, to
-      // the entry: a receipt naming another parent at this path was copied or misplaced, never
-      // written by this task's owner (the same fail-closed outcome as an unreadable receipt).
-      if (receipt.receipt.parentWorkspaceId !== parentWorkspaceId) {
-        return {
-          proven: false,
-          reason: `settlement receipt names parent ${receipt.receipt.parentWorkspaceId}, expected ${parentWorkspaceId}`,
-        };
-      }
-      return { proven: true, reason: "settlement receipt found" };
-    }
-    return {
-      proven: false,
-      reason:
-        receipt.kind === "unreadable"
-          ? `settlement receipt unreadable: ${receipt.error}`
-          : "no settlement receipt for the predecessor attempt",
-    };
+    return this.attemptLedger.evaluateAttemptLineage(taskId, entry);
   }
 
-  /**
-   * Resolve once none of `workspaceIds` holds a Stop latch, or at `deadlineMs`. A Stop releases
-   * its latch only after its settlement receipt is durable or failed (recheckWorkspaceStopRelease),
-   * and the release notifies the attempt settlement listeners.
-   */
-  private async waitForWorkspaceStopsToRelease(
+  /** Tests spy on this; TaskStopLatch owns the wait. */
+  private waitForWorkspaceStopsToRelease(
     workspaceIds: readonly string[],
     deadlineMs: number
   ): Promise<void> {
-    for (const id of workspaceIds) {
-      while (this.isWorkspaceStopInProgress(id)) {
-        const remainingMs = deadlineMs - Date.now();
-        if (remainingMs <= 0) {
-          log.warn("Stop latch still held at the cleanup deadline; its receipt may be missing", {
-            taskId: id,
-          });
-          return;
-        }
-        const released = Promise.withResolvers<void>();
-        const listener = () => released.resolve();
-        const listeners = this.attemptSettlementListenersByTaskId.get(id) ?? new Set();
-        listeners.add(listener);
-        this.attemptSettlementListenersByTaskId.set(id, listeners);
-        try {
-          await raceWithAbortAndTimeout(released.promise, { timeoutMs: remainingMs });
-        } finally {
-          this.removeAttemptSettlementListener(id, listener);
-        }
-      }
-    }
-  }
-
-  /** Resolve once the task's settlement entry leaves `closing` (or the bound elapses). */
-  private async waitForAttemptClosureToSettle(taskId: string, timeoutMs: number): Promise<void> {
-    const isClosing = () => this.attemptSettlementByTaskId.get(taskId)?.phase === "closing";
-    if (!isClosing()) return;
-    const deadline = Date.now() + timeoutMs;
-    while (isClosing()) {
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) return;
-      const notified = Promise.withResolvers<void>();
-      const listener = () => notified.resolve();
-      const listeners = this.attemptSettlementListenersByTaskId.get(taskId) ?? new Set();
-      listeners.add(listener);
-      this.attemptSettlementListenersByTaskId.set(taskId, listeners);
-      try {
-        await raceWithAbortAndTimeout(notified.promise, { timeoutMs: remainingMs });
-      } finally {
-        this.removeAttemptSettlementListener(taskId, listener);
-      }
-    }
+    return this.taskStopLatch.waitForWorkspaceStopsToRelease(workspaceIds, deadlineMs);
   }
 
   /**
@@ -4451,7 +2480,7 @@ export class TaskService implements AgentTaskIntegration {
       );
       return undefined;
     }
-    this.publishAttemptRotation(taskId, attemptId);
+    this.attemptLedger.publishAttemptRotation(taskId, attemptId);
     return attemptId;
   }
 
@@ -4516,212 +2545,21 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
-  /**
-   * Cross-process evidence (G2) that the task's CURRENT attempt ended without a report, for an
-   * attempt this process does not own (another backend, or this one before a restart). Called
-   * only after the report artifact read positively found none: a receipt never outranks a report.
-   *
-   * Attempt identity: the receipt must name the row's current taskAttemptId. The workflow journal
-   * names only the child task, and every task admission (launch, reawaken, re-drive) rotates the
-   * id, so the current id is the only attempt that can still run; a receipt for an older attempt
-   * says nothing about it. A plain send binds to the current id instead: another backend's turn
-   * can therefore run under an attempt this receipt settled (#4545) — its late report still wins
-   * unless a claim retired the attempt first (publishAgentTaskReport). Only the PARENT's receipt copy counts (the copy lineage reads; ancestor copies are fan-out
-   * and never evidence on their own), and it must name that parent. Every read is strict, and
-   * the row is re-read after the receipt so an admission landing in between is never missed.
-   */
-  private async readUnownedSettlementProof(
-    taskId: string
-  ): Promise<{ kind: "proven"; attemptId: string } | { kind: "unproven"; reason: string }> {
-    const unproven = (reason: string) => ({ kind: "unproven" as const, reason });
-    const readRow = () =>
-      findWorkspaceEntry(this.config.loadConfigOrDefault({ throwOnError: true }), taskId)
-        ?.workspace;
-    let row: WorkspaceConfigEntry | undefined;
-    try {
-      row = readRow();
-    } catch (error: unknown) {
-      return unproven(`config unreadable: ${getErrorMessage(error)}`);
-    }
-    if (row == null) return unproven("no task record");
-    const attemptId = row.taskAttemptId;
-    if (!isTaskAttemptId(attemptId)) return unproven("no attempt id (pre-identity entry)");
-    if (row.taskStatus !== "interrupted") return unproven(`status ${row.taskStatus ?? "missing"}`);
-    if (row.taskAttemptUnproven === true) return unproven("lineage marked unproven");
-    const parentWorkspaceId = coerceNonEmptyString(row.parentWorkspaceId);
-    if (parentWorkspaceId == null) return unproven("no parent");
-    const receipt = await readSubagentAttemptSettlementReceiptStrict(
-      path.join(this.config.sessionsDir, parentWorkspaceId),
-      taskId,
-      attemptId
-    );
-    if (receipt.kind === "not_found") return unproven(`no settlement receipt for ${attemptId}`);
-    if (receipt.kind === "unreadable") {
-      return unproven(`settlement receipt unreadable: ${receipt.error}`);
-    }
-    if (receipt.receipt.parentWorkspaceId !== parentWorkspaceId) {
-      return unproven(`settlement receipt names parent ${receipt.receipt.parentWorkspaceId}`);
-    }
-    let latest: WorkspaceConfigEntry | undefined;
-    try {
-      latest = readRow();
-    } catch (error: unknown) {
-      return unproven(`config unreadable: ${getErrorMessage(error)}`);
-    }
-    if (
-      latest?.taskAttemptId !== attemptId ||
-      latest.taskStatus !== "interrupted" ||
-      latest.taskAttemptUnproven === true
-    ) {
-      return unproven("the attempt changed while its receipt was read");
-    }
-    return { kind: "proven", attemptId };
-  }
-
-  /**
-   * Workflow claim that retires `attemptId` of `taskId` so exactly one replacement can be
-   * published for it (G2). A pure compare-and-swap fence: the classifier (readAttemptOutcome)
-   * decided the attempt ended without a report; the claim only makes that decision exclusive.
-   * Granted while the row still names the attempt, is interrupted, belongs to this run/step and
-   * has no replacement yet; an earlier claim of the same run/step is re-stamped with a fresh
-   * nonce (a stale runner holding the old nonce can then no longer publish). Every admission
-   * already refuses a retired attempt. Confirmed by a strict re-read, since a config edit that
-   * fails to write is not always surfaced to its caller.
-   *
-   * A spent claim is never re-granted, even when its replacementTaskId names a row that is gone
-   * (a replacement whose launch failed sanitization is unpublished). That is safe because the
-   * workflow checkpoints the replacement (createMany's onTaskReserved) BEFORE the publishing
-   * commit that sets replacementTaskId: once it is set, the journal already names the
-   * replacement, so no runner classifies this attempt again. Recovery is retry-from-checkpoint's
-   * fresh reservation (WorkflowRunner.replacementRace.test.ts).
-   */
-  async claimRetiredAttempt(
+  /** Workflow adapter (see AttemptLedger.claimRetiredAttempt). */
+  claimRetiredAttempt(
     taskId: string,
     attemptId: string,
     claimant: { runId: string; stepId: string; inputHash: string }
   ): Promise<Result<{ nonce: string }, string>> {
-    assert(taskId.length > 0, "claimRetiredAttempt: taskId must be non-empty");
-    assertTaskAttemptId(attemptId, "claimRetiredAttempt");
-    assert(
-      claimant.runId.length > 0 && claimant.stepId.length > 0,
-      "claimRetiredAttempt: claimant"
-    );
-    return await this.workspaceEventLocks.withLock(taskId, async () => {
-      if (
-        this.isWorkspaceStopInProgress(taskId) ||
-        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId) != null ||
-        this.aiService.isStreaming(taskId) ||
-        this.workspaceService.getActiveTurnGeneration(taskId) != null
-      ) {
-        return Err("attempt is live");
-      }
-      const nonce = randomUUID();
-      let refusal: string | undefined = "task record not found";
-      try {
-        await this.editWorkspaceEntry(
-          taskId,
-          (ws) => {
-            refusal = retiredAttemptClaimRefusal(ws, attemptId, claimant);
-            if (refusal != null) return;
-            markChildGoalPauseOwed(ws);
-            ws.taskAttemptRetiredBy = {
-              runId: claimant.runId,
-              stepId: claimant.stepId,
-              inputHash: claimant.inputHash,
-              childTaskId: taskId,
-              attemptId,
-              mode: "no-report",
-              at: new Date().toISOString(),
-              nonce,
-            };
-          },
-          { allowMissing: true }
-        );
-      } catch (error: unknown) {
-        return Err(`claim write failed: ${getErrorMessage(error)}`);
-      }
-      if (refusal != null) return Err(refusal);
-      let row: WorkspaceConfigEntry | undefined;
-      try {
-        row = findWorkspaceEntry(
-          this.config.loadConfigOrDefault({ throwOnError: true }),
-          taskId
-        )?.workspace;
-      } catch (error: unknown) {
-        return Err(`claim unconfirmed: config unreadable: ${getErrorMessage(error)}`);
-      }
-      if (row?.taskAttemptId !== attemptId || row.taskAttemptRetiredBy?.nonce !== nonce) {
-        return Err("claim lost");
-      }
-      await this.settleChildGoalPause(taskId);
-      return Ok({ nonce });
-    });
+    return this.attemptLedger.claimRetiredAttempt(taskId, attemptId, claimant);
   }
 
-  /**
-   * A workflow step's started checkpoint is written in createMany's onTaskReserved, BEFORE
-   * commitReservations publishes the child's row. A crash in between leaves a checkpoint naming a
-   * task that never existed. Replacing it outright is unsafe: the reserving backend may only be
-   * stalled (lease expired, process alive), and its late commit would then publish a second child
-   * for the step, or re-run a step the replacement already recorded. So the replacing runner first
-   * tombstones the ID on the parent's row; commitReservations checks the tombstone inside its own
-   * config write and refuses, which makes "replace" and "late commit" mutually exclusive.
-   *
-   * Granted only while a strict read shows no row for the task (checked inside the same write) and
-   * this process owns no attempt for it (an own reservation may still be before its commit).
-   * Idempotent. Confirmed by a strict re-read, since a config edit that fails to write is not
-   * always surfaced to its caller.
-   */
-  async tombstoneUnpublishedReservation(
+  /** Workflow adapter (see AttemptLedger.tombstoneUnpublishedReservation). */
+  tombstoneUnpublishedReservation(
     parentWorkspaceId: string,
     taskId: string
   ): Promise<Result<void, string>> {
-    assert(parentWorkspaceId.length > 0, "tombstoneUnpublishedReservation: parentWorkspaceId");
-    assert(taskId.length > 0, "tombstoneUnpublishedReservation: taskId");
-    return await this.workspaceEventLocks.withLock(taskId, async () => {
-      if (this.ownedAttemptByTaskId.has(taskId)) {
-        return Err("this process owns an attempt for the task");
-      }
-      let refusal: string | undefined;
-      try {
-        await this.config.editConfig((config) => {
-          refusal = undefined;
-          if (findWorkspaceEntry(config, taskId) != null) {
-            refusal = "the task was published";
-            return config;
-          }
-          const parent = findWorkspaceEntry(config, parentWorkspaceId)?.workspace;
-          if (parent == null) {
-            refusal = "parent record not found";
-            return config;
-          }
-          const tombstones = parent.taskReservationTombstones ?? [];
-          if (!tombstones.includes(taskId)) {
-            parent.taskReservationTombstones = [...tombstones, taskId];
-          }
-          return config;
-        });
-      } catch (error: unknown) {
-        return Err(`tombstone write failed: ${getErrorMessage(error)}`);
-      }
-      if (refusal != null) return Err(refusal);
-      let config: ProjectsConfig;
-      try {
-        config = this.config.loadConfigOrDefault({ throwOnError: true });
-      } catch (error: unknown) {
-        return Err(`tombstone unconfirmed: config unreadable: ${getErrorMessage(error)}`);
-      }
-      if (
-        findWorkspaceEntry(config, taskId) != null ||
-        findWorkspaceEntry(
-          config,
-          parentWorkspaceId
-        )?.workspace.taskReservationTombstones?.includes(taskId) !== true
-      ) {
-        return Err("tombstone lost");
-      }
-      return Ok(undefined);
-    });
+    return this.attemptLedger.tombstoneUnpublishedReservation(parentWorkspaceId, taskId);
   }
 
   /**
@@ -4747,7 +2585,7 @@ export class TaskService implements AgentTaskIntegration {
       kind: "indeterminate",
       reason,
     });
-    const cached = this.completedReportsByTaskId.get(taskId);
+    const cached = this.waiters.getCompletedReport(taskId);
     if (cached) {
       return { kind: "reported", report: toAgentTaskReport(cached) };
     }
@@ -4766,7 +2604,7 @@ export class TaskService implements AgentTaskIntegration {
         taskId
       );
       if (read.kind === "found") {
-        this.completedReportsByTaskId.set(taskId, {
+        this.waiters.cacheCompletedReport(taskId, {
           reportMarkdown: read.artifact.reportMarkdown,
           title: read.artifact.title,
           planFilePath: read.artifact.planFilePath,
@@ -4776,7 +2614,6 @@ export class TaskService implements AgentTaskIntegration {
           workflowOwnedAncestorWorkspaceIds: read.artifact.workflowOwnedAncestorWorkspaceIds,
           ancestorWorkspaceIds: read.artifact.ancestorWorkspaceIds,
         });
-        this.enforceCompletedReportCacheLimit();
         return { kind: "reported", report: toAgentTaskReport(read.artifact) };
       }
       if (read.kind === "unreadable") {
@@ -4804,7 +2641,7 @@ export class TaskService implements AgentTaskIntegration {
         } catch {
           row = undefined;
         }
-        const owned = this.ownedAttemptByTaskId.get(taskId);
+        const owned = this.attemptLedger.ownedAttempt(taskId);
         const attemptId = row?.taskAttemptId;
         const marked = markedTerminalFailure(row, attemptId);
         if (marked != null && (owned?.attemptId == null || owned.attemptId === attemptId)) {
@@ -4848,7 +2685,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     const status = entry?.workspace.taskStatus ?? (entry != null ? "running" : undefined);
-    const owned = this.ownedAttemptByTaskId.get(taskId);
+    const owned = this.attemptLedger.ownedAttempt(taskId);
     if (owned == null) {
       if (entry == null) {
         const reason = "no task record and no attempt owned by this process";
@@ -4858,7 +2695,7 @@ export class TaskService implements AgentTaskIntegration {
       }
       // Report first: this branch runs only once the report artifact read positively found none.
       if (reportPositivelyAbsent) {
-        const proof = await this.readUnownedSettlementProof(taskId);
+        const proof = await this.attemptLedger.readUnownedSettlementProof(taskId);
         if (proof.kind === "proven") {
           return {
             kind: "terminal-no-report",
@@ -4893,7 +2730,7 @@ export class TaskService implements AgentTaskIntegration {
         `row names attempt ${currentRow.taskAttemptId ?? "none"}; this process owns ${owned.attemptId ?? "none"}`
       );
     }
-    const settlement = this.attemptSettlementByTaskId.get(taskId);
+    const settlement = this.attemptLedger.attemptSettlement(taskId);
     if (settlement?.attempt === owned) {
       // Closed but not yet settled: the producer's awaited write (config, later the receipt) is
       // still in flight. Its settlement is the guaranteed next signal (fail closed, not a wait).
@@ -4922,118 +2759,12 @@ export class TaskService implements AgentTaskIntegration {
     );
   }
 
-  /**
-   * Take the task's event lock for a short read while the caller's bound (deadline/abort) keeps
-   * applying to the WAIT for the lock: a publication holding it must not pin a bounded caller.
-   * Abandoned before entry → the late acquisition is a no-op that releases at once (nothing read,
-   * no subscription installed). Once entered, the operation runs to completion (never detached).
-   */
-  private async runUnderEventLockBounded<T>(
-    taskId: string,
-    operation: () => Promise<T>,
-    bound: { signal?: AbortSignal; deadline: number }
-  ): Promise<{ kind: "ok"; value: T } | { kind: "timeout" } | { kind: "aborted" }> {
-    let entered = false;
-    let abandoned = false;
-    const run = this.workspaceEventLocks.withLock(taskId, async (): Promise<T | undefined> => {
-      if (abandoned) return undefined;
-      entered = true;
-      return await operation();
-    });
-    return await new Promise((resolve, reject) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const cleanup = () => {
-        if (timer != null) clearTimeout(timer);
-        bound.signal?.removeEventListener("abort", onAbort);
-      };
-      const abandon = (result: { kind: "timeout" } | { kind: "aborted" }) => {
-        if (entered || abandoned) return;
-        abandoned = true;
-        cleanup();
-        resolve(result);
-      };
-      const onAbort = () => abandon({ kind: "aborted" });
-      bound.signal?.addEventListener("abort", onAbort, { once: true });
-      const remainingMs = bound.deadline - Date.now();
-      if (bound.signal?.aborted) {
-        abandon({ kind: "aborted" });
-      } else if (remainingMs <= 0) {
-        abandon({ kind: "timeout" });
-      } else {
-        timer = setTimeout(() => abandon({ kind: "timeout" }), remainingMs);
-        timer.unref?.();
-      }
-      run.then(
-        (value) => {
-          cleanup();
-          if (!abandoned) resolve({ kind: "ok", value: value as T });
-        },
-        (error: unknown) => {
-          cleanup();
-          if (!abandoned) reject(error instanceof Error ? error : new Error(String(error)));
-        }
-      );
-    });
-  }
-
-  /**
-   * Bounded wait for the current attempt to settle: subscribe THEN re-read under the task's
-   * event lock (a settlement landing between the two is observed by the re-read), release the
-   * lock before awaiting, and re-read on every notification. The bound also covers waiting for
-   * the lock itself (runUnderEventLockBounded). `indeterminate` returns at once — an unknown
-   * owner never pins the caller. Timeout is a bounded outcome, abort rejects.
-   */
-  async waitForAttemptSettlement(
+  /** Public entry point (WorkflowTaskServiceAdapter, WorkflowRunner); AttemptLedger owns the wait. */
+  waitForAttemptSettlement(
     taskId: string,
     options: { abortSignal?: AbortSignal; timeoutMs: number; requestingWorkspaceId?: string }
   ): Promise<TaskAttemptSettlement<AgentTaskReport>> {
-    assert(taskId.length > 0, "waitForAttemptSettlement: taskId must be non-empty");
-    assert(
-      Number.isFinite(options.timeoutMs) && options.timeoutMs > 0,
-      "waitForAttemptSettlement: timeoutMs invalid"
-    );
-    const deadline = Date.now() + options.timeoutMs;
-    const bound = { signal: options.abortSignal, deadline };
-    let notified = Promise.withResolvers<void>();
-    const listener = () => notified.resolve();
-    try {
-      const first = await this.runUnderEventLockBounded(
-        taskId,
-        async () => {
-          const listeners = this.attemptSettlementListenersByTaskId.get(taskId) ?? new Set();
-          listeners.add(listener);
-          this.attemptSettlementListenersByTaskId.set(taskId, listeners);
-          return await this.inspectAttemptOutcome(taskId, options);
-        },
-        bound
-      );
-      if (first.kind === "aborted") throw new Error("Interrupted");
-      if (first.kind === "timeout") return { kind: "timeout" };
-      let outcome = first.value;
-      while (outcome.kind === "live" || outcome.kind === "cleanup-pending") {
-        const remainingMs = deadline - Date.now();
-        if (remainingMs <= 0) return { kind: "timeout" };
-        const raced = await raceWithAbortAndTimeout(notified.promise, {
-          signal: options.abortSignal,
-          timeoutMs: remainingMs,
-        });
-        if (raced.kind === "aborted") throw new Error("Interrupted");
-        if (raced.kind === "timeout") return { kind: "timeout" };
-        // Re-arm before re-reading so a notification during the read is never lost.
-        notified = Promise.withResolvers<void>();
-        const reread = await this.runUnderEventLockBounded(
-          taskId,
-          () => this.inspectAttemptOutcome(taskId, options),
-          bound
-        );
-        if (reread.kind === "aborted") throw new Error("Interrupted");
-        if (reread.kind === "timeout") return { kind: "timeout" };
-        outcome = reread.value;
-      }
-      return outcome;
-    } finally {
-      this.removeAttemptSettlementListener(taskId, listener);
-    }
+    return this.attemptLedger.waitForAttemptSettlement(taskId, options);
   }
 
   private recordTaskInterrupted(taskId: string, parentWorkspaceId: string | undefined): void {
@@ -5074,7 +2805,7 @@ export class TaskService implements AgentTaskIntegration {
    * Delayed source events are separately fenced by their execution identity and Stop epoch.
    */
   private clearTaskRecovery(taskId: string): void {
-    this.deferredTaskStreamEnds.delete(taskId);
+    this.streamEndLedger.forgetDeferral(taskId);
     this.workspaceService.clearQueueCutReceipts(taskId);
     const removal = this.workspaceService.removeQueuedMessagesByDedupeKeyPrefix(
       taskId,
@@ -5161,16 +2892,8 @@ export class TaskService implements AgentTaskIntegration {
     return true;
   }
 
-  private markTaskQueueBackgrounded(taskId: string): void {
-    this.userBackgroundedTaskIds.add(taskId);
-  }
-
   markTaskForegroundRelevant(taskId: string): void {
-    this.userBackgroundedTaskIds.delete(taskId);
-  }
-
-  private isTaskQueueBackgrounded(taskId: string): boolean {
-    return this.userBackgroundedTaskIds.has(taskId);
+    this.waiters.markTaskForegroundRelevant(taskId);
   }
 
   /**
@@ -5201,14 +2924,131 @@ export class TaskService implements AgentTaskIntegration {
     terminalAttentionStore?: TerminalAttentionStore,
     private readonly desktopInputCoordinator = new DesktopInputCoordinator(config)
   ) {
+    this.attemptLedger = new AttemptLedger({
+      config: () => this.config,
+      aiService: () => this.aiService,
+      workspaceService: () => this.workspaceService,
+      turnManager: () => this.getWorkspaceTurnManager(),
+      workspaceEventLocks: () => this.workspaceEventLocks,
+      buildAgentTaskIndex: (cfg) => this.buildAgentTaskIndex(cfg),
+      listAncestorWorkspaceIdsUsingParentById: (parentById, taskId) =>
+        this.listAncestorWorkspaceIdsUsingParentById(parentById, taskId),
+      stopRecordAttemptId: (taskId) => this.taskStopLatch.stopRecordAttemptId(taskId),
+      hasStopRecord: (taskId) => this.taskStopLatch.hasStopRecord(taskId),
+      isWorkspaceStopInProgress: (workspaceId) => this.isWorkspaceStopInProgress(workspaceId),
+      isCurrentStopRecord: (workspaceId, record) =>
+        this.taskStopLatch.isCurrentStopRecord(workspaceId, record),
+      recheckWorkspaceStopRelease: (workspaceId) =>
+        this.taskStopLatch.recheckWorkspaceStopRelease(workspaceId),
+      currentTaskAttemptId: (taskId, entry) => this.currentTaskAttemptId(taskId, entry),
+      editWorkspaceEntry: (workspaceId, updater, options) =>
+        this.editWorkspaceEntry(workspaceId, updater, options),
+      settleChildGoalPause: (workspaceId) => this.settleChildGoalPause(workspaceId),
+      findStreamEndDecision: (taskId, attemptId) =>
+        this.streamEndLedger.findStreamEndDecision(taskId, attemptId),
+      pruneStreamEndDecisions: (taskId) => this.streamEndLedger.pruneStreamEndDecisions(taskId),
+      discardStreamEndDecisions: (taskId) => {
+        this.streamEndLedger.discardStreamEndDecisions(taskId);
+      },
+      // Through TaskService: tests spy on inspectAttemptOutcome on the instance.
+      inspectAttemptOutcome: (taskId, options) => this.inspectAttemptOutcome(taskId, options),
+      notifyAttemptSettlementListeners: (taskId) => this.notifyAttemptSettlementListeners(taskId),
+      closeAttemptAdmission: (taskId, attemptId, ownedAttempt, source) =>
+        this.closeAttemptAdmission(taskId, attemptId, ownedAttempt, source),
+      settleOwnedTaskAttempt: (taskId, attempt, source) =>
+        this.settleOwnedTaskAttempt(taskId, attempt, source),
+      decideSettlementReceipt: (taskId, attempt, settlementSource) =>
+        this.decideSettlementReceipt(taskId, attempt, settlementSource),
+      writeSettlementReceipt: (taskId, target, source) =>
+        this.writeSettlementReceipt(taskId, target, source),
+    });
+    this.taskStopLatch = new TaskStopLatch({
+      config: () => this.config,
+      aiService: () => this.aiService,
+      workspaceService: () => this.workspaceService,
+      turnManager: () => this.getWorkspaceTurnManager(),
+      terminalAttention: () => this.terminalAttention,
+      scheduleMaybeStartQueuedTasks: () => this.scheduleMaybeStartQueuedTasks(),
+      scheduleParkedPeerSendFlush: (workspaceId) =>
+        this.peerSendParking.scheduleParkedPeerSendFlush(workspaceId),
+      notifyAttemptSettlementListeners: (taskId) => this.notifyAttemptSettlementListeners(taskId),
+      addAttemptSettlementListener: (taskId, listener) =>
+        this.attemptLedger.addAttemptSettlementListener(taskId, listener),
+      removeAttemptSettlementListener: (taskId, listener) =>
+        this.attemptLedger.removeAttemptSettlementListener(taskId, listener),
+      ownedAttempt: (taskId) => this.attemptLedger.ownedAttempt(taskId),
+      currentTaskAttemptId: (taskId) => this.currentTaskAttemptId(taskId),
+      admittedSends: (taskId) => this.attemptLedger.sendsOf(taskId),
+      ownsReceiptEligibleAttempt: (taskId, attempt) =>
+        this.attemptLedger.ownsReceiptEligibleAttempt(taskId, attempt),
+      findStreamEndDecision: (taskId, attemptId) =>
+        this.streamEndLedger.findStreamEndDecision(taskId, attemptId),
+      decideSettlementReceipt: (taskId, attempt, settlementSource) =>
+        this.decideSettlementReceipt(taskId, attempt, settlementSource),
+      writeSettlementReceipt: (taskId, target, source) =>
+        this.writeSettlementReceipt(taskId, target, source),
+      closeAttemptAdmission: (taskId, attemptId, ownedAttempt, source) =>
+        this.closeAttemptAdmission(taskId, attemptId, ownedAttempt, source),
+      settleOwnedTaskAttempt: (taskId, attempt, source) =>
+        this.settleOwnedTaskAttempt(taskId, attempt, source),
+      recheckResumeFailureSettlement: (taskId) =>
+        this.attemptLedger.recheckResumeFailureSettlement(taskId),
+    });
+    this.streamEndLedger = new StreamEndLedger({
+      config: () => this.config,
+      workspaceService: () => this.workspaceService,
+      workspaceGoalService: () => this.workspaceGoalService,
+      workspaceEventLocks: () => this.workspaceEventLocks,
+      handleStreamEnd: (event, queueCutSnapshot, taskOrigin) =>
+        this.handleStreamEnd(event, queueCutSnapshot, taskOrigin),
+      recoverTaskFromIncompleteStreamEnd: (workspaceId, status, streamAttemptId) =>
+        this.recoverTaskFromIncompleteStreamEnd(workspaceId, status, streamAttemptId),
+      getWorkspaceStopEpoch: (workspaceId) => this.getWorkspaceStopEpoch(workspaceId),
+      getAgentTaskExecutionId: (taskId) => this.getAgentTaskExecutionId(taskId),
+      recheckWorkspaceStopRelease: (workspaceId) =>
+        this.taskStopLatch.recheckWorkspaceStopRelease(workspaceId),
+      attemptAdmissionOpen: (taskId, attemptId) =>
+        this.attemptLedger.attemptAdmissionOpen(taskId, attemptId),
+      addAttemptSettlementListener: (taskId, listener) =>
+        this.attemptLedger.addAttemptSettlementListener(taskId, listener),
+      removeAttemptSettlementListener: (taskId, listener) =>
+        this.attemptLedger.removeAttemptSettlementListener(taskId, listener),
+      sendsOf: (taskId) => this.attemptLedger.sendsOf(taskId),
+    });
+    this.peerSendParking = new PeerSendParking({
+      flush: (targetId) => this.flushParkedPeerSends(targetId),
+      getWorkspaceTurnManager: () => this.getWorkspaceTurnManager(),
+      isWorkspaceStopInProgress: (workspaceId) => this.isWorkspaceStopInProgress(workspaceId),
+      getWorkspaceStopEpoch: (workspaceId) => this.getWorkspaceStopEpoch(workspaceId),
+      sendTreeMessage: (spec) => this.sendTreeMessage(spec),
+    });
     this.agentPeerMessageBroker = new AgentPeerMessageBroker({
       // Parked sends count against the recipient's queue cap like queued ones.
       countQueuedAgentPeerMessages: (targetId) =>
         workspaceService.countQueuedAgentPeerMessages(targetId) +
-        (this.parkedPeerSendsByTarget.get(targetId)?.length ?? 0),
+        this.peerSendParking.countParked(targetId),
+    });
+    this.waiters = new TaskWaiters({
+      scheduleNotifyOnTerminalPersist: (taskId, ownerWorkspaceId) =>
+        this.scheduleNotifyOnTerminalPersist(taskId, ownerWorkspaceId),
+      hasQueuedMessages: (workspaceId, dispatchMode) =>
+        this.workspaceService.hasQueuedMessages(workspaceId, dispatchMode),
     });
     this.terminalAttentionStore = terminalAttentionStore ?? new TerminalAttentionStore(config);
-    this.gitPatchArtifactService = new GitPatchArtifactService(config);
+    this.workflowRunAttention = new WorkflowRunAttention({
+      sessionsDir: () => this.config.sessionsDir,
+      terminalAttentionStore: () => this.terminalAttentionStore,
+    });
+    this.terminalAttention = new TerminalAttentionNotifier({
+      terminalAttentionStore: () => this.terminalAttentionStore,
+      config: () => this.config,
+      aiService: () => this.aiService,
+      workspaceService: () => this.workspaceService,
+      turnManager: () => this.getWorkspaceTurnManager(),
+      // Through TaskService: the test harness wraps drainTerminalAttention on the instance.
+      drain: (ownerWorkspaceId) => this.drainTerminalAttention(ownerWorkspaceId),
+    });
+    this.gitPatchArtifactService = new GitPatchArtifactService(config, historyService.locks);
 
     this.aiService.on("stream-end", (payload: unknown) => {
       if (!isStreamEndEvent(payload)) return;
@@ -5231,13 +3071,13 @@ export class TaskService implements AgentTaskIntegration {
       };
       // The decision this handler owes for the attempt's ended stream, registered in the event's
       // own tick so the session's turn-completion drain (a later microtask) finds it.
-      const decision = this.registerStreamEndDecision(
+      const decision = this.streamEndLedger.registerStreamEndDecision(
         payload.workspaceId,
         payload.messageId,
         taskOrigin.ownedAttempt,
         taskOrigin.unownedAttemptId
       );
-      this.runStreamEndHandler(payload, queueCutSnapshot, taskOrigin, decision);
+      this.streamEndLedger.runStreamEndHandler(payload, queueCutSnapshot, taskOrigin, decision);
     });
 
     this.aiService.on("stream-abort", (payload: unknown) => {
@@ -5280,10 +3120,10 @@ export class TaskService implements AgentTaskIntegration {
 
     // Successor outcomes (withdrawn, admitted, streaming) are published as queue changes.
     this.workspaceService.onQueuedMessageChanged((workspaceId) => {
-      if (!this.deferredTaskStreamEnds.has(workspaceId)) return;
+      if (!this.streamEndLedger.hasDeferral(workspaceId)) return;
       this.workspaceEventLocks
         .withLock(workspaceId, async () => {
-          await this.reconcileDeferredTaskStreamEnd(workspaceId);
+          await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId);
         })
         .catch((error: unknown) => {
           log.error("TaskService.reconcileDeferredTaskStreamEnd failed", { error });
@@ -5569,7 +3409,7 @@ export class TaskService implements AgentTaskIntegration {
             discovery.runtime,
             discovery.workspacePath,
             agentId,
-            { projectPluginsTrusted }
+            { projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
           );
           const chain = await resolveAgentInheritanceChain({
             runtime: discovery.runtime,
@@ -5578,6 +3418,7 @@ export class TaskService implements AgentTaskIntegration {
             agentDefinition,
             workspaceId: entry.workspace.id ?? workspaceName,
             projectPluginsTrusted,
+            runtimeFactory: nodeRuntimeFactory,
           });
 
           if (agentDefinition.scope === "project") {
@@ -6826,6 +4667,7 @@ export class TaskService implements AgentTaskIntegration {
       try {
         const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
           projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
         });
         const runnableIds = (
           await Promise.all(
@@ -6838,6 +4680,7 @@ export class TaskService implements AgentTaskIntegration {
                   {
                     skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
                     projectPluginsTrusted,
+                    runtimeFactory: nodeRuntimeFactory,
                   }
                 );
                 if (
@@ -6873,7 +4716,10 @@ export class TaskService implements AgentTaskIntegration {
     let frontmatterJson: string;
     try {
       const definitionRead = await this.readCancellable(
-        resolveAgentDefinition(runtime, parentWorkspacePath, agentId, { projectPluginsTrusted }),
+        resolveAgentDefinition(runtime, parentWorkspacePath, agentId, {
+          projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
+        }),
         signal
       );
       if (definitionRead.kind !== "ok") return Err(progress.interruptedError());
@@ -6924,6 +4770,7 @@ export class TaskService implements AgentTaskIntegration {
             workspacePath: parentWorkspacePath,
             workspaceId: parentWorkspaceId,
             projectPluginsTrusted,
+            runtimeFactory: nodeRuntimeFactory,
           },
         }),
         signal
@@ -7070,6 +4917,7 @@ export class TaskService implements AgentTaskIntegration {
         const definitionNowRead = await this.readCancellable(
           resolveAgentDefinition(plan.runtime, plan.parentWorkspacePath, plan.agentId, {
             projectPluginsTrusted: isWorkspaceProjectTrustedIn(cfg.projects, parentMetaNow.data),
+            runtimeFactory: nodeRuntimeFactory,
           }),
           signal
         );
@@ -7260,7 +5108,7 @@ export class TaskService implements AgentTaskIntegration {
       // The first fence write that rejected; thrown once every plan was handled (#5028).
       let fenceFailure: { error: unknown } | undefined;
       for (const plan of plans) {
-        const ownedAttempt = this.ownedAttemptByTaskId.get(plan.taskId);
+        const ownedAttempt = this.attemptLedger.ownedAttempt(plan.taskId);
         let transitioned = canceledInsideCommit;
         let superseded = false;
         if (!canceledInsideCommit) {
@@ -7284,7 +5132,7 @@ export class TaskService implements AgentTaskIntegration {
           } catch (error: unknown) {
             // Nothing launches this row now (#5028), unless the row already moved on (another
             // writer's attempt, whose waiters this cancel must not touch).
-            if (!rowMoved) this.armWaitersOfUnendedTask(plan.taskId);
+            if (!rowMoved) this.waiters.armWaitersOfUnendedTask(plan.taskId);
             fenceFailure ??= { error };
             continue;
           }
@@ -7299,7 +5147,7 @@ export class TaskService implements AgentTaskIntegration {
           this.rejectWaiters(plan.taskId, new Error(TASK_RESERVATION_CANCELED_MESSAGE));
         }
         // Canceled before any launch was scheduled: nothing ran under the attempt.
-        await this.persistOwnedAttemptSettlement(
+        await this.attemptLedger.persistOwnedAttemptSettlement(
           plan.taskId,
           ownedAttempt,
           "reservation-canceled",
@@ -7454,10 +5302,10 @@ export class TaskService implements AgentTaskIntegration {
   private closeReservedAttempts(plans: readonly TaskLaunchPlan[], source: string): void {
     for (const plan of plans) {
       if (plan.attemptId == null) continue;
-      this.closeAttemptAdmissionUnlessOtherClosed(
+      this.attemptLedger.closeAttemptAdmissionUnlessOtherClosed(
         plan.taskId,
         plan.attemptId,
-        this.ownedAttemptByTaskId.get(plan.taskId),
+        this.attemptLedger.ownedAttempt(plan.taskId),
         source
       );
     }
@@ -7527,13 +5375,13 @@ export class TaskService implements AgentTaskIntegration {
             error: fenceError,
           });
           // Nothing launches this row now (#5028), unless it already moved on (see above).
-          if (!rowMoved) this.armWaitersOfUnendedTask(plan.taskId);
+          if (!rowMoved) this.waiters.armWaitersOfUnendedTask(plan.taskId);
           continue;
         }
       }
       // The pre-launch path failed before scheduling: nothing ran under the attempt. A row the
       // failed commit never wrote gets no receipt (readSettlementReceiptRow: elsewhere).
-      await this.persistOwnedAttemptSettlement(
+      await this.attemptLedger.persistOwnedAttemptSettlement(
         plan.taskId,
         ownedAttempts.get(plan.taskId),
         signal?.aborted ? "reservation-canceled" : "reservation-failed",
@@ -7586,7 +5434,7 @@ export class TaskService implements AgentTaskIntegration {
    * interrupt or delete them. Unowned tasks and pre-identity owners are never held back.
    */
   private ownedAttemptSuperseded(taskId: string, row: WorkspaceConfigEntry | undefined): boolean {
-    const owned = this.ownedAttemptByTaskId.get(taskId)?.attemptId;
+    const owned = this.attemptLedger.ownedAttempt(taskId)?.attemptId;
     return owned != null && row?.taskAttemptId !== owned;
   }
 
@@ -7722,7 +5570,7 @@ export class TaskService implements AgentTaskIntegration {
     let unpublished = false;
     if (
       expectedAttemptId != null &&
-      this.ownedAttemptByTaskId.get(taskId)?.attemptId === expectedAttemptId
+      this.attemptLedger.ownedAttempt(taskId)?.attemptId === expectedAttemptId
     ) {
       try {
         await this.config.editConfig((config) => {
@@ -7991,7 +5839,7 @@ export class TaskService implements AgentTaskIntegration {
     // The launch owner gives up: settle exactly the attempt it owned when it decided. The
     // closure is recorded inside the updater, against the fresh row's id, before the write is
     // awaited — no send can be admitted for that id from here on.
-    const ownedAttempt = this.ownedAttemptByTaskId.get(taskId);
+    const ownedAttempt = this.attemptLedger.ownedAttempt(taskId);
     let transitionedToInterrupted = false;
     let superseded = false;
     let parentWorkspaceId: string | undefined;
@@ -8023,10 +5871,10 @@ export class TaskService implements AgentTaskIntegration {
       // unknown when the updater never ran. But a waiter that attached while the task was
       // queued/starting arms its timeout only on the move to running, which this failed launch
       // never makes; arm it now (and for later waiters) so they settle at their timeout.
-      this.armWaitersOfUnendedTask(taskId);
+      this.waiters.armWaitersOfUnendedTask(taskId);
       throw error;
     }
-    this.unpersistedLaunchFailureTaskIds.delete(taskId);
+    this.waiters.clearUnpersistedLaunchFailure(taskId);
     if (superseded) {
       log.info("Task launch failure not recorded: the record was re-admitted by another writer", {
         taskId,
@@ -8050,7 +5898,7 @@ export class TaskService implements AgentTaskIntegration {
     // registered meanwhile must not be rejected as this attempt's.
     this.rejectWaiters(taskId, new Error(message));
     if (neverSent) {
-      await this.persistOwnedAttemptSettlement(
+      await this.attemptLedger.persistOwnedAttemptSettlement(
         taskId,
         ownedAttempt,
         "launch-failed",
@@ -8115,7 +5963,7 @@ export class TaskService implements AgentTaskIntegration {
     // "queued", so a deferred launch hands its record back or it is stranded; the latch release
     // rechecks the queue. Only a still-reserved record is reverted — a status written meanwhile
     // (an explicit Stop's "interrupted") stays as is and is never relaunched.
-    if (this.deferLaunchWhileStopInProgress(plan.taskId, plan.parentWorkspaceId)) {
+    if (this.taskStopLatch.deferLaunchWhileStopInProgress(plan.taskId, plan.parentWorkspaceId)) {
       log.debug("startReservedAgentTask deferred: a stop is in progress", { taskId: plan.taskId });
       try {
         await this.editActiveWorkspaceEntry(
@@ -8134,7 +5982,7 @@ export class TaskService implements AgentTaskIntegration {
       await this.emitWorkspaceMetadata(plan.taskId);
       // The release-time drain may have seen "starting" while this rollback was awaiting disk.
       // Complete the handoff after publishing "queued", or leave the next release owning it.
-      if (!this.deferLaunchWhileStopInProgress(plan.taskId, plan.parentWorkspaceId)) {
+      if (!this.taskStopLatch.deferLaunchWhileStopInProgress(plan.taskId, plan.parentWorkspaceId)) {
         this.scheduleMaybeStartQueuedTasks();
       }
       return;
@@ -8178,10 +6026,10 @@ export class TaskService implements AgentTaskIntegration {
       launchAttemptId =
         findWorkspaceEntry(this.config.loadConfigOrDefault(), plan.taskId)?.workspace
           .taskAttemptId ?? stamped;
-      this.publishAttemptRotation(plan.taskId, launchAttemptId);
+      this.attemptLedger.publishAttemptRotation(plan.taskId, launchAttemptId);
     }
     plan.attemptId = launchAttemptId;
-    if (this.ownedAttemptByTaskId.get(plan.taskId)?.attemptId !== launchAttemptId) {
+    if (this.attemptLedger.ownedAttempt(plan.taskId)?.attemptId !== launchAttemptId) {
       this.beginOwnedTaskAttempt(plan.taskId, "launch", {
         attemptId: launchAttemptId,
         receiptEligible: launchReceiptEligible,
@@ -8802,6 +6650,7 @@ export class TaskService implements AgentTaskIntegration {
       try {
         const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
           projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
         });
 
         const runnableIds = (
@@ -8815,6 +6664,7 @@ export class TaskService implements AgentTaskIntegration {
                   {
                     skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
                     projectPluginsTrusted,
+                    runtimeFactory: nodeRuntimeFactory,
                   }
                 );
                 if (
@@ -8850,6 +6700,7 @@ export class TaskService implements AgentTaskIntegration {
     try {
       const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId, {
         projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
         const hint = await getRunnableHint();
@@ -8902,6 +6753,7 @@ export class TaskService implements AgentTaskIntegration {
           workspacePath: parentWorkspacePath,
           workspaceId: parentWorkspaceId,
           projectPluginsTrusted,
+          runtimeFactory: nodeRuntimeFactory,
         },
       }));
     } catch (error) {
@@ -9099,7 +6951,7 @@ export class TaskService implements AgentTaskIntegration {
       // work is that writer's and must not be sampled as ours.
       const liveUnderLaunchAttempt = (): boolean => {
         const activeTurn = this.workspaceService.getActiveTurnGeneration(taskId);
-        for (const send of this.admittedSendsByTaskId.get(taskId) ?? []) {
+        for (const send of this.attemptLedger.sendsOf(taskId)) {
           if (send.attemptId !== attemptId) continue;
           if (send.state === "pending" || send.state === "enqueued") return true;
           if (send.state === "admitted" && send.turnId != null && send.turnId === activeTurn) {
@@ -9165,18 +7017,21 @@ export class TaskService implements AgentTaskIntegration {
         ? this.workspaceService.getActiveTurnGeneration(taskId) != null ||
           this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId) != null ||
           this.aiService.isStreaming(taskId) ||
-          this.hasPendingAdmissions(taskId)
+          this.attemptLedger.hasPendingAdmissions(taskId)
         : liveUnderLaunchAttempt();
       if (rowStillOurs && liveExecution) {
-        this.beginWorkspaceStop(taskId);
-        this.markWorkspaceStopPersisted(taskId);
+        this.taskStopLatch.beginWorkspaceStop(taskId);
+        this.taskStopLatch.markWorkspaceStopPersisted(taskId);
         await this.runWorkspaceStopCleanup([taskId], {
           label: "TaskService.create launch failure",
           abandonPartial: true,
           clearQueue: true,
         });
-        await this.waitForAttemptClosureToSettle(taskId, ATTEMPT_CLOSURE_SETTLE_WAIT_MS);
-        if (this.workspaceStopRecords.has(taskId)) {
+        await this.attemptLedger.waitForAttemptClosureToSettle(
+          taskId,
+          ATTEMPT_CLOSURE_SETTLE_WAIT_MS
+        );
+        if (this.taskStopLatch.hasStopRecord(taskId)) {
           log.warn("Task.create launch failure: the failed launch's attempt is still live", {
             taskId,
             message,
@@ -9188,7 +7043,7 @@ export class TaskService implements AgentTaskIntegration {
         if (launchSendAdmitted) {
           this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
         } else {
-          await this.persistOwnedAttemptSettlement(
+          await this.attemptLedger.persistOwnedAttemptSettlement(
             taskId,
             launchAttempt,
             "launch-failed",
@@ -9744,7 +7599,7 @@ export class TaskService implements AgentTaskIntegration {
       // A manual resume (reawakenInterruptedTask, which holds neither the event nor the tree
       // lock) may have published and started its own attempt since the caller found the child
       // inactive: rotating it would supersede that live turn and drop its report.
-      if (this.hasLiveReawakening(taskId)) {
+      if (this.attemptLedger.hasLiveReawakening(taskId)) {
         return Err({
           code: "send_failed" as const,
           message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE,
@@ -9802,7 +7657,7 @@ export class TaskService implements AgentTaskIntegration {
           message: "Sub-agent reactivation refused: its attempt changed concurrently; retry.",
         });
       }
-      this.publishAttemptRotation(taskId, reactivationAttemptId);
+      this.attemptLedger.publishAttemptRotation(taskId, reactivationAttemptId);
       if (!committedProven) {
         log.info("[task-attempt] reactivated attempt is not receipt-eligible", {
           taskId,
@@ -9815,7 +7670,7 @@ export class TaskService implements AgentTaskIntegration {
         receiptEligible: committedProven,
       });
       // Live until createWorkspaceTurn returns; its send's admission is the evidence after that.
-      this.reawakeningsInFlight.set(taskId, reactivationAttemptId);
+      this.attemptLedger.beginReawakening(taskId, reactivationAttemptId);
     }
     let execution: Awaited<ReturnType<WorkspaceTurnManager["createWorkspaceTurn"]>>;
     try {
@@ -9844,9 +7699,7 @@ export class TaskService implements AgentTaskIntegration {
           : {}),
       });
     } finally {
-      if (this.reawakeningsInFlight.get(taskId) === reactivationAttemptId) {
-        this.reawakeningsInFlight.delete(taskId);
-      }
+      this.attemptLedger.endReawakening(taskId, reactivationAttemptId);
     }
     if (!execution.success) {
       // The fresh attempt is already published (config and memory) and stays: it reads as an
@@ -9922,6 +7775,7 @@ export class TaskService implements AgentTaskIntegration {
         workspacePath: context.workspacePath,
         workspaceId: taskId,
         projectPluginsTrusted: context.projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       },
       { abortSignal: AbortSignal.timeout(REAWAKEN_DEFINITION_READ_TIMEOUT_MS) }
     );
@@ -10011,7 +7865,19 @@ export class TaskService implements AgentTaskIntegration {
   ): Promise<Result<SendAgentTaskMessageResult, SendAgentTaskMessageError>> {
     // Before the first await: a Stop of the child or any ancestor (the sender's included) that
     // lands while this send is suspended overtakes a reawakening it decides on.
-    const stopFence = this.captureReawakeningStopFence(taskId);
+    const stopFence = resolveDescendantMessageStopFence(
+      options,
+      this.captureReawakeningStopFence(taskId)
+    );
+    const deferral = {
+      ancestorWorkspaceId,
+      taskId,
+      trimmedMessage,
+      queueDispatchMode,
+      sender,
+      options,
+      stopFence,
+    };
     const messageLabel = options?.messageLabel ?? "Updated guidance from parent";
     // Keep the labeled message explicit in the child transcript so it cannot be confused
     // with the original brief, whoever the sender is.
@@ -10128,13 +7994,13 @@ export class TaskService implements AgentTaskIntegration {
           entry.workspace.archivedAt,
           entry.workspace.unarchivedAt
         );
-        if (
+        const inactive =
           !continuationActive &&
-          (entry.workspace.taskStatus === "reported" ||
-            entry.workspace.taskStatus === "interrupted" ||
-            legacyArchived) &&
-          !this.aiService.isStreaming(taskId)
-        ) {
+          isInactiveAgentTaskStatus(entry.workspace.taskStatus, legacyArchived);
+        if (this.deferDescendantMessage(deferral, inactive)) {
+          return Ok({ delivery: "queued" as const, queueDispatchMode });
+        }
+        if (inactive && !this.aiService.isStreaming(taskId)) {
           return this.reactivateInactiveAgentTask({
             ancestorWorkspaceId,
             taskId,
@@ -10271,6 +8137,88 @@ export class TaskService implements AgentTaskIntegration {
         return Ok(accepted ? { delivery: "accepted" } : { delivery: "queued", queueDispatchMode });
       })
     );
+  }
+
+  /**
+   * Send order (F54): while an earlier message to this task waits for the target to go idle, a new
+   * message queues behind it instead of overtaking it. Redeliveries are the chain itself.
+   */
+  private deferDescendantMessage(params: DeferredDescendantMessage, inactive: boolean): boolean {
+    if (
+      params.options?.redelivery == null &&
+      this.deferredDescendantMessagesByTask.has(params.taskId)
+    ) {
+      this.scheduleDeferredDescendantMessage(params);
+      return true;
+    }
+    return inactive && this.deferWhileTargetStreamsWithoutExecution(params);
+  }
+
+  /**
+   * F54: an inactive task's stream belongs to no task execution (for example the tail of one that
+   * just settled). A message queued into it would run as a plain turn that cannot report, message
+   * or spawn, so it waits until the target is idle, where it reawakens the task. After
+   * MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS waits it falls back to the live path.
+   */
+  private deferWhileTargetStreamsWithoutExecution(params: DeferredDescendantMessage): boolean {
+    if (!this.aiService.isStreaming(params.taskId)) return false;
+    const redelivery = params.options?.redelivery;
+    if (redelivery == null) {
+      this.scheduleDeferredDescendantMessage(params);
+      return true;
+    }
+    if (redelivery.attempt >= MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS) return false;
+    redelivery.deferAgain = true;
+    return true;
+  }
+
+  /**
+   * Redeliver a trusted descendant message once the target is idle (see the F54 note in
+   * dispatchTrustedDescendantMessage). Messages to one task chain in send order. The chain is the
+   * owner: tracked with terminal attention drains (tests await them) and failures are logged.
+   * Like the session queue it replaces for this case, the wait is in memory only.
+   */
+  private scheduleDeferredDescendantMessage(params: DeferredDescendantMessage): void {
+    const previous = this.deferredDescendantMessagesByTask.get(params.taskId);
+    const deliver = async () => {
+      // A message behind an earlier one tries at once when that one is done: the earlier one may
+      // have reawakened the task, whose live execution then takes this message as guidance.
+      let waitForIdle = previous == null;
+      await previous;
+      for (let attempt = 0; ; attempt++) {
+        if (waitForIdle) await this.workspaceService.waitForIdleAndNoQueuedMessages(params.taskId);
+        waitForIdle = true;
+        const redelivery = { stopFence: params.stopFence, attempt, deferAgain: false };
+        const result = await this.dispatchTrustedDescendantMessage(
+          params.ancestorWorkspaceId,
+          params.taskId,
+          params.trimmedMessage,
+          params.queueDispatchMode,
+          params.sender,
+          { ...params.options, redelivery }
+        );
+        if (redelivery.deferAgain) continue;
+        if (!result.success) {
+          log.warn("Deferred descendant message was not delivered", {
+            taskId: params.taskId,
+            error: result.error,
+          });
+        }
+        return;
+      }
+    };
+    const promise = deliver()
+      .catch((error: unknown) => {
+        log.warn("Deferred descendant message failed", { taskId: params.taskId, error });
+      })
+      .finally(() => {
+        this.terminalAttention.untrackDrain(promise);
+        if (this.deferredDescendantMessagesByTask.get(params.taskId) === promise) {
+          this.deferredDescendantMessagesByTask.delete(params.taskId);
+        }
+      });
+    this.deferredDescendantMessagesByTask.set(params.taskId, promise);
+    this.terminalAttention.trackDrain(promise);
   }
 
   private taskGuidanceSendOptions(
@@ -10666,8 +8614,7 @@ export class TaskService implements AgentTaskIntegration {
         // A retry leaves the parked list only here, under the target's admission lock: removed
         // earlier, it was counted nowhere while it waited for the lock, and a fresh send
         // admitted meanwhile could push the queue past its cap (see flushParkedPeerSends).
-        const parked = this.parkedPeerSendsByTarget.get(targetId);
-        if (parked?.[0] === spec) parked.shift();
+        this.peerSendParking.removeRetry(targetId, spec);
       }
       const cfg = this.config.loadConfigOrDefault();
       const targetEntry = findWorkspaceEntry(cfg, targetId);
@@ -10813,7 +8760,7 @@ export class TaskService implements AgentTaskIntegration {
         // settled again before this check (#5271).
         if (
           awaitedDelegatedTurn != null &&
-          (this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0) !==
+          this.peerSendParking.registrationEpoch(targetId) !==
             awaitedDelegatedTurn.registrationEpoch
         ) {
           return awaitDelegatedTurn;
@@ -11152,7 +9099,7 @@ export class TaskService implements AgentTaskIntegration {
         const delegatedRootRefusal = getDelegatedRootRefusal();
         if (delegatedRootRefusal != null) {
           if (delegatedRootRefusal === awaitDelegatedTurn) {
-            refusedAtRegistrationEpoch ??= this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0;
+            refusedAtRegistrationEpoch ??= this.peerSendParking.registrationEpoch(targetId);
           }
           admissionRefusal = delegatedRootRefusal;
           return true;
@@ -11277,13 +9224,13 @@ export class TaskService implements AgentTaskIntegration {
           return;
         }
         parkedThisAttempt = true;
-        this.parkPeerSend({
+        this.peerSendParking.parkPeerSend({
           ...spec,
           awaitedDelegatedTurn: {
             unrelatedConsent,
             tagGenerations,
             registrationEpoch:
-              refusedAtRegistrationEpoch ?? this.workspaceTurnRegistrationEpochs.get(targetId) ?? 0,
+              refusedAtRegistrationEpoch ?? this.peerSendParking.registrationEpoch(targetId),
             stopEpochs: new Map(capturedStopEpochs),
           },
         });
@@ -11305,7 +9252,7 @@ export class TaskService implements AgentTaskIntegration {
       if (
         firstAttempt &&
         !targetIsAgentTask &&
-        this.parkedPeerSendsByTarget.has(targetId) &&
+        this.peerSendParking.hasParked(targetId) &&
         this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId) == null
       ) {
         return waitForDelegatedTurn();
@@ -11450,7 +9397,7 @@ export class TaskService implements AgentTaskIntegration {
       // clean while statuses still read running); each latch drops once its owner settled and
       // cleanup finished.
       for (const id of taskIds) {
-        this.beginWorkspaceStop(id);
+        this.taskStopLatch.beginWorkspaceStop(id);
         latched.push(id);
       }
       const activeWorkspaceTurns = await this.getWorkspaceTurnManager().listAllWorkspaceTurns({
@@ -11462,7 +9409,7 @@ export class TaskService implements AgentTaskIntegration {
         if (!current) {
           // Removed since the subtree snapshot: no status is left to persist, but the latch
           // still waits for the captured owner and the planned cleanup (no absent-config bypass).
-          this.markWorkspaceStopPersisted(id);
+          this.taskStopLatch.markWorkspaceStopPersisted(id);
           continue;
         }
         const status = current.workspace.taskStatus ?? "running";
@@ -11471,7 +9418,7 @@ export class TaskService implements AgentTaskIntegration {
           ACTIVE_AGENT_TASK_STATUSES.has(status) || this.aiService.isStreaming(id);
         if (!executionActive && activeHandles.length === 0) {
           // Already terminal with nothing live: the persisted status is the stop marker.
-          this.markWorkspaceStopPersisted(id);
+          this.taskStopLatch.markWorkspaceStopPersisted(id);
           continue;
         }
         activeHandlesById.set(
@@ -11504,9 +9451,9 @@ export class TaskService implements AgentTaskIntegration {
           },
           { allowMissing: true }
         );
-        this.markWorkspaceStopPersisted(id);
+        this.taskStopLatch.markWorkspaceStopPersisted(id);
         if (parentWorkspaceId != null) {
-          await this.suppressTerminalAttention({
+          await this.terminalAttention.suppressTerminalAttention({
             ownerWorkspaceId: parentWorkspaceId,
             sourceKind: "agent_task",
             sourceId: id,
@@ -11559,7 +9506,7 @@ export class TaskService implements AgentTaskIntegration {
           });
           continue;
         }
-        await this.suppressTerminalAttention({
+        await this.terminalAttention.suppressTerminalAttention({
           ownerWorkspaceId: handle.ownerWorkspaceId,
           sourceKind: "workspace_turn",
           sourceId: handle.handleId,
@@ -11622,9 +9569,9 @@ export class TaskService implements AgentTaskIntegration {
 
       const terminationError = new Error("Task terminated");
       for (const id of toTerminate) {
-        this.beginWorkspaceStop(id);
+        this.taskStopLatch.beginWorkspaceStop(id);
         latched.push(id);
-        this.completedReportsByTaskId.delete(id);
+        this.waiters.deleteCompletedReport(id);
         this.rejectWaiters(id, terminationError);
         // Durable stop marker before removal: a workspace whose removal later fails or times out
         // must not read as a live running task once its latch settles. An entry already gone has
@@ -11636,7 +9583,7 @@ export class TaskService implements AgentTaskIntegration {
           },
           { allowMissing: true }
         );
-        this.markWorkspaceStopPersisted(id);
+        this.taskStopLatch.markWorkspaceStopPersisted(id);
       }
     } finally {
       // Phase B: every stop at once, bounded per child and in aggregate; a timed-out stop keeps
@@ -12069,7 +10016,7 @@ export class TaskService implements AgentTaskIntegration {
       // baseline and could wake a cousin or the root after Stop. Each latch holds until the
       // captured owner settles and the descendant's cleanup finishes (recheckWorkspaceStopRelease).
       for (const id of descendants) {
-        const record = this.beginWorkspaceStop(id);
+        const record = this.taskStopLatch.beginWorkspaceStop(id);
         latched.push(id);
         // Every latched descendant, a preserved completed report included (its continuation can
         // be executing): synchronously here, so the retirement withdraws an in-flight wake and
@@ -12109,14 +10056,14 @@ export class TaskService implements AgentTaskIntegration {
             // Missing descendants should still reject prompt waiters promptly so task_await does
             // not hang until timeout after a parent hard interrupt races with external cleanup.
             // There is no status left to persist; the owner conditions still apply.
-            this.markWorkspaceStopPersisted(id);
+            this.taskStopLatch.markWorkspaceStopPersisted(id);
             this.rejectWaiters(id, interruptionError);
             log.debug("terminateAllDescendantAgentTasks: descendant workspace missing", {
               taskId: id,
             });
             continue;
           }
-          this.markWorkspaceStopPersisted(id);
+          this.taskStopLatch.markWorkspaceStopPersisted(id);
 
           if (preservedCompletedDescendant) {
             // A reawakened completed child executes under a live workspace-turn handle while its
@@ -12263,142 +10210,42 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   isForegroundAwaiting(workspaceId: string): boolean {
-    const count = this.foregroundAwaitCountByWorkspaceId.get(workspaceId);
-    return typeof count === "number" && count > 0;
+    return this.waiters.isForegroundAwaiting(workspaceId);
   }
 
   startForegroundAwait(workspaceId: string): () => void {
-    assert(workspaceId.length > 0, "startForegroundAwait: workspaceId must be non-empty");
-
-    const current = this.foregroundAwaitCountByWorkspaceId.get(workspaceId) ?? 0;
-    assert(
-      Number.isInteger(current) && current >= 0,
-      "startForegroundAwait: expected non-negative integer counter"
-    );
-
-    this.foregroundAwaitCountByWorkspaceId.set(workspaceId, current + 1);
-
-    return () => {
-      const current = this.foregroundAwaitCountByWorkspaceId.get(workspaceId) ?? 0;
-      assert(
-        Number.isInteger(current) && current > 0,
-        "startForegroundAwait cleanup: expected positive integer counter"
-      );
-      if (current <= 1) {
-        this.foregroundAwaitCountByWorkspaceId.delete(workspaceId);
-      } else {
-        this.foregroundAwaitCountByWorkspaceId.set(workspaceId, current - 1);
-      }
-    };
+    return this.waiters.startForegroundAwait(workspaceId);
   }
 
   registerBackgroundableForegroundWaiter(
     workspaceId: string,
     waiter: BackgroundableForegroundWaiter
   ): void {
-    let set = this.backgroundableForegroundWaitersByWorkspaceId.get(workspaceId);
-    if (!set) {
-      set = new Set();
-      this.backgroundableForegroundWaitersByWorkspaceId.set(workspaceId, set);
-    }
-    set.add(waiter);
+    this.waiters.registerBackgroundableForegroundWaiter(workspaceId, waiter);
   }
 
   unregisterBackgroundableForegroundWaiter(
     workspaceId: string,
     waiter: BackgroundableForegroundWaiter
   ): void {
-    const set = this.backgroundableForegroundWaitersByWorkspaceId.get(workspaceId);
-    if (!set) return;
-    set.delete(waiter);
-    if (set.size === 0) {
-      this.backgroundableForegroundWaitersByWorkspaceId.delete(workspaceId);
-    }
+    this.waiters.unregisterBackgroundableForegroundWaiter(workspaceId, waiter);
   }
 
-  /**
-   * Reject all foreground task waiters for a workspace that opted into backgrounding
-   * when a new message is queued. Returns the number of waiters signaled.
-   * Safe to call repeatedly — already-cleaned-up waiters are skipped.
-   */
+  /** See TaskWaiters.backgroundForegroundWaitsForWorkspace. */
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number {
-    const set = this.backgroundableForegroundWaitersByWorkspaceId.get(workspaceId);
-    if (!set || set.size === 0) return 0;
-
-    const waiters = [...set];
-    let count = 0;
-    for (const waiter of waiters) {
-      try {
-        this.markTaskQueueBackgrounded(waiter.taskId);
-        // A foreground wait detached by a queued message becomes durably non-blocking:
-        // persist notify_on_terminal so future stream-ends and restarts do not re-force the
-        // await. The in-memory mark above covers the immediate next stream-end while this
-        // persistence settles. Tracked so handleStreamEnd can await it before reading config.
-        this.scheduleNotifyOnTerminalPersist(waiter.taskId, waiter.requestingWorkspaceId);
-        waiter.reject(new ForegroundWaitBackgroundedError());
-        count++;
-      } catch {
-        // waiter already resolved/rejected — ignore
-      }
-    }
-    return count;
+    return this.waiters.backgroundForegroundWaitsForWorkspace(workspaceId);
   }
 
-  /**
-   * Persist `notify_on_terminal` on a backgrounded handle (agent task config or
-   * workspace-turn record). Tracked per workspace so `handleStreamEnd` can await
-   * any in-flight persistence before it reads config to decide blocking work.
-   */
-  /**
-   * Durably mark a still-active task/handle as `notify_on_terminal`. Used when a foreground wait
-   * detaches because it exceeded its foreground wait budget (timeout) and the work continues in the
-   * background: like queued-message detachment, the work must not re-force the owner to await it.
-   * Awaited so callers (e.g. the task tool) can rely on the policy before returning pending results.
-   */
-  async markBackgroundWorkNotifyOnTerminal(
-    taskId: string,
-    ownerWorkspaceId: string
-  ): Promise<void> {
-    await this.persistNotifyOnTerminalPolicy(taskId, ownerWorkspaceId);
+  /** See TerminalAttentionNotifier.markBackgroundWorkNotifyOnTerminal (task tool calls it). */
+  markBackgroundWorkNotifyOnTerminal(taskId: string, ownerWorkspaceId: string): Promise<void> {
+    return this.terminalAttention.markBackgroundWorkNotifyOnTerminal(taskId, ownerWorkspaceId);
   }
 
   private scheduleNotifyOnTerminalPersist(
     taskId: string,
     ownerWorkspaceId: string | undefined
   ): void {
-    const promise = this.persistNotifyOnTerminalPolicy(taskId, ownerWorkspaceId)
-      .catch((error: unknown) => {
-        log.error("Failed to persist notify_on_terminal policy for backgrounded wait", {
-          taskId,
-          error,
-        });
-      })
-      .finally(() => {
-        this.pendingNotifyOnTerminalPersists.delete(promise);
-      });
-    this.pendingNotifyOnTerminalPersists.add(promise);
-  }
-
-  private async persistNotifyOnTerminalPolicy(
-    taskId: string,
-    ownerWorkspaceId: string | undefined
-  ): Promise<void> {
-    if (isWorkspaceTurnTaskId(taskId)) {
-      if (ownerWorkspaceId != null) {
-        await this.getWorkspaceTurnManager().markWorkspaceTurnBackgroundWorkNotifyOnTerminal(
-          taskId,
-          ownerWorkspaceId
-        );
-      }
-      return;
-    }
-    await this.config.editConfig((config) => {
-      const found = findWorkspaceEntry(config, taskId);
-      if (found != null && found.workspace.taskAttentionPolicy !== "notify_on_terminal") {
-        found.workspace.taskAttentionPolicy = "notify_on_terminal";
-      }
-      return config;
-    });
+    this.terminalAttention.scheduleNotifyOnTerminalPersist(taskId, ownerWorkspaceId);
   }
 
   /**
@@ -12529,7 +10376,7 @@ export class TaskService implements AgentTaskIntegration {
               continue;
             }
           }
-          if (this.queueWorkflowRunAttention(workspace.id, run.id)) {
+          if (this.workflowRunAttention.queueWorkflowRunAttention(workspace.id, run.id)) {
             queuedCount += 1;
           }
           queuedForWorkspace = true;
@@ -12568,38 +10415,13 @@ export class TaskService implements AgentTaskIntegration {
     if (!isTerminalWorkflowRunStatus(params.status)) {
       return;
     }
-    this.queueWorkflowRunAttention(params.ownerWorkspaceId, params.runId);
+    this.workflowRunAttention.queueWorkflowRunAttention(params.ownerWorkspaceId, params.runId);
     this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
   }
 
-  /**
-   * Level-triggered retry for outbox (sub-agent / workspace-turn) attention: pending records
-   * are the durable "wake owed" state, but unlike workflow runs they have no periodic
-   * re-derivation of their own, so a drain that failed transiently (for example an unreadable
-   * history for caller restrictions) would otherwise leave them stuck until restart. Startup
-   * and the sweep interval both re-poke their owners; drains are idempotent and no-op when
-   * nothing is deliverable.
-   */
-  private async schedulePendingTerminalAttentionOwnerDrains(): Promise<number> {
-    const ownerWorkspaceIds = await this.terminalAttentionStore.listPendingOwnerWorkspaceIds();
-    for (const ownerWorkspaceId of ownerWorkspaceIds) {
-      this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-    }
-    return ownerWorkspaceIds.length;
-  }
-
-  /** Returns true when the run was newly queued for this owner. */
-  private queueWorkflowRunAttention(ownerWorkspaceId: string, runId: string): boolean {
-    let runIds = this.pendingWorkflowRunAttention.get(ownerWorkspaceId);
-    if (runIds == null) {
-      runIds = new Set();
-      this.pendingWorkflowRunAttention.set(ownerWorkspaceId, runIds);
-    }
-    if (runIds.has(runId)) {
-      return false;
-    }
-    runIds.add(runId);
-    return true;
+  // Startup and the sweep call this; tests cast-call it. See the notifier for the why.
+  private schedulePendingTerminalAttentionOwnerDrains(): Promise<number> {
+    return this.terminalAttention.schedulePendingTerminalAttentionOwnerDrains();
   }
 
   /**
@@ -12613,13 +10435,7 @@ export class TaskService implements AgentTaskIntegration {
     return this.workspaceService.getWorkflowInvocationBoundaryMessageId(workspaceId, runId);
   }
 
-  /**
-   * Durable "this terminal generation needs no further wake" marker, keyed by the run's
-   * terminal updatedAt: a later resume produces a new generation and thereby re-arms
-   * attention without any reset bookkeeping. Write-once and best-effort by design: if the
-   * write fails or never happens, the next drain evaluation re-derives the same answer from
-   * run + history evidence and merely re-attempts the marker.
-   */
+  /** See WorkflowRunAttention.markWorkflowRunTerminalAttentionSettled. */
   async markWorkflowRunTerminalAttentionSettled(params: {
     ownerWorkspaceId: string;
     runId: string;
@@ -12627,163 +10443,15 @@ export class TaskService implements AgentTaskIntegration {
     runUpdatedAt: string;
     settledAs: "delivered" | "superseded";
   }): Promise<void> {
-    assert(
-      params.ownerWorkspaceId.length > 0,
-      "markWorkflowRunTerminalAttentionSettled requires ownerWorkspaceId"
-    );
-    assert(params.runId.length > 0, "markWorkflowRunTerminalAttentionSettled requires runId");
-    if (!isTerminalWorkflowRunStatus(params.status)) {
-      return;
-    }
-    const key = `${params.ownerWorkspaceId}\u0000${params.runId}`;
-    const previous = this.workflowRunSettlementByRun.get(key) ?? Promise.resolve();
-    const run = previous
-      .catch(() => undefined)
-      .then(() => this.settleWorkflowRunTerminalAttention(params));
-    const tracked = run
-      .then(
-        () => undefined,
-        () => undefined
-      )
-      .finally(() => {
-        if (this.workflowRunSettlementByRun.get(key) === tracked) {
-          this.workflowRunSettlementByRun.delete(key);
-        }
-      });
-    this.workflowRunSettlementByRun.set(key, tracked);
-    return await run;
+    return await this.workflowRunAttention.markWorkflowRunTerminalAttentionSettled(params);
   }
 
-  private async settleWorkflowRunTerminalAttention(params: {
-    ownerWorkspaceId: string;
-    runId: string;
-    status: WorkflowRunStatus;
-    runUpdatedAt: string;
-    settledAs: "delivered" | "superseded";
-  }): Promise<void> {
-    try {
-      // Downgrade compatibility: the previous build dedupes its startup re-derivation on the
-      // stable un-suffixed workflow_run id, so settling only the generation marker would let
-      // a downgraded build re-create a pending wake for a result the user already consumed.
-      // Stable-first ordering keeps the generation marker (this build's authority) retryable:
-      // if either write fails, the queue entry survives and the next drain re-settles both.
-      // The refresh (not write-once) matters: a stale previous-generation stable marker can
-      // survive its best-effort restart-time clear, and a downgraded build would read it as
-      // consumption of THIS generation's result. The recorded generation also gives the
-      // sweep's upgrade fallback exact evidence immune to wall-clock corrections.
-      await this.terminalAttentionStore.recordSettled(
-        {
-          ownerWorkspaceId: params.ownerWorkspaceId,
-          sourceKind: "workflow_run",
-          sourceId: params.runId,
-          generationId: params.runUpdatedAt,
-          terminalOutcome: terminalAttentionOutcome(params.status),
-          status: params.settledAs,
-        },
-        { wholeSourceRefresh: true }
-      );
-      await this.terminalAttentionStore.recordSettled({
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        sourceKind: "workflow_run",
-        sourceId: params.runId,
-        generationId: params.runUpdatedAt,
-        terminalOutcome: terminalAttentionOutcome(params.status),
-        status: params.settledAs,
-      });
-    } catch (error: unknown) {
-      // Contain marker I/O here so no caller fails on bookkeeping: workflow_resume and
-      // task_await must still return the run's durable result, and the drain must move on to
-      // its other candidates. Keep the queue entry so the next drain re-evaluates from run +
-      // history evidence and re-attempts the marker; at worst a truthful wake re-delivers.
-      log.warn("Failed to record workflow terminal settlement marker", {
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        runId: params.runId,
-        settledAs: params.settledAs,
-        error,
-      });
-      return;
-    }
-    // Post-write revalidation: a wake-turn workflow_resume can restart the run while this
-    // settlement's snapshot was in flight, so the restart-time stable clear can land BEFORE
-    // the stable write above re-creates the marker. That marker postdates the newer
-    // generation's updatedAt, so the sweep's upgrade fallback (and a downgraded build's
-    // whole-run dedupe) would permanently suppress the newer result, and the by-run-id queue
-    // delete below would drop its owed wake. Reading the run AFTER the writes closes the
-    // write-side race: any restart after this read re-clears the stable marker itself and
-    // its terminal callback re-queues behind this deletion.
-    let currentRunUpdatedAt: string | null;
-    try {
-      const runStore = new WorkflowRunStore({
-        sessionDir: path.join(this.config.sessionsDir, params.ownerWorkspaceId),
-      });
-      currentRunUpdatedAt = (await runStore.getRun(params.runId)).updatedAt;
-    } catch {
-      currentRunUpdatedAt = null;
-    }
-    if (currentRunUpdatedAt !== params.runUpdatedAt) {
-      // The settled snapshot is no longer the run's newest generation (or the run is
-      // unreadable): the stable whole-run marker must not outlive the snapshot. The
-      // generation marker stays; it truthfully settles only this snapshot.
-      await this.clearWorkflowRunDowngradeSettlement({
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        runId: params.runId,
-      });
-      if (currentRunUpdatedAt != null) {
-        // The queue entry now represents the newer generation's owed wake: leave it for the
-        // drain the terminal callback scheduled (the sweep backstops a lost poke).
-        return;
-      }
-      // Unreadable run: fall through to the delete. With no stable marker surviving, the
-      // sweep re-derives any owed newer generation from durable state.
-    }
-    this.pendingWorkflowRunAttention.get(params.ownerWorkspaceId)?.delete(params.runId);
-  }
-
-  /**
-   * Downgrade-compat bookkeeping only: settlement dual-writes a stable un-suffixed marker for
-   * the previous build's whole-run dedupe (see markWorkflowRunTerminalAttentionSettled), and a
-   * restarted run invalidates it. Without this delete, downgrading after a resume would leave
-   * the old build refusing to enqueue the run's newer result behind the stale stable marker.
-   * This build reads the stable marker only as recency-gated upgrade evidence behind
-   * generation markers (see sweepWorkflowRunTerminalAttention), so the delete stays
-   * best-effort and must never fail the status transition.
-   */
+  /** See WorkflowRunAttention.clearWorkflowRunDowngradeSettlement. */
   async clearWorkflowRunDowngradeSettlement(params: {
     ownerWorkspaceId: string;
     runId: string;
   }): Promise<void> {
-    assert(
-      params.ownerWorkspaceId.length > 0,
-      "clearWorkflowRunDowngradeSettlement requires ownerWorkspaceId"
-    );
-    assert(params.runId.length > 0, "clearWorkflowRunDowngradeSettlement requires runId");
-    try {
-      await this.terminalAttentionStore.delete(
-        params.ownerWorkspaceId,
-        TerminalAttentionStore.notificationId("workflow_run", params.runId)
-      );
-    } catch (error: unknown) {
-      log.warn("Failed to clear stale workflow downgrade settlement marker", {
-        ownerWorkspaceId: params.ownerWorkspaceId,
-        runId: params.runId,
-        error,
-      });
-    }
-  }
-
-  private async suppressTerminalAttention(params: {
-    ownerWorkspaceId: string;
-    sourceKind: TerminalAttentionNotification["sourceKind"];
-    sourceId: string;
-  }): Promise<void> {
-    await this.terminalAttentionStore.enqueueIfAbsent({
-      ...params,
-      terminalOutcome: "interrupted",
-    });
-    await this.terminalAttentionStore.markSuperseded(
-      params.ownerWorkspaceId,
-      TerminalAttentionStore.notificationId(params.sourceKind, params.sourceId)
-    );
+    return await this.workflowRunAttention.clearWorkflowRunDowngradeSettlement(params);
   }
 
   private async getAgentTerminalAttentionGenerationId(
@@ -12797,47 +10465,15 @@ export class TaskService implements AgentTaskIntegration {
     return execution?.record.handleId;
   }
 
-  async enqueueTerminalAttention(params: {
-    ownerWorkspaceId: string;
-    sourceKind: TerminalAttentionNotification["sourceKind"];
-    terminalOutcome: TerminalAttentionOutcome;
-    sourceId: string;
-    generationId?: string;
-  }): Promise<void> {
-    const created = await this.terminalAttentionStore.enqueueIfAbsent(params);
-    if (created == null) {
-      return;
-    }
-    const liveTurn = this.aiService.isStreaming(created.ownerWorkspaceId)
-      ? this.workspaceService.getActiveTurnGeneration(created.ownerWorkspaceId)
-      : undefined;
-    if (created.sourceKind === "agent_task" && liveTurn != null) {
-      let fresh = this.freshSubagentAttentionTurnByOwner.get(created.ownerWorkspaceId);
-      if (fresh == null) {
-        fresh = new Map();
-        this.freshSubagentAttentionTurnByOwner.set(created.ownerWorkspaceId, fresh);
-      }
-      fresh.set(created.id, liveTurn);
-    }
-    this.scheduleTerminalAttentionDrain(params.ownerWorkspaceId);
+  // Spied on in tests, and called through TaskHost (taskWorkspaceSeam): stays a facade.
+  enqueueTerminalAttention(
+    params: Parameters<TerminalAttentionNotifier["enqueueTerminalAttention"]>[0]
+  ): Promise<void> {
+    return this.terminalAttention.enqueueTerminalAttention(params);
   }
 
   scheduleTerminalAttentionDrain(ownerWorkspaceId: string): void {
-    const previous = this.pendingTerminalAttentionDrainsByOwner.get(ownerWorkspaceId);
-    const promise = (previous ?? Promise.resolve())
-      .catch(() => undefined)
-      .then(() => this.drainTerminalAttention(ownerWorkspaceId))
-      .catch((error: unknown) => {
-        log.error("Terminal attention drain failed", { ownerWorkspaceId, error });
-      })
-      .finally(() => {
-        this.pendingTerminalAttentionDrains.delete(promise);
-        if (this.pendingTerminalAttentionDrainsByOwner.get(ownerWorkspaceId) === promise) {
-          this.pendingTerminalAttentionDrainsByOwner.delete(ownerWorkspaceId);
-        }
-      });
-    this.pendingTerminalAttentionDrainsByOwner.set(ownerWorkspaceId, promise);
-    this.pendingTerminalAttentionDrains.add(promise);
+    this.terminalAttention.scheduleTerminalAttentionDrain(ownerWorkspaceId);
   }
 
   /**
@@ -12956,34 +10592,6 @@ export class TaskService implements AgentTaskIntegration {
     return { ...state.restrictions, ...withToolPolicy(state.trace.policy), ...state.pin };
   }
 
-  private scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId: string): void {
-    // One idle wait per owner: each wait subscribes to the owner session's chat-event, and every
-    // report deferred by a busy owner lands here. The drain it schedules reads every pending
-    // notification from the store, so one wait delivers all of them, in store order.
-    if (this.pendingTerminalAttentionIdleWaitsByOwner.has(ownerWorkspaceId)) return;
-    const promise = this.workspaceService
-      .waitForIdleAndNoQueuedMessages(ownerWorkspaceId)
-      .catch((error: unknown) => {
-        log.debug("Terminal attention idle wait failed; retrying drain anyway", {
-          ownerWorkspaceId,
-          error,
-        });
-      })
-      .then(() => {
-        // Release the slot before scheduling: that drain can find the owner busy again and must
-        // be able to install the next idle wait.
-        if (this.pendingTerminalAttentionIdleWaitsByOwner.get(ownerWorkspaceId) === promise) {
-          this.pendingTerminalAttentionIdleWaitsByOwner.delete(ownerWorkspaceId);
-        }
-        this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-      })
-      .finally(() => {
-        this.pendingTerminalAttentionDrains.delete(promise);
-      });
-    this.pendingTerminalAttentionIdleWaitsByOwner.set(ownerWorkspaceId, promise);
-    this.pendingTerminalAttentionDrains.add(promise);
-  }
-
   /**
    * A withdrawn correlated continuation settles nothing itself, but its turn's stream end may have
    * deferred to it (#5261). Once the target is idle the stale-turn sweep decides from live state;
@@ -13020,9 +10628,9 @@ export class TaskService implements AgentTaskIntegration {
         log.warn("Withdrawn workspace-turn continuation reconcile failed", { targetId, error });
       })
       .finally(() => {
-        this.pendingTerminalAttentionDrains.delete(promise);
+        this.terminalAttention.untrackDrain(promise);
       });
-    this.pendingTerminalAttentionDrains.add(promise);
+    this.terminalAttention.trackDrain(promise);
   }
 
   /**
@@ -13475,25 +11083,6 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Back the given terminal-wake send batches off until the sweep cadence retries them and
-   * re-poke the drain so the remaining batches get their send this cycle instead of starving
-   * behind the failed one.
-   */
-  private backOffTerminalWakeSends(ownerWorkspaceId: string, keys: readonly string[]): void {
-    assert(keys.length > 0, "backOffTerminalWakeSends requires keys");
-    let ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
-    if (ownerBackoff == null) {
-      ownerBackoff = new Map();
-      this.workflowWakeGroupSendBackoffUntilMs.set(ownerWorkspaceId, ownerBackoff);
-    }
-    const retryAt = Date.now() + WORKFLOW_TERMINAL_ATTENTION_SWEEP_INTERVAL_MS;
-    for (const key of keys) {
-      ownerBackoff.set(key, retryAt);
-    }
-    this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-  }
-
-  /**
    * A sub-agent report or failure that lands while its owner is mid-turn is already a durable row
    * in the owner's history, but the terminal drain defers until idle and the running turn's model
    * only sees its in-memory messages. A parent blocked in a long task_await on OTHER tasks (or any
@@ -13604,9 +11193,7 @@ export class TaskService implements AgentTaskIntegration {
   private async drainTerminalAttention(ownerWorkspaceId: string): Promise<void> {
     // Every drain consumes the fresh edges, whichever branch it takes: an idle drain delivers them
     // itself, and a busy drain may cut the live turn for them exactly once.
-    const freshSubagentAttentionTurns =
-      this.freshSubagentAttentionTurnByOwner.get(ownerWorkspaceId) ?? new Map<string, symbol>();
-    this.freshSubagentAttentionTurnByOwner.delete(ownerWorkspaceId);
+    const freshSubagentAttentionTurns = this.terminalAttention.takeFreshTurns(ownerWorkspaceId);
     const allPending = await this.terminalAttentionStore.listPending(ownerWorkspaceId);
     // Legacy pre-reconciler outbox records for workflow runs (no generation suffix) are dead
     // state now that workflow wakes are re-derived from run records + settled markers: delete
@@ -13617,9 +11204,7 @@ export class TaskService implements AgentTaskIntegration {
       }
     }
     let pending = allPending.filter((notification) => notification.sourceKind !== "workflow_run");
-    const queuedWorkflowRunIds = Array.from(
-      this.pendingWorkflowRunAttention.get(ownerWorkspaceId) ?? []
-    );
+    const queuedWorkflowRunIds = this.workflowRunAttention.queuedRunIds(ownerWorkspaceId);
     if (pending.length === 0 && queuedWorkflowRunIds.length === 0) {
       return;
     }
@@ -13629,7 +11214,7 @@ export class TaskService implements AgentTaskIntegration {
     if (entry == null) {
       // Owner workspace no longer exists: the terminal artifacts remain retrievable elsewhere.
       // Queue only, no markers: a settled-marker write would recreate the deleted session dir.
-      this.pendingWorkflowRunAttention.delete(ownerWorkspaceId);
+      this.workflowRunAttention.dropOwner(ownerWorkspaceId);
       for (const notification of pending) {
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
       }
@@ -13639,7 +11224,7 @@ export class TaskService implements AgentTaskIntegration {
     if (isWorkspaceArchived(entry.workspace.archivedAt, entry.workspace.unarchivedAt)) {
       // Workflow wakes stay unsettled while archived: the sweep skips archived workspaces, so
       // dropping the queue parks them until an unarchive-time sweep re-derives the entries.
-      this.pendingWorkflowRunAttention.delete(ownerWorkspaceId);
+      this.workflowRunAttention.dropOwner(ownerWorkspaceId);
       for (const notification of pending) {
         await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, notification.id);
       }
@@ -13665,7 +11250,7 @@ export class TaskService implements AgentTaskIntegration {
         freshSubagentAttentionTurns
       );
       if (ownerHasBusyQueuedOrRetry && !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId)) {
-        this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+        this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
       }
       return;
     }
@@ -13748,7 +11333,7 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
       if (workflowPrompt.outcome === "drop") {
-        this.pendingWorkflowRunAttention.get(ownerWorkspaceId)?.delete(runId);
+        this.workflowRunAttention.dropRun(ownerWorkspaceId, runId);
         continue;
       }
       if (workflowPrompt.outcome === "settle") {
@@ -13788,21 +11373,10 @@ export class TaskService implements AgentTaskIntegration {
     // A backed-off non-workflow batch (its conversation-identity send was rejected) sits out
     // the drain entirely, staying pending for the sweep-cadence retry, so agent-bound groups
     // are not starved behind a send that fails the same way on every drain.
-    const nonWorkflowSendBackoffUntil = this.workflowWakeGroupSendBackoffUntilMs
-      .get(ownerWorkspaceId)
-      ?.get(NON_WORKFLOW_WAKE_BACKOFF_KEY);
-    let nonWorkflowSendBackedOff = false;
-    if (nonWorkflowSendBackoffUntil != null) {
-      if (nonWorkflowSendBackoffUntil > Date.now()) {
-        nonWorkflowSendBackedOff = true;
-      } else {
-        const ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
-        ownerBackoff?.delete(NON_WORKFLOW_WAKE_BACKOFF_KEY);
-        if (ownerBackoff?.size === 0) {
-          this.workflowWakeGroupSendBackoffUntilMs.delete(ownerWorkspaceId);
-        }
-      }
-    }
+    const nonWorkflowSendBackedOff = this.terminalAttention.isWakeSendBackedOff(
+      ownerWorkspaceId,
+      NON_WORKFLOW_WAKE_BACKOFF_KEY
+    );
     const hasNonWorkflowDeliverables =
       !nonWorkflowSendBackedOff &&
       (deliverableAgentNotificationIds.size > 0 || workspaceTurnCandidates.length > 0);
@@ -13892,20 +11466,12 @@ export class TaskService implements AgentTaskIntegration {
       );
       // Group keys embed \u0000, so the empty string safely keys the unpinned group.
       const backoffKey = groupKey ?? "";
-      const ownerBackoff = this.workflowWakeGroupSendBackoffUntilMs.get(ownerWorkspaceId);
-      const backoffUntil = ownerBackoff?.get(backoffKey);
-      if (backoffUntil != null) {
-        if (backoffUntil > Date.now()) {
-          // Recently rejected send: leave the group queued and give the next group its turn.
-          remainingWorkflowPrompts = remainingWorkflowPrompts.filter(
-            (candidate) => !groupCandidates.includes(candidate)
-          );
-          continue;
-        }
-        ownerBackoff?.delete(backoffKey);
-        if (ownerBackoff?.size === 0) {
-          this.workflowWakeGroupSendBackoffUntilMs.delete(ownerWorkspaceId);
-        }
+      if (this.terminalAttention.isWakeSendBackedOff(ownerWorkspaceId, backoffKey)) {
+        // Recently rejected send: leave the group queued and give the next group its turn.
+        remainingWorkflowPrompts = remainingWorkflowPrompts.filter(
+          (candidate) => !groupCandidates.includes(candidate)
+        );
+        continue;
       }
       // Resolve the send identity before the revalidation reread so the reread stays the last
       // await before dispatch: a history clear that completes during this history and
@@ -14077,12 +11643,14 @@ export class TaskService implements AgentTaskIntegration {
         // Same starvation shape as the prompt path: agent-bound groups were excluded by this
         // batch, so back it off and re-poke to let them send under their own launch identity.
         if (deliverableWorkflowPrompts.some((candidate) => candidate.initiatingAgent != null)) {
-          this.backOffTerminalWakeSends(ownerWorkspaceId, [NON_WORKFLOW_WAKE_BACKOFF_KEY]);
+          this.terminalAttention.backOffTerminalWakeSends(ownerWorkspaceId, [
+            NON_WORKFLOW_WAKE_BACKOFF_KEY,
+          ]);
         }
         return;
       }
       if (!resumeResult.data.started) {
-        this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+        this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
         return;
       }
       await markPendingDelivered();
@@ -14158,11 +11726,11 @@ export class TaskService implements AgentTaskIntegration {
             // Same wake as the primary send above (#4721).
             skipOnSendCompaction: true,
             onCanceled: () => {
-              this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+              this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
             },
             onAcceptedPreStreamFailure: async () => {
               await markPendingForRetry();
-              this.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+              this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
             },
             onAccepted: async () => {
               fallbackAccepted = true;
@@ -14195,7 +11763,7 @@ export class TaskService implements AgentTaskIntegration {
           backoffKeys.push(NON_WORKFLOW_WAKE_BACKOFF_KEY);
         }
         if (backoffKeys.length > 0) {
-          this.backOffTerminalWakeSends(ownerWorkspaceId, backoffKeys);
+          this.terminalAttention.backOffTerminalWakeSends(ownerWorkspaceId, backoffKeys);
         }
       }
       // Busy rejection: the owner started work between the idle check and the send; leave
@@ -14210,24 +11778,15 @@ export class TaskService implements AgentTaskIntegration {
     await markPendingDelivered();
   }
 
-  /**
-   * Background any registered foreground waits for the requesting workspace when a
-   * tool-end message is already queued. Shared by both wait-registration paths
-   * (workspace-turn and task await): the auto-backgrounding signal is edge-triggered
-   * on enqueue, so a message queued before the waiter registered must be re-checked
-   * here. No-op when backgrounding is disabled or no requesting workspace is set.
-   */
+  /** See TaskWaiters.backgroundForegroundWaitIfQueued. */
   backgroundForegroundWaitIfQueued(
     shouldBackgroundOnQueuedMessage: boolean,
     requestingWorkspaceId: string | undefined
   ): void {
-    if (
-      shouldBackgroundOnQueuedMessage &&
-      requestingWorkspaceId &&
-      this.workspaceService.hasQueuedMessages(requestingWorkspaceId, "tool-end")
-    ) {
-      this.backgroundForegroundWaitsForWorkspace(requestingWorkspaceId);
-    }
+    this.waiters.backgroundForegroundWaitIfQueued(
+      shouldBackgroundOnQueuedMessage,
+      requestingWorkspaceId
+    );
   }
 
   async reportAgentProgress(
@@ -14618,7 +12177,7 @@ export class TaskService implements AgentTaskIntegration {
       if (!entry?.workspace.parentWorkspaceId) {
         return { status: "not_active" as const };
       }
-      if (hasCompletedAgentReport(entry.workspace) || this.completedReportsByTaskId.has(taskId)) {
+      if (hasCompletedAgentReport(entry.workspace) || this.waiters.hasCompletedReport(taskId)) {
         return { status: "already_reported" as const };
       }
       if (entry.workspace.taskStatus === "interrupted" && !this.aiService.isStreaming(taskId)) {
@@ -14658,10 +12217,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!freshEntry?.workspace.parentWorkspaceId) {
       return "not_active";
     }
-    if (
-      hasCompletedAgentReport(freshEntry.workspace) ||
-      this.completedReportsByTaskId.has(taskId)
-    ) {
+    if (hasCompletedAgentReport(freshEntry.workspace) || this.waiters.hasCompletedReport(taskId)) {
       return "already_reported";
     }
     let finalizationAccepted = false;
@@ -14672,7 +12228,7 @@ export class TaskService implements AgentTaskIntegration {
         if (!entry?.workspace.parentWorkspaceId) {
           return;
         }
-        if (hasCompletedAgentReport(entry.workspace) || this.completedReportsByTaskId.has(taskId)) {
+        if (hasCompletedAgentReport(entry.workspace) || this.waiters.hasCompletedReport(taskId)) {
           return;
         }
         await this.editActiveWorkspaceEntry(
@@ -14765,7 +12321,7 @@ export class TaskService implements AgentTaskIntegration {
       if (!entry?.workspace.parentWorkspaceId) {
         return;
       }
-      if (hasCompletedAgentReport(entry.workspace) || this.completedReportsByTaskId.has(taskId)) {
+      if (hasCompletedAgentReport(entry.workspace) || this.waiters.hasCompletedReport(taskId)) {
         return;
       }
       try {
@@ -14812,7 +12368,7 @@ export class TaskService implements AgentTaskIntegration {
 
     // Report monotonicity invariant: check the in-memory cache before any status-based
     // interruption handling so a finalized report stays awaitable once observed.
-    const cached = this.completedReportsByTaskId.get(taskId);
+    const cached = this.waiters.getCompletedReport(taskId);
     if (cached) {
       return {
         reportMarkdown: cached.reportMarkdown,
@@ -14984,15 +12540,7 @@ export class TaskService implements AgentTaskIntegration {
               this.unregisterBackgroundableForegroundWaiter(entry.requestingWorkspaceId, entry);
             }
 
-            const current = this.pendingWaitersByTaskId.get(taskId);
-            if (current) {
-              const next = current.filter((w) => w !== entry);
-              if (next.length === 0) {
-                this.pendingWaitersByTaskId.delete(taskId);
-              } else {
-                this.pendingWaitersByTaskId.set(taskId, next);
-              }
-            }
+            this.waiters.removePendingWaiter(taskId, entry);
 
             cleanupStartWaiter();
 
@@ -15016,9 +12564,7 @@ export class TaskService implements AgentTaskIntegration {
           },
         };
 
-        const list = this.pendingWaitersByTaskId.get(taskId) ?? [];
-        list.push(entry);
-        this.pendingWaitersByTaskId.set(taskId, list);
+        this.waiters.addPendingWaiter(taskId, entry);
 
         const shouldBackgroundOnQueuedMessage = Boolean(
           requestingWorkspaceId && (options?.backgroundOnMessageQueued ?? true)
@@ -15043,22 +12589,12 @@ export class TaskService implements AgentTaskIntegration {
           const startWaiterEntry: PendingTaskStartWaiter = {
             start: startReportTimeout,
             cleanup: () => {
-              const currentStartWaiters = this.pendingStartWaitersByTaskId.get(taskId);
-              if (currentStartWaiters) {
-                const next = currentStartWaiters.filter((w) => w !== startWaiterEntry);
-                if (next.length === 0) {
-                  this.pendingStartWaitersByTaskId.delete(taskId);
-                } else {
-                  this.pendingStartWaitersByTaskId.set(taskId, next);
-                }
-              }
+              this.waiters.removePendingStartWaiter(taskId, startWaiterEntry);
             },
           };
           startWaiter = startWaiterEntry;
 
-          const currentStartWaiters = this.pendingStartWaitersByTaskId.get(taskId) ?? [];
-          currentStartWaiters.push(startWaiterEntry);
-          this.pendingStartWaitersByTaskId.set(taskId, currentStartWaiters);
+          this.waiters.addPendingStartWaiter(taskId, startWaiterEntry);
 
           // Close the race where the task starts between the initial config read and registering the waiter.
           // A launch whose failure could not be written never starts: arm the timeout now (#4747).
@@ -15067,7 +12603,7 @@ export class TaskService implements AgentTaskIntegration {
           if (
             (afterEntry?.workspace.taskStatus !== "queued" &&
               afterEntry?.workspace.taskStatus !== "starting") ||
-            this.unpersistedLaunchFailureTaskIds.has(taskId)
+            this.waiters.isLaunchFailureUnpersisted(taskId)
           ) {
             cleanupStartWaiter();
             startReportTimeout();
@@ -15565,6 +13101,8 @@ export class TaskService implements AgentTaskIntegration {
               namedWorkspacePath: workspacePath,
             }),
             projectRepos: getWorkspaceProjectRepos({
+              // Outside the agent loop: the host's runtimes.
+              runtimeFactory: nodeRuntimeFactory,
               workspaceId: taskId,
               workspaceName,
               workspacePath,
@@ -15933,7 +13471,7 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
 
-      const cached = this.completedReportsByTaskId.get(taskId);
+      const cached = this.waiters.getCompletedReport(taskId);
       if (hasAncestorWorkspaceId(cached, ancestorWorkspaceId)) {
         result.push(taskId);
         continue;
@@ -16034,7 +13572,7 @@ export class TaskService implements AgentTaskIntegration {
       return indexResult;
     }
 
-    const cached = this.completedReportsByTaskId.get(taskId);
+    const cached = this.waiters.getCompletedReport(taskId);
     if (hasWorkflowOwnedAncestorWorkspaceId(cached, ancestorWorkspaceId)) {
       return true;
     }
@@ -16099,7 +13637,7 @@ export class TaskService implements AgentTaskIntegration {
     // The task workspace may have been removed after it settled (cleanup/restart). Preserve scope
     // checks by consulting persisted report AND failure artifacts in the ancestor session dir —
     // a terminally-failed child must stay awaitable so its typed failure can be surfaced.
-    const cached = this.completedReportsByTaskId.get(taskId);
+    const cached = this.waiters.getCompletedReport(taskId);
     if (hasAncestorWorkspaceId(cached, ancestorWorkspaceId)) {
       return true;
     }
@@ -16966,7 +14504,7 @@ export class TaskService implements AgentTaskIntegration {
       const workflowOwned = next.workflowOwned || entry?.workflowTask != null;
       const nonBlockingSubtree =
         this.resolveAgentTaskAttentionPolicy(next.taskId, index) === "notify_on_terminal" ||
-        this.isTaskQueueBackgrounded(next.taskId);
+        this.waiters.isTaskQueueBackgrounded(next.taskId);
       if (
         !nonBlockingSubtree &&
         entry != null &&
@@ -17180,7 +14718,10 @@ export class TaskService implements AgentTaskIntegration {
         // Stop-cascade barrier (see startReservedAgentTask): a task whose own or parent's stop
         // latch is held is not even reserved; the latch release rechecks the queue.
         if (
-          this.deferLaunchWhileStopInProgress(taskId, coerceNonEmptyString(task.parentWorkspaceId))
+          this.taskStopLatch.deferLaunchWhileStopInProgress(
+            taskId,
+            coerceNonEmptyString(task.parentWorkspaceId)
+          )
         ) {
           continue;
         }
@@ -17298,6 +14839,7 @@ export class TaskService implements AgentTaskIntegration {
                 kind: parentEntry.workspace.kind,
                 projectPath: parentEntry.projectPath,
               }),
+              runtimeFactory: nodeRuntimeFactory,
             }
           );
           skipInitHook = frontmatter.subagent?.skip_init_hook === true;
@@ -17361,7 +14903,7 @@ export class TaskService implements AgentTaskIntegration {
             ) {
               return;
             }
-            const owned = this.ownedAttemptByTaskId.get(taskId);
+            const owned = this.attemptLedger.ownedAttempt(taskId);
             const attemptId =
               owned?.attemptId != null && owned.attemptId === workspace.taskAttemptId
                 ? owned.attemptId
@@ -17389,8 +14931,8 @@ export class TaskService implements AgentTaskIntegration {
           });
           continue;
         }
-        this.publishAttemptRotation(taskId, launch.attemptId);
-        if (this.ownedAttemptByTaskId.get(taskId)?.attemptId !== launch.attemptId) {
+        this.attemptLedger.publishAttemptRotation(taskId, launch.attemptId);
+        if (this.attemptLedger.ownedAttempt(taskId)?.attemptId !== launch.attemptId) {
           this.beginOwnedTaskAttempt(taskId, "launch", launch);
         }
         reservedSlots += 1;
@@ -17423,7 +14965,7 @@ export class TaskService implements AgentTaskIntegration {
           launchLease,
           // A reservation this process owns keeps its cancellation across the queue.
           ...(() => {
-            const abortSignal = this.ownedAttemptByTaskId.get(taskId)?.abortSignal;
+            const abortSignal = this.attemptLedger.ownedAttempt(taskId)?.abortSignal;
             return abortSignal != null ? { abortSignal } : {};
           })(),
         });
@@ -17490,51 +15032,26 @@ export class TaskService implements AgentTaskIntegration {
     await this.emitWorkspaceMetadata(workspaceId);
 
     if (status === "running") {
-      this.unpersistedLaunchFailureTaskIds.delete(workspaceId);
-      this.startPendingStartWaiters(workspaceId);
+      this.waiters.clearUnpersistedLaunchFailure(workspaceId);
+      this.waiters.startPendingStartWaiters(workspaceId);
     }
     return true;
   }
 
-  /**
-   * A write that would have ended a queued/starting task rejected, and nothing will move the row
-   * to running (#4747, #5028). Fail closed: waiters are not rejected with the unpersisted outcome,
-   * whose owner is unknown when the updater never ran. Their timeout is armed instead, now and for
-   * waiters that attach later, so they settle at their timeout.
-   */
-  private armWaitersOfUnendedTask(taskId: string): void {
-    this.unpersistedLaunchFailureTaskIds.add(taskId);
-    this.startPendingStartWaiters(taskId);
-  }
-
   noteWorkspaceRemoved(workspaceId: string): void {
-    this.unpersistedLaunchFailureTaskIds.delete(workspaceId);
+    this.waiters.clearUnpersistedLaunchFailure(workspaceId);
     // #5334: the stop generations otherwise grow with every workspace ever stopped. Dropping
     // them resets the generation to 0, which keeps the latch sound only because this runs after
     // the workspace left the config: peer-send admission rereads both endpoints from the config
     // and refuses a missing one, and a removed ancestor's descendants were removed before it.
     // Best-effort: a stop handled after this call, or a removal by another backend, can still
     // leave an entry behind.
-    this.workspaceStopEpochs.delete(workspaceId);
+    this.taskStopLatch.forgetStopEpoch(workspaceId);
     this.workspaceUserStopEpochs.delete(workspaceId);
     // Per-task goal arbitration history (bounded per task, but not across removed tasks).
     this.childGoalArbitratedStreams.delete(workspaceId);
     // Likewise the goal service's per-workspace stream-accounting receipts.
     this.workspaceGoalService?.forgetStreamAccountingReceipts(workspaceId);
-  }
-
-  /** Arms the report timeout of every waiter that attached while the task was queued/starting. */
-  private startPendingStartWaiters(workspaceId: string): void {
-    const waiters = this.pendingStartWaitersByTaskId.get(workspaceId);
-    if (!waiters || waiters.length === 0) return;
-    this.pendingStartWaitersByTaskId.delete(workspaceId);
-    for (const waiter of waiters) {
-      try {
-        waiter.start();
-      } catch (error: unknown) {
-        log.error("Task start waiter callback failed", { workspaceId, error });
-      }
-    }
   }
 
   /**
@@ -17561,7 +15078,7 @@ export class TaskService implements AgentTaskIntegration {
     // A user Stop refuses agent messages that were not admitted yet, including those waiting
     // for a delegated turn: their retry takes a new baseline for the target's stop epoch (see
     // sendTreeMessage), so drop them here rather than let them run after a resume.
-    if (this.parkedPeerSendsByTarget.delete(workspaceId)) {
+    if (this.peerSendParking.dropParked(workspaceId)) {
       log.debug("Dropped peer messages waiting for a delegated turn after a user stop", {
         workspaceId,
       });
@@ -17620,7 +15137,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!entryAtStart?.workspace.parentWorkspaceId) {
       return notApplicable;
     }
-    const settledPredecessor = this.attemptSettlementByTaskId.get(workspaceId);
+    const settledPredecessor = this.attemptLedger.attemptSettlement(workspaceId);
     // A parent continuation preserves `reported`; Stop then closes its attempt without changing
     // that status. Explicit manual recovery must rotate the settled identity, not reopen it.
     //
@@ -17635,7 +15152,7 @@ export class TaskService implements AgentTaskIntegration {
     // the same way — nothing in this process can own or settle an id it never had — so it gets
     // its first, unproven attempt here rather than running as an unfenced pre-identity send.
     const releasedReportedAttempt =
-      settledPredecessor == null && !this.ownedAttemptByTaskId.has(workspaceId);
+      settledPredecessor == null && !this.attemptLedger.hasOwnedAttempt(workspaceId);
     const resumeSettledReportedTask =
       entryAtStart.workspace.taskStatus === "reported" &&
       entryAtStart.workspace.taskDesktopOwnerWorkspaceId == null &&
@@ -17706,8 +15223,8 @@ export class TaskService implements AgentTaskIntegration {
         this.isWorkspaceStopInProgress(workspaceId) ||
         this.getWorkspaceStopEpoch(workspaceId) !== stopEpochAtStart ||
         (resumeSettledReportedTask &&
-          (this.attemptSettlementByTaskId.get(workspaceId) !== settledPredecessor ||
-            (releasedReportedAttempt && this.ownedAttemptByTaskId.has(workspaceId))))
+          (this.attemptLedger.attemptSettlement(workspaceId) !== settledPredecessor ||
+            (releasedReportedAttempt && this.attemptLedger.hasOwnedAttempt(workspaceId))))
       ) {
         log.debug("markInterruptedTaskRunning refused: overtaken by a stop", { workspaceId });
         return lost(SEND_ADMISSION_STALE_MESSAGE);
@@ -17716,7 +15233,7 @@ export class TaskService implements AgentTaskIntegration {
       // and runs, so the row alone reads resumable: rotating that live attempt would supersede the
       // continuation and drop its report. The user's send loses and
       // can retry; once the continuation streams, sends queue behind it instead of reaching here.
-      if (this.hasLiveReawakening(workspaceId)) {
+      if (this.attemptLedger.hasLiveReawakening(workspaceId)) {
         log.debug("markInterruptedTaskRunning refused: another reawakening is live", {
           workspaceId,
         });
@@ -17768,7 +15285,7 @@ export class TaskService implements AgentTaskIntegration {
         return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
       }
       // The row names a new attempt now: the earlier attempt's cached report is not its (#7003).
-      this.completedReportsByTaskId.delete(workspaceId);
+      this.waiters.deleteCompletedReport(workspaceId);
       // Writers outside this mutex (a reactivation under its own locks, another backend) may have
       // rotated the row again during the commit's own awaits: never publish or own an identity
       // the durable row no longer names — the successor's ownership and closures stay untouched.
@@ -17781,7 +15298,7 @@ export class TaskService implements AgentTaskIntegration {
         });
         return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
       }
-      this.publishAttemptRotation(workspaceId, attemptId);
+      this.attemptLedger.publishAttemptRotation(workspaceId, attemptId);
       if (!committedProven) {
         log.info("[task-attempt] reawakened attempt is not receipt-eligible", {
           workspaceId,
@@ -17794,15 +15311,13 @@ export class TaskService implements AgentTaskIntegration {
         receiptEligible: committedProven,
       });
       // Live until the caller's send binds to it (its admission is the evidence after that).
-      this.reawakeningsInFlight.set(workspaceId, attemptId);
+      this.attemptLedger.beginReawakening(workspaceId, attemptId);
     }
 
     try {
       await this.emitWorkspaceMetadata(workspaceId);
     } finally {
-      if (this.reawakeningsInFlight.get(workspaceId) === attemptId) {
-        this.reawakeningsInFlight.delete(workspaceId);
-      }
+      this.attemptLedger.endReawakening(workspaceId, attemptId);
     }
     return { kind: "reawakened", attemptId, statusChanged: !resumeSettledReportedTask };
   }
@@ -17828,7 +15343,7 @@ export class TaskService implements AgentTaskIntegration {
 
     // Captured before the awaited write: only the exact attempt the failed send was bound to,
     // and only while this process owns it, is ended here.
-    const ownedAttempt = this.ownedAttemptByTaskId.get(workspaceId);
+    const ownedAttempt = this.attemptLedger.ownedAttempt(workspaceId);
     let revertedToInterrupted = false;
     let revertedOwnedAttempt = false;
     let parentWorkspaceId: string | undefined;
@@ -17866,7 +15381,7 @@ export class TaskService implements AgentTaskIntegration {
       revertedOwnedAttempt &&
       expectedAttemptId != null &&
       ownedAttempt != null &&
-      this.ownedAttemptByTaskId.get(workspaceId) === ownedAttempt
+      this.attemptLedger.ownedAttempt(workspaceId) === ownedAttempt
     ) {
       this.closeAttemptAdmission(workspaceId, expectedAttemptId, ownedAttempt, "resume-failed");
       // Identity is what later checks compare; its attemptId was checked to be a string.
@@ -17879,42 +15394,11 @@ export class TaskService implements AgentTaskIntegration {
 
     this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
     if (closedAttempt != null) {
-      this.resumeFailureSettlementByTaskId.set(workspaceId, closedAttempt);
-      this.recheckResumeFailureSettlement(workspaceId);
+      this.attemptLedger.recordResumeFailureSettlement(workspaceId, closedAttempt);
+      this.attemptLedger.recheckResumeFailureSettlement(workspaceId);
     }
     if (revertedToInterrupted) await this.settleChildGoalPause(workspaceId);
     await this.emitWorkspaceMetadata(workspaceId);
-  }
-
-  /**
-   * Settle a failed reawaken's closed attempt (restoreInterruptedTaskAfterResumeFailure) once the
-   * shared no-report boundary holds (attemptCannotStillReport): never from the send's error alone.
-   * The failed send's obligation is typically disposed only after the rollback returned (a refused
-   * or no-work send), and an admitted preparation failure rolls back while its turn is still
-   * live, so this is rechecked on the rollback, on every obligation disposal and on every turn
-   * settlement. It drops out without settling when the attempt was superseded (a new owner) or
-   * settled by another producer (Stop), and defers to an in-progress Stop, whose release settles.
-   */
-  private recheckResumeFailureSettlement(taskId: string): void {
-    const attempt = this.resumeFailureSettlementByTaskId.get(taskId);
-    if (attempt == null) return;
-    const closure = this.attemptSettlementByTaskId.get(taskId);
-    if (
-      this.ownedAttemptByTaskId.get(taskId) !== attempt ||
-      closure?.attempt !== attempt ||
-      closure.phase !== "closing"
-    ) {
-      this.resumeFailureSettlementByTaskId.delete(taskId);
-      return;
-    }
-    if (this.workspaceStopRecords.has(taskId)) return;
-    if (!this.attemptCannotStillReport(taskId, attempt)) return;
-    this.resumeFailureSettlementByTaskId.delete(taskId);
-    this.persistOwnedAttemptSettlement(taskId, attempt, "idle-settled", "resume-failed").catch(
-      (error: unknown) => {
-        log.error("[task-attempt] failed reawaken settlement failed", { taskId, error });
-      }
-    );
   }
 
   private buildTaskCompletionRecoveryMessage(
@@ -18276,8 +15760,9 @@ export class TaskService implements AgentTaskIntegration {
 
     // Ensure any in-flight notify_on_terminal persistence (from a just-detached foreground wait)
     // has settled so the config we read below reflects the durable non-blocking policy.
-    if (this.pendingNotifyOnTerminalPersists.size > 0) {
-      await Promise.all([...this.pendingNotifyOnTerminalPersists]);
+    const notifyOnTerminalPersists = this.terminalAttention.inFlightNotifyOnTerminalPersists();
+    if (notifyOnTerminalPersists.length > 0) {
+      await Promise.all(notifyOnTerminalPersists);
     }
 
     // The owner's own stream ending is the signal to retry any terminal wake-ups that were deferred
@@ -18359,7 +15844,7 @@ export class TaskService implements AgentTaskIntegration {
         });
       let activeTaskIds = [...listBlockingDescendantTaskIds(), ...activeWorkspaceTurnIds];
       const queueBackgroundedTaskIds = new Set(
-        activeTaskIds.filter((id) => this.isTaskQueueBackgrounded(id))
+        activeTaskIds.filter((id) => this.waiters.isTaskQueueBackgrounded(id))
       );
       // Durable `notify_on_terminal` work is non-blocking: it never forces the parent to
       // task_await and is not consumed at stream-end. Agent-task policy is applied by
@@ -18620,9 +16105,9 @@ export class TaskService implements AgentTaskIntegration {
     // BEFORE the recovery/continuation sends below, so a user follow-up queued during the stream
     // still dispatches ahead of them, exactly as it did before the hold existed.
     if (reportArgs == null && !(isPlanLike && proposePlanResult) && status !== "interrupted") {
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         workspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           workspaceId,
           taskOrigin.ownedAttempt,
           taskOrigin.unownedAttemptId
@@ -18741,9 +16226,9 @@ export class TaskService implements AgentTaskIntegration {
         status,
         streamAttemptId,
         () =>
-          this.resolveStreamEndDecision(
+          this.streamEndLedger.resolveStreamEndDecision(
             workspaceId,
-            this.findPendingStreamEndDecision(
+            this.streamEndLedger.findPendingStreamEndDecision(
               workspaceId,
               taskOrigin.ownedAttempt,
               taskOrigin.unownedAttemptId
@@ -18789,9 +16274,9 @@ export class TaskService implements AgentTaskIntegration {
       // exec. Decide (and wake the held queue) before the handoff, as for any other non-report
       // end above: the kickoff's admission reads a still-pending decision for its attempt as
       // stale and would be refused, leaving the task running with no exec turn.
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         workspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           workspaceId,
           taskOrigin.ownedAttempt,
           taskOrigin.unownedAttemptId
@@ -18811,8 +16296,8 @@ export class TaskService implements AgentTaskIntegration {
       discardCutReceipt();
       return;
     }
-    if (await this.reconcileDeferredTaskStreamEnd(workspaceId)) return;
-    const pendingCut = this.deferredTaskStreamEnds.get(workspaceId);
+    if (await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId)) return;
+    const pendingCut = this.streamEndLedger.deferralOf(workspaceId);
     // A different turn can be admitted ahead of the designated continuation. Its incomplete
     // end does not withdraw that continuation or transfer the old cut's recovery obligation.
     if (pendingCut != null && pendingCut.sourceTurnGeneration !== queueCutSnapshot.turnGeneration) {
@@ -18840,7 +16325,7 @@ export class TaskService implements AgentTaskIntegration {
               expectedAttemptId: streamAttemptId,
             });
           }
-          this.deferredTaskStreamEnds.set(workspaceId, {
+          this.streamEndLedger.recordDeferral(workspaceId, {
             sourceMessageId: event.messageId,
             sourceTurnGeneration: receipt.sourceTurnGeneration,
             continuationEntryId,
@@ -18849,7 +16334,7 @@ export class TaskService implements AgentTaskIntegration {
             attemptId: streamAttemptId,
           });
           // The successor may have been withdrawn between the cut and this classification.
-          await this.reconcileDeferredTaskStreamEnd(workspaceId);
+          await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId);
           return;
         }
       }
@@ -18900,7 +16385,8 @@ export class TaskService implements AgentTaskIntegration {
     if (
       status !== "running" ||
       this.isChildGoalPauseOwed(workspaceId) ||
-      (streamAttemptId != null && !this.attemptAdmissionOpen(workspaceId, streamAttemptId))
+      (streamAttemptId != null &&
+        !this.attemptLedger.attemptAdmissionOpen(workspaceId, streamAttemptId))
     ) {
       return "none";
     }
@@ -19180,7 +16666,11 @@ export class TaskService implements AgentTaskIntegration {
       .withLock(workspaceId, async () => {
         const status = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId)?.workspace
           .taskStatus;
-        if (status !== "running" || !this.attemptAdmissionOpen(workspaceId, attemptId)) return;
+        if (
+          status !== "running" ||
+          !this.attemptLedger.attemptAdmissionOpen(workspaceId, attemptId)
+        )
+          return;
         if (
           this.aiService.isStreaming(workspaceId) ||
           this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId)
@@ -19310,7 +16800,7 @@ export class TaskService implements AgentTaskIntegration {
     return (
       workspace?.taskStatus === "running" &&
       workspace.taskGoalPauseOwed == null &&
-      this.attemptAdmissionOpen(workspaceId, attemptId)
+      this.attemptLedger.attemptAdmissionOpen(workspaceId, attemptId)
     );
   }
 
@@ -19434,58 +16924,6 @@ export class TaskService implements AgentTaskIntegration {
     });
   }
 
-  /**
-   * Settle a deferred cut from the recorded successor outcome. Runs under the task's
-   * workspaceEventLock (from handleStreamEnd, the queue-change listener, stream-abort and error
-   * handlers). Only `canceled`/`prestream-failed` (recover once) and `streaming` (transfer) settle
-   * it; `pending`/`admitted` keep waiting. A task whose execution or stop epoch moved on, or that
-   * left `running`, drops the deferral without recovery.
-   */
-  private async reconcileDeferredTaskStreamEnd(workspaceId: string): Promise<boolean> {
-    const deferral = this.deferredTaskStreamEnds.get(workspaceId);
-    if (deferral == null) return false;
-    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-    if (
-      entry?.workspace.parentWorkspaceId == null ||
-      entry.workspace.taskStatus !== "running" ||
-      rowSupersedes(entry.workspace, deferral.attemptId) ||
-      entry.workspace.taskExecutionId !== deferral.executionId ||
-      this.getWorkspaceStopEpoch(workspaceId) !== deferral.stopEpoch
-    ) {
-      this.deferredTaskStreamEnds.delete(workspaceId);
-      this.workspaceService.disposeQueueCut(workspaceId, deferral.continuationEntryId);
-      return false;
-    }
-    const receipt = this.workspaceService.getQueueCutReceipt(
-      workspaceId,
-      deferral.continuationEntryId
-    );
-    if (receipt == null || receipt.successor === "streaming") {
-      this.deferredTaskStreamEnds.delete(workspaceId);
-      return false;
-    }
-    if (receipt.successor !== "canceled" && receipt.successor !== "prestream-failed") {
-      return false;
-    }
-    this.deferredTaskStreamEnds.delete(workspaceId);
-    if (!this.workspaceService.disposeQueueCut(workspaceId, deferral.continuationEntryId)) {
-      return true;
-    }
-    log.debug("Deferred task stream end recovering: continuation withdrawn", {
-      workspaceId,
-      sourceMessageId: deferral.sourceMessageId,
-      continuationEntryId: deferral.continuationEntryId,
-      successor: receipt.successor,
-    });
-    // Recovery acts for the cut stream's attempt only (its writes and prompt are CAS'd on it).
-    await this.recoverTaskFromIncompleteStreamEnd(
-      workspaceId,
-      entry.workspace.taskStatus,
-      deferral.attemptId
-    );
-    return true;
-  }
-
   private async handleStreamAbort(
     event: StreamAbortEvent,
     /** Captured by the stream-abort listener in the event's own tick, before the lock wait. */
@@ -19497,7 +16935,7 @@ export class TaskService implements AgentTaskIntegration {
       this.bumpWorkspaceStopEpoch(event.workspaceId);
       this.clearTaskRecovery(event.workspaceId);
     } else {
-      await this.reconcileDeferredTaskStreamEnd(event.workspaceId);
+      await this.streamEndLedger.reconcileDeferredTaskStreamEnd(event.workspaceId);
     }
     // Settles a continuation handle (execution mirror) first. A reawakened child is ALSO
     // `running` in its stable status (markInterruptedTaskRunning), and the desktop ledger treats
@@ -19555,7 +16993,7 @@ export class TaskService implements AgentTaskIntegration {
         if (
           this.aiService.isStreaming(workspaceId) ||
           this.workspaceService.hasPendingQueuedOrPreparingTurn(workspaceId) ||
-          this.hasPendingAdmissions(workspaceId) ||
+          this.attemptLedger.hasPendingAdmissions(workspaceId) ||
           isActiveWorkspaceTurnTaskStatus(ws.taskExecutionStatus)
         ) {
           return;
@@ -19578,7 +17016,7 @@ export class TaskService implements AgentTaskIntegration {
     // process still owns the attempt it decided for: a send during the write may have begun a
     // new attempt (a user message reawakening the task), and entries queued behind that turn are
     // its input, not the stopped attempt's — clearing them would drop the user's message.
-    if (this.ownedAttemptByTaskId.get(workspaceId) === ownedAttempt) {
+    if (this.attemptLedger.ownedAttempt(workspaceId) === ownedAttempt) {
       this.workspaceService.clearQueue(workspaceId);
     }
     this.recordTaskInterrupted(workspaceId, parentWorkspaceId);
@@ -19586,7 +17024,7 @@ export class TaskService implements AgentTaskIntegration {
     // backend reawakening the now-interrupted task) must not be rejected as this attempt's.
     this.rejectWaiters(workspaceId, new Error("Task interrupted"));
     // Verified idle inside the edit (no stream, no pending turn, no execution mirror).
-    await this.persistOwnedAttemptSettlement(
+    await this.attemptLedger.persistOwnedAttemptSettlement(
       workspaceId,
       ownedAttempt,
       "idle-settled",
@@ -19728,7 +17166,7 @@ export class TaskService implements AgentTaskIntegration {
 
     // A startup error can wait behind the source handler until its continuation failure is
     // recorded. That disposition already requested recovery; do not spend the budget twice.
-    if (await this.reconcileDeferredTaskStreamEnd(workspaceId)) return;
+    if (await this.streamEndLedger.reconcileDeferredTaskStreamEnd(workspaceId)) return;
 
     if (status !== "awaiting_report") {
       // Retryable errors during `running` are handled by the agent session's
@@ -19795,7 +17233,7 @@ export class TaskService implements AgentTaskIntegration {
     // otherwise report publication may still be in flight (stream-end handling precedes turn
     // settlement), so a stop record captures the live work and the execution-settlement producer
     // settles the attempt when that record releases.
-    const ownedAttempt = this.ownedAttemptByTaskId.get(workspaceId);
+    const ownedAttempt = this.attemptLedger.ownedAttempt(workspaceId);
     // Close admission FIRST, synchronously with the decision: a send reaching the fence from here
     // on is refused, so the activity sample below is authoritative — every obligation or turn
     // admitted before it is visible to it and captured by the stop record, and none can be
@@ -19811,11 +17249,11 @@ export class TaskService implements AgentTaskIntegration {
       this.workspaceService.getActiveTurnGeneration(workspaceId) != null ||
       this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(workspaceId) != null ||
       this.aiService.isStreaming(workspaceId) ||
-      this.hasPendingAdmissions(workspaceId);
+      this.attemptLedger.hasPendingAdmissions(workspaceId);
     let stopRecord: WorkspaceStopRecord | undefined;
     if (expectedAttemptId == null && sampleLiveExecution()) {
       await using _lock = await this.mutex.acquire();
-      stopRecord = this.beginWorkspaceStop(workspaceId);
+      stopRecord = this.taskStopLatch.beginWorkspaceStop(workspaceId);
     }
     let superseded = false;
     let transitionedToInterrupted = false;
@@ -19860,7 +17298,7 @@ export class TaskService implements AgentTaskIntegration {
         await using _lock = await this.mutex.acquire();
         rowStillExpected = this.currentTaskAttemptId(workspaceId) === expectedAttemptId;
         if (rowStillExpected && sampleLiveExecution()) {
-          stopRecord = this.beginWorkspaceStop(workspaceId);
+          stopRecord = this.taskStopLatch.beginWorkspaceStop(workspaceId);
         }
       }
       if (!rowStillExpected) {
@@ -19897,6 +17335,7 @@ export class TaskService implements AgentTaskIntegration {
       for (const ancestorWorkspaceId of ancestorWorkspaceIds) {
         try {
           await upsertSubagentFailureArtifact({
+            locks: this.historyService.locks,
             workspaceId: ancestorWorkspaceId,
             workspaceSessionDir: path.join(this.config.sessionsDir, ancestorWorkspaceId),
             childTaskId: workspaceId,
@@ -19919,7 +17358,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     if (stopRecord != null) {
-      this.markWorkspaceStopPersisted(workspaceId);
+      this.taskStopLatch.markWorkspaceStopPersisted(workspaceId);
       // Phase B for the single task: clearQueue + stopStream against the captured execution;
       // release (and the in-memory settlement) follows the captured turn's own settlement.
       await this.runWorkspaceStopCleanup([workspaceId], {
@@ -19930,7 +17369,7 @@ export class TaskService implements AgentTaskIntegration {
     } else {
       this.workspaceService.clearQueue(workspaceId);
       // Idle terminal settlement: nothing live was admitted before the closure above.
-      await this.persistOwnedAttemptSettlement(
+      await this.attemptLedger.persistOwnedAttemptSettlement(
         workspaceId,
         ownedAttempt,
         "idle-settled",
@@ -19941,7 +17380,7 @@ export class TaskService implements AgentTaskIntegration {
 
     // Captured before settlement: rejectWaiters consumes the pending waiters
     // that prove a parent turn is actively listening for this task.
-    const hadForegroundWaiters = (this.pendingWaitersByTaskId.get(workspaceId)?.length ?? 0) > 0;
+    const hadForegroundWaiters = this.waiters.hasPendingWaiters(workspaceId);
 
     await this.settleInterruptedTaskAtStreamEnd(
       workspaceId,
@@ -20184,7 +17623,7 @@ export class TaskService implements AgentTaskIntegration {
         const runtime = createRuntimeForWorkspace(info);
         const planResult = await readPlanFile(
           runtime,
-          await resolvePlanFileLocation(this.config, runtime, info)
+          await resolvePlanFileLocation(this.config, runtime, info, this.historyService.locks)
         );
         if (planResult.exists && planResult.content.trim().length > 0) {
           if (planResult.path !== args.proposePlanResult.planPath) {
@@ -20216,9 +17655,9 @@ export class TaskService implements AgentTaskIntegration {
       // continues. Decide (and wake the held queue) before the completion prompt, as for any
       // other non-report end: the prompt's admission reads a still-pending decision for its
       // attempt as stale and would be refused, leaving the task awaiting a report forever.
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         args.workspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           args.workspaceId,
           args.reportedAttempt,
           args.reportedAttempt == null ? (args.streamAttemptId ?? undefined) : undefined
@@ -20297,7 +17736,7 @@ export class TaskService implements AgentTaskIntegration {
           const runtime = createRuntimeForWorkspace(info);
           const planResult = await readPlanFile(
             runtime,
-            await resolvePlanFileLocation(this.config, runtime, info)
+            await resolvePlanFileLocation(this.config, runtime, info, this.historyService.locks)
           );
           if (planResult.exists) {
             planSummary = { content: planResult.content, path: planResult.path };
@@ -21003,9 +18442,9 @@ export class TaskService implements AgentTaskIntegration {
       // stream's pending decision before the completion prompt, as handleStreamEnd does for any
       // other non-report end: the prompt's admission reads a still-pending decision for its
       // attempt as stale and is refused, leaving the workflow step awaiting a report forever.
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           childWorkspaceId,
           reportedAttempt,
           reportedAttempt == null ? (reportedAttemptId ?? undefined) : undefined
@@ -21272,9 +18711,9 @@ export class TaskService implements AgentTaskIntegration {
       );
       // Never a continuation of the reporting attempt; its held entries are refused (they also
       // read stale at their own gates, since the row names another attempt).
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           childWorkspaceId,
           reportedAttempt,
           unownedReportedAttemptId
@@ -21330,9 +18769,9 @@ export class TaskService implements AgentTaskIntegration {
       this.resolveWaiters(childWorkspaceId, reportArgs);
       this.scheduleMaybeStartQueuedTasks();
       // Reported row, no release, nobody to report to: not a continuation of the attempt.
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           childWorkspaceId,
           reportedAttempt,
           unownedReportedAttemptId
@@ -21380,6 +18819,7 @@ export class TaskService implements AgentTaskIntegration {
       try {
         const ancestorSessionDir = path.join(this.config.sessionsDir, ancestorWorkspaceId);
         await upsertSubagentReportArtifact({
+          locks: this.historyService.locks,
           workspaceId: ancestorWorkspaceId,
           workspaceSessionDir: ancestorSessionDir,
           childTaskId: childWorkspaceId,
@@ -21409,10 +18849,10 @@ export class TaskService implements AgentTaskIntegration {
     // row says reported while the attempt stays owned — neither a continuation nor a completion,
     // so held follow-ups are refused rather than run under an attempt of unknown standing.
     if (persistedInEveryAncestor) {
-      this.releaseReportedTaskAttempt(childWorkspaceId, reportedAttempt);
-      this.resolveStreamEndDecision(
+      this.attemptLedger.releaseReportedTaskAttempt(childWorkspaceId, reportedAttempt);
+      this.streamEndLedger.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           childWorkspaceId,
           reportedAttempt,
           unownedReportedAttemptId
@@ -21420,9 +18860,9 @@ export class TaskService implements AgentTaskIntegration {
         "published"
       );
     } else {
-      this.resolveStreamEndDecision(
+      this.streamEndLedger.resolveStreamEndDecision(
         childWorkspaceId,
-        this.findPendingStreamEndDecision(
+        this.streamEndLedger.findPendingStreamEndDecision(
           childWorkspaceId,
           reportedAttempt,
           unownedReportedAttemptId
@@ -21468,7 +18908,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     // Cache for the current process (best-effort). Disk is the source of truth.
-    this.completedReportsByTaskId.set(taskId, {
+    this.waiters.cacheCompletedReport(taskId, {
       reportMarkdown: artifact.reportMarkdown,
       title: artifact.title,
       planFilePath: artifact.planFilePath,
@@ -21478,12 +18918,11 @@ export class TaskService implements AgentTaskIntegration {
       workflowOwnedAncestorWorkspaceIds: artifact.workflowOwnedAncestorWorkspaceIds,
       ancestorWorkspaceIds: artifact.ancestorWorkspaceIds,
     });
-    this.enforceCompletedReportCacheLimit();
 
     // After the committed `reported` (ours above, or the other backend's): a report bound to the
     // row's attempt settles that attempt's stream-end decision (#7003); the notification then
     // re-runs its deferral (the row no longer reads running).
-    if (this.resolveDecisionOfReportedAttempt(taskId, artifact.taskAttemptId)) {
+    if (this.streamEndLedger.resolveDecisionOfReportedAttempt(taskId, artifact.taskAttemptId)) {
       this.notifyAttemptSettlementListeners(taskId);
     }
     if (adopt) {
@@ -21508,27 +18947,6 @@ export class TaskService implements AgentTaskIntegration {
       model: artifact.model,
       thinkingLevel: artifact.thinkingLevel,
     };
-  }
-  /**
-   * The row reads a completed report for `attemptId` (#7003): that attempt reported, possibly on
-   * another backend. Its pending stream-end decision (`decision`, else the attempt's) resolves
-   * `indeterminate`, as publication's not-durable branch does: held follow-ups are refused and
-   * handed back, never run as a new turn of a reported attempt. Returns whether the row reads so.
-   */
-  private resolveDecisionOfReportedAttempt(
-    taskId: string,
-    attemptId: string | undefined,
-    decision?: StreamEndDecision
-  ): boolean {
-    if (attemptId == null) return false;
-    const workspace = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId)?.workspace;
-    if (workspace?.taskAttemptId !== attemptId || !hasCompletedAgentReport(workspace)) return false;
-    this.resolveStreamEndDecision(
-      taskId,
-      decision ?? this.findStreamEndDecision(taskId, attemptId),
-      "indeterminate"
-    );
-    return true;
   }
 
   /**
@@ -21561,14 +18979,6 @@ export class TaskService implements AgentTaskIntegration {
     return !rowMoved;
   }
 
-  private enforceCompletedReportCacheLimit(): void {
-    while (this.completedReportsByTaskId.size > COMPLETED_REPORT_CACHE_MAX_ENTRIES) {
-      const first = this.completedReportsByTaskId.keys().next();
-      if (first.done) break;
-      this.completedReportsByTaskId.delete(first.value);
-    }
-  }
-
   private resolveWaiters(
     taskId: string,
     report: {
@@ -21595,7 +19005,7 @@ export class TaskService implements AgentTaskIntegration {
         true
     );
 
-    this.completedReportsByTaskId.set(taskId, {
+    this.waiters.cacheCompletedReport(taskId, {
       reportMarkdown: report.reportMarkdown,
       title: report.title,
       planFilePath: report.planFilePath,
@@ -21605,41 +19015,13 @@ export class TaskService implements AgentTaskIntegration {
       ancestorWorkspaceIds,
       workflowOwnedAncestorWorkspaceIds,
     });
-    this.enforceCompletedReportCacheLimit();
 
-    const waiters = this.pendingWaitersByTaskId.get(taskId);
-    if (!waiters || waiters.length === 0) {
-      return false;
-    }
-
-    this.pendingWaitersByTaskId.delete(taskId);
-    for (const waiter of waiters) {
-      try {
-        waiter.cleanup();
-        waiter.resolve(report);
-      } catch {
-        // ignore
-      }
-    }
-
-    return true;
+    return this.waiters.resolvePendingWaiters(taskId, report);
   }
 
+  // Kept on TaskService: tests spy on it, and every internal rejection goes through here.
   private rejectWaiters(taskId: string, error: Error): void {
-    this.markTaskForegroundRelevant(taskId);
-
-    const waiters = this.pendingWaitersByTaskId.get(taskId);
-    if (!waiters || waiters.length === 0) {
-      return;
-    }
-
-    for (const waiter of [...waiters]) {
-      try {
-        waiter.reject(error);
-      } catch (rejectError: unknown) {
-        log.error("Task waiter reject callback failed", { taskId, error: rejectError });
-      }
-    }
+    this.waiters.rejectWaiters(taskId, error);
   }
 
   private findProposePlanSuccessInParts(parts: readonly unknown[]): { planPath: string } | null {
@@ -22244,8 +19626,7 @@ export class TaskService implements AgentTaskIntegration {
     // If someone is actively awaiting this report (foreground task tool call or task_await),
     // skip injecting a synthetic history message to avoid duplicating the report in context.
     if (childWorkspaceId) {
-      const waiters = this.pendingWaitersByTaskId.get(childWorkspaceId);
-      if (waiters && waiters.length > 0) {
+      if (this.waiters.hasPendingWaiters(childWorkspaceId)) {
         return [];
       }
     }

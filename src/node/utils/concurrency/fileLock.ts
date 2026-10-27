@@ -117,8 +117,15 @@ const FILE_LOCK_RENEW_INTERVAL_MS = FILE_LOCK_LEASE_MS / 4;
 export type ReclaimSeamPhase = "post-guard" | "pre-restore";
 
 export interface ProcessFileLockOptions {
-  /** Absolute or relative lockfile path; the parent directory is created. */
+  /** Absolute or relative lockfile path; the parent directory is created (see createParentDir). */
   lockPath: string;
+  /**
+   * Default true. False: the parent directory must already exist, and a
+   * missing one fails acquisition with ENOENT. A session-dir writer that can
+   * run after workspace removal passes false, so it cannot recreate the
+   * deleted directory just by taking the lock (#7474).
+   */
+  createParentDir?: boolean;
   /** Max milliseconds to wait before acquisition fails. */
   timeoutMs: number;
   /** Human label for error/log messages (e.g. "append lock", "blob lock"). */
@@ -253,6 +260,19 @@ function parseLockToken(raw: string): HolderEvidence | null {
   return null;
 }
 
+/**
+ * Whether lockPath's lock file exists: a holder, live or dead, has it. One stat, so a caller
+ * that only needs to know if a holder may exist (branchSummary's marker reader) neither creates
+ * the lock's folder nor contends with the holder.
+ */
+export async function processFileLockExists(lockPath: string): Promise<boolean> {
+  assert(lockPath.length > 0, "processFileLockExists requires a lock path");
+  return await fs.stat(lockPath).then(
+    () => true,
+    () => false
+  );
+}
+
 export async function acquireProcessFileLock(
   options: ProcessFileLockOptions
 ): Promise<ProcessFileLock> {
@@ -264,7 +284,9 @@ export async function acquireProcessFileLock(
   const deadline = Date.now() + timeoutMs;
   let acquired = false;
   try {
-    await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    if (options.createParentDir !== false) {
+      await fs.mkdir(path.dirname(lockPath), { recursive: true });
+    }
     await fs.writeFile(tempPath, token, "utf-8");
     for (;;) {
       try {

@@ -3,7 +3,7 @@
 # an empty build context, and no cache.
 #
 # The image is published by the main branch only (.github/workflows/bugbash-sandbox-image.yml),
-# and runners pull it by the digest in image.json. The base images are pinned by digest. The
+# and runners pull it by the digest of its attested stable tag. The base images are pinned by digest. The
 # Debian apt mirror and the Playwright download CDN are not pinned: the build trusts them, and
 # the published digest fixes the bytes after the build.
 FROM oven/bun:1.4.3-slim@sha256:14a223fa35747ec728bce300ef85888bc5f7958164d15bbba6a54b22b52a3288 AS bun

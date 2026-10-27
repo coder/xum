@@ -71,6 +71,8 @@ import {
   WEB_FETCH_MAX_OUTPUT_BYTES,
 } from "@/common/constants/toolLimits";
 import { SESSION_MEMORY_VIRTUAL_DIR } from "@/common/constants/memory";
+import { getDefaultBashDisplayName } from "@/common/utils/tools/bashDisplayName";
+import { STATUS_PAGE_AGENT_MAX_UPDATE_CHARS } from "@/common/constants/artifacts";
 import {
   ConfigMutationPathSchema,
   ConfigOperationsSchema,
@@ -100,46 +102,16 @@ import {
   INSTANCE_DISCOVERY_DEFAULT_LIMIT,
   INSTANCE_DISCOVERY_MAX_LIMIT,
 } from "@/constants/agentMessaging";
+import {
+  AskUserQuestionQuestionSchema,
+  AskUserQuestionToolArgsSchema,
+} from "./askUserQuestionSchemas";
 
 // -----------------------------------------------------------------------------
 // ask_user_question (interactive questions for top-level agents)
 // -----------------------------------------------------------------------------
 
-export const AskUserQuestionOptionSchema = z
-  .object({
-    label: z.string().min(1),
-    description: z.string().min(1),
-  })
-  .strict();
-
-export const AskUserQuestionQuestionSchema = z
-  .object({
-    question: z.string().min(1),
-    header: z.string().min(1).max(32).describe("Short UI label"),
-    options: z.array(AskUserQuestionOptionSchema).min(2).max(4),
-    multiSelect: z.boolean(),
-  })
-  .strict()
-  .superRefine((question, ctx) => {
-    const labels = question.options.map((o) => o.label);
-    const labelSet = new Set(labels);
-    if (labelSet.size !== labels.length) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "Option labels must be unique within a question",
-        path: ["options"],
-      });
-    }
-
-    // Claude Code provides "Other" automatically; do not include it explicitly.
-    if (labels.some((label) => label.trim().toLowerCase() === "other")) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "Do not include an 'Other' option; it is provided automatically",
-        path: ["options"],
-      });
-    }
-  });
+export { AskUserQuestionQuestionSchema, AskUserQuestionToolArgsSchema };
 
 const AskUserQuestionUiOnlySchema = z.object({
   questions: z.array(AskUserQuestionQuestionSchema),
@@ -170,25 +142,6 @@ const ToolOutputUiOnlySchema = z.object({
 const ToolOutputUiOnlyFieldSchema = {
   ui_only: ToolOutputUiOnlySchema.optional(),
 };
-
-export const AskUserQuestionToolArgsSchema = z
-  .object({
-    questions: z.array(AskUserQuestionQuestionSchema).min(1).max(4),
-    // Optional prefilled answers (Claude Code supports this, though Xum typically won't use it)
-    answers: z.record(z.string(), z.string()).nullish(),
-  })
-  .strict()
-  .superRefine((args, ctx) => {
-    const questionTexts = args.questions.map((q) => q.question);
-    const questionTextSet = new Set(questionTexts);
-    if (questionTextSet.size !== questionTexts.length) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        message: "Question text must be unique across questions",
-        path: ["questions"],
-      });
-    }
-  });
 
 const AskUserQuestionToolSummarySchema = z
   .object({
@@ -2372,6 +2325,16 @@ export const TOOL_DEFINITIONS = {
         let obj = value as Record<string, unknown>;
         obj = renameAliasField(obj, "command", "script");
         obj = renameAliasField(obj, "description", "display_name");
+        // Some models (mostly Haiku 5.5) omit the required display_name.
+        // Rejecting the call costs a model step and a retry, so fill it here
+        // while the model-visible schema keeps it required. The script-derived
+        // name is the same one bash.ts already falls back to.
+        // timeout_secs gets no default on purpose: a short default would start a
+        // long install or build and kill it partway, while a rejection runs
+        // nothing and the model retries with a timeout.
+        if (typeof obj.display_name !== "string" && typeof obj.script === "string") {
+          obj = { ...obj, display_name: getDefaultBashDisplayName(obj.script) };
+        }
         return obj;
       },
       z
@@ -3089,6 +3052,27 @@ export const TOOL_DEFINITIONS = {
       })
       .strict(),
   },
+  status_update: {
+    // Registered only in status page agent mode (artifacts-status-page-agent); the static
+    // description keeps the tool block cache-stable. Who edits the page belongs in the system
+    // prompt, not here: a tool policy that denies this tool keeps the description on a refusal
+    // stub (#5253) while the prompt tells the agent to edit the page itself.
+    ptcExcluded: "Top-level presence selects the status page agent guidance",
+    description:
+      "Send the status page agent an update for the status page the user sees instead of this chat. " +
+      "It edits the page with its own model in the background, and this call returns at once. " +
+      "Send a short, self-contained update when you start, at each milestone and before you finish: what you are doing, progress, results, and anything that needs the user. " +
+      "Say what to replace or remove.",
+    schema: z
+      .object({
+        update: z
+          .string()
+          .min(1)
+          .max(STATUS_PAGE_AGENT_MAX_UPDATE_CHARS)
+          .describe("The update, in plain words."),
+      })
+      .strict(),
+  },
   artifact_list: {
     // The guidance lives in this static description (not a prompt section) so it is
     // cache-stable and appears exactly when the tool does.
@@ -3436,6 +3420,11 @@ export function getToolSchemas(): Record<string, ToolSchema> {
   );
 }
 
+/** Opt-in tool groups: absent flags mean off. */
+function whenEnabled(enabled: boolean | undefined, toolNames: string[]): string[] {
+  return enabled === true ? toolNames : [];
+}
+
 /**
  * Get which tools are available for a given model
  * @param modelString The model string (e.g., "anthropic:claude-opus-4-1")
@@ -3458,6 +3447,8 @@ export function getAvailableTools(
     enableSessionHistory?: boolean;
     enableTimelineEvent?: boolean;
     enableArtifacts?: boolean;
+    /** Whether status_update is available (status page agent mode active this turn). */
+    enableStatusUpdate?: boolean;
     /** Whether tool_catalog_search is available (tool-search experiment + deferred MCP tools present). */
     enableToolSearch?: boolean;
     /** Whether mcp_prompt_get is available (connected MCP servers advertise prompts). */
@@ -3477,14 +3468,7 @@ export function getAvailableTools(
 ): string[] {
   const [provider] = modelString.split(":");
   const enableAgentReport = options.enableAgentReport ?? true;
-  const enableFamilyMessaging = options.enableFamilyMessaging ?? false;
   const enableAnalyticsQuery = options.enableAnalyticsQuery ?? true;
-  const enableDynamicWorkflows = options.enableDynamicWorkflows ?? false;
-  const enableMemory = options.enableMemory ?? false;
-  const enableTimelineEvent = options.enableTimelineEvent ?? false;
-  const enableArtifacts = options.enableArtifacts ?? false;
-  const enableToolSearch = options.enableToolSearch ?? false;
-  const enableMcpPromptGet = options.enableMcpPromptGet ?? false;
   const enableReviewPane = options.enableReviewPane ?? true;
   const enableGitPatches = options.enableGitPatches ?? true;
 
@@ -3517,12 +3501,13 @@ export function getAvailableTools(
     "file_edit_replace_string",
     // "file_edit_replace_lines", // DISABLED: causes models to break repo state
     "file_edit_insert",
-    ...(options.enableSessionHistory ? ["session_history", "new_context"] : []),
-    ...(enableMemory ? ["memory"] : []),
-    ...(enableTimelineEvent ? ["timeline_event"] : []),
-    ...(enableArtifacts ? ["artifact_list", "artifact", "artifact_read"] : []),
-    ...(enableToolSearch ? ["tool_catalog_search"] : []),
-    ...(enableMcpPromptGet ? ["mcp_prompt_get"] : []),
+    ...whenEnabled(options.enableSessionHistory, ["session_history", "new_context"]),
+    ...whenEnabled(options.enableMemory, ["memory"]),
+    ...whenEnabled(options.enableTimelineEvent, ["timeline_event"]),
+    ...whenEnabled(options.enableArtifacts, ["artifact_list", "artifact", "artifact_read"]),
+    ...whenEnabled(options.enableStatusUpdate, ["status_update"]),
+    ...whenEnabled(options.enableToolSearch, ["tool_catalog_search"]),
+    ...whenEnabled(options.enableMcpPromptGet, ["mcp_prompt_get"]),
     "ask_user_question",
     "propose_plan",
     "bash",
@@ -3535,9 +3520,9 @@ export function getAvailableTools(
     "task_remove",
     "task_workspace_lifecycle",
     "task_list",
-    ...(enableDynamicWorkflows ? ["workflow_run", "workflow_resume"] : []),
+    ...whenEnabled(options.enableDynamicWorkflows, ["workflow_run", "workflow_resume"]),
     ...(enableAgentReport ? ["agent_report"] : []),
-    ...(enableFamilyMessaging ? ["task_message_parent", "task_message_sibling"] : []),
+    ...whenEnabled(options.enableFamilyMessaging, ["task_message_parent", "task_message_sibling"]),
     "set_goal",
     "get_goal",
     "complete_goal",

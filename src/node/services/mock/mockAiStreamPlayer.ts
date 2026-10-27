@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import assert from "@/common/utils/assert";
 import type { MuxMessage, MuxMessageMetadata } from "@/common/types/message";
 import { createMuxMessage } from "@/common/types/message";
@@ -220,6 +221,13 @@ export class MockAiStreamPlayer {
   private readonly lastModelByWorkspace = new Map<string, string>();
   private readonly activeStreams = new Map<string, ActiveStream>();
   private nextMockMessageId = 0;
+  /**
+   * Each player (each backend) counts from 0, so its first reply would reuse the id of a row an
+   * earlier backend wrote to the same history (#7204). The random tag keeps ids unique across
+   * restarts (a full UUID: histories outlive many restarts); fixtures that record ids normalize
+   * them, so replays stay deterministic.
+   */
+  private readonly mockMessageIdTag = randomUUID();
 
   constructor(private readonly deps: MockPlayerDeps) {}
 
@@ -282,8 +290,9 @@ export class MockAiStreamPlayer {
   }
 
   /**
-   * Canned tool calls never run, but a successful todo_write must leave the list on disk as the
-   * real tool does: AgentSession's turn-end TODO nudge reads it there (needsTodoTurnEndNudge).
+   * Canned tool calls never run, but a successful todo_write must leave the list in the session's
+   * files as the real tool does: AgentSession's turn-end TODO nudge reads it there
+   * (needsTodoTurnEndNudge).
    * Runs in the call's tool-end handler, before its tool-call-end event: a stream stopped before
    * that point writes nothing, as with a real tool. The queue awaits each handler in order, so
    * stream-end always sees the new list.
@@ -297,7 +306,13 @@ export class MockAiStreamPlayer {
     if (sessionsDir === undefined) return;
     const todos = writtenTodoList(active.parts, event);
     if (todos === null) return;
-    await setTodosForSessionDir(workspaceId, path.join(sessionsDir, workspaceId), todos);
+    await setTodosForSessionDir(
+      workspaceId,
+      path.join(sessionsDir, workspaceId),
+      todos,
+      this.deps.historyService.locks,
+      this.deps.historyService.files
+    );
   }
 
   private async waitForStreamStartGate(
@@ -443,7 +458,7 @@ export class MockAiStreamPlayer {
       latestUserText: latestText,
     });
 
-    const messageId = `msg-mock-${this.nextMockMessageId++}`;
+    const messageId = `msg-mock-${this.mockMessageIdTag}-${this.nextMockMessageId++}`;
     if (reply.waitForStreamStart) {
       await this.waitForStreamStartGate(workspaceId, abortSignal);
       if (abortSignal?.aborted) {

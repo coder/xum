@@ -72,6 +72,8 @@ import type { ServerAuthService } from "@/node/services/serverAuthService";
 import type { ServerService } from "@/node/services/serverService";
 import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
+import type { HostProcesses } from "@/node/services/hostProcesses/hostProcesses";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import type { SessionTimingService } from "@/node/services/sessionTimingService";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { SshPromptService } from "@/node/services/sshPromptService";
@@ -79,6 +81,11 @@ import type { StreamManager } from "@/node/services/streamManager";
 import type { TaskService } from "@/node/services/taskService";
 import type { TelemetryService } from "@/node/services/telemetryService";
 import type { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import type { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
+import type { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
+import type { WorkspaceNaming } from "@/node/services/workspaceNaming";
+import type { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
+import type { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
 import type { TerminalService } from "@/node/services/terminalService";
 import type { TimelineService } from "@/node/services/timelineService";
 import type { TokenizerService } from "@/node/services/tokenizerService";
@@ -111,6 +118,14 @@ export class SessionFilesTag extends Context.Service<SessionFilesTag, SessionFil
 export class HostFilesTag extends Context.Service<HostFilesTag, HostFiles>()("xum/HostFiles") {}
 /** The Xum home, the user home and the temp folder (hostFiles/hostFiles.ts). */
 export class HostPathsTag extends Context.Service<HostPathsTag, HostPaths>()("xum/HostPaths") {}
+/** Host git spawns and network calls of loop code (hostProcesses/hostProcesses.ts). */
+export class HostProcessesTag extends Context.Service<HostProcessesTag, HostProcesses>()(
+  "xum/HostProcesses"
+) {}
+/** Every runtime that loop code builds (runtimeFactory/runtimeFactoryService.ts). */
+export class RuntimeFactoryTag extends Context.Service<RuntimeFactoryTag, RuntimeFactory>()(
+  "xum/RuntimeFactory"
+) {}
 /** Every lock that guards a session write (phase 4); StoresLive gives the Node layer. */
 export class SessionLocksTag extends Context.Service<SessionLocksTag, SessionLocks>()(
   "xum/SessionLocks"
@@ -197,6 +212,33 @@ export class TerminalAttentionStoreTag extends Context.Service<
   TerminalAttentionStoreTag,
   TerminalAttentionStore
 >()("xum/TerminalAttentionStore") {}
+/**
+ * Which workspaces this backend is renaming, removing or archiving; shared by WorkspaceService and
+ * the services split out of it (not a `CoreServices` field).
+ */
+export class WorkspaceLifecycleGatesTag extends Context.Service<
+  WorkspaceLifecycleGatesTag,
+  WorkspaceLifecycleGates
+>()("xum/WorkspaceLifecycleGates") {}
+/** External editor opens of each workspace, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceExternalEditorsTag extends Context.Service<
+  WorkspaceExternalEditorsTag,
+  WorkspaceExternalEditors
+>()("xum/WorkspaceExternalEditors") {}
+/** In-process naming claims of each workspace, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceNamingTag extends Context.Service<WorkspaceNamingTag, WorkspaceNaming>()(
+  "xum/WorkspaceNaming"
+) {}
+/** Active workflow runs of each workspace, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceWorkflowRunsTag extends Context.Service<
+  WorkspaceWorkflowRunsTag,
+  WorkspaceWorkflowRuns
+>()("xum/WorkspaceWorkflowRuns") {}
+/** Archive admission of non-send operations, split out of WorkspaceService (not a `CoreServices` field). */
+export class WorkspaceOperationAdmissionTag extends Context.Service<
+  WorkspaceOperationAdmissionTag,
+  WorkspaceOperationAdmission
+>()("xum/WorkspaceOperationAdmission") {}
 /** Late-bound collaborators of the turn request builder (a mutable record, filled by wiring). */
 export class TurnRequestBuilderBindingsTag extends Context.Service<
   TurnRequestBuilderBindingsTag,
@@ -340,6 +382,8 @@ export type StoreTags =
   | SessionFilesTag
   | HostFilesTag
   | HostPathsTag
+  | HostProcessesTag
+  | RuntimeFactoryTag
   | SessionLocksTag
   | ProvidersConfigStoreTag
   | SecretsStoreTag
@@ -355,7 +399,8 @@ export type RuntimeSeamTags = EffectRunnerTag | HostClockTag | AppFiberScopeTag;
 
 /**
  * Everything `CoreLive` (./layers/core.ts) provides: every `CoreServices`
- * field plus the graph-internal `TerminalAttentionStore`.
+ * field plus the graph-internal `TerminalAttentionStore`, `WorkspaceLifecycleGates` and
+ * `WorkspaceExternalEditors`.
  */
 export type CoreTags =
   | ContextManagement
@@ -381,6 +426,11 @@ export type CoreTags =
   | MemoryConsolidation
   | DesktopInputCoordinatorTag
   | TerminalAttentionStoreTag
+  | WorkspaceLifecycleGatesTag
+  | WorkspaceExternalEditorsTag
+  | WorkspaceNamingTag
+  | WorkspaceWorkflowRunsTag
+  | WorkspaceOperationAdmissionTag
   | TurnRequestBuilderBindingsTag;
 
 /**

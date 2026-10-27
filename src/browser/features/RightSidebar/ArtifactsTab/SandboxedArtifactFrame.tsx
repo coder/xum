@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { useTheme } from "@/browser/contexts/ThemeContext";
 import {
   toWorkspaceSelection,
@@ -8,20 +8,27 @@ import {
 import { isLightThemeMode } from "@/browser/utils/highlighting/shiki-shared";
 import { matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { useAppConfig, useUserPreferences } from "@/browser/stores/AppConfigStore";
+import type { Keybind } from "@/common/types/keybind";
 import type { FrontendWorkspaceMetadata } from "@/common/types/workspace";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { WORKSPACE_TURN_TASK_TAGS } from "@/constants/workspaceTags";
 import { ARTIFACT_CLICK_SEND_WINDOW_MS } from "@/common/constants/artifactInteractions";
 import { getErrorMessage } from "@/common/utils/errors";
-import { createArtifactAssetLoader } from "./artifactAssets";
+import { cn } from "@/common/lib/utils";
+import { createArtifactAssetLoader, type ArtifactAssetReader } from "./artifactAssets";
 import {
   ARTIFACT_FRAME_CHORDS,
+  ARTIFACT_FRAME_INTERRUPT_KEYS,
   acceptArtifactFrameMessage,
+  artifactBackdropColor,
   buildArtifactBridgeScript,
   createBridgeRateLimiter,
   postArtifactAnnotateMode,
   postArtifactTheme,
+  STATUS_PAGE_FRAME_CHORDS,
+  type ArtifactAppearance,
   type ArtifactFrameChord,
+  type ArtifactFrameInterruptKey,
   type ArtifactFrameToHostMessage,
   type ArtifactTheme,
 } from "./artifactBridge";
@@ -30,12 +37,14 @@ import {
   buildSandboxedSvgDocument,
   finalizeSandboxedDocument,
   inlineArtifactHtmlAssets,
+  isUnstyledHtmlDocument,
   parseArtifactHtml,
 } from "./artifactDocument";
 import { pickFromFrameAnnotation, type ArtifactAnnotationPick } from "./artifactAnnotation";
 import type { ArtifactInteractionHandlers, ArtifactSendOrigin } from "./artifactInteractions";
 import { FrameNavigatedNotice, useFrameNavigationGuard } from "./frameNavigationGuard";
 import { Notice, SourceText } from "./SourceText";
+import { readAppStyleVariables } from "./appStyleVariables";
 import { useArtifactAssetReader } from "./useArtifactAssetReader";
 
 /**
@@ -55,6 +64,16 @@ interface BuiltDocument {
   srcDoc: string | null;
   notices: string[];
   error: string | null;
+  /** The page takes the theme's color scheme (isUnstyledHtmlDocument), so no white backdrop. */
+  followsColorScheme: boolean;
+}
+
+/**
+ * Whether the user's focus is in `frame`. Browsers leave focus on a frame that a `hidden`
+ * ancestor stopped rendering, so that focus does not count.
+ */
+function frameHasFocus(frame: HTMLIFrameElement | null): frame is HTMLIFrameElement {
+  return frame != null && document.activeElement === frame && frame.checkVisibility();
 }
 
 /**
@@ -62,7 +81,7 @@ interface BuiltDocument {
  * `window.xum.send` that skips the confirm strip. The artifact's script can post any of them at
  * any time, so the host honours them only while the user's
  * own click or key press inside `frame` is live: focus is on the iframe (a click or Tab into a
- * frame moves the app's activeElement to it, and a hidden frame cannot hold focus), and the app
+ * frame moves the app's activeElement to it; focus on a hidden frame does not count), and the app
  * has transient user activation (a gesture in a child frame also activates its ancestors). Each check alone is not enough: typing in the
  * composer also activates the app, and focus stays on the frame long after the click.
  * No confirm strip for openWorkspace: a switch sends nothing and reveals nothing to the frame,
@@ -75,33 +94,72 @@ interface BuiltDocument {
 function hasLiveUserGesture(frame: HTMLIFrameElement | null): boolean {
   const activation = (navigator as Navigator & { userActivation?: { isActive?: boolean } })
     .userActivation;
-  return frame != null && document.activeElement === frame && activation?.isActive === true;
+  return frameHasFocus(frame) && activation?.isActive === true;
 }
 
 /**
- * Replays a right-sidebar chord pressed inside `frame` as a keydown on the frame element, so the
- * app's one handler for it applies its own rules: WorkspaceShell's useRightSidebarToggleKey for
- * TOGGLE_RIGHT_SIDEBAR, useArtifactsTabKey for OPEN_ARTIFACTS_TAB. Both keep the dialog block
- * (Artifacts fullscreen is a modal dialog) and the focus move to the toggle after a collapse.
+ * Replays a chord pressed inside `frame` as a keydown on the frame element, so the app's one
+ * handler for it applies its own rules: WorkspaceShell's useRightSidebarToggleKey for
+ * TOGGLE_RIGHT_SIDEBAR, useArtifactsTabKey for OPEN_ARTIFACTS_TAB, and from the main pane's status
+ * page only (the one frame that forwards them), the main pane's Agent interface view handler for
+ * TOGGLE_AGENT_INTERFACE_VIEW and the status bar's for TOGGLE_STATUS_TRANSCRIPT_PEEK. All keep the
+ * dialog block (Artifacts fullscreen is a modal dialog); the sidebar ones also move focus to the
+ * toggle after a collapse.
  *
- * SECURITY AUDIT: the artifact's script can post the message without a key press. The host
- * honours it only while the frame holds focus (a hidden frame cannot), and the replayed event
- * matches only the named chord's keybind. The frame lives in the right sidebar's Artifacts tab, so
- * either chord can only collapse the sidebar, which unmounts the frame: OPEN_ARTIFACTS_TAB
- * collapses a sidebar that shows that tab, and where a collapse refuses it selects the tab that
- * already shows. Like Escape, it needs no live gesture.
+ * SECURITY AUDIT: the artifact's script can post the message without a key press, and can move
+ * focus into its own frame with window.focus(). The host honours it only during the user's own
+ * key press in the visible frame (hasLiveUserGesture), and the replayed event matches only the
+ * named chord's keybind. Otherwise a timer could flip the main pane's view, or the right sidebar
+ * under a main-pane status page, over and over, rewriting the stored view choice each time.
  */
 function replayFrameSidebarKey(
   frame: HTMLIFrameElement | null,
   message: { chord: ArtifactFrameChord; ctrlKey: boolean; metaKey: boolean }
 ): void {
-  if (frame == null || document.activeElement !== frame) return;
-  const keybind = ARTIFACT_FRAME_CHORDS[message.chord];
-  const event = new KeyboardEvent("keydown", {
-    key: keybind.key,
+  replayKeybindOnFrame(frame, ARTIFACT_FRAME_CHORDS[message.chord], {
     shiftKey: true,
     ctrlKey: message.ctrlKey,
     metaKey: message.metaKey,
+  });
+}
+
+/**
+ * Replays a stream-interrupt key pressed inside `frame` as a keydown on the frame element, so
+ * the chat's interrupt handler (useAIViewKeybinds) applies its own rules (compaction, a pending
+ * question). Only for the active keybind (`active`, from the Vim setting).
+ *
+ * SECURITY AUDIT: the artifact's script can post the message at any time, and a page that did
+ * so on a timer would stop every turn while its frame shows. So, as for chords, the host honours
+ * it only during the user's own gesture in the visible frame (hasLiveUserGesture). Escape grants
+ * no user activation (HTML), so a lone Escape interrupts only shortly after the user's last
+ * click or key in the page; Ctrl+C grants it itself.
+ */
+function replayFrameInterruptKey(
+  frame: HTMLIFrameElement | null,
+  keybind: ArtifactFrameInterruptKey,
+  active: ArtifactFrameInterruptKey | undefined
+): void {
+  if (keybind !== active) return;
+  const target: Keybind = ARTIFACT_FRAME_INTERRUPT_KEYS[keybind];
+  replayKeybindOnFrame(frame, target, {
+    shiftKey: false,
+    ctrlKey: target.ctrl === true,
+    metaKey: false,
+  });
+}
+
+function replayKeybindOnFrame(
+  frame: HTMLIFrameElement | null,
+  keybind: Keybind,
+  modifiers: { shiftKey: boolean; ctrlKey: boolean; metaKey: boolean }
+): void {
+  if (!hasLiveUserGesture(frame) || frame == null) return;
+  const event = new KeyboardEvent("keydown", {
+    key: keybind.key,
+    // matchesKeybind compares the physical key when the keybind names one.
+    code: keybind.code,
+    altKey: keybind.alt === true,
+    ...modifiers,
     bubbles: true,
     cancelable: true,
   });
@@ -129,24 +187,104 @@ function takeFrameSendOrigin(
 
 type ArtifactFrameKeyMessage = Extract<
   ArtifactFrameToHostMessage,
-  { type: "key" } | { type: "sidebarKey" }
+  { type: "key" } | { type: "sidebarKey" } | { type: "interruptKey" }
 >;
 
 /** The host side of the keys a frame forwards: keys typed in the frame never reach the app. */
 function handleFrameKeyMessage(
   message: ArtifactFrameKeyMessage,
   frame: HTMLIFrameElement | null,
-  onFrameKey: ((key: ArtifactFrameKey) => void) | undefined
+  handlers: {
+    onFrameKey: ((key: ArtifactFrameKey) => void) | undefined;
+    /** Set only for the main pane's status page (SandboxedArtifactFrame's mainPaneInterruptKey). */
+    mainPaneInterruptKey: ArtifactFrameInterruptKey | undefined;
+  }
 ): void {
   if (message.type === "sidebarKey") {
+    // Any other frame's shim never forwards these: its page's own script posted it.
+    if (
+      STATUS_PAGE_FRAME_CHORDS.has(message.chord) &&
+      handlers.mainPaneInterruptKey === undefined
+    ) {
+      return;
+    }
     replayFrameSidebarKey(frame, message);
     return;
   }
+  if (message.type === "interruptKey") {
+    replayFrameInterruptKey(frame, message.keybind, handlers.mainPaneInterruptKey);
+    return;
+  }
+  const { onFrameKey } = handlers;
   // "C" (the annotate shortcut) can turn annotate mode on, so, like openWorkspace, it needs the
   // user's own key press in this frame: the artifact's script could post it at any time.
   // "Escape" and "F" only ever exit, so they need no gesture.
   if (message.key === "C" && !hasLiveUserGesture(frame)) return;
   onFrameKey?.(message.key);
+}
+
+type FrameDocument = Pick<BuiltDocument, "srcDoc" | "notices" | "error" | "followsColorScheme">;
+
+/**
+ * The sandboxed srcdoc for an HTML/SVG artifact. `bridgeScript` is told whether the page takes
+ * the theme's color scheme (an HTML page without styles of its own, isUnstyledHtmlDocument).
+ */
+async function buildFrameDocument(input: {
+  kind: "html" | "svg";
+  content: string;
+  path: string;
+  allowCdn: boolean;
+  read: ArtifactAssetReader | null;
+  bridgeScript: (followsColorScheme: boolean) => string;
+}): Promise<FrameDocument> {
+  const csp = buildArtifactCsp({ allowCdn: input.allowCdn });
+  if (input.kind === "svg") {
+    const options = { csp, bridgeScript: input.bridgeScript(false) };
+    const srcDoc = buildSandboxedSvgDocument(input.content, options);
+    return { srcDoc, notices: [], error: null, followsColorScheme: false };
+  }
+  const doc = parseArtifactHtml(input.content);
+  const followsColorScheme = isUnstyledHtmlDocument(doc);
+  const options = { csp, bridgeScript: input.bridgeScript(followsColorScheme) };
+  const loader = createArtifactAssetLoader(input.path, input.read ?? (() => Promise.resolve(null)));
+  try {
+    const notices = await inlineArtifactHtmlAssets(doc, loader, { allowCdn: input.allowCdn });
+    return {
+      srcDoc: finalizeSandboxedDocument(doc, options),
+      notices,
+      error: null,
+      followsColorScheme,
+    };
+  } catch (error) {
+    return { srcDoc: null, notices: [], error: getErrorMessage(error), followsColorScheme };
+  }
+}
+
+/** The frame's window while it still shows our srcdoc; null after it navigated away. */
+function liveFrameWindow(
+  navigatedRef: RefObject<boolean>,
+  frameRef: RefObject<HTMLIFrameElement | null>
+): Window | null | undefined {
+  return navigatedRef.current ? null : frameRef.current?.contentWindow;
+}
+
+/**
+ * A page with the theme's scheme paints no canvas of its own, so the backdrop shows: the pane
+ * surface (main pane and right sidebar alike), so the page sits seamlessly in the pane. Any other
+ * page gets the opaque color it reports (backdropColor), or the browser's default white canvas
+ * once it reports none or a translucent one. Before its first report the frame stays clear and
+ * the pane shows through, so a dark page does not load over a white flash.
+ */
+function frameClassName(
+  followsColorScheme: boolean,
+  annotating: boolean,
+  backdropColor: string | null | undefined
+): string {
+  return cn(
+    "min-h-0 w-full flex-1 border-0",
+    followsColorScheme ? "bg-surface-primary" : backdropColor === null && "bg-white",
+    annotating && "cursor-crosshair"
+  );
 }
 
 /**
@@ -213,6 +351,12 @@ export function SandboxedArtifactFrame(props: {
   kind: "html" | "svg";
   content: string;
   onFrameKey?: (key: ArtifactFrameKey) => void;
+  /**
+   * Set only for the main pane's status page, which takes the chat's place: the chat's
+   * stream-interrupt keybind, which the frame replays (replayFrameInterruptKey). That frame also
+   * forwards the view switch chord, since it shows only while the switch exists.
+   */
+  mainPaneInterruptKey?: ArtifactFrameInterruptKey;
   /** send/setState from the artifact (M5b); without it both are ignored. */
   interactions?: ArtifactInteractionHandlers;
   /** Set only while annotate mode is on: pins clicked inside the frame (M5b). */
@@ -225,13 +369,20 @@ export function SandboxedArtifactFrame(props: {
   // Only the theme at mount is baked into the document; later changes travel over the bridge
   // so a theme switch never reloads the artifact.
   const [initialTheme] = useState(theme);
+  // The palette (`--xum-*`) follows the full theme mode: light and flexoki-light differ.
+  const currentAppearance = (): ArtifactAppearance => ({
+    themeName: themeMode,
+    variables: readAppStyleVariables("xum"),
+  });
+  const [initialAppearance] = useState(currentAppearance);
   const [allowMessage] = useState(() => createBridgeRateLimiter());
   const [built, setBuilt] = useState<BuiltDocument | null>(null);
   const { openWorkspace, openWorkspaceRefused } = useArtifactWorkspaceOpener();
   const frameRef = useRef<HTMLIFrameElement | null>(null);
   // When this frame last sent without the strip (see ARTIFACT_CLICK_SEND_WINDOW_MS).
   const lastClickSendAtRef = useRef<number | null>(null);
-  const { kind, content, path } = props;
+  const { kind, content, path, mainPaneInterruptKey } = props;
+  const forwardsViewSwitch = mainPaneInterruptKey !== undefined;
   // SECURITY AUDIT: the persisted state goes into the srcdoc, never through postMessage (which
   // must target "*" and could reach a page the frame navigated to). So an interactive artifact
   // is built only once its state is known; `undefined` means it is still loading.
@@ -244,32 +395,53 @@ export function SandboxedArtifactFrame(props: {
       : null;
   const guard = useFrameNavigationGuard(current?.srcDoc ?? null);
   const { navigatedRef } = guard;
-  // The frame's window while it still shows our srcdoc; null after it navigated away.
-  const liveWindow = () => (navigatedRef.current ? null : frameRef.current?.contentWindow);
+  // The canvas color the frame last reported (the bridge's backdrop message): undefined until
+  // its first report, null when it paints none. It outlives the document that reported it: a
+  // rewritten or reloaded page keeps the previous color until it reports its own (the bridge
+  // always reports after load), so a dark page is not followed by a flash of frameClassName's
+  // white.
+  const [backdropColor, setBackdropColor] = useState<string | null | undefined>(undefined);
+  const liveWindow = () => liveFrameWindow(navigatedRef, frameRef);
 
   useEffect(() => {
     if (waitingForState) return;
     let cancelled = false;
-    const options = {
-      csp: buildArtifactCsp({ allowCdn }),
-      bridgeScript: buildArtifactBridgeScript(initialTheme, state),
-    };
-    const finish = (srcDoc: string | null, notices: string[], error: string | null = null) => {
-      if (!cancelled) setBuilt({ content, allowCdn, state, srcDoc, notices, error });
-    };
-    if (kind === "svg") {
-      finish(buildSandboxedSvgDocument(content, options), []);
-    } else {
-      const doc = parseArtifactHtml(content);
-      const loader = createArtifactAssetLoader(path, read ?? (() => Promise.resolve(null)));
-      inlineArtifactHtmlAssets(doc, loader, { allowCdn })
-        .then((notices) => finish(finalizeSandboxedDocument(doc, options), notices))
-        .catch((error: unknown) => finish(null, [], getErrorMessage(error)));
-    }
+    buildFrameDocument({
+      kind,
+      content,
+      path,
+      allowCdn,
+      read,
+      bridgeScript: (followsColorScheme) =>
+        buildArtifactBridgeScript(
+          initialTheme,
+          state,
+          initialAppearance,
+          followsColorScheme,
+          forwardsViewSwitch
+        ),
+    })
+      .then((frameDocument) => {
+        if (!cancelled) setBuilt({ content, allowCdn, state, ...frameDocument });
+      })
+      .catch((error: unknown) => {
+        console.error("[Artifacts] building the frame document failed:", getErrorMessage(error));
+      });
     return () => {
       cancelled = true;
     };
-  }, [kind, content, path, allowCdn, initialTheme, read, waitingForState, state]);
+  }, [
+    kind,
+    content,
+    path,
+    allowCdn,
+    initialTheme,
+    initialAppearance,
+    read,
+    waitingForState,
+    state,
+    forwardsViewSwitch,
+  ]);
 
   // Bridge, host side: only messages from this frame's window, rate limited, schema-valid.
   const onFrameKey = props.onFrameKey;
@@ -279,14 +451,15 @@ export function SandboxedArtifactFrame(props: {
     const handler = (event: MessageEvent) => {
       const message = acceptArtifactFrameMessage(
         event,
-        navigatedRef.current ? null : frameRef.current?.contentWindow,
+        liveFrameWindow(navigatedRef, frameRef),
         allowMessage
       );
       if (message == null) return;
       switch (message.type) {
         case "key":
         case "sidebarKey":
-          handleFrameKeyMessage(message, frameRef.current, onFrameKey);
+        case "interruptKey":
+          handleFrameKeyMessage(message, frameRef.current, { onFrameKey, mainPaneInterruptKey });
           break;
         case "send":
           // A live click or key in this frame sends at once, one message per click; any other
@@ -315,24 +488,35 @@ export function SandboxedArtifactFrame(props: {
           onAnnotate(pickFromFrameAnnotation(message, frame.getBoundingClientRect()));
           break;
         }
+        case "backdrop":
+          setBackdropColor(artifactBackdropColor(message.color));
+          break;
       }
     };
     window.addEventListener("message", handler);
     return () => window.removeEventListener("message", handler);
-  }, [allowMessage, onFrameKey, interactions, onAnnotate, navigatedRef, openWorkspace]);
+  }, [
+    allowMessage,
+    onFrameKey,
+    mainPaneInterruptKey,
+    interactions,
+    onAnnotate,
+    navigatedRef,
+    openWorkspace,
+  ]);
 
   const annotating = onAnnotate != null;
   useEffect(() => {
-    postArtifactAnnotateMode(
-      navigatedRef.current ? null : frameRef.current?.contentWindow,
-      annotating
-    );
+    postArtifactAnnotateMode(liveFrameWindow(navigatedRef, frameRef), annotating);
   }, [annotating, navigatedRef]);
 
   // Keep the artifact's view of the theme current without reloading it.
   useEffect(() => {
-    postArtifactTheme(navigatedRef.current ? null : frameRef.current?.contentWindow, theme);
-  }, [theme, navigatedRef]);
+    postArtifactTheme(liveFrameWindow(navigatedRef, frameRef), theme, {
+      themeName: themeMode,
+      variables: readAppStyleVariables("xum"),
+    });
+  }, [theme, themeMode, navigatedRef]);
 
   if (current == null) return <Notice>Loading…</Notice>;
   if (current.error != null) return <div className="text-danger p-4 text-xs">{current.error}</div>;
@@ -373,10 +557,17 @@ export function SandboxedArtifactFrame(props: {
         onLoad={() => {
           // A second load is the frame navigating away: never re-post into it.
           if (!guard.onLoad()) return;
-          postArtifactTheme(liveWindow(), theme);
+          postArtifactTheme(liveWindow(), theme, currentAppearance());
           if (annotating) postArtifactAnnotateMode(liveWindow(), true);
         }}
-        className={`min-h-0 w-full flex-1 border-0 bg-white ${annotating ? "cursor-crosshair" : ""}`}
+        className={frameClassName(current.followsColorScheme, annotating, backdropColor)}
+        // SECURITY AUDIT: the frame's script picks this color. It only ever reaches this one CSS
+        // property through React's style object, bounded in length, limited to a plain computed
+        // color (no var(), url() or keywords) and checked with CSS.supports
+        // (artifactBackdropColor). WebKit shows the iframe element's background wherever the
+        // page's canvas is not painted (overscroll, a frame that just grew), so it must match
+        // the page's own background, not frameClassName's white.
+        style={{ backgroundColor: backdropColor ?? undefined }}
         data-testid="artifact-frame"
       />
     </div>

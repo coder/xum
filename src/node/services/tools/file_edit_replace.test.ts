@@ -10,6 +10,7 @@ import type {
 import type { ToolExecutionOptions } from "ai";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { getTestDeps } from "./testHelpers";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 // Mock ToolCallOptions for testing
 const mockToolCallOptions: ToolExecutionOptions<unknown> = {
@@ -50,6 +51,7 @@ describe("file_edit_replace_string tool", () => {
   it("should apply a single edit successfully", async () => {
     await setupFile(testFilePath, "Hello world\nThis is a test\nGoodbye world");
     const tool = createFileEditReplaceStringTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -75,6 +77,7 @@ describe("file_edit_replace_string tool", () => {
   it("matches LF args against a CRLF file and preserves CRLF", async () => {
     await setupFile(testFilePath, "Hello world\r\nThis is a test\r\nGoodbye world\r\n");
     const tool = createFileEditReplaceStringTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -99,6 +102,7 @@ describe("file_edit_replace_string tool", () => {
     const original = "Hello world\n";
     await setupFile(testFilePath, original);
     const tool = createFileEditReplaceStringTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
@@ -121,6 +125,7 @@ describe("file_edit_replace_string tool", () => {
     const original = "repeat\nrepeat\n";
     await setupFile(testFilePath, original);
     const tool = createFileEditReplaceStringTool({
+      sessionLocks: nodeSessionLocks,
       ...getTestDeps(),
       cwd: testDir,
       runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),

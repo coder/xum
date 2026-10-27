@@ -31,6 +31,7 @@ import {
   startAbandonedBranchSummaryInBackground,
 } from "../branchSummary";
 import { InitStateManager } from "../initStateManager";
+import { nodeSessionLocks } from "./nodeSessionLocks";
 import { addPinnedPath } from "../pinnedArtifactFiles";
 import { acquireRollbackFileLock } from "../refinement/refinementRollback";
 import { SessionTimingService } from "../sessionTimingService";
@@ -61,6 +62,7 @@ import {
 } from "../workspaceTurnManager.testHarness";
 import { removeSessionDirUnderMemoryLocks } from "../workspaceRemoval";
 import { workspaceUseLeasesFor } from "../workspaceUseLeases";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
 
 /**
  * Each scenario names the temp roots and workspace ids that it creates, and
@@ -119,9 +121,13 @@ export async function oneTurn(names: LockNames): Promise<void> {
   try {
     await b.session.sendMessage("hello", sendOptions);
     const sessionDir = path.join(b.config.sessionsDir, workspaceId);
-    await setTodosForSessionDir(workspaceId, sessionDir, [
-      { content: "Record the locks", status: "in_progress" },
-    ]);
+    await setTodosForSessionDir(
+      workspaceId,
+      sessionDir,
+      [{ content: "Record the locks", status: "in_progress" }],
+      nodeSessionLocks,
+      nodeSessionFiles
+    );
     const reviewPane = createReviewPaneUpdateTool(
       createTestToolConfig(b.config.sessionsDir, {
         workspaceId,
@@ -234,51 +240,53 @@ export async function oneRefineApply(names: LockNames): Promise<void> {
     // The shared HistoryService seam (AGENTS.md): its temp root is the Xum home here.
     const { historyService, config, tempDir: muxHome, cleanup } = await createTestHistoryService();
     names.root(muxHome, "refine");
-    await fs.mkdir(path.join(muxHome, "memory"), { recursive: true });
-    await config.editConfig((cfg) => {
-      cfg.projects.set("/projects/demo", {
-        workspaces: [{ id: workspaceId, name: workspaceId, path: workspacePath }],
-      });
-      return cfg;
-    });
-    const metaService = new MemoryMetaService(muxHome);
-    const model = new MockLanguageModelV3({
-      doStream: () =>
-        Promise.resolve({
-          stream: simulateReadableStream({
-            chunks: [
-              { type: "text-start", id: "t1" },
-              { type: "text-delta", id: "t1", delta: "Nothing worth distilling." },
-              { type: "text-end", id: "t1" },
-              finishChunk(),
-            ] satisfies LanguageModelV3StreamPart[],
-          }),
-        }),
-    });
-    const enabled = new Set<ExperimentId>([
-      EXPERIMENT_IDS.RLM,
-      EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
-    ]);
-    const service = new RefineService(
-      config,
-      new MemoryService(config, metaService),
-      metaService,
-      historyService,
-      {
-        createModelWithPinnedMetadata: (modelString: string) =>
-          Promise.resolve(Ok({ model, metadataModel: modelString })),
-        getWorkspaceMetadata: () => Promise.resolve(Err("no metadata in this scenario")),
-      },
-      { isExperimentEnabled: (id) => enabled.has(id) },
-      { emitChatMessage: () => undefined }
-    );
-    for (const [index, text] of ["Run the tests.", "Lesson: run bun install first."].entries()) {
-      await historyService.appendToHistory(
-        workspaceId,
-        createMuxMessage(`user-${index}`, "user", text, { timestamp: 1_000 + index })
-      );
-    }
+    // The seeding runs inside the try, so a failed append or config edit
+    // still removes the temp root of createTestHistoryService() (#7326 Finding 3).
     try {
+      await fs.mkdir(path.join(muxHome, "memory"), { recursive: true });
+      await config.editConfig((cfg) => {
+        cfg.projects.set("/projects/demo", {
+          workspaces: [{ id: workspaceId, name: workspaceId, path: workspacePath }],
+        });
+        return cfg;
+      });
+      const metaService = new MemoryMetaService(muxHome);
+      const model = new MockLanguageModelV3({
+        doStream: () =>
+          Promise.resolve({
+            stream: simulateReadableStream({
+              chunks: [
+                { type: "text-start", id: "t1" },
+                { type: "text-delta", id: "t1", delta: "Nothing worth distilling." },
+                { type: "text-end", id: "t1" },
+                finishChunk(),
+              ] satisfies LanguageModelV3StreamPart[],
+            }),
+          }),
+      });
+      const enabled = new Set<ExperimentId>([
+        EXPERIMENT_IDS.RLM,
+        EXPERIMENT_IDS.PROGRAMMATIC_TOOL_CALLING,
+      ]);
+      const service = new RefineService(
+        config,
+        new MemoryService(config, metaService),
+        metaService,
+        historyService,
+        {
+          createModelWithPinnedMetadata: (modelString: string) =>
+            Promise.resolve(Ok({ model, metadataModel: modelString })),
+          getWorkspaceMetadata: () => Promise.resolve(Err("no metadata in this scenario")),
+        },
+        { isExperimentEnabled: (id) => enabled.has(id) },
+        { emitChatMessage: () => undefined }
+      );
+      for (const [index, text] of ["Run the tests.", "Lesson: run bun install first."].entries()) {
+        await historyService.appendToHistory(
+          workspaceId,
+          createMuxMessage(`user-${index}`, "user", text, { timestamp: 1_000 + index })
+        );
+      }
       await service.run(workspaceId);
       await service.apply(workspaceId, "no-proposal-rendered");
     } finally {
@@ -311,7 +319,7 @@ export async function oneFork(
         getWorkspaceMetadata: () => Promise.resolve(Err("no metadata in this scenario")),
       },
       workspaceId,
-      sessionDir,
+      marker: { sessionDir, locks: historyService.locks },
       abandonedMessages: [],
       guardTailMessageId: "none",
     });
@@ -323,7 +331,10 @@ export async function oneFork(
       label: "scenario branch summary marker",
     });
     const waitCall = nextLockCall(path.join(sessionDir, "branch-summary.lock"));
-    const waiting = awaitPendingBranchSummary("ws-record-fork-foreign", sessionDir);
+    const waiting = awaitPendingBranchSummary("ws-record-fork-foreign", {
+      sessionDir,
+      locks: historyService.locks,
+    });
     await waitCall;
     await marker[Symbol.asyncDispose]();
     await waiting;
@@ -384,13 +395,19 @@ export async function oneChildReport(names: LockNames): Promise<void> {
       childTaskId: "ws-record-child",
       parentWorkspaceId: workspaceId,
       ancestorWorkspaceIds: [workspaceId],
+      locks: nodeSessionLocks,
     };
     // subagentReportArtifacts.ts has two lock calls: a step name keeps them apart.
     await step("upsert report", () =>
       upsertSubagentReportArtifact({ ...child, reportMarkdown: "Done." })
     );
     await upsertSubagentFailureArtifact({ ...child, errorType: "unknown", errorMessage: "down" });
-    const unchanged = { workspaceId, workspaceSessionDir, update: () => undefined };
+    const unchanged = {
+      workspaceId,
+      workspaceSessionDir,
+      update: () => undefined,
+      locks: nodeSessionLocks,
+    };
     await step("update reports", () => updateSubagentReportArtifactsFile(unchanged));
     await updateSubagentTranscriptArtifactsFile(unchanged);
     await updateSubagentGitPatchArtifactsFile(unchanged);
@@ -433,7 +450,9 @@ export async function oneInitAndPlan(names: LockNames): Promise<void> {
       {
         id: workspaceId,
         runtimeConfig: { type: "ssh", host: "plans.invalid", srcBaseDir: "~/xum" },
-      }
+      },
+      // The scenario records the Node lock calls.
+      nodeSessionLocks
     );
   });
 }

@@ -19,6 +19,8 @@ import {
   type StoreTags,
 } from "@/node/services/di/tags";
 import { HostFilesNode, HostPathsNode } from "@/node/services/hostFiles/nodeHostFiles";
+import { HostProcessesNode } from "@/node/services/hostProcesses/nodeHostProcesses";
+import { RuntimeFactoryNode } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { SessionFilesNode } from "@/node/services/sessionFiles/nodeSessionFiles";
 
 /**
@@ -36,6 +38,8 @@ export function StoresLive(stores: ConfigStores): Layer.Layer<StoreTags> {
     // The same for the host files and paths outside the session dirs.
     HostFilesNode,
     HostPathsNode,
+    HostProcessesNode,
+    RuntimeFactoryNode,
     SessionLocksNode,
     Layer.succeed(ProvidersConfigStoreTag)(stores.providersConfigStore),
     Layer.succeed(SecretsStoreTag)(stores.secretsStore),

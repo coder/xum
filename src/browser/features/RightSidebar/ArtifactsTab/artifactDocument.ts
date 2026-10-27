@@ -9,6 +9,7 @@ import { toImageDataUrl, type createArtifactAssetLoader } from "./artifactAssets
  * <meta> as the FIRST child of <head>, followed by the bridge <script>. A meta CSP only
  * governs content after it, and because the HTML parser places every artifact node after
  * <head>'s first child, nothing the artifact wrote can run or load before the policy applies.
+ * A host <style> (TEXT_SIZE_ADJUST_STYLE) follows the bridge scripts.
  * Never build these documents by string concatenation.
  */
 
@@ -42,6 +43,9 @@ function insertSecurityPreamble(doc: Document, options: SandboxedDocumentOptions
     previous.after(script);
     previous = script;
   }
+  const style = doc.createElement("style");
+  style.textContent = TEXT_SIZE_ADJUST_STYLE;
+  previous.after(style);
 }
 
 function serialize(doc: Document): string {
@@ -50,6 +54,31 @@ function serialize(doc: Document): string {
 
 export function parseArtifactHtml(html: string): Document {
   return new window.DOMParser().parseFromString(html, "text/html");
+}
+
+/**
+ * Whether a parsed HTML page uses only the browser's default colors: no styles, scripts,
+ * presentational color attributes or graphics. Only such a page can take the app theme's color
+ * scheme (a dark canvas with light text) without some of its colors staying dark on dark.
+ */
+export function isUnstyledHtmlDocument(doc: Document): boolean {
+  return (
+    doc.querySelector(
+      'style, link[rel~="stylesheet"], script, [style], [bgcolor], [color], [text], img, svg, canvas, video, picture, object, embed, iframe'
+    ) == null
+  );
+}
+
+/**
+ * Whether a parsed HTML page shows nothing: its body is empty (a skeleton, comments) and it is
+ * unstyled, as a script or CSS (`body::before { content: ... }`, a background) can still draw.
+ */
+export function isBlankHtmlDocument(doc: Document): boolean {
+  return (
+    isUnstyledHtmlDocument(doc) &&
+    doc.body.childElementCount === 0 &&
+    (doc.body.textContent ?? "").trim() === ""
+  );
 }
 
 /** Final step for HTML artifacts: add the CSP + bridge preamble and serialize. */
@@ -61,12 +90,15 @@ export function finalizeSandboxedDocument(
   return serialize(doc);
 }
 
-export function buildSandboxedHtmlDocument(
-  html: string,
-  options: SandboxedDocumentOptions
-): string {
-  return finalizeSandboxedDocument(parseArtifactHtml(html), options);
-}
+/**
+ * iOS WebKit autosizes (inflates) long text blocks inside iframes, and the host's own
+ * text-size-adjust in globals.css does not reach the srcdoc document, so status pages became
+ * unreadable on phones. The anonymous, first-declared `@layer` ranks below every artifact layer
+ * and unlayered rule (an unlayered host rule would beat layered artifact rules), and `:where`
+ * keeps zero specificity, so every artifact rule still overrides it.
+ */
+const TEXT_SIZE_ADJUST_STYLE =
+  "@layer{:where(html){-webkit-text-size-adjust:100%;text-size-adjust:100%}}";
 
 const SVG_FRAME_STYLE =
   "html,body{margin:0;height:100%}" +

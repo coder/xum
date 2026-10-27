@@ -7,22 +7,23 @@
  * last user text carries a Token Budget warning with a memory write to the session checkpoint,
  * and answers everything else (tool results, "Continue", side requests) with short text.
  *
- * The fixture reports provider usage through a per-test function of the request size. That is the
- * gap under test: stage prompts must be decided from the built request's estimate (E), not from
- * saved provider usage, or they are published and then refused at the ceiling (#5286).
+ * The fixture reports provider usage through a per-test function of the request size. Stage
+ * prompts are decided on E, the count the turn-start check enforces: the newest reply's provider
+ * usage plus the messages after it (#7662), else the full estimate. Step zero counts the same
+ * way, so a published prompt is never refused at the ceiling (#5286).
  *
  * Numbers (limit 100,000): hard ceiling C = 91,808, final point F = 81,616, slider 70 → handoff
- * point H = 70,000. Measured with these fixtures: E ≈ 43.8k for the first request (system prompt
- * and tool schemas), and each "read 4 files" turn adds ≈ 15.7k, so the third turn starts at
- * E ≈ 75k, inside the handoff band.
+ * point H = 70,000. Measured with these fixtures and the real tokenizer: the system prompt and
+ * tool schemas count ≈ 43.8k once padded (below), and each file read adds ≈ 3.9k, so after two
+ * "read 4 files" turns the third turn starts at E ≈ 73k, inside the handoff band.
  *
  * The system prompt also lists global skills and instructions found under HOME, so the first E
- * differs between machines (≈ 37.1k with an empty HOME, as in CI). After the first turn each
- * scenario pads the workspace scratchpad by the difference, so every later E matches the
- * measured bands. The pad and the later growth go in the scratchpad, not AGENTS.md: inside a
- * context segment an AGENTS.md change is sent as a row with the whole new block while the
- * system prompt keeps the old one (prompt-cache mechanism 10), so it would grow E by more
- * than its own size.
+ * differs between machines (≈ 25k with an empty HOME, as in CI). After the first turn each
+ * scenario pads the workspace scratchpad up to CALIBRATED_FIRST_ESTIMATE, so every later E stays
+ * within about 1k of the measured bands. The pad and the later growth go in the scratchpad, not
+ * AGENTS.md: inside a context segment an AGENTS.md change is sent as a row with the whole new
+ * block while the system prompt keeps the old one (prompt-cache mechanism 10), so it would grow
+ * E by more than its own size.
  */
 
 import assert from "node:assert/strict";
@@ -58,7 +59,7 @@ const TEST_TIMEOUT_MS = 180_000;
 const WARNING_MARKER = "Context budget ~";
 const CHECKPOINT_PATH = "/memories/session/checkpoint.md";
 const NOTE_FILES = 40;
-/** E of the first request on the machine where the bands in this file were measured. */
+/** First-request E that each scenario is padded to; the bands in this file were measured from it. */
 const CALIBRATED_FIRST_ESTIMATE = 43_800;
 
 interface Block {
@@ -377,26 +378,41 @@ async function startScenario(options: {
 
 type Scenario = Awaited<ReturnType<typeof startScenario>>;
 
-/** Saved usage stays far below every stage point; only the request estimate crosses them. */
-const LOW_USAGE: UsageFor = () => 1_000;
+/** Provider usage that tracks the full estimate, so the anchored E keeps the measured bands. */
+const TRACKING_USAGE: UsageFor = (chars) => Math.round(chars / 2.4);
+
+/** Three turns; only the last turn start crosses H (E ≈ 76.5k), and the handoff is published. */
+async function sendUntilHandoff(scenario: Scenario) {
+  await scenario.send("Turn 0: read 4 files.");
+  // One file keeps turn 1's estimate below H, so its settlement opens no stage.
+  await scenario.send("Turn 1: read 1 files.");
+  await scenario.send(`Turn 2: read 4 files. Pasted deploy log:\n${filler("Paste", 14_000)}`);
+}
 
 describeIntegration("Token Budget stages (loopback fixture)", () => {
+  // Rows record systemMessageTokens with the real tokenizer, as in production: the turn anchor
+  // compares the sent system text against that count (#7662).
+  const forceRealTokenizer = process.env.XUM_FORCE_REAL_TOKENIZER;
   beforeAll(async () => {
+    process.env.XUM_FORCE_REAL_TOKENIZER = "1";
     await preloadTestModules();
   });
+  afterAll(() => {
+    if (forceRealTokenizer == null) delete process.env.XUM_FORCE_REAL_TOKENIZER;
+    else process.env.XUM_FORCE_REAL_TOKENIZER = forceRealTokenizer;
+  });
 
-  describe("estimate-only crossing (R2a)", () => {
+  describe("turn-start crossing (R2a)", () => {
     let scenario: Scenario;
     beforeAll(async () => {
-      scenario = await startScenario({ slider: 70, usageFor: LOW_USAGE });
-      for (const turn of [0, 1, 2]) await scenario.send(`Turn ${turn}: read 4 files.`);
+      scenario = await startScenario({ slider: 70, usageFor: TRACKING_USAGE });
+      await sendUntilHandoff(scenario);
     }, TEST_TIMEOUT_MS);
     afterAll(async () => {
       await scenario?.close();
     });
 
     test("publishes the handoff from the request estimate and the checkpoint write runs", async () => {
-      // Settlement schedules in provider terms (1,000 tokens), so only turn start can see E ≥ H.
       const stage = scenario.stageRequests();
       expect(stage).toHaveLength(1);
       expect(stage[0].lastUserText).toContain("Turn 2: read 4 files.");
@@ -457,9 +473,10 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
   });
 
   test(
-    "realistic usage gap (R2b): no warning row is followed by a rollover without a reply",
+    "realistic usage gap (R2b): a warning decided on the provider count is answered, not refused",
     async () => {
-      // E/usage ≈ 1.5, as when provider usage trails the full request estimate.
+      // E/usage ≈ 1.5, as when provider usage trails the full request estimate. E follows the
+      // provider count (#7662), and step zero counts the same way.
       const scenario = await startScenario({
         slider: 70,
         usageFor: (chars) => Math.round(chars / 3.6),
@@ -467,11 +484,17 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
       try {
         await scenario.send("Turn 0: read 4 files.");
         await scenario.send("Turn 1: read 4 files.");
-        // A large paste takes E past the ceiling while saved usage plus the paste reads only ~74k.
+        // Saved usage plus the paste reads ≈76k, inside the handoff band.
         await scenario.send(`Turn 2: read 0 files. Pasted deploy log:\n${filler("Paste", 25_000)}`);
         const history = await scenario.history();
-        // The ceiling was reached (non-vacuous): the paste rolled the window over.
-        expect(history.some(isReset)).toBe(true);
+        expect(history.filter(isWarning).map((row) => row.metadata?.muxMetadata?.handoff)).toEqual([
+          true,
+        ]);
+        // Non-vacuous: the full estimate (≈2.4 request chars per token) of the sent stage request
+        // is past the hard ceiling, so a full count at step zero would have refused it.
+        const [stage] = scenario.stageRequests();
+        expect(stage.chars / 2.4).toBeGreaterThan(91_808);
+        expect(history.some(isReset)).toBe(false);
         const unanswered = history.flatMap((row, index) => {
           if (!isWarning(row)) return [];
           const next = history.slice(index + 1).find((r) => r.role === "assistant");
@@ -489,17 +512,14 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
     "instruction growth: no warning when the row and its reserve no longer fit, and the turn runs",
     async () => {
       // Usage tracks E here, so an old usage-based decision would also open the handoff stage.
-      const scenario = await startScenario({
-        slider: 70,
-        usageFor: (chars) => Math.round(chars / 2.4),
-      });
+      const scenario = await startScenario({ slider: 70, usageFor: TRACKING_USAGE });
       try {
         await scenario.send("Turn 0: read 4 files.");
         // One file keeps turn 1's estimate below H, so its settlement opens no stage (#5223).
         await scenario.send("Turn 1: read 1 files.");
-        // Grow the instructions so E ≈ 90.8k: below C (91,808), but E′ + 2,048 ≥ C. The assertions bracket
+        // Grow the instructions so E ≈ 90.6k: below C (91,808), but E′ + 2,048 ≥ C. The assertions bracket
         // the band: less growth publishes a warning, more is refused and rolls the window over.
-        await scenario.writeInstructions(filler("Instruction", 26_270));
+        await scenario.writeInstructions(filler("Instruction", 29_400));
         await scenario.send("Turn 2: read 0 files.");
         const history = await scenario.history();
         expect(history.filter(isWarning)).toEqual([]);
@@ -519,13 +539,13 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
   test(
     "after a restart the next send decides from its own estimate and does not repeat the handoff",
     async () => {
-      const scenario = await startScenario({ slider: 70, usageFor: LOW_USAGE });
+      const scenario = await startScenario({ slider: 70, usageFor: TRACKING_USAGE });
       try {
-        for (const turn of [0, 1, 2]) await scenario.send(`Turn ${turn}: read 4 files.`);
+        await sendUntilHandoff(scenario);
         expect((await scenario.history()).filter(isWarning)).toHaveLength(1);
         await scenario.restart();
         // E ≈ 84k after restart: inside the final band [81,616, C − 4,048), handoff already claimed.
-        await scenario.writeInstructions(filler("Instruction", 7_500));
+        await scenario.writeInstructions(filler("Instruction", 5_500));
         await scenario.send("Turn 3: read 0 files.");
         const warnings = (await scenario.history()).filter(isWarning);
         expect(
@@ -549,13 +569,13 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
   test(
     "a refusal fallback with a stage due is sent without one, and the next turn start offers it once",
     async () => {
-      // The primary's window (200k, H = 140k) has no stage due at E ≈ 75k. The fallback's window
+      // The primary's window (200k, H = 140k) has no stage due at E ≈ 73k. The fallback's window
       // (100k, H = 70k) does. The fallback request is sent as built, with no stage decision: the
       // warning cannot sit before the turn's placeholder row, and a handover would need a new
       // mechanism (#5286). The stage comes at the next turn start that reaches it, one turn late.
       const scenario = await startScenario({
         slider: 70,
-        usageFor: LOW_USAGE,
+        usageFor: TRACKING_USAGE,
         refusalFallback: { primaryLimit: 200_000 },
       });
       try {
@@ -583,6 +603,40 @@ describeIntegration("Token Budget stages (loopback fixture)", () => {
         expect(warnings.map((row) => row.metadata?.muxMetadata?.handoff)).toEqual([true]);
         expect(scenario.stageRequests().map((r) => r.model)).toEqual([FALLBACK_MODEL_ID]);
         expect(scenario.stageRequests()[0]?.lastUserText).toContain("Turn 3: read 0 files.");
+      } finally {
+        await scenario.close();
+      }
+    },
+    TEST_TIMEOUT_MS
+  );
+
+  test(
+    "a rollover whose first request is past the handoff point publishes the warning in the new window",
+    async () => {
+      const scenario = await startScenario({ slider: 70, usageFor: TRACKING_USAGE });
+      try {
+        await scenario.send("Turn 0: read 4 files.");
+        // Two files keep turn 1's estimate below H, so the old window publishes no stage.
+        await scenario.send("Turn 1: read 2 files.");
+        // The paste takes the old window past C, so the send rolls it over. The fresh window's
+        // own first request (system prompt, lead-in, paste) is past H (70k) and still has room
+        // for the row and its reserve below C (#7215).
+        await scenario.send(`Turn 2: read 0 files. Pasted deploy log:\n${filler("Paste", 30_000)}`);
+        const history = await scenario.history();
+        const reset = history.findLastIndex(isReset);
+        expect(reset).toBeGreaterThanOrEqual(0);
+        const window = history.slice(reset);
+        const user = window.findIndex((row) => textOf(row.parts as Block[]).includes("Pasted"));
+        expect(user).toBeGreaterThan(0);
+        // The warning follows the copied user row, and the request that was sent carries it.
+        const warning = window[user + 1];
+        expect(warning && isWarning(warning)).toBe(true);
+        expect(warning?.metadata?.muxMetadata?.handoff).toBe(true);
+        const stage = scenario.stageRequests();
+        expect(stage).toHaveLength(1);
+        expect(stage[0]?.messages.some((m) => textOf(m.blocks).includes("Pasted"))).toBe(true);
+        // The new window's request is the one with the warning: nothing sealed sits before it.
+        expect(stage[0]?.messages.some((m) => textOf(m.blocks).includes("Turn 0"))).toBe(false);
       } finally {
         await scenario.close();
       }

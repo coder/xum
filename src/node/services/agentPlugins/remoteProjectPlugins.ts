@@ -69,6 +69,20 @@ export function buildRemotePluginListingScript(checkoutRoot: string, containers:
     `tab=$(printf '\\t')`,
     `nl='`,
     `'`,
+    // One `readlink -f` (else one `realpath`) for all links of a walk: one fork per link took ~1 ms,
+    // seconds near the entry cap (#7249). GNU prints no line for a link that fails and BusyBox
+    // readlink takes one file, so the batch counts only when it exits 0 with one line per link.
+    // Otherwise each link runs rp alone, with an empty target when it fails. The subshell keeps
+    // set -f and IFS from the rest of the script.
+    `links() (`,
+    `  set -f; IFS=$nl; lk=$1`,
+    `  ts=$(readlink -f $lk 2>/dev/null) || ts=$(realpath $lk 2>/dev/null) || ts=`,
+    `  set -- $lk; n=$#; set -- $ts; [ $# -eq "$n" ] || set --`,
+    `  for e in $lk; do`,
+    `    if [ $# -gt 0 ]; then t=$1; shift; else t=$(rp "$e") || t=; fi`,
+    `    printf 'L\\t%s\\t%s\\n' "$t" "$e"`,
+    `  done`,
+    `)`,
     `count=0`,
     `files=`,
     `walked=$nl`,
@@ -85,7 +99,7 @@ export function buildRemotePluginListingScript(checkoutRoot: string, containers:
     `  l=$(${tree} -type l) || exit 7`,
     `  f=$(${tree} -type f -size -${MAX_FILE_SIZE + 1}c) || exit 7`,
     `  [ -z "$d" ] || printf '%s\\n' "$d" | sed "s|^|D\${tab}\${tab}|"`,
-    `  [ -z "$l" ] || printf '%s\\n' "$l" | while IFS= read -r e; do t=$(rp "$e") || t=; printf 'L\\t%s\\t%s\\n' "$t" "$e"; done`,
+    `  [ -z "$l" ] || links "$l"`,
     `  [ -z "$f" ] || { printf '%s\\n' "$f" | sed "s|^|F\${tab}\${tab}|"; files="$files$f$nl"; }`,
     `}`,
     `for c in "$@"; do`,

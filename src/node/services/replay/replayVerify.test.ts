@@ -28,7 +28,6 @@ import {
 } from "./replayFixture";
 import {
   collectFullHistory,
-  readRecordedSteps,
   replayVerifySession,
   type ReplayVerifySessionResult,
 } from "./replayVerify";
@@ -150,7 +149,7 @@ describe("replayVerifySession pairing", () => {
     ]);
   });
 
-  test("the step audit keeps the log order of overlapping runs", async () => {
+  test("the step audit orders overlapping runs by log order, or by observation when recorded", async () => {
     using tmp = new DisposableTempDir("replay-verify-step-order");
     const ctx = createReplayFixtureSessionContext(tmp.path);
     for (const userText of ["First.", "Second."]) {
@@ -167,14 +166,39 @@ describe("replayVerifySession pairing", () => {
     ctx.devtoolsLines.push(
       JSON.stringify({ type: "step", step: { ...firstStep, id: "step-1b", stepNumber: 1 } })
     );
-    await flushReplayFixtureDevtools(ctx);
+    // Without observation records the audit compares in log order, so A1 breaks against B0.
+    expect((await verify(ctx)).stepPrefix).toMatchObject({
+      comparedPairs: 2,
+      breaks: [{ runId: "run-1", stepNumber: 1, boundary: "turn" }],
+    });
 
-    const steps = await readRecordedSteps(ctx.sessionDir);
-    expect(steps.map((step) => `${step.runId}:${step.stepNumber}`)).toEqual([
-      "run-1:0",
-      "run-2:0",
-      "run-1:1",
-    ]);
+    // The monitor observed A0, A1, B0 in one millisecond. Only the observation counter orders
+    // them, so the log read must keep it: A1 then repeats A0 and B0 extends it.
+    const loggedStepIds = ctx.devtoolsLines.flatMap((line) => {
+      const entry = JSON.parse(line) as { type: string; step?: DevToolsStep };
+      return entry.type === "step" && entry.step != null ? [entry.step.id] : [];
+    });
+    expect(loggedStepIds).toHaveLength(3);
+    const observedSeqInLogOrder = [1, 3, 2];
+    loggedStepIds.forEach((stepId, index) => {
+      ctx.devtoolsLines.push(
+        JSON.stringify({
+          type: "step-update",
+          stepId,
+          update: {
+            promptCacheWire: {
+              route: "anthropic",
+              modelString: REPLAY_FIXTURE_MODEL,
+              cacheMarkersInjected: true,
+              dispatched: true,
+              observedAt: firstStep.startedAt,
+              observedSeq: observedSeqInLogOrder[index],
+            },
+          },
+        })
+      );
+    });
+    expect((await verify(ctx)).stepPrefix).toMatchObject({ comparedPairs: 2, breaks: [] });
   });
 
   test("a compact-agent turn without a compaction request row is skipped", async () => {
@@ -417,11 +441,6 @@ describe("replayVerifySession pairing", () => {
       comparedPairs: 2,
       breaks: [{ runId: "run-2", boundary: "turn" }],
     });
-    // The observation counter survives the read: it orders same-millisecond responses.
-    const cut = (await readRecordedSteps(ctx.sessionDir)).find(
-      (step) => step.stepId === "step-cut"
-    );
-    expect(cut?.promptCacheWire?.observedSeq).toBe(7);
     // A damaged wire record falls back to the old rule, which drops a failed step without usage.
     ctx.devtoolsLines[3] = JSON.stringify({
       type: "step-update",

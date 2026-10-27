@@ -100,6 +100,7 @@ import type {
 import type { BashMonitorRegistryStore } from "./bashMonitorRegistryStore";
 import type { TurnCoordinator } from "@/node/services/turnCoordinator";
 import { registerInProcessWorkflowRun } from "@/node/services/workflows/workflowArchiveAdmission";
+import type { PreflightCounter } from "@/node/services/preflightCounter";
 
 /**
  * Independent field → tag listing for every DI-built ORPC context field (the
@@ -216,7 +217,7 @@ describe("ServiceContainer", () => {
       dispatchBashMonitorWake(
         dispatch: BashMonitorWakeDispatch
       ): Promise<BashMonitorWakeDispatchOutcome>;
-      drainBashMonitorPersistence(workspaceId: string): Promise<void>;
+      bashMonitorPersistence: { drainBashMonitorPersistence(workspaceId: string): Promise<void> };
       scheduleBashMonitorWakeReconcile(workspaceId: string): void;
     };
     await internal.bashMonitorRecoveryPromise;
@@ -291,7 +292,7 @@ describe("ServiceContainer", () => {
       expect(container.collectRestartBlockers()).toEqual(blocked);
 
       container.backgroundProcessManager.emit("monitor:armed", armed.workspaceId, armed);
-      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence(armed.workspaceId);
       await container.refreshRestartBlockers();
       expect(container.collectRestartBlockers()).toEqual([]);
 
@@ -402,7 +403,7 @@ describe("ServiceContainer", () => {
     try {
       upsert.mockRejectedValueOnce(new Error("registry write failed"));
       container.backgroundProcessManager.emit("monitor:armed", armed.workspaceId, armed);
-      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence(armed.workspaceId);
       await container.refreshRestartBlockers();
       expect(container.collectRestartBlockers()).toEqual([
         { kind: "background-processes", count: 1 },
@@ -419,7 +420,7 @@ describe("ServiceContainer", () => {
       ]);
     } finally {
       releaseWrite?.();
-      await internal.drainBashMonitorPersistence(armed.workspaceId);
+      await internal.bashMonitorPersistence.drainBashMonitorPersistence(armed.workspaceId);
       upsert.mockRestore();
       processes.clear();
     }
@@ -502,9 +503,11 @@ describe("ServiceContainer", () => {
     };
     const project = services.projectService as unknown as { activeGitInits: Set<string> };
     let releaseWorkflow: (() => void) | undefined;
+    let executingAdmission: Disposable | undefined;
+    let sendingAdmission: Disposable | undefined;
     const workspace = services.workspaceService as unknown as {
-      preflightSendCounts: Map<string, number>;
-      preflightExecCounts: Map<string, number>;
+      sendPreflight: { sends: PreflightCounter };
+      operationAdmission: { exec: PreflightCounter };
       initSettlementPromises: Map<string, Promise<void>>;
       initAbortControllers: Map<string, AbortController>;
       removingWorkspaces: Set<string>;
@@ -531,8 +534,8 @@ describe("ServiceContainer", () => {
       processes.processes.set("running", { status: "running", isForeground: false });
       processes.processes.set("foreground", { status: "running", isForeground: true });
       processes.processes.set("finished", { status: "exited", isForeground: false });
-      workspace.preflightSendCounts.set("preflight", 1);
-      workspace.preflightExecCounts.set("executing", 1);
+      sendingAdmission = workspace.sendPreflight.sends.acquire("preflight");
+      executingAdmission = workspace.operationAdmission.exec.acquire("executing");
       expect(services.collectRestartBlockers()).toEqual([
         { kind: "pending-turns", count: 1 },
         { kind: "workspace-inits", count: 3 },
@@ -548,8 +551,8 @@ describe("ServiceContainer", () => {
       streams.workspaceStreams.clear();
       terminals.pendingSessionCreations.clear();
       processes.processes.clear();
-      workspace.preflightSendCounts.clear();
-      workspace.preflightExecCounts.clear();
+      sendingAdmission?.[Symbol.dispose]();
+      executingAdmission?.[Symbol.dispose]();
       workspace.initSettlementPromises.clear();
       workspace.initAbortControllers.clear();
       services.initStateManager.clearInMemoryState("finishing");
@@ -923,6 +926,7 @@ describe("ServiceContainer", () => {
     "coderOauthService.separateDiscoveredModels",
     "experimentsService.initialize",
     "bashAiProxy.restore",
+    "projectService.watchProjectTrust",
     "agentResourceLimits.start",
     "taskService.recoverInterruptedTasks",
   ];
@@ -1215,7 +1219,7 @@ describe("ServiceContainer", () => {
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
-  it("initializeCore records the seven core steps and re-runs them when called again", async () => {
+  it("initializeCore records the eight core steps and re-runs them when called again", async () => {
     services = new ServiceContainer(stores);
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
       undefined

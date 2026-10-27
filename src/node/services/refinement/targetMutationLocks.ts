@@ -64,8 +64,9 @@
 import crypto from "node:crypto";
 import * as path from "node:path";
 
-import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 
 /** Bound on waiting for a contended cross-process target lock (see module doc). */
 export const TARGET_MUTATION_LOCK_TIMEOUT_MS = 2_000;
@@ -88,13 +89,17 @@ export function memoryMutationLockKey(muxRoot: string, physicalRoot: string): st
     : resolved;
 }
 
-/** Acquire one target's in-process mutex + cross-process file lock, then run. */
+/**
+ * Acquire one target's in-process mutex + cross-process file lock, then run. `locks` takes the
+ * file lock (phase 4: SessionLocks); callers without session locks keep the Node default.
+ */
 export async function withTargetMutationLock<T>(
   muxRoot: string | null,
   key: string,
-  fn: () => Promise<T>
+  fn: () => Promise<T>,
+  locks: SessionLocks = nodeSessionLocks
 ): Promise<T> {
-  return withTargetMutationLocks(muxRoot, [key], fn);
+  return withTargetMutationLocks(muxRoot, [key], fn, locks);
 }
 
 /**
@@ -106,7 +111,8 @@ export async function withTargetMutationLock<T>(
 export async function withTargetMutationLocks<T>(
   muxRoot: string | null,
   keys: string[],
-  fn: () => Promise<T>
+  fn: () => Promise<T>,
+  locks: SessionLocks = nodeSessionLocks
 ): Promise<T> {
   const sorted = [...new Set(keys.map((key) => path.resolve(key)))].sort();
   const run = (index: number): Promise<T> => {
@@ -115,7 +121,7 @@ export async function withTargetMutationLocks<T>(
       if (muxRoot === null) {
         return await run(index + 1);
       }
-      await using _fileLock = await acquireTargetFileLock(muxRoot, sorted[index]);
+      await using _fileLock = await acquireTargetFileLock(muxRoot, sorted[index], locks);
       return await run(index + 1);
     });
   };
@@ -123,9 +129,13 @@ export async function withTargetMutationLocks<T>(
 }
 
 /** Acquire the cross-process leg, rethrowing timeouts as actionable errors. */
-async function acquireTargetFileLock(muxRoot: string, key: string): Promise<AsyncDisposable> {
+async function acquireTargetFileLock(
+  muxRoot: string,
+  key: string,
+  locks: SessionLocks
+): Promise<AsyncDisposable> {
   try {
-    return await acquireProcessFileLock({
+    return await locks.acquireProcessFileLock({
       lockPath: targetMutationLockFilePath(muxRoot, key),
       timeoutMs: TARGET_MUTATION_LOCK_TIMEOUT_MS,
       label: "target mutation lock",

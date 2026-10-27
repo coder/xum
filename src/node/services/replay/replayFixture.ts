@@ -133,16 +133,18 @@ export function createReplayFixtureSessionContext(
   sessionDir: string,
   workspaceId: string = REPLAY_FIXTURE_WORKSPACE_ID
 ): ReplayFixtureSessionContext {
+  const historyService = new HistoryService({
+    getSessionDir: () => sessionDir,
+    // Fixture writes take the history write lock under `<rootDir>/locks`;
+    // lockfiles are transient (removed on release).
+    rootDir: path.dirname(sessionDir),
+  });
   return {
     sessionDir,
     workspaceId,
-    historyService: new HistoryService({
-      getSessionDir: () => sessionDir,
-      // Fixture writes take the history write lock under `<rootDir>/locks`;
-      // lockfiles are transient (removed on release).
-      rootDir: path.dirname(sessionDir),
-    }),
-    journal: new DurableEventJournal(sessionDir),
+    historyService,
+    // The journal's locks are the history service's (phase 4: SessionLocks).
+    journal: new DurableEventJournal(sessionDir, historyService.locks, historyService.files),
     devtoolsLines: [],
     turnCounter: 0,
   };

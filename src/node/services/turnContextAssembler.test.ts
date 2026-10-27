@@ -28,6 +28,7 @@ import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { createTestHistoryService } from "./testHistoryService";
+import { createFileChangeNotificationMessage } from "./utils/fileChangeTracker";
 import { createContextBudgetWarning } from "./contextWindowRollover";
 import { extractToolInstructionsFromSources } from "./systemMessage";
 
@@ -39,6 +40,8 @@ import {
   prepareProviderRequestMessages,
   removeMemoryGuidance,
 } from "./turnContextAssembler";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 class TestRuntime extends LocalRuntime {
   constructor(
@@ -126,11 +129,11 @@ async function buildSystemContextForTest(args: {
     modelString: "openai:gpt-5.2",
     cfg: args.cfg,
     providersConfig: null,
-    mcpServers: {},
     memoryToolAvailable: args.memoryToolAvailable,
     tokenBudgetEnabled: args.tokenBudgetEnabled,
     workspaceMemoryWritable: args.workspaceMemoryWritable,
     instructionSources: args.instructionSources,
+    runtimeFactory,
   });
 }
 
@@ -786,46 +789,38 @@ describe("assemblePromptPayload", () => {
       const gemini = await withTail(warning("B"), history, {});
       expect(gemini.system).toBe(stable + warning("B"));
       expect(gemini.volatileSystemTail).toBeUndefined();
-
-      // Anthropic rejects a system row after an assistant row: send B as before and refreeze.
-      const resumed = await withTail(warning("B"), [
-        ...history,
-        createMuxMessage("a2", "assistant", "partial", { partial: true }),
-      ]);
-      expect(roles(resumed).slice(0, 2)).toEqual(["system:stable", `system:${warning("B")}`]);
-      expect(roles(resumed).filter((role) => role.startsWith("system")).length).toBe(2);
-      expect(resumed.volatileSystemTail).toEqual({ text: warning("B"), placement: "system" });
     });
 
-    test("a re-freeze after an assistant-last resume drops the rows before it", async () => {
-      // Codex P1 (PRRT_kwDOPxxmWM6sqho9): row B says it replaces the earlier sections, so if
-      // it stayed after a re-freeze at C, the model would read B as the newer tail.
+    test("an assistant-last request keeps the frozen tail and the next user turn sends the row", async () => {
+      // F36: a retry after a stream failure (or a resume) ends with an assistant row, where
+      // Anthropic rejects a system row. It re-froze at the live tail and rewrote the warm
+      // cache seconds after the failed attempt. Now it keeps A and row B, and records nothing.
       const history = [
         createMuxMessage("u1", "user", "first"),
         answer("a1", "system", warning("A")),
         createMuxMessage("u2", "user", "second"),
         answer("a2", "row", warning("B")),
         createMuxMessage("u3", "user", "third"),
-        createMuxMessage("a3", "assistant", "partial", { partial: true }),
       ];
-      const resumed = await withTail(warning("C"), history);
-      expect(resumed.volatileSystemTail).toEqual({ text: warning("C"), placement: "system" });
-      expect(roles(resumed).filter((role) => role.startsWith("system"))).toEqual([
-        "system:stable",
-        `system:${warning("C")}`,
+      const sent = await withTail(warning("B"), history);
+      const resumed = await withTail(warning("C"), [
+        ...history,
+        createMuxMessage("a3", "assistant", "partial", { partial: true }),
       ]);
+      expect(resumed.volatileSystemTail).toBeUndefined();
+      expect(withoutMarkers(resumed.messages.slice(0, sent.messages.length))).toBe(
+        withoutMarkers(sent.messages)
+      );
+      expect(JSON.stringify(resumed.messages)).not.toContain("[Warning: C]");
 
-      // The next turn keeps the re-freeze: C stays in the system prompt and B does not return.
+      // The next request after a user message sends C as a row.
       const next = await withTail(warning("C"), [
-        ...history.slice(0, -1),
-        answer("a3", "system", warning("C"), { partial: true }),
+        ...history,
+        createMuxMessage("a3", "assistant", "answer"),
         createMuxMessage("u4", "user", "fourth"),
       ]);
-      expect(next.volatileSystemTail).toBeUndefined();
-      expect(roles(next).filter((role) => role.startsWith("system"))).toEqual([
-        "system:stable",
-        `system:${warning("C")}`,
-      ]);
+      expect(next.volatileSystemTail).toEqual({ text: warning("C"), placement: "row" });
+      expect(roles(next).slice(0, 2)).toEqual(["system:stable", `system:${warning("A")}`]);
     });
 
     test("a row skipped on rebuild does not hide its tail from the model", async () => {
@@ -1055,6 +1050,38 @@ describe("assemblePromptPayload", () => {
       );
     });
 
+    test("a retry after an assistant row keeps the frozen skill index in the tool block", async () => {
+      // F36 (live, 2026-10-26): a stream closed mid-turn, and the retry's history ended with
+      // the committed assistant row. The skill list had changed meanwhile, so the retry
+      // re-froze it and rewrote the cached tool block 2 s after the failed attempt.
+      const index = (skills: string) => `\n\nAvailable skills:\n${skills}`;
+      const send = (skills: string, history: MuxMessage[]) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable,
+          tools: {
+            agent_skill_read: tool({
+              description: `Read a skill.${index(skills)}`,
+              inputSchema: jsonSchema({ type: "object" }),
+            }),
+          },
+          skillIndexSection: { prefix: "Read a skill.", block: index(skills) },
+        });
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        createMuxMessage("a1", "assistant", "answer", {
+          skillIndex: { text: index("- a"), placement: "system" },
+        }),
+      ];
+      const retry = await send("- a\n- b", history);
+      expect(retry.tools?.agent_skill_read?.description).toBe(`Read a skill.${index("- a")}`);
+      expect(retry.skillIndex).toBeUndefined();
+      const next = await send("- a\n- b", [...history, createMuxMessage("u2", "user", "second")]);
+      expect(next.tools?.agent_skill_read?.description).toBe(`Read a skill.${index("- a")}`);
+      expect(next.skillIndex).toEqual({ text: index("- a\n- b"), placement: "row" });
+    });
+
     test("a skill index change keeps the frozen tool description and replays from the records", async () => {
       const index = (skills: string) => `\n\nAvailable skills:\n${skills}`;
       const send = (
@@ -1256,6 +1283,84 @@ describe("assemblePromptPayload", () => {
       expect(unchanged.customInstructions).toBeUndefined();
     });
 
+    test("an assistant-last request after an agent switch re-freezes every section", async () => {
+      // Codex PRRT_kwDOPxxmWM6wf11x: a partial turn resumed under another agent must send that
+      // agent's live Tool: instructions, skill index and tail, not the old agent's frozen ones
+      // until a later user turn. A same-agent retry still keeps the frozen sections (F36).
+      const index = (skills: string) => `\n\nAvailable skills:\n${skills}`;
+      const send = (
+        live: { bash: string; skills: string; tail: string },
+        history: MuxMessage[],
+        extra: object = {}
+      ) =>
+        assemble({
+          ...opus,
+          history,
+          systemMessage: stable + live.tail,
+          volatileSystemSuffixLength: live.tail.length,
+          tools: {
+            bash: tool({
+              description: `Run bash.\n\n${live.bash}`,
+              inputSchema: jsonSchema({ type: "object" }),
+            }),
+            agent_skill_read: tool({
+              description: `Read a skill.${index(live.skills)}`,
+              inputSchema: jsonSchema({ type: "object" }),
+            }),
+          },
+          toolInstructions: { bash: live.bash },
+          skillIndexSection: { prefix: "Read a skill.", block: index(live.skills) },
+          ...extra,
+        });
+      const history = [
+        createMuxMessage("u1", "user", "first"),
+        createMuxMessage("a1", "assistant", "answer", {
+          agentId: "exec",
+          toolInstructions: { text: JSON.stringify({ bash: "Use rg." }), placement: "system" },
+          skillIndex: { text: index("- a"), placement: "system" },
+          volatileSystemTail: { text: warning("A"), placement: "system" },
+        }),
+        createMuxMessage("u2", "user", "second"),
+        createMuxMessage("a2", "assistant", "partial", { agentId: "exec", partial: true }),
+      ];
+      const live = { bash: "Use fd.", skills: "- a\n- b", tail: warning("B") };
+
+      const switched = await send(live, history, { effectiveAgentId: "plan" });
+      expect(switched.tools?.bash?.description).toBe("Run bash.\n\nUse fd.");
+      expect(switched.tools?.agent_skill_read?.description).toBe(
+        `Read a skill.${index("- a\n- b")}`
+      );
+      expect(switched.messages[1]).toMatchObject({ role: "system", content: warning("B") });
+      expect(switched.toolInstructions).toEqual({
+        text: JSON.stringify({ bash: "Use fd." }),
+        placement: "system",
+      });
+      expect(switched.skillIndex).toEqual({ text: index("- a\n- b"), placement: "system" });
+      expect(switched.volatileSystemTail).toEqual({ text: warning("B"), placement: "system" });
+      // The replay verifier rebuilds the same request from the turn's records.
+      const replayed = await assemble({
+        ...opus,
+        history,
+        systemMessage: stable + live.tail,
+        volatileSystemSuffixLength: live.tail.length,
+        effectiveAgentId: "plan",
+        replayedTurn: {
+          record: switched.volatileSystemTail,
+          skillIndex: switched.skillIndex,
+          toolInstructions: switched.toolInstructions,
+        },
+      });
+      expect(withoutMarkers(replayed.messages)).toBe(withoutMarkers(switched.messages));
+
+      const retry = await send(live, history, { effectiveAgentId: "exec" });
+      expect(retry.tools?.bash?.description).toBe("Run bash.\n\nUse rg.");
+      expect(retry.tools?.agent_skill_read?.description).toBe(`Read a skill.${index("- a")}`);
+      expect(retry.messages[1]).toMatchObject({ role: "system", content: warning("A") });
+      expect(retry.toolInstructions).toBeUndefined();
+      expect(retry.skillIndex).toBeUndefined();
+      expect(retry.volatileSystemTail).toBeUndefined();
+    });
+
     test("Tool: instructions it cannot place or a corrupt record keep the live descriptions", async () => {
       const send = (description: string, instructions: string, history: MuxMessage[]) =>
         assemble({
@@ -1428,6 +1533,135 @@ describe("assemblePromptPayload", () => {
     expect(JSON.stringify(payload.messages[1])).toContain("approved plan body");
   });
 
+  test("post-compaction attachments leave every row before the newest request unchanged", async () => {
+    // F34: the attachments are request-only and come back every few turns for the segment.
+    // After the compaction summary they rewrote the cached history on the turn they appeared
+    // and again on the next turn, when they were gone.
+    const opus = {
+      modelString: "anthropic:claude-opus-5-5",
+      providerForMessages: "anthropic",
+      routeProvider: "anthropic",
+    };
+    const summary = createMuxMessage("summary", "assistant", "Compacted summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const [u1, a1, u2, a2, u3] = [
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer 1"),
+      createMuxMessage("u2", "user", "second"),
+      createMuxMessage("a2", "assistant", "answer 2"),
+      createMuxMessage("u3", "user", "third"),
+    ];
+    const attachments = [
+      {
+        type: "plan_file_reference" as const,
+        planFilePath: "/tmp/plan.md",
+        planContent: "ATTACHED PLAN",
+      },
+    ];
+    const send = (history: MuxMessage[], withAttachments: boolean) =>
+      assemble({
+        ...opus,
+        history,
+        systemMessage: "stable instructions",
+        postCompactionAttachments: withAttachments ? attachments : null,
+      });
+    const rows = (payload: Awaited<ReturnType<typeof send>>, count: number) =>
+      JSON.stringify(payload.messages.slice(0, count), (key, value: unknown) =>
+        key === "providerOptions" ? undefined : value
+      );
+
+    const plain = await send([summary, u1, a1, u2], false);
+    const attached = await send([summary, u1, a1, u2], true);
+    const next = await send([summary, u1, a1, u2, a2, u3], false);
+    // The cached system row, the summary, u1 and a1 come before the newest request (u2).
+    const before = plain.messages.length - 1;
+    expect(JSON.stringify(plain.messages.at(-1))).toContain("second");
+    expect(rows(attached, before)).toBe(rows(plain, before));
+    expect(rows(next, before)).toBe(rows(attached, before));
+    // The newest request carries the attachments, first.
+    expect(attached.messages).toHaveLength(plain.messages.length);
+    const request = JSON.stringify(attached.messages.at(-1));
+    expect(request.indexOf("ATTACHED PLAN")).toBeLessThan(request.indexOf("second"));
+  });
+
+  test("post-compaction attachments keep their place when a file-change row is the newest", async () => {
+    // F37: AgentSession appends the durable <system-file-update> row before it reads the
+    // history, so it is the newest user row. Every rebuild of the turn (a retry after the
+    // committed assistant row, a budget warning appended mid-turn) and the plain request
+    // keep the rows before the turn's request, and the retry extends the first request.
+    const opus = {
+      modelString: "anthropic:claude-opus-5-5",
+      providerForMessages: "anthropic",
+      routeProvider: "anthropic",
+    };
+    const summary = createMuxMessage("summary", "assistant", "Compacted summary", {
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+    });
+    const notification = createFileChangeNotificationMessage([
+      { type: "edited_text_file", filename: "src/a.ts", snippet: "@@ -1 +1 @@" },
+    ]);
+    const turn = [
+      summary,
+      createMuxMessage("u1", "user", "first"),
+      createMuxMessage("a1", "assistant", "answer 1"),
+      createMuxMessage("u2", "user", "second"),
+      notification,
+    ];
+    const attachments = [
+      { type: "plan_file_reference" as const, planFilePath: "/p.md", planContent: "ATTACHED PLAN" },
+    ];
+    const send = (history: MuxMessage[], withAttachments = true) =>
+      assemble({
+        ...opus,
+        history,
+        systemMessage: "stable instructions",
+        postCompactionAttachments: withAttachments ? attachments : null,
+      });
+    const rows = (payload: Awaited<ReturnType<typeof send>>, count: number) =>
+      JSON.stringify(payload.messages.slice(0, count), (key, value: unknown) =>
+        key === "providerOptions" ? undefined : value
+      );
+
+    const first = await send(turn);
+    const before = first.messages.length - 1;
+    const request = JSON.stringify(first.messages.at(-1));
+    expect(request.indexOf("second")).toBeLessThan(request.indexOf("ATTACHED PLAN"));
+    expect(request.indexOf("ATTACHED PLAN")).toBeLessThan(request.indexOf("system-file-update"));
+
+    const retry = await send([...turn, createMuxMessage("a2", "assistant", "partial answer")]);
+    expect(rows(retry, first.messages.length)).toBe(rows(first, first.messages.length));
+    const warned = await send([
+      ...turn,
+      createContextBudgetWarning({
+        contextTokens: 80_000,
+        maxTokens: 128_000,
+        budgetTokens: 96_000,
+        sessionHistoryAvailable: true,
+        handoff: true,
+      }),
+    ]);
+    expect(rows(warned, before)).toBe(rows(first, before));
+    expect(JSON.stringify(warned.messages.at(-1))).toContain("ATTACHED PLAN");
+    for (const plain of [
+      await send(turn, false),
+      await send(
+        [
+          ...turn,
+          createMuxMessage("a2", "assistant", "answer 2"),
+          createMuxMessage("u3", "user", "third"),
+        ],
+        false
+      ),
+    ]) {
+      expect(rows(plain, before)).toBe(rows(first, before));
+    }
+  });
+
   test("token budget tags persisted user rows with their session_history item ID", async () => {
     const request = createMuxMessage("request", "user", "fix the bug", { historySequence: 7 });
     const reply = createMuxMessage("reply", "assistant", "on it", { historySequence: 8 });
@@ -1581,6 +1815,7 @@ describe("buildPlanInstructions", () => {
         createMuxMessage("a1", "assistant", "Here is the plan.", { agentId: "plan" }),
         createMuxMessage("u1", "user", "implement it"),
       ],
+      runtimeFactory,
     }).catch((error: unknown) => error);
     expect(outcome).toMatchObject({ type: "network" });
   });
@@ -1623,6 +1858,7 @@ describe("buildPlanInstructions", () => {
       taskDepth: 0,
       taskSettings: DEFAULT_TASK_SETTINGS,
       requestPayloadMessages,
+      runtimeFactory,
     });
 
     expect(result.effectiveAdditionalInstructions).toContain(
@@ -1699,6 +1935,7 @@ describe("buildPlanInstructions", () => {
       taskDepth: 0,
       taskSettings: DEFAULT_TASK_SETTINGS,
       requestPayloadMessages,
+      runtimeFactory,
     });
 
     const fromFullHistory = await buildPlanInstructions({
@@ -1717,6 +1954,7 @@ describe("buildPlanInstructions", () => {
       taskDepth: 0,
       taskSettings: DEFAULT_TASK_SETTINGS,
       requestPayloadMessages: fullHistory,
+      runtimeFactory,
     });
 
     expect(fromSlicedPayload.effectiveAdditionalInstructions).toContain(
@@ -2085,7 +2323,7 @@ describe("buildStreamSystemContext", () => {
       modelString: "openai:gpt-5.2",
       cfg,
       providersConfig: null,
-      mcpServers: {},
+      runtimeFactory,
     });
 
     expect(result.agentSystemPromptSections.join("\n\n")).toContain(
@@ -2290,7 +2528,7 @@ describe("buildStreamSystemContext", () => {
       modelString: "openai:gpt-5.2",
       cfg,
       providersConfig: null,
-      mcpServers: {},
+      runtimeFactory,
     });
 
     expect(result.ancestorPlanFilePaths).toEqual([scoped("child-workspace")]);

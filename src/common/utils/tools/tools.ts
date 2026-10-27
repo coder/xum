@@ -1,7 +1,10 @@
 import type { HistoryService } from "@/node/services/historyService";
-import type { HostClock } from "@/node/utils/hostClock";
+import { nodeClock, type HostClock } from "@/node/utils/hostClock";
 import { createSessionHistoryTool } from "@/node/services/tools/session_history";
 import { createNewContextTool } from "@/node/services/tools/new_context";
+import type { HostFiles, HostPaths } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
+import { getSharedClutterScanner } from "@/node/runtime/homeClutterWatch";
 import { xai } from "@ai-sdk/xai";
 import type { Tool } from "ai";
 import type { MuxProviderOptions } from "@/common/types/providerOptions";
@@ -34,6 +37,10 @@ import { createArtifactListTool } from "@/node/services/tools/artifact_list";
 import { createArtifactTool } from "@/node/services/tools/artifact";
 import { createArtifactReadTool } from "@/node/services/tools/artifact_read";
 import { createTimelineEventTool } from "@/node/services/tools/timeline_event";
+import {
+  createStatusUpdateTools,
+  isStatusUpdateEnabled,
+} from "@/node/services/tools/status_update";
 import { createToolSearchTool } from "@/node/services/tools/toolSearch";
 import { createMcpPromptGetTool } from "@/node/services/tools/mcp_prompt_get";
 import { createAnalyticsQueryTool } from "@/node/services/tools/analyticsQuery";
@@ -85,11 +92,14 @@ import type { MCPPromptDescriptor } from "@/common/orpc/schemas/mcp";
 
 import type { Result } from "@/common/types/result";
 import type { Runtime } from "@/node/runtime/Runtime";
-import * as os from "os";
 import type { InitStateManager } from "@/node/services/initStateManager";
 import type { BackgroundProcessManager } from "@/node/services/backgroundProcessManager";
 import type { DesktopSessionManager } from "@/node/services/desktop/DesktopSessionManager";
 import type { DesktopNotifications } from "@/node/services/desktopNotifications/desktopNotifications";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import type { ComputerUseService } from "@/node/services/computerUse/computerUseService";
 import type { TaskService } from "@/node/services/taskService";
 import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
@@ -99,6 +109,7 @@ import { createMemoryTool } from "@/node/services/tools/memory";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { GoalToolContext } from "@/common/utils/tools/toolAvailability";
 import type { TimelineService } from "@/node/services/timelineService";
+import type { StatusPageAgentQueue } from "@/node/services/statusPageAgentService";
 import type { WorkspaceChatMessage } from "@/common/orpc/types";
 import type { FileState } from "@/node/services/agentSession";
 import type { AgentDefinitionDescriptor } from "@/common/types/agentDefinition";
@@ -151,6 +162,15 @@ export interface ToolConfiguration {
   runtime: Runtime;
   /** OS notifications for the notify tool. Absent: the Node layer (configs that tests build by hand). */
   desktopNotifications?: DesktopNotifications;
+  /** Session locks of the todo, review pane and patch-applied watermark writes. */
+  sessionLocks: SessionLocks;
+  /** Session files of the todo and review pane state. Absent: the Node layer (configs that tests build by hand). */
+  sessionFiles?: SessionFiles;
+  /** Runtime builders of the skill tools. Absent: the Node layer (configs that tests build by hand). */
+  runtimeFactory?: RuntimeFactory;
+  /** Host files and paths of the home clutter scan. Absent: the Node layers (configs that tests build by hand). */
+  hostFiles?: HostFiles;
+  hostPaths?: HostPaths;
   /** Project roots in this workspace (single- or multi-project context for tool descriptions) */
   projects?: ProjectRef[];
   /** Environment secrets to inject (optional) */
@@ -209,6 +229,19 @@ export interface ToolConfiguration {
   historyService?: HistoryService;
   memoryService?: MemoryService;
   timelineService?: TimelineService;
+  /** Status page agent queue; status_update is registered only with statusPageAgentActive. */
+  statusPageAgent?: StatusPageAgentQueue;
+  /**
+   * Status page agent mode is active this turn: the Agent interface view is active (not a side
+   * chat or compaction, scratch dir set) and the artifacts-status-page-agent experiment is on.
+   */
+  statusPageAgentActive?: boolean;
+  /**
+   * The turn's model as the user selected it (its route: a Coder instance, a custom provider),
+   * which status_update queues for an Inherit Status Page model. The tools' model string is a
+   * normalized identity that the model factory could route elsewhere.
+   */
+  statusUpdateFallbackModel?: string;
   /** Per-scope memory write policy for the current agent (defaults to read-only). */
   memoryAccess?: MemoryScopeAccess;
   /** Memory scopes the tool serves (see resolveMemoryScopes); defaults to no session scope. */
@@ -421,7 +454,9 @@ function augmentToolDescription(baseTool: Tool, additionalInstructions: string):
 function wrapToolExecuteWithModelOnlyNotifications(
   toolName: string,
   baseTool: Tool,
-  engine: NotificationEngine
+  engine: NotificationEngine,
+  // The session's clock, so a poll's `now` and the sources' own times read one clock (#7282).
+  clock: HostClock
 ): Tool {
   // Access the tool as a record to get its properties.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, local/no-chained-type-assertions -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
@@ -450,7 +485,7 @@ function wrapToolExecuteWithModelOnlyNotifications(
           toolName,
           toolSucceeded: true,
           resultCanCarryNotifications: canCarryModelOnlyToolNotifications(result),
-          now: Date.now(),
+          now: clock.nowMs(),
         });
       } catch (error) {
         log.debug("[getToolsForModel] notification poll failed", { error, toolName });
@@ -462,7 +497,7 @@ function wrapToolExecuteWithModelOnlyNotifications(
         await engine.pollAfterToolCall({
           toolName,
           toolSucceeded: false,
-          now: Date.now(),
+          now: clock.nowMs(),
         });
       } catch (pollError) {
         log.debug("[getToolsForModel] notification poll failed", { pollError, toolName });
@@ -587,30 +622,47 @@ function wrapToolsWithModelOnlyNotifications(
   }
 
   const engine = new NotificationEngine([
-    new TodoListReminderSource({ workspaceSessionDir: config.workspaceSessionDir }),
+    new TodoListReminderSource({
+      workspaceSessionDir: config.workspaceSessionDir,
+      // mutation-equivalent: sessionFiles is a SessionFiles object or undefined, so ?? and || agree
+      sessionFiles: config.sessionFiles ?? nodeSessionFiles,
+    }),
     // Only commands on this host can clutter this host's home dir, so gate on the runtime type
     // (XUM_RUNTIME), not on XUM_SCRATCH_DIR, which SSH/Docker/devcontainer export too. The
     // env value also covers multi-project local workspaces, whose MultiProjectRuntime wrapper is
     // not a LocalBaseRuntime. The reminder points at $XUM_SCRATCH_DIR, so it must be set.
     ...((config.xumEnv?.XUM_RUNTIME === "local" || config.xumEnv?.XUM_RUNTIME === "worktree") &&
     config.xumEnv.XUM_SCRATCH_DIR != null
-      ? [
-          new HomeClutterReminderSource({
-            // The host user's real home is where clutter piles up. A HOME override (project
-            // secret, .xum/tool_env) already sends writes elsewhere, so it is not tracked.
-            homeDir: os.homedir(),
-            workspaceId: config.workspaceId,
-          }),
-        ]
+      ? [homeClutterSource(config)]
       : []),
   ]);
 
   const wrappedTools: Record<string, Tool> = {};
   for (const [toolName, tool] of Object.entries(tools)) {
-    wrappedTools[toolName] = wrapToolExecuteWithModelOnlyNotifications(toolName, tool, engine);
+    wrappedTools[toolName] = wrapToolExecuteWithModelOnlyNotifications(
+      toolName,
+      tool,
+      engine,
+      // mutation-equivalent: clock is a HostClock object or undefined, so ?? and || agree
+      config.clock ?? nodeClock
+    );
   }
 
   return wrappedTools;
+}
+
+function homeClutterSource(config: ToolConfiguration): HomeClutterReminderSource {
+  // The host user's real home is where clutter piles up. A HOME override (project
+  // secret, .xum/tool_env) already sends writes elsewhere, so it is not tracked.
+  // mutation-equivalent: hostPaths is a HostPaths object or undefined, so ?? and || agree
+  const homeDir = (config.hostPaths ?? nodeHostPaths).userHome();
+  return new HomeClutterReminderSource({
+    homeDir,
+    workspaceId: config.workspaceId,
+    // The loop's HostFiles reads the home dir (phase 5).
+    scanner: getSharedClutterScanner(homeDir, config.hostFiles),
+    clock: config.clock,
+  });
 }
 
 export { deriveToolHookConfig } from "@/node/services/tools/withHooks";
@@ -914,6 +966,7 @@ function toolAllowlistOptions(
     enableTimelineEvent: Boolean(config.timelineService),
     enableArtifacts:
       config.experiments?.artifacts === true && config.xumEnv?.XUM_SCRATCH_DIR != null,
+    enableStatusUpdate: isStatusUpdateEnabled(config),
     enableToolSearch: Boolean(config.toolSearchRuntime),
     enableMcpPromptGet: Boolean(config.mcpPromptRuntime),
     // Sub-agents (enableAgentReport is set iff the workspace has a parentWorkspaceId) do not get
@@ -1022,6 +1075,7 @@ export async function getToolsForModel(
     ...(config.toolSearchRuntime ? { tool_catalog_search: createToolSearchTool(config) } : {}),
     ...(config.mcpPromptRuntime ? { mcp_prompt_get: createMcpPromptGetTool(config) } : {}),
     ...(config.timelineService ? { timeline_event: createTimelineEventTool(config) } : {}),
+    ...createStatusUpdateTools(config, modelString),
     // Only where $XUM_SCRATCH_DIR exists: without it the description's
     // "$XUM_SCRATCH_DIR/artifacts/" would expand to "/artifacts/".
     ...(config.experiments?.artifacts && config.xumEnv?.XUM_SCRATCH_DIR != null

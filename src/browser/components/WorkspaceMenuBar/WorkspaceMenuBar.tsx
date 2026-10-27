@@ -14,6 +14,7 @@ import {
 } from "@/browser/stores/AppConfigStore";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { LazySettingsModal } from "./LazySettingsModal";
+import { AgentInterfaceViewToggle } from "@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceViewToggle";
 import { Popover, PopoverTrigger, PopoverContent } from "../Popover/Popover";
 import { Checkbox } from "../Checkbox/Checkbox";
 import {
@@ -800,7 +801,12 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
               Workspace details ({formatKeybind(KEYBINDS.SHOW_WORKSPACE_DETAILS)})
             </TooltipContent>
           </Tooltip>
-          <PopoverContent align="start" className="flex flex-col gap-0.5 p-2 text-xs">
+          {/* Paths have no spaces to wrap at: they ran past the popover, and on a phone off
+              screen and under the side safe area. */}
+          <PopoverContent
+            align="start"
+            className="flex w-max max-w-[min(32rem,var(--radix-popover-content-available-width))] flex-col gap-0.5 p-2 text-xs [overflow-wrap:anywhere]"
+          >
             <span className="font-mono">{projectLabel}</span>
             <span>{workspaceName}</span>
             <span className="text-muted">{namedWorkspacePath}</span>
@@ -838,6 +844,7 @@ export const WorkspaceMenuBar: React.FC<WorkspaceMenuBarProps> = ({
           isDesktop && "titlebar-no-drag"
         )}
       >
+        <AgentInterfaceViewToggle workspaceId={workspaceId} />
         {/* The footer hides these links at this width, so the header carries them. */}
         <WorkspaceLinks
           workspaceId={workspaceId}

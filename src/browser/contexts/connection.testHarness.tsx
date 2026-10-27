@@ -3,6 +3,7 @@ import type { ClientContext, ClientLink } from "@orpc/client";
 import { useState, type ReactNode } from "react";
 import { APIContext, type APIClient, type UseAPIResult } from "@/browser/contexts/API";
 import { ConnectionLink } from "@/browser/contexts/connectionLink";
+import { drainMicrotasks } from "@/browser/testFakeClock";
 import type { TestApiOverrides } from "@/browser/testUtils";
 import { createClient } from "@/common/orpc/client";
 
@@ -118,3 +119,15 @@ export function createConnectionHarness(
 }
 
 export type ConnectionHarness = ReturnType<typeof createConnectionHarness>;
+
+/**
+ * Lets the calls and streams that a drop or a connect started settle, and React render what they
+ * changed. It waits for the promise chains themselves, not for a fixed time, so a check after it
+ * cannot pass just because the unwanted change came late through a promise. Work that waits on a
+ * timer stays pending: drive that with fake timers.
+ */
+export async function settle(): Promise<void> {
+  await act(async () => {
+    await drainMicrotasks();
+  });
+}

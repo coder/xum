@@ -7,7 +7,7 @@ import { createMockORPCClient } from "./mocks/orpc";
 import { createAssistantMessage } from "./mocks/messages";
 import type { ProjectConfig } from "@/common/types/project";
 import { createWorkspace, groupWorkspacesByProject, STABLE_TIMESTAMP } from "./mocks/workspaces";
-import { waitForAppFadeInDone } from "./storyPlayHelpers";
+import { openLeftSidebar, waitForAppFadeInDone } from "./storyPlayHelpers";
 import {
   clearWorkspaceSelection,
   collapseLeftSidebar,
@@ -32,7 +32,11 @@ async function checkPhoneViewport(context: Parameters<NonNullable<AppStory["play
 }
 
 async function switchWorkspace(canvasElement: HTMLElement, workspaceId: string) {
+  // The wide sidebar: collapseLeftSidebar() below only writes storage, and a later re-render
+  // reads it and collapses the sidebar. This live write keeps it open for the next switch, as
+  // the desktop snapshot expects. openLeftSidebar() opens the phone drawer, which ignores the flag.
   expandLeftSidebar();
+  await openLeftSidebar(canvasElement);
   const row = await waitFor(async () => {
     const element = canvasElement.querySelector<HTMLElement>(
       '[data-workspace-id="' + workspaceId + '"][role="button"]'
@@ -351,7 +355,8 @@ function createHydrationStory(workspaceId: string): AppStory {
         historySequence: 2,
         startTime: STABLE_TIMESTAMP,
       });
-      await expect(await canvas.findByText(/ streaming$/)).toBeVisible();
+      // The composer's live line leaves the model name out of its status label.
+      await expect(await canvas.findByText(/^streaming$/)).toBeVisible();
       await checkTranscriptLayout(canvasElement);
       await expect(canvas.queryByTestId("transcript-hydration-placeholder")).toBeNull();
       emitChat(history);
@@ -774,7 +779,7 @@ function createCreationPendingStory(): AppStory {
     const textarea = () => canvasElement.querySelector<HTMLTextAreaElement>("textarea");
 
     await step("Open the project creation view", async () => {
-      expandLeftSidebar();
+      await openLeftSidebar(canvasElement);
       const projectRow = await waitFor(async () => {
         const element = canvasElement.querySelector<HTMLElement>(
           '[data-project-path="' + projectPath + '"][aria-controls]'

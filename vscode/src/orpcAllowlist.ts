@@ -398,7 +398,7 @@ function redactBackgroundBashState(value: unknown): unknown {
       if (typeof record.monitor !== "object" || record.monitor === null) {
         return process;
       }
-      return { ...record, monitor: { ...(record.monitor as object), lastLines: [] } };
+      return { ...record, monitor: { ...(record.monitor), lastLines: [] } };
     }),
   };
 }

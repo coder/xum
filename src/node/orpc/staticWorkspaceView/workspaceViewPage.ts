@@ -1,5 +1,5 @@
 import assert from "node:assert";
-import { AUTH_TOKEN_KEY, LEFT_SIDEBAR_COLLAPSED_KEY } from "@/common/constants/storage";
+import { AUTH_TOKEN_KEY } from "@/common/constants/storage";
 import {
   WORKSPACE_VIEW_APP_STARTED_ATTR,
   WORKSPACE_VIEW_ID,
@@ -78,8 +78,7 @@ export const WORKSPACE_VIEW_EARLY_SCRIPT = `(() => {
   const phone = () => innerWidth >= ${PHONE_CHROME_WIDTHS.min} && innerWidth <= ${PHONE_CHROME_WIDTHS.max};
   let workspaceId = null;
   try { workspaceId = m && decodeURIComponent(m[1]); } catch {}
-  if (!workspaceId || document.visibilityState === "hidden" || !phone() || !matchMedia("(pointer: coarse)").matches ||
-      read(${q(LEFT_SIDEBAR_COLLAPSED_KEY)}) === "false") return loadApp();
+  if (!workspaceId || document.visibilityState === "hidden" || !phone() || !matchMedia("(pointer: coarse)").matches) return loadApp();
   document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && loadApp());
   addEventListener("resize", () => phone() || view()?.remove());
   ${VIEW_BUILDER_SOURCE}

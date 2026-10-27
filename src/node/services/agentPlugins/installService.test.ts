@@ -45,7 +45,10 @@ import {
 } from "./mcpConfig";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import { skillConsentFingerprint } from "./componentConsent";
-import { discoverAgentSkills } from "@/node/services/agentSkills/agentSkillsService";
+import {
+  discoverAgentSkills,
+  readAgentSkill,
+} from "@/node/services/agentSkills/agentSkillsService";
 import {
   assertStoredPluginWorkflowReviewed,
   resolveWorkflowScript,
@@ -56,6 +59,7 @@ import {
   WorkflowService,
 } from "@/node/services/workflows/WorkflowService";
 import { WorkflowScriptDescriptorSchema } from "@/common/orpc/schemas/workflow";
+import { SkillNameSchema } from "@/common/orpc/schemas/agentSkill";
 import type { WorkflowScriptDescriptor } from "@/common/types/workflow";
 import { writeGlobalSkill } from "@/node/services/tools/testHelpers";
 import { z } from "zod";
@@ -65,6 +69,7 @@ import {
   discoverAgentDefinitions,
   readAgentDefinition,
 } from "@/node/services/agentDefinitions/agentDefinitionsService";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /**
  * Lifecycle tests against a real local git "remote". Local-path remotes go
@@ -1737,6 +1742,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
       const servers = await createAgentPluginsMcpProvider({ xumHome: muxRoot })({ trusted: false });
       return {
@@ -1804,6 +1810,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
     const approveReview = async () => {
       const review = await service.previewComponentReview({ name: "demo-plugin" });
@@ -1900,6 +1907,7 @@ describe("AgentPluginInstallService", () => {
             projectPluginRoots: [projectPlugins],
             globalPluginRoots: [pluginsDir()],
           },
+          runtimeFactory: nodeRuntimeFactory,
         }),
       runnerId: "runner-6629",
     });
@@ -1955,6 +1963,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
     for (const scriptPath of ["plugin://demo-plugin/~run.js", "plugin://demo-plugin/./~run.js"]) {
       await expect(resolve(scriptPath)).rejects.toThrow("must be relative");
@@ -2007,6 +2016,7 @@ describe("AgentPluginInstallService", () => {
             universalRoot: "",
             globalPluginRoots: [pluginsDir()],
           },
+          runtimeFactory: nodeRuntimeFactory,
         }),
       runnerId: "runner-6777",
     });
@@ -2059,6 +2069,7 @@ describe("AgentPluginInstallService", () => {
           workspacePath: muxRoot,
           projectTrusted: true,
           roots,
+          runtimeFactory: nodeRuntimeFactory,
         })
       );
     // A same-name user skill shadows the plugin skill in the global scope.
@@ -2099,6 +2110,7 @@ describe("AgentPluginInstallService", () => {
           workspacePath: muxRoot,
           projectTrusted: true,
           roots,
+          runtimeFactory: nodeRuntimeFactory,
         }),
       runnerId: "runner-6826",
     });
@@ -2190,6 +2202,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
     expect((await resolve("skill://greet/workflow.js")).source).toContain("name: 'greet'");
     // No review covers any other script of a managed skill, so it never runs as a workflow.
@@ -2258,11 +2271,19 @@ describe("AgentPluginInstallService", () => {
       globalPluginRoots: [pluginsDir()],
     };
     const listed = async () =>
-      (await discoverAgentDefinitions(runtime, muxRoot, { roots }))
+      (
+        await discoverAgentDefinitions(runtime, muxRoot, {
+          roots,
+          runtimeFactory: nodeRuntimeFactory,
+        })
+      )
         .filter((agent) => agent.pluginName === "demo-plugin")
         .map((agent) => agent.description);
     const loads = () =>
-      readAgentDefinition(runtime, muxRoot, "helper", { roots }).then(
+      readAgentDefinition(runtime, muxRoot, "helper", {
+        roots,
+        runtimeFactory: nodeRuntimeFactory,
+      }).then(
         (agent) => agent.frontmatter.description,
         () => null
       );
@@ -2324,11 +2345,19 @@ describe("AgentPluginInstallService", () => {
       globalPluginRoots: [pluginsDir()],
     };
     const listed = async () =>
-      (await discoverAgentDefinitions(runtime, muxRoot, { roots }))
+      (
+        await discoverAgentDefinitions(runtime, muxRoot, {
+          roots,
+          runtimeFactory: nodeRuntimeFactory,
+        })
+      )
         .filter((agent) => agent.pluginName === "demo-plugin")
         .map((agent) => agent.description);
     const loads = () =>
-      readAgentDefinition(runtime, muxRoot, "reviewer", { roots }).then(
+      readAgentDefinition(runtime, muxRoot, "reviewer", {
+        roots,
+        runtimeFactory: nodeRuntimeFactory,
+      }).then(
         (agent) => agent.frontmatter.description,
         () => null
       );
@@ -2383,6 +2412,7 @@ describe("AgentPluginInstallService", () => {
     };
     const loaded = await readAgentDefinition(new LocalRuntime(muxRoot), muxRoot, "helper", {
       roots,
+      runtimeFactory: nodeRuntimeFactory,
     });
     expect(loaded.frontmatter.description).toBe("Formats");
 
@@ -2552,13 +2582,16 @@ describe("AgentPluginInstallService", () => {
       path.join(remoteDir, ".codex-plugin", "plugin.json"),
       JSON.stringify({ name: "demo-plugin", skills: ["./skills/", "./extra/"] })
     );
-    for (const [dir, name] of [
-      ["extra", "summarize"],
-      ["extra", "greet"],
+    for (const [dir, folder, name] of [
+      ["extra", "summarize", "summarize"],
+      ["extra", "greet", "greet"],
+      ["skills", "review-loop", "review-loop"],
+      // A snake_case folder loads as review-loop too: its warning names the real folder.
+      ["extra", "review_loop", "review-loop"],
     ]) {
-      await fsPromises.mkdir(path.join(remoteDir, dir, name), { recursive: true });
+      await fsPromises.mkdir(path.join(remoteDir, dir, folder), { recursive: true });
       await fsPromises.writeFile(
-        path.join(remoteDir, dir, name, "SKILL.md"),
+        path.join(remoteDir, dir, folder, "SKILL.md"),
         `---\nname: ${name}\ndescription: From ${dir}\n---\n\nBody.\n`
       );
     }
@@ -2568,11 +2601,12 @@ describe("AgentPluginInstallService", () => {
     // skills/greet comes first, so extra/greet never loads and is not offered.
     expect(preview.skills).toEqual([
       { name: "greet", description: "Greets people" },
+      { name: "review-loop", description: "From skills" },
       { name: "summarize", description: "From extra" },
     ]);
-    expect(preview.warnings.filter((warning) => warning.startsWith("extra/greet:"))).toHaveLength(
-      1
-    );
+    for (const label of ["extra/greet:", "extra/review_loop:"]) {
+      expect(preview.warnings.filter((warning) => warning.startsWith(label))).toHaveLength(1);
+    }
   });
 
   test("consent preview and install treat a skills path that holds SKILL.md as one skill", async () => {
@@ -2620,6 +2654,7 @@ describe("AgentPluginInstallService", () => {
         universalRoot: "",
         globalPluginRoots: [pluginsDir()],
       },
+      runtimeFactory: nodeRuntimeFactory,
     });
     expect(
       skills
@@ -2669,6 +2704,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
     expect((await resolve("skill://demo-plugin/workflow.js")).source).toBe("'root skill';\n");
     expect((await resolve("plugin://demo-plugin/workflow.js")).source).toBe("'top level';\n");
@@ -3010,6 +3046,7 @@ describe("AgentPluginInstallService", () => {
           universalRoot: "",
           globalPluginRoots: [pluginsDir()],
         },
+        runtimeFactory: nodeRuntimeFactory,
       });
       return skills
         .filter((skill) => skill.pluginName === "demo-plugin")
@@ -3291,6 +3328,42 @@ describe("AgentPluginInstallService", () => {
       expect(listed !== "blocked" && listed[0].interface?.logoDataUrl).toBeUndefined();
     }
   );
+
+  test("a snake_case skill folder is previewed, installed and read under its kebab-case name", async () => {
+    // google/elephant-goldfish-model: skills/egm_bootstrap/SKILL.md has `name: egm-bootstrap`.
+    await fsPromises.mkdir(path.join(remoteDir, "skills", "egm_bootstrap"), { recursive: true });
+    await fsPromises.writeFile(
+      path.join(remoteDir, "skills", "egm_bootstrap", "SKILL.md"),
+      "---\nname: egm-bootstrap\ndescription: Bootstrap\n---\n\nBody.\n"
+    );
+    await commitAll(remoteDir, "adds a snake_case skill folder");
+
+    const preview = await service.preview({ input: remoteDir });
+    expect(preview.skills.map((skill) => skill.name).sort()).toEqual(["egm-bootstrap", "greet"]);
+    expect(preview.warnings).toEqual([]);
+
+    // The consent recorded for the folder covers the kebab-case name (#6498).
+    await service.install({ source: preview.source, expectedSha: preview.lockedSha });
+    const runtime = new LocalRuntime(muxRoot);
+    const options = {
+      roots: {
+        projectRoot: "",
+        globalRoot: path.join(muxRoot, "skills"),
+        universalRoot: "",
+        globalPluginRoots: [pluginsDir()],
+      },
+      runtimeFactory: nodeRuntimeFactory,
+    };
+    const { skills } = await discoverAgentSkills(runtime, muxRoot, options);
+    expect(skills.some((skill) => skill.name === "egm-bootstrap")).toBe(true);
+    const read = await readAgentSkill(
+      runtime,
+      muxRoot,
+      SkillNameSchema.parse("egm-bootstrap"),
+      options
+    );
+    expect(path.basename(read.skillDir)).toBe("egm_bootstrap");
+  });
 
   test("preview lists a display-name skill under its directory name like runtime discovery", async () => {
     // pstack ships `name: Poteto Mode` in skills/poteto-mode: runtime discovery
@@ -3711,10 +3784,17 @@ describe("AgentPluginInstallService", () => {
       const { failing, result } = await updateWithFailingSignOut(stopStub);
       await result;
       await failing.dispose();
+      // 2 s, not 10 ms: the pass deadline must outlast the real sign-out's disk write after
+      // release under CI load, or the pass counts it as late and keeps the record (#7416). It
+      // stays below the test timeout, so recovery that awaited the slow pass stores false.
       const restarted = new AgentPluginInstallService(config, {
         mcpServerManager: stopStub as unknown as MCPServerManager,
-        reconciliationTimeoutMs: 10,
+        reconciliationTimeoutMs: 2_000,
       });
+      const internals = restarted as unknown as {
+        settledSignOutPasses: () => Promise<void>;
+        reconciliationState: Promise<boolean>;
+      };
       const oauth = new McpOauthService(config, new MCPConfigService(config));
       let release: (() => void) | undefined;
       let entered: (() => void) | undefined;
@@ -3732,19 +3812,16 @@ describe("AgentPluginInstallService", () => {
       } as unknown as McpOauthService);
       // The startup pass fails fast and keeps the record; section open meets the slow logout.
       await restarted.list();
+      // A fast-fail pass that is still running must not meet the slow logout.
+      await internals.settledSignOutPasses();
       slow = true;
-      // The list waits on the plugin mutation lock behind the sign-out, so release it first.
       const listed = restarted.list();
       await slowEntered;
-      const internals = restarted as unknown as {
-        pendingSignOutPass?: Promise<void>;
-        reconciliationState: Promise<boolean>;
-      };
       // Recovery settles while the sign-out still hangs, and its health stays true.
       expect(await internals.reconciliationState).toBe(true);
       release?.();
       await listed;
-      await internals.pendingSignOutPass;
+      await internals.settledSignOutPasses();
       expect(await pendingSignOuts()).toBeUndefined();
       // Journal health stayed true, so the custom gate opens without another section open.
       expect(await discovered()).toBe(1);
@@ -7232,6 +7309,37 @@ describe("AgentPluginInstallService", () => {
     await serviceWithMcp.uninstall({ name: "demo-plugin", deletePluginData: false });
     expect(stops).toBe(2);
     expect(await registry()).toEqual([]);
+  });
+
+  test("a failed install hygiene sweep reports a count and at most 5 workspace IDs", async () => {
+    // A 6,302-workspace config failed this sweep for 800-plus workspaces, and
+    // the error listed every ID. The log keeps one warning per workspace.
+    const ids = ["ws-1", "ws-2", "ws-3", "ws-4", "ws-5", "ws-6", "ws-7"];
+    const serviceWithOverrides = new AgentPluginInstallService(config, {
+      workspaceMcpOverridesService: overridesServiceStub(() =>
+        Promise.reject(new Error("pruning exceeded the plugin-prune budget"))
+      ),
+    });
+    const metadataSpy = spyOn(config, "getAllWorkspaceMetadata").mockImplementation(
+      () =>
+        Promise.resolve(
+          ids.map((id) => ({ id, runtimeConfig: { type: "local" } }))
+        ) as unknown as ReturnType<Config["getAllWorkspaceMetadata"]>
+    );
+    try {
+      const preview = await serviceWithOverrides.preview({ input: remoteDir });
+      const install = serviceWithOverrides.install({
+        source: preview.source,
+        expectedSha: preview.lockedSha,
+      });
+      await expect(install).rejects.toThrow(
+        "7 workspaces (ws-1, ws-2, ws-3, ws-4, ws-5, and 2 more)"
+      );
+      await expect(install).rejects.not.toThrow(/ws-6/);
+      expect(await registry()).toEqual([]);
+    } finally {
+      metadataSpy.mockRestore();
+    }
   });
 
   test("failed per-workspace prunes persist a tombstone that gates reinstall and self-heals", async () => {

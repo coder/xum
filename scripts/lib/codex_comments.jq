@@ -185,11 +185,23 @@ def codex_comment_is_informational($bot; $head; $resolved; $cleared):
         codex_summary_status($bot; $head; $resolved; $cleared) == "completed"
       else
         codex_usage_limit($bot)
-        or ($body | test("Didn.t find any major issues|create a Codex account"))
+        # The clean code-review receipt: one fixed sentence, one free-text
+        # flourish line ("Nice work!", ":+1:"; Codex varies it), and an optional
+        # Reviewed commit line. Anchored so text after it blocks (coder/xum#7504).
+        # Codex findings carry a priority badge, so a flourish with a [P0]-[P3]
+        # tag, badge text, or a markdown link or image blocks too.
+        or ($body | test("^Codex Review: Didn[’']t find any major issues\\."
+          + "( (?![^\n]*(\\[P[0-3]\\]|P[0-3] Badge|!\\[|\\]\\())[^\n]{1,80})?"
+          + "(\n\n\\*\\*Reviewed commit:\\*\\* `[0-9a-f]{7,40}`)?$"))
+        # Codex's account setup notice reports no finding; wait_pr_codex.sh
+        # still counts it as a failed review.
+        or $body == "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors)."
         # codex_without_help removed at most one known heading; a second or
         # unknown heading must not hide finding-bearing text.
+        # Codex sometimes omits the Reviewed commit line (coder/xum#7302). The
+        # rest of the receipt is fixed text that reports no finding.
         or ($body | test("^Security review completed\\. No security issues were found in this pull request\\."
-          + "\n+\\*\\*Reviewed commit:\\*\\* `[0-9a-f]{7,40}`"
+          + "(\n+\\*\\*Reviewed commit:\\*\\* `[0-9a-f]{7,40}`)?"
           + "\n+\\[View security finding report\\]\\(https://chatgpt\\.com/codex/cloud/tasks/[A-Za-z0-9_-]+\\)"
           + "\n+_Only the user who started this review can view the report in Codex\\._$"))
       end

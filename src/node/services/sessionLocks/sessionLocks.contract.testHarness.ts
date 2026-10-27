@@ -4,23 +4,22 @@
  * case builds a fresh layer: no holders, clock or lock state is shared.
  */
 import { describe, expect, test } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { Effect, type Layer } from "effect";
-import { SessionLocksTag } from "@/node/services/di/tags";
+import type { Layer } from "effect";
+import type { SessionLocksTag } from "@/node/services/di/tags";
+import {
+  WorkspaceMutationInProgressError,
+  workspaceMutationInProgressMessage,
+  workspaceMutationLockPath,
+  workspaceUseLockDir,
+} from "@/node/services/workspaceUseLeases";
 import type { ProcessIdentity } from "@/node/utils/concurrency/processLiveness";
 import { CrossProcessLockTimeoutError } from "@/node/utils/concurrency/lockErrors";
+import { describeHolder } from "@/node/utils/main/crossProcessLock";
+import { foreignRecord, liveBlocker } from "./foreignHolders.testHarness";
+import { buildSessionLocks } from "./buildSessionLocks.testHarness";
 import type { SessionLocks } from "./sessionLocks";
-
-/** Builds a SessionLocks layer into its service. The layers keep no scope. */
-export async function buildSessionLocks(
-  layer: Layer.Layer<SessionLocksTag>
-): Promise<SessionLocks> {
-  return await Effect.runPromise(
-    Effect.gen(function* () {
-      return yield* SessionLocksTag;
-    }).pipe(Effect.provide(layer))
-  );
-}
 
 /** Another backend that holds a lock, in the medium of the layer under test. */
 export interface ForeignHolder {
@@ -56,7 +55,7 @@ export function describeSessionLocksContract(
   const withLayer = async (fn: (locks: SessionLocks, t: LocksUnderTest) => Promise<void>) => {
     const t = await make();
     try {
-      await fn(await buildSessionLocks(t.layer), t);
+      await fn(buildSessionLocks(t.layer), t);
     } finally {
       await t.cleanup();
     }
@@ -131,6 +130,51 @@ export function describeSessionLocksContract(
         expect(await locks.inspectCrossProcessLock(dead)).toEqual({ state: "dead" });
       }));
 
+    // The turn owner's probe (workspaceTurnManager keepIfOwnedElsewhere) relies on both halves:
+    // a record this backend holds reads as held, and a probe never takes or reclaims a lock.
+    test("inspect never takes a lock: an own record reads held, a dead one stays until an acquire", () =>
+      withLayer(async (locks, t) => {
+        const own = path.join(t.dir, "own.lock");
+        const options = { acquireTimeoutMs: 0, staleMs: 60_000, timeoutMessage: "contract." };
+        const release = await locks.acquireCrossProcessLock({ lockPath: own, ...options });
+        expect(await locks.inspectCrossProcessLock(own)).toMatchObject({ state: "held" });
+        await release();
+        expect(await locks.inspectCrossProcessLock(own)).toEqual({ state: "absent" });
+
+        const dead = path.join(t.dir, "dead-record.lock");
+        await t.foreignHolder(dead, "dead", "record");
+        expect(await locks.inspectCrossProcessLock(dead)).toEqual({ state: "dead" });
+        expect(await locks.inspectCrossProcessLock(dead)).toEqual({ state: "dead" });
+        const reclaimed = await locks.acquireCrossProcessLock({ lockPath: dead, ...options });
+        expect(await locks.inspectCrossProcessLock(dead)).toMatchObject({ state: "held" });
+        await reclaimed();
+      }));
+
+    // branchSummary's marker reader relies on it: the probe sees the writer in every layer, and
+    // it never takes or reclaims the lock.
+    test("processFileLockExists sees an own or a foreign file lock, live or dead, and takes none", () =>
+      withLayer(async (locks, t) => {
+        const own = path.join(t.dir, "probe-own.lock");
+        const options = { lockPath: own, timeoutMs: SHORT_MS, label: "contract lock" };
+        expect(await locks.processFileLockExists(own)).toBe(false);
+        const lock = await locks.acquireProcessFileLock(options);
+        expect(await locks.processFileLockExists(own)).toBe(true);
+        await lock[Symbol.asyncDispose]();
+        expect(await locks.processFileLockExists(own)).toBe(false);
+        const live = path.join(t.dir, "probe-live.lock");
+        const holder = await t.foreignHolder(live, "live", "file");
+        expect(await locks.processFileLockExists(live)).toBe(true);
+        await holder.release();
+        expect(await locks.processFileLockExists(live)).toBe(false);
+        const dead = path.join(t.dir, "probe-dead.lock");
+        await t.foreignHolder(dead, "dead", "file");
+        expect(await locks.processFileLockExists(dead)).toBe(true);
+        expect(await locks.processFileLockExists(dead)).toBe(true);
+        const reclaimed = await locks.acquireProcessFileLock({ ...options, lockPath: dead });
+        expect(await locks.processFileLockExists(dead)).toBe(true);
+        await reclaimed[Symbol.asyncDispose]();
+        expect(await locks.processFileLockExists(dead)).toBe(false);
+      }));
     test("a dead foreign holder is reclaimed", () =>
       withLayer(async (locks, t) => {
         const file = path.join(t.dir, "dead-file.lock");
@@ -152,6 +196,110 @@ export function describeSessionLocksContract(
         await release();
       }));
 
+    test("an aborted signal wins over a live holder of a record", () =>
+      withLayer(async (locks, t) => {
+        const lockPath = path.join(t.dir, "aborted.lock");
+        const holder = await t.foreignHolder(lockPath, "live", "record");
+        const error = await locks
+          .acquireCrossProcessLock({
+            lockPath,
+            acquireTimeoutMs: SHORT_MS,
+            staleMs: 60_000,
+            timeoutMessage: "contract record is held.",
+            signal: AbortSignal.abort(),
+          })
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+        expect(error).not.toBeInstanceOf(CrossProcessLockTimeoutError);
+        expect((error as Error).message).toBe("Lock acquisition was aborted");
+        await holder.release();
+      }));
+
+    test("createParentDirectory false on a missing parent rejects with ENOENT", () =>
+      withLayer(async (locks, t) => {
+        const error = await locks
+          .acquireCrossProcessLock({
+            lockPath: path.join(t.dir, "removed-run", "run.lock"),
+            createParentDirectory: false,
+            acquireTimeoutMs: 0,
+            staleMs: 60_000,
+            timeoutMessage: "contract record is held.",
+          })
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+        expect((error as NodeJS.ErrnoException).code).toBe("ENOENT");
+      }));
+
+    test("a file lock creates its missing parent", () =>
+      withLayer(async (locks, t) => {
+        const lockPath = path.join(t.dir, "new-file-dir", "file.lock");
+        const lock = await locks.acquireProcessFileLock({
+          lockPath,
+          timeoutMs: SHORT_MS,
+          label: "contract lock",
+        });
+        expect((await fs.stat(path.dirname(lockPath))).isDirectory()).toBe(true);
+        await lock[Symbol.asyncDispose]();
+      }));
+
+    test("a file lock with createParentDir false on a missing parent rejects with ENOENT", () =>
+      withLayer(async (locks, t) => {
+        const lockPath = path.join(t.dir, "removed-session", "blobs.lock");
+        const error = await locks
+          .acquireProcessFileLock({
+            lockPath,
+            timeoutMs: SHORT_MS,
+            label: "contract lock",
+            createParentDir: false,
+          })
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+        expect((error as NodeJS.ErrnoException).code).toBe("ENOENT");
+        expect(
+          await fs.stat(path.dirname(lockPath)).then(
+            () => true,
+            () => false
+          )
+        ).toBe(false);
+      }));
+
+    test("a record lock creates its missing parent by default", () =>
+      withLayer(async (locks, t) => {
+        const lockPath = path.join(t.dir, "new-dir", "record.lock");
+        const release = await locks.acquireCrossProcessLock({
+          lockPath,
+          acquireTimeoutMs: 0,
+          staleMs: 60_000,
+          timeoutMessage: "contract record is held.",
+        });
+        expect((await fs.stat(path.dirname(lockPath))).isDirectory()).toBe(true);
+        await release();
+      }));
+
+    test("an aborted signal wins over a missing parent", () =>
+      withLayer(async (locks, t) => {
+        const error = await locks
+          .acquireCrossProcessLock({
+            lockPath: path.join(t.dir, "removed-run", "run.lock"),
+            createParentDirectory: false,
+            acquireTimeoutMs: 0,
+            staleMs: 60_000,
+            timeoutMessage: "contract record is held.",
+            signal: AbortSignal.abort(),
+          })
+          .then(
+            () => null,
+            (caught: unknown) => caught
+          );
+        expect((error as Error).message).toBe("Lock acquisition was aborted");
+      }));
+
     test("useLeasesFor gives one object per config: hold, isHeld, release", () =>
       withLayer(async (locks, t) => {
         const config = { rootDir: t.dir };
@@ -161,6 +309,47 @@ export function describeSessionLocksContract(
         expect(await leases.isHeld("ws-contract", "turn")).toBe(true);
         await lease.release();
         expect(await leases.isHeld("ws-contract", "turn")).toBe(false);
+      }));
+
+    test("a live foreign mutator makes hold refuse with today's text, and its release admits", () =>
+      withLayer(async (locks, t) => {
+        const leases = locks.useLeasesFor({ rootDir: t.dir });
+        const gate = workspaceMutationLockPath(t.dir, "ws-gate");
+        const mutator = await t.foreignHolder(gate, "live", "record");
+        const error = await leases.hold("ws-gate", "turn").then(
+          () => null,
+          (caught: unknown) => caught
+        );
+        expect(error).toBeInstanceOf(WorkspaceMutationInProgressError);
+        const identity = mutator.identity ?? undefined;
+        expect((error as Error).message).toBe(
+          workspaceMutationInProgressMessage("ws-gate", {
+            holder: describeHolder(foreignRecord(mutator.pid, identity)),
+            why: liveBlocker(mutator.pid, identity).why,
+          })
+        );
+        // The refused hold withdrew its lease.
+        expect(await leases.isHeld("ws-gate", "turn")).toBe(false);
+        await mutator.release();
+        const lease = await leases.hold("ws-gate", "turn");
+        await lease.release();
+      }));
+
+    test("isHeld sees another backend's live lease of that kind, and not a dead one", () =>
+      withLayer(async (locks, t) => {
+        const leases = locks.useLeasesFor({ rootDir: t.dir });
+        const dir = workspaceUseLockDir(t.dir, "ws-leases");
+        const live = await t.foreignHolder(
+          path.join(dir, "other-backend.turn.lock"),
+          "live",
+          "record"
+        );
+        await t.foreignHolder(path.join(dir, "other-backend.exec.lock"), "dead", "record");
+        expect(await leases.isHeld("ws-leases", "turn")).toBe(true);
+        expect(await leases.isHeld("ws-leases", "exec")).toBe(false);
+        expect(await leases.isHeld("ws-leases", "terminal")).toBe(false);
+        await live.release();
+        expect(await leases.isHeld("ws-leases", "turn")).toBe(false);
       }));
 
     test("workspaceFiles runs two operations on one key in FIFO order", () =>

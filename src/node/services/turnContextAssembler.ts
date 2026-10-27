@@ -61,6 +61,7 @@ import {
   usesInstallationScopedPlans,
 } from "@/common/utils/planStorage";
 import { createRemoteProjectId } from "@/node/runtime/remoteProjectLayout";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import type { PlanFileLocation } from "@/node/utils/runtime/planLocation";
 import { getPlanFileHint, getPlanModeInstruction } from "@/common/utils/ui/modeUtils";
 import { hasStartHerePlanSummary } from "@/common/utils/messages/startHerePlanSummary";
@@ -84,6 +85,7 @@ import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillSto
 import {
   buildSystemMessageFromSources,
   loadWorkspaceInstructionSources,
+  type InstructionHost,
   type BuiltSystemMessage,
 } from "./systemMessage";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
@@ -478,7 +480,8 @@ function planStableSystem(
   options: AssemblePromptPayloadOptions,
   liveStable: string,
   history: MuxMessage[],
-  rowsSupported: boolean
+  rowsSupported: boolean,
+  switched: boolean
 ) {
   if (options.replayedTurn) {
     const record = options.replayedTurn.customInstructions;
@@ -492,7 +495,7 @@ function planStableSystem(
     section?.block ?? "",
     valid && rowsSupported,
     undefined,
-    switchesModelOrAgent(options, history)
+    switched
   );
   const stableSystem = valid
     ? section.prefix +
@@ -503,11 +506,13 @@ function planStableSystem(
 }
 
 /**
- * Whether this request's model, route or agent differs from the segment's previous turn. The
- * instruction blocks then re-freeze instead of sending the new model's or agent's
- * `<model-...>`/`<mode-...>` sections in a row under the old ones: that costs no cache, since
- * each model has its own prompt cache and an agent switch already changes the
- * `<agent-instructions>` before the blocks (buildSystemMessageFromSources).
+ * Whether this request's model, route or agent differs from the segment's previous turn. Every
+ * system section then re-freezes instead of sending the new model's or agent's sections in a
+ * row under the old ones: that costs no cache, since each model has its own prompt cache and an
+ * agent switch already changes the `<agent-instructions>` before the instruction blocks
+ * (buildSystemMessageFromSources). This holds on an assistant-last request too (Codex
+ * PRRT_kwDOPxxmWM6wf11x): a partial turn resumed under another agent must not keep the old
+ * agent's frozen Tool: instructions, skill index or tail until the next user turn.
  */
 function switchesModelOrAgent(options: AssemblePromptPayloadOptions, history: MuxMessage[]) {
   const previous = history
@@ -539,14 +544,21 @@ function differs(before: string | undefined, now: string | undefined): boolean {
 function planSkillIndexTool(
   options: AssemblePromptPayloadOptions,
   history: MuxMessage[],
-  rowsSupported: boolean
+  rowsSupported: boolean,
+  switched: boolean
 ) {
   if (options.replayedTurn) {
     const record = options.replayedTurn.skillIndex;
     return { tools: options.tools, plan: planSkillIndex(history, "", rowsSupported, { record }) };
   }
   const live = locateSkillIndex(options);
-  const plan = planSkillIndex(history, live?.block ?? "", live != null && rowsSupported);
+  const plan = planSkillIndex(
+    history,
+    live?.block ?? "",
+    live != null && rowsSupported,
+    undefined,
+    switched
+  );
   if (live == null || plan.systemTail === live.block) return { tools: options.tools, plan };
   const frozen = withDescription(live.tool, live.prefix + plan.systemTail + live.rest);
   return { tools: { ...options.tools, agent_skill_read: frozen }, plan };
@@ -576,14 +588,21 @@ function planToolInstructionsTools(
   options: AssemblePromptPayloadOptions,
   tools: Record<string, Tool> | undefined,
   history: MuxMessage[],
-  rowsSupported: boolean
+  rowsSupported: boolean,
+  switched: boolean
 ) {
   if (options.replayedTurn) {
     const record = options.replayedTurn.toolInstructions;
     return { tools, plan: planToolInstructions(history, {}, rowsSupported, { record }) };
   }
   const live = locateToolInstructions(options);
-  const plan = planToolInstructions(history, live ?? {}, live != null && rowsSupported);
+  const plan = planToolInstructions(
+    history,
+    live ?? {},
+    live != null && rowsSupported,
+    undefined,
+    switched
+  );
   // A corrupt frozen record keeps the live descriptions (its rows still name the change).
   const frozen = parseToolInstructions(plan.systemTail);
   if (live == null || frozen == null || tools == null) return { tools, plan };
@@ -674,11 +693,13 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
   );
   const liveStable = options.systemMessage.slice(0, options.systemMessage.length - volatileLength);
   const rowsSupported = acceptsSystemSectionRows(options, liveStable);
+  const switched = switchesModelOrAgent(options, history);
   const { stableSystem, plan: instructionsPlan } = planStableSystem(
     options,
     liveStable,
     history,
-    rowsSupported
+    rowsSupported,
+    switched
   );
   const cachedSystemMessage = createCachedSystemMessage(
     stableSystem,
@@ -686,12 +707,13 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
     options.anthropicCacheTtl,
     options.providersConfig
   );
-  const skills = planSkillIndexTool(options, instructionsPlan.messages, rowsSupported);
+  const skills = planSkillIndexTool(options, instructionsPlan.messages, rowsSupported, switched);
   const { tools, plan: toolInstructionsPlan } = planToolInstructionsTools(
     options,
     skills.tools,
     skills.plan.messages,
-    rowsSupported
+    rowsSupported,
+    switched
   );
   // Length 0 means no volatile sections, or a tail the caller could not split off (middleware
   // edited it; turnRequestBuilder passes 0 then). Either way this request sends as before and
@@ -700,7 +722,8 @@ function planSystemPrompt(options: AssemblePromptPayloadOptions, history: MuxMes
     toolInstructionsPlan.messages,
     options.systemMessage.slice(liveStable.length),
     volatileLength > 0 && rowsSupported,
-    options.replayedTurn
+    options.replayedTurn,
+    switched
   );
   return {
     stableSystem,
@@ -837,6 +860,8 @@ export async function assemblePromptPayload(
 /** Options for building plan-aware additional instructions. */
 export interface BuildPlanInstructionsOptions {
   runtime: Runtime;
+  /** The session's runtime builders, for agent-definition reads. */
+  runtimeFactory: RuntimeFactory;
   metadata: WorkspaceMetadata;
   /** Where this workspace's plan lives (planLocation.ts). */
   planLocation: PlanFileLocation;
@@ -984,6 +1009,7 @@ export async function buildPlanInstructions(
               {
                 cache: opts.agentDefinitionCache,
                 projectPluginsTrusted: opts.projectPluginsTrusted,
+                runtimeFactory: opts.runtimeFactory,
               }
             );
             const lastChain = await resolveAgentInheritanceChain({
@@ -994,6 +1020,7 @@ export async function buildPlanInstructions(
               workspaceId,
               cache: opts.agentDefinitionCache,
               projectPluginsTrusted: opts.projectPluginsTrusted,
+              runtimeFactory: opts.runtimeFactory,
             });
             lastAgentIsPlanLike = isPlanLikeInResolvedChain(lastChain);
           } catch (error) {
@@ -1023,6 +1050,10 @@ export async function buildPlanInstructions(
 /** Options for building the system message context. */
 export interface BuildStreamSystemContextOptions {
   runtime: Runtime;
+  /** The session's runtime builders, for agent-definition and skill reads. */
+  runtimeFactory: RuntimeFactory;
+  /** The loop's host files and paths, for the global instruction reads. Absent: the Node layers. */
+  instructionHost?: InstructionHost;
   metadata: WorkspaceMetadata;
   workspacePath: string;
   workspaceId: string;
@@ -1049,9 +1080,12 @@ export interface BuildStreamSystemContextOptions {
   modelString: string;
   cfg: ProjectsConfig;
   providersConfig?: ProvidersConfigMap | null;
-  mcpServers: Parameters<typeof buildSystemMessageFromSources>[5];
   /** XUM_SCRATCH_DIR is exported for this turn (remote runtimes only promise it then). */
   scratchDirSet?: boolean;
+  /** Agent interface view is on and XUM_SCRATCH_DIR is set: the prompt describes the page. */
+  agentInterfaceView?: boolean;
+  /** The final toolset has status_update: the prompt points at it instead of page edits. */
+  statusPageAgent?: boolean;
   xumScope?: XumToolScope;
   loadDesktopCapability?: () => Promise<DesktopCapability>;
   /**
@@ -1385,7 +1419,6 @@ export async function buildStreamSystemContext(
     modelString,
     cfg,
     providersConfig,
-    mcpServers,
     xumScope,
     loadDesktopCapability,
   } = opts;
@@ -1398,12 +1431,14 @@ export async function buildStreamSystemContext(
     skipScopesAbove: getSkipScopesAboveForKnownScope(agentDefinition.scope),
     cache: opts.agentDefinitionCache,
     projectPluginsTrusted,
+    runtimeFactory: opts.runtimeFactory,
   };
   const skillCtx = resolveSkillStorageContext({
     runtime,
     workspacePath,
     xumScope,
     includeClaudeSkills: opts.claudeSkillsCompatEnabled,
+    runtimeFactory: opts.runtimeFactory,
   });
 
   // The agent body, subagent frontmatter, subagent discovery, skill discovery,
@@ -1457,13 +1492,13 @@ export async function buildStreamSystemContext(
           loadDesktopCapability,
           cache: opts.agentDefinitionCache,
           projectPluginsTrusted,
+          runtimeFactory: opts.runtimeFactory,
         }),
     // Discover available skills for tool description context
     discoverAgentSkills(skillCtx.runtime, skillCtx.workspacePath, {
       roots: skillCtx.roots,
       containment: skillCtx.containment,
-      // Used only for the project-runtime default-roots fallback (skillCtx.roots undefined).
-      includeClaudeSkills: opts.claudeSkillsCompatEnabled,
+      runtimeFactory: opts.runtimeFactory,
     })
       .then((discovery) => {
         requireReachableSkills(discovery);
@@ -1484,7 +1519,8 @@ export async function buildStreamSystemContext(
         runtime,
         workspacePath,
         cfg.projects,
-        opts.claudeSkillsCompatEnabled
+        opts.claudeSkillsCompatEnabled,
+        opts.instructionHost
       ),
   ]);
 
@@ -1525,7 +1561,6 @@ export async function buildStreamSystemContext(
     workspacePath,
     mergedAdditionalInstructions,
     modelString,
-    mcpServers,
     // "Mode: <mode>" sections in Xum-dedicated instruction sources match the
     // effective mode (so "Mode: plan" also covers custom plan-like agents)
     // and the agent id (so per-agent sections work). The effective mode names
@@ -1535,6 +1570,8 @@ export async function buildStreamSystemContext(
       agentSystemPromptSections,
       modes: [effectiveMode, agentDefinition.id],
       scratchDirSet: opts.scratchDirSet,
+      agentInterfaceView: opts.agentInterfaceView,
+      statusPageAgent: opts.statusPageAgent,
     }
   );
   const systemMessage = built.systemMessage;
@@ -1582,6 +1619,8 @@ export async function discoverAvailableSubagentsForToolContext(args: {
   cache?: AgentDefinitionRequestCache;
   /** #6426: only `true` lists project plugin agents (used only without explicit `roots`). */
   projectPluginsTrusted?: boolean;
+  /** Builds the host-local runtimes of the definition scans. */
+  runtimeFactory: RuntimeFactory;
 }): Promise<Awaited<ReturnType<typeof discoverAgentDefinitions>>> {
   assert(args, "discoverAvailableSubagentsForToolContext: args is required");
   assert(args.runtime, "discoverAvailableSubagentsForToolContext: runtime is required");
@@ -1594,6 +1633,7 @@ export async function discoverAvailableSubagentsForToolContext(args: {
   const discovered = await discoverAgentDefinitions(args.runtime, args.workspacePath, {
     roots: args.roots,
     projectPluginsTrusted: args.projectPluginsTrusted,
+    runtimeFactory: args.runtimeFactory,
   });
 
   let desktopAvailablePromise: Promise<boolean> | undefined;
@@ -1623,6 +1663,7 @@ export async function discoverAvailableSubagentsForToolContext(args: {
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
             cache: args.cache,
             projectPluginsTrusted: args.projectPluginsTrusted,
+            runtimeFactory: args.runtimeFactory,
           }
         );
 

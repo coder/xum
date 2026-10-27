@@ -4,17 +4,18 @@
 // per-test temp root are unchanged.
 import type { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import * as path from "path";
-import { expect, mock } from "bun:test";
+import { expect, mock, spyOn } from "bun:test";
 import * as fsPromises from "fs/promises";
 import * as os from "os";
 import type { Config } from "@/node/config";
-import type { WorkspaceTurnTaskHandleRecord } from "@/node/services/taskHandleStore";
+import { TaskHandleStore } from "@/node/services/taskHandleStore";
 import { type Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { HistoryService } from "@/node/services/historyService";
 import { upsertSubagentReportArtifact } from "@/node/services/subagentReportArtifacts";
 import type { SessionUsageService } from "@/node/services/sessionUsageService";
 import type { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
 import type { TaskService } from "@/node/services/taskService";
+import type { WorkspaceTurnManager } from "@/node/services/workspaceTurnManager";
 import { Ok, type Result } from "@/common/types/result";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { isDynamicToolPart, type DynamicToolPart } from "@/common/types/toolParts";
@@ -40,6 +41,7 @@ import {
   workspaceTurnManagerInternals,
   workspaceTurnRecord,
 } from "@/node/services/taskService.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 /**
  * Per-test temp root. Each split file owns its `rootDir` and installs it with
@@ -66,48 +68,124 @@ export async function collectFullHistory(service: HistoryService, workspaceId: s
 }
 
 /**
- * Where a seeded live workspace-turn registration comes from in production:
- * - "recovered": the startup restart path. The handle record goes through the real store and
- *   reconcileAgentTaskExecutionIds() registers it (fail-closed, unaccepted) together with the
- *   task's execution mirror; the helper asserts that the restart path really did.
- * - "reserved" / "accepted": createWorkspaceTurn's registration before / after the owner's send
- *   passed turn admission. That path generates the handle and turn IDs and sends through the
- *   host, which these admission tests assert against, so these seeds (a documented residual)
- *   write the owner's registration map directly after the same real-store record write.
+ * Seed a live workspace-turn registration directly: the record goes through the real store, then
+ * the owner's private registration map is written. Prefer startLiveWorkspaceTurn, which gets the
+ * same state from createWorkspaceTurn. This seed remains only for states that producer cannot
+ * reach in the test's scenario: a race window inside a spied step, an owner/target pair no turn
+ * can create, or a tree already at its task capacity. "reserved" / "accepted" mirror
+ * createWorkspaceTurn's registration before / after the owner's send passed turn admission.
  */
-export type LiveWorkspaceTurnSource = "recovered" | "reserved" | "accepted";
+export type LiveWorkspaceTurnSource = "reserved" | "accepted";
 
 export async function registerLiveWorkspaceTurnHandle(
   taskService: TaskService,
   workspaceId: string,
   handleId: string,
   ownerWorkspaceId = "tree-root",
-  source: LiveWorkspaceTurnSource = "accepted",
-  recordOverrides: Partial<WorkspaceTurnTaskHandleRecord> = {}
+  source: LiveWorkspaceTurnSource = "accepted"
 ): Promise<void> {
-  const manager = workspaceTurnManagerFor(taskService);
   const internals = workspaceTurnManagerInternals(taskService);
   await internals.taskHandleStore.upsertWorkspaceTurn(
     workspaceTurnRecord(ownerWorkspaceId, workspaceId, handleId, "running", {
       turnId: `${handleId}-turn`,
       createdAt: "2026-08-24T00:00:00.000Z",
       updatedAt: "2026-08-24T00:00:00.000Z",
-      ...recordOverrides,
     })
   );
-  if (source === "recovered") {
-    await manager.reconcileAgentTaskExecutionIds();
-    assert(
-      manager.getLiveWorkspaceTurnRegistration(workspaceId)?.handleId === handleId,
-      `reconcileAgentTaskExecutionIds did not register ${handleId} for ${workspaceId}`
-    );
-    return;
-  }
   internals.activeWorkspaceTurnHandleByWorkspaceId.set(workspaceId, {
     handleId,
     ownerWorkspaceId,
     accepted: source === "accepted",
   });
+}
+
+/**
+ * Start a live workspace turn through the owner's real createWorkspaceTurn, the production
+ * producer of a live workspace-turn registration (and, for a persistent agent-task child, its
+ * running execution mirror). With `workspaceId` the owner continues that existing workspace: a
+ * descendant agent task, or (with `ownerCreatedWorkspace`) a workspace an earlier completed turn of
+ * the owner created, which the helper persists as that durable record. Without `workspaceId` the
+ * owner creates a new workspace through the stack's host `create` mock. The
+ * turn's handle id is `handleId` and its turn id `${handleId}-turn`. The prompt goes through
+ * createWorkspaceTurn's own sender seam (as a bash-monitor wake does), so the stack's host
+ * sendMessage mock records only the test's sends. With `accept: false` the send defers admission
+ * like a queued send: the registration stays a reservation until the returned `accept` runs the
+ * turn's onAccepted.
+ */
+export async function startLiveWorkspaceTurn(
+  taskService: TaskService,
+  config: Config,
+  params: {
+    ownerWorkspaceId: string;
+    handleId: string;
+    workspaceId?: string;
+    ownerCreatedWorkspace?: boolean;
+    accept?: boolean;
+    attentionPolicy?: Parameters<WorkspaceTurnManager["createWorkspaceTurn"]>[0]["attentionPolicy"];
+  }
+): Promise<{ workspaceId: string; accept: () => Promise<void> }> {
+  assert(params.handleId.startsWith("wst_"), "startLiveWorkspaceTurn: handleId must be a wst_ id");
+  const manager = workspaceTurnManagerFor(taskService);
+  if (params.ownerCreatedWorkspace === true) {
+    assert(
+      params.workspaceId != null,
+      "startLiveWorkspaceTurn: ownerCreatedWorkspace needs a target"
+    );
+    await new TaskHandleStore(config).upsertWorkspaceTurn(
+      workspaceTurnRecord(
+        params.ownerWorkspaceId,
+        params.workspaceId,
+        `${params.handleId}_create`,
+        "completed",
+        { createdWorkspace: true }
+      )
+    );
+  }
+  const ids = [params.handleId.slice("wst_".length), `${params.handleId}-turn`];
+  const generateStableId = spyOn(config, "generateStableId").mockImplementation(() => {
+    const id = ids.shift();
+    assert(id != null, "startLiveWorkspaceTurn: createWorkspaceTurn generated an unexpected id");
+    return id;
+  });
+  let onAccepted: (() => Promise<void> | void) | undefined;
+  let created: Awaited<ReturnType<WorkspaceTurnManager["createWorkspaceTurn"]>>;
+  try {
+    created = await manager.createWorkspaceTurn({
+      ownerWorkspaceId: params.ownerWorkspaceId,
+      prompt: "Continue.",
+      title: "Workspace turn",
+      ...(params.attentionPolicy != null ? { attentionPolicy: params.attentionPolicy } : {}),
+      ...(params.workspaceId != null
+        ? {
+            allowAgentWorkspace: true,
+            workspace: { mode: "existing" as const, workspaceId: params.workspaceId },
+          }
+        : { workspace: { mode: "new" as const } }),
+      sendMessage: async (_workspaceId, _message, _options, internal) => {
+        onAccepted = internal?.onAccepted;
+        if (params.accept !== false) await onAccepted?.();
+        return Ok(undefined);
+      },
+    });
+  } finally {
+    generateStableId.mockRestore();
+  }
+  assert(
+    created.success && created.data.taskId === params.handleId,
+    `startLiveWorkspaceTurn: createWorkspaceTurn failed: ${JSON.stringify(created)}`
+  );
+  const workspaceId = created.data.workspaceId;
+  assert(
+    manager.getLiveWorkspaceTurnRegistration(workspaceId)?.accepted === (params.accept !== false),
+    `startLiveWorkspaceTurn: unexpected registration for ${workspaceId}`
+  );
+  return {
+    workspaceId,
+    accept: async () => {
+      assert(onAccepted != null, "startLiveWorkspaceTurn: the send carried no onAccepted");
+      await onAccepted();
+    },
+  };
 }
 
 export async function createAgentTask(
@@ -344,8 +422,10 @@ export async function flushTerminalAttentionDrains(
   assert(passes > 0, "flushTerminalAttentionDrains needs at least one pass");
   for (let i = 0; i < passes; i++) {
     const drains = (
-      taskService as unknown as { pendingTerminalAttentionDrains: Set<Promise<void>> }
-    ).pendingTerminalAttentionDrains;
+      taskService as unknown as {
+        terminalAttention: { pendingTerminalAttentionDrains: Set<Promise<void>> };
+      }
+    ).terminalAttention.pendingTerminalAttentionDrains;
     if (drains.size === 0) break;
     await Promise.all([...drains]);
   }
@@ -382,8 +462,10 @@ export function queuedWorkflowRunAttention(
   ownerWorkspaceId: string
 ): ReadonlySet<string> {
   const queue = (
-    taskService as unknown as { pendingWorkflowRunAttention: Map<string, Set<string>> }
-  ).pendingWorkflowRunAttention;
+    taskService as unknown as {
+      workflowRunAttention: { pendingWorkflowRunAttention: Map<string, Set<string>> };
+    }
+  ).workflowRunAttention.pendingWorkflowRunAttention;
   return new Set(queue.get(ownerWorkspaceId));
 }
 
@@ -399,6 +481,7 @@ export async function upsertTestSubagentReports(params: {
   const parentSessionDir = path.join(params.config.sessionsDir, params.parentId);
   for (const report of params.reports) {
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: params.parentId,
       workspaceSessionDir: parentSessionDir,
       childTaskId: report.childTaskId,

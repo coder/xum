@@ -5,7 +5,6 @@ import {
 import type { PlanReviewRecord } from "@/common/utils/planReview/planReviewRecord";
 import { describe, expect, spyOn, test } from "bun:test";
 
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
@@ -44,6 +43,12 @@ import {
   type SideChannelMetadata,
 } from "./branchSummary";
 import { createTestHistoryService } from "./testHistoryService";
+import { Layer } from "effect";
+import type { SessionLocksTag } from "@/node/services/di/tags";
+import { HostClockTag } from "@/node/services/di/hostClockLive";
+import { createMemoryHost } from "@/node/services/hostFiles/memoryHostFiles.testHarness";
+import { SessionLocksMemory } from "@/node/services/sessionLocks/memorySessionLocks.testHarness";
+import { nodeClock } from "@/node/utils/hostClock";
 
 function finishChunk(unified: "stop" | "length" = "stop"): LanguageModelV3StreamPart {
   return {
@@ -1347,7 +1352,9 @@ describe("branch summary placement on fork/truncate flows", () => {
     }
   });
 
-  test("a send in another process waits on the pending marker before proceeding (r48)", async () => {
+  // The Node layer and the memory layer: the reader must find the writer's marker through the
+  // same SessionLocks, since a memory lock leaves no lock file on the disk.
+  const crossProcessMarkerWait = async (locks?: Layer.Layer<SessionLocksTag>) => {
     // The registration map is process-local: with XUM_ALLOW_MULTIPLE_INSTANCES=1
     // a fork created by backend A is invisible to backend B, whose first send
     // would append its user row immediately and advance the guarded tail —
@@ -1356,7 +1363,7 @@ describe("branch summary placement on fork/truncate flows", () => {
     // send that finds NO local registration must wait on that marker.
     // Simulated here with a foreign workspace id (no local map entry)
     // sharing the session dir.
-    const { historyService, config, cleanup } = await createTestHistoryService();
+    const { historyService, config, cleanup } = await createTestHistoryService({ locks });
     try {
       const ws = "ws-cross-process-marker";
       const branchPoint = createMuxMessage("xp-1", "assistant", "branch point", { timestamp: 1 });
@@ -1388,7 +1395,7 @@ describe("branch summary placement on fork/truncate flows", () => {
         historyService,
         aiService: fakeAiService(gatedModel),
         workspaceId: ws,
-        sessionDir,
+        marker: { sessionDir, locks: historyService.locks },
         abandonedMessages: [
           createMuxMessage("xp-abandoned-user", "user", `Fix this: ${filler}`, { timestamp: 2 }),
           createMuxMessage("xp-abandoned-assistant", "assistant", `Findings: ${filler}`, {
@@ -1404,16 +1411,14 @@ describe("branch summary placement on fork/truncate flows", () => {
       // first send could observe it. No polling: a regression to detached
       // acquisition fails this assertion outright.
       const lockPath = path.join(sessionDir, "branch-summary.lock");
-      expect(
-        await fs.stat(lockPath).then(
-          () => true,
-          () => false
-        )
-      ).toBe(true);
+      expect(await historyService.locks.processFileLockExists(lockPath)).toBe(true);
 
       // Foreign send: no local registration under this id, marker exists —
       // it must BLOCK until the writer settles, not return immediately.
-      const foreignWait = awaitPendingBranchSummary("ws-foreign-process", sessionDir);
+      const foreignWait = awaitPendingBranchSummary("ws-foreign-process", {
+        sessionDir,
+        locks: historyService.locks,
+      });
       const sentinel = Symbol("still-pending");
       expect(
         await Promise.race([
@@ -1438,7 +1443,18 @@ describe("branch summary placement on fork/truncate flows", () => {
     } finally {
       await cleanup();
     }
-  });
+  };
+
+  test("a send in another process waits on the pending marker before proceeding (r48)", () =>
+    crossProcessMarkerWait());
+
+  test("a send in another process sees a marker that the memory locks hold (r48)", () =>
+    crossProcessMarkerWait(
+      SessionLocksMemory.pipe(
+        Layer.provide(Layer.succeed(HostClockTag)(nodeClock)),
+        Layer.provide(createMemoryHost().layer)
+      )
+    ));
 
   test("removal cancels an inline edit-resend summary through clearPendingBranchSummary (r57 P1)", async () => {
     // The edit-resend path awaits its summary synchronously — no first-send

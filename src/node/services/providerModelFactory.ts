@@ -145,6 +145,7 @@ import {
   type ProviderRequirementError,
 } from "@/node/utils/providerRequirements";
 import { EnvHttpProxyAgent, type Dispatcher } from "undici";
+import { guardAgainstBrotliResponses } from "@/node/utils/network/brotliResponseGuard";
 import packageJson from "../../../package.json";
 
 // ---------------------------------------------------------------------------
@@ -154,10 +155,12 @@ import packageJson from "../../../package.json";
 // and NO_PROXY environment variables for debugging/corporate network support.
 // ---------------------------------------------------------------------------
 
-const unlimitedTimeoutAgent = new EnvHttpProxyAgent({
-  bodyTimeout: 0, // No timeout - prevents BodyTimeoutError on long reasoning pauses
-  headersTimeout: 0, // No timeout for headers
-});
+const unlimitedTimeoutAgent = guardAgainstBrotliResponses(
+  new EnvHttpProxyAgent({
+    bodyTimeout: 0, // No timeout - prevents BodyTimeoutError on long reasoning pauses
+    headersTimeout: 0, // No timeout for headers
+  })
+);
 
 // Extend RequestInit with undici-specific dispatcher property (Node.js only)
 type RequestInitWithDispatcher = RequestInit & { dispatcher?: Dispatcher };
@@ -726,7 +729,7 @@ function withToolTypeArraysAsAnyOf(model: Parameters<typeof wrapLanguageModel>[0
  * createOpenAIModelWithPreservedOptions: the injected "none" must be visible
  * to that wrapper's body patch, or the SDK strips it.
  */
-export function clampGpt6ChatCompletionsToolReasoning(
+function clampGpt6ChatCompletionsToolReasoning(
   model: LanguageModelV4,
   capabilityModel: string
 ): LanguageModelV4 {

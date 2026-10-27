@@ -2,6 +2,7 @@ import * as path from "node:path";
 import assert from "@/common/utils/assert";
 
 import {
+  isRemoteRuntime,
   isRuntimeReadFailure,
   isRuntimeTransportError,
   type Runtime,
@@ -12,7 +13,6 @@ import { createRuntime } from "@/node/runtime/runtimeFactory";
 import { createRuntimeForWorkspace } from "@/node/runtime/runtimeHelpers";
 import { isAgentEffectivelyDisabled } from "./agentEnablement";
 import { resolveAgentVisibility } from "./agentVisibility";
-import { RemoteRuntime } from "@/node/runtime/RemoteRuntime";
 import { resolveGlobalRuntime } from "@/node/runtime/hostGlobalXumHome";
 import { getErrorMessage } from "@/common/utils/errors";
 import {
@@ -42,13 +42,14 @@ import {
 } from "@/node/utils/projectTrust";
 import { MAX_FILE_SIZE, validateFileSize } from "@/node/services/tools/fileCommon";
 
-import { LocalRuntime } from "@/node/runtime/LocalRuntime";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
-  discoverAgentPlugins,
-  nodePluginFs,
-  readPluginFileWithinRootCapped,
+  discoverAgentPluginsOnHost,
+  hostPluginFs,
   UNIVERSAL_AGENT_PLUGINS_CONTAINER,
   type AgentPluginContainer,
+  type PluginFileReadArgs,
+  type PluginFileReadResult,
   type PluginFs,
 } from "@/node/services/agentPlugins/discovery";
 import { getRemoteProjectPluginSnapshot } from "@/node/services/agentPlugins/remoteProjectPlugins";
@@ -57,7 +58,7 @@ import {
   type ComponentConsent,
 } from "@/node/services/agentPlugins/componentConsent";
 import { ambiguousPluginAgentIds, pluginAgentIdOf } from "@/node/services/agentPlugins/agentFiles";
-import { ensurePathContained, hasErrorCode } from "@/node/services/tools/skillFileUtils";
+import { hasErrorCode } from "@/node/services/tools/skillFileUtils";
 
 import { getBuiltInAgentDefinitions } from "./builtInAgentDefinitions";
 import {
@@ -167,7 +168,7 @@ function pluginRootsOf(
   AgentDefinitionsRoots,
   "projectPluginRoots" | "remoteProjectPluginRoots" | "globalPluginRoots"
 > {
-  if (runtime instanceof RemoteRuntime) {
+  if (isRemoteRuntime(runtime)) {
     return {
       ...(projectContainers.length > 0 ? { remoteProjectPluginRoots: projectContainers } : {}),
       // Tilde form: the host LocalRuntime maps ~/.xum to the host Xum home.
@@ -195,13 +196,19 @@ interface AgentDefinitionScanCandidate {
    * round trip), and every path stays a remote path; `runtime` is the RemoteRuntime.
    */
   pluginFs?: PluginFs;
+  /**
+   * The host filesystem of the scan's RuntimeFactory (hostPluginFs): the listing, containment
+   * and plugin reads of a host-local root that do not go through `runtime` (phase 5).
+   */
+  hostFs: PluginFs;
 }
 
 /** #6426: scan candidates for the plugin agents of a trusted remote checkout's snapshot. */
 async function buildRemotePluginAgentCandidates(
   runtime: Runtime,
   roots: AgentDefinitionsRoots,
-  workspacePath: string
+  workspacePath: string,
+  hostFs: PluginFs
 ): Promise<AgentDefinitionScanCandidate[]> {
   const containers = roots.remoteProjectPluginRoots ?? [];
   if (containers.length === 0) return [];
@@ -217,6 +224,7 @@ async function buildRemotePluginAgentCandidates(
             pluginRoot: plugin.rootPath,
             pluginName: plugin.name,
             pluginFs: snapshot?.fs,
+            hostFs,
           },
         ]
   );
@@ -234,12 +242,15 @@ async function buildPluginAgentScanCandidates(args: {
   projectContainmentRoot?: string;
   /** The Xum home that owns the plugin registry, so managed plugins carry consent (#6629). */
   managedHome: string;
+  /** Builds the host-local runtime that resolves the containers. */
+  runtimeFactory: RuntimeFactory;
 }): Promise<AgentDefinitionScanCandidate[]> {
   if (args.containers.length === 0) {
     return [];
   }
 
-  const localRuntime = new LocalRuntime(args.workspacePath);
+  const localRuntime = args.runtimeFactory.createLocalRuntime(args.workspacePath);
+  const hostFs = hostPluginFs(args.runtimeFactory.hostFiles);
   const resolvedContainers: AgentPluginContainer[] = [];
   for (const container of args.containers) {
     try {
@@ -253,7 +264,7 @@ async function buildPluginAgentScanCandidates(args: {
     }
   }
 
-  const { plugins } = await discoverAgentPlugins(resolvedContainers, {
+  const { plugins } = await discoverAgentPluginsOnHost(hostFs, resolvedContainers, {
     managedHome: await localRuntime.resolvePath(args.managedHome),
   });
 
@@ -265,7 +276,7 @@ async function buildPluginAgentScanCandidates(args: {
 
     if (args.projectContainmentRoot != null) {
       try {
-        await ensurePathContained(args.projectContainmentRoot, plugin.rootPath);
+        await hostFs.ensureContained(args.projectContainmentRoot, plugin.rootPath);
       } catch (error) {
         log.warn(
           `Skipping project plugin '${plugin.name}' at '${plugin.rootPath}': plugin root escapes the project containment root: ${getErrorMessage(error)}`
@@ -281,6 +292,7 @@ async function buildPluginAgentScanCandidates(args: {
       pluginRoot: plugin.rootPath,
       pluginName: plugin.name,
       pluginConsent: plugin.componentConsent,
+      hostFs,
     });
   }
 
@@ -295,23 +307,27 @@ async function buildPluginAgentScanCandidates(args: {
 async function buildScanCandidates(
   runtime: Runtime,
   workspacePath: string,
-  roots: AgentDefinitionsRoots
+  roots: AgentDefinitionsRoots,
+  runtimeFactory: RuntimeFactory
 ): Promise<AgentDefinitionScanCandidate[]> {
   // The registry lives in the Xum home above the global agents root (tilde form maps to the host
   // home), as plugin skill discovery derives it.
   const managedHome = path.dirname(roots.globalRoot);
+  const hostFs = hostPluginFs(runtimeFactory.hostFiles);
   const projectPluginCandidates = await buildPluginAgentScanCandidates({
     containers: roots.projectPluginRoots ?? [],
     scope: "project",
     workspacePath,
     projectContainmentRoot: workspacePath,
     managedHome,
+    runtimeFactory,
   });
   const globalPluginCandidates = await buildPluginAgentScanCandidates({
     containers: roots.globalPluginRoots ?? [],
     scope: "global",
     workspacePath,
     managedHome,
+    runtimeFactory,
   });
 
   return [
@@ -319,13 +335,15 @@ async function buildScanCandidates(
       scope: "project" as const,
       root,
       runtime,
+      hostFs,
     })),
     ...projectPluginCandidates,
-    ...(await buildRemotePluginAgentCandidates(runtime, roots, workspacePath)),
+    ...(await buildRemotePluginAgentCandidates(runtime, roots, workspacePath, hostFs)),
     {
       scope: "global",
       root: roots.globalRoot,
-      runtime: resolveGlobalRuntime(runtime, workspacePath),
+      runtime: resolveGlobalRuntime(runtime, workspacePath, runtimeFactory),
+      hostFs,
     },
     ...globalPluginCandidates,
   ];
@@ -359,7 +377,8 @@ async function resolvePluginAgentFile(args: {
   pluginRoot: string;
   agentsDir: string;
   agentId: AgentId;
-  pluginFs?: PluginFs;
+  /** A remote plugin's snapshot, else the host filesystem (the candidate's hostFs). */
+  pluginFs: PluginFs;
 }): Promise<string | null> {
   const names = await listAgentFiles(args.pluginFs, args.agentsDir);
   const ambiguous = warnAmbiguousPluginAgents(names);
@@ -377,11 +396,11 @@ async function isPluginAgentContained(args: {
   pluginRoot: string;
   filePath: string;
   agentId: AgentId;
-  /** A remote plugin's snapshot; the host filesystem when absent. */
-  pluginFs?: PluginFs;
+  /** A remote plugin's snapshot, else the host filesystem (the candidate's hostFs). */
+  pluginFs: PluginFs;
 }): Promise<boolean> {
   try {
-    await (args.pluginFs ?? nodePluginFs).ensureContained(args.pluginRoot, args.filePath);
+    await args.pluginFs.ensureContained(args.pluginRoot, args.filePath);
     return true;
   } catch (error) {
     if (!hasErrorCode(error, "ENOENT")) {
@@ -394,9 +413,9 @@ async function isPluginAgentContained(args: {
 }
 
 /** The agent files of a plugin agents dir: in a remote snapshot, else on the host. */
-async function listAgentFiles(pluginFs: PluginFs | undefined, root: string): Promise<string[]> {
+async function listAgentFiles(pluginFs: PluginFs, root: string): Promise<string[]> {
   try {
-    const entries = await (pluginFs ?? nodePluginFs).readdir(root);
+    const entries = await pluginFs.readdir(root);
     return entries
       .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith(".md"))
       .map((entry) => entry.name);
@@ -407,13 +426,13 @@ async function listAgentFiles(pluginFs: PluginFs | undefined, root: string): Pro
 
 /** A scan root's agent files: from its snapshot, over its remote runtime, or on the host. */
 function listCandidateAgentFiles(
-  scan: Pick<AgentDefinitionScanCandidate, "runtime" | "pluginFs">,
+  scan: Pick<AgentDefinitionScanCandidate, "runtime" | "pluginFs" | "hostFs">,
   resolvedRoot: string,
   workspacePath: string
 ): Promise<string[]> {
-  return scan.pluginFs == null && scan.runtime instanceof RemoteRuntime
+  return scan.pluginFs == null && isRemoteRuntime(scan.runtime)
     ? listAgentFilesFromRuntime(scan.runtime, resolvedRoot, { cwd: workspacePath })
-    : listAgentFiles(scan.pluginFs, resolvedRoot);
+    : listAgentFiles(candidateFs(scan), resolvedRoot);
 }
 
 /** A scan root, resolved. A remote plugin root is already a real remote path: no round trip. */
@@ -425,12 +444,20 @@ function resolveCandidateRoot(
     : candidate.runtime.resolvePath(candidate.root);
 }
 
-/** A plugin agent file: from its remote snapshot, else the host's contained reader. */
+/** The filesystem of a candidate's plugin reads: its remote snapshot, else the host's. */
+function candidateFs(
+  candidate: Pick<AgentDefinitionScanCandidate, "pluginFs" | "hostFs">
+): PluginFs {
+  // mutation-equivalent: pluginFs is a PluginFs object or undefined, so ?? and || agree
+  return candidate.pluginFs ?? candidate.hostFs;
+}
+
+/** A plugin agent file: from its remote snapshot, else the host's contained reader (hostFs). */
 function readPluginAgentFile(
-  pluginFs: PluginFs | undefined,
-  args: Parameters<typeof readPluginFileWithinRootCapped>[0]
-): ReturnType<typeof readPluginFileWithinRootCapped> {
-  return pluginFs != null ? pluginFs.readFileCapped(args) : readPluginFileWithinRootCapped(args);
+  pluginFs: PluginFs,
+  args: PluginFileReadArgs
+): Promise<PluginFileReadResult> {
+  return pluginFs.readFileCapped(args);
 }
 
 async function listAgentFilesFromRuntime(
@@ -516,7 +543,7 @@ async function readAgentDescriptorFromFile(
   filePath: string,
   agentId: AgentId,
   scope: Exclude<AgentDefinitionScope, "built-in">,
-  pluginName?: string,
+  pluginName: string | undefined,
   /**
    * Plugin agents (host-local by construction): the consuming read must
    * revalidate containment + file identity through a bounded post-open
@@ -526,10 +553,10 @@ async function readAgentDescriptorFromFile(
    * reads that as a capability removal, and the outside frontmatter would
    * otherwise control agent policy (runnable/base/tools).
    */
-  pluginRoot?: string,
-  pluginConsent?: ComponentConsent,
-  /** A remote plugin's snapshot (AgentDefinitionScanCandidate.pluginFs). */
-  pluginFs?: PluginFs
+  pluginRoot: string | undefined,
+  pluginConsent: ComponentConsent | undefined,
+  /** The remote snapshot or the host filesystem of a plugin agent (see readPluginAgentFile). */
+  pluginFs: PluginFs
 ): Promise<AgentDefinitionDescriptor | null> {
   let content: string;
   let byteSize: number;
@@ -632,7 +659,7 @@ function buildAgentDescriptor(pkg: AgentDefinitionPackage): AgentDefinitionDescr
 export async function discoverAgentDefinitions(
   runtime: Runtime,
   workspacePath: string,
-  options?: {
+  options: {
     roots?: AgentDefinitionsRoots;
     /**
      * When false, return every discovered descriptor in precedence order
@@ -642,6 +669,8 @@ export async function discoverAgentDefinitions(
     dedupeById?: boolean;
     /** #6426: only `true` adds project plugin agents (used only when `roots` is absent). */
     projectPluginsTrusted?: boolean;
+    /** Builds the host-local runtimes of the plugin and global scans. */
+    runtimeFactory: RuntimeFactory;
   }
 ): Promise<AgentDefinitionDescriptor[]> {
   if (!workspacePath) {
@@ -649,13 +678,13 @@ export async function discoverAgentDefinitions(
   }
 
   const roots = resolveAgentDefinitionsRoots(runtime, workspacePath, options);
-  const dedupeById = options?.dedupeById ?? true;
+  const dedupeById = options.dedupeById ?? true;
 
   const byId = new Map<AgentId, AgentDefinitionDescriptor>();
   const discovered: AgentDefinitionDescriptor[] = [];
 
   // Scan order encodes precedence: earlier roots win when ids collide.
-  const scans = await buildScanCandidates(runtime, workspacePath, roots);
+  const scans = await buildScanCandidates(runtime, workspacePath, roots, options.runtimeFactory);
 
   for (const scan of scans) {
     let resolvedRoot: string;
@@ -690,7 +719,7 @@ export async function discoverAgentDefinitions(
           pluginRoot: scan.pluginRoot,
           filePath,
           agentId,
-          pluginFs: scan.pluginFs,
+          pluginFs: candidateFs(scan),
         });
         if (!contained) continue;
       }
@@ -703,7 +732,7 @@ export async function discoverAgentDefinitions(
         scan.pluginName,
         scan.pluginRoot,
         scan.pluginConsent,
-        scan.pluginFs
+        candidateFs(scan)
       );
       if (!descriptor) continue;
 
@@ -770,11 +799,14 @@ export async function discoverAgentDefinitions(
  */
 export class AgentDefinitionRequestCache {
   private readonly definitions = new Map<string, Promise<AgentDefinitionPackage>>();
-  /** Identity keys: distinct runtime or roots objects never share entries. */
-  private readonly objectIds = new WeakMap<Runtime | AgentDefinitionsRoots, number>();
+  /** Identity keys: distinct runtime, roots or runtime factory objects never share entries. */
+  private readonly objectIds = new WeakMap<
+    Runtime | AgentDefinitionsRoots | RuntimeFactory,
+    number
+  >();
   private nextObjectId = 1;
 
-  private objectId(value: Runtime | AgentDefinitionsRoots): number {
+  private objectId(value: Runtime | AgentDefinitionsRoots | RuntimeFactory): number {
     let id = this.objectIds.get(value);
     if (id == null) {
       id = this.nextObjectId++;
@@ -787,17 +819,18 @@ export class AgentDefinitionRequestCache {
     runtime: Runtime,
     workspacePath: string,
     agentId: AgentId,
-    options: ReadAgentDefinitionOptions | undefined,
+    options: ReadAgentDefinitionOptions,
     load: () => Promise<AgentDefinitionPackage>
   ): Promise<AgentDefinitionPackage> {
     const key = JSON.stringify([
       this.objectId(runtime),
       workspacePath,
       agentId,
-      options?.roots != null ? this.objectId(options.roots) : null,
-      options?.skipScopesAbove ?? null,
+      options.roots != null ? this.objectId(options.roots) : null,
+      options.skipScopesAbove ?? null,
       // #6426: the default roots differ with trust (project plugin agents).
-      options?.projectPluginsTrusted === true,
+      options.projectPluginsTrusted === true,
+      this.objectId(options.runtimeFactory),
     ]);
     let definition = this.definitions.get(key);
     if (definition == null) {
@@ -825,6 +858,8 @@ export interface ReadAgentDefinitionOptions {
   abortSignal?: AbortSignal;
   /** #6426: only `true` adds project plugin agents (used only when `roots` is absent). */
   projectPluginsTrusted?: boolean;
+  /** Builds the host-local runtimes of the plugin and global scans. */
+  runtimeFactory: RuntimeFactory;
 }
 
 const SCOPE_PRIORITY: AgentDefinitionScope[] = ["project", "global", "built-in"];
@@ -841,12 +876,19 @@ function resolveAgentDefinitionsRoots(
 
 /** The options each inherited read keeps from the caller (its skip scope is per base). */
 function pickInheritedReadOptions(
-  options: Pick<ReadAgentDefinitionOptions, "roots" | "cache" | "projectPluginsTrusted"> | undefined
-): Pick<ReadAgentDefinitionOptions, "roots" | "cache" | "projectPluginsTrusted"> {
+  options: Pick<
+    ReadAgentDefinitionOptions,
+    "roots" | "cache" | "projectPluginsTrusted" | "runtimeFactory"
+  >
+): Pick<
+  ReadAgentDefinitionOptions,
+  "roots" | "cache" | "projectPluginsTrusted" | "runtimeFactory"
+> {
   return {
-    roots: options?.roots,
-    cache: options?.cache,
-    projectPluginsTrusted: options?.projectPluginsTrusted,
+    roots: options.roots,
+    cache: options.cache,
+    projectPluginsTrusted: options.projectPluginsTrusted,
+    runtimeFactory: options.runtimeFactory,
   };
 }
 
@@ -854,12 +896,12 @@ export async function readAgentDefinition(
   runtime: Runtime,
   workspacePath: string,
   agentId: AgentId,
-  options?: ReadAgentDefinitionOptions
+  options: ReadAgentDefinitionOptions
 ): Promise<AgentDefinitionPackage> {
   if (!workspacePath) {
     throw new Error("readAgentDefinition: workspacePath is required");
   }
-  const cache = options?.cache;
+  const cache = options.cache;
   if (cache != null) {
     return cache.read(runtime, workspacePath, agentId, options, () =>
       loadAgentDefinition(runtime, workspacePath, agentId, options)
@@ -872,10 +914,10 @@ async function loadAgentDefinition(
   runtime: Runtime,
   workspacePath: string,
   agentId: AgentId,
-  options?: ReadAgentDefinitionOptions
+  options: ReadAgentDefinitionOptions
 ): Promise<AgentDefinitionPackage> {
   const roots = resolveAgentDefinitionsRoots(runtime, workspacePath, options);
-  const skipScopesAbove = options?.skipScopesAbove;
+  const skipScopesAbove = options.skipScopesAbove;
 
   // Determine which scopes to skip based on skipScopesAbove
   const skipScopes = new Set<AgentDefinitionScope>();
@@ -891,9 +933,14 @@ async function loadAgentDefinition(
 
   // Precedence: project overrides plugin(project) overrides global overrides
   // plugin(global) overrides built-in.
-  const candidates = await buildScanCandidates(runtime, workspacePath, roots);
+  const candidates = await buildScanCandidates(
+    runtime,
+    workspacePath,
+    roots,
+    options.runtimeFactory
+  );
 
-  const abortSignal = options?.abortSignal;
+  const abortSignal = options.abortSignal;
   for (const candidate of candidates) {
     abortSignal?.throwIfAborted();
     if (skipScopes.has(candidate.scope)) {
@@ -917,7 +964,7 @@ async function loadAgentDefinition(
         pluginRoot: candidate.pluginRoot,
         agentsDir: resolvedRoot,
         agentId,
-        pluginFs: candidate.pluginFs,
+        pluginFs: candidateFs(candidate),
       });
       if (pluginFile === null) continue;
       filePath = pluginFile;
@@ -932,7 +979,7 @@ async function loadAgentDefinition(
         // This frontmatter controls agent policy (runnable/base/tools), so a
         // replacement symlink promoted after isPluginAgentContained must not
         // have its outside target read here.
-        const result = await readPluginAgentFile(candidate.pluginFs, {
+        const result = await readPluginAgentFile(candidateFs(candidate), {
           filePath,
           pluginRoot: candidate.pluginRoot,
           maxBytes: MAX_FILE_SIZE,
@@ -1013,12 +1060,14 @@ export async function resolveAgentBody(
   runtime: Runtime,
   workspacePath: string,
   agentId: AgentId,
-  options?: {
+  options: {
     roots?: AgentDefinitionsRoots;
     skipScopesAbove?: AgentDefinitionScope;
     cache?: AgentDefinitionRequestCache;
     /** #6426: see ReadAgentDefinitionOptions.projectPluginsTrusted. */
     projectPluginsTrusted?: boolean;
+    /** See ReadAgentDefinitionOptions.runtimeFactory. */
+    runtimeFactory: RuntimeFactory;
   }
 ): Promise<string> {
   const visited = new Set<string>();
@@ -1084,7 +1133,7 @@ export async function resolveAgentBody(
     return `${baseBody}${separator}${pkg.body}`;
   }
 
-  return resolve(agentId, 0, options?.skipScopesAbove);
+  return resolve(agentId, 0, options.skipScopesAbove);
 }
 
 function formatZodIssues(
@@ -1157,7 +1206,7 @@ export async function resolveAgentDefinition(
   runtime: Runtime,
   workspacePath: string,
   agentId: AgentId,
-  options?: ReadAgentDefinitionOptions
+  options: ReadAgentDefinitionOptions
 ): Promise<AgentDefinitionPackage> {
   if (!workspacePath) {
     throw new Error("resolveAgentFrontmatter: workspacePath is required");
@@ -1239,14 +1288,14 @@ export async function resolveAgentDefinition(
     };
   }
 
-  return resolve(agentId, 0, options?.skipScopesAbove);
+  return resolve(agentId, 0, options.skipScopesAbove);
 }
 
 export async function resolveAgentFrontmatter(
   runtime: Runtime,
   workspacePath: string,
   agentId: AgentId,
-  options?: ReadAgentDefinitionOptions
+  options: ReadAgentDefinitionOptions
 ): Promise<AgentDefinitionPackage["frontmatter"]> {
   return (await resolveAgentDefinition(runtime, workspacePath, agentId, options)).frontmatter;
 }
@@ -1262,14 +1311,21 @@ export async function resolveAgentFrontmatter(
  */
 export async function resolveHeadlessAgentDefinition(
   muxRoot: string,
-  agentId: string
+  agentId: string,
+  runtimeFactory: RuntimeFactory
 ): Promise<AgentDefinitionPackage | null> {
   assert(/^[a-z0-9][a-z0-9_-]*$/.test(agentId), "headless agent ID must be path-safe");
   try {
-    const definition = await resolveAgentDefinition(new LocalRuntime(muxRoot), muxRoot, agentId, {
-      // Headless tools have no live checkout: never consult repo overrides or plugins.
-      roots: { projectRoots: [], globalRoot: path.join(muxRoot, "agents") },
-    });
+    const definition = await resolveAgentDefinition(
+      runtimeFactory.createLocalRuntime(muxRoot),
+      muxRoot,
+      agentId,
+      {
+        // Headless tools have no live checkout: never consult repo overrides or plugins.
+        roots: { projectRoots: [], globalRoot: path.join(muxRoot, "agents") },
+        runtimeFactory,
+      }
+    );
     const body = definition.body.trim();
     // Preserve legacy frontmatter-only overrides without discarding their effective metadata.
     const fallbackBody = getBuiltInAgentDefinitions().find((entry) => entry.id === agentId)?.body;
@@ -1285,7 +1341,7 @@ export async function resolveHeadlessAgentDefinition(
 }
 
 export type AgentDefinitionsContext = Pick<ORPCContext, "config"> & {
-  aiService: Pick<ORPCContext["aiService"], "getWorkspaceMetadata">;
+  aiService: Pick<ORPCContext["aiService"], "getWorkspaceMetadata" | "runtimeFactory">;
   initStateManager: Pick<ORPCContext["initStateManager"], "waitForInit">;
 };
 
@@ -1338,8 +1394,10 @@ export async function listAgentDefinitions(
     context,
     input
   );
+  const runtimeFactory = context.aiService.runtimeFactory;
   const descriptors = await discoverAgentDefinitions(runtime, discoveryPath, {
     projectPluginsTrusted,
+    runtimeFactory,
   });
   const cfg = context.config.loadConfigOrDefault();
   const resolved = await Promise.all(
@@ -1352,6 +1410,7 @@ export async function listAgentDefinitions(
           {
             skipScopesAbove: getSkipScopesAboveForKnownScope(descriptor.scope),
             projectPluginsTrusted,
+            runtimeFactory,
           }
         );
         if (
@@ -1399,5 +1458,8 @@ export async function getAgentDefinition(
     context,
     input
   );
-  return readAgentDefinition(runtime, discoveryPath, input.agentId, { projectPluginsTrusted });
+  return readAgentDefinition(runtime, discoveryPath, input.agentId, {
+    projectPluginsTrusted,
+    runtimeFactory: context.aiService.runtimeFactory,
+  });
 }

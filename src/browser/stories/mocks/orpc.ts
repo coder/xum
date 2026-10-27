@@ -162,6 +162,8 @@ export interface MockORPCClientOptions {
     updateChecks?: AgentPluginUpdateCheck[];
     /** Returned by agentPlugins.preview; omit to make preview fail. */
     preview?: AgentPluginInstallPreview;
+    /** The error agentPlugins.preview returns when it fails. */
+    previewError?: string;
     /** Returned by agentPlugins.preview for an "Install as" method; others get `preview`. */
     previewsByMethod?: Partial<Record<AgentPluginInstallMethod["kind"], AgentPluginInstallPreview>>;
     /** Returned by agentPlugins.preview without a method: a Claude Code marketplace listing. */
@@ -1428,7 +1430,7 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
           ? Promise.resolve({ success: true as const, data: { kind: "plugin" as const, preview } })
           : Promise.resolve({
               success: false as const,
-              error: "No preview configured in this story",
+              error: agentPluginsMock?.previewError ?? "No preview configured in this story",
             });
       },
       // Like the backend's command, from the typed source (the backend normalizes it first).

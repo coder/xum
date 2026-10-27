@@ -12,6 +12,7 @@ import type { AgentSkillDeleteToolResult } from "@/common/types/tools";
 import { getErrorMessage } from "@/common/utils/errors";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
@@ -299,6 +300,7 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
       try {
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
+          runtimeFactory: toolRuntimeFactory(config),
           workspacePath: config.cwd,
           xumScope: config.xumScope ?? null,
         });
@@ -322,7 +324,8 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
             await withTargetMutationLock(
               config.xumScope.xumHome,
               path.resolve(projectSkillDirs[0], ".."),
-              () => migrateLegacyProjectSkill(skillCtx, parsedName.data)
+              () => migrateLegacyProjectSkill(skillCtx, parsedName.data),
+              config.sessionLocks
             );
           }
         }
@@ -397,7 +400,8 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
           return await withTargetMutationLock(
             config.xumScope.xumHome,
             path.resolve(projectSkillDirs[0], ".."),
-            deleteProjectSkillDirs
+            deleteProjectSkillDirs,
+            config.sessionLocks
           );
         }
 
@@ -615,7 +619,8 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
                 success: true,
                 deleted: "skill",
               } satisfies AgentSkillDeleteToolResult;
-            }
+            },
+            config.sessionLocks
           );
         }
 
@@ -759,7 +764,8 @@ export const createAgentSkillDeleteTool: ToolFactory = (config: ToolConfiguratio
               success: true,
               deleted: "file",
             } satisfies AgentSkillDeleteToolResult;
-          }
+          },
+          config.sessionLocks
         );
       } catch (error) {
         return deleteFailure(error, "Failed to delete skill: ");

@@ -10,6 +10,7 @@ import {
   discoverAgentPlugins,
   ensurePluginPathContained,
   journalDerivedDiscoveryGate,
+  pluginSkillFolderNames,
   readPluginFileWithinRootCapped,
   setAgentPluginDiscoveryGate,
 } from "./discovery";
@@ -1422,7 +1423,9 @@ describe("discoverAgentPlugins", () => {
 
     expect(result.plugins).toEqual([]);
     expect(result.diagnostics).toHaveLength(1);
-    expect(result.diagnostics[0].message).toContain("Unsupported Agent Plugins version");
+    expect(result.diagnostics[0].message).toStartWith(
+      "Unsupported Agent Plugins version (plugin.json): "
+    );
   });
 
   test("loads plugins with unknown top-level manifest fields and reports a warning", async () => {
@@ -2131,6 +2134,97 @@ describe("Claude Code plugin discovery", () => {
       ["c", "from-claude", true],
     ]);
   });
+
+  test("a root plugin.json without $schema yields to a Codex or Claude manifest", async () => {
+    // DietrichGebert/ponytail ships `{"name":"ponytail"}` at the root for another harness, next
+    // to its .codex-plugin and .claude-plugin manifests.
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    const claude = claudeManifest({ name: "from-claude" });
+    const codex = { ".codex-plugin/plugin.json": JSON.stringify({ name: "from-codex" }) };
+    const foreignRoot = { "plugin.json": JSON.stringify({ name: "from-root" }) };
+    await writeTree(path.join(container, "a"), { ...claude, ...codex, ...foreignRoot });
+    await writeTree(path.join(container, "b"), { ...claude, ...foreignRoot });
+    // Alone, the root manifest is still reported, so an author who forgot $schema learns why.
+    await writeTree(path.join(container, "c"), foreignRoot);
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins.map((p) => [p.dirName, p.name, p.claudeFallback === true])).toEqual([
+      ["a", "from-codex", false],
+      ["b", "from-claude", true],
+    ]);
+    expect(
+      result.diagnostics.map(({ path: diagnosticPath, severity, message }) => ({
+        diagnosticPath,
+        severity,
+        message,
+      }))
+    ).toEqual([
+      {
+        diagnosticPath: path.join(container, "c", "plugin.json"),
+        severity: "error",
+        message:
+          "Invalid plugin manifest (plugin.json): '$schema' is required and must be a string",
+      },
+    ]);
+  });
+
+  test("a manifest error names the file from the repository root when given the plugin folder", async () => {
+    // Settings installs a repository's `.codex-plugin` folder as the plugin root: its
+    // plugin.json must read as `.codex-plugin/plugin.json`, the path the user knows.
+    using tmp = new DisposableTempDir("agent-plugins");
+    const pluginDir = path.join(tmp.path, "staged");
+    await writeTree(pluginDir, { "plugin.json": JSON.stringify({ name: "multi-harness" }) });
+
+    const result = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      shownRoot: ".codex-plugin",
+    });
+
+    expect(result.plugin).toBeNull();
+    expect(result.diagnostics.map((d) => d.message)).toEqual([
+      "Invalid plugin manifest (.codex-plugin/plugin.json): '$schema' is required and must be a string",
+    ]);
+  });
+
+  test("a manifest read error names the file from the repository root too", async () => {
+    // Read, size and containment errors come before validation (Codex review, #7422).
+    using tmp = new DisposableTempDir("agent-plugins");
+    const pluginDir = path.join(tmp.path, "staged");
+    await writeTree(pluginDir, { "plugin.json": "{ not json" });
+
+    const result = await discoverAgentPluginAt({
+      pluginDir,
+      scope: "global",
+      shownRoot: ".codex-plugin",
+    });
+
+    expect(result.plugin).toBeNull();
+    const messages = result.diagnostics.map((d) => d.message);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatch(/^Failed to read \.codex-plugin\/plugin\.json: /);
+  });
+
+  test("an invalid Codex manifest error names .codex-plugin/plugin.json", async () => {
+    using tmp = new DisposableTempDir("agent-plugins");
+    const container = path.join(tmp.path, "plugins");
+    // "--" has no safe name mapping, so the validator refuses the manifest.
+    await writeTree(path.join(container, "bad"), {
+      ".codex-plugin/plugin.json": JSON.stringify({ name: "my--plugin" }),
+    });
+
+    const result = await discoverAgentPlugins([{ path: container, scope: "global" }]);
+
+    expect(result.plugins).toEqual([]);
+    expect(result.diagnostics.map((d) => [d.severity, d.path])).toEqual([
+      ["error", path.join(container, "bad", ".codex-plugin", "plugin.json")],
+    ]);
+    expect(result.diagnostics[0].message).toStartWith(
+      "Invalid plugin manifest (.codex-plugin/plugin.json): "
+    );
+  });
 });
 
 describe("generatedFrom marker (skills-only packages)", () => {
@@ -2331,4 +2425,16 @@ describe("generatedFrom marker (Claude marketplace packages)", () => {
       });
     }
   });
+});
+
+// On a case-insensitive filesystem (the macOS default), a `Foo-Bar` folder answers the lookup of
+// `foo-bar`, so its snake_case twin must not be offered although no entry is named `foo-bar`.
+test("a snake_case plugin skill folder yields to any kebab-case path that is a directory", async () => {
+  const caseInsensitive = (folder: string) => Promise.resolve(folder.toLowerCase() === "foo-bar");
+  expect(
+    await pluginSkillFolderNames(["Foo-Bar", "foo_bar", "other_skill"], caseInsensitive)
+  ).toEqual([
+    { folder: "Foo-Bar", name: "Foo-Bar" },
+    { folder: "other_skill", name: "other-skill" },
+  ]);
 });

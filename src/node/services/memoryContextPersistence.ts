@@ -1,13 +1,13 @@
-import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import assert from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { z } from "zod";
 import type { Config } from "@/node/config";
 import { log } from "@/node/services/log";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import type { SessionFiles } from "@/node/services/sessionFiles/sessionFiles";
 import type { MemorySessionContext } from "@/node/services/memoryService";
 import { isErrnoWithCode } from "@/node/utils/fs";
-import writeFileAtomic from "@/node/utils/writeFileAtomic";
 
 /**
  * Session file that holds the memory context of the current context window.
@@ -101,7 +101,9 @@ export class MemoryContextStore {
 
   constructor(
     config: Config,
-    private readonly workspaceId: string
+    private readonly workspaceId: string,
+    /** The session files of the workspace (phase 5). Absent: the Node layer. */
+    private readonly files: SessionFiles = nodeSessionFiles
   ) {
     assert(workspaceId.length > 0, "MemoryContextStore requires a workspace id");
     this.filePath = path.join(config.sessionsDir, workspaceId, MEMORY_CONTEXT_FILE_NAME);
@@ -118,7 +120,7 @@ export class MemoryContextStore {
     const generation = this.generation;
     const raw = await this.enqueue("read", async () => {
       try {
-        return await fs.readFile(this.filePath, "utf-8");
+        return await this.files.promises.readFile(this.filePath, "utf-8");
       } catch (error) {
         if (isErrnoWithCode(error, "ENOENT")) return null;
         throw error;
@@ -160,8 +162,8 @@ export class MemoryContextStore {
     const written = await this.enqueue("write", async () => {
       // A window boundary that ran while this write waited owns the file now.
       if (generation !== this.generation) return false;
-      await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-      await writeFileAtomic(this.filePath, JSON.stringify(toFile(windowKey, entries)));
+      await this.files.promises.mkdir(path.dirname(this.filePath), { recursive: true });
+      await this.files.writeFileAtomic(this.filePath, JSON.stringify(toFile(windowKey, entries)));
       return true;
     });
     return written === true;
@@ -170,7 +172,7 @@ export class MemoryContextStore {
   /** A window boundary: the saved context must not reach the next window. */
   async discard(): Promise<void> {
     this.generation++;
-    await this.enqueue("delete", () => fs.rm(this.filePath, { force: true }));
+    await this.enqueue("delete", () => this.files.promises.rm(this.filePath, { force: true }));
   }
 
   /** Run one file operation after the earlier ones; a failure logs and resolves undefined. */

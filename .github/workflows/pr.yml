@@ -751,8 +751,10 @@ jobs:
       - run: make test-storybook
 
   test-e2e:
-    # Renders "linux 1/4" for shards and plain "macos" for the unsharded entry.
-    name: Test / E2E (${{ matrix.os }}${{ matrix.shard && format(' {0}', matrix.shard) || '' }})
+    # No matrix expression in the name: GitHub then appends the matrix values ("linux, 1/4",
+    # "macos") to expanded jobs, and a job skipped before matrix expansion shows plain
+    # "Test / E2E" instead of the unexpanded expression (#7340).
+    name: Test / E2E
     needs: [changes]
     # Queue only on PR pushes: in 330 sampled PR runs (2026-10-16..23) the jobs moved here (E2E,
     # bug-bash sandbox, Smoke / Server, Build / Linux, Build / VS Code) failed 8 times but were
@@ -841,8 +843,9 @@ jobs:
   bugbash-sandbox:
     # The bug-bash sandbox (#5714, #5931): its self-check (isolation, proxy and export refusals,
     # against a fake upstream) and the repros of fixed bugs through its launcher, on the mock app
-    # AI. No secrets and no model. The launcher pulls the pinned image by digest without
-    # credentials, and exits nonzero on a refusal, a failed check or a container left `unknown`.
+    # AI. No secrets and no model. The launcher pulls main's attested image by digest without
+    # registry credentials (or builds one from this checkout), and exits nonzero on a refusal, a
+    # failed check or a container left `unknown`.
     # E2E shard 1 still runs the same repros on the host until this job proves stable.
     name: Test / Bug-bash sandbox
     needs: [changes]
@@ -850,24 +853,25 @@ jobs:
     if: >-
       needs.changes.outputs.tests == 'true' && github.event.inputs.test_filter == '' &&
       (github.event_name != 'pull_request' || needs.changes.outputs.e2e_tests == 'true')
-    # 45, not 30: a stale image key adds a local image build of up to 25 minutes (below).
+    # 45, not 30: a PR that changes the image inputs has no published image yet (main publishes
+    # it after the merge), so the launcher builds one locally, for up to 25 minutes.
     timeout-minutes: 45
     runs-on: ${{ needs.changes.outputs.runner-4 }}
-    # Stale-key local build: only main publishes the image, so a PR that changes its inputs (Dockerfile, build.sh,
-    # playwright-core) has a stale image.json. With this opt-in the launcher then builds the image
-    # locally with build.sh, for these two jobs only, and prints a warning. Model-driven runs
-    # (make bug-bash, make mcp-apps-e2e) ignore it and keep the pinned digest.
-    env:
-      BUGBASH_SANDBOX_BUILD_STALE: "1"
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-xum
+      # GH_TOKEN: the launcher's gh verifies the published image's attestation on the host. It
+      # never reaches Docker or a job container (the container env drops it).
       - name: Sandbox self-check
         run: make bug-bash-sandbox-check
+        env:
+          GH_TOKEN: ${{ github.token }}
       - name: Repros in the sandbox
         run: make test-bugbash-repros-sandbox
+        env:
+          GH_TOKEN: ${{ github.token }}
 
   test-windows:
     name: Test / Windows
@@ -892,6 +896,9 @@ jobs:
         shell: pwsh
         run: |
           bun test src/node/utils/paths.test.ts src/node/utils/findExecutableOnPath.test.ts src/node/utils/gitNoHooksEnv.discovery.test.ts src/node/utils/main/bashPath.test.ts src/node/utils/main/resolveLocalPtyShell.test.ts src/node/runtime/SSH2ConnectionPool.test.ts src/node/services/historyService.statusLock.test.ts
+      - name: Verify Report slowness script-path placeholders on Windows paths
+        shell: pwsh
+        run: bun test src/node/services/perf/perfReportService.test.ts -t "script paths"
       - name: Verify Windows plugin path aliases
         shell: pwsh
         run: bun test src/node/services/agentPlugins/discovery.test.ts -t "coalesces Windows case aliases"

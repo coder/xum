@@ -13,7 +13,9 @@ import type { TodoItem } from "@/common/types/tools";
 import { getTodoFilePath } from "@/node/services/todos/todoStorage";
 import { TURN_STOP_PROMPT_MAX_CHARS } from "./agentPlugins/promptHooks";
 import { TODO_TURN_END_NUDGE } from "@/node/services/agentNotifications/todoTurnEndNudge";
+import { STATUS_PAGE_TURN_END_NUDGE } from "@/common/utils/machineTurnPrompts";
 import { Ok } from "@/common/types/result";
+import { createMuxMessage } from "@/common/types/message";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 import type { AgentSessionAIService } from "./agentSession";
 import { eventSpine, type TurnStopContext } from "./events/eventSpine";
@@ -24,6 +26,7 @@ import {
   type AgentSessionHarnessOptions,
 } from "./agentSession.testHarness";
 import { ExtensionMetadataService } from "./ExtensionMetadataService";
+import { SessionFilesMemory } from "./sessionFiles/memorySessionFiles.testHarness";
 import { createTestHistoryService } from "./testHistoryService";
 import { registerNoopContinuationBridgeForTest } from "./testDispatchHelpers";
 import { WorkspaceGoalService } from "./workspaceGoalService";
@@ -80,6 +83,8 @@ async function setup(
     fallbackModel?: (turn: number) => string | undefined;
     /** Runs while turn N streams, before it ends. */
     whileStreaming?: (turn: number, h: AgentSessionHarness) => void;
+    /** Every turn's status page earns the Agent interface view's turn-end nudge. */
+    statusPageNeedsNudge?: boolean;
     session?: Omit<AgentSessionHarnessOptions, "workspaceId" | "aiEmitter" | "aiServiceOverrides">;
   } = {}
 ) {
@@ -92,6 +97,9 @@ async function setup(
     workspaceId,
     aiEmitter: emitter,
     aiServiceOverrides: {
+      ...(input.statusPageNeedsNudge === true
+        ? { statusPageTurnEndNudge: () => Promise.resolve(STATUS_PAGE_TURN_END_NUDGE) }
+        : {}),
       streamMessage: mock<AgentSessionAIService["streamMessage"]>((request) => {
         requests.push(request);
         const messageId = `a${++turns}`;
@@ -775,6 +783,24 @@ describe("todo turn-end nudge", () => {
     expect(streams()).toBe(4);
   });
 
+  test("the nudge reads the list in the session's SessionFiles", async () => {
+    const history = await createTestHistoryService({ files: SessionFilesMemory });
+    unregisters.push(() => void history.cleanup());
+    const { h, streams } = await setup({
+      parts: todoWriteThenReply,
+      session: { config: history.config, historyService: history.historyService },
+    });
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await history.files.promises.mkdir(sessionDir, { recursive: true });
+    await history.files.promises.writeFile(getTodoFilePath(sessionDir), JSON.stringify(openTodos));
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(streams()).toBe(2);
+    expect(await userTexts(h)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
+  });
+
   test("a plugin continuation and the nudge share one continuation prompt", async () => {
     addConsumer(keepGoing);
     const { h, requests } = await setup({ parts: todoWriteThenReply });
@@ -820,6 +846,270 @@ describe("todo turn-end nudge", () => {
             : todoWriteThenReply,
     });
     await writeTodos(h, row.todos ?? openTodos);
+
+    await h.session.sendMessage("fix the bug", { ...options, agentId: row.agentId ?? "exec" });
+    await settle(h);
+
+    expect(streams()).toBe(1);
+  });
+
+  test.each([
+    {
+      name: "a background wake",
+      text: "Background sub-agent task(s) have completed.",
+      internal: { acceptanceOrigin: "automatic", synthetic: true, agentInitiated: true },
+    },
+    // Heartbeats carry no agentInitiated, so the gate must not rely on it.
+    {
+      name: "a heartbeat",
+      text: "[Heartbeat] Check on the workspace.",
+      internal: { acceptanceOrigin: "automatic", synthetic: true },
+    },
+    // A visible automatic send (a task brief) is not a message the user sent either.
+    {
+      name: "an automatic visible send",
+      text: "Work on the task.",
+      internal: { acceptanceOrigin: "automatic" },
+    },
+  ] as const)("a turn $name started gets no nudge", async (row) => {
+    const { h, streams } = await setup({ parts: todoWriteThenReply });
+    await writeTodos(h, openTodos);
+
+    await h.session.sendMessage(row.text, options, row.internal);
+    await settle(h);
+    expect(streams()).toBe(1);
+
+    // The next message the user sends is a user turn again and gets its nudge.
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+    expect(streams()).toBe(3);
+    expect((await userTexts(h)).slice(1)).toEqual(["fix the bug", TODO_TURN_END_NUDGE]);
+  });
+
+  // Compaction requests are automatic: after a user turn, neither a heartbeat's compaction
+  // (idle-compaction) nor an auto-compaction passes the user origin on to its follow-up.
+  test.each([
+    { source: "idle-compaction", nudged: false },
+    { source: "auto-compaction", nudged: false },
+  ] as const)(
+    "after a user turn, a compaction request with source $source starts a machine turn",
+    async (row) => {
+      // Only the follow-up (turn 3) writes todos.
+      const { h, streams } = await setup({
+        parts: (turn) => (turn === 3 ? todoWriteThenReply() : [{ type: "text", text: "ok" }]),
+      });
+      await writeTodos(h, openTodos);
+      await h.session.sendMessage("first", options);
+      await settle(h);
+      // The compaction stream runs; its summary is seeded below instead of written by the handler.
+      const session = h.session as unknown as {
+        contextController: {
+          compaction: { handleCompletion(...args: unknown[]): Promise<boolean> };
+        };
+      };
+      spyOn(session.contextController.compaction, "handleCompletion").mockResolvedValue(false);
+      await h.session.sendMessage(
+        "Please compact",
+        {
+          ...options,
+          agentId: "compact",
+          muxMetadata: {
+            type: "compaction-request",
+            rawCommand: "/compact",
+            parsed: {},
+            source: row.source,
+          },
+        },
+        { acceptanceOrigin: "automatic", synthetic: true }
+      );
+      await settle(h);
+      const summary = createMuxMessage("summary", "assistant", "compacted summary", {
+        compactionBoundary: true,
+        compacted: "user",
+        compactionEpoch: 1,
+        muxMetadata: {
+          type: "compaction-summary",
+          pendingFollowUp: { text: "check the workspace", model, agentId: "exec" },
+        },
+      });
+      assert((await h.historyService.appendToHistory(workspaceId, summary)).success);
+
+      expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+      await settle(h);
+
+      expect(streams()).toBe(row.nudged ? 4 : 3);
+      expect((await userTexts(h)).includes(TODO_TURN_END_NUDGE)).toBe(row.nudged);
+    }
+  );
+
+  // A resume starts a stream without a new message: an automatic one (the prompt-free resume after
+  // a sub-agent report) is a machine wake, and a manual one continues the user's turn.
+  test.each([
+    { name: "an automatic resume", internal: { acceptanceOrigin: "automatic" }, nudged: false },
+    { name: "a manual resume", internal: { acceptanceOrigin: "manual" }, nudged: true },
+  ] as const)("$name after a user turn keeps the right origin", async (row) => {
+    // Only the resumed stream (turn 2) writes todos, so turn 1 itself is never nudged.
+    const { h, streams } = await setup({
+      parts: (turn) => (turn === 2 ? todoWriteThenReply() : [{ type: "text", text: "ok" }]),
+    });
+    await writeTodos(h, openTodos);
+    await h.session.sendMessage("first", options);
+    await settle(h);
+
+    const resumed = await h.session.resumeStream(options, {
+      ...row.internal,
+      agentInitiated: true,
+    });
+    assert(resumed.success);
+    await settle(h);
+
+    expect(streams()).toBe(row.nudged ? 3 : 2);
+    expect((await userTexts(h)).includes(TODO_TURN_END_NUDGE)).toBe(row.nudged);
+  });
+
+  // A compaction follow-up is an automatic synthetic send: a machine turn, even after a user turn.
+  test.each([
+    { name: "a user turn", internal: undefined, nudged: false },
+    {
+      name: "a machine wake",
+      internal: { acceptanceOrigin: "automatic", synthetic: true },
+      nudged: false,
+    },
+  ] as const)("a compaction follow-up after $name gets no nudge", async (row) => {
+    // Only the follow-up (turn 2) writes todos, so turn 1 itself is never nudged.
+    const { h, streams } = await setup({
+      parts: (turn) => (turn === 2 ? todoWriteThenReply() : [{ type: "text", text: "ok" }]),
+    });
+    await writeTodos(h, openTodos);
+    await h.session.sendMessage("first", options, row.internal);
+    await settle(h);
+    const summary = createMuxMessage("summary", "assistant", "compacted summary", {
+      compactionBoundary: true,
+      compacted: "user",
+      compactionEpoch: 1,
+      muxMetadata: {
+        type: "compaction-summary",
+        pendingFollowUp: { text: "fix the bug", model, agentId: "exec" },
+      },
+    });
+    assert((await h.historyService.appendToHistory(workspaceId, summary)).success);
+
+    expect(await h.session.dispatchPendingCompactionFollowUpIfNeeded()).toBe(true);
+    await settle(h);
+
+    expect(streams()).toBe(row.nudged ? 3 : 2);
+    expect((await userTexts(h)).includes(TODO_TURN_END_NUDGE)).toBe(row.nudged);
+  });
+});
+
+describe("status page turn-end nudge", () => {
+  test("a turn whose status page needs it gets exactly one nudge per user turn", async () => {
+    // The nudge's own turn would earn it too: only the first stream of a user turn is nudged.
+    const { h, streams } = await setup({ statusPageNeedsNudge: true });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+    expect(await userTexts(h)).toEqual(["fix the bug", STATUS_PAGE_TURN_END_NUDGE]);
+
+    await h.session.sendMessage("now lint", options);
+    await settle(h);
+    expect(streams()).toBe(4);
+  });
+
+  test("a plugin continuation carries the nudge once, and its own turns get none", async () => {
+    addConsumer(keepGoing);
+    const { h } = await setup({ statusPageNeedsNudge: true });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual([
+      "fix the bug",
+      `Run the failing tests again.\n\n${STATUS_PAGE_TURN_END_NUDGE}`,
+      "Run the failing tests again.",
+      "Run the failing tests again.",
+    ]);
+  });
+
+  test("with the TODO nudge and a capped plugin prompt, both nudges arrive whole, TODO first", async () => {
+    const todoWrite: CompletedMessagePart = {
+      type: "dynamic-tool",
+      toolCallId: "todo-1",
+      toolName: "todo_write",
+      input: { todos: [] },
+      state: "output-available",
+      output: { success: true },
+    };
+    addConsumer((ctx) => void ctx.continueReasons.push("x".repeat(TURN_STOP_PROMPT_MAX_CHARS)));
+    const { h } = await setup({ statusPageNeedsNudge: true, parts: () => [todoWrite] });
+    const sessionDir = path.join(h.config.sessionsDir, workspaceId);
+    await fs.mkdir(sessionDir, { recursive: true });
+    const openTodos: TodoItem[] = [{ content: "Verify the fix", status: "in_progress" }];
+    await fs.writeFile(getTodoFilePath(sessionDir), JSON.stringify(openTodos));
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    const [, continuation] = await userTexts(h);
+    expect(continuation.length).toBe(TURN_STOP_PROMPT_MAX_CHARS);
+    expect(
+      continuation.endsWith(`x\n\n${TODO_TURN_END_NUDGE}\n\n${STATUS_PAGE_TURN_END_NUDGE}`)
+    ).toBe(true);
+  });
+
+  test("a Stop that finished while the turn's last event arrived ends the turn without a nudge", async () => {
+    // The stream still ends normally, and the Stop is over before the stream-end work reaches
+    // the nudge: only the epoch the turn was admitted under shows the turn was stopped.
+    let stopEpoch = 0;
+    const { h, streams } = await setup({
+      statusPageNeedsNudge: true,
+      whileStreaming: () => void stopEpoch++,
+      session: { getStopEpoch: () => stopEpoch },
+    });
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual(["fix the bug"]);
+    expect(streams()).toBe(1);
+  });
+
+  test("a Stop while the nudge row is written rolls the row back", async () => {
+    // Past dequeue, queue clearing no longer sees the continuation: its admission must.
+    let stopEpoch = 0;
+    const { h, streams } = await setup({
+      statusPageNeedsNudge: true,
+      session: { getStopEpoch: () => stopEpoch },
+    });
+    const accept = h.historyService.acceptCompactionReplacement.bind(h.historyService);
+    spyOn(h.historyService, "acceptCompactionReplacement").mockImplementation(
+      async (id, capture, operation, observer) => {
+        const result = await accept(id, capture, operation, observer);
+        const nudgeRow =
+          operation.kind === "append" &&
+          operation.messages.some((row) =>
+            row.parts.some(
+              (part) => part.type === "text" && part.text === STATUS_PAGE_TURN_END_NUDGE
+            )
+          );
+        if (nudgeRow) stopEpoch++;
+        return result;
+      }
+    );
+
+    await h.session.sendMessage("fix the bug", options);
+    await settle(h);
+
+    expect(await userTexts(h)).toEqual(["fix the bug"]);
+    expect(streams()).toBe(1);
+  });
+
+  test.each([
+    { name: "a Plan mode turn", agentId: "plan" },
+    { name: "a turn a plugin halted", halt: true },
+  ])("$name gets no nudge", async (row) => {
+    if (row.halt === true) addConsumer((ctx) => (ctx.halted = { pluginName: "guard" }));
+    const { h, streams } = await setup({ statusPageNeedsNudge: true });
 
     await h.session.sendMessage("fix the bug", { ...options, agentId: row.agentId ?? "exec" });
     await settle(h);

@@ -3,6 +3,7 @@ import { tool } from "ai";
 import type { AgentSkillDescriptor, InvocableSkill } from "@/common/types/agentSkill";
 import type { AgentSkillReadToolResult } from "@/common/types/tools";
 import type { ToolConfiguration, ToolFactory } from "@/common/utils/tools/tools";
+import { toolRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 import { TOOL_DEFINITIONS } from "@/common/utils/tools/toolDefinitions";
 import { AGENT_SKILL_INDEX_DESCRIPTION_MAX_CHARS } from "@/common/constants/toolLimits";
 import { parseSkillLookupName } from "@/common/utils/agentSkills/skillLookupName";
@@ -152,6 +153,7 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
         const includeClaudeSkills = config.experiments?.claudeSkillsCompat === true;
         const skillCtx = resolveSkillStorageContext({
           runtime: config.runtime,
+          runtimeFactory: toolRuntimeFactory(config),
           workspacePath,
           xumScope: config.xumScope ?? null,
           includeClaudeSkills,
@@ -159,6 +161,7 @@ export const createAgentSkillReadTool: ToolFactory = (config: ToolConfiguration)
         const resolved = await readAgentSkill(skillCtx.runtime, skillCtx.workspacePath, name, {
           roots: skillCtx.roots,
           containment: skillCtx.containment,
+          runtimeFactory: toolRuntimeFactory(config),
           includeClaudeSkills,
         });
         // Judged against config.runtime: that is where the model's bash runs.

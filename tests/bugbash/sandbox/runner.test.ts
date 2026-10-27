@@ -18,11 +18,11 @@ import {
 } from "./launch";
 import * as proxyModule from "./proxy";
 import { Ledger } from "./proxyPolicy";
-import { groupState, readImageLock, Refusal, Session, Stopped } from "./runner";
+import { groupState, Refusal, Session, Stopped } from "./runner";
 import { checkSet, CONTAINER_CHECKS, runSelfCheck, selfCheckExit } from "./selfCheckRun";
 
-// Each test runs the real build.sh in a throwaway git repo and a fake `docker` on PATH. The
-// runner gives docker a stripped env, so the fake reads its answers from bin/fake.env.
+// Each test runs the real build.sh in a throwaway git repo and a fake `docker` and `gh` on PATH.
+// The runner gives both a stripped env, so the fakes read their answers from bin/fake.env.
 const SANDBOX = "tests/bugbash/sandbox";
 const DIGEST = `sha256:${"61".repeat(32)}`;
 const REF = `ghcr.io/coder/xum-bugbash-sandbox@${DIGEST}`;
@@ -32,13 +32,22 @@ const FAKE = `#!/bin/sh
 bin=$(dirname "$0"); . "$bin/fake.env"
 unregister() { awk -v id="$1" '$1!=id' "$bin/containers" > "$bin/c.tmp"; mv "$bin/c.tmp" "$bin/containers"; }
 echo "$* [home=\${HOME-} cfg=\${DOCKER_CONFIG-}]" >> "$bin/calls.log"
+env | grep -oE '^(GH|XDG|DBUS)_[A-Z_]*' | sed 's/^/docker got /' >> "$bin/calls.log"
 case "$1" in
   context) if [ "\${CONTEXT-}" = hang ]; then trap '' TERM; exec sleep 30; fi; echo "$HOST" ;;
   info) echo "$INFO" ;;
   images) [ "$IMAGES_RC" = 0 ] || { echo "daemon down" >&2; exit 1; }
     case "$*" in *xum-bugbash-sandbox:inputs-*) echo "$LOCAL" ;; *) echo "$IMAGES" ;; esac ;;
-  # build.sh's local build: it prints the ID of its tag with \`image inspect\` next.
-  buildx) [ "$BUILD" = fail ] && { echo "build failed" >&2; exit 1; }; exit 0 ;;
+  # The stable tag's lookup (TAG): its digest, quoted as by {{json}}, or the registry's error.
+  # Else build.sh's local build: it prints the ID of its tag with \`image inspect\` next.
+  buildx) if [ "$2" = imagetools ]; then for tag in "$@"; do :; done
+      case "$TAG" in
+        found) echo "\\"$DIGEST\\"" ;;
+        garbage) echo "$DIGEST" ;;
+        missing) echo "ERROR: $tag: not found" >&2; exit 1 ;;
+        *) echo "ERROR: $tag: dial tcp: lookup ghcr.io: no such host" >&2; exit 1 ;;
+      esac; exit 0; fi
+    [ "$BUILD" = fail ] && { echo "build failed" >&2; exit 1; }; exit 0 ;;
   pull)
     if [ "$PULL" = hang ]; then trap '' TERM; exec sleep 30; fi
     # A grandchild that holds no pipe: only a signal to the whole group reaches it.
@@ -96,6 +105,14 @@ case "$1" in
 esac
 `;
 
+// gh attestation verify: exits GH_RC with GH_ERR on stderr, and logs the env names it reads for
+// the user's login.
+const FAKE_GH = `#!/bin/sh
+bin=$(dirname "$0"); . "$bin/fake.env"
+echo "gh $* [token=\${GH_TOKEN-} config=\${GH_CONFIG_DIR-} xdg=\${XDG_CONFIG_HOME-} bus=\${DBUS_SESSION_BUS_ADDRESS-} run=\${XDG_RUNTIME_DIR-}]" >> "$bin/calls.log"
+[ "$GH_RC" = 0 ] || { echo "$GH_ERR" >&2; exit "$GH_RC"; }
+`;
+
 let root = "";
 let bin = "";
 let key = "";
@@ -121,10 +138,10 @@ beforeEach(() => {
     encoding: "utf8",
   }).stdout.trim();
   expect(key).toMatch(/^[0-9a-f]{64}$/);
-  lock(key);
   bin = path.join(root, "bin");
   fs.mkdirSync(bin);
   fs.writeFileSync(path.join(bin, "docker"), FAKE, { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, "gh"), FAKE_GH, { mode: 0o755 });
   fs.writeFileSync(path.join(bin, "containers"), "");
   fake();
   process.env.PATH = `${bin}:${savedPath ?? ""}`;
@@ -143,20 +160,14 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function lock(inputsKey: string, digest = DIGEST) {
-  const record = {
-    image: "ghcr.io/coder/xum-bugbash-sandbox",
-    digest,
-    inputsKey,
-    playwrightCore: "1.63.0",
-    publishedFrom: "7".repeat(40),
-  };
-  fs.writeFileSync(path.join(root, SANDBOX, "image.json"), JSON.stringify(record));
-}
 function fake(over: Record<string, string> = {}) {
   const vars = {
     HOST: "unix:///var/run/docker.sock",
     INFO: '{"OSType":"linux","OperatingSystem":"Ubuntu 22.04","Architecture":"x86_64","SecurityOptions":["name=seccomp"]}',
+    TAG: "found",
+    DIGEST,
+    GH_RC: "0",
+    GH_ERR: "",
     IMAGES_RC: "0",
     IMAGES: "",
     LOCAL: "",
@@ -199,26 +210,34 @@ const session = (stop = new AbortController(), graceMs?: number) => {
   return s;
 };
 
-test("the committed image.json is a valid lock, and a malformed one refuses", () => {
-  expect(readImageLock().digest).toMatch(/^sha256:[0-9a-f]{64}$/);
-  lock(key, "sha256:short");
-  expect(() => readImageLock(root)).toThrow(Refusal);
-});
+/** A session whose log lines (the fallback reason) the test reads. */
+const logged = () => {
+  const lines: string[] = [];
+  const s = new Session(new AbortController().signal, { root, log: (l) => lines.push(l) });
+  sessions.push(s);
+  return { s, lines };
+};
+const WORKFLOW = "coder/xum/.github/workflows/bugbash-sandbox-image.yml";
 
-test("a stale inputs key refuses before any docker command", async () => {
-  lock("0".repeat(64));
-  expect(await failure(session().ensureImage())).toThrow(/stale image/);
-  await Bun.sleep(0);
-  expect(calls()).toBe("");
-});
-
-test("a missing image is pulled by digest, with a private client config", async () => {
-  const s = session();
-  expect(await s.ensureImage()).toBe(REF);
+test("a verified image of the stable tag is pulled by digest, with a private client config", async () => {
+  const { s, lines: log } = logged();
+  expect(await s.ensureImage()).toEqual({ ref: REF, local: null });
+  // One log line, and it names the image that runs.
+  expect(log).toHaveLength(1);
+  expect(log[0]).toContain(REF);
   const lines = calls().trim().split("\n");
-  expect(lines.map((l) => l.split(" ")[0])).toEqual(["context", "info", "images", "pull", "image"]);
-  expect(lines[3]).toStartWith(`pull --quiet ${REF} `);
-  // After `context inspect`, docker gets no HOME and an empty config folder that cleanup removes.
+  const kinds = lines.map((l) => l.split(" ")[0]);
+  expect(kinds).toEqual(["context", "info", "buildx", "gh", "images", "pull", "image"]);
+  // The lookup is of this key's stable tag. gh accepts only main's publish workflow of coder/xum.
+  expect(lines[2]).toStartWith(
+    `buildx imagetools inspect --format {{json .Manifest.Digest}} ghcr.io/coder/xum-bugbash-sandbox:inputs-${key} `
+  );
+  expect(lines[3]).toStartWith(
+    `gh attestation verify oci://${REF} --repo coder/xum --bundle-from-oci --source-ref refs/heads/main --signer-workflow ${WORKFLOW} `
+  );
+  expect(lines[5]).toStartWith(`pull --quiet ${REF} `);
+  // After `context inspect`, docker (the lookup too) gets no HOME and an empty config folder
+  // that cleanup removes.
   const cfg = /cfg=(\S+)\]/.exec(lines[2])![1];
   expect(lines[2]).toContain("[home= ");
   expect(fs.readdirSync(cfg)).toEqual([]);
@@ -226,9 +245,9 @@ test("a missing image is pulled by digest, with a private client config", async 
   expect(fs.existsSync(cfg)).toBe(false);
 });
 
-test("a present image is not pulled", async () => {
+test("a present verified image is not pulled", async () => {
   fake({ IMAGES: "sha256:abc" });
-  expect(await session().ensureImage()).toBe(REF);
+  expect(await session().ensureImage()).toEqual({ ref: REF, local: null });
   expect(calls()).not.toContain("pull");
 });
 
@@ -266,41 +285,71 @@ test("U6: an arm64 daemon refuses before the pull, naming the fix", async () => 
   expect(error).toThrow(/linux\/amd64/);
   expect(error).toThrow(/aarch64/);
   expect(error).toThrow(/use an amd64 host/);
-  expect(calls()).not.toMatch(/^(images|pull)/m);
+  expect(calls()).not.toMatch(/^(images|pull|buildx)/m);
 });
 
 test("U6: an amd64 daemon pulls the image", async () => {
   fake();
-  expect(await session().ensureImage()).toBe(REF);
+  expect((await session().ensureImage()).ref).toBe(REF);
   expect(calls()).toContain("pull");
 });
 
-// The stale-key local build: with `localBuild` and a stale key only, build.sh's local image replaces the pinned one.
-// The launcher sets `localBuild` by the job kind (the launch tests below).
-test("local build: a stale key with localBuild builds through build.sh, with the private client config", async () => {
-  lock("0".repeat(64));
-  expect(await session().ensureImage({ localBuild: true })).toBe(LOCAL_ID);
-  const lines = calls().trim().split("\n");
-  const build = lines.find((l) => l.startsWith("buildx build "))!;
-  expect(build).toContain(` --load --tag xum-bugbash-sandbox:inputs-${key} `);
-  const cfg = /cfg=(\S+)\]/.exec(lines[2])![1];
-  expect(build).toEndWith(`[home= cfg=${cfg}]`);
-  // The label check is of the built image. Nothing is pulled, pushed or logged in to.
-  expect(lines.at(-1)).toStartWith(`image inspect --format {{json .Config.Labels}} ${LOCAL_ID} `);
-  expect(calls()).not.toMatch(/^(pull|push|login)|--push|ghcr\.io/m);
+// The local build: without a verified image of main's publish workflow for this key, build.sh
+// builds one from this checkout. The reason goes to the log and to the caller (the warning).
+test.each([
+  ["a tag that is not published", { TAG: "missing" }, /:inputs-[0-9a-f]{64} is not published$/],
+  ["a failed tag lookup", { TAG: "down" }, /lookup of \S+ failed: .*no such host$/],
+  ["a lookup with no digest", { TAG: "garbage" }, /lookup of \S+ gave "sha256:6161/],
+  [
+    "an attestation that does not verify",
+    { GH_RC: "1", GH_ERR: "Error: verifying with issuer: no matching attestations" },
+    /@sha256:(61){32} is not verified \(gh exit 1\): Error: verifying .*no matching attestations$/,
+  ],
+  ["no gh login", { GH_RC: "4", GH_ERR: "try authenticating with:  gh auth login" }, /no gh token/],
+])(
+  "local build: %s builds through build.sh, with the private client config",
+  async (_name, over, why) => {
+    fake(over);
+    const { s, lines: log } = logged();
+    const image = await s.ensureImage();
+    expect(image.ref).toBe(LOCAL_ID);
+    expect(image.local).toMatch(why);
+    expect(log).toContain(`no verified image for inputs key ${key.slice(0, 16)}: ${image.local}`);
+    const lines = calls().trim().split("\n");
+    const build = lines.find((l) => l.startsWith("buildx build "))!;
+    expect(build).toContain(` --load --tag xum-bugbash-sandbox:inputs-${key} `);
+    const cfg = /cfg=(\S+)\]/.exec(lines[2])![1];
+    expect(build).toEndWith(`[home= cfg=${cfg}]`);
+    // gh runs only for a digest the lookup found.
+    expect(lines.some((l) => l.startsWith("gh "))).toBe("GH_RC" in over);
+    // The label check is of the built image. Nothing is pulled, pushed or logged in to.
+    expect(lines.at(-1)).toStartWith(`image inspect --format {{json .Config.Labels}} ${LOCAL_ID} `);
+    expect(calls()).not.toMatch(/^(pull|push|login)|--push/m);
+  }
+);
+
+test("local build: without gh on PATH, the image is built, not refused", async () => {
+  // A PATH of every system command but gh: the real gh must not answer for the fake.
+  const nogh = path.join(root, "nogh");
+  fs.mkdirSync(nogh);
+  const linked = new Set(["gh"]);
+  for (const dir of (savedPath ?? "").split(":"))
+    for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : [])
+      if (!linked.has(name)) {
+        linked.add(name);
+        fs.symlinkSync(path.join(dir, name), path.join(nogh, name));
+      }
+  fs.rmSync(path.join(bin, "gh"));
+  process.env.PATH = `${bin}:${nogh}`;
+  const image = await session().ensureImage();
+  expect(image).toEqual({ ref: LOCAL_ID, local: "gh is not installed" });
+  expect(calls()).toMatch(/^buildx build /m);
 });
 
-test("local build: a present local image of the stale key is reused, not built again", async () => {
-  lock("0".repeat(64));
-  fake({ LOCAL: LOCAL_ID });
-  expect(await session().ensureImage({ localBuild: true })).toBe(LOCAL_ID);
-  expect(calls()).not.toMatch(/^(buildx|pull)/m);
-});
-
-test("local build: a matching key takes the pinned digest and never builds, even with localBuild", async () => {
-  expect(await session().ensureImage({ localBuild: true })).toBe(REF);
-  expect(calls()).toMatch(/^pull --quiet /m);
-  expect(calls()).not.toMatch(/^buildx/m);
+test("local build: a present local image of the key is reused, not built again", async () => {
+  fake({ TAG: "missing", LOCAL: LOCAL_ID });
+  expect((await session().ensureImage()).ref).toBe(LOCAL_ID);
+  expect(calls()).not.toMatch(/^(buildx build|pull)/m);
 });
 
 test.each([
@@ -311,9 +360,8 @@ test.each([
   ],
   ["a failed build", { BUILD: "fail" }, /build\.sh: build failed/],
 ])("local build: a local image with %s refuses", async (_name, over, message) => {
-  lock("0".repeat(64));
-  fake(over);
-  expect(await failure(session().ensureImage({ localBuild: true }))).toThrow(message);
+  fake({ TAG: "missing", ...over });
+  expect(await failure(session().ensureImage())).toThrow(message);
 });
 
 const JOB = { name: "xbb-1", owner: "boot:pid", checkout: "abc" };
@@ -1985,7 +2033,7 @@ test("U1: the Docker preflight reports an unknown cleanup instead of a refusal o
     expect(await checkDocker(o)).toBe("unknown: process groups 9 still run");
     cleanup.mockResolvedValue("none");
     expect(await checkDocker(o).catch((e: unknown) => e)).toBeInstanceOf(Refusal);
-    ensure.mockResolvedValue("ref");
+    ensure.mockResolvedValue({ ref: "ref", local: null });
     expect(await checkDocker(o)).toBe("none");
     // A stop that lands during the cleanup still ends the preflight as a stop.
     const stop = new AbortController();
@@ -2002,30 +2050,48 @@ test("U1: the Docker preflight reports an unknown cleanup instead of a refusal o
   }
 });
 
-// The local build's gate in the launcher. Only the self-check and exact-step repros may use a local image, and
-// only with BUGBASH_SANDBOX_BUILD_STALE=1 (CI's bugbash-sandbox job).
-const OPT_IN = { BUGBASH_SANDBOX_BUILD_STALE: "1" };
+// Every job kind resolves its image the same way: main's verified image, else a local build of
+// its checkout with a warning. Only the image differs, never a container flag.
 const SELF_CHECK_ARGS = ["self-check", "--output", ".e2e/s"];
+const KINDS = {
+  "an exact-step repro": "repro",
+  "a self-check": "self-check",
+  "an explore charter": "explore",
+  "the MCP Apps suite": MCP_APPS,
+  "the story suite": STORIES,
+  "the agent repros": AGENT_REPROS,
+} as const;
+type Kind = (typeof KINDS)[keyof typeof KINDS];
 /** One job's `docker run` line and stderr, without its per-job values (name, folders, nonce). */
-async function jobRun(kind: "repro" | "self-check", env: Record<string, string>) {
-  fs.rmSync(path.join(root, "tests/bugbash/.e2e"), { recursive: true, force: true });
+async function jobRun(kind: Kind, env: Record<string, string>, over: Record<string, string> = {}) {
+  for (const dir of ["tests/bugbash/.e2e", "tests/stories/.e2e"])
+    fs.rmSync(path.join(root, dir), { recursive: true, force: true });
   fs.rmSync(path.join(bin, "calls.log"), { force: true });
-  const stderr: string[] = [];
+  let stderr: string[] = [];
   const error = spyOn(console, "error").mockImplementation(
     (line: string) => void stderr.push(line)
   );
   try {
-    const outcome =
-      kind === "repro"
-        ? await launchJob(ARGS, {
-            root: fs.realpathSync(root),
-            cwd: prepare(),
-            env: { ...HOST_ENV, ...env },
-            stop: new AbortController().signal,
-            log: () => undefined,
-          })
-        : (await selfCheckLaunch({}, SELF_CHECK_ARGS, env)).outcome;
-    expect(outcome).toMatchObject({ code: 7, cleanup: "removed" });
+    if (typeof kind !== "string") {
+      error.mockRestore(); // mcpLaunch reads stderr itself
+      const driven = await mcpLaunch(over, env, undefined, undefined, kind);
+      expect(driven.code).toBe(7);
+      stderr = driven.logged;
+    } else {
+      const outcome =
+        kind === "repro"
+          ? await launchJob(ARGS, {
+              root: fs.realpathSync(root),
+              cwd: prepare(over),
+              env: { ...HOST_ENV, ...env },
+              stop: new AbortController().signal,
+              log: () => undefined,
+            })
+          : kind === "self-check"
+            ? (await selfCheckLaunch(over, SELF_CHECK_ARGS, env)).outcome
+            : (await exploreLaunch(over, env)).outcome;
+      expect(outcome).toMatchObject({ code: 7, cleanup: "removed" });
+    }
   } finally {
     error.mockRestore();
   }
@@ -2038,64 +2104,70 @@ async function jobRun(kind: "repro" | "self-check", env: Record<string, string>)
   return { run, stderr, built: /^buildx build /m.test(calls()) };
 }
 
-test.each(["repro", "self-check"] as const)(
-  "local build: with the opt-in, a stale key gives the %s job a local image with the same container flags",
-  async (kind) => {
-    const pinned = await jobRun(kind, { ...OPT_IN, GITHUB_ACTIONS: "true" });
-    expect(pinned.built).toBe(false);
-    expect(pinned.stderr.filter((l) => l.startsWith("::warning::"))).toEqual([]);
-    lock("0".repeat(64));
-    const local = await jobRun(kind, { ...OPT_IN, GITHUB_ACTIONS: "true" });
+test.each(Object.entries(KINDS))(
+  "local build: without a verified image, %s gets a local image with the same container flags",
+  async (_name, kind) => {
+    const verified = await jobRun(kind, { GITHUB_ACTIONS: "true" });
+    expect(verified.built).toBe(false);
+    expect(verified.run).toContain(` ${REF} `);
+    expect(verified.stderr.filter((l) => l.startsWith("::warning::"))).toEqual([]);
+    const local = await jobRun(kind, { GITHUB_ACTIONS: "true" }, { TAG: "missing" });
     expect(local.built).toBe(true);
     // Only the image differs: every hardening flag stays.
     expect(local.run).toContain(` ${LOCAL_ID} `);
-    expect(local.run.replace(LOCAL_ID, REF)).toBe(pinned.run);
-    // One annotation in CI's log.
-    expect(local.stderr.filter((l) => l.startsWith("::warning::"))).toHaveLength(1);
+    expect(local.run.replace(LOCAL_ID, REF)).toBe(verified.run);
+    // One annotation in CI's log, with the reason.
+    const warnings = local.stderr.filter((l) => l.startsWith("::warning::"));
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/LOCAL IMAGE sha256:b1b1.*:inputs-[0-9a-f]{64} is not published/);
   }
 );
 
-test.each([
-  ["an explore charter", "1"],
-  ["the MCP Apps suite", "1"],
-  ["the story suite", "1"],
-  ["the agent repros", "1"],
-  ["a repro whose opt-in is not exactly 1", "true"],
-])("local build: %s refuses a stale key, and nothing is built", async (job, value) => {
-  lock("0".repeat(64));
-  const env = { BUGBASH_SANDBOX_BUILD_STALE: value };
-  const driven: Record<string, DrivenRun> = {
-    "the MCP Apps suite": MCP_APPS,
-    "the story suite": STORIES,
-    "the agent repros": AGENT_REPROS,
+test("the gh login env reaches gh on the host, and never docker or the job container", async () => {
+  // A token, a custom config folder, and the keyring's session bus.
+  const gh = {
+    GH_TOKEN: "ghs_hosttoken",
+    GH_CONFIG_DIR: "/home/u/.gh-custom",
+    XDG_CONFIG_HOME: "/home/u/.cfg",
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/1000/bus",
+    XDG_RUNTIME_DIR: "/run/user/1000",
   };
-  const error =
-    job === "an explore charter"
-      ? ((await exploreLaunch({}, env)).outcome as { error: unknown }).error
-      : job in driven
-        ? (await mcpLaunch({}, env, undefined, undefined, driven[job])).code
-        : await launchIn({}, new AbortController(), { ...HOST_ENV, ...env }).catch(
-            (e: unknown) => e
-          );
-  expect(error).toBeInstanceOf(Refusal);
-  expect((error as Error).message).toMatch(/stale image/);
-  expect(calls()).not.toMatch(/^buildx/m);
+  const saved = Object.fromEntries(Object.keys(gh).map((name) => [name, process.env[name]]));
+  Object.assign(process.env, gh);
+  try {
+    // The launcher's env is the host env (launch.ts's main passes process.env).
+    const { run } = await jobRun("repro", gh);
+    expect(run).toContain(` ${REF} `);
+    expect(calls()).toContain(
+      "[token=ghs_hosttoken config=/home/u/.gh-custom xdg=/home/u/.cfg " +
+        "bus=unix:path=/run/user/1000/bus run=/run/user/1000]"
+    );
+    expect(calls()).not.toMatch(/docker got/);
+    for (const [name, value] of Object.entries(gh)) {
+      expect(run).not.toContain(name);
+      expect(run).not.toContain(value);
+    }
+  } finally {
+    for (const [name, value] of Object.entries(saved))
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+  }
 });
 
-test("local build: the Docker preflight refuses a stale key, even with the opt-in", async () => {
-  lock("0".repeat(64));
-  const saved = process.env.BUGBASH_SANDBOX_BUILD_STALE;
-  process.env.BUGBASH_SANDBOX_BUILD_STALE = "1";
+test("local build: the Docker preflight builds the local image instead of refusing", async () => {
+  const stop = new AbortController().signal;
+  const o = { root: fs.realpathSync(root), stop };
+  // run.ts's preflight (make bug-bash), then launch.ts --preflight (make mcp-apps-e2e).
+  const error = spyOn(console, "error").mockImplementation(() => undefined);
   try {
-    const stop = new AbortController().signal;
-    const o = { root: fs.realpathSync(root), stop };
-    // run.ts's preflight (make bug-bash), then launch.ts --preflight (make mcp-apps-e2e).
-    expect(await failure(checkDocker(o))).toThrow(/stale image/);
-    const env = { ...HOST_ENV, ...OPT_IN };
-    expect(await failure(preflight(ARGS, { ...o, cwd: prepare(), env }))).toThrow(/stale image/);
-    expect(calls()).not.toMatch(/^buildx/m);
+    fake({ TAG: "missing" });
+    expect(await checkDocker(o)).toBe("none");
+    expect(calls()).toMatch(/^buildx build /m);
+    const cwd = prepare({ TAG: "missing" });
+    fs.rmSync(path.join(bin, "calls.log"), { force: true });
+    expect(await preflight(ARGS, { ...o, cwd, env: HOST_ENV })).toBe("none");
+    expect(calls()).toMatch(/^buildx build /m);
   } finally {
-    if (saved === undefined) delete process.env.BUGBASH_SANDBOX_BUILD_STALE;
-    else process.env.BUGBASH_SANDBOX_BUILD_STALE = saved;
+    error.mockRestore();
   }
 });

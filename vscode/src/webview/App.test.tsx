@@ -88,7 +88,7 @@ class TestBridge implements VscodeBridge {
     await this.emit({ type: "orpcStreamData", streamId, value });
   }
 
-  orpcCalls(path: string): Array<Extract<WebviewToExtensionMessage, { type: "orpcCall" }>> {
+  orpcCalls(path: string): Extract<WebviewToExtensionMessage, { type: "orpcCall" }>[] {
     return this.sent.filter(
       (message): message is Extract<WebviewToExtensionMessage, { type: "orpcCall" }> =>
         message.type === "orpcCall" && message.path.join(".") === path
@@ -676,7 +676,7 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
     });
 
   // Stop and Esc share one interrupt path; both must reach the host and mark the stream.
-  const interruptTriggers: Array<[string, (view: ReturnType<typeof render>) => void]> = [
+  const interruptTriggers: [string, (view: ReturnType<typeof render>) => void][] = [
     ["Stop", (view) => fireEvent.click(view.getByRole("button", { name: "Stop streaming" }))],
     ["Esc", () => fireEvent.keyDown(window, { key: "Escape" })],
     [
@@ -800,7 +800,7 @@ describe("vscode webview turn status and jump to bottom (#4971)", () => {
     await selectWorkspace(bridge);
 
     const sentinel = view.getByTestId("transcript-bottom-sentinel");
-    const scrollport = sentinel.parentElement as HTMLElement;
+    const scrollport = sentinel.parentElement!;
     const content = scrollport.firstElementChild as HTMLElement;
     const scrollUp = () =>
       act(async () => {
@@ -1433,10 +1433,30 @@ describe("vscode webview workspace AI settings", () => {
 
     expect(agentPicker(view).textContent).toBe("Exec");
     expect(agentPicker(view).disabled).toBe(true);
-    // Agent cycling is locked too, so the composer does not advertise it.
-    expect(view.queryByText("- change agent")).toBeNull();
     const options = await send(bridge, view);
     expect(options.agentId).toBe("exec");
+  });
+
+  test("the empty composer shows no shortcut hints but Ctrl+/ still changes the model (#7540)", async () => {
+    const { view } = await selectWorkspaceWith({
+      ...WORKSPACE,
+      ai: {
+        agentId: "exec",
+        aiSettingsByAgent: {
+          exec: { model: "anthropic:claude-opus-5-5", thinkingLevel: "medium" },
+        },
+      },
+    });
+    // Like the desktop workspace composer (#7476), the one-line empty box has no hint row.
+    expect(view.queryByText("- change model")).toBeNull();
+
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea did not render");
+    const modelBefore = view.getByRole("combobox").textContent;
+    await pressKey(textarea, { key: "/", ctrlKey: true });
+    // Read the selector rather than sending: a send with a pick leaves module-level persistence
+    // state in flight for later suites.
+    expect(view.getByRole("combobox").textContent).not.toBe(modelBefore);
   });
 
   test("switching the agent restores that agent's own settings", async () => {
@@ -1600,12 +1620,10 @@ describe("vscode webview agent lookup", () => {
     await bridge.emit({ type: "workspaces", workspaces: [WORKSPACE] });
     await bridge.emit({ type: "setSelectedWorkspace", workspaceId: WORKSPACE.id });
     expect(toggle().disabled).toBe(true);
-    expect(view.queryByText("- change agent")).toBeNull();
 
     // With a server connection, the scope follows the listed selection.
     await bridge.emit({ type: "connectionStatus", status: { mode: "api", baseUrl: "http://x" } });
     expect(toggle().disabled).toBe(false);
-    expect(view.queryByText("- change agent")).not.toBeNull();
   });
 
   test("keeps the agent toggle disabled for a restored selection until the workspace list arrives (#4820)", async () => {
@@ -2195,6 +2213,7 @@ describe("vscode webview message rows", () => {
   // ChatPane-level derivations the webview shares with desktop (#5002).
   test("prompt arrows skip machine wakes and scroll the neighboring prompt into view", async () => {
     const scrolled: Element[] = [];
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- saved only to restore the prototype method afterwards
     const originalScrollIntoView = Element.prototype.scrollIntoView;
     Element.prototype.scrollIntoView = function (this: Element) {
       scrolled.push(this);
@@ -3154,7 +3173,7 @@ describe("vscode webview background processes strip (#5092)", () => {
     };
     const bridge = new TestBridge();
     // Snapshot the document after every commit, before passive effects run.
-    const commits: Array<{ rows: boolean; error: boolean }> = [];
+    const commits: { rows: boolean; error: boolean }[] = [];
     const onRender = () => {
       const text = document.body.textContent ?? "";
       commits.push({
@@ -3278,12 +3297,12 @@ describe("vscode webview first reveal (#5202)", () => {
         workspaceName: `reveal-${label}`,
       };
       const bridge = new TestBridge();
-      const commits: Array<{
+      const commits: {
         transcript: boolean;
         held: boolean;
         strip: boolean;
         status: boolean;
-      }> = [];
+      }[] = [];
       const onRender = () => {
         const text = document.body.textContent ?? "";
         commits.push({

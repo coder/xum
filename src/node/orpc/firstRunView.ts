@@ -29,9 +29,10 @@ import { VERSION } from "@/version";
  *   (`z-[1500]`).
  * - The left sidebar and the shell header come from the live 1200 px first paint (owner decision
  *   10-14), with runtime attributes and Radix ScrollArea pieces gone. Both sidebar states are here:
- *   the <style> shows the one App.tsx starts with (collapsed at or below
- *   `NARROW_VIEWPORT_MAX_WIDTH_PX`) or the saved one the early script sets in `data-sidebar`. A
- *   saved custom width is not copied (leftover).
+ *   the <style> shows the one App.tsx starts with: always collapsed at or below
+ *   `NARROW_VIEWPORT_MAX_WIDTH_PX` (the drawer starts closed and ignores the saved flag,
+ *   useLeftSidebarState), above it the saved one the early script sets in `data-sidebar`, else
+ *   expanded. A saved custom width is not copied (leftover).
  * - The logo's fill follows `data-theme` (set before the app by index.html), as ProjectSidebar picks
  *   its dark or light logo from the theme.
  * - The live wizard focuses its first button and shows a focus ring. The inert copy has none.
@@ -50,9 +51,8 @@ export function firstRunViewHtml(gitDescribe: string): string {
   const hide = "{ display: none !important }";
   return `<div id="${FIRST_RUN_VIEW_ID}" inert style="position:fixed;inset:0;z-index:1500;overflow:hidden">
   <style>
-    @media (max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px) { ${view}:not([data-sidebar="expanded"]) [data-pre="e"], ${view} [data-pre="handle"] ${hide} }
-    @media (min-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX + 1}px) { ${view}:not([data-sidebar="collapsed"]) [data-pre="c"] ${hide} }
-    ${view}[data-sidebar="collapsed"] [data-pre="e"], ${view}[data-sidebar="expanded"] [data-pre="c"] ${hide}
+    @media (max-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX}px) { ${view} [data-pre="e"], ${view} [data-pre="handle"] ${hide} }
+    @media (min-width: ${NARROW_VIEWPORT_MAX_WIDTH_PX + 1}px) { ${view}:not([data-sidebar="collapsed"]) [data-pre="c"], ${view}[data-sidebar="collapsed"] [data-pre="e"] ${hide} }
     ${view} [data-pre-logo] { color: #000 } :root[data-theme="dark"] ${view} [data-pre-logo], :root[data-theme$="-dark"] ${view} [data-pre-logo] { color: #fff }
   </style>
   <div class="h-full">
@@ -126,7 +126,7 @@ export function firstRunViewHtml(gitDescribe: string): string {
     </div>
   </div>
   <div data-modal-dialog-overlay="" class="fixed inset-0 z-[1500] before:absolute before:inset-0 before:bg-black/50 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"></div>
-  <div role="dialog" class="bg-dark border-border fixed top-[50%] left-[50%] z-[1500] grid w-[90%] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]" style="max-width: 500px">
+  <div role="dialog" class="bg-dark border-border fixed top-[50%] left-[calc(50%_+_(env(safe-area-inset-left,0px)_-_env(safe-area-inset-right,0px))/2)] z-[1500] grid w-[calc((100%_-_env(safe-area-inset-left,0px)_-_env(safe-area-inset-right,0px))*0.9)] translate-x-[-50%] translate-y-[-50%] gap-4 rounded-lg border p-6 shadow-lg duration-200 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 data-[state=closed]:slide-out-to-left-1/2 data-[state=closed]:slide-out-to-top-[48%] data-[state=open]:slide-in-from-left-1/2 data-[state=open]:slide-in-from-top-[48%] max-h-[85vh] grid-rows-[auto_minmax(0,1fr)_auto]" style="max-width: 500px">
     <div class="flex flex-col space-y-1.5 text-left">
       <h2 class="text-foreground text-lg font-semibold leading-none tracking-tight">Choose your own AI providers</h2>
     </div>

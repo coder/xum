@@ -8,6 +8,8 @@ import { RuntimeError } from "@/node/runtime/Runtime";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import { setTodosForSessionDir } from "./todo";
 import { TestTempDir, createTestToolConfig } from "./testHelpers";
+import { nodeSessionFiles } from "@/node/services/sessionFiles/nodeSessionFiles";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 const toolCallOptions: ToolExecutionOptions<unknown> = {
   toolCallId: "test-call-id",
@@ -23,11 +25,17 @@ describe("propose_plan tool", () => {
     await fs.writeFile(planPath, "# Plan\n\n- Step 1\n");
 
     const config = createTestToolConfig(tempDir.path);
-    await setTodosForSessionDir(config.workspaceId!, config.workspaceSessionDir!, [
-      { content: "Inspected relevant files", status: "completed" },
-      { content: "Writing the plan", status: "in_progress" },
-      { content: "Wait for approval", status: "pending" },
-    ]);
+    await setTodosForSessionDir(
+      config.workspaceId!,
+      config.workspaceSessionDir!,
+      [
+        { content: "Inspected relevant files", status: "completed" },
+        { content: "Writing the plan", status: "in_progress" },
+        { content: "Wait for approval", status: "pending" },
+      ],
+      nodeSessionLocks,
+      nodeSessionFiles
+    );
 
     const tool = createProposePlanTool({
       ...config,
@@ -41,7 +49,7 @@ describe("propose_plan tool", () => {
       planPath,
       message: "Plan proposed. Waiting for user approval.",
     });
-    expect(await readTodosForSessionDir(config.workspaceSessionDir!)).toEqual([
+    expect(await readTodosForSessionDir(config.workspaceSessionDir!, nodeSessionFiles)).toEqual([
       { content: "Inspected relevant files", status: "completed" },
       { content: "Writing the plan", status: "completed" },
       { content: "Wait for approval", status: "pending" },

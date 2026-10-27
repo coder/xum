@@ -233,6 +233,33 @@ describe("the early script", () => {
     expect(page.view()?.dataset.sidebar).toBe(state);
   });
 
+  // The view's <style> must show the sidebar App.tsx mounts with: the phone drawer always starts
+  // closed (the saved flag drives only the wide sidebar), and the wide sidebar is the saved one or
+  // expanded. Catches a phone copy that shows the drawer over the page for a saved expanded sidebar.
+  test.each([
+    [382, "unset", "collapsed"],
+    [382, "expanded", "collapsed"],
+    [382, "collapsed", "collapsed"],
+    [951, "unset", "expanded"],
+    [951, "expanded", "expanded"],
+    [951, "collapsed", "collapsed"],
+  ])("at %i px with data-sidebar %s the view shows the %s sidebar", (width, saved, shown) => {
+    const window = new GlobalWindow({ width, height: 700 });
+    dom = window;
+    window.document.body.innerHTML = FIRST_RUN_VIEW_HTML;
+    const view = window.document.getElementById(FIRST_RUN_VIEW_ID)!;
+    if (saved !== "unset") view.setAttribute("data-sidebar", saved);
+    const visible = (copy: string) =>
+      [...view.querySelectorAll(`[data-pre="${copy}"]`)].map(
+        (el) => window.getComputedStyle(el).display !== "none"
+      );
+    const expanded = shown === "expanded";
+    expect([visible("e"), visible("c")]).toEqual([
+      [expanded, expanded],
+      [!expanded, !expanded],
+    ]);
+  });
+
   // Catches a script that runs on a slashless URL, which the redirect script navigates away from.
   test("does nothing on a slashless URL", () => {
     const page = run({ url: "http://127.0.0.1/xum" });

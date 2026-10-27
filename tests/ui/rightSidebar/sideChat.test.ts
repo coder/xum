@@ -246,7 +246,7 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
       await waitFor(
         () => {
           expect(getSideComposer(app, firstId).value).toBe("");
-          expect(pane.querySelector('[role="tab"][id$="-tab-new"]')).toBeNull();
+          expect(pane.querySelector('[role="tab"][id$="-tab-new"]') === null).toBe(true);
           const tab = pane.querySelector(`[role="tab"][id$="-tab-side:${firstId}"]`);
           expect(tab).not.toBeNull();
           expect(document.activeElement === getSideComposer(app, firstId)).toBe(true);
@@ -466,8 +466,8 @@ describe("/side chat tab in the right sidebar (mock AI router)", () => {
         () => {
           expect(getSidePane(app)).toBeNull();
           expect(
-            app.view.container.querySelector('button[aria-label="Close side chat"]')
-          ).toBeNull();
+            app.view.container.querySelector('button[aria-label="Close side chat"]') === null
+          ).toBe(true);
         },
         { timeout: 10_000 }
       );

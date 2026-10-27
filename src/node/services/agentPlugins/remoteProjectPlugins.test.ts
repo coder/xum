@@ -1,6 +1,9 @@
+import * as childProcess from "child_process";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { CONTAINER_CLI_ENV } from "@/node/runtime/containerCli";
 import { DockerRuntime, getContainerName } from "@/node/runtime/DockerRuntime";
 import type { ExecOptions, ExecStream } from "@/node/runtime/Runtime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
@@ -8,8 +11,10 @@ import { ShellRemoteRuntime } from "@/node/runtime/testRemoteRuntime";
 import { createSSHTransport } from "@/node/runtime/transports";
 import { log } from "@/node/services/log";
 import { DisposableTempDir } from "@/node/services/tempDir";
+import { execBuffered } from "@/node/utils/runtime/helpers";
 import { AGENT_PLUGIN_SCHEMA_ID_1_0_0 } from "./manifest";
 import {
+  buildRemotePluginListingScript,
   clearRemoteProjectPluginSnapshots,
   createRemoteProjectPluginSnapshot,
   getRemoteProjectPluginSnapshot,
@@ -161,6 +166,59 @@ describe("buildRemotePluginListingScript", () => {
     expect((await snapshot())?.plugins.map((plugin) => plugin.name)).toEqual(["kit"]);
     await fake("realpath", "exit 1");
     expect(await snapshot()).toBeNull();
+  });
+
+  test("each link line keeps its own target, and an empty one when readlink fails", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-links");
+    const { root, container, kit } = await checkoutWithKit(checkout.path);
+    // GNU `readlink -f a b c` prints no line for a link that fails (uutils stops there), so a
+    // plain batch would shift every target after it. Five of each, so in almost any directory
+    // order (find's order) a good link comes after a failing one.
+    const dir = path.join(kit, "links");
+    await fs.mkdir(dir);
+    const expected: Record<string, string> = {};
+    for (let i = 0; i < 5; i++) {
+      await fs.symlink(path.join(kit, "skills"), path.join(dir, `good${i}`));
+      expected[path.join(dir, `good${i}`)] = path.join(kit, "skills");
+      await fs.symlink(path.join(root, "missing", "x"), path.join(dir, `bad${i}`));
+      expected[path.join(dir, `bad${i}`)] = "";
+    }
+    const result = await execBuffered(
+      new CountingRemoteRuntime(root, "test"),
+      buildRemotePluginListingScript(root, [container]),
+      { cwd: "/", timeout: 10 }
+    );
+    expect(result.exitCode).toBe(0);
+    const links = result.stdout
+      .split("\n")
+      .filter((line) => line.startsWith("L\t"))
+      .map((line) => line.split("\t"));
+    expect(Object.fromEntries(links.map(([, target, link]) => [link, target]))).toEqual(expected);
+  });
+
+  test("one readlink resolves every link of a walk", async () => {
+    using checkout = new DisposableTempDir("remote-plugins-batch");
+    const { root, container, kit } = await checkoutWithKit(checkout.path);
+    const links = path.join(kit, "links");
+    await fs.mkdir(links);
+    for (let i = 0; i < 8; i++) {
+      await fs.symlink(path.join(kit, "skills"), path.join(links, `l${i}`));
+    }
+    const bin = path.join(root, "bin");
+    const calls = path.join(root, "readlink-calls");
+    await writeFile(
+      path.join(bin, "readlink"),
+      `#!/bin/sh\necho >> ${calls}\nexec ${Bun.which("readlink") ?? "readlink"} "$@"\n`
+    );
+    await fs.chmod(path.join(bin, "readlink"), 0o755);
+    const snapshot = await createRemoteProjectPluginSnapshot({
+      runtime: new CountingRemoteRuntime(root, "test", `PATH=${bin}:$PATH\n`),
+      checkoutRoot: root,
+      containers: [container],
+    });
+    expect(snapshot?.plugins.map((plugin) => plugin.name)).toEqual(["kit"]);
+    // The checkout root, the container and one batch; per link it was 8 more.
+    expect((await fs.readFile(calls, "utf8")).length).toBe(3);
   });
 
   test("a plugin link to a folder inside its container is walked once", async () => {
@@ -391,14 +449,50 @@ describe("getRemoteProjectPluginSnapshot", () => {
     expect(new Set(keys).size).toBe(keys.length);
     expect(sshKey({ host: "alice@build" })).toBe(keys[0]);
 
-    const docker = new DockerRuntime({
-      image: "node:22",
-      containerName: getContainerName("/p6426", "w"),
-    });
-    const before = docker.getAgentHostKey();
-    // Deleting (or creating) the container under this name gives it a new key.
-    await docker.deleteWorkspace("/p6426", "w", true).catch(() => undefined);
-    expect(docker.getAgentHostKey()).not.toBe(before);
+    // #7612: a unit test must not need a Docker daemon. The CLI override skips the `docker info`
+    // probe, and the stubbed spawn answers each docker command: `inspect` finds the container while
+    // `present` is true, and every other command (`rm -f`) succeeds.
+    const containerName = getContainerName("/p6426", "w");
+    let present = true;
+    const commands: string[] = [];
+    const originalCli = process.env[CONTAINER_CLI_ENV];
+    process.env[CONTAINER_CLI_ENV] = "docker";
+    const spawnSpy = spyOn(childProcess, "spawn").mockImplementation(((command: string) => {
+      commands.push(command);
+      const missing = !present && command.startsWith("docker inspect ");
+      const child = Object.assign(new EventEmitter(), {
+        stdout: new EventEmitter(),
+        stderr: new EventEmitter(),
+        kill: () => true,
+      });
+      process.nextTick(() => {
+        if (missing)
+          child.stderr.emit("data", Buffer.from(`Error: No such object: ${containerName}`));
+        child.emit("close", missing ? 1 : 0);
+      });
+      return child;
+    }) as unknown as typeof childProcess.spawn);
+    try {
+      const docker = new DockerRuntime({ image: "node:22", containerName });
+      const keysSeen = [docker.getAgentHostKey()];
+      // Deleting (or creating) the container under this name gives it a new key, whether Xum
+      // removes the container or finds it already gone.
+      expect(await docker.deleteWorkspace("/p6426", "w", true)).toMatchObject({ success: true });
+      keysSeen.push(docker.getAgentHostKey());
+      present = false;
+      expect(await docker.deleteWorkspace("/p6426", "w", true)).toMatchObject({ success: true });
+      keysSeen.push(docker.getAgentHostKey());
+      expect(new Set(keysSeen).size).toBe(3);
+      expect(commands).toEqual([
+        `docker inspect ${containerName}`,
+        `docker rm -f ${containerName}`,
+        `docker inspect ${containerName}`,
+      ]);
+    } finally {
+      spawnSpy.mockRestore();
+      if (originalCli === undefined) delete process.env[CONTAINER_CLI_ENV];
+      else process.env[CONTAINER_CLI_ENV] = originalCli;
+    }
     expect(new DockerRuntime({ image: "node:22" }).getAgentHostKey()).toBeUndefined();
   });
 });

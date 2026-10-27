@@ -14,7 +14,6 @@ import { HEARTBEAT_MAX_INTERVAL_MS, HEARTBEAT_MIN_INTERVAL_MS } from "@/constant
 import { DEFAULT_GOAL_DEFAULTS } from "@/constants/goals";
 
 export { RuntimeEnablementOverridesSchema } from "../../schemas/runtimeEnablement";
-export type { RuntimeEnablementOverrides } from "../../schemas/runtimeEnablement";
 export { UserPreferencesSchema } from "./userPreferences";
 export type { UserPreferences } from "./userPreferences";
 export { TaskSettingsSchema } from "./taskSettings";
@@ -26,11 +25,7 @@ export {
   AgentPluginInstallEntrySchema,
   AgentPluginInstallSourceSchema,
 } from "./agentPluginInstalls";
-export type {
-  AgentPluginGitSource,
-  AgentPluginInstallEntry,
-  AgentPluginInstallSource,
-} from "./agentPluginInstalls";
+export type { AgentPluginGitSource, AgentPluginInstallEntry } from "./agentPluginInstalls";
 
 /**
  * Sparse delegated-run (sub-agent) override profile nested under an agent's

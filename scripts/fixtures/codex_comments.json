@@ -73,5 +73,28 @@
     "source": "https://github.com/coder/xum/pull/7002#issuecomment-6261074683",
     "body": "Codex Review: Something went wrong. Try again later by commenting “@codex review”.\n\n```\nAn unknown error occurred\n```\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
     "expected_exit_code": 1
+  },
+  "receipt_security_no_findings_without_commit": {
+    "source": "https://github.com/coder/xum/pull/7276#issuecomment-6354868209",
+    "body": "<!-- codex-review-receipt:v1 -->\n\n### 🛡️ Codex Security Review · _Automatically triggered_\n\nSecurity review completed. No security issues were found in this pull request.\n\n[View security finding report](https://chatgpt.com/codex/cloud/tasks/task_b_6adab189363c832e9e497c26a4cf51a0)\n\n_Only the user who started this review can view the report in Codex._\n\n<details> <summary>ℹ️ About Codex security reviews in GitHub</summary>\n<br/>\n\nThis is an experimental Codex feature. Security reviews are triggered when:\n- You comment \"@codex security review\"\n- A regular code review gets triggered (for example, \"@codex review\" or when a PR is opened), and you’re opted in so security review runs alongside code review\n\nOnce complete, Codex will leave suggestions, or a comment if no findings are found.\n\n\n</details>",
+    "expected_exit_code": 0
+  },
+  "code_review_no_findings": {
+    "source": "https://github.com/coder/xum/pull/7512#issuecomment-6401589388",
+    "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. More of your lovely PRs please.\n\n**Reviewed commit:** `74ad33212c`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+    "expected_exit_code": 0,
+    "wait_exit_code": 0
+  },
+  "code_review_no_findings_without_commit": {
+    "source": "https://github.com/coder/xum/pull/7488#issuecomment-6399975771",
+    "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. Another round soon, please!\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+    "expected_exit_code": 0,
+    "wait_exit_code": 0
+  },
+  "account_setup_notice": {
+    "source": "https://github.com/coder/xum/pull/3695#issuecomment-4917092105",
+    "body": "To use Codex here, [create a Codex account and connect to github](https://chatgpt.com/codex/cloud/settings/connectors).",
+    "expected_exit_code": 0,
+    "wait_exit_code": 1
   }
 }

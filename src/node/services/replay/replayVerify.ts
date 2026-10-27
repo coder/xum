@@ -214,15 +214,11 @@ export async function readDevtoolsLog(sessionDir: string): Promise<DevtoolsLogSn
 }
 
 /**
- * Parse devtools.jsonl into per-run first-step requests. Later steps of a run
+ * Per-run first-step requests of the devtools log. Later steps of a run
  * are SDK-internal tool loops whose extra messages come from the streamed
  * output (persisted at turn end), so the log-purity comparison targets
  * step 0 — the request assembled from chat.jsonl.
  */
-export async function readRecordedRequests(sessionDir: string): Promise<RecordedProviderRequest[]> {
-  return recordedRequestsFromLog(await readDevtoolsLog(sessionDir));
-}
-
 function recordedRequestsFromLog(log: DevtoolsLogSnapshot): RecordedProviderRequest[] {
   const { runs, stepUsageUpdates } = log;
   const requests: RecordedProviderRequest[] = [];
@@ -291,10 +287,6 @@ export function recordedStepsFromLog(log: DevtoolsLogSnapshot): RecordedStepRequ
           },
         ];
   });
-}
-
-export async function readRecordedSteps(sessionDir: string): Promise<RecordedStepRequest[]> {
-  return recordedStepsFromLog(await readDevtoolsLog(sessionDir));
 }
 
 /** First structural difference between two JSON values (depth-first). */

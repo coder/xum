@@ -19,6 +19,14 @@ export const RightSidebarOverlayContext = createContext(false);
 export const PinnedViewToolbarSpacerContext = createContext<ComponentType>(NoToolbarSpacer);
 
 /**
+ * What immersive review's toolbar renders at its start: RightSidebar provides the left sidebar
+ * toggle bar spacer while the left sidebar is collapsed. Immersive review covers only the
+ * workspace shell at every width, so unlike a pinned view it never covers the bar, which sat over
+ * its Back button (on a phone, a tap there opened the sidebar).
+ */
+export const ShellOverlayToolbarSpacerContext = createContext<ComponentType>(NoToolbarSpacer);
+
+/**
  * No toggle bar to keep clear: outside RightSidebar (the webview, tests), or while the left
  * sidebar is expanded (its toggle bar then sits over the sidebar, not over the pinned view).
  */

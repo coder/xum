@@ -2,7 +2,8 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { acquireCrossProcessLock } from "@/node/utils/main/crossProcessLock";
 import { isPathSafeWorkspaceId, WorkflowRunStore } from "./WorkflowRunStore";
@@ -1336,6 +1337,66 @@ describe("WorkflowRunStore", () => {
     await expect(store.acquireLease("wfr_123", "runner-a", 1001)).resolves.toBe(false);
     await expect(store.acquireLease("wfr_123", "runner-b", 1001)).resolves.toBe(false);
     await expect(store.acquireLease("wfr_123", "runner-b", 1012)).resolves.toBe(true);
+  });
+});
+
+// Each test kills a mutant that the phase 4 mutation runs left alive (#7475).
+describe("WorkflowRunStore option and argument bounds", () => {
+  test("the constructor rejects an empty session dir and a zero lock wait", () => {
+    expect(() => new WorkflowRunStore({ sessionDir: "" })).toThrow("sessionDir is required");
+    expect(() => new WorkflowRunStore({ sessionDir: "/", mutationLockWaitTimeoutMs: 0 })).toThrow(
+      "mutationLockWaitTimeoutMs must be positive"
+    );
+    // One character and one millisecond are the smallest valid values.
+    expect(
+      () => new WorkflowRunStore({ sessionDir: "/", mutationLockWaitTimeoutMs: 1 })
+    ).not.toThrow();
+  });
+
+  test("a zero stale lease window is kept, not replaced by the default", () => {
+    const store = new WorkflowRunStore({ sessionDir: "/", staleLeaseMs: 0 });
+    expect(store.getLeaseRenewalIntervalMs()).toBe(1);
+  });
+
+  test("acquireLease rejects an empty owner id and accepts a one-character one", async () => {
+    using tmp = new DisposableTempDir("workflow-runs");
+    const store = await createStore(tmp.path);
+    await expect(store.acquireLease("wfr_123", "", 1000)).rejects.toThrow("ownerId is required");
+    await expect(store.acquireLease("wfr_123", "a", 1000)).resolves.toBe(true);
+  });
+
+  test("a lease exactly staleLeaseMs old is still active", async () => {
+    using tmp = new DisposableTempDir("workflow-runs");
+    const store = await createStore(tmp.path, 10);
+    await expect(store.acquireLease("wfr_123", "runner-a", 1000)).resolves.toBe(true);
+    await expect(store.acquireLease("wfr_123", "runner-b", 1010)).resolves.toBe(false);
+    await expect(store.acquireLease("wfr_123", "runner-b", 1011)).resolves.toBe(true);
+  });
+
+  test("a waiter that passes its deadline in the queue gets a zero cross-process budget", async () => {
+    using tmp = new DisposableTempDir("workflow-runs");
+    const budgets: number[] = [];
+    const store = new WorkflowRunStore({
+      sessionDir: tmp.path,
+      mutationLockWaitTimeoutMs: 1_000,
+      locks: {
+        ...nodeSessionLocks,
+        acquireCrossProcessLock: (options) => {
+          budgets.push(options.acquireTimeoutMs);
+          return Promise.resolve(() => Promise.resolve());
+        },
+      },
+    });
+    // Every clock read is 5 s after the last, so the 1 s deadline has passed when the
+    // cross-process budget is computed.
+    let clock = 1_000_000;
+    const now = spyOn(Date, "now").mockImplementation(() => (clock += 5_000));
+    try {
+      await store.releaseLease("wfr_123", "runner-a");
+    } finally {
+      now.mockRestore();
+    }
+    expect(budgets).toEqual([0]);
   });
 });
 

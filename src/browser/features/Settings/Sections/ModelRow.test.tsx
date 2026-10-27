@@ -5,7 +5,7 @@ import { restoreModulesAfterSuite } from "../../../../../tests/ui/moduleMocks";
 import { createSelectPrimitiveDouble } from "../../../../../tests/ui/selectPrimitiveDouble";
 import * as ActualSelectPrimitiveModule from "@/browser/components/SelectPrimitive/SelectPrimitive";
 import { TooltipProvider } from "@/browser/components/Tooltip/Tooltip";
-import type { ProvidersConfigMap } from "@/common/orpc/types";
+import { createMappedAliasProvidersConfig, MAPPED_ALIAS_MODEL } from "@/browser/testUtils";
 
 // Snapshot the real exports before the mock below replaces them: the namespace import is a live
 // binding, so restoring from it would republish the mock into later test files.
@@ -36,14 +36,7 @@ describe("ModelRow minimum thinking", () => {
   });
 
   test("labels a mapped alias's xhigh and max floors from its target model", () => {
-    const providersConfig: ProvidersConfigMap = {
-      openai: {
-        apiKeySet: true,
-        isEnabled: true,
-        isConfigured: true,
-        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
-      },
-    };
+    const providersConfig = createMappedAliasProvidersConfig();
     const view = render(
       <TooltipProvider>
         <table>
@@ -51,7 +44,7 @@ describe("ModelRow minimum thinking", () => {
             <ModelRow
               provider="openai"
               modelId="team-sol"
-              fullId="openai:team-sol"
+              fullId={MAPPED_ALIAS_MODEL}
               isCustom
               isDefault={false}
               isEditing={false}

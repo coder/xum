@@ -15,6 +15,7 @@ import { AppFiberScopeTag } from "@/node/services/di/appFiberScope";
 import { makeAppRuntime, type AppRuntime } from "@/node/services/di/appRuntime";
 import { CoreRootLive, coreServicesFromContext } from "@/node/services/di/layers/core";
 import type { CoreRootTags } from "@/node/services/di/tags";
+import { installBrotliResponseGuard } from "@/node/utils/network/brotliResponseGuard";
 
 export interface CoreServicesRoot extends CoreServices {
   /** The runtime that owns the graph; composition roots only (DI contract). */
@@ -28,6 +29,9 @@ export interface CoreServicesRoot extends CoreServices {
  * suspends) fails here, inside the caller's existing startup error path.
  */
 export function createCoreServices(opts: CoreServicesOptions): CoreServicesRoot {
+  // These processes run on the user's own Node, which can lack the CVE-2026-111497 fix (#7358).
+  // ServiceContainer installs the same guard for desktop, `xum server` and ACP.
+  installBrotliResponseGuard();
   const runtime = makeAppRuntime(CoreRootLive(opts));
   return {
     ...coreServicesFromContext(runtime.context),

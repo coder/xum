@@ -359,6 +359,15 @@ export function describeFaultCases(name: string, layer: Layer.Layer<SessionFiles
       expect(await files.promises.readFile(file, "utf8")).toBe("abc\n");
     });
 
+    it("a cut writeFile keeps N bytes, throws EIO, and does not stay queued", async (files, faults, dir) => {
+      const file = path.join(dir, "auto-retry-preference.json");
+      faults.cutNextWrite(file, { afterBytes: 2 });
+      expect(await errorCode(() => files.promises.writeFile(file, "{}\n"))).toBe("EIO");
+      expect(await files.promises.readFile(file, "utf8")).toBe("{}");
+      await files.promises.appendFile(file, "abc");
+      expect(await files.promises.readFile(file, "utf8")).toBe("{}abc");
+    });
+
     it("a cut writeSync(fd) maps the fd to its path and keeps N bytes", async (files, faults, dir) => {
       const file = path.join(dir, "chat.jsonl");
       const handle = await files.promises.open(file, "a", 0o600);

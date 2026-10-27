@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -167,6 +167,8 @@ describe("acquireProcessFileLock", () => {
     await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 500, label: "test" });
     const parts = (await fs.readFile(lockPath, "utf-8")).split(":");
     expect(Number(parts[0])).toBe(process.pid);
+    // Older builds compare this birth segment.
+    expect(parts[2]).toBe(Buffer.from(getProcessBirth(process.pid) ?? "").toString("hex"));
     const identity = JSON.parse(Buffer.from(parts[3], "hex").toString("utf-8")) as {
       platform: string;
     };
@@ -590,4 +592,131 @@ describe("acquireProcessFileLock", () => {
       expect(String(error)).toContain("Timed out");
     }
   });
+});
+
+/** Plant a dead lock and `guards` dead reclaim guards nested over it (<lock>.reclaim, ...). */
+async function plantDeadGuards(lockPath: string, guards: number): Promise<void> {
+  const dead = deadPid();
+  for (let depth = 0; depth <= guards; depth++) {
+    await fs.writeFile(lockPath + ".reclaim".repeat(depth), `${dead}:dead${depth}`, "utf-8");
+  }
+}
+
+// Each test below kills mutants that the phase 4 whole-file mutation run left alive (#7255).
+describe("acquireProcessFileLock edges", () => {
+  test("takes over dead reclaim guards nested 7 deep and fails closed at 8", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const atBound = path.join(tmp.path, "a.lock");
+    await plantDeadGuards(atBound, 7);
+    await (
+      await acquireProcessFileLock({ lockPath: atBound, timeoutMs: 5_000, label: "test" })
+    )[Symbol.asyncDispose]();
+    const tooDeep = path.join(tmp.path, "b.lock");
+    await plantDeadGuards(tooDeep, 8);
+    const refusal = await acquireProcessFileLock({
+      lockPath: tooDeep,
+      timeoutMs: 150,
+      label: "test",
+    }).catch((error: unknown) => error);
+    expect(String(refusal)).toContain("nested 8 guards deep");
+  });
+
+  test("restores a fresh owner's lock that a reclaim displaced after its re-read", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    await fs.writeFile(lockPath, `${deadPid()}:deadbeef`, "utf-8");
+    const owner = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+      stdio: "ignore",
+    });
+    try {
+      const fresh = v2Token(owner.pid!, "fresh", { birth: probeProcessBirth(owner.pid!) });
+      const realRename = fs.rename;
+      let raced = false;
+      const spy = spyOn(fs, "rename").mockImplementation(async (from, to) => {
+        if (!raced && String(from) === lockPath) {
+          raced = true;
+          await fs.writeFile(lockPath, fresh, "utf-8"); // The fresh owner acquires.
+        }
+        return realRename(from, to);
+      });
+      try {
+        await expectTimeout(lockPath);
+      } finally {
+        spy.mockRestore();
+      }
+      expect(raced).toBe(true);
+      expect(await fs.readFile(lockPath, "utf-8")).toBe(fresh);
+      expect(await fs.readdir(tmp.path)).toEqual(["x.lock"]);
+    } finally {
+      owner.kill("SIGKILL");
+    }
+  });
+
+  test("a token with a fifth segment is malformed, not a dead holder: it waits for the lease", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    await fs.writeFile(lockPath, `${v2Token(deadPid(), "dead", {})}:ff`, "utf-8");
+    await expectTimeout(lockPath);
+  });
+
+  test("release waits for a renewal in flight", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    const lock = await acquireProcessFileLock({
+      lockPath,
+      timeoutMs: 500,
+      label: "test",
+      renewIntervalMs: 20,
+    });
+    const renewing = Promise.withResolvers<void>();
+    const unblock = Promise.withResolvers<void>();
+    let blocked = false;
+    const readFile = fs.readFile;
+    const spy = spyOn(fs, "readFile").mockImplementation(
+      new Proxy(readFile, {
+        async apply(target, thisArg, args: Parameters<typeof readFile>) {
+          if (!blocked && args[0] === lockPath) {
+            blocked = true;
+            renewing.resolve();
+            await unblock.promise;
+          }
+          return Reflect.apply(target, thisArg, args);
+        },
+      })
+    );
+    try {
+      await renewing.promise;
+      let released = false;
+      const release = lock[Symbol.asyncDispose]().then(() => {
+        released = true;
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(released).toBe(false);
+      unblock.resolve();
+      await release;
+    } finally {
+      spy.mockRestore();
+    }
+    expect(await lockExists(lockPath)).toBe(false);
+  });
+
+  test("release gives up after 40 failed unlinks and retires the token", async () => {
+    using tmp = new DisposableTempDir("file-lock-test");
+    const lockPath = path.join(tmp.path, "x.lock");
+    const lock = await acquireProcessFileLock({ lockPath, timeoutMs: 500, label: "test" });
+    const realUnlink = fs.unlink;
+    let attempts = 0;
+    const spy = spyOn(fs, "unlink").mockImplementation((target) => {
+      if (String(target) !== lockPath) return realUnlink(target);
+      attempts += 1;
+      return Promise.reject(Object.assign(new Error("EBUSY"), { code: "EBUSY" }));
+    });
+    try {
+      await lock[Symbol.asyncDispose]();
+    } finally {
+      spy.mockRestore();
+    }
+    expect(attempts).toBe(40);
+    await using _lock = await acquireProcessFileLock({ lockPath, timeoutMs: 2_000, label: "test" });
+  }, 10_000);
 });

@@ -21,6 +21,7 @@ import type { InitStateManager } from "@/node/services/initStateManager";
 import type { Tool } from "ai";
 
 import { getToolsForModel, type ToolConfiguration } from "./tools";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 type ToolExecuteFn = (args: unknown, options: unknown) => Promise<unknown>;
 
@@ -61,6 +62,7 @@ async function buildTools(
   const tools = await getToolsForModel(
     "noop:model",
     {
+      sessionLocks: nodeSessionLocks,
       cwd: workspace,
       runtime,
       runtimeTempDir: os.tmpdir(),

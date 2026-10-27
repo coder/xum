@@ -5,6 +5,7 @@ import { installDom } from "../../../../tests/ui/dom";
 import { restoreModulesAfterSuite } from "../../../../tests/ui/moduleMocks";
 import * as ActualTooltipModule from "@/browser/components/Tooltip/Tooltip";
 import * as ActualProvidersConfigModule from "@/browser/hooks/useProvidersConfig";
+import { createMappedAliasProvidersConfig, MAPPED_ALIAS_MODEL } from "@/browser/testUtils";
 import type { ProvidersConfigMap } from "@/common/orpc/types";
 import type { AutoModelRoutingRecord } from "@/common/types/autoModelRouting";
 
@@ -229,17 +230,10 @@ describe("AutoModelRoutingBadge", () => {
   });
 
   test("labels a mapped alias's thinking from its target model", () => {
-    providersConfig = {
-      openai: {
-        apiKeySet: true,
-        isEnabled: true,
-        isConfigured: true,
-        models: [{ id: "team-sol", mappedToModel: "openai:gpt-5.6-sol" }],
-      },
-    };
+    providersConfig = createMappedAliasProvidersConfig();
     const record: AutoModelRoutingRecord = {
       ...routed,
-      model: "openai:team-sol",
+      model: MAPPED_ALIAS_MODEL,
       thinkingLevel: "max",
     };
 

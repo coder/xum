@@ -1,6 +1,7 @@
-import * as fsPromises from "fs/promises";
 import * as path from "path";
 import { assert } from "@/common/utils/assert";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
+import { nodeHostFiles } from "@/node/services/hostFiles/nodeHostFiles";
 
 /**
  * Warn (never block) when agent commands or file writes create new entries directly in the
@@ -41,7 +42,7 @@ export type ClutterSnapshot = ReadonlyMap<string, ReadonlySet<string>>;
 
 export type ReadDir = (dir: string) => Promise<string[]>;
 
-const defaultReadDir: ReadDir = (dir) => fsPromises.readdir(dir);
+const defaultReadDir: ReadDir = (dir) => nodeHostFiles.promises.readdir(dir);
 
 function isMissingDirError(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
@@ -100,12 +101,16 @@ export class ClutterScanner {
     this.readDir = readDir;
   }
 
-  /** The in-flight scan, or a new one when none is running. */
-  scan(now = Date.now()): Promise<ClutterSnapshot> {
+  /**
+   * The in-flight scan, or a new one when none is running. `now` comes from the caller's
+   * clock (no Date.now() default), so `busyForMs` compares times of one clock (#7282).
+   */
+  scan(now: number): Promise<ClutterSnapshot> {
     if (this.inFlight != null) return this.inFlight.scan;
     const scan = snapshotClutterRoots(this.roots, this.readDir)
       .then((fresh) => {
         const merged = new Map(fresh);
+        // mutation-equivalent: last is a Map or null, and a Map is truthy, so ?? and || agree
         for (const [dir, names] of this.last ?? []) {
           if (!merged.has(dir)) merged.set(dir, names);
         }
@@ -113,6 +118,8 @@ export class ClutterScanner {
         return merged as ClutterSnapshot;
       })
       .finally(() => {
+        // mutation-equivalent: inFlight is set before this promise can settle and only this
+        // callback clears it, so it is never null here and ?. and . agree
         if (this.inFlight?.scan === scan) this.inFlight = null;
       });
     this.inFlight = { scan, startedAt: now };
@@ -120,19 +127,29 @@ export class ClutterScanner {
   }
 
   /** How long the current scan has been running (0 when idle). */
-  busyForMs(now = Date.now()): number {
+  busyForMs(now: number): number {
     return this.inFlight == null ? 0 : now - this.inFlight.startedAt;
   }
 }
 
-const sharedScanners = new Map<string, ClutterScanner>();
+// One registry per HostFiles: the Node layer in production. A test graph on a memory volume
+// (phase 5) gets its own scanners, which read that volume.
+const sharedScanners = new WeakMap<HostFiles, Map<string, ClutterScanner>>();
 
-export function getSharedClutterScanner(homeDir: string): ClutterScanner {
+export function getSharedClutterScanner(
+  homeDir: string,
+  files: HostFiles = nodeHostFiles
+): ClutterScanner {
+  let byHome = sharedScanners.get(files);
+  if (byHome == null) {
+    byHome = new Map();
+    sharedScanners.set(files, byHome);
+  }
   const key = path.resolve(homeDir);
-  let scanner = sharedScanners.get(key);
+  let scanner = byHome.get(key);
   if (scanner == null) {
-    scanner = new ClutterScanner(getClutterWatchRoots(key));
-    sharedScanners.set(key, scanner);
+    scanner = new ClutterScanner(getClutterWatchRoots(key), (dir) => files.promises.readdir(dir));
+    byHome.set(key, scanner);
   }
   return scanner;
 }

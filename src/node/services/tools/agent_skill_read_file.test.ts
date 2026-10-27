@@ -24,6 +24,8 @@ import {
   writeGlobalSkill,
   writeProjectSkill,
 } from "./testHelpers";
+// The Node layer: these tests read through host runtimes.
+import { nodeRuntimeFactory as runtimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 type ReadFileTool = ReturnType<typeof createAgentSkillReadFileTool>;
 type ReadFileArgs = Parameters<NonNullable<ReadFileTool["execute"]>>[0];
@@ -302,10 +304,12 @@ describe("agent_skill_read_file", () => {
       runtime: config.runtime,
       workspacePath: config.cwd,
       xumScope: config.xumScope,
+      runtimeFactory,
     });
     const discovery = await discoverAgentSkills(ctx.runtime, ctx.workspacePath, {
       roots: ctx.roots,
       containment: ctx.containment,
+      runtimeFactory,
     });
     const tool = createAgentSkillReadFileTool({
       ...config,

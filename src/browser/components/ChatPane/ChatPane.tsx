@@ -12,7 +12,6 @@ import { SideChatBanner } from "@/browser/components/SideChatBanner/SideChatBann
 import { Skeleton } from "@/browser/components/Skeleton/Skeleton";
 import { MessageListProvider } from "@/browser/features/Messages/MessageListContext";
 import { cn } from "@/common/lib/utils";
-import { ChatInstructionsChatDecoration } from "@/browser/components/InstructionsTab/AdditionalSystemContextScratchpad";
 import { MessageRenderer } from "@/browser/features/Messages/MessageRenderer";
 import { MarkdownRenderer } from "@/browser/features/Messages/MarkdownRenderer";
 import { useTranscriptContextMenu } from "@/browser/features/Messages/useTranscriptContextMenu";
@@ -21,7 +20,6 @@ import { useResumeStream } from "@/browser/hooks/useResumeStream";
 import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditCutoffBarrier";
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
-import { PinnedTodoList } from "../PinnedTodoList/PinnedTodoList";
 import { AskUserQuestionDock } from "./AskUserQuestionDock";
 import { useAcceptedAnswersVersion } from "@/browser/utils/messages/openAskUserQuestions";
 import {
@@ -69,6 +67,9 @@ import {
   useWorkspaceStoreRaw,
 } from "@/browser/stores/WorkspaceStore";
 import { WorkspaceMenuBar } from "../WorkspaceMenuBar/WorkspaceMenuBar";
+import { useMainPaneAgentInterfaceView } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceView";
+import type { AgentInterfaceView } from "@/browser/features/RightSidebar/ArtifactsTab/agentInterfaceViewState";
+import { AgentInterfaceStatusView } from "@/browser/features/RightSidebar/ArtifactsTab/AgentInterfaceStatusView";
 import { WorkspaceFooterBar } from "./WorkspaceFooterBar";
 import type { DisplayedMessage, QueuedMessage as QueuedMessageData } from "@/common/types/message";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
@@ -81,8 +82,6 @@ import { DelegatedCreationInterruptedBanner } from "@/browser/components/Delegat
 import { LegacyPlanImportBanner } from "@/browser/components/LegacyPlanImportBanner/LegacyPlanImportBanner";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
 import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
-import { SubAgentTasksDecoration } from "../SubAgentTasksDecoration/SubAgentTasksDecoration";
-import { BackgroundProcessesBanner } from "../BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
@@ -109,9 +108,9 @@ import {
   ChatDockSurface,
   useChatDockColumnWidthClass,
 } from "./chatDockColumn";
+import { ChatActivityLine } from "./ChatActivityLine";
 import { useTranscriptDensity } from "@/browser/hooks/useTranscriptDensity";
 import { useReviews } from "@/browser/hooks/useReviews";
-import { ReviewsBanner } from "../ReviewsBanner/ReviewsBanner";
 import type { ReviewNoteData } from "@/common/types/review";
 import { useWorkspaceContext } from "@/browser/contexts/WorkspaceContext";
 import { useBackgroundBashError } from "@/browser/contexts/BackgroundBashContext";
@@ -181,6 +180,11 @@ export type ChatPaneContentProps = Omit<
   embedded?: boolean;
   /** Let an explicitly opened embedded chat claim focus when its composer mounts. */
   onChatInputReady?: (api: ChatInputAPI) => void;
+  /**
+   * Agent interface view: which view the main pane shows, or null/absent when the workspace has
+   * no status page to show (or the experiment is off), which leaves the transcript as is.
+   */
+  agentInterfaceView?: AgentInterfaceView | null;
 };
 
 type ReviewsState = ReturnType<typeof useReviews>;
@@ -210,7 +214,11 @@ function mountedSlice<Row>(rows: readonly Row[], from: number, to: number): read
 const isInSlice = (index: number, from: number, to: number) => index >= from && index < to;
 
 /** Off the bottom, or detached: the bottom of the slice is not the live tail. */
-const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean) => !autoScroll || isDetached;
+const offersJumpToBottom = (autoScroll: boolean, isDetached: boolean, statusShown: boolean) =>
+  !statusShown && (!autoScroll || isDetached);
+
+/** Tab skips the transcript under the status page; the composer dock it holds stays reachable. */
+const transcriptTabIndex = (statusShown: boolean) => (statusShown ? -1 : 0);
 
 /** The last mounted transcript row and where it is now, for loadOlderAnchorRef. */
 function lastRowAnchor(scrollport: HTMLDivElement | null) {
@@ -348,6 +356,8 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
   const meta = workspaceMetadata.get(workspaceId);
   const workspaceTitle = meta?.title ?? meta?.name ?? props.workspaceName;
 
+  const agentInterfaceView = useMainPaneAgentInterfaceView(workspaceId);
+
   return (
     <PerfRenderMarker id="chat-pane">
       <div
@@ -399,6 +409,7 @@ export const ChatPane: React.FC<ChatPaneProps> = (props) => {
             namedWorkspacePath={props.namedWorkspacePath}
             runtimeConfig={props.runtimeConfig}
             onOpenTerminal={props.onOpenTerminal}
+            agentInterfaceView={agentInterfaceView}
           />
         </main>
 
@@ -450,6 +461,10 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
   const workspaceUsage = useWorkspaceUsage(workspaceId);
   const reviews = useReviews(workspaceId);
   const { clearError: clearBackgroundBashError } = useBackgroundBashError();
+
+  // Agent interface view: the transcript stays mounted (hidden) under the status page, so its
+  // scroll position survives a round trip; the status page unmounts while the transcript shows.
+  const showStatusView = props.agentInterfaceView === "status";
 
   // Transcript-only workspaces preserve historical chat and usage after the worktree is deleted,
   // so the transcript stays readable while new sends remain disabled.
@@ -1350,8 +1365,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
     workspaceState.messages
   );
   const resumeInterruptedStream = () => void resumeInterruptedStreamAsync();
-  // Live status belongs beside the input, below async decorations: neither history
-  // reveal nor banners arriving should bump the label and Stop across the screen.
+  // Transcript-only workspaces have no composer, so their live status stands alone; the
+  // composer's live line (ChatActivityLine) renders its own.
   const turnStatus = shouldMountStreamingBarrier ? (
     <ChatDockSurface>
       <StreamingBarrier
@@ -1636,6 +1651,15 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             props.embedded !== true && "mobile-header-spacer"
           )}
         >
+          {/* Before the scrollport, which holds the composer dock, so Tab reaches the page
+              before the composer below it. */}
+          <AgentInterfaceStatusView
+            key={workspaceId}
+            workspaceId={workspaceId}
+            view={props.agentInterfaceView}
+            dockRef={composerDockRef}
+            composerApiRef={chatInputAPI}
+          />
           <div
             ref={contentRef}
             onWheel={handleTranscriptWheel}
@@ -1646,7 +1670,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
             onKeyDown={handleTranscriptKeyDown}
             onScroll={handleTranscriptScroll}
             onContextMenu={transcriptContextMenu.onContextMenu}
-            tabIndex={0}
+            tabIndex={transcriptTabIndex(showStatusView)}
             data-testid="message-window"
             // Settled marker for perf tests and story play helpers: includes
             // decoration data readiness AND the tail-first reveal having settled
@@ -1700,7 +1724,9 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                 // so the placeholder's flex-1 centering works). The hydration
                 // skeleton renders in normal top-aligned transcript flow so it sits
                 // where real messages will, avoiding a jump when hydration completes.
-                showEmptyTranscriptPlaceholder && "flex flex-col"
+                showEmptyTranscriptPlaceholder && "flex flex-col",
+                // Under the status page: hidden but laid out, so its scroll position survives.
+                { invisible: showStatusView }
               )}
             >
               {showTranscriptHydrationPlaceholder ? (
@@ -1815,7 +1841,7 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                       <span className="sr-only">Loading messages...</span>
                     </div>
                   )}
-                  {offersJumpToBottom(autoScroll, isTranscriptDetached) && (
+                  {offersJumpToBottom(autoScroll, isTranscriptDetached, showStatusView) && (
                     <button
                       onClick={handleJumpToBottom}
                       type="button"
@@ -1849,7 +1875,8 @@ export const ChatPaneContent: React.FC<ChatPaneContentProps> = (props) => {
                     </>
                   ) : (
                     <ChatInputPane
-                      turnStatus={turnStatus}
+                      vimEnabled={vimEnabled}
+                      onCancelCompaction={handleCancelCompactionFromBarrier}
                       kind={meta?.kind}
                       workspaceId={workspaceId}
                       projectName={projectName}
@@ -1943,7 +1970,8 @@ const TranscriptOnlyNoticePane: React.FC<{
 };
 
 interface ChatInputPaneProps {
-  turnStatus: React.ReactNode;
+  vimEnabled: boolean;
+  onCancelCompaction: () => void;
   kind?: "scratch";
   workspaceId: string;
   projectName: string;
@@ -2099,45 +2127,12 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   }
   // Match Codex’s behavior: shared local checkouts intentionally have no concurrency warning.
 
-  if (props.shouldShowPinnedTodoList) {
-    addDecorationEntry({
-      key: "pinned-todo-list",
-      // Keyed by workspace: ChatPane stays mounted across workspace switches, and the panel's
-      // scroll position (set to the current item on open) must not carry over to another chat.
-      node: <PinnedTodoList key={props.workspaceId} workspaceId={props.workspaceId} />,
-    });
-  }
-  addDecorationEntry({
-    key: "sub-agent-tasks",
-    // Durable sub-agents live with their parent chat instead of relying only on nested sidebar rows.
-    // The decoration is collapsed by default, so inactive task history is available without noise.
-    // Keyed by workspace: ChatPane stays mounted across workspace switches, and the decoration
-    // retains observed workflow-run refs that must never leak into another chat's tray.
-    node: <SubAgentTasksDecoration key={props.workspaceId} workspaceId={props.workspaceId} />,
-  });
-  addDecorationEntry({
-    key: "background-processes",
-    node: <BackgroundProcessesBanner workspaceId={props.workspaceId} />,
-  });
   // Self-gating: only an SSH workspace from before #5174 with a plan to import shows it. Keyed by
   // workspace so one workspace's offer, error or pending import never carries over to another.
   addDecorationEntry({
     key: "legacy-plan-import",
     node: <LegacyPlanImportBanner key={props.workspaceId} workspaceId={props.workspaceId} />,
   });
-  // The Chat Instructions decoration is intentionally self-gating: it renders
-  // nothing when the scratchpad is empty or disabled, so it can always be in
-  // the decoration lane without affecting layout for users who don't use it.
-  addDecorationEntry({
-    key: "chat-instructions",
-    node: <ChatInstructionsChatDecoration workspaceId={props.workspaceId} />,
-  });
-  if (props.shouldShowReviewsBanner) {
-    addDecorationEntry({
-      key: "reviews-banner",
-      node: <ReviewsBanner workspaceId={props.workspaceId} />,
-    });
-  }
   if (props.delegatedCreationInterrupted) {
     addDecorationEntry({
       key: "delegated-creation-interrupted",
@@ -2186,7 +2181,16 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
       <ChatInputDecorationStackLane
         items={selectVisibleChatInputDecorations(decorationEntries, props.revealDecorations)}
       />
-      {props.turnStatus}
+      {/* Live status sits beside the input, below async decorations: neither history reveal nor
+          banners arriving should bump the label and Stop across the screen. */}
+      <ChatActivityLine
+        workspaceId={props.workspaceId}
+        vimEnabled={props.vimEnabled}
+        onCancelCompaction={props.onCancelCompaction}
+        revealChips={props.revealDecorations}
+        showTodo={props.shouldShowPinnedTodoList}
+        showReviews={props.shouldShowReviewsBanner}
+      />
       <ChatInput
         key={props.workspaceId}
         variant="workspace"

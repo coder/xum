@@ -39,6 +39,7 @@ import { pluginSkillFileName } from "./claudeCommands";
 import { pluginAgentIdOf } from "./agentFiles";
 import { parseSkillMarkdown } from "@/node/services/agentSkills/parseSkillMarkdown";
 import { MAX_FILE_SIZE } from "@/node/services/tools/fileCommon";
+import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import { nodeHostFiles, nodeHostPaths } from "@/node/services/hostFiles/nodeHostFiles";
 
 /**
@@ -151,15 +152,33 @@ export interface PluginFileReadArgs {
   label: string;
 }
 
-/** The host filesystem: one module-level object, so a read costs no wrapper per call. */
-export const nodePluginFs: PluginFs = {
-  realpath: (filePath) => nodeHostFiles.promises.realpath(filePath),
-  stat: (filePath) => nodeHostFiles.promises.stat(filePath),
-  lstat: (filePath) => nodeHostFiles.promises.lstat(filePath),
-  readdir: (dirPath) => nodeHostFiles.promises.readdir(dirPath, { withFileTypes: true }),
-  ensureContained: ensurePathContained,
-  readFileCapped: readPluginFileWithinRootCapped,
-};
+const hostPluginFsByFiles = new WeakMap<HostFiles, PluginFs>();
+
+/**
+ * The PluginFs of a host filesystem: one object per HostFiles, so a read costs no wrapper per
+ * call. Phase 5: the host-local scans of skills, agents and plugins read the HostFiles of their
+ * RuntimeFactory, so a test graph's memory host serves them too.
+ */
+export function hostPluginFs(files: HostFiles): PluginFs {
+  const known = hostPluginFsByFiles.get(files);
+  if (known !== undefined) return known;
+  const fs: PluginFs = {
+    realpath: (filePath) => files.promises.realpath(filePath),
+    stat: (filePath) => files.promises.stat(filePath),
+    lstat: (filePath) => files.promises.lstat(filePath),
+    readdir: (dirPath) => files.promises.readdir(dirPath, { withFileTypes: true }),
+    ensureContained: (root, candidatePath, options) =>
+      ensurePathContained(root, candidatePath, options, files),
+    // The reader's own containment check (ensurePluginPathContained) reads the current PluginFs.
+    readFileCapped: (args) =>
+      pluginFsStorage.run(fs, () => readPluginFileWithinRootCapped(args, files)),
+  };
+  hostPluginFsByFiles.set(files, fs);
+  return fs;
+}
+
+/** The host filesystem. */
+export const nodePluginFs: PluginFs = hostPluginFs(nodeHostFiles);
 
 /**
  * The PluginFs of the discovery that is running. AsyncLocalStorage, not a parameter, so the
@@ -194,6 +213,19 @@ export async function discoverAgentPluginsIn(
     return { plugins: [], diagnostics: [] };
   }
   return await pluginFsStorage.run(fs, () => discoverAgentPlugins(containers));
+}
+
+/**
+ * discoverAgentPlugins on a host filesystem (hostPluginFs of the caller's RuntimeFactory, phase
+ * 5). Unlike discoverAgentPluginsIn, managed containers are allowed: their registries and
+ * journals still read the Node host.
+ */
+export async function discoverAgentPluginsOnHost(
+  fs: PluginFs,
+  containers: AgentPluginContainer[],
+  options?: { managedHome?: string }
+): Promise<DiscoverAgentPluginsResult> {
+  return await pluginFsStorage.run(fs, () => discoverAgentPlugins(containers, options));
 }
 
 /** A plugin path that resolves into the plugin root's `.git` directory (#6161). */
@@ -262,14 +294,16 @@ export async function ensurePluginPathContained(
  * the caller skips and re-measures on the next discovery.
  */
 export async function readPluginFileWithinRootCapped(
-  args: PluginFileReadArgs
+  args: PluginFileReadArgs,
+  /** The host filesystem of the read (hostPluginFs). Absent: the Node layer. */
+  files: HostFiles = nodeHostFiles
 ): Promise<PluginFileReadResult> {
   const { filePath, pluginRoot, maxBytes, label } = args;
   // Opening a FIFO for reading blocks until a writer appears, which would hang every caller
   // (list(), preview, skill/agent/hook/MCP config loads). Refuse anything but a regular file
   // before the open; O_NONBLOCK covers a swap to a FIFO between this stat and the open (it
   // has no effect on regular files), and the identity check below still runs after the open.
-  const fsPromises = nodeHostFiles.promises;
+  const fsPromises = files.promises;
   const target = await fsPromises.stat(filePath);
   if (!target.isFile()) {
     throw new Error(`${label} is not a regular file: ${filePath}`);
@@ -412,8 +446,8 @@ export type PluginSkillsRoot =
   /** Holds `<name>/SKILL.md` skill folders. */
   | { dir: string; single?: undefined; name?: undefined; command?: undefined }
   /**
-   * Holds SKILL.md itself. `name` is the folder name as declared, or the plugin name when the
-   * path is the plugin root. It is not validated here: scan sites reject an invalid skill name.
+   * Holds SKILL.md itself. `name` is the skill name of the folder as declared
+   * (pluginSkillNameOfFolder), or the plugin name when the path is the plugin root. It is not validated here: scan sites reject an invalid skill name.
    * `command`: a Claude command instead, the file `<dir>/<name>.md` (claudeCommands.ts). Its
    * `dir` is the commands folder and its name is valid. Command roots follow every skills root,
    * so a skill of the same name wins; discovery drops such a command with a warning.
@@ -421,29 +455,87 @@ export type PluginSkillsRoot =
   | { dir: string; single: true; name: string; command?: true };
 
 /**
+ * The skill name of a plugin skill folder. Claude Code and Codex name a skill by its SKILL.md
+ * `name`, not its folder, so plugins ship snake_case folders: google/elephant-goldfish-model
+ * has `skills/egm_bootstrap/SKILL.md` with `name: egm-bootstrap`. A folder with `_` and no `-`
+ * loads under the kebab-case name. The mapping is 1:1 (pluginSkillFolderAlias inverts it), so a
+ * lookup finds the folder without listing the root. Other names come back unchanged: scan sites
+ * reject an invalid one, and the SKILL.md `name` must still match the result.
+ */
+export function pluginSkillNameOfFolder(folder: string): string {
+  if (!folder.includes("_") || folder.includes("-")) return folder;
+  return folder.replaceAll("_", "-");
+}
+
+/** The snake_case folder that can also hold plugin skill `name` (pluginSkillNameOfFolder). */
+export function pluginSkillFolderAlias(name: string): string | undefined {
+  return name.includes("-") ? name.replaceAll("-", "_") : undefined;
+}
+
+/**
+ * The skill name of each plugin skill folder. A snake_case folder is dropped when the kebab-case
+ * path is a directory (`isDirectory` follows symlinks): lookups try that path first and fall
+ * back only when it is not a directory, so the two always agree. The path is stat'ed even when
+ * the listing has no entry of that exact name: on a case-insensitive filesystem a `Foo-Bar`
+ * folder answers the lookup of `foo-bar`.
+ */
+export async function pluginSkillFolderNames(
+  folders: readonly string[],
+  isDirectory: (folder: string) => Promise<boolean>
+): Promise<Array<{ folder: string; name: string }>> {
+  const entries: Array<{ folder: string; name: string }> = [];
+  for (const folder of folders) {
+    const name = pluginSkillNameOfFolder(folder);
+    if (name !== folder && (await isDirectory(name))) continue;
+    entries.push({ folder, name });
+  }
+  return entries;
+}
+
+/**
+ * Whether the kebab-case twin of a snake_case plugin skill folder is a directory
+ * (pluginSkillFolderNames). An entry Xum cannot stat for a reason other than absence (a symlink
+ * loop, a permission error) counts as present: a lookup refuses such a folder instead of falling
+ * back (#4438), so its snake_case twin must not load in its place anywhere.
+ */
+export function isPluginSkillDirectory(
+  stat: Promise<{ isDirectory(): boolean }>
+): Promise<boolean> {
+  return stat.then(
+    (result) => result.isDirectory(),
+    (error: unknown) => !(hasErrorCode(error, "ENOENT") || hasErrorCode(error, "ENOTDIR"))
+  );
+}
+
+/**
  * The skill folders of one skills root, sorted: the root itself when it is a single skill, else
  * its subfolders, symlinks included (runtime discovery follows them, so consent must list them).
+ * `name` is the skill name (pluginSkillNameOfFolder). `folder` is the folder's own name in a
+ * container root, and `name` for a single root (whose review label is the root's path).
  * `file` is the skill's Markdown file (SKILL.md, or a command's `<name>.md`). Names are not
  * validated: callers report an invalid one.
  */
 export async function listPluginSkillFolders(
   root: PluginSkillsRoot
-): Promise<Array<{ name: string; dir: string; file: string }>> {
+): Promise<Array<{ name: string; folder: string; dir: string; file: string }>> {
   if (root.single) {
     const file = path.join(root.dir, pluginSkillFileName(root.name, root.command));
-    return [{ name: root.name, dir: root.dir, file }];
+    return [{ name: root.name, folder: root.name, dir: root.dir, file }];
   }
   try {
     const entries = await pluginFs().readdir(root.dir);
-    return entries
+    const folders = entries
       .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
       .map((entry) => entry.name)
-      .sort((a, b) => a.localeCompare(b))
-      .map((name) => ({
-        name,
-        dir: path.join(root.dir, name),
-        file: path.join(root.dir, name, SKILL_FILENAME),
-      }));
+      .sort((a, b) => a.localeCompare(b));
+    const isDirectory = (folder: string) =>
+      isPluginSkillDirectory(pluginFs().stat(path.join(root.dir, folder)));
+    return (await pluginSkillFolderNames(folders, isDirectory)).map(({ folder, name }) => ({
+      name,
+      folder,
+      dir: path.join(root.dir, folder),
+      file: path.join(root.dir, folder, SKILL_FILENAME),
+    }));
   } catch {
     return [];
   }
@@ -556,10 +648,14 @@ type ManifestCandidate =
   | { status: "invalid"; message: string }
   | { status: "ok"; raw: unknown };
 
-/** Read one manifest location with the shared containment and size caps. */
+/**
+ * Read one manifest location with the shared containment and size caps. `shown`: the path that
+ * error messages name (shownManifestPath), default `relative`.
+ */
 async function readManifestCandidate(
   rootReal: string,
-  relative: string
+  relative: string,
+  shown = relative
 ): Promise<ManifestCandidate> {
   let manifestReal: string;
   try {
@@ -574,8 +670,8 @@ async function readManifestCandidate(
       status: "invalid",
       message:
         error instanceof PluginGitPathError
-          ? `${relative} resolves into the plugin's .git directory`
-          : `${relative} resolves outside the plugin root: ${getErrorMessage(error)}`,
+          ? `${shown} resolves into the plugin's .git directory`
+          : `${shown} resolves outside the plugin root: ${getErrorMessage(error)}`,
     };
   }
   const stat = await pluginFs()
@@ -586,7 +682,7 @@ async function readManifestCandidate(
   if (stat.size > MAX_PLUGIN_MANIFEST_BYTES) {
     return {
       status: "invalid",
-      message: `${relative} is too large (${stat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`,
+      message: `${shown} is too large (${stat.size} bytes; max ${MAX_PLUGIN_MANIFEST_BYTES})`,
     };
   }
   try {
@@ -597,11 +693,11 @@ async function readManifestCandidate(
       filePath: manifestReal,
       pluginRoot: rootReal,
       maxBytes: MAX_PLUGIN_MANIFEST_BYTES,
-      label: relative,
+      label: shown,
     });
     return { status: "ok", raw: JSON.parse(content) };
   } catch (error) {
-    return { status: "invalid", message: `Failed to read ${relative}: ${getErrorMessage(error)}` };
+    return { status: "invalid", message: `Failed to read ${shown}: ${getErrorMessage(error)}` };
   }
 }
 
@@ -678,7 +774,10 @@ async function classifySkillsRoot(args: {
   // Decide "root" from the declared path, not the canonical one: `alias -> .` is still
   // the folder the author named `alias`.
   const declaredPath = path.resolve(args.rootReal, args.relative);
-  const name = declaredPath === args.rootReal ? args.pluginName : path.basename(declaredPath);
+  const name =
+    declaredPath === args.rootReal
+      ? args.pluginName
+      : pluginSkillNameOfFolder(path.basename(declaredPath));
   return { dir: args.canonical, single: true, name };
 }
 
@@ -1049,12 +1148,73 @@ async function resolveXumComponents(args: {
   return resolved;
 }
 
+/**
+ * A root plugin.json that other harnesses use (no `$schema` member): it yields to a Codex or a
+ * Claude manifest (selectManifest).
+ */
+function isSchemaLessManifest(raw: unknown): boolean {
+  return isPlainObject(raw) && raw.$schema === undefined;
+}
+
+/**
+ * True when the root plugin.json of `rootReal` reads, through the manifest containment and size
+ * caps, as a schema-less one. installMethods uses it so the method it offers is the manifest
+ * discovery loads.
+ */
+export async function isSchemaLessRootManifest(rootReal: string): Promise<boolean> {
+  const read = await readManifestCandidate(rootReal, PLUGIN_MANIFEST_RELATIVE_PATH);
+  return read.status === "ok" && isSchemaLessManifest(read.raw);
+}
+
+/**
+ * Pick the manifest of a plugin folder. Root plugin.json wins, then the Codex and the Claude Code
+ * manifests. Each one goes through the same caps and containment. Null when none exists.
+ *
+ * A root plugin.json with no `$schema` is not an Agent Plugins manifest: other harnesses use the
+ * same file name (DietrichGebert/ponytail ships `{"name":"ponytail"}` next to its Codex and Claude
+ * manifests). It yields to a later candidate, and is returned (so validation reports it) only
+ * when no other manifest exists. The fallback gets the narrower Codex or Claude component set.
+ */
+async function selectManifest(
+  rootReal: string,
+  /** See discoverAgentPluginAt: read errors name the file from here, like validation errors. */
+  shownRoot: string | undefined
+): Promise<{ relative: string; raw: unknown } | { relative: string; error: string } | null> {
+  let schemaLessRoot: { relative: string; raw: unknown } | null = null;
+  for (const relative of [
+    PLUGIN_MANIFEST_RELATIVE_PATH,
+    CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
+    CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
+  ]) {
+    const read = await readManifestCandidate(
+      rootReal,
+      relative,
+      shownManifestPath(shownRoot, relative)
+    );
+    if (read.status === "missing") continue;
+    if (read.status === "invalid") return { relative, error: read.message };
+    if (relative === PLUGIN_MANIFEST_RELATIVE_PATH && isSchemaLessManifest(read.raw)) {
+      schemaLessRoot = { relative, raw: read.raw };
+      continue;
+    }
+    return { relative, raw: read.raw };
+  }
+  return schemaLessRoot;
+}
+
+/** The manifest path an error shows: from `shownRoot` (default the plugin root), `/` on every OS. */
+function shownManifestPath(shownRoot: string | undefined, manifestRelative: string): string {
+  return path.posix.join(shownRoot ?? ".", manifestRelative.split(path.sep).join("/"));
+}
+
 async function discoverPluginAt(args: {
   pluginDir: string;
   containerPath: string;
   dirName: string;
   scope: AgentPluginScope;
   diagnostics: AgentPluginDiagnostic[];
+  /** See discoverAgentPluginAt. */
+  shownRoot?: string;
 }): Promise<AgentPluginInfo | null> {
   const { pluginDir, scope, diagnostics } = args;
 
@@ -1072,33 +1232,18 @@ async function discoverPluginAt(args: {
     return null;
   }
 
-  // Root plugin.json wins, then the Codex and the Claude Code manifests. Each one goes through
-  // the same caps and containment.
-  let manifestRelative = PLUGIN_MANIFEST_RELATIVE_PATH;
-  let manifestPath = path.join(rootReal, manifestRelative);
-  let rawManifest: unknown;
-  let found = false;
-  for (const candidate of [
-    PLUGIN_MANIFEST_RELATIVE_PATH,
-    CODEX_PLUGIN_MANIFEST_RELATIVE_PATH,
-    CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH,
-  ]) {
-    manifestRelative = candidate;
-    manifestPath = path.join(rootReal, candidate);
-    const read = await readManifestCandidate(rootReal, candidate);
-    if (read.status === "missing") continue;
-    if (read.status === "invalid") {
-      pushError(manifestPath, read.message);
-      return null;
-    }
-    rawManifest = read.raw;
-    found = true;
-    break;
-  }
-  if (!found) {
+  const selected = await selectManifest(rootReal, args.shownRoot);
+  if (selected === null) {
     // No manifest → not a plugin (silent skip, e.g. Codex marketplace.json entries).
     return null;
   }
+  const manifestRelative = selected.relative;
+  const manifestPath = path.join(rootReal, manifestRelative);
+  if ("error" in selected) {
+    pushError(manifestPath, selected.error);
+    return null;
+  }
+  const rawManifest = selected.raw;
 
   const codexFallback = manifestRelative === CODEX_PLUGIN_MANIFEST_RELATIVE_PATH;
   const claudeFallback = manifestRelative === CLAUDE_PLUGIN_MANIFEST_RELATIVE_PATH;
@@ -1113,7 +1258,11 @@ async function discoverPluginAt(args: {
       validation.reason === "unsupported-version"
         ? "Unsupported Agent Plugins version"
         : "Invalid plugin manifest";
-    pushError(manifestPath, `${label}: ${validation.errors.join("; ")}`);
+    // Name the manifest: a plugin can carry plugin.json, .codex-plugin/plugin.json and
+    // .claude-plugin/plugin.json, and the user must see which one failed. Forward slashes on
+    // every OS, because the path is shown, not opened.
+    const shownManifest = shownManifestPath(args.shownRoot, manifestRelative);
+    pushError(manifestPath, `${label} (${shownManifest}): ${validation.errors.join("; ")}`);
     return null;
   }
 
@@ -1242,6 +1391,8 @@ export function computeAgentPluginContainers(args: {
   xumHome: string;
   projectRoot?: string;
   projectTrusted: boolean;
+  /** The home of ~/.agents/plugins (phase 5: the caller's HostPaths). Absent: the Node home. */
+  userHome?: string;
 }): AgentPluginContainer[] {
   const containers: AgentPluginContainer[] = [];
   // projectAutomationDisabled: benchmark harness kill-switch: dataset repos
@@ -1265,7 +1416,8 @@ export function computeAgentPluginContainers(args: {
     registryPath: path.join(args.xumHome, PLUGIN_REGISTRY_FILE_NAME),
   });
   containers.push({
-    path: path.join(nodeHostPaths.userHome(), ".agents", "plugins"),
+    // mutation-equivalent: userHome is a string or undefined, and an empty home is no path
+    path: path.join(args.userHome ?? nodeHostPaths.userHome(), ".agents", "plugins"),
     scope: "global",
   });
   return containers;
@@ -1322,6 +1474,12 @@ export async function discoverWorkspaceAgentPlugins(args: {
 export async function discoverAgentPluginAt(args: {
   pluginDir: string;
   scope: AgentPluginScope;
+  /**
+   * The plugin folder's path inside its repository (an install's "Plugin folder"), so a manifest
+   * error names the file the way the user sees the repository: `.codex-plugin/plugin.json`, not
+   * a bare `plugin.json`. Display only.
+   */
+  shownRoot?: string;
 }): Promise<{ plugin: AgentPluginInfo | null; diagnostics: AgentPluginDiagnostic[] }> {
   if (!path.isAbsolute(args.pluginDir)) {
     throw new Error(`discoverAgentPluginAt: pluginDir must be absolute: ${args.pluginDir}`);
@@ -1334,6 +1492,7 @@ export async function discoverAgentPluginAt(args: {
     dirName: path.basename(args.pluginDir),
     scope: args.scope,
     diagnostics,
+    shownRoot: args.shownRoot,
   });
   return { plugin, diagnostics };
 }

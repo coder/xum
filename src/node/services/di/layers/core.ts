@@ -34,6 +34,9 @@ import {
   ConfigTag,
   ContextManagement,
   DesktopNotificationsTag,
+  RuntimeFactoryTag,
+  HostFilesTag,
+  HostPathsTag,
   Evaluation,
   ExtensionMetadata,
   FileLeaseManagerTag,
@@ -50,6 +53,7 @@ import {
   SecretsStoreTag,
   SessionFilesTag,
   SessionLocatorTag,
+  SessionLocksTag,
   SessionUsage,
   StreamManagerTag,
   Task,
@@ -57,9 +61,14 @@ import {
   TerminalAttentionStoreTag,
   TurnRequestBuilderBindingsTag,
   Workspace,
+  WorkspaceExternalEditorsTag,
   WorkspaceGoal,
+  WorkspaceLifecycleGatesTag,
   WorkspaceMcpOverrides,
+  WorkspaceNamingTag,
   WorkspaceTurnManagerTag,
+  WorkspaceWorkflowRunsTag,
+  WorkspaceOperationAdmissionTag,
   type CoreRootTags,
   type CoreTags,
   type StoreTags,
@@ -84,6 +93,12 @@ import { ToolCallDisplayRegistry } from "@/node/services/toolCallDisplayRegistry
 import { DesktopInputCoordinator } from "@/node/services/desktop/DesktopInputCoordinator";
 import { TaskService } from "@/node/services/taskService";
 import { TerminalAttentionStore } from "@/node/services/terminalAttentionStore";
+import { WorkspaceLifecycleGates } from "@/node/services/workspaceLifecycleGates";
+import { WorkspaceExternalEditors } from "@/node/services/workspaceExternalEditors";
+import { WorkspaceNaming } from "@/node/services/workspaceNaming";
+import { WorkspaceWorkflowRuns } from "@/node/services/workspaceWorkflowRuns";
+import { WorkspaceOperationAdmission } from "@/node/services/workspaceOperationAdmission";
+import { workspaceUseLeasesFor } from "@/node/services/workspaceUseLeases";
 import type { TurnRequestBuilderBindings } from "@/node/services/turnRequestBuilder";
 import { mergeMultiProjectSecrets } from "@/node/services/utils/multiProjectSecrets";
 import { WorkspaceGoalService } from "@/node/services/workspaceGoalService";
@@ -176,7 +191,11 @@ export const WorkspaceMcpOverridesDefaultLive: Layer.Layer<
 export const HistoryLive = Layer.effect(
   History,
   Effect.gen(function* () {
-    return new HistoryService(yield* SessionLocatorTag, yield* SessionFilesTag);
+    return new HistoryService(
+      yield* SessionLocatorTag,
+      yield* SessionFilesTag,
+      yield* SessionLocksTag
+    );
   })
 );
 
@@ -251,6 +270,46 @@ export const TerminalAttentionStoreLive = Layer.effect(
 // consumer is registered by `CoreWiringLive` once Task/Workspace exist.
 export const IdleDispatcherLive = Layer.sync(IdleDispatcherTag, () => new IdleDispatcher());
 
+/** One shared instance per graph: WorkspaceService and the services split out of it read it. */
+export const WorkspaceLifecycleGatesLive = Layer.sync(
+  WorkspaceLifecycleGatesTag,
+  () => new WorkspaceLifecycleGates()
+);
+
+/** Built on the shared lifecycle gates, so an open sees WorkspaceService's archive state. */
+export const WorkspaceExternalEditorsLive = Layer.effect(
+  WorkspaceExternalEditorsTag,
+  Effect.gen(function* () {
+    const config = yield* ConfigTag;
+    return new WorkspaceExternalEditors({
+      config,
+      files: yield* HostFilesTag,
+      leases: workspaceUseLeasesFor(config),
+      gates: yield* WorkspaceLifecycleGatesTag,
+    });
+  })
+);
+
+/** WorkspaceService's naming claims; no dependencies, one instance per graph. */
+export const WorkspaceNamingLive = Layer.sync(WorkspaceNamingTag, () => new WorkspaceNaming());
+
+/** WorkspaceService's workflow-run activity cache; reads only the config. */
+export const WorkspaceWorkflowRunsLive = Layer.effect(
+  WorkspaceWorkflowRunsTag,
+  Effect.map(ConfigTag, (config) => new WorkspaceWorkflowRuns({ config }))
+);
+
+/** Archive admission of non-send operations; built on the shared lifecycle gates. */
+export const WorkspaceOperationAdmissionLive = Layer.effect(
+  WorkspaceOperationAdmissionTag,
+  Effect.gen(function* () {
+    return new WorkspaceOperationAdmission({
+      config: yield* ConfigTag,
+      gates: yield* WorkspaceLifecycleGatesTag,
+    });
+  })
+);
+
 /** One mutable record per graph build (`sync`, not `succeed`); filled by `CoreWiringLive`. */
 export const TurnRequestBuilderBindingsLive = Layer.sync(
   TurnRequestBuilderBindingsTag,
@@ -305,7 +364,7 @@ export const StreamManagerLive = Layer.effect(
       yield* EffectRunnerTag,
       // The stream engine is the AppFiberScope's occupant: dispose() closes the
       // scope before the explicit teardown steps, which aborts and awaits every
-      // in-flight stream (StreamManager.superviseEngine).
+      // in-flight stream (TurnRegistry.superviseEngine).
       yield* AppFiberScopeTag,
       yield* ToolCallDisplayRegistryTag,
       { hostClock: yield* HostClockTag }
@@ -338,7 +397,12 @@ export const AILive = Layer.effect(
       yield* TurnRequestBuilderBindingsTag,
       yield* ProvidersConfigStoreTag,
       yield* SecretsStoreTag,
-      { desktopNotifications: yield* DesktopNotificationsTag }
+      {
+        desktopNotifications: yield* DesktopNotificationsTag,
+        runtimeFactory: yield* RuntimeFactoryTag,
+        hostFiles: yield* HostFilesTag,
+        hostPaths: yield* HostPathsTag,
+      }
     );
   })
 );
@@ -494,7 +558,12 @@ export const WorkspaceLive = Layer.effect(
       yield* EffectRunnerTag,
       yield* AppFiberScopeTag,
       yield* AutoModelRouterTag,
-      yield* HostClockTag
+      yield* HostClockTag,
+      yield* WorkspaceLifecycleGatesTag,
+      yield* WorkspaceExternalEditorsTag,
+      yield* WorkspaceNamingTag,
+      yield* WorkspaceWorkflowRunsTag,
+      yield* WorkspaceOperationAdmissionTag
     );
   })
 );
@@ -741,9 +810,18 @@ const S1 = Layer.mergeAll(
   TerminalAttentionStoreLive,
   DesktopInputCoordinatorLive,
   IdleDispatcherLive,
+  WorkspaceLifecycleGatesLive,
+  WorkspaceNamingLive,
+  WorkspaceWorkflowRunsLive,
   TurnRequestBuilderBindingsLive
 );
-const S2a = Layer.mergeAll(SessionUsageLive, WorkspaceGoalLive).pipe(Layer.provideMerge(S1));
+// WorkspaceExternalEditorsLive and WorkspaceOperationAdmissionLive read S1's WorkspaceLifecycleGatesTag.
+const S2a = Layer.mergeAll(
+  SessionUsageLive,
+  WorkspaceGoalLive,
+  WorkspaceExternalEditorsLive,
+  WorkspaceOperationAdmissionLive
+).pipe(Layer.provideMerge(S1));
 const S2b = StreamManagerLive.pipe(Layer.provideMerge(S2a));
 const S3 = AILive.pipe(Layer.provideMerge(S2b));
 const S4 = Layer.mergeAll(MemoryConsolidationLive, MCPConfigLive, ContextManagementLive).pipe(

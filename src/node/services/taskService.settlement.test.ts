@@ -68,6 +68,7 @@ import {
   createTaskServiceTestRoot,
   removeTaskServiceTestRoot,
 } from "@/node/services/taskService.shared.testHarness";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("TaskService", () => {
   let rootDir: string;
@@ -647,6 +648,7 @@ describe("TaskService", () => {
       const t = await setupChildTask();
       t.receiptFake.register("late-source-entry", "prestream-failed");
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: t.parentId,
         workspaceSessionDir: path.join(t.config.sessionsDir, t.parentId),
         childTaskId: t.childId,
@@ -1695,6 +1697,7 @@ describe("TaskService", () => {
       markdown: string
     ) {
       await upsertSubagentReportArtifact({
+        locks: nodeSessionLocks,
         workspaceId: ownerId,
         workspaceSessionDir: path.join(config.sessionsDir, ownerId),
         childTaskId: taskId,
@@ -1977,9 +1980,11 @@ describe("TaskService", () => {
         });
         const owned = (
           taskService as unknown as {
-            ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
+            attemptLedger: {
+              ownedAttemptByTaskId: Map<string, { attemptId?: string; receiptEligible: boolean }>;
+            };
           }
-        ).ownedAttemptByTaskId.get(taskId);
+        ).attemptLedger.ownedAttemptByTaskId.get(taskId);
         expect(owned?.attemptId).toBe(entry?.taskAttemptId);
         expect(owned?.receiptEligible).toBe(false);
       } finally {
@@ -2114,7 +2119,7 @@ describe("TaskService", () => {
       const internals = taskService as unknown as {
         inspectAttemptOutcome: (taskId: string, options: unknown) => Promise<unknown>;
         workspaceEventLocks: { withLock: <T>(key: string, op: () => Promise<T>) => Promise<T> };
-        attemptSettlementListenersByTaskId: Map<string, Set<unknown>>;
+        attemptLedger: { attemptSettlementListenersByTaskId: Map<string, Set<unknown>> };
       };
       const inspect = spyOn(internals, "inspectAttemptOutcome");
       const gate = Promise.withResolvers<void>();
@@ -2146,7 +2151,9 @@ describe("TaskService", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
       // Late acquisitions are no-ops: no read, no leaked subscription.
       expect(inspect).not.toHaveBeenCalled();
-      expect(internals.attemptSettlementListenersByTaskId.get(taskId)?.size ?? 0).toBe(0);
+      expect(
+        internals.attemptLedger.attemptSettlementListenersByTaskId.get(taskId)?.size ?? 0
+      ).toBe(0);
       // The lock is usable again and a normal read works.
       expect((await taskService.readAttemptOutcome(taskId, requesting)).kind).toBe("indeterminate");
     });
@@ -2204,9 +2211,9 @@ describe("TaskService", () => {
         // Subscriptions do not leak past the wait.
         const listeners = (
           taskService as unknown as {
-            attemptSettlementListenersByTaskId: Map<string, Set<unknown>>;
+            attemptLedger: { attemptSettlementListenersByTaskId: Map<string, Set<unknown>> };
           }
-        ).attemptSettlementListenersByTaskId;
+        ).attemptLedger.attemptSettlementListenersByTaskId;
         expect(listeners.get(taskId)?.size ?? 0).toBe(0);
         expect(listeners.get(legacyId)?.size ?? 0).toBe(0);
       } finally {
@@ -2215,9 +2222,11 @@ describe("TaskService", () => {
     });
 
     interface AttemptLedgerInternals {
-      ownedAttemptByTaskId: Map<string, { generation: number }>;
-      attemptSettlementByTaskId: Map<string, { attempt: { generation: number } }>;
-      completedReportsByTaskId: Map<string, unknown>;
+      attemptLedger: {
+        ownedAttemptByTaskId: Map<string, { generation: number }>;
+        attemptSettlementByTaskId: Map<string, { attempt: { generation: number } }>;
+      };
+      waiters: { completedReportsByTaskId: Map<string, unknown> };
       shouldAllowLegacyInvalidWorkflowOutputSchema: (...args: unknown[]) => Promise<boolean>;
     }
     const ledgerInternals = (taskService: TaskService) =>
@@ -2253,13 +2262,15 @@ describe("TaskService", () => {
         const { taskService } = createTaskServiceHarness(config);
         const internals = ledgerInternals(taskService);
         expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-        const attempt = internals.ownedAttemptByTaskId.get(taskId);
+        const attempt = internals.attemptLedger.ownedAttemptByTaskId.get(taskId);
         expect(attempt).toBeDefined();
         if (statusAtStreamEnd === "interrupted") {
           // Stopped before its stream ended: the no-report receipt is retained until the report
           // that follows makes it redundant.
           await taskService.terminateAllDescendantAgentTasks(rootId);
-          expect(internals.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
+          expect(internals.attemptLedger.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(
+            attempt
+          );
           expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
             kind: "terminal-no-report",
           });
@@ -2268,12 +2279,12 @@ describe("TaskService", () => {
         await streamEnd(taskService, reportStreamEnd(taskId, "final answer"));
 
         expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
-        expect(internals.ownedAttemptByTaskId.has(taskId)).toBe(false);
-        expect(internals.attemptSettlementByTaskId.has(taskId)).toBe(false);
+        expect(internals.attemptLedger.ownedAttemptByTaskId.has(taskId)).toBe(false);
+        expect(internals.attemptLedger.attemptSettlementByTaskId.has(taskId)).toBe(false);
         const reported = { kind: "reported", report: { reportMarkdown: "final answer" } };
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
         // Not just the in-memory cache: the persisted artifact answers, here and in a fresh process.
-        internals.completedReportsByTaskId.clear();
+        internals.waiters.completedReportsByTaskId.clear();
         expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
         const { taskService: freshService } = createTaskServiceHarness(config);
         expect(await freshService.readAttemptOutcome(taskId, requesting)).toMatchObject(reported);
@@ -2295,7 +2306,7 @@ describe("TaskService", () => {
         const internals = ledgerInternals(taskService);
         expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
         await taskService.terminateAllDescendantAgentTasks(rootId);
-        const firstAttempt = internals.ownedAttemptByTaskId.get(taskId);
+        const firstAttempt = internals.attemptLedger.ownedAttemptByTaskId.get(taskId);
         expect(firstAttempt).toBeDefined();
 
         const blocked = Promise.withResolvers<void>();
@@ -2348,7 +2359,7 @@ describe("TaskService", () => {
           }
           // The user resumes the (still interrupted) task while the older report is in flight.
           expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-          const secondAttempt = internals.ownedAttemptByTaskId.get(taskId);
+          const secondAttempt = internals.attemptLedger.ownedAttemptByTaskId.get(taskId);
           const secondAttemptId = findWorkspaceInConfig(config, taskId)?.taskAttemptId;
           expect(secondAttempt).toBeDefined();
           expect(secondAttempt).not.toBe(firstAttempt);
@@ -2375,7 +2386,7 @@ describe("TaskService", () => {
             taskAttemptId: secondAttemptId,
           });
           expect(waiterOutcome).toBeUndefined();
-          expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(secondAttempt);
+          expect(internals.attemptLedger.ownedAttemptByTaskId.get(taskId)).toBe(secondAttempt);
           expect(
             await readSubagentReportArtifact(path.join(config.sessionsDir, rootId), taskId)
           ).toBeNull();
@@ -2399,13 +2410,13 @@ describe("TaskService", () => {
       const { taskService } = createTaskServiceHarness(config);
       const internals = ledgerInternals(taskService);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
-      const attempt = internals.ownedAttemptByTaskId.get(taskId);
+      const attempt = internals.attemptLedger.ownedAttemptByTaskId.get(taskId);
       expect(attempt).toBeDefined();
 
       await streamEnd(taskService, reportStreamEnd(taskId, "lost report"));
 
       expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("reported");
-      expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
+      expect(internals.attemptLedger.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
       // A fresh process has no durable report to classify from.
       const { taskService: freshService } = createTaskServiceHarness(config);
       expect((await freshService.readAttemptOutcome(taskId, requesting)).kind).toBe(
@@ -2422,7 +2433,7 @@ describe("TaskService", () => {
       const internals = ledgerInternals(taskService);
       expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
       await taskService.terminateAllDescendantAgentTasks(rootId);
-      const attempt = internals.ownedAttemptByTaskId.get(taskId);
+      const attempt = internals.attemptLedger.ownedAttemptByTaskId.get(taskId);
       expect(attempt).toBeDefined();
 
       // Cut short by the stop: no explicit `stop` finish, so nothing is promoted to a report.
@@ -2435,8 +2446,8 @@ describe("TaskService", () => {
       });
 
       expect(findWorkspaceInConfig(config, taskId)?.taskStatus).toBe("interrupted");
-      expect(internals.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
-      expect(internals.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
+      expect(internals.attemptLedger.ownedAttemptByTaskId.get(taskId)).toBe(attempt);
+      expect(internals.attemptLedger.attemptSettlementByTaskId.get(taskId)?.attempt).toBe(attempt);
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
         kind: "terminal-no-report",
       });
@@ -2940,9 +2951,9 @@ describe("TaskService", () => {
         expect(await taskService.markInterruptedTaskRunning(spawnedId)).toBe(true);
         const owned = (
           taskService as unknown as {
-            ownedAttemptByTaskId: Map<string, { abortSignal?: AbortSignal }>;
+            attemptLedger: { ownedAttemptByTaskId: Map<string, { abortSignal?: AbortSignal }> };
           }
-        ).ownedAttemptByTaskId.get(spawnedId);
+        ).attemptLedger.ownedAttemptByTaskId.get(spawnedId);
         expect(owned?.abortSignal).toBeUndefined();
       }
     );

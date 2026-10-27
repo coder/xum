@@ -14,7 +14,7 @@ import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import type { Config } from "@/node/config";
 
 import type { AgentSession } from "./agentSession";
-import { createAgentSessionHarness, createStreamLifecycleMocks } from "./agentSession.testHarness";
+import { createAgentSessionHarness, createTestStreamManager } from "./agentSession.testHarness";
 import type { CompactionHandler } from "./compactionHandler";
 import { CompactionPendingState } from "./compactionPendingState";
 import type { HistoryService } from "./historyService";
@@ -25,6 +25,7 @@ import { recordArtifactVersion } from "./artifactVersionStore";
 import { upsertSubagentReportArtifact } from "./subagentReportArtifacts";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import type { EffectRunner } from "./di/effectRunner";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 function createSuccessfulFileEditMessage(id: string, filePath: string, diff: string): MuxMessage {
   return {
@@ -117,7 +118,7 @@ async function createSessionForHistory(
     workspaceId: WORKSPACE_ID,
     config,
     historyService,
-    ...(runner ? { streamManager: { ...createStreamLifecycleMocks(), effectRunner: runner } } : {}),
+    ...(runner ? { streamManager: createTestStreamManager(undefined, runner) } : {}),
     aiServiceOverrides: {
       getWorkspaceMetadata: mock(() => Promise.resolve(Err("metadata unavailable"))),
     },
@@ -345,6 +346,7 @@ describe("AgentSession post-compaction attachments", () => {
     const sessionDir = path.join(config.sessionsDir, WORKSPACE_ID);
     await writePendingPostCompactionState({ sessionDir, diffs: [], loadedSkills: [] });
     await upsertSubagentReportArtifact({
+      locks: nodeSessionLocks,
       workspaceId: WORKSPACE_ID,
       workspaceSessionDir: sessionDir,
       childTaskId: "task-before-compaction",

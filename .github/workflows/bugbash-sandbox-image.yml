@@ -1,16 +1,26 @@
 # The bug-bash sandbox image (#5714): tests/bugbash/sandbox/Dockerfile, built by build.sh.
 #
-# Pull requests build it with a read-only token and push nothing. Publishing is manual: only a
-# workflow_dispatch run on main publishes, from that run's exact commit, with no cache and no
-# artifact from any other run. Each publish builds fresh, and the attestation names that build's
-# own output. A person then copies the digest from the job summary into image.json in a pull
-# request: no workflow writes to the repo. Nothing here deletes an image.
+# Pull requests build it with a read-only token and push nothing. Only main publishes: a push to
+# main that changes an image input, or a manual run on main, from that run's exact commit, with no
+# cache and no artifact from any other run. Publishing is create-if-missing (the user's pick, so
+# an image change needs no person): each inputs key gets one stable tag, inputs-<key>. A run whose
+# key has that tag pushes nothing. Otherwise it builds fresh, pushes, attests that build's own
+# digest, and only then points the stable tag at the same digest. Nothing here deletes an image.
 #
-# Until a new image is published and its digest PR merges, runners refuse a checkout whose image
-# inputs changed (stale inputs key).
+# Runners (tests/bugbash/sandbox/runner.ts) look up the stable tag of their checkout's key and
+# accept it only with this workflow's attestation from main. Without one they build the image
+# from their own checkout, so a pull request that changes an image input passes before the merge.
 name: Bug-bash sandbox image
 
 on:
+  # The image inputs (build.sh --key) and this file: a change here publishes the current key once.
+  push:
+    branches: [main]
+    paths:
+      - tests/bugbash/sandbox/Dockerfile
+      - tests/bugbash/sandbox/build.sh
+      - bun.lock
+      - .github/workflows/bugbash-sandbox-image.yml
   pull_request:
     paths:
       - tests/bugbash/sandbox/Dockerfile
@@ -18,6 +28,7 @@ on:
       - bun.lock
       - Makefile
       - .github/workflows/bugbash-sandbox-image.yml
+  # A re-run on main, for example after a failed publish.
   workflow_dispatch: {}
 
 permissions: {}
@@ -46,13 +57,15 @@ jobs:
 
   publish:
     name: Publish
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    # A push to main or a manual run on main, never a pull request. The concurrency group above
+    # runs one publish at a time and never cancels it, so two pushes of one key cannot both push.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      # Push ghcr.io/coder/xum-bugbash-sandbox. Only this job, only a manual run on main.
+      # Push ghcr.io/coder/xum-bugbash-sandbox. Only this job, only on main.
       packages: write
-      # Build provenance for audit (the runner trusts the digest in image.json).
+      # Build provenance: runners verify it before they use the stable tag's digest.
       id-token: write
       attestations: write
     steps:
@@ -69,20 +82,63 @@ jobs:
       - name: Build and push
         id: push
         run: |
-          make -s bugbash-sandbox-publish > image.json
-          # The subject of the attestation is this build's own output (image.json).
-          echo "image=$(jq -er .image image.json)" >> "$GITHUB_OUTPUT"
-          echo "digest=$(jq -er .digest image.json)" >> "$GITHUB_OUTPUT"
+          # Create if missing: a key whose stable tag exists pushes nothing and sets no outputs.
+          # "not found" is the only lookup error that means missing: any other error fails the job.
+          key=$(make -s bugbash-sandbox-key)
+          tag="ghcr.io/coder/xum-bugbash-sandbox:inputs-$key"
+          if docker buildx imagetools inspect "$tag" > /dev/null 2> "$RUNNER_TEMP/inspect.err"; then
+            echo "\`$tag\` exists: nothing to publish." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if ! grep -q ': not found$' "$RUNNER_TEMP/inspect.err"; then
+            cat "$RUNNER_TEMP/inspect.err" >&2
+            exit 1
+          fi
+          record="$RUNNER_TEMP/publish.json"
+          make -s bugbash-sandbox-publish > "$record"
+          # The subject of the attestation is this build's own output (the publish record).
+          # Assignments, not $(...) inside echo: a failed jq must fail the step, or an empty
+          # digest would skip Attest.
+          image=$(jq -er .image "$record")
+          digest=$(jq -er .digest "$record")
           {
-            echo '### tests/bugbash/sandbox/image.json'
+            echo "image=$image"
+            echo "digest=$digest"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo '### Publish record'
             echo
             echo '```json'
-            cat image.json
+            cat "$record"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Attest
+        # Skipped when the key already had an image: the push step set no subject.
+        if: steps.push.outputs.digest != ''
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+          # Runners verify the attestation bundle in GHCR and read no artifact storage record.
+          # Creating one needs artifact-metadata: write, and without it the action warns.
+          create-storage-record: false
+      # The stable tag marks the key as published, so it comes only after the attestation: a failed
+      # Attest leaves no tag, and a re-run builds and attests again instead of skipping the key.
+      - name: Tag inputs-<key>
+        if: steps.push.outputs.digest != ''
+        env:
+          TAG: ${{ steps.push.outputs.tag }}
+          REF: ${{ steps.push.outputs.image }}@${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          # --prefer-index=false copies the manifest as it is. The default wraps a single manifest
+          # in a new index, whose digest the attestation does not name.
+          docker buildx imagetools create --prefer-index=false --tag "$TAG" "$REF"
+          got=$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' "$TAG" | jq -er .)
+          if [ "$got" != "$DIGEST" ]; then
+            echo "::error::$TAG has digest $got, not the attested $DIGEST"
+            exit 1
+          fi
+          echo "Stable tag: \`$TAG\` names the attested \`$DIGEST\`." >> "$GITHUB_STEP_SUMMARY"

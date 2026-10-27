@@ -5,10 +5,16 @@ import { setupSimpleChatStory } from "@/browser/stories/helpers/chatSetup";
 import { createAssistantMessage, createUserMessage } from "@/browser/stories/mocks/messages";
 import { createTerminalTool } from "@/browser/stories/mocks/tools";
 import { STABLE_TIMESTAMP } from "@/browser/stories/mocks/workspaces";
+import { openChatActivityPanel } from "@/browser/stories/storyPlayHelpers";
 
 const meta = {
   ...appMeta,
   title: "App/Chat/Components/BackgroundProcesses",
+};
+
+// The bashes chip starts closed; the pending-wake stories snapshot its open list.
+const openBashesPanel: AppStory["play"] = async ({ canvasElement }) => {
+  await openChatActivityPanel(canvasElement, "BackgroundProcessesBanner");
 };
 
 export default meta;
@@ -164,6 +170,7 @@ export const MonitorWakePendingAfterExit: AppStory = {
       },
     },
   },
+  play: openBashesPanel,
 };
 
 export const MonitorLostWakePendingAfterRestart: AppStory = {
@@ -223,6 +230,7 @@ export const MonitorLostWakePendingAfterRestart: AppStory = {
       },
     },
   },
+  play: openBashesPanel,
 };
 
 const NAMED_PROCESS = "Background calls, one every 5 s";
@@ -274,7 +282,8 @@ export const OutputDialogHeading: AppStory = {
   parameters: { ...appMeta.parameters, pixel: PIXEL_DISABLED },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await userEvent.click(await canvas.findByText(/background bashes/));
+    // The bashes chip in the composer's live line opens the list.
+    await userEvent.click(await canvas.findByRole("button", { name: /background bashes/ }));
     const body = within(canvasElement.ownerDocument.body);
 
     const viewButtons = await canvas.findAllByRole("button", { name: "View output" });

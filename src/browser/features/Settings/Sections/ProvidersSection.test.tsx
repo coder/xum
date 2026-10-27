@@ -488,7 +488,7 @@ describe("ProvidersSection", () => {
       });
     });
     await waitFor(() => {
-      expect(view.queryByRole("button", { name: "Add custom provider" })).toBeNull();
+      expect(view.queryByRole("button", { name: "Add custom provider" }) === null).toBe(true);
     });
     expect(view.getByRole("button", { name: "Add provider" })).toBeTruthy();
   });
@@ -511,7 +511,7 @@ describe("ProvidersSection", () => {
       expect(view.addCustomProvider).toHaveBeenCalled();
     });
     await waitFor(() => {
-      expect(view.queryByRole("button", { name: "Add custom provider" })).toBeNull();
+      expect(view.queryByRole("button", { name: "Add custom provider" }) === null).toBe(true);
     });
     expect(view.queryByText("Failed to add custom provider.")).toBeNull();
     expect(
@@ -724,7 +724,7 @@ describe("ProvidersSection", () => {
       expect(view.removeCustomProvider).toHaveBeenCalledWith({ provider: CUSTOM_PROVIDER_ID });
     });
     await waitFor(() => {
-      expect(view.queryByRole("button", { name: /Acme OpenAI/ })).toBeNull();
+      expect(view.queryByRole("button", { name: /Acme OpenAI/ }) === null).toBe(true);
     });
     expect(
       await view.findByText(

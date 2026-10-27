@@ -67,7 +67,10 @@ describe("getProjectAvatarColors", () => {
 
 describe("getHashedProjectColor", () => {
   test("is stable per name and spreads different names apart", () => {
-    expect(getHashedProjectColor("coder")).toBe(getHashedProjectColor("coder"));
+    // Pinned: a project without a configured color keeps its avatar across loads and releases,
+    // so a change to the hash or the base tone recolors every such project.
+    expect(getHashedProjectColor("coder")).toBe("#8d8ee0");
+    expect(getHashedProjectColor("xum")).toBe("#c17cbd");
     const colors = new Set(["coder", "xum", "dogfood", "docs", "infra"].map(getHashedProjectColor));
     expect(colors.size).toBe(5);
     expect(colors.has(DEFAULT_SECTION_COLOR)).toBe(false);

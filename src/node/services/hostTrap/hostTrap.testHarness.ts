@@ -31,6 +31,10 @@ export interface HostTrapRow {
   arg: string;
   /** The first src/ or tests/ stack frame outside this file. */
   site: string;
+  /** For an fd argument: the path that opened the fd while the trap was armed. */
+  fdPath?: string;
+  /** The second path of a two-path fs call (rename, copyFile, link, symlink, cp). */
+  arg2?: string;
 }
 
 export interface HostTrap {
@@ -87,6 +91,8 @@ function callSite(): string {
 function createTrap(installedBeforeSetup: boolean) {
   const rows: HostTrapRow[] = [];
   const open = new Map<number, string>();
+  // The path of each fd opened while armed. An fd opened before arm() has none.
+  const fdPaths = new Map<number, string>();
   let armed = false;
   let recording = false;
   let nextId = 1;
@@ -94,12 +100,19 @@ function createTrap(installedBeforeSetup: boolean) {
   const realSetImmediate = globalThis.setImmediate;
 
   /** Adds a row and returns its id, or null when the trap is not armed. */
-  function record(api: string, arg: unknown): number | null {
+  function record(api: string, arg: unknown, arg2?: unknown): number | null {
     if (!armed || recording) return null;
     // A host call inside the bookkeeping below must not record itself.
     recording = true;
     try {
-      rows.push({ api, arg: argText(arg), site: callSite() });
+      const fdPath = typeof arg === "number" ? fdPaths.get(arg) : undefined;
+      rows.push({
+        api,
+        arg: argText(arg),
+        site: callSite(),
+        ...(fdPath === undefined ? {} : { fdPath }),
+        ...(arg2 === undefined ? {} : { arg2: argText(arg2) }),
+      });
       return nextId++;
     } finally {
       recording = false;
@@ -112,6 +125,11 @@ function createTrap(installedBeforeSetup: boolean) {
     const id = nextId++;
     open.set(id, what);
     return id;
+  }
+
+  /** Remembers the path of an fd that a recorded open returned. */
+  function noteFd(id: number | null, fd: unknown, openedPath: unknown): void {
+    if (id !== null && typeof fd === "number") fdPaths.set(fd, argText(openedPath));
   }
 
   function openUntil(id: number | null, what: string, done: PromiseLike<unknown>): void {
@@ -135,6 +153,7 @@ function createTrap(installedBeforeSetup: boolean) {
     arm() {
       rows.length = 0;
       open.clear();
+      fdPaths.clear();
       armed = true;
     },
     disarm() {
@@ -151,10 +170,13 @@ function createTrap(installedBeforeSetup: boolean) {
     },
     installedBeforeSetup,
   };
-  return { trap, record, track, openUntil, openUntilEvent, open };
+  return { trap, record, track, noteFd, openUntil, openUntilEvent, open };
 }
 
 type Recorder = ReturnType<typeof createTrap>;
+
+/** fs calls whose second argument is a path too. */
+const TWO_PATH_FUNCTIONS = /^(rename|copyFile|link|symlink|cp)(Sync)?$/;
 
 /** Child-process functions that return a ChildProcess, which emits "close". */
 const CHILD_FUNCTIONS = new Set(["spawn", "exec", "execFile", "fork"]);
@@ -162,8 +184,11 @@ const CHILD_FUNCTIONS = new Set(["spawn", "exec", "execFile", "fork"]);
 function wrapFunction(rec: Recorder, original: AnyFunction, api: string, promiseApi: boolean) {
   const name = api.slice(api.indexOf(".") + 1);
   const wrapped = function (this: unknown, ...args: unknown[]): unknown {
-    const id = rec.record(api, args[0]);
-    if (id !== null && !promiseApi && !name.endsWith("Sync")) {
+    const twoPaths = api.startsWith("fs") && TWO_PATH_FUNCTIONS.test(name);
+    const id = rec.record(api, args[0], twoPaths ? args[1] : undefined);
+    // fs.watch takes an event listener, not a completion callback: the watcher is open until
+    // it closes (below).
+    if (id !== null && !promiseApi && !name.endsWith("Sync") && api !== "fs.watch") {
       // Callback form (fs.readFile(path, cb)): open until the callback runs.
       const at = args.findLastIndex(isFunction);
       if (at >= 0) {
@@ -171,11 +196,13 @@ function wrapFunction(rec: Recorder, original: AnyFunction, api: string, promise
         rec.open.set(id, api);
         args[at] = function (this: unknown, ...results: unknown[]) {
           rec.open.delete(id);
+          if (api === "fs.open" && results[0] == null) rec.noteFd(id, results[1], args[0]);
           return callback.apply(this, results);
         };
       }
     }
     const result = original.apply(this, args);
+    if (api === "fs.openSync") rec.noteFd(id, result, args[0]);
     if (api === "fs.createWriteStream") wrapStreamWrite(rec, result, args[0]);
     if (id === null) return result;
     if (api === "fsp.open" && isThenable(result)) {
@@ -183,7 +210,8 @@ function wrapFunction(rec: Recorder, original: AnyFunction, api: string, promise
       rec.open.set(id, `FileHandle ${argText(args[0])}`);
       result.then(
         (handle) => {
-          const fileHandle = handle as { close: AnyFunction };
+          const fileHandle = handle as { close: AnyFunction; fd: number };
+          rec.noteFd(id, fileHandle.fd, args[0]);
           const close = fileHandle.close;
           fileHandle.close = function (this: unknown, ...closeArgs: unknown[]) {
             const closed = close.apply(this, closeArgs);
@@ -206,7 +234,7 @@ function wrapFunction(rec: Recorder, original: AnyFunction, api: string, promise
       // Bun.spawn: open until the child exits.
       rec.openUntil(id, api, exited);
     } else if (
-      /^fs\.create(Read|Write)Stream$/.test(api) ||
+      /^fs\.(create(Read|Write)Stream|watch)$/.test(api) ||
       (api.startsWith("cp.") && CHILD_FUNCTIONS.has(name))
     ) {
       const emitter = result as { once(event: string, listener: () => void): unknown };

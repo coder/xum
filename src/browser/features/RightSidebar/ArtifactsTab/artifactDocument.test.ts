@@ -7,10 +7,10 @@ import type { ArtifactReadResult } from "@/common/orpc/schemas/artifacts";
 import { ARTIFACT_ASSET_LIMITS, createArtifactAssetLoader } from "./artifactAssets";
 import { buildArtifactCsp, isArtifactCdnUrl } from "./artifactCsp";
 import {
-  buildSandboxedHtmlDocument,
   buildSandboxedSvgDocument,
   finalizeSandboxedDocument,
   inlineArtifactHtmlAssets,
+  isUnstyledHtmlDocument,
   parseArtifactHtml,
 } from "./artifactDocument";
 
@@ -20,6 +20,25 @@ const OPTIONS = { csp: CSP, bridgeScript: "/*bridge*/" };
 function firstHeadChildren(srcdoc: string) {
   const doc = new window.DOMParser().parseFromString(srcdoc, "text/html");
   return Array.from(doc.head.children);
+}
+
+/** The host's text-size-adjust style precedes every artifact style, so artifact rules win. */
+function expectTextSizeAdjustBeforeArtifactStyles(srcdoc: string) {
+  const doc = new window.DOMParser().parseFromString(srcdoc, "text/html");
+  const [host, ...artifactStyles] = Array.from(
+    doc.querySelectorAll('style, link[rel~="stylesheet"]')
+  );
+  expect(artifactStyles.length).toBeGreaterThan(0);
+  expect(host?.tagName).toBe("STYLE");
+  expect(host?.parentElement).toBe(doc.head);
+  expect(host?.previousElementSibling).not.toBeNull();
+  // Unlayered, it would outrank artifact rules declared inside @layer.
+  expect(host?.textContent).toMatch(/^@layer\s*\{\s*:where\(html\)\s*\{[^}]*\}\s*\}$/);
+  // iOS WebKit, where the autosizing happens, needs the -webkit- prefixed property.
+  expect(host?.textContent).toMatch(/:where\(html\)\s*\{[^}]*-webkit-text-size-adjust:\s*100%/);
+  expect(host?.textContent).toMatch(
+    /:where\(html\)\s*\{[^}]*(?<!-webkit-)text-size-adjust:\s*100%/
+  );
 }
 
 function expectCspFirst(srcdoc: string) {
@@ -58,7 +77,13 @@ describe("isArtifactCdnUrl", () => {
   });
 });
 
-describe("buildSandboxedHtmlDocument", () => {
+// Production parses the artifact HTML, inlines its assets, then finalizes it
+// (SandboxedArtifactFrame, McpAppFrame): the CSP contract belongs to the finalize step.
+function finalizeHtml(html: string): string {
+  return finalizeSandboxedDocument(parseArtifactHtml(html), OPTIONS);
+}
+
+describe("finalizeSandboxedDocument", () => {
   let cleanupDom: (() => void) | null = null;
   beforeEach(() => {
     cleanupDom = installDom();
@@ -78,14 +103,26 @@ describe("buildSandboxedHtmlDocument", () => {
       "",
       "<!-- comment --><html lang=en>text",
     ]) {
-      const srcdoc = buildSandboxedHtmlDocument(html, OPTIONS);
+      const srcdoc = finalizeHtml(html);
       expect(srcdoc.startsWith("<!DOCTYPE html>\n<html")).toBe(true);
       expectCspFirst(srcdoc);
     }
   });
 
+  test("adds a text-size-adjust style that artifact styles override", () => {
+    for (const html of [
+      "<head><style>p{color:red}</style></head><p>x</p>",
+      "<style>p{color:red}</style><link rel=stylesheet href='https://unpkg.com/x.css'>",
+      "<p>x</p><style>body{font-size:13px}</style>",
+    ]) {
+      const srcdoc = finalizeHtml(html);
+      expectCspFirst(srcdoc);
+      expectTextSizeAdjustBeforeArtifactStyles(srcdoc);
+    }
+  });
+
   test("keeps the artifact's own markup", () => {
-    const srcdoc = buildSandboxedHtmlDocument("<h1 id=t>Hello</h1>", OPTIONS);
+    const srcdoc = finalizeHtml("<h1 id=t>Hello</h1>");
     const doc = new window.DOMParser().parseFromString(srcdoc, "text/html");
     expect(doc.getElementById("t")?.textContent).toBe("Hello");
   });
@@ -97,8 +134,36 @@ describe("buildSandboxedHtmlDocument", () => {
     );
     expect(srcdoc).not.toBeNull();
     expectCspFirst(srcdoc!);
+    expectTextSizeAdjustBeforeArtifactStyles(srcdoc!);
     expect(srcdoc).toContain("<circle");
     expect(buildSandboxedSvgDocument("<html><body>nope</body></html>", OPTIONS)).toBeNull();
+  });
+});
+
+describe("isUnstyledHtmlDocument", () => {
+  let cleanupDom: (() => void) | null = null;
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+  afterEach(() => {
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  // Only a page whose every color is a browser default can take the theme's color scheme:
+  // any color of its own (or a graphic) could end up dark on a dark canvas.
+  test.each<[string, boolean]>([
+    ["<h1>Status</h1><p>All <a href='#x'>good</a></p><ul><li>one</li></ul>", true],
+    ["<style>p { color: #333 }</style><p>hi</p>", false],
+    ["<link rel='stylesheet' href='theme.css'><p>hi</p>", false],
+    ["<p style='color: black'>hi</p>", false],
+    ["<body bgcolor='white'><p>hi</p></body>", false],
+    ["<p><font color='black'>hi</font></p>", false],
+    ["<script>document.body.append('built at runtime')</script>", false],
+    ["<p>chart</p><svg viewBox='0 0 4 4'><circle r='2'/></svg>", false],
+    ["<p>chart</p><img src='chart.png'>", false],
+  ])("%s -> %p", (html, expected) => {
+    expect(isUnstyledHtmlDocument(parseArtifactHtml(html))).toBe(expected);
   });
 });
 
@@ -240,7 +305,10 @@ describe("inlineArtifactHtmlAssets", () => {
     );
     expect(scripts).toHaveLength(1);
     expect(scripts[0]?.textContent).toContain("window.ok = 1;");
-    expect(reparsed.querySelectorAll("style")).toHaveLength(1);
+    const styles = Array.from(reparsed.querySelectorAll("style")).filter(
+      (s) => !(s.textContent ?? "").includes(":where(html)")
+    );
+    expect(styles).toHaveLength(1);
     expect(reparsed.querySelector("b, i")).toBeNull();
   });
 

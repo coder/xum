@@ -387,11 +387,20 @@ span.search-highlight {
   transition: opacity 0.2s;
 }
 
-.code-block-wrapper:hover .code-run-button {
-  opacity: 1;
+/* Revealed on hover only where hover exists. Touch screens have no hover, so the buttons stay
+   visible there; a reveal on a tap's :hover made iOS drop that tap's click. */
+@media (hover: hover) {
+  .code-block-wrapper:hover .code-run-button,
+  .code-block-wrapper:hover .code-copy-button {
+    opacity: 1;
+  }
 }
-.code-block-wrapper:hover .code-copy-button {
-  opacity: 1;
+
+@media (hover: none) {
+  .code-run-button,
+  .code-copy-button {
+    opacity: 1;
+  }
 }
 
 /* Single-line code block: inline copy button at top-right */

@@ -10,6 +10,7 @@ import {
   TOOL_DEFINITIONS,
   WorkflowRunToolArgsSchema,
 } from "./toolDefinitions";
+import { AskUserQuestionToolArgsSchema as LightAskUserQuestionToolArgsSchema } from "./askUserQuestionSchemas";
 
 describe("TOOL_DEFINITIONS", () => {
   it("accepts custom subagent_type IDs (deprecated alias)", () => {
@@ -348,6 +349,44 @@ describe("TOOL_DEFINITIONS", () => {
     }
   });
 
+  it("derives display_name from the script when a bash call omits it", () => {
+    // Haiku 5.5 often omits display_name; a rejection wastes one model step.
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({
+      script: "\n  git status --short  \necho done",
+      timeout_secs: 60,
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.display_name).toBe("git status --short");
+    }
+  });
+
+  it("falls back to the default display_name for a whitespace-only script", () => {
+    const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({
+      script: "  \n\t\n",
+      timeout_secs: 60,
+      display_name: null,
+    });
+
+    expect(parsed.success).toBe(true);
+    if (parsed.success) {
+      expect(parsed.data.display_name).toBe("bash");
+    }
+  });
+
+  it("still rejects bash calls without timeout_secs, foreground or background", () => {
+    // Only display_name is filled: a default timeout could kill a long command
+    // partway, while a rejection runs nothing and the model retries.
+    for (const run_in_background of [false, true]) {
+      const parsed = TOOL_DEFINITIONS.bash.schema.safeParse({ script: "ls", run_in_background });
+      expect(parsed.success).toBe(false);
+      if (!parsed.success) {
+        expect(parsed.error.issues.map((issue) => issue.path.join("."))).toEqual(["timeout_secs"]);
+      }
+    }
+  });
+
   it("validates heartbeat tool configuration bounds", () => {
     expect(TOOL_DEFINITIONS.heartbeat.schema.safeParse({ action: "get" }).success).toBe(true);
     expect(
@@ -576,6 +615,13 @@ describe("TOOL_DEFINITIONS", () => {
       expect(schema.safeParse({ ...validArgs, isolation: "fork" }).success).toBe(true);
       expect(schema.safeParse({ ...validArgs, isolation: "sandbox" }).success).toBe(false);
     });
+  });
+
+  // The renderer's open-question selector (openAskUserQuestions.ts) and the aggregator's
+  // truncation rule parse args with the light module's schema (kept out of the main chunk,
+  // #7363); it must stay the schema the tool itself validates with.
+  it("ask_user_question validates with the light askUserQuestionSchemas module's schema", () => {
+    expect(TOOL_DEFINITIONS.ask_user_question.schema).toBe(LightAskUserQuestionToolArgsSchema);
   });
 
   it("accepts ask_user_question headers longer than 12 characters", () => {

@@ -6,9 +6,11 @@ import { z } from "zod";
 import { KNOWN_MODELS } from "@/common/constants/knownModels";
 import { StreamEndEventSchema } from "@/common/orpc/schemas/stream";
 import { Ok, Err } from "@/common/types/result";
-import { StreamManager, type ModelFallbackPrepareOptions } from "./streamManager";
+import type { ModelFallbackPrepareOptions } from "./streamManager";
 import type { MuxMessage } from "@/common/types/message";
 import { HistoryService } from "./historyService";
+import { acquireProcessFileLock } from "@/node/utils/concurrency/fileLock";
+import { historyWriteLockPath } from "./workspaceRemoval";
 import type { SessionUsageService } from "./sessionUsageService";
 import { countTokens } from "@/node/utils/main/tokenizer";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
@@ -28,6 +30,8 @@ import {
   createStreamResultForTests,
   createStreamInfoForTests,
   runTurnForTests,
+  scriptedStreamText,
+  STOP_FINISH,
 } from "./streamManager.suite.testHarness";
 
 installStreamManagerTestHistory();
@@ -87,26 +91,52 @@ describe("StreamManager - exact step indices", () => {
     // The trailing empty step start is not persisted.
     expect(committed?.metadata?.stepStartPartIndices).toEqual([0, 1]);
   });
+});
 
-  // The preserve-parts reset is proven publicly by errorRecovery's step-boundary
-  // previousResponseId retry, which commits stepStartPartIndices [0, 1].
-  test("retry reset discards step indices together with discarded parts", async () => {
-    const streamManager = new StreamManager(historyService);
-    const streamInfo = createStreamInfoForTests({
-      parts: [{ type: "text", text: "discarded", timestamp: 1 }],
-      stepStartIndices: [0, 1, 3],
+// #7499: StreamRetries.test.ts owns the retry reset; this checks the conditional delete it uses.
+describe("StreamManager - the retry's partial delete holds the history write lock (#7499)", () => {
+  const workspaceId = "retry-partial-workspace";
+  const partialOf = (id: string): MuxMessage => ({
+    id,
+    role: "assistant",
+    parts: [{ type: "text", text: `partial of ${id}` }],
+    metadata: { historySequence: 1 },
+  });
+
+  test("a foreign backend's replacement between the check and the unlink survives", async () => {
+    await historyService.writePartial(workspaceId, partialOf("this-message"));
+    // This test plays the foreign backend: it holds the cross-process history write lock that
+    // partial writes take, and replaces partial.json while the delete (deleteForRetry's
+    // conditional delete) waits.
+    const lockPath = historyWriteLockPath(historyConfig.rootDir, workspaceId);
+    const foreignLock = await acquireProcessFileLock({
+      lockPath,
+      timeoutMs: 5_000,
+      label: "foreign history write lock",
     });
-    const reset = engineInternals(streamManager).resetStreamStateForRetry;
-    await reset.call(streamManager, "step-reset-workspace", streamInfo, { preserveParts: false });
-    expect(streamInfo.stepStartIndices).toEqual([0]);
-    expect(streamInfo.currentStepStartIndex).toBe(0);
-    const buildPartial = engineInternals(streamManager).buildPartialAssistantMessage;
-    const partial = buildPartial.call(streamManager, streamInfo);
-    expect(partial.metadata?.stepStartPartIndices).toEqual([]);
-    await historyService.writePartial("step-reset-workspace", partial);
-    expect(
-      (await historyService.readPartial("step-reset-workspace"))?.metadata?.stepStartPartIndices
-    ).toEqual([]);
+    const locks = historyService.locks;
+    const acquire = locks.acquireProcessFileLock.bind(locks);
+    let markWaiting = () => undefined as void;
+    const waiting = new Promise<void>((resolve) => (markWaiting = resolve));
+    const lockSpy = spyOn(locks, "acquireProcessFileLock").mockImplementation((options) => {
+      if (options.lockPath === lockPath) markWaiting();
+      return acquire(options);
+    });
+    try {
+      const deleted = historyService.deletePartialIfMessageIdMatches(workspaceId, "this-message");
+      // Without the lock the delete never waits: it finishes first and deletes this partial,
+      // before the replacement below.
+      await Promise.race([waiting, deleted]);
+      nodeFs.writeFileSync(
+        path.join(historyConfig.sessionsDir, workspaceId, "partial.json"),
+        JSON.stringify(partialOf("other-message"))
+      );
+      await foreignLock[Symbol.asyncDispose]();
+      expect(await deleted).toEqual(Ok(false));
+    } finally {
+      lockSpy.mockRestore();
+    }
+    expect((await historyService.readPartial(workspaceId))?.id).toBe("other-message");
   });
 });
 
@@ -332,6 +362,26 @@ describe("StreamManager - empty stream completions", () => {
     // dedicated sidecar tests) so a later commit cannot double-count.
     expect(partial?.metadata?.usage).toBeUndefined();
     expect(partial?.metadata?.providerMetadata).toEqual({ openai: { cached_tokens: 2 } });
+  });
+
+  test("an empty-output retry forgets the empty attempt's finish", async () => {
+    // The empty attempt ended with a finish event. The retried attempt closes
+    // without one, so it must still fail as truncated, not complete.
+    const usage = { inputTokens: 3, outputTokens: 0, totalTokens: 3 };
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
+        { chunks: [STOP_FINISH], usage },
+        { chunks: [{ type: "text-delta", text: "partial answer" }], usage },
+      ]),
+    });
+    const workspaceId = "empty-retry-truncated-workspace";
+
+    const { completion } = await runTurnForTests(streamManager, { workspaceId });
+
+    expect(completion.status).toBe("failed");
+    const partial = await historyService.readPartial(workspaceId);
+    expect(partial?.metadata?.errorType).toBe("stream_truncated");
+    expect(partial?.parts).toMatchObject([{ type: "text", text: "partial answer" }]);
   });
 
   test("persists retryable partial error when a non-empty stream closes before finish", async () => {
@@ -1644,5 +1694,67 @@ describe("StreamManager - empty stream completions", () => {
 
     const partial = await historyService.readPartial(workspaceId);
     expect(partial?.metadata?.errorType).toBe("model_refusal");
+  });
+});
+
+describe("StreamManager - stream start", () => {
+  const answered = {
+    chunks: [{ type: "text-delta", text: "answer" }, STOP_FINISH],
+    usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+  };
+
+  test("stream-start carries the turn's history sequence", async () => {
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([answered]),
+    });
+    const starts: Array<{ historySequence?: number }> = [];
+    onTurnEngineEvent(streamManager, "stream-start", (data) => starts.push(data));
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "stream-start-history-sequence",
+      historySequence: 7,
+    });
+    expect(completion.status).toBe("completed");
+    expect(starts.map((start) => start.historySequence)).toEqual([7]);
+  });
+
+  test("the live token tracker counts the turn's model from stream start", async () => {
+    const setModel = mock((_model: string, _metadataModel?: string) => Promise.resolve());
+    const streamManager = createStreamManagerForTests(historyService, {
+      tokenTracker: { setModel, countTokens: () => Promise.resolve(0) },
+      streamText: scriptedStreamText([answered]),
+    });
+    const { completion } = await runTurnForTests(streamManager, {
+      workspaceId: "stream-start-token-tracker",
+      modelString: KNOWN_MODELS.SONNET.id,
+    });
+    expect(completion.status).toBe("completed");
+    expect(setModel.mock.calls[0]?.[0]).toBe(KNOWN_MODELS.SONNET.id);
+  });
+
+  test("a running turn reports streaming, and a failed one reports error while it settles", async () => {
+    // isStreaming() reads this state: queued sends wait while a turn streams, and
+    // a failing turn must stop counting as streaming before its error event.
+    const workspaceId = "stream-state-lifecycle";
+    const streamManager = createStreamManagerForTests(historyService, {
+      streamText: scriptedStreamText([
+        {
+          chunks: [
+            { type: "text-delta", text: "partial" },
+            () => Promise.reject(new Error("provider exploded")),
+          ],
+        },
+      ]),
+    });
+    const states: string[] = [];
+    onTurnEngineEvent(streamManager, "stream-start", () =>
+      states.push(`start:${streamManager.getStreamState(workspaceId)}`)
+    );
+    onTurnEngineEvent(streamManager, "error", () =>
+      states.push(`error:${streamManager.getStreamState(workspaceId)}`)
+    );
+
+    const { completion } = await runTurnForTests(streamManager, { workspaceId });
+    expect(completion.status).toBe("failed");
+    expect(states).toEqual(["start:streaming", "error:error"]);
   });
 });

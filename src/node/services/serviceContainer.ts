@@ -9,6 +9,7 @@ import {
   replayPendingArtifactInteractions,
 } from "@/node/services/artifactInteractions";
 import { log } from "@/node/services/log";
+import { installBrotliResponseGuard } from "@/node/utils/network/brotliResponseGuard";
 import type { Config, ConfigStores, WorkspaceSessionLocator } from "@/node/config";
 import type { FileLeaseManager, ProvidersConfigStore, SecretsStore } from "@/node/config";
 import { SLOW_STARTUP_WARN_THRESHOLD_MS } from "@/constants/startup";
@@ -320,6 +321,8 @@ export class ServiceContainer {
   private disposePromise: Promise<void> | null = null;
 
   constructor(stores: ConfigStores) {
+    // Desktop, `xum server` and ACP all build this before any service can fetch (#7358).
+    installBrotliResponseGuard();
     // Built eagerly and synchronously: a layer body that throws fails the
     // constructor, like any service constructor did before the graph existed.
     this.runtime = makeAppRuntime(AppLive(stores));
@@ -460,6 +463,13 @@ export class ServiceContainer {
     // Bash commands that outlived a restart still hold the proxy URL and key: bind the saved
     // port again before clients connect. Best-effort: a proxy problem never blocks startup.
     { name: "bashAiProxy.restore", run: () => this.bashAiProxy.restore(), bestEffort: true },
+    // #7621: a trust change from `xum trust` or another config.json writer drops the remote
+    // plugin snapshots. Never throws (best-effort anyway).
+    {
+      name: "projectService.watchProjectTrust",
+      run: () => Promise.resolve(this.projectService.watchProjectTrust()),
+      bestEffort: true,
+    },
     // Before task recovery, so commands of recovered tasks start under the agent resource limit.
     // Best-effort: a limit that cannot apply is reported in Settings and never blocks startup.
     {
@@ -947,7 +957,7 @@ export class ServiceContainer {
       }
     });
     // Interrupt and await the runtime's supervised fibers — the stream engine's
-    // per-stream supervisors (StreamManager.superviseEngine): every in-flight
+    // per-stream scopes (TurnRegistry.superviseEngine): every in-flight
     // stream is aborted as "system" and its partial committed to chat.jsonl —
     // while every dependency they touch during finalization is still alive.
     // Fixed here (before the explicit teardown) so clients still receive the

@@ -1099,7 +1099,8 @@ const DOCK_ALIGNMENT_MESSAGES = [
   }),
 ];
 
-// Renders a ChatInputDecoration, so the assertions cover a decoration and not only the composer.
+// Renders a chip in the composer's live line, so the assertions cover the line and not only the
+// composer.
 const DOCK_ALIGNMENT_BACKGROUND_PROCESS = {
   id: "bash_1",
   pid: 4242,
@@ -1140,9 +1141,9 @@ async function assertDockSurfacesMatchTranscript(
     surfaces.push([label, element]);
   };
   addSurface("composer", '[data-component="ChatInputSurface"]');
-  // The background-process decoration can mount after the composer autofocuses.
+  // The background-process chip can mount after the composer autofocuses.
   await waitFor(() =>
-    addSurface("decoration", '[data-component="ChatInputDecorationStack"] button')
+    addSurface("activity line", '[data-component="ChatActivityLine"]:has([data-activity-chip])')
   );
   const wrapped = storyRoot.querySelectorAll<HTMLElement>('[data-component="ChatDockSurface"]');
   if (wrapped.length === 0) throw new Error("No ChatDockSurface-wrapped entry rendered");

@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test types `await expect(...).rejects.toThrow()` as void */
 import { describe, expect, test } from "bun:test";
 import { promisify } from "node:util";
 import {
@@ -117,7 +118,7 @@ describe("timedTimeout", () => {
   test("records a timer of 1 ms or more from the call to the fire, with its arguments", () => {
     const seen: Interval[] = [];
     const fired: unknown[][] = [];
-    const queued: Array<() => void> = [];
+    const queued: (() => void)[] = [];
     const fakeSetTimeout = (
       handler: (...args: unknown[]) => void,
       _ms?: number,
@@ -135,7 +136,7 @@ describe("timedTimeout", () => {
     const seen: Interval[] = [];
     const custom = (_ms: number, value?: unknown) => Promise.resolve(value);
     const fake = Object.assign(() => 0, { [promisify.custom]: custom });
-    const sleep = promisify(timedTimeout(fake, (i) => seen.push(i), clock(5, 9))) as typeof custom;
+    const sleep = promisify(timedTimeout(fake, (i) => seen.push(i), clock(5, 9)));
     expect(await sleep(0, "yield")).toBe("yield");
     expect(await sleep(4, "wait")).toBe("wait");
     expect(seen).toEqual([[5, 9]]);
@@ -196,7 +197,7 @@ describe("timedInterval", () => {
   test("each fire of an interval of 1 ms or more records since the call or the fire before", () => {
     const seen: Interval[] = [];
     const fired: unknown[][] = [];
-    const handlers: Array<(...args: unknown[]) => void> = [];
+    const handlers: ((...args: unknown[]) => void)[] = [];
     const fakeSetInterval = (handler: (...args: unknown[]) => void, _ms?: number) =>
       handlers.push(handler);
     const wrapped = timedInterval(fakeSetInterval, (i) => seen.push(i), clock(0, 10, 25));

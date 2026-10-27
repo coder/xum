@@ -37,12 +37,15 @@ import { shellQuote } from "@/common/utils/shell";
 import { getErrorMessage } from "@/common/utils/errors";
 import { PlatformPaths } from "@/common/utils/paths";
 import { PlatformPaths as NodePlatformPaths } from "@/node/utils/paths.main";
+import type { SessionLocks } from "@/node/services/sessionLocks/sessionLocks";
 import {
   getWorkspaceProjectRepos,
   getWorkspaceProjectStorageKeys,
 } from "@/node/services/workspaceProjectRepos";
 import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { taskGitPatchEngine } from "@/node/services/taskGitPatchEngine";
+// Outside the agent loop: GitPatchArtifactService passes the host's runtimes (nodeRuntimeFactory) to agent and skill reads.
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
 
 /** Callback invoked after patch generation completes (success or failure). */
 export type OnPatchGenerationComplete = (childWorkspaceId: string) => Promise<void>;
@@ -116,7 +119,7 @@ async function resolveAgentEditingCapability(args: {
         discovery.runtime,
         discovery.workspacePath,
         parsedAgentId.data,
-        { projectPluginsTrusted: args.projectPluginsTrusted }
+        { projectPluginsTrusted: args.projectPluginsTrusted, runtimeFactory: nodeRuntimeFactory }
       );
       const chain = await resolveAgentInheritanceChain({
         runtime: discovery.runtime,
@@ -125,6 +128,7 @@ async function resolveAgentEditingCapability(args: {
         agentDefinition,
         workspaceId: args.workspaceId,
         projectPluginsTrusted: args.projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
       });
 
       if (agentDefinition.scope === "project") {
@@ -318,7 +322,11 @@ export class GitPatchArtifactService {
   private readonly operationLocks = new MutexMap<string>();
   private readonly pendingJobsByTaskId = new Map<string, Promise<void>>();
 
-  constructor(private readonly config: Config) {}
+  constructor(
+    private readonly config: Config,
+    /** The workspace FIFO of the parent's patch artifact index writes (phase 4: SessionLocks). */
+    private readonly locks: SessionLocks
+  ) {}
 
   withOperationLock<T>(childWorkspaceId: string, operation: () => Promise<T>): Promise<T> {
     assert(childWorkspaceId.length > 0, "withOperationLock: childWorkspaceId must be non-empty");
@@ -452,6 +460,7 @@ export class GitPatchArtifactService {
 
     const artifact = await upsertSubagentGitPatchArtifact({
       workspaceId: parentWorkspaceId,
+      locks: this.locks,
       workspaceSessionDir: parentSessionDir,
       childTaskId: childWorkspaceId,
       updater: (existing) => {
@@ -501,6 +510,7 @@ export class GitPatchArtifactService {
           try {
             await upsertSubagentGitPatchArtifact({
               workspaceId: parentWorkspaceId,
+              locks: this.locks,
               workspaceSessionDir: parentSessionDir,
               childTaskId: childWorkspaceId,
               updater: (existing) => {
@@ -535,6 +545,7 @@ export class GitPatchArtifactService {
     } catch (error: unknown) {
       await upsertSubagentGitPatchArtifact({
         workspaceId: parentWorkspaceId,
+        locks: this.locks,
         workspaceSessionDir: parentSessionDir,
         childTaskId: childWorkspaceId,
         updater: (existing) => {
@@ -587,6 +598,7 @@ export class GitPatchArtifactService {
     ): Promise<SubagentGitPatchArtifact> => {
       return await upsertSubagentGitPatchArtifact({
         workspaceId: parentWorkspaceId,
+        locks: this.locks,
         workspaceSessionDir: parentSessionDir,
         childTaskId: childWorkspaceId,
         updater,
@@ -703,6 +715,8 @@ export class GitPatchArtifactService {
       });
 
       const projectRepos = getWorkspaceProjectRepos({
+        // Outside the agent loop: the host's runtimes.
+        runtimeFactory: nodeRuntimeFactory,
         workspaceId: childWorkspaceId,
         workspaceName,
         workspacePath,

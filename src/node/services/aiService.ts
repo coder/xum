@@ -15,7 +15,6 @@ import {
 } from "./agentPlugins/promptHooks";
 import * as path from "path";
 import { EventEmitter } from "events";
-import * as fs from "fs/promises";
 
 import assert from "@/common/utils/assert";
 import { type LanguageModel, type Tool } from "ai";
@@ -24,7 +23,6 @@ import type { ProvidersConfigMap, SendMessageOptions } from "@/common/orpc/types
 import type { Result } from "@/common/types/result";
 import { Err, Ok } from "@/common/types/result";
 import type { WorkspaceMetadata } from "@/common/types/workspace";
-import { ensurePrivateDir } from "@/node/utils/fs";
 import {
   TurnRequestBuilder,
   type LoopHostServices,
@@ -57,13 +55,10 @@ import {
   type Config,
   type WorkspaceMetadataOptions,
 } from "@/node/config";
-import { ContainerManager } from "@/node/multiProject/containerManager";
-import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
-import { createRuntime } from "@/node/runtime/runtimeFactory";
+import { nodeRuntimeFactory } from "@/node/services/runtimeFactory/nodeRuntimeFactory";
+import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
-  createRuntimeContextForWorkspace,
-  createRuntimeForWorkspace,
   resolveWorkspaceExecutionPath,
   resolveWorkspaceRootPath,
   type WorkspaceRuntimeContext,
@@ -110,6 +105,13 @@ import { validateJsonSchemaSubsetSchema } from "@/common/utils/jsonSchemaSubset"
 import { resolveModelForMetadata } from "@/common/utils/providers/modelEntries";
 import { WorkflowRunStore } from "@/node/services/workflows/WorkflowRunStore";
 import { MockAiStreamPlayer } from "./mock/mockAiStreamPlayer";
+import type { CompletedMessagePart } from "@/common/types/stream";
+import { needsStatusPageTurnEndNudge } from "./agentInterfaceStatusPage";
+import { isStatusPageAgentEnabledInSettings } from "./statusPageAgentService";
+import {
+  STATUS_PAGE_AGENT_TURN_END_NUDGE,
+  STATUS_PAGE_TURN_END_NUDGE,
+} from "@/common/utils/machineTurnPrompts";
 import { isMockAiMode } from "./mock/mockAiMode";
 import { ProviderModelFactory } from "./providerModelFactory";
 
@@ -180,6 +182,8 @@ export class AIService extends EventEmitter {
   private readonly devToolsService?: DevToolsService;
   private readonly providersConfigStore: ProvidersConfigStore;
   private readonly experimentsService?: ExperimentsService;
+  /** Builds every runtime of this service and of its sessions (AgentSessionAIService). */
+  readonly runtimeFactory: RuntimeFactory;
 
   /**
    * Tracks queued DevTools run metadata by assistant message id so stream-end/abort
@@ -218,7 +222,7 @@ export class AIService extends EventEmitter {
       config.rootDir
     ),
     /** Absent members: the Node layer (`new AIService(` in tests passes none). */
-    hostServices: LoopHostServices = {}
+    private readonly hostServices: LoopHostServices = {}
   ) {
     super();
     // No listener cap: every live AgentSession adds one listener per forwarded event, and a
@@ -228,6 +232,7 @@ export class AIService extends EventEmitter {
     // disposed session that keeps its listeners) is caught by
     // workspaceService.sessionListeners.test.ts instead.
     this.setMaxListeners(0);
+    this.runtimeFactory = hostServices.runtimeFactory ?? nodeRuntimeFactory;
     this.workspaceMcpOverridesService =
       workspaceMcpOverridesService ?? new WorkspaceMcpOverridesService(config);
     this.providersConfigStore = providersConfigStore ?? new ProvidersConfigStore(config.rootDir);
@@ -272,6 +277,7 @@ export class AIService extends EventEmitter {
       lastLlmRequestByWorkspace: this.lastLlmRequestByWorkspace,
       bindings: this.turnRequestBuilderBindings,
       hostServices,
+      runtimeFactory: this.runtimeFactory,
       emit: (event, ...args) => this.emit(event, ...args),
       createAbortedTurnHandle: (messageId, signal) =>
         this.createAbortedTurnHandle(messageId, signal),
@@ -335,7 +341,7 @@ export class AIService extends EventEmitter {
       const metadataResult = await this.getWorkspaceMetadata(workspaceId);
       if (!metadataResult.success) return null;
       const metadata = metadataResult.data;
-      const runtime = createRuntimeForWorkspace(metadata);
+      const runtime = this.runtimeFactory.createRuntimeForWorkspace(metadata);
       const ctx = {
         runtime,
         checkoutCwd: "",
@@ -519,7 +525,7 @@ export class AIService extends EventEmitter {
 
   private async ensureSessionsDir(): Promise<void> {
     try {
-      await ensurePrivateDir(this.config.sessionsDir);
+      await this.historyService.files.ensurePrivateDir(this.config.sessionsDir);
     } catch (error) {
       log.error("Failed to create sessions directory:", error);
     }
@@ -531,7 +537,11 @@ export class AIService extends EventEmitter {
    * vars-snapshot writer (independent instances would corrupt seq ordering).
    */
   private durableEventJournalFor(workspaceId: string): DurableEventJournal {
-    return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId));
+    // The history's layers: a memory graph keeps the turn's journal rows and blobs in its volume.
+    return sharedDurableEventJournal(path.join(this.config.sessionsDir, workspaceId), {
+      files: this.historyService.files,
+      locks: this.historyService.locks,
+    });
   }
 
   /** Reconcile lazy workspace hooks before pinning a rollover's request-assembly contract. */
@@ -548,6 +558,8 @@ export class AIService extends EventEmitter {
       hostCheckoutRoot: runtimeContext.data.hostCheckoutRoot,
       journal: this.durableEventJournalFor(workspaceId),
       mcpServerManager: this.turnRequestBuilderBindings.mcpServerManager,
+      hostFiles: this.hostServices.hostFiles,
+      hostPaths: this.hostServices.hostPaths,
     });
     return Ok(eventSpine.captureRequestAssembly(workspaceId));
   }
@@ -601,6 +613,45 @@ export class AIService extends EventEmitter {
       ? await this.resolvePromptHookCwd(workspaceId)
       : undefined;
     return runTurnStopHooks(eventSpine, workspaceId, { ...input, cwd });
+  }
+
+  /**
+   * The Agent interface view's turn-end status page nudge that the turn that streamed `messageId`
+   * earns (needsStatusPageTurnEndNudge), or null. In status page agent mode it asks for a
+   * status_update call instead of an edit. Consumes the turn's state, so a second call is null.
+   */
+  async statusPageTurnEndNudge(
+    workspaceId: string,
+    input: { messageId: string; parts: readonly CompletedMessagePart[] }
+  ): Promise<string | null> {
+    const taken = this.turnRequestBuilder.takeAgentInterfaceStatusPageTurn(
+      workspaceId,
+      input.messageId
+    );
+    // Switched off since the turn started: the status page agent drops its queued updates, so
+    // a status_update the turn sent counts for nothing and the agent must edit the page.
+    const turn = taken && {
+      ...taken,
+      statusPageAgent: taken.statusPageAgent === true && this.isStatusPageAgentStillOn(),
+    };
+    const needed = await needsStatusPageTurnEndNudge({
+      turn,
+      viewEnabled:
+        this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS) &&
+        this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_AGENT_INTERFACE),
+      parts: input.parts,
+    });
+    if (!needed) return null;
+    return turn?.statusPageAgent === true
+      ? STATUS_PAGE_AGENT_TURN_END_NUDGE
+      : STATUS_PAGE_TURN_END_NUDGE;
+  }
+
+  private isStatusPageAgentStillOn(): boolean {
+    return (
+      this.isExperimentEnabled(EXPERIMENT_IDS.ARTIFACTS_STATUS_PAGE_AGENT) &&
+      isStatusPageAgentEnabledInSettings(this.config.loadConfigOrDefault())
+    );
   }
 
   /** The lazy hook setup of request building, fail-soft: the hooks already loaded still run. */
@@ -858,6 +909,7 @@ export class AIService extends EventEmitter {
         metadata: metadata.data,
         runtime: context.data.runtime,
         workspacePath: context.data.workspacePath,
+        runtimeFactory: this.runtimeFactory,
         requestedAgentId: options.agentId,
         disableWorkspaceAgents: options.disableWorkspaceAgents ?? false,
         automaticGoalTurn: true,
@@ -904,35 +956,32 @@ export class AIService extends EventEmitter {
 
     const singleProjectContext = isMultiProject(metadata)
       ? undefined
-      : createRuntimeContextForWorkspace(metadataWithPath);
+      : this.runtimeFactory.createRuntimeContextForWorkspace(metadataWithPath);
     const runtime = singleProjectContext
       ? singleProjectContext.runtime
-      : new MultiProjectRuntime(
-          new ContainerManager(getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir),
-          getProjects(metadata).map((project) => ({
+      : this.runtimeFactory.createMultiProjectRuntime({
+          runtimeConfig: metadata.runtimeConfig,
+          srcBaseDir: getSrcBaseDir(metadata.runtimeConfig) ?? this.config.srcDir,
+          workspaceName: metadata.name,
+          projects: getProjects(metadata).map((project) => ({
             projectPath: project.projectPath,
             projectName: project.projectName,
-            runtime: createRuntime(metadata.runtimeConfig, {
-              projectPath: project.projectPath,
-              workspaceName: metadata.name,
-              workspacePath: isSSHRuntime(metadata.runtimeConfig)
-                ? getWorkspacePathHintForProject(
-                    {
-                      workspaceId,
-                      workspaceName: metadata.name,
-                      workspacePath: workspace.workspacePath,
-                      runtimeConfig: metadata.runtimeConfig,
-                      projectPath: metadata.projectPath,
-                      projectName: metadata.projectName,
-                      projects: metadata.projects,
-                    },
-                    project.projectPath
-                  )
-                : undefined,
-            }),
+            workspacePath: isSSHRuntime(metadata.runtimeConfig)
+              ? getWorkspacePathHintForProject(
+                  {
+                    workspaceId,
+                    workspaceName: metadata.name,
+                    workspacePath: workspace.workspacePath,
+                    runtimeConfig: metadata.runtimeConfig,
+                    projectPath: metadata.projectPath,
+                    projectName: metadata.projectName,
+                    projects: metadata.projects,
+                  },
+                  project.projectPath
+                )
+              : undefined,
           })),
-          metadata.name
-        );
+        });
 
     const workspacePath =
       singleProjectContext?.workspacePath ??
@@ -1128,7 +1177,7 @@ export class AIService extends EventEmitter {
       recordStartupPhaseTiming("commitPartialMs", commitPartialStartedAt);
 
       const buildOutcome = prepared
-        ? await prepared.request.start(opts.activeTurnThinkingOverride)
+        ? await prepared.request.start(opts.activeTurnThinkingOverride, opts.onTurnStartStage)
         : await this.turnRequestBuilder.build(opts, {
             abortSignal: combinedAbortSignal,
             syntheticMessageId,
@@ -1241,7 +1290,7 @@ export class AIService extends EventEmitter {
   async deleteWorkspace(workspaceId: string): Promise<Result<void>> {
     try {
       const workspaceDir = path.join(this.config.sessionsDir, workspaceId);
-      await fs.rm(workspaceDir, { recursive: true, force: true });
+      await this.historyService.files.promises.rm(workspaceDir, { recursive: true, force: true });
       return Ok(undefined);
     } catch (error) {
       const message = getErrorMessage(error);

@@ -11,6 +11,7 @@ import type { TaskCreateResult } from "@/node/services/taskService";
 import { createRuntime } from "@/node/runtime/runtimeFactory";
 
 const patchToolConfig: TaskGitPatchApplyConfig = {
+  sessionLocks: nodeSessionLocks,
   cwd: "/repo",
   runtime: createRuntime({ type: "local", srcBaseDir: "/tmp" }),
   runtimeTempDir: "/tmp",
@@ -20,6 +21,7 @@ import {
   DEFAULT_WORKFLOW_AGENT_ID,
   WorkflowTaskServiceAdapter,
 } from "./WorkflowTaskServiceAdapter";
+import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
 
 describe("WorkflowTaskServiceAdapter", () => {
   test("spawns a workflow child task with workflow metadata and returns its report", async () => {

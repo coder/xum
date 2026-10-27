@@ -55,7 +55,6 @@ export const EvaluationInputSchema = z.union([
   z.array(EvaluationJsonValueSchema),
   z.record(z.string(), EvaluationJsonValueSchema),
 ]);
-export type EvaluationInput = z.infer<typeof EvaluationInputSchema>;
 
 export const EvaluationStateSchema = EvaluationInputSchema;
 export type EvaluationState = z.infer<typeof EvaluationStateSchema>;
@@ -116,7 +115,6 @@ export const EvaluationProviderOptionsSchema = z.record(
   z.string(),
   z.record(z.string(), EvaluationJsonValueSchema)
 );
-export type EvaluationProviderOptions = z.infer<typeof EvaluationProviderOptionsSchema>;
 
 /**
  * The sandbox-facing `evaluate(state, spec)` options (consumed by the workflow
