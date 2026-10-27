@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { cleanup, fireEvent, render, within } from "@testing-library/react";
-import type React from "react";
+import { useEffect, useRef, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import { installDom, stubNarrowViewport, stubShortViewport } from "../../../../tests/ui/dom";
 
 import { ChatInputDecoration } from "./ChatInputDecoration";
@@ -15,9 +15,17 @@ let cleanupDom: (() => void) | null = null;
 function Chip(props: {
   id: ChatActivityId;
   label: string;
-  onContentKeyDown?: (event: React.KeyboardEvent<HTMLDivElement>) => void;
+  rows?: string[];
+  focusFirstRowOnOpen?: boolean;
+  onContentKeyDown?: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
 }) {
   const [expanded, setExpanded] = useChatActivityPanel(props.id);
+  const rows = props.rows ?? [`${props.label} list`];
+  const firstRowRef = useRef<HTMLButtonElement>(null);
+  const focusFirstRowOnOpen = props.focusFirstRowOnOpen === true;
+  useEffect(() => {
+    if (expanded && focusFirstRowOnOpen) firstRowRef.current?.focus();
+  }, [expanded, focusFirstRowOnOpen]);
   return (
     <ChatInputDecoration
       activityId={props.id}
@@ -26,7 +34,13 @@ function Chip(props: {
       chipLabel={props.label}
       summary={props.label}
       onContentKeyDown={props.onContentKeyDown}
-      renderExpanded={() => <button type="button">{props.label} list</button>}
+      renderExpanded={() =>
+        rows.map((row, index) => (
+          <button key={row} ref={index === 0 ? firstRowRef : undefined} type="button">
+            {row}
+          </button>
+        ))
+      }
     />
   );
 }
@@ -223,6 +237,80 @@ describe("chat activity panels", () => {
       expect(view.queryByRole("dialog")).toBeNull();
       expect(view.queryByText("TODO list")).toBeNull();
       expect(document.activeElement).toBe(chip);
+    });
+
+    it("keeps focus off the page it covers until it closes", () => {
+      // A modal: Tab past the sheet's last control must not reach the composer behind it.
+      const view = render(renderLine());
+      const outside = view.getByRole("button", { name: "outside" });
+
+      fireEvent.click(view.getByRole("button", { name: "TODO" }));
+      const sheet = view.getByRole("dialog", { name: "Activity" });
+      outside.focus();
+      expect(sheet.contains(document.activeElement)).toBe(true);
+
+      fireEvent.click(within(sheet).getByRole("button", { name: "Close" }));
+      outside.focus();
+      expect(document.activeElement).toBe(outside);
+    });
+
+    it("closes on Escape after the focused row leaves, without reaching window handlers", () => {
+      const line = (rows: string[]) => (
+        <ChatActivityPanelsProvider>
+          <Chip id="background-bashes" label="Bashes" rows={rows} />
+        </ChatActivityPanelsProvider>
+      );
+      const view = render(line(["dev server", "CI watch"]));
+      let windowSawEscape = false;
+      const onWindowKeyDown = (event: KeyboardEvent) => {
+        if (event.key === "Escape") windowSawEscape = true;
+      };
+      window.addEventListener("keydown", onWindowKeyDown);
+      fireEvent.click(view.getByRole("button", { name: "Bashes" }));
+      view.getByRole("button", { name: "dev server" }).focus();
+
+      // The process exits: its row goes, and focus drops to <body>, outside the sheet.
+      view.rerender(line(["CI watch"]));
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      window.removeEventListener("keydown", onWindowKeyDown);
+
+      expect(view.queryByRole("dialog")).toBeNull();
+      expect(windowSawEscape).toBe(false);
+    });
+
+    it("returns focus to the composer when a panel took focus as it opened", () => {
+      // The background-bash chord, pressed in the composer, opens the list on its first row.
+      const view = render(
+        <div>
+          <ChatActivityPanelsProvider>
+            <Chip id="background-bashes" label="Bashes" focusFirstRowOnOpen />
+          </ChatActivityPanelsProvider>
+          <button type="button">composer</button>
+        </div>
+      );
+      const composer = view.getByRole("button", { name: "composer" });
+      composer.focus();
+
+      fireEvent.click(view.getByRole("button", { name: "Bashes" }));
+      const row = view.getByRole("button", { name: "Bashes list" });
+      expect(document.activeElement === row).toBe(true);
+
+      fireEvent.keyDown(row, { key: "Escape" });
+      expect(view.queryByRole("dialog")).toBeNull();
+      expect(document.activeElement === composer).toBe(true);
+    });
+
+    it("leaves Escape from a layer opened over it to that layer", () => {
+      // A menu or toast portaled to <body> after the sheet opened is not under it.
+      const view = render(renderLine());
+      fireEvent.click(view.getByRole("button", { name: "TODO" }));
+      const layer = document.createElement("button");
+      document.body.append(layer);
+
+      fireEvent.keyDown(layer, { key: "Escape" });
+      layer.remove();
+
+      expect(view.queryByRole("dialog", { name: "Activity" })).not.toBeNull();
     });
 
     it("closes on Escape from a tab without reaching window handlers", () => {

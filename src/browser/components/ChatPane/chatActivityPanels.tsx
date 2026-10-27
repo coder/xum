@@ -3,6 +3,7 @@ import {
   useContext,
   useEffect,
   useId,
+  useLayoutEffect,
   useRef,
   useState,
   type ReactNode,
@@ -13,6 +14,7 @@ import { X } from "lucide-react";
 import { useNarrowViewport, useShortViewport } from "@/browser/hooks/useNarrowViewport";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
 import { isDialogOpen } from "@/browser/utils/ui/keybinds";
+import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
 import { cn } from "@/common/lib/utils";
 
 /**
@@ -173,30 +175,37 @@ function useSheetSlots(sheetViewport: boolean) {
 }
 
 /**
- * Modal focus for the sheet: moves focus into it when it opens, unless a panel already placed it
- * there (the background-bash chord focuses its first row; the line's effects run before the
- * sheet's). Returns the sheet's close, which hands focus back to where it was before, if that
- * element is still there.
+ * Modal focus for the sheet. While it is open the covered page is inert, so Tab cannot leave the
+ * sheet for the composer behind it, and focus moves in unless a panel already placed it there
+ * (the background-bash chord focuses its first row; the line's effects run before the sheet's).
+ * Closing hands focus back to where it was before once the page is interactive again (an inert
+ * element cannot take focus). In a passive effect's cleanup: a layout effect's cleanup runs amid
+ * the commit's DOM changes, and React then puts focus back on the element that had it before.
  */
 function useSheetFocus(
   open: boolean,
-  dialogRef: RefObject<HTMLDivElement | null>,
-  onClose: () => void
-): () => void {
-  const returnFocusRef = useRef<HTMLElement | null>(null);
+  rootRef: RefObject<HTMLDivElement | null>,
+  dialogRef: RefObject<HTMLDivElement | null>
+): void {
+  // Read in the commit that opens the sheet, before the chord's effect moves focus to its row.
+  // Closing reads it too, unused.
+  const returnFocusRef = useRef<Element | null>(null);
+  useLayoutEffect(() => {
+    returnFocusRef.current = document.activeElement;
+  }, [open]);
   useEffect(() => {
+    const root = rootRef.current;
     const dialog = dialogRef.current;
-    if (!open || dialog === null || dialog.contains(document.activeElement)) return;
-    returnFocusRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    dialog.focus();
-  }, [open, dialogRef]);
-  return () => {
-    onClose();
-    const target = returnFocusRef.current;
-    returnFocusRef.current = null;
-    if (target?.isConnected) target.focus();
-  };
+    if (!open || root === null || dialog === null) return;
+    const returnFocus = returnFocusRef.current;
+    const restoreOthers = makeOthersInert(root);
+    if (!dialog.contains(document.activeElement)) dialog.focus();
+    return () => {
+      restoreOthers();
+      // No isConnected check: focus() does nothing on an element that left the page meanwhile.
+      if (returnFocus instanceof HTMLElement) returnFocus.focus();
+    };
+  }, [open, rootRef, dialogRef]);
 }
 
 /**
@@ -204,7 +213,9 @@ function useSheetFocus(
  * sheet from their chips, so their React events bubble to the chips and never reach a React
  * handler here. It runs after those handlers, so a panel that handles Escape itself (by
  * preventing default or stopping it) keeps it, and it stops Escape before the window's stream
- * interrupt sees it.
+ * interrupt sees it. It listens on <body>, not the sheet: a row removed while focused (a stopped
+ * bash) drops focus there, and the page behind the sheet is inert, so a key from <body> is the
+ * sheet's too.
  */
 function useSheetEscape(
   open: boolean,
@@ -216,12 +227,14 @@ function useSheetEscape(
     if (!open || root === null) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape" || event.defaultPrevented) return;
+      const target = event.target;
+      if (target !== document.body && !(target instanceof Node && root.contains(target))) return;
       event.preventDefault();
       stopKeyboardPropagation(event);
       close();
     };
-    root.addEventListener("keydown", onKeyDown);
-    return () => root.removeEventListener("keydown", onKeyDown);
+    document.body.addEventListener("keydown", onKeyDown);
+    return () => document.body.removeEventListener("keydown", onKeyDown);
   }, [open, rootRef, close]);
 }
 
@@ -240,7 +253,8 @@ function ChatActivitySheet(props: {
   const rootRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const open = props.open;
-  const close = useSheetFocus(open, dialogRef, props.onClose);
+  const close = props.onClose;
+  useSheetFocus(open, rootRef, dialogRef);
   useSheetEscape(open, rootRef, close);
 
   return createPortal(
