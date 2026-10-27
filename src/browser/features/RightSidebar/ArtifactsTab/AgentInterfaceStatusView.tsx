@@ -324,7 +324,7 @@ function TranscriptPeek(props: { id: string; messages: WorkspaceState["messages"
             row.kind === "boundary" ? (
               <li
                 key={row.id}
-                className="text-muted flex items-center gap-2 px-3 py-0.5 before:h-px before:flex-1 before:bg-border-light after:h-px after:flex-1 after:bg-border-light"
+                className="text-muted before:bg-border-light after:bg-border-light flex items-center gap-2 px-3 py-0.5 before:h-px before:flex-1 after:h-px after:flex-1"
               >
                 {row.label}
               </li>

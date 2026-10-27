@@ -124,13 +124,16 @@ function Wrapper(props: { children: ReactNode }) {
   );
 }
 
+/** The real store getter, captured before any spy (not a hook: it only returns the singleton). */
+const readRealWorkspaceStore = WorkspaceStoreModule.useWorkspaceStoreRaw;
+
 /** Workspace states the status bar reads, for workspaces the real store never registered. */
 const seededStates = new Map<string, WorkspaceState>();
 const restoreSpies: Array<() => void> = [];
 
 function seedWorkspace(workspaceId: string, patch: Partial<WorkspaceState>) {
   if (restoreSpies.length === 0) {
-    const realStore = WorkspaceStoreModule.useWorkspaceStoreRaw();
+    const realStore = readRealWorkspaceStore();
     const store = overlayWorkspaceStoreRaw(realStore, {
       hasRegisteredWorkspace: (id: string) =>
         seededStates.has(id) || realStore.hasRegisteredWorkspace(id),
