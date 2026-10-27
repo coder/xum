@@ -509,11 +509,13 @@ export class TokenBudgetStrategy {
 
   /**
    * Turn-start stage decision (#5286). A stage prompt is decided and published by the send that
-   * delivers it, in TurnRequestBuilder.start(), from E, the full estimate the turn-start check
-   * counted on the built request. It opens when it is unclaimed in this window (warning rows in
-   * the turn's own messages) and E reaches its point. The builder then counts the request with
-   * the row (E′) and publishes the row only if `fits(E′)`. Due and fit never read saved provider
-   * usage or in-memory claims, so a restart, an edit or a resume decides the same way.
+   * delivers it, in TurnRequestBuilder.start(), from E, the count the turn-start check enforced
+   * on the built request: the newest reply's saved provider usage plus the messages after it
+   * (createTurnBudgetAnchor), else the full estimate. It opens when it is unclaimed in this
+   * window (warning rows in the turn's own messages) and E reaches its point. The builder then
+   * counts the request with the row (E′) and publishes the row only if `fits(E′)`. Due and fit
+   * read only the turn's history rows, never in-memory claims, so a restart, an edit or a resume
+   * decides the same way.
    */
   async prepareTurnStartStage(
     budget: Parameters<OnTurnStartStage>[0],

@@ -36,6 +36,7 @@ import {
   checkAssembledRequestBudgetForModel,
   createContextBudgetAnchor,
   type ContextBudgetAnchorRequest,
+  type TurnBudgetAnchor,
 } from "@/node/services/contextBudgetCounting";
 import { ContextBudgetBlockedError } from "@/node/services/contextBudgetError";
 import type { HistoryService } from "@/node/services/historyService";
@@ -434,17 +435,34 @@ export function buildContextBudgetRequest(
   };
 }
 
-/** Hard-stop the step when its assembled request exceeds the safe context budget. */
+/**
+ * The turn anchor counts the request at the level the turn started at. A thinking override the
+ * step applied (the step-0 rebuild, or options only when it failed) changes which reasoning is
+ * sent, so the step uses the full estimate then (#7662).
+ */
+function turnAnchorAfterOverride(
+  request: Pick<StreamRequestConfig, "contextBudgetTurnAnchor">,
+  thinkingOverride: Record<string, unknown> | undefined
+): TurnBudgetAnchor | undefined {
+  return thinkingOverride === undefined ? request.contextBudgetTurnAnchor : undefined;
+}
+
+/**
+ * Hard-stop the step when its assembled request exceeds the safe context budget. Step zero has
+ * no settled step, so it counts against the turn anchor, as the turn-start check did (#7662).
+ */
 async function enforceContextBudgetPreflight(
   request: Pick<StreamRequestConfig, "onStepSettled">,
   modelContextLimit: number,
   budgetRequest: ContextBudgetAnchorRequest,
   previousRequest: ContextBudgetAnchorRequest | undefined,
   lastStep: Parameters<typeof createContextBudgetAnchor>[1],
-  stepNumber: number
+  stepNumber: number,
+  turnAnchor: TurnBudgetAnchor | undefined
 ): Promise<void> {
   const budgetOptions = { ...budgetRequest, modelContextLimit };
-  const anchor = createContextBudgetAnchor(previousRequest, lastStep);
+  const anchor =
+    stepNumber === 0 ? turnAnchor : createContextBudgetAnchor(previousRequest, lastStep);
   const exceeded = await checkAssembledRequestBudgetForModel(budgetRequest, budgetOptions, anchor);
   // Step zero can follow executed tools on a fallback. This late hard stop
   // preserves settled results; it must not reset/replay the activated catalog.
@@ -715,7 +733,8 @@ export class StepPreparation {
         budgetRequest,
         previousRequest,
         steps.at(-1),
-        stepNumber
+        stepNumber,
+        turnAnchorAfterOverride(request, thinkingOverride)
       );
     }
     return buildPrepareStepResult({

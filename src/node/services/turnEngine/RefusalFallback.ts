@@ -531,6 +531,7 @@ export class RefusalFallback {
       onStepMessages: streamInfo.request.onStepMessages,
       onStepSettled: streamInfo.request.onStepSettled,
       contextBudgetLimit: prepared.contextBudgetLimit,
+      contextBudgetTurnAnchor: prepared.contextBudgetTurnAnchor,
       // Same state object: aiService's fallback prepare() rebuilt it in place
       // against the fallback toolset, so prepareStep keeps reading live state.
       toolSearchState: streamInfo.request.toolSearchState,

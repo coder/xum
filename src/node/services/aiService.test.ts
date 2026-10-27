@@ -2638,6 +2638,8 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
         duringPlaceholderAppend?: () => void;
         abortController?: AbortController;
         activeTurnThinkingOverride?: ActiveTurnThinkingOverride;
+        /** History rows before the turn's user row. */
+        earlier?: MuxMessage[];
       } = {}
     ) {
       const metadata = createLocalWorkspaceMetadata("turn-start-stage", xumHomePath);
@@ -2657,6 +2659,9 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
           if (message.role === "assistant") options.duringPlaceholderAppend?.();
           return appended;
         });
+      }
+      for (const row of options.earlier ?? []) {
+        expect((await harness.historyService.appendToHistory(metadata.id, row)).success).toBe(true);
       }
       const user = createMuxMessage("user-1", "user", USER_TEXT);
       expect((await harness.historyService.appendToHistory(metadata.id, user)).success).toBe(true);
@@ -2851,6 +2856,34 @@ describe("AIService.streamMessage compaction boundary slicing", () => {
       expect(turn.measured).toEqual([await countRequest(turn, sent.messages)]);
       expect(turn.countOptions.length).toBe(3);
     });
+
+    // #7662: the turn anchor holds the provider's count at the reply's thinking level. The fold
+    // rebuilds the request at the pending level, so step zero gets the anchor of that rebuild.
+    it.each([
+      { replyLevel: "off", anchored: false },
+      { replyLevel: "high", anchored: true },
+    ] as const)(
+      "a pre-stream thinking fold dispatches the turn anchor of its rebuild (reply at $replyLevel)",
+      async ({ replyLevel, anchored }) => {
+        using xumHome = new DisposableTempDir("ai-turn-start-thinking-fold-anchor");
+        const reply = createMuxMessage("reply-0", "assistant", "done", {
+          model: KNOWN_MODELS.SONNET.id,
+          metadataModel: KNOWN_MODELS.SONNET.id,
+          agentId: "exec",
+          thinkingLevel: replyLevel,
+          systemMessageTokens: 0,
+          contextUsage: { inputTokens: 500, outputTokens: 10, totalTokens: 510 },
+        });
+        const override: ActiveTurnThinkingOverride = { pending: "high" };
+        const turn = await runStageTurn(xumHome.path, {
+          stageCallback: false,
+          activeTurnThinkingOverride: override,
+          earlier: [createMuxMessage("user-0", "user", "first request"), reply],
+        });
+        expect(turn.sent!.thinkingLevel).toBe("high");
+        expect(turn.sent!.contextBudgetTurnAnchor != null).toBe(anchored);
+      }
+    );
   });
 
   it("emits startup breadcrumbs as runtime-status events before stream start", async () => {
