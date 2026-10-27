@@ -91,6 +91,16 @@ describe("deriveStatusActivity", () => {
     ).toBe("Waking the workspace");
   });
 
+  test("compacting and a pending question name their phase over the turn's running tool", () => {
+    const turn = [user("go"), tool("ask_user_question", "executing")];
+    expect(deriveStatusActivity(turn, { ...streaming, isCompacting: true }).kind).toBe(
+      "compacting"
+    );
+    expect(deriveStatusActivity(turn, { ...streaming, awaitingUserQuestion: true }).kind).toBe(
+      "question"
+    );
+  });
+
   test("a running tool beats streaming reasoning, which beats reply text", () => {
     const running = tool("bash", "executing", { display_name: "Run tests" });
     const turn = [user("go"), reasoning(true), running, assistant("so far", { isStreaming: true })];
