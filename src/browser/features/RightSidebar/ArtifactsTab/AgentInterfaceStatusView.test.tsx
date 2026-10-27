@@ -234,6 +234,24 @@ const MID_TURN: DisplayedMessage[] = [
   },
 ];
 
+/** MID_TURN once its bash call finished, with no newer reply. */
+const MID_TURN_DONE: DisplayedMessage[] = MID_TURN.map((row) =>
+  row.type === "tool" ? { ...row, status: "completed" } : row
+);
+
+/** The reply a later turn adds after MID_TURN_DONE. */
+const NEWER_REPLY: DisplayedMessage = {
+  type: "assistant",
+  id: "a2",
+  historyId: "a2",
+  content: "The check passed.",
+  historySequence: 4,
+  isStreaming: false,
+  isPartial: false,
+  isCompacted: false,
+  isIdleCompacted: false,
+};
+
 /** The main pane's wiring: the poll and shortcut hook, then the status view it selects. */
 function MainPane(props: { workspaceId: string }) {
   const view = useMainPaneAgentInterfaceView(props.workspaceId);
@@ -747,7 +765,7 @@ describe("Agent interface status view", () => {
     expect(activity.textContent).not.toContain("Slow check");
   });
 
-  test("Start here from the status bar opens the confirmation once the turn ends, and a turn that starts under it turns OK off", async () => {
+  test("Start here from the status bar opens the confirmation once the turn ends, and a turn that starts under it or a newer reply turns OK off", async () => {
     seedWorkspace("ws-bar-idle", { messages: MID_TURN.slice(0, 2) });
     const view = render(<MainPane workspaceId="ws-bar-idle" />, { wrapper: Wrapper });
     await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
@@ -768,6 +786,48 @@ describe("Agent interface status view", () => {
     // under it.
     updateSeededWorkspace("ws-bar-idle", { messages: MID_TURN, canInterrupt: true });
     expect(ok.hasAttribute("disabled")).toBe(true);
+    // OK is back once the turn ends, but not once it leaves a newer reply: the dialog opened for
+    // the older one. Reopened, it is for the newer one.
+    updateSeededWorkspace("ws-bar-idle", { messages: MID_TURN_DONE, canInterrupt: false });
+    expect(ok.hasAttribute("disabled")).toBe(false);
+    updateSeededWorkspace("ws-bar-idle", { messages: [...MID_TURN_DONE, NEWER_REPLY] });
+    expect(ok.hasAttribute("disabled")).toBe(true);
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    fireEvent.click(startHere);
+    const reopened = await within(document.body).findByRole("dialog");
+    expect(within(reopened).getByRole("button", { name: "OK" }).hasAttribute("disabled")).toBe(
+      false
+    );
+  });
+
+  test("an armed auto-retry shows in the status bar and keeps Start here off until it is abandoned", async () => {
+    const failed: DisplayedMessage = {
+      type: "stream-error",
+      id: "e1",
+      historyId: "e1",
+      error: "overloaded",
+      errorType: "unknown",
+      historySequence: 3,
+    };
+    seedWorkspace("ws-bar-retry", {
+      messages: [...MID_TURN.slice(0, 2), failed],
+      autoRetryStatus: {
+        type: "auto-retry-scheduled",
+        attempt: 1,
+        delayMs: 5_000,
+        scheduledAt: Date.now(),
+      },
+    });
+    const view = render(<MainPane workspaceId="ws-bar-retry" />, { wrapper: Wrapper });
+    await waitFor(() => expect(shownPage(view)).toContain("<p>AAAA</p>"));
+    const bar = view.getByTestId("agent-interface-status-bar");
+    expect(within(bar).getByRole("status").textContent).toContain("Retrying");
+    const startHere = within(bar).getByRole("button", { name: "Start here" });
+    expect(startHere.hasAttribute("disabled")).toBe(true);
+    updateSeededWorkspace("ws-bar-retry", {
+      autoRetryStatus: { type: "auto-retry-abandoned", reason: "Stopped" },
+    });
+    expect(startHere.hasAttribute("disabled")).toBe(false);
   });
 
   test("the transcript peek's shortcut opens and closes it, but not on a held chord, AltGr, from the command palette or under a dialog", async () => {

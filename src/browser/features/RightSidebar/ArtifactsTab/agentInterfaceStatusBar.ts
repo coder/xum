@@ -1,3 +1,4 @@
+import type { AutoRetryStatus } from "@/browser/utils/messages/autoRetryStatus";
 import type { HeldInput } from "@/common/orpc/types";
 import type { DisplayedMessage, DisplayedUserMessage, QueuedMessage } from "@/common/types/message";
 import type { RuntimeStatusEvent } from "@/common/types/stream";
@@ -34,6 +35,7 @@ export type StatusActivityKind =
   | "thinking"
   | "writing"
   | "working"
+  | "retrying"
   | "monitor"
   | "idle"
   | "error";
@@ -55,6 +57,8 @@ export interface StatusActivityFlags {
   activeBashMonitorCount: number;
   /** The backend's startup breadcrumb (runtime readiness, tool loading), as StreamingBarrier shows it. */
   runtimeStatus?: Pick<RuntimeStatusEvent, "phase" | "detail"> | null;
+  /** The latest auto-retry event after a failed stream, as RetryBarrier shows it. */
+  autoRetryStatus: AutoRetryStatus | null;
 }
 
 type DisplayedTool = Extract<DisplayedMessage, { type: "tool" }>;
@@ -104,6 +108,11 @@ function startingLabel(runtimeStatus: StatusActivityFlags["runtimeStatus"]): str
   return detail != null && detail !== "" ? detail : "Starting…";
 }
 
+/** A retry that is armed or starting resumes the failed turn, as RetryBarrier counts it. */
+function isRetryPending(status: AutoRetryStatus | null): boolean {
+  return status?.type === "auto-retry-scheduled" || status?.type === "auto-retry-starting";
+}
+
 /** After the turn: an armed monitor wakes the agent on matching output, so it is not idle. */
 function settledActivity(
   messages: readonly DisplayedMessage[],
@@ -136,6 +145,7 @@ export function deriveStatusActivity(
   if (flags.isCompacting) return { kind: "compacting", label: "Compacting context…" };
   if (flags.awaitingUserQuestion) return { kind: "question", label: "Waiting for your answer" };
   if (flags.canInterrupt) return streamingActivity(messages);
+  if (isRetryPending(flags.autoRetryStatus)) return { kind: "retrying", label: "Retrying…" };
   return settledActivity(messages, flags.activeBashMonitorCount);
 }
 

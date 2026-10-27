@@ -86,8 +86,18 @@ const streaming: StatusActivityFlags = {
   isCompacting: false,
   awaitingUserQuestion: false,
   activeBashMonitorCount: 0,
+  autoRetryStatus: null,
 };
 const idle: StatusActivityFlags = { ...streaming, canInterrupt: false };
+
+const errored: DisplayedMessage = {
+  type: "stream-error",
+  id: "e1",
+  historyId: "e1",
+  error: "overloaded",
+  errorType: "unknown",
+  historySequence: 99,
+};
 
 describe("deriveStatusActivity", () => {
   test("a turn that is starting reports starting, with the runtime's breadcrumb when present", () => {
@@ -182,19 +192,21 @@ describe("deriveStatusActivity", () => {
 
   test("not streaming is idle, or stopped when the newest row is a stream error", () => {
     expect(deriveStatusActivity([], idle).kind).toBe("idle");
-    const errored: DisplayedMessage = {
-      type: "stream-error",
-      id: "e1",
-      historyId: "e1",
-      error: "overloaded",
-      errorType: "unknown",
-      historySequence: 99,
-    };
     expect(deriveStatusActivity([user("go"), assistant("partial"), errored], idle).kind).toBe(
       "error"
     );
     // A retry that answered after the error leaves the turn settled, not stopped.
     expect(deriveStatusActivity([user("go"), errored, assistant("done")], idle).kind).toBe("idle");
+  });
+
+  test("an armed or starting auto-retry keeps the failed turn running until it is abandoned", () => {
+    const withRetry = (autoRetryStatus: StatusActivityFlags["autoRetryStatus"]) =>
+      deriveStatusActivity([user("go"), errored], { ...idle, autoRetryStatus }).kind;
+    expect(
+      withRetry({ type: "auto-retry-scheduled", attempt: 1, delayMs: 2_000, scheduledAt: 0 })
+    ).toBe("retrying");
+    expect(withRetry({ type: "auto-retry-starting", attempt: 1 })).toBe("retrying");
+    expect(withRetry({ type: "auto-retry-abandoned", reason: "Stopped" })).toBe("error");
   });
 
   test("after the turn, an armed bash monitor is waited on, not idle", () => {
@@ -217,6 +229,11 @@ describe("deriveStatusActivity", () => {
       [idle, [user("go"), assistant("done")], false],
       [{ ...streaming, isInterrupting: true }, [user("go"), tool("bash", "executing")], true],
       [{ ...idle, activeBashMonitorCount: 1 }, [user("go"), assistant("watching")], false],
+      [
+        { ...idle, autoRetryStatus: { type: "auto-retry-starting", attempt: 1 } },
+        [user("go"), errored],
+        true,
+      ],
     ];
     for (const [flags, messages, active] of phases) {
       expect(isTurnActive(deriveStatusActivity(messages, flags))).toBe(active);

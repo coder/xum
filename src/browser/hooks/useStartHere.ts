@@ -18,6 +18,12 @@ interface StartHereOptions {
    * landing under the running turn, also from a confirmation opened before the turn started.
    */
   turnActive?: boolean;
+  /**
+   * The row `content` comes from, for a caller whose content can move to a newer row while the
+   * confirmation is open. OK turns off once it moves, so a confirm never starts from a reply the
+   * user did not open it for.
+   */
+  sourceKey?: string;
 }
 
 /**
@@ -56,6 +62,24 @@ async function appendStartHereBoundary(
   }
 }
 
+/** When the button and the open confirmation's OK may start here. */
+function useStartHereGate(workspaceId: string | undefined, options: StartHereOptions | undefined) {
+  // The row the open confirmation is for (StartHereOptions.sourceKey).
+  const [openedSourceKey, setOpenedSourceKey] = useState<string>();
+  // Rendered disabled state follows the barrier, so the button never offers a click that
+  // `openModal`/`executeStartHere` would refuse.
+  const transcriptMutationAllowed = useTranscriptMutationAllowed(workspaceId);
+  // The open dialog follows it too, and the turn state: a replay that drops out, or a turn that
+  // starts, after it opened disables OK (its click and its keybind) rather than letting a confirm
+  // resolve to nothing or land under the turn.
+  const blocked = !transcriptMutationAllowed || options?.turnActive === true;
+  return {
+    blocked,
+    confirmDisabled: blocked || options?.sourceKey !== openedSourceKey,
+    rememberSource: () => setOpenedSourceKey(options?.sourceKey),
+  };
+}
+
 /**
  * Hook for managing Start Here button state and modal.
  * Returns a button config and modal state management.
@@ -74,13 +98,7 @@ export function useStartHere(
   const { api } = useAPI();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isStartingHere, setIsStartingHere] = useState(false);
-  // Rendered disabled state follows the barrier, so the button never offers a click that
-  // `openModal`/`executeStartHere` would refuse.
-  const transcriptMutationAllowed = useTranscriptMutationAllowed(workspaceId);
-  // The open dialog follows it too, and the turn state: a replay that drops out, or a turn that
-  // starts, after it opened disables OK (its click and its keybind) rather than letting a confirm
-  // resolve to nothing or land under the turn.
-  const blocked = !transcriptMutationAllowed || options?.turnActive === true;
+  const gate = useStartHereGate(workspaceId, options);
 
   // Opens the confirmation modal
   const openModal = () => {
@@ -88,6 +106,7 @@ export function useStartHere(
     // Start Here rewrites the request window around a row the user sees; refuse while the
     // transcript is not yet a verified copy of history (same barrier as sends and edits).
     if (!isTranscriptMutationAllowed(workspaceId)) return;
+    gate.rememberSource();
     setIsModalOpen(true);
   };
 
@@ -118,14 +137,14 @@ export function useStartHere(
     isOpen: isModalOpen,
     onClose: closeModal,
     onConfirm: executeStartHere,
-    confirmDisabled: blocked,
+    confirmDisabled: gate.confirmDisabled,
   });
 
   return {
     openModal,
     isStartingHere,
     buttonLabel: `Start Here`,
-    disabled: !workspaceId || isStartingHere || isCompacted || blocked,
+    disabled: !workspaceId || isStartingHere || isCompacted || gate.blocked,
     modal, // Pre-configured modal to render
   };
 }

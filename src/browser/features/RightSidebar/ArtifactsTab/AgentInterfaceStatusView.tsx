@@ -258,6 +258,7 @@ function StatusBar(props: { workspaceId: string; state: WorkspaceState }) {
     awaitingUserQuestion: state.awaitingUserQuestion,
     activeBashMonitorCount: state.activeBashMonitorCount,
     runtimeStatus: state.runtimeStatus,
+    autoRetryStatus: state.autoRetryStatus,
   });
   const receipt = deriveLastMessageReceipt(state.messages, state.queuedMessage, state.heldInputs);
 
@@ -336,6 +337,8 @@ function StartHereButton(props: {
     sourceAgentId: source?.agentId ?? source?.mode,
     // Off while a turn runs, in the confirmation too: it may have opened before the turn started.
     turnActive: props.turnActive,
+    // The last reply can change under the open confirmation (a monitor wakes the agent).
+    sourceKey: source?.id,
   });
   // SECURITY AUDIT: unlike the peek's chord, the status page's frame does not forward this one.
   // The host honours a forwarded chord during any live gesture in the frame, so the page's
