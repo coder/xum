@@ -172,8 +172,9 @@ describe("parent removal cascades over its sub-agent tree across two backends", 
   // #5028: the mark a task gets when the write ending it rejects (#4747) is in-memory only and
   // has no reader once the row is gone. White-box: the leak is its only observable effect.
   test("removing tasks drops their unpersisted-end marks", async () => {
-    const marks = (a.taskService as unknown as { unpersistedLaunchFailureTaskIds: Set<string> })
-      .unpersistedLaunchFailureTaskIds;
+    const marks = (
+      a.taskService as unknown as { waiters: { unpersistedLaunchFailureTaskIds: Set<string> } }
+    ).waiters.unpersistedLaunchFailureTaskIds;
     marks.add(childId);
     marks.add(grandchildId);
 

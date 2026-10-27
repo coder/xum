@@ -609,7 +609,7 @@ describe("TaskService", () => {
     });
 
     const internal = taskService as unknown as {
-      completedReportsByTaskId: Map<string, unknown>;
+      waiters: { completedReportsByTaskId: Map<string, unknown> };
     };
 
     await streamEnd(taskService, {
@@ -644,7 +644,7 @@ describe("TaskService", () => {
     expect(ws?.taskStatus).toBe("reported");
 
     // Validate report persistence path (not just in-memory cache).
-    internal.completedReportsByTaskId.clear();
+    internal.waiters.completedReportsByTaskId.clear();
     const persisted = await taskService.waitForAgentReport(childId, {
       timeoutMs: 10_000,
       requestingWorkspaceId: parentId,

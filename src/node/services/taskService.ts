@@ -56,6 +56,7 @@ import {
   type WorkspaceTurnHost,
 } from "@/node/services/taskWorkspaceSeam";
 export type { TaskKind } from "@/node/services/taskWorkspaceSeam";
+export { ForegroundWaitBackgroundedError } from "@/node/services/taskWaiters";
 import {
   ACTIVE_AGENT_TASK_STATUSES,
   buildAgentTaskIndex,
@@ -111,6 +112,11 @@ import {
 } from "@/constants/taskMessages";
 import { log } from "@/node/services/log";
 import { PeerSendParking } from "@/node/services/peerSendParking";
+import {
+  TaskWaiters,
+  type PendingTaskStartWaiter,
+  type PendingTaskWaiter,
+} from "@/node/services/taskWaiters";
 import { isProjectTrusted, isWorkspaceProjectTrustedIn } from "@/node/utils/projectTrust";
 import { eventSpine } from "@/node/services/events/eventSpine";
 import { sandboxHostService } from "@/node/services/sandbox/sandboxHostService";
@@ -1331,8 +1337,6 @@ function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
 
 const REMOVED_AGENT_TASKS_DIR = "removed-agent-tasks";
 
-const COMPLETED_REPORT_CACHE_MAX_ENTRIES = 128;
-
 // Level-triggered backstop for workflow terminal wakes: the sweep re-derives owed wakes from
 // durable state (run records + settled markers), so lost terminal callbacks, deferred
 // (transiently unreadable) evaluations, and crashes all recover here without any per-failure
@@ -1630,37 +1634,6 @@ interface InactiveWorkflowTaskOwner {
 
 type InterruptedTaskStatusMutation = "interrupted" | "preserved-completed-report";
 
-interface PendingTaskWaiter extends BackgroundableForegroundWaiter {
-  resolve: (report: {
-    reportMarkdown: string;
-    title?: string;
-    structuredOutput?: unknown;
-    planFilePath?: string;
-    model?: string;
-    thinkingLevel?: ThinkingLevel;
-  }) => void;
-}
-
-interface PendingTaskStartWaiter {
-  start: () => void;
-  cleanup: () => void;
-}
-
-interface CompletedAgentReportCacheEntry {
-  reportMarkdown: string;
-  planFilePath?: string;
-  structuredOutput?: unknown;
-  title?: string;
-  // Final settings the child reported with (post plan-to-exec handoff), not the launch snapshot.
-  model?: string;
-  thinkingLevel?: ThinkingLevel;
-  // Ancestor workspace IDs captured when the report was cached.
-  // Used to keep descendant-scope checks working even if the task workspace is cleaned up.
-  ancestorWorkspaceIds: string[];
-  // Ancestors for which the task report must only be consumed through a workflow run.
-  workflowOwnedAncestorWorkspaceIds?: string[];
-}
-
 interface ParentAutoResumeHint {
   agentId?: string;
 }
@@ -1837,13 +1810,6 @@ async function readTaskBaseCommitShaByProjectPath(params: {
   return taskBaseCommitShaByProjectPath;
 }
 
-export class ForegroundWaitBackgroundedError extends Error {
-  constructor() {
-    super("Foreground wait sent to background due to queued message");
-    this.name = "ForegroundWaitBackgroundedError";
-  }
-}
-
 function buildWorkflowTimeoutFinalizationPrompt(
   finalInstructions: string | undefined,
   completionKind: "final_response" | "propose_plan",
@@ -1979,28 +1945,10 @@ export class TaskService implements AgentTaskIntegration {
   private workflowAttentionSweepTimer: ReturnType<typeof setInterval> | null = null;
   /** The pending drain retry after a refused launch lease (QUEUED_LAUNCH_LEASE_RETRY_MS). */
   private queuedLaunchLeaseRetryTimer: ReturnType<typeof setTimeout> | undefined;
-  private readonly pendingWaitersByTaskId = new Map<string, PendingTaskWaiter[]>();
-  private readonly pendingStartWaitersByTaskId = new Map<string, PendingTaskStartWaiter[]>();
-  // Tasks whose launch failed, or whose reservation was canceled or failed, but whose write
-  // ending the row rejected (#4747, #5028): the row still says queued/starting and nothing will
-  // move it to running, so waiters arm their timeout at once. A later move to running, a
-  // recorded launch failure or the workspace's removal clears the mark.
-  private readonly unpersistedLaunchFailureTaskIds = new Set<string>();
-  // Tracks workspaces currently blocked in a foreground wait (e.g. a task tool call awaiting
-  // agent_report). Used to avoid scheduler deadlocks when maxParallelAgentTasks is low and tasks
-  // spawn nested tasks in the foreground.
-  private readonly foregroundAwaitCountByWorkspaceId = new Map<string, number>();
-  private readonly backgroundableForegroundWaitersByWorkspaceId = new Map<
-    string,
-    Set<BackgroundableForegroundWaiter>
-  >();
+  /** Report/start waiters, foreground-await state and the completed-report cache. */
+  private readonly waiters: TaskWaiters;
 
   private readonly terminalAttentionStore: TerminalAttentionStore;
-  private readonly userBackgroundedTaskIds = new Set<string>();
-
-  // Cache completed reports so callers can retrieve them without re-reading disk.
-  // Bounded by max entries; disk persistence is the source of truth for restart-safety.
-  private readonly completedReportsByTaskId = new Map<string, CompletedAgentReportCacheEntry>();
 
   // Task workspace removals that outlived their termination timeout. Retries must
   // await the ORIGINAL removal outcome: the host's remove() short-circuits Ok
@@ -4263,7 +4211,7 @@ export class TaskService implements AgentTaskIntegration {
       kind: "indeterminate",
       reason,
     });
-    const cached = this.completedReportsByTaskId.get(taskId);
+    const cached = this.waiters.getCompletedReport(taskId);
     if (cached) {
       return { kind: "reported", report: toAgentTaskReport(cached) };
     }
@@ -4282,7 +4230,7 @@ export class TaskService implements AgentTaskIntegration {
         taskId
       );
       if (read.kind === "found") {
-        this.completedReportsByTaskId.set(taskId, {
+        this.waiters.cacheCompletedReport(taskId, {
           reportMarkdown: read.artifact.reportMarkdown,
           title: read.artifact.title,
           planFilePath: read.artifact.planFilePath,
@@ -4292,7 +4240,6 @@ export class TaskService implements AgentTaskIntegration {
           workflowOwnedAncestorWorkspaceIds: read.artifact.workflowOwnedAncestorWorkspaceIds,
           ancestorWorkspaceIds: read.artifact.ancestorWorkspaceIds,
         });
-        this.enforceCompletedReportCacheLimit();
         return { kind: "reported", report: toAgentTaskReport(read.artifact) };
       }
       if (read.kind === "unreadable") {
@@ -4677,16 +4624,8 @@ export class TaskService implements AgentTaskIntegration {
     return true;
   }
 
-  private markTaskQueueBackgrounded(taskId: string): void {
-    this.userBackgroundedTaskIds.add(taskId);
-  }
-
   markTaskForegroundRelevant(taskId: string): void {
-    this.userBackgroundedTaskIds.delete(taskId);
-  }
-
-  private isTaskQueueBackgrounded(taskId: string): boolean {
-    return this.userBackgroundedTaskIds.has(taskId);
+    this.waiters.markTaskForegroundRelevant(taskId);
   }
 
   /**
@@ -4729,6 +4668,12 @@ export class TaskService implements AgentTaskIntegration {
       countQueuedAgentPeerMessages: (targetId) =>
         workspaceService.countQueuedAgentPeerMessages(targetId) +
         this.peerSendParking.countParked(targetId),
+    });
+    this.waiters = new TaskWaiters({
+      scheduleNotifyOnTerminalPersist: (taskId, ownerWorkspaceId) =>
+        this.scheduleNotifyOnTerminalPersist(taskId, ownerWorkspaceId),
+      hasQueuedMessages: (workspaceId, dispatchMode) =>
+        this.workspaceService.hasQueuedMessages(workspaceId, dispatchMode),
     });
     this.terminalAttentionStore = terminalAttentionStore ?? new TerminalAttentionStore(config);
     this.workflowRunAttention = new WorkflowRunAttention({
@@ -6819,7 +6764,7 @@ export class TaskService implements AgentTaskIntegration {
           } catch (error: unknown) {
             // Nothing launches this row now (#5028), unless the row already moved on (another
             // writer's attempt, whose waiters this cancel must not touch).
-            if (!rowMoved) this.armWaitersOfUnendedTask(plan.taskId);
+            if (!rowMoved) this.waiters.armWaitersOfUnendedTask(plan.taskId);
             fenceFailure ??= { error };
             continue;
           }
@@ -7062,7 +7007,7 @@ export class TaskService implements AgentTaskIntegration {
             error: fenceError,
           });
           // Nothing launches this row now (#5028), unless it already moved on (see above).
-          if (!rowMoved) this.armWaitersOfUnendedTask(plan.taskId);
+          if (!rowMoved) this.waiters.armWaitersOfUnendedTask(plan.taskId);
           continue;
         }
       }
@@ -7558,10 +7503,10 @@ export class TaskService implements AgentTaskIntegration {
       // unknown when the updater never ran. But a waiter that attached while the task was
       // queued/starting arms its timeout only on the move to running, which this failed launch
       // never makes; arm it now (and for later waiters) so they settle at their timeout.
-      this.armWaitersOfUnendedTask(taskId);
+      this.waiters.armWaitersOfUnendedTask(taskId);
       throw error;
     }
-    this.unpersistedLaunchFailureTaskIds.delete(taskId);
+    this.waiters.clearUnpersistedLaunchFailure(taskId);
     if (superseded) {
       log.info("Task launch failure not recorded: the record was re-admitted by another writer", {
         taskId,
@@ -11257,7 +11202,7 @@ export class TaskService implements AgentTaskIntegration {
       for (const id of toTerminate) {
         this.beginWorkspaceStop(id);
         latched.push(id);
-        this.completedReportsByTaskId.delete(id);
+        this.waiters.deleteCompletedReport(id);
         this.rejectWaiters(id, terminationError);
         // Durable stop marker before removal: a workspace whose removal later fails or times out
         // must not read as a live running task once its latch settles. An entry already gone has
@@ -11896,85 +11841,30 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   isForegroundAwaiting(workspaceId: string): boolean {
-    const count = this.foregroundAwaitCountByWorkspaceId.get(workspaceId);
-    return typeof count === "number" && count > 0;
+    return this.waiters.isForegroundAwaiting(workspaceId);
   }
 
   startForegroundAwait(workspaceId: string): () => void {
-    assert(workspaceId.length > 0, "startForegroundAwait: workspaceId must be non-empty");
-
-    const current = this.foregroundAwaitCountByWorkspaceId.get(workspaceId) ?? 0;
-    assert(
-      Number.isInteger(current) && current >= 0,
-      "startForegroundAwait: expected non-negative integer counter"
-    );
-
-    this.foregroundAwaitCountByWorkspaceId.set(workspaceId, current + 1);
-
-    return () => {
-      const current = this.foregroundAwaitCountByWorkspaceId.get(workspaceId) ?? 0;
-      assert(
-        Number.isInteger(current) && current > 0,
-        "startForegroundAwait cleanup: expected positive integer counter"
-      );
-      if (current <= 1) {
-        this.foregroundAwaitCountByWorkspaceId.delete(workspaceId);
-      } else {
-        this.foregroundAwaitCountByWorkspaceId.set(workspaceId, current - 1);
-      }
-    };
+    return this.waiters.startForegroundAwait(workspaceId);
   }
 
   registerBackgroundableForegroundWaiter(
     workspaceId: string,
     waiter: BackgroundableForegroundWaiter
   ): void {
-    let set = this.backgroundableForegroundWaitersByWorkspaceId.get(workspaceId);
-    if (!set) {
-      set = new Set();
-      this.backgroundableForegroundWaitersByWorkspaceId.set(workspaceId, set);
-    }
-    set.add(waiter);
+    this.waiters.registerBackgroundableForegroundWaiter(workspaceId, waiter);
   }
 
   unregisterBackgroundableForegroundWaiter(
     workspaceId: string,
     waiter: BackgroundableForegroundWaiter
   ): void {
-    const set = this.backgroundableForegroundWaitersByWorkspaceId.get(workspaceId);
-    if (!set) return;
-    set.delete(waiter);
-    if (set.size === 0) {
-      this.backgroundableForegroundWaitersByWorkspaceId.delete(workspaceId);
-    }
+    this.waiters.unregisterBackgroundableForegroundWaiter(workspaceId, waiter);
   }
 
-  /**
-   * Reject all foreground task waiters for a workspace that opted into backgrounding
-   * when a new message is queued. Returns the number of waiters signaled.
-   * Safe to call repeatedly — already-cleaned-up waiters are skipped.
-   */
+  /** See TaskWaiters.backgroundForegroundWaitsForWorkspace. */
   backgroundForegroundWaitsForWorkspace(workspaceId: string): number {
-    const set = this.backgroundableForegroundWaitersByWorkspaceId.get(workspaceId);
-    if (!set || set.size === 0) return 0;
-
-    const waiters = [...set];
-    let count = 0;
-    for (const waiter of waiters) {
-      try {
-        this.markTaskQueueBackgrounded(waiter.taskId);
-        // A foreground wait detached by a queued message becomes durably non-blocking:
-        // persist notify_on_terminal so future stream-ends and restarts do not re-force the
-        // await. The in-memory mark above covers the immediate next stream-end while this
-        // persistence settles. Tracked so handleStreamEnd can await it before reading config.
-        this.scheduleNotifyOnTerminalPersist(waiter.taskId, waiter.requestingWorkspaceId);
-        waiter.reject(new ForegroundWaitBackgroundedError());
-        count++;
-      } catch {
-        // waiter already resolved/rejected — ignore
-      }
-    }
-    return count;
+    return this.waiters.backgroundForegroundWaitsForWorkspace(workspaceId);
   }
 
   /**
@@ -13688,24 +13578,15 @@ export class TaskService implements AgentTaskIntegration {
     await markPendingDelivered();
   }
 
-  /**
-   * Background any registered foreground waits for the requesting workspace when a
-   * tool-end message is already queued. Shared by both wait-registration paths
-   * (workspace-turn and task await): the auto-backgrounding signal is edge-triggered
-   * on enqueue, so a message queued before the waiter registered must be re-checked
-   * here. No-op when backgrounding is disabled or no requesting workspace is set.
-   */
+  /** See TaskWaiters.backgroundForegroundWaitIfQueued. */
   backgroundForegroundWaitIfQueued(
     shouldBackgroundOnQueuedMessage: boolean,
     requestingWorkspaceId: string | undefined
   ): void {
-    if (
-      shouldBackgroundOnQueuedMessage &&
-      requestingWorkspaceId &&
-      this.workspaceService.hasQueuedMessages(requestingWorkspaceId, "tool-end")
-    ) {
-      this.backgroundForegroundWaitsForWorkspace(requestingWorkspaceId);
-    }
+    this.waiters.backgroundForegroundWaitIfQueued(
+      shouldBackgroundOnQueuedMessage,
+      requestingWorkspaceId
+    );
   }
 
   async reportAgentProgress(
@@ -14096,7 +13977,7 @@ export class TaskService implements AgentTaskIntegration {
       if (!entry?.workspace.parentWorkspaceId) {
         return { status: "not_active" as const };
       }
-      if (hasCompletedAgentReport(entry.workspace) || this.completedReportsByTaskId.has(taskId)) {
+      if (hasCompletedAgentReport(entry.workspace) || this.waiters.hasCompletedReport(taskId)) {
         return { status: "already_reported" as const };
       }
       if (entry.workspace.taskStatus === "interrupted" && !this.aiService.isStreaming(taskId)) {
@@ -14136,10 +14017,7 @@ export class TaskService implements AgentTaskIntegration {
     if (!freshEntry?.workspace.parentWorkspaceId) {
       return "not_active";
     }
-    if (
-      hasCompletedAgentReport(freshEntry.workspace) ||
-      this.completedReportsByTaskId.has(taskId)
-    ) {
+    if (hasCompletedAgentReport(freshEntry.workspace) || this.waiters.hasCompletedReport(taskId)) {
       return "already_reported";
     }
     let finalizationAccepted = false;
@@ -14150,7 +14028,7 @@ export class TaskService implements AgentTaskIntegration {
         if (!entry?.workspace.parentWorkspaceId) {
           return;
         }
-        if (hasCompletedAgentReport(entry.workspace) || this.completedReportsByTaskId.has(taskId)) {
+        if (hasCompletedAgentReport(entry.workspace) || this.waiters.hasCompletedReport(taskId)) {
           return;
         }
         await this.editActiveWorkspaceEntry(
@@ -14243,7 +14121,7 @@ export class TaskService implements AgentTaskIntegration {
       if (!entry?.workspace.parentWorkspaceId) {
         return;
       }
-      if (hasCompletedAgentReport(entry.workspace) || this.completedReportsByTaskId.has(taskId)) {
+      if (hasCompletedAgentReport(entry.workspace) || this.waiters.hasCompletedReport(taskId)) {
         return;
       }
       try {
@@ -14290,7 +14168,7 @@ export class TaskService implements AgentTaskIntegration {
 
     // Report monotonicity invariant: check the in-memory cache before any status-based
     // interruption handling so a finalized report stays awaitable once observed.
-    const cached = this.completedReportsByTaskId.get(taskId);
+    const cached = this.waiters.getCompletedReport(taskId);
     if (cached) {
       return {
         reportMarkdown: cached.reportMarkdown,
@@ -14462,15 +14340,7 @@ export class TaskService implements AgentTaskIntegration {
               this.unregisterBackgroundableForegroundWaiter(entry.requestingWorkspaceId, entry);
             }
 
-            const current = this.pendingWaitersByTaskId.get(taskId);
-            if (current) {
-              const next = current.filter((w) => w !== entry);
-              if (next.length === 0) {
-                this.pendingWaitersByTaskId.delete(taskId);
-              } else {
-                this.pendingWaitersByTaskId.set(taskId, next);
-              }
-            }
+            this.waiters.removePendingWaiter(taskId, entry);
 
             cleanupStartWaiter();
 
@@ -14494,9 +14364,7 @@ export class TaskService implements AgentTaskIntegration {
           },
         };
 
-        const list = this.pendingWaitersByTaskId.get(taskId) ?? [];
-        list.push(entry);
-        this.pendingWaitersByTaskId.set(taskId, list);
+        this.waiters.addPendingWaiter(taskId, entry);
 
         const shouldBackgroundOnQueuedMessage = Boolean(
           requestingWorkspaceId && (options?.backgroundOnMessageQueued ?? true)
@@ -14521,22 +14389,12 @@ export class TaskService implements AgentTaskIntegration {
           const startWaiterEntry: PendingTaskStartWaiter = {
             start: startReportTimeout,
             cleanup: () => {
-              const currentStartWaiters = this.pendingStartWaitersByTaskId.get(taskId);
-              if (currentStartWaiters) {
-                const next = currentStartWaiters.filter((w) => w !== startWaiterEntry);
-                if (next.length === 0) {
-                  this.pendingStartWaitersByTaskId.delete(taskId);
-                } else {
-                  this.pendingStartWaitersByTaskId.set(taskId, next);
-                }
-              }
+              this.waiters.removePendingStartWaiter(taskId, startWaiterEntry);
             },
           };
           startWaiter = startWaiterEntry;
 
-          const currentStartWaiters = this.pendingStartWaitersByTaskId.get(taskId) ?? [];
-          currentStartWaiters.push(startWaiterEntry);
-          this.pendingStartWaitersByTaskId.set(taskId, currentStartWaiters);
+          this.waiters.addPendingStartWaiter(taskId, startWaiterEntry);
 
           // Close the race where the task starts between the initial config read and registering the waiter.
           // A launch whose failure could not be written never starts: arm the timeout now (#4747).
@@ -14545,7 +14403,7 @@ export class TaskService implements AgentTaskIntegration {
           if (
             (afterEntry?.workspace.taskStatus !== "queued" &&
               afterEntry?.workspace.taskStatus !== "starting") ||
-            this.unpersistedLaunchFailureTaskIds.has(taskId)
+            this.waiters.isLaunchFailureUnpersisted(taskId)
           ) {
             cleanupStartWaiter();
             startReportTimeout();
@@ -15413,7 +15271,7 @@ export class TaskService implements AgentTaskIntegration {
         continue;
       }
 
-      const cached = this.completedReportsByTaskId.get(taskId);
+      const cached = this.waiters.getCompletedReport(taskId);
       if (hasAncestorWorkspaceId(cached, ancestorWorkspaceId)) {
         result.push(taskId);
         continue;
@@ -15514,7 +15372,7 @@ export class TaskService implements AgentTaskIntegration {
       return indexResult;
     }
 
-    const cached = this.completedReportsByTaskId.get(taskId);
+    const cached = this.waiters.getCompletedReport(taskId);
     if (hasWorkflowOwnedAncestorWorkspaceId(cached, ancestorWorkspaceId)) {
       return true;
     }
@@ -15579,7 +15437,7 @@ export class TaskService implements AgentTaskIntegration {
     // The task workspace may have been removed after it settled (cleanup/restart). Preserve scope
     // checks by consulting persisted report AND failure artifacts in the ancestor session dir —
     // a terminally-failed child must stay awaitable so its typed failure can be surfaced.
-    const cached = this.completedReportsByTaskId.get(taskId);
+    const cached = this.waiters.getCompletedReport(taskId);
     if (hasAncestorWorkspaceId(cached, ancestorWorkspaceId)) {
       return true;
     }
@@ -16446,7 +16304,7 @@ export class TaskService implements AgentTaskIntegration {
       const workflowOwned = next.workflowOwned || entry?.workflowTask != null;
       const nonBlockingSubtree =
         this.resolveAgentTaskAttentionPolicy(next.taskId, index) === "notify_on_terminal" ||
-        this.isTaskQueueBackgrounded(next.taskId);
+        this.waiters.isTaskQueueBackgrounded(next.taskId);
       if (
         !nonBlockingSubtree &&
         entry != null &&
@@ -16971,25 +16829,14 @@ export class TaskService implements AgentTaskIntegration {
     await this.emitWorkspaceMetadata(workspaceId);
 
     if (status === "running") {
-      this.unpersistedLaunchFailureTaskIds.delete(workspaceId);
-      this.startPendingStartWaiters(workspaceId);
+      this.waiters.clearUnpersistedLaunchFailure(workspaceId);
+      this.waiters.startPendingStartWaiters(workspaceId);
     }
     return true;
   }
 
-  /**
-   * A write that would have ended a queued/starting task rejected, and nothing will move the row
-   * to running (#4747, #5028). Fail closed: waiters are not rejected with the unpersisted outcome,
-   * whose owner is unknown when the updater never ran. Their timeout is armed instead, now and for
-   * waiters that attach later, so they settle at their timeout.
-   */
-  private armWaitersOfUnendedTask(taskId: string): void {
-    this.unpersistedLaunchFailureTaskIds.add(taskId);
-    this.startPendingStartWaiters(taskId);
-  }
-
   noteWorkspaceRemoved(workspaceId: string): void {
-    this.unpersistedLaunchFailureTaskIds.delete(workspaceId);
+    this.waiters.clearUnpersistedLaunchFailure(workspaceId);
     // #5334: the stop generations otherwise grow with every workspace ever stopped. Dropping
     // them resets the generation to 0, which keeps the latch sound only because this runs after
     // the workspace left the config: peer-send admission rereads both endpoints from the config
@@ -17002,20 +16849,6 @@ export class TaskService implements AgentTaskIntegration {
     this.childGoalArbitratedStreams.delete(workspaceId);
     // Likewise the goal service's per-workspace stream-accounting receipts.
     this.workspaceGoalService?.forgetStreamAccountingReceipts(workspaceId);
-  }
-
-  /** Arms the report timeout of every waiter that attached while the task was queued/starting. */
-  private startPendingStartWaiters(workspaceId: string): void {
-    const waiters = this.pendingStartWaitersByTaskId.get(workspaceId);
-    if (!waiters || waiters.length === 0) return;
-    this.pendingStartWaitersByTaskId.delete(workspaceId);
-    for (const waiter of waiters) {
-      try {
-        waiter.start();
-      } catch (error: unknown) {
-        log.error("Task start waiter callback failed", { workspaceId, error });
-      }
-    }
   }
 
   /**
@@ -17249,7 +17082,7 @@ export class TaskService implements AgentTaskIntegration {
         return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
       }
       // The row names a new attempt now: the earlier attempt's cached report is not its (#7003).
-      this.completedReportsByTaskId.delete(workspaceId);
+      this.waiters.deleteCompletedReport(workspaceId);
       // Writers outside this mutex (a reactivation under its own locks, another backend) may have
       // rotated the row again during the commit's own awaits: never publish or own an identity
       // the durable row no longer names — the successor's ownership and closures stay untouched.
@@ -17840,7 +17673,7 @@ export class TaskService implements AgentTaskIntegration {
         });
       let activeTaskIds = [...listBlockingDescendantTaskIds(), ...activeWorkspaceTurnIds];
       const queueBackgroundedTaskIds = new Set(
-        activeTaskIds.filter((id) => this.isTaskQueueBackgrounded(id))
+        activeTaskIds.filter((id) => this.waiters.isTaskQueueBackgrounded(id))
       );
       // Durable `notify_on_terminal` work is non-blocking: it never forces the parent to
       // task_await and is not consumed at stream-end. Agent-task policy is applied by
@@ -19423,7 +19256,7 @@ export class TaskService implements AgentTaskIntegration {
 
     // Captured before settlement: rejectWaiters consumes the pending waiters
     // that prove a parent turn is actively listening for this task.
-    const hadForegroundWaiters = (this.pendingWaitersByTaskId.get(workspaceId)?.length ?? 0) > 0;
+    const hadForegroundWaiters = this.waiters.hasPendingWaiters(workspaceId);
 
     await this.settleInterruptedTaskAtStreamEnd(
       workspaceId,
@@ -20951,7 +20784,7 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     // Cache for the current process (best-effort). Disk is the source of truth.
-    this.completedReportsByTaskId.set(taskId, {
+    this.waiters.cacheCompletedReport(taskId, {
       reportMarkdown: artifact.reportMarkdown,
       title: artifact.title,
       planFilePath: artifact.planFilePath,
@@ -20961,7 +20794,6 @@ export class TaskService implements AgentTaskIntegration {
       workflowOwnedAncestorWorkspaceIds: artifact.workflowOwnedAncestorWorkspaceIds,
       ancestorWorkspaceIds: artifact.ancestorWorkspaceIds,
     });
-    this.enforceCompletedReportCacheLimit();
 
     // After the committed `reported` (ours above, or the other backend's): a report bound to the
     // row's attempt settles that attempt's stream-end decision (#7003); the notification then
@@ -21044,14 +20876,6 @@ export class TaskService implements AgentTaskIntegration {
     return !rowMoved;
   }
 
-  private enforceCompletedReportCacheLimit(): void {
-    while (this.completedReportsByTaskId.size > COMPLETED_REPORT_CACHE_MAX_ENTRIES) {
-      const first = this.completedReportsByTaskId.keys().next();
-      if (first.done) break;
-      this.completedReportsByTaskId.delete(first.value);
-    }
-  }
-
   private resolveWaiters(
     taskId: string,
     report: {
@@ -21078,7 +20902,7 @@ export class TaskService implements AgentTaskIntegration {
         true
     );
 
-    this.completedReportsByTaskId.set(taskId, {
+    this.waiters.cacheCompletedReport(taskId, {
       reportMarkdown: report.reportMarkdown,
       title: report.title,
       planFilePath: report.planFilePath,
@@ -21088,41 +20912,13 @@ export class TaskService implements AgentTaskIntegration {
       ancestorWorkspaceIds,
       workflowOwnedAncestorWorkspaceIds,
     });
-    this.enforceCompletedReportCacheLimit();
 
-    const waiters = this.pendingWaitersByTaskId.get(taskId);
-    if (!waiters || waiters.length === 0) {
-      return false;
-    }
-
-    this.pendingWaitersByTaskId.delete(taskId);
-    for (const waiter of waiters) {
-      try {
-        waiter.cleanup();
-        waiter.resolve(report);
-      } catch {
-        // ignore
-      }
-    }
-
-    return true;
+    return this.waiters.resolvePendingWaiters(taskId, report);
   }
 
+  // Kept on TaskService: tests spy on it, and every internal rejection goes through here.
   private rejectWaiters(taskId: string, error: Error): void {
-    this.markTaskForegroundRelevant(taskId);
-
-    const waiters = this.pendingWaitersByTaskId.get(taskId);
-    if (!waiters || waiters.length === 0) {
-      return;
-    }
-
-    for (const waiter of [...waiters]) {
-      try {
-        waiter.reject(error);
-      } catch (rejectError: unknown) {
-        log.error("Task waiter reject callback failed", { taskId, error: rejectError });
-      }
-    }
+    this.waiters.rejectWaiters(taskId, error);
   }
 
   private findProposePlanSuccessInParts(parts: readonly unknown[]): { planPath: string } | null {
@@ -21727,8 +21523,7 @@ export class TaskService implements AgentTaskIntegration {
     // If someone is actively awaiting this report (foreground task tool call or task_await),
     // skip injecting a synthetic history message to avoid duplicating the report in context.
     if (childWorkspaceId) {
-      const waiters = this.pendingWaitersByTaskId.get(childWorkspaceId);
-      if (waiters && waiters.length > 0) {
+      if (this.waiters.hasPendingWaiters(childWorkspaceId)) {
         return [];
       }
     }
