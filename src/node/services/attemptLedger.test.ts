@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/await-thenable -- bun:test async matchers return thenables the rule cannot see */
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
