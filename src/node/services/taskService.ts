@@ -1473,6 +1473,51 @@ function markedTerminalFailure(
   };
 }
 
+function indeterminateOutcome(reason: string): TaskAttemptOutcome<AgentTaskReport> {
+  return { kind: "indeterminate", reason };
+}
+
+/** A step of inspectAttemptOutcome that already decided the outcome (the method returns it). */
+interface DecidedAttemptOutcome {
+  readonly kind: "decided";
+  readonly outcome: TaskAttemptOutcome<AgentTaskReport>;
+}
+
+/** The row (lenient read) and the session dir that would hold its report. */
+interface LocatedAttemptRecord {
+  readonly entry: ReturnType<typeof findWorkspaceEntry>;
+  readonly reportOwnerWorkspaceId: string | undefined;
+}
+
+/**
+ * What the artifact reads proved. One record, so every classification step decides from the
+ * same observation: `entry` is the row read after the artifact awaits (#4414), never the
+ * snapshot taken before them, and `reportPositivelyAbsent` is true only once the report read
+ * positively found none.
+ */
+interface AttemptArtifactProbe {
+  readonly entry: ReturnType<typeof findWorkspaceEntry>;
+  readonly failure: { errorMessage: string } | undefined;
+  readonly reportPositivelyAbsent: boolean;
+}
+
+/**
+ * The row's terminal-failure marker (#4579) counts only for the attempt it names, so an
+ * artifact write that failed still fails the step, and a later attempt's no-report is not.
+ */
+function failureFieldsOf(
+  probe: AttemptArtifactProbe,
+  attemptId: string | undefined
+): { failure?: { errorMessage: string } } {
+  const marked = probe.failure ?? markedTerminalFailure(probe.entry?.workspace, attemptId);
+  return marked != null ? { failure: marked } : {};
+}
+
+/** The probed row's status: a row without one predates the field and reads as running. */
+function probedTaskStatus(probe: AttemptArtifactProbe): AgentTaskStatus | undefined {
+  return probe.entry?.workspace.taskStatus ?? (probe.entry != null ? "running" : undefined);
+}
+
 /**
  * The attempt a settlement/finalization write acts for (see rowSupersedes). A REQUIRED parameter
  * on every helper reachable from stream end, stream error, report publication and interrupted
@@ -2581,136 +2626,235 @@ export class TaskService implements AgentTaskIntegration {
     taskId: string,
     options?: { requestingWorkspaceId?: string }
   ): Promise<TaskAttemptOutcome<AgentTaskReport>> {
-    const indeterminate = (reason: string): TaskAttemptOutcome<AgentTaskReport> => ({
-      kind: "indeterminate",
-      reason,
-    });
     const cached = this.waiters.getCompletedReport(taskId);
     if (cached) {
       return { kind: "reported", report: toAgentTaskReport(cached) };
     }
-    let entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    const located = this.locateAttemptRecord(taskId, options);
+    if (located.kind === "decided") return located.outcome;
+    const read = await this.readAttemptArtifacts(taskId, located.record);
+    if (read.kind === "decided") return read.outcome;
+    const { probe } = read;
+    const live = this.classifyLiveAttempt(taskId, probe);
+    if (live.kind === "decided") return live.outcome;
+
+    const status = probedTaskStatus(probe);
+    const owned = this.attemptLedger.ownedAttempt(taskId);
+    if (owned == null) {
+      return await this.classifyUnownedAttempt(taskId, probe, status);
+    }
+    return this.classifyOwnedAttempt(taskId, probe, {
+      owned,
+      status,
+      executionId: live.executionId,
+    });
+  }
+
+  /** Rejects a row that is not an agent task, else locates it (see LocatedAttemptRecord). */
+  private locateAttemptRecord(
+    taskId: string,
+    options: { requestingWorkspaceId?: string } | undefined
+  ): DecidedAttemptOutcome | { kind: "located"; record: LocatedAttemptRecord } {
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
     if (entry != null && !entry.workspace.parentWorkspaceId) {
-      return indeterminate("workspace is not an agent task");
+      return { kind: "decided", outcome: indeterminateOutcome("workspace is not an agent task") };
     }
     const reportOwnerWorkspaceId =
       coerceNonEmptyString(options?.requestingWorkspaceId) ??
       coerceNonEmptyString(entry?.workspace.parentWorkspaceId);
-    let reportPositivelyAbsent = false;
-    let failure: { errorMessage: string } | undefined;
-    if (reportOwnerWorkspaceId != null) {
-      const read = await readSubagentReportArtifactStrict(
-        path.join(this.config.sessionsDir, reportOwnerWorkspaceId),
-        taskId
-      );
-      if (read.kind === "found") {
-        this.waiters.cacheCompletedReport(taskId, {
-          reportMarkdown: read.artifact.reportMarkdown,
-          title: read.artifact.title,
-          planFilePath: read.artifact.planFilePath,
-          structuredOutput: read.artifact.structuredOutput,
-          model: read.artifact.model,
-          thinkingLevel: read.artifact.thinkingLevel,
-          workflowOwnedAncestorWorkspaceIds: read.artifact.workflowOwnedAncestorWorkspaceIds,
-          ancestorWorkspaceIds: read.artifact.ancestorWorkspaceIds,
-        });
-        return { kind: "reported", report: toAgentTaskReport(read.artifact) };
-      }
-      if (read.kind === "unreadable") {
-        return indeterminate(
-          `report artifact unreadable in ${reportOwnerWorkspaceId}: ${read.error}`
-        );
-      }
-      reportPositivelyAbsent = true;
-      // A terminal failure (failAgentTaskTerminally) settles like a no-report stop and leaves a
-      // receipt too, so its failure artifact is read next, as strictly as the report: a found
-      // failure marks the outcome (never replaced), an unreadable one proves nothing.
-      const failureRead = await readSubagentFailureArtifactStrict(
-        path.join(this.config.sessionsDir, reportOwnerWorkspaceId),
-        taskId
-      );
-      if (failureRead.kind === "unreadable") {
-        // The row's marker (#4579) still proves a terminal failure for the attempt it names;
-        // without one, a damaged artifact proves nothing (fail closed).
-        let row: WorkspaceConfigEntry | undefined;
-        try {
-          row = findWorkspaceEntry(
-            this.config.loadConfigOrDefault({ throwOnError: true }),
-            taskId
-          )?.workspace;
-        } catch {
-          row = undefined;
-        }
-        const owned = this.attemptLedger.ownedAttempt(taskId);
-        const attemptId = row?.taskAttemptId;
-        const marked = markedTerminalFailure(row, attemptId);
-        if (marked != null && (owned?.attemptId == null || owned.attemptId === attemptId)) {
-          return { kind: "terminal-no-report", attemptId, failure: marked };
-        }
-        return indeterminate(
-          `failure artifact unreadable in ${reportOwnerWorkspaceId}: ${failureRead.error}`
-        );
-      }
-      if (failureRead.kind === "found") {
-        failure = { errorMessage: failureRead.artifact.errorMessage };
-      }
-      // The artifact read awaited: another backend may have re-admitted the row meanwhile, so
-      // the classification below must not decide from the snapshot taken before it (#4414).
-      entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
-    }
+    return { kind: "located", record: { entry, reportOwnerWorkspaceId } };
+  }
 
-    // The row's terminal-failure marker (#4579) counts only for the attempt it names, so an
-    // artifact write that failed still fails the step, and a later attempt's no-report is not.
-    const failureFields = (attemptId: string | undefined) => {
-      const marked = failure ?? markedTerminalFailure(entry?.workspace, attemptId);
-      return marked != null ? { failure: marked } : {};
-    };
+  /**
+   * Strict report read, then (only when the report is positively absent) the strict failure
+   * read. Without a session dir nothing is read and the located row stays the probe's row.
+   */
+  private async readAttemptArtifacts(
+    taskId: string,
+    located: LocatedAttemptRecord
+  ): Promise<DecidedAttemptOutcome | { kind: "probed"; probe: AttemptArtifactProbe }> {
+    const { reportOwnerWorkspaceId } = located;
+    if (reportOwnerWorkspaceId == null) {
+      return {
+        kind: "probed",
+        probe: { entry: located.entry, failure: undefined, reportPositivelyAbsent: false },
+      };
+    }
+    const read = await readSubagentReportArtifactStrict(
+      path.join(this.config.sessionsDir, reportOwnerWorkspaceId),
+      taskId
+    );
+    if (read.kind === "found") {
+      this.waiters.cacheCompletedReport(taskId, {
+        reportMarkdown: read.artifact.reportMarkdown,
+        title: read.artifact.title,
+        planFilePath: read.artifact.planFilePath,
+        structuredOutput: read.artifact.structuredOutput,
+        model: read.artifact.model,
+        thinkingLevel: read.artifact.thinkingLevel,
+        workflowOwnedAncestorWorkspaceIds: read.artifact.workflowOwnedAncestorWorkspaceIds,
+        ancestorWorkspaceIds: read.artifact.ancestorWorkspaceIds,
+      });
+      return {
+        kind: "decided",
+        outcome: { kind: "reported", report: toAgentTaskReport(read.artifact) },
+      };
+    }
+    if (read.kind === "unreadable") {
+      return {
+        kind: "decided",
+        outcome: indeterminateOutcome(
+          `report artifact unreadable in ${reportOwnerWorkspaceId}: ${read.error}`
+        ),
+      };
+    }
+    // A terminal failure (failAgentTaskTerminally) settles like a no-report stop and leaves a
+    // receipt too, so its failure artifact is read next, as strictly as the report: a found
+    // failure marks the outcome (never replaced), an unreadable one proves nothing.
+    const failureRead = await readSubagentFailureArtifactStrict(
+      path.join(this.config.sessionsDir, reportOwnerWorkspaceId),
+      taskId
+    );
+    if (failureRead.kind === "unreadable") {
+      return {
+        kind: "decided",
+        outcome: this.resolveUnreadableFailureArtifact(
+          taskId,
+          reportOwnerWorkspaceId,
+          failureRead.error
+        ),
+      };
+    }
+    const failure =
+      failureRead.kind === "found"
+        ? { errorMessage: failureRead.artifact.errorMessage }
+        : undefined;
+    // The artifact read awaited: another backend may have re-admitted the row meanwhile, so
+    // the classification below must not decide from the snapshot taken before it (#4414).
+    const entry = findWorkspaceEntry(this.config.loadConfigOrDefault(), taskId);
+    return { kind: "probed", probe: { entry, failure, reportPositivelyAbsent: true } };
+  }
+
+  /**
+   * The row's marker (#4579) still proves a terminal failure for the attempt it names;
+   * without one, a damaged artifact proves nothing (fail closed).
+   */
+  private resolveUnreadableFailureArtifact(
+    taskId: string,
+    reportOwnerWorkspaceId: string,
+    error: string
+  ): TaskAttemptOutcome<AgentTaskReport> {
+    let row: WorkspaceConfigEntry | undefined;
+    try {
+      row = findWorkspaceEntry(
+        this.config.loadConfigOrDefault({ throwOnError: true }),
+        taskId
+      )?.workspace;
+    } catch {
+      row = undefined;
+    }
+    const owned = this.attemptLedger.ownedAttempt(taskId);
+    const attemptId = row?.taskAttemptId;
+    const marked = markedTerminalFailure(row, attemptId);
+    if (marked != null && (owned?.attemptId == null || owned.attemptId === attemptId)) {
+      return { kind: "terminal-no-report", attemptId, failure: marked };
+    }
+    return indeterminateOutcome(
+      `failure artifact unreadable in ${reportOwnerWorkspaceId}: ${error}`
+    );
+  }
+
+  /**
+   * Evidence that the attempt is still running in this process. Runs after the artifact
+   * awaits; `executionId` carries over to the owned classification.
+   */
+  private classifyLiveAttempt(
+    taskId: string,
+    probe: AttemptArtifactProbe
+  ): DecidedAttemptOutcome | { kind: "not-live"; executionId: string } {
     // Owned cleanup in flight (Layer 2 latch): its release is the guaranteed settlement signal.
     if (this.isWorkspaceStopInProgress(taskId)) {
-      return { kind: "cleanup-pending" };
+      return { kind: "decided", outcome: { kind: "cleanup-pending" } };
     }
     const liveRegistration =
       this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId);
     if (liveRegistration != null) {
-      return { kind: "live", executionId: liveRegistration.handleId };
+      return { kind: "decided", outcome: { kind: "live", executionId: liveRegistration.handleId } };
     }
-    const executionId = coerceNonEmptyString(entry?.workspace.taskExecutionId) ?? taskId;
+    const executionId = coerceNonEmptyString(probe.entry?.workspace.taskExecutionId) ?? taskId;
     // Admitted in this process: a registered stream, or a turn admitted but still preparing
     // (no stream yet; Layer 2 may already have persisted "interrupted" ahead of its settlement).
     if (
       this.aiService.isStreaming(taskId) ||
       this.workspaceService.getActiveTurnGeneration(taskId) != null
     ) {
-      return { kind: "live", executionId };
+      return { kind: "decided", outcome: { kind: "live", executionId } };
     }
+    return { kind: "not-live", executionId };
+  }
 
-    const status = entry?.workspace.taskStatus ?? (entry != null ? "running" : undefined);
-    const owned = this.attemptLedger.ownedAttempt(taskId);
-    if (owned == null) {
-      if (entry == null) {
-        const reason = "no task record and no attempt owned by this process";
-        return this.taskRowPositivelyAbsent(taskId)
-          ? { kind: "indeterminate", reason, code: "no-record" }
-          : indeterminate(reason);
+  /** No attempt owned here: only durable evidence (the row, the parent's receipt) can decide. */
+  private async classifyUnownedAttempt(
+    taskId: string,
+    probe: AttemptArtifactProbe,
+    status: AgentTaskStatus | undefined
+  ): Promise<TaskAttemptOutcome<AgentTaskReport>> {
+    if (probe.entry == null) {
+      const reason = "no task record and no attempt owned by this process";
+      return this.taskRowPositivelyAbsent(taskId)
+        ? { kind: "indeterminate", reason, code: "no-record" }
+        : indeterminateOutcome(reason);
+    }
+    // Report first: this branch runs only once the report artifact read positively found none.
+    if (probe.reportPositivelyAbsent) {
+      const proof = await this.attemptLedger.readUnownedSettlementProof(taskId);
+      if (proof.kind === "proven") {
+        return {
+          kind: "terminal-no-report",
+          attemptId: proof.attemptId,
+          ...failureFieldsOf(probe, proof.attemptId),
+        };
       }
-      // Report first: this branch runs only once the report artifact read positively found none.
-      if (reportPositivelyAbsent) {
-        const proof = await this.attemptLedger.readUnownedSettlementProof(taskId);
-        if (proof.kind === "proven") {
-          return {
-            kind: "terminal-no-report",
-            attemptId: proof.attemptId,
-            ...failureFields(proof.attemptId),
-          };
-        }
-        return indeterminate(
-          `task status ${status ?? "running"} without an attempt owned by this process: ${proof.reason}`
-        );
-      }
-      return indeterminate(
-        `task status ${status ?? "running"} without an attempt owned by this process (legacy or prior-process attempt)`
+      return indeterminateOutcome(
+        `task status ${status ?? "running"} without an attempt owned by this process: ${proof.reason}`
       );
     }
+    return indeterminateOutcome(
+      `task status ${status ?? "running"} without an attempt owned by this process (legacy or prior-process attempt)`
+    );
+  }
+
+  /** An attempt this process owns: the current row, then its settlement, then its status. */
+  private classifyOwnedAttempt(
+    taskId: string,
+    probe: AttemptArtifactProbe,
+    attempt: {
+      readonly owned: OwnedTaskAttempt;
+      readonly status: AgentTaskStatus | undefined;
+      readonly executionId: string;
+    }
+  ): TaskAttemptOutcome<AgentTaskReport> {
+    const { owned, status } = attempt;
+    const rowConflict = this.readOwnedAttemptRowConflict(taskId, owned);
+    if (rowConflict != null) return rowConflict;
+    const settlement = this.attemptLedger.attemptSettlement(taskId);
+    if (settlement?.attempt === owned) {
+      return this.settleOwnedAttempt(taskId, probe, owned, settlement.phase);
+    }
+    if (status != null && ACTIVE_AGENT_TASK_STATUSES.has(status)) {
+      // Reserved/queued/launching/running under this process's ownership; no stream yet.
+      return { kind: "live", executionId: attempt.executionId };
+    }
+    return indeterminateOutcome(
+      `owned attempt (${owned.source}) has status ${status ?? "missing"} without settlement evidence`
+    );
+  }
+
+  /** The outcome when the current row contradicts this process's ownership; undefined if not. */
+  private readOwnedAttemptRowConflict(
+    taskId: string,
+    owned: OwnedTaskAttempt
+  ): TaskAttemptOutcome<AgentTaskReport> | undefined {
     // In-process authority covers exactly the attempt the persisted row names now (#4311, #4414):
     // once the row names another writer's attempt, lost its id, or cannot be read, this process's
     // ownership says nothing about the task — never report it as ended. Strict, and after the last
@@ -2723,40 +2867,40 @@ export class TaskService implements AgentTaskIntegration {
         taskId
       )?.workspace;
     } catch (error: unknown) {
-      return indeterminate(`config unreadable: ${getErrorMessage(error)}`);
+      return indeterminateOutcome(`config unreadable: ${getErrorMessage(error)}`);
     }
     if (currentRow != null && currentRow.taskAttemptId !== owned.attemptId) {
-      return indeterminate(
+      return indeterminateOutcome(
         `row names attempt ${currentRow.taskAttemptId ?? "none"}; this process owns ${owned.attemptId ?? "none"}`
       );
     }
-    const settlement = this.attemptLedger.attemptSettlement(taskId);
-    if (settlement?.attempt === owned) {
-      // Closed but not yet settled: the producer's awaited write (config, later the receipt) is
-      // still in flight. Its settlement is the guaranteed next signal (fail closed, not a wait).
-      if (settlement.phase === "closing") return { kind: "cleanup-pending" };
-      if (!reportPositivelyAbsent) {
-        return indeterminate(
-          "attempt settled but no session directory names where its report would be"
-        );
-      }
-      return {
-        kind: "terminal-no-report",
-        ...(owned.attemptId != null ? { attemptId: owned.attemptId } : {}),
-        ...failureFields(owned.attemptId),
-        // Ended before (or without) a published row, e.g. a canceled reservation.
-        ...(entry == null && this.taskRowPositivelyAbsent(taskId)
-          ? { code: "no-record" as const }
-          : {}),
-      };
+    return undefined;
+  }
+
+  /** The owned attempt's own settlement entry decides: closing, or settled without a report. */
+  private settleOwnedAttempt(
+    taskId: string,
+    probe: AttemptArtifactProbe,
+    owned: OwnedTaskAttempt,
+    phase: AttemptSettlementEntry["phase"]
+  ): TaskAttemptOutcome<AgentTaskReport> {
+    // Closed but not yet settled: the producer's awaited write (config, later the receipt) is
+    // still in flight. Its settlement is the guaranteed next signal (fail closed, not a wait).
+    if (phase === "closing") return { kind: "cleanup-pending" };
+    if (!probe.reportPositivelyAbsent) {
+      return indeterminateOutcome(
+        "attempt settled but no session directory names where its report would be"
+      );
     }
-    if (status != null && ACTIVE_AGENT_TASK_STATUSES.has(status)) {
-      // Reserved/queued/launching/running under this process's ownership; no stream yet.
-      return { kind: "live", executionId };
-    }
-    return indeterminate(
-      `owned attempt (${owned.source}) has status ${status ?? "missing"} without settlement evidence`
-    );
+    return {
+      kind: "terminal-no-report",
+      ...(owned.attemptId != null ? { attemptId: owned.attemptId } : {}),
+      ...failureFieldsOf(probe, owned.attemptId),
+      // Ended before (or without) a published row, e.g. a canceled reservation.
+      ...(probe.entry == null && this.taskRowPositivelyAbsent(taskId)
+        ? { code: "no-record" as const }
+        : {}),
+    };
   }
 
   /** Public entry point (WorkflowTaskServiceAdapter, WorkflowRunner); AttemptLedger owns the wait. */
