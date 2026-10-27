@@ -452,6 +452,7 @@ describe("TurnRequestBuilder assembled preflight", () => {
     const base = options("openai:large-context-model");
     const reply = createMuxMessage("reply", "assistant", "done", {
       model: base.modelString,
+      metadataModel: base.modelString,
       agentId: "exec",
       systemMessageTokens: 0,
       contextUsage: { inputTokens: 50_000, outputTokens: 10, totalTokens: 50_010 },

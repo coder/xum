@@ -8,7 +8,7 @@ import {
   type AssembledRequestBudgetInput,
 } from "@/common/utils/compaction/contextBudget";
 import type { JSONSchema7 } from "@ai-sdk/provider";
-import { createMuxMessage, type MuxMetadata } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
 import { CLAUDE_ENCODING_BUDGET_FACTOR } from "@/constants/tokenizerCorrection";
 import calibration from "./__fixtures__/contextBudgetClaudeTokenizer.json";
 import {
@@ -850,19 +850,32 @@ describe("turn-start anchor (#7662)", () => {
   const system = "Answer briefly and cite the files you read.";
   const systemTokens = async (forModel: string) =>
     (await tokenizerModule.getTokenizerForModel(forModel)).countTokens(system);
-  const request = { model, agentId: "exec", routeProvider: "openai", system };
+  const request: {
+    model: string;
+    metadataModel?: string;
+    agentId: string;
+    routeProvider: string;
+    system: string;
+  } = { model, agentId: "exec", routeProvider: "openai", system };
   const anchorFor = async (
     metadata?: Partial<MuxMetadata>,
-    overrides?: Partial<typeof request>
+    overrides?: Partial<typeof request>,
+    parts?: MuxMessage["parts"]
   ) => {
-    const reply = createMuxMessage("a1", "assistant", "answer", {
-      model,
-      agentId: "exec",
-      routeProvider: "openai",
-      systemMessageTokens: await systemTokens(overrides?.model ?? model),
-      contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
-      ...metadata,
-    });
+    const reply = createMuxMessage(
+      "a1",
+      "assistant",
+      parts == null ? "answer" : "",
+      {
+        model,
+        agentId: "exec",
+        routeProvider: "openai",
+        systemMessageTokens: await systemTokens(overrides?.model ?? model),
+        contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
+        ...metadata,
+      },
+      parts
+    );
     return createTurnBudgetAnchor([createMuxMessage("u1", "user", "hi"), reply], {
       ...request,
       ...overrides,
@@ -888,7 +901,7 @@ describe("turn-start anchor (#7662)", () => {
     );
   });
 
-  test("counts cache reads and writes once, adds system growth, and leaves out the reply's reasoning", async () => {
+  test("counts cache reads and writes once, and adds the reply's reasoning and system growth", async () => {
     const contextUsage = {
       inputTokens: 1000,
       outputTokens: 80,
@@ -899,11 +912,11 @@ describe("turn-start anchor (#7662)", () => {
     // Rows keep cache writes in provider metadata: 300 uncached + 600 read + 100 written.
     const contextProviderMetadata = { anthropic: { cacheCreationInputTokens: 100 } };
     const sent = await systemTokens(model);
-    expect((await anchorFor({ contextUsage, contextProviderMetadata }))?.providerTokens).toBe(1000);
+    expect((await anchorFor({ contextUsage, contextProviderMetadata }))?.providerTokens).toBe(1050);
     const grown = { contextUsage, systemMessageTokens: sent - 30 };
-    expect((await anchorFor(grown))?.providerTokens).toBe(1030);
+    expect((await anchorFor(grown))?.providerTokens).toBe(1080);
     const shrunk = { contextUsage, systemMessageTokens: sent + 30 };
-    expect((await anchorFor(shrunk))?.providerTokens).toBe(1000);
+    expect((await anchorFor(shrunk))?.providerTokens).toBe(1050);
     // Claude-encoded growth is scaled like every other claude count (#5219). Tests default to
     // the approximate tokenizer, which has no claude encoding.
     const original = process.env.XUM_FORCE_REAL_TOKENIZER;
@@ -912,10 +925,12 @@ describe("turn-start anchor (#7662)", () => {
       const claude = "anthropic:claude-opus-5-5";
       const claudeGrown = {
         model: claude,
+        metadataModel: claude,
         contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
         systemMessageTokens: (await systemTokens(claude)) - 30,
       };
-      expect((await anchorFor(claudeGrown, { model: claude }))?.providerTokens).toBe(
+      const claudeRequest = { model: claude, metadataModel: claude };
+      expect((await anchorFor(claudeGrown, claudeRequest))?.providerTokens).toBe(
         1000 + Math.ceil(30 * CLAUDE_ENCODING_BUDGET_FACTOR)
       );
     } finally {
@@ -940,10 +955,35 @@ describe("turn-start anchor (#7662)", () => {
     ["a reply without its system count", { systemMessageTokens: undefined }, {}],
     ["a reply without its model", { model: undefined }, {}],
     ["another model", {}, { model: "openai:gpt-4.1" }],
+    // A providers.jsonc mapping changes the resolved model and keeps the model.
+    ["another resolved model", { metadataModel: "openai:gpt-4.1" }, { metadataModel: model }],
+    ["a reply without its resolved model", {}, { metadataModel: model }],
     ["another route", {}, { routeProvider: "openrouter" }],
     ["another agent", {}, { agentId: "plan" }],
   ])("%s yields no turn anchor", async (_name, metadata, overrides) => {
     expect(await anchorFor(metadata, overrides)).toBeUndefined();
+  });
+
+  // The next request replays the last step's thinking at its full count; the estimator sees at
+  // most its summary text (Anthropic redacted thinking and OpenAI encrypted reasoning have none).
+  const thinking = { type: "reasoning" as const, text: "" };
+  const text = (value: string) => ({ type: "text" as const, text: value });
+  test.each<[string, MuxMessage["parts"], Partial<MuxMetadata>, number | undefined]>([
+    ["last-step reasoning without a reported count", [thinking], {}, undefined],
+    [
+      "last-step reasoning counted only in provider metadata",
+      [thinking],
+      { contextProviderMetadata: { openai: { reasoningTokens: 40 } } },
+      1040,
+    ],
+    [
+      "reasoning only before the last step",
+      [thinking, text("step one"), text("answer")],
+      { stepStartPartIndices: [0, 2] },
+      1000,
+    ],
+  ])("a reply with %s", async (_name, parts, metadata, providerTokens) => {
+    expect((await anchorFor(metadata, {}, parts))?.providerTokens).toBe(providerTokens);
   });
 
   test("a reply marked as not compacted still anchors", async () => {

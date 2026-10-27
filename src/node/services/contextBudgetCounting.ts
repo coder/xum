@@ -16,8 +16,12 @@ import {
 } from "@/common/constants/contextBudget";
 import type { MuxMessage } from "@/common/types/message";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
-import { createDisplayUsage } from "@/common/utils/tokens/displayUsage";
-import { normalizeUsage, type AiSdkUsageLike } from "@/common/utils/tokens/usageHelpers";
+import { isTrustedStepStartList } from "@/common/utils/messages/stepStartPartIndices";
+import {
+  getPromptTokens,
+  readUsageTokens,
+  type AiSdkUsageLike,
+} from "@/common/utils/tokens/usageHelpers";
 import { countToolReferences } from "@/common/utils/tools/toolCatalog";
 import { getTokenizerForModel } from "@/node/utils/main/tokenizer";
 import {
@@ -173,24 +177,33 @@ export interface TurnBudgetAnchor extends BudgetModel {
   providerTokens: number;
 }
 
-/** A step's usage normalized for display, or undefined without a positive integer input total. */
-function reportedUsage(
+/**
+ * The provider's count of a step's request (cache reads and writes included) plus the step's
+ * reasoning output: the next request replays that reasoning, and the local estimator skips its
+ * encrypted form (signatures, redacted data, encrypted content). The visible reasoning text the
+ * next request also carries is counted again by its estimate, a small overcount. Undefined (so
+ * the caller uses the full estimate) without a positive integer input total, or when the step
+ * emitted reasoning without a reported count.
+ */
+function replayedStepTokens(
   usage: AiSdkUsageLike,
-  model: string,
-  providerMetadata: Record<string, unknown> | undefined
-) {
-  const normalized = normalizeUsage(usage);
+  providerMetadata: Record<string, unknown> | undefined,
+  emittedReasoning: boolean
+): number | undefined {
   // Cache or reasoning details without an input total do not count the whole request.
-  const input = normalized.inputTokens;
+  const input = usage.inputTokens;
   if (input == null || !Number.isSafeInteger(input) || input <= 0) return undefined;
-  return createDisplayUsage(normalized, model, providerMetadata);
+  // Provider-metadata-only reasoning counts are read too. Zero cannot tell "no reasoning" from
+  // "not reported", so a step that emitted reasoning needs a count.
+  const tokens = readUsageTokens(usage, providerMetadata);
+  if (emittedReasoning && tokens.reasoning === 0) return undefined;
+  const total = getPromptTokens(tokens) + tokens.reasoning;
+  return Number.isSafeInteger(total) ? total : undefined;
 }
 
 /**
- * Pairs a step's request with the usage the provider reported for it. Reasoning output is
- * added because the next request replays it and the local estimator skips encrypted
- * reasoning. Undefined (so the caller uses the full estimate) when the provider reported no
- * positive integer input total, or when the step emitted reasoning without a reported count.
+ * Pairs a step's request with its provider count (replayedStepTokens). Undefined (so the caller
+ * uses the full estimate) when the step has none.
  */
 export function createContextBudgetAnchor(
   request: ContextBudgetAnchorRequest | undefined,
@@ -203,17 +216,9 @@ export function createContextBudgetAnchor(
     | undefined
 ): ContextBudgetAnchor | undefined {
   if (request == null || step?.usage == null) return undefined;
-  const usage = reportedUsage(step.usage, request.model, step.providerMetadata);
-  if (usage == null) return undefined;
-  // Display recovery also reads provider-metadata-only reasoning counts. Zero cannot tell
-  // "no reasoning" from "not reported", so a step that emitted reasoning needs a count.
-  const reasoning = usage.reasoning.tokens;
-  if (reasoning === 0 && (step.reasoning?.length ?? 0) > 0) return undefined;
-  const providerTokens =
-    usage.input.tokens + usage.cached.tokens + usage.cacheCreate.tokens + reasoning;
-  return Number.isSafeInteger(providerTokens) && providerTokens > 0
-    ? { ...request, providerTokens }
-    : undefined;
+  const emittedReasoning = (step.reasoning?.length ?? 0) > 0;
+  const providerTokens = replayedStepTokens(step.usage, step.providerMetadata, emittedReasoning);
+  return providerTokens == null ? undefined : { ...request, providerTokens };
 }
 
 /** Both set and different: a row without the field does not count as a switch. */
@@ -238,62 +243,78 @@ function isCompletedReply(metadata: ReplyMetadata): boolean {
   );
 }
 
-/** The model, route and agent switches that re-freeze the system prompt. */
-function sameRequestRoute(
-  metadata: ReplyMetadata & { model: string },
-  request: BudgetModel & { routeProvider?: string; agentId?: string }
-): boolean {
-  // Rows record the canonical model (Coder ids raw), so compare both sides canonicalized.
+type AnchorRequest = BudgetModel & { routeProvider?: string; agentId?: string };
+
+/**
+ * The model the provider counted with, and the route and agent switches that re-freeze the
+ * system prompt.
+ */
+function sameRequestRoute(metadata: ReplyMetadata & { model: string }, request: AnchorRequest) {
+  // Rows record the canonical model (Coder ids raw), so compare both sides canonicalized. A
+  // providers.jsonc mapping keeps the model and changes the resolved model, which picks the
+  // tokenizer and the request transforms, so a row from another one (or from a build that did
+  // not record it) does not anchor.
   return (
     normalizeToCanonical(metadata.model) === normalizeToCanonical(request.model) &&
+    metadata.metadataModel === request.metadataModel &&
     !differs(metadata.routeProvider, request.routeProvider) &&
     !differs(metadata.agentId, request.agentId)
   );
 }
 
 /** The newest reply's metadata when its saved usage can anchor this request, else undefined. */
-function anchoringReply(
-  rows: readonly MuxMessage[],
-  request: BudgetModel & { routeProvider?: string; agentId?: string }
-) {
-  const metadata = rows.findLast((row) => row.role === "assistant")?.metadata;
+function anchoringReply(metadata: ReplyMetadata | undefined, request: AnchorRequest) {
   const { contextUsage, model, systemMessageTokens } = metadata ?? {};
   if (contextUsage == null || model == null || systemMessageTokens == null) return undefined;
   const reply = { ...metadata, contextUsage, model, systemMessageTokens };
   return isCompletedReply(reply) && sameRequestRoute(reply, request) ? reply : undefined;
 }
 
+/** Whether the reply's last step (from its last trusted step start) emitted reasoning. */
+function lastStepEmittedReasoning(reply: Pick<MuxMessage, "parts" | "metadata">): boolean {
+  const starts: unknown = reply.metadata?.stepStartPartIndices;
+  const first = isTrustedStepStartList(starts)
+    ? (starts.findLast((index) => index < reply.parts.length) ?? 0)
+    : 0;
+  return reply.parts.slice(first).some((part) => part.type === "reasoning");
+}
+
 /**
  * The anchor for a turn-start request built from `rows`, its provider request rows (#7662).
- * The newest assistant row must be a completed reply from the same model, route and agent (the
- * switches that re-freeze the system prompt), with the provider's input total for its last step
- * and its sent system token count. Undefined (so the caller uses the full estimate) otherwise.
+ * The newest assistant row must be a completed reply from the same model, resolved model, route
+ * and agent, with the provider's input total for its last step and its sent system token count.
+ * Undefined (so the caller uses the full estimate) otherwise.
  *
- * Reasoning output is not added, unlike the in-turn anchor: the request carries that step's
- * output, reasoning text included, after the anchored prefix, so the estimator counts it.
+ * Like the in-turn anchor, the last step's reasoning output is added (replayedStepTokens): the
+ * request replays it after the anchored prefix, and a model that keeps earlier thinking (Claude
+ * Opus 5.5 does) counts all of it, not the summary text the estimator sees. For a model that
+ * drops it, this overcounts by that step's reasoning.
+ *
  * Growth of `system`, the sent system text, since that request (a live system prompt changes
  * between turns when the provider takes no system rows) is added, because the provider count
  * holds the old prompt. New tail rows go after the newest reply, where the delta counts them.
  */
 export async function createTurnBudgetAnchor(
   rows: readonly MuxMessage[],
-  request: BudgetModel & { routeProvider?: string; agentId?: string; system: string }
+  request: AnchorRequest & { system: string }
 ): Promise<TurnBudgetAnchor | undefined> {
-  const reply = anchoringReply(rows, request);
+  const row = rows.findLast((candidate) => candidate.role === "assistant");
+  if (row == null) return undefined;
+  const reply = anchoringReply(row.metadata, request);
   if (reply == null) return undefined;
-  const usage = reportedUsage(reply.contextUsage, request.model, reply.contextProviderMetadata);
-  if (usage == null) return undefined;
+  const replayed = replayedStepTokens(
+    reply.contextUsage,
+    reply.contextProviderMetadata,
+    lastStepEmittedReasoning(row)
+  );
+  if (replayed == null) return undefined;
   // The row counted its system text, tail rows included, with this tokenizer (measureSentSystem),
   // so its rows only make the growth smaller. Claude-encoded growth is scaled like every other
   // claude count (#5219).
   const tokenizer = await getTokenizerForModel(request.model, request.metadataModel);
   const growth = (await tokenizer.countTokens(request.system)) - reply.systemMessageTokens;
   const factor = tokenizer.encoding === "claude" ? CLAUDE_ENCODING_BUDGET_FACTOR : 1;
-  const providerTokens =
-    usage.input.tokens +
-    usage.cached.tokens +
-    usage.cacheCreate.tokens +
-    Math.ceil(Math.max(0, growth) * factor);
+  const providerTokens = replayed + Math.ceil(Math.max(0, growth) * factor);
   return Number.isSafeInteger(providerTokens)
     ? { model: request.model, metadataModel: request.metadataModel, providerTokens }
     : undefined;
