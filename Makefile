@@ -236,14 +236,14 @@ bug-bash: ## Agent bug bash in the bug-bash sandbox: e2e explore charters x mode
 	@bun tests/bugbash/run.ts $(BUGBASH_ARGS)
 
 # The bug-bash sandbox image (tests/bugbash/sandbox/build.sh, #5714). Each prints one value on
-# stdout. Publishing runs only in the manual "Bug-bash sandbox image" workflow on main.
+# stdout. Publishing runs only in the "Bug-bash sandbox image" workflow on main.
 bugbash-sandbox-key: ## Print the inputs key of the bug-bash sandbox image for this checkout
 	@./tests/bugbash/sandbox/build.sh --key
 
 bugbash-sandbox-image: ## Build the bug-bash sandbox image locally (linux/amd64) and print its image ID
 	@./tests/bugbash/sandbox/build.sh
 
-bugbash-sandbox-publish: ## Workflow only: build and push the bug-bash sandbox image, print its image.json record
+bugbash-sandbox-publish: ## Workflow only: build and push the bug-bash sandbox image, print its publish record
 	@./tests/bugbash/sandbox/build.sh --push
 
 # The sandbox self-check (tests/bugbash/sandbox/selfCheckRun.ts, #5714): three jobs through the real
