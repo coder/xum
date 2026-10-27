@@ -154,7 +154,9 @@ function setupMidTurn(workspaceId: string) {
           toolCallId: "call-canary-check",
           toolName: "bash",
           args: { script: "sleep 20", display_name: "Canary error rate", timeout_secs: 30 },
-          tokens: 5,
+          // No tokens: the chat's streaming token count refreshes on deltas, not on tool-call-start,
+          // so tokens here showed only when no render ran between the two events (a flaky snapshot).
+          tokens: 0,
           timestamp: STABLE_TIMESTAMP,
         });
       }, 50);
