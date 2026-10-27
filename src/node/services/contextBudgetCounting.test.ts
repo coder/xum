@@ -9,6 +9,7 @@ import {
 } from "@/common/utils/compaction/contextBudget";
 import type { JSONSchema7 } from "@ai-sdk/provider";
 import { createMuxMessage, type MuxMessage, type MuxMetadata } from "@/common/types/message";
+import type { ThinkingLevel } from "@/common/types/thinking";
 import { CLAUDE_ENCODING_BUDGET_FACTOR } from "@/constants/tokenizerCorrection";
 import calibration from "./__fixtures__/contextBudgetClaudeTokenizer.json";
 import {
@@ -855,8 +856,9 @@ describe("turn-start anchor (#7662)", () => {
     metadataModel?: string;
     agentId: string;
     routeProvider: string;
+    thinkingLevel: ThinkingLevel;
     system: string;
-  } = { model, agentId: "exec", routeProvider: "openai", system };
+  } = { model, agentId: "exec", routeProvider: "openai", thinkingLevel: "high", system };
   const anchorFor = async (
     metadata?: Partial<MuxMetadata>,
     overrides?: Partial<typeof request>,
@@ -870,6 +872,7 @@ describe("turn-start anchor (#7662)", () => {
         model,
         agentId: "exec",
         routeProvider: "openai",
+        thinkingLevel: "high",
         systemMessageTokens: await systemTokens(overrides?.model ?? model),
         contextUsage: { inputTokens: 1000, outputTokens: 10, totalTokens: 1010 },
         ...metadata,
@@ -984,6 +987,9 @@ describe("turn-start anchor (#7662)", () => {
     ["a reply without its resolved model", {}, { metadataModel: model }],
     ["another route", {}, { routeProvider: "openrouter" }],
     ["another agent", {}, { agentId: "plan" }],
+    // Anthropic history keeps signed reasoning with thinking on and strips it at "off".
+    ["another thinking level", {}, { thinkingLevel: "off" }],
+    ["a reply without its thinking level", { thinkingLevel: undefined }, {}],
   ])("%s yields no turn anchor", async (_name, metadata, overrides) => {
     expect(await anchorFor(metadata, overrides)).toBeUndefined();
   });
@@ -992,6 +998,14 @@ describe("turn-start anchor (#7662)", () => {
   // most its summary text (Anthropic redacted thinking and OpenAI encrypted reasoning have none).
   const thinking = { type: "reasoning" as const, text: "" };
   const text = (value: string) => ({ type: "text" as const, text: value });
+  const toolCall = {
+    type: "dynamic-tool" as const,
+    toolCallId: "call-1",
+    toolName: "web_search",
+    state: "output-available" as const,
+    input: { query: "docs" },
+    output: "results ".repeat(500),
+  };
   test.each<[string, MuxMessage["parts"], Partial<MuxMetadata>, number | undefined]>([
     ["last-step reasoning without a reported count", [thinking], {}, undefined],
     [
@@ -1004,6 +1018,20 @@ describe("turn-start anchor (#7662)", () => {
       "reasoning only before the last step",
       [thinking, text("step one"), text("answer")],
       { stepStartPartIndices: [0, 2] },
+      1000,
+    ],
+    // The rebuild sends the tool call and its result before the trailing text message.
+    [
+      "text after a last-step tool call",
+      [text("searching"), toolCall, text("answer")],
+      {},
+      undefined,
+    ],
+    ["a tool call that ends the last step", [text("checking"), toolCall], {}, 1000],
+    [
+      "a tool call only before the last step",
+      [toolCall, text("answer")],
+      { stepStartPartIndices: [0, 1] },
       1000,
     ],
   ])("a reply with %s", async (_name, parts, metadata, providerTokens) => {

@@ -774,6 +774,7 @@ async function turnBudgetAnchorFor(
     metadataModel,
     routeProvider: options.routeProvider,
     agentId: options.effectiveAgentId,
+    thinkingLevel: options.effectiveThinkingLevel,
     // The text the reply's systemMessageTokens counted (measureSentSystem), rows included.
     system: payload.sentSystem.message + payload.sentSystem.rowsText,
   });

@@ -15,6 +15,8 @@ import {
   REQUEST_FRAMING_TOKENS,
 } from "@/common/constants/contextBudget";
 import type { MuxMessage } from "@/common/types/message";
+import type { ThinkingLevel } from "@/common/types/thinking";
+import { isDynamicToolPart } from "@/common/types/toolParts";
 import { normalizeToCanonical } from "@/common/utils/ai/models";
 import { isTrustedStepStartList } from "@/common/utils/messages/stepStartPartIndices";
 import {
@@ -250,11 +252,15 @@ function isCompletedReply(metadata: ReplyMetadata): boolean {
   );
 }
 
-type AnchorRequest = BudgetModel & { routeProvider?: string; agentId?: string };
+type AnchorRequest = BudgetModel & {
+  routeProvider?: string;
+  agentId?: string;
+  thinkingLevel: ThinkingLevel;
+};
 
 /**
- * The model the provider counted with, and the route and agent switches that re-freeze the
- * system prompt.
+ * The model the provider counted with, the route and agent switches that re-freeze the system
+ * prompt, and the thinking level that decides which earlier reasoning replays.
  */
 function sameRequestRoute(metadata: ReplyMetadata & { model: string }, request: AnchorRequest) {
   // Rows record the canonical model (Coder ids raw), so compare both sides canonicalized. A
@@ -264,6 +270,9 @@ function sameRequestRoute(metadata: ReplyMetadata & { model: string }, request: 
   return (
     normalizeToCanonical(metadata.model) === normalizeToCanonical(request.model) &&
     metadata.metadataModel === request.metadataModel &&
+    // Message preparation keeps or strips earlier Anthropic reasoning by the effective level,
+    // which the row records, so another level replays history the count does not hold.
+    metadata.thinkingLevel === request.thinkingLevel &&
     !differs(metadata.routeProvider, request.routeProvider) &&
     !differs(metadata.agentId, request.agentId)
   );
@@ -277,20 +286,31 @@ function anchoringReply(metadata: ReplyMetadata | undefined, request: AnchorRequ
   return isCompletedReply(reply) && sameRequestRoute(reply, request) ? reply : undefined;
 }
 
-/** Whether the reply's last step (from its last trusted step start) emitted reasoning. */
-function lastStepEmittedReasoning(reply: Pick<MuxMessage, "parts" | "metadata">): boolean {
+/** The reply's last step: its parts from its last trusted step start. */
+function lastStepParts(reply: Pick<MuxMessage, "parts" | "metadata">): MuxMessage["parts"] {
   const starts: unknown = reply.metadata?.stepStartPartIndices;
   const first = isTrustedStepStartList(starts)
     ? (starts.findLast((index) => index < reply.parts.length) ?? 0)
     : 0;
-  return reply.parts.slice(first).some((part) => part.type === "reasoning");
+  return reply.parts.slice(first);
+}
+
+/**
+ * Whether content follows a tool call in the step. The rebuild then splits the step into an
+ * assistant message, its tool results and a trailing assistant message (a provider-run web
+ * search does this), so a delta from the last assistant message would miss the first two.
+ */
+function splitsAfterToolCall(parts: MuxMessage["parts"]): boolean {
+  const firstTool = parts.findIndex(isDynamicToolPart);
+  return firstTool >= 0 && parts.slice(firstTool).some((part) => !isDynamicToolPart(part));
 }
 
 /**
  * The anchor for a turn-start request built from `rows`, its provider request rows (#7662).
- * The newest assistant row must be a completed reply from the same model, resolved model, route
- * and agent, with the provider's input total for its last step and its sent system token count.
- * Undefined (so the caller uses the full estimate) otherwise.
+ * The newest assistant row must be a completed reply from the same model, resolved model, route,
+ * agent and thinking level, with the provider's input total for its last step and its sent
+ * system token count, and its last step must end in one assistant message. Undefined (so the
+ * caller uses the full estimate) otherwise.
  *
  * Like the in-turn anchor, the last step's reasoning output is added (replayedStepTokens): the
  * request replays it after the anchored prefix, and a model that keeps earlier thinking (Claude
@@ -309,11 +329,12 @@ export async function createTurnBudgetAnchor(
   const row = rows.findLast((candidate) => candidate.role === "assistant");
   if (row == null) return undefined;
   const reply = anchoringReply(row.metadata, request);
-  if (reply == null) return undefined;
+  const lastStep = lastStepParts(row);
+  if (reply == null || splitsAfterToolCall(lastStep)) return undefined;
   const replayed = replayedStepTokens(
     reply.contextUsage,
     reply.contextProviderMetadata,
-    lastStepEmittedReasoning(row)
+    lastStep.some((part) => part.type === "reasoning")
   );
   if (replayed == null) return undefined;
   // The row counted the same text (message and rows) with this tokenizer (measureSentSystem).

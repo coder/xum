@@ -455,6 +455,7 @@ describe("TurnRequestBuilder assembled preflight", () => {
       model: base.modelString,
       metadataModel: base.modelString,
       agentId: "exec",
+      thinkingLevel: base.effectiveThinkingLevel,
       systemMessageTokens: 0,
       contextUsage: { inputTokens: 50_000, outputTokens: 10, totalTokens: 50_010 },
     });
@@ -509,6 +510,7 @@ describe("TurnRequestBuilder assembled preflight", () => {
       metadataModel: opus.modelString,
       agentId: "exec",
       routeProvider: "anthropic",
+      thinkingLevel: opus.effectiveThinkingLevel,
       volatileSystemTail: { text: tail, placement: "row" },
       systemMessageTokens: await tokenizer.countTokens(
         earlier.sentSystem.message + earlier.sentSystem.rowsText
