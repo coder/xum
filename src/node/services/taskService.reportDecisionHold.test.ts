@@ -52,8 +52,8 @@ interface Internals {
   attemptLedger: {
     ownedAttemptByTaskId: Map<string, { attemptId?: string }>;
     attemptSettlementByTaskId: Map<string, { attemptId?: string; phase: string }>;
+    admittedSendsByTaskId: Map<string, Set<{ state: string; attemptId: string }>>;
   };
-  admittedSendsByTaskId: Map<string, Set<{ state: string; attemptId: string }>>;
   streamEndDecisionsByTaskId: Map<string, Array<{ attemptId: string; outcome: string }>>;
   taskStopLatch: { workspaceStopRecords: Map<string, unknown> };
   emitWorkspaceMetadata: (workspaceId: string) => Promise<void>;
@@ -128,7 +128,9 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
   const entryOf = (config: Config, id: string) => findWorkspaceInConfig(config, id);
   /** Obligations that could still start a turn (an admitted one belongs to its turn until it settles). */
   const outstanding = (svc: Internals, id: string) =>
-    [...(svc.admittedSendsByTaskId.get(id) ?? [])].filter((send) => send.state !== "admitted");
+    [...(svc.attemptLedger.admittedSendsByTaskId.get(id) ?? [])].filter(
+      (send) => send.state !== "admitted"
+    );
   async function until(condition: () => boolean, label: string): Promise<void> {
     const deadline = Date.now() + 5_000;
     while (!condition() && Date.now() < deadline) {
@@ -847,7 +849,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       });
       // The follow-up went out (turn admitted); any recovery nudge queues behind it; the decision
       // has no reader left.
-      const sends = [...(svc.admittedSendsByTaskId.get(childId) ?? [])];
+      const sends = [...(svc.attemptLedger.admittedSendsByTaskId.get(childId) ?? [])];
       expect(sends.some((send) => send.state === "admitted" && send.attemptId === attemptA)).toBe(
         true
       );
@@ -1132,7 +1134,7 @@ describe("report-decision hold for queued follow-ups (real host)", () => {
       expect(completions).toHaveLength(1);
       expect(entryOf(config, childId)?.taskAttemptId).toBe("att_00000000000000b4");
       expect(stack.heldTexts()).toEqual(["follow-up text"]);
-      const sends = [...(svc.admittedSendsByTaskId.get(childId) ?? [])];
+      const sends = [...(svc.attemptLedger.admittedSendsByTaskId.get(childId) ?? [])];
       expect(sends.some((send) => send.attemptId === "att_00000000000000b4")).toBe(false);
       expect(outstanding(svc, childId).filter((send) => send.attemptId === attemptA)).toHaveLength(
         0
