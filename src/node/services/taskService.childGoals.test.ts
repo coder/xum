@@ -582,6 +582,36 @@ describe("TaskService child goals", () => {
     expect(t.sends()).toHaveLength(0);
   });
 
+  // #4545: a workflow claim retired the attempt while its stream ran, so the replacement owns the
+  // outcome. The final prose is not published, and this attempt's waiters end now.
+  test("a final report on a retired attempt is not published and rejects its waiters", async () => {
+    const t = await setup();
+    const waiter = t.taskService
+      .waitForAgentReport(childId, { timeoutMs: 5_000, requestingWorkspaceId: parentId })
+      .then(
+        () => "resolved",
+        (error: unknown) => `rejected: ${error instanceof Error ? error.message : String(error)}`
+      );
+    await t.editChild((workspace) => {
+      workspace.taskAttemptRetiredBy = {
+        runId: "wfr_retired",
+        stepId: "summarize",
+        inputHash: "hash-1",
+        childTaskId: "replacement-child",
+        attemptId: "att_00000000000000c1",
+        mode: "no-report",
+        at: "2026-10-01T00:00:00.000Z",
+      };
+    });
+
+    await streamEnd(t.taskService, t.proseEnd("assistant-1"));
+
+    expect(await waiter).toContain("retired this task attempt");
+    expect(t.child()?.taskStatus).toBe("running");
+    expect(await t.parentReports()).toHaveLength(0);
+    expect(t.sends()).toHaveLength(0);
+  });
+
   test("a user pause during arbitration publishes the report and starts no goal turn", async () => {
     const t = await setup();
     await t.setChildGoal();
@@ -1642,6 +1672,28 @@ describe("TaskService child goals", () => {
     await t.untilSends(1);
     expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual(["goal_continuation"]);
     expect(t.staleAtSend).toEqual([false]);
+    expect(await t.parentReports()).toHaveLength(0);
+  });
+
+  // The last goal arbitration (no final report) defers too: handleStreamEnd returns "deferred"
+  // so the ledger hands the stream to deferChildStreamEnd instead of asking for the report now.
+  test("unsettled accounting defers a stream end without a report; its settlement continues the goal", async () => {
+    const t = await setup();
+    await t.setChildGoal();
+    const realWait = t.goals.waitForStreamAccountingReceipt.bind(t.goals);
+    spyOn(t.goals, "waitForStreamAccountingReceipt").mockImplementation((workspaceId, messageId) =>
+      realWait(workspaceId, messageId, 20)
+    );
+    t.goals.beginStreamAccountingReceipt(childId, "assistant-1");
+
+    await streamEnd(t.taskService, t.workEnd("assistant-1"));
+    // Deferred: no recovery prompt and no goal turn yet.
+    expect(t.sends()).toHaveLength(0);
+    expect(t.child()?.taskStatus).toBe("running");
+
+    t.goals.settleStreamAccountingReceipt(childId, "assistant-1");
+    await t.untilSends(1);
+    expect(t.sends().map((send) => send.internal?.taskTurnKind)).toEqual(["goal_continuation"]);
     expect(await t.parentReports()).toHaveLength(0);
   });
 
