@@ -680,6 +680,56 @@ export interface AttemptSettlementEntry {
   source: string;
 }
 
+/** A reawakenInterruptedTask refusal: the call decided to reawaken and lost a race. */
+type ReawakenRefusal = Extract<TaskReawakenOutcome, { kind: "refused" }>;
+
+/** The settled-predecessor evidence reawakenInterruptedTask reads before its lineage awaits. */
+interface ReawakenPredecessor {
+  readonly settledPredecessor: AttemptSettlementEntry | undefined;
+  readonly releasedReportedAttempt: boolean;
+  readonly resumeSettledReportedTask: boolean;
+}
+
+/** What reawakenInterruptedTask read from the row and ledgers before its lineage awaits. */
+interface ReawakenCandidate extends ReawakenPredecessor {
+  readonly workspace: WorkspaceConfigEntry;
+  readonly previousAttemptId: string | undefined;
+  readonly stopEpochAtStart: number;
+}
+
+/** classifyReawakenAdmission: an outcome that ends the call, or a candidate to reawaken. */
+type ReawakenAdmission =
+  | Exclude<TaskReawakenOutcome, { kind: "reawakened" }>
+  | { kind: "proceed"; candidate: ReawakenCandidate };
+
+/**
+ * The snapshots reawakenInterruptedTask's critical section rechecks against: all taken before
+ * the mutex (the stop epoch before the lineage awaits), never re-read under it.
+ */
+interface ReawakenPlan extends ReawakenCandidate {
+  readonly workspaceId: string;
+  readonly lineage: { readonly proven: boolean; readonly reason: string };
+  readonly attemptId: string;
+}
+
+/** The row reads resumable as an interrupted task or a desktop-owned reported one. */
+function rowReadsInterruptedForReawaken(
+  ws: Pick<WorkspaceConfigEntry, "taskStatus" | "taskDesktopOwnerWorkspaceId">
+): boolean {
+  return (
+    ws.taskStatus === "interrupted" ||
+    (ws.taskStatus === "reported" && ws.taskDesktopOwnerWorkspaceId != null)
+  );
+}
+
+/** This process settled exactly the attempt the row still names. */
+function settlementNamesRowAttempt(
+  settled: AttemptSettlementEntry | undefined,
+  rowAttemptId: string | undefined
+): boolean {
+  return rowAttemptId != null && settled?.attemptId === rowAttemptId && settled.phase === "settled";
+}
+
 /**
  * One send admitted into a task workspace against a specific attempt (see TurnAdmissionToken in
  * the seam). Identity is immutable: an obligation admitted under attempt X can never enter, or be
@@ -15269,48 +15319,60 @@ export class TaskService implements AgentTaskIntegration {
    */
   async reawakenInterruptedTask(workspaceId: string): Promise<TaskReawakenOutcome> {
     assert(workspaceId.length > 0, "reawakenInterruptedTask: workspaceId must be non-empty");
-    const notApplicable = { kind: "not-applicable" } as const;
     // Stop-cascade barrier: a resume must not resurrect a task whose stop is still settling.
     if (this.isWorkspaceStopInProgress(workspaceId)) {
       log.debug("markInterruptedTaskRunning refused: a stop is in progress", { workspaceId });
-      return notApplicable;
+      return { kind: "not-applicable" };
     }
 
+    const admission = this.classifyReawakenAdmission(workspaceId);
+    if (admission.kind !== "proceed") {
+      return admission;
+    }
+    const candidate = admission.candidate;
+    // Lineage evaluation (receipt read, bounded wait for a closing producer) stays outside the
+    // mutex below: it must never hold up task creation or a cascade's Phase A.
+    // As in reactivation: the interrupted attempt's goal stays paused (see settleChildGoalPause).
+    await this.settleChildGoalPause(workspaceId, { force: true });
+    const lineage = await this.evaluateAttemptLineage(workspaceId, candidate.workspace);
+    const plan: ReawakenPlan = {
+      ...candidate,
+      workspaceId,
+      lineage,
+      attemptId: newTaskAttemptId(),
+    };
+    const committed = await this.commitReawakenUnderMutex(plan);
+    if (committed.kind === "refused") {
+      return committed;
+    }
+
+    try {
+      await this.emitWorkspaceMetadata(workspaceId);
+    } finally {
+      this.attemptLedger.endReawakening(workspaceId, plan.attemptId);
+    }
+    return {
+      kind: "reawakened",
+      attemptId: plan.attemptId,
+      statusChanged: !plan.resumeSettledReportedTask,
+    };
+  }
+
+  /**
+   * reawakenInterruptedTask's admission, read from the row at start: not a task, not resumable,
+   * retired or being removed ends the call; otherwise the row is a candidate to reawaken.
+   */
+  private classifyReawakenAdmission(workspaceId: string): ReawakenAdmission {
+    const notApplicable = { kind: "not-applicable" } as const;
     const configAtStart = this.config.loadConfigOrDefault();
     const entryAtStart = findWorkspaceEntry(configAtStart, workspaceId);
     if (!entryAtStart?.workspace.parentWorkspaceId) {
       return notApplicable;
     }
-    const settledPredecessor = this.attemptLedger.attemptSettlement(workspaceId);
-    // A parent continuation preserves `reported`; Stop then closes its attempt without changing
-    // that status. Explicit manual recovery must rotate the settled identity, not reopen it.
-    //
-    // The ordinary reported child is the other terminal shape: its report is durable and
-    // releaseReportedTaskAttempt dropped the attempt's owner AND its settlement entry, so neither
-    // ledger names the task. That attempt is not live in this process — a live one would still be
-    // owned (live continuation: continued, not rotated), a closing or stop-closed one would still
-    // have its entry (refused below and at the fence) — so a manual follow-up mints a fresh
-    // attempt for it exactly as the parent's reactivation does (lineage unproven: no settlement,
-    // no receipt), instead of the fence admitting the continuation under the completed id.
-    // A reported row written before attempt identities existed (no taskAttemptId) is released
-    // the same way — nothing in this process can own or settle an id it never had — so it gets
-    // its first, unproven attempt here rather than running as an unfenced pre-identity send.
-    const releasedReportedAttempt =
-      settledPredecessor == null && !this.attemptLedger.hasOwnedAttempt(workspaceId);
-    const resumeSettledReportedTask =
-      entryAtStart.workspace.taskStatus === "reported" &&
-      entryAtStart.workspace.taskDesktopOwnerWorkspaceId == null &&
-      ((entryAtStart.workspace.taskAttemptId != null &&
-        settledPredecessor?.attemptId === entryAtStart.workspace.taskAttemptId &&
-        settledPredecessor.phase === "settled") ||
-        releasedReportedAttempt);
+    const predecessor = this.readReawakenPredecessor(workspaceId, entryAtStart.workspace);
     if (
-      !resumeSettledReportedTask &&
-      entryAtStart.workspace.taskStatus !== "interrupted" &&
-      !(
-        entryAtStart.workspace.taskStatus === "reported" &&
-        entryAtStart.workspace.taskDesktopOwnerWorkspaceId != null
-      )
+      !predecessor.resumeSettledReportedTask &&
+      !rowReadsInterruptedForReawaken(entryAtStart.workspace)
     ) {
       return notApplicable;
     }
@@ -15329,141 +15391,191 @@ export class TaskService implements AgentTaskIntegration {
     }
     // From here on this call has decided to reawaken: losing any race below refuses the caller's
     // send instead of letting it bind to whatever attempt the winner published.
-    const lost = (message: string): TaskReawakenOutcome => ({ kind: "refused", message });
+    return {
+      kind: "proceed",
+      candidate: {
+        workspace: entryAtStart.workspace,
+        ...predecessor,
+        // Admission classification: reawaken = new OWNED attempt. Lineage is proven only when the
+        // predecessor is settled by this process or by a receipt; the CAS below publishes the
+        // fresh id (refusing when the id moved or a claim landed) and decides the marker from the
+        // fresh row.
+        previousAttemptId: entryAtStart.workspace.taskAttemptId,
+        // A Stop that runs to completion while this admission is still evaluating overtakes it:
+        // the user's Stop came after this resume began, so the resume must not resurrect the task
+        // (a recovery initiated after that Stop is a new decision and proceeds normally).
+        stopEpochAtStart: this.getWorkspaceStopEpoch(workspaceId),
+      },
+    };
+  }
 
-    // Admission classification: reawaken = new OWNED attempt. Lineage is proven only when the
-    // predecessor is settled by this process or by a receipt; the CAS below publishes the fresh
-    // id (refusing when the id moved or a claim landed) and decides the marker from the fresh row.
-    const previousAttemptId = entryAtStart.workspace.taskAttemptId;
-    // A Stop that runs to completion while this admission is still evaluating overtakes it: the
-    // user's Stop came after this resume began, so the resume must not resurrect the task (a
-    // recovery initiated after that Stop is a new decision and proceeds normally).
-    const stopEpochAtStart = this.getWorkspaceStopEpoch(workspaceId);
-    // Lineage evaluation (receipt read, bounded wait for a closing producer) stays outside the
-    // mutex below: it must never hold up task creation or a cascade's Phase A.
-    // As in reactivation: the interrupted attempt's goal stays paused (see settleChildGoalPause).
-    await this.settleChildGoalPause(workspaceId, { force: true });
-    const lineage = await this.evaluateAttemptLineage(workspaceId, entryAtStart.workspace);
-    const attemptId = newTaskAttemptId();
+  /** The settled-predecessor evidence that decides whether a reported row resumes. */
+  private readReawakenPredecessor(
+    workspaceId: string,
+    workspace: WorkspaceConfigEntry
+  ): ReawakenPredecessor {
+    const settledPredecessor = this.attemptLedger.attemptSettlement(workspaceId);
+    // A parent continuation preserves `reported`; Stop then closes its attempt without changing
+    // that status. Explicit manual recovery must rotate the settled identity, not reopen it.
+    //
+    // The ordinary reported child is the other terminal shape: its report is durable and
+    // releaseReportedTaskAttempt dropped the attempt's owner AND its settlement entry, so neither
+    // ledger names the task. That attempt is not live in this process — a live one would still be
+    // owned (live continuation: continued, not rotated), a closing or stop-closed one would still
+    // have its entry (refused below and at the fence) — so a manual follow-up mints a fresh
+    // attempt for it exactly as the parent's reactivation does (lineage unproven: no settlement,
+    // no receipt), instead of the fence admitting the continuation under the completed id.
+    // A reported row written before attempt identities existed (no taskAttemptId) is released
+    // the same way — nothing in this process can own or settle an id it never had — so it gets
+    // its first, unproven attempt here rather than running as an unfenced pre-identity send.
+    const releasedReportedAttempt =
+      settledPredecessor == null && !this.attemptLedger.hasOwnedAttempt(workspaceId);
+    const resumeSettledReportedTask =
+      workspace.taskStatus === "reported" &&
+      workspace.taskDesktopOwnerWorkspaceId == null &&
+      (settlementNamesRowAttempt(settledPredecessor, workspace.taskAttemptId) ||
+        releasedReportedAttempt);
+    return { settledPredecessor, releasedReportedAttempt, resumeSettledReportedTask };
+  }
+
+  /** reawakenInterruptedTask's critical section; the lock releases when this returns. */
+  private async commitReawakenUnderMutex(
+    plan: ReawakenPlan
+  ): Promise<ReawakenRefusal | { kind: "committed" }> {
+    const workspaceId = plan.workspaceId;
+    // Critical section: every stop-record capture (beginWorkspaceStop, Phase A of each cascade)
+    // runs under this mutex, so between the identity CAS below and the ownership it installs
+    // no cascade can observe the fresh id — a Stop either latched before (refused here and in
+    // the mutator) or captures the attempt owned, and its release settles exactly that attempt.
+    // Ownership follows the committed CAS (as in reactivateInactiveAgentTask): a CAS that
+    // loses to a concurrent writer has nothing to roll back. Only the CAS, the row check and
+    // the in-memory publish/install run here; the lineage above, the metadata emission and the
+    // caller's send stay outside. Lock order: this mutex → desktop admission gate → config
+    // edit queue, the order create/createWorkspaceTurn already establish; no event or tree lock
+    // is taken inside. No mutex holder reaches this method: launch sends are guarded
+    // (admissionStale probe → WorkspaceService skips the user-resume rescue) and workspace-turn
+    // sends carry their correlation.
+    await using _lock = await this.mutex.acquire();
+    if (this.isReawakenOvertaken(plan)) {
+      log.debug("markInterruptedTaskRunning refused: overtaken by a stop", { workspaceId });
+      return { kind: "refused", message: SEND_ADMISSION_STALE_MESSAGE };
+    }
+    // A parent's reactivation leaves the status `interrupted` while its fresh attempt launches
+    // and runs, so the row alone reads resumable: rotating that live attempt would supersede the
+    // continuation and drop its report. The user's send loses and
+    // can retry; once the continuation streams, sends queue behind it instead of reaching here.
+    if (this.attemptLedger.hasLiveReawakening(workspaceId)) {
+      log.debug("markInterruptedTaskRunning refused: another reawakening is live", {
+        workspaceId,
+      });
+      return { kind: "refused", message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE };
+    }
     let published = false;
     let committedProven = false;
-    {
-      // Critical section: every stop-record capture (beginWorkspaceStop, Phase A of each cascade)
-      // runs under this mutex, so between the identity CAS below and the ownership it installs
-      // no cascade can observe the fresh id — a Stop either latched before (refused here and in
-      // the mutator) or captures the attempt owned, and its release settles exactly that attempt.
-      // Ownership follows the committed CAS (as in reactivateInactiveAgentTask): a CAS that
-      // loses to a concurrent writer has nothing to roll back. Only the CAS, the row check and
-      // the in-memory publish/install run here; the lineage above, the metadata emission and the
-      // caller's send stay outside. Lock order: this mutex → desktop admission gate → config
-      // edit queue, the order create/createWorkspaceTurn already establish; no event or tree lock
-      // is taken inside. No mutex holder reaches this method: launch sends are guarded
-      // (admissionStale probe → WorkspaceService skips the user-resume rescue) and workspace-turn
-      // sends carry their correlation.
-      await using _lock = await this.mutex.acquire();
-      // The reported-child decision above rechecks its evidence here: a closure recorded, or an
-      // owner installed for the released attempt, during the lineage awaits invalidates it.
-      if (
-        this.isWorkspaceStopInProgress(workspaceId) ||
-        this.getWorkspaceStopEpoch(workspaceId) !== stopEpochAtStart ||
-        (resumeSettledReportedTask &&
-          (this.attemptLedger.attemptSettlement(workspaceId) !== settledPredecessor ||
-            (releasedReportedAttempt && this.attemptLedger.hasOwnedAttempt(workspaceId))))
-      ) {
-        log.debug("markInterruptedTaskRunning refused: overtaken by a stop", { workspaceId });
-        return lost(SEND_ADMISSION_STALE_MESSAGE);
-      }
-      // A parent's reactivation leaves the status `interrupted` while its fresh attempt launches
-      // and runs, so the row alone reads resumable: rotating that live attempt would supersede the
-      // continuation and drop its report. The user's send loses and
-      // can retry; once the continuation streams, sends queue behind it instead of reaching here.
-      if (this.attemptLedger.hasLiveReawakening(workspaceId)) {
-        log.debug("markInterruptedTaskRunning refused: another reawakening is live", {
-          workspaceId,
-        });
-        return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
-      }
-      await this.editActiveWorkspaceEntry(
+    await this.editActiveWorkspaceEntry(
+      workspaceId,
+      (ws) => {
+        if (!this.rowAdmitsReawaken(ws, plan)) {
+          return;
+        }
+
+        // Preserve taskPrompt here: interrupted queued tasks store their only initial
+        // prompt in config. If send/resume fails, restoreInterruptedTaskAfterResumeFailure
+        // must be able to retain that original prompt for inspection/retry.
+        if (!plan.resumeSettledReportedTask) ws.taskStatus = "running";
+        // A user-initiated resume is a fresh chance: clear the recovery budget so a
+        // breaker-tripped task doesn't instantly re-fail on its first recovery prompt.
+        delete ws.taskRecoveryAttempts;
+        ws.taskAttemptId = plan.attemptId;
+        // The marker is only ever added, so one that appeared after the snapshot can only
+        // downgrade the proof; a proven admission never carries it.
+        committedProven = plan.lineage.proven && ws.taskAttemptUnproven !== true;
+        if (!committedProven) ws.taskAttemptUnproven = true;
+        published = true;
+      },
+      { allowMissing: true }
+    );
+
+    if (!published) {
+      // Nothing was published: the previous attempt (owned or not) stays exactly as it was,
+      // and the row moved under this decision (another writer's resume, a stop, a claim).
+      return { kind: "refused", message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE };
+    }
+    return this.publishReawakenAttempt(plan, committedProven);
+  }
+
+  /**
+   * The reported-child decision above rechecks its evidence here: a closure recorded, or an
+   * owner installed for the released attempt, during the lineage awaits invalidates it.
+   */
+  private isReawakenOvertaken(plan: ReawakenPlan): boolean {
+    const workspaceId = plan.workspaceId;
+    return (
+      this.isWorkspaceStopInProgress(workspaceId) ||
+      this.getWorkspaceStopEpoch(workspaceId) !== plan.stopEpochAtStart ||
+      (plan.resumeSettledReportedTask &&
+        (this.attemptLedger.attemptSettlement(workspaceId) !== plan.settledPredecessor ||
+          (plan.releasedReportedAttempt && this.attemptLedger.hasOwnedAttempt(workspaceId))))
+    );
+  }
+
+  /** The CAS's row check, run inside the config edit: the row still reads as the plan saw it. */
+  private rowAdmitsReawaken(ws: WorkspaceConfigEntry, plan: ReawakenPlan): boolean {
+    // Only descendant task workspaces have task lifecycle status.
+    if (!ws.parentWorkspaceId || this.isWorkspaceStopInProgress(plan.workspaceId)) {
+      return false;
+    }
+    if (
+      plan.resumeSettledReportedTask
+        ? ws.taskStatus !== "reported" || ws.taskDesktopOwnerWorkspaceId != null
+        : !rowReadsInterruptedForReawaken(ws)
+    ) {
+      return false;
+    }
+    return (
+      ws.taskAttemptRetiredBy == null &&
+      ws.pendingRemoval == null &&
+      ws.taskAttemptId === plan.previousAttemptId
+    );
+  }
+
+  /** After the CAS: own the fresh attempt only if the durable row still names it. */
+  private publishReawakenAttempt(
+    plan: ReawakenPlan,
+    committedProven: boolean
+  ): ReawakenRefusal | { kind: "committed" } {
+    const { workspaceId, attemptId } = plan;
+    // The row names a new attempt now: the earlier attempt's cached report is not its (#7003).
+    this.waiters.deleteCompletedReport(workspaceId);
+    // Writers outside this mutex (a reactivation under its own locks, another backend) may have
+    // rotated the row again during the commit's own awaits: never publish or own an identity
+    // the durable row no longer names — the successor's ownership and closures stay untouched.
+    const committedRow = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
+    if (committedRow?.workspace.taskAttemptId !== attemptId) {
+      log.info("[task-attempt] reawakened attempt superseded before it was owned", {
         workspaceId,
-        (ws) => {
-          // Only descendant task workspaces have task lifecycle status.
-          if (!ws.parentWorkspaceId || this.isWorkspaceStopInProgress(workspaceId)) {
-            return;
-          }
-          if (
-            resumeSettledReportedTask
-              ? ws.taskStatus !== "reported" || ws.taskDesktopOwnerWorkspaceId != null
-              : ws.taskStatus !== "interrupted" &&
-                !(ws.taskStatus === "reported" && ws.taskDesktopOwnerWorkspaceId != null)
-          ) {
-            return;
-          }
-          if (
-            ws.taskAttemptRetiredBy != null ||
-            ws.pendingRemoval != null ||
-            ws.taskAttemptId !== previousAttemptId
-          ) {
-            return;
-          }
-
-          // Preserve taskPrompt here: interrupted queued tasks store their only initial
-          // prompt in config. If send/resume fails, restoreInterruptedTaskAfterResumeFailure
-          // must be able to retain that original prompt for inspection/retry.
-          if (!resumeSettledReportedTask) ws.taskStatus = "running";
-          // A user-initiated resume is a fresh chance: clear the recovery budget so a
-          // breaker-tripped task doesn't instantly re-fail on its first recovery prompt.
-          delete ws.taskRecoveryAttempts;
-          ws.taskAttemptId = attemptId;
-          // The marker is only ever added, so one that appeared after the snapshot can only
-          // downgrade the proof; a proven admission never carries it.
-          committedProven = lineage.proven && ws.taskAttemptUnproven !== true;
-          if (!committedProven) ws.taskAttemptUnproven = true;
-          published = true;
-        },
-        { allowMissing: true }
-      );
-
-      if (!published) {
-        // Nothing was published: the previous attempt (owned or not) stays exactly as it was,
-        // and the row moved under this decision (another writer's resume, a stop, a claim).
-        return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
-      }
-      // The row names a new attempt now: the earlier attempt's cached report is not its (#7003).
-      this.waiters.deleteCompletedReport(workspaceId);
-      // Writers outside this mutex (a reactivation under its own locks, another backend) may have
-      // rotated the row again during the commit's own awaits: never publish or own an identity
-      // the durable row no longer names — the successor's ownership and closures stay untouched.
-      const committedRow = findWorkspaceEntry(this.config.loadConfigOrDefault(), workspaceId);
-      if (committedRow?.workspace.taskAttemptId !== attemptId) {
-        log.info("[task-attempt] reawakened attempt superseded before it was owned", {
-          workspaceId,
-          attemptId,
-          current: committedRow?.workspace.taskAttemptId,
-        });
-        return lost(TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE);
-      }
-      this.attemptLedger.publishAttemptRotation(workspaceId, attemptId);
-      if (!committedProven) {
-        log.info("[task-attempt] reawakened attempt is not receipt-eligible", {
-          workspaceId,
-          attemptId,
-          reason: lineage.proven ? "unproven marker appeared before the CAS" : lineage.reason,
-        });
-      }
-      this.beginOwnedTaskAttempt(workspaceId, "reawaken", {
         attemptId,
-        receiptEligible: committedProven,
+        current: committedRow?.workspace.taskAttemptId,
       });
-      // Live until the caller's send binds to it (its admission is the evidence after that).
-      this.attemptLedger.beginReawakening(workspaceId, attemptId);
+      return { kind: "refused", message: TASK_REAWAKEN_LOST_SEND_BLOCKED_MESSAGE };
     }
-
-    try {
-      await this.emitWorkspaceMetadata(workspaceId);
-    } finally {
-      this.attemptLedger.endReawakening(workspaceId, attemptId);
+    this.attemptLedger.publishAttemptRotation(workspaceId, attemptId);
+    if (!committedProven) {
+      log.info("[task-attempt] reawakened attempt is not receipt-eligible", {
+        workspaceId,
+        attemptId,
+        reason: plan.lineage.proven
+          ? "unproven marker appeared before the CAS"
+          : plan.lineage.reason,
+      });
     }
-    return { kind: "reawakened", attemptId, statusChanged: !resumeSettledReportedTask };
+    this.beginOwnedTaskAttempt(workspaceId, "reawaken", {
+      attemptId,
+      receiptEligible: committedProven,
+    });
+    // Live until the caller's send binds to it (its admission is the evidence after that).
+    this.attemptLedger.beginReawakening(workspaceId, attemptId);
+    return { kind: "committed" };
   }
 
   /**
