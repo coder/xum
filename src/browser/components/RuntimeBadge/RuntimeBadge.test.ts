@@ -25,7 +25,7 @@ describe("getSshRuntimeInfo", () => {
       type: "ssh",
       host: "sb-1.xum--daytona",
       srcBaseDir: "~/src",
-      daytona: { sandboxId: "sb-1" },
+      daytona: { sandboxName: "sb-1" },
     });
     expect(created.type).toBe("daytona");
     expect(created.label).toContain("sb-1");

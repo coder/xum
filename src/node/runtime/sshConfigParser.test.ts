@@ -132,7 +132,7 @@ describe("resolveSSHConfig", () => {
         sshConfigPath: configPath,
       });
       await writer.writeSandbox({
-        sandboxId: "sb-1",
+        sandboxName: "sb-1",
         token: "tokenA",
         gateway: { host: "ssh.daytona.test", port: 2222, hostKeys: ["ssh-ed25519 AAAA"] },
       });
@@ -165,7 +165,7 @@ describe("resolveSSHConfig", () => {
         sshConfigPath: configPath,
       });
       await writer.writeSandbox({
-        sandboxId: "sb-1",
+        sandboxName: "sb-1",
         token: "tokenA",
         gateway: { host: "ssh.daytona.test", port: 22, hostKeys: ["ssh-ed25519 AAAA"] },
       });

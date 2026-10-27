@@ -356,7 +356,7 @@ import type {
 import {
   hasSrcBaseDir,
   getSrcBaseDir,
-  getDaytonaSandboxId,
+  getDaytonaSandboxName,
   isSSHRuntime,
   ownsDaytonaSandbox,
   isDockerRuntime,
@@ -1075,16 +1075,18 @@ async function probeDaytonaRuntimeStatuses(
   const workspacesBySandbox = new Map<string, string[]>();
   for (const workspaceId of workspaceIds) {
     const runtimeConfig = metadataById.get(workspaceId)?.runtimeConfig;
-    const sandboxId = isSSHRuntime(runtimeConfig) ? runtimeConfig.daytona?.sandboxId : undefined;
-    if (!sandboxId) continue;
-    const workspaces = workspacesBySandbox.get(sandboxId) ?? [];
+    const sandboxName = isSSHRuntime(runtimeConfig)
+      ? runtimeConfig.daytona?.sandboxName
+      : undefined;
+    if (!sandboxName) continue;
+    const workspaces = workspacesBySandbox.get(sandboxName) ?? [];
     workspaces.push(workspaceId);
-    workspacesBySandbox.set(sandboxId, workspaces);
+    workspacesBySandbox.set(sandboxName, workspaces);
   }
   const statuses: Record<string, WorkspaceRuntimeStatus> = {};
   await Promise.all(
-    [...workspacesBySandbox].map(async ([sandboxId, workspaces]) => {
-      const status = await probeDaytonaRuntimeStatus(sandboxId);
+    [...workspacesBySandbox].map(async ([sandboxName, workspaces]) => {
+      const status = await probeDaytonaRuntimeStatus(sandboxName);
       for (const workspaceId of workspaces) statuses[workspaceId] = status;
     })
   );
@@ -1092,15 +1094,15 @@ async function probeDaytonaRuntimeStatuses(
 }
 
 /** Passive Daytona probe: reads the sandbox state, never starts it. */
-async function probeDaytonaRuntimeStatus(sandboxId: string): Promise<WorkspaceRuntimeStatus> {
+async function probeDaytonaRuntimeStatus(sandboxName: string): Promise<WorkspaceRuntimeStatus> {
   const service = getGlobalDaytonaService();
   if (!service) return "unknown";
   try {
-    const { state } = await service.sandboxes.getSandboxState(sandboxId);
+    const { state } = await service.sandboxes.getSandboxState(sandboxName);
     return DAYTONA_RUNTIME_STATUS[state];
   } catch (error) {
     log.debug("Failed to read Daytona sandbox state for runtime status", {
-      sandboxId,
+      sandboxName,
       error: getErrorMessage(error),
     });
     return "unknown";
@@ -1134,7 +1136,7 @@ const ARCHIVE_OWN_ACTIVITY_POLICY = {
 
 /** What archive refusals call the dedicated remote box, so Daytona users are not told "Coder". */
 function dedicatedRemoteBoxLabel(metadata: WorkspaceMetadata | undefined): string {
-  return getDaytonaSandboxId(metadata?.runtimeConfig) ? "Daytona sandbox" : "Coder workspace";
+  return getDaytonaSandboxName(metadata?.runtimeConfig) ? "Daytona sandbox" : "Coder workspace";
 }
 
 /** A Coder workspace Xum created for this workspace (not an existing one it connected to). */

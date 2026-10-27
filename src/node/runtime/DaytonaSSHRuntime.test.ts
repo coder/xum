@@ -83,28 +83,28 @@ const SMALL = { cpu: 2, memoryGiB: 4, diskGiB: 10 };
 describe("DaytonaSSHRuntime.ensureReady", () => {
   it("trusts a ready result for 60 s across runtime instances, then checks again", async () => {
     rig.plane.addSandbox({ id: "sb-ready" });
-    expect(await makeRuntime({ sandboxId: "sb-ready" }).ensureReady()).toEqual({ ready: true });
+    expect(await makeRuntime({ sandboxName: "sb-ready" }).ensureReady()).toEqual({ ready: true });
     const getsAfterFirst = rig.plane.countCalls("GET /sandbox/sb-ready");
 
     // A stream start builds a fresh runtime; it must not hit the control plane again.
-    expect(await makeRuntime({ sandboxId: "sb-ready" }).ensureReady()).toEqual({ ready: true });
+    expect(await makeRuntime({ sandboxName: "sb-ready" }).ensureReady()).toEqual({ ready: true });
     expect(rig.plane.countCalls("GET /sandbox/sb-ready")).toBe(getsAfterFirst);
 
     rig.clock.now += DAYTONA_READY_CACHE_MS;
-    await makeRuntime({ sandboxId: "sb-ready" }).ensureReady();
+    await makeRuntime({ sandboxName: "sb-ready" }).ensureReady();
     expect(rig.plane.countCalls("GET /sandbox/sb-ready")).toBeGreaterThan(getsAfterFirst);
   });
 
   it("puts back the ~/.ssh/config block for an external ssh client within the ready cache", async () => {
     rig.plane.addSandbox({ id: "sb-ready" });
-    expect(await makeRuntime({ sandboxId: "sb-ready" }).ensureReady()).toEqual({ ready: true });
+    expect(await makeRuntime({ sandboxName: "sb-ready" }).ensureReady()).toEqual({ ready: true });
     rig.writer.managedBlockPresent = false;
 
     // Xum's own commands read only daytona.conf: a cached check leaves the block alone.
-    expect(await makeRuntime({ sandboxId: "sb-ready" }).ensureReady()).toEqual({ ready: true });
+    expect(await makeRuntime({ sandboxName: "sb-ready" }).ensureReady()).toEqual({ ready: true });
     expect(rig.writer.managedBlockPresent).toBe(false);
 
-    const forEditor = await makeRuntime({ sandboxId: "sb-ready" }).ensureReady({
+    const forEditor = await makeRuntime({ sandboxName: "sb-ready" }).ensureReady({
       externalSshClient: true,
     });
     expect(forEditor).toEqual({ ready: true });
@@ -115,7 +115,7 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     execSpy.mockRestore();
     rig.plane.addSandbox({ id: "sb-shared" });
     const runtimeFor = (workspaceName: string) =>
-      makeRuntime({ sandboxId: "sb-shared" }, rig, {
+      makeRuntime({ sandboxName: "sb-shared" }, rig, {
         transport: localShellTransport(rig.rootDir),
         projectPath: "/home/me/project",
         workspaceName,
@@ -135,7 +135,7 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     rig.plane.addSandbox({ id: "sb-stopped", state: "stopped" });
     const events: RuntimeStatusEvent[] = [];
 
-    const result = await makeRuntime({ sandboxId: "sb-stopped" }).ensureReady({
+    const result = await makeRuntime({ sandboxName: "sb-stopped" }).ensureReady({
       statusSink: (event) => events.push(event),
     });
 
@@ -151,7 +151,7 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
     const phases: string[][] = [[], []];
     const results = await Promise.all(
       phases.map((seen) =>
-        makeRuntime({ sandboxId: "sb-archived" }).ensureReady({
+        makeRuntime({ sandboxName: "sb-archived" }).ensureReady({
           statusSink: (event) => seen.push(event.phase),
         })
       )
@@ -164,7 +164,7 @@ describe("DaytonaSSHRuntime.ensureReady", () => {
   });
 
   it("reports a sandbox removed outside Xum as runtime_not_ready and never recreates it", async () => {
-    const result = await makeRuntime({ sandboxId: "sb-gone" }).ensureReady();
+    const result = await makeRuntime({ sandboxName: "sb-gone" }).ensureReady();
 
     expect(result.ready).toBe(false);
     if (!result.ready) {
@@ -179,7 +179,7 @@ describe("DaytonaSSHRuntime integrated terminals", () => {
   it("start a stopped sandbox before the terminal's ssh session opens", async () => {
     const sandbox = rig.plane.addSandbox({ id: "sb-term", state: "stopped" });
     let stateWhenOpened: string | undefined;
-    const runtime = makeRuntime({ sandboxId: "sb-term" }, rig, {
+    const runtime = makeRuntime({ sandboxName: "sb-term" }, rig, {
       transport: {
         ...localShellTransport(rig.rootDir),
         createPtySession: () => {
@@ -197,7 +197,7 @@ describe("DaytonaSSHRuntime integrated terminals", () => {
 
   it("report a sandbox that cannot be brought up instead of opening ssh", async () => {
     let opened = false;
-    const runtime = makeRuntime({ sandboxId: "sb-gone" }, rig, {
+    const runtime = makeRuntime({ sandboxName: "sb-gone" }, rig, {
       transport: {
         ...localShellTransport(rig.rootDir),
         createPtySession: () => {
@@ -221,9 +221,9 @@ describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
     const result = await runtime.finalizeConfig("Feature_X", sshDaytonaConfig({}));
     expect(result.success).toBe(true);
     if (!result.success || result.data.type !== "ssh") throw new Error("expected ssh config");
-    const sandboxId = result.data.daytona?.sandboxId ?? "";
-    expect(sandboxId).toMatch(/^xum-feature-x-[0-9a-f]{6}$/);
-    expect(result.data.host).toBe(`${sandboxId}.xum--daytona`);
+    const sandboxName = result.data.daytona?.sandboxName ?? "";
+    expect(sandboxName).toMatch(/^xum-feature-x-[0-9a-f]{6}$/);
+    expect(result.data.host).toBe(`${sandboxName}.xum--daytona`);
     expect(result.data.daytona).toMatchObject({ ...SMALL });
     expect(await runtime.validateBeforePersist("Feature_X", result.data)).toEqual({
       success: true,
@@ -236,10 +236,10 @@ describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
     const runtime = makeRuntime({});
     const result = await runtime.finalizeConfig(
       "b",
-      sshDaytonaConfig({ sandboxId: "sb-mine", forked: true })
+      sshDaytonaConfig({ sandboxName: "sb-mine", forked: true })
     );
     if (!result.success || result.data.type !== "ssh") throw new Error("expected ssh config");
-    expect(result.data.daytona?.sandboxId).toMatch(/^xum-b-[0-9a-f]{6}$/);
+    expect(result.data.daytona?.sandboxName).toMatch(/^xum-b-[0-9a-f]{6}$/);
     expect(result.data.daytona?.forked).toBeUndefined();
   });
 
@@ -255,11 +255,11 @@ describe("DaytonaSSHRuntime.finalizeConfig and validateBeforePersist", () => {
     const runtime = makeRuntime({});
     const odd = await runtime.finalizeConfig("b", sshDaytonaConfig({ cpu: 3 }));
     expect(odd.success).toBe(false);
-    const handEdited = sshDaytonaConfig({ sandboxId: "xum-b-1", cpu: 64 });
+    const handEdited = sshDaytonaConfig({ sandboxName: "xum-b-1", cpu: 64 });
     expect((await runtime.validateBeforePersist("b", handEdited)).success).toBe(false);
 
     rig.plane.addSandbox({ id: "sb-9", name: "xum-b-taken" });
-    const taken = sshDaytonaConfig({ sandboxId: "xum-b-taken", ...SMALL });
+    const taken = sshDaytonaConfig({ sandboxName: "xum-b-taken", ...SMALL });
     expect((await runtime.validateBeforePersist("b", taken)).success).toBe(false);
   });
 });
@@ -324,7 +324,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
       rig.service.account.setConfig({ apiKey: "key-b" })
     );
 
-    const failure = await makeRuntime({ sandboxId: "xum-switch", ...SMALL })
+    const failure = await makeRuntime({ sandboxName: "xum-switch", ...SMALL })
       .postCreateSetup(initParams())
       .then(
         () => undefined,
@@ -352,7 +352,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
       return rig.service.account.setConfig({ apiKey: "key-b" });
     });
 
-    const failure = await makeRuntime({ sandboxId: "sb-src", forked: true, ...SMALL })
+    const failure = await makeRuntime({ sandboxName: "sb-src", forked: true, ...SMALL })
       .postCreateSetup(initParams())
       .then(
         () => undefined,
@@ -366,7 +366,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
   });
 
   it("creates the sandbox with preset resources, labels and lifecycle intervals", async () => {
-    await makeRuntime({ sandboxId: "xum-new", ...SMALL }).postCreateSetup(initParams());
+    await makeRuntime({ sandboxName: "xum-new", ...SMALL }).postCreateSetup(initParams());
 
     expect(rig.plane.createBodies).toHaveLength(1);
     expect(rig.plane.createBodies[0]).toMatchObject({
@@ -401,7 +401,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
       Object.assign(rig.plane, { rejectCreateResources: true, snapshotResources, ...omit });
 
       await makeRuntime({
-        sandboxId: "xum-fixed",
+        sandboxName: "xum-fixed",
         snapshot: "fixed-snap",
         cpu: 4,
         memoryGiB: 8,
@@ -429,14 +429,16 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
       const created = rig.plane.find("xum-swap");
       if (created && created.id !== "id-other") {
         rig.plane.sandboxes.delete(created.id);
-        rig.plane.addSandbox({ id: "id-other", name: "xum-swap", labels: {}, disk: 50 });
+        rig.plane.addSandbox(
+          { id: "id-other", name: "xum-swap", labels: {}, disk: 50 },
+          { recorded: false }
+        );
       }
       return Promise.resolve();
     };
-    rig.plane.onRequest.set("POST /sandbox/xum-swap/stop", swap);
     rig.plane.onRequest.set("POST /sandbox/sb-1/stop", swap);
 
-    const daytona = { sandboxId: "xum-swap", snapshot: "fixed-snap", cpu: 4, memoryGiB: 8 };
+    const daytona = { sandboxName: "xum-swap", snapshot: "fixed-snap", cpu: 4, memoryGiB: 8 };
     // eslint-disable-next-line @typescript-eslint/await-thenable
     await expect(
       makeRuntime({ ...daytona, diskGiB: 20 }).postCreateSetup(initParams())
@@ -448,7 +450,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     rig.writer.writeError = new Error("No space left on device");
     const params = initParams();
 
-    const failure = await makeRuntime({ sandboxId: "xum-doomed", ...SMALL })
+    const failure = await makeRuntime({ sandboxName: "xum-doomed", ...SMALL })
       .postCreateSetup(params)
       .then(
         () => undefined,
@@ -469,27 +471,27 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
     });
     try {
       // A setup error that persists blocks the removal's checks, so only a forced one goes.
-      for (const [sandboxId, force] of [
+      for (const [sandboxName, force] of [
         ["xum-transient", false],
         ["xum-persistent", true],
       ] as const) {
         rig.writer.writeError = new Error("No space left on device");
-        // The delete goes to the id of the sandbox the setup created, not to its name.
-        rig.plane.onRequest.set(`GET /sandbox/${sandboxId}`, () => {
-          const created = rig.plane.find(sandboxId);
-          if (created) rig.plane.failingRoutes.add(`DELETE /sandbox/${created.id}`);
-          return Promise.resolve();
+        // The setup's delete of the sandbox it created fails.
+        const record = spyOn(rig.plane.recordedIds, "record").mockImplementation((name, id) => {
+          rig.plane.failingRoutes.add(`DELETE /sandbox/${id}`);
+          rig.plane.recordedIds.ids.set(name, id);
+          return Promise.resolve(true);
         });
-        const daytona = { sandboxId, ...SMALL };
+        const daytona = { sandboxName, ...SMALL };
 
         // eslint-disable-next-line @typescript-eslint/await-thenable
         await expect(makeRuntime(daytona).postCreateSetup(initParams())).rejects.toThrow(
           "setup failed"
         );
-        expect(rig.plane.find(sandboxId)).toBeDefined();
+        expect(rig.plane.find(sandboxName)).toBeDefined();
 
         // The persisted workspace still names the sandbox; removing it deletes the sandbox.
-        rig.plane.onRequest.clear();
+        record.mockRestore();
         rig.plane.failingRoutes.clear();
         if (!force) rig.writer.writeError = undefined;
         const removal = await makeRuntime(daytona).deleteWorkspace(
@@ -498,7 +500,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
           force
         );
         expect(removal.success).toBe(true);
-        expect(rig.plane.find(sandboxId)).toBeUndefined();
+        expect(rig.plane.find(sandboxName)).toBeUndefined();
       }
     } finally {
       sshDelete.mockRestore();
@@ -513,7 +515,7 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
       labels: { "xum.instance": "another-install", "xum.workspaceId": "ws-other" },
     });
 
-    const failure = await makeRuntime({ sandboxId: "xum-raced", ...SMALL })
+    const failure = await makeRuntime({ sandboxName: "xum-raced", ...SMALL })
       .postCreateSetup(initParams())
       .then(
         () => undefined,
@@ -526,8 +528,8 @@ describe("DaytonaSSHRuntime.postCreateSetup", () => {
   });
 
   it("after a create of unknown outcome, deletes the sandbox only when it has its labels", async () => {
-    const setUp = (sandboxId: string) =>
-      makeRuntime({ sandboxId, ...SMALL })
+    const setUp = (sandboxName: string) =>
+      makeRuntime({ sandboxName, ...SMALL })
         .postCreateSetup(initParams())
         .then(
           () => undefined,
@@ -571,7 +573,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     await rig.service.ssh.ensureSshAccess("sb-1");
     sshDeleteSpy.mockResolvedValue({ success: false, error: "ssh: host unreachable" });
 
-    const forced = await makeRuntime({ sandboxId: "sb-1", forked: true }, rig, {
+    const forced = await makeRuntime({ sandboxName: "sb-1", forked: true }, rig, {
       workspaceId: "ws-fork",
     }).deleteWorkspace("/home/me/project", "ws-fork", true);
 
@@ -585,7 +587,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     rig.plane.addSandbox({ id: "sb-dirty" });
     sshDeleteSpy.mockResolvedValue({ success: false, error: "uncommitted changes" });
 
-    const result = await makeRuntime({ sandboxId: "sb-dirty" }).deleteWorkspace(
+    const result = await makeRuntime({ sandboxName: "sb-dirty" }).deleteWorkspace(
       "/home/me/project",
       "feature",
       false
@@ -599,7 +601,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     rig.plane.addSandbox({ id: "sb-clean" });
     await rig.service.ssh.ensureSshAccess("sb-clean");
 
-    const result = await makeRuntime({ sandboxId: "sb-clean" }).deleteWorkspace(
+    const result = await makeRuntime({ sandboxName: "sb-clean" }).deleteWorkspace(
       "/home/me/project",
       "feature",
       false
@@ -614,25 +616,25 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
 
   it("never starts a stopped or archived sandbox for removal checks, as for Coder", async () => {
     for (const state of ["stopped", "archived"]) {
-      const sandboxId = `sb-${state}`;
-      rig.plane.addSandbox({ id: sandboxId, state });
+      const sandboxName = `sb-${state}`;
+      rig.plane.addSandbox({ id: sandboxName, state });
 
-      const fork = await makeRuntime({ sandboxId, forked: true }).deleteWorkspace(
+      const fork = await makeRuntime({ sandboxName, forked: true }).deleteWorkspace(
         "/home/me/project",
         "feature-fork",
         false
       );
       expect(fork.success).toBe(true);
-      expect(rig.plane.find(sandboxId)?.state).toBe(state);
+      expect(rig.plane.find(sandboxName)?.state).toBe(state);
 
-      const owner = await makeRuntime({ sandboxId }).deleteWorkspace(
+      const owner = await makeRuntime({ sandboxName }).deleteWorkspace(
         "/home/me/project",
         "feature",
         false
       );
       expect(owner.success).toBe(true);
-      expect(rig.plane.find(sandboxId)).toBeUndefined();
-      expect(rig.plane.countCalls(`POST /sandbox/${sandboxId}/start`)).toBe(0);
+      expect(rig.plane.find(sandboxName)).toBeUndefined();
+      expect(rig.plane.countCalls(`POST /sandbox/${sandboxName}/start`)).toBe(0);
     }
     expect(sshDeleteSpy).not.toHaveBeenCalled();
   });
@@ -644,7 +646,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       workspacePath: "/fork",
     });
     try {
-      const sourceDaytona = { sandboxId: "sb-parent", ...SMALL };
+      const sourceDaytona = { sandboxName: "sb-parent", ...SMALL };
       const fork = await makeRuntime(sourceDaytona).forkWorkspace({
         projectPath: "/home/me/project",
         sourceWorkspaceName: "feature",
@@ -685,8 +687,8 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       stateWhenForked = sandbox.state;
       return Promise.resolve({ success: true, workspacePath: "/fork" });
     });
-    const forkFrom = (sandboxId: string) =>
-      makeRuntime({ sandboxId, ...SMALL }).forkWorkspace({
+    const forkFrom = (sandboxName: string) =>
+      makeRuntime({ sandboxName, ...SMALL }).forkWorkspace({
         projectPath: "/home/me/project",
         sourceWorkspaceName: "feature",
         newWorkspaceName: "feature-fork",
@@ -712,7 +714,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
       workspacePath: "/fork",
     });
     try {
-      const sourceDaytona = { sandboxId: "sb-parent", ...SMALL };
+      const sourceDaytona = { sandboxName: "sb-parent", ...SMALL };
       const fork = await makeRuntime(sourceDaytona).forkWorkspace({
         projectPath: "/home/me/project",
         sourceWorkspaceName: "feature",
@@ -745,7 +747,7 @@ describe("DaytonaSSHRuntime.deleteWorkspace", () => {
     rig.plane.addSandbox({ id: "sb-stuck" });
     rig.plane.failingRoutes.add("DELETE /sandbox/sb-stuck");
 
-    const result = await makeRuntime({ sandboxId: "sb-stuck" }).deleteWorkspace(
+    const result = await makeRuntime({ sandboxName: "sb-stuck" }).deleteWorkspace(
       "/home/me/project",
       "feature",
       true
@@ -760,7 +762,7 @@ describe("DaytonaSSHRuntime delete checks on the unresolved ~ workspace path", (
     execSpy.mockRestore();
     const home = path.join(rig.rootDir, "sandbox-home");
     rig.plane.addSandbox({ id: "sb-dirty" });
-    const runtime = makeRuntime({ sandboxId: "sb-dirty" }, rig, {
+    const runtime = makeRuntime({ sandboxName: "sb-dirty" }, rig, {
       transport: localShellTransport(home),
     });
     // Deferred access never resolves `~` at creation, so this is the path deletion sees.
@@ -793,7 +795,7 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     await rig.service.ssh.ensureSshAccess("sb-tok");
     const token = rig.writer.tokens.get("sb-tok");
     if (!token) throw new Error("expected a minted token");
-    const runtime = makeRuntime({ sandboxId: "sb-tok" }, rig, {
+    const runtime = makeRuntime({ sandboxName: "sb-tok" }, rig, {
       transport: localShellTransport(rig.rootDir),
     });
 
@@ -812,7 +814,7 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
     const token = rig.writer.tokens.get("sb-tok");
     if (!token) throw new Error("expected a minted token");
     let spawns = 0;
-    const runtime = makeRuntime({ sandboxId: "sb-tok" }, rig, {
+    const runtime = makeRuntime({ sandboxName: "sb-tok" }, rig, {
       transport: {
         ...localShellTransport(rig.rootDir),
         spawnRemoteProcess: () => {
@@ -847,7 +849,7 @@ describe("DaytonaSSHRuntime ssh token redaction", () => {
 
     let readsWhenSpawned: number | undefined;
     // A UI runtime: its commands never run ensureReady first.
-    const runtime = makeRuntime({ sandboxId: "sb-old" }, rig, {
+    const runtime = makeRuntime({ sandboxName: "sb-old" }, rig, {
       transport: {
         ...localShellTransport(rig.rootDir),
         spawnRemoteProcess: () => {
@@ -880,12 +882,12 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
           ? local.spawnRemoteProcess(command, options)
           : Promise.reject(new RuntimeError("Connection closed by 127.0.0.1 port 22", "network")),
     };
-    const turn = makeRuntime({ sandboxId: "sb-nap" }, rig, { transport });
+    const turn = makeRuntime({ sandboxName: "sb-nap" }, rig, { transport });
     expect(await turn.ensureReady()).toEqual({ ready: true });
     sandbox.state = "stopped";
 
     // A UI or background runtime never starts the (billed) sandbox.
-    const background = makeRuntime({ sandboxId: "sb-nap" }, rig, { transport });
+    const background = makeRuntime({ sandboxName: "sb-nap" }, rig, { transport });
     // eslint-disable-next-line @typescript-eslint/await-thenable
     await expect(background.exec("echo ok", { cwd: "/tmp", timeout: 10 })).rejects.toThrow(
       "Connection closed"
@@ -910,7 +912,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
           : Promise.reject(new RuntimeError("Connection closed by 127.0.0.1 port 22", "network")),
     };
     const runtimeFor = () =>
-      makeRuntime({ sandboxId: "sb-nap3" }, rig, {
+      makeRuntime({ sandboxName: "sb-nap3" }, rig, {
         transport,
         projectPath: "/home/me/project",
         workspaceName: "ws-a",
@@ -941,7 +943,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
           : Promise.reject(new RuntimeError("Host key verification failed.", "network"));
       },
     };
-    const runtime = makeRuntime({ sandboxId: "sb-moved" }, rig, { transport });
+    const runtime = makeRuntime({ sandboxName: "sb-moved" }, rig, { transport });
     expect(await runtime.ensureReady()).toEqual({ ready: true });
     const configFetches = rig.plane.countCalls("GET /config");
     const gateway = {
@@ -964,7 +966,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
   });
 
   /** The gateway answers a stopped or deleted sandbox with the same refusal as a bad token. */
-  function refusingTransportWhile(sandboxId: string, refuses: () => boolean): SSHTransport {
+  function refusingTransportWhile(sandboxName: string, refuses: () => boolean): SSHTransport {
     const local = localShellTransport(rig.rootDir);
     return {
       ...local,
@@ -972,7 +974,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
         refuses()
           ? Promise.reject(
               new RuntimeError(
-                `${rig.writer.tokens.get(sandboxId) ?? ""}@127.0.0.1: Permission denied (publickey).`,
+                `${rig.writer.tokens.get(sandboxName) ?? ""}@127.0.0.1: Permission denied (publickey).`,
                 "network"
               )
             )
@@ -984,7 +986,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     rig.plane.addSandbox({ id: "sb-gone" });
     await rig.service.ssh.ensureSshAccess("sb-gone");
     rig.plane.sandboxes.delete("sb-gone");
-    const runtime = makeRuntime({ sandboxId: "sb-gone" }, rig, {
+    const runtime = makeRuntime({ sandboxName: "sb-gone" }, rig, {
       transport: refusingTransportWhile("sb-gone", () => true),
     });
 
@@ -1000,7 +1002,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
     await rig.service.ssh.ensureSshAccess("sb-relabeled");
     const minted = rig.plane.countCalls("POST /sandbox/sb-relabeled/ssh-access");
     sandbox.labels = {};
-    const runtime = makeRuntime({ sandboxId: "sb-relabeled" }, rig, {
+    const runtime = makeRuntime({ sandboxName: "sb-relabeled" }, rig, {
       transport: refusingTransportWhile("sb-relabeled", () => true),
     });
 
@@ -1030,7 +1032,7 @@ describe("DaytonaSSHRuntime reconnect after a stop", () => {
           : local.spawnRemoteProcess(command, options),
     };
     // Not a turn's runtime: a new token starts nothing, so any runtime replaces it.
-    const runtime = makeRuntime({ sandboxId: "sb-rev" }, rig, { transport });
+    const runtime = makeRuntime({ sandboxName: "sb-rev" }, rig, { transport });
 
     const stream = await runtime.exec("echo ok", { cwd: "/tmp", timeout: 10 });
     expect(await new Response(stream.stdout).text()).toBe("ok\n");

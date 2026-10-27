@@ -231,11 +231,11 @@ describe("WorkspaceService.getRuntimeStatuses for Daytona workspaces", () => {
   let harness: WorkspaceServiceHarness;
   let projectPath: string;
   let globalService: { mockRestore: () => void };
-  const getSandboxState = mock((sandboxId: string) =>
-    sandboxId === "sb-broken"
+  const getSandboxState = mock((sandboxName: string) =>
+    sandboxName === "sb-broken"
       ? Promise.reject(new Error("throttled"))
       : Promise.resolve({
-          state: sandboxId === "sb-1" ? ("started" as const) : ("stopped" as const),
+          state: sandboxName === "sb-1" ? ("started" as const) : ("stopped" as const),
         })
   );
 
@@ -258,15 +258,15 @@ describe("WorkspaceService.getRuntimeStatuses for Daytona workspaces", () => {
     await harness.config.editConfig((config) => {
       config.projects.set(projectPath, {
         trusted: true,
-        workspaces: Object.entries(sandboxByWorkspace).map(([id, sandboxId]) => ({
+        workspaces: Object.entries(sandboxByWorkspace).map(([id, sandboxName]) => ({
           id,
           name: id,
           path: path.join(harness.rootDir, "checkouts", id),
           runtimeConfig: {
             type: "ssh",
-            host: `${sandboxId}.xum--daytona`,
+            host: `${sandboxName}.xum--daytona`,
             srcBaseDir: "/home/daytona/xum",
-            daytona: { sandboxId },
+            daytona: { sandboxName },
           },
           createdAt: "2026-01-01T00:00:00.000Z",
         })),
@@ -303,7 +303,7 @@ describe("WorkspaceService.getRuntimeStatuses for Daytona workspaces", () => {
       broken1: "unknown",
       broken2: "unknown",
     });
-    expect(getSandboxState.mock.calls.map(([sandboxId]) => sandboxId).sort()).toEqual([
+    expect(getSandboxState.mock.calls.map(([sandboxName]) => sandboxName).sort()).toEqual([
       "sb-1",
       "sb-2",
       "sb-broken",
@@ -355,7 +355,7 @@ describe("WorkspaceService.recordExternalEditorOpen for a Daytona workspace", ()
               type: "ssh",
               host: "sb-1.xum--daytona",
               srcBaseDir: "/home/daytona/xum",
-              daytona: { sandboxId: "sb-1" },
+              daytona: { sandboxName: "sb-1" },
             },
             createdAt: "2026-01-01T00:00:00.000Z",
             archivedAt,

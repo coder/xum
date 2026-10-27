@@ -15,7 +15,7 @@ describe("createSshForwardTarget", () => {
     const rig = await createDaytonaTestRig();
     try {
       const plain = { host: "box", srcBaseDir: "~/src" };
-      const daytona = { ...plain, host: "sb-1.xum--daytona", daytona: { sandboxId: "sb-1" } };
+      const daytona = { ...plain, host: "sb-1.xum--daytona", daytona: { sandboxName: "sb-1" } };
       const sshTarget = createSshForwardTarget(
         new SSHRuntime(plain, createSSHTransport(plain, false))
       );

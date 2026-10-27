@@ -88,7 +88,7 @@ describe("RuntimeConfigSchema ssh backends", () => {
 
   test("keeps the daytona sub-config through a persist round-trip", () => {
     const daytona = {
-      sandboxId: "sb-1",
+      sandboxName: "sb-1",
       snapshot: "node-22",
       cpu: 2,
       memoryGiB: 4,
@@ -103,7 +103,7 @@ describe("RuntimeConfigSchema ssh backends", () => {
     const result = RuntimeConfigSchema.safeParse({
       ...ssh,
       coder: { workspaceName: "ws" },
-      daytona: { sandboxId: "sb-1" },
+      daytona: { sandboxName: "sb-1" },
     });
     expect(result.success).toBe(false);
   });

@@ -1,5 +1,5 @@
 import { Err, Ok, type Result } from "@/common/types/result";
-import { getDaytonaSandboxId, ownsDaytonaSandbox } from "@/common/types/runtime";
+import { getDaytonaSandboxName, ownsDaytonaSandbox } from "@/common/types/runtime";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { BeforeArchiveHook } from "@/node/services/workspaceLifecycleHooks";
 import type { DaytonaSandboxes } from "./daytonaSandboxes";
@@ -17,15 +17,15 @@ export interface DaytonaArchiveHookOptions {
 
 export function createDaytonaArchiveHook(options: DaytonaArchiveHookOptions): BeforeArchiveHook {
   return async (args): Promise<Result<void>> => {
-    const sandboxId = ownsDaytonaSandbox(args.workspaceMetadata)
-      ? getDaytonaSandboxId(args.workspaceMetadata.runtimeConfig)
+    const sandboxName = ownsDaytonaSandbox(args.workspaceMetadata)
+      ? getDaytonaSandboxName(args.workspaceMetadata.runtimeConfig)
       : undefined;
-    if (!sandboxId) return Ok(undefined);
+    if (!sandboxName) return Ok(undefined);
     try {
-      await options.daytonaService.sandboxes.deleteSandbox(sandboxId);
+      await options.daytonaService.sandboxes.deleteSandbox(sandboxName);
       return Ok(undefined);
     } catch (error) {
-      return Err(`Failed to delete Daytona sandbox "${sandboxId}": ${getErrorMessage(error)}`);
+      return Err(`Failed to delete Daytona sandbox "${sandboxName}": ${getErrorMessage(error)}`);
     }
   };
 }

@@ -60,6 +60,7 @@ import { createBackendCpuProfiler } from "@/node/services/perf/backendCpuProfile
 import { PerfCaptureService } from "@/node/services/perf/perfCaptureService";
 import { AgentResourceLimitsService } from "@/node/services/agentResourceLimits/agentResourceLimitsService";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
+import { createConfigSandboxIds } from "@/node/services/daytona/daytonaSandboxIds";
 import { DaytonaService } from "@/node/services/daytona/daytonaService";
 import {
   DaytonaReconciler,
@@ -346,6 +347,7 @@ export class ServiceContainer {
     this.agentResourceLimits = new AgentResourceLimitsService(this.config);
     this.daytonaService = new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(this.config.rootDir),
+      sandboxIds: createConfigSandboxIds(this.config),
       rootDir: this.config.rootDir,
     });
     this.perfCaptures = new PerfCaptureService({

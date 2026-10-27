@@ -18,6 +18,7 @@ import type { InitLogger } from "@/node/runtime/Runtime";
 import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import { createSSHTransport } from "@/node/runtime/transports";
 import { createDaytonaArchiveHook } from "@/node/services/daytona/daytonaLifecycleHooks";
+import { InMemoryDaytonaSandboxIds } from "@/node/services/daytona/daytonaSandboxIds";
 import { DaytonaService } from "@/node/services/daytona/daytonaService";
 import { execBuffered, readFileString, writeFileString } from "@/node/utils/runtime/helpers";
 
@@ -36,7 +37,7 @@ describeDaytona("Daytona runtime (real control plane)", () => {
   let originalHome: string | undefined;
   let service: DaytonaService;
   let projectPath: string;
-  let sandboxId: string | undefined;
+  let sandboxName: string | undefined;
 
   function makeRuntime(config: Extract<RuntimeConfig, { type: "ssh" }>, workspaceName: string) {
     if (!config.daytona) throw new Error("expected a daytona config");
@@ -56,6 +57,7 @@ describeDaytona("Daytona runtime (real control plane)", () => {
     await fs.mkdir(xumHome, { recursive: true });
     service = new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(xumHome),
+      sandboxIds: new InMemoryDaytonaSandboxIds(),
       rootDir: xumHome,
       sshConfigWriter: new DaytonaSshConfigWriter({
         xumHome,
@@ -73,7 +75,7 @@ describeDaytona("Daytona runtime (real control plane)", () => {
   }, 60_000);
 
   afterAll(async () => {
-    if (sandboxId) await service.sandboxes.deleteSandbox(sandboxId);
+    if (sandboxName) await service.sandboxes.deleteSandbox(sandboxName);
     process.env.HOME = originalHome;
     await fs.rm(tempRoot, { recursive: true, force: true });
   }, 120_000);
@@ -88,7 +90,7 @@ describeDaytona("Daytona runtime (real control plane)", () => {
     const creator = makeRuntime(draft, "feature");
     const finalized = await creator.finalizeConfig("feature", draft);
     if (!finalized.success || finalized.data.type !== "ssh") throw new Error("finalize failed");
-    sandboxId = finalized.data.daytona?.sandboxId;
+    sandboxName = finalized.data.daytona?.sandboxName;
     expect((await creator.validateBeforePersist("feature", finalized.data)).success).toBe(true);
 
     const runtime = makeRuntime(finalized.data, "feature");
@@ -138,7 +140,7 @@ describeDaytona("Daytona runtime (real control plane)", () => {
     const forkRuntime = makeRuntime(forkConfig, "feature-fork");
     const deleted = await forkRuntime.deleteWorkspace(projectPath, "feature-fork", false);
     expect(deleted.success).toBe(true);
-    expect((await service.sandboxes.getSandboxState(sandboxId ?? "")).state).toBe("started");
+    expect((await service.sandboxes.getSandboxState(sandboxName ?? "")).state).toBe("started");
 
     // Archiving the workspace that created the sandbox deletes it.
     const archiveHook = createDaytonaArchiveHook({ daytonaService: service });
@@ -153,6 +155,6 @@ describeDaytona("Daytona runtime (real control plane)", () => {
       },
     });
     expect(archived.success).toBe(true);
-    expect((await service.sandboxes.getSandboxState(sandboxId ?? "")).state).toBe("missing");
+    expect((await service.sandboxes.getSandboxState(sandboxName ?? "")).state).toBe("missing");
   }, 900_000);
 });

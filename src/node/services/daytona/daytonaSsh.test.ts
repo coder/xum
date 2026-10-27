@@ -23,6 +23,7 @@ describe("DaytonaSsh", () => {
   ): DaytonaService {
     return new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(rootDir, env),
+      sandboxIds: plane.recordedIds,
       rootDir,
       sshConfigWriter,
       fetch: plane.fetch,
@@ -35,22 +36,22 @@ describe("DaytonaSsh", () => {
     });
   }
 
-  /** An include file kept as a map from sandbox id to token. */
+  /** An include file kept as a map from sandbox name to token. */
   function mapWriter(includeFile: Map<string, string>): DaytonaSshWriter {
-    const store = (input: { sandboxId: string; token: string }) => {
-      includeFile.set(input.sandboxId, input.token);
+    const store = (input: { sandboxName: string; token: string }) => {
+      includeFile.set(input.sandboxName, input.token);
       return Promise.resolve();
     };
     return {
       writeSandbox: store,
       ensureManagedBlock: () => Promise.resolve(),
       updateToken: store,
-      removeSandbox: (sandboxId) => {
-        includeFile.delete(sandboxId);
+      removeSandbox: (sandboxName) => {
+        includeFile.delete(sandboxName);
         return Promise.resolve();
       },
       readTokens: () =>
-        Promise.resolve([...includeFile].map(([sandboxId, token]) => ({ sandboxId, token }))),
+        Promise.resolve([...includeFile].map(([sandboxName, token]) => ({ sandboxName, token }))),
       repointGateway: () => Promise.resolve(),
     };
   }
@@ -84,6 +85,21 @@ describe("DaytonaSsh", () => {
     expect(second.token).not.toBe(first.token);
     expect(order).toEqual([`installed ${second.token}, revoked so far: `]);
     expect(plane.revoked).toEqual([first.token]);
+  });
+
+  it("mints and revokes tokens for the recorded id, never for a sandbox that took the name", async () => {
+    // Daytona resolves names too: a request by name would reach the sandbox holding it now.
+    const mine = plane.addSandbox({ id: "id-mine", name: "xum-a" });
+    mine.name = "xum-a-renamed";
+    plane.addSandbox({ id: "id-other", name: "xum-a" }, { recorded: false });
+
+    await service.ssh.ensureSshAccess("xum-a");
+    await service.ssh.releaseSshAccess("xum-a");
+
+    expect(plane.calls.filter((call) => call.includes("ssh-access"))).toEqual([
+      "POST /sandbox/id-mine/ssh-access",
+      "DELETE /sandbox/id-mine/ssh-access",
+    ]);
   });
 
   it("shares one mint between concurrent token requests", async () => {
@@ -164,6 +180,7 @@ describe("DaytonaSsh", () => {
     const startProcess = async () => {
       const started = new DaytonaService({
         credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+        sandboxIds: plane.recordedIds,
         rootDir,
         fetch: plane.fetch,
         now: () => clock,
@@ -188,6 +205,7 @@ describe("DaytonaSsh", () => {
     const sshConfigPath = path.join(rootDir, "home", ".ssh", "config");
     service = new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(rootDir, { DAYTONA_API_KEY: "k" }),
+      sandboxIds: plane.recordedIds,
       rootDir,
       fetch: plane.fetch,
       now: () => clock,

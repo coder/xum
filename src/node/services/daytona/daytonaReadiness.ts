@@ -27,18 +27,18 @@ export class DaytonaReadiness {
   constructor(private readonly now: () => number) {}
 
   /** Whether a readiness check for this sandbox passed within DAYTONA_READY_CACHE_MS. */
-  isSandboxReady(sandboxId: string): boolean {
-    const at = this.readyAt.get(sandboxId);
+  isSandboxReady(sandboxName: string): boolean {
+    const at = this.readyAt.get(sandboxName);
     return at !== undefined && this.now() - at < DAYTONA_READY_CACHE_MS;
   }
 
-  markSandboxReady(sandboxId: string): void {
-    this.readyAt.set(sandboxId, this.now());
+  markSandboxReady(sandboxName: string): void {
+    this.readyAt.set(sandboxName, this.now());
   }
 
   /** An ssh connection failed: the sandbox may have stopped within the ready cache. */
-  invalidateSandboxReady(sandboxId: string): void {
-    this.readyAt.delete(sandboxId);
+  invalidateSandboxReady(sandboxName: string): void {
+    this.readyAt.delete(sandboxName);
   }
 
   invalidateAll(): void {
@@ -51,17 +51,17 @@ export class DaytonaReadiness {
    * `onStarting`, through the callback `run` gets.
    */
   async join(
-    sandboxId: string,
+    sandboxName: string,
     options: DaytonaEnsureReadyOptions,
     run: (onStarting: () => void) => Promise<void>
   ): Promise<void> {
-    let request = this.readyRequests.get(sandboxId);
+    let request = this.readyRequests.get(sandboxName);
     if (!request) {
       // A cancelled caller hears no later start: nothing would report its end.
       request = run(() => {
         if (!options.signal?.aborted) options.onStarting?.();
-      }).finally(() => this.readyRequests.delete(sandboxId));
-      this.readyRequests.set(sandboxId, request);
+      }).finally(() => this.readyRequests.delete(sandboxName));
+      this.readyRequests.set(sandboxName, request);
     }
     const raced = await raceWithAbortAndTimeout(request, { signal: options.signal });
     if (raced.kind !== "ok") throw new Error("Aborted");
@@ -72,14 +72,14 @@ export class DaytonaReadiness {
    * otherwise land after a stop or a release and undo it. Bounded by the start timeout; its
    * failure belongs to its own callers, so it is only logged here.
    */
-  async waitForSandboxReadiness(sandboxId: string): Promise<void> {
-    const request = this.readyRequests.get(sandboxId);
+  async waitForSandboxReadiness(sandboxName: string): Promise<void> {
+    const request = this.readyRequests.get(sandboxName);
     if (!request) return;
     try {
       await request;
     } catch (error) {
       log.warn("Daytona sandbox readiness failed while another operation waited for it", {
-        sandboxId,
+        sandboxName,
         error: getErrorMessage(error),
       });
     }

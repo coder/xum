@@ -85,7 +85,7 @@ export function getSshRuntimeInfo(runtimeConfig: Extract<RuntimeConfig, { type: 
   if (runtimeConfig.daytona) {
     return {
       type: "daytona",
-      label: `Daytona sandbox: ${runtimeConfig.daytona.sandboxId ?? runtimeConfig.host}`,
+      label: `Daytona sandbox: ${runtimeConfig.daytona.sandboxName ?? runtimeConfig.host}`,
     };
   }
   const hostname = extractSshHostname(runtimeConfig);

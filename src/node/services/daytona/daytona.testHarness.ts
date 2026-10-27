@@ -6,6 +6,7 @@ import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import type { DaytonaSshConfigWriter, DaytonaSshGateway } from "@/node/runtime/daytonaSshConfig";
 import type { SSHTransport } from "@/node/runtime/transports";
 import { DAYTONA_LABEL_INSTANCE } from "./daytonaSandboxes";
+import { InMemoryDaytonaSandboxIds } from "./daytonaSandboxIds";
 import { DaytonaService } from "./daytonaService";
 
 /**
@@ -86,6 +87,11 @@ export class FakeDaytonaControlPlane {
   apiKey?: string;
   /** A proxy that echoes the request URI and its Authorization header in a failed revoke. */
   revokeEchoesRequest = false;
+  /**
+   * Xum's side, not Daytona's: the ids the workspace config records per sandbox name. A
+   * sandbox a test adds is recorded, as Xum records the sandboxes it creates.
+   */
+  readonly recordedIds = new InMemoryDaytonaSandboxIds();
 
   constructor(private readonly now: () => number) {}
 
@@ -102,7 +108,10 @@ export class FakeDaytonaControlPlane {
     return hook().then(() => this.handle(route, url, init));
   }) as typeof fetch;
 
-  addSandbox(partial: Partial<FakeSandbox> & { id: string }): FakeSandbox {
+  addSandbox(
+    partial: Partial<FakeSandbox> & { id: string },
+    options: { recorded?: boolean } = {}
+  ): FakeSandbox {
     const sandbox: FakeSandbox = {
       name: partial.id,
       state: "started",
@@ -114,6 +123,7 @@ export class FakeDaytonaControlPlane {
       ...partial,
     };
     this.sandboxes.set(sandbox.id, sandbox);
+    if (options.recorded !== false) this.recordedIds.ids.set(sandbox.name, sandbox.id);
     return sandbox;
   }
 
@@ -306,14 +316,14 @@ export class FakeDaytonaSshConfigWriter implements Pick<
   gateway?: DaytonaSshGateway;
   readonly repoints: DaytonaSshGateway[] = [];
   writeSandbox(input: {
-    sandboxId: string;
+    sandboxName: string;
     token: string;
     gateway: DaytonaSshGateway;
   }): Promise<void> {
     if (this.writeError) return Promise.reject(this.writeError);
-    this.fullWrites.push(input.sandboxId);
+    this.fullWrites.push(input.sandboxName);
     this.gateway = input.gateway;
-    this.tokens.set(input.sandboxId, input.token);
+    this.tokens.set(input.sandboxName, input.token);
     return Promise.resolve();
   }
 
@@ -326,12 +336,12 @@ export class FakeDaytonaSshConfigWriter implements Pick<
   }
 
   updateToken(input: {
-    sandboxId: string;
+    sandboxName: string;
     token: string;
     gateway: DaytonaSshGateway;
   }): Promise<void> {
     this.gateway = input.gateway;
-    this.tokens.set(input.sandboxId, input.token);
+    this.tokens.set(input.sandboxName, input.token);
     return Promise.resolve();
   }
 
@@ -341,14 +351,16 @@ export class FakeDaytonaSshConfigWriter implements Pick<
     return Promise.resolve();
   }
 
-  removeSandbox(sandboxId: string): Promise<void> {
-    this.removed.push(sandboxId);
-    this.tokens.delete(sandboxId);
+  removeSandbox(sandboxName: string): Promise<void> {
+    this.removed.push(sandboxName);
+    this.tokens.delete(sandboxName);
     return Promise.resolve();
   }
 
-  readTokens(): Promise<Array<{ sandboxId: string; token: string }>> {
-    return Promise.resolve([...this.tokens].map(([sandboxId, token]) => ({ sandboxId, token })));
+  readTokens(): Promise<Array<{ sandboxName: string; token: string }>> {
+    return Promise.resolve(
+      [...this.tokens].map(([sandboxName, token]) => ({ sandboxName, token }))
+    );
   }
 }
 
@@ -376,6 +388,7 @@ export async function createDaytonaTestRig(
     options.apiKey === null ? {} : { DAYTONA_API_KEY: options.apiKey ?? "test-key" };
   const service = new DaytonaService({
     credentialsStore: new DaytonaCredentialsStore(rootDir, env),
+    sandboxIds: plane.recordedIds,
     rootDir,
     sshConfigWriter: writer,
     fetch: plane.fetch,

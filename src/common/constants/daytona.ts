@@ -6,14 +6,14 @@
 export const DAYTONA_DEFAULT_API_URL = "https://app.daytona.io/api";
 
 /**
- * Host suffix for Daytona sandboxes (`<sandboxId>.xum--daytona`). The `--` keeps Xum's managed
+ * Host suffix for Daytona sandboxes (`<sandboxName>.xum--daytona`). The `--` keeps Xum's managed
  * ssh config block from colliding with user-managed entries, as the Coder suffix does.
  */
 export const XUM_DAYTONA_HOST_SUFFIX = "xum--daytona";
 
 /** Build the SSH alias for a Daytona sandbox (e.g. `abc123.xum--daytona`). */
-export function toXumDaytonaHost(sandboxId: string): string {
-  return `${sandboxId}.${XUM_DAYTONA_HOST_SUFFIX}`;
+export function toXumDaytonaHost(sandboxName: string): string {
+  return `${sandboxName}.${XUM_DAYTONA_HOST_SUFFIX}`;
 }
 
 /** Whether an ssh host (optionally `user@host`) is a Daytona sandbox alias Xum manages. */

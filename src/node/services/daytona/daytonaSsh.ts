@@ -5,6 +5,7 @@ import { log } from "@/node/services/log";
 import type { DaytonaAccount } from "./daytonaAccount";
 import type { DaytonaClient, DaytonaGatewayConfig, DaytonaSshAccess } from "./daytonaClient";
 import type { DaytonaReadiness } from "./daytonaReadiness";
+import { requireSandboxId, type DaytonaSandboxIds } from "./daytonaSandboxIds";
 
 /** Tokens are minted for an hour and replaced once less than 15 minutes remain. */
 export const DAYTONA_SSH_TOKEN_TTL_MINUTES = 60;
@@ -23,6 +24,7 @@ export type DaytonaSshWriter = Pick<
 export interface DaytonaSshOptions {
   account: Pick<DaytonaAccount, "getClient">;
   readiness: DaytonaReadiness;
+  ids: Pick<DaytonaSandboxIds, "get">;
   sshConfigWriter: DaytonaSshWriter;
   now: () => number;
 }
@@ -48,11 +50,13 @@ function toSshGateway(config: DaytonaGatewayConfig) {
  * Xum's SSH access to sandboxes: the per-sandbox tokens (minted, refreshed, revoked), the
  * include file and `~/.ssh/config` block they are written to, and the gateway `/config` they
  * point at. One instance per Xum backend: a second one would mint (and revoke) tokens behind
- * the first one's back.
+ * the first one's back. Keyed by sandbox name (the alias); tokens are minted and revoked for the
+ * recorded id.
  */
 export class DaytonaSsh {
   private readonly account: DaytonaSshOptions["account"];
   private readonly readiness: DaytonaReadiness;
+  private readonly ids: DaytonaSshOptions["ids"];
   private readonly now: () => number;
   /** Daytona's `/config` of these settings, fetched once; a repair fetches it again. */
   private gatewayCache?: { apiUrl: string; config: DaytonaGatewayConfig };
@@ -69,6 +73,7 @@ export class DaytonaSsh {
   constructor(options: DaytonaSshOptions) {
     this.account = options.account;
     this.readiness = options.readiness;
+    this.ids = options.ids;
     this.now = options.now;
     this.sshConfigWriter = options.sshConfigWriter;
   }
@@ -80,7 +85,7 @@ export class DaytonaSsh {
    * reads it too but goes on when the read fails. A missing file holds nothing.
    */
   async loadPersistedTokens(): Promise<void> {
-    let entries: Array<{ sandboxId: string; token: string }>;
+    let entries: Array<{ sandboxName: string; token: string }>;
     try {
       entries = await this.sshConfigWriter.readTokens();
     } catch (error) {
@@ -89,12 +94,12 @@ export class DaytonaSsh {
       });
       throw error;
     }
-    for (const { sandboxId, token } of entries) {
+    for (const { sandboxName, token } of entries) {
       rememberDaytonaToken(token);
       // An earlier run's tokens: holding them lets a replacement, a settings change or an
       // archive revoke them. The file has no expiry, so they are due for refresh at once.
-      if (!this.persistedTokensLoaded && !this.tokens.has(sandboxId)) {
-        this.tokens.set(sandboxId, { token, expiresAt: new Date(0).toISOString() });
+      if (!this.persistedTokensLoaded && !this.tokens.has(sandboxName)) {
+        this.tokens.set(sandboxName, { token, expiresAt: new Date(0).toISOString() });
       }
     }
     this.persistedTokensLoaded = true;
@@ -112,11 +117,11 @@ export class DaytonaSsh {
     this.tokens.clear();
     this.sshConfigured.clear();
     this.gatewayCache = undefined;
-    for (const [sandboxId] of tokens) await this.removeOldAccountAlias(sandboxId);
+    for (const [sandboxName] of tokens) await this.removeOldAccountAlias(sandboxName);
     if (previousClient) {
       await Promise.all(
-        tokens.map(([sandboxId, access]) =>
-          this.revokeQuietly(previousClient, sandboxId, access.token)
+        tokens.map(([sandboxName, access]) =>
+          this.revokeQuietly(previousClient, sandboxName, access.token)
         )
       );
     }
@@ -139,15 +144,15 @@ export class DaytonaSsh {
    * this sandbox's token, revoking the old one. Pooled connections opened before keep their old
    * gateway until they close.
    */
-  async repairSshAccess(sandboxId: string): Promise<void> {
+  async repairSshAccess(sandboxName: string): Promise<void> {
     const { client, credentials } = await this.account.getClient();
     const config = await client.getConfig();
     this.gatewayCache = { apiUrl: credentials.apiUrl, config };
     await this.sshConfigWriter.repointGateway(toSshGateway(config));
-    const cached = this.tokens.get(sandboxId);
+    const cached = this.tokens.get(sandboxName);
     // Due at once, so ensureSshAccess mints, writes, and revokes the old one.
-    if (cached) this.tokens.set(sandboxId, { ...cached, expiresAt: new Date(0).toISOString() });
-    await this.ensureSshAccess(sandboxId);
+    if (cached) this.tokens.set(sandboxName, { ...cached, expiresAt: new Date(0).toISOString() });
+    await this.ensureSshAccess(sandboxName);
   }
 
   /**
@@ -156,40 +161,35 @@ export class DaytonaSsh {
    * The `~/.ssh/config` block is checked every time: another tool may have removed it while a
    * cached token stays fresh, and an external editor needs it to resolve the alias.
    */
-  async ensureSshAccess(sandboxId: string): Promise<void> {
+  async ensureSshAccess(sandboxName: string): Promise<void> {
     // Fails before a mint when the control plane cannot say where the gateway is.
     await this.getGatewayConfig();
     // A cached token was written by the mint that produced it, so only a mint writes files.
-    await this.getSshToken(sandboxId, {
+    await this.getSshToken(sandboxName, {
       onNewToken: async ({ token }) => {
         const gateway = toSshGateway(await this.getGatewayConfig());
-        if (this.sshConfigured.has(sandboxId)) {
-          await this.sshConfigWriter.updateToken({ sandboxId, token, gateway });
+        if (this.sshConfigured.has(sandboxName)) {
+          await this.sshConfigWriter.updateToken({ sandboxName, token, gateway });
           return;
         }
-        await this.sshConfigWriter.writeSandbox({ sandboxId, token, gateway });
+        await this.sshConfigWriter.writeSandbox({ sandboxName, token, gateway });
       },
     });
     await this.sshConfigWriter.ensureManagedBlock();
-    this.sshConfigured.add(sandboxId);
-  }
-
-  /** Whether this process holds a token for the sandbox that is close to expiry. */
-  hasExpiringSshToken(sandboxId: string): boolean {
-    return this.tokens.has(sandboxId) && this.tokenNeedsRefresh(sandboxId);
+    this.sshConfigured.add(sandboxName);
   }
 
   /** Revoke the token and remove the sandbox's include block. */
-  async releaseSshAccess(sandboxId: string): Promise<void> {
-    await this.readiness.waitForSandboxReadiness(sandboxId);
-    this.sshConfigured.delete(sandboxId);
-    this.readiness.invalidateSandboxReady(sandboxId);
-    await this.forgetSshToken(sandboxId);
-    await this.sshConfigWriter.removeSandbox(sandboxId);
+  async releaseSshAccess(sandboxName: string): Promise<void> {
+    await this.readiness.waitForSandboxReadiness(sandboxName);
+    this.sshConfigured.delete(sandboxName);
+    this.readiness.invalidateSandboxReady(sandboxName);
+    await this.forgetSshToken(sandboxName);
+    await this.sshConfigWriter.removeSandbox(sandboxName);
   }
 
-  tokenNeedsRefresh(sandboxId: string): boolean {
-    const cached = this.tokens.get(sandboxId);
+  private tokenNeedsRefresh(sandboxName: string): boolean {
+    const cached = this.tokens.get(sandboxName);
     if (!cached) return true;
     const expiresAt = Date.parse(cached.expiresAt);
     return (
@@ -203,45 +203,46 @@ export class DaytonaSsh {
    * after `onNewToken` resolves; a failed revoke is logged, since the token expires anyway.
    */
   async getSshToken(
-    sandboxId: string,
+    sandboxName: string,
     options: DaytonaSshTokenOptions = {}
   ): Promise<DaytonaSshAccess> {
-    const cached = this.tokens.get(sandboxId);
-    if (cached && !this.tokenNeedsRefresh(sandboxId)) return cached;
-    const inFlight = this.tokenRequests.get(sandboxId);
+    const cached = this.tokens.get(sandboxName);
+    if (cached && !this.tokenNeedsRefresh(sandboxName)) return cached;
+    const inFlight = this.tokenRequests.get(sandboxName);
     if (inFlight) return inFlight;
 
-    const request = this.mintSshToken(sandboxId, cached, options).finally(() => {
-      this.tokenRequests.delete(sandboxId);
+    const request = this.mintSshToken(sandboxName, cached, options).finally(() => {
+      this.tokenRequests.delete(sandboxName);
     });
-    this.tokenRequests.set(sandboxId, request);
+    this.tokenRequests.set(sandboxName, request);
     return request;
   }
 
   private async mintSshToken(
-    sandboxId: string,
+    sandboxName: string,
     previous: DaytonaSshAccess | undefined,
     options: DaytonaSshTokenOptions
   ): Promise<DaytonaSshAccess> {
     const accountChanges = this.accountChanges;
+    const sandboxId = requireSandboxId(this.ids, sandboxName);
     const { client } = await this.account.getClient();
     const access = await client.createSshAccess(sandboxId, DAYTONA_SSH_TOKEN_TTL_MINUTES);
     rememberDaytonaToken(access.token);
-    await this.announceNewToken(client, sandboxId, access, options);
+    await this.announceNewToken(client, sandboxName, access, options);
     // No await between this check and the set: forgetAccount sees the token, or this sees it.
     if (this.accountChanges !== accountChanges) {
-      await this.dropOldAccountToken(client, sandboxId, access.token);
+      await this.dropOldAccountToken(client, sandboxName, access.token);
     }
-    this.tokens.set(sandboxId, access);
+    this.tokens.set(sandboxName, access);
     if (previous && previous.token !== access.token) {
-      await this.revokeQuietly(client, sandboxId, previous.token);
+      await this.revokeQuietly(client, sandboxName, previous.token);
     }
     return access;
   }
 
   private async announceNewToken(
     client: DaytonaClient,
-    sandboxId: string,
+    sandboxName: string,
     access: DaytonaSshAccess,
     options: DaytonaSshTokenOptions
   ): Promise<void> {
@@ -249,7 +250,7 @@ export class DaytonaSsh {
       await options.onNewToken?.(access);
     } catch (error) {
       // Nothing holds the new token any more: revoke it rather than leave it live.
-      await this.revokeQuietly(client, sandboxId, access.token);
+      await this.revokeQuietly(client, sandboxName, access.token);
       throw error;
     }
   }
@@ -261,45 +262,48 @@ export class DaytonaSsh {
    */
   private async dropOldAccountToken(
     client: DaytonaClient,
-    sandboxId: string,
+    sandboxName: string,
     token: string
   ): Promise<never> {
-    await this.removeOldAccountAlias(sandboxId);
-    await this.revokeQuietly(client, sandboxId, token);
-    throw new Error(`The Daytona settings changed while Xum got ssh access to ${sandboxId}`);
+    await this.removeOldAccountAlias(sandboxName);
+    await this.revokeQuietly(client, sandboxName, token);
+    throw new Error(`The Daytona settings changed while Xum got ssh access to ${sandboxName}`);
   }
 
-  private async removeOldAccountAlias(sandboxId: string): Promise<void> {
+  private async removeOldAccountAlias(sandboxName: string): Promise<void> {
     try {
-      await this.sshConfigWriter.removeSandbox(sandboxId);
+      await this.sshConfigWriter.removeSandbox(sandboxName);
     } catch (error) {
       log.warn("Failed to remove an old-account Daytona alias from the include file", {
-        sandboxId,
+        sandboxName,
         error: getErrorMessage(error),
       });
     }
   }
 
   /** Revoke and forget the cached token (workspace deleted or sandbox detached). */
-  async forgetSshToken(sandboxId: string): Promise<void> {
-    const cached = this.tokens.get(sandboxId);
-    this.tokens.delete(sandboxId);
+  async forgetSshToken(sandboxName: string): Promise<void> {
+    const cached = this.tokens.get(sandboxName);
+    this.tokens.delete(sandboxName);
     if (!cached) return;
     const { client } = await this.account.getClient();
-    await this.revokeQuietly(client, sandboxId, cached.token);
+    await this.revokeQuietly(client, sandboxName, cached.token);
   }
 
+  /** Without a recorded id there is no sandbox to ask: the token expires on its own. */
   private async revokeQuietly(
     client: DaytonaClient,
-    sandboxId: string,
+    sandboxName: string,
     token: string
   ): Promise<void> {
+    const sandboxId = this.ids.get(sandboxName);
+    if (!sandboxId) return;
     try {
       await client.revokeSshAccess(sandboxId, token);
     } catch (error) {
       // Never log the token itself.
       log.warn("Failed to revoke a Daytona SSH token; it expires on its own", {
-        sandboxId,
+        sandboxName,
         error: getErrorMessage(error),
       });
     }

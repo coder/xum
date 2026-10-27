@@ -41,7 +41,7 @@ describe("DaytonaSshConfigWriter", () => {
     await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
     await fs.writeFile(sshConfigPath, "Host work\n  User me\n", "utf8");
 
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
 
     expect(await fs.readFile(sshConfigPath, "utf8")).toBe(
       [
@@ -84,12 +84,12 @@ describe("DaytonaSshConfigWriter", () => {
   });
 
   it("refreshes a token by rewriting only the include file, keeping other sandboxes", async () => {
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
-    await writer.writeSandbox({ sandboxId: "sb-2", token: "tokenB", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxName: "sb-2", token: "tokenB", gateway: GATEWAY });
     const sshConfigBefore = await fs.readFile(sshConfigPath, "utf8");
     await fs.rm(writer.paths.knownHostsPath);
 
-    await writer.updateToken({ sandboxId: "sb-1", token: "tokenA2", gateway: GATEWAY });
+    await writer.updateToken({ sandboxName: "sb-1", token: "tokenA2", gateway: GATEWAY });
 
     const include = await fs.readFile(writer.paths.includePath, "utf8");
     expect(include).toContain("User tokenA2");
@@ -105,7 +105,7 @@ describe("DaytonaSshConfigWriter", () => {
   });
 
   it("puts back a removed managed block, and leaves an unchanged config untouched", async () => {
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
     const written = await fs.readFile(sshConfigPath, "utf8");
     const { ino } = await fs.stat(sshConfigPath);
 
@@ -119,8 +119,8 @@ describe("DaytonaSshConfigWriter", () => {
   });
 
   it("repoints every sandbox at a new gateway in the write that replaces its host keys", async () => {
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
-    await writer.writeSandbox({ sandboxId: "sb-2", token: "tokenB", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxName: "sb-2", token: "tokenB", gateway: GATEWAY });
     const moved = {
       host: "ssh2.daytona.test",
       port: 2222,
@@ -128,7 +128,7 @@ describe("DaytonaSshConfigWriter", () => {
     };
 
     // sb-1 is refreshed first; sb-2 still has a turn on the shared known_hosts file.
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA2", gateway: moved });
+    await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA2", gateway: moved });
 
     const include = await fs.readFile(writer.paths.includePath, "utf8");
     expect(include).not.toContain("ssh.daytona.test");
@@ -141,8 +141,8 @@ describe("DaytonaSshConfigWriter", () => {
       ].join("\n")
     );
     expect(await writer.readTokens()).toEqual([
-      { sandboxId: "sb-1", token: "tokenA2" },
-      { sandboxId: "sb-2", token: "tokenB" },
+      { sandboxName: "sb-1", token: "tokenA2" },
+      { sandboxName: "sb-2", token: "tokenB" },
     ]);
 
     // Moved back without a token refresh: every block follows, tokens kept.
@@ -156,20 +156,20 @@ describe("DaytonaSshConfigWriter", () => {
     const later = new DaytonaSshConfigWriter({ xumHome, sshConfigPath });
     expect(await later.readTokens()).toEqual([]);
 
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
-    await writer.writeSandbox({ sandboxId: "sb-2", token: "tokenB", gateway: GATEWAY });
-    await writer.updateToken({ sandboxId: "sb-1", token: "tokenA2", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxName: "sb-2", token: "tokenB", gateway: GATEWAY });
+    await writer.updateToken({ sandboxName: "sb-1", token: "tokenA2", gateway: GATEWAY });
 
     expect(await later.readTokens()).toEqual([
-      { sandboxId: "sb-1", token: "tokenA2" },
-      { sandboxId: "sb-2", token: "tokenB" },
+      { sandboxName: "sb-1", token: "tokenA2" },
+      { sandboxName: "sb-2", token: "tokenB" },
     ]);
   });
 
   it("refuses control-plane values that would inject ssh directives", async () => {
     for (const input of [
-      { sandboxId: "sb-1", token: "tok\n  ProxyCommand touch /tmp/pwned" },
-      { sandboxId: "sb-1\nHost *", token: "tok" },
+      { sandboxName: "sb-1", token: "tok\n  ProxyCommand touch /tmp/pwned" },
+      { sandboxName: "sb-1\nHost *", token: "tok" },
     ]) {
       // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
       await expect(writer.writeSandbox({ ...input, gateway: GATEWAY })).rejects.toThrow(
@@ -195,7 +195,7 @@ describe("DaytonaSshConfigWriter", () => {
       xumHome: path.join(tempDir, root),
       sshConfigPath,
     });
-    const input = { sandboxId: "sb-1", token: "tok", gateway: GATEWAY };
+    const input = { sandboxName: "sb-1", token: "tok", gateway: GATEWAY };
     for (const update of [
       () => tokenWriter.writeSandbox(input),
       () => tokenWriter.updateToken(input),
@@ -214,13 +214,13 @@ describe("DaytonaSshConfigWriter", () => {
       xumHome: path.join(tempDir, "José Smith", ".xum"),
       sshConfigPath,
     });
-    await spacedWriter.writeSandbox({ sandboxId: "sb-1", token: "tok", gateway: GATEWAY });
-    expect(await spacedWriter.readTokens()).toEqual([{ sandboxId: "sb-1", token: "tok" }]);
+    await spacedWriter.writeSandbox({ sandboxName: "sb-1", token: "tok", gateway: GATEWAY });
+    expect(await spacedWriter.readTokens()).toEqual([{ sandboxName: "sb-1", token: "tok" }]);
   });
 
   it("writes a self-hosted IPv6 gateway as OpenSSH resolves it, refusing zone ids", async () => {
     const gateway = { ...GATEWAY, host: "2001:db8::10", port: 2222 };
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway });
+    await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway });
 
     expect(await fs.readFile(writer.paths.knownHostsPath, "utf8")).toBe(
       [
@@ -242,7 +242,7 @@ describe("DaytonaSshConfigWriter", () => {
     // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
     await expect(
       writer.writeSandbox({
-        sandboxId: "sb-2",
+        sandboxName: "sb-2",
         token: "t",
         gateway: { ...gateway, host: "fe80::1%eth0" },
       })
@@ -253,7 +253,7 @@ describe("DaytonaSshConfigWriter", () => {
   // HostKeyAlias as is, both to look up the pinned key and (ssh2) to match known_hosts lines.
   it("writes an absolute gateway name with its trailing dot, pinned under that name", async () => {
     const gateway = { ...GATEWAY, host: "gateway.example.com.", port: 2222 };
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway });
+    await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway });
 
     const knownHosts = await fs.readFile(writer.paths.knownHostsPath, "utf8");
     expect(knownHosts).toBe(
@@ -285,7 +285,7 @@ describe("DaytonaSshConfigWriter", () => {
     for (const host of ["gateway.example.com..", "gateway..example.com", ".example.com", "."]) {
       // eslint-disable-next-line @typescript-eslint/await-thenable -- Bun's expect().rejects.toThrow() is thenable at runtime
       await expect(
-        writer.writeSandbox({ sandboxId: "sb-2", token: "t", gateway: { ...gateway, host } })
+        writer.writeSandbox({ sandboxName: "sb-2", token: "t", gateway: { ...gateway, host } })
       ).rejects.toThrow(/Refusing to write an invalid Daytona gateway host/);
     }
   });
@@ -304,7 +304,7 @@ describe("DaytonaSshConfigWriter", () => {
   it.skipIf(!hasOpenSsh)("resolves the alias through the managed ssh config block", async () => {
     await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
     await fs.writeFile(sshConfigPath, "Host other\n  User someone\n", "utf8");
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
 
     const alias = spawnSync("ssh", ["-G", "-F", sshConfigPath, toXumDaytonaHost("sb-1")]);
     expect(alias.stdout.toString()).toMatch(/^user tokenA$/m);
@@ -318,7 +318,7 @@ describe("DaytonaSshConfigWriter", () => {
   it.skipIf(!hasOpenSsh)("keeps your own ssh clients quiet for a Daytona alias", async () => {
     await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
     await fs.writeFile(sshConfigPath, "Host *\n  LogLevel VERBOSE\n", "utf8");
-    await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+    await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
 
     const resolve = (host: string) =>
       spawnSync("ssh", ["-G", "-F", sshConfigPath, host]).stdout.toString();
@@ -359,7 +359,7 @@ describe("DaytonaSshConfigWriter", () => {
         ].join("\n"),
         "utf8"
       );
-      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+      await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
 
       const daytona = resolve(toXumDaytonaHost("sb-1"));
       expect(daytona).toMatch(/^user tokenA$/m);
@@ -406,7 +406,7 @@ describe("DaytonaSshConfigWriter", () => {
           ].join("\n"),
           "utf8"
         );
-        await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+        await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
 
         const daytona = resolveFromUserConfig(toXumDaytonaHost("sb-1"));
         expect(daytona).toMatch(/^user tokenA$/m);
@@ -432,7 +432,7 @@ describe("DaytonaSshConfigWriter", () => {
     it.skipIf(!hasOpenSsh)("ignores a ProxyJump the user sets for every host", async () => {
       await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
       await fs.writeFile(sshConfigPath, "Host *\n  ProxyJump jump.example.com\n", "utf8");
-      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+      await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
 
       expect(resolveFromUserConfig(toXumDaytonaHost("sb-1"))).not.toMatch(/\nproxy(command|jump) /);
       expect(resolveFromUserConfig("other.example.com")).toContain(
@@ -443,7 +443,7 @@ describe("DaytonaSshConfigWriter", () => {
     it.skipIf(!hasOpenSsh)("gives the sandbox no tun device a user Tunnel asks for", async () => {
       await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
       await fs.writeFile(sshConfigPath, "Host *\n  Tunnel yes\n", "utf8");
-      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+      await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
 
       expect(resolveFromUserConfig(toXumDaytonaHost("sb-1"))).toContain("\ntunnel false\n");
       expect(resolveFromUserConfig("other.example.com")).toContain("\ntunnel point-to-point\n");
@@ -465,14 +465,14 @@ describe("DaytonaSshConfigWriter", () => {
         "utf8"
       );
 
-      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+      await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
       const content = await fs.readFile(sshConfigPath, "utf8");
       expect(content.startsWith(`${XUM_DAYTONA_SSH_BLOCK_START}\n`)).toBe(true);
       expect(content.endsWith(`${XUM_DAYTONA_SSH_BLOCK_END}\n${userConfig}`)).toBe(true);
       expect(content.split(XUM_DAYTONA_SSH_BLOCK_START)).toHaveLength(2);
 
       // Already on top: rewriting it changes nothing.
-      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+      await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
       expect(await fs.readFile(sshConfigPath, "utf8")).toBe(content);
     });
   });
@@ -483,7 +483,7 @@ describe("DaytonaSshConfigWriter", () => {
     it.skipIf(!hasOpenSsh)("cannot turn off strict checking for Xum's ssh calls", async () => {
       await fs.mkdir(path.dirname(sshConfigPath), { recursive: true });
       await fs.writeFile(sshConfigPath, WEAKENING_CONFIG, "utf8");
-      await writer.writeSandbox({ sandboxId: "sb-1", token: "tokenA", gateway: GATEWAY });
+      await writer.writeSandbox({ sandboxName: "sb-1", token: "tokenA", gateway: GATEWAY });
 
       const args = ["-G", "-F", sshConfigPath];
       appendOpenSSHHostKeyPolicyArgs(args, toXumDaytonaHost("sb-1"));

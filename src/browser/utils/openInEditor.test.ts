@@ -124,7 +124,7 @@ describe("openInEditor", () => {
       type: "ssh",
       host: "xum-daytona-sb-1",
       srcBaseDir: "/home/daytona/xum",
-      daytona: { sandboxId: "sb-1" },
+      daytona: { sandboxName: "sb-1" },
     };
 
     // The default srcBaseDir (~/mux) is persisted unresolved: the sandbox may not exist yet when

@@ -630,9 +630,9 @@ describe("WorkspaceService archive lifecycle hooks", () => {
   });
 
   test("archive() refuses a model-driven archive that deletes a Daytona sandbox, not a fork's", async () => {
-    const daytonaRuntime = (daytona: { sandboxId: string; forked?: boolean }) => ({
+    const daytonaRuntime = (daytona: { sandboxName: string; forked?: boolean }) => ({
       type: "ssh" as const,
-      host: `${daytona.sandboxId}.xum--daytona`,
+      host: `${daytona.sandboxName}.xum--daytona`,
       srcBaseDir: "~/src",
       daytona,
     });
@@ -651,13 +651,13 @@ describe("WorkspaceService archive lifecycle hooks", () => {
       });
 
     await editEntry((entry) => {
-      entry.runtimeConfig = daytonaRuntime({ sandboxId: "xum-own" });
+      entry.runtimeConfig = daytonaRuntime({ sandboxName: "xum-own" });
     });
     expect(await modelArchive()).toEqual(Err(DAYTONA_ARCHIVE_NEEDS_USER));
     expect(hookRuns).toBe(0);
 
     await editEntry((entry) => {
-      entry.runtimeConfig = daytonaRuntime({ sandboxId: "xum-own", forked: true });
+      entry.runtimeConfig = daytonaRuntime({ sandboxName: "xum-own", forked: true });
     });
     expect(await modelArchive()).toEqual(Ok({ kind: "archived" }));
     expect(hookRuns).toBe(1);

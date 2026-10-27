@@ -2,8 +2,16 @@ import { z } from "zod";
 
 // Daytona sandbox config - attached to the SSH runtime when Daytona is the SSH backend.
 export const DaytonaSandboxConfigSchema = z.object({
-  /** Set by Xum when it creates the sandbox (finalizeConfig picks its name). */
-  sandboxId: z.string().optional().meta({ description: "Daytona sandbox id" }),
+  /** The name Xum gives the sandbox it creates (finalizeConfig picks it); also its ssh alias. */
+  sandboxName: z.string().optional().meta({ description: "Daytona sandbox name" }),
+  /**
+   * Daytona's id of the sandbox, recorded once Xum created it. Control-plane requests go to the
+   * id: another sandbox can take the name once this one is gone, never the id.
+   */
+  sandboxId: z
+    .string()
+    .optional()
+    .meta({ description: "Daytona sandbox id (recorded after creation)" }),
   snapshot: z
     .string()
     .optional()

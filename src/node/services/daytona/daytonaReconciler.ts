@@ -1,11 +1,10 @@
 import type { Workspace } from "@/common/types/project";
-import { getDaytonaSandboxId, type RuntimeConfig } from "@/common/types/runtime";
+import { getDaytonaSandboxName, isSSHRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
 import type { DaytonaSandbox } from "./daytonaClient";
 import type { DaytonaAccount } from "./daytonaAccount";
 import { mapDaytonaSandboxState, type DaytonaSandboxes } from "./daytonaSandboxes";
-import type { DaytonaSsh } from "./daytonaSsh";
 
 export const DAYTONA_RECONCILE_INTERVAL_MS = 60_000;
 /** Each control-plane call gets this long; a hung call is logged and the sweep moves on. */
@@ -20,7 +19,6 @@ export interface DaytonaReconcilerOptions {
   daytonaService: {
     account: Pick<DaytonaAccount, "checkAvailability">;
     sandboxes: Pick<DaytonaSandboxes, "listInstanceSandboxes" | "refreshActivity">;
-    ssh: Pick<DaytonaSsh, "hasExpiringSshToken" | "ensureSshAccess">;
   };
   listWorkspaces: () => DaytonaWorkspaceRef[];
   /**
@@ -48,10 +46,10 @@ export function listDaytonaWorkspaceRefs(config: {
   return refs;
 }
 
-/** A workspace on a Daytona sandbox. */
+/** A workspace on a Daytona sandbox Xum created and recorded. */
 export interface DaytonaSandboxRef {
   workspaceId: string;
-  runtimeConfig: RuntimeConfig;
+  sandboxName: string;
   sandboxId: string;
 }
 
@@ -71,11 +69,11 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number, what: string): P
 }
 
 /**
- * One sweep a minute, safe to repeat, that keeps Daytona sandboxes in line with Xum:
- * - keepalive: refresh activity for sandboxes whose workspace is streaming or running a
- *   background job, so Daytona's 30-minute auto-stop does not cut off long agent work;
- * - token refresh: replace an active workspace's ssh token before it expires.
- * Sandboxes no workspace uses are left to Daytona's auto-stop.
+ * One sweep a minute, safe to repeat, that refreshes activity for sandboxes whose workspace is
+ * streaming or running a background job, so Daytona's 30-minute auto-stop does not cut off long
+ * agent work. Sandboxes no workspace uses are left to Daytona's auto-stop. Tokens are not its
+ * business: ensureReady replaces an expiring one, and a command a stale token fails is repaired
+ * and retried, both under the sandbox's readiness request that a release waits for.
  * The first sweep runs one interval after start: startup never waits on the control plane.
  */
 export class DaytonaReconciler {
@@ -120,8 +118,8 @@ export class DaytonaReconciler {
         "listing Daytona sandboxes"
       );
     } catch (error) {
-      // Without the list Xum cannot map stored names to ids or see states: keepalive waits
-      // for the next sweep instead of guessing.
+      // Without the list Xum cannot see labels or states: keepalive waits for the next sweep
+      // instead of guessing.
       log.warn("Daytona reconcile: could not list sandboxes", { error: getErrorMessage(error) });
       return;
     }
@@ -134,15 +132,27 @@ export class DaytonaReconciler {
   private collectReferences(): DaytonaSandboxRef[] {
     const refs: DaytonaSandboxRef[] = [];
     for (const { workspaceId, runtimeConfig } of this.options.listWorkspaces()) {
-      const sandboxId = getDaytonaSandboxId(runtimeConfig);
-      if (sandboxId && runtimeConfig) refs.push({ workspaceId, runtimeConfig, sandboxId });
+      const sandboxName = getDaytonaSandboxName(runtimeConfig);
+      const sandboxId = isSSHRuntime(runtimeConfig) ? runtimeConfig.daytona?.sandboxId : undefined;
+      if (sandboxName && sandboxId) refs.push({ workspaceId, sandboxName, sandboxId });
     }
     return refs;
   }
 
   private async keepAlive(ref: DaytonaSandboxRef, sandboxes: DaytonaSandbox[]): Promise<void> {
     const sandbox = await this.findActiveSandbox(ref, sandboxes);
-    if (sandbox) await this.refreshActivityAndToken(ref.sandboxId, sandbox.id);
+    if (!sandbox) return;
+    try {
+      await this.call(
+        this.options.daytonaService.sandboxes.refreshActivity(sandbox.id),
+        "refreshing activity"
+      );
+    } catch (error) {
+      log.warn("Daytona reconcile: activity refresh failed", {
+        sandboxName: ref.sandboxName,
+        error: getErrorMessage(error),
+      });
+    }
   }
 
   /** The sandbox of a workspace that is active, if the sandbox is known and started. */
@@ -150,9 +160,9 @@ export class DaytonaReconciler {
     ref: DaytonaSandboxRef,
     sandboxes: DaytonaSandbox[]
   ): Promise<DaytonaSandbox | undefined> {
-    // Xum stores a name for sandboxes it created; last-activity only takes the real id. Only the
-    // label-filtered list counts: a sandbox without this install's label is not Xum's to touch.
-    const sandbox = sandboxes.find((sb) => sb.id === ref.sandboxId || sb.name === ref.sandboxId);
+    // Only the label-filtered list counts: a sandbox without this install's label is not Xum's
+    // to touch.
+    const sandbox = sandboxes.find((sb) => sb.id === ref.sandboxId);
     // A stopped sandbox has nothing to keep alive, and checking its jobs over ssh would start it.
     if (!sandbox || !isStarted(sandbox)) return undefined;
     return (await this.isWorkspaceActive(ref.workspaceId)) ? sandbox : undefined;
@@ -170,28 +180,6 @@ export class DaytonaReconciler {
         error: getErrorMessage(error),
       });
       return false;
-    }
-  }
-
-  /** `storedId` is what the workspace config holds (tokens use it), `realId` the sandbox id. */
-  private async refreshActivityAndToken(storedId: string, realId: string): Promise<void> {
-    const service = this.options.daytonaService;
-    try {
-      await this.call(service.sandboxes.refreshActivity(realId), "refreshing activity");
-    } catch (error) {
-      log.warn("Daytona reconcile: activity refresh failed", {
-        sandboxId: storedId,
-        error: getErrorMessage(error),
-      });
-    }
-    if (!service.ssh.hasExpiringSshToken(storedId)) return;
-    try {
-      await this.call(service.ssh.ensureSshAccess(storedId), "refreshing the ssh token");
-    } catch (error) {
-      log.warn("Daytona reconcile: ssh token refresh failed", {
-        sandboxId: storedId,
-        error: getErrorMessage(error),
-      });
     }
   }
 

@@ -68,7 +68,7 @@ export class DaytonaSshConfigError extends Error {
 
 // Everything rendered into ssh config is validated first: a newline or quote in a control-plane
 // value would let it inject arbitrary ssh directives (ProxyCommand runs local commands).
-const SANDBOX_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const SANDBOX_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const TOKEN_PATTERN = /^[A-Za-z0-9._~+/=-]+$/;
 // Dot-separated labels (no empty one), optionally absolute: one trailing dot.
 const HOSTNAME_LABEL = "[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?";
@@ -168,12 +168,12 @@ export function renderDaytonaKnownHosts(gateway: DaytonaSshGateway): string {
 }
 
 export function renderDaytonaHostBlock(input: {
-  sandboxId: string;
+  sandboxName: string;
   token: string;
   gateway: DaytonaSshGateway;
   knownHostsPath: string;
 }): string {
-  assertValid(input.sandboxId, SANDBOX_ID_PATTERN, "sandbox id");
+  assertValid(input.sandboxName, SANDBOX_NAME_PATTERN, "sandbox name");
   assertValid(input.token, TOKEN_PATTERN, "SSH token");
   validateGateway(input.gateway);
   // The sandbox and the network path to the gateway are untrusted, and an editor's ssh reads
@@ -185,7 +185,7 @@ export function renderDaytonaHostBlock(input: {
   // The gateway authenticates with "none" (the token is the user name), so password and
   // keyboard-interactive auth are off: their prompts would print the token.
   return [
-    `Host ${toXumDaytonaHost(input.sandboxId)}`,
+    `Host ${toXumDaytonaHost(input.sandboxName)}`,
     "  ProxyCommand none",
     "  ForwardAgent no",
     "  ForwardX11 no",
@@ -232,7 +232,7 @@ function renderIncludeFile(blocks: Map<string, string>): string {
 }
 
 export interface SandboxToken {
-  sandboxId: string;
+  sandboxName: string;
   token: string;
 }
 
@@ -242,7 +242,7 @@ function tokensIn(blocks: Map<string, string>): SandboxToken[] {
   for (const [alias, block] of blocks) {
     const token = /^\s*User\s+(\S+)\s*$/m.exec(block)?.[1];
     if (alias.endsWith(suffix) && token) {
-      tokens.push({ sandboxId: alias.slice(0, -suffix.length), token });
+      tokens.push({ sandboxName: alias.slice(0, -suffix.length), token });
     }
   }
   return tokens;
@@ -269,12 +269,12 @@ export class DaytonaSshConfigWriter {
 
   /** First write for a sandbox: known_hosts, its include block, and the managed ssh block. */
   async writeSandbox(input: {
-    sandboxId: string;
+    sandboxName: string;
     token: string;
     gateway: DaytonaSshGateway;
   }): Promise<void> {
     await this.installGateway(input.gateway, (blocks) =>
-      blocks.set(toXumDaytonaHost(input.sandboxId), this.renderBlock(input))
+      blocks.set(toXumDaytonaHost(input.sandboxName), this.renderBlock(input))
     );
     await this.ensureManagedBlock();
   }
@@ -318,7 +318,7 @@ export class DaytonaSshConfigWriter {
     await this.withIncludeFileLock(async () => {
       const blocks = await this.readBlocks();
       for (const other of tokensIn(blocks)) {
-        blocks.set(toXumDaytonaHost(other.sandboxId), this.renderBlock({ ...other, gateway }));
+        blocks.set(toXumDaytonaHost(other.sandboxName), this.renderBlock({ ...other, gateway }));
       }
       edit(blocks);
       await this.writeKnownHosts(knownHosts);
@@ -332,15 +332,15 @@ export class DaytonaSshConfigWriter {
 
   /** Token refresh: rewrites only the include file, never `~/.ssh/config` or known_hosts. */
   async updateToken(input: {
-    sandboxId: string;
+    sandboxName: string;
     token: string;
     gateway: DaytonaSshGateway;
   }): Promise<void> {
     await this.upsertBlock(input);
   }
 
-  async removeSandbox(sandboxId: string): Promise<void> {
-    const alias = toXumDaytonaHost(sandboxId);
+  async removeSandbox(sandboxName: string): Promise<void> {
+    const alias = toXumDaytonaHost(sandboxName);
     await this.withIncludeFileLock(async () => {
       const blocks = await this.readBlocks();
       if (!blocks.delete(alias)) return;
@@ -348,23 +348,23 @@ export class DaytonaSshConfigWriter {
     });
   }
 
-  /** The sandbox ids and tokens the include file holds (written by this or an earlier process). */
+  /** The sandbox names and tokens the include file holds (written by this or an earlier process). */
   async readTokens(): Promise<SandboxToken[]> {
     return tokensIn(await this.readBlocks());
   }
 
-  private renderBlock(input: { sandboxId: string; token: string; gateway: DaytonaSshGateway }) {
+  private renderBlock(input: { sandboxName: string; token: string; gateway: DaytonaSshGateway }) {
     return renderDaytonaHostBlock({ ...input, knownHostsPath: this.paths.knownHostsPath });
   }
 
   private upsertBlock(input: {
-    sandboxId: string;
+    sandboxName: string;
     token: string;
     gateway: DaytonaSshGateway;
   }): Promise<void> {
     this.assertPathsReadLiterallyBySsh();
     const block = this.renderBlock(input);
-    const alias = toXumDaytonaHost(input.sandboxId);
+    const alias = toXumDaytonaHost(input.sandboxName);
     return this.withIncludeFileLock(async () => {
       const blocks = await this.readBlocks();
       blocks.set(alias, block);

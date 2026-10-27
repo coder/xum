@@ -276,9 +276,9 @@ export function isSSHRuntime(
 }
 
 /** The Daytona sandbox a runtime config points at, if any. */
-export function getDaytonaSandboxId(config: RuntimeConfig | undefined): string | undefined {
-  const sandboxId = isSSHRuntime(config) ? config.daytona?.sandboxId?.trim() : undefined;
-  return sandboxId === "" ? undefined : sandboxId;
+export function getDaytonaSandboxName(config: RuntimeConfig | undefined): string | undefined {
+  const sandboxName = isSSHRuntime(config) ? config.daytona?.sandboxName?.trim() : undefined;
+  return sandboxName === "" ? undefined : sandboxName;
 }
 
 /**
@@ -295,7 +295,7 @@ export function ownsDaytonaSandbox(workspace: {
     workspace.taskIsolation !== "none" &&
     isSSHRuntime(config) &&
     config.daytona?.forked !== true &&
-    getDaytonaSandboxId(config) !== undefined
+    getDaytonaSandboxName(config) !== undefined
   );
 }
 

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import { DaytonaCredentialsStore } from "@/node/config/daytonaCredentialsStore";
 import { DaytonaApiError } from "./daytonaClient";
 import { createDaytonaTestRig, type DaytonaTestRig } from "./daytona.testHarness";
@@ -92,6 +92,7 @@ describe("DaytonaSandboxes", () => {
     });
     const again = await new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(rig.rootDir, {}),
+      sandboxIds: rig.plane.recordedIds,
       rootDir: rig.rootDir,
     }).sandboxes.buildLabels({
       workspaceId: "ws-2",
@@ -137,39 +138,51 @@ describe("DaytonaSandboxes", () => {
     expect(rig.plane.find("sb-own")).toBeUndefined();
   });
 
-  it("never deletes a sandbox that took the name after the ownership check", async () => {
+  it("deletes the recorded sandbox, never a later one that took its name", async () => {
     rig.plane.addSandbox({ id: "id-old", name: "ws-1" });
-    await rig.service.ssh.ensureSshAccess("ws-1");
-    // The revoke runs between the check and the delete: the sandbox goes, another takes its name.
-    rig.plane.onRequest.set("DELETE /sandbox/ws-1/ssh-access", () => {
-      rig.plane.sandboxes.delete("id-old");
-      rig.plane.addSandbox({ id: "id-new", name: "ws-1", labels: {} });
-      return Promise.resolve();
-    });
+    rig.plane.sandboxes.delete("id-old");
+    rig.plane.addSandbox({ id: "id-new", name: "ws-1" }, { recorded: false });
 
     await rig.service.sandboxes.deleteSandbox("ws-1");
     expect(rig.plane.find("id-new")).toBeDefined();
-    expect(rig.plane.countCalls("DELETE /sandbox/ws-1")).toBe(0);
+    expect(rig.plane.calls.filter((call) => call.startsWith("DELETE /sandbox/id-new"))).toEqual([]);
   });
 
-  it("never starts a sandbox that took the name after the label check", async () => {
+  it("starts and opens ssh access to the recorded sandbox only", async () => {
     rig.plane.addSandbox({ id: "id-a", name: "ws-s", state: "stopped" });
-    const swap = () => {
-      if (rig.plane.sandboxes.delete("id-a")) {
-        rig.plane.addSandbox({ id: "id-b", name: "ws-s", state: "stopped", labels: {} });
-      }
-      return Promise.resolve();
-    };
-    rig.plane.onRequest.set("POST /sandbox/ws-s/start", swap);
-    rig.plane.onRequest.set("POST /sandbox/id-a/start", swap);
+    rig.plane.sandboxes.delete("id-a");
+    rig.plane.addSandbox({ id: "id-b", name: "ws-s", state: "stopped" }, { recorded: false });
 
     // eslint-disable-next-line @typescript-eslint/await-thenable
     await expect(rig.service.sandboxes.ensureSandboxReady("ws-s")).rejects.toThrow();
     expect(rig.plane.find("id-b")?.state).toBe("stopped");
+    expect(rig.plane.calls.filter((call) => call.includes("/sandbox/id-b"))).toEqual([]);
+  });
+
+  it("deletes the sandbox it created when the workspace is gone before the id is recorded", async () => {
+    spyOn(rig.plane.recordedIds, "record").mockResolvedValue(false);
+
+    // eslint-disable-next-line @typescript-eslint/await-thenable
+    await expect(rig.service.sandboxes.createSandbox({ name: "ws-gone" })).rejects.toThrow(
+      "removed during setup"
+    );
+    expect(rig.plane.find("ws-gone")).toBeUndefined();
   });
 
   it("sends no delete for a sandbox that is already gone", async () => {
     await rig.service.sandboxes.deleteSandbox("ws-gone");
     expect(rig.plane.countCalls("DELETE /sandbox/ws-gone")).toBe(0);
+  });
+
+  it("treats a deleted sandbox that Daytona still reports by id as gone", async () => {
+    rig.plane.addSandbox({ id: "id-del", name: "ws-del", state: "deleting" });
+
+    expect((await rig.service.sandboxes.getSandboxState("ws-del")).state).toBe("missing");
+    const error = await rig.service.sandboxes
+      .startAndWait("ws-del", rig.clock.now + 60_000)
+      .catch((caught: unknown) => caught);
+    expect(error instanceof DaytonaApiError && error.kind).toBe("not_found");
+    await rig.service.sandboxes.deleteSandbox("ws-del");
+    expect(rig.plane.countCalls("DELETE /sandbox/id-del")).toBe(0);
   });
 });

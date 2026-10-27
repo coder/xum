@@ -16,6 +16,7 @@ describe("DaytonaAccount", () => {
   function makeService(env: NodeJS.ProcessEnv = { DAYTONA_API_KEY: "k" }): DaytonaService {
     return new DaytonaService({
       credentialsStore: new DaytonaCredentialsStore(rootDir, env),
+      sandboxIds: plane.recordedIds,
       rootDir,
       fetch: plane.fetch,
       now: () => clock,

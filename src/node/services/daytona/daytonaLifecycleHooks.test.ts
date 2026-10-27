@@ -35,7 +35,7 @@ describe("createDaytonaArchiveHook", () => {
     await rig.service.sandboxes.ensureSandboxReady("sb-own");
     expect(rig.writer.tokens.has("sb-own")).toBe(true);
 
-    expect((await archive(metadata({ sandboxId: "sb-own" }))).success).toBe(true);
+    expect((await archive(metadata({ sandboxName: "sb-own" }))).success).toBe(true);
 
     expect(rig.plane.find("sb-own")).toBeUndefined();
     expect(rig.writer.tokens.has("sb-own")).toBe(false);
@@ -44,10 +44,10 @@ describe("createDaytonaArchiveHook", () => {
   it("leaves the sandbox alone when a fork or a shared-checkout task is archived", async () => {
     rig.plane.addSandbox({ id: "sb-parent" });
 
-    const fork = metadata({ sandboxId: "sb-parent", forked: true });
+    const fork = metadata({ sandboxName: "sb-parent", forked: true });
     // An isolation:none task copies the parent's runtime config, sandbox ID included.
     const sharedCheckout = {
-      ...metadata({ sandboxId: "sb-parent" }),
+      ...metadata({ sandboxName: "sb-parent" }),
       taskIsolation: "none" as const,
     };
     expect((await archive(fork)).success).toBe(true);
@@ -58,6 +58,6 @@ describe("createDaytonaArchiveHook", () => {
   });
 
   it("archives a workspace whose sandbox is already gone", async () => {
-    expect((await archive(metadata({ sandboxId: "sb-gone" }))).success).toBe(true);
+    expect((await archive(metadata({ sandboxName: "sb-gone" }))).success).toBe(true);
   });
 });

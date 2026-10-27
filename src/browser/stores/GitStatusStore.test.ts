@@ -40,7 +40,7 @@ const DAYTONA_RUNTIME = {
   type: "ssh" as const,
   host: "sb-1.xum--daytona",
   srcBaseDir: "~/mux",
-  daytona: { sandboxId: "sb-1" },
+  daytona: { sandboxName: "sb-1" },
 };
 
 // The store refreshes on RefreshController timers (debounce, cooldown), fetch intervals and a

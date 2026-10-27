@@ -2000,7 +2000,7 @@ describe("TerminalService.openNative", () => {
                 type: "ssh",
                 host: "sb-1.xum--daytona",
                 srcBaseDir: "~/src",
-                daytona: { sandboxId: "sb-1" },
+                daytona: { sandboxName: "sb-1" },
               },
             },
           ])

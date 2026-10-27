@@ -747,7 +747,7 @@ describe("WorkspaceService remove shared-workspace guard", () => {
       type: "ssh" as const,
       host: "sb-1.xum--daytona",
       srcBaseDir: "/home/daytona/xum",
-      daytona: { sandboxId: "sb-1" },
+      daytona: { sandboxName: "sb-1" },
     };
 
     async function createDaytonaHarness(borrowers: string[]): Promise<WorkspaceServiceHarness> {

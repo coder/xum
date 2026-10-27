@@ -314,9 +314,9 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
 }
 
 function resolveSSHRuntimeHost(config: Extract<RuntimeConfig, { type: "ssh" }>): string {
-  const daytonaSandboxId = config.daytona?.sandboxId;
-  return daytonaSandboxId
-    ? toXumDaytonaHost(daytonaSandboxId)
+  const daytonaSandboxName = config.daytona?.sandboxName;
+  return daytonaSandboxName
+    ? toXumDaytonaHost(daytonaSandboxName)
     : resolveCoderSSHHost(config.host, config.coder?.workspaceName);
 }
 

@@ -226,7 +226,7 @@ describe.skipIf(process.platform === "win32")(
         };
 
         await writer.writeSandbox({
-          sandboxId: "sb-1",
+          sandboxName: "sb-1",
           token: "tokenA",
           gateway: { ...gateway, hostKeys: [publicKeyLine(newPrivateKey())] },
         });
@@ -265,7 +265,7 @@ describe.skipIf(process.platform === "win32")(
       ]) {
         await withDaytonaHome(userConfig, async (writer) => {
           await writer.writeSandbox({
-            sandboxId: "sb-1",
+            sandboxName: "sb-1",
             token: "tokenA",
             gateway: {
               host: "127.0.0.1",
