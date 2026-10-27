@@ -117,11 +117,10 @@ function Chip(props: { id: ChatActivityId; label: string; panelKeybind?: Keybind
 
 /** A line whose strip has room for `room` px of bordered chips (60 px each, +N 40 px). */
 function stubLayout(room: number): void {
-  const realRect = HTMLElement.prototype.getBoundingClientRect;
   HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
     if (this.hasAttribute("data-activity-chip")) return rect(60);
     if (this.hasAttribute("data-activity-overflow-chip")) return rect(40);
-    return realRect.call(this);
+    return rect(0);
   };
   Object.defineProperty(HTMLElement.prototype, "clientWidth", {
     configurable: true,
@@ -197,10 +196,8 @@ describe("panel shortcuts", () => {
   beforeEach(() => {
     // happy-dom reports AltGraph for every Ctrl+Alt event; a real keyboard does only for AltGr.
     altGraph = false;
-    const real = window.KeyboardEvent.prototype.getModifierState;
-    window.KeyboardEvent.prototype.getModifierState = function (this: KeyboardEvent, key) {
-      return key === "AltGraph" ? altGraph : real.call(this, key);
-    };
+    // The keybind matcher queries only AltGraph; the event's own flags carry the other modifiers.
+    window.KeyboardEvent.prototype.getModifierState = (key) => key === "AltGraph" && altGraph;
   });
 
   const chord = (target: Element, keybind: Keybind) =>
