@@ -4,8 +4,8 @@
 # main that changes an image input, or a manual run on main, from that run's exact commit, with no
 # cache and no artifact from any other run. Publishing is create-if-missing (the user's pick, so
 # an image change needs no person): each inputs key gets one stable tag, inputs-<key>. A run whose
-# key has that tag pushes nothing. Otherwise it builds fresh, pushes, points the stable tag at that
-# build's own digest, and attests the digest. Nothing here deletes an image.
+# key has that tag pushes nothing. Otherwise it builds fresh, pushes, attests that build's own
+# digest, and only then points the stable tag at the same digest. Nothing here deletes an image.
 #
 # Runners still trust only the digest in image.json: a person copies it from the job summary into
 # image.json in a pull request (no workflow writes to the repo). Until that PR merges, runners
@@ -95,15 +95,13 @@ jobs:
             exit 1
           fi
           make -s bugbash-sandbox-publish > image.json
-          # The subject of the attestation is this build's own output (image.json). The stable tag
-          # names the same digest, so the attestation covers it too.
-          ref="$(jq -er .image image.json)@$(jq -er .digest image.json)"
-          docker buildx imagetools create --tag "$tag" "$ref"
-          echo "image=$(jq -er .image image.json)" >> "$GITHUB_OUTPUT"
-          echo "digest=$(jq -er .digest image.json)" >> "$GITHUB_OUTPUT"
+          # The subject of the attestation is this build's own output (image.json).
           {
-            echo "Stable tag: \`$tag\`"
-            echo
+            echo "image=$(jq -er .image image.json)"
+            echo "digest=$(jq -er .digest image.json)"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          {
             echo '### tests/bugbash/sandbox/image.json'
             echo
             echo '```json'
@@ -118,3 +116,21 @@ jobs:
           subject-name: ${{ steps.push.outputs.image }}
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
+      # The stable tag marks the key as published, so it comes only after the attestation: a failed
+      # Attest leaves no tag, and a re-run builds and attests again instead of skipping the key.
+      - name: Tag inputs-<key>
+        if: steps.push.outputs.digest != ''
+        env:
+          TAG: ${{ steps.push.outputs.tag }}
+          REF: ${{ steps.push.outputs.image }}@${{ steps.push.outputs.digest }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          # --prefer-index=false copies the manifest as it is. The default wraps a single manifest
+          # in a new index, whose digest the attestation does not name.
+          docker buildx imagetools create --prefer-index=false --tag "$TAG" "$REF"
+          got=$(docker buildx imagetools inspect --format '{{json .Manifest.Digest}}' "$TAG" | jq -er .)
+          if [ "$got" != "$DIGEST" ]; then
+            echo "::error::$TAG has digest $got, not the attested $DIGEST"
+            exit 1
+          fi
+          echo "Stable tag: \`$TAG\` names the attested \`$DIGEST\`." >> "$GITHUB_STEP_SUMMARY"
