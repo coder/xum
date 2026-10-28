@@ -15,6 +15,7 @@ import {
 import type { ErrorEvent } from "@/common/types/stream";
 import { createMuxMessage } from "@/common/types/message";
 import { createContextBudgetWarning } from "@/node/services/contextWindowRollover";
+import { createPostCompactionAttachmentsMessage } from "@/browser/utils/messages/modelMessageTransform";
 import {
   buildPlanReviewMetadata,
   formatPlanReviewEnvelope,
@@ -806,6 +807,18 @@ describe("WorkspaceTurnManager", () => {
           handoff: true,
           sessionHistoryAvailable: true,
         }),
+    },
+    {
+      row: "post-compaction attachments row",
+      // The first turn after a compaction persists its attachments right after the prompt.
+      build: () => {
+        const row = createPostCompactionAttachmentsMessage(
+          [{ type: "todo_list", todos: [{ content: "Keep going", status: "in_progress" }] }],
+          1
+        );
+        assert(row);
+        return row;
+      },
     },
   ])("a trailing $row does not block reviving a retrying workspace turn", async ({ build }) => {
     // Reconciliation must treat these rows like the absence of a row: the correlated prompt is

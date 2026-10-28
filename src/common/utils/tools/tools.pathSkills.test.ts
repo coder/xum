@@ -216,18 +216,6 @@ describe("getToolsForModel - path-scoped skill activation", () => {
     expect(surfacedNames(await call(tools.file_read, { path: "src/foo.ts" }))).toBeUndefined();
   });
 
-  test("a skill carried in the post-compaction snapshot is not pointed at again", () => {
-    const runtime = new LocalRuntime(workspace);
-    const activation = createPathSkillActivation({
-      skills: SKILLS,
-      messages: [],
-      loadedSkillNames: ["ts-rules"],
-      cwd: workspace,
-      runtime,
-    });
-    expect(activation?.takeMatches("src/foo.ts")).toEqual([]);
-  });
-
   test("only the first MAX_PATH_SCOPED_SKILLS path-scoped skills can activate", () => {
     const runtime = new LocalRuntime(workspace);
     const many = Array.from({ length: MAX_PATH_SCOPED_SKILLS + 1 }, (_, i) => ({

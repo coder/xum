@@ -566,6 +566,15 @@ describe("WorkspaceGoalService", () => {
           sessionHistoryAvailable: true,
         }),
     },
+    {
+      row: "a post-compaction attachments row",
+      // The first turn after compaction appends this row right after its user row.
+      build: () =>
+        createMuxMessage("post-compaction-1", "user", "<system-update>\nPlan\n</system-update>", {
+          timestamp: Date.now(),
+          synthetic: true,
+        }),
+    },
   ])(
     "getGoal keeps a never-driven goal active when $row follows the processed prompt",
     async ({ build }) => {

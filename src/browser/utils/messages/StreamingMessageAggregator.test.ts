@@ -5465,40 +5465,49 @@ describe("StreamingMessageAggregator in-turn hidden notice rows", () => {
     "<system-file-update>\nNote: a.ts was modified\n</system-file-update>",
     { historySequence: 2, timestamp: Date.now(), synthetic: true }
   );
+  const postCompactionAttachments = createMuxMessage(
+    "post-compaction-1700000000000",
+    "user",
+    "<system-update>\nPlan file:\n...\n</system-update>",
+    { historySequence: 3, timestamp: Date.now(), synthetic: true }
+  );
   const continueSentinel = createMuxMessage("user-continue", "user", "[CONTINUE]", {
-    historySequence: 3,
+    historySequence: 4,
     timestamp: Date.now(),
     synthetic: true,
   });
 
   test("a notice row during PREPARING keeps the pending turn's compaction, model and status", () => {
     // Rows as the client receives them: oRPC strips keys the wire schema does not know.
-    const [request, notice, sentinel] = [compactionRequest, fileChangeNotice, continueSentinel].map(
-      (row) => MuxMessageSchema.parse(row) as typeof row
-    );
+    const [request, notice, attachments, sentinel] = [
+      compactionRequest,
+      fileChangeNotice,
+      postCompactionAttachments,
+      continueSentinel,
+    ].map((row) => MuxMessageSchema.parse(row) as typeof row);
     const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT);
     aggregator.handleMessage({ ...request, type: "message" });
     const pendingStart = aggregator.getPendingStreamStartTime();
     expect(pendingStart).not.toBeNull();
 
     aggregator.handleMessage({ ...notice, type: "message" });
+    aggregator.handleMessage({ ...attachments, type: "message" });
     aggregator.handleMessage({ ...sentinel, type: "message" });
 
     expect(aggregator.getPendingStreamModel()).toBe(model);
     expect(aggregator.getAgentStatus()?.message).toBe("Compacting");
     expect(aggregator.getPendingStreamStartTime()).toBe(pendingStart);
     // Hidden in the transcript, but kept as edit evidence that matches the persisted rows.
-    expect(aggregator.getDisplayedMessages().some((row) => row.id === fileChangeNotice.id)).toBe(
-      false
-    );
+    const hiddenIds = [fileChangeNotice.id, postCompactionAttachments.id];
+    expect(aggregator.getDisplayedMessages().some((row) => hiddenIds.includes(row.id))).toBe(false);
     expect(
       buildHistoryEditPrecondition(aggregator.getHistoryEvidenceMessages(), request.id)
-    ).toEqual(buildHistoryEditPrecondition([request, notice, sentinel], request.id));
+    ).toEqual(buildHistoryEditPrecondition([request, notice, attachments, sentinel], request.id));
     aggregator.handleStreamStart({
       type: "stream-start",
       workspaceId: "test-workspace",
       messageId: "compact-stream",
-      historySequence: 4,
+      historySequence: 5,
       model,
       startTime: Date.now(),
       mode: "compact",

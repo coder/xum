@@ -461,27 +461,36 @@ describe("TaskService child goals", () => {
   });
 
   test.each([
-    { tail: "goal_continuation row", appendWarning: false },
-    // A Token Budget warning row is a synthetic user row appended after the turn's trigger; it is
-    // a notice, not a newer trigger, so the ended turn still counts as the goal continuation.
-    { tail: "goal_continuation row then a Token Budget warning", appendWarning: true },
+    { tail: "goal_continuation row", trailingRow: null },
+    // Token Budget warning and post-compaction attachments rows are synthetic user rows appended
+    // after the turn's trigger; they are not a newer trigger, so the ended turn still counts as the
+    // goal continuation.
+    {
+      tail: "goal_continuation row then a Token Budget warning",
+      trailingRow: () =>
+        createContextBudgetWarning({
+          contextTokens: 90_000,
+          maxTokens: 128_000,
+          budgetTokens: 119_808,
+          handoff: true,
+          sessionHistoryAvailable: true,
+        }),
+    },
+    {
+      tail: "goal_continuation row then a post-compaction attachments row",
+      trailingRow: () =>
+        createMuxMessage("post-compaction-1", "user", "<system-update>\nPlan\n</system-update>", {
+          synthetic: true,
+        }),
+    },
   ])(
     "a tool-free goal continuation completes the goal and publishes exactly one report ($tail)",
-    async ({ appendWarning }) => {
+    async ({ trailingRow }) => {
       const t = await setup();
       const goal = await t.setChildGoal();
       await t.appendGoalContinuationRow(goal.goalId);
-      if (appendWarning) {
-        const appended = await t.historyService.appendToHistory(
-          childId,
-          createContextBudgetWarning({
-            contextTokens: 90_000,
-            maxTokens: 128_000,
-            budgetTokens: 119_808,
-            handoff: true,
-            sessionHistoryAvailable: true,
-          })
-        );
+      if (trailingRow != null) {
+        const appended = await t.historyService.appendToHistory(childId, trailingRow());
         expect(appended.success).toBe(true);
       }
 

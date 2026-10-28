@@ -30,6 +30,7 @@ import {
   getCompactionFollowUpContent,
   type CompactionFollowUpRequest,
   type CompactionSummaryMetadata,
+  isPostCompactionAttachmentsMessage,
   type MuxMessage,
 } from "@/common/types/message";
 import { createCompactionSummaryMessageId } from "@/node/services/utils/messageIds";
@@ -1284,7 +1285,10 @@ export class CompactionHandler {
   }
 
   /** Copies for regular RLM keep-tail and continuous compaction tails. */
-  private buildTailCopies(tailRows: MuxMessage[]): MuxMessage[] {
+  private buildTailCopies(allTailRows: MuxMessage[]): MuxMessage[] {
+    // Drop the old window's post-compaction attachments row: the next turn writes a fresh one
+    // from the new pending state, and a copy would send the same context twice.
+    const tailRows = allTailRows.filter((row) => !isPostCompactionAttachmentsMessage(row));
     // Preassign copy IDs for ALL tail rows before building any copy: MCP
     // snapshot rows precede the user row they expand, so a build-time map
     // would not yet contain the invoking row's copy ID when the snapshot row

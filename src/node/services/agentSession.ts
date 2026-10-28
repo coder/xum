@@ -211,7 +211,9 @@ import {
   pickStartupRetrySendOptions,
   prepareUserMessageForSend,
   type AgentSkillReference,
+  isAppendedTurnNoticeMessage,
   isContextBudgetWarningMessage,
+  isPostCompactionAttachmentsMessage,
   isSyntheticSnapshotUserMessage,
   type CompactionFollowUpRequest,
   type MuxMessageMetadata,
@@ -223,7 +225,6 @@ import {
   type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
 import { toValidGoalId } from "@/common/types/goal";
-import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
 import type { RuntimeFactory } from "@/node/services/runtimeFactory/runtimeFactoryService";
 import {
   carriedPlanReviewFeedback,
@@ -294,12 +295,9 @@ import type {
   PostCompactionAttachment,
   PostCompactionExclusions,
 } from "@/common/types/attachment";
-import { TURNS_BETWEEN_ATTACHMENTS } from "@/common/constants/attachments";
 
-import {
-  extractEditedFileDiffs,
-  type FileEditDiff,
-} from "@/common/utils/messages/extractEditedFiles";
+import type { FileEditDiff } from "@/common/utils/messages/extractEditedFiles";
+import { createPostCompactionAttachmentsMessage } from "@/browser/utils/messages/modelMessageTransform";
 import { buildCompactionMessageText } from "@/common/utils/compaction/compactionPrompt";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
 import { getModelCapabilitiesResolved } from "@/common/utils/ai/modelCapabilities";
@@ -333,8 +331,6 @@ import {
 import { resolveSkillStorageContext } from "@/node/services/agentSkills/skillStorageContext";
 import {
   createLoadedSkillSnapshot,
-  extractLoadedSkillSnapshotsFromMessages,
-  mergeLoadedSkillSnapshots,
   stringifyAgentSkillFrontmatter,
 } from "@/node/services/agentSkills/loadedSkillSnapshots";
 import { createSkillArgumentSubstituter } from "@/node/services/agentSkills/skillArguments";
@@ -1729,18 +1725,6 @@ export class AgentSession {
   };
 
   /**
-   * Track turns since last post-compaction attachment injection.
-   * Start at max to trigger immediate injection on first turn after compaction.
-   */
-  private turnsSinceLastAttachment = TURNS_BETWEEN_ATTACHMENTS;
-
-  /**
-   * Flag indicating compaction has occurred in this session.
-   * Used to enable the cooldown-based attachment injection.
-   */
-  private compactionOccurred = false;
-
-  /**
    * Retain the exact injected snapshot so a late completion cannot consume a replacement.
    *
    * This is intentionally delayed until stream-end so a crash mid-stream doesn't lose the diffs.
@@ -1841,8 +1825,8 @@ export class AgentSession {
   /** Last lifecycle snapshot emitted to live subscribers (used for change detection only). */
   private lastEmittedStreamLifecycle: StreamLifecycleSnapshot | null = null;
 
-  /** Tracks whether the current stream included post-compaction attachments. */
-  private activeStreamHadPostCompactionInjection = false;
+  /** The post-compaction attachments row the current stream sent, if any. */
+  private activeStreamPostCompactionRow: MuxMessage | undefined;
 
   /**
    * muxMetadata of the queued entry currently being dispatched, held from
@@ -7350,7 +7334,6 @@ export class AgentSession {
         ),
         recordFileState: this.fileChangeTracker.record.bind(this.fileChangeTracker),
         recordProposedPlan: this.recordProposedPlan,
-        postCompactionAttachments: null,
         resolveMemoryContext: (model) => this.resolveMemoryContext(model, cache, { windowKey }),
         workspaceGoalService: this.workspaceGoalService,
         goalTurnKind: goalKind,
@@ -8842,7 +8825,7 @@ export class AgentSession {
       this.clearLiveUsageState();
       this.pendingPostCompactionStateToAcknowledge = null;
       this.activeStreamHadAnyDelta = false;
-      this.activeStreamHadPostCompactionInjection = false;
+      this.activeStreamPostCompactionRow = undefined;
       const providersConfig = this.getProvidersConfigSafe();
       // Provider-start fence closes over the epoch captured at this turn's admission (never
       // refreshed here, so a prepared candidate cannot launder a stop that happened meanwhile).
@@ -8919,9 +8902,10 @@ export class AgentSession {
           return await refuseRejectedResume(retryRequest);
         // Model-hidden records (plan-review snapshot/resolve/reopen rows) are UI state that can
         // land after the resumable row without changing provider-visible history; resume from
-        // the newest visible row so such a record cannot silently cancel the request.
+        // the newest visible row so such a record cannot silently cancel the request. The
+        // attachments row of a failed post-compaction turn follows its request the same way.
         const target = tail.data.findLast(
-          (message) => !isModelHiddenMessage(message) && !isContextBudgetWarningMessage(message)
+          (message) => !isModelHiddenMessage(message) && !isAppendedTurnNoticeMessage(message)
         );
         if (!target) return await fail(createUnknownSendMessageError(EMPTY_RESUME_HISTORY_ERROR));
         if (target.metadata?.contextBudgetRejected) return await refuseRejectedResume(target);
@@ -9097,21 +9081,22 @@ export class AgentSession {
         return Ok(undefined);
       }
 
-      // Check if post-compaction attachments should be injected.
-      const postCompactionAttachments =
-        disablePostCompactionAttachments === true || preparedRequest != null || leaseRefusal != null
-          ? null
-          : await this.getPostCompactionAttachmentsIfNeeded(this.isRlmCompactionEnabled());
-      if (isStreamStartAborted()) {
-        return Ok(undefined);
-      }
-
       // #4476: from here the provider can run tools in the checkout, so another backend's rename
       // or removal must have seen this turn's lease (confirmed above; a running one refused it).
       if (leaseRefusal != null) return fail(createUnknownSendMessageError(leaseRefusal));
 
-      this.activeStreamHadPostCompactionInjection =
-        postCompactionAttachments !== null && postCompactionAttachments.length > 0;
+      const withAttachments = await this.addPostCompactionAttachmentsRow(
+        { messages: requestMessages, historyReadSequence },
+        disablePostCompactionAttachments === true || preparedRequest != null
+      );
+      if (isStreamStartAborted()) {
+        return Ok(undefined);
+      }
+      if (!withAttachments.success) {
+        return await fail(createUnknownSendMessageError(withAttachments.error));
+      }
+      requestMessages = withAttachments.data.messages;
+      historyReadSequence = withAttachments.data.historyReadSequence;
 
       // Apply per-model thinking floors once so desktop, mobile, and ACP requests match.
       // Gateway-preserving key first (an explicit coder:<instance>/<model>
@@ -9227,7 +9212,6 @@ export class AgentSession {
         muxMetadata: streamMuxMetadata,
         recordFileState,
         recordProposedPlan: this.recordProposedPlan,
-        postCompactionAttachments,
         // Invoked by AIService after runtime.ensureReady() (project-scope
         // listing needs a running runtime). Still ordered after the
         // post-compaction check above: a just-consumed compaction boundary has
@@ -9438,6 +9422,90 @@ export class AgentSession {
         workspaceId: this.workspaceId,
         reason,
         error: deleteMessageResult.error,
+      });
+    }
+  }
+
+  /**
+   * Persist the pending post-compaction attachments as one synthetic row after the request, and
+   * record the row this turn sends. A turn that failed before the ack already wrote the row in
+   * this window: reuse that row. A compaction turn skips the attachments: its new publication
+   * merges the old pending state.
+   * @param request The request history of the current window and the newest sequence it read
+   * @param skip True when the turn disables the attachments or sends a prepared request
+   */
+  private async addPostCompactionAttachmentsRow(
+    request: { messages: MuxMessage[]; historyReadSequence: number },
+    skip: boolean
+  ): Promise<Result<{ messages: MuxMessage[]; historyReadSequence: number }>> {
+    if (skip || this.activeCompactionRequest != null) return Ok(request);
+    const attachments = await this.getPostCompactionAttachmentsIfNeeded(
+      this.isRlmCompactionEnabled()
+    );
+    if (attachments == null || attachments.length === 0) return Ok(request);
+    this.activeStreamPostCompactionRow = request.messages.find(isPostCompactionAttachmentsMessage);
+    if (this.activeStreamPostCompactionRow) return Ok(request);
+    // Record time: wall clock until #7282 moves its consumers to HostClock.
+    const row = createPostCompactionAttachmentsMessage(attachments, nodeClock.nowMs());
+    if (row == null) return Ok(request);
+    const appendResult = await this.historyService.appendToHistory(this.workspaceId, row);
+    if (!appendResult.success) return Err(appendResult.error);
+    // Publish the hidden row like the file-change row, so an edit fence counts the same rows.
+    this.emitChatEvent({ ...row, type: "message" });
+    this.activeStreamPostCompactionRow = row;
+    const messages = [...request.messages, row];
+    return Ok({ messages, historyReadSequence: newestHistorySequence(messages) });
+  }
+
+  /**
+   * The context-exceeded retry runs without the attachments, so their row leaves history too.
+   * The delete changes the provider context, so the retry adopts the frontier after it.
+   * @returns false when the row is still in history
+   */
+  private async deletePostCompactionRow(
+    row: MuxMessage,
+    admissionCapture: CompactionReplacementCapture | undefined
+  ): Promise<boolean> {
+    const fail = (error: string) => {
+      log.warn("Failed to delete post-compaction attachments row", {
+        workspaceId: this.workspaceId,
+        error,
+      });
+      return false;
+    };
+    if (!admissionCapture) {
+      const deleted = await this.historyService.deleteMessage(this.workspaceId, row.id);
+      if (!deleted.success) return fail(deleted.error);
+      const sequence = row.metadata?.historySequence;
+      if (sequence != null) this.emitChatEvent({ type: "delete", historySequences: [sequence] });
+      return true;
+    }
+    const deleted = await this.historyService.deleteMessageUnderAdmission(
+      this.workspaceId,
+      admissionCapture,
+      row.id
+    );
+    if (!deleted.success) return fail(deleted.error);
+    // Copy the predecessor: the advance rewrites admissionCapture in place.
+    this.advanceOwnedCompactionAdmission(
+      { ...admissionCapture },
+      deleted.data.capture,
+      admissionCapture
+    );
+    this.emitChatEvent({ type: "delete", historySequences: deleted.data.sequences });
+    return true;
+  }
+
+  private async discardFailedPostCompactionState(
+    pendingState: Awaited<ReturnType<CompactionHandler["peekPendingState"]>>
+  ): Promise<void> {
+    try {
+      await this.contextController.discardFailedCarryover(pendingState);
+      this.onPostCompactionStateChange?.();
+    } catch (error) {
+      log.warn("Failed to discard pending post-compaction state", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
       });
     }
   }
@@ -9690,8 +9758,9 @@ export class AgentSession {
       return false;
     }
 
-    // Only retry if we actually injected post-compaction context.
-    if (!this.activeStreamHadPostCompactionInjection) {
+    // Only retry if this turn sent the post-compaction row.
+    const postCompactionRow = this.activeStreamPostCompactionRow;
+    if (postCompactionRow == null) {
       return false;
     }
 
@@ -9719,15 +9788,7 @@ export class AgentSession {
     });
 
     // The post-compaction context is likely the culprit; discard it so we don't loop.
-    try {
-      await this.contextController.discardFailedCarryover(pendingState);
-      this.onPostCompactionStateChange?.();
-    } catch (error) {
-      log.warn("Failed to discard pending post-compaction state", {
-        workspaceId: this.workspaceId,
-        error: getErrorMessage(error),
-      });
-    }
+    await this.discardFailedPostCompactionState(pendingState);
 
     // Abort the failed assistant placeholder and clean up persisted partial/history state.
     this.resetActiveStreamState();
@@ -9737,6 +9798,9 @@ export class AgentSession {
       messageId: data.messageId,
     });
     await this.clearFailedAssistantMessage(data.messageId, "post-compaction-retry");
+    if (!(await this.deletePostCompactionRow(postCompactionRow, context.admissionCapture))) {
+      return false;
+    }
 
     // r40: same admission gate as the compaction retry above — this path also
     // crosses a transient idle gap before re-entering PREPARING.
@@ -9928,7 +9992,7 @@ export class AgentSession {
     this.activeStreamContext = undefined;
     this.activeStreamUserMessageId = undefined;
     this.activeStreamStartedAtMs = undefined;
-    this.activeStreamHadPostCompactionInjection = false;
+    this.activeStreamPostCompactionRow = undefined;
     this.activeStreamHadAnyDelta = false;
     this.pendingPostCompactionStateToAcknowledge = null;
   }
@@ -13376,15 +13440,12 @@ export class AgentSession {
    * summarize PRE-boundary epochs; injecting them into a later turn would
    * resurrect context the user explicitly discarded and tell the model files
    * were "previously read" when their contents are gone from active context.
-   * Covers both injection routes: the immediate pending-state path (on-disk
-   * post-compaction.json) and the periodic capture of qualified carryover.
+   * Covers the pending-state path (on-disk post-compaction.json).
    */
   async clearPostCompactionState(): Promise<void> {
     await this.discardMemoryContext();
-    // In-memory clears stay unconditional: they stop THIS session from
-    // injecting carryover even when the durable discard below fails.
-    this.compactionOccurred = false;
-    this.turnsSinceLastAttachment = TURNS_BETWEEN_ATTACHMENTS;
+    // The in-memory clear stays unconditional: it stops THIS session from
+    // acknowledging stale state even when the durable discard below fails.
     this.pendingPostCompactionStateToAcknowledge = null;
     // The destructive history operation already fenced its captured context under the locks.
     // Retire compatible old bytes for downgrades; preserve newer publications and unknown schemas.
@@ -13479,23 +13540,17 @@ export class AgentSession {
   }
 
   /**
-   * Get post-compaction attachments if they should be injected this turn.
+   * Get post-compaction attachments when a compaction left pending state, and clear the file
+   * state cache. The caller persists them as one row, so they appear once per compaction.
    *
-   * Logic:
-   * - On first turn after compaction: inject immediately, clear file state cache
-   * - Subsequent turns: inject every TURNS_BETWEEN_ATTACHMENTS turns
-   *
-   * @returns Attachments to inject, or null if none needed
+   * @returns Attachments to persist, or null if none needed
    */
   private async getPostCompactionAttachmentsIfNeeded(
     includeReadFiles: boolean
   ): Promise<PostCompactionAttachment[] | null> {
-    // Check if compaction just occurred (immediate injection with cached post-compaction state)
     const pendingState = await this.contextController.compaction.peekPendingState();
     if (pendingState !== null) {
       this.pendingPostCompactionStateToAcknowledge = pendingState;
-      this.compactionOccurred = true;
-      this.turnsSinceLastAttachment = 0;
       // Compaction boundary: invalidate the session-cached memory context so
       // the next stream recomputes the index from current files.
       await this.discardMemoryContext();
@@ -13514,58 +13569,7 @@ export class AgentSession {
       });
     }
 
-    // Increment turn counter
-    this.turnsSinceLastAttachment++;
-
-    // Check cooldown for subsequent injections (re-read from current history)
-    if (this.compactionOccurred && this.turnsSinceLastAttachment >= TURNS_BETWEEN_ATTACHMENTS) {
-      const warm = await this.contextController.compaction.peekCarryoverState();
-      this.pendingPostCompactionStateToAcknowledge = warm;
-      this.turnsSinceLastAttachment = 0;
-      return this.generatePostCompactionAttachments(includeReadFiles, warm);
-    }
-
     return null;
-  }
-
-  /**
-   * Generate post-compaction attachments by extracting diffs and loaded skills from message history.
-   */
-  private async generatePostCompactionAttachments(
-    includeReadFiles: boolean,
-    warm: Awaited<ReturnType<CompactionHandler["peekCarryoverState"]>>
-  ): Promise<PostCompactionAttachment[]> {
-    // getHistoryFromLatestBoundary already returns only the active compaction epoch,
-    // so no further boundary slicing is needed.
-    const historyResult = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
-    if (!historyResult.success) {
-      return [];
-    }
-
-    const fileDiffs = extractEditedFileDiffs(historyResult.data);
-    const loadedSkills = mergeLoadedSkillSnapshots([
-      ...(warm?.loadedSkills ?? []),
-      ...extractLoadedSkillSnapshotsFromMessages(historyResult.data),
-    ]);
-    // Mirror loadedSkills: cumulative pre-boundary reads carried in memory,
-    // merged with reads from the current epoch (newest-first, capped).
-    const readFilePaths = includeReadFiles
-      ? mergeReadFilePaths(warm?.readFiles ?? [], extractReadFilePaths(historyResult.data))
-      : [];
-
-    // Reports completed before the latest boundary had their tool results summarized away;
-    // anything newer is still visible in the active epoch and would be redundant.
-    const boundaryTimestampMs = historyResult.data.find(
-      (message) => message.metadata?.compactionBoundary === true
-    )?.metadata?.timestamp;
-
-    return this.buildAttachmentsFromContext({
-      diffs: fileDiffs,
-      loadedSkills,
-      readFilePaths,
-      // Wall clock, like the boundary timestamp: report times come from Date.now() (#7282).
-      reportsCompletedBeforeMs: boundaryTimestampMs ?? nodeClock.nowMs(),
-    });
   }
 
   /**

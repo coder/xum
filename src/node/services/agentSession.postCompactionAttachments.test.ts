@@ -7,16 +7,12 @@ import type {
   PostCompactionAttachment,
   TodoListAttachment,
 } from "@/common/types/attachment";
-import { TURNS_BETWEEN_ATTACHMENTS } from "@/common/constants/attachments";
-import { createMuxMessage, type MuxMessage } from "@/common/types/message";
+import { createMuxMessage } from "@/common/types/message";
 import { Err } from "@/common/types/result";
-import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import type { Config } from "@/node/config";
 
 import type { AgentSession } from "./agentSession";
 import { createAgentSessionHarness, createTestStreamManager } from "./agentSession.testHarness";
-import type { CompactionHandler } from "./compactionHandler";
-import { CompactionPendingState } from "./compactionPendingState";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
 import { createLoadedSkillSnapshot } from "@/node/services/agentSkills/loadedSkillSnapshots";
@@ -26,26 +22,6 @@ import { upsertSubagentReportArtifact } from "./subagentReportArtifacts";
 import { makeTestEffectRunner } from "./di/testEffectRunner";
 import type { EffectRunner } from "./di/effectRunner";
 import { nodeSessionLocks } from "@/node/services/sessionLocks/nodeSessionLocks";
-
-function createSuccessfulFileEditMessage(id: string, filePath: string, diff: string): MuxMessage {
-  return {
-    id,
-    role: "assistant",
-    parts: [
-      {
-        type: "dynamic-tool",
-        toolCallId: `tool-${id}`,
-        toolName: "file_edit_replace_string",
-        state: "output-available",
-        input: { path: filePath },
-        output: { success: true, diff },
-      },
-    ],
-    metadata: {
-      timestamp: Date.now(),
-    },
-  };
-}
 
 function createLoadedSkillFixture(args: {
   name: string;
@@ -127,9 +103,6 @@ async function createSessionForHistory(
 }
 
 interface PrivateSessionAccess {
-  compactionOccurred: boolean;
-  turnsSinceLastAttachment: number;
-  contextController: { compactionHandler: CompactionHandler };
   getPostCompactionAttachmentsIfNeeded: () => Promise<PostCompactionAttachment[] | null>;
 }
 
@@ -139,20 +112,6 @@ async function getImmediatePostCompactionAttachments(
   const privateSession = session as unknown as PrivateSessionAccess;
   const attachments = await privateSession.getPostCompactionAttachmentsIfNeeded();
   expect(attachments).not.toBeNull();
-  return attachments ?? [];
-}
-
-async function generatePeriodicPostCompactionAttachments(
-  session: AgentSession
-): Promise<PostCompactionAttachment[]> {
-  const privateSession = session as unknown as PrivateSessionAccess;
-
-  privateSession.compactionOccurred = true;
-  privateSession.turnsSinceLastAttachment = TURNS_BETWEEN_ATTACHMENTS - 1;
-
-  const attachments = await privateSession.getPostCompactionAttachmentsIfNeeded();
-  expect(attachments).not.toBeNull();
-
   return attachments ?? [];
 }
 
@@ -231,11 +190,8 @@ describe("AgentSession post-compaction attachments", () => {
       expect((await historyService.clearHistory(WORKSPACE_ID)).success).toBe(true);
       await session.clearPostCompactionState();
 
-      // ...no later turn may re-inject pre-boundary paths — neither
-      // immediately from pending state nor via the periodic re-merge.
-      for (let turn = 0; turn <= TURNS_BETWEEN_ATTACHMENTS; turn++) {
-        expect(await privateSession.getPostCompactionAttachmentsIfNeeded(true)).toBeNull();
-      }
+      // ...no later turn may re-inject pre-boundary paths.
+      expect(await privateSession.getPostCompactionAttachmentsIfNeeded(true)).toBeNull();
       // Explicit destruction removes compatible legacy bytes so a downgrade cannot reload them.
       const stateExists = await fs.access(path.join(sessionDir, "post-compaction.json")).then(
         () => true,
@@ -252,86 +208,6 @@ describe("AgentSession post-compaction attachments", () => {
       } finally {
         await restarted.dispose();
       }
-    } finally {
-      await session.dispose();
-    }
-  });
-
-  test("extracts edited file diffs from the latest durable compaction boundary slice", async () => {
-    const { historyService, config, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
-    const history: MuxMessage[] = [
-      createSuccessfulFileEditMessage(
-        "stale-before-boundary",
-        "/tmp/stale-before-boundary.ts",
-        "@@ -1 +1 @@\n-old\n+older\n"
-      ),
-      createMuxMessage("boundary-1", "assistant", "epoch 1 summary", {
-        compacted: "user",
-        compactionBoundary: true,
-        compactionEpoch: 1,
-      }),
-      createSuccessfulFileEditMessage(
-        "stale-epoch-1",
-        "/tmp/stale-epoch-1.ts",
-        "@@ -1 +1 @@\n-old\n+stale\n"
-      ),
-      createMuxMessage("boundary-2", "assistant", "epoch 2 summary", {
-        compacted: "user",
-        compactionBoundary: true,
-        compactionEpoch: 2,
-      }),
-      createSuccessfulFileEditMessage(
-        "recent-epoch-2",
-        "/tmp/recent-epoch-2.ts",
-        "@@ -1 +1 @@\n-before\n+after\n"
-      ),
-    ];
-
-    const workspaceId = "workspace-post-compaction-test";
-    for (const msg of history) {
-      await historyService.appendToHistory(workspaceId, msg);
-    }
-
-    const session = await createSessionForHistory(historyService, config);
-
-    try {
-      const attachments = await generatePeriodicPostCompactionAttachments(session);
-      expect(getEditedFilePaths(attachments)).toEqual(["/tmp/recent-epoch-2.ts"]);
-    } finally {
-      await session.dispose();
-    }
-  });
-
-  test("falls back safely when boundary markers are malformed", async () => {
-    const { historyService, config, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-
-    const history: MuxMessage[] = [
-      createSuccessfulFileEditMessage("stale-edit", "/tmp/stale.ts", "@@ -1 +1 @@\n-old\n+stale\n"),
-      createMuxMessage("malformed-boundary", "assistant", "malformed summary", {
-        compacted: "user",
-        compactionBoundary: true,
-        // Missing compactionEpoch: marker should be ignored without crashing.
-      }),
-      createSuccessfulFileEditMessage(
-        "recent-edit",
-        "/tmp/recent.ts",
-        "@@ -1 +1 @@\n-before\n+after\n"
-      ),
-    ];
-
-    const workspaceId = "workspace-post-compaction-test";
-    for (const msg of history) {
-      await historyService.appendToHistory(workspaceId, msg);
-    }
-
-    const session = await createSessionForHistory(historyService, config);
-
-    try {
-      const attachments = await generatePeriodicPostCompactionAttachments(session);
-      expect(getEditedFilePaths(attachments)).toEqual(["/tmp/recent.ts", "/tmp/stale.ts"]);
     } finally {
       await session.dispose();
     }
@@ -408,74 +284,6 @@ describe("AgentSession post-compaction attachments", () => {
         "Avoid unnecessary useEffect calls."
       );
       expect(getEditedFilePaths(attachments)).toEqual(["/tmp/post-compaction.ts"]);
-    } finally {
-      await session.dispose();
-    }
-  });
-
-  test("reinjects cached loaded skills on later turns even after pending state is acknowledged", async () => {
-    const { historyService, config, cleanup } = await createTestHistoryService();
-    historyCleanup = cleanup;
-    const sessionDir = path.join(config.sessionsDir, WORKSPACE_ID);
-
-    const history: MuxMessage[] = [
-      createMuxMessage("boundary-1", "assistant", "epoch 1 summary", {
-        compacted: "user",
-        compactionBoundary: true,
-        compactionEpoch: 1,
-      }),
-      createSuccessfulFileEditMessage(
-        "recent-edit",
-        "/tmp/recent-periodic.ts",
-        "@@ -1 +1 @@\n-before\n+after\n"
-      ),
-    ];
-
-    const workspaceId = "workspace-post-compaction-test";
-
-    const session = await createSessionForHistory(historyService, config);
-    const loadedSkill = createLoadedSkillFixture({
-      name: "react-effects",
-      body: "Persist this guardrail across follow-up turns.",
-    });
-
-    try {
-      // Acknowledged warmth belongs to the exact durable publication; seed its row and
-      // pending file together so the test exercises the same identity as real compaction.
-      const pending = new CompactionPendingState(
-        path.join(sessionDir, POST_COMPACTION_STATE_FILENAME),
-        historyService.getCompactionPendingHistory(workspaceId)
-      );
-      expect(
-        (
-          await pending.publishBoundary({
-            summaryMessage: history[0],
-            tailCopies: history.slice(1),
-            updateExisting: false,
-            attachments: { diffs: [], loadedSkills: [loadedSkill], readFiles: [] },
-            publication: {
-              generation: await historyService
-                .getContinuousCompactionJournal(workspaceId)
-                .captureGeneration(),
-            },
-            isCurrent: () => true,
-            shouldPersist: () => true,
-            onCommitted: () => undefined,
-          })
-        ).success
-      ).toBe(true);
-      expect(getLoadedSkillNames(await getImmediatePostCompactionAttachments(session))).toEqual([
-        "react-effects",
-      ]);
-      await (
-        session as unknown as PrivateSessionAccess
-      ).contextController.compactionHandler.ackPendingStateConsumed();
-      const attachments = await generatePeriodicPostCompactionAttachments(session);
-      expect(getLoadedSkillNames(attachments)).toEqual(["react-effects"]);
-      expect(getLoadedSkillAttachment(attachments)?.skills[0]?.body).toContain(
-        "Persist this guardrail across follow-up turns."
-      );
-      expect(getEditedFilePaths(attachments)).toEqual(["/tmp/recent-periodic.ts"]);
     } finally {
       await session.dispose();
     }

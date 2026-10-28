@@ -5780,6 +5780,32 @@ export class HistoryService {
     );
   }
 
+  /**
+   * Delete one row of the caller's own turn under its admission. Removing a provider-visible
+   * row advances the context generation, so this returns the frontier after the delete: the
+   * caller adopts it, because its own delete is not a foreign reset.
+   */
+  deleteMessageUnderAdmission(
+    workspaceId: string,
+    captured: CompactionReplacementCapture,
+    messageId: string
+  ): Promise<Result<{ sequences: number[]; capture: CompactionReplacementCapture }>> {
+    const expected = { ...captured };
+    return this.withRecoveredHistoryWriteResultLock(
+      workspaceId,
+      "Failed to delete message",
+      async () => {
+        const current = await this.captureCompactionReplacementUnderHistoryLock(workspaceId);
+        if (current.nonce !== expected.nonce || current.generation !== expected.generation)
+          return Err("Compaction admission was superseded");
+        const deleted = await this.deleteMessageUnderWriteLock(workspaceId, messageId);
+        if (!deleted.success) return deleted;
+        const capture = await this.captureCompactionReplacementUnderHistoryLock(workspaceId);
+        return Ok({ sequences: deleted.data, capture });
+      }
+    );
+  }
+
   private async fenceDeletedMessagesUnderHistoryLock(
     workspaceId: string,
     rows: HistoryRewriteRow[],

@@ -5,7 +5,6 @@ import {
   type PathSkillsResultField,
 } from "@/common/types/tools";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { MuxMessage } from "@/common/types/message";
 import { deriveProjectRelativePath } from "@/common/utils/review/assistedReview";
 import { createSkillPathsMatcher } from "@/common/utils/skills/skillPaths";
@@ -171,15 +170,6 @@ function createTurnMatcher(): (skill: AgentSkillDescriptor, relativePath: string
   };
 }
 
-/** Names of the skills a post-compaction `loaded_skills_snapshot` re-injects. */
-export function loadedSnapshotSkillNames(
-  attachments: readonly PostCompactionAttachment[] | null | undefined
-): string[] {
-  return (attachments ?? []).flatMap((attachment) =>
-    attachment.type === "loaded_skills_snapshot" ? attachment.skills.map((skill) => skill.name) : []
-  );
-}
-
 /**
  * Build the turn's activation, or undefined when no skill can activate (no model-
  * invocable skill has `paths`), so the file tools stay unwrapped.
@@ -190,8 +180,6 @@ export function loadedSnapshotSkillNames(
 export function createPathSkillActivation(params: {
   skills: readonly AgentSkillDescriptor[] | undefined;
   messages: readonly MuxMessage[];
-  /** Skills already in the request outside history (post-compaction loaded-skill snapshot). */
-  loadedSkillNames?: readonly string[];
   cwd: string;
   runtime: Runtime;
 }): PathSkillActivation | undefined {
@@ -201,7 +189,6 @@ export function createPathSkillActivation(params: {
   }
 
   const surfaced = collectSurfacedSkillNames(params.messages);
-  for (const name of params.loadedSkillNames ?? []) surfaced.add(name);
   const matches = createTurnMatcher();
 
   return {

@@ -170,7 +170,7 @@ import {
 } from "@/common/types/backgroundWorkAttention";
 import {
   createMuxMessage,
-  isContextBudgetWarningMessage,
+  isAppendedTurnNoticeMessage,
   type MuxMessage,
   type MuxMessageMetadata,
 } from "@/common/types/message";
@@ -17094,7 +17094,7 @@ export class TaskService implements AgentTaskIntegration {
     const tail = await this.historyService.getLastMessages(workspaceId, 20);
     if (!tail.success) return false;
     const userRow = tail.data.findLast(
-      (message) => message.role === "user" && !isContextBudgetWarningMessage(message)
+      (message) => message.role === "user" && !isAppendedTurnNoticeMessage(message)
     );
     return userRow?.metadata?.kind === GOAL_CONTINUATION_KIND && userRow.metadata.goalId === goalId;
   }

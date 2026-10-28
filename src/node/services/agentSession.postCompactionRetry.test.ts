@@ -3,6 +3,7 @@ import { EventEmitter } from "events";
 import * as fsPromises from "fs/promises";
 import * as path from "path";
 
+import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { Err } from "@/common/types/result";
 
 import type { MuxMessage } from "@/common/types/message";
@@ -153,18 +154,18 @@ describe("AgentSession post-compaction context retry", () => {
       "retry-started"
     );
 
-    // With the options bag, arg[0] is the StreamMessageOptions object.
-    const firstOpts = (streamMessage as ReturnType<typeof mock>).mock.calls[0][0] as Record<
-      string,
-      unknown
-    >;
-    expect(Array.isArray(firstOpts.postCompactionAttachments)).toBe(true);
-
-    const secondOpts = (streamMessage as ReturnType<typeof mock>).mock.calls[1][0] as Record<
-      string,
-      unknown
-    >;
-    expect(secondOpts.postCompactionAttachments).toBeNull();
+    // The first request carried the durable attachments row; the retry runs without it.
+    const hasAttachmentsRow = (messages: MuxMessage[]) =>
+      messages.some((message) =>
+        message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX)
+      );
+    const requestMessages = (call: number) =>
+      ((streamMessage as ReturnType<typeof mock>).mock.calls[call][0] as { messages: MuxMessage[] })
+        .messages;
+    expect(hasAttachmentsRow(requestMessages(0))).toBe(true);
+    expect(hasAttachmentsRow(requestMessages(1))).toBe(false);
+    const historyAfterRetry = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(historyAfterRetry.success && hasAttachmentsRow(historyAfterRetry.data)).toBe(false);
 
     expect((historyService.deleteMessage as ReturnType<typeof mock>).mock.calls[0][1]).toBe(
       "assistant-ctx-exceeded"
@@ -380,6 +381,72 @@ describe("AgentSession post-compaction context retry", () => {
       )
     ).toBe("terminal");
     expect(callCount).toBe(2);
+
+    await session.dispose();
+  });
+
+  // The row is durable: a turn that fails before the ack must not append a second copy.
+  test("a failed turn keeps its attachments row and the next turn reuses it", async () => {
+    const workspaceId = "ws-reuse";
+    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
+    await createPersistedPostCompactionState({
+      filePath: path.join(sessionDir, "post-compaction.json"),
+      diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
+    });
+    await historyService.appendToHistory(workspaceId, {
+      id: "user-1",
+      role: "user",
+      parts: [{ type: "text", text: "Continue" }],
+      metadata: { timestamp: 1100 },
+    });
+
+    let callCount = 0;
+    const streamMessage = mock((..._args: unknown[]) => {
+      callCount += 1;
+      if (callCount === 1) {
+        return Promise.resolve({
+          success: false as const,
+          error: { type: "unknown" as const, raw: "startup failed before stream" },
+        });
+      }
+      return Promise.resolve({
+        success: true as const,
+        data: createStartedTurnHandle(session.closingSignal, "assistant-next"),
+      });
+    });
+    const { session } = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+      aiServiceOverrides: {
+        streamMessage,
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
+    });
+    const options = { model: "openai:gpt-4o", agentId: "exec" } as unknown as SendMessageOptions;
+
+    await session.resumeStream(options);
+    // The manual Retry resumes the request past the failed turn's attachments row.
+    expect(await session.resumeStream(options)).toEqual({ success: true, data: { started: true } });
+
+    expect(callCount).toBe(2);
+    const attachmentRowIds = (messages: MuxMessage[]) =>
+      messages
+        .filter((message) => message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX))
+        .map((message) => message.id);
+    const requestRowIds = (call: number) =>
+      attachmentRowIds(
+        (
+          (streamMessage as ReturnType<typeof mock>).mock.calls[call][0] as {
+            messages: MuxMessage[];
+          }
+        ).messages
+      );
+    const firstRowIds = requestRowIds(0);
+    expect(firstRowIds).toHaveLength(1);
+    expect(requestRowIds(1)).toEqual(firstRowIds);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success && attachmentRowIds(history.data)).toEqual(firstRowIds);
 
     await session.dispose();
   });
