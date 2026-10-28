@@ -899,6 +899,59 @@ interface TaskCreatePlan extends TaskCreatePlacement {
   readonly createdAt: string;
 }
 
+/** Validates Task.create's bestOf: undefined when absent, else the normalized group slot. */
+function normalizeTaskCreateBestOf(
+  bestOf: TaskCreateArgs["bestOf"]
+): Result<TaskCreateArgs["bestOf"], string> {
+  if (!bestOf) {
+    return Ok(undefined);
+  }
+  const groupId = coerceNonEmptyString(bestOf.groupId);
+  if (!groupId) {
+    return Err("Task.create: bestOf.groupId is required when bestOf is provided");
+  }
+  if (!Number.isInteger(bestOf.index) || bestOf.index < 0) {
+    return Err("Task.create: bestOf.index must be a non-negative integer");
+  }
+  if (!Number.isInteger(bestOf.total) || bestOf.total < 2) {
+    return Err("Task.create: bestOf.total must be an integer >= 2");
+  }
+  if (bestOf.index >= bestOf.total) {
+    return Err("Task.create: bestOf.index must be less than bestOf.total");
+  }
+
+  return Ok({
+    groupId,
+    index: bestOf.index,
+    total: bestOf.total,
+  });
+}
+
+/**
+ * Whether a task shares its parent's checkout: a scratch parent, or isolation: "none" on a
+ * runtime that supports it for a single-project parent. A multi-project parent there is refused.
+ */
+function decideSharedTaskWorkspace(
+  isolation: TaskCreateArgs["isolation"],
+  taskRuntimeMode: ReturnType<typeof getRuntimeType>,
+  parentIsScratch: boolean,
+  parentIsMultiProject: boolean
+): Result<boolean, string> {
+  if (
+    isolation === "none" &&
+    runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+    parentIsMultiProject
+  ) {
+    return Err(`Task.create: ${MULTI_PROJECT_SHARED_ISOLATION_ERROR}`);
+  }
+  return Ok(
+    parentIsScratch ||
+      (isolation === "none" &&
+        runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+        !parentIsMultiProject)
+  );
+}
+
 /** A direct launch's materialized checkout, read by the steps after its entry is persisted. */
 interface TaskLaunchCheckout {
   readonly initLogger: InitLogger;
@@ -6960,6 +7013,24 @@ export class TaskService implements AgentTaskIntegration {
     args: TaskCreateArgs,
     parentWorkspaceId: string
   ): Promise<Result<TaskCreateResult, string>> {
+    const request = this.readTaskCreateRequest(args, parentWorkspaceId);
+    if (!request.success) {
+      return request;
+    }
+
+    // Held until the create settles: every step below runs under it, and none takes it again (the
+    // mutex is not reentrant). The step call must be awaited here: a bare `return promise` would
+    // dispose the lock before the promise settles.
+    await using _lock = await this.mutex.acquire();
+
+    return await this.loadTaskCreateParent(request.data);
+  }
+
+  /** Validates a Task.create request before the global mutex is taken. */
+  private readTaskCreateRequest(
+    args: TaskCreateArgs,
+    parentWorkspaceId: string
+  ): Result<TaskCreateRequest, string> {
     if (args.kind !== "agent") {
       return Err("Task.create: unsupported kind");
     }
@@ -6979,28 +7050,9 @@ export class TaskService implements AgentTaskIntegration {
       return Err(`Task.create: invalid agentId (${normalizedAgentId})`);
     }
 
-    let normalizedBestOf: TaskCreateArgs["bestOf"];
-    const bestOf = args.bestOf;
-    if (bestOf) {
-      const groupId = coerceNonEmptyString(bestOf.groupId);
-      if (!groupId) {
-        return Err("Task.create: bestOf.groupId is required when bestOf is provided");
-      }
-      if (!Number.isInteger(bestOf.index) || bestOf.index < 0) {
-        return Err("Task.create: bestOf.index must be a non-negative integer");
-      }
-      if (!Number.isInteger(bestOf.total) || bestOf.total < 2) {
-        return Err("Task.create: bestOf.total must be an integer >= 2");
-      }
-      if (bestOf.index >= bestOf.total) {
-        return Err("Task.create: bestOf.index must be less than bestOf.total");
-      }
-
-      normalizedBestOf = {
-        groupId,
-        index: bestOf.index,
-        total: bestOf.total,
-      };
+    const normalizedBestOf = normalizeTaskCreateBestOf(args.bestOf);
+    if (!normalizedBestOf.success) {
+      return normalizedBestOf;
     }
 
     const agentId = parsedAgentId.data;
@@ -7012,15 +7064,43 @@ export class TaskService implements AgentTaskIntegration {
       return Err(getErrorMessage(error));
     }
 
-    await using _lock = await this.mutex.acquire();
+    return Ok({
+      args,
+      parentWorkspaceId,
+      prompt,
+      agentId,
+      agentType,
+      normalizedBestOf: normalizedBestOf.data,
+      taskDesktopOwnerWorkspaceId,
+    });
+  }
 
+  /**
+   * Task.create under the global mutex: reads the parent, then chains to countAndPlaceTask and
+   * the later steps. Each step starts the next in the same tick as its own last await, so no call
+   * runs later than it did inline.
+   */
+  private async loadTaskCreateParent(
+    request: TaskCreateRequest
+  ): Promise<Result<TaskCreateResult, string>> {
     // Validate parent exists and fetch runtime context.
-    const parentMetaResult = await this.aiService.getWorkspaceMetadata(parentWorkspaceId);
+    const parentMetaResult = await this.aiService.getWorkspaceMetadata(request.parentWorkspaceId);
     if (!parentMetaResult.success) {
       return Err(`Task.create: parent workspace not found (${parentMetaResult.error})`);
     }
-    const parentMeta = parentMetaResult.data;
+    const parent = this.readTaskCreateParent(request, parentMetaResult.data);
+    if (!parent.success) {
+      return parent;
+    }
+    return this.countAndPlaceTask(parent.data);
+  }
 
+  /** Reads the parent's config facts once, and refuses an archived parent or untrusted project. */
+  private readTaskCreateParent(
+    request: TaskCreateRequest,
+    parentMeta: WorkspaceMetadata
+  ): Result<TaskCreateParent, string> {
+    const { parentWorkspaceId } = request;
     // Enforce nesting depth.
     const cfg = this.config.loadConfigOrDefault();
     // #6426: once per create, from the loaded config.
@@ -7049,6 +7129,60 @@ export class TaskService implements AgentTaskIntegration {
       );
     }
 
+    return Ok({
+      ...request,
+      parentMeta,
+      cfg,
+      projectPluginsTrusted,
+      taskSettings,
+      parentEntry,
+      legacyParentRow,
+      parentIsScratch,
+      configProjectPath,
+    });
+  }
+
+  /** Refuses a stopped or too-deep parent, then counts the active tasks and names the new task. */
+  private async countAndPlaceTask(
+    parent: TaskCreateParent
+  ): Promise<Result<TaskCreateResult, string>> {
+    const { cfg, taskSettings, agentId } = parent;
+    const refusal = this.refuseTaskCreateUnderParent(parent);
+    if (refusal !== undefined) {
+      return refusal;
+    }
+
+    // Enforce parallelism (global).
+    const activeCount =
+      this.countActiveAgentTasks(cfg) +
+      (await this.getWorkspaceTurnManager().countActiveWorkspaceTurns());
+    const shouldQueue = activeCount >= taskSettings.maxParallelAgentTasks;
+
+    const taskId = this.config.generateStableId();
+    const workspaceName = buildAgentWorkspaceName(agentId, taskId);
+
+    const nameValidation = validateWorkspaceName(workspaceName);
+    if (!nameValidation.valid) {
+      return Err(
+        `Task.create: generated workspace name invalid (${nameValidation.error ?? "unknown error"})`
+      );
+    }
+
+    const placement = this.placeTaskWorkspace(parent, {
+      activeCount,
+      shouldQueue,
+      taskId,
+      workspaceName,
+    });
+    if (!placement.success) {
+      return placement;
+    }
+    return this.readTaskCreateParentBranch(placement.data);
+  }
+
+  /** The parent-state and nesting-depth gates: the refusal, or undefined to admit the child. */
+  private refuseTaskCreateUnderParent(parent: TaskCreateParent): Result<never, string> | undefined {
+    const { cfg, parentEntry, parentWorkspaceId, taskSettings } = parent;
     if (
       parentEntry?.workspace.taskStatus === "interrupted" &&
       !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
@@ -7070,22 +7204,15 @@ export class TaskService implements AgentTaskIntegration {
       );
     }
 
-    // Enforce parallelism (global).
-    const activeCount =
-      this.countActiveAgentTasks(cfg) +
-      (await this.getWorkspaceTurnManager().countActiveWorkspaceTurns());
-    const shouldQueue = activeCount >= taskSettings.maxParallelAgentTasks;
+    return undefined;
+  }
 
-    const taskId = this.config.generateStableId();
-    const workspaceName = buildAgentWorkspaceName(agentId, taskId);
-
-    const nameValidation = validateWorkspaceName(workspaceName);
-    if (!nameValidation.valid) {
-      return Err(
-        `Task.create: generated workspace name invalid (${nameValidation.error ?? "unknown error"})`
-      );
-    }
-
+  /** Builds the task's runtime from the parent's and decides whether it shares the checkout. */
+  private placeTaskWorkspace(
+    parent: TaskCreateParent,
+    counted: Pick<TaskCreatePlacement, "activeCount" | "shouldQueue" | "taskId" | "workspaceName">
+  ): Result<TaskCreatePlacement, string> {
+    const { args, parentMeta, parentEntry, parentIsScratch } = parent;
     const parentRuntimeConfig = parentMeta.runtimeConfig;
     const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
 
@@ -7116,18 +7243,47 @@ export class TaskService implements AgentTaskIntegration {
     // runtimes are refused (see MULTI_PROJECT_SHARED_ISOLATION_ERROR); otherwise fall back to forking.
     const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
     const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
-    if (
-      args.isolation === "none" &&
-      runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+    const sharedWorkspace = decideSharedTaskWorkspace(
+      args.isolation,
+      taskRuntimeMode,
+      parentIsScratch,
       parentIsMultiProject
-    ) {
-      return Err(`Task.create: ${MULTI_PROJECT_SHARED_ISOLATION_ERROR}`);
+    );
+    if (!sharedWorkspace.success) {
+      return sharedWorkspace;
     }
-    const useSharedWorkspace =
-      parentIsScratch ||
-      (args.isolation === "none" &&
-        runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
-        !parentIsMultiProject);
+    return Ok({
+      ...parent,
+      ...counted,
+      parentRuntimeConfig,
+      taskRuntimeConfig,
+      runtime,
+      parentWorkspacePath,
+      taskRuntimeMode,
+      parentIsMultiProject,
+      useSharedWorkspace: sharedWorkspace.data,
+    });
+  }
+
+  /**
+   * Task.create once the task is placed: reads the parent's checked-out branch, then chains to
+   * checkTaskAgentRunnable and resolveTaskCreateAiSettings, which queues or launches the task.
+   * Each step starts the next in the same tick as its own last await.
+   */
+  private async readTaskCreateParentBranch(
+    placement: TaskCreatePlacement
+  ): Promise<Result<TaskCreateResult, string>> {
+    const {
+      args,
+      parentEntry,
+      parentMeta,
+      runtime,
+      parentWorkspacePath,
+      useSharedWorkspace,
+      taskId,
+      taskRuntimeMode,
+      parentIsMultiProject,
+    } = placement;
     // The branch actually checked out in the parent's checkout (see readTaskParentBranch): an
     // isolation: "none" parent's name, and an auto-named worktree parent's, name no branch.
     // Persisting the real branch keeps dequeue fork-fallbacks (preferredTrunkBranch) on an
@@ -7143,60 +7299,71 @@ export class TaskService implements AgentTaskIntegration {
         parentIsMultiProject,
       });
     }
+    return this.checkTaskAgentRunnable(placement, parentBranchName);
+  }
 
-    // Helper to build error hint with all available runnable agents.
-    // NOTE: This resolves frontmatter inheritance so same-name overrides (e.g. project exec.md
-    // with base: exec) still count as runnable.
-    const getRunnableHint = async (): Promise<string> => {
-      try {
-        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
-          projectPluginsTrusted,
-          runtimeFactory: nodeRuntimeFactory,
-        });
+  /**
+   * Builds the error hint with all available runnable agents.
+   * NOTE: This resolves frontmatter inheritance so same-name overrides (e.g. project exec.md
+   * with base: exec) still count as runnable.
+   */
+  private async describeRunnableTaskAgents(placement: TaskCreatePlacement): Promise<string> {
+    const { args, cfg, runtime, parentWorkspacePath, projectPluginsTrusted } = placement;
+    try {
+      const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
+        projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
+      });
 
-        const runnableIds = (
-          await Promise.all(
-            allAgents.map(async (agent) => {
-              try {
-                const frontmatter = await resolveAgentFrontmatter(
-                  runtime,
-                  parentWorkspacePath,
-                  agent.id,
-                  {
-                    skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
-                    projectPluginsTrusted,
-                    runtimeFactory: nodeRuntimeFactory,
-                  }
-                );
-                if (
-                  !isAgentRunnableAsChild(frontmatter, {
-                    workflowOwned: args.workflowTask != null,
-                  })
-                ) {
-                  return null;
+      const runnableIds = (
+        await Promise.all(
+          allAgents.map(async (agent) => {
+            try {
+              const frontmatter = await resolveAgentFrontmatter(
+                runtime,
+                parentWorkspacePath,
+                agent.id,
+                {
+                  skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
+                  projectPluginsTrusted,
+                  runtimeFactory: nodeRuntimeFactory,
                 }
-
-                const effectivelyDisabled = isAgentEffectivelyDisabled({
-                  cfg,
-                  agentId: agent.id,
-                  resolvedFrontmatter: frontmatter,
-                });
-                return effectivelyDisabled ? null : agent.id;
-              } catch {
+              );
+              if (
+                !isAgentRunnableAsChild(frontmatter, {
+                  workflowOwned: args.workflowTask != null,
+                })
+              ) {
                 return null;
               }
-            })
-          )
-        ).filter((id): id is string => typeof id === "string");
 
-        return runnableIds.length > 0
-          ? `Runnable agentIds: ${runnableIds.join(", ")}`
-          : "No runnable agents available";
-      } catch {
-        return "Could not discover available agents";
-      }
-    };
+              const effectivelyDisabled = isAgentEffectivelyDisabled({
+                cfg,
+                agentId: agent.id,
+                resolvedFrontmatter: frontmatter,
+              });
+              return effectivelyDisabled ? null : agent.id;
+            } catch {
+              return null;
+            }
+          })
+        )
+      ).filter((id): id is string => typeof id === "string");
 
+      return runnableIds.length > 0
+        ? `Runnable agentIds: ${runnableIds.join(", ")}`
+        : "No runnable agents available";
+    } catch {
+      return "Could not discover available agents";
+    }
+  }
+
+  /** Refuses an agent that is unknown, disabled or not runnable as a sub-agent. */
+  private async checkTaskAgentRunnable(
+    placement: TaskCreatePlacement,
+    parentBranchName: string | undefined
+  ): Promise<Result<TaskCreateResult, string>> {
+    const { args, cfg, agentId, runtime, parentWorkspacePath, projectPluginsTrusted } = placement;
     let skipInitHook = false;
     try {
       const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId, {
@@ -7204,7 +7371,7 @@ export class TaskService implements AgentTaskIntegration {
         runtimeFactory: nodeRuntimeFactory,
       });
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
-        const hint = await getRunnableHint();
+        const hint = await this.describeRunnableTaskAgents(placement);
         return Err(`Task.create: agentId is not runnable as a sub-agent (${agentId}). ${hint}`);
       }
 
@@ -7215,7 +7382,7 @@ export class TaskService implements AgentTaskIntegration {
           resolvedFrontmatter: frontmatter,
         })
       ) {
-        const hint = await getRunnableHint();
+        const hint = await this.describeRunnableTaskAgents(placement);
         return Err(`Task.create: agentId is disabled (${agentId}). ${hint}`);
       }
       skipInitHook = frontmatter.subagent?.skip_init_hook === true;
@@ -7225,10 +7392,35 @@ export class TaskService implements AgentTaskIntegration {
           formatRuntimeUnreachableError(`Task.create: could not verify agentId (${agentId})`, error)
         );
       }
-      const hint = await getRunnableHint();
+      const hint = await this.describeRunnableTaskAgents(placement);
       return Err(`Task.create: unknown agentId (${agentId}). ${hint}`);
     }
+    return this.resolveTaskCreateAiSettings(placement, parentBranchName, skipInitHook);
+  }
 
+  /** Resolves the task's model and thinking settings, then queues or launches the task. */
+  private async resolveTaskCreateAiSettings(
+    placement: TaskCreatePlacement,
+    parentBranchName: string | undefined,
+    skipInitHook: boolean
+  ): Promise<Result<TaskCreateResult, string>> {
+    const {
+      args,
+      cfg,
+      parentWorkspaceId,
+      parentMeta,
+      agentId,
+      runtime,
+      parentWorkspacePath,
+      projectPluginsTrusted,
+      taskId,
+      workspaceName,
+      activeCount,
+      taskSettings,
+      shouldQueue,
+      taskRuntimeConfig,
+      prompt,
+    } = placement;
     let taskModelString: string;
     let canonicalModel: string;
     let effectiveThinkingLevel: ThinkingLevel;
@@ -7287,32 +7479,7 @@ export class TaskService implements AgentTaskIntegration {
     });
 
     const plan: TaskCreatePlan = {
-      args,
-      parentWorkspaceId,
-      prompt,
-      agentId,
-      agentType,
-      normalizedBestOf,
-      taskDesktopOwnerWorkspaceId,
-      parentMeta,
-      cfg,
-      projectPluginsTrusted,
-      taskSettings,
-      parentEntry,
-      legacyParentRow,
-      parentIsScratch,
-      configProjectPath,
-      activeCount,
-      shouldQueue,
-      taskId,
-      workspaceName,
-      parentRuntimeConfig,
-      taskRuntimeConfig,
-      runtime,
-      parentWorkspacePath,
-      taskRuntimeMode,
-      parentIsMultiProject,
-      useSharedWorkspace,
+      ...placement,
       parentBranchName,
       skipInitHook,
       taskModelString,
@@ -7324,10 +7491,10 @@ export class TaskService implements AgentTaskIntegration {
     };
 
     if (shouldQueue) {
-      return await this.createQueuedTask(plan);
+      return this.createQueuedTask(plan);
     }
 
-    return await this.launchTask(plan);
+    return this.launchTask(plan);
   }
 
   /**
