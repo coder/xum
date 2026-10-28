@@ -908,6 +908,17 @@ interface TaskLaunchCheckout {
   readonly runtimeForTaskWorkspace: Runtime;
 }
 
+/** What a direct launch materialized, before its entry is persisted. */
+interface MaterializedTaskCheckout extends TaskLaunchCheckout {
+  readonly forkedFromSource: boolean;
+  readonly inheritedProjects: ProjectRef[] | undefined;
+  /**
+   * Written with the task's row (appendLaunchedTaskEntry), never before it: a fork rollback
+   * elsewhere restores this parent mark only while no row uses the shared workspace (#5114).
+   */
+  readonly sourceRuntimeConfigUpdate: RuntimeConfig | undefined;
+}
+
 /**
  * A direct Task.create launch's progress. The launch writes it as it advances and its failure
  * path (failTaskLaunch) reads it, so it is one mutable record: a copy would read stale values.
@@ -7316,6 +7327,15 @@ export class TaskService implements AgentTaskIntegration {
       return await this.createQueuedTask(plan);
     }
 
+    return await this.launchTask(plan);
+  }
+
+  /**
+   * Task.create's direct launch: materializes the checkout and persists the entry under the
+   * desktop gate, then chains to sanitizeTaskLaunchCheckout. Runs under the global mutex that
+   * createUnderTaskTreeLifecycleLock holds.
+   */
+  private async launchTask(plan: TaskCreatePlan): Promise<Result<TaskCreateResult, string>> {
     const launch: TaskLaunchState = {
       // Set once a checkout exists for this task: a throw after that point (base-SHA read, config
       // persistence) must roll the checkout back instead of leaking it like an unhandled rejection.
@@ -7332,195 +7352,9 @@ export class TaskService implements AgentTaskIntegration {
       // that observes it false has positive evidence that this launch never dispatched its prompt.
       sendAdmitted: false,
     };
-    const materialize = async () => {
-      const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
-
-      let workspacePath: string;
-      let trunkBranch: string;
-      let forkedRuntimeConfig: RuntimeConfig;
-      let runtimeForTaskWorkspace: Runtime;
-      let forkedFromSource: boolean;
-      let inheritedProjects: ProjectRef[] | undefined;
-      // Written with the task's row below, never before it: a fork rollback elsewhere restores
-      // this parent mark only while no row uses the shared workspace (#5114).
-      let sourceRuntimeConfigUpdate: RuntimeConfig | undefined;
-
-      if (useSharedWorkspace) {
-        // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead
-        // of forking. Mirrors local-runtime semantics for worktree/SSH so read-only analysis (or
-        // prompt-isolated work) skips the fork + init overhead and sees the parent's uncommitted work.
-        //
-        // SAFETY: the task still gets a unique workspace name, and workspace deletion is keyed on that
-        // name (runtime.deleteWorkspace(projectPath, name)), so removing this task never deletes the
-        // shared parent checkout. workspaceService.remove additionally skips physical deletion for
-        // tasks persisted with taskIsolation === "none".
-        workspacePath = parentWorkspacePath;
-        trunkBranch = parentBranchName ?? "main";
-        forkedRuntimeConfig = parentRuntimeConfig;
-        forkedFromSource = false;
-        inheritedProjects = parentMeta.projects;
-        // Build the runtime with the child's identity but the parent's checkout path. Worktree/SSH
-        // runtimes honor this persisted path override (see *Runtime.getWorkspacePath), so cwd
-        // resolution and ensureReady land in the shared parent checkout instead of a name-derived
-        // directory that was never created. This mirrors the runtime rebuilt from the persisted entry.
-        runtimeForTaskWorkspace = createRuntimeForWorkspace({
-          runtimeConfig: parentRuntimeConfig,
-          projectPath: parentMeta.projectPath,
-          name: workspaceName,
-          namedWorkspacePath: parentWorkspacePath,
-        });
-        initLogger.logStep("Sharing parent workspace (isolation: none) — skipping fork and init");
-        initLogger.logComplete(0);
-      } else {
-        // Note: Local project-dir runtimes share the same directory (unsafe by design).
-        // For worktree/ssh runtimes we attempt a fork first; otherwise fall back to createWorkspace.
-        const forkResult = await orchestrateFork({
-          sourceRuntime: runtime,
-          projectPath: parentMeta.projectPath,
-          sourceWorkspaceName: parentMeta.name,
-          newWorkspaceName: workspaceName,
-          newWorkspaceId: taskId,
-          initLogger,
-          config: this.config,
-          sourceWorkspaceId: parentWorkspaceId,
-          sourceRuntimeConfig: parentRuntimeConfig,
-          parentMetadata: parentMeta,
-          allowCreateFallback: true,
-          // Create-fallback base when the fork cannot detect a source branch — a shared parent's
-          // synthetic name, or an auto-named worktree parent's, names no branch, so supply the
-          // actual checked-out branch. Only then: other parents keep the existing
-          // branch-discovery fallback.
-          ...(parentBranchName != null && parentBranchName !== parentMeta.name
-            ? { preferredTrunkBranch: parentBranchName }
-            : {}),
-          trusted:
-            this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
-          multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
-            EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
-          ),
-        });
-
-        if (!forkResult.success) {
-          initLogger.logComplete(-1);
-          return Err(`Task fork failed: ${forkResult.error}`);
-        }
-
-        workspacePath = forkResult.data.workspacePath;
-        trunkBranch = forkResult.data.trunkBranch;
-        forkedRuntimeConfig = forkResult.data.forkedRuntimeConfig;
-        sourceRuntimeConfigUpdate = forkResult.data.sourceRuntimeConfigUpdate;
-        runtimeForTaskWorkspace = forkResult.data.targetRuntime;
-        forkedFromSource = forkResult.data.forkedFromSource;
-        inheritedProjects = forkResult.data.projects;
-      }
-
-      launch.materializedCheckout = { initLogger, runtime: runtimeForTaskWorkspace };
-
-      // Multi-project forks need per-project secrets for each runtime's init hook.
-      this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
-
-      const taskBaseCommitShaByProjectPath = await readTaskBaseCommitShaByProjectPath({
-        workspaceId: taskId,
-        workspaceName,
-        workspacePath,
-        runtimeConfig: forkedRuntimeConfig,
-        projectPath: parentMeta.projectPath,
-        projectName: parentMeta.projectName,
-        projects: inheritedProjects,
-        runtime: runtimeForTaskWorkspace,
-      });
-      const taskBaseCommitSha = taskBaseCommitShaByProjectPath[parentMeta.projectPath];
-
-      taskQueueDebug("TaskService.create started (workspace created)", {
-        taskId,
-        workspaceName,
-        workspacePath,
-        trunkBranch,
-        forkSuccess: forkedFromSource,
-      });
-
-      // Persist workspace entry before starting work so it's durable across crashes.
-      await this.config.editConfig((config) => {
-        assertParentAdmitsChild(config, parentWorkspaceId, {
-          requireRow: parentEntry != null,
-          legacyRow: legacyParentRow,
-        });
-        if (sourceRuntimeConfigUpdate != null) {
-          const parentRow = Array.from(config.projects.values())
-            .flatMap((project) => project.workspaces)
-            .find((workspace) => workspace.id === parentWorkspaceId);
-          if (parentRow == null) {
-            throw new Error(`Workspace ${parentWorkspaceId} not found in config`);
-          }
-          parentRow.runtimeConfig = sourceRuntimeConfigUpdate;
-        }
-        let projectConfig = config.projects.get(configProjectPath);
-        if (!projectConfig) {
-          projectConfig = { workspaces: [] };
-          config.projects.set(configProjectPath, projectConfig);
-        }
-
-        projectConfig.workspaces.push({
-          kind: parentIsScratch ? "scratch" : undefined,
-          path: workspacePath,
-          id: taskId,
-          name: workspaceName,
-          title: args.title,
-          createdAt,
-          runtimeConfig: forkedRuntimeConfig,
-          // New rows have no legacy plan to migrate (#5174).
-          remotePlanMigrated: true,
-          aiSettings: {
-            model: canonicalModel,
-            thinkingLevel: effectiveThinkingLevel,
-            ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
-          },
-          agentId,
-          parentWorkspaceId,
-          agentType,
-          workflowTask: args.workflowTask,
-          bestOf: normalizedBestOf,
-          taskStatus: "running",
-          // Direct (unqueued) launch: this write is the admission, so it stamps the attempt id the
-          // send below is fenced against (WorkspaceService binds the obligation at handoff).
-          taskAttemptId: launch.attemptId,
-          taskTrunkBranch: trunkBranch,
-          taskBaseCommitSha: taskBaseCommitSha ?? undefined,
-          taskBaseCommitShaByProjectPath,
-          taskModelString,
-          taskThinkingLevel: effectiveThinkingLevel,
-          taskAiPins,
-          taskOnRefusal: args.onRefusal,
-          taskIsolation: useSharedWorkspace ? "none" : undefined,
-          taskAttentionPolicy: args.attentionPolicy,
-          taskDesktopOwnerWorkspaceId,
-          projects: inheritedProjects,
-        });
-        this.desktopInputCoordinator.assertAdmission(config, taskId);
-        return config;
-      });
-      // Owned before the entry is announced (emitWorkspaceMetadata below): the first send into
-      // this workspace, whoever issues it, is admitted under an attempt this process owns.
-      launch.launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
-        attemptId: launch.attemptId,
-        receiptEligible: true,
-      });
-      if (sourceRuntimeConfigUpdate != null) {
-        // Ensure UI gets the updated runtimeConfig for the parent workspace.
-        await this.emitWorkspaceMetadata(parentWorkspaceId);
-      }
-
-      return Ok({
-        initLogger,
-        workspacePath,
-        trunkBranch,
-        forkedRuntimeConfig,
-        runtimeForTaskWorkspace,
-      });
-    };
-    const materialized = await this.reserveTaskDesktop(plan, materialize).catch((error: unknown) =>
-      Err(getErrorMessage(error))
-    );
+    const materialized = await this.reserveTaskDesktop(plan, () =>
+      this.materializeTaskCheckout(plan, launch)
+    ).catch((error: unknown) => Err(getErrorMessage(error)));
     if (!materialized.success) {
       if (launch.materializedCheckout != null) {
         // Runs after the desktop gate released: only the checkout and any persisted entry (which
@@ -7531,14 +7365,238 @@ export class TaskService implements AgentTaskIntegration {
           materialized.error,
           launch.materializedCheckout.runtime,
           {
-            preservePhysicalWorkspace: useSharedWorkspace,
+            preservePhysicalWorkspace: plan.useSharedWorkspace,
           }
         );
         launch.materializedCheckout.initLogger.logComplete(-1);
       }
       return materialized;
     }
-    return await this.sanitizeTaskLaunchCheckout(plan, launch, materialized.data);
+    return this.sanitizeTaskLaunchCheckout(plan, launch, materialized.data);
+  }
+
+  /**
+   * Shares the parent's checkout or forks a new one, then persists the task's entry and owns its
+   * launch attempt. Runs inside the desktop gate (reserveTaskDesktop).
+   */
+  private async materializeTaskCheckout(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState
+  ): Promise<Result<TaskLaunchCheckout, string>> {
+    const { taskId, workspaceName, parentWorkspaceId, parentMeta } = plan;
+    const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
+
+    let checkout: MaterializedTaskCheckout;
+    if (plan.useSharedWorkspace) {
+      checkout = this.shareParentCheckout(plan, initLogger);
+    } else {
+      // Note: Local project-dir runtimes share the same directory (unsafe by design).
+      // For worktree/ssh runtimes we attempt a fork first; otherwise fall back to createWorkspace.
+      const forkResult = await orchestrateFork(this.buildTaskForkOptions(plan, initLogger));
+
+      if (!forkResult.success) {
+        initLogger.logComplete(-1);
+        return Err(`Task fork failed: ${forkResult.error}`);
+      }
+
+      checkout = {
+        initLogger,
+        workspacePath: forkResult.data.workspacePath,
+        trunkBranch: forkResult.data.trunkBranch,
+        forkedRuntimeConfig: forkResult.data.forkedRuntimeConfig,
+        sourceRuntimeConfigUpdate: forkResult.data.sourceRuntimeConfigUpdate,
+        runtimeForTaskWorkspace: forkResult.data.targetRuntime,
+        forkedFromSource: forkResult.data.forkedFromSource,
+        inheritedProjects: forkResult.data.projects,
+      };
+    }
+    const { workspacePath, trunkBranch, runtimeForTaskWorkspace } = checkout;
+
+    launch.materializedCheckout = { initLogger, runtime: runtimeForTaskWorkspace };
+
+    // Multi-project forks need per-project secrets for each runtime's init hook.
+    this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
+
+    const taskBaseCommitShaByProjectPath = await readTaskBaseCommitShaByProjectPath({
+      workspaceId: taskId,
+      workspaceName,
+      workspacePath,
+      runtimeConfig: checkout.forkedRuntimeConfig,
+      projectPath: parentMeta.projectPath,
+      projectName: parentMeta.projectName,
+      projects: checkout.inheritedProjects,
+      runtime: runtimeForTaskWorkspace,
+    });
+    const taskBaseCommitSha = taskBaseCommitShaByProjectPath[parentMeta.projectPath];
+
+    taskQueueDebug("TaskService.create started (workspace created)", {
+      taskId,
+      workspaceName,
+      workspacePath,
+      trunkBranch,
+      forkSuccess: checkout.forkedFromSource,
+    });
+
+    // Persist workspace entry before starting work so it's durable across crashes.
+    await this.config.editConfig((config) =>
+      this.appendLaunchedTaskEntry(config, plan, launch, checkout, {
+        taskBaseCommitSha: taskBaseCommitSha ?? undefined,
+        taskBaseCommitShaByProjectPath,
+      })
+    );
+    // Owned before the entry is announced (emitWorkspaceMetadata below): the first send into
+    // this workspace, whoever issues it, is admitted under an attempt this process owns.
+    launch.launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
+      attemptId: launch.attemptId,
+      receiptEligible: true,
+    });
+    if (checkout.sourceRuntimeConfigUpdate != null) {
+      // Ensure UI gets the updated runtimeConfig for the parent workspace.
+      await this.emitWorkspaceMetadata(parentWorkspaceId);
+    }
+
+    return Ok(checkout);
+  }
+
+  /** isolation: "none": the task runs in the parent workspace's checkout, without fork or init. */
+  private shareParentCheckout(
+    plan: TaskCreatePlan,
+    initLogger: InitLogger
+  ): MaterializedTaskCheckout {
+    // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead
+    // of forking. Mirrors local-runtime semantics for worktree/SSH so read-only analysis (or
+    // prompt-isolated work) skips the fork + init overhead and sees the parent's uncommitted work.
+    //
+    // SAFETY: the task still gets a unique workspace name, and workspace deletion is keyed on that
+    // name (runtime.deleteWorkspace(projectPath, name)), so removing this task never deletes the
+    // shared parent checkout. workspaceService.remove additionally skips physical deletion for
+    // tasks persisted with taskIsolation === "none".
+    const workspacePath = plan.parentWorkspacePath;
+    const trunkBranch = plan.parentBranchName ?? "main";
+    // Build the runtime with the child's identity but the parent's checkout path. Worktree/SSH
+    // runtimes honor this persisted path override (see *Runtime.getWorkspacePath), so cwd
+    // resolution and ensureReady land in the shared parent checkout instead of a name-derived
+    // directory that was never created. This mirrors the runtime rebuilt from the persisted entry.
+    const runtimeForTaskWorkspace = createRuntimeForWorkspace({
+      runtimeConfig: plan.parentRuntimeConfig,
+      projectPath: plan.parentMeta.projectPath,
+      name: plan.workspaceName,
+      namedWorkspacePath: plan.parentWorkspacePath,
+    });
+    initLogger.logStep("Sharing parent workspace (isolation: none) — skipping fork and init");
+    initLogger.logComplete(0);
+    return {
+      initLogger,
+      workspacePath,
+      trunkBranch,
+      forkedRuntimeConfig: plan.parentRuntimeConfig,
+      sourceRuntimeConfigUpdate: undefined,
+      runtimeForTaskWorkspace,
+      forkedFromSource: false,
+      inheritedProjects: plan.parentMeta.projects,
+    };
+  }
+
+  /** The orchestrateFork options for a task that forks its parent's checkout. */
+  private buildTaskForkOptions(
+    plan: TaskCreatePlan,
+    initLogger: InitLogger
+  ): Parameters<typeof orchestrateFork>[0] {
+    const { parentMeta, parentBranchName } = plan;
+    return {
+      sourceRuntime: plan.runtime,
+      projectPath: parentMeta.projectPath,
+      sourceWorkspaceName: parentMeta.name,
+      newWorkspaceName: plan.workspaceName,
+      newWorkspaceId: plan.taskId,
+      initLogger,
+      config: this.config,
+      sourceWorkspaceId: plan.parentWorkspaceId,
+      sourceRuntimeConfig: plan.parentRuntimeConfig,
+      parentMetadata: parentMeta,
+      allowCreateFallback: true,
+      // Create-fallback base when the fork cannot detect a source branch — a shared parent's
+      // synthetic name, or an auto-named worktree parent's, names no branch, so supply the
+      // actual checked-out branch. Only then: other parents keep the existing
+      // branch-discovery fallback.
+      ...(parentBranchName != null && parentBranchName !== parentMeta.name
+        ? { preferredTrunkBranch: parentBranchName }
+        : {}),
+      trusted:
+        this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
+      multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
+        EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
+      ),
+    };
+  }
+
+  /** The direct launch's config edit: appends the running task's row under its parent's project. */
+  private appendLaunchedTaskEntry(
+    config: ProjectsConfig,
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    checkout: MaterializedTaskCheckout,
+    base: Pick<WorkspaceConfigEntry, "taskBaseCommitSha" | "taskBaseCommitShaByProjectPath">
+  ): ProjectsConfig {
+    const { taskId, parentWorkspaceId, effectiveThinkingLevel, effectiveReasoningMode } = plan;
+    const { sourceRuntimeConfigUpdate } = checkout;
+    assertParentAdmitsChild(config, parentWorkspaceId, {
+      requireRow: plan.parentEntry != null,
+      legacyRow: plan.legacyParentRow,
+    });
+    if (sourceRuntimeConfigUpdate != null) {
+      const parentRow = Array.from(config.projects.values())
+        .flatMap((project) => project.workspaces)
+        .find((workspace) => workspace.id === parentWorkspaceId);
+      if (parentRow == null) {
+        throw new Error(`Workspace ${parentWorkspaceId} not found in config`);
+      }
+      parentRow.runtimeConfig = sourceRuntimeConfigUpdate;
+    }
+    let projectConfig = config.projects.get(plan.configProjectPath);
+    if (!projectConfig) {
+      projectConfig = { workspaces: [] };
+      config.projects.set(plan.configProjectPath, projectConfig);
+    }
+
+    projectConfig.workspaces.push({
+      kind: plan.parentIsScratch ? "scratch" : undefined,
+      path: checkout.workspacePath,
+      id: taskId,
+      name: plan.workspaceName,
+      title: plan.args.title,
+      createdAt: plan.createdAt,
+      runtimeConfig: checkout.forkedRuntimeConfig,
+      // New rows have no legacy plan to migrate (#5174).
+      remotePlanMigrated: true,
+      aiSettings: {
+        model: plan.canonicalModel,
+        thinkingLevel: effectiveThinkingLevel,
+        ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+      },
+      agentId: plan.agentId,
+      parentWorkspaceId,
+      agentType: plan.agentType,
+      workflowTask: plan.args.workflowTask,
+      bestOf: plan.normalizedBestOf,
+      taskStatus: "running",
+      // Direct (unqueued) launch: this write is the admission, so it stamps the attempt id the
+      // send below is fenced against (WorkspaceService binds the obligation at handoff).
+      taskAttemptId: launch.attemptId,
+      taskTrunkBranch: checkout.trunkBranch,
+      taskBaseCommitSha: base.taskBaseCommitSha,
+      taskBaseCommitShaByProjectPath: base.taskBaseCommitShaByProjectPath,
+      taskModelString: plan.taskModelString,
+      taskThinkingLevel: effectiveThinkingLevel,
+      taskAiPins: plan.taskAiPins,
+      taskOnRefusal: plan.args.onRefusal,
+      taskIsolation: plan.useSharedWorkspace ? "none" : undefined,
+      taskAttentionPolicy: plan.args.attentionPolicy,
+      taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
+      projects: checkout.inheritedProjects,
+    });
+    this.desktopInputCoordinator.assertAdmission(config, taskId);
+    return config;
   }
 
   /**
