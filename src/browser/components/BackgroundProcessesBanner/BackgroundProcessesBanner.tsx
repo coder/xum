@@ -7,9 +7,11 @@ import {
   ACTIVITY_SHORTCUT_HINT_CLASS,
   ActivityChipLiveDot,
   ChatInputDecoration,
+  shownChip,
 } from "../ChatPane/ChatInputDecoration";
 import {
   acceptsActivityPanelChord,
+  useChatActivityOverflow,
   useChatActivityPanel,
   useChatActivitySheet,
 } from "../ChatPane/chatActivityPanels";
@@ -49,11 +51,17 @@ function restoreFocus(
 }
 
 /**
- * The strip's expand/collapse control: the live line's chip, or else the row button that
- * ChatInputDecoration renders just before the list (the VS Code webview's tray).
+ * The strip's expand/collapse control: the live line's chip (the "+N" chip while the line has no
+ * room for it), or else the row button that ChatInputDecoration renders just before the list (the
+ * VS Code webview's tray).
  */
-function stripToggle(root: HTMLElement | null, list: HTMLElement | null): Element | null {
-  return root?.querySelector("[data-activity-chip]") ?? list?.previousElementSibling ?? null;
+function stripToggle(
+  root: HTMLElement | null,
+  list: HTMLElement | null,
+  overflowed: boolean
+): Element | null {
+  const chip = root?.querySelector("[data-activity-chip]") ?? null;
+  return chip === null ? (list?.previousElementSibling ?? null) : shownChip(chip, overflowed);
 }
 
 function backgroundBashNoun(count: number): string {
@@ -173,6 +181,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   // the focused element so focus never jumps into the other chat's list.
   const paneScope = useChatPaneScope();
   const sheet = useChatActivitySheet();
+  const overflowed = useChatActivityOverflow().overflow.includes("background-bashes");
   // Listens only while there is something to focus, so the chord is not consumed otherwise.
   useEffect(() => {
     if (count === 0) return;
@@ -196,7 +205,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       event.preventDefault();
       if (event.repeat) return;
       if (listRef.current?.contains(document.activeElement)) {
-        const toggle = stripToggle(rootRef.current, listRef.current);
+        const toggle = stripToggle(rootRef.current, listRef.current, overflowed);
         setIsExpanded(false);
         restoreFocus(returnFocusRef, toggle);
       } else {
@@ -217,7 +226,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, onFocusRequest);
     };
-  }, [count, props.workspaceId, paneScope, sheet, setIsExpanded]);
+  }, [count, props.workspaceId, paneScope, sheet, overflowed, setIsExpanded]);
 
   useEffect(() => {
     if (focusRequest > 0) focusProcessRow(listRef.current, 0);
@@ -261,7 +270,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     const proc = visibleProcesses[index];
     if (!row || !proc) return;
     if (matchesKeybind(event, KEYBINDS.CANCEL)) {
-      const toggle = stripToggle(rootRef.current, listRef.current);
+      const toggle = stripToggle(rootRef.current, listRef.current, overflowed);
       setIsExpanded(false);
       restoreFocus(returnFocusRef, toggle);
     } else if (matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_NEXT)) {

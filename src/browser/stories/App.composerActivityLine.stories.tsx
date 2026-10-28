@@ -7,6 +7,7 @@
  * Play-only: the Pixel snapshot budget is full, and the plays (not a snapshot) carry the behavior.
  */
 
+import type { ComponentType } from "react";
 import { expect, screen, userEvent, waitFor, within } from "storybook/test";
 
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
@@ -344,6 +345,48 @@ export const WorstCaseDesktop: AppStory = {
     await assertPanelChords(line, canvasElement);
     await assertTodoChipFollowsRewrite(line, "ws-activity-line-desktop");
     await assertPanelSurvivesTurnEnd(line, "ws-activity-line-desktop");
+  },
+};
+
+/** A chat pane as narrow as a desktop window with both sidebars open leaves it. */
+function NarrowPaneDecorator(Story: ComponentType) {
+  return (
+    <div style={{ width: 375, height: 667, overflow: "hidden" }}>
+      <Story />
+    </div>
+  );
+}
+
+// The bashes chip folds into "+N" while a turn runs. Its list, opened from the "+N" entry, closes
+// on a row's Escape or the bashes chord and hands focus to the "+N" chip: the hidden bashes chip
+// cannot take it.
+async function assertBashesFromOverflow(line: HTMLElement) {
+  const more = within(line).getByRole("button", { name: /^\d+ more$/ });
+  for (const close of ["{Escape}", "{Control>}{Shift>}J{/Shift}{/Control}"]) {
+    await userEvent.click(more);
+    const list = await within(line).findByRole("group", { name: "More activity" });
+    await userEvent.click(within(list).getByRole("button", { name: /Bashes/ }));
+    await waitFor(() =>
+      expect(document.activeElement?.closest("[data-process-row]")).not.toBeNull()
+    );
+    await userEvent.keyboard(close);
+    await waitFor(() => expect(document.querySelector("[data-activity-panel]")).toBeNull());
+    await expect(more).toHaveFocus();
+  }
+}
+
+// A desktop window: matchMedia sees its width, so the panels open as popovers above the line,
+// while the fixed-width frame narrows the line until chips fold into "+N".
+export const NarrowPaneDesktop: AppStory = {
+  render: () => <AppWithMocks setup={() => setupActivityLineStory("ws-activity-line-narrow")} />,
+  decorators: [NarrowPaneDecorator],
+  parameters: {
+    ...appMeta.parameters,
+    pixel: PIXEL_DISABLED,
+  },
+  play: async ({ canvasElement }) => {
+    const line = await findLine(canvasElement);
+    await assertBashesFromOverflow(line);
   },
 };
 

@@ -152,16 +152,12 @@ export function ActivityChipLiveDot() {
   return <span aria-hidden className="size-1.5 shrink-0 rounded-full bg-[var(--color-success)]" />;
 }
 
-/** Focus for a closing panel: its chip, or the "+N" chip while the line has no room for it. */
-function focusChip(chip: HTMLButtonElement | null, overflowed: boolean): void {
-  if (overflowed) {
-    chip
-      ?.closest("[data-activity-strip]")
-      ?.querySelector<HTMLElement>("[data-activity-overflow-chip]")
-      ?.focus();
-  } else {
-    chip?.focus();
-  }
+/** What takes focus for a chip: the chip, or the "+N" chip while the line has no room for it. */
+export function shownChip(chip: Element | null, overflowed: boolean): HTMLElement | null {
+  const target = overflowed
+    ? chip?.closest("[data-activity-strip]")?.querySelector("[data-activity-overflow-chip]")
+    : chip;
+  return target instanceof HTMLElement ? target : null;
 }
 
 const PANEL_FOCUSABLE =
@@ -265,7 +261,7 @@ function ChatActivityChip(props: ChatInputDecorationProps) {
       origin.focus();
     } else {
       // mutation-equivalent: close runs only from the chip's own handlers and listener, so the chip is mounted
-      focusChip(chipRef.current, overflowed);
+      shownChip(chipRef.current, overflowed)?.focus();
     }
   };
   useCloseChatActivityPanelOnBodyEscape(open, close);
