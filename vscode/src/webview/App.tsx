@@ -1273,8 +1273,8 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                     ) : null}
                     {/* The live line (#7689), as in the desktop dock: the turn status plus one
                         chip per kind of activity (sub-agents, background bashes), each opening
-                        its list in a panel, instead of one full-width row per kind. Between turns
-                        it shows only the chips, and it hides itself when none render. */}
+                        its list in a panel. Between turns it shows only the chips, and it hides
+                        itself when none render. */}
                     {selectedWorkspaceId && chatRevealed ? (
                       <ChatActivityPanelsProvider
                         // Keyed by connection and workspace: no open panel, bash output dialog or
