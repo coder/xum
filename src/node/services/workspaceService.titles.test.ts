@@ -1,5 +1,6 @@
 import { describe, expect, test, mock, beforeEach, afterEach, spyOn } from "bun:test";
 import type { WorkspaceService } from "./workspaceService";
+import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { NAME_GEN_PREFERRED_MODELS } from "@/common/constants/nameGeneration";
 import { DEFAULT_MODEL } from "@/common/constants/knownModels";
 import type { ThinkingLevel } from "@/common/types/thinking";
@@ -569,6 +570,7 @@ describe("WorkspaceService regenerateTitle", () => {
         "ws-regenerate-title-first-plus-last-three",
         "title-hidden-review",
         "title-budget-warning",
+        "title-attachments-row",
       ].map((id) => ({ id, name: id, path: `/tmp/proj/${id}` })),
       {
         agentAiDefaults: {
@@ -659,6 +661,35 @@ describe("WorkspaceService regenerateTitle", () => {
       expect((await workspaceService.regenerateTitle(workspaceId)).success).toBe(true);
       const call = generate.mock.calls[0];
       expect(call?.[3]).toContain(warningText);
+      expect(call?.[4]).toBe("visible follow-up request");
+    } finally {
+      generate.mockRestore();
+    }
+  });
+
+  test("the post-compaction attachments row is neither title context nor the latest request", async () => {
+    const workspaceId = "title-attachments-row";
+    const rows = [
+      createMuxMessage("objective", "user", "visible objective"),
+      createMuxMessage("answer", "assistant", "visible progress"),
+      createMuxMessage("follow-up", "user", "visible follow-up request"),
+      createMuxMessage(
+        `${POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX}1`,
+        "user",
+        "<system-update>ATTACHMENTS_SENTINEL</system-update>",
+        { synthetic: true }
+      ),
+    ];
+    for (const row of rows)
+      expect((await historyService.appendToHistory(workspaceId, row)).success).toBe(true);
+    const generate = spyOn(workspaceTitleGenerator, "generateWorkspaceIdentity").mockResolvedValue(
+      Ok({ name: "visible-title", title: "Visible title", modelUsed: "test:model" })
+    );
+    try {
+      expect((await workspaceService.regenerateTitle(workspaceId)).success).toBe(true);
+      const call = generate.mock.calls[0];
+      expect(call?.[3]).toContain("visible follow-up request");
+      expect(call?.[3]).not.toContain("ATTACHMENTS_SENTINEL");
       expect(call?.[4]).toBe("visible follow-up request");
     } finally {
       generate.mockRestore();

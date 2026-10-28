@@ -1,4 +1,8 @@
-import { isSyntheticSnapshotUserMessage, type MuxMessage } from "@/common/types/message";
+import {
+  isPostCompactionAttachmentsMessage,
+  isSyntheticSnapshotUserMessage,
+  type MuxMessage,
+} from "@/common/types/message";
 import assert from "@/common/utils/assert";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import {
@@ -27,6 +31,16 @@ export interface RollingCut {
   headTokens: number;
   tailTokens: number;
   stepCut?: { messageId: string; partIndex: number; firstTailToolCallId?: string };
+}
+
+// A synthetic snapshot joins the prompt after it, and the post-compaction attachments row follows
+// its turn's prompt: neither starts a turn.
+function startsTurn(row: MuxMessage): boolean {
+  return (
+    row.role === "user" &&
+    !isSyntheticSnapshotUserMessage(row) &&
+    !isPostCompactionAttachmentsMessage(row)
+  );
 }
 
 function exactStepStarts(indices: readonly number[] | undefined, partCount: number): number[] {
@@ -118,7 +132,7 @@ export function selectRollingCut(
 
   for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
     const row = rows[rowIndex];
-    if (row.role === "user" && !isSyntheticSnapshotUserMessage(row)) {
+    if (startsTurn(row)) {
       userIndex = rowIndex;
       clusterStart = rowIndex;
       while (clusterStart > 0 && isSyntheticSnapshotUserMessage(rows[clusterStart - 1])) {

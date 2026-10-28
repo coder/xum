@@ -9,6 +9,7 @@ import * as path from "node:path";
 import { MockLanguageModelV3, simulateReadableStream } from "ai/test";
 import type { LanguageModelV3CallOptions, LanguageModelV3StreamPart } from "@ai-sdk/provider";
 
+import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { EXPERIMENT_IDS, type ExperimentId } from "@/common/constants/experiments";
 import type { ProviderName } from "@/common/constants/providers";
 import { WORDS_TO_TOKENS_RATIO } from "@/common/constants/ui";
@@ -468,6 +469,35 @@ describe("maybeAppendAbandonedBranchSummary", () => {
             }
           ),
         ],
+      });
+      expect(result).toBeNull();
+      expect(calls).toBe(0);
+    } finally {
+      await cleanup();
+    }
+  });
+
+  test("a post-compaction attachments row is not abandoned work", async () => {
+    const attachments = createMuxMessage(
+      `${POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX}1`,
+      "user",
+      "carried plan ".repeat(BRANCH_SUMMARY_MIN_SEGMENT_TOKENS * 3),
+      { synthetic: true }
+    );
+    expect(buildAbandonedBranchTranscript([attachments])).toBe("");
+    const { historyService, cleanup } = await createTestHistoryService();
+    let calls = 0;
+    try {
+      const result = await maybeAppendAbandonedBranchSummary({
+        historyService,
+        workspaceId: "attachments-row-budget",
+        isExperimentEnabled: RLM_ON,
+        aiService: fakeAiService(
+          summaryModel("summary", () => {
+            calls++;
+          })
+        ),
+        abandonedMessages: [createMuxMessage("visible", "user", "tiny visible turn"), attachments],
       });
       expect(result).toBeNull();
       expect(calls).toBe(0);

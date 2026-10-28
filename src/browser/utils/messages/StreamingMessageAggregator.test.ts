@@ -1,5 +1,6 @@
 import type { MCPToolCallDisplay } from "@/common/types/mcp";
 import { describe, test, expect } from "bun:test";
+import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { CONTEXT_BOUNDARY_KINDS } from "@/common/constants/contextBoundary";
 import { MuxMessageSchema } from "@/common/orpc/schemas/message";
 import { createMuxMessage, type DisplayedMessage } from "@/common/types/message";
@@ -3445,7 +3446,8 @@ describe("StreamingMessageAggregator", () => {
       expect(aggregator.isCompacting()).toBe(false);
     });
 
-    test("suppresses response notifications for default post-compaction Continue resumes", () => {
+    // The backend stores the post-compaction attachments row after the follow-up row.
+    test.each([false, true])("mutes default Continue resumes (attachments row: %p)", (withRow) => {
       const workspaceId = "test-workspace-default-continue-notify";
       const aggregator = new StreamingMessageAggregator(TEST_CREATED_AT, workspaceId);
       let completion: Parameters<typeof shouldNotifyOnResponseComplete>[0];
@@ -3478,6 +3480,17 @@ describe("StreamingMessageAggregator", () => {
         }),
         type: "message",
       });
+      if (withRow) {
+        aggregator.handleMessage({
+          ...createMuxMessage(
+            `${POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX}1`,
+            "user",
+            "<system-update>plan</system-update>",
+            { historySequence: 3, timestamp: Date.now(), synthetic: true }
+          ),
+          type: "message",
+        });
+      }
 
       aggregator.handleStreamStart({
         type: "stream-start",

@@ -9540,11 +9540,13 @@ export class AgentSession {
   /**
    * An edit cuts from its prompt, so it also cuts an attachments row stored after that prompt.
    * The snapshot was acknowledged and no later turn writes the row again: put the row back
-   * before the edited prompt. An edit that cut a context boundary also cut the row's window.
+   * before the edited prompt. Only rows before the first cut context boundary belong to the
+   * window the edit keeps; later rows belong to windows the edit cut.
    */
   private async restorePostCompactionRowAfterEdit(removed: readonly MuxMessage[]): Promise<void> {
-    if (removed.some(isDurableContextBoundaryMarker)) return;
-    const row = removed.findLast(isPostCompactionAttachmentsMessage);
+    const boundaryIndex = removed.findIndex(isDurableContextBoundaryMarker);
+    const keptWindowRows = boundaryIndex === -1 ? removed : removed.slice(0, boundaryIndex);
+    const row = keptWindowRows.findLast(isPostCompactionAttachmentsMessage);
     if (row == null) return;
     const { historySequence: _sequence, ...metadata } = row.metadata ?? {};
     const restored: MuxMessage = { ...row, metadata };

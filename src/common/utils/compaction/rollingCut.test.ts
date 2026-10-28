@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { selectRollingCut, type RollingCutBudget } from "./rollingCut";
@@ -97,6 +98,18 @@ describe("selectRollingCut", () => {
     const cut = selectRollingCut(rows, null, budget);
     expect(cut?.head).toEqual(rows.slice(0, 4));
     expect(cut?.tail).toEqual(rows.slice(4));
+  });
+
+  test("duplicates the prompt, not the post-compaction attachments row after it", () => {
+    const attachments: MuxMessage = {
+      ...message(`${POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX}1`, "user", 100),
+      metadata: { synthetic: true },
+    };
+    const rows = [...oldHead(), message("user", "user", 100), attachments, steppedAnswer(18_000)];
+    const cut = selectRollingCut(rows, null, budget);
+    expect(cut?.stepCut?.partIndex).toBe(1);
+    expect(cut?.tail.slice(0, 1)).toEqual(rows.slice(2, 3));
+    expect(cut?.tail).not.toContain(attachments);
   });
 
   test("splits consecutive tool-only steps only at recorded boundaries and duplicates the user cluster", () => {

@@ -627,10 +627,15 @@ describe("AgentSession post-compaction context retry", () => {
 
   /**
    * Run a first turn after a compaction (it sends and acknowledges the attachments row), then
-   * edit `editMessageId`. History: user-0, compaction boundary, user-1, row, reply.
+   * edit `editMessageId`. History: user-0, compaction boundary, user-1, row, reply, and with
+   * `laterWindow` one more compaction boundary.
    * @returns the attachments row IDs that the first turn and the edit turn sent
    */
-  async function editAfterAttachmentsTurn(workspaceId: string, editMessageId: string) {
+  async function editAfterAttachmentsTurn(
+    workspaceId: string,
+    editMessageId: string,
+    laterWindow = false
+  ) {
     const model = "openai:gpt-4o";
     const firstCompletion = Promise.withResolvers<Awaited<TurnStreamHandle["completion"]>>();
     const streamMessage = mock((..._args: unknown[]) =>
@@ -673,6 +678,9 @@ describe("AgentSession post-compaction context retry", () => {
         },
       });
       await policy.value;
+      if (laterWindow) {
+        await publishEditWindow(h, workspaceId, "b", model);
+      }
 
       const edited = await h.session.sendMessage("edited", {
         model,
@@ -698,6 +706,12 @@ describe("AgentSession post-compaction context retry", () => {
     const sent = await editAfterAttachmentsTurn("ws-edit-keeps-row", "user-1");
     expect(sent.first).toHaveLength(1);
     expect(sent.edit).toEqual(sent.first);
+  });
+
+  test("an edit that also cuts a later compaction boundary keeps the row", async () => {
+    const sent = await editAfterAttachmentsTurn("ws-edit-later-boundary", "user-1", true);
+    expect(sent.first).toHaveLength(1);
+    expect(sent.edit).toContain(sent.first[0]);
   });
 
   test("an edit before the compaction boundary drops the row with its window", async () => {

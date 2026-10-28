@@ -12,6 +12,7 @@ import {
   getMcpPromptReferenceKey,
   isCompactionSummaryMetadata,
   isContextBudgetWarningMessage,
+  isPostCompactionAttachmentsMessage,
   sanitizeAgentSkillRefs,
   sanitizeMcpPromptRefs,
 } from "@/common/types/message";
@@ -177,6 +178,12 @@ function startsUserTurn(message: MuxMessage): boolean {
     !isContextBudgetWarningMessage(message) &&
     !isDisplayOnlyCompletedSubagentReport(message)
   );
+}
+
+// A hidden plan-review record can sit between the compaction summary and its follow-up row, and
+// the post-compaction attachments row lands after the follow-up row.
+function isPostCompactionHiddenRow(message: MuxMessage): boolean {
+  return isPlanReviewRecordMessage(message) || isPostCompactionAttachmentsMessage(message);
 }
 
 // Maximum number of messages to display in the DOM for performance
@@ -1863,8 +1870,7 @@ export class StreamingMessageAggregator {
   }
 
   private isDefaultPostCompactionContinueTurn(): boolean {
-    // A hidden plan-review record can sit between the summary and its follow-up row.
-    const messages = this.getAllMessages().filter((message) => !isPlanReviewRecordMessage(message));
+    const messages = this.getAllMessages().filter((message) => !isPostCompactionHiddenRow(message));
     const latestMessage = messages.at(-1);
     const previousMessage = messages.at(-2);
     if (latestMessage?.role !== "user" || previousMessage?.role !== "assistant") {
