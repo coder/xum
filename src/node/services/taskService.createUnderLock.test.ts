@@ -3,6 +3,9 @@
 // the other suites do not reach: they pin today's behavior before that method is split into steps.
 import { describe, test, expect, mock, spyOn, beforeEach, afterEach } from "bun:test";
 import assert from "node:assert";
+import { existsSync } from "node:fs";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import type { Config, Workspace as WorkspaceConfigEntry } from "@/node/config";
 import type { TaskService } from "@/node/services/taskService";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -50,15 +53,35 @@ function workspaceIds(config: Config): string[] {
 describe("TaskService.create paths before the split", () => {
   let rootDir: string;
   let config: Config;
+  // The background inits that launches started. The host mocks' registerExternalBackgroundInit
+  // is a no-op, so nothing else waits for them: an init still running its shell probes under
+  // rootDir would race the root's removal or a later test.
+  let backgroundInits: Array<Promise<void>>;
   beforeEach(async () => {
     rootDir = await createTaskServiceTestRoot();
     config = await createTestConfig(rootDir);
     stubStableIds(config, [TASK_ID], "bbbbbbbbbb");
+    backgroundInits = [];
   });
   afterEach(async () => {
+    await settleBackgroundInits();
     mock.restore();
     await removeTaskServiceTestRoot(rootDir);
   });
+
+  /** Records every background init the host is asked to register. */
+  function captureBackgroundInits(host: ReturnType<typeof createWorkspaceServiceMocks>) {
+    spyOn(host.workspaceService, "registerExternalBackgroundInit").mockImplementation(
+      (_workspaceId: string, _controller: AbortController, settlement: Promise<void>) => {
+        backgroundInits.push(settlement);
+      }
+    );
+  }
+
+  /** Waits until every background init started so far has settled. */
+  async function settleBackgroundInits() {
+    await Promise.all(backgroundInits.splice(0));
+  }
 
   /** A local parent plus a TaskService whose host records sends. */
   async function setup(
@@ -68,6 +91,7 @@ describe("TaskService.create paths before the split", () => {
   ) {
     const parent = await saveLocalParentWorkspace(config, rootDir, options);
     const host = options.workspaceService ?? createWorkspaceServiceMocks();
+    captureBackgroundInits(host);
     const { taskService } = createTaskServiceHarness(config, {
       workspaceService: host.workspaceService,
     });
@@ -109,6 +133,7 @@ describe("TaskService.create paths before the split", () => {
       }),
     });
     const host = createWorkspaceServiceMocks();
+    captureBackgroundInits(host);
     const { taskService } = createTaskServiceHarness(config, {
       aiService,
       workspaceService: host.workspaceService,
@@ -380,34 +405,22 @@ describe("TaskService.create paths before the split", () => {
 
   // The built-in explore agent's definition sets subagent.skip_init_hook: true; exec's does not.
   test.each([
-    ["explore", true],
-    ["exec", false],
+    ["explore", false],
+    ["exec", true],
   ] as const)(
-    "a launched %s task's init skips the repo init hook: %p",
-    async (agentType, skipsHook) => {
-      const { parentId } = await saveLocalParentWorkspace(config, rootDir);
-      const host = createWorkspaceServiceMocks();
-      const { taskService, initStateManager } = createTaskServiceHarness(config, {
-        workspaceService: host.workspaceService,
-      });
-      // Every init output line, with the workspace it belongs to.
-      const appendOutput = spyOn(initStateManager, "appendOutput");
-      const inits: Array<Promise<void>> = [];
-      spyOn(host.workspaceService, "registerExternalBackgroundInit").mockImplementation(
-        (_workspaceId: string, _controller: AbortController, settlement: Promise<void>) => {
-          inits.push(settlement);
-        }
-      );
+    "a launched %s task runs the project's init hook: %p",
+    async (agentType, runsHook) => {
+      const { parentId, projectPath, taskService } = await setup();
+      const marker = path.join(rootDir, "init-hook-ran");
+      await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+      const hookPath = path.join(projectPath, ".xum", "init");
+      await fs.writeFile(hookPath, `#!/usr/bin/env bash\necho ran > ${JSON.stringify(marker)}\n`);
+      await fs.chmod(hookPath, 0o755);
       const created = await createAgentTask(taskService, parentId, "go", { agentType });
       expect(created.success && created.data.status).toBe("running");
-      expect(inits).toHaveLength(1);
-      await inits[0];
-      const taskSteps = appendOutput.mock.calls
-        .filter(([workspaceId]) => workspaceId === TASK_ID)
-        .map(([, line]) => line);
-      expect(taskSteps.includes("Skipping .xum/init hook (disabled for this task)")).toBe(
-        skipsHook
-      );
+      expect(backgroundInits).toHaveLength(1);
+      await settleBackgroundInits();
+      expect(existsSync(marker)).toBe(runsHook);
     }
   );
 });
