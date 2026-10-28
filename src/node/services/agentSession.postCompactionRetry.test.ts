@@ -5,6 +5,7 @@ import * as path from "path";
 
 import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { Err } from "@/common/types/result";
+import assert from "@/common/utils/assert";
 
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
@@ -39,6 +40,47 @@ function createPersistedPostCompactionState(options: {
   };
 
   return fsPromises.writeFile(options.filePath, JSON.stringify(payload));
+}
+
+/** Publish a continuous compaction boundary for a window that edited `/<id>.ts`. */
+async function publishEditWindow(
+  h: Awaited<ReturnType<typeof createAgentSessionHarness>>,
+  workspaceId: string,
+  id: string,
+  model: string
+): Promise<void> {
+  const handler = (
+    h.session as unknown as { contextController: { compactionHandler: CompactionHandler } }
+  ).contextController.compactionHandler;
+  const edit = createMuxMessage(id, "assistant", "");
+  edit.parts = [
+    {
+      type: "dynamic-tool",
+      toolCallId: id,
+      toolName: "file_edit_replace_string",
+      state: "output-available",
+      input: { path: `/${id}.ts` },
+      output: { success: true, diff: `change ${id}` },
+    },
+  ];
+  const published = await handler.persistContinuousCompaction({
+    preparation: handler.beginPreparation(() => true),
+    publication: {
+      generation: await h.historyService
+        .getContinuousCompactionJournal(workspaceId)
+        .captureGeneration(),
+    },
+    attachmentMessages: [edit],
+    messages: [edit],
+    boundaryMessageId: id,
+    text: `${id} summary`,
+    model,
+    tail: [],
+    systemMessageTokens: 0,
+    attachmentTokens: 0,
+    shouldPersist: () => true,
+  });
+  expect(published).toBe(true);
 }
 
 describe("AgentSession post-compaction context retry", () => {
@@ -475,42 +517,7 @@ describe("AgentSession post-compaction context retry", () => {
       onTurnSettled: () => settled.resolve(),
       aiServiceOverrides: { streamMessage },
     });
-    const handler = (
-      h.session as unknown as {
-        contextController: { compactionHandler: CompactionHandler };
-      }
-    ).contextController.compactionHandler;
-    async function publish(id: string) {
-      const edit = createMuxMessage(id, "assistant", "");
-      edit.parts = [
-        {
-          type: "dynamic-tool",
-          toolCallId: id,
-          toolName: "file_edit_replace_string",
-          state: "output-available",
-          input: { path: `/${id}.ts` },
-          output: { success: true, diff: `change ${id}` },
-        },
-      ];
-      const published = await handler.persistContinuousCompaction({
-        preparation: handler.beginPreparation(() => true),
-        publication: {
-          generation: await h.historyService
-            .getContinuousCompactionJournal(workspaceId)
-            .captureGeneration(),
-        },
-        attachmentMessages: [edit],
-        messages: [edit],
-        boundaryMessageId: id,
-        text: `${id} summary`,
-        model,
-        tail: [],
-        systemMessageTokens: 0,
-        attachmentTokens: 0,
-        shouldPersist: () => true,
-      });
-      expect(published).toBe(true);
-    }
+    const publish = (id: string) => publishEditWindow(h, workspaceId, id, model);
     // Publication B lands after the first turn read snapshot A and before it appends A's row.
     let publishedB = false;
     const reports = spyOn(AttachmentService, "generateCompletedReportsAttachment");
@@ -548,6 +555,90 @@ describe("AgentSession post-compaction context retry", () => {
     } finally {
       reports.mockRestore();
       firstCompletion.resolve({ status: "aborted", abortReason: "user" });
+      await h.cleanup();
+    }
+  });
+
+  // A turn that reuses a failed turn's row must not acknowledge a snapshot published after its
+  // history read: that row carries the older snapshot, so the newer diffs would never be sent.
+  test("a publication before a turn reuses its row keeps the new snapshot pending", async () => {
+    const workspaceId = "ws-publication-reuse-race";
+    const model = "openai:gpt-4o";
+    const secondCompletion = Promise.withResolvers<Awaited<TurnStreamHandle["completion"]>>();
+    const streamMessage = mock((..._args: unknown[]) => {
+      const call = streamMessage.mock.calls.length;
+      if (call === 1) {
+        return Promise.resolve({
+          success: false as const,
+          error: { type: "unknown" as const, raw: "startup failed before stream" },
+        });
+      }
+      return Promise.resolve({
+        success: true as const,
+        data:
+          call === 2
+            ? { messageId: "assistant-second", completion: secondCompletion.promise }
+            : createStartedTurnHandle(h.session.closingSignal, "assistant-next"),
+      });
+    });
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: { streamMessage },
+    });
+    const session = h.session as unknown as {
+      coordinator: { consumeCompletion: (...args: never[]) => Promise<void> };
+      getPostCompactionAttachmentsIfNeeded: (includeReadFiles: boolean) => Promise<unknown>;
+    };
+    const publish = (id: string) => publishEditWindow(h, workspaceId, id, model);
+    // Publication B lands after the second turn read window A and before it captures the
+    // pending state, so that turn captures B while its request still holds A's row.
+    let publishB = false;
+    const captureAttachments = session.getPostCompactionAttachmentsIfNeeded.bind(session);
+    const capture = spyOn(session, "getPostCompactionAttachmentsIfNeeded");
+    const consumer = spyOn(session.coordinator, "consumeCompletion");
+    capture.mockImplementation(async (includeReadFiles) => {
+      if (publishB) {
+        publishB = false;
+        await publish("b");
+      }
+      return captureAttachments(includeReadFiles);
+    });
+    const sentRows = (call: number) =>
+      (streamMessage.mock.calls[call][0] as { messages: MuxMessage[] }).messages.filter((message) =>
+        message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX)
+      );
+    const started = { success: true as const, data: { started: true } };
+
+    try {
+      await publish("a");
+      await h.historyService.appendToHistory(workspaceId, createMuxMessage("user-1", "user", "go"));
+      await h.session.resumeStream({ model, agentId: "exec" });
+      expect(sentRows(0)).toHaveLength(1);
+
+      publishB = true;
+      expect(await h.session.resumeStream({ model, agentId: "exec" })).toEqual(started);
+      expect(publishB).toBe(false);
+      const policy = consumer.mock.results.at(-1);
+      assert(policy?.type === "return", "Expected the second turn's completion consumer");
+      secondCompletion.resolve({
+        status: "completed",
+        streamEnd: {
+          type: "stream-end",
+          workspaceId,
+          metadata: { model },
+          parts: [{ type: "text", text: "done" }],
+        },
+      });
+      await policy.value;
+
+      expect(await h.session.resumeStream({ model, agentId: "exec" })).toEqual(started);
+      const sent = sentRows(2);
+      expect(sent).toHaveLength(1);
+      expect(JSON.stringify(sent[0].parts)).toContain("/b.ts");
+    } finally {
+      capture.mockRestore();
+      consumer.mockRestore();
+      secondCompletion.resolve({ status: "aborted", abortReason: "user" });
       await h.cleanup();
     }
   });

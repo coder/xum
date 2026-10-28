@@ -9455,8 +9455,8 @@ export class AgentSession {
       this.isRlmCompactionEnabled()
     );
     if (attachments == null) return Ok(request);
-    this.activeStreamPostCompactionRow = request.messages.find(isPostCompactionAttachmentsMessage);
-    if (this.activeStreamPostCompactionRow) return Ok(request);
+    const reusableRow = request.messages.find(isPostCompactionAttachmentsMessage);
+    if (reusableRow) return this.reusePostCompactionRow(request, reusableRow);
     // Record time: wall clock until #7282 moves its consumers to HostClock.
     const row = createPostCompactionAttachmentsMessage(attachments, nodeClock.nowMs());
     if (row == null) return Ok(request);
@@ -9478,6 +9478,22 @@ export class AgentSession {
     this.activeStreamPostCompactionRow = row;
     const messages = [...request.messages, row];
     return Ok({ messages, ...readHistoryPosition(messages) });
+  }
+
+  /**
+   * Reuse a failed turn's row only while history still ends where this turn read it. A
+   * publication after the read moves the tail, and the pending state captured after it is newer
+   * than this row: acknowledging it would drop the newer attachments.
+   */
+  private async reusePostCompactionRow(
+    request: { messages: MuxMessage[] } & HistoryReadPosition,
+    row: MuxMessage
+  ): Promise<Result<{ messages: MuxMessage[] } & HistoryReadPosition>> {
+    const tail = await this.historyService.getLastMessages(this.workspaceId, 1);
+    if (!tail.success) return Err(tail.error);
+    if (tail.data.at(-1)?.id === request.historyTailId) this.activeStreamPostCompactionRow = row;
+    else this.pendingPostCompactionStateToAcknowledge = null;
+    return Ok(request);
   }
 
   /**
