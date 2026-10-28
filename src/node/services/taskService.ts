@@ -1460,10 +1460,18 @@ interface PeerSendAttempt {
   accepted: boolean;
 }
 
-/** What a peer send hands to the target's turn admission. */
-interface PeerSendDispatch {
+/** A prepared peer message: the untrusted envelope for the payload row and the fixed trigger. */
+interface PeerSendEnvelope {
+  readonly envelope: string;
+  readonly payloadMessageId: string;
   readonly trigger: string;
-  readonly payloadRow: MuxMessage;
+  readonly muxMetadata: MuxMessageMetadata;
+  readonly peerTriggerMeta: AgentPeerMessageMeta;
+}
+
+/** The prepared message plus the delegated-turn correlation its trigger carries, if any. */
+interface PeerSendTurn extends PeerSendEnvelope {
+  readonly triggerMuxMetadata: MuxMessageMetadata;
   readonly workspaceTurnMuxMetadata: Awaited<
     ReturnType<WorkspaceTurnManager["getActiveWorkspaceTurnMuxMetadataForWorkspace"]>
   >;
@@ -9836,188 +9844,250 @@ export class TaskService implements AgentTaskIntegration {
         firstAttempt: awaitedDelegatedTurn == null,
       };
 
-      // A known missing checkout (#4305), e.g. a worktree archived with checkout deletion and then
-      // unarchived: refuse before any envelope row is persisted, instead of
-      // accepting the message and failing later with runtime_not_ready. One probe of this target,
-      // never in instance discovery. Same-tree targets are probed too (#4824). An unrelated
-      // sender is untrusted, so its reason is fixed and carries no path or runtime detail; a
-      // same-tree sender gets the readiness error. A checkout deleted after this probe still
-      // hits the runtime gate. Probed after the stop epochs are captured: this await is a
-      // suspension point, and admissionStale() must still see a Stop that lands while it is
-      // pending.
-      const checkoutError = await getMissingHostLocalCheckoutError(targetEntry);
-      if (checkoutError != null) {
-        return Err({
-          code: "refused" as const,
-          reason: OPAQUE_CHECKOUT_RELATIONS.has(relation)
-            ? "The target workspace's checkout is unavailable, so it cannot receive messages."
-            : `The target workspace's checkout is unavailable (${checkoutError}), so it cannot receive messages.`,
-        });
-      }
-
-      // A retry after a delegated turn was already admitted and counted once.
-      const throttleError =
-        awaitedDelegatedTurn == null
-          ? this.agentPeerMessageBroker.checkPeerAdmission(senderWorkspaceId, targetId, message)
-          : null;
-      if (throttleError != null) {
-        return Err(throttleError);
-      }
-      // Charge the rate slot at admission, like the family route: sendMessage can persist the
-      // payload row and still report failure, and charging only successes let a failing loop
-      // land a payload per call without limit. A retry was charged when it was first admitted.
-      // A send refused after this point (the admission probe sees a stop, an archive or a consent
-      // change, or park() refuses after a user Stop) keeps its slot too. That is intended (#5334): it matches the
-      // family route, and a refund would have to tell a clean refusal apart from a failure that
-      // already persisted rows, which is the case the charge exists for.
-      if (awaitedDelegatedTurn == null) {
-        this.agentPeerMessageBroker.recordPeerAttempt(senderWorkspaceId, targetId);
-      }
-
-      const rawSenderTitle =
-        coerceNonEmptyString(senderEntry.workspace.title) ??
-        coerceNonEmptyString(senderEntry.workspace.name);
-      const {
-        envelope,
-        fromTitle: senderTitle,
-        payloadMessageId,
-        relationship,
-        trigger,
-      } = this.agentPeerMessageBroker.preparePeerMessage({
-        senderWorkspaceId,
-        senderTitle: rawSenderTitle,
-        relation,
-        message,
-      });
-      const muxMetadata: MuxMessageMetadata = {
-        type: "agent-peer-message",
-        fromWorkspaceId: senderWorkspaceId,
-        ...(senderTitle != null ? { fromTitle: senderTitle } : {}),
-        relationship,
-      };
-      // Bare attribution (no discriminator) — carried on workspace-turn correlated triggers so
-      // correlation stripping can downgrade the row to plain peer metadata (see message.ts).
-      // payloadMessageId lets the transcript fold the trigger into the payload card.
-      const peerTriggerMeta: AgentPeerMessageMeta = {
-        fromWorkspaceId: senderWorkspaceId,
-        ...(senderTitle != null ? { fromTitle: senderTitle } : {}),
-        relationship,
-        payloadMessageId,
-      };
-      // SECURITY: same assistant-row/fixed-trigger separation as the family-message paths above —
-      // sending the envelope as the message TEXT persisted it as a USER row, promoting
-      // prompt-injected peer output to user-priority input in the target (user turns drive
-      // bash/file tools under the target's own policy). The envelope rides as an assistant-role
-      // pre-turn row instead, and the turn is triggered by a fixed-content user message with
-      // ZERO sender-controlled bytes (workspace IDs are server-generated; the capped title stays
-      // inside the untrusted envelope row). The trigger names the payload row by its
-      // server-generated message ID, not adjacency — a streaming target's own assistant row can
-      // land between payload and queued trigger.
-
-      // Delegated-turn correlation: if the target is currently executing a delegated workspace
-      // turn, the trigger must carry that correlation (like wakeParentWorkspaceWithSynthetic-
-      // Message) — otherwise the queued peer wake dispatches as an unrelated turn and the next
-      // stream end settles the owner's delegated turn as interrupted/superseded. Peer
-      // attribution stays on the assistant payload row, so no provenance is lost; the queue
-      // still counts these entries by their dedupe-key prefix.
-      // A retry after a delegated turn never carries a correlation (#4997).
-      const resolvedTurnMuxMetadata =
-        awaitedDelegatedTurn == null
-          ? await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
-              targetId,
-              { requireAcceptedRegistration: true }
-            )
-          : undefined;
-      // Only its owner continues a root's delegated turn (#4997): a non-owner's message waits for
-      // it, so it never needs the correlation, and must not carry it if the turn settles before
-      // the admission gates look again. Reawakened agent-task children are continued
-      // by any peer.
-      const workspaceTurnMuxMetadata =
-        targetIsAgentTask || resolvedTurnMuxMetadata?.ownerWorkspaceId === senderWorkspaceId
-          ? resolvedTurnMuxMetadata
-          : undefined;
-      attempt.delegatedTurnCorrelation = workspaceTurnMuxMetadata;
-      // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
-      // renders machine notifications from metadata, so a bare workspace-turn replacement would
-      // present the backend trigger as a human prompt (and re-enter prompt navigation).
-      const triggerMuxMetadata: MuxMessageMetadata =
-        workspaceTurnMuxMetadata != null
-          ? { ...workspaceTurnMuxMetadata, agentPeerMessageTrigger: peerTriggerMeta }
-          : { type: "agent-peer-message", ...peerTriggerMeta };
-
-      let sendOptions: SendMessageOptions;
-      if (relation === "target_ancestor" && awaitedDelegatedTurn == null) {
-        const resumeOptions = await this.resolveParentAutoResumeOptions(
-          targetId,
-          targetEntry,
-          defaultModel
-        );
-        sendOptions = {
-          model: resumeOptions.model,
-          agentId: resumeOptions.agentId,
-          thinkingLevel: resumeOptions.thinkingLevel,
-          reasoningMode: resumeOptions.reasoningMode,
-          serviceTier: resumeOptions.serviceTier,
-          muxMetadata: triggerMuxMetadata,
-        };
-      } else if (!targetIsAgentTask || awaitedDelegatedTurn != null) {
-        assert(!targetIsAgentTask);
-        // Honor the recipient's selected identity (including plan), not the sender's or an
-        // older history row. Without a selection, the shared history → exec fallback applies.
-        // Known tradeoff: the owner's continuation of its delegated turn also uses these
-        // persisted settings, not its per-turn agent override (handle records do not store it).
-        // A retry after a delegated turn never falls back to history, whose newest agent is that
-        // turn's override: it takes the recipient's saved agent or the workspace default.
-        const persistedAgentId =
-          awaitedDelegatedTurn != null
-            ? resolvePersistedAgentId(targetEntry.workspace)
-            : resolvePersistedAgentIdCandidates(targetEntry.workspace)[0];
-        const resumeOptions = await this.resolveParentAutoResumeOptions(
-          targetId,
-          targetEntry,
-          defaultModel,
-          persistedAgentId ? { agentId: persistedAgentId } : undefined
-        );
-        sendOptions = {
-          ...resumeOptions,
-          muxMetadata: triggerMuxMetadata,
-        };
-      } else {
-        const activeAgentId = resolveTaskAgentIdForResume(targetEntry.workspace);
-        const activeAiSettings = this.resolveWorkspaceAISettings(
-          targetEntry.workspace,
-          activeAgentId
-        );
-        sendOptions = {
-          model:
-            coerceNonEmptyString(activeAiSettings?.model) ??
-            targetEntry.workspace.taskModelString ??
-            defaultModel,
-          agentId: activeAgentId,
-          thinkingLevel: activeAiSettings?.thinkingLevel ?? targetEntry.workspace.taskThinkingLevel,
-          reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
-          serviceTier: ServiceTierSchema.safeParse(activeAiSettings?.serviceTier).data,
-          muxMetadata: triggerMuxMetadata,
-        };
-      }
-
-      // The envelope rides as an assistant-role pre-turn row (never a user turn), persisted
-      // atomically with the trigger through the target's own turn admission — a direct history
-      // append could land inside another turn's PREPARING window.
-      const payloadRow = createMuxMessage(payloadMessageId, "assistant", envelope, {
-        timestamp: Date.now(),
-        synthetic: true,
-        uiVisible: true,
-        muxMetadata,
-      });
-
-      return this.dispatchPeerSend(
-        admission,
-        attempt,
-        { trigger, payloadRow, workspaceTurnMuxMetadata },
-        sendOptions
-      );
+      return this.checkPeerTargetCheckout(admission, attempt);
     });
+  }
+
+  /**
+   * A known missing checkout (#4305), e.g. a worktree archived with checkout deletion and then
+   * unarchived: refuse before any envelope row is persisted, instead of
+   * accepting the message and failing later with runtime_not_ready. One probe of this target,
+   * never in instance discovery. Same-tree targets are probed too (#4824). An unrelated
+   * sender is untrusted, so its reason is fixed and carries no path or runtime detail; a
+   * same-tree sender gets the readiness error. A checkout deleted after this probe still
+   * hits the runtime gate. Probed after the stop epochs are captured: this await is a
+   * suspension point, and admissionStale() must still see a Stop that lands while it is
+   * pending.
+   */
+  private async checkPeerTargetCheckout(
+    admission: PeerSendAdmission,
+    attempt: PeerSendAttempt
+  ): Promise<PeerSendResult> {
+    const checkoutError = await getMissingHostLocalCheckoutError(admission.targetEntry);
+    if (checkoutError != null) {
+      return Err({
+        code: "refused" as const,
+        reason: OPAQUE_CHECKOUT_RELATIONS.has(admission.relation)
+          ? "The target workspace's checkout is unavailable, so it cannot receive messages."
+          : `The target workspace's checkout is unavailable (${checkoutError}), so it cannot receive messages.`,
+      });
+    }
+
+    const throttleError = this.chargePeerSendAttempt(admission);
+    if (throttleError != null) {
+      return Err(throttleError);
+    }
+    return this.resolvePeerTurnMetadata(
+      admission,
+      attempt,
+      this.preparePeerSendEnvelope(admission)
+    );
+  }
+
+  /** Checks the peer throttles and charges the rate slot of a first attempt. */
+  private chargePeerSendAttempt(
+    admission: PeerSendAdmission
+  ): AgentPeerMessageAdmissionError | null {
+    const { senderWorkspaceId, targetId, message, awaitedDelegatedTurn } = admission;
+    // A retry after a delegated turn was already admitted and counted once.
+    const throttleError =
+      awaitedDelegatedTurn == null
+        ? this.agentPeerMessageBroker.checkPeerAdmission(senderWorkspaceId, targetId, message)
+        : null;
+    if (throttleError != null) {
+      return throttleError;
+    }
+    // Charge the rate slot at admission, like the family route: sendMessage can persist the
+    // payload row and still report failure, and charging only successes let a failing loop
+    // land a payload per call without limit. A retry was charged when it was first admitted.
+    // A send refused after this point (the admission probe sees a stop, an archive or a consent
+    // change, or park() refuses after a user Stop) keeps its slot too. That is intended (#5334): it matches the
+    // family route, and a refund would have to tell a clean refusal apart from a failure that
+    // already persisted rows, which is the case the charge exists for.
+    if (awaitedDelegatedTurn == null) {
+      this.agentPeerMessageBroker.recordPeerAttempt(senderWorkspaceId, targetId);
+    }
+    return null;
+  }
+
+  /** Builds the peer envelope, its payload row metadata and the trigger's attribution. */
+  private preparePeerSendEnvelope(admission: PeerSendAdmission): PeerSendEnvelope {
+    const { senderWorkspaceId, senderEntry, relation, message } = admission;
+    const rawSenderTitle =
+      coerceNonEmptyString(senderEntry.workspace.title) ??
+      coerceNonEmptyString(senderEntry.workspace.name);
+    const {
+      envelope,
+      fromTitle: senderTitle,
+      payloadMessageId,
+      relationship,
+      trigger,
+    } = this.agentPeerMessageBroker.preparePeerMessage({
+      senderWorkspaceId,
+      senderTitle: rawSenderTitle,
+      relation,
+      message,
+    });
+    const muxMetadata: MuxMessageMetadata = {
+      type: "agent-peer-message",
+      fromWorkspaceId: senderWorkspaceId,
+      ...(senderTitle != null ? { fromTitle: senderTitle } : {}),
+      relationship,
+    };
+    // Bare attribution (no discriminator) — carried on workspace-turn correlated triggers so
+    // correlation stripping can downgrade the row to plain peer metadata (see message.ts).
+    // payloadMessageId lets the transcript fold the trigger into the payload card.
+    const peerTriggerMeta: AgentPeerMessageMeta = {
+      fromWorkspaceId: senderWorkspaceId,
+      ...(senderTitle != null ? { fromTitle: senderTitle } : {}),
+      relationship,
+      payloadMessageId,
+    };
+    // SECURITY: same assistant-row/fixed-trigger separation as the family-message paths above —
+    // sending the envelope as the message TEXT persisted it as a USER row, promoting
+    // prompt-injected peer output to user-priority input in the target (user turns drive
+    // bash/file tools under the target's own policy). The envelope rides as an assistant-role
+    // pre-turn row instead, and the turn is triggered by a fixed-content user message with
+    // ZERO sender-controlled bytes (workspace IDs are server-generated; the capped title stays
+    // inside the untrusted envelope row). The trigger names the payload row by its
+    // server-generated message ID, not adjacency — a streaming target's own assistant row can
+    // land between payload and queued trigger.
+    return { envelope, payloadMessageId, trigger, muxMetadata, peerTriggerMeta };
+  }
+
+  /**
+   * Delegated-turn correlation: if the target is currently executing a delegated workspace
+   * turn, the trigger must carry that correlation (like wakeParentWorkspaceWithSynthetic-
+   * Message) — otherwise the queued peer wake dispatches as an unrelated turn and the next
+   * stream end settles the owner's delegated turn as interrupted/superseded. Peer
+   * attribution stays on the assistant payload row, so no provenance is lost; the queue
+   * still counts these entries by their dedupe-key prefix.
+   * A retry after a delegated turn never carries a correlation (#4997).
+   */
+  private async resolvePeerTurnMetadata(
+    admission: PeerSendAdmission,
+    attempt: PeerSendAttempt,
+    prepared: PeerSendEnvelope
+  ): Promise<PeerSendResult> {
+    const { senderWorkspaceId, targetId, awaitedDelegatedTurn, targetIsAgentTask } = admission;
+    const resolvedTurnMuxMetadata =
+      awaitedDelegatedTurn == null
+        ? await this.getWorkspaceTurnManager().getActiveWorkspaceTurnMuxMetadataForWorkspace(
+            targetId,
+            { requireAcceptedRegistration: true }
+          )
+        : undefined;
+    // Only its owner continues a root's delegated turn (#4997): a non-owner's message waits for
+    // it, so it never needs the correlation, and must not carry it if the turn settles before
+    // the admission gates look again. Reawakened agent-task children are continued
+    // by any peer.
+    const workspaceTurnMuxMetadata =
+      targetIsAgentTask || resolvedTurnMuxMetadata?.ownerWorkspaceId === senderWorkspaceId
+        ? resolvedTurnMuxMetadata
+        : undefined;
+    attempt.delegatedTurnCorrelation = workspaceTurnMuxMetadata;
+    // Keep the explicit trigger marker alongside the correlation: displayedMessageBuilder
+    // renders machine notifications from metadata, so a bare workspace-turn replacement would
+    // present the backend trigger as a human prompt (and re-enter prompt navigation).
+    const triggerMuxMetadata: MuxMessageMetadata =
+      workspaceTurnMuxMetadata != null
+        ? { ...workspaceTurnMuxMetadata, agentPeerMessageTrigger: prepared.peerTriggerMeta }
+        : { type: "agent-peer-message", ...prepared.peerTriggerMeta };
+    return this.resolvePeerSendOptions(admission, attempt, {
+      ...prepared,
+      workspaceTurnMuxMetadata,
+      triggerMuxMetadata,
+    });
+  }
+
+  /** Picks the send options of the target's kind, then dispatches with them. */
+  private resolvePeerSendOptions(
+    admission: PeerSendAdmission,
+    attempt: PeerSendAttempt,
+    turn: PeerSendTurn
+  ): Promise<PeerSendResult> {
+    const { relation, awaitedDelegatedTurn, targetIsAgentTask } = admission;
+    if (relation === "target_ancestor" && awaitedDelegatedTurn == null) {
+      return this.dispatchPeerSendWithAncestorOptions(admission, attempt, turn);
+    }
+    if (!targetIsAgentTask || awaitedDelegatedTurn != null) {
+      return this.dispatchPeerSendWithRecipientOptions(admission, attempt, turn);
+    }
+    return this.dispatchPeerSend(
+      admission,
+      attempt,
+      turn,
+      this.buildTaskPeerSendOptions(admission, turn.triggerMuxMetadata)
+    );
+  }
+
+  private async dispatchPeerSendWithAncestorOptions(
+    admission: PeerSendAdmission,
+    attempt: PeerSendAttempt,
+    turn: PeerSendTurn
+  ): Promise<PeerSendResult> {
+    const resumeOptions = await this.resolveParentAutoResumeOptions(
+      admission.targetId,
+      admission.targetEntry,
+      defaultModel
+    );
+    return this.dispatchPeerSend(admission, attempt, turn, {
+      model: resumeOptions.model,
+      agentId: resumeOptions.agentId,
+      thinkingLevel: resumeOptions.thinkingLevel,
+      reasoningMode: resumeOptions.reasoningMode,
+      serviceTier: resumeOptions.serviceTier,
+      muxMetadata: turn.triggerMuxMetadata,
+    });
+  }
+
+  private async dispatchPeerSendWithRecipientOptions(
+    admission: PeerSendAdmission,
+    attempt: PeerSendAttempt,
+    turn: PeerSendTurn
+  ): Promise<PeerSendResult> {
+    const { targetId, targetEntry, awaitedDelegatedTurn } = admission;
+    assert(!admission.targetIsAgentTask);
+    // Honor the recipient's selected identity (including plan), not the sender's or an
+    // older history row. Without a selection, the shared history → exec fallback applies.
+    // Known tradeoff: the owner's continuation of its delegated turn also uses these
+    // persisted settings, not its per-turn agent override (handle records do not store it).
+    // A retry after a delegated turn never falls back to history, whose newest agent is that
+    // turn's override: it takes the recipient's saved agent or the workspace default.
+    const persistedAgentId =
+      awaitedDelegatedTurn != null
+        ? resolvePersistedAgentId(targetEntry.workspace)
+        : resolvePersistedAgentIdCandidates(targetEntry.workspace)[0];
+    const resumeOptions = await this.resolveParentAutoResumeOptions(
+      targetId,
+      targetEntry,
+      defaultModel,
+      persistedAgentId ? { agentId: persistedAgentId } : undefined
+    );
+    return this.dispatchPeerSend(admission, attempt, turn, {
+      ...resumeOptions,
+      muxMetadata: turn.triggerMuxMetadata,
+    });
+  }
+
+  private buildTaskPeerSendOptions(
+    admission: PeerSendAdmission,
+    triggerMuxMetadata: MuxMessageMetadata
+  ): SendMessageOptions {
+    const { targetEntry } = admission;
+    const activeAgentId = resolveTaskAgentIdForResume(targetEntry.workspace);
+    const activeAiSettings = this.resolveWorkspaceAISettings(targetEntry.workspace, activeAgentId);
+    return {
+      model:
+        coerceNonEmptyString(activeAiSettings?.model) ??
+        targetEntry.workspace.taskModelString ??
+        defaultModel,
+      agentId: activeAgentId,
+      thinkingLevel: activeAiSettings?.thinkingLevel ?? targetEntry.workspace.taskThinkingLevel,
+      reasoningMode: coerceOpenAIReasoningMode(activeAiSettings?.reasoningMode),
+      serviceTier: ServiceTierSchema.safeParse(activeAiSettings?.serviceTier).data,
+      muxMetadata: triggerMuxMetadata,
+    };
   }
 
   /**
@@ -10027,11 +10097,20 @@ export class TaskService implements AgentTaskIntegration {
   private async dispatchPeerSend(
     admission: PeerSendAdmission,
     attempt: PeerSendAttempt,
-    dispatch: PeerSendDispatch,
+    turn: PeerSendTurn,
     sendOptions: SendMessageOptions
   ): Promise<PeerSendResult> {
     const { spec, senderWorkspaceId, targetId, firstAttempt, refusals } = admission;
-    const { trigger, payloadRow, workspaceTurnMuxMetadata } = dispatch;
+    const { trigger, workspaceTurnMuxMetadata } = turn;
+    // The envelope rides as an assistant-role pre-turn row (never a user turn), persisted
+    // atomically with the trigger through the target's own turn admission — a direct history
+    // append could land inside another turn's PREPARING window.
+    const payloadRow = createMuxMessage(turn.payloadMessageId, "assistant", turn.envelope, {
+      timestamp: Date.now(),
+      synthetic: true,
+      uiVisible: true,
+      muxMetadata: turn.muxMetadata,
+    });
     const refusedBeforeDispatch =
       this.refuseStalePeerSendBeforeDispatch(admission, attempt) ??
       this.queuePeerSendBehindParked(admission, attempt);
