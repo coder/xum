@@ -49,7 +49,15 @@ function useSheetFocus(
     if (!open || dialog === null) return;
     const opener = openerRef.current;
     if (!dialog.contains(document.activeElement)) dialog.focus();
+    // A focused control that leaves the open sheet (one of several unsent messages sent, a bash
+    // that exits) drops focus to <body>, behind the inert page: put it back in the sheet. Not
+    // when the window lost focus (the browser's own UI has it then).
+    const keepFocusIn = new MutationObserver(() => {
+      if (document.activeElement === document.body && document.hasFocus()) dialog.focus();
+    });
+    keepFocusIn.observe(dialog, { childList: true, subtree: true });
     return () => {
+      keepFocusIn.disconnect();
       const target = returnFocusRef.current?.(opener) ?? opener;
       // No isConnected check: focus() does nothing on an element that left the page meanwhile.
       if (target instanceof HTMLElement) target.focus();

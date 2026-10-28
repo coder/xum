@@ -295,11 +295,13 @@ export function measureChipOverflow(strip: HTMLElement): ChatActivityId[] {
   );
   const widths = bordered.map((chip) => chip.getBoundingClientRect().width);
   const moreWidth = more?.getBoundingClientRect().width ?? 0;
-  // Flex items: the plain chips, the spacer between them and the rest, the chips shown, and the
-  // "+N" chip once any hides. One gap between each pair.
+  // Flex items: the plain chips, the spacer between them and the rest (StreamingBarrierView shows
+  // it only beside a plain chip), the chips shown, and the "+N" chip once any hides. One gap
+  // between each pair.
+  const spacer = plain.length > 0 ? 1 : 0;
   const needed = (shown: number) => {
     const hides = shown < bordered.length;
-    const items = plain.length + 1 + shown + (hides ? 1 : 0);
+    const items = plain.length + spacer + shown + (hides ? 1 : 0);
     const chipsWidth = widths.slice(0, shown).reduce((sum, width) => sum + width, 0);
     return plainWidth + chipsWidth + (hides ? moreWidth : 0) + gap * (items - 1);
   };

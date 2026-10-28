@@ -96,6 +96,19 @@ describe("measureChipOverflow", () => {
     // The reserve (104) and the two chips (120) fit 250; at its current width (200) they would not.
     expect(measureChipOverflow(element)).toEqual([]);
   });
+
+  it("leaves out the spacer's gap without a TODO chip, which hides the spacer", () => {
+    // Four 60px chips and their three 6px gaps fit 260; a gap for the spacer would make it 264.
+    const element = strip(260, [
+      { id: "sub-agents", width: 60 },
+      { id: "background-bashes", width: 60 },
+      { id: "reviews", width: 60 },
+      { id: "chat-instructions", width: 60 },
+    ]);
+    element.style.columnGap = "6px";
+    document.body.append(element);
+    expect(measureChipOverflow(element)).toEqual([]);
+  });
 });
 
 function Chip(props: { id: ChatActivityId; label: string; panelKeybind?: Keybind }) {

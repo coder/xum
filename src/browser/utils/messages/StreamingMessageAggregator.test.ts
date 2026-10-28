@@ -5417,6 +5417,32 @@ describe("StreamingMessageAggregator window seed (#4961)", () => {
     aggregator.loadHistoricalMessages([userRow(10)], true, { mode: "replace" });
     expect(aggregator.getCurrentTodos()).toEqual(done.todos);
   });
+
+  test("an all-completed seeded list that no row wrote clears when the running turn ends", () => {
+    // The seed is the session's list now: during a turn it may be that turn's own plan, or the
+    // one before it. A turn that writes none in the window does not keep it past its end.
+    const done = { ...seed, todos: [{ content: "done", status: "completed" as const }] };
+    const aggregator = createTestAggregator();
+    aggregator.setWindowSeed(done);
+    aggregator.loadHistoricalMessages([userRow(10)], true, { mode: "replace" });
+    startTestStream(aggregator, { historySequence: 11 });
+    expect(aggregator.getCurrentTodos()).toEqual(done.todos);
+
+    endTestStream(aggregator);
+    expect(aggregator.getCurrentTodos()).toEqual([]);
+  });
+
+  test("a finished list the running turn writes still stays after that turn", () => {
+    const done = { ...seed, todos: [{ content: "done", status: "completed" as const }] };
+    const aggregator = createTestAggregator();
+    aggregator.setWindowSeed(done);
+    aggregator.loadHistoricalMessages([userRow(10)], true, { mode: "replace" });
+    startTestStream(aggregator, { historySequence: 11 });
+    writeTodos(aggregator, done.todos);
+
+    endTestStream(aggregator);
+    expect(aggregator.getCurrentTodos()).toEqual(done.todos);
+  });
 });
 
 describe("StreamingMessageAggregator in-turn hidden notice rows", () => {

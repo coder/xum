@@ -729,9 +729,12 @@ export class StreamingMessageAggregator {
   >();
 
   // Current TODO list (updated when todo_write succeeds)
-  // Incomplete lists persist across streams and reloads; fully completed lists clear
-  // once the final stream finishes so stale plans do not linger in the UI.
+  // Incomplete lists persist across streams and reloads; a finished list stays until the next
+  // user turn starts, so its chip reads 5/5 after its turn.
   private currentTodos: TodoItem[] = [];
+  // The list came from the window seed and no row or tool result has written one since. The seed
+  // is the session's list now, so during a turn it may be an earlier turn's finished plan.
+  private todosFromWindowSeed = false;
 
   // Current agent status (updated when status_set is called)
   // Unlike todos, this persists after stream completion to show last activity
@@ -1588,6 +1591,7 @@ export class StreamingMessageAggregator {
     // A finished seed list stays until a replayed user turn clears it (replayDerivedState).
     const next = this.windowSeed?.todos ?? [];
     if (!this.todosEqual(this.currentTodos, next)) this.currentTodos = next;
+    this.todosFromWindowSeed = next.length > 0;
     this.assistedReviewHunks = [...(this.windowSeed?.assistedReview ?? [])];
   }
 
@@ -2477,6 +2481,9 @@ export class StreamingMessageAggregator {
       // Clean up stream-scoped state for this stream.
       this.cleanupStreamState(data.messageId);
     }
+    // A finished list only the seed knows may be the turn before this one's: unlike one this turn
+    // wrote, it does not outlast this turn (a replayed user row cannot clear it mid-stream).
+    if (this.todosFromWindowSeed && this.activeStreams.size === 0) this.clearFinishedTodos();
     // Assistant message is now stable (completed or reconnected) - invalidate all caches.
     this.markMessageDirty(data.messageId);
   }
@@ -2825,6 +2832,15 @@ export class StreamingMessageAggregator {
     }
   }
 
+  private applyTodoWrite(input: unknown): void {
+    const args = parseTodoWriteInput(input);
+    // Guard against malformed historical data.
+    if (!args) return;
+    this.todosFromWindowSeed = false;
+    // Update only on real changes to prevent flicker from equivalent-but-new todo array references.
+    if (!this.todosEqual(this.currentTodos, args.todos)) this.currentTodos = args.todos;
+  }
+
   /**
    * Process a completed tool call's result to update derived state.
    * Called for both live tool-call-end events and historical tool parts.
@@ -2852,14 +2868,7 @@ export class StreamingMessageAggregator {
     // Update TODO state if this was a successful todo_write.
     // We still reconstruct from history so plans survive reloads; a finished plan clears when
     // the next user turn starts.
-    if (toolName === "todo_write" && hasSuccessResult(output)) {
-      const args = parseTodoWriteInput(input);
-      if (args && !this.todosEqual(this.currentTodos, args.todos)) {
-        // Guard against malformed historical data and update only on real changes
-        // to prevent flicker from equivalent-but-new todo array references.
-        this.currentTodos = args.todos;
-      }
-    }
+    if (toolName === "todo_write" && hasSuccessResult(output)) this.applyTodoWrite(input);
 
     // Update Assisted Review state when review_pane_update succeeds.
     // The tool returns the resulting list directly (already merged + deduped

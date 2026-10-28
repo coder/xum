@@ -9,6 +9,7 @@ import {
   type Dispatch,
   type KeyboardEvent,
   type ReactNode,
+  type RefObject,
   type SetStateAction,
 } from "react";
 import { createPortal } from "react-dom";
@@ -92,6 +93,8 @@ interface WaitingOnYouCardState {
   setBodyHost: (element: HTMLElement | null) => void;
   setAfterHost: (element: HTMLElement | null) => void;
   setSheetHost: (element: HTMLElement | null) => void;
+  /** The desktop card's tabs. The provider owns it: the phone sheet reads it after it unmounts. */
+  tablistRef: RefObject<HTMLDivElement>;
 }
 
 const WaitingOnYouCardContext = createContext<WaitingOnYouCardState | null>(null);
@@ -229,6 +232,7 @@ export function WaitingOnYouProvider(props: { children: ReactNode }) {
   const [afterHost, setAfterHost] = useState<HTMLElement | null>(null);
   const [sheetHost, setSheetHost] = useState<HTMLElement | null>(null);
   const focusBeforeCommit = useRef<Element | null>(null);
+  const tablistRef = useRef<HTMLDivElement>(null);
   const phone = useSheetViewport();
 
   const arranged = arrangeWaiting(entries, chosen, phone);
@@ -261,6 +265,7 @@ export function WaitingOnYouProvider(props: { children: ReactNode }) {
             setBodyHost,
             setAfterHost,
             setSheetHost,
+            tablistRef,
           }}
         >
           <FocusBeforeCommit arranged={arranged} hosts={hosts} focusRef={focusBeforeCommit} />
@@ -269,6 +274,30 @@ export function WaitingOnYouProvider(props: { children: ReactNode }) {
       </WaitingOnYouContext.Provider>
     </WaitingOnYouRegisterContext.Provider>
   );
+}
+
+/**
+ * The card broke up around the focused control (a tab, or the sheet's row for the item that left)
+ * and focus fell to the page; on phones the sheet closed with it. The item left over shows inline
+ * again and takes focus, as a sheet row's item does in the open sheet. Only when focus did fall:
+ * content that kept it (an answer being typed) keeps it.
+ */
+function useFocusWhenCardBreaksUp(
+  waiting: WaitingOnYouValue | null,
+  id: WaitingOnYouId,
+  container: HTMLElement
+): void {
+  const consolidated = waiting?.consolidated === true;
+  // The queued message sends by itself: it is never the item left waiting.
+  const leftOver = !consolidated && id !== "queued" && waiting?.waits(id) === true;
+  const wasConsolidated = useRef(consolidated);
+  useLayoutEffect(() => {
+    const brokeUp = wasConsolidated.current && !consolidated;
+    wasConsolidated.current = consolidated;
+    if (!brokeUp || !leftOver) return;
+    if (document.activeElement !== null && document.activeElement !== document.body) return;
+    container.focus({ preventScroll: true });
+  }, [consolidated, leftOver, container]);
 }
 
 /**
@@ -290,6 +319,9 @@ export function WaitingOnYouSlot(props: {
   const [container] = useState(() => {
     const element = document.createElement("div");
     element.dataset.waitingOnYouSlot = props.id;
+    // Focusable for useFocusWhenCardBreaksUp only, so not in the Tab order.
+    element.tabIndex = -1;
+    element.className = "outline-none";
     return element;
   });
   const slotRef = useRef<HTMLDivElement>(null);
@@ -312,6 +344,8 @@ export function WaitingOnYouSlot(props: {
     }
   }, [host, container, focusBeforeCommit]);
   useLayoutEffect(() => () => container.remove(), [container]);
+  // After the move above, which puts back a container that left the page with the sheet or card.
+  useFocusWhenCardBreaksUp(waiting, props.id, container);
 
   if (waiting === null) {
     return <>{props.children}</>;
@@ -381,6 +415,13 @@ function useFocusWhenItemLeaves(
   });
 }
 
+function selectedTab(card: WaitingOnYouCardState): HTMLElement | null {
+  return (
+    card.tablistRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]') ??
+    null
+  );
+}
+
 /** Left/Right move between the tabs (the tablist keyboard pattern). */
 function moveTabFocus(event: KeyboardEvent<HTMLElement>): void {
   const step = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
@@ -440,11 +481,8 @@ function WaitingTab(props: {
 function WaitingOnYouTabs(props: { card: WaitingOnYouCardState; panelId: string }) {
   const card = props.card;
   const count = card.entries.length;
-  const tablistRef = useRef<HTMLDivElement>(null);
   // The item on show: its tab and content. The other tabs leave the Tab order (a roving tabindex).
-  useFocusWhenItemLeaves(card, [card.selected], () =>
-    tablistRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
-  );
+  useFocusWhenItemLeaves(card, [card.selected], () => selectedTab(card));
   return (
     <ChatDockSurface>
       <div className="py-1.5">
@@ -461,7 +499,7 @@ function WaitingOnYouTabs(props: { card: WaitingOnYouCardState; panelId: string 
           >
             <WaitingCountBadge count={count} label className="h-7 px-2 text-xs" />
             <div
-              ref={tablistRef}
+              ref={card.tablistRef}
               role="tablist"
               aria-label="Waiting on you"
               onKeyDown={moveTabFocus}
@@ -557,6 +595,9 @@ function WaitingOnYouSummary(props: { card: WaitingOnYouCardState }) {
       <ChatDockSheet
         open={card.sheetOpen}
         onClose={() => card.setSheetOpen(false)}
+        // The window outgrew the sheet: the desktop card replaced the summary row, and its tab
+        // takes focus back.
+        returnFocus={(opener) => (opener?.isConnected === true ? opener : selectedTab(card))}
         title={
           <>
             Waiting on you
