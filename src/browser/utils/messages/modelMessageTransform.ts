@@ -5,6 +5,7 @@
 
 import type { ModelMessage, AssistantModelMessage, ToolModelMessage, UserModelMessage } from "ai";
 import {
+  isAppendedTurnNoticeMessage,
   isContextBudgetWarningMessage,
   type MuxMessage,
   type MuxReasoningPart,
@@ -143,7 +144,7 @@ export function injectAgentTransition(
   // Find the index of the last user message
   let lastUserIndex = -1;
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user" && !isContextBudgetWarningMessage(messages[i])) {
+    if (messages[i].role === "user" && !isAppendedTurnNoticeMessage(messages[i])) {
       lastUserIndex = i;
       break;
     }
