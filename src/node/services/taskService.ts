@@ -1769,6 +1769,43 @@ function workflowWakeGroupKey(agent: WorkflowWakeInitiatingAgent): string {
 // keys the unpinned group, so a leading \u0000 cannot collide.
 const NON_WORKFLOW_WAKE_BACKOFF_KEY = "\u0000non-workflow";
 
+/** A queued workflow run's terminal wake prompt, built for one terminal-attention drain. */
+interface TerminalWorkflowWakeCandidate {
+  runId: string;
+  run: WorkflowRunRecord;
+  prompt: string;
+  initiatingAgent?: WorkflowWakeInitiatingAgent;
+}
+
+/**
+ * A terminal-attention drain's composed wake, read by the delivery steps (deliverTerminalWake).
+ * Every field is final once the drain has partitioned its candidates and composed the prompt.
+ */
+interface TerminalWakeDelivery {
+  readonly ownerWorkspaceId: string;
+  readonly entry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
+  readonly agentNotifications: readonly TerminalAttentionNotification[];
+  readonly deliverableWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[];
+  /** The selected launch-identity group; empty when no workflow group revalidated. */
+  readonly currentWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[];
+  readonly workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;
+  readonly supersededWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[];
+  readonly suppressedNotificationIds: readonly string[];
+  /** The sub-agent and workspace-turn notifications this wake delivers. */
+  readonly effectivePending: readonly TerminalAttentionNotification[];
+  readonly prompt: string;
+  readonly resumeOptions: ParentAutoResumeOptions;
+  readonly wakeRestrictions: Awaited<
+    ReturnType<TaskService["resolveTerminalWakeCallerSendRestrictions"]>
+  >;
+  readonly effectiveStrictPin: SendMessageOptions["strictAgentResolution"];
+  readonly workspaceTurnMuxMetadata: Awaited<
+    ReturnType<WorkspaceTurnManager["getActiveWorkspaceTurnMuxMetadataForWorkspace"]>
+  >;
+}
+
+type TerminalWakeSendResult = Awaited<ReturnType<WorkspaceHost["sendMessage"]>>;
+
 function isTypedWorkspaceEvent(value: unknown, type: string): boolean {
   return (
     typeof value === "object" &&
@@ -11805,20 +11842,6 @@ export class TaskService implements AgentTaskIntegration {
       deliverableWorkspaceTurnNotificationIds.add(candidate.notification.id);
       publicAwaitIds.push(candidate.publicAwaitId);
     });
-    const markSuppressedSuperseded = async () => {
-      for (const id of suppressedNotificationIds) {
-        await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, id);
-      }
-      for (const candidate of supersededWorkflowPrompts) {
-        await this.markWorkflowRunTerminalAttentionSettled({
-          ownerWorkspaceId,
-          runId: candidate.runId,
-          status: candidate.run.status,
-          runUpdatedAt: candidate.run.updatedAt,
-          settledAs: "superseded",
-        });
-      }
-    };
 
     // Sub-agent reports and failures are already durable user-context messages. Resume from history
     // directly instead of injecting a second user turn that merely tells the model they exist.
@@ -11836,46 +11859,107 @@ export class TaskService implements AgentTaskIntegration {
           }
           return deliverableWorkspaceTurnNotificationIds.has(notification.id);
         });
-    if (effectivePending.length === 0 && currentWorkflowPrompts.length === 0) {
-      await markSuppressedSuperseded();
-      // Suppression can empty the very batch that excluded agent-bound workflow groups; with
-      // nothing sent there is no streamEnded drain, so re-poke instead of parking the queued
-      // wake on the sweep. No spin: re-poke only when this drain durably changed state (a
-      // suppressed turn or superseded workflow was just marked), so the re-drain sees a
-      // different candidate set; an all-indeterminate batch parks for the sweep instead.
-      if (
-        deliverableWorkflowPrompts.length > 0 &&
-        (suppressedNotificationIds.length > 0 || supersededWorkflowPrompts.length > 0)
-      ) {
-        this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-      }
-      return;
+    return this.deliverTerminalWake({
+      ownerWorkspaceId,
+      entry,
+      agentNotifications,
+      deliverableWorkflowPrompts,
+      currentWorkflowPrompts,
+      workflowInitiatingAgent,
+      supersededWorkflowPrompts,
+      suppressedNotificationIds,
+      effectivePending,
+      prompt,
+      resumeOptions,
+      wakeRestrictions,
+      effectiveStrictPin,
+      workspaceTurnMuxMetadata,
+    });
+  }
+
+  /**
+   * Delivers a drain's composed wake through a chain of steps: exitTerminalWakeWithoutDelivery,
+   * resumeTerminalWakeWithoutPrompt, or sendTerminalWakePrompt → fallBackFromBusyTerminalWake →
+   * sendBusyFallbackTerminalWake → finishTerminalWakeSend. Each step starts the next one in the
+   * same tick as its own last await, so no collaborator call runs a microtask later than it did
+   * inline; only the drain's own resolution comes later. This step stays synchronous: no await
+   * may separate the drain's batch revalidation from sendMessage.
+   */
+  private deliverTerminalWake(wake: TerminalWakeDelivery): Promise<void> {
+    if (wake.effectivePending.length === 0 && wake.currentWorkflowPrompts.length === 0) {
+      return this.exitTerminalWakeWithoutDelivery(wake);
     }
+    const sendOptions = this.buildTerminalWakeSendOptions(wake);
+    if (wake.prompt.length === 0) {
+      return this.resumeTerminalWakeWithoutPrompt(wake, sendOptions);
+    }
+    return this.sendTerminalWakePrompt(wake, sendOptions);
+  }
 
-    const markPendingDelivered = async () => {
-      for (const notification of effectivePending) {
-        await this.terminalAttentionStore.markDelivered(ownerWorkspaceId, notification.id);
-      }
-      for (const candidate of currentWorkflowPrompts) {
-        // Marker failures are contained inside the settle method; the delivered wake itself is
-        // durable history evidence, so the next evaluation settles this run as consumed.
-        await this.markWorkflowRunTerminalAttentionSettled({
-          ownerWorkspaceId,
-          runId: candidate.runId,
-          status: candidate.run.status,
-          runUpdatedAt: candidate.run.updatedAt,
-          settledAs: "delivered",
-        });
-      }
-    };
+  /** Nothing to send: marks the suppressed wakes superseded, and re-pokes when that changed state. */
+  private async exitTerminalWakeWithoutDelivery(wake: TerminalWakeDelivery): Promise<void> {
+    const { ownerWorkspaceId, suppressedNotificationIds, supersededWorkflowPrompts } = wake;
+    await this.markSuppressedTerminalWakesSuperseded(wake);
+    // Suppression can empty the very batch that excluded agent-bound workflow groups; with
+    // nothing sent there is no streamEnded drain, so re-poke instead of parking the queued
+    // wake on the sweep. No spin: re-poke only when this drain durably changed state (a
+    // suppressed turn or superseded workflow was just marked), so the re-drain sees a
+    // different candidate set; an all-indeterminate batch parks for the sweep instead.
+    if (
+      wake.deliverableWorkflowPrompts.length > 0 &&
+      (suppressedNotificationIds.length > 0 || supersededWorkflowPrompts.length > 0)
+    ) {
+      this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+    }
+  }
 
-    const markPendingForRetry = async () => {
-      for (const notification of effectivePending) {
-        await this.terminalAttentionStore.markPending(ownerWorkspaceId, notification.id);
-      }
-    };
+  /** Marks the wake's suppressed workspace turns and superseded workflow runs as settled. */
+  private async markSuppressedTerminalWakesSuperseded(wake: TerminalWakeDelivery): Promise<void> {
+    const { ownerWorkspaceId } = wake;
+    for (const id of wake.suppressedNotificationIds) {
+      await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, id);
+    }
+    for (const candidate of wake.supersededWorkflowPrompts) {
+      await this.markWorkflowRunTerminalAttentionSettled({
+        ownerWorkspaceId,
+        runId: candidate.runId,
+        status: candidate.run.status,
+        runUpdatedAt: candidate.run.updatedAt,
+        settledAs: "superseded",
+      });
+    }
+  }
 
-    const sendOptions = {
+  /** Marks the wake's notifications delivered and its workflow runs settled as delivered. */
+  private async markTerminalWakeDelivered(wake: TerminalWakeDelivery): Promise<void> {
+    const { ownerWorkspaceId } = wake;
+    for (const notification of wake.effectivePending) {
+      await this.terminalAttentionStore.markDelivered(ownerWorkspaceId, notification.id);
+    }
+    for (const candidate of wake.currentWorkflowPrompts) {
+      // Marker failures are contained inside the settle method; the delivered wake itself is
+      // durable history evidence, so the next evaluation settles this run as consumed.
+      await this.markWorkflowRunTerminalAttentionSettled({
+        ownerWorkspaceId,
+        runId: candidate.runId,
+        status: candidate.run.status,
+        runUpdatedAt: candidate.run.updatedAt,
+        settledAs: "delivered",
+      });
+    }
+  }
+
+  /** Returns the wake's notifications to pending after an accepted send failed before its stream. */
+  private async markTerminalWakePendingForRetry(wake: TerminalWakeDelivery): Promise<void> {
+    for (const notification of wake.effectivePending) {
+      await this.terminalAttentionStore.markPending(wake.ownerWorkspaceId, notification.id);
+    }
+  }
+
+  /** The wake's send options: the resolved identity plus the caller's restrictions and pin. */
+  private buildTerminalWakeSendOptions(wake: TerminalWakeDelivery): SendMessageOptions {
+    const { resumeOptions, wakeRestrictions, effectiveStrictPin, workspaceTurnMuxMetadata } = wake;
+    return {
       model: resumeOptions.model,
       agentId: resumeOptions.agentId,
       thinkingLevel: resumeOptions.thinkingLevel,
@@ -11886,45 +11970,59 @@ export class TaskService implements AgentTaskIntegration {
       ...(effectiveStrictPin != null ? { strictAgentResolution: effectiveStrictPin } : {}),
       ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     };
-    if (prompt.length === 0) {
-      assert(agentNotifications.length > 0, "prompt-free terminal drain requires sub-agent work");
-      // No workspace-turn wakes are delivered on this path, so marking the
-      // suppressed ones first cannot go stale against a delivery.
-      await markSuppressedSuperseded();
-      const resumeResult = await this.workspaceService.resumeStream(ownerWorkspaceId, sendOptions, {
-        acceptanceOrigin: "automatic",
-        agentInitiated: true,
-        // A nested task owner resumed for a descendant's report runs an automatic task turn:
-        // it must not be able to create or replace that child's goal.
-        ...(entry.workspace.parentWorkspaceId ? { taskTurnKind: "recovery" as const } : {}),
+  }
+
+  /** A prompt-free wake: resumes the owner from history, which already holds the sub-agent reports. */
+  private async resumeTerminalWakeWithoutPrompt(
+    wake: TerminalWakeDelivery,
+    sendOptions: SendMessageOptions
+  ): Promise<void> {
+    const { ownerWorkspaceId, entry } = wake;
+    assert(
+      wake.agentNotifications.length > 0,
+      "prompt-free terminal drain requires sub-agent work"
+    );
+    // No workspace-turn wakes are delivered on this path, so marking the
+    // suppressed ones first cannot go stale against a delivery.
+    await this.markSuppressedTerminalWakesSuperseded(wake);
+    const resumeResult = await this.workspaceService.resumeStream(ownerWorkspaceId, sendOptions, {
+      acceptanceOrigin: "automatic",
+      agentInitiated: true,
+      // A nested task owner resumed for a descendant's report runs an automatic task turn:
+      // it must not be able to create or replace that child's goal.
+      ...(entry.workspace.parentWorkspaceId ? { taskTurnKind: "recovery" as const } : {}),
+    });
+    if (!resumeResult.success) {
+      // Persistent failures (for example a budget/model gate) are not made retryable by waiting for
+      // idle—the owner is already idle here. Keep the outbox entry pending for a later real signal.
+      log.warn("Prompt-free sub-agent resume failed; leaving attention pending", {
+        ownerWorkspaceId,
+        error: resumeResult.error,
       });
-      if (!resumeResult.success) {
-        // Persistent failures (for example a budget/model gate) are not made retryable by waiting for
-        // idle—the owner is already idle here. Keep the outbox entry pending for a later real signal.
-        log.warn("Prompt-free sub-agent resume failed; leaving attention pending", {
-          ownerWorkspaceId,
-          error: resumeResult.error,
-        });
-        // Same starvation shape as the prompt path: agent-bound groups were excluded by this
-        // batch, so back it off and re-poke to let them send under their own launch identity.
-        if (deliverableWorkflowPrompts.some((candidate) => candidate.initiatingAgent != null)) {
-          this.terminalAttention.backOffTerminalWakeSends(ownerWorkspaceId, [
-            NON_WORKFLOW_WAKE_BACKOFF_KEY,
-          ]);
-        }
-        return;
+      // Same starvation shape as the prompt path: agent-bound groups were excluded by this
+      // batch, so back it off and re-poke to let them send under their own launch identity.
+      if (wake.deliverableWorkflowPrompts.some((candidate) => candidate.initiatingAgent != null)) {
+        this.terminalAttention.backOffTerminalWakeSends(ownerWorkspaceId, [
+          NON_WORKFLOW_WAKE_BACKOFF_KEY,
+        ]);
       }
-      if (!resumeResult.data.started) {
-        this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
-        return;
-      }
-      await markPendingDelivered();
       return;
     }
+    if (!resumeResult.data.started) {
+      this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+      return;
+    }
+    await this.markTerminalWakeDelivered(wake);
+  }
 
-    let sendResult = await this.workspaceService.sendMessage(
-      ownerWorkspaceId,
-      prompt,
+  /** Sends the wake prompt idle-only, then marks the suppressed wakes superseded. */
+  private async sendTerminalWakePrompt(
+    wake: TerminalWakeDelivery,
+    sendOptions: SendMessageOptions
+  ): Promise<void> {
+    const sendResult = await this.workspaceService.sendMessage(
+      wake.ownerWorkspaceId,
+      wake.prompt,
       sendOptions,
       // Synthetic, idle-only auto-resume — same flags as the active-work auto-resume path.
       {
@@ -11942,8 +12040,21 @@ export class TaskService implements AgentTaskIntegration {
     // batch revalidation above from sendMessage. Best-effort: an early return
     // above leaves these pending, and a later drain re-derives suppression
     // from the records and drops them again.
-    await markSuppressedSuperseded();
+    await this.markSuppressedTerminalWakesSuperseded(wake);
+    return this.fallBackFromBusyTerminalWake(wake, sendOptions, sendResult);
+  }
 
+  /**
+   * After a busy idle-only rejection, retries the wake without requireIdle when the owner is idle
+   * again and no blocking work is active (sendBusyFallbackTerminalWake). Every other result goes
+   * on to finishTerminalWakeSend unchanged.
+   */
+  private async fallBackFromBusyTerminalWake(
+    wake: TerminalWakeDelivery,
+    sendOptions: SendMessageOptions,
+    sendResult: TerminalWakeSendResult
+  ): Promise<void> {
+    const { ownerWorkspaceId } = wake;
     if (!sendResult.success && isWorkspaceBusyIdleOnlySend(sendResult.error)) {
       const latestCfg = this.config.loadConfigOrDefault();
       const latestTaskIndex = this.buildAgentTaskIndex(latestCfg);
@@ -11954,61 +12065,79 @@ export class TaskService implements AgentTaskIntegration {
         !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId) &&
         !(await this.hasBlockingActiveWorkForTerminalDrain(ownerWorkspaceId, latestTaskIndex))
       ) {
-        // Security: the composed prompt retains the pre-check workflow results, and this
-        // fallback send omits requireIdle, so its epoch snapshot postdates any clear or reset
-        // that completed during the awaited checks above and the clear guard would accept the
-        // stale injection into the fresh context. The busy race the primary send just lost
-        // may also have been a competing owner turn consuming these very results through
-        // kernel-nested task_await (settlement marker only, no history evidence) or a
-        // Workflows UI resume changing the run generation. Revalidate everything so the
-        // fallback keeps the primary path's contract (no awaits between revalidation and
-        // delivery); any stale candidate aborts toward a fresh drain that re-derives, and
-        // the queue entries survive for it.
-        if (currentWorkflowPrompts.length > 0) {
-          const fallbackRevalidation = await Promise.all(
-            currentWorkflowPrompts.map((candidate) =>
-              this.revalidateWorkflowPromptForDispatch(ownerWorkspaceId, candidate)
-            )
-          );
-          if (fallbackRevalidation.some((verdict) => verdict !== "deliverable")) {
-            log.debug("Terminal wake busy fallback aborted; workflow candidates went stale", {
-              ownerWorkspaceId,
-            });
-            this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-            return;
-          }
-        }
-        let fallbackAccepted = false;
-        sendResult = await this.workspaceService.sendMessage(
-          ownerWorkspaceId,
-          prompt,
-          sendOptions,
-          {
-            acceptanceOrigin: "automatic",
-            skipAutoResumeReset: true,
-            synthetic: true,
-            agentInitiated: true,
-            // Same wake as the primary send above (#4721).
-            skipOnSendCompaction: true,
-            onCanceled: () => {
-              this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
-            },
-            onAcceptedPreStreamFailure: async () => {
-              await markPendingForRetry();
-              this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
-            },
-            onAccepted: async () => {
-              fallbackAccepted = true;
-              await markPendingDelivered();
-            },
-          }
-        );
-        if (sendResult.success && !fallbackAccepted) {
-          return;
-        }
+        return this.sendBusyFallbackTerminalWake(wake, sendOptions);
       }
     }
+    return this.finishTerminalWakeSend(wake, sendResult);
+  }
 
+  /** Revalidates the wake's workflow candidates and sends the wake again, without requireIdle. */
+  private async sendBusyFallbackTerminalWake(
+    wake: TerminalWakeDelivery,
+    sendOptions: SendMessageOptions
+  ): Promise<void> {
+    const { ownerWorkspaceId, currentWorkflowPrompts } = wake;
+    // Security: the composed prompt retains the pre-check workflow results, and this
+    // fallback send omits requireIdle, so its epoch snapshot postdates any clear or reset
+    // that completed during the awaited checks above and the clear guard would accept the
+    // stale injection into the fresh context. The busy race the primary send just lost
+    // may also have been a competing owner turn consuming these very results through
+    // kernel-nested task_await (settlement marker only, no history evidence) or a
+    // Workflows UI resume changing the run generation. Revalidate everything so the
+    // fallback keeps the primary path's contract (no awaits between revalidation and
+    // delivery); any stale candidate aborts toward a fresh drain that re-derives, and
+    // the queue entries survive for it.
+    if (currentWorkflowPrompts.length > 0) {
+      const fallbackRevalidation = await Promise.all(
+        currentWorkflowPrompts.map((candidate) =>
+          this.revalidateWorkflowPromptForDispatch(ownerWorkspaceId, candidate)
+        )
+      );
+      if (fallbackRevalidation.some((verdict) => verdict !== "deliverable")) {
+        log.debug("Terminal wake busy fallback aborted; workflow candidates went stale", {
+          ownerWorkspaceId,
+        });
+        this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+        return;
+      }
+    }
+    let fallbackAccepted = false;
+    const sendResult = await this.workspaceService.sendMessage(
+      ownerWorkspaceId,
+      wake.prompt,
+      sendOptions,
+      {
+        acceptanceOrigin: "automatic",
+        skipAutoResumeReset: true,
+        synthetic: true,
+        agentInitiated: true,
+        // Same wake as the primary send above (#4721).
+        skipOnSendCompaction: true,
+        onCanceled: () => {
+          this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+        },
+        onAcceptedPreStreamFailure: async () => {
+          await this.markTerminalWakePendingForRetry(wake);
+          this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+        },
+        onAccepted: async () => {
+          fallbackAccepted = true;
+          await this.markTerminalWakeDelivered(wake);
+        },
+      }
+    );
+    if (sendResult.success && !fallbackAccepted) {
+      return;
+    }
+    return this.finishTerminalWakeSend(wake, sendResult);
+  }
+
+  /** A rejected wake backs off its batches (non-busy rejections) and stays pending; else delivered. */
+  private async finishTerminalWakeSend(
+    wake: TerminalWakeDelivery,
+    sendResult: TerminalWakeSendResult
+  ): Promise<void> {
+    const { ownerWorkspaceId, currentWorkflowPrompts, workflowInitiatingAgent } = wake;
     if (!sendResult.success) {
       if (!isWorkspaceBusyIdleOnlySend(sendResult.error)) {
         // A non-busy rejection is likely batch-specific (an unresolvable pinned agent, a model
@@ -12024,7 +12153,7 @@ export class TaskService implements AgentTaskIntegration {
             workflowInitiatingAgent != null ? workflowWakeGroupKey(workflowInitiatingAgent) : ""
           );
         }
-        if (effectivePending.length > 0) {
+        if (wake.effectivePending.length > 0) {
           backoffKeys.push(NON_WORKFLOW_WAKE_BACKOFF_KEY);
         }
         if (backoffKeys.length > 0) {
@@ -12040,7 +12169,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    await markPendingDelivered();
+    await this.markTerminalWakeDelivered(wake);
   }
 
   /** See TaskWaiters.backgroundForegroundWaitIfQueued. */
