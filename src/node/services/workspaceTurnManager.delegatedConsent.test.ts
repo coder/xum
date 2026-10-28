@@ -146,6 +146,20 @@ describe("delegated target default consent (#4453)", () => {
   async function crashBeforeRecord(options: { disposable?: boolean } = {}) {
     const [created, paused] = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
     const a = await setUp({ afterCreate: () => (created.resolve(), paused.promise) });
+    // #7694: the target's background init ends with one more metadata publish (the service's own
+    // init-end listener refreshes it), at a time CI load decides. A test that counts publishes
+    // awaits this first. The service registered its listener first, so the next TARGET publish
+    // after init-end is that refresh.
+    const initPublished = Promise.withResolvers<void>();
+    a.initStateManager.on("init-end", (event: { workspaceId: string }) => {
+      if (event.workspaceId !== TARGET) return;
+      const onMetadata = (published: { workspaceId: string }) => {
+        if (published.workspaceId !== TARGET) return;
+        a.real.off("metadata", onMetadata);
+        initPublished.resolve();
+      };
+      a.real.on("metadata", onMetadata);
+    });
     const creating = createTurn(a.manager, a.parentId, {
       mode: "new",
       disposable: options.disposable,
@@ -157,7 +171,7 @@ describe("delegated target default consent (#4453)", () => {
       paused.resolve();
       await creating;
     };
-    return { ...a, finish };
+    return { ...a, finish, initPublished: initPublished.promise };
   }
 
   const handleRecordPath = (parentId: string) =>
@@ -660,6 +674,7 @@ describe("delegated target default consent (#4453)", () => {
     await (await backend()).manager.resolveOrphanedDelegatedTargets();
     expect(await flagOf()).toBe(true);
 
+    await a.initPublished;
     const published: unknown[] = [];
     a.real.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
       if (event.workspaceId !== TARGET) return;
@@ -765,6 +780,7 @@ describe("delegated target default consent (#4453)", () => {
     expect((await (await backend()).real.keepInterruptedDelegatedWorkspace(TARGET)).success).toBe(
       true
     );
+    await a.initPublished;
     const published: unknown[] = [];
     a.real.on("metadata", (event: { workspaceId: string; metadata: unknown }) => {
       if (event.workspaceId !== TARGET) return;
