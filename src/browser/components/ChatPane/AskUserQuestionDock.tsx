@@ -1,4 +1,5 @@
 import { useState, useSyncExternalStore } from "react";
+import { MessageCircleQuestion } from "lucide-react";
 
 import { ToolMessage } from "@/browser/features/Messages/ToolMessage";
 import { LazyAskUserQuestionChain } from "@/browser/features/Tools/Shared/ToolCardsLoad";
@@ -17,8 +18,27 @@ import {
 } from "@/browser/utils/messages/openAskUserQuestions";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
 import type { DisplayedMessage } from "@/common/types/message";
+import { AskUserQuestionToolArgsSchema } from "@/common/utils/tools/askUserQuestionSchemas";
 import { isAsyncAskUserQuestionOutput } from "@/common/utils/tools/askUserQuestionSummary";
 import { ChatDockSurface } from "./chatDockColumn";
+import { useWaitingOnYou, type WaitingOnYouEntry } from "./WaitingOnYou";
+
+/** The open questions as the "Waiting on you" card names them, or null while none is open. */
+function questionsEntry(open: readonly AskUserQuestionToolMessage[]): WaitingOnYouEntry | null {
+  const questions = open.flatMap((message) => {
+    const parsed = AskUserQuestionToolArgsSchema.safeParse(message.args);
+    return parsed.success ? parsed.data.questions : [];
+  });
+  if (questions.length === 0) return null;
+  const count = questions.length;
+  return {
+    icon: MessageCircleQuestion,
+    tab: count === 1 ? "Question" : `${count} questions`,
+    title: questions[0].question,
+    detail: count === 1 ? "The agent asks you" : `Question 1 of ${count}`,
+    urgent: true,
+  };
+}
 
 /**
  * The rows that still take answers. React Compiler memoizes this call on its arguments alone, so
@@ -72,6 +92,9 @@ export function AskUserQuestionDock(props: { workspaceId: string }) {
     (message): message is AskUserQuestionToolMessage =>
       message.type === "tool" && nextDockState.includes(message.id)
   );
+  // Closed cards stay docked (rendering nothing) until they release themselves: only open ones
+  // wait on the user.
+  useWaitingOnYou(questionsEntry(dockedQuestions.filter((message) => openRowIds.has(message.id))));
 
   if (dockedQuestions.length === 0) {
     return null;

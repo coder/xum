@@ -2,20 +2,27 @@ import {
   createContext,
   useContext,
   useEffect,
-  useId,
   useLayoutEffect,
   useRef,
   useState,
   type ReactNode,
   type RefObject,
 } from "react";
-import { createPortal } from "react-dom";
-import { X } from "lucide-react";
 import { useNarrowViewport, useShortViewport } from "@/browser/hooks/useNarrowViewport";
+import { ChatDockSheet, type ChatDockSheetReturnFocus } from "./ChatDockSheet";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import { isDialogOpen } from "@/browser/utils/ui/keybinds";
-import { makeOthersInert } from "@/browser/utils/ui/makeOthersInert";
-import { cn } from "@/common/lib/utils";
+import {
+  isAltGraphPressed,
+  isBrowserViewportFocused,
+  isCommandPaletteTarget,
+  isDesktopViewportFocused,
+  isDialogOpen,
+  isTerminalFocused,
+  matchesKeybind,
+  paneHandlesKeyEvent,
+  type ChatPaneScope,
+  type Keybind,
+} from "@/browser/utils/ui/keybinds";
 
 /**
  * The activity summaries that share the composer's live line as chips: the streaming status row
@@ -40,7 +47,10 @@ export const CHAT_ACTIVITY_ORDER: Record<ChatActivityId, number> = {
   "chat-instructions": 4,
 };
 
-type OpenIdUpdate = (current: ChatActivityId | null) => ChatActivityId | null;
+/** What the line's one panel slot can hold: a chip's panel, or the "+N" chip's list of hidden chips. */
+export type ChatActivityPanelId = ChatActivityId | "more";
+
+type OpenIdUpdate = (current: ChatActivityPanelId | null) => ChatActivityPanelId | null;
 
 /** Where chips render their tab and open panel on phones: the activity sheet. */
 export interface ChatActivitySheetSlots {
@@ -49,10 +59,15 @@ export interface ChatActivitySheetSlots {
 }
 
 interface ChatActivityPanelsValue {
-  openId: ChatActivityId | null;
+  openId: ChatActivityPanelId | null;
   setOpenId: (update: OpenIdUpdate) => void;
   /** Set on phones, where every panel opens in one bottom sheet with a tab per chip. */
   sheet: ChatActivitySheetSlots | null;
+  /** The chips the line has no room for, in line order; the "+N" chip stands in for them. */
+  overflow: readonly ChatActivityId[];
+  /** Where hidden chips render their entry while the "+N" chip's list is open, else null. */
+  moreList: HTMLElement | null;
+  setMoreList: (element: HTMLElement | null) => void;
 }
 
 const ChatActivityPanelsContext = createContext<ChatActivityPanelsValue | null>(null);
@@ -65,6 +80,20 @@ export function useInChatActivityLine(): boolean {
 /** The activity sheet's slots while the line opens its panels in the sheet, else null. */
 export function useChatActivitySheet(): ChatActivitySheetSlots | null {
   return useContext(ChatActivityPanelsContext)?.sheet ?? null;
+}
+
+const NO_OVERFLOW: readonly ChatActivityId[] = [];
+
+/** The line's overflow state, for the "+N" chip and the chips it stands in for. */
+export function useChatActivityOverflow() {
+  const panels = useContext(ChatActivityPanelsContext);
+  return {
+    overflow: panels?.overflow ?? NO_OVERFLOW,
+    moreList: panels?.moreList ?? null,
+    setMoreList: panels?.setMoreList,
+    openId: panels?.openId ?? null,
+    setOpenId: panels?.setOpenId,
+  };
 }
 
 type SetExpanded = (next: boolean | ((current: boolean) => boolean)) => void;
@@ -106,6 +135,44 @@ export function useReleaseChatActivityPanelOnUnmount(id: ChatActivityId | undefi
   }, [setOpenId, id]);
 }
 
+/** Whether `target` is in the open activity sheet whose slots are `sheet`. */
+function isInOpenSheet(target: EventTarget | null, sheet: ChatActivitySheetSlots | null): boolean {
+  // The dialog role is set only while the sheet is open.
+  const dialog = sheet?.body.closest('[role="dialog"]');
+  return target instanceof Node && dialog?.contains(target) === true;
+}
+
+/**
+ * Whether a window keydown is the chord that opens a live-line panel in this pane. The main chat
+ * and each /side chat mount their own line, so only the pane owning the focused element reacts.
+ * `element` is in the line: under immersive review desktop keeps the chat pane mounted but inert.
+ * `sheet` is the line's activity sheet (phones and short windows): a modal over an inert page,
+ * chips included, whose panels the chords still switch and close while focus is in it.
+ */
+export function acceptsActivityPanelChord(
+  event: KeyboardEvent,
+  keybind: Keybind,
+  paneScope: ChatPaneScope,
+  element: Element | null,
+  sheet: ChatActivitySheetSlots | null
+): boolean {
+  // Ctrl+Alt chords must not claim AltGr input, which types characters.
+  if (!matchesKeybind(event, keybind) || isAltGraphPressed(event)) return false;
+  if (isInOpenSheet(event.target, sheet)) return true;
+  if (isDialogOpen()) return false;
+  if (!paneHandlesKeyEvent(paneScope, event.target)) return false;
+  if (isCommandPaletteTarget(event.target)) return false;
+  // The terminal and the browser and desktop viewports own their keystrokes.
+  if (
+    isTerminalFocused(event.target) ||
+    isBrowserViewportFocused(event.target) ||
+    isDesktopViewportFocused(event.target)
+  ) {
+    return false;
+  }
+  return element?.closest("[inert]") == null;
+}
+
 /**
  * Escape from <body> closes the open panel, popover or sheet. Focus lands there when a focused row
  * leaves (a stopped bash) or a dialog opened from a row closes (bash output), where the panel's
@@ -141,10 +208,18 @@ export function ChatActivityPanelsProvider(props: {
   className?: string;
   dataComponent?: string;
 }) {
-  const [openId, setOpenIdState] = useState<ChatActivityId | null>(null);
+  const [openId, setOpenIdState] = useState<ChatActivityPanelId | null>(null);
+  const [moreList, setMoreList] = useState<HTMLElement | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const sheetViewport = useSheetViewport();
   const { sheet, setSheetTabs, setSheetBody } = useSheetSlots(sheetViewport);
+  const overflow = useChipOverflow(rootRef, setOpenIdState);
+  useChipFocusWhenHidden(rootRef, overflow);
+  // The panel the sheet showed last, whose chip the closing sheet may return focus to.
+  const sheetPanelRef = useRef<ChatActivityPanelId | null>(null);
+  useLayoutEffect(() => {
+    if (openId !== null) sheetPanelRef.current = openId;
+  }, [openId]);
 
   useEffect(() => {
     if (openId === null) return;
@@ -158,14 +233,21 @@ export function ChatActivityPanelsProvider(props: {
   }, [openId]);
 
   return (
-    <ChatActivityPanelsContext.Provider value={{ openId, setOpenId: setOpenIdState, sheet }}>
+    <ChatActivityPanelsContext.Provider
+      value={{ openId, setOpenId: setOpenIdState, sheet, overflow, moreList, setMoreList }}
+    >
       <div ref={rootRef} className={props.className} data-component={props.dataComponent}>
         {props.children}
       </div>
       {sheetViewport && (
         <ChatActivitySheet
-          open={openId !== null}
+          // The "+N" chip's list opens above the line on phones too: it holds chips without a
+          // panel (Chat Instructions), which the sheet has no tab for.
+          open={openId !== null && openId !== "more"}
           onClose={() => setOpenIdState(null)}
+          returnFocus={(opener) =>
+            shownFocusTarget(opener, sheetPanelRef.current, overflow, rootRef.current)
+          }
           tabsRef={setSheetTabs}
           bodyRef={setSheetBody}
         />
@@ -175,10 +257,166 @@ export function ChatActivityPanelsProvider(props: {
 }
 
 /**
+ * The width the TODO chip keeps before a chip after it moves into the "+N" chip, so the current
+ * step stays readable on a phone (the approved phone design shows its first words).
+ */
+const PLAIN_CHIP_RESERVE_PX = 104;
+
+/** The line's chips, the "+N" chip included. */
+const LINE_CHIPS = "[data-activity-chip], [data-activity-overflow-chip]";
+
+/** A chip's width without truncation: its width plus what its truncating text cuts off. */
+function naturalChipWidth(chip: HTMLElement): number {
+  const text = chip.querySelector<HTMLElement>("[data-chip-truncates]");
+  const cut = text === null ? 0 : text.scrollWidth - text.clientWidth;
+  return chip.getBoundingClientRect().width + cut;
+}
+
+/**
+ * The bordered chips that do not fit the strip, from the end of the line. The TODO chip
+ * (plain) never hides: it yields width down to its reserve first. A hidden chip stays laid out
+ * out of the flow (ChatActivityChipButton), so its width is known when room comes back.
+ */
+export function measureChipOverflow(strip: HTMLElement): ChatActivityId[] {
+  const chips = [...strip.querySelectorAll<HTMLElement>("[data-activity-chip][data-activity-id]")];
+  const plain = chips.filter((chip) => chip.dataset.chipVariant === "plain");
+  const bordered = chips
+    .filter((chip) => chip.dataset.chipVariant !== "plain")
+    .sort(
+      (a, b) =>
+        CHAT_ACTIVITY_ORDER[a.dataset.activityId as ChatActivityId] -
+        CHAT_ACTIVITY_ORDER[b.dataset.activityId as ChatActivityId]
+    );
+  const more = strip.querySelector<HTMLElement>("[data-activity-overflow-chip]");
+  const gap = Number.parseFloat(getComputedStyle(strip).columnGap) || 0;
+  const plainWidth = plain.reduce(
+    (sum, chip) => sum + Math.min(naturalChipWidth(chip), PLAIN_CHIP_RESERVE_PX),
+    0
+  );
+  const widths = bordered.map((chip) => chip.getBoundingClientRect().width);
+  const moreWidth = more?.getBoundingClientRect().width ?? 0;
+  // Flex items: the plain chips, the spacer between them and the rest (StreamingBarrierView shows
+  // it only beside a plain chip), the chips shown, and the "+N" chip once any hides. One gap
+  // between each pair.
+  const spacer = plain.length > 0 ? 1 : 0;
+  const needed = (shown: number) => {
+    const hides = shown < bordered.length;
+    const items = plain.length + spacer + shown + (hides ? 1 : 0);
+    const chipsWidth = widths.slice(0, shown).reduce((sum, width) => sum + width, 0);
+    return plainWidth + chipsWidth + (hides ? moreWidth : 0) + gap * (items - 1);
+  };
+  let shown = bordered.length;
+  // Sub-pixel layout: a chip that fits to within half a pixel stays.
+  while (shown > 0 && needed(shown) > strip.clientWidth + 0.5) shown--;
+  return bordered.slice(shown).map((chip) => chip.dataset.activityId as ChatActivityId);
+}
+
+function sameIds(a: readonly ChatActivityId[], b: readonly ChatActivityId[]): boolean {
+  return a.length === b.length && a.every((id, index) => id === b[index]);
+}
+
+/**
+ * Which chips the line has no room for. Measured from the DOM, not computed in render: the chips
+ * render themselves (each decides whether it has anything to show), and only layout knows their
+ * widths. Re-measured when the strip or a chip resizes, and when chips mount or unmount.
+ */
+function useChipOverflow(
+  rootRef: RefObject<HTMLDivElement | null>,
+  setOpenId: (update: OpenIdUpdate) => void
+): readonly ChatActivityId[] {
+  const [overflow, setOverflow] = useState<readonly ChatActivityId[]>(NO_OVERFLOW);
+  useLayoutEffect(() => {
+    const root = rootRef.current;
+    // mutation-equivalent: the ref attaches in the provider's commit, before its layout effects
+    if (root === null) return;
+    let strip: HTMLElement | null = null;
+    const update = () => {
+      const next = strip === null ? NO_OVERFLOW : measureChipOverflow(strip);
+      setOverflow((current) => (sameIds(current, next) ? current : next));
+      // Nothing left to list: the "+N" chip went away with its list open.
+      if (next.length === 0) setOpenId((current) => (current === "more" ? null : current));
+    };
+    const resizes = new ResizeObserver(update);
+    const observe = () => {
+      resizes.disconnect();
+      strip = root.querySelector<HTMLElement>("[data-activity-strip]");
+      if (strip === null) return;
+      resizes.observe(strip);
+      for (const chip of strip.querySelectorAll(LINE_CHIPS)) {
+        resizes.observe(chip);
+      }
+    };
+    const mutations = new MutationObserver(() => {
+      observe();
+      update();
+    });
+    mutations.observe(root, { childList: true, subtree: true });
+    observe();
+    update();
+    return () => {
+      resizes.disconnect();
+      mutations.disconnect();
+    };
+  }, [rootRef, setOpenId]);
+  return overflow;
+}
+
+/**
+ * A chip that hides while it has focus would drop focus to the page: it goes to what shows the
+ * chip now instead, the "+N" chip, or for the "+N" chip the first chip it stood in for. In the
+ * commit that hides the chip, while the browser still counts it as focused.
+ */
+function useChipFocusWhenHidden(
+  rootRef: RefObject<HTMLDivElement | null>,
+  overflow: readonly ChatActivityId[]
+): void {
+  const previousRef = useRef(overflow);
+  useLayoutEffect(() => {
+    const previous = previousRef.current;
+    previousRef.current = overflow;
+    const line = rootRef.current;
+    const focused = document.activeElement;
+    if (!line?.contains(focused)) return;
+    // mutation-equivalent: without `?? null`, the heir lookup finds the "+N" chip, a candidate already
+    const target = shownFocusTarget(focused, previous.at(0) ?? null, overflow, line);
+    if (target !== focused) target?.focus();
+  }, [rootRef, overflow]);
+}
+
+/**
+ * Where focus on `element` goes: `element` itself, unless it is a chip the line no longer shows,
+ * which cannot take focus. The line hides the chips it has no room for (Stop or a status label
+ * can take room) and the "+N" chip once every chip fits again, and a chip leaves with its
+ * activity (the last bash exits). Then the first the line shows of: the "+N" chip, which stands
+ * in for a hidden chip; `heir`, the chip that takes over from a hidden "+N" chip; any chip.
+ */
+function shownFocusTarget(
+  element: Element | null,
+  heir: ChatActivityPanelId | null,
+  overflow: readonly ChatActivityId[],
+  line: HTMLElement | null
+): HTMLElement | null {
+  const shown = (candidate: Element | null | undefined): candidate is HTMLElement =>
+    candidate instanceof HTMLElement &&
+    candidate.isConnected &&
+    (candidate.hasAttribute("data-activity-overflow-chip")
+      ? overflow.length > 0
+      : !overflow.includes(candidate.dataset.activityId as ChatActivityId));
+  const chips = [...(line?.querySelectorAll<HTMLElement>(LINE_CHIPS) ?? [])];
+  const candidates = [
+    element,
+    chips.find((chip) => chip.hasAttribute("data-activity-overflow-chip")),
+    chips.find((chip) => chip.dataset.activityId === heir),
+    ...chips,
+  ];
+  return candidates.find(shown) ?? null;
+}
+
+/**
  * True where the panels open in the sheet: phone widths, and viewports too short for a popover
  * above the line (a phone in landscape), which would run off the top of the screen.
  */
-function useSheetViewport(): boolean {
+export function useSheetViewport(): boolean {
   const narrow = useNarrowViewport();
   const short = useShortViewport();
   return narrow || short;
@@ -197,68 +435,6 @@ function useSheetSlots(sheetViewport: boolean) {
 }
 
 /**
- * Modal focus for the sheet. While it is open the covered page is inert, so Tab cannot leave the
- * sheet for the composer behind it, and focus moves in unless a panel already placed it there
- * (the background-bash chord focuses its first row; the line's effects run before the sheet's).
- * Closing hands focus back to where it was before once the page is interactive again (an inert
- * element cannot take focus). In a passive effect's cleanup: a layout effect's cleanup runs amid
- * the commit's DOM changes, and React then puts focus back on the element that had it before.
- */
-function useSheetFocus(
-  open: boolean,
-  rootRef: RefObject<HTMLDivElement | null>,
-  dialogRef: RefObject<HTMLDivElement | null>
-): void {
-  // Read in the commit that opens the sheet, before the chord's effect moves focus to its row.
-  // Closing reads it too, unused.
-  const returnFocusRef = useRef<Element | null>(null);
-  useLayoutEffect(() => {
-    returnFocusRef.current = document.activeElement;
-  }, [open]);
-  useEffect(() => {
-    const root = rootRef.current;
-    const dialog = dialogRef.current;
-    // mutation-equivalent: both refs attach in the sheet's one commit, so they are null together
-    if (!open || root === null || dialog === null) return;
-    const returnFocus = returnFocusRef.current;
-    const restoreOthers = makeOthersInert(root);
-    if (!dialog.contains(document.activeElement)) dialog.focus();
-    return () => {
-      restoreOthers();
-      // No isConnected check: focus() does nothing on an element that left the page meanwhile.
-      if (returnFocus instanceof HTMLElement) returnFocus.focus();
-    };
-  }, [open, rootRef, dialogRef]);
-}
-
-/**
- * Escape closes the sheet. A DOM listener, not onKeyDown: the tabs and the panel portal into the
- * sheet from their chips, so their React events bubble to the chips and never reach a React
- * handler here. It runs after those handlers, so a panel that handles Escape itself (by
- * preventing default or stopping it) keeps it, and it stops Escape before the window's stream
- * interrupt sees it. Escape from <body> reaches the open panel's chip instead
- * (useCloseChatActivityPanelOnBodyEscape).
- */
-function useSheetEscape(
-  open: boolean,
-  rootRef: RefObject<HTMLDivElement | null>,
-  close: () => void
-): void {
-  useEffect(() => {
-    const root = rootRef.current;
-    if (!open || root === null) return;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) return;
-      event.preventDefault();
-      stopKeyboardPropagation(event);
-      close();
-    };
-    root.addEventListener("keydown", onKeyDown);
-    return () => root.removeEventListener("keydown", onKeyDown);
-  }, [open, rootRef, close]);
-}
-
-/**
  * The phone sheet. It stays mounted (hidden while closed) so its slots exist before a panel
  * opens: the background-bash chord opens the panel and focuses its first row in one commit, which
  * needs the row in the DOM on that commit.
@@ -266,56 +442,25 @@ function useSheetEscape(
 function ChatActivitySheet(props: {
   open: boolean;
   onClose: () => void;
+  returnFocus: ChatDockSheetReturnFocus;
   tabsRef: (element: HTMLElement | null) => void;
   bodyRef: (element: HTMLElement | null) => void;
 }) {
-  const titleId = useId();
-  const rootRef = useRef<HTMLDivElement>(null);
-  const dialogRef = useRef<HTMLDivElement>(null);
-  const open = props.open;
-  const close = props.onClose;
-  useSheetFocus(open, rootRef, dialogRef);
-  useSheetEscape(open, rootRef, close);
-
-  return createPortal(
-    <div
-      ref={rootRef}
-      className={cn("fixed inset-0 z-[1400]", !open && "hidden")}
-      data-component="ChatActivitySheet"
+  return (
+    <ChatDockSheet
+      open={props.open}
+      onClose={props.onClose}
+      returnFocus={props.returnFocus}
+      title="Activity"
+      dataComponent="ChatActivitySheet"
     >
-      <div aria-hidden className="absolute inset-0 bg-black/50" onClick={close} />
       <div
-        ref={dialogRef}
-        // Only while open: isDialogOpen() looks for an aria-modal dialog anywhere in the DOM.
-        role={open ? "dialog" : undefined}
-        aria-modal={open ? true : undefined}
-        aria-labelledby={titleId}
-        tabIndex={-1}
-        className="bg-surface-primary border-border-medium absolute inset-x-0 bottom-0 flex max-h-[min(80vh,40rem)] flex-col rounded-t-2xl border-t pb-[env(safe-area-inset-bottom,0px)] shadow-lg outline-none"
-      >
-        <div aria-hidden className="bg-border-medium mx-auto mt-2 h-1 w-9 shrink-0 rounded-full" />
-        <div className="flex shrink-0 items-center gap-2 pt-2 pr-2 pl-4">
-          <h2 id={titleId} className="text-foreground text-base font-semibold">
-            Activity
-          </h2>
-          <button
-            type="button"
-            aria-label="Close"
-            onClick={close}
-            className="text-muted hover:text-foreground ml-auto inline-flex size-8 items-center justify-center rounded-md transition-colors"
-          >
-            <X className="size-4" />
-          </button>
-        </div>
-        <div
-          ref={props.tabsRef}
-          role="tablist"
-          aria-label="Activity"
-          className="bg-surface-secondary mx-4 mt-2 flex shrink-0 scroll-px-1 scrollbar-none gap-1 overflow-x-auto rounded-lg p-1"
-        />
-        <div ref={props.bodyRef} className="flex min-h-0 flex-1 flex-col" />
-      </div>
-    </div>,
-    document.body
+        ref={props.tabsRef}
+        role="tablist"
+        aria-label="Activity"
+        className="bg-surface-secondary mx-4 mt-2 flex shrink-0 scroll-px-1 scrollbar-none gap-1 overflow-x-auto rounded-lg p-1"
+      />
+      <div ref={props.bodyRef} className="flex min-h-0 flex-1 flex-col" />
+    </ChatDockSheet>
   );
 }

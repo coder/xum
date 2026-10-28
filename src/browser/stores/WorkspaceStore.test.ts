@@ -6219,6 +6219,32 @@ describe("WorkspaceStore", () => {
       expect(state.agentStatus).toEqual({ emoji: "🔄", message: "Run typecheck" });
     });
 
+    it("between turns a finished plan keeps its TODO chip but not the sidebar status", () => {
+      const workspaceId = "active-finished-plan-status";
+      createAndAddWorkspace(store, workspaceId);
+      const todos: TodoItem[] = [
+        { content: "Run typecheck", status: "completed" },
+        { content: "Add regression test", status: "completed" },
+      ];
+      seedPinnedTodos(store, workspaceId, todos);
+      const aggregator = store.getAggregator(workspaceId);
+      if (!aggregator) throw new Error("expected aggregator");
+
+      aggregator.handleStreamEnd({
+        type: "stream-end",
+        workspaceId,
+        messageId: `${workspaceId}-stream`,
+        metadata: { historySequence: 1, timestamp: 1_003, model: "claude-sonnet-4" },
+        parts: [],
+      });
+
+      // The chip still reads 2/2, but the sidebar does not name the plan's last step: with the
+      // plan cleared at the turn's end it fell through to the agent's own status, here none.
+      const state = store.getWorkspaceState(workspaceId);
+      expect(state.todos).toEqual(todos);
+      expect(state.agentStatus).toBeUndefined();
+    });
+
     it("falls back to persisted AI status for active workspaces with no live todos", async () => {
       // Live aggregator todos are the freshest signal for "what is the
       // agent doing right now" because `todo_write` is processed

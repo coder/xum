@@ -432,11 +432,69 @@ async function assertMenuClearsSafeArea(page: StoryPage) {
   }
 }
 
+const LANDSCAPE_SHEET_STORY = "app-composeractivityline--worst-case-phone";
+
+/**
+ * The live line's activity sheet on a touch phone, upright and in landscape. Landscape is wider
+ * than globals.css's touch-size rule (up to 768px) but short, so the sheet opens there too, and its
+ * Close button and tabs must still be 44px touch targets. Upright, four tabs do not fit: each must
+ * keep its label and count (the strip scrolls), though that rule's 44px min-width would let a tab
+ * shrink below them. Plays cannot emulate the pointer.
+ */
+async function assertSheetTouchTargets(page: StoryPage) {
+  const client = await page.context().newCDPSession(page);
+  const viewport = page.viewportSize();
+  const problems: string[] = [];
+  try {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: true });
+    for (const size of [
+      { width: 844, height: 390 },
+      { width: 375, height: 667 },
+    ]) {
+      await page.setViewportSize(size);
+      await page.waitForFunction(
+        (width) => matchMedia("(pointer: coarse)").matches && innerWidth === width,
+        size.width,
+        { timeout: 5000 }
+      );
+      await page
+        .locator('[data-component="ChatActivityLine"] [data-component="PinnedTodoList"] button')
+        .first()
+        .click();
+      const sheet = page.getByRole("dialog", { name: "Activity" });
+      await sheet.waitFor({ timeout: 5000 });
+      const targets = [
+        sheet.getByRole("button", { name: "Close" }),
+        ...(await sheet.getByRole("tab").all()),
+      ];
+      for (const target of targets) {
+        const box = await target.boundingBox();
+        const name = `${size.width}px ${(await target.textContent())?.trim() || "Close"}`;
+        const clipped = await target.evaluate(
+          (element) => element.scrollWidth > element.clientWidth
+        );
+        if (!box) problems.push(`${name}: missing`);
+        else if (box.height < 44) problems.push(`${name}: ${Math.round(box.height)}px tall`);
+        else if (clipped) problems.push(`${name}: label cut`);
+      }
+      await page.keyboard.press("Escape");
+      await sheet.waitFor({ state: "hidden", timeout: 5000 });
+    }
+    assert.equal(problems.join("; "), "", "The sheet's controls must be whole touch targets");
+  } finally {
+    await client.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+    await client.detach();
+    if (viewport) await page.setViewportSize(viewport);
+  }
+}
+
 // Stories that need a phone viewport for their play, as their globals.viewport gives them in
 // Storybook. A fixed-size frame would not do: matchMedia, which decides where the live line opens
 // its panels (the phone sheet or a popover), still sees the desktop window.
 const PHONE_VIEWPORT_STORIES = new Map([
   ["app-composeractivityline--worst-case-phone", { width: 375, height: 667 }],
+  ["app-waitingonyou--phone", { width: 390, height: 844 }],
+  ["app-waitingonyou--phone-count-change-keeps-typing", { width: 390, height: 844 }],
 ]);
 const viewportsToRestore = new WeakMap<object, { width: number; height: number }>();
 
@@ -461,6 +519,12 @@ const config: TestRunnerConfig = {
     if (restoreViewport) {
       viewportsToRestore.delete(page);
       await page.setViewportSize(restoreViewport);
+    }
+    if (context.id === LANDSCAPE_SHEET_STORY) {
+      if (page.context().browser()?.browserType().name() === "chromium") {
+        await assertSheetTouchTargets(page);
+      }
+      return;
     }
     const insetTarget = SIDE_INSET_TARGETS.get(context.id);
     if (insetTarget) {

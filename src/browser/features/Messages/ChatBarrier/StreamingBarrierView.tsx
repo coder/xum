@@ -197,13 +197,17 @@ function ActivityChips(props: {
           )}
         />
       )}
-      {/* Chips scroll sideways rather than wrap when a phone-width row runs out of room.
-          No edge-fade mask here: a mask would also clip the chips' panels, which render
-          inside this row but are positioned against the whole line. With chips the strip takes
-          the row's free width. With a plain TODO chip the spacer (between it and the bordered
-          chips, by flex order) ends the line with the bordered chips next to Stop; without one
-          the spacer stays hidden so the bordered chips follow the status label. */}
-      <div className="flex min-w-0 scrollbar-none items-center gap-1.5 overflow-x-auto has-[[data-activity-chip]]:flex-1">
+      {/* The chips that do not fit move into a "+N" chip (the composer's live line measures the
+          strip, `data-activity-strip`); the strip still scrolls sideways when even that does
+          not fit, rather than wrap. No edge-fade mask here: a mask would also clip the chips'
+          panels, which render inside this row but are positioned against the whole line. With
+          chips the strip takes the row's free width. With a plain TODO chip the spacer (between
+          it and the bordered chips, by flex order) ends the line with the bordered chips next to
+          Stop; without one the spacer stays hidden so the bordered chips follow the status label. */}
+      <div
+        data-activity-strip=""
+        className="flex min-w-0 scrollbar-none items-center gap-1.5 overflow-x-auto has-[[data-activity-chip]]:flex-1"
+      >
         {props.children}
         <span
           aria-hidden

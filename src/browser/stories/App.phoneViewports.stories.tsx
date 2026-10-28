@@ -410,7 +410,7 @@ export const IPhone16eComposerDecorations: AppStory = {
       // The test-runner's wide window around the phone frame: a popover above the line.
       await expect(panelRect.bottom).toBeLessThanOrEqual(line.getBoundingClientRect().top);
     }
-    await expect(within(panel).getByText("dev server")).toBeVisible();
+    await expect(within(panel).getByText("bun run dev")).toBeVisible();
   },
 };
 

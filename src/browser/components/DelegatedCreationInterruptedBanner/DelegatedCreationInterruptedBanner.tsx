@@ -1,6 +1,10 @@
 import React, { useRef, useState } from "react";
 import { Check, Loader2, TriangleAlert, Trash2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
+import {
+  useWaitingOnYou,
+  type WaitingOnYouEntry,
+} from "@/browser/components/ChatPane/WaitingOnYou";
 import { useLiveAPI } from "@/browser/contexts/API";
 import {
   useConfirmDialog,
@@ -24,6 +28,13 @@ export const DELEGATED_CREATION_INTERRUPTED_MESSAGE =
 
 type BannerAction = "remove" | "keep";
 
+const SETUP_INTERRUPTED_ENTRY: WaitingOnYouEntry = {
+  icon: TriangleAlert,
+  tab: "Setup interrupted",
+  title: "Setup interrupted",
+  detail: "Keep or remove this workspace",
+};
+
 export interface DelegatedCreationInterruptedNoticeProps {
   workspaceId: string;
   /** Names what the removal deletes on this workspace's runtime (#5204). */
@@ -41,6 +52,7 @@ export interface DelegatedCreationInterruptedNoticeProps {
 export const DelegatedCreationInterruptedNotice: React.FC<
   DelegatedCreationInterruptedNoticeProps
 > = (props) => {
+  useWaitingOnYou(SETUP_INTERRUPTED_ENTRY);
   const liveApi = useLiveAPI();
   const [pendingAction, setPendingAction] = useState<BannerAction | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);

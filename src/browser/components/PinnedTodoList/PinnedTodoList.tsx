@@ -5,6 +5,7 @@ import { TodoList } from "../TodoList/TodoList";
 import { ChatInputDecoration } from "../ChatPane/ChatInputDecoration";
 import { useChatActivityPanel } from "../ChatPane/chatActivityPanels";
 import { useWorkspaceStoreRaw } from "@/browser/stores/WorkspaceStore";
+import { KEYBINDS } from "@/browser/utils/ui/keybinds";
 import type { TodoItem } from "@/common/types/tools";
 
 interface PinnedTodoListProps {
@@ -91,8 +92,8 @@ function TodoProgressRing(props: { completed: number; total: number }) {
 
 /**
  * Pinned TODO list: a chip in the composer's live line that names the current step, with the
- * full list in its panel. Incomplete plans persist across streams until the agent updates them,
- * while fully completed plans clear when the final stream ends for this workspace.
+ * full list in its panel. Plans persist across streams until the agent updates them; a finished
+ * plan stays, its chip reading 5/5, until the next turn starts.
  *
  * Relies on natural reference stability from MapStore + Aggregator architecture:
  * - Aggregator.getCurrentTodos() returns direct reference (not a copy)
@@ -136,6 +137,7 @@ export const PinnedTodoList: React.FC<PinnedTodoListProps> = ({ workspaceId }) =
       chipVariant="plain"
       chipClassName="min-w-14"
       panelTitle="TODO"
+      panelKeybind={KEYBINDS.OPEN_TODO_PANEL}
       panelMeta={[`${progress} done`, ...(currentTodo ? summaryParts : [])].join(" · ")}
       tab={
         <>
@@ -151,7 +153,12 @@ export const PinnedTodoList: React.FC<PinnedTodoListProps> = ({ workspaceId }) =
           <span className={cn("counter-nums text-muted", currentTodo && "hidden @md:inline")}>
             {progress}
           </span>
-          {currentTodo && <span className="min-w-0 truncate">{currentTodo.content}</span>}
+          {currentTodo && (
+            // The live line reads what this cuts off when it decides which chips fit.
+            <span data-chip-truncates="" className="min-w-0 truncate">
+              {currentTodo.content}
+            </span>
+          )}
         </>
       }
       summary={

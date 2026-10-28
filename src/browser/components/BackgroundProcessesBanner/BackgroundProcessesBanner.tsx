@@ -3,8 +3,18 @@ import { Terminal, X, Loader2, FileText } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "../Tooltip/Tooltip";
 import { cn } from "@/common/lib/utils";
 import { BackgroundBashOutputDialog } from "../BackgroundBashOutputDialog/BackgroundBashOutputDialog";
-import { ActivityChipLiveDot, ChatInputDecoration } from "../ChatPane/ChatInputDecoration";
-import { useChatActivityPanel } from "../ChatPane/chatActivityPanels";
+import {
+  ACTIVITY_SHORTCUT_HINT_CLASS,
+  ActivityChipLiveDot,
+  ChatInputDecoration,
+  shownChip,
+} from "../ChatPane/ChatInputDecoration";
+import {
+  acceptsActivityPanelChord,
+  useChatActivityOverflow,
+  useChatActivityPanel,
+  useChatActivitySheet,
+} from "../ChatPane/chatActivityPanels";
 import { formatKeyLabel } from "../Keycap/Keycap";
 import { formatElapsed } from "@/common/utils/formatDuration";
 import type { BackgroundProcessInfo } from "@/common/orpc/schemas/api";
@@ -15,20 +25,9 @@ import {
 import { useBackgroundBashActions } from "@/browser/contexts/BackgroundBashContext";
 import { useChatHostContext } from "@/browser/contexts/ChatHostContext";
 import { stopKeyboardPropagation } from "@/browser/utils/events";
-import {
-  KEYBINDS,
-  formatKeybind,
-  isCommandPaletteTarget,
-  isDialogOpen,
-  isTerminalFocused,
-  matchesKeybind,
-  paneHandlesKeyEvent,
-} from "@/browser/utils/ui/keybinds";
+import { KEYBINDS, formatKeybind, matchesKeybind } from "@/browser/utils/ui/keybinds";
 import { useChatPaneScope } from "@/browser/contexts/ChatPaneScopeContext";
 import { CUSTOM_EVENTS, type CustomEventPayloads } from "@/common/constants/events";
-
-const SHORTCUT_HINT_CLASS =
-  "ml-1.5 font-mono text-[10px] opacity-70 [@media(max-width:768px)]:hidden";
 
 /** Focuses the expanded strip's row at `index`, clamped to the rows that exist. */
 function focusProcessRow(list: HTMLElement | null, index: number): void {
@@ -52,11 +51,17 @@ function restoreFocus(
 }
 
 /**
- * The strip's expand/collapse control: the live line's chip, or else the row button that
- * ChatInputDecoration renders just before the list (the VS Code webview's tray).
+ * The strip's expand/collapse control: the live line's chip (the "+N" chip while the line has no
+ * room for it), or else the row button that ChatInputDecoration renders just before the list (the
+ * VS Code webview's tray).
  */
-function stripToggle(root: HTMLElement | null, list: HTMLElement | null): Element | null {
-  return root?.querySelector("[data-activity-chip]") ?? list?.previousElementSibling ?? null;
+function stripToggle(
+  root: HTMLElement | null,
+  list: HTMLElement | null,
+  overflowed: boolean
+): Element | null {
+  const chip = root?.querySelector("[data-activity-chip]");
+  return chip == null ? (list?.previousElementSibling ?? null) : shownChip(chip, overflowed);
 }
 
 function backgroundBashNoun(count: number): string {
@@ -81,12 +86,30 @@ function BashesKeyHints(props: { canViewOutput: boolean }) {
   return <>{hints.filter((hint) => hint !== false).join(" · ")}</>;
 }
 
+type ProcessRowFields = Pick<BackgroundProcessInfo, "id" | "script" | "displayName">;
+
 /**
- * A row's muted line, e.g. "watching /READY|FAILED/ · 0 matches · pid 48211". Rows synthesized
- * from a durable pending wake (process gone after restart) carry no real pid, but always a monitor.
+ * What a row leads with: its command, the script's first non-blank line (the row truncates it to
+ * fit), else the agent's name for the process.
  */
-export function formatProcessDetail(proc: Pick<BackgroundProcessInfo, "monitor" | "pid">): string {
+function processRowTitle(proc: ProcessRowFields): string {
+  const command = proc.script.split("\n").find((line) => line.trim() !== "");
+  return command?.trim() ?? proc.displayName ?? proc.id;
+}
+
+/**
+ * A row's muted line, e.g. "CI watch · watching /READY|FAILED/ · 0 matches · pid 48211": the
+ * agent's name for the process (the row leads with its command), then its monitor and pid. Rows
+ * synthesized from a durable pending wake (process gone after restart) carry no real pid, but
+ * always a monitor.
+ */
+export function formatProcessDetail(
+  proc: ProcessRowFields & Pick<BackgroundProcessInfo, "monitor" | "pid">
+): string {
   const parts: string[] = [];
+  if (proc.displayName && proc.displayName !== processRowTitle(proc)) {
+    parts.push(proc.displayName);
+  }
   if (proc.monitor) {
     const matches = proc.monitor.totalMatches;
     parts.push(`watching /${proc.monitor.filter}/`, `${matches} match${matches === 1 ? "" : "es"}`);
@@ -103,18 +126,6 @@ function ProcessRowDot(props: { running: boolean }) {
   ) : (
     <span aria-hidden className="size-1.5 shrink-0" />
   );
-}
-
-/**
- * Truncate script to reasonable display length.
- */
-function truncateScript(script: string, maxLength = 60): string {
-  // First line only, truncated
-  const firstLine = script.split("\n")[0] ?? script;
-  if (firstLine.length <= maxLength) {
-    return firstLine;
-  }
-  return firstLine.slice(0, maxLength - 3) + "...";
 }
 
 interface BackgroundProcessesBannerProps {
@@ -141,8 +152,10 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   const [focusRequest, setFocusRequest] = useState(0);
   // The focused row; if its process leaves the list, a neighbor takes focus instead of the body.
   const focusedRowRef = useRef<{ processId: string; index: number } | null>(null);
-  // The output dialog has no trigger to return focus to, so a keyboard open records its row.
-  const refocusAfterOutputRef = useRef<{ row: HTMLElement; index: number } | null>(null);
+  // The output dialog has no trigger to return focus to, so opening it records what opened it:
+  // the row (keyboard) or its View output button (mouse). Radix would otherwise leave focus on
+  // the body, where the next Escape closed the panel instead of reaching the row.
+  const refocusAfterOutputRef = useRef<{ target: HTMLElement; index: number } | null>(null);
   // Under immersive review desktop keeps the chat pane mounted but inert: ignore requests then.
   const rootRef = useRef<HTMLDivElement>(null);
 
@@ -167,6 +180,8 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
   // The main chat and the /side chat tab each mount a banner; the chord goes to the pane owning
   // the focused element so focus never jumps into the other chat's list.
   const paneScope = useChatPaneScope();
+  const sheet = useChatActivitySheet();
+  const overflowed = useChatActivityOverflow().overflow.includes("background-bashes");
   // Listens only while there is something to focus, so the chord is not consumed otherwise.
   useEffect(() => {
     if (count === 0) return;
@@ -184,15 +199,13 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       setFocusRequest((request) => request + 1);
     };
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!matchesKeybind(event, KEYBINDS.FOCUS_BACKGROUND_PROCESSES) || isDialogOpen()) return;
-      if (!paneHandlesKeyEvent(paneScope, event.target)) return;
-      if (isCommandPaletteTarget(event.target)) return;
-      if (isTerminalFocused(event.target)) return; // the terminal owns its keystrokes
-      if (rootRef.current?.closest("[inert]")) return;
+      const root = rootRef.current;
+      const chord = KEYBINDS.FOCUS_BACKGROUND_PROCESSES;
+      if (!acceptsActivityPanelChord(event, chord, paneScope, root, sheet)) return;
       event.preventDefault();
       if (event.repeat) return;
       if (listRef.current?.contains(document.activeElement)) {
-        const toggle = stripToggle(rootRef.current, listRef.current);
+        const toggle = stripToggle(rootRef.current, listRef.current, overflowed);
         setIsExpanded(false);
         restoreFocus(returnFocusRef, toggle);
       } else {
@@ -213,7 +226,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener(CUSTOM_EVENTS.FOCUS_BACKGROUND_PROCESSES, onFocusRequest);
     };
-  }, [count, props.workspaceId, paneScope, setIsExpanded]);
+  }, [count, props.workspaceId, paneScope, sheet, overflowed, setIsExpanded]);
 
   useEffect(() => {
     if (focusRequest > 0) focusProcessRow(listRef.current, 0);
@@ -239,8 +252,8 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     refocusAfterOutputRef.current = null;
     if (target == null) return;
     // The row's process may have left the list while the dialog was open.
-    if (target.row.isConnected) {
-      target.row.focus();
+    if (target.target.isConnected) {
+      target.target.focus();
     } else if (listRef.current) {
       focusProcessRow(listRef.current, target.index);
     } else {
@@ -257,7 +270,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     const proc = visibleProcesses[index];
     if (!row || !proc) return;
     if (matchesKeybind(event, KEYBINDS.CANCEL)) {
-      const toggle = stripToggle(rootRef.current, listRef.current);
+      const toggle = stripToggle(rootRef.current, listRef.current, overflowed);
       setIsExpanded(false);
       restoreFocus(returnFocusRef, toggle);
     } else if (matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_NEXT)) {
@@ -272,7 +285,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
       canViewOutput &&
       !terminatingIds.has(proc.id)
     ) {
-      refocusAfterOutputRef.current = { row, index };
+      refocusAfterOutputRef.current = { target: row, index };
       setViewingProcessId(proc.id);
     } else if (
       matchesKeybind(event, KEYBINDS.BACKGROUND_PROCESS_TERMINATE) &&
@@ -288,10 +301,15 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
     stopKeyboardPropagation(event);
   };
 
-  const handleViewOutput = useCallback((processId: string, event: React.MouseEvent) => {
+  const handleViewOutput = (
+    processId: string,
+    index: number,
+    event: React.MouseEvent<HTMLButtonElement>
+  ) => {
     event.stopPropagation();
+    refocusAfterOutputRef.current = { target: event.currentTarget, index };
     setViewingProcessId(processId);
-  }, []);
+  };
 
   const handleTerminate = useCallback(
     (processId: string, event: React.MouseEvent) => {
@@ -323,7 +341,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
           chipTooltip={
             <>
               Background bashes
-              <kbd className={SHORTCUT_HINT_CLASS}>
+              <kbd className={ACTIVITY_SHORTCUT_HINT_CLASS}>
                 {formatKeybind(KEYBINDS.FOCUS_BACKGROUND_PROCESSES)}
               </kbd>
             </>
@@ -382,9 +400,19 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                 >
                   <ProcessRowDot running={proc.status === "running"} />
                   <div className="min-w-0 flex-1">
-                    <div className="text-foreground truncate font-mono text-xs" title={proc.script}>
-                      {proc.displayName ?? truncateScript(proc.script)}
-                    </div>
+                    {/* The command, as in the approved design; the detail line names the
+                        process. The tooltip carries the whole script, which the row cuts at
+                        its first line and the row's width. */}
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <div className="text-foreground truncate font-mono text-xs">
+                          {processRowTitle(proc)}
+                        </div>
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-md font-mono break-all whitespace-pre-wrap">
+                        {proc.script}
+                      </TooltipContent>
+                    </Tooltip>
                     <div className="text-muted truncate text-[10px]">
                       {formatProcessDetail(proc)}
                     </div>
@@ -421,7 +449,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                             type="button"
                             aria-label="View output"
                             disabled={isTerminating}
-                            onClick={(e) => handleViewOutput(proc.id, e)}
+                            onClick={(e) => handleViewOutput(proc.id, index, e)}
                             className={cn(
                               "text-muted hover:text-secondary rounded p-1 transition-colors",
                               isTerminating && "cursor-not-allowed"
@@ -432,7 +460,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         </TooltipTrigger>
                         <TooltipContent>
                           View output
-                          <kbd className={SHORTCUT_HINT_CLASS}>
+                          <kbd className={ACTIVITY_SHORTCUT_HINT_CLASS}>
                             {formatKeybind(KEYBINDS.BACKGROUND_PROCESS_VIEW_OUTPUT)}
                           </kbd>
                         </TooltipContent>
@@ -444,6 +472,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         <TooltipTrigger asChild>
                           <button
                             type="button"
+                            aria-label="Terminate process"
                             disabled={isTerminating}
                             onClick={(e) => handleTerminate(proc.id, e)}
                             className={cn(
@@ -460,7 +489,7 @@ export const BackgroundProcessesBanner: React.FC<BackgroundProcessesBannerProps>
                         </TooltipTrigger>
                         <TooltipContent>
                           Terminate process
-                          <kbd className={SHORTCUT_HINT_CLASS}>
+                          <kbd className={ACTIVITY_SHORTCUT_HINT_CLASS}>
                             {formatKeybind(KEYBINDS.BACKGROUND_PROCESS_TERMINATE)}
                           </kbd>
                         </TooltipContent>

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { CircleSlash, Loader2, Send, Trash2 } from "lucide-react";
 import { ChatDockSurface } from "@/browser/components/ChatPane/chatDockColumn";
+import type { WaitingOnYouEntry } from "@/browser/components/ChatPane/WaitingOnYou";
 import { useAPI, type APIClient } from "@/browser/contexts/API";
 import type { HeldInput as HeldInputData } from "@/common/orpc/types";
 import {
@@ -40,6 +41,17 @@ const HELD_INPUT_REASON_LABELS: Record<HeldInputData["reason"], string> = {
 
 function pluralize(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+/** The held inputs as the "Waiting on you" card names them. */
+export function heldInputsEntry(count: number): WaitingOnYouEntry {
+  return {
+    icon: CircleSlash,
+    tab: `${count} unsent`,
+    title: pluralize(count, "unsent message"),
+    detail: "Not sent · Send or Discard",
+    urgent: true,
+  };
 }
 
 type HeldInputAction = "send" | "discard";

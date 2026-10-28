@@ -21,6 +21,7 @@ import { EditCutoffBarrier } from "@/browser/features/Messages/ChatBarrier/EditC
 import { StreamingBarrier } from "@/browser/features/Messages/ChatBarrier/StreamingBarrier";
 import { RetryBarrier } from "@/browser/features/Messages/ChatBarrier/RetryBarrier";
 import { AskUserQuestionDock } from "./AskUserQuestionDock";
+import { WaitingOnYouCard, WaitingOnYouProvider, WaitingOnYouSlot } from "./WaitingOnYou";
 import { useAcceptedAnswersVersion } from "@/browser/utils/messages/openAskUserQuestions";
 import {
   AskUserQuestionPlacementProvider,
@@ -76,12 +77,15 @@ import type { HeldInput as HeldInputData } from "@/common/orpc/types";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import { getRuntimeTypeForTelemetry } from "@/common/telemetry";
 import { useAIViewKeybinds } from "@/browser/hooks/useAIViewKeybinds";
-import { QueuedMessage } from "@/browser/features/Messages/QueuedMessage";
-import { HeldInput } from "@/browser/features/Messages/HeldInput";
+import { QueuedMessage, queuedMessageEntry } from "@/browser/features/Messages/QueuedMessage";
+import { HeldInput, heldInputsEntry } from "@/browser/features/Messages/HeldInput";
 import { DelegatedCreationInterruptedBanner } from "@/browser/components/DelegatedCreationInterruptedBanner/DelegatedCreationInterruptedBanner";
 import { LegacyPlanImportBanner } from "@/browser/components/LegacyPlanImportBanner/LegacyPlanImportBanner";
 import { CompactionWarning } from "../CompactionWarning/CompactionWarning";
-import { ContextSwitchWarning as ContextSwitchWarningBanner } from "../ContextSwitchWarning/ContextSwitchWarning";
+import {
+  ContextSwitchWarning as ContextSwitchWarningBanner,
+  contextSwitchEntry,
+} from "../ContextSwitchWarning/ContextSwitchWarning";
 import { checkAutoCompaction } from "@/common/utils/compaction/autoCompactionCheck";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { getEffectiveThreshold } from "@/browser/features/RightSidebar/ThresholdSlider";
@@ -2046,34 +2050,42 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
         // while compaction/reconnect bypasses the hydration skeleton but other data is still loading.
         revealBeforeReady: true,
         node: (
-          <QueuedMessage
-            message={props.queuedMessage}
-            onEdit={() => void props.onEditQueuedMessage()}
-            editBlocked={props.editingMessage !== undefined}
-            onChangeDispatchMode={props.onQueuedDispatchModeChange}
-            onActionError={props.onQueuedActionError}
-            actionError={props.queuedActionError}
-            onActionStart={props.onClearQueuedActionError}
-            onSendImmediately={props.onSendQueuedImmediately}
-          />
+          <WaitingOnYouSlot id="queued" entry={queuedMessageEntry(props.queuedMessage)}>
+            <QueuedMessage
+              message={props.queuedMessage}
+              onEdit={() => void props.onEditQueuedMessage()}
+              editBlocked={props.editingMessage !== undefined}
+              onChangeDispatchMode={props.onQueuedDispatchModeChange}
+              onActionError={props.onQueuedActionError}
+              actionError={props.queuedActionError}
+              onActionStart={props.onClearQueuedActionError}
+              onSendImmediately={props.onSendQueuedImmediately}
+            />
+          </WaitingOnYouSlot>
         ),
       })
     );
   }
   // Refused queued messages sit next to the queued one: they are the user's unsent input too, and
   // the backend replays them as synchronous chat state, so they bypass the hydration reveal gate.
-  for (const [index, heldInput] of props.heldInputs.entries()) {
+  // One slot for all of them: the "Waiting on you" card gives them one tab ("2 unsent").
+  if (props.heldInputs.length > 0) {
     decorationEntries.push(
       createChatInputDecorationStackItem({
-        key: `held-input-${heldInput.id}`,
+        key: "held-inputs",
         revealBeforeReady: true,
         node: (
-          <HeldInput
-            workspaceId={props.workspaceId}
-            heldInput={heldInput}
-            // The composer's held-input shortcuts act on the oldest one (see ChatInput).
-            isShortcutTarget={index === 0}
-          />
+          <WaitingOnYouSlot id="held-inputs" entry={heldInputsEntry(props.heldInputs.length)}>
+            {props.heldInputs.map((heldInput, index) => (
+              <HeldInput
+                key={heldInput.id}
+                workspaceId={props.workspaceId}
+                heldInput={heldInput}
+                // The composer's held-input shortcuts act on the oldest one (see ChatInput).
+                isShortcutTarget={index === 0}
+              />
+            ))}
+          </WaitingOnYouSlot>
         ),
       })
     );
@@ -2115,13 +2127,18 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
     addDecorationEntry({
       key: "context-switch-warning",
       node: (
-        <ChatDockSurface>
-          <ContextSwitchWarningBanner
-            warning={props.contextSwitchWarning}
-            onCompact={props.onContextSwitchCompact}
-            onDismiss={props.onContextSwitchDismiss}
-          />
-        </ChatDockSurface>
+        <WaitingOnYouSlot
+          id="context-switch"
+          entry={contextSwitchEntry(props.contextSwitchWarning)}
+        >
+          <ChatDockSurface>
+            <ContextSwitchWarningBanner
+              warning={props.contextSwitchWarning}
+              onCompact={props.onContextSwitchCompact}
+              onDismiss={props.onContextSwitchDismiss}
+            />
+          </ChatDockSurface>
+        </WaitingOnYouSlot>
       ),
     });
   }
@@ -2131,19 +2148,25 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
   // workspace so one workspace's offer, error or pending import never carries over to another.
   addDecorationEntry({
     key: "legacy-plan-import",
-    node: <LegacyPlanImportBanner key={props.workspaceId} workspaceId={props.workspaceId} />,
+    node: (
+      <WaitingOnYouSlot id="legacy-plan">
+        <LegacyPlanImportBanner key={props.workspaceId} workspaceId={props.workspaceId} />
+      </WaitingOnYouSlot>
+    ),
   });
   if (props.delegatedCreationInterrupted) {
     addDecorationEntry({
       key: "delegated-creation-interrupted",
       node: (
-        <DelegatedCreationInterruptedBanner
-          // Keyed by workspace: ChatPane stays mounted across switches, and one workspace's
-          // pending Remove/Keep or its error must not carry over to another's banner.
-          key={props.workspaceId}
-          workspaceId={props.workspaceId}
-          workspaceName={props.workspaceName}
-        />
+        <WaitingOnYouSlot id="delegated-creation">
+          <DelegatedCreationInterruptedBanner
+            // Keyed by workspace: ChatPane stays mounted across switches, and one workspace's
+            // pending Remove/Keep or its error must not carry over to another's banner.
+            key={props.workspaceId}
+            workspaceId={props.workspaceId}
+            workspaceName={props.workspaceName}
+          />
+        </WaitingOnYouSlot>
       ),
     });
   }
@@ -2170,7 +2193,20 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
     createChatInputDecorationStackItem({
       key: "ask-user-question",
       revealBeforeReady: true,
-      node: <AskUserQuestionDock key={props.workspaceId} workspaceId={props.workspaceId} />,
+      node: (
+        <WaitingOnYouSlot id="question">
+          <AskUserQuestionDock key={props.workspaceId} workspaceId={props.workspaceId} />
+        </WaitingOnYouSlot>
+      ),
+    })
+  );
+  // Two or more of the items above at once fold into this card, under them in the stack (the
+  // items move into it, see WaitingOnYouSlot). Renders nothing otherwise.
+  decorationEntries.push(
+    createChatInputDecorationStackItem({
+      key: "waiting-on-you",
+      revealBeforeReady: true,
+      node: <WaitingOnYouCard />,
     })
   );
   // Keep decorations in the in-flow composer dock so height changes reserve
@@ -2178,9 +2214,11 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
 
   return (
     <>
-      <ChatInputDecorationStackLane
-        items={selectVisibleChatInputDecorations(decorationEntries, props.revealDecorations)}
-      />
+      <WaitingOnYouProvider key={props.workspaceId}>
+        <ChatInputDecorationStackLane
+          items={selectVisibleChatInputDecorations(decorationEntries, props.revealDecorations)}
+        />
+      </WaitingOnYouProvider>
       {/* Live status sits beside the input, below async decorations: neither history reveal nor
           banners arriving should bump the label and Stop across the screen. */}
       <ChatActivityLine
