@@ -899,6 +899,15 @@ interface TaskCreatePlan extends TaskCreatePlacement {
   readonly createdAt: string;
 }
 
+/** A direct launch's materialized checkout, read by the steps after its entry is persisted. */
+interface TaskLaunchCheckout {
+  readonly initLogger: InitLogger;
+  readonly workspacePath: string;
+  readonly trunkBranch: string;
+  readonly forkedRuntimeConfig: RuntimeConfig;
+  readonly runtimeForTaskWorkspace: Runtime;
+}
+
 /**
  * A direct Task.create launch's progress. The launch writes it as it advances and its failure
  * path (failTaskLaunch) reads it, so it is one mutable record: a copy would read stale values.
@@ -7529,10 +7538,20 @@ export class TaskService implements AgentTaskIntegration {
       }
       return materialized;
     }
-    const { initLogger, workspacePath, trunkBranch, forkedRuntimeConfig, runtimeForTaskWorkspace } =
-      materialized.data;
+    return await this.sanitizeTaskLaunchCheckout(plan, launch, materialized.data);
+  }
 
-    if (!useSharedWorkspace) {
+  /**
+   * The direct launch after its entry is persisted. Sanitizes the materialized checkout, then
+   * chains to announceAndInitTask and sendTaskLaunchPrompt: each step starts the next in the same
+   * tick as its own last await, so no call runs later than it did inline.
+   */
+  private async sanitizeTaskLaunchCheckout(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    checkout: TaskLaunchCheckout
+  ): Promise<Result<TaskCreateResult, string>> {
+    if (!plan.useSharedWorkspace) {
       // SECURITY: this checkout materialized outside the host's create/fork paths, so
       // registration-time plugin-override sanitization never saw it —
       // a tracked stale `plugin:` enable would re-activate a same-name
@@ -7542,28 +7561,43 @@ export class TaskService implements AgentTaskIntegration {
       // subscriber can send to this running-status task workspace while
       // sanitization is still waiting on the override lock.
       const sanitizeError = await this.workspaceService.sanitizeMaterializedTaskWorkspace(
-        taskId,
-        workspacePath,
-        forkedRuntimeConfig
+        plan.taskId,
+        checkout.workspacePath,
+        checkout.forkedRuntimeConfig
       );
       if (sanitizeError !== undefined) {
         // The row stays published with this checkout: MCP and sends refuse it (#4674).
-        this.initStateManager.markCheckoutUnsanitized(taskId);
-        await this.failTaskLaunch(plan, launch, sanitizeError, runtimeForTaskWorkspace, {});
-        initLogger.logComplete(-1);
+        this.initStateManager.markCheckoutUnsanitized(plan.taskId);
+        await this.failTaskLaunch(
+          plan,
+          launch,
+          sanitizeError,
+          checkout.runtimeForTaskWorkspace,
+          {}
+        );
+        checkout.initLogger.logComplete(-1);
         return Err(sanitizeError);
       }
     }
+    return this.announceAndInitTask(plan, launch, checkout);
+  }
 
+  /** Announces the launched task's workspace and kicks its init, then sends the prompt. */
+  private async announceAndInitTask(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    checkout: TaskLaunchCheckout
+  ): Promise<Result<TaskCreateResult, string>> {
+    const { taskId } = plan;
     // Emit metadata update so the UI sees the workspace immediately.
     await this.emitWorkspaceMetadata(taskId);
 
     // Kick init (best-effort, async). Shared-workspace (isolation: "none") tasks reuse the parent's
     // already-initialized checkout, so re-running init would redundantly (and possibly disruptively)
     // mutate the live parent workspace — skip it entirely.
-    if (!useSharedWorkspace) {
+    if (!plan.useSharedWorkspace) {
       const secrets = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(parentMeta.projectPath)
+        this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
       // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and
@@ -7574,25 +7608,35 @@ export class TaskService implements AgentTaskIntegration {
         taskId,
         initAbortController,
         runBackgroundInit(
-          runtimeForTaskWorkspace,
+          checkout.runtimeForTaskWorkspace,
           {
-            projectPath: parentMeta.projectPath,
-            branchName: workspaceName,
-            trunkBranch,
-            workspacePath,
-            initLogger,
+            projectPath: plan.parentMeta.projectPath,
+            branchName: plan.workspaceName,
+            trunkBranch: checkout.trunkBranch,
+            workspacePath: checkout.workspacePath,
+            initLogger: checkout.initLogger,
             env: secrets,
             abortSignal: initAbortController.signal,
-            skipInitHook,
+            skipInitHook: plan.skipInitHook,
             trusted:
-              this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
+              this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
+              false,
           },
           taskId,
           workspaceUseLeasesFor(this.config)
         )
       );
     }
+    return this.sendTaskLaunchPrompt(plan, launch, checkout);
+  }
 
+  /** Admits the launch's prompt under the attempt it persisted and sends it. */
+  private async sendTaskLaunchPrompt(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    checkout: TaskLaunchCheckout
+  ): Promise<Result<TaskCreateResult, string>> {
+    const { taskId, taskModelString, effectiveThinkingLevel } = plan;
     // Start immediately (counts towards parallel limit). Launch fence, as in startReservedAgentTask:
     // the obligation is bound under the owned attempt before dispatch and the token doubles as the
     // send's staleness probe. A guarded send is never a user resume, so WorkspaceService skips
@@ -7617,12 +7661,12 @@ export class TaskService implements AgentTaskIntegration {
         : await this.workspaceService
             .sendMessage(
               taskId,
-              prompt,
+              plan.prompt,
               {
                 model: taskModelString,
-                agentId,
+                agentId: plan.agentId,
                 thinkingLevel: effectiveThinkingLevel,
-                reasoningMode: effectiveReasoningMode,
+                reasoningMode: plan.effectiveReasoningMode,
               },
               {
                 acceptanceOrigin: "automatic",
@@ -7637,8 +7681,8 @@ export class TaskService implements AgentTaskIntegration {
         typeof sendResult.error === "string"
           ? sendResult.error
           : formatSendMessageError(sendResult.error).message;
-      await this.failTaskLaunch(plan, launch, message, runtimeForTaskWorkspace, {
-        preservePhysicalWorkspace: useSharedWorkspace,
+      await this.failTaskLaunch(plan, launch, message, checkout.runtimeForTaskWorkspace, {
+        preservePhysicalWorkspace: plan.useSharedWorkspace,
       });
       return Err(message);
     }
@@ -7649,7 +7693,7 @@ export class TaskService implements AgentTaskIntegration {
       status: "running",
       modelString: taskModelString,
       thinkingLevel: effectiveThinkingLevel,
-      desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
+      desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
     });
   }
 
