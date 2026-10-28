@@ -244,6 +244,10 @@ describe("TaskService.create paths before the split", () => {
     expect(config.loadConfigOrDefault().projects.get(projectPath)?.workspaces).toEqual([
       expect.objectContaining({ id: TASK_ID, taskStatus: "queued", parentWorkspaceId: parentId }),
     ]);
+    // The removed project took the sibling that forced the queue, so the create's queue drain
+    // finds a free slot and starts. Let it settle here: its config writes must not run into
+    // afterEach's cleanup or a later test.
+    await taskService.queueDrainSettled();
   });
 
   test("a queued task whose persist fails returns the error and announces nothing", async () => {
