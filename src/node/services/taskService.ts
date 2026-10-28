@@ -9740,43 +9740,7 @@ export class TaskService implements AgentTaskIntegration {
           interrupted: interruptedRefusal,
         },
       };
-      const getDelegatedRootRefusal = ():
-        | typeof delegatedRootStartingRefusal
-        | typeof awaitDelegatedTurn
-        | null => {
-        if (targetIsAgentTask) return null;
-        // A retry is dropped once any delegated turn registered after it parked, even one that
-        // settled again before this check (#5271).
-        if (
-          awaitedDelegatedTurn != null &&
-          this.peerSendParking.registrationEpoch(targetId) !==
-            awaitedDelegatedTurn.registrationEpoch
-        ) {
-          return awaitDelegatedTurn;
-        }
-        const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
-        // A send that resolved a correlation continues that turn only while it is registered:
-        // once it settled (for example by a read of its handle, which does not take this lock),
-        // the correlation is stale and must not reach the session.
-        if (live == null) {
-          return attempt.delegatedTurnCorrelation != null &&
-            attempt.delegatedTurnCorrelation !== "unresolved"
-            ? delegatedRootStartingRefusal
-            : null;
-        }
-        // A retry never joins a delegated turn, not even one its own sender started meanwhile.
-        if (live.ownerWorkspaceId !== senderWorkspaceId || awaitedDelegatedTurn != null) {
-          return awaitDelegatedTurn;
-        }
-        if (!live.accepted) return delegatedRootStartingRefusal;
-        // Before the correlation lookup, the owner's accepted turn is a continuation candidate.
-        if (attempt.delegatedTurnCorrelation === "unresolved") return null;
-        return live.handleId !== attempt.delegatedTurnCorrelation?.taskHandleId ||
-          live.ownerWorkspaceId !== attempt.delegatedTurnCorrelation.ownerWorkspaceId
-          ? delegatedRootStartingRefusal
-          : null;
-      };
-      if (getDelegatedRootRefusal() === delegatedRootStartingRefusal) {
+      if (this.delegatedRootRefusalOf(route, attempt) === delegatedRootStartingRefusal) {
         return Err(delegatedRootStartingRefusal);
       }
       if (targetIsAgentTask) {
@@ -9814,9 +9778,7 @@ export class TaskService implements AgentTaskIntegration {
         targetId,
         ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, targetId),
       ];
-      const targetChainInterrupted = (): boolean =>
-        targetChainIds.some((id) => this.interruptedParentWorkspaceIds.has(id));
-      if (targetChainInterrupted()) {
+      if (this.isPeerChainInterrupted(targetChainIds)) {
         return Err(interruptedRefusal);
       }
 
@@ -9828,9 +9790,7 @@ export class TaskService implements AgentTaskIntegration {
         senderWorkspaceId,
         ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, senderWorkspaceId),
       ];
-      const senderChainInterrupted = (): boolean =>
-        senderChainIds.some((id) => this.interruptedParentWorkspaceIds.has(id));
-      if (senderChainInterrupted()) {
+      if (this.isPeerChainInterrupted(senderChainIds)) {
         return Err(senderInactiveRefusal);
       }
 
@@ -9839,14 +9799,10 @@ export class TaskService implements AgentTaskIntegration {
       // while the cascade is still persisting terminal statuses — the endpoints still read
       // running. The level latch spans exactly that window; once released, the persisted
       // statuses take over refusal. Target attribution wins on a shared stopped ancestor.
-      const targetChainStopping = (): boolean =>
-        targetChainIds.some((id) => this.isWorkspaceStopInProgress(id));
-      const senderChainStopping = (): boolean =>
-        senderChainIds.some((id) => this.isWorkspaceStopInProgress(id));
-      if (targetChainStopping()) {
+      if (this.isPeerChainStopping(targetChainIds)) {
         return Err(interruptedRefusal);
       }
-      if (senderChainStopping()) {
+      if (this.isPeerChainStopping(senderChainIds)) {
         return Err(senderInactiveRefusal);
       }
 
@@ -9868,8 +9824,6 @@ export class TaskService implements AgentTaskIntegration {
           awaitedDelegatedTurn?.stopEpochs.get(id) ?? this.getWorkspaceStopEpoch(id),
         ])
       );
-      const chainStopEpochChanged = (chainIds: string[]): boolean =>
-        chainIds.some((id) => this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id));
       // Only a first attempt parks, and only root targets wait, so the target's own count is
       // the one that matters (see park()).
       const capturedUserStopEpoch = this.workspaceUserStopEpochs.get(targetId) ?? 0;
@@ -10057,145 +10011,11 @@ export class TaskService implements AgentTaskIntegration {
         muxMetadata,
       });
 
-      // Admission staleness probe: neither interruptStream nor stopDescendantAgentTask takes
-      // this target's event lock, so a user Stop or task_stop can land during ANY await between
-      // here and the real admission — including the host's sendMessage() pricing/settings
-      // awaits and the session's turn preparation. The probe is synchronous and
-      // re-evaluated by the host at the enqueue block and the session's turn-admission
-      // gates, so a stop in those windows refuses the send instead of queueing a wake or
-      // resurrecting the stopped task via markInterruptedTaskRunning.
-      const admissionStale = (): boolean => {
-        // Latched stop checks first: unlike the level-triggered probes below, a generation bump
-        // stays observable even when a user resume already cleared suppression and restored
-        // running statuses between probe evaluations. The in-progress latch backstops stops
-        // whose cascade has not yet persisted terminal statuses. Target attribution wins when
-        // a shared ancestor (e.g. the tree root) was stopped — the target-side refusal tells
-        // the sender the recipient will not accept messages until the user resumes it.
-        if (chainStopEpochChanged(targetChainIds) || targetChainStopping()) {
-          attempt.admissionRefusal = interruptedRefusal;
-          return true;
-        }
-        if (chainStopEpochChanged(senderChainIds) || senderChainStopping()) {
-          attempt.admissionRefusal = senderInactiveRefusal;
-          return true;
-        }
-        if (targetChainInterrupted()) {
-          attempt.admissionRefusal = interruptedRefusal;
-          return true;
-        }
-        const delegatedRootRefusal = getDelegatedRootRefusal();
-        if (delegatedRootRefusal != null) {
-          if (delegatedRootRefusal === awaitDelegatedTurn) {
-            attempt.refusedAtRegistrationEpoch ??= this.peerSendParking.registrationEpoch(targetId);
-          }
-          attempt.admissionRefusal = delegatedRootRefusal;
-          return true;
-        }
-        const freshCfg = this.config.loadConfigOrDefault();
-        // Sender revalidation: a reawakened child stopped mid-send (its owner interrupted the
-        // workspace turn) must not wake an idle peer from its winding-down tool call. The
-        // execution mirror is marked terminal with the handle transition, so this re-read
-        // observes the stop before stopStream completes. The chain check covers a user stop on
-        // a sender ancestor whose cascade has not reached the sender yet.
-        const freshSender = findWorkspaceEntry(freshCfg, senderWorkspaceId);
-        if (
-          freshSender == null ||
-          senderChainInterrupted() ||
-          this.isInactivePeerMessagingEndpoint(freshSender.workspace, senderWorkspaceId)
-        ) {
-          attempt.admissionRefusal = senderInactiveRefusal;
-          return true;
-        }
-        const freshEntry = findWorkspaceEntry(freshCfg, targetId);
-        if (freshEntry == null) {
-          attempt.admissionRefusal = { code: "not_found" as const };
-          return true;
-        }
-        // Chat links and @tags authorize only the currently linked pair/group, not a
-        // permanent cross-runtime grant. Recheck after preparation and at queued dispatch.
-        if (
-          this.resolveAgentTreeTargetRelation(
-            freshCfg,
-            this.buildAgentTaskIndex(freshCfg).parentById,
-            senderWorkspaceId,
-            targetId
-          ) !== relation
-        ) {
-          attempt.admissionRefusal = { code: "invalid_scope" as const };
-          return true;
-        }
-        // The relation can re-resolve as tagged after a clear/re-tag cycle with the
-        // same string; the generation fence is what permanently invalidates the send.
-        if (
-          this.tagGenerationMismatch(
-            relation,
-            tagGenerations,
-            this.messagingTagGenerationsOf(freshSender.workspace, freshEntry.workspace)
-          )
-        ) {
-          attempt.admissionRefusal = { code: "invalid_scope" as const };
-          return true;
-        }
-        // An off/on cycle is a new grant, not permission to revive previously queued input.
-        // Recheck through the final synchronous session gate as well as after preparation awaits.
-        if (
-          relation === "target_unrelated" &&
-          getValidUnrelatedWorkspaceConsent(freshEntry.workspace.unrelatedWorkspaceConsent) !==
-            unrelatedConsent
-        ) {
-          attempt.admissionRefusal = { code: "not_found" as const };
-          return true;
-        }
-        // Runtime can change during preparation or while queued; recheck both ends at dispatch.
-        if (
-          relation === "target_unrelated" &&
-          (!this.isUnrelatedMessagingEndpoint(freshSender.workspace) ||
-            !this.isUnrelatedMessagingEndpoint(freshEntry.workspace))
-        ) {
-          attempt.admissionRefusal = unrelatedRuntimeRefusal;
-          return true;
-        }
-        // Closing a side chat claims removal before tearing down its session; neither an
-        // in-flight reply nor queued input may wake it behind that discard/archive boundary.
-        if (
-          freshEntry.workspace.pendingRemoval != null ||
-          isWorkspaceArchived(freshEntry.workspace.archivedAt, freshEntry.workspace.unarchivedAt)
-        ) {
-          attempt.admissionRefusal = {
-            code: "not_active" as const,
-            taskStatus: freshEntry.workspace.taskStatus ?? "unknown",
-            message:
-              "Target workspace is archived or being removed; it cannot receive peer messages.",
-          };
-          return true;
-        }
-        if (targetIsAgentTask) {
-          // task_stop persists taskStatus="interrupted" (and terminal execution mirrors) under
-          // the task-tree lifecycle lock; re-read the persisted state at admission so the stop
-          // always wins the race.
-          const freshStatus = freshEntry.workspace.taskStatus ?? "running";
-          if (
-            !this.hasLiveRunningExecution(freshEntry.workspace, targetId) &&
-            freshStatus !== "running" &&
-            freshStatus !== "awaiting_report"
-          ) {
-            attempt.admissionRefusal = {
-              code: "not_active" as const,
-              taskStatus: freshStatus,
-              message:
-                "Target stopped before the message was admitted; peer messages cannot reactivate it.",
-            };
-            return true;
-          }
-        }
-        return false;
-      };
       return this.dispatchPeerSend(
         admission,
         attempt,
         { trigger, payloadRow, workspaceTurnMuxMetadata },
-        sendOptions,
-        admissionStale
+        sendOptions
       );
     });
   }
@@ -10208,13 +10028,12 @@ export class TaskService implements AgentTaskIntegration {
     admission: PeerSendAdmission,
     attempt: PeerSendAttempt,
     dispatch: PeerSendDispatch,
-    sendOptions: SendMessageOptions,
-    admissionStale: () => boolean
+    sendOptions: SendMessageOptions
   ): Promise<PeerSendResult> {
     const { spec, senderWorkspaceId, targetId, firstAttempt, refusals } = admission;
     const { trigger, payloadRow, workspaceTurnMuxMetadata } = dispatch;
     const refusedBeforeDispatch =
-      this.refuseStalePeerSendBeforeDispatch(admission, attempt, admissionStale) ??
+      this.refuseStalePeerSendBeforeDispatch(admission, attempt) ??
       this.queuePeerSendBehindParked(admission, attempt);
     if (refusedBeforeDispatch !== undefined) {
       return refusedBeforeDispatch;
@@ -10242,7 +10061,7 @@ export class TaskService implements AgentTaskIntegration {
       queuedSendOptions,
       {
         acceptanceOrigin: "automatic",
-        admissionStale,
+        admissionStale: () => this.isPeerAdmissionStale(admission, attempt),
         // Re-read at the enqueue point, after sendMessage's own awaits (#4804).
         honorRecipientHold: true,
         synthetic: true,
@@ -10283,10 +10102,9 @@ export class TaskService implements AgentTaskIntegration {
    */
   private refuseStalePeerSendBeforeDispatch(
     admission: PeerSendAdmission,
-    attempt: PeerSendAttempt,
-    admissionStale: () => boolean
+    attempt: PeerSendAttempt
   ): PeerSendResult | undefined {
-    if (admissionStale()) {
+    if (this.isPeerAdmissionStale(admission, attempt)) {
       if (
         admission.firstAttempt &&
         attempt.admissionRefusal === admission.refusals.awaitDelegatedTurn
@@ -10412,6 +10230,275 @@ export class TaskService implements AgentTaskIntegration {
         ? { delivery: "accepted" as const, relation }
         : { delivery: "queued" as const, relation, queueDispatchMode: effectiveDispatchMode }
     );
+  }
+
+  /**
+   * Admission staleness probe: neither interruptStream nor stopDescendantAgentTask takes
+   * this target's event lock, so a user Stop or task_stop can land during ANY await between
+   * the stop capture and the real admission — including the host's sendMessage() pricing/settings
+   * awaits and the session's turn preparation. The probe is synchronous and
+   * re-evaluated by the host at the enqueue block and the session's turn-admission
+   * gates, so a stop in those windows refuses the send instead of queueing a wake or
+   * resurrecting the stopped task via markInterruptedTaskRunning.
+   * It runs from sendMessage and the session, so it reads and writes the attempt when it runs.
+   */
+  private isPeerAdmissionStale(admission: PeerSendAdmission, attempt: PeerSendAttempt): boolean {
+    return (
+      this.isPeerAdmissionStaleByStops(admission, attempt) ||
+      this.isPeerAdmissionStaleByDelegatedRoot(admission, attempt) ||
+      this.isPeerAdmissionStaleInConfig(admission, attempt)
+    );
+  }
+
+  private isPeerAdmissionStaleByStops(
+    admission: PeerSendAdmission,
+    attempt: PeerSendAttempt
+  ): boolean {
+    const { targetChainIds, senderChainIds, capturedStopEpochs, refusals } = admission;
+    // Latched stop checks first: unlike the level-triggered probes below, a generation bump
+    // stays observable even when a user resume already cleared suppression and restored
+    // running statuses between probe evaluations. The in-progress latch backstops stops
+    // whose cascade has not yet persisted terminal statuses. Target attribution wins when
+    // a shared ancestor (e.g. the tree root) was stopped — the target-side refusal tells
+    // the sender the recipient will not accept messages until the user resumes it.
+    if (
+      this.peerChainStopEpochChanged(targetChainIds, capturedStopEpochs) ||
+      this.isPeerChainStopping(targetChainIds)
+    ) {
+      attempt.admissionRefusal = refusals.interrupted;
+      return true;
+    }
+    if (
+      this.peerChainStopEpochChanged(senderChainIds, capturedStopEpochs) ||
+      this.isPeerChainStopping(senderChainIds)
+    ) {
+      attempt.admissionRefusal = refusals.senderInactive;
+      return true;
+    }
+    if (this.isPeerChainInterrupted(targetChainIds)) {
+      attempt.admissionRefusal = refusals.interrupted;
+      return true;
+    }
+    return false;
+  }
+
+  private isPeerAdmissionStaleByDelegatedRoot(
+    admission: PeerSendAdmission,
+    attempt: PeerSendAttempt
+  ): boolean {
+    const delegatedRootRefusal = this.delegatedRootRefusalOf(admission, attempt);
+    if (delegatedRootRefusal != null) {
+      if (delegatedRootRefusal === admission.refusals.awaitDelegatedTurn) {
+        attempt.refusedAtRegistrationEpoch ??= this.peerSendParking.registrationEpoch(
+          admission.targetId
+        );
+      }
+      attempt.admissionRefusal = delegatedRootRefusal;
+      return true;
+    }
+    return false;
+  }
+
+  private isPeerAdmissionStaleInConfig(
+    admission: PeerSendAdmission,
+    attempt: PeerSendAttempt
+  ): boolean {
+    const { senderWorkspaceId, targetId, senderChainIds, refusals } = admission;
+    const freshCfg = this.config.loadConfigOrDefault();
+    // Sender revalidation: a reawakened child stopped mid-send (its owner interrupted the
+    // workspace turn) must not wake an idle peer from its winding-down tool call. The
+    // execution mirror is marked terminal with the handle transition, so this re-read
+    // observes the stop before stopStream completes. The chain check covers a user stop on
+    // a sender ancestor whose cascade has not reached the sender yet.
+    const freshSender = findWorkspaceEntry(freshCfg, senderWorkspaceId);
+    if (
+      freshSender == null ||
+      this.isPeerChainInterrupted(senderChainIds) ||
+      this.isInactivePeerMessagingEndpoint(freshSender.workspace, senderWorkspaceId)
+    ) {
+      attempt.admissionRefusal = refusals.senderInactive;
+      return true;
+    }
+    const freshEntry = findWorkspaceEntry(freshCfg, targetId);
+    if (freshEntry == null) {
+      attempt.admissionRefusal = { code: "not_found" as const };
+      return true;
+    }
+    return (
+      this.isPeerAdmissionStaleByLink(admission, attempt, freshCfg, freshSender, freshEntry) ||
+      this.isPeerAdmissionStaleByArchive(attempt, freshEntry) ||
+      this.isPeerAdmissionStaleByAgentStatus(admission, attempt, freshEntry)
+    );
+  }
+
+  private isPeerAdmissionStaleByLink(
+    admission: PeerSendAdmission,
+    attempt: PeerSendAttempt,
+    freshCfg: ProjectsConfig,
+    freshSender: NonNullable<ReturnType<typeof findWorkspaceEntry>>,
+    freshEntry: NonNullable<ReturnType<typeof findWorkspaceEntry>>
+  ): boolean {
+    const { senderWorkspaceId, targetId, relation, tagGenerations, unrelatedConsent } = admission;
+    // Chat links and @tags authorize only the currently linked pair/group, not a
+    // permanent cross-runtime grant. Recheck after preparation and at queued dispatch.
+    if (
+      this.resolveAgentTreeTargetRelation(
+        freshCfg,
+        this.buildAgentTaskIndex(freshCfg).parentById,
+        senderWorkspaceId,
+        targetId
+      ) !== relation
+    ) {
+      attempt.admissionRefusal = { code: "invalid_scope" as const };
+      return true;
+    }
+    // The relation can re-resolve as tagged after a clear/re-tag cycle with the
+    // same string; the generation fence is what permanently invalidates the send.
+    if (
+      this.tagGenerationMismatch(
+        relation,
+        tagGenerations,
+        this.messagingTagGenerationsOf(freshSender.workspace, freshEntry.workspace)
+      )
+    ) {
+      attempt.admissionRefusal = { code: "invalid_scope" as const };
+      return true;
+    }
+    // An off/on cycle is a new grant, not permission to revive previously queued input.
+    // Recheck through the final synchronous session gate as well as after preparation awaits.
+    if (
+      relation === "target_unrelated" &&
+      getValidUnrelatedWorkspaceConsent(freshEntry.workspace.unrelatedWorkspaceConsent) !==
+        unrelatedConsent
+    ) {
+      attempt.admissionRefusal = { code: "not_found" as const };
+      return true;
+    }
+    // Runtime can change during preparation or while queued; recheck both ends at dispatch.
+    if (
+      relation === "target_unrelated" &&
+      (!this.isUnrelatedMessagingEndpoint(freshSender.workspace) ||
+        !this.isUnrelatedMessagingEndpoint(freshEntry.workspace))
+    ) {
+      attempt.admissionRefusal = admission.refusals.unrelatedRuntime;
+      return true;
+    }
+    return false;
+  }
+
+  private isPeerAdmissionStaleByArchive(
+    attempt: PeerSendAttempt,
+    freshEntry: NonNullable<ReturnType<typeof findWorkspaceEntry>>
+  ): boolean {
+    // Closing a side chat claims removal before tearing down its session; neither an
+    // in-flight reply nor queued input may wake it behind that discard/archive boundary.
+    if (
+      freshEntry.workspace.pendingRemoval != null ||
+      isWorkspaceArchived(freshEntry.workspace.archivedAt, freshEntry.workspace.unarchivedAt)
+    ) {
+      attempt.admissionRefusal = {
+        code: "not_active" as const,
+        taskStatus: freshEntry.workspace.taskStatus ?? "unknown",
+        message: "Target workspace is archived or being removed; it cannot receive peer messages.",
+      };
+      return true;
+    }
+    return false;
+  }
+
+  private isPeerAdmissionStaleByAgentStatus(
+    admission: PeerSendAdmission,
+    attempt: PeerSendAttempt,
+    freshEntry: NonNullable<ReturnType<typeof findWorkspaceEntry>>
+  ): boolean {
+    if (admission.targetIsAgentTask) {
+      // task_stop persists taskStatus="interrupted" (and terminal execution mirrors) under
+      // the task-tree lifecycle lock; re-read the persisted state at admission so the stop
+      // always wins the race.
+      const freshStatus = freshEntry.workspace.taskStatus ?? "running";
+      if (
+        !this.hasLiveRunningExecution(freshEntry.workspace, admission.targetId) &&
+        freshStatus !== "running" &&
+        freshStatus !== "awaiting_report"
+      ) {
+        attempt.admissionRefusal = {
+          code: "not_active" as const,
+          taskStatus: freshStatus,
+          message:
+            "Target stopped before the message was admitted; peer messages cannot reactivate it.",
+        };
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * The delegated-turn refusal of a root target, or null. The admission probe calls it again
+   * after the correlation lookup, so it reads the attempt's correlation when it runs.
+   */
+  private delegatedRootRefusalOf(
+    route: PeerSendRoute,
+    attempt: PeerSendAttempt
+  ): PeerSendRefusal | null {
+    const { targetId, awaitedDelegatedTurn, refusals } = route;
+    if (route.targetIsAgentTask) return null;
+    // A retry is dropped once any delegated turn registered after it parked, even one that
+    // settled again before this check (#5271).
+    if (
+      awaitedDelegatedTurn != null &&
+      this.peerSendParking.registrationEpoch(targetId) !== awaitedDelegatedTurn.registrationEpoch
+    ) {
+      return refusals.awaitDelegatedTurn;
+    }
+    const live = this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(targetId);
+    // A send that resolved a correlation continues that turn only while it is registered:
+    // once it settled (for example by a read of its handle, which does not take this lock),
+    // the correlation is stale and must not reach the session.
+    if (live == null) {
+      return attempt.delegatedTurnCorrelation != null &&
+        attempt.delegatedTurnCorrelation !== "unresolved"
+        ? refusals.delegatedRootStarting
+        : null;
+    }
+    return this.liveDelegatedTurnRefusalOf(route, attempt, live);
+  }
+
+  private liveDelegatedTurnRefusalOf(
+    route: PeerSendRoute,
+    attempt: PeerSendAttempt,
+    live: NonNullable<ReturnType<WorkspaceTurnManager["getLiveWorkspaceTurnRegistration"]>>
+  ): PeerSendRefusal | null {
+    const { refusals } = route;
+    // A retry never joins a delegated turn, not even one its own sender started meanwhile.
+    if (live.ownerWorkspaceId !== route.senderWorkspaceId || route.awaitedDelegatedTurn != null) {
+      return refusals.awaitDelegatedTurn;
+    }
+    if (!live.accepted) return refusals.delegatedRootStarting;
+    // Before the correlation lookup, the owner's accepted turn is a continuation candidate.
+    if (attempt.delegatedTurnCorrelation === "unresolved") return null;
+    return live.handleId !== attempt.delegatedTurnCorrelation?.taskHandleId ||
+      live.ownerWorkspaceId !== attempt.delegatedTurnCorrelation.ownerWorkspaceId
+      ? refusals.delegatedRootStarting
+      : null;
+  }
+
+  /** True when the user interrupted a workspace of the chain (see sendTreeMessage). */
+  private isPeerChainInterrupted(chainIds: readonly string[]): boolean {
+    return chainIds.some((id) => this.interruptedParentWorkspaceIds.has(id));
+  }
+
+  /** True while a stop of a workspace of the chain is still in progress. */
+  private isPeerChainStopping(chainIds: readonly string[]): boolean {
+    return chainIds.some((id) => this.isWorkspaceStopInProgress(id));
+  }
+
+  /** True when a workspace of the chain was stopped since its stop epoch was captured. */
+  private peerChainStopEpochChanged(
+    chainIds: readonly string[],
+    capturedStopEpochs: ReadonlyMap<string, number>
+  ): boolean {
+    return chainIds.some((id) => this.getWorkspaceStopEpoch(id) !== capturedStopEpochs.get(id));
   }
 
   async stopDescendantAgentTask(
