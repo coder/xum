@@ -60,8 +60,8 @@ function stripToggle(
   list: HTMLElement | null,
   overflowed: boolean
 ): Element | null {
-  const chip = root?.querySelector("[data-activity-chip]") ?? null;
-  return chip === null ? (list?.previousElementSibling ?? null) : shownChip(chip, overflowed);
+  const chip = root?.querySelector("[data-activity-chip]");
+  return chip == null ? (list?.previousElementSibling ?? null) : shownChip(chip, overflowed);
 }
 
 function backgroundBashNoun(count: number): string {

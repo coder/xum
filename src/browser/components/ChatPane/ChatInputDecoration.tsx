@@ -666,6 +666,8 @@ export function ChatActivityOverflowChip() {
           aria-label="More activity"
           data-activity-panel=""
           onKeyDown={(event) => closeOnEscape(event, close)}
+          // At the line's end even without a TODO chip, unlike the bordered chips' panels: the
+          // "+N" chip shows only in a full strip, so it sits at the strip's end in both layouts.
           className="bg-surface-primary border-border-medium absolute right-0 bottom-full z-30 mb-1 flex w-max max-w-full min-w-44 flex-col gap-0.5 rounded-lg border p-1 shadow-lg"
         />
       )}

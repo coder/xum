@@ -374,10 +374,11 @@ async function assertBashesFromOverflow(line: HTMLElement) {
 }
 
 // A desktop window: matchMedia sees its width, so the panels open as popovers above the line,
-// while the fixed-width frame narrows the line until chips fold into "+N".
+// while the fixed-width frame narrows the line until chips fold into "+N". 375px, not 390px: the
+// bashes chip still fits a 390px frame.
 export const NarrowPaneDesktop: AppStory = {
   render: () => <AppWithMocks setup={() => setupActivityLineStory("ws-activity-line-narrow")} />,
-  decorators: [PhoneFrameDecorator],
+  decorators: [phoneFrame(375)],
   parameters: {
     ...appMeta.parameters,
     pixel: PIXEL_DISABLED,
@@ -548,19 +549,21 @@ export const SubAgentsOnlyDesktop: AppStory = {
 
 // The line lays out by its own @container width, so a phone-width frame gives the test-runner
 // (which applies no globals.viewport) the phone line.
-function PhoneFrameDecorator(Story: ComponentType) {
-  return (
-    <div style={{ width: 390, maxWidth: "100%", height: 844, overflow: "hidden" }}>
-      <Story />
-    </div>
-  );
+function phoneFrame(width: number) {
+  return function PhoneFrameDecorator(Story: ComponentType) {
+    return (
+      <div style={{ width, maxWidth: "100%", height: 844, overflow: "hidden" }}>
+        <Story />
+      </div>
+    );
+  };
 }
 
 export const SubAgentsOnlyPhone: AppStory = {
   globals: {
     viewport: { value: "mobile1", isRotated: false },
   },
-  decorators: [PhoneFrameDecorator],
+  decorators: [phoneFrame(390)],
   render: () => (
     <AppWithMocks
       setup={() => setupActivityLineStory("ws-activity-line-subagents-phone", "sub-agents-only")}
