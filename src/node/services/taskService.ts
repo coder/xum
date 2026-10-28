@@ -1777,15 +1777,44 @@ interface TerminalWorkflowWakeCandidate {
   initiatingAgent?: WorkflowWakeInitiatingAgent;
 }
 
+/** A workspace-turn notification that can wake its owner, and the handle id the wake names. */
+interface TerminalWorkspaceTurnWakeCandidate {
+  notification: TerminalAttentionNotification;
+  publicAwaitId: string;
+}
+
+/** A terminal-attention drain's candidates, collected after the owner was seen idle. */
+interface TerminalDrainCandidates {
+  readonly ownerWorkspaceId: string;
+  readonly entry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
+  /** The owner's pending notifications, without the agent reports the drain acknowledged. */
+  readonly pending: readonly TerminalAttentionNotification[];
+  readonly agentNotifications: readonly TerminalAttentionNotification[];
+  readonly deliverableAgentNotificationIds: ReadonlySet<string>;
+  readonly workspaceTurnCandidates: readonly TerminalWorkspaceTurnWakeCandidate[];
+  readonly deliverableWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[];
+  /** A recent send of the non-workflow batch was rejected: the batch sits out this drain. */
+  readonly nonWorkflowSendBackedOff: boolean;
+  readonly hasNonWorkflowDeliverables: boolean;
+  readonly workspaceTurnMuxMetadata: Awaited<
+    ReturnType<WorkspaceTurnManager["getActiveWorkspaceTurnMuxMetadataForWorkspace"]>
+  >;
+}
+
+/** A drain's candidates plus the wake's caller restrictions and the reread candidate records. */
+interface TerminalWakeRevalidation extends TerminalDrainCandidates {
+  readonly wakeRestrictions: Awaited<
+    ReturnType<TaskService["resolveTerminalWakeCallerSendRestrictions"]>
+  >;
+  /** The workspace-turn candidates' records, reread in one batch, by candidate index. */
+  readonly candidateRecords: ReadonlyArray<WorkspaceTurnTaskHandleRecord | null>;
+}
+
 /**
  * A terminal-attention drain's composed wake, read by the delivery steps (deliverTerminalWake).
  * Every field is final once the drain has partitioned its candidates and composed the prompt.
  */
-interface TerminalWakeDelivery {
-  readonly ownerWorkspaceId: string;
-  readonly entry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
-  readonly agentNotifications: readonly TerminalAttentionNotification[];
-  readonly deliverableWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[];
+interface TerminalWakeDelivery extends TerminalWakeRevalidation {
   /** The selected launch-identity group; empty when no workflow group revalidated. */
   readonly currentWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[];
   readonly workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;
@@ -1795,16 +1824,87 @@ interface TerminalWakeDelivery {
   readonly effectivePending: readonly TerminalAttentionNotification[];
   readonly prompt: string;
   readonly resumeOptions: ParentAutoResumeOptions;
-  readonly wakeRestrictions: Awaited<
-    ReturnType<TaskService["resolveTerminalWakeCallerSendRestrictions"]>
-  >;
   readonly effectiveStrictPin: SendMessageOptions["strictAgentResolution"];
-  readonly workspaceTurnMuxMetadata: Awaited<
-    ReturnType<WorkspaceTurnManager["getActiveWorkspaceTurnMuxMetadataForWorkspace"]>
-  >;
 }
 
 type TerminalWakeSendResult = Awaited<ReturnType<WorkspaceHost["sendMessage"]>>;
+
+/**
+ * Picks the newest launch-identity group among the remaining workflow wakes. The wakes without an
+ * initiating agent form one group, picked once no agent-bound wake remains.
+ */
+function pickNewestWorkflowWakeGroup(
+  remainingWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[]
+): {
+  groupAgent: WorkflowWakeInitiatingAgent | undefined;
+  groupKey: string | undefined;
+  groupCandidates: TerminalWorkflowWakeCandidate[];
+} {
+  let groupAgent: WorkflowWakeInitiatingAgent | undefined;
+  for (const candidate of remainingWorkflowPrompts) {
+    const agent = candidate.initiatingAgent;
+    if (agent != null && (groupAgent == null || agent.createdAtMs > groupAgent.createdAtMs)) {
+      groupAgent = agent;
+    }
+  }
+  const groupKey = groupAgent != null ? workflowWakeGroupKey(groupAgent) : undefined;
+  const groupCandidates = remainingWorkflowPrompts.filter((candidate) =>
+    groupKey == null
+      ? candidate.initiatingAgent == null
+      : candidate.initiatingAgent != null &&
+        workflowWakeGroupKey(candidate.initiatingAgent) === groupKey
+  );
+  return { groupAgent, groupKey, groupCandidates };
+}
+
+/** Splits a workflow group by its revalidation verdicts; a "defer" wake lands in neither list. */
+function classifyWorkflowGroupRevalidation(
+  groupCandidates: readonly TerminalWorkflowWakeCandidate[],
+  groupRevalidation: ReadonlyArray<"deliverable" | "superseded" | "defer">
+): {
+  groupCurrent: TerminalWorkflowWakeCandidate[];
+  groupSuperseded: TerminalWorkflowWakeCandidate[];
+} {
+  const groupCurrent: TerminalWorkflowWakeCandidate[] = [];
+  const groupSuperseded: TerminalWorkflowWakeCandidate[] = [];
+  groupCandidates.forEach((candidate, index) => {
+    const verdict = groupRevalidation[index];
+    if (verdict === "deliverable") {
+      groupCurrent.push(candidate);
+    } else if (verdict === "superseded") {
+      groupSuperseded.push(candidate);
+    }
+  });
+  return { groupCurrent, groupSuperseded };
+}
+
+/**
+ * Partitions the reread workspace-turn candidates: a suppressed handle is marked superseded later,
+ * a backed-off non-workflow batch sits out the drain, and every other candidate is delivered.
+ */
+function partitionWorkspaceTurnWakeCandidates(revalidation: TerminalWakeRevalidation): {
+  deliverableWorkspaceTurnNotificationIds: Set<string>;
+  publicAwaitIds: string[];
+  suppressedNotificationIds: string[];
+} {
+  const deliverableWorkspaceTurnNotificationIds = new Set<string>();
+  const publicAwaitIds: string[] = [];
+  const suppressedNotificationIds: string[] = [];
+  revalidation.workspaceTurnCandidates.forEach((candidate, index) => {
+    const record = revalidation.candidateRecords[index];
+    if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
+      suppressedNotificationIds.push(candidate.notification.id);
+      return;
+    }
+    if (revalidation.nonWorkflowSendBackedOff) {
+      // Backed off: sits out this drain and stays pending for the sweep-cadence retry.
+      return;
+    }
+    deliverableWorkspaceTurnNotificationIds.add(candidate.notification.id);
+    publicAwaitIds.push(candidate.publicAwaitId);
+  });
+  return { deliverableWorkspaceTurnNotificationIds, publicAwaitIds, suppressedNotificationIds };
+}
 
 function isTypedWorkspaceEvent(value: unknown, type: string): boolean {
   return (
@@ -11689,16 +11789,35 @@ export class TaskService implements AgentTaskIntegration {
         ownerWorkspaceId
       );
 
+    return this.resolveTerminalWakeRestrictions({
+      ownerWorkspaceId,
+      entry,
+      pending,
+      agentNotifications,
+      deliverableAgentNotificationIds,
+      workspaceTurnCandidates,
+      deliverableWorkflowPrompts,
+      nonWorkflowSendBackedOff,
+      hasNonWorkflowDeliverables,
+      workspaceTurnMuxMetadata,
+    });
+  }
+
+  /**
+   * Resolves the wake's caller restrictions and rereads the workspace-turn candidates, then
+   * chains on: selectTerminalWorkflowWakeGroup → composeTerminalWake → deliverTerminalWake. Each
+   * step starts the next one in the same tick as its own last await.
+   */
+  private async resolveTerminalWakeRestrictions(
+    candidates: TerminalDrainCandidates
+  ): Promise<void> {
+    const { ownerWorkspaceId } = candidates;
     // Security: restore the conversation's active caller tool policy on the wake. The ordinary
     // in-stream workflow continuation carries the live turn's effectiveToolPolicy; this
     // synthetic send starts a fresh turn, and omitting the policy would let a workflow wake
     // regain tools the caller disabled (with attacker-influenced workflow output choosing the
     // timing). The agent-level policy recomposes from agentId at send resolution.
-    let wakeRestrictions: {
-      toolPolicy?: ToolPolicy;
-      disableWorkspaceAgents?: boolean;
-      strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
-    };
+    let wakeRestrictions: TerminalWakeRevalidation["wakeRestrictions"];
     try {
       wakeRestrictions = await this.resolveTerminalWakeCallerSendRestrictions(ownerWorkspaceId);
     } catch (error: unknown) {
@@ -11725,13 +11844,28 @@ export class TaskService implements AgentTaskIntegration {
     // not do; worst case is one redundant wake (fail toward notify, never a
     // lost wake).
     const candidateRecords = await Promise.all(
-      workspaceTurnCandidates.map((candidate) =>
+      candidates.workspaceTurnCandidates.map((candidate) =>
         this.getWorkspaceTurnManager().getWorkspaceTurnRecord(
           ownerWorkspaceId,
           candidate.notification.sourceId
         )
       )
     );
+    return this.selectTerminalWorkflowWakeGroup({
+      ...candidates,
+      wakeRestrictions,
+      candidateRecords,
+    });
+  }
+
+  /**
+   * Selects the launch-identity group of workflow wakes to deliver, and resolves the wake's resume
+   * options under that group's identity (or the conversation's own when none is selected).
+   */
+  private async selectTerminalWorkflowWakeGroup(
+    revalidation: TerminalWakeRevalidation
+  ): Promise<void> {
+    const { ownerWorkspaceId, entry, deliverableWorkflowPrompts } = revalidation;
     // Workflow candidates get the same last-moment treatment, one launch-identity group at a
     // time: a full history clear that completes after buildWorkflowTerminalPrompt classified
     // these runs retires the sidecar but cannot retract the materialized candidates, and once
@@ -11742,30 +11876,16 @@ export class TaskService implements AgentTaskIntegration {
     // newest-first until one revalidates, so one unreadable group cannot stall independent
     // wakes behind the sweep. Bounded: every iteration permanently removes one group from
     // this drain's consideration.
-    const supersededWorkflowPrompts: typeof deliverableWorkflowPrompts = [];
-    let currentWorkflowPrompts: typeof deliverableWorkflowPrompts = [];
+    const supersededWorkflowPrompts: TerminalWorkflowWakeCandidate[] = [];
+    let currentWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[] = [];
     let workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;
-    let resumeOptions:
-      | Awaited<ReturnType<TaskService["resolveParentAutoResumeOptions"]>>
-      | undefined;
-    let remainingWorkflowPrompts = hasNonWorkflowDeliverables
+    let resumeOptions: ParentAutoResumeOptions | undefined;
+    let remainingWorkflowPrompts = revalidation.hasNonWorkflowDeliverables
       ? deliverableWorkflowPrompts.filter((candidate) => candidate.initiatingAgent == null)
       : deliverableWorkflowPrompts;
     while (remainingWorkflowPrompts.length > 0) {
-      let groupAgent: WorkflowWakeInitiatingAgent | undefined;
-      for (const candidate of remainingWorkflowPrompts) {
-        const agent = candidate.initiatingAgent;
-        if (agent != null && (groupAgent == null || agent.createdAtMs > groupAgent.createdAtMs)) {
-          groupAgent = agent;
-        }
-      }
-      const groupKey = groupAgent != null ? workflowWakeGroupKey(groupAgent) : undefined;
-      const groupCandidates = remainingWorkflowPrompts.filter((candidate) =>
-        groupKey == null
-          ? candidate.initiatingAgent == null
-          : candidate.initiatingAgent != null &&
-            workflowWakeGroupKey(candidate.initiatingAgent) === groupKey
-      );
+      const { groupAgent, groupKey, groupCandidates } =
+        pickNewestWorkflowWakeGroup(remainingWorkflowPrompts);
       // Group keys embed \u0000, so the empty string safely keys the unpinned group.
       const backoffKey = groupKey ?? "";
       if (this.terminalAttention.isWakeSendBackedOff(ownerWorkspaceId, backoffKey)) {
@@ -11790,15 +11910,11 @@ export class TaskService implements AgentTaskIntegration {
           this.revalidateWorkflowPromptForDispatch(ownerWorkspaceId, candidate)
         )
       );
-      const groupCurrent: typeof deliverableWorkflowPrompts = [];
-      groupCandidates.forEach((candidate, index) => {
-        const verdict = groupRevalidation[index];
-        if (verdict === "deliverable") {
-          groupCurrent.push(candidate);
-        } else if (verdict === "superseded") {
-          supersededWorkflowPrompts.push(candidate);
-        }
-      });
+      const { groupCurrent, groupSuperseded } = classifyWorkflowGroupRevalidation(
+        groupCandidates,
+        groupRevalidation
+      );
+      supersededWorkflowPrompts.push(...groupSuperseded);
       if (groupCurrent.length > 0) {
         currentWorkflowPrompts = groupCurrent;
         workflowInitiatingAgent = groupAgent;
@@ -11818,30 +11934,40 @@ export class TaskService implements AgentTaskIntegration {
       entry,
       defaultModel
     );
+    return this.composeTerminalWake(revalidation, {
+      currentWorkflowPrompts,
+      workflowInitiatingAgent,
+      supersededWorkflowPrompts,
+      resumeOptions,
+    });
+  }
+
+  /**
+   * Partitions the reread workspace-turn candidates, composes the wake prompt and hands the wake
+   * to deliverTerminalWake. Synchronous: it runs inside the batch read → sendMessage window.
+   */
+  private composeTerminalWake(
+    revalidation: TerminalWakeRevalidation,
+    selection: Pick<
+      TerminalWakeDelivery,
+      | "currentWorkflowPrompts"
+      | "workflowInitiatingAgent"
+      | "supersededWorkflowPrompts"
+      | "resumeOptions"
+    >
+  ): Promise<void> {
     // Pair the pin with the delivered group: the newest pin-bearing history row can belong to
     // a different group's wake (each wake persists its own pin), and pinning another agent's
     // provenance onto this group's agentId makes resolution reject the wake on every retry. A
     // recorded pin (or a verified-unpinned null) overrides the walk; legacy references
     // without the field keep the walk pin.
-    const groupPin = workflowInitiatingAgent?.strictAgentResolution;
+    const groupPin = selection.workflowInitiatingAgent?.strictAgentResolution;
     const effectiveStrictPin =
-      groupPin !== undefined ? (groupPin ?? undefined) : wakeRestrictions.strictAgentResolution;
-    const deliverableWorkspaceTurnNotificationIds = new Set<string>();
-    const publicAwaitIds: string[] = [];
-    const suppressedNotificationIds: string[] = [];
-    workspaceTurnCandidates.forEach((candidate, index) => {
-      const record = candidateRecords[index];
-      if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
-        suppressedNotificationIds.push(candidate.notification.id);
-        return;
-      }
-      if (nonWorkflowSendBackedOff) {
-        // Backed off: sits out this drain and stays pending for the sweep-cadence retry.
-        return;
-      }
-      deliverableWorkspaceTurnNotificationIds.add(candidate.notification.id);
-      publicAwaitIds.push(candidate.publicAwaitId);
-    });
+      groupPin !== undefined
+        ? (groupPin ?? undefined)
+        : revalidation.wakeRestrictions.strictAgentResolution;
+    const { deliverableWorkspaceTurnNotificationIds, publicAwaitIds, suppressedNotificationIds } =
+      partitionWorkspaceTurnWakeCandidates(revalidation);
 
     // Sub-agent reports and failures are already durable user-context messages. Resume from history
     // directly instead of injecting a second user turn that merely tells the model they exist.
@@ -11849,31 +11975,23 @@ export class TaskService implements AgentTaskIntegration {
     if (publicAwaitIds.length > 0) {
       promptSections.push(buildCompletedWorkspaceTurnPrompt(publicAwaitIds));
     }
-    promptSections.push(...currentWorkflowPrompts.map((candidate) => candidate.prompt));
+    promptSections.push(...selection.currentWorkflowPrompts.map((candidate) => candidate.prompt));
     const prompt = promptSections.join("\n\n");
-    const effectivePending = nonWorkflowSendBackedOff
+    const effectivePending = revalidation.nonWorkflowSendBackedOff
       ? []
-      : pending.filter((notification) => {
+      : revalidation.pending.filter((notification) => {
           if (notification.sourceKind === "agent_task") {
-            return deliverableAgentNotificationIds.has(notification.id);
+            return revalidation.deliverableAgentNotificationIds.has(notification.id);
           }
           return deliverableWorkspaceTurnNotificationIds.has(notification.id);
         });
     return this.deliverTerminalWake({
-      ownerWorkspaceId,
-      entry,
-      agentNotifications,
-      deliverableWorkflowPrompts,
-      currentWorkflowPrompts,
-      workflowInitiatingAgent,
-      supersededWorkflowPrompts,
+      ...revalidation,
+      ...selection,
       suppressedNotificationIds,
       effectivePending,
       prompt,
-      resumeOptions,
-      wakeRestrictions,
       effectiveStrictPin,
-      workspaceTurnMuxMetadata,
     });
   }
 
