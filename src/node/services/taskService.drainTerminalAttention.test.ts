@@ -121,6 +121,45 @@ describe("TaskService.drainTerminalAttention", () => {
     expect((await store.get(parentId, id))?.status).toBe("delivered");
   });
 
+  test("a busy rejection skips the fallback while the owner still has a queued turn", async () => {
+    // The idle-only send loses the race to a queued owner turn, which is still there when the
+    // drain re-checks the owner, so no fallback send runs.
+    let ownerTurnQueued = false;
+    let sends = 0;
+    const sendMessage: SendMock = mock(() => {
+      sends += 1;
+      if (sends === 1) {
+        ownerTurnQueued = true;
+        return Promise.resolve(Err(BUSY_IDLE_ONLY));
+      }
+      return Promise.resolve(Ok(undefined));
+    });
+    const hasPendingQueuedOrPreparingTurn = mock(() => ownerTurnQueued);
+    const { parentId, store, taskService, waitForIdleAndNoQueuedMessages } = await setup({
+      sendMessage,
+      hasPendingQueuedOrPreparingTurn,
+    });
+    const id = await enqueueWorkspaceTurnWake(store, parentId);
+
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    // Busy rejection: the wake stays pending for the next drain trigger, with no after-idle
+    // reschedule.
+    expect(sendMessage).toHaveBeenCalledTimes(1);
+    expect(waitForIdleAndNoQueuedMessages).not.toHaveBeenCalled();
+    expect((await store.get(parentId, id))?.status).toBe("pending");
+
+    // No back-off either: once the queued turn is gone, the next drain sends and delivers it.
+    ownerTurnQueued = false;
+    taskService.scheduleTerminalAttentionDrain(parentId);
+    await flushTerminalAttentionDrains(taskService);
+
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    expect((sendMessage.mock.calls[1]?.[3] as SendInternal).requireIdle).toBe(true);
+    expect((await store.get(parentId, id))?.status).toBe("delivered");
+  });
+
   test("busy fallback revalidates a current workflow wake and delivers it", async () => {
     const runId = "wfr_fallback_current";
     const sendMessage = busyThenFallback(async (internal) => {
