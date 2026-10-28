@@ -377,4 +377,37 @@ describe("TaskService.create paths before the split", () => {
       internals(taskService).attemptLedger.attemptSettlementByTaskId.get(TASK_ID)
     ).toMatchObject({ phase: "settled", source: "launch-failed" });
   });
+
+  // The built-in explore agent's definition sets subagent.skip_init_hook: true; exec's does not.
+  test.each([
+    ["explore", true],
+    ["exec", false],
+  ] as const)(
+    "a launched %s task's init skips the repo init hook: %p",
+    async (agentType, skipsHook) => {
+      const { parentId } = await saveLocalParentWorkspace(config, rootDir);
+      const host = createWorkspaceServiceMocks();
+      const { taskService, initStateManager } = createTaskServiceHarness(config, {
+        workspaceService: host.workspaceService,
+      });
+      // Every init output line, with the workspace it belongs to.
+      const appendOutput = spyOn(initStateManager, "appendOutput");
+      const inits: Array<Promise<void>> = [];
+      spyOn(host.workspaceService, "registerExternalBackgroundInit").mockImplementation(
+        (_workspaceId: string, _controller: AbortController, settlement: Promise<void>) => {
+          inits.push(settlement);
+        }
+      );
+      const created = await createAgentTask(taskService, parentId, "go", { agentType });
+      expect(created.success && created.data.status).toBe("running");
+      expect(inits).toHaveLength(1);
+      await inits[0];
+      const taskSteps = appendOutput.mock.calls
+        .filter(([workspaceId]) => workspaceId === TASK_ID)
+        .map(([, line]) => line);
+      expect(taskSteps.includes("Skipping .xum/init hook (disabled for this task)")).toBe(
+        skipsHook
+      );
+    }
+  );
 });
