@@ -848,6 +848,57 @@ interface TaskLaunchPlan {
   launchLease?: WorkspaceUseLease;
 }
 
+/** A Task.create request after validation, read before the global mutex is taken. */
+interface TaskCreateRequest {
+  readonly args: TaskCreateArgs;
+  readonly parentWorkspaceId: string;
+  readonly prompt: string;
+  readonly agentId: string;
+  /** Legacy alias of agentId, for on-disk compatibility. */
+  readonly agentType: string;
+  readonly normalizedBestOf: TaskCreateArgs["bestOf"];
+  readonly taskDesktopOwnerWorkspaceId: string | undefined;
+}
+
+/** The request plus the parent facts Task.create reads once under the global mutex. */
+interface TaskCreateParent extends TaskCreateRequest {
+  readonly parentMeta: WorkspaceMetadata;
+  readonly cfg: ProjectsConfig;
+  readonly projectPluginsTrusted: boolean;
+  readonly taskSettings: TaskSettings;
+  readonly parentEntry: ReturnType<typeof findWorkspaceEntry>;
+  readonly legacyParentRow: LegacyParentRow | undefined;
+  readonly parentIsScratch: boolean;
+  readonly configProjectPath: string;
+}
+
+/** The parent facts plus the new task's identity, runtime and checkout choice. */
+interface TaskCreatePlacement extends TaskCreateParent {
+  readonly activeCount: number;
+  readonly shouldQueue: boolean;
+  readonly taskId: string;
+  readonly workspaceName: string;
+  readonly parentRuntimeConfig: RuntimeConfig;
+  readonly taskRuntimeConfig: RuntimeConfig;
+  readonly runtime: Runtime;
+  readonly parentWorkspacePath: string;
+  readonly taskRuntimeMode: ReturnType<typeof getRuntimeType>;
+  readonly parentIsMultiProject: boolean;
+  readonly useSharedWorkspace: boolean;
+}
+
+/** Everything Task.create decided before it queues or launches the task. */
+interface TaskCreatePlan extends TaskCreatePlacement {
+  readonly parentBranchName: string | undefined;
+  readonly skipInitHook: boolean;
+  readonly taskModelString: string;
+  readonly canonicalModel: string;
+  readonly effectiveThinkingLevel: ThinkingLevel;
+  readonly effectiveReasoningMode: OpenAIReasoningMode | undefined;
+  readonly taskAiPins: TaskAiPins;
+  readonly createdAt: string;
+}
+
 /** Release a launch lease; a failed release is logged (the lock dies with the process anyway). */
 async function releaseLaunchLease(taskId: string, lease: WorkspaceUseLease): Promise<void> {
   await lease.release().catch((error: unknown) => {
@@ -6921,14 +6972,6 @@ export class TaskService implements AgentTaskIntegration {
     } catch (error) {
       return Err(getErrorMessage(error));
     }
-    const reserveDesktop = <T>(reserve: () => Promise<T>): Promise<T> =>
-      taskDesktopOwnerWorkspaceId == null
-        ? reserve()
-        : this.desktopInputCoordinator.withReservation(
-            taskDesktopOwnerWorkspaceId,
-            taskId,
-            reserve
-          );
 
     await using _lock = await this.mutex.acquire();
 
@@ -7204,108 +7247,45 @@ export class TaskService implements AgentTaskIntegration {
       thinkingLevel: effectiveThinkingLevel,
     });
 
+    const plan: TaskCreatePlan = {
+      args,
+      parentWorkspaceId,
+      prompt,
+      agentId,
+      agentType,
+      normalizedBestOf,
+      taskDesktopOwnerWorkspaceId,
+      parentMeta,
+      cfg,
+      projectPluginsTrusted,
+      taskSettings,
+      parentEntry,
+      legacyParentRow,
+      parentIsScratch,
+      configProjectPath,
+      activeCount,
+      shouldQueue,
+      taskId,
+      workspaceName,
+      parentRuntimeConfig,
+      taskRuntimeConfig,
+      runtime,
+      parentWorkspacePath,
+      taskRuntimeMode,
+      parentIsMultiProject,
+      useSharedWorkspace,
+      parentBranchName,
+      skipInitHook,
+      taskModelString,
+      canonicalModel,
+      effectiveThinkingLevel,
+      effectiveReasoningMode,
+      taskAiPins,
+      createdAt,
+    };
+
     if (shouldQueue) {
-      const trunkBranch = parentBranchName;
-      if (!trunkBranch) {
-        return Err("Task.create: parent workspace name missing (cannot queue task)");
-      }
-
-      // NOTE: Queued tasks are persisted immediately, but their workspace is created later
-      // when a parallel slot is available. This ensures queued tasks don't create worktrees
-      // or run init hooks until they actually start.
-      // Shared-workspace (isolation: "none") tasks point at the parent's existing checkout, so the
-      // dequeue path sees the directory already exists and skips fork + init.
-      const workspacePath = useSharedWorkspace
-        ? parentWorkspacePath
-        : runtime.getWorkspacePath(parentMeta.projectPath, workspaceName);
-
-      taskQueueDebug("TaskService.create queued (persist-only)", {
-        taskId,
-        workspaceName,
-        parentWorkspaceId,
-        trunkBranch,
-        workspacePath,
-      });
-
-      try {
-        await reserveDesktop(async () => {
-          await this.config.editConfig((config) => {
-            assertParentAdmitsChild(config, parentWorkspaceId, {
-              requireRow: parentEntry != null,
-              legacyRow: legacyParentRow,
-            });
-            let projectConfig = config.projects.get(configProjectPath);
-            if (!projectConfig) {
-              projectConfig = { workspaces: [] };
-              config.projects.set(configProjectPath, projectConfig);
-            }
-
-            projectConfig.workspaces.push({
-              kind: parentIsScratch ? "scratch" : undefined,
-              path: workspacePath,
-              id: taskId,
-              name: workspaceName,
-              title: args.title,
-              createdAt,
-              runtimeConfig: taskRuntimeConfig,
-              // New rows have no legacy plan to migrate (#5174).
-              remotePlanMigrated: true,
-              aiSettings: {
-                model: canonicalModel,
-                thinkingLevel: effectiveThinkingLevel,
-                ...(effectiveReasoningMode != null
-                  ? { reasoningMode: effectiveReasoningMode }
-                  : {}),
-              },
-              parentWorkspaceId,
-              agentId,
-              agentType,
-              workflowTask: args.workflowTask,
-              bestOf: normalizedBestOf,
-              taskStatus: "queued",
-              // Never admitted: the queue drain's launch CAS rotates it and takes ownership.
-              taskAttemptId: newTaskAttemptId(),
-              taskPrompt: prompt,
-              taskTrunkBranch: trunkBranch,
-              taskModelString,
-              taskThinkingLevel: effectiveThinkingLevel,
-              taskAiPins,
-              taskOnRefusal: args.onRefusal,
-              taskIsolation: useSharedWorkspace ? "none" : undefined,
-              taskAttentionPolicy: args.attentionPolicy,
-              taskDesktopOwnerWorkspaceId,
-              projects: parentMeta.projects,
-            });
-            this.desktopInputCoordinator.assertAdmission(config, taskId);
-            return config;
-          });
-        });
-      } catch (error) {
-        return Err(getErrorMessage(error));
-      }
-
-      // Emit metadata update so the UI sees the workspace immediately.
-      await this.emitWorkspaceMetadata(taskId);
-
-      // NOTE: Do NOT persist the prompt into chat history until the task actually starts.
-      // Otherwise the frontend treats "last message is user" as an interrupted stream and
-      // will auto-retry / backoff-spam resume attempts while the task is queued.
-      taskQueueDebug("TaskService.create queued persisted (prompt stored in config)", {
-        taskId,
-        workspaceName,
-      });
-
-      // Schedule queue processing (best-effort).
-      this.scheduleMaybeStartQueuedTasks();
-      taskQueueDebug("TaskService.create queued scheduled maybeStartQueuedTasks", { taskId });
-      return Ok({
-        taskId,
-        kind: "agent",
-        status: "queued",
-        modelString: taskModelString,
-        thinkingLevel: effectiveThinkingLevel,
-        desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
-      });
+      return await this.createQueuedTask(plan);
     }
 
     // Set once a checkout exists for this task: a throw after that point (base-SHA read, config
@@ -7662,7 +7642,7 @@ export class TaskService implements AgentTaskIntegration {
         runtimeForTaskWorkspace,
       });
     };
-    const materialized = await reserveDesktop(materialize).catch((error: unknown) =>
+    const materialized = await this.reserveTaskDesktop(plan, materialize).catch((error: unknown) =>
       Err(getErrorMessage(error))
     );
     if (!materialized.success) {
@@ -7798,6 +7778,135 @@ export class TaskService implements AgentTaskIntegration {
       thinkingLevel: effectiveThinkingLevel,
       desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
     });
+  }
+
+  /** Runs `reserve` under the shared desktop's reservation for the task, when the task has one. */
+  private reserveTaskDesktop<T>(plan: TaskCreatePlan, reserve: () => Promise<T>): Promise<T> {
+    return plan.taskDesktopOwnerWorkspaceId == null
+      ? reserve()
+      : this.desktopInputCoordinator.withReservation(
+          plan.taskDesktopOwnerWorkspaceId,
+          plan.taskId,
+          reserve
+        );
+  }
+
+  /**
+   * Task.create's queued branch: persists the task as queued and schedules the queue drain.
+   * Runs under the global mutex that createUnderTaskTreeLifecycleLock holds.
+   */
+  private async createQueuedTask(plan: TaskCreatePlan): Promise<Result<TaskCreateResult, string>> {
+    const { taskId, workspaceName, parentWorkspaceId } = plan;
+    const trunkBranch = plan.parentBranchName;
+    if (!trunkBranch) {
+      return Err("Task.create: parent workspace name missing (cannot queue task)");
+    }
+
+    // NOTE: Queued tasks are persisted immediately, but their workspace is created later
+    // when a parallel slot is available. This ensures queued tasks don't create worktrees
+    // or run init hooks until they actually start.
+    // Shared-workspace (isolation: "none") tasks point at the parent's existing checkout, so the
+    // dequeue path sees the directory already exists and skips fork + init.
+    const workspacePath = plan.useSharedWorkspace
+      ? plan.parentWorkspacePath
+      : plan.runtime.getWorkspacePath(plan.parentMeta.projectPath, workspaceName);
+
+    taskQueueDebug("TaskService.create queued (persist-only)", {
+      taskId,
+      workspaceName,
+      parentWorkspaceId,
+      trunkBranch,
+      workspacePath,
+    });
+
+    try {
+      await this.reserveTaskDesktop(plan, async () => {
+        await this.config.editConfig((config) =>
+          this.appendQueuedTaskEntry(config, plan, workspacePath, trunkBranch)
+        );
+      });
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+
+    // Emit metadata update so the UI sees the workspace immediately.
+    await this.emitWorkspaceMetadata(taskId);
+
+    // NOTE: Do NOT persist the prompt into chat history until the task actually starts.
+    // Otherwise the frontend treats "last message is user" as an interrupted stream and
+    // will auto-retry / backoff-spam resume attempts while the task is queued.
+    taskQueueDebug("TaskService.create queued persisted (prompt stored in config)", {
+      taskId,
+      workspaceName,
+    });
+
+    // Schedule queue processing (best-effort).
+    this.scheduleMaybeStartQueuedTasks();
+    taskQueueDebug("TaskService.create queued scheduled maybeStartQueuedTasks", { taskId });
+    return Ok({
+      taskId,
+      kind: "agent",
+      status: "queued",
+      modelString: plan.taskModelString,
+      thinkingLevel: plan.effectiveThinkingLevel,
+      desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
+    });
+  }
+
+  /** The queued branch's config edit: appends the queued task's row under its parent's project. */
+  private appendQueuedTaskEntry(
+    config: ProjectsConfig,
+    plan: TaskCreatePlan,
+    workspacePath: string,
+    trunkBranch: string
+  ): ProjectsConfig {
+    const { taskId, parentWorkspaceId, effectiveThinkingLevel, effectiveReasoningMode } = plan;
+    assertParentAdmitsChild(config, parentWorkspaceId, {
+      requireRow: plan.parentEntry != null,
+      legacyRow: plan.legacyParentRow,
+    });
+    let projectConfig = config.projects.get(plan.configProjectPath);
+    if (!projectConfig) {
+      projectConfig = { workspaces: [] };
+      config.projects.set(plan.configProjectPath, projectConfig);
+    }
+
+    projectConfig.workspaces.push({
+      kind: plan.parentIsScratch ? "scratch" : undefined,
+      path: workspacePath,
+      id: taskId,
+      name: plan.workspaceName,
+      title: plan.args.title,
+      createdAt: plan.createdAt,
+      runtimeConfig: plan.taskRuntimeConfig,
+      // New rows have no legacy plan to migrate (#5174).
+      remotePlanMigrated: true,
+      aiSettings: {
+        model: plan.canonicalModel,
+        thinkingLevel: effectiveThinkingLevel,
+        ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+      },
+      parentWorkspaceId,
+      agentId: plan.agentId,
+      agentType: plan.agentType,
+      workflowTask: plan.args.workflowTask,
+      bestOf: plan.normalizedBestOf,
+      taskStatus: "queued",
+      // Never admitted: the queue drain's launch CAS rotates it and takes ownership.
+      taskAttemptId: newTaskAttemptId(),
+      taskPrompt: plan.prompt,
+      taskTrunkBranch: trunkBranch,
+      taskModelString: plan.taskModelString,
+      taskThinkingLevel: effectiveThinkingLevel,
+      taskAiPins: plan.taskAiPins,
+      taskOnRefusal: plan.args.onRefusal,
+      taskIsolation: plan.useSharedWorkspace ? "none" : undefined,
+      taskAttentionPolicy: plan.args.attentionPolicy,
+      taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
+      projects: plan.parentMeta.projects,
+    });
+    this.desktopInputCoordinator.assertAdmission(config, taskId);
+    return config;
   }
 
   async retitleDescendantAgentTask(
