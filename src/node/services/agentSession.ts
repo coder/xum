@@ -36,6 +36,7 @@ import {
 } from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import {
+  isDurableContextBoundaryMarker,
   isProviderEligibleMessage,
   leavesCompactionFollowUpPending,
   sliceMessagesForProviderFromLatestContextBoundary,
@@ -5635,6 +5636,7 @@ export class AgentSession {
 
       if (truncateResult.success) {
         editTailTruncated = true;
+        await this.restorePostCompactionRowAfterEdit(truncateResult.data.removedMessages);
         // RLM mode: summarize the truncated tail into a durable labeled row
         // BEFORE the edited user message is appended and this turn's request is
         // built (log purity by construction). Best-effort with a hard deadline —
@@ -9535,6 +9537,28 @@ export class AgentSession {
     return true;
   }
 
+  /**
+   * An edit cuts from its prompt, so it also cuts an attachments row stored after that prompt.
+   * The snapshot was acknowledged and no later turn writes the row again: put the row back
+   * before the edited prompt. An edit that cut a context boundary also cut the row's window.
+   */
+  private async restorePostCompactionRowAfterEdit(removed: readonly MuxMessage[]): Promise<void> {
+    if (removed.some(isDurableContextBoundaryMarker)) return;
+    const row = removed.findLast(isPostCompactionAttachmentsMessage);
+    if (row == null) return;
+    const { historySequence: _sequence, ...metadata } = row.metadata ?? {};
+    const restored: MuxMessage = { ...row, metadata };
+    const appended = await this.historyService.appendToHistory(this.workspaceId, restored);
+    if (!appended.success) {
+      log.warn("Failed to restore post-compaction attachments row after edit", {
+        workspaceId: this.workspaceId,
+        error: appended.error,
+      });
+      return;
+    }
+    this.emitChatEvent({ ...restored, type: "message" });
+  }
+
   private async discardFailedPostCompactionState(
     pendingState: Awaited<ReturnType<CompactionHandler["peekPendingState"]>>
   ): Promise<void> {
@@ -9818,16 +9842,11 @@ export class AgentSession {
       return false;
     }
 
-    this.postCompactionRetryAttempts.add(requestId);
-
     log.info("Post-compaction context hit context limit; retrying once without it", {
       workspaceId: this.workspaceId,
       requestId,
       model: context.modelString,
     });
-
-    // The post-compaction context is likely the culprit; discard it so we don't loop.
-    await this.discardFailedPostCompactionState(pendingState);
 
     // Abort the failed assistant placeholder and clean up persisted partial/history state.
     this.resetActiveStreamState();
@@ -9837,9 +9856,13 @@ export class AgentSession {
       messageId: data.messageId,
     });
     await this.clearFailedAssistantMessage(data.messageId, "post-compaction-retry");
+    // Keep the pending state while the row stays in history: the next turn reuses the row.
     if (!(await this.deletePostCompactionRow(postCompactionRow, context.admissionCapture))) {
       return false;
     }
+    this.postCompactionRetryAttempts.add(requestId);
+    // The post-compaction context is likely the culprit; discard it so we don't loop.
+    await this.discardFailedPostCompactionState(pendingState);
 
     // r40: same admission gate as the compaction retry above — this path also
     // crosses a transient idle gap before re-entering PREPARING.

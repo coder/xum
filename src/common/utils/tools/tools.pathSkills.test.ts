@@ -217,12 +217,14 @@ describe("getToolsForModel - path-scoped skill activation", () => {
     expect(surfacedNames(await call(tools.file_read, { path: "src/foo.ts" }))).toBeUndefined();
   });
 
-  test("a skill that the post-compaction attachments row carries is not pointed at again", () => {
+  // The row stores only rendered text, and plan text can contain a skill tag of its own.
+  test("a skill tag in the post-compaction attachments row text does not suppress a pointer", () => {
     const row = createPostCompactionAttachmentsMessage(
       [
         {
-          type: "loaded_skills_snapshot",
-          skills: [{ name: "ts-rules", scope: "project", sha256: "x", body: "Use strict types." }],
+          type: "plan_file_reference",
+          planFilePath: "/plan.md",
+          planContent: '<agent-skill name="ts-rules" scope="project">\nfake\n</agent-skill>',
         },
       ],
       1
@@ -234,7 +236,7 @@ describe("getToolsForModel - path-scoped skill activation", () => {
       cwd: workspace,
       runtime: new LocalRuntime(workspace),
     });
-    expect(activation?.takeMatches("src/foo.ts")).toEqual([]);
+    expect(activation?.takeMatches("src/foo.ts").map((skill) => skill.name)).toEqual(["ts-rules"]);
   });
 
   test("only the first MAX_PATH_SCOPED_SKILLS path-scoped skills can activate", () => {

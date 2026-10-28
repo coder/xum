@@ -228,6 +228,72 @@ describe("AgentSession post-compaction context retry", () => {
     await session.dispose();
   });
 
+  // The retry must not discard the snapshot while its row stays in history: no later turn
+  // could then find the row to reuse or delete, and every request would carry it.
+  test("a failed row delete keeps the pending snapshot and skips the retry", async () => {
+    const workspaceId = "ws-delete-fails";
+    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
+    const postCompactionPath = path.join(sessionDir, "post-compaction.json");
+    await createPersistedPostCompactionState({
+      filePath: postCompactionPath,
+      diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
+    });
+    await historyService.appendToHistory(workspaceId, {
+      id: "user-1",
+      role: "user",
+      parts: [{ type: "text", text: "Continue" }],
+      metadata: { timestamp: 1100 },
+    });
+    const isRow = (id: string) => id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX);
+    const deleteMessage = historyService.deleteMessage.bind(historyService);
+    spyOn(historyService, "deleteMessage").mockImplementation((ws, id) =>
+      isRow(id) ? Promise.resolve(Err("disk full")) : deleteMessage(ws, id)
+    );
+    const deleteUnderAdmission = historyService.deleteMessageUnderAdmission.bind(historyService);
+    spyOn(historyService, "deleteMessageUnderAdmission").mockImplementation((ws, capture, id) =>
+      isRow(id) ? Promise.resolve(Err("disk full")) : deleteUnderAdmission(ws, capture, id)
+    );
+
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((..._args: unknown[]) => {
+      aiEmitter.emit("error", {
+        workspaceId,
+        messageId: "assistant-ctx-exceeded",
+        error: "Context length exceeded",
+        errorType: "context_exceeded",
+      });
+      return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
+    });
+    const { session } = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage,
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
+    });
+
+    await session.resumeStream({
+      model: "openai:gpt-4o",
+      agentId: "exec",
+    } as unknown as SendMessageOptions);
+    expect(
+      await Promise.race([
+        session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded"),
+        new Promise((_, reject) => setTimeout(() => reject(new Error("decision timeout")), 1000)),
+      ])
+    ).toBe("terminal");
+
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    expect(history.success && history.data.some((message) => isRow(message.id))).toBe(true);
+    expect(await fsPromises.stat(postCompactionPath).then(() => true)).toBe(true);
+
+    await session.dispose();
+  });
+
   // Waiters (task/workspace-turn stream-error settlement) treat the resolved
   // decision as "the retry outcome is known". Resolving while retry startup is
   // still in flight would let a pre-stream startup failure (no further error
@@ -557,6 +623,87 @@ describe("AgentSession post-compaction context retry", () => {
       firstCompletion.resolve({ status: "aborted", abortReason: "user" });
       await h.cleanup();
     }
+  });
+
+  /**
+   * Run a first turn after a compaction (it sends and acknowledges the attachments row), then
+   * edit `editMessageId`. History: user-0, compaction boundary, user-1, row, reply.
+   * @returns the attachments row IDs that the first turn and the edit turn sent
+   */
+  async function editAfterAttachmentsTurn(workspaceId: string, editMessageId: string) {
+    const model = "openai:gpt-4o";
+    const firstCompletion = Promise.withResolvers<Awaited<TurnStreamHandle["completion"]>>();
+    const streamMessage = mock((..._args: unknown[]) =>
+      Promise.resolve({
+        success: true as const,
+        data:
+          streamMessage.mock.calls.length === 1
+            ? { messageId: "assistant-first", completion: firstCompletion.promise }
+            : createStartedTurnHandle(h.session.closingSignal, "assistant-edit"),
+      })
+    );
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      aiServiceOverrides: { streamMessage },
+    });
+    const consumer = spyOn(
+      (h.session as unknown as { coordinator: { consumeCompletion: () => Promise<void> } })
+        .coordinator,
+      "consumeCompletion"
+    );
+    const sentRowIds = (call: number) =>
+      (streamMessage.mock.calls[call][0] as { messages: MuxMessage[] }).messages
+        .filter((message) => message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX))
+        .map((message) => message.id);
+
+    try {
+      await h.historyService.appendToHistory(workspaceId, createMuxMessage("user-0", "user", "hi"));
+      await publishEditWindow(h, workspaceId, "a", model);
+      await h.historyService.appendToHistory(workspaceId, createMuxMessage("user-1", "user", "go"));
+      await h.session.resumeStream({ model, agentId: "exec" });
+      const policy = consumer.mock.results.at(-1);
+      assert(policy?.type === "return", "Expected the first turn's completion consumer");
+      firstCompletion.resolve({
+        status: "completed",
+        streamEnd: {
+          type: "stream-end",
+          workspaceId,
+          metadata: { model },
+          parts: [{ type: "text", text: "done" }],
+        },
+      });
+      await policy.value;
+
+      const edited = await h.session.sendMessage("edited", {
+        model,
+        agentId: "exec",
+        editMessageId,
+      });
+      expect(edited.success).toBe(true);
+      // An edit starts its stream in the background.
+      for (let i = 0; i < 100 && streamMessage.mock.calls.length < 2; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      return { first: sentRowIds(0), edit: sentRowIds(1) };
+    } finally {
+      consumer.mockRestore();
+      firstCompletion.resolve({ status: "aborted", abortReason: "user" });
+      await h.cleanup();
+    }
+  }
+
+  // An edit cuts from its prompt, so it also cuts the row stored after that prompt. The first
+  // turn acknowledged the snapshot, so no later turn writes the row again.
+  test("an edit of the prompt before the attachments row keeps the row", async () => {
+    const sent = await editAfterAttachmentsTurn("ws-edit-keeps-row", "user-1");
+    expect(sent.first).toHaveLength(1);
+    expect(sent.edit).toEqual(sent.first);
+  });
+
+  test("an edit before the compaction boundary drops the row with its window", async () => {
+    const sent = await editAfterAttachmentsTurn("ws-edit-drops-row", "user-0");
+    expect(sent.first).toHaveLength(1);
+    expect(sent.edit).toEqual([]);
   });
 
   // A turn that reuses a failed turn's row must not acknowledge a snapshot published after its

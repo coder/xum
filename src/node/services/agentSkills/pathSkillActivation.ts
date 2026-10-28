@@ -5,7 +5,7 @@ import {
   type PathSkillsResultField,
 } from "@/common/types/tools";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
-import { isPostCompactionAttachmentsMessage, type MuxMessage } from "@/common/types/message";
+import type { MuxMessage } from "@/common/types/message";
 import { deriveProjectRelativePath } from "@/common/utils/review/assistedReview";
 import { createSkillPathsMatcher } from "@/common/utils/skills/skillPaths";
 import { log } from "@/node/services/log";
@@ -107,40 +107,21 @@ function collectFromParts(parts: unknown, names: Set<string>): void {
   }
 }
 
-/** The opening tag of a carried skill, at a line start, as renderAgentSkillSnapshotText writes it. */
-const CARRIED_SKILL_TAG = /^<agent-skill name="([^"]+)" scope="[^"]+">$/gm;
-
-/**
- * Skills that the post-compaction attachments row carries into the window. The row stores
- * only rendered text, so read the names from its skill tags. A skill that the row budget
- * dropped has no tag, so it can still get a pointer.
- */
-function collectCarriedSkillNames(parts: unknown, names: Set<string>): void {
-  if (!Array.isArray(parts)) return;
-  for (const part of parts) {
-    const text = asRecord(part)?.text;
-    if (typeof text !== "string") continue;
-    for (const match of text.matchAll(CARRIED_SKILL_TAG)) names.add(match[1]);
-  }
-}
-
 /**
  * Names of skills already in the context window: prior pointers, successful
- * agent_skill_read calls, /skill-name snapshot rows and skills that the post-compaction
- * attachments row carries. History is untrusted on disk, so malformed rows are skipped,
- * never thrown on (self-healing).
+ * agent_skill_read calls, and /skill-name snapshot rows. History is untrusted on disk,
+ * so malformed rows are skipped, never thrown on (self-healing).
+ *
+ * The post-compaction attachments row does not count: it stores only rendered text, and
+ * plan text or a skill body can contain a skill tag. A skill that the row carries can get
+ * one extra pointer, but a spoofed tag cannot hide a pointer.
  */
 export function collectSurfacedSkillNames(messages: readonly MuxMessage[]): Set<string> {
   const names = new Set<string>();
   for (const message of messages) {
     const record = asRecord(message);
-    if (record == null) continue;
-    addName(names, asRecord(asRecord(record.metadata)?.agentSkillSnapshot)?.skillName);
-    collectFromParts(record.parts, names);
-    // The shared check reads the ID as a string: skip a malformed row without one first.
-    if (typeof record.id === "string" && isPostCompactionAttachmentsMessage(message)) {
-      collectCarriedSkillNames(record.parts, names);
-    }
+    addName(names, asRecord(asRecord(record?.metadata)?.agentSkillSnapshot)?.skillName);
+    collectFromParts(record?.parts, names);
   }
   return names;
 }
