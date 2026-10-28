@@ -61,6 +61,7 @@ import {
   streamEnd,
   stubStableIds,
   testTaskSettings,
+  workspaceTurnManagerFor,
 } from "@/node/services/taskService.testHarness";
 import {
   createTaskServiceHarness,
@@ -255,6 +256,61 @@ describe("TaskService", () => {
         expect(t.child()?.taskStatus).toBe("running");
       }
     );
+
+    test("an awaiting_report task whose cut successor is pending runs again and defers", async () => {
+      const t = await setupChildTask({ taskStatus: "awaiting_report" });
+      t.receiptFake.register("entry-1", "pending");
+
+      await streamEnd(
+        t.taskService,
+        cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+      );
+
+      // The pending continuation owns the turn: the task runs again and nothing is prompted.
+      expect(t.child()?.taskStatus).toBe("running");
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.child()?.taskRecoveryAttempts).toBeUndefined();
+      expect(t.receiptFake.receipts.get("entry-1")).toMatchObject({
+        sourceHandled: true,
+        disposed: false,
+      });
+    });
+
+    // A Stop or reactivation can land while the stream end awaits its report read: the second
+    // cut-source check, right before the continuation classification, discards the cut.
+    test("a stop epoch bump during the report read discards the cut instead of deferring it", async () => {
+      // awaiting_report: a deferral would also set the task running again.
+      const t = await setupChildTask({ taskStatus: "awaiting_report" });
+      t.receiptFake.register("entry-1", "pending");
+      const internal = t.taskService as unknown as {
+        isPlanLikeTaskWorkspace: (entry: unknown) => Promise<boolean>;
+      };
+      const realIsPlanLike = internal.isPlanLikeTaskWorkspace.bind(t.taskService);
+      let bumps = 0;
+      const isPlanLike = spyOn(internal, "isPlanLikeTaskWorkspace").mockImplementation(
+        async (entry) => {
+          bumps++;
+          t.taskService.bumpWorkspaceStopEpoch(t.childId);
+          return await realIsPlanLike(entry);
+        }
+      );
+
+      try {
+        await streamEnd(
+          t.taskService,
+          cutEvent(t.childId, { kind: "queued-input", entryId: "entry-1" })
+        );
+      } finally {
+        isPlanLike.mockRestore();
+      }
+
+      expect(bumps).toBe(1);
+      expect(t.sendMessage).not.toHaveBeenCalled();
+      expect(t.child()?.taskStatus).toBe("awaiting_report");
+      // Disposed and handled, so released; a deferral would have kept it undisposed.
+      expect(t.receiptFake.overrides.disposeQueueCut).toHaveBeenCalledTimes(1);
+      expect(t.receiptFake.receipts.has("entry-1")).toBe(false);
+    });
 
     test.each<QueueCutSuccessorState>([
       "pending",
@@ -1761,6 +1817,68 @@ describe("TaskService", () => {
       expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
         kind: "live",
         executionId: taskId,
+      });
+    });
+
+    test("a workspace that is not an agent task is indeterminate, even with a report in the requester's session dir", async () => {
+      const { config } = await setupTree([]);
+      // A report keyed by the root's id: the agent-task check must decide before any artifact read.
+      await persistReport(config, unrelatedParentId, rootId, "not a task report");
+      const { taskService } = createTaskServiceHarness(config);
+      expect(
+        await taskService.readAttemptOutcome(rootId, { requestingWorkspaceId: unrelatedParentId })
+      ).toEqual({ kind: "indeterminate", reason: "workspace is not an agent task" });
+    });
+
+    test("a live workspace turn registration is live under its handle, ahead of interrupted config", async () => {
+      const taskId = "task-outcome-live-registration";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      const registration = spyOn(
+        workspaceTurnManagerFor(taskService),
+        "getLiveWorkspaceTurnRegistration"
+      ).mockImplementation((workspaceId) =>
+        workspaceId === taskId
+          ? { handleId: "wst_live_turn", ownerWorkspaceId: rootId, accepted: true }
+          : undefined
+      );
+      try {
+        expect(await taskService.readAttemptOutcome(taskId, requesting)).toEqual({
+          kind: "live",
+          executionId: "wst_live_turn",
+        });
+      } finally {
+        registration.mockRestore();
+      }
+    });
+
+    test("paired: an owned settled attempt whose row is gone proves no report only through a session dir", async () => {
+      const taskId = "task-outcome-owned-rowless";
+      const { config } = await setupTree([
+        { id: taskId, parent: rootId, overrides: { taskStatus: "interrupted" } },
+      ]);
+      const { taskService } = createTaskServiceHarness(config);
+      expect(await taskService.markInterruptedTaskRunning(taskId)).toBe(true);
+      await taskService.terminateAllDescendantAgentTasks(rootId);
+      await waitForOutcomeKind(taskService, taskId, "terminal-no-report");
+      // The row disappears outside this process (no TaskService path drops its ownership).
+      await config.editConfig((cfg) => {
+        for (const project of cfg.projects.values()) {
+          project.workspaces = project.workspaces.filter((entry) => entry.id !== taskId);
+        }
+        return cfg;
+      });
+      // No requester and no row: nothing names where a report would be, so nothing is proven.
+      expect(await taskService.readAttemptOutcome(taskId)).toEqual({
+        kind: "indeterminate",
+        reason: "attempt settled but no session directory names where its report would be",
+      });
+      // The requester's session dir positively holds no report: the owned settlement decides.
+      expect(await taskService.readAttemptOutcome(taskId, requesting)).toMatchObject({
+        kind: "terminal-no-report",
+        code: "no-record",
       });
     });
 
