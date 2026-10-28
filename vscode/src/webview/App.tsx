@@ -30,6 +30,8 @@ import {
 } from "xum/browser/contexts/BackgroundBashContext";
 import { BackgroundProcessesBanner } from "xum/browser/components/BackgroundProcessesBanner/BackgroundProcessesBanner";
 import { SubAgentTasksDock } from "./SubAgentTasksDock";
+import { ChatActivityPanelsProvider } from "xum/browser/components/ChatPane/chatActivityPanels";
+import { ChatActivityOverflowChip } from "xum/browser/components/ChatPane/ChatInputDecoration";
 import { PopoverError } from "xum/browser/components/PopoverError/PopoverError";
 import {
   useBackgroundBashStateKnown,
@@ -1269,46 +1271,52 @@ function WebviewApp(props: { bridge: VscodeBridge; apiClient: APIClient }): JSX.
                         ))}
                       </div>
                     ) : null}
-                    {/* Background bashes sit between held inputs and the turn status, as in the
-                        desktop dock. Keyed so the expanded list and an open output dialog never
-                        carry over to another workspace or server. Without a server connection the
-                        store has no client, so its last-known processes are not offered. */}
-                    {selectedWorkspaceId && canChat && chatRevealed ? (
-                      // Above the background bashes, as in the desktop dock. Same gutter fix.
-                      <div className="-mx-[15px]">
-                        <SubAgentTasksDock
-                          key={`sub-agent-tasks-${apiConnectionKey ?? ""}-${selectedWorkspaceId}`}
-                          workspaces={workspaces}
+                    {/* The live line (#7689), as in the desktop dock: the turn status plus one
+                        chip per kind of activity (sub-agents, background bashes), each opening
+                        its list in a panel. Between turns it shows only the chips, and it hides
+                        itself when none render. */}
+                    {selectedWorkspaceId && chatRevealed ? (
+                      <ChatActivityPanelsProvider
+                        // Keyed by connection and workspace: no open panel, bash output dialog or
+                        // retained workflow-run ref may carry over to another workspace or server
+                        // (both servers may share a workspace ID). Siblings of the composer
+                        // (keyed by the bare workspace ID) must not share keys.
+                        key={`activity-line-${apiConnectionKey ?? ""}-${selectedWorkspaceId}`}
+                        className="relative"
+                        dataComponent="ChatActivityLine"
+                      >
+                        {/* Always mounted, even between turns (it then shows only the chips):
+                            swapping it for another component when a turn starts or ends would
+                            remount the chips, closing an open panel and the bash output dialog
+                            and dropping their state. */}
+                        <VscodeStreamingBarrier
                           workspaceId={selectedWorkspaceId}
-                          activity={workspaceActivity}
-                          onSelect={(workspaceId) =>
-                            bridge.postMessage({ type: "selectWorkspace", workspaceId })
+                          aggregator={aggregatorRef.current}
+                          activeBashMonitorCount={activeBashMonitorCount}
+                          onCancel={(phase) =>
+                            interruptStream({ abandonPartial: phase === "compacting" })
+                          }
+                          // No keys on the chips: the provider's key remounts them per workspace
+                          // and connection. Without a server connection the background bash
+                          // store has no client, so its last-known processes are not offered.
+                          activity={
+                            canChat ? (
+                              <>
+                                <SubAgentTasksDock
+                                  workspaces={workspaces}
+                                  workspaceId={selectedWorkspaceId}
+                                  activity={workspaceActivity}
+                                  onSelect={(workspaceId) =>
+                                    bridge.postMessage({ type: "selectWorkspace", workspaceId })
+                                  }
+                                />
+                                <BackgroundProcessesBanner workspaceId={selectedWorkspaceId} />
+                                <ChatActivityOverflowChip />
+                              </>
+                            ) : null
                           }
                         />
-                      </div>
-                    ) : null}
-                    {selectedWorkspaceId && canChat && chatRevealed ? (
-                      // The shared banner brings its own dock gutter (desktop's composer has the
-                      // same one); cancel this dock's padding so it lines up with the composer.
-                      <div className="-mx-[15px]">
-                        <BackgroundProcessesBanner
-                          // Sibling of the composer, which is keyed by the bare workspace ID.
-                          // Includes the connection: both servers may share a workspace ID.
-                          key={`background-processes-${apiConnectionKey ?? ""}-${selectedWorkspaceId}`}
-                          workspaceId={selectedWorkspaceId}
-                        />
-                      </div>
-                    ) : null}
-                    {/* Live turn status sits beside the input, below held inputs, as in desktop. */}
-                    {selectedWorkspaceId && chatRevealed ? (
-                      <VscodeStreamingBarrier
-                        workspaceId={selectedWorkspaceId}
-                        aggregator={aggregatorRef.current}
-                        activeBashMonitorCount={activeBashMonitorCount}
-                        onCancel={(phase) =>
-                          interruptStream({ abandonPartial: phase === "compacting" })
-                        }
-                      />
+                      </ChatActivityPanelsProvider>
                     ) : null}
                     {selectedWorkspaceId ? (
                       <ChatComposer
