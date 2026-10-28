@@ -410,17 +410,29 @@ describe("TaskService.create paths before the split", () => {
   ] as const)(
     "a launched %s task runs the project's init hook: %p",
     async (agentType, runsHook) => {
-      const { parentId, projectPath, taskService } = await setup();
-      const marker = path.join(rootDir, "init-hook-ran");
-      await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
-      const hookPath = path.join(projectPath, ".xum", "init");
-      await fs.writeFile(hookPath, `#!/usr/bin/env bash\necho ran > ${JSON.stringify(marker)}\n`);
-      await fs.chmod(hookPath, 0o755);
-      const created = await createAgentTask(taskService, parentId, "go", { agentType });
-      expect(created.success && created.data.status).toBe("running");
-      expect(backgroundInits).toHaveLength(1);
-      await settleBackgroundInits();
-      expect(existsSync(marker)).toBe(runsHook);
+      // The project-automation kill switch skips every hook, so clear it (and its legacy alias)
+      // for this test: only skip_init_hook may decide whether the hook runs.
+      const killSwitchNames = ["XUM_DISABLE_PROJECT_AUTOMATION", "MUX_DISABLE_PROJECT_AUTOMATION"];
+      const savedKillSwitch = killSwitchNames.map((name) => [name, process.env[name]] as const);
+      for (const name of killSwitchNames) delete process.env[name];
+      try {
+        const { parentId, projectPath, taskService } = await setup();
+        const marker = path.join(rootDir, "init-hook-ran");
+        await fs.mkdir(path.join(projectPath, ".xum"), { recursive: true });
+        const hookPath = path.join(projectPath, ".xum", "init");
+        await fs.writeFile(hookPath, `#!/usr/bin/env bash\necho ran > ${JSON.stringify(marker)}\n`);
+        await fs.chmod(hookPath, 0o755);
+        const created = await createAgentTask(taskService, parentId, "go", { agentType });
+        expect(created.success && created.data.status).toBe("running");
+        expect(backgroundInits).toHaveLength(1);
+        await settleBackgroundInits();
+        expect(existsSync(marker)).toBe(runsHook);
+      } finally {
+        for (const [name, value] of savedKillSwitch) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
     }
   );
 });
