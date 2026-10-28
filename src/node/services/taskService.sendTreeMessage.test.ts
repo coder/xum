@@ -31,6 +31,10 @@ interface TaskServiceInternals {
   flushParkedPeerSends(targetId: string): Promise<void>;
   workspaceEventLocks: { withLock<T>(key: string, fn: () => Promise<T>): Promise<T> };
   interruptedParentWorkspaceIds: Set<string>;
+  workspaceUserStopEpochs: Map<string, number>;
+  peerSendParking: { hasParked(targetId: string): boolean };
+  resolveParentAutoResumeOptions(...args: unknown[]): Promise<unknown>;
+  agentPeerMessageBroker: { recordPeerDelivery(...args: unknown[]): void };
 }
 
 describe("TaskService.sendTreeMessage uncovered paths", () => {
@@ -205,5 +209,39 @@ describe("TaskService.sendTreeMessage uncovered paths", () => {
     expect(s.sendMessage).toHaveBeenCalledTimes(1);
     // The wait's refusal (code refused), not the generic transport failure (send_failed).
     expect(retry).toMatchObject(Err({ code: "refused" }));
+  });
+
+  test("a send that would wait for a delegated turn is refused when the user stopped the target since admission", async () => {
+    const s = await setUp();
+    // Another workspace's delegated turn runs on beta, so the pre-dispatch probe tells alpha's
+    // message to wait for it.
+    await registerLiveWorkspaceTurnHandle(s.taskService, "beta", "wst_owner", "owner");
+    // A user Stop bumps this count together with the stop epoch, which the probe checks first,
+    // so only the count is bumped here. The bump lands during the send-options await, after the
+    // send captured its baseline and before the wait parks the message.
+    const original = s.internals.resolveParentAutoResumeOptions.bind(s.taskService);
+    const resumeOptions = spyOn(s.internals, "resolveParentAutoResumeOptions");
+    resumeOptions.mockImplementationOnce((...args: unknown[]) => {
+      s.internals.workspaceUserStopEpochs.set(
+        "beta",
+        (s.internals.workspaceUserStopEpochs.get("beta") ?? 0) + 1
+      );
+      return original(...args);
+    });
+    const deliveries = spyOn(s.internals.agentPeerMessageBroker, "recordPeerDelivery");
+
+    const result = await s.taskService.sendAgentTreeMessage("alpha", "beta", "Status?");
+
+    expect(resumeOptions).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject(Err({ code: "refused" }));
+    // Refused, not parked: nothing waits for the turn, nothing reached beta, no delivery counted.
+    expect(s.internals.peerSendParking.hasParked("beta")).toBe(false);
+    expect(s.sendMessage).not.toHaveBeenCalled();
+    expect(deliveries).not.toHaveBeenCalled();
+    resumeOptions.mockRestore();
+    deliveries.mockRestore();
+    workspaceTurnManagerInternals(s.taskService).activeWorkspaceTurnHandleByWorkspaceId.delete(
+      "beta"
+    );
   });
 });
