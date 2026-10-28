@@ -1783,14 +1783,31 @@ interface TerminalWorkspaceTurnWakeCandidate {
   publicAwaitId: string;
 }
 
-/** A terminal-attention drain's candidates, collected after the owner was seen idle. */
-interface TerminalDrainCandidates {
+/** A terminal-attention drain's pending notifications and queued workflow runs, read at its start. */
+interface TerminalDrainSnapshot {
   readonly ownerWorkspaceId: string;
-  readonly entry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
-  /** The owner's pending notifications, without the agent reports the drain acknowledged. */
+  readonly freshSubagentAttentionTurns: ReadonlyMap<string, symbol>;
+  /** Without legacy workflow records; acknowledgeTerminalDrainReports drops acknowledged reports. */
   readonly pending: readonly TerminalAttentionNotification[];
+  readonly queuedWorkflowRunIds: readonly string[];
+}
+
+/** A drain's snapshot plus the owner's config entry, which exists and is not archived. */
+interface TerminalDrainOwner extends TerminalDrainSnapshot {
+  readonly cfg: ReturnType<Config["loadConfigOrDefault"]>;
+  readonly entry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
+}
+
+/** A drain's owner after its agent reports were acknowledged and their messages ensured. */
+interface TerminalDrainAgentAttention extends TerminalDrainOwner {
+  readonly taskIndex: AgentTaskIndex;
   readonly agentNotifications: readonly TerminalAttentionNotification[];
   readonly deliverableAgentNotificationIds: ReadonlySet<string>;
+  readonly latestMessageTimestampByTaskId: ReadonlyMap<string, number>;
+}
+
+/** A terminal-attention drain's candidates, collected after the owner was seen idle. */
+interface TerminalDrainCandidates extends TerminalDrainAgentAttention {
   readonly workspaceTurnCandidates: readonly TerminalWorkspaceTurnWakeCandidate[];
   readonly deliverableWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[];
   /** A recent send of the non-workflow batch was rejected: the batch sits out this drain. */
@@ -11605,12 +11622,29 @@ export class TaskService implements AgentTaskIntegration {
         await this.terminalAttentionStore.delete(ownerWorkspaceId, notification.id);
       }
     }
-    let pending = allPending.filter((notification) => notification.sourceKind !== "workflow_run");
+    const pending = allPending.filter((notification) => notification.sourceKind !== "workflow_run");
     const queuedWorkflowRunIds = this.workflowRunAttention.queuedRunIds(ownerWorkspaceId);
     if (pending.length === 0 && queuedWorkflowRunIds.length === 0) {
       return;
     }
+    // The rest of the drain is a chain of steps: resolveTerminalDrainOwner →
+    // deferTerminalDrainWhileOwnerBusy → acknowledgeTerminalDrainReports →
+    // collectWorkspaceTurnWakeCandidates → collectTerminalWorkflowWakePrompts →
+    // readNonWorkflowBackoffAndMuxMetadata → resolveTerminalWakeRestrictions →
+    // selectTerminalWorkflowWakeGroup → composeTerminalWake → deliverTerminalWake. Each step
+    // starts the next one in the same tick as its own last await, so no collaborator call runs a
+    // microtask later than it did inline; only the drain's own resolution comes later.
+    return this.resolveTerminalDrainOwner({
+      ownerWorkspaceId,
+      freshSubagentAttentionTurns,
+      pending,
+      queuedWorkflowRunIds,
+    });
+  }
 
+  /** Supersedes the pending wakes of a deleted or archived owner; else checks the owner's turn. */
+  private async resolveTerminalDrainOwner(snapshot: TerminalDrainSnapshot): Promise<void> {
+    const { ownerWorkspaceId, pending } = snapshot;
     const cfg = this.config.loadConfigOrDefault();
     const entry = findWorkspaceEntry(cfg, ownerWorkspaceId);
     if (entry == null) {
@@ -11632,7 +11666,12 @@ export class TaskService implements AgentTaskIntegration {
       }
       return;
     }
+    return this.deferTerminalDrainWhileOwnerBusy({ ...snapshot, cfg, entry });
+  }
 
+  /** A busy owner keeps its wakes pending; the drain may cut its live turn for fresh reports. */
+  private async deferTerminalDrainWhileOwnerBusy(owner: TerminalDrainOwner): Promise<void> {
+    const { ownerWorkspaceId } = owner;
     // Defer-until-idle: never inject ahead of an active stream or a queued/preparing user turn.
     const ownerHasPendingQueuedPreparingOrRetry =
       this.workspaceService.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
@@ -11647,17 +11686,22 @@ export class TaskService implements AgentTaskIntegration {
     ) {
       await this.cutBusyOwnerTurnForSubagentAttention(
         ownerWorkspaceId,
-        entry,
-        pending,
-        freshSubagentAttentionTurns
+        owner.entry,
+        owner.pending,
+        owner.freshSubagentAttentionTurns
       );
       if (ownerHasBusyQueuedOrRetry && !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId)) {
         this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
       }
       return;
     }
+    return this.acknowledgeTerminalDrainReports(owner);
+  }
 
-    const taskIndex = this.buildAgentTaskIndex(cfg);
+  /** Acknowledges the agent reports already in history, and ensures the rest have messages. */
+  private async acknowledgeTerminalDrainReports(owner: TerminalDrainOwner): Promise<void> {
+    const { ownerWorkspaceId } = owner;
+    const taskIndex = this.buildAgentTaskIndex(owner.cfg);
     if (await this.hasBlockingActiveWorkForTerminalDrain(ownerWorkspaceId, taskIndex)) {
       return;
     }
@@ -11667,7 +11711,7 @@ export class TaskService implements AgentTaskIntegration {
     // Normal completion acknowledges before compaction; this is recovery for missed
     // callbacks or reports whose notification was published after the answer committed.
     const consumedIds = await this.acknowledgeAgentReports(ownerWorkspaceId);
-    pending = pending.filter((notification) => !consumedIds.has(notification.id));
+    const pending = owner.pending.filter((notification) => !consumedIds.has(notification.id));
 
     const agentNotifications = pending.filter(
       (notification) => notification.sourceKind === "agent_task"
@@ -11676,13 +11720,29 @@ export class TaskService implements AgentTaskIntegration {
       deliverableNotificationIds: deliverableAgentNotificationIds,
       latestMessageTimestampByTaskId,
     } = await this.ensureAgentTerminalMessages(ownerWorkspaceId, agentNotifications);
-    const workspaceTurnNotifications = pending.filter(
+    // The acknowledged subset replaces the snapshot's pending list for every later step.
+    return this.collectWorkspaceTurnWakeCandidates({
+      ...owner,
+      pending,
+      taskIndex,
+      agentNotifications,
+      deliverableAgentNotificationIds,
+      latestMessageTimestampByTaskId,
+    });
+  }
+
+  /**
+   * Collects the pending workspace-turn wakes, superseding a persistent child continuation whose
+   * report is already in the owner's history.
+   */
+  private async collectWorkspaceTurnWakeCandidates(
+    attention: TerminalDrainAgentAttention
+  ): Promise<void> {
+    const { ownerWorkspaceId, taskIndex, latestMessageTimestampByTaskId } = attention;
+    const workspaceTurnNotifications = attention.pending.filter(
       (notification) => notification.sourceKind === "workspace_turn"
     );
-    const workspaceTurnCandidates: Array<{
-      notification: (typeof pending)[number];
-      publicAwaitId: string;
-    }> = [];
+    const workspaceTurnCandidates: TerminalWorkspaceTurnWakeCandidate[] = [];
     for (const notification of workspaceTurnNotifications) {
       const record = await this.getWorkspaceTurnManager().getWorkspaceTurnRecord(
         ownerWorkspaceId,
@@ -11716,14 +11776,18 @@ export class TaskService implements AgentTaskIntegration {
         publicAwaitId: isPersistentChildContinuation ? record.workspaceId : notification.sourceId,
       });
     }
-    const deliverableWorkflowPrompts: Array<{
-      runId: string;
-      run: WorkflowRunRecord;
-      prompt: string;
-      initiatingAgent?: WorkflowWakeInitiatingAgent;
-    }> = [];
+    return this.collectTerminalWorkflowWakePrompts(attention, workspaceTurnCandidates);
+  }
 
-    for (const runId of queuedWorkflowRunIds) {
+  /** Builds the queued workflow runs' wake prompts, settling or dropping the stale runs. */
+  private async collectTerminalWorkflowWakePrompts(
+    attention: TerminalDrainAgentAttention,
+    workspaceTurnCandidates: readonly TerminalWorkspaceTurnWakeCandidate[]
+  ): Promise<void> {
+    const { ownerWorkspaceId } = attention;
+    const deliverableWorkflowPrompts: TerminalWorkflowWakeCandidate[] = [];
+
+    for (const runId of attention.queuedWorkflowRunIds) {
       const workflowPrompt = await this.buildWorkflowTerminalPrompt(ownerWorkspaceId, runId);
       if (workflowPrompt.outcome === "defer") {
         // History, sidecar, or the run record was transiently unreadable: the run stays
@@ -11762,6 +11826,20 @@ export class TaskService implements AgentTaskIntegration {
           : {}),
       });
     }
+    return this.readNonWorkflowBackoffAndMuxMetadata(
+      attention,
+      workspaceTurnCandidates,
+      deliverableWorkflowPrompts
+    );
+  }
+
+  /** Reads whether the non-workflow batch is backed off, and the active turn's mux metadata. */
+  private async readNonWorkflowBackoffAndMuxMetadata(
+    attention: TerminalDrainAgentAttention,
+    workspaceTurnCandidates: readonly TerminalWorkspaceTurnWakeCandidate[],
+    deliverableWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[]
+  ): Promise<void> {
+    const { ownerWorkspaceId } = attention;
     // Deliver one launch-identity group per drain, keyed by agentId AND recorded strict pin:
     // the whole coalesced prompt is handled under the single agentId/pin passed to
     // sendMessage, so batching runs from different launch identities would hand a restricted
@@ -11781,7 +11859,7 @@ export class TaskService implements AgentTaskIntegration {
     );
     const hasNonWorkflowDeliverables =
       !nonWorkflowSendBackedOff &&
-      (deliverableAgentNotificationIds.size > 0 || workspaceTurnCandidates.length > 0);
+      (attention.deliverableAgentNotificationIds.size > 0 || workspaceTurnCandidates.length > 0);
     // Unselected groups stay queued: the delivered group's wake turn ends with a streamEnded
     // drain (and the sweep backstops an aborted one), which delivers the next group.
     const workspaceTurnMuxMetadata =
@@ -11790,11 +11868,7 @@ export class TaskService implements AgentTaskIntegration {
       );
 
     return this.resolveTerminalWakeRestrictions({
-      ownerWorkspaceId,
-      entry,
-      pending,
-      agentNotifications,
-      deliverableAgentNotificationIds,
+      ...attention,
       workspaceTurnCandidates,
       deliverableWorkflowPrompts,
       nonWorkflowSendBackedOff,
