@@ -10,9 +10,7 @@ import {
   buildRuntimeString,
   RUNTIME_MODE,
   CODER_RUNTIME_PLACEHOLDER,
-  DAYTONA_RUNTIME_PLACEHOLDER,
 } from "@/common/types/runtime";
-import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
 import type { RuntimeChoice } from "@/browser/utils/runtimeUi";
 import {
   readOptionField,
@@ -52,7 +50,6 @@ export interface DraftWorkspaceSettings {
 interface SshRuntimeConfig {
   host: string;
   coder?: CoderWorkspaceConfig;
-  daytona?: DaytonaSandboxConfig;
 }
 
 interface SshRuntimeState {
@@ -92,9 +89,6 @@ const buildRuntimeForMode = (
       const effectiveHost =
         sshConfig.coder && !sshConfig.host.trim() ? CODER_RUNTIME_PLACEHOLDER : sshConfig.host;
 
-      if (sshConfig.daytona) {
-        return { mode: "ssh", host: DAYTONA_RUNTIME_PLACEHOLDER, daytona: sshConfig.daytona };
-      }
       return {
         mode: "ssh",
         host: effectiveHost,
@@ -115,18 +109,6 @@ const buildRuntimeForMode = (
   }
 };
 
-const mergeRememberedSsh = (
-  nextRuntime: Extract<ParsedRuntime, { mode: "ssh" }>,
-  remembered: RememberedRuntimeValues["ssh"]
-): ParsedRuntime => ({
-  ...nextRuntime,
-  host: !nextRuntime.host.trim() && remembered.host.trim() ? remembered.host : nextRuntime.host,
-  coder:
-    nextRuntime.coder === undefined && remembered.coder != null
-      ? remembered.coder
-      : nextRuntime.coder,
-});
-
 const mergeRememberedRuntimeConfig = (
   nextRuntime: ParsedRuntime,
   previousMode: RuntimeMode,
@@ -138,9 +120,17 @@ const mergeRememberedRuntimeConfig = (
 
   switch (nextRuntime.mode) {
     case RUNTIME_MODE.SSH:
-      // A Daytona selection takes no remembered host or Coder config: its host is a
-      // placeholder, and one managed backend per workspace (the runtime schema rejects both).
-      return nextRuntime.daytona ? nextRuntime : mergeRememberedSsh(nextRuntime, remembered.ssh);
+      return {
+        ...nextRuntime,
+        host:
+          !nextRuntime.host.trim() && remembered.ssh.host.trim()
+            ? remembered.ssh.host
+            : nextRuntime.host,
+        coder:
+          nextRuntime.coder === undefined && remembered.ssh.coder != null
+            ? remembered.ssh.coder
+            : nextRuntime.coder,
+      };
     case RUNTIME_MODE.DOCKER:
       return {
         ...nextRuntime,
@@ -170,22 +160,9 @@ const mergeRememberedRuntimeConfig = (
   }
 };
 
-/** The default runtime-type button: Coder and Daytona are SSH sub-choices. */
-const resolveDefaultRuntimeChoice = (
-  settingsDefaultRuntime: RuntimeChoice,
-  defaultRuntimeMode: RuntimeMode,
-  coderDefaultFromString: boolean
-): RuntimeChoice => {
-  if (settingsDefaultRuntime === "daytona") return "daytona";
-  return defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString
-    ? "coder"
-    : defaultRuntimeMode;
-};
-
 const normalizeRuntimeChoice = (value: unknown): RuntimeChoice | null => {
   if (
     value === "coder" ||
-    value === "daytona" ||
     value === RUNTIME_MODE.LOCAL ||
     value === RUNTIME_MODE.WORKTREE ||
     value === RUNTIME_MODE.SSH ||
@@ -202,8 +179,6 @@ const buildRuntimeFromChoice = (choice: RuntimeChoice): ParsedRuntime => {
   switch (choice) {
     case "coder":
       return { mode: RUNTIME_MODE.SSH, host: CODER_RUNTIME_PLACEHOLDER };
-    case "daytona":
-      return { mode: RUNTIME_MODE.SSH, host: DAYTONA_RUNTIME_PLACEHOLDER };
     case RUNTIME_MODE.LOCAL:
       return { mode: RUNTIME_MODE.LOCAL };
     case RUNTIME_MODE.WORKTREE:
@@ -373,7 +348,12 @@ export function useDraftWorkspaceSettings(
 
   const coderDefaultFromString =
     parsedDefault?.mode === RUNTIME_MODE.SSH && parsedDefault.host === CODER_RUNTIME_PLACEHOLDER;
-  const daytonaDefault = settingsDefaultRuntime === "daytona";
+  // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
+  const defaultRuntimeChoice: RuntimeChoice =
+    defaultRuntimeMode === RUNTIME_MODE.SSH && coderDefaultFromString
+      ? "coder"
+      : defaultRuntimeMode;
+
   const setLastRuntimeConfig = useCallback(
     // eslint-disable-next-line local/no-object-parameters -- grandfathered when the rule was introduced; fix the underlying type instead of copying this pattern
     (mode: RuntimeMode, field: string, value: string | boolean | object | null) => {
@@ -435,11 +415,7 @@ export function useDraftWorkspaceSettings(
   // Uses discriminated union: SSH has host, Docker has image.
   const defaultRuntime = buildRuntimeForMode(
     defaultRuntimeMode,
-    {
-      host: defaultSshHost,
-      coder: defaultSshCoder,
-      daytona: daytonaDefault ? {} : undefined,
-    },
+    { host: defaultSshHost, coder: defaultSshCoder },
     defaultDockerImage,
     lastShareCredentials,
     defaultDevcontainerConfigPath,
@@ -508,12 +484,7 @@ export function useDraftWorkspaceSettings(
       reasoningMode,
       agentId,
       selectedRuntime,
-      // Defaults must stay explicit and sticky; last-used SSH state should only seed inputs.
-      defaultRuntimeMode: resolveDefaultRuntimeChoice(
-        settingsDefaultRuntime,
-        defaultRuntimeMode,
-        coderDefaultFromString
-      ),
+      defaultRuntimeMode: defaultRuntimeChoice,
       trunkBranch,
     },
     coderConfigFallback,

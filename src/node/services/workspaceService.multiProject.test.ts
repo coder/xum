@@ -6,7 +6,6 @@ import path from "node:path";
 import { tmpdir } from "node:os";
 import { MULTI_PROJECT_CONFIG_KEY } from "@/common/constants/multiProject";
 import { getValidUnrelatedWorkspaceConsent } from "@/common/orpc/schemas/workspace";
-import type { RuntimeConfig } from "@/common/types/runtime";
 import { Config, type SecretsStore } from "@/node/config";
 import { ContainerManager } from "@/node/multiProject/containerManager";
 import { MultiProjectRuntime } from "@/node/runtime/multiProjectRuntime";
@@ -1157,58 +1156,45 @@ describe("WorkspaceService multi-project lifecycle", () => {
       );
     });
   });
-  // Daytona (an ssh runtime) included: its removal settles one sandbox per workspace, which the
-  // per-project multi-project removal never does.
-  test.each<[string, RuntimeConfig]>([
-    ["docker", { type: "docker", image: "ubuntu:22.04" }],
-    [
-      "ssh",
-      {
-        type: "ssh",
-        host: "daytona://",
-        srcBaseDir: "~/src",
-        daytona: { sandboxName: "xum-multi" },
-      },
-    ],
-  ])(
-    "createMultiProject rejects a %s runtime (not local/worktree)",
-    async (name, runtimeConfig) => {
-      await withTempMuxRoot(async (rootDir) => {
-        const projectAPath = path.join(rootDir, "project-a");
-        const projectBPath = path.join(rootDir, "project-b");
-        const config = new Config(rootDir);
-        await config.editConfig((snapshot) => {
-          snapshot.projects.set(projectAPath, { workspaces: [], trusted: true });
-          snapshot.projects.set(projectBPath, { workspaces: [], trusted: true });
-          return snapshot;
-        });
-        const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime");
-        try {
-          const workspaceService = createWorkspaceServiceForTest({ config, historyService });
-          const result = await workspaceService.createMultiProject(
-            [
-              { projectPath: projectAPath, projectName: "project-a" },
-              { projectPath: projectBPath, projectName: "project-b" },
-            ],
-            "feature-unsupported-runtime",
-            "main",
-            "Unsupported runtime",
-            runtimeConfig
-          );
-          expect(result.success).toBe(false);
-          if (result.success) {
-            return;
-          }
-          expect(result.error).toContain(
-            `Multi-project workspaces currently require local or worktree runtime, got: ${name}`
-          );
-          expect(createRuntimeSpy).not.toHaveBeenCalled();
-        } finally {
-          createRuntimeSpy.mockRestore();
-        }
+  test("createMultiProject rejects runtimes that are not local/worktree", async () => {
+    await withTempMuxRoot(async (rootDir) => {
+      const projectAPath = path.join(rootDir, "project-a");
+      const projectBPath = path.join(rootDir, "project-b");
+      const config = new Config(rootDir);
+      await config.editConfig((snapshot) => {
+        snapshot.projects.set(projectAPath, { workspaces: [], trusted: true });
+        snapshot.projects.set(projectBPath, { workspaces: [], trusted: true });
+        return snapshot;
       });
-    }
-  );
+      const createRuntimeSpy = spyOn(runtimeFactory, "createRuntime");
+      try {
+        const workspaceService = createWorkspaceServiceForTest({ config, historyService });
+        const result = await workspaceService.createMultiProject(
+          [
+            { projectPath: projectAPath, projectName: "project-a" },
+            { projectPath: projectBPath, projectName: "project-b" },
+          ],
+          "feature-unsupported-runtime",
+          "main",
+          "Unsupported runtime",
+          {
+            type: "docker",
+            image: "ubuntu:22.04",
+          }
+        );
+        expect(result.success).toBe(false);
+        if (result.success) {
+          return;
+        }
+        expect(result.error).toContain(
+          "Multi-project workspaces currently require local or worktree runtime, got: docker"
+        );
+        expect(createRuntimeSpy).not.toHaveBeenCalled();
+      } finally {
+        createRuntimeSpy.mockRestore();
+      }
+    });
+  });
   // Case-insensitive volumes and Windows name trimming alias these to .mux/.xum as well.
   test.each([".mux", ".XUM", ".Mux."])(
     "createMultiProject refuses a project named like the workspace metadata directory (%s, #4455)",

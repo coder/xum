@@ -91,11 +91,6 @@ import type {
   CoderTemplate,
   CoderWorkspace,
 } from "@/common/orpc/schemas/coder";
-import type {
-  DaytonaListSnapshotsResult,
-  DaytonaPublicConfig,
-  DaytonaTestConnectionResult,
-} from "@/common/orpc/schemas/daytona";
 import type { CoderWorkspaceArchiveBehavior } from "@/common/config/coderArchiveBehavior";
 import type { WorktreeArchiveBehavior } from "@/common/config/worktreeArchiveBehavior";
 import {
@@ -431,10 +426,6 @@ export interface MockORPCClientOptions {
   coderPresetsResult?: Map<string, CoderListPresetsResult>;
   /** Override Coder workspace list result (including error states) */
   coderWorkspacesResult?: CoderListWorkspacesResult;
-  /** Daytona access as Settings > Runtimes sees it (default: no key). */
-  daytonaConfig?: DaytonaPublicConfig;
-  daytonaTestConnectionResult?: DaytonaTestConnectionResult;
-  daytonaSnapshotsResult?: DaytonaListSnapshotsResult;
   /** Available agent skills (descriptors) */
   agentSkills?: AgentSkillDescriptor[];
   /** Agent skills that were discovered but couldn't be loaded (SKILL.md parse errors, etc.) */
@@ -600,9 +591,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
     coderTemplatesResult,
     coderPresetsResult = new Map<string, CoderListPresetsResult>(),
     coderWorkspacesResult,
-    daytonaConfig: initialDaytonaConfig = { apiKeySet: false, apiKeySource: null },
-    daytonaTestConnectionResult = { ok: true },
-    daytonaSnapshotsResult = { ok: true, snapshots: [] },
     agentSkills = [],
     invalidAgentSkills = [],
     unavailableAgentSkillSources = [],
@@ -746,13 +734,11 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
   let toolSearchEnabled = true;
   let bashAiProxyEnabled = false;
   let agentHeartbeatsEnabled = false;
-  let daytonaConfig = initialDaytonaConfig;
   let runtimeEnablement: Record<string, boolean> = initialRuntimeEnablement ?? {
     local: true,
     worktree: true,
     ssh: true,
     coder: true,
-    daytona: true,
     docker: true,
     devcontainer: true,
   };
@@ -2441,20 +2427,6 @@ export function createMockORPCClient(options: MockORPCClientOptions = {}): APICl
         ),
       listWorkspaces: () =>
         Promise.resolve(coderWorkspacesResult ?? { ok: true, workspaces: coderWorkspaces }),
-    },
-    daytona: {
-      getConfig: () => Promise.resolve(daytonaConfig),
-      setConfig: (input: { apiKey?: string }) => {
-        const keyCleared = input.apiKey === "";
-        const keySet = input.apiKey !== undefined && !keyCleared;
-        daytonaConfig = {
-          apiKeySet: keySet || (!keyCleared && daytonaConfig.apiKeySet),
-          apiKeySource: keySet ? "settings" : keyCleared ? null : daytonaConfig.apiKeySource,
-        };
-        return Promise.resolve(daytonaConfig);
-      },
-      testConnection: () => Promise.resolve(daytonaTestConnectionResult),
-      listSnapshots: () => Promise.resolve(daytonaSnapshotsResult),
     },
     nameGeneration: {
       generate: () => {

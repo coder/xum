@@ -36,13 +36,6 @@ const DEVCONTAINER_RUNTIME = {
   configPath: ".devcontainer/devcontainer.json",
 };
 
-const DAYTONA_RUNTIME = {
-  type: "ssh" as const,
-  host: "sb-1.xum--daytona",
-  srcBaseDir: "~/mux",
-  daytona: { sandboxName: "sb-1" },
-};
-
 // The store refreshes on RefreshController timers (debounce, cooldown), fetch intervals and a
 // promise pipeline, so every test runs on a fake clock: waits take no real time, and a negative
 // check advances past the whole window it claims nothing happens in.
@@ -550,36 +543,29 @@ describe("GitStatusStore", () => {
   });
 
   describe("passive fetch runtime gating", () => {
-    it.each([
-      ["devcontainer", DEVCONTAINER_RUNTIME],
-      // A Daytona sandbox starts on the first command: opening the workspace must not start it.
-      ["Daytona", DAYTONA_RUNTIME],
-    ] as const)(
-      "skips passive fetch and status checks for a %s with unresolved runtime status",
-      async (_label, runtimeConfig) => {
-        store.dispose();
-        const workspaceId = "dc-unresolved";
-        const runtimeStatusStore = createRuntimeStatusStoreMock(null);
-        store = createStore(runtimeStatusStore.runtimeStatusStore);
-        store.syncWorkspaces(
-          new Map([[workspaceId, createWorkspaceMetadata(workspaceId, runtimeConfig)]])
-        );
-        const unsubscribe = store.subscribeKey(workspaceId, jest.fn());
+    it("skips passive fetch and status checks for devcontainer with unresolved runtime status", async () => {
+      store.dispose();
+      const workspaceId = "dc-unresolved";
+      const runtimeStatusStore = createRuntimeStatusStoreMock(null);
+      store = createStore(runtimeStatusStore.runtimeStatusStore);
+      store.syncWorkspaces(
+        new Map([[workspaceId, createWorkspaceMetadata(workspaceId, DEVCONTAINER_RUNTIME)]])
+      );
+      const unsubscribe = store.subscribeKey(workspaceId, jest.fn());
 
-        await waitUntil(() => runtimeStatusStore.getListenerCount(workspaceId) > 0);
-        expect(getFetchCallCount()).toBe(0);
+      await waitUntil(() => runtimeStatusStore.getListenerCount(workspaceId) > 0);
+      expect(getFetchCallCount()).toBe(0);
 
-        mockExecuteBash.mockClear();
+      mockExecuteBash.mockClear();
 
-        // @ts-expect-error - Accessing private method for passive fetch coverage
-        await store.updateGitStatus();
+      // @ts-expect-error - Accessing private method for passive fetch coverage
+      await store.updateGitStatus();
 
-        expect(getFetchCallCount()).toBe(0);
-        expect(mockExecuteBash).not.toHaveBeenCalled();
+      expect(getFetchCallCount()).toBe(0);
+      expect(mockExecuteBash).not.toHaveBeenCalled();
 
-        unsubscribe();
-      }
-    );
+      unsubscribe();
+    });
 
     it("retries passive fetch when devcontainer runtime transitions from null to running", async () => {
       store.dispose();

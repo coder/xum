@@ -6,8 +6,6 @@ import { LocalRuntime } from "./LocalRuntime";
 import { WorktreeRuntime } from "./WorktreeRuntime";
 import { SSHRuntime } from "./SSHRuntime";
 import { CoderSSHRuntime } from "./CoderSSHRuntime";
-import { DaytonaSSHRuntime, type DaytonaRuntimeService } from "./DaytonaSSHRuntime";
-import { redactDaytonaTokens } from "./daytonaTokenRedaction";
 import { createSSHTransport } from "./transports";
 import { DockerRuntime, getContainerName } from "./DockerRuntime";
 import { DevcontainerRuntime } from "./DevcontainerRuntime";
@@ -23,7 +21,6 @@ import { Config } from "@/node/config";
 import { checkDevcontainerCliVersion } from "./devcontainerCli";
 import { buildDevcontainerConfigInfo, scanDevcontainerConfigs } from "./devcontainerConfigs";
 import { resolveCoderSSHHost } from "@/constants/coder";
-import { toXumDaytonaHost } from "@/common/constants/daytona";
 import { getErrorMessage } from "@/common/utils/errors";
 
 // Global CoderService singleton - set during app init so all createRuntime calls can use it
@@ -36,18 +33,6 @@ let globalCoderService: CoderService | undefined;
  */
 export function setGlobalCoderService(service: CoderService): void {
   globalCoderService = service;
-}
-
-// Global DaytonaService singleton, set by the service container (same pattern as Coder).
-let globalDaytonaService: DaytonaRuntimeService | undefined;
-
-export function setGlobalDaytonaService(service: DaytonaRuntimeService): void {
-  globalDaytonaService = service;
-}
-
-/** For passive sandbox status probes; undefined before the service container wires it. */
-export function getGlobalDaytonaService(): DaytonaRuntimeService | undefined {
-  return globalDaytonaService;
 }
 
 /**
@@ -91,9 +76,8 @@ export function runBackgroundInit(
   return withInitUseLease(useLeases, workspaceId, () => runFullInit(runtime, params)).then(
     () => undefined,
     (error: unknown) => {
-      // An Error serializes to `{}` in the log; a Daytona ssh error may name its token.
-      const errorMsg = redactDaytonaTokens(getErrorMessage(error));
-      logger?.error(`Workspace init failed for ${workspaceId}:`, { error: errorMsg });
+      const errorMsg = getErrorMessage(error);
+      logger?.error(`Workspace init failed for ${workspaceId}:`, { error });
       params.initLogger.logStderr(`Initialization failed: ${errorMsg}`);
       params.initLogger.logComplete(-1);
     }
@@ -187,8 +171,6 @@ export interface CreateRuntimeOptions {
    * When provided and config has coder field, returns a Coder SSH runtime (SSH/SSH2).
    */
   coderService?: CoderService;
-  /** Daytona service for SSH runtimes with a `daytona` sub-config (defaults to the global one). */
-  daytonaService?: DaytonaRuntimeService;
 }
 
 /**
@@ -236,33 +218,35 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
       return new WorktreeRuntime(config.srcBaseDir, runtimeIdentity);
 
     case "ssh": {
-      // Normalize the host before transport creation so both transport and runtime use the
-      // canonical managed alias (*.mux--coder, *.xum--daytona) from the start.
+      // Normalize Coder host before transport creation so both transport
+      // and runtime use the canonical *.mux--coder hostname from the start.
+      const sshHost = resolveCoderSSHHost(config.host, config.coder?.workspaceName);
       const sshConfig = {
-        host: resolveSSHRuntimeHost(config),
+        host: sshHost,
         srcBaseDir: config.srcBaseDir,
         bgOutputDir: config.bgOutputDir,
         identityFile: config.identityFile,
         port: config.port,
       };
-      const transport = createSSHTransport(sshConfig, shouldUseSSH2Runtime());
 
-      if (config.daytona) {
-        return createDaytonaRuntime(
-          { ...sshConfig, daytona: config.daytona },
-          transport,
-          options,
-          runtimeIdentity
-        );
-      }
+      const useSSH2 = shouldUseSSH2Runtime();
+      const transport = createSSHTransport(sshConfig, useSSH2);
+
+      // Use a Coder SSH runtime for SSH+Coder when coderService is available (explicit or global)
+      const coderService = options?.coderService ?? globalCoderService;
+
       if (config.coder) {
-        return createCoderRuntime(
+        if (!coderService) {
+          throw new Error("Coder runtime requested but CoderService is not initialized");
+        }
+        return new CoderSSHRuntime(
           { ...sshConfig, coder: config.coder },
           transport,
-          options,
+          coderService,
           runtimeIdentity
         );
       }
+
       return new SSHRuntime(sshConfig, transport, runtimeIdentity);
     }
 
@@ -313,47 +297,6 @@ export function createRuntime(config: RuntimeConfig, options?: CreateRuntimeOpti
   }
 }
 
-function resolveSSHRuntimeHost(config: Extract<RuntimeConfig, { type: "ssh" }>): string {
-  const daytonaSandboxName = config.daytona?.sandboxName;
-  return daytonaSandboxName
-    ? toXumDaytonaHost(daytonaSandboxName)
-    : resolveCoderSSHHost(config.host, config.coder?.workspaceName);
-}
-
-type RuntimeIdentity = ConstructorParameters<typeof SSHRuntime>[2];
-
-/** SSH + Coder, using the explicit CoderService or the global one. */
-function createCoderRuntime(
-  config: ConstructorParameters<typeof CoderSSHRuntime>[0],
-  transport: ReturnType<typeof createSSHTransport>,
-  options: CreateRuntimeOptions | undefined,
-  runtimeIdentity: RuntimeIdentity
-): CoderSSHRuntime {
-  const coderService = options?.coderService ?? globalCoderService;
-  if (!coderService) {
-    throw new Error("Coder runtime requested but CoderService is not initialized");
-  }
-  return new CoderSSHRuntime(config, transport, coderService, runtimeIdentity);
-}
-
-/** SSH + Daytona, using the explicit DaytonaService or the global one. */
-function createDaytonaRuntime(
-  config: ConstructorParameters<typeof DaytonaSSHRuntime>[0],
-  transport: ReturnType<typeof createSSHTransport>,
-  options: CreateRuntimeOptions | undefined,
-  runtimeIdentity: RuntimeIdentity
-): DaytonaSSHRuntime {
-  const daytonaService = options?.daytonaService ?? globalDaytonaService;
-  if (!daytonaService) {
-    throw new Error("Daytona runtime requested but DaytonaService is not initialized");
-  }
-  // The workspace id labels a sandbox Xum creates, for the reconciler.
-  return new DaytonaSSHRuntime(config, transport, daytonaService, {
-    ...runtimeIdentity,
-    workspaceId: options?.workspaceId,
-  });
-}
-
 /**
  * Check if a project has a .git directory (is a git repository).
  */
@@ -368,10 +311,7 @@ async function isGitRepository(projectPath: string): Promise<boolean> {
   }
 }
 
-/** One entry per RuntimeMode, plus Daytona (an `ssh` sub-config that needs credentials). */
-type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus> & {
-  daytona: RuntimeAvailabilityStatus;
-};
+type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 
 /**
  * Check availability of all runtime types for a given project.
@@ -380,24 +320,17 @@ type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus> & {
 export async function checkRuntimeAvailability(
   projectPath: string
 ): Promise<RuntimeAvailabilityMap> {
-  const [
-    isGit,
-    containerEngine,
-    dockerResponsive,
-    devcontainerCliInfo,
-    devcontainerConfigs,
-    daytonaAvailability,
-  ] = await Promise.all([
-    isGitRepository(projectPath),
-    detectContainerEngine(),
-    // The devcontainer CLI shells out to the literal `docker` binary regardless
-    // of which engine the Docker runtime resolved (e.g. an XUM_CONTAINER_CLI
-    // override), so Dev Container availability needs its own docker probe.
-    isEngineResponsive("docker"),
-    checkDevcontainerCliVersion(),
-    scanDevcontainerConfigs(projectPath),
-    checkDaytonaAvailability(),
-  ]);
+  const [isGit, containerEngine, dockerResponsive, devcontainerCliInfo, devcontainerConfigs] =
+    await Promise.all([
+      isGitRepository(projectPath),
+      detectContainerEngine(),
+      // The devcontainer CLI shells out to the literal `docker` binary regardless
+      // of which engine the Docker runtime resolved (e.g. an XUM_CONTAINER_CLI
+      // override), so Dev Container availability needs its own docker probe.
+      isEngineResponsive("docker"),
+      checkDevcontainerCliVersion(),
+      scanDevcontainerConfigs(projectPath),
+    ]);
 
   const devcontainerConfigInfo = buildDevcontainerConfigInfo(devcontainerConfigs);
 
@@ -437,20 +370,5 @@ export async function checkRuntimeAvailability(
         ? { available: false, reason: containerEngine.reason }
         : { available: true },
     devcontainer: devcontainerAvailability,
-    // Like ssh, Daytona syncs a git checkout to the box.
-    daytona: isGit ? daytonaAvailability : { available: false, reason: gitRequiredReason },
   };
-}
-
-async function checkDaytonaAvailability(): Promise<RuntimeAvailabilityStatus> {
-  const daytonaService = globalDaytonaService;
-  if (!daytonaService) {
-    return { available: false, reason: "Daytona is not initialized" };
-  }
-  try {
-    return await daytonaService.account.checkAvailability();
-  } catch (error) {
-    // Availability must never fail the whole runtime list.
-    return { available: false, reason: `Daytona settings unreadable: ${getErrorMessage(error)}` };
-  }
 }

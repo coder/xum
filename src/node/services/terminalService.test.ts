@@ -1,6 +1,5 @@
 import { describe, it, expect, mock, beforeEach, afterEach, spyOn, vi, type Mock } from "bun:test";
 import { TerminalService } from "./terminalService";
-import { DaytonaSshConfigWriter } from "@/node/runtime/daytonaSshConfig";
 import {
   WorkspaceMutationInProgressError,
   WorkspaceUseLeases,
@@ -14,8 +13,6 @@ import type { TerminalCreateParams } from "@/common/types/terminal";
 import type { RuntimeConfig } from "@/common/types/runtime";
 import * as childProcess from "child_process";
 import * as fs from "fs/promises";
-import type { Runtime } from "@/node/runtime/Runtime";
-import * as runtimeHelpers from "@/node/runtime/runtimeHelpers";
 
 // Unique per test run: native-terminal markers persist on disk, so a shared path would leak
 // sticky state across runs and flake the "not yet opened" assertions.
@@ -1497,8 +1494,8 @@ describe("TerminalService.openNative", () => {
       const script = call[1]?.[1];
       expect(script).toContain('tell application "Terminal"');
       expect(script).toContain("ssh");
-      expect(script).toContain("'-p' '2222'"); // port
-      expect(script).toContain("'-i' '~/.ssh/id_rsa'"); // identity file
+      expect(script).toContain("-p 2222"); // port
+      expect(script).toContain("-i ~/.ssh/id_rsa"); // identity file
       expect(script).toContain("remote.example.com"); // host
     });
   });
@@ -1882,150 +1879,9 @@ describe("TerminalService.openNative", () => {
     });
   });
 
-  // A native terminal gets ssh as one command string (Ghostty, Terminal.app, xfce4-terminal), so
-  // each argument must survive the shell's word splitting: a home like "/Users/John Smith" puts
-  // spaces in the Daytona include path and the identity file.
-  describe("SSH command strings", () => {
-    const writer = new DaytonaSshConfigWriter({ xumHome: "/tmp/John Smith/.xum" });
-    const identityFile = "/tmp/John Smith/id key";
-    const host = "sb-1.xum--daytona";
-    const remotePath = "/home/user/it's here";
-    const expectedArgv = [
-      "ssh",
-      "-i",
-      identityFile,
-      "-t",
-      "-F",
-      writer.paths.includePath,
-      host,
-      `cd "${remotePath}" && exec $SHELL`,
-    ];
-    const configWithDaytonaWorkspace = {
-      ...configWithSSHWorkspace,
-      getAllWorkspaceMetadata: mock(() =>
-        Promise.resolve([
-          {
-            id: "ws-daytona",
-            projectPath: "/home/user/project",
-            name: "feature",
-            namedWorkspacePath: remotePath,
-            runtimeConfig: { type: "ssh", host, srcBaseDir: "~/src", identityFile },
-          },
-        ])
-      ),
-    } as unknown as Config;
-
-    /** The argv a POSIX shell splits `command` into. */
-    function shellArgv(command: string): string[] {
-      const printed = Bun.spawnSync(["sh", "-c", `printf '%s\\0' ${command}`]).stdout.toString();
-      return printed.split("\0").slice(0, -1);
-    }
-
-    async function spawnedArgs(): Promise<string[]> {
-      service = new TerminalService(configWithDaytonaWorkspace, mockPTYService, mockSecretsStore);
-      await service.openNative("ws-daytona");
-      expect(spawnSpy).toHaveBeenCalledTimes(1);
-      return (spawnSpy.mock.calls[0] as [string, string[]])[1];
-    }
-
-    it("Ghostty", async () => {
-      setPlatform("darwin");
-      fsStatSpy.mockImplementation((statPath: string) =>
-        statPath === "/Applications/Ghostty.app/Contents/MacOS/ghostty"
-          ? Promise.resolve({ isFile: () => true, mode: 0o755 })
-          : Promise.reject(new Error("ENOENT"))
-      );
-      const args = await spawnedArgs();
-      const command = args.find((arg) => arg.startsWith("--command="));
-      expect(shellArgv(command?.slice("--command=".length) ?? "")).toEqual(expectedArgv);
-    });
-
-    it("Terminal.app", async () => {
-      setPlatform("darwin");
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) =>
-        cmd === "which" && args?.[0] === "ghostty" ? { status: 1 } : { status: 0 }
-      );
-      const script = (await spawnedArgs())[1];
-      const appleScriptString = /do script "((?:[^"\\]|\\.)*)"/.exec(script)?.[1] ?? "";
-      expect(shellArgv(appleScriptString.replace(/\\(.)/g, "$1"))).toEqual(expectedArgv);
-    });
-
-    it("xfce4-terminal", async () => {
-      setPlatform("linux");
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) =>
-        cmd === "which" && args?.[0] === "xfce4-terminal" ? { status: 0 } : { status: 1 }
-      );
-      const args = await spawnedArgs();
-      expect(shellArgv(args[1])).toEqual(expectedArgv);
-    });
-
-    it("expands a ~ workspace path on the remote host", async () => {
-      setPlatform("linux");
-      spawnSyncSpy.mockImplementation((cmd: string, args: string[]) =>
-        cmd === "which" && args?.[0] === "xfce4-terminal" ? { status: 0 } : { status: 1 }
-      );
-      const [workspace] = await configWithDaytonaWorkspace.getAllWorkspaceMetadata();
-      service = new TerminalService(
-        {
-          ...configWithDaytonaWorkspace,
-          getAllWorkspaceMetadata: mock(() =>
-            Promise.resolve([{ ...workspace, namedWorkspacePath: "~/src/project/feature" }])
-          ),
-        } as unknown as Config,
-        mockPTYService,
-        mockSecretsStore
-      );
-      await service.openNative("ws-daytona");
-      const args = (spawnSpy.mock.calls[0] as [string, string[]])[1];
-      expect(shellArgv(args[1]).at(-1)).toBe('cd "$HOME/src/project/feature" && exec $SHELL');
-    });
-  });
-
   describe("Linux", () => {
     beforeEach(() => {
       setPlatform("linux");
-    });
-
-    it("brings a Daytona sandbox up before launching its terminal, and stops if it cannot", async () => {
-      const daytonaConfig = {
-        ...configWithSSHWorkspace,
-        getAllWorkspaceMetadata: mock(() =>
-          Promise.resolve([
-            {
-              id: "ws-ssh",
-              projectPath: "/home/user/project",
-              name: "feature",
-              namedWorkspacePath: "~/src/project/feature",
-              runtimeConfig: {
-                type: "ssh",
-                host: "sb-1.xum--daytona",
-                srcBaseDir: "~/src",
-                daytona: { sandboxName: "sb-1" },
-              },
-            },
-          ])
-        ),
-      } as unknown as Config;
-      const ensureReady = mock(() =>
-        Promise.resolve({
-          ready: false as const,
-          error: 'Daytona sandbox "sb-1" no longer exists',
-          errorType: "runtime_not_ready" as const,
-        })
-      );
-      const createRuntime = spyOn(runtimeHelpers, "createRuntimeForWorkspace").mockReturnValue({
-        ensureReady,
-      } as unknown as Runtime);
-      try {
-        service = new TerminalService(daytonaConfig, mockPTYService, mockSecretsStore);
-
-        // eslint-disable-next-line @typescript-eslint/await-thenable
-        await expect(service.openNative("ws-ssh")).rejects.toThrow("no longer exists");
-        expect(ensureReady).toHaveBeenCalledTimes(1);
-        expect(spawnSpy).not.toHaveBeenCalled();
-      } finally {
-        createRuntime.mockRestore();
-      }
     });
 
     it("should try terminal emulators in order of preference", async () => {

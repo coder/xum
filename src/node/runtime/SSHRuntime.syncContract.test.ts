@@ -1,7 +1,5 @@
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
-import * as childProcess from "child_process";
-import { execSync, spawnSync, type ChildProcess } from "node:child_process";
-import { once } from "node:events";
+import { execSync, spawnSync } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -505,39 +503,6 @@ describe("SSHRuntime authoritative sync contract", () => {
       encoding: "utf8",
     });
     expect(repairedContent).toBe("initial");
-  });
-
-  it("uploads the whole bundle when the remote shell starts after git has exited", async () => {
-    const projectPath = await createTempGitRepo();
-    const realSpawn = childProcess.spawn;
-    const spawned: ChildProcess[] = [];
-    spyOn(childProcess, "spawn").mockImplementation(((...args: Parameters<typeof realSpawn>) => {
-      const child = realSpawn(...args);
-      spawned.push(child);
-      return child;
-    }) as typeof realSpawn);
-    const uploaded: Buffer[] = [];
-    class SlowShellSSHRuntime extends CommandCaptureSSHRuntime {
-      override async exec(command: string, options: ExecOptions): Promise<ExecStream> {
-        const stream = await super.exec(command, options);
-        const git = spawned[0];
-        if (git?.exitCode === null) await once(git, "exit");
-        await new Promise((resolve) => setImmediate(resolve));
-        return {
-          ...stream,
-          stdin: new WritableStream<Uint8Array>({
-            write(chunk) {
-              uploaded.push(Buffer.from(chunk));
-            },
-          }),
-        };
-      }
-    }
-    const privateApi = new SlowShellSSHRuntime() as unknown as BundleSyncPrivateApi;
-
-    await privateApi.transferBundleToRemote(projectPath, "~/b.bundle", noopInitLogger);
-
-    expect(Buffer.concat(uploaded).toString("utf8")).toStartWith("# v2 git bundle\n");
   });
 
   it("fetches pruneable bundle branches separately from shared tags", async () => {

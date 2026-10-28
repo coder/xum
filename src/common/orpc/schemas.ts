@@ -166,7 +166,6 @@ export {
   AWSCredentialStatusSchema,
   analytics,
   coder,
-  daytona,
   config,
   browser,
   devtools,

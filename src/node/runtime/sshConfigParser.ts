@@ -24,9 +24,6 @@ export interface ResolvedSSHConfig {
   port: number;
   identityFiles: string[];
   proxyCommand?: string;
-  /** First UserKnownHostsFile, home-expanded (ssh2 verifies pinned Daytona keys against it). */
-  userKnownHostsFile?: string;
-  hostKeyAlias?: string;
 }
 
 function getHomeDir(): string {
@@ -251,10 +248,9 @@ function toStringArray(value: ComputedConfigValue | undefined): string[] {
   return [];
 }
 
-/** `configFile` replaces ~/.ssh/config, as OpenSSH's `-F` does. */
-async function loadSSHConfig(configFile?: string): Promise<SSHConfig | null> {
+async function loadSSHConfig(): Promise<SSHConfig | null> {
   const homeDir = getHomeDir();
-  const configPath = configFile ?? path.join(homeDir, ".ssh", "config");
+  const configPath = path.join(homeDir, ".ssh", "config");
 
   try {
     const content = await fs.readFile(configPath, "utf8");
@@ -271,14 +267,11 @@ async function loadSSHConfig(configFile?: string): Promise<SSHConfig | null> {
   }
 }
 
-export async function resolveSSHConfig(
-  host: string,
-  configFile?: string
-): Promise<ResolvedSSHConfig> {
+export async function resolveSSHConfig(host: string): Promise<ResolvedSSHConfig> {
   const { host: hostAlias, user: userOverride } = parseHostAndUser(host);
   const homeDir = getHomeDir();
 
-  const config = await loadSSHConfig(configFile);
+  const config = await loadSSHConfig();
   const computed = config
     ? userOverride
       ? config.compute({ Host: hostAlias, User: userOverride })
@@ -314,22 +307,5 @@ export async function resolveSSHConfig(
     port: Number.isFinite(port) ? port : DEFAULT_SSH_PORT,
     identityFiles,
     proxyCommand,
-    ...readHostKeyPinning(computed, homeDir),
-  };
-}
-
-function readHostKeyPinning(
-  computed: Parameters<typeof getConfigValue>[0],
-  homeDir: string
-): Pick<ResolvedSSHConfig, "userKnownHostsFile" | "hostKeyAlias"> {
-  // ssh-config already splits the files and strips their quotes: a single value is one file.
-  const firstKnownHostsFile = toStringValue(getConfigValue(computed, "UserKnownHostsFile"));
-  const userKnownHostsFile = firstKnownHostsFile
-    ? expandHomePath(firstKnownHostsFile, homeDir)
-    : undefined;
-  const hostKeyAlias = toStringValue(getConfigValue(computed, "HostKeyAlias"));
-  return {
-    ...(userKnownHostsFile ? { userKnownHostsFile } : {}),
-    ...(hostKeyAlias ? { hostKeyAlias } : {}),
   };
 }

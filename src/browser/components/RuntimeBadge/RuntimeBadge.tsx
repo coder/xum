@@ -70,33 +70,20 @@ function TooltipRow({
 
 type RuntimeType = keyof typeof RUNTIME_BADGE_UI;
 
-/** SSH runtimes split by their managed backend (Coder, Daytona) or plain host. */
-export function getSshRuntimeInfo(runtimeConfig: Extract<RuntimeConfig, { type: "ssh" }>): {
-  type: RuntimeType;
-  label: string;
-} {
-  if (runtimeConfig.coder) {
-    const coderWorkspaceName = runtimeConfig.coder.workspaceName;
-    return {
-      type: "coder",
-      label: `Coder Workspace: ${coderWorkspaceName ?? runtimeConfig.host}`,
-    };
-  }
-  if (runtimeConfig.daytona) {
-    return {
-      type: "daytona",
-      label: `Daytona sandbox: ${runtimeConfig.daytona.sandboxName ?? runtimeConfig.host}`,
-    };
-  }
-  const hostname = extractSshHostname(runtimeConfig);
-  return { type: "ssh", label: `SSH: ${hostname ?? runtimeConfig.host}` };
-}
-
 function getRuntimeInfo(
   runtimeConfig?: RuntimeConfig
 ): { type: RuntimeType; label: string } | null {
   if (isSSHRuntime(runtimeConfig)) {
-    return getSshRuntimeInfo(runtimeConfig);
+    // Coder-backed SSH runtime gets special treatment
+    if (runtimeConfig.coder) {
+      const coderWorkspaceName = runtimeConfig.coder.workspaceName;
+      return {
+        type: "coder",
+        label: `Coder Workspace: ${coderWorkspaceName ?? runtimeConfig.host}`,
+      };
+    }
+    const hostname = extractSshHostname(runtimeConfig);
+    return { type: "ssh", label: `SSH: ${hostname ?? runtimeConfig.host}` };
   }
   if (isWorktreeRuntime(runtimeConfig)) {
     return { type: "worktree", label: "Worktree: isolated git worktree" };
