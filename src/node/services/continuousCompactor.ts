@@ -18,7 +18,11 @@ import {
   type MuxMessage,
   type MuxMetadata,
 } from "@/common/types/message";
-import { selectRollingCut, type RollingCut } from "@/common/utils/compaction/rollingCut";
+import {
+  estimateRetainedRowTokens,
+  selectRollingCut,
+  type RollingCut,
+} from "@/common/utils/compaction/rollingCut";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { isModelHiddenMessage } from "@/common/utils/messages/modelHiddenMessages";
 import {
@@ -504,7 +508,7 @@ export class ContinuousCompactor {
       summaryTokens +
       (context.systemMessageTokens ?? 0) +
       Math.max(context.attachmentTokens ?? 0, staged.attachmentTokens) +
-      tail.reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0);
+      tail.reduce((sum, row) => sum + estimateRetainedRowTokens(row), 0);
     return (
       tokens <
       (context.contextWindowTokens * (context.thresholdPercent + FORCE_COMPACTION_BUFFER_PERCENT)) /

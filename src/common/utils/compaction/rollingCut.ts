@@ -43,6 +43,14 @@ function startsTurn(row: MuxMessage): boolean {
   );
 }
 
+/**
+ * The boundary drops the old window's post-compaction attachments row (the next turn writes a
+ * fresh one), and the attachment budget already counts that fresh row.
+ */
+export function estimateRetainedRowTokens(row: MuxMessage): number {
+  return isPostCompactionAttachmentsMessage(row) ? 0 : estimateMuxMessageTokens(row);
+}
+
 function exactStepStarts(indices: readonly number[] | undefined, partCount: number): number[] {
   // Old or malformed metadata is not permission to guess boundaries from tool shapes.
   const isArray: boolean = Array.isArray(indices);
@@ -112,7 +120,7 @@ export function selectRollingCut(
   const minHead = Math.min(MIN_HEAD_TOKENS, 0.1 * budget.contextWindowTokens);
   const prefixTokens = [0];
   for (const row of rows) {
-    prefixTokens.push(prefixTokens[prefixTokens.length - 1] + estimateMuxMessageTokens(row));
+    prefixTokens.push(prefixTokens[prefixTokens.length - 1] + estimateRetainedRowTokens(row));
   }
   const totalTokens = prefixTokens[rows.length];
   let best: RollingCut | null = null;

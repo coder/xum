@@ -12,6 +12,7 @@ import {
   type CompactionFollowUpRequest,
   type MuxMessage,
 } from "@/common/types/message";
+import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { EAGER_LEAD_PERCENT } from "@/constants/continuousCompaction";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
@@ -1573,6 +1574,30 @@ describe("ContinuousCompactor", () => {
     expect(persisted[0].metadata?.compactionBoundary).toBe(true);
     expect(persisted[0].parts).toMatchObject([{ type: "text", text: summary.text }]);
     expect(completed.mock.calls[0][0]).toMatchObject({ preservedTailMessageCount: 0 });
+  });
+
+  it("keeps the recent turn when its post-compaction attachments row alone outgrows the budgets", async () => {
+    // The boundary drops the old attachments row (the next turn writes a fresh one), so its tokens
+    // must neither shrink the retained tail nor block staging.
+    await seed(
+      createMuxMessage("old-user", "user", "Investigate the regression"),
+      createMuxMessage("old-answer", "assistant", "earlier investigation ".repeat(4_000)),
+      createMuxMessage("recent-user", "user", "Implement the fix"),
+      createMuxMessage(
+        `${POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX}1`,
+        "user",
+        "x".repeat(context.contextWindowTokens * 4),
+        { synthetic: true }
+      ),
+      createMuxMessage("recent-answer", "assistant", "The fix is ready for review.")
+    );
+    await stage();
+    expect(await compactor.observe(context.thresholdPercent, context)).toBe("applied");
+    expect(completed.mock.calls[0][0]).toMatchObject({ preservedTailMessageCount: 2 });
+    const texts = (await rows()).map((row) =>
+      row.parts.map((part) => (part.type === "text" ? part.text : "")).join("")
+    );
+    expect(texts).toEqual([summary.text, "Implement the fix", "The fix is ready for review."]);
   });
 
   it("requests full-compaction fallback at the force threshold when no summary is ready", async () => {
