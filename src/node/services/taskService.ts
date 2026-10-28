@@ -899,6 +899,25 @@ interface TaskCreatePlan extends TaskCreatePlacement {
   readonly createdAt: string;
 }
 
+/**
+ * A direct Task.create launch's progress. The launch writes it as it advances and its failure
+ * path (failTaskLaunch) reads it, so it is one mutable record: a copy would read stale values.
+ */
+interface TaskLaunchState {
+  materializedCheckout: { initLogger: InitLogger; runtime: Runtime } | undefined;
+  readonly attemptId: string;
+  /** Unset until the entry is persisted: a failure before that only rolls the checkout back. */
+  launchAttempt: OwnedTaskAttempt | undefined;
+  sendAdmitted: boolean;
+}
+
+/** What failTaskLaunch's CAS on the task's row found. */
+interface TaskLaunchFailureMark {
+  superseded: boolean;
+  transitionedToInterrupted: boolean;
+  parentWorkspaceId: string | undefined;
+}
+
 /** Release a launch lease; a failed release is logged (the lock dies with the process anyway). */
 async function releaseLaunchLease(taskId: string, lease: WorkspaceUseLease): Promise<void> {
   await lease.release().catch((error: unknown) => {
@@ -7288,173 +7307,21 @@ export class TaskService implements AgentTaskIntegration {
       return await this.createQueuedTask(plan);
     }
 
-    // Set once a checkout exists for this task: a throw after that point (base-SHA read, config
-    // persistence) must roll the checkout back instead of leaking it like an unhandled rejection.
-    let materializedCheckout: { initLogger: InitLogger; runtime: Runtime } | undefined;
-    // Admission classification: a direct (unqueued) launch is the FIRST admission of a brand-new
-    // task by construction, exactly like a reservation — the id minted here is persisted by the
-    // write that creates the entry and owned by this process before anything can send into the
-    // workspace; a launch failure below settles that ownership (launch failed) as soon as nothing
-    // runs under it, so a Stop or reawaken never meets an owned attempt without settlement
-    // evidence while work still running under it keeps its own settlement.
-    const attemptId = newTaskAttemptId();
-    let launchAttempt: OwnedTaskAttempt | undefined;
-    // Flipped when the launch fence admits the send (as TaskLaunchPlan.sendAdmitted): a failure
-    // that observes it false has positive evidence that this launch never dispatched its prompt.
-    let launchSendAdmitted = false;
-    /**
-     * Launch failure. Before the entry is persisted (launchAttempt unset) nothing is published:
-     * only the materialized checkout exists and the rollback removes it. Once the entry is
-     * persisted the workspace IS published — a racing user or peer send can be admitted under
-     * the attempt while the launch send is in flight, and another writer (a second backend's
-     * startup re-drive or reawaken) can re-admit the row under its own attempt (A → B). Deleting
-     * the row, checkout and session dir underneath those obligations, or underneath the other
-     * writer's attempt, would strand them — so a published launch is never rolled back: it ends
-     * as an interrupted workspace with its launch error (removable like any other), exactly as
-     * the queued launch's markTaskLaunchFailed leaves it, and every step is bound to the attempt
-     * this launch decided:
-     *  1. the closure (synchronous: no further send binds to the id);
-     *  2. the durable marker, a CAS on the row still naming this attempt — a row another writer
-     *     re-admitted is that writer's to end (no marker, no stop, no metadata for it; only this
-     *     attempt's own obligations are accounted for);
-     *  3. when anything is live under the row this launch still owns, this task's own stop
-     *     cascade in the two-producer shape of failAgentTaskTerminally: Phase A directly (this
-     *     method holds the global mutex Phase A requires; the mutex is not reentrant, so it must
-     *     not be re-acquired here), Phase B (clearQueue + stopStream, bounded), then a bounded
-     *     wait for the captured owners to settle, which releases the record and settles the
-     *     attempt (Phase C).
-     * An owner that outlives the bound (or one that runs under a row another writer took over)
-     * defers the settlement to its own end: no proof is minted here for work still running. The
-     * bound keeps this method's hold on the global mutex finite; a hung owner never pins task
-     * creation.
-     */
-    const failLaunch = async (
-      message: string,
-      runtimeForRollback: Runtime,
-      rollback: { preservePhysicalWorkspace?: boolean }
-    ): Promise<void> => {
-      if (launchAttempt == null) {
-        await this.rollbackFailedTaskCreate(
-          runtimeForRollback,
-          parentMeta.projectPath,
-          workspaceName,
-          taskId,
-          rollback
-        );
-        return;
-      }
-      this.closeAttemptAdmission(taskId, attemptId, launchAttempt, "launch-failed");
-      // The attempt's own live work, by the ledger that binds sends to attempts: an obligation
-      // still in preflight or queued, or an admitted one whose turn is the session's live turn.
-      // Attempt-scoped on purpose — under a row another writer re-admitted, the session's other
-      // work is that writer's and must not be sampled as ours.
-      const liveUnderLaunchAttempt = (): boolean => {
-        const activeTurn = this.workspaceService.getActiveTurnGeneration(taskId);
-        for (const send of this.attemptLedger.sendsOf(taskId)) {
-          if (send.attemptId !== attemptId) continue;
-          if (send.state === "pending" || send.state === "enqueued") return true;
-          if (send.state === "admitted" && send.turnId != null && send.turnId === activeTurn) {
-            return true;
-          }
-        }
-        return false;
-      };
-      let superseded = false;
-      let transitionedToInterrupted = false;
-      let parentWorkspaceId: string | undefined;
-      try {
-        const found = await this.editWorkspaceEntry(
-          taskId,
-          (ws) => {
-            if (ws.taskAttemptId !== attemptId) {
-              superseded = true;
-              return;
-            }
-            transitionedToInterrupted = ws.taskStatus !== "interrupted";
-            parentWorkspaceId = ws.parentWorkspaceId;
-            ws.taskStatus = "interrupted";
-            markChildGoalPauseOwed(ws);
-            ws.taskLaunchError = message;
-            // Survives a restart, like markTaskLaunchFailed (#4674).
-            if (this.initStateManager.getUnsanitizedCheckoutError(taskId)) {
-              ws.taskCheckoutUnsanitized = true;
-            }
-          },
-          { allowMissing: true }
-        );
-        // A row another writer removed meanwhile is theirs as well: nothing of ours to mark.
-        if (!found) superseded = true;
-      } catch (error: unknown) {
-        // No durable marker and no knowledge of the row: fail closed. The attempt stays closed
-        // (no send binds to it) and unsettled (a Stop or reawaken finds it closing); nothing is
-        // stopped or deleted against a row of unknown ownership.
-        log.error("Task.create: failed to persist the launch failure", {
-          taskId,
-          error: getErrorMessage(error),
-        });
-        return;
-      }
-      if (superseded) {
-        log.info("Task launch failure not recorded: the record was re-admitted by another writer", {
-          taskId,
-          message,
-        });
-        // Idle under this attempt (its pending obligations are refused at their next gate, since
-        // the row no longer names it): settled. Live: its turn ends on its own — no early proof.
-        if (!liveUnderLaunchAttempt()) {
-          this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
-        }
-        return;
-      }
-      // The marker is durable on a row this launch still owns. Anything live under the row is
-      // ours to stop: the closure above preceded the marker's await, so this sample is
-      // authoritative (nothing binds to the attempt since), and the row is re-read synchronously
-      // here because the other writer's rotation may have landed during that await — in which
-      // case the row is theirs from here on and only this attempt's own obligations count.
-      const rowStillOurs = this.currentTaskAttemptId(taskId) === attemptId;
-      const liveExecution = rowStillOurs
-        ? this.workspaceService.getActiveTurnGeneration(taskId) != null ||
-          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId) != null ||
-          this.aiService.isStreaming(taskId) ||
-          this.attemptLedger.hasPendingAdmissions(taskId)
-        : liveUnderLaunchAttempt();
-      if (rowStillOurs && liveExecution) {
-        this.taskStopLatch.beginWorkspaceStop(taskId);
-        this.taskStopLatch.markWorkspaceStopPersisted(taskId);
-        await this.runWorkspaceStopCleanup([taskId], {
-          label: "TaskService.create launch failure",
-          abandonPartial: true,
-          clearQueue: true,
-        });
-        await this.attemptLedger.waitForAttemptClosureToSettle(
-          taskId,
-          ATTEMPT_CLOSURE_SETTLE_WAIT_MS
-        );
-        if (this.taskStopLatch.hasStopRecord(taskId)) {
-          log.warn("Task.create launch failure: the failed launch's attempt is still live", {
-            taskId,
-            message,
-          });
-        }
-      } else if (!liveExecution) {
-        // Receipt evidence as in markTaskLaunchFailed: the send was never admitted (on top of the
-        // shared attemptCannotStillReport boundary); otherwise the settlement stays in memory.
-        if (launchSendAdmitted) {
-          this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
-        } else {
-          await this.attemptLedger.persistOwnedAttemptSettlement(
-            taskId,
-            launchAttempt,
-            "launch-failed",
-            "launch-failed"
-          );
-        }
-      }
-      if (transitionedToInterrupted) {
-        this.recordTaskInterrupted(taskId, parentWorkspaceId);
-      }
-      if (!superseded) await this.settleChildGoalPause(taskId);
-      await this.emitWorkspaceMetadata(taskId);
+    const launch: TaskLaunchState = {
+      // Set once a checkout exists for this task: a throw after that point (base-SHA read, config
+      // persistence) must roll the checkout back instead of leaking it like an unhandled rejection.
+      materializedCheckout: undefined,
+      // Admission classification: a direct (unqueued) launch is the FIRST admission of a brand-new
+      // task by construction, exactly like a reservation — the id minted here is persisted by the
+      // write that creates the entry and owned by this process before anything can send into the
+      // workspace; a launch failure below settles that ownership (launch failed) as soon as nothing
+      // runs under it, so a Stop or reawaken never meets an owned attempt without settlement
+      // evidence while work still running under it keeps its own settlement.
+      attemptId: newTaskAttemptId(),
+      launchAttempt: undefined,
+      // Flipped when the launch fence admits the send (as TaskLaunchPlan.sendAdmitted): a failure
+      // that observes it false has positive evidence that this launch never dispatched its prompt.
+      sendAdmitted: false,
     };
     const materialize = async () => {
       const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
@@ -7538,7 +7405,7 @@ export class TaskService implements AgentTaskIntegration {
         inheritedProjects = forkResult.data.projects;
       }
 
-      materializedCheckout = { initLogger, runtime: runtimeForTaskWorkspace };
+      launch.materializedCheckout = { initLogger, runtime: runtimeForTaskWorkspace };
 
       // Multi-project forks need per-project secrets for each runtime's init hook.
       this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
@@ -7607,7 +7474,7 @@ export class TaskService implements AgentTaskIntegration {
           taskStatus: "running",
           // Direct (unqueued) launch: this write is the admission, so it stamps the attempt id the
           // send below is fenced against (WorkspaceService binds the obligation at handoff).
-          taskAttemptId: attemptId,
+          taskAttemptId: launch.attemptId,
           taskTrunkBranch: trunkBranch,
           taskBaseCommitSha: taskBaseCommitSha ?? undefined,
           taskBaseCommitShaByProjectPath,
@@ -7625,8 +7492,8 @@ export class TaskService implements AgentTaskIntegration {
       });
       // Owned before the entry is announced (emitWorkspaceMetadata below): the first send into
       // this workspace, whoever issues it, is admitted under an attempt this process owns.
-      launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
-        attemptId,
+      launch.launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
+        attemptId: launch.attemptId,
         receiptEligible: true,
       });
       if (sourceRuntimeConfigUpdate != null) {
@@ -7646,13 +7513,19 @@ export class TaskService implements AgentTaskIntegration {
       Err(getErrorMessage(error))
     );
     if (!materialized.success) {
-      if (materializedCheckout != null) {
+      if (launch.materializedCheckout != null) {
         // Runs after the desktop gate released: only the checkout and any persisted entry (which
         // would otherwise hold the desktop reservation as a running child) need to go.
-        await failLaunch(materialized.error, materializedCheckout.runtime, {
-          preservePhysicalWorkspace: useSharedWorkspace,
-        });
-        materializedCheckout.initLogger.logComplete(-1);
+        await this.failTaskLaunch(
+          plan,
+          launch,
+          materialized.error,
+          launch.materializedCheckout.runtime,
+          {
+            preservePhysicalWorkspace: useSharedWorkspace,
+          }
+        );
+        launch.materializedCheckout.initLogger.logComplete(-1);
       }
       return materialized;
     }
@@ -7676,7 +7549,7 @@ export class TaskService implements AgentTaskIntegration {
       if (sanitizeError !== undefined) {
         // The row stays published with this checkout: MCP and sends refuse it (#4674).
         this.initStateManager.markCheckoutUnsanitized(taskId);
-        await failLaunch(sanitizeError, runtimeForTaskWorkspace, {});
+        await this.failTaskLaunch(plan, launch, sanitizeError, runtimeForTaskWorkspace, {});
         initLogger.logComplete(-1);
         return Err(sanitizeError);
       }
@@ -7731,9 +7604,9 @@ export class TaskService implements AgentTaskIntegration {
     // failure path below leaves B's row alone).
     const admission = this.admitTaskWorkspaceTurn(taskId, {
       acceptanceOrigin: "automatic",
-      expectedAttemptId: attemptId,
+      expectedAttemptId: launch.attemptId,
     });
-    launchSendAdmitted = admission.kind === "admitted";
+    launch.sendAdmitted = admission.kind === "admitted";
     const sendResult =
       admission.kind !== "admitted"
         ? Err(
@@ -7764,7 +7637,7 @@ export class TaskService implements AgentTaskIntegration {
         typeof sendResult.error === "string"
           ? sendResult.error
           : formatSendMessageError(sendResult.error).message;
-      await failLaunch(message, runtimeForTaskWorkspace, {
+      await this.failTaskLaunch(plan, launch, message, runtimeForTaskWorkspace, {
         preservePhysicalWorkspace: useSharedWorkspace,
       });
       return Err(message);
@@ -7778,6 +7651,215 @@ export class TaskService implements AgentTaskIntegration {
       thinkingLevel: effectiveThinkingLevel,
       desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
     });
+  }
+
+  /**
+   * Launch failure. Before the entry is persisted (launchAttempt unset) nothing is published:
+   * only the materialized checkout exists and the rollback removes it. Once the entry is
+   * persisted the workspace IS published — a racing user or peer send can be admitted under
+   * the attempt while the launch send is in flight, and another writer (a second backend's
+   * startup re-drive or reawaken) can re-admit the row under its own attempt (A → B). Deleting
+   * the row, checkout and session dir underneath those obligations, or underneath the other
+   * writer's attempt, would strand them — so a published launch is never rolled back: it ends
+   * as an interrupted workspace with its launch error (removable like any other), exactly as
+   * the queued launch's markTaskLaunchFailed leaves it, and every step is bound to the attempt
+   * this launch decided:
+   *  1. the closure (synchronous: no further send binds to the id);
+   *  2. the durable marker, a CAS on the row still naming this attempt — a row another writer
+   *     re-admitted is that writer's to end (no marker, no stop, no metadata for it; only this
+   *     attempt's own obligations are accounted for);
+   *  3. when anything is live under the row this launch still owns, this task's own stop
+   *     cascade in the two-producer shape of failAgentTaskTerminally: Phase A directly (this
+   *     method holds the global mutex Phase A requires; the mutex is not reentrant, so it must
+   *     not be re-acquired here), Phase B (clearQueue + stopStream, bounded), then a bounded
+   *     wait for the captured owners to settle, which releases the record and settles the
+   *     attempt (Phase C).
+   * An owner that outlives the bound (or one that runs under a row another writer took over)
+   * defers the settlement to its own end: no proof is minted here for work still running. The
+   * bound keeps this method's hold on the global mutex finite; a hung owner never pins task
+   * creation.
+   *
+   * After the marker's await the steps chain (endPublishedTaskLaunchFailure, then
+   * stopFailedTaskLaunch or settleFailedTaskLaunch, then finishTaskLaunchFailure): each starts
+   * the next in the same tick as its own last await, so no call runs later than it did inline.
+   */
+  private async failTaskLaunch(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    message: string,
+    runtimeForRollback: Runtime,
+    rollback: { preservePhysicalWorkspace?: boolean }
+  ): Promise<void> {
+    const { taskId } = plan;
+    const { attemptId, launchAttempt } = launch;
+    if (launchAttempt == null) {
+      await this.rollbackFailedTaskCreate(
+        runtimeForRollback,
+        plan.parentMeta.projectPath,
+        plan.workspaceName,
+        taskId,
+        rollback
+      );
+      return;
+    }
+    this.closeAttemptAdmission(taskId, attemptId, launchAttempt, "launch-failed");
+    const mark: TaskLaunchFailureMark = {
+      superseded: false,
+      transitionedToInterrupted: false,
+      parentWorkspaceId: undefined,
+    };
+    try {
+      const found = await this.editWorkspaceEntry(
+        taskId,
+        (ws) => {
+          if (ws.taskAttemptId !== attemptId) {
+            mark.superseded = true;
+            return;
+          }
+          mark.transitionedToInterrupted = ws.taskStatus !== "interrupted";
+          mark.parentWorkspaceId = ws.parentWorkspaceId;
+          ws.taskStatus = "interrupted";
+          markChildGoalPauseOwed(ws);
+          ws.taskLaunchError = message;
+          // Survives a restart, like markTaskLaunchFailed (#4674).
+          if (this.initStateManager.getUnsanitizedCheckoutError(taskId)) {
+            ws.taskCheckoutUnsanitized = true;
+          }
+        },
+        { allowMissing: true }
+      );
+      // A row another writer removed meanwhile is theirs as well: nothing of ours to mark.
+      if (!found) mark.superseded = true;
+    } catch (error: unknown) {
+      // No durable marker and no knowledge of the row: fail closed. The attempt stays closed
+      // (no send binds to it) and unsettled (a Stop or reawaken finds it closing); nothing is
+      // stopped or deleted against a row of unknown ownership.
+      log.error("Task.create: failed to persist the launch failure", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    if (mark.superseded) {
+      log.info("Task launch failure not recorded: the record was re-admitted by another writer", {
+        taskId,
+        message,
+      });
+      // Idle under this attempt (its pending obligations are refused at their next gate, since
+      // the row no longer names it): settled. Live: its turn ends on its own — no early proof.
+      if (!this.isLiveUnderLaunchAttempt(taskId, attemptId)) {
+        this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
+      }
+      return;
+    }
+    return this.endPublishedTaskLaunchFailure(taskId, launch, launchAttempt, message, mark);
+  }
+
+  /**
+   * The launch attempt's own live work, by the ledger that binds sends to attempts: an obligation
+   * still in preflight or queued, or an admitted one whose turn is the session's live turn.
+   * Attempt-scoped on purpose — under a row another writer re-admitted, the session's other
+   * work is that writer's and must not be sampled as ours.
+   */
+  private isLiveUnderLaunchAttempt(taskId: string, attemptId: string): boolean {
+    const activeTurn = this.workspaceService.getActiveTurnGeneration(taskId);
+    for (const send of this.attemptLedger.sendsOf(taskId)) {
+      if (send.attemptId !== attemptId) continue;
+      if (send.state === "pending" || send.state === "enqueued") return true;
+      if (send.state === "admitted" && send.turnId != null && send.turnId === activeTurn) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * failTaskLaunch after its durable marker landed on a row this launch still owns: stops what
+   * is live under the row, or settles the idle attempt, then finishes the failure.
+   */
+  private endPublishedTaskLaunchFailure(
+    taskId: string,
+    launch: TaskLaunchState,
+    launchAttempt: OwnedTaskAttempt,
+    message: string,
+    mark: TaskLaunchFailureMark
+  ): Promise<void> {
+    // The marker is durable on a row this launch still owns. Anything live under the row is
+    // ours to stop: the closure above preceded the marker's await, so this sample is
+    // authoritative (nothing binds to the attempt since), and the row is re-read synchronously
+    // here because the other writer's rotation may have landed during that await — in which
+    // case the row is theirs from here on and only this attempt's own obligations count.
+    const rowStillOurs = this.currentTaskAttemptId(taskId) === launch.attemptId;
+    const liveExecution = rowStillOurs
+      ? this.workspaceService.getActiveTurnGeneration(taskId) != null ||
+        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId) != null ||
+        this.aiService.isStreaming(taskId) ||
+        this.attemptLedger.hasPendingAdmissions(taskId)
+      : this.isLiveUnderLaunchAttempt(taskId, launch.attemptId);
+    if (rowStillOurs && liveExecution) {
+      return this.stopFailedTaskLaunch(taskId, message, mark);
+    }
+    if (!liveExecution) {
+      return this.settleFailedTaskLaunch(taskId, launch, launchAttempt, mark);
+    }
+    return this.finishTaskLaunchFailure(taskId, mark);
+  }
+
+  /** Runs the failed launch's own stop cascade on the row it still owns, then finishes. */
+  private async stopFailedTaskLaunch(
+    taskId: string,
+    message: string,
+    mark: TaskLaunchFailureMark
+  ): Promise<void> {
+    this.taskStopLatch.beginWorkspaceStop(taskId);
+    this.taskStopLatch.markWorkspaceStopPersisted(taskId);
+    await this.runWorkspaceStopCleanup([taskId], {
+      label: "TaskService.create launch failure",
+      abandonPartial: true,
+      clearQueue: true,
+    });
+    await this.attemptLedger.waitForAttemptClosureToSettle(taskId, ATTEMPT_CLOSURE_SETTLE_WAIT_MS);
+    if (this.taskStopLatch.hasStopRecord(taskId)) {
+      log.warn("Task.create launch failure: the failed launch's attempt is still live", {
+        taskId,
+        message,
+      });
+    }
+    return this.finishTaskLaunchFailure(taskId, mark);
+  }
+
+  /** Settles the failed launch's idle attempt, then finishes. */
+  private async settleFailedTaskLaunch(
+    taskId: string,
+    launch: TaskLaunchState,
+    launchAttempt: OwnedTaskAttempt,
+    mark: TaskLaunchFailureMark
+  ): Promise<void> {
+    // Receipt evidence as in markTaskLaunchFailed: the send was never admitted (on top of the
+    // shared attemptCannotStillReport boundary); otherwise the settlement stays in memory.
+    if (launch.sendAdmitted) {
+      this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
+    } else {
+      await this.attemptLedger.persistOwnedAttemptSettlement(
+        taskId,
+        launchAttempt,
+        "launch-failed",
+        "launch-failed"
+      );
+    }
+    return this.finishTaskLaunchFailure(taskId, mark);
+  }
+
+  /** Records the interrupted transition, settles the owed goal pause and announces the row. */
+  private async finishTaskLaunchFailure(
+    taskId: string,
+    mark: TaskLaunchFailureMark
+  ): Promise<void> {
+    if (mark.transitionedToInterrupted) {
+      this.recordTaskInterrupted(taskId, mark.parentWorkspaceId);
+    }
+    if (!mark.superseded) await this.settleChildGoalPause(taskId);
+    await this.emitWorkspaceMetadata(taskId);
   }
 
   /** Runs `reserve` under the shared desktop's reservation for the task, when the task has one. */
