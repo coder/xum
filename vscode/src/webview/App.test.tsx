@@ -3179,7 +3179,8 @@ describe("vscode webview background processes strip (#5092)", () => {
     const onRender = () => {
       const text = document.body.textContent ?? "";
       commits.push({
-        rows: text.includes("background bash"),
+        // The live line's bash chip shows only a count, so look for the chip itself.
+        rows: document.body.querySelector('[data-activity-id="background-bashes"]') !== null,
         error: text.includes("terminate refused"),
       });
     };
@@ -3331,6 +3332,7 @@ describe("vscode webview live line (#7689)", () => {
     const textarea = view.container.querySelector("textarea");
     if (!textarea) throw new Error("the composer is not rendered");
     textarea.focus();
+    expect(expanded(view, "sub-agents")).toBe("false");
 
     const chord = new window.KeyboardEvent("keydown", {
       key: "a",
