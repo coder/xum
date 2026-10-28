@@ -147,18 +147,24 @@ describe("delegated target default consent (#4453)", () => {
     const [created, paused] = [Promise.withResolvers<void>(), Promise.withResolvers<void>()];
     const a = await setUp({ afterCreate: () => (created.resolve(), paused.promise) });
     // #7694: the target's background init ends with one more metadata publish (the service's own
-    // init-end listener refreshes it), at a time CI load decides. A test that counts publishes
-    // awaits this first. The service registered its listener first, so the next TARGET publish
-    // after init-end is that refresh.
+    // init-end listener starts refreshAndEmitMetadata without awaiting it), at a time CI load
+    // decides. A test that counts publishes awaits that refresh first. Another TARGET publish
+    // can come first, so wait for the refresh call itself: the prepended listener runs just
+    // before the service's listener makes that call, in the same synchronous emit.
     const initPublished = Promise.withResolvers<void>();
-    a.initStateManager.on("init-end", (event: { workspaceId: string }) => {
-      if (event.workspaceId !== TARGET) return;
-      const onMetadata = (published: { workspaceId: string }) => {
-        if (published.workspaceId !== TARGET) return;
-        a.real.off("metadata", onMetadata);
-        initPublished.resolve();
-      };
-      a.real.on("metadata", onMetadata);
+    let initRefreshNext = false;
+    a.initStateManager.prependListener("init-end", (event: { workspaceId: string }) => {
+      initRefreshNext = event.workspaceId === TARGET;
+    });
+    const refresh = a.real.refreshAndEmitMetadata.bind(a.real);
+    spyOn(a.real, "refreshAndEmitMetadata").mockImplementation(async (workspaceId) => {
+      const isInitRefresh = initRefreshNext && workspaceId === TARGET;
+      initRefreshNext = false;
+      try {
+        await refresh(workspaceId);
+      } finally {
+        if (isInitRefresh) initPublished.resolve();
+      }
     });
     const creating = createTurn(a.manager, a.parentId, {
       mode: "new",
