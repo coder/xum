@@ -6,9 +6,12 @@ import * as path from "path";
 import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { Err } from "@/common/types/result";
 
-import type { MuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import { createTestHistoryService } from "./testHistoryService";
+import { AttachmentService } from "./attachmentService";
+import type { CompactionHandler } from "./compactionHandler";
+import type { TurnStreamHandle } from "./turnEngine/types";
 import {
   createAgentSessionHarness,
   createFailedTurnHandle,
@@ -449,5 +452,103 @@ describe("AgentSession post-compaction context retry", () => {
     expect(history.success && attachmentRowIds(history.data)).toEqual(firstRowIds);
 
     await session.dispose();
+  });
+
+  // A publication that lands while a turn builds its row must not leave that row in the new
+  // window: the next turn would reuse it and send the older snapshot's attachments.
+  test("a publication while a turn builds its row skips the row, so the next turn sends the new snapshot", async () => {
+    const workspaceId = "ws-publication-race";
+    const model = "openai:gpt-4o";
+    const firstCompletion = Promise.withResolvers<Awaited<TurnStreamHandle["completion"]>>();
+    const settled = Promise.withResolvers<void>();
+    const streamMessage = mock((..._args: unknown[]) =>
+      Promise.resolve({
+        success: true as const,
+        data:
+          streamMessage.mock.calls.length === 1
+            ? { messageId: "assistant-first", completion: firstCompletion.promise }
+            : createStartedTurnHandle(h.session.closingSignal, "assistant-next"),
+      })
+    );
+    const h = await createAgentSessionHarness({
+      workspaceId,
+      onTurnSettled: () => settled.resolve(),
+      aiServiceOverrides: { streamMessage },
+    });
+    const handler = (
+      h.session as unknown as {
+        contextController: { compactionHandler: CompactionHandler };
+      }
+    ).contextController.compactionHandler;
+    async function publish(id: string) {
+      const edit = createMuxMessage(id, "assistant", "");
+      edit.parts = [
+        {
+          type: "dynamic-tool",
+          toolCallId: id,
+          toolName: "file_edit_replace_string",
+          state: "output-available",
+          input: { path: `/${id}.ts` },
+          output: { success: true, diff: `change ${id}` },
+        },
+      ];
+      const published = await handler.persistContinuousCompaction({
+        preparation: handler.beginPreparation(() => true),
+        publication: {
+          generation: await h.historyService
+            .getContinuousCompactionJournal(workspaceId)
+            .captureGeneration(),
+        },
+        attachmentMessages: [edit],
+        messages: [edit],
+        boundaryMessageId: id,
+        text: `${id} summary`,
+        model,
+        tail: [],
+        systemMessageTokens: 0,
+        attachmentTokens: 0,
+        shouldPersist: () => true,
+      });
+      expect(published).toBe(true);
+    }
+    // Publication B lands after the first turn read snapshot A and before it appends A's row.
+    let publishedB = false;
+    const reports = spyOn(AttachmentService, "generateCompletedReportsAttachment");
+    reports.mockImplementation(async () => {
+      if (!publishedB) {
+        publishedB = true;
+        await publish("b");
+      }
+      return null;
+    });
+    const attachmentRows = (messages: MuxMessage[]) =>
+      messages.filter((message) =>
+        message.id.startsWith(POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX)
+      );
+    const sentRows = (call: number) =>
+      attachmentRows((streamMessage.mock.calls[call][0] as { messages: MuxMessage[] }).messages);
+    const started = { success: true as const, data: { started: true } };
+
+    try {
+      await publish("a");
+      await h.historyService.appendToHistory(workspaceId, createMuxMessage("user-1", "user", "go"));
+
+      expect(await h.session.resumeStream({ model, agentId: "exec" })).toEqual(started);
+      expect(publishedB).toBe(true);
+      expect(sentRows(0)).toHaveLength(0);
+      const history = await h.historyService.getHistoryFromLatestBoundary(workspaceId);
+      expect(history.success && attachmentRows(history.data)).toEqual([]);
+
+      firstCompletion.resolve({ status: "aborted", abortReason: "user" });
+      await settled.promise;
+      expect(await h.session.resumeStream({ model, agentId: "exec" })).toEqual(started);
+      const sent = sentRows(1);
+      expect(sent).toHaveLength(1);
+      expect(JSON.stringify(sent[0].parts)).toContain("/b.ts");
+    } finally {
+      reports.mockRestore();
+      firstCompletion.resolve({ status: "aborted", abortReason: "user" });
+      await h.cleanup();
+    }
   });
 });

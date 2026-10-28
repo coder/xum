@@ -8,6 +8,7 @@ import type { ThinkingLevel } from "@/common/types/thinking";
 import { createTestHistoryService } from "./testHistoryService";
 import { prepareMessagesForProvider, sanitizeAssistantModelMessages } from "./messagePipeline";
 import { SUPPORTED_PROVIDERS } from "@/common/constants/providers";
+import { POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX } from "@/common/constants/attachments";
 import { extractToolMediaAsUserMessagesFromModelMessages } from "@/node/utils/messages/extractToolMediaAsUserMessagesFromModelMessages";
 import { createToolAttachmentSummaryText } from "@/node/utils/messages/toolResultAttachments";
 
@@ -1182,5 +1183,53 @@ describe("prepareMessagesForProvider: MCP tool results", () => {
     ]);
     expect(outputs["mcp-call"]).toMatchObject({ type: "json", value: malformed });
     expect(outputs["mcp-missing"]).toEqual({ type: "json", value: null });
+  });
+});
+
+describe("prepareMessagesForProvider: durable post-compaction attachments row", () => {
+  const options = {
+    effectiveAgentId: "exec",
+    toolNamesForSentinel: [] as string[],
+    providerForMessages: "anthropic",
+    effectiveThinkingLevel: "off" as const,
+    modelString: "anthropic:claude-sonnet-4-5",
+    workspaceId: "test-ws",
+  };
+  const firstTurn = [
+    createMuxMessage("summary-1", "assistant", "Summary of earlier work.", {
+      timestamp: 1000,
+      compacted: "user",
+      compactionBoundary: true,
+    }),
+    createMuxMessage("user-1", "user", "OPERATOR_PROMPT", { timestamp: 1001 }),
+    createMuxMessage("file-change-1", "user", "<system-file-update>x</system-file-update>", {
+      timestamp: 1002,
+      synthetic: true,
+    }),
+    createMuxMessage(`${POST_COMPACTION_ATTACHMENTS_MESSAGE_ID_PREFIX}1`, "user", "REPO_BYTES", {
+      timestamp: 1003,
+      synthetic: true,
+    }),
+  ];
+
+  function textOrder(messages: ModelMessage[]): string[] {
+    return JSON.stringify(messages).match(/OPERATOR_PROMPT|REPO_BYTES|SECOND_PROMPT/g) ?? [];
+  }
+
+  it("sends the attachments before the operator's prompt on every turn", async () => {
+    // AgentSession appends the row after the prompt; repository bytes must never be the
+    // last text of the merged user message, on the first turn or when later turns replay it.
+    const first = await prepareMessagesForProvider({ ...options, messagesWithSentinel: firstTurn });
+    expect(textOrder(first)).toEqual(["REPO_BYTES", "OPERATOR_PROMPT"]);
+
+    const second = await prepareMessagesForProvider({
+      ...options,
+      messagesWithSentinel: [
+        ...firstTurn,
+        createMuxMessage("assistant-1", "assistant", "Done.", { timestamp: 1004 }),
+        createMuxMessage("user-2", "user", "SECOND_PROMPT", { timestamp: 1005 }),
+      ],
+    });
+    expect(textOrder(second)).toEqual(["REPO_BYTES", "OPERATOR_PROMPT", "SECOND_PROMPT"]);
   });
 });

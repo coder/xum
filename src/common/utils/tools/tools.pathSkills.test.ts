@@ -4,6 +4,7 @@ import * as os from "os";
 import * as path from "path";
 import { z } from "zod";
 
+import { createPostCompactionAttachmentsMessage } from "@/browser/utils/messages/modelMessageTransform";
 import type { AgentSkillDescriptor } from "@/common/types/agentSkill";
 import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { PATH_SKILLS_RESULT_FIELD } from "@/common/types/tools";
@@ -214,6 +215,26 @@ describe("getToolsForModel - path-scoped skill activation", () => {
     const read = await call(tools.agent_skill_read, { name: "ts-rules" });
     expect(read.success).toBe(true);
     expect(surfacedNames(await call(tools.file_read, { path: "src/foo.ts" }))).toBeUndefined();
+  });
+
+  test("a skill that the post-compaction attachments row carries is not pointed at again", () => {
+    const row = createPostCompactionAttachmentsMessage(
+      [
+        {
+          type: "loaded_skills_snapshot",
+          skills: [{ name: "ts-rules", scope: "project", sha256: "x", body: "Use strict types." }],
+        },
+      ],
+      1
+    );
+    expect(row).not.toBeNull();
+    const activation = createPathSkillActivation({
+      skills: SKILLS,
+      messages: [row!],
+      cwd: workspace,
+      runtime: new LocalRuntime(workspace),
+    });
+    expect(activation?.takeMatches("src/foo.ts")).toEqual([]);
   });
 
   test("only the first MAX_PATH_SCOPED_SKILLS path-scoped skills can activate", () => {

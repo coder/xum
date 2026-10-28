@@ -1441,6 +1441,18 @@ function newestHistorySequence(rows: readonly MuxMessage[]): number {
   return rows.reduce((newest, row) => Math.max(newest, row.metadata?.historySequence ?? -1), -1);
 }
 
+/** What a turn's history read saw. */
+interface HistoryReadPosition {
+  /** The newest sequence: a stage warning is refused after a row above it (#5286). */
+  historyReadSequence: number;
+  /** The newest raw row's ID: a tail-guarded append refuses when a row landed after the read. */
+  historyTailId: string;
+}
+
+function readHistoryPosition(rows: readonly MuxMessage[]): HistoryReadPosition {
+  return { historyReadSequence: newestHistorySequence(rows), historyTailId: rows.at(-1)?.id ?? "" };
+}
+
 export class AgentSession {
   private readonly replayPublication = new AsyncLocalStorage<{
     listener: (event: AgentSessionReplayEvent) => void;
@@ -8998,10 +9010,10 @@ export class AgentSession {
       // A crash between snapshot and user-row appends can leave orphaned prompt
       // expansions on disk; exclude them from every provider request.
       let requestMessages = filterOrphanedMcpPromptSnapshots(historyResult.data);
-      // The newest sequence this turn's history read saw, before any filter: a stage warning is
-      // refused after a row above it (#5286). Rows the filters drop are never delivered, so
+      // What this turn's history read saw, before any filter: a stage warning is refused after a
+      // row above its newest sequence (#5286). Rows the filters drop are never delivered, so
       // counting them as seen is right.
-      let historyReadSequence = newestHistorySequence(historyResult.data);
+      let historyRead = readHistoryPosition(historyResult.data);
 
       if (requestMessages.length === 0) {
         return await fail(createUnknownSendMessageError(EMPTY_RESUME_HISTORY_ERROR));
@@ -9048,7 +9060,7 @@ export class AgentSession {
           );
           if (refreshed.success) {
             requestMessages = filterOrphanedMcpPromptSnapshots(refreshed.data);
-            historyReadSequence = newestHistorySequence(refreshed.data);
+            historyRead = readHistoryPosition(refreshed.data);
           }
         }
       }
@@ -9086,7 +9098,7 @@ export class AgentSession {
       if (leaseRefusal != null) return fail(createUnknownSendMessageError(leaseRefusal));
 
       const withAttachments = await this.addPostCompactionAttachmentsRow(
-        { messages: requestMessages, historyReadSequence },
+        { messages: requestMessages, ...historyRead },
         disablePostCompactionAttachments === true || preparedRequest != null
       );
       if (isStreamStartAborted()) {
@@ -9096,7 +9108,7 @@ export class AgentSession {
         return await fail(createUnknownSendMessageError(withAttachments.error));
       }
       requestMessages = withAttachments.data.messages;
-      historyReadSequence = withAttachments.data.historyReadSequence;
+      historyRead = withAttachments.data;
 
       // Apply per-model thinking floors once so desktop, mobile, and ACP requests match.
       // Gateway-preserving key first (an explicit coder:<instance>/<model>
@@ -9242,7 +9254,7 @@ export class AgentSession {
         onTurnStartStage: this.contextController.turnStartStage(options, (row) =>
           this.publishTurnStartStage(
             row,
-            historyReadSequence,
+            historyRead.historyReadSequence,
             admissionCapture,
             isStreamStartAborted,
             stopFence
@@ -9431,30 +9443,41 @@ export class AgentSession {
    * record the row this turn sends. A turn that failed before the ack already wrote the row in
    * this window: reuse that row. A compaction turn skips the attachments: its new publication
    * merges the old pending state.
-   * @param request The request history of the current window and the newest sequence it read
+   * @param request The request history of the current window and what its history read saw
    * @param skip True when the turn disables the attachments or sends a prepared request
    */
   private async addPostCompactionAttachmentsRow(
-    request: { messages: MuxMessage[]; historyReadSequence: number },
+    request: { messages: MuxMessage[] } & HistoryReadPosition,
     skip: boolean
-  ): Promise<Result<{ messages: MuxMessage[]; historyReadSequence: number }>> {
+  ): Promise<Result<{ messages: MuxMessage[] } & HistoryReadPosition>> {
     if (skip || this.activeCompactionRequest != null) return Ok(request);
     const attachments = await this.getPostCompactionAttachmentsIfNeeded(
       this.isRlmCompactionEnabled()
     );
-    if (attachments == null || attachments.length === 0) return Ok(request);
+    if (attachments == null) return Ok(request);
     this.activeStreamPostCompactionRow = request.messages.find(isPostCompactionAttachmentsMessage);
     if (this.activeStreamPostCompactionRow) return Ok(request);
     // Record time: wall clock until #7282 moves its consumers to HostClock.
     const row = createPostCompactionAttachmentsMessage(attachments, nodeClock.nowMs());
     if (row == null) return Ok(request);
-    const appendResult = await this.historyService.appendToHistory(this.workspaceId, row);
+    const appendResult = await this.historyService.appendToHistoryIfTailMatches(
+      this.workspaceId,
+      row,
+      request.historyTailId
+    );
     if (!appendResult.success) return Err(appendResult.error);
+    if (appendResult.data === "tail-mismatch") {
+      // A row landed after this turn read history, such as a newer compaction boundary. This
+      // row could then sit in a window that it was not built for, and a retry would reuse it.
+      // Send this turn without it; the next turn writes the row from the current pending state.
+      this.pendingPostCompactionStateToAcknowledge = null;
+      return Ok(request);
+    }
     // Publish the hidden row like the file-change row, so an edit fence counts the same rows.
     this.emitChatEvent({ ...row, type: "message" });
     this.activeStreamPostCompactionRow = row;
     const messages = [...request.messages, row];
-    return Ok({ messages, historyReadSequence: newestHistorySequence(messages) });
+    return Ok({ messages, ...readHistoryPosition(messages) });
   }
 
   /**

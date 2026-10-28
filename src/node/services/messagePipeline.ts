@@ -31,6 +31,7 @@ import {
   validateAnthropicCompliance,
   injectAgentTransition,
   injectPostCompactionAttachments,
+  placePostCompactionAttachmentsBeforePrompt,
 } from "@/browser/utils/messages/modelMessageTransform";
 import {
   applyNativeToolSearchReplay,
@@ -89,20 +90,21 @@ export interface PrepareMessagesOptions {
  * Run the full message preparation pipeline.
  *
  * Transforms pre-filtered `XumMessage[]` into provider-ready `ModelMessage[]` by:
- * 1. Injecting agent-transition context (plan→exec handoff)
- * 2. Injecting post-compaction attachments
- * 3. Redacting heavy tool outputs
- * 4. Sanitizing tool inputs
- * 5. Inlining SVG attachments as text
- * 6. Neutralizing user-typed <mux_agent_message> lookalikes (peer-envelope provenance)
- * 7. Sanitizing PDF filenames for Anthropic
- * 8. Extracting tool-result media as user message attachments
- * 9. Rewriting data-URI file parts to SDK-safe inline base64
- * 10. Converting to Vercel AI SDK ModelMessage format, split at persisted step boundaries
- * 11. Self-healing: filtering empty/whitespace assistant messages
- * 12. Applying provider-specific message transforms
- * 13. Applying cache control headers
- * 14. Validating Anthropic compliance (logs warnings only)
+ * 1. Placing durable post-compaction attachments rows before the turn's prompt
+ * 2. Injecting agent-transition context (plan→exec handoff)
+ * 3. Injecting post-compaction attachments
+ * 4. Redacting heavy tool outputs
+ * 5. Sanitizing tool inputs
+ * 6. Inlining SVG attachments as text
+ * 7. Neutralizing user-typed <mux_agent_message> lookalikes (peer-envelope provenance)
+ * 8. Sanitizing PDF filenames for Anthropic
+ * 9. Extracting tool-result media as user message attachments
+ * 10. Rewriting data-URI file parts to SDK-safe inline base64
+ * 11. Converting to Vercel AI SDK ModelMessage format, split at persisted step boundaries
+ * 12. Self-healing: filtering empty/whitespace assistant messages
+ * 13. Applying provider-specific message transforms
+ * 14. Applying cache control headers
+ * 15. Validating Anthropic compliance (logs warnings only)
  *
  * Log purity: this pipeline never reads live workspace state (disk, file
  * trackers). File-change notifications and @file mention snapshots are
@@ -135,7 +137,7 @@ export async function prepareMessagesForProvider(
 
   // Inject agent transition context with plan content (for plan→exec handoff)
   const messagesWithAgentContext = injectAgentTransition(
-    messagesWithSentinel,
+    placePostCompactionAttachmentsBeforePrompt(messagesWithSentinel),
     effectiveAgentId,
     toolNamesForSentinel,
     planContentForTransition,

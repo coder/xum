@@ -7,6 +7,7 @@ import type { ModelMessage, AssistantModelMessage, ToolModelMessage, UserModelMe
 import {
   isAppendedTurnNoticeMessage,
   isContextBudgetWarningMessage,
+  isPostCompactionAttachmentsMessage,
   type MuxMessage,
   type MuxReasoningPart,
 } from "@/common/types/message";
@@ -241,6 +242,32 @@ export function createPostCompactionAttachmentsMessage(
     parts: [{ type: "text", text }],
     metadata: { timestamp, synthetic: true },
   };
+}
+
+/**
+ * Move each durable post-compaction attachments row before the run of user rows it follows.
+ * AgentSession appends the row after the turn's prompt, but the attachments carry repository
+ * bytes (plan, skills, diffs) that must not be the last text the model reads: the operator's
+ * request comes last, as it did when the row was injected per request. The new position
+ * depends only on earlier rows, so later turns replay the same prefix.
+ */
+export function placePostCompactionAttachmentsBeforePrompt(messages: MuxMessage[]): MuxMessage[] {
+  if (!messages.some(isPostCompactionAttachmentsMessage)) {
+    return messages;
+  }
+  const result: MuxMessage[] = [];
+  for (const message of messages) {
+    if (!isPostCompactionAttachmentsMessage(message)) {
+      result.push(message);
+      continue;
+    }
+    let index = result.length;
+    while (index > 0 && result[index - 1].role === "user") {
+      index--;
+    }
+    result.splice(index, 0, message);
+  }
+  return result;
 }
 
 /**
