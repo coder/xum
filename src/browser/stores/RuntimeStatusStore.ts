@@ -1,15 +1,23 @@
 import { useSyncExternalStore } from "react";
 import type { APIClient } from "@/browser/contexts/API";
 import { type FrontendWorkspaceMetadata } from "@/common/types/workspace";
-import { isDevcontainerRuntime } from "@/common/types/runtime";
+import { isDevcontainerRuntime, isSSHRuntime, type RuntimeConfig } from "@/common/types/runtime";
 import { MapStore } from "./MapStore";
 import { RefreshController } from "@/browser/utils/RefreshController";
 import { getStatusInputChanges } from "@/browser/utils/statusRefreshInputs";
 
 export type RuntimeStatus = "running" | "stopped" | "unknown" | "unsupported";
 
+/** Runtimes with a start/stop lifecycle the UI shows: devcontainers and Daytona sandboxes. */
+export function hasRuntimeStatus(runtimeConfig: RuntimeConfig | undefined): boolean {
+  return (
+    isDevcontainerRuntime(runtimeConfig) ||
+    (isSSHRuntime(runtimeConfig) && runtimeConfig.daytona != null)
+  );
+}
+
 /**
- * Whether a metadata update can change the status of a displayed devcontainer workspace.
+ * Whether a metadata update can change the status of a displayed devcontainer or Daytona workspace.
  * Every workspace metadata event (title, tag, AI settings, ...) delivers a new Map, and the store's
  * requestImmediate bypasses the debounce and the hidden-window check (#5573). So refresh only when
  * such a workspace appeared, its runtime inputs changed, or its task status changed: launching or
@@ -29,7 +37,7 @@ function hasDisplayedRuntimeChange(
   }
   return changedWorkspaceIds.some(
     (workspaceId) =>
-      isSubscribed(workspaceId) && isDevcontainerRuntime(next.get(workspaceId)?.runtimeConfig)
+      isSubscribed(workspaceId) && hasRuntimeStatus(next.get(workspaceId)?.runtimeConfig)
   );
 }
 
@@ -111,7 +119,7 @@ export class RuntimeStatusStore {
 
     for (const workspaceId of Array.from(this.statusCache.keys())) {
       const workspace = metadata.get(workspaceId);
-      if (!workspace || !isDevcontainerRuntime(workspace.runtimeConfig)) {
+      if (!workspace || !hasRuntimeStatus(workspace.runtimeConfig)) {
         this.statusCache.delete(workspaceId);
         this.statuses.delete(workspaceId);
       }
@@ -144,8 +152,7 @@ export class RuntimeStatusStore {
     const workspaceIds = Array.from(this.workspaceMetadata.values())
       .filter((workspace) => {
         return (
-          isDevcontainerRuntime(workspace.runtimeConfig) &&
-          this.statuses.hasKeySubscribers(workspace.id)
+          hasRuntimeStatus(workspace.runtimeConfig) && this.statuses.hasKeySubscribers(workspace.id)
         );
       })
       .map((workspace) => workspace.id);

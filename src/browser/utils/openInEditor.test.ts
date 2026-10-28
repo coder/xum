@@ -119,6 +119,43 @@ describe("openInEditor", () => {
     expect(url.endsWith(`${filePath}:1:1`)).toBe(true);
   });
 
+  describe("Daytona SSH workspaces", () => {
+    const daytonaConfig: RuntimeConfig = {
+      type: "ssh",
+      host: "xum-daytona-sb-1",
+      srcBaseDir: "/home/daytona/xum",
+      daytona: { sandboxName: "sb-1" },
+    };
+
+    // The default srcBaseDir (~/mux) is persisted unresolved: the sandbox may not exist yet when
+    // the workspace is created, so only the backend can resolve it once the sandbox is up.
+    test("opens the path the backend resolved for a checkout under ~", async () => {
+      const calls: OpenCall[] = [];
+      const recordEditorOpen = mock((_input: { workspaceId: string; remotePath?: string | null }) =>
+        Promise.resolve({
+          success: true as const,
+          data: { remotePath: "/home/daytona/mux/project/feature" },
+        })
+      );
+      const api = createTestApiClient({ general: { recordEditorOpen } });
+
+      const result = await withWindow(createMockWindow(calls), () =>
+        openInEditor({
+          api,
+          workspaceId,
+          targetPath: "~/mux/project/feature",
+          runtimeConfig: { ...daytonaConfig, srcBaseDir: "~/mux" },
+        })
+      );
+
+      expect(result).toEqual({ success: true });
+      expect(recordEditorOpen.mock.calls[0]?.[0].remotePath).toBe("~/mux/project/feature");
+      expect(calls.map(([url]) => url)).toEqual([
+        "vscode://vscode-remote/ssh-remote+xum-daytona-sb-1/home/daytona/mux/project/feature",
+      ]);
+    });
+  });
+
   test("opens devcontainer deep links with mapped container path", async () => {
     const calls: OpenCall[] = [];
 

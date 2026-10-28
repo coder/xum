@@ -1,0 +1,909 @@
+/**
+ * DaytonaSSHRuntime - SSH runtime for Daytona Cloud sandboxes, reached through Daytona's SSH
+ * gateway. Mirrors CoderSSHRuntime: the sandbox is provisioned in postCreateSetup (after the
+ * workspace metadata is persisted, so progress streams to the init log), and ensureReady starts
+ * a stopped or archived sandbox on demand.
+ *
+ * Sandbox identity: finalizeConfig picks a unique name for the sandbox Xum creates and stores
+ * it as `daytona.sandboxName`, so the host alias (`<sandboxName>.xum--daytona`) is known before
+ * persist, like Coder's. The create records Daytona's id as `daytona.sandboxId`, and every
+ * control-plane request goes to that id (DaytonaSandboxIds).
+ */
+
+import { randomBytes } from "crypto";
+import type {
+  EnsureReadyOptions,
+  EnsureReadyResult,
+  ExecOptions,
+  InitLogger,
+  RuntimeCreateFlags,
+  RuntimeStatusEvent,
+  WorkspaceCreationParams,
+  WorkspaceCreationResult,
+  WorkspaceForkParams,
+  WorkspaceForkResult,
+  WorkspaceInitParams,
+  WorkspaceInitResult,
+} from "./Runtime";
+import { isRuntimeTransportError, RuntimeError } from "./Runtime";
+import type { SpawnResult } from "./RemoteRuntime";
+import { SSHRuntime, type SSHRuntimeConfig } from "./SSHRuntime";
+import type { PtyHandle, PtySessionParams, SSHTransport } from "./transports";
+import {
+  DAYTONA_DEFAULT_SIZE_PRESET_ID,
+  DAYTONA_SIZE_PRESETS,
+  findDaytonaSizePreset,
+  toXumDaytonaHost,
+  type DaytonaSizePreset,
+} from "@/common/constants/daytona";
+import type { DaytonaSandboxConfig } from "@/common/orpc/schemas/daytona";
+import type { RuntimeConfig } from "@/common/types/runtime";
+import { isSSHRuntime } from "@/common/types/runtime";
+import type { Result } from "@/common/types/result";
+import { Err, Ok } from "@/common/types/result";
+import { getErrorMessage } from "@/common/utils/errors";
+import { DaytonaApiError, type DaytonaSandbox } from "@/node/services/daytona/daytonaClient";
+import type {
+  DaytonaAccount,
+  UnsupportedDaytonaSandboxKind,
+} from "@/node/services/daytona/daytonaAccount";
+import type { DaytonaReadiness } from "@/node/services/daytona/daytonaReadiness";
+import {
+  DAYTONA_START_TIMEOUT_MS,
+  type DaytonaSandboxes,
+} from "@/node/services/daytona/daytonaSandboxes";
+import type { DaytonaSsh } from "@/node/services/daytona/daytonaSsh";
+import { log } from "@/node/services/log";
+import {
+  redactChildStderr,
+  redactDaytonaError,
+  redactDaytonaTokens,
+} from "./daytonaTokenRedaction";
+
+/** The DaytonaService parts this runtime uses (tests pass an in-memory fake). */
+export interface DaytonaRuntimeService {
+  account: Pick<
+    DaytonaAccount,
+    | "checkAvailability"
+    | "getDefaultTarget"
+    | "findSnapshot"
+    | "withPinnedAccount"
+    | "pinnedAccountChanged"
+  >;
+  readiness: Pick<
+    DaytonaReadiness,
+    "isSandboxReady" | "markSandboxReady" | "invalidateSandboxReady" | "join"
+  >;
+  ssh: Pick<
+    DaytonaSsh,
+    | "ensureSshAccess"
+    | "repairSshAccess"
+    | "loadPersistedTokens"
+    | "getGatewayConfig"
+    | "releaseSshAccess"
+  >;
+  sandboxes: Pick<
+    DaytonaSandboxes,
+    | "getSandboxState"
+    | "isNameTaken"
+    | "assertOwned"
+    | "buildLabels"
+    | "createSandbox"
+    | "resizeSandbox"
+    | "stopAndWait"
+    | "startAndWait"
+    | "deleteSandbox"
+    | "ensureSandboxReady"
+  >;
+}
+
+export interface DaytonaSSHRuntimeConfig extends SSHRuntimeConfig {
+  daytona: DaytonaSandboxConfig;
+}
+
+export interface DaytonaSSHRuntimeOptions {
+  projectPath?: string;
+  workspaceName?: string;
+  workspacePath?: string;
+  /** Labels the created sandbox, so the reconciler can tell which workspace it belongs to. */
+  workspaceId?: string;
+}
+
+/** Idle sandboxes stop after 30 minutes and archive after a day stopped; never auto-delete. */
+const DAYTONA_AUTO_STOP_MINUTES = 30;
+const DAYTONA_AUTO_ARCHIVE_MINUTES = 1440;
+const DAYTONA_AUTO_DELETE_DISABLED = -1;
+
+const SANDBOX_NAME_MAX_BRANCH_LENGTH = 40;
+const UNSUPPORTED_SANDBOXES: Record<UnsupportedDaytonaSandboxKind, { label: string; why: string }> =
+  {
+    windows: {
+      label: "Windows",
+      why: "Xum sets up and runs a workspace over SSH with Linux shell commands, so it needs a Linux sandbox.",
+    },
+    gpu: {
+      label: "GPU",
+      why: "GPU sandboxes are ephemeral: Daytona deletes one when it stops, and a workspace's sandbox stops when idle, so its checkout would be lost.",
+    },
+  };
+
+/** `xum-<branch>-<random>`: unique per creation, and readable in the Daytona dashboard. */
+export function buildDaytonaSandboxName(branchName: string): string {
+  const slug = branchName
+    .toLowerCase()
+    .replace(/[^a-z0-9-]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, SANDBOX_NAME_MAX_BRANCH_LENGTH)
+    .replace(/-+$/g, "");
+  const suffix = randomBytes(3).toString("hex");
+  return slug ? `xum-${slug}-${suffix}` : `xum-${suffix}`;
+}
+
+/** No size set means the default preset; anything else must be exactly one preset. */
+function resolveSizePreset(config: DaytonaSandboxConfig): DaytonaSizePreset | undefined {
+  if (config.cpu === undefined && config.memoryGiB === undefined && config.diskGiB === undefined) {
+    return DAYTONA_SIZE_PRESETS.find((preset) => preset.id === DAYTONA_DEFAULT_SIZE_PRESET_ID);
+  }
+  return findDaytonaSizePreset(config);
+}
+
+function invalidSizeError(): string {
+  const sizes = DAYTONA_SIZE_PRESETS.map(
+    (preset) => `${preset.label} (${preset.cpu} vCPU, ${preset.memoryGiB} GiB)`
+  ).join(", ");
+  return `Daytona sandbox size must be one of: ${sizes}`;
+}
+
+function isBadRequest(error: unknown): boolean {
+  return error instanceof DaytonaApiError && error.kind === "bad_request";
+}
+
+type DeleteResult =
+  | { success: true; deletedPath: string }
+  | { success: false; error: string; leftoverPaths?: string[] };
+
+type StatusEmitter = (phase: RuntimeStatusEvent["phase"], detail?: string) => void;
+
+class SandboxMissingError extends Error {}
+
+function sandboxMissingMessage(sandboxName: string): string {
+  return (
+    `Daytona sandbox "${sandboxName}" no longer exists. Archiving or removing the workspace ` +
+    `that created it deletes it, and Xum does not recreate it; delete this workspace.`
+  );
+}
+
+function redactingInitLogger(initLogger: InitLogger): InitLogger {
+  return {
+    ...initLogger,
+    logStep: (line) => initLogger.logStep(redactDaytonaTokens(line)),
+    logStdout: (line) => initLogger.logStdout(redactDaytonaTokens(line)),
+    logStderr: (line) => initLogger.logStderr(redactDaytonaTokens(line)),
+  };
+}
+
+function makeStatusEmitter(statusSink: EnsureReadyOptions["statusSink"]): StatusEmitter {
+  return (phase, detail) => statusSink?.({ phase, runtimeType: "ssh", detail });
+}
+
+/**
+ * As for Coder: a stopped or archived sandbox is never started for SSH cleanup, so its checks
+ * are skipped. An unreadable state tries SSH, which fails rather than deleting unchecked work.
+ */
+function reachableForCleanup(state: string | undefined): boolean {
+  return state !== "missing" && state !== "stopped" && state !== "archived";
+}
+
+function growsDisk(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {
+  return sandbox.disk !== undefined && sandbox.disk < preset.diskGiB;
+}
+
+/**
+ * A running sandbox can only grow cpu and memory. An unreported value may be above the preset,
+ * so it is resized stopped, where either direction is allowed.
+ */
+function shrinksCompute(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {
+  return (sandbox.cpu ?? Infinity) > preset.cpu || (sandbox.memory ?? Infinity) > preset.memoryGiB;
+}
+
+function changesCompute(sandbox: DaytonaSandbox, preset: DaytonaSizePreset): boolean {
+  return sandbox.cpu !== preset.cpu || sandbox.memory !== preset.memoryGiB;
+}
+
+/**
+ * IMPORTANT: extends SSHRuntime (rather than delegating) so code that checks
+ * `runtime instanceof SSHRuntime` (PTY, tools, MCP, bash AI proxy) treats Daytona as SSH.
+ */
+export class DaytonaSSHRuntime extends SSHRuntime {
+  private readonly daytonaConfig: DaytonaSandboxConfig;
+  private readonly daytonaService: DaytonaRuntimeService;
+  private readonly workspaceId?: string;
+  /**
+   * Set once ensureReady runs its checks on this instance. Only such a runtime (a turn's or a
+   * terminal's) restarts a sandbox that stopped under it; UI and background runtimes never
+   * start a billed sandbox.
+   */
+  private restartsStoppedSandbox = false;
+  /** SSHRuntime keeps its own reference private; a replaced token needs its backoff reset. */
+  private readonly sshTransport: SSHTransport;
+
+  /** As Coder: the sandbox does not exist yet at create time, so skip host access. */
+  readonly createFlags: RuntimeCreateFlags = {
+    deferredRuntimeAccess: true,
+    configLevelCollisionDetection: true,
+  };
+
+  constructor(
+    config: DaytonaSSHRuntimeConfig,
+    transport: SSHTransport,
+    daytonaService: DaytonaRuntimeService,
+    options?: DaytonaSSHRuntimeOptions
+  ) {
+    const sandboxName = config.daytona.sandboxName;
+    super(
+      {
+        host: sandboxName ? toXumDaytonaHost(sandboxName) : config.host,
+        srcBaseDir: config.srcBaseDir,
+        bgOutputDir: config.bgOutputDir,
+        identityFile: config.identityFile,
+        port: config.port,
+      },
+      transport,
+      options
+    );
+    this.daytonaConfig = config.daytona;
+    this.sshTransport = transport;
+    this.daytonaService = daytonaService;
+    this.workspaceId = options?.workspaceId;
+  }
+
+  private sandboxMissing(sandboxName: string): EnsureReadyResult {
+    return {
+      ready: false,
+      error: sandboxMissingMessage(sandboxName),
+      errorType: "runtime_not_ready",
+    };
+  }
+
+  /** Keep cleanup hooks from starting a stopped (billed) sandbox through SSH. */
+  async isRunningWithoutStart(_abortSignal: AbortSignal): Promise<boolean> {
+    const sandboxName = this.daytonaConfig.sandboxName;
+    return sandboxName ? this.isSandboxStarted(sandboxName) : false;
+  }
+
+  private async isSandboxStarted(sandboxName: string): Promise<boolean> {
+    return (await this.readSandboxState(sandboxName)) === "started";
+  }
+
+  /** Undefined when the state cannot be read: callers treat that as not running. */
+  private async readSandboxState(sandboxName: string): Promise<string | undefined> {
+    try {
+      return (await this.daytonaService.sandboxes.getSandboxState(sandboxName)).state;
+    } catch (error) {
+      log.warn("Could not read Daytona sandbox state; treating it as not running", {
+        sandboxName,
+        error: getErrorMessage(error),
+      });
+      return undefined;
+    }
+  }
+
+  /**
+   * Ready means started and reachable over ssh with a fresh token. A ready result is cached
+   * per sandbox for 60 s (in the service: runtimes are recreated per stream), and concurrent
+   * checks share one control-plane request. A sandbox removed outside Xum is reported, never
+   * silently recreated.
+   */
+  override async ensureReady(options?: EnsureReadyOptions): Promise<EnsureReadyResult> {
+    const sandboxName = this.daytonaConfig.sandboxName;
+    if (!sandboxName) {
+      return {
+        ready: false,
+        error: "Daytona sandbox name not set",
+        errorType: "runtime_not_ready",
+      };
+    }
+    const emitStatus = makeStatusEmitter(options?.statusSink);
+    // An external client reads the user's ssh config, which the cache does not cover: another
+    // tool may have removed the managed block since. Only a full check writes it again.
+    if (!options?.externalSshClient && this.daytonaService.readiness.isSandboxReady(sandboxName)) {
+      return this.ensureReadyFromCache(options, emitStatus);
+    }
+    return this.ensureReadyUncached(sandboxName, options, emitStatus);
+  }
+
+  private async ensureReadyUncached(
+    sandboxName: string,
+    options: EnsureReadyOptions | undefined,
+    emitStatus: StatusEmitter
+  ): Promise<EnsureReadyResult> {
+    emitStatus("checking");
+    const failure = await this.bringSandboxUp(sandboxName, emitStatus, options?.signal);
+    if (failure) return failure;
+    const result = await this.markReadyIfRepoPresent(sandboxName, options, emitStatus);
+    if (result.ready) this.restartsStoppedSandbox = true;
+    return result;
+  }
+
+  /** The cache covers the sandbox, not this workspace's checkout: a fork shares the sandbox. */
+  private async ensureReadyFromCache(
+    options: EnsureReadyOptions | undefined,
+    emitStatus: StatusEmitter
+  ): Promise<EnsureReadyResult> {
+    // Set before the probe: ensureReady is an explicit action, so a sandbox that stopped
+    // within the cache is started again (repairForRetry) instead of failing until it expires.
+    this.restartsStoppedSandbox = true;
+    const repoFailure = await this.checkRepo(options, emitStatus);
+    if (repoFailure) return repoFailure;
+    return { ready: true };
+  }
+
+  /**
+   * Every ssh command to the sandbox goes through here: its stderr and errors are redacted
+   * (the token is the ssh user name). A transport failure is repaired (repairForRetry) and the
+   * command retried once.
+   */
+  protected override async spawnRemoteProcess(
+    fullCommand: string,
+    options: ExecOptions & { deadlineMs?: number }
+  ): Promise<SpawnResult> {
+    let result: SpawnResult;
+    const sandboxName = this.daytonaConfig.sandboxName;
+    // ssh may send a token an earlier process left in the include file: the redactor must
+    // know it before ssh can quote it. Not every command runs after ensureReady.
+    if (sandboxName) await this.daytonaService.ssh.loadPersistedTokens();
+    try {
+      result = await super.spawnRemoteProcess(fullCommand, options);
+    } catch (error) {
+      if (!(await this.repairForRetry(error, options.abortSignal))) {
+        throw redactDaytonaError(error);
+      }
+      try {
+        result = await super.spawnRemoteProcess(fullCommand, options);
+      } catch (retryError) {
+        throw redactDaytonaError(retryError);
+      }
+    }
+    redactChildStderr(result.process);
+    const onExit = result.onExit;
+    return {
+      ...result,
+      onExit: (exitCode, stderr) => {
+        // The ready cache must not hide a sandbox that stopped: the next ensureReady checks.
+        if (sandboxName && this.isTransportFailureExit(exitCode, stderr)) {
+          this.daytonaService.readiness.invalidateSandboxReady(sandboxName);
+        }
+        onExit?.(exitCode, stderr);
+      },
+    };
+  }
+
+  /**
+   * True when the failure was repaired and a retry may pass. Concurrent failures on one
+   * sandbox share a single repair. Throws a clear error for a sandbox deleted outside Xum.
+   */
+  private async repairForRetry(
+    error: unknown,
+    abortSignal: AbortSignal | undefined
+  ): Promise<boolean> {
+    const sandboxName = this.daytonaConfig.sandboxName;
+    if (!sandboxName || !isRuntimeTransportError(error) || abortSignal?.aborted) return false;
+    this.daytonaService.readiness.invalidateSandboxReady(sandboxName);
+    try {
+      await this.daytonaService.readiness.join(sandboxName, { signal: abortSignal }, () =>
+        this.repairSandbox(sandboxName)
+      );
+    } catch (repairError) {
+      if (repairError instanceof SandboxMissingError) {
+        throw new RuntimeError(
+          sandboxMissingMessage(sandboxName),
+          "network",
+          redactDaytonaError(error)
+        );
+      }
+      log.warn("Could not repair ssh access to the Daytona sandbox", {
+        sandboxName,
+        error: getErrorMessage(redactDaytonaError(repairError)),
+      });
+      return false;
+    }
+    // A failure against the old token or gateway may have marked the alias as failing for good.
+    this.sshTransport.resetConnectionHealth?.();
+    return true;
+  }
+
+  /**
+   * The sandbox state decides, not the error text: a stopped or deleted sandbox also answers
+   * "Permission denied". A started one gets a fresh token and gateway; a stopped one is started
+   * only by a runtime that may start it. Throws when nothing was repaired.
+   */
+  private async repairSandbox(sandboxName: string): Promise<void> {
+    const { state, sandbox } = await this.daytonaService.sandboxes.getSandboxState(sandboxName);
+    if (!sandbox) throw new SandboxMissingError();
+    if (state === "started") {
+      await this.daytonaService.sandboxes.assertOwned(sandbox, sandboxName);
+      log.info("An ssh command to the Daytona sandbox failed; replacing its token and retrying", {
+        sandboxName,
+      });
+      await this.daytonaService.ssh.repairSshAccess(sandboxName);
+      return;
+    }
+    if (!this.restartsStoppedSandbox) throw new Error(`the sandbox is ${state}`);
+    log.info("Daytona sandbox is not running; starting it and retrying the command once", {
+      sandboxName,
+    });
+    // Not ensureSandboxReady: it would join this repair and wait for itself.
+    await this.daytonaService.sandboxes.startAndWait(
+      sandboxName,
+      Date.now() + DAYTONA_START_TIMEOUT_MS
+    );
+    await this.daytonaService.ssh.ensureSshAccess(sandboxName);
+  }
+
+  /**
+   * A terminal goes straight to ssh, so it brings the sandbox up first (a stopped or archived
+   * sandbox starts, an expiring token is replaced). The user opened it, so starting the
+   * billed sandbox is expected, as for a turn.
+   */
+  override async createPtySession(params: PtySessionParams): Promise<PtyHandle> {
+    const ready = await this.ensureReady();
+    if (!ready.ready) throw new Error(ready.error);
+    return super.createPtySession(params);
+  }
+
+  /** Init output (sync, git push, hook) can quote ssh's stderr, so it is redacted too. */
+  override async initWorkspace(params: WorkspaceInitParams): Promise<WorkspaceInitResult> {
+    try {
+      const result = await super.initWorkspace({
+        ...params,
+        initLogger: redactingInitLogger(params.initLogger),
+      });
+      return result.error ? { ...result, error: redactDaytonaTokens(result.error) } : result;
+    } catch (error) {
+      throw redactDaytonaError(error);
+    }
+  }
+
+  /** Start the sandbox if needed and refresh ssh access; a failure result, or undefined. */
+  private async bringSandboxUp(
+    sandboxName: string,
+    emitStatus: StatusEmitter,
+    signal: AbortSignal | undefined
+  ): Promise<EnsureReadyResult | undefined> {
+    try {
+      await this.daytonaService.sandboxes.ensureSandboxReady(sandboxName, {
+        onStarting: () => emitStatus("starting", "Starting sandbox..."),
+        signal,
+      });
+      return undefined;
+    } catch (error) {
+      emitStatus("error");
+      return this.ensureReadyFailure(sandboxName, error, signal);
+    }
+  }
+
+  private async markReadyIfRepoPresent(
+    sandboxName: string,
+    options: EnsureReadyOptions | undefined,
+    emitStatus: StatusEmitter
+  ): Promise<EnsureReadyResult> {
+    const repoFailure = await this.checkRepo(options, emitStatus);
+    if (repoFailure) return repoFailure;
+    this.daytonaService.readiness.markSandboxReady(sandboxName);
+    emitStatus("ready");
+    return { ready: true };
+  }
+
+  /** The failure when this workspace's checkout is missing or broken; reports ready otherwise. */
+  private async checkRepo(
+    options: EnsureReadyOptions | undefined,
+    emitStatus: StatusEmitter
+  ): Promise<EnsureReadyResult | undefined> {
+    const repoCheck = await this.checkWorkspaceRepo(options);
+    if (!repoCheck) return undefined;
+    if (!repoCheck.ready) {
+      emitStatus("error", repoCheck.error);
+      return repoCheck;
+    }
+    emitStatus("ready");
+    return undefined;
+  }
+
+  private ensureReadyFailure(
+    sandboxName: string,
+    error: unknown,
+    signal: AbortSignal | undefined
+  ): EnsureReadyResult {
+    if (signal?.aborted) {
+      return { ready: false, error: "Aborted", errorType: "runtime_start_failed" };
+    }
+    if (error instanceof DaytonaApiError) {
+      if (error.kind === "not_found") return this.sandboxMissing(sandboxName);
+      if (error.kind === "not_configured" || error.kind === "unauthorized") {
+        return { ready: false, error: error.message, errorType: "runtime_not_ready" };
+      }
+    }
+    return {
+      ready: false,
+      error: `Failed to start Daytona sandbox: ${getErrorMessage(error)}`,
+      errorType: "runtime_start_failed",
+    };
+  }
+
+  /**
+   * Fill in the sandbox identity after collision handling: Xum creates a sandbox with a fresh
+   * name, and the default size when none was chosen.
+   */
+  async finalizeConfig(
+    finalBranchName: string,
+    config: RuntimeConfig
+  ): Promise<Result<RuntimeConfig, string>> {
+    if (!isSSHRuntime(config) || !config.daytona) {
+      return Ok(config);
+    }
+    const availability = await this.daytonaService.account.checkAvailability();
+    if (!availability.available) {
+      return Err(availability.reason);
+    }
+
+    const daytona = config.daytona;
+    const preset = resolveSizePreset(daytona);
+    if (!preset) {
+      return Err(invalidSizeError());
+    }
+    const sandboxName = buildDaytonaSandboxName(finalBranchName);
+    return Ok({
+      ...config,
+      host: toXumDaytonaHost(sandboxName),
+      daytona: {
+        ...daytona,
+        sandboxName,
+        // A creation request never reuses a sandbox, whatever a hand-edited config says.
+        sandboxId: undefined,
+        forked: undefined,
+        cpu: preset.cpu,
+        memoryGiB: preset.memoryGiB,
+        diskGiB: preset.diskGiB,
+      },
+    });
+  }
+
+  /**
+   * Check before persisting: credentials, a preset size (hand-edited configs included), a free
+   * name and a snapshot Xum can use.
+   */
+  async validateBeforePersist(
+    _finalBranchName: string,
+    config: RuntimeConfig
+  ): Promise<Result<void, string>> {
+    if (!isSSHRuntime(config) || !config.daytona) {
+      return Ok(undefined);
+    }
+    const availability = await this.daytonaService.account.checkAvailability();
+    if (!availability.available) {
+      return Err(availability.reason);
+    }
+    const daytona = config.daytona;
+    const sandboxName = daytona.sandboxName;
+    if (!sandboxName) {
+      return Err("Daytona sandbox name is required (should be set by finalizeConfig)");
+    }
+    return this.checkNewSandbox(sandboxName, daytona);
+  }
+
+  /** A sandbox Xum creates: a preset size, a free name, and a snapshot that is not Windows. */
+  private async checkNewSandbox(
+    sandboxName: string,
+    daytona: DaytonaSandboxConfig
+  ): Promise<Result<void, string>> {
+    if (!findDaytonaSizePreset(daytona)) return Err(invalidSizeError());
+    const nameFree = await this.checkNameFree(sandboxName);
+    if (!nameFree.success) return nameFree;
+    return daytona.snapshot
+      ? this.checkSnapshotClass(daytona.snapshot)
+      : this.checkDefaultSnapshotClass();
+  }
+
+  /**
+   * "Daytona default" creates from the snapshot the deployment advertises, so a Windows or
+   * inactive default is refused like a chosen one. A default the organization cannot look up
+   * is Daytona's to resolve at create time, as when none is advertised.
+   */
+  private async checkDefaultSnapshotClass(): Promise<Result<void, string>> {
+    let snapshot: string | undefined;
+    try {
+      snapshot = (await this.daytonaService.ssh.getGatewayConfig()).defaultSnapshot;
+    } catch (error) {
+      return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
+    }
+    return snapshot ? this.checkSnapshotClass(snapshot, { missingOk: true }) : Ok(undefined);
+  }
+
+  private async checkNameFree(sandboxName: string): Promise<Result<void, string>> {
+    let taken: boolean;
+    try {
+      taken = await this.daytonaService.sandboxes.isNameTaken(sandboxName);
+    } catch (error) {
+      return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
+    }
+    return taken ? Err(`A Daytona sandbox named "${sandboxName}" already exists`) : Ok(undefined);
+  }
+
+  /** Refused before any sandbox is created: a Windows snapshot makes a billed box setup fails on. */
+  private async checkSnapshotClass(
+    snapshot: string,
+    options?: { missingOk: boolean }
+  ): Promise<Result<void, string>> {
+    let found: Awaited<ReturnType<DaytonaAccount["findSnapshot"]>>;
+    try {
+      found = await this.daytonaService.account.findSnapshot(snapshot);
+    } catch (error) {
+      return Err(`Could not reach Daytona: ${getErrorMessage(error)}`);
+    }
+    // A stale choice (deleted after it was saved as a default) would fail every setup retry.
+    if (!found) {
+      if (options?.missingOk) return Ok(undefined);
+      return Err(`Daytona snapshot "${snapshot}" was not found; pick another snapshot`);
+    }
+    if (found.unsupported) {
+      const { label, why } = UNSUPPORTED_SANDBOXES[found.unsupported];
+      return Err(`Daytona snapshot "${snapshot}" creates ${label} sandboxes. ${why}`);
+    }
+    return Ok(undefined);
+  }
+
+  /** The sandbox may not exist yet, so only compute the path (as Coder does). */
+  override createWorkspace(params: WorkspaceCreationParams): Promise<WorkspaceCreationResult> {
+    const workspacePath = this.getWorkspacePath(params.projectPath, params.directoryName);
+    params.initLogger.logStep("Workspace path computed (Daytona provisioning will follow)");
+    return Promise.resolve({ success: true, workspacePath });
+  }
+
+  /**
+   * Provision the sandbox (unless forked), wait until it runs, configure ssh and prepare
+   * the workspace directory. initWorkspace then runs the normal SSH
+   * sync, worktree creation and init hook. If anything fails after the create request was
+   * sent, the sandbox this call created is deleted again so it cannot linger and bill.
+   */
+  postCreateSetup(params: WorkspaceInitParams): Promise<void> {
+    return this.daytonaService.account.withPinnedAccount(() => this.setUpSandbox(params));
+  }
+
+  private async setUpSandbox(params: WorkspaceInitParams): Promise<void> {
+    const sandboxName = this.daytonaConfig.sandboxName;
+    if (!sandboxName) {
+      throw new Error("Daytona sandbox name is required (should be set by finalizeConfig)");
+    }
+    // A fork reuses its source's sandbox: create nothing (and so never delete it on failure).
+    const creates = this.daytonaConfig.forked !== true;
+
+    try {
+      if (creates) {
+        params.initLogger.logStep(`Creating Daytona sandbox "${sandboxName}"...`);
+        await this.createSandbox(sandboxName, params);
+        params.initLogger.logStep("Daytona sandbox created");
+      }
+      await this.connect(sandboxName, params);
+      await this.prepareWorkspaceParentDirectory(params);
+      // After a settings save during the setup, the workspace would sit in an account Xum no
+      // longer uses, with ssh access the save's cleanup did not see: undo both, as for any
+      // failure.
+      if (await this.daytonaService.account.pinnedAccountChanged()) {
+        await this.daytonaService.ssh.releaseSshAccess(sandboxName);
+        throw new Error("the Daytona settings changed during setup; create the workspace again");
+      }
+    } catch (error) {
+      const errorMsg = redactDaytonaTokens(getErrorMessage(error));
+      log.error("Daytona sandbox setup failed", { sandboxName, error: errorMsg });
+      params.initLogger.logStderr(`Daytona sandbox setup failed: ${errorMsg}`);
+      // A failed create may still have made the sandbox (a timeout, a 5xx); deleteSandbox keeps
+      // one without this install's label.
+      if (creates) await this.deleteCreatedSandbox(sandboxName, params.initLogger);
+      throw new Error(`Daytona sandbox setup failed: ${errorMsg}`);
+    }
+  }
+
+  /** Wait until the sandbox runs and write ssh access. */
+  private async connect(sandboxName: string, params: WorkspaceInitParams): Promise<void> {
+    const { initLogger, abortSignal } = params;
+    initLogger.logStep("Waiting for the sandbox to start and configuring SSH...");
+    await this.daytonaService.sandboxes.ensureSandboxReady(sandboxName, {
+      onStarting: () => initLogger.logStep("Starting sandbox..."),
+      signal: abortSignal,
+    });
+  }
+
+  private async deleteCreatedSandbox(
+    sandboxName: string,
+    initLogger: WorkspaceInitParams["initLogger"]
+  ): Promise<void> {
+    try {
+      initLogger.logStep(`Deleting the sandbox "${sandboxName}" this setup created...`);
+      await this.daytonaService.sandboxes.deleteSandbox(sandboxName);
+    } catch (error) {
+      // The persisted workspace still names the sandbox; removing the workspace deletes it.
+      const message = getErrorMessage(error);
+      log.error("Failed to delete a Daytona sandbox after setup failed", {
+        sandboxName,
+        error: message,
+      });
+      initLogger.logStderr(
+        `Failed to delete Daytona sandbox "${sandboxName}": ${message}. The sandbox is kept; ` +
+          "removing this workspace deletes it."
+      );
+    }
+  }
+
+  /**
+   * Create with the preset resources. Daytona rejects resources (HTTP 400) for snapshots with
+   * fixed resources: then create with the snapshot's own size and resize to the preset.
+   */
+  private async createSandbox(sandboxName: string, params: WorkspaceInitParams): Promise<void> {
+    const preset = resolveSizePreset(this.daytonaConfig);
+    if (!preset) throw new Error(invalidSizeError());
+    const base = {
+      name: sandboxName,
+      ...(this.daytonaConfig.snapshot ? { snapshot: this.daytonaConfig.snapshot } : {}),
+      labels: await this.daytonaService.sandboxes.buildLabels({
+        workspaceId: this.workspaceId ?? sandboxName,
+        projectPath: params.projectPath,
+      }),
+      ...(await this.resolveTarget()),
+      autoStopInterval: DAYTONA_AUTO_STOP_MINUTES,
+      autoArchiveInterval: DAYTONA_AUTO_ARCHIVE_MINUTES,
+      autoDeleteInterval: DAYTONA_AUTO_DELETE_DISABLED,
+    };
+    try {
+      await this.daytonaService.sandboxes.createSandbox({
+        ...base,
+        cpu: preset.cpu,
+        memory: preset.memoryGiB,
+        disk: preset.diskGiB,
+      });
+      return;
+    } catch (error) {
+      if (!isBadRequest(error)) throw error;
+      params.initLogger.logStep(
+        `Daytona refused the size for this snapshot (${getErrorMessage(error)}); ` +
+          `creating with the snapshot's size and resizing to ${preset.label}...`
+      );
+    }
+    await this.daytonaService.sandboxes.createSandbox(base);
+    await this.resizeToPreset(sandboxName, preset);
+  }
+
+  private async resolveTarget(): Promise<{ target?: string }> {
+    const target =
+      this.daytonaConfig.target ?? (await this.daytonaService.account.getDefaultTarget());
+    return target ? { target } : {};
+  }
+
+  /**
+   * A running sandbox can only grow cpu and memory; shrinking them or growing the disk needs a
+   * stopped one. Disk never shrinks, so a larger snapshot disk is kept.
+   */
+  private async resizeToPreset(sandboxName: string, preset: DaytonaSizePreset): Promise<void> {
+    const deadline = () => Date.now() + DAYTONA_START_TIMEOUT_MS;
+    const sandbox = await this.daytonaService.sandboxes.startAndWait(sandboxName, deadline());
+    const disk = growsDisk(sandbox, preset);
+    const request = {
+      cpu: preset.cpu,
+      memory: preset.memoryGiB,
+      ...(disk ? { disk: preset.diskGiB } : {}),
+    };
+    if (disk || shrinksCompute(sandbox, preset)) {
+      await this.daytonaService.sandboxes.stopAndWait(sandboxName, deadline());
+      await this.daytonaService.sandboxes.resizeSandbox(sandboxName, request);
+    } else if (changesCompute(sandbox, preset)) {
+      await this.daytonaService.sandboxes.resizeSandbox(sandboxName, request);
+    }
+    await this.daytonaService.sandboxes.startAndWait(sandboxName, deadline());
+  }
+
+  /**
+   * Keep the inherited worktree fork: the child reuses the parent's sandbox (`forked`, so its
+   * setup creates none, and its archive or removal never stops or deletes the sandbox). The
+   * user asked for the fork, so a stopped or archived source sandbox is started first, as for
+   * a terminal.
+   */
+  override async forkWorkspace(params: WorkspaceForkParams): Promise<WorkspaceForkResult> {
+    const ready = await this.ensureReady();
+    if (!ready.ready) return { success: false, error: ready.error, failureIsFatal: true };
+    const result = await super.forkWorkspace(params);
+    // Sub-agents must share the parent's sandbox: never fall back to creating a new one.
+    if (!result.success) return { ...result, failureIsFatal: true };
+    return {
+      ...result,
+      forkedRuntimeConfig: {
+        type: "ssh" as const,
+        ...this.getConfig(),
+        daytona: { ...this.daytonaConfig, forked: true },
+      },
+    };
+  }
+
+  /**
+   * Delete the workspace, and the sandbox too when this workspace created it (a fork only
+   * deletes its checkout). The SSH dirty and unpushed checks run first on a running sandbox. As
+   * for Coder, a stopped or archived one is never started for them, so its work goes unchecked.
+   * Force skips the checks, and deletes the sandbox without SSH.
+   */
+  override async deleteWorkspace(
+    projectPath: string,
+    workspaceName: string,
+    force: boolean,
+    abortSignal?: AbortSignal,
+    trusted?: boolean,
+    options?: { keepBranch?: boolean }
+  ): Promise<DeleteResult> {
+    const sshDelete = () =>
+      super.deleteWorkspace(projectPath, workspaceName, force, abortSignal, trusted, options);
+    return this.deleteWorkspaceAndSandbox(
+      this.getWorkspacePath(projectPath, workspaceName),
+      force,
+      sshDelete
+    );
+  }
+
+  private async deleteWorkspaceAndSandbox(
+    deletedPath: string,
+    force: boolean,
+    sshDelete: () => Promise<DeleteResult>
+  ): Promise<DeleteResult> {
+    const sandboxName = this.daytonaConfig.sandboxName;
+    if (!sandboxName) {
+      log.warn("Daytona sandbox name not set, falling back to SSH-only deletion");
+      return sshDelete();
+    }
+    const reachable = reachableForCleanup(await this.readSandboxState(sandboxName));
+    if (this.daytonaConfig.forked === true) {
+      return reachable
+        ? this.deleteForkCheckout(sandboxName, deletedPath, force, sshDelete)
+        : { success: true, deletedPath };
+    }
+    if (force || !reachable) return this.deleteOwnedSandbox(sandboxName, deletedPath);
+    const sshResult = await sshDelete();
+    return sshResult.success
+      ? this.deleteOwnedSandbox(sandboxName, deletedPath, "SSH delete succeeded, but ")
+      : sshResult;
+  }
+
+  /**
+   * A fork's removal deletes only its checkout: the sandbox belongs to the workspace that
+   * created it. A forced removal goes on when the checkout cannot be deleted.
+   */
+  private async deleteForkCheckout(
+    sandboxName: string,
+    deletedPath: string,
+    force: boolean,
+    sshDelete: () => Promise<DeleteResult>
+  ): Promise<DeleteResult> {
+    const result = await sshDelete();
+    if (result.success || !force) return result;
+    log.warn("Left a fork's checkout on its Daytona sandbox", { sandboxName, deletedPath });
+    return { success: true, deletedPath };
+  }
+
+  private async deleteOwnedSandbox(
+    sandboxName: string,
+    deletedPath: string,
+    errorPrefix?: string
+  ): Promise<DeleteResult> {
+    try {
+      await this.daytonaService.sandboxes.deleteSandbox(sandboxName);
+      return { success: true, deletedPath };
+    } catch (error) {
+      const message = getErrorMessage(error);
+      log.error("Failed to delete Daytona sandbox", { sandboxName, error: message });
+      return {
+        success: false,
+        error: errorPrefix
+          ? `${errorPrefix}failed to delete Daytona sandbox: ${message}`
+          : `Failed to delete Daytona sandbox: ${message}`,
+        // A forced removal goes on without it: remove shows this as a warning to act on.
+        leftoverPaths: [`Daytona sandbox "${sandboxName}"`],
+      };
+    }
+  }
+}

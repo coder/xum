@@ -6,13 +6,16 @@ import * as path from "path";
 import { spawnPtyProcess } from "../ptySpawn";
 import { cdThenExecShell, runInPosixShell } from "../streamUtils";
 import { expandTildeForSSH } from "../tildeExpansion";
+import { redactDaytonaHostStderr } from "../daytonaTokenRedaction";
 import {
+  appendDaytonaOpenSSHArgs,
   appendOpenSSHHostKeyPolicyArgs,
   sshConnectionPool,
   type SSHConnectionConfig,
 } from "../sshConnectionPool";
 import type { SpawnResult } from "../RemoteRuntime";
 import { RuntimeError } from "../Runtime";
+import { isXumDaytonaHost } from "@/common/constants/daytona";
 import { assert } from "@/common/utils/assert";
 import { getErrorMessage } from "@/common/utils/errors";
 import { log } from "@/node/services/log";
@@ -59,6 +62,10 @@ export class OpenSSHTransport implements SSHTransport {
 
   getConfig(): SSHTransportConfig {
     return this.config;
+  }
+
+  resetConnectionHealth(): void {
+    sshConnectionPool.forgetHealth(this.config);
   }
 
   async acquireConnection(options?: SSHTransportAcquireOptions): Promise<void> {
@@ -108,7 +115,7 @@ export class OpenSSHTransport implements SSHTransport {
     sshArgs.push("-o", "ServerAliveInterval=5");
     sshArgs.push("-o", "ServerAliveCountMax=2");
     sshArgs.push("-o", "BatchMode=yes");
-    appendOpenSSHHostKeyPolicyArgs(sshArgs);
+    appendOpenSSHHostKeyPolicyArgs(sshArgs, this.config.host);
     sshArgs.push(this.config.host, fullCommand);
 
     const process = spawn("ssh", sshArgs, {
@@ -140,12 +147,19 @@ export class OpenSSHTransport implements SSHTransport {
   async createPtySession(params: PtySessionParams): Promise<PtyHandle> {
     await this.acquireConnection({ maxWaitMs: 0 });
 
-    const args: string[] = [...this.buildBaseSSHArgs()];
+    // Daytona's gateway takes the access token as the ssh user name, and OpenSSH's fatal
+    // `<user>@<host>: Permission denied` would print it into the terminal, which clients
+    // replay. QUIET also silences fatal messages, so a Daytona terminal shows no ssh messages
+    // (ensureReady reports connection problems before it opens).
+    const logLevel = isXumDaytonaHost(this.config.host) ? "QUIET" : "FATAL";
+    const args: string[] = [...this.buildBaseSSHArgs(logLevel)];
     args.push("-o", "ControlMaster=no");
     args.push("-o", "ConnectTimeout=15");
     args.push("-o", "ServerAliveInterval=5");
     args.push("-o", "ServerAliveCountMax=2");
     args.push("-t");
+    // Not the full host key policy: a terminal on another host may ask about an unknown key.
+    appendDaytonaOpenSSHArgs(args, this.config.host);
     args.push(this.config.host);
 
     // expandTildeForSSH already returns a quoted string (e.g., "$HOME/path")
@@ -208,10 +222,11 @@ export class OpenSSHTransport implements SSHTransport {
       "-o",
       "LogLevel=ERROR"
     );
-    appendOpenSSHHostKeyPolicyArgs(args);
+    appendOpenSSHHostKeyPolicyArgs(args, this.config.host);
     args.push(this.config.host);
 
     const master = spawn("ssh", args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    redactDaytonaHostStderr(master, this.config.host);
     let stderr = "";
     master.stderr?.on("data", (chunk: Buffer) => {
       if (stderr.length < 4096) stderr += chunk.toString();
@@ -235,7 +250,10 @@ export class OpenSSHTransport implements SSHTransport {
       if (master.exitCode === null && master.signalCode === null) master.kill();
     };
     const control = (...command: string[]) =>
-      runSshClient(["-F", "/dev/null", "-S", controlPath, ...command, this.config.host]);
+      runSshClient(
+        ["-F", "/dev/null", "-S", controlPath, ...command, this.config.host],
+        this.config.host
+      );
 
     const deadline = Date.now() + REVERSE_FORWARD_READY_TIMEOUT_MS;
     while ((await control("-O", "check")).code !== 0) {
@@ -260,7 +278,7 @@ export class OpenSSHTransport implements SSHTransport {
     return { closed, close };
   }
 
-  private buildBaseSSHArgs(): string[] {
+  private buildBaseSSHArgs(logLevel: "FATAL" | "QUIET" = "FATAL"): string[] {
     const args: string[] = [];
 
     if (this.config.port) {
@@ -271,15 +289,19 @@ export class OpenSSHTransport implements SSHTransport {
       args.push("-i", this.config.identityFile);
     }
 
-    args.push("-o", "LogLevel=FATAL");
+    args.push("-o", `LogLevel=${logLevel}`);
     return args;
   }
 }
 
 /** Runs a short ssh control command (`-O ...`) and reports its exit code and stderr. */
-function runSshClient(args: string[]): Promise<{ code: number | null; stderr: string }> {
+function runSshClient(
+  args: string[],
+  host: string
+): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve) => {
     const child = spawn("ssh", args, { stdio: ["ignore", "ignore", "pipe"], windowsHide: true });
+    redactDaytonaHostStderr(child, host);
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       if (stderr.length < 4096) stderr += chunk.toString();

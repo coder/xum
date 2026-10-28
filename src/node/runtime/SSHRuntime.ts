@@ -1930,6 +1930,15 @@ export class SSHRuntime extends RemoteRuntime {
     }
 
     initLogger.logStep("Creating git bundle...");
+    // Start the remote writer before git: when git exits before anything reads its stdout,
+    // Node discards the unread output, and a slow ssh start (a Daytona gateway) uploaded an
+    // empty bundle.
+    const remoteAbortController = createAbortController(300_000, abortSignal);
+    const remoteStream = await this.exec(`cat > ${this.quoteForRemote(remoteBundlePath)}`, {
+      cwd: "~",
+      abortSignal: remoteAbortController.signal,
+    });
+
     // Use --branches --tags instead of --all to exclude refs/remotes/origin/*
     // from the bundle. Those tracking refs are from the local machine's last
     // fetch and can be arbitrarily stale — importing them into the shared bare
@@ -1953,12 +1962,6 @@ export class SSHRuntime extends RemoteRuntime {
       for (const line of chunk.split("\n").filter(Boolean)) {
         initLogger.logStderr(line);
       }
-    });
-
-    const remoteAbortController = createAbortController(300_000, abortSignal);
-    const remoteStream = await this.exec(`cat > ${this.quoteForRemote(remoteBundlePath)}`, {
-      cwd: "~",
-      abortSignal: remoteAbortController.signal,
     });
 
     try {
@@ -2121,7 +2124,7 @@ export class SSHRuntime extends RemoteRuntime {
     args.push("-o", "ServerAliveCountMax=2");
 
     // Match the runtime's host key policy (permissive in headless mode).
-    appendOpenSSHHostKeyPolicyArgs(args);
+    appendOpenSSHHostKeyPolicyArgs(args, config.host, q);
 
     return args.join(" ");
   }
@@ -2561,6 +2564,23 @@ export class SSHRuntime extends RemoteRuntime {
         success: false,
         error: getErrorMessage(error),
       };
+    }
+  }
+
+  /** For hosts provisioned in postCreateSetup (Coder, Daytona): git clone does not create the parent. */
+  protected async prepareWorkspaceParentDirectory(params: WorkspaceInitParams): Promise<void> {
+    params.initLogger.logStep("Preparing workspace directory...");
+    const parentDir = path.posix.dirname(params.workspacePath);
+    const mkdirResult = await execBuffered(this, `mkdir -p ${expandTildeForSSH(parentDir)}`, {
+      cwd: "/tmp",
+      timeout: 10,
+      abortSignal: params.abortSignal,
+    });
+    if (mkdirResult.exitCode !== 0) {
+      const errorMsg = mkdirResult.stderr || mkdirResult.stdout || "Unknown error";
+      log.error("Failed to create workspace parent directory", { parentDir, error: errorMsg });
+      params.initLogger.logStderr(`Failed to prepare workspace directory: ${errorMsg}`);
+      throw new Error(`Failed to prepare workspace directory: ${errorMsg}`);
     }
   }
 
@@ -3255,15 +3275,18 @@ export class SSHRuntime extends RemoteRuntime {
     const deletedPath = this.getWorkspacePath(projectPath, workspaceName);
 
     try {
+      // quoteForRemote expands a leading ~ remotely: a deferred-access runtime (Coder, Daytona)
+      // keeps the unresolved `~/...` path, and a quoted `~` would make a dirty checkout look missing.
+      const deletedPathArg = this.quoteForRemote(deletedPath);
       // Combine all pre-deletion checks into a single bash script to minimize round trips
       // Exit codes: 0=ok to delete, 1=uncommitted changes, 2=unpushed commits, 3=doesn't exist
       const checkScript = force
         ? // When force=true, only check existence
-          `test -d ${shescape.quote(deletedPath)} || exit 3`
+          `test -d ${deletedPathArg} || exit 3`
         : // When force=false, perform all safety checks
           `
-            test -d ${shescape.quote(deletedPath)} || exit 3
-            cd ${shescape.quote(deletedPath)} || exit 1
+            test -d ${deletedPathArg} || exit 3
+            cd ${deletedPathArg} || exit 1
             git diff --quiet --exit-code && git diff --quiet --cached --exit-code || exit 1
             if git remote | grep -q .; then
               # First, check the original condition: any commits not in any remote

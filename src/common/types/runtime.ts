@@ -6,6 +6,7 @@ import type { z } from "zod";
 import type { RuntimeConfigSchema } from "../orpc/schemas";
 import { RuntimeEnablementIdSchema, RuntimeModeSchema } from "../orpc/schemas/runtime";
 import type { CoderWorkspaceConfig } from "../orpc/schemas/coder";
+import type { DaytonaSandboxConfig } from "../orpc/schemas/daytona";
 
 // Re-export CoderWorkspaceConfig type from schema (single source of truth)
 export type { CoderWorkspaceConfig };
@@ -49,7 +50,7 @@ export function runtimeModeSupportsSharedTaskWorkspace(mode: RuntimeMode | undef
 
 /**
  * Runtime IDs that can be enabled/disabled in Settings → Runtimes.
- * Note: includes "coder" which is a UI-level choice (not a RuntimeMode).
+ * Note: includes "coder" and "daytona", UI-level choices (both are `ssh` under the hood, not RuntimeModes).
  */
 export const RUNTIME_ENABLEMENT_IDS = RuntimeEnablementIdSchema.options;
 
@@ -57,11 +58,23 @@ export type RuntimeEnablementId = z.infer<typeof RuntimeEnablementIdSchema>;
 
 export type RuntimeEnablement = Record<RuntimeEnablementId, boolean>;
 
+/** The RuntimeMode each enablement ID runs as: Coder and Daytona are `ssh` plus a sub-config. */
+export const RUNTIME_MODE_FOR_ENABLEMENT_ID: Record<RuntimeEnablementId, RuntimeMode> = {
+  local: RUNTIME_MODE.LOCAL,
+  worktree: RUNTIME_MODE.WORKTREE,
+  ssh: RUNTIME_MODE.SSH,
+  coder: RUNTIME_MODE.SSH,
+  daytona: RUNTIME_MODE.SSH,
+  docker: RUNTIME_MODE.DOCKER,
+  devcontainer: RUNTIME_MODE.DEVCONTAINER,
+};
+
 export const DEFAULT_RUNTIME_ENABLEMENT: RuntimeEnablement = {
   local: true,
   worktree: true,
   ssh: true,
   coder: true,
+  daytona: true,
   docker: true,
   devcontainer: true,
 };
@@ -99,6 +112,14 @@ export const DEVCONTAINER_RUNTIME_PREFIX = "devcontainer ";
 /** Placeholder host for Coder SSH runtimes (where host is derived from Coder config) */
 export const CODER_RUNTIME_PLACEHOLDER = "coder://";
 
+/** Placeholder host for Daytona SSH runtimes (finalizeConfig derives the real alias) */
+export const DAYTONA_RUNTIME_PLACEHOLDER = "daytona://";
+
+/** Hosts the creation UI fills in for managed SSH backends; never a user's SSH host. */
+export function isManagedSshPlaceholder(host: string): boolean {
+  return host === CODER_RUNTIME_PLACEHOLDER || host === DAYTONA_RUNTIME_PLACEHOLDER;
+}
+
 export type RuntimeConfig = z.infer<typeof RuntimeConfigSchema>;
 
 /**
@@ -108,7 +129,7 @@ export type RuntimeConfig = z.infer<typeof RuntimeConfigSchema>;
 export type ParsedRuntime =
   | { mode: "local" }
   | { mode: "worktree" }
-  | { mode: "ssh"; host: string; coder?: CoderWorkspaceConfig }
+  | { mode: "ssh"; host: string; coder?: CoderWorkspaceConfig; daytona?: DaytonaSandboxConfig }
   | { mode: "docker"; image: string; shareCredentials?: boolean }
   | { mode: "devcontainer"; configPath: string; shareCredentials?: boolean };
 
@@ -223,6 +244,7 @@ export function buildRuntimeConfig(parsed: ParsedRuntime): RuntimeConfig | undef
         host: parsed.host.trim(),
         srcBaseDir: "~/mux", // Default remote base directory (tilde resolved by backend)
         coder: parsed.coder,
+        daytona: parsed.daytona,
       };
     case RUNTIME_MODE.DOCKER:
       return {
@@ -251,6 +273,30 @@ export function isSSHRuntime(
   config: RuntimeConfig | undefined
 ): config is Extract<RuntimeConfig, { type: "ssh" }> {
   return config?.type === "ssh";
+}
+
+/** The Daytona sandbox a runtime config points at, if any. */
+export function getDaytonaSandboxName(config: RuntimeConfig | undefined): string | undefined {
+  const sandboxName = isSSHRuntime(config) ? config.daytona?.sandboxName?.trim() : undefined;
+  return sandboxName === "" ? undefined : sandboxName;
+}
+
+/**
+ * Whether the workspace created its Daytona sandbox, so archiving or removing it deletes the
+ * sandbox. A fork (a sub-agent's worktree) and a shared-checkout task only use the sandbox of
+ * the workspace they came from, with its runtime config copied.
+ */
+export function ownsDaytonaSandbox(workspace: {
+  runtimeConfig?: RuntimeConfig;
+  taskIsolation?: "fork" | "none";
+}): boolean {
+  const config = workspace.runtimeConfig;
+  return (
+    workspace.taskIsolation !== "none" &&
+    isSSHRuntime(config) &&
+    config.daytona?.forked !== true &&
+    getDaytonaSandboxName(config) !== undefined
+  );
 }
 
 /**

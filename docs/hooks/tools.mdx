@@ -182,7 +182,7 @@ Xum searches for each hook file in this order:
 
 This applies to `tool_pre`, `tool_post`, and `tool_env`.
 
-For SSH workspaces, hooks execute **on the remote machine**.
+For SSH workspaces (including Coder and Daytona), hooks execute **on the remote machine**, and the user-level location there is `~/.mux/<hook>`, not `~/.xum/<hook>`. Docker workspaces read user-level hooks from `/var/mux/<hook>` inside the container.
 
 </Accordion>
 
