@@ -1736,6 +1736,57 @@ function isIdleLegacyStartupTask(
   return state === "idle" && pendingGuidanceCount === 0 && lacksLegacyRestartEvidence(task, state);
 }
 
+/**
+ * What startup recovery read after its queue drain, for every re-drive step: snapshots, never
+ * re-read after a re-drive's awaits.
+ */
+interface StartupRecoverySnapshot {
+  readonly taskIndex: AgentTaskIndex;
+  readonly states: ReadonlyMap<string | undefined, StartupRecoveryState>;
+}
+
+/**
+ * The counters of recoverInterruptedTasks' completion log. One mutable record: each re-drive
+ * step adds to the counters for what it did.
+ */
+interface StartupRecoveryTally {
+  resumedRunningCount: number;
+  skippedRunningDueToActiveDescendants: number;
+  skippedRunningAlreadyStreaming: number;
+  failedRunningCount: number;
+}
+
+/** A running task's startup re-drive, decided from the recovery snapshot before its rotation. */
+interface RunningTaskRedrive {
+  readonly taskId: string;
+  /** The recovery snapshot row. */
+  readonly task: AgentTaskWorkspaceEntry;
+  readonly pendingGuidance: NonNullable<AgentTaskWorkspaceEntry["taskPendingGuidance"]>;
+  /** A task with a pending question: its guidance only queues. */
+  readonly queueOnly: boolean;
+  readonly alreadyStreaming: boolean;
+}
+
+/** A running task's re-drive after its attempt rotation: each send is fenced to that attempt. */
+interface FencedRunningTaskRedrive extends RunningTaskRedrive {
+  readonly fenceStartupSend: () => TurnAdmissionToken | undefined;
+  readonly sendOptions: ReturnType<typeof buildTaskTurnSendOptions>;
+}
+
+/**
+ * Counts the compaction follow-up of a running task's re-drive. True when it ends the re-drive:
+ * the follow-up failed, or it resumed a task that has no guidance to replay.
+ */
+function tallyRunningFollowUp(
+  followUp: Result<boolean>,
+  pendingGuidanceCount: number,
+  tally: StartupRecoveryTally
+): boolean {
+  if (!followUp.success) tally.failedRunningCount += 1;
+  else if (followUp.data && pendingGuidanceCount === 0) tally.resumedRunningCount += 1;
+  return !followUp.success || (followUp.data && pendingGuidanceCount === 0);
+}
+
 function isWorkspaceBusyIdleOnlySend(error: unknown): boolean {
   return (
     error != null &&
@@ -4597,166 +4648,19 @@ export class TaskService implements AgentTaskIntegration {
       resumedAwaitingReportCount += 1;
     }
 
-    let resumedRunningCount = 0;
-    let skippedRunningDueToActiveDescendants = 0;
-    let skippedRunningAlreadyStreaming = 0;
-    let failedRunningCount = 0;
+    const snapshot: StartupRecoverySnapshot = { taskIndex, states };
+    const tally: StartupRecoveryTally = {
+      resumedRunningCount: 0,
+      skippedRunningDueToActiveDescendants: 0,
+      skippedRunningAlreadyStreaming: 0,
+      failedRunningCount: 0,
+    };
 
     for (const task of runningTasks) {
       if (!task.id) continue;
       if (cancelled("running")) return;
       if (!(await admitRecovery(task, "startup-running"))) continue;
-
-      const pendingGuidance = task.taskPendingGuidance ?? [];
-      const queueOnly = states.get(task.id) === "question";
-      if (queueOnly && pendingGuidance.length === 0) continue;
-      // A busy session counts as active: re-drive sends return once accepted, so an earlier
-      // recovery pass's nudge can still be preparing (not yet streaming) when this pass runs.
-      const alreadyStreaming =
-        this.aiService.isStreaming(task.id) || this.workspaceService.isBusyForMessage(task.id);
-      // Guidance must queue even for active tasks; generic restart nudges must not.
-      if (alreadyStreaming && pendingGuidance.length === 0) {
-        skippedRunningAlreadyStreaming += 1;
-        continue;
-      }
-      const hasBlockingActiveDescendants =
-        this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(taskIndex, task.id).length > 0;
-      if (hasBlockingActiveDescendants && pendingGuidance.length === 0) {
-        skippedRunningDueToActiveDescendants += 1;
-        continue;
-      }
-      // Decided before the attempt rotation below: that rotation writes the whole config file,
-      // and a large config with many legacy rows outlived the startup step bound (#6511).
-      if (isIdleLegacyStartupTask(task, states.get(task.id), pendingGuidance.length)) continue;
-
-      // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
-      // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
-      // by the recovery snapshot (`task`) like the awaiting-report re-drive above.
-      // Retry a goal pause the previous process owed before re-driving the task.
-      await this.settleChildGoalPause(task.id);
-      const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
-      if (rotatedAttemptId == null) {
-        failedRunningCount += 1;
-        continue;
-      }
-
-      // Restore compaction intent before new guidance/nudges make its tail stale.
-      // Guidance then queues behind that continuation without losing either payload.
-      const followUp =
-        alreadyStreaming || queueOnly
-          ? Ok(false)
-          : await this.dispatchFencedStartupCompactionFollowUp(task.id, rotatedAttemptId);
-      if (!followUp.success) failedRunningCount += 1;
-      else if (followUp.data && pendingGuidance.length === 0) resumedRunningCount += 1;
-      if (!followUp.success || (followUp.data && pendingGuidance.length === 0)) continue;
-      // Every further send of this decision is fenced to the attempt rotated for it: bound here
-      // (refused once another writer's attempt owns the row) and carried as the send's token, so
-      // the handoff never adopts a successor and a Stop captures the obligation.
-      const startupTaskId = task.id;
-      const fenceStartupSend = (): TurnAdmissionToken | undefined => {
-        const admission = this.admitTaskWorkspaceTurn(startupTaskId, {
-          acceptanceOrigin: "automatic",
-          expectedAttemptId: rotatedAttemptId,
-        });
-        return admission.kind === "admitted" ? admission.token : undefined;
-      };
-      const model = task.taskModelString ?? defaultModel;
-      const agentId = resolveTaskAgentIdForResume(task);
-      const sendOptions = {
-        model,
-        agentId,
-        thinkingLevel: task.taskThinkingLevel,
-        reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
-        serviceTier: ServiceTierSchema.safeParse(
-          resolveWorkspaceAISettings(task, agentId)?.serviceTier
-        ).data,
-      };
-      if (pendingGuidance.length > 0) {
-        let sendResult: Result<void, SendMessageError> = Ok(undefined);
-        for (const guidance of pendingGuidance) {
-          const token = fenceStartupSend();
-          if (token == null) {
-            sendResult = Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
-            break;
-          }
-          sendResult = await this.workspaceService.sendMessage(
-            task.id,
-            `Updated guidance from parent:\n\n${guidance.message}`,
-            { ...sendOptions, queueDispatchMode: guidance.queueDispatchMode },
-            {
-              ...this.taskGuidanceSendOptions(task.id, guidance.id, task.taskStatus ?? "running"),
-              restoreQueued: queueOnly,
-              turnAdmission: token,
-              admissionStale: () => token.admissionStale(),
-            }
-          );
-          if (!sendResult.success) break;
-        }
-        if (!sendResult.success) {
-          failedRunningCount += 1;
-          log.error("Failed to replay pending task guidance on startup", {
-            taskId: task.id,
-            error: sendResult.error,
-          });
-          continue;
-        }
-        resumedRunningCount += 1;
-        continue;
-      }
-
-      // Legacy tasks lack active-status evidence. Durable compaction/guidance above still wins.
-      if (lacksLegacyRestartEvidence(task, states.get(task.id))) continue;
-      const isPlanLike = await this.isPlanLikeTaskWorkspace({
-        projectPath: task.projectPath,
-        workspace: task,
-      });
-
-      const logContext = {
-        taskId: task.id,
-        taskName: task.name,
-        projectPath: task.projectPath,
-        model,
-        agentId,
-        isPlanLike,
-      };
-      log.info("[startup] Resuming running task", logContext);
-      const resumeStartedAt = Date.now();
-      const restartCompletionInstruction = isPlanLike
-        ? "When you have a final plan, call propose_plan exactly once."
-        : "When you have a final answer, return it in your final assistant message.";
-      const nudgeToken = fenceStartupSend();
-      const sendResult =
-        nudgeToken == null
-          ? Err<SendMessageError>({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE })
-          : await this.workspaceService.sendMessage(
-              task.id,
-              "Xum restarted while this task was running. Continue where you left off. " +
-                restartCompletionInstruction,
-              sendOptions,
-              {
-                acceptanceOrigin: "automatic",
-                synthetic: true,
-                agentInitiated: true,
-                taskTurnKind: "recovery",
-                // Accepted is enough; stream startup must not gate the listener (see method doc).
-                startStreamInBackground: true,
-                turnAdmission: nudgeToken,
-                admissionStale: () => nudgeToken.admissionStale(),
-              }
-            );
-      const durationMs = Date.now() - resumeStartedAt;
-      if (!sendResult.success) {
-        failedRunningCount += 1;
-        log.error("Failed to resume running task on startup", {
-          ...logContext,
-          durationMs,
-          error: sendResult.error,
-        });
-        continue;
-      }
-
-      resumedRunningCount += 1;
-      log.info("[startup] Resumed running task", { ...logContext, durationMs });
+      await this.resumeRunningTask(task.id, task, snapshot, tally);
     }
 
     log.info("[startup] TaskService.recoverInterruptedTasks completed", {
@@ -4768,11 +4672,233 @@ export class TaskService implements AgentTaskIntegration {
       skippedAwaitingReportAlreadyBusy,
       failedAwaitingReportCount,
       runningTaskCount: runningTasks.length,
-      resumedRunningCount,
-      skippedRunningDueToActiveDescendants,
-      skippedRunningAlreadyStreaming,
-      failedRunningCount,
+      resumedRunningCount: tally.resumedRunningCount,
+      skippedRunningDueToActiveDescendants: tally.skippedRunningDueToActiveDescendants,
+      skippedRunningAlreadyStreaming: tally.skippedRunningAlreadyStreaming,
+      failedRunningCount: tally.failedRunningCount,
     });
+  }
+
+  /**
+   * Startup re-drive of one admitted `running` task (or one with a pending question). Returns
+   * without a send when the task has nothing to re-drive: each skip below was a `continue` of
+   * recoverInterruptedTasks' running loop.
+   */
+  private async resumeRunningTask(
+    taskId: string,
+    task: AgentTaskWorkspaceEntry,
+    snapshot: StartupRecoverySnapshot,
+    tally: StartupRecoveryTally
+  ): Promise<void> {
+    const pendingGuidance = task.taskPendingGuidance ?? [];
+    const queueOnly = snapshot.states.get(taskId) === "question";
+    if (queueOnly && pendingGuidance.length === 0) return;
+    // A busy session counts as active: re-drive sends return once accepted, so an earlier
+    // recovery pass's nudge can still be preparing (not yet streaming) when this pass runs.
+    const alreadyStreaming =
+      this.aiService.isStreaming(taskId) || this.workspaceService.isBusyForMessage(taskId);
+    const redrive = { taskId, task, pendingGuidance, queueOnly, alreadyStreaming };
+    if (this.skipActiveRunningTask(redrive, snapshot.taskIndex, tally)) return;
+    // Decided before the attempt rotation below: that rotation writes the whole config file,
+    // and a large config with many legacy rows outlived the startup step bound (#6511).
+    if (isIdleLegacyStartupTask(task, snapshot.states.get(taskId), pendingGuidance.length)) return;
+    await this.rotateAndFollowUpRunningTask(redrive, snapshot, tally);
+  }
+
+  /**
+   * Counts and skips a running task without guidance to queue that is already streaming or
+   * waits on blocking active descendants.
+   */
+  private skipActiveRunningTask(
+    redrive: RunningTaskRedrive,
+    taskIndex: AgentTaskIndex,
+    tally: StartupRecoveryTally
+  ): boolean {
+    const { taskId, pendingGuidance, alreadyStreaming } = redrive;
+    // Guidance must queue even for active tasks; generic restart nudges must not.
+    if (alreadyStreaming && pendingGuidance.length === 0) {
+      tally.skippedRunningAlreadyStreaming += 1;
+      return true;
+    }
+    const hasBlockingActiveDescendants =
+      this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(taskIndex, taskId).length > 0;
+    if (hasBlockingActiveDescendants && pendingGuidance.length === 0) {
+      tally.skippedRunningDueToActiveDescendants += 1;
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Rotates a running task's attempt for its re-drive and restores its compaction intent, then
+   * sends the rest of the re-drive fenced to the rotated attempt.
+   */
+  private async rotateAndFollowUpRunningTask(
+    redrive: RunningTaskRedrive,
+    snapshot: StartupRecoverySnapshot,
+    tally: StartupRecoveryTally
+  ): Promise<void> {
+    const { taskId, task } = redrive;
+    // Admission classification: startup re-drive (compaction follow-up, guidance replay or the
+    // restart nudge) = new UNOWNED attempt; rotate + mark once before the first send, guarded
+    // by the recovery snapshot (`task`) like the awaiting-report re-drive above.
+    // Retry a goal pause the previous process owed before re-driving the task.
+    await this.settleChildGoalPause(taskId);
+    const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(taskId, task);
+    if (rotatedAttemptId == null) {
+      tally.failedRunningCount += 1;
+      return;
+    }
+
+    // Restore compaction intent before new guidance/nudges make its tail stale.
+    // Guidance then queues behind that continuation without losing either payload.
+    const followUp =
+      redrive.alreadyStreaming || redrive.queueOnly
+        ? Ok(false)
+        : await this.dispatchFencedStartupCompactionFollowUp(taskId, rotatedAttemptId);
+    if (tallyRunningFollowUp(followUp, redrive.pendingGuidance.length, tally)) return;
+    await this.sendFencedRunningTaskRedrive(redrive, rotatedAttemptId, snapshot, tally);
+  }
+
+  /**
+   * Fences the guidance replay or restart nudge of a running task's re-drive to its rotated
+   * attempt, then sends it.
+   */
+  private async sendFencedRunningTaskRedrive(
+    redrive: RunningTaskRedrive,
+    rotatedAttemptId: string,
+    snapshot: StartupRecoverySnapshot,
+    tally: StartupRecoveryTally
+  ): Promise<void> {
+    const { task } = redrive;
+    // Every further send of this decision is fenced to the attempt rotated for it: bound here
+    // (refused once another writer's attempt owns the row) and carried as the send's token, so
+    // the handoff never adopts a successor and a Stop captures the obligation.
+    const startupTaskId = redrive.taskId;
+    const fenceStartupSend = (): TurnAdmissionToken | undefined => {
+      const admission = this.admitTaskWorkspaceTurn(startupTaskId, {
+        acceptanceOrigin: "automatic",
+        expectedAttemptId: rotatedAttemptId,
+      });
+      return admission.kind === "admitted" ? admission.token : undefined;
+    };
+    const model = task.taskModelString ?? defaultModel;
+    const agentId = resolveTaskAgentIdForResume(task);
+    const sendOptions = {
+      model,
+      agentId,
+      thinkingLevel: task.taskThinkingLevel,
+      reasoningMode: coerceOpenAIReasoningMode(task.aiSettings?.reasoningMode),
+      serviceTier: ServiceTierSchema.safeParse(
+        resolveWorkspaceAISettings(task, agentId)?.serviceTier
+      ).data,
+    };
+    const send: FencedRunningTaskRedrive = { ...redrive, fenceStartupSend, sendOptions };
+    if (redrive.pendingGuidance.length > 0) {
+      await this.replayStartupPendingGuidance(send, tally);
+      return;
+    }
+    await this.sendStartupRestartNudge(send, snapshot, tally);
+  }
+
+  /** Replays a running task's pending guidance in order; the first failed send ends the replay. */
+  private async replayStartupPendingGuidance(
+    send: FencedRunningTaskRedrive,
+    tally: StartupRecoveryTally
+  ): Promise<void> {
+    const { taskId, task, queueOnly, fenceStartupSend, sendOptions } = send;
+    let sendResult: Result<void, SendMessageError> = Ok(undefined);
+    for (const guidance of send.pendingGuidance) {
+      const token = fenceStartupSend();
+      if (token == null) {
+        sendResult = Err({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE });
+        break;
+      }
+      sendResult = await this.workspaceService.sendMessage(
+        taskId,
+        `Updated guidance from parent:\n\n${guidance.message}`,
+        { ...sendOptions, queueDispatchMode: guidance.queueDispatchMode },
+        {
+          ...this.taskGuidanceSendOptions(taskId, guidance.id, task.taskStatus ?? "running"),
+          restoreQueued: queueOnly,
+          turnAdmission: token,
+          admissionStale: () => token.admissionStale(),
+        }
+      );
+      if (!sendResult.success) break;
+    }
+    if (!sendResult.success) {
+      tally.failedRunningCount += 1;
+      log.error("Failed to replay pending task guidance on startup", {
+        taskId,
+        error: sendResult.error,
+      });
+      return;
+    }
+    tally.resumedRunningCount += 1;
+  }
+
+  /** Sends the restart nudge of a running task's re-drive. */
+  private async sendStartupRestartNudge(
+    send: FencedRunningTaskRedrive,
+    snapshot: StartupRecoverySnapshot,
+    tally: StartupRecoveryTally
+  ): Promise<void> {
+    const { taskId, task, fenceStartupSend, sendOptions } = send;
+    // Legacy tasks lack active-status evidence. Durable compaction/guidance above still wins.
+    if (lacksLegacyRestartEvidence(task, snapshot.states.get(taskId))) return;
+    const isPlanLike = await this.isPlanLikeTaskWorkspace({
+      projectPath: task.projectPath,
+      workspace: task,
+    });
+
+    const logContext = {
+      taskId,
+      taskName: task.name,
+      projectPath: task.projectPath,
+      model: sendOptions.model,
+      agentId: sendOptions.agentId,
+      isPlanLike,
+    };
+    log.info("[startup] Resuming running task", logContext);
+    const resumeStartedAt = Date.now();
+    const restartCompletionInstruction = isPlanLike
+      ? "When you have a final plan, call propose_plan exactly once."
+      : "When you have a final answer, return it in your final assistant message.";
+    const nudgeToken = fenceStartupSend();
+    const sendResult =
+      nudgeToken == null
+        ? Err<SendMessageError>({ type: "unknown", raw: SEND_ADMISSION_STALE_MESSAGE })
+        : await this.workspaceService.sendMessage(
+            taskId,
+            "Xum restarted while this task was running. Continue where you left off. " +
+              restartCompletionInstruction,
+            sendOptions,
+            {
+              acceptanceOrigin: "automatic",
+              synthetic: true,
+              agentInitiated: true,
+              taskTurnKind: "recovery",
+              // Accepted is enough; stream startup must not gate the listener (see
+              // recoverInterruptedTasks' doc).
+              startStreamInBackground: true,
+              turnAdmission: nudgeToken,
+              admissionStale: () => nudgeToken.admissionStale(),
+            }
+          );
+    const durationMs = Date.now() - resumeStartedAt;
+    if (!sendResult.success) {
+      tally.failedRunningCount += 1;
+      log.error("Failed to resume running task on startup", {
+        ...logContext,
+        durationMs,
+        error: sendResult.error,
+      });
+      return;
+    }
+
+    tally.resumedRunningCount += 1;
+    log.info("[startup] Resumed running task", { ...logContext, durationMs });
   }
 
   /**
