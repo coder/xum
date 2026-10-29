@@ -15,6 +15,7 @@ import { stageWorkspaceAttachment } from "@/node/utils/attachments/stageWorkspac
 import { Err, Ok, type Result } from "@/common/types/result";
 import type { Workspace } from "@/common/types/project";
 import { SCRATCH_PROJECT_CONFIG_KEY } from "@/common/constants/scratch";
+import { DAYTONA_ARCHIVE_NEEDS_USER } from "@/common/constants/daytona";
 import { CHAT_ARCHIVE_FILE_NAME } from "@/common/constants/paths";
 import { createMuxMessage } from "@/common/types/message";
 import { workspaceFileLocks } from "@/node/utils/concurrency/workspaceFileLocks";
@@ -626,6 +627,40 @@ describe("WorkspaceService archive lifecycle hooks", () => {
     });
     expect(pinned).toEqual(Ok({ kind: "archived" }));
     expect(hookBehavior).toBe("keep");
+  });
+
+  test("archive() refuses a model-driven archive that deletes a Daytona sandbox, not a fork's", async () => {
+    const daytonaRuntime = (daytona: { sandboxName: string; forked?: boolean }) => ({
+      type: "ssh" as const,
+      host: `${daytona.sandboxName}.xum--daytona`,
+      srcBaseDir: "~/src",
+      daytona,
+    });
+    const hooks = new WorkspaceLifecycleHooks();
+    let hookRuns = 0;
+    hooks.registerBeforeArchive(() => {
+      hookRuns++;
+      return Promise.resolve(Ok(undefined));
+    });
+    workspaceService.setWorkspaceLifecycleHooks(hooks);
+    const modelArchive = () =>
+      workspaceService.archive(workspaceId, undefined, {
+        forbidCoderWorkspaceDeletion: true,
+        // The Coder setting does not apply: archiving the owner always deletes its sandbox.
+        coderWorkspaceArchiveBehaviorOverride: "keep",
+      });
+
+    await editEntry((entry) => {
+      entry.runtimeConfig = daytonaRuntime({ sandboxName: "xum-own" });
+    });
+    expect(await modelArchive()).toEqual(Err(DAYTONA_ARCHIVE_NEEDS_USER));
+    expect(hookRuns).toBe(0);
+
+    await editEntry((entry) => {
+      entry.runtimeConfig = daytonaRuntime({ sandboxName: "xum-own", forked: true });
+    });
+    expect(await modelArchive()).toEqual(Ok({ kind: "archived" }));
+    expect(hookRuns).toBe(1);
   });
 
   test("archive() under refuseLiveUserActivity closes an idle desktop process instead of refusing", async () => {

@@ -124,8 +124,12 @@ import { isNonRetryableStreamError } from "@/common/utils/messages/retryEligibil
 import type { StreamErrorType } from "@/common/types/errors";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { DEFAULT_WORKTREE_ARCHIVE_BEHAVIOR } from "@/common/config/worktreeArchiveBehavior";
-import { DEFAULT_CODER_ARCHIVE_BEHAVIOR } from "@/common/config/coderArchiveBehavior";
-import { isSSHRuntime, isWorktreeRuntime } from "@/common/types/runtime";
+import {
+  DEFAULT_CODER_ARCHIVE_BEHAVIOR,
+  type CoderWorkspaceArchiveBehavior,
+} from "@/common/config/coderArchiveBehavior";
+import { isSSHRuntime, isWorktreeRuntime, ownsDaytonaSandbox } from "@/common/types/runtime";
+import { DAYTONA_ARCHIVE_NEEDS_USER } from "@/common/constants/daytona";
 import {
   TaskHandleStore,
   WORKSPACE_TURN_TASK_ID_PREFIX,
@@ -691,6 +695,22 @@ class LiveWorkspaceTurnRegistrations extends Map<string, LiveWorkspaceTurnRegist
     if (deleted) this.onReleased(workspaceId);
     return deleted;
   }
+}
+
+/**
+ * Why an agent-driven archive must refuse a permanent remote deletion: a dedicated Coder
+ * workspace under the Coder "delete" policy, or the Daytona sandbox a workspace created, which
+ * archive always deletes. Unarchive cannot recreate either.
+ */
+function remoteBoxDeletionRefusal(
+  metadata: { runtimeConfig?: RuntimeConfig; taskIsolation?: "fork" | "none" },
+  isDedicatedCoderWorkspace: boolean,
+  coderArchiveBehavior: CoderWorkspaceArchiveBehavior
+): string | undefined {
+  if (isDedicatedCoderWorkspace && coderArchiveBehavior === "delete") {
+    return 'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop".';
+  }
+  return ownsDaytonaSandbox(metadata) ? DAYTONA_ARCHIVE_NEEDS_USER : undefined;
 }
 
 export class WorkspaceTurnManager {
@@ -4019,13 +4039,17 @@ export class WorkspaceTurnManager {
             targetRuntimeConfig.coder != null &&
             targetRuntimeConfig.coder.existingWorkspace !== true &&
             (targetRuntimeConfig.coder.workspaceName?.trim() ?? "") !== "";
-          if (isDedicatedCoderWorkspace && coderArchiveBehavior === "delete") {
+          const remoteDeletion = remoteBoxDeletionRefusal(
+            resolved.metadata,
+            isDedicatedCoderWorkspace,
+            coderArchiveBehavior
+          );
+          if (remoteDeletion) {
             return Ok({
               status: "error",
               action: "archive",
               ...this.lifecycleTargetFields(resolved),
-              error:
-                'Coder workspace archive behavior is set to "Delete", which would permanently delete the dedicated remote Coder workspace without user confirmation (unarchive cannot recreate it). Ask the user to archive this workspace manually or change the Coder archive behavior to "Keep" or "Stop".',
+              error: remoteDeletion,
             });
           }
 

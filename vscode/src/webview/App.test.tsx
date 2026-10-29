@@ -2725,6 +2725,9 @@ describe("vscode webview sub-agent tasks strip (#5109)", () => {
   const idle = { activeBashMonitorCount: 0, streaming: false, activeWorkflowRunIds: [] };
   const strip = (view: ReturnType<typeof render>) =>
     view.container.querySelector('[data-component="SubAgentTasksDecoration"]');
+  // The live line's sub-agents chip (#7689) names its counts in its accessible name.
+  const chipName = (view: ReturnType<typeof render>) =>
+    view.container.querySelector('[data-activity-id="sub-agents"]')?.getAttribute("aria-label");
 
   test("follows the host's live list and activity, and a row selects the sub-agent", async () => {
     const bridge = new TestBridge();
@@ -2733,20 +2736,23 @@ describe("vscode webview sub-agent tasks strip (#5109)", () => {
     expect(strip(view)).toBeNull();
 
     await bridge.emit({ type: "workspaces", workspaces: [parent, child({ taskStatus: "running" })] });
-    expect(strip(view)?.textContent).toContain("1 sub-agent · 1 active");
+    expect(chipName(view)).toBe("1 sub-agent, 1 active");
     await act(async () => {
       fireEvent.click(view.getByRole("button", { name: /1 sub-agent/ }));
       await Promise.resolve();
     });
+    // The open panel's heading carries the activity.
+    expect(strip(view)?.textContent).toContain("1 active");
     fireEvent.click(view.getByRole("button", { name: /Explorer/ }));
     expect(bridge.sent.at(-1)).toEqual({ type: "selectWorkspace", workspaceId: "ws-child" });
 
     // The host re-posts the list when the task reports; an armed monitor keeps it active.
     await bridge.emit({ type: "workspaces", workspaces: [parent, child({ taskStatus: "reported" })] });
-    expect(strip(view)?.textContent).toContain("1 sub-agent · inactive");
+    expect(chipName(view)).toBe("1 sub-agent");
+    expect(strip(view)?.textContent).toContain("inactive");
     const activity = { [parent.id]: idle, "ws-child": { ...idle, activeBashMonitorCount: 1 } };
     await bridge.emit({ type: "workspaceActivity", workspaceId: parent.id, activity });
-    expect(strip(view)?.textContent).toContain("1 sub-agent · 1 active");
+    expect(chipName(view)).toBe("1 sub-agent, 1 active");
     expect(view.getByRole("button", { name: /Explorer/ }).textContent).toContain("Monitoring");
 
     // Removed or archived descendants leave the strip.
@@ -2761,7 +2767,7 @@ describe("vscode webview sub-agent tasks strip (#5109)", () => {
     await selectWorkspace(bridge, [], parent);
     const activity = { [parent.id]: { ...idle, activeWorkflowRunIds: ["wfr_abcdef123456"] } };
     await bridge.emit({ type: "workspaceActivity", workspaceId: parent.id, activity });
-    expect(strip(view)?.textContent).toContain("running");
+    expect(chipName(view)).toContain("running");
   });
 });
 
@@ -3173,7 +3179,8 @@ describe("vscode webview background processes strip (#5092)", () => {
     const onRender = () => {
       const text = document.body.textContent ?? "";
       commits.push({
-        rows: text.includes("background bash"),
+        // The live line's bash chip shows only a count, so look for the chip itself.
+        rows: document.body.querySelector('[data-activity-id="background-bashes"]') !== null,
         error: text.includes("terminate refused"),
       });
     };
@@ -3252,6 +3259,141 @@ describe("vscode webview background processes strip (#5092)", () => {
   });
 });
 
+describe("vscode webview live line (#7689)", () => {
+  let cleanupDom: (() => void) | null = null;
+
+  beforeEach(() => {
+    cleanupDom = installDom();
+  });
+
+  afterEach(() => {
+    cleanup();
+    cleanupDom?.();
+    cleanupDom = null;
+  });
+
+  // Workspaces no other test selects: the background bash store keeps last-known processes.
+  const parentOf = (id: string): UiWorkspace => ({ ...WORKSPACE, id, workspaceName: id });
+  const childOf = (parent: UiWorkspace): UiWorkspace => ({
+    ...WORKSPACE,
+    id: `${parent.id}-child`,
+    workspaceName: "Explorer",
+    ai: { parentWorkspaceId: parent.id },
+    task: { taskStatus: "running" },
+  });
+  const chip = (view: ReturnType<typeof render>, id: string) => {
+    const element = view.container.querySelector<HTMLElement>(`[data-activity-id="${id}"]`);
+    if (!element) throw new Error(`the ${id} chip is not rendered`);
+    return element;
+  };
+  const expanded = (view: ReturnType<typeof render>, id: string) =>
+    chip(view, id).getAttribute("aria-expanded");
+  const click = async (element: Element) => {
+    await act(async () => {
+      fireEvent.click(element);
+      await Promise.resolve();
+    });
+  };
+  const openParent = async (bridge: TestBridge, parent: UiWorkspace) => {
+    await selectWorkspace(bridge, [], parent);
+    await bridge.emit({ type: "workspaces", workspaces: [parent, childOf(parent)] });
+  };
+  const chat = (bridge: TestBridge, workspaceId: string, event: Record<string, unknown>) =>
+    bridge.emit({ type: "chatEvent", workspaceId, event });
+
+  test("the sub-agents and bash chips share one line and its one panel", async () => {
+    const parent = parentOf("ws-line-chips");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await openParent(bridge, parent);
+    await emitBackgroundBashes(bridge, parent.id, [runningProcess]);
+
+    const lines = view.container.querySelectorAll('[data-component="ChatActivityLine"]');
+    expect(lines).toHaveLength(1);
+    expect(lines[0].contains(chip(view, "sub-agents"))).toBe(true);
+    expect(lines[0].contains(chip(view, "background-bashes"))).toBe(true);
+
+    await click(chip(view, "sub-agents"));
+    expect(expanded(view, "sub-agents")).toBe("true");
+    expect(view.queryByRole("button", { name: /Explorer/ }) !== null).toBe(true);
+
+    await click(chip(view, "background-bashes"));
+    expect(expanded(view, "sub-agents")).toBe("false");
+    expect(expanded(view, "background-bashes")).toBe("true");
+    expect(view.queryByRole("button", { name: /Explorer/ }) === null).toBe(true);
+    expect(view.queryByText("sleep 600") !== null).toBe(true);
+  });
+
+  test("the sub-agents chord opens its panel from the composer", async () => {
+    const parent = parentOf("ws-line-chord");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await openParent(bridge, parent);
+    const textarea = view.container.querySelector("textarea");
+    if (!textarea) throw new Error("the composer is not rendered");
+    textarea.focus();
+    expect(expanded(view, "sub-agents")).toBe("false");
+
+    const chord = new window.KeyboardEvent("keydown", {
+      key: "a",
+      code: "KeyA",
+      ctrlKey: true,
+      altKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    // happy-dom infers AltGraph from any Ctrl+Alt chord; model physical Ctrl+Alt here.
+    Object.defineProperty(chord, "getModifierState", { value: () => false });
+    await act(async () => {
+      fireEvent(textarea, chord);
+      await Promise.resolve();
+    });
+    expect(expanded(view, "sub-agents")).toBe("true");
+    const explorer = view.queryByRole("button", { name: /Explorer/ });
+    expect(explorer !== null).toBe(true);
+  });
+
+  test("the line keeps its chips and open panel across a turn, but not across workspaces", async () => {
+    const parent = parentOf("ws-line-turn");
+    const other = parentOf("ws-line-turn-other");
+    const bridge = new TestBridge();
+    const view = render(<App bridge={bridge} />);
+    await openParent(bridge, parent);
+    // Between turns the line still shows the chip, without a turn status.
+    expect(view.queryByRole("button", { name: "Stop streaming" }) === null).toBe(true);
+    await click(chip(view, "sub-agents"));
+    expect(expanded(view, "sub-agents")).toBe("true");
+
+    await chat(bridge, parent.id, {
+      type: "stream-start",
+      workspaceId: parent.id,
+      messageId: "a1",
+      model: "anthropic:claude-sonnet-4-5",
+      historySequence: 1,
+      startTime: 1,
+    });
+    expect(view.queryByRole("button", { name: "Stop streaming" }) !== null).toBe(true);
+    await chat(bridge, parent.id, {
+      type: "stream-abort",
+      workspaceId: parent.id,
+      messageId: "a1",
+      abortReason: "user",
+    });
+    expect(view.queryByRole("button", { name: "Stop streaming" }) === null).toBe(true);
+    // The turn starting and ending did not remount the chip, which would close its panel.
+    expect(expanded(view, "sub-agents")).toBe("true");
+
+    await bridge.emit({
+      type: "workspaces",
+      workspaces: [parent, childOf(parent), other, childOf(other)],
+    });
+    await bridge.emit({ type: "setSelectedWorkspace", workspaceId: other.id });
+    await chat(bridge, other.id, { type: "caught-up" });
+    await emitBackgroundBashes(bridge, other.id);
+    expect(expanded(view, "sub-agents")).toBe("false");
+  });
+});
+
 // #5202: like desktop ChatPane, the first paint after a selection waits for the background bash
 // state, so the dock never grows under a transcript the user is already reading.
 describe("vscode webview first reveal (#5202)", () => {
@@ -3302,7 +3444,7 @@ describe("vscode webview first reveal (#5202)", () => {
         commits.push({
           transcript: text.includes("earlier question"),
           held: text.includes("held follow-up"),
-          strip: text.includes("background bash"),
+          strip: document.body.querySelector('[data-activity-id="background-bashes"]') !== null,
           status: document.body.querySelector('[aria-label="Stop streaming"]') !== null,
         });
       };

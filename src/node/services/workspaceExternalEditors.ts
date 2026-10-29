@@ -10,9 +10,14 @@
 import * as path from "path";
 import type { Result } from "@/common/types/result";
 import { Ok, Err } from "@/common/types/result";
+import { isSSHRuntime } from "@/common/types/runtime";
 import { isWorkspaceArchived } from "@/common/utils/archive";
 import { getErrorMessage } from "@/common/utils/errors";
 import type { Config } from "@/node/config";
+import {
+  createRuntimeForWorkspace,
+  ensureDaytonaSandboxReady,
+} from "@/node/runtime/runtimeHelpers";
 import type { HostFiles } from "@/node/services/hostFiles/hostFiles";
 import { log } from "@/node/services/log";
 import { findWorkspaceEntry } from "@/node/services/taskUtils";
@@ -22,6 +27,10 @@ import { MutexMap } from "@/node/utils/concurrency/mutexMap";
 import { isErrnoWithCode } from "@/node/utils/fs";
 
 const EXTERNAL_EDITOR_ROLLBACK_TOMBSTONE_CAP = 1024;
+
+function isHomeRelativePath(remotePath: string | null | undefined): remotePath is string {
+  return remotePath === "~" || remotePath?.startsWith("~/") === true;
+}
 
 export interface WorkspaceExternalEditorsDeps {
   readonly config: Pick<Config, "sessionsDir" | "loadConfigOrDefault">;
@@ -139,10 +148,20 @@ export class WorkspaceExternalEditors {
    * first refuses the open while an open recorded first is observed by the sink's
    * untrackable-app check before snapshot capture.
    */
-  async recordExternalEditorOpen(workspaceId: string, launchToken: string): Promise<Result<void>> {
+  async recordExternalEditorOpen(
+    workspaceId: string,
+    launchToken: string,
+    remotePath?: string | null
+  ): Promise<Result<{ remotePath: string } | undefined>> {
     const admitted = await this.recordExternalEditorOpenForLaunch(workspaceId);
     if (!admitted.success) {
       return admitted;
+    }
+    // Before the tombstone check below: a rollback that arrives meanwhile is still consumed.
+    const resolved = await this.resolveEditorRemotePath(workspaceId, remotePath);
+    if (!resolved.success) {
+      await admitted.data.rollbackAfterFailedLaunch();
+      return resolved;
     }
     // A rollback for this token that raced ahead of the recording (the renderer saw the RPC
     // reject while this handler was still persisting the marker) is consumed here, in the
@@ -165,7 +184,37 @@ export class WorkspaceExternalEditors {
       workspaceId,
       rollback: admitted.data.rollbackAfterFailedLaunch,
     });
-    return Ok(undefined);
+    return Ok(resolved.data);
+  }
+
+  /**
+   * SSH workspaces whose runtime is provisioned after creation (Daytona, Coder) keep the
+   * unresolved default srcBaseDir (`~/mux`), so their checkout path starts with `~`. An
+   * editor's ssh deep link needs it absolute: resolve it on the host, which the admission
+   * above has made ready. Older records keep working, since nothing is rewritten.
+   */
+  private async resolveEditorRemotePath(
+    workspaceId: string,
+    remotePath: string | null | undefined
+  ): Promise<Result<{ remotePath: string } | undefined>> {
+    if (!isHomeRelativePath(remotePath)) return Ok(undefined);
+    const entry = findWorkspaceEntry(this.deps.config.loadConfigOrDefault(), workspaceId);
+    const runtimeConfig = entry?.workspace.runtimeConfig;
+    if (entry == null || !isSSHRuntime(runtimeConfig)) return Ok(undefined);
+    try {
+      const runtime = createRuntimeForWorkspace({
+        id: workspaceId,
+        runtimeConfig,
+        projectPath: entry.projectPath,
+        name: entry.workspace.name ?? workspaceId,
+        namedWorkspacePath: entry.workspace.path,
+      });
+      return Ok({ remotePath: await runtime.resolvePath(remotePath) });
+    } catch (error) {
+      return Err(
+        `Could not resolve ${remotePath} on the workspace's host: ${getErrorMessage(error)}`
+      );
+    }
   }
 
   /**
@@ -343,6 +392,24 @@ export class WorkspaceExternalEditors {
     ) {
       await lease.release();
       return Err(`Workspace is archived: ${workspaceId}. Unarchive it before opening an editor.`);
+    }
+    // The editor connects to a Daytona sandbox's ssh alias on its own, so start a stopped
+    // sandbox and refresh its token first. Only under the lease, as for a native terminal: an
+    // archive cannot run meanwhile, so it cannot see the sandbox stopped and leave it running.
+    // Before the durable marker write, so a refused open cannot gate future snapshot archives.
+    const { workspace } = workspaceEntry;
+    if (workspace.runtimeConfig != null) {
+      const ready = await ensureDaytonaSandboxReady({
+        id: workspaceId,
+        runtimeConfig: workspace.runtimeConfig,
+        projectPath: workspaceEntry.projectPath,
+        name: workspace.name ?? workspaceId,
+        namedWorkspacePath: workspace.path,
+      });
+      if (!ready.success) {
+        await lease.release();
+        return Err(ready.error);
+      }
     }
     // Before any durable effect: one share per workspace is kept, after a failed launch too
     // (fail closed).

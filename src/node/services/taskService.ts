@@ -848,6 +848,149 @@ interface TaskLaunchPlan {
   launchLease?: WorkspaceUseLease;
 }
 
+/** A Task.create request after validation, read before the global mutex is taken. */
+interface TaskCreateRequest {
+  readonly args: TaskCreateArgs;
+  readonly parentWorkspaceId: string;
+  readonly prompt: string;
+  readonly agentId: string;
+  /** Legacy alias of agentId, for on-disk compatibility. */
+  readonly agentType: string;
+  readonly normalizedBestOf: TaskCreateArgs["bestOf"];
+  readonly taskDesktopOwnerWorkspaceId: string | undefined;
+}
+
+/** The request plus the parent facts Task.create reads once under the global mutex. */
+interface TaskCreateParent extends TaskCreateRequest {
+  readonly parentMeta: WorkspaceMetadata;
+  readonly cfg: ProjectsConfig;
+  readonly projectPluginsTrusted: boolean;
+  readonly taskSettings: TaskSettings;
+  readonly parentEntry: ReturnType<typeof findWorkspaceEntry>;
+  readonly legacyParentRow: LegacyParentRow | undefined;
+  readonly parentIsScratch: boolean;
+  readonly configProjectPath: string;
+}
+
+/** The parent facts plus the new task's identity, runtime and checkout choice. */
+interface TaskCreatePlacement extends TaskCreateParent {
+  readonly activeCount: number;
+  readonly shouldQueue: boolean;
+  readonly taskId: string;
+  readonly workspaceName: string;
+  readonly parentRuntimeConfig: RuntimeConfig;
+  readonly taskRuntimeConfig: RuntimeConfig;
+  readonly runtime: Runtime;
+  readonly parentWorkspacePath: string;
+  readonly taskRuntimeMode: ReturnType<typeof getRuntimeType>;
+  readonly parentIsMultiProject: boolean;
+  readonly useSharedWorkspace: boolean;
+}
+
+/** Everything Task.create decided before it queues or launches the task. */
+interface TaskCreatePlan extends TaskCreatePlacement {
+  readonly parentBranchName: string | undefined;
+  readonly skipInitHook: boolean;
+  readonly taskModelString: string;
+  readonly canonicalModel: string;
+  readonly effectiveThinkingLevel: ThinkingLevel;
+  readonly effectiveReasoningMode: OpenAIReasoningMode | undefined;
+  readonly taskAiPins: TaskAiPins;
+  readonly createdAt: string;
+}
+
+/** Validates Task.create's bestOf: undefined when absent, else the normalized group slot. */
+function normalizeTaskCreateBestOf(
+  bestOf: TaskCreateArgs["bestOf"]
+): Result<TaskCreateArgs["bestOf"], string> {
+  if (!bestOf) {
+    return Ok(undefined);
+  }
+  const groupId = coerceNonEmptyString(bestOf.groupId);
+  if (!groupId) {
+    return Err("Task.create: bestOf.groupId is required when bestOf is provided");
+  }
+  if (!Number.isInteger(bestOf.index) || bestOf.index < 0) {
+    return Err("Task.create: bestOf.index must be a non-negative integer");
+  }
+  if (!Number.isInteger(bestOf.total) || bestOf.total < 2) {
+    return Err("Task.create: bestOf.total must be an integer >= 2");
+  }
+  if (bestOf.index >= bestOf.total) {
+    return Err("Task.create: bestOf.index must be less than bestOf.total");
+  }
+
+  return Ok({
+    groupId,
+    index: bestOf.index,
+    total: bestOf.total,
+  });
+}
+
+/**
+ * Whether a task shares its parent's checkout: a scratch parent, or isolation: "none" on a
+ * runtime that supports it for a single-project parent. A multi-project parent there is refused.
+ */
+function decideSharedTaskWorkspace(
+  isolation: TaskCreateArgs["isolation"],
+  taskRuntimeMode: ReturnType<typeof getRuntimeType>,
+  parentIsScratch: boolean,
+  parentIsMultiProject: boolean
+): Result<boolean, string> {
+  if (
+    isolation === "none" &&
+    runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+    parentIsMultiProject
+  ) {
+    return Err(`Task.create: ${MULTI_PROJECT_SHARED_ISOLATION_ERROR}`);
+  }
+  return Ok(
+    parentIsScratch ||
+      (isolation === "none" &&
+        runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+        !parentIsMultiProject)
+  );
+}
+
+/** A direct launch's materialized checkout, read by the steps after its entry is persisted. */
+interface TaskLaunchCheckout {
+  readonly initLogger: InitLogger;
+  readonly workspacePath: string;
+  readonly trunkBranch: string;
+  readonly forkedRuntimeConfig: RuntimeConfig;
+  readonly runtimeForTaskWorkspace: Runtime;
+}
+
+/** What a direct launch materialized, before its entry is persisted. */
+interface MaterializedTaskCheckout extends TaskLaunchCheckout {
+  readonly forkedFromSource: boolean;
+  readonly inheritedProjects: ProjectRef[] | undefined;
+  /**
+   * Written with the task's row (appendLaunchedTaskEntry), never before it: a fork rollback
+   * elsewhere restores this parent mark only while no row uses the shared workspace (#5114).
+   */
+  readonly sourceRuntimeConfigUpdate: RuntimeConfig | undefined;
+}
+
+/**
+ * A direct Task.create launch's progress. The launch writes it as it advances and its failure
+ * path (failTaskLaunch) reads it, so it is one mutable record: a copy would read stale values.
+ */
+interface TaskLaunchState {
+  materializedCheckout: { initLogger: InitLogger; runtime: Runtime } | undefined;
+  readonly attemptId: string;
+  /** Unset until the entry is persisted: a failure before that only rolls the checkout back. */
+  launchAttempt: OwnedTaskAttempt | undefined;
+  sendAdmitted: boolean;
+}
+
+/** What failTaskLaunch's CAS on the task's row found. */
+interface TaskLaunchFailureMark {
+  superseded: boolean;
+  transitionedToInterrupted: boolean;
+  parentWorkspaceId: string | undefined;
+}
+
 /** Release a launch lease; a failed release is logged (the lock dies with the process anyway). */
 async function releaseLaunchLease(taskId: string, lease: WorkspaceUseLease): Promise<void> {
   await lease.release().catch((error: unknown) => {
@@ -1768,6 +1911,160 @@ function workflowWakeGroupKey(agent: WorkflowWakeInitiatingAgent): string {
 // workspace-turn) send batch. Group keys start with a non-empty agentId and the empty string
 // keys the unpinned group, so a leading \u0000 cannot collide.
 const NON_WORKFLOW_WAKE_BACKOFF_KEY = "\u0000non-workflow";
+
+/** A queued workflow run's terminal wake prompt, built for one terminal-attention drain. */
+interface TerminalWorkflowWakeCandidate {
+  runId: string;
+  run: WorkflowRunRecord;
+  prompt: string;
+  initiatingAgent?: WorkflowWakeInitiatingAgent;
+}
+
+/** A workspace-turn notification that can wake its owner, and the handle id the wake names. */
+interface TerminalWorkspaceTurnWakeCandidate {
+  notification: TerminalAttentionNotification;
+  publicAwaitId: string;
+}
+
+/** A terminal-attention drain's pending notifications and queued workflow runs, read at its start. */
+interface TerminalDrainSnapshot {
+  readonly ownerWorkspaceId: string;
+  readonly freshSubagentAttentionTurns: ReadonlyMap<string, symbol>;
+  /** Without legacy workflow records; acknowledgeTerminalDrainReports drops acknowledged reports. */
+  readonly pending: readonly TerminalAttentionNotification[];
+  readonly queuedWorkflowRunIds: readonly string[];
+}
+
+/** A drain's snapshot plus the owner's config entry, which exists and is not archived. */
+interface TerminalDrainOwner extends TerminalDrainSnapshot {
+  readonly cfg: ReturnType<Config["loadConfigOrDefault"]>;
+  readonly entry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
+}
+
+/** A drain's owner after its agent reports were acknowledged and their messages ensured. */
+interface TerminalDrainAgentAttention extends TerminalDrainOwner {
+  readonly taskIndex: AgentTaskIndex;
+  readonly agentNotifications: readonly TerminalAttentionNotification[];
+  readonly deliverableAgentNotificationIds: ReadonlySet<string>;
+  readonly latestMessageTimestampByTaskId: ReadonlyMap<string, number>;
+}
+
+/** A terminal-attention drain's candidates, collected after the owner was seen idle. */
+interface TerminalDrainCandidates extends TerminalDrainAgentAttention {
+  readonly workspaceTurnCandidates: readonly TerminalWorkspaceTurnWakeCandidate[];
+  readonly deliverableWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[];
+  /** A recent send of the non-workflow batch was rejected: the batch sits out this drain. */
+  readonly nonWorkflowSendBackedOff: boolean;
+  readonly hasNonWorkflowDeliverables: boolean;
+  readonly workspaceTurnMuxMetadata: Awaited<
+    ReturnType<WorkspaceTurnManager["getActiveWorkspaceTurnMuxMetadataForWorkspace"]>
+  >;
+}
+
+/** A drain's candidates plus the wake's caller restrictions and the reread candidate records. */
+interface TerminalWakeRevalidation extends TerminalDrainCandidates {
+  readonly wakeRestrictions: Awaited<
+    ReturnType<TaskService["resolveTerminalWakeCallerSendRestrictions"]>
+  >;
+  /** The workspace-turn candidates' records, reread in one batch, by candidate index. */
+  readonly candidateRecords: ReadonlyArray<WorkspaceTurnTaskHandleRecord | null>;
+}
+
+/**
+ * A terminal-attention drain's composed wake, read by the delivery steps (deliverTerminalWake).
+ * Every field is final once the drain has partitioned its candidates and composed the prompt.
+ */
+interface TerminalWakeDelivery extends TerminalWakeRevalidation {
+  /** The selected launch-identity group; empty when no workflow group revalidated. */
+  readonly currentWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[];
+  readonly workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;
+  readonly supersededWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[];
+  readonly suppressedNotificationIds: readonly string[];
+  /** The sub-agent and workspace-turn notifications this wake delivers. */
+  readonly effectivePending: readonly TerminalAttentionNotification[];
+  readonly prompt: string;
+  readonly resumeOptions: ParentAutoResumeOptions;
+  readonly effectiveStrictPin: SendMessageOptions["strictAgentResolution"];
+}
+
+type TerminalWakeSendResult = Awaited<ReturnType<WorkspaceHost["sendMessage"]>>;
+
+/**
+ * Picks the newest launch-identity group among the remaining workflow wakes. The wakes without an
+ * initiating agent form one group, picked once no agent-bound wake remains.
+ */
+function pickNewestWorkflowWakeGroup(
+  remainingWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[]
+): {
+  groupAgent: WorkflowWakeInitiatingAgent | undefined;
+  groupKey: string | undefined;
+  groupCandidates: TerminalWorkflowWakeCandidate[];
+} {
+  let groupAgent: WorkflowWakeInitiatingAgent | undefined;
+  for (const candidate of remainingWorkflowPrompts) {
+    const agent = candidate.initiatingAgent;
+    if (agent != null && (groupAgent == null || agent.createdAtMs > groupAgent.createdAtMs)) {
+      groupAgent = agent;
+    }
+  }
+  const groupKey = groupAgent != null ? workflowWakeGroupKey(groupAgent) : undefined;
+  const groupCandidates = remainingWorkflowPrompts.filter((candidate) =>
+    groupKey == null
+      ? candidate.initiatingAgent == null
+      : candidate.initiatingAgent != null &&
+        workflowWakeGroupKey(candidate.initiatingAgent) === groupKey
+  );
+  return { groupAgent, groupKey, groupCandidates };
+}
+
+/** Splits a workflow group by its revalidation verdicts; a "defer" wake lands in neither list. */
+function classifyWorkflowGroupRevalidation(
+  groupCandidates: readonly TerminalWorkflowWakeCandidate[],
+  groupRevalidation: ReadonlyArray<"deliverable" | "superseded" | "defer">
+): {
+  groupCurrent: TerminalWorkflowWakeCandidate[];
+  groupSuperseded: TerminalWorkflowWakeCandidate[];
+} {
+  const groupCurrent: TerminalWorkflowWakeCandidate[] = [];
+  const groupSuperseded: TerminalWorkflowWakeCandidate[] = [];
+  groupCandidates.forEach((candidate, index) => {
+    const verdict = groupRevalidation[index];
+    if (verdict === "deliverable") {
+      groupCurrent.push(candidate);
+    } else if (verdict === "superseded") {
+      groupSuperseded.push(candidate);
+    }
+  });
+  return { groupCurrent, groupSuperseded };
+}
+
+/**
+ * Partitions the reread workspace-turn candidates: a suppressed handle is marked superseded later,
+ * a backed-off non-workflow batch sits out the drain, and every other candidate is delivered.
+ */
+function partitionWorkspaceTurnWakeCandidates(revalidation: TerminalWakeRevalidation): {
+  deliverableWorkspaceTurnNotificationIds: Set<string>;
+  publicAwaitIds: string[];
+  suppressedNotificationIds: string[];
+} {
+  const deliverableWorkspaceTurnNotificationIds = new Set<string>();
+  const publicAwaitIds: string[] = [];
+  const suppressedNotificationIds: string[] = [];
+  revalidation.workspaceTurnCandidates.forEach((candidate, index) => {
+    const record = revalidation.candidateRecords[index];
+    if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
+      suppressedNotificationIds.push(candidate.notification.id);
+      return;
+    }
+    if (revalidation.nonWorkflowSendBackedOff) {
+      // Backed off: sits out this drain and stays pending for the sweep-cadence retry.
+      return;
+    }
+    deliverableWorkspaceTurnNotificationIds.add(candidate.notification.id);
+    publicAwaitIds.push(candidate.publicAwaitId);
+  });
+  return { deliverableWorkspaceTurnNotificationIds, publicAwaitIds, suppressedNotificationIds };
+}
 
 function isTypedWorkspaceEvent(value: unknown, type: string): boolean {
   return (
@@ -6716,6 +7013,24 @@ export class TaskService implements AgentTaskIntegration {
     args: TaskCreateArgs,
     parentWorkspaceId: string
   ): Promise<Result<TaskCreateResult, string>> {
+    const request = this.readTaskCreateRequest(args, parentWorkspaceId);
+    if (!request.success) {
+      return request;
+    }
+
+    // Held until the create settles: every step below runs under it, and none takes it again (the
+    // mutex is not reentrant). The step call must be awaited here: a bare `return promise` would
+    // dispose the lock before the promise settles.
+    await using _lock = await this.mutex.acquire();
+
+    return await this.loadTaskCreateParent(request.data);
+  }
+
+  /** Validates a Task.create request before the global mutex is taken. */
+  private readTaskCreateRequest(
+    args: TaskCreateArgs,
+    parentWorkspaceId: string
+  ): Result<TaskCreateRequest, string> {
     if (args.kind !== "agent") {
       return Err("Task.create: unsupported kind");
     }
@@ -6735,28 +7050,9 @@ export class TaskService implements AgentTaskIntegration {
       return Err(`Task.create: invalid agentId (${normalizedAgentId})`);
     }
 
-    let normalizedBestOf: TaskCreateArgs["bestOf"];
-    const bestOf = args.bestOf;
-    if (bestOf) {
-      const groupId = coerceNonEmptyString(bestOf.groupId);
-      if (!groupId) {
-        return Err("Task.create: bestOf.groupId is required when bestOf is provided");
-      }
-      if (!Number.isInteger(bestOf.index) || bestOf.index < 0) {
-        return Err("Task.create: bestOf.index must be a non-negative integer");
-      }
-      if (!Number.isInteger(bestOf.total) || bestOf.total < 2) {
-        return Err("Task.create: bestOf.total must be an integer >= 2");
-      }
-      if (bestOf.index >= bestOf.total) {
-        return Err("Task.create: bestOf.index must be less than bestOf.total");
-      }
-
-      normalizedBestOf = {
-        groupId,
-        index: bestOf.index,
-        total: bestOf.total,
-      };
+    const normalizedBestOf = normalizeTaskCreateBestOf(args.bestOf);
+    if (!normalizedBestOf.success) {
+      return normalizedBestOf;
     }
 
     const agentId = parsedAgentId.data;
@@ -6767,24 +7063,44 @@ export class TaskService implements AgentTaskIntegration {
     } catch (error) {
       return Err(getErrorMessage(error));
     }
-    const reserveDesktop = <T>(reserve: () => Promise<T>): Promise<T> =>
-      taskDesktopOwnerWorkspaceId == null
-        ? reserve()
-        : this.desktopInputCoordinator.withReservation(
-            taskDesktopOwnerWorkspaceId,
-            taskId,
-            reserve
-          );
 
-    await using _lock = await this.mutex.acquire();
+    return Ok({
+      args,
+      parentWorkspaceId,
+      prompt,
+      agentId,
+      agentType,
+      normalizedBestOf: normalizedBestOf.data,
+      taskDesktopOwnerWorkspaceId,
+    });
+  }
 
+  /**
+   * Task.create under the global mutex: reads the parent, then chains to countAndPlaceTask and
+   * the later steps. Each step starts the next in the same tick as its own last await, so no call
+   * runs later than it did inline.
+   */
+  private async loadTaskCreateParent(
+    request: TaskCreateRequest
+  ): Promise<Result<TaskCreateResult, string>> {
     // Validate parent exists and fetch runtime context.
-    const parentMetaResult = await this.aiService.getWorkspaceMetadata(parentWorkspaceId);
+    const parentMetaResult = await this.aiService.getWorkspaceMetadata(request.parentWorkspaceId);
     if (!parentMetaResult.success) {
       return Err(`Task.create: parent workspace not found (${parentMetaResult.error})`);
     }
-    const parentMeta = parentMetaResult.data;
+    const parent = this.readTaskCreateParent(request, parentMetaResult.data);
+    if (!parent.success) {
+      return parent;
+    }
+    return this.countAndPlaceTask(parent.data);
+  }
 
+  /** Reads the parent's config facts once, and refuses an archived parent or untrusted project. */
+  private readTaskCreateParent(
+    request: TaskCreateRequest,
+    parentMeta: WorkspaceMetadata
+  ): Result<TaskCreateParent, string> {
+    const { parentWorkspaceId } = request;
     // Enforce nesting depth.
     const cfg = this.config.loadConfigOrDefault();
     // #6426: once per create, from the loaded config.
@@ -6813,6 +7129,60 @@ export class TaskService implements AgentTaskIntegration {
       );
     }
 
+    return Ok({
+      ...request,
+      parentMeta,
+      cfg,
+      projectPluginsTrusted,
+      taskSettings,
+      parentEntry,
+      legacyParentRow,
+      parentIsScratch,
+      configProjectPath,
+    });
+  }
+
+  /** Refuses a stopped or too-deep parent, then counts the active tasks and names the new task. */
+  private async countAndPlaceTask(
+    parent: TaskCreateParent
+  ): Promise<Result<TaskCreateResult, string>> {
+    const { cfg, taskSettings, agentId } = parent;
+    const refusal = this.refuseTaskCreateUnderParent(parent);
+    if (refusal !== undefined) {
+      return refusal;
+    }
+
+    // Enforce parallelism (global).
+    const activeCount =
+      this.countActiveAgentTasks(cfg) +
+      (await this.getWorkspaceTurnManager().countActiveWorkspaceTurns());
+    const shouldQueue = activeCount >= taskSettings.maxParallelAgentTasks;
+
+    const taskId = this.config.generateStableId();
+    const workspaceName = buildAgentWorkspaceName(agentId, taskId);
+
+    const nameValidation = validateWorkspaceName(workspaceName);
+    if (!nameValidation.valid) {
+      return Err(
+        `Task.create: generated workspace name invalid (${nameValidation.error ?? "unknown error"})`
+      );
+    }
+
+    const placement = this.placeTaskWorkspace(parent, {
+      activeCount,
+      shouldQueue,
+      taskId,
+      workspaceName,
+    });
+    if (!placement.success) {
+      return placement;
+    }
+    return this.readTaskCreateParentBranch(placement.data);
+  }
+
+  /** The parent-state and nesting-depth gates: the refusal, or undefined to admit the child. */
+  private refuseTaskCreateUnderParent(parent: TaskCreateParent): Result<never, string> | undefined {
+    const { cfg, parentEntry, parentWorkspaceId, taskSettings } = parent;
     if (
       parentEntry?.workspace.taskStatus === "interrupted" &&
       !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
@@ -6834,22 +7204,15 @@ export class TaskService implements AgentTaskIntegration {
       );
     }
 
-    // Enforce parallelism (global).
-    const activeCount =
-      this.countActiveAgentTasks(cfg) +
-      (await this.getWorkspaceTurnManager().countActiveWorkspaceTurns());
-    const shouldQueue = activeCount >= taskSettings.maxParallelAgentTasks;
+    return undefined;
+  }
 
-    const taskId = this.config.generateStableId();
-    const workspaceName = buildAgentWorkspaceName(agentId, taskId);
-
-    const nameValidation = validateWorkspaceName(workspaceName);
-    if (!nameValidation.valid) {
-      return Err(
-        `Task.create: generated workspace name invalid (${nameValidation.error ?? "unknown error"})`
-      );
-    }
-
+  /** Builds the task's runtime from the parent's and decides whether it shares the checkout. */
+  private placeTaskWorkspace(
+    parent: TaskCreateParent,
+    counted: Pick<TaskCreatePlacement, "activeCount" | "shouldQueue" | "taskId" | "workspaceName">
+  ): Result<TaskCreatePlacement, string> {
+    const { args, parentMeta, parentEntry, parentIsScratch } = parent;
     const parentRuntimeConfig = parentMeta.runtimeConfig;
     const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
 
@@ -6880,18 +7243,47 @@ export class TaskService implements AgentTaskIntegration {
     // runtimes are refused (see MULTI_PROJECT_SHARED_ISOLATION_ERROR); otherwise fall back to forking.
     const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
     const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
-    if (
-      args.isolation === "none" &&
-      runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+    const sharedWorkspace = decideSharedTaskWorkspace(
+      args.isolation,
+      taskRuntimeMode,
+      parentIsScratch,
       parentIsMultiProject
-    ) {
-      return Err(`Task.create: ${MULTI_PROJECT_SHARED_ISOLATION_ERROR}`);
+    );
+    if (!sharedWorkspace.success) {
+      return sharedWorkspace;
     }
-    const useSharedWorkspace =
-      parentIsScratch ||
-      (args.isolation === "none" &&
-        runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
-        !parentIsMultiProject);
+    return Ok({
+      ...parent,
+      ...counted,
+      parentRuntimeConfig,
+      taskRuntimeConfig,
+      runtime,
+      parentWorkspacePath,
+      taskRuntimeMode,
+      parentIsMultiProject,
+      useSharedWorkspace: sharedWorkspace.data,
+    });
+  }
+
+  /**
+   * Task.create once the task is placed: reads the parent's checked-out branch, then chains to
+   * checkTaskAgentRunnable and resolveTaskCreateAiSettings, which queues or launches the task.
+   * Each step starts the next in the same tick as its own last await.
+   */
+  private async readTaskCreateParentBranch(
+    placement: TaskCreatePlacement
+  ): Promise<Result<TaskCreateResult, string>> {
+    const {
+      args,
+      parentEntry,
+      parentMeta,
+      runtime,
+      parentWorkspacePath,
+      useSharedWorkspace,
+      taskId,
+      taskRuntimeMode,
+      parentIsMultiProject,
+    } = placement;
     // The branch actually checked out in the parent's checkout (see readTaskParentBranch): an
     // isolation: "none" parent's name, and an auto-named worktree parent's, name no branch.
     // Persisting the real branch keeps dequeue fork-fallbacks (preferredTrunkBranch) on an
@@ -6907,60 +7299,71 @@ export class TaskService implements AgentTaskIntegration {
         parentIsMultiProject,
       });
     }
+    return this.checkTaskAgentRunnable(placement, parentBranchName);
+  }
 
-    // Helper to build error hint with all available runnable agents.
-    // NOTE: This resolves frontmatter inheritance so same-name overrides (e.g. project exec.md
-    // with base: exec) still count as runnable.
-    const getRunnableHint = async (): Promise<string> => {
-      try {
-        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
-          projectPluginsTrusted,
-          runtimeFactory: nodeRuntimeFactory,
-        });
+  /**
+   * Builds the error hint with all available runnable agents.
+   * NOTE: This resolves frontmatter inheritance so same-name overrides (e.g. project exec.md
+   * with base: exec) still count as runnable.
+   */
+  private async describeRunnableTaskAgents(placement: TaskCreatePlacement): Promise<string> {
+    const { args, cfg, runtime, parentWorkspacePath, projectPluginsTrusted } = placement;
+    try {
+      const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
+        projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
+      });
 
-        const runnableIds = (
-          await Promise.all(
-            allAgents.map(async (agent) => {
-              try {
-                const frontmatter = await resolveAgentFrontmatter(
-                  runtime,
-                  parentWorkspacePath,
-                  agent.id,
-                  {
-                    skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
-                    projectPluginsTrusted,
-                    runtimeFactory: nodeRuntimeFactory,
-                  }
-                );
-                if (
-                  !isAgentRunnableAsChild(frontmatter, {
-                    workflowOwned: args.workflowTask != null,
-                  })
-                ) {
-                  return null;
+      const runnableIds = (
+        await Promise.all(
+          allAgents.map(async (agent) => {
+            try {
+              const frontmatter = await resolveAgentFrontmatter(
+                runtime,
+                parentWorkspacePath,
+                agent.id,
+                {
+                  skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
+                  projectPluginsTrusted,
+                  runtimeFactory: nodeRuntimeFactory,
                 }
-
-                const effectivelyDisabled = isAgentEffectivelyDisabled({
-                  cfg,
-                  agentId: agent.id,
-                  resolvedFrontmatter: frontmatter,
-                });
-                return effectivelyDisabled ? null : agent.id;
-              } catch {
+              );
+              if (
+                !isAgentRunnableAsChild(frontmatter, {
+                  workflowOwned: args.workflowTask != null,
+                })
+              ) {
                 return null;
               }
-            })
-          )
-        ).filter((id): id is string => typeof id === "string");
 
-        return runnableIds.length > 0
-          ? `Runnable agentIds: ${runnableIds.join(", ")}`
-          : "No runnable agents available";
-      } catch {
-        return "Could not discover available agents";
-      }
-    };
+              const effectivelyDisabled = isAgentEffectivelyDisabled({
+                cfg,
+                agentId: agent.id,
+                resolvedFrontmatter: frontmatter,
+              });
+              return effectivelyDisabled ? null : agent.id;
+            } catch {
+              return null;
+            }
+          })
+        )
+      ).filter((id): id is string => typeof id === "string");
 
+      return runnableIds.length > 0
+        ? `Runnable agentIds: ${runnableIds.join(", ")}`
+        : "No runnable agents available";
+    } catch {
+      return "Could not discover available agents";
+    }
+  }
+
+  /** Refuses an agent that is unknown, disabled or not runnable as a sub-agent. */
+  private async checkTaskAgentRunnable(
+    placement: TaskCreatePlacement,
+    parentBranchName: string | undefined
+  ): Promise<Result<TaskCreateResult, string>> {
+    const { args, cfg, agentId, runtime, parentWorkspacePath, projectPluginsTrusted } = placement;
     let skipInitHook = false;
     try {
       const frontmatter = await resolveAgentFrontmatter(runtime, parentWorkspacePath, agentId, {
@@ -6968,7 +7371,7 @@ export class TaskService implements AgentTaskIntegration {
         runtimeFactory: nodeRuntimeFactory,
       });
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
-        const hint = await getRunnableHint();
+        const hint = await this.describeRunnableTaskAgents(placement);
         return Err(`Task.create: agentId is not runnable as a sub-agent (${agentId}). ${hint}`);
       }
 
@@ -6979,7 +7382,7 @@ export class TaskService implements AgentTaskIntegration {
           resolvedFrontmatter: frontmatter,
         })
       ) {
-        const hint = await getRunnableHint();
+        const hint = await this.describeRunnableTaskAgents(placement);
         return Err(`Task.create: agentId is disabled (${agentId}). ${hint}`);
       }
       skipInitHook = frontmatter.subagent?.skip_init_hook === true;
@@ -6989,10 +7392,35 @@ export class TaskService implements AgentTaskIntegration {
           formatRuntimeUnreachableError(`Task.create: could not verify agentId (${agentId})`, error)
         );
       }
-      const hint = await getRunnableHint();
+      const hint = await this.describeRunnableTaskAgents(placement);
       return Err(`Task.create: unknown agentId (${agentId}). ${hint}`);
     }
+    return this.resolveTaskCreateAiSettings(placement, parentBranchName, skipInitHook);
+  }
 
+  /** Resolves the task's model and thinking settings, then queues or launches the task. */
+  private async resolveTaskCreateAiSettings(
+    placement: TaskCreatePlacement,
+    parentBranchName: string | undefined,
+    skipInitHook: boolean
+  ): Promise<Result<TaskCreateResult, string>> {
+    const {
+      args,
+      cfg,
+      parentWorkspaceId,
+      parentMeta,
+      agentId,
+      runtime,
+      parentWorkspacePath,
+      projectPluginsTrusted,
+      taskId,
+      workspaceName,
+      activeCount,
+      taskSettings,
+      shouldQueue,
+      taskRuntimeConfig,
+      prompt,
+    } = placement;
     let taskModelString: string;
     let canonicalModel: string;
     let effectiveThinkingLevel: ThinkingLevel;
@@ -7050,482 +7478,305 @@ export class TaskService implements AgentTaskIntegration {
       thinkingLevel: effectiveThinkingLevel,
     });
 
+    const plan: TaskCreatePlan = {
+      ...placement,
+      parentBranchName,
+      skipInitHook,
+      taskModelString,
+      canonicalModel,
+      effectiveThinkingLevel,
+      effectiveReasoningMode,
+      taskAiPins,
+      createdAt,
+    };
+
     if (shouldQueue) {
-      const trunkBranch = parentBranchName;
-      if (!trunkBranch) {
-        return Err("Task.create: parent workspace name missing (cannot queue task)");
-      }
-
-      // NOTE: Queued tasks are persisted immediately, but their workspace is created later
-      // when a parallel slot is available. This ensures queued tasks don't create worktrees
-      // or run init hooks until they actually start.
-      // Shared-workspace (isolation: "none") tasks point at the parent's existing checkout, so the
-      // dequeue path sees the directory already exists and skips fork + init.
-      const workspacePath = useSharedWorkspace
-        ? parentWorkspacePath
-        : runtime.getWorkspacePath(parentMeta.projectPath, workspaceName);
-
-      taskQueueDebug("TaskService.create queued (persist-only)", {
-        taskId,
-        workspaceName,
-        parentWorkspaceId,
-        trunkBranch,
-        workspacePath,
-      });
-
-      try {
-        await reserveDesktop(async () => {
-          await this.config.editConfig((config) => {
-            assertParentAdmitsChild(config, parentWorkspaceId, {
-              requireRow: parentEntry != null,
-              legacyRow: legacyParentRow,
-            });
-            let projectConfig = config.projects.get(configProjectPath);
-            if (!projectConfig) {
-              projectConfig = { workspaces: [] };
-              config.projects.set(configProjectPath, projectConfig);
-            }
-
-            projectConfig.workspaces.push({
-              kind: parentIsScratch ? "scratch" : undefined,
-              path: workspacePath,
-              id: taskId,
-              name: workspaceName,
-              title: args.title,
-              createdAt,
-              runtimeConfig: taskRuntimeConfig,
-              // New rows have no legacy plan to migrate (#5174).
-              remotePlanMigrated: true,
-              aiSettings: {
-                model: canonicalModel,
-                thinkingLevel: effectiveThinkingLevel,
-                ...(effectiveReasoningMode != null
-                  ? { reasoningMode: effectiveReasoningMode }
-                  : {}),
-              },
-              parentWorkspaceId,
-              agentId,
-              agentType,
-              workflowTask: args.workflowTask,
-              bestOf: normalizedBestOf,
-              taskStatus: "queued",
-              // Never admitted: the queue drain's launch CAS rotates it and takes ownership.
-              taskAttemptId: newTaskAttemptId(),
-              taskPrompt: prompt,
-              taskTrunkBranch: trunkBranch,
-              taskModelString,
-              taskThinkingLevel: effectiveThinkingLevel,
-              taskAiPins,
-              taskOnRefusal: args.onRefusal,
-              taskIsolation: useSharedWorkspace ? "none" : undefined,
-              taskAttentionPolicy: args.attentionPolicy,
-              taskDesktopOwnerWorkspaceId,
-              projects: parentMeta.projects,
-            });
-            this.desktopInputCoordinator.assertAdmission(config, taskId);
-            return config;
-          });
-        });
-      } catch (error) {
-        return Err(getErrorMessage(error));
-      }
-
-      // Emit metadata update so the UI sees the workspace immediately.
-      await this.emitWorkspaceMetadata(taskId);
-
-      // NOTE: Do NOT persist the prompt into chat history until the task actually starts.
-      // Otherwise the frontend treats "last message is user" as an interrupted stream and
-      // will auto-retry / backoff-spam resume attempts while the task is queued.
-      taskQueueDebug("TaskService.create queued persisted (prompt stored in config)", {
-        taskId,
-        workspaceName,
-      });
-
-      // Schedule queue processing (best-effort).
-      this.scheduleMaybeStartQueuedTasks();
-      taskQueueDebug("TaskService.create queued scheduled maybeStartQueuedTasks", { taskId });
-      return Ok({
-        taskId,
-        kind: "agent",
-        status: "queued",
-        modelString: taskModelString,
-        thinkingLevel: effectiveThinkingLevel,
-        desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
-      });
+      return this.createQueuedTask(plan);
     }
 
-    // Set once a checkout exists for this task: a throw after that point (base-SHA read, config
-    // persistence) must roll the checkout back instead of leaking it like an unhandled rejection.
-    let materializedCheckout: { initLogger: InitLogger; runtime: Runtime } | undefined;
-    // Admission classification: a direct (unqueued) launch is the FIRST admission of a brand-new
-    // task by construction, exactly like a reservation — the id minted here is persisted by the
-    // write that creates the entry and owned by this process before anything can send into the
-    // workspace; a launch failure below settles that ownership (launch failed) as soon as nothing
-    // runs under it, so a Stop or reawaken never meets an owned attempt without settlement
-    // evidence while work still running under it keeps its own settlement.
-    const attemptId = newTaskAttemptId();
-    let launchAttempt: OwnedTaskAttempt | undefined;
-    // Flipped when the launch fence admits the send (as TaskLaunchPlan.sendAdmitted): a failure
-    // that observes it false has positive evidence that this launch never dispatched its prompt.
-    let launchSendAdmitted = false;
-    /**
-     * Launch failure. Before the entry is persisted (launchAttempt unset) nothing is published:
-     * only the materialized checkout exists and the rollback removes it. Once the entry is
-     * persisted the workspace IS published — a racing user or peer send can be admitted under
-     * the attempt while the launch send is in flight, and another writer (a second backend's
-     * startup re-drive or reawaken) can re-admit the row under its own attempt (A → B). Deleting
-     * the row, checkout and session dir underneath those obligations, or underneath the other
-     * writer's attempt, would strand them — so a published launch is never rolled back: it ends
-     * as an interrupted workspace with its launch error (removable like any other), exactly as
-     * the queued launch's markTaskLaunchFailed leaves it, and every step is bound to the attempt
-     * this launch decided:
-     *  1. the closure (synchronous: no further send binds to the id);
-     *  2. the durable marker, a CAS on the row still naming this attempt — a row another writer
-     *     re-admitted is that writer's to end (no marker, no stop, no metadata for it; only this
-     *     attempt's own obligations are accounted for);
-     *  3. when anything is live under the row this launch still owns, this task's own stop
-     *     cascade in the two-producer shape of failAgentTaskTerminally: Phase A directly (this
-     *     method holds the global mutex Phase A requires; the mutex is not reentrant, so it must
-     *     not be re-acquired here), Phase B (clearQueue + stopStream, bounded), then a bounded
-     *     wait for the captured owners to settle, which releases the record and settles the
-     *     attempt (Phase C).
-     * An owner that outlives the bound (or one that runs under a row another writer took over)
-     * defers the settlement to its own end: no proof is minted here for work still running. The
-     * bound keeps this method's hold on the global mutex finite; a hung owner never pins task
-     * creation.
-     */
-    const failLaunch = async (
-      message: string,
-      runtimeForRollback: Runtime,
-      rollback: { preservePhysicalWorkspace?: boolean }
-    ): Promise<void> => {
-      if (launchAttempt == null) {
-        await this.rollbackFailedTaskCreate(
-          runtimeForRollback,
-          parentMeta.projectPath,
-          workspaceName,
-          taskId,
-          rollback
-        );
-        return;
-      }
-      this.closeAttemptAdmission(taskId, attemptId, launchAttempt, "launch-failed");
-      // The attempt's own live work, by the ledger that binds sends to attempts: an obligation
-      // still in preflight or queued, or an admitted one whose turn is the session's live turn.
-      // Attempt-scoped on purpose — under a row another writer re-admitted, the session's other
-      // work is that writer's and must not be sampled as ours.
-      const liveUnderLaunchAttempt = (): boolean => {
-        const activeTurn = this.workspaceService.getActiveTurnGeneration(taskId);
-        for (const send of this.attemptLedger.sendsOf(taskId)) {
-          if (send.attemptId !== attemptId) continue;
-          if (send.state === "pending" || send.state === "enqueued") return true;
-          if (send.state === "admitted" && send.turnId != null && send.turnId === activeTurn) {
-            return true;
-          }
-        }
-        return false;
-      };
-      let superseded = false;
-      let transitionedToInterrupted = false;
-      let parentWorkspaceId: string | undefined;
-      try {
-        const found = await this.editWorkspaceEntry(
-          taskId,
-          (ws) => {
-            if (ws.taskAttemptId !== attemptId) {
-              superseded = true;
-              return;
-            }
-            transitionedToInterrupted = ws.taskStatus !== "interrupted";
-            parentWorkspaceId = ws.parentWorkspaceId;
-            ws.taskStatus = "interrupted";
-            markChildGoalPauseOwed(ws);
-            ws.taskLaunchError = message;
-            // Survives a restart, like markTaskLaunchFailed (#4674).
-            if (this.initStateManager.getUnsanitizedCheckoutError(taskId)) {
-              ws.taskCheckoutUnsanitized = true;
-            }
-          },
-          { allowMissing: true }
-        );
-        // A row another writer removed meanwhile is theirs as well: nothing of ours to mark.
-        if (!found) superseded = true;
-      } catch (error: unknown) {
-        // No durable marker and no knowledge of the row: fail closed. The attempt stays closed
-        // (no send binds to it) and unsettled (a Stop or reawaken finds it closing); nothing is
-        // stopped or deleted against a row of unknown ownership.
-        log.error("Task.create: failed to persist the launch failure", {
-          taskId,
-          error: getErrorMessage(error),
-        });
-        return;
-      }
-      if (superseded) {
-        log.info("Task launch failure not recorded: the record was re-admitted by another writer", {
-          taskId,
-          message,
-        });
-        // Idle under this attempt (its pending obligations are refused at their next gate, since
-        // the row no longer names it): settled. Live: its turn ends on its own — no early proof.
-        if (!liveUnderLaunchAttempt()) {
-          this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
-        }
-        return;
-      }
-      // The marker is durable on a row this launch still owns. Anything live under the row is
-      // ours to stop: the closure above preceded the marker's await, so this sample is
-      // authoritative (nothing binds to the attempt since), and the row is re-read synchronously
-      // here because the other writer's rotation may have landed during that await — in which
-      // case the row is theirs from here on and only this attempt's own obligations count.
-      const rowStillOurs = this.currentTaskAttemptId(taskId) === attemptId;
-      const liveExecution = rowStillOurs
-        ? this.workspaceService.getActiveTurnGeneration(taskId) != null ||
-          this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId) != null ||
-          this.aiService.isStreaming(taskId) ||
-          this.attemptLedger.hasPendingAdmissions(taskId)
-        : liveUnderLaunchAttempt();
-      if (rowStillOurs && liveExecution) {
-        this.taskStopLatch.beginWorkspaceStop(taskId);
-        this.taskStopLatch.markWorkspaceStopPersisted(taskId);
-        await this.runWorkspaceStopCleanup([taskId], {
-          label: "TaskService.create launch failure",
-          abandonPartial: true,
-          clearQueue: true,
-        });
-        await this.attemptLedger.waitForAttemptClosureToSettle(
-          taskId,
-          ATTEMPT_CLOSURE_SETTLE_WAIT_MS
-        );
-        if (this.taskStopLatch.hasStopRecord(taskId)) {
-          log.warn("Task.create launch failure: the failed launch's attempt is still live", {
-            taskId,
-            message,
-          });
-        }
-      } else if (!liveExecution) {
-        // Receipt evidence as in markTaskLaunchFailed: the send was never admitted (on top of the
-        // shared attemptCannotStillReport boundary); otherwise the settlement stays in memory.
-        if (launchSendAdmitted) {
-          this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
-        } else {
-          await this.attemptLedger.persistOwnedAttemptSettlement(
-            taskId,
-            launchAttempt,
-            "launch-failed",
-            "launch-failed"
-          );
-        }
-      }
-      if (transitionedToInterrupted) {
-        this.recordTaskInterrupted(taskId, parentWorkspaceId);
-      }
-      if (!superseded) await this.settleChildGoalPause(taskId);
-      await this.emitWorkspaceMetadata(taskId);
+    return this.launchTask(plan);
+  }
+
+  /**
+   * Task.create's direct launch: materializes the checkout and persists the entry under the
+   * desktop gate, then chains to sanitizeTaskLaunchCheckout. Runs under the global mutex that
+   * createUnderTaskTreeLifecycleLock holds.
+   */
+  private async launchTask(plan: TaskCreatePlan): Promise<Result<TaskCreateResult, string>> {
+    const launch: TaskLaunchState = {
+      // Set once a checkout exists for this task: a throw after that point (base-SHA read, config
+      // persistence) must roll the checkout back instead of leaking it like an unhandled rejection.
+      materializedCheckout: undefined,
+      // Admission classification: a direct (unqueued) launch is the FIRST admission of a brand-new
+      // task by construction, exactly like a reservation — the id minted here is persisted by the
+      // write that creates the entry and owned by this process before anything can send into the
+      // workspace; a launch failure below settles that ownership (launch failed) as soon as nothing
+      // runs under it, so a Stop or reawaken never meets an owned attempt without settlement
+      // evidence while work still running under it keeps its own settlement.
+      attemptId: newTaskAttemptId(),
+      launchAttempt: undefined,
+      // Flipped when the launch fence admits the send (as TaskLaunchPlan.sendAdmitted): a failure
+      // that observes it false has positive evidence that this launch never dispatched its prompt.
+      sendAdmitted: false,
     };
-    const materialize = async () => {
-      const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
-
-      let workspacePath: string;
-      let trunkBranch: string;
-      let forkedRuntimeConfig: RuntimeConfig;
-      let runtimeForTaskWorkspace: Runtime;
-      let forkedFromSource: boolean;
-      let inheritedProjects: ProjectRef[] | undefined;
-      // Written with the task's row below, never before it: a fork rollback elsewhere restores
-      // this parent mark only while no row uses the shared workspace (#5114).
-      let sourceRuntimeConfigUpdate: RuntimeConfig | undefined;
-
-      if (useSharedWorkspace) {
-        // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead
-        // of forking. Mirrors local-runtime semantics for worktree/SSH so read-only analysis (or
-        // prompt-isolated work) skips the fork + init overhead and sees the parent's uncommitted work.
-        //
-        // SAFETY: the task still gets a unique workspace name, and workspace deletion is keyed on that
-        // name (runtime.deleteWorkspace(projectPath, name)), so removing this task never deletes the
-        // shared parent checkout. workspaceService.remove additionally skips physical deletion for
-        // tasks persisted with taskIsolation === "none".
-        workspacePath = parentWorkspacePath;
-        trunkBranch = parentBranchName ?? "main";
-        forkedRuntimeConfig = parentRuntimeConfig;
-        forkedFromSource = false;
-        inheritedProjects = parentMeta.projects;
-        // Build the runtime with the child's identity but the parent's checkout path. Worktree/SSH
-        // runtimes honor this persisted path override (see *Runtime.getWorkspacePath), so cwd
-        // resolution and ensureReady land in the shared parent checkout instead of a name-derived
-        // directory that was never created. This mirrors the runtime rebuilt from the persisted entry.
-        runtimeForTaskWorkspace = createRuntimeForWorkspace({
-          runtimeConfig: parentRuntimeConfig,
-          projectPath: parentMeta.projectPath,
-          name: workspaceName,
-          namedWorkspacePath: parentWorkspacePath,
-        });
-        initLogger.logStep("Sharing parent workspace (isolation: none) — skipping fork and init");
-        initLogger.logComplete(0);
-      } else {
-        // Note: Local project-dir runtimes share the same directory (unsafe by design).
-        // For worktree/ssh runtimes we attempt a fork first; otherwise fall back to createWorkspace.
-        const forkResult = await orchestrateFork({
-          sourceRuntime: runtime,
-          projectPath: parentMeta.projectPath,
-          sourceWorkspaceName: parentMeta.name,
-          newWorkspaceName: workspaceName,
-          newWorkspaceId: taskId,
-          initLogger,
-          config: this.config,
-          sourceWorkspaceId: parentWorkspaceId,
-          sourceRuntimeConfig: parentRuntimeConfig,
-          parentMetadata: parentMeta,
-          allowCreateFallback: true,
-          // Create-fallback base when the fork cannot detect a source branch — a shared parent's
-          // synthetic name, or an auto-named worktree parent's, names no branch, so supply the
-          // actual checked-out branch. Only then: other parents keep the existing
-          // branch-discovery fallback.
-          ...(parentBranchName != null && parentBranchName !== parentMeta.name
-            ? { preferredTrunkBranch: parentBranchName }
-            : {}),
-          trusted:
-            this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
-          multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
-            EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
-          ),
-        });
-
-        if (!forkResult.success) {
-          initLogger.logComplete(-1);
-          return Err(`Task fork failed: ${forkResult.error}`);
-        }
-
-        workspacePath = forkResult.data.workspacePath;
-        trunkBranch = forkResult.data.trunkBranch;
-        forkedRuntimeConfig = forkResult.data.forkedRuntimeConfig;
-        sourceRuntimeConfigUpdate = forkResult.data.sourceRuntimeConfigUpdate;
-        runtimeForTaskWorkspace = forkResult.data.targetRuntime;
-        forkedFromSource = forkResult.data.forkedFromSource;
-        inheritedProjects = forkResult.data.projects;
-      }
-
-      materializedCheckout = { initLogger, runtime: runtimeForTaskWorkspace };
-
-      // Multi-project forks need per-project secrets for each runtime's init hook.
-      this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
-
-      const taskBaseCommitShaByProjectPath = await readTaskBaseCommitShaByProjectPath({
-        workspaceId: taskId,
-        workspaceName,
-        workspacePath,
-        runtimeConfig: forkedRuntimeConfig,
-        projectPath: parentMeta.projectPath,
-        projectName: parentMeta.projectName,
-        projects: inheritedProjects,
-        runtime: runtimeForTaskWorkspace,
-      });
-      const taskBaseCommitSha = taskBaseCommitShaByProjectPath[parentMeta.projectPath];
-
-      taskQueueDebug("TaskService.create started (workspace created)", {
-        taskId,
-        workspaceName,
-        workspacePath,
-        trunkBranch,
-        forkSuccess: forkedFromSource,
-      });
-
-      // Persist workspace entry before starting work so it's durable across crashes.
-      await this.config.editConfig((config) => {
-        assertParentAdmitsChild(config, parentWorkspaceId, {
-          requireRow: parentEntry != null,
-          legacyRow: legacyParentRow,
-        });
-        if (sourceRuntimeConfigUpdate != null) {
-          const parentRow = Array.from(config.projects.values())
-            .flatMap((project) => project.workspaces)
-            .find((workspace) => workspace.id === parentWorkspaceId);
-          if (parentRow == null) {
-            throw new Error(`Workspace ${parentWorkspaceId} not found in config`);
-          }
-          parentRow.runtimeConfig = sourceRuntimeConfigUpdate;
-        }
-        let projectConfig = config.projects.get(configProjectPath);
-        if (!projectConfig) {
-          projectConfig = { workspaces: [] };
-          config.projects.set(configProjectPath, projectConfig);
-        }
-
-        projectConfig.workspaces.push({
-          kind: parentIsScratch ? "scratch" : undefined,
-          path: workspacePath,
-          id: taskId,
-          name: workspaceName,
-          title: args.title,
-          createdAt,
-          runtimeConfig: forkedRuntimeConfig,
-          // New rows have no legacy plan to migrate (#5174).
-          remotePlanMigrated: true,
-          aiSettings: {
-            model: canonicalModel,
-            thinkingLevel: effectiveThinkingLevel,
-            ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
-          },
-          agentId,
-          parentWorkspaceId,
-          agentType,
-          workflowTask: args.workflowTask,
-          bestOf: normalizedBestOf,
-          taskStatus: "running",
-          // Direct (unqueued) launch: this write is the admission, so it stamps the attempt id the
-          // send below is fenced against (WorkspaceService binds the obligation at handoff).
-          taskAttemptId: attemptId,
-          taskTrunkBranch: trunkBranch,
-          taskBaseCommitSha: taskBaseCommitSha ?? undefined,
-          taskBaseCommitShaByProjectPath,
-          taskModelString,
-          taskThinkingLevel: effectiveThinkingLevel,
-          taskAiPins,
-          taskOnRefusal: args.onRefusal,
-          taskIsolation: useSharedWorkspace ? "none" : undefined,
-          taskAttentionPolicy: args.attentionPolicy,
-          taskDesktopOwnerWorkspaceId,
-          projects: inheritedProjects,
-        });
-        this.desktopInputCoordinator.assertAdmission(config, taskId);
-        return config;
-      });
-      // Owned before the entry is announced (emitWorkspaceMetadata below): the first send into
-      // this workspace, whoever issues it, is admitted under an attempt this process owns.
-      launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
-        attemptId,
-        receiptEligible: true,
-      });
-      if (sourceRuntimeConfigUpdate != null) {
-        // Ensure UI gets the updated runtimeConfig for the parent workspace.
-        await this.emitWorkspaceMetadata(parentWorkspaceId);
-      }
-
-      return Ok({
-        initLogger,
-        workspacePath,
-        trunkBranch,
-        forkedRuntimeConfig,
-        runtimeForTaskWorkspace,
-      });
-    };
-    const materialized = await reserveDesktop(materialize).catch((error: unknown) =>
-      Err(getErrorMessage(error))
-    );
+    const materialized = await this.reserveTaskDesktop(plan, () =>
+      this.materializeTaskCheckout(plan, launch)
+    ).catch((error: unknown) => Err(getErrorMessage(error)));
     if (!materialized.success) {
-      if (materializedCheckout != null) {
+      if (launch.materializedCheckout != null) {
         // Runs after the desktop gate released: only the checkout and any persisted entry (which
         // would otherwise hold the desktop reservation as a running child) need to go.
-        await failLaunch(materialized.error, materializedCheckout.runtime, {
-          preservePhysicalWorkspace: useSharedWorkspace,
-        });
-        materializedCheckout.initLogger.logComplete(-1);
+        await this.failTaskLaunch(
+          plan,
+          launch,
+          materialized.error,
+          launch.materializedCheckout.runtime,
+          {
+            preservePhysicalWorkspace: plan.useSharedWorkspace,
+          }
+        );
+        launch.materializedCheckout.initLogger.logComplete(-1);
       }
       return materialized;
     }
-    const { initLogger, workspacePath, trunkBranch, forkedRuntimeConfig, runtimeForTaskWorkspace } =
-      materialized.data;
+    return this.sanitizeTaskLaunchCheckout(plan, launch, materialized.data);
+  }
 
-    if (!useSharedWorkspace) {
+  /**
+   * Shares the parent's checkout or forks a new one, then persists the task's entry and owns its
+   * launch attempt. Runs inside the desktop gate (reserveTaskDesktop).
+   */
+  private async materializeTaskCheckout(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState
+  ): Promise<Result<TaskLaunchCheckout, string>> {
+    const { taskId, workspaceName, parentWorkspaceId, parentMeta } = plan;
+    const initLogger = this.startWorkspaceInit(taskId, parentMeta.projectPath);
+
+    let checkout: MaterializedTaskCheckout;
+    if (plan.useSharedWorkspace) {
+      checkout = this.shareParentCheckout(plan, initLogger);
+    } else {
+      // Note: Local project-dir runtimes share the same directory (unsafe by design).
+      // For worktree/ssh runtimes we attempt a fork first; otherwise fall back to createWorkspace.
+      const forkResult = await orchestrateFork(this.buildTaskForkOptions(plan, initLogger));
+
+      if (!forkResult.success) {
+        initLogger.logComplete(-1);
+        return Err(`Task fork failed: ${forkResult.error}`);
+      }
+
+      checkout = {
+        initLogger,
+        workspacePath: forkResult.data.workspacePath,
+        trunkBranch: forkResult.data.trunkBranch,
+        forkedRuntimeConfig: forkResult.data.forkedRuntimeConfig,
+        sourceRuntimeConfigUpdate: forkResult.data.sourceRuntimeConfigUpdate,
+        runtimeForTaskWorkspace: forkResult.data.targetRuntime,
+        forkedFromSource: forkResult.data.forkedFromSource,
+        inheritedProjects: forkResult.data.projects,
+      };
+    }
+    const { workspacePath, trunkBranch, runtimeForTaskWorkspace } = checkout;
+
+    launch.materializedCheckout = { initLogger, runtime: runtimeForTaskWorkspace };
+
+    // Multi-project forks need per-project secrets for each runtime's init hook.
+    this.configureMultiProjectRuntimeEnvResolver(runtimeForTaskWorkspace);
+
+    const taskBaseCommitShaByProjectPath = await readTaskBaseCommitShaByProjectPath({
+      workspaceId: taskId,
+      workspaceName,
+      workspacePath,
+      runtimeConfig: checkout.forkedRuntimeConfig,
+      projectPath: parentMeta.projectPath,
+      projectName: parentMeta.projectName,
+      projects: checkout.inheritedProjects,
+      runtime: runtimeForTaskWorkspace,
+    });
+    const taskBaseCommitSha = taskBaseCommitShaByProjectPath[parentMeta.projectPath];
+
+    taskQueueDebug("TaskService.create started (workspace created)", {
+      taskId,
+      workspaceName,
+      workspacePath,
+      trunkBranch,
+      forkSuccess: checkout.forkedFromSource,
+    });
+
+    // Persist workspace entry before starting work so it's durable across crashes.
+    await this.config.editConfig((config) =>
+      this.appendLaunchedTaskEntry(config, plan, launch, checkout, {
+        taskBaseCommitSha: taskBaseCommitSha ?? undefined,
+        taskBaseCommitShaByProjectPath,
+      })
+    );
+    // Owned before the entry is announced (emitWorkspaceMetadata below): the first send into
+    // this workspace, whoever issues it, is admitted under an attempt this process owns.
+    launch.launchAttempt = this.beginOwnedTaskAttempt(taskId, "launch", {
+      attemptId: launch.attemptId,
+      receiptEligible: true,
+    });
+    if (checkout.sourceRuntimeConfigUpdate != null) {
+      // Ensure UI gets the updated runtimeConfig for the parent workspace.
+      await this.emitWorkspaceMetadata(parentWorkspaceId);
+    }
+
+    return Ok(checkout);
+  }
+
+  /** isolation: "none": the task runs in the parent workspace's checkout, without fork or init. */
+  private shareParentCheckout(
+    plan: TaskCreatePlan,
+    initLogger: InitLogger
+  ): MaterializedTaskCheckout {
+    // isolation: "none" — run the sub-agent directly in the parent workspace's checkout instead
+    // of forking. Mirrors local-runtime semantics for worktree/SSH so read-only analysis (or
+    // prompt-isolated work) skips the fork + init overhead and sees the parent's uncommitted work.
+    //
+    // SAFETY: the task still gets a unique workspace name, and workspace deletion is keyed on that
+    // name (runtime.deleteWorkspace(projectPath, name)), so removing this task never deletes the
+    // shared parent checkout. workspaceService.remove additionally skips physical deletion for
+    // tasks persisted with taskIsolation === "none".
+    const workspacePath = plan.parentWorkspacePath;
+    const trunkBranch = plan.parentBranchName ?? "main";
+    // Build the runtime with the child's identity but the parent's checkout path. Worktree/SSH
+    // runtimes honor this persisted path override (see *Runtime.getWorkspacePath), so cwd
+    // resolution and ensureReady land in the shared parent checkout instead of a name-derived
+    // directory that was never created. This mirrors the runtime rebuilt from the persisted entry.
+    const runtimeForTaskWorkspace = createRuntimeForWorkspace({
+      runtimeConfig: plan.parentRuntimeConfig,
+      projectPath: plan.parentMeta.projectPath,
+      name: plan.workspaceName,
+      namedWorkspacePath: plan.parentWorkspacePath,
+    });
+    initLogger.logStep("Sharing parent workspace (isolation: none) — skipping fork and init");
+    initLogger.logComplete(0);
+    return {
+      initLogger,
+      workspacePath,
+      trunkBranch,
+      forkedRuntimeConfig: plan.parentRuntimeConfig,
+      sourceRuntimeConfigUpdate: undefined,
+      runtimeForTaskWorkspace,
+      forkedFromSource: false,
+      inheritedProjects: plan.parentMeta.projects,
+    };
+  }
+
+  /** The orchestrateFork options for a task that forks its parent's checkout. */
+  private buildTaskForkOptions(
+    plan: TaskCreatePlan,
+    initLogger: InitLogger
+  ): Parameters<typeof orchestrateFork>[0] {
+    const { parentMeta, parentBranchName } = plan;
+    return {
+      sourceRuntime: plan.runtime,
+      projectPath: parentMeta.projectPath,
+      sourceWorkspaceName: parentMeta.name,
+      newWorkspaceName: plan.workspaceName,
+      newWorkspaceId: plan.taskId,
+      initLogger,
+      config: this.config,
+      sourceWorkspaceId: plan.parentWorkspaceId,
+      sourceRuntimeConfig: plan.parentRuntimeConfig,
+      parentMetadata: parentMeta,
+      allowCreateFallback: true,
+      // Create-fallback base when the fork cannot detect a source branch — a shared parent's
+      // synthetic name, or an auto-named worktree parent's, names no branch, so supply the
+      // actual checked-out branch. Only then: other parents keep the existing
+      // branch-discovery fallback.
+      ...(parentBranchName != null && parentBranchName !== parentMeta.name
+        ? { preferredTrunkBranch: parentBranchName }
+        : {}),
+      trusted:
+        this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ?? false,
+      multiProjectExperimentEnabled: this.workspaceService.isExperimentEnabled(
+        EXPERIMENT_IDS.MULTI_PROJECT_WORKSPACES
+      ),
+    };
+  }
+
+  /** The direct launch's config edit: appends the running task's row under its parent's project. */
+  private appendLaunchedTaskEntry(
+    config: ProjectsConfig,
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    checkout: MaterializedTaskCheckout,
+    base: Pick<WorkspaceConfigEntry, "taskBaseCommitSha" | "taskBaseCommitShaByProjectPath">
+  ): ProjectsConfig {
+    const { taskId, parentWorkspaceId, effectiveThinkingLevel, effectiveReasoningMode } = plan;
+    const { sourceRuntimeConfigUpdate } = checkout;
+    assertParentAdmitsChild(config, parentWorkspaceId, {
+      requireRow: plan.parentEntry != null,
+      legacyRow: plan.legacyParentRow,
+    });
+    if (sourceRuntimeConfigUpdate != null) {
+      const parentRow = Array.from(config.projects.values())
+        .flatMap((project) => project.workspaces)
+        .find((workspace) => workspace.id === parentWorkspaceId);
+      if (parentRow == null) {
+        throw new Error(`Workspace ${parentWorkspaceId} not found in config`);
+      }
+      parentRow.runtimeConfig = sourceRuntimeConfigUpdate;
+    }
+    let projectConfig = config.projects.get(plan.configProjectPath);
+    if (!projectConfig) {
+      projectConfig = { workspaces: [] };
+      config.projects.set(plan.configProjectPath, projectConfig);
+    }
+
+    projectConfig.workspaces.push({
+      kind: plan.parentIsScratch ? "scratch" : undefined,
+      path: checkout.workspacePath,
+      id: taskId,
+      name: plan.workspaceName,
+      title: plan.args.title,
+      createdAt: plan.createdAt,
+      runtimeConfig: checkout.forkedRuntimeConfig,
+      // New rows have no legacy plan to migrate (#5174).
+      remotePlanMigrated: true,
+      aiSettings: {
+        model: plan.canonicalModel,
+        thinkingLevel: effectiveThinkingLevel,
+        ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+      },
+      agentId: plan.agentId,
+      parentWorkspaceId,
+      agentType: plan.agentType,
+      workflowTask: plan.args.workflowTask,
+      bestOf: plan.normalizedBestOf,
+      taskStatus: "running",
+      // Direct (unqueued) launch: this write is the admission, so it stamps the attempt id the
+      // send below is fenced against (WorkspaceService binds the obligation at handoff).
+      taskAttemptId: launch.attemptId,
+      taskTrunkBranch: checkout.trunkBranch,
+      taskBaseCommitSha: base.taskBaseCommitSha,
+      taskBaseCommitShaByProjectPath: base.taskBaseCommitShaByProjectPath,
+      taskModelString: plan.taskModelString,
+      taskThinkingLevel: effectiveThinkingLevel,
+      taskAiPins: plan.taskAiPins,
+      taskOnRefusal: plan.args.onRefusal,
+      taskIsolation: plan.useSharedWorkspace ? "none" : undefined,
+      taskAttentionPolicy: plan.args.attentionPolicy,
+      taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
+      projects: checkout.inheritedProjects,
+    });
+    this.desktopInputCoordinator.assertAdmission(config, taskId);
+    return config;
+  }
+
+  /**
+   * The direct launch after its entry is persisted. Sanitizes the materialized checkout, then
+   * chains to announceAndInitTask and sendTaskLaunchPrompt: each step starts the next in the same
+   * tick as its own last await, so no call runs later than it did inline.
+   */
+  private async sanitizeTaskLaunchCheckout(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    checkout: TaskLaunchCheckout
+  ): Promise<Result<TaskCreateResult, string>> {
+    if (!plan.useSharedWorkspace) {
       // SECURITY: this checkout materialized outside the host's create/fork paths, so
       // registration-time plugin-override sanitization never saw it —
       // a tracked stale `plugin:` enable would re-activate a same-name
@@ -7535,28 +7786,43 @@ export class TaskService implements AgentTaskIntegration {
       // subscriber can send to this running-status task workspace while
       // sanitization is still waiting on the override lock.
       const sanitizeError = await this.workspaceService.sanitizeMaterializedTaskWorkspace(
-        taskId,
-        workspacePath,
-        forkedRuntimeConfig
+        plan.taskId,
+        checkout.workspacePath,
+        checkout.forkedRuntimeConfig
       );
       if (sanitizeError !== undefined) {
         // The row stays published with this checkout: MCP and sends refuse it (#4674).
-        this.initStateManager.markCheckoutUnsanitized(taskId);
-        await failLaunch(sanitizeError, runtimeForTaskWorkspace, {});
-        initLogger.logComplete(-1);
+        this.initStateManager.markCheckoutUnsanitized(plan.taskId);
+        await this.failTaskLaunch(
+          plan,
+          launch,
+          sanitizeError,
+          checkout.runtimeForTaskWorkspace,
+          {}
+        );
+        checkout.initLogger.logComplete(-1);
         return Err(sanitizeError);
       }
     }
+    return this.announceAndInitTask(plan, launch, checkout);
+  }
 
+  /** Announces the launched task's workspace and kicks its init, then sends the prompt. */
+  private async announceAndInitTask(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    checkout: TaskLaunchCheckout
+  ): Promise<Result<TaskCreateResult, string>> {
+    const { taskId } = plan;
     // Emit metadata update so the UI sees the workspace immediately.
     await this.emitWorkspaceMetadata(taskId);
 
     // Kick init (best-effort, async). Shared-workspace (isolation: "none") tasks reuse the parent's
     // already-initialized checkout, so re-running init would redundantly (and possibly disruptively)
     // mutate the live parent workspace — skip it entirely.
-    if (!useSharedWorkspace) {
+    if (!plan.useSharedWorkspace) {
       const secrets = await secretsToRecord(
-        this.secretsStore.getEffectiveSecrets(parentMeta.projectPath)
+        this.secretsStore.getEffectiveSecrets(plan.parentMeta.projectPath)
       );
       // Registered (not just fired) with the host's abort-and-settlement mechanism:
       // a model-driven archive of this task workspace must be able to cancel the init and
@@ -7567,25 +7833,35 @@ export class TaskService implements AgentTaskIntegration {
         taskId,
         initAbortController,
         runBackgroundInit(
-          runtimeForTaskWorkspace,
+          checkout.runtimeForTaskWorkspace,
           {
-            projectPath: parentMeta.projectPath,
-            branchName: workspaceName,
-            trunkBranch,
-            workspacePath,
-            initLogger,
+            projectPath: plan.parentMeta.projectPath,
+            branchName: plan.workspaceName,
+            trunkBranch: checkout.trunkBranch,
+            workspacePath: checkout.workspacePath,
+            initLogger: checkout.initLogger,
             env: secrets,
             abortSignal: initAbortController.signal,
-            skipInitHook,
+            skipInitHook: plan.skipInitHook,
             trusted:
-              this.config.loadConfigOrDefault().projects.get(configProjectPath)?.trusted ?? false,
+              this.config.loadConfigOrDefault().projects.get(plan.configProjectPath)?.trusted ??
+              false,
           },
           taskId,
           workspaceUseLeasesFor(this.config)
         )
       );
     }
+    return this.sendTaskLaunchPrompt(plan, launch, checkout);
+  }
 
+  /** Admits the launch's prompt under the attempt it persisted and sends it. */
+  private async sendTaskLaunchPrompt(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    checkout: TaskLaunchCheckout
+  ): Promise<Result<TaskCreateResult, string>> {
+    const { taskId, taskModelString, effectiveThinkingLevel } = plan;
     // Start immediately (counts towards parallel limit). Launch fence, as in startReservedAgentTask:
     // the obligation is bound under the owned attempt before dispatch and the token doubles as the
     // send's staleness probe. A guarded send is never a user resume, so WorkspaceService skips
@@ -7597,9 +7873,9 @@ export class TaskService implements AgentTaskIntegration {
     // failure path below leaves B's row alone).
     const admission = this.admitTaskWorkspaceTurn(taskId, {
       acceptanceOrigin: "automatic",
-      expectedAttemptId: attemptId,
+      expectedAttemptId: launch.attemptId,
     });
-    launchSendAdmitted = admission.kind === "admitted";
+    launch.sendAdmitted = admission.kind === "admitted";
     const sendResult =
       admission.kind !== "admitted"
         ? Err(
@@ -7610,12 +7886,12 @@ export class TaskService implements AgentTaskIntegration {
         : await this.workspaceService
             .sendMessage(
               taskId,
-              prompt,
+              plan.prompt,
               {
                 model: taskModelString,
-                agentId,
+                agentId: plan.agentId,
                 thinkingLevel: effectiveThinkingLevel,
-                reasoningMode: effectiveReasoningMode,
+                reasoningMode: plan.effectiveReasoningMode,
               },
               {
                 acceptanceOrigin: "automatic",
@@ -7630,8 +7906,8 @@ export class TaskService implements AgentTaskIntegration {
         typeof sendResult.error === "string"
           ? sendResult.error
           : formatSendMessageError(sendResult.error).message;
-      await failLaunch(message, runtimeForTaskWorkspace, {
-        preservePhysicalWorkspace: useSharedWorkspace,
+      await this.failTaskLaunch(plan, launch, message, checkout.runtimeForTaskWorkspace, {
+        preservePhysicalWorkspace: plan.useSharedWorkspace,
       });
       return Err(message);
     }
@@ -7642,8 +7918,346 @@ export class TaskService implements AgentTaskIntegration {
       status: "running",
       modelString: taskModelString,
       thinkingLevel: effectiveThinkingLevel,
-      desktopOwnerWorkspaceId: taskDesktopOwnerWorkspaceId ?? taskId,
+      desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
     });
+  }
+
+  /**
+   * Launch failure. Before the entry is persisted (launchAttempt unset) nothing is published:
+   * only the materialized checkout exists and the rollback removes it. Once the entry is
+   * persisted the workspace IS published — a racing user or peer send can be admitted under
+   * the attempt while the launch send is in flight, and another writer (a second backend's
+   * startup re-drive or reawaken) can re-admit the row under its own attempt (A → B). Deleting
+   * the row, checkout and session dir underneath those obligations, or underneath the other
+   * writer's attempt, would strand them — so a published launch is never rolled back: it ends
+   * as an interrupted workspace with its launch error (removable like any other), exactly as
+   * the queued launch's markTaskLaunchFailed leaves it, and every step is bound to the attempt
+   * this launch decided:
+   *  1. the closure (synchronous: no further send binds to the id);
+   *  2. the durable marker, a CAS on the row still naming this attempt — a row another writer
+   *     re-admitted is that writer's to end (no marker, no stop, no metadata for it; only this
+   *     attempt's own obligations are accounted for);
+   *  3. when anything is live under the row this launch still owns, this task's own stop
+   *     cascade in the two-producer shape of failAgentTaskTerminally: Phase A directly (this
+   *     method holds the global mutex Phase A requires; the mutex is not reentrant, so it must
+   *     not be re-acquired here), Phase B (clearQueue + stopStream, bounded), then a bounded
+   *     wait for the captured owners to settle, which releases the record and settles the
+   *     attempt (Phase C).
+   * An owner that outlives the bound (or one that runs under a row another writer took over)
+   * defers the settlement to its own end: no proof is minted here for work still running. The
+   * bound keeps this method's hold on the global mutex finite; a hung owner never pins task
+   * creation.
+   *
+   * After the marker's await the steps chain (endPublishedTaskLaunchFailure, then
+   * stopFailedTaskLaunch or settleFailedTaskLaunch, then finishTaskLaunchFailure): each starts
+   * the next in the same tick as its own last await, so no call runs later than it did inline.
+   */
+  private async failTaskLaunch(
+    plan: TaskCreatePlan,
+    launch: TaskLaunchState,
+    message: string,
+    runtimeForRollback: Runtime,
+    rollback: { preservePhysicalWorkspace?: boolean }
+  ): Promise<void> {
+    const { taskId } = plan;
+    const { attemptId, launchAttempt } = launch;
+    if (launchAttempt == null) {
+      await this.rollbackFailedTaskCreate(
+        runtimeForRollback,
+        plan.parentMeta.projectPath,
+        plan.workspaceName,
+        taskId,
+        rollback
+      );
+      return;
+    }
+    this.closeAttemptAdmission(taskId, attemptId, launchAttempt, "launch-failed");
+    const mark: TaskLaunchFailureMark = {
+      superseded: false,
+      transitionedToInterrupted: false,
+      parentWorkspaceId: undefined,
+    };
+    try {
+      const found = await this.editWorkspaceEntry(
+        taskId,
+        (ws) => {
+          if (ws.taskAttemptId !== attemptId) {
+            mark.superseded = true;
+            return;
+          }
+          mark.transitionedToInterrupted = ws.taskStatus !== "interrupted";
+          mark.parentWorkspaceId = ws.parentWorkspaceId;
+          ws.taskStatus = "interrupted";
+          markChildGoalPauseOwed(ws);
+          ws.taskLaunchError = message;
+          // Survives a restart, like markTaskLaunchFailed (#4674).
+          if (this.initStateManager.getUnsanitizedCheckoutError(taskId)) {
+            ws.taskCheckoutUnsanitized = true;
+          }
+        },
+        { allowMissing: true }
+      );
+      // A row another writer removed meanwhile is theirs as well: nothing of ours to mark.
+      if (!found) mark.superseded = true;
+    } catch (error: unknown) {
+      // No durable marker and no knowledge of the row: fail closed. The attempt stays closed
+      // (no send binds to it) and unsettled (a Stop or reawaken finds it closing); nothing is
+      // stopped or deleted against a row of unknown ownership.
+      log.error("Task.create: failed to persist the launch failure", {
+        taskId,
+        error: getErrorMessage(error),
+      });
+      return;
+    }
+    if (mark.superseded) {
+      log.info("Task launch failure not recorded: the record was re-admitted by another writer", {
+        taskId,
+        message,
+      });
+      // Idle under this attempt (its pending obligations are refused at their next gate, since
+      // the row no longer names it): settled. Live: its turn ends on its own — no early proof.
+      if (!this.isLiveUnderLaunchAttempt(taskId, attemptId)) {
+        this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
+      }
+      return;
+    }
+    return this.endPublishedTaskLaunchFailure(taskId, launch, launchAttempt, message, mark);
+  }
+
+  /**
+   * The launch attempt's own live work, by the ledger that binds sends to attempts: an obligation
+   * still in preflight or queued, or an admitted one whose turn is the session's live turn.
+   * Attempt-scoped on purpose — under a row another writer re-admitted, the session's other
+   * work is that writer's and must not be sampled as ours.
+   */
+  private isLiveUnderLaunchAttempt(taskId: string, attemptId: string): boolean {
+    const activeTurn = this.workspaceService.getActiveTurnGeneration(taskId);
+    for (const send of this.attemptLedger.sendsOf(taskId)) {
+      if (send.attemptId !== attemptId) continue;
+      if (send.state === "pending" || send.state === "enqueued") return true;
+      if (send.state === "admitted" && send.turnId != null && send.turnId === activeTurn) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * failTaskLaunch after its durable marker landed on a row this launch still owns: stops what
+   * is live under the row, or settles the idle attempt, then finishes the failure.
+   */
+  private endPublishedTaskLaunchFailure(
+    taskId: string,
+    launch: TaskLaunchState,
+    launchAttempt: OwnedTaskAttempt,
+    message: string,
+    mark: TaskLaunchFailureMark
+  ): Promise<void> {
+    // The marker is durable on a row this launch still owns. Anything live under the row is
+    // ours to stop: the closure above preceded the marker's await, so this sample is
+    // authoritative (nothing binds to the attempt since), and the row is re-read synchronously
+    // here because the other writer's rotation may have landed during that await — in which
+    // case the row is theirs from here on and only this attempt's own obligations count.
+    const rowStillOurs = this.currentTaskAttemptId(taskId) === launch.attemptId;
+    const liveExecution = rowStillOurs
+      ? this.workspaceService.getActiveTurnGeneration(taskId) != null ||
+        this.getWorkspaceTurnManager().getLiveWorkspaceTurnRegistration(taskId) != null ||
+        this.aiService.isStreaming(taskId) ||
+        this.attemptLedger.hasPendingAdmissions(taskId)
+      : this.isLiveUnderLaunchAttempt(taskId, launch.attemptId);
+    if (rowStillOurs && liveExecution) {
+      return this.stopFailedTaskLaunch(taskId, message, mark);
+    }
+    if (!liveExecution) {
+      return this.settleFailedTaskLaunch(taskId, launch, launchAttempt, mark);
+    }
+    return this.finishTaskLaunchFailure(taskId, mark);
+  }
+
+  /** Runs the failed launch's own stop cascade on the row it still owns, then finishes. */
+  private async stopFailedTaskLaunch(
+    taskId: string,
+    message: string,
+    mark: TaskLaunchFailureMark
+  ): Promise<void> {
+    this.taskStopLatch.beginWorkspaceStop(taskId);
+    this.taskStopLatch.markWorkspaceStopPersisted(taskId);
+    await this.runWorkspaceStopCleanup([taskId], {
+      label: "TaskService.create launch failure",
+      abandonPartial: true,
+      clearQueue: true,
+    });
+    await this.attemptLedger.waitForAttemptClosureToSettle(taskId, ATTEMPT_CLOSURE_SETTLE_WAIT_MS);
+    if (this.taskStopLatch.hasStopRecord(taskId)) {
+      log.warn("Task.create launch failure: the failed launch's attempt is still live", {
+        taskId,
+        message,
+      });
+    }
+    return this.finishTaskLaunchFailure(taskId, mark);
+  }
+
+  /** Settles the failed launch's idle attempt, then finishes. */
+  private async settleFailedTaskLaunch(
+    taskId: string,
+    launch: TaskLaunchState,
+    launchAttempt: OwnedTaskAttempt,
+    mark: TaskLaunchFailureMark
+  ): Promise<void> {
+    // Receipt evidence as in markTaskLaunchFailed: the send was never admitted (on top of the
+    // shared attemptCannotStillReport boundary); otherwise the settlement stays in memory.
+    if (launch.sendAdmitted) {
+      this.settleOwnedTaskAttempt(taskId, launchAttempt, "launch-failed");
+    } else {
+      await this.attemptLedger.persistOwnedAttemptSettlement(
+        taskId,
+        launchAttempt,
+        "launch-failed",
+        "launch-failed"
+      );
+    }
+    return this.finishTaskLaunchFailure(taskId, mark);
+  }
+
+  /** Records the interrupted transition, settles the owed goal pause and announces the row. */
+  private async finishTaskLaunchFailure(
+    taskId: string,
+    mark: TaskLaunchFailureMark
+  ): Promise<void> {
+    if (mark.transitionedToInterrupted) {
+      this.recordTaskInterrupted(taskId, mark.parentWorkspaceId);
+    }
+    if (!mark.superseded) await this.settleChildGoalPause(taskId);
+    await this.emitWorkspaceMetadata(taskId);
+  }
+
+  /** Runs `reserve` under the shared desktop's reservation for the task, when the task has one. */
+  private reserveTaskDesktop<T>(plan: TaskCreatePlan, reserve: () => Promise<T>): Promise<T> {
+    return plan.taskDesktopOwnerWorkspaceId == null
+      ? reserve()
+      : this.desktopInputCoordinator.withReservation(
+          plan.taskDesktopOwnerWorkspaceId,
+          plan.taskId,
+          reserve
+        );
+  }
+
+  /**
+   * Task.create's queued branch: persists the task as queued and schedules the queue drain.
+   * Runs under the global mutex that createUnderTaskTreeLifecycleLock holds.
+   */
+  private async createQueuedTask(plan: TaskCreatePlan): Promise<Result<TaskCreateResult, string>> {
+    const { taskId, workspaceName, parentWorkspaceId } = plan;
+    const trunkBranch = plan.parentBranchName;
+    if (!trunkBranch) {
+      return Err("Task.create: parent workspace name missing (cannot queue task)");
+    }
+
+    // NOTE: Queued tasks are persisted immediately, but their workspace is created later
+    // when a parallel slot is available. This ensures queued tasks don't create worktrees
+    // or run init hooks until they actually start.
+    // Shared-workspace (isolation: "none") tasks point at the parent's existing checkout, so the
+    // dequeue path sees the directory already exists and skips fork + init.
+    const workspacePath = plan.useSharedWorkspace
+      ? plan.parentWorkspacePath
+      : plan.runtime.getWorkspacePath(plan.parentMeta.projectPath, workspaceName);
+
+    taskQueueDebug("TaskService.create queued (persist-only)", {
+      taskId,
+      workspaceName,
+      parentWorkspaceId,
+      trunkBranch,
+      workspacePath,
+    });
+
+    try {
+      await this.reserveTaskDesktop(plan, async () => {
+        await this.config.editConfig((config) =>
+          this.appendQueuedTaskEntry(config, plan, workspacePath, trunkBranch)
+        );
+      });
+    } catch (error) {
+      return Err(getErrorMessage(error));
+    }
+
+    // Emit metadata update so the UI sees the workspace immediately.
+    await this.emitWorkspaceMetadata(taskId);
+
+    // NOTE: Do NOT persist the prompt into chat history until the task actually starts.
+    // Otherwise the frontend treats "last message is user" as an interrupted stream and
+    // will auto-retry / backoff-spam resume attempts while the task is queued.
+    taskQueueDebug("TaskService.create queued persisted (prompt stored in config)", {
+      taskId,
+      workspaceName,
+    });
+
+    // Schedule queue processing (best-effort).
+    this.scheduleMaybeStartQueuedTasks();
+    taskQueueDebug("TaskService.create queued scheduled maybeStartQueuedTasks", { taskId });
+    return Ok({
+      taskId,
+      kind: "agent",
+      status: "queued",
+      modelString: plan.taskModelString,
+      thinkingLevel: plan.effectiveThinkingLevel,
+      desktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId ?? taskId,
+    });
+  }
+
+  /** The queued branch's config edit: appends the queued task's row under its parent's project. */
+  private appendQueuedTaskEntry(
+    config: ProjectsConfig,
+    plan: TaskCreatePlan,
+    workspacePath: string,
+    trunkBranch: string
+  ): ProjectsConfig {
+    const { taskId, parentWorkspaceId, effectiveThinkingLevel, effectiveReasoningMode } = plan;
+    assertParentAdmitsChild(config, parentWorkspaceId, {
+      requireRow: plan.parentEntry != null,
+      legacyRow: plan.legacyParentRow,
+    });
+    let projectConfig = config.projects.get(plan.configProjectPath);
+    if (!projectConfig) {
+      projectConfig = { workspaces: [] };
+      config.projects.set(plan.configProjectPath, projectConfig);
+    }
+
+    projectConfig.workspaces.push({
+      kind: plan.parentIsScratch ? "scratch" : undefined,
+      path: workspacePath,
+      id: taskId,
+      name: plan.workspaceName,
+      title: plan.args.title,
+      createdAt: plan.createdAt,
+      runtimeConfig: plan.taskRuntimeConfig,
+      // New rows have no legacy plan to migrate (#5174).
+      remotePlanMigrated: true,
+      aiSettings: {
+        model: plan.canonicalModel,
+        thinkingLevel: effectiveThinkingLevel,
+        ...(effectiveReasoningMode != null ? { reasoningMode: effectiveReasoningMode } : {}),
+      },
+      parentWorkspaceId,
+      agentId: plan.agentId,
+      agentType: plan.agentType,
+      workflowTask: plan.args.workflowTask,
+      bestOf: plan.normalizedBestOf,
+      taskStatus: "queued",
+      // Never admitted: the queue drain's launch CAS rotates it and takes ownership.
+      taskAttemptId: newTaskAttemptId(),
+      taskPrompt: plan.prompt,
+      taskTrunkBranch: trunkBranch,
+      taskModelString: plan.taskModelString,
+      taskThinkingLevel: effectiveThinkingLevel,
+      taskAiPins: plan.taskAiPins,
+      taskOnRefusal: plan.args.onRefusal,
+      taskIsolation: plan.useSharedWorkspace ? "none" : undefined,
+      taskAttentionPolicy: plan.args.attentionPolicy,
+      taskDesktopOwnerWorkspaceId: plan.taskDesktopOwnerWorkspaceId,
+      projects: plan.parentMeta.projects,
+    });
+    this.desktopInputCoordinator.assertAdmission(config, taskId);
+    return config;
   }
 
   async retitleDescendantAgentTask(
@@ -11468,12 +12082,29 @@ export class TaskService implements AgentTaskIntegration {
         await this.terminalAttentionStore.delete(ownerWorkspaceId, notification.id);
       }
     }
-    let pending = allPending.filter((notification) => notification.sourceKind !== "workflow_run");
+    const pending = allPending.filter((notification) => notification.sourceKind !== "workflow_run");
     const queuedWorkflowRunIds = this.workflowRunAttention.queuedRunIds(ownerWorkspaceId);
     if (pending.length === 0 && queuedWorkflowRunIds.length === 0) {
       return;
     }
+    // The rest of the drain is a chain of steps: resolveTerminalDrainOwner →
+    // deferTerminalDrainWhileOwnerBusy → acknowledgeTerminalDrainReports →
+    // collectWorkspaceTurnWakeCandidates → collectTerminalWorkflowWakePrompts →
+    // readNonWorkflowBackoffAndMuxMetadata → resolveTerminalWakeRestrictions →
+    // selectTerminalWorkflowWakeGroup → composeTerminalWake → deliverTerminalWake. Each step
+    // starts the next one in the same tick as its own last await, so no collaborator call runs a
+    // microtask later than it did inline; only the drain's own resolution comes later.
+    return this.resolveTerminalDrainOwner({
+      ownerWorkspaceId,
+      freshSubagentAttentionTurns,
+      pending,
+      queuedWorkflowRunIds,
+    });
+  }
 
+  /** Supersedes the pending wakes of a deleted or archived owner; else checks the owner's turn. */
+  private async resolveTerminalDrainOwner(snapshot: TerminalDrainSnapshot): Promise<void> {
+    const { ownerWorkspaceId, pending } = snapshot;
     const cfg = this.config.loadConfigOrDefault();
     const entry = findWorkspaceEntry(cfg, ownerWorkspaceId);
     if (entry == null) {
@@ -11495,7 +12126,12 @@ export class TaskService implements AgentTaskIntegration {
       }
       return;
     }
+    return this.deferTerminalDrainWhileOwnerBusy({ ...snapshot, cfg, entry });
+  }
 
+  /** A busy owner keeps its wakes pending; the drain may cut its live turn for fresh reports. */
+  private async deferTerminalDrainWhileOwnerBusy(owner: TerminalDrainOwner): Promise<void> {
+    const { ownerWorkspaceId } = owner;
     // Defer-until-idle: never inject ahead of an active stream or a queued/preparing user turn.
     const ownerHasPendingQueuedPreparingOrRetry =
       this.workspaceService.hasPendingQueuedOrPreparingTurn(ownerWorkspaceId);
@@ -11510,17 +12146,22 @@ export class TaskService implements AgentTaskIntegration {
     ) {
       await this.cutBusyOwnerTurnForSubagentAttention(
         ownerWorkspaceId,
-        entry,
-        pending,
-        freshSubagentAttentionTurns
+        owner.entry,
+        owner.pending,
+        owner.freshSubagentAttentionTurns
       );
       if (ownerHasBusyQueuedOrRetry && !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId)) {
         this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
       }
       return;
     }
+    return this.acknowledgeTerminalDrainReports(owner);
+  }
 
-    const taskIndex = this.buildAgentTaskIndex(cfg);
+  /** Acknowledges the agent reports already in history, and ensures the rest have messages. */
+  private async acknowledgeTerminalDrainReports(owner: TerminalDrainOwner): Promise<void> {
+    const { ownerWorkspaceId } = owner;
+    const taskIndex = this.buildAgentTaskIndex(owner.cfg);
     if (await this.hasBlockingActiveWorkForTerminalDrain(ownerWorkspaceId, taskIndex)) {
       return;
     }
@@ -11530,7 +12171,7 @@ export class TaskService implements AgentTaskIntegration {
     // Normal completion acknowledges before compaction; this is recovery for missed
     // callbacks or reports whose notification was published after the answer committed.
     const consumedIds = await this.acknowledgeAgentReports(ownerWorkspaceId);
-    pending = pending.filter((notification) => !consumedIds.has(notification.id));
+    const pending = owner.pending.filter((notification) => !consumedIds.has(notification.id));
 
     const agentNotifications = pending.filter(
       (notification) => notification.sourceKind === "agent_task"
@@ -11539,13 +12180,29 @@ export class TaskService implements AgentTaskIntegration {
       deliverableNotificationIds: deliverableAgentNotificationIds,
       latestMessageTimestampByTaskId,
     } = await this.ensureAgentTerminalMessages(ownerWorkspaceId, agentNotifications);
-    const workspaceTurnNotifications = pending.filter(
+    // The acknowledged subset replaces the snapshot's pending list for every later step.
+    return this.collectWorkspaceTurnWakeCandidates({
+      ...owner,
+      pending,
+      taskIndex,
+      agentNotifications,
+      deliverableAgentNotificationIds,
+      latestMessageTimestampByTaskId,
+    });
+  }
+
+  /**
+   * Collects the pending workspace-turn wakes, superseding a persistent child continuation whose
+   * report is already in the owner's history.
+   */
+  private async collectWorkspaceTurnWakeCandidates(
+    attention: TerminalDrainAgentAttention
+  ): Promise<void> {
+    const { ownerWorkspaceId, taskIndex, latestMessageTimestampByTaskId } = attention;
+    const workspaceTurnNotifications = attention.pending.filter(
       (notification) => notification.sourceKind === "workspace_turn"
     );
-    const workspaceTurnCandidates: Array<{
-      notification: (typeof pending)[number];
-      publicAwaitId: string;
-    }> = [];
+    const workspaceTurnCandidates: TerminalWorkspaceTurnWakeCandidate[] = [];
     for (const notification of workspaceTurnNotifications) {
       const record = await this.getWorkspaceTurnManager().getWorkspaceTurnRecord(
         ownerWorkspaceId,
@@ -11579,14 +12236,18 @@ export class TaskService implements AgentTaskIntegration {
         publicAwaitId: isPersistentChildContinuation ? record.workspaceId : notification.sourceId,
       });
     }
-    const deliverableWorkflowPrompts: Array<{
-      runId: string;
-      run: WorkflowRunRecord;
-      prompt: string;
-      initiatingAgent?: WorkflowWakeInitiatingAgent;
-    }> = [];
+    return this.collectTerminalWorkflowWakePrompts(attention, workspaceTurnCandidates);
+  }
 
-    for (const runId of queuedWorkflowRunIds) {
+  /** Builds the queued workflow runs' wake prompts, settling or dropping the stale runs. */
+  private async collectTerminalWorkflowWakePrompts(
+    attention: TerminalDrainAgentAttention,
+    workspaceTurnCandidates: readonly TerminalWorkspaceTurnWakeCandidate[]
+  ): Promise<void> {
+    const { ownerWorkspaceId } = attention;
+    const deliverableWorkflowPrompts: TerminalWorkflowWakeCandidate[] = [];
+
+    for (const runId of attention.queuedWorkflowRunIds) {
       const workflowPrompt = await this.buildWorkflowTerminalPrompt(ownerWorkspaceId, runId);
       if (workflowPrompt.outcome === "defer") {
         // History, sidecar, or the run record was transiently unreadable: the run stays
@@ -11625,6 +12286,20 @@ export class TaskService implements AgentTaskIntegration {
           : {}),
       });
     }
+    return this.readNonWorkflowBackoffAndMuxMetadata(
+      attention,
+      workspaceTurnCandidates,
+      deliverableWorkflowPrompts
+    );
+  }
+
+  /** Reads whether the non-workflow batch is backed off, and the active turn's mux metadata. */
+  private async readNonWorkflowBackoffAndMuxMetadata(
+    attention: TerminalDrainAgentAttention,
+    workspaceTurnCandidates: readonly TerminalWorkspaceTurnWakeCandidate[],
+    deliverableWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[]
+  ): Promise<void> {
+    const { ownerWorkspaceId } = attention;
     // Deliver one launch-identity group per drain, keyed by agentId AND recorded strict pin:
     // the whole coalesced prompt is handled under the single agentId/pin passed to
     // sendMessage, so batching runs from different launch identities would hand a restricted
@@ -11644,7 +12319,7 @@ export class TaskService implements AgentTaskIntegration {
     );
     const hasNonWorkflowDeliverables =
       !nonWorkflowSendBackedOff &&
-      (deliverableAgentNotificationIds.size > 0 || workspaceTurnCandidates.length > 0);
+      (attention.deliverableAgentNotificationIds.size > 0 || workspaceTurnCandidates.length > 0);
     // Unselected groups stay queued: the delivered group's wake turn ends with a streamEnded
     // drain (and the sweep backstops an aborted one), which delivers the next group.
     const workspaceTurnMuxMetadata =
@@ -11652,16 +12327,31 @@ export class TaskService implements AgentTaskIntegration {
         ownerWorkspaceId
       );
 
+    return this.resolveTerminalWakeRestrictions({
+      ...attention,
+      workspaceTurnCandidates,
+      deliverableWorkflowPrompts,
+      nonWorkflowSendBackedOff,
+      hasNonWorkflowDeliverables,
+      workspaceTurnMuxMetadata,
+    });
+  }
+
+  /**
+   * Resolves the wake's caller restrictions and rereads the workspace-turn candidates, then
+   * chains on: selectTerminalWorkflowWakeGroup → composeTerminalWake → deliverTerminalWake. Each
+   * step starts the next one in the same tick as its own last await.
+   */
+  private async resolveTerminalWakeRestrictions(
+    candidates: TerminalDrainCandidates
+  ): Promise<void> {
+    const { ownerWorkspaceId } = candidates;
     // Security: restore the conversation's active caller tool policy on the wake. The ordinary
     // in-stream workflow continuation carries the live turn's effectiveToolPolicy; this
     // synthetic send starts a fresh turn, and omitting the policy would let a workflow wake
     // regain tools the caller disabled (with attacker-influenced workflow output choosing the
     // timing). The agent-level policy recomposes from agentId at send resolution.
-    let wakeRestrictions: {
-      toolPolicy?: ToolPolicy;
-      disableWorkspaceAgents?: boolean;
-      strictAgentResolution?: SendMessageOptions["strictAgentResolution"];
-    };
+    let wakeRestrictions: TerminalWakeRevalidation["wakeRestrictions"];
     try {
       wakeRestrictions = await this.resolveTerminalWakeCallerSendRestrictions(ownerWorkspaceId);
     } catch (error: unknown) {
@@ -11688,13 +12378,28 @@ export class TaskService implements AgentTaskIntegration {
     // not do; worst case is one redundant wake (fail toward notify, never a
     // lost wake).
     const candidateRecords = await Promise.all(
-      workspaceTurnCandidates.map((candidate) =>
+      candidates.workspaceTurnCandidates.map((candidate) =>
         this.getWorkspaceTurnManager().getWorkspaceTurnRecord(
           ownerWorkspaceId,
           candidate.notification.sourceId
         )
       )
     );
+    return this.selectTerminalWorkflowWakeGroup({
+      ...candidates,
+      wakeRestrictions,
+      candidateRecords,
+    });
+  }
+
+  /**
+   * Selects the launch-identity group of workflow wakes to deliver, and resolves the wake's resume
+   * options under that group's identity (or the conversation's own when none is selected).
+   */
+  private async selectTerminalWorkflowWakeGroup(
+    revalidation: TerminalWakeRevalidation
+  ): Promise<void> {
+    const { ownerWorkspaceId, entry, deliverableWorkflowPrompts } = revalidation;
     // Workflow candidates get the same last-moment treatment, one launch-identity group at a
     // time: a full history clear that completes after buildWorkflowTerminalPrompt classified
     // these runs retires the sidecar but cannot retract the materialized candidates, and once
@@ -11705,30 +12410,16 @@ export class TaskService implements AgentTaskIntegration {
     // newest-first until one revalidates, so one unreadable group cannot stall independent
     // wakes behind the sweep. Bounded: every iteration permanently removes one group from
     // this drain's consideration.
-    const supersededWorkflowPrompts: typeof deliverableWorkflowPrompts = [];
-    let currentWorkflowPrompts: typeof deliverableWorkflowPrompts = [];
+    const supersededWorkflowPrompts: TerminalWorkflowWakeCandidate[] = [];
+    let currentWorkflowPrompts: readonly TerminalWorkflowWakeCandidate[] = [];
     let workflowInitiatingAgent: WorkflowWakeInitiatingAgent | undefined;
-    let resumeOptions:
-      | Awaited<ReturnType<TaskService["resolveParentAutoResumeOptions"]>>
-      | undefined;
-    let remainingWorkflowPrompts = hasNonWorkflowDeliverables
+    let resumeOptions: ParentAutoResumeOptions | undefined;
+    let remainingWorkflowPrompts = revalidation.hasNonWorkflowDeliverables
       ? deliverableWorkflowPrompts.filter((candidate) => candidate.initiatingAgent == null)
       : deliverableWorkflowPrompts;
     while (remainingWorkflowPrompts.length > 0) {
-      let groupAgent: WorkflowWakeInitiatingAgent | undefined;
-      for (const candidate of remainingWorkflowPrompts) {
-        const agent = candidate.initiatingAgent;
-        if (agent != null && (groupAgent == null || agent.createdAtMs > groupAgent.createdAtMs)) {
-          groupAgent = agent;
-        }
-      }
-      const groupKey = groupAgent != null ? workflowWakeGroupKey(groupAgent) : undefined;
-      const groupCandidates = remainingWorkflowPrompts.filter((candidate) =>
-        groupKey == null
-          ? candidate.initiatingAgent == null
-          : candidate.initiatingAgent != null &&
-            workflowWakeGroupKey(candidate.initiatingAgent) === groupKey
-      );
+      const { groupAgent, groupKey, groupCandidates } =
+        pickNewestWorkflowWakeGroup(remainingWorkflowPrompts);
       // Group keys embed \u0000, so the empty string safely keys the unpinned group.
       const backoffKey = groupKey ?? "";
       if (this.terminalAttention.isWakeSendBackedOff(ownerWorkspaceId, backoffKey)) {
@@ -11753,15 +12444,11 @@ export class TaskService implements AgentTaskIntegration {
           this.revalidateWorkflowPromptForDispatch(ownerWorkspaceId, candidate)
         )
       );
-      const groupCurrent: typeof deliverableWorkflowPrompts = [];
-      groupCandidates.forEach((candidate, index) => {
-        const verdict = groupRevalidation[index];
-        if (verdict === "deliverable") {
-          groupCurrent.push(candidate);
-        } else if (verdict === "superseded") {
-          supersededWorkflowPrompts.push(candidate);
-        }
-      });
+      const { groupCurrent, groupSuperseded } = classifyWorkflowGroupRevalidation(
+        groupCandidates,
+        groupRevalidation
+      );
+      supersededWorkflowPrompts.push(...groupSuperseded);
       if (groupCurrent.length > 0) {
         currentWorkflowPrompts = groupCurrent;
         workflowInitiatingAgent = groupAgent;
@@ -11781,44 +12468,40 @@ export class TaskService implements AgentTaskIntegration {
       entry,
       defaultModel
     );
+    return this.composeTerminalWake(revalidation, {
+      currentWorkflowPrompts,
+      workflowInitiatingAgent,
+      supersededWorkflowPrompts,
+      resumeOptions,
+    });
+  }
+
+  /**
+   * Partitions the reread workspace-turn candidates, composes the wake prompt and hands the wake
+   * to deliverTerminalWake. Synchronous: it runs inside the batch read → sendMessage window.
+   */
+  private composeTerminalWake(
+    revalidation: TerminalWakeRevalidation,
+    selection: Pick<
+      TerminalWakeDelivery,
+      | "currentWorkflowPrompts"
+      | "workflowInitiatingAgent"
+      | "supersededWorkflowPrompts"
+      | "resumeOptions"
+    >
+  ): Promise<void> {
     // Pair the pin with the delivered group: the newest pin-bearing history row can belong to
     // a different group's wake (each wake persists its own pin), and pinning another agent's
     // provenance onto this group's agentId makes resolution reject the wake on every retry. A
     // recorded pin (or a verified-unpinned null) overrides the walk; legacy references
     // without the field keep the walk pin.
-    const groupPin = workflowInitiatingAgent?.strictAgentResolution;
+    const groupPin = selection.workflowInitiatingAgent?.strictAgentResolution;
     const effectiveStrictPin =
-      groupPin !== undefined ? (groupPin ?? undefined) : wakeRestrictions.strictAgentResolution;
-    const deliverableWorkspaceTurnNotificationIds = new Set<string>();
-    const publicAwaitIds: string[] = [];
-    const suppressedNotificationIds: string[] = [];
-    workspaceTurnCandidates.forEach((candidate, index) => {
-      const record = candidateRecords[index];
-      if (record != null && workspaceTurnTerminalAttentionSuppressed(record)) {
-        suppressedNotificationIds.push(candidate.notification.id);
-        return;
-      }
-      if (nonWorkflowSendBackedOff) {
-        // Backed off: sits out this drain and stays pending for the sweep-cadence retry.
-        return;
-      }
-      deliverableWorkspaceTurnNotificationIds.add(candidate.notification.id);
-      publicAwaitIds.push(candidate.publicAwaitId);
-    });
-    const markSuppressedSuperseded = async () => {
-      for (const id of suppressedNotificationIds) {
-        await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, id);
-      }
-      for (const candidate of supersededWorkflowPrompts) {
-        await this.markWorkflowRunTerminalAttentionSettled({
-          ownerWorkspaceId,
-          runId: candidate.runId,
-          status: candidate.run.status,
-          runUpdatedAt: candidate.run.updatedAt,
-          settledAs: "superseded",
-        });
-      }
-    };
+      groupPin !== undefined
+        ? (groupPin ?? undefined)
+        : revalidation.wakeRestrictions.strictAgentResolution;
+    const { deliverableWorkspaceTurnNotificationIds, publicAwaitIds, suppressedNotificationIds } =
+      partitionWorkspaceTurnWakeCandidates(revalidation);
 
     // Sub-agent reports and failures are already durable user-context messages. Resume from history
     // directly instead of injecting a second user turn that merely tells the model they exist.
@@ -11826,56 +12509,109 @@ export class TaskService implements AgentTaskIntegration {
     if (publicAwaitIds.length > 0) {
       promptSections.push(buildCompletedWorkspaceTurnPrompt(publicAwaitIds));
     }
-    promptSections.push(...currentWorkflowPrompts.map((candidate) => candidate.prompt));
+    promptSections.push(...selection.currentWorkflowPrompts.map((candidate) => candidate.prompt));
     const prompt = promptSections.join("\n\n");
-    const effectivePending = nonWorkflowSendBackedOff
+    const effectivePending = revalidation.nonWorkflowSendBackedOff
       ? []
-      : pending.filter((notification) => {
+      : revalidation.pending.filter((notification) => {
           if (notification.sourceKind === "agent_task") {
-            return deliverableAgentNotificationIds.has(notification.id);
+            return revalidation.deliverableAgentNotificationIds.has(notification.id);
           }
           return deliverableWorkspaceTurnNotificationIds.has(notification.id);
         });
-    if (effectivePending.length === 0 && currentWorkflowPrompts.length === 0) {
-      await markSuppressedSuperseded();
-      // Suppression can empty the very batch that excluded agent-bound workflow groups; with
-      // nothing sent there is no streamEnded drain, so re-poke instead of parking the queued
-      // wake on the sweep. No spin: re-poke only when this drain durably changed state (a
-      // suppressed turn or superseded workflow was just marked), so the re-drain sees a
-      // different candidate set; an all-indeterminate batch parks for the sweep instead.
-      if (
-        deliverableWorkflowPrompts.length > 0 &&
-        (suppressedNotificationIds.length > 0 || supersededWorkflowPrompts.length > 0)
-      ) {
-        this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-      }
-      return;
+    return this.deliverTerminalWake({
+      ...revalidation,
+      ...selection,
+      suppressedNotificationIds,
+      effectivePending,
+      prompt,
+      effectiveStrictPin,
+    });
+  }
+
+  /**
+   * Delivers a drain's composed wake through a chain of steps: exitTerminalWakeWithoutDelivery,
+   * resumeTerminalWakeWithoutPrompt, or sendTerminalWakePrompt → fallBackFromBusyTerminalWake →
+   * sendBusyFallbackTerminalWake → finishTerminalWakeSend. Each step starts the next one in the
+   * same tick as its own last await, so no collaborator call runs a microtask later than it did
+   * inline; only the drain's own resolution comes later. This step stays synchronous: no await
+   * may separate the drain's batch revalidation from sendMessage.
+   */
+  private deliverTerminalWake(wake: TerminalWakeDelivery): Promise<void> {
+    if (wake.effectivePending.length === 0 && wake.currentWorkflowPrompts.length === 0) {
+      return this.exitTerminalWakeWithoutDelivery(wake);
     }
+    const sendOptions = this.buildTerminalWakeSendOptions(wake);
+    if (wake.prompt.length === 0) {
+      return this.resumeTerminalWakeWithoutPrompt(wake, sendOptions);
+    }
+    return this.sendTerminalWakePrompt(wake, sendOptions);
+  }
 
-    const markPendingDelivered = async () => {
-      for (const notification of effectivePending) {
-        await this.terminalAttentionStore.markDelivered(ownerWorkspaceId, notification.id);
-      }
-      for (const candidate of currentWorkflowPrompts) {
-        // Marker failures are contained inside the settle method; the delivered wake itself is
-        // durable history evidence, so the next evaluation settles this run as consumed.
-        await this.markWorkflowRunTerminalAttentionSettled({
-          ownerWorkspaceId,
-          runId: candidate.runId,
-          status: candidate.run.status,
-          runUpdatedAt: candidate.run.updatedAt,
-          settledAs: "delivered",
-        });
-      }
-    };
+  /** Nothing to send: marks the suppressed wakes superseded, and re-pokes when that changed state. */
+  private async exitTerminalWakeWithoutDelivery(wake: TerminalWakeDelivery): Promise<void> {
+    const { ownerWorkspaceId, suppressedNotificationIds, supersededWorkflowPrompts } = wake;
+    await this.markSuppressedTerminalWakesSuperseded(wake);
+    // Suppression can empty the very batch that excluded agent-bound workflow groups; with
+    // nothing sent there is no streamEnded drain, so re-poke instead of parking the queued
+    // wake on the sweep. No spin: re-poke only when this drain durably changed state (a
+    // suppressed turn or superseded workflow was just marked), so the re-drain sees a
+    // different candidate set; an all-indeterminate batch parks for the sweep instead.
+    if (
+      wake.deliverableWorkflowPrompts.length > 0 &&
+      (suppressedNotificationIds.length > 0 || supersededWorkflowPrompts.length > 0)
+    ) {
+      this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+    }
+  }
 
-    const markPendingForRetry = async () => {
-      for (const notification of effectivePending) {
-        await this.terminalAttentionStore.markPending(ownerWorkspaceId, notification.id);
-      }
-    };
+  /** Marks the wake's suppressed workspace turns and superseded workflow runs as settled. */
+  private async markSuppressedTerminalWakesSuperseded(wake: TerminalWakeDelivery): Promise<void> {
+    const { ownerWorkspaceId } = wake;
+    for (const id of wake.suppressedNotificationIds) {
+      await this.terminalAttentionStore.markSuperseded(ownerWorkspaceId, id);
+    }
+    for (const candidate of wake.supersededWorkflowPrompts) {
+      await this.markWorkflowRunTerminalAttentionSettled({
+        ownerWorkspaceId,
+        runId: candidate.runId,
+        status: candidate.run.status,
+        runUpdatedAt: candidate.run.updatedAt,
+        settledAs: "superseded",
+      });
+    }
+  }
 
-    const sendOptions = {
+  /** Marks the wake's notifications delivered and its workflow runs settled as delivered. */
+  private async markTerminalWakeDelivered(wake: TerminalWakeDelivery): Promise<void> {
+    const { ownerWorkspaceId } = wake;
+    for (const notification of wake.effectivePending) {
+      await this.terminalAttentionStore.markDelivered(ownerWorkspaceId, notification.id);
+    }
+    for (const candidate of wake.currentWorkflowPrompts) {
+      // Marker failures are contained inside the settle method; the delivered wake itself is
+      // durable history evidence, so the next evaluation settles this run as consumed.
+      await this.markWorkflowRunTerminalAttentionSettled({
+        ownerWorkspaceId,
+        runId: candidate.runId,
+        status: candidate.run.status,
+        runUpdatedAt: candidate.run.updatedAt,
+        settledAs: "delivered",
+      });
+    }
+  }
+
+  /** Returns the wake's notifications to pending after an accepted send failed before its stream. */
+  private async markTerminalWakePendingForRetry(wake: TerminalWakeDelivery): Promise<void> {
+    for (const notification of wake.effectivePending) {
+      await this.terminalAttentionStore.markPending(wake.ownerWorkspaceId, notification.id);
+    }
+  }
+
+  /** The wake's send options: the resolved identity plus the caller's restrictions and pin. */
+  private buildTerminalWakeSendOptions(wake: TerminalWakeDelivery): SendMessageOptions {
+    const { resumeOptions, wakeRestrictions, effectiveStrictPin, workspaceTurnMuxMetadata } = wake;
+    return {
       model: resumeOptions.model,
       agentId: resumeOptions.agentId,
       thinkingLevel: resumeOptions.thinkingLevel,
@@ -11886,45 +12622,59 @@ export class TaskService implements AgentTaskIntegration {
       ...(effectiveStrictPin != null ? { strictAgentResolution: effectiveStrictPin } : {}),
       ...(workspaceTurnMuxMetadata != null ? { muxMetadata: workspaceTurnMuxMetadata } : {}),
     };
-    if (prompt.length === 0) {
-      assert(agentNotifications.length > 0, "prompt-free terminal drain requires sub-agent work");
-      // No workspace-turn wakes are delivered on this path, so marking the
-      // suppressed ones first cannot go stale against a delivery.
-      await markSuppressedSuperseded();
-      const resumeResult = await this.workspaceService.resumeStream(ownerWorkspaceId, sendOptions, {
-        acceptanceOrigin: "automatic",
-        agentInitiated: true,
-        // A nested task owner resumed for a descendant's report runs an automatic task turn:
-        // it must not be able to create or replace that child's goal.
-        ...(entry.workspace.parentWorkspaceId ? { taskTurnKind: "recovery" as const } : {}),
+  }
+
+  /** A prompt-free wake: resumes the owner from history, which already holds the sub-agent reports. */
+  private async resumeTerminalWakeWithoutPrompt(
+    wake: TerminalWakeDelivery,
+    sendOptions: SendMessageOptions
+  ): Promise<void> {
+    const { ownerWorkspaceId, entry } = wake;
+    assert(
+      wake.agentNotifications.length > 0,
+      "prompt-free terminal drain requires sub-agent work"
+    );
+    // No workspace-turn wakes are delivered on this path, so marking the
+    // suppressed ones first cannot go stale against a delivery.
+    await this.markSuppressedTerminalWakesSuperseded(wake);
+    const resumeResult = await this.workspaceService.resumeStream(ownerWorkspaceId, sendOptions, {
+      acceptanceOrigin: "automatic",
+      agentInitiated: true,
+      // A nested task owner resumed for a descendant's report runs an automatic task turn:
+      // it must not be able to create or replace that child's goal.
+      ...(entry.workspace.parentWorkspaceId ? { taskTurnKind: "recovery" as const } : {}),
+    });
+    if (!resumeResult.success) {
+      // Persistent failures (for example a budget/model gate) are not made retryable by waiting for
+      // idle—the owner is already idle here. Keep the outbox entry pending for a later real signal.
+      log.warn("Prompt-free sub-agent resume failed; leaving attention pending", {
+        ownerWorkspaceId,
+        error: resumeResult.error,
       });
-      if (!resumeResult.success) {
-        // Persistent failures (for example a budget/model gate) are not made retryable by waiting for
-        // idle—the owner is already idle here. Keep the outbox entry pending for a later real signal.
-        log.warn("Prompt-free sub-agent resume failed; leaving attention pending", {
-          ownerWorkspaceId,
-          error: resumeResult.error,
-        });
-        // Same starvation shape as the prompt path: agent-bound groups were excluded by this
-        // batch, so back it off and re-poke to let them send under their own launch identity.
-        if (deliverableWorkflowPrompts.some((candidate) => candidate.initiatingAgent != null)) {
-          this.terminalAttention.backOffTerminalWakeSends(ownerWorkspaceId, [
-            NON_WORKFLOW_WAKE_BACKOFF_KEY,
-          ]);
-        }
-        return;
+      // Same starvation shape as the prompt path: agent-bound groups were excluded by this
+      // batch, so back it off and re-poke to let them send under their own launch identity.
+      if (wake.deliverableWorkflowPrompts.some((candidate) => candidate.initiatingAgent != null)) {
+        this.terminalAttention.backOffTerminalWakeSends(ownerWorkspaceId, [
+          NON_WORKFLOW_WAKE_BACKOFF_KEY,
+        ]);
       }
-      if (!resumeResult.data.started) {
-        this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
-        return;
-      }
-      await markPendingDelivered();
       return;
     }
+    if (!resumeResult.data.started) {
+      this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+      return;
+    }
+    await this.markTerminalWakeDelivered(wake);
+  }
 
-    let sendResult = await this.workspaceService.sendMessage(
-      ownerWorkspaceId,
-      prompt,
+  /** Sends the wake prompt idle-only, then marks the suppressed wakes superseded. */
+  private async sendTerminalWakePrompt(
+    wake: TerminalWakeDelivery,
+    sendOptions: SendMessageOptions
+  ): Promise<void> {
+    const sendResult = await this.workspaceService.sendMessage(
+      wake.ownerWorkspaceId,
+      wake.prompt,
       sendOptions,
       // Synthetic, idle-only auto-resume — same flags as the active-work auto-resume path.
       {
@@ -11942,8 +12692,21 @@ export class TaskService implements AgentTaskIntegration {
     // batch revalidation above from sendMessage. Best-effort: an early return
     // above leaves these pending, and a later drain re-derives suppression
     // from the records and drops them again.
-    await markSuppressedSuperseded();
+    await this.markSuppressedTerminalWakesSuperseded(wake);
+    return this.fallBackFromBusyTerminalWake(wake, sendOptions, sendResult);
+  }
 
+  /**
+   * After a busy idle-only rejection, retries the wake without requireIdle when the owner is idle
+   * again and no blocking work is active (sendBusyFallbackTerminalWake). Every other result goes
+   * on to finishTerminalWakeSend unchanged.
+   */
+  private async fallBackFromBusyTerminalWake(
+    wake: TerminalWakeDelivery,
+    sendOptions: SendMessageOptions,
+    sendResult: TerminalWakeSendResult
+  ): Promise<void> {
+    const { ownerWorkspaceId } = wake;
     if (!sendResult.success && isWorkspaceBusyIdleOnlySend(sendResult.error)) {
       const latestCfg = this.config.loadConfigOrDefault();
       const latestTaskIndex = this.buildAgentTaskIndex(latestCfg);
@@ -11954,61 +12717,79 @@ export class TaskService implements AgentTaskIntegration {
         !this.interruptedParentWorkspaceIds.has(ownerWorkspaceId) &&
         !(await this.hasBlockingActiveWorkForTerminalDrain(ownerWorkspaceId, latestTaskIndex))
       ) {
-        // Security: the composed prompt retains the pre-check workflow results, and this
-        // fallback send omits requireIdle, so its epoch snapshot postdates any clear or reset
-        // that completed during the awaited checks above and the clear guard would accept the
-        // stale injection into the fresh context. The busy race the primary send just lost
-        // may also have been a competing owner turn consuming these very results through
-        // kernel-nested task_await (settlement marker only, no history evidence) or a
-        // Workflows UI resume changing the run generation. Revalidate everything so the
-        // fallback keeps the primary path's contract (no awaits between revalidation and
-        // delivery); any stale candidate aborts toward a fresh drain that re-derives, and
-        // the queue entries survive for it.
-        if (currentWorkflowPrompts.length > 0) {
-          const fallbackRevalidation = await Promise.all(
-            currentWorkflowPrompts.map((candidate) =>
-              this.revalidateWorkflowPromptForDispatch(ownerWorkspaceId, candidate)
-            )
-          );
-          if (fallbackRevalidation.some((verdict) => verdict !== "deliverable")) {
-            log.debug("Terminal wake busy fallback aborted; workflow candidates went stale", {
-              ownerWorkspaceId,
-            });
-            this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
-            return;
-          }
-        }
-        let fallbackAccepted = false;
-        sendResult = await this.workspaceService.sendMessage(
-          ownerWorkspaceId,
-          prompt,
-          sendOptions,
-          {
-            acceptanceOrigin: "automatic",
-            skipAutoResumeReset: true,
-            synthetic: true,
-            agentInitiated: true,
-            // Same wake as the primary send above (#4721).
-            skipOnSendCompaction: true,
-            onCanceled: () => {
-              this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
-            },
-            onAcceptedPreStreamFailure: async () => {
-              await markPendingForRetry();
-              this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
-            },
-            onAccepted: async () => {
-              fallbackAccepted = true;
-              await markPendingDelivered();
-            },
-          }
-        );
-        if (sendResult.success && !fallbackAccepted) {
-          return;
-        }
+        return this.sendBusyFallbackTerminalWake(wake, sendOptions);
       }
     }
+    return this.finishTerminalWakeSend(wake, sendResult);
+  }
 
+  /** Revalidates the wake's workflow candidates and sends the wake again, without requireIdle. */
+  private async sendBusyFallbackTerminalWake(
+    wake: TerminalWakeDelivery,
+    sendOptions: SendMessageOptions
+  ): Promise<void> {
+    const { ownerWorkspaceId, currentWorkflowPrompts } = wake;
+    // Security: the composed prompt retains the pre-check workflow results, and this
+    // fallback send omits requireIdle, so its epoch snapshot postdates any clear or reset
+    // that completed during the awaited checks above and the clear guard would accept the
+    // stale injection into the fresh context. The busy race the primary send just lost
+    // may also have been a competing owner turn consuming these very results through
+    // kernel-nested task_await (settlement marker only, no history evidence) or a
+    // Workflows UI resume changing the run generation. Revalidate everything so the
+    // fallback keeps the primary path's contract (no awaits between revalidation and
+    // delivery); any stale candidate aborts toward a fresh drain that re-derives, and
+    // the queue entries survive for it.
+    if (currentWorkflowPrompts.length > 0) {
+      const fallbackRevalidation = await Promise.all(
+        currentWorkflowPrompts.map((candidate) =>
+          this.revalidateWorkflowPromptForDispatch(ownerWorkspaceId, candidate)
+        )
+      );
+      if (fallbackRevalidation.some((verdict) => verdict !== "deliverable")) {
+        log.debug("Terminal wake busy fallback aborted; workflow candidates went stale", {
+          ownerWorkspaceId,
+        });
+        this.scheduleTerminalAttentionDrain(ownerWorkspaceId);
+        return;
+      }
+    }
+    let fallbackAccepted = false;
+    const sendResult = await this.workspaceService.sendMessage(
+      ownerWorkspaceId,
+      wake.prompt,
+      sendOptions,
+      {
+        acceptanceOrigin: "automatic",
+        skipAutoResumeReset: true,
+        synthetic: true,
+        agentInitiated: true,
+        // Same wake as the primary send above (#4721).
+        skipOnSendCompaction: true,
+        onCanceled: () => {
+          this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+        },
+        onAcceptedPreStreamFailure: async () => {
+          await this.markTerminalWakePendingForRetry(wake);
+          this.terminalAttention.scheduleTerminalAttentionDrainAfterIdle(ownerWorkspaceId);
+        },
+        onAccepted: async () => {
+          fallbackAccepted = true;
+          await this.markTerminalWakeDelivered(wake);
+        },
+      }
+    );
+    if (sendResult.success && !fallbackAccepted) {
+      return;
+    }
+    return this.finishTerminalWakeSend(wake, sendResult);
+  }
+
+  /** A rejected wake backs off its batches (non-busy rejections) and stays pending; else delivered. */
+  private async finishTerminalWakeSend(
+    wake: TerminalWakeDelivery,
+    sendResult: TerminalWakeSendResult
+  ): Promise<void> {
+    const { ownerWorkspaceId, currentWorkflowPrompts, workflowInitiatingAgent } = wake;
     if (!sendResult.success) {
       if (!isWorkspaceBusyIdleOnlySend(sendResult.error)) {
         // A non-busy rejection is likely batch-specific (an unresolvable pinned agent, a model
@@ -12024,7 +12805,7 @@ export class TaskService implements AgentTaskIntegration {
             workflowInitiatingAgent != null ? workflowWakeGroupKey(workflowInitiatingAgent) : ""
           );
         }
-        if (effectivePending.length > 0) {
+        if (wake.effectivePending.length > 0) {
           backoffKeys.push(NON_WORKFLOW_WAKE_BACKOFF_KEY);
         }
         if (backoffKeys.length > 0) {
@@ -12040,7 +12821,7 @@ export class TaskService implements AgentTaskIntegration {
       return;
     }
 
-    await markPendingDelivered();
+    await this.markTerminalWakeDelivered(wake);
   }
 
   /** See TaskWaiters.backgroundForegroundWaitIfQueued. */

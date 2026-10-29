@@ -3270,6 +3270,16 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
   }
 
   /**
+   * Like hasRunningBackgroundProcesses, after checking whether the workspace's running processes
+   * exited: a job killed outside Xum must not read as running (for example to keep a remote
+   * sandbox awake).
+   */
+  async hasLiveBackgroundProcesses(workspaceId: string): Promise<boolean> {
+    await this.refreshRunningStatuses(workspaceId);
+    return this.hasRunningBackgroundProcesses(workspaceId);
+  }
+
+  /**
    * Crash-orphan probe: whether a durable spawn record shows a still-running process for this
    * workspace that this manager does not track. Processes run under nohup/setsid, so they
    * survive an unclean app shutdown while the in-memory map resets; without this probe the
@@ -3640,9 +3650,9 @@ export class BackgroundProcessManager extends EventEmitter<BackgroundProcessMana
    * Check all "running" processes and update status if they've exited.
    * Called lazily from list() to avoid polling overhead.
    */
-  private async refreshRunningStatuses(): Promise<void> {
+  private async refreshRunningStatuses(workspaceId?: string): Promise<void> {
     const runningProcesses = Array.from(this.processes.values()).filter(
-      (p) => p.status === "running"
+      (p) => p.status === "running" && (workspaceId === undefined || p.workspaceId === workspaceId)
     );
 
     for (const proc of runningProcesses) {

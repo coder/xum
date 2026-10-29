@@ -3,7 +3,32 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { isXumRootShared } from "./sshForwardTarget";
+import { DaytonaSSHRuntime } from "@/node/runtime/DaytonaSSHRuntime";
+import { SSHRuntime } from "@/node/runtime/SSHRuntime";
+import { createSSHTransport } from "@/node/runtime/transports";
+import { createDaytonaTestRig } from "@/node/services/daytona/daytona.testHarness";
+
+import { createSshForwardTarget, isXumRootShared } from "./sshForwardTarget";
+
+describe("createSshForwardTarget", () => {
+  test("gives a Daytona sandbox no forward (its gateway refuses remote port forwarding)", async () => {
+    const rig = await createDaytonaTestRig();
+    try {
+      const plain = { host: "box", srcBaseDir: "~/src" };
+      const daytona = { ...plain, host: "sb-1.xum--daytona", daytona: { sandboxName: "sb-1" } };
+      const sshTarget = createSshForwardTarget(
+        new SSHRuntime(plain, createSSHTransport(plain, false))
+      );
+      const daytonaTarget = createSshForwardTarget(
+        new DaytonaSSHRuntime(daytona, createSSHTransport(daytona, false), rig.service)
+      );
+      expect(sshTarget).toBeDefined();
+      expect(daytonaTarget).toBeUndefined();
+    } finally {
+      await rig.cleanup();
+    }
+  });
+});
 
 describe("isXumRootShared", () => {
   let rootDir: string;

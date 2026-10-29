@@ -67,6 +67,7 @@
                   "runtime/worktree",
                   "runtime/ssh",
                   "runtime/coder",
+                  "runtime/daytona",
                   "runtime/docker",
                   "runtime/devcontainer"
                 ]

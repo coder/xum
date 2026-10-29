@@ -106,9 +106,9 @@ import type { PreflightCounter } from "@/node/services/preflightCounter";
  * Independent field → tag listing for every DI-built ORPC context field (the
  * production mapping lives in the Layer files); `Record<keyof …>` keeps it
  * exhaustive, so a field added to `ORPCContext` without a tag fails to compile
- * here. `perfFlightRecorder`, `perfCaptures`, `perfReports`, `sessionTapes` and
- * `agentResourceLimits` are container-owned (constructed directly by ServiceContainer, outside
- * the DI graph) and are checked separately below. `rowTreeClient` is added by `xum server` only
+ * here. `perfFlightRecorder`, `perfCaptures`, `perfReports`, `sessionTapes`,
+ * `agentResourceLimits` and `daytonaService` are container-owned (constructed directly by
+ * ServiceContainer, outside the DI graph) and are checked separately below. `rowTreeClient` is added by `xum server` only
  * (src/cli/server.ts).
  */
 const ORPC_FIELD_TAGS: Record<
@@ -123,6 +123,7 @@ const ORPC_FIELD_TAGS: Record<
     | "perfReports"
     | "sessionTapes"
     | "agentResourceLimits"
+    | "daytonaService"
   >,
   Context.Key<AppTags, unknown>
 > = {
@@ -925,6 +926,7 @@ describe("ServiceContainer", () => {
     "telemetryService.initialize",
     "coderOauthService.separateDiscoveredModels",
     "experimentsService.initialize",
+    "daytonaService.loadPersistedTokens",
     "bashAiProxy.restore",
     "projectService.watchProjectTrust",
     "agentResourceLimits.start",
@@ -1219,7 +1221,28 @@ describe("ServiceContainer", () => {
     expect(recoverTasks).not.toHaveBeenCalled();
   });
 
-  it("initializeCore records the eight core steps and re-runs them when called again", async () => {
+  it("initializeCore registers Daytona's saved ssh tokens before the bash AI proxy restores forwards", async () => {
+    services = new ServiceContainer(stores);
+    spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(undefined);
+    // Forward restoration starts ssh in the background; its errors may quote a token.
+    const restore = spyOn(services.bashAiProxy, "restore").mockResolvedValue(undefined);
+    let tokensRequested!: () => void;
+    const requested = new Promise<void>((resolve) => (tokensRequested = resolve));
+    let releaseTokens!: () => void;
+    spyOn(services.daytonaService.ssh, "loadPersistedTokens").mockImplementation(() => {
+      tokensRequested();
+      return new Promise<void>((resolve) => (releaseTokens = resolve));
+    });
+
+    const core = services.initializeCore();
+    await requested;
+    expect(restore).not.toHaveBeenCalled();
+    releaseTokens();
+    await core;
+    expect(restore).toHaveBeenCalledTimes(1);
+  });
+
+  it("initializeCore records the nine core steps and re-runs them when called again", async () => {
     services = new ServiceContainer(stores);
     const recoverTasks = spyOn(services.taskService, "recoverInterruptedTasks").mockResolvedValue(
       undefined
@@ -1689,6 +1712,7 @@ describe("ServiceContainer", () => {
     expect(orpcContext.perfReports).toBe(services.perfReports);
     expect(orpcContext.sessionTapes).toBe(services.sessionTapes);
     expect(orpcContext.agentResourceLimits).toBe(services.agentResourceLimits);
+    expect(orpcContext.daytonaService).toBe(services.daytonaService);
     expect(services.runtime.get(IdleDispatcherTag)).toBe(services.idleDispatcher);
     expect(services.runtime.get(StreamManagerTag).effectRunner).toBe(
       services.runtime.get(EffectRunnerTag)
