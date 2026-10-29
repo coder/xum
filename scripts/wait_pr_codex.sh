@@ -107,6 +107,7 @@ GRAPHQL_QUERY='query($owner: String!, $repo: String!, $pr: Int!) {
     pullRequest(number: $pr) {
       state
       headRefOid
+      commits(last: 1) { nodes { commit { committedDate } } }
       comments(last: 100) {
         pageInfo {
           hasPreviousPage
@@ -370,6 +371,25 @@ run_codex_comments_gate() {
   fi
 }
 
+# A push-triggered Codex run posts no security receipt (coder/xum#7731), so the gate waits on
+# one. Ask for it once per head: skip while a review request newer than the head commit exists.
+request_security_review_once() {
+  local pr_data="$1" head="$2" committed_at requested
+  if ! printf '%s' "$pr_data" | jq -e -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$head" \
+    'include "codex_comments"; .data.repository.pullRequest.comments.nodes | codex_security_receipt_missing($bot; $head)' >/dev/null; then
+    return 0
+  fi
+  committed_at=$(printf '%s' "$pr_data" | jq -r '.data.repository.pullRequest.commits.nodes[0].commit.committedDate // empty')
+  # Without the head's commit time a request cannot be matched to this head: never post then.
+  [[ -n "$committed_at" ]] || return 0
+  requested=$(printf '%s' "$pr_data" | jq -r --arg bot "$BOT_LOGIN_GRAPHQL" --arg since "$committed_at" \
+    '[.data.repository.pullRequest.comments.nodes[] | select(.author.login != $bot and .createdAt > $since
+      and (.body | contains("@codex review") or contains("@codex security review")))] | length')
+  [[ "$requested" == "0" ]] || return 0
+  echo "⏳ Codex finished without a security receipt for ${head:0:10}; requesting a Codex security review."
+  gh pr comment "$PR_NUMBER" --repo "$OWNER/$REPO" --body "@codex security review" >/dev/null
+}
+
 CHECK_CODEX_STATUS_ONCE() {
   local pr_data
   local pr_state
@@ -542,6 +562,7 @@ CHECK_CODEX_STATUS_ONCE() {
   case "$check_rc" in
     0) ;;
     10)
+      request_security_review_once "$pr_data" "$pr_head" || return 1
       return 10
       ;;
     *)

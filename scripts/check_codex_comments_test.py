@@ -71,7 +71,7 @@ def connection(nodes, more=False):
     }
 
 
-def snapshot(comments=(), threads=(), reactions=(), more=False, head=None):
+def snapshot(comments=(), threads=(), reactions=(), more=False, head=None, committed_at=None):
     # The PR head defaults to the head of the first board in the snapshot, so a
     # fixture board describes the current head unless a test says otherwise.
     if head is None:
@@ -86,6 +86,11 @@ def snapshot(comments=(), threads=(), reactions=(), more=False, head=None):
                     "comments": connection(list(comments), more),
                     "reviewThreads": connection(list(threads), more),
                     "reactions": connection(list(reactions)),
+                    **(
+                        {"commits": {"nodes": [{"commit": {"committedDate": committed_at}}]}}
+                        if committed_at
+                        else {}
+                    ),
                 }
             }
         }
@@ -103,6 +108,11 @@ class CodexGateTest(unittest.TestCase):
         gh.write_text("""#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
+if args[:2] == ['pr', 'comment']:
+    # The only write the scripts may make: a Codex review request (wait_pr_codex.sh).
+    with open(os.environ['CODEX_GATE_POSTS'], 'a') as posts:
+        posts.write(args[args.index('--body') + 1] + '\\n')
+    sys.exit(0)
 assert args[:2] == ['api', 'graphql'], args
 query = next(arg[6:] for arg in args if arg.startswith('query='))
 cursor = next((arg[7:] for arg in args if arg.startswith('cursor=')), 'null')
@@ -151,6 +161,8 @@ else:
             round_marker.unlink()
         calls = self.directory / "calls"
         calls.write_text("")
+        self.posts = self.directory / "posts"
+        self.posts.write_text("")
         cache_file = self.directory / "cache.json"
         if cache is not None:
             cache_file.write_text(json.dumps(cache))
@@ -164,6 +176,7 @@ else:
                 "PATH": str(self.directory) + os.pathsep + os.environ["PATH"],
                 "CODEX_GATE_FIXTURE": str(fixture),
                 "CODEX_GATE_CALLS": str(calls),
+                "CODEX_GATE_POSTS": str(self.posts),
                 "MUX_GH_OWNER": "fixture",
                 "MUX_GH_REPO": "fixture",
                 "MUX_SKIP_FETCH_SYNC": "1",
@@ -330,9 +343,10 @@ else:
         self.assertNotEqual(running, board)
         for case, comments, threads, pr_head, expected in (
             ("clean receipt for this head", [board, receipt], [], head, 0),
-            ("no receipt", [board], [], head, 1),
+            # Pending, not failed: a push-triggered run posts no receipt (coder/xum#7731).
+            ("no receipt", [board], [], head, 10),
             ("open Codex thread", [board, receipt], [open_thread], head, 1),
-            ("receipt for an older head", [board, older_receipt], [], head, 1),
+            ("receipt for an older head", [board, older_receipt], [], head, 10),
             # Unknown, not "older review in progress": null flags are clean only for this head.
             ("board and receipt for an older head", [board, receipt], [], NEWER_HEAD, 1),
             ("advisory section", [advisory, receipt], [], head, 1),
@@ -346,7 +360,31 @@ else:
                     self.assert_gate(expected, data, cache=data if cached else None)
         with self.subTest("a minimized receipt does not count"):
             data = snapshot([comment(board), comment(receipt, minimized=True)], head=head)
-            self.assert_gate(1, data)
+            self.assert_gate(10, data)
+        with self.subTest("the CI wait ends once the receipt lands"):
+            pending = snapshot([comment(board)], head=head)
+            self.assert_gate(0, [pending, snapshot([comment(board), comment(receipt)], head=head)], wait=60)
+            self.assertEqual(self.comment_rounds, 2)
+        with self.subTest("a finding still fails while the receipt is pending"):
+            data = snapshot([comment(board)], [open_thread], head=head)
+            self.assert_gate(1, data, wait=60)
+
+    def test_missing_security_receipt_is_requested_once_per_head(self):
+        board = FIXTURES["review_state_null_security_summary"]["body"]
+        receipt = FIXTURES["receipt_security_no_findings_null_board"]["body"]
+        head = board_head(board)
+        request = comment("@codex review", "maintainer", BEFORE)
+        newer = comment("@codex security review", "maintainer", AFTER)
+        for case, comments, committed_at, posts in (
+            ("request older than the head", [request, comment(board)], REQUEST, 1),
+            ("request newer than the head", [request, newer, comment(board)], REQUEST, 0),
+            ("receipt present", [request, comment(board), comment(receipt)], REQUEST, 0),
+            ("head commit time unknown", [request, comment(board)], None, 0),
+        ):
+            with self.subTest(case=case):
+                data = snapshot(comments, head=head, committed_at=committed_at)
+                self.run_gate(data, "wait_pr_codex.sh")
+                self.assertEqual(self.posts.read_text().splitlines(), ["@codex security review"] * posts)
 
     def test_resolved_codex_threads_clear_unresolved_review_state(self):
         # Codex keeps has_unresolved_findings true after its threads are resolved

@@ -40,6 +40,16 @@ def codex_clean_security_receipt_for($bot; $head):
     and ([.body | codex_without_help | capture(codex_clean_security_receipt) | .commit // empty]
       | any(. as $commit | $head | startswith($commit))));
 
+# Input: PR comment nodes. Output: whether Codex finished a security review of $head with null
+# findings flags and no clean receipt for $head exists yet (see codex_summary_status).
+def codex_security_receipt_missing($bot; $head):
+  ([.[] | select(.author.login == $bot and .isMinimized == false)
+    | .body | select(startswith(codex_summary_marker))
+    | first(capture("<!-- codex-review-state:v1 (?<p>.*) -->").p | fromjson? | .security_review)
+    | select(.commit_sha == $head and .status == "completed"
+        and .has_unresolved_findings == null and .has_any_findings == null)] | length > 0)
+  and (codex_clean_security_receipt_for($bot; $head) | not);
+
 # Input: review thread nodes. Output: the root comment IDs of resolved Codex
 # threads, the IDs that board advisory links use (#discussion_r<id>).
 def codex_resolved_discussions($bot):
@@ -111,8 +121,12 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
           # set by check_codex_comments.sh). Any other null stays unknown, so it blocks.
           | ($security.status == "completed" and $security.headSha == $head
             and $security.mergeGateEnabled == false
-            and ($lines | any(. == "### Security findings" or test("^#### Advisory findings")) | not)
-            and $cleared.clean_security_receipt == true) as $null_security_ok
+            and ($lines | any(. == "### Security findings" or test("^#### Advisory findings")) | not))
+            as $null_security_base
+          # Runs triggered by a push post no receipt (coder/xum#7731): until a Codex security
+          # review request brings one, such a board is pending, so wait budgets cover it.
+          | ($state | any(.security_review | .status == "completed"
+              and .has_unresolved_findings == null and .has_any_findings == null)) as $null_security
           | if $lines[0] == codex_summary_marker
             # Unknown state fields or statuses could be findings. has_any_findings
             # stays true after findings are resolved, so it is not used.
@@ -127,7 +141,7 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
                 # Codex sends null only while a review runs; a completed one must say false.
                 and (.has_unresolved_findings == false
                   or (.has_unresolved_findings == null and .status == "running")
-                  or ($kind == "security_review" and $null_security_ok and .commit_sha == $head
+                  or ($kind == "security_review" and $null_security_base and .commit_sha == $head
                     and .status == "completed" and .has_unresolved_findings == null
                     and .has_any_findings == null)
                   # Codex keeps true after its threads are resolved, until it reviews
@@ -174,6 +188,7 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
             # it, which must be the current head: Codex starts both reviews together on
             # each push or request, so an older push's code review cannot sit next to it.
             then (if $security.status == "running" or ($lines[2:] | any(test(codex_running_row)))
+                     or ($null_security and $cleared.clean_security_receipt != true)
                      or $security.headSha != $head
                      or ($reviews | any(.status == "running" or (.commit_sha // $head) != $head))
                   then "running" else "completed" end)
