@@ -22,6 +22,13 @@ function wrapSystemUpdate(content: string): string {
   return `${SYSTEM_UPDATE_OPEN}${content}${SYSTEM_UPDATE_CLOSE}`;
 }
 
+const PLAN_FILE_REFERENCE_LEAD = "A plan file exists from plan mode at: ";
+
+/** Whether rendered attachments carry a plan; a plan is always the first block. */
+export function rendersPlanFileReference(content: string): boolean {
+  return content.startsWith(`${SYSTEM_UPDATE_OPEN}${PLAN_FILE_REFERENCE_LEAD}`);
+}
+
 /**
  * Render a todo list attachment to a content string.
  */
@@ -140,13 +147,13 @@ function renderPlanFileReferenceWithBudget(
     return null;
   }
 
-  const prefix = `A plan file exists from plan mode at: ${attachment.planFilePath}\n\nPlan contents:\n`;
+  const prefix = `${PLAN_FILE_REFERENCE_LEAD}${attachment.planFilePath}\n\nPlan contents:\n`;
   const suffix =
     "\n\nIf this plan is relevant to the current work and not already complete, continue working on it.";
 
   const availableForContent = maxChars - prefix.length - suffix.length;
   if (availableForContent <= 0) {
-    const minimal = `A plan file exists from plan mode at: ${attachment.planFilePath}`;
+    const minimal = `${PLAN_FILE_REFERENCE_LEAD}${attachment.planFilePath}`;
     return minimal.length <= maxChars ? minimal : null;
   }
 

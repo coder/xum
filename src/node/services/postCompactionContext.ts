@@ -10,7 +10,10 @@ import {
   COMPACTION_BOUNDARY_ROW_HEADROOM_BYTES,
   SESSION_HISTORY_MAX_LINE_BYTES,
 } from "@/common/constants/contextBudget";
-import { renderAttachmentsToContentWithBudget } from "@/browser/utils/messages/attachmentRenderer";
+import {
+  renderAttachmentsToContentWithBudget,
+  rendersPlanFileReference,
+} from "@/browser/utils/messages/attachmentRenderer";
 import {
   isDurableCompactionBoundaryMarker,
   isDurableContextBoundaryMarker,
@@ -70,6 +73,12 @@ export function findPostCompactionContext(
 /** Skills that the latest boundary's header loads into every request of its window. */
 export function findPostCompactionContextSkillNames(messages: readonly MuxMessage[]): string[] {
   return findPostCompactionContext(messages)?.skillNames ?? [];
+}
+
+/** Whether the latest boundary's header carries the plan file. */
+export function postCompactionContextCarriesPlan(messages: readonly MuxMessage[]): boolean {
+  const context = findPostCompactionContext(messages);
+  return context != null && rendersPlanFileReference(context.text);
 }
 
 /** The id of the latest context boundary when its header renders into the request. */

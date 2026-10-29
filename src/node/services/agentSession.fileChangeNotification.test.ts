@@ -151,67 +151,103 @@ describe("AgentSession file-change notification (turn start)", () => {
     expect(notificationText).toContain("+plan v2");
   }
 
+  /** Compact for real; the boundary header holds the plan unless exclusions.json drops it. */
+  async function compact(session: AgentSession, historyService: HistoryService): Promise<void> {
+    const handler = (session as unknown as { contextController: { compaction: CompactionHandler } })
+      .contextController.compaction;
+    expect(
+      await handler.persistContinuousCompaction({
+        preparation: handler.beginPreparation(() => true),
+        publication: {
+          generation: await historyService.getContinuousCompactionJournal("ws").captureGeneration(),
+        },
+        attachmentMessages: [],
+        messages: [],
+        boundaryMessageId: "boundary",
+        text: "summary",
+        model: "anthropic:claude-sonnet-4-5",
+        tail: [],
+        systemMessageTokens: 0,
+        attachmentTokens: 0,
+        shouldPersist: () => true,
+      })
+    ).toBe(true);
+    // A user row after the boundary lets every later resume start a turn.
+    await historyService.appendToHistory(
+      "ws",
+      createMuxMessage("user-2", "user", "continue", { timestamp: Date.now() })
+    );
+  }
+
+  async function writeExclusions(config: { sessionsDir: string }, excludedItems: string[]) {
+    const sessionDir = join(config.sessionsDir, "ws");
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(join(sessionDir, "exclusions.json"), JSON.stringify({ excludedItems }));
+  }
+
+  async function resume(session: AgentSession): Promise<void> {
+    const result = await session.resumeStream({
+      model: "anthropic:claude-sonnet-4-5",
+      agentId: "exec",
+    });
+    expect(result.success).toBe(true);
+  }
+
+  async function countNotifications(historyService: HistoryService): Promise<number> {
+    const historyResult = await historyService.getHistoryFromLatestBoundary("ws");
+    if (!historyResult.success) throw new Error(historyResult.error);
+    return historyResult.data.filter((m) => m.id.startsWith("file-change-")).length;
+  }
+
   test("a plan edit between compaction and the next turn appends a notification", async () => {
     await withPlanFile(async (planFile) => {
       const { historyService, session } = await createSessionFixture();
       // Nothing tracks the plan before this compaction, whose boundary header holds "plan v1".
-      const handler = (
-        session as unknown as { contextController: { compaction: CompactionHandler } }
-      ).contextController.compaction;
-      expect(
-        await handler.persistContinuousCompaction({
-          preparation: handler.beginPreparation(() => true),
-          publication: {
-            generation: await historyService
-              .getContinuousCompactionJournal("ws")
-              .captureGeneration(),
-          },
-          attachmentMessages: [],
-          messages: [],
-          boundaryMessageId: "boundary",
-          text: "summary",
-          model: "anthropic:claude-sonnet-4-5",
-          tail: [],
-          systemMessageTokens: 0,
-          attachmentTokens: 0,
-          shouldPersist: () => true,
-        })
-      ).toBe(true);
+      await compact(session, historyService);
 
       await editPlanExternally(planFile);
-      const result = await session.resumeStream({
-        model: "anthropic:claude-sonnet-4-5",
-        agentId: "exec",
-      });
-      expect(result.success).toBe(true);
+      await resume(session);
       await expectOnePlanNotification(historyService);
     });
   });
 
   test("an external plan edit after compaction appends a notification", async () => {
     await withPlanFile(async (planFile) => {
-      const { historyService, session, config } = await createSessionFixture();
-      const sessionDir = join(config.sessionsDir, "ws");
-      await mkdir(sessionDir, { recursive: true });
-      await writeFile(
-        join(sessionDir, "post-compaction.json"),
-        JSON.stringify({ version: 1, createdAt: Date.now(), diffs: [], loadedSkills: [] })
-      );
-
+      const { historyService, session } = await createSessionFixture();
+      await compact(session, historyService);
       // The first turn after compaction consumes the pending state and clears the tracker.
-      const firstResult = await session.resumeStream({
-        model: "anthropic:claude-sonnet-4-5",
-        agentId: "exec",
-      });
-      expect(firstResult.success).toBe(true);
+      await resume(session);
 
       await editPlanExternally(planFile);
-      const secondResult = await session.resumeStream({
-        model: "anthropic:claude-sonnet-4-5",
-        agentId: "exec",
-      });
-      expect(secondResult.success).toBe(true);
+      await resume(session);
       await expectOnePlanNotification(historyService);
+    });
+  });
+
+  test("plan tracking follows the boundary header, not exclusions changed after it", async () => {
+    await withPlanFile(async (planFile) => {
+      const { historyService, session, config } = await createSessionFixture();
+      await compact(session, historyService);
+      await writeExclusions(config, ["plan"]);
+      await resume(session);
+
+      await editPlanExternally(planFile);
+      await resume(session);
+      await expectOnePlanNotification(historyService);
+    });
+  });
+
+  test("a plan excluded at compaction stays untracked when the exclusion is removed", async () => {
+    await withPlanFile(async (planFile) => {
+      const { historyService, session, config } = await createSessionFixture();
+      await writeExclusions(config, ["plan"]);
+      await compact(session, historyService);
+      await writeExclusions(config, []);
+      await resume(session);
+
+      await editPlanExternally(planFile);
+      await resume(session);
+      expect(await countNotifications(historyService)).toBe(0);
     });
   });
 
