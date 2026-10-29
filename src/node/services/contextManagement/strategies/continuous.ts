@@ -15,6 +15,7 @@ import { ContinuousCompactor, type ContinuousCompactionContext } from "../../con
 import { summarizeContinuousCompaction } from "../../continuousCompactionSummary";
 import { estimatePostCompactionContextTokens } from "../../postCompactionContext";
 import type { CompactionHandler } from "../../compactionHandler";
+import type { CompactionPreparationSnapshot } from "../../compactionPreparationLifecycle";
 import type { CompactionMonitor } from "../../compactionMonitor";
 import type { CompactionToken } from "../../turnCoordinator";
 import { eventSpine } from "../../events/eventSpine";
@@ -26,6 +27,12 @@ import type { SessionContextHost } from "../sessionContextHost";
 import type { StreamContextSnapshot } from "../types";
 
 type SessionCompactionContext = ContinuousCompactionContext & { sendOptions?: SendMessageOptions };
+
+const NO_ATTACHMENTS: CompactionPreparationSnapshot = {
+  diffs: [],
+  loadedSkills: [],
+  readFiles: [],
+};
 
 function is1MContextEnabledForModel(
   model: string,
@@ -113,17 +120,17 @@ export class ContinuousStrategy {
   }
 
   private async buildContinuousPostCompactionContext(head: MuxMessage[]) {
-    const pending = await this.handler.peekPendingState();
-    const warm = await this.handler.peekCarryoverState();
+    const pending = (await this.handler.peekPendingState()) ?? NO_ATTACHMENTS;
+    const warm = (await this.handler.peekCarryoverState()) ?? NO_ATTACHMENTS;
     return this.host.buildPostCompactionContext({
-      diffs: [...(pending?.diffs ?? []), ...extractEditedFileDiffs(head)],
+      diffs: [...pending.diffs, ...extractEditedFileDiffs(head)],
       loadedSkills: mergeLoadedSkillSnapshots([
-        ...(warm?.loadedSkills ?? []),
-        ...(pending?.loadedSkills ?? []),
+        ...warm.loadedSkills,
+        ...pending.loadedSkills,
         ...extractLoadedSkillSnapshotsFromMessages(head),
       ]),
-      readFilePaths: mergeReadFilePaths(warm?.readFiles ?? [], [
-        ...(pending?.readFiles ?? []),
+      readFilePaths: mergeReadFilePaths(warm.readFiles, [
+        ...pending.readFiles,
         ...extractReadFilePaths(head),
       ]),
       // Wall clock on purpose: TaskService and WorkflowService stamp report
