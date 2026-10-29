@@ -117,18 +117,6 @@ export class FileChangeTracker {
     this.fileState.set(canonicalPath, state);
   }
 
-  /**
-   * Resolve the path now and return a write that records the file only when it has no baseline
-   * then; an existing baseline may hold an unreported edit. The write does not await, so a caller
-   * can resolve inside a time box and write only if the box was met.
-   */
-  async prepareRecordIfUntracked(filePath: string, state: FileState): Promise<() => void> {
-    const canonicalPath = await this.canonicalize(filePath);
-    return () => {
-      if (!this.fileState.has(canonicalPath)) this.fileState.set(canonicalPath, state);
-    };
-  }
-
   /** Capture only these accepted states, before later tool reads can replace their baseline. */
   captureSnapshotBaseline(states: readonly FileState[]): { restore(): void; forget(): void } {
     const accepted = new Set(states);
@@ -163,6 +151,14 @@ export class FileChangeTracker {
   /** Clear all tracked state (e.g., on /clear). */
   clear(): void {
     this.fileState.clear();
+  }
+
+  /** Clear all tracked state except the baseline of this file. */
+  async clearExcept(filePath: string | undefined): Promise<void> {
+    const keptPath = filePath == null ? undefined : await this.canonicalize(filePath);
+    const kept = keptPath == null ? undefined : this.fileState.get(keptPath);
+    this.fileState.clear();
+    if (keptPath != null && kept) this.fileState.set(keptPath, kept);
   }
 
   /**

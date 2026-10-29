@@ -4,7 +4,11 @@ import {
   postCompactionContextMessageId,
   type MuxMessage,
   type PostCompactionContext,
+  type PostCompactionPlan,
 } from "@/common/types/message";
+import { isNonNegativeInteger } from "@/common/utils/numbers";
+import { isPlainObject } from "@/common/utils/isPlainObject";
+import { readStringArray } from "@/common/utils/readStringArray";
 import { MAX_POST_COMPACTION_INJECTION_CHARS } from "@/common/constants/attachments";
 import {
   COMPACTION_BOUNDARY_ROW_HEADROOM_BYTES,
@@ -39,27 +43,52 @@ export interface PostCompactionContextInput {
  * renderer change cannot alter the bytes that earlier requests sent.
  */
 export function renderPostCompactionContext(
-  attachments: PostCompactionAttachment[]
+  attachments: PostCompactionAttachment[],
+  plan: PostCompactionPlan | null
 ): PostCompactionContext | null {
   const text = renderAttachmentsToContentWithBudget(attachments, {
     maxChars: MAX_POST_COMPACTION_INJECTION_CHARS,
   });
-  return text.length > 0 ? { text, skillNames: loadedSnapshotSkillNames(attachments) } : null;
+  if (text.length === 0) return null;
+  const context = { text, skillNames: loadedSnapshotSkillNames(attachments) };
+  // The budget can leave the plan out of the text; then the window has no plan to track.
+  return plan && rendersPlanFileReference(text) ? { ...context, plan } : context;
 }
 
-/** The header of a compaction boundary row; a malformed persisted value counts as none. */
-function readPostCompactionContext(message: MuxMessage): PostCompactionContext | null {
+function readPostCompactionPlan(plan: unknown): PostCompactionPlan | undefined {
+  if (!isPlainObject(plan)) return undefined;
+  const { path, content, modifiedTimeMs } = plan;
+  return typeof path === "string" &&
+    typeof content === "string" &&
+    typeof modifiedTimeMs === "number" &&
+    Number.isFinite(modifiedTimeMs)
+    ? { path, content, modifiedTimeMs }
+    : undefined;
+}
+
+/**
+ * The header of a compaction boundary row, also when requests leave it out; a malformed
+ * persisted value counts as none.
+ */
+function readPersistedPostCompactionContext(message: MuxMessage): PostCompactionContext | null {
   if (!isDurableCompactionBoundaryMarker(message)) return null;
   const context: unknown = message.metadata?.postCompactionContext;
-  if (typeof context !== "object" || context === null) return null;
-  const { text, skillNames } = context as Partial<Record<keyof PostCompactionContext, unknown>>;
+  if (!isPlainObject(context)) return null;
+  const { text, skillNames, omittedFromRequestSequence, plan } = context;
   if (typeof text !== "string" || text.length === 0) return null;
+  const parsedPlan = readPostCompactionPlan(plan);
   return {
     text,
-    skillNames: Array.isArray(skillNames)
-      ? skillNames.filter((name): name is string => typeof name === "string")
-      : [],
+    skillNames: readStringArray(skillNames),
+    ...(isNonNegativeInteger(omittedFromRequestSequence) ? { omittedFromRequestSequence } : {}),
+    ...(parsedPlan ? { plan: parsedPlan } : {}),
   };
+}
+
+/** The header that new requests render after a boundary row; null once a retry left it out. */
+function readPostCompactionContext(message: MuxMessage): PostCompactionContext | null {
+  const context = readPersistedPostCompactionContext(message);
+  return context?.omittedFromRequestSequence == null ? context : null;
 }
 
 /** The header of the latest context boundary, if that boundary is a compaction with one. */
@@ -75,10 +104,11 @@ export function findPostCompactionContextSkillNames(messages: readonly MuxMessag
   return findPostCompactionContext(messages)?.skillNames ?? [];
 }
 
-/** Whether the latest boundary's header carries the plan file. */
-export function postCompactionContextCarriesPlan(messages: readonly MuxMessage[]): boolean {
-  const context = findPostCompactionContext(messages);
-  return context != null && rendersPlanFileReference(context.text);
+/** The plan that the latest boundary's header shows the model, if any. */
+export function findPostCompactionPlan(
+  messages: readonly MuxMessage[]
+): PostCompactionPlan | undefined {
+  return findPostCompactionContext(messages)?.plan;
 }
 
 /** The id of the latest context boundary when its header renders into the request. */
@@ -90,16 +120,46 @@ export function findPostCompactionContextBoundaryId(
 }
 
 /**
- * Remove the header from one boundary row of a request copy. chat.jsonl keeps the header; only
- * the requests of this session leave it out (see the context-exceeded retry in AgentSession).
+ * The boundary row with its header left out of requests from this sequence on, for the
+ * context-exceeded retry in AgentSession. The row keeps the header, so replay can rebuild the
+ * earlier requests. Null when requests do not render a header for the row.
  */
-export function omitPostCompactionContext(
+export function omitPostCompactionContextFrom(
+  boundary: MuxMessage,
+  requestHistorySequence: number
+): MuxMessage | null {
+  const context = readPostCompactionContext(boundary);
+  if (!context) return null;
+  return {
+    ...boundary,
+    metadata: {
+      ...boundary.metadata,
+      postCompactionContext: { ...context, omittedFromRequestSequence: requestHistorySequence },
+    },
+  };
+}
+
+/**
+ * Replay: the history as a request at this sequence saw it. A header that a retry left out
+ * still rendered into the requests before that retry.
+ */
+export function restorePostCompactionContextBefore(
   messages: MuxMessage[],
-  boundaryId: string | undefined
+  requestHistorySequence: number
 ): MuxMessage[] {
-  if (boundaryId == null) return messages;
-  return messages.map((message) =>
-    message.id === boundaryId ? splitPostCompactionContext(message).boundary : message
+  const index = messages.findLastIndex(isDurableContextBoundaryMarker);
+  if (index === -1) return messages;
+  const context = readPersistedPostCompactionContext(messages[index]);
+  if (
+    context?.omittedFromRequestSequence == null ||
+    requestHistorySequence >= context.omittedFromRequestSequence
+  )
+    return messages;
+  const { omittedFromRequestSequence: _omitted, ...restored } = context;
+  return messages.map((message, messageIndex) =>
+    messageIndex === index
+      ? { ...message, metadata: { ...message.metadata, postCompactionContext: restored } }
+      : message
   );
 }
 
@@ -116,6 +176,8 @@ export function splitPostCompactionContext(boundary: MuxMessage): {
 /**
  * Set the header on a boundary that has none. The summary is worth more than the header, so a
  * header that would push the row over the history line limit is dropped, not the summary cut.
+ * The plan baseline goes first: without it, only a session that restarts in the window misses
+ * plan edits.
  */
 export function withPostCompactionContext(
   boundary: MuxMessage,
@@ -123,20 +185,32 @@ export function withPostCompactionContext(
   workspaceId: string
 ): MuxMessage {
   if (!context || boundary.metadata?.postCompactionContext) return boundary;
+  const withContext = fitPostCompactionContext(boundary, context, workspaceId);
+  if (withContext || !context.plan) return withContext ?? boundary;
+  const { plan: _plan, ...withoutPlan } = context;
+  return fitPostCompactionContext(boundary, withoutPlan, workspaceId) ?? boundary;
+}
+
+function fitPostCompactionContext(
+  boundary: MuxMessage,
+  context: PostCompactionContext,
+  workspaceId: string
+): MuxMessage | null {
   const withContext: MuxMessage = {
     ...boundary,
     metadata: { ...boundary.metadata, postCompactionContext: context },
   };
   const rowBytes = measurePersistedHistoryRowBytes(withContext, workspaceId);
-  if (rowBytes > SESSION_HISTORY_MAX_LINE_BYTES - COMPACTION_BOUNDARY_ROW_HEADROOM_BYTES) {
-    log.warn("Post-compaction context does not fit the boundary row; dropping it", {
-      workspaceId,
-      messageId: boundary.id,
-      rowBytes,
-    });
-    return boundary;
+  if (rowBytes <= SESSION_HISTORY_MAX_LINE_BYTES - COMPACTION_BOUNDARY_ROW_HEADROOM_BYTES) {
+    return withContext;
   }
-  return withContext;
+  log.warn("Post-compaction context does not fit the boundary row; dropping it", {
+    workspaceId,
+    messageId: boundary.id,
+    rowBytes,
+    withPlan: context.plan != null,
+  });
+  return null;
 }
 
 function createPostCompactionContextMessage(

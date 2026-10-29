@@ -45,10 +45,7 @@ import {
 } from "@/common/utils/messages/compactionBoundary";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
 import type { HistoryService } from "@/node/services/historyService";
-import {
-  findPostCompactionContextBoundaryId,
-  omitPostCompactionContext,
-} from "@/node/services/postCompactionContext";
+import { restorePostCompactionContextBefore } from "@/node/services/postCompactionContext";
 import {
   hashToolSchema,
   isProviderDefinedToolRecord,
@@ -357,7 +354,7 @@ export interface ReplayVerifyTurnResult {
   assistantMessageId: string;
   runId: string;
   status: "PASS" | "FAIL" | "SKIPPED";
-  /** Why verification was impossible (SKIPPED), or how the messages matched without the full log. */
+  /** Present for SKIPPED (why verification was impossible). */
   reason?: string;
   systemPromptMatch?: boolean;
   toolsetMatch?: boolean;
@@ -706,34 +703,6 @@ function parseAnthropicCacheTtl(value: string | undefined): AnthropicCacheTtl | 
   return value === "5m" || value === "1h" ? value : undefined;
 }
 
-const HEADER_OMITTED_REASON =
-  "matched without the boundary's post-compaction header (a context-exceeded retry omits it)";
-
-/**
- * Rebuild a turn's prompt and compare it with the recorded one. After a context-exceeded retry,
- * AgentSession leaves the boundary's post-compaction header out of the rest of the window's
- * requests, and no log records that. So a mismatch is rebuilt once more without the header.
- */
-async function rebuildRecordedMessages(
-  historySlice: MuxMessage[],
-  recordedPrompt: unknown,
-  rebuild: (history: MuxMessage[]) => Promise<unknown>
-): Promise<{ rebuiltJson: unknown; messagesMatch: boolean; headerOmitted: boolean }> {
-  const recordedJson = JSON.stringify(recordedPrompt);
-  const rebuiltJson = await rebuild(historySlice);
-  if (JSON.stringify(rebuiltJson) === recordedJson) {
-    return { rebuiltJson, messagesMatch: true, headerOmitted: false };
-  }
-  const boundaryId = findPostCompactionContextBoundaryId(historySlice);
-  if (boundaryId != null) {
-    const withoutHeader = await rebuild(omitPostCompactionContext(historySlice, boundaryId));
-    if (JSON.stringify(withoutHeader) === recordedJson) {
-      return { rebuiltJson: withoutHeader, messagesMatch: true, headerOmitted: true };
-    }
-  }
-  return { rebuiltJson, messagesMatch: false, headerOmitted: false };
-}
-
 /**
  * Verify every turn of a session: rebuild the provider request from durable
  * logs and byte-compare against the recorded devtools request.
@@ -860,48 +829,47 @@ export async function replayVerifySession(params: {
 
       // 3) Messages: rebuild the full LanguageModel prompt from log rows and
       // byte-compare against the recorded request.
-      const historySlice = sliceEpochForTurn(params.historyMessages, turn.requestHistorySequence);
-
-      const messages = await rebuildRecordedMessages(
-        historySlice,
-        record.prompt,
-        async (history) => {
-          const rebuilt = await buildReplayRequest({
-            historyMessages: history,
-            systemPrompt,
-            modelString: envelope.data.modelString,
-            thinkingLevel: envelope.data.thinkingLevel as ThinkingLevel,
-            effectiveAgentId: turn.message.metadata?.agentId ?? "exec",
-            // Prefer the independently-recorded sentinel names: forced first-step
-            // scoping (e.g. xAI search) narrows the wire manifest while the live
-            // sentinel listed the full active set. Manifest names remain the
-            // legacy fallback for rows written before sentinelToolNames existed.
-            toolNamesForSentinel:
-              envelope.data.sentinelToolNames ??
-              envelope.data.toolsetManifest.map((entry) => entry.name),
-            routeProvider: turn.message.metadata?.routeProvider,
-            providersConfig: params.providersConfig,
-            wireProviderName: envelope.data.wireProviderName,
-            anthropicCacheTtl: parseAnthropicCacheTtl(envelope.data.anthropicCacheTtl),
-            systemPromptVolatileSuffixLength: envelope.data.systemPromptVolatileSuffixLength,
-            volatileSystemTail: readVolatileSystemTailRecord(turn.message),
-            customInstructions: readCustomInstructionsRecord(turn.message),
-            skillIndex: readSkillIndexRecord(turn.message),
-            toolInstructions: readToolInstructionsRecord(turn.message),
-            planContentForTransition,
-            planFilePath: envelope.data.planTransitionFilePath,
-            partialContinuation,
-            mcpAppModelContext,
-            deferLoadingToolNames: deferLoadingNamesFromRecordedTools(record.tools),
-            workspaceId: params.workspaceId,
-            compactionInputBudgetTokens: record.compactionInputBudgetTokens,
-          });
-          // JSON round-trip the rebuilt prompt so both sides are plain JSON values
-          // (the recorded prompt already survived a devtools.jsonl round-trip).
-          return JSON.parse(JSON.stringify(rebuilt.lmPrompt)) as unknown;
-        }
+      // A header that a later context-exceeded retry left out still rendered into this request.
+      const historySlice = restorePostCompactionContextBefore(
+        sliceEpochForTurn(params.historyMessages, turn.requestHistorySequence),
+        turn.requestHistorySequence
       );
-      const { messagesMatch } = messages;
+
+      const rebuilt = await buildReplayRequest({
+        historyMessages: historySlice,
+        systemPrompt,
+        modelString: envelope.data.modelString,
+        thinkingLevel: envelope.data.thinkingLevel as ThinkingLevel,
+        effectiveAgentId: turn.message.metadata?.agentId ?? "exec",
+        // Prefer the independently-recorded sentinel names: forced first-step
+        // scoping (e.g. xAI search) narrows the wire manifest while the live
+        // sentinel listed the full active set. Manifest names remain the
+        // legacy fallback for rows written before sentinelToolNames existed.
+        toolNamesForSentinel:
+          envelope.data.sentinelToolNames ??
+          envelope.data.toolsetManifest.map((entry) => entry.name),
+        routeProvider: turn.message.metadata?.routeProvider,
+        providersConfig: params.providersConfig,
+        wireProviderName: envelope.data.wireProviderName,
+        anthropicCacheTtl: parseAnthropicCacheTtl(envelope.data.anthropicCacheTtl),
+        systemPromptVolatileSuffixLength: envelope.data.systemPromptVolatileSuffixLength,
+        volatileSystemTail: readVolatileSystemTailRecord(turn.message),
+        customInstructions: readCustomInstructionsRecord(turn.message),
+        skillIndex: readSkillIndexRecord(turn.message),
+        toolInstructions: readToolInstructionsRecord(turn.message),
+        planContentForTransition,
+        planFilePath: envelope.data.planTransitionFilePath,
+        partialContinuation,
+        mcpAppModelContext,
+        deferLoadingToolNames: deferLoadingNamesFromRecordedTools(record.tools),
+        workspaceId: params.workspaceId,
+        compactionInputBudgetTokens: record.compactionInputBudgetTokens,
+      });
+
+      // JSON round-trip the rebuilt prompt so both sides are plain JSON values
+      // (the recorded prompt already survived a devtools.jsonl round-trip).
+      const rebuiltJson: unknown = JSON.parse(JSON.stringify(rebuilt.lmPrompt));
+      const messagesMatch = JSON.stringify(rebuiltJson) === JSON.stringify(record.prompt);
 
       const pass = systemPromptMatch && toolsetMatch && messagesMatch;
       results.push({
@@ -910,15 +878,12 @@ export async function replayVerifySession(params: {
         assistantMessageId: turn.message.id,
         runId: record.runId,
         status: pass ? "PASS" : "FAIL",
-        ...(messages.headerOmitted ? { reason: HEADER_OMITTED_REASON } : {}),
         systemPromptMatch,
         toolsetMatch,
         messagesMatch,
         ...(messagesMatch
           ? {}
-          : {
-              divergence: findFirstJsonDivergence(messages.rebuiltJson, record.prompt) ?? undefined,
-            }),
+          : { divergence: findFirstJsonDivergence(rebuiltJson, record.prompt) ?? undefined }),
         ...(toolsetMatch
           ? {}
           : { toolsetDiff: describeManifestDiff(envelope.data.toolsetManifest, recordedManifest) }),

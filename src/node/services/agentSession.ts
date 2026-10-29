@@ -36,6 +36,7 @@ import {
 } from "./agentPlugins/promptHooks";
 import { createContextBudgetRejectedMessage } from "@/common/utils/messages/contextBudgetRejection";
 import {
+  isDurableContextBoundaryMarker,
   isProviderEligibleMessage,
   leavesCompactionFollowUpPending,
   sliceMessagesForProviderFromLatestContextBoundary,
@@ -175,6 +176,7 @@ import {
 import {
   FileChangeTracker,
   createFileChangeNotificationMessage,
+  type FileChangeDetection,
   type FileState,
 } from "@/node/services/utils/fileChangeTracker";
 import type { Result } from "@/common/types/result";
@@ -221,6 +223,7 @@ import {
   type MuxMetadata,
   type PluginHookContextEntry,
   type PostCompactionContext,
+  type PostCompactionPlan,
   type StartupRetrySendOptions,
   type WorkspaceTurnTaskCorrelation,
 } from "@/common/types/message";
@@ -298,9 +301,9 @@ import type {
 
 import type { FileEditDiff } from "@/common/utils/messages/extractEditedFiles";
 import {
+  findPostCompactionPlan,
   findPostCompactionContextBoundaryId,
-  omitPostCompactionContext,
-  postCompactionContextCarriesPlan,
+  omitPostCompactionContextFrom,
   renderPostCompactionContext,
   type PostCompactionContextInput,
 } from "./postCompactionContext";
@@ -555,18 +558,16 @@ function overflowedModel(request: { modelString: string }, failedModel: string |
   return failedModel ?? request.modelString;
 }
 
-/** A plan's path and state for the file-change tracker. */
-interface TrackedPlanState {
-  path: string;
-  state: FileState;
-}
-
-/** The tracker state of a plan read with a stat first; null without one. */
-function trackedPlanState(runtime: Runtime, plan: PlanFileRead | null): TrackedPlanState | null {
+/** The header's plan baseline for a plan read with a stat first; null without one. */
+function postCompactionPlan(
+  runtime: Runtime,
+  plan: PlanFileRead | null
+): PostCompactionPlan | null {
   if (plan?.modifiedTimeMs == null) return null;
   return {
     path: runtime.normalizePath(plan.planFilePath, "/"),
-    state: { content: plan.planContent, timestamp: plan.modifiedTimeMs },
+    content: plan.planContent,
+    modifiedTimeMs: plan.modifiedTimeMs,
   };
 }
 
@@ -1810,10 +1811,10 @@ export class AgentSession {
   private activeStreamPostCompactionBoundaryId: string | undefined;
 
   /**
-   * A boundary whose header overflowed the context window once. Later requests of this session
-   * leave the header out, so the next turn cannot hit the same limit again (#1932).
+   * The latest boundary when turn start last took the plan baseline from it (null without a
+   * boundary); undefined until the first turn of this session (seedPlanBaselineFromBoundary).
    */
-  private omittedPostCompactionBoundaryId: string | undefined;
+  private planBaselineBoundaryId: string | null | undefined;
 
   /** Backend start time for the current stream, used to avoid charging goals created mid-stream. */
   private activeStreamStartedAtMs?: number;
@@ -8978,7 +8979,7 @@ export class AgentSession {
       const fileChangeDetection =
         preparedRequest || leaseRefusal != null
           ? { attachments: [], commit: () => undefined }
-          : await this.fileChangeTracker.getChangedAttachments();
+          : await this.detectFileChanges();
       if (isStreamStartAborted()) {
         return Ok(undefined);
       }
@@ -9076,10 +9077,6 @@ export class AgentSession {
         }
       }
 
-      requestMessages = omitPostCompactionContext(
-        requestMessages,
-        this.omittedPostCompactionBoundaryId
-      );
       this.activeStreamPostCompactionBoundaryId =
         findPostCompactionContextBoundaryId(requestMessages);
 
@@ -9687,6 +9684,29 @@ export class AgentSession {
   }
 
   /**
+   * Mark the boundary row's header as left out of the failed request and every later one. The
+   * mark is in chat.jsonl, so the header stays out after a restart, and replay still rebuilds
+   * the earlier requests of the window with it.
+   */
+  private async omitPostCompactionContextFromFailedRequest(
+    boundaryId: string,
+    failedMessageId: string
+  ): Promise<void> {
+    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const boundary = history.data.find((message) => message.id === boundaryId);
+    if (!boundary) return;
+    const failed = history.data.find((message) => message.id === failedMessageId);
+    const omitted = omitPostCompactionContextFrom(
+      boundary,
+      failed?.metadata?.requestHistorySequence ?? newestHistorySequence(history.data)
+    );
+    if (!omitted) return;
+    const updated = await this.historyService.updateHistory(this.workspaceId, omitted);
+    if (!updated.success) throw new Error(updated.error);
+  }
+
+  /**
    * #1932: a post-compaction header can push the first request of a window over the context
    * limit. Only token-budget mode rolls over on that error, so other modes would fail every turn.
    * Retry once without the header, and keep it out of later requests for this boundary.
@@ -9723,14 +9743,15 @@ export class AgentSession {
 
     this.postCompactionRetryAttempts.add(requestId);
 
-    // The next compaction must not carry the same context forward again.
-    // Fail closed if the discard throws: once the header is omitted, no later
-    // request hits this path to discard it, so the next compaction would merge it again.
+    // The next compaction must not carry the same context forward again. Discard before the
+    // header is left out, and fail closed if either step throws: once the header is out, no
+    // later request hits this path to discard it, so the next compaction would merge it again.
     try {
       await this.contextController.discardFailedCarryover(pendingState);
       this.onPostCompactionStateChange?.();
+      await this.omitPostCompactionContextFromFailedRequest(boundaryId, data.messageId);
     } catch (error) {
-      log.warn("Failed to discard pending post-compaction state; not retrying without it", {
+      log.warn("Failed to discard the post-compaction context; not retrying without it", {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
       });
@@ -9738,7 +9759,6 @@ export class AgentSession {
       this.postCompactionRetryAttempts.delete(requestId);
       return false;
     }
-    this.omittedPostCompactionBoundaryId = boundaryId;
 
     log.info("Post-compaction context hit context limit; retrying once without it", {
       workspaceId: this.workspaceId,
@@ -13489,6 +13509,39 @@ export class AgentSession {
     await this.memoryContextStore.discard();
   }
 
+  /** External file edits since the tracked baselines, which include the boundary header's plan. */
+  private async detectFileChanges(): Promise<FileChangeDetection> {
+    await this.seedPlanBaselineFromBoundary();
+    return this.fileChangeTracker.getChangedAttachments();
+  }
+
+  /**
+   * Turn start, before file-change detection: track the plan file from the state that the latest
+   * boundary's header carries. The model sees that header, so detection reports any edit made
+   * after it. The state is on the boundary row, so this also works after a restart. Each
+   * boundary seeds once per session, and in a session only a compaction (with its pending
+   * state) adds a boundary, so most turns skip the history read.
+   */
+  private async seedPlanBaselineFromBoundary(): Promise<void> {
+    if (
+      this.planBaselineBoundaryId !== undefined &&
+      (await this.contextController.compaction.peekPendingState()) === null
+    )
+      return;
+    const history = await this.historyService.getHistoryFromLatestBoundary(this.workspaceId);
+    if (!history.success) return;
+    const boundaryId = history.data.findLast(isDurableContextBoundaryMarker)?.id ?? null;
+    if (boundaryId === this.planBaselineBoundaryId) return;
+    this.planBaselineBoundaryId = boundaryId;
+    const plan = findPostCompactionPlan(history.data);
+    if (plan) {
+      await this.recordFileState(plan.path, {
+        content: plan.content,
+        timestamp: plan.modifiedTimeMs,
+      });
+    }
+  }
+
   /**
    * The first turn after a compaction consumes its pending state. The boundary row already
    * carries the post-compaction context, so this only starts the new window: it keeps the
@@ -13500,41 +13553,10 @@ export class AgentSession {
     this.pendingPostCompactionStateToAcknowledge = pendingState;
     // The next stream recomputes the memory index from current files.
     await this.discardMemoryContext();
-    // Clear file state cache since history context is gone
-    this.clearFileState();
-    // The boundary header holds the plan as it was at compaction and never refreshes. When it
-    // carries the plan, track the plan again, so a later external edit reaches the model as a
-    // file-change notification. The header decides, not the current exclusions: like the
-    // header, a change to them applies from the next compaction.
-    if (!postCompactionContextCarriesPlan(history)) return;
-    const plan = await this.readLocalPlanFileState();
-    if (plan) await this.recordFileState(plan.path, plan.state);
-  }
-
-  /**
-   * The plan file's path and current state for the file-change tracker. The tracker reads the
-   * host filesystem, so only local runtimes qualify; null also when the plan cannot be read.
-   */
-  private async readLocalPlanFileState(): Promise<TrackedPlanState | null> {
-    try {
-      const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
-      if (!metadataResult.success) return null;
-      const runtime = this.aiService.runtimeFactory.createRuntimeForWorkspace(metadataResult.data);
-      if (runtime.location !== "local") return null;
-      const location = await resolvePlanFileLocation(
-        this.config,
-        runtime,
-        { ...metadataResult.data, id: this.workspaceId },
-        this.historyService.locks
-      );
-      return trackedPlanState(
-        runtime,
-        await AttachmentService.readPlan(location, runtime, { statFirst: true })
-      );
-    } catch (error) {
-      log.debug("Skipping plan file tracking", { error: getErrorMessage(error) });
-      return null;
-    }
+    // History context is gone, so drop the file baselines. Keep the plan baseline that turn
+    // start took from the boundary header (seedPlanBaselineFromBoundary).
+    await this.fileChangeTracker.clearExcept(findPostCompactionPlan(history)?.path);
+    this.acceptedFileSnapshotBaseline = undefined;
   }
 
   /**
@@ -13553,24 +13575,13 @@ export class AgentSession {
       });
       return null;
     }
-    const { context, recordPlan } = built.value;
-    // The first turn after the boundary detects file edits before it tracks the plan again, so
-    // baseline an untracked plan with the state the header rendered: that turn then reports an
-    // edit made after this snapshot. Estimates and unpublished builds only start tracking it
-    // sooner. Only a build that wins the time box writes the baseline, and the write does not
-    // await: a late build must not touch the tracker after the next window started.
-    recordPlan?.();
-    return context;
+    return built.value;
   }
 
-  /**
-   * The unbounded header build. It resolves the plan baseline but leaves the write to the caller,
-   * as recordPlan.
-   */
-  private async renderPostCompactionContextHeader(input: PostCompactionContextInput): Promise<{
-    context: PostCompactionContext | null;
-    recordPlan: (() => void) | null;
-  }> {
+  /** The unbounded header build. */
+  private async renderPostCompactionContextHeader(
+    input: PostCompactionContextInput
+  ): Promise<PostCompactionContext | null> {
     const excludedItems = await this.loadExcludedItems();
     const { attachments, plan } = await this.buildAttachmentsFromContext({
       ...input,
@@ -13579,12 +13590,7 @@ export class AgentSession {
       // model-visible in RLM mode, keeping RLM-off prompts byte-identical.
       readFilePaths: this.isRlmCompactionEnabled() ? input.readFilePaths : [],
     });
-    return {
-      context: renderPostCompactionContext(attachments),
-      recordPlan: plan
-        ? await this.fileChangeTracker.prepareRecordIfUntracked(plan.path, plan.state)
-        : null,
-    };
+    return renderPostCompactionContext(attachments, plan);
   }
 
   /**
@@ -13603,7 +13609,7 @@ export class AgentSession {
   }): Promise<{
     attachments: PostCompactionAttachment[];
     /** The plan the attachments carry, for the file-change tracker; local runtimes only. */
-    plan: TrackedPlanState | null;
+    plan: PostCompactionPlan | null;
   }> {
     const { excludedItems } = context;
     const todoAttachment = await this.loadTodoListAttachment(excludedItems);
@@ -13700,7 +13706,7 @@ export class AgentSession {
       attachments.push(artifactsIndexAttachment);
     }
 
-    return { attachments, plan: trackedPlanState(runtime, plan) };
+    return { attachments, plan: postCompactionPlan(runtime, plan) };
   }
 
   /**

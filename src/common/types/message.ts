@@ -1058,6 +1058,20 @@ export interface PostCompactionContext {
   text: string;
   /** Skills that `text` already loads, so path-based activation does not load them again. */
   skillNames: string[];
+  /**
+   * Set when the header pushed a request over the context window (#1932). Requests whose
+   * requestHistorySequence is at least this value leave the header out.
+   */
+  omittedFromRequestSequence?: number;
+  /** The plan file that `text` carries, as the file-change tracker baseline for its window. */
+  plan?: PostCompactionPlan;
+}
+
+/** PostCompactionContext.plan: a local plan file as compaction read it. */
+export interface PostCompactionPlan {
+  path: string;
+  content: string;
+  modifiedTimeMs: number;
 }
 
 /**

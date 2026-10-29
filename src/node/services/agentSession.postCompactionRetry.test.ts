@@ -5,9 +5,10 @@ import * as path from "path";
 
 import { Err } from "@/common/types/result";
 
-import type { MuxMessage } from "@/common/types/message";
+import { postCompactionContextMessageId, type MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
 import type { AgentSession } from "./agentSession";
+import { insertPostCompactionContext } from "./postCompactionContext";
 import { createTestHistoryService } from "./testHistoryService";
 import {
   compactSessionForTest,
@@ -44,11 +45,12 @@ function createHeaderBoundary(): MuxMessage {
   };
 }
 
-/** The header on the boundary row of one streamMessage call's request messages. */
-function requestHeader(streamMessage: ReturnType<typeof mock>, call: number): unknown {
+/** Whether one streamMessage call's request renders the header of the boundary row. */
+function requestRendersHeader(streamMessage: ReturnType<typeof mock>, call: number): boolean {
   const { messages } = streamMessage.mock.calls[call][0] as { messages: MuxMessage[] };
-  return messages.find((message) => message.id === "compaction-summary")?.metadata
-    ?.postCompactionContext;
+  return insertPostCompactionContext(messages).some(
+    (message) => message.id === postCompactionContextMessageId("compaction-summary")
+  );
 }
 
 function createPersistedPostCompactionState(options: {
@@ -179,8 +181,8 @@ describe("AgentSession post-compaction context retry", () => {
       "retry-started"
     );
 
-    expect(requestHeader(streamMessage, 0)).toEqual(HEADER);
-    expect(requestHeader(streamMessage, 1)).toBeUndefined();
+    expect(requestRendersHeader(streamMessage, 0)).toBe(true);
+    expect(requestRendersHeader(streamMessage, 1)).toBe(false);
 
     expect((historyService.deleteMessage as ReturnType<typeof mock>).mock.calls[0][1]).toBe(
       "assistant-ctx-exceeded"
@@ -196,6 +198,57 @@ describe("AgentSession post-compaction context retry", () => {
     expect(exists).toBe(false);
 
     await session.dispose();
+  });
+
+  test("a header that a retry left out stays out after a restart", async () => {
+    const workspaceId = "ws-restart";
+    const fixture = await createSessionsFixture(workspaceId);
+    const { historyService } = fixture;
+    await historyService.appendToHistory(workspaceId, createHeaderBoundary());
+    await historyService.appendToHistory(workspaceId, {
+      id: "user-1",
+      role: "user",
+      parts: [{ type: "text", text: "Continue" }],
+      metadata: { timestamp: 1100 },
+    });
+    const { session } = await resumeIntoContextRetry(fixture, workspaceId);
+    await session.dispose();
+
+    const streamMessage = mock((..._args: unknown[]) =>
+      Promise.resolve({
+        success: true as const,
+        data: createStartedTurnHandle(restarted.closingSignal, "assistant-after-restart"),
+      })
+    );
+    const { session: restarted } = await createAgentSessionHarness({
+      workspaceId,
+      config: fixture.config,
+      historyService,
+      aiServiceOverrides: {
+        streamMessage,
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
+    });
+    await historyService.appendToHistory(workspaceId, {
+      id: "user-2",
+      role: "user",
+      parts: [{ type: "text", text: "Go on" }],
+      metadata: { timestamp: 1200 },
+    });
+    await restarted.resumeStream({
+      model: "openai:gpt-4o",
+      agentId: "exec",
+    } as unknown as SendMessageOptions);
+
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+    expect(requestRendersHeader(streamMessage, 0)).toBe(false);
+    // chat.jsonl keeps the header text, so replay can rebuild the requests that sent it.
+    const history = await historyService.getHistoryFromLatestBoundary(workspaceId);
+    if (!history.success) throw new Error(history.error);
+    const boundary = history.data.find((message) => message.id === "compaction-summary");
+    expect(boundary?.metadata?.postCompactionContext?.text).toBe(HEADER.text);
+
+    await restarted.dispose();
   });
 
   test("a retry after the window's first turn discards the acknowledged carryover", async () => {
@@ -288,6 +341,51 @@ describe("AgentSession post-compaction context retry", () => {
     ).toBe("retry-started");
     expect(streamMessage).toHaveBeenCalledTimes(3);
     expect(await compaction.peekCarryoverState()).toBeNull();
+
+    await session.dispose();
+  });
+
+  test("does not retry without the header when leaving it out of chat.jsonl fails", async () => {
+    const workspaceId = "ws-omit-fails";
+    const { historyService, config } = await createSessionsFixture(workspaceId);
+    await historyService.appendToHistory(workspaceId, createHeaderBoundary());
+    await historyService.appendToHistory(workspaceId, {
+      id: "user-1",
+      role: "user",
+      parts: [{ type: "text", text: "Continue" }],
+      metadata: { timestamp: 1100 },
+    });
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((..._args: unknown[]) => {
+      aiEmitter.emit("error", {
+        workspaceId,
+        messageId: "assistant-ctx-exceeded",
+        error: "Context length exceeded",
+        errorType: "context_exceeded",
+      });
+      return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
+    });
+    const { session } = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage,
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
+    });
+    spyOn(historyService, "updateHistory").mockResolvedValueOnce(Err("disk"));
+
+    await session.resumeStream({
+      model: "openai:gpt-4o",
+      agentId: "exec",
+    } as unknown as SendMessageOptions);
+
+    expect(await session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded")).toBe(
+      "terminal"
+    );
+    expect(streamMessage).toHaveBeenCalledTimes(1);
 
     await session.dispose();
   });
@@ -538,10 +636,10 @@ describe("AgentSession post-compaction context retry", () => {
     ).toBe("terminal");
     expect(callCount).toBe(2);
 
-    // The header stays in chat.jsonl, but later requests of this session leave it out.
+    // Later requests leave the header out too.
     await session.resumeStream(options);
     expect(callCount).toBe(3);
-    expect(requestHeader(streamMessage, 2)).toBeUndefined();
+    expect(requestRendersHeader(streamMessage, 2)).toBe(false);
 
     await session.dispose();
   });

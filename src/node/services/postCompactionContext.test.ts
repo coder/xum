@@ -10,7 +10,9 @@ import {
 import {
   findPostCompactionContext,
   insertPostCompactionContext,
+  omitPostCompactionContextFrom,
   renderPostCompactionContext,
+  restorePostCompactionContextBefore,
   withPostCompactionContext,
 } from "./postCompactionContext";
 
@@ -25,24 +27,45 @@ const compactionBoundary = (id: string, postCompactionContext?: PostCompactionCo
 
 const header = (text: string): PostCompactionContext => ({ text, skillNames: [] });
 
+const plan = { path: "/plans/ws.md", content: "plan v1", modifiedTimeMs: 5 };
+
 describe("renderPostCompactionContext", () => {
   test("returns no header without attachments", () => {
-    expect(renderPostCompactionContext([])).toBeNull();
+    expect(renderPostCompactionContext([], plan)).toBeNull();
+  });
+
+  test("carries the plan baseline only when the text renders the plan", () => {
+    const planAttachment = {
+      type: "plan_file_reference" as const,
+      planFilePath: plan.path,
+      planContent: plan.content,
+    };
+    const todos = {
+      type: "todo_list" as const,
+      todos: [{ content: "a", status: "pending" as const }],
+    };
+    expect(renderPostCompactionContext([planAttachment, todos], plan)?.plan).toEqual(plan);
+    const withoutPlan = renderPostCompactionContext([todos], plan);
+    expect(withoutPlan?.text.length).toBeGreaterThan(0);
+    expect(withoutPlan?.plan).toBeUndefined();
   });
 
   test("keeps the text within the injection budget", () => {
-    const context = renderPostCompactionContext([
-      {
-        type: "edited_files_reference",
-        files: [
-          {
-            path: "src/huge.ts",
-            diff: "x".repeat(MAX_POST_COMPACTION_INJECTION_CHARS + 10_000),
-            truncated: false,
-          },
-        ],
-      },
-    ]);
+    const context = renderPostCompactionContext(
+      [
+        {
+          type: "edited_files_reference",
+          files: [
+            {
+              path: "src/huge.ts",
+              diff: "x".repeat(MAX_POST_COMPACTION_INJECTION_CHARS + 10_000),
+              truncated: false,
+            },
+          ],
+        },
+      ],
+      null
+    );
     expect(context?.text.length).toBeGreaterThan(0);
     expect(context?.text.length).toBeLessThanOrEqual(MAX_POST_COMPACTION_INJECTION_CHARS);
   });
@@ -93,11 +116,35 @@ describe("insertPostCompactionContext", () => {
       ];
       expect(insertPostCompactionContext(messages)).toBe(messages);
     }
-    const mixedNames = JSON.parse('{"text":"CTX","skillNames":["a",1]}') as PostCompactionContext;
-    expect(findPostCompactionContext([compactionBoundary("summary", mixedNames)])).toEqual({
+    const mixedFields = JSON.parse(
+      '{"text":"CTX","skillNames":["a",1],"omittedFromRequestSequence":"3","plan":{"path":"p"}}'
+    ) as PostCompactionContext;
+    expect(findPostCompactionContext([compactionBoundary("summary", mixedFields)])).toEqual({
       text: "CTX",
       skillNames: ["a"],
     });
+  });
+});
+
+describe("omitPostCompactionContextFrom", () => {
+  const renderedHeaders = (messages: MuxMessage[]) =>
+    insertPostCompactionContext(messages)
+      .filter((message) => message.id.startsWith("post-compaction-context-"))
+      .map((message) => message.parts);
+
+  test("leaves the header out of requests from the sequence on, and replay restores it before", () => {
+    const omitted = omitPostCompactionContextFrom(compactionBoundary("s", header("CTX")), 7);
+    if (!omitted) throw new Error("expected the header to be left out");
+    const messages = [omitted, createMuxMessage("u1", "user", "first")];
+
+    expect(renderedHeaders(messages)).toEqual([]);
+    expect(findPostCompactionContext(messages)).toBeNull();
+    expect(renderedHeaders(restorePostCompactionContextBefore(messages, 6))).toEqual([
+      [{ type: "text", text: "CTX" }],
+    ]);
+    expect(restorePostCompactionContextBefore(messages, 7)).toBe(messages);
+    // A second retry cannot leave out a header that requests no longer render.
+    expect(omitPostCompactionContextFrom(omitted, 9)).toBeNull();
   });
 });
 
@@ -119,5 +166,16 @@ describe("withPostCompactionContext", () => {
     const bare = compactionBoundary("s");
     const oversized = header("x".repeat(SESSION_HISTORY_MAX_LINE_BYTES));
     expect(withPostCompactionContext(bare, oversized, "ws")).toBe(bare);
+  });
+
+  test("drops the plan baseline first when the row is too big with it", () => {
+    const text = "x".repeat(SESSION_HISTORY_MAX_LINE_BYTES / 2);
+    const bigPlan = { ...plan, content: "y".repeat(SESSION_HISTORY_MAX_LINE_BYTES / 2) };
+    const fitted = withPostCompactionContext(
+      compactionBoundary("s"),
+      { ...header(text), plan: bigPlan },
+      "ws"
+    );
+    expect(boundaryHeader(fitted)).toEqual(header(text));
   });
 });

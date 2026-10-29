@@ -31,10 +31,7 @@ import assert from "@/common/utils/assert";
 import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
 import { replaceOrAppendMessageById } from "@/node/services/aiService";
 import { HistoryService } from "@/node/services/historyService";
-import {
-  findPostCompactionContextBoundaryId,
-  omitPostCompactionContext,
-} from "@/node/services/postCompactionContext";
+import { omitPostCompactionContextFrom } from "@/node/services/postCompactionContext";
 import { assemblePromptPayload } from "@/node/services/turnContextAssembler";
 import { emitTurnEnvelope } from "@/node/services/turnEnvelope";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -105,7 +102,7 @@ export interface ReplayFixtureTurnSpec {
   systemVolatileSuffixLength?: number;
   /** Set false to simulate devtools logging being off for this turn. */
   recordDevtools?: boolean;
-  /** Send the request without the boundary's header, as AgentSession does after a context-exceeded retry. */
+  /** Leave the boundary's header out from this turn on, as AgentSession's context-exceeded retry does. */
   omitPostCompactionContext?: boolean;
   /**
    * Emit this many extra turn-envelope rows (same requestHistorySequence)
@@ -189,6 +186,7 @@ export async function appendReplayFixtureTurn(
     ...(spec.pluginHookContext != null ? { pluginHookContext: spec.pluginHookContext } : {}),
   });
   const requestHistorySequence = await appendOrThrow(ctx, userMessage);
+  await omitFixturePostCompactionContext(ctx, spec, requestHistorySequence);
 
   // The request is built from history as read BEFORE the assistant row is
   // appended — same ordering as AgentSession.streamWithHistory.
@@ -285,6 +283,20 @@ export async function appendReplayFixtureTurn(
   }
 }
 
+async function omitFixturePostCompactionContext(
+  ctx: ReplayFixtureSessionContext,
+  spec: ReplayFixtureTurnSpec,
+  requestHistorySequence: number
+): Promise<void> {
+  if (!spec.omitPostCompactionContext) return;
+  const history = await ctx.historyService.getHistoryFromLatestBoundary(ctx.workspaceId);
+  assert(history.success, "fixture history read failed");
+  const omitted = omitPostCompactionContextFrom(history.data[0], requestHistorySequence);
+  assert(omitted != null, "fixture boundary has no post-compaction header to omit");
+  const result = await ctx.historyService.updateHistory(ctx.workspaceId, omitted);
+  assert(result.success, "fixture boundary update failed");
+}
+
 function fixtureModel(spec: ReplayFixtureTurnSpec): string {
   return spec.liveToolInstructions == null ? REPLAY_FIXTURE_MODEL : REPLAY_FIXTURE_ROWS_MODEL;
 }
@@ -293,12 +305,9 @@ function fixtureModel(spec: ReplayFixtureTurnSpec): string {
 function buildFixtureRequest(
   ctx: ReplayFixtureSessionContext,
   spec: ReplayFixtureTurnSpec,
-  history: MuxMessage[],
+  historyMessages: MuxMessage[],
   agentId: string
 ) {
-  const historyMessages = spec.omitPostCompactionContext
-    ? omitPostCompactionContext(history, findPostCompactionContextBoundaryId(history))
-    : history;
   return spec.liveToolInstructions == null
     ? buildReplayedFixtureRequest(ctx, spec, historyMessages, agentId)
     : buildLiveFixtureRequest(ctx, spec, historyMessages, agentId);
