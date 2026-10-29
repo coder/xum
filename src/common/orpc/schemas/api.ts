@@ -147,6 +147,7 @@ import {
   DraftUpdateInputSchema,
   DraftWriteOutputSchema,
   RemovedCreationDraftSchema,
+  CreationDraftDeleteInputSchema,
   CreationDraftImportLegacyInputSchema,
   CreationDraftListSchema,
   CreationDraftSchema,
@@ -3879,7 +3880,7 @@ export const drafts = {
     output: CreationDraftSummarySchema,
   },
   deleteCreation: {
-    input: z.object({ scope: CreationDraftScopeSchema }),
+    input: CreationDraftDeleteInputSchema,
     output: z.void(),
   },
   importLegacyCreation: {

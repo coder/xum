@@ -74,6 +74,11 @@ interface Entry {
   persisted: boolean;
   /** A failed save may still have written the record (its reply was lost), so a clear saves too. */
   maybeSaved: boolean;
+  /**
+   * The record as this window last knew it (read, or sent in a save that landed or may have). A
+   * delete retry removes the record only while it still holds this (F202).
+   */
+  stored: CreationDraft | null;
   /** Changed fields not sent yet. */
   pending: CreationDraftPatch;
   /** Never rejects (save records its error). */
@@ -278,9 +283,11 @@ export class CreationDraftStore {
   private readonly blankIds = new Map<string, string>();
   /**
    * Deletes the backend has not confirmed (#7551): retried on failure and on each new client.
-   * In memory only, as DraftStore's were before #6620.
+   * In memory only, as DraftStore's were before #6620. The value is the record the delete is for
+   * (Entry.stored): a retry runs later, so it must not remove another window's later save. Null:
+   * this window never knew the record, so only the first try deletes.
    */
-  private readonly pendingDeletes = new Set<string>();
+  private readonly pendingDeletes = new Map<string, Omit<CreationDraft, "id"> | null>();
   /**
    * Ids deleted in this session, confirmed or not. A delete is final: a list never shows them (even
    * one read before the delete), and opening one again gives a blank draft.
@@ -309,7 +316,9 @@ export class CreationDraftStore {
     this.deleteTimers.clear();
     if (!client) return;
     this.loadList(client);
-    for (const id of this.pendingDeletes) this.sendDelete(id, 0).catch(() => undefined);
+    for (const id of this.pendingDeletes.keys()) {
+      this.sendDelete(id, 0, true).catch(() => undefined);
+    }
     for (const [id, entry] of this.entries) {
       if (entry.load.status === "loadFailed") this.retryLoad(id);
       else if (entry.saveError !== null) this.flushInBackground(id);
@@ -480,6 +489,7 @@ export class CreationDraftStore {
       entry.draft =
         record ?? createBlankCreationDraft(id, entry.blank.projectPath, entry.blank.subProjectPath);
       entry.persisted = record !== null;
+      entry.stored = record;
       entry.load = { status: "ready" };
       this.recompute(id, entry);
     };
@@ -589,6 +599,7 @@ export class CreationDraftStore {
       });
       entry.saving = false;
       entry.persisted = true;
+      entry.stored = draft;
       entry.saveError = null;
       if (this.entries.get(id) !== entry) return;
       if (!this.deletedIds.has(id)) {
@@ -598,7 +609,7 @@ export class CreationDraftStore {
     } catch (error) {
       entry.saving = false;
       if (this.entries.get(id) !== entry) return;
-      this.keepFailedSave(entry, patch, client, error);
+      this.keepFailedSave(entry, draft, patch, client, error);
     }
     this.recompute(id, entry);
   }
@@ -606,12 +617,16 @@ export class CreationDraftStore {
   /** A failed save: its fields wait for the next save. */
   private keepFailedSave(
     entry: Entry,
+    draft: CreationDraft,
     patch: CreationDraftPatch,
     client: APIClient | null,
     error: unknown
   ): void {
-    // A refused save wrote nothing; other failures may have.
-    if (client && !isSaveRefusal(error)) entry.maybeSaved = true;
+    // A refused save wrote nothing; other failures may have (most often the reply was lost).
+    if (client && !isSaveRefusal(error)) {
+      entry.maybeSaved = true;
+      entry.stored = draft;
+    }
     // Later edits win over the fields this save carried.
     entry.pending = { ...patch, ...entry.pending };
     // Lost with a connection that was replaced meanwhile: no error, so flush() saves it again on
@@ -637,16 +652,35 @@ export class CreationDraftStore {
     // Let a save in flight land first, so it cannot recreate the file after the delete. Pending
     // (resent by a new client) only after it: a resend must not overtake that save either.
     await entry?.inFlight;
-    this.pendingDeletes.add(id);
-    await this.sendDelete(id, 0);
+    // Read after the wait: the save that landed meanwhile is what the record holds.
+    const stored = entry?.stored ?? null;
+    let ifStored: Omit<CreationDraft, "id"> | null = null;
+    if (stored) {
+      const { id: _id, ...fields } = stored;
+      ifStored = fields;
+    }
+    this.pendingDeletes.set(id, ifStored);
+    await this.sendDelete(id, 0, false);
   }
 
-  private async sendDelete(id: string, attempt: number): Promise<void> {
+  /**
+   * `conditional`: a retry or a resend. It deletes only the record this window knew, so another
+   * window's save that landed after the first try survives. The first try deletes whatever is there.
+   */
+  private async sendDelete(id: string, attempt: number, conditional: boolean): Promise<void> {
     const client = this.client;
+    const ifStored = this.pendingDeletes.get(id);
     // Without a client the next one retries it (setClient).
-    if (!client || !this.pendingDeletes.has(id)) return;
+    if (!client || ifStored === undefined) return;
+    if (conditional && ifStored === null) {
+      this.pendingDeletes.delete(id);
+      return;
+    }
     try {
-      await client.drafts.deleteCreation({ scope: { kind: "creation", draftId: id } });
+      await client.drafts.deleteCreation({
+        scope: { kind: "creation", draftId: id },
+        ...(conditional && ifStored ? { ifStored } : {}),
+      });
       this.pendingDeletes.delete(id);
     } catch (error) {
       console.warn("Failed to delete a creation draft; retrying:", error);
@@ -655,7 +689,7 @@ export class CreationDraftStore {
       clearTimeout(this.deleteTimers.get(id));
       const timer = setTimeout(() => {
         this.deleteTimers.delete(id);
-        this.sendDelete(id, attempt + 1).catch(() => undefined);
+        this.sendDelete(id, attempt + 1, true).catch(() => undefined);
       }, retryDelayMs(attempt));
       this.deleteTimers.set(id, timer);
     }
@@ -689,6 +723,7 @@ export class CreationDraftStore {
       load,
       persisted,
       maybeSaved: false,
+      stored: null,
       pending: {},
       inFlight: null,
       saving: false,

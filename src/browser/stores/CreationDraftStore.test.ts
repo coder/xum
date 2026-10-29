@@ -3,6 +3,7 @@ import { ORPCError } from "@orpc/client";
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test";
 import { createTestApiClient } from "@/browser/testUtils";
 import type {
+  CreationDraftDeleteInput,
   CreationDraftImportLegacyInput,
   CreationDraftScope,
   CreationDraftUpdateInput,
@@ -119,14 +120,14 @@ async function createHarness(
       }
       return reply;
     },
-    deleteCreation: async ({ scope }: { scope: CreationDraftScope }) => {
+    deleteCreation: async ({ scope, ifStored }: CreationDraftDeleteInput) => {
       control.deleteCalls++;
       try {
         if (control.failDeletes > 0) {
           control.failDeletes--;
           throw new Error("connection lost");
         }
-        await service.delete(scope.draftId);
+        await service.delete(scope.draftId, ifStored);
         control.deletesDone++;
       } finally {
         control.deletesSettled++;
@@ -500,6 +501,8 @@ describe("CreationDraftStore", () => {
     const harness = await createHarness(tempDir);
     const { store, control, service } = harness;
     const id = store.create(PROJECT_A, null, { text: "sent" });
+    // The resend deletes only the record it knew: an attachment must not make it look changed.
+    store.update(id, { attachments: [image] });
     await store.flush(id);
     control.failDeletes = 1;
 
@@ -597,6 +600,27 @@ describe("CreationDraftStore", () => {
     jest.useRealTimers();
     await waitFor(() => control.deletesSettled === control.deleteCalls);
     expect((await service.get(id))?.text).toBe("typed in B");
+  });
+
+  test("a delete resent on reconnect does not remove settings another window saved meanwhile", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-resend-other-window");
+    const harness = await createHarness(tempDir);
+    const { store: windowA, control, service } = harness;
+    const id = windowA.create(PROJECT_A, null, { text: "sent" });
+    await windowA.flush(id);
+    const windowB = await reopen(harness, id, PROJECT_A);
+
+    // Window A's delete fails, and its connection drops before the backoff retry.
+    control.failDeletes = 1;
+    await windowA.delete(id);
+    windowA.setClient(null);
+    // Window B changes a field other than the text, and its save is confirmed.
+    windowB.update(id, { manualName: "named-in-b" });
+    await windowB.flush(id);
+
+    windowA.setClient(harness.newClient());
+    await waitFor(() => control.deleteCalls === 2 && control.deletesSettled === 2);
+    expect((await service.get(id))?.manualName).toBe("named-in-b");
   });
 
   test("a list that lands while a deleted draft's save runs does not show it (#7551)", async () => {
