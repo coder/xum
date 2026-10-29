@@ -624,6 +624,48 @@ describe("CreationDraftStore", () => {
     expect(await service.get(other)).toBeNull();
   });
 
+  test("a delete made while disconnected is still a first delete on reconnect", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-offline");
+    const harness = await createHarness(tempDir);
+    const { store: windowA, service } = harness;
+    const id = windowA.create(PROJECT_A, null, { text: "listed" });
+    await windowA.flush(id);
+    // A window that never opened the draft deletes it while disconnected.
+    const sidebarWindow = new CreationDraftStore();
+    await sidebarWindow.delete(id);
+    expect(await service.get(id)).not.toBeNull();
+
+    sidebarWindow.setClient(harness.newClient());
+    await waitFor(() => harness.control.deletesDone === 1);
+    expect(await service.get(id)).toBeNull();
+  });
+
+  test("a delete retry removes what a save racing the delete wrote (its reply lost)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-racing-save");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+    let releaseSave: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    store.update(id, { text: "edited" });
+    const saving = store.flush(id).catch(() => undefined);
+    await waitFor(() => control.updates.length === 2);
+    // The delete waits for the save, which lands but loses its reply. Then the delete fails.
+    control.loseUpdateReplies = 1;
+    control.failDeletes = 1;
+    const deleting = store.delete(id);
+    releaseSave();
+    await Promise.all([saving, deleting]);
+    expect((await service.get(id))?.text).toBe("edited");
+
+    store.setClient(harness.newClient());
+    await waitFor(() => control.deleteCalls === 2 && control.deletesSettled === 2);
+    expect(await service.get(id)).toBeNull();
+  });
+
   test("a delete resent on reconnect does not remove settings another window saved meanwhile", async () => {
     using tempDir = new TestTempDir("creation-store-delete-resend-other-window");
     const harness = await createHarness(tempDir);
