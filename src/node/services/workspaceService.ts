@@ -11132,8 +11132,12 @@ export class WorkspaceService
   // (the router, EditorService, TaskService) and the tests that spy on it unchanged.
 
   /** See WorkspaceExternalEditors.recordExternalEditorOpen. */
-  recordExternalEditorOpen(workspaceId: string, launchToken: string): Promise<Result<void>> {
-    return this.externalEditors.recordExternalEditorOpen(workspaceId, launchToken);
+  recordExternalEditorOpen(
+    workspaceId: string,
+    launchToken: string,
+    remotePath?: string | null
+  ): Promise<Result<{ remotePath: string } | undefined>> {
+    return this.externalEditors.recordExternalEditorOpen(workspaceId, launchToken, remotePath);
   }
 
   /** See WorkspaceExternalEditors.rollbackRecordedEditorOpen. */

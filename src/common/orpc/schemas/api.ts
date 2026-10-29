@@ -4009,8 +4009,10 @@ export const general = {
     input: z.object({
       workspaceId: z.string(),
       launchToken: z.string().min(1).max(128),
+      // An SSH checkout path the editor opens; one under `~` comes back resolved on the host.
+      remotePath: z.string().nullish(),
     }),
-    output: ResultSchema(z.void(), z.string()),
+    output: ResultSchema(z.object({ remotePath: z.string() }).nullish(), z.string()),
   },
   /**
    * Undo a recordEditorOpen whose deep-link launch provably never happened (the renderer's
