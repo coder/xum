@@ -11,7 +11,6 @@ export const RuntimeEnablementIdSchema = z.enum([
   "worktree",
   "ssh",
   "coder",
-  "daytona",
   "docker",
   "devcontainer",
 ]);

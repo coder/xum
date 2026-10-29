@@ -251,8 +251,8 @@ export async function openInEditor(args: OpenInEditorArgs): Promise<OpenInEditor
 
 /**
  * An SSH checkout path the backend resolves while it records the open: workspaces whose host
- * is provisioned after creation (Daytona, Coder) keep the default srcBaseDir's `~`, which an
- * editor's ssh deep link cannot use.
+ * is provisioned after creation (Coder) keep the default srcBaseDir's `~`, which an editor's
+ * ssh deep link cannot use.
  */
 interface RemoteEditorPath {
   path: string;

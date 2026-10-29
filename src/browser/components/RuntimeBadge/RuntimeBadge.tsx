@@ -70,7 +70,7 @@ function TooltipRow({
 
 type RuntimeType = keyof typeof RUNTIME_BADGE_UI;
 
-/** SSH runtimes split by their managed backend (Coder, Daytona) or plain host. */
+/** SSH runtimes split by their managed backend (Coder) or plain host. */
 export function getSshRuntimeInfo(runtimeConfig: Extract<RuntimeConfig, { type: "ssh" }>): {
   type: RuntimeType;
   label: string;
@@ -80,12 +80,6 @@ export function getSshRuntimeInfo(runtimeConfig: Extract<RuntimeConfig, { type: 
     return {
       type: "coder",
       label: `Coder Workspace: ${coderWorkspaceName ?? runtimeConfig.host}`,
-    };
-  }
-  if (runtimeConfig.daytona) {
-    return {
-      type: "daytona",
-      label: `Daytona sandbox: ${runtimeConfig.daytona.sandboxName ?? runtimeConfig.host}`,
     };
   }
   const hostname = extractSshHostname(runtimeConfig);

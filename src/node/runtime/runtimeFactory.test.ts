@@ -18,8 +18,6 @@ import {
 import { LocalRuntime } from "./LocalRuntime";
 import { WorktreeRuntime } from "./WorktreeRuntime";
 import { CoderSSHRuntime } from "./CoderSSHRuntime";
-import { DaytonaSSHRuntime } from "./DaytonaSSHRuntime";
-import { createDaytonaTestRig } from "@/node/services/daytona/daytona.testHarness";
 import type { CoderService } from "@/node/services/coderService";
 
 describe("isIncompatibleRuntimeConfig", () => {
@@ -205,31 +203,5 @@ describe("createRuntime - Coder host normalization", () => {
 
     expect(sshRuntime.getConfig().host).toBe("legacy.mux--coder");
     expect(sshRuntime.transport.getConfig().host).toBe("legacy.mux--coder");
-  });
-});
-
-describe("createRuntime - Daytona", () => {
-  it("selects DaytonaSSHRuntime and points the transport at the sandbox alias", async () => {
-    const rig = await createDaytonaTestRig();
-    try {
-      const config: RuntimeConfig = {
-        type: "ssh",
-        host: "placeholder",
-        srcBaseDir: "~/src",
-        daytona: { sandboxName: "sb-1" },
-      };
-
-      const runtime = createRuntime(config, { daytonaService: rig.service });
-
-      expect(runtime).toBeInstanceOf(DaytonaSSHRuntime);
-      const sshRuntime = runtime as unknown as {
-        getConfig(): { host: string };
-        transport: { getConfig(): { host: string } };
-      };
-      expect(sshRuntime.getConfig().host).toBe("sb-1.xum--daytona");
-      expect(sshRuntime.transport.getConfig().host).toBe("sb-1.xum--daytona");
-    } finally {
-      await rig.cleanup();
-    }
   });
 });

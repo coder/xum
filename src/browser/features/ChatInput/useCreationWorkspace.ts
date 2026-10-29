@@ -211,10 +211,7 @@ interface UseCreationWorkspaceReturn {
 }
 
 /** Runtime availability status for each mode */
-// Daytona is `ssh` plus a sub-config, so its availability rides next to the mode-keyed entries.
-export type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus> & {
-  daytona?: RuntimeAvailabilityStatus;
-};
+export type RuntimeAvailabilityMap = Record<RuntimeMode, RuntimeAvailabilityStatus>;
 
 export type RuntimeAvailabilityState =
   | { status: "loading" }

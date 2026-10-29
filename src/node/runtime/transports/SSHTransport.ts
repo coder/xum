@@ -77,10 +77,4 @@ export interface SSHTransport {
    * ReverseForwardRefusedError when the host refused it.
    */
   openReverseForward(remotePort: number, localPort: number): Promise<ReverseForward>;
-
-  /**
-   * Forget the host's recorded failures and backoff, after its credentials changed (Xum
-   * replaced a Daytona token the gateway refused), so the next acquire connects at once.
-   */
-  resetConnectionHealth?(): void;
 }
