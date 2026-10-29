@@ -17,13 +17,13 @@ import * as path from "node:path";
 import { tool, type Tool } from "ai";
 import type { LanguageModelV2Usage } from "@ai-sdk/provider";
 import { z } from "zod";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { DevToolsLogEntry } from "@/common/types/devtools";
 import {
   createMuxMessage,
   filterOrphanedMcpPromptSnapshots,
   type MuxMessage,
   type PluginHookContextEntry,
+  type PostCompactionContext,
   type SystemSectionRecords,
 } from "@/common/types/message";
 import { applyCacheControlToTools, type AnthropicCacheTtl } from "@/common/utils/ai/cacheStrategy";
@@ -90,7 +90,6 @@ export interface ReplayFixtureTurnSpec {
   /** Request-time inputs beyond chat.jsonl — logged in the turn envelope. */
   planContentForTransition?: string;
   planFilePath?: string;
-  postCompactionAttachments?: PostCompactionAttachment[];
   /** Refusal-fallback partial continuation (envelope-only, never in chat.jsonl). */
   partialContinuation?: MuxMessage;
   /** MCP Apps model context message (request-only, never in chat.jsonl). */
@@ -212,7 +211,6 @@ export async function appendReplayFixtureTurn(
       anthropicCacheTtl: spec.anthropicCacheTtl,
       planContentForTransition: spec.planContentForTransition,
       planFilePath: spec.planFilePath,
-      postCompactionAttachments: spec.postCompactionAttachments,
       partialContinuationMessage: spec.partialContinuation,
       mcpAppModelContextMessage:
         spec.envelopeOmitsMcpAppModelContext === true ? undefined : spec.mcpAppModelContext,
@@ -316,7 +314,6 @@ async function buildReplayedFixtureRequest(
     anthropicCacheTtl: spec.anthropicCacheTtl,
     planContentForTransition: spec.planContentForTransition,
     planFilePath: spec.planFilePath,
-    postCompactionAttachments: spec.postCompactionAttachments,
     partialContinuation: spec.partialContinuation,
     mcpAppModelContext: spec.mcpAppModelContext,
     // Production derives these from the request tools (assemblePromptPayload).
@@ -364,7 +361,6 @@ async function buildLiveFixtureRequest(
     anthropicCacheTtl: spec.anthropicCacheTtl,
     planContentForTransition: spec.planContentForTransition,
     planFilePath: spec.planFilePath,
-    postCompactionAttachments: spec.postCompactionAttachments,
     requestContextMessage: spec.mcpAppModelContext,
     compactionInputBudgetTokens: spec.compactionInputBudgetTokens,
     modelString: REPLAY_FIXTURE_ROWS_MODEL,
@@ -406,7 +402,8 @@ async function buildLiveFixtureRequest(
 export async function appendReplayFixtureCompactionBoundary(
   ctx: ReplayFixtureSessionContext,
   summaryText: string,
-  compactionEpoch: number
+  compactionEpoch: number,
+  postCompactionContext?: PostCompactionContext
 ): Promise<void> {
   ctx.turnCounter += 1;
   const boundaryMessage = createMuxMessage(
@@ -418,6 +415,7 @@ export async function appendReplayFixtureCompactionBoundary(
       compactionBoundary: true,
       compacted: true,
       compactionEpoch,
+      postCompactionContext,
     }
   );
   await appendOrThrow(ctx, boundaryMessage);

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { mkdtemp, rm, stat, utimes, writeFile } from "fs/promises";
+import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from "fs/promises";
 import { tmpdir } from "os";
-import { join } from "path";
+import { dirname, join } from "path";
 
 import { createMuxMessage } from "@/common/types/message";
 import type { MuxMessage } from "@/common/types/message";
@@ -39,7 +39,7 @@ describe("AgentSession file-change notification (turn start)", () => {
       capturedRequests.push(opts.messages);
       return Promise.resolve(Ok(createStartedTurnHandle(session.closingSignal)));
     });
-    const { historyService, session, cleanup } = await createAgentSessionHarness({
+    const { historyService, session, config, cleanup } = await createAgentSessionHarness({
       workspaceId: "ws",
       aiServiceOverrides: { streamMessage },
     });
@@ -50,7 +50,7 @@ describe("AgentSession file-change notification (turn start)", () => {
       createMuxMessage("user-1", "user", "hello", { timestamp: Date.now() })
     );
 
-    return { historyService, session, capturedRequests, streamMessage };
+    return { historyService, session, config, capturedRequests, streamMessage };
   }
 
   /** Track a file via the session, then edit it externally (content + future mtime). */
@@ -114,6 +114,53 @@ describe("AgentSession file-change notification (turn start)", () => {
     if (!secondHistory.success) return;
     const notificationRows = secondHistory.data.filter((m) => m.id.startsWith("file-change-"));
     expect(notificationRows).toHaveLength(1);
+  });
+
+  test("an external plan edit after compaction appends a notification", async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "mux-file-change-notification-"));
+    const previousRoot = process.env.XUM_ROOT;
+    process.env.XUM_ROOT = tmpDir;
+    try {
+      const { historyService, session, config } = await createSessionFixture();
+      // The harness metadata is local workspace "ws" in project "project".
+      const planFile = join(tmpDir, "plans", "project", "ws.md");
+      await mkdir(dirname(planFile), { recursive: true });
+      await writeFile(planFile, "plan v1");
+      const sessionDir = join(config.sessionsDir, "ws");
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(
+        join(sessionDir, "post-compaction.json"),
+        JSON.stringify({ version: 1, createdAt: Date.now(), diffs: [], loadedSkills: [] })
+      );
+
+      // The first turn after compaction consumes the pending state and clears the tracker.
+      const firstResult = await session.resumeStream({
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+      });
+      expect(firstResult.success).toBe(true);
+
+      await writeFile(planFile, "plan v2");
+      const futureMtime = Date.now() + 1000;
+      await utimes(planFile, futureMtime / 1000, futureMtime / 1000);
+
+      const secondResult = await session.resumeStream({
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+      });
+      expect(secondResult.success).toBe(true);
+
+      const historyResult = await historyService.getHistoryFromLatestBoundary("ws");
+      expect(historyResult.success).toBe(true);
+      if (!historyResult.success) return;
+      const notificationRows = historyResult.data.filter((m) => m.id.startsWith("file-change-"));
+      expect(notificationRows).toHaveLength(1);
+      const notificationText = notificationRows[0].parts.find((p) => p.type === "text")?.text ?? "";
+      expect(notificationText).toContain("+plan v2");
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
   });
 
   test("a failed notification append is not dropped: retry re-detects and persists it", async () => {

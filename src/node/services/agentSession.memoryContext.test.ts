@@ -61,7 +61,7 @@ interface PrivateSessionAccess {
     cache?: Map<string, unknown>,
     persistence?: { windowKey: string | undefined }
   ) => Promise<MemorySessionContext | undefined>;
-  getPostCompactionAttachmentsIfNeeded: () => Promise<unknown>;
+  consumePendingPostCompactionState: () => Promise<void>;
   clearPostCompactionState: () => Promise<void>;
   applyContextResetSideEffects: () => Promise<void>;
 }
@@ -346,7 +346,7 @@ describe("AgentSession memory context", () => {
         else if (boundary === "new segment") await priv.clearPostCompactionState();
         else {
           await writePendingPostCompactionState(path.join(config.sessionsDir, WORKSPACE_ID));
-          await priv.getPostCompactionAttachmentsIfNeeded();
+          await priv.consumePendingPostCompactionState();
         }
       } finally {
         await before.dispose();
@@ -474,7 +474,7 @@ describe("AgentSession memory context", () => {
       // Consume a pending compaction boundary (first stream after compaction).
       version = 2;
       await writePendingPostCompactionState(path.join(config.sessionsDir, WORKSPACE_ID));
-      await priv.getPostCompactionAttachmentsIfNeeded();
+      await priv.consumePendingPostCompactionState();
 
       expect(nameOf(await priv.resolveMemoryContext("test-model"))).toBe("/memories/global/v2.md");
       expect(buildMemorySessionContext).toHaveBeenCalledTimes(2);

@@ -29,7 +29,6 @@ import type {
   DevToolsStep,
   DevToolsUsage,
 } from "@/common/types/devtools";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { DurableEvent } from "@/common/types/durableEvent";
 import type { MuxMessage } from "@/common/types/message";
 import type { Result } from "@/common/types/result";
@@ -781,18 +780,18 @@ export async function replayVerifySession(params: {
         planContentForTransition = planContent;
       }
 
-      let postCompactionAttachments: PostCompactionAttachment[] | undefined;
       if (envelope.data.postCompactionAttachmentsHash != null) {
-        const attachmentsJson = await journal.blobs.getText(
-          envelope.data.postCompactionAttachmentsHash
-        );
-        if (attachmentsJson == null) {
-          fail(
-            `post-compaction attachments blob ${envelope.data.postCompactionAttachmentsHash} missing from blob store`
-          );
-          continue;
-        }
-        postCompactionAttachments = JSON.parse(attachmentsJson) as PostCompactionAttachment[];
+        // Older builds added post-compaction attachments at request time. This build renders
+        // the boundary's header from chat.jsonl instead, so it cannot rebuild those requests.
+        results.push({
+          turnIndex: i,
+          envelopeSeq: envelope.seq,
+          assistantMessageId: turn.message.id,
+          runId: record.runId,
+          status: "SKIPPED",
+          reason: "request-time post-compaction attachments from an older build",
+        });
+        continue;
       }
 
       let partialContinuation: MuxMessage | undefined;
@@ -855,7 +854,6 @@ export async function replayVerifySession(params: {
         toolInstructions: readToolInstructionsRecord(turn.message),
         planContentForTransition,
         planFilePath: envelope.data.planTransitionFilePath,
-        postCompactionAttachments,
         partialContinuation,
         mcpAppModelContext,
         deferLoadingToolNames: deferLoadingNamesFromRecordedTools(record.tools),

@@ -2,7 +2,7 @@
  * Behavior tests for replayVerifySession's pairing and failure isolation:
  * compacted histories, missing assistant rows, devtools toggling, retries,
  * corrupted turns, and the turn-envelope round-trip of request-time inputs
- * (plan-transition content, post-compaction attachments, per-send cache TTL).
+ * (plan-transition content, per-send cache TTL).
  *
  * Sessions are generated in temp dirs through the same fixture harness the
  * committed golden fixture uses (appendReplayFixtureTurn), so the recorded
@@ -18,6 +18,7 @@ import { createMuxMessage } from "@/common/types/message";
 import { TOOL_SEARCH_TOOL_NAME } from "@/common/utils/tools/toolCatalog";
 import { DisposableTempDir } from "@/node/services/tempDir";
 import { emitTurnEnvelope } from "@/node/services/turnEnvelope";
+import { DURABLE_EVENTS_FILE_NAME } from "@/node/utils/journal/durableEventJournal";
 import {
   appendReplayFixtureCompactionBoundary,
   appendReplayFixtureTurn,
@@ -67,21 +68,16 @@ describe("replayVerifySession pairing", () => {
       systemPrompt: SYSTEM_PROMPT,
       tools: tools(),
     });
-    await appendReplayFixtureCompactionBoundary(ctx, "Summary of the session so far.", 1);
+    // The boundary's post-compaction header renders into the request from chat.jsonl alone.
+    await appendReplayFixtureCompactionBoundary(ctx, "Summary of the session so far.", 1, {
+      text: "1. do the thing",
+      skillNames: [],
+    });
     await appendReplayFixtureTurn(ctx, {
       userText: "After compaction.",
       assistantText: "Answer two.",
       systemPrompt: SYSTEM_PROMPT,
       tools: tools(),
-      // Post-compaction attachments are injected into the request and must be
-      // reconstructible from the envelope blob alone.
-      postCompactionAttachments: [
-        {
-          type: "plan_file_reference",
-          planFilePath: "/tmp/plan.md",
-          planContent: "1. do the thing",
-        },
-      ],
     });
 
     const result = await verify(ctx);
@@ -90,10 +86,37 @@ describe("replayVerifySession pairing", () => {
       { status: "PASS", reason: undefined },
     ]);
 
-    // Guard against a vacuous pass: the injected attachment content must
-    // actually be model-visible in the recorded request.
+    // Guard against a vacuous pass: the header must actually be model-visible in the
+    // recorded request.
     const devtoolsRaw = ctx.devtoolsLines.join("\n");
     expect(devtoolsRaw).toContain("1. do the thing");
+  });
+
+  test("skips a turn whose envelope recorded request-time post-compaction attachments", async () => {
+    using tmp = new DisposableTempDir("replay-verify-legacy-attachments");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    for (const userText of ["First.", "Second."]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText,
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+      });
+    }
+    // Older builds added attachments to the request and logged them in the envelope;
+    // this build cannot rebuild those bytes from chat.jsonl.
+    const eventsPath = `${tmp.path}/${DURABLE_EVENTS_FILE_NAME}`;
+    const lines = (await fs.readFile(eventsPath, "utf-8")).trim().split("\n");
+    const lastEnvelopeIndex = lines.findLastIndex((line) => line.includes('"turn-envelope"'));
+    const envelope = JSON.parse(lines[lastEnvelopeIndex]) as {
+      data: Record<string, unknown> & { systemPromptHash: unknown };
+    };
+    envelope.data.postCompactionAttachmentsHash = envelope.data.systemPromptHash;
+    lines[lastEnvelopeIndex] = JSON.stringify(envelope);
+    await fs.writeFile(eventsPath, `${lines.join("\n")}\n`, "utf-8");
+
+    const result = await verify(ctx);
+    expect(result.turns.map((turn) => turn.status)).toEqual(["PASS", "SKIPPED"]);
   });
 
   test("the prefix rule checks every recorded step, not only each turn's first", async () => {

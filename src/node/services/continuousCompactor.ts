@@ -1,6 +1,4 @@
-import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
 import type { ModelMessage } from "ai";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import type { ContinuousCompactionJournal } from "@/common/orpc/schemas/continuousCompaction";
 import {
   exactJson,
@@ -17,6 +15,7 @@ import {
   type CompactionFollowUpRequest,
   type MuxMessage,
   type MuxMetadata,
+  type PostCompactionContext,
 } from "@/common/types/message";
 import { selectRollingCut, type RollingCut } from "@/common/utils/compaction/rollingCut";
 import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
@@ -28,6 +27,11 @@ import {
 import type { HistoryService } from "./historyService";
 import type { CompactionHandler } from "./compactionHandler";
 import { log } from "./log";
+import {
+  estimatePostCompactionContextTokens,
+  findPostCompactionContext,
+  withPostCompactionContext,
+} from "./postCompactionContext";
 
 export interface ContinuousCompactionContext {
   enabled: boolean;
@@ -69,7 +73,7 @@ interface Dependencies {
     preparation: ContinuousCompactionJournal["preparation"];
     systemPrefix: ModelMessage[];
     requestProviderOptions?: Record<string, unknown>;
-    attachments: PostCompactionAttachment[];
+    postCompactionContext: PostCompactionContext | null;
     cacheEnabled: boolean;
   } | null>;
   // Includes usage recording: the generation fence must be AFTER the last await.
@@ -549,7 +553,7 @@ export class ContinuousCompactor {
       return false;
     const prepared = await this.deps.prepareSwap(staged.cut.head);
     if (!prepared || !this.isValid(staged, rows)) return false;
-    const { boundary, copies } = this.deps.compactionHandler.buildContinuousCompactionRows({
+    const built = this.deps.compactionHandler.buildContinuousCompactionRows({
       messages: rows,
       text: staged.text,
       model: staged.model,
@@ -557,6 +561,13 @@ export class ContinuousCompactor {
       systemMessageTokens: context.systemMessageTokens ?? 0,
       attachmentTokens: staged.attachmentTokens,
     });
+    // The swapped prefix and every later request render the header from this boundary.
+    const boundary = withPostCompactionContext(
+      built.boundary,
+      prepared.postCompactionContext,
+      this.deps.workspaceId
+    );
+    const copies = built.copies;
     const staticCopies = copies.slice(0, -1);
     const liveCopy = copies.at(-1);
     assert(liveCopy && tail.at(-1)?.id === live.messageId, "Live tail must be final");
@@ -577,11 +588,11 @@ export class ContinuousCompactor {
           partIndex,
           metadataTemplate: liveCopy.metadata,
         },
+        postCompactionAttachments: [],
         prefixSourceRows: [boundary, ...staticCopies],
         systemPrefix: z.array(z.json()).parse(exactJson(prepared.systemPrefix)),
         cacheEnabled: prepared.cacheEnabled,
         sourceFingerprint: fingerprint(journalSourceRows(visibleRows, source, partIndex)),
-        postCompactionAttachments: prepared.attachments,
         preparation: prepared.preparation,
         requestProviderOptions:
           prepared.requestProviderOptions == null
@@ -752,10 +763,7 @@ export class ContinuousCompactor {
       model: journal.summaryModel,
       tail: [],
       systemMessageTokens: boundary.metadata?.systemMessageTokens ?? 0,
-      attachmentTokens: injectPostCompactionAttachments(
-        [],
-        journal.postCompactionAttachments
-      ).reduce((sum, row) => sum + estimateMuxMessageTokens(row), 0),
+      attachmentTokens: estimatePostCompactionContextTokens(findPostCompactionContext([boundary])),
       // Sequence assignment must not mutate the exact journal receipt used by cleanup.
       prepared: { boundary, copies: [...structuredClone(journal.staticCopies), liveCopy] },
       publication: { generation: journal.publicationGeneration, journal },

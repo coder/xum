@@ -775,7 +775,7 @@ describe("ContinuousCompactor", () => {
             toolNamesForSentinel: ["bash"],
             effectiveThinkingLevel: "off",
           },
-          attachments: [{ type: "read_files_reference", paths: ["kept.txt"] }],
+          postCompactionContext: { text: "Read kept.txt", skillNames: [] },
           systemPrefix: [],
           cacheEnabled: true,
         }),
@@ -887,6 +887,28 @@ describe("ContinuousCompactor", () => {
     });
     expect(full.filter((row) => row.id === "resolve-mid-stream")).toHaveLength(1);
     expect(full.filter((row) => row.id === journal.boundary.id)).toHaveLength(1);
+  });
+
+  it("keeps the post-compaction header from the journal boundary through recovery", async () => {
+    const { journal, journalStore, swap } = await activateJournaledSwap();
+    const header = { text: "Read kept.txt", skillNames: [] };
+    expect(journal.boundary.metadata?.postCompactionContext).toEqual(header);
+    expect(JSON.stringify(swap.prefix)).toContain(header.text);
+    // Older builds also wrote the attachments into the journal; such a journal still folds.
+    await writeFile(
+      journalStore.path,
+      JSON.stringify({
+        ...journal,
+        postCompactionAttachments: [{ type: "read_files_reference", paths: ["kept.txt"] }],
+      })
+    );
+    streaming = false;
+    live = undefined;
+    expect(await compactor.recover()).toBe(true);
+    const boundary = (await rows())[0];
+    expect(boundary.id).toBe(journal.boundary.id);
+    expect(boundary.metadata?.postCompactionContext).toEqual(header);
+    expect(await journalStore.read()).toBeNull();
   });
 
   it("recovers a journal whose source fingerprint an earlier build took over raw rows", async () => {
@@ -1095,7 +1117,7 @@ describe("ContinuousCompactor", () => {
           effectiveThinkingLevel: "off",
           toolNamesForSentinel: ["bash"],
         },
-        attachments: [],
+        postCompactionContext: null,
         systemPrefix: [],
         cacheEnabled: true,
       });

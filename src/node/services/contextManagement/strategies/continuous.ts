@@ -4,8 +4,6 @@ import type { MuxMessage, CompactionFollowUpRequest } from "@/common/types/messa
 import { FORCE_COMPACTION_BUFFER_PERCENT } from "@/common/constants/ui";
 import { getEffectiveContextLimit } from "@/common/utils/compaction/contextLimit";
 import { isAnthropic1MEffectivelyEnabled } from "@/common/utils/ai/providerOptions";
-import { injectPostCompactionAttachments } from "@/browser/utils/messages/modelMessageTransform";
-import { estimateMuxMessageTokens } from "@/common/utils/messages/keepRecentTail";
 import { extractEditedFileDiffs } from "@/common/utils/messages/extractEditedFiles";
 import { extractReadFilePaths, mergeReadFilePaths } from "@/common/utils/messages/extractReadFiles";
 import { nodeClock } from "@/node/utils/hostClock";
@@ -15,6 +13,7 @@ import {
 } from "../../agentSkills/loadedSkillSnapshots";
 import { ContinuousCompactor, type ContinuousCompactionContext } from "../../continuousCompactor";
 import { summarizeContinuousCompaction } from "../../continuousCompactionSummary";
+import { estimatePostCompactionContextTokens } from "../../postCompactionContext";
 import type { CompactionHandler } from "../../compactionHandler";
 import type { CompactionMonitor } from "../../compactionMonitor";
 import type { CompactionToken } from "../../turnCoordinator";
@@ -79,20 +78,15 @@ export class ContinuousStrategy {
           workspaceId: this.host.workspaceId,
           reason: "continuous-eager",
         }),
-      estimateAttachmentTokens: async (head) => {
-        const attachments = await this.buildContinuousCompactionAttachments(head);
-        return injectPostCompactionAttachments([], attachments).reduce(
-          (sum, row) => sum + estimateMuxMessageTokens(row),
-          0
-        );
-      },
+      estimateAttachmentTokens: async (head) =>
+        estimatePostCompactionContextTokens(await this.buildContinuousPostCompactionContext(head)),
       prepareSwap: async (head) => {
         // A consumed swap may need the fast-stop fallback on a provider-family hop.
         if (!this.host.state.stream?.options) return null;
         const prepared = this.host.streams.getPrefixSwapPreparation?.(this.host.workspaceId);
         if (!prepared) return null;
-        const attachments = await this.buildContinuousCompactionAttachments(head);
-        return { ...prepared, attachments };
+        const postCompactionContext = await this.buildContinuousPostCompactionContext(head);
+        return { ...prepared, postCompactionContext };
       },
       summarize: (head, signal, context: SessionCompactionContext, receiptRows) => {
         const baseOptions = context.sendOptions ?? { model: context.model, agentId: "exec" };
@@ -118,10 +112,10 @@ export class ContinuousStrategy {
     });
   }
 
-  private async buildContinuousCompactionAttachments(head: MuxMessage[]) {
+  private async buildContinuousPostCompactionContext(head: MuxMessage[]) {
     const pending = await this.handler.peekPendingState();
     const warm = await this.handler.peekCarryoverState();
-    return this.host.buildAttachments({
+    return this.host.buildPostCompactionContext({
       diffs: [...(pending?.diffs ?? []), ...extractEditedFileDiffs(head)],
       loadedSkills: mergeLoadedSkillSnapshots([
         ...(warm?.loadedSkills ?? []),

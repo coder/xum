@@ -149,7 +149,6 @@ function journalFixture(
       partIndex: overrides.partIndex ?? 0,
       metadataTemplate: {},
     },
-    postCompactionAttachments: [],
     prefixSourceRows: [boundary],
     systemPrefix: [],
     cacheEnabled: true,

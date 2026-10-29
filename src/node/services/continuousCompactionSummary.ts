@@ -166,7 +166,6 @@ export async function summarizeContinuousCompaction(args: {
       replayReceiptMessages: args.receiptRows,
       effectiveAgentId: "compact",
       toolNamesForSentinel: [],
-      postCompactionAttachments: null,
       providerForMessages: created.data.wireProviderName,
       effectiveThinkingLevel: thinkingLevel,
       modelString: created.data.optionsModelString,

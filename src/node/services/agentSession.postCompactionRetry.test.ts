@@ -24,6 +24,30 @@ function contextExceededResult(messageId: string) {
   };
 }
 
+const HEADER = { text: "<post-compaction context>", skillNames: [] };
+
+function createHeaderBoundary(): MuxMessage {
+  return {
+    id: "compaction-summary",
+    role: "assistant",
+    parts: [{ type: "text", text: "Summary" }],
+    metadata: {
+      timestamp: 1000,
+      compacted: "user",
+      compactionBoundary: true,
+      compactionEpoch: 1,
+      postCompactionContext: HEADER,
+    },
+  };
+}
+
+/** The header on the boundary row of one streamMessage call's request messages. */
+function requestHeader(streamMessage: ReturnType<typeof mock>, call: number): unknown {
+  const { messages } = streamMessage.mock.calls[call][0] as { messages: MuxMessage[] };
+  return messages.find((message) => message.id === "compaction-summary")?.metadata
+    ?.postCompactionContext;
+}
+
 function createPersistedPostCompactionState(options: {
   filePath: string;
   diffs: Array<{ path: string; diff: string; truncated: boolean }>;
@@ -31,6 +55,8 @@ function createPersistedPostCompactionState(options: {
   const payload = {
     version: 1 as const,
     createdAt: Date.now(),
+    // Pending state belongs to the boundary that createHeaderBoundary writes.
+    boundaryMessageId: "compaction-summary",
     diffs: options.diffs,
   };
 
@@ -69,12 +95,7 @@ describe("AgentSession post-compaction context retry", () => {
     });
 
     const history: MuxMessage[] = [
-      {
-        id: "compaction-summary",
-        role: "assistant",
-        parts: [{ type: "text", text: "Summary" }],
-        metadata: { timestamp: 1000, compacted: "user" },
-      },
+      createHeaderBoundary(),
       {
         id: "user-1",
         role: "user",
@@ -153,18 +174,8 @@ describe("AgentSession post-compaction context retry", () => {
       "retry-started"
     );
 
-    // With the options bag, arg[0] is the StreamMessageOptions object.
-    const firstOpts = (streamMessage as ReturnType<typeof mock>).mock.calls[0][0] as Record<
-      string,
-      unknown
-    >;
-    expect(Array.isArray(firstOpts.postCompactionAttachments)).toBe(true);
-
-    const secondOpts = (streamMessage as ReturnType<typeof mock>).mock.calls[1][0] as Record<
-      string,
-      unknown
-    >;
-    expect(secondOpts.postCompactionAttachments).toBeNull();
+    expect(requestHeader(streamMessage, 0)).toEqual(HEADER);
+    expect(requestHeader(streamMessage, 1)).toBeUndefined();
 
     expect((historyService.deleteMessage as ReturnType<typeof mock>).mock.calls[0][1]).toBe(
       "assistant-ctx-exceeded"
@@ -182,6 +193,51 @@ describe("AgentSession post-compaction context retry", () => {
     await session.dispose();
   });
 
+  test("does not retry when the request had no post-compaction header", async () => {
+    const workspaceId = "ws-no-header";
+    const { historyService, config } = await createSessionsFixture(workspaceId);
+    await historyService.appendToHistory(workspaceId, {
+      id: "user-1",
+      role: "user",
+      parts: [{ type: "text", text: "Continue" }],
+      metadata: { timestamp: 1100 },
+    });
+
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((..._args: unknown[]) => {
+      aiEmitter.emit("error", {
+        workspaceId,
+        messageId: "assistant-ctx-exceeded",
+        error: "Context length exceeded",
+        errorType: "context_exceeded",
+      });
+      return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
+    });
+
+    const { session } = await createAgentSessionHarness({
+      workspaceId,
+      config,
+      historyService,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage,
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
+    });
+
+    await session.resumeStream({
+      model: "openai:gpt-4o",
+      agentId: "exec",
+    } as unknown as SendMessageOptions);
+
+    expect(await session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded")).toBe(
+      "terminal"
+    );
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+
+    await session.dispose();
+  });
+
   // Waiters (task/workspace-turn stream-error settlement) treat the resolved
   // decision as "the retry outcome is known". Resolving while retry startup is
   // still in flight would let a pre-stream startup failure (no further error
@@ -194,6 +250,7 @@ describe("AgentSession post-compaction context retry", () => {
       diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
     });
 
+    await historyService.appendToHistory(workspaceId, createHeaderBoundary());
     await historyService.appendToHistory(workspaceId, {
       id: "user-1",
       role: "user",
@@ -301,6 +358,7 @@ describe("AgentSession post-compaction context retry", () => {
       diffs: [{ path: "/tmp/foo.ts", diff: "@@ -1 +1 @@\n-foo\n+bar\n", truncated: false }],
     });
 
+    await historyService.appendToHistory(workspaceId, createHeaderBoundary());
     await historyService.appendToHistory(workspaceId, {
       id: "user-1",
       role: "user",
@@ -380,6 +438,11 @@ describe("AgentSession post-compaction context retry", () => {
       )
     ).toBe("terminal");
     expect(callCount).toBe(2);
+
+    // The header stays in chat.jsonl, but later requests of this session leave it out.
+    await session.resumeStream(options);
+    expect(callCount).toBe(3);
+    expect(requestHeader(streamMessage, 2)).toBeUndefined();
 
     await session.dispose();
   });

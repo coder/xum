@@ -2,8 +2,6 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import { readFile } from "fs/promises";
 import * as path from "path";
-import { TURNS_BETWEEN_ATTACHMENTS } from "@/common/constants/attachments";
-import type { PostCompactionAttachment } from "@/common/types/attachment";
 import { createMuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { StreamEndEvent } from "@/common/types/stream";
@@ -18,10 +16,10 @@ const model = "openai:gpt-4o";
 interface SessionAccess {
   contextController: { compactionHandler: CompactionHandler };
   coordinator: TurnCoordinator;
-  turnsSinceLastAttachment: number;
-  getPostCompactionAttachmentsIfNeeded(
-    includeReadFiles: boolean
-  ): Promise<PostCompactionAttachment[] | null>;
+  pendingPostCompactionStateToAcknowledge: Awaited<
+    ReturnType<CompactionHandler["peekPendingState"]>
+  >;
+  consumePendingPostCompactionState(): Promise<void>;
   clearStartupAutoRetryAbandon(): Promise<void>;
   maybeRetryCompactionOnContextExceeded(): Promise<boolean>;
 }
@@ -31,15 +29,9 @@ afterEach(() => {
 });
 
 describe("pending snapshot consumers", () => {
-  test.each([
-    { outcome: "success", periodic: false, replacement: true },
-    { outcome: "context-exceeded", periodic: false, replacement: true },
-    { outcome: "success", periodic: true, replacement: true },
-    { outcome: "context-exceeded", periodic: true, replacement: true },
-    { outcome: "context-exceeded", periodic: true, replacement: false },
-  ] as const)(
-    "$outcome retains its request snapshot (periodic=$periodic, replacement=$replacement)",
-    async ({ outcome, periodic, replacement }) => {
+  test.each(["success", "context-exceeded"] as const)(
+    "%s settles its own request snapshot, not a successor's",
+    async (outcome) => {
       const completion = Promise.withResolvers<TurnCompletion>();
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
@@ -82,14 +74,6 @@ describe("pending snapshot consumers", () => {
             input: { path: `/${id}.ts` },
             output: { success: true, diff: `change ${id}` },
           },
-          {
-            type: "dynamic-tool",
-            toolCallId: `${id}-read`,
-            toolName: "file_read",
-            state: "output-available",
-            input: { path: `/${id}.ts` },
-            output: { success: true },
-          },
         ];
         const preparation = handler.beginPreparation(() => true);
         expect(
@@ -115,24 +99,7 @@ describe("pending snapshot consumers", () => {
       let policy: Promise<void> | undefined;
       try {
         await publish("a");
-        if (periodic) {
-          await session.getPostCompactionAttachmentsIfNeeded(true);
-          await handler.ackPendingStateConsumed();
-          session.turnsSinceLastAttachment = TURNS_BETWEEN_ATTACHMENTS;
-          // Periodic injection reads current-epoch edits even when RLM read-path injection is off.
-          const recent = createMuxMessage("recent", "assistant", "");
-          recent.parts = [
-            {
-              type: "dynamic-tool",
-              toolCallId: "recent-edit",
-              toolName: "file_edit_replace_string",
-              state: "output-available",
-              input: { path: "/recent.ts" },
-              output: { success: true, diff: "recent change" },
-            },
-          ];
-          await h.historyService.appendToHistory(workspaceId, recent);
-        }
+        // A context-exceeded request with a header retries without it and discards its carryover.
         const consume = spyOn(
           handler,
           outcome === "success" ? "ackPendingStateConsumed" : "discardPendingState"
@@ -142,16 +109,16 @@ describe("pending snapshot consumers", () => {
           createMuxMessage("user", "user", "continue")
         );
         expect((await h.session.resumeStream({ model, agentId: "exec" })).success).toBe(true);
+        const hold = async () => {
+          entered.resolve();
+          await release.promise;
+        };
         if (outcome === "success") {
-          spyOn(session, "clearStartupAutoRetryAbandon").mockImplementationOnce(async () => {
-            entered.resolve();
-            await release.promise;
-          });
+          spyOn(session, "clearStartupAutoRetryAbandon").mockImplementationOnce(hold);
         } else {
           spyOn(session, "maybeRetryCompactionOnContextExceeded").mockImplementationOnce(
             async () => {
-              entered.resolve();
-              await release.promise;
+              await hold();
               return false;
             }
           );
@@ -179,40 +146,30 @@ describe("pending snapshot consumers", () => {
         const result = consumer.mock.results.at(-1);
         assert(result?.type === "return", "Expected an active completion consumer");
         policy = result.value;
+        await publish("b");
+        // A successor request captures B while A's policy is suspended. A retains its entry value.
+        await session.consumePendingPostCompactionState();
+        expect(
+          session.pendingPostCompactionStateToAcknowledge?.diffs.some(
+            (diff) => diff.path === "/b.ts"
+          )
+        ).toBe(true);
         const pendingPath = path.join(h.config.sessionsDir, workspaceId, "post-compaction.json");
-        let bytes: string | undefined;
-        if (replacement) {
-          await publish("b");
-          // A successor request captures B while A's policy is suspended. A retains its entry value.
-          const attachments = await session.getPostCompactionAttachmentsIfNeeded(false);
-          expect(
-            attachments
-              ?.find((attachment) => attachment.type === "edited_files_reference")
-              ?.files.some((file) => file.path === "/b.ts")
-          ).toBe(true);
-          bytes = await readFile(pendingPath, "utf8");
-        }
+        const bytes = await readFile(pendingPath, "utf8");
         release.resolve();
         await policy;
         expect(consume).toHaveBeenCalledTimes(1);
-        if (replacement) {
-          expect(
-            (await handler.peekPendingState())?.diffs.some((diff) => diff.path === "/b.ts")
-          ).toBe(true);
-          assert(bytes !== undefined, "Expected replacement file");
-          const {
-            previousState: _previous,
-            previousStateGeneration: _generation,
-            previousStateBoundary: _boundary,
-            ...successor
-          } = JSON.parse(bytes) as Record<string, unknown>;
-          // Retiring A also retires its crash fallback, while B's exact owner survives.
-          expect(JSON.parse(await readFile(pendingPath, "utf8"))).toEqual(successor);
-        } else {
-          // The failed periodic injection still owns A's retained read-path carryover after ack.
-          await publish("c");
-          expect((await handler.peekPendingState())?.readFiles).toEqual(["/c.ts"]);
-        }
+        expect(
+          (await handler.peekPendingState())?.diffs.some((diff) => diff.path === "/b.ts")
+        ).toBe(true);
+        const {
+          previousState: _previous,
+          previousStateGeneration: _generation,
+          previousStateBoundary: _boundary,
+          ...successor
+        } = JSON.parse(bytes) as Record<string, unknown>;
+        // Retiring A also retires its crash fallback, while B's exact owner survives.
+        expect(JSON.parse(await readFile(pendingPath, "utf8"))).toEqual(successor);
         if (outcome === "context-exceeded") {
           expect(calls).toBe(2);
           expect(h.session.isBusy()).toBe(true);

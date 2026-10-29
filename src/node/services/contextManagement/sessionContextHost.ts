@@ -5,13 +5,16 @@ import type {
   ProvidersConfigMap,
 } from "@/common/orpc/types";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
-import type { CompactionFollowUpRequest, MuxMessageMetadata } from "@/common/types/message";
-import type { LoadedSkillSnapshot, PostCompactionAttachment } from "@/common/types/attachment";
+import type {
+  CompactionFollowUpRequest,
+  MuxMessageMetadata,
+  PostCompactionContext,
+} from "@/common/types/message";
 import type { AutoCompactionUsageState } from "@/common/utils/compaction/autoCompactionCheck";
-import type { FileEditDiff } from "@/common/utils/messages/extractEditedFiles";
 import type { AgentSessionStreamManager } from "../agentSession";
 import type { TurnCoordinator } from "../turnCoordinator";
 import type { TurnAcceptanceOrigin } from "../taskWorkspaceSeam";
+import type { PostCompactionContextInput } from "../postCompactionContext";
 import type {
   ContextDispatchRequest,
   CompactionContinuation,
@@ -91,12 +94,10 @@ export interface SessionContextHost {
     continuation: CompactionContinuation
   ): Promise<void>;
   dispatchPendingFollowUp(summaryId: string | null, admissionStale: () => boolean): Promise<void>;
-  buildAttachments(input: {
-    diffs: FileEditDiff[];
-    loadedSkills: LoadedSkillSnapshot[];
-    readFilePaths: string[];
-    reportsCompletedBeforeMs: number;
-  }): Promise<PostCompactionAttachment[]>;
+  /** Builds the header that a new compaction boundary row stores (null: nothing to restore). */
+  buildPostCompactionContext(
+    input: PostCompactionContextInput
+  ): Promise<PostCompactionContext | null>;
   emitChatEvent(event: WorkspaceChatMessage): void;
   onCompactionComplete?(metadata: CompactionCompletionMetadata): void;
   onIdleCompactionOutcome?(success: boolean): void;
