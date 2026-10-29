@@ -8,9 +8,12 @@ import type { MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { AgentSession } from "./agentSession";
 import type { StreamMessageOptions } from "./aiService";
-import type { CompactionHandler } from "./compactionHandler";
 import type { HistoryService } from "./historyService";
-import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
+import {
+  compactSessionForTest,
+  createAgentSessionHarness,
+  createStartedTurnHandle,
+} from "./agentSession.testHarness";
 
 /**
  * Log purity: externally-edited files must produce a durable <system-file-update>
@@ -153,25 +156,7 @@ describe("AgentSession file-change notification (turn start)", () => {
 
   /** Compact for real; the boundary header holds the plan unless exclusions.json drops it. */
   async function compact(session: AgentSession, historyService: HistoryService): Promise<void> {
-    const handler = (session as unknown as { contextController: { compaction: CompactionHandler } })
-      .contextController.compaction;
-    expect(
-      await handler.persistContinuousCompaction({
-        preparation: handler.beginPreparation(() => true),
-        publication: {
-          generation: await historyService.getContinuousCompactionJournal("ws").captureGeneration(),
-        },
-        attachmentMessages: [],
-        messages: [],
-        boundaryMessageId: "boundary",
-        text: "summary",
-        model: "anthropic:claude-sonnet-4-5",
-        tail: [],
-        systemMessageTokens: 0,
-        attachmentTokens: 0,
-        shouldPersist: () => true,
-      })
-    ).toBe(true);
+    await compactSessionForTest(session, historyService, "ws");
     // A user row after the boundary lets every later resume start a turn.
     await historyService.appendToHistory(
       "ws",

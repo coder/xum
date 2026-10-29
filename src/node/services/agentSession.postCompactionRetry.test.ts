@@ -7,11 +7,14 @@ import { Err } from "@/common/types/result";
 
 import type { MuxMessage } from "@/common/types/message";
 import type { SendMessageOptions } from "@/common/orpc/types";
+import type { AgentSession } from "./agentSession";
 import { createTestHistoryService } from "./testHistoryService";
 import {
+  compactSessionForTest,
   createAgentSessionHarness,
   createFailedTurnHandle,
   createStartedTurnHandle,
+  sessionCompactionHandler,
 } from "./agentSession.testHarness";
 
 function contextExceededResult(messageId: string) {
@@ -78,10 +81,67 @@ describe("AgentSession post-compaction context retry", () => {
     return { historyService, config, sessionDir };
   }
 
+  /**
+   * Resume a session whose first stream fails with context_exceeded, and wait until the retry
+   * streams. `beforeResume` runs on the new session before the resume.
+   */
+  async function resumeIntoContextRetry(
+    fixture: Awaited<ReturnType<typeof createSessionsFixture>>,
+    workspaceId: string,
+    beforeResume?: (session: AgentSession) => Promise<void>
+  ) {
+    const aiEmitter = new EventEmitter();
+    let resolveRetry: (() => void) | undefined;
+    const retried = new Promise<void>((resolve) => {
+      resolveRetry = resolve;
+    });
+    const streamMessage = mock((..._args: unknown[]) => {
+      if (streamMessage.mock.calls.length === 1) {
+        // Simulate a provider context limit error before any deltas.
+        aiEmitter.emit("error", {
+          workspaceId,
+          messageId: "assistant-ctx-exceeded",
+          error: "Context length exceeded",
+          errorType: "context_exceeded",
+        });
+        return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
+      }
+      resolveRetry?.();
+      return Promise.resolve({
+        success: true as const,
+        data: createStartedTurnHandle(session.closingSignal, "assistant-retry"),
+      });
+    });
+    const { session } = await createAgentSessionHarness({
+      workspaceId,
+      config: fixture.config,
+      historyService: fixture.historyService,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage,
+        // No workspace metadata: the retry path must not depend on a runtime.
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
+    });
+    await beforeResume?.(session);
+
+    // Exercise the public resume facade so retry preparation has a real admitted owner.
+    await session.resumeStream({
+      model: "openai:gpt-4o",
+      agentId: "exec",
+    } as unknown as SendMessageOptions);
+    await Promise.race([
+      retried,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("retry timeout")), 1000)),
+    ]);
+    return { session, streamMessage };
+  }
+
   test("retries once without post-compaction injection on context_exceeded", async () => {
     const workspaceId = "ws";
-    const { historyService, config, sessionDir } = await createSessionsFixture(workspaceId);
-    const postCompactionPath = path.join(sessionDir, "post-compaction.json");
+    const fixture = await createSessionsFixture(workspaceId);
+    const { historyService } = fixture;
+    const postCompactionPath = path.join(fixture.sessionDir, "post-compaction.json");
 
     await createPersistedPostCompactionState({
       filePath: postCompactionPath,
@@ -109,62 +169,7 @@ describe("AgentSession post-compaction context retry", () => {
     }
     spyOn(historyService, "deleteMessage");
 
-    const aiEmitter = new EventEmitter();
-
-    let resolveSecondCall: (() => void) | undefined;
-    const secondCall = new Promise<void>((resolve) => {
-      resolveSecondCall = resolve;
-    });
-
-    let callCount = 0;
-    const streamMessage = mock((..._args: unknown[]) => {
-      callCount += 1;
-
-      if (callCount === 1) {
-        // Simulate a provider context limit error before any deltas.
-        aiEmitter.emit("error", {
-          workspaceId,
-          messageId: "assistant-ctx-exceeded",
-          error: "Context length exceeded",
-          errorType: "context_exceeded",
-        });
-
-        return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
-      }
-
-      resolveSecondCall?.();
-      return Promise.resolve({
-        success: true as const,
-        data: createStartedTurnHandle(session.closingSignal, "assistant-retry"),
-      });
-    });
-
-    const { session } = await createAgentSessionHarness({
-      workspaceId,
-      config,
-      historyService,
-      aiEmitter,
-      aiServiceOverrides: {
-        streamMessage,
-        // No workspace metadata: the retry path must not depend on a runtime.
-        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
-      },
-    });
-
-    const options: SendMessageOptions = {
-      model: "openai:gpt-4o",
-      agentId: "exec",
-    } as unknown as SendMessageOptions;
-
-    // Exercise the public resume facade so retry preparation has a real admitted owner.
-    await session.resumeStream(options);
-
-    // Wait for the retry call to happen.
-    await Promise.race([
-      secondCall,
-      new Promise((_, reject) => setTimeout(() => reject(new Error("retry timeout")), 1000)),
-    ]);
-
+    const { session, streamMessage } = await resumeIntoContextRetry(fixture, workspaceId);
     expect(streamMessage).toHaveBeenCalledTimes(2);
 
     // Codex fast-retry scenario: a waiter that arrives only after the retry
@@ -190,6 +195,33 @@ describe("AgentSession post-compaction context retry", () => {
     }
     expect(exists).toBe(false);
 
+    await session.dispose();
+  });
+
+  test("a retry after the window's first turn discards the acknowledged carryover", async () => {
+    const workspaceId = "ws-carryover";
+    const fixture = await createSessionsFixture(workspaceId);
+    // Carryover needs a published boundary; a todo list gives its header content.
+    await fsPromises.writeFile(
+      path.join(fixture.sessionDir, "todos.json"),
+      JSON.stringify([{ content: "Keep going", status: "pending" }])
+    );
+
+    const { session } = await resumeIntoContextRetry(fixture, workspaceId, async (session) => {
+      await compactSessionForTest(session, fixture.historyService, workspaceId);
+      await fixture.historyService.appendToHistory(workspaceId, {
+        id: "user-1",
+        role: "user",
+        parts: [{ type: "text", text: "Continue" }],
+        metadata: { timestamp: Date.now() },
+      });
+      // The window's first turn succeeded, so its snapshot is carryover now, not pending.
+      const compaction = sessionCompactionHandler(session);
+      await compaction.ackPendingStateConsumed();
+      expect(await compaction.peekCarryoverState()).not.toBeNull();
+    });
+
+    expect(await sessionCompactionHandler(session).peekCarryoverState()).toBeNull();
     await session.dispose();
   });
 
