@@ -13480,20 +13480,24 @@ export class AgentSession {
     await this.discardMemoryContext();
     // Clear file state cache since history context is gone
     this.clearFileState();
-    await this.trackPlanFileAfterCompaction();
+    // The boundary header holds the plan as it was at compaction and never refreshes. Track the
+    // plan again, so a later external edit reaches the model as a file-change notification.
+    const plan = await this.readLocalPlanFileState();
+    if (plan) await this.recordFileState(plan.path, plan.state);
   }
 
   /**
-   * The boundary header holds the plan as it was at compaction and never refreshes. Track the
-   * plan again, so a later external edit reaches the model as a file-change notification.
-   * The tracker reads the host filesystem, so only local runtimes qualify.
+   * The plan file's path and current state for the file-change tracker. The tracker reads the
+   * host filesystem, so only local runtimes qualify; null also when the user excluded the plan
+   * from post-compaction context or the plan cannot be read.
    */
-  private async trackPlanFileAfterCompaction(): Promise<void> {
+  private async readLocalPlanFileState(): Promise<{ path: string; state: FileState } | null> {
     try {
+      if ((await this.loadExcludedItems()).has("plan")) return null;
       const metadataResult = await this.aiService.getWorkspaceMetadata(this.workspaceId);
-      if (!metadataResult.success) return;
+      if (!metadataResult.success) return null;
       const runtime = this.aiService.runtimeFactory.createRuntimeForWorkspace(metadataResult.data);
-      if (runtime.location !== "local") return;
+      if (runtime.location !== "local") return null;
       const { planPath } = await resolvePlanFileLocation(
         this.config,
         runtime,
@@ -13504,12 +13508,13 @@ export class AgentSession {
         requireRegularFile: true,
       });
       const fileStat = await runtime.stat(planPath);
-      await this.recordFileState(runtime.normalizePath(planPath, "/"), {
-        content,
-        timestamp: fileStat.modifiedTime.getTime(),
-      });
+      return {
+        path: runtime.normalizePath(planPath, "/"),
+        state: { content, timestamp: fileStat.modifiedTime.getTime() },
+      };
     } catch (error) {
-      log.debug("Skipping plan file tracking after compaction", { error: getErrorMessage(error) });
+      log.debug("Skipping plan file tracking", { error: getErrorMessage(error) });
+      return null;
     }
   }
 
@@ -13517,6 +13522,11 @@ export class AgentSession {
   private async buildPostCompactionContext(
     input: PostCompactionContextInput
   ): Promise<PostCompactionContext | null> {
+    // The first turn after the boundary detects file edits before it tracks the plan again, so
+    // baseline an untracked plan before the header reads it: that turn then reports an edit
+    // made after this snapshot. Estimates and unpublished builds only start tracking it sooner.
+    const plan = await this.readLocalPlanFileState();
+    if (plan) await this.fileChangeTracker.recordIfUntracked(plan.path, plan.state);
     return renderPostCompactionContext(
       await this.buildAttachmentsFromContext({
         ...input,

@@ -117,6 +117,12 @@ export class FileChangeTracker {
     this.fileState.set(canonicalPath, state);
   }
 
+  /** Record a file only when it has no baseline; an existing baseline may hold an unreported edit. */
+  async recordIfUntracked(filePath: string, state: FileState): Promise<void> {
+    const canonicalPath = await this.canonicalize(filePath);
+    if (!this.fileState.has(canonicalPath)) this.fileState.set(canonicalPath, state);
+  }
+
   /** Capture only these accepted states, before later tool reads can replace their baseline. */
   captureSnapshotBaseline(states: readonly FileState[]): { restore(): void; forget(): void } {
     const accepted = new Set(states);

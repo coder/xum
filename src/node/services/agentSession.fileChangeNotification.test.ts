@@ -8,6 +8,8 @@ import type { MuxMessage } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { AgentSession } from "./agentSession";
 import type { StreamMessageOptions } from "./aiService";
+import type { CompactionHandler } from "./compactionHandler";
+import type { HistoryService } from "./historyService";
 import { createAgentSessionHarness, createStartedTurnHandle } from "./agentSession.testHarness";
 
 /**
@@ -116,16 +118,79 @@ describe("AgentSession file-change notification (turn start)", () => {
     expect(notificationRows).toHaveLength(1);
   });
 
-  test("an external plan edit after compaction appends a notification", async () => {
+  /** Run `body` with XUM_ROOT in a temp dir that holds the plan "plan v1" of workspace "ws". */
+  async function withPlanFile(body: (planFile: string) => Promise<void>): Promise<void> {
     tmpDir = await mkdtemp(join(tmpdir(), "mux-file-change-notification-"));
     const previousRoot = process.env.XUM_ROOT;
     process.env.XUM_ROOT = tmpDir;
     try {
-      const { historyService, session, config } = await createSessionFixture();
       // The harness metadata is local workspace "ws" in project "project".
       const planFile = join(tmpDir, "plans", "project", "ws.md");
       await mkdir(dirname(planFile), { recursive: true });
       await writeFile(planFile, "plan v1");
+      await body(planFile);
+    } finally {
+      if (previousRoot === undefined) delete process.env.XUM_ROOT;
+      else process.env.XUM_ROOT = previousRoot;
+    }
+  }
+
+  async function editPlanExternally(planFile: string): Promise<void> {
+    await writeFile(planFile, "plan v2");
+    const futureMtime = Date.now() + 1000;
+    await utimes(planFile, futureMtime / 1000, futureMtime / 1000);
+  }
+
+  async function expectOnePlanNotification(historyService: HistoryService): Promise<void> {
+    const historyResult = await historyService.getHistoryFromLatestBoundary("ws");
+    expect(historyResult.success).toBe(true);
+    if (!historyResult.success) return;
+    const notificationRows = historyResult.data.filter((m) => m.id.startsWith("file-change-"));
+    expect(notificationRows).toHaveLength(1);
+    const notificationText = notificationRows[0].parts.find((p) => p.type === "text")?.text ?? "";
+    expect(notificationText).toContain("+plan v2");
+  }
+
+  test("a plan edit between compaction and the next turn appends a notification", async () => {
+    await withPlanFile(async (planFile) => {
+      const { historyService, session } = await createSessionFixture();
+      // Nothing tracks the plan before this compaction, whose boundary header holds "plan v1".
+      const handler = (
+        session as unknown as { contextController: { compaction: CompactionHandler } }
+      ).contextController.compaction;
+      expect(
+        await handler.persistContinuousCompaction({
+          preparation: handler.beginPreparation(() => true),
+          publication: {
+            generation: await historyService
+              .getContinuousCompactionJournal("ws")
+              .captureGeneration(),
+          },
+          attachmentMessages: [],
+          messages: [],
+          boundaryMessageId: "boundary",
+          text: "summary",
+          model: "anthropic:claude-sonnet-4-5",
+          tail: [],
+          systemMessageTokens: 0,
+          attachmentTokens: 0,
+          shouldPersist: () => true,
+        })
+      ).toBe(true);
+
+      await editPlanExternally(planFile);
+      const result = await session.resumeStream({
+        model: "anthropic:claude-sonnet-4-5",
+        agentId: "exec",
+      });
+      expect(result.success).toBe(true);
+      await expectOnePlanNotification(historyService);
+    });
+  });
+
+  test("an external plan edit after compaction appends a notification", async () => {
+    await withPlanFile(async (planFile) => {
+      const { historyService, session, config } = await createSessionFixture();
       const sessionDir = join(config.sessionsDir, "ws");
       await mkdir(sessionDir, { recursive: true });
       await writeFile(
@@ -140,27 +205,14 @@ describe("AgentSession file-change notification (turn start)", () => {
       });
       expect(firstResult.success).toBe(true);
 
-      await writeFile(planFile, "plan v2");
-      const futureMtime = Date.now() + 1000;
-      await utimes(planFile, futureMtime / 1000, futureMtime / 1000);
-
+      await editPlanExternally(planFile);
       const secondResult = await session.resumeStream({
         model: "anthropic:claude-sonnet-4-5",
         agentId: "exec",
       });
       expect(secondResult.success).toBe(true);
-
-      const historyResult = await historyService.getHistoryFromLatestBoundary("ws");
-      expect(historyResult.success).toBe(true);
-      if (!historyResult.success) return;
-      const notificationRows = historyResult.data.filter((m) => m.id.startsWith("file-change-"));
-      expect(notificationRows).toHaveLength(1);
-      const notificationText = notificationRows[0].parts.find((p) => p.type === "text")?.text ?? "";
-      expect(notificationText).toContain("+plan v2");
-    } finally {
-      if (previousRoot === undefined) delete process.env.XUM_ROOT;
-      else process.env.XUM_ROOT = previousRoot;
-    }
+      await expectOnePlanNotification(historyService);
+    });
   });
 
   test("a failed notification append is not dropped: retry re-detects and persists it", async () => {

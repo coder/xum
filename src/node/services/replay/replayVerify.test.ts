@@ -92,6 +92,34 @@ describe("replayVerifySession pairing", () => {
     expect(devtoolsRaw).toContain("1. do the thing");
   });
 
+  test("a request sent without the boundary's header passes and says so", async () => {
+    using tmp = new DisposableTempDir("replay-verify-header-omitted");
+    const ctx = createReplayFixtureSessionContext(tmp.path);
+    await appendReplayFixtureCompactionBoundary(ctx, "Summary of the session so far.", 1, {
+      text: "1. do the thing",
+      skillNames: [],
+    });
+    for (const omitPostCompactionContext of [false, true]) {
+      await appendReplayFixtureTurn(ctx, {
+        userText: "After compaction.",
+        assistantText: "Done.",
+        systemPrompt: SYSTEM_PROMPT,
+        tools: tools(),
+        omitPostCompactionContext,
+      });
+    }
+
+    const result = await verify(ctx);
+    expect(
+      result.turns.map((turn) => ({ status: turn.status, omitted: turn.reason != null }))
+    ).toEqual([
+      { status: "PASS", omitted: false },
+      { status: "PASS", omitted: true },
+    ]);
+    // Guard against a vacuous pass: only the first recorded request holds the header.
+    expect(ctx.devtoolsLines.filter((line) => line.includes("1. do the thing"))).toHaveLength(1);
+  });
+
   test("skips a turn whose envelope recorded request-time post-compaction attachments", async () => {
     using tmp = new DisposableTempDir("replay-verify-legacy-attachments");
     const ctx = createReplayFixtureSessionContext(tmp.path);

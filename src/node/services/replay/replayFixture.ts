@@ -31,6 +31,10 @@ import assert from "@/common/utils/assert";
 import { collectDeferLoadingToolNames } from "@/common/utils/tools/toolCatalog";
 import { replaceOrAppendMessageById } from "@/node/services/aiService";
 import { HistoryService } from "@/node/services/historyService";
+import {
+  findPostCompactionContextBoundaryId,
+  omitPostCompactionContext,
+} from "@/node/services/postCompactionContext";
 import { assemblePromptPayload } from "@/node/services/turnContextAssembler";
 import { emitTurnEnvelope } from "@/node/services/turnEnvelope";
 import { DurableEventJournal } from "@/node/utils/journal/durableEventJournal";
@@ -101,6 +105,8 @@ export interface ReplayFixtureTurnSpec {
   systemVolatileSuffixLength?: number;
   /** Set false to simulate devtools logging being off for this turn. */
   recordDevtools?: boolean;
+  /** Send the request without the boundary's header, as AgentSession does after a context-exceeded retry. */
+  omitPostCompactionContext?: boolean;
   /**
    * Emit this many extra turn-envelope rows (same requestHistorySequence)
    * before the final one — simulates retried attempts whose streams failed.
@@ -287,9 +293,12 @@ function fixtureModel(spec: ReplayFixtureTurnSpec): string {
 function buildFixtureRequest(
   ctx: ReplayFixtureSessionContext,
   spec: ReplayFixtureTurnSpec,
-  historyMessages: MuxMessage[],
+  history: MuxMessage[],
   agentId: string
 ) {
+  const historyMessages = spec.omitPostCompactionContext
+    ? omitPostCompactionContext(history, findPostCompactionContextBoundaryId(history))
+    : history;
   return spec.liveToolInstructions == null
     ? buildReplayedFixtureRequest(ctx, spec, historyMessages, agentId)
     : buildLiveFixtureRequest(ctx, spec, historyMessages, agentId);
