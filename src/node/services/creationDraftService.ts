@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { isDeepStrictEqual } from "util";
 import type { Config } from "@/node/config";
 import writeFileAtomic from "@/node/utils/writeFileAtomic";
 import { log } from "@/node/services/log";
@@ -34,9 +35,10 @@ import {
  * update of the same record. The dir is outside the old `drafts/` root on purpose: an older build's
  * startup GC deletes unknown dirs there, and must never see these records after a downgrade.
  *
- * Deliberately absent (one active editor per draft is the contract): no revisions, live sync,
- * tombstones or conditional deletes. Concurrent saves of one field: last write wins; a late save
- * can recreate a deleted draft's file only through an explicit project (a create).
+ * Deliberately absent (one active editor per draft is the contract): no revisions, live sync or
+ * tombstones. Concurrent saves of one field: last write wins; a late save can recreate a deleted
+ * draft's file only through an explicit project (a create). The one conditional write is a delete
+ * retry (`ifStored`): it must not remove a later save of another window.
  */
 const RECORDS_DIR_NAME = "creation-drafts";
 const RECORD_FILE_VERSION = 1;
@@ -175,6 +177,24 @@ async function readOldBody(
   drafts.set(key, draft);
 }
 
+/** A record as reads return it: staged attachments dropped, then the schema. Null when invalid. */
+function toRecord(raw: unknown): CreationDraft | null {
+  const { attachments } = sanitizeDraft(raw).draft;
+  const parsed = CreationDraftSchema.safeParse({
+    ...(raw as object),
+    attachments: stripStagedDraftAttachments(attachments),
+  });
+  return parsed.success ? parsed.data : null;
+}
+
+/** Every stored field equal (JSON form: an absent optional field equals an undefined one). */
+function sameRecord(stored: CreationDraft, expected: CreationDraft | null): boolean {
+  return (
+    expected !== null &&
+    isDeepStrictEqual(JSON.parse(JSON.stringify(stored)), JSON.parse(JSON.stringify(expected)))
+  );
+}
+
 export class CreationDraftService {
   private readonly root: string;
   private readonly oldRoot: string;
@@ -224,10 +244,21 @@ export class CreationDraftService {
     });
   }
 
-  async delete(draftId: string): Promise<void> {
+  /**
+   * With `ifStored` (a delete retry), delete only while the record holds exactly that, so a retry
+   * cannot remove what another window saved after the first try failed.
+   */
+  async delete(draftId: string, ifStored?: Omit<CreationDraft, "id">): Promise<void> {
     const filePath = this.filePathFor(draftId);
     await this.ensureLoaded();
     await withTargetMutationLock(this.config.rootDir, filePath, async () => {
+      if (ifStored !== undefined) {
+        const current = await this.readRecord(draftId);
+        if (current !== null && !sameRecord(current, toRecord({ ...ifStored, id: draftId }))) {
+          log.debug(`Kept creation draft ${draftId}: it changed after its delete was first sent`);
+          return;
+        }
+      }
       await fs.rm(filePath, { force: true });
       this.summaries?.delete(draftId);
     });
@@ -316,16 +347,12 @@ export class CreationDraftService {
     const filePath = this.filePathFor(draftId);
     const raw = await readJsonFile(filePath);
     if (raw === null) return null;
-    const { attachments } = sanitizeDraft(raw).draft;
-    const parsed = CreationDraftSchema.safeParse({
-      ...(raw as object),
-      attachments: stripStagedDraftAttachments(attachments),
-    });
-    if (!parsed.success || parsed.data.id !== draftId) {
+    const record = toRecord(raw);
+    if (record?.id !== draftId) {
       log.warn(`Ignoring malformed creation draft ${filePath}`);
       return null;
     }
-    return parsed.data;
+    return record;
   }
 
   /** Atomic replace: a failed write leaves the last complete file. */

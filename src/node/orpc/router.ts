@@ -844,7 +844,9 @@ export const router = (authToken?: string) => {
       deleteCreation: t
         .input(schemas.drafts.deleteCreation.input)
         .output(schemas.drafts.deleteCreation.output)
-        .handler(({ context, input }) => context.draftService.creation.delete(input.scope.draftId)),
+        .handler(({ context, input }) =>
+          context.draftService.creation.delete(input.scope.draftId, input.ifStored)
+        ),
       importLegacyCreation: t
         .input(schemas.drafts.importLegacyCreation.input)
         .output(schemas.drafts.importLegacyCreation.output)

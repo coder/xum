@@ -336,6 +336,15 @@ export const CreationDraftUpdateInputSchema = CreationDraftSchema.omit({ id: tru
   .partial()
   .extend({ scope: CreationDraftScopeSchema });
 
+/**
+ * `ifStored`: delete only while the record holds exactly this (every field but the id). A delete
+ * retry sends it, so it cannot remove what another window saved after the first try failed.
+ */
+export const CreationDraftDeleteInputSchema = z.object({
+  scope: CreationDraftScopeSchema,
+  ifStored: CreationDraftSchema.omit({ id: true }).optional(),
+});
+
 /** A pre-record renderer draft (localStorage text or a typed name) of an old creation scope. */
 export const CreationDraftImportLegacyInputSchema = z.object({
   projectPath: z.string().min(1),
@@ -373,4 +382,5 @@ export type CreationDraftExecution = z.infer<typeof CreationDraftExecutionSchema
 export type CreationDraftSummary = z.infer<typeof CreationDraftSummarySchema>;
 export type CreationDraftList = z.infer<typeof CreationDraftListSchema>;
 export type CreationDraftUpdateInput = z.infer<typeof CreationDraftUpdateInputSchema>;
+export type CreationDraftDeleteInput = z.infer<typeof CreationDraftDeleteInputSchema>;
 export type CreationDraftImportLegacyInput = z.infer<typeof CreationDraftImportLegacyInputSchema>;
