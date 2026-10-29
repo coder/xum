@@ -602,6 +602,28 @@ describe("CreationDraftStore", () => {
     expect((await service.get(id))?.text).toBe("typed in B");
   });
 
+  test("a first delete removes the record whatever it holds (no condition)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-first-try");
+    const harness = await createHarness(tempDir);
+    const { store: windowA, service } = harness;
+    const id = windowA.create(PROJECT_A, null, { text: "sent" });
+    await windowA.flush(id);
+    // Another window saved after A last saw the record: A's delete still removes it.
+    const windowB = await reopen(harness, id, PROJECT_A);
+    windowB.update(id, { text: "typed in B" });
+    await windowB.flush(id);
+    await windowA.delete(id);
+    expect(await service.get(id)).toBeNull();
+
+    // A window that never opened a draft (a sidebar Delete) removes it too.
+    const other = windowA.create(PROJECT_A, null, { text: "listed" });
+    await windowA.flush(other);
+    const sidebarWindow = new CreationDraftStore();
+    sidebarWindow.setClient(harness.newClient());
+    await sidebarWindow.delete(other);
+    expect(await service.get(other)).toBeNull();
+  });
+
   test("a delete resent on reconnect does not remove settings another window saved meanwhile", async () => {
     using tempDir = new TestTempDir("creation-store-delete-resend-other-window");
     const harness = await createHarness(tempDir);
