@@ -271,6 +271,18 @@ async function importLegacyDraft(
   deleteWorkspaceStorage(scopeId);
 }
 
+/** A refused save wrote nothing; other failures may have (most often the reply was lost). */
+function noteMaybeSaved(
+  entry: Entry,
+  draft: CreationDraft,
+  client: APIClient | null,
+  error: unknown
+): void {
+  if (!client || isSaveRefusal(error)) return;
+  entry.maybeSaved = true;
+  entry.stored = draft;
+}
+
 export class CreationDraftStore {
   private client: APIClient | null = null;
   private readonly entries = new Map<string, Entry>();
@@ -609,12 +621,8 @@ export class CreationDraftStore {
       }
     } catch (error) {
       entry.saving = false;
-      // A refused save wrote nothing; other failures may have (most often the reply was lost).
-      // Recorded before the check below: a delete that removed the entry waits for this save.
-      if (client && !isSaveRefusal(error)) {
-        entry.maybeSaved = true;
-        entry.stored = draft;
-      }
+      // Before the check below: a delete that removed the entry waits for this save.
+      noteMaybeSaved(entry, draft, client, error);
       if (this.entries.get(id) !== entry) return;
       this.keepFailedSave(entry, patch, client, error);
     }
