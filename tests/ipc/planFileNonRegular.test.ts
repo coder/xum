@@ -147,17 +147,17 @@ describeIntegration("plan file readers on a non-regular plan path", () => {
     await fs.writeFile(planPath, "# canonical\n");
     const canonical = await generate();
     expect(canonical).toEqual({
-      type: "plan_file_reference",
       planFilePath: getPlanFilePath(workspaceName, projectName, runtime.getXumHome()),
       planContent: "# canonical\n",
+      modifiedTimeMs: expect.any(Number),
     });
     await fs.rm(planPath);
     await fs.writeFile(legacyPlanPath, "# legacy\n");
     const legacy = await generate();
     expect(legacy).toEqual({
-      type: "plan_file_reference",
       planFilePath: getLegacyPlanFilePath(workspaceId, runtime.getXumHome()),
       planContent: "# legacy\n",
+      modifiedTimeMs: expect.any(Number),
     });
     await fs.rm(legacyPlanPath);
   }, 60_000);
