@@ -297,10 +297,6 @@ export class SSH2Transport implements SSHTransport {
     return this.config;
   }
 
-  resetConnectionHealth(): void {
-    ssh2ConnectionPool.forgetHealth(this.config);
-  }
-
   async acquireConnection(options?: SSHTransportAcquireOptions): Promise<void> {
     try {
       await ssh2ConnectionPool.acquireConnection(this.config, {

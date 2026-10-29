@@ -92,26 +92,6 @@ export function CoderIcon({ size = 10, className }: IconProps) {
   );
 }
 
-/** Cloud icon for the Daytona-backed SSH runtime (a managed cloud sandbox) */
-export function DaytonaIcon({ size = 10, className }: IconProps) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.5"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-label="Daytona Runtime"
-      className={className}
-    >
-      <path d="M4.5 12.5 A3 3 0 0 1 4.2 6.5 A4 4 0 0 1 11.8 6 A3.25 3.25 0 0 1 11.5 12.5 Z" />
-    </svg>
-  );
-}
-
 /** Container icon for Docker runtime */
 export function DockerIcon({ size = 10, className }: IconProps) {
   return (

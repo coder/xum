@@ -1349,6 +1349,8 @@ interface DeferredDescendantRedelivery {
   attempt: number;
   /** Set by the dispatch when the target is still streaming without a task execution. */
   deferAgain: boolean;
+  /** The target's archive at the original send (see DeferredDescendantMessage). */
+  archivedAtSend: string | null;
 }
 
 /** A trusted descendant message whose delivery waits for an idle target (F54). */
@@ -1360,6 +1362,13 @@ interface DeferredDescendantMessage {
   sender: "ancestor" | "sibling";
   options: TrustedDescendantMessageOptions | undefined;
   stopFence: ReadonlyMap<string, number>;
+  /**
+   * F203: the target's archivedAt at the original send, or null when it was not archived. A send
+   * to an archived task unarchives it on purpose. An archive that lands during the wait (also a
+   * re-archive after an unarchive) is a later user decision than the message, so, like a Stop, it
+   * wins over the redelivery.
+   */
+  archivedAtSend: string | null;
 }
 
 function resolveDescendantMessageStopFence(
@@ -1374,6 +1383,22 @@ function isInactiveAgentTaskStatus(
   legacyArchived: boolean
 ): boolean {
   return status === "reported" || status === "interrupted" || legacyArchived;
+}
+
+/**
+ * The target's archive at the original send (F203), or null when the user archived it during the
+ * wait: that archive is a later user decision than the message and wins, like a Stop. An archive
+ * is identified by its archivedAt, so a re-archive after an unarchive also counts as new.
+ */
+function resolveDeferralArchivedAtSend(
+  redelivery: DeferredDescendantRedelivery | undefined,
+  target: { archived: boolean; archivedAt: string | undefined }
+): { archivedAtSend: string | null } | null {
+  const current = target.archived ? (target.archivedAt ?? null) : null;
+  if (redelivery == null) return { archivedAtSend: current };
+  return current != null && current !== redelivery.archivedAtSend
+    ? null
+    : { archivedAtSend: redelivery.archivedAtSend };
 }
 
 /** After this many idle waits, a deferred message falls back to plain live delivery. */
@@ -9236,9 +9261,13 @@ export class TaskService implements AgentTaskIntegration {
         const inactive =
           !continuationActive &&
           isInactiveAgentTaskStatus(entry.workspace.taskStatus, legacyArchived);
-        if (this.deferDescendantMessage(deferral, inactive)) {
-          return Ok({ delivery: "queued" as const, queueDispatchMode });
-        }
+        const deferred = this.deferDescendantMessage(deferral, {
+          inactive,
+          archived: legacyArchived,
+          archivedAt: entry.workspace.archivedAt,
+          taskStatus: entry.workspace.taskStatus,
+        });
+        if (deferred != null) return deferred;
         if (inactive && !this.aiService.isStreaming(taskId)) {
           return this.reactivateInactiveAgentTask({
             ancestorWorkspaceId,
@@ -9382,15 +9411,33 @@ export class TaskService implements AgentTaskIntegration {
    * Send order (F54): while an earlier message to this task waits for the target to go idle, a new
    * message queues behind it instead of overtaking it. Redeliveries are the chain itself.
    */
-  private deferDescendantMessage(params: DeferredDescendantMessage, inactive: boolean): boolean {
+  private deferDescendantMessage(
+    deferral: Omit<DeferredDescendantMessage, "archivedAtSend">,
+    target: {
+      inactive: boolean;
+      archived: boolean;
+      archivedAt: string | undefined;
+      taskStatus: AgentTaskStatus | undefined;
+    }
+  ): Result<SendAgentTaskMessageResult, SendAgentTaskMessageError> | null {
+    const archive = resolveDeferralArchivedAtSend(deferral.options?.redelivery, target);
+    if (archive == null) {
+      return Err({
+        code: "not_active" as const,
+        taskStatus: target.taskStatus ?? "unknown",
+        message: "Task workspace was archived while the message waited for its stream to end.",
+      });
+    }
+    const params = { ...deferral, archivedAtSend: archive.archivedAtSend };
+    const queued = Ok({ delivery: "queued" as const, queueDispatchMode: params.queueDispatchMode });
     if (
       params.options?.redelivery == null &&
       this.deferredDescendantMessagesByTask.has(params.taskId)
     ) {
       this.scheduleDeferredDescendantMessage(params);
-      return true;
+      return queued;
     }
-    return inactive && this.deferWhileTargetStreamsWithoutExecution(params);
+    return target.inactive && this.deferWhileTargetStreamsWithoutExecution(params) ? queued : null;
   }
 
   /**
@@ -9427,7 +9474,12 @@ export class TaskService implements AgentTaskIntegration {
       for (let attempt = 0; ; attempt++) {
         if (waitForIdle) await this.workspaceService.waitForIdleAndNoQueuedMessages(params.taskId);
         waitForIdle = true;
-        const redelivery = { stopFence: params.stopFence, attempt, deferAgain: false };
+        const redelivery = {
+          stopFence: params.stopFence,
+          attempt,
+          deferAgain: false,
+          archivedAtSend: params.archivedAtSend,
+        };
         const result = await this.dispatchTrustedDescendantMessage(
           params.ancestorWorkspaceId,
           params.taskId,

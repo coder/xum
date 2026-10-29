@@ -1,6 +1,5 @@
 import { z } from "zod";
 import { CoderWorkspaceConfigSchema } from "./coder";
-import { DaytonaSandboxConfigSchema } from "./daytona";
 
 export const RuntimeModeSchema = z.enum(["local", "worktree", "ssh", "docker", "devcontainer"]);
 
@@ -55,18 +54,7 @@ export const RuntimeAvailabilitySchema = z.object({
   ssh: RuntimeAvailabilityStatusSchema,
   docker: RuntimeAvailabilityStatusSchema,
   devcontainer: RuntimeAvailabilityStatusSchema,
-  // Daytona is `ssh` + a sub-config, not a RuntimeMode; optional so mode-keyed maps still fit.
-  daytona: RuntimeAvailabilityStatusSchema.optional(),
 });
-/** Passive runtime status for the UI (never starts anything). */
-export const WorkspaceRuntimeStatusSchema = z.enum([
-  "running",
-  "stopped",
-  "unknown",
-  "unsupported",
-]);
-export type WorkspaceRuntimeStatus = z.infer<typeof WorkspaceRuntimeStatusSchema>;
-
 export const RuntimeConfigSchema = z.union([
   // Legacy local with srcBaseDir (treated as worktree)
   z.object({
@@ -90,33 +78,24 @@ export const RuntimeConfigSchema = z.union([
     bgOutputDir: bgOutputDirField,
   }),
   // SSH runtime
-  z
-    .object({
-      type: z.literal("ssh"),
-      host: z
-        .string()
-        .meta({ description: "SSH host (can be hostname, user@host, or SSH config alias)" }),
-      srcBaseDir: z
-        .string()
-        .meta({ description: "Base directory on remote host where all workspaces are stored" }),
-      bgOutputDir: bgOutputDirField,
-      identityFile: z
-        .string()
-        .optional()
-        .meta({ description: "Path to SSH private key (if not using ~/.ssh/config or ssh-agent)" }),
-      port: z.number().optional().meta({ description: "SSH port (default: 22)" }),
-      coder: CoderWorkspaceConfigSchema.optional().meta({
-        description: "Coder workspace configuration (when using Coder as SSH backend)",
-      }),
-      daytona: DaytonaSandboxConfigSchema.optional().meta({
-        description: "Daytona sandbox configuration (when using Daytona as SSH backend)",
-      }),
-    })
-    // One managed SSH backend per workspace: each owns the host alias and its lifecycle hooks.
-    .refine((config) => config.coder == null || config.daytona == null, {
-      message: "SSH runtime cannot use both Coder and Daytona",
-      path: ["daytona"],
+  z.object({
+    type: z.literal("ssh"),
+    host: z
+      .string()
+      .meta({ description: "SSH host (can be hostname, user@host, or SSH config alias)" }),
+    srcBaseDir: z
+      .string()
+      .meta({ description: "Base directory on remote host where all workspaces are stored" }),
+    bgOutputDir: bgOutputDirField,
+    identityFile: z
+      .string()
+      .optional()
+      .meta({ description: "Path to SSH private key (if not using ~/.ssh/config or ssh-agent)" }),
+    port: z.number().optional().meta({ description: "SSH port (default: 22)" }),
+    coder: CoderWorkspaceConfigSchema.optional().meta({
+      description: "Coder workspace configuration (when using Coder as SSH backend)",
     }),
+  }),
   // Docker runtime - each workspace runs in its own container
   z.object({
     type: z.literal("docker"),

@@ -26,7 +26,6 @@ import type { RuntimeConfig } from "@/common/types/runtime";
 import { isSSHRuntime, isDockerRuntime, isDevcontainerRuntime } from "@/common/types/runtime";
 import {
   createRuntimeForWorkspace,
-  ensureDaytonaSandboxReady,
   resolveWorkspaceExecutionPath,
 } from "@/node/runtime/runtimeHelpers";
 import { log } from "@/node/services/log";
@@ -35,7 +34,6 @@ import { workspaceUseLeasesFor, type WorkspaceUseLease } from "@/node/services/w
 import { isCommandAvailable, findAvailableCommand } from "@/node/utils/commandDiscovery";
 import { resolveContainerCli } from "@/node/runtime/containerCli";
 import { sanitizeXumChildEnv } from "@/node/runtime/childProcessEnv";
-import { appendDaytonaOpenSSHArgs } from "@/node/runtime/sshConnectionPool";
 import { cdCommandForSSH } from "@/node/runtime/tildeExpansion";
 import { Terminal } from "@xterm/headless";
 import { SerializeAddon } from "@xterm/addon-serialize";
@@ -77,14 +75,6 @@ function assertTerminalsEnabled(): void {
   if (process.env.XUM_DISABLE_TERMINALS === "1") {
     throw new Error("Terminals are disabled on this server (XUM_DISABLE_TERMINALS=1)");
   }
-}
-
-/** The user asked for this terminal: a Daytona sandbox must be up before a native emulator runs ssh. */
-async function ensureDaytonaSandboxUp(
-  workspace: Parameters<typeof ensureDaytonaSandboxReady>[0]
-): Promise<void> {
-  const ready = await ensureDaytonaSandboxReady(workspace);
-  if (!ready.success) throw new Error(ready.error);
 }
 
 export class TerminalService {
@@ -814,8 +804,6 @@ export class TerminalService {
         );
       }
 
-      await ensureDaytonaSandboxUp(workspace);
-
       // Before any durable effect: one share per workspace is kept, after a failed launch too
       // (fail closed; see nativeTerminalUseLeases), and a refusal above releases this open's.
       if (this.nativeTerminalUseLeases.has(workspaceId)) {
@@ -1010,7 +998,6 @@ export class TerminalService {
       }
       // Force pseudo-terminal allocation
       sshArgs.push("-t");
-      appendDaytonaOpenSSHArgs(sshArgs, config.sshConfig.host);
       // Add host
       sshArgs.push(config.sshConfig.host);
       // Add remote command to cd into directory and start shell

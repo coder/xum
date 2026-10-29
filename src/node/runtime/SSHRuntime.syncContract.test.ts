@@ -567,3 +567,48 @@ describe("SSHRuntime authoritative sync contract", () => {
     expect(fetchCommands[1]).not.toContain("refs/heads/*:refs/mux-bundle/*");
   });
 });
+
+describe("SSHRuntime.deleteWorkspace", () => {
+  it("keeps a dirty checkout under a ~ base directory", async () => {
+    const home = await mkdtemp(path.join(os.tmpdir(), "mux-ssh-delete-home-"));
+    tempDirs.push(home);
+    class LocalShellSSHRuntime extends SSHRuntime {
+      constructor() {
+        const config: SSHRuntimeConfig = { host: "example.test", srcBaseDir: "~/src" };
+        super(config, createMockTransport(config));
+      }
+
+      override exec(command: string, _options: ExecOptions): Promise<ExecStream> {
+        const result = spawnSync("bash", ["-c", command], {
+          cwd: home,
+          env: { ...process.env, HOME: home },
+          encoding: "utf8",
+        });
+        return Promise.resolve(createExecStream(result.stdout, result.stderr, result.status ?? 1));
+      }
+    }
+    const runtime = new LocalShellSSHRuntime();
+    const workspacePath = runtime.getWorkspacePath("/local/project", "feature");
+    expect(workspacePath).toStartWith("~/");
+    const checkoutPath = path.join(home, workspacePath.slice(2));
+    execSync(
+      [
+        `git init -q -b main "${checkoutPath}"`,
+        `git -C "${checkoutPath}" config user.email "test@test.com"`,
+        `git -C "${checkoutPath}" config user.name "Test"`,
+        `printf initial > "${checkoutPath}/file.txt"`,
+        `git -C "${checkoutPath}" add file.txt`,
+        `git -C "${checkoutPath}" commit -q -m initial`,
+        `printf dirty > "${checkoutPath}/file.txt"`,
+      ].join(" && "),
+      { stdio: "pipe" }
+    );
+
+    const result = await runtime.deleteWorkspace("/local/project", "feature", false);
+
+    expect(result).toEqual({
+      success: false,
+      error: "Workspace contains uncommitted changes. Use force flag to delete anyway.",
+    });
+  });
+});

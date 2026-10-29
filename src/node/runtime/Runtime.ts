@@ -442,13 +442,6 @@ export interface EnsureReadyOptions {
    * Abort signal to cancel long-running operations.
    */
   signal?: AbortSignal;
-
-  /**
-   * An ssh client outside Xum (an external editor, a native terminal) connects next, so
-   * runtimes whose readiness cache skips the user's ssh setup redo it (Daytona: the
-   * `~/.ssh/config` block and the alias's token).
-   */
-  externalSshClient?: boolean;
 }
 
 /**
