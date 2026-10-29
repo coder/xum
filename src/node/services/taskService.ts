@@ -5276,6 +5276,30 @@ export class TaskService implements AgentTaskIntegration {
     const prompt = coerceNonEmptyString(args.prompt);
     if (!prompt) return Err("Task.createMany: prompt is required");
 
+    const agent = this.resolveReservationAgentId(args);
+    if (!agent.success) return agent;
+    const bestOf = this.normalizeReservationBestOf(args.bestOf);
+    if (!bestOf.success) return bestOf;
+
+    return this.readReservationParent(
+      {
+        args,
+        cfg,
+        taskSettings,
+        parentWorkspaceId,
+        prompt,
+        ...agent.data,
+        normalizedBestOf: bestOf.data,
+      },
+      progress,
+      signal
+    );
+  }
+
+  /** Parses the requested agentId and resolves the task's desktop owner. */
+  private resolveReservationAgentId(
+    args: TaskCreateArgs
+  ): Result<Pick<PreparedTaskReservation, "agentId" | "taskDesktopOwnerWorkspaceId">, string> {
     const normalizedAgentId = normalizeAgentId(args.agentId ?? args.agentType, "");
     if (!normalizedAgentId) return Err("Task.createMany: agentId is required");
     const parsedAgentId = AgentIdSchema.safeParse(normalizedAgentId);
@@ -5289,9 +5313,14 @@ export class TaskService implements AgentTaskIntegration {
     } catch (error) {
       return Err(getErrorMessage(error));
     }
+    return Ok({ agentId, taskDesktopOwnerWorkspaceId });
+  }
 
+  /** Checks a best-of request and returns it normalized (undefined when there is none). */
+  private normalizeReservationBestOf(
+    bestOf: TaskCreateArgs["bestOf"]
+  ): Result<TaskCreateArgs["bestOf"], string> {
     let normalizedBestOf: TaskCreateArgs["bestOf"];
-    const bestOf = args.bestOf;
     if (bestOf) {
       const groupId = coerceNonEmptyString(bestOf.groupId);
       if (!groupId)
@@ -5311,21 +5340,7 @@ export class TaskService implements AgentTaskIntegration {
         total: bestOf.total,
       };
     }
-
-    return this.readReservationParent(
-      {
-        args,
-        cfg,
-        taskSettings,
-        parentWorkspaceId,
-        prompt,
-        agentId,
-        taskDesktopOwnerWorkspaceId,
-        normalizedBestOf,
-      },
-      progress,
-      signal
-    );
+    return Ok(normalizedBestOf);
   }
 
   /**
