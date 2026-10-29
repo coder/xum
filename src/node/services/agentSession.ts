@@ -9734,6 +9734,8 @@ export class AgentSession {
         workspaceId: this.workspaceId,
         error: getErrorMessage(error),
       });
+      // A later retry of this request must still be able to discard and retry.
+      this.postCompactionRetryAttempts.delete(requestId);
       return false;
     }
     this.omittedPostCompactionBoundaryId = boundaryId;

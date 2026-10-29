@@ -225,7 +225,7 @@ describe("AgentSession post-compaction context retry", () => {
     await session.dispose();
   });
 
-  test("does not retry without the header when the carryover discard fails", async () => {
+  test("a failed carryover discard fails the turn, and the turn's retry can still recover", async () => {
     const workspaceId = "ws-discard-fails";
     const fixture = await createSessionsFixture(workspaceId);
     await fsPromises.writeFile(
@@ -235,13 +235,20 @@ describe("AgentSession post-compaction context retry", () => {
 
     const aiEmitter = new EventEmitter();
     const streamMessage = mock((..._args: unknown[]) => {
+      const call = streamMessage.mock.calls.length;
+      if (call === 3) {
+        return Promise.resolve({
+          success: true as const,
+          data: createStartedTurnHandle(session.closingSignal, "assistant-retry"),
+        });
+      }
       aiEmitter.emit("error", {
         workspaceId,
-        messageId: "assistant-ctx-exceeded",
+        messageId: `assistant-ctx-exceeded-${call}`,
         error: "Context length exceeded",
         errorType: "context_exceeded",
       });
-      return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
+      return Promise.resolve(contextExceededResult(`assistant-ctx-exceeded-${call}`));
     });
     const { session } = await createAgentSessionHarness({
       workspaceId,
@@ -263,18 +270,24 @@ describe("AgentSession post-compaction context retry", () => {
     const compaction = sessionCompactionHandler(session);
     await compaction.ackPendingStateConsumed();
     spyOn(compaction, "discardPendingState").mockRejectedValueOnce(new Error("disk"));
+    const options = { model: "openai:gpt-4o", agentId: "exec" } as unknown as SendMessageOptions;
 
-    await session.resumeStream({
-      model: "openai:gpt-4o",
-      agentId: "exec",
-    } as unknown as SendMessageOptions);
+    await session.resumeStream(options);
 
     // A headerless retry would leave the carryover for the next compaction to merge again.
-    expect(await session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded")).toBe(
-      "terminal"
-    );
+    expect(
+      await session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded-1")
+    ).toBe("terminal");
     expect(streamMessage).toHaveBeenCalledTimes(1);
     expect(await compaction.peekCarryoverState()).not.toBeNull();
+
+    // Retrying the same user turn once the disk recovers discards the carryover and retries.
+    await session.resumeStream(options);
+    expect(
+      await session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded-2")
+    ).toBe("retry-started");
+    expect(streamMessage).toHaveBeenCalledTimes(3);
+    expect(await compaction.peekCarryoverState()).toBeNull();
 
     await session.dispose();
   });
