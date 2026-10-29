@@ -383,6 +383,12 @@ else:
              [review, comment(posted, "outsider", association="NONE"), comment(board)], 1, 10),
             ("an approval does not end the wait", [review, comment(board), approval], 1, 10),
             ("receipt present", [review, comment(board), comment(receipt), approval], 0, 0),
+            # No receipt will come after a usage-limit notice: fail, never pass the security half.
+            ("usage limits after the head's request",
+             [review, comment(posted, "maintainer", REQUEST), comment(board), comment(USAGE_LIMIT_NOTICES[0])], 0, 1),
+            ("usage limits before the head's request",
+             [review, comment(USAGE_LIMIT_NOTICES[0], created_at=BEFORE), comment(posted, "maintainer", REQUEST),
+              comment(board)], 0, 10),
         ):
             with self.subTest(case=case):
                 result = self.run_gate(snapshot(comments, head=head), "wait_pr_codex.sh")

@@ -462,6 +462,13 @@ CHECK_CODEX_STATUS_ONCE() {
   # the gate, so request the receipt and keep waiting (coder/xum#7731).
   run_codex_comments_gate
   if [ "$check_rc" -eq 10 ] && [[ "$check_output" == *"Waiting for the Codex security receipt for $pr_head"* ]]; then
+    # A usage-limit notice after this head's request means no receipt will come: fail, never pass.
+    if [ "$(echo "$all_comments" | jq -L "$SCRIPT_DIR/lib" --arg bot "$BOT_LOGIN_GRAPHQL" --arg head "$pr_head" 'include "codex_comments";
+      ([.[] | select(.author.login != $bot and (.body | contains("@codex security review") and contains($head))) | .createdAt] | max) as $asked
+      | $asked != null and any(.[]; .createdAt > $asked and .isMinimized != true and codex_usage_limit($bot))')" = "true" ]; then
+      echo "❌ Codex usage limits reached: no security receipt for $pr_head."
+      return 1
+    fi
     request_security_review_if_needed "$pr_head" || return 1
     return 10
   fi
