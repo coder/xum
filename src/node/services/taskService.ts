@@ -1217,6 +1217,40 @@ interface PreparedTaskReservation {
   parentMetaJson: string;
 }
 
+/**
+ * What prepareTaskReservation knows before it reads the agent definition: the checked request,
+ * the parent and its placement. Read before awaits, so the later steps never re-read them.
+ */
+interface ReservationPlacement extends Readonly<
+  Pick<
+    PreparedTaskReservation,
+    | "args"
+    | "parentWorkspaceId"
+    | "prompt"
+    | "agentId"
+    | "parentMeta"
+    | "configProjectPath"
+    | "parentIsScratch"
+    | "taskDesktopOwnerWorkspaceId"
+    | "normalizedBestOf"
+    | "runtime"
+    | "parentWorkspacePath"
+    | "taskRuntimeConfig"
+    | "parentRuntimeConfig"
+    | "sharedWorkspacePath"
+    | "parentBranchName"
+  >
+> {
+  readonly cfg: ProjectsConfig;
+  readonly projectPluginsTrusted: boolean;
+}
+
+/** The placement plus the facts read from the agent definition. */
+interface ReservationAgentDefinition
+  extends
+    ReservationPlacement,
+    Readonly<Pick<PreparedTaskReservation, "skipInitHook" | "definitionSource" | "frontmatter">> {}
+
 interface MaterializedTaskLaunch {
   workspacePath: string;
   trunkBranch: string;
@@ -5364,54 +5398,94 @@ export class TaskService implements AgentTaskIntegration {
       });
     }
 
-    const getRunnableHint = async (): Promise<string> => {
-      try {
-        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
-          projectPluginsTrusted,
-          runtimeFactory: nodeRuntimeFactory,
-        });
-        const runnableIds = (
-          await Promise.all(
-            allAgents.map(async (agent) => {
-              try {
-                const frontmatter = await resolveAgentFrontmatter(
-                  runtime,
-                  parentWorkspacePath,
-                  agent.id,
-                  {
-                    skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
-                    projectPluginsTrusted,
-                    runtimeFactory: nodeRuntimeFactory,
-                  }
-                );
-                if (
-                  !isAgentRunnableAsChild(frontmatter, {
-                    workflowOwned: args.workflowTask != null,
-                  })
-                ) {
-                  return null;
+    return this.readReservationAgentDefinition(
+      {
+        args,
+        cfg,
+        parentWorkspaceId,
+        prompt,
+        agentId,
+        parentMeta,
+        projectPluginsTrusted,
+        configProjectPath,
+        parentIsScratch,
+        taskDesktopOwnerWorkspaceId,
+        normalizedBestOf,
+        runtime,
+        parentWorkspacePath,
+        taskRuntimeConfig,
+        parentRuntimeConfig,
+        sharedWorkspacePath,
+        parentBranchName,
+      },
+      progress,
+      signal
+    );
+  }
+
+  /**
+   * The runnable agentIds for a refusal message. Only the refusal paths of
+   * readReservationAgentDefinition call it.
+   */
+  private async describeRunnableAgents(reservation: ReservationPlacement): Promise<string> {
+    const { args, cfg, runtime, parentWorkspacePath, projectPluginsTrusted } = reservation;
+    try {
+      const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
+        projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
+      });
+      const runnableIds = (
+        await Promise.all(
+          allAgents.map(async (agent) => {
+            try {
+              const frontmatter = await resolveAgentFrontmatter(
+                runtime,
+                parentWorkspacePath,
+                agent.id,
+                {
+                  skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
+                  projectPluginsTrusted,
+                  runtimeFactory: nodeRuntimeFactory,
                 }
-                return isAgentEffectivelyDisabled({
-                  cfg,
-                  agentId: agent.id,
-                  resolvedFrontmatter: frontmatter,
+              );
+              if (
+                !isAgentRunnableAsChild(frontmatter, {
+                  workflowOwned: args.workflowTask != null,
                 })
-                  ? null
-                  : agent.id;
-              } catch {
+              ) {
                 return null;
               }
-            })
-          )
-        ).filter((id): id is string => typeof id === "string");
-        return runnableIds.length > 0
-          ? `Runnable agentIds: ${runnableIds.join(", ")}`
-          : "No runnable agents available";
-      } catch {
-        return "Could not discover available agents";
-      }
-    };
+              return isAgentEffectivelyDisabled({
+                cfg,
+                agentId: agent.id,
+                resolvedFrontmatter: frontmatter,
+              })
+                ? null
+                : agent.id;
+            } catch {
+              return null;
+            }
+          })
+        )
+      ).filter((id): id is string => typeof id === "string");
+      return runnableIds.length > 0
+        ? `Runnable agentIds: ${runnableIds.join(", ")}`
+        : "No runnable agents available";
+    } catch {
+      return "Could not discover available agents";
+    }
+  }
 
+  /**
+   * Reads the agent definition (cancellable) and refuses an agent that cannot run as this
+   * sub-agent, then reads the AI settings.
+   */
+  private async readReservationAgentDefinition(
+    reservation: ReservationPlacement,
+    progress: TaskReservationProgress,
+    signal: AbortSignal | undefined
+  ): Promise<Result<PreparedTaskReservation, string>> {
+    const { args, cfg, agentId, runtime, parentWorkspacePath, projectPluginsTrusted } = reservation;
     let skipInitHook = false;
     let definitionSource: string | undefined;
     let frontmatterJson: string;
@@ -5427,11 +5501,11 @@ export class TaskService implements AgentTaskIntegration {
       const definition = definitionRead.value;
       const frontmatter = definition.frontmatter;
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
-        const hint = await getRunnableHint();
+        const hint = await this.describeRunnableAgents(reservation);
         return Err(`Task.createMany: agentId is not runnable as a sub-agent (${agentId}). ${hint}`);
       }
       if (isAgentEffectivelyDisabled({ cfg, agentId, resolvedFrontmatter: frontmatter })) {
-        const hint = await getRunnableHint();
+        const hint = await this.describeRunnableAgents(reservation);
         return Err(`Task.createMany: agentId is disabled (${agentId}). ${hint}`);
       }
       skipInitHook = frontmatter.subagent?.skip_init_hook === true;
@@ -5447,10 +5521,45 @@ export class TaskService implements AgentTaskIntegration {
           )
         );
       }
-      const hint = await getRunnableHint();
+      const hint = await this.describeRunnableAgents(reservation);
       return Err(`Task.createMany: unknown agentId (${agentId}). ${hint}`);
     }
 
+    return this.readReservationAiSettings(
+      { ...reservation, skipInitHook, definitionSource, frontmatter: frontmatterJson },
+      progress,
+      signal
+    );
+  }
+
+  /** Resolves the task's AI settings (cancellable) and builds the prepared reservation. */
+  private async readReservationAiSettings(
+    reservation: ReservationAgentDefinition,
+    progress: TaskReservationProgress,
+    signal: AbortSignal | undefined
+  ): Promise<Result<PreparedTaskReservation, string>> {
+    const {
+      args,
+      cfg,
+      parentWorkspaceId,
+      prompt,
+      agentId,
+      parentMeta,
+      projectPluginsTrusted,
+      configProjectPath,
+      parentIsScratch,
+      taskDesktopOwnerWorkspaceId,
+      normalizedBestOf,
+      runtime,
+      parentWorkspacePath,
+      taskRuntimeConfig,
+      parentRuntimeConfig,
+      sharedWorkspacePath,
+      parentBranchName,
+      skipInitHook,
+      definitionSource,
+      frontmatter: frontmatterJson,
+    } = reservation;
     let taskModelString: string;
     let canonicalModel: string;
     let effectiveThinkingLevel: ThinkingLevel;
