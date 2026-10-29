@@ -225,6 +225,60 @@ describe("AgentSession post-compaction context retry", () => {
     await session.dispose();
   });
 
+  test("does not retry without the header when the carryover discard fails", async () => {
+    const workspaceId = "ws-discard-fails";
+    const fixture = await createSessionsFixture(workspaceId);
+    await fsPromises.writeFile(
+      path.join(fixture.sessionDir, "todos.json"),
+      JSON.stringify([{ content: "Keep going", status: "pending" }])
+    );
+
+    const aiEmitter = new EventEmitter();
+    const streamMessage = mock((..._args: unknown[]) => {
+      aiEmitter.emit("error", {
+        workspaceId,
+        messageId: "assistant-ctx-exceeded",
+        error: "Context length exceeded",
+        errorType: "context_exceeded",
+      });
+      return Promise.resolve(contextExceededResult("assistant-ctx-exceeded"));
+    });
+    const { session } = await createAgentSessionHarness({
+      workspaceId,
+      config: fixture.config,
+      historyService: fixture.historyService,
+      aiEmitter,
+      aiServiceOverrides: {
+        streamMessage,
+        getWorkspaceMetadata: mock(() => Promise.resolve(Err("nope"))),
+      },
+    });
+    await compactSessionForTest(session, fixture.historyService, workspaceId);
+    await fixture.historyService.appendToHistory(workspaceId, {
+      id: "user-1",
+      role: "user",
+      parts: [{ type: "text", text: "Continue" }],
+      metadata: { timestamp: Date.now() },
+    });
+    const compaction = sessionCompactionHandler(session);
+    await compaction.ackPendingStateConsumed();
+    spyOn(compaction, "discardPendingState").mockRejectedValueOnce(new Error("disk"));
+
+    await session.resumeStream({
+      model: "openai:gpt-4o",
+      agentId: "exec",
+    } as unknown as SendMessageOptions);
+
+    // A headerless retry would leave the carryover for the next compaction to merge again.
+    expect(await session.waitForPendingStreamErrorRecoveryDecision("assistant-ctx-exceeded")).toBe(
+      "terminal"
+    );
+    expect(streamMessage).toHaveBeenCalledTimes(1);
+    expect(await compaction.peekCarryoverState()).not.toBeNull();
+
+    await session.dispose();
+  });
+
   test("does not retry when the request had no post-compaction header", async () => {
     const workspaceId = "ws-no-header";
     const { historyService, config } = await createSessionsFixture(workspaceId);

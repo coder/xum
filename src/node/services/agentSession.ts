@@ -9722,6 +9722,20 @@ export class AgentSession {
     }
 
     this.postCompactionRetryAttempts.add(requestId);
+
+    // The next compaction must not carry the same context forward again.
+    // Fail closed if the discard throws: once the header is omitted, no later
+    // request hits this path to discard it, so the next compaction would merge it again.
+    try {
+      await this.contextController.discardFailedCarryover(pendingState);
+      this.onPostCompactionStateChange?.();
+    } catch (error) {
+      log.warn("Failed to discard pending post-compaction state; not retrying without it", {
+        workspaceId: this.workspaceId,
+        error: getErrorMessage(error),
+      });
+      return false;
+    }
     this.omittedPostCompactionBoundaryId = boundaryId;
 
     log.info("Post-compaction context hit context limit; retrying once without it", {
@@ -9729,17 +9743,6 @@ export class AgentSession {
       requestId,
       model: context.modelString,
     });
-
-    // The next compaction must not carry the same context forward again.
-    try {
-      await this.contextController.discardFailedCarryover(pendingState);
-      this.onPostCompactionStateChange?.();
-    } catch (error) {
-      log.warn("Failed to discard pending post-compaction state", {
-        workspaceId: this.workspaceId,
-        error: getErrorMessage(error),
-      });
-    }
 
     // Abort the failed assistant placeholder and clean up persisted partial/history state.
     this.resetActiveStreamState();
