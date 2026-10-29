@@ -151,6 +151,10 @@ def codex_summary_status($bot; $head; $resolved; $cleared):
                   or ($kind == "security_review" and $null_security_base and .commit_sha == $head
                     and .status == "completed" and .has_unresolved_findings == null
                     and .has_any_findings == null)
+                  # Since 2026-10-29 a finished code review can also say null (coder/xum#7734). Its
+                  # findings are Codex threads and finding comments, which block on their own.
+                  or ($kind == "code_review" and .commit_sha == $head and .status == "completed"
+                    and .has_unresolved_findings == null)
                   # Codex keeps true after its threads are resolved, until it reviews
                   # again (coder/xum#6786). Codex posts its threads before it updates
                   # the board, so this review's resolved threads clear it.

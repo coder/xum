@@ -1217,6 +1217,60 @@ interface PreparedTaskReservation {
   parentMetaJson: string;
 }
 
+/**
+ * The checked request: what prepareTaskReservation knows before its first read. Each step gets
+ * these values from the record, so no step re-reads them after an await.
+ */
+interface ReservationRequest extends Readonly<
+  Pick<
+    PreparedTaskReservation,
+    | "args"
+    | "parentWorkspaceId"
+    | "prompt"
+    | "agentId"
+    | "taskDesktopOwnerWorkspaceId"
+    | "normalizedBestOf"
+  >
+> {
+  readonly cfg: ProjectsConfig;
+  readonly taskSettings: TaskSettings;
+}
+
+/** The request plus the parent, read from its metadata and the loaded config. */
+interface ReservationParent
+  extends
+    ReservationRequest,
+    Readonly<
+      Pick<PreparedTaskReservation, "parentMeta" | "configProjectPath" | "parentIsScratch">
+    > {
+  readonly parentEntry: ReturnType<typeof findWorkspaceEntry>;
+  readonly projectPluginsTrusted: boolean;
+}
+
+/** The parent's runtime and checkout (see resolveParentRuntime). */
+interface ReservationParentRuntime extends Readonly<
+  Pick<
+    PreparedTaskReservation,
+    "runtime" | "parentWorkspacePath" | "taskRuntimeConfig" | "parentRuntimeConfig"
+  >
+> {
+  readonly taskRuntimeMode: ReturnType<typeof getRuntimeType>;
+  readonly parentIsMultiProject: boolean;
+}
+
+/** What prepareTaskReservation knows before it reads the agent definition. */
+interface ReservationPlacement
+  extends
+    ReservationParent,
+    ReservationParentRuntime,
+    Readonly<Pick<PreparedTaskReservation, "sharedWorkspacePath" | "parentBranchName">> {}
+
+/** The placement plus the facts read from the agent definition. */
+interface ReservationAgentDefinition
+  extends
+    ReservationPlacement,
+    Readonly<Pick<PreparedTaskReservation, "skipInitHook" | "definitionSource" | "frontmatter">> {}
+
 interface MaterializedTaskLaunch {
   workspacePath: string;
   trunkBranch: string;
@@ -5247,6 +5301,30 @@ export class TaskService implements AgentTaskIntegration {
     const prompt = coerceNonEmptyString(args.prompt);
     if (!prompt) return Err("Task.createMany: prompt is required");
 
+    const agent = this.resolveReservationAgentId(args);
+    if (!agent.success) return agent;
+    const bestOf = this.normalizeReservationBestOf(args.bestOf);
+    if (!bestOf.success) return bestOf;
+
+    return this.readReservationParent(
+      {
+        args,
+        cfg,
+        taskSettings,
+        parentWorkspaceId,
+        prompt,
+        ...agent.data,
+        normalizedBestOf: bestOf.data,
+      },
+      progress,
+      signal
+    );
+  }
+
+  /** Parses the requested agentId and resolves the task's desktop owner. */
+  private resolveReservationAgentId(
+    args: TaskCreateArgs
+  ): Result<Pick<PreparedTaskReservation, "agentId" | "taskDesktopOwnerWorkspaceId">, string> {
     const normalizedAgentId = normalizeAgentId(args.agentId ?? args.agentType, "");
     if (!normalizedAgentId) return Err("Task.createMany: agentId is required");
     const parsedAgentId = AgentIdSchema.safeParse(normalizedAgentId);
@@ -5260,9 +5338,14 @@ export class TaskService implements AgentTaskIntegration {
     } catch (error) {
       return Err(getErrorMessage(error));
     }
+    return Ok({ agentId, taskDesktopOwnerWorkspaceId });
+  }
 
+  /** Checks a best-of request and returns it normalized (undefined when there is none). */
+  private normalizeReservationBestOf(
+    bestOf: TaskCreateArgs["bestOf"]
+  ): Result<TaskCreateArgs["bestOf"], string> {
     let normalizedBestOf: TaskCreateArgs["bestOf"];
-    const bestOf = args.bestOf;
     if (bestOf) {
       const groupId = coerceNonEmptyString(bestOf.groupId);
       if (!groupId)
@@ -5282,7 +5365,19 @@ export class TaskService implements AgentTaskIntegration {
         total: bestOf.total,
       };
     }
+    return Ok(normalizedBestOf);
+  }
 
+  /**
+   * Reads the parent's metadata (cancellable) and refuses a parent that cannot take a new task,
+   * then places the task.
+   */
+  private async readReservationParent(
+    request: ReservationRequest,
+    progress: TaskReservationProgress,
+    signal: AbortSignal | undefined
+  ): Promise<Result<PreparedTaskReservation, string>> {
+    const { cfg, taskSettings, parentWorkspaceId } = request;
     const parentMetaRead = await this.readCancellable(
       this.aiService.getWorkspaceMetadata(parentWorkspaceId, { persistMigrations: false }),
       signal
@@ -5296,6 +5391,31 @@ export class TaskService implements AgentTaskIntegration {
     // #6426: once per reservation, from the loaded config.
     const projectPluginsTrusted = isWorkspaceProjectTrustedIn(cfg.projects, parentMeta);
     const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+    const project = this.resolveTrustedParentProject(cfg, parentMeta, parentEntry);
+    if (!project.success) return project;
+    const parentRefusal = this.refuseStoppedOrReportedParent(parentEntry);
+    if (!parentRefusal.success) return parentRefusal;
+
+    const requestedDepth = this.getTaskDepth(cfg, parentWorkspaceId) + 1;
+    if (requestedDepth > taskSettings.maxTaskNestingDepth) {
+      return Err(
+        `Task.createMany: maxTaskNestingDepth exceeded (requestedDepth=${requestedDepth}, max=${taskSettings.maxTaskNestingDepth})`
+      );
+    }
+
+    return this.readReservationParentBranch(
+      { ...request, parentMeta, parentEntry, projectPluginsTrusted, ...project.data },
+      progress,
+      signal
+    );
+  }
+
+  /** Refuses an archived parent or an untrusted project; returns the project's config key. */
+  private resolveTrustedParentProject(
+    cfg: ProjectsConfig,
+    parentMeta: WorkspaceMetadata,
+    parentEntry: ReturnType<typeof findWorkspaceEntry>
+  ): Result<Pick<PreparedTaskReservation, "parentIsScratch" | "configProjectPath">, string> {
     if (
       parentEntry != null &&
       isWorkspaceArchived(parentEntry.workspace.archivedAt, parentEntry.workspace.unarchivedAt)
@@ -5312,7 +5432,13 @@ export class TaskService implements AgentTaskIntegration {
         "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
       );
     }
+    return Ok({ parentIsScratch, configProjectPath });
+  }
 
+  /** Refuses a parent stopped by task_stop or done after agent_report, unless its turn is active. */
+  private refuseStoppedOrReportedParent(
+    parentEntry: ReturnType<typeof findWorkspaceEntry>
+  ): Result<void, string> {
     if (
       parentEntry?.workspace.taskStatus === "interrupted" &&
       !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
@@ -5326,14 +5452,54 @@ export class TaskService implements AgentTaskIntegration {
     ) {
       return Err("Task.createMany: cannot spawn new tasks after agent_report");
     }
+    return Ok(undefined);
+  }
 
-    const requestedDepth = this.getTaskDepth(cfg, parentWorkspaceId) + 1;
-    if (requestedDepth > taskSettings.maxTaskNestingDepth) {
-      return Err(
-        `Task.createMany: maxTaskNestingDepth exceeded (requestedDepth=${requestedDepth}, max=${taskSettings.maxTaskNestingDepth})`
-      );
+  /**
+   * Places the task on the parent's runtime and decides whether it shares the parent's
+   * checkout, then reads the parent's branch (cancellable) and reads the agent definition.
+   */
+  private async readReservationParentBranch(
+    parent: ReservationParent,
+    progress: TaskReservationProgress,
+    signal: AbortSignal | undefined
+  ): Promise<Result<PreparedTaskReservation, string>> {
+    const { args, parentWorkspaceId, parentMeta, parentEntry } = parent;
+    const parentRuntime = this.resolveParentRuntime(parentMeta, parentEntry);
+    const { runtime, parentWorkspacePath, taskRuntimeMode, parentIsMultiProject } = parentRuntime;
+    const sharing = this.resolveSharedTaskWorkspace(args, parent.parentIsScratch, parentRuntime);
+    if (!sharing.success) return sharing;
+    const { useSharedWorkspace, sharedWorkspacePath } = sharing.data;
+    // Branch actually checked out in the parent's checkout (see create() for rationale).
+    const parentBranchRead = await this.readCancellable(
+      readTaskParentBranch(parentEntry, parentMeta, () => ({
+        runtime,
+        workspacePath: parentWorkspacePath,
+      })),
+      signal
+    );
+    if (parentBranchRead.kind !== "ok") return Err(progress.interruptedError());
+    const parentBranchName = parentBranchRead.value;
+    if (args.isolation === "none" && !useSharedWorkspace) {
+      log.debug("Task.createMany: isolation=none not honored; falling back to fork", {
+        parentWorkspaceId,
+        runtimeMode: taskRuntimeMode,
+        parentIsMultiProject,
+      });
     }
 
+    return this.readReservationAgentDefinition(
+      { ...parent, ...parentRuntime, sharedWorkspacePath, parentBranchName },
+      progress,
+      signal
+    );
+  }
+
+  /** The parent's runtime, its checkout path and the facts the isolation gating reads. */
+  private resolveParentRuntime(
+    parentMeta: WorkspaceMetadata,
+    parentEntry: ReturnType<typeof findWorkspaceEntry>
+  ): ReservationParentRuntime {
     const parentRuntimeConfig = parentMeta.runtimeConfig;
     const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
     // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) resolve the
@@ -5353,11 +5519,31 @@ export class TaskService implements AgentTaskIntegration {
       : (coerceNonEmptyString(parentEntry?.workspace.path) ??
         runtime.getWorkspacePath(parentMeta.projectPath, parentMeta.name));
 
+    const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
+    const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
+    return {
+      parentRuntimeConfig,
+      taskRuntimeConfig,
+      runtime,
+      parentWorkspacePath,
+      taskRuntimeMode,
+      parentIsMultiProject,
+    };
+  }
+
+  /** Decides whether the task shares the parent's checkout (isolation: "none" or a scratch parent). */
+  private resolveSharedTaskWorkspace(
+    args: TaskCreateArgs,
+    parentIsScratch: boolean,
+    parentRuntime: ReservationParentRuntime
+  ): Result<
+    Pick<PreparedTaskReservation, "sharedWorkspacePath"> & { useSharedWorkspace: boolean },
+    string
+  > {
+    const { taskRuntimeMode, parentIsMultiProject, parentWorkspacePath } = parentRuntime;
     // isolation: "none" — same gating as create(): only worktree/SSH single-project parents
     // share the parent checkout; multi-project parents on those runtimes are refused (see
     // MULTI_PROJECT_SHARED_ISOLATION_ERROR); everything else falls back to the normal fork path.
-    const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
-    const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
     if (
       args.isolation === "none" &&
       runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
@@ -5371,72 +5557,72 @@ export class TaskService implements AgentTaskIntegration {
         runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
         !parentIsMultiProject);
     const sharedWorkspacePath = useSharedWorkspace ? parentWorkspacePath : undefined;
-    // Branch actually checked out in the parent's checkout (see create() for rationale).
-    const parentBranchRead = await this.readCancellable(
-      readTaskParentBranch(parentEntry, parentMeta, () => ({
-        runtime,
-        workspacePath: parentWorkspacePath,
-      })),
-      signal
-    );
-    if (parentBranchRead.kind !== "ok") return Err(progress.interruptedError());
-    const parentBranchName = parentBranchRead.value;
-    if (args.isolation === "none" && !useSharedWorkspace) {
-      log.debug("Task.createMany: isolation=none not honored; falling back to fork", {
-        parentWorkspaceId,
-        runtimeMode: taskRuntimeMode,
-        parentIsMultiProject,
-      });
-    }
+    return Ok({ useSharedWorkspace, sharedWorkspacePath });
+  }
 
-    const getRunnableHint = async (): Promise<string> => {
-      try {
-        const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
-          projectPluginsTrusted,
-          runtimeFactory: nodeRuntimeFactory,
-        });
-        const runnableIds = (
-          await Promise.all(
-            allAgents.map(async (agent) => {
-              try {
-                const frontmatter = await resolveAgentFrontmatter(
-                  runtime,
-                  parentWorkspacePath,
-                  agent.id,
-                  {
-                    skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
-                    projectPluginsTrusted,
-                    runtimeFactory: nodeRuntimeFactory,
-                  }
-                );
-                if (
-                  !isAgentRunnableAsChild(frontmatter, {
-                    workflowOwned: args.workflowTask != null,
-                  })
-                ) {
-                  return null;
+  /**
+   * The runnable agentIds for a refusal message. Only the refusal paths of
+   * readReservationAgentDefinition call it.
+   */
+  private async describeRunnableAgents(reservation: ReservationPlacement): Promise<string> {
+    const { args, cfg, runtime, parentWorkspacePath, projectPluginsTrusted } = reservation;
+    try {
+      const allAgents = await discoverAgentDefinitions(runtime, parentWorkspacePath, {
+        projectPluginsTrusted,
+        runtimeFactory: nodeRuntimeFactory,
+      });
+      const runnableIds = (
+        await Promise.all(
+          allAgents.map(async (agent) => {
+            try {
+              const frontmatter = await resolveAgentFrontmatter(
+                runtime,
+                parentWorkspacePath,
+                agent.id,
+                {
+                  skipScopesAbove: getSkipScopesAboveForKnownScope(agent.scope),
+                  projectPluginsTrusted,
+                  runtimeFactory: nodeRuntimeFactory,
                 }
-                return isAgentEffectivelyDisabled({
-                  cfg,
-                  agentId: agent.id,
-                  resolvedFrontmatter: frontmatter,
+              );
+              if (
+                !isAgentRunnableAsChild(frontmatter, {
+                  workflowOwned: args.workflowTask != null,
                 })
-                  ? null
-                  : agent.id;
-              } catch {
+              ) {
                 return null;
               }
-            })
-          )
-        ).filter((id): id is string => typeof id === "string");
-        return runnableIds.length > 0
-          ? `Runnable agentIds: ${runnableIds.join(", ")}`
-          : "No runnable agents available";
-      } catch {
-        return "Could not discover available agents";
-      }
-    };
+              return isAgentEffectivelyDisabled({
+                cfg,
+                agentId: agent.id,
+                resolvedFrontmatter: frontmatter,
+              })
+                ? null
+                : agent.id;
+            } catch {
+              return null;
+            }
+          })
+        )
+      ).filter((id): id is string => typeof id === "string");
+      return runnableIds.length > 0
+        ? `Runnable agentIds: ${runnableIds.join(", ")}`
+        : "No runnable agents available";
+    } catch {
+      return "Could not discover available agents";
+    }
+  }
 
+  /**
+   * Reads the agent definition (cancellable) and refuses an agent that cannot run as this
+   * sub-agent, then reads the AI settings.
+   */
+  private async readReservationAgentDefinition(
+    reservation: ReservationPlacement,
+    progress: TaskReservationProgress,
+    signal: AbortSignal | undefined
+  ): Promise<Result<PreparedTaskReservation, string>> {
+    const { args, cfg, agentId, runtime, parentWorkspacePath, projectPluginsTrusted } = reservation;
     let skipInitHook = false;
     let definitionSource: string | undefined;
     let frontmatterJson: string;
@@ -5452,11 +5638,11 @@ export class TaskService implements AgentTaskIntegration {
       const definition = definitionRead.value;
       const frontmatter = definition.frontmatter;
       if (!isAgentRunnableAsChild(frontmatter, { workflowOwned: args.workflowTask != null })) {
-        const hint = await getRunnableHint();
+        const hint = await this.describeRunnableAgents(reservation);
         return Err(`Task.createMany: agentId is not runnable as a sub-agent (${agentId}). ${hint}`);
       }
       if (isAgentEffectivelyDisabled({ cfg, agentId, resolvedFrontmatter: frontmatter })) {
-        const hint = await getRunnableHint();
+        const hint = await this.describeRunnableAgents(reservation);
         return Err(`Task.createMany: agentId is disabled (${agentId}). ${hint}`);
       }
       skipInitHook = frontmatter.subagent?.skip_init_hook === true;
@@ -5472,10 +5658,45 @@ export class TaskService implements AgentTaskIntegration {
           )
         );
       }
-      const hint = await getRunnableHint();
+      const hint = await this.describeRunnableAgents(reservation);
       return Err(`Task.createMany: unknown agentId (${agentId}). ${hint}`);
     }
 
+    return this.readReservationAiSettings(
+      { ...reservation, skipInitHook, definitionSource, frontmatter: frontmatterJson },
+      progress,
+      signal
+    );
+  }
+
+  /** Resolves the task's AI settings (cancellable) and builds the prepared reservation. */
+  private async readReservationAiSettings(
+    reservation: ReservationAgentDefinition,
+    progress: TaskReservationProgress,
+    signal: AbortSignal | undefined
+  ): Promise<Result<PreparedTaskReservation, string>> {
+    const {
+      args,
+      cfg,
+      parentWorkspaceId,
+      prompt,
+      agentId,
+      parentMeta,
+      projectPluginsTrusted,
+      configProjectPath,
+      parentIsScratch,
+      taskDesktopOwnerWorkspaceId,
+      normalizedBestOf,
+      runtime,
+      parentWorkspacePath,
+      taskRuntimeConfig,
+      parentRuntimeConfig,
+      sharedWorkspacePath,
+      parentBranchName,
+      skipInitHook,
+      definitionSource,
+      frontmatter: frontmatterJson,
+    } = reservation;
     let taskModelString: string;
     let canonicalModel: string;
     let effectiveThinkingLevel: ThinkingLevel;

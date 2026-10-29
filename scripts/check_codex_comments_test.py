@@ -289,8 +289,9 @@ else:
         unresolved = '"has_unresolved_findings":false'
         for case, changed, expected in (
             ("observed", body, 0),
-            # Codex sends null while a review runs; a completed review must say false.
-            ("completed, null findings", body.replace(unresolved, '"has_unresolved_findings":null', 1), 1),
+            # A finished code review of this head may say null (coder/xum#7734): its findings are
+            # threads and finding comments, which block on their own.
+            ("completed, null findings", body.replace(unresolved, '"has_unresolved_findings":null', 1), 0),
             ("running, null findings", body.replace(
                 unresolved + ',"status":"completed"}', '"has_unresolved_findings":null,"status":"running"}', 1), 10),
             ("code unresolved", body.replace(unresolved, '"has_unresolved_findings":true', 1), 1),
@@ -394,6 +395,30 @@ else:
                 result = self.run_gate(snapshot(comments, head=head), "wait_pr_codex.sh")
                 self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
                 self.assertEqual(self.posts.read_text().split("\0")[:-1], [posted] * posts)
+
+    def test_null_code_review_flags_pass_only_for_this_head(self):
+        # Since 2026-10-29 Codex can finish a code review with null flags (coder/xum#7734,
+        # observed on #7732). Its findings are threads and finding comments, which block alone.
+        clean = FIXTURES["review_state_summary"]["body"]
+        head = board_head(clean)
+        code_flags = '"has_any_findings":true,"has_unresolved_findings":false,"status":"completed"},"security'
+        self.assertIn(code_flags, clean)
+        null_flags = code_flags.replace('"has_unresolved_findings":false', '"has_unresolved_findings":null')
+        null_code = clean.replace(code_flags, null_flags, 1)
+        code_marker = "\n\n<!-- codex-code-review-finding:v1 -->"
+        self.assertNotEqual(null_code, clean)
+        for case, comments, threads, expected in (
+            ("clean", [null_code], [], 0),
+            ("open Codex thread", [null_code], [thread("[P2] Open" + code_marker, commit=head)], 1),
+            ("Codex finding comment", [null_code, "**P1** Validate the caller" + code_marker], [], 1),
+            ("older commit", [null_code.replace('"code_review":{"commit_sha":"' + head, '"code_review":{"commit_sha":"' + "c" * 40, 1)],
+             [], 1),
+            ("running", [null_code.replace(null_flags, null_flags.replace("completed", "running"), 1)], [], 10),
+        ):
+            for cached in (False, True):
+                with self.subTest(case=case, cached=cached):
+                    data = snapshot([comment(body) for body in comments], threads, head=head)
+                    self.assert_gate(expected, data, cache=data if cached else None)
 
     def test_resolved_codex_threads_clear_unresolved_review_state(self):
         # Codex keeps has_unresolved_findings true after its threads are resolved
