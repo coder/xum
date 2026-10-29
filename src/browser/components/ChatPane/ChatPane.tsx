@@ -2214,7 +2214,10 @@ const ChatInputPane: React.FC<ChatInputPaneProps> = (props) => {
 
   return (
     <>
-      <WaitingOnYouProvider key={props.workspaceId}>
+      {/* Remount per workspace, but keep this key distinct from the sibling ChatInput's: React
+          cannot reconcile same-keyed siblings, and on a workspace switch it left the previous
+          workspace's decoration stack (queued message, questions) in the dock. */}
+      <WaitingOnYouProvider key={`waiting-on-you:${props.workspaceId}`}>
         <ChatInputDecorationStackLane
           items={selectVisibleChatInputDecorations(decorationEntries, props.revealDecorations)}
         />
