@@ -1741,6 +1741,7 @@ function isIdleLegacyStartupTask(
  * re-read after a re-drive's awaits.
  */
 interface StartupRecoverySnapshot {
+  readonly config: ProjectsConfig;
   readonly taskIndex: AgentTaskIndex;
   readonly states: ReadonlyMap<string | undefined, StartupRecoveryState>;
 }
@@ -1750,6 +1751,10 @@ interface StartupRecoverySnapshot {
  * step adds to the counters for what it did.
  */
 interface StartupRecoveryTally {
+  resumedAwaitingReportCount: number;
+  skippedAwaitingReportDueToActiveDescendants: number;
+  skippedAwaitingReportAlreadyBusy: number;
+  failedAwaitingReportCount: number;
   resumedRunningCount: number;
   skippedRunningDueToActiveDescendants: number;
   skippedRunningAlreadyStreaming: number;
@@ -4560,106 +4565,27 @@ export class TaskService implements AgentTaskIntegration {
       (task) => (task.taskStatus ?? "running") === "running" || states.get(task.id) === "question"
     );
 
-    const admitRecovery = async (task: (typeof eligible)[number], reason: string) => {
-      if (
-        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-        !(await this.admitTaskDesktopRecovery(task.id!)) ||
-        (await this.interruptTaskRecoveryForInactiveWorkflowOwner(
-          // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-          task.id!,
-          config,
-          reason,
-          taskIndex
-        ))
-      )
-        return false;
-      // Earlier recovery awaits can finish other candidates; verify live status at each dispatch.
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-      const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), task.id!)?.workspace;
-      return latest != null && latest.taskStatus === task.taskStatus;
-    };
-
-    let resumedAwaitingReportCount = 0;
-    let skippedAwaitingReportDueToActiveDescendants = 0;
-    let skippedAwaitingReportAlreadyBusy = 0;
-    let failedAwaitingReportCount = 0;
-
-    for (const task of awaitingReportTasks) {
-      if (!task.id) continue;
-      if (cancelled("awaiting-report")) return;
-      if (!(await admitRecovery(task, "startup-awaiting-report"))) continue;
-
-      // Avoid resuming a task while it still has blocking active descendants (it shouldn't report yet).
-      const hasBlockingActiveDescendants =
-        this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(taskIndex, task.id).length > 0;
-      if (hasBlockingActiveDescendants) {
-        skippedAwaitingReportDueToActiveDescendants += 1;
-        continue;
-      }
-      // A busy session already owns a turn (e.g. an earlier pass's background completion prompt
-      // still preparing, not yet streaming): rotating would hand its result to a superseded
-      // attempt. Its stream end re-enters completion recovery.
-      if (this.workspaceService.isBusyForMessage(task.id)) {
-        skippedAwaitingReportAlreadyBusy += 1;
-        continue;
-      }
-
-      // Admission classification: startup re-drive = new UNOWNED attempt (rotate + mark) before
-      // the first send below; the sends are then fenced against the fresh id at the handoff.
-      // Guarded by the recovery snapshot (`task`), not a re-read: a row that moved meanwhile was
-      // admitted or stopped by another writer and must not be re-driven.
-      // Retry a goal pause the previous process owed before re-driving the task.
-      await this.settleChildGoalPause(task.id);
-      const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(task.id, task);
-      if (rotatedAttemptId == null) {
-        failedAwaitingReportCount += 1;
-        continue;
-      }
-      const followUp = await this.dispatchFencedStartupCompactionFollowUp(
-        task.id,
-        rotatedAttemptId
-      );
-      if (!followUp.success) failedAwaitingReportCount += 1;
-      else if (followUp.data) resumedAwaitingReportCount += 1;
-      if (!followUp.success || followUp.data) continue;
-      // The completion prompt is fenced to the attempt this decision rotated, like every other
-      // startup send: bound here (refused once another writer's attempt owns the row) and carried
-      // through the prompt helper's own awaits as its token, so a rotation landing during them
-      // refuses the send at the gates instead of the handoff adopting the successor.
-      const completionAdmission = this.admitTaskWorkspaceTurn(task.id, {
-        acceptanceOrigin: "automatic",
-        expectedAttemptId: rotatedAttemptId,
-      });
-      if (completionAdmission.kind !== "admitted") {
-        failedAwaitingReportCount += 1;
-        continue;
-      }
-      const resumed = await this.promptTaskForRequiredCompletionTool(task.id, {
-        reason: "startup",
-        fence: { turnAdmission: completionAdmission.token, attemptId: rotatedAttemptId },
-        // The fence carries the attempt (see the option's doc).
-        expectedAttemptId: null,
-      });
-      if (!resumed) {
-        failedAwaitingReportCount += 1;
-        continue;
-      }
-
-      resumedAwaitingReportCount += 1;
-    }
-
-    const snapshot: StartupRecoverySnapshot = { taskIndex, states };
+    const snapshot: StartupRecoverySnapshot = { config, taskIndex, states };
     const tally: StartupRecoveryTally = {
+      resumedAwaitingReportCount: 0,
+      skippedAwaitingReportDueToActiveDescendants: 0,
+      skippedAwaitingReportAlreadyBusy: 0,
+      failedAwaitingReportCount: 0,
       resumedRunningCount: 0,
       skippedRunningDueToActiveDescendants: 0,
       skippedRunningAlreadyStreaming: 0,
       failedRunningCount: 0,
     };
 
+    for (const task of awaitingReportTasks) {
+      if (!task.id) continue;
+      if (cancelled("awaiting-report")) return;
+      await this.resumeAwaitingReportTask(task.id, task, snapshot, tally);
+    }
+
     for (const task of runningTasks) {
       if (!task.id) continue;
       if (cancelled("running")) return;
-      if (!(await admitRecovery(task, "startup-running"))) continue;
       await this.resumeRunningTask(task.id, task, snapshot, tally);
     }
 
@@ -4667,10 +4593,11 @@ export class TaskService implements AgentTaskIntegration {
       totalMs: Date.now() - startupStartedAt,
       skippedInUseElsewhereCount: inUseElsewhere.size,
       awaitingReportTaskCount: awaitingReportTasks.length,
-      resumedAwaitingReportCount,
-      skippedAwaitingReportDueToActiveDescendants,
-      skippedAwaitingReportAlreadyBusy,
-      failedAwaitingReportCount,
+      resumedAwaitingReportCount: tally.resumedAwaitingReportCount,
+      skippedAwaitingReportDueToActiveDescendants:
+        tally.skippedAwaitingReportDueToActiveDescendants,
+      skippedAwaitingReportAlreadyBusy: tally.skippedAwaitingReportAlreadyBusy,
+      failedAwaitingReportCount: tally.failedAwaitingReportCount,
       runningTaskCount: runningTasks.length,
       resumedRunningCount: tally.resumedRunningCount,
       skippedRunningDueToActiveDescendants: tally.skippedRunningDueToActiveDescendants,
@@ -4680,8 +4607,122 @@ export class TaskService implements AgentTaskIntegration {
   }
 
   /**
-   * Startup re-drive of one admitted `running` task (or one with a pending question). Returns
-   * without a send when the task has nothing to re-drive: each skip below was a `continue` of
+   * Admits one startup re-drive: the desktop admits it, no inactive workflow owns the task, and
+   * its live row still has the status of the recovery snapshot.
+   */
+  private async admitStartupRecovery(
+    task: AgentTaskWorkspaceEntry,
+    reason: string,
+    snapshot: StartupRecoverySnapshot
+  ): Promise<boolean> {
+    if (
+      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+      !(await this.admitTaskDesktopRecovery(task.id!)) ||
+      (await this.interruptTaskRecoveryForInactiveWorkflowOwner(
+        // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+        task.id!,
+        snapshot.config,
+        reason,
+        snapshot.taskIndex
+      ))
+    )
+      return false;
+    // Earlier recovery awaits can finish other candidates; verify live status at each dispatch.
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+    const latest = findWorkspaceEntry(this.config.loadConfigOrDefault(), task.id!)?.workspace;
+    return latest != null && latest.taskStatus === task.taskStatus;
+  }
+
+  /**
+   * Startup re-drive of one `awaiting_report` task: its compaction follow-up, else the prompt for
+   * its required completion tool. Each early return below was a `continue` of
+   * recoverInterruptedTasks' awaiting-report loop.
+   */
+  private async resumeAwaitingReportTask(
+    taskId: string,
+    task: AgentTaskWorkspaceEntry,
+    snapshot: StartupRecoverySnapshot,
+    tally: StartupRecoveryTally
+  ): Promise<void> {
+    if (!(await this.admitStartupRecovery(task, "startup-awaiting-report", snapshot))) return;
+    if (this.skipActiveAwaitingReportTask(taskId, snapshot.taskIndex, tally)) return;
+
+    // Admission classification: startup re-drive = new UNOWNED attempt (rotate + mark) before
+    // the first send below; the sends are then fenced against the fresh id at the handoff.
+    // Guarded by the recovery snapshot (`task`), not a re-read: a row that moved meanwhile was
+    // admitted or stopped by another writer and must not be re-driven.
+    // Retry a goal pause the previous process owed before re-driving the task.
+    await this.settleChildGoalPause(taskId);
+    const rotatedAttemptId = await this.rotateAttemptForStartupRedrive(taskId, task);
+    if (rotatedAttemptId == null) {
+      tally.failedAwaitingReportCount += 1;
+      return;
+    }
+    const followUp = await this.dispatchFencedStartupCompactionFollowUp(taskId, rotatedAttemptId);
+    if (!followUp.success) tally.failedAwaitingReportCount += 1;
+    else if (followUp.data) tally.resumedAwaitingReportCount += 1;
+    if (!followUp.success || followUp.data) return;
+    await this.promptStartupAwaitingReportCompletion(taskId, rotatedAttemptId, tally);
+  }
+
+  /** Counts and skips an awaiting_report task that has blocking active descendants or is busy. */
+  private skipActiveAwaitingReportTask(
+    taskId: string,
+    taskIndex: AgentTaskIndex,
+    tally: StartupRecoveryTally
+  ): boolean {
+    // Avoid resuming a task while it still has blocking active descendants (it shouldn't report yet).
+    const hasBlockingActiveDescendants =
+      this.listBlockingActiveDescendantAgentTaskIdsUsingIndex(taskIndex, taskId).length > 0;
+    if (hasBlockingActiveDescendants) {
+      tally.skippedAwaitingReportDueToActiveDescendants += 1;
+      return true;
+    }
+    // A busy session already owns a turn (e.g. an earlier pass's background completion prompt
+    // still preparing, not yet streaming): rotating would hand its result to a superseded
+    // attempt. Its stream end re-enters completion recovery.
+    if (this.workspaceService.isBusyForMessage(taskId)) {
+      tally.skippedAwaitingReportAlreadyBusy += 1;
+      return true;
+    }
+    return false;
+  }
+
+  /** Prompts for the required completion tool, fenced to the task's rotated attempt. */
+  private async promptStartupAwaitingReportCompletion(
+    taskId: string,
+    rotatedAttemptId: string,
+    tally: StartupRecoveryTally
+  ): Promise<void> {
+    // The completion prompt is fenced to the attempt this decision rotated, like every other
+    // startup send: bound here (refused once another writer's attempt owns the row) and carried
+    // through the prompt helper's own awaits as its token, so a rotation landing during them
+    // refuses the send at the gates instead of the handoff adopting the successor.
+    const completionAdmission = this.admitTaskWorkspaceTurn(taskId, {
+      acceptanceOrigin: "automatic",
+      expectedAttemptId: rotatedAttemptId,
+    });
+    if (completionAdmission.kind !== "admitted") {
+      tally.failedAwaitingReportCount += 1;
+      return;
+    }
+    const resumed = await this.promptTaskForRequiredCompletionTool(taskId, {
+      reason: "startup",
+      fence: { turnAdmission: completionAdmission.token, attemptId: rotatedAttemptId },
+      // The fence carries the attempt (see the option's doc).
+      expectedAttemptId: null,
+    });
+    if (!resumed) {
+      tally.failedAwaitingReportCount += 1;
+      return;
+    }
+
+    tally.resumedAwaitingReportCount += 1;
+  }
+
+  /**
+   * Startup re-drive of one `running` task (or one with a pending question). Returns without a
+   * send when the task has nothing to re-drive: each skip below was a `continue` of
    * recoverInterruptedTasks' running loop.
    */
   private async resumeRunningTask(
@@ -4690,6 +4731,7 @@ export class TaskService implements AgentTaskIntegration {
     snapshot: StartupRecoverySnapshot,
     tally: StartupRecoveryTally
   ): Promise<void> {
+    if (!(await this.admitStartupRecovery(task, "startup-running", snapshot))) return;
     const pendingGuidance = task.taskPendingGuidance ?? [];
     const queueOnly = snapshot.states.get(taskId) === "question";
     if (queueOnly && pendingGuidance.length === 0) return;
