@@ -83,9 +83,12 @@ describe("Composer decorations across workspace switches", () => {
       await waitFor(() => expect(queuedBanners(app)).toHaveLength(0), LOAD_TOLERANT_WAIT);
       expect(dockDecorationStacks(app)).toHaveLength(1);
 
-      const duplicateKeyErrors = consoleErrorSpy.mock.calls.filter((args) =>
-        args.some((arg) => typeof arg === "string" && arg.includes(DUPLICATE_KEY_WARNING))
-      );
+      // Keep the warning and the duplicated key only; the component stack runs to thousands of lines.
+      const duplicateKeyErrors = consoleErrorSpy.mock.calls
+        .filter((args) =>
+          args.some((arg) => typeof arg === "string" && arg.includes(DUPLICATE_KEY_WARNING))
+        )
+        .map((args) => args.slice(0, 2));
       expect(duplicateKeyErrors).toEqual([]);
 
       app.env.services.aiService.releaseMockStreamStartGate(app.workspaceId);
