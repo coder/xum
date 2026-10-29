@@ -1218,32 +1218,52 @@ interface PreparedTaskReservation {
 }
 
 /**
- * What prepareTaskReservation knows before it reads the agent definition: the checked request,
- * the parent and its placement. Read before awaits, so the later steps never re-read them.
+ * The checked request: what prepareTaskReservation knows before its first read. Each step gets
+ * these values from the record, so no step re-reads them after an await.
  */
-interface ReservationPlacement extends Readonly<
+interface ReservationRequest extends Readonly<
   Pick<
     PreparedTaskReservation,
     | "args"
     | "parentWorkspaceId"
     | "prompt"
     | "agentId"
-    | "parentMeta"
-    | "configProjectPath"
-    | "parentIsScratch"
     | "taskDesktopOwnerWorkspaceId"
     | "normalizedBestOf"
-    | "runtime"
-    | "parentWorkspacePath"
-    | "taskRuntimeConfig"
-    | "parentRuntimeConfig"
-    | "sharedWorkspacePath"
-    | "parentBranchName"
   >
 > {
   readonly cfg: ProjectsConfig;
+  readonly taskSettings: TaskSettings;
+}
+
+/** The request plus the parent, read from its metadata and the loaded config. */
+interface ReservationParent
+  extends
+    ReservationRequest,
+    Readonly<
+      Pick<PreparedTaskReservation, "parentMeta" | "configProjectPath" | "parentIsScratch">
+    > {
+  readonly parentEntry: ReturnType<typeof findWorkspaceEntry>;
   readonly projectPluginsTrusted: boolean;
 }
+
+/** The parent's runtime and checkout (see resolveParentRuntime). */
+interface ReservationParentRuntime extends Readonly<
+  Pick<
+    PreparedTaskReservation,
+    "runtime" | "parentWorkspacePath" | "taskRuntimeConfig" | "parentRuntimeConfig"
+  >
+> {
+  readonly taskRuntimeMode: ReturnType<typeof getRuntimeType>;
+  readonly parentIsMultiProject: boolean;
+}
+
+/** What prepareTaskReservation knows before it reads the agent definition. */
+interface ReservationPlacement
+  extends
+    ReservationParent,
+    ReservationParentRuntime,
+    Readonly<Pick<PreparedTaskReservation, "sharedWorkspacePath" | "parentBranchName">> {}
 
 /** The placement plus the facts read from the agent definition. */
 interface ReservationAgentDefinition
@@ -5292,6 +5312,32 @@ export class TaskService implements AgentTaskIntegration {
       };
     }
 
+    return this.readReservationParent(
+      {
+        args,
+        cfg,
+        taskSettings,
+        parentWorkspaceId,
+        prompt,
+        agentId,
+        taskDesktopOwnerWorkspaceId,
+        normalizedBestOf,
+      },
+      progress,
+      signal
+    );
+  }
+
+  /**
+   * Reads the parent's metadata (cancellable) and refuses a parent that cannot take a new task,
+   * then places the task.
+   */
+  private async readReservationParent(
+    request: ReservationRequest,
+    progress: TaskReservationProgress,
+    signal: AbortSignal | undefined
+  ): Promise<Result<PreparedTaskReservation, string>> {
+    const { cfg, taskSettings, parentWorkspaceId } = request;
     const parentMetaRead = await this.readCancellable(
       this.aiService.getWorkspaceMetadata(parentWorkspaceId, { persistMigrations: false }),
       signal
@@ -5305,6 +5351,31 @@ export class TaskService implements AgentTaskIntegration {
     // #6426: once per reservation, from the loaded config.
     const projectPluginsTrusted = isWorkspaceProjectTrustedIn(cfg.projects, parentMeta);
     const parentEntry = findWorkspaceEntry(cfg, parentWorkspaceId);
+    const project = this.resolveTrustedParentProject(cfg, parentMeta, parentEntry);
+    if (!project.success) return project;
+    const parentRefusal = this.refuseStoppedOrReportedParent(parentEntry);
+    if (!parentRefusal.success) return parentRefusal;
+
+    const requestedDepth = this.getTaskDepth(cfg, parentWorkspaceId) + 1;
+    if (requestedDepth > taskSettings.maxTaskNestingDepth) {
+      return Err(
+        `Task.createMany: maxTaskNestingDepth exceeded (requestedDepth=${requestedDepth}, max=${taskSettings.maxTaskNestingDepth})`
+      );
+    }
+
+    return this.readReservationParentBranch(
+      { ...request, parentMeta, parentEntry, projectPluginsTrusted, ...project.data },
+      progress,
+      signal
+    );
+  }
+
+  /** Refuses an archived parent or an untrusted project; returns the project's config key. */
+  private resolveTrustedParentProject(
+    cfg: ProjectsConfig,
+    parentMeta: WorkspaceMetadata,
+    parentEntry: ReturnType<typeof findWorkspaceEntry>
+  ): Result<Pick<PreparedTaskReservation, "parentIsScratch" | "configProjectPath">, string> {
     if (
       parentEntry != null &&
       isWorkspaceArchived(parentEntry.workspace.archivedAt, parentEntry.workspace.unarchivedAt)
@@ -5321,7 +5392,13 @@ export class TaskService implements AgentTaskIntegration {
         "This project must be trusted before creating workspaces. Trust the project in Settings → Security, or create a workspace from the project page."
       );
     }
+    return Ok({ parentIsScratch, configProjectPath });
+  }
 
+  /** Refuses a parent stopped by task_stop or done after agent_report, unless its turn is active. */
+  private refuseStoppedOrReportedParent(
+    parentEntry: ReturnType<typeof findWorkspaceEntry>
+  ): Result<void, string> {
     if (
       parentEntry?.workspace.taskStatus === "interrupted" &&
       !isActiveWorkspaceTurnTaskStatus(parentEntry.workspace.taskExecutionStatus)
@@ -5335,51 +5412,24 @@ export class TaskService implements AgentTaskIntegration {
     ) {
       return Err("Task.createMany: cannot spawn new tasks after agent_report");
     }
+    return Ok(undefined);
+  }
 
-    const requestedDepth = this.getTaskDepth(cfg, parentWorkspaceId) + 1;
-    if (requestedDepth > taskSettings.maxTaskNestingDepth) {
-      return Err(
-        `Task.createMany: maxTaskNestingDepth exceeded (requestedDepth=${requestedDepth}, max=${taskSettings.maxTaskNestingDepth})`
-      );
-    }
-
-    const parentRuntimeConfig = parentMeta.runtimeConfig;
-    const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
-    // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) resolve the
-    // parent's REAL checkout when the parent is itself an isolation: "none" task (see create()).
-    const runtime = createRuntimeForWorkspace({
-      runtimeConfig: taskRuntimeConfig,
-      projectPath: parentMeta.projectPath,
-      name: parentMeta.name,
-      namedWorkspacePath: coerceNonEmptyString(parentEntry?.workspace.path),
-    });
-    // Prefer the parent's persisted checkout path over the name-derived one: when the parent is
-    // itself an isolation: "none" task, its name is synthetic and the derived path does not
-    // exist — its real checkout is the persisted (shared) path.
-    const isInPlace = parentMeta.projectPath === parentMeta.name;
-    const parentWorkspacePath = isInPlace
-      ? parentMeta.projectPath
-      : (coerceNonEmptyString(parentEntry?.workspace.path) ??
-        runtime.getWorkspacePath(parentMeta.projectPath, parentMeta.name));
-
-    // isolation: "none" — same gating as create(): only worktree/SSH single-project parents
-    // share the parent checkout; multi-project parents on those runtimes are refused (see
-    // MULTI_PROJECT_SHARED_ISOLATION_ERROR); everything else falls back to the normal fork path.
-    const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
-    const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
-    if (
-      args.isolation === "none" &&
-      runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
-      parentIsMultiProject
-    ) {
-      return Err(`Task.createMany: ${MULTI_PROJECT_SHARED_ISOLATION_ERROR}`);
-    }
-    const useSharedWorkspace =
-      parentIsScratch ||
-      (args.isolation === "none" &&
-        runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
-        !parentIsMultiProject);
-    const sharedWorkspacePath = useSharedWorkspace ? parentWorkspacePath : undefined;
+  /**
+   * Places the task on the parent's runtime and decides whether it shares the parent's
+   * checkout, then reads the parent's branch (cancellable) and reads the agent definition.
+   */
+  private async readReservationParentBranch(
+    parent: ReservationParent,
+    progress: TaskReservationProgress,
+    signal: AbortSignal | undefined
+  ): Promise<Result<PreparedTaskReservation, string>> {
+    const { args, parentWorkspaceId, parentMeta, parentEntry } = parent;
+    const parentRuntime = this.resolveParentRuntime(parentMeta, parentEntry);
+    const { runtime, parentWorkspacePath, taskRuntimeMode, parentIsMultiProject } = parentRuntime;
+    const sharing = this.resolveSharedTaskWorkspace(args, parent.parentIsScratch, parentRuntime);
+    if (!sharing.success) return sharing;
+    const { useSharedWorkspace, sharedWorkspacePath } = sharing.data;
     // Branch actually checked out in the parent's checkout (see create() for rationale).
     const parentBranchRead = await this.readCancellable(
       readTaskParentBranch(parentEntry, parentMeta, () => ({
@@ -5399,28 +5449,75 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     return this.readReservationAgentDefinition(
-      {
-        args,
-        cfg,
-        parentWorkspaceId,
-        prompt,
-        agentId,
-        parentMeta,
-        projectPluginsTrusted,
-        configProjectPath,
-        parentIsScratch,
-        taskDesktopOwnerWorkspaceId,
-        normalizedBestOf,
-        runtime,
-        parentWorkspacePath,
-        taskRuntimeConfig,
-        parentRuntimeConfig,
-        sharedWorkspacePath,
-        parentBranchName,
-      },
+      { ...parent, ...parentRuntime, sharedWorkspacePath, parentBranchName },
       progress,
       signal
     );
+  }
+
+  /** The parent's runtime, its checkout path and the facts the isolation gating reads. */
+  private resolveParentRuntime(
+    parentMeta: WorkspaceMetadata,
+    parentEntry: ReturnType<typeof findWorkspaceEntry>
+  ): ReservationParentRuntime {
+    const parentRuntimeConfig = parentMeta.runtimeConfig;
+    const taskRuntimeConfig: RuntimeConfig = parentRuntimeConfig;
+    // Supply the parent's persisted path so override-aware runtimes (worktree/SSH) resolve the
+    // parent's REAL checkout when the parent is itself an isolation: "none" task (see create()).
+    const runtime = createRuntimeForWorkspace({
+      runtimeConfig: taskRuntimeConfig,
+      projectPath: parentMeta.projectPath,
+      name: parentMeta.name,
+      namedWorkspacePath: coerceNonEmptyString(parentEntry?.workspace.path),
+    });
+    // Prefer the parent's persisted checkout path over the name-derived one: when the parent is
+    // itself an isolation: "none" task, its name is synthetic and the derived path does not
+    // exist — its real checkout is the persisted (shared) path.
+    const isInPlace = parentMeta.projectPath === parentMeta.name;
+    const parentWorkspacePath = isInPlace
+      ? parentMeta.projectPath
+      : (coerceNonEmptyString(parentEntry?.workspace.path) ??
+        runtime.getWorkspacePath(parentMeta.projectPath, parentMeta.name));
+
+    const taskRuntimeMode = getRuntimeType(taskRuntimeConfig);
+    const parentIsMultiProject = (parentMeta.projects?.length ?? 0) > 1;
+    return {
+      parentRuntimeConfig,
+      taskRuntimeConfig,
+      runtime,
+      parentWorkspacePath,
+      taskRuntimeMode,
+      parentIsMultiProject,
+    };
+  }
+
+  /** Decides whether the task shares the parent's checkout (isolation: "none" or a scratch parent). */
+  private resolveSharedTaskWorkspace(
+    args: TaskCreateArgs,
+    parentIsScratch: boolean,
+    parentRuntime: ReservationParentRuntime
+  ): Result<
+    Pick<PreparedTaskReservation, "sharedWorkspacePath"> & { useSharedWorkspace: boolean },
+    string
+  > {
+    const { taskRuntimeMode, parentIsMultiProject, parentWorkspacePath } = parentRuntime;
+    // isolation: "none" — same gating as create(): only worktree/SSH single-project parents
+    // share the parent checkout; multi-project parents on those runtimes are refused (see
+    // MULTI_PROJECT_SHARED_ISOLATION_ERROR); everything else falls back to the normal fork path.
+    if (
+      args.isolation === "none" &&
+      runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+      parentIsMultiProject
+    ) {
+      return Err(`Task.createMany: ${MULTI_PROJECT_SHARED_ISOLATION_ERROR}`);
+    }
+    const useSharedWorkspace =
+      parentIsScratch ||
+      (args.isolation === "none" &&
+        runtimeModeSupportsSharedTaskWorkspace(taskRuntimeMode) &&
+        !parentIsMultiProject);
+    const sharedWorkspacePath = useSharedWorkspace ? parentWorkspacePath : undefined;
+    return Ok({ useSharedWorkspace, sharedWorkspacePath });
   }
 
   /**
