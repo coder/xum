@@ -1295,6 +1295,8 @@ interface DeferredDescendantRedelivery {
   attempt: number;
   /** Set by the dispatch when the target is still streaming without a task execution. */
   deferAgain: boolean;
+  /** Whether the target was archived at the original send (see DeferredDescendantMessage). */
+  archivedAtSend: boolean;
 }
 
 /** A trusted descendant message whose delivery waits for an idle target (F54). */
@@ -1306,6 +1308,11 @@ interface DeferredDescendantMessage {
   sender: "ancestor" | "sibling";
   options: TrustedDescendantMessageOptions | undefined;
   stopFence: ReadonlyMap<string, number>;
+  /**
+   * F203: a send to an archived task unarchives it on purpose. An archive that lands during the
+   * wait is a later user decision than the message, so, like a Stop, it wins over the redelivery.
+   */
+  archivedAtSend: boolean;
 }
 
 function resolveDescendantMessageStopFence(
@@ -9015,7 +9022,15 @@ export class TaskService implements AgentTaskIntegration {
         const inactive =
           !continuationActive &&
           isInactiveAgentTaskStatus(entry.workspace.taskStatus, legacyArchived);
-        if (this.deferDescendantMessage(deferral, inactive)) {
+        if (options?.redelivery != null && legacyArchived && !options.redelivery.archivedAtSend) {
+          return Err({
+            code: "not_active" as const,
+            taskStatus: entry.workspace.taskStatus ?? "unknown",
+            message: "Task workspace was archived while the message waited for its stream to end.",
+          });
+        }
+        const archivedAtSend = options?.redelivery?.archivedAtSend ?? legacyArchived;
+        if (this.deferDescendantMessage({ ...deferral, archivedAtSend }, inactive)) {
           return Ok({ delivery: "queued" as const, queueDispatchMode });
         }
         if (inactive && !this.aiService.isStreaming(taskId)) {
@@ -9206,7 +9221,12 @@ export class TaskService implements AgentTaskIntegration {
       for (let attempt = 0; ; attempt++) {
         if (waitForIdle) await this.workspaceService.waitForIdleAndNoQueuedMessages(params.taskId);
         waitForIdle = true;
-        const redelivery = { stopFence: params.stopFence, attempt, deferAgain: false };
+        const redelivery = {
+          stopFence: params.stopFence,
+          attempt,
+          deferAgain: false,
+          archivedAtSend: params.archivedAtSend,
+        };
         const result = await this.dispatchTrustedDescendantMessage(
           params.ancestorWorkspaceId,
           params.taskId,
