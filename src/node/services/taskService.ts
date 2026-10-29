@@ -1411,14 +1411,59 @@ interface PeerSendRefusals {
   readonly interrupted: PeerSendRefusal;
 }
 
-/** A peer send's facts, read once under the target's admission lock (see sendTreeMessage). */
-interface PeerSendRoute {
+/** One send's refusals: each send makes its own set (see PeerSendRefusals). */
+function createPeerSendRefusals(): PeerSendRefusals {
+  return {
+    unrelatedRuntime: {
+      code: "refused",
+      reason: "Unrelated messages require local or worktree runtimes on both endpoints.",
+    },
+    senderInactive: {
+      code: "refused",
+      reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
+    },
+    delegatedRootStarting: {
+      code: "refused",
+      reason: "The target is starting or switching a delegated workspace turn; retry shortly.",
+    },
+    // Marks a message that waits for the delegated turn. Returned to the sender only when the
+    // turn started while the send was already being admitted and its rows may be durable.
+    awaitDelegatedTurn: {
+      code: "refused",
+      reason:
+        "The target started a delegated workspace turn that another workspace owns; retry after it finishes.",
+    },
+    interrupted: {
+      code: "refused",
+      reason:
+        "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
+    },
+  };
+}
+
+/** The entry point named in sendTreeMessage's assertion message. */
+function treeMessageAssertionName(spec: TreeMessageSpec): string {
+  return spec.relation === "descendant"
+    ? "sendMessageToDescendantAgentTask"
+    : spec.relation === "peer"
+      ? "sendAgentTreeMessage"
+      : spec.relation === "parent-family"
+        ? "sendMessageToParentFromAgentTask"
+        : "sendMessageToSiblingAgentTask";
+}
+
+/** A peer send's request, read before the target's admission lock is taken. */
+interface PeerSendRequest {
   readonly spec: PeerTreeMessageSpec;
   readonly message: string;
   readonly senderWorkspaceId: string;
   readonly targetId: string;
   readonly relation: PeerTreeMessageSpec["targetRelation"];
   readonly awaitedDelegatedTurn: PeerDelegatedTurnWait | undefined;
+}
+
+/** A peer send's facts, read once under the target's admission lock (see sendTreeMessage). */
+interface PeerSendRoute extends PeerSendRequest {
   readonly index: AgentTaskIndex;
   readonly targetEntry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
   readonly senderEntry: NonNullable<ReturnType<typeof findWorkspaceEntry>>;
@@ -9544,14 +9589,7 @@ export class TaskService implements AgentTaskIntegration {
     spec: TreeMessageSpec
   ): Promise<Result<TreeMessagePipelineResult, TreeMessagePipelineError>> {
     const message = spec.message.trim();
-    const assertionName =
-      spec.relation === "descendant"
-        ? "sendMessageToDescendantAgentTask"
-        : spec.relation === "peer"
-          ? "sendAgentTreeMessage"
-          : spec.relation === "parent-family"
-            ? "sendMessageToParentFromAgentTask"
-            : "sendMessageToSiblingAgentTask";
+    const assertionName = treeMessageAssertionName(spec);
     assert(message.length > 0, `${assertionName}: message must be non-empty`);
 
     if (spec.relation === "descendant") {
@@ -9582,161 +9620,169 @@ export class TaskService implements AgentTaskIntegration {
     }
 
     const { senderWorkspaceId, targetId, targetRelation: relation, awaitedDelegatedTurn } = spec;
-    return this.withPeerAdmissionLock(targetId, async () => {
-      if (awaitedDelegatedTurn != null) {
-        // A retry leaves the parked list only here, under the target's admission lock: removed
-        // earlier, it was counted nowhere while it waited for the lock, and a fresh send
-        // admitted meanwhile could push the queue past its cap (see flushParkedPeerSends).
-        this.peerSendParking.removeRetry(targetId, spec);
-      }
-      const cfg = this.config.loadConfigOrDefault();
-      const targetEntry = findWorkspaceEntry(cfg, targetId);
-      const senderEntry = findWorkspaceEntry(cfg, senderWorkspaceId);
-      if (!targetEntry || !senderEntry) {
-        return Err({ code: "not_found" as const });
-      }
-      const index = this.buildAgentTaskIndex(cfg);
+    const request: PeerSendRequest = {
+      spec,
+      message,
+      senderWorkspaceId,
+      targetId,
+      relation,
+      awaitedDelegatedTurn,
+    };
+    // Every peer step runs inside both admission locks and none takes either again. The
+    // callback returns the step chain's promise, so the locks release when the send settles.
+    return this.withPeerAdmissionLock(targetId, () => this.admitPeerSendUnderLock(request));
+  }
 
-      // Re-verify under the target's event lock: tree membership may have changed since routing.
-      if (
-        this.resolveAgentTreeTargetRelation(cfg, index.parentById, senderWorkspaceId, targetId) !==
-        relation
-      ) {
-        return Err({ code: "invalid_scope" as const });
-      }
+  /** The peer send under the target's admission locks (see withPeerAdmissionLock). */
+  private async admitPeerSendUnderLock(request: PeerSendRequest): Promise<PeerSendResult> {
+    const route = this.resolvePeerSendRoute(request);
+    if (!route.success) {
+      return route;
+    }
+    const refusal =
+      this.refusePeerSendByEndpoint(route.data) ??
+      this.refusePeerSendByIsolation(route.data) ??
+      this.refusePeerSendByArchive(route.data);
+    if (refusal != null) {
+      return Err(refusal);
+    }
+    const admitted = this.admitPeerSendToTarget(route.data);
+    if (!admitted.success) {
+      return admitted;
+    }
+    return this.checkPeerTargetCheckout(admitted.data.admission, admitted.data.attempt);
+  }
 
-      // Recipient consent is separate from knowing its ID. Refuse before exposing target state,
-      // using the same response as an unknown workspace.
-      const unrelatedConsent = getValidUnrelatedWorkspaceConsent(
-        targetEntry.workspace.unrelatedWorkspaceConsent
-      );
-      // A retry after a delegated turn needs the grant it was first admitted under: an off/on
-      // cycle is a new grant, not permission to revive input admitted before it.
-      if (this.unrelatedConsentRevoked(relation, unrelatedConsent, awaitedDelegatedTurn)) {
-        return Err({ code: "not_found" as const });
-      }
-      // Same rule for tag links: both endpoints' generations are captured here and in
-      // the parked wait, so restoring the same tag string after a revocation is a new
-      // link and cannot revive a message admitted under the previous one.
-      const tagGenerations = this.messagingTagGenerationsOf(
-        senderEntry.workspace,
-        targetEntry.workspace
-      );
-      if (
-        awaitedDelegatedTurn != null &&
-        this.tagGenerationMismatch(relation, awaitedDelegatedTurn.tagGenerations, tagGenerations)
-      ) {
-        return Err({ code: "invalid_scope" as const });
-      }
+  /**
+   * Reads both endpoints under the lock and re-verifies the relation and the link the send was
+   * routed under.
+   */
+  private resolvePeerSendRoute(
+    request: PeerSendRequest
+  ): Result<PeerSendRoute, SendAgentTreeMessageError> {
+    const { spec, senderWorkspaceId, targetId, relation, awaitedDelegatedTurn } = request;
+    if (awaitedDelegatedTurn != null) {
+      // A retry leaves the parked list only here, under the target's admission lock: removed
+      // earlier, it was counted nowhere while it waited for the lock, and a fresh send
+      // admitted meanwhile could push the queue past its cap (see flushParkedPeerSends).
+      this.peerSendParking.removeRetry(targetId, spec);
+    }
+    const cfg = this.config.loadConfigOrDefault();
+    const targetEntry = findWorkspaceEntry(cfg, targetId);
+    const senderEntry = findWorkspaceEntry(cfg, senderWorkspaceId);
+    if (!targetEntry || !senderEntry) {
+      return Err({ code: "not_found" as const });
+    }
+    const index = this.buildAgentTaskIndex(cfg);
 
-      const unrelatedRuntimeRefusal = {
-        code: "refused" as const,
-        reason: "Unrelated messages require local or worktree runtimes on both endpoints.",
-      };
-      // Preserve remote/container isolation without changing the existing same-tree policy.
-      if (
-        relation === "target_unrelated" &&
-        (!this.isUnrelatedMessagingEndpoint(senderEntry.workspace) ||
-          !this.isUnrelatedMessagingEndpoint(targetEntry.workspace))
-      ) {
-        return Err(unrelatedRuntimeRefusal);
-      }
+    // Re-verify under the target's event lock: tree membership may have changed since routing.
+    if (
+      this.resolveAgentTreeTargetRelation(cfg, index.parentById, senderWorkspaceId, targetId) !==
+      relation
+    ) {
+      return Err({ code: "invalid_scope" as const });
+    }
 
-      // Terminal and archived senders cannot wake peers. A reawakened child may send only while
-      // its mirrored workspace-turn execution is running and backed by an accepted live handle;
-      // queued/starting reservations still belong to the previous terminal execution.
-      const senderInactiveRefusal = {
-        code: "refused" as const,
-        reason: "Sender is no longer active; terminal or archived tasks cannot send peer messages.",
-      };
-      if (this.isInactivePeerMessagingEndpoint(senderEntry.workspace, senderWorkspaceId)) {
-        return Err(senderInactiveRefusal);
-      }
+    // Recipient consent is separate from knowing its ID. Refuse before exposing target state,
+    // using the same response as an unknown workspace.
+    const unrelatedConsent = getValidUnrelatedWorkspaceConsent(
+      targetEntry.workspace.unrelatedWorkspaceConsent
+    );
+    // A retry after a delegated turn needs the grant it was first admitted under: an off/on
+    // cycle is a new grant, not permission to revive input admitted before it.
+    if (this.unrelatedConsentRevoked(relation, unrelatedConsent, awaitedDelegatedTurn)) {
+      return Err({ code: "not_found" as const });
+    }
+    // Same rule for tag links: both endpoints' generations are captured here and in
+    // the parked wait, so restoring the same tag string after a revocation is a new
+    // link and cannot revive a message admitted under the previous one.
+    const tagGenerations = this.messagingTagGenerationsOf(
+      senderEntry.workspace,
+      targetEntry.workspace
+    );
+    if (
+      awaitedDelegatedTurn != null &&
+      this.tagGenerationMismatch(relation, awaitedDelegatedTurn.tagGenerations, tagGenerations)
+    ) {
+      return Err({ code: "invalid_scope" as const });
+    }
 
-      // Workflow-owned endpoints exchange I/O through WorkflowRunner's journal; peer messages
-      // would break durable replay (same rationale as reportAgentProgress's early return).
-      if (
-        this.isWorkflowOwnedTaskUsingIndex(index, senderWorkspaceId) ||
-        this.isWorkflowOwnedTaskUsingIndex(index, targetId)
-      ) {
-        return Err({
-          code: "refused" as const,
-          reason: "Workflow-owned tasks cannot send or receive peer messages.",
-        });
-      }
-
-      // Best-of candidates (and their subtrees) must stay independent: sibling↔candidate would
-      // break candidate independence and candidate→ancestor would lobby the selecting parent
-      // mid-run. Only the existing ancestor→candidate guidance path is allowed.
-      if (
-        this.isBestOfChainUsingIndex(index, senderWorkspaceId) ||
-        this.isBestOfChainUsingIndex(index, targetId)
-      ) {
-        return Err({
-          code: "refused" as const,
-          reason: "Best-of candidates cannot send or receive peer messages.",
-        });
-      }
-
-      const targetUnavailable =
-        targetEntry.workspace.pendingRemoval != null ||
-        isWorkspaceArchived(targetEntry.workspace.archivedAt, targetEntry.workspace.unarchivedAt);
-      if (targetUnavailable) {
-        return Err({
-          code: "not_active" as const,
-          taskStatus: targetEntry.workspace.taskStatus ?? "unknown",
-          message:
-            "Target workspace is archived or being removed; it cannot receive peer messages.",
-        });
-      }
-
+    return Ok({
+      ...request,
+      index,
+      targetEntry,
+      senderEntry,
+      unrelatedConsent,
+      tagGenerations,
       // Roots may start an idle turn. Agent-task targets must already be live: peers cannot own
       // queued prompts or reactivate terminal tasks without rerouting their report ownership.
-      const targetIsAgentTask =
-        coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
-      const delegatedRootStartingRefusal = {
-        code: "refused" as const,
-        reason: "The target is starting or switching a delegated workspace turn; retry shortly.",
-      };
-      // Marks a message that waits for the delegated turn. Returned to the sender only when the
-      // turn started while the send was already being admitted and its rows may be durable.
-      const awaitDelegatedTurn = {
-        code: "refused" as const,
-        reason:
-          "The target started a delegated workspace turn that another workspace owns; retry after it finishes.",
-      };
-      const interruptedRefusal = {
-        code: "refused" as const,
-        reason:
-          "Target was interrupted by the user and will not accept agent messages until the user resumes it.",
-      };
-      const route: PeerSendRoute = {
-        spec,
-        message,
-        senderWorkspaceId,
-        targetId,
-        relation,
-        awaitedDelegatedTurn,
-        index,
-        targetEntry,
-        senderEntry,
-        unrelatedConsent,
-        tagGenerations,
-        targetIsAgentTask,
-        refusals: {
-          unrelatedRuntime: unrelatedRuntimeRefusal,
-          senderInactive: senderInactiveRefusal,
-          delegatedRootStarting: delegatedRootStartingRefusal,
-          awaitDelegatedTurn,
-          interrupted: interruptedRefusal,
-        },
-      };
-      const admitted = this.admitPeerSendToTarget(route);
-      if (!admitted.success) {
-        return admitted;
-      }
-      return this.checkPeerTargetCheckout(admitted.data.admission, admitted.data.attempt);
+      targetIsAgentTask: coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null,
+      refusals: createPeerSendRefusals(),
     });
+  }
+
+  private refusePeerSendByEndpoint(route: PeerSendRoute): SendAgentTreeMessageError | null {
+    const { senderWorkspaceId, relation, targetEntry, senderEntry, refusals } = route;
+    // Preserve remote/container isolation without changing the existing same-tree policy.
+    if (
+      relation === "target_unrelated" &&
+      (!this.isUnrelatedMessagingEndpoint(senderEntry.workspace) ||
+        !this.isUnrelatedMessagingEndpoint(targetEntry.workspace))
+    ) {
+      return refusals.unrelatedRuntime;
+    }
+
+    // Terminal and archived senders cannot wake peers. A reawakened child may send only while
+    // its mirrored workspace-turn execution is running and backed by an accepted live handle;
+    // queued/starting reservations still belong to the previous terminal execution.
+    if (this.isInactivePeerMessagingEndpoint(senderEntry.workspace, senderWorkspaceId)) {
+      return refusals.senderInactive;
+    }
+    return null;
+  }
+
+  private refusePeerSendByIsolation(route: PeerSendRoute): SendAgentTreeMessageError | null {
+    const { senderWorkspaceId, targetId, index } = route;
+    // Workflow-owned endpoints exchange I/O through WorkflowRunner's journal; peer messages
+    // would break durable replay (same rationale as reportAgentProgress's early return).
+    if (
+      this.isWorkflowOwnedTaskUsingIndex(index, senderWorkspaceId) ||
+      this.isWorkflowOwnedTaskUsingIndex(index, targetId)
+    ) {
+      return {
+        code: "refused" as const,
+        reason: "Workflow-owned tasks cannot send or receive peer messages.",
+      };
+    }
+
+    // Best-of candidates (and their subtrees) must stay independent: sibling↔candidate would
+    // break candidate independence and candidate→ancestor would lobby the selecting parent
+    // mid-run. Only the existing ancestor→candidate guidance path is allowed.
+    if (
+      this.isBestOfChainUsingIndex(index, senderWorkspaceId) ||
+      this.isBestOfChainUsingIndex(index, targetId)
+    ) {
+      return {
+        code: "refused" as const,
+        reason: "Best-of candidates cannot send or receive peer messages.",
+      };
+    }
+    return null;
+  }
+
+  private refusePeerSendByArchive(route: PeerSendRoute): SendAgentTreeMessageError | null {
+    const { targetEntry } = route;
+    const targetUnavailable =
+      targetEntry.workspace.pendingRemoval != null ||
+      isWorkspaceArchived(targetEntry.workspace.archivedAt, targetEntry.workspace.unarchivedAt);
+    if (targetUnavailable) {
+      return {
+        code: "not_active" as const,
+        taskStatus: targetEntry.workspace.taskStatus ?? "unknown",
+        message: "Target workspace is archived or being removed; it cannot receive peer messages.",
+      };
+    }
+    return null;
   }
 
   /**
