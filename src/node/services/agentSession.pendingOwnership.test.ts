@@ -2,7 +2,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "events";
 import { readFile } from "fs/promises";
 import * as path from "path";
-import { createMuxMessage } from "@/common/types/message";
+import { createMuxMessage, type MuxMessage } from "@/common/types/message";
 import { Ok } from "@/common/types/result";
 import type { StreamEndEvent } from "@/common/types/stream";
 import assert from "@/common/utils/assert";
@@ -19,7 +19,7 @@ interface SessionAccess {
   pendingPostCompactionStateToAcknowledge: Awaited<
     ReturnType<CompactionHandler["peekPendingState"]>
   >;
-  consumePendingPostCompactionState(): Promise<void>;
+  consumePendingPostCompactionState(history: readonly MuxMessage[]): Promise<void>;
   clearStartupAutoRetryAbandon(): Promise<void>;
   maybeRetryCompactionOnContextExceeded(): Promise<boolean>;
 }
@@ -148,7 +148,7 @@ describe("pending snapshot consumers", () => {
         policy = result.value;
         await publish("b");
         // A successor request captures B while A's policy is suspended. A retains its entry value.
-        await session.consumePendingPostCompactionState();
+        await session.consumePendingPostCompactionState([]);
         expect(
           session.pendingPostCompactionStateToAcknowledge?.diffs.some(
             (diff) => diff.path === "/b.ts"
