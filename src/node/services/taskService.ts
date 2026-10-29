@@ -1428,10 +1428,14 @@ interface PeerSendRoute {
   readonly refusals: PeerSendRefusals;
 }
 
-/** The route plus the stop baselines a peer send latched before its first await. */
-interface PeerSendAdmission extends PeerSendRoute {
+/** Both endpoints of a peer send with their ancestors, each endpoint first. */
+interface PeerSendChains {
   readonly targetChainIds: string[];
   readonly senderChainIds: string[];
+}
+
+/** The route plus the stop baselines a peer send latched before its first await. */
+interface PeerSendAdmission extends PeerSendRoute, PeerSendChains {
   readonly capturedStopEpochs: Map<string, number>;
   readonly capturedUserStopEpoch: number;
   readonly firstAttempt: boolean;
@@ -9690,27 +9694,6 @@ export class TaskService implements AgentTaskIntegration {
       // queued prompts or reactivate terminal tasks without rerouting their report ownership.
       const targetIsAgentTask =
         coerceNonEmptyString(targetEntry.workspace.parentWorkspaceId) != null;
-      // A root running a delegated workspace turn stays owner-only (#4997). Only the turn's OWNER
-      // may CONTINUE it (correlation resolved below): the owner already steers the turn through
-      // follow-ups. Any other sender, an opted-in unrelated root or a same-tree descendant, waits
-      // until the turn settles and then runs as its own turn under the recipient's saved agent:
-      // continuing the turn would run under the recipient's saved agent rather than the owner's
-      // per-turn override (handle records do not store it) and land in the owner's result. Even
-      // the owner is refused while the turn is only reserved (its requireIdle send has not passed
-      // admission) or when the live handle no longer matches the resolved correlation:
-      // dispatched uncorrelated, such a wake would steal the reserved turn or settle the owner's
-      // turn as superseded. Agent-task targets are excluded: a reawakened child's execution is its
-      // own task run under its own agent, and once it settles the child is terminal, which peers
-      // cannot reactivate.
-      // Process-local courtesy: another backend's delegated turn is invisible here (#4446; see
-      // CONCURRENT BACKENDS in processLiveness.ts).
-      const attempt: PeerSendAttempt = {
-        delegatedTurnCorrelation: "unresolved",
-        admissionRefusal: null,
-        refusedAtRegistrationEpoch: undefined,
-        parkedThisAttempt: false,
-        accepted: false,
-      };
       const delegatedRootStartingRefusal = {
         code: "refused" as const,
         reason: "The target is starting or switching a delegated workspace turn; retry shortly.",
@@ -9748,104 +9731,165 @@ export class TaskService implements AgentTaskIntegration {
           interrupted: interruptedRefusal,
         },
       };
-      if (this.delegatedRootRefusalOf(route, attempt) === delegatedRootStartingRefusal) {
-        return Err(delegatedRootStartingRefusal);
+      const admitted = this.admitPeerSendToTarget(route);
+      if (!admitted.success) {
+        return admitted;
       }
-      if (targetIsAgentTask) {
-        const targetStatus = targetEntry.workspace.taskStatus ?? "running";
-        // Match task_list's effective-running overlay, but require accepted correlation so a
-        // queued reawakening cannot be converted into an unowned peer continuation.
-        const targetExecutionActive = this.hasLiveRunningExecution(targetEntry.workspace, targetId);
-        if (!targetExecutionActive) {
-          if (targetStatus === "queued" || targetStatus === "starting") {
-            return Err({
-              code: "not_active" as const,
-              taskStatus: targetStatus,
-              message:
-                "Target has not started yet; only its parent may update a queued task's prompt.",
-            });
-          }
-          // Stable terminal status wins even while the old stream winds down, or a queued peer
-          // trigger could dispatch after completion and reactivate the task.
-          if (targetStatus !== "running" && targetStatus !== "awaiting_report") {
-            return Err({
-              code: "not_active" as const,
-              taskStatus: targetStatus,
-              message: "Target is inactive; peer messages cannot reactivate it — ask its parent.",
-            });
-          }
+      return this.checkPeerTargetCheckout(admitted.data.admission, admitted.data.attempt);
+    });
+  }
+
+  /**
+   * Admits a routed peer send to its target: the delegated-turn, agent-status and stop gates,
+   * then the stop baselines the admission probe compares against.
+   */
+  private admitPeerSendToTarget(
+    route: PeerSendRoute
+  ): Result<{ admission: PeerSendAdmission; attempt: PeerSendAttempt }, SendAgentTreeMessageError> {
+    const { refusals } = route;
+    // A root running a delegated workspace turn stays owner-only (#4997). Only the turn's OWNER
+    // may CONTINUE it (correlation resolved below): the owner already steers the turn through
+    // follow-ups. Any other sender, an opted-in unrelated root or a same-tree descendant, waits
+    // until the turn settles and then runs as its own turn under the recipient's saved agent:
+    // continuing the turn would run under the recipient's saved agent rather than the owner's
+    // per-turn override (handle records do not store it) and land in the owner's result. Even
+    // the owner is refused while the turn is only reserved (its requireIdle send has not passed
+    // admission) or when the live handle no longer matches the resolved correlation:
+    // dispatched uncorrelated, such a wake would steal the reserved turn or settle the owner's
+    // turn as superseded. Agent-task targets are excluded: a reawakened child's execution is its
+    // own task run under its own agent, and once it settles the child is terminal, which peers
+    // cannot reactivate.
+    // Process-local courtesy: another backend's delegated turn is invisible here (#4446; see
+    // CONCURRENT BACKENDS in processLiveness.ts).
+    const attempt: PeerSendAttempt = {
+      delegatedTurnCorrelation: "unresolved",
+      admissionRefusal: null,
+      refusedAtRegistrationEpoch: undefined,
+      parkedThisAttempt: false,
+      accepted: false,
+    };
+    if (this.delegatedRootRefusalOf(route, attempt) === refusals.delegatedRootStarting) {
+      return Err(refusals.delegatedRootStarting);
+    }
+    const statusRefusal = this.refusePeerSendByAgentStatus(route);
+    if (statusRefusal != null) {
+      return Err(statusRefusal);
+    }
+    const chains = this.resolvePeerSendChains(route);
+    if (!chains.success) {
+      return chains;
+    }
+    return Ok({ admission: this.capturePeerStopEpochs(route, chains.data), attempt });
+  }
+
+  private refusePeerSendByAgentStatus(route: PeerSendRoute): SendAgentTreeMessageError | null {
+    const { targetId, targetEntry } = route;
+    if (route.targetIsAgentTask) {
+      const targetStatus = targetEntry.workspace.taskStatus ?? "running";
+      // Match task_list's effective-running overlay, but require accepted correlation so a
+      // queued reawakening cannot be converted into an unowned peer continuation.
+      const targetExecutionActive = this.hasLiveRunningExecution(targetEntry.workspace, targetId);
+      if (!targetExecutionActive) {
+        if (targetStatus === "queued" || targetStatus === "starting") {
+          return {
+            code: "not_active" as const,
+            taskStatus: targetStatus,
+            message:
+              "Target has not started yet; only its parent may update a queued task's prompt.",
+          };
+        }
+        // Stable terminal status wins even while the old stream winds down, or a queued peer
+        // trigger could dispatch after completion and reactivate the task.
+        if (targetStatus !== "running" && targetStatus !== "awaiting_report") {
+          return {
+            code: "not_active" as const,
+            taskStatus: targetStatus,
+            message: "Target is inactive; peer messages cannot reactivate it — ask its parent.",
+          };
         }
       }
+    }
+    return null;
+  }
 
-      // A hard interrupt is an explicit user stop: markParentWorkspaceInterrupted suppresses
-      // auto-resume until real user input, and an agent message racing that cascade must not
-      // undo the stop by queueing or starting another turn on the interrupted workspace. The
-      // suppression set holds the ANCESTOR the user interrupted, so check the target's whole
-      // ancestor chain — the termination cascade may not have reached a lower target yet.
-      const targetChainIds = [
-        targetId,
-        ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, targetId),
-      ];
-      if (this.isPeerChainInterrupted(targetChainIds)) {
-        return Err(interruptedRefusal);
-      }
+  /** Both endpoints' ancestor chains, refused when the user interrupted or is stopping one. */
+  private resolvePeerSendChains(
+    route: PeerSendRoute
+  ): Result<PeerSendChains, SendAgentTreeMessageError> {
+    const { senderWorkspaceId, targetId, index, refusals } = route;
+    // A hard interrupt is an explicit user stop: markParentWorkspaceInterrupted suppresses
+    // auto-resume until real user input, and an agent message racing that cascade must not
+    // undo the stop by queueing or starting another turn on the interrupted workspace. The
+    // suppression set holds the ANCESTOR the user interrupted, so check the target's whole
+    // ancestor chain — the termination cascade may not have reached a lower target yet.
+    const targetChainIds = [
+      targetId,
+      ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, targetId),
+    ];
+    if (this.isPeerChainInterrupted(targetChainIds)) {
+      return Err(refusals.interrupted);
+    }
 
-      // A user stop on any of the SENDER's ancestors also invalidates this send: the descendant
-      // interruption cascade may not have reached the sender yet (its status still reads
-      // running), but a prompt-influenced agent in a stopped subtree must not wake workspaces
-      // outside it from its winding-down tool call.
-      const senderChainIds = [
-        senderWorkspaceId,
-        ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, senderWorkspaceId),
-      ];
-      if (this.isPeerChainInterrupted(senderChainIds)) {
-        return Err(senderInactiveRefusal);
-      }
+    // A user stop on any of the SENDER's ancestors also invalidates this send: the descendant
+    // interruption cascade may not have reached the sender yet (its status still reads
+    // running), but a prompt-influenced agent in a stopped subtree must not wake workspaces
+    // outside it from its winding-down tool call.
+    const senderChainIds = [
+      senderWorkspaceId,
+      ...this.listAncestorWorkspaceIdsUsingParentById(index.parentById, senderWorkspaceId),
+    ];
+    if (this.isPeerChainInterrupted(senderChainIds)) {
+      return Err(refusals.senderInactive);
+    }
 
-      // In-progress stop latches: a send ENTERING after a stop's epoch bump would capture the
-      // post-bump generation as its clean baseline (making the epoch probe below blind to it)
-      // while the cascade is still persisting terminal statuses — the endpoints still read
-      // running. The level latch spans exactly that window; once released, the persisted
-      // statuses take over refusal. Target attribution wins on a shared stopped ancestor.
-      if (this.isPeerChainStopping(targetChainIds)) {
-        return Err(interruptedRefusal);
-      }
-      if (this.isPeerChainStopping(senderChainIds)) {
-        return Err(senderInactiveRefusal);
-      }
+    // In-progress stop latches: a send ENTERING after a stop's epoch bump would capture the
+    // post-bump generation as its clean baseline (making the epoch probe below blind to it)
+    // while the cascade is still persisting terminal statuses — the endpoints still read
+    // running. The level latch spans exactly that window; once released, the persisted
+    // statuses take over refusal. Target attribution wins on a shared stopped ancestor.
+    if (this.isPeerChainStopping(targetChainIds)) {
+      return Err(refusals.interrupted);
+    }
+    if (this.isPeerChainStopping(senderChainIds)) {
+      return Err(refusals.senderInactive);
+    }
+    return Ok({ targetChainIds, senderChainIds });
+  }
 
-      // Latch stop generations for the admission probe below: the suppression set and persisted
-      // statuses are level-triggered, so a Stop followed by a quick user resume BETWEEN probe
-      // evaluations (e.g. while a queued entry sits in PREPARING) would read as clean again. Any
-      // bump after this capture keeps the send stale forever — the resumed workspace belongs to
-      // the user, not to a wake admitted before the stop. Both endpoints' chains are captured;
-      // the per-chain probes attribute the refusal to the stopped side.
-      // A retry after a delegated turn keeps its first admission's generations; the target's was
-      // refreshed when the drain started (see flushParkedPeerSends).
-      assert(
-        awaitedDelegatedTurn == null || (targetChainIds.length === 1 && !targetIsAgentTask),
-        "only root targets wait for a delegated turn"
-      );
-      const capturedStopEpochs = new Map(
-        [...senderChainIds, ...targetChainIds].map((id) => [
-          id,
-          awaitedDelegatedTurn?.stopEpochs.get(id) ?? this.getWorkspaceStopEpoch(id),
-        ])
-      );
-      // Only a first attempt parks, and only root targets wait, so the target's own count is
-      // the one that matters (see park()).
-      const capturedUserStopEpoch = this.workspaceUserStopEpochs.get(targetId) ?? 0;
-      const admission: PeerSendAdmission = {
-        ...route,
-        targetChainIds,
-        senderChainIds,
-        capturedStopEpochs,
-        capturedUserStopEpoch,
-        firstAttempt: awaitedDelegatedTurn == null,
-      };
-
-      return this.checkPeerTargetCheckout(admission, attempt);
-    });
+  /**
+   * Latch stop generations for the admission probe: the suppression set and persisted
+   * statuses are level-triggered, so a Stop followed by a quick user resume BETWEEN probe
+   * evaluations (e.g. while a queued entry sits in PREPARING) would read as clean again. Any
+   * bump after this capture keeps the send stale forever — the resumed workspace belongs to
+   * the user, not to a wake admitted before the stop. Both endpoints' chains are captured;
+   * the per-chain probes attribute the refusal to the stopped side.
+   * A retry after a delegated turn keeps its first admission's generations; the target's was
+   * refreshed when the drain started (see flushParkedPeerSends).
+   */
+  private capturePeerStopEpochs(route: PeerSendRoute, chains: PeerSendChains): PeerSendAdmission {
+    const { targetId, awaitedDelegatedTurn } = route;
+    const { targetChainIds, senderChainIds } = chains;
+    assert(
+      awaitedDelegatedTurn == null || (targetChainIds.length === 1 && !route.targetIsAgentTask),
+      "only root targets wait for a delegated turn"
+    );
+    const capturedStopEpochs = new Map(
+      [...senderChainIds, ...targetChainIds].map((id) => [
+        id,
+        awaitedDelegatedTurn?.stopEpochs.get(id) ?? this.getWorkspaceStopEpoch(id),
+      ])
+    );
+    // Only a first attempt parks, and only root targets wait, so the target's own count is
+    // the one that matters (see park()).
+    const capturedUserStopEpoch = this.workspaceUserStopEpochs.get(targetId) ?? 0;
+    return {
+      ...route,
+      targetChainIds,
+      senderChainIds,
+      capturedStopEpochs,
+      capturedUserStopEpoch,
+      firstAttempt: awaitedDelegatedTurn == null,
+    };
   }
 
   /**
