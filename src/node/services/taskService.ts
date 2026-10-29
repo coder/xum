@@ -1744,6 +1744,18 @@ interface StartupRecoverySnapshot {
   readonly config: ProjectsConfig;
   readonly taskIndex: AgentTaskIndex;
   readonly states: ReadonlyMap<string | undefined, StartupRecoveryState>;
+  readonly awaitingReportTasks: readonly AgentTaskWorkspaceEntry[];
+  readonly runningTasks: readonly AgentTaskWorkspaceEntry[];
+}
+
+/** Whether shutdown aborted startup recovery; logs the stage it stopped before. */
+function startupRecoveryCancelled(
+  options: { signal?: AbortSignal } | undefined,
+  stage: string
+): boolean {
+  if (options?.signal?.aborted !== true) return false;
+  log.info("[startup] TaskService.recoverInterruptedTasks cancelled by shutdown", { stage });
+  return true;
 }
 
 /**
@@ -4420,19 +4432,8 @@ export class TaskService implements AgentTaskIntegration {
    */
   async recoverInterruptedTasks(options?: { signal?: AbortSignal }): Promise<void> {
     const startupStartedAt = Date.now();
-    const cancelled = (stage: string): boolean => {
-      if (options?.signal?.aborted !== true) return false;
-      log.info("[startup] TaskService.recoverInterruptedTasks cancelled by shutdown", { stage });
-      return true;
-    };
     const startupConfig = this.config.loadConfigOrDefault();
-    const queuedTaskCountAtStartup = this.listAgentTaskWorkspaces(startupConfig).filter(
-      (task) => task.taskStatus === "queued" && typeof task.id === "string"
-    ).length;
-
-    log.info("[startup] TaskService.recoverInterruptedTasks starting", {
-      queuedTaskCountAtStartup,
-    });
+    this.logStartupRecoveryStarting(startupConfig);
 
     await this.getWorkspaceTurnManager().reconcileAgentTaskExecutionIds();
 
@@ -4446,6 +4447,92 @@ export class TaskService implements AgentTaskIntegration {
     // fencing treats the other backend's execution as superseded.
     const inUseElsewhere = await this.findTasksInUseByOtherBackends(startupConfig);
 
+    await this.recoverStaleStartingTasks(startupConfig, inUseElsewhere);
+    await this.interruptStartupTasksOfInactiveWorkflows(inUseElsewhere);
+    const candidates = this.listStartupRedriveCandidates(
+      this.config.loadConfigOrDefault(),
+      inUseElsewhere
+    );
+    const states = new Map(
+      await Promise.all(
+        candidates.map(
+          async (task) =>
+            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
+            [task.id, await this.workspaceService.getStartupRecoveryState(task.id!)] as const
+        )
+      )
+    );
+    await this.settleStoppedStartupTasks(candidates, states);
+
+    // Normalize stopped capacity before launching siblings; newly launched work is not part of
+    // the recovery snapshot and must never be interrupted by an old Stop or opt-out.
+    // Scheduled, not awaited: launches are ordinary runtime work that already races clients
+    // (reservation is a CAS on `queued`), and the re-drives below only touch snapshot candidates.
+    if (startupRecoveryCancelled(options, "queue-drain")) return;
+    // The drain sweeps stale workspace turns even with an empty queue (see the field's comment).
+    this.staleTurnSweepRequestedGeneration += 1;
+    this.scheduleMaybeStartQueuedTasks();
+
+    const snapshot = this.loadStartupRecoverySnapshot(inUseElsewhere, states);
+    const tally: StartupRecoveryTally = {
+      resumedAwaitingReportCount: 0,
+      skippedAwaitingReportDueToActiveDescendants: 0,
+      skippedAwaitingReportAlreadyBusy: 0,
+      failedAwaitingReportCount: 0,
+      resumedRunningCount: 0,
+      skippedRunningDueToActiveDescendants: 0,
+      skippedRunningAlreadyStreaming: 0,
+      failedRunningCount: 0,
+    };
+
+    for (const task of snapshot.awaitingReportTasks) {
+      if (!task.id) continue;
+      if (startupRecoveryCancelled(options, "awaiting-report")) return;
+      await this.resumeAwaitingReportTask(task.id, task, snapshot, tally);
+    }
+
+    for (const task of snapshot.runningTasks) {
+      if (!task.id) continue;
+      if (startupRecoveryCancelled(options, "running")) return;
+      await this.resumeRunningTask(task.id, task, snapshot, tally);
+    }
+
+    log.info("[startup] TaskService.recoverInterruptedTasks completed", {
+      totalMs: Date.now() - startupStartedAt,
+      skippedInUseElsewhereCount: inUseElsewhere.size,
+      awaitingReportTaskCount: snapshot.awaitingReportTasks.length,
+      resumedAwaitingReportCount: tally.resumedAwaitingReportCount,
+      skippedAwaitingReportDueToActiveDescendants:
+        tally.skippedAwaitingReportDueToActiveDescendants,
+      skippedAwaitingReportAlreadyBusy: tally.skippedAwaitingReportAlreadyBusy,
+      failedAwaitingReportCount: tally.failedAwaitingReportCount,
+      runningTaskCount: snapshot.runningTasks.length,
+      resumedRunningCount: tally.resumedRunningCount,
+      skippedRunningDueToActiveDescendants: tally.skippedRunningDueToActiveDescendants,
+      skippedRunningAlreadyStreaming: tally.skippedRunningAlreadyStreaming,
+      failedRunningCount: tally.failedRunningCount,
+    });
+  }
+
+  /** Logs the start of recoverInterruptedTasks with the number of queued tasks it found. */
+  private logStartupRecoveryStarting(startupConfig: ProjectsConfig): void {
+    const queuedTaskCountAtStartup = this.listAgentTaskWorkspaces(startupConfig).filter(
+      (task) => task.taskStatus === "queued" && typeof task.id === "string"
+    ).length;
+
+    log.info("[startup] TaskService.recoverInterruptedTasks starting", {
+      queuedTaskCountAtStartup,
+    });
+  }
+
+  /**
+   * Requeues the `starting` rows of startupConfig that no other backend uses: a launch that the
+   * previous process left there. A row whose stream is still live becomes `running` instead.
+   */
+  private async recoverStaleStartingTasks(
+    startupConfig: ProjectsConfig,
+    inUseElsewhere: ReadonlySet<string>
+  ): Promise<void> {
     const staleStartingTasks = this.listAgentTaskWorkspaces(startupConfig).filter(
       (task) =>
         task.taskStatus === "starting" &&
@@ -4459,45 +4546,61 @@ export class TaskService implements AgentTaskIntegration {
         const isStreaming = this.aiService.isStreaming(task.id);
         const acceptedPrompt = !isStreaming && (await this.hasAcceptedInitialTaskPrompt(task));
         if (acceptedPrompt) acceptedPromptCount += 1;
-        try {
-          await this.editActiveWorkspaceEntry(
-            task.id,
-            (workspace) => {
-              if (workspace.taskStatus !== "starting") return;
-              // Only the reservation the lease scan judged: a row re-admitted under a new attempt
-              // since is that launch's, and its lease was published after the scan.
-              if (workspace.taskAttemptId !== task.taskAttemptId) return;
-              workspace.taskStatus = isStreaming ? "running" : "queued";
-              // A `starting` entry found at startup may already have an admitted execution in
-              // another process. The relaunch would otherwise look exactly like a never-launched
-              // reservation, so mark the lineage unproven: the drain's launcher owns it in memory
-              // but can never vouch for it across processes.
-              workspace.taskAttemptUnproven = true;
-              // History already owns accepted prompts; do not duplicate them on restart.
-              if (acceptedPrompt) {
-                workspace.taskPrompt = undefined;
-                workspace.taskPromptSendId = undefined;
-              }
-            },
-            { allowMissing: true }
-          );
-        } catch (error) {
-          await this.markTaskLaunchFailed(task.id, getErrorMessage(error));
-        }
+        await this.requeueStaleStartingTask(task.id, task, isStreaming, acceptedPrompt);
       }
       log.info("[startup] Recovered stale starting agent tasks", {
         count: staleStartingTasks.length,
         acceptedPromptCount,
       });
     }
+  }
 
-    let config = this.config.loadConfigOrDefault();
-    let taskIndex = this.buildAgentTaskIndex(config);
-    const startupTasks = () =>
-      this.listAgentTaskWorkspaces(config).filter((task) =>
-        isStartupRedriveCandidate(task, inUseElsewhere)
+  /**
+   * Requeues one stale `starting` row under the attempt the lease scan judged (`task`, the
+   * startupConfig row). A failed write marks the task's launch failed.
+   */
+  private async requeueStaleStartingTask(
+    taskId: string,
+    task: AgentTaskWorkspaceEntry,
+    isStreaming: boolean,
+    acceptedPrompt: boolean
+  ): Promise<void> {
+    try {
+      await this.editActiveWorkspaceEntry(
+        taskId,
+        (workspace) => {
+          if (workspace.taskStatus !== "starting") return;
+          // Only the reservation the lease scan judged: a row re-admitted under a new attempt
+          // since is that launch's, and its lease was published after the scan.
+          if (workspace.taskAttemptId !== task.taskAttemptId) return;
+          workspace.taskStatus = isStreaming ? "running" : "queued";
+          // A `starting` entry found at startup may already have an admitted execution in
+          // another process. The relaunch would otherwise look exactly like a never-launched
+          // reservation, so mark the lineage unproven: the drain's launcher owns it in memory
+          // but can never vouch for it across processes.
+          workspace.taskAttemptUnproven = true;
+          // History already owns accepted prompts; do not duplicate them on restart.
+          if (acceptedPrompt) {
+            workspace.taskPrompt = undefined;
+            workspace.taskPromptSendId = undefined;
+          }
+        },
+        { allowMissing: true }
       );
+    } catch (error) {
+      await this.markTaskLaunchFailed(taskId, getErrorMessage(error));
+    }
+  }
 
+  /**
+   * Startup prepass: interrupts the recovery of every active task whose workflow owner is
+   * inactive, before any task is settled or re-driven.
+   */
+  private async interruptStartupTasksOfInactiveWorkflows(
+    inUseElsewhere: ReadonlySet<string>
+  ): Promise<void> {
+    const config = this.config.loadConfigOrDefault();
+    const taskIndex = this.buildAgentTaskIndex(config);
     // Workflow cancellation is authoritative even when a child has its own Stop or question, and
     // for archived rows too: a cancelled run's archived child must not stay active until unarchive.
     const activeTasks = this.listAgentTaskWorkspaces(config).filter((task) =>
@@ -4513,17 +4616,23 @@ export class TaskService implements AgentTaskIntegration {
         { scheduleQueueDrain: false }
       );
     }
-    config = this.config.loadConfigOrDefault();
-    const candidates = startupTasks();
-    const states = new Map(
-      await Promise.all(
-        candidates.map(
-          async (task) =>
-            // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
-            [task.id, await this.workspaceService.getStartupRecoveryState(task.id!)] as const
-        )
-      )
+  }
+
+  /** The rows startup recovery re-drives (see isStartupRedriveCandidate). */
+  private listStartupRedriveCandidates(
+    config: ProjectsConfig,
+    inUseElsewhere: ReadonlySet<string>
+  ): AgentTaskWorkspaceEntry[] {
+    return this.listAgentTaskWorkspaces(config).filter((task) =>
+      isStartupRedriveCandidate(task, inUseElsewhere)
     );
+  }
+
+  /** Stops each `stopped` candidate that is neither streaming nor busy, under its tree lock. */
+  private async settleStoppedStartupTasks(
+    candidates: readonly AgentTaskWorkspaceEntry[],
+    states: StartupRecoverySnapshot["states"]
+  ): Promise<void> {
     for (const task of candidates) {
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       const id = task.id!;
@@ -4541,20 +4650,20 @@ export class TaskService implements AgentTaskIntegration {
         log.warn("Failed to settle stopped task on startup", { taskId: id, error });
       });
     }
+  }
 
-    // Normalize stopped capacity before launching siblings; newly launched work is not part of
-    // the recovery snapshot and must never be interrupted by an old Stop or opt-out.
-    // Scheduled, not awaited: launches are ordinary runtime work that already races clients
-    // (reservation is a CAS on `queued`), and the re-drives below only touch snapshot candidates.
-    if (cancelled("queue-drain")) return;
-    // The drain sweeps stale workspace turns even with an empty queue (see the field's comment).
-    this.staleTurnSweepRequestedGeneration += 1;
-    this.scheduleMaybeStartQueuedTasks();
-
+  /**
+   * The recovery snapshot of the re-drives: config re-read after the queue drain, and the
+   * eligible candidates split into awaiting-report and running re-drives.
+   */
+  private loadStartupRecoverySnapshot(
+    inUseElsewhere: ReadonlySet<string>,
+    states: StartupRecoverySnapshot["states"]
+  ): StartupRecoverySnapshot {
     // Recovery awaits and queue draining can change task status: re-read before replaying intent.
-    config = this.config.loadConfigOrDefault();
-    taskIndex = this.buildAgentTaskIndex(config);
-    const eligible = startupTasks().filter(
+    const config = this.config.loadConfigOrDefault();
+    const taskIndex = this.buildAgentTaskIndex(config);
+    const eligible = this.listStartupRedriveCandidates(config, inUseElsewhere).filter(
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- legacy site from before the ban; remove when touching this line
       (task) => states.has(task.id) && !["blocked", "stopped"].includes(states.get(task.id)!)
     );
@@ -4564,46 +4673,7 @@ export class TaskService implements AgentTaskIntegration {
     const runningTasks = eligible.filter(
       (task) => (task.taskStatus ?? "running") === "running" || states.get(task.id) === "question"
     );
-
-    const snapshot: StartupRecoverySnapshot = { config, taskIndex, states };
-    const tally: StartupRecoveryTally = {
-      resumedAwaitingReportCount: 0,
-      skippedAwaitingReportDueToActiveDescendants: 0,
-      skippedAwaitingReportAlreadyBusy: 0,
-      failedAwaitingReportCount: 0,
-      resumedRunningCount: 0,
-      skippedRunningDueToActiveDescendants: 0,
-      skippedRunningAlreadyStreaming: 0,
-      failedRunningCount: 0,
-    };
-
-    for (const task of awaitingReportTasks) {
-      if (!task.id) continue;
-      if (cancelled("awaiting-report")) return;
-      await this.resumeAwaitingReportTask(task.id, task, snapshot, tally);
-    }
-
-    for (const task of runningTasks) {
-      if (!task.id) continue;
-      if (cancelled("running")) return;
-      await this.resumeRunningTask(task.id, task, snapshot, tally);
-    }
-
-    log.info("[startup] TaskService.recoverInterruptedTasks completed", {
-      totalMs: Date.now() - startupStartedAt,
-      skippedInUseElsewhereCount: inUseElsewhere.size,
-      awaitingReportTaskCount: awaitingReportTasks.length,
-      resumedAwaitingReportCount: tally.resumedAwaitingReportCount,
-      skippedAwaitingReportDueToActiveDescendants:
-        tally.skippedAwaitingReportDueToActiveDescendants,
-      skippedAwaitingReportAlreadyBusy: tally.skippedAwaitingReportAlreadyBusy,
-      failedAwaitingReportCount: tally.failedAwaitingReportCount,
-      runningTaskCount: runningTasks.length,
-      resumedRunningCount: tally.resumedRunningCount,
-      skippedRunningDueToActiveDescendants: tally.skippedRunningDueToActiveDescendants,
-      skippedRunningAlreadyStreaming: tally.skippedRunningAlreadyStreaming,
-      failedRunningCount: tally.failedRunningCount,
-    });
+    return { config, taskIndex, states, awaitingReportTasks, runningTasks };
   }
 
   /**
