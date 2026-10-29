@@ -94,7 +94,10 @@ export interface SessionContextHost {
     continuation: CompactionContinuation
   ): Promise<void>;
   dispatchPendingFollowUp(summaryId: string | null, admissionStale: () => boolean): Promise<void>;
-  /** Builds the header that a new compaction boundary row stores (null: nothing to restore). */
+  /**
+   * Builds the header that a new compaction boundary row stores (null: nothing to restore, or the
+   * build did not settle in time). It settles in bounded time.
+   */
   buildPostCompactionContext(
     input: PostCompactionContextInput
   ): Promise<PostCompactionContext | null>;

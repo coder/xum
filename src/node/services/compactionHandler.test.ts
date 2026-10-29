@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach, jest, mock, spyOn } from "bun:test";
+import { describe, it, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import { CompactionHandler } from "./compactionHandler";
 import type { HistoryService } from "./historyService";
 import { createTestHistoryService } from "./testHistoryService";
@@ -20,7 +20,6 @@ import type { PostCompactionContextInput } from "./postCompactionContext";
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import { SESSION_HISTORY_MAX_LINE_BYTES } from "@/common/constants/contextBudget";
 import { CHAT_ARCHIVE_FILE_NAME, CHAT_FILE_NAME } from "@/common/constants/paths";
-import { POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS } from "@/constants/compaction";
 import assert from "@/common/utils/assert";
 import { formatCompactionSummaryTruncationMarker } from "./historyRowBudget";
 import { countTokens } from "@/node/utils/main/tokenizer";
@@ -143,8 +142,6 @@ const getEmittedStreamEndEvent = (events: EmittedEvent[]): StreamEndEvent | unde
       );
     });
 };
-
-const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 describe("CompactionHandler", () => {
   let handler: CompactionHandler;
@@ -2335,30 +2332,6 @@ describe("CompactionHandler", () => {
       await seedHistory(createMuxMessage("u0", "user", "hello"), createCompactionRequest());
 
       expect(await handler.handleCompletion(createStreamEndEvent("Summary"))).toBe(true);
-
-      const boundary = await latestBoundary();
-      expect(boundary?.metadata?.postCompactionContext).toBeUndefined();
-    });
-
-    it("publishes the boundary without a header when the builder does not settle in time", async () => {
-      let markStarted!: () => void;
-      const started = new Promise<void>((resolve) => (markStarted = resolve));
-      installBuilder(() => {
-        markStarted();
-        return new Promise<PostCompactionContext | null>(() => undefined);
-      });
-      await seedHistory(createMuxMessage("u0", "user", "hello"), createCompactionRequest());
-
-      fakeTimers.useFakeTimers();
-      let completion: Promise<boolean>;
-      try {
-        completion = handler.handleCompletion(createStreamEndEvent("Summary"));
-        await started;
-        fakeTimers.advanceTimersByTime(POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS);
-      } finally {
-        fakeTimers.useRealTimers();
-      }
-      expect(await completion).toBe(true);
 
       const boundary = await latestBoundary();
       expect(boundary?.metadata?.postCompactionContext).toBeUndefined();

@@ -1,19 +1,23 @@
-import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, describe, expect, jest, mock, spyOn, test } from "bun:test";
 import { mkdir, mkdtemp, rm, stat, utimes, writeFile } from "fs/promises";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
 
+import { POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS } from "@/constants/compaction";
 import { createMuxMessage } from "@/common/types/message";
-import type { MuxMessage } from "@/common/types/message";
+import type { MuxMessage, PostCompactionContext } from "@/common/types/message";
 import { Err, Ok } from "@/common/types/result";
 import type { AgentSession } from "./agentSession";
 import type { StreamMessageOptions } from "./aiService";
 import type { HistoryService } from "./historyService";
+import type { PostCompactionContextInput } from "./postCompactionContext";
 import {
   compactSessionForTest,
   createAgentSessionHarness,
   createStartedTurnHandle,
 } from "./agentSession.testHarness";
+
+const fakeTimers = jest as typeof jest & { advanceTimersByTime: (ms: number) => void };
 
 /**
  * Log purity: externally-edited files must produce a durable <system-file-update>
@@ -230,6 +234,49 @@ describe("AgentSession file-change notification (turn start)", () => {
       await writeExclusions(config, []);
       await resume(session);
 
+      await editPlanExternally(planFile);
+      await resume(session);
+      expect(await countNotifications(historyService)).toBe(0);
+    });
+  });
+
+  test("a header build that misses its time box leaves the plan untracked", async () => {
+    await withPlanFile(async (planFile) => {
+      const { historyService, session } = await createSessionFixture();
+      const internals = session as unknown as {
+        buildPostCompactionContext(
+          input: PostCompactionContextInput
+        ): Promise<PostCompactionContext | null>;
+        renderPostCompactionContextHeader(input: PostCompactionContextInput): Promise<unknown>;
+      };
+      const render = internals.renderPostCompactionContextHeader.bind(session);
+      let releaseBuild!: () => void;
+      const buildReleased = new Promise<void>((resolve) => (releaseBuild = resolve));
+      let lateBuild: Promise<unknown> | undefined;
+      spyOn(internals, "renderPostCompactionContextHeader").mockImplementationOnce((input) => {
+        lateBuild = buildReleased.then(() => render(input));
+        return lateBuild;
+      });
+      const input = {
+        diffs: [],
+        loadedSkills: [],
+        readFilePaths: [],
+        reportsCompletedBeforeMs: Date.now(),
+      };
+
+      fakeTimers.useFakeTimers();
+      let built: Promise<PostCompactionContext | null>;
+      try {
+        built = internals.buildPostCompactionContext(input);
+        fakeTimers.advanceTimersByTime(POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS);
+      } finally {
+        fakeTimers.useRealTimers();
+      }
+      expect(await built).toBeNull();
+
+      // The build reads the plan only after its time box ended, when the next window may run.
+      releaseBuild();
+      await lateBuild;
       await editPlanExternally(planFile);
       await resume(session);
       expect(await countNotifications(historyService)).toBe(0);

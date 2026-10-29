@@ -120,6 +120,7 @@ import type {
 } from "@/common/orpc/types";
 import { WORKSPACE_DEFAULTS } from "@/constants/workspaceDefaults";
 import { COMPACTION_RETRY_INPUT_BUDGET_SCALE } from "@/constants/continuousCompaction";
+import { POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS } from "@/constants/compaction";
 import { readTodosForSessionDir } from "@/node/services/todos/todoStorage";
 import {
   mergeTurnStopContinuation,
@@ -13520,17 +13521,40 @@ export class AgentSession {
     }
   }
 
-  /** Render the boundary header from the compaction's carryover; null when nothing is kept. */
+  /**
+   * Render the boundary header from the compaction's carryover; null when nothing is kept or
+   * the build does not settle in time.
+   */
   private async buildPostCompactionContext(
     input: PostCompactionContextInput
   ): Promise<PostCompactionContext | null> {
+    const built = await raceWithAbortAndTimeout(this.renderPostCompactionContextHeader(input), {
+      timeoutMs: POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS,
+    });
+    if (built.kind !== "ok") {
+      log.warn("Post-compaction context build timed out; continuing without it", {
+        workspaceId: this.workspaceId,
+      });
+      return null;
+    }
+    const { context, plan } = built.value;
     // The first turn after the boundary detects file edits before it tracks the plan again, so
-    // baseline an untracked plan before the header reads it: that turn then reports an edit
-    // made after this snapshot. Estimates and unpublished builds only start tracking it sooner.
+    // baseline an untracked plan with the state read before the header read it: that turn then
+    // reports an edit made after this snapshot. Estimates and unpublished builds only start
+    // tracking it sooner. Only a build that wins the time box writes the baseline: a late build
+    // must not touch the tracker after the next window started.
+    if (plan) await this.fileChangeTracker.recordIfUntracked(plan.path, plan.state);
+    return context;
+  }
+
+  /** The unbounded header build. It reads the plan state but leaves the tracker to the caller. */
+  private async renderPostCompactionContextHeader(input: PostCompactionContextInput): Promise<{
+    context: PostCompactionContext | null;
+    plan: { path: string; state: FileState } | null;
+  }> {
     const excludedItems = await this.loadExcludedItems();
     const plan = excludedItems.has("plan") ? null : await this.readLocalPlanFileState();
-    if (plan) await this.fileChangeTracker.recordIfUntracked(plan.path, plan.state);
-    return renderPostCompactionContext(
+    const context = renderPostCompactionContext(
       await this.buildAttachmentsFromContext({
         ...input,
         excludedItems,
@@ -13539,6 +13563,7 @@ export class AgentSession {
         readFilePaths: this.isRlmCompactionEnabled() ? input.readFilePaths : [],
       })
     );
+    return { context, plan };
   }
 
   /**

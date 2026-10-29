@@ -9,11 +9,7 @@ import type { CompactionFollowUpCleanupOutcome, HistoryService } from "./history
 import type { CompactionCompletionMetadata } from "@/common/types/compaction";
 import type { ContinuousCompactionPublication } from "./continuousCompactionJournal";
 import { exactJson } from "./continuousCompactionJournal";
-import {
-  POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS,
-  POST_COMPACTION_STATE_FILENAME,
-} from "@/constants/compaction";
-import { raceWithAbortAndTimeout } from "@/node/utils/concurrency/withTimeout";
+import { POST_COMPACTION_STATE_FILENAME } from "@/constants/compaction";
 import {
   CompactionPendingState,
   type CompactionPendingAttachments,
@@ -222,7 +218,10 @@ interface CompactionHandlerOptions {
    * workspace whose compaction keeps failing even though the provider stream ended cleanly.
    */
   onIdleCompactionOutcome?: (success: boolean) => void;
-  /** Builds the post-compaction context header that each new boundary row stores. */
+  /**
+   * Builds the post-compaction context header that each new boundary row stores. It settles in
+   * bounded time, so a slow read cannot hold the paid summary unpublished.
+   */
   buildPostCompactionContext?: (
     input: PostCompactionContextInput
   ) => Promise<PostCompactionContext | null>;
@@ -400,25 +399,16 @@ export class CompactionHandler {
   ): Promise<MuxMessage> {
     if (!buildHeader || !this.buildPostCompactionContext) return summary;
     try {
-      const built = await raceWithAbortAndTimeout(
-        this.buildPostCompactionContext({
-          diffs: attachments.diffs,
-          loadedSkills: attachments.loadedSkills,
-          readFilePaths: attachments.readFiles,
-          // Not the summary timestamp: idle compaction dates the summary at the last activity,
-          // but reports that finished after it are summarized too (#3517). Wall clock: report
-          // times come from Date.now() (#7282).
-          reportsCompletedBeforeMs: nodeClock.nowMs(),
-        }),
-        { timeoutMs: POST_COMPACTION_CONTEXT_BUILD_TIMEOUT_MS }
-      );
-      if (built.kind !== "ok") {
-        log.warn("Post-compaction context build timed out; publishing the boundary without it", {
-          workspaceId: this.workspaceId,
-        });
-        return summary;
-      }
-      return withPostCompactionContext(summary, built.value, this.workspaceId);
+      const built = await this.buildPostCompactionContext({
+        diffs: attachments.diffs,
+        loadedSkills: attachments.loadedSkills,
+        readFilePaths: attachments.readFiles,
+        // Not the summary timestamp: idle compaction dates the summary at the last activity,
+        // but reports that finished after it are summarized too (#3517). Wall clock: report
+        // times come from Date.now() (#7282).
+        reportsCompletedBeforeMs: nodeClock.nowMs(),
+      });
+      return withPostCompactionContext(summary, built, this.workspaceId);
     } catch (error) {
       // The header only restores context; it must never block the compaction itself.
       log.warn("Failed to build post-compaction context; publishing the boundary without it", {
