@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 
 import { resolveXumEnvironmentValue } from "@/common/compat/legacyMux";
 import { CoderSSHRuntime } from "@/node/runtime/CoderSSHRuntime";
-import { DaytonaSSHRuntime } from "@/node/runtime/DaytonaSSHRuntime";
 import type { Runtime } from "@/node/runtime/Runtime";
 import { SSHRuntime } from "@/node/runtime/SSHRuntime";
 import { ServerLockfile } from "@/node/services/serverLockfile";
@@ -29,9 +28,6 @@ export function remoteHealthScript(remotePort: number, nonce: string): string {
 export function createSshForwardTarget(runtime: Runtime): ForwardTarget | undefined {
   // MultiProjectRuntime, Docker and devcontainer are not SSH runtimes: no forward.
   if (!(runtime instanceof SSHRuntime)) return undefined;
-  // Daytona's ssh gateway refuses remote port forwarding (checked live with OpenSSH and ssh2), so
-  // each try would only hold up the command that waits for it.
-  if (runtime instanceof DaytonaSSHRuntime) return undefined;
   const config = runtime.getConfig();
   return {
     hostKey: [config.host, config.port ?? 22, config.identityFile ?? ""].join("|"),

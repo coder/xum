@@ -9,7 +9,6 @@ import {
   SSHConnectionPool,
   type SSHRuntimeConfig,
 } from "./sshConnectionPool";
-import { getDaytonaSshConfigPath } from "./daytonaSshConfig";
 import { isPermanentSSHFailure } from "./Runtime";
 
 // bun-types (^1.2.23) lags the pinned runtime (bun@1.4.3), which implements this.
@@ -141,7 +140,7 @@ describe("appendOpenSSHHostKeyPolicyArgs", () => {
     const args: string[] = ["-T"];
     setOpenSSHHostKeyPolicyMode("headless-fallback");
 
-    appendOpenSSHHostKeyPolicyArgs(args, "example.test");
+    appendOpenSSHHostKeyPolicyArgs(args);
 
     expect(args).toEqual([
       "-T",
@@ -156,27 +155,15 @@ describe("appendOpenSSHHostKeyPolicyArgs", () => {
     const args: string[] = ["-T"];
     setOpenSSHHostKeyPolicyMode("strict");
 
-    appendOpenSSHHostKeyPolicyArgs(args, "example.test");
+    appendOpenSSHHostKeyPolicyArgs(args);
 
     expect(args).toEqual(["-T"]);
   });
 
-  test.each(["headless-fallback", "strict"] as const)(
-    "reads only Xum's include file for a Daytona alias, without the fallback (%s mode)",
-    (mode) => {
-      const args: string[] = ["-T"];
-      setOpenSSHHostKeyPolicyMode(mode);
-
-      appendOpenSSHHostKeyPolicyArgs(args, "xum-feature-a1b2c3.xum--daytona");
-
-      expect(args).toEqual(["-T", "-F", getDaytonaSshConfigPath()]);
-    }
-  );
-
   test("defaults to headless-fallback", () => {
     const args: string[] = ["-T"];
 
-    appendOpenSSHHostKeyPolicyArgs(args, "example.test");
+    appendOpenSSHHostKeyPolicyArgs(args);
 
     expect(args).toEqual([
       "-T",
