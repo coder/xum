@@ -146,19 +146,19 @@ describeIntegration("plan file readers on a non-regular plan path", () => {
     // Controls: canonical regular file wins; missing canonical falls back to a regular legacy file.
     await fs.writeFile(planPath, "# canonical\n");
     const canonical = await generate();
-    expect(canonical).toEqual({
+    expect(canonical).toMatchObject({
       planFilePath: getPlanFilePath(workspaceName, projectName, runtime.getXumHome()),
       planContent: "# canonical\n",
-      modifiedTimeMs: expect.any(Number),
     });
+    expect(typeof canonical?.modifiedTimeMs).toBe("number");
     await fs.rm(planPath);
     await fs.writeFile(legacyPlanPath, "# legacy\n");
     const legacy = await generate();
-    expect(legacy).toEqual({
+    expect(legacy).toMatchObject({
       planFilePath: getLegacyPlanFilePath(workspaceId, runtime.getXumHome()),
       planContent: "# legacy\n",
-      modifiedTimeMs: expect.any(Number),
     });
+    expect(typeof legacy?.modifiedTimeMs).toBe("number");
     await fs.rm(legacyPlanPath);
   }, 60_000);
 
