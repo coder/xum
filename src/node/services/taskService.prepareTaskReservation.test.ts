@@ -135,13 +135,15 @@ describe("TaskService.createMany preparation paths before the split", () => {
 
   test("a valid bestOf is persisted on the task row", async () => {
     const { parentId, taskService, createOne } = await setup();
+    const launchesSettled = recordLaunches(taskService);
     const created = await createOne({ bestOf: { groupId: "group", index: 1, total: 3 } });
     expect(created.success).toBe(true);
     const row = findWorkspaceEntry(config.loadConfigOrDefault(), TASK_ID)?.workspace;
     expect(row?.parentWorkspaceId).toBe(parentId);
     expect(row?.bestOf).toEqual({ groupId: "group", index: 1, total: 3 });
-    // The create schedules a queue drain: let it settle inside the test.
+    // The create schedules a queue drain and a direct launch: let both settle inside the test.
     await taskService.queueDrainSettled();
+    await launchesSettled();
   });
 
   test.each([
