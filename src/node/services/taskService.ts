@@ -1329,6 +1329,18 @@ function isInactiveAgentTaskStatus(
   return status === "reported" || status === "interrupted" || legacyArchived;
 }
 
+/**
+ * Whether the target was archived at the original send, or null when the user archived it during
+ * the wait (F203): that archive is a later user decision than the message and wins, like a Stop.
+ */
+function resolveDeferralArchivedAtSend(
+  redelivery: DeferredDescendantRedelivery | undefined,
+  target: { archived: boolean }
+): boolean | null {
+  if (redelivery == null) return target.archived;
+  return target.archived && !redelivery.archivedAtSend ? null : redelivery.archivedAtSend;
+}
+
 /** After this many idle waits, a deferred message falls back to plain live delivery. */
 const MAX_DEFERRED_DESCENDANT_MESSAGE_WAITS = 5;
 
@@ -9022,17 +9034,12 @@ export class TaskService implements AgentTaskIntegration {
         const inactive =
           !continuationActive &&
           isInactiveAgentTaskStatus(entry.workspace.taskStatus, legacyArchived);
-        if (options?.redelivery != null && legacyArchived && !options.redelivery.archivedAtSend) {
-          return Err({
-            code: "not_active" as const,
-            taskStatus: entry.workspace.taskStatus ?? "unknown",
-            message: "Task workspace was archived while the message waited for its stream to end.",
-          });
-        }
-        const archivedAtSend = options?.redelivery?.archivedAtSend ?? legacyArchived;
-        if (this.deferDescendantMessage({ ...deferral, archivedAtSend }, inactive)) {
-          return Ok({ delivery: "queued" as const, queueDispatchMode });
-        }
+        const deferred = this.deferDescendantMessage(deferral, {
+          inactive,
+          archived: legacyArchived,
+          taskStatus: entry.workspace.taskStatus,
+        });
+        if (deferred != null) return deferred;
         if (inactive && !this.aiService.isStreaming(taskId)) {
           return this.reactivateInactiveAgentTask({
             ancestorWorkspaceId,
@@ -9176,15 +9183,28 @@ export class TaskService implements AgentTaskIntegration {
    * Send order (F54): while an earlier message to this task waits for the target to go idle, a new
    * message queues behind it instead of overtaking it. Redeliveries are the chain itself.
    */
-  private deferDescendantMessage(params: DeferredDescendantMessage, inactive: boolean): boolean {
+  private deferDescendantMessage(
+    deferral: Omit<DeferredDescendantMessage, "archivedAtSend">,
+    target: { inactive: boolean; archived: boolean; taskStatus: AgentTaskStatus | undefined }
+  ): Result<SendAgentTaskMessageResult, SendAgentTaskMessageError> | null {
+    const archivedAtSend = resolveDeferralArchivedAtSend(deferral.options?.redelivery, target);
+    if (archivedAtSend == null) {
+      return Err({
+        code: "not_active" as const,
+        taskStatus: target.taskStatus ?? "unknown",
+        message: "Task workspace was archived while the message waited for its stream to end.",
+      });
+    }
+    const params = { ...deferral, archivedAtSend };
+    const queued = Ok({ delivery: "queued" as const, queueDispatchMode: params.queueDispatchMode });
     if (
       params.options?.redelivery == null &&
       this.deferredDescendantMessagesByTask.has(params.taskId)
     ) {
       this.scheduleDeferredDescendantMessage(params);
-      return true;
+      return queued;
     }
-    return inactive && this.deferWhileTargetStreamsWithoutExecution(params);
+    return target.inactive && this.deferWhileTargetStreamsWithoutExecution(params) ? queued : null;
   }
 
   /**
