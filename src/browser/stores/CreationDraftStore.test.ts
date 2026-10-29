@@ -666,6 +666,70 @@ describe("CreationDraftStore", () => {
     expect(await service.get(id)).toBeNull();
   });
 
+  test("a failed delete of a draft this window never opened is retried (#7728)", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-unopened-retry");
+    const harness = await createHarness(tempDir);
+    const { store: windowA, control, service } = harness;
+    const id = windowA.create(PROJECT_A, null, { text: "listed" });
+    await windowA.flush(id);
+    const sidebarWindow = new CreationDraftStore();
+    sidebarWindow.setClient(harness.newClient());
+    control.failDeletes = 1;
+    await sidebarWindow.delete(id);
+    expect(await service.get(id)).not.toBeNull();
+
+    // No snapshot: the resend deletes without a condition, as before #7719.
+    sidebarWindow.setClient(harness.newClient());
+    await waitFor(() => control.deletesDone === 1);
+    expect(await service.get(id)).toBeNull();
+  });
+
+  test("a second delete of the same draft keeps the first one's condition", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-twice");
+    const harness = await createHarness(tempDir);
+    const { store: windowA, control, service } = harness;
+    const id = windowA.create(PROJECT_A, null, { text: "sent" });
+    await windowA.flush(id);
+    const windowB = await reopen(harness, id, PROJECT_A);
+    control.failDeletes = 1;
+    await windowA.delete(id);
+    windowB.update(id, { text: "typed in B" });
+    await windowB.flush(id);
+
+    // The sidebar Delete overlaps the one after Send: it is not a new first request.
+    await windowA.delete(id);
+    await waitFor(() => control.deletesSettled === control.deleteCalls);
+    expect((await service.get(id))?.text).toBe("typed in B");
+  });
+
+  test("a delete waits for every save a running flush starts", async () => {
+    using tempDir = new TestTempDir("creation-store-delete-successor-save");
+    const harness = await createHarness(tempDir);
+    const { store, control, service } = harness;
+    const id = store.create(PROJECT_A, null, { text: "sent" });
+    await store.flush(id);
+    let releaseSave: () => void = () => undefined;
+    control.updateGate = new Promise<void>((resolve) => {
+      releaseSave = resolve;
+    });
+    store.update(id, { text: "edited" });
+    const saving = store.flush(id).catch(() => undefined);
+    await waitFor(() => control.updates.length === 2);
+    // Queued behind the save in flight: the running flush saves it next.
+    store.update(id, { text: "edited again" });
+    control.failDeletes = 1;
+    const deleting = store.delete(id);
+    releaseSave();
+    await Promise.all([saving, deleting]);
+    expect(control.updates.length).toBe(3);
+    expect((await service.get(id))?.text).toBe("edited again");
+
+    // The resend's condition is the last save, so it deletes the record.
+    store.setClient(harness.newClient());
+    await waitFor(() => control.deleteCalls === 2 && control.deletesSettled === 2);
+    expect(await service.get(id)).toBeNull();
+  });
+
   test("a delete resent on reconnect does not remove settings another window saved meanwhile", async () => {
     using tempDir = new TestTempDir("creation-store-delete-resend-other-window");
     const harness = await createHarness(tempDir);

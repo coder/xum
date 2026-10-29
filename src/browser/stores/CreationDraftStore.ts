@@ -271,6 +271,28 @@ async function importLegacyDraft(
   deleteWorkspaceStorage(scopeId);
 }
 
+interface PendingDelete {
+  ifStored: Omit<CreationDraft, "id"> | null;
+  sent: boolean;
+}
+
+/**
+ * A delete's pending state from what the record holds (`stored`). A second delete of the same id
+ * (a sidebar Delete overlapping the one after Send) has no entry: it keeps the first one's
+ * snapshot and whether its first request was sent.
+ */
+function nextPendingDelete(
+  stored: CreationDraft | null,
+  existing: PendingDelete | undefined
+): PendingDelete {
+  let ifStored = existing?.ifStored ?? null;
+  if (stored) {
+    const { id: _id, ...fields } = stored;
+    ifStored = fields;
+  }
+  return { ifStored, sent: existing?.sent ?? false };
+}
+
 /** A refused save wrote nothing; other failures may have (most often the reply was lost). */
 function noteMaybeSaved(
   entry: Entry,
@@ -297,12 +319,9 @@ export class CreationDraftStore {
    * Deletes the backend has not confirmed (#7551): retried on failure and on each new client.
    * In memory only, as DraftStore's were before #6620. `ifStored` is the record the delete is for
    * (Entry.stored): a later try must not remove another window's save that landed after the first
-   * try was sent. Null: this window never knew the record, so only the first try deletes.
+   * try was sent. Null: this window never knew the record, so every try deletes (sendDelete).
    */
-  private readonly pendingDeletes = new Map<
-    string,
-    { ifStored: Omit<CreationDraft, "id"> | null; sent: boolean }
-  >();
+  private readonly pendingDeletes = new Map<string, PendingDelete>();
   /**
    * Ids deleted in this session, confirmed or not. A delete is final: a list never shows them (even
    * one read before the delete), and opening one again gives a blank draft.
@@ -659,23 +678,22 @@ export class CreationDraftStore {
     // Before the wait, so a list that lands meanwhile cannot show the record again.
     this.deletedIds.add(id);
     // Let a save in flight land first, so it cannot recreate the file after the delete. Pending
-    // (resent by a new client) only after it: a resend must not overtake that save either.
-    await entry?.inFlight;
+    // (resent by a new client) only after it: a resend must not overtake that save either. A
+    // flush() that was running starts the next save once this one lands: wait for that one too.
+    while (entry?.inFlight) await entry.inFlight;
     // Read after the wait: the save that landed meanwhile is what the record holds.
-    const stored = entry?.stored ?? null;
-    let ifStored: Omit<CreationDraft, "id"> | null = null;
-    if (stored) {
-      const { id: _id, ...fields } = stored;
-      ifStored = fields;
-    }
-    this.pendingDeletes.set(id, { ifStored, sent: false });
+    this.pendingDeletes.set(
+      id,
+      nextPendingDelete(entry?.stored ?? null, this.pendingDeletes.get(id))
+    );
     await this.sendDelete(id, 0);
   }
 
   /**
    * The first request deletes whatever the record holds. Every later one (a retry, or a resend on
    * a new client) deletes only the record this window knew, so another window's save that landed
-   * after the first request survives.
+   * after the first request survives. Known limit: a window that never knew the record (a sidebar
+   * Delete of a draft it never opened) retries without a condition, as before (#7728).
    */
   private async sendDelete(id: string, attempt: number): Promise<void> {
     const client = this.client;
@@ -683,10 +701,6 @@ export class CreationDraftStore {
     // Without a client the next one retries it (setClient): that is still the first request.
     if (!client || !pending) return;
     const { ifStored, sent } = pending;
-    if (sent && ifStored === null) {
-      this.pendingDeletes.delete(id);
-      return;
-    }
     pending.sent = true;
     try {
       await client.drafts.deleteCreation({
