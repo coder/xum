@@ -25,11 +25,13 @@ const dockDecorationStacks = (app: AppHarness) =>
 async function showWorkspace(harness: AppHarness, workspaceId: string, name: string) {
   const row = await waitFor(
     () => {
-      const el = harness.view.container.querySelector(`[data-workspace-id="${workspaceId}"]`);
+      const el = harness.view.container.querySelector<HTMLElement>(
+        `[data-workspace-id="${workspaceId}"]`
+      );
       if (!el || el.getAttribute("aria-disabled") === "true") {
         throw new Error("Workspace row not selectable yet");
       }
-      return el as HTMLElement;
+      return el;
     },
     { timeout: 10_000 }
   );
